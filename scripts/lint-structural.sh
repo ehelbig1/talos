@@ -5070,6 +5070,40 @@ $(
         CI_GATE_FAIL=1
     fi
 
+    # ── 64b: named by a runner is not named by the RIGHT runner (2026-09-04, #748) ──
+    # The controller DB-harness binaries partition by an invisible property:
+    # `mod common;` files need DATABASE_URL (the CTRL_TESTS loop supplies it,
+    # plus TALOS_MASTER_KEY, default threads); `mod test_helpers;` files
+    # self-provision a testcontainer (TC_TESTS, no DATABASE_URL,
+    # --test-threads=1). Leg 64 above proves only the UNION — that a binary is
+    # named SOMEWHERE — so a `common` binary registered in TC_TESTS is green
+    # here and dies in CI in 0.00 s at `common/mod.rs:117` before any
+    # assertion. That is exactly how #748's own first CI run failed. Measured
+    # before writing: post-fix 45 agree / 0 mismatch; pristine main 0
+    # pre-existing — a population of one, deterministic (a `^mod X;` grep
+    # against two arrays), 100% precision. Proven three ways on scratch copies
+    # of the runner: silent on the fixed tree, fires "OTHER list" on the
+    # pre-fix registration, fires "neither" when unregistered. Stated limit:
+    # literal array names and literal `mod` lines — a third harness or a
+    # renamed array is invisible until added here. No opt-out: there is no
+    # legitimate reason for a binary to sit in the list whose environment it
+    # cannot run in.
+    CTRL64="$(awk '/^CTRL_TESTS=\(/{f=1;next} f&&/^\)/{f=0} f' "$INTEGRATION_SH" | grep -oE '"[a-z_0-9]+"' | tr -d '"')"
+    TC64="$(awk '/^TC_TESTS=\(/{f=1;next} f&&/^\)/{f=0} f' "$INTEGRATION_SH" | grep -oE '"[a-z_0-9]+"' | tr -d '"')"
+    for f64 in controller/tests/*.rs; do
+        name64="$(basename "$f64" .rs)"
+        if grep -qE '^mod common;' "$f64"; then want64="CTRL_TESTS"; have64="$CTRL64"; other64="$TC64"; h64="common"
+        elif grep -qE '^mod test_helpers;' "$f64"; then want64="TC_TESTS"; have64="$TC64"; other64="$CTRL64"; h64="test_helpers"
+        else continue; fi
+        if ! printf '%s\n' "$have64" | grep -qx "$name64"; then
+            if printf '%s\n' "$other64" | grep -qx "$name64"; then
+                red "✗ controller/tests/${name64}.rs uses the ${h64} harness but is registered in the OTHER runner list — it starts in CI and dies before any assertion; move it to ${want64}"
+            else
+                red "✗ controller/tests/${name64}.rs uses the ${h64} harness but is in neither runner list; add it to ${want64}"
+            fi
+            CI_GATE_FAIL=1
+        fi
+    done
     if [ "$CI_GATE_FAIL" -eq 0 ]; then
         green "✓ all $CI_GATE_SCANNED cargo test targets are gated or explicitly marked ci-ungated (runners wired, no stale entries)"
     fi
@@ -7871,6 +7905,160 @@ else
 fi
 echo
 
+
+
+# ── check 81: ARCHIVED is not ABSENT on a by-id execution read ───────────────
+# `ExecutionRepository::get_execution(exec_id, user_id) -> Result<Option<_>>`
+# read `workflow_executions` ALONE, so `Ok(None)` meant "no such execution"
+# and "the retention sweep moved it to workflow_executions_archive"
+# indistinguishably, at every one of its twenty-two call sites.
+#
+# That was academic until #746: `workflow_executions_archive` had held ZERO
+# rows across the platform's entire history, so no reader had ever had to
+# represent an archived execution. #746's first boot pass moved 96 real
+# executions into it, and within the hour four tools answered this about one
+# of them (`5492b60e-…`, completed, pa-followup-approval-notifier):
+#
+#     get_execution_status       → "Execution not found or access denied"
+#     get_execution_logs         → "Execution not found or access denied"
+#     get_execution_output       → "Execution not found or access denied"
+#     analyze_execution_failure  → "Execution not found or access denied"
+#
+# BOTH clauses of that sentence are false. It IS found — `list_archived_
+# executions` returns it — and access is NOT denied: same user, same tenancy
+# predicate. This is the misleading-report class (checks 74, 76, 79/79b) once
+# more: a DETERMINATE NEGATIVE asserted for a state the reader cannot
+# represent.
+#
+# The fix is structural: `lookup_execution` returns the three-way
+# `ExecutionLookup::{Live, Archived{row, archived_at}, Absent}`, is
+# `#[must_use]`, and offers no `Into<Option>`, no `row()` accessor and no
+# `.ok()` — so a caller cannot re-collapse the two without writing an
+# `Archived` arm on purpose. The compiler therefore enforces most of this
+# rule. These three legs cover what it cannot.
+#
+# (a) THE DELETED FLATTENING READER MUST STAY DELETED — the footgun cannot be
+#     re-acquired (same shape as check 68(c)). `pub async fn get_execution(`
+#     must not be defined in `talos-execution-repository/src/`. MEASURED: it
+#     is defined once on a clean `git archive origin/main` and zero times on
+#     the fixed tree. Precision is trivially 100% — an exact assertion over a
+#     definition site, not a heuristic.
+#
+# (b) NO CALL SITE MAY FOLD THE TWO BACK TOGETHER — a `.get_execution(` whose
+#     `Ok(None)` / `None` arm renders a not-found answer. This is the leg
+#     MEASURED AGAINST THE REAL DEFECT rather than a synthetic mutation:
+#     against pristine main it reports FOURTEEN sites — the thirteen
+#     `talos-mcp-handlers/src/executions.rs` handlers plus
+#     `talos-failure-analysis-service`'s `analyze` — and every one is a real
+#     instance of the bug. ZERO false positives: `talos-api`'s
+#     `module_execution_logs` calls `ModuleExecutionService::get_execution`
+#     (a different table, `module_executions`, which has no archive tier) but
+#     spells its check `.is_none()` rather than a match arm, so it is out of
+#     range by shape. On the fixed tree: 0.
+#
+# (c) AN `Archived` ARM MAY NOT RENDER THE NOT-FOUND STRING, and a match on
+#     `lookup_execution` may not carry a `_ =>` / `Ok(_) =>` wildcard (which
+#     would swallow `Archived` silently past the exhaustiveness check).
+#     PROPHYLACTIC — it found nothing on either tree, and saying so matters
+#     more than implying it caught something. Both halves are MUTATION-PROVED
+#     on the fixed tree: reinstating the collapse at
+#     `handle_get_execution_status` in either spelling is reported by line.
+#
+# Stated limits, each confirmed rather than inferred:
+#   * All three legs are TEXTUAL. (a) pins one identifier in one crate, so a
+#     differently-named flattening convenience (`fetch_execution`) is
+#     invisible — the same limit check 68(c) states.
+#   * (b) is WINDOW-bounded at 600 chars past the call. It does NOT see the
+#     `.ok_or(OrchestrationError::ExecutionNotFound(..))?` spelling, which is
+#     how `talos-execution-orchestration`'s retry and replay wrote it — those
+#     two ARE real pre-fix defects and this leg reports neither. Measured, not
+#     assumed: main's true population of the class is 16 and (b) sees 14.
+#   * (c)'s arm-body window stops at the next arm of the same match. Without
+#     that stop the sibling `Absent` arm — which legitimately renders the
+#     not-found string — lands in the window and EVERY site false-positives;
+#     measured at 14 of 14 before the stop was added.
+#   * No leg can prove the `Archived` arm's answer is GOOD, only that it is
+#     distinct. A handler that classifies correctly and then renders a bare
+#     "archived" with no timestamp passes all three. The wording is pinned by
+#     `archived_render_tests` instead.
+# Opt-out `// allow-collapsed-execution-read: <reason>` on the reported line
+# or within the 8 lines above.
+bold "▶ check 81: ARCHIVED is not ABSENT on a by-id execution read"
+ARCHIVED_FAIL=0
+
+# (a) the deleted flattening reader must stay deleted
+if grep -rn --include='*.rs' -E '^[[:space:]]*pub async fn get_execution\(' \
+        talos-execution-repository/src/ 2>/dev/null | grep -q .; then
+    grep -rn --include='*.rs' -E '^[[:space:]]*pub async fn get_execution\(' \
+        talos-execution-repository/src/ 2>/dev/null \
+        | while IFS= read -r hit; do
+            red "✗ ${hit%%:*}: ExecutionRepository::get_execution is back"
+        done
+    yellow "  → it reads workflow_executions ALONE, so Ok(None) cannot tell an"
+    yellow "    archived execution from an absent one. Use lookup_execution."
+    ARCHIVED_FAIL=1
+fi
+
+# (b) + (c): call-site collapses, and an Archived arm that renders not-found
+ARCHIVED_RS_FILES="$(git ls-files '*.rs' 2>/dev/null | grep -v '^vendor/' || true)"
+if [ -n "$ARCHIVED_RS_FILES" ]; then
+    # shellcheck disable=SC2086
+    ARCHIVED_HITS="$(perl -0777 -ne '
+        # (b) a two-valued get_execution whose empty arm answers "not found"
+        while (/\.get_execution\s*\(/g) {
+            my $pos = pos($_);
+            my $win = substr($_, $pos, 600);
+            if ($win =~ /(?:Ok\(None\)|None)\s*=>[^\n]{0,220}(?:Execution not found|ExecutionNotFound)/s) {
+                my $line = (substr($_, 0, $pos) =~ tr/\n//) + 1;
+                print "$ARGV:$line:b\n";
+            }
+        }
+        # (c1) an Archived arm that renders the not-found string. The window
+        # STOPS at the next arm — the sibling Absent arm legitimately renders
+        # it, and without the stop every site false-positives (measured 14/14).
+        while (/ExecutionLookup::Archived[^=]*=>/g) {
+            my $pos = pos($_);
+            my $win = substr($_, $pos, 800);
+            if ($win =~ /^(.*?)(?:Ok\(ExecutionLookup::|Err\(\s*e\s*\)\s*=>|Err\(_\)\s*=>)/s) { $win = $1; }
+            if ($win =~ /Execution not found/s) {
+                my $line = (substr($_, 0, $pos) =~ tr/\n//) + 1;
+                print "$ARGV:$line:c\n";
+            }
+        }
+        # (c2) a wildcard arm on a lookup_execution match swallows Archived
+        # past the exhaustiveness check the enum otherwise buys.
+        while (/\.lookup_execution\s*\(/g) {
+            my $pos = pos($_);
+            my $win = substr($_, $pos, 700);
+            if ($win =~ /(?:^|\n)\s*(?:_|Ok\(_\))\s*=>/s) {
+                my $line = (substr($_, 0, $pos) =~ tr/\n//) + 1;
+                print "$ARGV:$line:c\n";
+            }
+        }
+    ' $ARCHIVED_RS_FILES 2>/dev/null || true)"
+    while IFS=: read -r f n leg; do
+        [ -n "${f:-}" ] || continue
+        lo=$(( n > 8 ? n - 8 : 1 ))
+        if sed -n "${lo},${n}p" "$f" 2>/dev/null | grep -q 'allow-collapsed-execution-read:'; then continue; fi
+        case "$leg" in
+            b) red "✗ $f:$n collapses a two-valued execution read into \"not found\" — an archived execution is neither absent nor denied" ;;
+            c) red "✗ $f:$n re-collapses ExecutionLookup — an Archived arm answering \"not found\", or a wildcard that swallows it" ;;
+        esac
+        ARCHIVED_FAIL=1
+    done <<< "$ARCHIVED_HITS"
+fi
+
+if [ "$ARCHIVED_FAIL" -gt 0 ]; then
+    yellow "  → an archived execution IS found and access is NOT denied. Classify it:"
+    yellow "    render the report FROM the archive and stamp it (get_execution_status,"
+    yellow "    get_execution_output, …), say \"archived — events not retained\" where the"
+    yellow "    children were CASCADEd away (get_execution_logs, analyze_execution_failure),"
+    yellow "    or REFUSE with \"archived\" as the reason (cancel, retry, replay, acknowledge)."
+    EXIT_CODE=1
+else
+    green "✓ every by-id execution read classifies Archived separately from Absent"
+fi
+echo
 
 bold "▶ check 54: lint self-consistency (check numbering + documented count)"
 ACTUAL_NUMS="$(grep -oE '^bold "▶ check [0-9]+:' "${BASH_SOURCE[0]}" | grep -oE '[0-9]+' | sort -n)"

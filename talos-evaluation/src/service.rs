@@ -353,14 +353,19 @@ impl EvaluationService {
         // a terminal state or the eval's own deadline elapses.
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait_ms);
         let (output, status) = loop {
+            // Deliberately `Live` only: this polls an execution this very
+            // call just created, against a `wait_ms` deadline. The retention
+            // sweep archives on a day-scale window, so `Archived` is not a
+            // reachable state here and pretending otherwise would be theatre.
             let row = self
                 .execution_repo
-                .get_execution(exec_id, input.user_id)
+                .lookup_execution(exec_id, input.user_id)
                 .await
                 .map_err(EvaluationError::Internal)?;
-            match row {
-                Some(r) if is_terminal(&r.status) => break (r.output_data, r.status),
-                _ => {}
+            if let talos_execution_repository::ExecutionLookup::Live(r) = row {
+                if is_terminal(&r.status) {
+                    break (r.output_data, r.status);
+                }
             }
             if std::time::Instant::now() >= deadline {
                 // Never reached terminal within the deadline → SKIP this arm
@@ -565,6 +570,7 @@ fn safe_orch(e: &OrchestrationError) -> String {
         }
         E::WorkflowNotFound(id) => format!("workflow {id} not found"),
         E::ExecutionNotFound(id) => format!("execution {id} not found"),
+        E::ExecutionArchived(id, at) => format!("execution {id} was archived at {at}"),
         E::ExecutionPaused => "execution paused".into(),
         E::WorkflowDisabled(id) => format!("workflow {id} disabled"),
         E::StatusConflict(s) => format!("status conflict: {s}"),

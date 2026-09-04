@@ -8090,6 +8090,7 @@ name = "talos-failure-analysis-service"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "serde_json",
  "talos-execution-repository",
  "talos-reason-class",

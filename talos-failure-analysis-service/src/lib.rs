@@ -27,7 +27,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use uuid::Uuid;
 
-use talos_execution_repository::ExecutionRepository;
+use talos_execution_repository::{ExecutionLookup, ExecutionRepository};
 
 // -----------------------------------------------------------------------------
 // Errors
@@ -44,6 +44,25 @@ pub enum FailureAnalysisError {
     /// the literal pre-extraction string.
     #[error("Execution not found or access denied")]
     NotFound,
+
+    /// The execution EXISTS and is visible to the caller, but the retention
+    /// sweep moved it to `workflow_executions_archive`. Analysis is driven
+    /// ENTIRELY by `execution_events` (`node_failed` rows), and archival
+    /// CASCADEs those away — so there is genuinely nothing to analyse. That
+    /// is a different fact from "no such execution", and the message says
+    /// which, because an operator told "not found or access denied" about a
+    /// row `list_archived_executions` returns goes looking for a permissions
+    /// problem that does not exist.
+    #[error(
+        "Execution {execution_id} was archived at {archived_at} — its per-node events were not \
+         retained past the archive window, so there is nothing left to analyse. The archived row \
+         itself (status, error_message, output) is still readable via get_execution_status / \
+         get_execution_output."
+    )]
+    Archived {
+        execution_id: Uuid,
+        archived_at: chrono::DateTime<chrono::Utc>,
+    },
 
     /// Execution is not in a terminal-failure state. Message is the
     /// literal pre-extraction string (status echoed).
@@ -68,6 +87,7 @@ impl FailureAnalysisError {
     pub fn jsonrpc_code(&self) -> i32 {
         match self {
             Self::NotFound
+            | Self::Archived { .. }
             | Self::NotAnalyzable { .. }
             | Self::ExecutionFetch(_)
             | Self::EventsFetch(_) => -32000,
@@ -924,9 +944,19 @@ impl FailureAnalysisService {
         } = input;
 
         // ── Fetch execution record ───────────────────────────────────────────
-        let exec = match self.execution_repo.get_execution(exec_id, user_id).await {
-            Ok(Some(e)) => e,
-            Ok(None) => return Err(FailureAnalysisError::NotFound),
+        let exec = match self.execution_repo.lookup_execution(exec_id, user_id).await {
+            Ok(ExecutionLookup::Live(e)) => e,
+            // ARCHIVED is not ABSENT. This analyser reads `execution_events`,
+            // which the archival move CASCADEs away, so it cannot do its job
+            // — but it must say WHY rather than claim the execution does not
+            // exist or that access was denied.
+            Ok(ExecutionLookup::Archived { archived_at, .. }) => {
+                return Err(FailureAnalysisError::Archived {
+                    execution_id: exec_id,
+                    archived_at,
+                })
+            }
+            Ok(ExecutionLookup::Absent) => return Err(FailureAnalysisError::NotFound),
             Err(e) => {
                 tracing::error!("analyze_execution_failure fetch failed: {}", e);
                 return Err(FailureAnalysisError::ExecutionFetch(e));

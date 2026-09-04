@@ -34,6 +34,16 @@ pub enum OrchestrationError {
     #[error("execution not found: {0}")]
     ExecutionNotFound(Uuid),
 
+    /// The execution EXISTS and the caller may see it, but the retention
+    /// sweep moved it to `workflow_executions_archive` — so it cannot be
+    /// acted on. Deliberately NOT folded into `ExecutionNotFound`: that is
+    /// the defect this variant exists to prevent. An operator told "not
+    /// found or access denied" about a row `list_archived_executions`
+    /// happily returns goes looking for a permissions problem that isn't
+    /// there. Carries the archival timestamp so the caller can say WHEN.
+    #[error("execution {0} was archived at {1}")]
+    ExecutionArchived(Uuid, chrono::DateTime<chrono::Utc>),
+
     /// Caller paused workflow execution globally (`pause_executions`
     /// MCP tool). Re-fires once `resume_executions` is called.
     #[error("workflow execution is currently paused at the platform level")]
@@ -114,6 +124,10 @@ impl OrchestrationError {
                 -32602
             }
             Self::WorkflowNotFound(_) | Self::ExecutionNotFound(_) => -32001,
+            // Same class as a status conflict: the row is real, the operation
+            // is refused because of the row's CURRENT state. Not -32001 —
+            // that code means "no such thing".
+            Self::ExecutionArchived(..) => -32003,
             Self::ExecutionPaused | Self::WorkflowDisabled(_) | Self::StatusConflict(_) => -32003,
             Self::AuthorizationDenied(_) => -32004,
             Self::ConcurrencyLimitExceeded(_) => -32005,
@@ -157,6 +171,21 @@ mod tests {
         assert_eq!(
             OrchestrationError::DispatchFailed("nats down".into()).jsonrpc_code(),
             -32000
+        );
+        // ExecutionArchived is a STATUS-CONFLICT code, NOT the -32001
+        // not-found code its sibling uses. The row exists and the caller may
+        // see it; the operation is refused because of where the row now
+        // lives. Filing it under -32001 would tell an MCP client switching on
+        // the numeric code that there is no such execution — the same lie the
+        // string form used to tell, one layer down.
+        assert_eq!(
+            OrchestrationError::ExecutionArchived(Uuid::nil(), chrono::Utc::now()).jsonrpc_code(),
+            -32003
+        );
+        assert_ne!(
+            OrchestrationError::ExecutionArchived(Uuid::nil(), chrono::Utc::now()).jsonrpc_code(),
+            OrchestrationError::ExecutionNotFound(Uuid::nil()).jsonrpc_code(),
+            "archived and absent must not share a code"
         );
     }
 }

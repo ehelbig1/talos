@@ -17,6 +17,7 @@ use uuid::Uuid;
 
 use talos_engine::builder::{for_workflow, EngineOpts};
 use talos_engine::nats_run::run_with_trigger_input_via_nats;
+use talos_execution_repository::ExecutionLookup;
 use talos_execution_result_collector as result_collector;
 
 use crate::deep_merge::deep_merge;
@@ -101,12 +102,26 @@ impl ExecutionOrchestrationService {
 
         // 2. Load the original execution (single SQL with ownership
         // check baked in via user_id).
-        let orig = self
+        //
+        // Three-way (see `retry`): an archived original is refused with
+        // its own reason rather than reported as absent.
+        let orig = match self
             .execution_repo
-            .get_execution(original_execution_id, user_id)
+            .lookup_execution(original_execution_id, user_id)
             .await
             .map_err(OrchestrationError::Internal)?
-            .ok_or(OrchestrationError::ExecutionNotFound(original_execution_id))?;
+        {
+            ExecutionLookup::Live(e) => e,
+            ExecutionLookup::Archived { archived_at, .. } => {
+                return Err(OrchestrationError::ExecutionArchived(
+                    original_execution_id,
+                    archived_at,
+                ))
+            }
+            ExecutionLookup::Absent => {
+                return Err(OrchestrationError::ExecutionNotFound(original_execution_id))
+            }
+        };
 
         let workflow_id = orig.workflow_id;
         let inherited_actor_id = orig.actor_id;

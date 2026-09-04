@@ -158,10 +158,13 @@ async fn get_execution_decodes_text_priority_column() {
     // The decode that used to blow up. Reading the row back at all is the
     // assertion; the priority value round-trips as the stored string.
     let exec_repo = ExecutionRepository::new(ctx.db_pool.clone());
-    let row = exec_repo
-        .get_execution(exec_id, user_id)
+    let row = match exec_repo
+        .lookup_execution(exec_id, user_id)
         .await
-        .expect("get_execution must decode the TEXT priority column")
-        .expect("row exists");
+        .expect("lookup_execution must decode the TEXT priority column")
+    {
+        talos_execution_repository::ExecutionLookup::Live(r) => r,
+        other => panic!("a just-created execution must be Live, got {other:?}"),
+    };
     assert_eq!(row.priority.as_deref(), Some("high"));
 }

@@ -21,6 +21,7 @@
 
 use talos_engine::builder::{for_workflow, EngineOpts};
 use talos_engine::nats_run::run_with_trigger_input_via_nats;
+use talos_execution_repository::ExecutionLookup;
 use talos_execution_result_collector as result_collector;
 
 use crate::errors::OrchestrationError;
@@ -43,12 +44,29 @@ impl ExecutionOrchestrationService {
         } = input;
 
         // 1. Load + ownership check (single SQL round-trip).
-        let exec = self
+        //
+        // Three-way: an ARCHIVED execution is refused with its own reason.
+        // A retry re-runs the workflow and writes a new row bound to the
+        // ORIGINAL's graph and actor, so an archived source is a real
+        // refusal — but "not found or access denied" is the wrong reason
+        // for it, and sends the operator to look at permissions.
+        let exec = match self
             .execution_repo
-            .get_execution(execution_id, user_id)
+            .lookup_execution(execution_id, user_id)
             .await
             .map_err(OrchestrationError::Internal)?
-            .ok_or(OrchestrationError::ExecutionNotFound(execution_id))?;
+        {
+            ExecutionLookup::Live(e) => e,
+            ExecutionLookup::Archived { archived_at, .. } => {
+                return Err(OrchestrationError::ExecutionArchived(
+                    execution_id,
+                    archived_at,
+                ))
+            }
+            ExecutionLookup::Absent => {
+                return Err(OrchestrationError::ExecutionNotFound(execution_id))
+            }
+        };
 
         // 2. Status gate. The historical handler exposes the current
         // status in the error message — preserve that for parity.
