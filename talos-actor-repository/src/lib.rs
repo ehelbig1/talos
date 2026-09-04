@@ -2900,39 +2900,27 @@ impl ActorRepository {
         .transpose()
     }
 
-    /// FAIL-OPEN ceiling resolution for MODULE-BOUND dispatch paths (gmail /
-    /// google-calendar / google-cloud / webhook push). Collapses the three
-    /// per-axis SELECTs into the single [`Self::get_actor_ceilings`] join, then
-    /// maps any failure to the actor-less **Tier-2** posture
-    /// (`Tier2` / `Write` / no egress override).
+    /// Read the three per-actor ceilings for a MODULE-BOUND dispatch path
+    /// (gmail / google-calendar / google-cloud / webhook push) and CLASSIFY
+    /// the read instead of collapsing it.
     ///
-    /// This is deliberately the OPPOSITE fail direction from
-    /// `apply_actor_to_engine` (which fails CLOSED to `Tier1` / `ReadOnly` /
-    /// `Local`): a module-bound push carries no owning workflow and a transient
-    /// DB hiccup must never DROP an inbound message — the historical behaviour is
-    /// "dispatch actor-less Tier-2 on any resolution error." The three inline
-    /// `.ok().flatten().unwrap_or(default)` blocks these paths used to run
-    /// (three round-trips) collapse here to one query with identical semantics:
-    /// row present → its real ceilings; row missing OR DB error → the Tier-2
-    /// default triple.
-    pub async fn get_module_bound_ceilings(
-        &self,
-        actor_id: Uuid,
-    ) -> (
-        talos_workflow_job_protocol::LlmTier,
-        talos_workflow_job_protocol::WriteCeiling,
-        Option<talos_workflow_job_protocol::EgressScope>,
-    ) {
-        match self.get_actor_ceilings(actor_id).await {
-            Ok(Some(triple)) => triple,
-            // Missing row or DB error → fail OPEN to actor-less Tier-2 (never
-            // drop an inbound push over a transient hiccup).
-            _ => (
-                talos_workflow_job_protocol::LlmTier::Tier2,
-                talos_workflow_job_protocol::WriteCeiling::Write,
-                None,
-            ),
-        }
+    /// Returns [`ModuleBoundCeilings`], which is `#[must_use]`-shaped by its
+    /// enum-ness: there is no triple to destructure until the caller has said
+    /// what an unreadable answer means at ITS site. See the type's docs for
+    /// why `Ok(None)` and `Err(_)` are different answers, and
+    /// [`ModuleBoundCeilings::resolve_for`] for the sites where a
+    /// refusal would destroy the inbound event.
+    ///
+    /// This is deliberately the OPPOSITE-SHAPED sibling of
+    /// `talos_engine::actor_binding::apply_actor_to_engine`, which both
+    /// stamps the most-restrictive triple AND returns `Err` so the caller
+    /// aborts. It can do both because a workflow trigger can be refused
+    /// safely; three of this function's five callers cannot (their upstream
+    /// has already been ACKed, and two of them have consumed a cursor or a
+    /// dedup claim), so the refusal half is the caller's decision, not this
+    /// function's.
+    pub async fn read_module_bound_ceilings(&self, actor_id: Uuid) -> ModuleBoundCeilings {
+        classify_module_bound_ceilings(self.get_actor_ceilings(actor_id).await)
     }
 
     /// Fetch only the max_capability_world string for a user (used by user_max_world helper).
@@ -4070,6 +4058,645 @@ pub fn spawn_log_admin_event(
             tracing::warn!(error = %e, "Failed to write admin_event_log entry (non-fatal)");
         }
     });
+}
+
+/// What a module-bound ceiling read actually told us.
+///
+/// #736: [`ActorRepository::read_module_bound_ceilings`] used to be
+/// `get_module_bound_ceilings`, returning a bare triple whose `_` arm
+/// collapsed `Ok(None)` and `Err(_)` into the same permissive
+/// `(Tier2, Write, None)`. Those two are not the same answer:
+///
+/// * `Ok(None)` is a READ THAT SUCCEEDED and said the actor row is gone.
+/// * `Err(_)` is a read that told us NOTHING — and on this particular
+///   query the likeliest cause is not a transient blip but permanent
+///   column drift, because [`ActorRepository::get_actor_ceilings`] is
+///   deliberately written so that read-side drift surfaces as `Err`
+///   rather than a silent default (the check-52 idiom). Swallowing it one
+///   frame up defeats exactly the discipline that produced it, and under
+///   drift the swallow is not a one-off: EVERY module-bound dispatch
+///   would run at Tier-2 / Write / public egress, indefinitely, with
+///   nothing but a missing log line to say so.
+///
+/// The permissive triple is also strictly more authority than the caller
+/// is entitled to assume: the five module-bound dispatch sites stamp
+/// `resolved_actor = Some(aid)` on the execution row, so a swallowed
+/// error ATTRIBUTES the run to an actor whose ceilings were never read.
+/// Note the asymmetry that made this visible — those same call sites'
+/// OUTER error arm (actor resolution itself failed) stamps
+/// `resolved_actor = None`, which is honest about not knowing. Two error
+/// paths in one block, one honest and one not.
+///
+/// This type does not decide what to do about that; it only refuses to
+/// hide it. [`Self::resolve_for`] takes the decision, and takes it from the
+/// CALL SITE's identity rather than from an ad-hoc string, so the
+/// restrict-vs-refuse choice each of the five sites makes is a value a unit
+/// test can pin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ModuleBoundCeilings {
+    /// The read succeeded and the actor declares these ceilings.
+    Resolved {
+        tier: talos_workflow_job_protocol::LlmTier,
+        write_ceiling: talos_workflow_job_protocol::WriteCeiling,
+        egress: Option<talos_workflow_job_protocol::EgressScope>,
+    },
+    /// The read succeeded and there is no such actor row.
+    ///
+    /// This is NOT the "module-bound dispatch is intentionally Tier-2"
+    /// posture CLAUDE.md documents — that one describes dispatching with NO
+    /// actor, and it is the call sites' OUTER error arm, which honestly
+    /// stamps `resolved_actor = None`. Here we hold an `actor_id` that
+    /// `get_or_create_default_actor` returned moments earlier, and we are
+    /// about to stamp it on the execution row. A row that has vanished since
+    /// is the delete race [`ActorRepository::get_actor_ceilings`]'s own doc
+    /// names when it says "caller should fail closed", so this restricts
+    /// exactly as [`Self::Unreadable`] does. It stays a DISTINCT variant with
+    /// its own log line because an operator must be able to tell a vanished
+    /// actor from an unreadable one — the first is a data question, the
+    /// second is usually schema drift.
+    ActorMissing,
+    /// The read FAILED. We know NOTHING about this actor's authority.
+    Unreadable(String),
+}
+
+/// The five module-bound dispatch sites, named so the restrict-vs-refuse
+/// choice is a property of the SITE rather than a decision re-taken by hand
+/// at each one.
+///
+/// #736: without this the choice was invisible to every test — a later
+/// "simplification" of the calendar site to a bare `?` would start dropping
+/// whole calendar batches irrecoverably and nothing would say so. The
+/// mapping in [`Self::event_recovery`] is the measured answer to one
+/// question per site: *if we refuse here, does the event come back?*
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchSite {
+    /// `talos-gmail` `dispatch_single_message`. Refusal LOSES the message:
+    /// `dispatch_history_entries` swallows per-message errors so one bad
+    /// message cannot force a whole-batch Pub/Sub retry, its caller advances
+    /// the history cursor regardless, the push handler already returned 200
+    /// from a detached task, `deduplicate_messages` claimed a 24 h SETNX key
+    /// before dispatch, and there is no polling fallback.
+    GmailMessage,
+    /// `talos-google-cloud` `dispatch_monitoring_incident`. Refusal LOSES the
+    /// incident: `pubsub_push_handler` acks 200 before spawning this task —
+    /// deliberately, so Pub/Sub does not retry a dead message forever — and
+    /// `reserve_dedup` claimed a 24 h key first, so even a manual re-push is
+    /// dropped.
+    GcpMonitoringIncident,
+    /// `talos-google-calendar` `process_webhook_events`. Refusal LOSES the
+    /// whole BATCH, irrecoverably: `sync_channel_events` COMMITS the advanced
+    /// sync token before returning the events in memory, so Google will never
+    /// resend them; the periodic re-sync was deliberately removed; the
+    /// notification handler returned 200 before spawning; and this site sits
+    /// OUTSIDE the per-event loop.
+    GcalWebhookEvents,
+    /// `talos-webhooks` `handle_webhook`, bare-module branch. Refusal is SAFE:
+    /// the handler is synchronous, so the error becomes a 500 the sender
+    /// retries — provided the dedup claim is released, which is the caller's
+    /// job and the reason this returns a refusal rather than doing it here.
+    WebhookModuleDispatch,
+    /// `talos-webhooks` `dispatch_replay`. Refusal is FREE: an operator-driven
+    /// `replayWebhookDeadLetterEntry` whose caller stamps `replayed_at` only
+    /// after this returns `Ok`, so the entry stays replayable.
+    WebhookDlqReplay,
+}
+
+/// Whether an inbound event survives a refusal at a given site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventRecovery {
+    /// The upstream re-delivers, or an operator can retry. Refusing DEFERS
+    /// the event, so refusing is the right way not to grant.
+    Recoverable,
+    /// The upstream has already been ACKed, or a cursor advanced, or a dedup
+    /// key was claimed. Refusing DESTROYS the event. The choice here is not
+    /// pass-vs-refuse but GRANT-vs-RESTRICT.
+    Lost,
+}
+
+/// A refusal to dispatch, for the sites where refusing is safe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CeilingRefusal {
+    pub actor_id: Uuid,
+    pub site: DispatchSite,
+    /// Operator-facing reason. Never contains a secret — it carries a sqlx
+    /// error string or the words "actor row not found".
+    pub reason: String,
+}
+
+impl std::fmt::Display for CeilingRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "could not read actor {}'s ceilings at {:?}, so the dispatch was refused rather \
+             than run at a posture that was never read: {}",
+            self.actor_id, self.site, self.reason
+        )
+    }
+}
+
+impl std::error::Error for CeilingRefusal {}
+
+impl DispatchSite {
+    /// THE per-site policy. Measured, not assumed — see each variant's doc
+    /// for the specific mechanism that makes its event recoverable or not.
+    #[must_use]
+    pub fn event_recovery(self) -> EventRecovery {
+        match self {
+            DispatchSite::GmailMessage
+            | DispatchSite::GcpMonitoringIncident
+            | DispatchSite::GcalWebhookEvents => EventRecovery::Lost,
+            DispatchSite::WebhookModuleDispatch | DispatchSite::WebhookDlqReplay => {
+                EventRecovery::Recoverable
+            }
+        }
+    }
+}
+
+impl ModuleBoundCeilings {
+    /// The most restrictive posture on every axis — the same triple
+    /// `talos_engine::actor_binding::apply_actor_to_engine` stamps when it
+    /// cannot read an actor's ceilings.
+    #[must_use]
+    pub fn most_restrictive() -> (
+        talos_workflow_job_protocol::LlmTier,
+        talos_workflow_job_protocol::WriteCeiling,
+        Option<talos_workflow_job_protocol::EgressScope>,
+    ) {
+        (
+            talos_workflow_job_protocol::LlmTier::Tier1,
+            talos_workflow_job_protocol::WriteCeiling::ReadOnly,
+            Some(talos_workflow_job_protocol::EgressScope::Local),
+        )
+    }
+
+    /// The historical actor-less posture the pre-#736 `_` arm handed back:
+    /// external LLM permitted, writes permitted, no egress override (which,
+    /// via `resolve_local_egress_only(None, Tier2)`, derives PUBLIC egress).
+    /// Retained as a named value so the tests can assert that NO unreadable
+    /// or missing-row path resolves to it.
+    #[must_use]
+    pub fn actor_less_tier2() -> (
+        talos_workflow_job_protocol::LlmTier,
+        talos_workflow_job_protocol::WriteCeiling,
+        Option<talos_workflow_job_protocol::EgressScope>,
+    ) {
+        (
+            talos_workflow_job_protocol::LlmTier::Tier2,
+            talos_workflow_job_protocol::WriteCeiling::Write,
+            None,
+        )
+    }
+
+    /// Resolve this read into a dispatch posture, or into a refusal, per the
+    /// SITE's recovery property.
+    ///
+    /// `Ok` at a [`EventRecovery::Lost`] site is the most restrictive triple:
+    /// the job still runs, still gets a durable execution row, and fails
+    /// LOUDLY and recoverably if it needed authority we could not confirm it
+    /// had. `Err` at a [`EventRecovery::Recoverable`] site defers the event
+    /// instead. Both satisfy the one rule that matters — **the gate must not
+    /// silently GRANT** — and neither is reachable by accident, because the
+    /// caller cannot get a triple out of this without naming its site.
+    ///
+    /// Logs at ERROR, not WARN: on this query the likeliest cause is
+    /// permanent column drift, so under a real failure EVERY dispatch takes
+    /// one of these branches.
+    pub fn resolve_for(
+        self,
+        actor_id: Uuid,
+        site: DispatchSite,
+    ) -> Result<
+        (
+            talos_workflow_job_protocol::LlmTier,
+            talos_workflow_job_protocol::WriteCeiling,
+            Option<talos_workflow_job_protocol::EgressScope>,
+        ),
+        CeilingRefusal,
+    > {
+        let (event_kind, reason, detail) = match self {
+            ModuleBoundCeilings::Resolved {
+                tier,
+                write_ceiling,
+                egress,
+            } => return Ok((tier, write_ceiling, egress)),
+            ModuleBoundCeilings::ActorMissing => (
+                "module_bound_ceilings_actor_missing",
+                "actor row not found".to_string(),
+                "the actor row vanished between default-actor resolution and the ceiling read",
+            ),
+            ModuleBoundCeilings::Unreadable(e) => (
+                "module_bound_ceilings_unreadable",
+                e,
+                "the ceiling read failed, so this actor's authority is unknown",
+            ),
+        };
+        match site.event_recovery() {
+            EventRecovery::Lost => {
+                tracing::error!(
+                    target: "actor_repository",
+                    event_kind,
+                    %actor_id,
+                    site = ?site,
+                    reason = %reason,
+                    detail,
+                    "dispatching at the MOST RESTRICTIVE posture rather than granting \
+                     Tier-2/Write/public egress to an actor whose authority was never read \
+                     (refusing here would destroy the inbound event)"
+                );
+                Ok(Self::most_restrictive())
+            }
+            EventRecovery::Recoverable => {
+                tracing::error!(
+                    target: "actor_repository",
+                    event_kind,
+                    %actor_id,
+                    site = ?site,
+                    reason = %reason,
+                    detail,
+                    "refusing the dispatch rather than running it at a posture that was never \
+                     read (the event is recoverable at this site)"
+                );
+                Err(CeilingRefusal {
+                    actor_id,
+                    site,
+                    reason,
+                })
+            }
+        }
+    }
+}
+
+/// Classify a [`ActorRepository::get_actor_ceilings`] read for a
+/// module-bound dispatch path. Pure so the three-way mapping is testable
+/// without Postgres — the collapse this replaces lived inside an async DB
+/// method and could not be unit-tested at all.
+#[must_use]
+pub fn classify_module_bound_ceilings<E: std::fmt::Display>(
+    read: Result<
+        Option<(
+            talos_workflow_job_protocol::LlmTier,
+            talos_workflow_job_protocol::WriteCeiling,
+            Option<talos_workflow_job_protocol::EgressScope>,
+        )>,
+        E,
+    >,
+) -> ModuleBoundCeilings {
+    match read {
+        Err(e) => ModuleBoundCeilings::Unreadable(e.to_string()),
+        Ok(None) => ModuleBoundCeilings::ActorMissing,
+        Ok(Some((tier, write_ceiling, egress))) => ModuleBoundCeilings::Resolved {
+            tier,
+            write_ceiling,
+            egress,
+        },
+    }
+}
+
+#[cfg(test)]
+mod module_bound_ceilings_tests {
+    use super::{classify_module_bound_ceilings, DispatchSite, EventRecovery, ModuleBoundCeilings};
+    use talos_workflow_job_protocol::{EgressScope, LlmTier, WriteCeiling};
+    use uuid::Uuid;
+
+    type Triple = (LlmTier, WriteCeiling, Option<EgressScope>);
+
+    const ALL_SITES: [DispatchSite; 5] = [
+        DispatchSite::GmailMessage,
+        DispatchSite::GcpMonitoringIncident,
+        DispatchSite::GcalWebhookEvents,
+        DispatchSite::WebhookModuleDispatch,
+        DispatchSite::WebhookDlqReplay,
+    ];
+
+    fn ok_tier2() -> Result<Option<Triple>, String> {
+        Ok(Some((LlmTier::Tier2, WriteCeiling::Write, None)))
+    }
+
+    fn unreadable() -> ModuleBoundCeilings {
+        classify_module_bound_ceilings(Err::<Option<Triple>, _>("connection closed".to_string()))
+    }
+
+    fn actor_missing() -> ModuleBoundCeilings {
+        classify_module_bound_ceilings(Ok::<Option<Triple>, String>(None))
+    }
+
+    // ---- classification -------------------------------------------------
+
+    /// THE #736 assertion. Pre-fix, `get_module_bound_ceilings` mapped a
+    /// FAILED READ and a genuinely-tier-2 actor to the identical
+    /// `(Tier2, Write, None)` triple, and its return type had no room to say
+    /// otherwise. "I could not read this actor's authority" and "this actor
+    /// holds the most permissive authority on all three axes" are not the same
+    /// answer, and only one of them is a fact.
+    #[test]
+    fn a_failed_read_is_not_the_same_answer_as_a_tier2_actor() {
+        assert_ne!(unreadable(), classify_module_bound_ceilings(ok_tier2()));
+    }
+
+    /// The realistic `Err` on this query is not a transient blip but PERMANENT
+    /// column drift: `get_actor_ceilings` reads every column as
+    /// `try_get::<Option<_>>?` precisely so drift surfaces as an error rather
+    /// than a silent default (the check-52 idiom). Swallowing it one frame up
+    /// defeated exactly the discipline that produced it.
+    #[test]
+    fn an_unreadable_row_carries_the_reason() {
+        match classify_module_bound_ceilings(Err::<Option<Triple>, _>(
+            "no column found for name: egress_scope".to_string(),
+        )) {
+            ModuleBoundCeilings::Unreadable(e) => assert!(e.contains("egress_scope"), "{e}"),
+            other => panic!("expected Unreadable, got {other:?}"),
+        }
+    }
+
+    /// A read that SUCCEEDED and said the row is gone is a third answer, not a
+    /// second spelling of either of the other two. It resolves the same way as
+    /// `Unreadable`, but an operator must still be able to tell them apart.
+    #[test]
+    fn a_missing_row_is_its_own_answer() {
+        assert_eq!(actor_missing(), ModuleBoundCeilings::ActorMissing);
+        assert_ne!(actor_missing(), unreadable());
+        assert_ne!(actor_missing(), classify_module_bound_ceilings(ok_tier2()));
+    }
+
+    #[test]
+    fn a_resolved_row_passes_its_ceilings_through_verbatim() {
+        let read: Result<Option<Triple>, String> = Ok(Some((
+            LlmTier::Tier1,
+            WriteCeiling::ReadOnly,
+            Some(EgressScope::Public),
+        )));
+        for site in ALL_SITES {
+            assert_eq!(
+                classify_module_bound_ceilings(read.clone())
+                    .resolve_for(Uuid::nil(), site)
+                    .expect("a successful read never refuses"),
+                (
+                    LlmTier::Tier1,
+                    WriteCeiling::ReadOnly,
+                    Some(EgressScope::Public)
+                ),
+                "{site:?} must pass a successful read through untouched"
+            );
+        }
+    }
+
+    // ---- the rule: never GRANT ------------------------------------------
+
+    /// The one invariant that spans every site and every failure mode: an
+    /// answer we could not read must NEVER resolve to the permissive triple
+    /// the pre-#736 `_` arm handed back.
+    #[test]
+    fn no_site_and_no_failure_mode_resolves_to_the_permissive_triple() {
+        for site in ALL_SITES {
+            for outcome in [unreadable(), actor_missing()] {
+                let label = format!("{site:?}/{outcome:?}");
+                if let Ok(triple) = outcome.resolve_for(Uuid::nil(), site) {
+                    assert_ne!(
+                        triple,
+                        ModuleBoundCeilings::actor_less_tier2(),
+                        "{label} resolved to the permissive triple"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Tier-1 keeps the LLM local, ReadOnly refuses mutation, and the egress
+    /// override must be an EXPLICIT `Local` — `None` is NOT equivalent,
+    /// because the worker's `resolve_local_egress_only` reads `None` as
+    /// `matches!(max_llm_tier, Tier1)`. That is exactly why the pre-fix
+    /// `(Tier2, Write, None)` derived PUBLIC egress despite looking like a
+    /// neutral default.
+    #[test]
+    fn a_restricted_dispatch_restricts_every_axis_including_an_explicit_local_egress() {
+        let got = unreadable()
+            .resolve_for(Uuid::nil(), DispatchSite::GmailMessage)
+            .expect("a Lost site restricts rather than refusing");
+        assert_eq!(
+            got,
+            (
+                LlmTier::Tier1,
+                WriteCeiling::ReadOnly,
+                Some(EgressScope::Local)
+            )
+        );
+        assert_ne!(got.2, None, "an explicit Local, never a bare None");
+    }
+
+    /// The restrictive triple must match the fail-closed sibling
+    /// `talos_engine::actor_binding::apply_actor_to_engine` exactly — two
+    /// paths that both mean "we could not read this actor" must not disagree
+    /// about what that implies.
+    #[test]
+    fn most_restrictive_matches_the_apply_actor_to_engine_fail_closed_triple() {
+        assert_eq!(
+            ModuleBoundCeilings::most_restrictive(),
+            (
+                LlmTier::Tier1,
+                WriteCeiling::ReadOnly,
+                Some(EgressScope::Local)
+            )
+        );
+    }
+
+    // ---- per-SITE choice, pinned ----------------------------------------
+    //
+    // #736 follow-up (3): the restrict-vs-refuse choice each site makes was
+    // invisible to every test. If someone later "simplifies" the calendar
+    // site, whole calendar batches start dropping irrecoverably. These pin
+    // the mapping site by site, with the mechanism named in each assertion
+    // message so a future editor has to argue with the evidence.
+
+    #[test]
+    fn gmail_restricts_because_refusing_would_lose_the_message() {
+        assert_eq!(
+            DispatchSite::GmailMessage.event_recovery(),
+            EventRecovery::Lost,
+            "the push handler acks 200 from a detached task, the history cursor advances \
+             regardless, a 24h dedup key is already claimed, and there is no polling fallback"
+        );
+        assert!(unreadable()
+            .resolve_for(Uuid::nil(), DispatchSite::GmailMessage)
+            .is_ok());
+    }
+
+    #[test]
+    fn gcp_restricts_because_pubsub_was_already_acked() {
+        assert_eq!(
+            DispatchSite::GcpMonitoringIncident.event_recovery(),
+            EventRecovery::Lost,
+            "pubsub_push_handler acks 200 before spawning this task — deliberately, so Pub/Sub \
+             does not retry a dead message forever — and reserve_dedup claimed a 24h key first"
+        );
+        assert!(unreadable()
+            .resolve_for(Uuid::nil(), DispatchSite::GcpMonitoringIncident)
+            .is_ok());
+    }
+
+    #[test]
+    fn gcal_restricts_because_the_sync_token_is_already_committed() {
+        assert_eq!(
+            DispatchSite::GcalWebhookEvents.event_recovery(),
+            EventRecovery::Lost,
+            "sync_channel_events COMMITS the advanced sync token before returning the events, \
+             the periodic re-sync was deliberately removed, and this site sits OUTSIDE the \
+             per-event loop — so a refusal drops the whole batch and Google never resends it"
+        );
+        assert!(unreadable()
+            .resolve_for(Uuid::nil(), DispatchSite::GcalWebhookEvents)
+            .is_ok());
+    }
+
+    #[test]
+    fn the_live_webhook_refuses_because_the_sender_retries() {
+        assert_eq!(
+            DispatchSite::WebhookModuleDispatch.event_recovery(),
+            EventRecovery::Recoverable,
+            "handle_webhook is synchronous, so the error becomes a 500 the sender retries"
+        );
+        let refusal = unreadable()
+            .resolve_for(Uuid::nil(), DispatchSite::WebhookModuleDispatch)
+            .expect_err("a Recoverable site refuses");
+        assert_eq!(refusal.site, DispatchSite::WebhookModuleDispatch);
+        assert!(
+            refusal.to_string().contains("connection closed"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn the_dlq_replay_refuses_because_the_entry_stays_replayable() {
+        assert_eq!(
+            DispatchSite::WebhookDlqReplay.event_recovery(),
+            EventRecovery::Recoverable,
+            "replayed_at is stamped only after dispatch_replay returns Ok"
+        );
+        assert!(unreadable()
+            .resolve_for(Uuid::nil(), DispatchSite::WebhookDlqReplay)
+            .is_err());
+    }
+
+    /// Exactly three sites lose their event and exactly two do not. A new
+    /// variant cannot inherit a classification silently, and a flipped one
+    /// changes this count.
+    #[test]
+    fn exactly_three_of_the_five_sites_lose_their_event() {
+        let lost = ALL_SITES
+            .iter()
+            .filter(|s| s.event_recovery() == EventRecovery::Lost)
+            .count();
+        assert_eq!(lost, 3, "{ALL_SITES:?}");
+        assert_eq!(ALL_SITES.len() - lost, 2);
+    }
+
+    // ---- follow-up (1): ActorMissing now restricts -----------------------
+
+    /// #736 follow-up (1). This case USED to keep the permissive
+    /// `(Tier2, Write, None)` triple, on the theory that a missing actor is
+    /// the documented actor-less Tier-2 posture. It is not: that posture is
+    /// the call sites' OUTER error arm, which stamps `resolved_actor = None`.
+    /// Here we hold an `actor_id` that `get_or_create_default_actor` returned
+    /// moments earlier and are about to stamp it on the execution row, so a
+    /// vanished row is the delete race `get_actor_ceilings`'s own doc names
+    /// when it says "caller should fail closed".
+    #[test]
+    fn a_missing_actor_row_restricts_rather_than_granting_tier2() {
+        let got = actor_missing()
+            .resolve_for(Uuid::nil(), DispatchSite::GmailMessage)
+            .expect("a Lost site restricts rather than refusing");
+        assert_eq!(got, ModuleBoundCeilings::most_restrictive());
+        assert_ne!(got, ModuleBoundCeilings::actor_less_tier2());
+    }
+
+    /// …and it refuses at the sites where refusal is safe, exactly as an
+    /// unreadable row does.
+    #[test]
+    fn a_missing_actor_row_refuses_at_recoverable_sites() {
+        let refusal = actor_missing()
+            .resolve_for(Uuid::nil(), DispatchSite::WebhookDlqReplay)
+            .expect_err("a Recoverable site refuses");
+        assert!(
+            refusal.to_string().contains("actor row not found"),
+            "{refusal}"
+        );
+    }
+}
+
+/// End-to-end coverage of the CALL PATH, not just the pure classifier.
+///
+/// A pure-function test cannot see a rewiring: reverting
+/// `read_module_bound_ceilings` to swallow its error would leave every test in
+/// `module_bound_ceilings_tests` green. These drive the real async repository
+/// method against a pool pointed at a closed port — the `connect_lazy` stub
+/// pattern from CLAUDE.md's testing conventions — so the read genuinely fails
+/// the way a DB outage or column drift makes it fail, with no Postgres needed.
+#[cfg(test)]
+mod module_bound_ceilings_call_path_tests {
+    use super::{ActorRepository, DispatchSite, ModuleBoundCeilings};
+    use talos_workflow_job_protocol::{EgressScope, LlmTier, WriteCeiling};
+    use uuid::Uuid;
+
+    /// A pool whose every query fails to connect. Nothing listens on port 1.
+    fn unreachable_repo() -> ActorRepository {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_secs(3))
+            .connect_lazy("postgres://talos:talos@127.0.0.1:1/talos")
+            .expect("lazy pool construction never connects");
+        ActorRepository::new(pool)
+    }
+
+    /// The #736 regression, at the call site. Against pristine `main` the
+    /// equivalent assertion — `assert_ne!(repo.get_module_bound_ceilings(id)
+    /// .await, (Tier2, Write, None))` — FAILS, because main's `_` arm hands
+    /// back exactly that triple when the read errors.
+    #[tokio::test]
+    async fn a_failed_read_does_not_grant_the_actor_less_tier2_triple() {
+        let got = unreachable_repo()
+            .read_module_bound_ceilings(Uuid::nil())
+            .await
+            .resolve_for(Uuid::nil(), DispatchSite::GmailMessage)
+            .expect("a Lost site restricts rather than refusing");
+        assert_ne!(
+            got,
+            ModuleBoundCeilings::actor_less_tier2(),
+            "a ceiling read that failed must not resolve to the most permissive triple"
+        );
+        assert_eq!(
+            got,
+            (
+                LlmTier::Tier1,
+                WriteCeiling::ReadOnly,
+                Some(EgressScope::Local)
+            )
+        );
+    }
+
+    /// The same read at a Recoverable site refuses instead — proving the
+    /// per-site policy is reached through the real async path, not only in
+    /// the pure tests.
+    #[tokio::test]
+    async fn a_failed_read_refuses_at_a_recoverable_site() {
+        let refusal = unreachable_repo()
+            .read_module_bound_ceilings(Uuid::nil())
+            .await
+            .resolve_for(Uuid::nil(), DispatchSite::WebhookDlqReplay)
+            .expect_err("a Recoverable site refuses");
+        assert_eq!(refusal.site, DispatchSite::WebhookDlqReplay);
+    }
+
+    /// The classification itself must survive the round trip — if
+    /// `read_module_bound_ceilings` were rewired to swallow, this would come
+    /// back `ActorMissing` or `Resolved` instead.
+    #[tokio::test]
+    async fn a_failed_read_classifies_as_unreadable() {
+        let got = unreachable_repo()
+            .read_module_bound_ceilings(Uuid::nil())
+            .await;
+        assert!(
+            matches!(got, ModuleBoundCeilings::Unreadable(_)),
+            "expected Unreadable, got {got:?}"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -123,24 +123,67 @@ fn is_ident_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
+/// What a custom Rhai trigger expression actually told us.
+///
+/// #736: `evaluate` used to return a bare `bool` under a docstring claiming
+/// it "fails closed". That claim was true for exactly one reading — "a broken
+/// expression must not spuriously TRIGGER a policy" — and false for the one
+/// that matters. The caller in `evaluator.rs` wrote
+/// `if !is_match { continue; }`, so an unevaluable expression SKIPPED the
+/// policy entirely and the loop fell through to
+/// `Ok(PolicyVerdict::Allow { .. })`. For `PolicyMode::Block` that is
+/// fail-OPEN: the action the operator asked to gate proceeds ungated, and
+/// nothing in the verdict, the response, or the action log says the gate did
+/// not run. A gate that could not read its rule is indistinguishable, in
+/// every surface, from a gate that passed.
+///
+/// The sibling arm of the very same `match` already had this right: built-in
+/// triggers run `builtin_detect(..).await?`, and that `?` propagates to
+/// `talos-workflow-versions`'s `hook.check(..).await?`, refusing the publish.
+/// So does the policy-cache load at the top of `PolicyEvaluator::evaluate`.
+/// The whole evaluator is fail-closed on an unreadable rule; the Rhai arm was
+/// the one outlier, and it was the only arm reachable by a user-authored
+/// expression.
+///
+/// Returning a three-way moves the decision to the caller, which is the only
+/// place that knows the policy's MODE — `Block` must refuse, `Log`/`Notify`
+/// may proceed but must say so loudly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExpressionOutcome {
+    /// The expression evaluated and was true.
+    Matched,
+    /// The expression evaluated and was false.
+    NotMatched,
+    /// The expression could NOT be evaluated (syntax error persisted before
+    /// validation existed, unknown variable, operation-limit trip, a type
+    /// error against this event's context shape). We know NOTHING about
+    /// whether the policy should have fired. Carries the engine's message for
+    /// the operator-facing refusal.
+    Unevaluable(String),
+}
+
 /// Evaluate a custom Rhai expression against a policy event.
-/// Fails closed: any evaluation error (syntax, variable-not-found,
-/// operation limit) returns `false`. Callers must not treat errors as
-/// policy matches — that would turn a broken expression into a live
-/// block.
-pub fn evaluate(expr: &str, event: &PolicyEvent) -> bool {
+///
+/// NEVER collapses an evaluation failure into `NotMatched` — see
+/// [`ExpressionOutcome`] for why that collapse was fail-open for
+/// `PolicyMode::Block`. The caller decides per mode.
+#[must_use]
+pub fn evaluate(expr: &str, event: &PolicyEvent) -> ExpressionOutcome {
     let ctx = event.to_rhai_context();
     match evaluate_condition_with_error(expr, &ctx) {
-        Ok(v) => v,
+        Ok(true) => ExpressionOutcome::Matched,
+        Ok(false) => ExpressionOutcome::NotMatched,
         Err(e) => {
             tracing::warn!(
                 target: "actor_policies",
+                event_kind = "policy_expression_unevaluable",
                 expr = %expr,
                 error = %e,
                 event = event.kind(),
-                "Rhai policy expression evaluation failed — treating as not-matched (fail closed)"
+                "Rhai policy expression could not be evaluated — the caller must NOT read this \
+                 as 'did not match'"
             );
-            false
+            ExpressionOutcome::Unevaluable(e)
         }
     }
 }
@@ -189,20 +232,75 @@ mod tests {
 
     #[test]
     fn evaluate_matches_on_event_string() {
-        assert!(evaluate(r#"event == "publish_version""#, &sample_event()));
+        assert_eq!(
+            evaluate(r#"event == "publish_version""#, &sample_event()),
+            ExpressionOutcome::Matched
+        );
+    }
+
+    /// THE regression test for #736, and the one that can be run against
+    /// pristine `main`: it compiles there (both sides were `bool`) and FAILS
+    /// there, because pre-fix `evaluate` returned `false` for a broken
+    /// expression and `false` for an expression that is simply false. Those
+    /// are not the same answer, and the caller — which cannot tell them apart
+    /// from a `bool` — was letting a `Block` policy through ungated on the
+    /// strength of the confusion.
+    #[test]
+    fn an_unevaluable_expression_is_not_the_same_answer_as_a_false_one() {
+        let ev = sample_event();
+        assert_ne!(evaluate("this is not rhai", &ev), evaluate("false", &ev));
+        assert_ne!(
+            evaluate("undefined_var == true", &ev),
+            evaluate("false", &ev)
+        );
+    }
+
+    /// Renamed from `evaluate_fails_closed_on_unknown_variable`. The old name
+    /// encoded the wrong security belief: "fails closed" was only true for the
+    /// reading "a broken expression must not spuriously TRIGGER a policy". For
+    /// `PolicyMode::Block` the caller's `if !is_match { continue; }` made the
+    /// same value fail OPEN. The assertion is kept — an unknown variable must
+    /// still never read as `Matched` — but it is no longer allowed to read as
+    /// `NotMatched` either.
+    #[test]
+    fn unknown_variable_is_unevaluable_and_never_matched() {
+        let out = evaluate("undefined_var == true", &sample_event());
+        assert!(
+            matches!(out, ExpressionOutcome::Unevaluable(_)),
+            "got {out:?}"
+        );
+    }
+
+    /// Renamed from `evaluate_fails_closed_on_broken_syntax` — same reason.
+    /// Persisted syntax errors (rows written before `validate_expression` was
+    /// wired into the save path) must not panic, must not match, and must not
+    /// masquerade as a clean `false`.
+    #[test]
+    fn broken_syntax_is_unevaluable_and_never_matched() {
+        let out = evaluate("this is not rhai", &sample_event());
+        assert!(
+            matches!(out, ExpressionOutcome::Unevaluable(_)),
+            "got {out:?}"
+        );
+    }
+
+    /// A non-boolean expression is a TYPE error against
+    /// `eval_with_scope::<bool>`, not a `false` — the same trap one step over.
+    #[test]
+    fn non_boolean_expression_is_unevaluable() {
+        let out = evaluate("1 + 1", &sample_event());
+        assert!(
+            matches!(out, ExpressionOutcome::Unevaluable(_)),
+            "got {out:?}"
+        );
     }
 
     #[test]
-    fn evaluate_fails_closed_on_unknown_variable() {
-        // References an undefined variable — should evaluate to false,
-        // NOT propagate an error.
-        assert!(!evaluate("undefined_var == true", &sample_event()));
-    }
-
-    #[test]
-    fn evaluate_fails_closed_on_broken_syntax() {
-        // Persisted syntax errors shouldn't panic or match.
-        assert!(!evaluate("this is not rhai", &sample_event()));
+    fn a_genuinely_false_expression_is_not_matched() {
+        assert_eq!(
+            evaluate(r#"event == "something_else""#, &sample_event()),
+            ExpressionOutcome::NotMatched
+        );
     }
 
     /// MCP-510: pre-fix `expr.contains("eval")` rejected any expression

@@ -1166,9 +1166,30 @@ pub async fn process_webhook_events(
         .await
     {
         Ok(aid) => {
-            // One joined SELECT, fail-OPEN to actor-less Tier-2 on any error
-            // (air-gapped actor stays air-gapped via the egress override).
-            let (tier, write_ceiling, egress) = actor_repo.get_module_bound_ceilings(aid).await;
+            // #736: one joined SELECT, CLASSIFIED rather than collapsed.
+            //
+            // The parenthetical this comment used to carry — "air-gapped actor
+            // stays air-gapped via the egress override" — was FALSE: the old
+            // fallback passed `None` for egress and `resolve_local_egress_only`
+            // reads `None => matches!(max_llm_tier, Tier1)`, so `(Tier2, _, None)`
+            // derives PUBLIC egress.
+            //
+            // Refusing is the WORST option on this path, and by the widest
+            // margin of the five: `sync_channel_events` has already COMMITTED
+            // the advanced sync token to the DB before returning the events in
+            // memory, the periodic re-sync task was deliberately removed, and
+            // `webhook_notification_handler` returned 200 before spawning this
+            // task — so Google will never resend them. This site also sits
+            // OUTSIDE the per-event loop, so an error would drop the whole
+            // batch. Restrict, do not refuse.
+            let (tier, write_ceiling, egress) = match actor_repo
+                .read_module_bound_ceilings(aid)
+                .await
+                .resolve_for(aid, talos_actor_repository::DispatchSite::GcalWebhookEvents)
+            {
+                Ok(triple) => triple,
+                Err(refusal) => return Err(anyhow::anyhow!("{refusal}")),
+            };
             (Some(aid), tier, write_ceiling, egress)
         }
         Err(e) => {

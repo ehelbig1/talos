@@ -1059,13 +1059,62 @@ impl WebhookRouter {
                     .await
                 {
                     Ok(aid) => {
-                        // One joined SELECT, fail-OPEN to actor-less Tier-2 on
-                        // any error: the actor's tier + write ceiling + egress
-                        // override all travel with the direct-dispatched webhook
-                        // job (grandfathered existing actors are Tier-2/Write,
-                        // so the fallback is non-breaking).
-                        let (tier, write_ceiling, egress) =
-                            actor_repo.get_module_bound_ceilings(aid).await;
+                        // #736: one joined SELECT, CLASSIFIED rather than
+                        // collapsed. The pre-#736 `_` arm mapped BOTH a missing
+                        // row and a FAILED READ to `(Tier2, Write, None)` — the
+                        // most permissive triple on all three axes — so a read
+                        // that told us nothing about this actor's authority
+                        // granted external-LLM egress, writes, and (via
+                        // `resolve_local_egress_only(None, Tier2)`) public
+                        // egress, on a job stamped `resolved_actor = Some(aid)`.
+                        //
+                        // Unlike the three Google push paths, refusing IS safe
+                        // here: `handle_webhook` is synchronous, so the error
+                        // reaches `webhook_handler` and becomes a 500 the sender
+                        // retries. The one thing that must not be forgotten is
+                        // the dedup claim — a bare `?` would leave it held and
+                        // the retry would be swallowed as a duplicate, turning a
+                        // deferral back into a loss. Same shape as the R2-4
+                        // transient-failure branch below.
+                        let (tier, write_ceiling, egress) = match actor_repo
+                            .read_module_bound_ceilings(aid)
+                            .await
+                            .resolve_for(
+                                aid,
+                                talos_actor_repository::DispatchSite::WebhookModuleDispatch,
+                            ) {
+                            Ok(triple) => triple,
+                            Err(refusal) => {
+                                tracing::error!(
+                                    trigger_id = %trigger_id,
+                                    actor_id = %aid,
+                                    error = %refusal,
+                                    "webhook dispatch: refusing rather than dispatching at a \
+                                     posture we never read"
+                                );
+                                self.log_request(
+                                    trigger_id,
+                                    headers,
+                                    &body,
+                                    source_ip,
+                                    StatusCode::INTERNAL_SERVER_ERROR.as_u16() as i32,
+                                    None,
+                                    0,
+                                    0,
+                                    false,
+                                    Some("Failed to resolve actor ceilings"),
+                                )
+                                .await;
+                                // R2-4: the module never ran, so abandon the
+                                // dedup claim and let the sender retry.
+                                self.release_dedup_claim(trigger_id, &dedup_claim).await;
+                                return Ok((
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "Internal server error",
+                                )
+                                    .into_response());
+                            }
+                        };
                         (Some(aid), tier, write_ceiling, egress)
                     }
                     Err(e) => {
@@ -2814,11 +2863,31 @@ impl WebhookRouter {
                 let actor_repo = talos_actor_repository::ActorRepository::new(self.db_pool.clone());
                 match actor_repo.resolve_effective_actor(user_id, None).await {
                     Ok(aid) => {
-                        // One joined SELECT, fail-OPEN to actor-less Tier-2 on
-                        // any error (egress override travels so an air-gapped
-                        // actor stays air-gapped).
-                        let (tier, write_ceiling, egress) =
-                            actor_repo.get_module_bound_ceilings(aid).await;
+                        // #736: one joined SELECT, CLASSIFIED rather than
+                        // collapsed. The parenthetical this comment used to
+                        // carry — "egress override travels so an air-gapped
+                        // actor stays air-gapped" — was FALSE on the fallback
+                        // path it described: it passed `None` for egress, and
+                        // `resolve_local_egress_only` reads
+                        // `None => matches!(max_llm_tier, Tier1)`, so
+                        // `(Tier2, _, None)` derives PUBLIC egress.
+                        //
+                        // Refusing is FREE on this path — the cheapest of the
+                        // five. This is an operator-initiated
+                        // `replayWebhookDeadLetterEntry`, and the caller stamps
+                        // `replayed_at` only AFTER this returns `Ok`, so a
+                        // refusal surfaces to the operator and leaves the entry
+                        // replayable. Nothing is lost and nothing is granted.
+                        let (tier, write_ceiling, egress) = actor_repo
+                            .read_module_bound_ceilings(aid)
+                            .await
+                            .resolve_for(
+                                aid,
+                                talos_actor_repository::DispatchSite::WebhookDlqReplay,
+                            )
+                            .map_err(|refusal| {
+                                anyhow::anyhow!("{refusal} (the entry remains replayable)")
+                            })?;
                         (Some(aid), tier, write_ceiling, egress)
                     }
                     Err(e) => {

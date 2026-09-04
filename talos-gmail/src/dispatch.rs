@@ -391,11 +391,11 @@ async fn dispatch_single_message(
         .await
     {
         Ok(aid) => {
-            // One joined SELECT, fail-OPEN to actor-less Tier-2 on any error.
+            // #736: one joined SELECT, CLASSIFIED rather than collapsed.
             //
             // The parenthetical this comment used to carry — "air-gapped actor
             // stays air-gapped via the egress override" — was FALSE, and the
-            // measurement is worth keeping: the fallback passes `None` for
+            // measurement is worth keeping: the old fallback passed `None` for
             // egress, and `resolve_local_egress_only` reads
             // `None => matches!(max_llm_tier, Tier1)`, so `(Tier2, _, None)`
             // derives PUBLIC egress. Three live tier-1 actors rely on exactly
@@ -403,15 +403,32 @@ async fn dispatch_single_message(
             // would hold only for an actor with an EXPLICIT
             // `egress_scope='local'`, and there are none.
             //
-            // Currently VACUOUS rather than exploitable: all five call sites
-            // resolve the DEFAULT actor via `resolve_effective_actor(_, None)`,
-            // and that actor is tier2/write, so the fallback grants what it
-            // already has. It becomes live the moment the default actor is
-            // tier-1. Splitting `Ok(None)` (designed, actor-less Tier-2) from
-            // `Err(_)` (a read that failed) is the fix, and it needs a
-            // decision about inbound-push semantics — see
-            // `get_module_bound_ceilings`.
-            let (tier, write_ceiling, egress) = actor_repo.get_module_bound_ceilings(aid).await;
+            // The old collapse was VACUOUS rather than exploitable, and still
+            // is: all five call sites resolve the DEFAULT actor via
+            // `resolve_effective_actor(_, None)`, and that actor is
+            // tier2/write, so the fallback granted what it already had. It
+            // becomes live the moment the default actor is tier-1.
+            //
+            // The decision this used to defer, now taken: refusing is NOT
+            // available on this path. `dispatch_history_entries` swallows a
+            // per-message error to avoid a whole-batch Pub/Sub retry, its
+            // caller advances the history cursor regardless, the handler
+            // already returned 200, `deduplicate_messages` claimed a 24 h SETNX
+            // key before dispatch, and there is no polling fallback — so an
+            // error here loses the message permanently. The choice is
+            // grant-vs-restrict, and we restrict.
+            // `GmailMessage` is an `EventRecovery::Lost` site, so this is
+            // infallible by construction — but it is still spelled as a
+            // `match` rather than an `unwrap`, so that flipping the site's
+            // recovery classification is a compile-time conversation.
+            let (tier, write_ceiling, egress) = match actor_repo
+                .read_module_bound_ceilings(aid)
+                .await
+                .resolve_for(aid, talos_actor_repository::DispatchSite::GmailMessage)
+            {
+                Ok(triple) => triple,
+                Err(refusal) => return Err(anyhow::anyhow!("{refusal}")),
+            };
             (Some(aid), tier, write_ceiling, egress)
         }
         Err(e) => {
