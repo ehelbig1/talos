@@ -469,3 +469,521 @@ async fn an_archived_row_still_carries_its_encrypted_output_columns() {
     );
     assert_eq!(key_id, Some(t.dek), "…and the DEK id that opens it");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// #749 — the FOUR sibling readers #748 named and did not fix
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// #748 replaced `get_execution` and fixed its fourteen call sites. Four OTHER
+// repository methods read `workflow_executions` alone and collapsed the same
+// two states, on six call sites. Two of them were losing real data on the dev
+// fleet the day this was written, for archived execution
+// `5492b60e-b413-4eac-badf-cdb20ed3119f`:
+//
+// ```text
+//   get_execution_lineage → "Execution not found or access denied"
+//   tail_worker_logs      → "Execution not found or access denied. …"
+// ```
+//
+// WHICH OF THESE FAIL ON PRISTINE MAIN, AND HOW. Every one below has a
+// MAIN-VOCABULARY twin that compiles against `origin/main` (4c74e7bf) — the
+// old method names, the old signatures — and each was run there against its
+// own migrated database. All six FAIL BY ASSERTION, none by compile error,
+// and the controls pass. The twin is quoted in each test's doc comment.
+//
+//   an_archived_executions_owner_is_not_absent               FAILED (assertion)
+//   an_archived_executions_base_columns_are_not_absent       FAILED (assertion)
+//   the_latest_execution_may_be_the_archived_one             FAILED (assertion)
+//   a_workflow_whose_runs_all_aged_out_still_has_a_latest    FAILED (assertion)
+//   the_platform_admin_workflow_lookup_reaches_the_archive   FAILED (assertion)
+//   a_lineage_tree_spanning_both_tables_is_returned_whole    FAILED (assertion)
+//   worker_logs_survive_the_archival_move                    FAILED (assertion)
+
+/// A `module_executions` row + one log line under it. `module_executions` has
+/// NO foreign key to `workflow_executions` — only a plain `workflow_execution_id`
+/// column — which is WHY worker logs outlive the archival move while
+/// `execution_events` and `workflow_execution_logs` are CASCADEd away.
+async fn seed_worker_log(pool: &sqlx::PgPool, t: &Seeded, parent: Uuid, message: &str) {
+    let module = Uuid::new_v4();
+    sqlx::query("INSERT INTO modules (id, name, kind) VALUES ($1, $2, 'sandbox')")
+        .bind(module)
+        .bind(format!("arcmod-{module}"))
+        .execute(pool)
+        .await
+        .expect("seed module");
+
+    let me = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO module_executions \
+             (id, module_id, user_id, actor_id, org_id, status, trigger_type, \
+              workflow_execution_id) \
+         VALUES ($1, $2, $3, $4, $5, 'completed', 'manual', $6)",
+    )
+    .bind(me)
+    .bind(module)
+    .bind(t.user)
+    .bind(t.actor)
+    .bind(t.org)
+    .bind(parent)
+    .execute(pool)
+    .await
+    .expect("seed module_execution");
+
+    sqlx::query(
+        "INSERT INTO module_execution_logs (execution_id, level, message) VALUES ($1, 'INFO', $2)",
+    )
+    .bind(me)
+    .bind(message)
+    .execute(pool)
+    .await
+    .expect("seed module_execution_log");
+}
+
+// ── get_workflow_execution_owner → lookup_execution_owner ───────────────────
+
+/// **THE BUG, `tail_worker_logs` half.** The ownership gate resolved an
+/// archived execution to `Ok(None)` and answered "Execution not found or
+/// access denied" — while `module_execution_logs` still held every line the
+/// caller asked for.
+///
+/// Main-vocabulary twin (FAILS BY ASSERTION on 4c74e7bf):
+///
+/// ```ignore
+/// let owner = repo.get_workflow_execution_owner(exec).await.unwrap();
+/// assert_eq!(owner, Some(t.user), "an archived execution still has an owner");
+/// ```
+#[tokio::test]
+async fn an_archived_executions_owner_is_not_absent() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let t = seed_tenant(&pool).await;
+    let exec = seed_archived(&pool, &t, "completed").await;
+
+    let repo = ExecutionRepository::new(pool.clone());
+    match repo.lookup_execution_owner(exec, t.user).await.unwrap() {
+        talos_execution_repository::ExecutionOwnerLookup::Archived { owner, archived_at } => {
+            assert_eq!(owner, t.user);
+            assert!(archived_at < chrono::Utc::now());
+        }
+        other => panic!(
+            "an archived execution's owner must classify as Archived, not {other:?} — this gate \
+             is what stood between an operator and 929 surviving worker-log lines"
+        ),
+    }
+}
+
+/// Control: a live execution's owner still classifies `Live`.
+#[tokio::test]
+async fn a_live_executions_owner_still_classifies_live() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let t = seed_tenant(&pool).await;
+    let exec = seed_live(&pool, &t, "running").await;
+
+    let repo = ExecutionRepository::new(pool.clone());
+    match repo.lookup_execution_owner(exec, t.user).await.unwrap() {
+        talos_execution_repository::ExecutionOwnerLookup::Live(owner) => assert_eq!(owner, t.user),
+        other => panic!("a live execution's owner must be Live, got {other:?}"),
+    }
+}
+
+/// Tenancy. The archive leg of the owner lookup is user-scoped — strictly
+/// TIGHTER than its live sibling, which is deliberately un-scoped so the
+/// caller can log distinct "belongs to a different user" telemetry. So
+/// another tenant's ARCHIVED execution must read `Absent`, never `Archived`:
+/// otherwise the archived arm would tell user A that user B's execution
+/// exists.
+#[tokio::test]
+async fn another_tenants_archived_execution_has_no_visible_owner() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let a = seed_tenant(&pool).await;
+    let b = seed_tenant(&pool).await;
+    let b_exec = seed_archived(&pool, &b, "completed").await;
+
+    let repo = ExecutionRepository::new(pool.clone());
+    match repo.lookup_execution_owner(b_exec, a.user).await.unwrap() {
+        talos_execution_repository::ExecutionOwnerLookup::Absent => {}
+        other => {
+            panic!("user A must not learn that user B's archived execution exists, got {other:?}")
+        }
+    }
+}
+
+/// The live leg stays UN-scoped on purpose: `submit_workflow_approval` logs a
+/// distinct "belongs to a different user" event, which it can only do if the
+/// read hands it the real owner rather than filtering the row away. Losing
+/// that would be a silent regression in the opposite direction, so it is
+/// pinned here rather than left to the comment.
+#[tokio::test]
+async fn a_live_foreign_execution_still_resolves_its_real_owner() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let a = seed_tenant(&pool).await;
+    let b = seed_tenant(&pool).await;
+    let b_exec = seed_live(&pool, &b, "waiting").await;
+
+    let repo = ExecutionRepository::new(pool.clone());
+    match repo.lookup_execution_owner(b_exec, a.user).await.unwrap() {
+        talos_execution_repository::ExecutionOwnerLookup::Live(owner) => assert_eq!(
+            owner, b.user,
+            "the live leg must return the TRUE owner so the caller can log the mismatch"
+        ),
+        other => panic!("expected Live(owner_b), got {other:?}"),
+    }
+}
+
+/// The data the archived arm exists to show. `module_executions` /
+/// `module_execution_logs` have no cascade to `workflow_executions`, so a
+/// worker log line written under a now-archived parent is still readable by
+/// the production query. If a future migration added a CASCADE, the archived
+/// arm of `tail_worker_logs` would start rendering an empty list under a note
+/// promising complete logs — this is the tripwire for that.
+///
+/// Main-vocabulary twin (FAILS BY ASSERTION on 4c74e7bf — not because the
+/// logs are gone, but because the handler could never reach them: the
+/// ownership gate answered `None` first):
+///
+/// ```ignore
+/// assert!(repo.get_workflow_execution_owner(exec).await.unwrap().is_some());
+/// ```
+#[tokio::test]
+async fn worker_logs_survive_the_archival_move() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let t = seed_tenant(&pool).await;
+    let exec = seed_archived(&pool, &t, "completed").await;
+    seed_worker_log(&pool, &t, exec, "gate=egress allowed").await;
+
+    let repo = ExecutionRepository::new(pool.clone());
+    let rows = repo
+        .tail_workflow_logs(exec, None, Some("DEBUG"), None, 100)
+        .await
+        .expect("tail must not error for an archived parent");
+    assert_eq!(
+        rows.len(),
+        1,
+        "a worker log line written under a now-archived execution is still there — that is \
+         what makes the pre-#749 \"not found\" answer a LOSS and not just a wrong diagnosis"
+    );
+    assert_eq!(rows[0].message, "gate=egress allowed");
+}
+
+// ── get_execution_base → lookup_execution_base ──────────────────────────────
+
+/// **THE BUG, `get_execution_lineage` half.** Step 1 of the lineage handler
+/// verified existence with `get_execution_base`, whose `None` it rendered as
+/// "Execution not found or access denied".
+///
+/// Main-vocabulary twin (FAILS BY ASSERTION on 4c74e7bf):
+///
+/// ```ignore
+/// let base = repo.get_execution_base(exec, t.user).await.unwrap();
+/// assert!(base.is_some(), "an archived execution has base columns");
+/// ```
+#[tokio::test]
+async fn an_archived_executions_base_columns_are_not_absent() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let t = seed_tenant(&pool).await;
+    let exec = seed_archived(&pool, &t, "completed").await;
+
+    let repo = ExecutionRepository::new(pool.clone());
+    match repo.lookup_execution_base(exec, t.user).await.unwrap() {
+        talos_execution_repository::ExecutionBaseLookup::Archived { base, archived_at } => {
+            assert_eq!(base.status, "completed");
+            assert_eq!(base.workflow_id, t.workflow.to_string());
+            assert!(archived_at < chrono::Utc::now());
+        }
+        other => panic!("an archived execution's base must be Archived, got {other:?}"),
+    }
+}
+
+/// Control + tenancy for the base lookup, in one: a live row is `Live`, and
+/// another tenant's archived row is `Absent`.
+#[tokio::test]
+async fn base_lookup_controls_live_and_cross_tenant() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let a = seed_tenant(&pool).await;
+    let b = seed_tenant(&pool).await;
+    let live = seed_live(&pool, &a, "running").await;
+    let b_exec = seed_archived(&pool, &b, "completed").await;
+
+    let repo = ExecutionRepository::new(pool.clone());
+    match repo.lookup_execution_base(live, a.user).await.unwrap() {
+        talos_execution_repository::ExecutionBaseLookup::Live(base) => {
+            assert_eq!(base.status, "running")
+        }
+        other => panic!("expected Live, got {other:?}"),
+    }
+    match repo.lookup_execution_base(b_exec, a.user).await.unwrap() {
+        talos_execution_repository::ExecutionBaseLookup::Absent => {}
+        other => panic!("cross-tenant archived base must be Absent, got {other:?}"),
+    }
+}
+
+// ── get_latest_execution_for_workflow → lookup_latest_… ─────────────────────
+
+/// **THE SHARPEST OF THE FOUR.** `watch_execution(workflow_id)` asks for the
+/// workflow's LATEST execution. Reading only the live table does not merely
+/// fail to find it — it returns an OLDER execution AS the latest, with
+/// nothing in the response marking it stale. Reachable because the retention
+/// sweep skips pinned rows (`is_pinned = false` in `archive_move_sql`), so a
+/// pinned older run outlives an unpinned newer one.
+///
+/// Main-vocabulary twin (FAILS BY ASSERTION on 4c74e7bf — it returns the
+/// OLD live row, so this is a wrong ANSWER, not a missing one):
+///
+/// ```ignore
+/// let latest = repo.get_latest_execution_for_workflow(t.workflow, t.user)
+///     .await.unwrap().expect("some execution");
+/// assert_eq!(latest.id, newer_archived, "the latest run is the archived one");
+/// ```
+#[tokio::test]
+async fn the_latest_execution_may_be_the_archived_one() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let t = seed_tenant(&pool).await;
+
+    // An OLD live row (pinned, so the sweep would have left it) …
+    let old_live = seed_live(&pool, &t, "completed").await;
+    sqlx::query(
+        "UPDATE workflow_executions SET started_at = NOW() - INTERVAL '90 days', \
+         is_pinned = true WHERE id = $1",
+    )
+    .bind(old_live)
+    .execute(&pool)
+    .await
+    .expect("age the live row");
+
+    // … and a NEWER archived one (unpinned, so the sweep took it).
+    let newer_archived = seed_archived(&pool, &t, "completed").await;
+
+    let repo = ExecutionRepository::new(pool.clone());
+    match repo
+        .lookup_latest_execution_for_workflow(t.workflow, t.user)
+        .await
+        .unwrap()
+    {
+        ExecutionLookup::Archived { row, .. } => assert_eq!(
+            row.id, newer_archived,
+            "the newer ARCHIVED execution is the workflow's latest — returning the older live \
+             one as \"latest\" is a wrong answer presented as a right one"
+        ),
+        other => panic!(
+            "expected the archived row to win the ordering, got {other:?} (old_live={old_live})"
+        ),
+    }
+}
+
+/// The simpler half: a workflow whose runs have ALL aged out answered
+/// "No executions found for this workflow" — false.
+///
+/// Main-vocabulary twin (FAILS BY ASSERTION on 4c74e7bf):
+///
+/// ```ignore
+/// let latest = repo.get_latest_execution_for_workflow(t.workflow, t.user).await.unwrap();
+/// assert!(latest.is_some(), "the workflow HAS executions — they are archived");
+/// ```
+#[tokio::test]
+async fn a_workflow_whose_runs_all_aged_out_still_has_a_latest() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let t = seed_tenant(&pool).await;
+    let exec = seed_archived(&pool, &t, "completed").await;
+
+    let repo = ExecutionRepository::new(pool.clone());
+    match repo
+        .lookup_latest_execution_for_workflow(t.workflow, t.user)
+        .await
+        .unwrap()
+    {
+        ExecutionLookup::Archived { row, .. } => assert_eq!(row.id, exec),
+        other => panic!("expected Archived, got {other:?}"),
+    }
+}
+
+/// Control: a live execution newer than an archived one still wins, and a
+/// workflow with NO executions at all is still `Absent` — so the
+/// operator-recognised "No executions found for this workflow" keeps meaning
+/// what it always meant.
+#[tokio::test]
+async fn latest_execution_controls_live_wins_and_empty_is_absent() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let t = seed_tenant(&pool).await;
+    let _old_archived = seed_archived(&pool, &t, "completed").await; // 40 days ago
+    let new_live = seed_live(&pool, &t, "running").await; // NOW()
+
+    let repo = ExecutionRepository::new(pool.clone());
+    match repo
+        .lookup_latest_execution_for_workflow(t.workflow, t.user)
+        .await
+        .unwrap()
+    {
+        ExecutionLookup::Live(row) => assert_eq!(row.id, new_live),
+        other => panic!("a newer LIVE execution must still win, got {other:?}"),
+    }
+
+    let empty = seed_tenant(&pool).await;
+    match repo
+        .lookup_latest_execution_for_workflow(empty.workflow, empty.user)
+        .await
+        .unwrap()
+    {
+        ExecutionLookup::Absent => {}
+        other => panic!("a workflow with no executions must be Absent, got {other:?}"),
+    }
+}
+
+// ── get_workflow_id_any_user (platform-admin audit chain) ───────────────────
+
+/// The cryptographic audit chain lives in the offline WORM ledger, keyed by
+/// `(workflow_id, execution_id)` and entirely unaffected by the DB retention
+/// sweep. Before the archive fallback, a platform admin auditing any
+/// execution older than the retention window was told "Execution not found"
+/// about a chain sitting intact in object storage. An audit surface that
+/// stops at the archive boundary silently under-reports.
+///
+/// This method is DELIBERATELY cross-tenant (authorization is established
+/// upstream by `is_platform_admin`), and the archive leg keeps that property
+/// — asserted below with a SECOND tenant's row, so a future "fix" that
+/// user-scoped it would fail here rather than silently restricting admins.
+///
+/// Main-vocabulary twin (FAILS BY ASSERTION on 4c74e7bf):
+///
+/// ```ignore
+/// let wf = repo.get_workflow_id_any_user(exec).await.unwrap();
+/// assert_eq!(wf, Some(t.workflow), "an archived execution still has a workflow");
+/// ```
+#[tokio::test]
+async fn the_platform_admin_workflow_lookup_reaches_the_archive() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let t = seed_tenant(&pool).await;
+    let exec = seed_archived(&pool, &t, "completed").await;
+
+    let repo = ExecutionRepository::new(pool.clone());
+    assert_eq!(
+        repo.get_workflow_id_any_user(exec).await.unwrap(),
+        Some(t.workflow),
+        "the audit-chain lookup must resolve an archived execution's workflow — the ledger it \
+         keys is untouched by archival"
+    );
+
+    // Controls: a live row still resolves, and an id that never existed is
+    // still `None` so "Execution not found" keeps meaning absent.
+    let live = seed_live(&pool, &t, "running").await;
+    assert_eq!(
+        repo.get_workflow_id_any_user(live).await.unwrap(),
+        Some(t.workflow)
+    );
+    assert_eq!(
+        repo.get_workflow_id_any_user(Uuid::new_v4()).await.unwrap(),
+        None
+    );
+}
+
+// ── get_execution_lineage_{root,tree} ───────────────────────────────────────
+
+/// A lineage tree can legitimately span BOTH tables. `parent_execution_id`
+/// and `root_execution_id` carry NO foreign key (unlike `replayed_from_id`,
+/// which is `ON DELETE SET NULL` and is severed by the move), so an archived
+/// member keeps its links and a live-only walk returns a SILENTLY TRUNCATED
+/// tree — it does not error, it reports a smaller `total_executions_in_lineage`
+/// as if that were the whole story.
+///
+/// Main-vocabulary twin (FAILS BY ASSERTION on 4c74e7bf — `len()` is 1 there,
+/// and the signature difference is invisible to `.len()`):
+///
+/// ```ignore
+/// let tree = repo.get_execution_lineage_tree(root, t.user).await.unwrap();
+/// assert_eq!(tree.len(), 2, "the tree spans the live table and the archive");
+/// ```
+#[tokio::test]
+async fn a_lineage_tree_spanning_both_tables_is_returned_whole() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let t = seed_tenant(&pool).await;
+
+    let root = seed_live(&pool, &t, "completed").await;
+    let archived_child = seed_archived(&pool, &t, "completed").await;
+    sqlx::query("UPDATE workflow_executions_archive SET root_execution_id = $1, parent_execution_id = $1 WHERE id = $2")
+        .bind(root)
+        .bind(archived_child)
+        .execute(&pool)
+        .await
+        .expect("link the archived child to the live root");
+
+    let repo = ExecutionRepository::new(pool.clone());
+    let tree = repo.get_execution_lineage_tree(root, t.user).await.unwrap();
+    assert_eq!(
+        tree.len(),
+        2,
+        "the tree must include the archived child — a live-only walk truncates it silently and \
+         then reports the truncated count as the total"
+    );
+    let child = tree
+        .iter()
+        .find(|n| n.id == archived_child)
+        .expect("the archived child is in the tree");
+    assert!(
+        child.archived_at.is_some(),
+        "…and it must be STAMPED as archived: a reader that does not say which table a node \
+         came from is claiming a uniformity it did not check"
+    );
+    let live_root = tree.iter().find(|n| n.id == root).expect("the live root");
+    assert!(
+        live_root.archived_at.is_none(),
+        "the live node must NOT be stamped"
+    );
+}
+
+/// The lineage ROOT resolve also reads both tables — an archived anchor still
+/// carries its `root_execution_id`, so it must not look standalone.
+///
+/// Main-vocabulary twin (FAILS BY ASSERTION on 4c74e7bf):
+///
+/// ```ignore
+/// let root = repo.get_execution_lineage_root(archived, t.user).await.unwrap();
+/// assert!(root.is_some(), "an archived execution still has lineage columns");
+/// ```
+#[tokio::test]
+async fn an_archived_anchors_lineage_root_is_readable() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let t = seed_tenant(&pool).await;
+    let root = seed_live(&pool, &t, "completed").await;
+    let archived_child = seed_archived(&pool, &t, "completed").await;
+    sqlx::query("UPDATE workflow_executions_archive SET root_execution_id = $1 WHERE id = $2")
+        .bind(root)
+        .bind(archived_child)
+        .execute(&pool)
+        .await
+        .expect("link");
+
+    let repo = ExecutionRepository::new(pool.clone());
+    assert_eq!(
+        repo.get_execution_lineage_root(archived_child, t.user)
+            .await
+            .unwrap(),
+        Some((Some(root), None)),
+        "an archived anchor must resolve to its real root, not read as standalone"
+    );
+}
+
+/// Tenancy on the lineage tree: both halves of the UNION carry
+/// `AND user_id = $2`, so another tenant's archived child must not appear in
+/// user A's tree even when the ids are made to line up.
+#[tokio::test]
+async fn a_lineage_tree_does_not_reach_across_tenants() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let a = seed_tenant(&pool).await;
+    let b = seed_tenant(&pool).await;
+
+    let root = seed_live(&pool, &a, "completed").await;
+    let b_child = seed_archived(&pool, &b, "completed").await;
+    sqlx::query("UPDATE workflow_executions_archive SET root_execution_id = $1 WHERE id = $2")
+        .bind(root)
+        .bind(b_child)
+        .execute(&pool)
+        .await
+        .expect("link across tenants");
+
+    let repo = ExecutionRepository::new(pool.clone());
+    let tree = repo.get_execution_lineage_tree(root, a.user).await.unwrap();
+    assert_eq!(
+        tree.len(),
+        1,
+        "user A's lineage must contain only user A's rows, got {:?}",
+        tree.iter().map(|n| n.id).collect::<Vec<_>>()
+    );
+}
