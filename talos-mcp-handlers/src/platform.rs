@@ -126,7 +126,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "security_audit",
-            "description": "Programmatic security posture check. Validates encryption keys, JWT configuration, audit triggers, CORS, and TLS settings. Returns a scored assessment with actionable recommendations.",
+            "description": "Programmatic security posture check. Validates encryption keys, JWT configuration, audit triggers, CORS, TLS settings, and whether the registered worker fleet enforces the per-actor write ceiling. Returns a scored assessment with actionable recommendations. Every check carries a 'verification' level: 'not_verified' means the check could NOT run, and describes what was not learned — it is never a pass. The write-ceiling check is reported but unscored (its flag is default-off by design, so a deployment using the default is not marked down for it).",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -929,6 +929,34 @@ fn handle_get_public_url_status(req_id: Option<serde_json::Value>) -> JsonRpcRes
 /// A DB failure degrades to an `error` field rather than failing the whole
 /// platform-info call — the rest of the response is still useful, and this
 /// section is diagnostic. The message is the generic one; details go to the log.
+/// Read the fleet's write-ceiling enforcement posture. `None` = the registry
+/// read FAILED, which every consumer must report as "not verified" rather than
+/// as an absence of enforcement — the two are different findings and only one
+/// of them is about the database.
+///
+/// ONE query, and one per calling surface: `get_platform_info` already reads
+/// the same rows for its build report, so this is used by the surfaces that
+/// need the summary WITHOUT the build listing (`security_audit`,
+/// `set_actor_write_ceiling`, `get_actor_summary`,
+/// `get_my_capability_ceiling`).
+pub(crate) async fn read_write_ceiling_fleet(
+    db_pool: &sqlx::PgPool,
+) -> Option<talos_worker_identity_repository::WriteCeilingFleetSummary> {
+    let repo = talos_worker_identity_repository::WorkerIdentityRepository::new(db_pool.clone());
+    match repo.list_active_builds().await {
+        Ok(rows) => {
+            Some(talos_worker_identity_repository::summarize_write_ceiling_enforcement(&rows))
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %format!("{e:#}"),
+                "write-ceiling fleet summary unavailable; surfaces must report it as unverified"
+            );
+            None
+        }
+    }
+}
+
 async fn build_fleet_report(db_pool: &sqlx::PgPool, controller_build: &str) -> serde_json::Value {
     use talos_worker_identity_repository::WorkerIdentityRepository;
 
@@ -1005,6 +1033,14 @@ fn assemble_fleet_report(
                 // `last_seen_at` above is BOOT REGISTRATION only and is not a
                 // liveness signal; do not read the two the same way.
                 "last_liveness_at": r.last_liveness_at.map(|t| t.to_rfc3339()),
+                // What THIS worker reported about the per-actor write ceiling
+                // it will enforce. null = UNREPORTED (a pre-feature worker, or
+                // an operator-CLI registration), which is NOT the same as
+                // `false` — see `write_ceiling` below for the fleet answer.
+                // Diagnostic only, on exactly the `build_version` terms.
+                "write_ceiling_enforced": r.write_ceiling_enforced,
+                // Subordinate to the above: inert while enforcement is off.
+                "write_ceiling_strict_egress": r.write_ceiling_strict_egress,
             })
         })
         .collect();
@@ -1043,6 +1079,13 @@ fn assemble_fleet_report(
             "static_key_count": key_count,
             "supports_sealing": serde_json::Value::Null,
             "last_seen_at": serde_json::Value::Null,
+            // A statically-keyed worker never calls the registration endpoint,
+            // so it reports NOTHING about write-ceiling enforcement — the same
+            // reason it can report no build. Emitted as explicit nulls rather
+            // than omitted so the two sources have one shape and a reader
+            // cannot mistake absence for `false`.
+            "write_ceiling_enforced": serde_json::Value::Null,
+            "write_ceiling_strict_egress": serde_json::Value::Null,
         }));
         unverifiable += 1;
     }
@@ -1082,6 +1125,14 @@ fn assemble_fleet_report(
         "build_skew": skew > 0,
         "skewed_workers": skew,
         "unverifiable_workers": unverifiable,
+        // The fleet's write-ceiling ENFORCEMENT posture. Derived from the
+        // REGISTERED rows only (a static-env worker reports nothing), by the
+        // one shared summariser every other surface also renders, so
+        // get_platform_info, set_actor_write_ceiling, get_actor_summary,
+        // get_my_capability_ceiling and security_audit cannot word the same
+        // fleet differently.
+        "write_ceiling": talos_worker_identity_repository::
+            summarize_write_ceiling_enforcement(rows).to_json(),
         // PER SOURCE, never of the merged array length: static rows are appended
         // after the DB LIMIT, so they must not make a short listing look
         // truncated — and a capped ring must not be silently dropped just
@@ -1105,7 +1156,16 @@ fn assemble_fleet_report(
                  in 'workers' (rotation keys and both-source workers each add one); distinct_worker_ids \
                  is the answer to 'how many workers do I have'. Every count above describes the rows IN \
                  THIS REPORT: each source is independently capped at 200 rows and 'truncated' is true \
-                 when either one was cut.",
+                 when either one was cut. write_ceiling summarises the per-actor write-ceiling \
+                 ENFORCEMENT posture over the REGISTERED rows ONLY, because a static-env worker never \
+                 registers and so reports nothing — a static-only fleet therefore reads \
+                 enforced_by='unknown' with registered_rows=0, which is the honest answer and not \
+                 'none'. enforced_by is 'all' | 'some' | 'none' | 'unknown': 'some' is the dangerous \
+                 one, because nothing routes jobs by enforcement posture, so a readonly actor's job may \
+                 land on the worker that does not enforce. Unreported rows are counted separately and \
+                 never folded into not_enforcing. Like build_version these bits are worker-self-reported \
+                 and outside the registration proof-of-possession: diagnostic only, never an \
+                 authorization input.",
     })
 }
 
@@ -1199,6 +1259,22 @@ async fn handle_get_platform_info(
     // The read goes through the repository (no raw sqlx in a handler — check 6).
     let fleet = build_fleet_report(&state.db_pool, &build_version).await;
 
+    // A COMPILE-TIME list of what this BUILD contains. Nothing here reads
+    // runtime state, and the accompanying `features_note` says so — because
+    // this list has already made a false claim: `execution_archival` was
+    // advertised for the ~5 months in which the archival pass archived exactly
+    // zero rows (#746). A list that reads no state is a claim about the build,
+    // and it must be labelled as one.
+    //
+    // Deliberately NOT measured, and the reason is not cost. Measuring ONE
+    // entry would imply the other eleven are measured too — a reader has no way
+    // to tell which is which — so a per-entry probe is all-or-nothing, and
+    // eleven probes is not what `get_platform_info` should be. The surfaces
+    // that DO measure are named in the note.
+    //
+    // Deliberately NOT renamed either: `features` is an existing response key,
+    // and the house rule for a misleading field is to disambiguate with an
+    // ADDED field rather than a rename (#579/#580).
     let features = vec![
         "talos_workflow_engine",
         "parallel_execution",
@@ -1228,6 +1304,16 @@ async fn handle_get_platform_info(
         "uptime_seconds": uptime_secs,
         "uptime_human": format!("{}h {}m {}s", uptime_secs / 3600, (uptime_secs % 3600) / 60, uptime_secs % 60),
         "features": features,
+        "features_note": "BUILD CAPABILITIES, NOT RUNTIME STATE. This is a compile-time list of \
+                          what this controller binary contains; no entry is verified against a \
+                          live database, a running worker, or any configuration flag. An entry \
+                          therefore means 'this build can do it', never 'this deployment is doing \
+                          it' — 'execution_archival' was listed here throughout the period in \
+                          which the archival pass archived zero rows. For measured answers use \
+                          'fleet' (registered workers, their builds, and their write-ceiling \
+                          enforcement posture) in this same response, get_archive_policy, \
+                          get_system_health, and security_audit, each of which reports what it \
+                          could NOT establish rather than defaulting.",
         "fleet": fleet,
     });
     mcp_text(
@@ -1369,8 +1455,13 @@ async fn handle_security_audit(
     state: &McpState,
 ) -> JsonRpcResponse {
     let sysrepo = talos_system_repo::SystemRepository::new(state.db_pool.clone());
-    let result =
-        talos_security_audit::run_security_audit(&sysrepo, state.secrets_manager.as_ref()).await;
+    let write_ceiling_fleet = read_write_ceiling_fleet(&state.db_pool).await;
+    let result = talos_security_audit::run_security_audit(
+        &sysrepo,
+        state.secrets_manager.as_ref(),
+        write_ceiling_fleet,
+    )
+    .await;
     mcp_text(
         req_id,
         &serde_json::to_string_pretty(&result).unwrap_or_default(),
@@ -2098,6 +2189,44 @@ async fn handle_get_secret_access_log(
     }
 }
 
+/// `read_write_ceiling_fleet` must distinguish a FAILED read from an EMPTY
+/// fleet. No live database required: a lazily-connected pool aimed at a dead
+/// port makes the query fail for real.
+#[cfg(test)]
+mod write_ceiling_read_tests {
+    /// A registry read that FAILS must return `None`, never an empty summary.
+    ///
+    /// The two render differently on purpose and the difference is what an
+    /// operator acts on: `None` says "the database could not be read", an
+    /// empty fleet says "no worker has registered". Collapsing the error into
+    /// `Some(summarize(&[]))` is a one-token change that compiles, keeps the
+    /// advisory verdict correct, and sends an operator to investigate their
+    /// fleet during a Postgres outage — the same misdiagnosis class as
+    /// answering "not found" for a row you could not read (#736/#749).
+    ///
+    /// This test exists because the mutation SURVIVED every other test here.
+    #[tokio::test]
+    async fn a_failed_registry_read_is_none_not_an_empty_fleet() {
+        let dead = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(600))
+            .connect_lazy("postgres://nobody:nobody@127.0.0.1:1/nope")
+            .expect("connect_lazy never dials");
+
+        let got = super::read_write_ceiling_fleet(&dead).await;
+        assert!(
+            got.is_none(),
+            "an unreadable registry must be None; got a summary, which would be \
+             rendered as a statement about the fleet rather than about the database"
+        );
+        // ...and the shared renderer turns that into a database finding.
+        let j = talos_worker_identity_repository::render_write_ceiling_enforcement(got);
+        assert_eq!(j["enforced_by"], "unknown");
+        assert!(j["note"].as_str().unwrap().contains("database problem"));
+        assert!(j["registered_rows"].is_null(), "nothing was counted");
+    }
+}
+
 #[cfg(test)]
 mod fleet_report_tests {
     use super::assemble_fleet_report;
@@ -2110,7 +2239,90 @@ mod fleet_report_tests {
             supports_sealing: false,
             last_seen_at: chrono::Utc::now(),
             last_liveness_at: None,
+            // Unreported by default — the pre-feature-worker shape, and the
+            // state the existing build tests should be indifferent to.
+            write_ceiling_enforced: None,
+            write_ceiling_strict_egress: None,
         }
+    }
+
+    /// A row reporting a write-ceiling enforcement posture.
+    fn ceiling_row(
+        worker_id: &str,
+        enforced: Option<bool>,
+        strict: Option<bool>,
+    ) -> WorkerBuildRow {
+        WorkerBuildRow {
+            write_ceiling_enforced: enforced,
+            write_ceiling_strict_egress: strict,
+            ..row(worker_id, Some("0.1.0+aaaaaaa"))
+        }
+    }
+
+    // ── write-ceiling enforcement in the fleet report ─────────────────────
+
+    /// The per-worker bits reach the registered rows, unswapped, and an
+    /// unreported row renders as JSON `null` rather than `false`.
+    #[test]
+    fn registered_rows_carry_the_write_ceiling_bits() {
+        let r = assemble_fleet_report(
+            "0.1.0+aaaaaaa",
+            &[
+                ceiling_row("enforcing", Some(true), Some(false)),
+                ceiling_row("silent", None, None),
+            ],
+            &[],
+        );
+        let ws = workers(&r);
+        assert_eq!(ws[0]["write_ceiling_enforced"], true);
+        assert_eq!(ws[0]["write_ceiling_strict_egress"], false);
+        assert!(
+            ws[1]["write_ceiling_enforced"].is_null(),
+            "unreported must be null, never false — the two are different claims"
+        );
+    }
+
+    /// A statically-keyed worker never registers, so it reports nothing. The
+    /// keys are emitted as explicit nulls rather than omitted so both sources
+    /// have ONE shape and a reader cannot mistake an absent key for `false`.
+    #[test]
+    fn static_env_rows_report_no_enforcement_explicitly() {
+        let r = assemble_fleet_report("0.1.0+aaaaaaa", &[], &ring(&[("pinned", 1)]));
+        let ws = workers(&r);
+        assert_eq!(ws[0]["source"], "static-env");
+        assert!(ws[0].get("write_ceiling_enforced").is_some());
+        assert!(ws[0]["write_ceiling_enforced"].is_null());
+        assert!(ws[0]["write_ceiling_strict_egress"].is_null());
+    }
+
+    /// The fleet-level summary is present and is the SHARED one — the same
+    /// `enforced_by` vocabulary every other surface renders.
+    #[test]
+    fn the_fleet_summary_is_present_and_shared() {
+        let r = assemble_fleet_report(
+            "0.1.0+aaaaaaa",
+            &[
+                ceiling_row("a", Some(true), Some(true)),
+                ceiling_row("b", Some(false), None),
+            ],
+            &[],
+        );
+        assert_eq!(r["write_ceiling"]["enforced_by"], "some");
+        assert_eq!(r["write_ceiling"]["enforcing"], 1);
+        assert_eq!(r["write_ceiling"]["not_enforcing"], 1);
+        assert_eq!(r["write_ceiling"]["strict_egress_effective"], 1);
+    }
+
+    /// A STATIC-ONLY fleet must read `unknown`, not `none`.
+    ///
+    /// The summary is over REGISTERED rows, and a static worker has none — so
+    /// the tempting answer ("nobody reports enforcement, therefore nothing
+    /// enforces") is exactly the unmeasured claim this feature exists to stop.
+    #[test]
+    fn a_static_only_fleet_is_unknown_not_none() {
+        let r = assemble_fleet_report("0.1.0+aaaaaaa", &[], &ring(&[("pinned", 2)]));
+        assert_eq!(r["write_ceiling"]["enforced_by"], "unknown");
+        assert_eq!(r["write_ceiling"]["registered_rows"], 0);
     }
 
     fn ring(entries: &[(&str, usize)]) -> Vec<(String, usize)> {

@@ -5078,6 +5078,9 @@ mod detector_metric_tests {
             supports_sealing: true,
             last_seen_at: chrono::Utc::now(),
             last_liveness_at: None,
+            // Build-skew accounting is indifferent to the write ceiling.
+            write_ceiling_enforced: None,
+            write_ceiling_strict_egress: None,
         }
     }
 
@@ -5373,6 +5376,8 @@ mod detector_metric_tests {
             supports_sealing: false,
             last_seen_at: chrono::Utc::now(),
             last_liveness_at: Some(chrono::Utc::now()),
+            write_ceiling_enforced: None,
+            write_ceiling_strict_egress: None,
         }];
         // The hazard, still live if the clamp is ever removed.
         let raw = std::panic::catch_unwind(|| {
@@ -5669,6 +5674,8 @@ mod worker_liveness_reaper_metric_tests {
             last_seen_at: chrono::Utc::now(),
             last_liveness_at: pinged_hours_ago
                 .map(|h| chrono::Utc::now() - chrono::Duration::hours(h)),
+            write_ceiling_enforced: None,
+            write_ceiling_strict_egress: None,
         }
     }
 

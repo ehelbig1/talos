@@ -49,6 +49,38 @@ use sqlx::PgPool;
 /// A genuine rotation deactivates the old key, so steady state is 1–2.
 pub const MAX_ACTIVE_KEYS_PER_WORKER: i64 = 4;
 
+/// What a registrant SELF-REPORTS about its own write-ceiling ENFORCEMENT
+/// POSTURE — the worker-only env flags `TALOS_WRITE_CEILING_ENFORCED` and
+/// `TALOS_WRITE_CEILING_STRICT_EGRESS`, as that worker read them at ITS boot.
+///
+/// A struct rather than two positional `Option<bool>` parameters ON PURPOSE:
+/// the two bits mean different things (mutation refusal vs. read-side egress
+/// narrowing), they thread through five registration signatures, and a
+/// positional swap would compile silently and mis-report both. Named fields
+/// make a swap visible at every call site.
+///
+/// `None` on either field means UNREPORTED, never `false`. Two callers
+/// legitimately report nothing: a pre-feature worker, and the operator CLI
+/// (`register-worker-identity`), which knows nothing about a pod's env.
+/// [`Default`] is therefore "unreported" — the correct value for any caller
+/// that has no answer.
+///
+/// DIAGNOSTIC ONLY, and deliberately NOT covered by the registration
+/// proof-of-possession, exactly like `build_version`. A worker may report
+/// anything; that is acceptable because nothing branches on it. Note the
+/// residual lie runs in the harmless direction — a worker can only report
+/// enforcement it is not performing, which makes an operator MORE cautious,
+/// never more permissive, and the real boundary is that worker's own gate,
+/// unreachable from here. Full argument in the column comments of
+/// `migrations/20260904220000_worker_identities_write_ceiling_enforcement.sql`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WriteCeilingReport {
+    /// `TALOS_WRITE_CEILING_ENFORCED` as the worker read it, or `None`.
+    pub enforced: Option<bool>,
+    /// `TALOS_WRITE_CEILING_STRICT_EGRESS` as the worker read it, or `None`.
+    pub strict_egress: Option<bool>,
+}
+
 /// One `(worker_id, public_key)` pair from the active registry — the minimal
 /// shape the controller's refresh task merges into the verifying-key snapshot.
 #[derive(Debug, Clone)]
@@ -101,6 +133,251 @@ pub struct WorkerBuildRow {
     /// because a build-skew detector that goes quiet on unknown liveness would
     /// be silenced by exactly the fleet it exists to watch.
     pub last_liveness_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// `TALOS_WRITE_CEILING_ENFORCED` as this worker reported it at
+    /// registration. `None` = UNREPORTED (a pre-feature worker, or the
+    /// operator CLI) and must never be summarised as `false` — see
+    /// [`WriteCeilingReport`] and [`summarize_write_ceiling_enforcement`].
+    pub write_ceiling_enforced: Option<bool>,
+    /// `TALOS_WRITE_CEILING_STRICT_EGRESS` as reported. `None` = unreported.
+    /// Subordinate to `write_ceiling_enforced` (inert while that is not
+    /// `Some(true)`), so an "effective" count must require both.
+    pub write_ceiling_strict_egress: Option<bool>,
+}
+
+/// How much of the registered fleet ENFORCES the per-actor write ceiling.
+///
+/// # Why this exists at all
+///
+/// `actors.max_write_ceiling` is set on the controller and travels HMAC-bound
+/// on every job, but it is enforced only inside the worker process, gated on a
+/// worker-only env flag that is **default off**. Before this type, no
+/// controller surface could tell an enforcing deployment from a decorative
+/// one: `set_actor_write_ceiling` printed the same sentence either way.
+///
+/// # The states, and why there are four (F6)
+///
+/// The dangerous case is `Some` — a MIXED fleet — because nothing routes jobs
+/// by enforcement posture, so a job may land on the worker that does not
+/// enforce. It must not be reported as "enforced".
+///
+/// Unknown is a first-class answer, not a rounding of "no". A row reports
+/// `None` when it was written by a pre-feature worker or by the operator CLI,
+/// and rolling that into `not_enforcing` would state as fact something nobody
+/// measured — the exact defect this whole type exists to remove, one level
+/// down. Absence of evidence is not evidence of absence (the `last_liveness_at`
+/// rule, restated).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FleetWriteCeilingState {
+    /// Every registered worker reported enforcement on.
+    All,
+    /// At least one reported on AND at least one did not (off, or unreported).
+    /// A job may land on either.
+    Some,
+    /// Every registered worker reported, and every one of them reported off.
+    /// The ceiling is definitively advisory on this deployment.
+    None,
+    /// Nothing registered at all, or nobody reported on and at least one row
+    /// said nothing. Not a verdict — a refusal to give one.
+    Unknown,
+}
+
+impl FleetWriteCeilingState {
+    /// Stable wire string. `get_platform_info`, `set_actor_write_ceiling`,
+    /// `get_actor_summary`, `get_my_capability_ceiling` and `security_audit`
+    /// all render THIS, so they cannot disagree about the same fleet.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Some => "some",
+            Self::None => "none",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// Whether a `readonly` ceiling should be described to the operator as
+    /// ADVISORY. True for everything except [`Self::All`]: with `Some` a job
+    /// may land on a non-enforcing worker, and with `Unknown` we cannot say it
+    /// will not — both must read as "do not rely on this".
+    #[must_use]
+    pub fn ceiling_is_advisory(self) -> bool {
+        self != Self::All
+    }
+}
+
+/// The fleet's write-ceiling enforcement posture, with the counts it was
+/// derived from. Counts are always carried so an operator can see the
+/// composition rather than trusting a one-word verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteCeilingFleetSummary {
+    /// Registered (`active`) rows considered. NOT distinct workers: a worker
+    /// mid-key-rotation holds two rows, and collapsing them would hide a fleet
+    /// where the two disagree.
+    pub registered_rows: usize,
+    /// Rows reporting `write_ceiling_enforced = true`.
+    pub enforcing: usize,
+    /// Rows reporting `false`.
+    pub not_enforcing: usize,
+    /// Rows reporting nothing (NULL).
+    pub unreported: usize,
+    /// Rows where strict egress is EFFECTIVE — both bits true. Strict egress
+    /// is inert while enforcement is off, so counting it alone would advertise
+    /// a control that cannot fire.
+    pub strict_egress_effective: usize,
+    pub state: FleetWriteCeilingState,
+}
+
+impl WriteCeilingFleetSummary {
+    /// One sentence an operator can act on, derived from the state. Rendered
+    /// by every consuming surface so they cannot word the same fleet
+    /// differently.
+    #[must_use]
+    pub fn note(&self) -> String {
+        match self.state {
+            FleetWriteCeilingState::All => format!(
+                "Enforced by all {} registered worker row(s): a 'readonly' ceiling refuses \
+                 data-mutating host ops.",
+                self.registered_rows
+            ),
+            FleetWriteCeilingState::Some => format!(
+                "ADVISORY IN PART: only {} of {} registered worker row(s) report enforcement. \
+                 Jobs are not routed by enforcement posture, so a 'readonly' actor's job may \
+                 land on a worker that does not enforce.",
+                self.enforcing, self.registered_rows
+            ),
+            FleetWriteCeilingState::None => format!(
+                "ADVISORY: all {} registered worker row(s) report TALOS_WRITE_CEILING_ENFORCED \
+                 off, so a 'readonly' ceiling is recorded but not enforced anywhere.",
+                self.registered_rows
+            ),
+            FleetWriteCeilingState::Unknown if self.registered_rows == 0 => {
+                "UNKNOWN: no worker has registered an identity, so nothing has reported whether \
+                 the write ceiling is enforced. A 'readonly' ceiling may be advisory."
+                    .to_string()
+            }
+            FleetWriteCeilingState::Unknown => format!(
+                "UNKNOWN: no registered worker reports enforcement and {} of {} row(s) reported \
+                 nothing (a pre-upgrade worker, or the operator CLI). Unreported is not the same \
+                 as off — a 'readonly' ceiling may be advisory.",
+                self.unreported, self.registered_rows
+            ),
+        }
+    }
+
+    /// The shared JSON rendering. ONE implementation, for the same reason
+    /// [`build_suffix`] lives here: five surfaces consume it, and two copies
+    /// would drift into disagreeing about one fleet.
+    #[must_use]
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "enforced_by": self.state.as_str(),
+            "registered_rows": self.registered_rows,
+            "enforcing": self.enforcing,
+            "not_enforcing": self.not_enforcing,
+            "unreported": self.unreported,
+            "strict_egress_effective": self.strict_egress_effective,
+            "note": self.note(),
+            "source": "worker self-report at registration — UNSIGNED and diagnostic only \
+                       (like build_version); it is not an authorization input. Covers \
+                       REGISTERED rows only: statically-keyed workers \
+                       (TALOS_WORKER_PUBLIC_KEYS) never register and so report nothing.",
+        })
+    }
+}
+
+/// Render the fleet's write-ceiling posture for an operator surface, INCLUDING
+/// the case where the registry could not be read.
+///
+/// ONE implementation because there are FOUR consumers
+/// (`set_actor_write_ceiling`, `get_actor_summary`,
+/// `get_my_capability_ceiling`, `security_audit`'s sibling check), and the
+/// `None` arm is the one most likely to drift: a surface that quietly renders a
+/// failed read as "not enforced" would state as fact something nobody measured
+/// — which is the defect this whole feature exists to remove. Four private
+/// copies of that arm is how it comes back (check 71's lesson, in miniature).
+///
+/// `None` means the read FAILED, never "no workers": an empty fleet is
+/// `Some(summary)` with `registered_rows: 0`, which the summariser already
+/// reports as `unknown`.
+#[must_use]
+pub fn render_write_ceiling_enforcement(
+    fleet: Option<WriteCeilingFleetSummary>,
+) -> serde_json::Value {
+    match fleet {
+        Some(f) => f.to_json(),
+        None => serde_json::json!({
+            "enforced_by": "unknown",
+            "note": "NOT VERIFIED: the worker-identity registry could not be read, so this run \
+                     did not establish whether any worker enforces the write ceiling. This is a \
+                     database problem, not a finding about the ceiling.",
+        }),
+    }
+}
+
+/// Whether a `readonly` ceiling should be described to the operator as
+/// ADVISORY, including the unreadable-registry case.
+///
+/// `None` (the read failed) is advisory: "we could not establish that it will
+/// be enforced" must reach an operator the same way "it will not be" does.
+/// Anything short of a unanimously-enforcing fleet is advisory — see
+/// [`FleetWriteCeilingState::ceiling_is_advisory`].
+#[must_use]
+pub fn write_ceiling_is_advisory(fleet: Option<&WriteCeilingFleetSummary>) -> bool {
+    fleet.is_none_or(|f| f.state.ceiling_is_advisory())
+}
+
+/// Summarise the fleet's write-ceiling enforcement from the registered rows.
+///
+/// Pure — no clock, no DB — so every branch of [`FleetWriteCeilingState`] is
+/// unit-testable without Postgres.
+///
+/// Branch order is load-bearing: `enforcing == registered_rows` must be tested
+/// only for a non-empty fleet (`0 == 0` would otherwise report an empty fleet
+/// as fully enforcing, which is the worst possible wrong answer here), and the
+/// `None` arm requires `unreported == 0` so a fleet of "off + unreported"
+/// degrades to `Unknown` rather than claiming every worker was measured.
+#[must_use]
+pub fn summarize_write_ceiling_enforcement(rows: &[WorkerBuildRow]) -> WriteCeilingFleetSummary {
+    let registered_rows = rows.len();
+    let enforcing = rows
+        .iter()
+        .filter(|r| r.write_ceiling_enforced == Some(true))
+        .count();
+    let not_enforcing = rows
+        .iter()
+        .filter(|r| r.write_ceiling_enforced == Some(false))
+        .count();
+    let unreported = rows
+        .iter()
+        .filter(|r| r.write_ceiling_enforced.is_none())
+        .count();
+    let strict_egress_effective = rows
+        .iter()
+        .filter(|r| {
+            r.write_ceiling_enforced == Some(true) && r.write_ceiling_strict_egress == Some(true)
+        })
+        .count();
+
+    let state = if registered_rows == 0 {
+        FleetWriteCeilingState::Unknown
+    } else if enforcing == registered_rows {
+        FleetWriteCeilingState::All
+    } else if enforcing > 0 {
+        FleetWriteCeilingState::Some
+    } else if unreported == 0 {
+        FleetWriteCeilingState::None
+    } else {
+        FleetWriteCeilingState::Unknown
+    };
+
+    WriteCeilingFleetSummary {
+        registered_rows,
+        enforcing,
+        not_enforcing,
+        unreported,
+        strict_egress_effective,
+        state,
+    }
 }
 
 /// The `+sha[-dirty]` half of a composite build string (`{pkg}+{sha}[-dirty]`),
@@ -264,10 +541,12 @@ async fn register_in_tx(
     public_key: &[u8; 32],
     supports_sealing: bool,
     build_version: Option<&str>,
+    write_ceiling: WriteCeilingReport,
 ) -> Result<RegisterOutcome> {
     let res = sqlx::query!(
-        "INSERT INTO worker_identities (worker_id, public_key, supports_sealing, build_version)
-         SELECT $1, $2, $3, $5
+        "INSERT INTO worker_identities (worker_id, public_key, supports_sealing, build_version,
+                                        write_ceiling_enforced, write_ceiling_strict_egress)
+         SELECT $1, $2, $3, $5, $6, $7
          WHERE (SELECT count(*) FROM worker_identities
                 WHERE worker_id = $1 AND active) < $4
             OR EXISTS (SELECT 1 FROM worker_identities
@@ -276,12 +555,16 @@ async fn register_in_tx(
             SET active = true,
                 supports_sealing = EXCLUDED.supports_sealing,
                 build_version = EXCLUDED.build_version,
+                write_ceiling_enforced = EXCLUDED.write_ceiling_enforced,
+                write_ceiling_strict_egress = EXCLUDED.write_ceiling_strict_egress,
                 last_seen_at = now()",
         worker_id,
         &public_key[..],
         supports_sealing,
         MAX_ACTIVE_KEYS_PER_WORKER,
         build_version,
+        write_ceiling.enforced,
+        write_ceiling.strict_egress,
     )
     .execute(&mut **tx)
     .await
@@ -305,6 +588,7 @@ async fn register_tofu_in_tx(
     public_key: &[u8; 32],
     supports_sealing: bool,
     build_version: Option<&str>,
+    write_ceiling: WriteCeilingReport,
 ) -> Result<TofuOutcome> {
     // Exact-row lookup: does this (worker_id, key) pair already exist, and is
     // it live? Compile-checked query! — `active` is a NOT NULL column so the
@@ -324,12 +608,16 @@ async fn register_tofu_in_tx(
         Some(true) => {
             sqlx::query!(
                 "UPDATE worker_identities
-                 SET supports_sealing = $3, build_version = $4, last_seen_at = now()
+                 SET supports_sealing = $3, build_version = $4,
+                     write_ceiling_enforced = $5, write_ceiling_strict_egress = $6,
+                     last_seen_at = now()
                  WHERE worker_id = $1 AND public_key = $2",
                 worker_id,
                 &public_key[..],
                 supports_sealing,
                 build_version,
+                write_ceiling.enforced,
+                write_ceiling.strict_egress,
             )
             .execute(&mut **tx)
             .await
@@ -353,12 +641,15 @@ async fn register_tofu_in_tx(
             if history == 0 {
                 sqlx::query!(
                     "INSERT INTO worker_identities
-                     (worker_id, public_key, supports_sealing, build_version)
-                     VALUES ($1, $2, $3, $4)",
+                     (worker_id, public_key, supports_sealing, build_version,
+                      write_ceiling_enforced, write_ceiling_strict_egress)
+                     VALUES ($1, $2, $3, $4, $5, $6)",
                     worker_id,
                     &public_key[..],
                     supports_sealing,
                     build_version,
+                    write_ceiling.enforced,
+                    write_ceiling.strict_egress,
                 )
                 .execute(&mut **tx)
                 .await
@@ -392,12 +683,19 @@ impl WorkerIdentityRepository {
     /// `build_version`: the registrant's self-reported build string, `None`
     /// from the operator CLI (which has no visibility into the pod's build).
     /// Diagnostic only — never an authorization input.
+    ///
+    /// `write_ceiling`: the registrant's self-reported enforcement posture
+    /// ([`WriteCeilingReport`]). Same write rule and same standing as
+    /// `build_version` — written verbatim including `None` (unreported), and
+    /// never an authorization input. `WriteCeilingReport::default()` is the
+    /// right value for the operator CLI, which cannot know a pod's env.
     pub async fn register(
         &self,
         worker_id: &str,
         public_key: &[u8; 32],
         supports_sealing: bool,
         build_version: Option<&str>,
+        write_ceiling: WriteCeilingReport,
     ) -> Result<RegisterOutcome> {
         let mut tx = self.db_pool.begin().await.context("begin register tx")?;
         advisory_lock_worker(&mut tx, worker_id).await?;
@@ -407,6 +705,7 @@ impl WorkerIdentityRepository {
             public_key,
             supports_sealing,
             build_version,
+            write_ceiling,
         )
         .await?;
         tx.commit().await.context("commit register tx")?;
@@ -431,15 +730,19 @@ impl WorkerIdentityRepository {
     /// Same advisory-lock serialisation as [`Self::register`], so a concurrent
     /// first-use race on one `worker_id` admits exactly one key.
     ///
-    /// `build_version`: see [`Self::register`] — diagnostic only, written
-    /// verbatim (including `None`) on both the first-use insert and the
-    /// idempotent refresh, so a redeployed worker's new build shows up.
+    /// `build_version` / `write_ceiling`: see [`Self::register`] — diagnostic
+    /// only, written verbatim (including `None`) on both the first-use insert
+    /// and the idempotent refresh, so a redeployed worker's new build AND its
+    /// new enforcement posture both show up. Writing them unconditionally is
+    /// the point: preserving a previous value across a silent re-registration
+    /// would leave a stale claim standing as if it were current.
     pub async fn register_tofu(
         &self,
         worker_id: &str,
         public_key: &[u8; 32],
         supports_sealing: bool,
         build_version: Option<&str>,
+        write_ceiling: WriteCeilingReport,
     ) -> Result<TofuOutcome> {
         let mut tx = self.db_pool.begin().await.context("begin tofu tx")?;
         advisory_lock_worker(&mut tx, worker_id).await?;
@@ -449,6 +752,7 @@ impl WorkerIdentityRepository {
             public_key,
             supports_sealing,
             build_version,
+            write_ceiling,
         )
         .await?;
         tx.commit().await.context("commit tofu tx")?;
@@ -480,8 +784,9 @@ impl WorkerIdentityRepository {
     /// is never stored or compared in SQL (lint check 41 discipline; hashing
     /// happens at the endpoint, so this layer never sees the credential).
     ///
-    /// `build_version`: see [`Self::register`] — diagnostic only, persisted on
-    /// whichever registration arm the token's binding selects.
+    /// `build_version` / `write_ceiling`: see [`Self::register`] — diagnostic
+    /// only, persisted on whichever registration arm the token's binding
+    /// selects.
     pub async fn register_with_provisioning_token(
         &self,
         token_hash: &str,
@@ -490,6 +795,7 @@ impl WorkerIdentityRepository {
         supports_sealing: bool,
         require_bound: bool,
         build_version: Option<&str>,
+        write_ceiling: WriteCeilingReport,
     ) -> Result<TokenRegisterOutcome> {
         let mut tx = self.db_pool.begin().await.context("begin token tx")?;
         advisory_lock_worker(&mut tx, worker_id).await?;
@@ -530,6 +836,7 @@ impl WorkerIdentityRepository {
                 public_key,
                 supports_sealing,
                 build_version,
+                write_ceiling,
             )
             .await?
             {
@@ -543,6 +850,7 @@ impl WorkerIdentityRepository {
                 public_key,
                 supports_sealing,
                 build_version,
+                write_ceiling,
             )
             .await?
             {
@@ -894,13 +1202,17 @@ impl WorkerIdentityRepository {
     /// re-run report could disagree with itself on identical data).
     pub async fn list_active_builds(&self) -> Result<Vec<WorkerBuildRow>> {
         // `query_as!` compile-checks name + SQL type + nullability against the
-        // struct: `build_version` is the schema's only nullable column here, so
-        // a future NOT NULL / rename drift is a build error rather than a
-        // silent default (checks 52/55 — no `try_get(...).unwrap_or(...)`
-        // anywhere on this path).
+        // struct, so a future NOT NULL / rename drift on ANY of these columns
+        // is a build error rather than a silent default (checks 52/55 — no
+        // `try_get(...).unwrap_or(...)` anywhere on this path). The nullable
+        // ones are `build_version`, `last_liveness_at` and the two
+        // write-ceiling bits, and their NULL means UNREPORTED in every case —
+        // `summarize_write_ceiling_enforcement` is what keeps that distinct
+        // from `false`.
         let rows = sqlx::query_as!(
             WorkerBuildRow,
-            "SELECT worker_id, build_version, supports_sealing, last_seen_at, last_liveness_at
+            "SELECT worker_id, build_version, supports_sealing, last_seen_at, last_liveness_at,
+                    write_ceiling_enforced, write_ceiling_strict_egress
              FROM worker_identities
              WHERE active
              ORDER BY worker_id, public_key
@@ -929,6 +1241,221 @@ fn decode_pubkey_bytes(bytes: &[u8], worker_id: &str) -> Result<[u8; 32]> {
 
 /// Build-identity comparison — pure, so these run everywhere (unlike the DB
 /// tests below, which skip without `DATABASE_URL`).
+/// The fleet write-ceiling state machine — pure, so every branch runs
+/// everywhere (unlike the DB tests below, which skip without `DATABASE_URL`).
+#[cfg(test)]
+mod write_ceiling_summary_tests {
+    use super::{summarize_write_ceiling_enforcement, FleetWriteCeilingState as S, WorkerBuildRow};
+
+    fn row(id: &str, enforced: Option<bool>, strict: Option<bool>) -> WorkerBuildRow {
+        WorkerBuildRow {
+            worker_id: id.to_string(),
+            build_version: Some("0.1.0+aaaaaaa".to_string()),
+            supports_sealing: false,
+            last_seen_at: chrono::Utc::now(),
+            last_liveness_at: None,
+            write_ceiling_enforced: enforced,
+            write_ceiling_strict_egress: strict,
+        }
+    }
+
+    /// An EMPTY fleet is `Unknown`, never `All`.
+    ///
+    /// This is the single most dangerous branch and the reason the emptiness
+    /// test comes FIRST in the function: `enforcing == registered_rows` is
+    /// vacuously `0 == 0` for an empty fleet, so the natural ordering reports a
+    /// deployment with no workers at all as fully enforcing — the worst
+    /// available wrong answer, since it is the state in which nothing is
+    /// enforced by construction.
+    #[test]
+    fn an_empty_fleet_is_unknown_not_all() {
+        let s = summarize_write_ceiling_enforcement(&[]);
+        assert_eq!(s.state, S::Unknown);
+        assert_eq!(s.registered_rows, 0);
+        assert!(s.state.ceiling_is_advisory());
+        assert!(s.note().contains("no worker has registered"));
+    }
+
+    #[test]
+    fn every_worker_enforcing_is_all_and_not_advisory() {
+        let s = summarize_write_ceiling_enforcement(&[
+            row("a", Some(true), Some(false)),
+            row("b", Some(true), Some(true)),
+        ]);
+        assert_eq!(s.state, S::All);
+        assert_eq!(s.enforcing, 2);
+        // Only the both-true row counts as effective strict egress.
+        assert_eq!(s.strict_egress_effective, 1);
+        assert!(!s.state.ceiling_is_advisory());
+    }
+
+    /// The dangerous case. Nothing routes jobs by enforcement posture, so a
+    /// readonly actor's job may land on the worker that does not enforce —
+    /// which is why this must not read as enforced.
+    #[test]
+    fn a_mixed_fleet_is_some_and_is_advisory() {
+        let s = summarize_write_ceiling_enforcement(&[
+            row("a", Some(true), Some(true)),
+            row("b", Some(false), Some(false)),
+        ]);
+        assert_eq!(s.state, S::Some);
+        assert!(s.state.ceiling_is_advisory());
+        assert!(s.note().contains("ADVISORY IN PART"));
+    }
+
+    /// A fleet that is enforcing + UNREPORTED is still `Some`: at least one
+    /// worker enforces and at least one might not.
+    #[test]
+    fn enforcing_plus_unreported_is_some() {
+        let s = summarize_write_ceiling_enforcement(&[
+            row("a", Some(true), Some(true)),
+            row("b", None, None),
+        ]);
+        assert_eq!(s.state, S::Some);
+        assert_eq!(s.unreported, 1);
+    }
+
+    #[test]
+    fn all_reported_off_is_none_and_definitive() {
+        let s = summarize_write_ceiling_enforcement(&[
+            row("a", Some(false), None),
+            row("b", Some(false), Some(true)),
+        ]);
+        assert_eq!(s.state, S::None);
+        assert_eq!(s.not_enforcing, 2);
+        // Strict egress is inert while enforcement is off, so a `Some(true)`
+        // strict bit on a non-enforcing worker must NOT be counted effective.
+        assert_eq!(s.strict_egress_effective, 0);
+        assert!(s.note().contains("ADVISORY"));
+    }
+
+    /// UNREPORTED must never be folded into `not_enforcing`.
+    ///
+    /// A row reports nothing when it was written by a pre-feature worker or by
+    /// the operator CLI. Rolling that into "off" would state as fact something
+    /// nobody measured — the exact defect this whole type exists to remove,
+    /// one level down. So a fleet of off + unreported degrades to `Unknown`
+    /// rather than claiming every worker was measured.
+    #[test]
+    fn off_plus_unreported_is_unknown_not_none() {
+        let s = summarize_write_ceiling_enforcement(&[
+            row("a", Some(false), None),
+            row("b", None, None),
+        ]);
+        assert_eq!(s.state, S::Unknown);
+        assert_eq!(s.not_enforcing, 1);
+        assert_eq!(s.unreported, 1);
+        assert!(s.note().contains("Unreported is not the same as off"));
+    }
+
+    #[test]
+    fn all_unreported_is_unknown() {
+        let s = summarize_write_ceiling_enforcement(&[row("a", None, None), row("b", None, None)]);
+        assert_eq!(s.state, S::Unknown);
+        assert!(s.state.ceiling_is_advisory());
+    }
+
+    /// Only `All` is non-advisory. Stated as its own test because the whole
+    /// disclosure hangs on it: "we cannot say it will be enforced" must read
+    /// the same to an operator as "it will not be".
+    #[test]
+    fn only_all_is_non_advisory() {
+        assert!(!S::All.ceiling_is_advisory());
+        for st in [S::Some, S::None, S::Unknown] {
+            assert!(st.ceiling_is_advisory(), "{} must be advisory", st.as_str());
+        }
+    }
+
+    /// The `None` (registry unreadable) arm of the shared renderer must NOT
+    /// look like "nothing enforces".
+    ///
+    /// This arm is the one most likely to drift back into a private copy per
+    /// surface, and the wrong version of it is silent: a failed read rendered
+    /// as `enforced_by: "none"` states as fact something nobody measured.
+    /// It must be `unknown`, must blame the database, and must be advisory.
+    #[test]
+    fn an_unreadable_registry_renders_unknown_and_advisory() {
+        let j = super::render_write_ceiling_enforcement(None);
+        assert_eq!(j["enforced_by"], "unknown");
+        let note = j["note"].as_str().unwrap();
+        assert!(note.contains("NOT VERIFIED"));
+        assert!(
+            note.contains("database problem"),
+            "must not read as a finding about the ceiling"
+        );
+        assert!(super::write_ceiling_is_advisory(None));
+    }
+
+    /// An EMPTY fleet is not the same input as an UNREADABLE one, and both are
+    /// advisory — but only one of them is a database problem. Keeping them
+    /// distinct is why `read_write_ceiling_fleet` returns `Option` rather than
+    /// an empty summary on error.
+    #[test]
+    fn empty_and_unreadable_are_different_inputs() {
+        let empty = summarize_write_ceiling_enforcement(&[]);
+        let rendered = super::render_write_ceiling_enforcement(Some(empty));
+        assert_eq!(rendered["enforced_by"], "unknown");
+        assert_eq!(rendered["registered_rows"], 0);
+        assert!(
+            !rendered["note"].as_str().unwrap().contains("database"),
+            "an empty fleet is not a database failure"
+        );
+        assert!(super::write_ceiling_is_advisory(Some(&empty)));
+    }
+
+    /// Only a unanimously-enforcing fleet is non-advisory through the shared
+    /// helper — the same rule as the state enum, asserted at the seam the
+    /// handlers actually call.
+    #[test]
+    fn advisory_helper_matches_the_state_rule() {
+        let all = summarize_write_ceiling_enforcement(&[row("a", Some(true), None)]);
+        assert!(!super::write_ceiling_is_advisory(Some(&all)));
+        let mixed = summarize_write_ceiling_enforcement(&[
+            row("a", Some(true), None),
+            row("b", Some(false), None),
+        ]);
+        assert!(super::write_ceiling_is_advisory(Some(&mixed)));
+    }
+
+    /// The counts partition the rows exactly — no row is dropped or
+    /// double-counted, whatever the mix.
+    #[test]
+    fn counts_partition_the_rows() {
+        let rows = [
+            row("a", Some(true), Some(true)),
+            row("b", Some(false), None),
+            row("c", None, Some(true)),
+            row("d", Some(true), None),
+        ];
+        let s = summarize_write_ceiling_enforcement(&rows);
+        assert_eq!(s.registered_rows, 4);
+        assert_eq!(
+            s.enforcing + s.not_enforcing + s.unreported,
+            s.registered_rows
+        );
+        assert_eq!((s.enforcing, s.not_enforcing, s.unreported), (2, 1, 1));
+        assert_eq!(s.strict_egress_effective, 1);
+    }
+
+    /// The JSON rendering carries the counts AND says where the value came
+    /// from — a reader must be able to tell this is a worker self-report, not
+    /// something the controller verified.
+    #[test]
+    fn json_carries_counts_and_names_its_source() {
+        let j = summarize_write_ceiling_enforcement(&[row("a", Some(true), Some(true))]).to_json();
+        assert_eq!(j["enforced_by"], "all");
+        assert_eq!(j["registered_rows"], 1);
+        assert_eq!(j["enforcing"], 1);
+        assert_eq!(j["strict_egress_effective"], 1);
+        let src = j["source"].as_str().unwrap();
+        assert!(src.contains("UNSIGNED"), "must disclose it is unsigned");
+        assert!(
+            src.contains("not an authorization input"),
+            "must disclose it gates nothing"
+        );
+    }
+}
+
 #[cfg(test)]
 mod build_identity_tests {
     use super::{build_is_verifiable, build_suffix, builds_match};
@@ -1073,12 +1600,16 @@ mod tests {
         cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
 
         assert_eq!(
-            repo.register(wid, &key(1), false, None).await.unwrap(),
+            repo.register(wid, &key(1), false, None, WriteCeilingReport::default())
+                .await
+                .unwrap(),
             RegisterOutcome::Registered
         );
         // Re-register the SAME key: idempotent, still one active key.
         assert_eq!(
-            repo.register(wid, &key(1), true, None).await.unwrap(),
+            repo.register(wid, &key(1), true, None, WriteCeilingReport::default())
+                .await
+                .unwrap(),
             RegisterOutcome::Registered
         );
 
@@ -1122,18 +1653,30 @@ mod tests {
 
         // TOFU first use carries the report through.
         assert_eq!(
-            repo.register_tofu(wid, &key(1), false, Some("0.1.0+aaaaaaa"))
-                .await
-                .unwrap(),
+            repo.register_tofu(
+                wid,
+                &key(1),
+                false,
+                Some("0.1.0+aaaaaaa"),
+                WriteCeilingReport::default()
+            )
+            .await
+            .unwrap(),
             TofuOutcome::Registered
         );
         assert_eq!(build_of(&repo).await.as_deref(), Some("0.1.0+aaaaaaa"));
 
         // Redeploy: same key, new build → the refresh arm updates it.
         assert_eq!(
-            repo.register_tofu(wid, &key(1), false, Some("0.1.0+bbbbbbb-dirty"))
-                .await
-                .unwrap(),
+            repo.register_tofu(
+                wid,
+                &key(1),
+                false,
+                Some("0.1.0+bbbbbbb-dirty"),
+                WriteCeilingReport::default()
+            )
+            .await
+            .unwrap(),
             TofuOutcome::Registered
         );
         assert_eq!(
@@ -1144,16 +1687,24 @@ mod tests {
         // A registrant that reports nothing (pre-handshake worker, or the
         // operator CLI) clears the column — "unreported", not "still on b".
         assert_eq!(
-            repo.register_tofu(wid, &key(1), false, None).await.unwrap(),
+            repo.register_tofu(wid, &key(1), false, None, WriteCeilingReport::default())
+                .await
+                .unwrap(),
             TofuOutcome::Registered
         );
         assert_eq!(build_of(&repo).await, None);
 
         // Operator-grade insert arm carries it too.
         assert_eq!(
-            repo.register(wid, &key(2), false, Some("9.9.9+ccccccc"))
-                .await
-                .unwrap(),
+            repo.register(
+                wid,
+                &key(2),
+                false,
+                Some("9.9.9+ccccccc"),
+                WriteCeilingReport::default()
+            )
+            .await
+            .unwrap(),
             RegisterOutcome::Registered
         );
         let builds: Vec<_> = repo
@@ -1206,9 +1757,15 @@ mod tests {
         cleanup_worker_rows(&repo.db_pool, &[wid, capped], &[&th]).await;
 
         assert_eq!(
-            repo.register_tofu(wid, &key(1), false, Some("0.1.0+goodaaa"))
-                .await
-                .unwrap(),
+            repo.register_tofu(
+                wid,
+                &key(1),
+                false,
+                Some("0.1.0+goodaaa"),
+                WriteCeilingReport::default()
+            )
+            .await
+            .unwrap(),
             TofuOutcome::Registered
         );
         let baseline = builds_for(&repo, wid).await;
@@ -1217,9 +1774,15 @@ mod tests {
         // A DIFFERENT key for a TOFU-bound worker_id: 409, and the attacker's
         // build string must not land anywhere.
         assert_eq!(
-            repo.register_tofu(wid, &key(2), false, Some("9.9.9+evilbbb"))
-                .await
-                .unwrap(),
+            repo.register_tofu(
+                wid,
+                &key(2),
+                false,
+                Some("9.9.9+evilbbb"),
+                WriteCeilingReport::default()
+            )
+            .await
+            .unwrap(),
             TofuOutcome::IdentityConflict
         );
         assert_eq!(builds_for(&repo, wid).await, baseline, "conflict wrote");
@@ -1233,7 +1796,8 @@ mod tests {
                 &key(2),
                 false,
                 true,
-                Some("9.9.9+evilccc")
+                Some("9.9.9+evilccc"),
+                WriteCeilingReport::default()
             )
             .await
             .unwrap(),
@@ -1244,17 +1808,29 @@ mod tests {
         // --- Cap-reached, on its own worker so the assertions stay exact.
         for i in 0..MAX_ACTIVE_KEYS_PER_WORKER as u8 {
             assert_eq!(
-                repo.register(capped, &key(i), false, Some(&format!("0.1.0+ok{i:05}")))
-                    .await
-                    .unwrap(),
+                repo.register(
+                    capped,
+                    &key(i),
+                    false,
+                    Some(&format!("0.1.0+ok{i:05}")),
+                    WriteCeilingReport::default()
+                )
+                .await
+                .unwrap(),
                 RegisterOutcome::Registered
             );
         }
         let at_cap = builds_for(&repo, capped).await;
         assert_eq!(
-            repo.register(capped, &key(200), false, Some("9.9.9+evilddd"))
-                .await
-                .unwrap(),
+            repo.register(
+                capped,
+                &key(200),
+                false,
+                Some("9.9.9+evilddd"),
+                WriteCeilingReport::default()
+            )
+            .await
+            .unwrap(),
             RegisterOutcome::CapReached
         );
         assert_eq!(builds_for(&repo, capped).await, at_cap, "cap arm wrote");
@@ -1277,12 +1853,16 @@ mod tests {
 
         // First use: no history → key(1) becomes the trusted identity.
         assert_eq!(
-            repo.register_tofu(wid, &key(1), false, None).await.unwrap(),
+            repo.register_tofu(wid, &key(1), false, None, WriteCeilingReport::default())
+                .await
+                .unwrap(),
             TofuOutcome::Registered
         );
         // Idempotent same-key refresh, updating the capability bit.
         assert_eq!(
-            repo.register_tofu(wid, &key(1), true, None).await.unwrap(),
+            repo.register_tofu(wid, &key(1), true, None, WriteCeilingReport::default())
+                .await
+                .unwrap(),
             TofuOutcome::Registered
         );
         assert!(repo.worker_supports_sealing(wid).await.unwrap());
@@ -1290,7 +1870,9 @@ mod tests {
         // A DIFFERENT key for the same worker_id is refused (the gap this
         // closes: shared-token impersonation).
         assert_eq!(
-            repo.register_tofu(wid, &key(2), false, None).await.unwrap(),
+            repo.register_tofu(wid, &key(2), false, None, WriteCeilingReport::default())
+                .await
+                .unwrap(),
             TofuOutcome::IdentityConflict
         );
         // ...and the refusal wrote nothing.
@@ -1317,7 +1899,9 @@ mod tests {
         cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
 
         assert_eq!(
-            repo.register_tofu(wid, &key(1), false, None).await.unwrap(),
+            repo.register_tofu(wid, &key(1), false, None, WriteCeilingReport::default())
+                .await
+                .unwrap(),
             TofuOutcome::Registered
         );
         // Operator revokes the key (compromise / decommission).
@@ -1325,23 +1909,31 @@ mod tests {
 
         // The revoked key cannot re-activate itself over the network path.
         assert_eq!(
-            repo.register_tofu(wid, &key(1), false, None).await.unwrap(),
+            repo.register_tofu(wid, &key(1), false, None, WriteCeilingReport::default())
+                .await
+                .unwrap(),
             TofuOutcome::IdentityConflict
         );
         // Nor can a NEW key claim the retired worker_id (history exists).
         assert_eq!(
-            repo.register_tofu(wid, &key(2), false, None).await.unwrap(),
+            repo.register_tofu(wid, &key(2), false, None, WriteCeilingReport::default())
+                .await
+                .unwrap(),
             TofuOutcome::IdentityConflict
         );
 
         // The OPERATOR path still rotates freely: register a new key, and the
         // worker's subsequent boot-time TOFU refresh of that key succeeds.
         assert_eq!(
-            repo.register(wid, &key(2), false, None).await.unwrap(),
+            repo.register(wid, &key(2), false, None, WriteCeilingReport::default())
+                .await
+                .unwrap(),
             RegisterOutcome::Registered
         );
         assert_eq!(
-            repo.register_tofu(wid, &key(2), true, None).await.unwrap(),
+            repo.register_tofu(wid, &key(2), true, None, WriteCeilingReport::default())
+                .await
+                .unwrap(),
             TofuOutcome::Registered
         );
 
@@ -1383,7 +1975,9 @@ mod tests {
 
         // Worker already has a TOFU-bound identity...
         assert_eq!(
-            repo.register_tofu(wid, &key(1), false, None).await.unwrap(),
+            repo.register_tofu(wid, &key(1), false, None, WriteCeilingReport::default())
+                .await
+                .unwrap(),
             TofuOutcome::Registered
         );
         // ...so a NEW key would be an IdentityConflict on the shared path. A
@@ -1393,18 +1987,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            repo.register_with_provisioning_token(&th, wid, &key(2), false, true, None)
-                .await
-                .unwrap(),
+            repo.register_with_provisioning_token(
+                &th,
+                wid,
+                &key(2),
+                false,
+                true,
+                None,
+                WriteCeilingReport::default()
+            )
+            .await
+            .unwrap(),
             TokenRegisterOutcome::Registered
         );
         assert!(token_used_at(&repo, id).await.is_some(), "token consumed");
 
         // Single use: a second redemption is refused even for a valid request.
         assert_eq!(
-            repo.register_with_provisioning_token(&th, wid, &key(3), false, true, None)
-                .await
-                .unwrap(),
+            repo.register_with_provisioning_token(
+                &th,
+                wid,
+                &key(3),
+                false,
+                true,
+                None,
+                WriteCeilingReport::default()
+            )
+            .await
+            .unwrap(),
             TokenRegisterOutcome::InvalidToken
         );
 
@@ -1431,18 +2041,34 @@ mod tests {
                 let repo = repo.clone();
                 let th = th.clone();
                 async move {
-                    repo.register_with_provisioning_token(&th, wid, &key(10), false, true, None)
-                        .await
-                        .unwrap()
+                    repo.register_with_provisioning_token(
+                        &th,
+                        wid,
+                        &key(10),
+                        false,
+                        true,
+                        None,
+                        WriteCeilingReport::default(),
+                    )
+                    .await
+                    .unwrap()
                 }
             },
             {
                 let repo = repo.clone();
                 let th = th.clone();
                 async move {
-                    repo.register_with_provisioning_token(&th, wid, &key(11), false, true, None)
-                        .await
-                        .unwrap()
+                    repo.register_with_provisioning_token(
+                        &th,
+                        wid,
+                        &key(11),
+                        false,
+                        true,
+                        None,
+                        WriteCeilingReport::default(),
+                    )
+                    .await
+                    .unwrap()
                 }
             }
         );
@@ -1497,9 +2123,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            repo.register_with_provisioning_token(&th_expired, wid, &key(1), false, true, None)
-                .await
-                .unwrap(),
+            repo.register_with_provisioning_token(
+                &th_expired,
+                wid,
+                &key(1),
+                false,
+                true,
+                None,
+                WriteCeilingReport::default()
+            )
+            .await
+            .unwrap(),
             TokenRegisterOutcome::InvalidToken
         );
         assert!(token_used_at(&repo, id_expired).await.is_none());
@@ -1510,9 +2144,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            repo.register_with_provisioning_token(&th_other, wid, &key(1), false, true, None)
-                .await
-                .unwrap(),
+            repo.register_with_provisioning_token(
+                &th_other,
+                wid,
+                &key(1),
+                false,
+                true,
+                None,
+                WriteCeilingReport::default()
+            )
+            .await
+            .unwrap(),
             TokenRegisterOutcome::InvalidToken
         );
         assert!(token_used_at(&repo, id_other).await.is_none());
@@ -1528,9 +2170,17 @@ mod tests {
             "second revoke is a no-op"
         );
         assert_eq!(
-            repo.register_with_provisioning_token(&th_revoked, wid, &key(1), false, true, None)
-                .await
-                .unwrap(),
+            repo.register_with_provisioning_token(
+                &th_revoked,
+                wid,
+                &key(1),
+                false,
+                true,
+                None,
+                WriteCeilingReport::default()
+            )
+            .await
+            .unwrap(),
             TokenRegisterOutcome::InvalidToken
         );
 
@@ -1567,18 +2217,34 @@ mod tests {
 
         // Enforcement ON → wildcard refused outright, NOT consumed.
         assert_eq!(
-            repo.register_with_provisioning_token(&th, wid, &key(1), false, true, None)
-                .await
-                .unwrap(),
+            repo.register_with_provisioning_token(
+                &th,
+                wid,
+                &key(1),
+                false,
+                true,
+                None,
+                WriteCeilingReport::default()
+            )
+            .await
+            .unwrap(),
             TokenRegisterOutcome::InvalidToken
         );
         assert!(token_used_at(&repo, id).await.is_none());
 
         // Enforcement OFF → accepted, TOFU semantics, consumed.
         assert_eq!(
-            repo.register_with_provisioning_token(&th, wid, &key(1), false, false, None)
-                .await
-                .unwrap(),
+            repo.register_with_provisioning_token(
+                &th,
+                wid,
+                &key(1),
+                false,
+                false,
+                None,
+                WriteCeilingReport::default()
+            )
+            .await
+            .unwrap(),
             TokenRegisterOutcome::Registered
         );
         assert!(token_used_at(&repo, id).await.is_some());
@@ -1591,9 +2257,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            repo.register_with_provisioning_token(&th2, wid, &key(2), false, false, None)
-                .await
-                .unwrap(),
+            repo.register_with_provisioning_token(
+                &th2,
+                wid,
+                &key(2),
+                false,
+                false,
+                None,
+                WriteCeilingReport::default()
+            )
+            .await
+            .unwrap(),
             TokenRegisterOutcome::IdentityConflict
         );
         assert!(
@@ -1617,7 +2291,9 @@ mod tests {
         // Fill the worker to its active-key cap via the operator path.
         for i in 0..MAX_ACTIVE_KEYS_PER_WORKER as u8 {
             assert_eq!(
-                repo.register(wid, &key(i), false, None).await.unwrap(),
+                repo.register(wid, &key(i), false, None, WriteCeilingReport::default())
+                    .await
+                    .unwrap(),
                 RegisterOutcome::Registered
             );
         }
@@ -1628,9 +2304,17 @@ mod tests {
 
         // Bound-token redemption hits the cap → refused, token survives.
         assert_eq!(
-            repo.register_with_provisioning_token(&th, wid, &key(100), false, true, None)
-                .await
-                .unwrap(),
+            repo.register_with_provisioning_token(
+                &th,
+                wid,
+                &key(100),
+                false,
+                true,
+                None,
+                WriteCeilingReport::default()
+            )
+            .await
+            .unwrap(),
             TokenRegisterOutcome::CapReached
         );
         assert!(token_used_at(&repo, id).await.is_none());
@@ -1638,9 +2322,17 @@ mod tests {
         // Operator frees a slot; the SAME token now redeems.
         assert!(repo.deactivate(wid, &key(0)).await.unwrap());
         assert_eq!(
-            repo.register_with_provisioning_token(&th, wid, &key(100), false, true, None)
-                .await
-                .unwrap(),
+            repo.register_with_provisioning_token(
+                &th,
+                wid,
+                &key(100),
+                false,
+                true,
+                None,
+                WriteCeilingReport::default()
+            )
+            .await
+            .unwrap(),
             TokenRegisterOutcome::Registered
         );
 
@@ -1659,18 +2351,24 @@ mod tests {
         // Fill up to the cap with distinct keys — all admitted.
         for i in 0..MAX_ACTIVE_KEYS_PER_WORKER as u8 {
             assert_eq!(
-                repo.register(wid, &key(i), false, None).await.unwrap(),
+                repo.register(wid, &key(i), false, None, WriteCeilingReport::default())
+                    .await
+                    .unwrap(),
                 RegisterOutcome::Registered
             );
         }
         // One more NEW key is refused.
         assert_eq!(
-            repo.register(wid, &key(200), false, None).await.unwrap(),
+            repo.register(wid, &key(200), false, None, WriteCeilingReport::default())
+                .await
+                .unwrap(),
             RegisterOutcome::CapReached
         );
         // But re-registering an EXISTING key is still allowed at the cap.
         assert_eq!(
-            repo.register(wid, &key(0), false, None).await.unwrap(),
+            repo.register(wid, &key(0), false, None, WriteCeilingReport::default())
+                .await
+                .unwrap(),
             RegisterOutcome::Registered
         );
 
@@ -1681,7 +2379,9 @@ mod tests {
             "second deactivate is a no-op"
         );
         assert_eq!(
-            repo.register(wid, &key(200), false, None).await.unwrap(),
+            repo.register(wid, &key(200), false, None, WriteCeilingReport::default())
+                .await
+                .unwrap(),
             RegisterOutcome::Registered
         );
 
@@ -1770,9 +2470,15 @@ mod tests {
         cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
 
         assert_eq!(
-            repo.register_tofu(wid, &key(1), false, Some("0.1.0+aaaaaaa"))
-                .await
-                .unwrap(),
+            repo.register_tofu(
+                wid,
+                &key(1),
+                false,
+                Some("0.1.0+aaaaaaa"),
+                WriteCeilingReport::default()
+            )
+            .await
+            .unwrap(),
             TofuOutcome::Registered
         );
 
@@ -1819,7 +2525,9 @@ mod tests {
         cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
 
         assert_eq!(
-            repo.register_tofu(wid, &key(1), false, None).await.unwrap(),
+            repo.register_tofu(wid, &key(1), false, None, WriteCeilingReport::default())
+                .await
+                .unwrap(),
             TofuOutcome::Registered
         );
         // Registered a decade ago and never pinged.
@@ -1852,7 +2560,9 @@ mod tests {
         cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
 
         assert_eq!(
-            repo.register_tofu(wid, &key(1), false, None).await.unwrap(),
+            repo.register_tofu(wid, &key(1), false, None, WriteCeilingReport::default())
+                .await
+                .unwrap(),
             TofuOutcome::Registered
         );
         assert!(repo.touch_liveness(wid, &key(1)).await.unwrap());
@@ -1898,7 +2608,9 @@ mod tests {
 
         // Registered, then reaped.
         assert_eq!(
-            repo.register_tofu(wid, &key(1), false, None).await.unwrap(),
+            repo.register_tofu(wid, &key(1), false, None, WriteCeilingReport::default())
+                .await
+                .unwrap(),
             TofuOutcome::Registered
         );
         assert!(repo.touch_liveness(wid, &key(1)).await.unwrap());
@@ -1916,16 +2628,22 @@ mod tests {
         // the network path exactly as a revoked key is, and a NEW key cannot
         // claim the reaped worker_id either.
         assert_eq!(
-            repo.register_tofu(wid, &key(1), false, None).await.unwrap(),
+            repo.register_tofu(wid, &key(1), false, None, WriteCeilingReport::default())
+                .await
+                .unwrap(),
             TofuOutcome::IdentityConflict
         );
         assert_eq!(
-            repo.register_tofu(wid, &key(2), false, None).await.unwrap(),
+            repo.register_tofu(wid, &key(2), false, None, WriteCeilingReport::default())
+                .await
+                .unwrap(),
             TofuOutcome::IdentityConflict
         );
         // The operator path remains the documented remedy.
         assert_eq!(
-            repo.register(wid, &key(1), false, None).await.unwrap(),
+            repo.register(wid, &key(1), false, None, WriteCeilingReport::default())
+                .await
+                .unwrap(),
             RegisterOutcome::Registered
         );
         assert!(is_active(&repo, wid, &key(1)).await);
@@ -1952,7 +2670,9 @@ mod tests {
             // Reset to a row that is exactly AT the edge: last pinged 2h ago
             // with a 1h window, so a sweep that lands first WOULD reap it.
             cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
-            repo.register_tofu(wid, &key(1), false, None).await.unwrap();
+            repo.register_tofu(wid, &key(1), false, None, WriteCeilingReport::default())
+                .await
+                .unwrap();
             age_row(&repo, wid, &key(1), Some(2), 2).await;
 
             let (pinged, _reaped) = tokio::join!(
@@ -2010,12 +2730,24 @@ mod tests {
 
         // The shared key, as observed.
         let shared = key(42);
-        repo.register_tofu(live, &shared, false, Some("0.1.0+3ffb611"))
-            .await
-            .unwrap();
-        repo.register_tofu(ghost, &shared, false, Some("0.1.0+cddef6d"))
-            .await
-            .unwrap();
+        repo.register_tofu(
+            live,
+            &shared,
+            false,
+            Some("0.1.0+3ffb611"),
+            WriteCeilingReport::default(),
+        )
+        .await
+        .unwrap();
+        repo.register_tofu(
+            ghost,
+            &shared,
+            false,
+            Some("0.1.0+cddef6d"),
+            WriteCeilingReport::default(),
+        )
+        .await
+        .unwrap();
 
         // BEFORE: the broken state. Two active identities; the ghost's is as
         // trusted as the live worker's, indefinitely.
@@ -2076,7 +2808,9 @@ mod tests {
         cleanup_worker_rows(&repo.db_pool, &[live, legacy, gone], &[]).await;
 
         for w in [live, legacy, gone] {
-            repo.register_tofu(w, &key(1), false, None).await.unwrap();
+            repo.register_tofu(w, &key(1), false, None, WriteCeilingReport::default())
+                .await
+                .unwrap();
         }
         // live: pinging now. legacy: never pinged, ancient. gone: pinged, silent.
         age_row(&repo, live, &key(1), Some(0), 5_000).await;
@@ -2140,18 +2874,30 @@ mod tests {
         cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
 
         // Day 0: worker on the liveness build registers and pings.
-        repo.register_tofu(wid, &key(1), false, Some("0.1.0+new1111"))
-            .await
-            .unwrap();
+        repo.register_tofu(
+            wid,
+            &key(1),
+            false,
+            Some("0.1.0+new1111"),
+            WriteCeilingReport::default(),
+        )
+        .await
+        .unwrap();
         assert!(repo.touch_liveness(wid, &key(1)).await.unwrap());
 
         // Day 1: operator rolls the image BACK to a pre-liveness build. The
         // worker is alive and re-registers on boot; nothing clears liveness.
         age_row(&repo, wid, &key(1), Some(25), 25).await;
         assert_eq!(
-            repo.register_tofu(wid, &key(1), false, Some("0.1.0+old0000"))
-                .await
-                .unwrap(),
+            repo.register_tofu(
+                wid,
+                &key(1),
+                false,
+                Some("0.1.0+old0000"),
+                WriteCeilingReport::default()
+            )
+            .await
+            .unwrap(),
             TofuOutcome::Registered,
             "the worker is demonstrably alive: it just re-registered"
         );
@@ -2179,7 +2925,9 @@ mod tests {
 
         // And it cannot recover on its own — needs an operator.
         assert_eq!(
-            repo.register_tofu(wid, &key(1), false, None).await.unwrap(),
+            repo.register_tofu(wid, &key(1), false, None, WriteCeilingReport::default())
+                .await
+                .unwrap(),
             TofuOutcome::IdentityConflict
         );
 
@@ -2199,13 +2947,25 @@ mod tests {
         let wid = "test-2a-control-live-worker";
         cleanup_worker_rows(&repo.db_pool, &[wid], &[]).await;
 
-        repo.register_tofu(wid, &key(1), false, Some("0.1.0+old0000"))
-            .await
-            .unwrap();
+        repo.register_tofu(
+            wid,
+            &key(1),
+            false,
+            Some("0.1.0+old0000"),
+            WriteCeilingReport::default(),
+        )
+        .await
+        .unwrap();
         age_row(&repo, wid, &key(1), None, 25).await;
-        repo.register_tofu(wid, &key(1), false, Some("0.1.0+old0000"))
-            .await
-            .unwrap();
+        repo.register_tofu(
+            wid,
+            &key(1),
+            false,
+            Some("0.1.0+old0000"),
+            WriteCeilingReport::default(),
+        )
+        .await
+        .unwrap();
         assert_eq!(repo.reap_departed_identities(24).await.unwrap(), 0);
         assert!(is_active(&repo, wid, &key(1)).await);
 
