@@ -37,6 +37,7 @@ impl ParallelWorkflowEngine {
         chain: Vec<NodeIndex>,
         chain_input: JsonValue,
         accumulated_snapshot: Option<Arc<JsonValue>>,
+        degraded_inputs: Option<JsonValue>,
         execution_id: Uuid,
         dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
         worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
@@ -543,6 +544,18 @@ impl ParallelWorkflowEngine {
                         }),
                     );
                 }
+            }
+            // Input-COMPLETENESS, keyed on the chain HEAD. Unlike freshness
+            // (a per-node declared contract, hence the loop above), degradation
+            // is a property of what flowed INTO the chain — and a chain is a
+            // linear in=out=1 run, so every upstream failure is an ancestor of
+            // the head and of nothing else. set-or-REMOVE, so a fabricated key
+            // arriving in `chain_input` or the head's config is deleted.
+            if let Some(obj) = wrapped.as_object_mut() {
+                talos_workflow_engine_core::reserved_keys::apply_degraded_inputs(
+                    obj,
+                    degraded_inputs.clone(),
+                );
             }
             first.input_payload = wrapped;
         }
@@ -1167,6 +1180,7 @@ mod pipeline_ledger_finalize_tests {
             .run_pipeline_chain_dispatch(
                 chain,
                 json!({ "seed": 1 }),
+                None,
                 None,
                 Uuid::new_v4(),
                 dispatcher,

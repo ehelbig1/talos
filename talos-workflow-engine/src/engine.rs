@@ -2034,10 +2034,12 @@ impl ParallelWorkflowEngine {
                     let chain_head_id = self.graph[node_idx];
                     self.progress
                         .mark_started(chain_head_id, self.chain_progress_label(&chain));
+                    let chain_degraded = self.degraded_inputs_report(node_idx, &results);
                     let fut = self.run_pipeline_chain_dispatch(
                         chain,
                         chain_input,
                         accumulated_snapshot,
+                        chain_degraded,
                         execution_id,
                         dispatcher.clone(),
                         worker_shared_key.clone(),
@@ -2805,6 +2807,11 @@ impl ParallelWorkflowEngine {
                 // node's envelope so the scaffold's "always preserved"
                 // contract is honored end to end.
                 let trigger_input_val = self.extract_trigger_input(&results);
+                // Input-COMPLETENESS report: which ancestors failed while the
+                // run was allowed to continue. Resolved HERE because `results`
+                // lives here; `run_single_node_dispatch` applies it
+                // set-or-REMOVE onto the assembled envelope.
+                let degraded_inputs = self.degraded_inputs_report(node_idx, &results);
                 let fut = self.run_single_node_dispatch(
                     node_idx,
                     node_id,
@@ -2814,6 +2821,7 @@ impl ParallelWorkflowEngine {
                     inputs,
                     accumulated_snapshot,
                     trigger_input_val,
+                    degraded_inputs,
                     execution_sandbox.clone(),
                 );
                 // Per-node timing + node_started event: always emitted

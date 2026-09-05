@@ -30,6 +30,16 @@ impl ParallelWorkflowEngine {
     /// Extracted from the reactor loop so the scheduler body reads as
     /// a sequence of handler dispatches rather than a 370-line inline
     /// closure. Semantics are preserved verbatim.
+    ///
+    /// `degraded_inputs` is the caller's
+    /// [`degraded_inputs_report`](Self::degraded_inputs_report) for this node —
+    /// resolved in the reactor because that is where `results` lives. It is
+    /// applied set-or-REMOVE, so passing `None` does not merely skip the key:
+    /// it DELETES any `__degraded_inputs__` that arrived from an upstream
+    /// module's output or the node's own config. That removal is the point —
+    /// the assembled envelope is built on top of caller data, and a node must
+    /// never be able to author its own claim about whether its inputs were
+    /// complete.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn run_single_node_dispatch(
         &self,
@@ -41,6 +51,7 @@ impl ParallelWorkflowEngine {
         inputs: JsonValue,
         accumulated_snapshot: Option<Arc<JsonValue>>,
         trigger_input: Option<JsonValue>,
+        degraded_inputs: Option<JsonValue>,
         _execution_sandbox: Option<Arc<cap_std::fs::Dir>>,
     ) -> (NodeIndex, Result<JsonValue, String>) {
         let module_id_resolved = self.resolve_module_id(node_id);
@@ -269,6 +280,18 @@ impl ParallelWorkflowEngine {
                 }
                 merged.insert("__staleness__".to_string(), report);
             }
+            // Input-COMPLETENESS contract, the twin of the freshness one
+            // above: when an upstream node FAILED and the run was allowed to
+            // continue, name it here so this node cannot present a
+            // partial picture as a whole one. set-or-REMOVE — `merged` is
+            // built on top of caller data (upstream module JSON, trigger
+            // payload), so a conditional insert would let a module author
+            // its own "inputs complete" claim. Nothing degraded ⇒ no key ⇒
+            // byte-identical to the pre-feature payload.
+            talos_workflow_engine_core::reserved_keys::apply_degraded_inputs(
+                &mut merged,
+                degraded_inputs.clone(),
+            );
             // `__trigger_input__` survives every hop — including across
             // sub-workflow boundaries when the dispatcher wraps the child
             // trigger with `__trigger_input__: parent_ti`. Injecting it
@@ -906,6 +929,7 @@ mod single_node_ledger_finalize_tests {
                 None,
                 None,
                 None,
+                None,
             )
             .await
             .1
@@ -1233,6 +1257,7 @@ mod oauth_repair_tests {
                 // all — the same precondition production dispatch has.
                 Some(WorkerSharedKey::new(vec![7u8; 32])),
                 json!({ "seed": 1 }),
+                None,
                 None,
                 None,
                 None,

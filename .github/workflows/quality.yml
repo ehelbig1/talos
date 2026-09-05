@@ -238,6 +238,7 @@ jobs:
             --test cancellation \
             --test chain_dispatch_gate \
             --test checkpointing \
+            --test degraded_inputs \
             --test fan_in_join \
             --test precheck_errors \
             --test rate_limit_store \
