@@ -33,6 +33,16 @@
 //! Optional:
 //!   * `TALOS_WORKER_SUPPORTS_SEALING`   — advertise P3/D3b capability (default
 //!                                         false).
+//!
+//! It also reports its WRITE-CEILING ENFORCEMENT POSTURE
+//! (`TALOS_WRITE_CEILING_ENFORCED` / `TALOS_WRITE_CEILING_STRICT_EGRESS`) so
+//! controller-side operator surfaces can stop describing `max_write_ceiling`
+//! in the abstract. That posture is read from
+//! [`talos_worker_runtime::context::write_ceiling_enforcement`] — the SAME
+//! `OnceLock`s the host-fn gates consult — never from a second env read here,
+//! because a report that can disagree with the gate it describes is worse than
+//! no report. Like `build_version` it is DIAGNOSTIC ONLY and deliberately
+//! outside the proof-of-possession; see [`build_registration_body`].
 
 use std::time::Duration;
 
@@ -74,6 +84,7 @@ pub(crate) fn build_registration_body(
     issued_at_ms: u64,
     nonce: &str,
     build_version: &str,
+    write_ceiling: talos_worker_runtime::context::WriteCeilingEnforcement,
     signing_key: &DispatchSigningKey,
 ) -> serde_json::Value {
     let proof = sign_worker_registration_proof(
@@ -108,6 +119,26 @@ pub(crate) fn build_registration_body(
         // carries no `deny_unknown_fields`), so this is safe to send at any
         // point in a rollout.
         "build_version": build_version,
+        // DIAGNOSTIC ONLY, unsigned, for exactly the reasons above — plus one
+        // that is specific to these two.
+        //
+        // What they are: what THIS process will do with the signed
+        // `max_write_ceiling` it receives, read from the same OnceLocks the
+        // mutating host-fn gates read. Before they existed, no controller
+        // surface could distinguish a deployment where a `readonly` actor is a
+        // live control from one where it is a decorative column — every
+        // operator tool printed the same sentence for both.
+        //
+        // Why signing them would be pointless rather than merely costly: a
+        // signature would prove "the key-holder said this", never "this
+        // process refuses mutations". The only claim worth binding is one the
+        // controller could act on, and it must not act on this one at all.
+        // Note which way a lie runs — a worker can only report enforcement it
+        // is NOT performing, which makes an operator more cautious, never more
+        // permissive; the real boundary is `write_ceiling_denies` inside this
+        // process, which no wire field can reach.
+        "write_ceiling_enforced": write_ceiling.enforced,
+        "write_ceiling_strict_egress": write_ceiling.strict_egress,
     })
 }
 
@@ -166,6 +197,8 @@ pub async fn register_worker_identity_at_boot(signing_key: &'static DispatchSign
     let supports_sealing = bool_env("TALOS_WORKER_SUPPORTS_SEALING");
     let public_key = signing_key.verifying_key().to_bytes();
     let build_version = worker_build_version();
+    // From the runtime's own gate readers, not a second env parse here.
+    let write_ceiling = talos_worker_runtime::context::write_ceiling_enforcement();
     let url = format!("{}/internal/worker-key", base_url.trim_end_matches('/'));
 
     // Explicit redirect policy (lint check 32) + bounded timeouts; the target is
@@ -200,6 +233,7 @@ pub async fn register_worker_identity_at_boot(signing_key: &'static DispatchSign
             issued_at_ms,
             &nonce,
             &build_version,
+            write_ceiling,
             signing_key,
         );
 
@@ -216,6 +250,8 @@ pub async fn register_worker_identity_at_boot(signing_key: &'static DispatchSign
                     worker_id = %worker_id,
                     supports_sealing,
                     build_version = %build_version,
+                    write_ceiling_enforced = write_ceiling.enforced,
+                    write_ceiling_strict_egress = write_ceiling.strict_egress,
                     "worker self-registered its Ed25519 identity (RFC 0010 P2 inc.4)"
                 );
                 return;
@@ -268,7 +304,16 @@ pub async fn register_worker_identity_at_boot(signing_key: &'static DispatchSign
 #[cfg(test)]
 mod tests {
     use super::*;
+    use talos_worker_runtime::context::WriteCeilingEnforcement;
     use talos_workflow_job_protocol::verify_worker_registration_proof;
+
+    /// Fixture posture with the two bits DIFFERENT, so a swapped field
+    /// assignment anywhere on the wire path is visible. Both-true or both-false
+    /// fixtures cannot see a swap, which is why this is asymmetric.
+    const POSTURE: WriteCeilingEnforcement = WriteCeilingEnforcement {
+        enforced: true,
+        strict_egress: false,
+    };
 
     #[test]
     fn registration_body_shape_and_proof_verify() {
@@ -281,6 +326,7 @@ mod tests {
             1_700_000_000_000,
             "nonce-1",
             "0.1.0+abc1234",
+            POSTURE,
             &sk,
         );
 
@@ -336,6 +382,7 @@ mod tests {
                 1_700_000_000_000,
                 "nonce-1",
                 bv,
+                POSTURE,
                 &sk,
             )
         };
@@ -361,6 +408,89 @@ mod tests {
         // The proof still verifies standalone — i.e. an old controller, which
         // never reads build_version, accepts the new body.
         let proof = hex::decode(b["proof"].as_str().unwrap()).unwrap();
+        verify_worker_registration_proof(
+            &pk,
+            "worker-42",
+            true,
+            1_700_000_000_000,
+            "nonce-1",
+            &proof,
+        )
+        .expect("old controller must accept a new worker's body");
+    }
+
+    /// The write-ceiling enforcement posture must reach the wire UNSWAPPED and
+    /// must not touch the proof-of-possession.
+    ///
+    /// Two independent failure modes, both silent without this test:
+    ///
+    /// 1. **Swap.** `enforced` and `strict_egress` are both `bool`, threaded
+    ///    through a JSON body, a request struct, five repository signatures and
+    ///    a report. A transposition compiles and would make the controller
+    ///    advertise a strict-egress narrowing that is off while calling the
+    ///    live mutation gate off — the report inverted on both axes. The
+    ///    fixture is deliberately asymmetric (`true`/`false`) so the swap is
+    ///    detectable at all; a `true`/`true` fixture would pass either way.
+    ///
+    /// 2. **Signing it.** Binding these into the PoP would break proof
+    ///    compatibility with any controller that has not rolled yet, for zero
+    ///    security gain (a signature proves the key-holder SAID it, never that
+    ///    the process ENFORCES it). Two bodies differing only in the posture
+    ///    must therefore carry byte-identical proofs — which is also what lets
+    ///    an OLD controller, which has never heard of these fields, accept a
+    ///    NEW worker's body.
+    #[test]
+    fn write_ceiling_flags_travel_unswapped_and_unsigned() {
+        let sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let pk = sk.verifying_key().to_bytes();
+
+        let mk = |p: WriteCeilingEnforcement| {
+            build_registration_body(
+                "worker-42",
+                &pk,
+                true,
+                1_700_000_000_000,
+                "nonce-1",
+                "0.1.0+abc1234",
+                p,
+                &sk,
+            )
+        };
+
+        // 1 — unswapped, and asymmetric so the assertion has content.
+        let body = mk(POSTURE);
+        assert_eq!(body["write_ceiling_enforced"], true);
+        assert_eq!(body["write_ceiling_strict_egress"], false);
+        // ...and the other way round, so neither field is hard-coded.
+        let flipped = mk(WriteCeilingEnforcement {
+            enforced: false,
+            strict_egress: true,
+        });
+        assert_eq!(flipped["write_ceiling_enforced"], false);
+        assert_eq!(flipped["write_ceiling_strict_egress"], true);
+
+        // 2 — the posture is outside the proof, so the proofs are identical
+        // and every OTHER field is untouched.
+        assert_eq!(
+            body["proof"], flipped["proof"],
+            "the proof must not bind the write-ceiling posture"
+        );
+        for field in [
+            "worker_id",
+            "public_key",
+            "supports_sealing",
+            "issued_at_ms",
+            "nonce",
+            "build_version",
+        ] {
+            assert_eq!(
+                body[field], flipped[field],
+                "field {field} must be unchanged"
+            );
+        }
+
+        // An old controller — which never reads these fields — still accepts it.
+        let proof = hex::decode(flipped["proof"].as_str().unwrap()).unwrap();
         verify_worker_registration_proof(
             &pk,
             "worker-42",

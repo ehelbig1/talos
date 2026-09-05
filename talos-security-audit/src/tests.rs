@@ -1058,7 +1058,197 @@ fn grade_a_is_reachable_in_development_only_at_perfection() {
 fn weights_sum_to_max_score() {
     let sum: u32 = CHECK_WEIGHTS.iter().map(|(_, p, _)| *p).sum();
     assert_eq!(sum, MAX_SCORE, "CHECK_WEIGHTS no longer sums to MAX_SCORE");
-    assert_eq!(CHECK_WEIGHTS.len(), 9);
+    // Nine SCORED checks plus `write_ceiling_enforcement`, which is weighted 0
+    // on purpose (see its CHECK_WEIGHTS entry). Ten entries, nine weights.
+    assert_eq!(CHECK_WEIGHTS.len(), 10);
+    assert_eq!(
+        CHECK_WEIGHTS.iter().filter(|(_, p, _)| *p > 0).count(),
+        9,
+        "exactly one check is deliberately unweighted"
+    );
+}
+
+/// An UNWEIGHTED check must cost nothing — not one point, in any arm.
+///
+/// This file has shipped the opposite before: a legend saying a class was
+/// ungraded while that class quietly cost 30 points. `max_points()` falls back
+/// to `self.points` for an unlisted name and `forfeited()` saturates, so an arm
+/// that awarded points under a zero weight would inflate `security_score` past
+/// `max_score` silently rather than failing anywhere. Drive every arm.
+#[test]
+fn unweighted_checks_cost_nothing() {
+    use talos_worker_identity_repository::{summarize_write_ceiling_enforcement, WorkerBuildRow};
+    fn row(enforced: Option<bool>) -> WorkerBuildRow {
+        WorkerBuildRow {
+            worker_id: "w".to_string(),
+            build_version: None,
+            supports_sealing: false,
+            last_seen_at: chrono::Utc::now(),
+            last_liveness_at: None,
+            write_ceiling_enforced: enforced,
+            write_ceiling_strict_egress: None,
+        }
+    }
+    let arms = [
+        check_write_ceiling_enforcement(None),
+        check_write_ceiling_enforcement(Some(summarize_write_ceiling_enforcement(&[]))),
+        check_write_ceiling_enforcement(Some(summarize_write_ceiling_enforcement(&[row(Some(
+            true,
+        ))]))),
+        check_write_ceiling_enforcement(Some(summarize_write_ceiling_enforcement(&[
+            row(Some(true)),
+            row(Some(false)),
+        ]))),
+        check_write_ceiling_enforcement(Some(summarize_write_ceiling_enforcement(&[row(Some(
+            false,
+        ))]))),
+        check_write_ceiling_enforcement(Some(summarize_write_ceiling_enforcement(&[row(None)]))),
+    ];
+    for c in &arms {
+        assert_eq!(c.points, 0, "{} awarded points under a zero weight", c.name);
+        assert_eq!(
+            c.max_points(),
+            0,
+            "{} must contribute 0 to max_score",
+            c.name
+        );
+        assert_eq!(c.forfeited(), 0, "{} must forfeit nothing", c.name);
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// write_ceiling_enforcement
+// ───────────────────────────────────────────────────────────────────────────
+
+mod write_ceiling {
+    use super::*;
+    use talos_worker_identity_repository::{summarize_write_ceiling_enforcement, WorkerBuildRow};
+
+    fn row(enforced: Option<bool>) -> WorkerBuildRow {
+        WorkerBuildRow {
+            worker_id: "w".to_string(),
+            build_version: None,
+            supports_sealing: false,
+            last_seen_at: chrono::Utc::now(),
+            last_liveness_at: None,
+            write_ceiling_enforced: enforced,
+            write_ceiling_strict_egress: None,
+        }
+    }
+    fn check(rows: &[WorkerBuildRow]) -> Check {
+        check_write_ceiling_enforcement(Some(summarize_write_ceiling_enforcement(rows)))
+    }
+
+    /// THE DANGEROUS SURVIVOR. A check that passes when the fleet reports
+    /// nothing is worse than no check: it converts "we never asked" into a
+    /// green tick, which is the exact class this whole change exists to
+    /// remove. An empty registry must be `NotVerified` — not `Pass`, and not
+    /// even a `Warn` that claims to have measured something.
+    #[test]
+    fn an_empty_fleet_is_not_verified_never_a_pass() {
+        let c = check(&[]);
+        assert_ne!(c.status, Status::Pass, "silence must never read as a pass");
+        assert_eq!(c.verification, Verification::NotVerified);
+        assert_eq!(c.points, 0);
+        assert!(c.detail.contains("UNKNOWN"));
+    }
+
+    /// Likewise when every row predates the feature: nobody reported, so
+    /// nothing was established. `Unknown` is a refusal to answer, not an "all
+    /// clear".
+    #[test]
+    fn an_all_unreported_fleet_is_not_verified() {
+        let c = check(&[row(None), row(None)]);
+        assert_ne!(c.status, Status::Pass);
+        assert_eq!(c.verification, Verification::NotVerified);
+    }
+
+    /// A FAILED registry read is a database finding, not a ceiling finding —
+    /// and must say so, so an operator does not go and change a ceiling in
+    /// response to a Postgres outage.
+    #[test]
+    fn an_unreadable_registry_is_not_verified_and_blames_the_database() {
+        let c = check_write_ceiling_enforcement(None);
+        assert_ne!(c.status, Status::Pass);
+        assert_eq!(c.verification, Verification::NotVerified);
+        assert_eq!(c.points, 0);
+        assert!(c.detail.contains("NOT VERIFIED"));
+        assert!(
+            c.detail.contains("database problem"),
+            "must not read as a finding about the ceiling"
+        );
+    }
+
+    /// The only passing shape: every registered worker reports enforcement.
+    /// Still `ConfigPresence`, never higher — the controller read a value
+    /// another process reported about its own env, unsigned, and exercised
+    /// nothing. Same standing as `aot_integrity_key`, whose enforcing key ring
+    /// also lives in the worker.
+    #[test]
+    fn a_fully_enforcing_fleet_passes_at_config_presence_only() {
+        let c = check(&[row(Some(true)), row(Some(true))]);
+        assert_eq!(c.status, Status::Pass);
+        assert_eq!(c.verification, Verification::ConfigPresence);
+        assert_ne!(
+            c.verification,
+            Verification::RoundTrip,
+            "nothing was exercised from the controller"
+        );
+        assert!(c.detail.contains("UNSIGNED"));
+        assert!(c.detail.contains("never an authorization input"));
+    }
+
+    /// A MIXED fleet must not pass. Nothing routes jobs by enforcement
+    /// posture, so a readonly actor's job may land on the worker that does not
+    /// enforce — and the detail has to say that, because "1 of 2 enforcing"
+    /// reads reassuringly on its own.
+    #[test]
+    fn a_mixed_fleet_warns_and_names_the_routing_hazard() {
+        let c = check(&[row(Some(true)), row(Some(false))]);
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(c.verification, Verification::ConfigPresence);
+        assert!(c.detail.contains("ADVISORY IN PART"));
+        assert!(c.detail.contains("may"));
+    }
+
+    /// Every worker reporting OFF is a definite answer — Warn, but measured,
+    /// so it is `ConfigPresence` rather than `NotVerified`. The distinction is
+    /// the whole point of the verification axis: "it is off" and "we could not
+    /// tell" are different jobs for the operator.
+    #[test]
+    fn a_fully_reporting_off_fleet_warns_but_is_measured() {
+        let c = check(&[row(Some(false)), row(Some(false))]);
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(c.verification, Verification::ConfigPresence);
+        assert_ne!(c.verification, Verification::NotVerified);
+        assert!(c.detail.contains("ADVISORY"));
+    }
+
+    /// The check reaches the assembled report, and an unestablished one is
+    /// named to the operator rather than being silently absent.
+    #[test]
+    fn it_reaches_the_report_and_the_recommendation() {
+        let checks = vec![check_write_ceiling_enforcement(None)];
+        let report = render_report(&checks);
+        let names: Vec<&str> = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["check"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"write_ceiling_enforcement"));
+        // Unweighted: it contributes to neither side of the score.
+        assert_eq!(report["security_score"], 0);
+        assert_eq!(report["max_score"], 0);
+        assert_eq!(report["verification_counts"]["not_verified"], 1);
+        assert!(
+            report["recommendation"]
+                .as_str()
+                .unwrap()
+                .contains("write_ceiling_enforcement"),
+            "an unverified check must be named, not just counted"
+        );
+    }
 }
 
 /// Every arm of every check: its name is weighted, and it never awards more
@@ -1107,6 +1297,7 @@ fn every_arm_is_weighted_and_within_its_weight() {
         })),
         check_master_encryption_key(Some(KekSelfTest::Unavailable)),
         check_master_encryption_key(None),
+        check_write_ceiling_enforcement(None),
         check_job_signing_key(JobSigningProbe::Verified),
         check_job_signing_key(JobSigningProbe::Absent),
         check_job_signing_key(JobSigningProbe::Unusable),

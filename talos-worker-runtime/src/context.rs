@@ -908,10 +908,63 @@ pub(crate) fn strict_egress_denies(
     enforced && strict && !ceiling.allows_write() && matched == crate::host::HostMatchKind::Wildcard
 }
 
+/// What THIS worker process will actually do with the signed
+/// `JobRequest.max_write_ceiling` it receives — the *enforcement posture*, as
+/// opposed to the per-actor ceiling itself.
+///
+/// Reported to the controller at boot self-registration so operator surfaces
+/// can stop describing the ceiling in the abstract. Both fields are read from
+/// the SAME [`write_ceiling_enforced`] / [`write_ceiling_strict_egress`]
+/// `OnceLock`s the host-fn gates read, deliberately: a second env read here
+/// would be a copy of the rule that could drift from the rule, and a report
+/// that disagrees with the gate it describes is worse than no report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WriteCeilingEnforcement {
+    /// `TALOS_WRITE_CEILING_ENFORCED` — whether a `readonly` actor's mutating
+    /// host ops are actually refused here.
+    pub enforced: bool,
+    /// `TALOS_WRITE_CEILING_STRICT_EGRESS` — the subordinate read-side control.
+    /// Inert while `enforced` is false (see [`strict_egress_denies`]), so any
+    /// consumer counting "effective strict egress" must require BOTH.
+    pub strict_egress: bool,
+}
+
+/// This process's live write-ceiling enforcement posture. See
+/// [`WriteCeilingEnforcement`]. Cheap (two `OnceLock` reads).
+#[must_use]
+pub fn write_ceiling_enforcement() -> WriteCeilingEnforcement {
+    WriteCeilingEnforcement {
+        enforced: write_ceiling_enforced(),
+        strict_egress: write_ceiling_strict_egress(),
+    }
+}
+
 #[cfg(test)]
 mod write_ceiling_decision_tests {
     use super::write_ceiling_denies;
     use talos_workflow_job_protocol::WriteCeiling;
+
+    /// The reported posture must come from the SAME readers the gates use.
+    ///
+    /// STATED LIMIT, because overstating a guard is the defect one level up:
+    /// both flags are `OnceLock`s over process env, so in a test process where
+    /// they hold the SAME value (the default — both unset, both false) this
+    /// cannot distinguish a swapped field assignment. The swap IS covered, on
+    /// the path where it would matter: `worker::self_register`'s
+    /// `write_ceiling_flags_travel_unswapped_and_unsigned` builds a body with
+    /// the two bits DIFFERENT and the controller-side round trip
+    /// (`worker_write_ceiling_reporting_tests`) reads them back apart.
+    #[test]
+    fn reported_posture_agrees_with_the_gate_readers() {
+        let posture = super::write_ceiling_enforcement();
+        assert_eq!(posture.enforced, super::write_ceiling_enforced());
+        assert_eq!(posture.strict_egress, super::write_ceiling_strict_egress());
+        // And the reported bit is the one the mutation gate consumes.
+        assert_eq!(
+            write_ceiling_denies(posture.enforced, WriteCeiling::ReadOnly),
+            posture.enforced
+        );
+    }
 
     #[test]
     fn disabled_never_refuses() {

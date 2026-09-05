@@ -71,7 +71,19 @@ pub(crate) async fn run_worker_identity_cli(sub: &str, args: &[String]) -> anyho
             // shell knows nothing about the pod's build, and inventing a value
             // here would put a false claim in the fleet report. The worker
             // stamps the real one on its next self-registration.
-            match repo.register(&wid, &pk, supports_sealing, None).await? {
+            // `None` build + default (unreported) write-ceiling posture: the
+            // operator CLI runs outside the worker pod and cannot know either.
+            // Reporting `false` here would state a measurement nobody took.
+            match repo
+                .register(
+                    &wid,
+                    &pk,
+                    supports_sealing,
+                    None,
+                    talos_worker_identity_repository::WriteCeilingReport::default(),
+                )
+                .await?
+            {
                 RegisterOutcome::Registered => {
                     println!("registered worker '{wid}' (supports_sealing={supports_sealing})");
                 }

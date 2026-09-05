@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE worker_identities\n                 SET supports_sealing = $3, build_version = $4,\n                     write_ceiling_enforced = $5, write_ceiling_strict_egress = $6,\n                     last_seen_at = now()\n                 WHERE worker_id = $1 AND public_key = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bytea",
+        "Bool",
+        "Text",
+        "Bool",
+        "Bool"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "99e7986923fef4238c0332c9bcf8047b2046ca89db31b45453f43b8c185d5579"
+}
