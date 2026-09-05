@@ -20,6 +20,13 @@ talos-system-repo = { path = "../talos-system-repo" }
 # is what stops security_audit and get_platform_info disagreeing about one
 # fleet — the `build_suffix` argument restated.
 talos-worker-identity-repository = { path = "../talos-worker-identity-repository" }
+# The CONTROLLER's own two write-ceiling gates, so `write_ceiling_enforcement`
+# can EXERCISE them instead of repeating the (now false) sentence "the
+# controller cannot exercise it from here". `talos-workflow-engine` also owns
+# the process's ONE reader of TALOS_WRITE_CEILING_ENFORCED — re-reading it here
+# would be a second answer to "is this control live" (lint check 69's class).
+talos-rpc-subscribers = { path = "../talos-rpc-subscribers" }
+talos-workflow-engine = { path = "../talos-workflow-engine" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 tokio = { version = "1", features = ["time"] }
 tracing.workspace = true

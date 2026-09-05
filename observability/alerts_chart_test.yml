@@ -4432,3 +4432,82 @@ tests:
       - eval_time: 100m
         alertname: TalosCatalogMissingWasmDetectorBlind
         exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
+  # TalosRPCWriteCeilingRefusals — the fleet-configuration signal.
+  #
+  # The case that mattered: before this change the ONLY trace of a signed-RPC
+  # write-ceiling refusal was a log line. The memory routes folded into
+  # `talos_memory_write_failures_total{reason="write_ceiling"}` — the same
+  # counter and label a ROUTINE #750 envelope refusal uses, whose own HELP
+  # text tells operators not to alert on it — and the integration-state and
+  # database routes incremented nothing at all. So the two arms below assert
+  # the two things that were missing: the series is present at 0 in the
+  # healthy steady state (so `increase(...) > 0` is well-defined without an
+  # absent() arm), and it FIRES on a refusal, carrying the labels an operator
+  # needs.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: seeded-at-zero stays quiet, then a refusal fires with its labels
+    input_series:
+      # Pre-seeded at 0 in talos-metrics for every (subject, reason) a live
+      # call site writes, then one refusal at t=30m on the memory subject.
+      - series: 'talos_rpc_write_ceiling_refusals_total{job="talos-controller",subject="talos.memory.op",reason="policy"}'
+        values: "0+0x30 1+0x60"
+      # A subject that never refuses must stay quiet — the alert must not
+      # aggregate the label away.
+      - series: 'talos_rpc_write_ceiling_refusals_total{job="talos-controller",subject="talos.database.query",reason="unreadable"}'
+        values: "0+0x90"
+    alert_rule_test:
+      # Healthy steady state: the series EXISTS and is flat at 0. This is the
+      # arm an absent series would have made unobservable.
+      - eval_time: 20m
+        alertname: TalosRPCWriteCeilingRefusals
+        exp_alerts: []
+      # `for: 5m` — pending, not yet firing, immediately after the refusal.
+      - eval_time: 33m
+        alertname: TalosRPCWriteCeilingRefusals
+        exp_alerts: []
+      # FIRING, and only for the subject that actually refused.
+      - eval_time: 40m
+        alertname: TalosRPCWriteCeilingRefusals
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: fleet-config
+              job: talos-controller
+              subject: talos.memory.op
+              reason: policy
+            exp_annotations:
+              summary: "Controller refused a signed-RPC mutation on the write ceiling (talos.memory.op, policy)"
+              description: |
+                A worker sent an actor-attributed mutation on talos.memory.op
+                that its OWN write-ceiling gate should have refused, and the
+                controller refused it instead (1 in 15m,
+                reason=policy).
+
+                The mutation did NOT land — this is not data loss. It is evidence
+                that at least one sender is not running the gate, so a readonly
+                actor's WORKER-LOCAL egress (http-fetch, webhook-send, email-send —
+                everything the controller cannot see) is very likely ungated on
+                that same sender.
+              action: |
+                1. `get_platform_info` → `fleet.write_ceiling.enforced_by`. `some`
+                   or `none` names the problem directly; `all` means the sender is
+                   not a registered worker and the finding is an identity one.
+                2. `security_audit` → the `write_ceiling_enforcement` check. Its
+                   `parts.controller_gate` says whether THIS controller enforces
+                   and whether its own gates are healthy; `parts.worker_fleet`
+                   says what the fleet self-reported.
+                3. reason="policy": set TALOS_WRITE_CEILING_ENFORCED on the workers
+                   that lack it (values.yaml sets it on BOTH controller and worker
+                   — a deployment with only one is the split this alert catches).
+                4. reason="unreadable": the gate failed CLOSED because the actor's
+                   ceiling could not be read. Look for `event_kind =
+                   write_ceiling_read_failed` on the talos_rpc target — a dangling
+                   actor_id, or Postgres unreachable from the enforcement path.
+      # Clears once the refusal falls out of the 15m window: the alert is
+      # about a CONDITION that recurs, not a latch.
+      - eval_time: 60m
+        alertname: TalosRPCWriteCeilingRefusals
+        exp_alerts: []

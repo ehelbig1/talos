@@ -13,6 +13,23 @@ use prometheus::{
 };
 use std::sync::{Arc, OnceLock};
 
+/// The complete, closed set of `subject` label values on
+/// `talos_rpc_write_ceiling_refusals_total` — the NATS subjects on which the
+/// controller serves a ceiling-gated mutation.
+///
+/// Must equal the distinct subjects in
+/// `talos_rpc_subscribers::write_ceiling::CONTROLLER_SERVED_WRITE_OPS`. The
+/// list is duplicated rather than imported because that crate DEPENDS on this
+/// one, so importing would be a cycle; `every_gated_subject_is_seeded_in_the_metrics_crate`
+/// (in that crate, where both are visible) pins the agreement. A gated subject
+/// missing here has an ABSENT series until its first refusal, and
+/// `increase(...) > 0` over an absent series matches nothing.
+pub const RPC_WRITE_CEILING_SUBJECTS: [&str; 3] = [
+    "talos.memory.op",
+    "talos.integration_state.op",
+    "talos.database.query",
+];
+
 /// The complete, closed set of `phase` label values on
 /// `talos_scheduler_dispatches_total`.
 ///
@@ -978,6 +995,35 @@ pub struct TalosMetrics {
     // See deploy/observability/alerts.yaml for the SLOs built on top.
     pub kek_decrypt_failures_total: CounterVec,
     pub memory_write_failures_total: CounterVec,
+    /// Signed-RPC mutations the CONTROLLER refused on the per-actor write
+    /// ceiling (#757). Labels: `subject` (the NATS subject) × `reason`
+    /// (`policy` | `unreadable`).
+    ///
+    /// **This is a FLEET-CONFIGURATION signal, not a routine policy event**,
+    /// and that is why it is its own series rather than another `reason` on
+    /// `talos_memory_write_failures_total`. A worker gates these ops itself;
+    /// reaching the controller's gate means the sender did NOT — its
+    /// `TALOS_WRITE_CEILING_ENFORCED` is unset, or its build predates the
+    /// gate, or it is not a Talos worker at all (the request is signed under
+    /// the FLEET-SHARED `WORKER_SHARED_KEY`, which proves possession of a key,
+    /// not that a gate ran).
+    ///
+    /// #757 stated that distinction and routed it to
+    /// `event_kind = "rpc_write_ceiling_refused"` plus the per-subject
+    /// `talos_rpc` outcome tag. Measured on the live controller 2026-09-05:
+    /// `talos_rpc` is a TRACING TARGET ONLY — no `talos_rpc*` Prometheus
+    /// series exists — and the memory routes folded into
+    /// `talos_memory_write_failures_total{reason="write_ceiling"}`, whose own
+    /// HELP text tells operators not to alert on it, while the
+    /// integration-state and database routes incremented nothing at all. So
+    /// the signal existed as prose and not as a series, and no alert could
+    /// select it.
+    ///
+    /// `reason="unreadable"` is the fail-closed arm (absent actor row, or an
+    /// unreadable one). It is an operator problem — a dangling actor id, or a
+    /// database the enforcement path cannot reach — not a policy working as
+    /// configured, which is why it is a separate label rather than folded in.
+    pub rpc_write_ceiling_refusals_total: CounterVec,
     /// `ops_alerts` ingest failures from the `__ops_alert__` hook.
     /// Labels: reason=validation|db|tenancy. Sustained bump means alert
     /// envelopes emitted by parser modules are being lost.
@@ -1838,13 +1884,18 @@ impl TalosMetrics {
         let memory_write_failures_total = CounterVec::new(
             prometheus::Opts::new(
                 "talos_memory_write_failures_total",
-                "__memory_write__ envelopes that produced no actor_memory row. \
-                 Labels: reason=crypto|db|validation|other|write_ceiling. The \
-                 first four are PERSISTENCE FAILURES (a sustained bump means \
-                 node outputs are being lost to disk); write_ceiling is a \
-                 POLICY REFUSAL working as designed (#750), expected to be \
-                 non-zero wherever TALOS_WRITE_CEILING_ENFORCED is set and \
-                 readonly actors run; do not alert on it.",
+                "actor_memory writes that produced no row. Labels: \
+                 reason=crypto|db|validation|other|write_ceiling. The first \
+                 four are PERSISTENCE FAILURES of a __memory_write__ envelope \
+                 (a sustained bump means node outputs are being lost to disk); \
+                 write_ceiling is a POLICY REFUSAL working as designed, \
+                 expected to be non-zero wherever TALOS_WRITE_CEILING_ENFORCED \
+                 is set and readonly actors run, and do not alert on it. \
+                 write_ceiling has TWO producers: the __memory_write__ \
+                 envelope gate (#750) and the signed-RPC memory gate (#757). \
+                 For the RPC route — which is a FLEET-CONFIGURATION signal and \
+                 IS worth alerting on — select \
+                 talos_rpc_write_ceiling_refusals_total instead.",
             ),
             &["reason"],
         )?;
@@ -1856,8 +1907,12 @@ impl TalosMetrics {
         // `write_ceiling` is the fifth and is NOT from that enum: it is the
         // literal stamped by `ControllerNodeHook::record_memory_write_refusal`
         // when the actor's `max_write_ceiling` declines a returned envelope
-        // (#750). It qualifies for seeding on the same rule as the others —
-        // a compile-time-known label with exactly one live `.inc()` site —
+        // (#750) AND by `talos_rpc_subscribers::write_ceiling::record_refusal`
+        // when the signed-RPC memory gate refuses one (#757) — TWO live sites,
+        // not one, which is exactly why the RPC route needed a series of its
+        // own: folded here, a fleet-configuration defect is indistinguishable
+        // from a routine policy refusal. It qualifies for seeding on the same
+        // rule as the others — a compile-time-known label with a live `.inc()` —
         // and it was MISSING, which was measured rather than assumed: on the
         // dev controller 2026-09-05 the four seeded reasons rendered `0` and
         // `write_ceiling` was simply ABSENT until a refusal happened, after
@@ -1870,6 +1925,37 @@ impl TalosMetrics {
             memory_write_failures_total
                 .with_label_values(&[reason])
                 .inc_by(0.0);
+        }
+
+        let rpc_write_ceiling_refusals_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_rpc_write_ceiling_refusals_total",
+                "Signed-RPC mutations the CONTROLLER refused on the per-actor \
+                 write ceiling. Labels: subject (NATS subject) × \
+                 reason=policy|unreadable. A non-zero value is a FLEET \
+                 CONFIGURATION signal: the sending worker did not run its own \
+                 write-ceiling gate, so its TALOS_WRITE_CEILING_ENFORCED is \
+                 unset or its build predates the gate. reason=unreadable is \
+                 the fail-closed arm (absent or unreadable actor row) and \
+                 names an operator problem, not a policy working as \
+                 configured.",
+            ),
+            &["subject", "reason"],
+        )?;
+        registry.register(Box::new(rpc_write_ceiling_refusals_total.clone()))?;
+        // Closed set, every combination has a live emitter: `write_ceiling::gate`
+        // is the ONE chokepoint, it is called on all three subjects, and both
+        // reasons are reachable at each of them (`decide` returns
+        // `Unreadable` for any subject whose actor row is absent or
+        // unreadable). Seeded because the healthy steady state is zero
+        // forever, and `increase(...) > 0` over an ABSENT series matches
+        // nothing — the detector silenced by exactly the condition it detects.
+        for subject in RPC_WRITE_CEILING_SUBJECTS {
+            for reason in ["policy", "unreadable"] {
+                rpc_write_ceiling_refusals_total
+                    .with_label_values(&[subject, reason])
+                    .inc_by(0.0);
+            }
         }
 
         let ops_alert_ingest_failures_total = CounterVec::new(
@@ -2044,6 +2130,7 @@ impl TalosMetrics {
             dlq_db_errors_total,
             kek_decrypt_failures_total,
             memory_write_failures_total,
+            rpc_write_ceiling_refusals_total,
             ops_alert_ingest_failures_total,
             ops_alert_auto_resolved_total,
             module_payload_encryption_failures_total,
@@ -2195,6 +2282,18 @@ mod tests {
             // — and it was unseeded until 2026-09-05, so the series only
             // existed on a controller that had already refused something.
             r#"talos_memory_write_failures_total{reason="write_ceiling"} 0"#,
+            // #757's fleet-configuration signal. Its healthy steady state is
+            // zero forever, which is exactly the case where ABSENT and ZERO
+            // diverge: the alert on it is an `increase(...) > 0`, and an
+            // absent counter matches nothing. All six combinations are seeded
+            // because `write_ceiling::gate` is one chokepoint reached on all
+            // three subjects, and both reasons are reachable at each.
+            r#"talos_rpc_write_ceiling_refusals_total{reason="policy",subject="talos.memory.op"} 0"#,
+            r#"talos_rpc_write_ceiling_refusals_total{reason="unreadable",subject="talos.memory.op"} 0"#,
+            r#"talos_rpc_write_ceiling_refusals_total{reason="policy",subject="talos.integration_state.op"} 0"#,
+            r#"talos_rpc_write_ceiling_refusals_total{reason="unreadable",subject="talos.integration_state.op"} 0"#,
+            r#"talos_rpc_write_ceiling_refusals_total{reason="policy",subject="talos.database.query"} 0"#,
+            r#"talos_rpc_write_ceiling_refusals_total{reason="unreadable",subject="talos.database.query"} 0"#,
             r#"talos_module_payload_encryption_failures_total{op="encrypt",stage="input"} 0"#,
             r#"talos_module_payload_encryption_failures_total{op="encrypt",stage="output"} 0"#,
             r#"talos_module_payload_encryption_failures_total{op="encrypt",stage="trigger_metadata"} 0"#,

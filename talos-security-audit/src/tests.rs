@@ -6,6 +6,22 @@
 
 use super::*;
 
+/// A controller-gate probe fixture.
+///
+/// `envelope: Ok(())` / `rpc: Ok(())` is the HEALTHY gate — what
+/// `ControllerGateProbe::run()` returns on this tree, pinned by
+/// `the_audit_probe_finds_this_gate_healthy` in each owning crate. `enforced`
+/// is the controller's own `TALOS_WRITE_CEILING_ENFORCED`, passed in rather
+/// than read so both postures are testable in one process (the real reader is
+/// a `OnceLock` a test cannot flip).
+fn gate_probe(enforced: bool) -> ControllerGateProbe {
+    ControllerGateProbe {
+        enforced,
+        envelope: Ok(()),
+        rpc: Ok(()),
+    }
+}
+
 // ───────────────────────────────────────────────────────────────────────────
 // jwt_algorithm
 // ───────────────────────────────────────────────────────────────────────────
@@ -1089,21 +1105,32 @@ fn unweighted_checks_cost_nothing() {
             write_ceiling_strict_egress: None,
         }
     }
-    let arms = [
-        check_write_ceiling_enforcement(None),
-        check_write_ceiling_enforcement(Some(summarize_write_ceiling_enforcement(&[]))),
-        check_write_ceiling_enforcement(Some(summarize_write_ceiling_enforcement(&[row(Some(
-            true,
-        ))]))),
-        check_write_ceiling_enforcement(Some(summarize_write_ceiling_enforcement(&[
+    let fleets = [
+        None,
+        Some(summarize_write_ceiling_enforcement(&[])),
+        Some(summarize_write_ceiling_enforcement(&[row(Some(true))])),
+        Some(summarize_write_ceiling_enforcement(&[
             row(Some(true)),
             row(Some(false)),
-        ]))),
-        check_write_ceiling_enforcement(Some(summarize_write_ceiling_enforcement(&[row(Some(
-            false,
-        ))]))),
-        check_write_ceiling_enforcement(Some(summarize_write_ceiling_enforcement(&[row(None)]))),
+        ])),
+        Some(summarize_write_ceiling_enforcement(&[row(Some(false))])),
+        Some(summarize_write_ceiling_enforcement(&[row(None)])),
     ];
+    // Every fleet arm × both controller postures × the BROKEN-gate arm. The
+    // last one is new and is exactly the kind of arm that has slipped through
+    // before: a Fail arm that quietly awards or forfeits points would inflate
+    // `security_score` past `max_score` with nothing failing anywhere.
+    let broken = ControllerGateProbe {
+        enforced: true,
+        envelope: Err("probe: synthetic broken arm"),
+        rpc: Ok(()),
+    };
+    let mut arms = Vec::new();
+    for f in &fleets {
+        for probe in [gate_probe(true), gate_probe(false), broken] {
+            arms.push(check_write_ceiling_enforcement(f.clone(), probe));
+        }
+    }
     for c in &arms {
         assert_eq!(c.points, 0, "{} awarded points under a zero weight", c.name);
         assert_eq!(
@@ -1136,7 +1163,10 @@ mod write_ceiling {
         }
     }
     fn check(rows: &[WorkerBuildRow]) -> Check {
-        check_write_ceiling_enforcement(Some(summarize_write_ceiling_enforcement(rows)))
+        check_write_ceiling_enforcement(
+            Some(summarize_write_ceiling_enforcement(rows)),
+            gate_probe(true),
+        )
     }
 
     /// THE DANGEROUS SURVIVOR. A check that passes when the fleet reports
@@ -1168,7 +1198,7 @@ mod write_ceiling {
     /// response to a Postgres outage.
     #[test]
     fn an_unreadable_registry_is_not_verified_and_blames_the_database() {
-        let c = check_write_ceiling_enforcement(None);
+        let c = check_write_ceiling_enforcement(None, gate_probe(true));
         assert_ne!(c.status, Status::Pass);
         assert_eq!(c.verification, Verification::NotVerified);
         assert_eq!(c.points, 0);
@@ -1177,6 +1207,166 @@ mod write_ceiling {
             c.detail.contains("database problem"),
             "must not read as a finding about the ceiling"
         );
+        // …and it must still say that the CONTROLLER half was exercised. A
+        // failed fleet read is a fact about the fleet; suppressing what this
+        // run DID establish would be the mirror of the defect being fixed.
+        assert!(
+            c.detail.contains("EXERCISED this run"),
+            "an unreadable registry must not erase the controller-half evidence: {}",
+            c.detail
+        );
+    }
+
+    /// THE FALSE SENTENCE. Until this change the detail said, verbatim, "the
+    /// enforcing gate lives in the worker process, so the controller cannot
+    /// exercise it from here" — true when #752 wrote it, and false from #750
+    /// (the `__memory_write__` envelope gate) and #757 (the signed-RPC
+    /// mutation gate), both of which run in THIS process. An audit that
+    /// describes a control it does run as one it cannot reach is the
+    /// misleading-report class inside the report of that control.
+    #[test]
+    fn the_detail_never_claims_the_controller_cannot_exercise_the_gate() {
+        for c in [
+            check(&[row(Some(true))]),
+            check(&[row(Some(false))]),
+            check(&[row(None)]),
+            check_write_ceiling_enforcement(None, gate_probe(true)),
+            check_write_ceiling_enforcement(None, gate_probe(false)),
+        ] {
+            assert!(
+                !c.detail.contains("cannot exercise it from here"),
+                "detail still claims the controller cannot exercise the gate: {}",
+                c.detail
+            );
+            assert!(
+                c.detail.contains("EXERCISED this run"),
+                "every arm must say what the controller half established: {}",
+                c.detail
+            );
+        }
+    }
+
+    /// THE SPLIT. Every worker enforces and this controller does not, so the
+    /// controller's own two routes are ungated for exactly the actors the
+    /// fleet is refusing. #750's chart note says to set the variable on BOTH
+    /// processes; before this change the check reported that state as a clean
+    /// PASS, because it could not see the controller half at all.
+    #[test]
+    fn an_unenforcing_controller_against_an_enforcing_fleet_is_a_split_not_a_pass() {
+        let c = check_write_ceiling_enforcement(
+            Some(summarize_write_ceiling_enforcement(&[row(Some(true))])),
+            gate_probe(false),
+        );
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.detail.contains("SPLIT CONTROL"), "{}", c.detail);
+        assert!(c.detail.contains("BOTH processes"), "{}", c.detail);
+        // The finding rests on the flag and the exercised gates, not on the
+        // fleet self-report — which agrees with neither.
+        assert_eq!(c.verification, Verification::Parsed);
+        assert_eq!(c.points, 0);
+    }
+
+    /// The two halves are verified to different standards and must be
+    /// rendered separately. Collapsing them into one word necessarily
+    /// misstates one of them.
+    #[test]
+    fn the_report_renders_both_halves_with_their_own_verification() {
+        let report = render_report(&[check(&[row(Some(true))])]);
+        let c = report["checks"][0].clone();
+        assert_eq!(
+            c["parts"]["controller_gate"]["verification"],
+            serde_json::json!("round_trip"),
+            "the controller half was exercised and must say so: {c}"
+        );
+        assert_eq!(
+            c["parts"]["worker_fleet"]["verification"],
+            serde_json::json!("config_presence"),
+            "the fleet half is an unsigned self-report and must not claim more: {c}"
+        );
+        assert_eq!(
+            c["parts"]["worker_fleet"]["state"],
+            serde_json::json!("all")
+        );
+        assert_eq!(
+            c["parts"]["controller_gate"]["probe"]["readonly_actor"],
+            serde_json::json!("refused")
+        );
+        assert_eq!(
+            c["parts"]["controller_gate"]["probe"]["unreadable_rule"],
+            serde_json::json!("refused (fail closed)")
+        );
+        // The TOP-level verification stays the weakest of the facts the status
+        // rests on. Promoting the whole check because half of it was exercised
+        // is the overstatement this change exists to remove.
+        assert_eq!(c["verification"], serde_json::json!("config_presence"));
+    }
+
+    /// Only the check that HAS halves emits `parts`. An empty `parts` on every
+    /// other check would read as "this check has halves and they were not
+    /// measured" — the opposite of true.
+    #[test]
+    fn no_other_check_grows_a_parts_key() {
+        let report = render_report(&[check_production_mode(true), check(&[row(Some(true))])]);
+        assert!(report["checks"][0].get("parts").is_none());
+        assert!(report["checks"][1].get("parts").is_some());
+    }
+
+    /// A BROKEN controller gate outranks every fleet finding, is reported at
+    /// `round_trip` (the finding came from an exercise, the shape
+    /// `job_signing_key`'s failing arm already uses), and still costs nothing
+    /// — the check is weighted 0 in every arm, including this new one.
+    #[test]
+    fn a_broken_controller_gate_fails_loudly_and_outranks_the_fleet() {
+        let c = check_write_ceiling_enforcement(
+            Some(summarize_write_ceiling_enforcement(&[row(Some(true))])),
+            ControllerGateProbe {
+                enforced: true,
+                envelope: Ok(()),
+                rpc: Err("signed-RPC route: an unreadable ceiling rule did NOT fail closed"),
+            },
+        );
+        assert_eq!(c.status, Status::Fail);
+        assert_eq!(c.verification, Verification::RoundTrip);
+        assert_eq!(c.points, 0);
+        assert_eq!(c.max_points(), 0);
+        assert!(c.detail.contains("CRITICAL"), "{}", c.detail);
+        assert!(c.detail.contains("did NOT fail closed"), "{}", c.detail);
+    }
+
+    /// The envelope arm is reported too — `broken_arm` must not be wired to
+    /// only one of the two routes.
+    #[test]
+    fn a_broken_envelope_gate_is_reported_as_well() {
+        let probe = ControllerGateProbe {
+            enforced: true,
+            envelope: Err("envelope route: a readonly actor's __memory_write__ was PERMITTED"),
+            rpc: Ok(()),
+        };
+        assert!(probe.broken_arm().is_some());
+        let c = check_write_ceiling_enforcement(None, probe);
+        assert_eq!(c.status, Status::Fail);
+        assert!(
+            c.detail.contains("__memory_write__ was PERMITTED"),
+            "{}",
+            c.detail
+        );
+    }
+
+    /// THE PROBE ITSELF, driven the way the running controller drives it.
+    ///
+    /// This is what makes the `round_trip` label a claim rather than a string:
+    /// if either controller gate regresses, this fails here and the audit
+    /// starts reporting `Fail` in production rather than a green tick.
+    #[test]
+    fn the_live_controller_gates_are_healthy_on_this_tree() {
+        let probe = ControllerGateProbe::run();
+        assert_eq!(
+            probe.broken_arm(),
+            None,
+            "a controller write-ceiling gate is broken: {probe:?}"
+        );
+        assert_eq!(probe.envelope, Ok(()));
+        assert_eq!(probe.rpc, Ok(()));
     }
 
     /// The only passing shape: every registered worker reports enforcement.
@@ -1228,7 +1418,7 @@ mod write_ceiling {
     /// named to the operator rather than being silently absent.
     #[test]
     fn it_reaches_the_report_and_the_recommendation() {
-        let checks = vec![check_write_ceiling_enforcement(None)];
+        let checks = vec![check_write_ceiling_enforcement(None, gate_probe(true))];
         let report = render_report(&checks);
         let names: Vec<&str> = report["checks"]
             .as_array()
@@ -1297,7 +1487,7 @@ fn every_arm_is_weighted_and_within_its_weight() {
         })),
         check_master_encryption_key(Some(KekSelfTest::Unavailable)),
         check_master_encryption_key(None),
-        check_write_ceiling_enforcement(None),
+        check_write_ceiling_enforcement(None, gate_probe(true)),
         check_job_signing_key(JobSigningProbe::Verified),
         check_job_signing_key(JobSigningProbe::Absent),
         check_job_signing_key(JobSigningProbe::Unusable),

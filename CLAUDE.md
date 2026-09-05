@@ -222,6 +222,68 @@ different semantics (a diagnostic; training data), so whether `readonly` should
 bar them is an operator policy call, not a memory-write fix. Recorded so the
 population is visible rather than rediscovered.
 
+**The control's own REPORTING was two defects behind the control (#760).**
+Two, measured 2026-09-05, and they are the same shape one level up — a
+misleading report about the thing being reported on.
+**(a) `security_audit.write_ceiling_enforcement` described a controller that no
+longer exists.** Its detail said, verbatim, "the enforcing gate lives in the
+worker process, so the controller cannot exercise it from here", and graded
+itself `config_presence`. True when #752 wrote it; false from #750 (the
+`__memory_write__` envelope gate) and #757 (the signed-RPC mutation gate), both
+of which run IN the controller and are PURE functions. So the audit's own
+legend — `round_trip` = "a probe value was pushed through the real primitive and
+the result inspected" — was reachable and unclaimed. `ControllerGateProbe::run()`
+now drives both real chokepoints every run (`probe_envelope_gate` /
+`probe_rpc_gate`, each owned by its gate's crate): a readonly probe must be
+REFUSED and its envelope REMOVED, a write-capable one permitted, an unreadable
+rule refused (fail closed), and an unenforcing deployment must permit
+everything. A broken arm is `Status::Fail` + `RoundTrip` + `CRITICAL`, which
+outranks every fleet finding. **The two halves are now rendered separately**
+(`parts.controller_gate` at `round_trip`, `parts.worker_fleet` at
+`config_presence`) because they are known to different standards and one word
+must misstate one of them; the check's TOP-level `verification` stays **the
+weakest of the facts its `status` rests on**, so `verification_counts` cannot
+over-claim — promoting the whole check because half of it was exercised would be
+the same overstatement in the other direction. Weight stays **0** (#752's three
+reasons stand). New finding it can now make: fleet `all` + controller flag unset
+is a **SPLIT CONTROL** `Warn`, not a `Pass` — the `some`-shaped state in the
+OTHER direction from #757's, where every worker refuses a readonly actor's host
+calls while the controller honours the same actor's returned envelope and its
+signed-RPC mutations. `TALOS_WRITE_CEILING_ENFORCED` must be set on BOTH
+processes and this is the check that can now say whether you did.
+**(b) An RPC refusal was indistinguishable from a routine envelope refusal.**
+#757 correctly said a refusal at the controller "means a worker sent a mutation
+its own gate should have refused — a fleet-config signal worth alerting on,
+unlike #750's envelope refusal", and routed it to `event_kind =
+"rpc_write_ceiling_refused"` plus the per-subject `talos_rpc` outcome tag.
+Measured live: **`talos_rpc` is a TRACING TARGET ONLY** — `curl
+/metrics/prometheus | grep '^talos_rpc'` returns nothing and no RPC counter was
+registered — and the three MEMORY routes folded into
+`talos_memory_write_failures_total{reason="write_ceiling"}`, **the same counter
+and label the routine envelope refusal uses, whose own HELP text says "do not
+alert on it"**, while the integration-state and database routes incremented
+NOTHING. So the fleet-config signal existed as prose and not as a series, and
+the one counter carrying part of it actively instructed operators to ignore it —
+check 58/65's class. Now: `talos_rpc_write_ceiling_refusals_total{subject,
+reason}` (`subject` = the NATS subject, `reason` = `policy` | `unreadable`), all
+six combinations PRE-SEEDED at 0 (absent ≠ zero: `increase(...) > 0` over an
+absent series matches nothing), incremented at the ONE chokepoint
+`write_ceiling::gate` so a new controller-served write op cannot forget it, and
+alerted at `warning`/never-paging by `TalosRPCWriteCeilingRefusals`. The
+`memory_write_failures` increment is KEPT — it answers a different question
+("which actor-memory writes did not land") — and the double count is now stated
+in its HELP text rather than silent. The log keeps the worker's tokens
+(`RefusalReason::as_str`); the metric uses the short pair
+(`RefusalReason::metric_label`), paired by an exhaustive match and pinned by
+`refusal_reason_spellings_stay_paired`.
+**No lint check was added, and that is a measurement, not an omission.** The
+obvious guard — "a refusal chokepoint that logs an `event_kind` must also
+increment a counter" — was measured before it was written: the workspace holds
+**22** `event_kind = "…refus|denied|reject|blocked…"` emitters and **21** have no
+counter within ±20 lines. A check cannot ship at 21, this repo does not re-add
+baselines (check 52's own rule), and the adjacency proxy has known false
+positives besides. So the count stays **84**.
+
 Writes that omit `metadata` produce rows with `metadata IS NULL`, which
 pass every filter — the right default for engine-trace style writes that
 shouldn't be excluded from recall. Readers don't need an `"execution"`

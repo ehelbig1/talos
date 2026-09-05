@@ -20,6 +20,17 @@
 //! [`Verification::ConfigPresence`] exist so a green tick can never mean "I did
 //! not look".
 //!
+//! **"Cannot be exercised" is a claim with an expiry date.** `write_ceiling_enforcement`
+//! said, verbatim, "the enforcing gate lives in the worker process, so the
+//! controller cannot exercise it from here" — true when it was written, and
+//! false from the moment the controller grew write-ceiling gates of its own
+//! (#750's `__memory_write__` envelope gate, #757's signed-RPC gate). Both run
+//! in THIS process; both are pure; both are now driven by
+//! [`ControllerGateProbe::run`] on every audit. When a check's own reason for
+//! not exercising something stops being true, the check becomes a false
+//! statement about the control it audits — which is the misleading-report class
+//! this crate exists to remove, arriving from inside.
+//!
 //! # Two failure modes, deliberately not collapsed
 //!
 //! *Control absent* and *control present but non-functional* are different
@@ -36,7 +47,10 @@
 //! None. Every probe operates on values minted inside the probe itself, and
 //! nothing is persisted, published, cached or counted. See the per-probe notes
 //! on [`SecretsManager::kek_selftest`], [`talos_audit_event::signing_selftest`]
-//! and [`talos_auth::jwt_selftest`].
+//! and [`talos_auth::jwt_selftest`]. The write-ceiling probes are the same:
+//! [`ControllerGateProbe::run`] pushes a synthetic node output and four
+//! synthetic ceiling reads through the two real gates, touching no database, no
+//! actor row and no counter.
 //!
 //! [`SecretsManager::kek_selftest`]: talos_secrets_manager::SecretsManager::kek_selftest
 
@@ -218,6 +232,19 @@ pub struct Check {
     pub verification: Verification,
     /// Points this outcome contributes to `security_score`.
     pub points: u32,
+    /// Optional per-HALF breakdown, for a check whose subject has more than
+    /// one enforcement surface and whose halves are verified to DIFFERENT
+    /// standards.
+    ///
+    /// `None` for every check with a single surface — which is all of them but
+    /// one. `write_ceiling_enforcement` uses it because the write ceiling is
+    /// ONE control with a controller half this process can EXERCISE and a
+    /// worker-fleet half it can only read a self-report about, and collapsing
+    /// those into a single `verification` word necessarily misstates one of
+    /// them. Each part carries its own `verification`; the check's top-level
+    /// `verification` remains the WEAKEST of the facts its `status` rests on,
+    /// so `verification_counts` can never over-claim.
+    pub parts: Option<serde_json::Value>,
 }
 
 impl Check {
@@ -252,7 +279,7 @@ impl Check {
     }
 
     fn json(&self) -> serde_json::Value {
-        serde_json::json!({
+        let mut v = serde_json::json!({
             "check": self.name,
             "status": self.status.as_str(),
             "detail": self.detail,
@@ -260,7 +287,14 @@ impl Check {
             "points": self.points,
             "max_points": self.max_points(),
             "kind": self.kind().as_str(),
-        })
+        });
+        // Only the check that HAS halves emits the key. An empty `parts: {}`
+        // on every other check would read as "this check has halves and they
+        // were not measured", which is the opposite of true.
+        if let (Some(parts), Some(obj)) = (self.parts.clone(), v.as_object_mut()) {
+            obj.insert("parts".to_string(), parts);
+        }
+        v
     }
 }
 
@@ -280,6 +314,7 @@ pub fn check_production_mode(is_prod: bool) -> Check {
         },
         verification: Verification::Parsed,
         points: if is_prod { 10 } else { 0 },
+        parts: None,
     }
 }
 
@@ -310,6 +345,7 @@ pub fn check_jwt_algorithm(outcome: talos_auth::JwtSelfTest, topology: &str) -> 
             ),
             verification: Verification::RoundTrip,
             points: 10,
+            parts: None,
         },
         talos_auth::JwtSelfTest::Verified {
             algorithm,
@@ -325,6 +361,7 @@ pub fn check_jwt_algorithm(outcome: talos_auth::JwtSelfTest, topology: &str) -> 
             ),
             verification: Verification::RoundTrip,
             points: 10,
+            parts: None,
         },
         talos_auth::JwtSelfTest::Verified { algorithm, .. } => Check {
             name: "jwt_algorithm",
@@ -336,6 +373,7 @@ pub fn check_jwt_algorithm(outcome: talos_auth::JwtSelfTest, topology: &str) -> 
             ),
             verification: Verification::RoundTrip,
             points: 5,
+            parts: None,
         },
         talos_auth::JwtSelfTest::Broken { stage: "secret" } => Check {
             name: "jwt_algorithm",
@@ -345,6 +383,7 @@ pub fn check_jwt_algorithm(outcome: talos_auth::JwtSelfTest, topology: &str) -> 
                 .to_string(),
             verification: Verification::RoundTrip,
             points: 0,
+            parts: None,
         },
         talos_auth::JwtSelfTest::Broken { stage } => Check {
             name: "jwt_algorithm",
@@ -359,6 +398,7 @@ pub fn check_jwt_algorithm(outcome: talos_auth::JwtSelfTest, topology: &str) -> 
             ),
             verification: Verification::RoundTrip,
             points: 0,
+            parts: None,
         },
     }
 }
@@ -382,6 +422,7 @@ pub fn check_master_encryption_key(outcome: Option<KekSelfTest>) -> Check {
             ),
             verification: Verification::RoundTrip,
             points: 15,
+            parts: None,
         },
         Some(KekSelfTest::Failed { provider, stage }) => Check {
             name: "master_encryption_key",
@@ -395,6 +436,7 @@ pub fn check_master_encryption_key(outcome: Option<KekSelfTest>) -> Check {
             ),
             verification: Verification::RoundTrip,
             points: 0,
+            parts: None,
         },
         Some(KekSelfTest::Unavailable) => Check {
             name: "master_encryption_key",
@@ -404,6 +446,7 @@ pub fn check_master_encryption_key(outcome: Option<KekSelfTest>) -> Check {
                 .to_string(),
             verification: Verification::NotVerified,
             points: 0,
+            parts: None,
         },
         None => Check {
             name: "master_encryption_key",
@@ -416,6 +459,7 @@ pub fn check_master_encryption_key(outcome: Option<KekSelfTest>) -> Check {
             ),
             verification: Verification::NotVerified,
             points: 0,
+            parts: None,
         },
     }
 }
@@ -517,6 +561,7 @@ pub fn check_job_signing_key(outcome: JobSigningProbe) -> Check {
                 .to_string(),
             verification: Verification::RoundTrip,
             points: 15,
+            parts: None,
         },
         JobSigningProbe::Absent => Check {
             name: "job_signing_key",
@@ -524,6 +569,7 @@ pub fn check_job_signing_key(outcome: JobSigningProbe) -> Check {
             detail: "WORKER_SHARED_KEY not set — job payloads are unsigned".to_string(),
             verification: Verification::Parsed,
             points: 0,
+            parts: None,
         },
         JobSigningProbe::Unusable => Check {
             name: "job_signing_key",
@@ -535,6 +581,7 @@ pub fn check_job_signing_key(outcome: JobSigningProbe) -> Check {
                 .to_string(),
             verification: Verification::RoundTrip,
             points: 0,
+            parts: None,
         },
         JobSigningProbe::RoundTripFailed => Check {
             name: "job_signing_key",
@@ -545,6 +592,7 @@ pub fn check_job_signing_key(outcome: JobSigningProbe) -> Check {
                 .to_string(),
             verification: Verification::RoundTrip,
             points: 0,
+            parts: None,
         },
     }
 }
@@ -584,6 +632,7 @@ pub fn check_aot_integrity_key(raw: &str) -> Check {
                 .to_string(),
             verification: Verification::ConfigPresence,
             points: 0,
+            parts: None,
         };
     }
     if decoded_len < MIN_AOT_KEY_BYTES {
@@ -597,6 +646,7 @@ pub fn check_aot_integrity_key(raw: &str) -> Check {
             ),
             verification: Verification::ConfigPresence,
             points: 0,
+            parts: None,
         };
     }
     Check {
@@ -608,6 +658,7 @@ pub fn check_aot_integrity_key(raw: &str) -> Check {
             .to_string(),
         verification: Verification::ConfigPresence,
         points: 10,
+        parts: None,
     }
 }
 
@@ -640,6 +691,7 @@ pub fn check_audit_event_signing(
                 .to_string(),
             verification: Verification::RoundTrip,
             points: 10,
+            parts: None,
         },
         (_, false, _) => Check {
             name: "audit_event_signing",
@@ -647,6 +699,7 @@ pub fn check_audit_event_signing(
             detail: "TALOS_AUDIT_SIGNING_KEY not set — audit events are unsigned".to_string(),
             verification: Verification::Parsed,
             points: 0,
+            parts: None,
         },
         // Key configured, but nothing signs and nothing verifies: the loader
         // dropped it at the entropy floor.
@@ -661,6 +714,7 @@ pub fn check_audit_event_signing(
                 .to_string(),
             verification: Verification::RoundTrip,
             points: 0,
+            parts: None,
         },
         // Signing and verification are both configured and disagree.
         (_, true, true) => Check {
@@ -673,6 +727,7 @@ pub fn check_audit_event_signing(
                 .to_string(),
             verification: Verification::RoundTrip,
             points: 0,
+            parts: None,
         },
     }
 }
@@ -750,6 +805,7 @@ pub fn check_redis_tls(transport: RedisTransport, is_prod: bool) -> Check {
             detail: "Redis not configured".to_string(),
             verification: Verification::Parsed,
             points: 0,
+            parts: None,
         },
         RedisTransport::Tls => Check {
             name: "redis_tls",
@@ -759,6 +815,7 @@ pub fn check_redis_tls(transport: RedisTransport, is_prod: bool) -> Check {
                 .to_string(),
             verification: Verification::Parsed,
             points: 10,
+            parts: None,
         },
         RedisTransport::TlsInsecure => Check {
             name: "redis_tls",
@@ -770,6 +827,7 @@ pub fn check_redis_tls(transport: RedisTransport, is_prod: bool) -> Check {
                 .to_string(),
             verification: Verification::Parsed,
             points: 0,
+            parts: None,
         },
         RedisTransport::Plaintext => Check {
             name: "redis_tls",
@@ -777,6 +835,7 @@ pub fn check_redis_tls(transport: RedisTransport, is_prod: bool) -> Check {
             detail: "Redis using plaintext (redis://) — use rediss:// in production".to_string(),
             verification: Verification::Parsed,
             points: 0,
+            parts: None,
         },
         RedisTransport::UnixSocket => Check {
             name: "redis_tls",
@@ -785,6 +844,7 @@ pub fn check_redis_tls(transport: RedisTransport, is_prod: bool) -> Check {
                 .to_string(),
             verification: Verification::Parsed,
             points: 0,
+            parts: None,
         },
         RedisTransport::Unparseable => Check {
             name: "redis_tls",
@@ -796,6 +856,7 @@ pub fn check_redis_tls(transport: RedisTransport, is_prod: bool) -> Check {
                 .to_string(),
             verification: Verification::Parsed,
             points: 0,
+            parts: None,
         },
     }
 }
@@ -815,6 +876,7 @@ pub fn check_audit_immutability_triggers(count: Option<i64>) -> Check {
             detail: format!("{} immutability trigger(s) active", n),
             verification: Verification::RoundTrip,
             points: 10,
+            parts: None,
         },
         Some(_) => Check {
             name: "audit_immutability_triggers",
@@ -822,6 +884,7 @@ pub fn check_audit_immutability_triggers(count: Option<i64>) -> Check {
             detail: "No audit immutability triggers found — run migrations".to_string(),
             verification: Verification::RoundTrip,
             points: 0,
+            parts: None,
         },
         None => Check {
             name: "audit_immutability_triggers",
@@ -832,6 +895,7 @@ pub fn check_audit_immutability_triggers(count: Option<i64>) -> Check {
                 .to_string(),
             verification: Verification::NotVerified,
             points: 0,
+            parts: None,
         },
     }
 }
@@ -840,78 +904,225 @@ pub fn check_audit_immutability_triggers(count: Option<i64>) -> Check {
 // Check 10 — per-actor write-ceiling enforcement (reported, unscored)
 // ───────────────────────────────────────────────────────────────────────────
 
+/// What one exercise of the CONTROLLER's own write-ceiling gates found.
+///
+/// # Why this type exists
+///
+/// The write ceiling is ONE control with THREE enforcement surfaces, and until
+/// this change the audit knew about one of them. The worker gates
+/// `agent_memory::set` and friends in its own process; the CONTROLLER gates the
+/// `__memory_write__` envelope on node completion (#750) and every
+/// actor-attributed signed-RPC mutation (#757). Both controller gates run in
+/// THIS process, both are pure functions, and both can therefore be handed a
+/// probe value and inspected — which is precisely the `round_trip` standard
+/// this audit's own legend sets.
+///
+/// The check used to say, verbatim, "the enforcing gate lives in the worker
+/// process, so the controller cannot exercise it from here." That was true when
+/// #752 wrote it and false by the time it was read: a false statement about the
+/// control being audited, inside the audit of that control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ControllerGateProbe {
+    /// Whether THIS process enforces the ceiling, from the controller's ONE
+    /// reader of `TALOS_WRITE_CEILING_ENFORCED`.
+    ///
+    /// Deliberately not re-read here. A second reader of a flag is a second
+    /// answer to "is this control live" (check 69's class), and an audit that
+    /// disagrees with the gate it audits is worse than one that stays quiet.
+    pub enforced: bool,
+    /// The `__memory_write__` envelope route (#750).
+    pub envelope: Result<(), &'static str>,
+    /// The signed-RPC mutation route (#757).
+    pub rpc: Result<(), &'static str>,
+}
+
+impl ControllerGateProbe {
+    /// Exercise both controller gates and read the controller's own flag.
+    ///
+    /// Pure, in-process, side-effect free and allocation-light — no database,
+    /// no env read beyond the already-cached `OnceLock`. That is what lets
+    /// [`run_security_audit`] keep its "the only database access is a read of
+    /// `pg_trigger`" promise while raising this check to `round_trip`.
+    #[must_use]
+    pub fn run() -> Self {
+        Self {
+            enforced: talos_workflow_engine::write_ceiling_gate::controller_write_ceiling_enforced(
+            ),
+            envelope: talos_workflow_engine::write_ceiling_gate::probe_envelope_gate(),
+            rpc: talos_rpc_subscribers::write_ceiling::probe_rpc_gate(),
+        }
+    }
+
+    /// The first broken arm, if either gate misbehaved.
+    #[must_use]
+    pub fn broken_arm(&self) -> Option<&'static str> {
+        self.envelope.err().or_else(|| self.rpc.err())
+    }
+}
+
 /// Render `write_ceiling_enforcement`.
 ///
 /// # What this grades
 ///
-/// `actors.max_write_ceiling` (`readonly` | `write`) is set on the controller
-/// and travels HMAC-bound on every job, but it is enforced only inside the
-/// WORKER process, gated on a worker-only env flag that is default OFF. So
-/// until the fleet reported that flag, an enforcing deployment and a
-/// decorative one were indistinguishable from every controller surface — and
-/// this audit had no ceiling check at all.
+/// `actors.max_write_ceiling` (`readonly` | `write`) is ONE control with two
+/// halves this process can know to two DIFFERENT standards, and the shape of
+/// this check follows from refusing to average them:
 ///
-/// # Why it never awards from a default
+/// * **The controller half** — the `__memory_write__` envelope gate (#750) and
+///   the signed-RPC mutation gate (#757) — runs here. It is EXERCISED every run
+///   by [`ControllerGateProbe::run`]: a readonly probe must be refused, a
+///   write-capable probe permitted, an unreadable rule refused (fail closed),
+///   and an unenforcing deployment must permit everything. That is
+///   `round_trip`.
+/// * **The worker-fleet half** is a value another process reported about its
+///   own env at ITS boot, transported UNSIGNED. Nothing was exercised. That is
+///   `config_presence` — the same standing as `aot_integrity_key`, whose
+///   enforcing key ring likewise lives in the worker.
 ///
-/// `None` means the fleet registry could not be read. That is [`NotVerified`]
-/// with zero points, never a pass: "nobody looked" and "nothing enforces" are
-/// different findings, and only one of them is about the database.
+/// # The top-level `verification`, and the rule behind it
 ///
-/// [`FleetWriteCeilingState::Unknown`] is likewise NOT a pass. It is what a
-/// fleet reports when nothing has registered, or when nobody reports
-/// enforcement and at least one row said nothing — the state in which the most
-/// tempting wrong answer ("no evidence of a problem") is exactly backwards.
-/// It maps to `NotVerified`, so the report's own `verification_counts` and the
-/// recommendation both name it as unestablished rather than fine.
+/// **The weakest verification among the facts the `status` rests on**, with one
+/// exception: a BROKEN controller gate is [`RoundTrip`], because that finding
+/// came from an exercise (the shape `job_signing_key`'s failing arm already
+/// uses).
 ///
-/// # Verification level, and why not higher
+/// So a healthy, fully-enforcing deployment still reports `config_presence` at
+/// the top, and `parts.controller_gate.verification` reports the `round_trip`
+/// that actually happened. Promoting the WHOLE check to `round_trip` because
+/// half of it was exercised would overstate — the fleet half is still an
+/// unsigned self-report — and overstating is the defect this change exists to
+/// remove. Understating, with a per-half breakdown that says which half is
+/// which, is the safe direction.
 ///
-/// Even the positive answer is [`ConfigPresence`], matching
-/// `aot_integrity_key` — whose enforcing key ring likewise lives in the worker
-/// process. Nothing here was exercised: the controller read a value another
-/// process reported about its own env at ITS boot, transported unsigned. It is
-/// evidence about configuration, not a demonstration that a mutation would be
-/// refused. Calling it `Parsed` would claim the value was read through the code
-/// that enforces it, which is true only in the worker, not here.
+/// # Why `None` is never a pass
+///
+/// `None` means the fleet registry could not be read: "nobody looked" and
+/// "nothing enforces" are different findings and only one of them is about the
+/// database. [`Unknown`] is likewise not a pass — it is what a fleet reports
+/// when nothing has registered, the state in which the most tempting wrong
+/// answer ("no evidence of a problem") is exactly backwards.
+///
+/// # The split
+///
+/// A fleet reporting `all` while THIS controller's flag is unset is a
+/// `some`-shaped split across the two halves of one control, in the other
+/// direction from the one #757 called dangerous: every worker refuses a
+/// readonly actor's host calls, and the controller honours the same actor's
+/// returned `__memory_write__` envelope and its signed-RPC mutations. #750's
+/// chart note says to set the variable on BOTH processes; this is the check
+/// that can now say whether you did.
 ///
 /// # What it deliberately does not do
 ///
-/// It does not count `readonly` actors. That would need a cross-tenant actor
-/// query for a platform-wide audit, and it would invent an awkward "zero
-/// readonly actors" arm whose only honest answer is the one this check already
-/// gives. The per-actor consequence is disclosed where it is actionable —
-/// `set_actor_write_ceiling` prints this same summary at the moment an
-/// operator sets a ceiling.
+/// It does not count `readonly` actors — that needs a cross-tenant actor query
+/// for a platform-wide audit, and the per-actor consequence is disclosed where
+/// it is actionable (`set_actor_write_ceiling`). It does not probe the
+/// DB-backed ceiling READ; see
+/// [`talos_rpc_subscribers::write_ceiling::probe_rpc_gate`] for why, and
+/// `controller/tests/rpc_write_ceiling_tests.rs` for what covers it.
 ///
-/// [`NotVerified`]: Verification::NotVerified
-/// [`ConfigPresence`]: Verification::ConfigPresence
+/// [`RoundTrip`]: Verification::RoundTrip
+/// [`Unknown`]: talos_worker_identity_repository::FleetWriteCeilingState::Unknown
 #[must_use]
 pub fn check_write_ceiling_enforcement(
     fleet: Option<talos_worker_identity_repository::WriteCeilingFleetSummary>,
+    probe: ControllerGateProbe,
 ) -> Check {
     use talos_worker_identity_repository::FleetWriteCeilingState as S;
+
+    let controller_part = |probe_json: serde_json::Value, verification: &'static str| {
+        serde_json::json!({
+            "enforced_flag": probe.enforced,
+            "probe": probe_json,
+            "verification": verification,
+        })
+    };
+
+    // A broken controller gate outranks every fleet finding: the process
+    // running this audit does not refuse what it is configured to refuse.
+    if let Some(arm) = probe.broken_arm() {
+        return Check {
+            name: "write_ceiling_enforcement",
+            status: Status::Fail,
+            detail: format!(
+                "CRITICAL: the CONTROLLER's own write-ceiling gate did not behave as the \
+                 control requires — {arm}. A probe value was pushed through the real gate and \
+                 the result inspected; this is not a reading of configuration. Until it is \
+                 fixed, a 'readonly' actor's writes are bounded by nothing the controller does."
+            ),
+            verification: Verification::RoundTrip,
+            points: 0,
+            parts: Some(serde_json::json!({
+                "controller_gate": controller_part(
+                    serde_json::json!({"result": "BROKEN", "arm": arm}),
+                    "round_trip",
+                ),
+                "worker_fleet": fleet_part(fleet.as_ref()),
+            })),
+        };
+    }
+
+    // Both controller gates behaved. Say exactly which values were pushed
+    // through them, so `round_trip` is a claim an operator can check.
+    let probe_json = serde_json::json!({
+        "readonly_actor": "refused",
+        "write_capable_actor": "permitted",
+        "unreadable_rule": "refused (fail closed)",
+        "enforcement_disabled": "permitted",
+        "routes": ["__memory_write__ envelope (#750)", "signed-RPC mutation (#757)"],
+    });
 
     let Some(f) = fleet else {
         return Check {
             name: "write_ceiling_enforcement",
             status: Status::Warn,
-            detail: "NOT VERIFIED: the worker-identity registry query failed, so this run did \
-                     not establish whether any worker enforces the per-actor write ceiling. \
-                     This is a database problem, not a finding about the ceiling."
-                .to_string(),
+            detail: format!(
+                "PARTLY VERIFIED. Controller half, EXERCISED this run: {} Fleet half, NOT \
+                 VERIFIED: the worker-identity registry query failed, so this run did not \
+                 establish whether any WORKER enforces the ceiling — a database problem, not a \
+                 finding about the ceiling.",
+                controller_posture(probe.enforced)
+            ),
             verification: Verification::NotVerified,
             points: 0,
+            parts: Some(serde_json::json!({
+                "controller_gate": controller_part(probe_json, "round_trip"),
+                "worker_fleet": fleet_part(None),
+            })),
         };
     };
 
-    let (status, verification) = match f.state {
-        S::All => (Status::Pass, Verification::ConfigPresence),
-        // A mixed fleet is a real finding: nothing routes jobs by enforcement
-        // posture, so a readonly actor's job may land on the worker that does
-        // not enforce.
-        S::Some | S::None => (Status::Warn, Verification::ConfigPresence),
-        // Not a pass. Nothing was established.
-        S::Unknown => (Status::Warn, Verification::NotVerified),
+    // The split: every worker enforces, this controller does not. Not a pass —
+    // the controller's two routes are ungated for the same actors the fleet is
+    // refusing.
+    let split = matches!(f.state, S::All) && !probe.enforced;
+
+    let (status, verification) = if split {
+        // The finding rests on the flag — read through the ONE reader the gate
+        // itself uses, i.e. `Parsed` — and on the exercised gates. It does not
+        // rest on the fleet self-report, which agrees with neither. `Parsed` is
+        // the weaker of the two facts it does rest on.
+        (Status::Warn, Verification::Parsed)
+    } else {
+        match f.state {
+            S::All => (Status::Pass, Verification::ConfigPresence),
+            // A mixed fleet is a real finding: nothing routes jobs by
+            // enforcement posture, so a readonly actor's job may land on the
+            // worker that does not enforce.
+            S::Some | S::None => (Status::Warn, Verification::ConfigPresence),
+            // Not a pass. Nothing was established about the fleet.
+            S::Unknown => (Status::Warn, Verification::NotVerified),
+        }
+    };
+
+    let split_note = if split {
+        " SPLIT CONTROL: every registered worker enforces the ceiling and THIS CONTROLLER does \
+         not — TALOS_WRITE_CEILING_ENFORCED is unset here, so the controller's own two routes \
+         (a module's returned __memory_write__ envelope, and every actor-attributed signed-RPC \
+         mutation) are ungated for the same actors the fleet is refusing. Set the variable on \
+         BOTH processes."
+    } else {
+        ""
     };
 
     Check {
@@ -919,12 +1130,56 @@ pub fn check_write_ceiling_enforcement(
         status,
         detail: format!(
             "{} Worker-self-reported at registration and UNSIGNED — diagnostic only, never an \
-             authorization input; the enforcing gate lives in the worker process, so the \
-             controller cannot exercise it from here. Reported, not scored.",
-            f.note()
+             authorization input.{} CONTROLLER HALF, EXERCISED this run: {} Reported, not \
+             scored.",
+            f.note(),
+            split_note,
+            controller_posture(probe.enforced),
         ),
         verification,
         points: 0,
+        parts: Some(serde_json::json!({
+            "controller_gate": controller_part(probe_json, "round_trip"),
+            "worker_fleet": fleet_part(Some(&f)),
+        })),
+    }
+}
+
+/// One sentence describing what the controller's own gates do, given the flag.
+///
+/// Both halves are true statements about an EXERCISED gate: with the flag off
+/// the gates were still driven and still permitted everything, which is the
+/// documented staged-rollout default rather than an absence of evidence.
+fn controller_posture(enforced: bool) -> &'static str {
+    if enforced {
+        "TALOS_WRITE_CEILING_ENFORCED is set here, and both controller gates (the \
+         __memory_write__ envelope gate and the signed-RPC mutation gate) refused a readonly \
+         probe, permitted a write-capable one, and failed CLOSED on an unreadable rule."
+    } else {
+        "TALOS_WRITE_CEILING_ENFORCED is NOT set here, so both controller gates permit every \
+         write by design (the staged-rollout default) — the gates themselves were driven and \
+         are correct; they are switched off."
+    }
+}
+
+/// The fleet half of `parts`, at the only standard it can honestly claim.
+fn fleet_part(
+    fleet: Option<&talos_worker_identity_repository::WriteCeilingFleetSummary>,
+) -> serde_json::Value {
+    match fleet {
+        Some(f) => serde_json::json!({
+            "state": f.state.as_str(),
+            "note": f.note(),
+            "source": "worker self-report at registration, UNSIGNED",
+            "verification": "config_presence",
+        }),
+        None => serde_json::json!({
+            "state": null,
+            "note": "the worker-identity registry query failed — nothing was established about \
+                     the fleet",
+            "source": "worker self-report at registration, UNSIGNED",
+            "verification": "not_verified",
+        }),
     }
 }
 
@@ -954,6 +1209,7 @@ pub fn check_cors_origins(parsed: &Result<Vec<String>, String>, explicitly_set: 
             detail: format!("CRITICAL: {}", e),
             verification: Verification::Parsed,
             points: 0,
+            parts: None,
         },
         Ok(origins) if origins.is_empty() => Check {
             name: "cors_origins",
@@ -964,6 +1220,7 @@ pub fn check_cors_origins(parsed: &Result<Vec<String>, String>, explicitly_set: 
                 .to_string(),
             verification: Verification::Parsed,
             points: 0,
+            parts: None,
         },
         Ok(origins) if explicitly_set => Check {
             name: "cors_origins",
@@ -974,6 +1231,7 @@ pub fn check_cors_origins(parsed: &Result<Vec<String>, String>, explicitly_set: 
             ),
             verification: Verification::Parsed,
             points: 10,
+            parts: None,
         },
         Ok(origins) => Check {
             name: "cors_origins",
@@ -984,6 +1242,7 @@ pub fn check_cors_origins(parsed: &Result<Vec<String>, String>, explicitly_set: 
             ),
             verification: Verification::Parsed,
             points: 0,
+            parts: None,
         },
     }
 }
@@ -1296,7 +1555,7 @@ pub async fn run_security_audit(
             is_prod,
         ),
         check_audit_immutability_triggers(triggers),
-        check_write_ceiling_enforcement(write_ceiling_fleet),
+        check_write_ceiling_enforcement(write_ceiling_fleet, ControllerGateProbe::run()),
         check_cors_origins(
             &talos_config::check_allowed_origins(),
             talos_config::env_var_is_set_nonempty("ALLOWED_ORIGIN"),
