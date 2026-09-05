@@ -138,15 +138,35 @@ impl SessionBriefService {
             .await
             .unwrap_or_default();
 
-        // Auto-archive stale drafts if requested
+        // Auto-archive stale drafts if requested.
+        //
+        // An `Err` here is DISCLOSED, not defaulted to 0: the sweep aborts
+        // rather than archive without the child exclusion (see
+        // `archive_stale_drafts_excluding_children`), and "0 archived" beside a
+        // silent failure reads as "there was nothing stale" — a claim about
+        // system state nobody measured.
         let mut auto_archived_count = 0i64;
+        let mut auto_archive_outcome: Option<talos_advanced_repository::StaleDraftArchiveOutcome> =
+            None;
+        let mut auto_archive_failed = false;
         if let Some(stale_days) = auto_archive_days {
-            if let Ok(n) = self
+            match self
                 .advanced_repo
-                .archive_stale_drafts(user_id, stale_days as i32)
+                .archive_stale_drafts_excluding_children(user_id, stale_days as i32)
                 .await
             {
-                auto_archived_count = n as i64;
+                Ok(outcome) => {
+                    auto_archived_count = i64::try_from(outcome.archived).unwrap_or(i64::MAX);
+                    auto_archive_outcome = Some(outcome);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        %user_id,
+                        error = %e,
+                        "session_start auto-archive failed; no draft was archived"
+                    );
+                    auto_archive_failed = true;
+                }
             }
         }
 
@@ -778,7 +798,39 @@ impl SessionBriefService {
         }
 
         if auto_archive_days.is_some() {
-            report["auto_archived_stale_drafts"] = serde_json::json!(auto_archived_count);
+            if auto_archive_failed {
+                // Null, not zero. A count of 0 here is indistinguishable from
+                // "nothing was stale", which is exactly the reassuring answer
+                // the surface must not invent.
+                report["auto_archived_stale_drafts"] = serde_json::Value::Null;
+                report["auto_archive_error"] = serde_json::json!(
+                    "the stale-draft sweep could not run, so NO draft was archived and this \
+                     response does not say how many were eligible (see the server log)"
+                );
+            } else {
+                report["auto_archived_stale_drafts"] = serde_json::json!(auto_archived_count);
+            }
+            if let Some(outcome) = auto_archive_outcome.as_ref() {
+                if !outcome.skipped_children.is_empty() {
+                    // The count and the eligible population deliberately
+                    // disagree, so say why — same vocabulary the hygiene
+                    // report uses for the same exclusion.
+                    report["auto_archive_skipped_children"] = serde_json::json!(outcome
+                        .skipped_children
+                        .iter()
+                        .map(|c| serde_json::json!({
+                            "id": c.id.to_string(),
+                            "name": c.name,
+                            "runs_as_child_of": c.runs_as_child_of,
+                            "reason": c.reason,
+                        }))
+                        .collect::<Vec<_>>());
+                }
+                if !outcome.unreadable_parents.is_empty() {
+                    report["auto_archive_unreadable_parents"] =
+                        serde_json::json!(outcome.unreadable_parents);
+                }
+            }
         }
 
         // #7 — hint to enable auto_archive when in-progress drafts accumulate

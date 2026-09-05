@@ -13,6 +13,10 @@ chrono.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+# The child-workflow reference scan. `delete_workflows` is the LAST line of
+# defence in front of an irreversible write — every other guard in this class
+# lives in a report that recommends calling it (#758/#759).
+talos-child-workflow-refs = { path = "../talos-child-workflow-refs" }
 talos-config = { path = "../talos-config" }
 talos-db = { path = "../talos-db" }
 talos-tenancy = { path = "../talos-tenancy" }
