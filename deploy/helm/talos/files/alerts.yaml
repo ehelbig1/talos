@@ -2160,6 +2160,69 @@ groups:
                reaper's precondition, which is the only thing keeping the
                detector and the reaper honest with each other.
 
+      # ── The controller refused a signed-RPC mutation on the per-actor write
+      # ceiling. This is a FLEET-CONFIGURATION signal, not a routine policy
+      # event, and the distinction is the whole reason the series exists.
+      #
+      # A worker gates these ops itself (`write_ceiling_refuses`). Reaching the
+      # controller's gate means the SENDER did not: its
+      # TALOS_WRITE_CEILING_ENFORCED is unset, its build predates the gate, or
+      # it is not a Talos worker at all — the request is signed under the
+      # FLEET-SHARED WORKER_SHARED_KEY, which proves possession of a key, never
+      # that a gate ran.
+      #
+      # Never paging. The refusal WORKED: the mutation did not land. What wants
+      # a human is the configuration behind it, on a working-hours timescale.
+      #
+      # No `absent()` arm, deliberately: all six (subject, reason) combinations
+      # are PRE-SEEDED at 0 in talos-metrics, so the series is present from the
+      # controller's first scrape and `increase(...) > 0` is well-defined on it.
+      # (An absent arm here would fire on every controller that has not yet
+      # started, i.e. permanently red during a rollout.) The seed proves
+      # REGISTRATION; what proves the incrementing call site still exists is
+      # `a_refusal_moves_the_rpc_counter` in talos-rpc-subscribers, which drives
+      # the production recorder.
+      #
+      # reason="unreadable" is the fail-closed arm — an absent or unreadable
+      # actor row — and names an operator problem (a dangling actor id, or a
+      # database the enforcement path cannot reach) rather than a policy
+      # working as configured. Both reasons are kept in one alert so the label
+      # reaches the operator instead of being aggregated away.
+      - alert: TalosRPCWriteCeilingRefusals
+        expr: increase(talos_rpc_write_ceiling_refusals_total[15m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          category: fleet-config
+        annotations:
+          summary: "Controller refused a signed-RPC mutation on the write ceiling ({{ $labels.subject }}, {{ $labels.reason }})"
+          description: |
+            A worker sent an actor-attributed mutation on {{ $labels.subject }}
+            that its OWN write-ceiling gate should have refused, and the
+            controller refused it instead ({{ $value }} in 15m,
+            reason={{ $labels.reason }}).
+
+            The mutation did NOT land — this is not data loss. It is evidence
+            that at least one sender is not running the gate, so a readonly
+            actor's WORKER-LOCAL egress (http-fetch, webhook-send, email-send —
+            everything the controller cannot see) is very likely ungated on
+            that same sender.
+          action: |
+            1. `get_platform_info` → `fleet.write_ceiling.enforced_by`. `some`
+               or `none` names the problem directly; `all` means the sender is
+               not a registered worker and the finding is an identity one.
+            2. `security_audit` → the `write_ceiling_enforcement` check. Its
+               `parts.controller_gate` says whether THIS controller enforces
+               and whether its own gates are healthy; `parts.worker_fleet`
+               says what the fleet self-reported.
+            3. reason="policy": set TALOS_WRITE_CEILING_ENFORCED on the workers
+               that lack it (values.yaml sets it on BOTH controller and worker
+               — a deployment with only one is the split this alert catches).
+            4. reason="unreadable": the gate failed CLOSED because the actor's
+               ceiling could not be read. Look for `event_kind =
+               write_ceiling_read_failed` on the talos_rpc target — a dangling
+               actor_id, or Postgres unreachable from the enforcement path.
+
   # ────────────────────────────────────────────────────────────────────
   - name: talos.integrations
     interval: 30s

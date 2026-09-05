@@ -95,6 +95,29 @@ impl RefusalReason {
             Self::Unreadable => "write_ceiling_unreadable",
         }
     }
+
+    /// The same two-valued fact, spelled for the `reason` label of
+    /// `talos_rpc_write_ceiling_refusals_total`.
+    ///
+    /// A SECOND spelling of one fact is the drift this file's own tests are
+    /// about, so it is justified rather than assumed: the metric is already
+    /// named `..._write_ceiling_refusals_total`, so a label reading
+    /// `reason="write_ceiling"` says the metric's own name back and carries no
+    /// information, while `reason="write_ceiling_unreadable"` is the only value
+    /// that distinguishes anything. The short pair is what a dashboard legend
+    /// can render. `refusal_reason_spellings_stay_paired` pins the mapping, and
+    /// the `match` is exhaustive, so a third variant cannot be added without
+    /// deciding its metric spelling.
+    ///
+    /// The LOG keeps [`Self::as_str`] — those tokens are the worker's, and
+    /// renaming them would break the `mutation_profile` ↔ audit-event
+    /// correlation `get_module_info` promises.
+    pub(crate) fn metric_label(self) -> &'static str {
+        match self {
+            Self::Policy => "policy",
+            Self::Unreadable => "unreadable",
+        }
+    }
 }
 
 /// The gate's verdict.
@@ -257,22 +280,115 @@ fn record_refusal(
          sending worker did not refuse it itself, which means its \
          TALOS_WRITE_CEILING_ENFORCED is unset or its build predates the gate"
     );
+    let Some(m) = talos_metrics::global() else {
+        return;
+    };
+    // The signal that is SPECIFIC to this route, and the reason it needed its
+    // own series. Reaching this gate means a worker sent a mutation its OWN
+    // gate should have refused — a fleet-configuration defect. #757 routed
+    // that fact to `event_kind = "rpc_write_ceiling_refused"` and to the
+    // `talos_rpc` outcome tag, and MEASURED afterwards (2026-09-05, live
+    // controller `/metrics/prometheus`) both are TRACING ONLY: no `talos_rpc*`
+    // Prometheus series exists, and no RPC counter was registered. So the
+    // fleet-config signal could not be selected by any alert — check 58/65's
+    // class, a signal that exists as prose and not as a series.
+    //
+    // Incremented at the ONE chokepoint, for every subject, so a new
+    // controller-served write op cannot forget it.
+    m.rpc_write_ceiling_refusals_total
+        .with_label_values(&[subject, reason.metric_label()])
+        .inc();
+
     if op == talos_workflow_engine_core::AGENT_MEMORY_SET_OP
         || op == AGENT_MEMORY_DELETE_OP
         || op == AGENT_MEMORY_STORE_WITH_EMBEDDING_OP
     {
-        if let Some(m) = talos_metrics::global() {
-            // The SAME counter and the SAME label value #750 uses, for the
-            // same reason it reused it for `invalid_key`: an operator asking
-            // "which actor-memory writes did not happen, and why" must find
-            // every route in one place. The two live alerts on this counter
-            // select `reason="crypto"` and `reason="db"` specifically, so a
-            // policy refusal cannot page anyone.
-            m.memory_write_failures_total
-                .with_label_values(&["write_ceiling"])
-                .inc();
+        // KEPT, deliberately, and the double count is documented rather than
+        // silent. This counter answers a DIFFERENT question — "which
+        // actor-memory writes did not land, and why" — and an operator asking
+        // it must find every route in one place, which is the same reason #750
+        // reused it for `invalid_key`. The two live alerts on it select
+        // `reason="crypto"` and `reason="db"`, so a policy refusal still cannot
+        // page anyone. Its HELP text names both routes, because a counter whose
+        // description mentions only one of its two producers is this change's
+        // own defect one level down.
+        m.memory_write_failures_total
+            .with_label_values(&["write_ceiling"])
+            .inc();
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// Audit probe
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Exercise THIS gate — the signed-RPC mutation route — and inspect the result.
+///
+/// The twin of `talos_workflow_engine::write_ceiling_gate::probe_envelope_gate`,
+/// and together they are what lets `security_audit` claim `round_trip` for the
+/// controller half of the write ceiling instead of repeating the sentence "the
+/// controller cannot exercise it from here", which stopped being true when
+/// #750 and #757 landed.
+///
+/// # What it asserts, and why each arm
+///
+/// * `readonly` REFUSES, with `RefusalReason::Policy` — the rule working as
+///   configured.
+/// * `write` PERMITS. A gate that refuses everything is an outage, not a gate.
+/// * **Both** unknown reads — `CeilingRead::NoSuchActor` and
+///   `CeilingRead::Unreadable` — REFUSE, with `RefusalReason::Unreadable`.
+///   This is the arm that matters most and the one no configuration check can
+///   reach: a gate that cannot read its rule and permits has, during a database
+///   incident, exactly the behaviour of no gate, while leaving logs implying one
+///   ran. The reason must also be DISTINCT from the policy refusal, because "this
+///   actor is readonly" and "I could not find out" send an operator to two
+///   different places.
+/// * With enforcement OFF every read PERMITS — the staged-rollout default,
+///   byte-identical to pre-#757 behaviour.
+///
+/// # Cost
+///
+/// Pure and in-process: `decide` takes `enforced` as a parameter and the
+/// database answer as a value, so this touches neither the env nor Postgres.
+/// The DB-backed `CeilingRead` path is deliberately NOT probed — resolving a
+/// real actor row would mean either writing a probe actor (a side effect in an
+/// audit documented as side-effect free) or depending on one existing (a probe
+/// that reports "broken" when the fixture is missing). What a live read adds
+/// over this is coverage of `read_actor_write_ceiling`'s own SQL, which is
+/// covered by `controller/tests/rpc_write_ceiling_tests.rs`.
+///
+/// # Errors
+///
+/// `Err(arm)` names the FIRST arm that behaved wrongly. No partial-success
+/// shape: a gate that refuses correctly and permits wrongly is broken.
+pub fn probe_rpc_gate() -> Result<(), &'static str> {
+    if decide(true, CeilingRead::Found(WriteCeiling::ReadOnly))
+        != CeilingDecision::Refuse(RefusalReason::Policy)
+    {
+        return Err("signed-RPC route: a readonly actor's mutation was PERMITTED");
+    }
+    if decide(true, CeilingRead::Found(WriteCeiling::Write)) != CeilingDecision::Permit {
+        return Err("signed-RPC route: a write-capable actor's mutation was REFUSED");
+    }
+    for read in [CeilingRead::NoSuchActor, CeilingRead::Unreadable] {
+        if decide(true, read) != CeilingDecision::Refuse(RefusalReason::Unreadable) {
+            return Err(
+                "signed-RPC route: an unreadable ceiling rule did NOT fail closed — during a \
+                 database incident this gate permits every mutation",
+            );
         }
     }
+    for read in [
+        CeilingRead::Found(WriteCeiling::ReadOnly),
+        CeilingRead::Found(WriteCeiling::Write),
+        CeilingRead::NoSuchActor,
+        CeilingRead::Unreadable,
+    ] {
+        if decide(false, read) != CeilingDecision::Permit {
+            return Err("signed-RPC route: enforcement is OFF but a mutation was refused anyway");
+        }
+    }
+    Ok(())
 }
 
 // ── The op vocabulary, and the parity contract ──────────────────────────────
@@ -478,6 +594,167 @@ mod write_ceiling_tests {
                  not ceiling-gate it — stale entry"
             );
         }
+    }
+
+    /// The audit's `round_trip` claim for the signed-RPC half rests entirely
+    /// on this returning `Ok`. A REGRESSION guard, not a restatement of the
+    /// `decide` tests above: those call `decide` directly, so all of them
+    /// could pass while the probe — the thing a running controller executes —
+    /// was wired wrong.
+    #[test]
+    fn the_audit_probe_finds_this_gate_healthy() {
+        assert_eq!(probe_rpc_gate(), Ok(()));
+    }
+
+    /// Two spellings of one fact must not drift. The log token is the
+    /// worker's vocabulary; the metric label is the dashboard's. An operator
+    /// correlating a `talos_rpc_write_ceiling_refusals_total{reason="policy"}`
+    /// bump against `event_kind=rpc_write_ceiling_refused reason=write_ceiling`
+    /// needs the pairing to be stable, and both come from exhaustive matches
+    /// so a third variant cannot skip either.
+    #[test]
+    fn refusal_reason_spellings_stay_paired() {
+        for (r, log, metric) in [
+            (RefusalReason::Policy, "write_ceiling", "policy"),
+            (
+                RefusalReason::Unreadable,
+                "write_ceiling_unreadable",
+                "unreadable",
+            ),
+        ] {
+            assert_eq!(r.as_str(), log);
+            assert_eq!(r.metric_label(), metric);
+        }
+        assert_ne!(
+            RefusalReason::Policy.metric_label(),
+            RefusalReason::Unreadable.metric_label()
+        );
+    }
+
+    /// A refusal MOVES the counter.
+    ///
+    /// This drives the production recorder — the function `gate` calls on
+    /// every refusal — rather than a test-local copy, which is the whole
+    /// point: the seeding test in `talos-metrics` passes whether or not
+    /// anything increments, so it cannot tell a wired counter from a dead one
+    /// (check 58's class). Deleting the `.inc()` in `record_refusal` fails
+    /// HERE and nowhere else.
+    ///
+    /// `gate` itself is not driven because it needs a `PgPool` and reads the
+    /// process flag from a `OnceLock` that a unit test cannot flip; the SQL
+    /// and the end-to-end refusal are covered by
+    /// `controller/tests/rpc_write_ceiling_tests.rs`.
+    #[test]
+    fn a_refusal_moves_the_rpc_counter() {
+        talos_metrics::set_global(
+            talos_metrics::TalosMetrics::new().expect("build a metrics registry"),
+        );
+        let m = talos_metrics::global().expect("global metrics installed");
+        let subject = talos_memory::memory_rpc::SUBJECT_MEMORY_OP;
+
+        // Deltas, not absolutes: `set_global` is a process-wide `OnceLock`
+        // and other tests in this binary may have stamped the same series.
+        let before_policy = m
+            .rpc_write_ceiling_refusals_total
+            .with_label_values(&[subject, "policy"])
+            .get();
+        let before_unreadable = m
+            .rpc_write_ceiling_refusals_total
+            .with_label_values(&[subject, "unreadable"])
+            .get();
+        let before_memory = m
+            .memory_write_failures_total
+            .with_label_values(&["write_ceiling"])
+            .get();
+
+        record_refusal(
+            uuid::Uuid::nil(),
+            talos_workflow_engine_core::AGENT_MEMORY_SET_OP,
+            subject,
+            "probe/key",
+            RefusalReason::Policy,
+            CeilingRead::Found(WriteCeiling::ReadOnly),
+        );
+        record_refusal(
+            uuid::Uuid::nil(),
+            DATABASE_QUERY_OP,
+            talos_memory::database_rpc::SUBJECT_DATABASE_QUERY,
+            "INSERT",
+            RefusalReason::Unreadable,
+            CeilingRead::Unreadable,
+        );
+        record_refusal(
+            uuid::Uuid::nil(),
+            AGENT_MEMORY_DELETE_OP,
+            subject,
+            "probe/key",
+            RefusalReason::Unreadable,
+            CeilingRead::NoSuchActor,
+        );
+
+        assert_eq!(
+            m.rpc_write_ceiling_refusals_total
+                .with_label_values(&[subject, "policy"])
+                .get()
+                - before_policy,
+            1.0,
+            "the policy refusal did not move the RPC counter"
+        );
+        assert_eq!(
+            m.rpc_write_ceiling_refusals_total
+                .with_label_values(&[subject, "unreadable"])
+                .get()
+                - before_unreadable,
+            1.0,
+            "the fail-closed refusal did not move the RPC counter"
+        );
+        // The database subject is counted too — #757 counted NOTHING for it.
+        assert_eq!(
+            m.rpc_write_ceiling_refusals_total
+                .with_label_values(&[
+                    talos_memory::database_rpc::SUBJECT_DATABASE_QUERY,
+                    "unreadable"
+                ])
+                .get(),
+            1.0,
+            "a database-route refusal must be counted, not only logged"
+        );
+        // And the shared "row did not land" counter still moves for the two
+        // actor-memory ops (and only those) — the documented double count.
+        assert_eq!(
+            m.memory_write_failures_total
+                .with_label_values(&["write_ceiling"])
+                .get()
+                - before_memory,
+            2.0,
+            "the memory-route refusals must still reach the shared counter"
+        );
+    }
+
+    /// Every `(subject, reason)` the chokepoint can write must be one
+    /// `talos-metrics` pre-seeds, or the series is ABSENT until the first
+    /// refusal — and `increase(...) > 0` over an absent series matches
+    /// nothing, which is the alert silenced by exactly the condition it
+    /// detects. The seed list cannot live in this crate (`talos-metrics` is a
+    /// dependency, not a dependent), so this is the pin that keeps the two
+    /// halves in agreement.
+    #[test]
+    fn every_gated_subject_is_seeded_in_the_metrics_crate() {
+        let seeded: HashSet<&str> = talos_metrics::RPC_WRITE_CEILING_SUBJECTS
+            .iter()
+            .copied()
+            .collect();
+        let gated: HashSet<&str> = CONTROLLER_SERVED_WRITE_OPS
+            .iter()
+            .map(|(_, subject)| *subject)
+            .collect();
+        assert_eq!(
+            seeded, gated,
+            "the pre-seeded subjects and the gated subjects disagree — a \
+             subject in `gated` but not `seeded` has an absent series until \
+             its first refusal; one in `seeded` but not `gated` implies a \
+             wired signal that does not exist"
+        );
     }
 
     #[test]
