@@ -143,12 +143,34 @@ pub(crate) struct RefusedMemoryWrite {
 ///    today complete would begin aborting. That is a much larger blast radius
 ///    than the gap warrants, and it is the kind of change an operator should
 ///    opt into separately.
-/// 3. The refusal is not silent, which is the actual requirement. It is in the
-///    node output, in a structured WARN, in the audit stream, and in
-///    `talos_memory_write_failures_total{reason="write_ceiling"}`.
+/// 3. The refusal is not silent, which is the actual requirement — but the
+///    mechanism is worth naming, because it is what a reader of this function
+///    alone would get wrong. This function does not record anything; it
+///    RETURNS the refusal. The caller (`engine_completion` /
+///    `engine_dispatch_pipeline`) hands it to
+///    `NodeLifecycleHook::on_memory_write_refused`, and the impl that owns the
+///    persistence side effect — `ControllerNodeHook` — is what emits the WARN
+///    on the `talos_audit` target and increments
+///    `talos_memory_write_failures_total{reason="write_ceiling"}`. Drop that
+///    notification and the gate still gates while every instrument goes quiet.
+///    So: node output (here), plus one structured WARN and one counter (there).
+///    Note "the `talos_audit` target" means a target STRING on an ordinary log
+///    line — there is no subscriber, sink or ledger behind it in the
+///    controller; see `ControllerNodeHook::record_memory_write_refusal`.
+///
+/// # Why `#[must_use]`
+///
+/// Load-bearing, not decoration: the returned refusal is the ONLY thing that
+/// reaches the recorder (`on_memory_write_refused` →
+/// `ControllerNodeHook::record_memory_write_refusal`), so a caller that drops
+/// it silences the audit event and the counter while the gate keeps gating.
+/// Under CI's `-D warnings` a bare-statement call is then a compile error.
+/// `let _ = …` still isn't, and neither is a caller that binds the refusal and
+/// then does nothing with it — which is what structural check 82 covers.
 ///
 /// A future `on_refusal: "fail"` per-node policy would be a clean addition;
 /// it is deliberately not this change.
+#[must_use]
 pub(crate) fn apply_memory_write_ceiling(
     output: &mut JsonValue,
     ceiling: WriteCeiling,
