@@ -270,6 +270,27 @@ impl ControllerNodeHook {
     /// in-method gate above — so the operator-facing vocabulary cannot drift
     /// between them.
     ///
+    /// **The engine notification is the LIVE one.** The in-method gate above
+    /// is unreachable on both engine paths by construction (the engine strips
+    /// the envelope first) and fires only for `handle_test_module`. So every
+    /// refusal an operator sees from a real workflow arrives here through
+    /// `on_memory_write_refused`, and deleting that one call would leave the
+    /// gate fully working and every instrument in this function permanently
+    /// silent — a refusal indistinguishable from a write that never happened,
+    /// which is the exact reading the gate exists to remove. That wiring is
+    /// pinned by `controller/tests/write_ceiling_memory_write_tests`.
+    ///
+    /// **What "the `talos_audit` target" is, precisely.** A target string on
+    /// an ordinary `tracing` event. The controller installs
+    /// `registry().with(EnvFilter).with(fmt::layer()).with(otel_layer)` and no
+    /// per-target layer, so nothing subscribes to, routes, persists or alerts
+    /// on `talos_audit` — it is a grep convention shared by ~60 emitters,
+    /// carried to stdout and thence to container logs. The METRIC is the only
+    /// machine-readable half. Stated here rather than left to be inferred: a
+    /// reader who takes "audit target" to mean a durable audit channel will
+    /// over-trust it exactly where the WORM-ledger comparison below invites
+    /// them to.
+    ///
     /// **Audit parity, and its stated limit.** `op` and `policy` are the
     /// EXACT tokens the worker stamps on its `wasi:capability_denied` rows for
     /// the same refusal (`agent-memory-set` / `write-ceiling`), because

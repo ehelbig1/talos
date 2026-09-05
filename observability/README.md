@@ -166,7 +166,7 @@ label combinations a live call site writes:
 |---|---|---|
 | `talos_auth_attempts_total{method}` | `password`, `oauth` | the only two interactive-login emitters; `api_key` is deliberately not in this population |
 | `talos_kek_decrypt_failures_total{provider}` | `active`, `both` | `legacy` has no emitting site anywhere — a flat 0 there would read as "watched" |
-| `talos_memory_write_failures_total{reason}` | `crypto`, `db`, `validation`, `other` | the exhaustive `MemoryWriteError::metric_label()` match |
+| `talos_memory_write_failures_total{reason}` | `crypto`, `db`, `validation`, `other`, `write_ceiling` | the exhaustive `MemoryWriteError::metric_label()` match, PLUS `write_ceiling` — not a variant of that enum but the #750 policy refusal, whose one emitter is `ControllerNodeHook::record_memory_write_refusal`. It was unseeded until 2026-09-05, so on a controller that had not yet refused anything the series was absent, i.e. indistinguishable from the gate not being wired |
 | `talos_module_payload_encryption_failures_total{op,stage}` | all 6 | both directions cover all three `PayloadSlot`s |
 
 Note this makes the series PRESENT; it does not prove the incrementing call
