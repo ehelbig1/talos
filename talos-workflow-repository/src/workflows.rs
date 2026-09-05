@@ -112,7 +112,7 @@ impl WorkflowRepository {
                      WHERE workflow_id = w.id ORDER BY started_at DESC LIMIT 1 \
                  ) latest ON true \
                  WHERE w.user_id = $1 AND $2 = ANY(w.tags) \
-                 ORDER BY w.updated_at DESC LIMIT 50",
+                 ORDER BY w.updated_at DESC, w.id DESC LIMIT 50",
             )
             .bind(user_id)
             .bind(tag)
@@ -129,7 +129,7 @@ impl WorkflowRepository {
                      WHERE workflow_id = w.id ORDER BY started_at DESC LIMIT 1 \
                  ) latest ON true \
                  WHERE w.user_id = $1 \
-                 ORDER BY w.updated_at DESC LIMIT 50",
+                 ORDER BY w.updated_at DESC, w.id DESC LIMIT 50",
             )
             .bind(user_id)
             .fetch_all(&mut *tx)
@@ -704,7 +704,7 @@ impl WorkflowRepository {
                 ) AS node_count
                FROM workflows w
                WHERE w.actor_id = $1 AND w.user_id = $2
-               ORDER BY w.updated_at DESC
+               ORDER BY w.updated_at DESC, w.id DESC
                LIMIT $3"#,
         )
         .bind(actor_id)
@@ -2244,9 +2244,17 @@ impl talos_workflow_engine_core::WorkflowGraphStore for WorkflowRepository {
         user_id: Uuid,
     ) -> Result<Option<(Uuid, String)>, talos_workflow_engine_core::BoxError> {
         let row: Option<(Uuid, String)> = sqlx::query_as(
+            // `, id DESC` is not cosmetic. Until migration 20260905120000 the
+            // hourly readiness recompute stamped `updated_at` on every row, so
+            // every candidate here was tied inside one second and this LIMIT 1
+            // resolved on HEAP ORDER — the workflow a capability-dispatch node
+            // executed could change between two identical runs. The tiebreaker
+            // makes the choice deterministic even when the timestamps tie.
+            // `find_workflows_for_capability_dispatch_preview` mirrors this
+            // ORDER BY exactly; change both or neither.
             "SELECT id, name FROM workflows \
              WHERE user_id = $1 AND capabilities @> $2 \
-             ORDER BY updated_at DESC LIMIT 1",
+             ORDER BY updated_at DESC, id DESC LIMIT 1",
         )
         .bind(user_id)
         .bind(required_capabilities)

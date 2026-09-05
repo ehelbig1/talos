@@ -4,6 +4,57 @@ use super::{auth, McpState};
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// When migration `20260905120000_updated_at_is_not_a_maintenance_clock` was
+/// APPLIED to *this* database — the instant after which `workflows.updated_at`
+/// means "a user edited this row" rather than "a background job touched it".
+///
+/// Before it, the generic trigger stamped the row on ANY column change, so the
+/// hourly readiness recompute overwrote the column fleet-wide: measured
+/// 2026-09-05, 36 of 36 workflows carried `updated_at == readiness_computed_at`
+/// to the microsecond. Those edit times are unrecoverable (`workflow_versions`
+/// covers 18 of 36 rows and records a PUBLISH, not an edit), so a reader
+/// discloses rather than guesses.
+///
+/// READ FROM `_sqlx_migrations`, not hardcoded, for a reason this change is
+/// itself about: a migration named `20260905120000` may be APPLIED days later,
+/// and a hardcoded name-date would call every row stamped in that gap
+/// "measured" while it was still the maintenance clock — asserting reliability
+/// the data does not have, in the unsafe direction. Unreadable ⇒ `None` ⇒ every
+/// row is disclosed as possibly-pre-cutover, which over-discloses rather than
+/// over-claims. Cached per process: the answer cannot change without a restart,
+/// since a migration is applied exactly once.
+static MAINTENANCE_CLOCK_CUTOVER: tokio::sync::OnceCell<Option<chrono::DateTime<chrono::Utc>>> =
+    tokio::sync::OnceCell::const_new();
+
+/// The migration version that ended the maintenance clock. `sqlx` stores this
+/// as the numeric prefix of the filename.
+const MAINTENANCE_CLOCK_MIGRATION: i64 = 20_260_905_120_000;
+
+async fn maintenance_clock_cutover(pool: &sqlx::PgPool) -> Option<chrono::DateTime<chrono::Utc>> {
+    *MAINTENANCE_CLOCK_CUTOVER
+        .get_or_init(|| async {
+            let repo = talos_analytics_repository::AnalyticsRepository::new(pool.clone());
+            match repo
+                .maintenance_clock_cutover(MAINTENANCE_CLOCK_MIGRATION)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    // Not fatal, and not silent: the caller degrades to
+                    // disclosing every timestamp, which is the safe direction.
+                    tracing::warn!(
+                        error = %e,
+                        "could not read the updated_at maintenance-clock cutover from \
+                         _sqlx_migrations; every workflow_updated event will be reported \
+                         as possibly-pre-cutover"
+                    );
+                    None
+                }
+            }
+        })
+        .await
+}
+
 /// Derive capability tag suggestions from a workflow's graph JSON.
 /// Pure computation: parse graph → extract module_ids → DB queries → return tags.
 async fn compute_capability_suggestions(graph_json: &str, pool: &sqlx::PgPool) -> Vec<String> {
@@ -1952,10 +2003,35 @@ async fn handle_get_workflow_audit_trail(
     }
 
     if wf_updated_at != wf_created_at {
+        // Before migration 20260905120000 the trigger stamped `updated_at` on
+        // ANY column change, so the hourly readiness recompute overwrote it on
+        // every row every hour — measured at 36 of 36 workflows carrying the
+        // recompute clock, not the edit time. This event therefore asserted
+        // "last modified" about a background job for every workflow on the
+        // platform. The trigger fix ends that going forward; it cannot recover
+        // what it destroyed, so a stamp from before the cutover is reported as
+        // what it is rather than as a modification.
+        //
+        // An UNKNOWN cutover is treated as pre-cutover: not knowing when the
+        // column became trustworthy is not evidence that it is.
+        let cutover = maintenance_clock_cutover(&state.db_pool).await;
+        let pre_cutover = match cutover {
+            Some(c) => wf_updated_at < c,
+            None => true,
+        };
         events.push(serde_json::json!({
             "event_type": "workflow_updated",
             "timestamp": wf_updated_at.to_rfc3339(),
-            "details": "Workflow configuration last modified",
+            "details": if pre_cutover {
+                "Workflow row last stamped. This predates (or cannot be shown to \
+                 postdate) the fix for background maintenance stamping updated_at \
+                 — hourly readiness recomputation moved this column on every \
+                 workflow — so it is NOT evidence of a configuration change."
+            } else {
+                "Workflow configuration last modified"
+            },
+            "provenance": if pre_cutover { "best_effort_pre_cutover" } else { "measured" },
+            "maintenance_clock_cutover": cutover.map(|c| c.to_rfc3339()),
         }));
     }
 

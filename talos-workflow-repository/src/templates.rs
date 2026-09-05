@@ -356,7 +356,7 @@ impl WorkflowRepository {
              SET wasm_bytes = $1, source_code = $2, capability_world = $3, \
                  allowed_secrets = $4, allowed_hosts = $5, \
                  integration_name = $7, content_hash = $8, \
-                 size_bytes = $9, compiled_at = NOW(), updated_at = NOW() \
+                 size_bytes = $9, compiled_at = NOW() \
              WHERE id = $6",
         )
         .bind(wasm_bytes)
@@ -459,7 +459,7 @@ impl WorkflowRepository {
                AND id != $2 \
                AND graph_json LIKE $3 \
                AND (status IS NULL OR status != 'archived') \
-             ORDER BY updated_at DESC \
+             ORDER BY updated_at DESC, id DESC \
              LIMIT 20",
         )
         .bind(user_id)

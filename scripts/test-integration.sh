@@ -294,6 +294,10 @@ fi
 # needed here. 64 hex = 32 bytes, non-zero.
 CTRL_MASTER_KEY="00000000000000000000000000000000000000000000000000000000deadbeef"
 CTRL_TESTS=(
+    # `updated_at` must date a user edit, not a maintenance write. Drives the
+    # REAL trigger with the REAL statements the background jobs issue, on the
+    # `common` (DATABASE_URL) harness — so it belongs here, not in TC_TESTS.
+    "updated_at_maintenance_tests"
     "api_key_tests"
     "api_auth_integration_test"
     "integration_mcp_tests"

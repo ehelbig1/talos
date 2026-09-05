@@ -198,8 +198,8 @@ async fn publish_template(
              oci_url                = EXCLUDED.oci_url, \
              allowed_hosts          = EXCLUDED.allowed_hosts, \
              allowed_secrets        = EXCLUDED.allowed_secrets, \
-             requires_approval_for  = EXCLUDED.requires_approval_for, \
-             updated_at             = NOW()",
+             requires_approval_for  = EXCLUDED.requires_approval_for \
+          /* updated_at deliberately NOT set — see talos-registry/src/lib.rs. */",
     )
     .bind(&payload.name)
     .bind(&payload.category)

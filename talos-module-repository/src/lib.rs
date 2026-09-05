@@ -842,7 +842,7 @@ impl ModuleRepository {
             "SELECT id, name, capability_world, max_fuel, usage_count, updated_at \
              FROM modules \
              WHERE user_id = $1 \
-             ORDER BY updated_at DESC \
+             ORDER BY updated_at DESC, id DESC \
              LIMIT $2",
         )
         .bind(user_id)
@@ -1261,7 +1261,7 @@ impl ModuleRepository {
             "SELECT id, name FROM workflows \
              WHERE user_id = $1 AND graph_json LIKE $2 \
                AND (status IS NULL OR status != 'archived') \
-             ORDER BY updated_at DESC LIMIT $3",
+             ORDER BY updated_at DESC, id DESC LIMIT $3",
         )
         .bind(user_id)
         .bind(&pattern)
@@ -1292,7 +1292,7 @@ impl ModuleRepository {
             "SELECT id, name FROM workflows \
              WHERE user_id = $1 AND graph_json LIKE $2 AND id != $3 \
                AND (status IS NULL OR status != 'archived') \
-             ORDER BY updated_at DESC LIMIT $4",
+             ORDER BY updated_at DESC, id DESC LIMIT $4",
         )
         .bind(user_id)
         .bind(&pattern)
@@ -1314,7 +1314,7 @@ impl ModuleRepository {
     /// CROSS-JOIN-UNNEST + window-function query replaces the per-target
     /// loop used by `handle_get_module_dependents` (N table-scans → 1).
     /// Per-target `limit_per_target` is enforced inside SQL via
-    /// `ROW_NUMBER() OVER (PARTITION BY target_id ORDER BY updated_at DESC)`,
+    /// `ROW_NUMBER() OVER (PARTITION BY target_id ORDER BY updated_at DESC, id DESC)`,
     /// preserving the prior per-target cap.
     ///
     /// Returns rows of `(target_workflow_id, referencing_workflow_id,
@@ -1337,7 +1337,7 @@ impl ModuleRepository {
             "SELECT target_id, id, name FROM ( \
                  SELECT t.target_id, w.id, w.name, \
                         ROW_NUMBER() OVER (PARTITION BY t.target_id \
-                                           ORDER BY w.updated_at DESC) AS rn \
+                                           ORDER BY w.updated_at DESC, w.id DESC) AS rn \
                  FROM workflows w \
                  CROSS JOIN UNNEST($2::uuid[]) AS t(target_id) \
                  WHERE w.user_id = $1 \
@@ -2760,8 +2760,8 @@ impl ModuleRepository {
                     modules.imported_interfaces), \
                 dependencies = COALESCE(EXCLUDED.dependencies, modules.dependencies), \
                 config = COALESCE(EXCLUDED.config, modules.config), \
-                compiled_at = NOW(), \
-                updated_at = NOW() \
+                compiled_at = NOW() \
+             /* updated_at deliberately NOT set — see talos-registry/src/lib.rs. */ \
              /* INTENTIONALLY OMITTED from SET list — preserve existing values: \
                   - allowed_hosts/methods/secrets: permission changes go through \
                     their own audited paths (update_module_allowed_secrets etc.). \
@@ -2901,8 +2901,8 @@ impl ModuleRepository {
                            10M -> 1.38M). Fresh inserts take the computed value. */ \
                         max_fuel = CASE WHEN $15 THEN EXCLUDED.max_fuel \
                                         ELSE modules.max_fuel END, \
-                        compiled_at = NOW(), \
-                        updated_at = NOW() \
+                        compiled_at = NOW() \
+                     /* updated_at deliberately NOT set — see talos-registry/src/lib.rs. */ \
                      RETURNING id, allowed_secrets, content_hash, compiled_at \
                  ) \
                  SELECT \
@@ -3242,7 +3242,7 @@ impl ModuleRepository {
                     "SELECT id, name, user_id FROM workflows \
                  WHERE (graph_json LIKE $1 OR graph_json LIKE $2) \
                    AND (status IS NULL OR status != 'archived') \
-                 ORDER BY updated_at DESC LIMIT 50",
+                 ORDER BY updated_at DESC, id DESC LIMIT 50",
                 )
                 .bind(&pattern_self)
                 .bind(pt)
@@ -3254,7 +3254,7 @@ impl ModuleRepository {
                     "SELECT id, name, user_id FROM workflows \
                  WHERE graph_json LIKE $1 \
                    AND (status IS NULL OR status != 'archived') \
-                 ORDER BY updated_at DESC LIMIT 50",
+                 ORDER BY updated_at DESC, id DESC LIMIT 50",
                 )
                 .bind(&pattern_self)
                 .fetch_all(&self.db_pool)
@@ -3287,7 +3287,7 @@ impl ModuleRepository {
                     "SELECT id, name, actor_id FROM workflows \
                  WHERE (graph_json LIKE $1 OR graph_json LIKE $2) \
                    AND (status IS NULL OR status != 'archived') \
-                 ORDER BY updated_at DESC LIMIT 50",
+                 ORDER BY updated_at DESC, id DESC LIMIT 50",
                 )
                 .bind(&pattern_self)
                 .bind(pt)
@@ -3299,7 +3299,7 @@ impl ModuleRepository {
                     "SELECT id, name, actor_id FROM workflows \
                  WHERE graph_json LIKE $1 \
                    AND (status IS NULL OR status != 'archived') \
-                 ORDER BY updated_at DESC LIMIT 50",
+                 ORDER BY updated_at DESC, id DESC LIMIT 50",
                 )
                 .bind(&pattern_self)
                 .fetch_all(&self.db_pool)

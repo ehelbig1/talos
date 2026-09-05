@@ -594,8 +594,12 @@ impl ModuleRegistry {
                 config                = EXCLUDED.config, \
                 oci_url               = EXCLUDED.oci_url, \
                 language              = EXCLUDED.language, \
-                compiled_at           = NOW(), \
-                updated_at            = NOW() \
+                compiled_at           = NOW() \
+             /* updated_at deliberately NOT set: the BEFORE UPDATE trigger stamps \
+                it only when a non-maintenance column really changed. An explicit \
+                NOW() overrides that verdict and re-dates every catalog row at \
+                every boot — the defect migration 20260905120000 measured at 75 of \
+                112 module rows sharing one boot second. */ \
              RETURNING id",
         )
         .bind(module.user_id)
@@ -1840,11 +1844,13 @@ impl ModuleRegistry {
         precompiled: Vec<u8>,
     ) -> anyhow::Result<()> {
         sqlx::query(
+            // Compile outputs only — `compiled_at` already dates the artifact.
+            // Stamping `updated_at` would date the module as edited by an AOT
+            // precompile that changed nothing the operator authored.
             "UPDATE modules \
              SET wasm_bytes = $1, \
                  size_bytes = LENGTH($1)::INTEGER, \
-                 compiled_at = NOW(), \
-                 updated_at = NOW() \
+                 compiled_at = NOW() \
              WHERE id = $2",
         )
         .bind(&precompiled)

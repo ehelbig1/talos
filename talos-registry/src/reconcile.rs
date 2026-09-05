@@ -266,7 +266,7 @@ pub async fn upsert_catalog_template_by_slug(
                  name = $2, category = $3, description = $4, config_schema = $5, \
                  source_code = $6, allowed_hosts = $7, allowed_secrets = $8, \
                  requires_approval_for = $9, capability_world = $10, \
-                 dependencies = $11, allowed_methods = $12, updated_at = NOW() \
+                 dependencies = $11, allowed_methods = $12 \
              WHERE id = $1",
         )
         .bind(id)
@@ -321,8 +321,8 @@ pub async fn upsert_catalog_template_by_slug(
                  requires_approval_for = EXCLUDED.requires_approval_for, \
                  capability_world = EXCLUDED.capability_world, \
                  dependencies = EXCLUDED.dependencies, \
-                 allowed_methods = EXCLUDED.allowed_methods, \
-                 updated_at = NOW() \
+                 allowed_methods = EXCLUDED.allowed_methods \
+             /* updated_at deliberately NOT set — see talos-registry/src/lib.rs. */ \
              RETURNING id, \
                  (wasm_bytes IS NOT NULL AND octet_length(wasm_bytes) > 0) AS has_wasm \
          ) \
@@ -374,9 +374,10 @@ pub async fn refresh_catalog_wasm_by_slug(
     content_hash: &str,
 ) -> Result<u64> {
     let res = sqlx::query(
+        // Compile outputs only; see store_precompiled_template.
         "UPDATE modules SET \
              wasm_bytes = $2, content_hash = $3, size_bytes = $4, \
-             compiled_at = NOW(), updated_at = NOW() \
+             compiled_at = NOW() \
          WHERE catalog_slug = $1 AND kind = 'catalog'",
     )
     .bind(catalog_slug)

@@ -3959,7 +3959,7 @@ impl SecretsManager {
         let rows = sqlx::query(
             "SELECT id, name FROM workflows \
              WHERE user_id = $1 AND graph_json LIKE $2 \
-             ORDER BY updated_at DESC LIMIT $3",
+             ORDER BY updated_at DESC, id DESC LIMIT $3",
         )
         .bind(user_id)
         .bind(&pattern)
@@ -3992,7 +3992,7 @@ impl SecretsManager {
             "SELECT id, name FROM workflows \
              WHERE user_id = $1 AND (status IS NULL OR status != 'archived') \
                AND (position($2 in graph_json) > 0 OR position($3 in graph_json) > 0) \
-             ORDER BY updated_at DESC LIMIT $4",
+             ORDER BY updated_at DESC, id DESC LIMIT $4",
         )
         .bind(user_id)
         .bind(&kp_needle)
