@@ -24,6 +24,11 @@ serde_json.workspace = true
 # misses).
 sqlparser = { version = "0.53", features = ["visitor"] }
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+# #754: the write-ceiling gate reads `actors.max_write_ceiling` before
+# persisting an actor-attributed mutation on a worker's behalf. The read lives
+# in the persistence layer (`read_actor_write_ceiling`) so this crate does not
+# become a second reader of a security column.
+talos-actor-repository = { path = "../talos-actor-repository" }
 talos-actor-memory-service = { path = "../talos-actor-memory-service" }
 talos-graph-rag = { path = "../talos-graph-rag" }
 talos-integration-state = { path = "../talos-integration-state" }
@@ -33,6 +38,10 @@ talos-memory-ranking = { path = "../talos-memory-ranking" }
 # RFC 0011 P2c: `talos.ml.predict` serving (model resolution + knn
 # batch inference under a tenant-scoped read tx).
 talos-ml = { path = "../talos-ml" }
+# #754: `memory_write_failures_total{reason="write_ceiling"}` — the SAME
+# counter #750's envelope refusal increments, so an operator asking "which
+# actor-memory writes did not happen, and why" finds every route in one place.
+talos-metrics = { path = "../talos-metrics" }
 talos-replay-guard = { path = "../talos-replay-guard" }
 talos-tenancy = { path = "../talos-tenancy" }
 # #603: `build_suffix` / `builds_match` / `build_is_verifiable` for the
@@ -47,9 +56,28 @@ talos-worker-identity-repository = { path = "../talos-worker-identity-repository
 # identically. Same single-source-of-truth pattern as
 # `LLM_PROVIDER_VAULT_PATHS` / `EXTERNAL_LLM_HOSTS`.
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
+# #754: the shared write-ceiling DECISION (`write_ceiling_denies`) and the
+# shared audit vocabulary (`AGENT_MEMORY_SET_OP` / `WRITE_CEILING_POLICY`) —
+# the same constants the worker's gate and #750's envelope gate use. Never a
+# local re-derivation: two paths answering one question differently IS the
+# defect this closes.
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
+# #754: `write_ceiling_gate::controller_write_ceiling_enforced` — the
+# controller process's ONE reader of `TALOS_WRITE_CEILING_ENFORCED`, already
+# consulted by the #750 envelope gate. Reused rather than re-read here: a
+# second env reader for one control is check 69's class. The edge is
+# acyclic — `talos-workflow-engine` depends on capability-world / config /
+# metrics / rhai-sandbox / engine-core / job-protocol and on nothing that
+# reaches back here.
+talos-workflow-engine = { path = "../talos-workflow-engine" }
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
 tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+# #754 parity test: the ops the controller gates must be spelled exactly as the
+# worker spells them. Test-only, so the production dep graph is unchanged.
+talos-capability-world = { path = "../talos-capability-world" }
 
 [lints]
 workspace = true

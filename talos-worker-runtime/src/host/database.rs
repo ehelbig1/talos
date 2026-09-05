@@ -363,6 +363,20 @@ impl wit_database::Host for TalosContext {
                     self.last_db_error = "Controller rejected request (HMAC mismatch)".to_string();
                     Err(wit_database::Error::Unauthorized)
                 }
+                // #754: the controller enforces the same write ceiling this
+                // host fn enforces above, because the fleet-shared signature
+                // proves possession of a key, not that any gate ran. Reaching
+                // this arm means THIS worker did not refuse — its
+                // `TALOS_WRITE_CEILING_ENFORCED` is unset while the
+                // controller's is set. Mapped to the SAME guest-visible error
+                // the local gate returns, so a module cannot tell which
+                // process refused it (and does not need to).
+                Err(DatabaseRpcError::WriteCeiling) => {
+                    self.last_db_error =
+                        "write ceiling: this read-only actor cannot run a mutating query"
+                            .to_string();
+                    Err(wit_database::Error::Unauthorized)
+                }
                 Err(DatabaseRpcError::InvalidQuery(m)) => {
                     self.last_db_error = m;
                     Err(wit_database::Error::Invalidquery)

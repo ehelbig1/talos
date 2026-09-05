@@ -553,6 +553,148 @@ pub enum MemoryRpcError {
     StorageFull,
     Internal(String),
     Timeout,
+    /// The actor's `max_write_ceiling` refuses this mutation, or the ceiling
+    /// could not be read and the gate failed closed.
+    ///
+    /// **Carries no payload, and that is the design.** The two refusal
+    /// reasons ("this actor is readonly" / "I could not read the rule") are
+    /// distinguished for the OPERATOR — `talos_audit` log field, `talos_rpc`
+    /// outcome tag — and collapsed for the CALLER, exactly as
+    /// `caller_facing_unauthorized` collapses every `Unauthorized` reason for
+    /// the same reason: splitting them on the wire hands a holder of the
+    /// fleet-shared key an actor-EXISTENCE oracle (a `Policy` refusal proves
+    /// the actor row exists; an `Unreadable` one does not), and neither
+    /// reason admits a different caller action — both are terminal for the
+    /// op, so there is nothing a legitimate worker could do with the split.
+    ///
+    /// **Wire compatibility.** `MemoryRpcError` is an externally-tagged serde
+    /// enum, so a worker built before this variant existed cannot decode it.
+    /// That path was MEASURED (`old_worker_cannot_decode_write_ceiling_but_
+    /// fails_safe`), not assumed: `call_memory_op` maps the decode failure to
+    /// `Internal("reply decode: …")` and `map_mem_err`'s catch-all maps that
+    /// to `wit_agent_memory::Error::NotAvailable` — byte-identical to what the
+    /// worker's OWN ceiling gate returns to the guest. An old worker
+    /// therefore sees the right answer with a misleading log line, and never
+    /// a panic and never a success. Appended last per the wire-format
+    /// stability rule.
+    WriteCeiling,
+}
+
+#[cfg(test)]
+mod write_ceiling_wire_compat_tests {
+    //! #754 added `MemoryRpcError::WriteCeiling`. `MemoryRpcError` is an
+    //! externally-tagged serde enum, so a worker built before the variant
+    //! existed CANNOT decode it. That is not a reason to avoid the variant —
+    //! it is a reason to MEASURE what an old worker does with the bytes, and
+    //! to pin the answer.
+    //!
+    //! The measured chain, end to end: `call_memory_op` decodes the reply with
+    //! `serde_json::from_slice::<MemoryRpcReply>` and maps a decode failure to
+    //! `MemoryRpcError::Internal("reply decode: …")`; `map_mem_err` maps
+    //! `Internal` to `wit_agent_memory::Error::NotAvailable` — which is
+    //! byte-for-byte what the worker's OWN ceiling gate returns to the guest.
+    //! So an old worker sees the correct guest-visible answer, with a
+    //! misleading log line, and never a panic and never a success. The
+    //! worker-side half of that chain is pinned in
+    //! `talos_worker_runtime::host::memory`'s own tests; this half pins the
+    //! wire bytes and the decode outcome.
+    use super::*;
+
+    /// `MemoryRpcError` exactly as it was BEFORE #754. Spelled out rather than
+    /// referenced so this test keeps measuring the OLD decoder even as the
+    /// real enum grows.
+    #[derive(Debug, Deserialize)]
+    #[allow(dead_code)]
+    enum LegacyMemoryRpcError {
+        NotAvailable,
+        KeyNotFound,
+        InvalidInput(String),
+        Unauthorized,
+        StorageFull,
+        Internal(String),
+        Timeout,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct LegacyMemoryRpcReply {
+        #[allow(dead_code)]
+        result: Result<MemoryOpResult, LegacyMemoryRpcError>,
+    }
+
+    /// The literal bytes a post-#754 controller puts on the wire for a
+    /// ceiling refusal. Pinned: a rename of the variant is a WIRE change, and
+    /// a wire change to a signed protocol's reply must be a deliberate act.
+    #[test]
+    fn write_ceiling_reply_has_a_stable_wire_form() {
+        let reply = MemoryRpcReply {
+            result: Err(MemoryRpcError::WriteCeiling),
+        };
+        assert_eq!(
+            serde_json::to_string(&reply).unwrap(),
+            r#"{"result":{"Err":"WriteCeiling"}}"#
+        );
+    }
+
+    /// The refusal carries NO payload, so it cannot leak WHY. The two refusal
+    /// reasons — "this actor is readonly" and "the rule could not be read" —
+    /// are distinguished for the operator and collapsed for the caller,
+    /// because a `Policy` refusal would otherwise prove to a holder of the
+    /// FLEET-SHARED key that the named actor row exists. Same rule, and the
+    /// same reasoning, as `caller_facing_unauthorized`.
+    #[test]
+    fn write_ceiling_reply_is_reason_independent() {
+        // There is exactly one encoding, whatever the controller-side reason.
+        let a = serde_json::to_string(&MemoryRpcReply {
+            result: Err(MemoryRpcError::WriteCeiling),
+        })
+        .unwrap();
+        let b = serde_json::to_string(&MemoryRpcReply {
+            result: Err(MemoryRpcError::WriteCeiling),
+        })
+        .unwrap();
+        assert_eq!(a, b);
+        // And it is not the shape of any variant that carries a message.
+        assert!(!a.contains("readonly"));
+        assert!(!a.contains("unreadable"));
+        assert!(!a.contains("actor"));
+    }
+
+    /// MEASURED, not assumed: an old worker cannot decode it — and the failure
+    /// is a `serde` error, not a panic and not a silently-successful parse
+    /// into some other variant.
+    #[test]
+    fn an_old_worker_cannot_decode_write_ceiling_and_fails_safe() {
+        let bytes = serde_json::to_vec(&MemoryRpcReply {
+            result: Err(MemoryRpcError::WriteCeiling),
+        })
+        .unwrap();
+        let decoded: Result<LegacyMemoryRpcReply, _> = serde_json::from_slice(&bytes);
+        assert!(
+            decoded.is_err(),
+            "an old worker must FAIL to decode the new variant — a successful              decode into some other variant would be the dangerous outcome"
+        );
+        // The decode error is what `call_memory_op` turns into
+        // `MemoryRpcError::Internal("reply decode: …")`, whose guest-visible
+        // mapping is `NotAvailable` — the same answer the worker's own gate
+        // gives. Pinned worker-side in `map_mem_err`'s tests.
+
+        // The CONVERSE also holds: every pre-#754 reply still decodes on a
+        // post-#754 worker, so this is a one-directional break in the safe
+        // direction only.
+        for legacy in [
+            r#"{"result":{"Err":"NotAvailable"}}"#,
+            r#"{"result":{"Err":"KeyNotFound"}}"#,
+            r#"{"result":{"Err":"Unauthorized"}}"#,
+            r#"{"result":{"Err":"StorageFull"}}"#,
+            r#"{"result":{"Err":"Timeout"}}"#,
+            r#"{"result":{"Err":{"Internal":"boom"}}}"#,
+            r#"{"result":{"Err":{"InvalidInput":"bad key"}}}"#,
+            r#"{"result":{"Ok":{"kind":"ok"}}}"#,
+        ] {
+            serde_json::from_str::<MemoryRpcReply>(legacy)
+                .unwrap_or_else(|e| panic!("legacy reply {legacy} must still decode: {e}"));
+        }
+    }
 }
 
 #[cfg(test)]

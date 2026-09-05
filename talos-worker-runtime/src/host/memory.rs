@@ -587,13 +587,31 @@ async fn call_memory_op(
     reply.result
 }
 
+/// Map a controller-side memory-RPC error onto the guest-visible WIT error.
+///
+/// **Exhaustive, with no `_` arm** — the checklist's §4 rule
+/// (`docs/platform-primitive-checklist.md`): a new `MemoryRpcError` variant
+/// must fail to compile here until someone chooses its guest-visible meaning,
+/// rather than silently inheriting `NotAvailable`. It was a catch-all until
+/// #754 added `WriteCeiling`, which would have landed on the right answer by
+/// accident; the next variant might not.
 fn map_mem_err(e: talos_memory::memory_rpc::MemoryRpcError) -> wit_agent_memory::Error {
     use talos_memory::memory_rpc::MemoryRpcError;
     match e {
         MemoryRpcError::KeyNotFound => wit_agent_memory::Error::KeyNotFound,
         MemoryRpcError::InvalidInput(_) => wit_agent_memory::Error::InvalidInput,
         MemoryRpcError::StorageFull => wit_agent_memory::Error::StorageFull,
-        _ => wit_agent_memory::Error::NotAvailable,
+        // #754: the controller enforces the same write ceiling `set` /
+        // `delete` / `store_with_embedding` enforce above. Reaching this means
+        // THIS worker did not refuse — its `TALOS_WRITE_CEILING_ENFORCED` is
+        // unset while the controller's is set. `NotAvailable` is byte-for-byte
+        // what the local gate returns to the guest, so a module cannot tell
+        // which process refused it (and does not need to).
+        MemoryRpcError::WriteCeiling => wit_agent_memory::Error::NotAvailable,
+        MemoryRpcError::NotAvailable
+        | MemoryRpcError::Unauthorized
+        | MemoryRpcError::Internal(_)
+        | MemoryRpcError::Timeout => wit_agent_memory::Error::NotAvailable,
     }
 }
 
@@ -720,5 +738,47 @@ impl wit_graph_memory::Host for TalosContext {
             );
         }
         __res
+    }
+}
+
+#[cfg(test)]
+mod write_ceiling_mapping_tests {
+    //! The worker-side half of #754's wire-compatibility measurement.
+    //!
+    //! Two claims are pinned here, and both are about what a worker does when
+    //! the CONTROLLER refuses a mutation the worker itself did not refuse
+    //! (i.e. a mixed-fleet deployment where this worker's
+    //! `TALOS_WRITE_CEILING_ENFORCED` is unset and the controller's is set).
+    use super::{map_mem_err, wit_agent_memory};
+    use talos_memory::memory_rpc::MemoryRpcError;
+
+    /// A NEW worker decodes the variant and maps it to exactly what its own
+    /// gate returns. A module therefore cannot tell which process refused it.
+    #[test]
+    fn write_ceiling_maps_to_the_same_guest_error_the_local_gate_returns() {
+        assert_eq!(
+            map_mem_err(MemoryRpcError::WriteCeiling),
+            wit_agent_memory::Error::NotAvailable
+        );
+        // `set`, `delete` and `store_with_embedding` each return exactly
+        // `NotAvailable` on a LOCAL ceiling refusal (see their gates above), so
+        // the guest-visible answer is identical whichever process refused.
+    }
+
+    /// An OLD worker cannot decode the variant at all
+    /// (`talos_memory::memory_rpc::write_ceiling_wire_compat_tests` measures
+    /// that half). `call_memory_op` turns the decode failure into
+    /// `Internal("reply decode: …")`; this pins where that lands. Same
+    /// answer — so the break is one-directional and in the SAFE direction:
+    /// an old worker refuses the guest, with a misleading log line, and never
+    /// succeeds and never panics.
+    #[test]
+    fn an_undecodable_reply_still_refuses_the_guest() {
+        assert_eq!(
+            map_mem_err(MemoryRpcError::Internal(
+                "reply decode: unknown variant".into()
+            )),
+            wit_agent_memory::Error::NotAvailable
+        );
     }
 }

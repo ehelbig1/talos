@@ -8234,6 +8234,98 @@ else
 fi
 echo
 
+# ── 84. An actor-attributed mutation on the signed-RPC routes must sit
+#        behind the write-ceiling chokepoint ───────────────────────────────
+#
+# `actors.max_write_ceiling` is ONE control, and #750 established the rule that
+# it must be checked on EVERY route to a mutation. #750 closed the controller's
+# `__memory_write__` envelope route and RECORDED the next one without fixing
+# it. #754 closed that one — the signed-RPC routes — and this check is what
+# stops the third from being written.
+#
+# The transport is why the crate cannot trust its caller: these requests are
+# HMAC-signed under `WORKER_SHARED_KEY`, which is FLEET-SHARED, so the
+# signature proves the sender holds a key, not that the sender ran a gate. A
+# worker booted without `TALOS_WRITE_CEILING_ENFORCED` (the mixed-fleet state
+# `get_platform_info.fleet.write_ceiling.enforced_by = "some"` reports) refuses
+# nothing locally, and before #754 the controller persisted whatever it sent.
+#
+# SCOPE is `talos-rpc-subscribers/src/` and the scoping is MEASURED, not
+# stylistic: the same four helpers are called from 59 other places in the
+# workspace — MCP handlers, the engine node hook, `scaffold_actor`, the
+# consolidation and reflection jobs — and those are the OPERATOR's or the
+# PLATFORM's writes, which the ceiling deliberately does not speak to. A
+# workspace-wide version of this check would be 59 false positives. Same
+# scoping principle as check 6 (`talos-mcp-handlers`) and check 50
+# (`talos-api/src/schema`).
+#
+# MEASURED IN BOTH DIRECTIONS before it was written, against the real trees
+# rather than a synthetic mutation: **4 findings on pristine `origin/main`** —
+# `persist_memory_with_metadata` (memory Set), `forget_exact` (memory Delete),
+# `execute_guest_query` (a mutating `database.query`) and
+# `talos_integration_state::execute_op` (integration-state Set/Delete), which
+# is exactly the set #754 fixed — and **0 on the fixed tree, with 0 false
+# positives**.
+#
+# STATED LIMITS, each confirmed rather than inferred. It is TEXTUAL and
+# WINDOW-bounded at 60 lines, so a gate hoisted further from its mutation
+# reads as absent (a FALSE POSITIVE — the loud direction; 60 was chosen
+# because the database site's gate sits 51 lines above its
+# `execute_guest_query` call). It matches an ENUMERATED set of mutation entry
+# points, so a mutation issued through a NEW helper, or through raw
+# `sqlx::query`, is invisible — that is a real hole and the reason
+# `write_ceiling::write_ceiling_tests::complement_is_worker_local` exists
+# beside it, forcing any newly ceiling-gated WORKER op to be classified as
+# controller-served or worker-local. And it proves the gate is NEAR the
+# mutation, never that its answer is HONOURED: a `gate(..).is_refused()` whose
+# result is discarded satisfies this check, which is why `CeilingDecision` is
+# `#[must_use]` and why the DB-level test
+# (`controller/tests/rpc_write_ceiling_tests.rs`) asserts on rows rather than
+# on replies — the one mutation that survived an earlier version of that test
+# was exactly a call-site assertion satisfied for the wrong reason.
+#
+# Opt-out `// allow-ungated-rpc-mutation: <reason>` within the 60 lines above
+# the call, for a mutation that is genuinely the PLATFORM's rather than the
+# actor's (the `execution_state` durability write and the `integration_state`
+# expiry sweeper are both that shape — and neither is matched here, because
+# neither goes through one of these helpers).
+bold "▶ check 84: signed-RPC actor mutations must sit behind the write-ceiling gate"
+RPC_CEILING_HITS="$(
+    perl -e '
+        my $window = 60;
+        for my $f (@ARGV) {
+            open(my $fh, "<", $f) or next;
+            my @l = <$fh>; close $fh;
+            for my $i (0..$#l) {
+                next if $l[$i] =~ m{^\s*//};
+                next if $l[$i] =~ /\bfn\s+\w+\s*\(/;
+                next unless $l[$i] =~ /(persist_memory_with_metadata(_typed)?|forget_exact|talos_integration_state::execute_op|execute_guest_query)\s*\(/;
+                my $lo = $i - $window; $lo = 0 if $lo < 0;
+                my $ctx = join("", @l[$lo..$i]);
+                next if $ctx =~ /write_ceiling::gate/;
+                next if $ctx =~ /allow-ungated-rpc-mutation/;
+                my $t = $l[$i]; $t =~ s/^\s+//; $t =~ s/\s+$//;
+                print "$f:", $i+1, ": $t\n";
+            }
+        }
+    ' talos-rpc-subscribers/src/*.rs 2>/dev/null || true
+)"
+if [ -n "$RPC_CEILING_HITS" ]; then
+    red "✗ actor-attributed mutation(s) in talos-rpc-subscribers with no write-ceiling gate within 60 lines:"
+    echo "$RPC_CEILING_HITS" | sed 's/^/    /'
+    yellow "  → the request is signed under the FLEET-SHARED WORKER_SHARED_KEY, so the"
+    yellow "    signature proves possession of a key, not that the sender gated itself."
+    yellow "  → route it through \`write_ceiling::gate(pool, actor_id, op, subject, target)\`"
+    yellow "    and refuse on \`.is_refused()\`, using an op token from"
+    yellow "    \`write_ceiling::CONTROLLER_SERVED_WRITE_OPS\` (the worker's own spelling)."
+    yellow "  → if the write is the PLATFORM's rather than the actor's, say so with"
+    yellow "    \`// allow-ungated-rpc-mutation: <reason>\`."
+    EXIT_CODE=1
+else
+    green "✓ every actor-attributed RPC mutation sits behind the write-ceiling gate"
+fi
+echo
+
 bold "▶ check 54: lint self-consistency (check numbering + documented count)"
 ACTUAL_NUMS="$(grep -oE '^bold "▶ check [0-9]+:' "${BASH_SOURCE[0]}" | grep -oE '[0-9]+' | sort -n)"
 EXPECTED_NUMS="$(seq 1 "$CHECK_COUNT")"

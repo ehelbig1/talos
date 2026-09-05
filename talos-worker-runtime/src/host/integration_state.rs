@@ -420,6 +420,11 @@ fn map_integration_err(
         E::Unauthorized => wit_integration_state::Error::Unauthorized,
         E::StorageFull => wit_integration_state::Error::StorageFull,
         E::Timeout => wit_integration_state::Error::Timeout,
+        // #754: the controller enforces the same write ceiling `set`/`delete`
+        // enforce above. Reaching this means THIS worker did not refuse — its
+        // `TALOS_WRITE_CEILING_ENFORCED` is unset while the controller's is
+        // set. Mapped to the SAME guest-visible error the local gate returns.
+        E::WriteCeiling => wit_integration_state::Error::Unauthorized,
         E::Internal(_) => wit_integration_state::Error::NotAvailable,
     }
 }
