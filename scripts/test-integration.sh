@@ -314,6 +314,12 @@ CTRL_TESTS=(
     # planning path AND `confirm=true` against a real row; `common` harness,
     # so CTRL_TESTS (64b).
     "stale_draft_child_workflow_tests"
+    # The NON-destructive half of the same blindness: three readiness scorers
+    # and the reuse report score or count a child from a table that records no
+    # row for it. Drives the REAL scan query, the shared `score_readiness`, the
+    # background writer's verbatim UPDATE and the (previously dead) schedule
+    # exclusion; `common` harness, so CTRL_TESTS (64b).
+    "child_readiness_tests"
     "api_key_tests"
     "api_auth_integration_test"
     "integration_mcp_tests"

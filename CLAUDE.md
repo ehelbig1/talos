@@ -457,19 +457,131 @@ archive path, so an operator who runs `session_start` after reading its own
 "ready to publish" list can archive what it just told them to ship; that is a
 real defect, reversible, and a change to what an existing opt-in flag does, so
 it is recorded rather than attempted. And `__ops_alert__` / `__ml_distill__`
-remain as #750 left them. Three INDEPENDENT readiness scorers (the on-demand handler, the
-hourly background loop, and `validate_workflow`) each score a child's
-reliability AND freshness at 0, and the background one PERSISTS ≤30/100 to
-`workflows.readiness_score` every hour, which
-`get_all_readiness_scores`/`below_50_count` then read. `get_workflow_reuse_stats`
-INNER-JOINs executions, so the most-reused workflow on the platform is ABSENT
-from the reuse tool. `get_workflow_risk_assessment`'s cascading-failure check
-and the background SLA-breach monitor both `continue` on a zero-row population,
-so they can never fire for a child. And
-`talos-advanced-repository`'s `get_frequently_executed_unscheduled` carries a
-sub-workflow exclusion that reads `module_id = 'system:sub_workflow'` and
-`config.sub_workflow_id` — neither is the shape the engine writes (`type` /
-`data`), so the exclusion is DEAD. **The structural question these all share is
+remain as #750 left them.
+
+**#762 — the SCORING half: a child's reliability and freshness are UNMEASURABLE,
+not zero.** #758/#760 fixed the DESTRUCTIVE readers; the same blindness also fed
+three readiness scorers, the reuse report and a dead schedule-suggestion filter,
+and those are fixed here. Reliability (50 pts) and freshness (20 pts) are read
+from `workflow_executions` and from nothing else, so 70 of a child's 100 points
+were scored from a table that is structurally silent about it. Measured on the
+reference fleet 2026-09-05 — the WHOLE population of children, not a sample:
+`cos-team-recall` 19 (the flagship's daily team gather), `pa-ask` 19 (runs per
+inbound email), `pa-quality-judge` 19 (judge of three workflows),
+`stress-05-child` 14, against a fleet otherwise at 40–87. The hourly loop
+PERSISTS those numbers and `get_all_readiness_scores` sorts ascending, so the
+flagship's own daily sub-workflow read as the least production-ready workflow on
+the platform and `below_50_count` counted it.
+
+**The DENOMINATOR shrinks; the score is not renormalised.** Two renderings were
+rejected before this one and the rejection is the design: scoring the two
+components 0 out of 100 is the determinate negative this whole class is about;
+scoring the measurable 30 and SCALING IT UP to 100 fabricates — a documented,
+low-risk child would report **100/100, fully production-ready** on zero execution
+evidence, which is worse than the zero it replaces because it is confident in the
+reassuring direction. So a child scores *N of `CHILD_MEASURABLE_MAX` (=30)*, its
+unmeasurable components are NAMED, and `comparable_to_fleet` is false. The
+shrunken denominator is what tells a reader the two numbers are not on one scale;
+a number out of 100 does not, however it was derived. ONE home:
+`talos_analytics_repository::readiness_basis::{ReadinessBasis, score_readiness}`,
+called by all three scorers — what is unified is the BASIS, deliberately NOT the
+reliability INPUT (the breakdown excludes acknowledged failures, the loop counts
+them; #758 chose to disclose that and that decision stands). Child-ness comes
+from `parents_of` (REPORT semantics), so an UNREADABLE parent leaves the workflow
+on the full scale and the incompleteness travels by NAME
+(`unreadable_parent_graphs` / `readiness_unreadable_parent_graphs`) rather than
+silently. **Nothing to say ⇒ no key**: a full-scale workflow's response is
+byte-identical to the pre-#762 one, except `get_all_readiness_scores`, which
+emits `max_possible` on EVERY row — that list exists to rank rows against each
+other, and a denominator present on some rows and absent on others is read as
+"the others are out of 100" by exactly the caller who needs telling otherwise.
+`below_50_count` EXCLUDES children with the exclusion disclosed
+(`below_50_count_raw`, names, `measured`, `complete`), because a child is below
+50 by construction; `avg_score` is deliberately NOT adjusted (it is a
+population-wide SQL mean that the page cannot correct) and says so. The
+page-scoped exclusion's COMPLETENESS is checked, not assumed: a child is ≤30, the
+page is the ascending prefix, so a page reaching past 30 has already swallowed
+every child — `child_exclusion_is_complete` computes that condition and the
+summary says PARTIAL when it does not hold.
+
+**Cost, measured rather than assumed.** The scan is one `LIKE`-prefiltered parent
+read: **0.40 ms** at one candidate (the breakdown / `validate_workflow` path) and
+**3.8–4.6 ms** with the whole 36-workflow fleet as candidates. The hourly loop
+runs ONE scan per USER per tick — the 500-row batch is grouped by `user_id` and
+each group's ids are the candidate list — against a loop that already issues
+THREE queries per workflow; a per-workflow scan would have been 36 of these. A
+failed scan falls back to full-scale (the pre-#762 answer) and is logged, never
+aborts the tick.
+
+**`get_workflow_reuse_stats` INNER-JOINs executions**, so `pa-ask` — dispatched
+per inbound email, 0 rows live and archived — was ABSENT from the reuse tool, not
+shown as zero. It now carries a SECOND list, `parent_dispatched`, with
+`total_invocations: null` and `runs_as_child_of`: folding those rows into the
+main list with a count of 0 was rejected because that list is RANKED by the count
+they do not have. Bounded by `REUSE_ZERO_INVOCATION_SCAN_LIMIT` with truncation
+disclosed.
+
+**`get_frequently_executed_unscheduled`'s sub-workflow exclusion was DEAD for two
+years and its own comment recorded the wrong lesson twice.** r242 wrote
+`node.kind` / `data.sub_workflow_id`; r243 "corrected" it to
+`module_id = 'system:sub_workflow'` / `config.sub_workflow_id` and wrote down
+*"the lesson: verify the actual JSON shape via `get_workflow`"* — having done
+exactly that and landed on a second shape the engine also does not write; r244
+then fixed a real `::jsonb` cast on top, which made the query RUN, which is why
+nothing looked broken. Measured live, both predicates as SQL against the real
+column: r243's matched **0** nodes, the engine's `type` / `data.*_workflow_id`
+shape matched **6** across 5 parents. The real lesson is that a hand-written
+`graph_json` predicate is a SECOND IMPLEMENTATION of a question the engine
+already answers — reading one workflow's JSON tells you one node kind's shape,
+and the engine names a child through EIGHT keys, one of which
+(`llm_dispatch`'s `routes`) is keyed by arbitrary class labels no key-name rule
+can see at all. The exclusion now runs through the ONE scan, in Rust over a
+widened page so removing a child does not under-fill the list of ten, and
+`child_reference_shape_tests` pins it against the engine's parser rather than
+against a string. Stated rather than sold: this exclusion is **vacuous on the
+reference fleet today** — `HAVING COUNT(we.id) >= 3` already excludes every pure
+child, so it bites only a HYBRID (dispatched AND directly triggered ≥3), of
+which there are currently zero.
+
+**`get_workflow_risk_assessment`'s cascading-failure check is DISCLOSED, not
+fixed.** It `continue`s on a zero-row population, so on this fleet the
+HIGH-severity check can never fire for any child. No risk entry is pushed (an
+`info` row on every parent with a judge node would be noise on three of this
+fleet's workflows); the population is emitted as
+`cascading_failure_check.sub_workflows_unmeasurable` so "no cascading-failure
+risk found" is legible as a statement about what was measurable. **The background
+SLA-breach monitor is RECORDED and NOT changed**: it is an ALERTER with no
+operator-facing field to disclose into, its `stats.total >= 3` gate can never
+pass for a child, and the honest fix is a per-run record it does not have. So
+`set_workflow_sla_threshold` on a child is silently inert.
+
+**What #762 could NOT guard, stated rather than implied.**
+`controller/src/bootstrap/background.rs` is `mod bootstrap` inside `main.rs`,
+i.e. bin-private, so no integration test can call its loop: deleting the loop's
+`child_scans` lookup leaves every test green. What is covered by construction is
+the shared decision — all three scorers call `score_readiness`, so removing the
+classification from it turns three tests red (mutation-proved). The handler-level
+wiring of the reuse list and the risk disclosure likewise has no test; the
+repository methods and pure renderers behind them do.
+
+**A lint for this class was BUILT, MEASURED and REJECTED — count stays 86.** The
+candidate rule was *"a reader that scores or counts from `workflow_executions`
+must consult the child scan"*. File-scoped, it reports **23 of 27** non-test
+files on the FIXED tree and nearly all are legitimate (`checkpoint_store`,
+`fence`, `stale_sweep`, `approval_gate`, the audit ledger, the secrets manager) —
+those read execution rows for durability, authorization and crypto, not to make a
+claim about use. Narrowed to an alternation of the five per-workflow reader
+methods it reaches **7 call sites**, ~71% precision against pristine main, and
+would ship at 2 with opt-out markers on the two surfaces deliberately left
+disclosed — but its recall against the ~26 graph-blind surfaces is **27%**, the
+alternation is the hand-maintained name list check 74 records as its own rot mode
+(there is no derived method family here — the six readers have six unrelated
+names in three crates), and, decisively, **it does not see the background loop at
+all**: that scorer reads executions with raw `sqlx::query_as`, not a repository
+method, so the lint would be green over the one writer whose number every other
+reader reads back. A gate blind to the most consequential site in its own class
+is the gate-that-doesn't-gate shape (#624, checks 64/65). The population is
+recorded here instead. **The structural question these all share is
 whether `execute_subworkflow_graph` should record a child `workflow_executions`
 row** (`parent_execution_id` / `root_execution_id` exist and are written only by
 replay today). Measured before deciding: ~225 estimated child runs/day, 98.6% of
