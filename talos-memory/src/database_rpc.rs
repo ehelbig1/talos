@@ -236,6 +236,12 @@ pub enum DatabaseRpcError {
     InvalidQuery(String),
     ResultTooLarge(String),
     Timeout,
+    /// The actor's `max_write_ceiling` refuses this MUTATING statement, or the
+    /// ceiling could not be read and the gate failed closed. Read statements
+    /// are unaffected. Payload-free and reason-blind for the caller — see
+    /// [`crate::memory_rpc::MemoryRpcError::WriteCeiling`]. Appended last per
+    /// the wire-format stability rule.
+    WriteCeiling,
 }
 
 #[cfg(test)]

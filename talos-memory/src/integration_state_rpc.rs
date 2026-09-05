@@ -428,6 +428,13 @@ pub enum IntegrationStateError {
     StorageFull,
     Internal(String),
     Timeout,
+    /// The actor's `max_write_ceiling` refuses this mutation, or the ceiling
+    /// could not be read and the gate failed closed. Payload-free and
+    /// reason-blind for the caller — see
+    /// [`crate::memory_rpc::MemoryRpcError::WriteCeiling`], which carries the
+    /// full argument for both properties and the measured old-worker
+    /// behaviour. Appended last per the wire-format stability rule.
+    WriteCeiling,
 }
 
 #[cfg(test)]

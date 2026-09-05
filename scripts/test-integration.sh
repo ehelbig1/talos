@@ -408,6 +408,16 @@ CTRL_TESTS=(
     # does. Also a separate PROCESS, because the memory crypto hook is a
     # process-wide OnceLock.
     "write_ceiling_hook_gate_tests"
+    # #754: the THIRD surface of the same control — the signed-RPC mutation
+    # routes (`talos.memory.op` Set/Delete, `talos.integration_state.op`
+    # Set/Delete, a mutating `talos.database.query`). Deliberately a separate
+    # binary again, for the same OnceLock reason as the two above, and because
+    # it is the only one that drives a real NATS round trip: it publishes a
+    # SIGNED request at the live subscriber and asserts on the DATABASE. Needs
+    # `TALOS_TEST_NATS_URL` — exported above for both loops — in addition to
+    # the `common` DATABASE_URL harness, so CTRL_TESTS and not TC_TESTS
+    # (sub-leg 64b). Fails on pristine main by assertion (`left: 1, right: 0`).
+    "rpc_write_ceiling_tests"
     "env_vars"
 )
 # 'talos_ctl' is now the migrated TEMPLATE: setup_test_context clones it into a

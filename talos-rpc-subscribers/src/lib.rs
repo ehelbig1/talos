@@ -27,6 +27,7 @@
 mod admission;
 mod build_skew;
 mod kernel;
+pub mod write_ceiling;
 use kernel::record_rpc_metric;
 
 pub use build_skew::{set_controller_build, set_worker_build_cache};
@@ -413,6 +414,87 @@ fn controller_permits_data_statement(stmt: &sqlparser::ast::Statement) -> bool {
     matches!(
         stmt,
         S::Query(_) | S::Insert(_) | S::Update { .. } | S::Delete(_) | S::Merge { .. }
+    )
+}
+
+/// Does this statement MUTATE? The write-ceiling half of the classification
+/// [`controller_permits_data_statement`] already performs.
+///
+/// The two functions are total over what actually reaches them: a statement
+/// that is not one of the five permitted variants is rejected before this is
+/// ever called, and of those five exactly `Query` is a read. So this is an
+/// EXTENSION of the controller's existing AST classifier, not a second,
+/// parallel one — deliberately, because "two paths answering one question
+/// differently" is the defect this whole line of work removes.
+///
+/// It is the controller's OWN parse, never the worker's `is_fetch` hint: the
+/// entire premise of the ceiling gate is that the sender may not have gated
+/// itself, so trusting a sender-supplied classification would be circular.
+///
+/// Statement-type token for audit, mirroring what the worker stamps as
+/// `target` on its own `database-query` refusal (`validated.stmt_type`).
+/// Deliberately NOT the SQL text: guest SQL carries literals, and literals
+/// carry PII (the same reason the worker's audit ledger stopped logging bind
+/// params verbatim).
+fn statement_type_label(stmt: &sqlparser::ast::Statement) -> &'static str {
+    use sqlparser::ast::Statement as S;
+    match stmt {
+        S::Query(_) => "SELECT",
+        S::Insert(_) => "INSERT",
+        S::Update { .. } => "UPDATE",
+        S::Delete(_) => "DELETE",
+        S::Merge { .. } => "MERGE",
+        _ => "UNKNOWN",
+    }
+}
+
+/// # A mutation can hide inside a `Statement::Query`, and it does
+///
+/// The first version of this function was `matches!(stmt, Insert | Update |
+/// Delete | Merge)` under a comment asserting that a Postgres data-modifying
+/// CTE (`WITH x AS (INSERT …) SELECT * FROM x`) "is a parse error, so it never
+/// reaches the pool". **That was written, then MEASURED, and it was wrong.**
+/// sqlparser 0.53 + `PostgreSqlDialect` parses
+/// `WITH ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) SELECT * FROM ins`
+/// into a `Statement::Query` whose CTE body is `SetExpr::Insert(Statement)`,
+/// and the `UPDATE` form likewise into `SetExpr::Update(Statement)`. Both are
+/// ADMITTED by [`controller_permits_data_statement`]. A `readonly` actor could
+/// therefore have smuggled an INSERT past a ceiling gate that called it a
+/// read. (`DELETE` and `MERGE` inside a CTE are parse errors in 0.53 — today.)
+///
+/// So the walk below is not an enumeration of known-bad shapes. It breaks on
+/// **any** nested `Statement` that is not itself a `Query`, which is fail
+/// closed against every statement type sqlparser learns to nest in future,
+/// including the two it currently refuses.
+fn controller_statement_mutates(stmt: &sqlparser::ast::Statement) -> bool {
+    use sqlparser::ast::{Statement as S, Visit, Visitor};
+    use std::ops::ControlFlow;
+
+    if matches!(
+        stmt,
+        S::Insert(_) | S::Update { .. } | S::Delete(_) | S::Merge { .. }
+    ) {
+        return true;
+    }
+
+    // Breaks on any statement node that is not a `Query`. On a genuine read
+    // the ONLY statement in the tree is the root `Statement::Query`, so the
+    // walk completes; anything else present is a mutation the outer `Query`
+    // is carrying.
+    struct NestedMutationVisitor;
+    impl Visitor for NestedMutationVisitor {
+        type Break = ();
+        fn pre_visit_statement(&mut self, s: &S) -> ControlFlow<()> {
+            match s {
+                S::Query(_) => ControlFlow::Continue(()),
+                _ => ControlFlow::Break(()),
+            }
+        }
+    }
+
+    matches!(
+        stmt.visit(&mut NestedMutationVisitor),
+        ControlFlow::Break(())
     )
 }
 
@@ -1708,6 +1790,10 @@ pub fn spawn_memory_rpc_subscriber(
                 Err(MemoryRpcError::InvalidInput(_)) => "invalid",
                 Err(MemoryRpcError::Timeout) => "timeout",
                 Err(MemoryRpcError::StorageFull) => "storage_full",
+                // Distinct tag: reaching this on the RPC route means a worker
+                // sent a mutation its OWN gate should have refused — a
+                // fleet-configuration signal, unlike the envelope refusal.
+                Err(MemoryRpcError::WriteCeiling) => "write_ceiling",
                 _ => "internal",
             };
             let reply = match op_result {
@@ -1806,6 +1892,34 @@ async fn execute_memory_op(
             // distinguish memory_type and too-large.
             let key = talos_memory::validate_memory_key(&key)
                 .map_err(|msg| MemoryRpcError::InvalidInput(msg.into()))?;
+            // Write ceiling (#754). The worker gates `agent-memory-set` AND
+            // `agent-memory-store-with-embedding` — both arrive here as
+            // `MemoryOp::Set`, distinguished only by `memory_type` — but the
+            // signature that got this far proves possession of the
+            // FLEET-SHARED key, not that any gate ran. See
+            // `write_ceiling`'s module docs.
+            //
+            // Placed AFTER key validation deliberately: an invalid key has a
+            // more specific diagnostic, and reporting a malformed request as a
+            // policy refusal would name the wrong cause (#750's own ordering
+            // argument at the envelope gate).
+            let op_label = if memory_type == "semantic" {
+                write_ceiling::AGENT_MEMORY_STORE_WITH_EMBEDDING_OP
+            } else {
+                talos_workflow_engine_core::AGENT_MEMORY_SET_OP
+            };
+            if write_ceiling::gate(
+                pool,
+                actor_id,
+                op_label,
+                talos_memory::memory_rpc::SUBJECT_MEMORY_OP,
+                key,
+            )
+            .await
+            .is_refused()
+            {
+                return Err(MemoryRpcError::WriteCeiling);
+            }
             match talos_memory::persist_memory_with_metadata(
                 pool,
                 actor_id,
@@ -1841,6 +1955,21 @@ async fn execute_memory_op(
             // no-op, indistinguishable from "key never existed."
             let key = talos_memory::validate_memory_key(&key)
                 .map_err(|msg| MemoryRpcError::InvalidInput(msg.into()))?;
+            // Write ceiling (#754): destroying memory is a mutation. Gating
+            // `Set` alone would leave a `readonly` actor able to erase its own
+            // data, which is the same control failing in the other direction.
+            if write_ceiling::gate(
+                pool,
+                actor_id,
+                write_ceiling::AGENT_MEMORY_DELETE_OP,
+                talos_memory::memory_rpc::SUBJECT_MEMORY_OP,
+                key,
+            )
+            .await
+            .is_refused()
+            {
+                return Err(MemoryRpcError::WriteCeiling);
+            }
             match talos_memory::forget_exact(pool, actor_id, key).await {
                 Ok(_) => Ok(MemoryOpResult::Ok),
                 Err(e) => Err(MemoryRpcError::Internal(e.to_string())),
@@ -2350,6 +2479,43 @@ pub fn spawn_database_rpc_subscriber(
                     );
                     return;
                 }
+
+                // Write ceiling (#754). The worker refuses a mutating
+                // statement for a `readonly` actor
+                // (`host/database.rs::sql_stmt_type_is_read_only` +
+                // `write_ceiling_refuses("database-query", …)`), but the
+                // signature that got this far proves possession of the
+                // FLEET-SHARED key, not that the worker's gate ran. Classified
+                // from the CONTROLLER's own AST, never from the sender's
+                // `is_fetch` hint — see `controller_statement_mutates`.
+                //
+                // Reads are untouched: the ceiling bounds mutation, not recall,
+                // and a SELECT never reaches the gate (so it never pays the
+                // ceiling lookup either).
+                if controller_statement_mutates(&stmts[0])
+                    && write_ceiling::gate(
+                        &pool,
+                        req.actor_id,
+                        write_ceiling::DATABASE_QUERY_OP,
+                        SUBJECT_DATABASE_QUERY,
+                        // The worker audits the statement TYPE, not the SQL —
+                        // guest SQL can carry PII in literals. Same choice
+                        // here.
+                        statement_type_label(&stmts[0]),
+                    )
+                    .await
+                    .is_refused()
+                {
+                    send(Err(DatabaseRpcError::WriteCeiling)).await;
+                    record_rpc_metric(
+                        SUBJECT_DATABASE_QUERY,
+                        req.actor_id,
+                        "write_ceiling",
+                        start.elapsed().as_millis() as u64,
+                        0,
+                    );
+                    return;
+                }
             }
 
             let _permit = sem.acquire_owned().await;
@@ -2395,6 +2561,11 @@ pub fn spawn_database_rpc_subscriber(
                 Err(DatabaseRpcError::ResultTooLarge(_)) => "too_large",
                 Err(DatabaseRpcError::Timeout) => "timeout",
                 Err(DatabaseRpcError::QueryError(_)) => "query_error",
+                // Unreachable from `execute_guest_query` (the gate above
+                // returns before it), but the match is exhaustive by design so
+                // a new variant forces a decision rather than falling into a
+                // catch-all.
+                Err(DatabaseRpcError::WriteCeiling) => "write_ceiling",
             };
             send(result).await;
             record_rpc_metric(
@@ -2816,6 +2987,50 @@ pub fn spawn_integration_state_subscriber(
             let _permit = sem.acquire_owned().await;
             let permit_at = std::time::Instant::now();
 
+            // Write ceiling (#754). The worker refuses `integration-state-set`
+            // / `integration-state-delete` for a `readonly` actor
+            // (`host/integration_state.rs`), but the signature that got this
+            // far proves possession of the FLEET-SHARED key, not that the
+            // worker's gate ran. Reads (`Get` / `List`) are untouched and never
+            // pay the lookup.
+            //
+            // The ceiling is resolved from `req.actor_id` — the SIGNED actor —
+            // never from `req.user_id` or `integration_name`, which are
+            // routing fields. The gate must key on the identity the signature
+            // binds, or it gates whatever the caller says it should.
+            let ceiling_op = match req.op.get() {
+                talos_memory::integration_state_rpc::IntegrationOp::Set { .. } => {
+                    Some(write_ceiling::INTEGRATION_STATE_SET_OP)
+                }
+                talos_memory::integration_state_rpc::IntegrationOp::Delete { .. } => {
+                    Some(write_ceiling::INTEGRATION_STATE_DELETE_OP)
+                }
+                talos_memory::integration_state_rpc::IntegrationOp::Get { .. }
+                | talos_memory::integration_state_rpc::IntegrationOp::List { .. } => None,
+            };
+            if let Some(op_label) = ceiling_op {
+                if write_ceiling::gate(
+                    &pool,
+                    req.actor_id,
+                    op_label,
+                    SUBJECT_INTEGRATION_STATE_OP,
+                    &req.integration_name,
+                )
+                .await
+                .is_refused()
+                {
+                    send_err(IntegrationStateError::WriteCeiling).await;
+                    record_rpc_metric(
+                        SUBJECT_INTEGRATION_STATE_OP,
+                        req.actor_id,
+                        "write_ceiling",
+                        permit_at.saturating_duration_since(start).as_millis() as u64,
+                        permit_at.elapsed().as_millis() as u64,
+                    );
+                    return;
+                }
+            }
+
             // Zombie-permit guard (docs/platform-primitive-checklist.md
             // §3): a stalled Postgres must not hold this permit
             // indefinitely. Elapsed maps to the protocol's existing
@@ -2847,6 +3062,10 @@ pub fn spawn_integration_state_subscriber(
                 Err(IntegrationStateError::InvalidInput(_)) => "invalid",
                 Err(IntegrationStateError::Timeout) => "timeout",
                 Err(IntegrationStateError::StorageFull) => "storage_full",
+                // Unreachable from `execute_op` (the gate above returns
+                // before it), spelled so a future producer inside the op
+                // executor is not silently tagged "internal".
+                Err(IntegrationStateError::WriteCeiling) => "write_ceiling",
                 _ => "internal",
             };
             let reply = match op_result {
@@ -3059,6 +3278,128 @@ mod controller_statement_allowlist_tests {
         assert!(!controller_permits_data_statement(&parse1(
             "EXPLAIN ANALYZE DELETE FROM t"
         )));
+    }
+
+    // ── #754: the write-ceiling half of the same classification ──────────
+
+    #[test]
+    fn exactly_the_dml_statements_mutate() {
+        use super::controller_statement_mutates;
+        for sql in [
+            "INSERT INTO t (a) VALUES ($1)",
+            "UPDATE t SET a = $1 WHERE id = $2",
+            "DELETE FROM t WHERE id = $1",
+            "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET a = s.a",
+        ] {
+            assert!(controller_statement_mutates(&parse1(sql)), "mutates: {sql}");
+        }
+        for sql in [
+            "SELECT * FROM t WHERE id = $1",
+            "WITH c AS (SELECT 1) SELECT * FROM c",
+        ] {
+            assert!(!controller_statement_mutates(&parse1(sql)), "reads: {sql}");
+        }
+    }
+
+    /// The two classifiers must PARTITION the permitted set: everything
+    /// `controller_permits_data_statement` admits is either a read or a
+    /// mutation, and nothing is both. Without this, a future permitted variant
+    /// could be admitted to the pool while `controller_statement_mutates`
+    /// silently calls it a read — the gate would still "run" and would refuse
+    /// nothing.
+    #[test]
+    fn the_permitted_set_is_partitioned_into_reads_and_mutations() {
+        use super::controller_statement_mutates;
+        const PERMITTED: &[&str] = &[
+            "SELECT * FROM t",
+            "INSERT INTO t (a) VALUES (1)",
+            "UPDATE t SET a = 1",
+            "DELETE FROM t",
+            "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET a = s.a",
+        ];
+        let mut reads = 0;
+        let mut mutations = 0;
+        for sql in PERMITTED {
+            let stmt = parse1(sql);
+            assert!(controller_permits_data_statement(&stmt), "{sql}");
+            if controller_statement_mutates(&stmt) {
+                mutations += 1;
+            } else {
+                reads += 1;
+            }
+        }
+        assert_eq!(reads, 1, "exactly SELECT is a read");
+        assert_eq!(mutations, 4, "the four DML forms mutate");
+    }
+
+    /// MEASURED, not assumed — and the measurement REFUTED the first version
+    /// of this classifier.
+    ///
+    /// A Postgres data-modifying CTE is the one shape where a mutation hides
+    /// inside `Statement::Query`. The doc comment originally claimed sqlparser
+    /// 0.53 refuses the form; run, this test FAILED, because it parses the
+    /// INSERT and UPDATE forms and `controller_permits_data_statement` admits
+    /// them. A `readonly` actor could have smuggled an INSERT past a gate that
+    /// called it a read.
+    #[test]
+    fn a_mutation_hiding_in_a_cte_is_not_reported_as_a_read() {
+        use super::controller_statement_mutates;
+        for sql in [
+            "WITH ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) SELECT * FROM ins",
+            "WITH u AS (UPDATE t SET a = 1 RETURNING a) SELECT * FROM u",
+        ] {
+            let stmt = parse1(sql);
+            assert!(
+                controller_permits_data_statement(&stmt),
+                "precondition: the statement gate ADMITS this, which is why the \
+                 ceiling gate has to classify it: {sql}"
+            );
+            assert!(
+                controller_statement_mutates(&stmt),
+                "a mutation inside a CTE must NOT read as a SELECT: {sql}"
+            );
+        }
+    }
+
+    /// The forms sqlparser 0.53 refuses today. Pinned so a dependency bump
+    /// that teaches it these forms is NOISY rather than silent — and note the
+    /// walk already handles them fail-closed if it does, because it breaks on
+    /// any non-`Query` statement node rather than on a list.
+    #[test]
+    fn delete_and_merge_ctes_do_not_parse_today() {
+        for sql in [
+            "WITH d AS (DELETE FROM t RETURNING a) SELECT * FROM d",
+            "WITH m AS (MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET a = s.a) SELECT 1",
+        ] {
+            assert!(
+                Parser::parse_sql(&PostgreSqlDialect {}, sql).is_err(),
+                "sqlparser now parses this. That is FINE for the ceiling gate \
+                 (`controller_statement_mutates` breaks on any non-Query \
+                 statement node), but update this test so the change is \
+                 recorded: {sql}"
+            );
+        }
+    }
+
+    /// Genuine reads, including nested and set-operation shapes, must NOT be
+    /// swept up. A gate that refused every SELECT would pass every refusal
+    /// test in this file and break the platform.
+    #[test]
+    fn ordinary_reads_are_still_reads() {
+        use super::controller_statement_mutates;
+        for sql in [
+            "SELECT * FROM t WHERE id = $1",
+            "SELECT * FROM (SELECT 1) x",
+            "WITH c AS (SELECT 1) SELECT * FROM c",
+            "WITH a AS (SELECT 1), b AS (SELECT * FROM a) SELECT * FROM b",
+            "SELECT 1 UNION SELECT 2",
+            "SELECT * FROM t WHERE id IN (SELECT id FROM u)",
+        ] {
+            assert!(
+                !controller_statement_mutates(&parse1(sql)),
+                "must remain a read: {sql}"
+            );
+        }
     }
 }
 

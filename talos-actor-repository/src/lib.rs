@@ -2760,14 +2760,7 @@ impl ActorRepository {
         &self,
         actor_id: Uuid,
     ) -> Result<Option<talos_workflow_job_protocol::WriteCeiling>> {
-        let row: Option<String> =
-            sqlx::query_scalar("SELECT max_write_ceiling FROM actors WHERE id = $1")
-                .bind(actor_id)
-                .fetch_optional(&self.db_pool)
-                .await?;
-        Ok(row
-            .as_deref()
-            .map(talos_workflow_job_protocol::WriteCeiling::from_db_str))
+        read_actor_write_ceiling(&self.db_pool, actor_id).await
     }
 
     /// Set an actor's data-mutation ceiling. Validates user ownership
@@ -4350,6 +4343,50 @@ pub fn classify_module_bound_ceilings<E: std::fmt::Display>(
             egress,
         },
     }
+}
+
+/// Pool-taking form of [`ActorRepository::get_actor_max_write_ceiling`], and
+/// the ONE place this column is read.
+///
+/// # Why a free function
+///
+/// The controller's signed-RPC subscribers (`talos-rpc-subscribers`) must
+/// consult this ceiling before persisting an actor-attributed mutation on a
+/// worker's behalf, and they hold a bare `PgPool` — no `ActorRepository`, no
+/// `SecretsManager`. Constructing a repository per RPC to read one column
+/// would be the wrong shape, and re-typing the `SELECT` at the subscriber
+/// would be a second reader of a SECURITY column. So the read lives here, in
+/// the persistence layer, with one caller shape for each need.
+///
+/// # Three-valued on purpose
+///
+/// `Ok(Some(ceiling))` = the rule was read. `Ok(None)` = there is no such
+/// actor row. `Err` = the rule could not be read at all. Those are three
+/// different answers and a gate must not collapse them: "no such actor" and
+/// "Postgres is down" are both *unknown*, never *permitted*. Callers fail
+/// closed on the second and third — see
+/// `talos_rpc_subscribers::write_ceiling::decide`.
+///
+/// # Why the bare pool is right here (checks 25 / 42)
+///
+/// This is a PLATFORM read on the enforcement path, not a tenant read. Its
+/// only input is the actor id that the RPC's HMAC/Ed25519 signature binds;
+/// it returns one policy token and no tenant data. Scoping it to a tenant
+/// transaction would require a `user_id` the enforcement path deliberately
+/// does not take from the caller — the signature binds the ACTOR, and asking
+/// the caller who it is would be the spoof this gate exists to stop.
+pub async fn read_actor_write_ceiling(
+    pool: &PgPool,
+    actor_id: Uuid,
+) -> Result<Option<talos_workflow_job_protocol::WriteCeiling>> {
+    let row: Option<String> =
+        sqlx::query_scalar("SELECT max_write_ceiling FROM actors WHERE id = $1")
+            .bind(actor_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row
+        .as_deref()
+        .map(talos_workflow_job_protocol::WriteCeiling::from_db_str))
 }
 
 #[cfg(test)]
