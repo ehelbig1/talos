@@ -569,8 +569,11 @@ pub async fn upsert_user_audit_settings(
             otlp_protocol = EXCLUDED.otlp_protocol,
             auth_headers_encrypted = EXCLUDED.auth_headers_encrypted,
             auth_headers_enc_key_id = EXCLUDED.auth_headers_enc_key_id,
-            auth_headers_format = EXCLUDED.auth_headers_format,
-            updated_at = NOW()
+            auth_headers_format = EXCLUDED.auth_headers_format
+            /* updated_at deliberately NOT set: the BEFORE UPDATE trigger stamps it
+               only when a column really changed (migration 20260905120000). A
+               block comment, not `--`: a line comment survives only while the
+               newlines do. */
         "#,
     )
     .bind(s.user_id)

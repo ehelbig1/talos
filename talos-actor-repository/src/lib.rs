@@ -3784,7 +3784,7 @@ impl ActorRepository {
         let rows = sqlx::query(
             "SELECT id, name FROM workflows \
              WHERE actor_id = $1 AND user_id = $2 AND status != 'archived' \
-             ORDER BY updated_at DESC LIMIT $3",
+             ORDER BY updated_at DESC, id DESC LIMIT $3",
         )
         .bind(actor_id)
         .bind(user_id)
@@ -3811,7 +3811,7 @@ impl ActorRepository {
             "SELECT id, name, description, capabilities \
              FROM workflows \
              WHERE actor_id = $1 AND status = 'published' \
-             ORDER BY updated_at DESC LIMIT $2",
+             ORDER BY updated_at DESC, id DESC LIMIT $2",
         )
         .bind(actor_id)
         .bind(limit)

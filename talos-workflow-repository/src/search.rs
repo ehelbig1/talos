@@ -231,7 +231,10 @@ impl WorkflowRepository {
                 .join(",")
         );
         let result = sqlx::query(
-            "UPDATE workflows SET embedding = $1::vector, updated_at = NOW() \
+            // `embedding` is a declared maintenance column: it is derived from
+            // content that already stamped the row on its own edit. Stamping
+            // `updated_at` here dated every workflow by the last embedding run.
+            "UPDATE workflows SET embedding = $1::vector \
              WHERE id = $2 AND user_id = $3",
         )
         .bind(&emb_str)
@@ -301,7 +304,7 @@ impl WorkflowRepository {
              FROM workflows \
              WHERE user_id = $1 \
                AND capabilities @> $2 \
-             ORDER BY updated_at DESC \
+             ORDER BY updated_at DESC, id DESC \
              LIMIT $3",
         )
         .bind(user_id)
@@ -527,7 +530,7 @@ impl WorkflowRepository {
                 "SELECT id, name, description, tags, status, created_at, updated_at \
                  FROM workflows WHERE user_id = $1 AND name ILIKE $2 AND $3 = ANY(tags) \
                  AND ($4 OR COALESCE(status, '') != 'archived') \
-                 ORDER BY updated_at DESC LIMIT $5",
+                 ORDER BY updated_at DESC, id DESC LIMIT $5",
             )
             .bind(user_id)
             .bind(ilike_pattern)
@@ -541,7 +544,7 @@ impl WorkflowRepository {
                 "SELECT id, name, description, tags, status, created_at, updated_at \
                  FROM workflows WHERE user_id = $1 AND name ILIKE $2 \
                  AND ($3 OR COALESCE(status, '') != 'archived') \
-                 ORDER BY updated_at DESC LIMIT $4",
+                 ORDER BY updated_at DESC, id DESC LIMIT $4",
             )
             .bind(user_id)
             .bind(ilike_pattern)
@@ -832,7 +835,7 @@ impl WorkflowRepository {
             sqlx::query(
                 "SELECT id, name, description, capabilities, intent \
                  FROM workflows WHERE user_id = $1 \
-                 ORDER BY updated_at DESC LIMIT $2",
+                 ORDER BY updated_at DESC, id DESC LIMIT $2",
             )
             .bind(user_id)
             .bind(limit)
@@ -842,7 +845,7 @@ impl WorkflowRepository {
             sqlx::query(
                 "SELECT id, name, description, capabilities, intent \
                  FROM workflows WHERE user_id = $1 AND embedding IS NULL \
-                 ORDER BY updated_at DESC LIMIT $2",
+                 ORDER BY updated_at DESC, id DESC LIMIT $2",
             )
             .bind(user_id)
             .bind(limit)

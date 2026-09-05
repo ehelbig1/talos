@@ -1826,7 +1826,7 @@ impl AdvancedRepository {
              WHERE w.user_id = $1 \
                AND w.status = 'draft' \
                AND NOT EXISTS (SELECT 1 FROM workflow_executions we WHERE we.workflow_id = w.id) \
-             ORDER BY w.updated_at DESC LIMIT 10",
+             ORDER BY w.updated_at DESC, w.id DESC LIMIT 10",
         )
         .bind(user_id)
         .fetch_all(&mut *tx)

@@ -2017,7 +2017,7 @@ impl AnalyticsRepository {
                     readiness_score, description, created_at, updated_at \
              FROM workflows \
              WHERE user_id = $1 AND (status IS NULL OR status != 'archived') \
-             ORDER BY updated_at DESC",
+             ORDER BY updated_at DESC, id DESC",
         )
         .bind(user_id)
         .fetch_all(&mut *tx)
@@ -2057,7 +2057,7 @@ impl AnalyticsRepository {
                     workflow_type, tags, created_at, updated_at \
              FROM workflows \
              WHERE user_id = $1 AND (status IS NULL OR status != 'archived') \
-             ORDER BY updated_at DESC \
+             ORDER BY updated_at DESC, id DESC \
              LIMIT $2",
         )
         .bind(user_id)
@@ -5990,6 +5990,26 @@ impl AnalyticsRepository {
         .fetch_all(&self.db_pool)
         .await?;
         Ok(rows)
+    }
+
+    /// When migration `20260905120000_updated_at_is_not_a_maintenance_clock` was
+    /// APPLIED to this database — the instant after which `workflows.updated_at`
+    /// means "a user edited this row" rather than "a background job touched it".
+    ///
+    /// `Ok(None)` means the migration is not applied here (a genuine answer, not
+    /// a failure). An `Err` is propagated rather than flattened: the caller
+    /// treats "cannot determine" as "assume pre-cutover", and it must be able to
+    /// tell that apart from "definitely not applied".
+    pub async fn maintenance_clock_cutover(
+        &self,
+        migration_version: i64,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        Ok(sqlx::query_scalar::<_, chrono::DateTime<chrono::Utc>>(
+            "SELECT installed_on FROM _sqlx_migrations WHERE version = $1",
+        )
+        .bind(migration_version)
+        .fetch_optional(&self.db_pool)
+        .await?)
     }
 }
 

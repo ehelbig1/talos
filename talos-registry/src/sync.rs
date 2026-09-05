@@ -830,8 +830,10 @@ async fn sync_template(
              oci_url                = EXCLUDED.oci_url, \
              allowed_hosts          = EXCLUDED.allowed_hosts, \
              allowed_secrets        = EXCLUDED.allowed_secrets, \
-             requires_approval_for  = EXCLUDED.requires_approval_for, \
-             updated_at             = NOW()",
+             requires_approval_for  = EXCLUDED.requires_approval_for \
+          /* updated_at deliberately NOT set — see talos-registry/src/lib.rs. This is \
+             the OCI source-of-truth mode; it re-syncs every catalog entry on a \
+             schedule, so an explicit stamp re-dates the whole catalog each pass. */",
     )
     .bind(name)
     .bind(category)

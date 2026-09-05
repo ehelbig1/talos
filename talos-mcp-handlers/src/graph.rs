@@ -5141,7 +5141,7 @@ async fn handle_preview_capability_dispatch(
             "required_capabilities": required_caps,
             "match_count": matches.len(),
             "matches": matches,
-            "dispatch_note": "At runtime, the engine selects the most recently updated (updated_at DESC) matching workflow regardless of status. The first entry in 'matches' is what will be selected. If match_count is 0, dispatch fails hard unless fallback_workflow_id is set on the node.",
+            "dispatch_note": "At runtime, the engine selects the most recently updated (ORDER BY updated_at DESC, id DESC) matching workflow regardless of status. The first entry in 'matches' is what will be selected. If match_count is 0, dispatch fails hard unless fallback_workflow_id is set on the node. Note: a workflow last stamped before 2026-09-05 may carry a background-maintenance timestamp rather than an edit time, so its position in this ordering is not evidence about when it was last changed.",
         }))
         .unwrap_or_default(),
     )

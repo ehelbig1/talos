@@ -8149,6 +8149,91 @@ else
 fi
 echo
 
+# ── 83. An explicit `updated_at = NOW()` must not override the trigger ────
+bold "▶ check 83: explicit updated_at = NOW() in an upsert on a trigger-maintained table"
+
+# Migration 20260905120000 made `updated_at` mean "a user edited this row":
+# the BEFORE UPDATE trigger stamps it only when a column OUTSIDE the table's
+# declared maintenance set actually changed. A statement that writes
+# `updated_at = NOW()` ITSELF is not subject to that verdict — the trigger can
+# only decide whether to OVERWRITE the value, never to revert one — so an
+# explicit stamp inside an `ON CONFLICT … DO UPDATE SET` silently reinstates
+# the whole defect for that path.
+#
+# That is not hypothetical, and the trigger fix ALONE did not close it: the
+# catalog seeder rewrites every catalog row at every controller boot, and it is
+# an upsert with an explicit stamp. Measured on the dev fleet, 75 of 112
+# `modules` rows shared a single boot second. The first version of the DB test
+# for this exercised `UPDATE modules SET description=…, source_code=…` — the
+# shape the seeder does NOT issue — and was green while the live path stayed
+# broken; `an_explicit_stamp_overrides_the_trigger` in
+# controller/tests/updated_at_maintenance_tests.rs now pins the real shape.
+#
+# MEASURED in both directions against a pristine `git show HEAD:` copy of the
+# tree: **7 findings, all 7 real** (talos-registry lib/api/reconcile/sync,
+# talos-module-repository x2, talos-audit-ledger) and **0** after the fix.
+# Six are catalog upserts across BOTH source-of-truth modes — disk seeding and
+# the OCI registry sync — so patching one mode would have left the other.
+#
+# The detector deliberately does NOT parse Rust string literals. An earlier
+# literal-parsing inventory written for this same change missed
+# `talos-registry/src/sync.rs` (and, on the sibling ORDER BY sweep, two more
+# sites) because one desynchronising quote earlier in the file put the
+# statement outside what the parser considered a literal. Scanning for the SQL
+# keyword sequence instead has no such failure mode.
+#
+# STATED LIMITS, each confirmed rather than inferred: it is TEXTUAL and
+# WINDOW-bounded (8000 chars from `INSERT INTO`, truncated at the first
+# `.bind(`/`.execute(`/`.fetch_*(` that ends the literal), so SQL assembled with
+# `format!()` or split across two literals is invisible — the quiet direction.
+# The table list is HARDCODED and must be extended when a table starts carrying
+# the trigger; the migration's own DO block and
+# `updated_at_declarations_name_real_columns` are what guard the declarations
+# themselves. It says nothing about a PLAIN `UPDATE … SET x = $1, updated_at =
+# NOW()`: that shape was measured at 24 sites on this tree and EVERY ONE is a
+# content write the trigger would stamp anyway, so gating it would be 0%
+# precision — the reason this check is scoped to `ON CONFLICT` upserts, where an
+# unchanged re-write is the normal case rather than the exception.
+# Opt-out `// allow-explicit-updated-at: <reason>`.
+UPSERT_STAMP_HITS="$(find . -name '*.rs' "${TREE_PRUNE_FIND[@]}" -not -path '*/target/*' -print0 2>/dev/null \
+  | xargs -0 perl -0777 -ne '
+    my $TBL = qr/workflows|secrets|users|webhook_triggers|mcp_agents|agent_roles|user_audit_settings|modules/;
+    my $src = $_;
+    while ($src =~ /INSERT\s+INTO\s*\\?\s*($TBL)\b/gs) {
+        my ($tbl, $start) = ($1, $-[0]);
+        my $rest = substr($src, $start, 8000);
+        my $end = length($rest);
+        if ($rest =~ /\.(?:bind|execute|fetch_one|fetch_all|fetch_optional)\s*\(/s) { $end = $-[0]; }
+        my $win = substr($rest, 0, $end);
+        next unless $win =~ /ON\s+CONFLICT/is;
+        next unless $win =~ /DO\s+UPDATE\s+SET/igs;
+        my $after = substr($win, $+[0]);
+        next unless $after =~ /\bupdated_at\s*\\?\s*=\s*NOW\(\)/is;
+        my $line = (substr($src, 0, $start) =~ tr/\n//) + 1;
+        print "$ARGV:$line:$tbl\n";
+    }
+  ' 2>/dev/null || true)"
+UPSERT_STAMP_FAIL=0
+if [ -n "$UPSERT_STAMP_HITS" ]; then
+    while IFS=: read -r f n tbl; do
+        [ -n "${f:-}" ] || continue
+        lo=$(( n > 8 ? n - 8 : 1 ))
+        if sed -n "${lo},${n}p" "$f" 2>/dev/null | grep -q 'allow-explicit-updated-at:'; then continue; fi
+        red "✗ $f:$n upsert on '$tbl' sets updated_at = NOW() explicitly, overriding the trigger's verdict"
+        UPSERT_STAMP_FAIL=1
+    done <<< "$UPSERT_STAMP_HITS"
+fi
+if [ "$UPSERT_STAMP_FAIL" -gt 0 ]; then
+    yellow "  → drop \`updated_at = NOW()\` from the DO UPDATE SET list and let the"
+    yellow "    BEFORE UPDATE trigger decide. It stamps the row when a non-maintenance"
+    yellow "    column really changed, and leaves an unchanged re-write alone — which"
+    yellow "    is what stops the catalog seeder re-dating the whole catalog per boot."
+    EXIT_CODE=1
+else
+    green "✓ no upsert re-dates a row the trigger judged unchanged"
+fi
+echo
+
 bold "▶ check 54: lint self-consistency (check numbering + documented count)"
 ACTUAL_NUMS="$(grep -oE '^bold "▶ check [0-9]+:' "${BASH_SOURCE[0]}" | grep -oE '[0-9]+' | sort -n)"
 EXPECTED_NUMS="$(seq 1 "$CHECK_COUNT")"

@@ -74,7 +74,7 @@ pub async fn run_workflow_chains(
         "SELECT id, graph_json, actor_id \
          FROM workflows \
          WHERE user_id = $1 AND graph_json LIKE $2 \
-         ORDER BY updated_at DESC \
+         ORDER BY updated_at DESC, id DESC \
          LIMIT $3",
     )
     .bind(user_id)
