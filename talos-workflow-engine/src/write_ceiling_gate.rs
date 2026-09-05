@@ -211,9 +211,99 @@ pub(crate) fn apply_memory_write_ceiling(
     Some(RefusedMemoryWrite { key })
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Audit probe
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Exercise THIS gate — the `__memory_write__` envelope route — with a
+/// synthetic probe envelope and inspect what came back.
+///
+/// # Why this exists
+///
+/// `security_audit`'s `write_ceiling_enforcement` check said, verbatim, that
+/// "the enforcing gate lives in the worker process, so the controller cannot
+/// exercise it from here". That was true when it was written and stopped being
+/// true when #750 landed this module and #757 landed the signed-RPC gate: the
+/// controller enforces the same ceiling on two routes of its own. An audit that
+/// describes a control it *does* run as one it cannot reach is the
+/// misleading-report class applied to the control's own reporting.
+///
+/// So this is not a test — it is the probe a running controller uses to make
+/// the `round_trip` claim honest: a value is pushed through the real
+/// `apply_memory_write_ceiling`, and the result is inspected.
+///
+/// # What it asserts, and why each arm
+///
+/// * A `readonly` actor's envelope is REFUSED, **and removed** — a merely
+///   flagged envelope is one `unwrap_or(false)` away from being honoured, and
+///   the refusal record must be present, because that record is the only thing
+///   downstream readers have.
+/// * A `write` actor's envelope is PERMITTED and left INTACT. A gate that
+///   refuses everything is not a working gate; it is an outage that grades
+///   green on the refusal arm alone.
+/// * With enforcement OFF the envelope survives. This is the staged-rollout
+///   default and the byte-identical-to-pre-#750 behaviour; a probe that only
+///   checked the enforcing arms could not tell a correct gate from one that
+///   ignores the flag.
+///
+/// # Cost and safety
+///
+/// Pure and in-process: no database, no env read, no allocation beyond one
+/// small `serde_json::Value`. Idempotent and side-effect free, which is what
+/// lets `run_security_audit` keep its "only DB access is a read of
+/// `pg_trigger`" promise.
+///
+/// # Errors
+///
+/// `Err(arm)` names the FIRST arm that behaved wrongly, in a sentence an
+/// operator can act on. There is deliberately no partial-success shape: a gate
+/// that refuses correctly and permits wrongly is broken, and reporting it as
+/// half-healthy is how a broken control reads as a working one.
+pub fn probe_envelope_gate() -> Result<(), &'static str> {
+    fn probe_output() -> JsonValue {
+        serde_json::json!({
+            reserved_keys::MEMORY_WRITE: {
+                "key": "security-audit/write-ceiling-probe",
+                "value": {"probe": true},
+            },
+        })
+    }
+    let verbatim = |s: &str| s.to_string();
+
+    // 1. readonly + enforced ⇒ refused, envelope GONE, refusal RECORDED.
+    let mut out = probe_output();
+    if apply_memory_write_ceiling(&mut out, WriteCeiling::ReadOnly, true, verbatim).is_none() {
+        return Err("envelope route: a readonly actor's __memory_write__ was PERMITTED");
+    }
+    if out.get(reserved_keys::MEMORY_WRITE).is_some() {
+        return Err("envelope route: a refused __memory_write__ envelope was left in the output");
+    }
+    if out.get(reserved_keys::MEMORY_WRITE_REFUSED).is_none() {
+        return Err("envelope route: a refusal was not recorded in the node output");
+    }
+
+    // 2. write + enforced ⇒ permitted, envelope INTACT.
+    let mut out = probe_output();
+    if apply_memory_write_ceiling(&mut out, WriteCeiling::Write, true, verbatim).is_some() {
+        return Err("envelope route: a write-capable actor's __memory_write__ was REFUSED");
+    }
+    if out.get(reserved_keys::MEMORY_WRITE).is_none() {
+        return Err("envelope route: a permitted __memory_write__ envelope was removed anyway");
+    }
+
+    // 3. enforcement OFF ⇒ permitted for every ceiling (the staged default).
+    for ceiling in [WriteCeiling::ReadOnly, WriteCeiling::Write] {
+        let mut out = probe_output();
+        if apply_memory_write_ceiling(&mut out, ceiling, false, verbatim).is_some() {
+            return Err("envelope route: enforcement is OFF but an envelope was refused anyway");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{apply_memory_write_ceiling, RefusedMemoryWrite};
+    use super::{apply_memory_write_ceiling, probe_envelope_gate, RefusedMemoryWrite};
     use serde_json::json;
     use talos_workflow_engine_core::reserved_keys::{MEMORY_WRITE, MEMORY_WRITE_REFUSED};
     use talos_workflow_engine_core::WriteCeiling;
@@ -350,5 +440,18 @@ mod tests {
             agent_ops.contains(&talos_workflow_engine_core::AGENT_MEMORY_SET_OP),
             "controller-side refusal audits under a label the worker never emits"
         );
+    }
+
+    /// The audit's `round_trip` claim rests entirely on this returning `Ok`.
+    ///
+    /// It is a REGRESSION guard, not a restatement of the tests above: those
+    /// call `apply_memory_write_ceiling` directly, so any of them could pass
+    /// while the probe — the thing the running controller actually executes —
+    /// was wired wrong. Mutating the gate (drop the `write_ceiling_denies`
+    /// call, or annotate without removing the envelope) fails HERE, which is
+    /// what makes the audit's claim falsifiable rather than decorative.
+    #[test]
+    fn the_audit_probe_finds_this_gate_healthy() {
+        assert_eq!(probe_envelope_gate(), Ok(()));
     }
 }
