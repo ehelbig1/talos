@@ -190,6 +190,119 @@ impl ParallelWorkflowEngine {
         }
     }
 
+    /// Build this node's [`DEGRADED_INPUTS`] report: every ANCESTOR whose
+    /// committed output reports a failure, named by its graph label.
+    ///
+    /// [`DEGRADED_INPUTS`]: talos_workflow_engine_core::reserved_keys::DEGRADED_INPUTS
+    ///
+    /// # Why ancestors and not just parents
+    ///
+    /// The node that loses a dimension is almost never the node next to the
+    /// failure. A fan-in sits between them, and a composer sits after that,
+    /// and the judge that is supposed to catch the gap sits after THAT. In the
+    /// shape this exists for, `judge → synthesize → collect → team_gather`,
+    /// only `collect` has the failed node as a direct parent — and `collect`
+    /// is the one node in the chain that renders nothing and judges nothing.
+    /// Walking ancestors is what puts the signal where a reader can act on it.
+    ///
+    /// # Why it is derived, never inherited
+    ///
+    /// The obvious cheaper design is to stamp each node's report onto its
+    /// OUTPUT and have children read their parents' copies — one hop instead
+    /// of a walk. That would make the report a value that flows through
+    /// module-authored JSON, and a module that emitted its own
+    /// `__degraded_inputs__` would be indistinguishable from the engine's. By
+    /// deriving the whole report from the engine's private `results` map and
+    /// the graph's topology on every dispatch, fabrication is not defended
+    /// against — it is unrepresentable. The cost is a walk over UUIDs, which
+    /// is nothing beside the payload clones `gather_inputs` already makes on
+    /// the same call.
+    ///
+    /// Iterative and `visited`-guarded rather than recursive: the reactor
+    /// only ever runs a DAG, but a topology bug must degrade to a wrong report
+    /// rather than a blown stack. Returns `None` when no ancestor failed —
+    /// which the set-or-REMOVE applier turns into "no key", so a healthy run's
+    /// payload is byte-identical to the pre-feature engine.
+    pub(crate) fn degraded_inputs_report(
+        &self,
+        node_idx: NodeIndex,
+        results: &HashMap<Uuid, JsonValue>,
+    ) -> Option<JsonValue> {
+        use talos_workflow_engine_core::reserved_keys as rk;
+
+        let mut visited: std::collections::HashSet<NodeIndex> = std::collections::HashSet::new();
+        let mut queue: std::collections::VecDeque<NodeIndex> = self
+            .graph
+            .neighbors_directed(node_idx, Direction::Incoming)
+            .collect();
+        // The node itself is never its own degraded input, even in a graph
+        // that (wrongly) cycles back to it.
+        visited.insert(node_idx);
+
+        let mut failed: Vec<(String, Option<String>)> = Vec::new();
+        while let Some(idx) = queue.pop_front() {
+            if !visited.insert(idx) {
+                continue;
+            }
+            let pid = self.graph[idx];
+            if let Some(output) = results.get(&pid) {
+                if rk::output_reports_error(output) {
+                    let label = self
+                        .node_labels
+                        .get(&pid)
+                        .cloned()
+                        .unwrap_or_else(|| pid.to_string());
+                    failed.push((label, rk::error_reason(output)));
+                }
+            }
+            for grandparent in self.graph.neighbors_directed(idx, Direction::Incoming) {
+                if !visited.contains(&grandparent) {
+                    queue.push_back(grandparent);
+                }
+            }
+        }
+        rk::build_degraded_inputs_report(failed)
+    }
+
+    /// Apply [`Self::degraded_inputs_report`] to an assembled input/output
+    /// object, set-or-REMOVE.
+    ///
+    /// The one call every dispatch chokepoint makes, so the anti-fabrication
+    /// removal cannot be forgotten at a site that only thought about the
+    /// insert.
+    pub(crate) fn apply_degraded_inputs_to(
+        &self,
+        node_idx: NodeIndex,
+        results: &HashMap<Uuid, JsonValue>,
+        target: &mut Map<String, JsonValue>,
+    ) {
+        talos_workflow_engine_core::reserved_keys::apply_degraded_inputs(
+            target,
+            self.degraded_inputs_report(node_idx, results),
+        );
+    }
+
+    /// [`Self::apply_degraded_inputs_to`] for a caller holding a whole
+    /// `JsonValue` rather than its map.
+    ///
+    /// **No-ops on a non-object** — there is nowhere to put a reserved key on
+    /// a bare string or array, and wrapping one would change the single-parent
+    /// input shape that `gather_inputs` documents as load-bearing. The loss is
+    /// narrow by construction: an ancestor that FAILED emits an object
+    /// (`{__error, error_message, …}`), so the only unreachable case is a
+    /// scalar-emitting healthy parent standing between a reader and a deeper
+    /// failure.
+    pub(crate) fn apply_degraded_inputs_to_value(
+        &self,
+        node_idx: NodeIndex,
+        results: &HashMap<Uuid, JsonValue>,
+        target: &mut JsonValue,
+    ) {
+        if let Some(obj) = target.as_object_mut() {
+            self.apply_degraded_inputs_to(node_idx, results, obj);
+        }
+    }
+
     /// Load the Wasm bytecode for a given node ID (enforces user ownership).
     ///
     /// Three layers: the engine-local speculative-prefetch cache, a
@@ -390,10 +503,23 @@ impl ParallelWorkflowEngine {
             .collect();
 
         let parent_count = parent_outputs.len();
-        let collected = serde_json::json!({
+        let mut collected = serde_json::json!({
             "items": parent_outputs,
             "count": parent_count,
         });
+
+        // `count: N` is a claim about how many branches ARRIVED, not about how
+        // many succeeded, and `items` is a POSITIONAL array with no labels —
+        // so a branch that failed lands in it as an unnamed element whose
+        // `__error` marker a reader has to go looking for. Measured: the array
+        // is ordered by `neighbors_directed`, which is neither the graph
+        // author's order nor stable, so position is not even a usable proxy
+        // for identity. Naming the failed branches here is the fan-in's own
+        // half of the fix; the input-side injection covers every node
+        // downstream of it. set-or-REMOVE via the shared applier.
+        if let Some(obj) = collected.as_object_mut() {
+            self.apply_degraded_inputs_to(node_idx, results, obj);
+        }
 
         tracing::info!(
             node_id = %node_id,

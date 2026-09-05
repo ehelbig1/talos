@@ -259,6 +259,44 @@ pub async fn start_graph_backfill(
 /// PROVENANCE (which keys + their ranking-feature snapshot) keyed by
 /// execution when `ENABLE_MEMORY_RANK_PROVENANCE` is on. `None` on paths
 /// with no durable execution (draft/test previews) — provenance is skipped.
+/// Remove every ENGINE-AUTHORED reserved key from an inbound payload.
+///
+/// Split out of [`inject_actor_context_into_input`] so the rule is testable
+/// without a `WorkflowRepository` — it had no coverage at all while it was an
+/// inline block, on a list whose whole job is to close spoofing vectors.
+///
+/// Each key here is something the engine DERIVES and a downstream consumer
+/// TRUSTS. A caller-supplied copy on an inbound trigger/test payload would be
+/// believed, and no legitimate internal path sets any of them top-level on an
+/// inbound payload — sub-workflows, continuation and the scheduler all
+/// re-derive their context server-side from their own actor binding.
+///
+/// Stripping is UNCONDITIONAL, ahead of every early return in the caller, so a
+/// SKIPPED injection cannot pass a spoofed value through.
+fn strip_engine_authored_keys(input: &mut serde_json::Value) {
+    let Some(obj) = input.as_object_mut() else {
+        return;
+    };
+    for reserved in [
+        talos_workflow_engine_core::reserved_keys::ACTOR_CONTEXT,
+        talos_workflow_engine_core::reserved_keys::ACCUMULATED,
+        talos_workflow_engine_core::reserved_keys::TRIGGER_INPUT,
+        // Engine-authored freshness verdict: a caller-supplied copy would be a
+        // trust-signal spoof — claiming "inputs verified fresh" on data the
+        // engine never checked.
+        talos_workflow_engine_core::reserved_keys::STALENESS,
+        // Engine-authored input-COMPLETENESS verdict. The spoof runs both ways
+        // here, which is why it belongs on this list rather than relying on the
+        // per-dispatch set-or-REMOVE alone: a caller could suppress a real
+        // degradation record by supplying nothing where one was due, or invent
+        // a failed upstream node that never ran and steer a composer into
+        // disclaiming evidence it actually had.
+        talos_workflow_engine_core::reserved_keys::DEGRADED_INPUTS,
+    ] {
+        obj.remove(reserved);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn inject_actor_context_into_input(
     workflow_repo: &talos_workflow_repository::WorkflowRepository,
@@ -286,19 +324,7 @@ pub async fn inject_actor_context_into_input(
     // ahead of every early return, so a skipped injection can never pass a
     // spoofed value through. The real context (when injected) overwrites the
     // now-cleared slot below.
-    if let Some(obj) = input.as_object_mut() {
-        for reserved in [
-            talos_workflow_engine_core::reserved_keys::ACTOR_CONTEXT,
-            talos_workflow_engine_core::reserved_keys::ACCUMULATED,
-            talos_workflow_engine_core::reserved_keys::TRIGGER_INPUT,
-            // Engine-authored freshness verdict: a caller-supplied copy would
-            // be a trust-signal spoof — claiming "inputs verified fresh" on
-            // data the engine never checked.
-            talos_workflow_engine_core::reserved_keys::STALENESS,
-        ] {
-            obj.remove(reserved);
-        }
-    }
+    strip_engine_authored_keys(input);
     if !inject {
         return;
     }
@@ -389,5 +415,66 @@ mod backfill_guard_tests {
         assert!(try_claim(b), "a different actor's backfill is independent");
         BACKFILLS_IN_FLIGHT.lock().unwrap().remove(&a);
         BACKFILLS_IN_FLIGHT.lock().unwrap().remove(&b);
+    }
+}
+
+#[cfg(test)]
+mod reserved_key_strip_tests {
+    //! The inbound spoof guard. Every key on this list is one the engine
+    //! DERIVES and a downstream consumer TRUSTS, so a caller-supplied copy is
+    //! believed unless it is removed here.
+
+    use super::strip_engine_authored_keys;
+    use serde_json::json;
+
+    #[test]
+    fn every_engine_authored_key_is_removed_and_user_data_survives() {
+        let mut input = json!({
+            "__actor_context__": { "spoofed": true },
+            "__accumulated__": { "spoofed": true },
+            "__trigger_input__": { "spoofed": true },
+            "__staleness__": { "verified": true, "any_stale": false },
+            "__degraded_inputs__": {
+                "any_degraded": true,
+                "entries": [{ "node": "a_branch_that_never_ran" }]
+            },
+            "question": "what is on my plate today?",
+            "__not_reserved__": 1
+        });
+        strip_engine_authored_keys(&mut input);
+        let obj = input.as_object().expect("object");
+        for k in [
+            "__actor_context__",
+            "__accumulated__",
+            "__trigger_input__",
+            "__staleness__",
+            "__degraded_inputs__",
+        ] {
+            assert!(!obj.contains_key(k), "{k} survived the strip");
+        }
+        assert_eq!(obj["question"], json!("what is on my plate today?"));
+        assert_eq!(
+            obj["__not_reserved__"],
+            json!(1),
+            "the strip is a fixed list, not a blanket `__`-prefix sweep"
+        );
+    }
+
+    #[test]
+    fn a_degradation_record_cannot_be_supplied_by_the_caller() {
+        // Both directions of the spoof. INVENTING one would steer a composer
+        // into disclaiming evidence it actually had; and because the strip runs
+        // unconditionally the key cannot survive to be re-read as "the engine
+        // found nothing" either.
+        let mut input = json!({ "__degraded_inputs__": { "any_degraded": true } });
+        strip_engine_authored_keys(&mut input);
+        assert_eq!(input, json!({}));
+    }
+
+    #[test]
+    fn a_non_object_payload_is_left_alone() {
+        let mut input = json!("a bare string trigger");
+        strip_engine_authored_keys(&mut input);
+        assert_eq!(input, json!("a bare string trigger"));
     }
 }

@@ -815,7 +815,17 @@ impl ParallelWorkflowEngine {
         let verdict_expr = verdict_expr.clone();
         let pass_threshold = *pass_threshold;
         let on_failure = on_failure.clone();
-        let parent_inputs = self.gather_inputs(node_idx, results);
+        let mut parent_inputs = self.gather_inputs(node_idx, results);
+        // A judge sees only the OUTPUT it is judging, and a missing input
+        // DIMENSION leaves that output perfectly well-formed — which is
+        // exactly how a deterministic completeness verdict scored 1.0 on a
+        // briefing that had silently lost a third of its evidence. Injecting
+        // the report puts `__degraded_inputs__` in the verdict expression's
+        // scope (`build_condition_scope` pushes every top-level key), so an
+        // author CAN require disclosure or abstain via `not_applicable`.
+        // Deliberately does NOT change the verdict by itself: routing is the
+        // author's, exactly as with `__staleness__`.
+        self.apply_degraded_inputs_to_value(node_idx, results, &mut parent_inputs);
         Some(self.dispatch_inline_judge(parent_inputs, &verdict_expr, pass_threshold, &on_failure))
     }
 
@@ -847,7 +857,11 @@ impl ParallelWorkflowEngine {
         let rubric = rubric.clone();
         let pass_threshold = *pass_threshold;
         let on_failure = on_failure.clone();
-        let parent_inputs = self.gather_inputs(node_idx, results);
+        let mut parent_inputs = self.gather_inputs(node_idx, results);
+        // Same reasoning as the inline judge: the sub-workflow judge receives
+        // this as its trigger input, so a rubric can be written to notice that
+        // the thing it is scoring was assembled from partial evidence.
+        self.apply_degraded_inputs_to_value(node_idx, results, &mut parent_inputs);
 
         Some(
             self.dispatch_judge(
