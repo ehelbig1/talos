@@ -29,6 +29,11 @@
 //!   per-node max-age contract on the actor-memory keys the node reads;
 //!   the engine answers with a [`STALENESS`] report on the node's input
 //!   so a reader can never silently present stale data as current.
+//! * **Input completeness** — [`DEGRADED_INPUTS`] names the upstream
+//!   nodes whose FAILURE left this node's inputs incomplete. Freshness
+//!   covers stale memory; this covers a dead branch. Together they are
+//!   the two ways a node's inputs can be wrong while its output looks
+//!   perfectly well-formed.
 //! * **Sub-workflow output** — keys prefixed `__judge_*`,
 //!   `__confidence_*`, `__ensemble_*`, `__verification_*`,
 //!   `__reflective_retry_*` are written by the corresponding
@@ -459,6 +464,174 @@ pub fn describe_stale_entries(report: &serde_json::Value) -> String {
     parts.join("; ")
 }
 
+/// Engine-authored report naming the upstream nodes whose failure left this
+/// node's inputs INCOMPLETE — the input-side twin of [`STALENESS`].
+///
+/// # Why a well-formed output is not evidence of a complete input
+///
+/// Every quality gate in a workflow judges the OUTPUT. A missing input
+/// DIMENSION leaves the output perfectly well-formed, so an output-only judge
+/// structurally cannot see it. Observed live on the cross-domain briefing:
+/// one of three gather branches died of fuel exhaustion, the fan-in folded its
+/// error envelope into `items` as an unlabelled positional element, the
+/// composing LLM did exactly what its prompt said ("if a source is empty or
+/// absent, simply draw fewer priorities from it") and the deterministic judge
+/// scored the result 1.0 — because that verdict only checked the SHAPE of each
+/// priority. The words "team", "unavailable" and "degraded" appeared nowhere
+/// in a briefing that had silently lost a third of its evidence.
+///
+/// [`REQUIRES_FRESH`] / [`STALENESS`] answers the same question for stale
+/// MEMORY inputs; this key answers it for a FAILED UPSTREAM NODE. They share a
+/// vocabulary on purpose, so a composer has one idiom for "your inputs are
+/// incomplete".
+///
+/// # Shape
+///
+/// ```json
+/// { "any_degraded": true, "count": 1, "truncated": false,
+///   "entries": [ { "node": "team_gather", "reason": "…fuel_exhaustion…" } ] }
+/// ```
+///
+/// `any_degraded` is ALWAYS `true` when the key is present — the key is
+/// set-or-REMOVE, so absence is the "nothing degraded" state. The field exists
+/// only so `__degraded_inputs__.any_degraded` and `__staleness__.any_stale`
+/// read the same way in a composer or a verdict expression.
+///
+/// # Trust
+///
+/// Engine-authored and DERIVED — never read back from any value a module,
+/// sub-workflow or LLM wrote. The engine computes it from its own results map
+/// and the graph's topology, applies it set-or-REMOVE on every dispatch, and
+/// strips it from inbound trigger payloads. A module cannot fabricate a
+/// degradation record and cannot inherit a stale one from its caller.
+pub const DEGRADED_INPUTS: &str = "__degraded_inputs__";
+
+/// Hard cap on [`DEGRADED_INPUTS`] entries. A fan-in of hundreds of failing
+/// branches must not turn every downstream node's input into a megabyte of
+/// error prose; the count field still reports the true total.
+pub const MAX_DEGRADED_INPUT_ENTRIES: usize = 16;
+
+/// Hard cap on a single entry's `reason`, in CHARS (truncation is
+/// char-boundary safe). Upstream reasons carry stack-ish worker text.
+pub const MAX_DEGRADED_REASON_CHARS: usize = 240;
+
+/// Hard cap on a single entry's `node` label.
+pub const MAX_DEGRADED_LABEL_CHARS: usize = 120;
+
+/// Truncate `s` to at most `max` CHARS, appending an ellipsis marker when it
+/// actually cut. Char-based so a multi-byte label/reason can never be split
+/// mid-codepoint (the em-dash class of panic).
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(max).collect();
+    out.push('…');
+    out
+}
+
+/// Build the [`DEGRADED_INPUTS`] payload from `(node_label, reason)` pairs for
+/// every upstream node whose output reported a failure.
+///
+/// Returns `None` for an empty input — that is the whole backward-compatibility
+/// story: with nothing to report the caller REMOVES the key rather than writing
+/// an "all clear" envelope, so a run with no upstream failure produces a
+/// byte-identical payload to the pre-feature engine.
+///
+/// Entries are deduplicated by label (first reason wins) and **sorted by
+/// label**. Sorting is load-bearing, not tidiness: the engine discovers parents
+/// through `petgraph`'s `neighbors_directed`, whose order is neither the graph
+/// author's nor stable across edits — a caller who read entry ordering as
+/// meaningful would be reading noise, and two runs over identical data would
+/// disagree.
+#[must_use]
+pub fn build_degraded_inputs_report<I>(failed: I) -> Option<serde_json::Value>
+where
+    I: IntoIterator<Item = (String, Option<String>)>,
+{
+    let mut seen: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for (label, reason) in failed {
+        let label = truncate_chars(label.trim(), MAX_DEGRADED_LABEL_CHARS);
+        let reason = reason
+            .as_deref()
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .map_or_else(
+                || "upstream node failed".to_string(),
+                |r| truncate_chars(r, MAX_DEGRADED_REASON_CHARS),
+            );
+        // First reason wins: a DIRECT parent is visited before its own
+        // ancestors, so the nearest description of a node survives.
+        seen.entry(label).or_insert(reason);
+    }
+    if seen.is_empty() {
+        return None;
+    }
+    let count = seen.len();
+    let truncated = count > MAX_DEGRADED_INPUT_ENTRIES;
+    let entries: Vec<serde_json::Value> = seen
+        .into_iter()
+        .take(MAX_DEGRADED_INPUT_ENTRIES)
+        .map(|(node, reason)| serde_json::json!({ "node": node, "reason": reason }))
+        .collect();
+    Some(serde_json::json!({
+        "any_degraded": true,
+        "count": count,
+        "truncated": truncated,
+        "entries": entries,
+    }))
+}
+
+/// Human-readable one-line summary of a [`DEGRADED_INPUTS`] report, for a
+/// rendered warning banner or a node log line. Mirrors
+/// [`describe_stale_entries`].
+///
+/// Returns an empty string for a report with no entries, so a caller can treat
+/// "" as "nothing to say" without a second presence check.
+#[must_use]
+pub fn describe_degraded_inputs(report: &serde_json::Value) -> String {
+    let Some(entries) = report.get("entries").and_then(|e| e.as_array()) else {
+        return String::new();
+    };
+    let parts: Vec<String> = entries
+        .iter()
+        .map(|e| {
+            let node = e.get("node").and_then(|v| v.as_str()).unwrap_or("?");
+            match e.get("reason").and_then(|v| v.as_str()) {
+                Some(r) if !r.is_empty() => format!("{node} unavailable ({r})"),
+                _ => format!("{node} unavailable"),
+            }
+        })
+        .collect();
+    parts.join("; ")
+}
+
+/// Apply a [`DEGRADED_INPUTS`] report to an input/output object using the
+/// **set-or-REMOVE** discipline every engine-authored key obeys.
+///
+/// The removal arm is the security-relevant half and is why this is a function
+/// rather than an `insert` at each call site. A node's assembled input is built
+/// on top of CALLER DATA — an upstream module's JSON, a trigger payload, an
+/// LLM's output object — so a merely-conditional insert leaves a
+/// caller-authored `__degraded_inputs__` in place whenever the engine has
+/// nothing to report. That is the inverse of the whole feature: a module could
+/// claim its inputs were complete when the engine never checked, or invent a
+/// failed sibling that never ran. Same rule as `build_judge_envelope`'s
+/// `__judge_*` keys and the inbound reserved-key strip.
+pub fn apply_degraded_inputs(
+    target: &mut serde_json::Map<String, serde_json::Value>,
+    report: Option<serde_json::Value>,
+) {
+    match report {
+        Some(r) => {
+            target.insert(DEGRADED_INPUTS.to_string(), r);
+        }
+        None => {
+            target.remove(DEGRADED_INPUTS);
+        }
+    }
+}
+
 /// Per-node graph-json field: does this node consume the injected
 /// [`ACTOR_CONTEXT`]? Defaults to `true` (see
 /// [`node_needs_memory_from_config`]) so the field is fully
@@ -832,6 +1005,164 @@ mod tests {
         at_bound.insert("k".to_string(), Some(6.0));
         let (_, stale_at_bound) = build_staleness_report(&policy, &at_bound);
         assert!(!stale_at_bound);
+    }
+
+    #[test]
+    fn degraded_report_is_none_when_nothing_failed() {
+        // The whole backward-compatibility story: nothing to report means NO
+        // KEY, not an all-clear envelope. An "all clear" would change every
+        // existing node payload in the fleet.
+        assert!(build_degraded_inputs_report(Vec::new()).is_none());
+    }
+
+    #[test]
+    fn degraded_report_names_nodes_and_reasons() {
+        let r = build_degraded_inputs_report(vec![(
+            "team_gather".to_string(),
+            Some("fuel exhausted".to_string()),
+        )])
+        .expect("one failure reports");
+        assert_eq!(r["any_degraded"], serde_json::json!(true));
+        assert_eq!(r["count"], serde_json::json!(1));
+        assert_eq!(r["truncated"], serde_json::json!(false));
+        assert_eq!(r["entries"][0]["node"], serde_json::json!("team_gather"));
+        assert_eq!(
+            r["entries"][0]["reason"],
+            serde_json::json!("fuel exhausted")
+        );
+    }
+
+    #[test]
+    fn a_reasonless_failure_still_names_the_node() {
+        // `error_reason` returns None for a bare `__error: true` envelope
+        // (rendering it would put the string "true" where a reason belongs).
+        // The NODE is the load-bearing half, so the entry must survive.
+        let r = build_degraded_inputs_report(vec![("gather".to_string(), None)])
+            .expect("a reasonless failure is still a failure");
+        assert_eq!(r["entries"][0]["node"], serde_json::json!("gather"));
+        assert_eq!(
+            r["entries"][0]["reason"],
+            serde_json::json!("upstream node failed")
+        );
+    }
+
+    #[test]
+    fn entries_are_sorted_and_deduplicated() {
+        // Sorting is not tidiness. The engine finds ancestors through
+        // petgraph's `neighbors_directed`, whose order is neither the graph
+        // author's nor stable across edits — measured live, a parent added
+        // FIRST came back SECOND. Unsorted output would make two runs over
+        // identical data disagree.
+        let r = build_degraded_inputs_report(vec![
+            ("zeta".to_string(), Some("z".to_string())),
+            ("alpha".to_string(), Some("first wins".to_string())),
+            ("alpha".to_string(), Some("second loses".to_string())),
+        ])
+        .expect("reports");
+        assert_eq!(r["count"], serde_json::json!(2), "the duplicate collapsed");
+        assert_eq!(r["entries"][0]["node"], serde_json::json!("alpha"));
+        assert_eq!(r["entries"][1]["node"], serde_json::json!("zeta"));
+        assert_eq!(
+            r["entries"][0]["reason"],
+            serde_json::json!("first wins"),
+            "the NEAREST description of a node survives — direct parents are \
+             visited before their own ancestors"
+        );
+    }
+
+    #[test]
+    fn a_wide_fanin_is_capped_but_still_counts_honestly() {
+        let many: Vec<(String, Option<String>)> = (0..40)
+            .map(|i| (format!("node{i:02}"), Some("boom".to_string())))
+            .collect();
+        let r = build_degraded_inputs_report(many).expect("reports");
+        assert_eq!(
+            r["count"],
+            serde_json::json!(40),
+            "the count reports the TRUE total; truncating it too would make \
+             the cap itself a misleading report"
+        );
+        assert_eq!(r["truncated"], serde_json::json!(true));
+        assert_eq!(
+            r["entries"].as_array().expect("array").len(),
+            MAX_DEGRADED_INPUT_ENTRIES
+        );
+    }
+
+    #[test]
+    fn a_long_reason_is_truncated_on_a_char_boundary() {
+        // Multi-byte on purpose: a byte-slice truncation panics mid-codepoint,
+        // which is a live class in this codebase (the em-dash in an injected
+        // memory payload).
+        let long = "é".repeat(MAX_DEGRADED_REASON_CHARS + 50);
+        let r = build_degraded_inputs_report(vec![("n".to_string(), Some(long))]).expect("reports");
+        let got = r["entries"][0]["reason"].as_str().expect("string");
+        assert_eq!(got.chars().count(), MAX_DEGRADED_REASON_CHARS + 1);
+        assert!(got.ends_with('…'));
+    }
+
+    #[test]
+    fn an_empty_reason_reads_as_no_reason() {
+        let r = build_degraded_inputs_report(vec![("n".to_string(), Some("   ".to_string()))])
+            .expect("reports");
+        assert_eq!(
+            r["entries"][0]["reason"],
+            serde_json::json!("upstream node failed")
+        );
+    }
+
+    #[test]
+    fn describe_degraded_inputs_renders_a_banner_line() {
+        let r = build_degraded_inputs_report(vec![
+            ("team".to_string(), Some("fuel exhausted".to_string())),
+            ("ops".to_string(), None),
+        ])
+        .expect("reports");
+        assert_eq!(
+            describe_degraded_inputs(&r),
+            "ops unavailable (upstream node failed); team unavailable (fuel exhausted)",
+            "the builder normalises a missing reason, so every rendered entry \
+             carries one; `describe`'s reasonless arm covers a hand-built report"
+        );
+        assert_eq!(
+            describe_degraded_inputs(&serde_json::json!({})),
+            "",
+            "a report with no entries says nothing, so callers need no second \
+             presence check"
+        );
+    }
+
+    #[test]
+    fn apply_degraded_inputs_removes_a_fabricated_key() {
+        // The removal arm is the security-relevant half. A node's assembled
+        // input is built on top of caller data, so a merely-conditional insert
+        // would let a module claim its inputs were complete when the engine
+        // never checked — or invent a failed sibling that never ran.
+        let mut target = serde_json::Map::new();
+        target.insert(
+            DEGRADED_INPUTS.to_string(),
+            serde_json::json!({ "any_degraded": true, "entries": [] }),
+        );
+        target.insert("keep".to_string(), serde_json::json!(1));
+        apply_degraded_inputs(&mut target, None);
+        assert!(!target.contains_key(DEGRADED_INPUTS));
+        assert_eq!(target["keep"], serde_json::json!(1));
+    }
+
+    #[test]
+    fn apply_degraded_inputs_replaces_rather_than_merges() {
+        let mut target = serde_json::Map::new();
+        target.insert(
+            DEGRADED_INPUTS.to_string(),
+            serde_json::json!({ "entries": [{ "node": "invented" }] }),
+        );
+        let real = build_degraded_inputs_report(vec![("real".to_string(), None)]);
+        apply_degraded_inputs(&mut target, real);
+        let entries = target[DEGRADED_INPUTS]["entries"]
+            .as_array()
+            .expect("array");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["node"], serde_json::json!("real"));
     }
 
     #[test]

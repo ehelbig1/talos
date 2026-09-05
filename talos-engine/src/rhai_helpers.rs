@@ -94,6 +94,56 @@ thread_local! {
 /// itself has an `input` key. `input.dry_run` against a trigger payload of
 /// `{"dry_run": true}` is an unbound-variable ERROR, not `false` — the exact
 /// shape that made a fail-open skip gate look like a working one.
+/// Bind the input-COMPLETENESS variables (`inputs_degraded`, `degraded_inputs`)
+/// into a Rhai scope.
+///
+/// # Why this is a function and not two copies
+///
+/// This crate has TWO scope builders, and they are not interchangeable:
+/// [`build_condition_scope`] serves edge predicates / skip conditions /
+/// approval-policy triggers, while `evaluate_expression` serves the
+/// `Synthesize` node AND — the one that matters here — the INLINE JUDGE's
+/// `verdict_expr`. Adding the binding to the first one only would have shipped
+/// a signal that every gate could read except the gate this whole change
+/// exists to fix. Same shape as the MCP-465 drift the two builders were
+/// unified for, which is why the fix is a shared call rather than a second
+/// copy.
+///
+/// # Why the bindings are unconditional
+///
+/// `__degraded_inputs__` is set-or-REMOVE, so on a healthy run the key is
+/// ABSENT — and Rhai does not evaluate an unbound variable to unit, it ABORTS
+/// the expression. An author writing the natural `__degraded_inputs__ == ()`
+/// would get a verdict that fails to evaluate on every healthy run and scores
+/// 0 on every degraded one: a detector that cannot tell the two apart, which
+/// is this signal's own failure mode one level up. `is_error` /
+/// `error_message` are pushed unconditionally for exactly this reason.
+///
+/// `degraded_inputs` is an empty ARRAY — never unit — when nothing is
+/// degraded, so `degraded_inputs.len()` is valid on every run.
+fn push_degraded_inputs_bindings(scope: &mut Scope<'_>, context: &JsonValue) {
+    let report = match context {
+        JsonValue::Object(map) => {
+            map.get(talos_workflow_engine_core::reserved_keys::DEGRADED_INPUTS)
+        }
+        _ => None,
+    };
+    scope.push(
+        "inputs_degraded",
+        report
+            .and_then(|r| r.get("any_degraded"))
+            .and_then(JsonValue::as_bool)
+            .unwrap_or(false),
+    );
+    let entries = report
+        .and_then(|r| r.get("entries"))
+        .cloned()
+        .unwrap_or_else(|| JsonValue::Array(Vec::new()));
+    if let Ok(d) = rhai::serde::to_dynamic(&entries) {
+        scope.push_dynamic("degraded_inputs", d);
+    }
+}
+
 fn build_condition_scope<'a>(context: &'a JsonValue) -> Scope<'a> {
     let mut scope = Scope::new();
     let mut detected_error = false;
@@ -155,6 +205,8 @@ fn build_condition_scope<'a>(context: &'a JsonValue) -> Scope<'a> {
     // this layer wins over any payload key pushed in the loop above.
     scope.push("is_error", detected_error);
     scope.push("error_message", detected_error_message);
+
+    push_degraded_inputs_bindings(&mut scope, context);
 
     // Also provide the whole context as 'ctx' / 'inputs' for nested pathing.
     if let Ok(ctx_dynamic) = rhai::serde::to_dynamic(context) {
@@ -427,6 +479,13 @@ pub fn evaluate_expression(expression: &str, context: &JsonValue) -> Result<Json
             scope.push_dynamic("ctx", ctx_dynamic.clone());
             scope.push_dynamic("inputs", ctx_dynamic);
         }
+
+        // The inline judge's `verdict_expr` evaluates HERE, not through
+        // `build_condition_scope` — so the completeness bindings have to be
+        // pushed here too or the one gate that most needs them is the one gate
+        // that cannot see them. Pushed last: Rhai's scope lookup walks
+        // back-to-front, so these win over a same-named payload key.
+        push_degraded_inputs_bindings(&mut scope, context);
 
         engine
             .eval_with_scope::<Dynamic>(&mut scope, expression)
@@ -800,5 +859,114 @@ mod looks_like_error_string_tests {
         // cap got dropped accidentally.
         let s = "x".repeat(5 * 1024 * 1024);
         assert!(!looks_like_error_string(&s));
+    }
+}
+
+#[cfg(test)]
+mod degraded_inputs_scope_tests {
+    //! The Rhai half of the input-COMPLETENESS signal.
+    //!
+    //! `talos-workflow-engine`'s own tests prove the ENGINE puts
+    //! `__degraded_inputs__` into the context it hands the evaluator; they
+    //! cannot prove what Rhai then does with it, because that crate cannot
+    //! dev-depend on this one without a dependency cycle. These close the
+    //! other half — and they drive BOTH scope builders, because the inline
+    //! judge's `verdict_expr` runs through `evaluate_expression` while edge
+    //! predicates run through `build_condition_scope`, and a binding added to
+    //! only one of them would leave the judge blind.
+
+    use super::*;
+    use serde_json::json;
+
+    fn degraded_ctx() -> JsonValue {
+        json!({
+            "priorities": [{ "title": "x" }],
+            "__degraded_inputs__": {
+                "any_degraded": true,
+                "count": 1,
+                "truncated": false,
+                "entries": [{ "node": "team_gather", "reason": "fuel exhausted" }]
+            }
+        })
+    }
+
+    fn healthy_ctx() -> JsonValue {
+        json!({ "priorities": [{ "title": "x" }] })
+    }
+
+    #[test]
+    fn a_verdict_expression_can_act_on_degradation() {
+        let expr =
+            r#"#{ score: if inputs_degraded { 0.0 } else { 1.0 }, passed: !inputs_degraded }"#;
+        let degraded = evaluate_expression(expr, &degraded_ctx()).expect("evaluates");
+        assert_eq!(degraded["score"], json!(0.0));
+        assert_eq!(degraded["passed"], json!(false));
+
+        // The positive control, and it is the load-bearing one: a rule that
+        // also fires on a healthy run is not a detector. This is precisely the
+        // mistake the engine-side tests made before it was added there.
+        let healthy = evaluate_expression(expr, &healthy_ctx()).expect("evaluates");
+        assert_eq!(healthy["score"], json!(1.0));
+        assert_eq!(healthy["passed"], json!(true));
+    }
+
+    #[test]
+    fn the_binding_exists_on_a_healthy_run_rather_than_aborting() {
+        // The whole reason the binding is unconditional. `__degraded_inputs__`
+        // is set-or-REMOVE, so a healthy context has no such key — and naming
+        // an unbound variable ABORTS a Rhai expression rather than yielding
+        // unit. Without this push, the natural authoring style would produce a
+        // verdict that never evaluates on the runs that are fine.
+        let raw = evaluate_expression(
+            r#"#{ score: if __degraded_inputs__ == () { 1.0 } else { 0.0 } }"#,
+            &healthy_ctx(),
+        );
+        assert!(
+            raw.is_err(),
+            "documenting WHY the plain reserved key is not the idiom: naming \
+             it on a healthy run aborts, it does not read as unit"
+        );
+        // …and the supported idiom works on the same context.
+        assert_eq!(
+            evaluate_expression(r#"#{ ok: !inputs_degraded }"#, &healthy_ctx()).expect("evaluates")
+                ["ok"],
+            json!(true)
+        );
+    }
+
+    #[test]
+    fn a_verdict_can_name_the_branch_it_lost() {
+        let out = evaluate_expression(
+            r#"#{ lost: if degraded_inputs.len() > 0 { degraded_inputs[0].node } else { "" } }"#,
+            &degraded_ctx(),
+        )
+        .expect("evaluates");
+        assert_eq!(out["lost"], json!("team_gather"));
+    }
+
+    #[test]
+    fn degraded_inputs_is_an_empty_array_never_unit() {
+        // `.len()` must be valid on every run, degraded or not.
+        let out = evaluate_expression(r#"#{ n: degraded_inputs.len() }"#, &healthy_ctx())
+            .expect("evaluates");
+        assert_eq!(out["n"], json!(0));
+    }
+
+    #[test]
+    fn edge_predicates_see_the_same_binding() {
+        // `build_condition_scope`'s consumers — skip conditions, edge
+        // predicates, actor approval-policy triggers.
+        assert!(evaluate_condition("inputs_degraded", &degraded_ctx()));
+        assert!(!evaluate_condition("inputs_degraded", &healthy_ctx()));
+    }
+
+    #[test]
+    fn a_fabricated_binding_cannot_be_shadowed_by_a_payload_key() {
+        // The bindings are pushed LAST and Rhai's lookup walks back-to-front,
+        // so a module output carrying its own `inputs_degraded` field cannot
+        // override the engine's answer.
+        let mut ctx = degraded_ctx();
+        ctx["inputs_degraded"] = json!(false);
+        assert!(evaluate_condition("inputs_degraded", &ctx));
     }
 }
