@@ -250,6 +250,7 @@ lint: ## Rustfmt + WIT drift + structural + clippy (-D warnings) + offline cargo
 # structural checks to "tidy up" — meta-check 54 pins the count, and
 # CLAUDE.md's "N checks today" sentence to it.
 	@printf '▶ structural lints (incl. rustfmt + clippy --workspace --no-deps -D warnings)\n'
+	@bash -n scripts/lint-structural.sh || { printf '\033[1;31m✗ scripts/lint-structural.sh does not parse — no check below ran\033[0m\n'; exit 1; }
 	@TALOS_LINT_CLIPPY=1 bash scripts/lint-structural.sh
 	@printf '▶ cargo-deny (offline: bans + licenses + sources)\n'
 	@if command -v cargo-deny >/dev/null 2>&1; then \
