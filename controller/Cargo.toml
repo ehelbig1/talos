@@ -268,6 +268,11 @@ rsa = { version = "0.9", features = ["pem"] }
 # `__memory_write__` write-ceiling gate (#750) is proven on the production
 # node-completion chain rather than on a helper.
 talos-workflow-engine-test-utils = { path = "../talos-workflow-engine-test-utils" }
+# dormant_child_workflow_tests: renders the REAL cleanup recommendation from a
+# REAL `HygieneReport`, because the defect is what the recommendation COUNTS —
+# a test against the repository row alone cannot see the sentence that names
+# `batch_delete_workflows`.
+talos-hygiene-service = { path = "../talos-hygiene-service" }
 
 [features]
 default = []

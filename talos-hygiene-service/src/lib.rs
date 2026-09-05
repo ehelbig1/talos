@@ -597,18 +597,43 @@ pub fn build_report(h: &talos_analytics_repository::HygieneReport) -> HygieneRep
         .collect();
 
     // --- 6. Dormant enabled workflows ---
+    //
+    // A row with a non-empty `runs_as_child_of` is NOT dormant-by-neglect: it
+    // is dispatched in-process by an enabled parent, which records no
+    // `workflow_executions` row, so its silence in that table is the expected
+    // shape and not evidence. It stays in the LIST — an operator asking "what
+    // has no executions?" should still see it, with the reason — and is
+    // excluded from the cleanup RECOMMENDATION below, which is the half that
+    // points at `batch_delete_workflows`.
     let dormant_workflows: Vec<serde_json::Value> = h
         .dormant_workflows
         .iter()
         .map(|r| {
-            serde_json::json!({
+            let mut entry = serde_json::json!({
                 "id": r.id.to_string(),
                 "name": r.name,
                 "created_at": r.created_at.to_rfc3339(),
                 "last_execution": r.last_execution.map(|t| t.to_rfc3339()),
-            })
+            });
+            if !r.runs_as_child_of.is_empty() {
+                entry["runs_as_child_of"] = serde_json::json!(r.runs_as_child_of);
+                entry["last_execution_note"] =
+                    serde_json::json!(talos_analytics_repository::DORMANT_CHILD_NOTE);
+                entry["last_child_activity_at"] =
+                    serde_json::json!(r.last_child_activity_at.map(|t| t.to_rfc3339()));
+                entry["last_child_activity_caveat"] =
+                    serde_json::json!(talos_analytics_repository::DORMANT_CHILD_ACTIVITY_CAVEAT);
+            }
+            entry
         })
         .collect();
+    // The population the cleanup recommendation is allowed to speak about.
+    let deletable_dormant: Vec<&talos_analytics_repository::DormantWorkflowRow> = h
+        .dormant_workflows
+        .iter()
+        .filter(|r| r.runs_as_child_of.is_empty())
+        .collect();
+    let dormant_children_excluded = h.dormant_workflows.len() - deletable_dormant.len();
 
     let stale_draft_workflows: Vec<serde_json::Value> = h
         .stale_draft_workflows
@@ -837,12 +862,36 @@ pub fn build_report(h: &talos_analytics_repository::HygieneReport) -> HygieneRep
         }));
     }
 
-    if !dormant_workflows.is_empty() {
+    if !deletable_dormant.is_empty() {
+        let mut action = format!(
+            "{} enabled workflow(s) have had no executions in 30+ days. Consider disabling or deleting them with batch_delete_workflows to reduce registry noise.",
+            deletable_dormant.len()
+        );
+        if !h.child_scan_unreadable_parents.is_empty() {
+            // The exclusion is INCOMPLETE and the advice says so, rather than
+            // presenting a short exclusion list as a full one. Named parents,
+            // not a count: the operator can go look at them.
+            action.push_str(&format!(
+                " NOTE: the child-reference scan could not parse the graph of {} enabled                  workflow(s) ({}), so a workflow dispatched only by one of those may be listed                  here in error — check before deleting.",
+                h.child_scan_unreadable_parents.len(),
+                h.child_scan_unreadable_parents.join(", "),
+            ));
+        }
+        if dormant_children_excluded > 0 {
+            // The count and the list deliberately disagree, so say why. A
+            // recommendation whose number silently excludes rows the reader
+            // can see above it is its own small misleading report.
+            action.push_str(&format!(
+                " {dormant_children_excluded} further listed workflow(s) are EXCLUDED from this                  count: an enabled parent dispatches into them as sub-workflows, which leaves no                  execution row — deleting one would remove a node its parent runs."
+            ));
+        }
         recommendations.push(serde_json::json!({
             "priority": "low",
             "category": "cleanup",
-            "action": format!("{} enabled workflow(s) have had no executions in 30+ days. Consider disabling or deleting them with batch_delete_workflows to reduce registry noise.", dormant_workflows.len()),
-            "affected_count": dormant_workflows.len(),
+            "action": action,
+            "affected_count": deletable_dormant.len(),
+            "excluded_child_workflows": dormant_children_excluded,
+            "deletable": deletable_dormant.iter().map(|r| r.name.clone()).collect::<Vec<_>>(),
         }));
     }
 
@@ -1094,6 +1143,10 @@ pub fn build_report(h: &talos_analytics_repository::HygieneReport) -> HygieneRep
     let count_of = |field: &'static str, v: usize| -> Option<i64> {
         (!h.readings.not_measured().contains(&field)).then(|| n(v))
     };
+    let child_scan_measured = !h
+        .readings
+        .not_measured()
+        .contains(&"summary.child_workflow_exclusion");
 
     let note = {
         // An UNREAD suppression count must not render as "nothing was
@@ -1169,6 +1222,20 @@ pub fn build_report(h: &talos_analytics_repository::HygieneReport) -> HygieneRep
             "total_workflows": total_workflow_count,
             "idle_actors_count": count_of("idle_actors", idle_actors.len()),
             "wildcard_secret_grant": h.has_wildcard_module,
+            // The scan behind `dormant_workflows[].runs_as_child_of`. Rendered
+            // as an object rather than a bare count so the INCOMPLETE case has
+            // somewhere to live: `unreadable_parents` non-empty means a
+            // workflow dispatched only by one of those may still be listed as
+            // dormant. When the scan could not run at all, this whole key is
+            // nulled by the ledger and named under `measurement.not_measured`.
+            "child_workflow_exclusion": if child_scan_measured {
+                serde_json::json!({
+                    "excluded_from_cleanup_count": dormant_children_excluded,
+                    "unreadable_parents": h.child_scan_unreadable_parents,
+                })
+            } else {
+                serde_json::Value::Null
+            },
             "orphaned_secrets_count": count_of("orphaned_secrets", orphaned_secrets.len()),
             "secrets_without_expiry_count": count_of("secrets_without_expiry", secrets_without_expiry.len()),
             "expiring_memories_count": count_of("expiring_actor_memories", expiring_actor_memories.len()),
@@ -1952,6 +2019,8 @@ mod partial_report_disclosure_tests {
             name: name.to_string(),
             created_at: chrono::Utc::now(),
             last_execution: None,
+            runs_as_child_of: Vec::new(),
+            last_child_activity_at: None,
         }
     }
 }

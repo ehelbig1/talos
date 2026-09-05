@@ -298,6 +298,16 @@ CTRL_TESTS=(
     # REAL trigger with the REAL statements the background jobs issue, on the
     # `common` (DATABASE_URL) harness — so it belongs here, not in TC_TESTS.
     "updated_at_maintenance_tests"
+    # "scored" and "unscored" are decided from TWO timestamp columns with two
+    # writers that each stamp only their own. Drives the background
+    # recompute's VERBATIM statement plus the on-demand write-back method, on
+    # the `common` (DATABASE_URL) harness — CTRL_TESTS, not TC_TESTS (64b).
+    "readiness_scored_state_tests"
+    # A sub-workflow leaves no `workflow_executions` row, so the hygiene
+    # report's dormant list recommended deleting the flagship's daily child.
+    # Renders the REAL recommendation from a REAL HygieneReport; `common`
+    # harness, so CTRL_TESTS (64b).
+    "dormant_child_workflow_tests"
     "api_key_tests"
     "api_auth_integration_test"
     "integration_mcp_tests"

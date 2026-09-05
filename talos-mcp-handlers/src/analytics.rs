@@ -7728,34 +7728,13 @@ async fn handle_get_readiness_breakdown(
 
 // ── get_all_readiness_scores ──────────────────────────────────────────────────
 
-/// Classify a readiness row into `(is_unscored, score_state_label)`
-/// from the two columns the DB returns: `readiness_score` (nullable
-/// i32) and `readiness_scored_at` (nullable timestamp).
-///
-/// `scored_at` is the single authoritative "has been scored"
-/// indicator. The two columns can drift — a workflow can have a
-/// non-null `readiness_score` (e.g. 22 from an initial insert)
-/// while `readiness_scored_at` is still NULL — so anchoring on
-/// `raw_score.is_none()` (the original buggy predicate) would
-/// classify those rows as "scored" while the per-row label called
-/// them "unscored". Returning a single `(is_unscored, label)`
-/// pair forces both consumers (the row's `score_state` field AND
-/// the summary's `unscored_count`) onto the same predicate.
-pub(crate) fn classify_readiness_state(
-    raw_score: Option<i32>,
-    scored_at: Option<chrono::DateTime<chrono::Utc>>,
-) -> (bool, &'static str) {
-    let is_unscored = scored_at.is_none();
-    let score = raw_score.unwrap_or(0);
-    let label = if is_unscored {
-        "unscored"
-    } else if score == 0 {
-        "scored_zero" // scored, genuinely zero — needs improvement
-    } else {
-        "scored" // scored, non-zero
-    };
-    (is_unscored, label)
-}
+// The readiness-state classifier used to live here, over
+// `readiness_scored_at` alone. It now lives in
+// `talos_analytics_repository::readiness_state` — the crate that owns BOTH
+// timestamp columns and both writers' SQL — and reads both. There is one
+// implementation, and the summary's `unscored_count` predicate sits beside
+// it in the same crate. See that module for why the columns are not
+// collapsed into one.
 
 /// Build the `summary` block for `get_all_readiness_scores` from the POPULATION
 /// aggregate — never from the returned page.
@@ -7890,29 +7869,45 @@ async fn handle_get_all_readiness_scores(
         .map(|r| {
             let raw_score = r.readiness_score;
             let score = raw_score.unwrap_or(0);
-            let scored_at = r.readiness_scored_at;
-            let score_age_hours: Option<i64> =
-                scored_at.map(|t| (chrono::Utc::now() - t).num_hours());
 
-            // Single authoritative "has been scored" indicator —
-            // shared by the per-row state label AND the aggregate
-            // counter so they can never diverge again. See
-            // `classify_readiness_state` for the full rationale.
-            let (is_unscored, score_state) = classify_readiness_state(raw_score, scored_at);
+            // Single authoritative "has been scored" indicator, over BOTH
+            // timestamp columns — shared by the per-row state label AND the
+            // aggregate counter so they can never diverge again. Anchoring on
+            // `readiness_scored_at` alone reported 27 of 28 workflows
+            // "unscored" beside their own fresh scores, because the hourly
+            // background recompute stamps the OTHER column. See
+            // `talos_analytics_repository::readiness_state`.
+            let state = talos_analytics_repository::classify_readiness_state(
+                raw_score,
+                r.readiness_scored_at,
+                r.readiness_computed_at,
+            );
+            let score_age_hours: Option<i64> = state
+                .scored_at
+                .map(|t| (chrono::Utc::now() - t).num_hours());
 
             let mut entry = serde_json::json!({
                 "workflow_id": r.id.to_string(),
                 "name": r.name,
                 "readiness_score": score,
-                "score_state": score_state,
+                "score_state": state.label,
                 "has_description": r.has_description,
                 "has_capabilities": r.has_capabilities,
-                "scored_at": scored_at.map(|t| t.to_rfc3339()),
+                // The EFFECTIVE timestamp — the more recent of the two
+                // writers' columns — so `score_age_hours` dates the number
+                // actually sitting in `readiness_score`. Both raw columns are
+                // emitted beside it: a caller that needs to know when the FULL
+                // breakdown last ran must not have to infer it.
+                "scored_at": state.scored_at.map(|t| t.to_rfc3339()),
                 "score_age_hours": score_age_hours,
+                "scored_by": state.scored_by.map(talos_analytics_repository::ReadinessScorer::as_str),
+                "breakdown_scored_at": r.readiness_scored_at.map(|t| t.to_rfc3339()),
+                "background_computed_at": r.readiness_computed_at.map(|t| t.to_rfc3339()),
             });
-            if is_unscored {
-                entry["note"] = serde_json::json!("Call get_readiness_breakdown to compute score");
-            }
+            entry["note"] = match state.scored_by {
+                None => serde_json::json!("Never scored. Call get_readiness_breakdown to compute a score."),
+                Some(by) => serde_json::json!(by.note()),
+            };
             entry
         })
         .collect();
@@ -8374,91 +8369,11 @@ mod retry_classifier_tests {
     }
 }
 
-#[cfg(test)]
-mod readiness_classification_tests {
-    use super::classify_readiness_state;
-
-    fn t(year: i32, month: u32, day: u32) -> chrono::DateTime<chrono::Utc> {
-        chrono::DateTime::from_naive_utc_and_offset(
-            chrono::NaiveDate::from_ymd_opt(year, month, day)
-                .unwrap()
-                .and_hms_opt(0, 0, 0)
-                .unwrap(),
-            chrono::Utc,
-        )
-    }
-
-    #[test]
-    fn null_scored_at_is_unscored_regardless_of_score_value() {
-        // The exact bug `unscored_count: 0 vs 17 actually-unscored`
-        // was triggered by this case: readiness_score populated
-        // (e.g. 22 from initial insert) while scored_at NULL. The
-        // old buggy predicate `raw_score.is_none()` would say
-        // "scored" — wrong. The fix anchors on scored_at only.
-        let (is_unscored, label) = classify_readiness_state(Some(22), None);
-        assert!(is_unscored);
-        assert_eq!(label, "unscored");
-    }
-
-    #[test]
-    fn null_score_with_null_scored_at_is_unscored() {
-        let (is_unscored, label) = classify_readiness_state(None, None);
-        assert!(is_unscored);
-        assert_eq!(label, "unscored");
-    }
-
-    #[test]
-    fn scored_zero_when_scored_at_present_and_score_zero() {
-        let (is_unscored, label) = classify_readiness_state(Some(0), Some(t(2026, 5, 7)));
-        assert!(!is_unscored);
-        assert_eq!(label, "scored_zero");
-    }
-
-    #[test]
-    fn scored_when_both_present_and_nonzero() {
-        let (is_unscored, label) = classify_readiness_state(Some(85), Some(t(2026, 5, 7)));
-        assert!(!is_unscored);
-        assert_eq!(label, "scored");
-    }
-
-    #[test]
-    fn null_score_with_scored_at_is_scored_zero_not_unscored() {
-        // Inverse drift: timestamp written but score not yet —
-        // classify as "scored_zero" so operators know the scoring
-        // pipeline at least ran. Either way, the per-row label and
-        // the aggregate counter MUST agree.
-        let (is_unscored, label) = classify_readiness_state(None, Some(t(2026, 5, 7)));
-        assert!(!is_unscored);
-        assert_eq!(label, "scored_zero");
-    }
-
-    #[test]
-    fn aggregate_invariant_holds_across_drift_combos() {
-        // Property test: across all four (score-present-or-not) ×
-        // (scored_at-present-or-not) combinations, the
-        // is_unscored boolean always agrees with `label == "unscored"`.
-        // If the two ever drift, summary.unscored_count would
-        // contradict the per-row entries — the original prod bug.
-        let combos = [
-            (None, None),
-            (Some(0), None),
-            (Some(50), None),
-            (None, Some(t(2026, 5, 7))),
-            (Some(0), Some(t(2026, 5, 7))),
-            (Some(50), Some(t(2026, 5, 7))),
-        ];
-        for (s, ts) in combos {
-            let (is_unscored, label) = classify_readiness_state(s, ts);
-            assert_eq!(
-                is_unscored,
-                label == "unscored",
-                "drift detected for (score={:?}, scored_at={:?})",
-                s,
-                ts
-            );
-        }
-    }
-}
+// `readiness_classification_tests` moved with the function it covered, to
+// `talos-analytics-repository/src/readiness_state.rs`. Every case is carried
+// over (including the inverse-drift one) and widened to the second timestamp
+// column; keeping a copy here would be the "two implementations of one
+// decision" shape the move exists to remove.
 
 #[cfg(test)]
 mod dependency_view_tests {

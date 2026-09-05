@@ -1752,39 +1752,25 @@ pub fn workflow_timeout_posture(graph: &serde_json::Value) -> WorkflowTimeoutPos
     }
 }
 
-/// Suffix shared by every key through which a node names another workflow.
-/// See [`collect_subworkflow_references`].
-const SUBWORKFLOW_REFERENCE_SUFFIX: &str = "_workflow_id";
-
 /// Every workflow a node dispatches into, as `(data key, workflow id)`.
 ///
-/// Matched on the `*_workflow_id` naming convention rather than a hardcoded
-/// list, because there is no single list to import: `talos-workflow-engine`'s
-/// `graph_parser.rs` reads SEVEN distinct keys, one per system-node kind —
-/// `sub_workflow_id`, `judge_workflow_id`, `child_workflow_id`,
-/// `body_workflow_id`, `fallback_workflow_id`, `reflection_workflow_id` and
-/// `classifier_workflow_id` — each inside its own typed parser. Copying that
-/// list here would make this a second place the set is stated, and the copy
-/// would go stale the first time an eighth node kind lands.
+/// Historical name for
+/// [`talos_workflow_engine_core::collect_child_workflow_references`], which is
+/// now the single implementation. The function MOVED rather than being copied:
+/// the same reference set answers the hygiene report's "is this workflow
+/// somebody's child, or genuinely dormant?" and the risk assessor's "does this
+/// parent dispatch into a workflow that fails a lot?", and a repository crate
+/// cannot depend on this validation crate to ask it.
 ///
-/// The convention is the contract, and the test below pins all seven of
-/// today's keys against it. A future parser key that does NOT end in
-/// `_workflow_id` would be missed; that is the residual gap, and it is a
-/// smaller one than the bug this replaces — the risk check previously read
-/// `data.workflow_id`, which is none of the seven, so it matched nothing the
-/// engine dispatches and could never fire on a real sub-workflow.
+/// The move also closed the residual gap this function's own doc comment
+/// declared: it matched the `*_workflow_id` suffix convention, which covers
+/// seven of the engine's eight child-naming sites and structurally cannot see
+/// the eighth — `llm_dispatch`'s `data.routes`, an object whose arbitrary
+/// class labels key the workflow ids. Route targets are now returned under
+/// `"routes.<label>"`.
 #[must_use]
 pub fn collect_subworkflow_references(node: &serde_json::Value) -> Vec<(String, uuid::Uuid)> {
-    let Some(data) = node.get("data").and_then(serde_json::Value::as_object) else {
-        return Vec::new();
-    };
-    data.iter()
-        .filter(|(k, _)| k.ends_with(SUBWORKFLOW_REFERENCE_SUFFIX))
-        .filter_map(|(k, v)| {
-            let id = v.as_str()?.parse::<uuid::Uuid>().ok()?;
-            Some((k.clone(), id))
-        })
-        .collect()
+    talos_workflow_engine_core::collect_child_workflow_references(node)
 }
 
 // ── What the engine calls a node's config ───────────────────────────────────
