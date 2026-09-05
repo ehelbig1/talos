@@ -23,6 +23,7 @@ serde_json.workspace = true
 # backend-killing pg_* functions that the statement-level deny-list
 # misses).
 sqlparser = { version = "0.53", features = ["visitor"] }
+talos-sql-classify = { path = "../talos-sql-classify" }  # THE read-only/mutation classifier, shared with the worker
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 # #754: the write-ceiling gate reads `actors.max_write_ceiling` before
 # persisting an actor-attributed mutation on a worker's behalf. The read lives

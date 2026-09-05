@@ -9119,6 +9119,7 @@ dependencies = [
  "talos-metrics",
  "talos-ml",
  "talos-replay-guard",
+ "talos-sql-classify",
  "talos-tenancy",
  "talos-worker-identity-repository",
  "talos-workflow-engine",
@@ -9341,6 +9342,13 @@ dependencies = [
  "tracing",
  "urlencoding",
  "uuid",
+]
+
+[[package]]
+name = "talos-sql-classify"
+version = "0.1.0"
+dependencies = [
+ "sqlparser",
 ]
 
 [[package]]
@@ -9602,6 +9610,7 @@ dependencies = [
  "talos-memory",
  "talos-secrets",
  "talos-sigstore-policy",
+ "talos-sql-classify",
  "talos-ssrf-classify",
  "talos-text-util",
  "talos-trace",
