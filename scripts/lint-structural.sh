@@ -8070,6 +8070,85 @@ else
 fi
 echo
 
+# ── 82. An engine write-ceiling gate must notify the refusal recorder ──
+# The gate and the INSTRUMENTS that say it fired live in different crates.
+# `apply_memory_write_ceiling` (talos-workflow-engine) removes the refused
+# `__memory_write__` envelope and RETURNS the refusal; it records nothing —
+# it cannot, the engine has no metrics registry and no database. The single
+# recorder is `ControllerNodeHook::record_memory_write_refusal`
+# (talos-engine), reached from the engine only via the
+# `NodeLifecycleHook::on_memory_write_refused` notification.
+#
+# So one deleted call leaves the gate WORKING PERFECTLY and every instrument
+# permanently silent: no `talos_audit` WARN, no
+# `talos_memory_write_failures_total{reason="write_ceiling"}`. That is a
+# refusal indistinguishable from a write that never happened — the exact
+# reading the gate exists to remove — and it is invisible to check 58, which
+# proves an `.inc()` SITE EXISTS and can say nothing about whether anything
+# reaches it.
+#
+# Population is 2 (`engine_completion.rs`, `engine_dispatch_pipeline.rs`) and
+# it ships at ZERO. It is not redundant with the behavioural guard:
+# `controller/tests/write_ceiling_memory_write_tests` covers the
+# NODE-COMPLETION site end to end (counter delta, audit target, fields) and
+# CANNOT cheaply reach the pipeline-step site — chain dispatch is
+# `ChainDispatch::Disabled` on every production entry point, and the in-crate
+# unit-test route is blocked by `controller_write_ceiling_enforced()` being a
+# process-global `OnceLock`. This check is the pipeline site's only guard.
+#
+# Stated limits, each confirmed rather than inferred: it is TEXTUAL, so a
+# notification routed through a helper in another crate is invisible; it
+# matches `on_memory_write_refused(` WITH the paren so ordinary prose does not
+# vouch for a deleted call, but a commented-OUT call still would; it fires on
+# the FILE, not the call, so a file with two gate sites and one notification
+# passes; and it proves the notification is PRESENT, never that it sits inside
+# the refusal branch or that a hook is wired at all. Verified in the failure
+# direction by mutation: deleting either `hook.on_memory_write_refused(…)`
+# block reports that file (and, for the node-completion one, also turns the
+# controller test red with `left: 0.0, right: 1.0`).
+bold "▶ check 82: engine write-ceiling gates must notify the refusal recorder"
+WC_GATE_FILE="talos-workflow-engine/src/write_ceiling_gate.rs"
+WC_NOTIFY_FAIL=0
+if [ ! -f "$WC_GATE_FILE" ]; then
+    red "✗ $WC_GATE_FILE not found — the write-ceiling gate moved;"
+    yellow "  → repoint check 82 rather than letting it silently pass."
+    WC_NOTIFY_FAIL=$((WC_NOTIFY_FAIL + 1))
+else
+    WC_CALLERS="$(grep -rl --include='*.rs' --exclude-dir=target --exclude-dir=vendor \
+                      --exclude-dir=node_modules "${TREE_PRUNE_GREP[@]}" \
+                      -F 'apply_memory_write_ceiling(' . 2>/dev/null || true)"
+    WC_SEEN=0
+    while IFS= read -r f; do
+        [ -n "${f:-}" ] || continue
+        # The defining file (and its own unit tests) call it without a hook.
+        if grep -q 'fn apply_memory_write_ceiling' "$f"; then continue; fi
+        WC_SEEN=$((WC_SEEN + 1))
+        if grep -q 'allow-ungated-refusal-notify:' "$f"; then continue; fi
+        if ! grep -qF 'on_memory_write_refused(' "$f"; then
+            red "✗ $f applies the write ceiling but never calls on_memory_write_refused(…) — the gate would refuse silently"
+            WC_NOTIFY_FAIL=$((WC_NOTIFY_FAIL + 1))
+        fi
+    done <<< "$WC_CALLERS"
+    if [ "$WC_SEEN" -eq 0 ]; then
+        red "✗ check 82 found no caller of apply_memory_write_ceiling( outside its own file"
+        yellow "  → the gate is either unwired or the call was renamed; a check that"
+        yellow "    matches nothing is a green tick over zero statements."
+        WC_NOTIFY_FAIL=$((WC_NOTIFY_FAIL + 1))
+    fi
+fi
+if [ "$WC_NOTIFY_FAIL" -gt 0 ]; then
+    yellow "  → hand the returned RefusedMemoryWrite to"
+    yellow "    NodeLifecycleHook::on_memory_write_refused so the ONE recorder"
+    yellow "    (ControllerNodeHook::record_memory_write_refusal) emits the"
+    yellow "    talos_audit WARN and increments"
+    yellow "    talos_memory_write_failures_total{reason=\"write_ceiling\"}."
+    yellow "    Opt out with // allow-ungated-refusal-notify: <reason>."
+    EXIT_CODE=1
+else
+    green "✓ every engine write-ceiling gate routes its refusal to the recorder"
+fi
+echo
+
 bold "▶ check 54: lint self-consistency (check numbering + documented count)"
 ACTUAL_NUMS="$(grep -oE '^bold "▶ check [0-9]+:' "${BASH_SOURCE[0]}" | grep -oE '[0-9]+' | sort -n)"
 EXPECTED_NUMS="$(seq 1 "$CHECK_COUNT")"

@@ -1838,20 +1838,35 @@ impl TalosMetrics {
         let memory_write_failures_total = CounterVec::new(
             prometheus::Opts::new(
                 "talos_memory_write_failures_total",
-                "actor_memory persistence failures from the __memory_write__ \
-                 hook. Labels: reason=crypto|db|validation. Sustained bump \
-                 means node outputs are being lost to disk.",
+                "__memory_write__ envelopes that produced no actor_memory row. \
+                 Labels: reason=crypto|db|validation|other|write_ceiling. The \
+                 first four are PERSISTENCE FAILURES (a sustained bump means \
+                 node outputs are being lost to disk); write_ceiling is a \
+                 POLICY REFUSAL working as designed (#750), expected to be \
+                 non-zero wherever TALOS_WRITE_CEILING_ENFORCED is set and \
+                 readonly actors run; do not alert on it.",
             ),
             &["reason"],
         )?;
         registry.register(Box::new(memory_write_failures_total.clone()))?;
-        // Closed set, and every value has a live emitter: the label comes
-        // from `MemoryWriteError::metric_label()`, whose four variants are
-        // exhaustively matched at the two `__memory_write__` hook sites in
-        // talos-engine. Note the description above lists only three — the
-        // catch-all `other` was added to the type without updating it; the
-        // seed follows the CODE, which is what actually emits.
-        for reason in ["crypto", "db", "validation", "other"] {
+        // Closed set, and every value has a live emitter. Four come from
+        // `MemoryWriteError::metric_label()`, whose variants are exhaustively
+        // matched at the two `__memory_write__` hook sites in talos-engine.
+        //
+        // `write_ceiling` is the fifth and is NOT from that enum: it is the
+        // literal stamped by `ControllerNodeHook::record_memory_write_refusal`
+        // when the actor's `max_write_ceiling` declines a returned envelope
+        // (#750). It qualifies for seeding on the same rule as the others —
+        // a compile-time-known label with exactly one live `.inc()` site —
+        // and it was MISSING, which was measured rather than assumed: on the
+        // dev controller 2026-09-05 the four seeded reasons rendered `0` and
+        // `write_ceiling` was simply ABSENT until a refusal happened, after
+        // which it read `1`. So before the first refusal of a process's life
+        // (i.e. after every restart) the series that says "policy declined a
+        // memory write" was indistinguishable from the wiring not existing.
+        // Absent is not zero — the same rule that motivated this whole seed
+        // loop, applied to the label the loop had not been told about.
+        for reason in ["crypto", "db", "validation", "other", "write_ceiling"] {
             memory_write_failures_total
                 .with_label_values(&[reason])
                 .inc_by(0.0);
@@ -2175,6 +2190,11 @@ mod tests {
             r#"talos_memory_write_failures_total{reason="db"} 0"#,
             r#"talos_memory_write_failures_total{reason="validation"} 0"#,
             r#"talos_memory_write_failures_total{reason="other"} 0"#,
+            // #750's policy refusal. Not a `MemoryWriteError` variant — the
+            // one emitter is `ControllerNodeHook::record_memory_write_refusal`
+            // — and it was unseeded until 2026-09-05, so the series only
+            // existed on a controller that had already refused something.
+            r#"talos_memory_write_failures_total{reason="write_ceiling"} 0"#,
             r#"talos_module_payload_encryption_failures_total{op="encrypt",stage="input"} 0"#,
             r#"talos_module_payload_encryption_failures_total{op="encrypt",stage="output"} 0"#,
             r#"talos_module_payload_encryption_failures_total{op="encrypt",stage="trigger_metadata"} 0"#,
