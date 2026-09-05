@@ -136,6 +136,39 @@ pub struct NodeTemplateConfigRow {
     pub allowed_secrets: Vec<String>,
 }
 
+/// A draft the stale-draft sweep declined to archive because an enabled
+/// parent dispatches into it — or because a parent that MENTIONS it could not
+/// be read, which is not the same as "no parent does".
+#[derive(Debug, Clone)]
+pub struct SkippedChildDraft {
+    /// The draft's workflow id.
+    pub id: Uuid,
+    /// The draft's name, as rendered to an operator.
+    pub name: String,
+    /// Enabled parents demonstrably dispatching into it. EMPTY when the only
+    /// evidence is a parent whose graph could not be parsed — see `reason`.
+    pub runs_as_child_of: Vec<String>,
+    /// Operator-facing explanation, from
+    /// [`talos_child_workflow_refs::ChildProtection::reason`].
+    pub reason: String,
+}
+
+/// What `session_start`'s auto-archive actually did.
+///
+/// A bare count cannot say "3 archived, 1 held back because the flagship runs
+/// it" — and a sweep that silently declines to act is its own small misleading
+/// report, one direction over from the one this change fixes.
+#[derive(Debug, Default, Clone)]
+pub struct StaleDraftArchiveOutcome {
+    /// Rows actually moved to `status = 'archived'`.
+    pub archived: u64,
+    /// Candidates deliberately left alone, with the reason.
+    pub skipped_children: Vec<SkippedChildDraft>,
+    /// Enabled parents whose graph could not be read during the scan. Every
+    /// candidate such a parent mentions is in `skipped_children`.
+    pub unreadable_parents: Vec<String>,
+}
+
 #[derive(Debug)]
 pub struct DraftWorkflowRow {
     pub id: Uuid,
@@ -1817,6 +1850,26 @@ impl AdvancedRepository {
     }
 
     /// Fetch recent draft workflows with no executions (max 10).
+    ///
+    /// **Deliberately NOT child-aware, and this is the report half of the
+    /// report/decision split.** It shares the sub-workflow-blind
+    /// `NOT EXISTS (… workflow_executions …)` premise with
+    /// [`Self::archive_stale_drafts_excluding_children`], so it can list a
+    /// workflow an enabled parent runs daily — but its only consumer is
+    /// `session_start`'s `in_progress_drafts` / `unpublished_substantive_drafts`
+    /// display, which takes no destructive action and whose worst advice is
+    /// "publish it": a no-op for a child, since a parent dispatches the
+    /// `graph_json` COLUMN with no version join and no status filter. The
+    /// exclusion exists to keep a live child out of DELETE and ARCHIVE sets,
+    /// not to hide it from an operator's list.
+    ///
+    /// Lint check 85 is FILE-scoped on leg (a), so the archive method above
+    /// vouches for this file and leg (a) is silent here; leg (b) does not
+    /// reach it because this is a SELECT. That is the check's stated limit
+    /// made concrete by a live site rather than left hypothetical. There is
+    /// deliberately no `allow-execution-blind-draft-path:` marker: leg (a)
+    /// matches it file-globally, so adding one would blind the whole file
+    /// including the destructive method beside it.
     pub async fn get_draft_workflows(&self, user_id: Uuid) -> Result<Vec<DraftWorkflowRow>> {
         // RFC 0005 S3: self-scope (workflows + workflow_executions backstop).
         let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
@@ -1848,8 +1901,48 @@ impl AdvancedRepository {
             .collect::<Result<Vec<_>>>()
     }
 
-    /// Archive draft workflows with no executions older than `stale_days`. Returns count.
-    pub async fn archive_stale_drafts(&self, user_id: Uuid, stale_days: i32) -> Result<u64> {
+    /// Archive draft workflows with no executions older than `stale_days`,
+    /// EXCEPT the ones an enabled parent dispatches into.
+    ///
+    /// # Why the exclusion is not optional
+    ///
+    /// The predicate this sweep is built on — *`status = 'draft'` and no
+    /// `workflow_executions` row* — is blind to a sub-workflow by
+    /// construction: `execute_subworkflow_graph` runs a child IN-PROCESS and
+    /// records no execution row at all (measured 2026-09-05: zero rows
+    /// carrying `parent_execution_id`, platform-wide). Measured live the same
+    /// day, `cos-team-recall` — `pa-chief-of-staff`'s daily `team_gather`
+    /// sub-workflow, which had run every day that week — matched this
+    /// predicate exactly, and the hygiene report was simultaneously
+    /// annotating it as that parent's child two sections above the line
+    /// recommending its deletion.
+    ///
+    /// A draft's `status` is also not a runtime fact: the parent dispatches
+    /// the child's `graph_json` COLUMN (`WorkflowGraphStore::get_graph`, no
+    /// version join and no status predicate), so neither `publish_version`
+    /// nor this archive changes how the parent runs it. That makes the archive
+    /// non-breaking but not harmless — it removes a live workflow from every
+    /// listing an operator manages it through, under the label "stale".
+    ///
+    /// # Shape
+    ///
+    /// SELECT the candidates, scan their parents, then UPDATE **by id**. The
+    /// write is a subset of what was scanned by construction — the discipline
+    /// `fix_all`'s stale-execution step learned in 2026-08-19, where a
+    /// user-wide write sat behind a 25-row preview. The UPDATE re-asserts
+    /// `status = 'draft'` and the no-executions predicate so a row that
+    /// started running in between is left alone.
+    ///
+    /// # Errors
+    ///
+    /// A failed parent scan ABORTS the sweep rather than archiving without the
+    /// exclusion: this is an automated, unattended write, and an empty index
+    /// reads as "nobody is anybody's child".
+    pub async fn archive_stale_drafts_excluding_children(
+        &self,
+        user_id: Uuid,
+        stale_days: i32,
+    ) -> Result<StaleDraftArchiveOutcome> {
         // MCP-1062 (2026-05-15): refuse non-positive `stale_days`.
         // Sibling caller-supplied-negative class as MCP-997. With
         // `make_interval(days => -N)` the `created_at <` predicate
@@ -1862,12 +1955,13 @@ impl AdvancedRepository {
                 %user_id,
                 "archive_stale_drafts refused: stale_days must be positive (would archive every empty draft)"
             );
-            return Ok(0);
+            return Ok(StaleDraftArchiveOutcome::default());
         }
-        // RFC 0005 S3: self-scope (workflows RLS backstop on the UPDATE).
+
+        // RFC 0005 S3: self-scope (workflows RLS backstop).
         let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
-        let n = sqlx::query(
-            "UPDATE workflows SET status = 'archived', updated_at = NOW() \
+        let rows = sqlx::query(
+            "SELECT id, name FROM workflows \
              WHERE user_id = $1 \
                AND status = 'draft' \
                AND NOT EXISTS (SELECT 1 FROM workflow_executions we WHERE we.workflow_id = workflows.id) \
@@ -1875,12 +1969,75 @@ impl AdvancedRepository {
         )
         .bind(user_id)
         .bind(stale_days)
-        .execute(&mut *tx)
+        .fetch_all(&mut *tx)
         .await
-        .map(|r| r.rows_affected())
-        .context("archive_stale_drafts")?;
+        .context("archive_stale_drafts candidate scan")?;
         tx.commit().await?;
-        Ok(n)
+
+        let candidates: Vec<(Uuid, String)> = rows
+            .into_iter()
+            .map(|r| -> Result<(Uuid, String)> { Ok((r.try_get("id")?, r.try_get("name")?)) })
+            .collect::<Result<Vec<_>>>()?;
+        if candidates.is_empty() {
+            return Ok(StaleDraftArchiveOutcome::default());
+        }
+
+        let candidate_ids: Vec<Uuid> = candidates.iter().map(|(id, _)| *id).collect();
+        let scan =
+            talos_child_workflow_refs::scan_child_parents(&self.db_pool, user_id, &candidate_ids)
+                .await
+                .context("archive_stale_drafts child-reference scan")?;
+
+        let mut to_archive: Vec<Uuid> = Vec::with_capacity(candidates.len());
+        let mut skipped_children: Vec<SkippedChildDraft> = Vec::new();
+        for (id, name) in candidates {
+            match scan.protection_for(id) {
+                Some(protection) => skipped_children.push(SkippedChildDraft {
+                    id,
+                    name,
+                    runs_as_child_of: protection.parent_names().to_vec(),
+                    reason: protection.reason(),
+                }),
+                None => to_archive.push(id),
+            }
+        }
+
+        let archived = if to_archive.is_empty() {
+            0
+        } else {
+            let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
+            let n = sqlx::query(
+                "UPDATE workflows SET status = 'archived', updated_at = NOW() \
+                 WHERE user_id = $1 \
+                   AND id = ANY($2) \
+                   AND status = 'draft' \
+                   AND NOT EXISTS (SELECT 1 FROM workflow_executions we WHERE we.workflow_id = workflows.id)",
+            )
+            .bind(user_id)
+            .bind(&to_archive)
+            .execute(&mut *tx)
+            .await
+            .map(|r| r.rows_affected())
+            .context("archive_stale_drafts")?;
+            tx.commit().await?;
+            n
+        };
+
+        if !skipped_children.is_empty() {
+            tracing::info!(
+                target: "talos_audit",
+                %user_id,
+                archived,
+                skipped = skipped_children.len(),
+                "archive_stale_drafts held back draft(s) an enabled parent dispatches into"
+            );
+        }
+
+        Ok(StaleDraftArchiveOutcome {
+            archived,
+            skipped_children,
+            unreadable_parents: scan.unreadable_parents().to_vec(),
+        })
     }
 
     /// Count workflows with no capability tags.

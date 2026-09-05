@@ -13,6 +13,7 @@ regex = "1.12"
 serde.workspace = true
 serde_json.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+talos-child-workflow-refs = { path = "../talos-child-workflow-refs" }
 talos-db = { path = "../talos-db" }
 talos-measurement = { path = "../talos-measurement" }
 talos-retry-intelligence = { path = "../talos-retry-intelligence" }

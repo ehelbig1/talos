@@ -103,6 +103,7 @@ members = [
     "talos-actor-memory-service",
     "talos-advanced-repository",
     "talos-analytics-repository",
+    "talos-child-workflow-refs",
     "talos-actor-repository",
     "talos-engine-events",
     "talos-execution-repository",

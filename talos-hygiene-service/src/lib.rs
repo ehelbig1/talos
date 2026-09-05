@@ -635,17 +635,42 @@ pub fn build_report(h: &talos_analytics_repository::HygieneReport) -> HygieneRep
         .collect();
     let dormant_children_excluded = h.dormant_workflows.len() - deletable_dormant.len();
 
+    // Same rule as the dormant list two blocks up, and for the same reason:
+    // this list's premise is "no `workflow_executions` row", and a
+    // sub-workflow runs in-process and leaves none. A protected row stays
+    // LISTED with the reason — an operator asking "what has never run?" should
+    // still see it — and is excluded from the cleanup RECOMMENDATION below and
+    // from `fix_all`'s auto-delete set, which are the halves that act.
     let stale_draft_workflows: Vec<serde_json::Value> = h
         .stale_draft_workflows
         .iter()
         .map(|r| {
-            serde_json::json!({
+            let mut entry = serde_json::json!({
                 "id": r.id.to_string(),
                 "name": r.name,
                 "created_at": r.created_at.to_rfc3339(),
-            })
+            });
+            if !r.runs_as_child_of.is_empty() {
+                entry["runs_as_child_of"] = serde_json::json!(r.runs_as_child_of);
+            }
+            if let Some(reason) = r.child_protection_reason.as_deref() {
+                entry["never_executed_note"] =
+                    serde_json::json!(talos_analytics_repository::STALE_DRAFT_CHILD_NOTE);
+                entry["excluded_from_cleanup_reason"] = serde_json::json!(reason);
+            }
+            entry
         })
         .collect();
+    // The population the draft cleanup recommendation is allowed to speak
+    // about. `child_protection_reason` is WIDER than `runs_as_child_of`: a
+    // draft mentioned by an enabled parent whose graph could not be parsed
+    // names no parent but is still held back, because UNKNOWN is not "no".
+    let deletable_drafts: Vec<&talos_analytics_repository::StaleDraftRow> = h
+        .stale_draft_workflows
+        .iter()
+        .filter(|r| r.child_protection_reason.is_none())
+        .collect();
+    let draft_children_excluded = h.stale_draft_workflows.len() - deletable_drafts.len();
 
     let idle_actors: Vec<serde_json::Value> = h
         .idle_actors
@@ -895,12 +920,27 @@ pub fn build_report(h: &talos_analytics_repository::HygieneReport) -> HygieneRep
         }));
     }
 
-    if !stale_draft_workflows.is_empty() {
+    if !deletable_drafts.is_empty() {
+        let mut action = format!(
+            "{} draft workflow(s) have never been published or executed in 7+ days — likely scaffolding leftovers. Review with get_workflow_quickstart then publish_version or delete with batch_delete_workflows.",
+            deletable_drafts.len()
+        );
+        if draft_children_excluded > 0 {
+            // The count and the list deliberately disagree, so say why —
+            // same rule, same vocabulary as the dormant advice above.
+            action.push_str(&format!(
+                " {draft_children_excluded} further listed draft(s) are EXCLUDED from this count \
+                 and from fix_all's auto-delete set: an enabled parent dispatches into them, \
+                 which leaves no execution row, so \"never executed\" is not evidence about them."
+            ));
+        }
         recommendations.push(serde_json::json!({
             "priority": "low",
             "category": "cleanup",
-            "action": format!("{} draft workflow(s) have never been published or executed in 7+ days — likely scaffolding leftovers. Review with get_workflow_quickstart then publish_version or delete with batch_delete_workflows.", stale_draft_workflows.len()),
-            "affected_count": stale_draft_workflows.len(),
+            "action": action,
+            "affected_count": deletable_drafts.len(),
+            "excluded_child_workflows": draft_children_excluded,
+            "deletable": deletable_drafts.iter().map(|r| r.name.clone()).collect::<Vec<_>>(),
         }));
     }
 
@@ -1222,15 +1262,25 @@ pub fn build_report(h: &talos_analytics_repository::HygieneReport) -> HygieneRep
             "total_workflows": total_workflow_count,
             "idle_actors_count": count_of("idle_actors", idle_actors.len()),
             "wildcard_secret_grant": h.has_wildcard_module,
-            // The scan behind `dormant_workflows[].runs_as_child_of`. Rendered
-            // as an object rather than a bare count so the INCOMPLETE case has
+            // The scan behind `dormant_workflows[].runs_as_child_of` AND
+            // `stale_draft_workflows[].runs_as_child_of`. Rendered as an
+            // object rather than a bare count so the INCOMPLETE case has
             // somewhere to live: `unreadable_parents` non-empty means a
             // workflow dispatched only by one of those may still be listed as
-            // dormant. When the scan could not run at all, this whole key is
+            // dormant (the report keeps listing it; the DECISION surfaces hold
+            // it back). When the scan could not run at all, this whole key is
             // nulled by the ledger and named under `measurement.not_measured`.
+            //
+            // Two counts, not one total: the two populations overlap by
+            // construction — a 40-day-old draft child is in BOTH lists — so a
+            // sum would double-count it and neither number would name a real
+            // set. `excluded_from_cleanup_count` keeps its pre-2026-09-05
+            // meaning (the dormant half) rather than silently changing
+            // denominator under a reader who already had it wired up.
             "child_workflow_exclusion": if child_scan_measured {
                 serde_json::json!({
                     "excluded_from_cleanup_count": dormant_children_excluded,
+                    "excluded_stale_drafts_count": draft_children_excluded,
                     "unreadable_parents": h.child_scan_unreadable_parents,
                 })
             } else {
@@ -1328,10 +1378,25 @@ pub fn build_report(h: &talos_analytics_repository::HygieneReport) -> HygieneRep
     // to ship. Now: substantive drafts appear in `substantive_drafts_skipped`
     // (informational; surfaces the safety net to the operator) and
     // are EXCLUDED from auto-delete.
-    let (substantive_drafts_skipped, auto_deletable_drafts): (Vec<_>, Vec<_>) = h
+    //
+    // 2026-09-05: a THIRD bucket, ahead of both. `is_substantive_workflow` is
+    // an authored-INTENT predicate — it asks whether a human shaped this
+    // draft, not whether anything runs it — and on the live fleet it happened
+    // to spare `cos-team-recall` (the flagship's daily `team_gather`
+    // sub-workflow) for that unrelated reason. A child that is NOT
+    // substantive would have been deleted, and the delete is irreversible.
+    // So the child check runs FIRST and on its own evidence: it holds back a
+    // draft an enabled parent dispatches into, AND a draft mentioned by a
+    // parent whose graph could not be read, because a delete cannot be undone
+    // by re-reading the graph afterwards.
+    let (child_drafts_skipped, publishable_or_deletable): (Vec<_>, Vec<_>) = h
         .stale_draft_workflows
         .iter()
-        .partition(|r| is_substantive_workflow(r.graph_json.as_deref()));
+        .partition(|r| r.child_protection_reason.is_some());
+    let (substantive_drafts_skipped, auto_deletable_drafts): (Vec<_>, Vec<_>) =
+        publishable_or_deletable
+            .into_iter()
+            .partition(|r| is_substantive_workflow(r.graph_json.as_deref()));
     let draft_ids: Vec<uuid::Uuid> = auto_deletable_drafts.iter().map(|r| r.id).collect();
     let stale_exec_ids: Vec<uuid::Uuid> = h.stale_executions.iter().map(|r| r.id).collect();
     let orphaned_module_ids: Vec<uuid::Uuid> = h.orphaned_modules.iter().map(|r| r.id).collect();
@@ -1339,6 +1404,12 @@ pub fn build_report(h: &talos_analytics_repository::HygieneReport) -> HygieneRep
     let fix_preview = serde_json::json!({
         "stale_draft_workflows_to_delete": auto_deletable_drafts.iter().map(|r| serde_json::json!({
             "id": r.id.to_string(), "name": r.name,
+        })).collect::<Vec<_>>(),
+        "child_drafts_skipped": child_drafts_skipped.iter().map(|r| serde_json::json!({
+            "id": r.id.to_string(),
+            "name": r.name,
+            "runs_as_child_of": r.runs_as_child_of,
+            "reason": r.child_protection_reason,
         })).collect::<Vec<_>>(),
         "substantive_drafts_skipped": substantive_drafts_skipped.iter().map(|r| serde_json::json!({
             "id": r.id.to_string(),
@@ -1362,8 +1433,12 @@ pub fn build_report(h: &talos_analytics_repository::HygieneReport) -> HygieneRep
         // is being asked to confirm.
         "coverage": {
             "stale_draft_workflows": talos_measurement::Coverage::new(
-                i64::try_from(auto_deletable_drafts.len() + substantive_drafts_skipped.len())
-                    .unwrap_or(i64::MAX),
+                i64::try_from(
+                    auto_deletable_drafts.len()
+                        + substantive_drafts_skipped.len()
+                        + child_drafts_skipped.len(),
+                )
+                .unwrap_or(i64::MAX),
                 talos_analytics_repository::HYGIENE_FINDING_LIMIT,
             ).to_json(),
             "stale_executions": talos_measurement::Coverage::new(
@@ -1413,19 +1488,54 @@ impl HygieneService {
 
         // 1. Delete stale draft workflows
         if !candidates.draft_ids.is_empty() {
-            let (deleted, blocked) = self
+            // The repository guard is the LAST line of defence and it is
+            // deliberately consulted even though `draft_ids` has already had
+            // children removed upstream: the preview an operator confirmed may
+            // be minutes old, and a `sub_workflow` node added in between is
+            // exactly the window a graph-derived exclusion cannot see.
+            let outcome = self
                 .workflow_repo
-                .delete_workflows(&candidates.draft_ids, user_id)
-                .await
-                .unwrap_or((vec![], vec![]));
-            tracing::warn!(
-                user_id = %user_id,
-                deleted = deleted.len(),
-                blocked = blocked.len(),
-                "hygiene fix: deleted stale draft workflows"
-            );
-            fix_results["stale_drafts_deleted"] = serde_json::json!(deleted.len());
-            fix_results["stale_drafts_blocked"] = serde_json::json!(blocked.len());
+                .delete_workflows_checked(&candidates.draft_ids, user_id)
+                .await;
+            match outcome {
+                Ok(outcome) => {
+                    tracing::warn!(
+                        user_id = %user_id,
+                        deleted = outcome.deleted.len(),
+                        blocked = outcome.blocked_running.len(),
+                        referenced = outcome.blocked_referenced.len(),
+                        "hygiene fix: deleted stale draft workflows"
+                    );
+                    fix_results["stale_drafts_deleted"] = serde_json::json!(outcome.deleted.len());
+                    fix_results["stale_drafts_blocked"] =
+                        serde_json::json!(outcome.blocked_running.len());
+                    if !outcome.blocked_referenced.is_empty() {
+                        fix_results["stale_drafts_referenced_by_a_parent"] =
+                            serde_json::json!(outcome
+                                .blocked_referenced
+                                .iter()
+                                .map(|r| serde_json::json!({
+                                    "workflow_id": r.id.to_string(),
+                                    "runs_as_child_of": r.parents,
+                                    "reason": r.reason,
+                                }))
+                                .collect::<Vec<_>>());
+                    }
+                }
+                Err(e) => {
+                    // Null, not 0. "0 deleted" beside a swallowed error reads
+                    // as "there was nothing to delete".
+                    tracing::error!(
+                        user_id = %user_id,
+                        error = %e,
+                        "hygiene fix: stale-draft delete failed; nothing was deleted"
+                    );
+                    fix_results["stale_drafts_deleted"] = serde_json::Value::Null;
+                    fix_results["stale_drafts_delete_error"] = serde_json::json!(
+                        "the stale-draft delete could not run; NO draft was deleted"
+                    );
+                }
+            }
         }
 
         // 2. Cancel/fail stale executions (mark as failed after >120 min stuck)
@@ -2078,7 +2188,7 @@ mod destructive_preview_pins {
     fn every_destructive_fix_all_step_is_bounded_by_its_preview() {
         let src = include_str!("lib.rs");
         for needle in [
-            concat!("delete_workflows(&candidates.", "draft_ids"),
+            concat!("delete_workflows_checked(&candidates.", "draft_ids"),
             concat!(
                 "delete_orphaned_modules(&candidates.",
                 "orphaned_module_ids"

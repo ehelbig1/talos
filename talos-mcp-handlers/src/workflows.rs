@@ -3435,10 +3435,10 @@ async fn handle_delete_workflow(
 
     match state
         .workflow_repo
-        .delete_workflows(&[wf_id], user_id)
+        .delete_workflows_checked(&[wf_id], user_id)
         .await
     {
-        Ok((deleted, _blocked)) if !deleted.is_empty() => {
+        Ok(outcome) if !outcome.deleted.is_empty() => {
             // MCP-389 (2026-05-11): close the audit-trail gap on
             // irreversible destructive operations. Pre-fix a
             // successful `delete_workflow` left NO trace anywhere —
@@ -3478,7 +3478,15 @@ async fn handle_delete_workflow(
                 .unwrap_or_default(),
             )
         }
-        Ok((_, blocked)) if !blocked.is_empty() => mcp_error(
+        // The reference refusal is reported BEFORE the running-execution one:
+        // a sub-workflow leaves no execution row, so a live child can only
+        // ever be refused by this arm, and reporting it as "not found" (which
+        // is what the fall-through used to do) is the misleading-report class
+        // this guard exists to close.
+        Ok(outcome) if !outcome.blocked_referenced.is_empty() => {
+            mcp_error(req_id, -32000, &outcome.blocked_referenced[0].reason)
+        }
+        Ok(outcome) if !outcome.blocked_running.is_empty() => mcp_error(
             req_id,
             -32000,
             "Cannot delete workflow with running or queued executions. Cancel them first.",
@@ -5837,12 +5845,12 @@ async fn handle_batch_delete_workflows(
         ));
     }
 
-    let (deleted_ids, blocked_ids) = match state
+    let outcome = match state
         .workflow_repo
-        .delete_workflows(&workflow_ids, user_id)
+        .delete_workflows_checked(&workflow_ids, user_id)
         .await
     {
-        Ok(pair) => pair,
+        Ok(outcome) => outcome,
         Err(e) => {
             tracing::error!("batch_delete_workflows failed: {}", e);
             return Some(mcp_error(
@@ -5853,9 +5861,21 @@ async fn handle_batch_delete_workflows(
         }
     };
 
-    let deleted_set: std::collections::HashSet<uuid::Uuid> = deleted_ids.iter().cloned().collect();
-    let blocked_set: std::collections::HashSet<uuid::Uuid> = blocked_ids.iter().cloned().collect();
+    let talos_workflow_repository::WorkflowDeleteOutcome {
+        deleted: deleted_ids,
+        blocked_running: blocked_ids,
+        blocked_referenced,
+    } = outcome;
 
+    let deleted_set: std::collections::HashSet<uuid::Uuid> = deleted_ids.iter().cloned().collect();
+    let mut blocked_set: std::collections::HashSet<uuid::Uuid> =
+        blocked_ids.iter().cloned().collect();
+    blocked_set.extend(blocked_referenced.iter().map(|r| r.id));
+
+    // Both refusals land in ONE `skipped` list, each carrying its own reason.
+    // A child refused here has no running execution and does exist, so with a
+    // single hardcoded "has running executions" reason it would have been
+    // described to the operator as something it is not.
     let skipped: Vec<serde_json::Value> = blocked_ids
         .iter()
         .map(|wid| {
@@ -5864,6 +5884,13 @@ async fn handle_batch_delete_workflows(
                 "reason": "Has running executions — cancel them first"
             })
         })
+        .chain(blocked_referenced.iter().map(|r| {
+            serde_json::json!({
+                "workflow_id": r.id,
+                "runs_as_child_of": r.parents,
+                "reason": r.reason,
+            })
+        }))
         .collect();
 
     // IDs that weren't deleted and weren't blocked — genuinely not found (or wrong user).
@@ -5886,6 +5913,7 @@ async fn handle_batch_delete_workflows(
             "deleted_workflow_ids": deleted_id_strs,
             "deleted_count": deleted_ids.len(),
             "blocked_count": blocked_ids.len(),
+            "referenced_count": blocked_referenced.len(),
         });
         crate::actor::spawn_log_admin_event(
             state.db_pool.clone(),

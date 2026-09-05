@@ -1074,21 +1074,96 @@ impl WorkflowRepository {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Delete workflows by ID list (ownership checked). Skips any that have running executions.
-    /// Returns `(deleted_ids, blocked_ids)`.
-    /// `blocked_ids` — workflows that exist, are owned by user, but have running/queued
-    ///   executions preventing deletion.
-    /// Ids that don't exist or belong to another user appear in neither list; callers
-    /// compute `not_found = requested - deleted - blocked`.
-    pub async fn delete_workflows(
+    /// Delete workflows by ID list (ownership checked).
+    ///
+    /// Refuses two ways, and the second is the newer one:
+    ///
+    /// * a workflow with a **running/queued/pending/resuming execution** —
+    ///   [`WorkflowDeleteOutcome::blocked_running`];
+    /// * a workflow an **enabled parent dispatches into** —
+    ///   [`WorkflowDeleteOutcome::blocked_referenced`].
+    ///
+    /// # Why the second guard is here rather than only in the report
+    ///
+    /// A sub-workflow runs in-process and records no `workflow_executions`
+    /// row, so a live child is invisible to the first guard AND to every
+    /// "never executed" / "no executions in 30+ days" predicate upstream —
+    /// which is how `get_platform_hygiene_report` came to print the flagship's
+    /// daily `team_gather` child under an instruction to delete it with
+    /// `batch_delete_workflows` (measured live 2026-09-05). #758 and its
+    /// follow-up taught the REPORTS to exclude it; this is the last line of
+    /// defence, because the reports are advice and this is the write. The
+    /// reference lives inside `workflows.graph_json` as TEXT, so no foreign
+    /// key can express it and nothing but a graph scan can see it.
+    ///
+    /// A parent that is ITSELF in `ids` does not block: deleting a parent and
+    /// its child in one call is a coherent operation, and refusing it would
+    /// make a retired workflow tree undeletable.
+    ///
+    /// Ids that don't exist or belong to another user appear in no list;
+    /// callers compute `not_found = requested - deleted - blocked_*`.
+    ///
+    /// # Errors
+    ///
+    /// A failed reference scan ABORTS the delete rather than proceeding
+    /// without the guard. An empty index reads as "nobody is anybody's child",
+    /// which is exactly the state this guard exists to distinguish from.
+    pub async fn delete_workflows_checked(
         &self,
         ids: &[Uuid],
         user_id: Uuid,
-    ) -> Result<(Vec<Uuid>, Vec<Uuid>)> {
+    ) -> Result<WorkflowDeleteOutcome> {
         if ids.is_empty() {
-            return Ok((vec![], vec![]));
+            return Ok(WorkflowDeleteOutcome::default());
         }
-        let deleted_ids: Vec<Uuid> = sqlx::query_scalar(
+
+        let scan = talos_child_workflow_refs::scan_child_parents(&self.db_pool, user_id, ids)
+            .await
+            .context("delete_workflows child-reference scan")?;
+        // A parent inside the delete set is not a reason to refuse.
+        let doomed_names: std::collections::HashSet<String> =
+            if scan.unreadable_parents().is_empty()
+                && ids.iter().all(|id| scan.protection_for(*id).is_none())
+            {
+                std::collections::HashSet::new()
+            } else {
+                sqlx::query_scalar::<_, String>(
+                    "SELECT name FROM workflows WHERE id = ANY($1) AND user_id = $2",
+                )
+                .bind(ids)
+                .bind(user_id)
+                .fetch_all(&self.db_pool)
+                .await
+                .context("delete_workflows doomed-parent lookup")?
+                .into_iter()
+                .collect()
+            };
+
+        let mut blocked_referenced: Vec<ReferencedWorkflow> = Vec::new();
+        let mut deletable: Vec<Uuid> = Vec::with_capacity(ids.len());
+        for id in ids {
+            match scan
+                .protection_for(*id)
+                .and_then(|p| p.without_parents(&doomed_names))
+            {
+                Some(protection) => blocked_referenced.push(ReferencedWorkflow {
+                    id: *id,
+                    parents: protection.parent_names().to_vec(),
+                    reason: protection.reason(),
+                }),
+                None => deletable.push(*id),
+            }
+        }
+
+        if deletable.is_empty() {
+            return Ok(WorkflowDeleteOutcome {
+                deleted: Vec::new(),
+                blocked_running: Vec::new(),
+                blocked_referenced,
+            });
+        }
+
+        let deleted: Vec<Uuid> = sqlx::query_scalar(
             "DELETE FROM workflows WHERE id = ANY($1) AND user_id = $2 \
              AND NOT EXISTS ( \
                  SELECT 1 FROM workflow_executions \
@@ -1096,29 +1171,43 @@ impl WorkflowRepository {
              ) \
              RETURNING id",
         )
-        .bind(ids)
+        .bind(&deletable)
         .bind(user_id)
         .fetch_all(&self.db_pool)
         .await?;
 
-        // Only include ids in `blocked` when the workflow EXISTS and is owned by
-        // this user but has active executions preventing deletion.  Ids that don't
-        // exist (or belong to another user) must NOT appear in `blocked` — the
-        // handler uses blocked.is_empty() to distinguish "blocked" from "not found".
-        let blocked: Vec<Uuid> = sqlx::query_scalar(
+        // Only include ids in `blocked_running` when the workflow EXISTS and is
+        // owned by this user but has active executions preventing deletion. Ids
+        // that don't exist (or belong to another user) must NOT appear — the
+        // handler uses the list to distinguish "blocked" from "not found".
+        let blocked_running: Vec<Uuid> = sqlx::query_scalar(
             "SELECT id FROM workflows WHERE id = ANY($1) AND user_id = $2 \
              AND EXISTS ( \
                  SELECT 1 FROM workflow_executions \
                  WHERE workflow_id = workflows.id AND status IN ('running', 'queued', 'pending', 'resuming') \
              )",
         )
-        .bind(ids)
+        .bind(&deletable)
         .bind(user_id)
         .fetch_all(&self.db_pool)
         .await
         .unwrap_or_default();
 
-        Ok((deleted_ids, blocked))
+        if !blocked_referenced.is_empty() {
+            tracing::warn!(
+                target: "talos_audit",
+                %user_id,
+                deleted = deleted.len(),
+                refused = blocked_referenced.len(),
+                "delete_workflows refused workflow(s) an enabled parent dispatches into"
+            );
+        }
+
+        Ok(WorkflowDeleteOutcome {
+            deleted,
+            blocked_running,
+            blocked_referenced,
+        })
     }
 
     /// Enable or disable a workflow. Returns true if a row was affected.
@@ -2144,6 +2233,34 @@ pub struct WorkflowIdentityRow {
     pub readiness_computed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub graph_json: String,
     pub input_schema: Option<serde_json::Value>,
+}
+
+/// A workflow `delete_workflows_checked` refused because an enabled parent
+/// dispatches into it — or mentions it from a graph that could not be read.
+#[derive(Debug, Clone)]
+pub struct ReferencedWorkflow {
+    /// The workflow that was NOT deleted.
+    pub id: Uuid,
+    /// The enabled parents behind the refusal.
+    pub parents: Vec<String>,
+    /// Operator-facing explanation, from
+    /// [`talos_child_workflow_refs::ChildProtection::reason`].
+    pub reason: String,
+}
+
+/// What a batch delete actually did, with each refusal separated by CAUSE.
+///
+/// A `(deleted, blocked)` pair could not say "one of these is still running
+/// and the other is the flagship's daily sub-workflow", and the two need
+/// different remedies — wait, versus edit or retire the parent first.
+#[derive(Debug, Default)]
+pub struct WorkflowDeleteOutcome {
+    /// Rows actually removed.
+    pub deleted: Vec<Uuid>,
+    /// Owned, existing rows with a running/queued/pending/resuming execution.
+    pub blocked_running: Vec<Uuid>,
+    /// Owned, existing rows an enabled parent dispatches into.
+    pub blocked_referenced: Vec<ReferencedWorkflow>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

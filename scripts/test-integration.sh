@@ -308,6 +308,12 @@ CTRL_TESTS=(
     # Renders the REAL recommendation from a REAL HygieneReport; `common`
     # harness, so CTRL_TESTS (64b).
     "dormant_child_workflow_tests"
+    # The same blindness on the OTHER draft population #758 called latent: the
+    # 7-day `stale_draft_workflows` list, which feeds fix_all's IRREVERSIBLE
+    # auto-delete and session_start's auto-archive. Drives the REAL fix_all
+    # planning path AND `confirm=true` against a real row; `common` harness,
+    # so CTRL_TESTS (64b).
+    "stale_draft_child_workflow_tests"
     "api_key_tests"
     "api_auth_integration_test"
     "integration_mcp_tests"

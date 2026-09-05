@@ -7489,6 +7489,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "talos-child-workflow-refs",
  "talos-config",
  "talos-db",
  "talos-dlp-provider",
@@ -7510,6 +7511,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "talos-child-workflow-refs",
  "talos-db",
  "talos-measurement",
  "talos-retry-intelligence",
@@ -7748,6 +7750,16 @@ name = "talos-capability-world"
 version = "0.1.0"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "talos-child-workflow-refs"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sqlx",
+ "talos-workflow-engine-core",
+ "uuid",
 ]
 
 [[package]]
@@ -9802,6 +9814,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sqlx",
+ "talos-child-workflow-refs",
  "talos-config",
  "talos-db",
  "talos-dlp-provider",

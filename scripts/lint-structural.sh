@@ -8491,6 +8491,101 @@ else
 fi
 echo
 
+# ── 86. A "never executed" predicate must not drive a destructive draft path ──
+bold "▶ check 86: NOT EXISTS(workflow_executions) must know about sub-workflows"
+
+# `execute_subworkflow_graph` runs a child IN-PROCESS and records no
+# `workflow_executions` row — measured 2026-09-05: zero rows carrying
+# `parent_execution_id` across the live table AND the archive, platform-wide.
+# So `NOT EXISTS (SELECT 1 FROM workflow_executions …)` does not mean "this
+# workflow never ran"; it means "nothing in that table can tell you". Three
+# statements are built on it, and two of them ACT: `fix_all confirm=true`
+# DELETES (irreversibly) and `session_start`'s auto-archive ARCHIVES without
+# confirmation. #758 fixed the 30-day dormant list and recorded these as
+# "latent today"; the first live report after that deploy listed the flagship's
+# daily `team_gather` sub-workflow under a delete instruction.
+#
+# Two legs, because either alone is defeated:
+#   (a) FILE-scoped — any non-test file carrying the predicate must name the
+#       child-reference chokepoint. Catches the SELECT that feeds a delete
+#       decision made 200 lines and three crates away, which no window can see.
+#   (b) SITE-scoped on the DESTRUCTIVE verb — an UPDATE/DELETE statement
+#       carrying the predicate must have the chokepoint within 40 lines. (a)
+#       alone lets a new destructive statement ride into an already-gated file;
+#       this is the leg that would still fire.
+DRAFT_CHILD_PRED='NOT EXISTS (SELECT 1 FROM workflow_executions'
+DRAFT_CHILD_CHOKE='scan_child_parents\|talos_child_workflow_refs\|ChildReferenceScan\|child_protection_reason'
+DRAFT_CHILD_FAIL=0
+DRAFT_CHILD_FILES="$(grep -rl --include='*.rs' --exclude-dir=target --exclude-dir=vendor \
+                       --exclude-dir=node_modules "${TREE_PRUNE_GREP[@]}" \
+                       -F "$DRAFT_CHILD_PRED" . 2>/dev/null || true)"
+DRAFT_CHILD_SEEN=0
+while IFS= read -r f; do
+    [ -n "${f:-}" ] || continue
+    case "$f" in */tests/*) continue ;; esac
+    DRAFT_CHILD_SEEN=$((DRAFT_CHILD_SEEN + 1))
+    grep -q 'allow-execution-blind-draft-path:' "$f" && continue
+    if ! grep -q "$DRAFT_CHILD_CHOKE" "$f"; then
+        red "✗ $f keys on \"no workflow_executions row\" but never consults the child-reference scan"
+        DRAFT_CHILD_FAIL=$((DRAFT_CHILD_FAIL + 1))
+    fi
+done <<< "$DRAFT_CHILD_FILES"
+if [ "$DRAFT_CHILD_SEEN" -eq 0 ]; then
+    red "✗ check 86 found no NOT EXISTS(workflow_executions) predicate anywhere"
+    yellow "  → the shape was reworded or the check is looking in the wrong place;"
+    yellow "    a check that matches nothing is a green tick over zero statements."
+    DRAFT_CHILD_FAIL=$((DRAFT_CHILD_FAIL + 1))
+fi
+# Leg (b): the destructive verb, site-scoped.
+DRAFT_CHILD_DESTRUCTIVE="$(
+    perl -e '
+        my $window = 40;
+        for my $f (@ARGV) {
+            next if $f =~ m{/tests/};
+            open(my $fh, "<", $f) or next;
+            my @l = <$fh>; close $fh;
+            for my $i (0..$#l) {
+                next unless $l[$i] =~ /NOT EXISTS \(SELECT 1 FROM workflow_executions/;
+                # Walk back to the statement head; only UPDATE/DELETE count.
+                my $head = -1;
+                # Start ABOVE the predicate line: its own `SELECT 1 FROM
+                # workflow_executions` would otherwise BE the statement head
+                # and every destructive site would read as a SELECT. Measured:
+                # with `$j = $i` this leg reported 0 on the pre-fix tree.
+                for (my $j = $i - 1; $j >= 0 && $j > $i - 25; $j--) {
+                    if ($l[$j] =~ /\b(UPDATE|DELETE\s+FROM|SELECT|INSERT\s+INTO)\b/) { $head = $j; last; }
+                }
+                next if $head < 0;
+                next unless $l[$head] =~ /\b(UPDATE|DELETE\s+FROM)\b/;
+                my $lo = $i - $window; $lo = 0 if $lo < 0;
+                my $ctx = join("", @l[$lo..$i]);
+                next if $ctx =~ /allow-execution-blind-draft-path:/;
+                next if $ctx =~ /scan_child_parents|talos_child_workflow_refs|ChildReferenceScan|child_protection_reason/;
+                printf("%s:%d\n", $f, $i + 1);
+            }
+        }
+    ' $(grep -rl --include='*.rs' --exclude-dir=target --exclude-dir=vendor \
+          --exclude-dir=node_modules "${TREE_PRUNE_GREP[@]}" \
+          -F "$DRAFT_CHILD_PRED" . 2>/dev/null || true) 2>/dev/null || true
+)"
+if [ -n "$DRAFT_CHILD_DESTRUCTIVE" ]; then
+    red "✗ destructive statement(s) keyed on \"no workflow_executions row\" with no child scan within 40 lines:"
+    echo "$DRAFT_CHILD_DESTRUCTIVE" | sed 's/^/    /'
+    DRAFT_CHILD_FAIL=$((DRAFT_CHILD_FAIL + 1))
+fi
+if [ "$DRAFT_CHILD_FAIL" -gt 0 ]; then
+    yellow "  → a sub-workflow leaves NO execution row, so this predicate cannot tell"
+    yellow "    an abandoned scaffold from the flagship's daily child."
+    yellow "  → scope the candidates, then \`talos_child_workflow_refs::scan_child_parents\`"
+    yellow "    and skip every id with a \`protection_for(id)\`; a REPORT still lists it"
+    yellow "    with \`runs_as_child_of\`, a DECISION excludes it and discloses the count."
+    yellow "  → opt out with // allow-execution-blind-draft-path: <reason>."
+    EXIT_CODE=1
+else
+    green "✓ every \"never executed\" draft path consults the child-reference scan"
+fi
+echo
+
 bold "▶ check 54: lint self-consistency (check numbering + documented count)"
 ACTUAL_NUMS="$(grep -oE '^bold "▶ check [0-9]+:' "${BASH_SOURCE[0]}" | grep -oE '[0-9]+' | sort -n)"
 EXPECTED_NUMS="$(seq 1 "$CHECK_COUNT")"

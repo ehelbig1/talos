@@ -1,0 +1,22 @@
+[package]
+name = "talos-child-workflow-refs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid"] }
+# The child-workflow reference set (`child_workflow_ids_checked`) — the eight
+# `data` keys through which a node names another workflow, read from the crate
+# the ENGINE's own parser shares rather than restated here. `-core` is a leaf
+# (serde/serde_json/uuid/sha2/async-trait).
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
+uuid.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true
