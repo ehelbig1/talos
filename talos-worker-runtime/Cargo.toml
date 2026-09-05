@@ -61,6 +61,7 @@ talos-idempotency = { path = "../talos-idempotency" }
 talos-text-util = { path = "../talos-text-util" }
 regex = "1.11"  # For error message sanitization
 sqlparser = { version = "0.53", features = ["visitor"] }  # AST-based SQL validation (replaces pattern matching)
+talos-sql-classify = { path = "../talos-sql-classify" }  # THE read-only/mutation classifier, shared with the controller
 
 # Security & sandboxing
 cap-std = "3.4"  # Capability-based filesystem security

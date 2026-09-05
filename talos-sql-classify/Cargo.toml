@@ -1,0 +1,18 @@
+[package]
+name = "talos-sql-classify"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Deliberately a LEAF: sqlparser and nothing else. This is the single source of
+# truth for "does this SQL statement mutate?", shared by the WASM-host worker
+# (talos-worker-runtime) and the controller's signed-RPC handler
+# (talos-rpc-subscribers), so it must stay light enough to pull into the worker
+# without dragging in sqlx, tokio, or a web framework.
+[dependencies]
+sqlparser = { version = "0.53", features = ["visitor"] }
+
+[lints]
+workspace = true

@@ -8326,6 +8326,171 @@ else
 fi
 echo
 
+# ── 85. "Does this SQL mutate?" must have exactly ONE implementation ──────
+#
+# The question is asked on BOTH sides of `talos.database.query` — by the worker
+# before it forwards a guest's SQL, and by the controller before it runs it on
+# the full-privilege pool — and the two sides answered it DIFFERENTLY. #757
+# fixed the controller (an AST walk that breaks on any nested non-`Query`
+# statement) and left the worker matching the STRING `"SELECT" | "EXPLAIN"`
+# against `sql_validator`'s TOP-LEVEL statement label. sqlparser 0.53 parses
+# `WITH ins AS (INSERT INTO t VALUES (1) RETURNING a) SELECT * FROM ins` as a
+# `Statement::Query`, so that label is `"SELECT"`, so the worker called a
+# `readonly` actor's INSERT a read and forwarded it. The controller caught it;
+# the worker — the documented PRIMARY fence — did not.
+#
+# The classification now lives in `talos-sql-classify` (a leaf crate: sqlparser
+# and nothing else) and both consumers call in. Three legs, because each alone
+# is trivially evaded:
+#
+#   (a) the deleted predicate must stay deleted. `sql_stmt_type_is_read_only`
+#       was the worker's private copy; pinning the identifier is check 68(c)'s
+#       shape. Exact assertion, so precision is trivially 100%.
+#   (b) a file that CALLS the `database-query` write-ceiling gate must name the
+#       shared classifier. Without it, (a) is defeated by re-deriving the
+#       verdict under a new name at the same call site. This is the
+#       "chokepoint that misses a site" guard, check 69(a)'s shape.
+#   (c) `sqlparser` may be a direct dependency of only the three crates that
+#       legitimately parse SQL. A fourth classifier would be born in a fourth
+#       crate, and the dependency edge is what makes that hard rather than
+#       merely discouraged — check 67(b)'s shape.
+#   (d) the deleted PREDICATE, not just its name: no non-comment line may pair
+#       the literals `"SELECT"` and `"EXPLAIN"`. Leg (d) exists because a
+#       MUTATION beat everything else here. Reverting the gate's CALL SITE to
+#       an inline `matches!(validated.stmt_type.as_str(), "SELECT" |
+#       "EXPLAIN")` passed all 635 worker-crate tests AND legs (a)-(c) — (a)
+#       pins an identifier the inline form never mentions, and (b) is satisfied
+#       because the file still names `talos_sql_classify` elsewhere. Two things
+#       closed it: the decision was extracted into `write_ceiling_applies`, so
+#       the expression the tests drive IS the expression the host function
+#       evaluates, and this leg, because a test can always be bypassed by
+#       inlining a DIFFERENT expression at the call site while a grep for the
+#       expression cannot. Measured: 0 non-comment hits on the fixed tree, 1 on
+#       the pre-fix tree, and 1 on the mutated tree — reported at the mutated
+#       line.
+#
+# MEASURED in both directions against a `git archive` extract of the pre-fix
+# tree (a4caecf9), and the numbers are given as they came out rather than
+# rounded toward the story. Leg (a): **9 lines in 1 file** there (the
+# definition, the gate call, and seven test references), 0 on the fixed tree.
+# Leg (b): **2 files** there, and only ONE of them is a defect — the worker's;
+# the controller's #757 walk was already correct and is reported purely because
+# the shared crate did not yet exist for it to name. So (b) is a 2-of-2
+# violation of the RULE and a 1-of-2 detector of the BUG on that tree, and
+# 0 on the fixed tree. **Leg (c) ships at ZERO and is PROPHYLACTIC: it found
+# nothing on either tree**, which is worth saying plainly rather than implying
+# it caught something.
+#
+# What was BUILT AND REJECTED, on measurement, so the next person does not
+# rebuild it: the obvious detector — "a `matches!` over `Statement::Insert |
+# Update | Delete | Merge` outside the classifier crate" — reports **20 lines
+# across 2 files on the FIXED tree, every one of them legitimate** (
+# `sql_validator::statement_type` / `always_blocked_label` /
+# `statement_returns_rows` / `is_ddl`, and the controller's
+# `controller_permits_data_statement` / `statement_type_label`). Those answer a
+# DIFFERENT question — which statement KIND is this, for the allowlist, the
+# audit target and the error text — whose right answer really is top-level
+# only. 0% precision; a lint there would be enforcement-shaped noise.
+#
+# Stated limits, each confirmed rather than inferred. All three legs are
+# TEXTUAL. (a) pins ONE identifier, so a differently-named private copy
+# (`stmt_reads_only`) is invisible — the same limit check 68(c) states. (b)
+# fires on the FILE, not the call, so an opt-out there also blinds it to a
+# future gate added to that file; and it proves the classifier is NAMED in the
+# file, never that the gate's decision actually flows from it. (c) sees only
+# DIRECT `[dependencies]` entries, so a crate reaching sqlparser through a
+# re-export is invisible. And no leg can see the shape that already exists and
+# is correct: `sql_validator::check_query_for_mutations` is a hand-rolled
+# recursive walk over `SetExpr`, and a read-only verdict rebuilt in THAT style
+# would evade all three. The guard against that is the shared crate's corpus
+# (`talos-sql-classify`'s `CORPUS`), not this grep.
+bold "▶ check 85: one SQL read-only/mutation classifier, with one home"
+SQLCLS_FAIL=0
+
+# (a) the deleted private predicate must stay deleted.
+SQLCLS_A="$(grep -rn --include='*.rs' 'sql_stmt_type_is_read_only' . \
+    --exclude-dir=target --exclude-dir=vendor --exclude-dir=node_modules \
+    "${TREE_PRUNE_GREP[@]}" 2>/dev/null \
+    | grep -v '^[^:]*:[0-9]*: *//' \
+    | grep -v '^[^:]*:[0-9]*: *#' || true)"
+if [ -n "$SQLCLS_A" ]; then
+    red "✗ the worker's private read-only predicate is back:"
+    echo "$SQLCLS_A" | sed 's/^/    /'
+    yellow "  → the read/mutate verdict comes from \`talos_sql_classify::classify\`;"
+    yellow "    a statement LABEL (\`sql_validator::statement_type\`) is a different"
+    yellow "    question and must not be used to answer this one."
+    SQLCLS_FAIL=1
+fi
+
+# (b) a file that gates the database-query write ceiling must name the
+#     shared classifier.
+while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    grep -q 'allow-forked-sql-classifier' "$f" && continue
+    if ! grep -q 'talos_sql_classify' "$f"; then
+        red "✗ $f gates the database-query write ceiling without the shared classifier"
+        SQLCLS_FAIL=1
+    fi
+done <<< "$(grep -rl --include='*.rs' -E 'write_ceiling_refuses\("database-query"|write_ceiling::gate\(' . \
+    --exclude-dir=target --exclude-dir=vendor --exclude-dir=node_modules \
+    "${TREE_PRUNE_GREP[@]}" 2>/dev/null || true)"
+
+# (c) sqlparser is a direct dependency of exactly the three crates that parse
+#     SQL. A fourth is where a fourth classifier would be written.
+SQLCLS_ALLOWED_CRATES="talos-sql-classify talos-rpc-subscribers talos-worker-runtime"
+while IFS= read -r m; do
+    [ -z "$m" ] && continue
+    crate="$(basename "$(dirname "$m")")"
+    case " $SQLCLS_ALLOWED_CRATES " in
+        *" $crate "*) ;;
+        *)
+            grep -q 'allow-new-sqlparser-dep' "$m" && continue
+            red "✗ $m adds a direct sqlparser dependency outside the three SQL crates"
+            yellow "  → parse there if you must, but classify via \`talos-sql-classify\`;"
+            yellow "    a fourth parser is where a fourth answer gets written."
+            SQLCLS_FAIL=1
+            ;;
+    esac
+done <<< "$(grep -rl --include='Cargo.toml' -E '^sqlparser[[:space:]]*=' . \
+    --exclude-dir=target --exclude-dir=vendor --exclude-dir=node_modules \
+    "${TREE_PRUNE_GREP[@]}" 2>/dev/null || true)"
+
+# (d) the deleted PREDICATE itself, in any spelling that pairs the two
+#     literals, on a non-comment line.
+SQLCLS_D="$(grep -rn --include='*.rs' -E '"SELECT"[^"]{0,40}"EXPLAIN"' . \
+    --exclude-dir=target --exclude-dir=vendor --exclude-dir=node_modules \
+    "${TREE_PRUNE_GREP[@]}" 2>/dev/null \
+    | grep -v '^[^:]*:[0-9]*: *//' \
+    | grep -v 'allow-forked-sql-classifier' || true)"
+if [ -n "$SQLCLS_D" ]; then
+    red "✗ a read-only verdict is being built from the \"SELECT\"/\"EXPLAIN\" literal pair:"
+    echo "$SQLCLS_D" | sed 's/^/    /'
+    yellow "  → a data-modifying CTE's top-level label IS \"SELECT\"; use"
+    yellow "    \`talos_sql_classify::classify\` on the AST instead."
+    SQLCLS_FAIL=1
+fi
+
+# (e) the worker's SQL host file must not build a predicate out of the
+#     statement LABEL. `stmt_type` is kept for the audit target only.
+SQLCLS_E="$(grep -n -E 'matches!\(\s*(&|\*)?validated\.stmt_type|validated\.stmt_type(\.as_str\(\))?\s*[=!]=' \
+    talos-worker-runtime/src/host/database.rs 2>/dev/null \
+    | grep -v '^[0-9]*: *//' \
+    | grep -v 'allow-forked-sql-classifier' || true)"
+if [ -n "$SQLCLS_E" ]; then
+    red "✗ talos-worker-runtime/src/host/database.rs builds a predicate from the statement LABEL:"
+    echo "$SQLCLS_E" | sed 's/^/    /'
+    yellow "  → \`stmt_type\` is a TOP-LEVEL label (a writable CTE's is \"SELECT\");"
+    yellow "    the read/mutate decision belongs in \`write_ceiling_audit_target\`."
+    SQLCLS_FAIL=1
+fi
+
+if [ "$SQLCLS_FAIL" -gt 0 ]; then
+    EXIT_CODE=1
+else
+    green "✓ one SQL read-only classifier (talos-sql-classify), both consumers call in"
+fi
+echo
+
 bold "▶ check 54: lint self-consistency (check numbering + documented count)"
 ACTUAL_NUMS="$(grep -oE '^bold "▶ check [0-9]+:' "${BASH_SOURCE[0]}" | grep -oE '[0-9]+' | sort -n)"
 EXPECTED_NUMS="$(seq 1 "$CHECK_COUNT")"

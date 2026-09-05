@@ -3,14 +3,49 @@
 
 use super::*;
 
-/// Whether a validated SQL statement type is read-only for the write-ceiling
-/// axis. Only `SELECT` and `EXPLAIN` read; every other `stmt_type` produced by
-/// `sql_validator::statement_type` — including the `UNKNOWN` catch-all for any
-/// sqlparser variant not yet enumerated — is treated as a mutation
-/// (fail-closed). A read-only actor is refused everything this returns `false`
-/// for.
-pub(crate) fn sql_stmt_type_is_read_only(stmt_type: &str) -> bool {
-    matches!(stmt_type, "SELECT" | "EXPLAIN")
+/// Does this statement need the write ceiling consulted, and under what audit
+/// label?
+///
+/// The whole of the ceiling decision for `database-query`, in one pure
+/// function with ONE caller (`execute_query`, below), so that the expression
+/// the tests drive IS the expression the host function evaluates.
+///
+/// That is not incidental. The first version of the tests for this fix drove a
+/// helper that re-derived `!validated.access.is_read_only()` rather than
+/// calling the gate, and a mutation reverting the CALL SITE to the old
+/// `matches!(validated.stmt_type, "SELECT" | "EXPLAIN")` string match passed
+/// all 635 crate tests — the same shape as `guard_that_passes_its_own_mutation`
+/// in the project's own notes. Naming the decision is what makes the mutation
+/// visible; lint check 85(d) is the second copy, because a test can be
+/// bypassed by inlining a different expression at the call site and a grep for
+/// that expression cannot.
+///
+/// The verdict comes from [`talos_sql_classify`] — the one implementation of
+/// "does this SQL mutate?" in the workspace, shared with the controller's
+/// `talos.database.query` handler — applied to the AST the validator already
+/// parsed. It is deliberately NOT derived from `stmt_type`, which is a
+/// top-level LABEL: `WITH ins AS (INSERT … RETURNING a) SELECT * FROM ins`
+/// is labelled `"SELECT"` because its root really is a `Statement::Query`.
+///
+/// Fail-closed: DDL, `CALL`, and any sqlparser variant the classifier has not
+/// been taught are `SqlAccess::Unclassified`, which is not a read.
+///
+/// It returns the audit LABEL rather than a bool so the call site has no
+/// boolean to invert and nowhere to inline a competing predicate — the seam a
+/// mutation used. It also ties the label to the decision: the string handed to
+/// `write_ceiling_refuses` now comes from the same call that decided to refuse,
+/// instead of being fetched separately from a field that means something else.
+/// The label is the statement TYPE, matching what the controller stamps: guest
+/// SQL carries literals and literals carry PII.
+#[must_use]
+pub(crate) fn write_ceiling_audit_target(
+    validated: &crate::sql_validator::ValidatedStmt,
+) -> Option<&str> {
+    if validated.access.is_read_only() {
+        None
+    } else {
+        Some(validated.stmt_type.as_str())
+    }
 }
 
 // ============================================================================
@@ -196,19 +231,42 @@ impl wit_database::Host for TalosContext {
                     }
                 };
 
-            // Write-ceiling gate: a read-only actor may run read statements
-            // (SELECT / EXPLAIN) but never a mutation. Fail-closed — any
-            // non-read `stmt_type`, including the validator's `UNKNOWN`
-            // catch-all, is treated as a mutation and refused. The read
-            // check short-circuits so SELECTs never touch the audit path.
-            if !sql_stmt_type_is_read_only(&validated.stmt_type)
-                && self
-                    .write_ceiling_refuses("database-query", &validated.stmt_type)
+            // Write-ceiling gate: a read-only actor may run a read but never
+            // a mutation. The decision comes from `talos_sql_classify` — the
+            // ONE implementation of "does this mutate?", shared with the
+            // controller's `talos.database.query` handler — applied to the AST
+            // the validator just parsed.
+            //
+            // It used to be `matches!(validated.stmt_type, "SELECT" |
+            // "EXPLAIN")`, a match on the top-level statement LABEL. That
+            // labels `WITH ins AS (INSERT INTO t VALUES (1) RETURNING a)
+            // SELECT * FROM ins` as `"SELECT"`, because its root really is a
+            // `Statement::Query`, so a `readonly` actor's INSERT was forwarded
+            // to the controller as a read. The controller's own gate (#757)
+            // caught it there; the worker — the documented PRIMARY fence —
+            // did not, and the two sides disagreed about the same statement.
+            //
+            // Fail-closed is unchanged and now stronger: DDL, `CALL`, and any
+            // sqlparser variant the classifier has not been taught land in
+            // `SqlAccess::Unclassified`, which is not a read. (`EXPLAIN` moves
+            // from read to non-read, which changes NO live decision: the
+            // validator's `always_blocked_label` refuses every EXPLAIN
+            // unconditionally several lines above, so the old `"EXPLAIN"` arm
+            // was unreachable — pinned by `explain_never_reaches_the_ceiling_gate`.)
+            //
+            // The gate is an `if let` over `write_ceiling_audit_target`, not a
+            // boolean: see that function for why the call site deliberately
+            // has no invertible condition of its own.
+            if let Some(audit_target) = write_ceiling_audit_target(&validated) {
+                if self
+                    .write_ceiling_refuses("database-query", audit_target)
                     .await
-            {
-                self.last_db_error =
-                    "write ceiling: this read-only actor cannot run a mutating query".to_string();
-                return Err(wit_database::Error::Unauthorized);
+                {
+                    self.last_db_error =
+                        "write ceiling: this read-only actor cannot run a mutating query"
+                            .to_string();
+                    return Err(wit_database::Error::Unauthorized);
+                }
             }
 
             if let Some(ledger_mutex) = &self.audit_ledger {
@@ -414,33 +472,194 @@ impl wit_database::Host for TalosContext {
 
 #[cfg(test)]
 mod write_ceiling_db_tests {
-    use super::sql_stmt_type_is_read_only;
+    use crate::sql_validator::{validate_sql_with_policy, EmptyAllowlistPolicy};
+    use talos_sql_classify::SqlAccess;
 
-    #[test]
-    fn only_select_and_explain_read() {
-        assert!(sql_stmt_type_is_read_only("SELECT"));
-        assert!(sql_stmt_type_is_read_only("EXPLAIN"));
+    /// What the ceiling gate in `execute_query` decides, driven through the
+    /// REAL path: the validator parses and classifies, and the gate reads
+    /// `validated.access.is_read_only()`. Nothing here re-derives the verdict.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Decision {
+        /// The validator refused before the ceiling was consulted.
+        ValidatorRefused,
+        /// Admitted as a read — a `readonly` actor may run it.
+        PermittedAsRead,
+        /// Classified as a mutation — the ceiling gate fires.
+        CeilingGateFires,
     }
 
-    #[test]
-    fn dml_and_ddl_are_mutations() {
-        // Every non-read `stmt_type` the validator emits must be treated as
-        // a mutation so a read-only actor is refused.
-        for m in [
-            "INSERT", "UPDATE", "DELETE", "COPY", "MERGE", "CALL", "CREATE", "DROP", "ALTER",
-            "TRUNCATE", "GRANT", "REVOKE", "ATTACH",
-        ] {
-            assert!(!sql_stmt_type_is_read_only(m), "{m} must be a mutation");
+    /// Drives the REAL path end to end: the validator parses and classifies,
+    /// then `super::write_ceiling_audit_target` — the exact expression
+    /// `execute_query` evaluates, not a copy of it — decides. Nothing here
+    /// re-derives the verdict; that mistake is documented on
+    /// `write_ceiling_applies` itself.
+    fn decide(sql: &str, ops: &[String], empty_policy: EmptyAllowlistPolicy) -> Decision {
+        match validate_sql_with_policy(sql, ops, empty_policy) {
+            Err(_) => Decision::ValidatorRefused,
+            Ok(v) if super::write_ceiling_audit_target(&v).is_some() => Decision::CeilingGateFires,
+            Ok(_) => Decision::PermittedAsRead,
         }
     }
 
+    fn ops(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// # The hole this test exists for
+    ///
+    /// Postgres data-modifying CTEs parse as `Statement::Query`, so the
+    /// pre-fix gate — `matches!(validated.stmt_type, "SELECT" | "EXPLAIN")` —
+    /// called them reads and forwarded a `readonly` actor's INSERT to the
+    /// controller. Run against the pre-fix tree these two cases assert
+    /// `CeilingGateFires` and get `PermittedAsRead`.
+    ///
+    /// The allowlist here ADMITS the mutation on purpose: the module's
+    /// `allowed_operations` policy and the actor's write ceiling are different
+    /// controls, and this test is about the ceiling. `DELETE` and `MERGE`
+    /// inside a CTE are sqlparser 0.53 parse errors and are pinned as such by
+    /// `talos_sql_classify`.
     #[test]
-    fn unknown_fails_closed_as_mutation() {
-        // The validator's fail-closed catch-all for un-enumerated sqlparser
-        // variants must NOT read as a read — otherwise a novel statement
-        // shape would slip past the ceiling.
-        assert!(!sql_stmt_type_is_read_only("UNKNOWN"));
-        assert!(!sql_stmt_type_is_read_only(""));
-        assert!(!sql_stmt_type_is_read_only("select")); // case-sensitive by design
+    fn a_writable_cte_reaches_the_ceiling_gate() {
+        let allowed = ops(&["INSERT", "UPDATE", "DELETE"]);
+        for sql in [
+            "WITH ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) SELECT * FROM ins",
+            "WITH d AS (UPDATE t SET a = 1 RETURNING a) SELECT * FROM d",
+            "WITH a AS (SELECT 1), b AS (INSERT INTO t VALUES (1) RETURNING 1) SELECT * FROM a",
+            "SELECT * FROM (WITH x AS (INSERT INTO t VALUES (1) RETURNING 1) SELECT * FROM x) y",
+        ] {
+            assert_eq!(
+                decide(sql, &allowed, EmptyAllowlistPolicy::AllowAllNonDdl),
+                Decision::CeilingGateFires,
+                "a mutation hidden in a CTE must not be admitted as a read: {sql}"
+            );
+        }
+    }
+
+    /// Controls. A plain read is still a read and a plain mutation is still a
+    /// mutation — the fix must change no existing decision.
+    #[test]
+    fn plain_statements_decide_exactly_as_before() {
+        let allowed = ops(&["INSERT", "UPDATE", "DELETE"]);
+        for sql in [
+            "SELECT 1",
+            "SELECT * FROM users WHERE id = $1",
+            "WITH a AS (SELECT 1) SELECT * FROM a",
+            "SELECT * FROM t UNION SELECT * FROM u",
+        ] {
+            assert_eq!(
+                decide(sql, &allowed, EmptyAllowlistPolicy::DenyMutations),
+                Decision::PermittedAsRead,
+                "control read: {sql}"
+            );
+        }
+        for sql in [
+            "INSERT INTO t (a) VALUES ($1)",
+            "UPDATE t SET a = 1 WHERE id = $1",
+            "DELETE FROM t WHERE id = $1",
+        ] {
+            assert_eq!(
+                decide(sql, &allowed, EmptyAllowlistPolicy::AllowAllNonDdl),
+                Decision::CeilingGateFires,
+                "control mutation: {sql}"
+            );
+        }
+    }
+
+    /// # The module-policy half, which is a different control and was also open
+    ///
+    /// `enforce_cte_mutation_policy` used to skip its allowlist test entirely
+    /// when `allowed_operations` was empty, so a writable CTE validated clean
+    /// under `DenyMutations` — the production default, whose documented
+    /// contract is "only SELECT passes when the allowlist is empty", and the
+    /// ONLY configuration that exists (every dispatch site hardcodes
+    /// `allowed_sql_operations: vec![]`). Pre-fix this asserts
+    /// `ValidatorRefused` and gets `PermittedAsRead`.
+    #[test]
+    fn an_empty_allowlist_refuses_a_writable_cte_like_it_refuses_a_bare_insert() {
+        for sql in [
+            "WITH ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) SELECT * FROM ins",
+            "WITH d AS (UPDATE t SET a = 1 RETURNING a) SELECT * FROM d",
+            "SELECT * FROM (WITH x AS (INSERT INTO t VALUES (1) RETURNING 1) SELECT * FROM x) y",
+            // The statement the empty-allowlist contract is written about,
+            // as the control that it already behaved correctly.
+            "INSERT INTO t (a) VALUES (1)",
+        ] {
+            assert_eq!(
+                decide(sql, &[], EmptyAllowlistPolicy::DenyMutations),
+                Decision::ValidatorRefused,
+                "empty allowlist under DenyMutations must refuse: {sql}"
+            );
+        }
+        // A read is untouched by the fix.
+        assert_eq!(
+            decide("SELECT * FROM t", &[], EmptyAllowlistPolicy::DenyMutations),
+            Decision::PermittedAsRead
+        );
+    }
+
+    /// Legacy permissive mode gives the SAME answer to the same question in
+    /// both positions: it admits a top-level mutation, so it admits one inside
+    /// a CTE — and the ceiling gate, not the allowlist, is what stops a
+    /// `readonly` actor there.
+    #[test]
+    fn permissive_empty_allowlist_treats_cte_and_top_level_alike() {
+        for sql in [
+            "WITH ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) SELECT * FROM ins",
+            "INSERT INTO t (a) VALUES (1)",
+        ] {
+            assert_eq!(
+                decide(sql, &[], EmptyAllowlistPolicy::AllowAllNonDdl),
+                Decision::CeilingGateFires,
+                "{sql}"
+            );
+        }
+    }
+
+    /// Reclassifying `EXPLAIN` from read to non-read changes no live decision,
+    /// because the validator refuses every EXPLAIN before the gate is reached.
+    /// Recorded so the claim is checked rather than asserted.
+    #[test]
+    fn explain_never_reaches_the_ceiling_gate() {
+        for sql in [
+            "EXPLAIN SELECT 1",
+            "EXPLAIN ANALYZE INSERT INTO t VALUES (1)",
+        ] {
+            assert_eq!(
+                decide(sql, &ops(&["INSERT"]), EmptyAllowlistPolicy::AllowAllNonDdl),
+                Decision::ValidatorRefused,
+                "{sql}"
+            );
+        }
+    }
+
+    /// DDL / `CALL` / `COPY` / `SET` are refused by the validator, and would
+    /// fail closed at the gate even if they were not: they classify as
+    /// `Unclassified`, which is not a read.
+    #[test]
+    fn non_data_statements_fail_closed_at_both_layers() {
+        for sql in [
+            "CREATE TABLE t (id INT)",
+            "DROP TABLE t",
+            "TRUNCATE t",
+            "GRANT SELECT ON t TO r",
+            "COPY t FROM '/etc/passwd'",
+            "SET search_path = x",
+        ] {
+            assert_eq!(
+                decide(sql, &[], EmptyAllowlistPolicy::AllowAllNonDdl),
+                Decision::ValidatorRefused,
+                "{sql}"
+            );
+            let stmt = sqlparser::parser::Parser::parse_sql(
+                &sqlparser::dialect::PostgreSqlDialect {},
+                sql,
+            )
+            .expect("parses");
+            assert_eq!(
+                talos_sql_classify::classify(&stmt[0]),
+                SqlAccess::Unclassified,
+                "backstop: {sql}"
+            );
+        }
     }
 }

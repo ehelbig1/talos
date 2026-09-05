@@ -341,8 +341,9 @@ fn always_blocked_label(stmt: &Statement) -> Option<&'static str> {
 fn check_cte_mutations(
     query: &ast::Query,
     allowed_operations: &[String],
+    empty_policy: EmptyAllowlistPolicy,
 ) -> Result<(), SqlValidationError> {
-    check_query_for_mutations(query, allowed_operations)
+    check_query_for_mutations(query, allowed_operations, empty_policy)
 }
 
 /// MCP-554: recursively walk a `Query` AST looking for mutation CTEs.
@@ -367,19 +368,20 @@ fn check_cte_mutations(
 fn check_query_for_mutations(
     query: &ast::Query,
     allowed_operations: &[String],
+    empty_policy: EmptyAllowlistPolicy,
 ) -> Result<(), SqlValidationError> {
     // 1. Inspect this query's CTE chain.
     if let Some(ref with) = query.with {
         for cte in &with.cte_tables {
             // Check this CTE body for a direct mutation first.
-            check_cte_body(&cte.query, allowed_operations)?;
+            check_cte_body(&cte.query, allowed_operations, empty_policy)?;
             // Then recurse into nested structure (the body may
             // itself carry a `with` or contain subqueries).
-            check_query_for_mutations(&cte.query, allowed_operations)?;
+            check_query_for_mutations(&cte.query, allowed_operations, empty_policy)?;
         }
     }
     // 2. Recurse into this query's body.
-    check_set_expr_for_mutations(&query.body, allowed_operations)
+    check_set_expr_for_mutations(&query.body, allowed_operations, empty_policy)
 }
 
 /// Classify a CTE's direct body. Returns Ok when the body is not a
@@ -388,18 +390,40 @@ fn check_query_for_mutations(
 fn check_cte_body(
     cte_query: &ast::Query,
     allowed_operations: &[String],
+    empty_policy: EmptyAllowlistPolicy,
 ) -> Result<(), SqlValidationError> {
     let cte_stmt_type = match cte_query.body.as_ref() {
         ast::SetExpr::Insert(_) => "INSERT",
         ast::SetExpr::Update(_) => "UPDATE",
         _ => return Ok(()),
     };
-    enforce_cte_mutation_policy(cte_stmt_type, allowed_operations)
+    enforce_cte_mutation_policy(cte_stmt_type, allowed_operations, empty_policy)
 }
 
+/// # An empty allowlist meant "anything, as long as you hide it in a CTE"
+///
+/// The allowlist test below used to be the WHOLE function body after the DDL
+/// guard, wrapped in `if !allowed_operations.is_empty()`. So an EMPTY
+/// allowlist fell straight through to `Ok(())` and a writable CTE was
+/// admitted — while the top-level path, twenty lines further down in
+/// `validate_sql_with_policy`, refuses a bare `INSERT` under exactly the same
+/// configuration (`DenyMutations` is the production default and its documented
+/// contract is "only SELECT passes when the allowlist is empty").
+///
+/// That was not a corner case: `allowed_sql_operations` is hardcoded to
+/// `vec![]` at EVERY dispatch site in the workspace
+/// (`engine_dispatch_single`, `engine_dispatch_pipeline`, `scheduler_handlers`,
+/// and the gmail / google-cloud module dispatchers), so the empty allowlist is
+/// the ONLY configuration that exists in the fleet. Measured on the pre-fix
+/// tree: `WITH ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) SELECT * FROM ins`
+/// validated clean with `allowed_operations = []`.
+///
+/// The empty case now takes the SAME branch the top-level path takes, so a
+/// mutation is admitted only where a top-level mutation would be.
 fn enforce_cte_mutation_policy(
     cte_stmt_type: &str,
     allowed_operations: &[String],
+    empty_policy: EmptyAllowlistPolicy,
 ) -> Result<(), SqlValidationError> {
     // DDL inside CTEs is not valid PostgreSQL, but block it defensively.
     if cte_stmt_type == "CREATE"
@@ -409,16 +433,26 @@ fn enforce_cte_mutation_policy(
     {
         return Err(SqlValidationError::DdlBlocked(cte_stmt_type.to_string()));
     }
-    // Check against the allowlist.
-    if !allowed_operations.is_empty() {
-        let permitted = allowed_operations
-            .iter()
-            .any(|op| op.eq_ignore_ascii_case(cte_stmt_type));
-        if !permitted {
-            return Err(SqlValidationError::CteMutationBlocked(
+    // Check against the allowlist. An EMPTY allowlist is not "no opinion": it
+    // resolves through the same `EmptyAllowlistPolicy` the top-level statement
+    // check uses, so `DenyMutations` (the production default) refuses here too.
+    if allowed_operations.is_empty() {
+        return match empty_policy {
+            EmptyAllowlistPolicy::DenyMutations => Err(SqlValidationError::CteMutationBlocked(
                 cte_stmt_type.to_string(),
-            ));
-        }
+            )),
+            // Legacy permissive mode admits top-level non-DDL mutations, so it
+            // admits them inside a CTE too — same answer to the same question.
+            EmptyAllowlistPolicy::AllowAllNonDdl => Ok(()),
+        };
+    }
+    let permitted = allowed_operations
+        .iter()
+        .any(|op| op.eq_ignore_ascii_case(cte_stmt_type));
+    if !permitted {
+        return Err(SqlValidationError::CteMutationBlocked(
+            cte_stmt_type.to_string(),
+        ));
     }
     Ok(())
 }
@@ -426,21 +460,22 @@ fn enforce_cte_mutation_policy(
 fn check_set_expr_for_mutations(
     body: &ast::SetExpr,
     allowed_operations: &[String],
+    empty_policy: EmptyAllowlistPolicy,
 ) -> Result<(), SqlValidationError> {
     match body {
         ast::SetExpr::Select(select) => {
             // FROM clauses can be table factors that are themselves
             // subqueries with their own WITH.
             for tbl in &select.from {
-                check_table_with_joins(tbl, allowed_operations)?;
+                check_table_with_joins(tbl, allowed_operations, empty_policy)?;
             }
         }
         ast::SetExpr::Query(inner) => {
-            check_query_for_mutations(inner, allowed_operations)?;
+            check_query_for_mutations(inner, allowed_operations, empty_policy)?;
         }
         ast::SetExpr::SetOperation { left, right, .. } => {
-            check_set_expr_for_mutations(left, allowed_operations)?;
-            check_set_expr_for_mutations(right, allowed_operations)?;
+            check_set_expr_for_mutations(left, allowed_operations, empty_policy)?;
+            check_set_expr_for_mutations(right, allowed_operations, empty_policy)?;
         }
         // Direct CTE-body INSERT / UPDATE handled by check_cte_body.
         // Values / Table / Insert / Update don't carry interior Queries
@@ -453,10 +488,11 @@ fn check_set_expr_for_mutations(
 fn check_table_with_joins(
     tbl: &ast::TableWithJoins,
     allowed_operations: &[String],
+    empty_policy: EmptyAllowlistPolicy,
 ) -> Result<(), SqlValidationError> {
-    check_table_factor(&tbl.relation, allowed_operations)?;
+    check_table_factor(&tbl.relation, allowed_operations, empty_policy)?;
     for join in &tbl.joins {
-        check_table_factor(&join.relation, allowed_operations)?;
+        check_table_factor(&join.relation, allowed_operations, empty_policy)?;
     }
     Ok(())
 }
@@ -464,15 +500,16 @@ fn check_table_with_joins(
 fn check_table_factor(
     relation: &ast::TableFactor,
     allowed_operations: &[String],
+    empty_policy: EmptyAllowlistPolicy,
 ) -> Result<(), SqlValidationError> {
     match relation {
         ast::TableFactor::Derived { subquery, .. } => {
-            check_query_for_mutations(subquery, allowed_operations)?;
+            check_query_for_mutations(subquery, allowed_operations, empty_policy)?;
         }
         ast::TableFactor::NestedJoin {
             table_with_joins, ..
         } => {
-            check_table_with_joins(table_with_joins, allowed_operations)?;
+            check_table_with_joins(table_with_joins, allowed_operations, empty_policy)?;
         }
         // Table / TableFunction / UNNEST etc. don't carry an interior
         // Query that could hide a CTE mutation.
@@ -654,6 +691,20 @@ fn denied_function_name(name: &ast::ObjectName) -> Option<String> {
 pub struct ValidatedStmt {
     pub stmt_type: String,
     pub returns_rows: bool,
+    /// Does this statement MUTATE? Answered by `talos_sql_classify`, the ONE
+    /// implementation of that question in the workspace — the same function
+    /// the controller's `talos.database.query` handler calls.
+    ///
+    /// It is deliberately NOT derived from [`Self::stmt_type`]. That field is
+    /// a top-level LABEL for the allowlist, the audit target and error text;
+    /// `WITH ins AS (INSERT … RETURNING a) SELECT * FROM ins` is labelled
+    /// `"SELECT"` because its root really is a `Statement::Query`. Reading
+    /// read-only-ness off the label is what let a `readonly` actor's INSERT
+    /// through — see `talos_sql_classify`'s module docs.
+    ///
+    /// Computed from the AST this function already parsed, so the classifier
+    /// costs a tree walk, not a second parse.
+    pub access: talos_sql_classify::SqlAccess,
 }
 
 /// AST-based check for whether a statement actually emits rows.
@@ -826,7 +877,7 @@ pub fn validate_sql_with_policy(
 
     // Check for CTE mutations hidden inside SELECT queries
     if let Statement::Query(query) = stmt {
-        check_cte_mutations(query, allowed_operations)?;
+        check_cte_mutations(query, allowed_operations, empty_policy)?;
     }
 
     // M-3 (2026-05-22): empty allowlist no longer means "anything
@@ -862,6 +913,7 @@ pub fn validate_sql_with_policy(
     Ok(ValidatedStmt {
         stmt_type: stmt_type.to_string(),
         returns_rows: statement_returns_rows(stmt),
+        access: talos_sql_classify::classify(stmt),
     })
 }
 

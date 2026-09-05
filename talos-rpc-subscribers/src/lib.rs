@@ -462,40 +462,29 @@ fn statement_type_label(stmt: &sqlparser::ast::Statement) -> &'static str {
 /// therefore have smuggled an INSERT past a ceiling gate that called it a
 /// read. (`DELETE` and `MERGE` inside a CTE are parse errors in 0.53 — today.)
 ///
-/// So the walk below is not an enumeration of known-bad shapes. It breaks on
-/// **any** nested `Statement` that is not itself a `Query`, which is fail
-/// closed against every statement type sqlparser learns to nest in future,
-/// including the two it currently refuses.
+/// # …and the worker was answering the same question differently
+///
+/// #757 fixed the walk HERE and left the worker matching the STRING
+/// `"SELECT" | "EXPLAIN"` against its top-level statement label, which calls
+/// every one of those CTE shapes a read. Two paths answering one question
+/// differently IS the bug, so the walk moved to `talos_sql_classify` — a leaf
+/// crate depending on `sqlparser` and nothing else — and BOTH sides call in.
+/// This function is now the controller's spelling of that one answer, kept as
+/// a named wrapper because its call site reads better for it and because the
+/// history above belongs next to the decision.
+///
+/// It stays the controller's OWN parse, never the worker's `is_fetch` hint:
+/// the entire premise of the ceiling gate is that the sender may not have
+/// gated itself, so trusting a sender-supplied classification would be
+/// circular.
+///
+/// Note the domains differ slightly and safely. [`controller_permits_data_statement`]
+/// has already rejected everything but the five data statements, so the
+/// classifier's `Unclassified` arm is unreachable from here; asking
+/// "is it NOT read-only" rather than "is it one of four mutation variants"
+/// means a future widening of the admission gate fails closed by default.
 fn controller_statement_mutates(stmt: &sqlparser::ast::Statement) -> bool {
-    use sqlparser::ast::{Statement as S, Visit, Visitor};
-    use std::ops::ControlFlow;
-
-    if matches!(
-        stmt,
-        S::Insert(_) | S::Update { .. } | S::Delete(_) | S::Merge { .. }
-    ) {
-        return true;
-    }
-
-    // Breaks on any statement node that is not a `Query`. On a genuine read
-    // the ONLY statement in the tree is the root `Statement::Query`, so the
-    // walk completes; anything else present is a mutation the outer `Query`
-    // is carrying.
-    struct NestedMutationVisitor;
-    impl Visitor for NestedMutationVisitor {
-        type Break = ();
-        fn pre_visit_statement(&mut self, s: &S) -> ControlFlow<()> {
-            match s {
-                S::Query(_) => ControlFlow::Continue(()),
-                _ => ControlFlow::Break(()),
-            }
-        }
-    }
-
-    matches!(
-        stmt.visit(&mut NestedMutationVisitor),
-        ControlFlow::Break(())
-    )
+    !talos_sql_classify::is_read_only(stmt)
 }
 
 /// Wasm-security review 2026-05-22 (MEDIUM-2): resolve the operator-
@@ -3377,6 +3366,37 @@ mod controller_statement_allowlist_tests {
                  (`controller_statement_mutates` breaks on any non-Query \
                  statement node), but update this test so the change is \
                  recorded: {sql}"
+            );
+        }
+    }
+
+    /// The controller's verdict IS the shared classifier's verdict, not a
+    /// copy of it that happens to agree today.
+    ///
+    /// This is the test half of lint check 85: the lint proves the file NAMES
+    /// `talos_sql_classify`, and this proves the answer actually comes from
+    /// there. Re-inlining a private walk that drifts by one shape fails here
+    /// even while the lint stays green.
+    #[test]
+    fn the_verdict_is_the_shared_classifiers_not_a_local_copy() {
+        use super::controller_statement_mutates;
+        for sql in [
+            "SELECT * FROM t",
+            "INSERT INTO t (a) VALUES (1)",
+            "UPDATE t SET a = 1",
+            "DELETE FROM t",
+            "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN UPDATE SET a = s.a",
+            "WITH ins AS (INSERT INTO t (a) VALUES (1) RETURNING a) SELECT * FROM ins",
+            "WITH d AS (UPDATE t SET a = 1 RETURNING a) SELECT * FROM d",
+            "SELECT * FROM (WITH x AS (INSERT INTO t VALUES (1) RETURNING 1) SELECT * FROM x) y",
+            "WITH c AS (SELECT 1) SELECT * FROM c",
+            "CREATE TABLE t (id INT)",
+        ] {
+            let stmt = parse1(sql);
+            assert_eq!(
+                controller_statement_mutates(&stmt),
+                !talos_sql_classify::is_read_only(&stmt),
+                "controller and shared classifier disagree: {sql}"
             );
         }
     }
