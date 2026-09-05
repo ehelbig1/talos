@@ -431,7 +431,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_workflow_reuse_stats",
-            "description": "Get reuse analytics across workflows: invocation counts, unique sessions, repeat-use ratio, and estimated token savings.",
+            "description": "Get reuse analytics across workflows: invocation counts, unique sessions, repeat-use ratio, and estimated token savings. Two lists: `workflows` is ranked by counted invocations from workflow_executions; `parent_dispatched` names workflows an enabled parent invokes as a sub-workflow, whose invocations are real but UNCOUNTED (a sub-workflow run records no execution row), so their total_invocations is null rather than 0 and they are kept out of the ranking.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -5530,12 +5530,30 @@ async fn handle_get_workflow_risk_assessment(
                 .await,
         )
         .unwrap_or_default();
+    // A sub-workflow's failure rate is UNMEASURABLE from `workflow_executions`
+    // — an `execute_subworkflow_graph` run is in-process and records no row —
+    // so `continue`-ing on a zero-row population is not "this child is fine",
+    // it is "nothing here can tell you". Measured platform-wide 2026-09-05:
+    // ZERO execution rows carry a `parent_execution_id`, so on the reference
+    // fleet this HIGH-severity check can never fire for ANY child. No risk
+    // entry is pushed for it (an `info` row on every parent that has a judge
+    // node would be noise on three of this fleet's workflows); the population
+    // is DISCLOSED instead, so "no cascading-failure risk found" is legible as
+    // a statement about what was measurable rather than about the children.
+    let mut unmeasurable_sub_workflows: Vec<String> = Vec::new();
     for sub_wf_id in &sub_wf_ids {
         let (failed, total) = match exec_counts.get(sub_wf_id) {
             Some(t) => *t,
-            None => continue, // no executions in window or not user-owned
+            None => {
+                // No executions in window, OR not user-owned. The two are
+                // indistinguishable here, and the note below says so rather
+                // than claiming every id in this list is a healthy child.
+                unmeasurable_sub_workflows.push(sub_wf_id.to_string());
+                continue;
+            }
         };
         if total <= 0 {
+            unmeasurable_sub_workflows.push(sub_wf_id.to_string());
             continue;
         }
         let fail_rate = (failed as f64 / total as f64) * 100.0;
@@ -5850,6 +5868,16 @@ async fn handle_get_workflow_risk_assessment(
         "low": risks.iter().filter(|r| r.get("risk_level").and_then(|l| l.as_str()) == Some("low")).count(),
         "risks": risks,
     });
+    // NOTHING TO SAY ⇒ NO KEY: a workflow that dispatches into nothing, or
+    // whose children all have counted executions, is byte-identical to the
+    // pre-#762 response.
+    if !unmeasurable_sub_workflows.is_empty() {
+        result["cascading_failure_check"] = serde_json::json!({
+            "sub_workflows_checked": sub_wf_ids.len(),
+            "sub_workflows_unmeasurable": unmeasurable_sub_workflows,
+            "note": "The cascading-failure check reads workflow_executions, and a sub-workflow                      run is IN-PROCESS and records no row there — measured platform-wide                      2026-09-05: zero execution rows carry a parent_execution_id, live table or                      archive. So for the workflows listed here the check could not run at all,                      and their ABSENCE from `risks` is not evidence that they are healthy.                      (An id can also appear here because it is not yours or no longer exists;                      the two are indistinguishable from this query.)",
+        });
+    }
     readings.attach(&mut result);
 
     mcp_text(
@@ -6310,12 +6338,87 @@ async fn handle_get_workflow_reuse_stats(
         Err(resp) => return resp,
     };
 
+    // Every field this tool renders is a claim about how much a workflow is
+    // used, so a read that failed must not become a workflow that is not used.
+    let mut readings = talos_measurement::Readings::new();
     match state
         .analytics_repo
         .get_workflow_reuse_stats(user_id, days as i32)
         .await
     {
         Ok(rows) => {
+            // ── Workflows a PARENT invokes ────────────────────────────────
+            //
+            // The query above INNER-JOINs `workflow_executions`, and a
+            // sub-workflow run records no row there, so a workflow whose every
+            // invocation is a parent dispatch is ABSENT from this tool — not
+            // reported as zero, absent. Measured 2026-09-05: `pa-ask` is
+            // dispatched per inbound email by `pa-ask-email` and has 0 rows in
+            // that table across live AND archive, so the most-invoked workflow
+            // on the reference fleet did not appear in the reuse report at all.
+            //
+            // Rendered as a SEPARATE list rather than folded into `workflows`
+            // with a count of 0: the main list is RANKED by
+            // `total_invocations`, and a row whose true count is unknowable
+            // cannot take a position in that ranking without asserting one.
+            // ONE scan over a bounded page, not one per row.
+            let zero_invocation = readings.record(
+                "parent_dispatched",
+                state
+                    .analytics_repo
+                    .list_zero_invocation_workflows(
+                        user_id,
+                        days as i32,
+                        talos_analytics_repository::REUSE_ZERO_INVOCATION_SCAN_LIMIT,
+                    )
+                    .await,
+            );
+            let mut parent_dispatched: Vec<serde_json::Value> = Vec::new();
+            let mut parent_dispatched_truncated = false;
+            let mut unreadable_parents: Vec<String> = Vec::new();
+            if let Some(candidates) = zero_invocation {
+                parent_dispatched_truncated = i64::try_from(candidates.len()).unwrap_or(i64::MAX)
+                    >= talos_analytics_repository::REUSE_ZERO_INVOCATION_SCAN_LIMIT;
+                let ids: Vec<Uuid> = candidates.iter().map(|c| c.workflow_id).collect();
+                let scan = readings.record(
+                    "parent_dispatched.scan",
+                    state
+                        .analytics_repo
+                        .scan_child_parents_for(user_id, &ids)
+                        .await,
+                );
+                if let Some(scan) = scan.as_ref() {
+                    unreadable_parents = scan.unreadable_parents().to_vec();
+                    for c in &candidates {
+                        let parents = scan.parents_of(c.workflow_id);
+                        if parents.is_empty() {
+                            // Zero runs and nobody dispatching into it: not
+                            // reuse, and this tool has nothing to say about it.
+                            continue;
+                        }
+                        let node_count = c
+                            .graph_json
+                            .as_deref()
+                            .and_then(|gj| serde_json::from_str::<serde_json::Value>(gj).ok())
+                            .and_then(|g| {
+                                g.get("nodes").and_then(|n| n.as_array()).map(|a| a.len())
+                            });
+                        parent_dispatched.push(serde_json::json!({
+                            "workflow_id": c.workflow_id,
+                            "name": c.name,
+                            // NULL, never 0. Nothing counts these runs, and a 0
+                            // beside a name in a REUSE report is the reading
+                            // this list exists to remove.
+                            "total_invocations": serde_json::Value::Null,
+                            "unique_active_days": serde_json::Value::Null,
+                            "estimated_token_savings": serde_json::Value::Null,
+                            "runs_as_child_of": parents,
+                            "node_count": node_count,
+                        }));
+                    }
+                }
+            }
+
             let stats: Vec<serde_json::Value> = rows
                 .iter()
                 .map(|row| {
@@ -6352,16 +6455,43 @@ async fn handle_get_workflow_reuse_stats(
                     })
                 })
                 .collect();
+            let mut result = serde_json::json!({
+                "period_days": days,
+                "count": stats.len(),
+                "workflow_count": stats.len(),
+                "workflows": stats,
+                "parent_dispatched": parent_dispatched,
+                "parent_dispatched_count": parent_dispatched.len(),
+                "parent_dispatched_note": "Workflows an ENABLED parent dispatches into as a \
+                    sub-workflow. Their invocations are real but UNCOUNTED: a sub-workflow runs \
+                    in-process and records no workflow_executions row, so total_invocations is \
+                    null — not zero — and these rows are deliberately kept out of the ranked \
+                    `workflows` list, whose order is by a count they do not have. \
+                    Measured platform-wide 2026-09-05: zero execution rows carry a \
+                    parent_execution_id, live table or archive.",
+                "note": "`workflows` counts all executions in workflow_executions. \
+                    unique_active_days = distinct calendar days with at least one run. \
+                    estimated_token_savings = total_invocations × node_count × 50 (rough per-node \
+                    scaffolding heuristic; not measured per-execution — treat as a \
+                    relative-magnitude signal, not a calibrated cost number). See \
+                    `parent_dispatched` for workflows this count structurally cannot see.",
+            });
+            if parent_dispatched_truncated {
+                result["parent_dispatched_truncated"] = serde_json::json!(true);
+                result["parent_dispatched_truncation_note"] = serde_json::json!(format!(
+                    "The candidate page for parent-dispatched workflows was capped at {}; \
+                     a child beyond that cap is not listed.",
+                    talos_analytics_repository::REUSE_ZERO_INVOCATION_SCAN_LIMIT
+                ));
+            }
+            if !unreadable_parents.is_empty() {
+                result["parent_dispatched_unreadable_parent_graphs"] =
+                    serde_json::json!(unreadable_parents);
+            }
+            readings.attach(&mut result);
             mcp_text(
                 req_id,
-                &serde_json::to_string_pretty(&serde_json::json!({
-                    "period_days": days,
-                    "count": stats.len(),
-                    "workflow_count": stats.len(),
-                    "workflows": stats,
-                    "note": "Counts all executions in workflow_executions. unique_active_days = distinct calendar days with at least one run. estimated_token_savings = total_invocations × node_count × 50 (rough per-node scaffolding heuristic; not measured per-execution — treat as a relative-magnitude signal, not a calibrated cost number).",
-                }))
-                .unwrap_or_default(),
+                &serde_json::to_string_pretty(&result).unwrap_or_default(),
             )
         }
         Err(e) => {
@@ -7497,7 +7627,46 @@ async fn handle_get_readiness_breakdown(
         expiring_secrets,
     );
 
-    let computed_score = (reliability + documentation + freshness + risk).round() as i32;
+    // ── Is this workflow somebody's child? ────────────────────────────────
+    //
+    // Reliability and freshness are read from `workflow_executions` and from
+    // nothing else, and a sub-workflow run leaves no row there. So for a
+    // parent-dispatched workflow 70 of the 100 points are scored from a table
+    // that is structurally silent about it, and scoring them 0 is a
+    // determinate negative about a state the reader cannot represent. ONE scan,
+    // one candidate — see `talos_analytics_repository::readiness_basis`.
+    let child_scan = readings.record(
+        "score_basis",
+        state
+            .analytics_repo
+            .scan_child_parents_for(user_id, &[wf_id])
+            .await,
+    );
+    if child_scan.is_none() {
+        // The score is still emitted — nulling it breaks every consumer — but
+        // an unread scan means a CHILD would be scored on the full scale, i.e.
+        // as if it had never run, which is the defect this block removes.
+        readings.mark_derived("readiness_score");
+    }
+    let unreadable_parents: Vec<String> = child_scan
+        .as_ref()
+        .map(|s| s.unreadable_parents().to_vec())
+        .unwrap_or_default();
+    let basis = child_scan.as_ref().map_or(
+        talos_analytics_repository::ReadinessBasis::FullScale,
+        |scan| talos_analytics_repository::ReadinessBasis::from_scan(scan, wf_id),
+    );
+    let is_child = basis.is_parent_dispatched();
+    let outcome = talos_analytics_repository::score_readiness(
+        talos_analytics_repository::ReadinessComponents {
+            reliability,
+            documentation,
+            freshness,
+            risk,
+        },
+        basis,
+    );
+    let computed_score = outcome.score;
 
     // ── Build actionable improvement suggestions ───────────────────────────
     let mut improvements: Vec<serde_json::Value> = Vec::new();
@@ -7532,7 +7701,24 @@ async fn handle_get_readiness_breakdown(
     // workflow with 5 runs at 60% was told only to "run it more" and
     // `total_points_available` understated its real gap by 5n(1−s). Both arms
     // now fire, and both derive their points from the score's own formula.
-    if exec_count == 0 {
+    if is_child {
+        // Every advice line below is derived from `exec_count` / `freshness`,
+        // both of which are 0 here BY CONSTRUCTION. "Execute the workflow at
+        // least once to establish reliability baseline" addressed to the
+        // flagship's daily `team_gather` is the same class of wrong-but-
+        // actionable advice as #758's "consider deleting" — specific, and
+        // aimed at a workflow that runs every day. Nothing is pushed; the
+        // components are declared UNMEASURED in `components` below.
+        improvements.push(serde_json::json!({
+            "action": "No reliability or freshness action is available for a parent-dispatched \
+                       workflow. Its runs are invisible to workflow_executions, so neither \
+                       component can be earned — or lost — by anything you do to this workflow.",
+            "points_available": 0,
+            "component": "reliability",
+            "type": "note",
+            "measured": false,
+        }));
+    } else if exec_count == 0 {
         // "Zero runs" and "we could not read the runs" are different facts, and
         // the second one must not be published as the first: telling the owner
         // of a workflow with thousands of executions to "execute it at least
@@ -7587,7 +7773,7 @@ async fn handle_get_readiness_breakdown(
             "component": "reliability",
         }));
     }
-    if exec_count > 0 && success_rate.unwrap_or(0.0) < 0.95 {
+    if !is_child && exec_count > 0 && success_rate.unwrap_or(0.0) < 0.95 {
         let pts = talos_analytics_repository::reliability_gain_from_success_rate(
             success_rate,
             exec_count,
@@ -7601,7 +7787,7 @@ async fn handle_get_readiness_breakdown(
             "component": "reliability",
         }));
     }
-    if freshness == 0.0 {
+    if !is_child && freshness == 0.0 {
         improvements.push(serde_json::json!({"action": "Execute within the last 30 days to restore freshness score", "points_available": 10, "component": "freshness"}));
     }
 
@@ -7665,21 +7851,28 @@ async fn handle_get_readiness_breakdown(
             "score": {
                 "current": computed_score,
                 "stored": computed_score,  // write-back completed above
-                "max_possible": 100,
+                // NOT always 100. A parent-dispatched workflow is scored on
+                // the measurable components only and the DENOMINATOR shrinks
+                // to say so — renormalising 30/30 up to 100 would report a
+                // never-observed workflow as fully production-ready, which is
+                // a worse claim than the zero it replaces.
+                "max_possible": outcome.max_points,
             },
             "components": {
                 "reliability": {
-                    "score": reliability.round() as i32,
-                    "max": 50,
-                    "weight": "50%",
+                    "score": if is_child { serde_json::Value::Null } else { serde_json::json!(reliability.round() as i32) },
+                    "max": if is_child { serde_json::Value::Null } else { serde_json::json!(50) },
+                    "weight": if is_child { "excluded" } else { "50%" },
                     "detail": {
-                        "executions_30d": exec_count,
+                        "executions_30d": if is_child { serde_json::Value::Null } else { serde_json::json!(exec_count) },
                         // MCP-111 (2026-05-08): replace ad-hoc rounding
                         // with the canonical `format_percent` helper used
                         // platform-wide post-MCP-19. The input is a 0-1
                         // fraction, so multiply by 100 first.
-                        "success_rate": success_rate
-                            .map(|r| talos_analytics_repository::format_percent(r * 100.0)),
+                        "success_rate": if is_child { serde_json::Value::Null } else {
+                            serde_json::json!(success_rate
+                                .map(|r| talos_analytics_repository::format_percent(r * 100.0)))
+                        },
                         "saturation_runs": 10,
                     }
                 },
@@ -7695,12 +7888,12 @@ async fn handle_get_readiness_breakdown(
                     }
                 },
                 "freshness": {
-                    "score": freshness.round() as i32,
-                    "max": 20,
-                    "weight": "20%",
+                    "score": if is_child { serde_json::Value::Null } else { serde_json::json!(freshness.round() as i32) },
+                    "max": if is_child { serde_json::Value::Null } else { serde_json::json!(20) },
+                    "weight": if is_child { "excluded" } else { "20%" },
                     "detail": {
-                        "last_executed": last_exec_at.map(|t| t.to_rfc3339()),
-                        "days_since_last_execution": days_since_last,
+                        "last_executed": if is_child { serde_json::Value::Null } else { serde_json::json!(last_exec_at.map(|t| t.to_rfc3339())) },
+                        "days_since_last_execution": if is_child { serde_json::Value::Null } else { serde_json::json!(days_since_last) },
                     }
                 },
                 "risk": {
@@ -7718,6 +7911,29 @@ async fn handle_get_readiness_breakdown(
             "improvements": improvements,
             "total_points_available": total_points_available,
     });
+    // #762. NOTHING TO SAY ⇒ NO KEY: a full-scale workflow whose parent graphs
+    // all read is byte-identical to the pre-#762 response (`max_possible` above
+    // is still the literal 100 for it). An "all clear" block on every response
+    // would change the shape fleet-wide to report the ABSENCE of a condition —
+    // the rule `__degraded_inputs__` and `Readings::attach` already follow.
+    if is_child {
+        result["score"]["basis"] = serde_json::json!(outcome.basis.as_str());
+        result["score"]["comparable_to_fleet"] = serde_json::json!(false);
+        result["score"]["unmeasured_components"] = serde_json::json!(outcome.unmeasured);
+        result["score"]["runs_as_child_of"] = serde_json::json!(outcome.basis.parents());
+        result["score"]["basis_note"] = serde_json::json!(outcome.note());
+        for component in talos_analytics_repository::readiness_basis::EXECUTION_DERIVED_COMPONENTS {
+            result["components"][*component]["measured"] = serde_json::json!(false);
+            result["components"][*component]["unmeasured_reason"] =
+                serde_json::json!(talos_analytics_repository::CHILD_UNMEASURED_REASON);
+        }
+    }
+    if !unreadable_parents.is_empty() {
+        // A parent whose graph could not be READ names nobody, so a workflow it
+        // dispatches into is scored on the full scale — i.e. as if it never
+        // ran. That incompleteness travels by NAME rather than silently.
+        result["score"]["unreadable_parent_graphs"] = serde_json::json!(unreadable_parents);
+    }
     readings.attach(&mut result);
 
     mcp_text(
@@ -7751,16 +7967,76 @@ async fn handle_get_readiness_breakdown(
 ///    worst-50 mean, and emitting that under the name `avg_score` is the exact
 ///    defect this function exists to remove. A null is a missing answer; a
 ///    biased sample under a population name is a wrong one.
+/// What the child exclusion did to `below_50_count`, so the count and the list
+/// can disagree out loud instead of silently.
+///
+/// #758/#760's rule, restated for a COUNT rather than a delete: the row stays
+/// listed with its parents named; the aggregate excludes it and says so.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ChildScoreExclusion {
+    /// Names of the parent-dispatched workflows removed from the count.
+    pub excluded: Vec<String>,
+    /// False when the page the exclusion was computed over may not hold every
+    /// child in the population — see
+    /// [`talos_analytics_repository::child_exclusion_is_complete`].
+    pub complete: bool,
+    /// False when the child scan itself could not be read, in which case NO
+    /// exclusion was applied and the count is the pre-fix number.
+    pub measured: bool,
+    /// Parents whose graph could not be read at all. A workflow one of them
+    /// dispatches into is scored — and counted — on the full scale.
+    pub unreadable_parents: Vec<String>,
+}
+
 pub(crate) fn readiness_summary_json(
     population: Option<&talos_analytics_repository::ReadinessPopulation>,
+    exclusion: &ChildScoreExclusion,
 ) -> serde_json::Value {
     match population {
-        Some(p) => serde_json::json!({
-            "avg_score": p.avg_score.map(|a| (a * 10.0).round() / 10.0),
-            "below_50_count": p.below_50,
-            "unscored_count": p.unscored,
-            "population": "all workflows matching the request filters, uncapped",
-        }),
+        Some(p) => {
+            // Subtracting is safe because `excluded` is built from rows that
+            // were themselves counted: a page row is in the population by
+            // construction, and only rows already below 50 are added to it.
+            let below_50 = (p.below_50 - exclusion.excluded.len() as i64).max(0);
+            serde_json::json!({
+                // Deliberately NOT adjusted. `avg_score` is a SQL mean over the
+                // whole population and the page cannot correct it; a mean that
+                // silently mixes /100 and /30 scores is a real defect, and it
+                // is disclosed in `population` below rather than half-fixed.
+                "avg_score": p.avg_score.map(|a| (a * 10.0).round() / 10.0),
+                "below_50_count": below_50,
+                "below_50_count_raw": p.below_50,
+                "unscored_count": p.unscored,
+                "child_workflow_exclusion": {
+                    "excluded_from_below_50": exclusion.excluded,
+                    "excluded_count": exclusion.excluded.len(),
+                    "measured": exclusion.measured,
+                    "complete": exclusion.complete,
+                    "unreadable_parent_graphs": exclusion.unreadable_parents,
+                    "why": talos_analytics_repository::CHILD_UNMEASURED_REASON,
+                },
+                "population": format!(
+                    "all workflows matching the request filters, uncapped. \
+                     below_50_count EXCLUDES {} parent-dispatched workflow(s) — they are scored \
+                     out of {} measurable points, so they are below 50 by construction and \
+                     counting them would report the platform's most-used sub-workflows as its \
+                     least ready. They remain LISTED below, annotated. \
+                     below_50_count_raw is the unexcluded figure. \
+                     avg_score is NOT adjusted: it is a population-wide SQL mean and mixes the \
+                     two denominators.{}{}",
+                    exclusion.excluded.len(),
+                    talos_analytics_repository::CHILD_MEASURABLE_MAX,
+                    if exclusion.measured { "" } else {
+                        " The child scan FAILED, so no exclusion was applied and this count is \
+                          the unexcluded one."
+                    },
+                    if exclusion.complete { "" } else {
+                        " The exclusion was computed over the returned page, which was capped \
+                          among rows a child could be hiding in, so it may be PARTIAL."
+                    },
+                ),
+            })
+        }
         None => serde_json::json!({
             "avg_score": serde_json::Value::Null,
             "below_50_count": serde_json::Value::Null,
@@ -7864,11 +8140,69 @@ async fn handle_get_all_readiness_scores(
             .await,
     );
 
+    // ONE scan for the whole page — never one per row. Scoped to the page's
+    // ids, which is what keeps the `LIKE` prefilter meaningful; an uncapped
+    // "read every enabled workflow's graph" is the unbounded payload
+    // `talos_child_workflow_refs` documents as the thing it refuses to do.
+    //
+    // The page is `ORDER BY COALESCE(readiness_score, 0) ASC LIMIT 50` and a
+    // freshly-scored child is at most 30 points, so a page reaching past 30 has
+    // already swallowed every child in the population — which is what makes a
+    // page-scoped exclusion of a POPULATION-wide count defensible. That
+    // condition is checked, not assumed:
+    // `talos_analytics_repository::child_exclusion_is_complete`.
+    let page_ids: Vec<uuid::Uuid> = rows.iter().map(|r| r.id).collect();
+    let child_scan = readings.record(
+        "summary.child_workflow_exclusion",
+        state
+            .analytics_repo
+            .scan_child_parents_for(user_id, &page_ids)
+            .await,
+    );
+    let mut exclusion = ChildScoreExclusion {
+        measured: child_scan.is_some(),
+        complete: true,
+        unreadable_parents: child_scan
+            .as_ref()
+            .map(|s| s.unreadable_parents().to_vec())
+            .unwrap_or_default(),
+        excluded: Vec::new(),
+    };
+    if let Some(scan) = child_scan.as_ref() {
+        let page_scores: Vec<i32> = rows
+            .iter()
+            .map(|r| r.readiness_score.unwrap_or(0))
+            .collect();
+        exclusion.complete = talos_analytics_repository::child_exclusion_is_complete(
+            &page_scores,
+            rows.len(),
+            talos_analytics_repository::READINESS_PAGE_LIMIT,
+        );
+        for r in &rows {
+            if !scan.parents_of(r.id).is_empty() && r.readiness_score.unwrap_or(0) < 50 {
+                exclusion.excluded.push(r.name.clone());
+            }
+        }
+    }
+
     let workflows: Vec<serde_json::Value> = rows
         .iter()
         .map(|r| {
             let raw_score = r.readiness_score;
             let score = raw_score.unwrap_or(0);
+            // The row's own basis. `parents_of` is the REPORT accessor: a
+            // parent whose graph could not be read names nobody here, and the
+            // names it could not read are surfaced in the summary instead.
+            let basis = child_scan.as_ref().map_or(
+                talos_analytics_repository::ReadinessBasis::FullScale,
+                |scan| talos_analytics_repository::ReadinessBasis::from_scan(scan, r.id),
+            );
+            let is_child = basis.is_parent_dispatched();
+            let max_points = if is_child {
+                talos_analytics_repository::CHILD_MEASURABLE_MAX
+            } else {
+                talos_analytics_repository::FULL_MAX
+            };
 
             // Single authoritative "has been scored" indicator, over BOTH
             // timestamp columns — shared by the per-row state label AND the
@@ -7890,6 +8224,15 @@ async fn handle_get_all_readiness_scores(
                 "workflow_id": r.id.to_string(),
                 "name": r.name,
                 "readiness_score": score,
+                // NOT always 100 — a parent-dispatched workflow is scored on
+                // the measurable components only, and the denominator is the
+                // only thing in this row that says the two numbers are not on
+                // one scale. Emitted on EVERY row (unlike the child-only block
+                // below) because this list's whole purpose is ranking rows
+                // against each other, and a denominator present on some rows
+                // and absent on others is read as "the others are out of 100"
+                // by exactly the caller who needs to be told otherwise.
+                "max_possible": max_points,
                 "score_state": state.label,
                 "has_description": r.has_description,
                 "has_capabilities": r.has_capabilities,
@@ -7904,9 +8247,23 @@ async fn handle_get_all_readiness_scores(
                 "breakdown_scored_at": r.readiness_scored_at.map(|t| t.to_rfc3339()),
                 "background_computed_at": r.readiness_computed_at.map(|t| t.to_rfc3339()),
             });
-            entry["note"] = match state.scored_by {
-                None => serde_json::json!("Never scored. Call get_readiness_breakdown to compute a score."),
-                Some(by) => serde_json::json!(by.note()),
+            let scorer_note = match state.scored_by {
+                None => "Never scored. Call get_readiness_breakdown to compute a score.".to_string(),
+                Some(by) => by.note().to_string(),
+            };
+            if is_child {
+                entry["score_basis"] = serde_json::json!(basis.as_str());
+                entry["comparable_to_fleet"] = serde_json::json!(false);
+                entry["runs_as_child_of"] = serde_json::json!(basis.parents());
+            }
+            entry["note"] = if is_child {
+                serde_json::json!(format!(
+                    "{scorer_note} Scored {score}/{max_points} — dispatched by {}. {}",
+                    basis.parents().join(", "),
+                    talos_analytics_repository::CHILD_UNMEASURED_REASON
+                ))
+            } else {
+                serde_json::json!(scorer_note)
             };
             entry
         })
@@ -7958,7 +8315,7 @@ async fn handle_get_all_readiness_scores(
         ),
     };
 
-    let summary = readiness_summary_json(population.as_ref());
+    let summary = readiness_summary_json(population.as_ref(), &exclusion);
 
     let mut result = serde_json::json!({
         "total": population.map_or(page_len, |p| p.total),
@@ -8508,8 +8865,19 @@ mod readiness_population_pins {
     //! LOWEST scorers. Accumulating a mean over it and calling it `avg_score` is
     //! not a truncation (which a `truncated: true` flag would answer); it is an
     //! inverted statistic. Pinned rather than disclosed for that reason.
-    use super::readiness_summary_json;
+    use super::{readiness_summary_json, ChildScoreExclusion};
     use talos_analytics_repository::ReadinessPopulation;
+
+    /// The scan ran and found no child — the common case, and the one the
+    /// pre-#762 assertions below were written against.
+    fn no_children() -> ChildScoreExclusion {
+        ChildScoreExclusion {
+            excluded: Vec::new(),
+            complete: true,
+            measured: true,
+            unreadable_parents: Vec::new(),
+        }
+    }
 
     fn pop(total: i64, avg: Option<f64>, below: i64, unscored: i64) -> ReadinessPopulation {
         ReadinessPopulation {
@@ -8524,7 +8892,7 @@ mod readiness_population_pins {
     fn summary_reports_population_figures_not_page_figures() {
         // The live reference deployment: 22 non-archived workflows, true mean
         // 75.59. The pre-fix handler emitted 75 (integer division).
-        let v = readiness_summary_json(Some(&pop(22, Some(75.59), 3, 21)));
+        let v = readiness_summary_json(Some(&pop(22, Some(75.59), 3, 21)), &no_children());
         assert_eq!(v["avg_score"], serde_json::json!(75.6));
         assert_eq!(v["below_50_count"], serde_json::json!(3));
         assert_eq!(v["unscored_count"], serde_json::json!(21));
@@ -8536,7 +8904,7 @@ mod readiness_population_pins {
         // This is the whole point. A fallback to page-derived figures would be
         // silently WRONG (a worst-50 mean under a fleet-average name); a null is
         // merely absent. If someone "helpfully" restores a fallback, this fails.
-        let v = readiness_summary_json(None);
+        let v = readiness_summary_json(None, &no_children());
         assert_eq!(v["avg_score"], serde_json::Value::Null);
         assert_eq!(v["below_50_count"], serde_json::Value::Null);
         assert_eq!(v["unscored_count"], serde_json::Value::Null);
@@ -8551,9 +8919,97 @@ mod readiness_population_pins {
         // AVG() over zero rows is SQL NULL. Rendering that as 0 would report an
         // empty account as "every workflow scores zero" — the same
         // absent-is-not-zero rule the alerting layer learned in #625.
-        let v = readiness_summary_json(Some(&pop(0, None, 0, 0)));
+        let v = readiness_summary_json(Some(&pop(0, None, 0, 0)), &no_children());
         assert_eq!(v["avg_score"], serde_json::Value::Null);
         assert_eq!(v["below_50_count"], serde_json::json!(0));
+    }
+
+    /// #762. A parent-dispatched workflow is below 50 BY CONSTRUCTION — it is
+    /// scored out of 30 — so counting it reports the platform's most-used
+    /// sub-workflows as its least ready. The row stays LISTED; the count
+    /// excludes it and says so. Both numbers are emitted, because an operator
+    /// who wants the raw figure must not have to recompute it.
+    #[test]
+    fn a_child_is_excluded_from_below_50_and_the_exclusion_is_disclosed() {
+        let exclusion = ChildScoreExclusion {
+            excluded: vec!["cos-team-recall".into(), "pa-ask".into()],
+            complete: true,
+            measured: true,
+            unreadable_parents: Vec::new(),
+        };
+        let v = readiness_summary_json(Some(&pop(28, Some(60.0), 5, 0)), &exclusion);
+        assert_eq!(v["below_50_count"], serde_json::json!(3), "5 − 2 children");
+        assert_eq!(v["below_50_count_raw"], serde_json::json!(5));
+        let names = &v["child_workflow_exclusion"]["excluded_from_below_50"];
+        assert_eq!(names, &serde_json::json!(["cos-team-recall", "pa-ask"]));
+        let prose = v["population"].as_str().unwrap();
+        assert!(prose.contains("EXCLUDES 2"), "{prose}");
+        assert!(
+            prose.contains("remain LISTED"),
+            "the count and the list disagree, and the prose must say why: {prose}"
+        );
+    }
+
+    /// A FAILED scan must not silently look like "no children found". The two
+    /// render identically in `excluded_from_below_50` (both empty), so
+    /// `measured` and the prose are the only things that separate them.
+    #[test]
+    fn an_unread_scan_says_no_exclusion_was_applied() {
+        let exclusion = ChildScoreExclusion {
+            excluded: Vec::new(),
+            complete: true,
+            measured: false,
+            unreadable_parents: Vec::new(),
+        };
+        let v = readiness_summary_json(Some(&pop(28, Some(60.0), 5, 0)), &exclusion);
+        assert_eq!(v["below_50_count"], serde_json::json!(5));
+        assert_eq!(
+            v["child_workflow_exclusion"]["measured"],
+            serde_json::json!(false)
+        );
+        assert!(v["population"].as_str().unwrap().contains("scan FAILED"));
+    }
+
+    /// A page capped among rows a child could hide in makes the exclusion
+    /// PARTIAL, and the summary must say so rather than present a partial
+    /// exclusion as a complete one.
+    #[test]
+    fn a_partial_exclusion_is_labelled_partial() {
+        let exclusion = ChildScoreExclusion {
+            excluded: vec!["pa-ask".into()],
+            complete: false,
+            measured: true,
+            unreadable_parents: vec!["enormous-parent".into()],
+        };
+        let v = readiness_summary_json(Some(&pop(400, Some(20.0), 300, 0)), &exclusion);
+        assert_eq!(
+            v["child_workflow_exclusion"]["complete"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            v["child_workflow_exclusion"]["unreadable_parent_graphs"],
+            serde_json::json!(["enormous-parent"])
+        );
+        assert!(v["population"].as_str().unwrap().contains("PARTIAL"));
+    }
+
+    /// `avg_score` is deliberately NOT adjusted, and the summary must say that
+    /// too — a mean that silently mixes /100 and /30 scores is a real defect,
+    /// and half-fixing it in Rust over a SQL population would be a worse one.
+    #[test]
+    fn the_mean_is_not_silently_adjusted() {
+        let exclusion = ChildScoreExclusion {
+            excluded: vec!["pa-ask".into()],
+            complete: true,
+            measured: true,
+            unreadable_parents: Vec::new(),
+        };
+        let v = readiness_summary_json(Some(&pop(28, Some(60.0), 5, 0)), &exclusion);
+        assert_eq!(v["avg_score"], serde_json::json!(60.0));
+        assert!(v["population"]
+            .as_str()
+            .unwrap()
+            .contains("avg_score is NOT adjusted"));
     }
 }
 

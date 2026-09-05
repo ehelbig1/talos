@@ -184,6 +184,18 @@ pub struct PrevScheduledRow {
     pub exec_count: i64,
 }
 
+/// How many candidates `get_frequently_executed_unscheduled` reads before the
+/// child-reference exclusion runs.
+///
+/// Wider than [`FREQUENTLY_EXECUTED_RESULT_LIMIT`] on purpose: the exclusion
+/// happens in Rust, so filtering a page of exactly ten would hand the operator
+/// a short list every time a child was removed from it — an exclusion that
+/// silently costs coverage.
+pub const FREQUENTLY_EXECUTED_SCAN_LIMIT: i64 = 30;
+
+/// How many suggestions `get_frequently_executed_unscheduled` returns.
+pub const FREQUENTLY_EXECUTED_RESULT_LIMIT: usize = 10;
+
 #[derive(Debug)]
 pub struct NextScheduledRunRow {
     pub cron_expression: String,
@@ -2202,28 +2214,53 @@ impl AdvancedRepository {
     ///    utilities with the `interactive` tag (via `tag_workflow`) to
     ///    suppress this signal permanently.
     ///
-    /// **r243 fixed two bugs introduced in r242:**
-    /// - The JSONB path I used (`node.kind == 'sub_workflow'`,
-    ///   `node.data.sub_workflow_id`) was wrong — actual graph_json schema is
-    ///   `node.module_id == 'system:sub_workflow'` and
-    ///   `node.config.sub_workflow_id`. The lesson: verify the actual JSON
-    ///   shape via `get_workflow` before writing JSONB queries against it.
-    /// - `jsonb_array_elements(other.graph_json -> 'nodes')` errors when ANY
-    ///   row's `graph_json -> 'nodes'` isn't a JSONB array (legacy/archived
-    ///   rows can have wrong shapes). The error fails the entire query, and
-    ///   the caller's `.unwrap_or_default()` swallowed it — the field looked
-    ///   "clean" while actually being broken. Fixed by guarding with
-    ///   `jsonb_typeof(...) = 'array'` AND surfacing the swallow at the
-    ///   caller via tracing::warn! so future query regressions are visible.
+    /// **The sub-workflow exclusion was DEAD for two years, and its own comment
+    /// recorded the wrong lesson twice (#762).** r242 wrote the predicate as
+    /// `node.kind == 'sub_workflow'` / `node.data.sub_workflow_id`; r243
+    /// "corrected" it to `node.module_id == 'system:sub_workflow'` /
+    /// `node.config.sub_workflow_id` and wrote down *"the lesson: verify the
+    /// actual JSON shape via `get_workflow` before writing JSONB queries
+    /// against it"* — having done exactly that and landed on a second shape the
+    /// engine also does not write. r244 then fixed a real `::jsonb` cast bug on
+    /// top, which made the query RUN, which is why nothing looked broken.
+    ///
+    /// **Measured on the live fleet 2026-09-05**, both predicates run as SQL
+    /// against the real `graph_json` column:
+    ///
+    /// | predicate | matching nodes |
+    /// |---|---|
+    /// | r243's `module_id` + `config.sub_workflow_id` | **0** |
+    /// | the engine's `type` + `data.*_workflow_id` | **6**, across 5 parents naming 4 children |
+    ///
+    /// So the filter r242 added to cut a false-positive rate had never excluded
+    /// anything. r243's lesson was right in form and wrong in substance: reading
+    /// ONE workflow's JSON tells you one node kind's shape, and the engine names
+    /// a child through EIGHT distinct `data` keys across eight node kinds, one
+    /// of which (`llm_dispatch`'s `routes`) is keyed by arbitrary class labels
+    /// that no key-name rule can see at all. **The real lesson is that a
+    /// hand-written predicate over `graph_json` is a second implementation of a
+    /// question the engine already answers** — so the exclusion now runs through
+    /// `talos_child_workflow_refs`, the ONE child-reference scan, which parses
+    /// the graph with `talos_workflow_engine_core`'s own key set rather than
+    /// restating it in SQL. `child_reference_shape_matches_the_engine_parser`
+    /// pins it against that parser, not against a string.
+    ///
+    /// The exclusion runs in Rust AFTER a widened SQL page
+    /// ([`FREQUENTLY_EXECUTED_SCAN_LIMIT`]) so removing a child does not
+    /// under-fill the operator's list of ten; the scan is ONE query over that
+    /// page, not one per row.
+    ///
+    /// Note this exclusion is **vacuous on the reference fleet today** and is
+    /// stated as such rather than sold as a fix: `HAVING COUNT(we.id) >= 3`
+    /// already excludes every pure child, since a child has no execution rows at
+    /// all. It bites only a HYBRID — a workflow both dispatched as a child and
+    /// triggered directly ≥3 times — of which there are currently zero.
     ///
     /// **r244 fixed a third bug**: `workflows.graph_json` is stored as TEXT
     /// (per `migrations/001_initial_schema.sql:5`), not JSONB. Applying any
-    /// JSONB operator (`->`, `#>>`, `jsonb_typeof`, `jsonb_array_elements`)
-    /// directly on the TEXT column errors with "function ... does not exist".
-    /// Even with the r243 tracing::warn surface, I missed this one because
-    /// the same column on `workflow_versions` IS JSONB, and other code paths
-    /// that read `workflows.graph_json` always cast explicitly. r244 adds
-    /// the missing `::jsonb` cast at every JSONB op site below.
+    /// JSONB operator directly on the TEXT column errors with
+    /// "function ... does not exist". That whole class is gone with the JSONB
+    /// predicate it applied to.
     pub async fn get_frequently_executed_unscheduled(
         &self,
         user_id: Uuid,
@@ -2240,28 +2277,18 @@ impl AdvancedRepository {
                    WHERE ws.workflow_id = w.id AND ws.is_enabled = true \
                ) \
                AND NOT (w.tags && ARRAY['interactive']::text[]) \
-               AND NOT EXISTS ( \
-                   SELECT 1 FROM workflows other \
-                   WHERE other.user_id = $1 \
-                     AND other.id != w.id \
-                     AND jsonb_typeof(other.graph_json::jsonb -> 'nodes') = 'array' \
-                     AND EXISTS ( \
-                         SELECT 1 \
-                         FROM jsonb_array_elements(other.graph_json::jsonb -> 'nodes') node \
-                         WHERE node ->> 'module_id' = 'system:sub_workflow' \
-                           AND node #>> '{config,sub_workflow_id}' = w.id::text \
-                     ) \
-               ) \
              GROUP BY w.id, w.name \
              HAVING COUNT(we.id) >= 3 \
-             ORDER BY exec_count DESC LIMIT 10",
+             ORDER BY exec_count DESC, w.id LIMIT $2",
         )
         .bind(user_id)
+        .bind(FREQUENTLY_EXECUTED_SCAN_LIMIT)
         .fetch_all(&self.db_pool)
         .await
         .context("get_frequently_executed_unscheduled")?;
 
-        rows.into_iter()
+        let candidates: Vec<PrevScheduledRow> = rows
+            .into_iter()
             .map(|r| -> Result<PrevScheduledRow> {
                 Ok(PrevScheduledRow {
                     id: r.try_get::<Option<Uuid>, _>("id")?.unwrap_or(Uuid::nil()),
@@ -2269,7 +2296,30 @@ impl AdvancedRepository {
                     exec_count: r.try_get::<Option<i64>, _>("exec_count")?.unwrap_or(0),
                 })
             })
-            .collect::<Result<Vec<_>>>()
+            .collect::<Result<Vec<_>>>()?;
+
+        // ONE scan over the whole page — the exclusion the dead SQL predicate
+        // was trying to express, run through the shared implementation.
+        // Propagated, never defaulted: an empty scan reads as "nobody is
+        // anybody's child", which is precisely the pre-#762 behaviour, and this
+        // method's caller already swallows its `Err` into an empty list with a
+        // warning, so a failure costs the operator a MISSING signal rather than
+        // a wrong one.
+        let ids: Vec<Uuid> = candidates.iter().map(|c| c.id).collect();
+        let scan = talos_child_workflow_refs::scan_child_parents(&self.db_pool, user_id, &ids)
+            .await
+            .context("get_frequently_executed_unscheduled: child-reference scan")?;
+
+        Ok(candidates
+            .into_iter()
+            // `parents_of`, not `protection_for`: this is a REPORT signal
+            // ("consider scheduling this"), and holding back a suggestion on
+            // the strength of a parent nobody could read would suppress advice
+            // rather than a destructive act. An unreadable parent therefore
+            // leaves the suggestion in place — the loud direction here.
+            .filter(|c| scan.parents_of(c.id).is_empty())
+            .take(FREQUENTLY_EXECUTED_RESULT_LIMIT)
+            .collect())
     }
 
     // ── Approval gates ────────────────────────────────────────────────────────
@@ -3653,6 +3703,100 @@ mod retention_report_tests {
         assert!(
             !out.contains("_failed"),
             "a clean pass must not report a failure: {out:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod child_reference_shape_tests {
+    //! The sub-workflow exclusion in `get_frequently_executed_unscheduled` must
+    //! recognise the shape the ENGINE writes, pinned against the engine's own
+    //! parser rather than against a string.
+    //!
+    //! r242 and r243 each hand-wrote a JSONB predicate for this and each got a
+    //! different wrong answer; r243 recorded *"verify the actual JSON shape"* as
+    //! the lesson while landing on a second shape the engine does not write.
+    //! Measured live 2026-09-05: r243's predicate matched **0** nodes on the
+    //! fleet, the engine's shape matched **6**. So a test asserting a string is
+    //! the very thing that failed twice — these drive
+    //! `ChildReferenceScan::build`, which parses through
+    //! `talos_workflow_engine_core::child_workflow_ids_checked`, the same
+    //! function the engine's dispatcher agrees with by construction.
+
+    use talos_child_workflow_refs::{ChildReferenceScan, ParentGraphRow};
+    use uuid::Uuid;
+
+    fn parent(graph: &str) -> ParentGraphRow {
+        ParentGraphRow {
+            id: Uuid::new_v4(),
+            name: "parent".into(),
+            graph_json: Some(graph.to_string()),
+        }
+    }
+
+    /// The shape the engine ACTUALLY writes: `type` on the node, the child id
+    /// under `data`. Six nodes of this shape exist on the reference fleet.
+    #[test]
+    fn the_engine_node_shape_is_recognised() {
+        let child = Uuid::new_v4();
+        let graph = format!(
+            r#"{{"nodes":[{{"id":"n","type":"system:sub_workflow","data":{{"sub_workflow_id":"{child}"}}}}],"edges":[]}}"#
+        );
+        let scan = ChildReferenceScan::build(&[parent(&graph)], &[child]);
+        assert_eq!(
+            scan.parents_of(child),
+            ["parent".to_string()],
+            "the exclusion must see the node kind the engine dispatches on"
+        );
+    }
+
+    /// The DEAD predicate's shape — `module_id` on the node, the child id under
+    /// `config` — is recognised by NOTHING, because the engine never writes it.
+    /// This is the positive control the assertion above cannot supply on its
+    /// own: without it, a scan that matched everything would also pass.
+    #[test]
+    fn the_dead_predicate_shape_is_not_the_engine_shape() {
+        let child = Uuid::new_v4();
+        let graph = format!(
+            r#"{{"nodes":[{{"id":"n","module_id":"system:sub_workflow","config":{{"sub_workflow_id":"{child}"}}}}],"edges":[]}}"#
+        );
+        let scan = ChildReferenceScan::build(&[parent(&graph)], &[child]);
+        assert!(
+            scan.parents_of(child).is_empty(),
+            "r243's shape names a child through `config`, which the engine's parser \
+             does not read — this is why the SQL exclusion matched 0 nodes for two years"
+        );
+    }
+
+    /// `llm_dispatch`'s route targets are object VALUES under arbitrary class
+    /// labels. No key-name predicate — in SQL or otherwise — can see them, which
+    /// is the structural reason this exclusion cannot be hand-written.
+    #[test]
+    fn a_route_target_no_key_rule_could_see_is_recognised() {
+        let child = Uuid::new_v4();
+        let graph = format!(
+            r#"{{"nodes":[{{"id":"n","type":"system:llm_dispatch","data":{{"routes":{{"billing":"{child}"}}}}}}],"edges":[]}}"#
+        );
+        let scan = ChildReferenceScan::build(&[parent(&graph)], &[child]);
+        assert_eq!(scan.parents_of(child), ["parent".to_string()]);
+    }
+
+    /// A graph that does not parse is UNKNOWN, and this REPORT path leaves the
+    /// suggestion in place rather than suppressing it — the loud direction for
+    /// advice, and the opposite of what a destructive path does with the same
+    /// scan (`protection_for`). Pinned so the two are not "simplified" into one.
+    #[test]
+    fn an_unreadable_parent_does_not_suppress_the_suggestion() {
+        let child = Uuid::new_v4();
+        let broken = format!(r#"{{"nodes": [ "{child}" "#);
+        let scan = ChildReferenceScan::build(&[parent(&broken)], &[child]);
+        assert!(
+            scan.parents_of(child).is_empty(),
+            "the report accessor asserts no reference from a graph it could not read"
+        );
+        assert!(
+            scan.protection_for(child).is_some(),
+            "…while the DECISION accessor still holds it back — the two must not converge"
         );
     }
 }

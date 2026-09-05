@@ -4010,6 +4010,15 @@ pub(crate) struct ReadinessReads<E> {
     pub last_exec_at: Result<Option<chrono::DateTime<chrono::Utc>>, E>,
     pub expiring_secrets: Result<i64, E>,
     pub wf_meta: Result<Option<talos_analytics_repository::WorkflowFullRow>, E>,
+    /// Who dispatches into this workflow — the FIFTH readiness input, and the
+    /// one that decides which SCALE the other four are scored on. A child's
+    /// reliability and freshness are read from `workflow_executions` and a
+    /// sub-workflow run leaves no row there, so scoring them 0 out of 100 is a
+    /// determinate negative about a state the reader cannot represent. A
+    /// FAILED scan degrades exactly like the other four: the workflow is
+    /// scored full-scale (the pre-#762 behaviour) and the failure is
+    /// disclosed, never silently absorbed.
+    pub child_scan: Result<talos_analytics_repository::ChildReferenceScan, E>,
     pub now: chrono::DateTime<chrono::Utc>,
 }
 
@@ -4164,6 +4173,7 @@ pub(crate) fn render_validate_workflow<E: std::fmt::Display>(
         last_exec_at: last_exec_res,
         expiring_secrets: expiring_res,
         wf_meta: wf_meta_res,
+        child_scan: child_scan_res,
         now,
     } = reads;
 
@@ -4216,6 +4226,32 @@ pub(crate) fn render_validate_workflow<E: std::fmt::Display>(
         degraded_inputs.push("workflow_metadata");
         None
     });
+    // The FIFTH input: which SCALE this workflow is scored on. A failed scan
+    // falls back to full-scale — the pre-#762 answer — because `parents_of` is
+    // the REPORT accessor and asserting child-ness from a read we did not get
+    // would be fabrication in the other direction. The failure is disclosed,
+    // so a `readiness_score` of 19 sitting beside
+    // `readiness_unreadable_inputs: ["child_reference_scan"]` is legible as
+    // "this may be a child scored as a top-level workflow".
+    let child_scan = child_scan_res
+        .map_err(|e| {
+            tracing::error!(
+                target: "talos_mcp",
+                %wf_id, error = %e, event_kind = "readiness_input_read_failed",
+                "readiness: child-reference scan unreadable — scoring on the full scale, \
+                 i.e. as if nothing dispatches into this workflow"
+            );
+            degraded_inputs.push("child_reference_scan");
+        })
+        .ok();
+    let basis = child_scan.as_ref().map_or(
+        talos_analytics_repository::ReadinessBasis::FullScale,
+        |scan| talos_analytics_repository::ReadinessBasis::from_scan(scan, wf_id),
+    );
+    let unreadable_parents: Vec<String> = child_scan
+        .as_ref()
+        .map(|s| s.unreadable_parents().to_vec())
+        .unwrap_or_default();
 
     // Documentation (20 pts): has_desc=10, has_node_desc=5, has_caps=5
     let has_desc = wf_meta
@@ -4260,7 +4296,17 @@ pub(crate) fn render_validate_workflow<E: std::fmt::Display>(
         expiring_secrets,
     );
 
-    let base_score = (reliability + documentation + freshness + risk).round() as i32;
+    let outcome = talos_analytics_repository::score_readiness(
+        talos_analytics_repository::ReadinessComponents {
+            reliability,
+            documentation,
+            freshness,
+            risk,
+        },
+        basis,
+    );
+    let base_score = outcome.score;
+    let max_points = outcome.max_points;
 
     // Hard penalties for structural/config validation failures (a broken workflow
     // cannot be "ready" regardless of quality factors).
@@ -4284,7 +4330,10 @@ pub(crate) fn render_validate_workflow<E: std::fmt::Display>(
     let penalty = (structural_issues.len() as i32 * 40)
         + (config_issues.len() as i32 * 20)
         + (vault_issues.len() as i32 * 20);
-    let readiness_score = (base_score - penalty).clamp(0, 100);
+    // Clamped to the BASIS's ceiling, not a hardcoded 100 — a child is scored
+    // out of 30, and a score allowed to exceed its own denominator would be a
+    // fresh way of saying the same untrue thing.
+    let readiness_score = (base_score - penalty).clamp(0, max_points);
 
     // ── Top improvements — ranked by points_available, top 2 surfaced ────────
     // Uses the same categories as get_readiness_breakdown so the score and the
@@ -4497,6 +4546,27 @@ pub(crate) fn render_validate_workflow<E: std::fmt::Display>(
              This is not evidence that the workflow lacks them."
         );
     }
+    // #762. NOTHING TO SAY ⇒ NO KEY. A full-scale workflow with every parent
+    // graph readable is byte-identical to the pre-#762 response — the same rule
+    // `__degraded_inputs__` and `Readings::attach` follow, and the reason the
+    // healthy shape is pinned by a test: an "all clear" block would change
+    // every response on the fleet to report the absence of a condition.
+    if outcome.basis.is_parent_dispatched() {
+        // The DENOMINATOR, which is 30 here and not 100. A caller comparing
+        // this number to another workflow's must be able to see they are on
+        // different scales; `get_readiness_breakdown` renders the same pair.
+        result["readiness_max_points"] = serde_json::json!(max_points);
+        result["readiness_score_basis"] = serde_json::json!(outcome.basis.as_str());
+        result["readiness_comparable_to_fleet"] = serde_json::json!(false);
+        result["readiness_unmeasured_components"] = serde_json::json!(outcome.unmeasured);
+        result["runs_as_child_of"] = serde_json::json!(outcome.basis.parents());
+        result["readiness_basis_note"] = serde_json::json!(outcome.note());
+    }
+    if !unreadable_parents.is_empty() {
+        // A parent whose graph could not be read names nobody, so a workflow it
+        // dispatches into is scored on the FULL scale — i.e. as if it never ran.
+        result["readiness_unreadable_parent_graphs"] = serde_json::json!(unreadable_parents);
+    }
     if !degraded_inputs.is_empty() {
         result["readiness_score_degraded"] = serde_json::json!(true);
         result["readiness_unreadable_inputs"] = serde_json::json!(degraded_inputs);
@@ -4557,11 +4627,17 @@ async fn handle_validate_workflow(
     // ONLY when the workflow was deleted between the validation service's read
     // and this one, and one decision site for "refuse vs disclose" is worth
     // more than saving four reads on a race.
-    let (exec_data, last_exec_at, expiring_secrets, wf_meta) = tokio::join!(
+    let candidates = [wf_id];
+    let (exec_data, last_exec_at, expiring_secrets, wf_meta, child_scan) = tokio::join!(
         state.analytics_repo.get_readiness_exec_data(wf_id),
         state.analytics_repo.get_max_execution_started_at(wf_id),
         state.analytics_repo.count_expiring_secrets(user_id),
         state.analytics_repo.get_workflow_full(wf_id, user_id),
+        // ONE scan, one candidate. Decides whether the reliability and
+        // freshness components mean anything at all for this workflow.
+        state
+            .analytics_repo
+            .scan_child_parents_for(user_id, &candidates),
     );
 
     match render_validate_workflow(
@@ -4573,6 +4649,7 @@ async fn handle_validate_workflow(
             last_exec_at,
             expiring_secrets,
             wf_meta,
+            child_scan: child_scan.map_err(anyhow::Error::from),
             now: chrono::Utc::now(),
         },
     ) {
@@ -4650,6 +4727,8 @@ mod validate_workflow_render_tests {
                     capabilities: Some(vec!["email".into()]),
                     intent: None,
                 })),
+                // Scan ran, nobody dispatches into it: full scale.
+                child_scan: Ok(talos_analytics_repository::ChildReferenceScan::default()),
                 now,
             },
             now,

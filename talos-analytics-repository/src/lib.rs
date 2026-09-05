@@ -16,7 +16,12 @@ type SqlxResult<T> = std::result::Result<T, sqlx::Error>;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+pub mod readiness_basis;
 pub mod readiness_state;
+pub use readiness_basis::{
+    child_exclusion_is_complete, score_readiness, ReadinessBasis, ReadinessComponents,
+    ReadinessOutcome, CHILD_MEASURABLE_MAX, CHILD_UNMEASURED_REASON, FULL_MAX,
+};
 pub use readiness_state::{classify_readiness_state, ReadinessScorer, ReadinessState};
 
 // ------------------------------------------------------------------
@@ -781,6 +786,11 @@ pub struct WorkflowCapabilityRow {
     /// without this count beside it.
     pub runs_30d: i64,
 }
+
+/// Cap on the zero-invocation candidate page the reuse report's child scan
+/// runs over. Stated so the caller can disclose truncation rather than present
+/// a capped list as complete.
+pub const REUSE_ZERO_INVOCATION_SCAN_LIMIT: i64 = 100;
 
 #[derive(Debug)]
 pub struct ReuseStatRow {
@@ -3361,6 +3371,62 @@ impl AnalyticsRepository {
 
     // -- Reuse stats ------------------------------------------------------
 
+    /// Non-archived workflows of `user_id` with ZERO executions in the window —
+    /// the candidate set for the reuse report's parent-dispatched list.
+    ///
+    /// [`Self::get_workflow_reuse_stats`] INNER-JOINs `workflow_executions`, so
+    /// a workflow whose every run is a sub-workflow dispatch cannot appear in
+    /// it at all. Measured 2026-09-05: `pa-ask` is dispatched by `pa-ask-email`
+    /// on every inbound email and has **0** rows in that table (live and
+    /// archive), so the most-invoked workflow on the reference fleet was simply
+    /// ABSENT from the tool that reports reuse — not shown as zero, not shown
+    /// at all.
+    ///
+    /// Bounded by [`REUSE_ZERO_INVOCATION_SCAN_LIMIT`] and ordered by
+    /// `updated_at DESC, id` so the page is stable and the caller can say it
+    /// was capped. A workflow with zero runs and no parent is NOT reuse and is
+    /// dropped by the caller after the scan; this method's job is only to
+    /// produce a bounded candidate set the ONE child scan can be run over.
+    pub async fn list_zero_invocation_workflows(
+        &self,
+        user_id: Uuid,
+        days: i32,
+        limit: i64,
+    ) -> Result<Vec<ReuseStatRow>> {
+        let rows = sqlx::query(
+            "SELECT w.id AS workflow_id, w.name, w.graph_json::text AS graph_json \
+             FROM workflows w \
+             WHERE w.user_id = $1 \
+               AND (w.status IS NULL OR w.status != 'archived') \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM workflow_executions we \
+                   WHERE we.workflow_id = w.id \
+                     AND we.started_at > NOW() - make_interval(days => $2::int) \
+               ) \
+             ORDER BY w.updated_at DESC, w.id \
+             LIMIT $3",
+        )
+        .bind(user_id)
+        .bind(days)
+        .bind(limit)
+        .fetch_all(&self.db_pool)
+        .await?;
+        rows.into_iter()
+            .map(|r| -> Result<ReuseStatRow> {
+                Ok(ReuseStatRow {
+                    workflow_id: r.try_get("workflow_id")?,
+                    name: r.try_get("name")?,
+                    graph_json: r.try_get::<Option<_>, _>("graph_json")?,
+                    // Not zero-as-a-measurement: this method's whole population
+                    // is "no rows in the window", and the caller renders the
+                    // count as NULL for a parent-dispatched row rather than 0.
+                    total_invocations: 0,
+                    unique_days: 0,
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+    }
+
     pub async fn get_workflow_reuse_stats(
         &self,
         user_id: Uuid,
@@ -3492,6 +3558,24 @@ impl AnalyticsRepository {
     }
 
     // -- Readiness breakdown ----------------------------------------------
+
+    /// Which of `candidates` does an enabled parent dispatch into?
+    ///
+    /// The repository-side door onto the ONE child-reference scan, so a handler
+    /// never needs a pool of its own (check 6). Thin by design — the scan lives
+    /// in [`talos_child_workflow_refs`] because three crates with no edge
+    /// between them ask this question.
+    ///
+    /// Callers MUST NOT default a failure to an empty scan: an empty index
+    /// reads as "nobody is anybody's child", which puts every child back on the
+    /// full 100-point scale with reliability and freshness at zero.
+    pub async fn scan_child_parents_for(
+        &self,
+        user_id: Uuid,
+        candidates: &[Uuid],
+    ) -> SqlxResult<ChildReferenceScan> {
+        scan_child_parents(&self.db_pool, user_id, candidates).await
+    }
 
     pub async fn get_readiness_exec_data(&self, wf_id: Uuid) -> Result<ReadinessExecData> {
         let row = sqlx::query(
