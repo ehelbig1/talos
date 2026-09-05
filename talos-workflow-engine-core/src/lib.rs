@@ -113,6 +113,7 @@ pub const HAS_LLM_PRIMITIVES: bool = cfg!(feature = "llm-primitives");
 mod approval_gate;
 mod assistant_report_reader;
 mod checkpoint;
+pub mod child_workflow_refs;
 mod context;
 mod dispatcher;
 mod edge;
@@ -148,6 +149,10 @@ mod write_ceiling;
 pub use approval_gate::{ApprovalGate, ApprovalStatus};
 pub use assistant_report_reader::AssistantReportReader;
 pub use checkpoint::CheckpointStore;
+pub use child_workflow_refs::{
+    child_workflow_ids, child_workflow_ids_checked, collect_child_workflow_references,
+    CHILD_WORKFLOW_ID_MAP_KEYS, CHILD_WORKFLOW_ID_SUFFIX,
+};
 pub use context::WorkflowContext;
 pub use dispatcher::{
     dispatch_chain_sequential, ChainDispatchRequest, ChainDispatchResult, ChainStepResult,

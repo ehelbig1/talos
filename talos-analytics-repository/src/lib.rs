@@ -16,6 +16,9 @@ type SqlxResult<T> = std::result::Result<T, sqlx::Error>;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+pub mod readiness_state;
+pub use readiness_state::{classify_readiness_state, ReadinessScorer, ReadinessState};
+
 // ------------------------------------------------------------------
 // Row DTOs
 // ------------------------------------------------------------------
@@ -526,7 +529,13 @@ pub struct ReadinessScoreRow {
     pub id: Uuid,
     pub name: String,
     pub readiness_score: Option<i32>,
+    /// Stamped ONLY by `get_readiness_breakdown`. Never read alone — see
+    /// [`crate::readiness_state`] for why a row can carry a fresh score with
+    /// this column NULL.
     pub readiness_scored_at: Option<DateTime<Utc>>,
+    /// Stamped ONLY by the hourly background recompute. The column that was
+    /// set on 36 of 36 dev-fleet rows while `readiness_scored_at` was set on 1.
+    pub readiness_computed_at: Option<DateTime<Utc>>,
     pub has_description: bool,
     pub has_capabilities: bool,
 }
@@ -892,7 +901,109 @@ pub struct DormantWorkflowRow {
     pub id: Uuid,
     pub name: String,
     pub created_at: DateTime<Utc>,
+    /// `MAX(started_at)` across the live table AND the archive. `None` means
+    /// NO EXECUTION ROW EXISTS — which for a workflow named in
+    /// [`Self::runs_as_child_of`] is not the same as "never ran": a
+    /// sub-workflow runs in-process (`execute_subworkflow_graph`) and records
+    /// no `workflow_executions` row at all.
     pub last_execution: Option<DateTime<Utc>>,
+    /// Names of ENABLED, non-archived workflows whose graph dispatches into
+    /// this one. Non-empty ⇒ this workflow is somebody's child and its silence
+    /// in `workflow_executions` is expected, not evidence of neglect.
+    pub runs_as_child_of: Vec<String>,
+    /// Most recent `execution_cost_rollup.recorded_at` attributed to this
+    /// workflow id. A LOWER BOUND on child activity, never a run record — see
+    /// [`DORMANT_CHILD_ACTIVITY_CAVEAT`].
+    pub last_child_activity_at: Option<DateTime<Utc>>,
+}
+
+/// Why `last_execution: null` on a child row is not evidence of anything.
+pub const DORMANT_CHILD_NOTE: &str =
+    "A sub-workflow runs in-process via execute_subworkflow_graph and records NO \
+     workflow_executions row, so `last_execution: null` here means NO EVIDENCE, not \
+     \"never ran\". Excluded from the cleanup recommendation: deleting it would remove a \
+     node its parent dispatches into.";
+
+/// What `last_child_activity_at` is worth, stated so a `null` there cannot be
+/// read as a second, independent "it never ran".
+///
+/// `execution_cost_rollup` is written only when a node returns
+/// `__fuel_consumed__ > 0`, and `execute_subworkflow_graph` runs the child
+/// under a fresh `Uuid::new_v4()`, so most child rows land under a synthetic
+/// workflow id that matches no workflow. Measured on the reference deployment
+/// 2026-09-05: the `crm_recall` node produced 21 rollup rows, of which **2**
+/// carried the child's real workflow id and 19 were synthetic — and in the
+/// 30-day window the child had ONE attributed row while its parent ran ~21
+/// times. Roughly 5% recall.
+pub const DORMANT_CHILD_ACTIVITY_CAVEAT: &str =
+    "Lower bound only. execution_cost_rollup records a row per node that burned fuel, and \
+     an in-process sub-workflow run usually lands under a synthetic workflow id \
+     (measured coverage ~5%), so a null here is NOT evidence the child never ran.";
+
+/// One enabled workflow's graph, for the child-reference scan.
+#[derive(Debug, Clone)]
+pub struct ParentGraphRow {
+    pub id: Uuid,
+    pub name: String,
+    pub graph_json: String,
+}
+
+/// `child workflow id -> names of the enabled parents that dispatch into it`.
+///
+/// Pure, so the hygiene report's most consequential exclusion — the one that
+/// keeps a workflow off a delete recommendation — is testable without
+/// Postgres. Parent names are sorted and deduplicated so the rendered list is
+/// stable across runs (input order is `ORDER BY id`, which is stable, but a
+/// caller should not have to know that).
+///
+/// A parent whose graph does not parse contributes NOTHING and is reported
+/// separately by [`unreadable_parent_graphs`] rather than silently counted as
+/// a workflow that references nobody: this function's answer suppresses a
+/// DELETE recommendation, so "I could not read that parent" must not arrive
+/// looking like "that parent references nothing".
+#[must_use]
+pub fn child_parent_index(
+    parents: &[ParentGraphRow],
+) -> std::collections::BTreeMap<Uuid, Vec<String>> {
+    let mut index: std::collections::BTreeMap<Uuid, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for p in parents {
+        let Some(children) = talos_workflow_engine_core::child_workflow_ids_checked(&p.graph_json)
+        else {
+            continue;
+        };
+        for child in children {
+            // A workflow that dispatches into ITSELF is not "somebody's
+            // child" for this purpose — the exclusion exists to protect a
+            // workflow whose runs are invisible because a DIFFERENT workflow
+            // drives them, and a self-reference would make every recursive
+            // workflow permanently undeletable by this report's advice.
+            if child == p.id {
+                continue;
+            }
+            index.entry(child).or_default().push(p.name.clone());
+        }
+    }
+    for names in index.values_mut() {
+        names.sort_unstable();
+        names.dedup();
+    }
+    index
+}
+
+/// Names of parents whose `graph_json` could not be read, so a caller can say
+/// that the child-reference scan was INCOMPLETE rather than presenting a
+/// partial index as a full one.
+#[must_use]
+pub fn unreadable_parent_graphs(parents: &[ParentGraphRow]) -> Vec<String> {
+    let mut names: Vec<String> = parents
+        .iter()
+        .filter(|p| talos_workflow_engine_core::child_workflow_ids_checked(&p.graph_json).is_none())
+        .map(|p| p.name.clone())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    names
 }
 
 #[derive(Debug)]
@@ -1044,9 +1155,11 @@ pub struct ReadinessPopulation {
     pub avg_score: Option<f64>,
     /// How many score below 50, over all of them.
     pub below_50: i64,
-    /// How many have never been scored, over all of them. Anchored on
-    /// `readiness_scored_at IS NULL` to match `classify_readiness_state`'s
-    /// authoritative predicate — the two columns can drift.
+    /// How many have never been scored, over all of them. Anchored on BOTH
+    /// timestamp columns being NULL, to match
+    /// [`crate::classify_readiness_state`] — a row stamped by either writer is
+    /// scored. Anchoring on `readiness_scored_at` alone reported 27 of 28
+    /// workflows unscored on a fleet where 36 of 36 had been scored that day.
     pub unscored: i64,
 }
 
@@ -1134,6 +1247,15 @@ pub const HYGIENE_CHECKS: &[HygieneCheck] = &[
     HygieneCheck::list("promotable_modules", HYGIENE_FINDING_LIMIT),
     HygieneCheck::list("stale_executions", HYGIENE_FINDING_LIMIT),
     HygieneCheck::list("dormant_workflows", HYGIENE_FINDING_LIMIT),
+    // The parent-reference scan behind `dormant_workflows[].runs_as_child_of`,
+    // disclosed under the `summary` object it renders into.
+    // Registered as a COUNT rather than a list because it renders no findings
+    // of its own: it decides which dormant rows are excluded from the cleanup
+    // recommendation, and it is uncapped by row (scoped instead to the graphs
+    // that mention a dormant candidate). If it cannot be read, the exclusion
+    // cannot be computed, and that must be visible in the coverage block
+    // rather than showing up as every child being deletable again.
+    HygieneCheck::count("summary.child_workflow_exclusion"),
     HygieneCheck::list("stale_draft_workflows", HYGIENE_FINDING_LIMIT),
     // No LIMIT: the idle-actor query is already narrowed by three NOT EXISTS
     // guards and returns single digits in practice.
@@ -1210,6 +1332,11 @@ pub struct HygieneReport {
     pub promotable_modules: Vec<PromotableModuleRow>,
     pub stale_executions: Vec<StaleExecutionRow>,
     pub dormant_workflows: Vec<DormantWorkflowRow>,
+    /// Names of enabled parents whose `graph_json` could not be parsed during
+    /// the `runs_as_child_of` scan. Non-empty ⇒ the child exclusion is
+    /// INCOMPLETE: a workflow named only by one of these is still presented as
+    /// deletable. Empty is the normal case and claims nothing.
+    pub child_scan_unreadable_parents: Vec<String>,
     pub stale_draft_workflows: Vec<StaleDraftRow>,
     pub idle_actors: Vec<IdleActorRow>,
     /// `None` when the wildcard scan could not be read — distinct from
@@ -1267,6 +1394,10 @@ impl HygieneReport {
     pub fn empty(readings: talos_measurement::Readings) -> Self {
         let missing = |field: &str| readings.not_measured().contains(&field);
         Self {
+            // Nothing was scanned, so nothing is claimed. The UNMEASURED fact
+            // travels in `readings` under
+            // `dormant_workflows.runs_as_child_of`, not here.
+            child_scan_unreadable_parents: Vec::new(),
             undescribed: Vec::new(),
             uncapabilized: Vec::new(),
             suppressed_count: (!missing("summary.suppressed_internal_test_workflows")).then_some(0),
@@ -3594,7 +3725,7 @@ impl AnalyticsRepository {
             "SELECT COUNT(*)::bigint AS total, \
                     AVG(COALESCE(readiness_score, 0))::float8 AS avg_score, \
                     COUNT(*) FILTER (WHERE COALESCE(readiness_score, 0) < 50)::bigint AS below_50, \
-                    COUNT(*) FILTER (WHERE readiness_scored_at IS NULL)::bigint AS unscored \
+                    COUNT(*) FILTER (WHERE readiness_scored_at IS NULL AND readiness_computed_at IS NULL)::bigint AS unscored \
              FROM workflows \
              WHERE user_id = $1 \
                AND ($2::uuid[] IS NULL OR id = ANY($2::uuid[])) \
@@ -3629,7 +3760,7 @@ impl AnalyticsRepository {
         include_archived: bool,
     ) -> Result<Vec<ReadinessScoreRow>> {
         let rows = sqlx::query(
-            "SELECT id, name, readiness_score, readiness_scored_at, \
+            "SELECT id, name, readiness_score, readiness_scored_at, readiness_computed_at, \
                    CASE WHEN description IS NOT NULL AND description != '' THEN true ELSE false END AS has_description, \
                    CASE WHEN capabilities IS NOT NULL AND array_length(capabilities, 1) > 0 THEN true ELSE false END AS has_capabilities, \
                    updated_at \
@@ -3654,6 +3785,7 @@ impl AnalyticsRepository {
                     name: r.try_get::<Option<_>, _>("name")?.unwrap_or_default(),
                     readiness_score: r.try_get::<Option<_>, _>("readiness_score")?,
                     readiness_scored_at: r.try_get::<Option<_>, _>("readiness_scored_at")?,
+                    readiness_computed_at: r.try_get::<Option<_>, _>("readiness_computed_at")?,
                     has_description: r
                         .try_get::<Option<_>, _>("has_description")?
                         .unwrap_or(false),
@@ -4762,14 +4894,50 @@ impl AnalyticsRepository {
         };
 
         // 8. Dormant workflows
+        //
+        // Two corrections over the original `LEFT JOIN workflow_executions`
+        // form, both of which made this list assert a determinate "no
+        // executions in 30+ days" for workflows that run:
+        //
+        // (a) THE ARCHIVE. The retention sweep MOVES terminal rows out of
+        //     `workflow_executions` after `archive_after_days` (default 30,
+        //     overridable per-deployment via `system_settings`), so a
+        //     live-table-only `MAX(started_at)` cannot see a run older than
+        //     that window. At the default the two windows coincide and the
+        //     answer happens to be right; lower `ARCHIVE_AFTER_DAYS` to 7 and
+        //     every workflow whose last run is 8 days old reads as dormant.
+        //     The coincidence is not the contract, so both tables are read.
+        //
+        // (b) CHILDREN. `execute_subworkflow_graph` runs a sub-workflow
+        //     IN-PROCESS and writes no execution row — measured 2026-09-05:
+        //     ZERO rows carrying `parent_execution_id` across the live table
+        //     and the archive, platform-wide. So the flagship's own
+        //     `cos-team-recall` (a `sub_workflow` node in `pa-chief-of-staff`,
+        //     which runs daily) and `pa-quality-judge` (the judge of three
+        //     workflows) were both listed here with `last_execution: null`
+        //     under a recommendation to delete them. The parent lookup below
+        //     resolves that from the GRAPH, which is the only place the
+        //     relationship is recorded.
         let dormant_workflows_fut = async {
             let fetched = sqlx::query(
-                "SELECT w.id, w.name, w.created_at, MAX(we.started_at) AS last_execution \
+                "WITH last_run AS ( \
+                 SELECT w.id, GREATEST( \
+                     (SELECT MAX(started_at) FROM workflow_executions we \
+                       WHERE we.workflow_id = w.id AND we.user_id = w.user_id), \
+                     (SELECT MAX(started_at) FROM workflow_executions_archive wa \
+                       WHERE wa.workflow_id = w.id AND wa.user_id = w.user_id) \
+                 ) AS last_execution \
+                 FROM workflows w \
+                 WHERE w.user_id = $1 AND w.is_enabled = true \
+                   AND w.created_at < NOW() - INTERVAL '30 days' \
+             ) \
+             SELECT w.id, w.name, w.created_at, lr.last_execution, \
+                    (SELECT MAX(r.recorded_at) FROM execution_cost_rollup r \
+                      WHERE r.workflow_id = w.id) AS last_child_activity_at \
              FROM workflows w \
-             LEFT JOIN workflow_executions we ON we.workflow_id = w.id AND we.user_id = w.user_id \
-             WHERE w.user_id = $1 AND w.is_enabled = true AND w.created_at < NOW() - INTERVAL '30 days' \
-             GROUP BY w.id, w.name, w.created_at \
-             HAVING MAX(we.started_at) IS NULL OR MAX(we.started_at) < NOW() - INTERVAL '30 days' \
+             JOIN last_run lr ON lr.id = w.id \
+             WHERE lr.last_execution IS NULL \
+                OR lr.last_execution < NOW() - INTERVAL '30 days' \
              ORDER BY w.created_at ASC LIMIT 25",
             )
             .bind(user_id)
@@ -4790,6 +4958,12 @@ impl AnalyticsRepository {
                         name: r.try_get("name")?,
                         created_at: r.try_get("created_at")?,
                         last_execution: r.try_get::<Option<_>, _>("last_execution")?,
+                        // Filled in at the join site from the graph scan — a
+                        // row cannot answer "who dispatches into me?" from its
+                        // own table.
+                        runs_as_child_of: Vec::new(),
+                        last_child_activity_at: r
+                            .try_get::<Option<_>, _>("last_child_activity_at")?,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -4942,7 +5116,90 @@ impl AnalyticsRepository {
         let orphaned_modules = readings.record_rows("orphaned_modules", orphaned_modules?);
         let promotable_modules = readings.record_rows("promotable_modules", promotable_modules?);
         let stale_executions = readings.record_rows("stale_executions", stale_executions?);
-        let dormant_workflows = readings.record_rows("dormant_workflows", dormant_workflows?);
+        let mut dormant_workflows = readings.record_rows("dormant_workflows", dormant_workflows?);
+        // The child-reference scan. A FAILED scan is recorded, not defaulted:
+        // an empty index would silently restore the pre-fix behaviour (every
+        // child listed as dormant under a delete recommendation), and the
+        // caller has to be able to say the exclusion could not be computed.
+        // 8b. Who dispatches into whom.
+        //
+        // Runs AFTER the dormant list rather than beside it, because it is
+        // scoped BY that list: the only graphs worth reading are the ones that
+        // mention one of the (at most `HYGIENE_FINDING_LIMIT`) candidates. The
+        // `LIKE` prefilter rides `idx_workflows_graph_json_trgm` and returns
+        // single-digit rows in practice; an unscoped "read every enabled
+        // workflow's graph" would be an unbounded payload on a large tenant,
+        // and capping THAT with a `LIMIT` would silently drop parents — the
+        // failure direction that puts a live child back under the delete
+        // advice.
+        //
+        // The `LIKE` is a PREFILTER only. Membership is decided in Rust by
+        // parsing the eight child-naming `data` keys, so a candidate's UUID
+        // appearing in an unrelated field (a prompt, a config value) does not
+        // earn it an exclusion.
+        //
+        // THREE outcomes, and the first is why this is not written as
+        // `if !dormant_workflows.is_empty()`: when the dormant read ITSELF
+        // failed we do not know the candidates, so the exclusion is
+        // UNMEASURED and must say so. Collapsing that into "no candidates,
+        // nothing to do" would publish a clean ledger over an unasked
+        // question — the defect this whole sweep's `Readings` exist to stop.
+        let child_scan: std::result::Result<Vec<ParentGraphRow>, String> =
+            if readings.not_measured().contains(&"dormant_workflows") {
+                Err("the dormant-workflow list could not be read, so the \
+                     runs-as-child-of exclusion could not be computed"
+                    .to_string())
+            } else if dormant_workflows.is_empty() {
+                // Measured, and vacuously complete: no candidate, nothing to
+                // exclude, no query issued.
+                Ok(Vec::new())
+            } else {
+                let candidate_ids: Vec<Uuid> = dormant_workflows.iter().map(|r| r.id).collect();
+                match sqlx::query(
+                    "SELECT id, name, graph_json FROM workflows \
+                     WHERE user_id = $1 AND is_enabled = true AND status != 'archived' \
+                       AND octet_length(graph_json) <= $3 \
+                       AND EXISTS (SELECT 1 FROM unnest($2::uuid[]) c \
+                                   WHERE graph_json LIKE '%' || c::text || '%') \
+                     ORDER BY id",
+                )
+                .bind(user_id)
+                .bind(&candidate_ids)
+                .bind(TWIN_SCAN_MAX_GRAPH_BYTES)
+                .fetch_all(&self.db_pool)
+                .await
+                {
+                    // The QUERY error is recorded (an empty index must not be
+                    // able to mean "nobody asked"); a ROW-MAPPING error
+                    // propagates with `?` (schema drift is loud, check 52).
+                    Ok(raw) => Ok(raw
+                        .into_iter()
+                        .map(|r| -> Result<ParentGraphRow> {
+                            Ok(ParentGraphRow {
+                                id: r.try_get("id")?,
+                                name: r.try_get("name")?,
+                                graph_json: r.try_get("graph_json")?,
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?),
+                    Err(e) => Err(e.to_string()),
+                }
+            };
+        let parents = readings.record("summary.child_workflow_exclusion", child_scan);
+        // Parents whose graph did not parse. A child named ONLY by one of them
+        // is still listed as deletable, so the incompleteness travels to the
+        // caller by NAME rather than as a silently short exclusion list.
+        let mut child_scan_unreadable_parents: Vec<String> = Vec::new();
+        if let Some(parents) = parents.as_deref() {
+            child_scan_unreadable_parents = unreadable_parent_graphs(parents);
+            let index = child_parent_index(parents);
+            for row in &mut dormant_workflows {
+                if let Some(names) = index.get(&row.id) {
+                    row.runs_as_child_of.clone_from(names);
+                }
+            }
+        }
+
         let stale_draft_workflows =
             readings.record_rows("stale_draft_workflows", stale_draft_workflows?);
         let idle_actors = readings.record_rows("idle_actors", idle_actors?);
@@ -5361,6 +5618,7 @@ impl AnalyticsRepository {
             .unwrap_or((Vec::new(), false, 0));
 
         Ok(HygieneReport {
+            child_scan_unreadable_parents,
             undescribed,
             uncapabilized,
             suppressed_count,
@@ -6784,5 +7042,100 @@ mod fuel_blindspot_tests {
             !body.contains("AND NOT we.is_test_execution \\"),
             "the inner-join test predicate reappeared"
         );
+    }
+}
+
+#[cfg(test)]
+mod child_parent_index_tests {
+    use super::{child_parent_index, unreadable_parent_graphs, ParentGraphRow};
+    use uuid::Uuid;
+
+    fn parent(name: &str, id: Uuid, graph: &str) -> ParentGraphRow {
+        ParentGraphRow {
+            id,
+            name: name.to_string(),
+            graph_json: graph.to_string(),
+        }
+    }
+
+    fn sub_node(child: Uuid) -> String {
+        format!(
+            r#"{{"nodes":[{{"id":"n","type":"system:sub_workflow","data":{{"sub_workflow_id":"{child}"}}}}],"edges":[]}}"#
+        )
+    }
+
+    /// The live shape: one child, three parents that judge with it. The
+    /// rendered list must be stable across runs and free of duplicates.
+    #[test]
+    fn parents_are_deduplicated_and_sorted() {
+        let judge = Uuid::new_v4();
+        let graph = format!(
+            r#"{{"nodes":[
+                 {{"id":"a","type":"system:judge","data":{{"judge_workflow_id":"{judge}"}}}},
+                 {{"id":"b","type":"system:judge","data":{{"judge_workflow_id":"{judge}"}}}}
+               ],"edges":[]}}"#
+        );
+        let parents = vec![
+            parent("pa-meeting-prep", Uuid::new_v4(), &graph),
+            parent("pa-chief-of-staff", Uuid::new_v4(), &graph),
+            parent("pa-daily-brief", Uuid::new_v4(), &graph),
+        ];
+        let index = child_parent_index(&parents);
+        assert_eq!(
+            index.get(&judge).map(Vec::as_slice),
+            Some(
+                &[
+                    "pa-chief-of-staff".to_string(),
+                    "pa-daily-brief".to_string(),
+                    "pa-meeting-prep".to_string(),
+                ][..]
+            ),
+            "one entry per parent, sorted, no duplicate from the two judge nodes"
+        );
+    }
+
+    /// A workflow that dispatches into itself is not protected by that fact.
+    /// The exclusion exists because a DIFFERENT workflow's runs hide this
+    /// one's; a self-reference hides nothing, and honouring it would make
+    /// every recursive workflow permanently immune to the cleanup advice.
+    #[test]
+    fn a_self_reference_is_not_a_parent() {
+        let id = Uuid::new_v4();
+        let index = child_parent_index(&[parent("recursive", id, &sub_node(id))]);
+        assert!(index.is_empty());
+    }
+
+    /// UNKNOWN is not EMPTY. A parent whose graph does not parse contributes
+    /// nothing to the index AND is named by the companion function, so the
+    /// caller can say the scan was incomplete instead of presenting a partial
+    /// index as a full one.
+    #[test]
+    fn an_unreadable_parent_is_reported_not_silently_skipped() {
+        let child = Uuid::new_v4();
+        let parents = vec![
+            parent("broken", Uuid::new_v4(), "{not json"),
+            parent("also-broken", Uuid::new_v4(), "{}"),
+            parent("good", Uuid::new_v4(), &sub_node(child)),
+        ];
+        let index = child_parent_index(&parents);
+        assert_eq!(index.get(&child).map(Vec::len), Some(1));
+        assert_eq!(
+            unreadable_parent_graphs(&parents),
+            vec!["also-broken".to_string(), "broken".to_string()],
+        );
+    }
+
+    /// The control: a fleet of parseable graphs that name nobody reports NO
+    /// unreadable parents — so the function above is not just returning every
+    /// name it is given.
+    #[test]
+    fn a_readable_graph_naming_nobody_is_not_reported_unreadable() {
+        let parents = vec![parent(
+            "leaf",
+            Uuid::new_v4(),
+            r#"{"nodes":[{"id":"n","type":"module","data":{"module_id":"x"}}],"edges":[]}"#,
+        )];
+        assert!(child_parent_index(&parents).is_empty());
+        assert!(unreadable_parent_graphs(&parents).is_empty());
     }
 }

@@ -17,6 +17,12 @@ talos-db = { path = "../talos-db" }
 talos-measurement = { path = "../talos-measurement" }
 talos-retry-intelligence = { path = "../talos-retry-intelligence" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
+# The child-workflow reference set (`child_workflow_ids_checked`) — the eight
+# `data` keys a node names another workflow through, read from the crate the
+# ENGINE's own parser shares rather than restated here. Check 51 forbids a
+# repository crate depending on `talos-workflow-engine`; `-core` is explicitly
+# NOT forbidden, and it is a leaf (serde/uuid/sha2/async-trait only).
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 tokio = { version = "1", features = ["macros", "rt"] }
 tracing.workspace = true

@@ -233,6 +233,104 @@ instead of the bare `search`. The filter is applied at the DB layer
 (`talos_memory::recall_semantic_filtered`, parameterized `text[]` bind)
 — not post-hoc in Rust, so it composes with limit + min_score cleanly.
 
+## Two columns for one fact; a child that leaves no trace
+
+Two operator-facing reports asserted a determinate negative for a state the
+reader could not represent — the misleading-report class (checks 74, 76, 79/79b,
+81) in two fresh shapes, both measured live 2026-09-05.
+
+**"Unscored" over a score written an hour ago.** `workflows` carries TWO
+readiness timestamps and TWO writers that each stamp only their own: the hourly
+recompute in `controller/src/bootstrap/background.rs` writes
+`readiness_computed_at`; the on-demand `get_readiness_breakdown` write-back
+(`AnalyticsRepository::set_workflow_readiness_score`) writes
+`readiness_scored_at`. Every reader anchored on the second, so with
+`readiness_computed_at` set on 36 of 36 dev-fleet rows and `readiness_scored_at`
+on **1**, `get_all_readiness_scores` answered `unscored_count: 27` of 28 and
+per-row `score_state: "unscored"` **beside a `readiness_score` of 87**, telling
+the operator to run a tool to compute a score that already existed; the flagship
+reported `score_age_hours: 986` against a score recomputed that afternoon. The
+previous fix here (MCP-1211) collapsed a two-STATEMENT write into one atomic
+UPDATE — correct, and it left the predicate intact because it never saw the
+**second writer**. The decision now has ONE home,
+`talos_analytics_repository::readiness_state::classify_readiness_state`, which
+reads BOTH columns, returns the EFFECTIVE (more recent) timestamp and NAMES the
+scorer. **The columns are deliberately NOT collapsed**, and the reason is
+measured rather than assumed: the two scorers are not the same function — the
+arithmetic is shared (`compute_reliability_score` IS the background loop's
+inline expression) but `get_readiness_exec_data` adds
+`AND NOT (status = 'failed' AND acknowledged_at IS NOT NULL)`, so the background
+number is the lower one on any workflow with an acknowledged failure in the
+window. One timestamp cannot say which scorer produced the stored number, and a
+`readiness_scored_at = COALESCE(...)` migration would relabel 35 background
+scores as breakdown scores. So the READER was taught to read both, and
+`readiness_population`'s `unscored` predicate now requires BOTH to be NULL.
+
+**A daily sub-workflow "recommended for deletion".** `execute_subworkflow_graph`
+runs a child IN-PROCESS and records no `workflow_executions` row — measured:
+ZERO rows carrying `parent_execution_id` across the live table AND the archive,
+platform-wide. `get_platform_hygiene_report`'s dormant query read that table
+alone, so 3 of its 13 findings were children of ENABLED parents
+(`cos-team-recall` — the flagship `pa-chief-of-staff`'s daily `team_gather`
+sub-workflow — `pa-quality-judge`, and `pa-ask`), listed under *"Consider
+disabling or deleting them with `batch_delete_workflows`"*. The row now carries
+`runs_as_child_of: [parent names]` plus the note that `last_execution: null`
+means NO EVIDENCE, and is EXCLUDED from the recommendation's count with the
+exclusion disclosed (`excluded_child_workflows`, and the deletable names
+enumerated) — it stays in the LIST, because an operator asking "what has no
+executions?" should still see it. The exclusion is graph-derived and keyed on an
+ENABLED parent; a self-reference does not protect a workflow, or every recursive
+one would be permanently immune. The same query now reads
+`workflow_executions_archive` too: the dormant window and `ARCHIVE_AFTER_DAYS`
+are both 30 by default, so a live-only read is right by COINCIDENCE, and at
+`ARCHIVE_AFTER_DAYS=7` every workflow that ran 8 days ago reads as never-run.
+
+**The child-reference set has ONE implementation**, moved (not copied) into
+`talos_workflow_engine_core::child_workflow_refs`, which
+`talos_workflow_validation::collect_subworkflow_references` now re-exports. The
+move closed the gap that function's own doc comment declared: the
+`*_workflow_id` suffix convention covers seven of the engine's EIGHT
+child-naming sites and structurally cannot see the eighth — `llm_dispatch`'s
+`data.routes`, whose arbitrary class labels key the workflow ids — so
+`get_workflow_risk_assessment` was blind to every route target too.
+`child_workflow_ids_checked` is three-valued: `None` = the graph did not parse
+(UNKNOWN), `Some(vec![])` = parsed and names nobody. A report that suppresses a
+DELETE recommendation on the strength of "this is somebody's child" must not
+read an unparseable parent as one that references nothing, so unreadable parents
+are NAMED in `summary.child_workflow_exclusion.unreadable_parents` and in the
+recommendation's own prose.
+
+**What was measured and NOT changed** (stated so the population is visible
+rather than rediscovered — the same discipline as the write-ceiling entry
+above). A graph-blind execution read misleads **26** surfaces, not one. Two more
+are DESTRUCTIVE and share the exact blindness: `stale_draft_workflows` (whose
+`fix_all confirm=true` DELETES) and `session_start`'s `archive_stale_drafts`
+(which ARCHIVES without confirmation), both keyed on
+`status='draft' AND NOT EXISTS (SELECT 1 FROM workflow_executions …)` — latent
+today (no draft child on the fleet), live the day someone leaves a child
+unpublished. Three INDEPENDENT readiness scorers (the on-demand handler, the
+hourly background loop, and `validate_workflow`) each score a child's
+reliability AND freshness at 0, and the background one PERSISTS ≤30/100 to
+`workflows.readiness_score` every hour, which
+`get_all_readiness_scores`/`below_50_count` then read. `get_workflow_reuse_stats`
+INNER-JOINs executions, so the most-reused workflow on the platform is ABSENT
+from the reuse tool. `get_workflow_risk_assessment`'s cascading-failure check
+and the background SLA-breach monitor both `continue` on a zero-row population,
+so they can never fire for a child. And
+`talos-advanced-repository`'s `get_frequently_executed_unscheduled` carries a
+sub-workflow exclusion that reads `module_id = 'system:sub_workflow'` and
+`config.sub_workflow_id` — neither is the shape the engine writes (`type` /
+`data`), so the exclusion is DEAD. **The structural question these all share is
+whether `execute_subworkflow_graph` should record a child `workflow_executions`
+row** (`parent_execution_id` / `root_execution_id` exist and are written only by
+replay today). Measured before deciding: ~225 estimated child runs/day, 98.6% of
+them one workflow; **163** `FROM workflow_executions` occurrences across 28
+non-test files, of which exactly **2** carry a `parent_execution_id IS [NOT]
+NULL` filter — so recording children would silently double-count in 161 places,
+including every fleet total, error rate and cost aggregate. That is a
+platform-wide change, not a report fix, and it is recorded here rather than
+attempted.
+
 ## Sub-workflow dispatch (engine)
 
 Every parent node that runs a sub-workflow (judge, ensemble, reflective-retry, llm-dispatch, sub_workflow) uses the shared dispatcher pattern in `controller/src/engine/parallel.rs`:
