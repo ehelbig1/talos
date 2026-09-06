@@ -3649,7 +3649,17 @@ async fn build_retry_advice_block(
         "workflow_has_bound_actor": advice.has_actor,
         "history_coverage": advice.history.note(),
         "nodes_recommended_to_change": changed,
+        // #764: this counts nodes that do not get the attempt window they ask
+        // for, which is BOTH findings — an attempt never dispatched AND an
+        // attempt clamped short. The second is new (the pre-#764 check could
+        // not see it) and is lower severity, so the count is stated rather
+        // than left to be read as "nodes that cannot complete".
         "nodes_currently_overrunning_budget": overrunning,
+        "nodes_currently_overrunning_budget_note":
+            "Nodes whose configured attempt sequence is not granted in full once the engine's \
+             per-attempt budget clamp is applied. Includes both severities: attempts that are \
+             never dispatched, and attempts that start but are cut short. `validate_workflow` \
+             separates them by category (`retry-envelope` vs `attempt-window-clamped`).",
         "blanket_safe_retry_count": blanket,
         "nodes": nodes,
         "skipped": advice.skipped.iter().map(|s| serde_json::json!({
@@ -3673,11 +3683,21 @@ fn describe_retry_bound(bound: &talos_workflow_validation::RetryAdviceBound) -> 
             "max_retry_count": max_retries,
             "workflow_budget_secs": budget_secs,
             "rejected_envelope_secs": proposed_envelope_secs,
-            "reason": "A higher count's worst-case envelope exceeds the workflow's enforced \
-                       wall-clock budget. The retry loop has no view of that deadline, so it \
-                       starts an attempt that cannot finish; when the budget expires the whole \
-                       execution is dropped, discarding every sibling node that had already \
-                       completed.",
+            // #764: the previous text described the pre-#686 retry loop. The
+            // loop now carries the workflow deadline and clamps every attempt
+            // (`talos_workflow_engine_core::clamp_attempt_timeout`), so the
+            // outcome is a routed NODE failure, not a dropped reactor future.
+            // This string and `talos_workflow_validation`'s
+            // `describe_retry_envelope_overrun` are the two operator-facing
+            // accounts of ONE engine behaviour and must not drift again.
+            "reason": "A higher count's worst-case envelope does not fit the workflow's \
+                       enforced wall-clock budget. The engine clamps every attempt to what \
+                       is left of that budget (holding back a small reserve so a failure can \
+                       still be recorded), so a higher count either has its later attempts \
+                       cut short or has them never dispatched at all. Either way the node \
+                       fails and the engine routes that failure normally — sibling results \
+                       are kept — but the retries you configured are not the retries you \
+                       get.",
         }),
         talos_workflow_validation::RetryAdviceBound::ModuleDefault {
             cap_retries,
@@ -9503,10 +9523,44 @@ mod retry_advice_rendering_tests {
         assert_eq!(v["max_retry_count"], 1);
         assert_eq!(v["workflow_budget_secs"], 300);
         assert_eq!(v["rejected_envelope_secs"], 369);
+        // #764: was `contains("discarding every sibling node")`, which pinned
+        // the pre-#686 mechanism. Pinned to the true one instead — a
+        // substring, so the rendering stays free to be reworded but not to
+        // revert to a reactor drop.
         assert!(v["reason"]
             .as_str()
             .unwrap()
-            .contains("discarding every sibling node"));
+            .contains("clamps every attempt"));
+    }
+
+    /// The reason string must name the mechanism the engine runs. Since #686
+    /// the retry loop takes a deadline and clamps every attempt; the sentence
+    /// this asserts against described the pre-#686 loop. Failed on
+    /// `origin/main` @ 1efc9513.
+    #[test]
+    fn the_budget_bound_reason_describes_the_clamp_not_a_reactor_drop() {
+        let v = describe_retry_bound(&RetryAdviceBound::Budget {
+            max_retries: 1,
+            budget_secs: 300,
+            proposed_envelope_secs: 369,
+        });
+        let reason = v["reason"].as_str().unwrap().to_string();
+        assert!(
+            !reason.contains("no view of that deadline"),
+            "stale mechanism: {reason}"
+        );
+        assert!(
+            !reason.contains("whole execution is dropped"),
+            "stale mechanism: {reason}"
+        );
+        assert!(
+            !reason.contains("discarding every sibling node"),
+            "stale mechanism: {reason}"
+        );
+        assert!(
+            reason.contains("clamp"),
+            "does not name the clamp: {reason}"
+        );
     }
 
     /// The cap reported must be the one that APPLIED, not the module default —
