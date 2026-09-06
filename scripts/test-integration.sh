@@ -447,6 +447,16 @@ CTRL_TESTS=(
     # (sub-leg 64b). Fails on pristine main by assertion (`left: 1, right: 0`).
     "rpc_write_ceiling_tests"
     "env_vars"
+    # The hygiene report's stale-draft ADVICE and the DECISION it recommends
+    # (`fix_all`) were built on the same rows and disagreed: `fix_all` has
+    # excluded SUBSTANTIVE drafts since M-I (2026-05-06), the recommendation
+    # never learned it, so one response counted a substantive draft under
+    # "likely scaffolding leftovers … delete with `batch_delete_workflows`"
+    # while the tool it named refused that row. Drives BOTH paths over ONE
+    # report; fails on pristine main by assertion (`left:
+    # ["abandoned-scaffold", "half-built-brief"], right: ["abandoned-scaffold"]`).
+    # `common` DATABASE_URL harness ⇒ CTRL_TESTS, not TC_TESTS (sub-leg 64b).
+    "stale_draft_advice_agreement_tests"
 )
 # 'talos_ctl' is now the migrated TEMPLATE: setup_test_context clones it into a
 # private per-test database (controller/tests/common::isolated_db_pool), so the
