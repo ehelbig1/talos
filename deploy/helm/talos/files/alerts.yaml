@@ -1223,6 +1223,129 @@ groups:
                handful of failures against a same-build fleet is the real shape.
             3. Check S3/MinIO Object Lock is still enforced on the audit bucket.
 
+      # ── The verifier could not READ the chain ────────────────────────
+      #
+      # A SEPARATE series from the one above, and the split is the design:
+      # "the chain is broken" and "I could not look" are different findings.
+      # Folding an object-store blip into the CRITICAL tamper alert above
+      # would train operators to ignore it (#578).
+      #
+      # WHY IT EXISTS. Until 2026-09-06 the `Err` arm of the sweep
+      # incremented NOTHING. Measured on the dev stack that day: the WORM
+      # bucket held 48,946 execution prefixes written since 2026-07-08, the
+      # hourly sweep logged 37 unverifiable executions in one hour, and the
+      # controller's whole history contained ZERO verified chains — because
+      # the verifier was built from the WRITE-ONLY writer's credentials and
+      # every listing came back AccessDenied. A control that had never
+      # functioned read green on every machine-readable surface.
+      #
+      # WARNING, not critical, and deliberately: this says the CONTROL is
+      # not working, not that the ledger is bad. The critical rule above
+      # keeps that job. But an unverifiable ledger means the tamper-evidence
+      # the threat model's Repudiation row claims is not being produced, so
+      # it must not sit at info either.
+      #
+      # `reason` is a CLOSED set from `talos_audit_ledger::ChainVerifyErrorKind`
+      # and every value is PRE-SEEDED at 0 — an `increase(...) > 0` over an
+      # absent series matches nothing, which is exactly how this stayed quiet.
+      - alert: TalosAuditChainUnverifiable
+        expr: increase(talos_audit_chain_unverifiable_total[2h]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          category: audit-integrity
+        annotations:
+          summary: "Audit chain could not be verified (reason={{ $labels.reason }})"
+          description: |
+            {{ $value }} job chain(s) in the last 2h could not be READ. The
+            WORM ledger is keyed per JOB — every object key is
+            <module_executions.id>/… — so this counts module executions, and
+            the sweep's summary line rolls them up to the workflow executions
+            they belong to. The ledger is still being written; nothing is
+            verifying it, so there is currently no tamper-evidence on those
+            runs.
+            reason=access_denied: the verifier identity may not read the audit
+            bucket. On this platform that almost always means the verifier is
+            running as the WRITE-ONLY writer — check
+            AUDIT_VERIFIER_ACCESS_KEY_ID names the read-only verifier user and
+            that the audit_read_only policy is attached to it.
+            reason=no_credentials: no verifier identity is configured at all.
+            reason=empty_chain: the prefix READ CLEANLY and held no events, so
+            nothing was verified — an empty chain trivially satisfies every
+            check. The identity is fine; the prefix is empty. The sweep names
+            <module_executions.id>/ prefixes, the id space the writer keys,
+            where an empty prefix is NOT expected (200 of 200 recent module
+            executions had events, measured 2026-09-06) — so suspect the
+            audit-ledger subscriber (did the batch reach the store?) rather
+            than the verifier, whose identity demonstrably works or this would
+            have been access_denied.
+            reason=no_such_bucket: a provisioning gap, not a permission one.
+            reason=transport / not_found: an object-store fault; check the
+            endpoint before treating this as a control failure.
+          action: |
+            1. security_audit → the `audit_chain_verification` check. It runs
+               the REAL verifier against a recent execution and reports the
+               same classified reason plus its remedy.
+            2. Grep the controller log for
+               event_kind="audit_chain_verification_errored" (per job; the
+               line carries module_execution_id AND workflow_execution_id)
+               and event_kind="audit_chain_sweep_aborted" (the whole pass gave
+               up on a deployment-wide condition).
+            3. Do NOT widen the WRITER's policy to fix this. The writer is
+               PutObject-only by design; the fix is the separate read-only
+               verifier identity.
+
+      # ── The sweep is alive but has verified nothing ──────────────────
+      #
+      # The meta-detector, and the ABSENT-vs-ZERO discipline is the whole
+      # point of its shape. `talos_audit_chain_last_verified_ok_timestamp_seconds`
+      # is deliberately NOT pre-seeded: a zero seed would read as 1970 and
+      # fire this on every healthy cold boot. So absence is a real state and
+      # gets its own arm.
+      #
+      # Gated on the sweep having actually RUN (the sweep-timestamp gauge is
+      # set on every completed pass, whatever it found) — otherwise this
+      # would fire permanently on a deployment with no WORM store, and a
+      # permanently-red alert trains operators to ignore red, which is the
+      # same defect (#625's lesson).
+      #
+      # 6h, not 2h: the sweep defaults to hourly and a quiet window with no
+      # terminal executions legitimately verifies nothing.
+      - alert: TalosAuditChainNeverVerified
+        expr: |
+          (
+            time() - talos_audit_chain_sweep_timestamp_seconds < 7200
+            and absent(talos_audit_chain_last_verified_ok_timestamp_seconds)
+          )
+          or
+          (
+            time() - talos_audit_chain_sweep_timestamp_seconds < 7200
+            and time() - talos_audit_chain_last_verified_ok_timestamp_seconds > 21600
+          )
+        for: 15m
+        labels:
+          severity: warning
+          category: audit-integrity
+        annotations:
+          summary: "Audit-chain sweep is running but has verified nothing"
+          description: |
+            The chain-verification sweep completed a pass within the last 2h,
+            and no job chain has verified clean in the last 6h (or ever, in
+            this controller process — the ABSENT arm). The WORM ledger is
+            being written and nothing is confirming it is intact.
+            This is the shape the dev stack sat in for two months: the loop
+            ran hourly, every listing came back AccessDenied, and no counter,
+            alert or audit check could say so.
+          action: |
+            1. TalosAuditChainUnverifiable should be firing beside this with
+               the classified reason. If it is not, the sweep is finding
+               nothing to verify — check that terminal MODULE executions
+               exist outside the 120s settle window (the sweep enumerates
+               module_executions, not workflow_executions: the ledger is
+               keyed per job).
+            2. security_audit → `audit_chain_verification` for a round-trip
+               verdict on one real job chain.
+
   # ────────────────────────────────────────────────────────────────────
   # Worker fleet identity + build agreement. Both series existed only as
   # controller log lines before 2026-08.

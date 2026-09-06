@@ -1,0 +1,150 @@
+{{- if and .Values.minio.enabled .Values.minio.provisioning.enabled -}}
+# -----------------------------------------------------------------------------
+# WORM audit bucket + its TWO least-privilege identities.
+#
+# WHY THIS FILE EXISTS. Until 2026-09-06 the chart provisioned none of this.
+# The MinIO StatefulSet set only the ROOT credentials; `deploy/k3s/install.sh`
+# generated MINIO_CONTROLLER_USER / _PASSWORD into the bootstrap Secret and the
+# controller Deployment mapped them onto AWS_ACCESS_KEY_ID / _SECRET; and
+# `grep -rn "mc admin" deploy/` matched NOTHING. So on a k3s deploy the
+# audit-logs bucket did not exist and the writer's key named no principal — the
+# ledger dark end to end, while README.md called it a "least-privilege
+# write-only user". This Job is the missing half, and it mirrors the
+# docker-compose `minio-init` recipe deliberately so the two cannot drift.
+#
+# TWO IDENTITIES, and the separation is the design, not an inconvenience:
+#   * audit_write_only  — s3:PutObject on audit-logs/* and nothing else. A
+#     writer that can also list and get is a writer that can survey and target
+#     what it wrote. Do NOT widen this to make verification work.
+#   * audit_read_only   — s3:ListBucket on the bucket + s3:GetObject on its
+#     objects. NO Put, NO Delete: a verifier that can write is not evidence of
+#     anything. `list_objects_v2` needs the first, the chain reader the second.
+#
+# IDEMPOTENT: `mb --ignore-existing`, and already-exists on policy/user
+# creation is tolerated, so it re-runs safely on every upgrade. It is a
+# post-install/post-upgrade hook rather than a pre- one because it must talk to
+# a RUNNING MinIO; the wait loop below is the same shape as the migrations
+# Job's wait-for-postgres initContainer and is bounded by
+# activeDeadlineSeconds rather than by an internal timeout.
+#
+# The verifier user is created from the SAME Secret keys the controller reads
+# as AUDIT_VERIFIER_ACCESS_KEY_ID / _SECRET_ACCESS_KEY. If those keys are
+# absent the container creates the writer and SKIPS the verifier with a loud
+# line — a deployment that has not provisioned a verifier must still get a
+# working ledger, and `security_audit`'s `audit_chain_verification` check is
+# what reports the gap.
+# -----------------------------------------------------------------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "talos.componentName" (list . "minio-provisioning") }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "talos.componentLabels" (list . "minio-provisioning") | nindent 4 }}
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    "helm.sh/hook-weight": "5"
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: 600
+  ttlSecondsAfterFinished: 1200
+  template:
+    metadata:
+      labels:
+        {{- include "talos.componentLabels" (list . "minio-provisioning") | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      {{- include "talos.imagePullSecrets" . | nindent 6 }}
+      securityContext:
+        {{- include "talos.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: mc
+          image: {{ include "talos.image" .Values.minio.provisioning.image }}
+          imagePullPolicy: {{ .Values.minio.provisioning.image.pullPolicy }}
+          securityContext:
+            {{- include "talos.containerSecurityContext" . | nindent 12 }}
+          env:
+            # mc writes its config under $HOME; the container security context
+            # makes the root filesystem read-only, so point it at /tmp.
+            - name: MC_CONFIG_DIR
+              value: /tmp/.mc
+            - name: MINIO_ENDPOINT
+              value: "http://{{ include "talos.componentName" (list . "minio") }}:{{ .Values.minio.service.apiPort }}"
+            - name: AUDIT_BUCKET
+              value: {{ .Values.minio.bucket | quote }}
+            - name: MINIO_ROOT_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: MINIO_ROOT_USER
+            - name: MINIO_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: MINIO_ROOT_PASSWORD
+            - name: MINIO_CONTROLLER_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: MINIO_CONTROLLER_USER
+            - name: MINIO_CONTROLLER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: MINIO_CONTROLLER_PASSWORD
+            - name: MINIO_VERIFIER_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: MINIO_VERIFIER_USER
+                  optional: true
+            - name: MINIO_VERIFIER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: MINIO_VERIFIER_PASSWORD
+                  optional: true
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -eu
+              mkdir -p /tmp/.mc
+
+              echo "waiting for MinIO at $MINIO_ENDPOINT ..."
+              until mc alias set talos "$MINIO_ENDPOINT" "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD" >/dev/null 2>&1; do
+                sleep 2
+              done
+
+              mc mb "talos/$AUDIT_BUCKET" --ignore-existing
+
+              # audit_write_only — PutObject and nothing else.
+              cat > /tmp/audit-write-policy.json <<'POLICY'
+              {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:PutObject"],"Resource":["arn:aws:s3:::BUCKET/*"]}]}
+              POLICY
+              sed -i "s|BUCKET|$AUDIT_BUCKET|g" /tmp/audit-write-policy.json
+              mc admin policy create talos audit_write_only /tmp/audit-write-policy.json || true
+              mc admin user add talos "$MINIO_CONTROLLER_USER" "$MINIO_CONTROLLER_PASSWORD" || true
+              mc admin policy attach talos audit_write_only --user "$MINIO_CONTROLLER_USER" || true
+              echo "writer identity ready (policy audit_write_only)"
+
+              # audit_read_only — ListBucket on the bucket, GetObject on its
+              # objects. Both arns are required and they are DIFFERENT: the
+              # bucket arn for the listing, the object arn for the reads.
+              if [ -n "${MINIO_VERIFIER_USER:-}" ] && [ -n "${MINIO_VERIFIER_PASSWORD:-}" ]; then
+                cat > /tmp/audit-read-policy.json <<'POLICY'
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:ListBucket"],"Resource":["arn:aws:s3:::BUCKET"]},{"Effect":"Allow","Action":["s3:GetObject"],"Resource":["arn:aws:s3:::BUCKET/*"]}]}
+              POLICY
+                sed -i "s|BUCKET|$AUDIT_BUCKET|g" /tmp/audit-read-policy.json
+                mc admin policy create talos audit_read_only /tmp/audit-read-policy.json || true
+                mc admin user add talos "$MINIO_VERIFIER_USER" "$MINIO_VERIFIER_PASSWORD" || true
+                mc admin policy attach talos audit_read_only --user "$MINIO_VERIFIER_USER" || true
+                echo "verifier identity ready (policy audit_read_only)"
+              else
+                echo "WARNING: MINIO_VERIFIER_USER/PASSWORD not set in the bootstrap secret."
+                echo "WARNING: the WORM audit ledger will be WRITTEN and never VERIFIED."
+                echo "WARNING: security_audit's audit_chain_verification check will report this."
+              fi
+          resources:
+            {{- toYaml .Values.minio.provisioning.resources | nindent 12 }}
+{{- end }}

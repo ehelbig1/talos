@@ -5324,7 +5324,7 @@ async fn handle_get_workflow_risk_assessment(
         // following the un-budgeted form. Resolved through the SAME budget
         // posture classifier the timeout finding above uses, and the same
         // ceiling function the validator and the retry advisor use.
-        let budget_ceiling = talos_workflow_validation::node_budget_retry_ceiling(
+        let retry_budget = talos_workflow_validation::node_retry_budget(
             node,
             match talos_workflow_validation::workflow_timeout_posture(&graph) {
                 talos_workflow_validation::WorkflowTimeoutPosture::Declared(s) => s,
@@ -5333,24 +5333,36 @@ async fn handle_get_workflow_risk_assessment(
             },
             talos_workflow_engine_core::default_node_timeout_secs(),
         );
-        let applied_retry_count = budget_ceiling.map_or(finding.world_default_retries, |c| {
-            c.min(finding.world_default_retries)
-        });
+        let applied_retry_count = retry_budget
+            .ceiling
+            .map_or(finding.world_default_retries, |c| {
+                c.min(finding.world_default_retries)
+            });
         risks.push(serde_json::json!({
             "risk_level": "medium",
             "category": "missing_retry",
             "node_id": node_id,
             "description": talos_workflow_validation::describe_disabled_retry_protection(
-                &finding, node_id, None, None, 0, 0, budget_ceiling,
+                &finding, node_id, None, None, 0, 0, &retry_budget,
             ),
             // The description (rendered by the shared #696 formatter) already
             // states both branches of the decision and the value to use. This
             // names the tool that applies it rather than restating them.
+            // #766: this branch carried its OWN copy of the truncated wording
+            // ("even its single first attempt can outrun the budget" in the
+            // sibling), which is false for the CLAMPED shape — and on the
+            // reference fleet 2026-09-06 every live zero-ceiling node was
+            // clamped. The reason now comes from `zero_ceiling_reason`, the
+            // same one the validator's finding uses, so the two surfaces
+            // cannot say different things about one node.
             "recommendation": if applied_retry_count == 0 {
                 format!(
                     "If the 0 is not deliberate: no retry count fits this workflow's budget at \
-                     node '{node_id}'s per-attempt timeout — raise execution_timeout_secs or \
-                     lower the node's timeout_secs first."
+                     node '{node_id}'s per-attempt timeout ({reason}) — raise \
+                     execution_timeout_secs or lower the node's timeout_secs first.",
+                    reason = retry_budget
+                        .zero_ceiling_reason()
+                        .unwrap_or_else(|| "the budget leaves no room".to_string()),
                 )
             } else {
                 format!(

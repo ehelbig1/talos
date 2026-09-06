@@ -257,6 +257,12 @@ jobs:
           # above is precisely what hid the fact that it ran nowhere. DB-free
           # — literal JSON + literal MAC hex, no Postgres.
           cargo nextest run -p talos-memory --test wire_format_snapshots
+          # DB-free and store-free: it MUTATES PROCESS ENV (AWS_* vs the
+          # verifier's own variables) to pin that the audit-chain verifier
+          # never falls back to the write-only writer's credentials, so it owns
+          # its process — one test, one binary. Same isolation reason as
+          # csrf_integration_tests two steps up.
+          cargo nextest run -p talos-audit-ledger --test verifier_identity_tests
           cargo nextest run -p worker \
             --test runtime_test \
             --test runtime_integration_test \

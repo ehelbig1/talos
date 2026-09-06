@@ -1074,13 +1074,15 @@ fn grade_a_is_reachable_in_development_only_at_perfection() {
 fn weights_sum_to_max_score() {
     let sum: u32 = CHECK_WEIGHTS.iter().map(|(_, p, _)| *p).sum();
     assert_eq!(sum, MAX_SCORE, "CHECK_WEIGHTS no longer sums to MAX_SCORE");
-    // Nine SCORED checks plus `write_ceiling_enforcement`, which is weighted 0
-    // on purpose (see its CHECK_WEIGHTS entry). Ten entries, nine weights.
-    assert_eq!(CHECK_WEIGHTS.len(), 10);
+    // Nine SCORED checks plus TWO deliberately weighted 0 —
+    // `write_ceiling_enforcement` and `audit_chain_verification` (each entry
+    // argues its own zero; the second does not borrow the first's reasons, and
+    // only one of the three applies to it). Eleven entries, nine weights.
+    assert_eq!(CHECK_WEIGHTS.len(), 11);
     assert_eq!(
         CHECK_WEIGHTS.iter().filter(|(_, p, _)| *p > 0).count(),
         9,
-        "exactly one check is deliberately unweighted"
+        "exactly two checks are deliberately unweighted"
     );
 }
 
@@ -1567,4 +1569,505 @@ fn scoring_changes_did_not_disturb_verification_semantics() {
         !rec.to_lowercase().contains("failing control"),
         "an unverified check is not a failure: {rec}"
     );
+}
+
+// ───────────────────────────────────────────────────────────────────────────
+// audit_chain_verification
+//
+// The renderer, every arm. What separates these from a presence test is the
+// THIRD arm: `Unverifiable` is the state the live dev stack was in for two
+// months while every other surface read green, and it must render `Fail`, not
+// `Pass` and not `Warn`. `the_unverifiable_arm_never_renders_a_pass` is the
+// mutation guard the brief asked for.
+// ───────────────────────────────────────────────────────────────────────────
+
+fn sweep(
+    verified_ok: usize,
+    errored: usize,
+    aborted: Option<talos_audit_ledger::ChainVerifyErrorKind>,
+    cap_hit: bool,
+) -> talos_audit_ledger::ChainSweepSnapshot {
+    talos_audit_ledger::ChainSweepSnapshot {
+        scanned: verified_ok + errored,
+        verified_ok,
+        empty: 0,
+        failed: 0,
+        errored,
+        unbound: 0,
+        cap_hit,
+        aborted,
+        // One job per workflow execution in the fixture — enough to prove the
+        // roll-up is RENDERED; `roll_up_by_workflow_execution`'s own tests own
+        // the arithmetic.
+        rollup: talos_audit_ledger::WorkflowExecutionRollup {
+            covered: verified_ok + errored,
+            verified_ok,
+            errored,
+            ..talos_audit_ledger::WorkflowExecutionRollup::default()
+        },
+        finished_at_unix: 1_757_000_000,
+    }
+}
+
+#[test]
+fn a_verified_chain_passes_as_a_round_trip() {
+    let c = check_audit_chain_verification(
+        &AuditChainProbe::Verified {
+            execution_id: "ex-1".to_string(),
+            workflow_execution_id: "wfx-1".to_string(),
+            total_events: 12,
+            signatures_checked: true,
+        },
+        Some(sweep(37, 0, None, false)),
+    );
+    assert_eq!(c.status, Status::Pass);
+    assert_eq!(c.verification, Verification::RoundTrip);
+    assert_eq!(c.points, 0);
+    assert!(c.detail.contains("12 event(s)"), "{}", c.detail);
+    assert!(c.detail.contains("37 verified"), "{}", c.detail);
+}
+
+/// A chain that verified without a signing key proved sequence and linkage
+/// only, and must say so — a `Pass` that silently means less than the reader
+/// thinks is the class this crate removes.
+#[test]
+fn a_verified_chain_without_keys_states_what_it_did_not_check() {
+    let c = check_audit_chain_verification(
+        &AuditChainProbe::Verified {
+            execution_id: "ex-1".to_string(),
+            workflow_execution_id: "wfx-1".to_string(),
+            total_events: 3,
+            signatures_checked: false,
+        },
+        None,
+    );
+    assert_eq!(c.status, Status::Pass);
+    assert!(c.detail.contains("WITHOUT HMAC signatures"), "{}", c.detail);
+}
+
+#[test]
+fn a_broken_chain_fails_and_says_critical() {
+    let c = check_audit_chain_verification(
+        &AuditChainProbe::Broken {
+            execution_id: "ex-2".to_string(),
+            workflow_execution_id: "wfx-1".to_string(),
+            breaks: 2,
+        },
+        Some(sweep(0, 0, None, false)),
+    );
+    assert_eq!(c.status, Status::Fail);
+    assert_eq!(c.verification, Verification::RoundTrip);
+    assert!(c.detail.starts_with("CRITICAL"), "{}", c.detail);
+    assert_eq!(c.points, 0);
+}
+
+/// The arm this check was written for. A control that cannot read what it
+/// verifies is a FAILING control, and the wording must separate that from
+/// tamper evidence — the two call for opposite first moves (fix the identity
+/// vs. freeze the evidence).
+#[test]
+fn the_unverifiable_arm_never_renders_a_pass() {
+    for reason in talos_audit_ledger::ChainVerifyErrorKind::ALL {
+        let c = check_audit_chain_verification(
+            &AuditChainProbe::Unverifiable {
+                reason: *reason,
+                remedy: "probe remedy",
+            },
+            Some(sweep(0, 37, Some(*reason), false)),
+        );
+        assert_eq!(
+            c.status,
+            Status::Fail,
+            "unverifiable ({}) must never render a pass",
+            reason.metric_label()
+        );
+        assert_eq!(c.verification, Verification::RoundTrip);
+        assert_eq!(c.points, 0);
+        assert!(
+            c.detail.contains(reason.metric_label()),
+            "the classified reason must reach the operator: {}",
+            c.detail
+        );
+        assert!(
+            c.detail
+                .contains("NON-FUNCTIONAL control, not a tamper finding"),
+            "{}",
+            c.detail
+        );
+    }
+}
+
+/// The state this platform is ACTUALLY in once the verifier identity is
+/// repaired: the read succeeds and returns nothing.
+///
+/// `verify_chain` over zero events answers `ok == true`, so without this arm
+/// the check would render a green PASS over a read that found nothing — which
+/// is the same defect as the AccessDenied it replaced, wearing the opposite
+/// face. The candidate is now drawn from `module_executions`, the id space
+/// the writer keys, where an empty prefix is rare (200 of 200 recent module
+/// executions had events, measured 2026-09-06) rather than universal — so
+/// this arm has moved from "the whole population" to "a real finding about
+/// one job", and it must still never render a Pass.
+#[test]
+fn an_empty_chain_never_renders_a_pass() {
+    let c = check_audit_chain_verification(
+        &AuditChainProbe::EmptyChain {
+            execution_id: "ex-3".to_string(),
+            workflow_execution_id: "wfx-1".to_string(),
+        },
+        Some(sweep(0, 0, None, false)),
+    );
+    assert_eq!(c.status, Status::Warn);
+    assert_eq!(c.verification, Verification::NotVerified);
+    assert_eq!(c.points, 0);
+    assert!(c.detail.starts_with("NOT VERIFIED"), "{}", c.detail);
+    assert!(c.detail.contains("held ZERO events"), "{}", c.detail);
+    // The identity is NOT the problem here, and saying so is what stops an
+    // operator chasing a permission fault that does not exist.
+    assert!(
+        c.detail.contains("verifier IDENTITY is working"),
+        "{}",
+        c.detail
+    );
+}
+
+/// No object store at all is a deployment WITHOUT the control, not a broken
+/// one — and it still has to say that the tamper-evidence the threat model
+/// claims is absent here.
+#[test]
+fn no_ledger_configured_is_info_not_fail() {
+    let c = check_audit_chain_verification(&AuditChainProbe::NoLedgerConfigured, None);
+    assert_eq!(c.status, Status::Info);
+    assert_eq!(c.verification, Verification::Parsed);
+    assert!(c.detail.contains("nothing to verify"), "{}", c.detail);
+    assert!(c.detail.contains("Repudiation"), "{}", c.detail);
+}
+
+/// Nothing eligible, or a failed candidate query, is NOT_VERIFIED — never a
+/// pass. `recommendation_for` pulls unverified checks out of the warn clause,
+/// so this lands in the "could not tell" sentence rather than in "fix this".
+#[test]
+fn nothing_to_verify_is_not_verified_and_says_why() {
+    let c = check_audit_chain_verification(
+        &AuditChainProbe::NothingToVerify {
+            why: "the candidate-execution query failed (connection reset), so nobody looked."
+                .to_string(),
+        },
+        None,
+    );
+    assert_eq!(c.status, Status::Warn);
+    assert_eq!(c.verification, Verification::NotVerified);
+    assert!(c.detail.starts_with("NOT VERIFIED"), "{}", c.detail);
+    assert!(c.detail.contains("nobody looked"), "{}", c.detail);
+}
+
+/// A sweep that aborted must not have its zero counts read as clean — the same
+/// trap `cap_hit` exists for, one condition over.
+#[test]
+fn an_aborted_sweep_is_not_a_clean_bill_of_health() {
+    let c = check_audit_chain_verification(
+        &AuditChainProbe::Unverifiable {
+            reason: talos_audit_ledger::ChainVerifyErrorKind::AccessDenied,
+            remedy: "probe remedy",
+        },
+        Some(sweep(
+            0,
+            1,
+            Some(talos_audit_ledger::ChainVerifyErrorKind::AccessDenied),
+            false,
+        )),
+    );
+    assert!(
+        c.detail.contains("not a clean bill of health"),
+        "{}",
+        c.detail
+    );
+
+    let capped = check_audit_chain_verification(
+        &AuditChainProbe::Verified {
+            execution_id: "ex".to_string(),
+            workflow_execution_id: "wfx-1".to_string(),
+            total_events: 1,
+            signatures_checked: true,
+        },
+        Some(sweep(500, 0, None, true)),
+    );
+    assert!(capped.detail.contains("row cap"), "{}", capped.detail);
+}
+
+/// No sweep snapshot means no pass has completed IN THIS PROCESS. UNKNOWN is
+/// not zero: it must never read as "the standing control verified nothing".
+#[test]
+fn an_absent_sweep_snapshot_reads_as_not_yet_run() {
+    let c = check_audit_chain_verification(
+        &AuditChainProbe::Verified {
+            execution_id: "ex".to_string(),
+            workflow_execution_id: "wfx-1".to_string(),
+            total_events: 1,
+            signatures_checked: true,
+        },
+        None,
+    );
+    assert!(
+        c.detail.contains("has not completed a pass"),
+        "{}",
+        c.detail
+    );
+    assert!(
+        !c.detail.contains("0 verified"),
+        "an absent snapshot must not render as a zero count: {}",
+        c.detail
+    );
+}
+
+/// Every arm of the new check costs exactly nothing, in both directions — the
+/// `unweighted_checks_cost_nothing` rule applied to the second zero-weighted
+/// check. A `Fail` arm that quietly forfeited points would inflate the
+/// shortfall an operator is asked to explain.
+#[test]
+fn the_chain_check_costs_nothing_in_every_arm() {
+    let probes = [
+        AuditChainProbe::Verified {
+            execution_id: "e".to_string(),
+            workflow_execution_id: "wfx-1".to_string(),
+            total_events: 1,
+            signatures_checked: true,
+        },
+        AuditChainProbe::Broken {
+            execution_id: "e".to_string(),
+            workflow_execution_id: "wfx-1".to_string(),
+            breaks: 1,
+        },
+        AuditChainProbe::Unverifiable {
+            reason: talos_audit_ledger::ChainVerifyErrorKind::AccessDenied,
+            remedy: "r",
+        },
+        AuditChainProbe::EmptyChain {
+            execution_id: "e".to_string(),
+            workflow_execution_id: "wfx-1".to_string(),
+        },
+        AuditChainProbe::NoLedgerConfigured,
+        AuditChainProbe::NothingToVerify {
+            why: "w".to_string(),
+        },
+    ];
+    for p in &probes {
+        let c = check_audit_chain_verification(p, None);
+        assert_eq!(c.points, 0, "{} awarded points", c.name);
+        assert_eq!(c.max_points(), 0, "{} contributes to max_score", c.name);
+        assert_eq!(c.forfeited(), 0, "{} invented a shortfall", c.name);
+    }
+}
+
+/// The claim the WEIGHT-0 decision rests on, pinned rather than asserted in a
+/// comment.
+///
+/// `CHECK_WEIGHTS` says the zero "does NOT make it decorative" because a
+/// failing chain check lands in `status_counts.fail` and in
+/// `recommendation_for`, which names failing checks BY NAME. That is a
+/// property of another function, and a prose claim about another function is
+/// exactly what this file keeps catching in other people's code.
+#[test]
+fn a_failing_chain_check_reaches_the_operator_despite_the_zero_weight() {
+    let broken = check_audit_chain_verification(
+        &AuditChainProbe::Broken {
+            execution_id: "ex".to_string(),
+            workflow_execution_id: "wfx-1".to_string(),
+            breaks: 1,
+        },
+        None,
+    );
+    let rec = recommendation_for(&[broken.clone()]);
+    assert!(
+        rec.contains("audit_chain_verification"),
+        "a zero-weighted FAIL must still be named to the operator: {rec}"
+    );
+    assert!(rec.contains("failing control"), "{rec}");
+    // And it must not invent a shortfall: 0 of 0 forfeited.
+    let report = render_report(&[broken]);
+    assert_eq!(report["status_counts"]["fail"], 1);
+    assert_eq!(report["score_accounting"]["forfeited"], 0);
+
+    // The EmptyChain arm goes to the "could not be verified" clause instead —
+    // it is not a failure of the control, it is a read that found nothing.
+    let empty = check_audit_chain_verification(
+        &AuditChainProbe::EmptyChain {
+            execution_id: "ex".to_string(),
+            workflow_execution_id: "wfx-1".to_string(),
+        },
+        None,
+    );
+    let rec = recommendation_for(&[empty]);
+    assert!(rec.contains("could not be verified"), "{rec}");
+    assert!(rec.contains("audit_chain_verification"), "{rec}");
+}
+
+/// The check must SAY which id space it verified.
+///
+/// The ledger is keyed per JOB and every other report on this platform is
+/// keyed on `workflow_executions.id`, so a Pass reading "the chain for
+/// execution <uuid> verified" is ambiguous in exactly the way that produced
+/// this whole change: the id looks like an execution id, and a reader who
+/// resolves it against `workflow_executions` finds nothing. Both ids and the
+/// key space are named, so no reader has to guess.
+#[test]
+fn the_pass_names_the_id_space_it_verified() {
+    let c = check_audit_chain_verification(
+        &AuditChainProbe::Verified {
+            execution_id: "me-9".to_string(),
+            workflow_execution_id: "wfx-9".to_string(),
+            total_events: 3,
+            signatures_checked: true,
+        },
+        Some(sweep(4, 0, None, false)),
+    );
+    assert_eq!(c.status, Status::Pass);
+    assert!(c.detail.contains("MODULE EXECUTION me-9"), "{}", c.detail);
+    assert!(
+        c.detail.contains("workflow execution wfx-9"),
+        "the run an operator would look up must be named too: {}",
+        c.detail
+    );
+    assert!(
+        c.detail.contains(talos_audit_ledger::LEDGER_KEY_SPACE),
+        "the key space must be named from its ONE home, not spelled out again: {}",
+        c.detail
+    );
+    assert!(
+        c.detail
+            .contains(talos_audit_ledger::LEDGER_GENESIS_WORKFLOW_COLUMN),
+        "{}",
+        c.detail
+    );
+}
+
+/// The Broken and EmptyChain arms carry the same pair, for the same reason:
+/// an operator handed a bare id during a suspected-tamper investigation must
+/// not have to work out which table to look in.
+#[test]
+fn every_chain_arm_names_both_ids() {
+    for probe in [
+        AuditChainProbe::Broken {
+            execution_id: "me-b".to_string(),
+            workflow_execution_id: "wfx-b".to_string(),
+            breaks: 2,
+        },
+        AuditChainProbe::EmptyChain {
+            execution_id: "me-b".to_string(),
+            workflow_execution_id: "wfx-b".to_string(),
+        },
+    ] {
+        let c = check_audit_chain_verification(&probe, None);
+        assert!(c.detail.contains("me-b"), "{}", c.detail);
+        assert!(
+            c.detail.contains("wfx-b"),
+            "{:?} dropped the workflow execution: {}",
+            probe,
+            c.detail
+        );
+    }
+}
+
+/// The sweep note reports BOTH grains, and never lets the per-job numbers
+/// stand in for the per-workflow-execution ones.
+///
+/// The mutation this catches: rendering only `scanned`/`verified_ok` after the
+/// population moved to jobs. "37 verified" then answers a question nobody
+/// asked — an operator wants to know how many of their RUNS have an intact
+/// audit trail, and one broken job among four makes that run's trail broken.
+#[test]
+fn the_sweep_note_reports_both_grains() {
+    let snapshot = talos_audit_ledger::ChainSweepSnapshot {
+        scanned: 12,
+        verified_ok: 9,
+        empty: 1,
+        failed: 1,
+        errored: 1,
+        unbound: 0,
+        cap_hit: false,
+        aborted: None,
+        rollup: talos_audit_ledger::WorkflowExecutionRollup {
+            covered: 4,
+            verified_ok: 1,
+            empty: 1,
+            errored: 1,
+            failed: 1,
+        },
+        finished_at_unix: 1_757_000_000,
+    };
+    let c = check_audit_chain_verification(
+        &AuditChainProbe::Verified {
+            execution_id: "me".to_string(),
+            workflow_execution_id: "wfx".to_string(),
+            total_events: 1,
+            signatures_checked: true,
+        },
+        Some(snapshot),
+    );
+    assert!(c.detail.contains("12 JOB chain(s) scanned"), "{}", c.detail);
+    assert!(
+        c.detail.contains("4 workflow execution(s)"),
+        "the roll-up must be rendered, not merely computed: {}",
+        c.detail
+    );
+}
+
+/// A job with no workflow execution was NOT attempted, and the note must say
+/// so rather than let it sit inside a clean count.
+#[test]
+fn unbound_jobs_are_disclosed_not_absorbed() {
+    let snapshot = talos_audit_ledger::ChainSweepSnapshot {
+        scanned: 5,
+        verified_ok: 3,
+        empty: 0,
+        failed: 0,
+        errored: 0,
+        unbound: 2,
+        cap_hit: false,
+        aborted: None,
+        rollup: talos_audit_ledger::WorkflowExecutionRollup {
+            covered: 3,
+            verified_ok: 3,
+            ..talos_audit_ledger::WorkflowExecutionRollup::default()
+        },
+        finished_at_unix: 1_757_000_000,
+    };
+    let c = check_audit_chain_verification(
+        &AuditChainProbe::Verified {
+            execution_id: "me".to_string(),
+            workflow_execution_id: "wfx".to_string(),
+            total_events: 1,
+            signatures_checked: true,
+        },
+        Some(snapshot),
+    );
+    assert!(
+        c.detail.contains("NOT attempted"),
+        "an unattempted job must never arrive inside a clean count: {}",
+        c.detail
+    );
+    assert!(c.detail.contains("2 job(s)"), "{}", c.detail);
+}
+
+/// A candidate the caller could not resolve must NOT be rendered as "there is
+/// nothing to verify" — the three-valued candidate exists so a database blip
+/// cannot become a determinate negative about the chain.
+#[tokio::test]
+async fn an_unreadable_candidate_is_distinguished_from_an_empty_one() {
+    let unreadable = probe_audit_chain(&AuditChainCandidate::Unreadable(
+        "connection reset".to_string(),
+    ))
+    .await;
+    let empty = probe_audit_chain(&AuditChainCandidate::NoneEligible).await;
+    match (&unreadable, &empty) {
+        (
+            AuditChainProbe::NothingToVerify { why: a },
+            AuditChainProbe::NothingToVerify { why: b },
+        ) => {
+            assert!(a.contains("nobody looked"), "{a}");
+            assert!(b.contains("quiet deployment"), "{b}");
+            assert_ne!(a, b);
+        }
+        other => panic!("unexpected probe outcomes: {other:?}"),
+    }
 }

@@ -1276,6 +1276,33 @@ minio:
 
   bucket: "audit-logs"
 
+  # Bucket + least-privilege user provisioning.
+  #
+  # Until 2026-09-06 this chart provisioned NONE of it: the StatefulSet set
+  # only the ROOT credentials, install.sh generated a "controller" user and
+  # password that no `mc admin` invocation anywhere under deploy/ ever created,
+  # and README.md described it as a "least-privilege write-only user". On a
+  # k3s deploy the audit bucket would not exist and the writer's key would name
+  # no principal — the ledger dark end to end, and the chain verifier reporting
+  # NoSuchBucket rather than AccessDenied. This Job mirrors the compose recipe
+  # for BOTH identities and is idempotent (`mb --ignore-existing`, and
+  # already-exists on policy/user creation is tolerated), so it can re-run on
+  # every `helm upgrade`.
+  provisioning:
+    enabled: true
+    image:
+      repository: minio/mc
+      tag: "latest"
+      digest: "sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727"
+      pullPolicy: IfNotPresent
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+
 # ----------------------------------------------------------------------------
 # Ollama — optional local LLM inference (tier-1 actor data-privacy gate).
 # Skip in Phase 2 unless GPU nodes are available.
@@ -1610,6 +1637,17 @@ bootstrapSecret:
     MINIO_CONTROLLER_PASSWORD: ""
     MINIO_WORKER_USER: ""
     MINIO_WORKER_PASSWORD: ""
+    # The audit-chain VERIFIER — a SEPARATE, read-only identity
+    # (policy `audit_read_only`: s3:ListBucket on the bucket +
+    # s3:GetObject on its objects; NO Put, NO Delete). The controller's
+    # hourly chain-verification sweep and the on-demand admin verify are
+    # built from these EXPLICITLY; there is no AWS_* fallback, because
+    # AWS_* is the WRITE-ONLY writer above and cannot list or get by
+    # design. Leave unset only if you accept that the WORM ledger is
+    # written and never verified — `security_audit`'s
+    # `audit_chain_verification` check reports exactly that.
+    MINIO_VERIFIER_USER: ""
+    MINIO_VERIFIER_PASSWORD: ""
     # Optional — LLM provider keys. Controller-only; never shipped to worker.
     ANTHROPIC_API_KEY: ""
     OPENAI_API_KEY: ""

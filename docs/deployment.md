@@ -91,7 +91,7 @@ The production overlay:
 | `EXECUTION_RETENTION_DAYS` | `30` | Days an **archived** execution is kept before permanent deletion (total lifetime = the two windows summed) |
 | `EXECUTION_MAX_ROWS` | `100000` | Max execution rows before eviction |
 | `AUDIT_LOG_RETENTION_DAYS` | `90` | Days to keep audit logs |
-| `AUDIT_CHAIN_SWEEP_INTERVAL_SECS` | `3600` | Cadence of the continuous WORM audit-chain verification sweep (clamped [300, 86400]; `0` disables). No-op without a WORM S3/MinIO endpoint; verification also needs `TALOS_AUDIT_SIGNING_KEY`. Logs `audit_chain_verification_failed` on any break. |
+| `AUDIT_CHAIN_SWEEP_INTERVAL_SECS` | `3600` | Cadence of the continuous WORM audit-chain verification sweep (clamped [300, 86400]; `0` disables). No-op without a WORM S3/MinIO endpoint; verification also needs `TALOS_AUDIT_SIGNING_KEY`. Each pass verifies up to 2000 JOB chains (`module_executions`) whose `completed_at` falls in the last 2× the interval, and logs `audit_chain_verification_failed` on any break. Lower the interval if your completion rate puts more than 2000 module executions in one window — the sweep keeps no cursor, so rows past the cap age out unverified and say so via `audit_chain_sweep_incomplete`. |
 | `WASM_CACHE_RETENTION_DAYS` | `30` | Days to keep unused WASM modules |
 | `WASM_CACHE_MAX_MODULES` | `1000` | Max cached WASM modules |
 | `WASM_CACHE_MAX_SIZE_MB` | `500` | Max WASM cache size in MB |
@@ -338,6 +338,64 @@ Talos uses S3-compatible object storage for the audit ledger and module artifact
 | `S3_REGION` | AWS region (or `us-east-1` for MinIO) | `us-east-1` |
 
 For local development, the default Docker Compose setup includes a MinIO instance. For production, use AWS S3 or a self-hosted MinIO cluster with TLS and non-default credentials.
+
+### The audit bucket has TWO identities, deliberately
+
+The WORM audit ledger is written by one principal and verified by a different
+one, and they must not be merged:
+
+| Identity | Compose / Secret keys | Controller env | Policy |
+|---|---|---|---|
+| **Writer** | `MINIO_CONTROLLER_USER` / `MINIO_CONTROLLER_PASSWORD` | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | `audit_write_only` — `s3:PutObject` on `audit-logs/*` and nothing else |
+| **Verifier** | `MINIO_VERIFIER_USER` / `MINIO_VERIFIER_PASSWORD` | `AUDIT_VERIFIER_ACCESS_KEY_ID` / `AUDIT_VERIFIER_SECRET_ACCESS_KEY` | `audit_read_only` — `s3:ListBucket` on the bucket + `s3:GetObject` on its objects; **no Put, no Delete** |
+
+A writer that can also list and get is a writer that can survey and target what
+it wrote; a verifier that can write is not evidence of anything. **Do not widen
+the writer's policy to make verification work** — the fix is the separate
+read-only identity.
+
+Both users and both policies are provisioned by the `minio-init` container in
+`docker-compose.yml` and by the `minio-provisioning` Job in the Helm chart
+(`minio.provisioning.enabled`, default true), which mirror each other and are
+idempotent.
+
+**If the verifier is not configured**, the ledger is still written and nothing
+verifies it. The controller says so rather than staying quiet: the sweep refuses
+to start with one `audit_chain_verifier_identity_missing` ERROR, the
+`talos_audit_chain_unverifiable_total{reason="no_credentials"}` counter moves,
+`TalosAuditChainUnverifiable` fires, and `security_audit`'s
+`audit_chain_verification` check renders `fail`. That instrumentation exists
+because the opposite state — a verifier silently running as the writer, every
+listing denied, and no surface able to report it — was live on the dev stack
+from 2026-07-08 to 2026-09-06.
+
+### What gets verified: one chain PER JOB
+
+The ledger has no chain at the grain of a workflow execution. A chain is
+created per MODULE DISPATCH: the worker builds
+`ExecutionLedger::new(workflow_execution_id, job_id)`, `job_id` IS
+`module_executions.id`, and every object key is
+`<module_executions.id>/<min>_<max>_<nanos>.jsonl`. The genesis hash binds BOTH
+halves, so a verifier that names the wrong `workflow_id` reports a break on a
+healthy chain rather than quietly getting a near-miss.
+
+So a run with four module dispatches has FOUR chains. The hourly sweep verifies
+each and rolls the outcomes up to the workflow execution, **worst outcome
+wins** — one broken chain among four makes that run's audit trail broken, not
+three-quarters clean — and its summary line carries both grains
+(`jobs_scanned` / `jobs_verified_ok` / … beside `workflow_executions_covered` /
+`workflow_executions_verified_ok` / …). The admin `verifyAuditChain` GraphQL
+query takes the workflow-execution id you already have, resolves it to its jobs,
+and returns per-job reports under an aggregate.
+
+**An empty prefix is not a verified chain**, and this is the trap worth
+knowing: `verify_chain` over zero events answers `ok == true` (there are no
+gaps, no broken links and no bad signatures in nothing). It is reported under
+its own reason (`talos_audit_chain_unverifiable_total{reason="empty_chain"}`),
+never as `verified_ok`, and it never stamps the "last verified ok" gauge. If it
+is the whole population, suspect the audit-ledger subscriber rather than the
+verifier — the identity demonstrably works or the reason would be
+`access_denied`.
 
 ## Email Configuration
 

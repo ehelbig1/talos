@@ -65,7 +65,53 @@ The MCP endpoint exposes 348+ tools via JSON-RPC over SSE and Streamable HTTP tr
 ### Repudiation
 - **Threat:** Admin invokes destructive operations (delete workflow, modify secrets) without audit trail.
 - **Mitigation:** Audit ledger with HMAC-signed events and hash chains. The WORM consumer **verifies the per-event HMAC and recomputes the event hash inline before S3 persist**, quarantining failures to an Object-Locked `rejected/` prefix (not silently dropped); an offline `verify_chain`/`verify_execution_chain` validates sequence contiguity, `previous_hash` linkage, and genesis across the full chain (finding #2). Immutability triggers on 4 audit tables prevent UPDATE/DELETE. `admin_event_log` records all admin actions.
-- **File:** `talos-audit-event` (shared chain/HMAC + `verify_chain`), `talos-audit-ledger` (consumer + inline verify + S3 verifier), `worker/src/audit.rs`
+- **Two identities, and the separation is load-bearing.** The audit bucket has a
+  WRITER and a VERIFIER and they must not be the same principal:
+  - **Writer** — `MINIO_CONTROLLER_USER`, policy `audit_write_only`
+    (`s3:PutObject` on `audit-logs/*` and nothing else), reaching the controller
+    as `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`. A writer that can also list
+    and get is a writer that can survey and target what it wrote.
+  - **Verifier** — `MINIO_VERIFIER_USER`, policy `audit_read_only`
+    (`s3:ListBucket` on the bucket + `s3:GetObject` on its objects; NO Put, NO
+    Delete), reaching the controller as `AUDIT_VERIFIER_ACCESS_KEY_ID` /
+    `AUDIT_VERIFIER_SECRET_ACCESS_KEY`. The hourly chain-verification sweep and
+    the on-demand admin `verifyAuditChain` query build their S3 client from
+    these EXPLICITLY — there is no `AWS_*` fallback, because `AWS_*` is the
+    write-only writer.
+  Until 2026-09-06 both read paths borrowed the writer's key. Measured on the
+  dev stack that day: the bucket held 48,946 execution prefixes written since
+  2026-07-08, the sweep logged 37 unverifiable executions in one hour, and the
+  controller's entire history contained ZERO verified chains — every
+  `list_objects_v2` came back AccessDenied. **The mitigation above was written
+  and never functioned**, and no counter, alert or audit check could say so.
+  With the verifier absent the sweep now refuses to start, logs one
+  `audit_chain_verifier_identity_missing` ERROR, increments
+  `talos_audit_chain_unverifiable_total{reason="no_credentials"}`, and
+  `security_audit`'s `audit_chain_verification` check reports the control as
+  non-functional rather than reporting nothing.
+- **The ledger is keyed PER JOB, and every reader now names that id space.**
+  A chain exists per MODULE DISPATCH, not per workflow execution: the worker
+  builds `ExecutionLedger::new(req.workflow_execution_id, req.job_id)`, `job_id`
+  IS `module_executions.id`, and the S3 object key is
+  `<module_executions.id>/<min>_<max>_<nanos>.jsonl`. The genesis hash binds
+  BOTH halves, so naming the wrong `workflow_id` is a reported break rather
+  than a near miss. Measured live 2026-09-06, both directions: 200 of 200
+  newest ledger prefixes resolve to a `module_executions` row and 0 to a
+  `workflow_executions` row; 200 of 200 recent settled module executions have a
+  non-empty prefix and 0 of 200 recent workflow executions do. Driving the real
+  verifier with read-capable credentials, the pair
+  `(module_executions.workflow_execution_id, module_executions.id)` returns
+  `ok=true total_events=1`, `(workflows.id, module_executions.id)` returns
+  `ok=false breaks=1`, and the pre-fix sweep's own shape returns `ok=true
+  total_events=0`. That last one is the trap: **`verify_chain` over an empty
+  event set answers `ok == true`**, so repairing the identity alone would have
+  converted 37 loud AccessDenied warnings into 37 silent verifications of
+  nothing. The sweep, `security_audit`'s round-trip check and the admin
+  `verifyAuditChain` query all enumerate `module_executions`; the sweep and the
+  GraphQL query roll their per-job outcomes up to the workflow execution an
+  operator asks about, worst outcome wins, and neither reports `ok` from an
+  empty job set.
+- **File:** `talos-audit-event` (shared chain/HMAC + `verify_chain`), `talos-audit-ledger` (consumer + inline verify + `verifier` module: the read-only identity and the failure classification), `worker/src/audit.rs`
 
 ### Information Disclosure
 - **Threat:** Tool responses leak internal errors, stack traces, or secret values.

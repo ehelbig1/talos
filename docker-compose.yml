@@ -564,8 +564,23 @@ services:
       # MinIO / S3 configuration for audit ledger
       AWS_ENDPOINT_URL: http://minio:9000
       MINIO_ENDPOINT: http://minio:9000
+      # THE WRITER. `audit_write_only` = s3:PutObject and nothing else, so
+      # these credentials cannot list or get the audit bucket — by design: a
+      # writer that can also read is a writer that can survey and target what
+      # it wrote. Do NOT widen this policy to "fix" verification.
       AWS_ACCESS_KEY_ID: ${MINIO_CONTROLLER_USER:?MINIO_CONTROLLER_USER required in .env}
       AWS_SECRET_ACCESS_KEY: ${MINIO_CONTROLLER_PASSWORD:?MINIO_CONTROLLER_PASSWORD required in .env}
+      # THE VERIFIER — a SEPARATE, read-only identity for the hourly
+      # chain-verification sweep and the on-demand admin verify. Until
+      # 2026-09-06 both of those borrowed the writer's key above, so every
+      # `list_objects_v2` came back AccessDenied and chain verification had
+      # never once succeeded on this stack (48,946 execution prefixes written
+      # since 2026-07-08, zero verified). The verifier client is built from
+      # THESE variables explicitly — there is no `AWS_*` fallback, and their
+      # absence stops the sweep with an error rather than silently retrying
+      # the writer's key.
+      AUDIT_VERIFIER_ACCESS_KEY_ID: ${MINIO_VERIFIER_USER:?MINIO_VERIFIER_USER required in .env}
+      AUDIT_VERIFIER_SECRET_ACCESS_KEY: ${MINIO_VERIFIER_PASSWORD:?MINIO_VERIFIER_PASSWORD required in .env}
       AWS_DEFAULT_REGION: us-east-1
       AWS_S3_FORCE_PATH_STYLE: "true"
       MINIO_BUCKET: audit-logs
@@ -1032,6 +1047,8 @@ services:
       MINIO_CONTROLLER_PASSWORD: ${MINIO_CONTROLLER_PASSWORD:?MINIO_CONTROLLER_PASSWORD required in .env}
       MINIO_WORKER_USER: ${MINIO_WORKER_USER:?MINIO_WORKER_USER required in .env}
       MINIO_WORKER_PASSWORD: ${MINIO_WORKER_PASSWORD:?MINIO_WORKER_PASSWORD required in .env}
+      MINIO_VERIFIER_USER: ${MINIO_VERIFIER_USER:?MINIO_VERIFIER_USER required in .env}
+      MINIO_VERIFIER_PASSWORD: ${MINIO_VERIFIER_PASSWORD:?MINIO_VERIFIER_PASSWORD required in .env}
     networks:
       - talos-network
     entrypoint: >
@@ -1046,15 +1063,31 @@ services:
         # controller user below is the only principal that may write to it)
         /usr/bin/mc mb myminio/audit-logs --ignore-existing || true;
 
-        # Create write-only policy for controller
-        echo '{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"s3:PutObject\"],\"Resource\":[\"arn:aws:s3:::audit-logs/*\"]}]}' > /tmp/audit-policy.json
+        # TWO identities, two policies, and the separation is the point.
+        #
+        # The WRITER may only PutObject: a writer that can also list and get is
+        # a writer that can survey and target what it wrote, which is what the
+        # write-only split exists to prevent.
+        echo '{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"s3:PutObject\"],\"Resource\":[\"arn:aws:s3:::audit-logs/*\"]}]}' > /tmp/audit-write-policy.json
 
-        # Apply the policy and user
-        /usr/bin/mc admin policy create myminio audit_write_only /tmp/audit-policy.json || true;
+        # The VERIFIER may only ListBucket + GetObject. NO PutObject, NO
+        # DeleteObject — a verifier that can write is not evidence of anything.
+        # ListBucket is on the BUCKET arn and GetObject on its OBJECTS; both are
+        # required (list_objects_v2 needs the first, the chain reader the second).
+        echo '{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"s3:ListBucket\"],\"Resource\":[\"arn:aws:s3:::audit-logs\"]},{\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\"],\"Resource\":[\"arn:aws:s3:::audit-logs/*\"]}]}' > /tmp/audit-read-policy.json
+
+        # Apply the policies and users. Idempotent: `policy create` and
+        # `user add` are re-run on every stack start and already-exists is not
+        # an error worth failing the container for.
+        /usr/bin/mc admin policy create myminio audit_write_only /tmp/audit-write-policy.json || true;
         /usr/bin/mc admin user add myminio $$MINIO_CONTROLLER_USER $$MINIO_CONTROLLER_PASSWORD || true;
         /usr/bin/mc admin policy attach myminio audit_write_only --user $$MINIO_CONTROLLER_USER || true;
 
-        echo \"MinIO bucket 'audit-logs' and least-privilege controller user ready\";
+        /usr/bin/mc admin policy create myminio audit_read_only /tmp/audit-read-policy.json || true;
+        /usr/bin/mc admin user add myminio $$MINIO_VERIFIER_USER $$MINIO_VERIFIER_PASSWORD || true;
+        /usr/bin/mc admin policy attach myminio audit_read_only --user $$MINIO_VERIFIER_USER || true;
+
+        echo \"MinIO bucket 'audit-logs', write-only controller user and read-only verifier user ready\";
         exit 0
       "
     restart: "no"

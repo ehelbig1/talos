@@ -205,6 +205,17 @@ impl PlatformQueries {
     /// sweep removed). Returns the structured break list (sequence gaps,
     /// linkage/genesis mismatch, bad/missing HMAC); the inline ingest check
     /// and the continuous sweep cover the always-on side.
+    ///
+    /// `execution_id` is a WORKFLOW EXECUTION id, which the ledger has no
+    /// chain for: every object key is `<module_executions.id>/…` and the
+    /// genesis hash binds `(module_executions.workflow_execution_id,
+    /// module_executions.id)`. Until 2026-09-06 this field used the caller's
+    /// id AS the prefix and `workflows.id` as the genesis half — measured live,
+    /// the first returns `ok=true total_events=0` (a verified-nothing) and the
+    /// second returns `ok=false breaks=1` (a genesis mismatch on a healthy
+    /// chain). It now resolves the execution to its JOBS and verifies each,
+    /// returning the per-job reports plus an aggregate whose `ok` requires at
+    /// least one verified chain.
     async fn verify_audit_chain(
         &self,
         ctx: &Context<'_>,
@@ -229,10 +240,11 @@ impl PlatformQueries {
             );
         }
 
-        // The chain genesis is bound to (workflow_id, execution_id), so we
-        // need the owning workflow id. Deliberately cross-tenant: authz was
-        // established upstream via is_platform_admin, and the repo method's
-        // doc carries the full rationale (`get_workflow_id_any_user`).
+        // The owning workflow id is carried for CONTINUITY of the response
+        // shape and to prove the execution exists; it is NOT part of the
+        // genesis binding. Deliberately cross-tenant: authz was established
+        // upstream via is_platform_admin, and the repo method's doc carries
+        // the full rationale (`get_workflow_id_any_user`).
         let exec_repo = talos_execution_repository::ExecutionRepository::new(db_pool.clone());
         let workflow_id = exec_repo
             .get_workflow_id_any_user(execution_id)
@@ -244,23 +256,57 @@ impl PlatformQueries {
         let workflow_id = workflow_id
             .ok_or_else(|| async_graphql::Error::new("Execution not found").extend_safe())?;
 
-        let report = talos_audit_ledger::verify_execution_chain_from_env(
-            &workflow_id.to_string(),
-            &execution_id.to_string(),
-        )
-        .await
-        .map_err(|e| {
-            // Generic client message; full detail (incl. "no S3 endpoint
-            // configured") stays server-side per the no-leak rule.
-            tracing::error!(
-                target: "talos_audit",
-                execution_id = %execution_id,
-                "verify_audit_chain failed: {}", e
-            );
-            async_graphql::Error::new("Audit chain verification unavailable").extend_safe()
-        })?;
+        // One chain PER JOB. The ledger does not exist at the grain the caller
+        // asked at, so the id is resolved to the jobs that ran under it.
+        let targets =
+            talos_audit_ledger::ledger_targets_for_workflow_execution(db_pool, execution_id)
+                .await
+                .map_err(|e| {
+                    tracing::error!(error = %e, "graphql: audit-chain job lookup failed");
+                    async_graphql::Error::new("Request could not be completed").extend_safe()
+                })?;
 
-        Ok(AuditChainVerification::from(report))
+        let mut reports = Vec::with_capacity(targets.len());
+        for target in &targets {
+            let report = talos_audit_ledger::verify_execution_chain_from_env(
+                &target.genesis_workflow_id(),
+                &target.execution_id(),
+            )
+            .await
+            .map_err(|e| {
+                // Generic client message; full detail (incl. "no S3 endpoint
+                // configured") stays server-side per the no-leak rule.
+                //
+                // The SERVER-SIDE half is classified. Until 2026-09-06 this
+                // path built its S3 client from the WRITE-ONLY writer's
+                // `AWS_*` credentials, so an operator invoking it got this
+                // generic message for a permission fault that no log line
+                // named — the SDK's `Display` on an `SdkError` renders the two
+                // words "service error". `reason` and `remedy` come from the
+                // same classifier the sweep and `security_audit` use, so the
+                // three cannot disagree about one failure.
+                tracing::error!(
+                    target: "talos_audit",
+                    event_kind = "audit_chain_on_demand_verification_failed",
+                    workflow_execution_id = %execution_id,
+                    module_execution_id = %target.module_execution_id,
+                    ledger_key_space = talos_audit_ledger::LEDGER_KEY_SPACE,
+                    reason = e.kind.metric_label(),
+                    context = %e.context,
+                    error = %e.detail,
+                    remedy = e.remedy(),
+                    "verify_audit_chain failed"
+                );
+                async_graphql::Error::new("Audit chain verification unavailable").extend_safe()
+            })?;
+            reports.push(report);
+        }
+
+        Ok(AuditChainVerification::aggregate(
+            execution_id.to_string(),
+            workflow_id.to_string(),
+            reports,
+        ))
     }
 
     async fn resource_quotas(&self, ctx: &Context<'_>) -> Result<ResourceQuota> {

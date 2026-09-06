@@ -326,6 +326,14 @@ CTRL_TESTS=(
     # SessionBriefService and the REAL sweep; `common` harness, so CTRL_TESTS
     # (64b).
     "session_start_substantive_draft_tests"
+    # The WORM audit-chain sweep enumerated `workflow_executions` while every
+    # ledger object key is `<module_executions.id>/…`, so with the verifier
+    # identity repaired it would have reported 37 silent `verified_ok` over
+    # prefixes holding nothing (`verify_chain` over zero events answers
+    # ok=true). Drives the sweep's EXTRACTED enumeration statement and
+    # `security_audit`'s candidate query against real seeded rows; `common`
+    # harness, so CTRL_TESTS (64b).
+    "audit_chain_population_tests"
     "api_key_tests"
     "api_auth_integration_test"
     "integration_mcp_tests"

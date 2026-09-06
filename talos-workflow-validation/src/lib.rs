@@ -599,16 +599,117 @@ pub fn max_retries_within_budget(
 /// reading its per-attempt timeout and backoff exactly as the engine does.
 ///
 /// `None` when the wall-clock cap is disabled (`budget_secs == 0`).
+///
+/// A THIN VIEW over [`node_retry_budget`]. Prefer that when you are about to
+/// EXPLAIN the ceiling to an operator: a bare `Some(0)` cannot say WHY nothing
+/// fits, and the two reasons call for different edits.
 #[must_use]
 pub fn node_budget_retry_ceiling(
     node: &serde_json::Value,
     budget_secs: u64,
     default_node_timeout_secs: u64,
 ) -> Option<u32> {
+    node_retry_budget(node, budget_secs, default_node_timeout_secs).ceiling
+}
+
+/// A node's retry ceiling TOGETHER with what its single, unretried attempt
+/// actually does inside the budget.
+///
+/// # Why these two travel as one value
+///
+/// `max_retries_within_budget` returns `Some(0)` whenever the retries=0
+/// sequence is not [`AttemptFit::Full`] — which is TRUE for a CLAMPED single
+/// attempt as well as a TRUNCATED one, and #765 established that those are
+/// different findings with different remedies. The remedy sentence
+/// [`describe_disabled_retry_protection`] emits for a zero ceiling said, in
+/// both cases, *"even its single first attempt can outrun the budget"* — the
+/// TRUNCATED wording. Measured live on the reference fleet 2026-09-06: the
+/// `Some(0)` arm fires on exactly TWO nodes today and BOTH are CLAMPED, so
+/// 2 of 2 live occurrences of that sentence were false — and both nodes ALSO
+/// carried the sibling `attempt-window-clamped` finding saying *"Every
+/// configured attempt starts"* in the same `validate_workflow` response.
+///
+/// Pairing them in one struct produced by one function is what stops a caller
+/// supplying a ceiling and a reason that disagree.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NodeRetryBudget {
+    /// [`max_retries_within_budget`] for this node. `None` = budget disabled.
+    pub ceiling: Option<u32>,
+    /// What the retries=0 sequence does. `None` = budget disabled, so there is
+    /// no container and nothing to say.
+    pub single_attempt_fit: Option<talos_workflow_engine_core::AttemptFit>,
+    /// The node's resolved per-attempt timeout, kept so the clamped clause can
+    /// name the allowance the node claims without a second resolution of the
+    /// same fields.
+    pub per_attempt_secs: u64,
+}
+
+impl NodeRetryBudget {
+    /// The clause explaining a ZERO ceiling, in the vocabulary #765 fixed
+    /// everywhere else.
+    ///
+    /// `None` when the ceiling is not zero (there is nothing to explain) or the
+    /// budget is disabled. ONE home, so `validate_workflow`'s finding and
+    /// `get_workflow_risk_assessment`'s recommendation — which carried its own
+    /// copy of the truncated wording — cannot drift.
+    #[must_use]
+    pub fn zero_ceiling_reason(&self) -> Option<String> {
+        use talos_workflow_engine_core::AttemptFit;
+        if self.ceiling != Some(0) {
+            return None;
+        }
+        Some(match self.single_attempt_fit.as_ref()? {
+            AttemptFit::Clamped { granted_secs, .. } => format!(
+                "its single attempt DOES start, but is already CLAMPED to {granted_secs}s of \
+                 the {allowance}s this node's dispatch claims ({per}s timeout_secs plus the \
+                 dispatcher's {grace}s outer-wrap grace, less the {reserve}s the engine \
+                 holds back to record a failure) — so there is no room for a second attempt",
+                allowance =
+                    talos_workflow_engine_core::dispatch_allowance_secs(self.per_attempt_secs),
+                per = self.per_attempt_secs,
+                grace = talos_workflow_engine_core::TOKIO_WRAP_GRACE_SECS,
+                reserve = talos_workflow_engine_core::BUDGET_RESERVE_SECS,
+            ),
+            AttemptFit::Truncated { .. } => {
+                "even its single first attempt is never dispatched — the budget is spent \
+                 before the engine can start it"
+                    .to_string()
+            }
+            // Unreachable: a `Full` retries=0 sequence yields a ceiling of at
+            // least 0 with `is_full() == true`, so the search would not have
+            // stopped at 0. Rendered rather than panicking — this is a
+            // reporting path.
+            AttemptFit::Full => "no retry count fits this workflow's budget".to_string(),
+        })
+    }
+}
+
+/// [`NodeRetryBudget`] for one node, reading its per-attempt timeout and
+/// backoff exactly as the engine does.
+#[must_use]
+pub fn node_retry_budget(
+    node: &serde_json::Value,
+    budget_secs: u64,
+    default_node_timeout_secs: u64,
+) -> NodeRetryBudget {
     let per_attempt_secs = node_per_attempt_timeout_secs(node, default_node_timeout_secs);
     let backoff_ms = node_declared_u64(node, "retry_backoff_ms")
         .unwrap_or(talos_workflow_engine_core::DEFAULT_BACKOFF_MS);
-    max_retries_within_budget(per_attempt_secs, backoff_ms, budget_secs)
+    let ceiling = max_retries_within_budget(per_attempt_secs, backoff_ms, budget_secs);
+    let single_attempt_fit = (budget_secs > 0).then(|| {
+        talos_workflow_engine_core::simulate_attempt_sequence(
+            per_attempt_secs,
+            0,
+            backoff_ms,
+            budget_secs,
+        )
+        .fit()
+    });
+    NodeRetryBudget {
+        ceiling,
+        single_attempt_fit,
+        per_attempt_secs,
+    }
 }
 
 // ── Observed failure history (authoring-time, Warning-only) ──────────────────
@@ -1151,8 +1252,10 @@ pub fn latest_failure_is_transient(latest_error: Option<&str>) -> Option<bool> {
 /// `observed` decorates the finding when the node ran inside the history
 /// window; absence of history never suppresses it (see the module note above).
 ///
-/// `budget_ceiling` is [`node_budget_retry_ceiling`] for this node — the
-/// largest retry count whose envelope fits the workflow budget. It exists
+/// `budget` is [`node_retry_budget`] for this node — the largest retry count
+/// whose envelope fits the workflow budget, TOGETHER with what its single
+/// unretried attempt does inside that budget (see [`NodeRetryBudget`] for why
+/// a bare `Option<u32>` was not enough). It exists
 /// because this message ENDS IN A NUMBER an operator is invited to apply, and
 /// until #721 that number was never checked against the budget it would have to
 /// fit inside. Measured on the live fleet 2026-09-01: **33 of the 35 nodes this
@@ -1171,7 +1274,7 @@ pub fn describe_disabled_retry_protection(
     latest_failure_transient: Option<bool>,
     executions_scanned: i64,
     window_days: i32,
-    budget_ceiling: Option<u32>,
+    budget: &NodeRetryBudget,
 ) -> String {
     let DisabledRetryProtection {
         world_default_retries,
@@ -1237,18 +1340,26 @@ pub fn describe_disabled_retry_protection(
     // resolves to; whether it FITS is a different question, and answering only
     // the first one is how this sentence came to contradict the sibling
     // retry-envelope warning on 33 of the 35 nodes it fires on.
-    match budget_ceiling {
+    match budget.ceiling {
         Some(ceiling) if ceiling >= *world_default_retries => msg.push_str(&format!(
             " If it is not deliberate, set retry_count to {world_default_retries} — the value \
              the module default already resolves to, and its envelope fits this workflow's \
              budget."
         )),
-        Some(0) => msg.push_str(
+        // #766: this arm used to say "even its single first attempt can outrun
+        // the budget" for BOTH shapes a zero ceiling can take. That is the
+        // TRUNCATED wording, and on the reference fleet 2026-09-06 both live
+        // occurrences were CLAMPED — so the sentence contradicted the sibling
+        // `attempt-window-clamped` finding on the same node in the same
+        // response. `zero_ceiling_reason` states the one that applies.
+        Some(0) => msg.push_str(&format!(
             " If it is not deliberate, note that NO retry count fits this workflow's budget at \
-             this node's per-attempt timeout — even its single first attempt can outrun the \
-             budget. Raise execution_timeout_secs or lower this node's timeout_secs before \
-             adding retries.",
-        ),
+             this node's per-attempt timeout: {reason}. Raise execution_timeout_secs or lower \
+             this node's timeout_secs before adding retries.",
+            reason = budget
+                .zero_ceiling_reason()
+                .unwrap_or_else(|| "no retry count fits this workflow's budget".to_string()),
+        )),
         Some(ceiling) => msg.push_str(&format!(
             " If it is not deliberate, do NOT simply set retry_count to {world_default_retries}: \
              that envelope does not fit this workflow's budget and would trip the \
@@ -1537,7 +1648,10 @@ pub fn node_retry_advice(ctx: NodeRetryContext<'_>) -> NodeRetryAdvice {
     let backoff_ms = node_backoff_ms(node);
     let current_envelope_secs =
         node_retry_envelope_secs(per_attempt_secs, current_retries, backoff_ms);
-    let budget_ceiling = max_retries_within_budget(per_attempt_secs, backoff_ms, budget_secs);
+    // One resolution of the pair, so the ceiling and the reason it is zero can
+    // never disagree (see `NodeRetryBudget`).
+    let retry_budget = node_retry_budget(node, budget_secs, default_node_timeout_secs);
+    let budget_ceiling = retry_budget.ceiling;
     let state_changing = module_is_side_effecting(module_hosts, module_methods);
     let world_default_retries =
         talos_workflow_engine_core::default_max_retries_for_module(module_methods, module_world);
@@ -1617,7 +1731,7 @@ pub fn node_retry_advice(ctx: NodeRetryContext<'_>) -> NodeRetryAdvice {
             latest_failure_transient,
             executions_scanned,
             window_days,
-            budget_ceiling,
+            &retry_budget,
         ));
     }
 
@@ -3104,7 +3218,7 @@ pub fn validate_prepared(prepared: PreparedValidation) -> ValidationResult {
                     // invited to apply. Measured 2026-09-01, 33 of the 35
                     // fleet nodes this fires on would have tripped the
                     // sibling retry-envelope warning on following it.
-                    node_budget_retry_ceiling(
+                    &node_retry_budget(
                         node,
                         budget,
                         talos_workflow_engine_core::default_node_timeout_secs(),
@@ -5682,9 +5796,31 @@ mod failure_history_tests {
 mod disabled_retry_tests {
     use super::{
         describe_disabled_retry_protection, disabled_retry_protection, latest_failure_is_transient,
-        ObservedNodeRecord,
+        node_retry_budget, ObservedNodeRecord,
     };
     use serde_json::json;
+
+    /// A budget in which `n` retries fit comfortably.
+    ///
+    /// Built through the REAL resolver rather than by hand-constructing the
+    /// struct: these tests are about the sentence the operator reads, and a
+    /// hand-built pair could carry a ceiling and a fit that the production
+    /// path can never produce together.
+    fn fits(n: u32) -> super::NodeRetryBudget {
+        // 10 s per attempt inside a 3600 s budget comfortably fits n retries;
+        // the assertion keeps the fixture honest if the arithmetic moves.
+        let node = json!({"id": "fixture", "retry_count": 0, "timeout_secs": 10});
+        let b = node_retry_budget(&node, 3600, 120);
+        assert!(
+            b.ceiling.is_some_and(|c| c >= n),
+            "fixture budget must fit {n} retries, got {:?}",
+            b.ceiling
+        );
+        super::NodeRetryBudget {
+            ceiling: Some(n),
+            ..b
+        }
+    }
 
     fn methods(m: &[&str]) -> Vec<String> {
         m.iter().map(|s| (*s).to_string()).collect()
@@ -5852,7 +5988,7 @@ mod disabled_retry_tests {
                 Some(true),
                 22,
                 30,
-                Some(4),
+                &fits(4),
             );
         assert!(msg.contains("sets retry_count explicitly to 0"));
         assert!(msg.contains("capability world 'http-node', allowed_methods [GET]"));
@@ -5873,7 +6009,7 @@ mod disabled_retry_tests {
     fn renders_without_history() {
         let node = json!({"id": "poll", "retry_count": 0});
         let f = disabled_retry_protection(&node, &methods(&["GET"]), Some("http-node")).unwrap();
-        let msg = describe_disabled_retry_protection(&f, "poll", None, None, 0, 30, Some(4));
+        let msg = describe_disabled_retry_protection(&f, "poll", None, None, 0, 30, &fits(4));
         assert!(msg.contains("runs EXACTLY ONCE"));
         assert!(!msg.contains("Observed:"));
         assert!(!msg.contains("TRANSIENT"));
@@ -5893,7 +6029,7 @@ mod disabled_retry_tests {
             None,
             50,
             30,
-            Some(4),
+            &fits(4),
         );
         assert!(msg.contains("has not failed in its last 4508 attempts"));
         assert!(msg.contains("exposure, not a report of damage"));
@@ -5916,7 +6052,7 @@ mod disabled_retry_tests {
             Some(false),
             22,
             30,
-            Some(4),
+            &fits(4),
         );
         assert!(msg.contains("classifies as permanent"));
         assert!(msg.contains("retries are not the lever"));
@@ -6779,7 +6915,7 @@ mod fleet_convergence_tests {
 mod retry_advice_tests {
     use super::{
         describe_disabled_retry_protection, disabled_retry_protection, max_retries_within_budget,
-        module_is_side_effecting, node_budget_retry_ceiling, node_retry_advice,
+        module_is_side_effecting, node_budget_retry_ceiling, node_retry_advice, node_retry_budget,
         node_retry_envelope_secs, resolved_node_retries, retry_advice_prepared,
         retry_envelope_overrun, HistoryCoverage, NodeRetryContext, PreparedValidation,
         RetryAdviceBound,
@@ -7262,10 +7398,10 @@ mod retry_advice_tests {
         let f = disabled_retry_protection(&node, &[], Some("secrets-node")).unwrap();
         // 120 s per attempt, 500 ms backoff, 300 s budget → ceiling 1, while
         // the module default is 2. This is 33 of the 35 fleet nodes.
-        let ceiling = node_budget_retry_ceiling(&node, 300, 120);
-        assert_eq!(ceiling, Some(1));
+        let budget = node_retry_budget(&node, 300, 120);
+        assert_eq!(budget.ceiling, Some(1));
         let msg =
-            describe_disabled_retry_protection(&f, "classify_work", None, None, 0, 30, ceiling);
+            describe_disabled_retry_protection(&f, "classify_work", None, None, 0, 30, &budget);
         assert!(msg.contains("do NOT simply set retry_count to 2"));
         assert!(msg.contains("The largest count that fits is 1"));
         // The un-budgeted form must be gone from this shape.
@@ -7283,17 +7419,101 @@ mod retry_advice_tests {
             None,
             0,
             30,
-            node_budget_retry_ceiling(&node, 300, 120),
+            &node_retry_budget(&node, 300, 120),
         );
         assert!(msg.contains("NO retry count fits"));
         assert!(!msg.contains("set retry_count to 2"));
+        // #766. 405 s of allowance in a 300 s budget is CLAMPED, not
+        // truncated: the attempt DOES start, cut to 298 s. The pre-#766
+        // sentence said "even its single first attempt can outrun the budget"
+        // here — the TRUNCATED wording, false for this shape, and on the
+        // reference fleet 2026-09-06 BOTH live occurrences of this arm were
+        // clamped, so 2 of 2 were wrong.
+        assert!(
+            msg.contains("its single attempt DOES start, but is already CLAMPED to 298s"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("can outrun the budget"),
+            "the truncated wording must not appear for a clamped attempt: {msg}"
+        );
+
+        // And the TRUNCATED shape still gets the truncated wording — the
+        // split is only worth having if both arms are reachable.
+        let truncated = describe_disabled_retry_protection(
+            &f,
+            "big",
+            None,
+            None,
+            0,
+            30,
+            // 2 s of budget: the engine holds back BUDGET_RESERVE_SECS and
+            // needs MIN_REMAINING_FOR_ATTEMPT_SECS to start anything, so
+            // attempt 1 is never dispatched.
+            &node_retry_budget(&node, 2, 120),
+        );
+        assert!(
+            truncated.contains("even its single first attempt is never dispatched"),
+            "{truncated}"
+        );
+    }
+
+    /// The LIVE fleet shape, 2026-09-06: a `minimal-node` at the default 120 s
+    /// node timeout inside a 120 s workflow budget. Two nodes on the reference
+    /// fleet are exactly this, and both emitted BOTH findings in ONE
+    /// `validate_workflow` response — the `attempt-window-clamped` one saying
+    /// "Every configured attempt starts, but attempt 1 is CLAMPED to 118s of
+    /// the 125s", and this one saying "even its single first attempt can
+    /// outrun the budget". The two contradicted each other about the same
+    /// node. This pins them to the same story.
+    #[test]
+    fn the_live_clamped_shape_agrees_with_the_sibling_envelope_finding() {
+        let node = json!({"id": "verify_extract", "retry_count": 0});
+        let f = disabled_retry_protection(&node, &[], Some("minimal-node")).unwrap();
+        let budget = node_retry_budget(
+            &node,
+            120,
+            talos_workflow_engine_core::default_node_timeout_secs(),
+        );
+        assert_eq!(budget.ceiling, Some(0));
+        assert!(
+            matches!(
+                budget.single_attempt_fit,
+                Some(talos_workflow_engine_core::AttemptFit::Clamped {
+                    first_clamped_attempt: 1,
+                    granted_secs: 118
+                })
+            ),
+            "{:?}",
+            budget.single_attempt_fit
+        );
+        let msg =
+            describe_disabled_retry_protection(&f, "verify_extract", None, None, 0, 30, &budget);
+        // The same three numbers the sibling `retry_envelope_overrun` finding
+        // prints for this node, so an operator reading both is reading one
+        // account of one node.
+        assert!(msg.contains("CLAMPED to 118s of the 125s"), "{msg}");
+        assert!(msg.contains("120s timeout_secs"), "{msg}");
+        assert!(
+            !msg.contains("can outrun the budget"),
+            "the truncated wording must not survive on the live shape: {msg}"
+        );
     }
 
     #[test]
     fn an_unresolvable_budget_keeps_the_unqualified_remedy() {
         let node = json!({"id": "n", "retry_count": 0});
         let f = disabled_retry_protection(&node, &[], Some("minimal-node")).unwrap();
-        let msg = describe_disabled_retry_protection(&f, "n", None, None, 0, 30, None);
+        let msg = describe_disabled_retry_protection(
+            &f,
+            "n",
+            None,
+            None,
+            0,
+            30,
+            // budget_secs = 0 ⇒ the wall-clock cap is disabled.
+            &node_retry_budget(&node, 0, 120),
+        );
         assert!(msg.contains("set retry_count to 2"));
     }
 

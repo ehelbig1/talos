@@ -20,6 +20,18 @@ talos-system-repo = { path = "../talos-system-repo" }
 # is what stops security_audit and get_platform_info disagreeing about one
 # fleet — the `build_suffix` argument restated.
 talos-worker-identity-repository = { path = "../talos-worker-identity-repository" }
+# The REAL audit-chain verifier, so `audit_chain_verification` can EXERCISE it
+# (`round_trip`) instead of reading a config value about it. That standard is
+# this crate's own: #760 promoted `write_ceiling_enforcement` off
+# `config_presence` for exactly this reason, and a chain check that only asked
+# "are verifier credentials set?" would be the presence test this crate exists
+# to remove — on the one control that has never functioned.
+#
+# The DATABASE half stays with the caller: `run_security_audit` is handed an
+# already-resolved candidate execution, so this crate keeps its single DB
+# touchpoint (`pg_trigger`) and every branch of the check stays unit-testable
+# without Postgres. Same split as `write_ceiling_fleet`.
+talos-audit-ledger = { path = "../talos-audit-ledger" }
 # The CONTROLLER's own two write-ceiling gates, so `write_ceiling_enforcement`
 # can EXERCISE them instead of repeating the (now false) sentence "the
 # controller cannot exercise it from here". `talos-workflow-engine` also owns
