@@ -477,6 +477,8 @@ impl ParallelWorkflowEngine {
             // is left of it — it never shortens the WIRE budget
             // (`timeout` above) and never grants an extra attempt.
             deadline: self.progress.deadline(),
+            // Attribution only — never clamps. See `DispatchJob::budget_secs`.
+            budget_secs: self.progress.budget_secs(),
             allowed_hosts: wasm_module.allowed_hosts.clone(),
             allowed_methods: wasm_module.allowed_methods.clone(),
             allowed_secrets: wasm_module.allowed_secrets.clone(),

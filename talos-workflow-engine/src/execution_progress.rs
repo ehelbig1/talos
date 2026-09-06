@@ -140,7 +140,15 @@ struct ProgressInner {
     /// representation. Contention is nil: one write per run, one
     /// uncontended read per node dispatch, no `.await` held across the
     /// guard.
-    deadline: std::sync::Mutex<Option<Instant>>,
+    ///
+    /// The `u64` alongside it is the run's TOTAL budget in seconds — the
+    /// same `secs` this deadline was derived from, stamped in the same
+    /// statement so the two can never describe different runs. It is
+    /// carried for ATTRIBUTION only (`DispatchJob::budget_secs`): a
+    /// clamp caused by a node allowance that could never fit the budget
+    /// is a graph problem, and one caused by a spent budget is a run
+    /// problem, and the deadline alone cannot tell them apart.
+    deadline: std::sync::Mutex<Option<(Instant, u64)>>,
 }
 
 impl ExecutionProgress {
@@ -151,12 +159,17 @@ impl ExecutionProgress {
         self.inner.completed.store(0, Ordering::Relaxed);
     }
 
-    /// Stamp (or clear) this run's absolute wall-clock deadline.
+    /// Stamp (or clear) this run's absolute wall-clock deadline and the
+    /// total budget it was derived from.
     ///
     /// Called only from [`crate::engine::run_with_workflow_timeout`].
+    /// Both halves move together, in ONE statement, deliberately: a
+    /// deadline paired with some other run's budget would attribute
+    /// clamps to the wrong cause.
+    ///
     /// A poisoned lock is swallowed: the deadline simply stays unset and
     /// dispatches clamp nothing, which is the pre-feature behaviour.
-    pub(crate) fn set_deadline(&self, deadline: Option<Instant>) {
+    pub(crate) fn set_deadline(&self, deadline: Option<(Instant, u64)>) {
         if let Ok(mut slot) = self.inner.deadline.lock() {
             *slot = deadline;
         }
@@ -169,7 +182,27 @@ impl ExecutionProgress {
     /// those is a fail-OPEN to "do not clamp" — a clamp derived from a
     /// wrong deadline would be worse than no clamp.
     pub(crate) fn deadline(&self) -> Option<Instant> {
-        self.inner.deadline.lock().ok().and_then(|slot| *slot)
+        self.inner
+            .deadline
+            .lock()
+            .ok()
+            .and_then(|slot| *slot)
+            .map(|(at, _)| at)
+    }
+
+    /// This run's TOTAL wall-clock budget in seconds, if it has a cap.
+    ///
+    /// Same fail-OPEN contract as [`Self::deadline`]: `None` means "the
+    /// cause of a clamp cannot be established here", which
+    /// [`talos_workflow_engine_core::clamp_cause`] treats as the loud
+    /// case rather than demoting anything.
+    pub(crate) fn budget_secs(&self) -> Option<u64> {
+        self.inner
+            .deadline
+            .lock()
+            .ok()
+            .and_then(|slot| *slot)
+            .map(|(_, secs)| secs)
     }
 
     /// Record that `node_id` (rendered as `label`) has been dispatched.

@@ -178,13 +178,26 @@ pub struct DispatchJob {
     /// allowance does not fit would remove successes. The reference
     /// NATS dispatcher clamps each attempt's outer cancellation wrap
     /// to `min(node_allowance, remaining - reserve)`; see
-    /// `talos_workflow_engine_nats::dispatcher::clamp_attempt_timeout`.
+    /// [`crate::clamp_attempt_timeout`], which is the ONE home for that
+    /// arithmetic (the pre-run validator simulates the same function).
     ///
     /// **Chain steps ignore it.** Like `max_retries` and
     /// `retry_condition` (see the type-level note above), the deadline
     /// is a chain-LEVEL concern; the reference impl's `dispatch_chain`
     /// reads neither this nor any per-step equivalent.
     pub deadline: Option<std::time::Instant>,
+    /// The run's TOTAL wall-clock budget in seconds — the value
+    /// [`Self::deadline`] was derived from, not what remains.
+    ///
+    /// **Attribution only. An impl must not clamp with it.** Its one
+    /// job is to let a clamp be told apart from a clamp:
+    /// [`crate::clamp_cause`] answers "would this node's allowance have
+    /// fitted at t = 0?", which separates a graph the operator can fix
+    /// (and which `talos_workflow_validation` reports before the run)
+    /// from a run that spent its budget. `None` means the caller does
+    /// not track one, and yields [`crate::ClampCause::Unknown`] — the
+    /// loud direction, never a demotion.
+    pub budget_secs: Option<u64>,
 
     // ── Capability grants ────────────────────────────────────────────
     /// Hostnames the worker permits outbound HTTP to.
@@ -319,6 +332,8 @@ impl Default for DispatchJob {
     ///   to set a budget.
     /// * `max_fuel` → 0 — impls that enforce fuel read this as "no
     ///   budget configured"
+    /// * `budget_secs` → `None` — no total budget known, so a clamp
+    ///   cannot be attributed (see [`DispatchJob::budget_secs`]).
     /// * `deadline` → `None` — no workflow wall-clock budget known,
     ///   so impls clamp nothing (the pre-field behaviour)
     /// * `priority` → 100 (documented default)
@@ -344,6 +359,7 @@ impl Default for DispatchJob {
             // dispatch, which is byte-identical to the pre-field
             // behaviour: impls clamp nothing.
             deadline: None,
+            budget_secs: None,
             allowed_hosts: Vec::new(),
             allowed_methods: Vec::new(),
             allowed_secrets: Vec::new(),
@@ -563,6 +579,13 @@ impl DispatchJobBuilder {
         self
     }
 
+    /// The run's total wall-clock budget in seconds. Attribution only —
+    /// see [`DispatchJob::budget_secs`].
+    pub fn budget_secs(mut self, budget_secs: u64) -> Self {
+        self.inner.budget_secs = Some(budget_secs);
+        self
+    }
+
     /// Hostnames the worker permits outbound HTTP to.
     pub fn allowed_hosts(mut self, hosts: Vec<String>) -> Self {
         self.inner.allowed_hosts = hosts;
@@ -718,6 +741,7 @@ impl fmt::Debug for DispatchJob {
             .field("timeout", &self.timeout)
             .field("max_fuel", &self.max_fuel)
             .field("deadline", &self.deadline)
+            .field("budget_secs", &self.budget_secs)
             .field("allowed_hosts", &self.allowed_hosts)
             .field("allowed_methods", &self.allowed_methods)
             .field("allowed_secrets", &self.allowed_secrets)
