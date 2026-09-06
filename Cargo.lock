@@ -1792,6 +1792,7 @@ dependencies = [
  "talos-auth-types",
  "talos-capability-downgrade",
  "talos-capability-world",
+ "talos-child-run-ledger",
  "talos-compilation",
  "talos-config",
  "talos-config-validator",
@@ -7491,6 +7492,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "talos-child-run-ledger",
  "talos-child-workflow-refs",
  "talos-config",
  "talos-db",
@@ -7756,6 +7758,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "talos-child-run-ledger"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "sqlx",
+ "talos-db",
+ "talos-workflow-engine-core",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "talos-child-workflow-refs"
 version = "0.1.0"
 dependencies = [
@@ -7933,6 +7949,7 @@ dependencies = [
  "talos-actor-memory-service",
  "talos-actor-repository",
  "talos-analytics-repository",
+ "talos-child-run-ledger",
  "talos-compilation",
  "talos-config",
  "talos-cost-attribution",
@@ -8610,6 +8627,7 @@ dependencies = [
  "talos-advanced-repository",
  "talos-analytics-repository",
  "talos-capability-world",
+ "talos-child-run-ledger",
  "talos-compilation",
  "talos-config",
  "talos-continuation-trigger",

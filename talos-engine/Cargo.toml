@@ -46,6 +46,8 @@ talos-ml = { path = "../talos-ml" }
 talos-operator-digest = { path = "../talos-operator-digest" }
 talos-metrics = { path = "../talos-metrics" }
 talos-analytics-repository = { path = "../talos-analytics-repository" }
+# RFC 0012: the child-run ledger's SQL home. The engine holds only the adapter.
+talos-child-run-ledger = { path = "../talos-child-run-ledger" }
 talos-compilation = { path = "../talos-compilation" }
 talos-module-executions = { path = "../talos-module-executions" }
 talos-module-payload-encryption = { path = "../talos-module-payload-encryption" }

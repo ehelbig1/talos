@@ -4,6 +4,7 @@ pub mod approval_gate;
 pub mod assistant_report_reader;
 pub mod builder;
 pub mod checkpoint_store;
+pub mod child_run_recorder;
 pub mod error;
 pub mod event_sink;
 pub mod events;

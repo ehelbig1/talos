@@ -483,6 +483,23 @@ impl ParallelWorkflowEngine {
         self.judge_score_recorder = Some(recorder);
     }
 
+    /// Inject the child-run ledger write port (RFC 0012).
+    ///
+    /// A sub-workflow runs IN-PROCESS through
+    /// [`execute_subworkflow_graph`](ParallelWorkflowEngine::execute_subworkflow_graph)
+    /// and records no `workflow_executions` row, so without this port nothing
+    /// in the platform knows a child ran. Wired by the controller engine
+    /// builder; absent out-of-tree, where child runs are simply not recorded.
+    ///
+    /// The recorder is best-effort by construction (its `record` returns
+    /// `()`), so injecting one can never change a workflow's outcome.
+    pub fn set_child_run_recorder(
+        &mut self,
+        recorder: Arc<dyn talos_workflow_engine_core::ChildRunRecorder>,
+    ) {
+        self.child_run_recorder = Some(recorder);
+    }
+
     /// Replace the default module-execution store. Consumers that
     /// don't have a Postgres-backed module store plug in their own
     /// impl (capture, append log, no-op) here.

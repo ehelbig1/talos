@@ -42,6 +42,9 @@ talos-actor-policies = { path = "../talos-actor-policies" }
 talos-actor-repository = { path = "../talos-actor-repository" }
 talos-advanced-repository = { path = "../talos-advanced-repository" }
 talos-analytics-repository = { path = "../talos-analytics-repository" }
+# RFC 0012: the child-run ledger. The two P1 consumers — get_execution_lineage
+# and get_workflow_reuse_stats — read it here.
+talos-child-run-ledger = { path = "../talos-child-run-ledger" }
 talos-operator-digest = { path = "../talos-operator-digest" }
 talos-capability-world = { path = "../talos-capability-world" }
 talos-compilation = { path = "../talos-compilation" }

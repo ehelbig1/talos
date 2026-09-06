@@ -63,7 +63,16 @@ impl SubflowError {
     /// Canonical `{__error, error_message}` envelope with a caller-provided
     /// context label (e.g. "Judge", "Ensemble child", "Sub-workflow").
     pub fn into_error_envelope(self, context: &str) -> JsonValue {
-        let msg = match self {
+        serde_json::json!({ "__error": true, "error_message": self.message(context) })
+    }
+
+    /// The human-readable half of [`Self::into_error_envelope`], without the
+    /// envelope. Split out so the child-run ledger can record the SAME text
+    /// the parent node's error envelope carries rather than a second wording
+    /// of the same failure.
+    #[must_use]
+    pub fn message(self, context: &str) -> String {
+        match self {
             SubflowError::NoRegistry => {
                 format!("Registry not available for {} node", context)
             }
@@ -80,8 +89,7 @@ impl SubflowError {
             SubflowError::ExecutionFailed(e) => {
                 format!("{} workflow execution failed: {}", context, e)
             }
-        };
-        serde_json::json!({ "__error": true, "error_message": msg })
+        }
     }
 
     /// Returns the missing sub-workflow id when this error is
@@ -483,6 +491,7 @@ impl ParallelWorkflowEngine {
         judge_wf_id_opt: Option<Uuid>,
         dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
         worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
+        site: talos_workflow_engine_core::ChildRunSite,
     ) -> JsonValue {
         let clean_input = if let Some(obj) = inputs.as_object() {
             let mut cleaned = obj.clone();
@@ -507,7 +516,13 @@ impl ParallelWorkflowEngine {
             let wsk = worker_shared_key.clone();
             async move {
                 match self
-                    .execute_subworkflow_graph(child_wf_id, input, dispatcher, wsk)
+                    .execute_subworkflow_graph(
+                        child_wf_id,
+                        input,
+                        dispatcher,
+                        wsk,
+                        site.with_kind(talos_workflow_engine_core::ChildDispatchKind::Ensemble),
+                    )
                     .await
                 {
                     Ok(v) => v,
@@ -582,6 +597,9 @@ impl ParallelWorkflowEngine {
                                     judge_input,
                                     dispatcher,
                                     wsk,
+                                    site.with_kind(
+                                        talos_workflow_engine_core::ChildDispatchKind::Ensemble,
+                                    ),
                                 )
                                 .await
                             {
@@ -704,6 +722,7 @@ impl ParallelWorkflowEngine {
         fallback_wf_id: Option<Uuid>,
         dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
         worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
+        site: talos_workflow_engine_core::ChildRunSite,
     ) -> JsonValue {
         let clean_input = if let Some(obj) = inputs.as_object() {
             let mut cleaned = obj.clone();
@@ -724,6 +743,7 @@ impl ParallelWorkflowEngine {
                 clean_input.clone(),
                 dispatcher.clone(),
                 worker_shared_key.clone(),
+                site.with_kind(talos_workflow_engine_core::ChildDispatchKind::LlmDispatch),
             )
             .await
         {
@@ -810,6 +830,7 @@ impl ParallelWorkflowEngine {
                 input_for_target,
                 dispatcher,
                 worker_shared_key,
+                site.with_kind(talos_workflow_engine_core::ChildDispatchKind::LlmDispatch),
             )
             .await
         {
@@ -881,6 +902,7 @@ impl ParallelWorkflowEngine {
         max_retries: u32,
         dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
         worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
+        site: talos_workflow_engine_core::ChildRunSite,
     ) -> JsonValue {
         let mut current_input = initial_input;
         let mut last_error = String::new();
@@ -900,6 +922,7 @@ impl ParallelWorkflowEngine {
                     clean_input.clone(),
                     dispatcher.clone(),
                     worker_shared_key.clone(),
+                    site.with_kind(talos_workflow_engine_core::ChildDispatchKind::ReflectiveRetry),
                 )
                 .await
             {
@@ -948,6 +971,9 @@ impl ParallelWorkflowEngine {
                         reflect_input,
                         dispatcher.clone(),
                         worker_shared_key.clone(),
+                        site.with_kind(
+                            talos_workflow_engine_core::ChildDispatchKind::ReflectiveRetry,
+                        ),
                     )
                     .await
                 {
@@ -997,6 +1023,7 @@ impl ParallelWorkflowEngine {
         sub_wf_id: Uuid,
         dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
         worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
+        site: talos_workflow_engine_core::ChildRunSite,
     ) -> JsonValue {
         // Strip internal metadata keys so sub-workflow input doesn't carry
         // engine internals (`__trigger_input__`, `__fuel_consumed__`, …).
@@ -1008,7 +1035,13 @@ impl ParallelWorkflowEngine {
             inputs
         };
         match self
-            .execute_subworkflow_graph(sub_wf_id, clean_input, dispatcher, worker_shared_key)
+            .execute_subworkflow_graph(
+                sub_wf_id,
+                clean_input,
+                dispatcher,
+                worker_shared_key,
+                site.with_kind(talos_workflow_engine_core::ChildDispatchKind::SubWorkflow),
+            )
             .await
         {
             Ok(collapsed) => collapsed,
@@ -1127,13 +1160,20 @@ impl ParallelWorkflowEngine {
         on_failure: &str,
         dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
         worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
+        site: talos_workflow_engine_core::ChildRunSite,
     ) -> JsonValue {
         let judge_input = serde_json::json!({
             "content": &parent_inputs,
             "rubric": rubric,
         });
         match self
-            .execute_subworkflow_graph(judge_wf_id, judge_input, dispatcher, worker_shared_key)
+            .execute_subworkflow_graph(
+                judge_wf_id,
+                judge_input,
+                dispatcher,
+                worker_shared_key,
+                site.with_kind(talos_workflow_engine_core::ChildDispatchKind::Judge),
+            )
             .await
         {
             Ok(collapsed) => {
@@ -1336,6 +1376,7 @@ impl ParallelWorkflowEngine {
         trigger_input: JsonValue,
         dispatcher: Arc<dyn talos_workflow_engine_core::NodeDispatcher>,
         worker_shared_key: Option<talos_workflow_engine_core::WorkerSharedKey>,
+        origin: talos_workflow_engine_core::ChildRunOrigin,
     ) -> Result<JsonValue, SubflowError> {
         self.module_fetcher
             .as_ref()
@@ -1404,17 +1445,143 @@ impl ParallelWorkflowEngine {
         let mut initial_results = HashMap::new();
         initial_results.insert(trigger_node_id, trigger_input);
 
-        let ctx = sub_engine
+        // The ledger clock starts HERE — at the moment the child engine begins
+        // running, not at the top of this function. A missing graph or a build
+        // failure is not a child RUN and gets no row (it surfaces in the
+        // parent's node output as an error envelope); recording one would put
+        // a "failed run" in the ledger for a child that never started.
+        let started = std::time::Instant::now();
+        let started_at_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+        let child_actor_id = sub_engine.actor_id;
+
+        let run = sub_engine
             .run_with_seed_with_transport(
                 dispatcher,
                 worker_shared_key,
                 initial_results,
                 Uuid::new_v4(),
             )
-            .await
-            .map_err(|e| SubflowError::ExecutionFailed(e.to_string()))?;
+            .await;
 
-        Ok(Self::collapse_subworkflow_output(&ctx.results, &sub_engine))
+        let outcome = match run {
+            Ok(ctx) => Ok(Self::collapse_subworkflow_output(&ctx.results, &sub_engine)),
+            Err(e) => Err(SubflowError::ExecutionFailed(e.to_string())),
+        };
+
+        // ONE write site for the whole child-run ledger (RFC 0012). AWAITED,
+        // not spawned: a spawned write is the orphaning shape
+        // `docs/platform-primitive-checklist.md` warns about, and one INSERT
+        // (~0.5 ms) after a run that took seconds is not a cost worth taking
+        // that risk for. Best-effort by construction — `record` returns `()`,
+        // so a ledger failure has nowhere to go and can never change what this
+        // function returns.
+        self.record_child_run(
+            origin,
+            sub_wf_id,
+            user_id,
+            child_actor_id,
+            started_at_unix_ms,
+            i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+            &outcome,
+        )
+        .await;
+
+        outcome
+    }
+
+    /// Persist one child run to the ledger. Called from exactly one place —
+    /// the tail of [`Self::execute_subworkflow_graph`] — so the five dispatch
+    /// kinds that route through it cannot each remember or forget.
+    ///
+    /// Silent no-op when there is no recorder wired, when the origin is
+    /// [`ChildRunOrigin::Untracked`](talos_workflow_engine_core::ChildRunOrigin::Untracked)
+    /// (the `test_subworkflow_contract` probe, a one-off embedder call), or
+    /// when this engine has no `workflow_id` — `parent_workflow_id` is NOT
+    /// NULL and there is nothing honest to put there. Same three-guard shape
+    /// as `record_judge_score`.
+    async fn record_child_run(
+        &self,
+        origin: talos_workflow_engine_core::ChildRunOrigin,
+        child_workflow_id: Uuid,
+        user_id: Uuid,
+        child_actor_id: Option<Uuid>,
+        started_at_unix_ms: i64,
+        duration_ms: i64,
+        outcome: &Result<JsonValue, SubflowError>,
+    ) {
+        let Some(recorder) = self.child_run_recorder.as_ref() else {
+            return;
+        };
+        let talos_workflow_engine_core::ChildRunOrigin::Node {
+            execution_id,
+            node_id,
+            kind,
+        } = origin
+        else {
+            return;
+        };
+        let Some(parent_workflow_id) = self.workflow_id else {
+            return;
+        };
+
+        // Redaction: `run_scheduler_loop` DLP-scrubs the whole results map on
+        // its way out, so an `Ok(collapsed)` message has already had one pass
+        // and this is a second. On the `Err` branch it is the ONLY pass — that
+        // text is an engine error string that never went near the sanitizer —
+        // which is why it is applied on both arms rather than only where a
+        // mutation would be caught.
+        //
+        // A child whose engine returned `Ok` can still have FAILED: its
+        // collapsed output may carry an error envelope, which is exactly what
+        // the reactor's own `route_system_node_output` reads to decide the
+        // parent node's fate. Classify with check 77's shared classifier, not
+        // with a second `as_bool()` opinion, so the ledger and the run can
+        // never disagree about whether a child failed.
+        let (status, error_class) = match outcome {
+            Ok(collapsed) if output_reports_error(collapsed) => (
+                talos_workflow_engine_core::ChildRunStatus::Failed,
+                collapsed
+                    .get("error_message")
+                    .and_then(JsonValue::as_str)
+                    .map(|m| self.redact_str(m)),
+            ),
+            Ok(_) => (talos_workflow_engine_core::ChildRunStatus::Completed, None),
+            Err(e) => (
+                talos_workflow_engine_core::ChildRunStatus::Failed,
+                Some(self.redact_str(&e.clone().message(kind.as_str()))),
+            ),
+        };
+
+        // The graph-facing node id ("n3", "team_gather") — resolved from the
+        // engine's own label map so the mapping has one home, falling back to
+        // the node UUID when the label is unknown.
+        let parent_node_id = self
+            .node_labels
+            .get(&node_id)
+            .cloned()
+            .unwrap_or_else(|| node_id.to_string());
+
+        recorder
+            .record(talos_workflow_engine_core::ChildRunRecord {
+                parent_execution_id: execution_id,
+                parent_workflow_id,
+                parent_node_id,
+                dispatch_kind: kind,
+                child_workflow_id,
+                user_id,
+                actor_id: child_actor_id,
+                // This engine is the PARENT; the child ran one level deeper.
+                // `AdapterSet::into_engine` computes the same `+1`.
+                depth: i16::try_from(self.current_subflow_depth.saturating_add(1))
+                    .unwrap_or(i16::MAX),
+                started_at_unix_ms,
+                duration_ms,
+                status,
+                error_class,
+            })
+            .await;
     }
 
     /// Resolve the binding a sub-workflow should run under: its OWN actor

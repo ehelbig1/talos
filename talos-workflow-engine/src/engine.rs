@@ -736,6 +736,14 @@ pub struct ParallelWorkflowEngine {
     /// live in. `None` (tests / out-of-tree consumers) skips recording.
     pub(crate) judge_score_recorder:
         Option<Arc<dyn talos_workflow_engine_core::JudgeScoreRecorder>>,
+    /// Write-side port for the child-run ledger (RFC 0012). A sub-workflow
+    /// runs in-process and leaves no `workflow_executions` row, so this is the
+    /// ONLY record that a child ran. Written at the one chokepoint
+    /// (`execute_subworkflow_graph`), awaited, and best-effort: the recorder
+    /// swallows its own errors, so a ledger failure can never change the
+    /// child's or the parent's outcome. `None` (tests / out-of-tree consumers)
+    /// records nothing.
+    pub(crate) child_run_recorder: Option<Arc<dyn talos_workflow_engine_core::ChildRunRecorder>>,
     /// Seals per-dispatch plaintext secrets into the opaque
     /// `(ciphertext, nonce)` pair forwarded on the wire. Defaults to
     /// [`talos_workflow_job_protocol::AesGcmSecretEnvelope`] — a
@@ -875,6 +883,7 @@ pub struct AdapterSet {
     assistant_report_reader: Option<Arc<dyn talos_workflow_engine_core::AssistantReportReader>>,
     operator_digest_reader: Option<Arc<dyn talos_workflow_engine_core::OperatorDigestReader>>,
     judge_score_recorder: Option<Arc<dyn talos_workflow_engine_core::JudgeScoreRecorder>>,
+    child_run_recorder: Option<Arc<dyn talos_workflow_engine_core::ChildRunRecorder>>,
     secret_envelope: Arc<dyn talos_workflow_engine_core::SecretEnvelope>,
     user_id: Option<Uuid>,
     actor_id: Option<Uuid>,
@@ -975,6 +984,9 @@ impl AdapterSet {
         engine.assistant_report_reader = self.assistant_report_reader;
         engine.operator_digest_reader = self.operator_digest_reader;
         engine.judge_score_recorder = self.judge_score_recorder;
+        // The ledger port travels into every sub-engine, so a NESTED child
+        // (depth 2+) is recorded too — it is a child run like any other.
+        engine.child_run_recorder = self.child_run_recorder;
         engine.secret_envelope = self.secret_envelope;
         engine.user_id = self.user_id;
         engine.actor_id = self.actor_id;
@@ -1075,6 +1087,7 @@ impl ParallelWorkflowEngine {
             assistant_report_reader: None,
             operator_digest_reader: None,
             judge_score_recorder: None,
+            child_run_recorder: None,
             secret_envelope: Arc::new(talos_workflow_job_protocol::AesGcmSecretEnvelope),
             sandbox_root: Some(default_sandbox_root().to_path_buf()),
             agent_loop_max_history: DEFAULT_AGENT_LOOP_MAX_HISTORY,
@@ -1119,6 +1132,7 @@ impl ParallelWorkflowEngine {
             assistant_report_reader: self.assistant_report_reader.clone(),
             operator_digest_reader: self.operator_digest_reader.clone(),
             judge_score_recorder: self.judge_score_recorder.clone(),
+            child_run_recorder: self.child_run_recorder.clone(),
             secret_envelope: self.secret_envelope.clone(),
             user_id: self.user_id,
             actor_id: self.actor_id,
@@ -2297,6 +2311,7 @@ impl ParallelWorkflowEngine {
                     .try_dispatch_judge(
                         node_idx,
                         node_id,
+                        execution_id,
                         &dispatcher,
                         &worker_shared_key,
                         &results,
@@ -2332,6 +2347,7 @@ impl ParallelWorkflowEngine {
                     .try_dispatch_ensemble(
                         node_idx,
                         node_id,
+                        execution_id,
                         &dispatcher,
                         &worker_shared_key,
                         &results,
@@ -2413,6 +2429,7 @@ impl ParallelWorkflowEngine {
                     .try_dispatch_reflective_retry(
                         node_idx,
                         node_id,
+                        execution_id,
                         &dispatcher,
                         &worker_shared_key,
                         &results,
@@ -2445,6 +2462,7 @@ impl ParallelWorkflowEngine {
                     .try_dispatch_llm_dispatch(
                         node_idx,
                         node_id,
+                        execution_id,
                         &dispatcher,
                         &worker_shared_key,
                         &results,

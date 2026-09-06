@@ -409,6 +409,13 @@ CTRL_TESTS=(
     # bound inside `record_completed`'s UPDATE: a pure-Rust test proves the
     # classifier, only the round trip proves the value is bound and survives.
     "module_execution_error_type_tests"
+    # RFC 0012's child-run ledger. A sub-workflow leaves no
+    # `workflow_executions` row, so `sub_workflow_runs` is the only evidence it
+    # ran — and every question this PR answers is a round trip: which row the
+    # real chokepoint wrote, which policy applies to it, and which rows the
+    # retention purge selects. Uses the `common` DATABASE_URL harness, so
+    # CTRL_TESTS and not TC_TESTS (sub-leg 64b).
+    "child_run_ledger_tests"
     "execution_archive_read_tests"
     # The same question one table over (2026-08-31). `execution_events.
     # duration_ms` was derived by a BEFORE INSERT trigger from two event

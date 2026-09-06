@@ -431,7 +431,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_workflow_reuse_stats",
-            "description": "Get reuse analytics across workflows: invocation counts, unique sessions, repeat-use ratio, and estimated token savings. Two lists: `workflows` is ranked by counted invocations from workflow_executions; `parent_dispatched` names workflows an enabled parent invokes as a sub-workflow, whose invocations are real but UNCOUNTED (a sub-workflow run records no execution row), so their total_invocations is null rather than 0 and they are kept out of the ranking.",
+            "description": "Get reuse analytics across workflows: invocation counts, unique sessions, repeat-use ratio, and estimated token savings. Two lists: `workflows` is ranked by counted invocations from workflow_executions; `parent_dispatched` names workflows an enabled parent invokes as a sub-workflow, whose invocations are real but UNCOUNTED (a sub-workflow run records no execution row), so their total_invocations is null rather than 0 and they are kept out of the ranking. Each `parent_dispatched` row also carries `child_runs_since_ledger` — a count from the RFC 0012 child-run ledger, floored at `child_runs_counted_from` (the later of the window and `ledger_since`) and null, never 0, when the ledger has nothing to say.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -6327,6 +6327,31 @@ async fn handle_get_workflows_by_capability(
     }
 }
 
+/// What `child_runs_since_ledger` means, and — the part that matters — what a
+/// zero or a null does NOT mean.
+///
+/// The ledger has a first row. A count of 0 for a window that starts before it
+/// is *nobody was recording*, not *nothing ran*, which is the same rule #758
+/// applies to `child_workflow_ids_checked`. So when `ledger_since` is unknown
+/// the per-row value is null, not 0, and this sentence says why.
+fn child_runs_note(ledger_has_started: bool, days: i64) -> String {
+    if !ledger_has_started {
+        return format!(
+            "child_runs_since_ledger is null on every row: the RFC 0012 child-run \
+             ledger holds no rows at all, so a 0 here would claim a measurement \
+             nobody made. {}",
+            talos_child_run_ledger::UNRECORDED_DISPATCH_KINDS_NOTE
+        );
+    }
+    format!(
+        "child_runs_since_ledger counts recorded sub-workflow runs from \
+         child_runs_counted_from (the later of the {days}-day window and \
+         ledger_since) to now. It is a SECOND number with its own floor, not a \
+         substitute for total_invocations, and the list is not ranked by it. {}",
+        talos_child_run_ledger::UNRECORDED_DISPATCH_KINDS_NOTE
+    )
+}
+
 async fn handle_get_workflow_reuse_stats(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
@@ -6373,6 +6398,26 @@ async fn handle_get_workflow_reuse_stats(
                     )
                     .await,
             );
+            // ── RFC 0012: the ledger can COUNT what this list could only
+            // ── name.
+            //
+            // `total_invocations` stays null: that column is
+            // `workflow_executions`, and a child has no row there. What the
+            // ledger adds is a SECOND, differently-sourced number with its own
+            // floor — `child_runs_since_ledger`, counted from
+            // max(period_start, ledger_since). It is NOT a substitute for
+            // `total_invocations` and is deliberately not used to rank the
+            // list; a row whose count begins at a different date cannot take a
+            // position in a ranking by a count that does not.
+            let ledger = talos_child_run_ledger::ChildRunLedger::new(state.db_pool.clone());
+            let ledger_since = readings
+                .record("ledger_since", ledger.since().await)
+                .flatten();
+            let period_start = chrono::Utc::now() - chrono::Duration::days(days);
+            // The floor of what the ledger can honestly answer for: it cannot
+            // speak about a period before its first row.
+            let counted_from = ledger_since.map(|s| s.max(period_start));
+
             let mut parent_dispatched: Vec<serde_json::Value> = Vec::new();
             let mut parent_dispatched_truncated = false;
             let mut unreadable_parents: Vec<String> = Vec::new();
@@ -6387,6 +6432,20 @@ async fn handle_get_workflow_reuse_stats(
                         .scan_child_parents_for(user_id, &ids)
                         .await,
                 );
+                // ONE batched count for the whole page (`= ANY($1)`), not one
+                // query per row — this is a list renderer, which is exactly
+                // where an N+1 is born. Absent from the map means NO ROWS,
+                // which the renderer turns into 0 only when `counted_from` is
+                // known; otherwise it stays null.
+                let child_run_counts = match counted_from {
+                    Some(from) => readings
+                        .record(
+                            "parent_dispatched.child_runs",
+                            ledger.count_for_children_since(&ids, user_id, from).await,
+                        )
+                        .unwrap_or_default(),
+                    None => std::collections::HashMap::new(),
+                };
                 if let Some(scan) = scan.as_ref() {
                     unreadable_parents = scan.unreadable_parents().to_vec();
                     for c in &candidates {
@@ -6414,6 +6473,15 @@ async fn handle_get_workflow_reuse_stats(
                             "estimated_token_savings": serde_json::Value::Null,
                             "runs_as_child_of": parents,
                             "node_count": node_count,
+                            // A measured count, or null with the reason beside
+                            // it in `child_runs_note` — never 0 for a period
+                            // nobody was recording.
+                            "child_runs_since_ledger": counted_from.map_or(
+                                serde_json::Value::Null,
+                                |_| serde_json::json!(
+                                    child_run_counts.get(&c.workflow_id).copied().unwrap_or(0)
+                                ),
+                            ),
                         }));
                     }
                 }
@@ -6462,6 +6530,9 @@ async fn handle_get_workflow_reuse_stats(
                 "workflows": stats,
                 "parent_dispatched": parent_dispatched,
                 "parent_dispatched_count": parent_dispatched.len(),
+                "ledger_since": ledger_since.map(|t| t.to_rfc3339()),
+                "child_runs_counted_from": counted_from.map(|t| t.to_rfc3339()),
+                "child_runs_note": child_runs_note(ledger_since.is_some(), days),
                 "parent_dispatched_note": "Workflows an ENABLED parent dispatches into as a \
                     sub-workflow. Their invocations are real but UNCOUNTED: a sub-workflow runs \
                     in-process and records no workflow_executions row, so total_invocations is \
@@ -10522,5 +10593,48 @@ mod fuel_report_blindspot_tests {
             body.contains("engine_node_uuid"),
             "node labels must be resolved with the canonical derivation (lint check 71)"
         );
+    }
+}
+
+#[cfg(test)]
+mod child_runs_since_ledger_note_tests {
+    use super::child_runs_note;
+
+    /// With no ledger rows at all, every per-row value is null — and the note
+    /// must say a 0 would have been a measurement nobody made. This is the
+    /// UNKNOWN-is-not-zero rule in the surface where it is easiest to get
+    /// wrong: a reuse report is read as a usage count.
+    #[test]
+    fn an_empty_ledger_is_declared_null_rather_than_zero() {
+        let note = super::child_runs_note(false, 30);
+        assert!(note.contains("null"), "{note}");
+        assert!(
+            note.contains("a 0 here would claim a measurement nobody made"),
+            "{note}"
+        );
+    }
+
+    /// Once the ledger has a floor, the note must state that the count has
+    /// its OWN start date and is not a substitute for `total_invocations` —
+    /// two numbers on one row with different denominators is how a reader
+    /// ends up comparing them.
+    #[test]
+    fn a_live_ledger_names_its_floor_and_refuses_to_stand_in_for_invocations() {
+        let note = child_runs_note(true, 14);
+        assert!(note.contains("child_runs_counted_from"), "{note}");
+        assert!(note.contains("14-day"), "{note}");
+        assert!(
+            note.contains("not a substitute for total_invocations"),
+            "{note}"
+        );
+        assert!(note.contains("not ranked by it"), "{note}");
+    }
+
+    #[test]
+    fn every_rendering_discloses_the_unrecorded_dispatch_kinds() {
+        for note in [child_runs_note(false, 7), child_runs_note(true, 7)] {
+            assert!(note.contains("agent_loop"), "{note}");
+            assert!(note.contains("capability_dispatch"), "{note}");
+        }
     }
 }

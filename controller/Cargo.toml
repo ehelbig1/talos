@@ -281,6 +281,11 @@ talos-session-brief-service = { path = "../talos-session-brief-service" }
 # …and names the two block REASONS from the one predicate that produces them,
 # rather than restating the strings a third time.
 talos-draft-heuristics = { path = "../talos-draft-heuristics" }
+# child_run_ledger_tests: RFC 0012's ledger is a new TABLE with new SQL, so
+# every assertion here is a round trip — the repository methods, the RLS
+# policy, and the retention purge's pinned-parent exemption cannot be observed
+# from Rust alone.
+talos-child-run-ledger = { path = "../talos-child-run-ledger" }
 
 [features]
 default = []

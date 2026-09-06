@@ -995,6 +995,13 @@ pub struct TalosMetrics {
     // See deploy/observability/alerts.yaml for the SLOs built on top.
     pub kek_decrypt_failures_total: CounterVec,
     pub memory_write_failures_total: CounterVec,
+    /// Child-run ledger writes that produced no row (RFC 0012). Labels:
+    /// `reason=acquire|insert`. A sub-workflow leaves no `workflow_executions`
+    /// row, so this ledger is the ONLY record that a child ran — a dropped
+    /// write is a run that, to every reader, never happened. The write is
+    /// best-effort by design (it must never fail the workflow), which is
+    /// exactly why the failure needs a series of its own.
+    pub child_run_record_failures_total: CounterVec,
     /// Signed-RPC mutations the CONTROLLER refused on the per-actor write
     /// ceiling (#757). Labels: `subject` (the NATS subject) × `reason`
     /// (`policy` | `unreadable`).
@@ -1927,6 +1934,32 @@ impl TalosMetrics {
                 .inc_by(0.0);
         }
 
+        let child_run_record_failures_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_child_run_record_failures_total",
+                "Child-run ledger writes that produced no row. Labels: \
+                 reason=acquire (no pooled connection) | insert (the INSERT \
+                 itself failed). RFC 0012: a sub-workflow runs in-process and \
+                 records no workflow_executions row, so sub_workflow_runs is \
+                 the only evidence a child ran; a dropped write is silence \
+                 that reads exactly like 'this child never ran'. The write is \
+                 deliberately best-effort — it must never fail a workflow — so \
+                 this counter is the only thing that can say it failed.",
+            ),
+            &["reason"],
+        )?;
+        registry.register(Box::new(child_run_record_failures_total.clone()))?;
+        // Closed set with a live emitter for each: `PostgresChildRunRecorder`
+        // has exactly two failure arms and stamps one label at each. Seeded
+        // because the healthy steady state is zero forever, and an ABSENT
+        // series makes `increase(...) > 0` match nothing — the detector
+        // silenced by exactly the condition it detects.
+        for reason in ["acquire", "insert"] {
+            child_run_record_failures_total
+                .with_label_values(&[reason])
+                .inc_by(0.0);
+        }
+
         let rpc_write_ceiling_refusals_total = CounterVec::new(
             prometheus::Opts::new(
                 "talos_rpc_write_ceiling_refusals_total",
@@ -2130,6 +2163,7 @@ impl TalosMetrics {
             dlq_db_errors_total,
             kek_decrypt_failures_total,
             memory_write_failures_total,
+            child_run_record_failures_total,
             rpc_write_ceiling_refusals_total,
             ops_alert_ingest_failures_total,
             ops_alert_auto_resolved_total,
@@ -2282,6 +2316,12 @@ mod tests {
             // — and it was unseeded until 2026-09-05, so the series only
             // existed on a controller that had already refused something.
             r#"talos_memory_write_failures_total{reason="write_ceiling"} 0"#,
+            // RFC 0012's child-run ledger. Its healthy steady state is zero
+            // forever, which is exactly the case where ABSENT and ZERO
+            // diverge. Both reasons have a live emitter in
+            // `PostgresChildRunRecorder`.
+            r#"talos_child_run_record_failures_total{reason="acquire"} 0"#,
+            r#"talos_child_run_record_failures_total{reason="insert"} 0"#,
             // #757's fleet-configuration signal. Its healthy steady state is
             // zero forever, which is exactly the case where ABSENT and ZERO
             // diverge: the alert on it is an `increase(...) > 0`, and an
