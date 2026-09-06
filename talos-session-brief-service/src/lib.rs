@@ -131,14 +131,22 @@ impl SessionBriefService {
         let embedding_provider_available = talos_search_service::embedding_provider_available();
         let auto_healing_embeddings = unembedded > 0 && embedding_provider_available;
 
-        // 2. Draft workflows (unpublished, no executions) — recent first
-        let draft_rows = self
-            .advanced_repo
-            .get_draft_workflows(user_id)
-            .await
-            .unwrap_or_default();
-
-        // Auto-archive stale drafts if requested.
+        // 2. Auto-archive stale drafts if requested — BEFORE the draft display
+        // read, deliberately.
+        //
+        // The order is the second half of the disjointness this response owes
+        // an operator. The first half is that the sweep now refuses to archive
+        // a draft a human visibly shaped, so a row can never appear under
+        // `unpublished_substantive_drafts` ("ready for publish_version") AND be
+        // archived by the same call — measured on pristine `origin/main`
+        // 2026-09-05, where exactly that happened with
+        // `auto_archived_stale_drafts: 1`. The second half is this ordering:
+        // `get_draft_workflows` filters `status = 'draft'`, so reading it AFTER
+        // the sweep means neither list can name a row this response just
+        // archived. Pre-2026-09-05 the read came first, so even a STUB was
+        // listed with `next_step: get_workflow_quickstart` moments after being
+        // archived — a smaller version of the same defect, and one no
+        // substantive-ness rule would have closed.
         //
         // An `Err` here is DISCLOSED, not defaulted to 0: the sweep aborts
         // rather than archive without the child exclusion (see
@@ -169,6 +177,14 @@ impl SessionBriefService {
                 }
             }
         }
+
+        // 2b. Draft workflows (unpublished, no executions) — recent first.
+        // Post-sweep by construction (see above).
+        let draft_rows = self
+            .advanced_repo
+            .get_draft_workflows(user_id)
+            .await
+            .unwrap_or_default();
 
         // Drafts split by substantive-ness (pain point #1, addressed r234):
         //   * `unpublished_substantive_drafts` — workflows that are well-configured
@@ -204,29 +220,16 @@ impl SessionBriefService {
                 talos_hygiene_service::count_nodes_with_empty_data(&nodes);
             let days_old = (chrono::Utc::now() - r.created_at).num_days();
 
-            // Substantive detection: walk graph_json once, look for any
-            // marker of authored intent. Cheap to compute (capped at 5 drafts).
-            let has_thoughtful_node = nodes.iter().any(|n| {
-                let data = n.get("data");
-                let prompt_len = data
-                    .and_then(|d| d.get("SYSTEM_PROMPT"))
-                    .and_then(|v| v.as_str())
-                    .map(str::len)
-                    .unwrap_or(0);
-                let has_output_schema = data
-                    .and_then(|d| d.get("OUTPUT_SCHEMA"))
-                    .map(|v| !v.is_null())
-                    .unwrap_or(false);
-                let has_retry = n.get("retry_count").is_some()
-                    || n.get("retry_condition").is_some()
-                    || n.get("retry_delay_expression").is_some();
-                let has_per_node_meta = n.get("description").is_some()
-                    || n.get("skip_condition").is_some()
-                    || n.get("continue_on_error").is_some();
-                prompt_len > 200 || has_output_schema || has_retry || has_per_node_meta
-            });
-            let all_nodes_configured = node_count > 0 && unconfigured_node_count == 0;
-            let is_substantive = all_nodes_configured || has_thoughtful_node;
+            // Substantive detection. Until 2026-09-05 this was an INLINE COPY
+            // of the walk in `talos-draft-heuristics` — behaviourally
+            // identical, and asserted to be the same predicate by that
+            // module's own doc comment, which claimed both surfaces "consult
+            // this helper". They did not. The copy is gone; this is the same
+            // call the ARCHIVE sweep below makes about the same row, which is
+            // what makes the two lists in this response disjoint by
+            // construction rather than by coincidence.
+            let is_substantive =
+                talos_hygiene_service::is_substantive_workflow(r.graph_json.as_deref());
 
             let next_step = if is_substantive {
                 format!("publish_version with workflow_id={}", id)
@@ -826,9 +829,31 @@ impl SessionBriefService {
                         }))
                         .collect::<Vec<_>>());
                 }
+                if !outcome.skipped_substantive.is_empty() {
+                    // The other half of the count/population disagreement, and
+                    // the one this response would otherwise contradict itself
+                    // about: every id here is (or was, before it aged past the
+                    // 5-row display cap) a row `unpublished_substantive_drafts`
+                    // calls ready to publish. Same `reason` vocabulary
+                    // `fix_all` prints under `substantive_drafts_skipped`.
+                    report["auto_archive_skipped_substantive"] = serde_json::json!(outcome
+                        .skipped_substantive
+                        .iter()
+                        .map(|d| serde_json::json!({
+                            "id": d.id.to_string(),
+                            "name": d.name,
+                            "reason": d.reason,
+                        }))
+                        .collect::<Vec<_>>());
+                }
                 if !outcome.unreadable_parents.is_empty() {
                     report["auto_archive_unreadable_parents"] =
                         serde_json::json!(outcome.unreadable_parents);
+                }
+                if !outcome.skipped_children.is_empty() || !outcome.skipped_substantive.is_empty() {
+                    report["auto_archive_note"] = serde_json::json!(
+                        "auto_archived_stale_drafts counts only rows this sweep MOVED. Drafts                          listed under auto_archive_skipped_children /                          auto_archive_skipped_substantive were eligible by age and by                          'never executed' and were deliberately left alone — there is no flag                          that widens the sweep to include them, by design. Archive one                          explicitly with archive_workflow, or publish it with publish_version."
+                    );
                 }
             }
         }
@@ -841,7 +866,10 @@ impl SessionBriefService {
             .unwrap_or(0);
         if in_progress_count > 0 && auto_archive_days.is_none() {
             report["auto_archive_hint"] = serde_json::json!(
-                "Pass auto_archive_stale_days: 14 to automatically clean up drafts older than 14 days on next session_start."
+                "Pass auto_archive_stale_days: 14 to automatically clean up STUB drafts older than \
+                 14 days on next session_start. Drafts a human visibly shaped (the \
+                 unpublished_substantive_drafts list) and drafts an enabled parent dispatches \
+                 into are never swept — archive those explicitly with archive_workflow."
             );
         }
 

@@ -273,6 +273,14 @@ talos-workflow-engine-test-utils = { path = "../talos-workflow-engine-test-utils
 # a test against the repository row alone cannot see the sentence that names
 # `batch_delete_workflows`.
 talos-hygiene-service = { path = "../talos-hygiene-service" }
+# session_start_substantive_draft_tests: drives the REAL `SessionBriefService`,
+# because the defect is what ONE RESPONSE says — the archive sweep and the
+# "ready for publish_version" list are assembled in the same function, and a
+# test against either half alone cannot see them contradict each other.
+talos-session-brief-service = { path = "../talos-session-brief-service" }
+# …and names the two block REASONS from the one predicate that produces them,
+# rather than restating the strings a third time.
+talos-draft-heuristics = { path = "../talos-draft-heuristics" }
 
 [features]
 default = []

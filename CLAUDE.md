@@ -451,13 +451,93 @@ every listing an operator manages it through, under the label "stale".
 shares the same blind predicate and is left as-is: its only consumer is
 `session_start`'s draft DISPLAY, which takes no destructive action (its
 reasoning is in that method's doc comment, along with why it carries no lint
-marker). `session_start`'s auto-archive still archives SUBSTANTIVE drafts —
-the exact contradiction M-I fixed for `fix_all` in 2026-05, still live on the
-archive path, so an operator who runs `session_start` after reading its own
-"ready to publish" list can archive what it just told them to ship; that is a
-real defect, reversible, and a change to what an existing opt-in flag does, so
-it is recorded rather than attempted. And `__ops_alert__` / `__ml_distill__`
-remain as #750 left them.
+marker). And `__ops_alert__` / `__ml_distill__` remain as #750 left them.
+
+**The auto-archive remainder is now CLOSED (2026-09-05).** #758 recorded that
+`session_start`'s auto-archive "still archives SUBSTANTIVE drafts — the exact
+contradiction M-I fixed for `fix_all` in 2026-05" and left it, because it is a
+behaviour change to an existing opt-in flag and archiving is reversible.
+Measured on pristine `origin/main` before it was fixed, driving the REAL
+`SessionBriefService`: the brief listed a shaped draft under
+`unpublished_substantive_drafts` with `next_step: "publish_version with
+workflow_id=…"` and reported `auto_archived_stale_drafts: 1` for that same row,
+**in one response** — because `get_draft_workflows` was read BEFORE the sweep.
+Both halves are fixed: the sweep now refuses a shaped draft, and the display
+read moved BELOW the sweep, so neither list can name a row the same call
+archived (that second half matters on its own — a STUB was listed with
+`next_step: get_workflow_quickstart` moments after being archived, and no
+substantive-ness rule would have closed that).
+
+The predicate MOVED (not copied) to the leaf crate `talos-draft-heuristics`
+(`serde_json` only), the reason `talos-child-workflow-refs` exists: the archive
+sweep lives in `talos-advanced-repository`, which must not depend on a service
+crate that pulls in four repositories. Three consumers, three crates, no edge
+between them: `fix_all`'s auto-DELETE partition, the auto-ARCHIVE sweep, and
+the draft DISPLAY. **The old home's doc comment claimed *"Both `session_start`
+… AND `get_platform_hygiene_report fix_all` consult this helper so the two
+surfaces never disagree"*, and it was FALSE — `session_start` carried an INLINE
+COPY of the same 20-line walk.** Behaviourally identical, which is why nothing
+caught it; an ALL-sites claim is worth only as much as the sites being unable
+to drift.
+
+`DraftIntent` is THREE-valued and `is_substantive_workflow` is a thin two-valued
+view over it, byte-for-byte the old behaviour. The third value is for the paths
+that WRITE: `is_substantive_workflow` answers `false` for "no markers" and for
+"`graph_json` would not parse" alike, and on a sweep those are not the same
+answer — `graph_json` is `text NOT NULL`, so an unparseable graph is storable,
+and it is now held back under its own distinct reason. Same UNKNOWN-is-not-NO
+rule the parent scan applies. Both exclusions run at the ONE chokepoint,
+child-FIRST (matching `fix_all`'s partition — publishing a draft retires the
+substantive reason and leaves the child reason standing), each skipped id
+reported under its own reason (`auto_archive_skipped_children` /
+`auto_archive_skipped_substantive`, with the `substantive_drafts_skipped`
+wording `fix_all` already prints), and the UPDATE stays by-id over what was
+classified.
+
+**Deliberately NO force flag**, mirroring `fix_all`, which has had this
+exclusion since 2026-05 with no override: the escape hatch is an EXPLICIT
+operator action (`publish_version`, or `archive_workflow` /
+`batch_delete_workflows` naming the workflow). An `include_substantive: true`
+would re-enable an unattended destructive sweep over exactly the population the
+rule exists to protect. The skip is disclosed in every response, so a draft
+cannot quietly acquire permanent immunity, and the tool schema now says so
+instead of promising to "archive draft workflows that have never been published
+or executed".
+
+**Blast radius, measured on the dev fleet 2026-09-05: ZERO additional skips
+today.** 36 workflows, 11 drafts, 2 with no execution row; at any window ≥7 days
+there is exactly ONE candidate, `cos-team-recall`, and #760's child rule already
+spares it. So the substantive rule is LATENT on this fleet — stated plainly
+rather than dressed up, since "latent is not live" cuts both ways and the
+previous entry in this section was written the same way one day before the
+condition it called latent went live.
+
+**What was measured and NOT changed here.** The hygiene REPORT's stale-draft
+recommendation counts a substantive draft as `deletable` and names
+`batch_delete_workflows`, while `fix_all` — the DECISION built on the same rows
+— excludes it. That is the report/decision split running the other way from the
+child case (where the report lists and the decision excludes), it is advice a
+human reads rather than an unattended write, and the sentence already offers
+`publish_version` first; changing it would move a count an operator may have
+wired up, so it is recorded. And a NON-substantive draft is still listed under
+`in_progress_drafts` and swept in the same session — that is the flag doing
+exactly what it was asked to do, and the ordering change means it is no longer
+listed and archived in the same RESPONSE.
+
+**No lint check was added, and the numbers are here so a future session need not
+re-measure.** A "the substantive predicate has one home" detector — a file
+naming both `retry_delay_expression` and `"SYSTEM_PROMPT"` outside the leaf
+crate — reports exactly the duplicate on pristine `origin/main` and 0 on the
+fixed tree: 1/1, trivially 100% precision, population ONE. That is a
+single-instance historical class already answered structurally (one `pub` home,
+`#[must_use]` on every entry point, and a DB test that drives both surfaces over
+the same rows), so it is left unwritten rather than shipped as a check that has
+never had anything to say. Note what that DB test does and does not cover,
+because it was proven by mutation and not by reasoning: reducing the DISPLAY
+half to branch 1 alone SURVIVED the first version of it, since every seeded row
+agreed on both branches — the test now seeds a branch-1-only and a
+branch-2-only shape, and the branch-2-only one (`data: {}` plus `retry_count`)
+is the shape the live fleet's only stale-draft candidate actually has.
 
 **#762 — the SCORING half: a child's reliability and freshness are UNMEASURABLE,
 not zero.** #758/#760 fixed the DESTRUCTIVE readers; the same blindness also fed

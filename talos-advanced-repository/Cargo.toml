@@ -17,6 +17,11 @@ sqlx = { version = "0.8", default-features = false, features = ["postgres", "run
 # as a scaffolding leftover. Shared leaf, not a second copy (see #758/#759).
 talos-child-workflow-refs = { path = "../talos-child-workflow-refs" }
 talos-config = { path = "../talos-config" }
+# The ONE draft-substantiveness predicate. `session_start` renders a shaped
+# draft as "ready for publish_version" in the SAME response this sweep runs in,
+# so the sweep must consult the predicate that produced that sentence rather
+# than a second copy of it. Leaf: serde_json only.
+talos-draft-heuristics = { path = "../talos-draft-heuristics" }
 talos-db = { path = "../talos-db" }
 tokio = { workspace = true, features = ["time"] }
 talos-dlp-provider = { path = "../talos-dlp-provider" }

@@ -1802,6 +1802,7 @@ dependencies = [
  "talos-db-monitor",
  "talos-dlp",
  "talos-dlp-provider",
+ "talos-draft-heuristics",
  "talos-engine",
  "talos-engine-events",
  "talos-errors",
@@ -1858,6 +1859,7 @@ dependencies = [
  "talos-secrets-manager",
  "talos-secrets-rotation",
  "talos-security-headers",
+ "talos-session-brief-service",
  "talos-shutdown",
  "talos-slack",
  "talos-subworkflow-contract",
@@ -7493,6 +7495,7 @@ dependencies = [
  "talos-config",
  "talos-db",
  "talos-dlp-provider",
+ "talos-draft-heuristics",
  "talos-tenancy",
  "talos-text-util",
  "tokio",
@@ -7897,6 +7900,13 @@ dependencies = [
  "talos-config",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "talos-draft-heuristics"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
 ]
 
 [[package]]
@@ -8388,6 +8398,7 @@ dependencies = [
  "chrono",
  "serde_json",
  "talos-analytics-repository",
+ "talos-draft-heuristics",
  "talos-execution-repository",
  "talos-measurement",
  "talos-module-repository",

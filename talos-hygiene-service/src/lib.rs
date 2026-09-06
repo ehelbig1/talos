@@ -11,10 +11,17 @@
 //! → format. Output JSON is byte-identical to the pre-extraction handler —
 //! the response shape is operator-facing API.
 
-pub mod graph_heuristics;
 pub mod twin_divergence;
 
-pub use graph_heuristics::{count_nodes_with_empty_data, is_substantive_workflow};
+// The draft-substantiveness heuristics MOVED to the leaf crate
+// `talos-draft-heuristics` on 2026-09-05 (not copied — see that crate's
+// header): `session_start`'s auto-ARCHIVE sweep lives in
+// `talos-advanced-repository`, which must not depend on a service crate that
+// pulls in four repositories. Re-exported so this crate's existing import
+// paths keep resolving.
+pub use talos_draft_heuristics::{
+    classify_draft_intent, count_nodes_with_empty_data, is_substantive_workflow, DraftIntent,
+};
 pub use twin_divergence::{analyze_twins, TwinAnalysis, TwinCandidate};
 
 use std::sync::Arc;
