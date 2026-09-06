@@ -454,7 +454,10 @@ Several default **ON** as of the 2026-07 "Tier 3" learning-loops cutover.
 | `AWS_ENDPOINT_URL` | none (optional) | Custom S3 endpoint | |
 | `MINIO_ENDPOINT` | none (optional) | MinIO endpoint | |
 | `MINIO_BUCKET` | `audit-logs` | Audit bucket name | |
-| (standard `AWS_*` credential vars) | SDK defaults | Read implicitly by the AWS SDK (`load_defaults`) | 🔒 |
+| (standard `AWS_*` credential vars) | SDK defaults | The WRITE path only. Read implicitly by the AWS SDK (`load_defaults`) in `build_audit_s3_client`. On this platform these are the `audit_write_only` identity: `s3:PutObject` and nothing else, so they CANNOT read the chain back — that is the design, not a gap. | 🔒 |
+| `AUDIT_VERIFIER_ACCESS_KEY_ID` | none | The READ path. Access key id of the read-only audit-chain verifier identity (`audit_read_only`: `s3:ListBucket` + `s3:GetObject`). Empty is treated as unset. The chain it reads is keyed PER JOB — every object key is `<module_executions.id>/…` — so the sweep enumerates `module_executions` and rolls its per-job outcomes up to workflow executions. | 🔒 |
+| `AUDIT_VERIFIER_SECRET_ACCESS_KEY` | none | Secret key for the above. **Both halves required**; one without the other reads as unset. With them absent the chain-verification sweep does not start, logs one `audit_chain_verifier_identity_missing` ERROR, increments `talos_audit_chain_unverifiable_total{reason="no_credentials"}`, and `security_audit`'s `audit_chain_verification` check reports the control as non-functional. There is deliberately **no `AWS_*` fallback** — that identity is write-only and every listing under it returns AccessDenied. | 🔒 |
+| `AUDIT_CHAIN_SWEEP_INTERVAL_SECS` | `3600` | Chain-verification sweep interval, clamped [300, 86400]. `0` disables the sweep entirely — a flat `talos_audit_chain_unverifiable_total` then means "never looked", not "verified clean". Each pass covers a window of 2× this value and caps at 2000 job chains; the cap is disclosed as `audit_chain_sweep_incomplete` rather than folded into a clean count. | |
 
 ---
 

@@ -1953,14 +1953,24 @@ pub(crate) fn spawn_maintenance_sweeps(
     // ---------- Audit-chain verification sweep (finding #2, Layer 2) ----------
     //
     // Continuously verifies the WORM audit ledger: each tick runs the offline
-    // chain verifier over recently-completed executions and emits a loud
-    // structured `audit_chain_verification_failed` event for any break
-    // (tamper / deletion / reorder / bad HMAC). This is what turns "we CAN
-    // verify the chain" into "we continuously DO" — the inline per-message
-    // check (`talos_audit_ledger::verify_audit_message`) catches forgery at
-    // ingest; this sweep catches gaps/deletions that only the full ordered
-    // set reveals. Runs as a trusted system task on the bare pool (the audit
-    // ledger is intentionally cross-tenant), so it needs no MCP/RBAC surface.
+    // chain verifier over recently-completed JOBS and emits a loud structured
+    // `audit_chain_verification_failed` event for any break (tamper /
+    // deletion / reorder / bad HMAC). This is what turns "we CAN verify the
+    // chain" into "we continuously DO" — the inline per-message check
+    // (`talos_audit_ledger::verify_audit_message`) catches forgery at ingest;
+    // this sweep catches gaps/deletions that only the full ordered set
+    // reveals. Runs as a trusted system task on the BARE POOL, deliberately:
+    // the audit ledger is a platform-wide, cross-tenant artefact and this is a
+    // system task with no caller and no tenant to scope to — a tenant-scoped
+    // tx here would verify one tenant's chains and silently certify the rest,
+    // which is the coverage lie the `cap_hit`/`aborted` flags exist to refuse.
+    //
+    // JOBS, not workflow executions: the ledger is keyed per module dispatch
+    // (`talos_audit_ledger::population` carries the binding and the live
+    // measurement — 200 of 200 object prefixes are `module_executions.id`,
+    // 0 of 200 are `workflow_executions.id`). The per-job outcomes are rolled
+    // up to workflow executions for the summary line, because that is the
+    // grain every other report is keyed on.
     //
     // Self-disables when no S3/WORM endpoint is configured (the from_env
     // helper returns None). Interval default 1h, clamped [300s, 86400s];
@@ -1981,8 +1991,23 @@ pub(crate) fn spawn_maintenance_sweeps(
         let audit_sweep_pool = db_pool.clone();
         let audit_sweep_shutdown = bg_shutdown_rx.clone();
         let lookback_secs = (audit_sweep_interval_secs as i64).saturating_mul(2);
-        const SETTLE_SECS: i64 = 120;
-        const MAX_EXECUTIONS_PER_SWEEP: i64 = 500;
+        // ONE home for the settle window: `security_audit`'s round-trip
+        // audit-chain check selects its candidate with the same constant, so
+        // the check and the standing sweep grade the same population.
+        const SETTLE_SECS: i64 = talos_audit_ledger::CHAIN_SETTLE_SECS;
+        // Sized against MEASURED volume, and re-sized when the population
+        // moved from workflow executions to jobs. Live dev stack 2026-09-06:
+        // 101 module executions in the sweep's own 2 h window, peak 150 in any
+        // 2 h bucket over 7 days, 1,342/day — against 45 workflow executions
+        // at the same peak, i.e. the population is ~3.3x larger, so the old
+        // 500 would have dropped from ~11x headroom to ~3x. A verification
+        // costs one `list_objects_v2` + one `get_object`; measured against the
+        // live store, 50 real verifications took 1.6 s wall including process
+        // start (~30 ms each), so 2000 is ~60 s of an HOURLY tick. `cap_hit`
+        // stays exactly as honest as before: the sweep keeps no cursor, so
+        // rows the cap drops age out of the sliding window and no later pass
+        // picks them up.
+        const MAX_JOBS_PER_SWEEP: i64 = 2000;
         tokio::spawn(async move {
             let mut shutdown = audit_sweep_shutdown;
             let mut ticker =
@@ -1997,18 +2022,67 @@ pub(crate) fn spawn_maintenance_sweeps(
                             &audit_sweep_pool,
                             lookback_secs,
                             SETTLE_SECS,
-                            MAX_EXECUTIONS_PER_SWEEP,
+                            MAX_JOBS_PER_SWEEP,
                         )
                         .await
                         {
-                            if stats.failed > 0 || stats.errored > 0 {
+                            if let Some(kind) = stats.aborted {
+                                // A deployment-wide condition: one identity,
+                                // one bucket, so every remaining execution in
+                                // the window would answer identically. ONE
+                                // line instead of up to 500 — and it must not
+                                // be read as a finished window, because the
+                                // rest of it was never examined.
+                                tracing::error!(
+                                    target: "talos_audit",
+                                    event_kind = "audit_chain_sweep_aborted",
+                                    reason = kind.metric_label(),
+                                    ledger_key_space = talos_audit_ledger::LEDGER_KEY_SPACE,
+                                    jobs_scanned = stats.scanned,
+                                    jobs_verified_ok = stats.verified_ok,
+                                    jobs_errored = stats.errored,
+                                    "audit chain verification sweep ABORTED on a deployment-wide \
+                                     condition — the WORM ledger is being written and cannot \
+                                     be verified. The remaining executions in this window \
+                                     were NOT examined, so the zero counts above are not a \
+                                     clean bill of health. See the preceding \
+                                     audit_chain_verification_errored line for the classified \
+                                     reason and its remedy."
+                                );
+                            } else if stats.failed > 0
+                                || stats.errored > 0
+                                || stats.empty > 0
+                                || stats.unbound > 0
+                            {
+                                // `empty` counts here: a prefix that read
+                                // cleanly and held NOTHING is not a verified
+                                // chain, and folding it into verified_ok is
+                                // how a repaired verifier identity would have
+                                // produced a permanently green "sweep
+                                // completed clean" over a population it never
+                                // reads. Now that the sweep enumerates the id
+                                // space the writer keys, an empty prefix is a
+                                // real per-job finding rather than the
+                                // expected reading. `unbound` counts too: a
+                                // job with no workflow execution has no
+                                // genesis pair and was NOT attempted, and an
+                                // unattempted row must never arrive inside a
+                                // clean count.
                                 tracing::warn!(
                                     target: "talos_audit",
                                     event_kind = "audit_chain_sweep_summary",
-                                    scanned = stats.scanned,
-                                    verified_ok = stats.verified_ok,
-                                    failed = stats.failed,
-                                    errored = stats.errored,
+                                    ledger_key_space = talos_audit_ledger::LEDGER_KEY_SPACE,
+                                    jobs_scanned = stats.scanned,
+                                    jobs_verified_ok = stats.verified_ok,
+                                    jobs_empty = stats.empty,
+                                    jobs_failed = stats.failed,
+                                    jobs_errored = stats.errored,
+                                    jobs_unbound = stats.unbound,
+                                    workflow_executions_covered = stats.rollup.covered,
+                                    workflow_executions_verified_ok = stats.rollup.verified_ok,
+                                    workflow_executions_empty = stats.rollup.empty,
+                                    workflow_executions_failed = stats.rollup.failed,
+                                    workflow_executions_errored = stats.rollup.errored,
                                     "audit chain verification sweep completed WITH findings"
                                 );
                             } else if stats.cap_hit {
@@ -2023,18 +2097,29 @@ pub(crate) fn spawn_maintenance_sweeps(
                                 tracing::warn!(
                                     target: "talos_audit",
                                     event_kind = "audit_chain_sweep_incomplete",
-                                    scanned = stats.scanned,
-                                    verified_ok = stats.verified_ok,
-                                    cap = MAX_EXECUTIONS_PER_SWEEP,
+                                    ledger_key_space = talos_audit_ledger::LEDGER_KEY_SPACE,
+                                    jobs_scanned = stats.scanned,
+                                    jobs_verified_ok = stats.verified_ok,
+                                    workflow_executions_covered = stats.rollup.covered,
+                                    cap = MAX_JOBS_PER_SWEEP,
                                     lookback_secs,
-                                    "audit chain verification sweep hit its row cap — the OLDEST                                      executions in this window were not verified and will not be                                      picked up by a later pass (the window slides and no cursor is                                      kept). No findings among the rows that WERE checked; this is                                      NOT a clean bill of health for the window. Lower                                      AUDIT_CHAIN_SWEEP_INTERVAL_SECS so fewer executions land in                                      each window, or raise the sweep cap."
+                                    "audit chain verification sweep hit its row cap — the OLDEST \
+                                     job chains in this window were not verified and will not be \
+                                     picked up by a later pass (the window slides and no cursor \
+                                     is kept). No findings among the rows that WERE checked; \
+                                     this is NOT a clean bill of health for the window. Lower \
+                                     AUDIT_CHAIN_SWEEP_INTERVAL_SECS so fewer module executions \
+                                     land in each window, or raise the sweep cap."
                                 );
                             } else if stats.scanned > 0 {
                                 tracing::info!(
                                     target: "talos_audit",
                                     event_kind = "audit_chain_sweep_summary",
-                                    scanned = stats.scanned,
-                                    verified_ok = stats.verified_ok,
+                                    ledger_key_space = talos_audit_ledger::LEDGER_KEY_SPACE,
+                                    jobs_scanned = stats.scanned,
+                                    jobs_verified_ok = stats.verified_ok,
+                                    workflow_executions_covered = stats.rollup.covered,
+                                    workflow_executions_verified_ok = stats.rollup.verified_ok,
                                     "audit chain verification sweep completed clean"
                                 );
                             }

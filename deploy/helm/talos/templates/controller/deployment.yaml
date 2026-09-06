@@ -224,6 +224,27 @@ spec:
                 secretKeyRef:
                   name: {{ include "talos.bootstrapSecretName" . }}
                   key: MINIO_CONTROLLER_PASSWORD
+            # The audit-chain VERIFIER identity, deliberately NOT the AWS_*
+            # pair above. Those carry `audit_write_only` (s3:PutObject and
+            # nothing else), so a verifier built from them gets AccessDenied on
+            # every listing — which is what happened, unnoticed, for two months.
+            # `optional: true` so an operator who has not provisioned the
+            # verifier yet gets a controller that BOOTS and reports the control
+            # as non-functional, rather than a CrashLoopBackOff: a missing
+            # verifier means the ledger is unverified, not that the platform
+            # must stop writing it.
+            - name: AUDIT_VERIFIER_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: MINIO_VERIFIER_USER
+                  optional: true
+            - name: AUDIT_VERIFIER_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: MINIO_VERIFIER_PASSWORD
+                  optional: true
             {{- include "talos.envFromSecret" (list (include "talos.bootstrapSecretName" .) $secretKeys) | nindent 12 }}
             # OAuth redirect URIs (derived from base URL).
             - name: GOOGLE_REDIRECT_URI

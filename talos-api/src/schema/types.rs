@@ -1636,25 +1636,28 @@ impl From<&talos_audit_ledger::ChainBreak> for AuditChainBreak {
     }
 }
 
-/// Result of verifying the cryptographic audit chain for one execution
-/// (finding #2). `ok` is true iff there are no `breaks` and — when signing
-/// keys are configured — every event's HMAC verified.
+/// ONE job's chain — the grain the WORM ledger is actually keyed at.
+///
+/// Every object key in the audit bucket is `<module_executions.id>/…`, so a
+/// workflow execution with four module dispatches has FOUR chains and
+/// verifying one says nothing about the other three.
 #[derive(SimpleObject, Clone)]
-pub struct AuditChainVerification {
-    pub execution_id: String,
-    pub workflow_id: String,
+pub struct AuditChainJobVerification {
+    /// `module_executions.id` — the ledger's `execution_id` and the S3 prefix.
+    pub module_execution_id: String,
+    /// `module_executions.workflow_execution_id` — the genesis `workflow_id`.
+    pub workflow_execution_id: String,
     pub total_events: i32,
     pub ok: bool,
-    /// Whether HMAC verification was attempted (signing keys configured).
     pub signatures_checked: bool,
     pub breaks: Vec<AuditChainBreak>,
 }
 
-impl From<talos_audit_ledger::ChainVerificationReport> for AuditChainVerification {
+impl From<talos_audit_ledger::ChainVerificationReport> for AuditChainJobVerification {
     fn from(r: talos_audit_ledger::ChainVerificationReport) -> Self {
         Self {
-            execution_id: r.execution_id,
-            workflow_id: r.workflow_id,
+            module_execution_id: r.execution_id,
+            workflow_execution_id: r.workflow_id,
             total_events: i32::try_from(r.total_events).unwrap_or(i32::MAX),
             ok: r.ok,
             signatures_checked: r.signatures_checked,
@@ -1663,10 +1666,82 @@ impl From<talos_audit_ledger::ChainVerificationReport> for AuditChainVerificatio
     }
 }
 
+/// Result of verifying the cryptographic audit chain for one WORKFLOW
+/// EXECUTION (finding #2) — the aggregate over its jobs.
+///
+/// `ok` is true iff at least one job chain was verified AND every one of them
+/// verified. The "at least one" clause is the whole point: `verify_chain` over
+/// an empty event set answers `ok == true` (there are no gaps, no broken links
+/// and no bad signatures in nothing), so an aggregate that reported `ok` from
+/// zero jobs would be a verified-nothing — which is exactly what this field
+/// returned before 2026-09-06, because it named a `workflow_executions` id as
+/// the S3 prefix and the writer has never used one.
+#[derive(SimpleObject, Clone)]
+pub struct AuditChainVerification {
+    /// The workflow execution the caller asked about.
+    pub execution_id: String,
+    /// The workflow that execution belongs to. Present for continuity with
+    /// the pre-2026-09-06 shape; it is NOT part of the ledger's genesis
+    /// binding, which uses the workflow EXECUTION id — a distinction the live
+    /// probe measured as the difference between `ok=true` and `ok=false`.
+    pub workflow_id: String,
+    /// The id space the ledger is keyed by, so a reader never has to guess
+    /// which table `module_execution_id` below belongs to.
+    pub ledger_key_space: String,
+    /// Summed over `jobs`.
+    pub total_events: i32,
+    /// Every job chain verified AND there was at least one.
+    pub ok: bool,
+    /// True iff HMAC verification was attempted for every job.
+    pub signatures_checked: bool,
+    /// Concatenated over `jobs`, in job order.
+    pub breaks: Vec<AuditChainBreak>,
+    /// The per-job chains this aggregate is built from. EMPTY means nothing
+    /// was verified, which is why `ok` is false in that case.
+    pub jobs: Vec<AuditChainJobVerification>,
+}
+
+impl AuditChainVerification {
+    /// Aggregate per-job reports for one workflow execution, worst outcome
+    /// wins — the same rule `talos_audit_ledger::roll_up_by_workflow_execution`
+    /// applies to the standing sweep, so the two surfaces cannot disagree
+    /// about the same run.
+    #[must_use]
+    pub fn aggregate(
+        execution_id: String,
+        workflow_id: String,
+        reports: Vec<talos_audit_ledger::ChainVerificationReport>,
+    ) -> Self {
+        let jobs: Vec<AuditChainJobVerification> = reports
+            .into_iter()
+            .map(AuditChainJobVerification::from)
+            .collect();
+        let total_events: i32 = jobs
+            .iter()
+            .map(|j| j.total_events)
+            .fold(0i32, i32::saturating_add);
+        let breaks: Vec<AuditChainBreak> =
+            jobs.iter().flat_map(|j| j.breaks.iter().cloned()).collect();
+        Self {
+            execution_id,
+            workflow_id,
+            ledger_key_space: talos_audit_ledger::LEDGER_KEY_SPACE.to_string(),
+            total_events,
+            // NOT `jobs.iter().all(..)`: `all` over an empty iterator is TRUE,
+            // which is the vacuous-success shape this whole change exists to
+            // remove. No job verified means nothing was verified.
+            ok: !jobs.is_empty() && jobs.iter().all(|j| j.ok),
+            signatures_checked: !jobs.is_empty() && jobs.iter().all(|j| j.signatures_checked),
+            breaks,
+            jobs,
+        }
+    }
+}
+
 #[cfg(test)]
 mod audit_chain_mapping_tests {
     use super::*;
-    use talos_audit_ledger::ChainBreak;
+    use talos_audit_ledger::{ChainBreak, ChainVerificationReport};
 
     #[test]
     fn sequence_gap_maps_found_to_sequence_and_both_to_expected_found() {
@@ -1705,19 +1780,90 @@ mod audit_chain_mapping_tests {
         assert_eq!(unsigned.sequence, Some(6));
     }
 
+    fn report(id: &str, ok: bool, total_events: usize) -> ChainVerificationReport {
+        ChainVerificationReport {
+            execution_id: id.to_string(),
+            workflow_id: "wfx".to_string(),
+            total_events,
+            ok,
+            signatures_checked: true,
+            breaks: if ok {
+                vec![]
+            } else {
+                vec![ChainBreak::SequenceGap {
+                    expected: 2,
+                    found: 4,
+                }]
+            },
+        }
+    }
+
     #[test]
     fn report_total_events_saturates_not_wraps() {
-        let report = talos_audit_ledger::ChainVerificationReport {
-            execution_id: "ex".to_string(),
-            workflow_id: "wf".to_string(),
-            total_events: usize::MAX,
-            ok: false,
-            signatures_checked: true,
-            breaks: vec![],
-        };
-        let v = AuditChainVerification::from(report);
+        let v = AuditChainJobVerification::from(report("ex", false, usize::MAX));
         assert_eq!(v.total_events, i32::MAX);
         assert!(!v.ok);
         assert!(v.signatures_checked);
+    }
+
+    /// **The vacuous-success shape, refused.** `jobs.iter().all(..)` over an
+    /// EMPTY iterator is `true`, which would report a workflow execution with
+    /// no ledgered jobs as a verified audit trail — the same reading that
+    /// `verify_chain` over zero events produces, and the reason this whole
+    /// change exists. Nothing verified is not `ok`.
+    #[test]
+    fn an_execution_with_no_job_chains_is_not_ok() {
+        let v = AuditChainVerification::aggregate("ex".into(), "wf".into(), vec![]);
+        assert!(!v.ok, "an empty job set must never report ok");
+        assert!(!v.signatures_checked);
+        assert_eq!(v.total_events, 0);
+        assert!(v.jobs.is_empty());
+        assert_eq!(v.ledger_key_space, talos_audit_ledger::LEDGER_KEY_SPACE);
+    }
+
+    /// Worst outcome wins, and the per-job detail survives: an operator
+    /// chasing tamper evidence needs to know WHICH job broke.
+    #[test]
+    fn one_broken_job_makes_the_execution_not_ok_and_names_it() {
+        let v = AuditChainVerification::aggregate(
+            "ex".into(),
+            "wf".into(),
+            vec![
+                report("me-1", true, 3),
+                report("me-2", false, 4),
+                report("me-3", true, 2),
+            ],
+        );
+        assert!(!v.ok, "three quarters clean is not clean");
+        assert_eq!(v.total_events, 9, "events sum across the jobs");
+        assert_eq!(v.breaks.len(), 1);
+        assert_eq!(v.jobs.len(), 3);
+        let broken: Vec<&str> = v
+            .jobs
+            .iter()
+            .filter(|j| !j.ok)
+            .map(|j| j.module_execution_id.as_str())
+            .collect();
+        assert_eq!(
+            broken,
+            vec!["me-2"],
+            "the aggregate must name the job, not just the run"
+        );
+        // And each job carries the genesis half, so the report is
+        // self-describing without a second lookup.
+        assert!(v.jobs.iter().all(|j| j.workflow_execution_id == "wfx"));
+    }
+
+    /// All clean and non-empty is the only `ok`.
+    #[test]
+    fn every_job_clean_is_ok() {
+        let v = AuditChainVerification::aggregate(
+            "ex".into(),
+            "wf".into(),
+            vec![report("me-1", true, 1), report("me-2", true, 1)],
+        );
+        assert!(v.ok);
+        assert!(v.signatures_checked);
+        assert_eq!(v.total_events, 2);
     }
 }

@@ -17,7 +17,19 @@ use std::time::Duration;
 pub use talos_audit_event::{
     audit_verify_keys, verify_chain, AuditEvent, ChainBreak, ChainVerificationReport,
 };
+
+pub mod population;
+pub mod verifier;
+use population::{roll_up_by_workflow_execution, JobChainOutcome};
+pub use population::{
+    LedgerTarget, WorkflowExecutionRollup, LEDGER_GENESIS_WORKFLOW_COLUMN, LEDGER_KEY_SPACE,
+};
 use uuid::Uuid;
+pub use verifier::{
+    build_audit_verifier_client_from_env, build_verifier_client, last_chain_sweep,
+    ChainSweepSnapshot, ChainVerifyError, ChainVerifyErrorKind, VerifierClient,
+    VerifierCredentials,
+};
 use zeroize::Zeroizing;
 
 /// Outcome of inline per-message audit verification (finding #2, Layer 1).
@@ -593,18 +605,26 @@ pub async fn upsert_user_audit_settings(
 /// Endpoint resolution: `AWS_ENDPOINT_URL`, then `MINIO_ENDPOINT` (empty
 /// strings treated as unset — the helm-placeholder class fixed in
 /// MCP-934). Path-style addressing via `AWS_S3_FORCE_PATH_STYLE` (MinIO).
-/// `None` when no endpoint is configured. Shared by the subscriber (write
-/// path) and [`verify_execution_chain`] (read path) so the (endpoint,
-/// path-style) resolution can never drift between them.
+/// `None` when no endpoint is configured.
+///
+/// **This is the WRITE path ONLY, and the sentence this replaces was the whole
+/// bug.** It used to read "Shared by the subscriber (write path) and
+/// `verify_execution_chain` (read path) so the (endpoint, path-style)
+/// resolution can never drift" — true about the endpoint, and fatal about the
+/// CREDENTIALS, which `aws_config::load_defaults` takes from the `AWS_*`
+/// chain. On every deployment of this platform those are the
+/// `audit_write_only` identity (`s3:PutObject` and nothing else), so the read
+/// path got AccessDenied on every listing and chain verification never once
+/// succeeded. The read path is now
+/// [`verifier::build_audit_verifier_client_from_env`], which shares the
+/// ENDPOINT resolution ([`verifier::audit_s3_endpoint_from_env`]) — the part
+/// that genuinely must not drift — and takes its credentials from the separate
+/// read-only verifier identity with no `load_defaults` on its path at all.
 pub async fn build_audit_s3_client() -> Option<S3Client> {
-    let s3_endpoint = std::env::var("AWS_ENDPOINT_URL")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .or_else(|| {
-            std::env::var("MINIO_ENDPOINT")
-                .ok()
-                .filter(|v| !v.is_empty())
-        })?;
+    // ONE endpoint resolution, shared with the verifier: writer and verifier
+    // must address the SAME bucket, or the verifier reads a different store
+    // and reports a clean chain about objects nobody wrote.
+    let s3_endpoint = verifier::audit_s3_endpoint_from_env()?;
     let config = aws_config::load_defaults(BehaviorVersion::latest()).await;
     let mut builder = aws_sdk_s3::config::Builder::from(&config).endpoint_url(s3_endpoint);
     // MCP-1073: canonical bool-env helper (accepts 1/yes/on/TRUE), required
@@ -631,24 +651,159 @@ pub fn audit_bucket_name() -> String {
 pub async fn verify_execution_chain_from_env(
     workflow_id: &str,
     execution_id: &str,
-) -> Result<ChainVerificationReport> {
-    let client = build_audit_s3_client().await.ok_or_else(|| {
-        anyhow::anyhow!(
-            "no audit S3 endpoint configured (set AWS_ENDPOINT_URL or MINIO_ENDPOINT) — \
-             the WORM chain has no durable store to verify"
-        )
-    })?;
+) -> std::result::Result<ChainVerificationReport, ChainVerifyError> {
+    let client = match build_audit_verifier_client_from_env() {
+        VerifierClient::Ready(c) => c,
+        VerifierClient::NoEndpoint => {
+            return Err(ChainVerifyError::new(
+                ChainVerifyErrorKind::Other,
+                "no audit S3 endpoint configured",
+                "set AWS_ENDPOINT_URL or MINIO_ENDPOINT — the WORM chain has no durable store \
+                 to verify"
+                    .to_string(),
+            ))
+        }
+        VerifierClient::NoCredentials => {
+            return Err(ChainVerifyError::new(
+                ChainVerifyErrorKind::NoCredentials,
+                "no audit-chain verifier identity configured",
+                format!(
+                    "set {} and {}",
+                    verifier::VERIFIER_ACCESS_KEY_ENV,
+                    verifier::VERIFIER_SECRET_KEY_ENV
+                ),
+            ))
+        }
+    };
     let bucket = audit_bucket_name();
     verify_execution_chain(&client, &bucket, workflow_id, execution_id).await
 }
 
+/// Seconds an execution must be terminal before its chain may be verified.
+///
+/// The audit consumer batches to the object store every few seconds, so a
+/// just-finished execution's chain is legitimately incomplete and would report
+/// a false sequence gap. ONE home: the background sweep and the
+/// `security_audit` probe must select from the SAME population, or the check
+/// grades a set the standing control never looks at.
+pub const CHAIN_SETTLE_SECS: i64 = 120;
+
+/// The most recent chain the verifier is entitled to verify.
+///
+/// Enumerates `module_executions`, because that is the id space the WRITER
+/// keys — see [`population`] for the binding and the measurement. Same
+/// eligibility predicate as [`run_chain_verification_sweep`] — terminal,
+/// `completed_at` outside the settle window, unique `ORDER BY` tiebreaker —
+/// deliberately, because this is what `security_audit`'s round-trip check
+/// verifies and a check that graded a different population would say nothing
+/// about the standing sweep. Returns `Ok(None)` when nothing is eligible,
+/// which is a QUIET deployment and not a finding; the `Err` is the third value
+/// and must never be folded into it.
+///
+/// `workflow_execution_id IS NOT NULL` is a REQUIREMENT, not a filter of
+/// convenience: `verify_chain` re-derives genesis from both halves, so a row
+/// without one has no chain to name. Measured 2026-09-06: 0 of 48,577
+/// `module_executions` rows carry a NULL there, so this excludes nothing
+/// today — latent, and stated as such.
+///
+/// Renamed from `latest_verifiable_execution` in the same change that moved
+/// the population: the old name and its `(Uuid, Uuid)` return said nothing
+/// about WHICH ids, and a caller that kept compiling against the old shape
+/// would have gone on grading the wrong id space silently.
+pub async fn latest_verifiable_ledger_target(
+    db_pool: &PgPool,
+    settle_secs: i64,
+) -> Result<Option<LedgerTarget>> {
+    let row = sqlx::query_as::<_, (Uuid, Uuid)>(
+        "SELECT id, workflow_execution_id \
+         FROM module_executions \
+         WHERE status IN ('completed', 'failed', 'cancelled') \
+           AND completed_at IS NOT NULL \
+           AND completed_at <= NOW() - (INTERVAL '1 second' * $1) \
+           AND workflow_execution_id IS NOT NULL \
+         ORDER BY completed_at DESC, id DESC \
+         LIMIT 1",
+    )
+    .bind(settle_secs)
+    .fetch_optional(db_pool)
+    .await?;
+    Ok(row.map(
+        |(module_execution_id, workflow_execution_id)| LedgerTarget {
+            module_execution_id,
+            workflow_execution_id,
+        },
+    ))
+}
+
+/// Every verifiable chain under ONE workflow execution.
+///
+/// The on-demand operator path takes a workflow-execution id (that is what
+/// `list_executions` hands them), and the ledger has no chain at that grain —
+/// it has one per module dispatch. So the id is resolved to its jobs here and
+/// each job's chain is verified separately, rather than the caller's id being
+/// used as a prefix the writer has never written.
+///
+/// Deliberately CROSS-TENANT (no `user_id` predicate): the only caller is the
+/// platform-admin GraphQL field, whose authorization is established upstream
+/// by `is_platform_admin` — the same rationale
+/// `ExecutionRepository::get_workflow_id_any_user` carries, one call above it.
+/// Do NOT reuse this from a tenant-facing surface.
+///
+/// `Ok(vec![])` means the workflow execution ran no modules — a real answer,
+/// and the reason the aggregate must NOT report `ok` from an empty job set.
+pub async fn ledger_targets_for_workflow_execution(
+    db_pool: &PgPool,
+    workflow_execution_id: Uuid,
+) -> Result<Vec<LedgerTarget>> {
+    let rows = sqlx::query_as::<_, (Uuid,)>(
+        "SELECT id FROM module_executions \
+         WHERE workflow_execution_id = $1 \
+         ORDER BY started_at ASC, id ASC",
+    )
+    .bind(workflow_execution_id)
+    .fetch_all(db_pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(module_execution_id,)| LedgerTarget {
+            module_execution_id,
+            workflow_execution_id,
+        })
+        .collect())
+}
+
 /// Tally from one [`run_chain_verification_sweep`] pass.
+///
+/// The unqualified counters are PER JOB (per `module_executions` row), because
+/// that is the grain the ledger is keyed at — see [`population`]. `rollup`
+/// lifts them to the grain an operator asks at. The two are reported side by
+/// side and never merged: "37 of 40 jobs verified" and "8 of 9 workflow
+/// executions verified" are both true and answer different questions.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ChainSweepStats {
-    /// Executions queried (terminal + within the window + cap).
+    /// Jobs (module executions) queried — terminal, within the window, capped.
     pub scanned: usize,
-    /// Chains that verified with no breaks.
+    /// Chains that verified with no breaks AND held at least one event.
+    ///
+    /// The event floor is load-bearing: `verify_chain` over an EMPTY set
+    /// returns `ok == true` (there are no gaps in nothing), so counting an
+    /// empty prefix here would be a "verified nothing" claim. See
+    /// [`ChainSweepStats::empty`].
     pub verified_ok: usize,
+    /// Prefixes that READ CLEANLY and held ZERO events.
+    ///
+    /// Split out 2026-09-06, and the measurement is why: `verify_chain` over
+    /// an empty event set returns `ok == true`, so before this field existed
+    /// an empty read was indistinguishable from a verified chain. At the time
+    /// it was the WHOLE population — the sweep enumerated
+    /// `workflow_executions` while every ledger prefix is a
+    /// `module_executions` id, so 34 of 34 executions in its own 2 h window
+    /// read empty. The population is now the one the writer keys, and the
+    /// same measurement says an empty prefix should be RARE there: 200 of 200
+    /// recent module executions had a non-empty prefix. So a non-zero `empty`
+    /// is now a real per-execution finding rather than the expected reading,
+    /// and it is still not folded into `verified_ok`.
+    pub empty: usize,
     /// Chains WITH breaks — tamper / corruption / gap / linkage / bad HMAC.
     pub failed: usize,
     /// Executions whose chain could not be read (S3/IO error) — unverified.
@@ -658,7 +813,7 @@ pub struct ChainSweepStats {
     ///
     /// # Why this is not merely a disclosure
     ///
-    /// The sweep takes `ORDER BY completed_at DESC ... LIMIT max_executions`
+    /// The sweep takes `ORDER BY completed_at DESC ... LIMIT max_jobs`
     /// over a SLIDING `[now-lookback, now-settle]` window, and keeps NO cursor,
     /// watermark or offset — `ChainSweepStats` is rebuilt from `default()` on
     /// every pass. So the rows the cap drops are the OLDEST in the window; by
@@ -669,7 +824,7 @@ pub struct ChainSweepStats {
     /// nobody looked at, so before 2026-08-19 the controller logged
     /// "audit chain verification sweep completed clean" as a bill of health over
     /// a window it had not finished — on a SECURITY assurance. An attacker who
-    /// breaks a chain and then generates more than `max_executions` completions
+    /// breaks a chain and then generates more than `max_jobs` completions
     /// inside one window would earn a permanent, unqualified "clean" for that
     /// break.
     ///
@@ -678,6 +833,39 @@ pub struct ChainSweepStats {
     /// the gap being reported as a clean bill of health, which is the difference
     /// between an unverified window and a window falsely certified.
     pub cap_hit: bool,
+    /// Set when the sweep STOPPED EARLY on a deployment-wide condition
+    /// (`AccessDenied`, `NoSuchBucket`, or no verifier identity at all).
+    ///
+    /// # Why abort rather than log once per job
+    ///
+    /// The sweep drives up to `max_jobs` verifications through ONE client
+    /// against ONE bucket. When the first answer is "this identity may not
+    /// read this bucket", the rest cannot differ — they are identical WARNs
+    /// whose only effect is to bury a per-job finding, plus that many needless
+    /// round trips. Measured on the dev stack 2026-09-06: 37 executions, 37
+    /// identical `service error` WARNs, one cause. `NotFound` and `Transport`
+    /// are deliberately NOT abort-worthy — a missing prefix is a fact about
+    /// that job and a reset connection may be the last one.
+    ///
+    /// The flag is a CLAIM ABOUT COVERAGE, in the same family as `cap_hit`:
+    /// `failed == 0 && errored == 1` after an abort must never read as a clean
+    /// window, because everything after the first was not looked at.
+    pub aborted: Option<ChainVerifyErrorKind>,
+    /// Jobs in the window whose `workflow_execution_id` is NULL, so no genesis
+    /// pair could be formed and NOTHING was attempted for them.
+    ///
+    /// Reported rather than filtered away, because "we did not look" must not
+    /// arrive as part of a clean count — the class this whole change is about.
+    /// Measured 2026-09-06: 0 of 48,577 rows platform-wide carry a NULL there,
+    /// so this is LATENT today and is stated as such rather than dressed up.
+    pub unbound: usize,
+    /// The per-job tally lifted to workflow executions, worst outcome wins.
+    ///
+    /// Present because every OTHER surface on this platform is keyed on
+    /// `workflow_executions.id`, and a report whose only number is per-job
+    /// cannot be joined to any of them. Verified at the grain the WRITER keys;
+    /// reported at the grain the OPERATOR asks.
+    pub rollup: WorkflowExecutionRollup,
 }
 
 /// Periodic sweep that runs the offline chain verifier over recently-completed
@@ -686,50 +874,40 @@ pub struct ChainSweepStats {
 /// only on demand — it runs as a trusted controller-side system task, so it
 /// needs no per-tenant scoping and no MCP/RBAC surface.
 ///
-/// Scope: terminal executions (`completed`/`failed`/`cancelled`) whose
-/// `completed_at` falls in `[now - lookback, now - settle]`, newest first,
-/// capped at `max_executions`. The `settle` floor avoids false "sequence gap"
-/// reports on executions whose audit events are still being batched to S3 (the
-/// consumer flushes every few seconds) — only chains old enough to be fully
-/// flushed are checked. Run the sweep on an interval that overlaps the lookback
-/// window slightly so nothing at a boundary is missed; re-verification is
-/// idempotent and cheap.
+/// Scope: terminal JOBS — `module_executions` rows, because that is the id
+/// space the ledger writer keys (see [`population`]) — whose `completed_at`
+/// falls in `[now - lookback, now - settle]`, newest first, capped at
+/// `max_jobs`. The `settle` floor avoids false "sequence gap" reports on jobs
+/// whose audit events are still being batched to S3 (the consumer flushes
+/// every few seconds) — only chains old enough to be fully flushed are
+/// checked. Run the sweep on an interval that overlaps the lookback window
+/// slightly so nothing at a boundary is missed; re-verification is idempotent
+/// and cheap.
+///
+/// ONE query, no join and no N+1: `module_executions` carries BOTH halves of
+/// the genesis binding (`id` and `workflow_execution_id`), so the join a
+/// reader would expect to `workflow_executions` is not merely batched away —
+/// it is unnecessary. Rows with a NULL `workflow_execution_id` come back too
+/// and are counted under [`ChainSweepStats::unbound`] rather than filtered out
+/// of sight.
 pub async fn run_chain_verification_sweep(
     db_pool: &PgPool,
     s3_client: &S3Client,
     bucket: &str,
     lookback_secs: i64,
     settle_secs: i64,
-    max_executions: i64,
+    max_jobs: i64,
 ) -> ChainSweepStats {
     let mut stats = ChainSweepStats::default();
 
-    // `INTERVAL '1 second' * $N` (not make_interval) — the int4-only
-    // make_interval args don't apply, and this form takes a bigint bind.
-    // Unique ORDER BY tiebreaker (id) per the pagination-stability rule.
-    let rows = match sqlx::query_as::<_, (Uuid, Uuid)>(
-        "SELECT id, workflow_id \
-         FROM workflow_executions \
-         WHERE status IN ('completed', 'failed', 'cancelled') \
-           AND completed_at IS NOT NULL \
-           AND completed_at <= NOW() - (INTERVAL '1 second' * $1) \
-           AND completed_at >= NOW() - (INTERVAL '1 second' * $2) \
-         ORDER BY completed_at DESC, id DESC \
-         LIMIT $3",
-    )
-    .bind(settle_secs)
-    .bind(lookback_secs)
-    .bind(max_executions)
-    .fetch_all(db_pool)
-    .await
-    {
+    let rows = match enumerate_sweep_jobs(db_pool, lookback_secs, settle_secs, max_jobs).await {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(
                 target: "talos_audit",
                 event_kind = "audit_chain_sweep_query_failed",
                 error = %e,
-                "audit chain sweep could not enumerate executions — skipping this pass"
+                "audit chain sweep could not enumerate module executions — skipping this pass"
             );
             return stats;
         }
@@ -739,14 +917,78 @@ pub async fn run_chain_verification_sweep(
     // `>=` for the safe direction: a window holding exactly the cap is
     // indistinguishable from one holding more, and the alternative is a sweep
     // that quietly certifies a short window.
-    stats.cap_hit = max_executions > 0 && rows.len() as i64 >= max_executions;
-    for (exec_id, wf_id) in rows {
-        let outcome =
-            verify_execution_chain(s3_client, bucket, &wf_id.to_string(), &exec_id.to_string())
-                .await;
-        record_chain_verification_outcome(&mut stats, outcome, exec_id, wf_id);
+    stats.cap_hit = max_jobs > 0 && rows.len() as i64 >= max_jobs;
+    // The partition hands back the unbound COUNT alongside the targets, so a
+    // row with no genesis pair cannot be obtained-and-forgotten: see
+    // `partition_sweep_rows` for the mutation that made this an extracted
+    // function rather than an `if let` in this loop.
+    let (targets, unbound) = population::partition_sweep_rows(&rows);
+    stats.unbound = unbound;
+    let mut outcomes: Vec<(Uuid, JobChainOutcome)> = Vec::with_capacity(targets.len());
+    for target in targets {
+        let outcome = verify_execution_chain(
+            s3_client,
+            bucket,
+            &target.genesis_workflow_id(),
+            &target.execution_id(),
+        )
+        .await;
+        let (control, class) = record_chain_verification_outcome(&mut stats, outcome, &target);
+        outcomes.push((target.workflow_execution_id, class));
+        if control == SweepControl::Abort {
+            break;
+        }
     }
+    stats.rollup = roll_up_by_workflow_execution(&outcomes);
     stats
+}
+
+/// The sweep's enumeration query, extracted so a DB test can drive the EXACT
+/// statement the sweep issues rather than a paraphrase of it.
+///
+/// That is not a stylistic preference — it is `updated_at_maintenance_tests`'
+/// recorded lesson: a hand-written statement in a test can be green over the
+/// shape the writer actually issues. The whole defect this function exists to
+/// close was a SELECT naming the wrong table, which no amount of testing the
+/// verification logic could have seen.
+///
+/// `Option<Uuid>` on the second column is deliberate: `workflow_execution_id`
+/// is NULLABLE, and a row without one has no genesis pair. It comes back so
+/// the caller can COUNT it (`ChainSweepStats::unbound`) instead of filtering
+/// it out of sight.
+///
+/// `INTERVAL '1 second' * $N` (not `make_interval`) — the int4-only
+/// `make_interval` args don't apply, and this form takes a bigint bind. Unique
+/// `ORDER BY` tiebreaker (`id`) per the pagination-stability rule (check 28).
+pub async fn enumerate_sweep_jobs(
+    db_pool: &PgPool,
+    lookback_secs: i64,
+    settle_secs: i64,
+    max_jobs: i64,
+) -> Result<Vec<(Uuid, Option<Uuid>)>> {
+    let rows = sqlx::query_as::<_, (Uuid, Option<Uuid>)>(
+        "SELECT id, workflow_execution_id \
+         FROM module_executions \
+         WHERE status IN ('completed', 'failed', 'cancelled') \
+           AND completed_at IS NOT NULL \
+           AND completed_at <= NOW() - (INTERVAL '1 second' * $1) \
+           AND completed_at >= NOW() - (INTERVAL '1 second' * $2) \
+         ORDER BY completed_at DESC, id DESC \
+         LIMIT $3",
+    )
+    .bind(settle_secs)
+    .bind(lookback_secs)
+    .bind(max_jobs)
+    .fetch_all(db_pool)
+    .await?;
+    Ok(rows)
+}
+
+/// Whether the sweep should keep going after one execution's outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepControl {
+    Continue,
+    Abort,
 }
 
 /// Fold ONE chain-verification result into the sweep stats, the operator log,
@@ -767,40 +1009,137 @@ pub async fn run_chain_verification_sweep(
 /// re-checking one known-broken chain cannot re-page.
 fn record_chain_verification_outcome(
     stats: &mut ChainSweepStats,
-    outcome: Result<ChainVerificationReport>,
-    exec_id: Uuid,
-    wf_id: Uuid,
-) {
-    match outcome {
-        Ok(report) if report.ok => stats.verified_ok += 1,
+    outcome: std::result::Result<ChainVerificationReport, ChainVerifyError>,
+    target: &LedgerTarget,
+) -> (SweepControl, JobChainOutcome) {
+    // Named for what they ARE, not for the ledger field they feed: the log
+    // reads `module_execution_id` / `workflow_execution_id`, so an operator
+    // grepping either one finds this line, and nobody has to know that the
+    // ledger calls the second half `workflow_id`.
+    let exec_id = target.module_execution_id;
+    let wf_id = target.workflow_execution_id;
+    let mut class = JobChainOutcome::VerifiedOk;
+    let control = match outcome {
+        // An EMPTY prefix is not a verified chain. It does not stamp the
+        // last-verified-ok gauge either — "the control works" must not be
+        // claimed from a read that returned nothing.
+        Ok(report) if report.ok && report.total_events == 0 => {
+            stats.empty += 1;
+            class = JobChainOutcome::Empty;
+            inc_chain_unverifiable(ChainVerifyErrorKind::EmptyChain);
+            tracing::warn!(
+                target: "talos_audit",
+                event_kind = "audit_chain_verification_empty",
+                module_execution_id = %exec_id,
+                workflow_execution_id = %wf_id,
+                ledger_key_space = LEDGER_KEY_SPACE,
+                reason = ChainVerifyErrorKind::EmptyChain.metric_label(),
+                remedy = ChainVerifyError::new(
+                    ChainVerifyErrorKind::EmptyChain,
+                    "empty prefix",
+                    String::new()
+                )
+                .remedy(),
+                "a job's audit prefix held NO events — nothing was verified"
+            );
+            SweepControl::Continue
+        }
+        Ok(report) if report.ok => {
+            stats.verified_ok += 1;
+            set_last_verified_ok_timestamp();
+            SweepControl::Continue
+        }
         Ok(report) => {
             stats.failed += 1;
+            class = JobChainOutcome::Failed;
             inc_audit_verification_failure(AUDIT_STAGE_CHAIN);
             // The security signal — one ERROR per broken chain so SIEM
-            // can alert per execution. `breaks` is a structured list.
+            // can alert per job. `breaks` is a structured list.
             tracing::error!(
                 target: "talos_audit",
                 event_kind = "audit_chain_verification_failed",
-                execution_id = %exec_id,
-                workflow_id = %wf_id,
+                module_execution_id = %exec_id,
+                workflow_execution_id = %wf_id,
+                ledger_key_space = LEDGER_KEY_SPACE,
                 total_events = report.total_events,
                 signatures_checked = report.signatures_checked,
                 breaks = ?report.breaks,
-                "audit chain verification FAILED for a completed execution — \
+                "audit chain verification FAILED for a completed job — \
                  possible tampering, deletion, reorder, or corruption"
             );
+            SweepControl::Continue
         }
         Err(e) => {
             stats.errored += 1;
+            class = JobChainOutcome::Errored;
+            // The counter the `Err` arm never had. `talos_audit_verification_failures_total`
+            // is deliberately NOT touched here — unverifiable is not
+            // verified-bad (#578), and folding the two would make an object-store
+            // blip page as a compliance incident. This is its own series, its
+            // own alert, and its own severity.
+            inc_chain_unverifiable(e.kind);
+            let abort = e.kind.aborts_sweep();
             tracing::warn!(
                 target: "talos_audit",
                 event_kind = "audit_chain_verification_errored",
-                execution_id = %exec_id,
-                workflow_id = %wf_id,
-                error = %e,
-                "could not verify an execution's audit chain (S3/IO) — left unverified"
+                module_execution_id = %exec_id,
+                workflow_execution_id = %wf_id,
+                ledger_key_space = LEDGER_KEY_SPACE,
+                reason = e.kind.metric_label(),
+                context = %e.context,
+                // The SDK's FULL error chain. The old `error = %e` rendered
+                // "service error" and nothing else.
+                error = %e.detail,
+                remedy = e.remedy(),
+                aborting_sweep = abort,
+                "could not verify an execution's audit chain — left unverified"
             );
+            if abort {
+                stats.aborted = Some(e.kind);
+                SweepControl::Abort
+            } else {
+                SweepControl::Continue
+            }
         }
+    };
+    (control, class)
+}
+
+/// Count one unverifiable chain, by classified reason.
+///
+/// Inert when `talos_metrics::set_global` has not run, per the
+/// `talos_metrics::global` contract — same shape as
+/// [`inc_audit_verification_failure`].
+fn inc_chain_unverifiable(kind: ChainVerifyErrorKind) {
+    if let Some(m) = talos_metrics::global() {
+        m.audit_chain_unverifiable_total
+            .with_label_values(&[kind.metric_label()])
+            .inc();
+    }
+}
+
+/// Seconds since the unix epoch, as the float a Prometheus gauge holds.
+///
+/// The `prometheus` crate exposes no `set_to_current_time` on `Gauge` (unlike
+/// the Go client), so the timestamp is taken here — once, from `chrono::Utc`,
+/// the same clock the sweep snapshot uses, so the gauge and the snapshot can
+/// never disagree about when a pass happened.
+fn unix_now_secs_f64() -> f64 {
+    chrono::Utc::now().timestamp() as f64
+}
+
+/// Stamp "a chain verified clean at this instant".
+///
+/// A GAUGE of a unix timestamp rather than a counter: the operator question is
+/// "when did this control last work?", and `time() - gauge > N` answers it
+/// while a counter delta cannot distinguish "never started" from "stopped an
+/// hour ago". Left UNSET (and therefore ABSENT) until the first success, which
+/// is the honest rendering — a gauge seeded at 0 would read as 1970 and make
+/// every staleness alert fire on a healthy cold boot.
+fn set_last_verified_ok_timestamp() {
+    if let Some(m) = talos_metrics::global() {
+        m.audit_chain_last_verified_ok_timestamp_seconds
+            .set(unix_now_secs_f64());
     }
 }
 
@@ -812,27 +1151,81 @@ pub async fn run_chain_verification_sweep_from_env(
     db_pool: &PgPool,
     lookback_secs: i64,
     settle_secs: i64,
-    max_executions: i64,
+    max_jobs: i64,
 ) -> Option<ChainSweepStats> {
-    let Some(client) = build_audit_s3_client().await else {
-        tracing::debug!(
-            target: "talos_audit",
-            "audit chain verification sweep skipped — no S3 endpoint configured"
-        );
-        return None;
+    let client = match build_audit_verifier_client_from_env() {
+        VerifierClient::Ready(c) => c,
+        VerifierClient::NoEndpoint => {
+            tracing::debug!(
+                target: "talos_audit",
+                "audit chain verification sweep skipped — no S3 endpoint configured"
+            );
+            return None;
+        }
+        // An endpoint IS configured, so a WORM ledger is being written and
+        // nothing is verifying it. That is a broken control, not an absent
+        // one, and it gets an ERROR, a counter and a published snapshot so
+        // `security_audit` can report it — never a silent fall back to the
+        // writer's `AWS_*`, which cannot read the bucket by design.
+        VerifierClient::NoCredentials => {
+            inc_chain_unverifiable(ChainVerifyErrorKind::NoCredentials);
+            let stats = ChainSweepStats {
+                aborted: Some(ChainVerifyErrorKind::NoCredentials),
+                ..ChainSweepStats::default()
+            };
+            publish_sweep_snapshot(&stats);
+            tracing::error!(
+                target: "talos_audit",
+                event_kind = "audit_chain_verifier_identity_missing",
+                reason = ChainVerifyErrorKind::NoCredentials.metric_label(),
+                access_key_env = verifier::VERIFIER_ACCESS_KEY_ENV,
+                secret_key_env = verifier::VERIFIER_SECRET_KEY_ENV,
+                "the WORM audit ledger is being WRITTEN and nothing can verify it — no \
+                 read-only audit-chain verifier identity is configured. The writer's \
+                 credentials are write-only by design and are deliberately NOT used here."
+            );
+            return Some(stats);
+        }
     };
     let bucket = audit_bucket_name();
-    Some(
-        run_chain_verification_sweep(
-            db_pool,
-            &client,
-            &bucket,
-            lookback_secs,
-            settle_secs,
-            max_executions,
-        )
-        .await,
+    let stats = run_chain_verification_sweep(
+        db_pool,
+        &client,
+        &bucket,
+        lookback_secs,
+        settle_secs,
+        max_jobs,
     )
+    .await;
+    publish_sweep_snapshot(&stats);
+    Some(stats)
+}
+
+/// Publish the pass's outcome for `security_audit`, and stamp the
+/// sweep-ran-at gauge.
+///
+/// The gauge answers "is the sweep running at all?" independently of whether
+/// it verified anything — the two questions have different answers on exactly
+/// the deployment this change is about (a sweep that runs hourly and verifies
+/// nothing), and one series cannot express both.
+fn publish_sweep_snapshot(stats: &ChainSweepStats) {
+    let now = chrono::Utc::now().timestamp();
+    verifier::publish_chain_sweep_snapshot(ChainSweepSnapshot {
+        scanned: stats.scanned,
+        verified_ok: stats.verified_ok,
+        empty: stats.empty,
+        failed: stats.failed,
+        errored: stats.errored,
+        unbound: stats.unbound,
+        cap_hit: stats.cap_hit,
+        aborted: stats.aborted,
+        rollup: stats.rollup,
+        finished_at_unix: now,
+    });
+    if let Some(m) = talos_metrics::global() {
+        m.audit_chain_sweep_timestamp_seconds
+            .set(unix_now_secs_f64());
+    }
 }
 
 pub async fn start_audit_ledger_subscriber(
@@ -1622,7 +2015,7 @@ pub async fn verify_execution_chain(
     bucket: &str,
     workflow_id: &str,
     execution_id: &str,
-) -> Result<ChainVerificationReport> {
+) -> std::result::Result<ChainVerificationReport, ChainVerifyError> {
     let prefix = format!("{execution_id}/");
     let mut bodies: Vec<Vec<u8>> = Vec::new();
     let mut continuation: Option<String> = None;
@@ -1633,10 +2026,14 @@ pub async fn verify_execution_chain(
         if let Some(token) = &continuation {
             req = req.continuation_token(token);
         }
-        let page = req
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("list_objects_v2 failed for {prefix}: {e}"))?;
+        // CLASSIFIED, not stringified. `%e` on an `SdkError` renders the two
+        // words "service error" — AccessDenied, NoSuchBucket and a reset
+        // connection are indistinguishable in it, and that is exactly what an
+        // operator needed to tell apart on this path (37 identical WARNs an
+        // hour on the dev stack, 2026-09-06).
+        let page = req.send().await.map_err(|e| {
+            ChainVerifyError::from_sdk(format!("list_objects_v2 failed for {prefix}"), &e)
+        })?;
 
         for obj in page.contents() {
             let Some(key) = obj.key() else { continue };
@@ -1656,12 +2053,22 @@ pub async fn verify_execution_chain(
                 .key(key)
                 .send()
                 .await
-                .map_err(|e| anyhow::anyhow!("get_object failed for {key}: {e}"))?;
+                .map_err(|e| {
+                    ChainVerifyError::from_sdk(format!("get_object failed for {key}"), &e)
+                })?;
             let bytes = got
                 .body
                 .collect()
                 .await
-                .map_err(|e| anyhow::anyhow!("reading body of {key} failed: {e}"))?
+                .map_err(|e| {
+                    // A body that stops mid-stream is a transport fault, not a
+                    // service answer — there is no S3 error code to read.
+                    ChainVerifyError::new(
+                        ChainVerifyErrorKind::Transport,
+                        format!("reading body of {key} failed"),
+                        e.to_string(),
+                    )
+                })?
                 .into_bytes();
             bodies.push(bytes.to_vec());
         }
@@ -1910,13 +2317,13 @@ mod audit_verification_metric_tests {
 
         // ok chain → no count.
         let before = stage_count(AUDIT_STAGE_CHAIN);
-        record_chain_verification_outcome(&mut stats, Ok(report(true)), Uuid::nil(), Uuid::nil());
+        record_chain_verification_outcome(&mut stats, Ok(report(true)), &nil_target());
         assert_eq!(stage_count(AUDIT_STAGE_CHAIN) - before, 0.0);
         assert_eq!(stats.verified_ok, 1);
 
         // broken chain → exactly one count.
         let before = stage_count(AUDIT_STAGE_CHAIN);
-        record_chain_verification_outcome(&mut stats, Ok(report(false)), Uuid::nil(), Uuid::nil());
+        record_chain_verification_outcome(&mut stats, Ok(report(false)), &nil_target());
         assert_eq!(
             stage_count(AUDIT_STAGE_CHAIN) - before,
             1.0,
@@ -1929,9 +2336,12 @@ mod audit_verification_metric_tests {
         let before = stage_count(AUDIT_STAGE_CHAIN);
         record_chain_verification_outcome(
             &mut stats,
-            Err(anyhow::anyhow!("s3 unreachable")),
-            Uuid::nil(),
-            Uuid::nil(),
+            Err(ChainVerifyError::new(
+                ChainVerifyErrorKind::Transport,
+                "s3 unreachable",
+                "connection reset".to_string(),
+            )),
+            &nil_target(),
         );
         assert_eq!(stage_count(AUDIT_STAGE_CHAIN) - before, 0.0);
         assert_eq!(stats.errored, 1);
@@ -1943,6 +2353,162 @@ mod audit_verification_metric_tests {
     fn stage_label_values_are_the_ones_the_alerts_select() {
         assert_eq!(AUDIT_STAGE_EVENT, "event");
         assert_eq!(AUDIT_STAGE_CHAIN, "chain");
+    }
+
+    /// A target whose halves are both nil: these tests are about the
+    /// CLASSIFICATION, not about the ids, and naming them keeps the call sites
+    /// from re-deciding which half is which.
+    fn nil_target() -> LedgerTarget {
+        LedgerTarget {
+            module_execution_id: Uuid::nil(),
+            workflow_execution_id: Uuid::nil(),
+        }
+    }
+
+    fn unverifiable_count(reason: &str) -> f64 {
+        talos_metrics::global()
+            .expect("global installed")
+            .audit_chain_unverifiable_total
+            .with_label_values(&[reason])
+            .get()
+    }
+
+    /// The counter the `Err` arm never had.
+    ///
+    /// Before this, an execution whose chain could not be READ incremented
+    /// NOTHING — so a verifier that had never once succeeded was, on every
+    /// machine-readable surface, indistinguishable from a ledger verified
+    /// clean. The mutation "delete the `inc_chain_unverifiable` call" fails
+    /// here; so does "classify everything as Other", because the reason label
+    /// is asserted.
+    #[test]
+    fn an_unreadable_chain_counts_under_its_classified_reason() {
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
+        let mut stats = ChainSweepStats::default();
+
+        let before = unverifiable_count("access_denied");
+        let tamper_before = stage_count(AUDIT_STAGE_CHAIN);
+        let (control, _class) = record_chain_verification_outcome(
+            &mut stats,
+            Err(ChainVerifyError::new(
+                ChainVerifyErrorKind::AccessDenied,
+                "list_objects_v2 failed for ex/",
+                "AccessDenied".to_string(),
+            )),
+            &nil_target(),
+        );
+        assert_eq!(unverifiable_count("access_denied") - before, 1.0);
+        // And it must NOT have touched the tamper counter — unverifiable is
+        // not verified-bad (#578), and folding the two would make a
+        // misconfigured identity page as a compliance incident.
+        assert_eq!(stage_count(AUDIT_STAGE_CHAIN) - tamper_before, 0.0);
+        assert_eq!(stats.errored, 1);
+        // A deployment-wide condition ABORTS: every remaining job would answer
+        // identically through the same client against the same bucket.
+        assert_eq!(control, SweepControl::Abort);
+        assert_eq!(stats.aborted, Some(ChainVerifyErrorKind::AccessDenied));
+    }
+
+    /// A per-object or per-request fault does NOT abort the pass: the next
+    /// execution may well verify, and stopping would silently shrink the
+    /// window's coverage on a transient blip.
+    #[test]
+    fn a_transient_fault_does_not_abort_the_sweep() {
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
+        let mut stats = ChainSweepStats::default();
+
+        let before = unverifiable_count("transport");
+        let (control, _class) = record_chain_verification_outcome(
+            &mut stats,
+            Err(ChainVerifyError::new(
+                ChainVerifyErrorKind::Transport,
+                "list_objects_v2 failed for ex/",
+                "connection reset".to_string(),
+            )),
+            &nil_target(),
+        );
+        assert_eq!(unverifiable_count("transport") - before, 1.0);
+        assert_eq!(control, SweepControl::Continue);
+        assert_eq!(stats.aborted, None);
+    }
+
+    /// An EMPTY prefix is NOT a verified chain, does not stamp the
+    /// last-verified-ok gauge, and is counted under its own reason.
+    ///
+    /// This is the reading that would otherwise have shipped: repairing the
+    /// verifier identity ALONE turns 37 loud AccessDenied WARNs into 37 silent
+    /// `verified_ok`, because `verify_chain` over zero events returns
+    /// `ok == true` and the sweep was naming `workflow_executions` ids that
+    /// the writer never uses as a prefix (0 of 200, measured 2026-09-06). The
+    /// sweep now enumerates `module_executions`, so an empty prefix is a real
+    /// per-job finding — but the distinction stays load-bearing whichever id
+    /// space is enumerated, which is why it is a variant and not a comment.
+    #[test]
+    fn an_empty_prefix_is_not_a_verified_chain() {
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
+        let gauge = || {
+            talos_metrics::global()
+                .expect("global installed")
+                .audit_chain_last_verified_ok_timestamp_seconds
+                .get()
+        };
+        let mut stats = ChainSweepStats::default();
+        let before = unverifiable_count("empty_chain");
+        let gauge_before = gauge();
+
+        let mut empty = report(true);
+        empty.total_events = 0;
+        let (control, class) =
+            record_chain_verification_outcome(&mut stats, Ok(empty), &nil_target());
+        assert_eq!(class, JobChainOutcome::Empty);
+        assert_eq!(
+            stats.verified_ok, 0,
+            "an empty prefix is not a verified chain"
+        );
+        assert_eq!(stats.empty, 1);
+        assert_eq!(unverifiable_count("empty_chain") - before, 1.0);
+        assert_eq!(
+            gauge(),
+            gauge_before,
+            "an empty read must not stamp \"the control works\""
+        );
+        // Per-execution, not deployment-wide: an execution can legitimately
+        // emit no audit events.
+        assert_eq!(control, SweepControl::Continue);
+        assert_eq!(stats.aborted, None);
+    }
+
+    /// A clean chain stamps "the control worked at this instant". Without it
+    /// the staleness rule has nothing to measure against and can only ever
+    /// report the absent case.
+    #[test]
+    fn a_verified_chain_stamps_the_last_verified_ok_gauge() {
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
+        let gauge = || {
+            talos_metrics::global()
+                .expect("global installed")
+                .audit_chain_last_verified_ok_timestamp_seconds
+                .get()
+        };
+        // A FRESH registry exports the gauge at 0 until something sets it —
+        // which is exactly why the alert on it carries an `absent()`/zero arm
+        // rather than reading 1970 as "last verified". Asserted on a local
+        // registry, not the process-global one, because sibling tests in this
+        // binary share the global and would race a `== 0` assertion on it.
+        assert_eq!(
+            talos_metrics::TalosMetrics::new()
+                .expect("metrics")
+                .audit_chain_last_verified_ok_timestamp_seconds
+                .get(),
+            0.0
+        );
+        let mut stats = ChainSweepStats::default();
+        record_chain_verification_outcome(&mut stats, Ok(report(true)), &nil_target());
+        assert!(
+            gauge() > 1_700_000_000.0,
+            "a verified chain must stamp the gauge with a real unix time, got {}",
+            gauge()
+        );
     }
 }
 
@@ -1959,25 +2525,27 @@ mod sweep_coverage_pins {
 
     /// Mirrors the assignment in `run_chain_verification_sweep`, which needs
     /// Postgres and an S3/WORM endpoint to drive end-to-end.
-    fn cap_hit(rows: usize, max_executions: i64) -> bool {
-        max_executions > 0 && rows as i64 >= max_executions
+    fn cap_hit(rows: usize, max_jobs: i64) -> bool {
+        max_jobs > 0 && rows as i64 >= max_jobs
     }
 
     #[test]
     fn a_full_page_marks_the_sweep_incomplete() {
         assert!(
-            cap_hit(500, 500),
+            cap_hit(2000, 2000),
             "a window that filled the cap left older rows unverified"
         );
-        assert!(cap_hit(501, 500));
+        assert!(cap_hit(2001, 2000));
     }
 
     #[test]
     fn a_short_page_is_a_finished_window() {
-        // The reference deployment: max 77 terminal executions per rolling 2h
-        // window against a cap of 500, so this is the live case today.
-        assert!(!cap_hit(77, 500));
-        assert!(!cap_hit(0, 500));
+        // The reference deployment after the population moved to JOBS:
+        // measured 2026-09-06, 101 module executions in the sweep's own 2 h
+        // window and a peak of 150 in any 2 h bucket over 7 days, against a
+        // cap of 2000 — so this is the live case today, with ~13x headroom.
+        assert!(!cap_hit(150, 2000));
+        assert!(!cap_hit(0, 2000));
     }
 
     #[test]
@@ -1986,11 +2554,15 @@ mod sweep_coverage_pins {
         // by rows nobody read, so the clean-bill branch must ALSO require
         // !cap_hit. If someone drops that condition this states why not.
         let truncated_but_no_findings = ChainSweepStats {
+            aborted: None,
+            empty: 0,
             scanned: 500,
             verified_ok: 500,
             failed: 0,
             errored: 0,
+            unbound: 0,
             cap_hit: true,
+            rollup: crate::WorkflowExecutionRollup::default(),
         };
         assert!(
             truncated_but_no_findings.failed == 0 && truncated_but_no_findings.errored == 0,

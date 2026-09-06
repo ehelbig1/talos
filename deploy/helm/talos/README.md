@@ -65,7 +65,8 @@ and set `bootstrapSecret.enabled: false`.
 | `WORKER_SHARED_KEY` | HMAC shared between controller ↔ worker (signs every NATS-RPC and Job) | `openssl rand -hex 32` | **Rotate annually.** Update secret; redeploy controller + worker together — mixed deploys fail signature verification |
 | `TALOS_AUDIT_SIGNING_KEY` | Tamper-evident audit-event signing | `openssl rand -hex 32` | Rotate annually; append to audit tooling's historical key set |
 | `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` | MinIO superuser | Random strings; 24+ chars | Rotate; restart minio statefulset |
-| `MINIO_CONTROLLER_USER` / `MINIO_CONTROLLER_PASSWORD` | Least-privilege write-only user for audit-logs bucket | Random strings | Rotate; update and restart controller |
+| `MINIO_CONTROLLER_USER` / `MINIO_CONTROLLER_PASSWORD` | Least-privilege **write-only** user for audit-logs bucket (`audit_write_only`: `s3:PutObject` only — it CANNOT list or get, by design) | Random strings | Rotate; update and restart controller |
+| `MINIO_VERIFIER_USER` / `MINIO_VERIFIER_PASSWORD` | Least-privilege **read-only** user for the audit-chain verifier (`audit_read_only`: `s3:ListBucket` + `s3:GetObject`, no Put/Delete). Reaches the controller as `AUDIT_VERIFIER_ACCESS_KEY_ID`/`AUDIT_VERIFIER_SECRET_ACCESS_KEY`. **Without it the WORM ledger is written and never verified** — `security_audit`'s `audit_chain_verification` check reports exactly that | Random strings | Rotate; update and restart controller |
 | `MINIO_WORKER_USER` / `MINIO_WORKER_PASSWORD` | Least-privilege worker writer | Random strings | As above |
 | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | Tier-2 LLM provider keys | From provider console | Rotate in provider; the LlmClient's 60s cache propagates to both controller scaffolding and worker sandbox |
 | `EMBEDDING_API_URL` / `EMBEDDING_API_KEY` | Hosted embeddings | From provider console | Leave blank to use in-cluster Ollama |
@@ -91,6 +92,8 @@ MINIO_ROOT_USER=$(openssl rand -hex 12)
 MINIO_ROOT_PASSWORD=$(openssl rand -hex 32)
 MINIO_CONTROLLER_USER=$(openssl rand -hex 12)
 MINIO_CONTROLLER_PASSWORD=$(openssl rand -hex 32)
+MINIO_VERIFIER_USER=$(openssl rand -hex 12)
+MINIO_VERIFIER_PASSWORD=$(openssl rand -hex 32)
 MINIO_WORKER_USER=$(openssl rand -hex 12)
 MINIO_WORKER_PASSWORD=$(openssl rand -hex 32)
 EOF

@@ -72,6 +72,12 @@ talos-inline-compile-service = { path = "../talos-inline-compile-service" }
 talos-search-service = { path = "../talos-search-service" }
 # Verifying security audit — `security_audit` is a thin wrapper over this crate.
 talos-security-audit = { path = "../talos-security-audit" }
+# `latest_verifiable_execution` + `CHAIN_SETTLE_SECS` — the eligibility
+# predicate `security_audit`'s audit-chain probe must share with the standing
+# sweep. Resolved HERE rather than inside talos-security-audit so that crate
+# keeps its single DB touchpoint (`pg_trigger`); same split as the
+# write-ceiling fleet read directly above it.
+talos-audit-ledger = { path = "../talos-audit-ledger" }
 talos-failure-analysis-service = { path = "../talos-failure-analysis-service" }
 talos-hygiene-service = { path = "../talos-hygiene-service" }
 talos-session-brief-service = { path = "../talos-session-brief-service" }

@@ -28,6 +28,16 @@ aws-sdk-s3 = { version = "1.30", default-features = false, features = [
     "default-https-client",
     "rt-tokio",
 ] }
+# The SDK's TYPED error surface, for the audit-chain verifier's failure
+# classification (`verifier::classify_sdk_error`). `SdkError` and
+# `ErrorMetadata` are re-exported by aws-sdk-s3, but the VARIANTS of `SdkError`
+# (DispatchFailure / TimeoutError / ConstructionFailure) and the
+# `ErrorMetadata::builder` used to construct probe errors in the classifier's
+# tests are only nameable through the smithy crates directly. Both are already
+# in the tree as transitive deps of aws-sdk-s3; naming them here is what makes
+# `cargo` guarantee the version this crate compiles against.
+aws-smithy-runtime-api = "1.12"
+aws-smithy-types = "1.4"
 chrono.workspace = true
 futures = "0.3"
 serde.workspace = true

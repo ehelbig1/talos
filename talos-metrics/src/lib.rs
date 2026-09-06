@@ -341,6 +341,43 @@ pub struct TalosMetrics {
     /// completed execution's full ordered record set. Either means the
     /// compliance artifact is void for that execution.
     pub audit_verification_failures_total: CounterVec,
+    /// Executions whose audit chain could NOT BE READ, by classified reason.
+    ///
+    /// The read-side twin of `audit_verification_failures_total`, and
+    /// deliberately a SEPARATE series: "the chain is broken" and "I could not
+    /// look" are different findings with different severities (#578), and
+    /// folding an object-store blip into the CRITICAL tamper alert would train
+    /// operators to ignore it. Before this existed the `Err` arm of the sweep
+    /// incremented NOTHING, so a verifier that had never once succeeded — the
+    /// live state of the dev stack on 2026-09-06, 37 unverifiable executions
+    /// an hour since 2026-07-08 — was indistinguishable, on every
+    /// machine-readable surface, from a ledger verified clean.
+    ///
+    /// Labels: `reason` over the CLOSED set in
+    /// `talos_audit_ledger::ChainVerifyErrorKind` (access_denied,
+    /// no_such_bucket, not_found, transport, other, no_credentials). Every
+    /// value is pre-seeded — an `increase(...) > 0` alert over an absent
+    /// series matches nothing, which is precisely how this control stayed
+    /// quiet. No execution id, workflow id or object key is ever a label.
+    pub audit_chain_unverifiable_total: CounterVec,
+    /// Unix seconds at which an audit chain last verified CLEAN.
+    ///
+    /// A gauge, and deliberately NOT pre-seeded: absent means "no chain has
+    /// verified in this process", which is the true state of a controller that
+    /// has just booted AND of one whose verifier cannot read the bucket. A
+    /// zero seed would render as 1970 and make every staleness rule fire on a
+    /// healthy cold start, so the alert on this carries an explicit
+    /// `absent()` arm instead.
+    pub audit_chain_last_verified_ok_timestamp_seconds: Gauge,
+    /// Unix seconds at which the chain-verification sweep last COMPLETED a
+    /// pass, whatever it found.
+    ///
+    /// Separate from the gauge above because the two questions have different
+    /// answers on the deployment this instrument was added for: the sweep ran
+    /// hourly for two months and verified nothing. One series cannot say both
+    /// "the loop is alive" and "the control works", and collapsing them is how
+    /// a dead control reads as a healthy one.
+    pub audit_chain_sweep_timestamp_seconds: Gauge,
     /// Worker-key trust-on-first-use conflicts at the self-registration
     /// endpoint: a `worker_id` presented a key that is not its bound
     /// identity. In-fleet impersonation, or an operator rotating off the
@@ -1400,6 +1437,59 @@ impl TalosMetrics {
                 .inc_by(0.0);
         }
 
+        let audit_chain_unverifiable_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_audit_chain_unverifiable_total",
+                "Executions whose WORM audit chain could not be READ, by classified \
+                 reason (access_denied, no_such_bucket, not_found, transport, other, \
+                 no_credentials, empty_chain). Distinct from \
+                 talos_audit_verification_failures_total: unverifiable is not \
+                 verified-bad, so a store outage must not page as a tamper incident. \
+                 access_denied on this platform means the verifier is running as the \
+                 WRITE-ONLY writer identity, which cannot list or get by design.",
+            ),
+            &["reason"],
+        )?;
+        registry.register(Box::new(audit_chain_unverifiable_total.clone()))?;
+        // The reason set is closed and every value has a live increment site in
+        // `talos-audit-ledger`, so seeding all six implies no signal that is not
+        // wired. Absent ≠ zero: `increase(...[2h]) > 0` over an untouched series
+        // matches nothing.
+        for reason in [
+            "access_denied",
+            "no_such_bucket",
+            "not_found",
+            "transport",
+            "other",
+            "no_credentials",
+            "empty_chain",
+        ] {
+            audit_chain_unverifiable_total
+                .with_label_values(&[reason])
+                .inc_by(0.0);
+        }
+
+        let audit_chain_last_verified_ok_timestamp_seconds = Gauge::new(
+            "talos_audit_chain_last_verified_ok_timestamp_seconds",
+            "Unix time at which an execution's WORM audit chain last verified CLEAN. \
+             ABSENT until the first success in this process — a zero seed would read \
+             as 1970 and fire every staleness rule on a healthy cold boot, so the \
+             alert carries an explicit absent() arm instead.",
+        )?;
+        registry.register(Box::new(
+            audit_chain_last_verified_ok_timestamp_seconds.clone(),
+        ))?;
+
+        let audit_chain_sweep_timestamp_seconds = Gauge::new(
+            "talos_audit_chain_sweep_timestamp_seconds",
+            "Unix time at which the audit-chain verification sweep last completed a \
+             pass, whatever it found. Paired with \
+             talos_audit_chain_last_verified_ok_timestamp_seconds: the sweep being \
+             alive and the control working are different facts, and on the deployment \
+             this was added for they disagreed for two months.",
+        )?;
+        registry.register(Box::new(audit_chain_sweep_timestamp_seconds.clone()))?;
+
         let worker_key_tofu_conflicts_total = Counter::new(
             "talos_worker_key_tofu_conflicts_total",
             "Worker self-registration refusals where the presented key is not \
@@ -2132,6 +2222,9 @@ impl TalosMetrics {
             module_executions_retention_deleted_total,
             job_results_dropped_unparseable_total,
             audit_verification_failures_total,
+            audit_chain_unverifiable_total,
+            audit_chain_last_verified_ok_timestamp_seconds,
+            audit_chain_sweep_timestamp_seconds,
             worker_key_tofu_conflicts_total,
             worker_build_skew_workers,
             catalog_templates_missing_wasm,
@@ -2334,6 +2427,21 @@ mod tests {
             r#"talos_rpc_write_ceiling_refusals_total{reason="unreadable",subject="talos.integration_state.op"} 0"#,
             r#"talos_rpc_write_ceiling_refusals_total{reason="policy",subject="talos.database.query"} 0"#,
             r#"talos_rpc_write_ceiling_refusals_total{reason="unreadable",subject="talos.database.query"} 0"#,
+            // #767's audit-chain read-side detector. ABSENT and ZERO diverge
+            // here in the sharpest possible way: the control this counts had
+            // NEVER functioned on the reference deployment, and the reason
+            // nothing said so is that its `Err` arm incremented nothing at
+            // all. All SEVEN reasons are seeded because every one has a live
+            // emitter — six through `inc_chain_unverifiable` at the sweep's
+            // one classification site, and `no_credentials` at the
+            // client-build refusal.
+            r#"talos_audit_chain_unverifiable_total{reason="access_denied"} 0"#,
+            r#"talos_audit_chain_unverifiable_total{reason="no_such_bucket"} 0"#,
+            r#"talos_audit_chain_unverifiable_total{reason="not_found"} 0"#,
+            r#"talos_audit_chain_unverifiable_total{reason="transport"} 0"#,
+            r#"talos_audit_chain_unverifiable_total{reason="other"} 0"#,
+            r#"talos_audit_chain_unverifiable_total{reason="no_credentials"} 0"#,
+            r#"talos_audit_chain_unverifiable_total{reason="empty_chain"} 0"#,
             r#"talos_module_payload_encryption_failures_total{op="encrypt",stage="input"} 0"#,
             r#"talos_module_payload_encryption_failures_total{op="encrypt",stage="output"} 0"#,
             r#"talos_module_payload_encryption_failures_total{op="encrypt",stage="trigger_metadata"} 0"#,

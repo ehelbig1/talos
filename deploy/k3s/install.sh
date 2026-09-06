@@ -342,6 +342,13 @@ else
     MINIO_CONTROLLER_PASSWORD=$(rand_b64_pw)
     MINIO_WORKER_USER="worker"
     MINIO_WORKER_PASSWORD=$(rand_b64_pw)
+    # The audit-chain VERIFIER — a SEPARATE, read-only identity for the
+    # controller's chain-verification sweep. It must NOT be the controller
+    # user above: that one carries `audit_write_only` (s3:PutObject only), so
+    # a verifier built from it gets AccessDenied on every listing. The
+    # `minio-provisioning` Job creates both users and both policies.
+    MINIO_VERIFIER_USER="audit-verifier"
+    MINIO_VERIFIER_PASSWORD=$(rand_b64_pw)
 
     # Worker /metrics endpoint requires a bearer token; comma-separated to
     # allow rotation. One token is enough for first deploy — operators can
@@ -375,6 +382,8 @@ else
         --from-literal=MINIO_ROOT_PASSWORD="$MINIO_ROOT_PASSWORD"
         --from-literal=MINIO_CONTROLLER_USER="$MINIO_CONTROLLER_USER"
         --from-literal=MINIO_CONTROLLER_PASSWORD="$MINIO_CONTROLLER_PASSWORD"
+        --from-literal=MINIO_VERIFIER_USER="$MINIO_VERIFIER_USER"
+        --from-literal=MINIO_VERIFIER_PASSWORD="$MINIO_VERIFIER_PASSWORD"
         --from-literal=MINIO_WORKER_USER="$MINIO_WORKER_USER"
         --from-literal=MINIO_WORKER_PASSWORD="$MINIO_WORKER_PASSWORD"
         --from-literal=METRICS_AUTH_TOKENS="$METRICS_AUTH_TOKENS"

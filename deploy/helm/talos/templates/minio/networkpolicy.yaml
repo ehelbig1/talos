@@ -23,6 +23,14 @@ spec:
             matchLabels:
               app.kubernetes.io/component: worker
               app.kubernetes.io/instance: {{ .Release.Name }}
+        # The bucket + identity provisioning Job. Without this the Job's
+        # `mc alias set` loop never connects and it fails on
+        # activeDeadlineSeconds — with the bucket uncreated and neither
+        # identity provisioned, i.e. exactly the state it exists to fix.
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/component: minio-provisioning
+              app.kubernetes.io/instance: {{ .Release.Name }}
       ports:
         - protocol: TCP
           port: {{ .Values.minio.service.apiPort }}

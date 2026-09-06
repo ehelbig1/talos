@@ -221,6 +221,42 @@ const CHECK_WEIGHTS: &[(&str, u32, CheckKind)] = &[
     // whose legend says "ungraded" while it quietly costs points is a defect
     // this file has shipped before.
     ("write_ceiling_enforcement", 0, CheckKind::Control),
+    // WEIGHT 0 — and this zero is a DIFFERENT decision from the one above, so
+    // it is argued from scratch rather than borrowed. Copying a neighbour's
+    // three reasons without checking which of them apply is the drift this
+    // file keeps catching in other people's code.
+    //
+    // Of the three reasons `write_ceiling_enforcement` gives, exactly ONE
+    // carries here:
+    //  1. "the control is default-OFF by design" — DOES NOT APPLY. The sweep
+    //     defaults ON (`AUDIT_CHAIN_SWEEP_INTERVAL_SECS` defaults to 3600) and
+    //     the WORM ledger is written wherever an S3 endpoint is configured.
+    //     A deployment with no endpoint has no control to grade, which this
+    //     check reports as `Info`/`Parsed` rather than as a failure — that is
+    //     the "nothing wrong" case, and it is handled by the ARM, not by the
+    //     weight.
+    //  2. "the grade bands are ABSOLUTE against a 100-point total" — APPLIES,
+    //     and it is decisive. `MAX_SCORE` is 100, `weights_sum_to_max_score`
+    //     pins it, and `MAX_SCORE`'s own doc block leans on the calibration
+    //     (a dev stack tops out at exactly 90, which is exactly `GRADE_A`).
+    //     An eleventh weighted check would re-grade every deployment and make
+    //     every score recorded before today incomparable — collateral far
+    //     wider than this finding, and not something to spend on a check's
+    //     first day.
+    //  3. "the finding is CONDITIONAL" — DOES NOT APPLY. Where a WORM ledger
+    //     is written and never verified, the compliance artifact is unbacked
+    //     unconditionally.
+    //
+    // A zero weight does NOT make it decorative, and here is what carries the
+    // finding instead: a chain BREAK renders `Status::Fail` with CRITICAL in
+    // its detail, and an unverifiable control renders `Status::Fail` too — so
+    // both land in `status_counts.fail`, in `score_accounting` (as a zero-max
+    // row, which is why `unweighted_checks_cost_nothing` drives every arm),
+    // and in `recommendation_for`, which names failing checks BY NAME in the
+    // sentence an operator reads first. The metric half
+    // (`talos_audit_chain_unverifiable_total`) and its alert are where a
+    // machine acts on it; this check is where a human does.
+    ("audit_chain_verification", 0, CheckKind::Control),
 ];
 
 /// One rendered check.
@@ -1184,6 +1220,359 @@ fn fleet_part(
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Check 11 — audit-chain verification (reported, unscored)
+// ───────────────────────────────────────────────────────────────────────────
+
+/// The execution this run should try to verify.
+///
+/// THREE-VALUED on purpose, and the third value is the point: a query that
+/// FAILED and a query that legitimately found nothing are different findings,
+/// and collapsing them would let a database blip render as "there is nothing
+/// to verify" — a determinate negative about a state the reader cannot
+/// represent, which is the class this whole crate exists to remove (checks 74,
+/// 76, 79).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditChainCandidate {
+    /// A terminal JOB old enough to have been flushed to the ledger.
+    ///
+    /// A JOB, not a workflow execution, and the field names say so. The WORM
+    /// ledger is keyed per module dispatch — every object key is
+    /// `<module_executions.id>/…` and the genesis hash binds
+    /// `(module_executions.workflow_execution_id, module_executions.id)` — so
+    /// a candidate expressed as a `workflow_executions` row names a prefix the
+    /// writer never uses, which `verify_chain` answers `ok=true,
+    /// total_events=0`: a verified-nothing. See
+    /// `talos_audit_ledger::population` for the measurement.
+    Execution(talos_audit_ledger::LedgerTarget),
+    /// The query ran and matched nothing — no completed job outside the
+    /// settle window. A quiet deployment, not a broken control.
+    NoneEligible,
+    /// The query could not be run. Nobody looked.
+    Unreadable(String),
+}
+
+/// What running the REAL verifier against the candidate produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditChainProbe {
+    /// The chain read back and verified with no breaks. `execution_id` is a
+    /// MODULE execution id (the ledger's key space); `workflow_execution_id`
+    /// is the run an operator would look up, carried so the report can name
+    /// both and nobody has to guess which id space was verified.
+    Verified {
+        execution_id: String,
+        workflow_execution_id: String,
+        total_events: usize,
+        signatures_checked: bool,
+    },
+    /// The chain read back and DID NOT verify — a gap, a broken link, a bad
+    /// HMAC. Tamper evidence.
+    Broken {
+        execution_id: String,
+        workflow_execution_id: String,
+        breaks: usize,
+    },
+    /// The prefix read cleanly and held ZERO events. `verify_chain` returns
+    /// `ok == true` over an empty set, so this must NOT render as a pass —
+    /// see `ChainVerifyErrorKind::EmptyChain`. Once the candidate is drawn
+    /// from the id space the writer keys, this is a REAL per-job finding
+    /// rather than the expected reading: measured 2026-09-06, 200 of 200
+    /// recent module executions had a non-empty prefix.
+    EmptyChain {
+        execution_id: String,
+        workflow_execution_id: String,
+    },
+    /// The chain could not be READ. The control is non-functional.
+    Unverifiable {
+        reason: talos_audit_ledger::ChainVerifyErrorKind,
+        remedy: &'static str,
+    },
+    /// No WORM store is configured here, so there is nothing to verify and
+    /// nothing is wrong. NOT the same as `Unverifiable`.
+    NoLedgerConfigured,
+    /// Nothing eligible to verify, or the candidate query failed. `why` says
+    /// which.
+    NothingToVerify { why: String },
+}
+
+/// Run the REAL verifier over the candidate.
+///
+/// # Side effects
+///
+/// Two GET-class S3 operations (`list_objects_v2` + `get_object`) against the
+/// audit bucket, through the READ-ONLY verifier identity. Nothing is written,
+/// nothing is persisted, and — deliberately — nothing is counted: the
+/// `talos_audit_chain_unverifiable_total` counter belongs to the SWEEP, and an
+/// operator re-running `security_audit` must not be able to move a series an
+/// alert fires on. Same rule `verify_execution_chain_from_env` already follows
+/// for `talos_audit_verification_failures_total`.
+pub async fn probe_audit_chain(candidate: &AuditChainCandidate) -> AuditChainProbe {
+    let target = match candidate {
+        AuditChainCandidate::Execution(target) => *target,
+        AuditChainCandidate::NoneEligible => {
+            return AuditChainProbe::NothingToVerify {
+                why: "no terminal module execution old enough to have been flushed to the \
+                 ledger was found, so this run had nothing to verify. This is a quiet \
+                 deployment, NOT a verified one."
+                    .to_string(),
+            }
+        }
+        AuditChainCandidate::Unreadable(e) => {
+            return AuditChainProbe::NothingToVerify {
+                why: format!(
+                    "the candidate-execution query failed ({e}), so nobody looked. This says \
+                     nothing about the chain."
+                ),
+            }
+        }
+    };
+
+    let execution_id = target.execution_id();
+    match talos_audit_ledger::verify_execution_chain_from_env(
+        &target.genesis_workflow_id(),
+        &execution_id,
+    )
+    .await
+    {
+        Ok(report) if report.ok && report.total_events == 0 => AuditChainProbe::EmptyChain {
+            execution_id,
+            workflow_execution_id: target.genesis_workflow_id(),
+        },
+        Ok(report) if report.ok => AuditChainProbe::Verified {
+            execution_id,
+            workflow_execution_id: target.genesis_workflow_id(),
+            total_events: report.total_events,
+            signatures_checked: report.signatures_checked,
+        },
+        Ok(report) => AuditChainProbe::Broken {
+            execution_id,
+            workflow_execution_id: target.genesis_workflow_id(),
+            breaks: report.breaks.len(),
+        },
+        Err(e) => {
+            // "No endpoint configured" arrives here as `Other`, and it is the
+            // one failure that is NOT a broken control: a deployment without a
+            // WORM store has nothing to verify. It is separated by asking the
+            // client builder, not by string-matching the error.
+            if matches!(
+                talos_audit_ledger::build_audit_verifier_client_from_env(),
+                talos_audit_ledger::VerifierClient::NoEndpoint
+            ) {
+                return AuditChainProbe::NoLedgerConfigured;
+            }
+            AuditChainProbe::Unverifiable {
+                reason: e.kind,
+                remedy: e.remedy(),
+            }
+        }
+    }
+}
+
+/// Render `audit_chain_verification`.
+///
+/// # Why this check exists
+///
+/// The WORM audit ledger is the platform's answer to Repudiation, and its
+/// offline chain verifier is the half that makes it evidence rather than a
+/// pile of objects. Measured on the dev stack 2026-09-06: the ledger held
+/// 48,946 execution prefixes written since 2026-07-08, the hourly sweep had
+/// logged 37 unverifiable executions in the previous hour, and the whole
+/// controller log contained ZERO verified chains — because the verifier was
+/// built from the WRITE-ONLY writer's credentials and every listing came back
+/// AccessDenied. On every machine-readable surface that read GREEN: the `Err`
+/// arm incremented no counter, no alert selected a series that could see it,
+/// and `security_audit` had no chain check at all. A control that has never
+/// functioned, invisible to the audit whose job is to notice exactly that.
+///
+/// `sweep` is the last completed pass of the CONTINUOUS sweep, which answers a
+/// different question from the probe: the probe says "can one chain be
+/// verified right now", the sweep says "has the standing control been working".
+/// `None` means no pass has completed IN THIS PROCESS — a freshly-booted
+/// controller, or one with the sweep disabled — and is rendered as "not yet
+/// run", never as "verified nothing". UNKNOWN is not zero.
+#[must_use]
+pub fn check_audit_chain_verification(
+    probe: &AuditChainProbe,
+    sweep: Option<talos_audit_ledger::ChainSweepSnapshot>,
+) -> Check {
+    let sweep_note = describe_last_sweep(sweep);
+    match probe {
+        AuditChainProbe::Verified {
+            execution_id,
+            workflow_execution_id,
+            total_events,
+            signatures_checked,
+        } => {
+            let sig = if *signatures_checked {
+                "with HMAC signatures checked"
+            } else {
+                "WITHOUT HMAC signatures (no verification key is configured, so this run \
+                 proved sequence and linkage only)"
+            };
+            Check {
+                name: "audit_chain_verification",
+                status: Status::Pass,
+                detail: format!(
+                    "The WORM audit chain for MODULE EXECUTION {execution_id} (of workflow \
+                     execution {workflow_execution_id}) was READ BACK from the object store \
+                     through the read-only verifier identity and verified: {total_events} \
+                     event(s), no gaps, no broken links, {sig}. The ledger is keyed PER JOB \
+                     — every object key is `<{key_space}>/…` and the genesis hash binds \
+                     ({genesis_col}, {key_space}) — so this is the id space that was \
+                     verified, not `workflow_executions.id`. {sweep_note} Reported, not \
+                     scored.",
+                    key_space = talos_audit_ledger::LEDGER_KEY_SPACE,
+                    genesis_col = talos_audit_ledger::LEDGER_GENESIS_WORKFLOW_COLUMN,
+                ),
+                verification: Verification::RoundTrip,
+                points: 0,
+                parts: None,
+            }
+        }
+        AuditChainProbe::Broken {
+            execution_id,
+            workflow_execution_id,
+            breaks,
+        } => Check {
+            name: "audit_chain_verification",
+            status: Status::Fail,
+            detail: format!(
+                "CRITICAL: the WORM audit chain for MODULE EXECUTION {execution_id} (of \
+                 workflow execution {workflow_execution_id}) FAILED verification with \
+                 {breaks} break(s) — a sequence gap (deleted or \
+                 never-persisted events), broken previous_hash linkage (reorder or \
+                 substitution), or a per-event HMAC failure. Treat that execution's audit \
+                 record as UNTRUSTED and delete nothing. Grep the controller log for \
+                 event_kind=\"audit_chain_verification_failed\" for the structured `breaks` \
+                 list, and rule out a controller/worker build skew and an unmatched \
+                 audit-signing key rotation before declaring tampering. {sweep_note} \
+                 Reported, not scored."
+            ),
+            verification: Verification::RoundTrip,
+            points: 0,
+            parts: None,
+        },
+        AuditChainProbe::EmptyChain {
+            execution_id,
+            workflow_execution_id,
+        } => Check {
+            name: "audit_chain_verification",
+            status: Status::Warn,
+            detail: format!(
+                "NOT VERIFIED: the WORM audit prefix for MODULE EXECUTION {execution_id} (of \
+                 workflow execution {workflow_execution_id}) was READ successfully through \
+                 the read-only verifier identity and held ZERO events, so nothing was \
+                 verified — an empty chain trivially satisfies every check (no gaps, no \
+                 broken links and no bad signatures in nothing). The verifier IDENTITY is \
+                 working; the prefix is empty. This candidate is drawn from `{key_space}`, \
+                 the id space the writer keys, where an empty prefix is NOT the expected \
+                 reading — 200 of 200 recent module executions had one or more events \
+                 (measured 2026-09-06). So treat this as a real finding about that job: \
+                 either the worker emitted no audit events for it, or its batch never \
+                 reached the object store. {sweep_note} Reported, not scored.",
+                key_space = talos_audit_ledger::LEDGER_KEY_SPACE,
+            ),
+            verification: Verification::NotVerified,
+            points: 0,
+            parts: None,
+        },
+        AuditChainProbe::Unverifiable { reason, remedy } => Check {
+            name: "audit_chain_verification",
+            status: Status::Fail,
+            detail: format!(
+                "CRITICAL: the WORM audit ledger is being WRITTEN and CANNOT BE VERIFIED \
+                 ({}). The chain was read back through the read-only verifier identity and \
+                 the object store refused: {remedy} This is a NON-FUNCTIONAL control, not a \
+                 tamper finding — nothing here says the ledger is bad, only that nothing can \
+                 tell you it is good, which is the same thing as having no tamper-evidence \
+                 at all. {sweep_note} Reported, not scored.",
+                reason.metric_label()
+            ),
+            verification: Verification::RoundTrip,
+            points: 0,
+            parts: None,
+        },
+        AuditChainProbe::NoLedgerConfigured => Check {
+            name: "audit_chain_verification",
+            status: Status::Info,
+            detail: "No WORM object store is configured (neither AWS_ENDPOINT_URL nor \
+             MINIO_ENDPOINT), so no audit chain is persisted and there is nothing to \
+             verify. This is a deployment without the control, not a broken one — but \
+             note that the tamper-evidence the threat model's Repudiation row claims \
+             is not present here. Reported, not scored."
+                .to_string(),
+            verification: Verification::Parsed,
+            points: 0,
+            parts: None,
+        },
+        AuditChainProbe::NothingToVerify { why } => Check {
+            name: "audit_chain_verification",
+            status: Status::Warn,
+            detail: format!("NOT VERIFIED: {why} {sweep_note} Reported, not scored."),
+            verification: Verification::NotVerified,
+            points: 0,
+            parts: None,
+        },
+    }
+}
+
+/// One sentence about the standing sweep, from the snapshot it publishes.
+///
+/// Every branch says what it does NOT know as plainly as what it does. The
+/// abort case is the one worth reading twice: after an abort `failed == 0 &&
+/// errored == 1` is TRUE and means nothing — the remaining executions in the
+/// window were never looked at — which is the same trap `cap_hit` exists for.
+fn describe_last_sweep(sweep: Option<talos_audit_ledger::ChainSweepSnapshot>) -> String {
+    let Some(s) = sweep else {
+        return "The continuous chain-verification sweep has not completed a pass in this \
+         controller process yet (it has just booted, or \
+         AUDIT_CHAIN_SWEEP_INTERVAL_SECS=0 disables it) — so this is a statement about \
+         ONE chain, not about the standing control."
+            .to_string();
+    };
+    // `empty` is reported BESIDE `verified` and never folded into it: a
+    // prefix that read cleanly and held nothing is not a verified chain, and
+    // on this platform it is currently the whole population.
+    let base = format!(
+        "Last sweep pass: {} JOB chain(s) scanned, {} verified, {} EMPTY (read cleanly, held \
+         no events — NOT verified), {} failed, {} unverifiable{}. Rolled up to the grain you \
+         ask at — worst outcome wins — that is {} workflow execution(s): {} verified, {} \
+         empty, {} failed, {} unverifiable.",
+        s.scanned,
+        s.verified_ok,
+        s.empty,
+        s.failed,
+        s.errored,
+        if s.unbound > 0 {
+            format!(
+                ", and {} job(s) had no workflow execution to bind a genesis hash to and were \
+                 NOT attempted",
+                s.unbound
+            )
+        } else {
+            String::new()
+        },
+        s.rollup.covered,
+        s.rollup.verified_ok,
+        s.rollup.empty,
+        s.rollup.failed,
+        s.rollup.errored,
+    );
+    match (s.aborted, s.cap_hit) {
+        (Some(kind), _) => format!(
+            "{base} That pass ABORTED on a deployment-wide condition ({}), so the rest of its \
+             window was never examined — its zero counts are not a clean bill of health.",
+            kind.metric_label()
+        ),
+        (None, true) => format!(
+            "{base} That pass hit its row cap, so the OLDEST executions in its window were not \
+             verified and no later pass will pick them up (the window slides and no cursor is \
+             kept)."
+        ),
+        (None, false) => base,
+    }
+}
+
+// ───────────────────────────────────────────────────────────────────────────
 // Check 9 — CORS origins
 // ───────────────────────────────────────────────────────────────────────────
 
@@ -1506,7 +1895,11 @@ pub fn render_report(checks: &[Check]) -> serde_json::Value {
 /// Run every check and render the report.
 ///
 /// Idempotent and side-effect free: see the per-probe documentation. The only
-/// database access is a read of `pg_trigger`.
+/// database access is a read of `pg_trigger`. The audit-chain probe performs
+/// two READ-ONLY S3 operations against the WORM bucket through the read-only
+/// verifier identity and increments no counter — see [`probe_audit_chain`].
+/// `audit_chain_candidate` is resolved by the CALLER for the same reason
+/// `write_ceiling_fleet` is: it keeps this crate's single DB touchpoint.
 /// `write_ceiling_fleet` is supplied by the CALLER rather than read here, so
 /// this crate keeps its single database touchpoint (`pg_trigger`) and every
 /// branch of the check stays unit-testable without Postgres. `None` = the
@@ -1515,6 +1908,7 @@ pub async fn run_security_audit(
     sysrepo: &SystemRepository,
     secrets: &SecretsManager,
     write_ceiling_fleet: Option<talos_worker_identity_repository::WriteCeilingFleetSummary>,
+    audit_chain_candidate: AuditChainCandidate,
 ) -> serde_json::Value {
     let is_prod = talos_config::is_production();
 
@@ -1556,6 +1950,10 @@ pub async fn run_security_audit(
         ),
         check_audit_immutability_triggers(triggers),
         check_write_ceiling_enforcement(write_ceiling_fleet, ControllerGateProbe::run()),
+        check_audit_chain_verification(
+            &probe_audit_chain(&audit_chain_candidate).await,
+            talos_audit_ledger::last_chain_sweep(),
+        ),
         check_cors_origins(
             &talos_config::check_allowed_origins(),
             talos_config::env_var_is_set_nonempty("ALLOWED_ORIGIN"),

@@ -957,6 +957,47 @@ pub(crate) async fn read_write_ceiling_fleet(
     }
 }
 
+/// Resolve the chain `security_audit`'s audit-chain check should verify.
+///
+/// A MODULE EXECUTION, because the WORM ledger is keyed per job — see
+/// `talos_audit_ledger::population` for the binding and the measurement that
+/// established it. A candidate drawn from `workflow_executions` names a prefix
+/// the writer never uses, and `verify_chain` answers an empty prefix
+/// `ok == true`, so the check would have reported a verified-nothing.
+///
+/// THREE-VALUED, and the third value is why this is not a bare `Option`: a
+/// failed query and an empty result mean different things, and collapsing them
+/// would let a database blip render as "there is nothing to verify" — a
+/// determinate negative about a state the reader cannot represent (checks 74,
+/// 76, 79). The eligibility predicate lives in `talos-audit-ledger` beside the
+/// sweep's own, so the check grades the population the standing control looks
+/// at.
+pub(crate) async fn read_audit_chain_candidate(
+    db_pool: &sqlx::PgPool,
+) -> talos_security_audit::AuditChainCandidate {
+    use talos_security_audit::AuditChainCandidate;
+    match talos_audit_ledger::latest_verifiable_ledger_target(
+        db_pool,
+        talos_audit_ledger::CHAIN_SETTLE_SECS,
+    )
+    .await
+    {
+        Ok(Some(target)) => AuditChainCandidate::Execution(target),
+        Ok(None) => AuditChainCandidate::NoneEligible,
+        Err(e) => {
+            tracing::warn!(
+                target: "talos_security",
+                event_kind = "security_audit_chain_candidate_query_failed",
+                error = %format!("{e:#}"),
+                "security_audit could not resolve a module execution to verify; the check must \
+                 report it as unverified, never as nothing-to-verify"
+            );
+            // The caller-facing string stays generic — the full chain is above.
+            AuditChainCandidate::Unreadable("database error".to_string())
+        }
+    }
+}
+
 async fn build_fleet_report(db_pool: &sqlx::PgPool, controller_build: &str) -> serde_json::Value {
     use talos_worker_identity_repository::WorkerIdentityRepository;
 
@@ -1456,10 +1497,12 @@ async fn handle_security_audit(
 ) -> JsonRpcResponse {
     let sysrepo = talos_system_repo::SystemRepository::new(state.db_pool.clone());
     let write_ceiling_fleet = read_write_ceiling_fleet(&state.db_pool).await;
+    let audit_chain_candidate = read_audit_chain_candidate(&state.db_pool).await;
     let result = talos_security_audit::run_security_audit(
         &sysrepo,
         state.secrets_manager.as_ref(),
         write_ceiling_fleet,
+        audit_chain_candidate,
     )
     .await;
     mcp_text(
