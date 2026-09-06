@@ -17,9 +17,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use talos_workflow_engine::emit_event_spawn;
 use talos_workflow_engine_core::{
-    BoxError, ChainDispatchRequest, ChainDispatchResult, ChainStepResult, DispatchJob,
+    clamp_attempt_timeout, clamp_cause, dispatch_allowance_secs, AttemptWindow, BoxError,
+    ChainDispatchRequest, ChainDispatchResult, ChainStepResult, ClampCause, DispatchJob,
     DispatchResult, EventSink, ExpressionEvaluator, JobTransport, NodeDispatcher, NodeEventWrite,
-    RetryClassifier, StepStatus, WorkerSharedKey,
+    RetryClassifier, StepStatus, WorkerSharedKey, MIN_REMAINING_FOR_ATTEMPT_SECS,
 };
 use talos_workflow_job_protocol::{
     EncryptedSecrets, JobRequest, JobResult, JobStatus, PipelineJobRequest, PipelineJobResult,
@@ -186,87 +187,18 @@ pub(crate) fn backoff_delay_ms(base_backoff_ms: u64, attempts: u32) -> u64 {
 // ─────────────────────────────────────────────────────────────────────
 // Budget-aware attempt clamp
 // ─────────────────────────────────────────────────────────────────────
-
-/// Seconds of the workflow's remaining wall-clock budget held back from
-/// a clamped attempt so the engine can still RECORD the failure.
-///
-/// A node failure is only worth more than a reactor drop because
-/// `handle_node_failure` gets to run: it `await`s a `node_failed` INSERT,
-/// fires the DLQ write, reaps sibling `module_executions` rows, and — for
-/// a node with an error edge or `__continue_on_error` — lets the workflow
-/// carry on. Clamping to exactly the remaining budget would race all of
-/// that against the wall-clock timeout and usually lose, converting the
-/// fix back into the bug.
-pub(crate) const BUDGET_RESERVE_SECS: u64 = 2;
-
-/// Below this much remaining budget an attempt is not started at all.
-///
-/// One second is the smallest attempt window this clamp will ever hand
-/// out; anything less cannot complete a NATS round-trip plus worker
-/// admission, so starting it removes no success that would otherwise
-/// have happened — while consuming the reserve the failure path needs.
-pub(crate) const MIN_REMAINING_FOR_ATTEMPT_SECS: u64 = BUDGET_RESERVE_SECS + 1;
-
-/// How long the retry loop may wait on one attempt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AttemptWindow {
-    /// Wait up to `secs`. `clamped` is true when the WORKFLOW budget —
-    /// not the node's own allowance — set the ceiling, which is what
-    /// makes a resulting timeout attributable to "out of budget" rather
-    /// than "too slow".
-    Wait { secs: u64, clamped: bool },
-    /// Too little budget remains to run an attempt AND still record the
-    /// failure. `remaining_secs` is what was left.
-    BudgetExhausted { remaining_secs: u64 },
-}
-
-/// Clamp one attempt's outer cancellation window to
-/// `min(node_allowance, remaining_budget - reserve)`.
-///
-/// Called once per attempt (not once per dispatch) so attempt 3 sees the
-/// budget attempts 1 and 2 consumed — computing it once before the loop
-/// is the bug this exists to fix, one level up.
-///
-/// # Invariants
-///
-/// * The returned `secs` is **never greater than `node_allowance_secs`**.
-///   The clamp can only shorten a wait, never lengthen one.
-/// * It never changes the number of attempts upward. `BudgetExhausted`
-///   ends the loop; `Wait` neither adds nor removes an attempt.
-/// * `deadline == None` returns `Wait { node_allowance_secs, false }` —
-///   byte-identical to the pre-clamp behaviour, which is what every
-///   caller that does not track a workflow budget gets.
-/// * `Duration::as_secs` truncates toward zero, so the remaining budget
-///   is understated by up to a second. That is the conservative
-///   direction (a slightly tighter clamp), deliberately not rounded up.
-pub(crate) fn clamp_attempt_timeout(
-    node_allowance_secs: u64,
-    deadline: Option<std::time::Instant>,
-    now: std::time::Instant,
-) -> AttemptWindow {
-    let Some(deadline) = deadline else {
-        return AttemptWindow::Wait {
-            secs: node_allowance_secs,
-            clamped: false,
-        };
-    };
-    let remaining_secs = deadline.saturating_duration_since(now).as_secs();
-    if remaining_secs < MIN_REMAINING_FOR_ATTEMPT_SECS {
-        return AttemptWindow::BudgetExhausted { remaining_secs };
-    }
-    let budgeted = remaining_secs - BUDGET_RESERVE_SECS;
-    if budgeted >= node_allowance_secs {
-        AttemptWindow::Wait {
-            secs: node_allowance_secs,
-            clamped: false,
-        }
-    } else {
-        AttemptWindow::Wait {
-            secs: budgeted,
-            clamped: true,
-        }
-    }
-}
+//
+// The arithmetic MOVED to `talos_workflow_engine_core::attempt_window`
+// in #764 and is imported above. It did not move for tidiness: the
+// VALIDATOR (`talos_workflow_validation`) has to answer the same
+// question before a run — "will this node's configured allowance
+// actually be granted?" — and it was answering it with its own,
+// simpler test (`envelope_secs <= budget_secs`), which disagrees with
+// this one by `TOKIO_WRAP_GRACE_SECS + BUDGET_RESERVE_SECS` = 7 s at
+// the boundary. Two implementations of one arithmetic, one of them
+// operator-facing. Do NOT re-add a local copy of the constants, the
+// enum or the clamp; extend the core module and both consumers move
+// together.
 
 /// Operator-facing error for an attempt the workflow budget cut short.
 ///
@@ -522,6 +454,13 @@ pub(crate) async fn execute_job_with_retry(
     // reproduces the pre-clamp behaviour exactly. See
     // `clamp_attempt_timeout` for the invariants this must preserve.
     deadline: Option<std::time::Instant>,
+    // The run's TOTAL wall-clock budget, from `DispatchJob::budget_secs`.
+    // Used for ATTRIBUTION ONLY — it never enters the clamp, so a `None`
+    // here changes no timing whatsoever. Without it a clamp caused by the
+    // graph (a node whose allowance could never fit this budget, even at
+    // t=0) is indistinguishable from one caused by the run having spent
+    // its budget, and the first fires on every healthy run.
+    budget_secs: Option<u64>,
 ) -> Result<serde_json::Value, String> {
     let mut attempts: u32 = 0;
     let mut current_payload = payload;
@@ -529,7 +468,7 @@ pub(crate) async fn execute_job_with_retry(
         // Budget-aware clamp, recomputed on EVERY attempt.
         //
         // `timeout_secs` is this node's own allowance (its wire budget
-        // plus TOKIO_WRAP_GRACE_SECS). It says nothing about how much of
+        // plus `TOKIO_WRAP_GRACE_SECS`). It says nothing about how much of
         // the WORKFLOW's wall-clock budget is left, so before this the
         // loop would happily start a 120 s attempt with 48 s of a 300 s
         // budget remaining, blow the budget, and get the whole reactor
@@ -563,12 +502,45 @@ pub(crate) async fn execute_job_with_retry(
                 }
             };
         if budget_clamped {
-            tracing::warn!(
-                attempt = attempts + 1,
-                attempt_timeout_secs = attempt_secs,
-                node_allowance_secs = timeout_secs,
-                "attempt window clamped to the workflow's remaining wall-clock budget"
-            );
+            // ATTRIBUTED, because the two causes deserve opposite
+            // attention and the noisy one was drowning the other.
+            //
+            // `Configuration` means the node's allowance could never
+            // have fitted this budget — it would have clamped at t=0,
+            // nothing about this RUN caused it, and the fix is a graph
+            // edit that `validate_workflow` now reports before the run.
+            // Measured on the reference fleet 2026-09-06: 2 326 of these
+            // per 48 h across three ACTIVE workflows, every one on
+            // attempt 1 of a run that then completed in under a second.
+            // A WARN that fires on every healthy run trains operators to
+            // ignore WARN, so it is `debug!`.
+            //
+            // `Consumption` (and `Unknown`, which cannot be proven to be
+            // configuration) stays WARN: the budget was spendable and
+            // something spent it, which is a fact about this run.
+            let cause = clamp_cause(timeout_secs, budget_secs);
+            match cause {
+                ClampCause::Configuration => tracing::debug!(
+                    event_kind = "attempt_window_clamped",
+                    cause = cause.as_str(),
+                    attempt = attempts + 1,
+                    attempt_timeout_secs = attempt_secs,
+                    node_allowance_secs = timeout_secs,
+                    workflow_budget_secs = budget_secs,
+                    "attempt window clamped to the workflow's remaining wall-clock budget \
+                     (the node's allowance could never fit this budget — a graph \
+                     configuration issue `validate_workflow` reports)"
+                ),
+                ClampCause::Consumption | ClampCause::Unknown => tracing::warn!(
+                    event_kind = "attempt_window_clamped",
+                    cause = cause.as_str(),
+                    attempt = attempts + 1,
+                    attempt_timeout_secs = attempt_secs,
+                    node_allowance_secs = timeout_secs,
+                    workflow_budget_secs = budget_secs,
+                    "attempt window clamped to the workflow's remaining wall-clock budget"
+                ),
+            }
         }
         // Re-arm the seal before every attempt (see `dispatch_with_retry`).
         if let Some(rearm) = on_before_send {
@@ -1200,13 +1172,6 @@ impl std::fmt::Debug for NatsNodeDispatcher {
     }
 }
 
-/// Slack added to the Tokio-outer retry timeout so the worker-side
-/// sandbox can finish gracefully before the outer timer cancels the
-/// request. The wire-format `timeout_ms` stays at the bare
-/// `DispatchJob::timeout` — only the cancellation wrap around
-/// `execute_job_with_retry` gets this extra grace.
-const TOKIO_WRAP_GRACE_SECS: u64 = 5;
-
 #[async_trait]
 impl NodeDispatcher for NatsNodeDispatcher {
     async fn dispatch(&self, mut job: DispatchJob) -> Result<DispatchResult, BoxError> {
@@ -1448,7 +1413,10 @@ impl NodeDispatcher for NatsNodeDispatcher {
             self.transport.as_ref(),
             topic,
             payload,
-            job.timeout.as_secs() + TOKIO_WRAP_GRACE_SECS,
+            // The node's allowance = wire budget + the outer-wrap grace.
+            // `dispatch_allowance_secs` states that sum once, so the
+            // validator simulates the SAME allowance this loop clamps.
+            dispatch_allowance_secs(job.timeout.as_secs()),
             job.max_retries,
             job.backoff_ms,
             self.worker_shared_key
@@ -1475,6 +1443,8 @@ impl NodeDispatcher for NatsNodeDispatcher {
             // NOT the wire `timeout_ms` above, which the worker still
             // enforces at its own full value.
             job.deadline,
+            // Total budget, for log ATTRIBUTION only (see the clamp site).
+            job.budget_secs,
         )
         .await;
 
@@ -2410,11 +2380,15 @@ mod backoff_delay_tests {
 
 #[cfg(test)]
 mod clamp_attempt_tests {
-    use super::{
-        budget_clamped_timeout_message, budget_exhausted_message, clamp_attempt_timeout,
-        AttemptWindow, BUDGET_RESERVE_SECS, MIN_REMAINING_FOR_ATTEMPT_SECS,
-    };
+    use super::{budget_clamped_timeout_message, budget_exhausted_message};
+    // Imported from the crate that now OWNS this arithmetic (#764), not
+    // re-exported through `super`: these tests assert the dispatcher's
+    // behaviour against the shared definition, so a local alias would be
+    // the very indirection the move removed.
     use std::time::{Duration, Instant};
+    use talos_workflow_engine_core::{
+        clamp_attempt_timeout, AttemptWindow, BUDGET_RESERVE_SECS, MIN_REMAINING_FOR_ATTEMPT_SECS,
+    };
 
     fn at(now: Instant, secs: u64) -> Option<Instant> {
         Some(now + Duration::from_secs(secs))
@@ -2673,12 +2647,22 @@ mod budget_clamp_loop_tests {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn run_loop(
         transport: &dyn JobTransport,
         timeout_secs: u64,
         max_retries: u32,
         deadline: Option<Instant>,
+    ) -> Result<serde_json::Value, String> {
+        run_loop_with_budget(transport, timeout_secs, max_retries, deadline, None).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_loop_with_budget(
+        transport: &dyn JobTransport,
+        timeout_secs: u64,
+        max_retries: u32,
+        deadline: Option<Instant>,
+        budget_secs: Option<u64>,
     ) -> Result<serde_json::Value, String> {
         let classifier = AlwaysTransient;
         let evaluator = NoExpr;
@@ -2702,6 +2686,7 @@ mod budget_clamp_loop_tests {
             None,
             None,
             deadline,
+            budget_secs,
         )
         .await
     }
@@ -2758,6 +2743,36 @@ mod budget_clamp_loop_tests {
         );
         assert_ne!(err, "Job execution timed out");
         assert_eq!(calls.load(Ordering::SeqCst), 1, "exactly one attempt");
+    }
+
+    /// #764: `budget_secs` is an ATTRIBUTION input. It changes the log
+    /// LEVEL and nothing else, so the same scenario must produce the same
+    /// outcome, the same message and the same attempt count whether the
+    /// total budget is known or not.
+    ///
+    /// Stated limit, because it matters more than implying coverage: this
+    /// crate has no tracing capture (no `tracing-subscriber` dev-dep), so
+    /// the LEVEL itself is not asserted here. The DECISION is
+    /// `talos_workflow_engine_core::clamp_cause`, unit-tested in its own
+    /// crate; what this pins is that feeding it changes no behaviour.
+    #[tokio::test]
+    async fn attribution_changes_nothing_the_caller_can_observe() {
+        let mut outcomes = Vec::new();
+        for budget in [None, Some(4u64), Some(3600u64)] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let t = SlowTransport {
+                delay: Duration::from_secs(30),
+                calls: calls.clone(),
+                succeed: true,
+            };
+            let deadline = Some(Instant::now() + Duration::from_secs(4));
+            let err = run_loop_with_budget(&t, 30, 0, deadline, budget)
+                .await
+                .expect_err("clamped out");
+            outcomes.push((err, calls.load(Ordering::SeqCst)));
+        }
+        assert_eq!(outcomes[0], outcomes[1], "unknown vs configuration-caused");
+        assert_eq!(outcomes[1], outcomes[2], "configuration vs consumption");
     }
 
     /// Below the floor the loop must not dispatch AT ALL — the transport

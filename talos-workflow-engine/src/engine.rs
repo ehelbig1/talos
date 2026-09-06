@@ -64,7 +64,7 @@ async fn run_with_workflow_timeout(
     // handle whose previous run HAD a cap cannot inherit a stale
     // deadline — the stamp happens on every entry, not only when a cap
     // exists.
-    progress.set_deadline(timeout_dur.map(|d| std::time::Instant::now() + d));
+    progress.set_deadline(timeout_dur.map(|d| (std::time::Instant::now() + d, secs)));
 
     let inner_result: Result<Result<_, String>, ()> = match (cancel, timeout_dur) {
         (Some(token), Some(dur)) => tokio::select! {

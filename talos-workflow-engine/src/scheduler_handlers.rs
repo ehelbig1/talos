@@ -2472,6 +2472,8 @@ impl ParallelWorkflowEngine {
                 // what makes iteration N see less budget than iteration
                 // 0 rather than the run-start value.
                 deadline: self.progress.deadline(),
+                // Attribution only — never clamps. See `DispatchJob::budget_secs`.
+                budget_secs: self.progress.budget_secs(),
                 // Per-node fuel precedence: the loop-body node's graph-JSON
                 // `data.max_fuel` override (if set) > module-row default, then
                 // the adaptive learned ceiling as a floor, clamped to the

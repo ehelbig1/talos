@@ -150,6 +150,7 @@ mod tests {
             // No workflow wall-clock budget in this stub — the
             // reference dispatcher's clamp is then a no-op.
             deadline: None,
+            budget_secs: None,
             allowed_hosts: vec![],
             allowed_methods: vec![],
             allowed_secrets: vec![],

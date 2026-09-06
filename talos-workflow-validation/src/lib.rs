@@ -122,24 +122,51 @@ pub fn node_receives_actor_context(capability_world: Option<&str>, explicit: Opt
 // container it has to fit inside.
 //
 // So a node can be configured with a retry envelope larger than the entire
-// workflow budget. The engine will honour it literally: the retry loop
-// (`talos-workflow-engine-nats::execute_job_with_retry`) terminates only on
-// `attempts > max_retries` and has no deadline parameter at all, while the
-// workflow budget is an OUTER `tokio::time::timeout` that DROPS the whole
-// reactor future when it fires. Nothing connects the two. An attempt that
-// cannot possibly finish is started anyway, runs until the budget expires, and
-// takes every already-completed sibling node's result down with it — those
-// results live only in the dropped future (per-node checkpointing is opt-in and
-// off).
+// workflow budget, and this check reports what the engine then DOES with it.
 //
-// Observed live 2026-08-27: a node with a 120 s per-attempt timeout and
-// `retry_count: 2` inside a 300 s budget started its third attempt at t=252 s
-// with 48 s left. It could not have completed under any outcome. Two completed
-// sibling nodes were discarded.
+// WHAT THE ENGINE DOES (as of #686, and this text was one release behind it
+// until #764). `execute_job_with_retry` takes the workflow's absolute deadline
+// and calls `talos_workflow_engine_core::clamp_attempt_timeout` before EVERY
+// attempt. An attempt is granted `min(allowance, remaining − 2 s)`; with less
+// than 3 s left it is not started at all. So there are three outcomes, not
+// one, and this check reports which:
 //
-// WHAT THIS CHECK CLAIMS, narrowly: at least one CONFIGURED attempt of this
-// node can never complete, whatever else the graph does. That is provable from
-// the single node — it needs no assumption about what runs in parallel.
+//   * every attempt gets its full allowance                       → silent
+//   * every attempt starts, at least one is CUT SHORT             → Warning
+//   * an attempt is never started at all                          → Warning
+//
+// Neither Warning is "the whole execution is dropped". A clamped attempt that
+// times out, and an attempt refused for want of budget, are both ORDINARY NODE
+// FAILURES the engine routes — error edges, `continue_on_error`, the DLQ — and
+// every already-completed sibling result is kept. The previous wording of this
+// check said the opposite, and pointed operators at a mechanism that had been
+// replaced.
+//
+// THE RESIDUAL, stated precisely rather than dropped. The workflow budget is
+// still an OUTER `tokio::time::timeout` that drops the reactor future. The 2 s
+// `BUDGET_RESERVE_SECS` the clamp holds back makes the failure RECORDING
+// likely, not certain: `handle_node_failure` awaits a `node_failed` INSERT, the
+// DLQ write and a sibling reap, and a failure path slower than the reserve
+// still loses the race. The clamp also covers ONLY module dispatch — a
+// `sub_workflow`, judge or ensemble node awaited inline in the reactor is
+// unclamped, and this check says nothing about those (it skips `system:*`
+// nodes).
+//
+// WHAT THIS CHECK CLAIMS, narrowly: the node's CONFIGURED attempt sequence,
+// simulated attempt by attempt through the engine's own clamp, does not get
+// what it asks for. That is provable from the single node — it needs no
+// assumption about what runs in parallel. The simulation is the WORST case
+// (every attempt burning its whole window); a run whose attempts finish early
+// reaches later attempts with more budget than this predicts, so the check
+// under-reports the good case and never over-reports it.
+//
+// ONE HOME FOR THE ARITHMETIC. The simulation is
+// `talos_workflow_engine_core::simulate_attempt_sequence`, over the same
+// `attempt_window_for_remaining` the dispatcher clamps with. Before #764 this
+// crate had its own fit test (`envelope_secs <= budget_secs`), which disagreed
+// with the dispatcher by `TOKIO_WRAP_GRACE_SECS + BUDGET_RESERVE_SECS` = 7 s:
+// nine live nodes across three ACTIVE workflows were reported as fitting and
+// clamped on attempt 1 of every run. Do not re-derive it here.
 //
 // It deliberately does NOT flag the (larger) population where the SUM of
 // envelopes along the critical path exceeds the budget. That shape assumes
@@ -148,9 +175,18 @@ pub fn node_receives_actor_context(capability_world: Option<&str>, explicit: Opt
 // it would fire on a clear majority of workflows that all work today. A warning
 // that fires on the majority is a warning nobody reads.
 
-/// Worst-case wall-clock seconds a node's configured retry envelope can occupy:
+/// Worst-case wall-clock seconds a node's configured retry envelope ASKS FOR:
 /// every attempt running to its full per-attempt timeout, plus the exponential
 /// backoff slept between them.
+///
+/// **This is a REPORTED FIGURE, not the fit decision.** It is what the node's
+/// configuration requests; whether the engine grants it is
+/// [`talos_workflow_engine_core::simulate_attempt_sequence`]'s answer, and
+/// [`retry_envelope_overrun`] asks that one. Keeping the request visible is
+/// useful ("you asked for ~361 s inside 120 s"), but a reader must not treat
+/// this number as the wall-clock a run can actually consume — the clamp bounds
+/// that by the budget. It also excludes the dispatcher's 5 s per-attempt grace,
+/// which the simulation includes.
 ///
 /// `retries` is the ALREADY-RESOLVED count (an author's declared `retry_count`,
 /// or `default_max_retries_for_module` when the author declared none) — this
@@ -262,10 +298,17 @@ pub const RETRY_COST_CAVEAT: &str =
      metered API call) each attempt pays it again — a timeout counts as transient, so a retry \
      can fire even when the first attempt may have completed";
 
-/// A node whose configured retry envelope cannot fit its workflow's budget.
+/// A node whose configured attempt sequence does not get what it asks for once
+/// the engine's per-attempt budget clamp is applied.
+///
+/// The name is historical (it predates the clamp) and is kept because the
+/// warning's `category` is `"retry-envelope"` and operators may have wired it
+/// up. [`Self::fit`] is what says WHICH of the two findings this is; the other
+/// fields describe the CONFIGURATION that produced it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryEnvelopeOverrun {
-    /// Worst-case seconds the node's attempts + backoff can occupy.
+    /// Worst-case seconds the node's attempts + backoff ASK FOR. See
+    /// [`node_retry_envelope_secs`] — a request, not what the engine grants.
     pub envelope_secs: u64,
     /// Total attempts the engine is configured to make (`retries + 1`).
     pub attempts: u64,
@@ -276,17 +319,37 @@ pub struct RetryEnvelopeOverrun {
     /// `true` when the count came from the node's own `retry_count`;
     /// `false` when the method-aware module default supplied it.
     pub retries_declared: bool,
+    /// What the engine actually grants, simulated attempt by attempt through
+    /// [`talos_workflow_engine_core::clamp_attempt_timeout`]'s own arithmetic.
+    ///
+    /// Never [`talos_workflow_engine_core::AttemptFit::Full`] — a full fit is
+    /// `None` from [`retry_envelope_overrun`], not a finding.
+    pub fit: talos_workflow_engine_core::AttemptFit,
+    /// The allowance the dispatcher clamps: `per_attempt_secs` plus the
+    /// dispatcher's outer-wrap grace. Reported because the 5 s difference is
+    /// exactly why a "120 s node in a 120 s budget" does not fit.
+    pub node_allowance_secs: u64,
 }
 
-/// Decide whether one node's retry envelope exceeds the workflow budget that
-/// contains it. `None` means it fits (or there is no budget to fit inside).
+/// Decide whether one node's configured attempt sequence gets what it asks for
+/// inside the workflow budget that contains it. `None` means every configured
+/// attempt starts AND is granted its full allowance (or there is no budget to
+/// fit inside).
+///
+/// **Simulates the engine's own clamp** rather than comparing two totals: it
+/// walks the attempts through
+/// [`talos_workflow_engine_core::simulate_attempt_sequence`], which is the
+/// function `talos_workflow_engine_nats` clamps each real attempt with. The
+/// previous `envelope_secs <= budget_secs` test was a second implementation of
+/// that arithmetic and disagreed with it by 7 s at the boundary (#764).
 ///
 /// Pure, so the fire / don't-fire decision is unit-tested against the real
 /// shapes rather than shadowed by a test-local reimplementation. `validate`
 /// calls this and only formats the message.
 ///
 /// `budget_secs == 0` means the workflow-level wall-clock cap is DISABLED —
-/// there is no container, so nothing can exceed it.
+/// the dispatcher gets `deadline: None` and clamps nothing, so nothing can
+/// exceed it.
 #[must_use]
 pub fn retry_envelope_overrun(
     node: &serde_json::Value,
@@ -304,7 +367,14 @@ pub fn retry_envelope_overrun(
     let per_attempt_secs = node_per_attempt_timeout_secs(node, default_node_timeout_secs);
     let backoff_ms = node_backoff_ms(node);
     let envelope_secs = node_retry_envelope_secs(per_attempt_secs, resolved_retries, backoff_ms);
-    if envelope_secs <= budget_secs {
+    let sequence = talos_workflow_engine_core::simulate_attempt_sequence(
+        per_attempt_secs,
+        resolved_retries,
+        backoff_ms,
+        budget_secs,
+    );
+    let fit = sequence.fit();
+    if fit.is_full() {
         return None;
     }
     Some(RetryEnvelopeOverrun {
@@ -313,28 +383,41 @@ pub fn retry_envelope_overrun(
         per_attempt_secs,
         resolved_retries,
         retries_declared,
+        fit,
+        node_allowance_secs: sequence.node_allowance_secs,
     })
 }
 
-/// Render the operator-facing text for a retry-envelope overrun.
+/// Render the operator-facing text for an attempt-window finding.
 ///
 /// Extracted from `validate_prepared` so the retry ADVISOR
 /// (`suggest_retry_config`) can quote the same explanation the VALIDATOR
 /// prints instead of composing a second account of the same mechanism. Two
 /// surfaces describing one engine behaviour in two vocabularies is how an
 /// operator ends up believing they are two different problems.
+///
+/// **Two findings, two remedies, deliberately not merged.** A TRUNCATED
+/// sequence loses an attempt the author configured; a CLAMPED one keeps every
+/// attempt but shortens it. They call for different edits and they are not
+/// equally severe, so folding the second into the first's sentence ("at least
+/// one attempt can never complete") would be false for it — which is what the
+/// pre-#764 text did to the nine live 120-in-120 nodes it never mentioned at
+/// all.
 #[must_use]
 pub fn describe_retry_envelope_overrun(
     overrun: &RetryEnvelopeOverrun,
     node_label: &str,
     budget_secs: u64,
 ) -> String {
+    use talos_workflow_engine_core::AttemptFit;
     let RetryEnvelopeOverrun {
         envelope_secs,
         attempts,
         per_attempt_secs,
         resolved_retries,
         retries_declared,
+        fit,
+        node_allowance_secs,
     } = overrun;
     let retry_note = if *retries_declared {
         format!("its declared retry_count of {resolved_retries}")
@@ -344,26 +427,95 @@ pub fn describe_retry_envelope_overrun(
              declares no retry_count)"
         )
     };
-    // With `resolved_retries == 0` the overrun is the node's SINGLE attempt
-    // outrunning the budget — there is no retry_count to lower, and telling an
-    // operator to lower one is advice they cannot act on.
-    let remedy = if *resolved_retries == 0 {
-        "This node makes only one attempt, so there is no retry_count to lower: raise \
-         execution_timeout_secs above the per-attempt timeout, lower this node's timeout_secs to \
-         fit, or make the node's work smaller."
-    } else {
-        "Lower retry_count or raise execution_timeout_secs. Do NOT raise this node's \
-         timeout_secs: that multiplies the envelope by the attempt count and makes the failure \
-         arrive sooner."
-    };
-    format!(
+    // The configuration, stated the same way in both branches so an operator
+    // comparing two findings is comparing like with like.
+    // Head kept VERBATIM from the pre-#764 wording (only the trailing full
+    // stop is new): the phrase "retry envelope" is what the `retry-envelope`
+    // category and every operator-facing quotation of this finding use, and
+    // renaming it would break a vocabulary for no gain. What changed is the
+    // sentence AFTER it, which is where the false mechanism lived.
+    let head = format!(
         "Node '{node_label}' has a retry envelope of ~{envelope_secs}s ({attempts} attempts x \
          {per_attempt_secs}s, plus backoff, from {retry_note}) inside a workflow budget of \
-         {budget_secs}s. At least one configured attempt can never complete: the retry loop has \
-         no view of the workflow deadline, so it starts the attempt anyway, and when the budget \
-         expires the whole execution is dropped — discarding every sibling node that had already \
-         finished. {remedy}"
-    )
+         {budget_secs}s."
+    );
+    // With `resolved_retries == 0` there is no retry_count to lower, and
+    // telling an operator to lower one is advice they cannot act on.
+    let single_attempt = *resolved_retries == 0;
+    match fit {
+        AttemptFit::Full => {
+            // Unreachable: `retry_envelope_overrun` returns `None` for a full
+            // fit. Rendered rather than panicking because this is a reporting
+            // path, and a rendered contradiction is easier to notice than a
+            // 500.
+            format!("{head} Every configured attempt fits.")
+        }
+        AttemptFit::Truncated {
+            started,
+            configured,
+            remaining_secs,
+        } => {
+            let remedy = if single_attempt {
+                "This node makes only one attempt, so there is no retry_count to lower: raise \
+                 execution_timeout_secs, lower this node's timeout_secs to fit, or make the \
+                 node's work smaller."
+            } else {
+                "Lower retry_count or raise execution_timeout_secs. Do NOT raise this node's \
+                 timeout_secs: that lengthens every attempt and brings the cutoff forward."
+            };
+            format!(
+                "{head} Only {started} of {configured} attempts can start: after them \
+                 {remaining_secs}s of budget remain, below the {min}s the engine needs to run \
+                 an attempt and record its outcome, so the rest are never dispatched. The \
+                 engine fails the NODE at that point (an ordinary node failure it routes — \
+                 error edges, continue_on_error, the dead-letter queue); it does not discard \
+                 sibling results. {remedy}",
+                min = talos_workflow_engine_core::MIN_REMAINING_FOR_ATTEMPT_SECS,
+            )
+        }
+        AttemptFit::Clamped {
+            first_clamped_attempt,
+            granted_secs,
+        } => {
+            let shortfall = node_allowance_secs.saturating_sub(*granted_secs);
+            format!(
+                "{head} Every configured attempt starts, but attempt {first_clamped_attempt} is \
+                 CLAMPED to {granted_secs}s of the {node_allowance_secs}s this node's dispatch \
+                 actually claims ({per_attempt_secs}s timeout_secs plus the dispatcher's \
+                 {grace}s outer-wrap grace), because the engine holds back {reserve}s of budget \
+                 to record a failure. The node therefore never gets the timeout it is \
+                 configured for, and work that would have finished in {granted_secs}..\
+                 {node_allowance_secs}s is cut short and fails. This is NOT an attempt that can \
+                 never complete — a faster run still succeeds — so it is lower severity than a \
+                 truncated sequence. Raise execution_timeout_secs by at least {shortfall}s, or \
+                 lower this node's timeout_secs by the same, to give it the window it declares.",
+                grace = talos_workflow_engine_core::TOKIO_WRAP_GRACE_SECS,
+                reserve = talos_workflow_engine_core::BUDGET_RESERVE_SECS,
+            )
+        }
+    }
+}
+
+/// The `category` a finding carries, split by which of the two it is.
+///
+/// `"retry-envelope"` is kept VERBATIM for the truncated case — it is the
+/// category this check has always emitted and the one an operator may have
+/// filtered on. The clamped case is NEW (the pre-#764 check could not report
+/// it) and gets its own, so the two are machine-separable without reading
+/// prose. Note the corollary, measured on the reference fleet: three nodes that
+/// used to be reported as `retry-envelope` are clamped rather than truncated
+/// and now carry the new category — the finding did not disappear, it was
+/// reclassified, because "an attempt that can never complete" was false for
+/// them.
+#[must_use]
+pub fn retry_finding_category(fit: &talos_workflow_engine_core::AttemptFit) -> &'static str {
+    match fit {
+        talos_workflow_engine_core::AttemptFit::Clamped { .. } => "attempt-window-clamped",
+        // A `Full` fit is not a finding at all; if one ever reaches here the
+        // historical category is the safe rendering.
+        talos_workflow_engine_core::AttemptFit::Truncated { .. }
+        | talos_workflow_engine_core::AttemptFit::Full => "retry-envelope",
+    }
 }
 
 /// Whether a module's DECLARED permissions make it capable of changing state at
@@ -393,13 +545,24 @@ pub fn module_is_side_effecting(allowed_hosts: &[String], allowed_methods: &[Str
 /// first attempt fits, i.e. no retry count is safe and the problem is the
 /// per-attempt timeout, not the retry count.
 ///
-/// **Searches over [`node_retry_envelope_secs`] rather than solving for a
-/// count.** A closed form would be a second statement of the envelope formula,
-/// and the first thing that would drift is the backoff term — which is exactly
-/// where [`retry_envelope_overrun`] and this function must agree, because this
-/// one exists to answer "then what count would NOT trip that warning?". The
-/// envelope is monotonic in the count and the count is capped at
+/// **Searches over the SAME simulation [`retry_envelope_overrun`] uses**, not a
+/// closed form and no longer over [`node_retry_envelope_secs`]. This function
+/// exists to answer "then what count would NOT trip that warning?", so it must
+/// be that warning's exact inverse: the largest count whose every attempt both
+/// starts and is granted its full allowance, with `ceiling + 1` producing a
+/// finding. Solving for a count in closed form would be a second statement of
+/// the arithmetic, and the first thing to drift would be the backoff term.
+///
+/// The result is monotonic in the count (each extra attempt only consumes more
+/// of the same budget) and the count is capped at
 /// `talos_workflow_types::MAX_RETRY_COUNT`, so the search is bounded and cheap.
+///
+/// **This ceiling moved with #764**, by up to one retry on shapes where the old
+/// formula's 7 s of slack fitted an extra attempt that the engine would have
+/// clamped: `max_retries_within_budget(120, 500, 240)` was `1` and is now `0`,
+/// because the second attempt's 125 s allowance cannot fit the 113 s left. The
+/// four shapes pinned by `budget_ceiling_is_the_inverse_of_the_overrun_check`
+/// are unchanged.
 #[must_use]
 pub fn max_retries_within_budget(
     per_attempt_secs: u64,
@@ -414,7 +577,15 @@ pub fn max_retries_within_budget(
     const MAX_SEARCH: u32 = 100;
     let mut best = 0u32;
     for retries in 0..=MAX_SEARCH {
-        if node_retry_envelope_secs(per_attempt_secs, retries, base_backoff_ms) <= budget_secs {
+        let fits = talos_workflow_engine_core::simulate_attempt_sequence(
+            per_attempt_secs,
+            retries,
+            base_backoff_ms,
+            budget_secs,
+        )
+        .fit()
+        .is_full();
+        if fits {
             best = retries;
         } else {
             // Monotonic: once it stops fitting it never fits again.
@@ -1213,7 +1384,16 @@ pub struct NodeRetryAdvice {
     /// `true` when the node's module declares egress hosts and a method
     /// allowlist not limited to GET/HEAD — [`module_is_side_effecting`].
     pub state_changing: bool,
-    /// `true` when the node's CURRENT configuration already overruns the budget.
+    /// `true` when the node's CURRENT configuration does not get the attempt
+    /// window it asks for — [`retry_envelope_overrun`] fires.
+    ///
+    /// **Widened by #764, and the count built on it moved.** It used to mean
+    /// "the configured envelope exceeds the budget"; it now means "at least one
+    /// configured attempt is clamped short or never started", which is what the
+    /// engine actually does. On the reference fleet that took the population
+    /// from 7 nodes to 16 — 4 truncated (a strict subset of the old 7) and 12
+    /// clamped, of which 3 were previously reported as the more severe finding
+    /// and 9 were reported as nothing at all.
     pub currently_overruns: bool,
     /// Ceilings that bound the recommendation below the proposal, if any.
     pub bounds: Vec<RetryAdviceBound>,
@@ -1530,7 +1710,10 @@ impl WorkflowRetryAdvice {
         self.nodes.iter().map(|n| n.safe_max_retries).min()
     }
 
-    /// Nodes whose CURRENT configuration already overruns the budget.
+    /// Nodes whose CURRENT configuration does not get the attempt window it
+    /// asks for. See [`NodeRetryAdvice::currently_overruns`] for what changed
+    /// in #764 — this population includes CLAMPED nodes, which are a real but
+    /// lower-severity finding than a truncated sequence.
     #[must_use]
     pub fn overrunning_nodes(&self) -> Vec<&NodeRetryAdvice> {
         self.nodes.iter().filter(|n| n.currently_overruns).collect()
@@ -2654,6 +2837,16 @@ pub fn validate_prepared(prepared: PreparedValidation) -> ValidationResult {
                         };
 
                         issues.push(ValidationIssue {
+                            // `ValidationSeverity` has exactly two values,
+                            // Error and Warning, and neither of these findings
+                            // is an Error (the workflow runs). "Lower
+                            // severity" for the CLAMPED case is therefore
+                            // expressed in the CATEGORY and the wording, not in
+                            // the enum: adding an `Info` variant would change
+                            // every counter, renderer and response shape that
+                            // reads a `ValidationResult`, which is a
+                            // cross-surface change and not this one. Recorded
+                            // rather than quietly conflated.
                             severity: ValidationSeverity::Warning,
                             // Rendered by the SHARED formatter so the retry
                             // advisor quotes this exact explanation rather
@@ -2661,7 +2854,7 @@ pub fn validate_prepared(prepared: PreparedValidation) -> ValidationResult {
                             // engine behaviour.
                             message: describe_retry_envelope_overrun(&overrun, node_label, budget),
                             node_id: Some(node_label.to_string()),
-                            category: "retry-envelope".into(),
+                            category: retry_finding_category(&overrun.fit).into(),
                         });
                     }
                 }
@@ -4952,13 +5145,31 @@ mod retry_envelope_tests {
         assert!(check(&node, BUDGET).is_none());
     }
 
-    /// Exactly filling the budget is not an overrun: the attempt CAN complete
-    /// if it starts immediately. It is a hazard (nothing else may run) but not
-    /// a structural impossibility, and this check only claims the latter.
+    /// DELIBERATELY INVERTED by #764, and this is the sharpest single
+    /// behaviour change in that PR.
+    ///
+    /// The old comment here read: "Exactly filling the budget is not an
+    /// overrun: the attempt CAN complete if it starts immediately." Measured
+    /// against the engine, it cannot. The dispatch claims
+    /// `timeout_secs + TOKIO_WRAP_GRACE_SECS` = 305 s and the clamp holds back
+    /// `BUDGET_RESERVE_SECS` = 2 s, so a 300 s attempt inside a 300 s budget is
+    /// granted 298 s on attempt 1 of every run — measured live at 117 s for the
+    /// 120-in-120 nodes on three ACTIVE fleet workflows. It is a CLAMPED
+    /// finding, not a truncated one: the attempt still runs and a faster run
+    /// still succeeds, which is why the two are rendered and remedied
+    /// differently rather than merged.
     #[test]
-    fn exactly_filling_the_budget_does_not_fire() {
+    fn exactly_filling_the_budget_is_a_clamp_not_a_fit() {
         let node = json!({ "retry_count": 0, "timeout_secs": 300 });
-        assert!(check(&node, BUDGET).is_none());
+        let o = check(&node, BUDGET).expect("305s of allowance cannot fit a 300s budget");
+        assert_eq!(
+            o.fit,
+            talos_workflow_engine_core::AttemptFit::Clamped {
+                first_clamped_attempt: 1,
+                granted_secs: 298
+            }
+        );
+        assert_eq!(o.node_allowance_secs, 305);
     }
 
     /// `execution_timeout_secs: 0` disables the workflow wall-clock cap, so
@@ -6127,6 +6338,82 @@ mod dispatch_config_tests {
     }
 }
 
+/// The mechanism the operator-facing text names must be the mechanism the
+/// engine runs. Both assertions here failed on `origin/main` @ 1efc9513.
+#[cfg(test)]
+mod attempt_window_prose_tests {
+    use super::{describe_retry_envelope_overrun, retry_envelope_overrun};
+
+    const MODULE: &str = "aaaaaaaa-1111-2222-3333-444444444444";
+
+    /// Since #686 the retry loop takes `deadline: Option<Instant>` and clamps
+    /// every attempt through `clamp_attempt_timeout`. The sentence this asserts
+    /// against described the pre-#686 loop.
+    ///
+    /// `pa-ask-email/fetch` verbatim: 3 x 120 s inside a 120 s budget, which is
+    /// the TRUNCATED shape (attempt 2 comes due with 2 s left).
+    #[test]
+    fn the_overrun_text_describes_the_clamp_not_a_reactor_drop() {
+        let node = serde_json::json!({"id": "fetch", "type": MODULE, "retry_count": 2});
+        let o = retry_envelope_overrun(&node, 120, true, &[], Some("minimal-node"), 120)
+            .expect("3 x 120s cannot fit 120s");
+        let msg = describe_retry_envelope_overrun(&o, "fetch", 120);
+        for stale in [
+            "no view of the workflow deadline",
+            "whole execution is dropped",
+            "discarding every sibling node",
+        ] {
+            assert!(!msg.contains(stale), "stale mechanism ({stale}): {msg}");
+        }
+        // The true mechanism, in the terms the engine uses.
+        assert!(msg.contains("1 of 3 attempts can start"), "{msg}");
+        assert!(msg.contains("does not discard sibling results"), "{msg}");
+        // The vocabulary the `retry-envelope` category is quoted by is kept.
+        assert!(msg.contains("retry envelope of ~361s"), "{msg}");
+    }
+
+    /// The CLAMPED branch, which the pre-#764 check could not report at all:
+    /// `pa-ask-email/verify_extract`, one attempt, 120 s inside 120 s.
+    #[test]
+    fn the_clamped_text_names_the_clamp_and_the_shortfall() {
+        let node = serde_json::json!({"id": "verify_extract", "type": MODULE, "retry_count": 0});
+        let o = retry_envelope_overrun(&node, 120, true, &[], Some("minimal-node"), 120)
+            .expect("125s of allowance cannot fit a 120s budget");
+        let msg = describe_retry_envelope_overrun(&o, "verify_extract", 120);
+        for stale in [
+            "no view of the workflow deadline",
+            "whole execution is dropped",
+            "at least one configured attempt can never complete",
+        ] {
+            assert!(!msg.contains(stale), "stale mechanism ({stale}): {msg}");
+        }
+        assert!(msg.contains("CLAMPED to 118s"), "{msg}");
+        assert!(msg.contains("125s"), "names the real allowance: {msg}");
+        assert!(
+            msg.contains("NOT an attempt that can never complete"),
+            "must not be sold as the severe finding: {msg}"
+        );
+        assert!(
+            msg.contains("by at least 7s"),
+            "must name the actionable shortfall: {msg}"
+        );
+    }
+
+    /// `pa-ask-email/verify_extract` on the live fleet: the engine default
+    /// 120 s per attempt, `retry_count: 0`, inside a 120 s budget. The
+    /// validator called this a fit (120 <= 120); the dispatcher clamps the
+    /// node's 125 s allowance to 118 s on attempt 1 of every run.
+    #[test]
+    fn a_node_that_exactly_fills_its_budget_is_still_a_finding() {
+        let node = serde_json::json!({"id": "verify_extract", "type": MODULE, "retry_count": 0});
+        assert!(
+            retry_envelope_overrun(&node, 120, true, &[], Some("minimal-node"), 120).is_some(),
+            "120s of allowance never fits a 120s budget once the +5s grace and the 2s \
+             reserve are applied"
+        );
+    }
+}
+
 #[cfg(test)]
 mod single_attempt_overrun_tests {
     use super::retry_envelope_overrun;
@@ -6872,6 +7159,62 @@ mod retry_advice_tests {
                 "ceiling {ceiling} is not maximal for {budget}s"
             );
         }
+    }
+
+    /// The STRONGER statement of the same property, against the predicate the
+    /// code now uses. `budget_ceiling_is_the_inverse_of_the_overrun_check`
+    /// above asserts against `node_retry_envelope_secs`, the CONFIGURED
+    /// envelope, and it still holds for its four shapes by arithmetic rather
+    /// than by construction — this one asserts the relation that is actually
+    /// load-bearing: the ceiling is the largest count `retry_envelope_overrun`
+    /// stays silent on, and one more makes it speak.
+    ///
+    /// The last shape is the one where the two differ: `(120, 500, 240)` had
+    /// ceiling 1 under the old formula (240 s envelope, 240 s budget) and has
+    /// ceiling 0 under the clamp, because attempt 2's 125 s allowance cannot
+    /// fit the 113 s that remain.
+    #[test]
+    fn budget_ceiling_is_the_inverse_of_the_attempt_simulation() {
+        for (per_attempt, backoff, budget) in [
+            (120u64, 3000u64, 300u64),
+            (120, 500, 300),
+            (150, 500, 240),
+            (90, 500, 300),
+            (120, 500, 240),
+        ] {
+            let ceiling =
+                max_retries_within_budget(per_attempt, backoff, budget).expect("budget is enabled");
+            let node = json!({
+                "retry_count": ceiling,
+                "timeout_secs": per_attempt,
+                "retry_backoff_ms": backoff,
+            });
+            assert!(
+                retry_envelope_overrun(&node, budget, true, &[], Some("http-node"), NODE_TIMEOUT)
+                    .is_none(),
+                "ceiling {ceiling} still produces a finding at {per_attempt}s/{budget}s"
+            );
+            let one_more = json!({
+                "retry_count": ceiling + 1,
+                "timeout_secs": per_attempt,
+                "retry_backoff_ms": backoff,
+            });
+            assert!(
+                retry_envelope_overrun(
+                    &one_more,
+                    budget,
+                    true,
+                    &[],
+                    Some("http-node"),
+                    NODE_TIMEOUT
+                )
+                .is_some(),
+                "ceiling {ceiling} is not maximal at {per_attempt}s/{budget}s"
+            );
+        }
+        // The measured move, pinned so a future change to either side is a
+        // deliberate act rather than a surprise.
+        assert_eq!(max_retries_within_budget(120, 500, 240), Some(0));
     }
 
     #[test]

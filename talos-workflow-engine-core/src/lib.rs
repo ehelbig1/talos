@@ -112,6 +112,7 @@ pub const HAS_LLM_PRIMITIVES: bool = cfg!(feature = "llm-primitives");
 
 mod approval_gate;
 mod assistant_report_reader;
+pub mod attempt_window;
 mod checkpoint;
 pub mod child_workflow_refs;
 mod context;
@@ -148,6 +149,12 @@ mod write_ceiling;
 
 pub use approval_gate::{ApprovalGate, ApprovalStatus};
 pub use assistant_report_reader::AssistantReportReader;
+pub use attempt_window::{
+    attempt_window_for_remaining, clamp_attempt_timeout, clamp_cause, dispatch_allowance_secs,
+    simulate_attempt_sequence, AttemptFit, AttemptSequence, AttemptWindow, ClampCause,
+    SimulatedAttempt, BUDGET_RESERVE_SECS, MAX_SIMULATED_ATTEMPTS, MIN_REMAINING_FOR_ATTEMPT_SECS,
+    TOKIO_WRAP_GRACE_SECS,
+};
 pub use checkpoint::CheckpointStore;
 pub use child_workflow_refs::{
     child_workflow_ids, child_workflow_ids_checked, collect_child_workflow_references,
