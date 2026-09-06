@@ -119,6 +119,77 @@ pub fn build_typed_scaffold_fix_commands(
         .collect()
 }
 
+/// The stale-draft population, split into the three sets every surface that
+/// speaks about it needs.
+///
+/// See [`partition_stale_drafts`] for why there is exactly one of these.
+pub struct StaleDraftPartition<'a> {
+    /// Never published, never executed, no enabled parent dispatches into it,
+    /// and no marker of authored intent — the only rows the cleanup advice may
+    /// count and `fix_all` may delete.
+    pub deletable: Vec<&'a talos_analytics_repository::StaleDraftRow>,
+    /// Held back because an enabled parent dispatches into it (or mentions it
+    /// in a graph nobody could read). #758/#760.
+    pub child_skipped: Vec<&'a talos_analytics_repository::StaleDraftRow>,
+    /// Held back because a human shaped it: `SYSTEM_PROMPT` / `OUTPUT_SCHEMA` /
+    /// retry / per-node description markers. M-I (2026-05-06).
+    pub substantive_skipped: Vec<&'a talos_analytics_repository::StaleDraftRow>,
+}
+
+/// Partition the stale-draft findings ONCE, for the cleanup RECOMMENDATION and
+/// for `fix_all`'s auto-delete set alike.
+///
+/// **The two used to partition separately and disagreed.** `fix_all` has
+/// excluded substantive drafts since M-I (2026-05-06) — an operator running
+/// `confirm=true` after reading `session_start`'s "5 substantive draft(s) ready
+/// to publish" would otherwise have deleted exactly the workflows they were
+/// about to ship. #760 then taught the RECOMMENDATION about child drafts and
+/// left its substantive blindness in place, so the report counted a substantive
+/// draft under *"likely scaffolding leftovers … delete with
+/// `batch_delete_workflows`"* while the tool it named refused that same row and
+/// filed it under `substantive_drafts_skipped`. The advice and the decision
+/// were built on the same rows, in the same crate, and said opposite things.
+///
+/// One function, so they cannot disagree again. The REPORT still lists every
+/// row — an operator asking "what has never run?" must see all of it, and the
+/// exclusions are disclosed beside the count — but every surface that ACTS or
+/// counts-for-action reads its population from here.
+///
+/// **Order is load-bearing.** The child check runs FIRST and on its own
+/// evidence: `is_substantive_workflow` is an authored-INTENT predicate that
+/// knows nothing about who dispatches a draft, so a child with a bare graph
+/// gets no protection from it (that was #760's finding — the live flagship
+/// child was spared by coincidence, not by design). A row that is BOTH is
+/// reported as a child, because that is the reason a delete would be
+/// destructive rather than merely premature.
+///
+/// Two-valued on purpose: `is_substantive_workflow` cannot report "I could not
+/// read this graph" — an unparseable graph returns `false` and lands in
+/// `deletable`. The UNREADABLE case is covered on the other axis
+/// (`child_protection_reason` is set for a draft an unreadable enabled parent
+/// mentions), and a three-valued authored-intent predicate belongs with the
+/// predicate, not here.
+#[must_use]
+pub fn partition_stale_drafts(
+    rows: &[talos_analytics_repository::StaleDraftRow],
+) -> StaleDraftPartition<'_> {
+    let mut p = StaleDraftPartition {
+        deletable: Vec::new(),
+        child_skipped: Vec::new(),
+        substantive_skipped: Vec::new(),
+    };
+    for r in rows {
+        if r.child_protection_reason.is_some() {
+            p.child_skipped.push(r);
+        } else if is_substantive_workflow(r.graph_json.as_deref()) {
+            p.substantive_skipped.push(r);
+        } else {
+            p.deletable.push(r);
+        }
+    }
+    p
+}
+
 pub fn render_share_pct(pct: Option<f64>) -> String {
     match pct {
         Some(p) => format!("{p}%"),
@@ -669,15 +740,19 @@ pub fn build_report(h: &talos_analytics_repository::HygieneReport) -> HygieneRep
         })
         .collect();
     // The population the draft cleanup recommendation is allowed to speak
-    // about. `child_protection_reason` is WIDER than `runs_as_child_of`: a
-    // draft mentioned by an enabled parent whose graph could not be parsed
-    // names no parent but is still held back, because UNKNOWN is not "no".
-    let deletable_drafts: Vec<&talos_analytics_repository::StaleDraftRow> = h
-        .stale_draft_workflows
-        .iter()
-        .filter(|r| r.child_protection_reason.is_none())
-        .collect();
-    let draft_children_excluded = h.stale_draft_workflows.len() - deletable_drafts.len();
+    // about — and, from here on, the SAME partition `fix_all` acts on. Before
+    // this, the recommendation filtered only on `child_protection_reason` while
+    // `fix_all` filtered on that AND `is_substantive_workflow`, so the advice
+    // counted a substantive draft as deletable and named the very tool that
+    // would refuse it. See [`partition_stale_drafts`].
+    //
+    // `child_protection_reason` is WIDER than `runs_as_child_of`: a draft
+    // mentioned by an enabled parent whose graph could not be parsed names no
+    // parent but is still held back, because UNKNOWN is not "no".
+    let draft_partition = partition_stale_drafts(&h.stale_draft_workflows);
+    let deletable_drafts = &draft_partition.deletable;
+    let draft_children_excluded = draft_partition.child_skipped.len();
+    let draft_substantive_excluded = draft_partition.substantive_skipped.len();
 
     let idle_actors: Vec<serde_json::Value> = h
         .idle_actors
@@ -928,8 +1003,11 @@ pub fn build_report(h: &talos_analytics_repository::HygieneReport) -> HygieneRep
     }
 
     if !deletable_drafts.is_empty() {
+        // "likely scaffolding leftovers" is only true of the population this
+        // count now speaks about, so the sentence says what that population is:
+        // no enabled parent dispatches into it AND no marker of authored intent.
         let mut action = format!(
-            "{} draft workflow(s) have never been published or executed in 7+ days — likely scaffolding leftovers. Review with get_workflow_quickstart then publish_version or delete with batch_delete_workflows.",
+            "{} draft workflow(s) have never been published or executed in 7+ days and carry no marker of authored intent — likely scaffolding leftovers. Review with get_workflow_quickstart then publish_version or delete with batch_delete_workflows.",
             deletable_drafts.len()
         );
         if draft_children_excluded > 0 {
@@ -941,13 +1019,34 @@ pub fn build_report(h: &talos_analytics_repository::HygieneReport) -> HygieneRep
                  which leaves no execution row, so \"never executed\" is not evidence about them."
             ));
         }
+        if draft_substantive_excluded > 0 {
+            // The exclusion `fix_all` has enforced since M-I (2026-05-06) and
+            // this advice did not. Naming them is not optional here: unlike the
+            // child exclusion, the report ROW carries no substantive marker, so
+            // `publishable` is the only place an operator can see WHICH of the
+            // listed drafts the count left out.
+            action.push_str(&format!(
+                " {draft_substantive_excluded} further listed draft(s) are EXCLUDED from this \
+                 count and from fix_all's auto-delete set: they carry markers of authored intent \
+                 (SYSTEM_PROMPT / OUTPUT_SCHEMA / retry_count / per-node description), so their \
+                 next step is publish_version, not deletion — they are named in `publishable`. \
+                 fix_all refuses to delete them; use batch_delete_workflows explicitly if you \
+                 really mean it."
+            ));
+        }
         recommendations.push(serde_json::json!({
             "priority": "low",
             "category": "cleanup",
             "action": action,
             "affected_count": deletable_drafts.len(),
             "excluded_child_workflows": draft_children_excluded,
+            "excluded_substantive_drafts": draft_substantive_excluded,
             "deletable": deletable_drafts.iter().map(|r| r.name.clone()).collect::<Vec<_>>(),
+            "publishable": draft_partition
+                .substantive_skipped
+                .iter()
+                .map(|r| r.name.clone())
+                .collect::<Vec<_>>(),
         }));
     }
 
@@ -1396,14 +1495,13 @@ pub fn build_report(h: &talos_analytics_repository::HygieneReport) -> HygieneRep
     // draft an enabled parent dispatches into, AND a draft mentioned by a
     // parent whose graph could not be read, because a delete cannot be undone
     // by re-reading the graph afterwards.
-    let (child_drafts_skipped, publishable_or_deletable): (Vec<_>, Vec<_>) = h
-        .stale_draft_workflows
-        .iter()
-        .partition(|r| r.child_protection_reason.is_some());
-    let (substantive_drafts_skipped, auto_deletable_drafts): (Vec<_>, Vec<_>) =
-        publishable_or_deletable
-            .into_iter()
-            .partition(|r| is_substantive_workflow(r.graph_json.as_deref()));
+    // The SAME partition the cleanup recommendation above counts from —
+    // computed once, at the top of this function. Two partitions of one
+    // population is how the advice came to recommend deleting a row this set
+    // refuses; see [`partition_stale_drafts`].
+    let child_drafts_skipped = &draft_partition.child_skipped;
+    let substantive_drafts_skipped = &draft_partition.substantive_skipped;
+    let auto_deletable_drafts = &draft_partition.deletable;
     let draft_ids: Vec<uuid::Uuid> = auto_deletable_drafts.iter().map(|r| r.id).collect();
     let stale_exec_ids: Vec<uuid::Uuid> = h.stale_executions.iter().map(|r| r.id).collect();
     let orphaned_module_ids: Vec<uuid::Uuid> = h.orphaned_modules.iter().map(|r| r.id).collect();
@@ -2210,5 +2308,151 @@ mod destructive_preview_pins {
                 "a destructive fix_all step stopped passing its previewed id list: {needle}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod partition_stale_drafts_tests {
+    use super::{partition_stale_drafts, StaleDraftPartition};
+    use talos_analytics_repository::StaleDraftRow;
+
+    /// `is_substantive_workflow` reports this as NOT substantive: one
+    /// non-structural node with empty `data` and no authored-intent marker.
+    const BARE: &str = r#"{"nodes":[{"id":"n","type":"module","data":{}}],"edges":[]}"#;
+    /// Substantive by the `retry_count` marker, with an otherwise bare node —
+    /// so a test riding on this cannot pass because the graph looks finished.
+    const SUBSTANTIVE: &str =
+        r#"{"nodes":[{"id":"n","type":"module","data":{},"retry_count":3}],"edges":[]}"#;
+
+    fn row(name: &str, graph: &str, child_reason: Option<&str>) -> StaleDraftRow {
+        StaleDraftRow {
+            id: uuid::Uuid::new_v4(),
+            name: name.to_string(),
+            created_at: chrono::Utc::now(),
+            graph_json: Some(graph.to_string()),
+            runs_as_child_of: child_reason
+                .map(|_| vec!["parent".to_string()])
+                .unwrap_or_default(),
+            child_protection_reason: child_reason.map(str::to_string),
+        }
+    }
+
+    fn names(rows: &[&StaleDraftRow]) -> Vec<String> {
+        rows.iter().map(|r| r.name.clone()).collect()
+    }
+
+    fn assert_total(p: &StaleDraftPartition<'_>, expected: usize) {
+        assert_eq!(
+            p.deletable.len() + p.child_skipped.len() + p.substantive_skipped.len(),
+            expected,
+            "the three buckets must partition the input — a lost row is a row no surface \
+             mentions and no surface acts on"
+        );
+    }
+
+    #[test]
+    fn a_bare_unreferenced_draft_is_deletable() {
+        let rows = vec![row("abandoned-scaffold", BARE, None)];
+        let p = partition_stale_drafts(&rows);
+        assert_eq!(names(&p.deletable), vec!["abandoned-scaffold".to_string()]);
+        assert!(p.child_skipped.is_empty() && p.substantive_skipped.is_empty());
+        assert_total(&p, 1);
+    }
+
+    #[test]
+    fn a_substantive_draft_is_never_deletable() {
+        // The defect this partition exists to close: pre-fix the RECOMMENDATION
+        // counted this row and named `batch_delete_workflows`, while `fix_all`
+        // filed it under `substantive_drafts_skipped` and refused it.
+        let rows = vec![row("half-built-brief", SUBSTANTIVE, None)];
+        let p = partition_stale_drafts(&rows);
+        assert!(p.deletable.is_empty(), "authored intent is not scaffolding");
+        assert_eq!(
+            names(&p.substantive_skipped),
+            vec!["half-built-brief".to_string()]
+        );
+        assert_total(&p, 1);
+    }
+
+    #[test]
+    fn the_child_check_runs_first_even_when_the_draft_is_also_substantive() {
+        // Order is load-bearing: a row that is BOTH is reported as a child,
+        // because that is the reason a delete would be DESTRUCTIVE rather than
+        // merely premature — and it is the reason that survives a later
+        // `publish_version`.
+        let rows = vec![row(
+            "cos-team-recall",
+            SUBSTANTIVE,
+            Some("dispatched by pa-chief-of-staff"),
+        )];
+        let p = partition_stale_drafts(&rows);
+        assert_eq!(names(&p.child_skipped), vec!["cos-team-recall".to_string()]);
+        assert!(p.substantive_skipped.is_empty() && p.deletable.is_empty());
+        assert_total(&p, 1);
+    }
+
+    #[test]
+    fn a_bare_child_is_protected_by_the_child_check_alone() {
+        // #760's finding: `is_substantive_workflow` knows nothing about who
+        // dispatches a draft, so a child with a bare graph gets NO protection
+        // from it. On the live fleet the flagship's child was spared by the
+        // authored-intent predicate for an unrelated reason — coincidence, not
+        // design.
+        let rows = vec![row("bare-child", BARE, Some("dispatched by parent"))];
+        let p = partition_stale_drafts(&rows);
+        assert_eq!(names(&p.child_skipped), vec!["bare-child".to_string()]);
+        assert!(p.deletable.is_empty());
+        assert_total(&p, 1);
+    }
+
+    #[test]
+    fn an_unparseable_graph_lands_in_deletable_and_that_is_stated_not_hidden() {
+        // Two-valued predicate: `is_substantive_workflow` cannot say "I could
+        // not read this". The UNREADABLE case is covered on the CHILD axis
+        // (`child_protection_reason` is set for a draft an unreadable enabled
+        // parent mentions), which is why this row is deletable only when no
+        // parent mentions it at all.
+        let rows = vec![
+            row("garbage-graph", "not json", None),
+            row(
+                "garbage-graph-but-mentioned",
+                "not json",
+                Some("mentioned by an unreadable parent"),
+            ),
+        ];
+        let p = partition_stale_drafts(&rows);
+        assert_eq!(names(&p.deletable), vec!["garbage-graph".to_string()]);
+        assert_eq!(
+            names(&p.child_skipped),
+            vec!["garbage-graph-but-mentioned".to_string()]
+        );
+        assert_total(&p, 2);
+    }
+
+    #[test]
+    fn a_mixed_population_partitions_with_nothing_lost() {
+        let rows = vec![
+            row("abandoned-scaffold", BARE, None),
+            row("half-built-brief", SUBSTANTIVE, None),
+            row(
+                "cos-team-recall",
+                BARE,
+                Some("dispatched by pa-chief-of-staff"),
+            ),
+        ];
+        let p = partition_stale_drafts(&rows);
+        assert_eq!(names(&p.deletable), vec!["abandoned-scaffold".to_string()]);
+        assert_eq!(
+            names(&p.substantive_skipped),
+            vec!["half-built-brief".to_string()]
+        );
+        assert_eq!(names(&p.child_skipped), vec!["cos-team-recall".to_string()]);
+        assert_total(&p, 3);
+    }
+
+    #[test]
+    fn an_empty_population_partitions_into_nothing() {
+        let p = partition_stale_drafts(&[]);
+        assert_total(&p, 0);
     }
 }
