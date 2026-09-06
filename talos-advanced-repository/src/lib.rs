@@ -153,6 +153,25 @@ pub struct SkippedChildDraft {
     pub reason: String,
 }
 
+/// A stale draft the sweep left alone because a human visibly shaped it — or
+/// because nothing in its graph could say whether a human shaped it.
+///
+/// The authored-INTENT half of the exclusion, mirroring `fix_all`'s
+/// `substantive_drafts_skipped` bucket. Kept SEPARATE from
+/// [`SkippedChildDraft`] because the two reasons are not interchangeable: one
+/// says *somebody runs this*, the other says *somebody wrote this*, and an
+/// operator deciding what to do next needs to know which.
+#[derive(Debug, Clone)]
+pub struct SkippedSubstantiveDraft {
+    /// The draft's workflow id.
+    pub id: Uuid,
+    /// The draft's name, as rendered to an operator.
+    pub name: String,
+    /// Operator-facing explanation, from
+    /// [`talos_draft_heuristics::DraftIntent::cleanup_block_reason`].
+    pub reason: String,
+}
+
 /// What `session_start`'s auto-archive actually did.
 ///
 /// A bare count cannot say "3 archived, 1 held back because the flagship runs
@@ -162,11 +181,82 @@ pub struct SkippedChildDraft {
 pub struct StaleDraftArchiveOutcome {
     /// Rows actually moved to `status = 'archived'`.
     pub archived: u64,
-    /// Candidates deliberately left alone, with the reason.
+    /// Candidates deliberately left alone because an enabled parent dispatches
+    /// into them.
     pub skipped_children: Vec<SkippedChildDraft>,
+    /// Candidates deliberately left alone because the draft carries markers of
+    /// authored intent — the population `session_start` renders, in the SAME
+    /// response, as "ready for `publish_version`".
+    pub skipped_substantive: Vec<SkippedSubstantiveDraft>,
     /// Enabled parents whose graph could not be read during the scan. Every
     /// candidate such a parent mentions is in `skipped_children`.
     pub unreadable_parents: Vec<String>,
+}
+
+/// The classified candidate set: what the sweep may archive, and what it must
+/// leave alone under which of the two reasons.
+struct StaleDraftPartition {
+    to_archive: Vec<Uuid>,
+    skipped_children: Vec<SkippedChildDraft>,
+    skipped_substantive: Vec<SkippedSubstantiveDraft>,
+}
+
+/// Apply BOTH auto-archive exclusions to a candidate set. Pure: the caller
+/// owns the SELECT above it and the by-id UPDATE below it, so the archived set
+/// is a subset of what this classified by construction.
+///
+/// Child FIRST, on its own evidence — the same order `fix_all`'s partition
+/// uses. A draft that is both a live child and visibly shaped is reported as a
+/// CHILD, because publishing it retires the second reason and leaves the first
+/// standing, and an operator picking a next action needs the one that will
+/// still be true afterwards.
+fn partition_stale_draft_candidates(
+    candidates: Vec<StaleDraftCandidate>,
+    scan: &talos_child_workflow_refs::ChildReferenceScan,
+) -> StaleDraftPartition {
+    let mut partition = StaleDraftPartition {
+        to_archive: Vec::with_capacity(candidates.len()),
+        skipped_children: Vec::new(),
+        skipped_substantive: Vec::new(),
+    };
+    for StaleDraftCandidate {
+        id,
+        name,
+        graph_json,
+    } in candidates
+    {
+        if let Some(protection) = scan.protection_for(id) {
+            partition.skipped_children.push(SkippedChildDraft {
+                id,
+                name,
+                runs_as_child_of: protection.parent_names().to_vec(),
+                reason: protection.reason(),
+            });
+            continue;
+        }
+        // `cleanup_block_reason()` is `Some` for BOTH blocked arms —
+        // "a human shaped this" and "nobody can read this" — with different
+        // text, so the two never borrow each other's explanation.
+        match talos_draft_heuristics::classify_draft_intent(graph_json.as_deref())
+            .cleanup_block_reason()
+        {
+            Some(reason) => partition.skipped_substantive.push(SkippedSubstantiveDraft {
+                id,
+                name,
+                reason: reason.to_string(),
+            }),
+            None => partition.to_archive.push(id),
+        }
+    }
+    partition
+}
+
+/// One row of the auto-archive candidate scan, carried from the SELECT to the
+/// classification so the UPDATE can be by-id over what was classified.
+struct StaleDraftCandidate {
+    id: Uuid,
+    name: String,
+    graph_json: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1914,7 +2004,44 @@ impl AdvancedRepository {
     }
 
     /// Archive draft workflows with no executions older than `stale_days`,
-    /// EXCEPT the ones an enabled parent dispatches into.
+    /// EXCEPT the ones an enabled parent dispatches into and the ones a human
+    /// visibly shaped.
+    ///
+    /// # The two exclusions, and why they are both here
+    ///
+    /// This is the ONE chokepoint. Both exclusions are evaluated between the
+    /// candidate SELECT and the UPDATE, each skipped id is reported under its
+    /// OWN reason, and the write is by id over what survived — so the archived
+    /// set is a subset of what was classified by construction.
+    ///
+    /// The child exclusion (#760) asks *does anything run this*. The
+    /// substantive exclusion asks *did a human shape this*, and it closes the
+    /// contradiction M-I fixed for `fix_all` in 2026-05 and left live here:
+    /// `session_start` reads the draft display BEFORE it sweeps, so ONE
+    /// response would list a draft under `unpublished_substantive_drafts` with
+    /// `next_step: "publish_version with workflow_id=…"` and report it
+    /// archived, in that order. Measured on pristine `origin/main`
+    /// 2026-09-05: `auto_archived_stale_drafts: 1` beside that very
+    /// recommendation.
+    ///
+    /// They run child-FIRST, matching `fix_all`'s partition: a draft that is
+    /// both is reported as a child, because that is the reason that survives
+    /// somebody publishing it.
+    ///
+    /// An UNREADABLE `graph_json` is held back too, under its own reason.
+    /// `is_substantive_workflow` answers `false` for "no markers" and for
+    /// "could not parse" alike; on a path that WRITES, those are not the same
+    /// answer — the same UNKNOWN-is-not-NO rule the parent scan applies.
+    ///
+    /// # Deliberately NO force flag
+    ///
+    /// `fix_all` has had this exclusion since 2026-05 with no override: the
+    /// escape hatch is an EXPLICIT operator action (`publish_version`, or
+    /// `archive_workflow` / `batch_delete_workflows` naming the workflow).
+    /// Mirrored here rather than adding an `include_substantive` — a flag that
+    /// re-enables an unattended destructive sweep is the silent widening this
+    /// change exists to prevent, and the skip is disclosed in every response
+    /// so the draft cannot quietly acquire permanent immunity.
     ///
     /// # Why the exclusion is not optional
     ///
@@ -1973,7 +2100,7 @@ impl AdvancedRepository {
         // RFC 0005 S3: self-scope (workflows RLS backstop).
         let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
         let rows = sqlx::query(
-            "SELECT id, name FROM workflows \
+            "SELECT id, name, graph_json FROM workflows \
              WHERE user_id = $1 \
                AND status = 'draft' \
                AND NOT EXISTS (SELECT 1 FROM workflow_executions we WHERE we.workflow_id = workflows.id) \
@@ -1986,33 +2113,43 @@ impl AdvancedRepository {
         .context("archive_stale_drafts candidate scan")?;
         tx.commit().await?;
 
-        let candidates: Vec<(Uuid, String)> = rows
+        // `graph_json` is `text NOT NULL`, so a `None` here is projection
+        // drift, not data — read it as `Option` and let `?` carry a real
+        // schema error out (check 52). A NULL that somehow existed would
+        // classify as `Unreadable` and be held back, which is the safe arm.
+        let candidates: Vec<StaleDraftCandidate> = rows
             .into_iter()
-            .map(|r| -> Result<(Uuid, String)> { Ok((r.try_get("id")?, r.try_get("name")?)) })
+            .map(|r| -> Result<StaleDraftCandidate> {
+                Ok(StaleDraftCandidate {
+                    id: r.try_get("id")?,
+                    name: r.try_get("name")?,
+                    graph_json: r.try_get::<Option<String>, _>("graph_json")?,
+                })
+            })
             .collect::<Result<Vec<_>>>()?;
         if candidates.is_empty() {
             return Ok(StaleDraftArchiveOutcome::default());
         }
 
-        let candidate_ids: Vec<Uuid> = candidates.iter().map(|(id, _)| *id).collect();
+        let candidate_ids: Vec<Uuid> = candidates.iter().map(|c| c.id).collect();
         let scan =
             talos_child_workflow_refs::scan_child_parents(&self.db_pool, user_id, &candidate_ids)
                 .await
                 .context("archive_stale_drafts child-reference scan")?;
 
-        let mut to_archive: Vec<Uuid> = Vec::with_capacity(candidates.len());
-        let mut skipped_children: Vec<SkippedChildDraft> = Vec::new();
-        for (id, name) in candidates {
-            match scan.protection_for(id) {
-                Some(protection) => skipped_children.push(SkippedChildDraft {
-                    id,
-                    name,
-                    runs_as_child_of: protection.parent_names().to_vec(),
-                    reason: protection.reason(),
-                }),
-                None => to_archive.push(id),
-            }
-        }
+        // BOTH exclusions, in one pure pass. Extracted so the classification
+        // is unit-testable without a database AND so the write below stays
+        // adjacent to `scan_child_parents` — lint check 86's leg (b) reads a
+        // 40-line window from the destructive statement, and an inlined loop
+        // this long pushes the chokepoint out of it. The right answer to a
+        // window that no longer reaches is to move the code, not to add an
+        // `allow-execution-blind-draft-path:` marker, which matches
+        // file-globally and would blind leg (a) for the whole file.
+        let StaleDraftPartition {
+            to_archive,
+            skipped_children,
+            skipped_substantive,
+        } = partition_stale_draft_candidates(candidates, &scan);
 
         let archived = if to_archive.is_empty() {
             0
@@ -2044,10 +2181,20 @@ impl AdvancedRepository {
                 "archive_stale_drafts held back draft(s) an enabled parent dispatches into"
             );
         }
+        if !skipped_substantive.is_empty() {
+            tracing::info!(
+                target: "talos_audit",
+                %user_id,
+                archived,
+                skipped = skipped_substantive.len(),
+                "archive_stale_drafts held back draft(s) a human visibly shaped"
+            );
+        }
 
         Ok(StaleDraftArchiveOutcome {
             archived,
             skipped_children,
+            skipped_substantive,
             unreadable_parents: scan.unreadable_parents().to_vec(),
         })
     }

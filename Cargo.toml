@@ -104,6 +104,7 @@ members = [
     "talos-advanced-repository",
     "talos-analytics-repository",
     "talos-child-workflow-refs",
+    "talos-draft-heuristics",
     "talos-actor-repository",
     "talos-engine-events",
     "talos-execution-repository",

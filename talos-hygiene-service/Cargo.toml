@@ -7,6 +7,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# The ONE draft-substantiveness predicate, shared with `session_start`'s
+# display AND its auto-archive sweep (leaf: serde_json only).
+talos-draft-heuristics = { path = "../talos-draft-heuristics" }
 talos-measurement = { path = "../talos-measurement" }
 anyhow.workspace = true
 chrono = { version = "0.4", features = ["serde"] }

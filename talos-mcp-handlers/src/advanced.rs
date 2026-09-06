@@ -324,9 +324,12 @@ mod blocked_tables_tests {
 
 // Graph-JSON draft heuristics (`count_nodes_with_empty_data` /
 // `is_substantive_workflow`) moved to `talos-hygiene-service` in the
-// 2026-07 extraction so the session brief and the hygiene fix_all flow
-// consult ONE shared predicate (the M-I invariant) from their service
-// crates.
+// 2026-07 extraction, and on to the LEAF crate `talos-draft-heuristics` in
+// 2026-09 once `session_start`'s auto-archive sweep — which lives in
+// `talos-advanced-repository` and must not depend upward on a service crate —
+// became a third consumer. The M-I invariant ("the two surfaces never
+// disagree") had been asserted from that 2026-07 home while `session_start`
+// in fact carried an inline copy; there is now ONE `pub` implementation.
 
 pub fn tool_schemas() -> Vec<serde_json::Value> {
     let worlds_csv = crate::capability_worlds::compilable_worlds_csv();
@@ -340,7 +343,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                 "properties": {
                     "auto_archive_stale_days": {
                         "type": "integer",
-                        "description": "When set, automatically archive draft workflows that have never been published or executed and are older than this many days. Recommended range: 7–30. Omit to skip auto-archiving."
+                        "description": "When set, automatically archive draft workflows that have never been published or executed and are older than this many days. Recommended range: 7–30. Omit to skip auto-archiving. Two populations are deliberately EXEMPT and no flag widens the sweep to include them: a draft an enabled parent dispatches into (a sub-workflow runs in-process and leaves no execution row, so 'never executed' is not evidence about it) and a draft carrying markers of authored intent — the same rows this response lists under unpublished_substantive_drafts as ready for publish_version. Both are reported back under auto_archive_skipped_children / auto_archive_skipped_substantive with a reason; archive one explicitly with archive_workflow if you really want it gone."
                     }
                 }
             }

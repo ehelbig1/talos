@@ -1,5 +1,5 @@
 //! Twinned-workflow divergence detection — pure graph analysis for the
-//! hygiene report. Sibling of [`crate::graph_heuristics`]: no DB, no IO,
+//! hygiene report. Sibling of the `talos-draft-heuristics` leaf crate: no DB, no IO,
 //! every function here is testable from a string fixture.
 //!
 //! ## Why this exists

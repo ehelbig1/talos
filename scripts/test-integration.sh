@@ -320,6 +320,12 @@ CTRL_TESTS=(
     # background writer's verbatim UPDATE and the (previously dead) schedule
     # exclusion; `common` harness, so CTRL_TESTS (64b).
     "child_readiness_tests"
+    # The remainder #760 recorded and did not fix: the auto-archive sweep did
+    # not know about `is_substantive_workflow`, so ONE session_start response
+    # recommended publish_version for a draft and archived it. Drives the REAL
+    # SessionBriefService and the REAL sweep; `common` harness, so CTRL_TESTS
+    # (64b).
+    "session_start_substantive_draft_tests"
     "api_key_tests"
     "api_auth_integration_test"
     "integration_mcp_tests"
