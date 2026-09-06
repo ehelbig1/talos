@@ -377,7 +377,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_execution_lineage",
-            "description": "Trace the full parent–child execution tree for any execution. Shows all ancestor and descendant executions linked via parent_execution_id, giving a unified view of how a single user action (trigger, handoff, or sub-workflow dispatch) spawned multiple executions across actors and workflows. Useful for debugging complex agentic scenarios where one intent fans out into many runs.",
+            "description": "Trace the full parent–child execution tree for any execution. Shows all ancestor and descendant executions linked via parent_execution_id, giving a unified view of how a single user action (trigger, handoff, or sub-workflow dispatch) spawned multiple executions across actors and workflows. Useful for debugging complex agentic scenarios where one intent fans out into many runs. Also lists `child_runs`: the sub-workflow runs this execution dispatched, which record NO workflow_executions row and therefore never appear in `lineage`. `child_runs` is null (never []) when the ledger could not be read, and `ledger_since` says from when a count of 0 is evidence rather than silence.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -5877,6 +5877,43 @@ async fn handle_cancel_queued_executions(
 
 // ── get_execution_lineage ────────────────────────────────────────────────────
 
+/// Cap on the child runs listed under one lineage anchor. A single parent
+/// execution can dispatch many (an `ensemble` node runs its child N times),
+/// and an unbounded list in a report is how a response becomes a payload.
+const CHILD_RUNS_PER_LINEAGE_ANCHOR: i64 = 100;
+
+/// What `child_runs` MEANS in this response — and, when it is empty or null,
+/// what it does NOT mean.
+///
+/// Three states, never collapsed: the ledger could not be read (`null`, and
+/// say so); the ledger holds nothing at all so no count is evidence
+/// (`ledger_since` absent); and a real, measured zero.
+fn child_runs_note(count: Option<usize>, ledger_has_started: bool, error: Option<&str>) -> String {
+    if let Some(e) = error {
+        return format!(
+            "child_runs is null because {e}. That is NOT a statement that this \
+             execution dispatched no sub-workflows."
+        );
+    }
+    let base = "A sub-workflow runs in-process and records NO workflow_executions                 row, so it never appears in `lineage`. `child_runs` is the RFC 0012                 ledger's record of what this execution dispatched.";
+    match (count, ledger_has_started) {
+        (Some(0) | None, false) => format!(
+            "{base} The ledger holds no rows at all, so `ledger_since` is null and \
+             this empty list is UNKNOWN, not zero — nothing was recording. {}",
+            talos_child_run_ledger::UNRECORDED_DISPATCH_KINDS_NOTE
+        ),
+        (Some(0), true) => format!(
+            "{base} The ledger has been recording since `ledger_since`; if this \
+             execution started before then, an empty list says nothing about it. {}",
+            talos_child_run_ledger::UNRECORDED_DISPATCH_KINDS_NOTE
+        ),
+        _ => format!(
+            "{base} {}",
+            talos_child_run_ledger::UNRECORDED_DISPATCH_KINDS_NOTE
+        ),
+    }
+}
+
 async fn handle_get_execution_lineage(
     req_id: Option<serde_json::Value>,
     args: &Value,
@@ -5962,6 +5999,46 @@ async fn handle_get_execution_lineage(
         }
     };
 
+    // ── RFC 0012: the child runs this execution dispatched ───────────────
+    //
+    // The lineage tree above is built from `parent_execution_id` /
+    // `root_execution_id` on `workflow_executions`, and a sub-workflow run
+    // records no row there — measured platform-wide 2026-09-05 and again
+    // 2026-09-06: ZERO rows carry a `parent_execution_id`. So on this fleet
+    // that tree is a single node for EVERY execution, and "this execution has
+    // no parent or child executions" was true only in the sense that nothing
+    // could see them. The ledger can.
+    //
+    // Additive and non-destructive: a read failure renders `child_runs: null`
+    // with a reason, never `[]`, because an empty list here is a claim.
+    let ledger = talos_child_run_ledger::ChildRunLedger::new(state.db_pool.clone());
+    let (child_runs, child_runs_error) = match ledger
+        .list_for_parent(exec_id, user_id, CHILD_RUNS_PER_LINEAGE_ANCHOR)
+        .await
+    {
+        Ok(rows) => (Some(rows), None),
+        Err(e) => {
+            tracing::warn!(
+                execution_id = %exec_id,
+                "get_execution_lineage: child-run ledger unreadable ({})", e
+            );
+            (None, Some("the child-run ledger could not be read"))
+        }
+    };
+    // UNKNOWN is not zero. A `child_runs: []` for an execution that predates
+    // the ledger is "nobody was recording", not "it dispatched nothing", and
+    // the two are told apart by `ledger_since`.
+    let ledger_since = match ledger.since().await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                execution_id = %exec_id,
+                "get_execution_lineage: ledger_since unreadable ({})", e
+            );
+            None
+        }
+    };
+
     let archived_in_lineage = tree.iter().filter(|n| n.archived_at.is_some()).count();
     let nodes: Vec<serde_json::Value> = tree
         .iter()
@@ -5985,12 +6062,45 @@ async fn handle_get_execution_lineage(
         })
         .collect();
 
+    let child_run_items: Option<Vec<serde_json::Value>> = child_runs.as_ref().map(|rows| {
+        rows.iter()
+            .map(|r| {
+                serde_json::json!({
+                    "parent_node_id": r.parent_node_id,
+                    "dispatch_kind": r.dispatch_kind,
+                    "child_workflow_id": r.child_workflow_id.to_string(),
+                    "child_workflow_name": r.child_workflow_name,
+                    "actor_id": r.actor_id.map(|a| a.to_string()),
+                    "depth": r.depth,
+                    "status": r.status,
+                    "started_at": r.started_at.to_rfc3339(),
+                    "completed_at": r.completed_at.to_rfc3339(),
+                    "duration_ms": r.duration_ms,
+                    "error_class": r.error_class,
+                })
+            })
+            .collect()
+    });
+    let child_runs_count = child_run_items.as_ref().map(Vec::len);
+
     let mut report = serde_json::json!({
         "root_execution_id": lineage_root.to_string(),
         "requested_execution_id": exec_id.to_string(),
         "total_executions_in_lineage": nodes.len(),
         "archived_executions_in_lineage": archived_in_lineage,
         "lineage": nodes,
+        // Under the ANCHOR, not folded into `lineage`: these are not
+        // executions and have no execution id, and putting them in a list
+        // whose every other member is a `workflow_executions` row would make
+        // `total_executions_in_lineage` a number nobody can reconcile.
+        "child_runs": child_run_items,
+        "child_runs_count": child_runs_count,
+        "ledger_since": ledger_since.map(|t| t.to_rfc3339()),
+        "child_runs_note": child_runs_note(
+            child_runs_count,
+            ledger_since.is_some(),
+            child_runs_error,
+        ),
         "note": if tree_degraded {
             "The lineage tree could not be read; only the requested execution is shown. \
              This is NOT a statement that it has no parent or children."
@@ -7141,5 +7251,49 @@ mod archived_array_wrap_tests {
     fn a_live_log_array_is_still_a_bare_array() {
         let resp = respond_maybe_archived(None, None, "[]".to_string());
         assert_eq!(text_of(&resp), "[]");
+    }
+}
+
+#[cfg(test)]
+mod child_runs_note_tests {
+    use super::child_runs_note;
+
+    /// UNKNOWN is not zero, and the sentence that says so must actually say
+    /// it. An empty `child_runs` on a ledger with no rows is "nothing was
+    /// recording", and a reader who takes it for "this execution dispatched
+    /// nothing" has been misled by the report — this file's whole class.
+    #[test]
+    fn an_empty_list_on_an_empty_ledger_is_declared_unknown() {
+        let note = child_runs_note(Some(0), false, None);
+        assert!(note.contains("UNKNOWN"), "{note}");
+        assert!(note.contains("not zero"), "{note}");
+    }
+
+    /// A read FAILURE is a third state, and it must not borrow either of the
+    /// other two's wording — `child_runs` is null, and the note says the
+    /// null is not a claim.
+    #[test]
+    fn a_read_failure_says_it_is_not_a_statement_about_dispatches() {
+        let note = child_runs_note(None, true, Some("the child-run ledger could not be read"));
+        assert!(note.contains("could not be read"), "{note}");
+        assert!(
+            note.contains("NOT a statement"),
+            "a failed read must refuse to make the claim: {note}"
+        );
+    }
+
+    /// Every rendering names the dispatch kinds the ledger does not record —
+    /// otherwise a child dispatched only by an agent-loop reads as one that
+    /// never ran.
+    #[test]
+    fn every_rendering_discloses_the_unrecorded_dispatch_kinds() {
+        for note in [
+            child_runs_note(Some(0), false, None),
+            child_runs_note(Some(0), true, None),
+            child_runs_note(Some(3), true, None),
+        ] {
+            assert!(note.contains("agent_loop"), "{note}");
+            assert!(note.contains("capability_dispatch"), "{note}");
+        }
     }
 }

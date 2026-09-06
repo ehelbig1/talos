@@ -16,6 +16,10 @@ sqlx = { version = "0.8", default-features = false, features = ["postgres", "run
 # DESTRUCTIVE draft path and must not treat a workflow somebody dispatches into
 # as a scaffolding leftover. Shared leaf, not a second copy (see #758/#759).
 talos-child-workflow-refs = { path = "../talos-child-workflow-refs" }
+# RFC 0012: the child-run ledger keeps its OWN retention here, because it has
+# no FK to `workflow_executions` — archival is a DELETE plus an INSERT, so a
+# CASCADE would erase the ledger at day 30 while the parent lives to day 60.
+talos-child-run-ledger = { path = "../talos-child-run-ledger" }
 talos-config = { path = "../talos-config" }
 # The ONE draft-substantiveness predicate. `session_start` renders a shaped
 # draft as "ready for publish_version" in the SAME response this sweep runs in,

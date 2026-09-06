@@ -835,6 +835,7 @@ impl ParallelWorkflowEngine {
         &self,
         node_idx: NodeIndex,
         node_id: Uuid,
+        execution_id: Uuid,
         dispatcher: &Arc<dyn NodeDispatcher>,
         worker_shared_key: &Option<WorkerSharedKey>,
         results: &HashMap<Uuid, JsonValue>,
@@ -872,6 +873,10 @@ impl ParallelWorkflowEngine {
                 &on_failure,
                 dispatcher.clone(),
                 worker_shared_key.clone(),
+                talos_workflow_engine_core::ChildRunSite::Node {
+                    execution_id,
+                    node_id,
+                },
             )
             .await,
         )
@@ -884,6 +889,7 @@ impl ParallelWorkflowEngine {
         &self,
         node_idx: NodeIndex,
         node_id: Uuid,
+        execution_id: Uuid,
         dispatcher: &Arc<dyn NodeDispatcher>,
         worker_shared_key: &Option<WorkerSharedKey>,
         results: &HashMap<Uuid, JsonValue>,
@@ -914,6 +920,10 @@ impl ParallelWorkflowEngine {
                 max_retries,
                 dispatcher.clone(),
                 worker_shared_key.clone(),
+                talos_workflow_engine_core::ChildRunSite::Node {
+                    execution_id,
+                    node_id,
+                },
             )
             .await,
         )
@@ -932,6 +942,7 @@ impl ParallelWorkflowEngine {
         &self,
         node_idx: NodeIndex,
         node_id: Uuid,
+        execution_id: Uuid,
         dispatcher: &Arc<dyn NodeDispatcher>,
         worker_shared_key: &Option<WorkerSharedKey>,
         results: &HashMap<Uuid, JsonValue>,
@@ -962,6 +973,10 @@ impl ParallelWorkflowEngine {
                 fallback_wf_id,
                 dispatcher.clone(),
                 worker_shared_key.clone(),
+                talos_workflow_engine_core::ChildRunSite::Node {
+                    execution_id,
+                    node_id,
+                },
             )
             .await,
         )
@@ -1096,6 +1111,10 @@ impl ParallelWorkflowEngine {
                 sub_wf_id,
                 dispatcher.clone(),
                 worker_shared_key.clone(),
+                talos_workflow_engine_core::ChildRunSite::Node {
+                    execution_id,
+                    node_id,
+                },
             )
             .await;
         let elapsed_ms = dispatch_started.elapsed().as_millis() as u64;
@@ -2699,6 +2718,7 @@ impl ParallelWorkflowEngine {
         &self,
         node_idx: NodeIndex,
         node_id: Uuid,
+        execution_id: Uuid,
         dispatcher: &Arc<dyn NodeDispatcher>,
         worker_shared_key: &Option<WorkerSharedKey>,
         results: &HashMap<Uuid, JsonValue>,
@@ -2732,6 +2752,10 @@ impl ParallelWorkflowEngine {
                 judge_wf_id_opt,
                 dispatcher.clone(),
                 worker_shared_key.clone(),
+                talos_workflow_engine_core::ChildRunSite::Node {
+                    execution_id,
+                    node_id,
+                },
             )
             .await,
         )

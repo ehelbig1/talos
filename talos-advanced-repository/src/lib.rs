@@ -625,6 +625,18 @@ pub struct RetentionPassOutcome {
     pub archive_error: Option<String>,
     /// Why the purge tier could not run, if it could not.
     pub purge_error: Option<String>,
+    /// Child-run ledger rows permanently deleted (RFC 0012).
+    ///
+    /// A THIRD tier, not a third window: the ledger has no archive of its own,
+    /// so it is trimmed at the TOTAL execution lifetime
+    /// (`archive_after_days + purge_after_days`). Anything shorter would
+    /// delete the evidence that a child ran while its parent is still
+    /// readable in the archive.
+    pub ledger_purged: u64,
+    /// Why the ledger tier could not run, if it could not. Same rule as the
+    /// two above: `Some(_)` with `0` and `None` with `0` are different
+    /// answers, and collapsing them is what hid a five-month outage.
+    pub ledger_purge_error: Option<String>,
 }
 
 impl RetentionPassOutcome {
@@ -674,6 +686,18 @@ impl RetentionPassOutcome {
                 self.purged
             );
         }
+        if self.ledger_purged > 0 {
+            tracing::info!(
+                target: "talos_engine",
+                event_kind = "child_run_ledger_purged",
+                count = self.ledger_purged,
+                retain_days = self
+                    .windows
+                    .map_or(-1, |w| w.archive_after_days.saturating_add(w.purge_after_days)),
+                "purged {} child-run ledger rows past the total execution lifetime",
+                self.ledger_purged
+            );
+        }
         // An unreported failure is how the five-month outage above
         // stayed invisible. Nothing else in the system can tell
         // "nothing was old enough" from "the move is broken".
@@ -696,6 +720,15 @@ impl RetentionPassOutcome {
                  trimmed and will grow without bound until this succeeds"
             );
         }
+        if let Some(e) = &self.ledger_purge_error {
+            tracing::error!(
+                target: "talos_engine",
+                event_kind = "child_run_ledger_purge_failed",
+                error = %e,
+                "child-run ledger purge FAILED — sub_workflow_runs is NOT being \
+                 trimmed and will grow without bound until this succeeds"
+            );
+        }
     }
 }
 
@@ -703,7 +736,9 @@ impl RetentionPassOutcome {
     /// Did either tier fail?
     #[must_use]
     pub fn failed(&self) -> bool {
-        self.archive_error.is_some() || self.purge_error.is_some()
+        self.archive_error.is_some()
+            || self.purge_error.is_some()
+            || self.ledger_purge_error.is_some()
     }
 }
 
@@ -738,6 +773,23 @@ pub async fn run_retention_pass(
     {
         Ok(n) => outcome.purged = n,
         Err(e) => outcome.purge_error = Some(format!("{e:#}")),
+    }
+    // RFC 0012's third tier. Clocked on the TOTAL lifetime, not on either
+    // window alone: the ledger has no FK to `workflow_executions` (a CASCADE
+    // would erase it at the archival move) and no archive of its own, so
+    // `archive_after_days` would delete the record of a child run while its
+    // parent is still readable in the archive. Its failure does not abort the
+    // others and is reported like theirs.
+    match repo
+        .purge_child_run_ledger(
+            windows
+                .archive_after_days
+                .saturating_add(windows.purge_after_days),
+        )
+        .await
+    {
+        Ok(n) => outcome.ledger_purged = n,
+        Err(e) => outcome.ledger_purge_error = Some(format!("{e:#}")),
     }
 
     outcome
@@ -1109,6 +1161,27 @@ impl AdvancedRepository {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
         Ok(total)
+    }
+
+    /// Tier three of the retention path: trim the child-run ledger
+    /// (`sub_workflow_runs`, RFC 0012).
+    ///
+    /// Delegates to [`talos_child_run_ledger::ChildRunLedger::purge_older_than`]
+    /// — all of the ledger's SQL lives in that leaf crate — which carries the
+    /// same three belts this file's `purge_archived_executions` carries: a
+    /// positive-days guard, a pinned-parent exemption checked against BOTH
+    /// execution tiers, and a `SKIP LOCKED` batch loop.
+    ///
+    /// `days` is the TOTAL execution lifetime, and the caller
+    /// ([`run_retention_pass`]) is the one place that computes it.
+    ///
+    /// # Errors
+    /// Any database failure, propagated rather than swallowed — the same
+    /// reason the two tiers above propagate theirs.
+    pub async fn purge_child_run_ledger(&self, days: i32) -> Result<u64> {
+        talos_child_run_ledger::ChildRunLedger::new(self.db_pool.clone())
+            .purge_older_than(days)
+            .await
     }
 
     /// List archived executions, optionally filtered by workflow_id.
@@ -3814,6 +3887,8 @@ mod retention_report_tests {
             purged: 0,
             archive_error: None,
             purge_error: None,
+            ledger_purged: 0,
+            ledger_purge_error: None,
         }
     }
 
@@ -3830,6 +3905,56 @@ mod retention_report_tests {
             out.contains("execution_archival_failed"),
             "archive failure not reported: {out:?}"
         );
+    }
+
+    /// RFC 0012's third tier reports like the other two. Deleting the
+    /// `ledger_purge_error` branch of `report()` makes this fail — the same
+    /// guard shape the two tiers above carry, added WITH the tier rather than
+    /// after the first silent outage.
+    #[test]
+    fn a_failed_ledger_purge_is_reported_at_error_level() {
+        let out = captured(&RetentionPassOutcome {
+            ledger_purge_error: Some("boom".into()),
+            ..quiet()
+        });
+        assert!(out.contains("ERROR"), "no ERROR-level event: {out:?}");
+        assert!(
+            out.contains("child_run_ledger_purge_failed"),
+            "ledger purge failure not reported: {out:?}"
+        );
+    }
+
+    /// A ledger purge that DID something says so, and a `failed()` outcome
+    /// includes the third tier — otherwise the retention loop's own
+    /// "did retention work" answer is silent about a tier that did not.
+    #[test]
+    fn a_ledger_purge_is_counted_and_a_ledger_failure_counts_as_failed() {
+        let out = captured(&RetentionPassOutcome {
+            ledger_purged: 7,
+            windows: Some(RetentionWindows {
+                archive_after_days: 30,
+                purge_after_days: 60,
+            }),
+            ..quiet()
+        });
+        assert!(
+            out.contains("child_run_ledger_purged"),
+            "a ledger purge that deleted rows must be reported: {out:?}"
+        );
+        assert!(
+            out.contains("90"),
+            "the reported retain_days must be the TOTAL lifetime (30 + 60): {out:?}"
+        );
+        assert!(!RetentionPassOutcome {
+            ledger_purged: 7,
+            ..quiet()
+        }
+        .failed());
+        assert!(RetentionPassOutcome {
+            ledger_purge_error: Some("boom".into()),
+            ..quiet()
+        }
+        .failed());
     }
 
     #[test]

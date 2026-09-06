@@ -86,7 +86,13 @@ async fn a_sub_workflow_node_is_attributed_to_the_sub_workflow() {
     ));
 
     parent
-        .execute_subworkflow_graph(sub_wf_id, serde_json::json!({}), dispatcher, None)
+        .execute_subworkflow_graph(
+            sub_wf_id,
+            serde_json::json!({}),
+            dispatcher,
+            None,
+            talos_workflow_engine_core::ChildRunOrigin::Untracked,
+        )
         .await
         .expect("the sub-workflow runs");
 
@@ -170,7 +176,13 @@ async fn the_parents_own_nodes_keep_the_parents_attribution() {
     // Run the sub-workflow first, then the parent's own graph, through the same
     // engine and the same hook.
     parent
-        .execute_subworkflow_graph(sub_wf_id, serde_json::json!({}), dispatcher.clone(), None)
+        .execute_subworkflow_graph(
+            sub_wf_id,
+            serde_json::json!({}),
+            dispatcher.clone(),
+            None,
+            talos_workflow_engine_core::ChildRunOrigin::Untracked,
+        )
         .await
         .expect("sub runs");
     parent

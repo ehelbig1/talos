@@ -104,6 +104,13 @@ members = [
     "talos-advanced-repository",
     "talos-analytics-repository",
     "talos-child-workflow-refs",
+    # RFC 0012: the child-run ledger. A sub-workflow runs in-process and leaves
+    # no `workflow_executions` row, so this narrow table is the ONLY record
+    # that a child ran. A leaf (sqlx + engine-core types) because its three
+    # consumers — the engine adapter in `talos-engine`, the retention pass in
+    # `talos-advanced-repository`, and the two MCP readers — sit in three
+    # crates with no edge between them.
+    "talos-child-run-ledger",
     "talos-draft-heuristics",
     "talos-actor-repository",
     "talos-engine-events",

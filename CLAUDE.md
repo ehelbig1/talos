@@ -672,6 +672,78 @@ including every fleet total, error rate and cost aggregate. That is a
 platform-wide change, not a report fix, and it is recorded here rather than
 attempted.
 
+**2026-09-06 — the ANSWER: `sub_workflow_runs`, the child-run ledger (RFC 0012 P1).**
+Everything above this line teaches a reader to say *"no evidence"* instead of
+*"never ran"*. None of it can ANSWER the question, and the structural question
+#762 recorded — *should `execute_subworkflow_graph` write a `workflow_executions`
+row?* — is answered NO for the reasons measured there (161 of 163 reads carry no
+`parent_execution_id` filter; `budget_precheck` counts execution rows, so a
+parent with a child would be billed twice; the retention sweep would split one
+tree across two tiers). RFC 0012 takes shape B: a separate, narrow table written
+at the dispatcher chokepoint, with no payload columns, RLS from its first
+migration, and its own retention tier in the existing pass at
+`archive_after_days + purge_after_days` (no FK, because archival is a DELETE plus
+an INSERT and a CASCADE would erase the ledger at day 30 while the parent lives
+to day 60).
+
+**P1 covers**: the migration + RLS, `ChildRunRecorder` in
+`talos-workflow-engine-core`, the leaf repo `talos-child-run-ledger`, the ONE
+chokepoint write, retention, `since()`, and the two smallest honest consumers —
+`get_execution_lineage` gains `child_runs` under the anchor, and
+`get_workflow_reuse_stats.parent_dispatched` gains `child_runs_since_ledger`
+beside `ledger_since`. **P2** is the four uncovered dispatch kinds plus
+readiness / hygiene / the dormant lists; **P3** the SLA monitor and the
+cascading-failure check.
+
+**The RFC's own premise was REFUTED before anything was written, and the
+correction is the part to remember.** `execute_subworkflow_graph` is NOT the one
+path every child takes. Enumerating every `AdapterSet::into_engine_with_graph`
+site — the only way a child graph becomes a running engine — finds THREE: the
+chokepoint, `run_dispatched_subworkflow` (`dispatch`, `capability_dispatch`) and
+the agent-loop body's per-iteration hydration. So P1 records five node kinds
+(`sub_workflow`, `judge`, `ensemble`, `reflective_retry`, `llm_dispatch`) and is
+structurally blind to four. On the reference fleet those four are LATENT — of 36
+workflows the only child-dispatching node kinds present are `sub_workflow` (3)
+and `judge` (3) — and *"latent is not live"* cuts both ways, so the gap is NAMED
+in `talos_child_run_ledger::UNRECORDED_DISPATCH_KINDS` and DISCLOSED by both
+consumers rather than left to read as "this child never ran". The table's CHECK
+admits exactly the five kinds that have a writer: `agent_loop` was in the RFC's
+draft list and is deliberately absent, because a value nothing writes is the same
+defect as a seeded metric label nothing increments.
+
+**Two non-negotiables, recorded so nobody "fixes" them.** (1) A child run is NOT
+charged to the actor's hourly execution budget — the parent's run was budgeted
+when it was created, and `budget_precheck` counts `workflow_executions` rows,
+which this adds none of (pinned by a DB round trip, not a comment). (2) UNKNOWN
+is not zero: the table has a first row, so a count of 0 for a period before
+`ChildRunLedger::since()` is *nobody was recording*, and every consumer renders
+`null` with the reason rather than `0`. `since()` is deliberately NOT user-scoped
+— the question is a deployment fact, and a per-user `MIN` would render UNKNOWN
+forever for a user who has legitimately never dispatched a child, turning a real
+zero into a permanent "we cannot tell".
+
+**Three implementation facts the code forced, all measured first.** The engine
+has NO `execution_id` field (it is a parameter of `run_inner`, and nodes dispatch
+concurrently), so `ChildRunSite { execution_id, node_id }` is threaded from the
+reactor loop through the five `dispatch_*` handlers — an ENUM with an explicit
+`Untracked` variant, not an `Option`, so a sixth handler cannot be added without
+the compiler asking; the WRITE still happens in one place. `org_id` was DROPPED
+from the RFC's table: the engine has no org handle, and the RLS policy joins
+`workflows` for the org exactly as `20260904210000` does, so the column would
+have been decorative and wrong. And `status` is CLASSIFIED with check 77's
+`output_reports_error`, never `.as_bool()` — a child whose engine returned `Ok`
+can still have failed, and the ledger must not disagree with the run about it.
+
+**What is NOT guarded, stated rather than implied.** The chokepoint's own
+`redact_str` on `error_class` is defence in depth on the `Ok` branch —
+`run_scheduler_loop` DLP-scrubs the whole results map on its way out, so
+removing the chokepoint's call does NOT turn the DB test red (measured). It is
+the ONLY pass on the `Err` branch, where the text is an engine error string that
+never met the sanitizer. **No lint check was added and the count stays 86**: the
+one write site is a chokepoint the compiler already funnels every caller
+through, so a "the ledger must be written" detector would have a population of
+ONE and nothing to say.
+
 ## Sub-workflow dispatch (engine)
 
 Every parent node that runs a sub-workflow (judge, ensemble, reflective-retry, llm-dispatch, sub_workflow) uses the shared dispatcher pattern in `controller/src/engine/parallel.rs`:

@@ -94,6 +94,12 @@ pub(super) fn build_controller_engine_registry_only(
     engine.set_judge_score_recorder(Arc::new(
         crate::judge_score_recorder::PostgresJudgeScoreRecorder::new(pool.clone()),
     ));
+    // RFC 0012: without this, a sub-workflow run leaves NO trace anywhere —
+    // not a `workflow_executions` row, not a ledger row — and every reader
+    // that asks "did this workflow run" answers "never".
+    engine.set_child_run_recorder(Arc::new(
+        crate::child_run_recorder::PostgresChildRunRecorder::new(pool.clone()),
+    ));
     engine.set_approval_gate(Arc::new(PostgresApprovalGate::new(pool)));
     engine.set_expression_evaluator(Arc::new(RhaiEvaluator::new()));
     engine.set_output_sanitizer(Arc::new(DlpSanitizer::new()));

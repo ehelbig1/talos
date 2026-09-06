@@ -281,7 +281,18 @@ pub async fn run_contract_test(
             "Sub-workflow contract test (dispatcher build)",
         ))
     })?;
-    let fut = engine.execute_subworkflow_graph(workflow_id, input, dispatcher, worker_shared_key);
+    // RFC 0012: `Untracked`. This is an operator PROBE, not a parent's run —
+    // there is no parent execution and no parent node, so there is nothing
+    // honest to key a child-run ledger row on. Recording one would put a run
+    // in the ledger that no workflow performed, and every consumer that counts
+    // "how often is this child dispatched" would count the author testing it.
+    let fut = engine.execute_subworkflow_graph(
+        workflow_id,
+        input,
+        dispatcher,
+        worker_shared_key,
+        talos_workflow_engine_core::ChildRunOrigin::Untracked,
+    );
     let exec_result = tokio::time::timeout(Duration::from_secs(timeout_secs), fut).await;
 
     let collapsed = match exec_result {
