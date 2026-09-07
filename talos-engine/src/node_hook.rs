@@ -398,9 +398,38 @@ impl NodeLifecycleHook for ControllerNodeHook {
         // shape and actor-binding contract as `__memory_write__`; the
         // whole flow is tokio::spawn'd inside, so node-completion
         // latency is unchanged.
+        //
+        // DELIBERATELY NOT WRITE-CEILING GATED — decided 2026-09-06 (#768),
+        // and the same decision covers step 4 below. #750 gated step 2 and
+        // recorded these two as "an operator policy call"; it is now called.
+        // `actors.max_write_ceiling` governs the ACTOR's own DATA PLANE
+        // (actor_memory, integration state, sandbox SQL). These two protocols
+        // take `ctx.actor_id` for TENANCY — which user/org owns the row — not
+        // because the row is the actor's data: one is a platform diagnostic,
+        // the other a training-example append. Gating them would break the
+        // intended shape of a `readonly` actor, which on this deployment is
+        // precisely the alert-triage actor whose whole purpose is to emit
+        // `__ops_alert__` while being forbidden to mutate anything of its own.
+        // Both are refused only when the actor is ABSENT (no tenancy
+        // principal), which is a different rule and stays.
+        //
+        // Testability, measured rather than assumed: `__ops_alert__` IS
+        // covered by a positive control —
+        // `controller/tests/write_ceiling_hook_gate_tests` drives this hook
+        // with a REAL `readonly` actor and asserts the `ops_alerts` row lands,
+        // so a future "fix" fails loudly. `__ml_distill__` is NOT, and cannot
+        // cheaply be: `spawn_distill_from_output` short-circuits on the
+        // process-global `DISTILL_CONTEXT` OnceLock (settable once per test
+        // BINARY, which sibling tests race — the same objection check 82
+        // records about `controller_write_ceiling_enforced`), and past it the
+        // flow needs an ML MAC key, an embedding provider, a model and a
+        // dataset. The decision is pinned by this comment and by
+        // `talos_security_audit::UNGATED_OUTPUT_PROTOCOLS`, which names BOTH
+        // and is asserted on.
         talos_ml::spawn_distill_from_output(ctx.actor_id, output);
 
         // ── 4. `__ops_alert__` protocol: persist normalized ops-alerts ──
+        // Outside the write ceiling by the same decision — see step 3.
         self.persist_ops_alert_if_present(ctx.actor_id, output);
     }
 

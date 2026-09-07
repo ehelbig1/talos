@@ -217,10 +217,36 @@ module-returned output and the SAME actor binding, also drives
 `__ops_alert__` (→ `ops_alerts`) and `__ml_distill__` (→ ML dataset rows). Both
 take the actor id, both refuse only when it is ABSENT, and neither consults the
 ceiling — i.e. "a module bypasses the ceiling by returning a value" is true of
-three output protocols and #750 gated one. They write different tables with
-different semantics (a diagnostic; training data), so whether `readonly` should
-bar them is an operator policy call, not a memory-write fix. Recorded so the
-population is visible rather than rediscovered.
+three output protocols and #750 gated one.
+
+**DECIDED 2026-09-06: those two stay OUTSIDE the ceiling, and the reports
+now say so.** #750 left it as "an operator policy call"; the call is that
+`actors.max_write_ceiling` governs the ACTOR's own DATA PLANE — actor_memory,
+integration state, sandbox SQL — and these two are PLATFORM ingestion that takes
+the actor id for TENANCY, not because the rows are the actor's data: one is a
+diagnostic, the other a training-example append. The live evidence is the
+decisive part rather than the argument: of 5 `readonly` actors on this fleet
+exactly ONE is `active`, it is bound to exactly ONE enabled workflow, and that
+workflow's whole purpose is to emit `__ops_alert__` through this hook. Gating
+the protocol would take the only live readonly actor's alert pipeline off the
+air — the intended shape is `readonly` PLUS these protocols, not either-or. The
+refusal that stays is the ABSENT-actor one: no actor is no tenancy principal.
+What changed is the REPORTING, because "enforced" with no scope is read as
+"nothing this actor emits reaches the database": `get_module_info`'s
+`write_gated_ops` note, `set_actor_write_ceiling`'s description and
+`security_audit.write_ceiling_enforcement` (detail + a
+`parts.controller_gate.probe.ungated_output_protocols` array, from the single
+`talos_security_audit::UNGATED_OUTPUT_PROTOCOLS`) all name both protocols.
+`controller/tests/write_ceiling_hook_gate_tests` is a POSITIVE CONTROL: a real
+`readonly` actor's `__ops_alert__` must still land a row, so a future "fix"
+fails loudly (mutation-proved — early-returning from
+`persist_ops_alert_if_present` gives `left: 0, right: 1`). `__ml_distill__` gets
+NO equivalent test and the reason is measured, not asserted:
+`spawn_distill_from_output` short-circuits on the process-global
+`DISTILL_CONTEXT` `OnceLock` that sibling tests in one binary race (check 82's
+own objection), and past it the flow needs an ML MAC key, an embedding provider,
+a model and a dataset. Its half of the decision is pinned at the call site in
+`talos-engine/src/node_hook.rs` and in the shared constant only.
 
 **The control's own REPORTING was two defects behind the control (#760).**
 Two, measured 2026-09-05, and they are the same shape one level up — a
@@ -451,7 +477,8 @@ every listing an operator manages it through, under the label "stale".
 shares the same blind predicate and is left as-is: its only consumer is
 `session_start`'s draft DISPLAY, which takes no destructive action (its
 reasoning is in that method's doc comment, along with why it carries no lint
-marker). And `__ops_alert__` / `__ml_distill__` remain as #750 left them.
+marker). And `__ops_alert__` / `__ml_distill__` remain ungated — no longer a
+remainder but a DECISION, argued and reported above.
 
 **The auto-archive remainder is now CLOSED (2026-09-05).** #758 recorded that
 `session_start`'s auto-archive "still archives SUBSTANTIVE drafts — the exact
@@ -733,6 +760,70 @@ from the RFC's table: the engine has no org handle, and the RLS policy joins
 have been decorative and wrong. And `status` is CLASSIFIED with check 77's
 `output_reports_error`, never `.as_bool()` — a child whose engine returned `Ok`
 can still have failed, and the ledger must not disagree with the run about it.
+
+**this change (2026-09-06) — the two smallest consumers say what they measured.** Two report
+surfaces asserted a determinate negative for a state the reader could not
+represent — checks 74/76/79's class again, in the two places RFC 0012 P1 had
+just made representable.
+
+**(B) `get_execution_lineage` contradicted itself in one response.** Its note
+read *"This execution has no parent or child executions — it is a standalone
+run."* fourteen lines below `child_runs_count`, which since #766 can be ≥ 1.
+Both halves were true: the note is a statement about `workflow_executions` ROWS
+and was worded as a statement about the RUN, and "standalone" is exactly the
+reading the ledger exists to remove. `lineage_note` is now a pure function of
+the four facts it may speak about, and the single-node arm is three-valued like
+`child_runs_note` beside it: a measured zero, a count with the reason `lineage`
+cannot show it, and UNKNOWN for an unreadable or not-yet-started ledger — never
+zero, never "standalone". **Latent on this fleet at the time of writing, and the
+brief's own observation could not be re-run**: `sub_workflow_runs` holds exactly
+ONE row, its parent execution row and both workflow rows were deleted (the
+ledger has no FK, by design), so no live execution can currently exhibit
+`count ≥ 1` beside that sentence. The defect is pinned by unit test rather than
+reproduced live, which is worth saying rather than implying otherwise.
+
+**(D) `get_archive_policy` reported one of the two retention windows and
+re-derived it itself.** An execution's readable lifetime is
+`ARCHIVE_AFTER_DAYS` (live → archive) PLUS `EXECUTION_RETENTION_DAYS` (archive →
+gone), 30 + 30 = **60 days** on the default this deployment runs — kept
+deliberately (decision 2026-09-06). The tool rendered the archive tier alone,
+so the purge window and the lifetime were invisible in every tool response,
+while `EXECUTION_RETENTION_DAYS`' NAME reads like the total it is not.
+`docs/configuration-reference.md` explained the 30 + 30 and nothing
+machine-readable did. The handler ALSO carried its own
+`talos_config::archive_after_days()` read, its own JSON parse and its own
+`d > 0` filter — a second implementation of `resolve_retention_windows`, whose
+own doc comment claims to be *"the ONLY place that decides which configured
+number governs which tier"* — and the two had drifted. It now renders from
+`talos_advanced_repository::resolve_retention_policy`, of which
+`resolve_retention_windows` is a projection, so the REPORT and the SWEEP cannot
+answer differently; every pre-existing key keeps its name and value, and
+`set_archive_policy` now states in its response and its description that it
+moves ONE of two windows. **The drift shape was narrower than it looked and the
+first test for it was green over the mutation** — serde strips the JSON
+delimiters, so `'"45"'::jsonb` reaches `as_str()` as `45` and the handler's
+`trim_matches('"')` is a no-op there; it bites only on a jsonb string whose
+CONTENT carries quote characters (`'"\"45\""'::jsonb` → `"45"`), which the
+resolver rejected and the handler accepted. Live population of ANY override on
+the reference fleet 2026-09-06: **ZERO** — `system_settings` held no rows at all
+— so the drift was latent, and the fix is that there is now one parse rather
+than that a live row was wrong. An unreadable setting still REFUSES (#730)
+rather than rendering the windows as null: it makes both reported sources wrong
+at once, and the one number still producible (the env default) is precisely the
+misleading one.
+
+**No lint check was added and `--count` stays 86.** The candidate for (D) —
+*"`talos_config::archive_after_days()` may be read only inside the resolver"* —
+was measured in both directions before it was written: on pristine `origin/main`
+it reports **2** non-test production sites outside `talos-advanced-repository`,
+of which **1** is the real defect and **1** is legitimate
+(`talos_workflow_validation::history_window_days`, which CAPS a display window
+at the archive boundary and decides no retention), i.e. 50% precision over a
+population of two, shipping at one-with-a-marker. Below the bar #765's own
+numbers set, and the structural answer is already stronger: one `pub` resolver,
+the projection above it, and a DB test driving BOTH entry points over the same
+rows. For (A) the guard already exists and is check 56 itself; for (B) the
+population is one.
 
 **What is NOT guarded, stated rather than implied.** The chokepoint's own
 `redact_str` on `error_class` is defence in depth on the `Ok` branch —
@@ -1501,7 +1592,7 @@ shared across MCP and GraphQL ctx. Remaining structural work below:
   53. unguarded wasmtime `Component::new` in `worker/src` — component compilation runs Cranelift codegen IN THE WORKER PROCESS, and wasmtime can PANIC (not `Err`) on certain guest instruction patterns (the aarch64 `value_is_real` lowering bug on jco/StarlingMonkey output; the class is open-ended and per-arch). An unguarded panic unwinds through the whole worker → every in-flight job dies (guest-influenceable DoS). All sites MUST route through `TalosRuntime::compile_component_guarded` (wraps `guard_codegen_panic` = `catch_unwind` → clean per-job error); the one chokepoint is tagged `// allow-unguarded-component-new`
   54. lint self-consistency meta-check — check numbers must be contiguous 1..N and CLAUDE.md's "N checks today" sentence must match `--count` (the count drifted three ways by 2026-07-01: script 49, CLAUDE.md 43, pre-push comment 40)
   55. bare `row.get(`/`r.get(` sqlx reads in DB-layer crates — **must be 0** (a bare `.get` PANICS on NULL/type-drift, killing the tokio task mid-request → caller sees a connection reset; the first workflow-bound webhook's NULL `module_id` took down every `list_webhooks` call this way, #427). The panic-side sibling of check 52 — correct idiom is `try_get(...)?` (same fail-loud, clean error). Introduced 2026-07-08 as a ratchet at 473; **fully burned down the same day (473→0 across all ten DB-layer crates) and GRADUATED to a hard rule**. Scope: repository crates + the check-52 widened family (talos-memory, talos-secrets-manager, talos-registry, talos-module-executions, talos-integration-state, talos-auth) — deliberately NOT mcp-handlers/engine, where `r.get` means serde_json. Do NOT re-add a baseline
-  56. engine built with a literal-None effective actor — `with_effective_actor(None, …)` outside the builder makes an unbound workflow run at the engine's Tier-1 fail-safe on that path while manual triggers resolve the default actor (PR #461: 16h of silent scheduled failures; review found the same defect on retry/replay/webhook/continuation). Resolve via `talos_workflow_authorization::resolve_effective_actor` and bind its answer; opt-out `// allow-unresolved-effective-actor: <reason>`
+  56. engine built with a literal-None effective actor — `with_effective_actor(None, …)` outside the builder makes an unbound workflow run at the engine's Tier-1 fail-safe on that path while manual triggers resolve the default actor (PR #461: 16h of silent scheduled failures; review found the same defect on retry/replay/webhook/continuation). Resolve via `talos_workflow_authorization::resolve_effective_actor` and bind its answer; opt-out `// allow-unresolved-effective-actor: <reason>`. **this change (2026-09-06) removed the last two opt-outs in `talos-mcp-handlers`, and the lesson is about the MARKER rather than the code.** `handle_call_workflow` carried one whose justification text read *"test_workflow's wf-actor-only binding is a documented asymmetry … acceptable for a TEST path"* — `call_workflow` is a production SYNC path the tool docs recommend for inline results, and the marker described a different handler entirely; `handle_bulk_trigger_workflow`'s said the gate plumbing "is tracked as a follow-up". An opt-out is only worth its reason, and neither reason was about the site it sat on. Both now resolve through `crate::utils::resolve_sync_call_effective_actor` — the SAME gate, the SAME `trigger_auth_error_to_response` mapping — ABOVE the row creation, so one value is stamped on the execution row and bound on the engine (the Phase-D2 contract `trigger.rs` has followed since #461). **The consequence was two-sided and measurable**: for an UNBOUND workflow the engine ran at the Tier-1 fail-safe with no tenancy principal (no `__actor_context__`; `__memory_write__` / `__ops_alert__` / `__ml_distill__` all refused for want of an actor; RFC 0012 ledger rows written with `actor_id: null`) while the BEFORE-INSERT trigger `trg_set_default_actor` stamped the user's Default actor on the execution ROW — the row said Default, the engine ran as nobody. **Latent for production, stated plainly**: 6 of 36 workflows on the reference fleet are unbound and every one is a `stress-*` draft (11 executions in 30 days), so no production workflow was affected. **Two behaviour changes, both correct and both new refusals**: the gate can now decline a sync call for an archived/terminated actor, an exhausted execution budget or a capability-ceiling violation on the workflow's own graph — all of which `trigger_workflow` already applied to the same workflow; and passing the resolved actor into `create_execution_under_concurrency_limit` turns on the per-actor advisory-lock budget backstop that both sync paths were skipping with `actor_id: None`. The guard against a revert is this check itself, mutation-proved at both sites
   57. sub-engine built without actor-bind + ceiling narrowing — a sub-engine from `adapter_set().into_engine_with_graph(…)` inherits the PARENT's `actor_id` AND `max_llm_tier`/`max_write_ceiling` verbatim. Two gaps: a sub-workflow bound to a stricter actor silently runs at the looser parent ceiling (the H2 escalation PR #504 closed via ceiling narrowing), AND direct `agent_memory` RPCs inside the sub resolve against the PARENT's actor instead of the sub-workflow's own bound actor — silently disagreeing with the `__actor_context__` injection path (which already uses the sub-actor) and writing memory into the wrong actor (identity axis added 2026-07). Both close at three build sites via the single chokepoint `bind_subengine_actor_and_ceilings` (agent-loop via `resolve_subworkflow_binding` hoisted before the loop). Any non-test file calling `into_engine_with_graph` must reference the binding chokepoint (`bind_subengine_actor_and_ceilings` / `resolve_subworkflow_binding`); opt-out `// allow-unnarrowed-subengine: <reason>` for deliberate parent-context clones. Sub-workflows with NO bound actor keep the parent identity (utility judges/classifiers run in the caller's context). Sibling of checks 29/56
   58. registered-but-never-incremented Prometheus metric (dead metric) — a `TalosMetrics` collector field that is declared + `registry.register()`ed but never mutated stays flat at 0 forever, so any alert/dashboard on it silently never fires (this is exactly how the #570 workflow failure-rate alert would have shipped useless — `talos_workflow_executions_total` had zero `.inc()` sites). For every metric field the check requires a LIVE mutation somewhere in the workspace (`.field … .inc()/.inc_by(nonzero)/.add()/.dec()/.observe()/.set()/.set_to_current_time()`); the `new()` registration + the `.inc_by(0.0)` pre-seed loops use the bare local (no leading dot) so they don't count. **Test code is not production code**: a `#[cfg(test)] mod` region at column 0 is dropped from the haystack, as are whole test-only source files (`src/tests.rs`, `*_tests.rs`, `src/test_support.rs`), so a metric mutated ONLY by a test still reads as dead. That stripping was CLAIMED here (and in the check's own header comment) from the day the check landed but was never implemented — the perl explicitly did the opposite, and the ~90 lines of production code that sit AFTER `crash_recovery.rs`'s test module are why a naive truncate-to-EOF is wrong. The gap was not theoretical: `talos_dek_cache_size` and `talos_module_payload_encryption_failures_total` read as LIVE purely because `talos-metrics`' own `crypto_invariant_metrics_render` unit test touches them — a test written to prove the alerts on them would not silently stop firing — while `TalosDEKCacheOverflow` and `TalosModulePayloadEncryptionFailures` shipped un-fireable for months. Fixed 2026-07-31 (#620) with a region strip that is conservative in the SAFE direction only (a mis-detected region end leaves test code in the haystack — a false negative — and can never swallow production code). Priority order for the burn-down baseline: a dead metric with no alert is debt, a dead metric WITH an alert is a false assurance — burn those first. **Two limits to state rather than imply** (overstating a lint is this same defect one level up): (a) the strip ends a region at the first column-0 `}`, so a multi-line raw string inside a test module ends it EARLY and leaves that module in the haystack — one real instance today, `talos-templates/src/generator.rs`, harmless because the safe direction is a false NEGATIVE; (b) the haystack is TEXTUAL, so an increment wrapped in a helper (`record_outcome`, `publish_dek_cache_size`, `inc_auth_attempt`/`inc_auth_failure`, `inc_payload_crypto_failure`, `inc_secret_decrypt_failure`) reads as live even if NOTHING CALLS THE HELPER — gutting a wrapper body is caught, deleting all its call sites is not (verified by mutation 2026-07-31). Closing (b) needs a call graph, not a grep; the guard for call sites is a per-metric unit test that drives the PRODUCTION path and asserts the counter moved, so ship one with every wrapper-wired metric. The strip carries its own two-direction tripwire, and the OVER-strip landmark must be production code sitting AFTER a `#[cfg(test)] mod` in the SAME file or the assert is vacuous — its first version pointed at `record_workflow_outcome` (above the test mod in `talos-metrics/src/lib.rs`), so a truncate-to-EOF strip left it silent while the check falsely called `crash_recovery_total` dead; it now pins `crash_recovery.rs`'s `record_outcome`. Opt-out `// allow-unincremented-metric: <reason>` on the field's struct-declaration line for a genuinely external/scrape-only collector
   61. signed JSON must be hashed as its EXACT WIRE BYTES — `serde_json`'s f64 round-trip is NOT idempotent (~10% of ordinary computed ratios reparse to a different f64, one ULP off, so `write(parse(write(x)))` differs in content and length). Hashing a signed field as `Sha256(value.to_string())` hashes a form RE-DERIVED on each side: controller hashed `write(x)`, worker hashed `write(parse(write(x)))`, hashes differed, and every job carrying an unstable float failed Ed25519 verification — `pa-autonomy-digest` failed 100% of runs while text payloads passed for weeks (a latent fleet-wide lottery). Normalising to a round-trip "fixed point" was the first fix and is INSUFFICIENT: some floats have no fixed point (`5.455171886890906e-115` cycles forever). **ONE generic type implements the fix for both signed-wire surfaces**: `talos_workflow_job_protocol::RawSigned<T>` — aliased `SignedJson = RawSigned<serde_json::Value>` for dispatch/result payloads, instantiated as `RawSigned<MemoryOp>`/`RawSigned<IntegrationOp>` for the memory / integration-state `Set` ops (#598, the memory-RPC twin, which retired `canonical_json_bytes`/`write_canonical`); `talos_memory::rpc_auth::RawSigned` is a `pub use`, not a second implementation. It carries the exact wire text and hashes it via `raw_bytes()`; construct only via `From<T>` (send side) or deserialization (receive side), and NEVER transcode a message through `serde_json::to_value`/`from_value` (that silently re-derives the bytes — use `to_vec`/`to_string` + `from_slice`/`from_str`). Both surfaces now carry literal wire-format snapshots (`talos-workflow-job-protocol/tests/wire_format_snapshots.rs`, `talos-memory/tests/wire_format_snapshots.rs`: expected JSON + expected MAC hex) — behavioural sign→verify tests cannot catch a CONSISTENT both-sides drift, and the snapshots can. The shared property harness (seeded `arbitrary_json`, the poison-float counterexamples, wire/transcode hop helpers) lives in `talos_workflow_job_protocol::test_support` behind the non-default `test-support` feature; `talos-memory` dev-depends on it. The check fails on a `Sha256`-over-`.to_string()` anywhere in `talos-workflow-job-protocol/src/*.rs` (with or without an intervening `.value()`/`.get()`) AND on any reintroduction of the `canonical_json_bytes`/`write_canonical` identifiers as live code in either crate. Opt-out `// allow-raw-json-hash: <reason>`

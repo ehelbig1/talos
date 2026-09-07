@@ -1204,3 +1204,151 @@ async fn the_config_driven_pass_runs_when_the_window_is_readable() {
         "with a readable window the pass must actually archive: {outcome:?}"
     );
 }
+
+// ── #768: the REPORT and the PASS must read one resolver ────────────────────
+
+/// `get_archive_policy` reported the ARCHIVE tier alone, and it re-derived that
+/// tier itself: its own `talos_config::archive_after_days()` read, its own JSON
+/// parse, its own `d > 0` filter — a second implementation of the function
+/// whose own doc comment says it is *"the ONLY place that decides which
+/// configured number governs which tier"*. The two had already drifted: the
+/// handler's parse trimmed surrounding quotes off a string-valued setting and
+/// the resolver's did not, so a doubly-quoted override would have been honoured
+/// by the REPORT and ignored by the SWEEP.
+///
+/// `resolve_retention_windows` is now a projection of `resolve_retention_policy`,
+/// so the two entry points cannot answer differently. This test drives BOTH over
+/// the same rows — with and without the DB override — and asserts they agree.
+///
+/// MUTATION that turns it red: give `resolve_retention_windows` its own body
+/// again (re-read the envs, re-parse, re-filter) and change any one of the
+/// three; the assertion below compares the two answers directly rather than
+/// each against a constant, so a drift in EITHER direction fails.
+#[tokio::test]
+async fn the_report_and_the_pass_resolve_the_same_two_windows() {
+    use talos_advanced_repository::{resolve_retention_policy, RetentionPolicyDecision};
+
+    let f = fixture().await;
+    let set = |v: serde_json::Value| {
+        let pool = f.pool.clone();
+        async move {
+            sqlx::query(
+                "INSERT INTO system_settings (key, value, updated_at) \
+                 VALUES ('archive_after_days', $1::jsonb, NOW()) \
+                 ON CONFLICT (key) DO UPDATE SET value = $1::jsonb",
+            )
+            .bind(v)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+    };
+    let clear = || {
+        let pool = f.pool.clone();
+        async move {
+            sqlx::query("DELETE FROM system_settings WHERE key = 'archive_after_days'")
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    };
+
+    // Five shapes: no override; a positive override; a non-positive override
+    // that must be IGNORED; a plain jsonb STRING (`"45"`, which both parses
+    // always agreed about); and the shape they did NOT agree about — a jsonb
+    // string whose CONTENT carries quote characters. That distinction was
+    // MEASURED rather than assumed: `serde_json` strips the JSON delimiters,
+    // so `as_str()` on `'"45"'::jsonb` is already `45` and `trim_matches('"')`
+    // is a no-op there; only `'"\"45\""'::jsonb` reaches the parse as `"45"`,
+    // which the resolver's un-trimmed copy rejected and the handler's trimmed
+    // copy accepted. The first version of this test used the plain string and
+    // the drift mutation SURVIVED it.
+    //
+    // Live population of the drift shape on the reference fleet 2026-09-06:
+    // ZERO — `system_settings` held no rows at all — so it is pinned here
+    // rather than discovered later.
+    let quoted_content = serde_json::Value::String("\"45\"".to_string());
+    let shapes: Vec<Option<serde_json::Value>> = vec![
+        None,
+        Some(serde_json::json!(7)),
+        Some(serde_json::json!(0)),
+        Some(serde_json::json!("45")),
+        Some(quoted_content.clone()),
+    ];
+
+    for shape in shapes {
+        match &shape {
+            Some(v) => set(v.clone()).await,
+            None => clear().await,
+        }
+
+        let RetentionPolicyDecision::Resolved(policy) = resolve_retention_policy(&f.pool).await
+        else {
+            panic!("a readable setting must resolve, not skip: {shape:?}");
+        };
+        let RetentionWindowDecision::Run(windows) = resolve_retention_windows(&f.pool).await else {
+            panic!("a readable setting must resolve, not skip: {shape:?}");
+        };
+
+        assert_eq!(
+            policy.windows, windows,
+            "the REPORT's resolver and the PASS's resolver must return the same two \
+             windows for {shape:?} — they are one implementation, and this is what \
+             stops a report from describing a sweep that is not running"
+        );
+        assert_eq!(
+            policy.total_lifetime_days(),
+            windows
+                .archive_after_days
+                .saturating_add(windows.purge_after_days),
+            "the reported lifetime must be the sum of the two windows the pass runs"
+        );
+        assert!(
+            policy.purge_window_is_env_only(),
+            "no system_settings key overrides the purge tier — set_archive_policy \
+             writes only 'archive_after_days'"
+        );
+    }
+
+    // The one shape whose parse used to differ, asserted on its VALUE too: a
+    // jsonb string carrying quote characters must govern, and must govern in
+    // BOTH readers.
+    set(quoted_content).await;
+    let RetentionPolicyDecision::Resolved(policy) = resolve_retention_policy(&f.pool).await else {
+        panic!("resolves");
+    };
+    assert_eq!(
+        policy.windows.archive_after_days, 45,
+        "a quoted integer override is honoured — and now by the sweep as well as \
+         the report, which is the drift this consolidation removes"
+    );
+    assert_eq!(policy.db_archive_setting, Some(45));
+    assert_eq!(policy.db_archive_setting_effective, Some(45));
+    assert_eq!(
+        policy.archive_source(),
+        talos_advanced_repository::ArchiveWindowSource::Database
+    );
+
+    // A non-positive override: stored value visible, effective value absent,
+    // environment governs. The report shows both; collapsing them is the
+    // display/reality drift MCP-759 fixed.
+    set(serde_json::json!(0)).await;
+    let RetentionPolicyDecision::Resolved(policy) = resolve_retention_policy(&f.pool).await else {
+        panic!("resolves");
+    };
+    assert_eq!(policy.db_archive_setting, Some(0), "what is stored");
+    assert_eq!(
+        policy.db_archive_setting_effective, None,
+        "what actually governs"
+    );
+    assert_eq!(
+        policy.windows.archive_after_days,
+        policy.env_archive_default
+    );
+    assert_eq!(
+        policy.archive_source(),
+        talos_advanced_repository::ArchiveWindowSource::Environment
+    );
+
+    clear().await;
+}

@@ -545,12 +545,109 @@ pub enum RetentionWindowDecision {
     SkipUnreadable(String),
 }
 
-/// Resolve both windows: the DB override for the archive tier where present,
-/// the env-derived defaults otherwise.
+/// Where the ARCHIVE window's live value came from. The purge window has no
+/// such enum because it has no second source — see
+/// [`RetentionPolicy::purge_window_is_env_only`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveWindowSource {
+    /// A positive `system_settings.archive_after_days` override is in force.
+    Database,
+    /// No override row, or one that was non-positive and therefore ignored.
+    Environment,
+}
+
+impl ArchiveWindowSource {
+    /// The string the `get_archive_policy` tool has always printed. Kept as a
+    /// method so the two spellings cannot drift.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Database => "database",
+            Self::Environment => "environment",
+        }
+    }
+}
+
+/// The resolved retention policy WITH its provenance — the windows plus the
+/// facts a report needs in order to say where each number came from.
+///
+/// # Why this exists rather than a second reader (#768)
+///
+/// `get_archive_policy` used to re-derive all of this in the MCP handler: its
+/// own `talos_config::archive_after_days()` read, its own JSON parse, its own
+/// `d > 0` filter. Two implementations of a decision this module's own doc
+/// comment claims to own exclusively, and they had already drifted — the
+/// handler's parse trimmed surrounding quotes off a string-valued setting and
+/// this one did not, so a doubly-quoted override would have been honoured by
+/// the REPORT and ignored by the SWEEP. (Measured 2026-09-06: `system_settings`
+/// held ZERO rows, so the drift was latent.) The parse below is now the union
+/// of the two, and it is the only one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetentionPolicy {
+    /// The two windows the retention pass actually runs under.
+    pub windows: RetentionWindows,
+    /// The `system_settings` override AS STORED, before the positivity filter.
+    /// `None` when there is no row (or its JSON is not an integer). Reported
+    /// so a non-positive override is visible rather than silently replaced.
+    pub db_archive_setting: Option<i32>,
+    /// The override AFTER the positivity filter — i.e. the value that actually
+    /// governs, or `None` when the environment default won.
+    pub db_archive_setting_effective: Option<i32>,
+    /// What the environment would give, whether or not it won.
+    pub env_archive_default: i32,
+}
+
+impl RetentionPolicy {
+    /// Where the ARCHIVE window's live value came from.
+    #[must_use]
+    pub fn archive_source(&self) -> ArchiveWindowSource {
+        if self.db_archive_setting_effective.is_some() {
+            ArchiveWindowSource::Database
+        } else {
+            ArchiveWindowSource::Environment
+        }
+    }
+
+    /// How long an execution is READABLE in total: the live tier plus the
+    /// archive tier. This is the number an operator asking "how far back can I
+    /// look?" wants, and it appeared in no tool response before #768 —
+    /// `get_archive_policy` rendered the archive tier alone, while
+    /// `EXECUTION_RETENTION_DAYS`'s NAME reads like the total it is not.
+    ///
+    /// Saturating: both inputs are `positive_env_or_default`-clamped or
+    /// filtered positive, but the sum is reported to an operator and must not
+    /// wrap on a hostile `system_settings` row.
+    #[must_use]
+    pub fn total_lifetime_days(&self) -> i32 {
+        self.windows
+            .archive_after_days
+            .saturating_add(self.windows.purge_after_days)
+    }
+
+    /// The purge window has exactly one source, and a report that leaves this
+    /// implicit invites the reading that `set_archive_policy` moves it.
+    /// `set_archive_policy` writes ONE key, `archive_after_days`; nothing in
+    /// this workspace writes a `system_settings` row for the purge tier.
+    pub const fn purge_window_is_env_only(&self) -> bool {
+        true
+    }
+}
+
+/// What resolving the full policy decided. Same two-valued contract as
+/// [`RetentionWindowDecision`] — an unreadable setting is NOT an unset one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetentionPolicyDecision {
+    Resolved(RetentionPolicy),
+    /// `system_settings.archive_after_days` could not be READ.
+    Unreadable(String),
+}
+
+/// Resolve both windows AND their provenance: the DB override for the archive
+/// tier where present, the env-derived defaults otherwise.
 ///
 /// This function is the ONLY place that decides which configured number
-/// governs which tier.
-pub async fn resolve_retention_windows(pool: &PgPool) -> RetentionWindowDecision {
+/// governs which tier. [`resolve_retention_windows`] is a projection of it.
+pub async fn resolve_retention_policy(pool: &PgPool) -> RetentionPolicyDecision {
     let env_archive_days = talos_config::archive_after_days();
     let purge_after_days = talos_config::execution_retention_days();
 
@@ -564,18 +661,27 @@ pub async fn resolve_retention_windows(pool: &PgPool) -> RetentionWindowDecision
         Ok(v) => v.and_then(|v| {
             v.as_i64()
                 .map(|n| i32::try_from(n).unwrap_or(i32::MAX))
-                .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                // `trim_matches('"')` came from the handler's copy of this
+                // parse; keeping it here is what makes the reporter and the
+                // sweep agree instead of disagreeing silently. The shape it
+                // covers is NARROWER than it looks and was measured, not
+                // assumed: serde already strips the JSON delimiters, so
+                // `'"45"'::jsonb` reaches `as_str()` as `45` and the trim is a
+                // no-op. It bites only on a jsonb string whose CONTENT carries
+                // quote characters (`'"\"45\""'::jsonb` -> `"45"`), which the
+                // un-trimmed parse rejected and the trimmed one accepted.
+                .or_else(|| v.as_str().and_then(|s| s.trim_matches('"').parse().ok()))
         }),
-        Err(e) => return RetentionWindowDecision::SkipUnreadable(e.to_string()),
+        Err(e) => return RetentionPolicyDecision::Unreadable(e.to_string()),
     };
 
     // MCP-758 / MCP-643: a non-positive override binds into
     // `make_interval(days => $1::int)` as "older than now" (or, negative, "older
     // than the future") and archives every completed execution on the next tick.
     // Ignore it loudly rather than obeying it.
-    let archive_after_days = match db_days {
-        Some(d) if d > 0 => d,
-        Some(d) => {
+    let db_days_effective = db_days.filter(|&d| d > 0);
+    if let Some(d) = db_days {
+        if d <= 0 {
             tracing::warn!(
                 target: "talos_engine",
                 event_kind = "archive_after_days_nonpositive_substituted",
@@ -586,15 +692,31 @@ pub async fn resolve_retention_windows(pool: &PgPool) -> RetentionWindowDecision
                  env-derived value",
                 d
             );
-            env_archive_days
         }
-        None => env_archive_days,
-    };
+    }
+    let archive_after_days = db_days_effective.unwrap_or(env_archive_days);
 
-    RetentionWindowDecision::Run(RetentionWindows {
-        archive_after_days,
-        purge_after_days,
+    RetentionPolicyDecision::Resolved(RetentionPolicy {
+        windows: RetentionWindows {
+            archive_after_days,
+            purge_after_days,
+        },
+        db_archive_setting: db_days,
+        db_archive_setting_effective: db_days_effective,
+        env_archive_default: env_archive_days,
     })
+}
+
+/// Resolve just the two windows the retention pass runs under.
+///
+/// A thin projection of [`resolve_retention_policy`] — NOT a second
+/// implementation. The pass has no use for provenance and must not be handed
+/// four interchangeable integers where it needs two named ones.
+pub async fn resolve_retention_windows(pool: &PgPool) -> RetentionWindowDecision {
+    match resolve_retention_policy(pool).await {
+        RetentionPolicyDecision::Resolved(p) => RetentionWindowDecision::Run(p.windows),
+        RetentionPolicyDecision::Unreadable(e) => RetentionWindowDecision::SkipUnreadable(e),
+    }
 }
 
 /// What one retention pass actually did.
@@ -1003,6 +1125,14 @@ impl AdvancedRepository {
     }
 
     // ── Archive policy ────────────────────────────────────────────────────────
+
+    /// The retention policy — both windows and their provenance — through the
+    /// ONE resolver the retention pass itself uses. Reporting surfaces call
+    /// this; nothing outside [`resolve_retention_policy`] may re-read the envs
+    /// or re-apply the positivity filter (#768).
+    pub async fn resolve_retention_policy(&self) -> RetentionPolicyDecision {
+        resolve_retention_policy(&self.db_pool).await
+    }
 
     /// Read the archive_after_days setting from system_settings.
     pub async fn get_archive_policy(&self) -> Result<Option<serde_json::Value>> {
