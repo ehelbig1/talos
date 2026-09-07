@@ -371,6 +371,17 @@ impl OrganizationService {
         let mut tx = db.begin().await.context("Failed to begin transaction")?;
 
         // Lock the relevant rows and count owners atomically.
+        //
+        // The COUNT sits OUTSIDE the locking subquery, and that is not a style
+        // choice (2026-09-07): Postgres refuses `SELECT COUNT(*) … FOR UPDATE`
+        // outright — `ERROR: FOR UPDATE is not allowed with aggregate
+        // functions` — so the aggregate form this carried since MCP-996 made
+        // EVERY call to `remove_member` fail at this line with "Failed to count
+        // owners", whoever the caller and whatever the target. Not a weakened
+        // guard: no member could be removed through this path at all, and the
+        // two last-owner refusals below were unreachable, which is why a
+        // mutation of them survived the suite. `FOR UPDATE` in the subquery
+        // takes the same row locks the original intended.
         let owner_count = sqlx::query_scalar::<_, i64>(
             // `SELECT COUNT(*) … FOR UPDATE` is rejected by Postgres
             // UNCONDITIONALLY (`0A000: FOR UPDATE is not allowed with aggregate
@@ -435,20 +446,39 @@ impl OrganizationService {
                         caller_role
                     ));
                 }
+                // THE last-owner guard. There is exactly one, and the
+                // enumeration below is why (2026-09-07). Until this change a
+                // SECOND arm sat immediately after this block —
+                // `if caller_id == user_id { … "Cannot remove yourself as the
+                // last owner" … }` — and it was DEAD, not merely redundant:
+                // its condition is a strict subset of this one and this arm
+                // returns first, so its message could never reach a caller.
+                // A mutation of THIS arm therefore survived every test — and
+                // the deeper reason is the one the fix above records: the
+                // `COUNT(*) … FOR UPDATE` twelve lines up made the whole
+                // function error before either arm could be reached, so NO test
+                // could distinguish them however it was written.
+                //
+                // The reachable population, enumerated over
+                // (caller role x target role x owner count):
+                //   * `check_org_access(.., Admin)` above admits only an Admin
+                //     or Owner caller, and `caller_role` is re-read INSIDE this
+                //     transaction, so the pair is snapshotted together.
+                //   * the rank rule three lines up refuses any caller whose
+                //     role is below the target's, and `Owner` is the maximum —
+                //     so a target of `Owner` implies a caller of `Owner`.
+                //   * an owner caller and an owner target that are DIFFERENT
+                //     rows make `owner_count >= 2`, which this arm does not
+                //     fire on.
+                // So `target_role == Owner && owner_count <= 1` is reachable
+                // only when `caller_id == user_id`: the sole owner removing
+                // themselves. That is the one case, and this is the one arm
+                // that answers it. Pinned by
+                // `organization_tests::the_sole_owner_cannot_remove_themselves`,
+                // which asserts the MESSAGE and not merely the refusal.
                 if target_role == OrgRole::Owner && owner_count <= 1 {
                     return Err(anyhow!(
                         "Cannot remove the last owner; transfer ownership first"
-                    ));
-                }
-            }
-        }
-
-        // Prevent a caller from removing themselves if they are the last owner.
-        if caller_id == user_id {
-            if let Some(ref role_str) = member_role_str {
-                if OrgRole::from_str(role_str) == Some(OrgRole::Owner) && owner_count <= 1 {
-                    return Err(anyhow!(
-                        "Cannot remove yourself as the last owner; transfer ownership first"
                     ));
                 }
             }
@@ -542,6 +572,10 @@ impl OrganizationService {
                 }
             }
             if current_role == Some(OrgRole::Owner) {
+                // Same aggregate-vs-FOR UPDATE defect as `remove_member`
+                // above, and the same fix. Here it fired only on the DEMOTION
+                // of an owner, so that one operation answered "Failed to count
+                // owners" instead of either succeeding (2+ owners) or refusing.
                 let owner_count = sqlx::query_scalar::<_, i64>(
                     // `SELECT COUNT(*) … FOR UPDATE` is rejected by Postgres
                     // UNCONDITIONALLY (`0A000: FOR UPDATE is not allowed with aggregate

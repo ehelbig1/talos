@@ -1090,7 +1090,11 @@ fn record_chain_verification_outcome(
                 workflow_execution_id = %target.workflow_execution_id,
                 ledger_key_space = LEDGER_KEY_SPACE,
                 dispatch_attempts = attempts,
-                "a job's audit prefix holds one chain PER CONTROLLER DISPATCH ATTEMPT —                  the controller re-dispatched this job_id and the credential-free worker                  could not know it, so each dispatch opened a fresh chain at sequence 1                  against the same genesis. Each is verified as its own chain. This is a                  RETRY, not tamper evidence."
+                "a job's audit prefix holds one chain PER CONTROLLER DISPATCH ATTEMPT — \
+                 the controller re-dispatched this job_id and the credential-free \
+                 worker could not know it, so each dispatch opened a fresh chain at \
+                 sequence 1 against the same genesis. Each is verified as its own \
+                 chain. This is a RETRY, not tamper evidence."
             );
         }
         let duplicates = report

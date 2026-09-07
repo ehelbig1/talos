@@ -144,3 +144,57 @@ async fn test_graphql_unauthenticated_access() {
         err_msg
     );
 }
+
+/// Drives `create_authenticated_org_client` — and through it
+/// `create_test_organization` + `add_user_to_organization` — end to end.
+///
+/// Until 2026-09-07 that chain was three helpers deep and had **zero** callers,
+/// so nothing had ever executed it and its `INSERT INTO organizations (name)`
+/// (omitting the NOT NULL `slug` AND `owner_id`) could not fail anything. A
+/// harness helper nobody runs is not "unused", it is unverified: the first test
+/// to reach for it would have failed on the helper rather than on its subject.
+#[tokio::test]
+async fn org_scoped_client_helper_actually_provisions_an_org() {
+    let ctx = setup_test_context().await;
+
+    let client = common::create_authenticated_org_client(
+        &ctx,
+        "test_org_client@example.com",
+        "Helper Org",
+        "admin",
+        vec![ApiKeyScope::WorkflowsRead],
+    )
+    .await;
+
+    let org_id = client
+        .organization_id
+        .expect("the org-scoped client must carry an organization id");
+
+    // The org row exists and is owned by the client's user.
+    let owner_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT owner_id FROM organizations WHERE id = $1")
+            .bind(org_id)
+            .fetch_one(&ctx.db_pool)
+            .await
+            .expect("the organization row must exist");
+    assert_eq!(owner_id, client.user_id);
+
+    // Exactly one membership row, carrying the role the caller asked for —
+    // `create_org` inserts the owner and `add_user_to_organization` upserts the
+    // requested role onto that same row rather than duplicating it.
+    let roles: Vec<String> =
+        sqlx::query_scalar("SELECT role FROM organization_members WHERE org_id = $1")
+            .bind(org_id)
+            .fetch_all(&ctx.db_pool)
+            .await
+            .expect("membership query");
+    assert_eq!(roles, vec!["admin".to_string()]);
+
+    // And the client is usable for a scoped GraphQL call.
+    let res = client.execute("query { workflows { id } }").await;
+    assert!(
+        res.errors.is_empty(),
+        "org-scoped client should execute a read query: {:?}",
+        res.errors
+    );
+}

@@ -1489,7 +1489,12 @@ pub fn check_audit_chain_verification(
             // job looks like — the shape that used to be reported as CRITICAL.
             let attempts = if *dispatch_attempts > 1 {
                 format!(
-                    " Those record(s) span {dispatch_attempts} CONTROLLER DISPATCH ATTEMPTS of                      this job — the controller re-dispatched the job_id, and the                      credential-free worker cannot read the previous dispatch's ledger, so it                      opened a fresh chain at sequence 1 against the same genesis. Each attempt                      was verified as its own chain. This is a RETRY, not tamper evidence."
+                    " Those record(s) span {dispatch_attempts} CONTROLLER DISPATCH ATTEMPTS \
+                     of this job — the controller re-dispatched the job_id, and the \
+                     credential-free worker cannot read the previous dispatch's \
+                     ledger, so it opened a fresh chain at sequence 1 against the \
+                     same genesis. Each attempt was verified as its own chain. This \
+                     is a RETRY, not tamper evidence."
                 )
             } else {
                 String::new()
@@ -1650,7 +1655,11 @@ fn describe_last_sweep(sweep: Option<talos_audit_ledger::ChainSweepSnapshot>) ->
     // re-dispatch and that the partitioning was applied.
     let base = if s.multi_attempt > 0 {
         format!(
-            "{base} {} of those job chain(s) hold MORE THAN ONE controller dispatch attempt —              the controller re-dispatched the job_id and the credential-free worker opened a              fresh chain at sequence 1 for each dispatch. Each attempt is verified as its own              chain from the same genesis; this is a RETRY, not tamper evidence.",
+            "{base} {} of those job chain(s) hold MORE THAN ONE controller dispatch \
+             attempt — the controller re-dispatched the job_id and the \
+             credential-free worker opened a fresh chain at sequence 1 for each \
+             dispatch. Each attempt is verified as its own chain from the same \
+             genesis; this is a RETRY, not tamper evidence.",
             s.multi_attempt
         )
     } else {

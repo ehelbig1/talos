@@ -8067,55 +8067,74 @@ async fn handle_get_workflow_summary(
     let sub_workflow_ids = talos_workflow_repository::extract_sub_workflow_id_strings(&graph);
 
     // 2. Execution stats (last 7 days)
-    let exec_stats = state
-        .workflow_repo
-        .get_workflow_execution_stats(wf_id, user_id, 7)
-        .await
-        .unwrap_or_else(|_| talos_workflow_repository::WorkflowExecStats::empty());
-    let (total, succeeded, failed, running, avg_duration_secs) = (
-        exec_stats.total,
-        exec_stats.succeeded,
-        exec_stats.failed,
-        exec_stats.running,
-        exec_stats.avg_duration_secs,
+    // Every read below is DISCLOSED, not defaulted (2026-09-07). Pre-fix this
+    // report answered a database failure with the four most reassuring numbers
+    // it can produce — `total: 0` succeeded/failed/running all zero, `versions:
+    // 0`, `active_schedules: 0`, `active_webhooks: 0` — i.e. "this workflow has
+    // never run, has never been published, and nothing triggers it", which is
+    // the exact reading an operator uses to decide a workflow is safe to
+    // retire. Same class and same instrument as `handle_get_system_health`
+    // (#726) and `handle_get_workflow_health`; see `talos_measurement::Readings`.
+    let mut readings = talos_measurement::Readings::new();
+
+    let exec_stats = readings.record(
+        "execution_stats_7d",
+        state
+            .workflow_repo
+            .get_workflow_execution_stats(wf_id, user_id, 7)
+            .await,
     );
-    let success_rate = exec_stats.success_rate_percent();
+    let (total, succeeded, failed, running, avg_duration_secs) = match &exec_stats {
+        Some(s) => (
+            s.total,
+            s.succeeded,
+            s.failed,
+            s.running,
+            s.avg_duration_secs,
+        ),
+        None => (0, 0, 0, 0, None),
+    };
+    let success_rate = exec_stats.as_ref().map(|s| s.success_rate_percent());
 
     // 3. Version info
-    let ver = state
-        .workflow_repo
-        .get_workflow_version_info(wf_id)
-        .await
-        .unwrap_or(talos_workflow_repository::WorkflowVersionInfo {
-            total_versions: 0,
-            latest_version: None,
-            last_published: None,
-        });
-    let (total_versions, latest_version, last_published) =
-        (ver.total_versions, ver.latest_version, ver.last_published);
+    let ver = readings.record(
+        "versions",
+        state.workflow_repo.get_workflow_version_info(wf_id).await,
+    );
+    let (total_versions, latest_version, last_published) = match ver {
+        Some(v) => (Some(v.total_versions), v.latest_version, v.last_published),
+        None => (None, None, None),
+    };
 
     // 4. Active schedules count
-    let schedule_count = state
-        .workflow_repo
-        .get_workflow_schedule_count(wf_id)
-        .await
-        .unwrap_or(0);
+    let schedule_count = readings.record(
+        "active_schedules",
+        state.workflow_repo.get_workflow_schedule_count(wf_id).await,
+    );
 
     // 5. Active webhooks count — find webhooks referencing modules used by this workflow
     let module_uuids: Vec<uuid::Uuid> = module_ids
         .iter()
         .filter_map(|s| s.parse::<uuid::Uuid>().ok())
         .collect();
-    let webhook_count = state
-        .workflow_repo
-        .get_workflow_webhook_count(&module_uuids, user_id)
-        .await
-        .unwrap_or(0);
+    let webhook_count = readings.record(
+        "active_webhooks",
+        state
+            .workflow_repo
+            .get_workflow_webhook_count(&module_uuids, user_id)
+            .await,
+    );
 
     // Batch-resolve module names
+    // Decorative by contrast: the fallback is the literal "unknown" beside the
+    // id the caller already passed in, and no count moves. Kept out of the
+    // ledger deliberately — a disclosure that fires on a cosmetic miss trains
+    // readers to ignore the disclosure.
     let module_names = state
         .workflow_repo
         .get_module_names(&module_uuids)
+        // allow-benign-default: display names only; the ids and every count
+        // beside them are untouched, so the default makes no favourable claim.
         .await
         .unwrap_or_default();
 
@@ -8140,18 +8159,21 @@ async fn handle_get_workflow_summary(
             "timeout_secs": timeout_secs,
             "max_concurrent_executions": max_concurrent,
         },
-        "execution_stats_7d": {
+        // An unreadable stats row nulls the whole block rather than rendering
+        // four zeros: a `total` of 0 and a `total` of "we could not ask" are
+        // the same JSON otherwise.
+        "execution_stats_7d": exec_stats.as_ref().map(|_| serde_json::json!({
             "total": total,
             "succeeded": succeeded,
             "failed": failed,
             "running": running,
-            "success_rate_percent": talos_analytics_repository::format_percent(success_rate),
+            "success_rate_percent": success_rate.map(talos_analytics_repository::format_percent),
             // MCP-79 (2026-05-07): round to 2 decimals via the round_2dp
             // pattern from MCP-30. Pre-fix this leaked the f64 raw
             // precision (e.g. 20.305119) and operators interpreted that
             // as meaningful sub-millisecond accuracy.
             "avg_duration_secs": avg_duration_secs.map(|v| (v * 100.0).round() / 100.0),
-        },
+        })),
         "versions": {
             "current_version": latest_version,
             "total_versions": total_versions,
@@ -8171,6 +8193,8 @@ async fn handle_get_workflow_summary(
             }
         }
     }
+
+    readings.attach(&mut summary);
 
     mcp_text(
         req_id.clone(),

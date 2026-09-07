@@ -109,11 +109,24 @@ async fn require_owned_actor(
             -32000,
             "Actor not found or access denied",
         )),
-        Err(_) => Err(mcp_error(
-            req_id,
-            -32000,
-            "Actor not found or access denied",
-        )),
+        // See `actor::resolve_actor_via_repo` for the argument: an unreadable
+        // ownership row is not an absent one, and the refusal direction (which
+        // was always right here — this gate guards PII in another tenant's
+        // graph) is kept while the DIAGNOSIS stops being false.
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                actor_id = %actor_id,
+                "knowledge-graph actor ownership lookup failed"
+            );
+            Err(mcp_error(
+                req_id,
+                -32000,
+                "Could not verify actor ownership — the actor registry is \
+                 unavailable. This is NOT a statement that the actor is absent \
+                 or that access was denied; retry, and check controller logs.",
+            ))
+        }
     }
 }
 

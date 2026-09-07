@@ -968,11 +968,27 @@ async fn handle_list_executions(
 
     // Parallel count for the pagination envelope. `has_more` lets callers
     // page without a second "did I get everything?" round-trip.
-    let total = state
-        .execution_repo
-        .count_executions(wf_id, user_id)
-        .await
-        .unwrap_or(rows.len() as i64);
+    //
+    // The count is NULLED, not substituted (2026-09-07). Pre-fix a failed COUNT
+    // fell back to `rows.len()` — the PAGE length — so `total` silently became
+    // "however many I happened to return", `has_more` computed to `false` from
+    // it, and a caller paging on that envelope stopped at the first page
+    // believing it had everything. Worse at the default `limit`: an unreadable
+    // count over 4000 executions renders `total: 20, has_more: false`. A count
+    // nobody could take is UNKNOWN, and `has_more` is then unknowable too.
+    let total = match state.execution_repo.count_executions(wf_id, user_id).await {
+        Ok(n) => Some(n),
+        Err(e) => {
+            tracing::error!(
+                workflow_id = %wf_id,
+                error = %e,
+                event_kind = "report_field_not_measured",
+                field = "total",
+                "list_executions: count query failed; total and has_more are null, not the page length"
+            );
+            None
+        }
+    };
 
     let executions: Vec<serde_json::Value> = rows
         .iter()
@@ -1028,18 +1044,33 @@ async fn handle_list_executions(
     // MCP-103 (2026-05-08): emit canonical `count` alongside legacy
     // `total` so envelope tooling that keys on `count` reads this
     // surface uniformly.
-    let has_more = offset + (executions.len() as i64) < total;
+    let has_more = total.map(|t| offset + (executions.len() as i64) < t);
+    let mut envelope = serde_json::json!({
+        "executions": executions,
+        "count": executions.len(),
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+        "has_more": has_more,
+    });
+    if total.is_none() {
+        if let Some(obj) = envelope.as_object_mut() {
+            obj.insert(
+                "measurement".to_string(),
+                serde_json::json!({
+                    "complete": false,
+                    "not_measured": ["total", "has_more"],
+                    "note": "DEGRADED: the execution COUNT could not be read, so `total` and \
+                             `has_more` are null, NOT the page length. `executions` and `count` \
+                             describe this page only and are unaffected. Do not treat a null \
+                             `has_more` as 'no further pages'.",
+                }),
+            );
+        }
+    }
     mcp_text(
         req_id,
-        &serde_json::to_string_pretty(&serde_json::json!({
-            "executions": executions,
-            "count": executions.len(),
-            "total": total,
-            "limit": limit,
-            "offset": offset,
-            "has_more": has_more,
-        }))
-        .unwrap_or_default(),
+        &serde_json::to_string_pretty(&envelope).unwrap_or_default(),
     )
 }
 
@@ -4982,33 +5013,51 @@ async fn handle_get_execution_replay_chain(
     let workflow_id = exec.workflow_id;
     let replayed_from_id = exec.replayed_from_id;
 
+    // Both walks are DISCLOSED, not defaulted (2026-09-07). An empty ancestor
+    // list is this tool's way of saying "this run is the origin of its chain",
+    // and an empty descendant list says "nothing was replayed from it" — two
+    // determinate negatives an operator uses to decide a replay tree is closed.
+    // `.unwrap_or_default()` produced both from a database failure, which is
+    // the same reading #771 removed from `get_execution_lineage`'s
+    // "standalone run" sentence one tool over.
+    let mut readings = talos_measurement::Readings::new();
+
     // Walk backward: use repo chain (walks ancestors via replayed_from_id)
-    let ancestor_chain = state
-        .execution_repo
-        .get_execution_replay_chain(exec_id, user_id, 20)
-        .await
-        .unwrap_or_default();
+    let ancestor_chain = readings.record(
+        "ancestors",
+        state
+            .execution_repo
+            .get_execution_replay_chain(exec_id, user_id, 20)
+            .await,
+    );
     // ancestor_chain is oldest→newest; exclude the execution itself (last element)
-    let ancestors: Vec<String> = ancestor_chain
-        .iter()
-        .filter(|e| e.id != exec_id)
-        .map(|e| e.id.to_string())
-        .collect();
+    let ancestors: Option<Vec<String>> = ancestor_chain.map(|chain| {
+        chain
+            .iter()
+            .filter(|e| e.id != exec_id)
+            .map(|e| e.id.to_string())
+            .collect()
+    });
 
     // Walk forward: find descendants
-    let descendants = state
-        .execution_repo
-        .list_execution_descendants(exec_id, user_id)
-        .await
-        .unwrap_or_default();
+    let descendants = readings.record(
+        "descendants",
+        state
+            .execution_repo
+            .list_execution_descendants(exec_id, user_id)
+            .await,
+    );
 
-    let result = serde_json::json!({
+    let mut result = serde_json::json!({
         "execution_id": exec_id.to_string(),
         "workflow_id": workflow_id.to_string(),
         "replayed_from": replayed_from_id.map(|id| id.to_string()),
         "ancestors": ancestors,
-        "descendants": descendants.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+        "descendants": descendants
+            .as_ref()
+            .map(|d| d.iter().map(|id| id.to_string()).collect::<Vec<_>>()),
     });
+    readings.attach(&mut result);
 
     respond_maybe_archived(
         req_id,

@@ -304,11 +304,26 @@ async fn require_dataset_owner(
     dataset_id: Uuid,
     user_id: Uuid,
 ) -> Result<talos_ml::DatasetTenancy, String> {
-    match svc.dataset_tenancy(conn, dataset_id).await {
-        Ok(t) if t.user_id == user_id => Ok(t),
+    match svc.lookup_dataset_tenancy(conn, dataset_id).await {
+        Ok(Some(t)) if t.user_id == user_id => Ok(t),
         // Single message for not-found AND foreign rows so the surface
-        // can't enumerate other tenants' dataset ids.
-        _ => Err("Dataset not found".to_string()),
+        // can't enumerate other tenants' dataset ids. That argument covers
+        // `Ok(None)` vs `Ok(foreign)` and says nothing about `Err` — a read
+        // that FAILED is not a row that is absent, and collapsing it here told
+        // the operator their dataset was gone during a database incident
+        // (2026-09-07). The refusal stays; only the diagnosis changes, and the
+        // enumeration property is untouched because the new message is
+        // dataset-independent.
+        Ok(_) => Err("Dataset not found".to_string()),
+        Err(e) => {
+            tracing::error!(error = %e, %dataset_id, "dataset tenancy lookup failed");
+            Err(
+                "Could not verify dataset ownership — the dataset registry is \
+                 unavailable. This is NOT a statement that the dataset is absent; \
+                 retry, and check controller logs."
+                    .to_string(),
+            )
+        }
     }
 }
 
