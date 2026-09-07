@@ -398,8 +398,8 @@ jobs:
           MINIO_ROOT_PASSWORD=ci-minio-root-pw-not-a-real-secret
           MINIO_CONTROLLER_USER=cictrl
           MINIO_CONTROLLER_PASSWORD=ci-minio-ctrl-pw-not-a-real-secret
-          MINIO_WORKER_USER=ciwrk
-          MINIO_WORKER_PASSWORD=ci-minio-wrk-pw-not-a-real-secret
+          MINIO_VERIFIER_USER=civfy
+          MINIO_VERIFIER_PASSWORD=ci-minio-vfy-pw-not-a-real-secret
           EOF
 
       - name: Build controller + worker images (parallel via compose)

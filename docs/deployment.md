@@ -51,6 +51,15 @@ The production overlay:
 
 ## Required Environment Variables
 
+> **`docs/configuration-reference.md` is the authoritative variable list** —
+> every variable, its default, which PROCESS reads it, and whether it is
+> sensitive. The tables below are the deploy-time subset and must agree with
+> it; where they disagree, that file wins. (They had drifted: until
+> 2026-09-07 the "Optional Configuration" table and the "S3 / MinIO"
+> section below both described the four `S3_*` variables as the audit
+> ledger's, which they have never been.)
+
+
 ### Controller
 
 | Variable | Description | Example |
@@ -98,8 +107,8 @@ The production overlay:
 | `STUCK_EXECUTION_TIMEOUT_MINS` | `30` | Minutes before marking stuck executions |
 | `EXECUTION_CHECKPOINTING_ENABLED` | `false` | Persist per-node checkpoints so an interrupted run resumes from the last node instead of restarting (see RFC 0003). Requires `WORKER_SHARED_KEY`. |
 | `CHECKPOINT_EVERY_N_NODES` | `1` | Checkpoint cadence when enabled — save every Nth node completion. Raise on large graphs to cut re-encryption cost (resume then re-runs up to N trailing nodes). |
-| `GRAPHQL_MAX_DEPTH` | `10` | Max GraphQL query nesting depth |
-| `GRAPHQL_MAX_COMPLEXITY` | `5000` | Max GraphQL query complexity score |
+| ~~`GRAPHQL_MAX_DEPTH`~~ | n/a | **Not a variable.** The depth limit is hardcoded `limit_depth(15)` in `controller/src/bootstrap/services.rs`; nothing reads this name. The `10` documented here until 2026-09-07 was not even the live value. Setting it changes nothing |
+| ~~`GRAPHQL_MAX_COMPLEXITY`~~ | n/a | **Not a variable.** Hardcoded `limit_complexity(5000)` in the same builder. The number was right; the knob never existed |
 | `TRUSTED_IPS` | (none) | IPs that bypass rate limiting |
 | `TRUSTED_PROXY_CIDRS` | (none) | Reverse proxy CIDRs for X-Forwarded-For |
 | `COMPILE_DIR` | `/tmp/talos-compilations` | Directory for WASM compilation artifacts |
@@ -107,10 +116,10 @@ The production overlay:
 | `ANTHROPIC_API_KEY` | (none) | Enable LLM features (Anthropic Claude) |
 | `OPENAI_API_KEY` | (none) | Enable LLM features (OpenAI GPT) |
 | `GEMINI_API_KEY` | (none) | Enable LLM features (Google Gemini) |
-| `S3_ENDPOINT` | (none) | S3-compatible storage endpoint URL |
-| `S3_ACCESS_KEY_ID` | (none) | S3 access key ID |
-| `S3_SECRET_ACCESS_KEY` | (none) | S3 secret access key |
-| `S3_REGION` | `us-east-1` | S3 region |
+| `S3_ENDPOINT` | (none) | **Worker only.** Endpoint for the `talos:core/object-storage` WIT host functions, which only `automation-node` modules may import. Nothing to do with the audit ledger — see "S3 / MinIO" below |
+| `S3_ACCESS_KEY_ID` | (none) | Access key for the same module-facing object store |
+| `S3_SECRET_ACCESS_KEY` | (none) | Secret key for the same |
+| `S3_REGION` | `us-east-1` | Region for the same |
 | `EMAIL_API_URL` | (none) | SendGrid-compatible email API endpoint |
 | `EMAIL_API_KEY` | (none) | Email service API key |
 | `EMAIL_FROM` | (none) | Default sender email address |
@@ -328,16 +337,66 @@ scrape_configs:
 
 ## S3 / MinIO Configuration
 
-Talos uses S3-compatible object storage for the audit ledger and module artifact storage. Configure via environment variables:
+**`docs/configuration-reference.md` is the authoritative variable list.** The
+tables here name the same variables and must agree with it; when they do not,
+that file wins. What this section adds is *which subsystem each set belongs
+to*, because there are TWO unrelated object-storage users in this platform and
+they read DIFFERENT variables.
 
-| Variable | Description | Example |
-|----------|-------------|---------|
-| `S3_ENDPOINT` | S3-compatible endpoint URL | `http://minio:9000` |
-| `S3_ACCESS_KEY_ID` | Access key ID | `minioadmin` |
-| `S3_SECRET_ACCESS_KEY` | Secret access key | `minioadmin` |
-| `S3_REGION` | AWS region (or `us-east-1` for MinIO) | `us-east-1` |
+Corrected 2026-09-07. This section previously said "Talos uses S3-compatible
+object storage for the audit ledger and module artifact storage" and then
+listed `S3_ENDPOINT` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` /
+`S3_REGION`. Both halves of that sentence were wrong, and the failure was
+silent: an operator on AWS who set exactly those four got no error and a
+**dark audit ledger**, because the ledger does not read any of them.
 
-For local development, the default Docker Compose setup includes a MinIO instance. For production, use AWS S3 or a self-hosted MinIO cluster with TLS and non-default credentials.
+### (a) The WORM audit ledger — controller only
+
+Written by `talos-audit-ledger` in the CONTROLLER process. The WORKER
+publishes audit events to the NATS subject `talos.audit.ledger` and never
+touches the object store; it carries no S3 identity for it.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `AWS_ENDPOINT_URL` | (none) | Endpoint. `MINIO_ENDPOINT` is the fallback spelling; empty is treated as unset. **If neither is set there is no ledger store at all** and both the writer and the verifier report `NoEndpoint` |
+| `MINIO_ENDPOINT` | (none) | Fallback for the above |
+| `MINIO_BUCKET` | `audit-logs` | Bucket name |
+| `AWS_S3_FORCE_PATH_STYLE` | `false` | Required `true` for MinIO |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | SDK chain | The **writer**, read implicitly by `aws_config::load_defaults`. On this platform they are the `audit_write_only` identity (`s3:PutObject` and nothing else) |
+| `AUDIT_VERIFIER_ACCESS_KEY_ID` / `AUDIT_VERIFIER_SECRET_ACCESS_KEY` | (none) | The **verifier**, resolved EXPLICITLY with no `load_defaults` on the path. Both halves required |
+| `AWS_REGION` / `AWS_DEFAULT_REGION` | `us-east-1` (verifier) | Region. Note the asymmetry: the verifier resolves these itself and falls back to `us-east-1`; the writer takes whatever the SDK's own chain resolves, so a deployment that sets neither can have a writer that errors on region and a verifier that quietly assumes one |
+| `TALOS_AUDIT_S3_OBJECT_LOCK` / `TALOS_AUDIT_S3_RETENTION_DAYS` | (none) | Object-Lock posture on written objects |
+| `AUDIT_CHAIN_SWEEP_INTERVAL_SECS` | `3600` | Chain-verification sweep cadence; `0` disables it |
+
+The two identities are the subject of the next subsection and must not be
+merged.
+
+### (b) The module-facing object store — worker only
+
+`S3_ENDPOINT` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` / `S3_REGION` are
+read by `talos-worker-runtime` (`context.rs`) and feed the
+`talos:core/object-storage` WIT host functions — `put` / `get` / `delete` /
+`list_objects` called BY A WASM MODULE. That interface is imported only by the
+`automation-node` world, and the host functions refuse
+(`Error::NotConfigured`) for any module whose resolved capability world is not
+`Trusted`, so leaving all four unset is the correct posture unless you are
+deliberately handing Trusted modules a bucket. They are unset in
+`docker-compose.yml` and in the Helm chart.
+
+**Module artifacts do not live in S3 at all.** Compiled WASM is stored in
+Postgres (`modules.wasm_bytes`) and distributed through the OCI template
+registry (`TALOS_REGISTRY_URL`). Nothing in this workspace writes a module
+artifact to an object store.
+
+### (c) `talos-offhost-backup`
+
+A separate binary with its own `AWS_*` credentials and its own target bucket
+(see `docs/backup-restore.md`). It is not configured by either set above.
+
+For local development, the default Docker Compose setup includes a MinIO
+instance and provisions (a)'s two identities via the `minio-init` container.
+For production, use AWS S3 or a self-hosted MinIO cluster with TLS and
+non-default credentials.
 
 ### The audit bucket has TWO identities, deliberately
 

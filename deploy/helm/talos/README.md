@@ -67,12 +67,14 @@ and set `bootstrapSecret.enabled: false`.
 | `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` | MinIO superuser | Random strings; 24+ chars | Rotate; restart minio statefulset |
 | `MINIO_CONTROLLER_USER` / `MINIO_CONTROLLER_PASSWORD` | Least-privilege **write-only** user for audit-logs bucket (`audit_write_only`: `s3:PutObject` only — it CANNOT list or get, by design) | Random strings | Rotate; update and restart controller |
 | `MINIO_VERIFIER_USER` / `MINIO_VERIFIER_PASSWORD` | Least-privilege **read-only** user for the audit-chain verifier (`audit_read_only`: `s3:ListBucket` + `s3:GetObject`, no Put/Delete). Reaches the controller as `AUDIT_VERIFIER_ACCESS_KEY_ID`/`AUDIT_VERIFIER_SECRET_ACCESS_KEY`. **Without it the WORM ledger is written and never verified** — `security_audit`'s `audit_chain_verification` check reports exactly that | Random strings | Rotate; update and restart controller |
-| `MINIO_WORKER_USER` / `MINIO_WORKER_PASSWORD` | Least-privilege worker writer | Random strings | As above |
 | `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | Tier-2 LLM provider keys | From provider console | Rotate in provider; the LlmClient's 60s cache propagates to both controller scaffolding and worker sandbox |
 | `EMBEDDING_API_URL` / `EMBEDDING_API_KEY` | Hosted embeddings | From provider console | Leave blank to use in-cluster Ollama |
 | `GOOGLE_CLIENT_ID/SECRET`, `GMAIL_*`, `SLACK_*`, `ATLASSIAN_*`, `OKTA_*`, `SNYK_*` | OAuth clients | Provider developer consoles | Per provider policy |
 | `ADMIN_SECRET_KEY` | Admin-only operator endpoints gate | `openssl rand -hex 32` | Leave empty in production; set only during active ops work |
 | `TOTP_ISSUER` | Shown on TOTP provisioning QR codes | Any string | Rarely |
+
+
+**There is no worker MinIO identity, deliberately.** The worker publishes audit events to the NATS subject `talos.audit.ledger` and never touches the object store; no line in `worker/src` or `talos-worker-runtime/src` reads `AWS_*` or `MINIO_*`. A `MINIO_WORKER_USER` / `MINIO_WORKER_PASSWORD` pair was carried here, in `values.yaml`, in the worker Deployment, in `install.sh`, in `docker-compose.yml` and in `.env.example` until 2026-09-07, described in this table as a "least-privilege worker writer" — and `minio-init` had never created that user, so it named no principal at all. If an existing bootstrap Secret still carries those two keys they are now unreferenced and inert; they can be dropped at the next rotation.
 
 ### Generating all keys at once
 
@@ -94,8 +96,6 @@ MINIO_CONTROLLER_USER=$(openssl rand -hex 12)
 MINIO_CONTROLLER_PASSWORD=$(openssl rand -hex 32)
 MINIO_VERIFIER_USER=$(openssl rand -hex 12)
 MINIO_VERIFIER_PASSWORD=$(openssl rand -hex 32)
-MINIO_WORKER_USER=$(openssl rand -hex 12)
-MINIO_WORKER_PASSWORD=$(openssl rand -hex 32)
 EOF
 ```
 

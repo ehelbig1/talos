@@ -31,9 +31,10 @@ pub use child_ledger::{
     READINESS_WINDOW_DAYS,
 };
 pub use readiness_basis::{
-    child_exclusion_is_complete, score_readiness, ChildLedgerEvidence, ReadinessBasis,
-    ReadinessComponents, ReadinessOutcome, CHILD_MEASURABLE_MAX, CHILD_UNMEASURED_REASON, FULL_MAX,
-    LEDGER_MIN_RUNS,
+    child_exclusion_is_complete, child_unmeasured_reason, score_readiness, ChildLedgerEvidence,
+    ReadinessBasis, ReadinessComponents, ReadinessOutcome, CHILD_MEASURABLE_MAX,
+    CHILD_UNMEASURED_REASON, DOCUMENTATION_MAX, FRESHNESS_MAX, FULL_MAX, LEDGER_MIN_RUNS,
+    RELIABILITY_MAX, RISK_MAX,
 };
 pub use readiness_state::{classify_readiness_state, ReadinessScorer, ReadinessState};
 pub use sla_window::{

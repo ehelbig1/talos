@@ -1,20 +1,20 @@
 //! Print the controller's GraphQL SDL to stdout.
 //!
 //! Refreshes the checked-in `frontend/schema.graphql` snapshot that
-//! graphql-codegen reads offline (see `frontend/codegen.yml`). SDL is
-//! derived from the type registry alone, so no runtime `.data()` context
-//! is needed. Run from the repo root:
+//! graphql-codegen reads offline (see `frontend/codegen.yml`). Run from the
+//! repo root:
 //!
 //! ```sh
-//! cargo run -p talos-api --bin dump_schema > frontend/schema.graphql
+//! cargo run -q -p talos-api --bin dump_schema > frontend/schema.graphql
+//! (cd frontend && npm run codegen)
 //! ```
+//!
+//! The schema is built by `talos_api::schema_sdl` and NOT inline here, so the
+//! bytes this binary emits are the same bytes
+//! `schema_snapshot_tests::the_checked_in_snapshot_matches_the_compiled_schema`
+//! compares the snapshot against. Two expressions for "the schema" is how the
+//! writer and the checker drift apart.
 
 fn main() {
-    let schema = async_graphql::Schema::build(
-        talos_api::schema::QueryRoot::default(),
-        talos_api::schema::MutationRoot::default(),
-        talos_api::schema::SubscriptionRoot,
-    )
-    .finish();
-    print!("{}", schema.sdl());
+    print!("{}", talos_api::schema_sdl());
 }

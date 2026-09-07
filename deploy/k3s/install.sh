@@ -340,8 +340,6 @@ else
     MINIO_ROOT_PASSWORD=$(rand_b64_pw)
     MINIO_CONTROLLER_USER="controller"
     MINIO_CONTROLLER_PASSWORD=$(rand_b64_pw)
-    MINIO_WORKER_USER="worker"
-    MINIO_WORKER_PASSWORD=$(rand_b64_pw)
     # The audit-chain VERIFIER — a SEPARATE, read-only identity for the
     # controller's chain-verification sweep. It must NOT be the controller
     # user above: that one carries `audit_write_only` (s3:PutObject only), so
@@ -349,6 +347,10 @@ else
     # `minio-provisioning` Job creates both users and both policies.
     MINIO_VERIFIER_USER="audit-verifier"
     MINIO_VERIFIER_PASSWORD=$(rand_b64_pw)
+    # There is NO worker identity. The worker publishes audit events over
+    # NATS and never touches the object store; a MINIO_WORKER_USER pair was
+    # generated and stored here until 2026-09-07 for a principal no `mc admin
+    # user add` has ever created. Do not re-add it.
 
     # Worker /metrics endpoint requires a bearer token; comma-separated to
     # allow rotation. One token is enough for first deploy — operators can
@@ -384,8 +386,6 @@ else
         --from-literal=MINIO_CONTROLLER_PASSWORD="$MINIO_CONTROLLER_PASSWORD"
         --from-literal=MINIO_VERIFIER_USER="$MINIO_VERIFIER_USER"
         --from-literal=MINIO_VERIFIER_PASSWORD="$MINIO_VERIFIER_PASSWORD"
-        --from-literal=MINIO_WORKER_USER="$MINIO_WORKER_USER"
-        --from-literal=MINIO_WORKER_PASSWORD="$MINIO_WORKER_PASSWORD"
         --from-literal=METRICS_AUTH_TOKENS="$METRICS_AUTH_TOKENS"
         --from-literal=ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
         --from-literal=OPENAI_API_KEY="${OPENAI_API_KEY:-}"

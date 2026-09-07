@@ -244,13 +244,52 @@ impl ChildLedgerEvidence {
 /// order they are rendered.
 pub const EXECUTION_DERIVED_COMPONENTS: &[&str] = &["reliability", "freshness"];
 
-/// The one sentence every surface uses for why those two are unmeasurable.
-/// Shared so three reports cannot describe the same fact three ways.
+/// Why the two execution-derived components are unmeasurable when NOTHING can
+/// speak for them — no `workflow_executions` row and no child-run ledger
+/// evidence either.
+///
+/// **Use [`child_unmeasured_reason`] on any per-workflow surface.** This
+/// constant asserts *"read from that table and from nothing else"*, which
+/// stopped being true for a child the ledger holds ANY rows for. Rendering it
+/// beside `ledger_runs: 1` is the report contradicting itself in the same
+/// object — the ledger IS a second source; what is missing there is not a
+/// source but enough of it. It remains correct, and is kept, for the
+/// POPULATION-level `why` in `get_all_readiness_scores`, where there is no one
+/// child's evidence to speak about.
 pub const CHILD_UNMEASURED_REASON: &str =
     "A parent dispatches into this workflow as a sub-workflow, which runs in-process and \
      records no workflow_executions row. Reliability and freshness are read from that table \
      and from nothing else, so they are UNMEASURABLE here — not zero. The score is out of the \
      measurable components only and is not comparable to a full-scale score.";
+
+/// The per-workflow version of the sentence above: three-valued, because the
+/// three states are three different facts.
+///
+/// * ledger NOT consulted, or consulted and holding nothing for this child —
+///   [`CHILD_UNMEASURED_REASON`] verbatim, which is exactly true there.
+/// * ledger holds runs but FEWER than [`LEDGER_MIN_RUNS`] — the components are
+///   readable from a SECOND source and the shortfall is the count, not the
+///   source. Saying "from that table and from nothing else" here is false in a
+///   way the same response refutes two fields up.
+/// * at or above the floor there is no unmeasured reason at all, because the
+///   basis is [`ReadinessBasis::LedgerMeasured`] and both components are
+///   scored.
+#[must_use]
+pub fn child_unmeasured_reason(ledger: Option<&ChildLedgerEvidence>) -> String {
+    match ledger {
+        Some(ev) if ev.runs > 0 && !ev.meets_floor() => format!(
+            "A parent dispatches into this workflow as a sub-workflow, which runs in-process \
+             and records no workflow_executions row. The child-run ledger (sub_workflow_runs) \
+             CAN see those runs and holds {} of them here — a second source, so this is not \
+             an absence of evidence — but that is below the {}-run floor at which a success \
+             RATE is a rate rather than an anecdote. Reliability and freshness are therefore \
+             left UNSCORED rather than computed from too little, the score is out of the \
+             measurable components only, and it is NEVER scaled up to 100.",
+            ev.runs, LEDGER_MIN_RUNS
+        ),
+        _ => CHILD_UNMEASURED_REASON.to_string(),
+    }
+}
 
 /// Which scale a readiness score is on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -453,7 +492,7 @@ impl ReadinessOutcome {
                     self.score,
                     self.max_points,
                     parents.join(", "),
-                    CHILD_UNMEASURED_REASON,
+                    child_unmeasured_reason(ledger.as_ref()),
                     ledger_clause
                 ))
             }

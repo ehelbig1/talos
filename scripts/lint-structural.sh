@@ -3902,13 +3902,34 @@ echo
 # crates via the check-52 playbook) and GRADUATED to a HARD RULE: the count
 # must stay 0 — any new bare `.get` sqlx read in a DB-layer crate is an
 # outright failure. Convert with `try_get(...)?`; do NOT re-add a baseline.
-bold "▶ check 55: bare row.get() sqlx reads in DB-layer crates (must be 0)"
+#
+# WIDENED 2026-09-07 to `controller/src/bootstrap/` + `controller/src/main.rs`,
+# and the reason is that a panic THERE is worse than the request-path panic
+# this check was built for. The SLA-breach monitor in
+# `controller/src/bootstrap/background.rs` decoded the NULLABLE
+# `workflow_sla_thresholds.notification_webhook` with
+# `Row::get::<String, _>(..)` inside a `tokio::spawn`ed loop. The NULL is not a
+# corner case — it is the DOCUMENTED API-polling configuration that migration
+# `20260404000001_nullable_sla_notification_webhook.sql` exists to allow and
+# that `set_workflow_sla_threshold` writes. One such row panics the task, and
+# a spawned task has no caller to return the reset to, nothing that restarts
+# it and nothing that logs its death: the alerter is simply off for the
+# process lifetime, and every surface still reports thresholds as configured.
+# The original scope is DB-LAYER CRATES, so it structurally could not see a
+# controller-bin file — the population was 5 and the check was green.
+#
+# `bootstrap/` and `main.rs` qualify on the same evidence the DB-layer crates
+# do: measured on the pre-fix tree, `r`/`row`/`rec`/`record`.get("…") in these
+# paths is a sqlx row read in 5 of 5 occurrences and a serde_json `.get` in 0 —
+# which is exactly why mcp-handlers and the engine are still OUT of scope.
+bold "▶ check 55: bare row.get() sqlx reads in DB-layer crates + controller bootstrap (must be 0)"
 BARE_ROW_GET_BASELINE=0
 BARE_ROW_GET_SCOPE="talos-actor-repository talos-advanced-repository talos-analytics-repository \
     talos-execution-repository talos-github-repository talos-module-repository \
     talos-webhook-repository talos-worker-identity-repository talos-workflow-repository \
     talos-schedule-repo talos-memory talos-secrets-manager talos-registry \
-    talos-module-executions talos-integration-state talos-auth talos-ml"
+    talos-module-executions talos-integration-state talos-auth talos-ml \
+    controller/src/bootstrap controller/src/main.rs"
 # shellcheck disable=SC2086
 BARE_ROW_GET_COUNT="$( { grep -rEc '(row|r)\.get(::<[^(]*>)?\("' \
         --include='*.rs' \
@@ -3918,15 +3939,17 @@ BARE_ROW_GET_COUNT="$( { grep -rEc '(row|r)\.get(::<[^(]*>)?\("' \
 # when preceded by "try_" — the regex above does NOT match try_get, but keep the
 # guard cheap and explicit in case of drift)
 if [ "$BARE_ROW_GET_COUNT" -gt "$BARE_ROW_GET_BASELINE" ]; then
-    red "✗ ${BARE_ROW_GET_COUNT} bare row.get() sqlx read(s) in DB-layer crates (must be 0):"
+    red "✗ ${BARE_ROW_GET_COUNT} bare row.get() sqlx read(s) in DB-layer crates / controller bootstrap (must be 0):"
     # shellcheck disable=SC2086
     grep -rEn '(row|r)\.get(::<[^(]*>)?\("' --include='*.rs' $BARE_ROW_GET_SCOPE 2>/dev/null | sed 's/^/    /'
     yellow "  → a bare .get panics on NULL/type-drift and kills the request task (connection"
     yellow "    reset — the #427 list_webhooks incident). Use .try_get(\"col\")? — or, for"
     yellow "    NULLABLE columns, .try_get::<Option<_>, _>(\"col\")? with an explicit default."
+    yellow "    In controller/src/bootstrap/ the caller is a spawned loop with NOBODY waiting:"
+    yellow "    decode the row into a Result and warn-and-continue, do not let it unwind."
     EXIT_CODE=1
 else
-    green "✓ no bare row.get() sqlx reads in DB-layer crates (hard rule, graduated from the 473-site ratchet)"
+    green "✓ no bare row.get() sqlx reads in DB-layer crates or controller bootstrap (hard rule, graduated from the 473-site ratchet)"
 fi
 echo
 

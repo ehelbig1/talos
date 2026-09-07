@@ -424,6 +424,27 @@ jobs:
 
       - run: npm ci
 
+      - name: Codegen snapshot is current
+        # `src/generated/{schema,graphql}.ts` are DERIVED from
+        # `frontend/schema.graphql` by graphql-codegen. `talos-api`'s
+        # `schema_snapshot_tests` pins the INPUT against the compiled Rust
+        # schema; nothing pinned the OUTPUT, and on 2026-09-07 both were six
+        # weeks stale TOGETHER — they drift in lockstep, which is exactly why
+        # neither noticed.
+        #
+        # None of the other steps in this job can see it: eslint EXCLUDES
+        # `src/generated/**` (eslint.config.js), and `tsc --noEmit` only fails
+        # if some file references a type the stale output is MISSING — a
+        # snapshot that merely lacks new types typechecks perfectly.
+        #
+        # Deliberately here and NOT in `make lint-frontend`: that target skips
+        # itself when `frontend/node_modules` is absent, and a gate that skips
+        # is not a gate (checks 64/65). This job has already run `npm ci`.
+        run: |
+          npm run codegen
+          git diff --exit-code -- src/generated \
+            || { echo "::error::frontend/src/generated is stale. Run: (cd frontend && npm run codegen) and commit the result."; exit 1; }
+
       - name: Lint (eslint + prettier)
         run: npm run lint
 

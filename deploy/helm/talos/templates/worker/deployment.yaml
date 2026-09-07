@@ -150,16 +150,17 @@ spec:
                   name: {{ include "talos.bootstrapSecretName" . }}
                   key: OCI_REGISTRY_PASSWORD
                   optional: true
-            - name: AWS_ACCESS_KEY_ID
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "talos.bootstrapSecretName" . }}
-                  key: MINIO_WORKER_USER
-            - name: AWS_SECRET_ACCESS_KEY
-              valueFrom:
-                secretKeyRef:
-                  name: {{ include "talos.bootstrapSecretName" . }}
-                  key: MINIO_WORKER_PASSWORD
+            # NO AWS_*/MINIO_* identity here, deliberately (2026-09-07).
+            # The worker publishes audit events to the NATS subject
+            # `talos.audit.ledger`; the CONTROLLER is the only writer to the
+            # object store. Until this date the Pod mounted AWS_ACCESS_KEY_ID /
+            # AWS_SECRET_ACCESS_KEY from the bootstrap Secret's
+            # MINIO_WORKER_USER / MINIO_WORKER_PASSWORD — as REQUIRED keys, so
+            # a Secret without them wedged the Pod in
+            # CreateContainerConfigError for a value no line in `worker/src` or
+            # `talos-worker-runtime/src` reads, naming a MinIO principal
+            # neither `minio-init` nor the `minio-provisioning` Job has ever
+            # created. Do not re-add it.
             - name: METRICS_AUTH_TOKENS
               valueFrom:
                 secretKeyRef:
