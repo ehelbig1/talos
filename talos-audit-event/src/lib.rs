@@ -58,6 +58,38 @@ pub struct AuditEvent {
     /// treat missing signatures as "unverified" rather than "invalid".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hmac_signature: Option<String>,
+
+    /// Which CONTROLLER DISPATCH of this job the event belongs to.
+    ///
+    /// `0` is the first dispatch — and every event written before this field
+    /// existed, which is why it is `#[serde(default)]` + omitted from the wire
+    /// when zero: an attempt-0 event is BYTE-IDENTICAL to the pre-field format,
+    /// hash and HMAC included, so every object already in the WORM bucket keeps
+    /// verifying with no migration.
+    ///
+    /// A PARTITION key, never a genesis input. The controller re-dispatches the
+    /// SAME `job_id` on a retry (`talos_workflow_engine_nats::execute_job_with_retry`),
+    /// and the worker that receives it is credential-free — it cannot read the
+    /// prior dispatch's ledger, so it starts a fresh chain at `sequence_num` 1
+    /// against the SAME genesis hash. Two such chains under one prefix used to
+    /// read as `DuplicateSequence`, i.e. tamper evidence, on a job that had
+    /// merely been retried. [`verify_chain`] now verifies each attempt as its
+    /// own chain from the same genesis, so old and new chains share one rule.
+    ///
+    /// Bound into [`AuditEvent::calculate_hash`] (conditionally, see there), so
+    /// an event cannot be moved between attempts without invalidating its HMAC.
+    #[serde(default, skip_serializing_if = "dispatch_attempt_is_default")]
+    pub dispatch_attempt: u32,
+}
+
+/// `skip_serializing_if` predicate for [`AuditEvent::dispatch_attempt`].
+///
+/// A free function rather than `u32::is_zero` because serde requires a
+/// by-reference predicate; the `&` is serde's, not a style choice
+/// (clippy's `trivially_copy_pass_by_ref` is allowed for exactly this reason).
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn dispatch_attempt_is_default(n: &u32) -> bool {
+    *n == 0
 }
 
 impl AuditEvent {
@@ -91,6 +123,20 @@ impl AuditEvent {
         event_bytes.extend_from_slice(&lp(&self.actor));
         event_bytes.extend_from_slice(&lp(&self.action));
         event_bytes.extend_from_slice(&lp(&self.payload));
+
+        // Dispatch attempt appended AT THE END, and ONLY when non-zero — the
+        // conditional-append idiom this workspace uses for every new signed
+        // wire field. An attempt-0 event therefore hashes the EXACT bytes it
+        // hashed before the field existed, so the ~49,600 chains already in the
+        // WORM bucket keep verifying and keep their stored `hash` and
+        // `hmac_signature`. Pinned by
+        // `attempt_zero_event_hash_and_hmac_are_pinned`.
+        //
+        // Tagged rather than bare so the encoding is self-describing at the
+        // one place a future field would be appended after it.
+        if self.dispatch_attempt != 0 {
+            event_bytes.extend_from_slice(&lp(&format!("attempt={}", self.dispatch_attempt)));
+        }
 
         // Hash the current event WITH the previous hash (pipe-separated for chain link)
         hasher.update(self.previous_hash.as_bytes());
@@ -386,6 +432,9 @@ pub fn signing_selftest(signing_key: Option<&[u8]>, verify_keys: &[Vec<u8>]) -> 
         payload: "{}".to_string(),
         previous_hash: "0".to_string(),
         hmac_signature: None,
+        // The selftest probe is not a persisted chain event; attempt 0 keeps
+        // its hash identical to the one this function has always signed.
+        dispatch_attempt: 0,
     };
     let hash = probe.calculate_hash();
     probe.sign_with_hash_using(&hash, signing_key);
@@ -415,15 +464,33 @@ pub struct ExecutionLedger {
     pub execution_id: String,
     pub current_sequence: u64,
     pub last_hash: String,
+    /// Stamped onto every event this ledger appends. See
+    /// [`AuditEvent::dispatch_attempt`] for why it is a partition key and not
+    /// a genesis input.
+    pub dispatch_attempt: u32,
 }
 
 impl ExecutionLedger {
+    /// A ledger for the FIRST dispatch of a job (`dispatch_attempt == 0`).
+    ///
+    /// Kept as the bare `new` because attempt 0 is the overwhelming majority
+    /// and every pre-existing caller means exactly this.
     pub fn new(workflow_id: &str, execution_id: &str) -> Self {
+        Self::new_for_attempt(workflow_id, execution_id, 0)
+    }
+
+    /// A ledger for a NAMED controller dispatch attempt of a job.
+    ///
+    /// The genesis hash is deliberately IDENTICAL across attempts: each
+    /// attempt is its own chain from the same root, so a chain written before
+    /// this field existed and one written after are verified by one rule.
+    pub fn new_for_attempt(workflow_id: &str, execution_id: &str, dispatch_attempt: u32) -> Self {
         Self {
             workflow_id: workflow_id.to_string(),
             execution_id: execution_id.to_string(),
             current_sequence: 0,
             last_hash: Self::genesis_hash(workflow_id, execution_id),
+            dispatch_attempt,
         }
     }
 
@@ -459,6 +526,7 @@ impl ExecutionLedger {
             payload: payload.to_string(),
             previous_hash: self.last_hash.clone(),
             hmac_signature: None,
+            dispatch_attempt: self.dispatch_attempt,
         };
 
         // Finalize the cryptographic link (one SHA-256 pass, reused for both
@@ -574,6 +642,41 @@ pub struct ChainVerificationReport {
     /// `Unsigned`/`BadSignature` are not asserted — the chain is structurally
     /// verified but its authenticity is "unverified".
     pub signatures_checked: bool,
+    /// Every break found, across every dispatch attempt, in attempt order.
+    ///
+    /// A `ChainBreak` carries a `seq` and no attempt, so with more than one
+    /// attempt two entries can name the same sequence and mean different
+    /// records. `attempts` is what disambiguates them; this list is kept flat
+    /// so every pre-existing consumer (the GraphQL flattener, the sweep's
+    /// `breaks = ?report.breaks` log) sees exactly what it saw before.
+    pub breaks: Vec<ChainBreak>,
+    /// One report per CONTROLLER DISPATCH ATTEMPT found under this prefix,
+    /// ascending by attempt.
+    ///
+    /// A single-attempt chain — which is every chain written before
+    /// [`AuditEvent::dispatch_attempt`] existed, and the overwhelming majority
+    /// after — yields exactly one entry with `dispatch_attempt == 0`, so this
+    /// field says nothing new about them. More than one entry means the
+    /// controller re-dispatched the job: see
+    /// [`ChainVerificationReport::dispatch_attempt_count`].
+    pub attempts: Vec<AttemptChainReport>,
+}
+
+/// The verification result for ONE dispatch attempt's chain.
+///
+/// Each attempt is verified as a complete chain in its own right — from the
+/// SAME genesis, with its own `1..N` sequence — because that is what the
+/// producer wrote: a credential-free worker handed a re-dispatched `job_id`
+/// cannot read the prior attempt's ledger, so it starts again at 1.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AttemptChainReport {
+    /// `0` for the first dispatch and for every pre-field chain.
+    pub dispatch_attempt: u32,
+    /// Records persisted under this attempt.
+    pub total_events: usize,
+    /// `true` iff none of this attempt's breaks is tamper evidence — the same
+    /// rule [`ChainVerificationReport::ok`] applies, one partition down.
+    pub ok: bool,
     pub breaks: Vec<ChainBreak>,
 }
 
@@ -590,6 +693,20 @@ impl ChainVerificationReport {
             .iter()
             .filter(|b| matches!(b, ChainBreak::DuplicateDelivery { .. }))
             .count()
+    }
+
+    /// How many CONTROLLER DISPATCH ATTEMPTS this prefix holds chains for.
+    ///
+    /// `1` for every ordinary job and for every chain written before the field
+    /// existed. `> 1` means the controller re-dispatched the same `job_id` and
+    /// each dispatch wrote its own chain — a retry, not a finding, and
+    /// deliberately NOT folded into `breaks`.
+    ///
+    /// `0` only for an EMPTY prefix, which is its own outcome upstream — see
+    /// `talos_audit_ledger::ChainSweepStats::empty`.
+    #[must_use]
+    pub fn dispatch_attempt_count(&self) -> usize {
+        self.attempts.len()
     }
 }
 
@@ -615,12 +732,77 @@ pub fn verify_chain(
     keys: &[Vec<u8>],
 ) -> ChainVerificationReport {
     let signatures_checked = !keys.is_empty();
+
+    // PARTITION FIRST, then verify each partition as its own chain.
+    //
+    // The producer's unit of chaining is one DISPATCH, not one job: a
+    // controller retry re-sends the same `job_id`, and the worker that picks
+    // it up is credential-free — it cannot read the previous dispatch's
+    // ledger, so it opens a new one at `sequence_num` 1 against the same
+    // genesis. Verifying the union of two such chains reported
+    // `DuplicateSequence` (positive tamper evidence) for a retried job, which
+    // is the false CRITICAL this partition exists to remove.
+    //
+    // `BTreeMap` for a deterministic ascending order — the report is read by
+    // humans and diffed by tests, and the input arrives in S3 listing order.
+    let mut partitions: std::collections::BTreeMap<u32, Vec<&AuditEvent>> =
+        std::collections::BTreeMap::new();
+    for e in events {
+        partitions.entry(e.dispatch_attempt).or_default().push(e);
+    }
+
+    let mut attempts: Vec<AttemptChainReport> = Vec::with_capacity(partitions.len());
+    let mut all_breaks: Vec<ChainBreak> = Vec::new();
+    for (dispatch_attempt, partition) in partitions {
+        let total_events = partition.len();
+        let breaks = verify_one_attempt(workflow_id, execution_id, partition, keys);
+        let ok = breaks.iter().all(|b| !b.is_tamper_evidence());
+        all_breaks.extend(breaks.iter().cloned());
+        attempts.push(AttemptChainReport {
+            dispatch_attempt,
+            total_events,
+            ok,
+            breaks,
+        });
+    }
+
+    ChainVerificationReport {
+        execution_id: execution_id.to_string(),
+        workflow_id: workflow_id.to_string(),
+        total_events: events.len(),
+        // Every attempt must verify. Computed from the same
+        // `is_tamper_evidence` predicate as before, per partition, so a
+        // single-attempt chain answers exactly what it answered before.
+        ok: attempts.iter().all(|a| a.ok),
+        signatures_checked,
+        breaks: all_breaks,
+        attempts,
+    }
+}
+
+/// The structural + authenticity walk over ONE dispatch attempt's events.
+///
+/// This is the body `verify_chain` had before partitioning, moved verbatim
+/// rather than copied: there is one implementation of "is this a valid chain",
+/// and `verify_chain` now runs it once per attempt. Every event handed here
+/// shares one `dispatch_attempt`, so `sequence_num` is again a unique key
+/// within the set and the duplicate classification means what it always meant.
+fn verify_one_attempt(
+    workflow_id: &str,
+    execution_id: &str,
+    events: Vec<&AuditEvent>,
+    keys: &[Vec<u8>],
+) -> Vec<ChainBreak> {
+    let signatures_checked = !keys.is_empty();
     let mut breaks = Vec::new();
 
-    let mut sorted: Vec<&AuditEvent> = events.iter().collect();
+    let mut sorted: Vec<&AuditEvent> = events;
     sorted.sort_by_key(|e| e.sequence_num);
 
     let mut expected_seq: u64 = 1;
+    // Every attempt links to the SAME genesis. The attempt is a partition key,
+    // not a genesis input, so a chain written before the field existed and one
+    // written after are verified by one rule.
     let mut prev_hash = ExecutionLedger::genesis_hash(workflow_id, execution_id);
 
     for (idx, event) in sorted.iter().enumerate() {
@@ -637,6 +819,11 @@ pub fn verify_chain(
         // "Identical" is decided by the RECOMPUTED hash (which covers every
         // field except the signature) AND the signature, so it cannot be
         // satisfied by a forged copy that merely claims the stored hash.
+        //
+        // Note what partitioning did and did NOT change here: two records at
+        // one sequence in ONE attempt are still exactly what they were. What
+        // moved is that two records at one sequence in DIFFERENT attempts are
+        // no longer compared at all — they are two chains, not two copies.
         if idx > 0 && event.sequence_num == sorted[idx - 1].sequence_num {
             let prev = sorted[idx - 1];
             let identical = event.calculate_hash() == prev.calculate_hash()
@@ -699,14 +886,7 @@ pub fn verify_chain(
         expected_seq = event.sequence_num + 1;
     }
 
-    ChainVerificationReport {
-        execution_id: execution_id.to_string(),
-        workflow_id: workflow_id.to_string(),
-        total_events: sorted.len(),
-        ok: breaks.iter().all(|b| !b.is_tamper_evidence()),
-        signatures_checked,
-        breaks,
-    }
+    breaks
 }
 
 // ============================================================================
@@ -768,11 +948,31 @@ impl AnchorVerdict {
 pub struct AnchoredChainVerificationReport {
     /// The structural + authenticity report from [`verify_chain`], unchanged.
     pub chain: ChainVerificationReport,
-    /// The terminal-anchor verdict (tail-truncation detection).
+    /// The terminal-anchor verdict for the chain as a whole: the WORST verdict
+    /// across dispatch attempts (any hard failure wins; otherwise the first
+    /// attempt's).
+    ///
+    /// For a single-attempt chain — every chain written before
+    /// [`AuditEvent::dispatch_attempt`] existed — this is byte-identical to the
+    /// pre-partition answer.
     pub anchor: AnchorVerdict,
+    /// One anchor verdict per dispatch attempt, ascending by attempt.
+    ///
+    /// Each dispatch of a job seals its OWN chain, so each attempt carries its
+    /// own terminal anchor committing its own length. Judged as one set they
+    /// read as [`AnchorVerdict::MultipleAnchors`] — a hard failure — for a job
+    /// that had merely been retried.
+    pub attempt_anchors: Vec<AttemptAnchorVerdict>,
     /// `chain.ok` AND no hard anchor failure. `Unanchored` does NOT clear
     /// this bit — legacy pre-anchor chains must keep verifying green.
     pub ok: bool,
+}
+
+/// One dispatch attempt's terminal-anchor verdict.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AttemptAnchorVerdict {
+    pub dispatch_attempt: u32,
+    pub anchor: AnchorVerdict,
 }
 
 /// Drop EXACT duplicates — events sharing a `sequence_num` whose recomputed
@@ -888,9 +1088,45 @@ pub fn verify_chain_anchored(
     keys: &[Vec<u8>],
 ) -> AnchoredChainVerificationReport {
     let chain = verify_chain(workflow_id, execution_id, events, keys);
-    let anchor = anchor_verdict(events);
-    let ok = chain.ok && !anchor.is_hard_failure();
-    AnchoredChainVerificationReport { chain, anchor, ok }
+
+    // One verdict per dispatch attempt, for the same reason `verify_chain`
+    // partitions: each dispatch seals its own chain and appends its own
+    // terminal anchor, so the union of two attempts carries two anchors and
+    // reads as `MultipleAnchors` — a HARD failure — on a job that was retried.
+    let mut partitions: std::collections::BTreeMap<u32, Vec<AuditEvent>> =
+        std::collections::BTreeMap::new();
+    for e in events {
+        partitions
+            .entry(e.dispatch_attempt)
+            .or_default()
+            .push(e.clone());
+    }
+    let attempt_anchors: Vec<AttemptAnchorVerdict> = partitions
+        .into_iter()
+        .map(|(dispatch_attempt, part)| AttemptAnchorVerdict {
+            dispatch_attempt,
+            anchor: anchor_verdict(&part),
+        })
+        .collect();
+
+    // WORST wins. `Unanchored` is soft and must not mask a hard failure in
+    // another attempt, and a hard failure anywhere must reach the single
+    // `anchor` field every pre-existing consumer reads. An empty event set
+    // keeps the pre-partition answer (`Unanchored`) rather than becoming an
+    // absent verdict nobody can render.
+    let anchor = attempt_anchors
+        .iter()
+        .find(|a| a.anchor.is_hard_failure())
+        .or_else(|| attempt_anchors.first())
+        .map_or(AnchorVerdict::Unanchored, |a| a.anchor.clone());
+
+    let ok = chain.ok && !attempt_anchors.iter().any(|a| a.anchor.is_hard_failure());
+    AnchoredChainVerificationReport {
+        chain,
+        anchor,
+        attempt_anchors,
+        ok,
+    }
 }
 
 #[cfg(test)]

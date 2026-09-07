@@ -1412,16 +1412,134 @@ anchor used to be appended (below the wall-clock timeout's `?`), so a job killed
 by the wall clock still earns nothing and keeps the deliberately-soft
 `Unanchored` verdict.
 
-**What is NOT closed, and it is 150 of the 196 prefixes.** The anchor is one per
-DISPATCH, not one per JOB-ID. A controller-level retry re-dispatches the SAME
+**What #769 did NOT close, and it is 150 of the 196 prefixes.** The anchor is one
+per DISPATCH, not one per JOB-ID. A controller-level retry re-dispatches the SAME
 `job_id` (`talos-workflow-engine-nats::execute_job_with_retry`, whose own doc
 notes the worker re-sees it), and each re-dispatch is a fresh
 `execute_job_with_full_features` call with a fresh ledger — which is why the
 ledger holds prefixes with far more copies than the in-worker ceiling of 4 (one
 has ELEVEN objects written 5 s apart across 55 s). Reconstructing a prior
-dispatch's ledger needs persisted state the credential-free worker cannot read,
-so those copies remain and are handled at the verifier like any other
-cross-batch pair.
+dispatch's ledger needs persisted state the credential-free worker cannot read.
+That is the next entry.
+
+## A re-dispatched job is a second chain, and the wire says so
+
+**`JobRequest.dispatch_attempt` — the partition key a credential-free worker
+cannot derive.** #769 fixed the in-WORKER retry (one ledger per job). The
+remainder it recorded is the CONTROLLER re-dispatching the same `job_id`: each
+re-dispatch is a fresh worker job with a fresh ledger, so two dispatches write
+two chains that both start at `sequence_num` 1 against the same genesis, under
+one S3 prefix. `verify_chain` sorted by `sequence_num` alone and had no key to
+tell them apart, so it reported `DuplicateSequence` — positive tamper evidence,
+ERROR, `talos_audit_verification_failures_total{stage="chain"}` — every time a
+controller retry followed a completed-but-unanswered attempt. A worker with no
+credentials cannot know it is a re-dispatch unless the controller tells it.
+
+**Measured on the live bucket 2026-09-07** (49,863 objects / 49,604 prefixes):
+**150 prefixes hold more than one object** (111×2, 23×3, 5×4, 3×5, 1×7, 1×8,
+1×10, 2×11, 3×12) plus **41 single-object prefixes at 960 B under a `1_1_` key**
+(two seq-1 events in one object), i.e. ~191, consistent with #769's 196. The
+largest are provably controller retries, not in-worker ones: the 12-object
+prefix's `workflow_executions` row carries `node_started` + **two
+`node_retrying`** + `node_failed`, i.e. **3 controller dispatches × 4 in-worker
+attempts = exactly 12 objects**, and 11–12 copies exceed the worker's own
+`RetryPolicy::default().max_attempts = 3` ceiling. Rate: ~1,300
+`module_executions`/day against 0–4 `node_retrying` events/day.
+
+**#769's mechanism sentence was wrong and the correction matters**: this is not
+"after a timeout". `execute_job_with_retry`'s `Err(_timeout)` arm RETURNS; the
+two arms that loop are an application-level failure and a NATS delivery/reply
+error. A reader sent to the timeout branch finds nothing.
+
+**The design.** `JobRequest.dispatch_attempt: u32`, `#[serde(default,
+skip_serializing_if)]`, appended to `signing_payload` as `:attempt=<n>` ONLY when
+non-zero and at the very END — so an all-default request is byte-identical on the
+wire AND in its MAC (pinned by the unchanged
+`job_request_signature_snapshot` hex plus a NEW non-default snapshot with its own
+JSON + MAC). `AuditEvent.dispatch_attempt` follows the same idiom into
+`calculate_hash`, so an attempt-0 event's hash and HMAC are byte-for-byte what
+they were and **every object already in the bucket keeps verifying** —
+`attempt_zero_event_hash_and_hmac_are_pinned` locks the literals, and the formula
+was additionally re-derived by an INDEPENDENT Python implementation against a real
+bucket object (stored `hash` and `previous_hash` both reproduced exactly), because
+a fixture that pins the code against the code cannot see a both-sides drift.
+`verify_chain` PARTITIONS by attempt and verifies each partition as its own chain
+**from the same genesis** — the attempt is a partition key, NEVER a genesis
+input, so an old chain and a new one are verified by one rule — and
+`verify_chain_anchored` partitions its anchor verdict the same way (two attempts
+carry two terminal anchors, which as one set read `MultipleAnchors`, a HARD
+failure, on a retried job). Within one attempt `DuplicateDelivery` and
+`DuplicateSequence` keep #769's meanings exactly; the CONTROL test proves a
+conflicting pair at ONE attempt still fails.
+
+**ONE stamping site, and that is structural rather than tidy.**
+`resign_payload_for_retry` sets the attempt before signing. Both call sites sit
+inside `if let Some(key) = worker_shared_key`, so a deployment with no WSK
+re-sends the ORIGINAL bytes — and that path **cannot produce a second chain at
+all**: `req.verify_dispatch` (nonce-replay included) runs in the worker ABOVE the
+ledger, so a replayed nonce fails before `execute_job_with_full_features` is
+reached. Every path that can write a second chain re-signs, and that is exactly
+the path that stamps.
+
+**Deploy ordering — measured in both directions, and the two are NOT symmetric.
+WORKERS ROLL FIRST OR TOGETHER**, the same rule the envelope-seal note carries,
+and the first draft of this paragraph got it backwards before the test was
+written. **Old controller + new workers is completely inert**: nothing stamps
+anything, every message is attempt 0, every byte identical. **New controller +
+old workers is safe for FIRST dispatches and refuses RETRIES.** Attempt 0 appends
+nothing, so an ordinary dispatch is byte-identical and an old worker verifies it
+exactly as before. A RETRY, though, is signed by the new controller over a
+payload ending `:attempt=1`, and an old worker's `signing_payload` cannot produce
+that segment — it does not know the field — so the two MACs differ and the old
+worker REFUSES the retry. Pinned by
+`an_old_worker_refuses_a_new_controllers_retry_but_accepts_its_first_dispatch`,
+which rebuilds the pre-field payload and asserts the signatures diverge (if they
+matched, binding the attempt would be a no-op). This is **fail-CLOSED and
+bounded**: the failure is a refused retry of an already-failing job, not a
+mis-verified one, and it lasts only for the width of the rollout — measured
+0–4 `node_retrying` events/day on the reference fleet. Roll workers first and it
+never arises.
+
+**Disclosed, never silent.** The sweep counts `ChainSweepStats::multi_attempt`
+and logs `jobs_with_multiple_attempts`; `security_audit`'s round-trip check names
+the attempt count on the chain it probed (because "4 events, verified" and "two
+dispatches of two" otherwise render identically — the same argument the
+`duplicate_deliveries` disclosure makes one axis over) and the sweep note carries
+the fleet count; the GraphQL job report gains `dispatchAttempts` and the
+aggregate `jobsWithMultipleAttempts`; `talos_audit_chain_multi_attempt_jobs_total`
+is pre-seeded at 0. **Nothing alerts on it** — a re-dispatch is the platform
+working as designed, and an alert here would train operators to ignore the one
+control that raises a true finding, which is the defect this change removes.
+
+**What is NOT closed, stated rather than implied.** (a) **Historical prefixes
+stay CONFLICTING.** Both copies carry no attempt field, so they partition into
+ONE attempt and `DuplicateSequence` is the correct answer for them — the fix is
+forward-only. They age out of the sweep's 2 h window; the ~191 already in the
+bucket are reachable only by an on-demand `verifyAuditChain`. (b)
+**`PipelineJobRequest` is deliberately unchanged.** The chain path CAN re-dispatch
+(`dispatch_with_retry` loops on a transport error), but it writes NO audit chain
+at all: the only non-test `ExecutionLedger::new` is in
+`execute_job_with_full_features` and the only `set_audit_ledger` is on the
+single-node path, so `execute_pipeline` mints neither — and every production
+entry point passes `ChainDispatch::Disabled` besides. A `dispatch_attempt` there
+would partition nothing that exists. (c) **The partition is only as good as the
+stamp reaching the worker.** No test in this workspace can drive
+controller-dispatch → NATS → worker → S3 end to end; the guard is the live read
+of the ledger after deploy, the position #767 and #769 both took about their own
+changes.
+
+**No lint check was added and `--count` stays 86.** Two candidates were measured
+first and both have a population of ONE, the bar this repo does not ship at. (i)
+*"a conditional-append signing segment must have a non-default wire snapshot"* —
+`signing_payload` holds FOUR conditional segments (`:egress=`, the sealing block,
+`:idem=`, `:attempt=`) and exactly ONE has a non-default snapshot (the one added
+here), so the check would ship at 3 and the repo does not re-add baselines
+(check 52's own rule). (ii) *"`ExecutionLedger::new_for_attempt` must be the
+producer's constructor"* — `ExecutionLedger::new*` occurs ONCE in non-test worker
+code, which is the same population #769 measured and rejected for the same
+reason. The structural answers are stronger than a grep in both cases: the
+snapshot pair is in the same file with a docstring saying why there are two, and
+the ledger has one construction site the compiler funnels every caller through.
 
 **Instruments, and deliberately no alert.** Both counters are PRE-SEEDED
 (`talos_audit_ledger_duplicate_deliveries_total{scope="batch"}` — the only scope
@@ -1642,7 +1760,7 @@ introduced per-org v4 per table).
   - **The clamp WARN is now attributed by cause.** `DispatchJob::budget_secs` (stamped beside `deadline` from the same `secs` on `ExecutionProgress`) feeds `clamp_cause`: `Configuration` (the allowance could never have fitted, even at t=0 — a graph problem `validate_workflow` now reports) logs at **debug**; `Consumption` and `Unknown` stay **warn**. `budget_secs` is ATTRIBUTION ONLY — it never enters the clamp, so `None` changes no timing, and `Unknown` is never demoted. **No metric was added**, and that is a measurement: `talos-workflow-engine-nats` has no `talos-metrics` dependency (it is reachable only transitively through `talos-workflow-engine`, which Rust does not permit), so a series would cost a new direct dependency edge — recorded and declined, which means the consumption clamp remains prose-only and cannot be alerted on.
   - **No lint was added, and here are the numbers so nobody re-measures.** "Clamp constants or `clamp_attempt_timeout` defined outside core" reports **1 file** on pristine main and 0 after — population ONE, which is the bar this repo does not ship at; the structural answer (one `pub` home, the constants deleted from the dispatcher) is already stronger. "An `envelope_secs <= budget` comparison outside core" reports 2 lines on main of which 1 is a legitimate test assertion (50% precision) and **3 on the FIXED tree, all of them the new comments explaining the fix** — check 73's self-report trap. `--count` stays **86**. Two mutations are open and measured SURVIVORS, both in the loud direction: re-inlining `job.timeout.as_secs() + 5` at the dispatch site is behaviourally identical and no test can see it (the guard is that the constant no longer exists in that crate), and passing `None` for `budget_secs` merely restores the WARN.
 
-- **New signed wire fields use the conditional-append idiom.** When adding a field to `JobRequest` / `PipelineJobRequest` / `PipelineStep` that must be HMAC-bound, append it to `signing_payload` ONLY when non-default, guarded so an all-default message is **byte-identical** to the pre-field wire format (the deploy-compat invariant). Follow the existing `:egress=` / `:retries=` / `:idem=` segments (appended at the END, `#[serde(default, skip_serializing_if=…)]` on the struct field). Add the field to the wire-format snapshot + security test constructors in the same change.
+- **New signed wire fields use the conditional-append idiom.** When adding a field to `JobRequest` / `PipelineJobRequest` / `PipelineStep` that must be HMAC-bound, append it to `signing_payload` ONLY when non-default, guarded so an all-default message is **byte-identical** to the pre-field wire format (the deploy-compat invariant). Follow the existing `:egress=` / `:retries=` / `:idem=` / `:attempt=` segments (appended at the END, `#[serde(default, skip_serializing_if=…)]` on the struct field). Add the field to the wire-format snapshot + security test constructors in the same change — and add a NON-default snapshot too, with its own expected JSON and MAC hex: the all-default snapshot proves the field ships inert and says nothing about the bytes the field actually adds.
 
 ## Git Safety Rules (MUST follow)
 - NEVER run `git checkout --`, `git restore`, or `git reset --hard` on files that show as modified in `git status` without first running `git stash`. Uncommitted changes are irrecoverable.

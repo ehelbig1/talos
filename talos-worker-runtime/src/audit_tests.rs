@@ -14,6 +14,7 @@ mod tests {
             payload: r#"{"key":"value"}"#.to_string(),
             previous_hash: "genesis".to_string(),
             hmac_signature: None,
+            dispatch_attempt: 0,
         };
 
         let hash1 = event.calculate_hash();
@@ -37,6 +38,7 @@ mod tests {
             payload: r#"{"key":"value"}"#.to_string(),
             previous_hash: "genesis".to_string(),
             hmac_signature: None,
+            dispatch_attempt: 0,
         };
 
         let event2 = AuditEvent {
@@ -49,6 +51,7 @@ mod tests {
             payload: r#"{"key":"value"}"#.to_string(),
             previous_hash: "genesis".to_string(),
             hmac_signature: None,
+            dispatch_attempt: 0,
         };
 
         assert_ne!(event1.calculate_hash(), event2.calculate_hash());
@@ -67,6 +70,7 @@ mod tests {
             payload: "a:b".to_string(),
             previous_hash: "genesis".to_string(),
             hmac_signature: None,
+            dispatch_attempt: 0,
         };
 
         let event2 = AuditEvent {
@@ -79,6 +83,7 @@ mod tests {
             payload: "ab".to_string(), // Different payload, no colon
             previous_hash: "genesis".to_string(),
             hmac_signature: None,
+            dispatch_attempt: 0,
         };
 
         // These should produce different hashes
@@ -359,5 +364,56 @@ mod seal_job_audit_chain_tests {
     async fn a_job_without_a_ledger_seals_nothing() {
         let eligible = AtomicBool::new(true);
         assert!(seal_job_audit_chain(None, &eligible).await.is_none());
+    }
+}
+
+/// The ledger the worker actually mints, and the attempt reaching it.
+///
+/// `build_job_ledger` exists as a separate function precisely so this is
+/// observable: its caller needs a wasmtime engine, a compiled component and a
+/// NATS server, so before the extraction the whole attempt-threading was
+/// invisible to every test in this crate (measured — all 639 stayed green when
+/// the attempt was dropped).
+#[cfg(test)]
+mod build_job_ledger_tests {
+    use crate::runtime::build_job_ledger;
+
+    fn ctx() -> (String, String, String) {
+        (
+            "wfx-1".to_string(),
+            "job-1".to_string(),
+            "mod-1".to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn the_dispatch_attempt_reaches_the_ledger_and_every_event_it_appends() {
+        let led = build_job_ledger(Some(&ctx()), 3).expect("a bound job gets a ledger");
+        let mut g = led.lock().await;
+        assert_eq!(g.dispatch_attempt, 3);
+        let e = g.append("worker", "act", "p");
+        assert_eq!(
+            e.dispatch_attempt, 3,
+            "the attempt must be stamped on the events, not merely held"
+        );
+        // The attempt is a PARTITION key, never a genesis input: a
+        // re-dispatch's chain starts from the SAME root as the first.
+        assert_eq!(
+            e.previous_hash,
+            crate::audit::ExecutionLedger::genesis_hash("wfx-1", "job-1")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_first_dispatch_is_attempt_zero() {
+        let led = build_job_ledger(Some(&ctx()), 0).expect("ledger");
+        let mut g = led.lock().await;
+        let e = g.append("worker", "act", "p");
+        assert_eq!(e.dispatch_attempt, 0);
+    }
+
+    #[test]
+    fn no_execution_context_means_no_chain() {
+        assert!(build_job_ledger(None, 2).is_none());
     }
 }

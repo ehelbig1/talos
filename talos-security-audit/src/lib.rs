@@ -1304,6 +1304,12 @@ pub enum AuditChainProbe {
         /// removed nothing — but it is DISCLOSED, because a reader told only
         /// "5 events, verified" cannot tell that two of them are one event.
         duplicate_deliveries: usize,
+        /// How many CONTROLLER DISPATCH ATTEMPTS the prefix holds chains for.
+        /// `1` for an ordinary job. `> 1` is still a PASS — a re-dispatch is a
+        /// retry, and each attempt is verified as its own chain — but it is
+        /// DISCLOSED for the same reason as the line above: a reader told only
+        /// "4 events, verified" cannot tell that they are two dispatches of two.
+        dispatch_attempts: usize,
     },
     /// The chain read back and DID NOT verify — a gap, a broken link, a bad
     /// HMAC. Tamper evidence.
@@ -1384,6 +1390,7 @@ pub async fn probe_audit_chain(candidate: &AuditChainCandidate) -> AuditChainPro
             total_events: report.total_events,
             signatures_checked: report.signatures_checked,
             duplicate_deliveries: report.duplicate_delivery_count(),
+            dispatch_attempts: report.dispatch_attempt_count(),
         },
         Ok(report) => AuditChainProbe::Broken {
             execution_id,
@@ -1453,6 +1460,7 @@ pub fn check_audit_chain_verification(
             total_events,
             signatures_checked,
             duplicate_deliveries,
+            dispatch_attempts,
         } => {
             let sig = if *signatures_checked {
                 "with HMAC signatures checked"
@@ -1475,6 +1483,17 @@ pub fn check_audit_chain_verification(
             } else {
                 String::new()
             };
+            // Same disclosure rule as `dupes`, one axis over: "4 events,
+            // verified" and "two dispatches of two events each" render
+            // identically without this, and the second is what a re-dispatched
+            // job looks like — the shape that used to be reported as CRITICAL.
+            let attempts = if *dispatch_attempts > 1 {
+                format!(
+                    " Those record(s) span {dispatch_attempts} CONTROLLER DISPATCH ATTEMPTS of                      this job — the controller re-dispatched the job_id, and the                      credential-free worker cannot read the previous dispatch's ledger, so it                      opened a fresh chain at sequence 1 against the same genesis. Each attempt                      was verified as its own chain. This is a RETRY, not tamper evidence."
+                )
+            } else {
+                String::new()
+            };
             Check {
                 name: "audit_chain_verification",
                 status: Status::Pass,
@@ -1485,8 +1504,8 @@ pub fn check_audit_chain_verification(
                      event(s), no gaps, no broken links, {sig}. The ledger is keyed PER JOB \
                      — every object key is `<{key_space}>/…` and the genesis hash binds \
                      ({genesis_col}, {key_space}) — so this is the id space that was \
-                     verified, not `workflow_executions.id`.{dupes} {sweep_note} Reported, \
-                     not scored.",
+                     verified, not `workflow_executions.id`.{dupes}{attempts} {sweep_note} \
+                     Reported, not scored.",
                     key_space = talos_audit_ledger::LEDGER_KEY_SPACE,
                     genesis_col = talos_audit_ledger::LEDGER_GENESIS_WORKFLOW_COLUMN,
                 ),
@@ -1624,6 +1643,19 @@ fn describe_last_sweep(sweep: Option<talos_audit_ledger::ChainSweepSnapshot>) ->
         s.rollup.failed,
         s.rollup.errored,
     );
+    // A re-dispatched job holds one chain PER DISPATCH ATTEMPT, verified
+    // separately. Disclosed rather than silent: before the attempt reached the
+    // wire this exact shape was reported as CRITICAL tamper evidence, so an
+    // operator reading a clean sweep deserves to know how much of it is
+    // re-dispatch and that the partitioning was applied.
+    let base = if s.multi_attempt > 0 {
+        format!(
+            "{base} {} of those job chain(s) hold MORE THAN ONE controller dispatch attempt —              the controller re-dispatched the job_id and the credential-free worker opened a              fresh chain at sequence 1 for each dispatch. Each attempt is verified as its own              chain from the same genesis; this is a RETRY, not tamper evidence.",
+            s.multi_attempt
+        )
+    } else {
+        base
+    };
     match (s.aborted, s.cap_hit) {
         (Some(kind), _) => format!(
             "{base} That pass ABORTED on a deployment-wide condition ({}), so the rest of its \

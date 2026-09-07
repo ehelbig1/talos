@@ -21,6 +21,7 @@ fn calculate_hash_is_deterministic_and_sha256() {
         payload: r#"{"key":"value"}"#.to_string(),
         previous_hash: "genesis".to_string(),
         hmac_signature: None,
+        dispatch_attempt: 0,
     };
     let h1 = event.calculate_hash();
     let h2 = event.calculate_hash();
@@ -40,6 +41,7 @@ fn hash_changes_with_field() {
         payload: r#"{"key":"value"}"#.to_string(),
         previous_hash: "genesis".to_string(),
         hmac_signature: None,
+        dispatch_attempt: 0,
     };
     let mut other = base.clone();
     other.sequence_num = 2;
@@ -58,6 +60,7 @@ fn length_prefix_resists_delimiter_injection() {
         payload: "a:b".to_string(),
         previous_hash: "genesis".to_string(),
         hmac_signature: None,
+        dispatch_attempt: 0,
     };
     let h1 = a.calculate_hash();
     a.payload = "ab".to_string();
@@ -116,6 +119,7 @@ fn verify_signature_round_trip() {
         payload: "p".to_string(),
         previous_hash: "g".to_string(),
         hmac_signature: None,
+        dispatch_attempt: 0,
     };
     event.hmac_signature = Some(hmac_sign(&event, &key));
     assert_eq!(
@@ -667,6 +671,7 @@ fn sign_with_hash_using_matches_the_canonical_hmac_construction() {
         payload: "{\"a\":1}".to_string(),
         previous_hash: "prev".to_string(),
         hmac_signature: None,
+        dispatch_attempt: 0,
     };
     let expected = hmac_sign(&ev, key);
     let hash = ev.calculate_hash();
@@ -708,4 +713,203 @@ fn two_conflicting_anchors_stay_a_hard_failure() {
     let report = verify_chain_anchored("wf", "ex", &[anchor, second], &[]);
     assert!(!report.ok, "{:?}", report);
     assert_eq!(report.anchor, AnchorVerdict::MultipleAnchors { count: 2 });
+}
+
+// ============================================================================
+// Attempt-0 byte-for-byte fixture (pinned 2026-09-07, BEFORE `dispatch_attempt`)
+// ============================================================================
+
+/// Deterministic attempt-0 event, hashed and HMAC-signed under a fixed key.
+///
+/// PINNED BEFORE the `dispatch_attempt` field existed. Every object already in
+/// the WORM bucket was written by a producer whose events carried no attempt
+/// index; the partitioning change must leave their hash and HMAC inputs
+/// untouched or every one of them stops verifying. A behavioural sign→verify
+/// test cannot see a CONSISTENT both-sides drift — only a literal can.
+#[test]
+fn attempt_zero_event_hash_and_hmac_are_pinned() {
+    let ev = AuditEvent {
+        workflow_id: "wf-fixture".to_string(),
+        execution_id: "exec-fixture".to_string(),
+        sequence_num: 1,
+        timestamp: 1_700_000_000,
+        actor: "worker".to_string(),
+        action: "execution_complete".to_string(),
+        payload: r#"{"total_events":1}"#.to_string(),
+        previous_hash: ExecutionLedger::genesis_hash("wf-fixture", "exec-fixture"),
+        hmac_signature: None,
+        dispatch_attempt: 0,
+    };
+    assert_eq!(
+        ev.calculate_hash(),
+        "6f3c29fb35b224a76315baee68f88d2550be59c394957a6ea1e1d31ca3bc4433"
+    );
+    assert_eq!(
+        hmac_sign(&ev, b"fixture-key-0123456789abcdef0123"),
+        "35cb8dcc6005f15bc03980dc79b10278f363721ef8fcb5cf14fb204e2c6ab864"
+    );
+    assert_eq!(
+        ExecutionLedger::genesis_hash("wf-fixture", "exec-fixture"),
+        "1e2a75a27dc45f8f14460bbc20406b60ca1b89250d8230136226822ffe38c21f"
+    );
+}
+
+// ============================================================================
+// Per-dispatch-attempt partitioning
+// ============================================================================
+
+/// THE test this change exists for.
+///
+/// A controller re-dispatch re-uses the same `job_id`, so the second attempt's
+/// worker mints a FRESH ledger — same genesis, `sequence_num` restarting at 1.
+/// Before `dispatch_attempt` existed the verifier had no key to tell those two
+/// chains apart and reported `DuplicateSequence` — positive tamper evidence —
+/// on a job that had merely been retried. Measured on the live bucket
+/// 2026-09-07: ~150 prefixes carry more than one object, and the largest
+/// (11 and 12 copies) match `node_retrying` rows one-for-one.
+#[test]
+fn two_dispatch_attempts_verify_as_two_chains() {
+    let mut a0 = ExecutionLedger::new_for_attempt("wf", "ex", 0);
+    let mut a1 = ExecutionLedger::new_for_attempt("wf", "ex", 1);
+    let mut events = vec![a0.append("worker", "act", "one")];
+    events.push(a0.append_terminal_anchor("worker"));
+    // Attempt 1's records are CONFLICTING with attempt 0's under the
+    // pre-partition rule — same sequence, different content — which is the
+    // majority live shape (161 of 196 prefixes measured 2026-09-07, differing
+    // by a `timestamp` that straddled a whole-second boundary). Modelled here
+    // as a different payload, because mutating a record AFTER `append` would
+    // break the chain link the ledger already committed to. So this test
+    // cannot pass by the byte-identical `DuplicateDelivery` route.
+    events.push(a1.append("worker", "act", "two"));
+    events.push(a1.append_terminal_anchor("worker"));
+
+    let report = verify_chain("wf", "ex", &events, &[]);
+    assert!(
+        report.ok,
+        "two attempts of one job are two chains, not a substitution: {:?}",
+        report.breaks
+    );
+    assert!(
+        report.breaks.is_empty(),
+        "no break of any kind is expected: {:?}",
+        report.breaks
+    );
+    assert_eq!(report.total_events, 4, "every persisted record is counted");
+    assert_eq!(
+        report.attempts.len(),
+        2,
+        "one report per dispatch attempt: {:?}",
+        report.attempts
+    );
+    assert_eq!(report.attempts[0].dispatch_attempt, 0);
+    assert_eq!(report.attempts[1].dispatch_attempt, 1);
+    assert!(report.attempts.iter().all(|a| a.ok));
+    assert!(report.attempts.iter().all(|a| a.total_events == 2));
+
+    // The anchor verdict partitions too: each attempt carries exactly one
+    // terminal anchor committing its OWN length, so the pre-partition reading
+    // (`MultipleAnchors`, a hard failure) must not survive.
+    let anchored = verify_chain_anchored("wf", "ex", &events, &[]);
+    assert!(anchored.ok, "anchor: {:?}", anchored.anchor);
+    assert!(matches!(
+        anchored.anchor,
+        AnchorVerdict::Anchored { total_events: 2 }
+    ));
+    assert_eq!(anchored.attempt_anchors.len(), 2);
+}
+
+/// The CONTROL. Partitioning must not become a way to launder a substitution:
+/// two conflicting records at the SAME attempt and the SAME sequence are still
+/// tamper evidence, and `ok` must still be false.
+#[test]
+fn conflicting_records_within_one_attempt_stay_tamper_evidence() {
+    let mut a1 = ExecutionLedger::new_for_attempt("wf", "ex", 1);
+    let first = a1.append("worker", "act", "one");
+    let mut conflicting = first.clone();
+    conflicting.timestamp += 1; // same attempt, same sequence, different content
+    let events = vec![first, conflicting];
+
+    let report = verify_chain("wf", "ex", &events, &[]);
+    assert!(
+        report
+            .breaks
+            .iter()
+            .any(|b| matches!(b, ChainBreak::DuplicateSequence { seq: 1 })),
+        "breaks: {:?}",
+        report.breaks
+    );
+    assert!(
+        !report.ok,
+        "a substitution within one attempt must not verify"
+    );
+    assert_eq!(report.attempts.len(), 1);
+    assert!(!report.attempts[0].ok);
+    assert_eq!(report.attempts[0].dispatch_attempt, 1);
+}
+
+/// A single-attempt chain must be indistinguishable from the pre-change
+/// answer: one attempt report, and the top-level fields unchanged.
+#[test]
+fn a_single_attempt_chain_reports_exactly_one_partition() {
+    let events = build_chain("wf", "ex", 3);
+    let report = verify_chain("wf", "ex", &events, &[]);
+    assert!(report.ok);
+    assert_eq!(report.attempts.len(), 1);
+    assert_eq!(report.attempts[0].dispatch_attempt, 0);
+    assert_eq!(report.attempts[0].total_events, 3);
+}
+
+/// Each attempt links to the SAME genesis — the attempt is a PARTITION key,
+/// never a genesis input, so an old chain and a new one share one rule.
+#[test]
+fn every_attempt_links_to_the_same_genesis() {
+    let g = ExecutionLedger::genesis_hash("wf", "ex");
+    let mut a2 = ExecutionLedger::new_for_attempt("wf", "ex", 2);
+    let first = a2.append("worker", "act", "one");
+    assert_eq!(first.previous_hash, g);
+    assert_eq!(first.dispatch_attempt, 2);
+}
+
+/// An attempt-0 event serialises WITHOUT the field, so every object already in
+/// the bucket round-trips byte-for-byte; a non-zero attempt carries it.
+#[test]
+fn attempt_zero_is_omitted_from_the_wire_and_non_zero_is_not() {
+    let mut a0 = ExecutionLedger::new("wf", "ex");
+    let e0 = a0.append("worker", "act", "p");
+    let j0 = serde_json::to_string(&e0).expect("serialize");
+    assert!(
+        !j0.contains("dispatch_attempt"),
+        "attempt-0 wire text must be byte-identical to the pre-field format: {j0}"
+    );
+
+    let mut a1 = ExecutionLedger::new_for_attempt("wf", "ex", 1);
+    let e1 = a1.append("worker", "act", "p");
+    let j1 = serde_json::to_string(&e1).expect("serialize");
+    assert!(j1.contains(r#""dispatch_attempt":1"#), "{j1}");
+
+    // And a legacy object with no field deserialises to attempt 0.
+    let back: AuditEvent = serde_json::from_str(&j0).expect("deserialize");
+    assert_eq!(back.dispatch_attempt, 0);
+}
+
+/// The attempt is part of the HASH, so it cannot be edited on a persisted
+/// record without breaking the signature — the partition key is as
+/// tamper-evident as every other field.
+#[test]
+fn the_attempt_is_bound_into_the_event_hash() {
+    let mut a0 = ExecutionLedger::new("wf", "ex");
+    let e0 = a0.append("worker", "act", "p");
+    let mut moved = e0.clone();
+    moved.dispatch_attempt = 1;
+    assert_ne!(
+        e0.calculate_hash(),
+        moved.calculate_hash(),
+        "moving an event between attempts must change its hash"
+    );
+    let key = b"0123456789abcdef0123456789abcdef".to_vec();
+    let mut signed = e0.clone();
+    signed.hmac_signature = Some(hmac_sign(&signed, &key));
+    let mut relabelled = signed.clone();
+    relabelled.dispatch_attempt = 1;
+    assert_eq!(relabelled.verify_signature(&[key]), Some(false));
 }

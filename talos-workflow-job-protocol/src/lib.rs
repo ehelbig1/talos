@@ -3581,6 +3581,40 @@ pub struct JobRequest {
     /// attacker cannot strip the key (forcing a duplicate on retry) or swap it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
+
+    /// Which CONTROLLER DISPATCH of this job this message is. `0` (the
+    /// default, and every legacy wire message) is the first dispatch.
+    ///
+    /// The controller's retry loop
+    /// (`talos_workflow_engine_nats::execute_job_with_retry`) re-dispatches the
+    /// SAME `job_id` — its own doc notes the worker re-sees it — and the worker
+    /// is credential-free: it cannot read the prior dispatch's audit ledger, so
+    /// it opens a NEW hash chain at `sequence_num` 1 against the same genesis.
+    /// Two such chains land under one WORM prefix and, with no key to tell them
+    /// apart, the offline verifier reported `DuplicateSequence` — positive
+    /// tamper evidence — for a job that had merely been retried. A
+    /// credential-free worker cannot know it is a re-dispatch unless the
+    /// controller tells it; this field is the controller telling it.
+    ///
+    /// HMAC-bound ONLY when non-zero (see [`Self::signing_payload`]): a `0`
+    /// appends NOTHING, so an all-default request is byte-identical on the wire
+    /// and in its MAC and the field ships inert. When non-zero, the
+    /// `:attempt=<n>` suffix is bound so an on-wire attacker can neither strip
+    /// it (re-merging two attempts into one chain, manufacturing a false tamper
+    /// finding) nor forge one (splitting a tampered chain into partitions that
+    /// each verify).
+    #[serde(default, skip_serializing_if = "dispatch_attempt_is_default")]
+    pub dispatch_attempt: u32,
+}
+
+/// `skip_serializing_if` predicate for [`JobRequest::dispatch_attempt`].
+///
+/// Serde mandates the by-reference signature, which is why clippy's
+/// `trivially_copy_pass_by_ref` is allowed here — the same reason
+/// `sealing_is_default` above carries it.
+#[allow(clippy::trivially_copy_pass_by_ref)]
+fn dispatch_attempt_is_default(n: &u32) -> bool {
+    *n == 0
 }
 
 impl JobRequest {
@@ -3825,6 +3859,21 @@ impl JobRequest {
         if let Some(ref idem) = self.idempotency_key {
             use std::fmt::Write as _;
             let _ = write!(payload, ":idem={}", lp(idem));
+        }
+
+        // Dispatch attempt appended AT THE VERY END, ONLY when non-zero, per
+        // the wire-format stability rule. Attempt 0 — the first dispatch, and
+        // every legacy message — appends nothing, so the signed bytes are
+        // byte-identical to the pre-field format and no coordinated restart is
+        // needed for the default path. When non-zero, binding it stops an
+        // on-wire attacker from stripping the attempt (which would re-merge two
+        // dispatches into one audit chain and manufacture a false
+        // `DuplicateSequence` tamper finding) or forging one (which would split
+        // a single tampered chain into partitions that each verify clean).
+        // Fixed-width decimal, so no length prefix is needed.
+        if self.dispatch_attempt != 0 {
+            use std::fmt::Write as _;
+            let _ = write!(payload, ":attempt={}", self.dispatch_attempt);
         }
 
         payload.into_bytes()
@@ -6600,6 +6649,7 @@ mod tests {
             dry_run: false,
             reply_topic: None,
             idempotency_key: None,
+            dispatch_attempt: 0,
         };
         req.sign(&key).unwrap();
 
@@ -6655,6 +6705,7 @@ mod tests {
             dry_run: false,
             reply_topic: None,
             idempotency_key: None,
+            dispatch_attempt: 0,
         };
 
         req.sign(&key).unwrap();
@@ -6702,6 +6753,7 @@ mod tests {
             dry_run: false,
             reply_topic: None,
             idempotency_key: None,
+            dispatch_attempt: 0,
         };
         req.sign(&key).unwrap();
         req.module_uri = "wasm://evil-module/v1".to_string(); // tamper
@@ -6882,6 +6934,7 @@ mod tests {
             dry_run: false,
             reply_topic: None,
             idempotency_key: None,
+            dispatch_attempt: 0,
         };
         req.sign(&key).unwrap();
         // An attacker cannot escalate from GET-only to POST by modifying the field.
@@ -6929,6 +6982,7 @@ mod tests {
             dry_run: false,
             reply_topic: None,
             idempotency_key: None,
+            dispatch_attempt: 0,
         };
         req.sign(&key).unwrap();
         // Reordering must not affect verification (sorted before hashing).
@@ -6993,6 +7047,7 @@ mod tests {
             dry_run: false,
             reply_topic: None,
             idempotency_key: None,
+            dispatch_attempt: 0,
         }
     }
 
@@ -7111,6 +7166,7 @@ mod tests {
                 dry_run: false,
                 reply_topic: None,
                 idempotency_key: None,
+                dispatch_attempt: 0,
             };
             req.sign_ed25519(&sk).unwrap();
 
@@ -7167,6 +7223,7 @@ mod tests {
             dry_run: false,
             reply_topic: None,
             idempotency_key: None,
+            dispatch_attempt: 0,
         }
     }
 

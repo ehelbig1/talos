@@ -344,6 +344,7 @@ pub(crate) async fn dispatch_monitoring_incident(
         dry_run: false,
         reply_topic: None,
         idempotency_key: None,
+        dispatch_attempt: 0,
         actor_id: resolved_actor,
         user_id,
     };

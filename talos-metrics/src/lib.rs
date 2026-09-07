@@ -381,6 +381,18 @@ pub struct TalosMetrics {
     /// redundancy is visible; not alerted on, for the same reason as the
     /// writer-side counter above.
     pub audit_chain_duplicate_deliveries_total: Counter,
+    /// Job chains the offline sweep found holding MORE THAN ONE controller
+    /// dispatch attempt — a re-dispatched `job_id`, whose second dispatch
+    /// necessarily opened a fresh hash chain at `sequence_num` 1.
+    ///
+    /// A retry, not a finding: such a chain verifies (`ok == true`), is counted
+    /// in `jobs_verified_ok`, and NOTHING alerts on this series. It exists
+    /// because before `dispatch_attempt` reached the wire this shape was
+    /// reported as `DuplicateSequence` — CRITICAL tamper evidence — and an
+    /// operator asking "how often does the fleet re-dispatch?" had no number to
+    /// read. Registration alone exports it at 0 so absent and zero do not
+    /// render alike.
+    pub audit_chain_multi_attempt_jobs_total: Counter,
     /// Unix seconds at which an audit chain last verified CLEAN.
     ///
     /// A gauge, and deliberately NOT pre-seeded: absent means "no chain has
@@ -1522,6 +1534,12 @@ impl TalosMetrics {
         )?;
         registry.register(Box::new(audit_chain_duplicate_deliveries_total.clone()))?;
 
+        let audit_chain_multi_attempt_jobs_total = Counter::new(
+            "talos_audit_chain_multi_attempt_jobs_total",
+            "Job chains the offline audit-chain sweep found holding more than one              CONTROLLER DISPATCH ATTEMPT. A re-dispatch re-uses the job_id and the              credential-free worker cannot read the prior dispatch's ledger, so it opens              a fresh chain at sequence 1 — a retry, not tamper evidence. Such a chain              VERIFIES and is counted in jobs_verified_ok; nothing alerts on this series.              Registration alone exports it at 0 so absent and zero do not render alike.",
+        )?;
+        registry.register(Box::new(audit_chain_multi_attempt_jobs_total.clone()))?;
+
         let audit_chain_last_verified_ok_timestamp_seconds = Gauge::new(
             "talos_audit_chain_last_verified_ok_timestamp_seconds",
             "Unix time at which an execution's WORM audit chain last verified CLEAN. \
@@ -2277,6 +2295,7 @@ impl TalosMetrics {
             audit_verification_failures_total,
             audit_ledger_duplicate_deliveries_total,
             audit_chain_duplicate_deliveries_total,
+            audit_chain_multi_attempt_jobs_total,
             audit_chain_unverifiable_total,
             audit_chain_last_verified_ok_timestamp_seconds,
             audit_chain_sweep_timestamp_seconds,
@@ -2506,6 +2525,11 @@ mod tests {
             // with no increment site.
             r#"talos_audit_ledger_duplicate_deliveries_total{scope="batch"} 0"#,
             "talos_audit_chain_duplicate_deliveries_total 0",
+            // Same reasoning as the pair above: a re-dispatch is a routine
+            // fleet fact, nothing alerts on it, and an absent series answers
+            // "how often does the controller re-dispatch?" with "never" when
+            // the truth is "nothing has looked".
+            "talos_audit_chain_multi_attempt_jobs_total 0",
             r#"talos_module_payload_encryption_failures_total{op="encrypt",stage="input"} 0"#,
             r#"talos_module_payload_encryption_failures_total{op="encrypt",stage="output"} 0"#,
             r#"talos_module_payload_encryption_failures_total{op="encrypt",stage="trigger_metadata"} 0"#,
