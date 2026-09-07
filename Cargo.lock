@@ -7449,6 +7449,7 @@ dependencies = [
  "talos-tenancy",
  "talos-text-util",
  "talos-workflow-job-protocol",
+ "talos-workflow-liveness",
  "tokio",
  "tracing",
  "uuid",

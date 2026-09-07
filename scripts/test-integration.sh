@@ -294,6 +294,12 @@ fi
 # needed here. 64 hex = 32 bytes, non-zero.
 CTRL_MASTER_KEY="00000000000000000000000000000000000000000000000000000000deadbeef"
 CTRL_TESTS=(
+    # A `sqlx::query("…")` statement is never schema-checked, so one naming a
+    # renamed column or a relation that never existed fails only at request
+    # time. Drives the REAL repository methods and the REAL statements against
+    # a migrated database; `common` (DATABASE_URL) harness, so CTRL_TESTS and
+    # not TC_TESTS (64b).
+    "dead_statement_tests"
     # `updated_at` must date a user edit, not a maintenance write. Drives the
     # REAL trigger with the REAL statements the background jobs issue, on the
     # `common` (DATABASE_URL) harness — so it belongs here, not in TC_TESTS.

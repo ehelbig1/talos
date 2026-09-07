@@ -23,9 +23,6 @@ pub use talos_secrets_manager::*;
 pub mod kek_provider {
     pub use talos_secrets_manager::kek_provider::*;
 }
-pub mod kek_rewrap {
-    pub use talos_secrets_manager::kek_rewrap::*;
-}
 pub mod provider {
     pub use talos_secrets_manager::provider::*;
 }

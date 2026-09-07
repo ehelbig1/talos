@@ -2850,12 +2850,14 @@ async fn handle_enqueue_workflow(
     // denied" sends the operator to check permissions during a database
     // incident, and it is the same sentence the sibling handlers already carry
     // repair comments about.
-    let wf_graph = match state
-        .execution_repo
-        .get_workflow_graph_for_user(wf_id, user_id)
-        .await
-    {
-        Ok(Some(g)) => g,
+    // 2026-09-07: this read the GRAPH alone (`get_workflow_graph_for_user`),
+    // so the handler had no `status` and no `is_enabled` to gate on and applied
+    // NO liveness predicate — an ARCHIVED or DISABLED workflow could be
+    // enqueued up to 10,000 times per call while `trigger_workflow` refused
+    // the disabled one. Reading the RECORD instead costs nothing (it carries
+    // the same `graph_json`) and makes the shared decision reachable.
+    let wf_record = match state.workflow_repo.get_workflow(wf_id, user_id).await {
+        Ok(Some(r)) => r,
         Ok(None) => return mcp_error(req_id, -32000, "Workflow not found or access denied"),
         Err(e) => {
             tracing::error!(
@@ -2871,6 +2873,20 @@ async fn handle_enqueue_workflow(
             );
         }
     };
+
+    // The shared trigger-time liveness rule — see
+    // `talos_workflow_repository::not_dispatchable_reason`, whose decision is
+    // `talos_workflow_liveness::is_dispatchable`. ABOVE the enqueue loop, so
+    // a refusal creates no `queued` execution rows at all rather than a partial
+    // batch somebody has to cancel.
+    if let Some(reason) = wf_record.not_dispatchable_reason() {
+        return mcp_error(
+            req_id,
+            -32003,
+            &talos_workflow_repository::not_dispatchable_message(reason),
+        );
+    }
+    let wf_graph = wf_record.graph_json;
 
     // Try active published version first, fall back to draft graph.
     //

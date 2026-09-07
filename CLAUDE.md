@@ -1981,6 +1981,105 @@ supervisor is a separate change; what this one buys is that the most likely
 CAUSE of such a panic — a bare `.get` on a nullable column — can no longer be
 added to that directory silently.
 
+## A statement that has never once executed, rendered as "nothing here" (2026-09-07)
+
+Three surfaces asserted a determinate negative — the misleading-report class
+(checks 74, 76, 79/79b, 81) — with a cause none of those checks can see: **the
+SQL never ran.** `sqlx::query("…")` takes a runtime `&str`, so a statement
+naming a renamed column is invisible to rustc, to clippy and to CI's sqlx
+offline cache (which covers only the `query!` MACRO forms). The population is
+now measured and gated by **check 88**.
+
+**(Y1) `webhooks: []` from a statement that cannot PREPARE.**
+`AnalyticsRepository::list_workflow_webhooks` asked `webhook_triggers` for
+`endpoint_path` and `is_enabled`. That table's flag column is `enabled`, and
+there has never been an `endpoint_path` column **at all** — the endpoint is
+DERIVED from the id (`/webhooks/{id}`), which is why the statement could not be
+repaired by a rename and why `webhook_endpoint_path` now has ONE home. Its
+caller `get_workflow_dependencies` did `.unwrap_or_default()`, so `webhooks: []`
+and `webhook_count: 0` were a determinate negative on every call. **The brief
+named one statement; there were two** — `list_webhooks_for_modules` is
+byte-identical in its column list and feeds `list_workflow_triggers`, which DOES
+route the read through a `Readings` ledger, so that tool has been honestly
+reporting `webhooks: not_measured` forever. Both now bind `user_id` as well:
+the callers do gate ownership upstream, but `workflow_id` is not the tenant half
+and check 70's lesson is that a statement should not rely on caller discipline.
+All three reads in `handle_get_workflow_dependencies_list` now go through a
+`Readings` ledger, and each COUNT is marked derived exactly when ITS OWN source
+read failed — not whenever anything failed, because `module_count` comes from
+the graph and is still measured when the NAME lookup is not.
+
+**(Y2) A filter on a status the schema does not have.** `workflows_needing_schema`
+filtered `w.status = 'published'`. The lifecycle enum is `draft | active |
+archived` (migration `20260318000000`) and `handle_list_workflows` **refuses
+`published` as a filter value in so many words** — *"the schema has no rows with
+that value so accepting it would silently return an empty list"* — so the
+hygiene check reported `[]` and `count: 0` for every operator on every run.
+**The brief said nothing has ever written that value; that is refuted.** Exactly
+one writer does — `insert_published_internal_workflow`, used by
+`plan_and_execute_workflow` — and it writes `workflow_type = 'internal'` in the
+SAME INSERT, which the predicate's very next clause EXCLUDES. So the filter was
+not merely unmatched, it was **self-contradictory**: the only rows the status
+clause admits are rows the type clause rejects. (Live fleet: 0 at
+`status='published'`, 0 at `workflow_type='internal'`; 17 active / 11 draft / 8
+archived.) The same literal was in a SECOND reader the brief did not name —
+`ActorRepository::list_published_workflows_for_actor`, the **A2A agent card**,
+so every actor's card advertised ZERO workflows and an empty card was
+indistinguishable from an actor that owns none. Both now read
+`talos_workflow_liveness::live_sql`.
+
+**And the writer itself could never have written a row.** Driving
+`insert_published_internal_workflow` in a DB test fails `23502`: it omits
+`workflows.module_uri`, which is `NOT NULL` with no default, while every other
+graph-workflow INSERT in that file binds `''`. So `plan_and_execute_workflow`
+failed at its first write. **A PREPARE probe cannot see this** — the statement
+parses and plans perfectly and only a real INSERT trips the constraint — which
+is the sharpest statement of check 88's limits, and it was found by a test
+rather than by the probe.
+
+**(Y3) Three trigger paths, three different answers.** `trigger_workflow`
+refused `is_enabled = false` and nothing else; `bulk_trigger_workflow` and
+`enqueue_workflow` applied **no liveness predicate at all**. So an ARCHIVED
+workflow was dispatchable from all three and a DISABLED one from two — check
+78's "three of four entry points refused", one tool over. Archiving does **not**
+clear `is_enabled` (none of the five `SET status = 'archived'` statements touch
+that column), so on the reference fleet **all 8 archived workflows are
+`is_enabled = true`** and nothing protected them incidentally. The decision is
+`talos_workflow_liveness::is_dispatchable` — **deliberately NOT
+`not_live_reason`**, which the brief named: a DRAFT must stay dispatchable
+(`trigger_workflow` has always run one, a parent dispatches a child's draft
+`graph_json` with no status predicate, and 11 of 36 workflows here are drafts,
+4 with enabled schedules), so gating on LIVENESS would refuse those and create a
+NEW disagreement in place of the one this closes. `not_live_reason` answers a
+REPORTING question; a trigger gate is a DISPATCH question.
+`OrchestrationError::WorkflowNotLive` is a new variant rather than a reuse, and
+the exhaustive matches made the compiler name all four mapping sites — including
+`talos-evaluation`'s, whose `_` arm would have rendered a deliberate policy
+refusal as *"execution dispatch failed"* and sent an operator to look at NATS
+(check 81(c)'s shape). `WorkflowDisabled` is KEPT for `replay`, which asks the
+narrower question off a boolean it reads directly.
+
+**Two behaviour changes, both new refusals, both stated plainly**: an archived
+workflow can no longer be triggered from any of the three paths (it could from
+all three), and a disabled one can no longer be bulk-triggered or enqueued. Both
+gates sit ABOVE the graph load and the per-input loop, so a refusal costs no
+dispatch and no partial batch an operator has to cancel.
+
+**What was measured and NOT done.** The `is_enabled` gate is functional but
+LATENT on this fleet — nothing is currently disabled — so the only refusal this
+change can produce today is the archived one. The scheduler / webhook /
+capability-resolution dispatch paths are deliberately untouched. And no live
+trigger was fired against an archived workflow to demonstrate the pre-fix
+behaviour, because doing so would EXECUTE it on the operator's only
+environment; the evidence is the code (no path reads `status`, and
+`WorkflowRecord` has carried it the whole time), the schema, and the fleet
+counts above.
+
+**One finding recorded and NOT fixed**: `controller/tests/common`'s
+`create_test_organization` omits the `NOT NULL` `slug`, so it fails on every
+call. It is the same class inside the harness; its other callers are outside
+this change and `dead_statement_tests` seeds its own row instead.
+
 ## Sub-workflow dispatch (engine)
 
 Every parent node that runs a sub-workflow (judge, ensemble, reflective-retry, llm-dispatch, sub_workflow) uses the shared dispatcher pattern in `controller/src/engine/parallel.rs`:
@@ -2319,7 +2418,7 @@ shared across MCP and GraphQL ctx. Remaining structural work below:
 - **Tests that hit async code** need `#[tokio::test]`, not `#[test]`. `sqlx::PgPoolOptions::connect_lazy` panics outside a Tokio runtime.
 
 ## Pre-deploy validation
-- **`make lint` enforces structural rules** via `scripts/lint-structural.sh`. 87 checks today (the authoritative, inline-documented list lives in the script; `bash scripts/lint-structural.sh --count` prints the live number, and check 54 fails the lint if this sentence's count goes stale), each tied to a specific past regression so it catches at PR-time the class of bug that survives `cargo check` cleanly but breaks at CI or request time:
+- **`make lint` enforces structural rules** via `scripts/lint-structural.sh`. 88 checks today (the authoritative, inline-documented list lives in the script; `bash scripts/lint-structural.sh --count` prints the live number, and check 54 fails the lint if this sentence's count goes stale), each tied to a specific past regression so it catches at PR-time the class of bug that survives `cargo check` cleanly but breaks at CI or request time:
   1. raw `actor_memory` writes + legacy `value`-column projections outside `talos-memory/`
   2. bidirectional `controller/src/main.rs` route ↔ `deploy/helm/talos/templates/frontend/configmap.yaml` location alignment (opt-outs: `// no-nginx-route`, `# no-controller-route`)
   3. legacy `__agent_context__` key regressions (canonical is `__actor_context__`; opt-out `// allow-agent-context-key`)
@@ -2423,6 +2522,7 @@ shared across MCP and GraphQL ctx. Remaining structural work below:
   86. a "never executed" predicate must not drive a destructive draft path — `execute_subworkflow_graph` runs a child IN-PROCESS and records no `workflow_executions` row (measured 2026-09-05: zero rows carrying `parent_execution_id`, live table and archive, platform-wide), so `NOT EXISTS (SELECT 1 FROM workflow_executions …)` does not mean *this workflow never ran*, it means *nothing in that table can tell you*. Three statements are built on it and two of them ACT: `fix_all confirm=true` DELETES irreversibly, and `session_start`'s auto-archive ARCHIVES with no confirmation. #758 fixed the 30-day dormant list, classified these two as "latent today — no draft child on the fleet", and **the first live report after it deployed listed the flagship's daily `team_gather` sub-workflow under a delete instruction** — the latency claim had been measured with the query that was already fixed. Two legs, because either alone is defeated: **(a)** FILE-scoped — any non-test file carrying the predicate must name the child-reference chokepoint (`scan_child_parents` / `talos_child_workflow_refs` / `ChildReferenceScan` / `child_protection_reason`). File-scoped and not windowed because the analytics SELECT feeds a delete decision made ~180 lines later and three crates away, which no window can see. **(b)** SITE-scoped on the DESTRUCTIVE verb — an `UPDATE`/`DELETE` statement carrying the predicate must have the chokepoint within 40 lines; without it, (a) lets a new destructive statement ride into an already-gated file. **Measured in both directions against a `git archive` of `origin/main`: leg (a) 2 findings (`talos-advanced-repository`, `talos-analytics-repository`), leg (b) 1 (`archive_stale_drafts`'s UPDATE) — every one real, 0 false positives — and 0 on the fixed tree.** Leg (b)'s statement-head walk starts ABOVE the predicate line and had to: the predicate's own `SELECT 1 FROM workflow_executions` was matching as the statement head, and **the first version of this leg therefore reported 0 on the pre-fix tree** — the gate-that-doesn't-gate shape (#624, checks 64/65) inside the guard for it, caught only because the leg was run against the real pre-fix tree instead of a mutation. Mutation-proved three further ways on the fixed tree: renaming the chokepoint away from the archive UPDATE fires (b) at that exact line while (a) stays silent (the file still names it elsewhere — which is precisely why (b) exists); a new destructive statement in a brand-new crate fires BOTH; and a tree where the predicate matches nothing at all FAILS LOUDLY rather than passing, since a check that matches nothing is a green tick over zero statements. **Stated limits, each confirmed rather than inferred:** both legs are TEXTUAL, so a predicate assembled with `format!()` or spelled differently (`NOT EXISTS(SELECT`, a `LEFT JOIN … IS NULL`) is invisible; **(a)'s file scope means one gated site vouches for every site in that file, and there is such a site TODAY** — `AdvancedRepository::get_draft_workflows`, deliberately left child-blind as a report-only path, sits in the same file as the gated archive method, so a fourth DESTRUCTIVE statement added to that file would be seen by (b) but not by (a) (it carries no opt-out marker precisely because (a) matches one file-globally); (b)'s 40-line window and 25-line head walk mean a reflowed statement reads as ungated — a FALSE POSITIVE, the loud direction; and neither leg can prove the scan's ANSWER is honoured, only that the chokepoint is named — a `protection_for(id)` whose result is discarded satisfies both, which is why the behaviour is pinned by `controller/tests/stale_draft_child_workflow_tests` driving the real `fix_all` planning path AND `confirm=true` against a real row. Opt-out `// allow-execution-blind-draft-path: <reason>` — file-globally for (a), within the 40-line window for (b).
 
   87. a `workflows` liveness predicate must name the shared home — `workflows` carries TWO columns that both claim to say whether a workflow is live and they are not the same fact: `is_enabled` (`20260314001600`) is the OPERATOR's pause toggle, `status` (`20260318000000`) is the LIFECYCLE. Neither writer touches the other's column — the six `UPDATE workflows SET status = 'archived'` sites never clear `is_enabled` and `set_workflow_enabled` never moves `status` — so, measured on the reference fleet 2026-09-07, **all eight archived rows still read `is_enabled = true`** (`active/t 17, archived/t 8, draft/t 11`). The hygiene report's dormant query predicated `w.is_enabled = true` with no status clause and listed every one of them under *"Consider disabling or deleting them with `batch_delete_workflows`"*: of the TEN workflows that advice named, EIGHT had already been retired by the operator it was advising. The predicate now has ONE home, the leaf crate `talos-workflow-liveness`, which renders the Rust predicate and its exact SQL twin (`live_sql` / `dispatchable_sql` / `retired_sql`), with `rust_and_sql_agree_on_every_status` EVALUATING the rendered fragment rather than comparing strings. **WINDOW-scoped, not file-scoped, and that is the whole design**: the four sibling queries in `talos-analytics-repository/src/lib.rs` already spelled the same predicate correctly a FOURTH way (`is_enabled = true AND (status IS NULL OR status != 'archived')` — the `status IS NULL` arm dead, the column being `NOT NULL`) in the SAME FILE as the defect, so a file-scoped rule — check 86(a)'s shape — would have been GREEN over it: four correct siblings vouching for a fifth site that forgot. **Measured in both directions: file-scoped reports 6 on pristine `origin/main` of which 3 are the `workflow_schedules.is_enabled` false positive (50% precision, shipping at 3 markers on correct code); window-scoped reports SEVEN, every one a real `workflows` liveness predicate, 0 false positives, and 0 on the fixed tree.** Stated honestly, and it matters: **7-of-7 against the RULE, 1-of-7 as a BUG detector** — the other six were CORRECT and merely unrouted (check 85(b)'s framing). Mutation-proved three ways: reinstating the dormant defect reports it at that exact line; a COMMENTED-OUT gate does not vouch (whole-line comments are stripped first — check 73's self-report trap, which cost this check one false finding on its own doc block before the strip went in); and a tree where the shape has vanished FAILS LOUDLY. That third leg needed a two-part tripwire and the first version got it wrong in the REASSURING direction — once a site is routed the literal `is_enabled = true` disappears from it, so a raw-literal-only tripwire reported "found nothing" on the fully-fixed tree (measured, not imagined); it now counts raw windows PLUS rendered `*_sql(` call sites. **Stated limits, each confirmed by mutation**: TEXTUAL and WINDOW-bounded, so a reflowed statement or one assembled from a fragment in another file reads as ungated — a FALSE POSITIVE, the loud direction; `workflow_schedules.is_enabled` (~55 references) is excluded by the window's own `workflow_schedules` test and `webhook_triggers`' column is spelled `enabled`, so both are out of range; it proves the home is NAMED in the window, never that the rendered fragment is the one bound into the query; and it says NOTHING about the 48 `status`-only sites, deliberately — nearly all are lifecycle filters (`status = 'draft'` for the stale-draft list) rather than liveness decisions, so a wider regex would be enforcement-shaped noise. **What it cannot reach, recorded rather than implied**: no EXECUTION path filters on `workflows.status` at all — proved with a scratch row against the verbatim scheduler due query, the post-due load, the webhook dispatch read, `resolve_by_capabilities` and `WorkflowGraphStore::get_graph`, all five of which returned an archived workflow. Latent on this fleet (the 8 archived rows have 0 enabled schedules and 0 enabled webhooks) and left alone as a fleet-wide behaviour change, not a report fix. Opt-out `// allow-split-liveness-predicate: <reason>` within the window.
+  88. every static sqlx statement must PREPARE against the real schema — `sqlx::query("…")`, the FUNCTION form, takes a runtime `&str`. **NOTHING checks it**: not rustc, not clippy, and not CI's "sqlx offline cache (compile-checked queries)" job, which covers only the `query!` MACRO forms. Measured on this tree: **69** macro call sites against **1,904** function-form static statements, so the two sets are **disjoint by construction** and this check covers exactly the complement, not the overlap. A statement naming a renamed column, a dropped table or a relation that never existed therefore compiles cleanly, ships, and errors at request time — where a caller's `.unwrap_or_default()` renders it as an empty list. `AnalyticsRepository::list_workflow_webhooks` asked `webhook_triggers` for `endpoint_path` and `is_enabled`; that table's flag column is `enabled` and there has never been an `endpoint_path` column at all (the endpoint is DERIVED from the id), so `get_workflow_dependencies` answered `webhooks: []`, `webhook_count: 0` for every workflow since the rename — **a determinate negative over SQL that has never once executed**, the misleading-report class (74, 76, 79/79b, 81) with a new cause. Check 74's glob does not name that handler and it built no `Readings`, so neither leg saw it. **Measured in both directions against a real `git worktree` of `origin/main`: ELEVEN findings there, all eleven real, 0 false positives — and 0 on the fixed tree.** The whole-workspace scan (wider than this check's roots) found **16**; the five outside them are `controller/examples/`. The eleven span four distinct causes, which is why this is a check and not a one-line fix: a RENAMED column (the two webhook statements); a relation that NEVER existed (`workflow_audit_log`, `workflow_webhooks` — both read by methods with ZERO callers, both deleted); a table a sibling integration has and this one does not (`gmail_integration_audit_log`, so **every Gmail connect/disconnect event has been lost since the integration shipped**, logging an ERROR each time — migration `20260907120000` creates it, copied clause-for-clause from `slack_integration_audit_log`); a column a COMPLETED migration retired (`encrypted_key_v2`, which Phase 5 `20260424030000` renamed to `encrypted_key` — and that migration is FOLDED INTO THE SCHEMA BASELINE, cutpoint `20260705130000`, so the Phase-3/4 tooling could never run on any database this repository can produce; its own abort message told the operator to run the tool that can no longer run, and the module plus both examples are deleted); and a statement Postgres rejects **unconditionally** — `SELECT COUNT(*) … FOR UPDATE` in `talos-organizations`, under a comment reading *"Use a transaction with FOR UPDATE to prevent TOCTOU races. Lock the relevant rows and count owners atomically."* No bind, no schema and no data can make that run, so `remove_member` errored on **every** call and the **last-owner guard has never once been evaluated**; the fix locks the owner rows in a subquery and counts what was locked. **Two false-positive classes are excluded by RULE, not by a path list, and both were measured rather than assumed.** (a) `42P08`/`42P18` **indeterminate parameter type** (8 workspace-wide, 2 of them production): the probe prepares with no type list so the server must infer, while sqlx at runtime SENDS the type OIDs from the Rust bindings — proven by re-preparing the same statements with an explicit type list and getting `DEALLOCATE`, and corroborated live by check 70's own record of one of them demonstrably executing. Counted and reported, never failed on. (b) **test-created runtime tables** (11, every one of them): `rls_probe`, `rls_union_probe`, `rls_perm_probe`, `rpcwc_probe` are `CREATE`d by the binary that queries them, so `tests/` directories are out of scope. **Stated limits, each measured rather than inferred:** it is TEXTUAL, so a statement assembled with `format!` or reached through a variable is INVISIBLE — **32 such call sites in scope**, reported as a count on every run so the coverage claim is visible rather than implied, and this change itself moved TWO statements out of range by routing them through `talos_workflow_liveness::live_sql` (one home for the predicate beat static-ness, and a DB test drives both). **PREPARE proves a statement can be PARSED and PLANNED, never that it can SUCCEED** — and that gap is not hypothetical: `insert_published_internal_workflow` omits `workflows.module_uri`, which is `NOT NULL` with no default, so `plan_and_execute_workflow` failed at its first write (0 rows at `workflow_type = 'internal'` platform-wide) and this check reports it as clean. It was found by a DB test, not by the probe; constraints, triggers, RLS and permissions are all outside what a PREPARE can see. It also says nothing about a statement that runs perfectly and matches nothing — `WHERE w.status = 'published'` prepares fine (see the dated entry below). It is ENV-GATED (`TALOS_LINT_SQL_PREPARE=1` + a migrated `TALOS_SQL_PREPARE_URL`/`DATABASE_URL`), exactly like check 7's clippy, and `make test-integration` runs it against the DB it already builds so the gate is not merely opt-in; asked-for-and-unable-to-run is a FAILURE rather than a skip, and extracting ZERO statements is a hard failure too, because a check that matches nothing is a green tick over nothing (checks 64/65) — that arm fired for real during development when the roots were passed as one argument. Mutation-proved in four directions on the fixed tree: reverting the webhook column, reverting one `COUNT(*) … FOR UPDATE`, and deleting the retry-intelligence opt-out each fire at the exact line; the first of those initially read as a SURVIVOR and was a `sed` that never matched — printing the diff before believing the result is the discipline, not the result itself. Opt-out `// allow-unpreparable-sql: <reason>` within 8 lines above the call, for a statement deliberately kept un-runnable (`talos-retry-intelligence`'s `diagnose_failures` is the one live instance: zero callers, and the paragraph above it documents a denominator trap a future reviver must read).
 
 - **Deleting a test file? Grep the CI workflows first.** `quality.yml` names individual integration targets by hand (`cargo nextest run -p controller --test <name>`), so removing a test file makes `cargo test --no-run` fail with `no test target named <name>` (exit 101) even though the code is fine — it failed the whole Rust-unit check in PR #567 after the circuit-breaker self-test was deleted. `grep -rn "<test_name>" .github/ Makefile` before deleting.
 - **A registered Prometheus metric with zero increment sites is DEAD — an alert on it silently never fires.** `talos_workflow_executions_total` was registered in `talos-metrics` but never incremented anywhere, so the failure-rate alert built on it would never have fired (found + fixed 2026-07-24: wired it at the `mark_execution_completed`/`_failed` chokepoints in both repo crates, counted only on a real row transition). When adding an alert, confirm the metric has a live `.with_label_values(&[…]).inc()` (or `.inc()`) call site — not just a `CounterVec::new` + `registry.register`. Now enforced by structural lint **check 58**.

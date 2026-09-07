@@ -573,6 +573,12 @@ fn safe_orch(e: &OrchestrationError) -> String {
         E::ExecutionArchived(id, at) => format!("execution {id} was archived at {at}"),
         E::ExecutionPaused => "execution paused".into(),
         E::WorkflowDisabled(id) => format!("workflow {id} disabled"),
+        // Explicit, NOT left to the `_` arm below: that arm renders
+        // "execution dispatch failed", which would send an operator looking at
+        // NATS and the worker fleet for a workflow the platform declined to
+        // dispatch on purpose. A wildcard swallowing a new refusal variant is
+        // check 81(c)'s shape.
+        E::WorkflowNotLive(id, reason) => format!("workflow {id} not dispatchable ({reason})"),
         E::StatusConflict(s) => format!("status conflict: {s}"),
         E::AuthorizationDenied(_) => "authorization denied".into(),
         E::ConcurrencyLimitExceeded(_) => "concurrency limit exceeded".into(),

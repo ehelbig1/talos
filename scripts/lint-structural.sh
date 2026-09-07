@@ -8740,6 +8740,66 @@ if [ "$LIVENESS_HOME_FAIL" -gt 0 ]; then
 else
     green "✓ every workflows liveness predicate reads the shared home"
 fi
+
+bold "▶ check 88: every static sqlx statement must PREPARE against the real schema"
+
+# `sqlx::query("…")` — the FUNCTION form — takes a runtime `&str`. NOTHING
+# checks it against the schema: not rustc, not clippy, and not CI's "sqlx
+# offline cache" job, which covers only the `query!` MACRO forms (69 call sites
+# vs 1,904 function-form statements — the two sets are disjoint by
+# construction). So a statement naming a renamed column, a dropped table or a
+# relation that never existed compiles cleanly, ships, and errors at request
+# time — where a caller's `.unwrap_or_default()` renders it as an empty list and
+# an operator reads a determinate negative over SQL that has never once run.
+#
+# Needs a migrated database, so it is ENV-GATED exactly like check 7's clippy:
+# set TALOS_LINT_SQL_PREPARE=1 and point TALOS_SQL_PREPARE_URL (or DATABASE_URL)
+# at one. `make test-integration` runs it against the DB it already builds, so
+# the gate is not merely opt-in.
+#
+# See CLAUDE.md check 88 for the measured numbers, the two false-positive
+# classes and the stated limits. Opt-out: // allow-unpreparable-sql: <reason>.
+
+SQL_PREPARE_URL="${TALOS_SQL_PREPARE_URL:-${DATABASE_URL:-}}"
+if [ "${TALOS_LINT_SQL_PREPARE:-0}" != "1" ]; then
+    yellow "⊘ skipped (set TALOS_LINT_SQL_PREPARE=1 + a migrated DATABASE_URL to run)"
+elif [ -z "$SQL_PREPARE_URL" ]; then
+    # Asked for and unable to run is a FAILURE, not a skip: a check that skips
+    # when switched on is a green tick over zero statements (checks 64/65).
+    red "✗ TALOS_LINT_SQL_PREPARE=1 but no TALOS_SQL_PREPARE_URL / DATABASE_URL"
+    EXIT_CODE=1
+elif [ ! -f "$ROOT/scripts/lint-sql-prepare.py" ]; then
+    red "✗ scripts/lint-sql-prepare.py is missing — the check cannot run"
+    EXIT_CODE=1
+else
+    # Roots: the crates whose statements are the platform's persistence layer —
+    # the repository crates plus the check-52 widened family (repositories by
+    # ROLE, not by name). The runner itself prunes `target`, `.claude` (check
+    # 75) and `tests/` (an integration binary legitimately CREATEs its own
+    # tables at runtime).
+    SQL_PREPARE_ROOTS=()
+    for d in "$ROOT"/talos-*-repository "$ROOT"/talos-memory "$ROOT"/talos-secrets-manager \
+             "$ROOT"/talos-registry "$ROOT"/talos-module-executions \
+             "$ROOT"/talos-integration-state "$ROOT"/talos-auth \
+             "$ROOT"/talos-organizations "$ROOT"/talos-gmail "$ROOT"/talos-google-calendar \
+             "$ROOT"/talos-slack "$ROOT"/talos-retry-intelligence; do
+        [ -d "$d/src" ] && SQL_PREPARE_ROOTS+=("$d/src")
+    done
+    if [ "${#SQL_PREPARE_ROOTS[@]}" -eq 0 ]; then
+        red "✗ no source roots resolved — the crate layout moved, so this check"
+        red "  would pass over zero statements"
+        EXIT_CODE=1
+    elif python3 "$ROOT/scripts/lint-sql-prepare.py" "$SQL_PREPARE_URL" "${SQL_PREPARE_ROOTS[@]}"; then
+        green "✓ every static sqlx statement prepares against the migrated schema"
+    else
+        red "✗ static sqlx statement(s) do not PREPARE — they cannot run at all"
+        yellow "  → a caller's .unwrap_or_default() renders this as an empty list, so the"
+        yellow "    tool reports a determinate negative over SQL that has never executed."
+        yellow "  → fix the statement, delete it if its table never existed, or mark it"
+        yellow "    // allow-unpreparable-sql: <reason> within 8 lines above the call."
+        EXIT_CODE=1
+    fi
+fi
 echo
 
 bold "▶ check 54: lint self-consistency (check numbering + documented count)"
