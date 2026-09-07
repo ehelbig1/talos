@@ -481,6 +481,9 @@ pub struct ChainSweepSnapshot {
     /// [`ChainVerifyErrorKind::EmptyChain`]. NOT verified.
     pub empty: usize,
     pub failed: usize,
+    /// Job chains carrying a BYTE-IDENTICAL redelivery. Never part of
+    /// `failed`; when it is the only finding the chain is in `verified_ok`.
+    pub duplicate_delivery: usize,
     pub errored: usize,
     /// Jobs with no `workflow_execution_id`, so no genesis pair and no
     /// attempt. Disclosed, never folded into a clean count.
@@ -731,6 +734,7 @@ mod verifier_tests {
             verified_ok: 0,
             empty: 0,
             failed: 0,
+            duplicate_delivery: 0,
             errored: 1,
             unbound: 0,
             cap_hit: false,

@@ -262,3 +262,102 @@ mod tests {
         assert_ne!(event_a.calculate_hash(), event_b.calculate_hash());
     }
 }
+
+/// The producer half of the duplicate-anchor defect, pinned at the sealing
+/// rule that replaced it.
+///
+/// Measured on the live ledger 2026-09-07: 196 of 49,461 job prefixes carried
+/// more than one `execution_complete` anchor, every one of them claiming
+/// `sequence_num` 1, because the worker's retry loop built a FRESH
+/// `ExecutionLedger` per attempt and anchored each one. 161 of the 196 carried
+/// copies whose `timestamp` differed by a second, so they were not even
+/// byte-identical — the verifier could not tell them from a substitution.
+#[cfg(test)]
+mod seal_job_audit_chain_tests {
+    use crate::audit::ExecutionLedger;
+    use crate::runtime::seal_job_audit_chain;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use talos_audit_event::{verify_chain_anchored, AnchorVerdict, ChainBreak};
+
+    fn ledger() -> Arc<tokio::sync::Mutex<ExecutionLedger>> {
+        Arc::new(tokio::sync::Mutex::new(ExecutionLedger::new("wf", "ex")))
+    }
+
+    /// The fix: attempts SHARE one ledger, the chain is one monotonic
+    /// sequence across them, and exactly one anchor closes it — committing
+    /// the real total, not one attempt's.
+    #[tokio::test]
+    async fn a_retried_job_yields_one_anchor_over_one_continuous_chain() {
+        let led = ledger();
+        let mut events = Vec::new();
+        // Attempt 1 emitted an event and failed; attempt 2 emitted one and
+        // succeeded. Both wrote through the SAME ledger.
+        for attempt in 1..=2 {
+            let mut guard = led.lock().await;
+            events.push(guard.append("worker", "act", &format!("attempt-{attempt}")));
+        }
+        let eligible = AtomicBool::new(true);
+        let anchor = seal_job_audit_chain(Some(led), &eligible)
+            .await
+            .expect("an eligible job seals its chain");
+        assert_eq!(anchor.sequence_num, 3, "the anchor continues the chain");
+        assert_eq!(anchor.payload, r#"{"total_events":3}"#);
+        events.push(anchor);
+
+        let report = verify_chain_anchored("wf", "ex", &events, &[]);
+        assert!(report.ok, "{report:?}");
+        assert_eq!(report.anchor, AnchorVerdict::Anchored { total_events: 3 });
+        assert!(report.chain.breaks.is_empty(), "{:?}", report.chain.breaks);
+    }
+
+    /// The defect, reproduced, so the test above is not merely asserting that
+    /// something works: a ledger PER ATTEMPT gives two events that both claim
+    /// sequence 1, and the verifier is right to complain about them.
+    #[tokio::test]
+    async fn a_ledger_per_attempt_is_what_produced_the_duplicate() {
+        let mut events = Vec::new();
+        for _ in 0..2 {
+            let eligible = AtomicBool::new(true);
+            let anchor = seal_job_audit_chain(Some(ledger()), &eligible)
+                .await
+                .expect("eligible");
+            events.push(anchor);
+        }
+        assert_eq!(events[0].sequence_num, 1);
+        assert_eq!(events[1].sequence_num, 1);
+        assert_eq!(
+            events[0].previous_hash, events[1].previous_hash,
+            "both restart at the deterministic genesis hash"
+        );
+        let report = verify_chain_anchored("wf", "ex", &events, &[]);
+        assert!(
+            report.chain.breaks.iter().any(|b| matches!(
+                b,
+                ChainBreak::DuplicateDelivery { seq: 1 } | ChainBreak::DuplicateSequence { seq: 1 }
+            )),
+            "{:?}",
+            report.chain.breaks
+        );
+    }
+
+    /// A job killed by the wall clock never completed, so it earns no anchor
+    /// and keeps the deliberately-soft `Unanchored` verdict. Dropping this
+    /// guard would anchor every timed-out execution and destroy the one
+    /// distinction `AnchorVerdict::Unanchored` exists to preserve.
+    #[tokio::test]
+    async fn an_uncompleted_job_is_not_anchored() {
+        let eligible = AtomicBool::new(false);
+        assert!(seal_job_audit_chain(Some(ledger()), &eligible)
+            .await
+            .is_none());
+    }
+
+    /// No execution context (sandbox / `test_module` runs) means no ledger and
+    /// no anchor — unchanged behaviour, pinned so the `?` is not "simplified".
+    #[tokio::test]
+    async fn a_job_without_a_ledger_seals_nothing() {
+        let eligible = AtomicBool::new(true);
+        assert!(seal_job_audit_chain(None, &eligible).await.is_none());
+    }
+}

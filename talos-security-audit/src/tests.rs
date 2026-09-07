@@ -1592,6 +1592,7 @@ fn sweep(
         verified_ok,
         empty: 0,
         failed: 0,
+        duplicate_delivery: 0,
         errored,
         unbound: 0,
         cap_hit,
@@ -1617,6 +1618,7 @@ fn a_verified_chain_passes_as_a_round_trip() {
             workflow_execution_id: "wfx-1".to_string(),
             total_events: 12,
             signatures_checked: true,
+            duplicate_deliveries: 0,
         },
         Some(sweep(37, 0, None, false)),
     );
@@ -1638,11 +1640,56 @@ fn a_verified_chain_without_keys_states_what_it_did_not_check() {
             workflow_execution_id: "wfx-1".to_string(),
             total_events: 3,
             signatures_checked: false,
+            duplicate_deliveries: 0,
         },
         None,
     );
     assert_eq!(c.status, Status::Pass);
     assert!(c.detail.contains("WITHOUT HMAC signatures"), "{}", c.detail);
+}
+
+/// A chain carrying a byte-identical REDELIVERY still PASSES — nothing was
+/// altered, added or removed — but the count is DISCLOSED. Without the
+/// sentence, "2 event(s), no gaps, no broken links" and "1 event delivered
+/// twice" render identically, and `total_events` counts persisted records.
+#[test]
+fn a_redelivered_chain_passes_with_the_count_disclosed() {
+    let c = check_audit_chain_verification(
+        &AuditChainProbe::Verified {
+            execution_id: "ex-1".to_string(),
+            workflow_execution_id: "wfx-1".to_string(),
+            total_events: 2,
+            signatures_checked: true,
+            duplicate_deliveries: 1,
+        },
+        Some(sweep(37, 0, None, false)),
+    );
+    assert_eq!(c.status, Status::Pass);
+    assert_eq!(c.verification, Verification::RoundTrip);
+    assert!(
+        c.detail.contains("1 of those record(s) are BYTE-IDENTICAL"),
+        "{}",
+        c.detail
+    );
+    assert!(c.detail.contains("not tampering"), "{}", c.detail);
+}
+
+/// The control: with nothing redelivered the check says nothing about
+/// redelivery. Nothing to say ⇒ no sentence — an "0 redeliveries" clause on
+/// every healthy report is noise that trains the reader to skip the line.
+#[test]
+fn a_clean_chain_says_nothing_about_redelivery() {
+    let c = check_audit_chain_verification(
+        &AuditChainProbe::Verified {
+            execution_id: "ex-1".to_string(),
+            workflow_execution_id: "wfx-1".to_string(),
+            total_events: 2,
+            signatures_checked: true,
+            duplicate_deliveries: 0,
+        },
+        None,
+    );
+    assert!(!c.detail.contains("BYTE-IDENTICAL"), "{}", c.detail);
 }
 
 #[test]
@@ -1789,6 +1836,7 @@ fn an_aborted_sweep_is_not_a_clean_bill_of_health() {
             workflow_execution_id: "wfx-1".to_string(),
             total_events: 1,
             signatures_checked: true,
+            duplicate_deliveries: 0,
         },
         Some(sweep(500, 0, None, true)),
     );
@@ -1805,6 +1853,7 @@ fn an_absent_sweep_snapshot_reads_as_not_yet_run() {
             workflow_execution_id: "wfx-1".to_string(),
             total_events: 1,
             signatures_checked: true,
+            duplicate_deliveries: 0,
         },
         None,
     );
@@ -1832,6 +1881,7 @@ fn the_chain_check_costs_nothing_in_every_arm() {
             workflow_execution_id: "wfx-1".to_string(),
             total_events: 1,
             signatures_checked: true,
+            duplicate_deliveries: 0,
         },
         AuditChainProbe::Broken {
             execution_id: "e".to_string(),
@@ -1918,6 +1968,7 @@ fn the_pass_names_the_id_space_it_verified() {
             workflow_execution_id: "wfx-9".to_string(),
             total_events: 3,
             signatures_checked: true,
+            duplicate_deliveries: 0,
         },
         Some(sweep(4, 0, None, false)),
     );
@@ -1982,6 +2033,7 @@ fn the_sweep_note_reports_both_grains() {
         verified_ok: 9,
         empty: 1,
         failed: 1,
+        duplicate_delivery: 0,
         errored: 1,
         unbound: 0,
         cap_hit: false,
@@ -2001,6 +2053,7 @@ fn the_sweep_note_reports_both_grains() {
             workflow_execution_id: "wfx".to_string(),
             total_events: 1,
             signatures_checked: true,
+            duplicate_deliveries: 0,
         },
         Some(snapshot),
     );
@@ -2021,6 +2074,7 @@ fn unbound_jobs_are_disclosed_not_absorbed() {
         verified_ok: 3,
         empty: 0,
         failed: 0,
+        duplicate_delivery: 0,
         errored: 0,
         unbound: 2,
         cap_hit: false,
@@ -2038,6 +2092,7 @@ fn unbound_jobs_are_disclosed_not_absorbed() {
             workflow_execution_id: "wfx".to_string(),
             total_events: 1,
             signatures_checked: true,
+            duplicate_deliveries: 0,
         },
         Some(snapshot),
     );

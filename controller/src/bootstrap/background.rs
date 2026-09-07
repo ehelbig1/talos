@@ -2076,6 +2076,12 @@ pub(crate) fn spawn_maintenance_sweeps(
                                     jobs_verified_ok = stats.verified_ok,
                                     jobs_empty = stats.empty,
                                     jobs_failed = stats.failed,
+                                    // Reported beside the verdict, never inside
+                                    // it: a byte-identical redelivery is
+                                    // at-least-once delivery, so it does not put
+                                    // a job in `failed` and does not by itself
+                                    // put this pass in the WITH-findings branch.
+                                    jobs_with_duplicate_delivery = stats.duplicate_delivery,
                                     jobs_errored = stats.errored,
                                     jobs_unbound = stats.unbound,
                                     workflow_executions_covered = stats.rollup.covered,
@@ -2118,6 +2124,7 @@ pub(crate) fn spawn_maintenance_sweeps(
                                     ledger_key_space = talos_audit_ledger::LEDGER_KEY_SPACE,
                                     jobs_scanned = stats.scanned,
                                     jobs_verified_ok = stats.verified_ok,
+                                    jobs_with_duplicate_delivery = stats.duplicate_delivery,
                                     workflow_executions_covered = stats.rollup.covered,
                                     workflow_executions_verified_ok = stats.rollup.verified_ok,
                                     "audit chain verification sweep completed clean"

@@ -1562,3 +1562,91 @@ tests:
                 3. Do NOT widen the WRITER's policy to fix this. The writer is
                    PutObject-only by design; the fix is the separate read-only
                    verifier identity.
+
+  # ══════════════════════════════════════════════════════════════════════
+  # A byte-identical REDELIVERY must not page as tampering.
+  #
+  # Measured on the live dev stack 2026-09-07: the first audit-chain sweep
+  # that ever completed reported jobs_failed=1 of 102, and the finding was
+  # one object whose two lines were byte-identical. That incremented
+  # talos_audit_verification_failures_total{stage="chain"} — the CRITICAL
+  # series whose HELP text says "positive tamper/corruption evidence" — so
+  # the control that exists to raise a true alarm raised a false one.
+  #
+  # The two cases below are the whole point of the split: the duplicate
+  # counters can climb as fast as they like and page nobody, while a real
+  # break on the SAME deployment still pages immediately.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: duplicate deliveries climb and NOTHING fires
+    input_series:
+      # One redelivery deduped at the writer every minute …
+      - series: 'talos_audit_ledger_duplicate_deliveries_total{scope="batch"}'
+        values: "0+1x180"
+      # … and one chain per sweep found carrying a cross-batch copy.
+      - series: 'talos_audit_chain_duplicate_deliveries_total'
+        values: "0+1x180"
+      # The tamper counter stays at its pre-seeded 0 throughout. Feeding it
+      # explicitly is the point: "flat at zero" and "absent" must both be
+      # quiet, and only one of them is the state a healthy fleet is in.
+      - series: 'talos_audit_verification_failures_total{stage="chain"}'
+        values: "0+0x180"
+    alert_rule_test:
+      - eval_time: 150m
+        alertname: TalosAuditVerificationFailures
+        exp_alerts: []
+
+  - interval: 1m
+    name: a real break still pages while duplicates are climbing
+    input_series:
+      - series: 'talos_audit_ledger_duplicate_deliveries_total{scope="batch"}'
+        values: "0+1x180"
+      - series: 'talos_audit_chain_duplicate_deliveries_total'
+        values: "0+1x180"
+      # A CONFLICTING duplicate, a gap, a bad link or a bad HMAC — anything
+      # that is still ChainBreak::is_tamper_evidence — lands here.
+      - series: 'talos_audit_verification_failures_total{stage="chain"}'
+        values: "0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: TalosAuditVerificationFailures
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              category: audit-integrity
+              stage: chain
+            exp_annotations:
+              summary: Audit ledger verification FAILED (stage=chain)
+              description: |
+                1 audit verification failure(s) in the last 15m against
+                the WORM audit ledger. Expected steady state is 0. Read the runbook
+                below BEFORE calling it tampering — a fleet-wide burst is far more
+                often a key-rotation or controller/worker build-skew fault, and both
+                look identical to tampering from this number alone.
+                stage=event: an inbound audit event failed its hash or HMAC check at
+                ingest and was QUARANTINED (not persisted). Grep the controller log
+                for event_kind="audit_event_verification_failed" — the `reason`
+                field distinguishes hash_mismatch / bad_signature /
+                event_deserialize_failed.
+                stage=chain: a completed execution's full chain failed offline
+                verification — a sequence gap (deleted or never-persisted events),
+                broken previous_hash linkage (reorder/substitution), or a per-event
+                HMAC failure. Grep event_kind="audit_chain_verification_failed" for
+                the execution_id and the structured `breaks` list. A byte-identical
+                REDELIVERY is deliberately NOT one of these — it reports as
+                duplicate_delivery, the chain still verifies, and it is logged at
+                INFO under event_kind="audit_chain_duplicate_delivery".
+              action: |
+                1. Treat the affected execution's audit record as UNTRUSTED; do not
+                   delete anything (the quarantined bytes are the evidence).
+                2. Rule out the two MISCONFIGURATION shapes before treating this as
+                   tampering — both present as a broad, simultaneous burst rather
+                   than an isolated event:
+                   a. audit signing keys rotated without a matching verify-key roll
+                      → bad_signature across many executions at once;
+                   b. controller and workers on different builds → hash_mismatch or
+                      event_deserialize_failed on essentially every event. Check
+                      TalosWorkerBuildSkew / get_platform_info.fleet.
+                   Tampering is the residual after both are excluded; a scattered
+                   handful of failures against a same-build fleet is the real shape.
+                3. Check S3/MinIO Object Lock is still enforced on the audit bucket.

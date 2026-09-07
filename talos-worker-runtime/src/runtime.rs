@@ -1508,6 +1508,36 @@ pub struct RetryPolicy {
     pub backoff_multiplier: f32,
 }
 
+/// Close a JOB's audit chain: append AT MOST ONE terminal anchor, and only
+/// when an attempt earned it.
+///
+/// Free function, taking the ledger and the flag rather than `&self`, so the
+/// rule is drivable without a wasmtime engine, a module or NATS — the retry
+/// loop it is called from is drivable by none of those things cheaply.
+///
+/// The two invariants it exists to hold, both of which the per-attempt anchor
+/// broke:
+///   * **At most one anchor per job.** `append_terminal_anchor` commits the
+///     chain's total length into a signed payload and `verify_chain_anchored`
+///     hard-fails a chain with more than one anchor or with events after one.
+///     A retried job that anchored per attempt produced N anchors, every one
+///     of them claiming to be terminal over a chain that later grew.
+///   * **The anchor is EARNED, not automatic.** `anchor_eligible` is set by an
+///     attempt whose guest call RETURNED. A job killed by the wall clock never
+///     completed and keeps the deliberately-soft `Unanchored` verdict, exactly
+///     as it did when the anchor was appended inline.
+pub(crate) async fn seal_job_audit_chain(
+    ledger: Option<Arc<tokio::sync::Mutex<crate::audit::ExecutionLedger>>>,
+    anchor_eligible: &std::sync::atomic::AtomicBool,
+) -> Option<crate::audit::AuditEvent> {
+    let ledger = ledger?;
+    if !anchor_eligible.load(Ordering::SeqCst) {
+        return None;
+    }
+    let mut guard = ledger.lock().await;
+    Some(guard.append_terminal_anchor("worker"))
+}
+
 impl Default for RetryPolicy {
     fn default() -> Self {
         // The default retry policy now provides a modest number of attempts to
@@ -3434,100 +3464,67 @@ impl TalosRuntime {
             }
         }
 
+        // ONE cryptographic ledger for the whole JOB, not one per attempt.
+        //
+        // Measured on the live dev stack 2026-09-07: this was per-ATTEMPT, so a
+        // job that retried appended a terminal anchor from a FRESH ledger on
+        // every attempt — each restarting at `current_sequence = 0` and at the
+        // deterministic genesis hash, i.e. each claiming `sequence_num` 1. Two
+        // attempts inside one wall-clock second (`AuditEvent::timestamp` is
+        // whole seconds) produced two BYTE-IDENTICAL anchors; attempts either
+        // side of a second boundary produced two CONFLICTING ones, which the
+        // offline verifier could not tell from a substitution. 196 of 49,461
+        // ledger prefixes carried more than one anchor; 161 of those 196 were
+        // conflicting. Sharing the ledger makes the chain what it claims to
+        // be: ONE monotonic sequence over the whole job, whatever it took to
+        // finish, with exactly one terminal anchor at the end.
+        let job_ledger: Option<std::sync::Arc<tokio::sync::Mutex<crate::audit::ExecutionLedger>>> =
+            execution_context.as_ref().map(|(workflow_id, exec_id, _)| {
+                std::sync::Arc::new(tokio::sync::Mutex::new(crate::audit::ExecutionLedger::new(
+                    workflow_id,
+                    exec_id,
+                )))
+            });
+        // Whether ANY attempt's guest call returned — the condition the
+        // per-attempt anchor used to be guarded by, hoisted rather than
+        // reinvented. An execution killed by the wall clock never completed,
+        // and its chain must stay on the soft `Unanchored` verdict; one that
+        // ran to completion (success OR module-level failure) is anchored. The
+        // decision is still taken at the same point in the attempt, so this is
+        // a change of WHERE the anchor is emitted, not of WHEN it is earned.
+        let anchor_eligible = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         // PHASE 2: AUTOMATIC RETRY LOGIC — retry on transient failures with exponential backoff
         let max_attempts = retry_policy.max_attempts + 1; // +1 for initial attempt
         let mut last_error = None;
 
-        for attempt in 0..max_attempts {
-            metrics.retry_attempts = attempt;
+        // A labelled block, so the anchor below has exactly ONE site to be
+        // emitted from. The loop has four terminal exits and a helper called at
+        // each of them is one forgotten call site away from the defect this
+        // change removes.
+        let job_outcome: Result<JsonValue> = 'retry: {
+            for attempt in 0..max_attempts {
+                metrics.retry_attempts = attempt;
 
-            // Log retry attempt if this isn't the first try
-            if attempt > 0 {
-                let backoff = retry_policy.backoff_for_attempt(attempt - 1);
+                // Log retry attempt if this isn't the first try
+                if attempt > 0 {
+                    let backoff = retry_policy.backoff_for_attempt(attempt - 1);
 
-                if let Some((_, exec_id, _)) = &execution_context {
-                    if let Some(nats) = &self.nats_client {
-                        let retry_log = serde_json::json!({
-                            "execution_id": exec_id,
-                            "level": "warn",
-                            "message": format!("Retrying WASM execution (attempt {}/{})", attempt + 1, max_attempts),
-                            "timestamp": chrono::Utc::now().to_rfc3339(),
-                            "source": "runtime",
-                            "metadata": {
-                                "retry_attempt": attempt,
-                                "backoff_ms": backoff.as_millis() as u64,
-                                "previous_error": last_error.as_ref().map(|e: &anyhow::Error| e.to_string()),
-                            }
-                        });
-                        if let Ok(payload) = serde_json::to_vec(&retry_log) {
-                            let _ = nats
-                                .publish(format!("wasm.log.{}", exec_id), payload.into())
-                                .await;
-                        }
-                    }
-                }
-
-                tokio::time::sleep(backoff).await;
-            }
-
-            match self
-                .execute_job_with_context_and_timeout_internal(
-                    wasm_bytes,
-                    allowed_hosts.clone(),
-                    allowed_methods.clone(),
-                    max_memory_mb,
-                    input.clone(),
-                    execution_context.clone(),
-                    secrets.clone(),
-                    token_sender.clone(),
-                    module_hash_bytes,
-                    timeout,
-                    &mut metrics,
-                    &security_policy,
-                    cap.clone(),
-                    effective_fuel_limit,
-                    dry_run,
-                    actor_id,
-                    user_id,
-                    max_llm_tier,
-                    max_write_ceiling,
-                    egress_scope,
-                    llm_usage_out.clone(),
-                    host_diag_out.clone(),
-                    job_cancel_flag.clone(),
-                )
-                .await
-            {
-                Ok(result) => {
-                    // Cache the result if caching is enabled
-                    if let Some(ttl_secs) = result_cache_ttl_secs {
-                        let cache_key = Self::result_cache_key(
-                            &module_hash_str,
-                            &input,
-                            execution_context.as_ref(),
-                        );
-                        self.cache_result(&cache_key, &result, ttl_secs).await;
-                    }
-
-                    // Log performance metrics
                     if let Some((_, exec_id, _)) = &execution_context {
                         if let Some(nats) = &self.nats_client {
-                            let perf_log = serde_json::json!({
+                            let retry_log = serde_json::json!({
                                 "execution_id": exec_id,
-                                "level": "info",
-                                "message": "WASM execution performance metrics",
+                                "level": "warn",
+                                "message": format!("Retrying WASM execution (attempt {}/{})", attempt + 1, max_attempts),
                                 "timestamp": chrono::Utc::now().to_rfc3339(),
                                 "source": "runtime",
                                 "metadata": {
-                                    "compilation_ms": metrics.compilation_ms,
-                                    "execution_ms": metrics.execution_ms,
-                                    "total_ms": overall_start.elapsed().as_millis() as u64,
-                                    "cache_hit": metrics.cache_hit,
-                                    "result_cache_hit": metrics.result_cache_hit,
-                                    "retry_attempts": metrics.retry_attempts,
+                                    "retry_attempt": attempt,
+                                    "backoff_ms": backoff.as_millis() as u64,
+                                    "previous_error": last_error.as_ref().map(|e: &anyhow::Error| e.to_string()),
                                 }
                             });
-                            if let Ok(payload) = serde_json::to_vec(&perf_log) {
+                            if let Ok(payload) = serde_json::to_vec(&retry_log) {
                                 let _ = nats
                                     .publish(format!("wasm.log.{}", exec_id), payload.into())
                                     .await;
@@ -3535,105 +3532,231 @@ impl TalosRuntime {
                         }
                     }
 
-                    // Record OpenTelemetry metrics (if enabled)
-                    if let Some(ref otel_metrics) = self.metrics {
-                        let total_duration = overall_start.elapsed().as_millis() as f64;
-                        otel_metrics.record_execution(total_duration, "success");
-                        otel_metrics
-                            .record_compilation(metrics.compilation_ms as f64, metrics.cache_hit);
+                    tokio::time::sleep(backoff).await;
+                }
 
-                        if metrics.retry_attempts > 0 {
-                            for _ in 0..metrics.retry_attempts {
-                                otel_metrics.record_retry("transient_error");
+                match self
+                    .execute_job_with_context_and_timeout_internal(
+                        wasm_bytes,
+                        allowed_hosts.clone(),
+                        allowed_methods.clone(),
+                        max_memory_mb,
+                        input.clone(),
+                        execution_context.clone(),
+                        secrets.clone(),
+                        token_sender.clone(),
+                        module_hash_bytes,
+                        timeout,
+                        &mut metrics,
+                        &security_policy,
+                        cap.clone(),
+                        effective_fuel_limit,
+                        dry_run,
+                        actor_id,
+                        user_id,
+                        max_llm_tier,
+                        max_write_ceiling,
+                        egress_scope,
+                        llm_usage_out.clone(),
+                        host_diag_out.clone(),
+                        job_cancel_flag.clone(),
+                        job_ledger.clone(),
+                        anchor_eligible.clone(),
+                    )
+                    .await
+                {
+                    Ok(result) => {
+                        // Cache the result if caching is enabled
+                        if let Some(ttl_secs) = result_cache_ttl_secs {
+                            let cache_key = Self::result_cache_key(
+                                &module_hash_str,
+                                &input,
+                                execution_context.as_ref(),
+                            );
+                            self.cache_result(&cache_key, &result, ttl_secs).await;
+                        }
+
+                        // Log performance metrics
+                        if let Some((_, exec_id, _)) = &execution_context {
+                            if let Some(nats) = &self.nats_client {
+                                let perf_log = serde_json::json!({
+                                    "execution_id": exec_id,
+                                    "level": "info",
+                                    "message": "WASM execution performance metrics",
+                                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                                    "source": "runtime",
+                                    "metadata": {
+                                        "compilation_ms": metrics.compilation_ms,
+                                        "execution_ms": metrics.execution_ms,
+                                        "total_ms": overall_start.elapsed().as_millis() as u64,
+                                        "cache_hit": metrics.cache_hit,
+                                        "result_cache_hit": metrics.result_cache_hit,
+                                        "retry_attempts": metrics.retry_attempts,
+                                    }
+                                });
+                                if let Ok(payload) = serde_json::to_vec(&perf_log) {
+                                    let _ = nats
+                                        .publish(format!("wasm.log.{}", exec_id), payload.into())
+                                        .await;
+                                }
                             }
                         }
-                    }
 
-                    return Ok(result);
-                }
-                Err(e) => {
-                    // Per-host circuit breaker gate: during a sustained
-                    // outage the breaker for this module's host opens after
-                    // repeated failures; re-dispatching the WASM module
-                    // against a dead host just burns the retry budget. When
-                    // OPEN, skip the in-worker retries and fail fast with a
-                    // clear, non-transient reason (host-only, no URL). Only
-                    // gates transient errors — a non-transient failure
-                    // already fails fast through the normal path below.
-                    if is_transient_error(&e) {
-                        if let Some(open_host) = first_open_circuit_host_in(
-                            crate::circuit_breaker::get_global_circuit_breaker(),
-                            &allowed_hosts,
-                        ) {
-                            tracing::warn!(
-                                target: "talos_runtime",
-                                host = %open_host,
-                                "WASM job short-circuited: host circuit breaker OPEN"
+                        // Record OpenTelemetry metrics (if enabled)
+                        if let Some(ref otel_metrics) = self.metrics {
+                            let total_duration = overall_start.elapsed().as_millis() as f64;
+                            otel_metrics.record_execution(total_duration, "success");
+                            otel_metrics.record_compilation(
+                                metrics.compilation_ms as f64,
+                                metrics.cache_hit,
                             );
+
+                            if metrics.retry_attempts > 0 {
+                                for _ in 0..metrics.retry_attempts {
+                                    otel_metrics.record_retry("transient_error");
+                                }
+                            }
+                        }
+
+                        break 'retry Ok(result);
+                    }
+                    Err(e) => {
+                        // Per-host circuit breaker gate: during a sustained
+                        // outage the breaker for this module's host opens after
+                        // repeated failures; re-dispatching the WASM module
+                        // against a dead host just burns the retry budget. When
+                        // OPEN, skip the in-worker retries and fail fast with a
+                        // clear, non-transient reason (host-only, no URL). Only
+                        // gates transient errors — a non-transient failure
+                        // already fails fast through the normal path below.
+                        if is_transient_error(&e) {
+                            if let Some(open_host) = first_open_circuit_host_in(
+                                crate::circuit_breaker::get_global_circuit_breaker(),
+                                &allowed_hosts,
+                            ) {
+                                tracing::warn!(
+                                    target: "talos_runtime",
+                                    host = %open_host,
+                                    "WASM job short-circuited: host circuit breaker OPEN"
+                                );
+                                if let Some(ref otel_metrics) = self.metrics {
+                                    let total_duration = overall_start.elapsed().as_millis() as f64;
+                                    otel_metrics.record_execution(total_duration, "error");
+                                    otel_metrics.record_error("circuit_open");
+                                }
+                                break 'retry Err(circuit_open_error(open_host));
+                            }
+                            if attempt < retry_policy.max_attempts {
+                                last_error = Some(e);
+                                continue; // Retry
+                            }
+                        }
+                        {
+                            // Record failure metrics (if enabled).
+                            // The error in `e` has already been formatted by the inner execution
+                            // function into a user-facing message:
+                            //   "Component returned error: ..."  — WIT Err(String) return
+                            //   "PANIC: ..."                     — panic via WASI stderr capture
+                            //   "WASM fuel exhausted: ..."       — fuel budget exhausted
+                            //                                      (`fuel_exhausted_message`)
+                            //   "WASM execution timed out ..."   — wall-clock timeout
+                            //   "WASM trap encountered"          — unexpected trap (sanitized above)
+                            // Do NOT replace e with a generic string — that would destroy the
+                            // specific, actionable message the inner function produced.
                             if let Some(ref otel_metrics) = self.metrics {
                                 let total_duration = overall_start.elapsed().as_millis() as f64;
                                 otel_metrics.record_execution(total_duration, "error");
-                                otel_metrics.record_error("circuit_open");
+                                let error_str = e.to_string();
+                                let error_type = if error_str.contains("timeout") {
+                                    "timeout"
+                                } else if error_str.contains("fuel") {
+                                    "out_of_fuel"
+                                } else if error_str.contains("trap") {
+                                    "trap"
+                                } else if error_str.contains("PANIC") {
+                                    "panic"
+                                } else if error_str.contains("Component returned error") {
+                                    "component_error"
+                                } else if error_str.contains("memory") {
+                                    "memory_limit"
+                                } else {
+                                    "runtime_error"
+                                };
+                                otel_metrics.record_error(error_type);
                             }
-                            return Err(circuit_open_error(open_host));
-                        }
-                        if attempt < retry_policy.max_attempts {
-                            last_error = Some(e);
-                            continue; // Retry
-                        }
-                    }
-                    {
-                        // Record failure metrics (if enabled).
-                        // The error in `e` has already been formatted by the inner execution
-                        // function into a user-facing message:
-                        //   "Component returned error: ..."  — WIT Err(String) return
-                        //   "PANIC: ..."                     — panic via WASI stderr capture
-                        //   "WASM fuel exhausted: ..."       — fuel budget exhausted
-                        //                                      (`fuel_exhausted_message`)
-                        //   "WASM execution timed out ..."   — wall-clock timeout
-                        //   "WASM trap encountered"          — unexpected trap (sanitized above)
-                        // Do NOT replace e with a generic string — that would destroy the
-                        // specific, actionable message the inner function produced.
-                        if let Some(ref otel_metrics) = self.metrics {
-                            let total_duration = overall_start.elapsed().as_millis() as f64;
-                            otel_metrics.record_execution(total_duration, "error");
-                            let error_str = e.to_string();
-                            let error_type = if error_str.contains("timeout") {
-                                "timeout"
-                            } else if error_str.contains("fuel") {
-                                "out_of_fuel"
-                            } else if error_str.contains("trap") {
-                                "trap"
-                            } else if error_str.contains("PANIC") {
-                                "panic"
-                            } else if error_str.contains("Component returned error") {
-                                "component_error"
-                            } else if error_str.contains("memory") {
-                                "memory_limit"
-                            } else {
-                                "runtime_error"
-                            };
-                            otel_metrics.record_error(error_type);
-                        }
 
-                        // Pass the already-formatted error through to the caller unchanged.
-                        return Err(e);
+                            // Pass the already-formatted error through to the caller unchanged.
+                            break 'retry Err(e);
+                        }
                     }
                 }
             }
+
+            // All retries exhausted
+            let error = last_error.unwrap_or_else(|| {
+                anyhow::anyhow!("Execution failed after {} attempts", max_attempts)
+            });
+
+            if let Some(ref otel_metrics) = self.metrics {
+                let total_duration = overall_start.elapsed().as_millis() as f64;
+                otel_metrics.record_execution(total_duration, "retry_exhausted");
+                otel_metrics.record_error("retries_exhausted");
+            }
+
+            Err(error)
+        };
+
+        // Terminal audit anchor (tail-truncation detection — the producer half
+        // of talos-audit-event's `verify_chain_anchored`). ONE per job, after
+        // every attempt is done, over the ledger every attempt shared. Local
+        // append is the WORM source of truth; the publish is best-effort SIEM
+        // replication, WARN on failure per MCP-735.
+        if let Some(anchor) = seal_job_audit_chain(job_ledger, &anchor_eligible).await {
+            self.replicate_audit_event_to_nats(anchor);
         }
 
-        // All retries exhausted
-        let error = last_error
-            .unwrap_or_else(|| anyhow::anyhow!("Execution failed after {} attempts", max_attempts));
+        job_outcome
+    }
 
-        if let Some(ref otel_metrics) = self.metrics {
-            let total_duration = overall_start.elapsed().as_millis() as f64;
-            otel_metrics.record_execution(total_duration, "retry_exhausted");
-            otel_metrics.record_error("retries_exhausted");
-        }
-
-        Err(error)
+    /// Best-effort SIEM replication of ONE audit event to `talos.audit.ledger`.
+    ///
+    /// Extracted from the terminal-anchor site so the publish is a single
+    /// statement there and cannot be silently duplicated by a second caller
+    /// appearing beside it. Fire-and-forget by design: the local WORM append
+    /// already happened and is the source of truth.
+    fn replicate_audit_event_to_nats(&self, event: crate::audit::AuditEvent) {
+        let Some(nats) = &self.nats_client else {
+            return;
+        };
+        let nats = nats.clone();
+        tokio::spawn(async move {
+            let hash = event.calculate_hash();
+            let msg = serde_json::json!({ "event": event, "hash": hash });
+            match serde_json::to_vec(&msg) {
+                Ok(bytes) => {
+                    if let Err(e) = nats
+                        .publish(
+                            talos_workflow_job_protocol::subjects::AUDIT_LEDGER.to_string(),
+                            bytes.into(),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            target: "talos_rpc",
+                            error = %e,
+                            "audit terminal-anchor NATS replication failed \
+                             (local WORM append succeeded; chain will verify \
+                             as anchored from the local ledger)"
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!(
+                    target: "talos_rpc",
+                    error = %e,
+                    "audit terminal-anchor serialization failed for NATS replication"
+                ),
+            }
+        });
     }
 
     /// Internal execution method with performance metrics tracking.
@@ -3690,6 +3813,20 @@ impl TalosRuntime {
         // on every in-worker retry and the 20 `is_cancelled()` egress guards
         // would let a cancelled job keep re-running inside one worker process.
         job_cancel_flag: Arc<std::sync::atomic::AtomicBool>,
+        // The JOB's cryptographic ledger, minted once above the retry loop and
+        // shared by every attempt. `None` when there is no execution context
+        // (sandbox / test_module runs), exactly as before. Per-ATTEMPT ledgers
+        // were the producer half of the duplicate-anchor defect: each restarted
+        // at sequence 1 and at the same genesis hash, so a retried job emitted
+        // one `execution_complete` event per attempt, all claiming sequence 1.
+        job_ledger: Option<std::sync::Arc<tokio::sync::Mutex<crate::audit::ExecutionLedger>>>,
+        // Set by this function when the guest call RETURNS (success or
+        // module-level failure), i.e. when this attempt earned a terminal
+        // anchor. The anchor itself is appended once, by the caller, after the
+        // last attempt. Never cleared: one completed attempt is enough, and a
+        // later attempt killed by the wall clock must not retract the fact that
+        // the chain reached a terminal state.
+        anchor_eligible: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<JsonValue> {
         // DISTRIBUTED TRACING: Create execution span
         let execution_id = execution_context
@@ -3816,23 +3953,17 @@ impl TalosRuntime {
         }
 
         // Set execution context for automatic logging
-        let mut ledger_for_anchor: Option<
-            std::sync::Arc<tokio::sync::Mutex<crate::audit::ExecutionLedger>>,
-        > = None;
         if let Some((workflow_id, exec_id, module_id)) = execution_context {
             context.set_workflow_context(workflow_id.clone(), exec_id.clone(), module_id.clone());
             // Correlate logs across controller and worker using the workflow ID.
             context.set_request_id(workflow_id.clone());
 
-            // Initialize cryptographic ledger for WORM logging
-            let ledger = std::sync::Arc::new(tokio::sync::Mutex::new(
-                crate::audit::ExecutionLedger::new(&workflow_id, &exec_id),
-            ));
-            // Held past the run so the terminal anchor (below) can commit
-            // the chain length after the module finishes — the Store owns
-            // the context (and its Arc) inside the call closure.
-            ledger_for_anchor = Some(ledger.clone());
-            context.set_audit_ledger(ledger);
+            // Adopt the JOB's cryptographic ledger for WORM logging. NOT a
+            // fresh one: a retry must continue the chain it started, not open
+            // a second chain at sequence 1 over the same execution id.
+            if let Some(ledger) = job_ledger.clone() {
+                context.set_audit_ledger(ledger);
+            }
         }
 
         // Durable state load-on-resume was previously read from the
@@ -4005,52 +4136,16 @@ impl TalosRuntime {
 
         metrics.execution_ms = execution_start.elapsed().as_millis() as u64;
 
-        // Terminal audit anchor (tail-truncation detection — the producer
-        // half of talos-audit-event's verify_chain_anchored). Fires on
-        // module success AND module-level failure (the chain completed
-        // either way); deliberately NOT on the wall-clock-timeout early
-        // return above — a killed execution never completed, and its
-        // unanchored chain reads as the softer 'unanchored' verdict.
-        // Same replicate-to-NATS shape as every other ledger event
-        // (local append is the WORM source of truth; the publish is
-        // best-effort SIEM replication, WARN on failure per MCP-735).
-        if let Some(ledger_mutex) = ledger_for_anchor {
-            let anchor = {
-                let mut ledger = ledger_mutex.lock().await;
-                ledger.append_terminal_anchor("worker")
-            };
-            if let Some(nats) = &self.nats_client {
-                let nats = nats.clone();
-                tokio::spawn(async move {
-                    let hash = anchor.calculate_hash();
-                    let msg = serde_json::json!({ "event": anchor, "hash": hash });
-                    match serde_json::to_vec(&msg) {
-                        Ok(bytes) => {
-                            if let Err(e) = nats
-                                .publish(
-                                    talos_workflow_job_protocol::subjects::AUDIT_LEDGER.to_string(),
-                                    bytes.into(),
-                                )
-                                .await
-                            {
-                                tracing::warn!(
-                                    target: "talos_rpc",
-                                    error = %e,
-                                    "audit terminal-anchor NATS replication failed \
-                                     (local WORM append succeeded; chain will verify \
-                                     as anchored from the local ledger)"
-                                );
-                            }
-                        }
-                        Err(e) => tracing::warn!(
-                            target: "talos_rpc",
-                            error = %e,
-                            "audit terminal-anchor serialization failed for NATS replication"
-                        ),
-                    }
-                });
-            }
-        }
+        // This attempt's guest call RETURNED, so the chain reached a terminal
+        // state and has earned a terminal anchor. Recorded here — the same
+        // point the anchor used to be appended, and still below the wall-clock
+        // timeout's `?` above, so a killed execution still earns nothing and
+        // keeps the softer `Unanchored` verdict. The anchor is APPENDED and
+        // published once, by `execute_job_with_full_features`, after the last
+        // attempt: an anchor emitted here would be one per attempt, each from
+        // a chain that a subsequent retry then continues past — which is both
+        // a duplicate sequence and an anchor that is no longer terminal.
+        anchor_eligible.store(true, Ordering::SeqCst);
 
         let _duration_ms = start_time.elapsed().as_millis() as u64;
 

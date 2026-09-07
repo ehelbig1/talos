@@ -506,8 +506,20 @@ pub enum ChainBreak {
     /// `sequence_num` is not contiguous — a record is missing (deletion / a
     /// never-persisted event). `expected` is the next sequence we required.
     SequenceGap { expected: u64, found: u64 },
-    /// Two records share a `sequence_num`.
+    /// Two records share a `sequence_num` and their CONTENT DIFFERS — one of
+    /// them is not what the producer wrote. Positive tamper evidence
+    /// (substitution), and the only duplicate kind that flips
+    /// [`ChainVerificationReport::ok`].
     DuplicateSequence { seq: u64 },
+    /// Two records share a `sequence_num` and are BYTE-IDENTICAL (same
+    /// recomputed hash, same signature) — one event that reached the ledger
+    /// twice.
+    ///
+    /// Reported, never a break: nothing was altered, added or removed from
+    /// the chain, so calling it "possible tampering" is a false positive on
+    /// the one control that exists to raise a true one. See
+    /// [`ChainBreak::is_tamper_evidence`].
+    DuplicateDelivery { seq: u64 },
     /// The first event's `previous_hash` does not match the deterministic
     /// genesis hash for `(workflow_id, execution_id)`.
     GenesisMismatch {
@@ -530,20 +542,55 @@ pub enum ChainBreak {
     Unsigned { seq: u64 },
 }
 
+impl ChainBreak {
+    /// `true` for positive tamper/corruption evidence — everything except
+    /// [`ChainBreak::DuplicateDelivery`], which is an at-least-once DELIVERY
+    /// artefact (or, on this platform, a producer that appended one terminal
+    /// anchor per retry attempt).
+    ///
+    /// The same shape as [`AnchorVerdict::is_hard_failure`], and for the same
+    /// reason: a finding worth REPORTING and a finding that means the ledger
+    /// is untrustworthy are different facts, and one boolean cannot carry
+    /// both. `ok` is computed from this, so a new variant must decide which
+    /// it is at the point it is added rather than inheriting "break".
+    #[must_use]
+    pub fn is_tamper_evidence(&self) -> bool {
+        !matches!(self, ChainBreak::DuplicateDelivery { .. })
+    }
+}
+
 /// The result of verifying a persisted audit chain for one execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ChainVerificationReport {
     pub execution_id: String,
     pub workflow_id: String,
     pub total_events: usize,
-    /// `true` iff there are no `breaks` AND (when keys are configured) every
-    /// event verified its signature.
+    /// `true` iff every entry in `breaks` is non-tamper-evidence — i.e. no
+    /// gap, no bad link, no bad/missing signature, and no CONFLICTING
+    /// duplicate. A [`ChainBreak::DuplicateDelivery`] is listed in `breaks`
+    /// and does NOT clear this bit; see [`ChainBreak::is_tamper_evidence`].
     pub ok: bool,
     /// Whether HMAC verification was attempted (keys configured). When false,
     /// `Unsigned`/`BadSignature` are not asserted — the chain is structurally
     /// verified but its authenticity is "unverified".
     pub signatures_checked: bool,
     pub breaks: Vec<ChainBreak>,
+}
+
+impl ChainVerificationReport {
+    /// How many BYTE-IDENTICAL redeliveries this chain carries.
+    ///
+    /// A separate accessor rather than a struct field so the report's shape
+    /// stays source-compatible for the consumers that build it by literal —
+    /// the same reason `AnchoredChainVerificationReport` wraps rather than
+    /// extends it.
+    #[must_use]
+    pub fn duplicate_delivery_count(&self) -> usize {
+        self.breaks
+            .iter()
+            .filter(|b| matches!(b, ChainBreak::DuplicateDelivery { .. }))
+            .count()
+    }
 }
 
 /// Verify a persisted audit chain for a single execution, end to end.
@@ -578,10 +625,35 @@ pub fn verify_chain(
 
     for (idx, event) in sorted.iter().enumerate() {
         // Duplicate vs gap on sequence_num.
+        //
+        // CLASSIFIED, never assumed. Two records sharing one sequence mean
+        // one of two opposite things, and reporting them alike made the
+        // benign one indistinguishable from the malicious one on the single
+        // control that exists to raise the alarm:
+        //   * IDENTICAL content  -> one event reached the ledger twice.
+        //     Nothing was altered, added or removed. Reported, not a break.
+        //   * DIFFERING content  -> one of the two is not what the producer
+        //     wrote. Substitution. Tamper evidence.
+        // "Identical" is decided by the RECOMPUTED hash (which covers every
+        // field except the signature) AND the signature, so it cannot be
+        // satisfied by a forged copy that merely claims the stored hash.
         if idx > 0 && event.sequence_num == sorted[idx - 1].sequence_num {
-            breaks.push(ChainBreak::DuplicateSequence {
-                seq: event.sequence_num,
+            let prev = sorted[idx - 1];
+            let identical = event.calculate_hash() == prev.calculate_hash()
+                && event.hmac_signature == prev.hmac_signature;
+            breaks.push(if identical {
+                ChainBreak::DuplicateDelivery {
+                    seq: event.sequence_num,
+                }
+            } else {
+                ChainBreak::DuplicateSequence {
+                    seq: event.sequence_num,
+                }
             });
+            // Either way the chain's CONTINUITY is computed over the deduped
+            // sequence: `prev_hash` and `expected_seq` are left untouched, so
+            // the second copy never re-checks a link and the successor still
+            // links to the ONE event at this sequence.
             continue;
         }
         if event.sequence_num != expected_seq {
@@ -631,7 +703,7 @@ pub fn verify_chain(
         execution_id: execution_id.to_string(),
         workflow_id: workflow_id.to_string(),
         total_events: sorted.len(),
-        ok: breaks.is_empty(),
+        ok: breaks.iter().all(|b| !b.is_tamper_evidence()),
         signatures_checked,
         breaks,
     }
@@ -703,11 +775,45 @@ pub struct AnchoredChainVerificationReport {
     pub ok: bool,
 }
 
+/// Drop EXACT duplicates — events sharing a `sequence_num` whose recomputed
+/// hash and signature both match — keeping the first of each group.
+///
+/// The same rule [`verify_chain`] uses to tell [`ChainBreak::DuplicateDelivery`]
+/// from [`ChainBreak::DuplicateSequence`], applied here so the anchor verdict
+/// agrees with the chain report about the same events. Without it an
+/// identical redelivery reads as `CountMismatch` (the anchor commits 1, the
+/// verifier counts 2) or `MultipleAnchors` — two HARD failures over an event
+/// that arrived twice. CONFLICTING duplicates are deliberately KEPT, so two
+/// anchors with different content still surface as `MultipleAnchors`, which
+/// is what a producer emitting one anchor per retry attempt looks like.
+fn dedupe_identical(events: &[AuditEvent]) -> Vec<&AuditEvent> {
+    let mut sorted: Vec<&AuditEvent> = events.iter().collect();
+    sorted.sort_by_key(|e| e.sequence_num);
+    let mut out: Vec<&AuditEvent> = Vec::with_capacity(sorted.len());
+    for e in sorted {
+        let dup = out.last().is_some_and(|prev: &&AuditEvent| {
+            prev.sequence_num == e.sequence_num
+                && prev.calculate_hash() == e.calculate_hash()
+                && prev.hmac_signature == e.hmac_signature
+        });
+        if !dup {
+            out.push(e);
+        }
+    }
+    out
+}
+
 /// Derive the terminal-anchor verdict for a set of persisted events.
 /// Pure and deterministic; order-independent (keyed on `sequence_num`).
+///
+/// Computed over the DEDUPED event set (see [`dedupe_identical`]) so an
+/// identical redelivery cannot manufacture a count mismatch or a phantom
+/// second anchor.
 fn anchor_verdict(events: &[AuditEvent]) -> AnchorVerdict {
+    let events = dedupe_identical(events);
     let anchors: Vec<&AuditEvent> = events
         .iter()
+        .copied()
         .filter(|e| e.action == TERMINAL_ANCHOR_ACTION)
         .collect();
     let anchor = match anchors.as_slice() {

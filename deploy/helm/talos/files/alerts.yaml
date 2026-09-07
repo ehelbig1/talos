@@ -1184,6 +1184,20 @@ groups:
       # AUDIT_CHAIN_SWEEP_INTERVAL_SECS=0 (explicitly disabled). A flat 0 on
       # either means "never looked", not "verified clean". stage="event" has no
       # such gate: the ingest subscriber runs wherever NATS does.
+      #
+      # REVIEWED 2026-09-07 and left unchanged, because the change that
+      # prompted the review made this rule MORE selective, not less. A
+      # BYTE-IDENTICAL redelivery of one event used to reach the verifier as
+      # ChainBreak::DuplicateSequence and increment stage="chain" — measured as
+      # 1 of 102 jobs on the first sweep that ever completed, i.e. a false
+      # CRITICAL on the one series whose steady state is the whole signal. It
+      # is now ChainBreak::DuplicateDelivery, which does not clear `ok`, is not
+      # counted in the sweep's `failed`, and touches NO series this rule
+      # selects; it has its own unalerted counters
+      # (talos_audit_ledger_duplicate_deliveries_total,
+      # talos_audit_chain_duplicate_deliveries_total). A CONFLICTING duplicate
+      # — one sequence, two contents — is still DuplicateSequence and still
+      # fires this alert, which is correct: that is a substitution.
       - alert: TalosAuditVerificationFailures
         expr: increase(talos_audit_verification_failures_total[15m]) > 0
         for: 0m
@@ -1207,7 +1221,10 @@ groups:
             verification — a sequence gap (deleted or never-persisted events),
             broken previous_hash linkage (reorder/substitution), or a per-event
             HMAC failure. Grep event_kind="audit_chain_verification_failed" for
-            the execution_id and the structured `breaks` list.
+            the execution_id and the structured `breaks` list. A byte-identical
+            REDELIVERY is deliberately NOT one of these — it reports as
+            duplicate_delivery, the chain still verifies, and it is logged at
+            INFO under event_kind="audit_chain_duplicate_delivery".
           action: |
             1. Treat the affected execution's audit record as UNTRUSTED; do not
                delete anything (the quarantined bytes are the evidence).

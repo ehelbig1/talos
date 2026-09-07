@@ -1074,6 +1074,130 @@ value from one function, so a caller cannot supply a pair that disagrees, and
 its own copy of the truncated wording in its `recommendation` string and now
 reads the same clause.
 
+**2026-09-07 — the first sweep that ever ran called an identical redelivery
+"possible tampering".** #767 gave the verifier an identity that can read; the
+FIRST completed pass then reported `jobs_scanned=102 jobs_verified_ok=101
+jobs_failed=1`, and the one failure was a prefix holding ONE object whose two
+lines were BYTE-IDENTICAL — same `sequence_num` 1, same `previous_hash`, same
+`hash`, same `hmac_signature`, same `timestamp` — logged at ERROR as *"possible
+tampering, deletion, reorder, or corruption"* and incrementing
+`talos_audit_verification_failures_total{stage="chain"}`, the series whose HELP
+text says "positive tamper/corruption evidence" and whose whole value is that
+its steady state is 0. A false CRITICAL on the one control that exists to raise
+a true one (check 69's class, on the audit control).
+
+**Two duplicate kinds, and only one says anything about integrity.**
+`verify_chain` sorted by `sequence_num` and reported `DuplicateSequence`
+whenever two adjacent events shared one, WITHOUT comparing their content. Now:
+BYTE-IDENTICAL (equal recomputed hash AND equal signature — hash covers every
+field but the signature, so the pair is equal iff the events are) is
+`ChainBreak::DuplicateDelivery`, which is REPORTED and does not clear `ok`;
+CONFLICTING content stays `DuplicateSequence`, still tamper evidence, still
+CRITICAL. `ChainBreak::is_tamper_evidence` is the one predicate `ok` is computed
+from, so a NEW variant must decide which it is at the point it is added instead
+of inheriting "break". Chain continuity was ALREADY computed over the deduped
+sequence — the pre-existing `continue` left `prev_hash` and `expected_seq`
+untouched — and that is recorded as a no-op rather than claimed as a fix.
+`anchor_verdict` now dedupes too: without it one identical redelivery produced
+TWO hard failures (`CountMismatch`, because the anchor commits 1 and the
+verifier counted 2; and a phantom `MultipleAnchors`).
+
+**The writer/verifier split is asymmetric ON PURPOSE.** `process_batch` drops an
+exact duplicate that shares a batch (`talos_audit_ledger::batch_dedupe`,
+`talos_audit_ledger_duplicate_deliveries_total{scope="batch"}`, one INFO line
+per batch, every dropped copy still ACKed — an unacked message is redelivered
+forever). It CANNOT dedupe across batches, because that means LISTING and
+READING the execution's prefix and the ledger writer's S3 identity is
+**write-only by design** — the read-only verifier is a separate credential
+precisely so a compromised writer cannot survey what it wrote. **Do not widen
+it.** Cross-batch copies are classified at the verifier instead, where the
+read-only identity already belongs.
+
+**The cause was the PRODUCER, and the population says so.** Measured over the
+whole bucket 2026-09-07 (49,720 objects / 49,461 prefixes): **196 prefixes
+(0.40 %) carried more than one terminal anchor — 35 byte-identical, 161
+CONFLICTING**. So the verifier classification covers 18 % of the historical
+population and the producer fix covers all of it. Mechanism, from the worker log
+(one `Received job`, one `Job completed`, **two** `wasm-execution` spans):
+`execute_job_with_full_features`' retry loop called the internal attempt
+function up to `RetryPolicy::max_attempts + 1 = 4` times, and EACH attempt built
+a fresh `ExecutionLedger::new(workflow_id, exec_id)` and appended its own
+terminal anchor — every attempt restarting at `current_sequence = 0` and at the
+deterministic genesis hash, so every attempt emitted an `execution_complete`
+event claiming `sequence_num` 1. `AuditEvent::timestamp` is WHOLE SECONDS, so
+two attempts inside one second are byte-identical and two either side of a
+second boundary are not: **a second boundary is the whole difference between the
+35 and the 161**, not any property of the transport. The object size classes
+match the attempt ceiling exactly (2, 3 and 4 copies; none above 4 in the recent
+population).
+
+Now: ONE ledger per JOB, minted above the retry loop and shared by every
+attempt, so the chain is one monotonic sequence over the whole job; and ONE
+anchor, appended by `seal_job_audit_chain` after the last attempt. The retry
+loop's four terminal exits were wrapped in a labelled block so the anchor has
+exactly ONE emission site — a helper called at each of four exits is one
+forgotten call site away from the defect being reintroduced. The anchor is still
+EARNED, not automatic: `anchor_eligible` is set at the same point the inline
+anchor used to be appended (below the wall-clock timeout's `?`), so a job killed
+by the wall clock still earns nothing and keeps the deliberately-soft
+`Unanchored` verdict.
+
+**What is NOT closed, and it is 150 of the 196 prefixes.** The anchor is one per
+DISPATCH, not one per JOB-ID. A controller-level retry re-dispatches the SAME
+`job_id` (`talos-workflow-engine-nats::execute_job_with_retry`, whose own doc
+notes the worker re-sees it), and each re-dispatch is a fresh
+`execute_job_with_full_features` call with a fresh ledger — which is why the
+ledger holds prefixes with far more copies than the in-worker ceiling of 4 (one
+has ELEVEN objects written 5 s apart across 55 s). Reconstructing a prior
+dispatch's ledger needs persisted state the credential-free worker cannot read,
+so those copies remain and are handled at the verifier like any other
+cross-batch pair.
+
+**Instruments, and deliberately no alert.** Both counters are PRE-SEEDED
+(`talos_audit_ledger_duplicate_deliveries_total{scope="batch"}` — the only scope
+with a live increment site, because the writer cannot see a cross-batch copy —
+and `talos_audit_chain_duplicate_deliveries_total`). NOTHING alerts on either:
+at-least-once delivery is the transport working as designed, and an alert here
+would be the same train-the-operator-to-ignore-it defect the classification
+removes. `TalosAuditVerificationFailures` was REVIEWED and left unchanged
+because the change made it strictly MORE selective — a duplicate delivery now
+touches no series it selects — with two promtool cases pinning both directions
+(duplicates climbing fires nothing; a real break still pages while they climb).
+The sweep reports `jobs_with_duplicate_delivery` beside the verdict and never
+inside `failed`; `security_audit`'s `audit_chain_verification` renders a
+duplicate-only chain as PASS with the count DISCLOSED, because "2 events,
+verified" and "1 event delivered twice" otherwise render identically. The
+GraphQL surface exposes `duplicate_delivery` as a `kind` and a per-job
+`duplicateDeliveries` count.
+
+**No lint check was added and the count stays 86.** TWO candidates were
+measured first, and both have a population of ONE, which is the bar this repo
+does not ship at. (i) *"a `ChainBreak` consumer must branch on
+`is_tamper_evidence`, not `breaks.is_empty()`"* — measured workspace-wide,
+`breaks.is_empty()`/`breaks.len()` appears at **3 lines and none is a verdict**
+(two test assertions and `security_audit`'s Broken-arm count, itself fixed here
+to count tamper evidence only); `ok` is computed in exactly ONE place. (ii)
+*"the worker runtime may mint an `ExecutionLedger` only above the retry loop"* —
+`ExecutionLedger::new` occurs **once** in non-test worker code and
+`append_terminal_anchor` **once**. The structural answers are already stronger
+than a grep: `ok` has one home, `seal_job_audit_chain` is the one place an
+anchor is appended and the labelled block gives it one call site, and the
+`From<&ChainBreak>` GraphQL mapping is an EXHAUSTIVE match that FAILED TO
+COMPILE until the new variant was classified — which is the guard that a grep
+would only imitate.
+
+**The one measured SURVIVOR, stated rather than implied.** Reinstating a
+per-attempt `ExecutionLedger` inside
+`execute_job_with_context_and_timeout_internal` — i.e. the original defect —
+leaves all 639 `talos-worker-runtime` tests green. Nothing in the suite can
+observe it: the anchor's only externally visible effect is a NATS publish, and
+the retry loop needs a wasmtime engine, a compiled component and a NATS server
+to drive. What IS covered is the sealing RULE (`seal_job_audit_chain`'s four
+tests, three of which fail under their own mutations) and the classification the
+defect used to trip (`verify_chain`'s). The honest guard for the call site is
+the live read of the ledger after deploy — the same position #767 took about its
+sweep — not a test that does not exist.
+
 ## Sub-workflow dispatch (engine)
 
 Every parent node that runs a sub-workflow (judge, ensemble, reflective-retry, llm-dispatch, sub_workflow) uses the shared dispatcher pattern in `controller/src/engine/parallel.rs`:

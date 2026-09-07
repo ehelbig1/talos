@@ -360,6 +360,27 @@ pub struct TalosMetrics {
     /// series matches nothing, which is precisely how this control stayed
     /// quiet. No execution id, workflow id or object key is ever a label.
     pub audit_chain_unverifiable_total: CounterVec,
+    /// EXACT duplicate audit events dropped by the WORM LEDGER WRITER before
+    /// persistence, by scope. `scope="batch"` is the only value with a live
+    /// increment site (`talos_audit_ledger::batch_dedupe`), because the writer
+    /// can only see the copies that share one batch — its S3 identity is
+    /// write-only by design, so it cannot read the prefix back to find a
+    /// cross-batch copy.
+    ///
+    /// Deliberately NOT alerted on and deliberately NOT folded into
+    /// `talos_audit_verification_failures_total`: at-least-once delivery is
+    /// the transport working as designed, and the tamper counter's whole value
+    /// is that its steady state is 0.
+    pub audit_ledger_duplicate_deliveries_total: CounterVec,
+    /// Job chains the offline sweep found carrying a BYTE-IDENTICAL redelivery
+    /// (`talos_audit_event::ChainBreak::DuplicateDelivery`) — the copies the
+    /// writer could not see because they arrived in different batches.
+    ///
+    /// A chain whose only finding is this still verifies (`ok == true`) and is
+    /// counted in `jobs_verified_ok`, never in `jobs_failed`. Reported so the
+    /// redundancy is visible; not alerted on, for the same reason as the
+    /// writer-side counter above.
+    pub audit_chain_duplicate_deliveries_total: Counter,
     /// Unix seconds at which an audit chain last verified CLEAN.
     ///
     /// A gauge, and deliberately NOT pre-seeded: absent means "no chain has
@@ -1469,6 +1490,38 @@ impl TalosMetrics {
                 .inc_by(0.0);
         }
 
+        let audit_ledger_duplicate_deliveries_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_audit_ledger_duplicate_deliveries_total",
+                "EXACT duplicate audit events dropped by the WORM ledger writer before \
+                 persistence, by scope (batch). At-least-once delivery is the transport \
+                 working as designed, so this is NOT tamper evidence and NOTHING alerts \
+                 on it — it is kept off talos_audit_verification_failures_total precisely \
+                 so that counter's steady state stays 0 and its CRITICAL alert stays \
+                 meaningful.",
+            ),
+            &["scope"],
+        )?;
+        registry.register(Box::new(audit_ledger_duplicate_deliveries_total.clone()))?;
+        // `batch` is the ONLY scope with a live increment site — the writer is
+        // write-only and cannot see a cross-batch copy. Seeding a second value
+        // would imply a signal that is not wired (check 58's own rule read
+        // from the label side).
+        audit_ledger_duplicate_deliveries_total
+            .with_label_values(&["batch"])
+            .inc_by(0.0);
+
+        let audit_chain_duplicate_deliveries_total = Counter::new(
+            "talos_audit_chain_duplicate_deliveries_total",
+            "Job chains the offline audit-chain sweep found carrying a BYTE-IDENTICAL \
+             redelivery — the copies the write-only ledger writer could not dedupe \
+             because they arrived in different batches. Such a chain still VERIFIES: it \
+             is counted in jobs_verified_ok, never in jobs_failed, and nothing alerts on \
+             this series. Registration alone exports it at 0 so absent and zero do not \
+             render alike.",
+        )?;
+        registry.register(Box::new(audit_chain_duplicate_deliveries_total.clone()))?;
+
         let audit_chain_last_verified_ok_timestamp_seconds = Gauge::new(
             "talos_audit_chain_last_verified_ok_timestamp_seconds",
             "Unix time at which an execution's WORM audit chain last verified CLEAN. \
@@ -2222,6 +2275,8 @@ impl TalosMetrics {
             module_executions_retention_deleted_total,
             job_results_dropped_unparseable_total,
             audit_verification_failures_total,
+            audit_ledger_duplicate_deliveries_total,
+            audit_chain_duplicate_deliveries_total,
             audit_chain_unverifiable_total,
             audit_chain_last_verified_ok_timestamp_seconds,
             audit_chain_sweep_timestamp_seconds,
@@ -2442,6 +2497,15 @@ mod tests {
             r#"talos_audit_chain_unverifiable_total{reason="other"} 0"#,
             r#"talos_audit_chain_unverifiable_total{reason="no_credentials"} 0"#,
             r#"talos_audit_chain_unverifiable_total{reason="empty_chain"} 0"#,
+            // The duplicate-delivery pair. Neither is alerted on — that is the
+            // point of them — but both are read by an operator asking "is this
+            // ledger carrying redundant copies?", and an ABSENT series answers
+            // that question "no" when the truth is "nothing has looked". Only
+            // `scope="batch"` is seeded: the writer is write-only and cannot
+            // see a cross-batch copy, so a second scope value would be a label
+            // with no increment site.
+            r#"talos_audit_ledger_duplicate_deliveries_total{scope="batch"} 0"#,
+            "talos_audit_chain_duplicate_deliveries_total 0",
             r#"talos_module_payload_encryption_failures_total{op="encrypt",stage="input"} 0"#,
             r#"talos_module_payload_encryption_failures_total{op="encrypt",stage="output"} 0"#,
             r#"talos_module_payload_encryption_failures_total{op="encrypt",stage="trigger_metadata"} 0"#,
