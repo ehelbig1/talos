@@ -372,6 +372,14 @@ CTRL_TESTS=(
     # at the read cannot see an answer discarded further down. `common`
     # harness, so CTRL_TESTS (64b).
     "swallowed_read_disclosure_tests"
+    # The fail-OPEN half of that same inventory: reads whose consumer is an
+    # ENFORCEMENT decision, where the default does not merely make a false
+    # statement, it LIFTS THE BOUND. Drives `run_sandbox` /
+    # `compile_custom_sandbox` (actor capability-world ceiling) and
+    # `tag_workflow` (the 100-tag cap) through the production dispatch with the
+    # relation the gate's read names removed. `common` harness, so CTRL_TESTS
+    # (64b).
+    "fail_open_gate_tests"
     "api_key_tests"
     "api_auth_integration_test"
     "integration_mcp_tests"

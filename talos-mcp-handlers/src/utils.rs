@@ -1133,6 +1133,63 @@ pub async fn enforce_executions_not_paused(
     }
 }
 
+/// Read an actor's capability-world ceiling for an AUTHORING-TIME gate, or
+/// refuse.
+///
+/// A gate that cannot read its rule must not GRANT (2026-09-07). The three
+/// authoring/compile-time ceiling gates — `compile_custom_sandbox`,
+/// `run_sandbox` and `add_node_to_workflow` — each read the ceiling through the
+/// LENIENT free function `talos_actor_repository::get_actor_max_world`, which
+/// answers `None` on a database error, and each wrapped the whole gate in
+/// `if let Some(max_world) = …`. So a transient Postgres fault SKIPPED the
+/// ceiling check entirely and the request proceeded at whatever world the
+/// role-based RBAC check above it allowed.
+///
+/// That is not a new rule and it is not a new argument: **MCP-545 fixed exactly
+/// this shape** on the two RUNTIME gates in `talos-workflow-authorization`
+/// (`create_workflow` and `trigger_workflow`), whose comments say a DB error
+/// "caused this `if let Some(...)` block to be SKIPPED — letting the actor
+/// CREATE a workflow with modules above their ceiling during the hiccup
+/// window". The strict sibling `try_get_actor_max_world` was added for that fix
+/// and its own doc says "New code that gates authorisation on the ceiling
+/// should call this". It then had exactly TWO callers, both in that crate; the
+/// three authoring-time siblings were never swept. The lenient function's own
+/// body logs "caller may default to permissive ceiling — wire
+/// try_get_actor_max_world to fail closed".
+///
+/// The `Ok(None)` arm keeps today's behaviour deliberately, and MATCHES
+/// MCP-545's: `actors.max_capability_world` is `TEXT NOT NULL DEFAULT
+/// 'minimal-node'`, so `Ok(None)` can only mean "no such actor row" — a
+/// caller-supplied `agent_id` naming nothing. Refusing that would be a NEW
+/// refusal on a path the runtime gate admits, and two surfaces answering one
+/// question differently IS the bug this closes.
+pub async fn read_actor_ceiling_or_refuse(
+    actor_repo: &talos_actor_repository::ActorRepository,
+    actor_id: uuid::Uuid,
+    req_id: &Option<serde_json::Value>,
+    surface: &str,
+) -> Result<Option<String>, JsonRpcResponse> {
+    match actor_repo.try_get_actor_max_world(actor_id).await {
+        Ok(opt) => Ok(opt),
+        Err(e) => {
+            tracing::error!(
+                actor_id = %actor_id,
+                surface = surface,
+                error = %e,
+                event_kind = "capability_ceiling_unreadable",
+                "capability ceiling read failed; refusing rather than proceeding without the gate"
+            );
+            Err(mcp_error(
+                req_id.clone(),
+                -32000,
+                "Could not read this actor's capability-world ceiling, so the ceiling \
+                 could not be enforced. The request was refused rather than run without \
+                 the gate. Retry shortly.",
+            ))
+        }
+    }
+}
+
 /// Parse the optional caller-supplied actor identifier, accepting both
 /// the canonical `actor_id` key and the legacy `agent_id` key for
 /// backward-compatibility. `None` when neither key is present, the

@@ -358,11 +358,42 @@ async fn handle_tag_workflow(
     }
 
     // Enforce per-workflow tag count cap (100 tags max).
-    let tag_count = state
-        .workflow_repo
-        .get_tag_count(wf_id, user_id)
-        .await
-        .unwrap_or(0);
+    //
+    // A cap that cannot read its own count REFUSES (2026-09-07). Pre-fix this
+    // read was `.unwrap_or(0)`, so a failed count rendered as "this workflow
+    // has no tags" and the bound was lifted by the very fault that made it
+    // unreadable — the fail-OPEN half of the collapsed-read class (the 210-site
+    // entry in CLAUDE.md), as distinct from the claim sites #776 repaired.
+    // And the fault was not hypothetical. Measured 2026-09-07 by this handler's
+    // own CONTROL test against an intact schema: `get_tag_count` selected
+    // `coalesce(array_length(tags, 1), 0)`, which is INT4, into an `i64` and
+    // therefore returned `ColumnDecode` on EVERY call that found a row. So the
+    // cap had never once been evaluated — the swallow was not a hiccup window,
+    // it was the only behaviour, and it is what hid a query that could not run
+    // (the shape `handle_get_workflow_summary`'s own comment records for
+    // `is_active` vs `is_enabled`). The `::bigint` cast in the repository is
+    // the other half of this fix.
+    //
+    // The refusal costs the caller one tag operation during a database fault.
+    // The alternative costs the bound.
+    let tag_count = match state.workflow_repo.get_tag_count(wf_id, user_id).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!(
+                workflow_id = %wf_id,
+                error = %e,
+                event_kind = "tag_cap_unreadable",
+                "tag_workflow: could not read the current tag count; refusing rather than \
+                 adding a tag with the 100-tag cap unenforced"
+            );
+            return mcp_error(
+                req_id,
+                -32000,
+                "Could not read this workflow's current tag count, so the 100-tag cap \
+                 could not be enforced. No tag was added. Retry shortly.",
+            );
+        }
+    };
 
     if tag_count >= 100 {
         return mcp_error(

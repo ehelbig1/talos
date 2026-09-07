@@ -2565,11 +2565,22 @@ async fn handle_get_module_dependents(
         direct_rows.iter().map(|r| (r.id, r.name.clone())).collect();
     let mut indirect_workflows: Vec<serde_json::Value> = Vec::new();
     let mut seen_ids: std::collections::HashSet<uuid::Uuid> = std::collections::HashSet::new();
-    if let Ok(triples) = state
-        .module_repo
-        .find_workflows_referencing_workflows(user_id, &direct_ids, 20)
-        .await
-    {
+    // DISCLOSED, not defaulted (2026-09-07). Operators consult this tool to
+    // decide whether a module is safe to change or delete, and pre-fix
+    // `if let Ok(triples)` answered a failed read with `indirect_count: 0` and
+    // an empty `indirect_via_sub_workflows` — "nothing depends on this
+    // indirectly", the single most reassuring thing this surface can say, from
+    // a query that never ran. The two reads ABOVE it in the same function
+    // already refuse on `Err`; this one did not.
+    let mut readings = talos_measurement::Readings::new();
+    let indirect_read = readings.record(
+        "indirect_via_sub_workflows",
+        state
+            .module_repo
+            .find_workflows_referencing_workflows(user_id, &direct_ids, 20)
+            .await,
+    );
+    if let Some(triples) = indirect_read.clone() {
         for (target_id, ref_id, ref_name) in triples {
             if seen_ids.insert(ref_id) {
                 let target_name = direct_names
@@ -2588,13 +2599,17 @@ async fn handle_get_module_dependents(
         }
     }
 
-    let result = serde_json::json!({
+    // `null`, never `0`: an unreadable indirect scan is UNKNOWN, and the count
+    // is what a reader compares against zero before deleting.
+    let measured = indirect_read.is_some();
+    let mut result = serde_json::json!({
         "module_id": module_id,
         "direct_workflows": direct_workflows,
         "direct_count": direct_workflows.len(),
-        "indirect_via_sub_workflows": indirect_workflows,
-        "indirect_count": indirect_workflows.len(),
+        "indirect_via_sub_workflows": measured.then_some(indirect_workflows),
+        "indirect_count": measured.then_some(seen_ids.len()),
     });
+    readings.attach(&mut result);
     mcp_text(
         req_id,
         &serde_json::to_string_pretty(&result).unwrap_or_default(),

@@ -1587,9 +1587,146 @@ not to widen a regex.
 remaining report sites for whoever takes the next pass:
 `search::handle_tag_workflow` skips the 100-tag cap when the count read fails,
 and `sandbox::handle_run_sandbox` skips the LINT step entirely on
-`if let Ok(lint_errors)`. And `analytics::handle_get_workflow_dependencies_list`
+`if let Ok(lint_errors)`. (**Both CLOSED 2026-09-07 — see the fail-OPEN entry
+below, which also refutes the second one's framing: the lint step is duplicated
+by the full compile and was never a gate.**) And
+`analytics::handle_get_workflow_dependencies_list`
 (`schedules`, `webhooks`) is deliberately untouched: it is the site the sibling
 PR #775 fixes.
+
+### 2026-09-07 — the fail-OPEN half: eight gates that stopped gating, and one that had never gated at all
+
+The entry above closed eleven CLAIM sites and recorded two fail-OPEN gates as
+"not fixed". Both were wrong about what they were, and the class was bigger than
+two. **A gate that cannot read its rule must REFUSE; it must never GRANT.**
+
+**The inventory was REBUILT as a checked-in artefact**, because package 23's
+detector and its classification table were lost with its worktree and a
+CLAUDE.md sentence must not cite an artefact the merge discards.
+`scripts/lint-swallow-classify.py` (statement-aware: comment and string CONTENT
+masked first — check 73's trap — then the postfix chain after each `.await`
+walked, a collapse counted only before any `?`) plus
+`scripts/swallow-read-verdicts.py` render `docs/swallowed-reads-inventory.md`,
+the read-side companion to `docs/swallowed-results-inventory.md`. Run against
+`38175869` — the tree package 23 measured — the rebuild reports **208** against
+its reported **210**, so the two independent detectors agree to within 1%. On
+`origin/main` `0c962874` it reports **193** sites: **65 claim, 60 decorative,
+37 fail-closed, 5 fail-open, 26 false-positive**.
+
+**The lint pre-flight was NOT a security gate, and the measurement changed the
+fix.** `handle_run_sandbox`'s `if let Ok(lint_errors) = …lint_code(..)` was
+carried as "the sandbox runs unlinted". It does not:
+`compile_to_wasm_with_config`, which runs immediately afterwards, executes the
+IDENTICAL `analyze::lint_source_code` static pass at its step 0a and refuses on
+its errors, and it alone enforces the dependency allowlist and cargo-audit. So
+nothing `lint_code` checks is unique to it, and refusing would take
+`run_sandbox` off the air on the most likely `Err` this call produces — "Lint
+queue full. Try again shortly.", the 60 s compilation-semaphore timeout — for a
+request the full compile would have served. What was wrong is the SILENCE:
+`talos_inline_compile_service` already reached this conclusion for the same call
+and logs it (its L-32 arm), while this site and `talos_workflow_creation::spec`
+did not. One function, three call sites, one disclosing. Both now WARN.
+
+**The real fail-open the brief did not name is the CAPABILITY-WORLD CEILING, and
+it is MCP-545 unswept.** `talos_actor_repository::get_actor_max_world` returns
+`Option<String>` and answers `None` on a database error; its own body logs
+*"caller may default to permissive ceiling — wire try_get_actor_max_world to
+fail closed"*, and the strict sibling's doc says *"New code that gates
+authorisation on the ceiling should call this"*. MCP-545 wired the two RUNTIME
+gates in `talos-workflow-authorization` and never reached the three
+authoring/compile-time siblings, each of which wrapped the whole gate in
+`if let Some(max_world) = …`: `run_sandbox` (which COMPILES AND EXECUTES
+caller-supplied Rust at the requested world — the highest blast radius in the
+package), `compile_custom_sandbox`, and `add_node_to_workflow`. One home now:
+`crate::utils::read_actor_ceiling_or_refuse`. `Ok(None)` deliberately keeps
+today's behaviour, **matching MCP-545's own decision** —
+`actors.max_capability_world` is `TEXT NOT NULL DEFAULT 'minimal-node'`, so
+`Ok(None)` can only mean "no such actor row", and refusing it would make the
+authoring gate stricter than the runtime one, which is the same defect in the
+other direction.
+
+**All EIGHT fail-open sites are fixed**: the three ceilings above, plus
+`add_node_to_workflow`'s module-world read (the OTHER half of the same gate) and
+its `get_templates_by_ids` read (which gates the ONLY pre-flight a node config
+gets — schema, patterns, vault grants and the template's retry policy),
+`tag_workflow`'s 100-tag cap, `create_webhook`'s name-uniqueness pre-flight
+(nothing downstream backs it: `webhook_triggers.name` carries no unique index,
+and the per-user CAP three lines below already fails closed under MCP-367 — two
+gates in one function disagreeing), and `dlq_updates`'s periodic permission
+refresh, which on a failed read KEPT the prior org set, so a subscriber whose
+access had just been revoked went on receiving another org's DLQ events. That
+last one now NARROWS to own-events-only rather than terminating the stream, and
+self-heals on the next successful tick.
+
+**The tag cap had never once been evaluated, and its own swallow is why.** With
+the swallow removed, the CONTROL arm of the new DB test failed on an INTACT
+schema. Measured: `get_tag_count` selects `coalesce(array_length(tags, 1), 0)`,
+which is INT4, into an `i64`, so it returns
+`ColumnDecode { "Rust type `i64` (as SQL type `INT8`) is not compatible with SQL
+type `INT4`" }` **on every call that finds a row**. `fetch_optional` answers
+`Ok(None)` when nothing matches, so a nonexistent workflow looked healthy; the
+statement PREPAREs and PLANs perfectly, so **check 88 cannot see it**. This is
+check 88's `COUNT(*) … FOR UPDATE` finding in a second shape: a swallow hiding a
+query that could never run. Fixed on both sides (`::bigint` in the repository,
+refusal at the handler). No sibling: every other `array_length` in the workspace
+sits in a boolean predicate or a `COUNT(*)`.
+
+**Thirteen CLAIM sites were fixed on top, chosen by BLAST RADIUS rather than by
+position in the list.** Ranked: `submit_workflow_approval` answered a failed
+approval WRITE with *"No pending approval found for this execution. It may have
+already been decided"* — the one diagnosis that stops a retry, on a
+human-approval gate; `export_workflow` shipped a bundle carrying `modules: []`
+with no flag, a corrupt backup byte-indistinguishable from a module-less
+workflow that `import_workflow` would reconstitute without the modules;
+`import_workflow` marked EVERY referenced module missing on a failed existence
+read and recompiled each from the bundle (the correct handling of that exact
+read is 4300 lines up in the same file); `get_module_dependents` answered
+`indirect_count: 0` — "nothing depends on this" — on the tool an operator
+consults before deleting a module; `whoami` rendered the hardcoded literal
+`http-node` as the user's authorization ceiling and `false` for admin;
+`get_execution_cost` rendered `total_fuel_consumed: 0`, "this execution cost
+nothing"; and `build_execution_trace_json` rendered `sub_execution_count: 0` in
+three surfaces at once. **Check 74b then found three more in the two functions
+that had just adopted `Readings`, which is the leg working exactly as its own
+entry describes** — a handler enrols itself by adopting the ledger, so the way
+to extend the coverage is to fix a handler rather than widen a regex. Two are
+the execution-EVENT reads that `nodes` and every `summary` count are derived
+from ("this execution ran no nodes"); the third is per-node fuel enrichment. The
+two graph reads beside them are label prettification and carry
+`allow-benign-default` with the reason, which is the marker's documented second
+clause. The report sites use the `Readings` ledger and render
+`null`, never `0`; the decision sites refuse.
+
+**What is LEFT, with counts, so the next pass starts from a number rather than a
+sweep.** 175 sites remain: **52 claim**, 60 decorative, 37 fail-closed, 25
+false-positive, and 1 nominal fail-open that is the repaired `dlq_updates`
+narrowing (the detector correctly still sees a default; its verdict on the fixed
+tree is fail-closed). The 52 claims by file: `analytics.rs` 7,
+`executions.rs` 7, `modules.rs` 6, `advanced.rs` 5, `workflows.rs` 5,
+`platform.rs` 4, `actor.rs` 3, `configuration.rs` 3, `graph.rs` 3, `search.rs`
+3, `lib.rs` 2, `ml.rs` 1, and 3 in `talos-api`. Ranked highest among them by the
+inventory: `analytics.rs`'s workflow AUDIT TRAIL (a failed read silently drops
+every version-published and execution-triggered event, so a workflow reads as
+never published and never run on a tool named for auditability),
+`executions.rs`'s `get_execution_lineage_root` (a failed root lookup
+substitutes the execution's own id, so the tree read comes back empty and
+renders the false-standalone-run claim #771 built `lineage_note` to remove),
+`executions.rs`'s `watch_execution` events, `modules.rs`'s catalog listing, and
+`ml.rs`'s `has_pending_disagreements`.
+
+**No lint check was added and `--count` stays 88.** The candidate — "an
+enforcement decision may not be taken from a defaulted read" — cannot be spelled
+textually: the three most severe members of this class were `if let Some(..)`
+over an Option-returning read, and widening the detector's binding leg to
+`Some(..)` was BUILT and MEASURED: it takes that leg from **20 to 69** sites on
+pristine main, of which **3** are the gates — ~6% precision, enforcement-shaped
+noise. The structural answer is stronger and is what shipped: one
+`read_actor_ceiling_or_refuse`, and `controller/tests/fail_open_gate_tests`
+(CTRL_TESTS per check 64b) drives `run_sandbox`, `compile_custom_sandbox`,
+`tag_workflow` and `get_execution_cost` through the production dispatch with the
+relation each gate's read names removed — one test per distinct SHAPE, each
+carrying its own CONTROL, because the pre-fix tag path ALSO refused, just with
+the wrong diagnosis.
 
 ### The whitespace-run artefact, and why no lint guards it
 

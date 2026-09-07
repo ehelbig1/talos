@@ -408,22 +408,45 @@ impl SubscriptionRoot {
                                     {
                                         Ok(new_ids) => accessible_org_ids = new_ids,
                                         Err(e) => {
+                                            // 2026-09-07: NARROW, do not keep.
+                                            // The refresh exists to notice a
+                                            // REVOCATION, so keeping the prior
+                                            // set on a failed read is the one
+                                            // outcome that defeats it: the
+                                            // subscriber goes on receiving
+                                            // another org's DLQ events for as
+                                            // long as the read keeps failing.
+                                            // Clearing degrades to the events
+                                            // the user certainly owns
+                                            // (`event.user_id == subscriber`),
+                                            // which keeps the stream alive
+                                            // rather than terminating it, and
+                                            // self-heals on the next
+                                            // successful tick.
+                                            accessible_org_ids = Vec::new();
                                             tracing::warn!(
                                                 target: "talos_audit",
                                                 %user_id,
                                                 error = %e,
-                                                "dlq_updates org-membership refresh failed; keeping prior permission set"
+                                                event_kind = "subscription_permission_unreadable",
+                                                "dlq_updates org-membership refresh failed; NARROWING to own-events only until the next successful refresh"
                                             );
                                         }
                                     }
                                 }
                             }
                             Err(e) => {
+                                // Same rule one axis over: an unreadable admin
+                                // flag must not preserve admin visibility,
+                                // which bypasses the filter entirely.
+                                is_admin = false;
+                                accessible_org_ids = Vec::new();
                                 tracing::warn!(
                                     target: "talos_audit",
                                     %user_id,
                                     error = %e,
-                                    "dlq_updates is_platform_admin refresh failed; keeping prior permission set"
+                                    event_kind = "subscription_permission_unreadable",
+                                    "dlq_updates is_platform_admin refresh failed; NARROWING to own-events only until the next successful refresh"
                                 );
                             }
                         }
