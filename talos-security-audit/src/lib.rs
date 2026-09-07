@@ -1263,6 +1263,11 @@ pub enum AuditChainProbe {
         workflow_execution_id: String,
         total_events: usize,
         signatures_checked: bool,
+        /// BYTE-IDENTICAL redeliveries found in the chain. Non-zero is still a
+        /// PASS — one event that reached the ledger twice altered, added and
+        /// removed nothing — but it is DISCLOSED, because a reader told only
+        /// "5 events, verified" cannot tell that two of them are one event.
+        duplicate_deliveries: usize,
     },
     /// The chain read back and DID NOT verify — a gap, a broken link, a bad
     /// HMAC. Tamper evidence.
@@ -1342,11 +1347,21 @@ pub async fn probe_audit_chain(candidate: &AuditChainCandidate) -> AuditChainPro
             workflow_execution_id: target.genesis_workflow_id(),
             total_events: report.total_events,
             signatures_checked: report.signatures_checked,
+            duplicate_deliveries: report.duplicate_delivery_count(),
         },
         Ok(report) => AuditChainProbe::Broken {
             execution_id,
             workflow_execution_id: target.genesis_workflow_id(),
-            breaks: report.breaks.len(),
+            // TAMPER-EVIDENCE breaks only. `breaks` also carries
+            // `DuplicateDelivery`, which is not one — counting it here would
+            // put "FAILED verification with 3 break(s)" over a chain with two
+            // real breaks and one redelivery, which is the same
+            // report-overstates-its-finding defect one level down.
+            breaks: report
+                .breaks
+                .iter()
+                .filter(|b| b.is_tamper_evidence())
+                .count(),
         },
         Err(e) => {
             // "No endpoint configured" arrives here as `Other`, and it is the
@@ -1401,12 +1416,28 @@ pub fn check_audit_chain_verification(
             workflow_execution_id,
             total_events,
             signatures_checked,
+            duplicate_deliveries,
         } => {
             let sig = if *signatures_checked {
                 "with HMAC signatures checked"
             } else {
                 "WITHOUT HMAC signatures (no verification key is configured, so this run \
                  proved sequence and linkage only)"
+            };
+            // A PASS with a disclosure, not a silent PASS. `total_events`
+            // counts persisted records, so without this sentence "2 events,
+            // verified" and "1 event delivered twice" render identically.
+            let dupes = if *duplicate_deliveries > 0 {
+                format!(
+                    " {duplicate_deliveries} of those record(s) are BYTE-IDENTICAL \
+                     REDELIVERIES of an event already in the chain — at-least-once \
+                     delivery, not tampering: nothing was altered, added or removed, and \
+                     continuity was verified over the deduped sequence. The ledger writer \
+                     drops same-batch copies; it cannot see cross-batch ones, because its \
+                     object-store identity is write-only by design."
+                )
+            } else {
+                String::new()
             };
             Check {
                 name: "audit_chain_verification",
@@ -1418,8 +1449,8 @@ pub fn check_audit_chain_verification(
                      event(s), no gaps, no broken links, {sig}. The ledger is keyed PER JOB \
                      — every object key is `<{key_space}>/…` and the genesis hash binds \
                      ({genesis_col}, {key_space}) — so this is the id space that was \
-                     verified, not `workflow_executions.id`. {sweep_note} Reported, not \
-                     scored.",
+                     verified, not `workflow_executions.id`.{dupes} {sweep_note} Reported, \
+                     not scored.",
                     key_space = talos_audit_ledger::LEDGER_KEY_SPACE,
                     genesis_col = talos_audit_ledger::LEDGER_GENESIS_WORKFLOW_COLUMN,
                 ),

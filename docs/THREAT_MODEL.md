@@ -111,7 +111,38 @@ The MCP endpoint exposes 348+ tools via JSON-RPC over SSE and Streamable HTTP tr
   GraphQL query roll their per-job outcomes up to the workflow execution an
   operator asks about, worst outcome wins, and neither reports `ok` from an
   empty job set.
-- **File:** `talos-audit-event` (shared chain/HMAC + `verify_chain`), `talos-audit-ledger` (consumer + inline verify + `verifier` module: the read-only identity and the failure classification), `worker/src/audit.rs`
+- **An EXACT REDELIVERY is deduped at write and tolerated at verify; a
+  CONFLICTING one is still tamper evidence.** At-least-once is the transport's
+  contract, so the same signed event can reach the ledger twice, and until
+  2026-09-07 the verifier reported that as `DuplicateSequence` under "possible
+  tampering, deletion, reorder, or corruption". Two duplicate kinds, and only
+  one of them says anything about integrity:
+  - **Byte-identical** (same `sequence_num`, same recomputed hash, same HMAC) —
+    one event that arrived twice. Nothing altered, added or removed. The WRITER
+    drops the surplus copy inside a batch (`talos_audit_ledger::batch_dedupe`,
+    counting `talos_audit_ledger_duplicate_deliveries_total{scope="batch"}`) and
+    the VERIFIER reports `ChainBreak::DuplicateDelivery`, which does not clear
+    `ok`, is not counted in the sweep's `failed`, and pages nobody. Chain
+    continuity is computed over the deduped sequence.
+  - **Conflicting** (one sequence, two contents) — a substitution. Still
+    `ChainBreak::DuplicateSequence`, still `ok == false`, still CRITICAL.
+  The split is not symmetric on purpose: the writer can only dedupe copies that
+  share a batch, because its S3 identity is **write-only by design** and reading
+  the prefix back to find an earlier copy would hand a compromised writer the
+  whole audit trail. Cross-batch copies are therefore classified at the reader,
+  where the read-only verifier identity already belongs.
+  Measured 2026-09-07: 196 of 49,461 job prefixes carried more than one terminal
+  anchor; 35 byte-identical, 161 conflicting. The conflicting majority was a
+  PRODUCER defect, not a transport one — the worker's in-process retry loop
+  built a fresh `ExecutionLedger` per attempt and anchored each, so every
+  attempt emitted an `execution_complete` event claiming `sequence_num` 1.
+  Attempts now share one ledger and the job is anchored once, so the chain is
+  one monotonic sequence over the whole job. Note the residual: the anchor is
+  one per DISPATCH, and a controller-level retry re-dispatches the same
+  `job_id`; reconstructing a prior dispatch's ledger would need persisted state
+  the credential-free worker cannot read, so those copies remain and are
+  classified at the verifier like any other cross-batch pair.
+- **File:** `talos-audit-event` (shared chain/HMAC + `verify_chain` + the duplicate classification), `talos-audit-ledger` (consumer + inline verify + `batch_dedupe` + `verifier` module: the read-only identity and the failure classification), `worker/src/audit.rs`, `talos-worker-runtime/src/runtime.rs` (`seal_job_audit_chain`)
 
 ### Information Disclosure
 - **Threat:** Tool responses leak internal errors, stack traces, or secret values.

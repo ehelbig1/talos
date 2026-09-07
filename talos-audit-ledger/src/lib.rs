@@ -18,6 +18,7 @@ pub use talos_audit_event::{
     audit_verify_keys, verify_chain, AuditEvent, ChainBreak, ChainVerificationReport,
 };
 
+pub mod batch_dedupe;
 pub mod population;
 pub mod verifier;
 use population::{roll_up_by_workflow_execution, JobChainOutcome};
@@ -97,6 +98,26 @@ fn inc_audit_verification_failure(stage: &'static str) {
             .inc();
     }
 }
+
+/// Count one EXACT duplicate dropped at the writer.
+///
+/// Deliberately NOT `talos_audit_verification_failures_total`: that series'
+/// HELP text says "positive tamper/corruption evidence" and a CRITICAL alert
+/// fires on it. A redelivery is the transport working as designed, so it gets
+/// its own series and no alert. Same reasoning that keeps
+/// `audit_chain_unverifiable_total` off the tamper counter.
+fn inc_batch_duplicate_delivery() {
+    if let Some(m) = talos_metrics::global() {
+        m.audit_ledger_duplicate_deliveries_total
+            .with_label_values(&[AUDIT_DUPLICATE_SCOPE_BATCH])
+            .inc();
+    }
+}
+
+/// The only `scope` label value with a live increment site. A second value
+/// must arrive with its own writer AND its own pre-seed, or check 58's
+/// dead-metric rule is being satisfied by a label nothing ever touches.
+pub(crate) const AUDIT_DUPLICATE_SCOPE_BATCH: &str = "batch";
 
 /// The verification decision itself, split from [`verify_audit_message`] so the
 /// counter has one exit point instead of one per `Reject` return.
@@ -805,7 +826,22 @@ pub struct ChainSweepStats {
     /// and it is still not folded into `verified_ok`.
     pub empty: usize,
     /// Chains WITH breaks — tamper / corruption / gap / linkage / bad HMAC.
+    ///
+    /// A byte-identical REDELIVERY is not one of these. It is counted in
+    /// [`ChainSweepStats::duplicate_delivery`] and, when it is the only
+    /// finding, in `verified_ok` — see
+    /// [`talos_audit_event::ChainBreak::is_tamper_evidence`].
     pub failed: usize,
+    /// Chains carrying at least one BYTE-IDENTICAL redelivery
+    /// ([`talos_audit_event::ChainBreak::DuplicateDelivery`]).
+    ///
+    /// Reported beside `verified_ok`, never folded into `failed`: one event
+    /// that reached the ledger twice altered, added and removed nothing, so
+    /// calling it tamper evidence is a false positive on the one control that
+    /// exists to raise a true one. Counted independently of the arm the job
+    /// landed in, so a chain with a REAL break AND a redelivery shows up in
+    /// both numbers rather than having the redelivery hidden by the break.
+    pub duplicate_delivery: usize,
     /// Executions whose chain could not be read (S3/IO error) — unverified.
     pub errored: usize,
     /// The row cap bound: there were AT LEAST `scanned` executions in the
@@ -1019,6 +1055,33 @@ fn record_chain_verification_outcome(
     let exec_id = target.module_execution_id;
     let wf_id = target.workflow_execution_id;
     let mut class = JobChainOutcome::VerifiedOk;
+    // Counted BEFORE the arms, and independently of them: a redelivery is a
+    // property of the chain, not of the verdict, so a job that also has a real
+    // break must still report the redelivery rather than have it swallowed by
+    // the louder finding.
+    if let Ok(report) = &outcome {
+        let duplicates = report
+            .breaks
+            .iter()
+            .filter(|b| matches!(b, ChainBreak::DuplicateDelivery { .. }))
+            .count();
+        if duplicates > 0 {
+            stats.duplicate_delivery += 1;
+            inc_chain_duplicate_delivery();
+            tracing::info!(
+                target: "talos_audit",
+                event_kind = "audit_chain_duplicate_delivery",
+                module_execution_id = %target.module_execution_id,
+                workflow_execution_id = %target.workflow_execution_id,
+                ledger_key_space = LEDGER_KEY_SPACE,
+                duplicate_events = duplicates,
+                "a job's audit chain carries byte-identical redelivered event(s) — \
+                 at-least-once delivery, NOT tamper evidence. The chain's continuity is \
+                 verified over the deduped sequence; the writer drops same-batch copies \
+                 and cannot see cross-batch ones (its store identity is write-only)."
+            );
+        }
+    }
     let control = match outcome {
         // An EMPTY prefix is not a verified chain. It does not stamp the
         // last-verified-ok gauge either — "the control works" must not be
@@ -1103,6 +1166,15 @@ fn record_chain_verification_outcome(
         }
     };
     (control, class)
+}
+
+/// Count one job chain found carrying a byte-identical redelivery.
+///
+/// No alert selects this series, deliberately: see the counter's HELP text.
+fn inc_chain_duplicate_delivery() {
+    if let Some(m) = talos_metrics::global() {
+        m.audit_chain_duplicate_deliveries_total.inc();
+    }
 }
 
 /// Count one unverifiable chain, by classified reason.
@@ -1215,6 +1287,7 @@ fn publish_sweep_snapshot(stats: &ChainSweepStats) {
         verified_ok: stats.verified_ok,
         empty: stats.empty,
         failed: stats.failed,
+        duplicate_delivery: stats.duplicate_delivery,
         errored: stats.errored,
         unbound: stats.unbound,
         cap_hit: stats.cap_hit,
@@ -1585,6 +1658,86 @@ async fn process_batch(
         }
     }
 
+    // Phase 1b: drop EXACT duplicates inside this batch.
+    //
+    // An audit event can reach this subscriber more than once — at-least-once
+    // is the transport's contract, and (measured 2026-09-07) the worker's own
+    // retry loop appended one terminal anchor per attempt from a fresh
+    // `ExecutionLedger`, so two attempts inside one wall-clock second produced
+    // two BYTE-IDENTICAL events. Written through, they became one `.jsonl`
+    // object with two identical lines, which the offline verifier reported as
+    // `DuplicateSequence` under "possible tampering, deletion, reorder, or
+    // corruption" — a false CRITICAL on the one control that exists to raise a
+    // true one.
+    //
+    // Only EXACT duplicates are dropped: a conflicting pair (one sequence, two
+    // contents) is a substitution and MUST reach the ledger and the verifier
+    // intact. See `batch_dedupe` for the identity, and for why the writer
+    // cannot close the cross-BATCH case (its S3 identity is write-only by
+    // design — do not widen it; the verifier classifies that case instead).
+    //
+    // Placed BEFORE the user_id resolve and the OTLP span emission so a
+    // dropped copy costs no query and emits no duplicate span either.
+    let (keep_indices, dropped_duplicates) =
+        batch_dedupe::partition_batch_duplicates(parsed.iter().map(|p| {
+            let event = p.wrapper.get("event");
+            (
+                p.idx,
+                batch_dedupe::BatchEventKey {
+                    execution_id: p.execution_id.clone(),
+                    sequence_num: event
+                        .and_then(|e| e.get("sequence_num"))
+                        .and_then(serde_json::Value::as_u64)
+                        .unwrap_or(0),
+                    hash: p
+                        .wrapper
+                        .get("hash")
+                        .and_then(|h| h.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    hmac_signature: event
+                        .and_then(|e| e.get("hmac_signature"))
+                        .and_then(|h| h.as_str())
+                        .map(str::to_string),
+                },
+                event
+                    .and_then(|e| e.get("action"))
+                    .and_then(|a| a.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+            )
+        }));
+    let duplicate_indices: Vec<usize> = dropped_duplicates.iter().map(|d| d.idx).collect();
+    if !dropped_duplicates.is_empty() {
+        for _ in &dropped_duplicates {
+            inc_batch_duplicate_delivery();
+        }
+        // ONE line per batch, at INFO. This is the transport working as
+        // designed, not an incident: an ERROR here would be the same
+        // train-the-operator-to-ignore-it defect the classification fixes.
+        let kinds: HashSet<&str> = dropped_duplicates
+            .iter()
+            .map(|d| d.event_kind.as_str())
+            .collect();
+        let mut kinds: Vec<&str> = kinds.into_iter().collect();
+        kinds.sort_unstable();
+        tracing::info!(
+            target: "talos_audit",
+            event_kind = "audit_batch_duplicate_delivery",
+            dropped = dropped_duplicates.len(),
+            event_kinds = ?kinds,
+            executions = dropped_duplicates
+                .iter()
+                .map(|d| d.execution_id.as_str())
+                .collect::<HashSet<&str>>()
+                .len(),
+            "dropped {} byte-identical audit event copy(ies) from this batch —              at-least-once delivery, NOT tamper evidence; the surviving copy is              written and every copy is acknowledged",
+            dropped_duplicates.len()
+        );
+        let keep: HashSet<usize> = keep_indices.into_iter().collect();
+        parsed.retain(|p| keep.contains(&p.idx));
+    }
+
     // Phase 2: batch-resolve user_ids for distinct workflow_ids in this batch.
     let distinct_wids: HashSet<Uuid> = parsed.iter().filter_map(|p| p.workflow_uuid).collect();
     let mut user_id_map: HashMap<Uuid, Uuid> = HashMap::new();
@@ -1921,6 +2074,10 @@ async fn process_batch(
     // quarantined). All are terminal — ACK so they don't block the stream.
     let mut all_to_ack = invalid_messages;
     all_to_ack.extend(successful_indices);
+    // A dropped duplicate is TERMINAL: its content is already being written
+    // by the copy that survived, so it must be ACKed. Leaving it unacked
+    // would have JetStream redeliver it after `ack_wait` forever.
+    all_to_ack.extend(duplicate_indices);
     all_to_ack.extend(rejected_messages.iter().map(|(idx, _, _)| *idx));
 
     for idx in all_to_ack {
@@ -2347,6 +2504,63 @@ mod audit_verification_metric_tests {
         assert_eq!(stats.errored, 1);
     }
 
+    /// The whole point, at the sweep's classification site: a chain whose ONLY
+    /// finding is a byte-identical redelivery is VERIFIED. It counts in
+    /// `verified_ok`, it counts in the separate `duplicate_delivery` tally, and
+    /// it must NOT touch `talos_audit_verification_failures_total{stage="chain"}`
+    /// — the CRITICAL series. Measured live 2026-09-07, this exact shape was
+    /// 1 of the 102 jobs in the first sweep that ever completed.
+    #[test]
+    fn a_redelivered_chain_is_verified_not_a_tamper_failure() {
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
+        let mut stats = ChainSweepStats::default();
+        let mut r = report(true);
+        r.breaks.push(ChainBreak::DuplicateDelivery { seq: 1 });
+
+        let before = stage_count(AUDIT_STAGE_CHAIN);
+        let before_dupes = chain_duplicate_count();
+        record_chain_verification_outcome(&mut stats, Ok(r), &nil_target());
+
+        assert_eq!(
+            stage_count(AUDIT_STAGE_CHAIN) - before,
+            0.0,
+            "a redelivery must not page as tamper evidence"
+        );
+        assert_eq!(chain_duplicate_count() - before_dupes, 1.0);
+        assert_eq!(stats.duplicate_delivery, 1);
+        assert_eq!(stats.verified_ok, 1);
+        assert_eq!(stats.failed, 0, "never in failed");
+    }
+
+    /// The control: a REAL break that also carries a redelivery is still a
+    /// failure, and the redelivery is still reported — one finding must not
+    /// swallow the other.
+    #[test]
+    fn a_broken_chain_that_also_redelivered_reports_both() {
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
+        let mut stats = ChainSweepStats::default();
+        let mut r = report(false);
+        r.breaks.push(ChainBreak::DuplicateDelivery { seq: 1 });
+        r.breaks.push(ChainBreak::SequenceGap {
+            expected: 2,
+            found: 3,
+        });
+
+        let before = stage_count(AUDIT_STAGE_CHAIN);
+        record_chain_verification_outcome(&mut stats, Ok(r), &nil_target());
+        assert_eq!(stage_count(AUDIT_STAGE_CHAIN) - before, 1.0);
+        assert_eq!(stats.failed, 1);
+        assert_eq!(stats.duplicate_delivery, 1);
+        assert_eq!(stats.verified_ok, 0);
+    }
+
+    fn chain_duplicate_count() -> f64 {
+        talos_metrics::global()
+            .expect("metrics")
+            .audit_chain_duplicate_deliveries_total
+            .get()
+    }
+
     /// The two stage labels are exactly what
     /// `deploy/helm/talos/files/alerts.yaml` selects on.
     #[test]
@@ -2559,6 +2773,7 @@ mod sweep_coverage_pins {
             scanned: 500,
             verified_ok: 500,
             failed: 0,
+            duplicate_delivery: 0,
             errored: 0,
             unbound: 0,
             cap_hit: true,

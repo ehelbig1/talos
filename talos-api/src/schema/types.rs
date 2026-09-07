@@ -1573,8 +1573,13 @@ pub struct GrantCapabilityCeilingInput {
 /// Flattened from `talos_audit_ledger::ChainBreak` for the GraphQL surface.
 #[derive(SimpleObject, Clone)]
 pub struct AuditChainBreak {
-    /// `sequence_gap` | `duplicate_sequence` | `genesis_mismatch` |
-    /// `linkage_mismatch` | `bad_signature` | `unsigned`.
+    /// `sequence_gap` | `duplicate_sequence` | `duplicate_delivery` |
+    /// `genesis_mismatch` | `linkage_mismatch` | `bad_signature` | `unsigned`.
+    ///
+    /// Every value EXCEPT `duplicate_delivery` is tamper/corruption evidence
+    /// and clears `ok`. `duplicate_delivery` is one event that reached the
+    /// ledger twice byte-for-byte — reported so the redundancy is visible,
+    /// never a reason to distrust the chain. Read `ok`, not `breaks.length`.
     pub kind: String,
     /// The sequence number the break is associated with, if applicable.
     pub sequence: Option<i64>,
@@ -1596,6 +1601,12 @@ impl From<&talos_audit_ledger::ChainBreak> for AuditChainBreak {
             },
             CB::DuplicateSequence { seq } => Self {
                 kind: "duplicate_sequence".to_string(),
+                sequence: i64::try_from(*seq).ok(),
+                expected: None,
+                found: None,
+            },
+            CB::DuplicateDelivery { seq } => Self {
+                kind: "duplicate_delivery".to_string(),
                 sequence: i64::try_from(*seq).ok(),
                 expected: None,
                 found: None,
@@ -1647,14 +1658,22 @@ pub struct AuditChainJobVerification {
     pub module_execution_id: String,
     /// `module_executions.workflow_execution_id` — the genesis `workflow_id`.
     pub workflow_execution_id: String,
+    /// Persisted records, redelivered copies INCLUDED. Subtract
+    /// `duplicateDeliveries` for the number of distinct events.
     pub total_events: i32,
     pub ok: bool,
     pub signatures_checked: bool,
     pub breaks: Vec<AuditChainBreak>,
+    /// How many of `breaks` are `duplicate_delivery` — a chain with a non-zero
+    /// count here and `ok: true` is a VERIFIED chain carrying redundant
+    /// copies, which is a different fact from a verified chain of distinct
+    /// events and must not render as one.
+    pub duplicate_deliveries: i32,
 }
 
 impl From<talos_audit_ledger::ChainVerificationReport> for AuditChainJobVerification {
     fn from(r: talos_audit_ledger::ChainVerificationReport) -> Self {
+        let duplicate_deliveries = i32::try_from(r.duplicate_delivery_count()).unwrap_or(i32::MAX);
         Self {
             module_execution_id: r.execution_id,
             workflow_execution_id: r.workflow_id,
@@ -1662,6 +1681,7 @@ impl From<talos_audit_ledger::ChainVerificationReport> for AuditChainJobVerifica
             ok: r.ok,
             signatures_checked: r.signatures_checked,
             breaks: r.breaks.iter().map(AuditChainBreak::from).collect(),
+            duplicate_deliveries,
         }
     }
 }
@@ -1694,8 +1714,11 @@ pub struct AuditChainVerification {
     pub ok: bool,
     /// True iff HMAC verification was attempted for every job.
     pub signatures_checked: bool,
-    /// Concatenated over `jobs`, in job order.
+    /// Concatenated over `jobs`, in job order. A `duplicate_delivery` entry
+    /// here does NOT clear `ok` — see `AuditChainBreak.kind`.
     pub breaks: Vec<AuditChainBreak>,
+    /// Summed over `jobs`.
+    pub duplicate_deliveries: i32,
     /// The per-job chains this aggregate is built from. EMPTY means nothing
     /// was verified, which is why `ok` is false in that case.
     pub jobs: Vec<AuditChainJobVerification>,
@@ -1722,6 +1745,10 @@ impl AuditChainVerification {
             .fold(0i32, i32::saturating_add);
         let breaks: Vec<AuditChainBreak> =
             jobs.iter().flat_map(|j| j.breaks.iter().cloned()).collect();
+        let duplicate_deliveries: i32 = jobs
+            .iter()
+            .map(|j| j.duplicate_deliveries)
+            .fold(0i32, i32::saturating_add);
         Self {
             execution_id,
             workflow_id,
@@ -1733,6 +1760,7 @@ impl AuditChainVerification {
             ok: !jobs.is_empty() && jobs.iter().all(|j| j.ok),
             signatures_checked: !jobs.is_empty() && jobs.iter().all(|j| j.signatures_checked),
             breaks,
+            duplicate_deliveries,
             jobs,
         }
     }

@@ -202,16 +202,97 @@ fn verify_chain_detects_genesis_mismatch() {
         .any(|b| matches!(b, ChainBreak::GenesisMismatch { seq: 1, .. })));
 }
 
+/// An EXACT redelivery of one event is a transport/producer artefact, not
+/// tamper evidence: nothing has been altered, added or removed from the
+/// chain — one event arrived twice. It is REPORTED (so an operator can see
+/// the ledger is carrying redundant copies) and it does NOT flip `ok`.
+///
+/// Measured on the live dev stack 2026-09-07: the first audit-chain sweep
+/// that ever completed reported `jobs_failed=1` on exactly this shape — one
+/// object whose two lines were byte-identical (same `sequence_num`, same
+/// `previous_hash`, same `hash`, same `hmac_signature`, same `timestamp`) —
+/// under the message "possible tampering, deletion, reorder, or corruption".
 #[test]
-fn verify_chain_detects_duplicate_sequence() {
+fn verify_chain_reports_an_identical_redelivery_as_delivery_not_tampering() {
     let mut events = build_chain("wf", "ex", 3);
-    let dup = events[1].clone();
+    let dup = events[1].clone(); // byte-identical copy of seq 2
     events.push(dup);
     let report = verify_chain("wf", "ex", &events, &[]);
-    assert!(report
-        .breaks
-        .iter()
-        .any(|b| matches!(b, ChainBreak::DuplicateSequence { seq: 2 })));
+    assert!(
+        report
+            .breaks
+            .iter()
+            .any(|b| matches!(b, ChainBreak::DuplicateDelivery { seq: 2 })),
+        "breaks: {:?}",
+        report.breaks
+    );
+    assert!(
+        !report
+            .breaks
+            .iter()
+            .any(|b| matches!(b, ChainBreak::DuplicateSequence { .. })),
+        "an identical copy must not be reported as conflicting: {:?}",
+        report.breaks
+    );
+    assert!(
+        report.ok,
+        "a duplicate DELIVERY is the only finding, so the chain still verifies: {:?}",
+        report.breaks
+    );
+}
+
+/// The control, and the reason `DuplicateDelivery` may not be defined as
+/// "two rows share a sequence": two events claiming ONE sequence with
+/// DIFFERENT content is a substitution — one of them is not what the
+/// producer wrote — and stays positive tamper evidence.
+///
+/// This is also the MAJORITY of the live population: 161 of the 196 affected
+/// prefixes measured 2026-09-07 carry copies that differ in `timestamp`
+/// (hence in hash and signature), because the producer appended one anchor
+/// per retry attempt and the attempts straddled a one-second boundary.
+#[test]
+fn verify_chain_keeps_conflicting_duplicates_as_tamper_evidence() {
+    let mut events = build_chain("wf", "ex", 3);
+    let mut dup = events[1].clone();
+    dup.timestamp += 1; // same sequence, different content
+    events.push(dup);
+    let report = verify_chain("wf", "ex", &events, &[]);
+    assert!(
+        report
+            .breaks
+            .iter()
+            .any(|b| matches!(b, ChainBreak::DuplicateSequence { seq: 2 })),
+        "breaks: {:?}",
+        report.breaks
+    );
+    assert!(!report.ok, "conflicting content must not verify");
+}
+
+/// The signature half of the comparison, kept separate so a
+/// `DuplicateDelivery` predicate that only compares hashes goes red here.
+/// Two copies with identical CONTENT but different signatures cannot both
+/// have been produced by a key holder over that content — one signature was
+/// substituted.
+#[test]
+fn verify_chain_treats_a_resigned_copy_as_conflicting() {
+    let key = b"0123456789abcdef0123456789abcdef".to_vec();
+    let mut events = build_chain("wf", "ex", 3);
+    for e in &mut events {
+        e.hmac_signature = Some(hmac_sign(e, &key));
+    }
+    let mut dup = events[1].clone();
+    dup.hmac_signature = Some("00".repeat(32));
+    events.push(dup);
+    let report = verify_chain("wf", "ex", &events, &[key.clone()]);
+    assert!(
+        report
+            .breaks
+            .iter()
+            .any(|b| matches!(b, ChainBreak::DuplicateSequence { seq: 2 })),
+        "breaks: {:?}",
+        report.breaks
+    );
+    assert!(!report.ok);
 }
 
 #[test]
@@ -592,4 +673,39 @@ fn sign_with_hash_using_matches_the_canonical_hmac_construction() {
     ev.sign_with_hash_using(&hash, key);
 
     assert_eq!(ev.hmac_signature.as_deref(), Some(expected.as_str()));
+}
+
+/// The anchored verifier must agree with the chain report about the same
+/// events. Before the dedupe, an identical redelivery of a one-event chain
+/// produced TWO hard failures from one benign copy: the anchor commits
+/// `total_events: 1` and the verifier counted 2 (`CountMismatch`), and the
+/// duplicated anchor also read as `MultipleAnchors`. That is the exact shape
+/// of the live finding (`total_events=2`, one anchor, seq 1).
+#[test]
+fn an_identical_redelivered_anchor_still_verifies_as_anchored() {
+    let mut ledger = ExecutionLedger::new("wf", "ex");
+    let anchor = ledger.append_terminal_anchor("worker");
+    let events = vec![anchor.clone(), anchor];
+    let report = verify_chain_anchored("wf", "ex", &events, &[]);
+    assert_eq!(report.anchor, AnchorVerdict::Anchored { total_events: 1 });
+    assert!(report.ok, "{:?}", report);
+    assert!(report
+        .chain
+        .breaks
+        .iter()
+        .any(|b| matches!(b, ChainBreak::DuplicateDelivery { seq: 1 })));
+}
+
+/// The control for the dedupe: two anchors that DIFFER stay a hard failure.
+/// This is the majority shape on the live ledger — one anchor per retry
+/// attempt, attempts straddling a one-second `timestamp` boundary.
+#[test]
+fn two_conflicting_anchors_stay_a_hard_failure() {
+    let mut ledger = ExecutionLedger::new("wf", "ex");
+    let anchor = ledger.append_terminal_anchor("worker");
+    let mut second = anchor.clone();
+    second.timestamp += 1;
+    let report = verify_chain_anchored("wf", "ex", &[anchor, second], &[]);
+    assert!(!report.ok, "{:?}", report);
+    assert_eq!(report.anchor, AnchorVerdict::MultipleAnchors { count: 2 });
 }
