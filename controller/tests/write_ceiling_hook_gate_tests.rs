@@ -155,3 +155,122 @@ async fn hook_refuses_a_readonly_envelope_with_no_engine_in_the_loop() {
          to strip it first — this is the only gate on the test_module path"
     );
 }
+
+// ── The SCOPE of the ceiling: what it deliberately does NOT gate ─────────────
+
+/// Seed an actor whose `max_write_ceiling` is really `readonly` in the
+/// database — the memory tests above pass the ceiling as a parameter and never
+/// need the column, but the point of the test below is that a future gate
+/// which READS the column must fail loudly, so the column has to be right.
+async fn seed_readonly_actor(pool: &sqlx::Pool<sqlx::Postgres>) -> Uuid {
+    let actor = seed_actor(pool).await;
+    sqlx::query("UPDATE actors SET max_write_ceiling = 'readonly' WHERE id = $1")
+        .bind(actor)
+        .execute(pool)
+        .await
+        .expect("set readonly ceiling");
+    let ceiling: String = sqlx::query_scalar("SELECT max_write_ceiling FROM actors WHERE id = $1")
+        .bind(actor)
+        .fetch_one(pool)
+        .await
+        .expect("read back ceiling");
+    assert_eq!(ceiling, "readonly", "the fixture must really be readonly");
+    actor
+}
+
+/// **POSITIVE CONTROL for a decision, not a guard against a bug.**
+///
+/// #750 found that three output protocols travel ONE node-completion hook on
+/// ONE actor binding, gated exactly one of them, and left the other two as "an
+/// operator policy call". Decided 2026-09-06 (#768): `actors.max_write_ceiling`
+/// governs the ACTOR's own DATA PLANE — actor_memory, integration state,
+/// sandbox SQL. `__ops_alert__` and `__ml_distill__` are PLATFORM ingestion
+/// that takes the actor id for TENANCY, not because the rows are the actor's
+/// data.
+///
+/// So this test asserts the row LANDS: a `readonly` actor, with
+/// `TALOS_WRITE_CEILING_ENFORCED=1` already set by the test above (and by
+/// `enforce_write_ceiling()` here), emitting `__ops_alert__` through the real
+/// `ControllerNodeHook`, must still write to `ops_alerts`. A future change that
+/// "closes the gap" by gating this protocol turns the test red instead of
+/// silently taking the one live readonly actor's alert pipeline off the air.
+///
+/// The refusal that DOES stay is a different rule and is covered below: an
+/// envelope with no actor at all has no tenancy principal and is dropped.
+///
+/// `__ml_distill__` gets no equivalent here, and the reason is measured rather
+/// than asserted: `talos_ml::spawn_distill_from_output` short-circuits on the
+/// process-global `DISTILL_CONTEXT` `OnceLock` — settable once per test BINARY,
+/// which sibling tests in the same process race (the objection check 82 already
+/// records about `controller_write_ceiling_enforced`) — and past it the flow
+/// needs an ML content-MAC key, an embedding provider, a model and a dataset.
+/// The decision for it is pinned in `talos-engine/src/node_hook.rs` at the call
+/// site and in `talos_security_audit::UNGATED_OUTPUT_PROTOCOLS`, which names
+/// both protocols and is what the operator-facing report renders.
+#[tokio::test]
+async fn a_readonly_actors_ops_alert_still_lands_because_it_is_outside_the_ceiling() {
+    enforce_write_ceiling();
+    let (pool, _db) = common::isolated_db_pool().await;
+    let actor = seed_readonly_actor(&pool).await;
+    let hook = talos_engine::node_hook::ControllerNodeHook::new(pool.clone());
+
+    let dedup = format!("hookgate-opsalert/{}", Uuid::new_v4());
+    hook.persist_ops_alert_if_present(
+        Some(actor),
+        &json!({
+            "__ops_alert__": {
+                "dedup_key": dedup,
+                "source": "hook-gate-test",
+                "title": "a readonly actor's diagnostic",
+                "severity_hint": "warning"
+            }
+        }),
+    );
+
+    // The ingest is `tokio::spawn`ed behind a tenancy lookup, so poll.
+    let mut landed = 0;
+    for _ in 0..100 {
+        landed =
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM ops_alerts WHERE dedup_key = $1")
+                .bind(&dedup)
+                .fetch_one(&pool)
+                .await
+                .expect("count ops_alerts");
+        if landed > 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        landed, 1,
+        "__ops_alert__ is OUTSIDE the write ceiling by decision (#768): a readonly \
+         actor's platform diagnostic must still land. If this failed because someone \
+         gated it, read the decision at the call site in talos-engine/src/node_hook.rs \
+         before changing this test."
+    );
+
+    // The rule that DOES survive: no actor is no tenancy principal. This is
+    // the control — without it, a hook that dropped every envelope would pass
+    // the assertion above only by accident of ordering.
+    let orphan = format!("hookgate-opsalert-orphan/{}", Uuid::new_v4());
+    hook.persist_ops_alert_if_present(
+        None,
+        &json!({
+            "__ops_alert__": {
+                "dedup_key": orphan,
+                "source": "hook-gate-test",
+                "title": "no actor bound"
+            }
+        }),
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM ops_alerts WHERE dedup_key = $1")
+            .bind(&orphan)
+            .fetch_one(&pool)
+            .await
+            .expect("count orphan ops_alerts"),
+        0,
+        "an envelope with no actor has no tenancy principal and must be dropped"
+    );
+}

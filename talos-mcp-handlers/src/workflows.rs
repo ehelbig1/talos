@@ -5065,6 +5065,31 @@ async fn handle_call_workflow(
             return Some(crate::utils::database_error(req_id.clone()));
         }
     };
+    // Phase D2, applied to the SYNC path (#768). `call_workflow` is a
+    // production invocation path — the tool description recommends it whenever
+    // the caller wants the result inline — and it used to build its engine with
+    // a literal `None` actor. For an UNBOUND workflow that ran the whole
+    // execution at the engine's Tier-1 fail-safe with no tenancy principal,
+    // while `trg_set_default_actor` stamped the user's Default actor on the
+    // execution ROW: the row said Default, the engine ran as nobody.
+    //
+    // Resolved HERE, above the row creation, because the contract is that ONE
+    // value is stamped on the row and bound on the engine. See
+    // `resolve_sync_call_effective_actor` for what the gate can now refuse.
+    let effective_actor = match crate::utils::resolve_sync_call_effective_actor(
+        &state.workflow_repo,
+        &state.actor_repo,
+        &state.db_pool,
+        wf_record.actor_id,
+        user_id,
+        &graph_json,
+        req_id.clone(),
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(resp) => return Some(resp),
+    };
     // Output shaping (IMP-5): resolved up front so it survives graph_json
     // moving into the run task. Applied to the RETURNED copy only — the full
     // output is still projected + persisted below.
@@ -5089,7 +5114,11 @@ async fn handle_call_workflow(
             user_id,
             version_id,
             None,
-            None,
+            // The SAME value the engine is built with, twelve lines below.
+            // Passing `None` here left the row's actor to the BEFORE-INSERT
+            // trigger and also skipped the atomic actor-budget backstop that
+            // `trigger_workflow` has always run.
+            effective_actor,
             None,
             None,
             None,
@@ -5173,20 +5202,17 @@ async fn handle_call_workflow(
     // handle_test_workflow / handle_test_workflow_draft and the GraphQL
     // test-workflow mutation.
     //
-    // Actor binding: this path uses wf_record.actor_id ONLY (no caller-arg
-    // fallback) — asymmetric from MCP trigger_workflow. Preserved as-is
-    // (refactor-plan open question #3).
     // MCP-268 (2026-05-10): direction-class wrong-type rejection.
     let dry_run = match crate::utils::validate_optional_bool(args, "dry_run", false, &req_id) {
         Ok(v) => v,
         Err(resp) => return Some(resp),
     };
     let opts = talos_engine::builder::EngineOpts::for_run(wf_id, graph_json.clone())
-        // allow-unresolved-effective-actor: test_workflow's wf-actor-only
-        // binding is a documented asymmetry (refactor-plan open question #3);
-        // an unbound draft test running at the Tier-1 fail-safe is acceptable
-        // for a test path and matches its historical behavior.
-        .with_effective_actor(None, wf_record.actor_id)
+        // Gate-resolved above and already stamped on the execution row. The
+        // second argument stays as the workflow's own actor so a hypothetical
+        // `Ok(None)` from the gate degrades to the pre-#768 binding rather
+        // than to nothing.
+        .with_effective_actor(effective_actor, wf_record.actor_id)
         .with_dry_run(dry_run);
     let mut engine = match talos_engine::builder::for_workflow(
         registry,
@@ -6129,6 +6155,28 @@ async fn handle_bulk_trigger_workflow(
         }
     };
 
+    // Phase D2 for the fan-out path (#768) — the "follow-up" the old check-56
+    // opt-out here promised. Resolved ONCE, above the loop: the gate reads the
+    // workflow's own graph and the actor's budget, both of which are constant
+    // across the batch, so per-input resolution would be N identical gate runs
+    // and N chances to disagree. A refusal aborts the whole call rather than
+    // producing 20 identical per-row errors — the batch has one actor and one
+    // verdict.
+    let effective_actor = match crate::utils::resolve_sync_call_effective_actor(
+        &state.workflow_repo,
+        &state.actor_repo,
+        &state.db_pool,
+        bulk_wf_agent_id,
+        user_id,
+        &graph_json,
+        req_id.clone(),
+    )
+    .await
+    {
+        Ok(a) => a,
+        Err(resp) => return Some(resp),
+    };
+
     let mut results = Vec::new();
 
     for (idx, input_payload) in inputs.iter().enumerate() {
@@ -6149,7 +6197,11 @@ async fn handle_bulk_trigger_workflow(
                 user_id,
                 version_id,
                 None,
-                None,
+                // Same value the per-input engine is built with, below. The
+                // per-actor advisory lock inside this call is what makes the
+                // batch's own budget accounting atomic — with `None` the
+                // twenty rows were created with no budget backstop at all.
+                effective_actor,
                 None,
                 None,
                 None,
@@ -6210,6 +6262,7 @@ async fn handle_bulk_trigger_workflow(
         let graph_json = graph_json.clone();
         let input_payload = input_payload.clone();
         let bulk_agent_id = bulk_wf_agent_id;
+        let bulk_effective_actor = effective_actor;
 
         let secrets_manager = state.secrets_manager.clone();
         let actor_repo_for_spawn = state.actor_repo.clone();
@@ -6222,11 +6275,10 @@ async fn handle_bulk_trigger_workflow(
             // parse_graph_document reads execution_timeout_secs from the graph
             // during load (TimeoutPolicy::Honor default).
             let opts = talos_engine::builder::EngineOpts::for_run(wf_id, graph_json)
-                // allow-unresolved-effective-actor: bulk_trigger is
-                // user-initiated (failures immediately visible, unlike the
-                // silent scheduled/webhook paths); D2 gate plumbing for the
-                // fan-out loop is tracked as a follow-up.
-                .with_effective_actor(None, bulk_agent_id);
+                // Gate-resolved once above the loop and already stamped on
+                // this row. The workflow's own actor stays as the fallback for
+                // the same reason as `call_workflow`'s.
+                .with_effective_actor(bulk_effective_actor, bulk_agent_id);
             let mut engine = match talos_engine::builder::for_workflow(
                 registry,
                 secrets_manager,

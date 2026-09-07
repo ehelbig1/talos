@@ -223,6 +223,23 @@ fn parent_engine(
     talos_workflow_engine::ParallelWorkflowEngine,
     Arc<ScriptedDispatcher>,
 ) {
+    parent_engine_bound_to(pool, t, response, Some(t.actor))
+}
+
+/// The same rig with the parent's bound actor as a PARAMETER, so a test can
+/// build the engine the way an unresolved binding used to leave it: with no
+/// actor at all. `None` is not a permissive actor — it is the Tier-1 fail-safe
+/// with no tenancy principal — and the ledger row is where that becomes
+/// visible after the fact.
+fn parent_engine_bound_to(
+    pool: &sqlx::PgPool,
+    t: &Seeded,
+    response: serde_json::Value,
+    actor: Option<Uuid>,
+) -> (
+    talos_workflow_engine::ParallelWorkflowEngine,
+    Arc<ScriptedDispatcher>,
+) {
     let module_id = Uuid::new_v4();
     let child_graph = WorkflowGraphBuilder::new()
         .add_module("work", module_id, None)
@@ -232,7 +249,9 @@ fn parent_engine(
     let mut parent = minimal_engine();
     parent.set_user_id(t.user);
     parent.set_workflow_id(t.parent_workflow);
-    parent.set_actor_id(t.actor);
+    if let Some(a) = actor {
+        parent.set_actor_id(a);
+    }
     // The REAL controller sanitizer, not the passthrough stub: `error_class`
     // redaction is one of the things under test, and a passthrough would make
     // the assertion vacuous.
@@ -949,5 +968,279 @@ async fn a_failed_ledger_write_is_swallowed_but_counted() {
         after > before,
         "a dropped ledger write must move talos_child_run_record_failures_total \
          {{reason=\"acquire\"}} — otherwise the silence is complete"
+    );
+}
+
+// ── #768: who a SYNC invocation runs as ─────────────────────────────────────
+//
+// `call_workflow` and `bulk_trigger_workflow` built their engine with
+// `with_effective_actor(None, wf_record.actor_id)` under a check-56 opt-out
+// whose stated reason described `test_workflow`, a different handler. For an
+// UNBOUND workflow that resolved to no actor at all, while the BEFORE INSERT
+// trigger `trg_set_default_actor` stamped the user's Default actor on the
+// execution ROW — the row said Default, the engine ran as nobody. The ledger
+// is where "as nobody" is legible after the fact: `sub_workflow_runs.actor_id`
+// takes the engine's binding, so the whole disagreement lands in one column.
+//
+// These tests drive the EXTRACTED resolver
+// (`talos_mcp_handlers::utils::resolve_sync_call_effective_actor`) and the REAL
+// ledger chokepoint. They cannot drive the handler bodies — `handle_call_workflow`
+// is private, needs an `McpState` and dispatches over NATS. The guard against a
+// call-site revert is structural instead: both opt-out markers are GONE, so
+// lint check 56 fails on any reintroduced `with_effective_actor(None, …)` in
+// `talos-mcp-handlers/src`. That mutation was performed and is recorded in
+// AGENT_NOTES.md.
+
+/// Seed an UNBOUND workflow (`actor_id IS NULL`) — the population this is
+/// about. Measured on the reference fleet 2026-09-06: 6 of 36 workflows,
+/// every one a `stress-*` draft, so the defect is LATENT for production
+/// workflows and this is the shape that exercises it.
+async fn seed_unbound_workflow(pool: &sqlx::PgPool, t: &Seeded) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workflows (id, user_id, org_id, name, module_uri, graph_json, actor_id) \
+         VALUES ($1, $2, $3, $4, 'test://none', '{}'::jsonb, NULL)",
+    )
+    .bind(id)
+    .bind(t.user)
+    .bind(t.org)
+    .bind(format!("unbound-{id}"))
+    .execute(pool)
+    .await
+    .expect("seed unbound workflow");
+    id
+}
+
+/// An unbound workflow invoked SYNCHRONOUSLY must run as the user's default
+/// actor — the same answer `trigger_workflow` has given since Phase D1, and
+/// the same answer the execution-row trigger has been stamping all along.
+///
+/// Three arms, because "it returned something" is not the claim:
+/// the unbound case resolves to the DEFAULT actor; a workflow with its own
+/// actor keeps that actor (the resolver must not overwrite a real binding with
+/// the default); and the answer is STABLE across calls, since the fallback
+/// creates the default actor on first use and a second call that minted a
+/// second one would give the same workflow two identities.
+#[tokio::test]
+async fn an_unbound_sync_call_resolves_the_users_default_actor() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let t = seed_tenant(&pool).await;
+    let unbound = seed_unbound_workflow(&pool, &t).await;
+
+    let workflow_repo = talos_workflow_repository::WorkflowRepository::new(pool.clone());
+    let actor_repo = talos_actor_repository::ActorRepository::new(pool.clone());
+
+    // No default actor exists yet — the fallback must create one, which is the
+    // Phase-D1 behaviour and the reason this is not simply a lookup.
+    let pre: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM actors WHERE user_id = $1 AND is_default")
+            .bind(t.user)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(pre, 0, "fixture must start with no default actor");
+
+    let resolved = talos_mcp_handlers::utils::resolve_sync_call_effective_actor(
+        &workflow_repo,
+        &actor_repo,
+        &pool,
+        None, // the unbound workflow's own actor_id
+        t.user,
+        "{}",
+        None,
+    )
+    .await
+    .expect("an unbound workflow must resolve, not refuse");
+
+    let actor = resolved.expect("the gate never returns None on success (Phase D1 fallback)");
+    let (owner, is_default): (Uuid, bool) =
+        sqlx::query_as("SELECT user_id, is_default FROM actors WHERE id = $1")
+            .bind(actor)
+            .fetch_one(&pool)
+            .await
+            .expect("the resolved actor must exist");
+    assert_eq!(owner, t.user, "the resolved actor belongs to the caller");
+    assert!(
+        is_default,
+        "an unbound workflow runs as the user's DEFAULT actor — the same principal \
+         trg_set_default_actor has been stamping on the execution row all along"
+    );
+
+    // A workflow WITH its own actor keeps it. Without this the assertion above
+    // is satisfied by a resolver that ignores its argument.
+    let bound = talos_mcp_handlers::utils::resolve_sync_call_effective_actor(
+        &workflow_repo,
+        &actor_repo,
+        &pool,
+        Some(t.actor),
+        t.user,
+        "{}",
+        None,
+    )
+    .await
+    .expect("a bound workflow resolves")
+    .expect("bound actor");
+    assert_eq!(
+        bound, t.actor,
+        "a workflow's own actor must not be replaced by the default"
+    );
+
+    // Stable: a second call must not mint a second default identity.
+    let again = talos_mcp_handlers::utils::resolve_sync_call_effective_actor(
+        &workflow_repo,
+        &actor_repo,
+        &pool,
+        None,
+        t.user,
+        "{}",
+        None,
+    )
+    .await
+    .expect("resolves")
+    .expect("actor");
+    assert_eq!(
+        again, actor,
+        "the default-actor fallback must be idempotent"
+    );
+
+    let _ = unbound; // the row exists so the fixture is honest; the gate reads the actor, not the row
+}
+
+/// The gate FAILS CLOSED, and the refusal reaches the caller as an MCP error
+/// rather than as a silent `None`.
+///
+/// An archived actor is an IRREVERSIBLE terminal state that `trigger_workflow`
+/// has always refused. Before #768 the sync path did not consult the gate at
+/// all, so the same workflow ran through `call_workflow` and was refused
+/// through `trigger_workflow` — the asymmetry, in one sentence.
+#[tokio::test]
+async fn an_archived_actor_refuses_the_sync_call_instead_of_binding_nobody() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let t = seed_tenant(&pool).await;
+    sqlx::query("UPDATE actors SET status = 'archived' WHERE id = $1")
+        .bind(t.actor)
+        .execute(&pool)
+        .await
+        .expect("archive the actor");
+
+    let workflow_repo = talos_workflow_repository::WorkflowRepository::new(pool.clone());
+    let actor_repo = talos_actor_repository::ActorRepository::new(pool.clone());
+
+    let err = talos_mcp_handlers::utils::resolve_sync_call_effective_actor(
+        &workflow_repo,
+        &actor_repo,
+        &pool,
+        Some(t.actor),
+        t.user,
+        "{}",
+        None,
+    )
+    .await
+    .expect_err("an archived actor must refuse");
+    // `mcp_error` returns the refusal as an MCP TOOL RESULT (`isError: true`
+    // plus `errorCode`), not as a JSON-RPC `error` object — so clients render
+    // the real message. Assert on the shape the caller actually sees.
+    let result = err
+        .result
+        .as_ref()
+        .expect("a refusal carries a tool result");
+    assert_eq!(result["isError"], true, "{result}");
+    assert_eq!(result["errorCode"], -32000, "{result}");
+    let msg = result["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("archived"),
+        "the refusal must carry the trigger path's own wording, not a generic one: {msg}"
+    );
+}
+
+/// What the binding COSTS, read back out of the ledger.
+///
+/// The engine bound to the resolved actor records it; the engine built the way
+/// an unresolved binding used to leave it records `actor_id: NULL` — a child
+/// run with no tenancy principal, on a run whose execution row says Default.
+/// This is the consequence #768 removes, pinned as a fact rather than as prose.
+#[tokio::test]
+async fn the_ledger_records_the_actor_the_engine_was_bound_to() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let t = seed_tenant(&pool).await;
+
+    let workflow_repo = talos_workflow_repository::WorkflowRepository::new(pool.clone());
+    let actor_repo = talos_actor_repository::ActorRepository::new(pool.clone());
+    let resolved = talos_mcp_handlers::utils::resolve_sync_call_effective_actor(
+        &workflow_repo,
+        &actor_repo,
+        &pool,
+        None,
+        t.user,
+        "{}",
+        None,
+    )
+    .await
+    .expect("resolves")
+    .expect("the default actor");
+
+    // (a) bound to the gate's answer.
+    let bound_exec = seed_live_execution(&pool, &t, false).await;
+    let (parent, dispatcher) =
+        parent_engine_bound_to(&pool, &t, serde_json::json!({ "ok": true }), Some(resolved));
+    parent
+        .execute_subworkflow_graph(
+            t.child_workflow,
+            serde_json::json!({}),
+            dispatcher,
+            None,
+            ChildRunOrigin::Node {
+                execution_id: bound_exec,
+                node_id: Uuid::new_v4(),
+                kind: talos_workflow_engine_core::ChildDispatchKind::SubWorkflow,
+            },
+        )
+        .await
+        .expect("the child runs");
+
+    // (b) the pre-#768 shape: no actor bound at all.
+    let unbound_exec = seed_live_execution(&pool, &t, false).await;
+    let (parent, dispatcher) =
+        parent_engine_bound_to(&pool, &t, serde_json::json!({ "ok": true }), None);
+    parent
+        .execute_subworkflow_graph(
+            t.child_workflow,
+            serde_json::json!({}),
+            dispatcher,
+            None,
+            ChildRunOrigin::Node {
+                execution_id: unbound_exec,
+                node_id: Uuid::new_v4(),
+                kind: talos_workflow_engine_core::ChildDispatchKind::SubWorkflow,
+            },
+        )
+        .await
+        .expect("the child runs");
+
+    let read = |exec: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<Uuid>>(
+                "SELECT actor_id FROM sub_workflow_runs WHERE parent_execution_id = $1",
+            )
+            .bind(exec)
+            .fetch_one(&pool)
+            .await
+            .expect("one ledger row per dispatch")
+        }
+    };
+
+    assert_eq!(
+        read(bound_exec).await,
+        Some(resolved),
+        "the ledger must record the actor the gate resolved — this is what the sync \
+         path now binds"
+    );
+    assert_eq!(
+        read(unbound_exec).await,
+        None,
+        "and this is what it recorded before #768: a child run attributed to nobody, \
+         beside an execution row the trg_set_default_actor trigger had stamped with \
+         the user's Default actor"
     );
 }

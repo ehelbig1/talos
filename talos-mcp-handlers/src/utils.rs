@@ -1319,6 +1319,58 @@ pub fn trigger_auth_error_to_response(
     }
 }
 
+/// Resolve the effective actor for a SYNCHRONOUS MCP invocation path, through
+/// the SAME gate `trigger_workflow` uses, and map a refusal to the SAME MCP
+/// response the async path returns.
+///
+/// # Why this exists
+///
+/// `handle_call_workflow` and `handle_bulk_trigger_workflow` used to build the
+/// engine with `with_effective_actor(None, wf_record.actor_id)` under a check-56
+/// opt-out whose reason described `test_workflow`, a different handler. For an
+/// UNBOUND workflow that resolved to `None`, and an engine with no actor is not
+/// an engine with a permissive actor — it is the Tier-1 fail-safe, with no
+/// `__actor_context__`, with `__memory_write__` / `__ops_alert__` /
+/// `__ml_distill__` all refused for want of a tenancy principal, and with RFC
+/// 0012 ledger rows recording `actor_id: null`. Meanwhile the execution ROW got
+/// the user's default actor stamped on it by the `trg_set_default_actor` BEFORE
+/// INSERT trigger. The row said Default; the engine ran as nobody.
+///
+/// [`talos_workflow_authorization::resolve_effective_actor`] is the Phase-D2
+/// contract: one answer used for authorization, for the execution row, and for
+/// the engine, with the Phase-D1 fallback to `get_or_create_default_actor` and
+/// `Err` on every DB failure (fail closed). Callers MUST stamp the returned
+/// value on the execution row as well as on the engine — passing it to only one
+/// of the two reintroduces exactly the divergence above.
+///
+/// # What changed for callers
+///
+/// The gate can now REFUSE a call that previously ran: an archived/terminated
+/// actor, an exhausted execution budget, or a capability-ceiling violation on
+/// the workflow's own graph. That is the whole point — those refusals already
+/// applied to the same workflow via `trigger_workflow`, and a sync call is not
+/// a lesser act.
+pub async fn resolve_sync_call_effective_actor(
+    workflow_repo: &talos_workflow_repository::WorkflowRepository,
+    actor_repo: &talos_actor_repository::ActorRepository,
+    db_pool: &sqlx::PgPool,
+    workflow_actor_id: Option<uuid::Uuid>,
+    user_id: uuid::Uuid,
+    graph_json: &str,
+    req_id: Option<serde_json::Value>,
+) -> Result<Option<uuid::Uuid>, JsonRpcResponse> {
+    talos_workflow_authorization::resolve_effective_actor(
+        workflow_repo,
+        actor_repo,
+        db_pool,
+        workflow_actor_id,
+        user_id,
+        graph_json,
+    )
+    .await
+    .map_err(|e| trigger_auth_error_to_response(e, req_id))
+}
+
 pub fn resource_not_found_error(id: Option<serde_json::Value>, uri: &str) -> JsonRpcResponse {
     JsonRpcResponse {
         jsonrpc: "2.0".to_string(),
