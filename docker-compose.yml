@@ -939,13 +939,30 @@ services:
       # HMAC key shared between controller and worker for signing NATS job requests.
       # Generate with: openssl rand -hex 32
       #
-      # MinIO / S3 for audit ledger
-      AWS_ENDPOINT_URL: http://minio:9000
-      AWS_ACCESS_KEY_ID: ${MINIO_WORKER_USER:?MINIO_WORKER_USER required in .env}
-      AWS_SECRET_ACCESS_KEY: ${MINIO_WORKER_PASSWORD:?MINIO_WORKER_PASSWORD required in .env}
-      AWS_DEFAULT_REGION: us-east-1
-      AWS_S3_FORCE_PATH_STYLE: "true"
-      MINIO_BUCKET: audit-logs
+      # NO S3 / MinIO identity here, deliberately (2026-09-07).
+      #
+      # This block used to hand the worker AWS_ENDPOINT_URL / AWS_ACCESS_KEY_ID
+      # = ${MINIO_WORKER_USER} / AWS_SECRET_ACCESS_KEY / AWS_DEFAULT_REGION /
+      # AWS_S3_FORCE_PATH_STYLE / MINIO_BUCKET "for the audit ledger". Three
+      # things were wrong with that at once:
+      #   * the worker publishes audit events to the NATS subject
+      #     `talos.audit.ledger`; the CONTROLLER is the only process that
+      #     writes to the object store (talos-audit-ledger),
+      #   * no line in `worker/src` or `talos-worker-runtime/src` reads AWS_*
+      #     or MINIO_* at all, and
+      #   * `MINIO_WORKER_USER` named a principal `minio-init` has never
+      #     created — `mc admin user list` returns the controller writer and
+      #     the verifier and nothing else.
+      # A credential that exists only to be rotated, audited and leaked is
+      # worse than no credential, so it is gone rather than made optional.
+      #
+      # The worker DOES have an S3 code path, and it is a different one: the
+      # `talos:core/object-storage` WIT host functions read S3_ENDPOINT /
+      # S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY / S3_REGION (see
+      # talos-worker-runtime/src/context.rs) on behalf of `automation-node`
+      # modules. Those are unset here on purpose — the host functions answer
+      # `NotConfigured` — and they are documented in
+      # docs/configuration-reference.md, NOT under the audit ledger.
       # Ollama (Tier 1 — local LLM inference from WASM modules)
       OLLAMA_URL: "http://ollama:11434"
       # Operator opt-in: allow modules to reach hostnames that resolve to
@@ -1033,7 +1050,10 @@ services:
       - talos-network
     restart: unless-stopped
 
-  # One-shot init container: creates the audit-logs bucket and a write-only user.
+  # One-shot init container: creates the audit-logs bucket and the TWO
+  # least-privilege identities that use it — the write-only controller
+  # writer and the read-only verifier. There is deliberately no worker
+  # identity: the worker never touches the object store.
   minio-init:
     image: minio/mc:latest@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
     container_name: talos-minio-init
@@ -1045,8 +1065,6 @@ services:
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?MINIO_ROOT_PASSWORD required in .env}
       MINIO_CONTROLLER_USER: ${MINIO_CONTROLLER_USER:?MINIO_CONTROLLER_USER required in .env}
       MINIO_CONTROLLER_PASSWORD: ${MINIO_CONTROLLER_PASSWORD:?MINIO_CONTROLLER_PASSWORD required in .env}
-      MINIO_WORKER_USER: ${MINIO_WORKER_USER:?MINIO_WORKER_USER required in .env}
-      MINIO_WORKER_PASSWORD: ${MINIO_WORKER_PASSWORD:?MINIO_WORKER_PASSWORD required in .env}
       MINIO_VERIFIER_USER: ${MINIO_VERIFIER_USER:?MINIO_VERIFIER_USER required in .env}
       MINIO_VERIFIER_PASSWORD: ${MINIO_VERIFIER_PASSWORD:?MINIO_VERIFIER_PASSWORD required in .env}
     networks:

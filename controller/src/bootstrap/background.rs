@@ -4943,7 +4943,9 @@ pub(crate) fn spawn_late_background_tasks(
                 // silently — the documented configuration disabled the
                 // alerter. Measured 2026-09-07 by driving the exact statement
                 // and the exact decode against a real row
-                // (`controller/tests/sla_ledger_tests.rs`).
+                // (`controller/tests/sla_ledger_tests.rs`). Check 55's
+                // DB-layer-crate scope structurally could not see it; the scope
+                // is widened to this directory in the same change.
                 let decoded = (|| -> Result<_, sqlx::Error> {
                     Ok((
                         row.try_get::<uuid::Uuid, _>("workflow_id")?,

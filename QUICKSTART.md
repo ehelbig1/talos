@@ -39,7 +39,7 @@ validator rejects anything else:
 | `POSTGRES_PASSWORD` / `REDIS_PASSWORD` | datastore creds |
 | `NATS_USER` / `NATS_PASSWORD` | message bus |
 | `NEO4J_PASSWORD` | graph store |
-| `MINIO_ROOT_*` / `MINIO_CONTROLLER_*` / `MINIO_WORKER_*` | object store |
+| `MINIO_ROOT_*` / `MINIO_CONTROLLER_*` / `MINIO_VERIFIER_*` | object store (root, the audit WRITER, the audit VERIFIER — there is no worker identity) |
 | `GRAFANA_PASSWORD` | observability |
 
 To rotate everything, delete `.env` and re-run `make setup`.

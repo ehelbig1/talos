@@ -58,8 +58,8 @@ MINIO_ROOT_USER=minioadmin
 MINIO_ROOT_PASSWORD=$(openssl rand -hex 16)
 MINIO_CONTROLLER_USER=talos-controller
 MINIO_CONTROLLER_PASSWORD=$(openssl rand -hex 16)
-MINIO_WORKER_USER=talos-worker
-MINIO_WORKER_PASSWORD=$(openssl rand -hex 16)
+MINIO_VERIFIER_USER=talos-audit-verifier
+MINIO_VERIFIER_PASSWORD=$(openssl rand -hex 16)
 
 # ─── Observability ──────────────────────────────────────────────────────────
 GRAFANA_PASSWORD=admin

@@ -251,7 +251,7 @@ the env vars above are fallbacks only. See CLAUDE.md "LLM key resolution".
 | `EMAIL_API_URL` | none (optional) | worker | Outbound email API URL (host function) | |
 | `EMAIL_API_KEY` | none (optional) | worker | Email API key | 🔒 |
 | `EMAIL_FROM` | built-in default | worker | Default From address | |
-| `S3_ENDPOINT` | none (optional) | worker | S3 endpoint for module host storage | |
+| `S3_ENDPOINT` | none (optional) | worker | Endpoint for the `talos:core/object-storage` WIT host functions a WASM module calls. Imported only by the `automation-node` world; the host fns answer `NotConfigured` for any other capability world. **Unrelated to the audit ledger** (that reads `AWS_ENDPOINT_URL`/`MINIO_ENDPOINT`) and unrelated to module artifact storage (compiled WASM lives in `modules.wasm_bytes` and the OCI registry). | |
 | `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` | none | worker | S3 credentials | 🔒 |
 | `S3_REGION` | built-in default | worker | S3 region | |
 | `DLP_PROVIDER` | `builtin` | talos-dlp-provider | DLP provider selection | |
@@ -454,6 +454,8 @@ Several default **ON** as of the 2026-07 "Tier 3" learning-loops cutover.
 | `AWS_ENDPOINT_URL` | none (optional) | Custom S3 endpoint | |
 | `MINIO_ENDPOINT` | none (optional) | MinIO endpoint | |
 | `MINIO_BUCKET` | `audit-logs` | Audit bucket name | |
+| `AWS_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing; required `true` for MinIO. Read by BOTH the writer and the verifier. | |
+| `AWS_REGION` / `AWS_DEFAULT_REGION` | `us-east-1` (verifier only) | Region. **Asymmetric on purpose-by-accident, so state it:** the VERIFIER resolves these itself and falls back to `us-east-1`; the WRITER takes whatever `aws_config::load_defaults` resolves from its own chain (env, profile, IMDS). A deployment that sets neither can therefore have a writer that fails on region while the verifier quietly assumes one. | |
 | (standard `AWS_*` credential vars) | SDK defaults | The WRITE path only. Read implicitly by the AWS SDK (`load_defaults`) in `build_audit_s3_client`. On this platform these are the `audit_write_only` identity: `s3:PutObject` and nothing else, so they CANNOT read the chain back — that is the design, not a gap. | 🔒 |
 | `AUDIT_VERIFIER_ACCESS_KEY_ID` | none | The READ path. Access key id of the read-only audit-chain verifier identity (`audit_read_only`: `s3:ListBucket` + `s3:GetObject`). Empty is treated as unset. The chain it reads is keyed PER JOB — every object key is `<module_executions.id>/…` — so the sweep enumerates `module_executions` and rolls its per-job outcomes up to workflow executions. | 🔒 |
 | `AUDIT_VERIFIER_SECRET_ACCESS_KEY` | none | Secret key for the above. **Both halves required**; one without the other reads as unset. With them absent the chain-verification sweep does not start, logs one `audit_chain_verifier_identity_missing` ERROR, increments `talos_audit_chain_unverifiable_total{reason="no_credentials"}`, and `security_audit`'s `audit_chain_verification` check reports the control as non-functional. There is deliberately **no `AWS_*` fallback** — that identity is write-only and every listing under it returns AccessDenied. | 🔒 |

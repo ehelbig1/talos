@@ -151,8 +151,13 @@ Flattened from `talos_audit_ledger::ChainBreak` for the GraphQL surface.
 """
 type AuditChainBreak {
 	"""
-	`sequence_gap` | `duplicate_sequence` | `genesis_mismatch` |
-	`linkage_mismatch` | `bad_signature` | `unsigned`.
+	`sequence_gap` | `duplicate_sequence` | `duplicate_delivery` |
+	`genesis_mismatch` | `linkage_mismatch` | `bad_signature` | `unsigned`.
+	
+	Every value EXCEPT `duplicate_delivery` is tamper/corruption evidence
+	and clears `ok`. `duplicate_delivery` is one event that reached the
+	ledger twice byte-for-byte — reported so the redundancy is visible,
+	never a reason to distrust the chain. Read `ok`, not `breaks.length`.
 	"""
 	kind: String!
 	"""
@@ -170,20 +175,110 @@ type AuditChainBreak {
 }
 
 """
-Result of verifying the cryptographic audit chain for one execution
-(finding #2). `ok` is true iff there are no `breaks` and — when signing
-keys are configured — every event's HMAC verified.
+ONE job's chain — the grain the WORM ledger is actually keyed at.
+
+Every object key in the audit bucket is `<module_executions.id>/…`, so a
+workflow execution with four module dispatches has FOUR chains and
+verifying one says nothing about the other three.
 """
-type AuditChainVerification {
-	executionId: String!
-	workflowId: String!
+type AuditChainJobVerification {
+	"""
+	`module_executions.id` — the ledger's `execution_id` and the S3 prefix.
+	"""
+	moduleExecutionId: String!
+	"""
+	`module_executions.workflow_execution_id` — the genesis `workflow_id`.
+	"""
+	workflowExecutionId: String!
+	"""
+	Persisted records, redelivered copies INCLUDED. Subtract
+	`duplicateDeliveries` for the number of distinct events.
+	"""
 	totalEvents: Int!
 	ok: Boolean!
-	"""
-	Whether HMAC verification was attempted (signing keys configured).
-	"""
 	signaturesChecked: Boolean!
 	breaks: [AuditChainBreak!]!
+	"""
+	How many of `breaks` are `duplicate_delivery` — a chain with a non-zero
+	count here and `ok: true` is a VERIFIED chain carrying redundant
+	copies, which is a different fact from a verified chain of distinct
+	events and must not render as one.
+	"""
+	duplicateDeliveries: Int!
+	"""
+	How many CONTROLLER DISPATCH ATTEMPTS this prefix holds chains for.
+	
+	`1` for an ordinary job. `> 1` means the controller re-dispatched the
+	`job_id`; the credential-free worker cannot read the previous
+	dispatch's ledger, so each dispatch opened a fresh chain at sequence 1
+	against the same genesis, and each was verified separately. A retry, not
+	tamper evidence — `ok` is unaffected. Without this a reader cannot tell
+	"4 events" from "two dispatches of two", and `breaks` can name the same
+	`sequence` twice meaning two different records.
+	"""
+	dispatchAttempts: Int!
+}
+
+"""
+Result of verifying the cryptographic audit chain for one WORKFLOW
+EXECUTION (finding #2) — the aggregate over its jobs.
+
+`ok` is true iff at least one job chain was verified AND every one of them
+verified. The "at least one" clause is the whole point: `verify_chain` over
+an empty event set answers `ok == true` (there are no gaps, no broken links
+and no bad signatures in nothing), so an aggregate that reported `ok` from
+zero jobs would be a verified-nothing — which is exactly what this field
+returned before 2026-09-06, because it named a `workflow_executions` id as
+the S3 prefix and the writer has never used one.
+"""
+type AuditChainVerification {
+	"""
+	The workflow execution the caller asked about.
+	"""
+	executionId: String!
+	"""
+	The workflow that execution belongs to. Present for continuity with
+	the pre-2026-09-06 shape; it is NOT part of the ledger's genesis
+	binding, which uses the workflow EXECUTION id — a distinction the live
+	probe measured as the difference between `ok=true` and `ok=false`.
+	"""
+	workflowId: String!
+	"""
+	The id space the ledger is keyed by, so a reader never has to guess
+	which table `module_execution_id` below belongs to.
+	"""
+	ledgerKeySpace: String!
+	"""
+	Summed over `jobs`.
+	"""
+	totalEvents: Int!
+	"""
+	Every job chain verified AND there was at least one.
+	"""
+	ok: Boolean!
+	"""
+	True iff HMAC verification was attempted for every job.
+	"""
+	signaturesChecked: Boolean!
+	"""
+	Concatenated over `jobs`, in job order. A `duplicate_delivery` entry
+	here does NOT clear `ok` — see `AuditChainBreak.kind`.
+	"""
+	breaks: [AuditChainBreak!]!
+	"""
+	Summed over `jobs`.
+	"""
+	duplicateDeliveries: Int!
+	"""
+	How many of `jobs` hold more than one controller dispatch attempt — a
+	re-dispatched `job_id`. A retry, not a finding; `ok` is unaffected.
+	"""
+	jobsWithMultipleAttempts: Int!
+	"""
+	The per-job chains this aggregate is built from. EMPTY means nothing
+	was verified, which is why `ok` is false in that case.
+	"""
+	jobs: [AuditChainJobVerification!]!
 }
 
 type AuthPayload {
@@ -730,8 +825,35 @@ type MlModelSummary {
 	promotedVersion: Int
 	"""
 	Holdout accuracy of the promoted version (0–1), if promoted.
+	
+	A BARE rate: no denominator, no date. Kept unchanged because the model
+	review page already renders it; read it alongside the four
+	`promotedAccuracy*` / `promotedBackend` fields below, which say over how
+	many rows, by which backend, and when it was measured.
 	"""
 	promotedAccuracy: Float
+	"""
+	The DENOMINATOR of `promotedAccuracy`: holdout rows the promoted
+	version was scored on. `null` for versions whose stored report carries
+	no total (pre-RFC-0011-era rows) — absent, not zero.
+	"""
+	promotedAccuracyN: Int
+	"""
+	Wilson 95% interval `[lo, hi]` for `promotedAccuracy`, so a 1-of-1
+	"100%" is visibly not a 400-of-400 one. `null` when `promotedAccuracyN`
+	is.
+	"""
+	promotedAccuracyCi95: [Float!]
+	"""
+	When the promoted version's eval was recorded (RFC 3339), carried from
+	the version row's `trained_at`. `null` on rows written before
+	provenance capture — which means UNKNOWN age, not recent.
+	"""
+	promotedAccuracyMeasuredAt: String
+	"""
+	The promoted version's backend (`knn-pgvector`, `linear-logreg`, …).
+	"""
+	promotedBackend: String
 	"""
 	Count of `pending` disagreements awaiting human review.
 	"""
@@ -773,6 +895,12 @@ type MlResolveResult {
 	"""
 	status: String!
 	correctionAppended: Boolean!
+	"""
+	Exact-duplicate copies of the same message closed by this one decision
+	(0 for a unique row). Exactly ONE gold correction is appended for the
+	whole group, never one per copy.
+	"""
+	siblingsResolved: Int!
 }
 
 type ModuleExecution {
@@ -791,6 +919,26 @@ type ModuleExecution {
 	fuelConsumed: Int
 	memoryUsedMb: Int
 	createdAt: String!
+	"""
+	RFC-3339 instant at which the payload-retention sweep cleared this
+	execution's stored input/output, or `null` if it never did.
+	
+	Read this before concluding anything from an empty `inputData` /
+	`outputData`. `null` here means the payload was never recorded;
+	non-null means it was recorded and has since been removed by policy.
+	The removal is irreversible — the stored form was AEAD ciphertext.
+	"""
+	payloadPrunedAt: String
+	"""
+	Size in bytes of the input payload at the moment it was pruned, or
+	`null` if this row was never pruned or held no input.
+	"""
+	prunedInputBytes: Int
+	"""
+	Size in bytes of the output payload at the moment it was pruned, or
+	`null` if this row was never pruned or held no output.
+	"""
+	prunedOutputBytes: Int
 	module: WasmModule
 	logs: [ModuleExecutionLog!]!
 }
@@ -1189,13 +1337,14 @@ type QueryRoot {
 	`actors` (1 + N requests, each opening its own tenant-scoped tx
 	and ownership check). This resolver serves the same data in ONE
 	request: one per-user unit of work, ONE batched ownership read
-	(`actor_ids_owned_by_user_scoped`), then the per-actor listings
-	on the same connection/snapshot. (Collapsing the listings into a
-	single `actor_id = ANY($1)` query needs a batched read in
-	`talos-memory` — actor_memory access MUST go through
-	`talos_memory::*` — tracked as a follow-up; the request-level
-	fan-out and per-request auth/tx overhead are already collapsed
-	here.)
+	(`actor_ids_owned_by_user_scoped`), then ONE batched listing
+	(`list_memories_with_ciphertext_batched_scoped`, a single
+	`actor_id = ANY($1)` window-capped scan) on the same
+	connection/snapshot. The prior residual — a per-actor listing
+	loop inside this one tx, because a crypto-aware `= ANY($1)` read
+	had to live in `talos-memory` (all actor_memory access MUST go
+	through `talos_memory::*`) — is now closed, so the whole page is
+	two queries (ownership + listing) regardless of actor count.
 	
 	Tenancy: ids that are unknown or another tenant's are silently
 	skipped (no group), so absence is indistinguishable from
@@ -1307,6 +1456,17 @@ type QueryRoot {
 	sweep removed). Returns the structured break list (sequence gaps,
 	linkage/genesis mismatch, bad/missing HMAC); the inline ingest check
 	and the continuous sweep cover the always-on side.
+	
+	`execution_id` is a WORKFLOW EXECUTION id, which the ledger has no
+	chain for: every object key is `<module_executions.id>/…` and the
+	genesis hash binds `(module_executions.workflow_execution_id,
+	module_executions.id)`. Until 2026-09-06 this field used the caller's
+	id AS the prefix and `workflows.id` as the genesis half — measured live,
+	the first returns `ok=true total_events=0` (a verified-nothing) and the
+	second returns `ok=false breaks=1` (a genesis mismatch on a healthy
+	chain). It now resolves the execution to its JOBS and verifies each,
+	returning the per-job reports plus an aggregate whose `ok` requires at
+	least one verified chain.
 	"""
 	verifyAuditChain(executionId: UUID!): AuditChainVerification!
 	resourceQuotas: ResourceQuota!

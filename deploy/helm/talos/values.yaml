@@ -1635,8 +1635,6 @@ bootstrapSecret:
     MINIO_ROOT_PASSWORD: ""
     MINIO_CONTROLLER_USER: ""
     MINIO_CONTROLLER_PASSWORD: ""
-    MINIO_WORKER_USER: ""
-    MINIO_WORKER_PASSWORD: ""
     # The audit-chain VERIFIER — a SEPARATE, read-only identity
     # (policy `audit_read_only`: s3:ListBucket on the bucket +
     # s3:GetObject on its objects; NO Put, NO Delete). The controller's

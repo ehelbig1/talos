@@ -8061,158 +8061,26 @@ async fn handle_get_readiness_breakdown(
     );
     let computed_score = outcome.score;
 
+    let retry_warning = retry_warning_for(has_retries_configured, shown_runs, shown_success_rate);
     // ── Build actionable improvement suggestions ───────────────────────────
-    let mut improvements: Vec<serde_json::Value> = Vec::new();
-    if !has_desc {
-        improvements.push(serde_json::json!({"action": "set_workflow_description — also improves semantic search quality", "points_available": 10, "component": "documentation"}));
-    }
-    if !has_node_desc {
-        improvements.push(serde_json::json!({"action": "Add descriptions to nodes in the graph", "points_available": 5, "component": "documentation"}));
-    }
-    if !has_caps {
-        improvements.push(serde_json::json!({"action": "set_workflow_capabilities or auto_tag_capabilities", "points_available": 5, "component": "documentation"}));
-    }
-    if !has_timeout {
-        improvements.push(serde_json::json!({"action": "Set execution_timeout_secs on the workflow graph", "points_available": 3, "component": "risk"}));
-    }
-    if !has_error_edges {
-        improvements.push(serde_json::json!({
-            "action": "Add error handler",
-            "detail": "add_error_handler(workflow_id: X, handler_module_id: Y) wires error edges from ALL at-risk nodes in one call",
-            "tool": "add_error_handler",
-            "points_available": 3,
-            "component": "risk"
-        }));
-    }
-    // Reliability advice. Two independent levers, NOT an `else if` chain.
-    //
-    // `compute_reliability_score` is `s · min(n/10, 1) · 50` — a PRODUCT of the
-    // success rate and the run-count ramp — so below saturation both levers are
-    // live at once and they are exactly additive:
-    //   (50 − 5n)  +  5n(1 − s)  =  50 − 5sn  =  the whole gap.
-    // Pre-fix the success-rate arm sat behind `else if exec_count < 10`, so a
-    // workflow with 5 runs at 60% was told only to "run it more" and
-    // `total_points_available` understated its real gap by 5n(1−s). Both arms
-    // now fire, and both derive their points from the score's own formula.
-    if unmeasurable_child {
-        // Every advice line below is derived from `exec_count` / `freshness`,
-        // both of which are 0 here BY CONSTRUCTION. "Execute the workflow at
-        // least once to establish reliability baseline" addressed to the
-        // flagship's daily `team_gather` is the same class of wrong-but-
-        // actionable advice as #758's "consider deleting" — specific, and
-        // aimed at a workflow that runs every day. Nothing is pushed; the
-        // components are declared UNMEASURED in `components` below.
-        improvements.push(serde_json::json!({
-            "action": "No reliability or freshness action is available for a parent-dispatched \
-                       workflow. Its runs are invisible to workflow_executions, so neither \
-                       component can be earned — or lost — by anything you do to this workflow.",
-            "points_available": 0,
-            "component": "reliability",
-            "type": "note",
-            "measured": false,
-        }));
-    } else if exec_count == 0 {
-        // "Zero runs" and "we could not read the runs" are different facts, and
-        // the second one must not be published as the first: telling the owner
-        // of a workflow with thousands of executions to "execute it at least
-        // once" is a fabricated claim about system state. `readings` already
-        // discloses the failed read; the ACTION TEXT has to say it too, because
-        // that is the sentence an operator (or a model) acts on.
-        let action = if reliability_measured {
-            "Execute the workflow at least once to establish reliability baseline".to_string()
-        } else {
-            "Reliability could NOT BE READ (see measurement.not_measured) — this is NOT a \
-             statement that the workflow has never run. Re-check before acting on it."
-                .to_string()
-        };
-        improvements.push(serde_json::json!({
-            "action": action,
-            "points_available": if reliability_measured { 50 } else { 0 },
-            "component": "reliability",
-            "measured": reliability_measured,
-        }));
-    } else if exec_count < 10 {
-        let remaining =
-            talos_analytics_repository::reliability_gain_from_more_runs(exec_count) as i32;
-        let forfeit_after = talos_analytics_repository::reliability_gain_from_success_rate(
-            success_rate,
-            exec_count,
-        );
-        // The destination is stated truthfully. "Full reliability credit" is
-        // reachable by running more ONLY at a 100% success rate; below that,
-        // 5n(1−s) points stay behind however many times you run it.
-        let action = if forfeit_after > 0.0 {
-            format!(
-                "Run {} more times (currently {}/10 runs) — worth {} pts. This does NOT reach \
-                 full reliability credit: at the current {:.0}% success rate, {} pts stay \
-                 forfeit to failures no matter how many runs you add, because the score is \
-                 success_rate × run-ramp, not a sum.",
-                10 - exec_count,
-                exec_count,
-                remaining,
-                success_rate.unwrap_or(0.0) * 100.0,
-                forfeit_after.round() as i32,
-            )
-        } else {
-            format!(
-                "Run {} more times to reach full reliability credit (currently {}/10 runs)",
-                10 - exec_count,
-                exec_count
-            )
-        };
-        improvements.push(serde_json::json!({
-            "action": action,
-            "points_available": remaining,
-            "component": "reliability",
-        }));
-    }
-    if !is_child && exec_count > 0 && success_rate.unwrap_or(0.0) < 0.95 {
-        let pts = talos_analytics_repository::reliability_gain_from_success_rate(
-            success_rate,
-            exec_count,
-        ) as i32;
-        improvements.push(serde_json::json!({
-            "action": format!(
-                "Improve success rate — currently {:.0}%, below the 95% bar",
-                success_rate.unwrap_or(0.0) * 100.0
-            ),
-            "points_available": pts,
-            "component": "reliability",
-        }));
-    }
-    if !is_child && freshness == 0.0 {
-        improvements.push(serde_json::json!({"action": "Execute within the last 30 days to restore freshness score", "points_available": 10, "component": "freshness"}));
-    }
-
-    // Retry warning: retries configured but failures appear deterministic (≠ transient)
-    let retry_warning: Option<&str> = if has_retries_configured
-        && exec_count > 0
-        && success_rate.unwrap_or(1.0) < 1.0
-    {
-        Some("Retries are configured but some failures appear deterministic. Run suggest_retry_config — if failures are auth/not-found/validation errors, retries waste fuel and mask root cause.")
-    } else {
-        None
-    };
-    if let Some(msg) = retry_warning {
-        improvements.push(serde_json::json!({
-            "action": msg,
-            "points_available": 0,
-            "component": "risk",
-            "type": "warning",
-        }));
-    }
-
-    // Sort by most impactful first (warnings with points_available: 0 sort last)
-    improvements.sort_by(|a, b| {
-        b.get("points_available")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0)
-            .cmp(
-                &a.get("points_available")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0),
-            )
-    });
+    // Pure renderer (see `build_readiness_improvements`) so the advice can be
+    // driven by a unit test without a database, a graph or an `McpState`.
+    let improvements = build_readiness_improvements(
+        &ReadinessAdviceInputs {
+            has_desc,
+            has_node_desc,
+            has_caps,
+            has_timeout,
+            has_error_edges,
+            reliability_measured,
+            has_retries_configured,
+        },
+        &outcome.basis,
+        shown_runs,
+        shown_success_rate,
+        freshness,
+        component_source,
+    );
 
     let total_points_available: i64 = improvements
         .iter()
@@ -8347,8 +8215,9 @@ async fn handle_get_readiness_breakdown(
                 talos_analytics_repository::readiness_basis::EXECUTION_DERIVED_COMPONENTS
             {
                 result["components"][*component]["measured"] = serde_json::json!(false);
-                result["components"][*component]["unmeasured_reason"] =
-                    serde_json::json!(talos_analytics_repository::CHILD_UNMEASURED_REASON);
+                result["components"][*component]["unmeasured_reason"] = serde_json::json!(
+                    talos_analytics_repository::child_unmeasured_reason(outcome.basis.ledger())
+                );
             }
         }
     }
@@ -8767,7 +8636,10 @@ async fn handle_get_all_readiness_scores(
             }
             entry["note"] = if is_child {
                 let tail = if basis.is_unmeasurable_child() {
-                    talos_analytics_repository::CHILD_UNMEASURED_REASON.to_string()
+                    // Three-valued: a child whose ledger holds 1 or 2 runs is
+                    // not one "nothing can measure" — the row two fields up
+                    // already prints `ledger_runs`.
+                    talos_analytics_repository::child_unmeasured_reason(basis.ledger())
                 } else {
                     "Reliability and freshness come from the child-run ledger \
                      (sub_workflow_runs), so this score IS on the fleet scale."
@@ -11330,6 +11202,483 @@ mod child_runs_since_ledger_note_tests {
         for note in [child_runs_note(false, 7), child_runs_note(true, 7)] {
             assert!(note.contains("agent_loop"), "{note}");
             assert!(note.contains("capability_dispatch"), "{note}");
+        }
+    }
+}
+
+/// The "retries configured but failures look deterministic" warning.
+///
+/// ONE home: it is rendered BOTH as an `improvements` entry and as
+/// `components.risk.detail.retry_warning`, and two copies of the predicate is
+/// two answers to one question in one response.
+pub(crate) fn retry_warning_for(
+    has_retries_configured: bool,
+    runs: i64,
+    success_rate: Option<f64>,
+) -> Option<&'static str> {
+    if has_retries_configured && runs > 0 && success_rate.unwrap_or(1.0) < 1.0 {
+        Some("Retries are configured but some failures appear deterministic. Run suggest_retry_config — if failures are auth/not-found/validation errors, retries waste fuel and mask root cause.")
+    } else {
+        None
+    }
+}
+
+/// Inputs to [`build_readiness_improvements`] that are not part of the score.
+pub(crate) struct ReadinessAdviceInputs {
+    pub has_desc: bool,
+    pub has_node_desc: bool,
+    pub has_caps: bool,
+    pub has_timeout: bool,
+    pub has_error_edges: bool,
+    pub reliability_measured: bool,
+    pub has_retries_configured: bool,
+}
+
+/// Every improvement, derived from the SAME components `score_readiness`
+/// scored — never from a second reading of `workflow_executions`.
+///
+/// # The contradiction this removes (observed live 2026-09-07 12:03Z)
+///
+/// The moment `pa-quality-judge` crossed the 3-run ledger floor,
+/// `get_readiness_breakdown` scored it `54/100`, `basis: "ledger"`,
+/// reliability `15/50` from `executions_30d: 3, source: "sub_workflow_runs"` —
+/// and `improvements[0]` in the SAME response read *"Execute the workflow at
+/// least once to establish reliability baseline"*, `points_available: 50`,
+/// `measured: true`.
+///
+/// Both halves were computed correctly and from DIFFERENT inputs. RFC 0012 P2
+/// moved the SCORE onto the child-run ledger and left the ADVICE keyed on the
+/// `workflow_executions` count, which is 0 for a sub-workflow by construction.
+/// So this function no longer receives that count at all: its reliability and
+/// freshness inputs are the ones the score was computed from, and the basis
+/// says which table they came from. A caller cannot hand it a pair that
+/// disagrees with the score, because there is nothing else to hand it.
+///
+/// # `points_available` is `max − score`, per component
+///
+/// Reliability's two arms are additive and sum to the whole gap
+/// (`(50 − 5n) + 5n(1 − s) = 50 − 5sn`); freshness is `FRESHNESS_MAX −
+/// freshness`, which also corrects a pre-fix understatement — the old arm
+/// fired only at `freshness == 0.0` and offered a literal `10` where the gap
+/// is 20, and said nothing at all at `freshness == 10.0` (8–30 days old),
+/// where the gap is 10.
+pub(crate) fn build_readiness_improvements(
+    inputs: &ReadinessAdviceInputs,
+    basis: &talos_analytics_repository::ReadinessBasis,
+    runs: i64,
+    success_rate: Option<f64>,
+    freshness: f64,
+    component_source: &str,
+) -> Vec<serde_json::Value> {
+    use talos_analytics_repository as ar;
+
+    let mut improvements: Vec<serde_json::Value> = Vec::new();
+    if !inputs.has_desc {
+        improvements.push(serde_json::json!({"action": "set_workflow_description — also improves semantic search quality", "points_available": 10, "component": "documentation"}));
+    }
+    if !inputs.has_node_desc {
+        improvements.push(serde_json::json!({"action": "Add descriptions to nodes in the graph", "points_available": 5, "component": "documentation"}));
+    }
+    if !inputs.has_caps {
+        improvements.push(serde_json::json!({"action": "set_workflow_capabilities or auto_tag_capabilities", "points_available": 5, "component": "documentation"}));
+    }
+    if !inputs.has_timeout {
+        improvements.push(serde_json::json!({"action": "Set execution_timeout_secs on the workflow graph", "points_available": 3, "component": "risk"}));
+    }
+    if !inputs.has_error_edges {
+        improvements.push(serde_json::json!({
+            "action": "Add error handler",
+            "detail": "add_error_handler(workflow_id: X, handler_module_id: Y) wires error edges from ALL at-risk nodes in one call",
+            "tool": "add_error_handler",
+            "points_available": 3,
+            "component": "risk"
+        }));
+    }
+
+    // The ONE predicate that decides whether reliability/freshness advice can
+    // be given at all. Deliberately `is_unmeasurable_child`, not
+    // `is_parent_dispatched`: a LEDGER-measured child is back on the fleet
+    // scale, so withholding its advice would leave the platform's most-used
+    // sub-workflows the only rows on a 100-point scale that are never told how
+    // to improve 70 of those points.
+    let unmeasurable_child = basis.is_unmeasurable_child();
+    let ledger_scored = matches!(basis, ar::ReadinessBasis::LedgerMeasured { .. });
+    let run_word = if ledger_scored { "recorded run" } else { "run" };
+
+    if unmeasurable_child {
+        // Nothing here is derivable: both components were EXCLUDED from the
+        // denominator rather than scored 0. "Execute the workflow at least
+        // once" addressed to the flagship's daily `team_gather` is #758's
+        // "consider deleting" in a new shape — specific, actionable, and aimed
+        // at a workflow that runs every day.
+        improvements.push(serde_json::json!({
+            "action": "No reliability or freshness action is available for a parent-dispatched \
+                       workflow. Its runs are invisible to workflow_executions, and the \
+                       child-run ledger (sub_workflow_runs) cannot yet measure it either, so \
+                       neither component can be earned — or lost — by anything you do to this \
+                       workflow.",
+            "points_available": 0,
+            "component": "reliability",
+            "type": "note",
+            "measured": false,
+        }));
+    } else if runs == 0 {
+        // Reachable ONLY on the full scale with a readable execution count —
+        // a `LedgerMeasured` basis carries at least `LEDGER_MIN_RUNS` runs by
+        // construction, so this branch can no longer fire for a child.
+        //
+        // "Zero runs" and "we could not read the runs" are different facts,
+        // and the second must not be published as the first: telling the owner
+        // of a workflow with thousands of executions to "execute it at least
+        // once" is a fabricated claim about system state.
+        let action = if inputs.reliability_measured {
+            "Execute the workflow at least once to establish reliability baseline".to_string()
+        } else {
+            "Reliability could NOT BE READ (see measurement.not_measured) — this is NOT a \
+             statement that the workflow has never run. Re-check before acting on it."
+                .to_string()
+        };
+        improvements.push(serde_json::json!({
+            "action": action,
+            "points_available": if inputs.reliability_measured { ar::RELIABILITY_MAX } else { 0 },
+            "component": "reliability",
+            "measured": inputs.reliability_measured,
+            "source": component_source,
+        }));
+    } else if runs < 10 {
+        let remaining = ar::reliability_gain_from_more_runs(runs) as i32;
+        let forfeit_after = ar::reliability_gain_from_success_rate(success_rate, runs);
+        // The destination is stated truthfully. "Full reliability credit" is
+        // reachable by running more ONLY at a 100% success rate; below that,
+        // 5n(1−s) points stay behind however many times you run it.
+        let action = if forfeit_after > 0.0 {
+            format!(
+                "{} more {}s ramp reliability toward saturation at 10 (currently {}/10, from \
+                 {}) — worth {} pts. This does NOT reach full reliability credit: at the \
+                 current {:.0}% success rate, {} pts stay forfeit to failures no matter how \
+                 many runs you add, because the score is success_rate × run-ramp, not a sum.",
+                10 - runs,
+                run_word,
+                runs,
+                component_source,
+                remaining,
+                success_rate.unwrap_or(0.0) * 100.0,
+                forfeit_after.round() as i32,
+            )
+        } else {
+            format!(
+                "{} more {}s ramp reliability toward saturation at 10, reaching full \
+                 reliability credit (currently {}/10, from {})",
+                10 - runs,
+                run_word,
+                runs,
+                component_source
+            )
+        };
+        improvements.push(serde_json::json!({
+            "action": action,
+            "points_available": remaining,
+            "component": "reliability",
+            "source": component_source,
+        }));
+    }
+
+    if !unmeasurable_child && runs > 0 && success_rate.unwrap_or(0.0) < 0.95 {
+        let pts = ar::reliability_gain_from_success_rate(success_rate, runs) as i32;
+        improvements.push(serde_json::json!({
+            "action": format!(
+                "Improve success rate — currently {:.0}% over {} {}s (from {}), below the 95% bar",
+                success_rate.unwrap_or(0.0) * 100.0,
+                runs,
+                run_word,
+                component_source
+            ),
+            "points_available": pts,
+            "component": "reliability",
+            "source": component_source,
+        }));
+    }
+
+    if !unmeasurable_child && freshness < f64::from(ar::FRESHNESS_MAX) {
+        let gap = (f64::from(ar::FRESHNESS_MAX) - freshness).round() as i32;
+        improvements.push(serde_json::json!({
+            "action": format!(
+                "Execute within the last 7 days to restore the full freshness score \
+                 (currently {}/{}, from {})",
+                freshness.round() as i32,
+                ar::FRESHNESS_MAX,
+                component_source
+            ),
+            "points_available": gap,
+            "component": "freshness",
+            "source": component_source,
+        }));
+    }
+
+    // Retry warning: retries configured but failures appear deterministic (≠ transient)
+    if let Some(msg) = retry_warning_for(inputs.has_retries_configured, runs, success_rate) {
+        improvements.push(serde_json::json!({
+            "action": msg,
+            "points_available": 0,
+            "component": "risk",
+            "type": "warning",
+        }));
+    }
+
+    // Sort by most impactful first (warnings with points_available: 0 sort last)
+    improvements.sort_by(|a, b| {
+        b.get("points_available")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            .cmp(
+                &a.get("points_available")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0),
+            )
+    });
+    improvements
+}
+
+#[cfg(test)]
+mod readiness_improvement_tests {
+    use super::{build_readiness_improvements, ReadinessAdviceInputs};
+    use talos_analytics_repository::{ChildLedgerEvidence, ReadinessBasis};
+
+    fn well_documented() -> ReadinessAdviceInputs {
+        ReadinessAdviceInputs {
+            has_desc: true,
+            has_node_desc: true,
+            has_caps: true,
+            has_timeout: true,
+            has_error_edges: true,
+            reliability_measured: true,
+            has_retries_configured: false,
+        }
+    }
+
+    fn actions(v: &[serde_json::Value]) -> Vec<String> {
+        v.iter()
+            .map(|i| i["action"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    /// The LIVE contradiction, 2026-09-07 12:03Z. `pa-quality-judge` crossed
+    /// the 3-run ledger floor; `get_readiness_breakdown` scored it 54/100,
+    /// `basis: "ledger"`, reliability 15/50 from `executions_30d: 3,
+    /// source: "sub_workflow_runs"` — and `improvements[0]` in the SAME
+    /// response read *"Execute the workflow at least once to establish
+    /// reliability baseline"*, `points_available: 50`, `measured: true`.
+    ///
+    /// The renderer keyed on the `workflow_executions` count (0) instead of on
+    /// the component sitting beside it. Check 74's contradiction shape.
+    #[test]
+    fn a_ledger_measured_child_is_never_told_to_execute_at_least_once() {
+        let now = chrono::Utc::now();
+        let ledger = ChildLedgerEvidence {
+            runs: 3,
+            failed: 0,
+            last_started_at: Some(now - chrono::Duration::hours(2)),
+            ledger_since: Some(now - chrono::Duration::hours(11)),
+            window_start: now - chrono::Duration::days(30),
+        };
+        assert!(ledger.meets_floor(), "fixture must be ON the fleet scale");
+        let basis = ReadinessBasis::LedgerMeasured {
+            parents: vec!["pa-chief-of-staff".to_string()],
+            ledger,
+        };
+        let (reliability, freshness) = ledger.components(now);
+
+        let out = build_readiness_improvements(
+            &well_documented(),
+            &basis,
+            ledger.runs,
+            ledger.success_rate(),
+            freshness,
+            "sub_workflow_runs",
+        );
+
+        let acts = actions(&out);
+        assert!(
+            !acts.iter().any(|a| a.contains("at least once")),
+            "a child with {} recorded runs (reliability {reliability}/50) must not be told to \
+             execute it at least once; got {acts:#?}",
+            ledger.runs
+        );
+        // …and the advice it SHOULD give is the ramp, priced from the score's
+        // own formula: 50 − 5n = 35 points at n = 3.
+        let ramp = out
+            .iter()
+            .find(|i| i["component"] == "reliability")
+            .expect("a below-saturation child must still get reliability advice");
+        assert_eq!(ramp["points_available"].as_i64(), Some(35));
+        assert!(
+            ramp["action"].as_str().unwrap().contains("recorded run"),
+            "the advice must name the ledger's own unit, not workflow_executions: {ramp:#?}"
+        );
+    }
+    /// The other half of #762's rule, and the direction a naive fix breaks:
+    /// an UNMEASURABLE child (below the floor, or no ledger read) must keep
+    /// P2's note and get NO reliability or freshness advice at all.
+    #[test]
+    fn an_unmeasurable_child_keeps_the_note_and_gets_no_derived_advice() {
+        let basis = ReadinessBasis::ParentDispatched {
+            parents: vec!["pa-chief-of-staff".to_string()],
+            ledger: None,
+        };
+        let out = build_readiness_improvements(
+            &well_documented(),
+            &basis,
+            0,
+            None,
+            0.0,
+            "workflow_executions",
+        );
+        let acts = actions(&out);
+        assert_eq!(acts.len(), 1, "exactly the note: {acts:#?}");
+        assert!(acts[0].contains("No reliability or freshness action is available"));
+        assert_eq!(out[0]["measured"], serde_json::json!(false));
+        assert_eq!(out[0]["points_available"], serde_json::json!(0));
+        assert!(
+            !acts.iter().any(|a| a.contains("freshness score")),
+            "freshness advice must not fire for a component that was EXCLUDED"
+        );
+    }
+
+    /// A ledger-measured child is on the FULL scale, so it must also receive
+    /// the success-rate and freshness advice that used to be withheld from
+    /// every child by a blanket `!is_child` gate — otherwise the platform's
+    /// most-used sub-workflows are the only rows scored out of 100 that are
+    /// never told how to move 70 of those points.
+    #[test]
+    fn a_ledger_measured_child_gets_success_rate_and_freshness_advice() {
+        let now = chrono::Utc::now();
+        let ledger = ChildLedgerEvidence {
+            runs: 10,
+            failed: 4,
+            // 12 days -> freshness 10 of 20, a gap the pre-fix arm could not
+            // even express (it fired only at exactly 0.0).
+            last_started_at: Some(now - chrono::Duration::days(12)),
+            ledger_since: Some(now - chrono::Duration::days(40)),
+            window_start: now - chrono::Duration::days(30),
+        };
+        let basis = ReadinessBasis::LedgerMeasured {
+            parents: vec!["pa-daily-brief".to_string()],
+            ledger,
+        };
+        let (_, freshness) = ledger.components(now);
+        assert_eq!(freshness, 10.0);
+
+        let out = build_readiness_improvements(
+            &well_documented(),
+            &basis,
+            ledger.runs,
+            ledger.success_rate(),
+            freshness,
+            "sub_workflow_runs",
+        );
+        let acts = actions(&out);
+        assert!(
+            acts.iter().any(|a| a.contains("Improve success rate")),
+            "60% over 10 recorded runs is below the 95% bar: {acts:#?}"
+        );
+        let fresh = out
+            .iter()
+            .find(|i| i["component"] == "freshness")
+            .expect("freshness advice");
+        assert_eq!(
+            fresh["points_available"].as_i64(),
+            Some(10),
+            "points_available is FRESHNESS_MAX - freshness, not a literal"
+        );
+        assert_eq!(fresh["source"], serde_json::json!("sub_workflow_runs"));
+        // At n = 10 the ramp is saturated, so no "run it more" line.
+        assert!(
+            !acts.iter().any(|a| a.contains("ramp reliability")),
+            "{acts:#?}"
+        );
+    }
+
+    /// Every reliability/freshness line must name the table it was derived
+    /// from. Two numbers under one field name, from two tables, is how the
+    /// contradiction above stayed invisible for a release.
+    #[test]
+    fn derived_advice_names_its_source_table() {
+        let out = build_readiness_improvements(
+            &well_documented(),
+            &ReadinessBasis::FullScale,
+            0,
+            None,
+            0.0,
+            "workflow_executions",
+        );
+        for i in &out {
+            if i["component"] == "reliability" || i["component"] == "freshness" {
+                assert_eq!(
+                    i["source"],
+                    serde_json::json!("workflow_executions"),
+                    "{i:#?}"
+                );
+            }
+        }
+        assert!(actions(&out).iter().any(|a| a.contains("at least once")));
+    }
+
+    /// An UNREADABLE reliability read must not be published as "it has never
+    /// run" — #730's rule, preserved through the extraction.
+    #[test]
+    fn an_unread_reliability_is_not_a_zero() {
+        let mut inputs = well_documented();
+        inputs.reliability_measured = false;
+        let out = build_readiness_improvements(
+            &inputs,
+            &ReadinessBasis::FullScale,
+            0,
+            None,
+            0.0,
+            "workflow_executions",
+        );
+        let rel = out
+            .iter()
+            .find(|i| i["component"] == "reliability")
+            .unwrap();
+        assert!(rel["action"]
+            .as_str()
+            .unwrap()
+            .contains("could NOT BE READ"));
+        assert_eq!(rel["points_available"], serde_json::json!(0));
+        assert_eq!(rel["measured"], serde_json::json!(false));
+    }
+
+    /// The below-floor wording. `CHILD_UNMEASURED_REASON` asserts reliability
+    /// is "read from that table and from nothing else" — false the moment the
+    /// ledger holds a row, and the same response prints `ledger_runs: 1` two
+    /// fields up.
+    #[test]
+    fn the_below_floor_reason_does_not_deny_the_ledger_it_just_counted() {
+        let now = chrono::Utc::now();
+        let ev = ChildLedgerEvidence {
+            runs: 1,
+            failed: 0,
+            last_started_at: Some(now),
+            ledger_since: Some(now - chrono::Duration::hours(11)),
+            window_start: now - chrono::Duration::days(30),
+        };
+        assert!(!ev.meets_floor());
+        let reason = talos_analytics_repository::child_unmeasured_reason(Some(&ev));
+        assert!(
+            !reason.contains("from nothing else"),
+            "the ledger IS a second source: {reason}"
+        );
+        assert!(reason.contains("below the 3-run floor"), "{reason}");
+        assert!(reason.contains("holds 1 of them"), "{reason}");
+
+        // …and with no ledger evidence at all the original sentence is exactly
+        // right and must be unchanged.
+        for absent in [None, Some(&ChildLedgerEvidence::unrecorded(now))] {
+            assert_eq!(
+                talos_analytics_repository::child_unmeasured_reason(absent),
+                talos_analytics_repository::CHILD_UNMEASURED_REASON
+            );
         }
     }
 }
