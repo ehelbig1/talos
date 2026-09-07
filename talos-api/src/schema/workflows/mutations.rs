@@ -130,6 +130,7 @@ impl WorkflowsMutations {
                     | OrchestrationError::ExecutionArchived(..)
                     | OrchestrationError::ExecutionPaused
                     | OrchestrationError::WorkflowDisabled(_)
+                    | OrchestrationError::WorkflowNotLive(..)
                     | OrchestrationError::StatusConflict(_)
                     | OrchestrationError::AuthorizationDenied(_)
                     | OrchestrationError::ConcurrencyLimitExceeded(_)

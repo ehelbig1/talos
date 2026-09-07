@@ -51,8 +51,24 @@ pub enum OrchestrationError {
 
     /// Workflow `is_enabled = false`. Different from `Paused` because
     /// this is a per-workflow toggle, not a platform-wide drain.
+    ///
+    /// Retained for `replay`, which asks the narrower question ("is this
+    /// workflow enabled") off a boolean it reads directly. The TRIGGER paths
+    /// use [`Self::WorkflowNotLive`], which also covers `archived`.
     #[error("workflow {0} is disabled")]
     WorkflowDisabled(Uuid),
+
+    /// Workflow is not dispatchable — `archived`, or `is_enabled = false`.
+    ///
+    /// 2026-09-07: the three execution-creating entry points disagreed about
+    /// this. `trigger_workflow` refused only `is_enabled = false`;
+    /// `bulk_trigger_workflow` and `enqueue_workflow` refused neither, so an
+    /// archived workflow was dispatchable from all three and a disabled one
+    /// from two. The reason string comes from
+    /// `talos_workflow_repository::not_dispatchable_reason` (whose DECISION is `talos_workflow_liveness::is_dispatchable`), so the three cannot
+    /// describe the same state differently.
+    #[error("workflow {0} is not dispatchable ({1})")]
+    WorkflowNotLive(Uuid, &'static str),
 
     /// Wrong source state for the operation. Examples: retry on a
     /// running execution, replay on a missing workflow row, ack on
@@ -128,7 +144,10 @@ impl OrchestrationError {
             // is refused because of the row's CURRENT state. Not -32001 —
             // that code means "no such thing".
             Self::ExecutionArchived(..) => -32003,
-            Self::ExecutionPaused | Self::WorkflowDisabled(_) | Self::StatusConflict(_) => -32003,
+            Self::ExecutionPaused
+            | Self::WorkflowDisabled(_)
+            | Self::WorkflowNotLive(..)
+            | Self::StatusConflict(_) => -32003,
             Self::AuthorizationDenied(_) => -32004,
             Self::ConcurrencyLimitExceeded(_) => -32005,
             Self::DispatchFailed(_) | Self::Database(_) | Self::Internal(_) => -32000,

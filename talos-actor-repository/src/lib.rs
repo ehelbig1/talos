@@ -3794,18 +3794,29 @@ impl ActorRepository {
             .collect::<Result<Vec<_>>>()
     }
 
-    /// List published workflows owned by an actor — projection for the A2A agent card.
+    /// The actor's live workflows — projection for the A2A agent card.
+    ///
+    /// 2026-09-07: this filtered `status = 'published'`, a value that is not in
+    /// the workflow lifecycle enum (`draft | active | archived`, migration
+    /// 20260318000000) and that exactly one writer in the workspace stores —
+    /// `plan_and_execute_workflow`'s internal orchestrator rows. So every
+    /// actor's agent card advertised ZERO workflows, and an empty card is
+    /// indistinguishable from an actor that genuinely owns none. Same defect,
+    /// same day, as the hygiene report's `workflows_needing_schema`. Both now
+    /// read the predicate from `talos_workflow_liveness::live_sql`, the ONE
+    /// home for it, rather than spelling a status literal twice.
     pub async fn list_published_workflows_for_actor(
         &self,
         actor_id: Uuid,
         limit: i64,
     ) -> Result<Vec<PublishedWorkflowRow>> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(&format!(
             "SELECT id, name, description, capabilities \
              FROM workflows \
-             WHERE actor_id = $1 AND status = 'published' \
+             WHERE actor_id = $1 AND {live} \
              ORDER BY updated_at DESC, id DESC LIMIT $2",
-        )
+            live = talos_workflow_liveness::live_sql(None),
+        ))
         .bind(actor_id)
         .bind(limit)
         .fetch_all(&self.db_pool)

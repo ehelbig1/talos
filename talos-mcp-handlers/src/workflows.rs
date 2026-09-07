@@ -6187,6 +6187,21 @@ async fn handle_bulk_trigger_workflow(
             return Some(crate::utils::database_error(req_id.clone()));
         }
     };
+    // 2026-09-07: this handler applied NO liveness predicate, so an ARCHIVED
+    // or DISABLED workflow was bulk-dispatchable up to 20 times per call while
+    // `trigger_workflow` refused the disabled one. The asymmetry is the defect
+    // (check 78's "three of four entry points refused"); the decision and the
+    // sentence both come from `talos_workflow_repository`, so the three paths
+    // cannot disagree. Placed ABOVE the graph load and the per-input loop, so
+    // a refusal costs no dispatch and no partial batch.
+    if let Some(reason) = wf_record.not_dispatchable_reason() {
+        return Some(mcp_error(
+            req_id.clone(),
+            -32003,
+            &talos_workflow_repository::not_dispatchable_message(reason),
+        ));
+    }
+
     let bulk_wf_agent_id = wf_record.actor_id;
 
     // Try active published version first, fall back to draft.

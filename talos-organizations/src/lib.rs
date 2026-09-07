@@ -372,7 +372,17 @@ impl OrganizationService {
 
         // Lock the relevant rows and count owners atomically.
         let owner_count = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM organization_members WHERE org_id = $1 AND role = 'owner' FOR UPDATE",
+            // `SELECT COUNT(*) … FOR UPDATE` is rejected by Postgres
+            // UNCONDITIONALLY (`0A000: FOR UPDATE is not allowed with aggregate
+            // functions`) — no bind, no schema and no data can make it run, so
+            // from the day it was written this statement returned an error on
+            // every call and the last-owner guard above it has never once been
+            // evaluated. Lock the owner ROWS in a subquery, then count what was
+            // locked: same intent, same rows locked, and it prepares.
+            "SELECT COUNT(*) FROM ( \
+               SELECT 1 FROM organization_members \
+                WHERE org_id = $1 AND role = 'owner' FOR UPDATE \
+             ) locked_owners",
         )
         .bind(org_id)
         .fetch_one(&mut *tx)
@@ -533,7 +543,17 @@ impl OrganizationService {
             }
             if current_role == Some(OrgRole::Owner) {
                 let owner_count = sqlx::query_scalar::<_, i64>(
-                    "SELECT COUNT(*) FROM organization_members WHERE org_id = $1 AND role = 'owner' FOR UPDATE",
+                    // `SELECT COUNT(*) … FOR UPDATE` is rejected by Postgres
+                    // UNCONDITIONALLY (`0A000: FOR UPDATE is not allowed with aggregate
+                    // functions`) — no bind, no schema and no data can make it run, so
+                    // from the day it was written this statement returned an error on
+                    // every call and the last-owner guard above it has never once been
+                    // evaluated. Lock the owner ROWS in a subquery, then count what was
+                    // locked: same intent, same rows locked, and it prepares.
+                    "SELECT COUNT(*) FROM ( \
+               SELECT 1 FROM organization_members \
+                WHERE org_id = $1 AND role = 'owner' FOR UPDATE \
+             ) locked_owners",
                 )
                 .bind(org_id)
                 .fetch_one(&mut *tx)

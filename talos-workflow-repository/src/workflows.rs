@@ -57,6 +57,73 @@ pub struct WorkflowRecord {
     pub input_schema: Option<serde_json::Value>,
 }
 
+/// Why a workflow must NOT be dispatched, or `None` if it may be.
+///
+/// **The DECISION is `talos_workflow_liveness::is_dispatchable`** — there is
+/// exactly one home for "may the platform still run this workflow", and this is
+/// not it. What lives here is the SENTENCE, so the three execution-creating
+/// entry points cannot describe one state three ways.
+///
+/// 2026-09-07: those three disagreed. `trigger_workflow` refused
+/// `is_enabled = false` and nothing else; `bulk_trigger_workflow` and
+/// `enqueue_workflow` applied NO predicate at all. So an ARCHIVED workflow was
+/// dispatchable from all three and a DISABLED one from two — check 78's "three
+/// of four entry points refused", one tool over. Archiving does not clear
+/// `is_enabled` (none of the five `SET status = 'archived'` statements in this
+/// workspace touch that column), so on the reference fleet all 8 archived
+/// workflows were `is_enabled = true` and nothing protected them incidentally.
+///
+/// **`is_dispatchable`, deliberately NOT `not_live_reason`.** A DRAFT is
+/// dispatchable: `trigger_workflow` has always run one, a parent dispatches a
+/// child's draft `graph_json` with no status predicate, and 11 of the 36
+/// workflows on the reference fleet are drafts (4 of them carrying enabled
+/// schedules). Gating on liveness would refuse those and create a NEW
+/// disagreement in place of the one this closes. `not_live_reason` answers a
+/// REPORTING question ("is this workflow live?"); this is a DISPATCH gate.
+///
+/// An absent status reads as dispatchable. `workflows.status` is
+/// `NOT NULL DEFAULT 'draft'`, so `None` here is a projection that did not
+/// select the column rather than a fact about the row, and refusing on it would
+/// take every trigger path down for a code-shape reason. `is_enabled` still
+/// gates. Stated rather than left to look like a fail-closed rule.
+#[must_use]
+pub fn not_dispatchable_reason(status: Option<&str>, is_enabled: bool) -> Option<&'static str> {
+    let status = status.unwrap_or(talos_workflow_liveness::STATUS_DRAFT);
+    if talos_workflow_liveness::is_dispatchable(status, is_enabled) {
+        return None;
+    }
+    if talos_workflow_liveness::is_retired(status) {
+        Some("archived")
+    } else {
+        Some("disabled")
+    }
+}
+
+/// The caller-facing refusal for a workflow that is not dispatchable.
+///
+/// One sentence per reason, naming the tool that undoes it — "workflow is
+/// archived" without "restore it first" is a report an operator cannot act on.
+#[must_use]
+pub fn not_dispatchable_message(reason: &str) -> String {
+    match reason {
+        "archived" => "This workflow is archived, so it was not dispatched. \
+             Restore it before triggering, or trigger a live copy."
+            .to_string(),
+        "disabled" => "This workflow is disabled, so it was not dispatched. \
+             Re-enable it with `enable_workflow` before triggering."
+            .to_string(),
+        other => format!("This workflow is not dispatchable ({other}), so it was not dispatched."),
+    }
+}
+
+impl WorkflowRecord {
+    /// [`not_dispatchable_reason`] over this record's own columns.
+    #[must_use]
+    pub fn not_dispatchable_reason(&self) -> Option<&'static str> {
+        not_dispatchable_reason(self.status.as_deref(), self.is_enabled)
+    }
+}
+
 impl WorkflowRepository {
     /// Open a write transaction scoped to the creator's **personal org**
     /// (RFC 0006 org-pin / RFC 0005 S3). Resolves that org in Rust so the
@@ -1597,8 +1664,18 @@ impl WorkflowRepository {
         // org-pin WITH CHECK enforces; bind the resolved org as `org_id` ($7).
         let (mut tx, personal_org) = self.begin_personal_org_write(user_id).await?;
         sqlx::query(
-            "INSERT INTO workflows (id, user_id, actor_id, name, description, graph_json, status, workflow_type, org_id) \
-             VALUES ($1, $2, $3, $4, $5, $6::jsonb, 'published', 'internal', $7)",
+            // `module_uri` is `NOT NULL` with NO default and this INSERT
+            // omitted it, so every call failed with 23502 and
+            // `plan_and_execute_workflow` could never create its subtask or
+            // orchestrator rows — measured 2026-09-07: 0 rows at
+            // `workflow_type = 'internal'` platform-wide, and driving this
+            // method in a DB test reproduces the constraint violation. `''` is
+            // the value every other graph-based workflow INSERT in this file
+            // binds (a graph workflow has no single module URI). Note a PREPARE
+            // probe cannot see this class: the statement PARSES and PLANS
+            // perfectly and only a real INSERT trips the constraint.
+            "INSERT INTO workflows (id, user_id, actor_id, name, description, graph_json, module_uri, status, workflow_type, org_id) \
+             VALUES ($1, $2, $3, $4, $5, $6::jsonb, '', 'published', 'internal', $7)",
         )
         .bind(workflow_id)
         .bind(user_id)
@@ -1948,8 +2025,10 @@ impl WorkflowRepository {
 
     /// Update the failure_webhook_url column on a workflow. Pass `None` to clear.
     /// Returns rows affected (0 = workflow not found / not owned).
-    /// Distinct from the `workflow_webhooks` table — this is a single-column
-    /// shortcut for the legacy MCP `set_failure_notification` tool.
+    /// Backs the MCP `set_failure_notification` tool. It used to be described
+    /// here as a shortcut past a `workflow_webhooks` table; there is no such
+    /// table and never was (2026-09-07), so this column is not a shortcut past
+    /// anything — it is the whole mechanism.
     pub async fn set_failure_webhook_url_column(
         &self,
         workflow_id: Uuid,
@@ -1967,10 +2046,12 @@ impl WorkflowRepository {
         Ok(result.rows_affected())
     }
 
-    /// Fetch the legacy `workflows.failure_webhook_url` column. Outer Option
+    /// Fetch the `workflows.failure_webhook_url` column. Outer Option
     /// = workflow found vs. not found; inner = column NULL vs. set.
-    /// Distinct from `get_failure_webhook_url`, which queries the newer
-    /// `workflow_webhooks` event-type table.
+    /// This is the ONLY failure-webhook reader. It was previously called
+    /// "legacy" and contrasted with a "newer `workflow_webhooks` event-type
+    /// table" that no migration has ever created (2026-09-07) — the reader of
+    /// that phantom table has been deleted.
     pub async fn get_failure_webhook_url_column(
         &self,
         workflow_id: Uuid,
@@ -2382,5 +2463,81 @@ impl talos_workflow_engine_core::WorkflowGraphStore for WorkflowRepository {
         .fetch_optional(&self.db_pool)
         .await?;
         Ok(row)
+    }
+}
+
+#[cfg(test)]
+mod dispatch_liveness_tests {
+    use super::{not_dispatchable_message, not_dispatchable_reason};
+
+    /// The three execution-creating entry points must agree, and the thing they
+    /// agree on is THIS function. Each row is a state one of them used to treat
+    /// differently.
+    #[test]
+    fn the_gate_refuses_archived_and_disabled_and_nothing_else() {
+        // Live: dispatchable, obviously.
+        assert_eq!(not_dispatchable_reason(Some("active"), true), None);
+
+        // DRAFT IS DISPATCHABLE. `trigger_workflow` has always run one and a
+        // parent dispatches a child's draft `graph_json` with no status
+        // predicate; 11 of 36 workflows on the reference fleet are drafts.
+        // Gating on LIVENESS (`not_live_reason`) instead of DISPATCHABILITY
+        // would refuse these — a new disagreement in place of the one this
+        // closes, which is why the decision is `is_dispatchable`.
+        assert_eq!(not_dispatchable_reason(Some("draft"), true), None);
+
+        // Archived. Archiving does NOT clear `is_enabled`, so this is the case
+        // every one of the three entry points used to permit.
+        assert_eq!(
+            not_dispatchable_reason(Some("archived"), true),
+            Some("archived")
+        );
+
+        // Disabled. `trigger_workflow` refused this; the other two did not.
+        assert_eq!(
+            not_dispatchable_reason(Some("active"), false),
+            Some("disabled")
+        );
+        assert_eq!(
+            not_dispatchable_reason(Some("draft"), false),
+            Some("disabled")
+        );
+
+        // Both. "archived" wins the wording — restoring it is the operator's
+        // first act, and re-enabling an archived workflow does not dispatch it.
+        assert_eq!(
+            not_dispatchable_reason(Some("archived"), false),
+            Some("archived")
+        );
+    }
+
+    /// An ABSENT status reads as dispatchable, deliberately. `workflows.status`
+    /// is `NOT NULL DEFAULT 'draft'`, so `None` is a projection that did not
+    /// select the column rather than a fact about the row; refusing on it would
+    /// take every trigger path down for a code-shape reason. `is_enabled` still
+    /// gates, which this pins.
+    #[test]
+    fn an_absent_status_does_not_refuse_but_is_enabled_still_does() {
+        assert_eq!(not_dispatchable_reason(None, true), None);
+        assert_eq!(not_dispatchable_reason(None, false), Some("disabled"));
+    }
+
+    /// A refusal an operator cannot act on is half a refusal: every message
+    /// names the state AND the way out.
+    #[test]
+    fn every_refusal_names_the_way_out() {
+        let archived = not_dispatchable_message("archived");
+        assert!(
+            archived.contains("archived") && archived.contains("Restore"),
+            "{archived}"
+        );
+        let disabled = not_dispatchable_message("disabled");
+        assert!(
+            disabled.contains("disabled") && disabled.contains("enable_workflow"),
+            "{disabled}"
+        );
+        // An unknown reason must still render as a refusal, not as an empty
+        // string or a panic.
+        assert!(not_dispatchable_message("weird").contains("not dispatchable"));
     }
 }

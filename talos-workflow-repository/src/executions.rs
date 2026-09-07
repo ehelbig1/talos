@@ -1400,23 +1400,13 @@ impl WorkflowRepository {
 
     // ── Alerts & webhooks ──────────────────────────────────────────────────
 
-    /// Fetch the failure webhook URL configured for a workflow.
-    pub async fn get_failure_webhook_url(
-        &self,
-        workflow_id: Uuid,
-        user_id: Uuid,
-    ) -> Result<Option<String>> {
-        let url: Option<String> = sqlx::query_scalar(
-            "SELECT url FROM workflow_webhooks \
-             WHERE workflow_id = $1 AND user_id = $2 AND event_type = 'execution_failed' \
-             LIMIT 1",
-        )
-        .bind(workflow_id)
-        .bind(user_id)
-        .fetch_optional(&self.db_pool)
-        .await?;
-        Ok(url)
-    }
+    // `get_failure_webhook_url` (previously reading a `workflow_webhooks`
+    // table that NO migration has ever created — `to_regclass` is NULL on the
+    // live database and on a freshly migrated one) was dead code and has been
+    // removed. It had zero callers; the live reader is
+    // `get_workflow_failure_webhook` below, which reads the
+    // `workflows.failure_webhook_url` COLUMN. Same disposition as the
+    // `actor_memories` pair above.
 
     /// Upsert a workflow execution failure alert (occurrence-count style).
     pub async fn upsert_execution_failure_alert(
@@ -1454,7 +1444,9 @@ impl WorkflowRepository {
     }
 
     /// Fetch the failure_webhook_url column directly from the workflows table.
-    /// (Distinct from `get_failure_webhook_url` which queries workflow_webhooks.)
+    /// This is the ONLY failure-webhook reader; the `workflow_webhooks`-table
+    /// twin it used to be contrasted with named a relation that never existed
+    /// and was removed 2026-09-07.
     pub async fn get_workflow_failure_webhook(&self, workflow_id: Uuid) -> Result<Option<String>> {
         let url: Option<String> =
             sqlx::query_scalar("SELECT failure_webhook_url FROM workflows WHERE id = $1")

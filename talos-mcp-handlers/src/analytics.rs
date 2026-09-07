@@ -1130,13 +1130,27 @@ async fn handle_get_workflow_dependencies_list(
         })
         .collect();
 
+    // Every read below is recorded. This handler is a statement about a
+    // workflow's EXTERNAL SURFACE AREA — "what reaches out of this workflow and
+    // what reaches into it" — so an empty list is exactly the answer an
+    // operator would act on, and until 2026-09-07 all three reads collapsed a
+    // failure into one with `.unwrap_or_default()`. The `webhooks` read could
+    // not have succeeded on any call: its statement named a column
+    // `webhook_triggers` does not have (see
+    // `AnalyticsRepository::list_workflow_webhooks`), so `webhooks: []` and
+    // `webhook_count: 0` were a determinate negative over SQL that never ran.
+    let mut readings = talos_measurement::Readings::new();
+
     // Resolve module names
     let module_names: std::collections::HashMap<uuid::Uuid, String> = if !module_ids.is_empty() {
-        state
-            .analytics_repo
-            .list_module_and_template_names(&module_ids)
-            .await
-            .unwrap_or_default()
+        readings
+            .record_rows(
+                "module_names",
+                state
+                    .analytics_repo
+                    .list_module_and_template_names(&module_ids)
+                    .await,
+            )
             .into_iter()
             .map(|r| (r.id, r.name))
             .collect()
@@ -1164,11 +1178,10 @@ async fn handle_get_workflow_dependencies_list(
         })
         .collect();
 
-    let schedule_rows = state
-        .analytics_repo
-        .list_workflow_schedules(wf_id)
-        .await
-        .unwrap_or_default();
+    let schedule_rows = readings.record_rows(
+        "schedules",
+        state.analytics_repo.list_workflow_schedules(wf_id).await,
+    );
     let schedules: Vec<serde_json::Value> = schedule_rows
         .iter()
         .map(|r| {
@@ -1179,17 +1192,20 @@ async fn handle_get_workflow_dependencies_list(
         })
         .collect();
 
-    let webhook_rows = state
-        .analytics_repo
-        .list_workflow_webhooks(wf_id)
-        .await
-        .unwrap_or_default();
+    let webhook_rows = readings.record_rows(
+        "webhooks",
+        state
+            .analytics_repo
+            .list_workflow_webhooks(wf_id, user_id)
+            .await,
+    );
     let webhooks: Vec<serde_json::Value> = webhook_rows
         .iter()
         .map(|r| {
             serde_json::json!({
                 "webhook_id": r.id.to_string(),
                 "endpoint_path": r.endpoint_path,
+                "name": r.name,
                 "is_enabled": r.is_enabled,
             })
         })
@@ -1198,7 +1214,7 @@ async fn handle_get_workflow_dependencies_list(
     // MCP-108 (2026-05-08): per-array counts + total_dependencies so a
     // caller can answer "what's this workflow's external surface area"
     // from one object lookup. Same MCP-83 pattern.
-    let result = serde_json::json!({
+    let mut result = serde_json::json!({
         "workflow_id": wf_id.to_string(),
         "module_count": modules.len(),
         "secret_count": secrets_referenced.len(),
@@ -1213,6 +1229,24 @@ async fn handle_get_workflow_dependencies_list(
         "schedules": schedules,
         "webhooks": webhooks,
     });
+    // A count over a list a read could not fill is a CLAIM, not a measurement,
+    // so each count is marked derived exactly when ITS OWN source read failed —
+    // not whenever anything failed. `module_count` is derived from the graph,
+    // not from a read, so it stays measured even when the NAME lookup fails.
+    let unmeasured: Vec<&str> = readings.not_measured().to_vec();
+    if unmeasured.contains(&"schedules") {
+        readings.mark_derived("schedule_count");
+    }
+    if unmeasured.contains(&"webhooks") {
+        readings.mark_derived("webhook_count");
+    }
+    if unmeasured
+        .iter()
+        .any(|f| *f == "schedules" || *f == "webhooks")
+    {
+        readings.mark_derived("total_dependencies");
+    }
+    readings.attach(&mut result);
 
     mcp_text(
         req_id,
@@ -2798,7 +2832,7 @@ async fn handle_list_workflow_triggers(
             "webhooks",
             state
                 .analytics_repo
-                .list_webhooks_for_modules(&webhook_module_ids, wf_id)
+                .list_webhooks_for_modules(&webhook_module_ids, wf_id, user_id)
                 .await,
         );
         webhook_rows
@@ -2807,6 +2841,7 @@ async fn handle_list_workflow_triggers(
                 serde_json::json!({
                     "webhook_id": r.id.to_string(),
                     "endpoint_path": r.endpoint_path,
+                    "name": r.name,
                     "is_enabled": r.is_enabled,
                 })
             })

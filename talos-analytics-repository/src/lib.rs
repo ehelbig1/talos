@@ -616,17 +616,23 @@ pub struct ScheduleRow {
 #[derive(Debug)]
 pub struct WebhookRow {
     pub id: Uuid,
+    /// DERIVED, never read from a column — `webhook_triggers` has no
+    /// `endpoint_path` and never did. See [`webhook_endpoint_path`].
     pub endpoint_path: String,
+    pub name: Option<String>,
     pub is_enabled: bool,
 }
 
-#[derive(Debug)]
-pub struct AuditEventRow {
-    pub id: Uuid,
-    pub event_type: String,
-    pub description: Option<String>,
-    pub created_at: DateTime<Utc>,
-    pub actor_id: Option<Uuid>,
+/// The public route a webhook trigger is reachable on.
+///
+/// The endpoint is a function of the id (`/webhooks/{id}`, plural — the route
+/// `talos-mcp-handlers::webhooks` renders and the router serves); it is not a
+/// stored column, which is why two statements asking `webhook_triggers` for an
+/// `endpoint_path` could never run. ONE home, so a second reader cannot invent
+/// a different path.
+#[must_use]
+pub fn webhook_endpoint_path(id: Uuid) -> String {
+    format!("/webhooks/{id}")
 }
 
 #[derive(Debug)]
@@ -2746,44 +2752,76 @@ impl AnalyticsRepository {
         Ok(count)
     }
 
-    pub async fn list_workflow_webhooks(&self, wf_id: Uuid) -> Result<Vec<WebhookRow>> {
+    /// Webhook triggers bound directly to a workflow.
+    ///
+    /// 2026-09-07: this statement named `endpoint_path` and `is_enabled`, and
+    /// `webhook_triggers` has NEITHER — its flag column is `enabled` and there
+    /// has never been an `endpoint_path` column at all, because the endpoint is
+    /// DERIVED from the id (`/webhooks/{id}`, see `handle_list_webhooks`) and is
+    /// not stored. So the statement failed to PREPARE on every call since the
+    /// rename, and its one caller's `.unwrap_or_default()` rendered that as
+    /// `webhooks: []` — a determinate negative over SQL that has never once
+    /// executed. `user_id` is now bound as well: the caller does gate on
+    /// ownership upstream, but `workflow_id` is not the tenant half and check
+    /// 70's lesson is that a statement should not rely on caller discipline for
+    /// its tenancy.
+    pub async fn list_workflow_webhooks(
+        &self,
+        wf_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Vec<WebhookRow>> {
         let rows = sqlx::query(
-            "SELECT id, endpoint_path, is_enabled \
-             FROM webhook_triggers WHERE workflow_id = $1",
+            "SELECT id, name, enabled \
+             FROM webhook_triggers WHERE workflow_id = $1 AND user_id = $2",
         )
         .bind(wf_id)
+        .bind(user_id)
         .fetch_all(&self.db_pool)
         .await?;
         rows.into_iter()
             .map(|r| -> Result<WebhookRow> {
+                let id: Uuid = r.try_get("id")?;
                 Ok(WebhookRow {
-                    id: r.try_get("id")?,
-                    endpoint_path: r.try_get("endpoint_path")?,
-                    is_enabled: r.try_get::<Option<_>, _>("is_enabled")?.unwrap_or(false),
+                    id,
+                    endpoint_path: webhook_endpoint_path(id),
+                    name: r.try_get::<Option<_>, _>("name")?,
+                    is_enabled: r.try_get::<Option<_>, _>("enabled")?.unwrap_or(false),
                 })
             })
             .collect::<Result<Vec<_>>>()
     }
 
+    /// Webhook triggers bound to any of a workflow's module ids.
+    ///
+    /// The twin of `list_workflow_webhooks` and dead for the same reason since
+    /// the same rename (2026-09-07). Its caller DOES route the read through a
+    /// `Readings` ledger, so `list_workflow_triggers` disclosed the failure as
+    /// `webhooks: not_measured` rather than as `[]` — honest, and still a read
+    /// that could never succeed.
     pub async fn list_webhooks_for_modules(
         &self,
         module_ids: &[Uuid],
         wf_id: Uuid,
+        user_id: Uuid,
     ) -> Result<Vec<WebhookRow>> {
         let rows = sqlx::query(
-            "SELECT id, endpoint_path, is_enabled \
-             FROM webhook_triggers WHERE module_id = ANY($1) AND workflow_id = $2",
+            "SELECT id, name, enabled \
+             FROM webhook_triggers \
+             WHERE module_id = ANY($1) AND workflow_id = $2 AND user_id = $3",
         )
         .bind(module_ids)
         .bind(wf_id)
+        .bind(user_id)
         .fetch_all(&self.db_pool)
         .await?;
         rows.into_iter()
             .map(|r| -> Result<WebhookRow> {
+                let id: Uuid = r.try_get("id")?;
                 Ok(WebhookRow {
-                    id: r.try_get("id")?,
-                    endpoint_path: r.try_get("endpoint_path")?,
-                    is_enabled: r.try_get::<Option<_>, _>("is_enabled")?.unwrap_or(false),
+                    id,
+                    endpoint_path: webhook_endpoint_path(id),
+                    name: r.try_get::<Option<_>, _>("name")?,
+                    is_enabled: r.try_get::<Option<_>, _>("enabled")?.unwrap_or(false),
                 })
             })
             .collect::<Result<Vec<_>>>()
@@ -2812,27 +2850,16 @@ impl AnalyticsRepository {
 
     // -- Audit ------------------------------------------------------------
 
-    pub async fn list_audit_events(&self, wf_id: Uuid, limit: i64) -> Result<Vec<AuditEventRow>> {
-        let rows = sqlx::query(
-            "SELECT id, event_type, description, created_at, actor_id \
-             FROM workflow_audit_log WHERE workflow_id = $1 ORDER BY created_at DESC LIMIT $2",
-        )
-        .bind(wf_id)
-        .bind(limit)
-        .fetch_all(&self.db_pool)
-        .await?;
-        rows.into_iter()
-            .map(|r| -> Result<AuditEventRow> {
-                Ok(AuditEventRow {
-                    id: r.try_get("id")?,
-                    event_type: r.try_get("event_type")?,
-                    description: r.try_get::<Option<_>, _>("description")?,
-                    created_at: r.try_get("created_at")?,
-                    actor_id: r.try_get::<Option<_>, _>("actor_id")?,
-                })
-            })
-            .collect::<Result<Vec<_>>>()
-    }
+    // `list_audit_events` (previously reading a `workflow_audit_log` table that
+    // NO migration has ever created — `to_regclass` is NULL on the live
+    // database and on a freshly migrated one) was dead code and has been
+    // removed, along with its `AuditEventRow`. It had zero callers
+    // workspace-wide, which is the only reason a statement that cannot
+    // PREPARE sat here unnoticed. Same disposition, and the same sentence,
+    // as the `actor_memories` pair in `talos-workflow-repository`. The live
+    // per-workflow audit surface is `list_executions_for_audit` below plus
+    // `audit_events` / `admin_event_log`; there is no workflow-scoped audit
+    // table to revive this against.
 
     pub async fn list_executions_for_audit(
         &self,
@@ -5729,17 +5756,45 @@ impl AnalyticsRepository {
         };
 
         // 15. Workflows needing schema
+        //
+        // 2026-09-07: this filtered `w.status = 'published'`. The workflow
+        // lifecycle enum is `draft | active | archived` (migration
+        // 20260318000000) and `handle_list_workflows` REFUSES `published` as a
+        // filter value in so many words — "the schema has no rows with that
+        // value so accepting it would silently return an empty list" — so this
+        // check reported `workflows_needing_schema: []` and
+        // `workflows_needing_schema_count: 0` for every operator on every run.
+        //
+        // The predicate was not merely unmatched, it was SELF-CONTRADICTORY.
+        // Exactly one writer in the workspace stores `'published'`
+        // (`insert_published_internal_workflow`, used by
+        // `plan_and_execute_workflow`) and it stores `workflow_type =
+        // 'internal'` in the SAME INSERT — which the very next clause
+        // excludes. So the only rows the status clause admits are rows the
+        // type clause rejects, and the only way this returns anything is an
+        // operator manually re-typing a `plan_and_execute` orchestrator row
+        // with `set_workflow_type`. (Live fleet 2026-09-07: 0 rows at
+        // `status='published'`, 0 at `workflow_type='internal'`; the whole
+        // population is 17 active / 11 draft / 8 archived.)
+        //
+        // The predicate comes from `talos_workflow_liveness::live_sql` — the ONE
+        // home for "is this workflow live" — rather than being spelled a third
+        // time here. `live_sql` is fixed text plus a caller-authored literal
+        // alias; no user input reaches it.
         let workflows_needing_schema_fut = async {
             let fetched = sqlx::query(
-                "SELECT w.id, w.name, COUNT(e.id)::bigint AS execution_count, MAX(e.started_at) AS last_run \
+                &format!(
+                    "SELECT w.id, w.name, COUNT(e.id)::bigint AS execution_count, MAX(e.started_at) AS last_run \
              FROM workflows w \
              JOIN workflow_executions e ON e.workflow_id = w.id AND e.status = 'completed' \
-             WHERE w.user_id = $1 AND w.status = 'published' \
+             WHERE w.user_id = $1 AND {live} \
                AND (w.workflow_type IS NULL OR w.workflow_type NOT IN ('test', 'internal')) \
                AND w.input_schema IS NULL \
              GROUP BY w.id, w.name \
              HAVING COUNT(e.id) >= 1 \
              ORDER BY COUNT(e.id) DESC LIMIT 20",
+                    live = talos_workflow_liveness::live_sql(Some("w")),
+                ),
             )
             .bind(user_id)
             .fetch_all(&self.db_pool)

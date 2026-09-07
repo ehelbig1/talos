@@ -430,6 +430,13 @@ pub async fn diagnose_failures(
     // put two different populations in one report under one label. If this is
     // ever revived: label the column `dispatches`, or aggregate
     // `COUNT(DISTINCT workflow_execution_id)` instead, and say which you chose.
+    // allow-unpreparable-sql: `module_executions` has no `node_label` and no
+    // `node_id`, so this statement cannot PREPARE — deliberately, and the
+    // paragraph above is the whole reason. `diagnose_failures` has zero callers
+    // workspace-wide; the statement is KEPT rather than deleted because the
+    // trap it documents (COUNT(*) here is DISPATCHES, not runs) is the thing a
+    // future reviver must read before adding the column. Reviving it means
+    // fixing the statement AND removing this marker.
     let node_failures: Vec<(String, i64, i64)> = sqlx::query_as(
         "SELECT COALESCE(node_label, node_id::text), COUNT(*), \
          COUNT(*) FILTER (WHERE status = 'failed') \

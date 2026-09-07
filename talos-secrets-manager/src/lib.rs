@@ -7,7 +7,6 @@
 //!   AES-GCM wrap/unwrap of DEKs),
 //! * [`vault_kek_provider::VaultTransitProvider`] (HashiCorp Vault Transit
 //!   wrap/unwrap),
-//! * [`kek_rewrap`] (Phase 4 dual-wrap soak helpers).
 //!
 //! Two pieces stay in the controller crate because they pull in transport
 //! / domain concerns this crate intentionally avoids:
@@ -24,7 +23,19 @@
 pub mod errors;
 pub mod integration_state_crypto;
 pub mod kek_provider;
-pub mod kek_rewrap;
+// `kek_rewrap` (Phase 3/4 of the KEK→KMS migration) was REMOVED 2026-09-07,
+// together with the `rewrap_deks_to_vault` and `verify_v2_decryptable`
+// examples that drove it. All three read or wrote
+// `encryption_keys.encrypted_key_v2`, and migration
+// `20260424030000_encryption_keys_drop_legacy_phase_5.sql` — which is FOLDED
+// INTO THE SCHEMA BASELINE (cutpoint 20260705130000), so every database this
+// repository can produce already has it — dropped the legacy column and
+// RENAMED `encrypted_key_v2` back to `encrypted_key`. So every statement in
+// that module failed to PREPARE ("column encrypted_key_v2 does not exist") on
+// any database it could ever be pointed at, and the Phase-5 migration's own
+// abort message told the operator to run a tool that could no longer run.
+// That migration said "Codepath collapses back to single-column SQL after this
+// rename"; this is that collapse, three phases late.
 pub mod provider;
 pub mod vault_kek_provider;
 

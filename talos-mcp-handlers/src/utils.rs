@@ -358,6 +358,12 @@ pub fn orchestration_error_to_response(
         E::WorkflowDisabled(_) => {
             "Workflow is disabled. Use enable_workflow to re-enable.".to_string()
         }
+        // ONE sentence per reason, from the same home the gate read the reason
+        // from, so `trigger_workflow` / `bulk_trigger_workflow` /
+        // `enqueue_workflow` cannot describe one state three ways.
+        E::WorkflowNotLive(_, reason) => {
+            talos_workflow_repository::not_dispatchable_message(reason)
+        }
         E::WorkflowNotFound(_) => "Workflow not found or access denied".to_string(),
         E::ExecutionNotFound(_) => "Execution not found or access denied".to_string(),
         // ARCHIVED is not ABSENT: the row exists and the caller may see it,

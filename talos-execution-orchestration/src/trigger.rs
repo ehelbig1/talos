@@ -200,8 +200,14 @@ impl ExecutionOrchestrationService {
             .await
             .map_err(OrchestrationError::Internal)?
             .ok_or(OrchestrationError::WorkflowNotFound(workflow_id))?;
-        if !wf_record.is_enabled {
-            return Err(OrchestrationError::WorkflowDisabled(workflow_id));
+        // 2026-09-07: this was `if !wf_record.is_enabled`, i.e. HALF the
+        // liveness rule — an ARCHIVED workflow (which archiving leaves
+        // `is_enabled = true`) was dispatchable here, and the two sibling
+        // entry points `bulk_trigger_workflow` / `enqueue_workflow` applied
+        // no predicate at all. One shared decision now, so the three cannot
+        // disagree about what "live" means.
+        if let Some(reason) = wf_record.not_dispatchable_reason() {
+            return Err(OrchestrationError::WorkflowNotLive(workflow_id, reason));
         }
 
         // 3. Active-version graph load.
