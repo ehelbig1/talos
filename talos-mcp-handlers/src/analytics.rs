@@ -7755,11 +7755,75 @@ async fn handle_get_readiness_breakdown(
         .as_ref()
         .map(|s| s.unreadable_parents().to_vec())
         .unwrap_or_default();
+
+    // RFC 0012 P2. If this workflow IS somebody's child, the child-run ledger
+    // is the only table that can measure its reliability and freshness, so it
+    // is read — ONE batched call over ONE candidate. A read FAILURE leaves
+    // `ledger: None` on the basis, which renders "the ledger was NOT
+    // consulted"; it must never collapse into "0 runs", and the `Readings`
+    // ledger records it either way.
+    let ledger_evidence = if child_scan
+        .as_ref()
+        .is_some_and(|s| !s.parents_of(wf_id).is_empty())
+    {
+        readings
+            .record(
+                "score_basis.ledger",
+                state
+                    .analytics_repo
+                    .child_ledger_evidence_for(user_id, &[wf_id], chrono::Utc::now())
+                    .await,
+            )
+            .and_then(|m| m.get(&wf_id).copied())
+    } else {
+        None
+    };
     let basis = child_scan.as_ref().map_or(
         talos_analytics_repository::ReadinessBasis::FullScale,
-        |scan| talos_analytics_repository::ReadinessBasis::from_scan(scan, wf_id),
+        |scan| {
+            talos_analytics_repository::ReadinessBasis::from_scan_with_ledger(
+                scan,
+                wf_id,
+                ledger_evidence,
+            )
+        },
     );
     let is_child = basis.is_parent_dispatched();
+    // The two execution-derived components come from the LEDGER when it can
+    // measure them, and from `workflow_executions` otherwise. Same shared
+    // `compute_*_score` functions on both paths — the INPUT moves, the
+    // arithmetic does not.
+    let (reliability, freshness) = match basis.ledger() {
+        Some(ev) if basis.max_points() == talos_analytics_repository::FULL_MAX && is_child => {
+            ev.components(chrono::Utc::now())
+        }
+        _ => (reliability, freshness),
+    };
+    let ledger_measured = is_child && basis.max_points() == talos_analytics_repository::FULL_MAX;
+    // A child scored on the ledger MUST render the ledger's own run count,
+    // success rate and last-run time — not `workflow_executions`' zeroes.
+    // Emitting a reliability score of 15 beside `executions_30d: 0` is the
+    // report contradicting itself, which is the class this phase is in.
+    let ledger_now = chrono::Utc::now();
+    let (shown_runs, shown_success_rate, shown_last_run, shown_days_since, component_source) =
+        match basis.ledger() {
+            Some(ev) if ledger_measured => (
+                ev.runs,
+                ev.success_rate(),
+                ev.last_started_at,
+                ev.last_started_at
+                    .map(|t| ledger_now.signed_duration_since(t).num_days()),
+                "sub_workflow_runs",
+            ),
+            _ => (
+                exec_count,
+                success_rate,
+                last_exec_at,
+                days_since_last,
+                "workflow_executions",
+            ),
+        };
+    let unmeasurable_child = is_child && !ledger_measured;
     let outcome = talos_analytics_repository::score_readiness(
         talos_analytics_repository::ReadinessComponents {
             reliability,
@@ -7804,7 +7868,7 @@ async fn handle_get_readiness_breakdown(
     // workflow with 5 runs at 60% was told only to "run it more" and
     // `total_points_available` understated its real gap by 5n(1−s). Both arms
     // now fire, and both derive their points from the score's own formula.
-    if is_child {
+    if unmeasurable_child {
         // Every advice line below is derived from `exec_count` / `freshness`,
         // both of which are 0 here BY CONSTRUCTION. "Execute the workflow at
         // least once to establish reliability baseline" addressed to the
@@ -7963,17 +8027,23 @@ async fn handle_get_readiness_breakdown(
             },
             "components": {
                 "reliability": {
-                    "score": if is_child { serde_json::Value::Null } else { serde_json::json!(reliability.round() as i32) },
-                    "max": if is_child { serde_json::Value::Null } else { serde_json::json!(50) },
-                    "weight": if is_child { "excluded" } else { "50%" },
+                    "score": if unmeasurable_child { serde_json::Value::Null } else { serde_json::json!(reliability.round() as i32) },
+                    "max": if unmeasurable_child { serde_json::Value::Null } else { serde_json::json!(50) },
+                    "weight": if unmeasurable_child { "excluded" } else { "50%" },
                     "detail": {
-                        "executions_30d": if is_child { serde_json::Value::Null } else { serde_json::json!(exec_count) },
+                        "executions_30d": if unmeasurable_child { serde_json::Value::Null } else { serde_json::json!(shown_runs) },
+                        // WHICH table these numbers came from. A child scored
+                        // on the ledger and a top-level workflow scored on
+                        // `workflow_executions` are on one scale but are not
+                        // the same measurement, and a reader comparing them
+                        // must be able to see that.
+                        "source": if unmeasurable_child { serde_json::Value::Null } else { serde_json::json!(component_source) },
                         // MCP-111 (2026-05-08): replace ad-hoc rounding
                         // with the canonical `format_percent` helper used
                         // platform-wide post-MCP-19. The input is a 0-1
                         // fraction, so multiply by 100 first.
-                        "success_rate": if is_child { serde_json::Value::Null } else {
-                            serde_json::json!(success_rate
+                        "success_rate": if unmeasurable_child { serde_json::Value::Null } else {
+                            serde_json::json!(shown_success_rate
                                 .map(|r| talos_analytics_repository::format_percent(r * 100.0)))
                         },
                         "saturation_runs": 10,
@@ -7991,12 +8061,13 @@ async fn handle_get_readiness_breakdown(
                     }
                 },
                 "freshness": {
-                    "score": if is_child { serde_json::Value::Null } else { serde_json::json!(freshness.round() as i32) },
-                    "max": if is_child { serde_json::Value::Null } else { serde_json::json!(20) },
-                    "weight": if is_child { "excluded" } else { "20%" },
+                    "score": if unmeasurable_child { serde_json::Value::Null } else { serde_json::json!(freshness.round() as i32) },
+                    "max": if unmeasurable_child { serde_json::Value::Null } else { serde_json::json!(20) },
+                    "weight": if unmeasurable_child { "excluded" } else { "20%" },
                     "detail": {
-                        "last_executed": if is_child { serde_json::Value::Null } else { serde_json::json!(last_exec_at.map(|t| t.to_rfc3339())) },
-                        "days_since_last_execution": if is_child { serde_json::Value::Null } else { serde_json::json!(days_since_last) },
+                        "last_executed": if unmeasurable_child { serde_json::Value::Null } else { serde_json::json!(shown_last_run.map(|t| t.to_rfc3339())) },
+                        "days_since_last_execution": if unmeasurable_child { serde_json::Value::Null } else { serde_json::json!(shown_days_since) },
+                        "source": if unmeasurable_child { serde_json::Value::Null } else { serde_json::json!(component_source) },
                     }
                 },
                 "risk": {
@@ -8021,14 +8092,38 @@ async fn handle_get_readiness_breakdown(
     // the rule `__degraded_inputs__` and `Readings::attach` already follow.
     if is_child {
         result["score"]["basis"] = serde_json::json!(outcome.basis.as_str());
-        result["score"]["comparable_to_fleet"] = serde_json::json!(false);
+        result["score"]["comparable_to_fleet"] = serde_json::json!(outcome.comparable_to_fleet());
         result["score"]["unmeasured_components"] = serde_json::json!(outcome.unmeasured);
         result["score"]["runs_as_child_of"] = serde_json::json!(outcome.basis.parents());
         result["score"]["basis_note"] = serde_json::json!(outcome.note());
-        for component in talos_analytics_repository::readiness_basis::EXECUTION_DERIVED_COMPONENTS {
-            result["components"][*component]["measured"] = serde_json::json!(false);
-            result["components"][*component]["unmeasured_reason"] =
-                serde_json::json!(talos_analytics_repository::CHILD_UNMEASURED_REASON);
+        // RFC 0012 P2: the ledger's own numbers, on EITHER child basis. Below
+        // the floor they are what says how far below; at or above it they are
+        // what the two execution components were computed from. `ledger_since`
+        // travels with the count on both, because a count without the floor
+        // cannot be told apart from the period nobody was recording.
+        if let Some(ev) = outcome.basis.ledger() {
+            result["score"]["ledger_runs"] = serde_json::json!(ev.runs);
+            result["score"]["ledger_failed_runs"] = serde_json::json!(ev.failed);
+            result["score"]["ledger_since"] =
+                serde_json::json!(ev.ledger_since.map(|t| t.to_rfc3339()));
+            result["score"]["ledger_min_runs"] =
+                serde_json::json!(talos_analytics_repository::LEDGER_MIN_RUNS);
+            result["score"]["ledger_note"] = serde_json::json!(ev.disclosure());
+        } else {
+            result["score"]["ledger_read"] = serde_json::json!("failed");
+        }
+        result["score"]["unrecorded_dispatch_kinds"] =
+            serde_json::json!(talos_child_run_ledger::UNRECORDED_DISPATCH_KINDS);
+        result["score"]["unrecorded_dispatch_kinds_note"] =
+            serde_json::json!(talos_child_run_ledger::UNRECORDED_DISPATCH_KINDS_NOTE);
+        if unmeasurable_child {
+            for component in
+                talos_analytics_repository::readiness_basis::EXECUTION_DERIVED_COMPONENTS
+            {
+                result["components"][*component]["measured"] = serde_json::json!(false);
+                result["components"][*component]["unmeasured_reason"] =
+                    serde_json::json!(talos_analytics_repository::CHILD_UNMEASURED_REASON);
+            }
         }
     }
     if !unreadable_parents.is_empty() {
@@ -8089,6 +8184,15 @@ pub(crate) struct ChildScoreExclusion {
     /// Parents whose graph could not be read at all. A workflow one of them
     /// dispatches into is scored — and counted — on the full scale.
     pub unreadable_parents: Vec<String>,
+    /// Children the child-run ledger COULD measure (RFC 0012 P2). These are on
+    /// the fleet scale and are deliberately NOT excluded from `below_50_count`
+    /// — named here so an operator can see which children moved and why the
+    /// exclusion list is shorter than the child list.
+    pub ledger_measured: Vec<String>,
+    /// False when the batched ledger read FAILED. Every child then falls back
+    /// to the 30-point basis, which is the pre-P2 answer and the conservative
+    /// direction — but it is a fallback, not a measurement, so it is stated.
+    pub ledger_read: bool,
 }
 
 pub(crate) fn readiness_summary_json(
@@ -8117,6 +8221,26 @@ pub(crate) fn readiness_summary_json(
                     "complete": exclusion.complete,
                     "unreadable_parent_graphs": exclusion.unreadable_parents,
                     "why": talos_analytics_repository::CHILD_UNMEASURED_REASON,
+                    // RFC 0012 P2.
+                    "ledger_measured_children": exclusion.ledger_measured,
+                    "ledger_measured_count": exclusion.ledger_measured.len(),
+                    "ledger_read": exclusion.ledger_read,
+                    "ledger_min_runs": talos_analytics_repository::LEDGER_MIN_RUNS,
+                    "ledger_note": if exclusion.ledger_read {
+                        format!(
+                            "A child with at least {} recorded runs in the window is scored from \
+                             the child-run ledger on the FULL 100-point scale and is NOT excluded \
+                             from below_50_count — it is comparable to the fleet. Below that \
+                             floor it stays on the {}-point basis and IS excluded.",
+                            talos_analytics_repository::LEDGER_MIN_RUNS,
+                            talos_analytics_repository::CHILD_MEASURABLE_MAX,
+                        )
+                    } else {
+                        "The child-run ledger could NOT be read, so every child here is scored \
+                         and excluded on the measurable-components basis. That is the \
+                         pre-RFC-0012-P2 answer, not a measurement."
+                            .to_string()
+                    },
                 },
                 "population": format!(
                     "all workflows matching the request filters, uncapped. \
@@ -8262,6 +8386,30 @@ async fn handle_get_all_readiness_scores(
             .scan_child_parents_for(user_id, &page_ids)
             .await,
     );
+    // RFC 0012 P2. ONE batched ledger read for the page's CHILDREN — not one
+    // per row, and not for rows nothing dispatches into. A read failure leaves
+    // the map empty, which renders every child on the pre-P2 30-point basis
+    // (the conservative direction) and is disclosed by the `Readings` ledger.
+    let child_ids: Vec<uuid::Uuid> = child_scan.as_ref().map_or_else(Vec::new, |scan| {
+        rows.iter()
+            .filter(|r| !scan.parents_of(r.id).is_empty())
+            .map(|r| r.id)
+            .collect()
+    });
+    let ledger_now = chrono::Utc::now();
+    let ledger_evidence = if child_ids.is_empty() {
+        // NOTHING TO SAY ⇒ NO READ. A page with no children must not pay for a
+        // query, and an empty map here means exactly the same thing.
+        Some(std::collections::HashMap::new())
+    } else {
+        readings.record(
+            "summary.child_workflow_exclusion.ledger",
+            state
+                .analytics_repo
+                .child_ledger_evidence_for(user_id, &child_ids, ledger_now)
+                .await,
+        )
+    };
     let mut exclusion = ChildScoreExclusion {
         measured: child_scan.is_some(),
         complete: true,
@@ -8270,6 +8418,8 @@ async fn handle_get_all_readiness_scores(
             .map(|s| s.unreadable_parents().to_vec())
             .unwrap_or_default(),
         excluded: Vec::new(),
+        ledger_measured: Vec::new(),
+        ledger_read: ledger_evidence.is_some(),
     };
     if let Some(scan) = child_scan.as_ref() {
         let page_scores: Vec<i32> = rows
@@ -8282,8 +8432,25 @@ async fn handle_get_all_readiness_scores(
             talos_analytics_repository::READINESS_PAGE_LIMIT,
         );
         for r in &rows {
-            if !scan.parents_of(r.id).is_empty() && r.readiness_score.unwrap_or(0) < 50 {
+            let basis = talos_analytics_repository::ReadinessBasis::from_scan_with_ledger(
+                scan,
+                r.id,
+                ledger_evidence.as_ref().and_then(|m| m.get(&r.id).copied()),
+            );
+            // The exclusion follows the BASIS, not child-ness. A
+            // ledger-measured child is scored out of 100 like everything else,
+            // so excluding it would hide the platform's most-used
+            // sub-workflows from the one count that would notice them
+            // degrading — the same defect as counting an unmeasurable one, in
+            // the other direction.
+            if basis.is_unmeasurable_child() && r.readiness_score.unwrap_or(0) < 50 {
                 exclusion.excluded.push(r.name.clone());
+            }
+            if matches!(
+                basis,
+                talos_analytics_repository::ReadinessBasis::LedgerMeasured { .. }
+            ) {
+                exclusion.ledger_measured.push(r.name.clone());
             }
         }
     }
@@ -8298,14 +8465,21 @@ async fn handle_get_all_readiness_scores(
             // names it could not read are surfaced in the summary instead.
             let basis = child_scan.as_ref().map_or(
                 talos_analytics_repository::ReadinessBasis::FullScale,
-                |scan| talos_analytics_repository::ReadinessBasis::from_scan(scan, r.id),
+                |scan| {
+                    talos_analytics_repository::ReadinessBasis::from_scan_with_ledger(
+                        scan,
+                        r.id,
+                        ledger_evidence.as_ref().and_then(|m| m.get(&r.id).copied()),
+                    )
+                },
             );
             let is_child = basis.is_parent_dispatched();
-            let max_points = if is_child {
-                talos_analytics_repository::CHILD_MEASURABLE_MAX
-            } else {
-                talos_analytics_repository::FULL_MAX
-            };
+            // From the BASIS, not from child-ness: a ledger-measured child's
+            // STORED score was written on the 100-point scale by the hourly
+            // loop reading the same ledger, so rendering `max_possible: 30`
+            // beside it would put the two halves of one report on different
+            // scales.
+            let max_points = basis.max_points();
 
             // Single authoritative "has been scored" indicator, over BOTH
             // timestamp columns — shared by the per-row state label AND the
@@ -8356,14 +8530,30 @@ async fn handle_get_all_readiness_scores(
             };
             if is_child {
                 entry["score_basis"] = serde_json::json!(basis.as_str());
-                entry["comparable_to_fleet"] = serde_json::json!(false);
+                entry["comparable_to_fleet"] =
+                    serde_json::json!(max_points == talos_analytics_repository::FULL_MAX);
                 entry["runs_as_child_of"] = serde_json::json!(basis.parents());
+                if let Some(ev) = basis.ledger() {
+                    entry["ledger_runs"] = serde_json::json!(ev.runs);
+                    entry["ledger_since"] =
+                        serde_json::json!(ev.ledger_since.map(|t| t.to_rfc3339()));
+                }
             }
             entry["note"] = if is_child {
+                let tail = if basis.is_unmeasurable_child() {
+                    talos_analytics_repository::CHILD_UNMEASURED_REASON.to_string()
+                } else {
+                    "Reliability and freshness come from the child-run ledger \
+                     (sub_workflow_runs), so this score IS on the fleet scale."
+                        .to_string()
+                };
+                let ledger_clause = basis
+                    .ledger()
+                    .map(|ev| format!(" {}", ev.disclosure()))
+                    .unwrap_or_default();
                 serde_json::json!(format!(
-                    "{scorer_note} Scored {score}/{max_points} — dispatched by {}. {}",
+                    "{scorer_note} Scored {score}/{max_points} — dispatched by {}. {tail}{ledger_clause}",
                     basis.parents().join(", "),
-                    talos_analytics_repository::CHILD_UNMEASURED_REASON
                 ))
             } else {
                 serde_json::json!(scorer_note)
@@ -8979,6 +9169,10 @@ mod readiness_population_pins {
             complete: true,
             measured: true,
             unreadable_parents: Vec::new(),
+            // RFC 0012 P2: these tests are about the graph-derived exclusion,
+            // so the ledger read SUCCEEDED and measured nobody.
+            ledger_measured: Vec::new(),
+            ledger_read: true,
         }
     }
 
@@ -9039,6 +9233,10 @@ mod readiness_population_pins {
             complete: true,
             measured: true,
             unreadable_parents: Vec::new(),
+            // RFC 0012 P2: these tests are about the graph-derived exclusion,
+            // so the ledger read SUCCEEDED and measured nobody.
+            ledger_measured: Vec::new(),
+            ledger_read: true,
         };
         let v = readiness_summary_json(Some(&pop(28, Some(60.0), 5, 0)), &exclusion);
         assert_eq!(v["below_50_count"], serde_json::json!(3), "5 − 2 children");
@@ -9063,6 +9261,10 @@ mod readiness_population_pins {
             complete: true,
             measured: false,
             unreadable_parents: Vec::new(),
+            // RFC 0012 P2: these tests are about the graph-derived exclusion,
+            // so the ledger read SUCCEEDED and measured nobody.
+            ledger_measured: Vec::new(),
+            ledger_read: true,
         };
         let v = readiness_summary_json(Some(&pop(28, Some(60.0), 5, 0)), &exclusion);
         assert_eq!(v["below_50_count"], serde_json::json!(5));
@@ -9083,6 +9285,10 @@ mod readiness_population_pins {
             complete: false,
             measured: true,
             unreadable_parents: vec!["enormous-parent".into()],
+            // RFC 0012 P2: these tests are about the graph-derived exclusion,
+            // so the ledger read SUCCEEDED and measured nobody.
+            ledger_measured: Vec::new(),
+            ledger_read: true,
         };
         let v = readiness_summary_json(Some(&pop(400, Some(20.0), 300, 0)), &exclusion);
         assert_eq!(
@@ -9106,6 +9312,10 @@ mod readiness_population_pins {
             complete: true,
             measured: true,
             unreadable_parents: Vec::new(),
+            // RFC 0012 P2: these tests are about the graph-derived exclusion,
+            // so the ledger read SUCCEEDED and measured nobody.
+            ledger_measured: Vec::new(),
+            ledger_read: true,
         };
         let v = readiness_summary_json(Some(&pop(28, Some(60.0), 5, 0)), &exclusion);
         assert_eq!(v["avg_score"], serde_json::json!(60.0));

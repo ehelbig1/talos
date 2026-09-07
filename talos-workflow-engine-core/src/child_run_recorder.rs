@@ -35,14 +35,21 @@ use uuid::Uuid;
 /// `execute_subworkflow_graph`, so every variant has a live writer and the
 /// table's CHECK constraint admits no value nothing writes.
 ///
-/// `agent_loop` / `react_loop` (the per-iteration body) and `dispatch` /
-/// `capability_dispatch` hydrate a child engine through a DIFFERENT site
+/// **RFC 0012 P2 closed the four-kind gap P1 recorded.** `dispatch` /
+/// `capability_dispatch` (`run_dispatched_subworkflow`) and the per-iteration
+/// `agent_loop` / `react_loop` body hydrate a child engine at a DIFFERENT site
 /// (`AdapterSet::into_engine_with_graph` called directly in
-/// `scheduler_handlers.rs`) and are deliberately NOT represented: P1 does not
-/// record them, and admitting a variant with no writer would make "this child
-/// has no rows" mean two different things with nothing to tell them apart.
-/// They are named in `talos_child_run_ledger::UNRECORDED_DISPATCH_KINDS` and
-/// disclosed by every consumer instead.
+/// `scheduler_handlers.rs`), so P1 could not see them; they now route through
+/// the same `ChildRunReporter` and are recorded. The rule that admitted only
+/// five variants still holds and is why the other four were added ONLY once
+/// they had a live writer: a value nothing writes makes "this child has no
+/// rows" mean two things with nothing to tell them apart, exactly as a seeded
+/// metric label nothing increments does.
+///
+/// Adding a TENTH kind means: a variant here, its spelling in the table's
+/// CHECK (a NEW migration — never edit an applied one), and a writer. Without
+/// the writer, name it in `talos_child_run_ledger::UNRECORDED_DISPATCH_KINDS`
+/// instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ChildDispatchKind {
     /// A `sub_workflow` node.
@@ -58,6 +65,20 @@ pub enum ChildDispatchKind {
     /// An `llm_dispatch` node — the classifier, a route target, or the
     /// fallback. `child_workflow_id` says which.
     LlmDispatch,
+    /// A `dispatch` node — the workflow it resolved by id (RFC 0012 P2).
+    Dispatch,
+    /// A `capability_dispatch` node — the workflow it matched by capability
+    /// tags, or its fallback (RFC 0012 P2).
+    CapabilityDispatch,
+    /// ONE ITERATION of an `agent_loop` node's body (RFC 0012 P2). A loop that
+    /// runs five iterations records five rows, because five child runs
+    /// happened — collapsing them to one would make the ledger disagree with
+    /// the fuel and duration the same iterations produced.
+    AgentLoop,
+    /// One iteration of a `react_loop` node's body. `ReActLoop` shares
+    /// `try_dispatch_agent_loop` at runtime but is a DISTINCT authored kind,
+    /// and the ledger records which one the author wrote.
+    ReactLoop,
 }
 
 impl ChildDispatchKind {
@@ -71,6 +92,10 @@ impl ChildDispatchKind {
             Self::Ensemble => "ensemble",
             Self::ReflectiveRetry => "reflective_retry",
             Self::LlmDispatch => "llm_dispatch",
+            Self::Dispatch => "dispatch",
+            Self::CapabilityDispatch => "capability_dispatch",
+            Self::AgentLoop => "agent_loop",
+            Self::ReactLoop => "react_loop",
         }
     }
 
@@ -82,6 +107,10 @@ impl ChildDispatchKind {
         Self::Ensemble,
         Self::ReflectiveRetry,
         Self::LlmDispatch,
+        Self::Dispatch,
+        Self::CapabilityDispatch,
+        Self::AgentLoop,
+        Self::ReactLoop,
     ];
 }
 

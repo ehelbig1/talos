@@ -738,6 +738,103 @@ admits exactly the five kinds that have a writer: `agent_loop` was in the RFC's
 draft list and is deliberately absent, because a value nothing writes is the same
 defect as a seeded metric label nothing increments.
 
+**2026-09-07 — P2: the readers learn to read the ledger, and the four blind
+dispatch kinds are closed.** P1 could ANSWER "did this child run"; nothing
+asked it. Four readiness surfaces and two hygiene lists now do.
+
+**Readiness.** `ReadinessBasis` gains `LedgerMeasured`. A child with ≥
+`LEDGER_MIN_RUNS` (**3**) recorded runs in the 30-day window is scored on the
+FULL 100 with reliability = the ledger's success rate and freshness = the age
+of its newest recorded run, both through the SAME `compute_reliability_score` /
+`compute_freshness_score` the fleet uses — the INPUT moves, the arithmetic does
+not. Below the floor the child KEEPS the 30-point denominator and the shortfall
+is disclosed with the count and `ledger_since`; it is NEVER scaled up, which is
+#762's second rejected rendering and stays rejected. **Why 3, argued from
+#762's own reasoning**: 1 promotes on one observation, so a single failure
+reports reliability `0/50` as a fleet-comparable fact — the determinate
+negative in a new shape; 10 (the ramp's saturation point) keeps a child that has
+demonstrably run nine times on a denominator whose stated reason is "nothing can
+measure this"; 3 is the smallest number from which a success RATE is a rate, and
+the ramp already discounts it (a perfect child at n=3 earns 15 of 50). The floor
+protects the DENOMINATOR claim, not the arithmetic. **`ReadinessBasis::from_scan`
+was DELETED**: it had zero production callers by the end of P2 and exactly one
+behaviour — silently scoring every child on 30 — so a scorer that FORGOT the
+ledger would have been indistinguishable from one that could not READ it.
+Callers pass an explicit `Option<ChildLedgerEvidence>`; `None` STATES "not
+consulted", the same reason P1 made `ChildRunSite` an enum and not an `Option`.
+All FOUR surfaces read it — the three `score_readiness` callers plus
+`get_all_readiness_scores`, which derives `max_possible` from the basis instead
+— and the `below_50` exclusion follows the BASIS
+(`ReadinessBasis::is_unmeasurable_child`), not child-ness: a ledger-measured
+child scoring 47 is a REAL below-50 finding, and excluding it would hide the
+platform's most-used sub-workflows from the one count that would notice them
+degrading.
+
+**Hygiene.** The dormant and stale-draft child rows gain `last_child_run_at`,
+`child_runs_since_ledger` (null, never 0, before `ledger_since`) and the
+`ChildRunEvidence::note` that refutes the stale-draft list's own "never
+executed" premise. The `execution_cost_rollup` proxy is **KEPT and DEMOTED, not
+deleted**, and the reason is a measurement: it is the only thing that can speak
+for the period BEFORE the ledger's first row, which was **~11 h old against a
+30-day window** the day this shipped. Its caveat now records the number that
+supersedes it — measured 2026-09-07, the worst case is **0%** recall and not the
+~5% P1 recorded: one child whose parent ran **5085** times in 30 days (461 of
+them in 48 h) has ZERO rollup rows in the whole window and a proxy timestamp 45
+days old. Once `ledger_since` is older than the 30-day window the proxy adds
+nothing and can be removed — an operator loses nothing then, and everything
+before the floor now.
+
+**The four uncovered dispatch kinds are RECORDED, and the "different shape" the
+RFC predicted was the shape the file already used.** `dispatch` /
+`capability_dispatch` (`run_dispatched_subworkflow`) and the per-iteration
+`agent_loop` / `react_loop` body now write. `execution_id` was already in scope
+at all three reactor call sites, so threading was never the obstacle; the
+obstacle was that the loop body's `async move` captures the adapter set and NOT
+`self`. `ChildRunReporter` — a small `Clone` value carrying the recorder, the
+sanitizer, the parent workflow id, the RESOLVED node label and the depth — is
+built from `&self` and captured beside `sub_binding`, which the same function
+had been doing for the same reason since #504. **The INSERT is still in exactly
+one function**; what moved is where its inputs come from. The loop records ONE
+ROW PER ITERATION (five iterations are five child runs; folding them would make
+the ledger disagree with `iterations_run` and with the fuel those iterations
+burned), and `ReActLoop` records `react_loop` even though it shares
+`try_dispatch_agent_loop` — the ledger records what the AUTHOR wrote.
+`UNRECORDED_DISPATCH_KINDS` is now EMPTY and is **kept rather than deleted**: an
+empty list is a CLAIM, and deleting the constant removes the only place that
+claim can be contradicted when a tenth kind arrives without a writer. Migration
+`20260907020000` widens the CHECK to nine values (a NEW migration, never an edit
+of the applied one).
+
+**Cost, measured rather than assumed.** The hourly loop adds **two queries per
+USER per tick** — a cached floor read and one grouped `= ANY($1)` count over
+that user's child ids, narrowed to rows the child scan already calls somebody's
+child, so a batch with no children costs no query at all. Against a loop already
+issuing THREE queries per workflow (108 for the 36-workflow fleet) that is ~2%
+more statements. On a standalone replica carrying P1's three indexes: at 13 500
+rows (60 days at ~225 runs/day) the batched count is 0.96–1.17 ms and
+`since()` is **1.7–1.9 ms as a SEQ SCAN**; at 135 000 rows they are 9.0 ms and
+**14.4–15.5 ms**. None of the three P1 indexes leads with `started_at`, so
+`MIN(started_at)` is linear in the table — and P2 takes that read's callers from
+two to five. The migration therefore adds `(started_at)`, measured at
+**0.036–0.045 ms** (Index Only Scan) on the same 135 000 rows, i.e. ~400x, for
+one more b-tree on an append-only table.
+
+**What is NOT covered, measured rather than implied.** Deleting the `record`
+call at the tail of `run_dispatched_subworkflow` leaves every
+`talos-workflow-engine` unit test AND both ledger DB binaries GREEN — a measured
+SURVIVOR, not a hypothetical. That function is private and the loop body sits
+inside a `tokio::time::timeout`'d `async move`, so driving either needs a full
+reactor run over a graph with a `dispatch` or `agent_loop` node, which the P1
+harness does not build. What IS covered by construction is the SHARED write site
+every path now routes through: gutting `ChildRunReporter::record` turns four
+`child_run_ledger_tests` red. The reference fleet has **zero** nodes of those
+four kinds, so there is nothing to read live yet either — both halves stated
+rather than left to look like coverage. **No lint was added and `--count` stays
+86**: the candidate ("a readiness scorer must consult the ledger") has a
+production population of FOUR and the structural answer is stronger than a grep
+over them — `from_scan` no longer exists, so the forgetful spelling does not
+compile.
+
 **Two non-negotiables, recorded so nobody "fixes" them.** (1) A child run is NOT
 charged to the actor's hourly execution budget — the parent's run was budgeted
 when it was created, and `budget_precheck` counts `workflow_executions` rows,

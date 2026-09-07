@@ -14,6 +14,13 @@ serde.workspace = true
 serde_json.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-child-workflow-refs = { path = "../talos-child-workflow-refs" }
+# RFC 0012 P2. The child-run ledger is the only table that can measure a
+# sub-workflow's reliability and freshness, and this crate owns the readiness
+# BASIS that decides whether they are measurable at all. A leaf repository
+# crate depending on another leaf repository crate; it does NOT reach up into
+# the execution engine (check 51 — `talos-child-run-ledger` itself depends on
+# engine-CORE only).
+talos-child-run-ledger = { path = "../talos-child-run-ledger" }
 talos-db = { path = "../talos-db" }
 talos-measurement = { path = "../talos-measurement" }
 talos-retry-intelligence = { path = "../talos-retry-intelligence" }
