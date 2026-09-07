@@ -144,6 +144,30 @@ impl ExecutionOrchestrationService {
             None => return Err(OrchestrationError::WorkflowNotFound(workflow_id)),
         }
 
+        // 3b. The NARROW lifecycle gate (2026-09-07), the OTHER column.
+        // `is_workflow_enabled` above reads `is_enabled` and says nothing about
+        // `status`; the two have independent writers and every archived row on
+        // the reference fleet still reads `is_enabled = true`, so the check
+        // directly above would have passed a retired workflow. Replay reuses no
+        // admission gate (it mints its row elsewhere), so it carries its own.
+        match self
+            .workflow_repo
+            .dispatch_lifecycle(workflow_id, user_id)
+            .await
+            .map_err(OrchestrationError::Internal)?
+        {
+            talos_workflow_repository::WorkflowDispatchLookup::Dispatchable => {}
+            talos_workflow_repository::WorkflowDispatchLookup::Retired => {
+                talos_metrics::record_dispatch_refusal(
+                    talos_workflow_liveness::dispatch::DispatchPath::Replay,
+                );
+                return Err(OrchestrationError::WorkflowArchived(workflow_id));
+            }
+            talos_workflow_repository::WorkflowDispatchLookup::Absent => {
+                return Err(OrchestrationError::WorkflowNotFound(workflow_id))
+            }
+        }
+
         // 4. Load the workflow graph (latest draft path; matches the
         // historical replay behaviour. Active-published-version
         // preference is intentional only for retry — replay starts

@@ -110,6 +110,26 @@ pub fn global() -> Option<&'static Arc<TalosMetrics>> {
     METRICS.get()
 }
 
+/// Record an archived-workflow dispatch refusal on the process-global
+/// `talos_dispatch_refused_total{path,reason}` counter.
+///
+/// ONE increment site for the whole narrow gate: every path that classifies a
+/// workflow's lifecycle in Rust calls this, and the `path` label is a typed
+/// [`talos_workflow_liveness::dispatch::DispatchPath`] rather than a string, so
+/// a new dispatch surface cannot spell a label the constructor never seeded.
+/// Inert when metrics are not wired (unit tests, any process without
+/// `set_global`) — never unwraps, mirroring [`global`]'s contract.
+pub fn record_dispatch_refusal(path: talos_workflow_liveness::dispatch::DispatchPath) {
+    if let Some(m) = global() {
+        m.dispatch_refused_total
+            .with_label_values(&[
+                path.as_str(),
+                talos_workflow_liveness::dispatch::REFUSAL_REASON_ARCHIVED,
+            ])
+            .inc();
+    }
+}
+
 /// Record a terminal workflow-execution outcome on the process-global
 /// `talos_workflow_executions_total{status}` counter. Inert when metrics
 /// aren't wired (unit tests, any process without `set_global`) — never
@@ -1101,6 +1121,28 @@ pub struct TalosMetrics {
     /// database the enforcement path cannot reach — not a policy working as
     /// configured, which is why it is a separate label rather than folded in.
     pub rpc_write_ceiling_refusals_total: CounterVec,
+    /// Dispatches refused because the workflow is ARCHIVED — the narrow
+    /// lifecycle gate (2026-09-07). Labels: `path` (which dispatch surface
+    /// refused, from `talos_workflow_liveness::dispatch::DispatchPath`) ×
+    /// `reason` (`archived` today, and only that value has an emitter).
+    ///
+    /// A non-zero value is the policy WORKING, not a fault: an operator
+    /// archived a workflow and something still tried to run it. Nothing alerts
+    /// on it, deliberately — an alert here would train operators to ignore the
+    /// series, which is the defect the gate exists to remove. What it answers
+    /// is the question a silently-filtered dispatch cannot: *a schedule stopped
+    /// firing — is the platform refusing it, or is the scheduler broken?*
+    ///
+    /// Pre-seeded at 0 for every `(path, archived)` pair, because the healthy
+    /// steady state is zero forever and `increase(...) > 0` over an ABSENT
+    /// series matches nothing.
+    ///
+    /// It does NOT count the four sites that enforce the gate in SQL (the chain
+    /// fan-out, `resolve_by_capabilities`, `resolve_by_name`, the sub-workflow
+    /// cache prefetch). Those choose among candidates rather than refusing a
+    /// named workflow, so there is no per-request refusal to count — see
+    /// `DispatchPath`'s own doc, and CLAUDE.md's stated limit.
+    pub dispatch_refused_total: CounterVec,
     /// `ops_alerts` ingest failures from the `__ops_alert__` hook.
     /// Labels: reason=validation|db|tenancy. Sustained bump means alert
     /// envelopes emitted by parser modules are being lost.
@@ -2158,6 +2200,35 @@ impl TalosMetrics {
             }
         }
 
+        let dispatch_refused_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_dispatch_refused_total",
+                "Workflow dispatches refused because the workflow is ARCHIVED. \
+                 Labels: path (which dispatch surface refused) × reason \
+                 (archived). A non-zero value is the lifecycle gate working as \
+                 configured, NOT a fault — do NOT alert on it. It exists so a \
+                 schedule that stopped firing can be told apart from a \
+                 scheduler that stopped working. Sites that enforce the gate in \
+                 SQL (chain fan-out, capability/name resolution, the \
+                 sub-workflow cache prefetch) are NOT counted here: they choose \
+                 among candidates rather than refusing a named workflow.",
+            ),
+            &["path", "reason"],
+        )?;
+        registry.register(Box::new(dispatch_refused_total.clone()))?;
+        // Closed set, every combination has a live emitter: each `DispatchPath`
+        // variant names a site that classifies in Rust and calls
+        // `record_dispatch_refusal`, and `archived` is the only reason with an
+        // emitter. Seeded for the same reason as the ceiling counter above.
+        for path in talos_workflow_liveness::dispatch::DispatchPath::ALL {
+            dispatch_refused_total
+                .with_label_values(&[
+                    path.as_str(),
+                    talos_workflow_liveness::dispatch::REFUSAL_REASON_ARCHIVED,
+                ])
+                .inc_by(0.0);
+        }
+
         let ops_alert_ingest_failures_total = CounterVec::new(
             prometheus::Opts::new(
                 "talos_ops_alert_ingest_failures_total",
@@ -2338,6 +2409,7 @@ impl TalosMetrics {
             memory_write_failures_total,
             child_run_record_failures_total,
             rpc_write_ceiling_refusals_total,
+            dispatch_refused_total,
             ops_alert_ingest_failures_total,
             ops_alert_auto_resolved_total,
             module_payload_encryption_failures_total,
@@ -2506,6 +2578,18 @@ mod tests {
             r#"talos_rpc_write_ceiling_refusals_total{reason="policy",subject="talos.integration_state.op"} 0"#,
             r#"talos_rpc_write_ceiling_refusals_total{reason="unreadable",subject="talos.integration_state.op"} 0"#,
             r#"talos_rpc_write_ceiling_refusals_total{reason="policy",subject="talos.database.query"} 0"#,
+            r#"talos_dispatch_refused_total{path="scheduler",reason="archived"} 0"#,
+            r#"talos_dispatch_refused_total{path="webhook",reason="archived"} 0"#,
+            r#"talos_dispatch_refused_total{path="trigger",reason="archived"} 0"#,
+            r#"talos_dispatch_refused_total{path="call_workflow",reason="archived"} 0"#,
+            r#"talos_dispatch_refused_total{path="bulk_trigger",reason="archived"} 0"#,
+            r#"talos_dispatch_refused_total{path="trigger_as_actors",reason="archived"} 0"#,
+            r#"talos_dispatch_refused_total{path="enqueue",reason="archived"} 0"#,
+            r#"talos_dispatch_refused_total{path="continuation",reason="archived"} 0"#,
+            r#"talos_dispatch_refused_total{path="sub_workflow",reason="archived"} 0"#,
+            r#"talos_dispatch_refused_total{path="retry",reason="archived"} 0"#,
+            r#"talos_dispatch_refused_total{path="replay",reason="archived"} 0"#,
+            r#"talos_dispatch_refused_total{path="handoff",reason="archived"} 0"#,
             r#"talos_rpc_write_ceiling_refusals_total{reason="unreadable",subject="talos.database.query"} 0"#,
             // #767's audit-chain read-side detector. ABSENT and ZERO diverge
             // here in the sharpest possible way: the control this counts had

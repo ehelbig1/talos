@@ -29,6 +29,29 @@ use uuid::Uuid;
 
 use crate::BoxError;
 
+/// What a by-id graph read found — THREE-valued, because "the operator retired
+/// this workflow" and "there is no such workflow" are different answers and a
+/// parent node that reports the second for the first sends its author looking
+/// for a typo.
+///
+/// The narrow lifecycle gate (2026-09-07). Same shape and the same reason as
+/// `ExecutionLookup::{Live, Archived, Absent}` (#748): deliberately NO
+/// `Into<Option>`, no `graph()` accessor and no `.ok()`, so the compiler makes
+/// every consumer decide what an archived child means to it rather than
+/// letting one `unwrap_or` collapse the distinction back.
+#[derive(Debug, Clone, PartialEq)]
+#[must_use]
+pub enum GraphLookup {
+    /// The workflow is visible to this user and is not retired.
+    Found(JsonValue),
+    /// The workflow is visible to this user and `status = 'archived'`.
+    /// It exists; the platform refuses to dispatch it.
+    Archived,
+    /// No workflow with that id is visible to this user. Indistinguishable
+    /// from "not owned" BY DESIGN — see the trait's security contract.
+    Absent,
+}
+
 /// Resolve stored workflow graphs by id, scoped to a user/tenant.
 ///
 /// # Security contract
@@ -41,13 +64,14 @@ use crate::BoxError;
 /// re-check ownership on the returned graph.
 #[async_trait]
 pub trait WorkflowGraphStore: Send + Sync {
-    /// Fetch one workflow's parsed graph. Returns `Ok(None)` when no
-    /// workflow with that id is visible to `user_id`.
-    async fn get_graph(
-        &self,
-        workflow_id: Uuid,
-        user_id: Uuid,
-    ) -> Result<Option<JsonValue>, BoxError>;
+    /// Fetch one workflow's parsed graph, three-valued.
+    ///
+    /// [`GraphLookup::Archived`] is a REFUSAL, not a miss: the row is there and
+    /// the caller may not run it. An impl that cannot distinguish the two (an
+    /// in-memory test map with no lifecycle column) returns
+    /// [`GraphLookup::Absent`] for a missing id and never `Archived` — which is
+    /// honest, because it has no lifecycle to report.
+    async fn get_graph(&self, workflow_id: Uuid, user_id: Uuid) -> Result<GraphLookup, BoxError>;
 
     /// Batch-fetch parsed graphs for a set of workflow ids scoped to
     /// `user_id`. Ids that do not resolve are simply absent from the
@@ -69,7 +93,12 @@ pub trait WorkflowGraphStore: Send + Sync {
     ) -> Result<HashMap<Uuid, JsonValue>, BoxError> {
         let mut out = HashMap::with_capacity(ids.len());
         for id in ids {
-            if let Some(graph) = self.get_graph(*id, user_id).await? {
+            // An ARCHIVED child is absent from the cache, exactly as a missing
+            // one is — and that is deliberate rather than lazy. This map only
+            // WARMS a cache; a miss falls through to `get_graph`, which reports
+            // `Archived` with its own wording. Reporting the refusal here as
+            // well would give one policy two messages that could drift.
+            if let GraphLookup::Found(graph) = self.get_graph(*id, user_id).await? {
                 out.insert(*id, graph);
             }
         }

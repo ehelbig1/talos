@@ -70,13 +70,24 @@ pub async fn run_workflow_chains(
         .filter(|n| *n > 0)
         .unwrap_or(50);
 
-    let workflows = match sqlx::query_as::<_, (Uuid, String, Option<Uuid>)>(
+    // The NARROW lifecycle gate (2026-09-07), in SQL rather than classified in
+    // Rust — and the reason is the LIMIT directly below it. This is a capped
+    // FAN-OUT, not a by-id dispatch: filtering after the read would let
+    // retired workflows consume cap slots and silently displace live ones from
+    // the chain set, so the predicate has to be inside the query the cap is
+    // applied to. The consequence, stated rather than glossed: an archived
+    // workflow simply is not in the fan-out and NO per-workflow refusal is
+    // counted here (`talos_dispatch_refused_total` has no `chain` label for
+    // exactly that reason). This is also the path every Google Calendar push
+    // notification and every webhook MODULE dispatch fans out through.
+    let not_retired = talos_workflow_liveness::not_retired_sql(None);
+    let workflows = match sqlx::query_as::<_, (Uuid, String, Option<Uuid>)>(&format!(
         "SELECT id, graph_json, actor_id \
          FROM workflows \
-         WHERE user_id = $1 AND graph_json LIKE $2 \
+         WHERE user_id = $1 AND graph_json LIKE $2 AND {not_retired} \
          ORDER BY updated_at DESC, id DESC \
-         LIMIT $3",
-    )
+         LIMIT $3"
+    ))
     .bind(user_id)
     .bind(&search)
     .bind(chain_cap + 1) // +1 so we can detect cap-hit without a second query

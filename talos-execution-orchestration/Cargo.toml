@@ -29,6 +29,7 @@ talos-text-util = { path = "../talos-text-util" }
 talos-actor-repository = { path = "../talos-actor-repository" }
 talos-execution-repository = { path = "../talos-execution-repository" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
+talos-workflow-liveness = { path = "../talos-workflow-liveness" }
 
 # Talos crates — services
 talos-actor-memory-service = { path = "../talos-actor-memory-service" }

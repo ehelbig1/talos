@@ -53,6 +53,16 @@ pub enum SubflowError {
     /// surface a precise diagnostic (e.g. "judge workflow X was
     /// deleted; edit the parent to reference a valid judge").
     GraphNotFound(Uuid),
+    /// The referenced workflow EXISTS and an operator ARCHIVED it — the narrow
+    /// lifecycle gate (2026-09-07).
+    ///
+    /// Deliberately NOT folded into [`GraphNotFound`](Self::GraphNotFound):
+    /// that variant's own doc says it "typically means the referenced workflow
+    /// was deleted", which is the wrong repair for a retired one and sends the
+    /// author looking for a deletion that never happened. `missing_sub_workflow_id`
+    /// does NOT report this variant, for the same reason — the child is not
+    /// missing.
+    GraphArchived(Uuid),
     /// `build_engine_from_graph_json_with_resolver` failed — usually a module resolution issue.
     BuildFailed(String),
     /// `run_with_seed` returned an error — execution actually ran and failed.
@@ -82,6 +92,13 @@ impl SubflowError {
             }
             SubflowError::GraphNotFound(id) => {
                 format!("{} workflow {} not found", context, id)
+            }
+            SubflowError::GraphArchived(id) => {
+                format!(
+                    "{} — {}",
+                    context,
+                    talos_workflow_liveness::dispatch::archived_refusal_message(&id.to_string()),
+                )
             }
             SubflowError::BuildFailed(e) => {
                 format!("Failed to build {} workflow engine: {}", context, e)
@@ -1386,10 +1403,19 @@ impl ParallelWorkflowEngine {
             .as_ref()
             .ok_or(SubflowError::NoSecretsResolver)?;
 
-        let graph_json = self
-            .get_sub_workflow_graph(sub_wf_id, user_id)
-            .await
-            .ok_or_else(|| SubflowError::GraphNotFound(sub_wf_id))?;
+        let graph_json = match self.get_sub_workflow_graph(sub_wf_id, user_id).await {
+            talos_workflow_engine_core::GraphLookup::Found(g) => g,
+            // The narrow lifecycle gate (2026-09-07). Its own error, not
+            // `GraphNotFound`: the child EXISTS and an operator retired it, and
+            // a parent whose node says "not found" sends its author hunting a
+            // typo that is not there.
+            talos_workflow_engine_core::GraphLookup::Archived => {
+                return Err(SubflowError::GraphArchived(sub_wf_id))
+            }
+            talos_workflow_engine_core::GraphLookup::Absent => {
+                return Err(SubflowError::GraphNotFound(sub_wf_id))
+            }
+        };
 
         // Reuse the parent's adapter Arcs (Arc::clone is a refcount
         // bump per trait object — cheap). Use the *guarded* path

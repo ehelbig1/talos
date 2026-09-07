@@ -58,16 +58,38 @@
 //! mirrored rather than quietly "fixed" on one side; `rust_and_sql_agree_on_every_status`
 //! pins it.
 //!
-//! # What this crate deliberately does NOT do
+//! # It now gates execution too — the NARROW gate (2026-09-07)
 //!
-//! It does not gate execution. Measured 2026-09-07 with a scratch row (an archived
-//! workflow with an enabled schedule and an enabled webhook): the scheduler due
-//! query, the post-due workflow load, the webhook dispatch read,
-//! `resolve_by_capabilities` and `WorkflowGraphStore::get_graph` ALL return it —
-//! no execution path in this workspace filters on `workflows.status` at all.
-//! Closing that is a fleet-wide behaviour change with its own blast radius (those
-//! 4 draft schedules among them), not a report fix, and it is recorded rather
-//! than attempted.
+//! The paragraph that used to sit here recorded that NO execution path in this
+//! workspace filtered on `workflows.status`, and left it. Package 24 closed
+//! that, and only that: every dispatch read refuses a workflow whose
+//! `status = 'archived'`, through [`not_retired_sql`] / [`is_not_retired`], and
+//! changes nothing else. A DRAFT still dispatches (4 drafts on the reference
+//! fleet carry enabled schedules), and `is_enabled` keeps whatever meaning each
+//! path already gave it — [`dispatchable_sql`] is deliberately NOT the predicate
+//! used there, because it also requires `is_enabled` and the decision was
+//! archived-only.
+//!
+//! [`not_retired_sql`] and [`dispatchable_sql`] are therefore NOT
+//! interchangeable and the difference is a behaviour change, not a style
+//! choice, and NOTHING greps for a confusion between them: check 87's window
+//! looks for a LIVENESS predicate over BOTH columns, and this gate is one
+//! column, so it does not see these sites at all. What pins the difference is
+//! `not_retired_is_weaker_than_dispatchable` here, plus the DRAFT and PAUSED
+//! controls in `controller/tests/archived_dispatch_gate_tests`.
+//!
+//! # A correction to what this file used to claim
+//!
+//! The paragraph replaced here said, flatly, that *"no execution path in this
+//! workspace filters on `workflows.status` at all"*. That was wrong by one
+//! site on the day it was written:
+//! `talos_actor_repository::ActorRepository::get_workflow_graph_for_user` — the
+//! handoff dispatch read — carried `AND (status IS NULL OR status != 'archived')`
+//! in SQL. `handoff_to_actor` was therefore the ONE dispatch surface that
+//! refused an archived workflow, while REPORTING the refusal as *"Workflow not
+//! found or access denied"*, false on both clauses. An ALL-sites claim is worth
+//! only as much as the enumeration behind it, and this crate is the file a
+//! reader would trust for that claim.
 
 /// `workflows.status` for a published workflow.
 pub const STATUS_ACTIVE: &str = "active";
@@ -141,6 +163,26 @@ pub fn is_retired(status: &str) -> bool {
     status == STATUS_ARCHIVED
 }
 
+/// May the PLATFORM still dispatch this workflow — i.e. has an operator NOT
+/// retired it?
+///
+/// This is the NARROW gate (package 24, 2026-09-07) and the exact twin of
+/// [`not_retired_sql`]. It is deliberately weaker than [`is_dispatchable`]:
+/// it says nothing about `is_enabled`, because each dispatch path enforces
+/// that flag (or does not) in its own way and the archived decision was taken
+/// alone. A gate that quietly upgraded to [`is_dispatchable`] would stop four
+/// live draft schedules and every path that has never consulted `is_enabled`
+/// at all — a fleet-wide behaviour change wearing a one-word diff.
+///
+/// A DRAFT is not retired, and an UNRECOGNISED status is not retired either:
+/// the column has no CHECK constraint, and refusing to dispatch a value the
+/// reader merely does not recognise would be a determinate negative over a
+/// state it cannot represent.
+#[must_use]
+pub fn is_not_retired(status: &str) -> bool {
+    !is_retired(status)
+}
+
 /// Why a workflow is not [`is_live`], as a phrase a report can print, or `None`
 /// when it IS live.
 ///
@@ -184,6 +226,20 @@ pub fn dispatchable_sql(alias: Option<&str>) -> String {
 pub fn retired_sql(alias: Option<&str>) -> String {
     let q = qualifier(alias);
     format!("{q}status = '{STATUS_ARCHIVED}'")
+}
+
+/// Render the SQL twin of [`is_not_retired`], optionally table-qualified —
+/// the NARROW dispatch gate.
+///
+/// Spelled `<>` rather than `NOT (status = '…')` because the negated form
+/// reads as though it were NULL-safe and is not: `workflows.status` is
+/// `NOT NULL` today, so the two are equivalent, and a fragment whose
+/// correctness depends on a schema fact it does not state is one migration
+/// away from being wrong quietly.
+#[must_use]
+pub fn not_retired_sql(alias: Option<&str>) -> String {
+    let q = qualifier(alias);
+    format!("{q}status <> '{STATUS_ARCHIVED}'")
 }
 
 fn qualifier(alias: Option<&str>) -> String {
@@ -301,6 +357,80 @@ mod tests {
         }
     }
 
+    /// The NARROW gate and the DISPATCHABLE predicate are not interchangeable,
+    /// and the gap is exactly the population package 24 was told not to touch:
+    /// a paused (`is_enabled = false`) workflow is NOT dispatchable and IS
+    /// not-retired. Swapping one for the other at a gate site is a behaviour
+    /// change wearing a one-word diff, which is why they are pinned apart here
+    /// rather than left to a reviewer's eye.
+    #[test]
+    fn not_retired_is_weaker_than_dispatchable() {
+        // The whole difference: the pause axis.
+        assert!(is_not_retired(STATUS_ACTIVE));
+        assert!(!is_dispatchable(STATUS_ACTIVE, false));
+
+        // A draft dispatches under the narrow gate — 4 drafts on the reference
+        // fleet carry enabled schedules and fire today.
+        assert!(is_not_retired(STATUS_DRAFT));
+        // An unrecognised status is not retired: no CHECK constraint on the
+        // column, and refusing a value the reader merely does not recognise is
+        // a determinate negative over a state it cannot represent.
+        assert!(is_not_retired("published"));
+        // The one thing it does refuse.
+        assert!(!is_not_retired(STATUS_ARCHIVED));
+    }
+
+    /// The Rust twin and the SQL twin of the NARROW gate must agree on every
+    /// status, evaluated rather than string-compared — same standard
+    /// `rust_and_sql_agree_on_every_status` holds the other two fragments to.
+    #[test]
+    fn rust_and_sql_agree_on_the_narrow_gate() {
+        fn eval_not_retired(fragment: &str, status: &str) -> bool {
+            let lit = fragment
+                .split('\'')
+                .nth(1)
+                .expect("a quoted status literal in the fragment");
+            assert!(fragment.contains("<>"), "the narrow gate is an inequality");
+            status != lit
+        }
+        for alias in [None, Some("w")] {
+            let frag = not_retired_sql(alias);
+            for status in [
+                STATUS_ACTIVE,
+                STATUS_DRAFT,
+                STATUS_ARCHIVED,
+                "published",
+                "",
+            ] {
+                assert_eq!(
+                    eval_not_retired(&frag, status),
+                    is_not_retired(status),
+                    "not_retired_sql disagrees with is_not_retired at {status:?}"
+                );
+            }
+        }
+        assert_eq!(not_retired_sql(Some("w")), "w.status <> 'archived'");
+        assert_eq!(not_retired_sql(None), "status <> 'archived'");
+    }
+
+    /// Every seeded `path` label must be distinct and non-empty — the list is
+    /// what `talos-metrics` iterates, and a duplicate would silently collapse
+    /// two paths into one series.
+    #[test]
+    fn every_dispatch_path_label_is_distinct() {
+        use dispatch::DispatchPath;
+        let mut seen = std::collections::BTreeSet::new();
+        for p in DispatchPath::ALL {
+            assert!(!p.as_str().is_empty());
+            assert!(
+                seen.insert(p.as_str()),
+                "duplicate path label {}",
+                p.as_str()
+            );
+        }
+        assert_eq!(seen.len(), DispatchPath::ALL.len());
+    }
+
     #[test]
     fn the_rendered_sql_is_table_qualified_on_request() {
         assert_eq!(
@@ -312,5 +442,129 @@ mod tests {
             "w.status <> 'archived' AND w.is_enabled = true"
         );
         assert_eq!(retired_sql(None), "status = 'archived'");
+    }
+}
+
+/// The NARROW dispatch gate's shared vocabulary: which paths enforce it, what a
+/// refusal is called in the log, and what an operator-facing refusal says.
+///
+/// One home for all four, because the gate is applied in six crates that have
+/// no edge between them. #760's `RefusalReason` split (a log spelling and a
+/// metric spelling, paired by an exhaustive match) is the precedent; the
+/// difference here is that this crate has no dependencies, so `talos-metrics`
+/// imports [`DispatchPath::ALL`] to pre-seed the counter rather than keeping a
+/// second copy of the list. `talos_rpc_write_ceiling_refusals_total`'s own
+/// `RPC_WRITE_CEILING_SUBJECTS` doc records that it wanted exactly this and
+/// could not have it (that crate depends on `talos-metrics`, so importing
+/// would be a cycle). Here there is no cycle.
+pub mod dispatch {
+    /// `tracing` target every archived-dispatch refusal carries, so one grep
+    /// finds all six paths.
+    pub const REFUSAL_TARGET: &str = "talos_dispatch";
+
+    /// `event_kind` field on every archived-dispatch refusal line.
+    pub const REFUSAL_EVENT_KIND: &str = "dispatch_refused_archived";
+
+    /// The `reason` label on `talos_dispatch_refused_total`.
+    ///
+    /// A single-valued label would be decoration; this one is not, because the
+    /// label exists so a SECOND refusal reason (a future lifecycle value, or
+    /// the `is_enabled` axis if a later decision folds it in here) cannot be
+    /// added without deciding whether it is the same series. Only this value
+    /// has an emitter today and only this value is seeded.
+    pub const REFUSAL_REASON_ARCHIVED: &str = "archived";
+
+    /// Which dispatch path refused. The `path` label on
+    /// `talos_dispatch_refused_total`, and the closed set `talos-metrics`
+    /// pre-seeds.
+    ///
+    /// **Every variant has a LIVE increment site.** Sites that enforce the
+    /// gate in SQL instead — the chain fan-out, `resolve_by_capabilities`,
+    /// `resolve_by_name` and the sub-workflow cache prefetch — deliberately
+    /// have NO variant here: they choose among candidates rather than refusing
+    /// a named workflow, so there is no per-request refusal to count, and a
+    /// seeded label nothing increments is the defect check 58 exists for.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum DispatchPath {
+        /// `talos-scheduler`, a due schedule's fire.
+        Scheduler,
+        /// `talos-webhooks`, an inbound webhook.
+        Webhook,
+        /// `ExecutionOrchestrationService::trigger` — MCP `trigger_workflow`
+        /// and the GraphQL `triggerWorkflow` mutation.
+        Trigger,
+        /// MCP `call_workflow` (the synchronous inline-result path).
+        CallWorkflow,
+        /// MCP `bulk_trigger_workflow`.
+        BulkTrigger,
+        /// MCP `trigger_workflow_as_actors`.
+        TriggerAsActors,
+        /// MCP `enqueue_workflow` (the batch admission gate).
+        Enqueue,
+        /// `talos-continuation-trigger`, an approval/suspension resume and the
+        /// Gmail push-notification workflow branch.
+        Continuation,
+        /// `WorkflowGraphStore::get_graph` — a parent node's child graph.
+        SubWorkflow,
+        /// `talos-execution-orchestration::retry`.
+        Retry,
+        /// `talos-execution-orchestration::replay`.
+        Replay,
+        /// `talos-actor-lifecycle-service::handoff`.
+        Handoff,
+    }
+
+    impl DispatchPath {
+        /// The complete, closed set — what `talos-metrics` seeds.
+        pub const ALL: [DispatchPath; 12] = [
+            DispatchPath::Scheduler,
+            DispatchPath::Webhook,
+            DispatchPath::Trigger,
+            DispatchPath::CallWorkflow,
+            DispatchPath::BulkTrigger,
+            DispatchPath::TriggerAsActors,
+            DispatchPath::Enqueue,
+            DispatchPath::Continuation,
+            DispatchPath::SubWorkflow,
+            DispatchPath::Retry,
+            DispatchPath::Replay,
+            DispatchPath::Handoff,
+        ];
+
+        /// The `path` label value.
+        #[must_use]
+        pub fn as_str(self) -> &'static str {
+            match self {
+                Self::Scheduler => "scheduler",
+                Self::Webhook => "webhook",
+                Self::Trigger => "trigger",
+                Self::CallWorkflow => "call_workflow",
+                Self::BulkTrigger => "bulk_trigger",
+                Self::TriggerAsActors => "trigger_as_actors",
+                Self::Enqueue => "enqueue",
+                Self::Continuation => "continuation",
+                Self::SubWorkflow => "sub_workflow",
+                Self::Retry => "retry",
+                Self::Replay => "replay",
+                Self::Handoff => "handoff",
+            }
+        }
+    }
+
+    /// What an AUTHENTICATED, operator-facing surface says when the gate
+    /// refuses. One wording, so six crates cannot describe one policy six ways.
+    ///
+    /// Deliberately NOT used on the inbound-webhook path: that caller is not
+    /// the operator, and telling it "this workflow is archived" hands an
+    /// existence oracle to anyone who can guess a trigger id. The webhook
+    /// answers exactly what it answers for a workflow that is not there, and
+    /// the distinction is kept for the operator in the log and the counter —
+    /// the same split `caller_facing_unauthorized` makes.
+    #[must_use]
+    pub fn archived_refusal_message(workflow_id: &str) -> String {
+        format!(
+            "Workflow {workflow_id} is archived and will not be dispatched. \
+             Un-archive it (set status back to 'active') to run it again."
+        )
     }
 }

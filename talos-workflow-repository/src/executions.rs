@@ -43,6 +43,30 @@ pub enum ConcurrencyAdmission {
         limit: i64,
         count: i64,
     },
+    /// The workflow is ARCHIVED. No row was written.
+    ///
+    /// The NARROW lifecycle gate (2026-09-07). `workflows.status` and
+    /// `workflows.is_enabled` are two columns for one fact and neither writer
+    /// touches the other's, so every archived row on the reference fleet still
+    /// reads `is_enabled = true` — an archived workflow was admitted by every
+    /// gate this function has. The check is FOLDED INTO the `FOR UPDATE` read
+    /// below rather than added as a second statement, so it costs no query and
+    /// is atomic with the INSERT it guards.
+    ///
+    /// **A new variant is the point.** This enum is matched exhaustively at
+    /// seven dispatch surfaces (scheduler, webhook, `trigger_workflow`,
+    /// `call_workflow`, `bulk_trigger_workflow`, `trigger_workflow_as_actors`,
+    /// `enqueue_workflow`); adding a variant makes the compiler ask each of
+    /// them how it renders the refusal, which is how `WorkflowDeleteOutcome`
+    /// forced its three call sites to notice a new refusal in #758. A boolean
+    /// or a silent `LimitReached` would have been forgettable.
+    ///
+    /// It does NOT subsume the per-path gates: `run_workflow_chains`, the
+    /// sub-workflow child dispatch, the continuation/resume trigger and
+    /// `retry`/`replay` mint their execution rows elsewhere or mint none at
+    /// all, so each carries its own. This is the backstop for the seven that
+    /// pass through here.
+    WorkflowArchived,
 }
 
 /// Render the human-facing message for a
@@ -95,6 +119,19 @@ pub struct BatchAdmission {
     /// In-flight count observed inside the transaction
     /// (running + queued + pending). 0 when no cap is configured.
     pub running: i64,
+    /// The workflow is ARCHIVED, so NOTHING was admitted — the narrow
+    /// lifecycle gate (2026-09-07), folded into the same `FOR UPDATE` read as
+    /// the cap so it costs no query.
+    ///
+    /// A field rather than a new return type, and the reason is that
+    /// `inserted == 0` ALREADY refuses: nothing is written either way, so a
+    /// caller that ignores this flag still admits nothing. What the flag buys
+    /// is the caller being able to say WHY, instead of reporting a retired
+    /// workflow as one whose concurrency cap is full — which invites a retry
+    /// that can never succeed. (Contrast `ConcurrencyAdmission::WorkflowArchived`,
+    /// which IS a new variant, because there `Created` and `LimitReached` are
+    /// different outcomes and a forgotten arm would have dispatched.)
+    pub archived: bool,
 }
 
 /// Pure helper extracted for unit-testing the cap math without a
@@ -619,14 +656,27 @@ impl WorkflowRepository {
         // workflow row vanished between the caller's validation and
         // here, we'd rather fail closed than INSERT against a missing
         // FK target.
-        let max_concurrent: Option<i32> = sqlx::query_scalar(
-            "SELECT max_concurrent_executions FROM workflows \
+        //
+        // `status` rides along on the SAME read (see
+        // `ConcurrencyAdmission::WorkflowArchived`): the lifecycle gate costs
+        // no extra query and is decided under the same row lock as the cap.
+        let (max_concurrent, status): (Option<i32>, String) = sqlx::query_as(
+            "SELECT max_concurrent_executions, status FROM workflows \
              WHERE id = $1 AND user_id = $2 FOR UPDATE",
         )
         .bind(workflow_id)
         .bind(user_id)
         .fetch_one(&mut *tx)
         .await?;
+
+        // The NARROW lifecycle gate. Refused BEFORE the parent-lineage and
+        // concurrency checks because it is the cheapest and the most
+        // categorical: a retired workflow's admission cannot be repaired by
+        // waiting, which is what `LimitReached` invites the caller to do.
+        if !talos_workflow_liveness::is_not_retired(&status) {
+            tx.rollback().await?;
+            return Ok(ConcurrencyAdmission::WorkflowArchived);
+        }
 
         // T5-N3 / T7-N1: if a parent_execution_id is provided, verify
         // it belongs to the same user. Audit lineage stays scoped to
@@ -721,20 +771,32 @@ impl WorkflowRepository {
                 inserted: 0,
                 limit: None,
                 running: 0,
+                archived: false,
             });
         }
         let mut tx = self.db_pool.begin().await?;
 
         // Lock the workflow row so concurrent enqueues against the same
         // workflow can't both pass the cap check and then both insert.
-        let max_concurrent: Option<i32> = sqlx::query_scalar(
-            "SELECT max_concurrent_executions FROM workflows \
+        // `status` rides along on the same read — see `BatchAdmission::archived`.
+        let (max_concurrent, status): (Option<i32>, String) = sqlx::query_as(
+            "SELECT max_concurrent_executions, status FROM workflows \
              WHERE id = $1 AND user_id = $2 FOR UPDATE",
         )
         .bind(wf_id)
         .bind(user_id)
         .fetch_one(&mut *tx)
         .await?;
+
+        if !talos_workflow_liveness::is_not_retired(&status) {
+            tx.rollback().await?;
+            return Ok(BatchAdmission {
+                inserted: 0,
+                limit: max_concurrent,
+                running: 0,
+                archived: true,
+            });
+        }
 
         let running: i64 = if max_concurrent.is_some() {
             sqlx::query_scalar(
@@ -756,6 +818,7 @@ impl WorkflowRepository {
                 inserted: 0,
                 limit: max_concurrent,
                 running,
+                archived: false,
             });
         }
 
@@ -798,6 +861,7 @@ impl WorkflowRepository {
             inserted: admit_count,
             limit: max_concurrent,
             running,
+            archived: false,
         })
     }
 

@@ -175,7 +175,7 @@ pub use edge::EdgeLogic;
 pub use egress_scope::EgressScope;
 pub use event_sink::{EventSink, NodeEventWrite};
 pub use expression::ExpressionEvaluator;
-pub use graph_store::WorkflowGraphStore;
+pub use graph_store::{GraphLookup, WorkflowGraphStore};
 pub use judge_score_recorder::JudgeScoreRecorder;
 pub use llm_tier::LlmTier;
 pub use memory_freshness::MemoryFreshnessResolver;

@@ -114,9 +114,14 @@ pub async fn trigger_continuation_workflow(
     // of silently elevated privilege.
     let actor_repo = Arc::new(ActorRepository::new(db_pool.clone()));
     let workflow_repo_for_auth = Arc::new(WorkflowRepository::new(db_pool.clone()));
-    let workflow_row: Option<(Option<Uuid>, String)> =
-        match sqlx::query_as::<_, (Option<Uuid>, String)>(
-            "SELECT actor_id, graph_json FROM workflows WHERE id = $1 AND user_id = $2",
+    // `status` rides along on the SAME read — the NARROW lifecycle gate
+    // (2026-09-07). This path mints no execution row through
+    // `create_execution_under_concurrency_limit`, so the admission backstop
+    // cannot see it and it carries its own; classified rather than filtered in
+    // SQL so an archived workflow is not reported as one the user cannot see.
+    let workflow_row: Option<(Option<Uuid>, String, String)> =
+        match sqlx::query_as::<_, (Option<Uuid>, String, String)>(
+            "SELECT actor_id, graph_json, status FROM workflows WHERE id = $1 AND user_id = $2",
         )
         .bind(workflow_id)
         .bind(user_id)
@@ -135,7 +140,7 @@ pub async fn trigger_continuation_workflow(
                 return None;
             }
         };
-    let (workflow_actor_id, graph_json) = match workflow_row {
+    let (workflow_actor_id, graph_json, workflow_status) = match workflow_row {
         Some(row) => row,
         None => {
             tracing::warn!(
@@ -147,6 +152,25 @@ pub async fn trigger_continuation_workflow(
             return None;
         }
     };
+    // The NARROW lifecycle gate. It sits ABOVE the authorization gate for the
+    // same reason the not-visible arm does: it is the cheapest refusal and the
+    // most categorical. This path covers approval-gate resumes, suspension
+    // resumes AND the Gmail push-notification workflow branch
+    // (`talos_gmail::dispatch::dispatch_to_workflow`), which reaches a stored
+    // workflow by bound id and had no lifecycle check of any kind.
+    if !talos_workflow_liveness::is_not_retired(&workflow_status) {
+        talos_metrics::record_dispatch_refusal(
+            talos_workflow_liveness::dispatch::DispatchPath::Continuation,
+        );
+        tracing::warn!(
+            target: talos_workflow_liveness::dispatch::REFUSAL_TARGET,
+            event_kind = talos_workflow_liveness::dispatch::REFUSAL_EVENT_KIND,
+            path = talos_workflow_liveness::dispatch::DispatchPath::Continuation.as_str(),
+            workflow_id = %workflow_id,
+            "Continuation target workflow is archived — refusing to dispatch"
+        );
+        return None;
+    }
     // Phase D2 parity (PR #461 follow-up): the gate runs UNCONDITIONALLY
     // and its resolved actor is captured for the engine binding below.
     // Pre-fix, unbound continuations skipped the gate AND the engine was

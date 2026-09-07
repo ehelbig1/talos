@@ -167,8 +167,11 @@ async fn self_referential_subworkflow_terminates_with_recursion_error() {
             &self,
             _id: Uuid,
             _user: Uuid,
-        ) -> Result<Option<serde_json::Value>, talos_workflow_engine_core::BoxError> {
-            Ok(Some(self.0.clone()))
+        ) -> Result<talos_workflow_engine_core::GraphLookup, talos_workflow_engine_core::BoxError>
+        {
+            Ok(talos_workflow_engine_core::GraphLookup::Found(
+                self.0.clone(),
+            ))
         }
         async fn get_graphs(
             &self,

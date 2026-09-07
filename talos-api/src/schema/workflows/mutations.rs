@@ -131,6 +131,11 @@ impl WorkflowsMutations {
                     | OrchestrationError::ExecutionPaused
                     | OrchestrationError::WorkflowDisabled(_)
                     | OrchestrationError::WorkflowNotLive(..)
+                    // ARCHIVED is not DISABLED and not ABSENT: the workflow
+                    // exists, `is_enabled` is untouched, and an operator
+                    // retired it. Its Display carries the wording and the
+                    // repair, from `talos_workflow_liveness::dispatch`.
+                    | OrchestrationError::WorkflowArchived(_)
                     | OrchestrationError::StatusConflict(_)
                     | OrchestrationError::AuthorizationDenied(_)
                     | OrchestrationError::ConcurrencyLimitExceeded(_)

@@ -1858,6 +1858,48 @@ async fn run_scheduled_execution(
     };
     match admission {
         talos_workflow_repository::ConcurrencyAdmission::Created => {}
+        talos_workflow_repository::ConcurrencyAdmission::WorkflowArchived => {
+            // The NARROW lifecycle gate (2026-09-07). An operator retired this
+            // workflow and its schedule kept firing, because `status` and
+            // `is_enabled` are two columns for one fact and archiving never
+            // touched the second — on the reference fleet every archived row
+            // still reads `is_enabled = true`.
+            //
+            // `DENIED`, not `SKIPPED`, and the existing partition already made
+            // that call: `SCHEDULER_OUTCOME_DENIED`'s own doc says it is for a
+            // fire "refused by POLICY … chronic configuration states that are
+            // unchanged by how many schedules came due at once", which is this
+            // exactly. Folding it into `SKIPPED` would put a permanent
+            // configuration state inside the startup-herd alert, which fires on
+            // every deploy with a cause it cannot support.
+            //
+            // The SCHEDULE ROW IS DELIBERATELY LEFT ENABLED. Disabling it on
+            // first refusal was considered and rejected: archiving is
+            // REVERSIBLE (`status` goes back to `active`), so a self-disabling
+            // schedule would make un-archiving silently not resume — a second,
+            // invisible operator act the platform would be performing on the
+            // operator's behalf, which is the exact asymmetry between two
+            // liveness columns that this whole class is about. A permanently
+            // firing WARN was rejected for check 69's reason (an ERROR that
+            // fires forever on a healthy fleet trains operators to ignore it),
+            // so the per-tick line is DEBUG and the durable signal is the
+            // counter.
+            record_dispatch(phase, talos_metrics::SCHEDULER_OUTCOME_DENIED);
+            talos_metrics::record_dispatch_refusal(
+                talos_workflow_liveness::dispatch::DispatchPath::Scheduler,
+            );
+            tracing::debug!(
+                target: talos_workflow_liveness::dispatch::REFUSAL_TARGET,
+                event_kind = talos_workflow_liveness::dispatch::REFUSAL_EVENT_KIND,
+                path = talos_workflow_liveness::dispatch::DispatchPath::Scheduler.as_str(),
+                execution_id = %execution_id,
+                workflow_id = %workflow_id,
+                schedule_id = %schedule_id,
+                "Scheduler: refusing a due fire — the workflow is archived. The \
+                 schedule stays enabled; un-archive the workflow to resume it."
+            );
+            return;
+        }
         talos_workflow_repository::ConcurrencyAdmission::LimitReached { limit, running } => {
             // Respect the per-workflow concurrency cap. `next_trigger_at` was
             // already advanced before this spawn (commit-before-dispatch), so a

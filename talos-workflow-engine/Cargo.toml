@@ -13,6 +13,13 @@ homepage = "https://github.com/aegix-dev/talos-workflow-engine"
 
 [dependencies]
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core", version = "0.3", default-features = false }
+# The ONE home for the `workflows.status` / `is_enabled` pair — the narrow
+# dispatch gate reads `not_retired_sql` / `is_not_retired` from here. `version`
+# is load-bearing for the same reason it is on `talos-rhai-sandbox` below: this
+# crate has no `publish` key, so it defaults to PUBLISHABLE, and cargo-deny's
+# `wildcard` rule (run by `make lint`, not by `scripts/lint-structural.sh`)
+# rejects a versionless path dep on a public crate.
+talos-workflow-liveness = { path = "../talos-workflow-liveness", version = "0.1.0" }
 talos-capability-world = { path = "../talos-capability-world", version = "0.1" }
 talos-config = { path = "../talos-config", version = "0.1.0" }
 anyhow = "1.0"

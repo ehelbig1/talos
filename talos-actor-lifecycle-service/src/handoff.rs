@@ -80,6 +80,21 @@ pub enum HandoffError {
     #[error("Workflow not found or access denied")]
     WorkflowNotFound,
 
+    /// The workflow EXISTS and an operator ARCHIVED it — the narrow lifecycle
+    /// gate (2026-09-07).
+    ///
+    /// This path has refused an archived workflow since long before that gate
+    /// existed, in SQL, inside `get_workflow_graph_for_user`. What it could not
+    /// do was SAY so: the filtered read returned `None` and the caller rendered
+    /// [`Self::WorkflowNotFound`] — "Workflow not found or access denied",
+    /// false on both clauses. Same correction #748 made for an archived
+    /// execution.
+    #[error(
+        "{}",
+        talos_workflow_liveness::dispatch::archived_refusal_message(&.0.to_string())
+    )]
+    WorkflowArchived(uuid::Uuid),
+
     /// The workflow-graph read FAILED — distinct from [`Self::WorkflowNotFound`],
     /// which is a definite answer.
     ///
@@ -446,10 +461,25 @@ impl ActorLifecycleService {
         // module worlds against.
         let graph_json = match self
             .actor_repo
-            .get_workflow_graph_for_user(wf_id, user_id)
+            .get_workflow_graph_and_status_for_user(wf_id, user_id)
             .await
         {
-            Ok(Some(g)) => g,
+            Ok(Some((g, status))) if talos_workflow_liveness::is_not_retired(&status) => g,
+            // The narrow lifecycle gate, now CLASSIFIED rather than filtered
+            // away upstream — the refusal is unchanged, the report is not.
+            Ok(Some(_)) => {
+                talos_metrics::record_dispatch_refusal(
+                    talos_workflow_liveness::dispatch::DispatchPath::Handoff,
+                );
+                tracing::warn!(
+                    target: talos_workflow_liveness::dispatch::REFUSAL_TARGET,
+                    event_kind = talos_workflow_liveness::dispatch::REFUSAL_EVENT_KIND,
+                    path = talos_workflow_liveness::dispatch::DispatchPath::Handoff.as_str(),
+                    workflow_id = %wf_id,
+                    "handoff: target workflow is archived — refusing"
+                );
+                return Err(HandoffError::WorkflowArchived(wf_id));
+            }
             Ok(None) => return Err(HandoffError::WorkflowNotFound),
             Err(e) => {
                 tracing::error!(

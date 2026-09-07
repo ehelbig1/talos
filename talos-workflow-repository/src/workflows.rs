@@ -607,6 +607,45 @@ impl WorkflowRepository {
         Ok(draft.map(|(gj,)| (gj, None)))
     }
 
+    /// The NARROW lifecycle gate's by-id chokepoint (2026-09-07): may the
+    /// platform still dispatch this workflow?
+    ///
+    /// THREE-valued, and none of the three may be folded into another.
+    /// `Absent` covers "no such workflow" AND "not this user's" — the same
+    /// deliberate collapse every by-id read here makes, since telling a caller
+    /// which of the two it is hands out an existence oracle. `Retired` is a
+    /// REFUSAL about a workflow that plainly exists.
+    ///
+    /// Used by the dispatch paths that do NOT mint their execution row through
+    /// `create_execution_under_concurrency_limit` (whose own `FOR UPDATE` read
+    /// carries the gate for the seven that do): `retry`, `replay`, and the
+    /// continuation/resume trigger. It is one PK read of `workflows` —
+    /// the same shape and cost as `read_actor_write_ceiling` on the #754
+    /// write-ceiling path (measured there at ~1.1 µs server-side).
+    ///
+    /// It is deliberately NOT a `bool`: a boolean gate is one `unwrap_or(true)`
+    /// from being fail-open, and its caller could not tell a retired workflow
+    /// from a deleted one when it renders the refusal.
+    pub async fn dispatch_lifecycle(
+        &self,
+        workflow_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<WorkflowDispatchLookup> {
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM workflows WHERE id = $1 AND user_id = $2")
+                .bind(workflow_id)
+                .bind(user_id)
+                .fetch_optional(&self.db_pool)
+                .await?;
+        Ok(match status {
+            None => WorkflowDispatchLookup::Absent,
+            Some(s) if talos_workflow_liveness::is_not_retired(&s) => {
+                WorkflowDispatchLookup::Dispatchable
+            }
+            Some(_) => WorkflowDispatchLookup::Retired,
+        })
+    }
+
     /// Check whether a workflow name is already taken for a user (ignoring archived).
     pub async fn find_workflow_by_name(&self, user_id: Uuid, name: &str) -> Result<Option<Uuid>> {
         // RFC 0005 S3: self-scope (see get_workflow).
@@ -2320,6 +2359,25 @@ pub struct WorkflowIdentityRow {
     pub input_schema: Option<serde_json::Value>,
 }
 
+/// What [`WorkflowRepository::dispatch_lifecycle`] found — the narrow lifecycle
+/// gate's three answers.
+///
+/// `#[must_use]` with no `Into<bool>` and no `is_ok()`: the whole defect this
+/// gate closes is a reader collapsing a three-valued fact into a two-valued
+/// one, and a convenience accessor is how that comes back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum WorkflowDispatchLookup {
+    /// Not retired. Says NOTHING about `is_enabled` — that is the other
+    /// column, with its own writer, and each dispatch path enforces it (or
+    /// deliberately does not) exactly as it did before this gate existed.
+    Dispatchable,
+    /// `status = 'archived'`. The row exists; the platform refuses to run it.
+    Retired,
+    /// No workflow with that id is visible to this user.
+    Absent,
+}
+
 /// A workflow `delete_workflows_checked` refused because an enabled parent
 /// dispatches into it — or mentions it from a graph that could not be read.
 #[derive(Debug, Clone)]
@@ -2360,28 +2418,49 @@ impl talos_workflow_engine_core::WorkflowGraphStore for WorkflowRepository {
         &self,
         workflow_id: Uuid,
         user_id: Uuid,
-    ) -> Result<Option<serde_json::Value>, talos_workflow_engine_core::BoxError> {
+    ) -> Result<talos_workflow_engine_core::GraphLookup, talos_workflow_engine_core::BoxError> {
         // `workflows.graph_json` is stored as TEXT (per the schema), not JSONB.
         // Decoding directly into `serde_json::Value` fails with a typed-decode
         // error and the engine treats the lookup as "graph not found" — which
         // breaks every sub-workflow / capability-dispatch / judge / ensemble
         // node with a misleading "Sub-workflow workflow X not found" error
         // message even though the row exists. Decode as String and parse.
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT graph_json FROM workflows WHERE id = $1 AND user_id = $2")
-                .bind(workflow_id)
-                .bind(user_id)
-                .fetch_optional(&self.db_pool)
-                .await?;
+        //
+        // `status` rides along on the SAME read (the narrow lifecycle gate,
+        // 2026-09-07) and is CLASSIFIED rather than filtered in SQL: filtering
+        // would answer `Absent` for a workflow that plainly exists, which is
+        // the misleading-report class this repository has spent five packages
+        // removing. The refusal is counted here, at the one read, rather than
+        // in the engine — this crate is where the lifecycle is legible.
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT graph_json, status FROM workflows WHERE id = $1 AND user_id = $2",
+        )
+        .bind(workflow_id)
+        .bind(user_id)
+        .fetch_optional(&self.db_pool)
+        .await?;
         match row {
-            None => Ok(None),
-            Some((s,)) => {
+            None => Ok(talos_workflow_engine_core::GraphLookup::Absent),
+            Some((_, status)) if !talos_workflow_liveness::is_not_retired(&status) => {
+                talos_metrics::record_dispatch_refusal(
+                    talos_workflow_liveness::dispatch::DispatchPath::SubWorkflow,
+                );
+                tracing::warn!(
+                    target: talos_workflow_liveness::dispatch::REFUSAL_TARGET,
+                    event_kind = talos_workflow_liveness::dispatch::REFUSAL_EVENT_KIND,
+                    path = talos_workflow_liveness::dispatch::DispatchPath::SubWorkflow.as_str(),
+                    workflow_id = %workflow_id,
+                    "A parent node dispatched into an archived workflow; refusing"
+                );
+                Ok(talos_workflow_engine_core::GraphLookup::Archived)
+            }
+            Some((s, _)) => {
                 let v = serde_json::from_str(&s).map_err(
                     |e| -> talos_workflow_engine_core::BoxError {
                         format!("graph_json parse error for {}: {}", workflow_id, e).into()
                     },
                 )?;
-                Ok(Some(v))
+                Ok(talos_workflow_engine_core::GraphLookup::Found(v))
             }
         }
     }
@@ -2399,10 +2478,15 @@ impl talos_workflow_engine_core::WorkflowGraphStore for WorkflowRepository {
         // error with a WARN and fell back to per-node `get_graph` queries —
         // which then ALSO failed with the same decode bug, so every
         // sub-workflow node returned GraphNotFound.
-        let rows: Vec<(Uuid, String)> = sqlx::query_as(
+        // The narrow lifecycle gate, in SQL here rather than classified: this
+        // query only WARMS a cache, so an archived child simply misses it and
+        // falls through to `get_graph`, which reports `Archived` and counts the
+        // refusal. One policy, one message, one increment.
+        let not_retired = talos_workflow_liveness::not_retired_sql(None);
+        let rows: Vec<(Uuid, String)> = sqlx::query_as(&format!(
             "SELECT id, graph_json FROM workflows \
-             WHERE id = ANY($1) AND user_id = $2",
-        )
+             WHERE id = ANY($1) AND user_id = $2 AND {not_retired}",
+        ))
         .bind(ids)
         .bind(user_id)
         .fetch_all(&self.db_pool)
@@ -2431,12 +2515,19 @@ impl talos_workflow_engine_core::WorkflowGraphStore for WorkflowRepository {
         name: &str,
         user_id: Uuid,
     ) -> Result<Option<Uuid>, talos_workflow_engine_core::BoxError> {
-        let row: Option<(Uuid,)> =
-            sqlx::query_as("SELECT id FROM workflows WHERE name = $1 AND user_id = $2 LIMIT 1")
-                .bind(name)
-                .bind(user_id)
-                .fetch_optional(&self.db_pool)
-                .await?;
+        // The narrow lifecycle gate, in SQL: this is a RESOLUTION among
+        // candidates, not a by-id refusal — a retired workflow is not a
+        // candidate, and there is no one named workflow being refused to count.
+        // Stated as a limit in CLAUDE.md rather than left to look like coverage.
+        let not_retired = talos_workflow_liveness::not_retired_sql(None);
+        let row: Option<(Uuid,)> = sqlx::query_as(&format!(
+            "SELECT id FROM workflows WHERE name = $1 AND user_id = $2 \
+             AND {not_retired} LIMIT 1"
+        ))
+        .bind(name)
+        .bind(user_id)
+        .fetch_optional(&self.db_pool)
+        .await?;
         Ok(row.map(|(id,)| id))
     }
 
@@ -2445,6 +2536,7 @@ impl talos_workflow_engine_core::WorkflowGraphStore for WorkflowRepository {
         required_capabilities: &[String],
         user_id: Uuid,
     ) -> Result<Option<(Uuid, String)>, talos_workflow_engine_core::BoxError> {
+        let not_retired = talos_workflow_liveness::not_retired_sql(None);
         let row: Option<(Uuid, String)> = sqlx::query_as(
             // `, id DESC` is not cosmetic. Until migration 20260905120000 the
             // hourly readiness recompute stamped `updated_at` on every row, so
@@ -2454,9 +2546,20 @@ impl talos_workflow_engine_core::WorkflowGraphStore for WorkflowRepository {
             // makes the choice deterministic even when the timestamps tie.
             // `find_workflows_for_capability_dispatch_preview` mirrors this
             // ORDER BY exactly; change both or neither.
-            "SELECT id, name FROM workflows \
-             WHERE user_id = $1 AND capabilities @> $2 \
-             ORDER BY updated_at DESC, id DESC LIMIT 1",
+            // The narrow lifecycle gate, in SQL — and this is the ONE site
+            // where it is not latent on the reference fleet. Measured
+            // 2026-09-07: all 8 archived rows carry non-empty `capabilities`
+            // (`email-delivery`, `sub-workflow`, `world-http`, …), so a
+            // retired workflow was a live candidate here — and, ordered by
+            // `updated_at DESC`, could be the WINNING one. Filtering rather
+            // than classifying is right because this chooses AMONG candidates:
+            // a retired candidate must not shadow a live one, which a
+            // read-then-refuse would do.
+            &format!(
+                "SELECT id, name FROM workflows \
+                 WHERE user_id = $1 AND capabilities @> $2 AND {not_retired} \
+                 ORDER BY updated_at DESC, id DESC LIMIT 1"
+            ),
         )
         .bind(user_id)
         .bind(required_capabilities)

@@ -463,15 +463,23 @@ between is exactly what a graph-derived exclusion cannot see.
 
 **Does a child's `draft` status mean anything at runtime? No, and this is worth
 knowing before anyone "fixes" it by publishing.** `execute_subworkflow_graph` →
-`WorkflowGraphStore::get_graph` is
-`SELECT graph_json FROM workflows WHERE id = $1 AND user_id = $2` — no version
-join, no status predicate — so the parent dispatches the child's DRAFT
-`graph_json` column and `publish_version` changes nothing about how the parent
-runs it. Two consequences: the "publish or delete" advice is half no-op and
-half destructive, and ARCHIVING a child does not break dispatch either (status
-is not read there), which is why the archive path is the least severe of the
-three even though it is the only unattended one — it hides a live workflow from
-every listing an operator manages it through, under the label "stale".
+`WorkflowGraphStore::get_graph` reads the child's DRAFT `graph_json` column with
+no version join, so `publish_version` changes nothing about how the parent runs
+it and the "publish or delete" advice is half no-op and half destructive. That
+half of the paragraph stands.
+
+**Its other half was TRUE UNTIL 2026-09-07 and is now FALSE — it is rewritten
+rather than left.** It read: *"ARCHIVING a child does not break dispatch either
+(status is not read there), which is why the archive path is the least severe of
+the three even though it is the only unattended one"*. The narrow dispatch gate
+below closed exactly that: `get_graph` now returns `GraphLookup::Archived` and
+the parent node FAILS naming the child and the word "archived". So **archiving a
+child DOES stop it being dispatched**, and the auto-archive sweep is no longer
+the least severe of the three destructive draft paths — it is now the one that
+can take a live sub-workflow off the air unattended. The child-reference
+exclusions #758/#760/#764 added to that sweep are what keep it from doing so,
+and they are load-bearing in a way they were not when this paragraph was
+written.
 
 **What was measured and NOT changed here.** `AdvancedRepository::get_draft_workflows`
 shares the same blind predicate and is left as-is: its only consumer is
@@ -815,6 +823,201 @@ wrong in the reassuring direction: once a site is ROUTED the literal
 `is_enabled = true` disappears from it, so a raw-literal-only tripwire reported
 "found nothing" on the fully-fixed tree — measured, not imagined. It now counts raw
 windows PLUS rendered `*_sql(` call sites.
+
+### "Archived" must mean "will not run" — the NARROW dispatch gate (2026-09-07)
+
+**The entry above closed the REPORT half and recorded the other half without
+fixing it**: *"No execution path in this workspace filters on `workflows.status`
+at all"*, proved with a scratch row that an archived workflow with an enabled
+schedule and an enabled webhook was returned by all five verbatim production
+reads. This closes it. The operator's decision is the NARROW gate and nothing
+wider: **every dispatch path refuses `status = 'archived'`, and nothing else
+changes.** A DRAFT still dispatches — 4 drafts on the reference fleet carry
+enabled schedules and fire today — and `is_enabled` keeps exactly the meaning
+each path already gave it, including the paths that have never consulted it.
+`dispatchable_sql` is deliberately NOT the predicate used here: it also requires
+`is_enabled`, which would have been a second, unauthorised behaviour change
+wearing a one-word diff. The gate is `talos_workflow_liveness::not_retired_sql`
+/ `is_not_retired`, and `not_retired_is_weaker_than_dispatchable` pins the two
+apart so a future edit cannot quietly promote one to the other.
+
+**The five paths that entry named were not the population; there are 35, and
+two of its five descriptions were wrong.** The due query
+(`talos-scheduler:1103`) reads `workflow_schedules` ALONE and never joins
+`workflows`, so there was no predicate to add there and the gate had to sit at
+the post-due load; and the named `talos-schedule-repo` join is a LISTING, not
+the due query. More importantly, **"no execution path filters on `status`" was
+itself false by one site**: `ActorRepository::get_workflow_graph_for_user`
+(`talos-actor-repository/src/lib.rs:2050`) has carried
+`AND (status IS NULL OR status != 'archived')` in SQL all along, and its only
+caller is `handoff_to_actor`. So handoff was the one dispatch surface that
+refused — while REPORTING the refusal as *"Workflow not found or access denied"*,
+false on both clauses, because the filtered read returned `None` and the caller
+had nothing else to say. That claim is corrected in the crate's own module doc,
+in check 87's entry, and the read now returns the status so the caller can
+classify it (`HandoffError::WorkflowArchived`).
+
+**One gate covers seven surfaces because the enum forces it to.** The scheduler,
+the webhook router, `trigger_workflow`, `call_workflow`, `bulk_trigger_workflow`,
+`trigger_workflow_as_actors` and `enqueue_workflow` all mint their execution row
+through `create_execution_under_concurrency_limit` (or its batch twin), whose
+`SELECT … FOR UPDATE` on `workflows` was already there — so `status` rides along
+on that read, the gate costs **no extra query**, and it is atomic with the INSERT
+it guards. `ConcurrencyAdmission::WorkflowArchived` is a NEW VARIANT rather than
+a boolean, and that is the point: the enum is matched exhaustively at all seven
+sites, so the compiler asked each of them how it renders the refusal. Same move
+`WorkflowDeleteOutcome` made in #758. The batch twin gets a `archived: bool`
+FIELD instead, and the asymmetry is argued rather than sloppy: there
+`inserted == 0` already refuses whether or not the caller reads the flag, so the
+flag buys the caller the ability to say WHY — "throttled" invites a wait for
+capacity that will never arrive.
+
+**The paths that mint no row, or mint it elsewhere, carry their own gate.**
+`retry` and `replay` reuse an existing row; the continuation trigger (approval
+resumes, suspension resumes, and the Gmail push-notification WORKFLOW branch)
+writes elsewhere; the sub-workflow child dispatch mints none by design. Those
+read `WorkflowRepository::dispatch_lifecycle` — one PK read of `workflows`, the
+same shape and cost as #754's `read_actor_write_ceiling` — returning
+`WorkflowDispatchLookup::{Dispatchable, Retired, Absent}`, `#[must_use]`, with no
+`Into<bool>`: a boolean gate is one `unwrap_or(true)` from fail-open, and its
+caller could not tell a retired workflow from a deleted one when it renders the
+refusal. Note `replay` already read `is_workflow_enabled` — the OTHER column —
+directly above, and would have passed a retired workflow on the strength of it.
+
+**CLASSIFY where there is one named workflow; FILTER IN SQL where there are
+candidates.** `get_graph` is classified (`GraphLookup::{Found, Archived, Absent}`,
+the `ExecutionLookup` shape from #748) so a parent node fails with a message
+naming the child and the word "archived" instead of "not found", which would send
+its author hunting a deletion that never happened. The chain fan-out,
+`resolve_by_capabilities`, `resolve_by_name` and the `get_graphs` cache prefill
+filter in SQL, and each has a reason: the fan-out's `LIMIT` must be applied over
+real candidates or retired rows displace live ones from the chain set; the two
+resolvers are `ORDER BY … LIMIT 1`, so a read-then-refuse would let a retired
+candidate SHADOW a live one; and the cache prefill is only a warm-up, so an
+archived child misses it and falls through to `get_graph`, which reports the
+refusal once, with one wording.
+
+**`resolve_by_capabilities` is the one site here that is NOT latent, and it is
+the reason this shipped as more than tidying.** Measured on the reference fleet
+2026-09-07: all 8 archived rows carry non-empty `capabilities`
+(`email-delivery`, `sub-workflow`, `world-http`, `actor-memory-read`, …), and
+that resolver is `WHERE capabilities @> $2 ORDER BY updated_at DESC, id DESC
+LIMIT 1` with no lifecycle predicate — so a retired workflow was not merely a
+candidate for capability dispatch and A2A, it could be the WINNING one. The DB
+test seeds the retired row with the NEWER `updated_at` for exactly that reason,
+and the main-vocabulary twin fails on pristine main by returning it.
+
+**Everything else is latent, and saying so plainly is the point.** The 8 archived
+rows have **zero schedule rows** (not merely zero enabled ones) and **zero
+webhook triggers**. And the child question the brief asked to measure: **ZERO
+archived children under enabled parents** — in fact zero archived workflows are
+mentioned in ANY workflow's `graph_json`, whatever the parent's status. That was
+measured WITH A CONTROL, because a query that finds nothing proves nothing until
+it is shown able to find something: dropping the archived filter returns 6 real
+parent→child mentions (`cos-team-recall`, `pa-ask`, `pa-quality-judge` ×3,
+`stress-05-child`). So the sub-workflow half of this change can alter no live
+behaviour today.
+
+**Refusals are VISIBLE to the OPERATOR and OPAQUE to an unauthenticated caller.**
+`talos_dispatch_refused_total{path, reason="archived"}` is pre-seeded at 0 for
+all 12 paths that classify in Rust, incremented at one helper
+(`talos_metrics::record_dispatch_refusal`) taking a TYPED
+`DispatchPath` so a new surface cannot spell a label the constructor never
+seeded. **Nothing alerts on it**: a refusal is the policy working, and an alert
+here would train operators to ignore the one series that answers *a schedule
+stopped firing — is the platform refusing it, or is the scheduler broken?* The
+scheduler's per-tick line is **DEBUG**, not WARN, for check 69's reason (an ERROR
+that fires forever on a healthy fleet trains operators to ignore ERROR); its
+durable signal is the counter plus `scheduler_dispatches_total{outcome="denied"}`
+— **`DENIED`, not `SKIPPED`, and the existing partition already made that call**:
+that label's own doc says it is for a fire "refused by POLICY … chronic
+configuration states that are unchanged by how many schedules came due at once",
+which is this exactly, and folding it into `SKIPPED` would put a permanent
+configuration state inside the startup-herd alert.
+
+**The scheduler DOES NOT disable the schedule row, and that was a decision.**
+Option (b) in the brief was to disable it on first refusal with a WARN. Rejected:
+archiving is REVERSIBLE, so a self-disabling schedule would make un-archiving
+silently not resume — a second, invisible operator act the platform performs on
+the operator's behalf, which is the same two-columns-disagreeing asymmetry this
+whole class is about. A permanently-firing WARN is check 69's shape. So option
+(a), with the per-tick line at DEBUG.
+
+**The webhook tells the caller nothing.** It answers exactly what it answers for
+a workflow that is not there — `404 "Workflow not found"`, byte-identical — and
+that is the one place in this change where a refusal is deliberately rendered as
+an absence: an inbound webhook caller is unauthenticated with respect to the
+workflow, and a reply that distinguishes "archived" from "no such workflow" is an
+existence oracle for anyone who can guess a trigger id (the
+`caller_facing_unauthorized` argument, and #754's collapsed
+`write_ceiling_unreadable` reply). The operator keeps the distinction in the
+counter and a WARN — WARN rather than the scheduler's DEBUG because a webhook
+refusal is one inbound request rather than a recurring tick, so it cannot become
+permanent noise. **There was no paused-workflow response to mirror, and that was
+MEASURED rather than assumed**: the webhook path consults `workflows.is_enabled`
+NOWHERE, in SQL or in Rust, so a disabled workflow still fires by webhook today.
+The narrow gate does not change that — it is the other column.
+
+**Sites deliberately NOT gated, argued rather than omitted.** (1) **Resume and
+crash recovery** (`claim_stuck_execution_for_resume`,
+`claim_waiting_execution_for_resume`, the resume auth gate): these FINISH a run
+that was already admitted, and refusing would strand a waiting approval gate the
+moment an operator archived the workflow — turning a reversible lifecycle change
+into permanent loss for an in-flight run. The gate is about what the platform
+will START. (2) **`test_workflow`, `test_workflow_draft`, GraphQL
+`testWorkflow`**: an operator explicitly asking to test ONE named workflow is not
+the platform deciding to run it, and refusing would remove the only way to check
+a workflow before un-archiving it. This is the place a reader might reasonably
+expect a refusal and not find one, so it is stated rather than left to be
+discovered. (3) **Module replay**: replays a MODULE against recorded inputs; the
+graph is read to rebuild a node's config, not to run the workflow.
+
+**The chain fan-out's refusal is SILENT, and that is a stated limit rather than
+an oversight.** `talos_dispatch_refused_total` has no `chain` label because that
+site is a capped SET read, not a per-request refusal — there is no one workflow
+being refused to count, and seeding a label nothing increments is the defect
+check 58 exists for. The same applies to the two resolvers and the cache
+prefill. Four of the sixteen gate sites are therefore uncounted, by construction.
+
+**Guard, and what it does and does not cover.**
+`controller/tests/archived_dispatch_gate_tests` (8 tests, CTRL_TESTS) drives the
+REAL admission chokepoint, the REAL `WorkflowGraphStore` reads, the REAL
+`dispatch_lifecycle` and the REAL handoff read. Two properties are deliberate:
+it asserts on **ROWS**, not just on the returned variant — an earlier version of
+#754's write-ceiling test passed because the INSERT would have failed anyway and
+survived the gate being deleted, and the first draft of THIS file reproduced that
+exactly (passing `actor_id: None` made both CONTROLS die on a NOT NULL constraint
+while the archived case "passed") — and every test carries an **ACTIVE and a
+DRAFT control**, so a gate widened to `status = 'active'` fails here rather than
+looking like a stricter version of the same thing.
+
+**Measured RED on pristine `origin/main`, by assertion and not by compile
+error**: six main-vocabulary twins were run in a real `git worktree` of `1a13ad6b`
+against its own migrated database, and **6 of 6 FAILED BY ASSERTION** — the
+admission gate admitted an archived workflow and wrote the row, the batch twin
+queued 3, `get_graph` handed back the archived child's graph, the capability
+resolver returned the RETIRED workflow as the winner, name resolution resolved
+it, and the handoff read hid the row. Zero failed by compile error. The twins are
+a scratch artefact and are not committed.
+
+**No lint check was added and `--count` stays 87.** The candidate — *"a
+`workflows` read that feeds dispatch must name the liveness home"* — was measured
+before it was written and REJECTED twice over. It cannot be scoped by SQL shape:
+the 35 dispatch reads share no predicate (`WHERE id = $1 AND user_id = $2` is
+also how ~40 report and authoring reads spell themselves), so a shape-scoped rule
+is ~50% precision at best. Scoped instead to the FILES that dispatch, it reports
+the 33 files carrying any `FROM workflows` and would ship at ~25 markers on
+correct code. And decisively, it would be **green over the very defect it is for**:
+every gate site in this change now names `talos_workflow_liveness`, so a
+file-scoped rule is satisfied by ONE gated read vouching for every other read in
+the same file — check 86(a)'s stated limit, which check 87 already had to
+window-scope around. Check 87 does not cover this either: its window looks for a
+LIVENESS predicate over both columns, and the dispatch gate is one column. The
+structural answers that ARE stronger than a grep: `ConcurrencyAdmission` and
+`GraphLookup` and `WorkflowDispatchLookup` are exhaustively-matched enums, so a
+new dispatch surface cannot be added without the compiler asking what it does
+with a retired workflow; `record_dispatch_refusal` takes a typed `DispatchPath`;
+and the DB tests carry a DRAFT control at every site.
 
 **2026-09-06 — the ANSWER: `sub_workflow_runs`, the child-run ledger (RFC 0012 P1).**
 Everything above this line teaches a reader to say *"no evidence"* instead of

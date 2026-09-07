@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 
 use petgraph::Direction;
 use serde_json::Value as JsonValue;
-use talos_workflow_engine_core::{EdgeLogic, SystemNodeKind};
+use talos_workflow_engine_core::{EdgeLogic, GraphLookup, SystemNodeKind};
 use uuid::Uuid;
 
 use crate::engine::ParallelWorkflowEngine;
@@ -171,26 +171,40 @@ impl ParallelWorkflowEngine {
     /// Look up a sub-workflow's graph JSON, checking the pre-populated cache first.
     /// Falls back to an individual DB query on cache miss (e.g., `DynamicDispatch`
     /// targets that are resolved at runtime).
+    ///
+    /// THREE-valued since the narrow lifecycle gate (2026-09-07). It previously
+    /// returned `Option`, which forced every caller to render an ARCHIVED child
+    /// — a workflow that plainly exists and that an operator deliberately
+    /// retired — as "not found", sending its author to look for a typo. The
+    /// distinction is carried, not collapsed: same rule as `ExecutionLookup`.
+    ///
+    /// A read ERROR is still folded into `Absent` with a WARN, unchanged from
+    /// before, and that is a stated limit rather than an oversight: this
+    /// function has no channel to report a fourth outcome and widening it was
+    /// out of the narrow gate's scope.
     pub(crate) async fn get_sub_workflow_graph(
         &self,
         sub_wf_id: Uuid,
         user_id: Uuid,
-    ) -> Option<JsonValue> {
-        // Fast path: cache hit.
+    ) -> GraphLookup {
+        // Fast path: cache hit. The cache is warmed by `get_graphs`, which
+        // excludes archived rows, so a hit is always a dispatchable graph.
         if let Some(cached) = self.sub_workflow_cache.get(&sub_wf_id) {
-            return Some(cached.clone());
+            return GraphLookup::Found(cached.clone());
         }
         // Cache miss — fall back to an individual query via the trait.
         tracing::debug!(
             workflow_id = %sub_wf_id,
             "Sub-workflow cache miss — falling back to individual query"
         );
-        let store = self.graph_store.as_ref()?;
+        let Some(store) = self.graph_store.as_ref() else {
+            return GraphLookup::Absent;
+        };
         match store.get_graph(sub_wf_id, user_id).await {
             Ok(g) => g,
             Err(e) => {
                 tracing::warn!(error = %e, "sub-workflow graph query failed");
-                None
+                GraphLookup::Absent
             }
         }
     }
