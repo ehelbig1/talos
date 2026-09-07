@@ -2040,21 +2040,35 @@ impl ActorRepository {
 
     // ── Handoff helpers ────────────────────────────────────────────────────
 
-    /// Fetch the graph_json for a workflow that belongs to a given user and is not archived.
-    pub async fn get_workflow_graph_for_user(
+    /// Fetch the `graph_json` and the LIFECYCLE STATUS for a workflow that
+    /// belongs to a given user, for the handoff dispatch path.
+    ///
+    /// **This read used to filter `status != 'archived'` in SQL**, which made
+    /// `handoff_to_actor` the only dispatch surface in the workspace that
+    /// refused an archived workflow (2026-09-07 — and the reason
+    /// `talos-workflow-liveness`' own module doc had to be corrected: it
+    /// claimed no execution path filtered on `status` at all). The refusal was
+    /// right; the REPORT was not — the caller could only render it as
+    /// "Workflow not found or access denied", which is false on both clauses
+    /// and sends an operator hunting a deletion or a permissions problem that
+    /// never happened. So the status now comes BACK instead of being filtered
+    /// out, and the caller classifies it, which is the same move #748 made for
+    /// `ExecutionLookup`.
+    ///
+    /// Returns `Ok(None)` only when no such workflow is visible to the user.
+    pub async fn get_workflow_graph_and_status_for_user(
         &self,
         workflow_id: Uuid,
         user_id: Uuid,
-    ) -> Result<Option<String>> {
-        let graph_json: Option<String> = sqlx::query_scalar(
-            "SELECT graph_json FROM workflows WHERE id = $1 AND user_id = $2 \
-             AND (status IS NULL OR status != 'archived')",
+    ) -> Result<Option<(String, String)>> {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT graph_json, status FROM workflows WHERE id = $1 AND user_id = $2",
         )
         .bind(workflow_id)
         .bind(user_id)
         .fetch_optional(&self.db_pool)
         .await?;
-        Ok(graph_json)
+        Ok(row)
     }
 
     /// Fetch the active workflow version ID for a workflow.

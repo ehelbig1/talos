@@ -321,6 +321,15 @@ CTRL_TESTS=(
     # boot warmup, each with its own control; `common` harness, so CTRL_TESTS
     # (64b).
     "workflow_liveness_hygiene_tests"
+    # The DISPATCH half of the same pair. #774 taught the REPORT to read both
+    # columns and recorded that NO execution path filtered on `status` at all;
+    # this is the guard for the narrow gate that closed it. Drives the REAL
+    # admission chokepoint (rows asserted, not just the returned variant), the
+    # REAL `WorkflowGraphStore` reads and the REAL handoff read — each with an
+    # ACTIVE *and* a DRAFT control, because the decision was archived-only and a
+    # gate widened to `status = 'active'` must fail here. `common` harness, so
+    # CTRL_TESTS (64b).
+    "archived_dispatch_gate_tests"
     # The same blindness on the OTHER draft population #758 called latent: the
     # 7-day `stale_draft_workflows` list, which feeds fix_all's IRREVERSIBLE
     # auto-delete and session_start's auto-archive. Drives the REAL fix_all

@@ -151,8 +151,12 @@ struct NoGraphStore;
 
 #[async_trait]
 impl WorkflowGraphStore for NoGraphStore {
-    async fn get_graph(&self, _id: Uuid, _u: Uuid) -> Result<Option<JsonValue>, BoxError> {
-        Ok(None)
+    async fn get_graph(
+        &self,
+        _id: Uuid,
+        _u: Uuid,
+    ) -> Result<talos_workflow_engine_core::GraphLookup, BoxError> {
+        Ok(talos_workflow_engine_core::GraphLookup::Absent)
     }
     async fn get_graphs(
         &self,

@@ -1012,7 +1012,8 @@ pub const DORMANT_ARCHIVED_NOTE: &str =
      already RETIRED them (status = 'archived'), so the report no longer recommends anything \
      about them. They still carry is_enabled = true — archiving never clears that column — which \
      is why a reader of is_enabled alone counted them as live enabled workflows and advised \
-     deleting them.";
+     deleting them. Since 2026-09-07 they also will not RUN: every dispatch path refuses an \
+     archived workflow, so a dormant archived row is retired in fact and not only in the listing.";
 
 /// What `last_child_activity_at` is worth, stated so a `null` there cannot be
 /// read as a second, independent "it never ran".

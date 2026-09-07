@@ -1611,8 +1611,14 @@ impl ParallelWorkflowEngine {
             });
         }
         let user_id = self.user_id().unwrap_or_else(Uuid::nil);
-        let Some(graph_json) = self.get_sub_workflow_graph(sub_wf_id, user_id).await else {
-            return origin.not_found_error(sub_wf_id);
+        let graph_json = match self.get_sub_workflow_graph(sub_wf_id, user_id).await {
+            talos_workflow_engine_core::GraphLookup::Found(g) => g,
+            talos_workflow_engine_core::GraphLookup::Archived => {
+                return origin.archived_error(sub_wf_id)
+            }
+            talos_workflow_engine_core::GraphLookup::Absent => {
+                return origin.not_found_error(sub_wf_id)
+            }
         };
         let hydrated = self
             .adapter_set()
@@ -1818,11 +1824,22 @@ impl ParallelWorkflowEngine {
                 "error_message": "user_id required for sub-workflow execution",
             }));
         };
-        let Some(graph_json) = self.get_sub_workflow_graph(body_wf_id, user_id).await else {
-            return Some(serde_json::json!({
-                "__error": true,
-                "error_message": format!("AgentLoop body workflow {body_wf_id} not found"),
-            }));
+        let graph_json = match self.get_sub_workflow_graph(body_wf_id, user_id).await {
+            talos_workflow_engine_core::GraphLookup::Found(g) => g,
+            talos_workflow_engine_core::GraphLookup::Archived => {
+                return Some(serde_json::json!({
+                    "__error": true,
+                    "error_message": talos_workflow_liveness::dispatch::archived_refusal_message(
+                        &body_wf_id.to_string(),
+                    ),
+                }));
+            }
+            talos_workflow_engine_core::GraphLookup::Absent => {
+                return Some(serde_json::json!({
+                    "__error": true,
+                    "error_message": format!("AgentLoop body workflow {body_wf_id} not found"),
+                }));
+            }
         };
 
         let dispatcher_al = dispatcher.clone();
@@ -2904,6 +2921,21 @@ impl DispatchedOrigin {
                 talos_workflow_engine_core::ChildDispatchKind::CapabilityDispatch
             }
         }
+    }
+
+    /// The narrow lifecycle gate's refusal (2026-09-07). Distinct from
+    /// [`Self::not_found_error`] because the workflow EXISTS: an operator
+    /// retired it, and the wording says so and says how to undo it. Both
+    /// dispatch origins share one message, from
+    /// `talos_workflow_liveness::dispatch`, so one policy cannot acquire two
+    /// descriptions.
+    fn archived_error(&self, sub_wf_id: Uuid) -> JsonValue {
+        serde_json::json!({
+            "__error": true,
+            "error_message": talos_workflow_liveness::dispatch::archived_refusal_message(
+                &sub_wf_id.to_string(),
+            ),
+        })
     }
 
     fn not_found_error(&self, sub_wf_id: Uuid) -> JsonValue {

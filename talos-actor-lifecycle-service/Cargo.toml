@@ -24,6 +24,8 @@ talos-validation = { path = "../talos-validation" }
 # Talos crates — repositories
 talos-actor-repository = { path = "../talos-actor-repository" }
 talos-module-repository = { path = "../talos-module-repository" }
+talos-workflow-liveness = { path = "../talos-workflow-liveness" }
+talos-metrics = { path = "../talos-metrics" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
 
 # Talos crates — services

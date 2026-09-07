@@ -29,6 +29,7 @@ talos-worker-fleet = { path = "../talos-worker-fleet" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
+talos-workflow-liveness = { path = "../talos-workflow-liveness" }
 talos-workflow-authorization = { path = "../talos-workflow-authorization" }
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
 tracing.workspace = true

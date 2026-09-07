@@ -600,7 +600,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "archive_workflow",
-            "description": "Archive a workflow. Archived workflows are excluded from search and discovery but are not deleted. Use this instead of batch_delete_workflows for production workflows you want to retire.",
+            "description": "Archive a workflow (status = 'archived'). An archived workflow is excluded from search and discovery, is not deleted, and — since 2026-09-07 — WILL NOT RUN: every dispatch path refuses it (schedules, webhooks, trigger/call/bulk/enqueue, sub-workflow and capability dispatch, chain fan-out, retry, replay, handoff). Note it does NOT clear is_enabled, which is the separate pause toggle; un-archiving is what resumes dispatch. Use this instead of batch_delete_workflows for production workflows you want to retire.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

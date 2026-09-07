@@ -96,6 +96,7 @@ talos-ml = { path = "../talos-ml" }
 talos-memory-consolidation = { path = "../talos-memory-consolidation" }
 talos-memory-ranking = { path = "../talos-memory-ranking" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
+talos-workflow-liveness = { path = "../talos-workflow-liveness" }
 talos-actor-memory-service = { path = "../talos-actor-memory-service" }
 talos-advanced-repository = { path = "../talos-advanced-repository" }
 talos-analytics-repository = { path = "../talos-analytics-repository" }

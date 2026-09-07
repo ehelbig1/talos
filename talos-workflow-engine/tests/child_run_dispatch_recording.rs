@@ -125,8 +125,11 @@ impl talos_workflow_engine_core::WorkflowGraphStore for KeyedGraphStore {
         &self,
         id: Uuid,
         _user: Uuid,
-    ) -> Result<Option<serde_json::Value>, BoxError> {
-        Ok(self.graphs.get(&id).cloned())
+    ) -> Result<talos_workflow_engine_core::GraphLookup, BoxError> {
+        Ok(self.graphs.get(&id).cloned().map_or(
+            talos_workflow_engine_core::GraphLookup::Absent,
+            talos_workflow_engine_core::GraphLookup::Found,
+        ))
     }
     async fn get_graphs(
         &self,

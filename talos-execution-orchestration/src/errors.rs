@@ -69,6 +69,18 @@ pub enum OrchestrationError {
     /// describe the same state differently.
     #[error("workflow {0} is not dispatchable ({1})")]
     WorkflowNotLive(Uuid, &'static str),
+    /// Workflow `status = 'archived'` — the narrow lifecycle gate
+    /// (2026-09-07).
+    ///
+    /// Deliberately NOT `WorkflowDisabled`. `is_enabled` and `status` are two
+    /// columns for one fact with two independent writers, and every archived
+    /// row on the reference fleet still reads `is_enabled = true`; telling an
+    /// operator their retired workflow is "disabled" points them at the pause
+    /// toggle, which is not the control that refused. And NOT
+    /// `WorkflowNotFound`: the row is there, `list_workflows` returns it, and
+    /// "not found" is the misleading-report class checks 74/76/79/81 exist for.
+    #[error("{}", talos_workflow_liveness::dispatch::archived_refusal_message(&.0.to_string()))]
+    WorkflowArchived(Uuid),
 
     /// Wrong source state for the operation. Examples: retry on a
     /// running execution, replay on a missing workflow row, ack on
@@ -147,6 +159,7 @@ impl OrchestrationError {
             Self::ExecutionPaused
             | Self::WorkflowDisabled(_)
             | Self::WorkflowNotLive(..)
+            | Self::WorkflowArchived(_)
             | Self::StatusConflict(_) => -32003,
             Self::AuthorizationDenied(_) => -32004,
             Self::ConcurrencyLimitExceeded(_) => -32005,

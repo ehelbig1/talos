@@ -5192,6 +5192,18 @@ async fn handle_call_workflow(
         .await
     {
         Ok(talos_workflow_repository::ConcurrencyAdmission::Created) => {}
+        // The NARROW lifecycle gate (2026-09-07). `call_workflow` checks
+        // `is_enabled` above; that is the OTHER column, with its own writer.
+        Ok(talos_workflow_repository::ConcurrencyAdmission::WorkflowArchived) => {
+            talos_metrics::record_dispatch_refusal(
+                talos_workflow_liveness::dispatch::DispatchPath::CallWorkflow,
+            );
+            return Some(mcp_error(
+                req_id.clone(),
+                -32003,
+                &talos_workflow_liveness::dispatch::archived_refusal_message(&wf_id.to_string()),
+            ));
+        }
         Ok(talos_workflow_repository::ConcurrencyAdmission::LimitReached { limit, running }) => {
             return Some(mcp_error(
                 req_id.clone(),
@@ -6290,6 +6302,22 @@ async fn handle_bulk_trigger_workflow(
             .await
         {
             Ok(talos_workflow_repository::ConcurrencyAdmission::Created) => {}
+            // The NARROW lifecycle gate (2026-09-07), as the atomic backstop:
+            // no execution row was written for this input.
+            Ok(talos_workflow_repository::ConcurrencyAdmission::WorkflowArchived) => {
+                talos_metrics::record_dispatch_refusal(
+                    talos_workflow_liveness::dispatch::DispatchPath::BulkTrigger,
+                );
+                results.push(serde_json::json!({
+                    "input_index": idx,
+                    "execution_id": serde_json::Value::Null,
+                    "status": "archived",
+                    "error": talos_workflow_liveness::dispatch::archived_refusal_message(
+                        &wf_id.to_string(),
+                    ),
+                }));
+                continue;
+            }
             Ok(talos_workflow_repository::ConcurrencyAdmission::LimitReached {
                 limit,
                 running,
@@ -6713,6 +6741,22 @@ async fn handle_trigger_workflow_as_actors(
             .await
         {
             Ok(talos_workflow_repository::ConcurrencyAdmission::Created) => {}
+            // The NARROW lifecycle gate (2026-09-07), as the atomic backstop:
+            // no execution row was written for this input.
+            Ok(talos_workflow_repository::ConcurrencyAdmission::WorkflowArchived) => {
+                talos_metrics::record_dispatch_refusal(
+                    talos_workflow_liveness::dispatch::DispatchPath::TriggerAsActors,
+                );
+                results.push(serde_json::json!({
+                    "actor_id": actor_id.to_string(),
+                    "execution_id": serde_json::Value::Null,
+                    "status": "archived",
+                    "error": talos_workflow_liveness::dispatch::archived_refusal_message(
+                        &wf_id.to_string(),
+                    ),
+                }));
+                continue;
+            }
             Ok(talos_workflow_repository::ConcurrencyAdmission::LimitReached {
                 limit,
                 running,

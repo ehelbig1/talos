@@ -92,6 +92,34 @@ impl ExecutionOrchestrationService {
         // have to UNDO the mark on auth failure, which is fragile.
         // Loading early costs nothing on the happy path and moves the
         // cheap fail (deleted workflow) ahead of the expensive admission.
+        // 2.4b. The NARROW lifecycle gate (2026-09-07). Retry does NOT pass
+        // through `create_execution_under_concurrency_limit` — it reuses the
+        // original execution row — so the admission backstop that covers the
+        // seven trigger surfaces cannot see it, and it carries its own.
+        // Hoisted ABOVE the graph load for the same reason the graph load was
+        // hoisted above the auth gate: the cheap categorical refusal goes
+        // first.
+        match self
+            .workflow_repo
+            .dispatch_lifecycle(workflow_id, user_id)
+            .await
+            .map_err(OrchestrationError::Internal)?
+        {
+            talos_workflow_repository::WorkflowDispatchLookup::Dispatchable => {}
+            talos_workflow_repository::WorkflowDispatchLookup::Retired => {
+                talos_metrics::record_dispatch_refusal(
+                    talos_workflow_liveness::dispatch::DispatchPath::Retry,
+                );
+                return Err(OrchestrationError::WorkflowArchived(workflow_id));
+            }
+            // Kept distinct from the refusal: the graph load below would
+            // report the same thing, but reporting it HERE means the two
+            // outcomes never share one message.
+            talos_workflow_repository::WorkflowDispatchLookup::Absent => {
+                return Err(OrchestrationError::WorkflowNotFound(workflow_id))
+            }
+        }
+
         let graph_json = match self
             .execution_repo
             .get_active_version_graph(workflow_id, user_id)

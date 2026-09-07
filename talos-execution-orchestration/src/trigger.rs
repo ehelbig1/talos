@@ -438,6 +438,17 @@ impl ExecutionOrchestrationService {
             .map_err(OrchestrationError::Internal)?;
         match admission {
             talos_workflow_repository::ConcurrencyAdmission::Created => {}
+            talos_workflow_repository::ConcurrencyAdmission::WorkflowArchived => {
+                // The NARROW lifecycle gate (2026-09-07), reached here as the
+                // atomic BACKSTOP: this path's own `is_enabled` check three
+                // steps up says nothing about `status`, and the two columns
+                // have independent writers. Refusing inside the admission
+                // transaction means no execution row was written.
+                talos_metrics::record_dispatch_refusal(
+                    talos_workflow_liveness::dispatch::DispatchPath::Trigger,
+                );
+                return Err(OrchestrationError::WorkflowArchived(workflow_id));
+            }
             talos_workflow_repository::ConcurrencyAdmission::LimitReached { limit, running } => {
                 return Err(OrchestrationError::ConcurrencyLimitExceeded(format!(
                     "workflow has reached its concurrency limit ({} running, max {}); \

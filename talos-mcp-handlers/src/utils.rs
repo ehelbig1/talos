@@ -364,6 +364,12 @@ pub fn orchestration_error_to_response(
         E::WorkflowNotLive(_, reason) => {
             talos_workflow_repository::not_dispatchable_message(reason)
         }
+        // ARCHIVED is a different column from DISABLED and a different repair.
+        // `enable_workflow` would not help — the workflow is not paused, it is
+        // retired — and "not found" would send the operator hunting a deletion
+        // that did not happen. The Display impl carries the one wording, from
+        // `talos_workflow_liveness::dispatch::archived_refusal_message`.
+        E::WorkflowArchived(_) => err.to_string(),
         E::WorkflowNotFound(_) => "Workflow not found or access denied".to_string(),
         E::ExecutionNotFound(_) => "Execution not found or access denied".to_string(),
         // ARCHIVED is not ABSENT: the row exists and the caller may see it,

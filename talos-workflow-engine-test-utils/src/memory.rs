@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use dashmap::DashMap;
 use serde_json::Value as JsonValue;
 use talos_workflow_engine_core::{
-    BoxError, CheckpointStore, ModuleFetcher, SecretsResolver, WasmModuleArtifact,
+    BoxError, CheckpointStore, GraphLookup, ModuleFetcher, SecretsResolver, WasmModuleArtifact,
     WorkflowGraphStore,
 };
 use uuid::Uuid;
@@ -182,6 +182,11 @@ pub struct InMemoryWorkflowGraphStore {
     graphs: Arc<DashMap<Uuid, JsonValue>>,
     by_name: Arc<DashMap<String, Uuid>>,
     by_capability: Arc<DashMap<Vec<String>, (Uuid, String)>>,
+    /// Workflows an operator has retired. Seeded by
+    /// [`InMemoryWorkflowGraphStore::with_archived`]; reported as
+    /// [`GraphLookup::Archived`] and excluded from name / capability
+    /// resolution, mirroring the production store.
+    archived: Arc<DashMap<Uuid, ()>>,
 }
 
 impl InMemoryWorkflowGraphStore {
@@ -193,6 +198,16 @@ impl InMemoryWorkflowGraphStore {
     /// Seed a workflow graph.
     pub fn with_graph(self, workflow_id: Uuid, graph_json: JsonValue) -> Self {
         self.graphs.insert(workflow_id, graph_json);
+        self
+    }
+
+    /// Seed a workflow that an operator has ARCHIVED — the narrow lifecycle
+    /// gate's refusal case (2026-09-07). Seed its graph with
+    /// [`Self::with_graph`] as well: an archived workflow still HAS a graph,
+    /// and a test that omits it would pass for the wrong reason (absent, not
+    /// refused).
+    pub fn with_archived(self, workflow_id: Uuid) -> Self {
+        self.archived.insert(workflow_id, ());
         self
     }
 
@@ -228,16 +243,25 @@ impl std::fmt::Debug for InMemoryWorkflowGraphStore {
 
 #[async_trait]
 impl WorkflowGraphStore for InMemoryWorkflowGraphStore {
-    async fn get_graph(
-        &self,
-        workflow_id: Uuid,
-        _user_id: Uuid,
-    ) -> Result<Option<JsonValue>, BoxError> {
-        Ok(self.graphs.get(&workflow_id).map(|e| e.clone()))
+    async fn get_graph(&self, workflow_id: Uuid, _user_id: Uuid) -> Result<GraphLookup, BoxError> {
+        if self.archived.contains_key(&workflow_id) {
+            return Ok(GraphLookup::Archived);
+        }
+        Ok(self
+            .graphs
+            .get(&workflow_id)
+            .map_or(GraphLookup::Absent, |e| GraphLookup::Found(e.clone())))
     }
 
     async fn resolve_by_name(&self, name: &str, _user_id: Uuid) -> Result<Option<Uuid>, BoxError> {
-        Ok(self.by_name.get(name).map(|e| *e))
+        // Resolution EXCLUDES a retired candidate rather than returning it and
+        // refusing later — the production store does the same, in SQL, so a
+        // retired workflow cannot shadow a live one.
+        Ok(self
+            .by_name
+            .get(name)
+            .map(|e| *e)
+            .filter(|id| !self.archived.contains_key(id)))
     }
 
     async fn resolve_by_capabilities(
@@ -246,7 +270,11 @@ impl WorkflowGraphStore for InMemoryWorkflowGraphStore {
         _user_id: Uuid,
     ) -> Result<Option<(Uuid, String)>, BoxError> {
         let key = required_capabilities.to_vec();
-        Ok(self.by_capability.get(&key).map(|e| e.clone()))
+        Ok(self
+            .by_capability
+            .get(&key)
+            .map(|e| e.clone())
+            .filter(|(id, _)| !self.archived.contains_key(id)))
     }
 }
 
@@ -468,7 +496,10 @@ mod tests {
             .with_name("my-workflow", id)
             .with_capabilities(vec!["send_email".into()], id, "email-workflow");
 
-        assert!(store.get_graph(id, Uuid::nil()).await.unwrap().is_some());
+        assert!(matches!(
+            store.get_graph(id, Uuid::nil()).await.unwrap(),
+            GraphLookup::Found(_)
+        ));
         assert_eq!(
             store
                 .resolve_by_name("my-workflow", Uuid::nil())
@@ -481,6 +512,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got, Some((id, "email-workflow".into())));
+    }
+
+    /// The narrow lifecycle gate, in the harness the engine tests use.
+    ///
+    /// A PAIR, because "the archived one is refused" is only worth something
+    /// beside "a live one still resolves": a store that answered `Absent` to
+    /// everything would pass the first half alone. Both halves assert on the
+    /// SAME seeded graph, so the difference really is the lifecycle.
+    #[tokio::test]
+    async fn an_archived_workflow_is_refused_not_reported_missing() {
+        let live = Uuid::new_v4();
+        let retired = Uuid::new_v4();
+        let store = InMemoryWorkflowGraphStore::new()
+            .with_graph(live, serde_json::json!({"nodes": []}))
+            .with_name("live", live)
+            .with_capabilities(vec!["send_email".into()], live, "live")
+            // An archived workflow still HAS a graph and a name and
+            // capabilities — seeding it without them would prove nothing.
+            .with_graph(retired, serde_json::json!({"nodes": []}))
+            .with_name("retired", retired)
+            .with_capabilities(vec!["archive_me".into()], retired, "retired")
+            .with_archived(retired);
+
+        // ARCHIVED, not ABSENT — the whole point of the three-valued read.
+        assert_eq!(
+            store.get_graph(retired, Uuid::nil()).await.unwrap(),
+            GraphLookup::Archived
+        );
+        // And a workflow that really is absent still reads Absent.
+        assert_eq!(
+            store.get_graph(Uuid::new_v4(), Uuid::nil()).await.unwrap(),
+            GraphLookup::Absent
+        );
+        // Resolution EXCLUDES the retired candidate…
+        assert_eq!(
+            store.resolve_by_name("retired", Uuid::nil()).await.unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .resolve_by_capabilities(&["archive_me".into()], Uuid::nil())
+                .await
+                .unwrap(),
+            None
+        );
+        // …and the batch prefetch skips it, so a cache hit is always
+        // dispatchable and the refusal is reported once, by `get_graph`.
+        let batch = store
+            .get_graphs(&[live, retired], Uuid::nil())
+            .await
+            .unwrap();
+        assert!(batch.contains_key(&live));
+        assert!(!batch.contains_key(&retired));
+
+        // THE CONTROL: the live twin is untouched on all four surfaces.
+        assert!(matches!(
+            store.get_graph(live, Uuid::nil()).await.unwrap(),
+            GraphLookup::Found(_)
+        ));
+        assert_eq!(
+            store.resolve_by_name("live", Uuid::nil()).await.unwrap(),
+            Some(live)
+        );
+        assert_eq!(
+            store
+                .resolve_by_capabilities(&["send_email".into()], Uuid::nil())
+                .await
+                .unwrap(),
+            Some((live, "live".into()))
+        );
     }
 
     #[tokio::test]

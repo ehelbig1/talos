@@ -1931,6 +1931,50 @@ impl WebhookRouter {
         };
         match admission {
             talos_workflow_repository::ConcurrencyAdmission::Created => {}
+            talos_workflow_repository::ConcurrencyAdmission::WorkflowArchived => {
+                // The NARROW lifecycle gate (2026-09-07).
+                //
+                // The CALLER is told exactly what it is told about a workflow
+                // that is not there — the same 404 and the same four words as
+                // the load at the top of this function. That is deliberate and
+                // it is the one place in this change where a refusal is
+                // rendered as an absence ON PURPOSE: an inbound webhook caller
+                // is unauthenticated with respect to the workflow, and a reply
+                // that distinguishes "archived" from "no such workflow" is an
+                // existence oracle for anyone who can guess a trigger id. Same
+                // argument as `caller_facing_unauthorized` and #754's
+                // collapsed `write_ceiling_unreadable` reply.
+                //
+                // There is no paused-workflow response to mirror, and that was
+                // MEASURED rather than assumed: this path consults
+                // `workflows.is_enabled` nowhere, in SQL or in Rust, so a
+                // disabled workflow still fires by webhook today. The narrow
+                // gate does not change that — it is the other column.
+                //
+                // The OPERATOR keeps the distinction, in the counter and in a
+                // WARN. WARN rather than the scheduler's DEBUG because this is
+                // not a recurring tick: a webhook refusal is one inbound
+                // request, so the line cannot become the permanent noise
+                // check 69 exists for, and an upstream that keeps posting to a
+                // retired workflow is worth seeing.
+                //
+                // The dedup claim is NOT released, matching the "Workflow not
+                // found" exit above: releasing invites a retry, and this
+                // refusal cannot be repaired by retrying.
+                talos_metrics::record_dispatch_refusal(
+                    talos_workflow_liveness::dispatch::DispatchPath::Webhook,
+                );
+                tracing::warn!(
+                    target: talos_workflow_liveness::dispatch::REFUSAL_TARGET,
+                    event_kind = talos_workflow_liveness::dispatch::REFUSAL_EVENT_KIND,
+                    path = talos_workflow_liveness::dispatch::DispatchPath::Webhook.as_str(),
+                    workflow_id = %workflow_id,
+                    trigger_id = %trigger_id,
+                    "Webhook fired at an archived workflow; refusing. The caller \
+                     is told only 'Workflow not found'."
+                );
+                return Ok((StatusCode::NOT_FOUND, "Workflow not found").into_response());
+            }
             talos_workflow_repository::ConcurrencyAdmission::LimitReached { limit, .. } => {
                 // FU-3: transient pre-dispatch failure — a concurrency slot may free
                 // up, so a later retry can succeed; release the dedup claim.

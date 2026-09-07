@@ -12,6 +12,12 @@ anyhow.workspace = true
 # talos-metrics only uses the text-exposition API (Registry/Counter/Opts), so no
 # protobuf feature is needed. Kept in lockstep with controller/worker prometheus 0.14.
 prometheus = "0.14"
+# The closed set of `path` label values on `talos_dispatch_refused_total` is
+# `talos_workflow_liveness::dispatch::DispatchPath::ALL`. Imported rather than
+# duplicated: that crate has NO dependencies, so unlike
+# `RPC_WRITE_CEILING_SUBJECTS` (whose owner depends on this crate) there is no
+# cycle, and one list cannot drift from itself.
+talos-workflow-liveness = { path = "../talos-workflow-liveness" }
 
 [lints]
 workspace = true

@@ -3121,6 +3121,35 @@ async fn handle_enqueue_workflow(
         }
     };
 
+    // The NARROW lifecycle gate (2026-09-07). Reported as its own status
+    // rather than folded into `throttled`: nothing was written either way, but
+    // "throttled" invites the caller to wait for capacity that will never
+    // arrive, and a retired workflow's admission cannot be repaired by waiting.
+    if admission.archived {
+        talos_metrics::record_dispatch_refusal(
+            talos_workflow_liveness::dispatch::DispatchPath::Enqueue,
+        );
+        let msg = talos_workflow_liveness::dispatch::archived_refusal_message(&wf_id.to_string());
+        for idx in 0..inputs.len() {
+            results.push(serde_json::json!({
+                "input_index": idx,
+                "execution_id": serde_json::Value::Null,
+                "status": "archived",
+                "error": msg,
+            }));
+        }
+        return mcp_text(
+            req_id,
+            &serde_json::to_string_pretty(&serde_json::json!({
+                "queued": 0,
+                "rate_per_second": rate_per_second,
+                "executions": results,
+                "monitor_with": null
+            }))
+            .unwrap_or_default(),
+        );
+    }
+
     let admitted = admission.inserted;
     let throttled = inputs.len() - admitted;
 
