@@ -484,6 +484,10 @@ pub struct ChainSweepSnapshot {
     /// Job chains carrying a BYTE-IDENTICAL redelivery. Never part of
     /// `failed`; when it is the only finding the chain is in `verified_ok`.
     pub duplicate_delivery: usize,
+    /// Job chains holding MORE THAN ONE controller dispatch attempt — a
+    /// re-dispatched `job_id`. A retry, not a finding: such a chain verifies
+    /// and is counted in `verified_ok`.
+    pub multi_attempt: usize,
     pub errored: usize,
     /// Jobs with no `workflow_execution_id`, so no genesis pair and no
     /// attempt. Disclosed, never folded into a clean count.
@@ -735,6 +739,7 @@ mod verifier_tests {
             empty: 0,
             failed: 0,
             duplicate_delivery: 0,
+            multi_attempt: 0,
             errored: 1,
             unbound: 0,
             cap_hit: false,

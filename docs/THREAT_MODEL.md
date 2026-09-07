@@ -140,9 +140,34 @@ The MCP endpoint exposes 348+ tools via JSON-RPC over SSE and Streamable HTTP tr
   one monotonic sequence over the whole job. Note the residual: the anchor is
   one per DISPATCH, and a controller-level retry re-dispatches the same
   `job_id`; reconstructing a prior dispatch's ledger would need persisted state
-  the credential-free worker cannot read, so those copies remain and are
-  classified at the verifier like any other cross-batch pair.
-- **File:** `talos-audit-event` (shared chain/HMAC + `verify_chain` + the duplicate classification), `talos-audit-ledger` (consumer + inline verify + `batch_dedupe` + `verifier` module: the read-only identity and the failure classification), `worker/src/audit.rs`, `talos-worker-runtime/src/runtime.rs` (`seal_job_audit_chain`)
+  the credential-free worker cannot read.
+- **A JOB IS ONE CHAIN PER CONTROLLER DISPATCH ATTEMPT.** That residual is now
+  closed at the source rather than at the verifier. `JobRequest.dispatch_attempt`
+  (default 0, HMAC-bound by conditional append so an all-default dispatch is
+  byte-identical on the wire and in its MAC) tells the credential-free worker
+  which dispatch it is running; the worker stamps it on every `AuditEvent` it
+  appends (also conditional, so an attempt-0 event's hash and HMAC are byte-for-byte
+  what they were before the field existed and every object already in the bucket
+  keeps verifying), and `verify_chain` PARTITIONS a prefix by attempt and
+  verifies each partition as its own chain **from the same genesis** — the
+  attempt is a partition key, never a genesis input, so old and new chains share
+  one rule. Within one attempt `DuplicateDelivery` and `DuplicateSequence` keep
+  the meanings above. The attempt is bound both ways: stripping it re-merges two
+  dispatches and manufactures a false `DuplicateSequence`; forging one splits a
+  tampered chain into partitions that each verify — both fail signature
+  verification. Disclosed, never silent: the sweep reports
+  `jobs_with_multiple_attempts`, `security_audit`'s round-trip check names the
+  attempt count on the chain it probed, the GraphQL job report carries
+  `dispatchAttempts`, and `talos_audit_chain_multi_attempt_jobs_total` is
+  pre-seeded at 0. Nothing alerts on it — a retry is the platform working.
+  **Deploy ordering: workers roll first or together.** Attempt 0 is
+  byte-identical so first dispatches are unaffected in both directions, but a new
+  controller's RETRY is signed over `:attempt=n`, which an old worker's signing
+  payload cannot reproduce — it refuses the retry (fail-closed, bounded to the
+  width of the rollout).
+  **Historical prefixes carry no attempt on either copy, so they partition into
+  one attempt and stay CONFLICTING**; they age out of the sweep's 2 h window.
+- **File:** `talos-audit-event` (shared chain/HMAC + `verify_chain` + the duplicate classification + the per-attempt partition), `talos-audit-ledger` (consumer + inline verify + `batch_dedupe` + `verifier` module: the read-only identity and the failure classification), `talos-workflow-engine-nats/src/dispatcher.rs` (`resign_payload_for_retry` — the one site that stamps the attempt), `worker/src/audit.rs`, `talos-worker-runtime/src/runtime.rs` (`seal_job_audit_chain`)
 
 ### Information Disclosure
 - **Threat:** Tool responses leak internal errors, stack traces, or secret values.

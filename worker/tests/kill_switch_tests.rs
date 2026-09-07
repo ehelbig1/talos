@@ -564,6 +564,7 @@ async fn cancellation_preempts_a_compute_bound_module() {
                 None, // egress_scope
                 None, // llm_usage_out
                 None, // host_diag_out
+                0,    // dispatch_attempt
             )
             .await
         })
@@ -699,6 +700,7 @@ async fn an_uncancelled_compute_bound_job_still_traps_at_its_own_budget() {
             None,
             None,
             None,
+            0, // dispatch_attempt
         )
         .await;
     let elapsed = start.elapsed();

@@ -40,6 +40,7 @@ fn job_request_roundtrip() {
         dry_run: false,
         reply_topic: None,
         idempotency_key: None,
+        dispatch_attempt: 0,
         max_llm_tier: LlmTier::default(),
         max_write_ceiling: WriteCeiling::default(),
         egress_scope: None,

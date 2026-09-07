@@ -1669,11 +1669,22 @@ pub struct AuditChainJobVerification {
     /// copies, which is a different fact from a verified chain of distinct
     /// events and must not render as one.
     pub duplicate_deliveries: i32,
+    /// How many CONTROLLER DISPATCH ATTEMPTS this prefix holds chains for.
+    ///
+    /// `1` for an ordinary job. `> 1` means the controller re-dispatched the
+    /// `job_id`; the credential-free worker cannot read the previous
+    /// dispatch's ledger, so each dispatch opened a fresh chain at sequence 1
+    /// against the same genesis, and each was verified separately. A retry, not
+    /// tamper evidence — `ok` is unaffected. Without this a reader cannot tell
+    /// "4 events" from "two dispatches of two", and `breaks` can name the same
+    /// `sequence` twice meaning two different records.
+    pub dispatch_attempts: i32,
 }
 
 impl From<talos_audit_ledger::ChainVerificationReport> for AuditChainJobVerification {
     fn from(r: talos_audit_ledger::ChainVerificationReport) -> Self {
         let duplicate_deliveries = i32::try_from(r.duplicate_delivery_count()).unwrap_or(i32::MAX);
+        let dispatch_attempts = i32::try_from(r.dispatch_attempt_count()).unwrap_or(i32::MAX);
         Self {
             module_execution_id: r.execution_id,
             workflow_execution_id: r.workflow_id,
@@ -1682,6 +1693,7 @@ impl From<talos_audit_ledger::ChainVerificationReport> for AuditChainJobVerifica
             signatures_checked: r.signatures_checked,
             breaks: r.breaks.iter().map(AuditChainBreak::from).collect(),
             duplicate_deliveries,
+            dispatch_attempts,
         }
     }
 }
@@ -1719,6 +1731,9 @@ pub struct AuditChainVerification {
     pub breaks: Vec<AuditChainBreak>,
     /// Summed over `jobs`.
     pub duplicate_deliveries: i32,
+    /// How many of `jobs` hold more than one controller dispatch attempt — a
+    /// re-dispatched `job_id`. A retry, not a finding; `ok` is unaffected.
+    pub jobs_with_multiple_attempts: i32,
     /// The per-job chains this aggregate is built from. EMPTY means nothing
     /// was verified, which is why `ok` is false in that case.
     pub jobs: Vec<AuditChainJobVerification>,
@@ -1749,6 +1764,9 @@ impl AuditChainVerification {
             .iter()
             .map(|j| j.duplicate_deliveries)
             .fold(0i32, i32::saturating_add);
+        let jobs_with_multiple_attempts: i32 =
+            i32::try_from(jobs.iter().filter(|j| j.dispatch_attempts > 1).count())
+                .unwrap_or(i32::MAX);
         Self {
             execution_id,
             workflow_id,
@@ -1761,6 +1779,7 @@ impl AuditChainVerification {
             signatures_checked: !jobs.is_empty() && jobs.iter().all(|j| j.signatures_checked),
             breaks,
             duplicate_deliveries,
+            jobs_with_multiple_attempts,
             jobs,
         }
     }
@@ -1823,7 +1842,73 @@ mod audit_chain_mapping_tests {
                     found: 4,
                 }]
             },
+            attempts: vec![talos_audit_ledger::AttemptChainReport {
+                dispatch_attempt: 0,
+                total_events,
+                ok,
+                breaks: vec![],
+            }],
         }
+    }
+
+    /// A report for a job the controller RE-DISPATCHED: two attempts, each its
+    /// own chain, both verified.
+    fn re_dispatched_report(id: &str) -> ChainVerificationReport {
+        ChainVerificationReport {
+            execution_id: id.to_string(),
+            workflow_id: "wfx".to_string(),
+            total_events: 4,
+            ok: true,
+            signatures_checked: true,
+            breaks: vec![],
+            attempts: vec![
+                talos_audit_ledger::AttemptChainReport {
+                    dispatch_attempt: 0,
+                    total_events: 2,
+                    ok: true,
+                    breaks: vec![],
+                },
+                talos_audit_ledger::AttemptChainReport {
+                    dispatch_attempt: 1,
+                    total_events: 2,
+                    ok: true,
+                    breaks: vec![],
+                },
+            ],
+        }
+    }
+
+    /// A re-dispatched job renders `dispatchAttempts: 2` and stays `ok` — and
+    /// the aggregate counts it. Without the field a caller reads "4 events,
+    /// verified" and cannot tell it was two dispatches of two, which is the
+    /// shape that used to be reported as tamper evidence.
+    #[test]
+    fn a_re_dispatched_job_renders_its_attempt_count_and_stays_ok() {
+        let one = AuditChainJobVerification::from(re_dispatched_report("m1"));
+        assert_eq!(one.dispatch_attempts, 2);
+        assert!(one.ok);
+
+        let agg = AuditChainVerification::aggregate(
+            "wfx-1".to_string(),
+            "wf".to_string(),
+            vec![re_dispatched_report("m1"), report("m2", true, 3)],
+        );
+        assert!(agg.ok);
+        assert_eq!(agg.jobs_with_multiple_attempts, 1);
+        assert_eq!(agg.total_events, 7);
+    }
+
+    /// The control: an ordinary job reports ONE attempt and the aggregate
+    /// counts none, so a non-zero reading means what it says.
+    #[test]
+    fn an_ordinary_job_reports_one_attempt() {
+        let agg = AuditChainVerification::aggregate(
+            "wfx-1".to_string(),
+            "wf".to_string(),
+            vec![report("m1", true, 3)],
+        );
+        assert_eq!(agg.jobs[0].dispatch_attempts, 1);
+        assert_eq!(agg.jobs_with_multiple_attempts, 0);
     }
 
     #[test]

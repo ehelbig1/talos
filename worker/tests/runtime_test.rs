@@ -39,6 +39,7 @@ async fn test_runtime_no_nested_block_on() {
             None,                                             // egress_scope: tier default
             None,                                             // llm_usage_out — not collected
             None,                                             // host_diag_out — not collected
+            0,                                                // dispatch_attempt
         )
         .await;
 

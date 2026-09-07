@@ -823,7 +823,9 @@ pub(crate) async fn execute_job_with_retry(
                     // security impact: a fresh nonce + valid HMAC is
                     // exactly what a non-retry dispatch would produce.
                     if let Some(key) = worker_shared_key {
-                        current_payload = resign_payload_for_retry(&current_payload, key)
+                        // `attempts` was incremented above, so the first retry
+                        // is dispatch attempt 1 — the first dispatch is 0.
+                        current_payload = resign_payload_for_retry(&current_payload, key, attempts)
                             .unwrap_or(current_payload);
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
@@ -854,8 +856,9 @@ pub(crate) async fn execute_job_with_retry(
                 // edge case where the worker did receive it and cached
                 // the nonce before the controller's request timed out.
                 if let Some(key) = worker_shared_key {
-                    current_payload =
-                        resign_payload_for_retry(&current_payload, key).unwrap_or(current_payload);
+                    // Same counter, same meaning: attempt 1 is the first retry.
+                    current_payload = resign_payload_for_retry(&current_payload, key, attempts)
+                        .unwrap_or(current_payload);
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             }
@@ -888,7 +891,7 @@ pub(crate) async fn execute_job_with_retry(
 /// hence the signature) changes. Routing this through
 /// `serde_json::to_value`/`from_value` instead would re-derive the payload text
 /// and could change the hash — see `SignedJson`'s docs.
-fn resign_payload_for_retry(payload: &[u8], key: &[u8]) -> Option<Vec<u8>> {
+fn resign_payload_for_retry(payload: &[u8], key: &[u8], dispatch_attempt: u32) -> Option<Vec<u8>> {
     let mut req: JobRequest = match serde_json::from_slice(payload) {
         Ok(r) => r,
         Err(e) => {
@@ -900,6 +903,25 @@ fn resign_payload_for_retry(payload: &[u8], key: &[u8]) -> Option<Vec<u8>> {
             return None;
         }
     };
+    // Stamp the attempt BEFORE signing, so the index is HMAC-bound and the
+    // worker can tell a re-dispatch from a first dispatch.
+    //
+    // The worker is credential-free: it cannot read the previous dispatch's
+    // audit ledger, so it opens a NEW hash chain at `sequence_num` 1 against
+    // the same genesis. Two such chains land under one WORM prefix and, with
+    // no key to tell them apart, the offline verifier reported
+    // `DuplicateSequence` — positive tamper evidence — for a job that had
+    // merely been retried. Measured on the live bucket 2026-09-07: 150 prefixes
+    // hold more than one object, and the 11- and 12-copy ones match
+    // `node_retrying` rows one for one.
+    //
+    // This is the ONLY place the attempt can be stamped, and that is a
+    // structural fact rather than a convenience: a retry that is NOT re-signed
+    // re-sends the previous nonce, which `JobRequest::verify_dispatch` rejects
+    // as a replay in the worker ABOVE the ledger — so it never mints a second
+    // chain to partition. Every path that can write a second chain passes
+    // through here.
+    req.dispatch_attempt = dispatch_attempt;
     // RFC 0010 P1: re-sign under the configured dispatch scheme so a retry
     // matches the primary path (Ed25519 when configured, else HMAC).
     let sign_result = match talos_workflow_job_protocol::configured_dispatch_signer() {
@@ -936,7 +958,7 @@ mod resign_payload_tests {
     /// (`5.455171886890906e-115` cycles forever under repeated
     /// serialize→parse→serialize). Any re-derivation of the payload text on
     /// the way through `resign_payload_for_retry` would show up here.
-    fn signed_request(key: &[u8]) -> Vec<u8> {
+    pub(super) fn signed_request(key: &[u8]) -> Vec<u8> {
         let mut req = JobRequest {
             crypto_scheme: 0,
             sealing: 0,
@@ -971,6 +993,7 @@ mod resign_payload_tests {
             dry_run: false,
             reply_topic: None,
             idempotency_key: None,
+            dispatch_attempt: 0,
         };
         req.sign(key).expect("sign");
         serde_json::to_vec(&req).expect("serialize")
@@ -986,7 +1009,7 @@ mod resign_payload_tests {
         let original_bytes = signed_request(&key);
         let original: JobRequest = serde_json::from_slice(&original_bytes).unwrap();
 
-        let resigned_bytes = resign_payload_for_retry(&original_bytes, &key).expect("re-sign");
+        let resigned_bytes = resign_payload_for_retry(&original_bytes, &key, 1).expect("re-sign");
         let resigned: JobRequest = serde_json::from_slice(&resigned_bytes).unwrap();
 
         assert_eq!(
@@ -1002,6 +1025,55 @@ mod resign_payload_tests {
         resigned
             .verify_no_replay(&key, 300)
             .expect("re-signed request verifies");
+    }
+
+    /// The re-dispatch STAMPS the attempt, and stamps it INSIDE the signature.
+    ///
+    /// This is the whole controller-side change: a credential-free worker
+    /// cannot know it is running a re-dispatch of a `job_id` it has already
+    /// seen, so its audit ledger restarts at `sequence_num` 1 against the same
+    /// genesis and the offline verifier read the two chains as one with a
+    /// duplicated sequence — tamper evidence, on a retry. The stamp is the
+    /// controller telling it.
+    #[test]
+    fn resign_stamps_the_dispatch_attempt_and_binds_it() {
+        let key = [7u8; 32];
+        let original_bytes = signed_request(&key);
+        let original: JobRequest = serde_json::from_slice(&original_bytes).unwrap();
+        assert_eq!(
+            original.dispatch_attempt, 0,
+            "the first dispatch is attempt 0"
+        );
+
+        let resigned_bytes = resign_payload_for_retry(&original_bytes, &key, 2).expect("re-sign");
+        let mut resigned: JobRequest = serde_json::from_slice(&resigned_bytes).unwrap();
+        assert_eq!(resigned.dispatch_attempt, 2);
+        resigned
+            .verify_no_replay(&key, 300)
+            .expect("the stamped request verifies");
+
+        // BOUND, not merely carried: an on-wire strip re-merges the two audit
+        // chains and manufactures a false tamper finding, so it must not verify.
+        resigned.dispatch_attempt = 0;
+        assert!(
+            resigned.verify_no_replay(&key, 300).is_err(),
+            "stripping the stamped attempt must invalidate the signature"
+        );
+    }
+
+    /// Attempt 0 through the same function is byte-identical in its SIGNED
+    /// bytes to the pre-field behaviour — the deploy-compat half. Only the
+    /// nonce and the signature move.
+    #[test]
+    fn resigning_at_attempt_zero_ships_nothing_new_on_the_wire() {
+        let key = [7u8; 32];
+        let original_bytes = signed_request(&key);
+        let resigned_bytes = resign_payload_for_retry(&original_bytes, &key, 0).expect("re-sign");
+        let text = String::from_utf8(resigned_bytes).expect("utf8");
+        assert!(
+            !text.contains("dispatch_attempt"),
+            "attempt 0 must not appear on the wire: {text}"
+        );
     }
 }
 
@@ -1263,6 +1335,12 @@ impl NodeDispatcher for NatsNodeDispatcher {
             // append) so it can't be stripped/swapped on the wire. `None` for
             // every other dispatch — ships nothing.
             idempotency_key,
+            // The FIRST dispatch is attempt 0 and appends nothing to the
+            // signing payload, so this request is byte-identical to the
+            // pre-field wire format. Retries are stamped by
+            // `resign_payload_for_retry`, which is the only path that can
+            // produce a second audit chain under this job's prefix.
+            dispatch_attempt: 0,
         };
 
         // RFC 0010 P3 (D3b): when the engine resolved PLAINTEXT secrets for this
@@ -2689,6 +2767,116 @@ mod budget_clamp_loop_tests {
             budget_secs,
         )
         .await
+    }
+
+    /// Transport that records every payload it is handed and fails the first
+    /// `fail_first` attempts at the APPLICATION level, so the loop retries.
+    struct RecordingTransport {
+        payloads: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        fail_first: usize,
+    }
+
+    #[async_trait]
+    impl JobTransport for RecordingTransport {
+        async fn request(&self, _topic: &str, payload: Vec<u8>) -> Result<Vec<u8>, BoxError> {
+            let n = {
+                let mut g = self.payloads.lock().expect("lock");
+                g.push(payload);
+                g.len()
+            };
+            let failing = n <= self.fail_first;
+            let jr = JobResult {
+                llm_usage: vec![],
+                job_id: uuid::Uuid::nil(),
+                status: if failing {
+                    JobStatus::Failed
+                } else {
+                    JobStatus::Success
+                },
+                output_payload: if failing {
+                    serde_json::json!({"error": "connection reset"})
+                } else {
+                    serde_json::json!({"ok": true})
+                }
+                .into(),
+                logs: vec![],
+                execution_time_ms: 1,
+                signature: vec![],
+                result_nonce: String::new(),
+                worker_id: String::new(),
+                crypto_scheme: 0,
+            };
+            Ok(serde_json::to_vec(&jr).unwrap())
+        }
+    }
+
+    /// THE CALL-SITE GUARD. `resign_payload_for_retry` taking an attempt is
+    /// worth nothing if the loop hands it a constant, and its own unit test
+    /// cannot see that — it drives the function, not the call site. This drives
+    /// the REAL `execute_job_with_retry` and reads the attempt off the bytes
+    /// that went to the transport.
+    ///
+    /// Measured: passing `0` at both call sites instead of `attempts` leaves
+    /// every other test in this crate green.
+    #[tokio::test]
+    async fn the_retry_loop_stamps_an_ascending_dispatch_attempt_on_the_wire() {
+        use talos_workflow_job_protocol::JobRequest;
+        let key = [9u8; 32];
+        let first = super::resign_payload_tests::signed_request(&key);
+        let payloads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let t = RecordingTransport {
+            payloads: payloads.clone(),
+            fail_first: 2,
+        };
+        let classifier = AlwaysTransient;
+        let evaluator = NoExpr;
+        let out = execute_job_with_retry(
+            &t,
+            "test.topic".to_string(),
+            first,
+            30,
+            2, // max_retries — two retries, so three dispatches
+            1, // base backoff ms
+            Some(&key),
+            None,
+            None,
+            None,
+            None,
+            uuid::Uuid::nil(),
+            uuid::Uuid::nil(),
+            &classifier,
+            &evaluator,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("third dispatch succeeds");
+        assert_eq!(out, serde_json::json!({"ok": true}));
+
+        let sent = payloads.lock().expect("lock");
+        assert_eq!(sent.len(), 3, "one first dispatch plus two retries");
+        let attempts: Vec<u32> = sent
+            .iter()
+            .map(|p| {
+                serde_json::from_slice::<JobRequest>(p)
+                    .expect("payload is a JobRequest")
+                    .dispatch_attempt
+            })
+            .collect();
+        assert_eq!(
+            attempts,
+            vec![0, 1, 2],
+            "each controller dispatch must carry its own attempt index"
+        );
+        // And the first dispatch carries NOTHING on the wire, so a mixed fleet
+        // sees the pre-field bytes for every ordinary job.
+        assert!(
+            !String::from_utf8_lossy(&sent[0]).contains("dispatch_attempt"),
+            "attempt 0 must not appear on the wire"
+        );
     }
 
     /// PRE-FIX BEHAVIOUR, asserted in place. A 30 s allowance against a

@@ -781,6 +781,7 @@ mod signature_failure_payload_tests {
             dry_run: false,
             reply_topic: None,
             idempotency_key: None,
+            dispatch_attempt: 0,
         }
     }
 
@@ -1500,6 +1501,14 @@ async fn execute_job(
             // diagnostics take the NATS route to the log tables. The
             // in-process sink exists only for the id-less MCP surfaces.
             None,
+            // Which controller DISPATCH of this job we are running. Read from
+            // the HMAC-bound `JobRequest` field verified above, never inferred:
+            // this process is credential-free and cannot look at what a
+            // previous dispatch of the same `job_id` wrote, so it is told.
+            // It reaches exactly one thing — the audit ledger's partition key —
+            // so a re-dispatch's fresh chain is legible as a second attempt
+            // rather than as a duplicated sequence in the first.
+            req.dispatch_attempt,
         ),
     )
     .await

@@ -831,6 +831,7 @@ async fn run_replays(
                 None,
                 None, // llm_usage_out — replay diagnostics don't collect usage
                 None, // host_diag_out — no in-process diagnostic sink on this path
+                0,    // dispatch_attempt — replay is its own dispatch, never a controller retry
             )
             .await;
         let duration_ms = start.elapsed().as_millis() as i64;

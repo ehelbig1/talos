@@ -49,6 +49,7 @@ fn make_job_request() -> JobRequest {
         dry_run: false,
         reply_topic: None,
         idempotency_key: None,
+        dispatch_attempt: 0,
     }
 }
 
@@ -283,6 +284,73 @@ fn default_none_egress_scope_signature_is_stable() {
     assert!(
         req.verify(&key, 300).is_ok(),
         "default-None egress_scope must sign+verify cleanly"
+    );
+}
+
+#[test]
+fn tampered_dispatch_attempt_fails_verification() {
+    // The attempt is the partition key the offline audit verifier splits a
+    // job's chains on, so tampering with it is tampering with the AUDIT
+    // record's shape, not merely with routing. Moving a job to another
+    // attempt splits one chain into two partitions that each verify clean,
+    // which is a way to launder a substitution.
+    let key = test_key();
+    let mut req = make_job_request();
+    req.dispatch_attempt = 2;
+    req.sign(&key).unwrap();
+    req.dispatch_attempt = 3;
+    assert!(
+        req.verify(&key, 300).is_err(),
+        "Tampered dispatch_attempt must invalidate the signature"
+    );
+}
+
+#[test]
+fn stripping_signed_dispatch_attempt_fails_verification() {
+    // Stripping the attempt (non-zero → 0) re-merges a re-dispatch into the
+    // first dispatch's chain, manufacturing a `DuplicateSequence` — a false
+    // CRITICAL on the one control that exists to raise a true one. Because the
+    // field is bound ONLY when non-zero, stripping it changes the signed bytes.
+    let key = test_key();
+    let mut req = make_job_request();
+    req.dispatch_attempt = 1;
+    req.sign(&key).unwrap();
+    req.dispatch_attempt = 0;
+    assert!(
+        req.verify(&key, 300).is_err(),
+        "Stripping a signed dispatch_attempt must invalidate the signature"
+    );
+}
+
+#[test]
+fn forging_a_dispatch_attempt_onto_a_first_dispatch_fails_verification() {
+    // The other direction: a first dispatch signs NOTHING for this field, so
+    // an attacker adding one must also fail — otherwise a tampered chain could
+    // be split into per-attempt partitions that each verify.
+    let key = test_key();
+    let mut req = make_job_request();
+    assert_eq!(req.dispatch_attempt, 0);
+    req.sign(&key).unwrap();
+    req.dispatch_attempt = 1;
+    assert!(
+        req.verify(&key, 300).is_err(),
+        "Forging a dispatch_attempt onto a first dispatch must invalidate the signature"
+    );
+}
+
+#[test]
+fn default_zero_dispatch_attempt_signature_is_stable() {
+    // The default (0) appends nothing to the signing payload, so a round-trip
+    // signs+verifies exactly as it did before the field existed. This is the
+    // deploy-compat half: every ordinary dispatch on a mixed fleet is
+    // byte-identical.
+    let key = test_key();
+    let mut req = make_job_request();
+    assert_eq!(req.dispatch_attempt, 0);
+    req.sign(&key).unwrap();
+    assert!(
+        req.verify(&key, 300).is_ok(),
+        "default-zero dispatch_attempt must sign+verify cleanly"
     );
 }
 
