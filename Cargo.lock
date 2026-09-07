@@ -1793,6 +1793,7 @@ dependencies = [
  "talos-capability-downgrade",
  "talos-capability-world",
  "talos-child-run-ledger",
+ "talos-child-workflow-refs",
  "talos-compilation",
  "talos-config",
  "talos-config-validator",
@@ -7524,6 +7525,7 @@ dependencies = [
  "talos-secrets-manager",
  "talos-workflow-engine-core",
  "talos-workflow-job-protocol",
+ "talos-workflow-liveness",
  "tokio",
  "tracing",
  "uuid",
@@ -7781,6 +7783,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "talos-workflow-engine-core",
+ "talos-workflow-liveness",
  "uuid",
 ]
 
@@ -8423,6 +8426,7 @@ dependencies = [
  "talos-execution-repository",
  "talos-measurement",
  "talos-module-repository",
+ "talos-workflow-liveness",
  "talos-workflow-repository",
  "thiserror 1.0.69",
  "tracing",
@@ -9825,6 +9829,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "talos-workflow-liveness"
+version = "0.1.0"
+
+[[package]]
 name = "talos-workflow-manifest"
 version = "0.1.0"
 dependencies = [
@@ -9864,6 +9872,7 @@ dependencies = [
  "talos-tenancy",
  "talos-text-util",
  "talos-workflow-engine-core",
+ "talos-workflow-liveness",
  "tokio",
  "tracing",
  "uuid",

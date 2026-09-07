@@ -7,6 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+talos-workflow-liveness = { path = "../talos-workflow-liveness" }
 # The ONE draft-substantiveness predicate, shared with `session_start`'s
 # display AND its auto-archive sweep (leaf: serde_json only).
 talos-draft-heuristics = { path = "../talos-draft-heuristics" }

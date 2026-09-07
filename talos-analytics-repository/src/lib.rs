@@ -999,6 +999,15 @@ pub const DORMANT_CHILD_NOTE: &str =
      \"never ran\". Excluded from the cleanup recommendation: deleting it would remove a \
      node its parent dispatches into.";
 
+/// What `summary.archived_excluded` means, stated so the count cannot be read
+/// as a second population of dormant workflows the operator should act on.
+pub const DORMANT_ARCHIVED_NOTE: &str =
+    "These workflows meet the same 30-day dormancy test as the list above, but an operator has \
+     already RETIRED them (status = 'archived'), so the report no longer recommends anything \
+     about them. They still carry is_enabled = true — archiving never clears that column — which \
+     is why a reader of is_enabled alone counted them as live enabled workflows and advised \
+     deleting them.";
+
 /// What `last_child_activity_at` is worth, stated so a `null` there cannot be
 /// read as a second, independent "it never ran".
 ///
@@ -1307,6 +1316,12 @@ pub const HYGIENE_CHECKS: &[HygieneCheck] = &[
     HygieneCheck::list("promotable_modules", HYGIENE_FINDING_LIMIT),
     HygieneCheck::list("stale_executions", HYGIENE_FINDING_LIMIT),
     HygieneCheck::list("dormant_workflows", HYGIENE_FINDING_LIMIT),
+    // The retired half of the same window. Registered as a COUNT: it renders no
+    // findings, it says how many rows the list above stopped speaking about. If
+    // it cannot be read, `archived_excluded` must render null with the reason —
+    // a defaulted 0 would claim the operator has retired nothing, which is the
+    // very sentence this exclusion exists to stop the report making.
+    HygieneCheck::count("summary.archived_excluded"),
     // The parent-reference scan behind `dormant_workflows[].runs_as_child_of`,
     // disclosed under the `summary` object it renders into.
     // Registered as a COUNT rather than a list because it renders no findings
@@ -1392,6 +1407,11 @@ pub struct HygieneReport {
     pub promotable_modules: Vec<PromotableModuleRow>,
     pub stale_executions: Vec<StaleExecutionRow>,
     pub dormant_workflows: Vec<DormantWorkflowRow>,
+    /// Workflows that clear the dormancy test but that an operator has already
+    /// RETIRED (`status = 'archived'`), and that the list above therefore no
+    /// longer speaks about. `None` = the read failed, disclosed under
+    /// `summary.archived_excluded`; it is never a zero.
+    pub dormant_archived_excluded: Option<ArchivedDormantExclusion>,
     /// Names of enabled parents whose `graph_json` could not be parsed during
     /// the `runs_as_child_of` scan. Non-empty ⇒ the child exclusion is
     /// INCOMPLETE: a workflow named only by one of these is still presented as
@@ -1469,6 +1489,8 @@ impl HygieneReport {
             promotable_modules: Vec::new(),
             stale_executions: Vec::new(),
             dormant_workflows: Vec::new(),
+            dormant_archived_excluded: (!missing("summary.archived_excluded"))
+                .then(ArchivedDormantExclusion::default),
             stale_draft_workflows: Vec::new(),
             idle_actors: Vec::new(),
             has_wildcard_module: (!missing("summary.wildcard_secret_grant")).then_some(false),
@@ -1485,6 +1507,27 @@ impl HygieneReport {
             readings,
         }
     }
+}
+
+/// How many retired-and-dormant workflow NAMES the report will carry. The
+/// count is exact regardless (`count(*) OVER ()`); only the name list is capped,
+/// and `truncated` says when it was.
+pub const ARCHIVED_EXCLUSION_NAME_LIMIT: i64 = 25;
+
+/// The rows the dormant list EXCLUDES because an operator already retired them.
+///
+/// Same window, same dormancy test, `status = 'archived'` instead of
+/// dispatchable — so this is a subset of what the list scanned, by
+/// construction, rather than a separately-derived number that could disagree
+/// with it.
+#[derive(Debug, Clone, Default)]
+pub struct ArchivedDormantExclusion {
+    /// The true total, from `count(*) OVER ()`, unaffected by the name cap.
+    pub total: i64,
+    /// Up to [`ARCHIVED_EXCLUSION_NAME_LIMIT`] names, oldest first.
+    pub names: Vec<String>,
+    /// `true` when `total` exceeds the names listed.
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -4742,17 +4785,26 @@ impl AnalyticsRepository {
         // "fixed it" that only changed which rows made the cut is
         // indistinguishable from one that did. Same check-28/60 principle as
         // the readiness-routing cut at ~:2419.
+        // ONE home for "the platform can still run this" — the same fragment
+        // `scan_child_parents`, the boot warmup and the dormant query below all
+        // read. Before 2026-09-07 this file spelled it
+        // `is_enabled = true AND (status IS NULL OR status != 'archived')` four
+        // times here and `is_enabled = true` ONCE in the dormant query, which is
+        // exactly why a file-scoped guard would have been green over the defect:
+        // four correct siblings vouching for a fifth site that forgot.
+        // (`status` is `NOT NULL`, so the dropped `status IS NULL` arm was dead
+        // — verified against the live catalog, 0 rows.)
+        let hygiene_dispatchable = talos_workflow_liveness::dispatchable_sql(None);
         let undescribed_fut = async {
-            let fetched = sqlx::query(
+            let fetched = sqlx::query(&format!(
                 "SELECT id, name, readiness_score, NULL::text AS description, created_at \
              FROM workflows \
-             WHERE user_id = $1 AND is_enabled = true \
-               AND (status IS NULL OR status != 'archived') \
+             WHERE user_id = $1 AND {hygiene_dispatchable} \
                AND workflow_type IN ('production', 'template') \
                AND (description IS NULL OR description = '') \
                AND (readiness_score IS NULL OR readiness_score >= 10) \
-             ORDER BY readiness_score DESC NULLS LAST, id LIMIT 25",
-            )
+             ORDER BY readiness_score DESC NULLS LAST, id LIMIT 25"
+            ))
             .bind(user_id)
             .fetch_all(&self.db_pool)
             .await;
@@ -4780,16 +4832,15 @@ impl AnalyticsRepository {
 
         // 2. Uncapabilized workflows (same `, id` tiebreaker rationale as #1).
         let uncapabilized_fut = async {
-            let fetched = sqlx::query(
+            let fetched = sqlx::query(&format!(
                 "SELECT id, name, readiness_score, description, created_at \
              FROM workflows \
-             WHERE user_id = $1 AND is_enabled = true \
-               AND (status IS NULL OR status != 'archived') \
+             WHERE user_id = $1 AND {hygiene_dispatchable} \
                AND workflow_type IN ('production', 'template') \
                AND (capabilities IS NULL OR array_length(capabilities, 1) IS NULL) \
                AND (readiness_score IS NULL OR readiness_score >= 10) \
-             ORDER BY readiness_score DESC NULLS LAST, id LIMIT 25",
-            )
+             ORDER BY readiness_score DESC NULLS LAST, id LIMIT 25"
+            ))
             .bind(user_id)
             .fetch_all(&self.db_pool)
             .await;
@@ -4817,12 +4868,11 @@ impl AnalyticsRepository {
 
         // 3. Suppressed count (internal/test workflow types)
         let suppressed_count_fut = async {
-            let v: Result<i64, sqlx::Error> = sqlx::query_scalar(
+            let v: Result<i64, sqlx::Error> = sqlx::query_scalar(&format!(
                 "SELECT COUNT(*)::bigint FROM workflows \
-             WHERE user_id = $1 AND is_enabled = true \
-               AND (status IS NULL OR status != 'archived') \
-               AND workflow_type IN ('internal', 'test')",
-            )
+             WHERE user_id = $1 AND {hygiene_dispatchable} \
+               AND workflow_type IN ('internal', 'test')"
+            ))
             .bind(user_id)
             .fetch_one(&self.db_pool)
             .await;
@@ -4831,13 +4881,12 @@ impl AnalyticsRepository {
 
         // 3b. Suppressed low-score count (drafts with readiness_score < 10 excluded from hygiene)
         let suppressed_low_score_count_fut = async {
-            let v: Result<i64, sqlx::Error> = sqlx::query_scalar(
+            let v: Result<i64, sqlx::Error> = sqlx::query_scalar(&format!(
                 "SELECT COUNT(*)::bigint FROM workflows \
-             WHERE user_id = $1 AND is_enabled = true \
-               AND (status IS NULL OR status != 'archived') \
+             WHERE user_id = $1 AND {hygiene_dispatchable} \
                AND workflow_type IN ('production', 'template') \
-               AND readiness_score < 10",
-            )
+               AND readiness_score < 10"
+            ))
             .bind(user_id)
             .fetch_one(&self.db_pool)
             .await;
@@ -5069,8 +5118,31 @@ impl AnalyticsRepository {
         //     under a recommendation to delete them. The parent lookup below
         //     resolves that from the GRAPH, which is the only place the
         //     relationship is recorded.
-        let dormant_workflows_fut = async {
-            let fetched = sqlx::query(
+        //
+        // (c) RETIRED WORKFLOWS. `workflows` carries TWO liveness columns and
+        //     this query used to read ONE of them. `is_enabled` is the
+        //     OPERATOR's pause toggle; `status` is the LIFECYCLE. The six
+        //     `UPDATE workflows SET status = 'archived'` sites never clear
+        //     `is_enabled`, so — measured on the reference fleet 2026-09-07 —
+        //     every one of the 8 archived rows still reads `is_enabled = true`,
+        //     and this query listed all 8 under advice to "consider disabling or
+        //     deleting them". Eight of the ten rows the recommendation named had
+        //     ALREADY been retired by the operator it was advising. The
+        //     predicate now comes from `talos_workflow_liveness`, which is the
+        //     same home `scan_child_parents` and the boot warmup read, and the
+        //     retired rows are COUNTED and disclosed rather than silently
+        //     dropped (`summary.archived_excluded`).
+        // 6b. The retired rows the dormant list now excludes.
+        //
+        // EXCLUDED is not DROPPED. The same window, the same dormancy test,
+        // the RETIRED half — so the count is a subset of the population the
+        // list scanned, by construction, and an operator can see what the
+        // report stopped speaking about. `count(*) OVER ()` carries the TRUE
+        // total past the name cap, and zero rows genuinely means zero (there is
+        // no aggregate over an empty set to misread here).
+        let dormant_retired = talos_workflow_liveness::retired_sql(Some("w"));
+        let dormant_archived_fut = async {
+            let fetched = sqlx::query(&format!(
                 "WITH last_run AS ( \
                  SELECT w.id, GREATEST( \
                      (SELECT MAX(started_at) FROM workflow_executions we \
@@ -5079,7 +5151,50 @@ impl AnalyticsRepository {
                        WHERE wa.workflow_id = w.id AND wa.user_id = w.user_id) \
                  ) AS last_execution \
                  FROM workflows w \
-                 WHERE w.user_id = $1 AND w.is_enabled = true \
+                 WHERE w.user_id = $1 AND {dormant_retired} \
+                   AND w.created_at < NOW() - INTERVAL '30 days' \
+             ) \
+             SELECT w.name, count(*) OVER () AS archived_total \
+             FROM workflows w \
+             JOIN last_run lr ON lr.id = w.id \
+             WHERE lr.last_execution IS NULL \
+                OR lr.last_execution < NOW() - INTERVAL '30 days' \
+             ORDER BY w.created_at ASC LIMIT {ARCHIVED_EXCLUSION_NAME_LIMIT}"
+            ))
+            .bind(user_id)
+            .fetch_all(&self.db_pool)
+            .await;
+            let raw = match fetched {
+                Ok(raw) => raw,
+                Err(e) => return Ok(Err(e)),
+            };
+            let total: i64 = match raw.first() {
+                Some(r) => r.try_get("archived_total")?,
+                None => 0,
+            };
+            let names: Vec<String> = raw
+                .iter()
+                .map(|r| r.try_get("name"))
+                .collect::<SqlxResult<Vec<String>>>()?;
+            Ok(Ok(ArchivedDormantExclusion {
+                truncated: total > names.len() as i64,
+                total,
+                names,
+            }))
+        };
+
+        let dormant_dispatchable = talos_workflow_liveness::dispatchable_sql(Some("w"));
+        let dormant_workflows_fut = async {
+            let fetched = sqlx::query(&format!(
+                "WITH last_run AS ( \
+                 SELECT w.id, GREATEST( \
+                     (SELECT MAX(started_at) FROM workflow_executions we \
+                       WHERE we.workflow_id = w.id AND we.user_id = w.user_id), \
+                     (SELECT MAX(started_at) FROM workflow_executions_archive wa \
+                       WHERE wa.workflow_id = w.id AND wa.user_id = w.user_id) \
+                 ) AS last_execution \
+                 FROM workflows w \
+                 WHERE w.user_id = $1 AND {dormant_dispatchable} \
                    AND w.created_at < NOW() - INTERVAL '30 days' \
              ) \
              SELECT w.id, w.name, w.created_at, lr.last_execution, \
@@ -5089,8 +5204,8 @@ impl AnalyticsRepository {
              JOIN last_run lr ON lr.id = w.id \
              WHERE lr.last_execution IS NULL \
                 OR lr.last_execution < NOW() - INTERVAL '30 days' \
-             ORDER BY w.created_at ASC LIMIT 25",
-            )
+             ORDER BY w.created_at ASC LIMIT 25"
+            ))
             .bind(user_id)
             .fetch_all(&self.db_pool)
             .await;
@@ -5257,6 +5372,7 @@ impl AnalyticsRepository {
             stale_draft_workflows,
             idle_actors,
             wildcard_module_names,
+            dormant_archived,
         ): (
             anyhow::Result<SqlxResult<Vec<OrphanedModuleRow>>>,
             anyhow::Result<SqlxResult<Vec<PromotableModuleRow>>>,
@@ -5265,6 +5381,7 @@ impl AnalyticsRepository {
             anyhow::Result<SqlxResult<Vec<StaleDraftRow>>>,
             anyhow::Result<SqlxResult<Vec<IdleActorRow>>>,
             SqlxResult<Vec<String>>,
+            anyhow::Result<SqlxResult<ArchivedDormantExclusion>>,
         ) = tokio::join!(
             orphaned_modules_fut,
             promotable_modules_fut,
@@ -5273,11 +5390,18 @@ impl AnalyticsRepository {
             stale_draft_workflows_fut,
             idle_actors_fut,
             wildcard_module_names_fut,
+            dormant_archived_fut,
         );
         let orphaned_modules = readings.record_rows("orphaned_modules", orphaned_modules?);
         let promotable_modules = readings.record_rows("promotable_modules", promotable_modules?);
         let stale_executions = readings.record_rows("stale_executions", stale_executions?);
         let mut dormant_workflows = readings.record_rows("dormant_workflows", dormant_workflows?);
+        // A failed read is NOT zero. `None` here renders `archived_excluded`
+        // as null with the reason, never as "the operator has retired nothing"
+        // — which is the same sentence, in the same report, that the dormant
+        // predicate itself was getting wrong.
+        let dormant_archived_excluded =
+            readings.record("summary.archived_excluded", dormant_archived?);
         // 8b. Who dispatches into whom.
         //
         // A FAILED scan is recorded, not defaulted: an empty index would
@@ -5848,6 +5972,7 @@ impl AnalyticsRepository {
             promotable_modules,
             stale_executions,
             dormant_workflows,
+            dormant_archived_excluded,
             stale_draft_workflows,
             idle_actors,
             has_wildcard_module,

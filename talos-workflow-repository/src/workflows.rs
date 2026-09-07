@@ -425,13 +425,17 @@ impl WorkflowRepository {
         // the transfer once the scan has seen enough. A graph too big for
         // the per-graph cap is not where warmup targets come from — the
         // flagship LLM graphs are single-digit KB.
-        let rows: Vec<(Option<String>,)> = sqlx::query_as(
+        // Same predicate as `scan_child_parents`, from the same home, so the
+        // two cannot answer differently about which workflows the platform can
+        // still run (they used to spell it `!=` and `<>` in two crates).
+        let dispatchable = talos_workflow_liveness::dispatchable_sql(None);
+        let rows: Vec<(Option<String>,)> = sqlx::query_as(&format!(
             "SELECT CASE WHEN octet_length(graph_json) <= $2 THEN graph_json::text END \
                FROM workflows \
-              WHERE is_enabled = true AND status <> 'archived' \
+              WHERE {dispatchable} \
               ORDER BY updated_at DESC NULLS LAST, id \
-              LIMIT $1",
-        )
+              LIMIT $1"
+        ))
         .bind(limit)
         .bind(BOOT_WARMUP_MAX_GRAPH_BYTES)
         .fetch_all(&self.db_pool)

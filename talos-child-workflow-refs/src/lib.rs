@@ -293,15 +293,20 @@ pub async fn scan_child_parents(
     // An oversized parent is RETURNED with a NULL body rather than filtered
     // out: dropping the row would hide the parent from `unreadable_parents`
     // and silently restore "this candidate is referenced by nobody".
-    let rows: Vec<(Uuid, String, Option<String>)> = sqlx::query_as(
+    // "an enabled parent that has not been retired" has ONE home
+    // (`talos_workflow_liveness`), so this predicate and the boot-warmup twin
+    // that spells it `status <> 'archived'` cannot drift apart. The fragment
+    // carries no caller input — the alias is a literal here.
+    let live_parent = talos_workflow_liveness::dispatchable_sql(None);
+    let rows: Vec<(Uuid, String, Option<String>)> = sqlx::query_as(&format!(
         "SELECT id, name, \
                 CASE WHEN octet_length(graph_json) <= $3 THEN graph_json END AS graph_json \
          FROM workflows \
-         WHERE user_id = $1 AND is_enabled = true AND status != 'archived' \
+         WHERE user_id = $1 AND {live_parent} \
            AND EXISTS (SELECT 1 FROM unnest($2::uuid[]) c \
                        WHERE graph_json LIKE '%' || c::text || '%') \
-         ORDER BY id",
-    )
+         ORDER BY id"
+    ))
     .bind(user_id)
     .bind(candidates)
     .bind(MAX_PARENT_GRAPH_BYTES)

@@ -2529,9 +2529,66 @@ pub(crate) fn render_sla_report(
     // hypothetical negative from wrapping into a huge u64 and suppressing the
     // warning (check 21).
     let total_u = u64::try_from(total).unwrap_or(0);
-    if total_u == 0 {
-        // The trailing clause is EMPTY unless the ledger was consulted, so a
-        // caller that does not read the ledger sees the exact pre-P3 sentence.
+    // 2026-09-07: the warning is derived from the SAME population decision the
+    // success-rate block above made (`rate_total`), not from
+    // `total_executions`. Keying it on `total == 0` alone made the response
+    // contradict itself the moment child runs crossed the floor: measured live
+    // on `pa-quality-judge` (0 execution rows, 3 ledger runs, floor 3),
+    // `success_rate.actual: 100.0` / `met: true` /
+    // `child_runs.counted_in_success_rate: true` sat fourteen lines above a
+    // warning reading "the success rate ... [is] null". Two decisions, one
+    // response. Below the floor `rate_total` is 0 by construction, so that case
+    // keeps the wording it has.
+    let sample_n = u64::try_from(rate_total).unwrap_or(0);
+    // EMPTY unless the rate's denominator is wider than `total_executions`, so
+    // a report with no child runs is byte-identical to the pre-fix one.
+    let sample_population_clause = if sample_n > total_u {
+        format!(
+            " That sample is the success rate's own denominator: {total_u} execution row(s) \
+             plus {child_n} child run(s) recorded by the RFC 0012 ledger.",
+            total_u = total_u,
+            child_n = child.total,
+        )
+    } else {
+        String::new()
+    };
+    // ONE sufficiency sentence, consulted by BOTH the execution-row branch and
+    // the child-only branch below, so the two cannot answer differently about
+    // the same rate. Returns the clause plus the threshold to publish (`None`
+    // where no finite threshold exists).
+    let sufficiency = |n: u64| -> Option<(String, Option<u64>)> {
+        match min_n_for_target {
+            Some(m) if n < m => Some((
+                format!(
+                    "Sample size ({n}) is below the threshold ({m}) needed for a {target_success_rate}% target to be statistically meaningful. A single failure is {failure_pct:.1}% of {n} runs — verdict may not be actionable. Consider lowering target_success_rate, extending the days window, or accepting the verdict as advisory.{sample_population_clause}",
+                    n = n,
+                    m = m,
+                    target_success_rate = target_success_rate,
+                    failure_pct = 100.0 / n as f64,
+                    sample_population_clause = sample_population_clause,
+                ),
+                Some(m),
+            )),
+            Some(_) => None,
+            // target is 0% or 100%: no finite sample size makes the verdict robust.
+            None => Some((
+                format!(
+                    "A {target_success_rate}% target has NO finite sufficiency threshold, so no sample \
+              size makes this verdict robust: at 100% a single failure fails the target no \
+              matter how many runs precede it, and at 0% the target is met unconditionally. \
+              `min_n_for_meaningful_target` is omitted because none exists — that omission is \
+              not a statement that the sample is large enough.",
+                    target_success_rate = target_success_rate,
+                ),
+                None,
+            )),
+        }
+    };
+    if sample_n == 0 {
+        // NOTHING was measured — no execution row, and no child run the floor
+        // lets us score. The trailing clause is EMPTY unless the ledger was
+        // consulted, so a caller that does not read the ledger sees the exact
+        // pre-P3 sentence.
         let ledger_clause = match reads.child_runs {
             None => String::new(),
             Some(_) if child.total == 0 => format!(
@@ -2558,25 +2615,67 @@ pub(crate) fn render_sla_report(
         if let Some(m) = min_n_for_target {
             result["min_n_for_meaningful_target"] = serde_json::json!(m);
         }
-    } else if let Some(min_n_for_target) = min_n_for_target.filter(|m| total_u < *m) {
+    } else if total_u == 0 {
+        // MEASURED, but by the ledger alone: `total_executions` is 0 and the
+        // success rate is still a real number over `child.total` recorded runs.
+        // The empty execution table costs the LATENCY half, and nothing else —
+        // saying "nothing was measured" here is the determinate negative this
+        // whole surface exists to remove.
+        //
+        // Every clause is derived from the values actually rendered above, not
+        // asserted: `p99_ms` decides the latency sentence and `in_compliance`
+        // decides the verdict sentence, so a caller who passes a p99 with no
+        // execution rows is not told a falsehood about it.
+        let latency_clause = if reads.p99_ms.is_none() {
+            " The LATENCY half is what the empty execution table costs: p50/p95/p99 and \
+             `duration.met` are null because the ledger records no percentile for the \
+             duration target (`child_runs.p95_ms` is a separate population and is not one)."
+        } else {
+            ""
+        };
+        let verdict_clause = match in_compliance {
+            None => {
+                " `compliance_status` is `not_measurable` for THAT reason only — read \
+                 `success_rate.met` for the half that was measured."
+            }
+            Some(false) => {
+                " `compliance_status` is `out_of_compliance`: the rate over those runs MISSED \
+                 the target."
+            }
+            Some(true) => {
+                " `compliance_status` is `in_compliance`: every component carrying a target \
+                 was measured."
+            }
+        };
+        let sufficiency_clause = match sufficiency(sample_n) {
+            Some((text, key)) => {
+                if let Some(m) = key {
+                    result["min_n_for_meaningful_target"] = serde_json::json!(m);
+                }
+                format!(" {text}")
+            }
+            None => String::new(),
+        };
         result["sample_size_warning"] = serde_json::json!(format!(
-            "Sample size ({total}) is below the threshold ({min_n_for_target}) needed for a {target_success_rate}% target to be statistically meaningful. A single failure is {failure_pct:.1}% of {total} runs — verdict may not be actionable. Consider lowering target_success_rate, extending the days window, or accepting the verdict as advisory.",
-            total = total,
-            min_n_for_target = min_n_for_target,
-            target_success_rate = target_success_rate,
-            failure_pct = 100.0 / total as f64,
+            "No workflow_executions row at all in the trailing {days} day(s), so \
+              `total_executions` is 0 — but the success rate WAS measured, over \
+              {child_n} child run(s) recorded by the RFC 0012 ledger since {ledger_since_str} \
+              (see `child_runs`): a workflow that runs only as somebody's sub-workflow leaves \
+              no workflow_executions row, and that is not the same as never having \
+              run.{latency_clause}{verdict_clause} Any period before {ledger_since_str} is \
+              UNKNOWN — nobody was recording.{sufficiency_clause}",
+            days = days,
+            child_n = child.total,
+            ledger_since_str = ledger_since_str,
+            latency_clause = latency_clause,
+            verdict_clause = verdict_clause,
+            sufficiency_clause = sufficiency_clause,
         ));
-        result["min_n_for_meaningful_target"] = serde_json::json!(min_n_for_target);
-    } else if min_n_for_target.is_none() {
-        // target is 0% or 100%: no finite sample size makes the verdict robust.
-        result["sample_size_warning"] = serde_json::json!(format!(
-            "A {target_success_rate}% target has NO finite sufficiency threshold, so no sample \
-              size makes this verdict robust: at 100% a single failure fails the target no \
-              matter how many runs precede it, and at 0% the target is met unconditionally. \
-              `min_n_for_meaningful_target` is omitted because none exists — that omission is \
-              not a statement that the sample is large enough.",
-            target_success_rate = target_success_rate,
-        ));
+    } else if let Some((text, key)) = sufficiency(sample_n) {
+        result["sample_size_warning"] = serde_json::json!(text);
+        if let Some(m) = key {
+            result["min_n_for_meaningful_target"] = serde_json::json!(m);
+        }
     }
 
     // A failed read is null AND named, never a benign zero.
@@ -10373,6 +10472,176 @@ mod sla_absence_disclosure_tests {
             .as_str()
             .unwrap()
             .contains("child run"));
+    }
+
+    // ── 2026-09-07: the warning and the verdict share one population ─────────
+
+    /// THE contradiction, measured live 2026-09-07 on `pa-quality-judge` and
+    /// reproduced here against the real renderer: at the floor the report said
+    /// `success_rate.actual: 100.0`, `met: true`,
+    /// `child_runs.counted_in_success_rate: true` and, fourteen lines below,
+    /// that the success rate and the compliance verdict "are all null" and that
+    /// "nothing about this workflow's SLA was measured".
+    ///
+    /// MUTATION that turns it red: key the first branch on `total_u == 0`
+    /// again instead of on `sample_n == 0`.
+    #[test]
+    fn at_the_floor_the_warning_agrees_with_the_verdict() {
+        let n = talos_analytics_repository::LEDGER_MIN_RUNS;
+        let out = render_sla_report(
+            &targets(99.0),
+            &SlaReads {
+                child_runs: Some(child(n, n, Some(4_000.0))),
+                ledger_since: a_ledger_floor(),
+                ..empty_reads()
+            },
+            &Readings::new(),
+        );
+
+        // The verdict half, unchanged: the rate IS measured at the floor.
+        assert_eq!(
+            out["success_rate"]["actual"],
+            serde_json::json!(100.0),
+            "{out}"
+        );
+        assert_eq!(out["success_rate"]["met"], serde_json::json!(true), "{out}");
+        assert_eq!(
+            out["child_runs"]["counted_in_success_rate"],
+            serde_json::json!(true),
+            "{out}"
+        );
+
+        let warn = out["sample_size_warning"].as_str().unwrap_or_default();
+        // The sentence that contradicted it must be gone.
+        assert!(
+            !warn.contains("nothing about this workflow's SLA was measured"),
+            "the warning still claims nothing was measured while the rate above \
+             is a number: {out}"
+        );
+        assert!(!warn.contains("compliance verdict are all null"), "{out}");
+        // …and replaced by what was actually measured, over what.
+        assert!(warn.contains("the success rate WAS measured"), "{out}");
+        assert!(
+            warn.contains(&format!("{n} child run(s) recorded by the RFC 0012 ledger")),
+            "{out}"
+        );
+        // The half the empty execution table really does cost.
+        assert!(warn.contains("p50/p95/p99"), "{out}");
+        assert!(
+            warn.contains("`compliance_status` is `not_measurable` for THAT reason only"),
+            "{out}"
+        );
+        assert_eq!(out["compliance_status"], "not_measurable", "{out}");
+        // Second defect of the same keying: `total_u == 0` short-circuited the
+        // whole `else if` chain, so the one MEASURED verdict on this surface was
+        // rendered with no sufficiency qualification at all.
+        assert_eq!(
+            out["min_n_for_meaningful_target"],
+            serde_json::json!(100),
+            "{out}"
+        );
+        assert!(
+            warn.contains("Sample size (3) is below the threshold (100)"),
+            "{out}"
+        );
+    }
+
+    /// Below the floor NOTHING is measured, so the pre-existing wording is
+    /// correct and must survive verbatim. (Brief: "the second must keep today's
+    /// wording".)
+    ///
+    /// MUTATION: key the first branch on `child.total == 0` — the below-floor
+    /// case would then fall into the child-only branch and claim a measured rate
+    /// the verdict above renders as null.
+    #[test]
+    fn below_the_floor_the_warning_keeps_todays_wording() {
+        let out = render_sla_report(
+            &targets(99.0),
+            &SlaReads {
+                child_runs: Some(child(2, 2, Some(4_000.0))),
+                ledger_since: a_ledger_floor(),
+                ..empty_reads()
+            },
+            &Readings::new(),
+        );
+        assert_eq!(
+            out["success_rate"]["actual"],
+            serde_json::Value::Null,
+            "{out}"
+        );
+        let warn = out["sample_size_warning"].as_str().unwrap_or_default();
+        assert!(warn.contains("No executions at all"), "{out}");
+        assert!(
+            warn.contains(
+                "The success rate, the latency percentiles and the compliance \
+                           verdict are all null"
+            ),
+            "{out}"
+        );
+        assert!(warn.contains("DOES hold 2 run(s)"), "{out}");
+        assert!(!warn.contains("WAS measured"), "{out}");
+    }
+
+    /// BYTE-IDENTICAL where nothing changed. A workflow with execution rows and
+    /// no child runs must render the exact pre-fix sufficiency sentence — no
+    /// population clause, `sample_n == total`.
+    ///
+    /// MUTATION: emit `sample_population_clause` unconditionally.
+    #[test]
+    fn an_execution_only_report_keeps_the_pre_fix_sufficiency_sentence() {
+        let out = render_sla_report(
+            &targets(99.0),
+            &SlaReads {
+                total: 5,
+                succeeded: 5,
+                p50_ms: Some(10.0),
+                p95_ms: Some(20.0),
+                p99_ms: Some(30.0),
+                ..empty_reads()
+            },
+            &Readings::new(),
+        );
+        let warn = out["sample_size_warning"].as_str().unwrap_or_default();
+        assert_eq!(
+            warn,
+            "Sample size (5) is below the threshold (100) needed for a 99% target to be \
+             statistically meaningful. A single failure is 20.0% of 5 runs — verdict may not be \
+             actionable. Consider lowering target_success_rate, extending the days window, or \
+             accepting the verdict as advisory.",
+            "{out}"
+        );
+        assert_eq!(out["min_n_for_meaningful_target"], serde_json::json!(100));
+    }
+
+    /// A HYBRID's sufficiency is judged over the rate's OWN denominator, and the
+    /// wider population is named rather than left to be inferred from a number
+    /// that no longer equals `total_executions`.
+    ///
+    /// MUTATION: pass `total_u` to `sufficiency` instead of `sample_n`.
+    #[test]
+    fn a_hybrid_sufficiency_is_judged_over_the_rates_own_denominator() {
+        let out = render_sla_report(
+            &targets(99.0),
+            &SlaReads {
+                total: 5,
+                succeeded: 5,
+                p99_ms: Some(30.0),
+                child_runs: Some(child(5, 5, Some(900.0))),
+                ledger_since: a_ledger_floor(),
+                ..empty_reads()
+            },
+            &Readings::new(),
+        );
+        let warn = out["sample_size_warning"].as_str().unwrap_or_default();
+        assert!(
+            warn.starts_with("Sample size (10) is below the threshold (100)"),
+            "{out}"
+        );
+        assert!(
+            warn.contains("5 execution row(s) plus 5 child run(s)"),
+            "the wider denominator must be named, not left to be read as \
+             `total_executions`: {out}"
+        );
     }
 }
 
