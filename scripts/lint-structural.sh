@@ -3944,6 +3944,19 @@ echo
 # answer — never a literal `None`. Opt-out for deliberate fail-safe
 # paths: `// allow-unresolved-effective-actor: <reason>` within 8 lines
 # above the call.
+#
+# `|| true` on the pipeline is LOAD-BEARING and was added in #768 after the
+# check killed a whole lint run. The script is `set -euo pipefail`. While the
+# workspace held at least one `with_effective_actor(None,` outside builder.rs,
+# every stage of this pipeline exited 0. #768 removed the last two (both in
+# `talos-mcp-handlers`), the trailing `grep -vE` then matched nothing, exited 1,
+# and pipefail turned the assignment into a fatal error: the run aborted HERE,
+# after 55 headers, and checks 57-86 — THIRTY of them, including every hard
+# must-be-0 rule above 56 — never ran and printed nothing. A gate that dies of
+# its own success is worse than one that fails: it takes the other gates with it
+# and the operator sees a stopped run rather than a red one. If another check
+# assigns from a `grep | grep` pipeline with no `|| true`, it has this bug
+# latent for the day its population reaches zero.
 bold "▶ check 56: with_effective_actor(None, …) without gate-resolved actor"
 UNRESOLVED_ACTOR_HITS="$(grep -rn 'with_effective_actor(None,' \
         --include='*.rs' \
@@ -3958,7 +3971,7 @@ UNRESOLVED_ACTOR_HITS="$(grep -rn 'with_effective_actor(None,' \
         if ! sed -n "${start},${n}p" "$f" | grep -q 'allow-unresolved-effective-actor'; then
             echo "$hit"
         fi
-    done)"
+    done || true)"
 if [ -n "$UNRESOLVED_ACTOR_HITS" ]; then
     red "✗ engine built with a literal-None effective actor (Tier-1 fail-safe by accident):"
     echo "$UNRESOLVED_ACTOR_HITS" | sed 's/^/    /'
@@ -3994,6 +4007,12 @@ echo
 # within 8 lines above (for deliberate parent-context clones that keep the
 # parent's own identity + ceilings).
 bold "▶ check 57: sub-engine built without actor-bind + ceiling narrowing (H2 escalation guard)"
+# The trailing `|| true` on the pipeline below is the SAME latent abort check 56
+# hit in #768, and it is here prophylactically. Under `set -euo pipefail`, if the
+# filtering greps ever match nothing — all remaining hits are the
+# `fn into_engine_with_graph` definition, or every call site moves into a test
+# file — the last grep exits 1 and the whole lint run dies HERE, taking every
+# later check with it. Check 56's population reaching zero is how that was found.
 UNNARROWED_SUBENGINE_HITS="$(grep -rn 'into_engine_with_graph(' \
         --include='*.rs' \
         talos-* worker controller 2>/dev/null \
@@ -4012,7 +4031,7 @@ UNNARROWED_SUBENGINE_HITS="$(grep -rn 'into_engine_with_graph(' \
             continue
         fi
         echo "$hit"
-    done)"
+    done || true)"
 if [ -n "$UNNARROWED_SUBENGINE_HITS" ]; then
     red "✗ sub-engine build site(s) without ceiling narrowing (H2 escalation re-opened):"
     echo "$UNNARROWED_SUBENGINE_HITS" | sed 's/^/    /'

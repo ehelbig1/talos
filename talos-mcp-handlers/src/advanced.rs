@@ -422,7 +422,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_archive_policy",
-            "description": "Get the current execution archive policy (how many days before executions are archived).",
+            "description": "Get BOTH execution-retention windows and the resulting lifetime: `archive_after_days` (live -> archive; settable via set_archive_policy or ARCHIVE_AFTER_DAYS), `purge_after_days` (archive -> permanently deleted; EXECUTION_RETENTION_DAYS ONLY — set_archive_policy cannot move it), and `total_lifetime_days`, the sum, which is how far back an execution is readable at all. Refuses rather than reporting an environment default if the override row cannot be read.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}
@@ -430,7 +430,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "set_archive_policy",
-            "description": "Set the execution archive policy (how many days before executions are archived).",
+            "description": "Set the ARCHIVE window only — how many days an execution stays in workflow_executions before it is MOVED to the archive. This is ONE of the two retention windows: it does NOT set how long the archived copy is then kept, which is EXECUTION_RETENTION_DAYS (env-only) and which nothing in this tool can change. Total readable lifetime is the sum of the two; call get_archive_policy to see both.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1769,6 +1769,68 @@ async fn handle_delete_scratch_session(
     }
 }
 
+/// Render `get_archive_policy` from the ONE resolved policy.
+///
+/// # What changed in #768, and what deliberately did not
+///
+/// Every pre-existing key is emitted with its pre-existing name and meaning —
+/// `effective_days`, `db_setting`, `db_setting_effective`, `env_default`,
+/// `source` — because an operator or a script may read them. What was MISSING
+/// is the rest of the sentence: this tool reported the ARCHIVE tier alone,
+/// while an execution's readable lifetime is `ARCHIVE_AFTER_DAYS` (live →
+/// archive) PLUS `EXECUTION_RETENTION_DAYS` (archive → gone). The second
+/// window was invisible in every tool response, and its env var's NAME reads
+/// like the total it is not — `docs/configuration-reference.md` explains the
+/// 30 + 30 and nothing machine-readable said it.
+///
+/// So the response gains `archive_after_days`, `purge_after_days` and
+/// `total_lifetime_days`, each carrying its own source, plus the fact that
+/// `set_archive_policy` cannot move the purge window.
+///
+/// Pure: takes the resolved policy, returns the JSON. The provenance decisions
+/// live on [`talos_advanced_repository::RetentionPolicy`]; nothing here
+/// re-reads an env or re-applies a filter.
+fn render_archive_policy(policy: &talos_advanced_repository::RetentionPolicy) -> serde_json::Value {
+    let source = policy.archive_source().as_str();
+    serde_json::json!({
+        // ── Pre-#768 keys, unchanged in name and meaning ──────────────────
+        "effective_days": policy.windows.archive_after_days,
+        "db_setting": policy.db_archive_setting,
+        "db_setting_effective": policy.db_archive_setting_effective,
+        "env_default": policy.env_archive_default,
+        "source": source,
+        // ── The rest of the sentence ──────────────────────────────────────
+        "archive_after_days": {
+            "days": policy.windows.archive_after_days,
+            "source": source,
+            "settable_by": "set_archive_policy (system_settings.archive_after_days) or ARCHIVE_AFTER_DAYS",
+            "means": "days an execution stays in workflow_executions before it is MOVED to \
+                      workflow_executions_archive. Its execution_events, workflow_execution_logs \
+                      and execution_approval_tokens CASCADE away at this boundary.",
+        },
+        "purge_after_days": {
+            "days": policy.windows.purge_after_days,
+            // Not a db|env choice: there is no second source to choose from.
+            "source": "environment",
+            "settable_by": "EXECUTION_RETENTION_DAYS only — set_archive_policy CANNOT move this \
+                            window, and no system_settings key overrides it.",
+            "means": "days an ARCHIVED execution is kept, clocked on archived_at, before \
+                      permanent deletion.",
+        },
+        "total_lifetime_days": {
+            "days": policy.total_lifetime_days(),
+            "source": "archive_after_days + purge_after_days",
+            "means": "how far back an execution is readable AT ALL. This is the number \
+                      EXECUTION_RETENTION_DAYS' name suggests and does not carry.",
+        },
+        "note": "This tool reports BOTH retention windows. Before #768 it reported the archive \
+                 tier alone, so the purge window and the resulting lifetime were invisible here \
+                 even though the retention pass runs both. Both numbers come from \
+                 talos_advanced_repository::resolve_retention_policy — the same resolver the \
+                 pass itself uses — so this report and the sweep cannot disagree.",
+    })
+}
+
 async fn handle_get_archive_policy(
     req_id: Option<serde_json::Value>,
     state: &McpState,
@@ -1782,9 +1844,24 @@ async fn handle_get_archive_policy(
     // provenance field is the sharpest part: `source` is an affirmative claim
     // about WHERE the live setting comes from, and it named the one place we
     // had not failed to read.
-    let db_value: Option<serde_json::Value> = match state.advanced_repo.get_archive_policy().await {
-        Ok(v) => v,
-        Err(e) => {
+    //
+    // #768 keeps that refusal rather than rendering the windows as `null` with
+    // a reason. An unreadable `system_settings` row makes BOTH reported
+    // sources wrong at once — the archive window is unknown, and the purge
+    // window is only meaningful beside it — so there is no partial answer to
+    // render; and the ONE number that could still be produced (the env
+    // default) is exactly the misleading one. `positive_env_or_default` cannot
+    // itself fail, so no other window here has an unreadable state to disclose.
+    //
+    // #768 also moved the resolution: the handler no longer re-reads
+    // ARCHIVE_AFTER_DAYS, re-parses the JSON or re-applies the positivity
+    // filter. All three were a second implementation of
+    // `resolve_retention_policy`, whose own doc comment claims to be the only
+    // place that decides which number governs which tier — and they had
+    // already drifted on the quoted-string case.
+    let policy = match state.advanced_repo.resolve_retention_policy().await {
+        talos_advanced_repository::RetentionPolicyDecision::Resolved(p) => p,
+        talos_advanced_repository::RetentionPolicyDecision::Unreadable(e) => {
             tracing::error!(
                 target: "talos_mcp_handlers::advanced",
                 event_kind = "get_archive_policy_read_failed",
@@ -1801,52 +1878,10 @@ async fn handle_get_archive_policy(
             );
         }
     };
-    // MCP-677 (2026-05-13): route through `positive_env_or_default` so
-    // the displayed env default matches what the controller scheduler
-    // actually uses (controller/src/main.rs:1292 has the canonical
-    // `positive_env_or_default::<i32>("ARCHIVE_AFTER_DAYS", 30)`).
-    // Pre-fix `ARCHIVE_AFTER_DAYS=0` made this handler report
-    // `effective_days=0` to the operator while the archiver actually
-    // used 30 (via the canonical helper's positive-substitute) — a
-    // confusing display/reality drift on the same env var. Sibling to
-    // the broader `=0`/empty-env footgun sweep (MCP-643/665/670/671).
-    let env_default: i32 = talos_config::archive_after_days();
 
-    // MCP-961 sibling: saturating i64→i32 conversion. The value
-    // originates from the `system_config` DB row's `value` column
-    // (JSON), an operator-supplied integer. A manual SQL UPDATE
-    // setting value > i32::MAX would silently wrap pre-fix.
-    let db_days_raw: Option<i32> = db_value.as_ref().and_then(|v| {
-        v.as_i64()
-            .map(|n| i32::try_from(n).unwrap_or(i32::MAX))
-            .or_else(|| v.as_str().and_then(|s| s.trim_matches('"').parse().ok()))
-    });
-
-    // MCP-759 (2026-05-13): align the reporter with the archiver's
-    // actual substitution behavior (MCP-758). The archiver
-    // (controller/src/main.rs::execution-archival) filters
-    // `Some(d) if d > 0` and falls back to env_default for any
-    // non-positive DB setting. Pre-fix this reporter showed
-    // `effective_days: 0, source: "database"` for a stored value of 0
-    // while the archiver was actually using 30 — display/reality drift
-    // that misled operators about what the system would do. Same
-    // align-display-to-runtime pattern as the MCP-640 fix in
-    // `handle_get_wasm_config`. Negative values get the same treatment
-    // (Postgres `make_interval(days => -7)` archives "older than NOW +
-    // 7 days" = everything).
-    let db_days_effective: Option<i32> = db_days_raw.filter(|&d| d > 0);
-
-    let effective_days = db_days_effective.unwrap_or(env_default);
-    let response = serde_json::json!({
-        "effective_days": effective_days,
-        "db_setting": db_days_raw,
-        "db_setting_effective": db_days_effective,
-        "env_default": env_default,
-        "source": if db_days_effective.is_some() { "database" } else { "environment" },
-    });
     mcp_text(
         req_id,
-        &serde_json::to_string_pretty(&response).unwrap_or_default(),
+        &serde_json::to_string_pretty(&render_archive_policy(&policy)).unwrap_or_default(),
     )
 }
 
@@ -1857,7 +1892,7 @@ async fn handle_set_archive_policy(
     user_id: Uuid,
 ) -> JsonRpcResponse {
     // MCP-326 (2026-05-11): `set_archive_policy` writes a single row
-    // to `system_settings` (key='archive_policy_days') that drives
+    // to `system_settings` (key='archive_after_days') that drives
     // every tenant's `archive_executions` cadence. Pre-fix the gate
     // was the agent-level `is_admin` (per-tenant), so an organization-
     // scoped admin in a multi-tenant deployment could shorten the
@@ -1899,11 +1934,57 @@ async fn handle_set_archive_policy(
         },
     };
 
-    match state.advanced_repo.set_archive_policy(days).await {
-        Ok(_) => mcp_text(req_id, &format!("Archive policy set to {} days", days)),
-        Err(e) => {
-            tracing::error!("set_archive_policy failed: {}", e);
-            mcp_error(req_id, -32000, "Failed to set archive policy")
+    if let Err(e) = state.advanced_repo.set_archive_policy(days).await {
+        tracing::error!("set_archive_policy failed: {}", e);
+        return mcp_error(req_id, -32000, "Failed to set archive policy");
+    }
+
+    // #768: the write moved ONE of two windows, and the old one-line reply
+    // ("Archive policy set to N days") let a reader take N for the retention
+    // period. Re-read the resolved policy through the SAME resolver
+    // `get_archive_policy` and the retention pass use, so the confirmation
+    // states the window that moved, the window that did not, and the lifetime
+    // that resulted — from the live decision rather than from `days`.
+    //
+    // A failed re-read does NOT fail the call: the WRITE succeeded and the
+    // caller must be told so. It degrades to the one fact this function owns,
+    // with the reason — never to a silent omission that reads as "there is
+    // only one window".
+    match state.advanced_repo.resolve_retention_policy().await {
+        talos_advanced_repository::RetentionPolicyDecision::Resolved(p) => mcp_text(
+            req_id,
+            &serde_json::to_string_pretty(&serde_json::json!({
+                "archive_after_days": p.windows.archive_after_days,
+                "purge_after_days": p.windows.purge_after_days,
+                "total_lifetime_days": p.total_lifetime_days(),
+                "message": format!(
+                    "Archive window set to {} days. The PURGE window is unchanged at {} days \
+                     (EXECUTION_RETENTION_DAYS — set_archive_policy cannot move it), so an \
+                     execution is now readable for {} days in total.",
+                    p.windows.archive_after_days,
+                    p.windows.purge_after_days,
+                    p.total_lifetime_days(),
+                ),
+            }))
+            .unwrap_or_default(),
+        ),
+        talos_advanced_repository::RetentionPolicyDecision::Unreadable(e) => {
+            tracing::error!(
+                target: "talos_mcp_handlers::advanced",
+                event_kind = "set_archive_policy_readback_failed",
+                error = %e,
+                "set_archive_policy: the write succeeded but the policy could not be re-read"
+            );
+            mcp_text(
+                req_id,
+                &format!(
+                    "Archive policy set to {} days. The resulting total lifetime could not be \
+                     reported: the policy read-back failed (see server logs). Note that the \
+                     PURGE window is a SECOND, separate window (EXECUTION_RETENTION_DAYS) that \
+                     this tool does not set — call get_archive_policy for both.",
+                    days
+                ),
+            )
         }
     }
 }
@@ -5351,5 +5432,96 @@ async fn handle_cancel_workflow_suspension(
             tracing::error!("cancel_workflow_suspension failed: {}", e);
             mcp_error(req_id, -32000, "Failed to cancel suspension")
         }
+    }
+}
+
+#[cfg(test)]
+mod archive_policy_render_tests {
+    use super::render_archive_policy;
+    use talos_advanced_repository::{RetentionPolicy, RetentionWindows};
+
+    fn policy(db: Option<i32>, db_eff: Option<i32>, archive: i32, purge: i32) -> RetentionPolicy {
+        RetentionPolicy {
+            windows: RetentionWindows {
+                archive_after_days: archive,
+                purge_after_days: purge,
+            },
+            db_archive_setting: db,
+            db_archive_setting_effective: db_eff,
+            env_archive_default: 30,
+        }
+    }
+
+    /// Every key the tool emitted before #768 is still emitted, with the same
+    /// name and the same value. A caller or script reading `effective_days` or
+    /// `source` must not have to change.
+    #[test]
+    fn the_pre_existing_keys_are_unchanged() {
+        let v = render_archive_policy(&policy(None, None, 30, 30));
+        assert_eq!(v["effective_days"], 30);
+        assert_eq!(v["db_setting"], serde_json::Value::Null);
+        assert_eq!(v["db_setting_effective"], serde_json::Value::Null);
+        assert_eq!(v["env_default"], 30);
+        assert_eq!(v["source"], "environment");
+
+        let v = render_archive_policy(&policy(Some(45), Some(45), 45, 30));
+        assert_eq!(v["effective_days"], 45);
+        assert_eq!(v["db_setting"], 45);
+        assert_eq!(v["db_setting_effective"], 45);
+        assert_eq!(v["env_default"], 30);
+        assert_eq!(v["source"], "database");
+    }
+
+    /// THE DEFECT: the purge window and the resulting lifetime were invisible.
+    /// Both windows are now reported, each with its own source, and the total
+    /// is their sum.
+    #[test]
+    fn both_windows_and_the_lifetime_are_reported() {
+        let v = render_archive_policy(&policy(None, None, 30, 30));
+        assert_eq!(v["archive_after_days"]["days"], 30);
+        assert_eq!(v["archive_after_days"]["source"], "environment");
+        assert_eq!(v["purge_after_days"]["days"], 30);
+        assert_eq!(v["total_lifetime_days"]["days"], 60);
+    }
+
+    /// The purge window has ONE source and the response must say so, because
+    /// the obvious reading of a tool called `set_archive_policy` is that it
+    /// sets retention. It does not — it sets one of two windows.
+    #[test]
+    fn the_purge_window_declares_that_set_archive_policy_cannot_move_it() {
+        let v = render_archive_policy(&policy(None, None, 30, 30));
+        assert_eq!(v["purge_after_days"]["source"], "environment");
+        let settable = v["purge_after_days"]["settable_by"].as_str().unwrap();
+        assert!(settable.contains("EXECUTION_RETENTION_DAYS"), "{settable}");
+        assert!(settable.contains("CANNOT"), "{settable}");
+    }
+
+    /// A non-positive override is IGNORED by the sweep, and the report must
+    /// show both facts: what is stored, and what actually governs. Collapsing
+    /// them is the display/reality drift MCP-759 fixed and #768 must preserve
+    /// while moving the resolution out of the handler.
+    #[test]
+    fn a_non_positive_override_is_shown_stored_and_ignored() {
+        let v = render_archive_policy(&policy(Some(0), None, 30, 30));
+        assert_eq!(v["db_setting"], 0, "what is stored");
+        assert_eq!(
+            v["db_setting_effective"],
+            serde_json::Value::Null,
+            "what governs"
+        );
+        assert_eq!(v["effective_days"], 30);
+        assert_eq!(v["source"], "environment");
+        assert_eq!(v["total_lifetime_days"]["days"], 60);
+    }
+
+    /// The lifetime is the SUM of the two live windows, not of the two
+    /// defaults — a DB override must move it.
+    #[test]
+    fn the_lifetime_follows_the_override() {
+        let v = render_archive_policy(&policy(Some(7), Some(7), 7, 90));
+        assert_eq!(v["archive_after_days"]["days"], 7);
+        assert_eq!(v["archive_after_days"]["source"], "database");
+        assert_eq!(v["purge_after_days"]["days"], 90);
+        assert_eq!(v["total_lifetime_days"]["days"], 97);
     }
 }

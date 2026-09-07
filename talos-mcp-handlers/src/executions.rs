@@ -5914,6 +5914,69 @@ fn child_runs_note(count: Option<usize>, ledger_has_started: bool, error: Option
     }
 }
 
+/// The lineage response's top-level `note`, as a pure function of the four
+/// facts it is allowed to speak about.
+///
+/// # Why this is not a one-line `if`
+///
+/// The sentence it replaced read *"This execution has no parent or child
+/// executions — it is a standalone run."* — and since #766 the SAME response
+/// can carry `child_runs_count: 1` fourteen lines above it. Both halves were
+/// true and the response contradicted itself, because the note is a statement
+/// about `workflow_executions` ROWS and it was worded as a statement about the
+/// run. A sub-workflow runs in-process and records no execution row, so
+/// "standalone" is exactly the reading the ledger exists to remove.
+///
+/// The note now says which population it is about and counts the ledger's
+/// child runs in the same sentence. Three shapes, never collapsed, matching
+/// [`child_runs_note`]'s own three-valued contract:
+///
+/// * `Some(0)` with a started ledger — a measured zero.
+/// * `Some(n)`, `n >= 1` — the number, plus why `lineage` cannot show them.
+/// * `None`, or a ledger with no rows at all — UNKNOWN. Never rendered as
+///   zero, and never as "standalone".
+fn lineage_note(
+    tree_degraded: bool,
+    archived_in_lineage: usize,
+    node_count: usize,
+    child_runs_count: Option<usize>,
+    ledger_has_started: bool,
+) -> String {
+    if tree_degraded {
+        return "The lineage tree could not be read; only the requested execution is shown. \
+                This is NOT a statement that it has no parent or children."
+            .to_string();
+    }
+    if archived_in_lineage > 0 {
+        return "Lineage includes all executions linked via root_execution_id, across the live \
+                table AND workflow_executions_archive — see each node's `archived` flag."
+            .to_string();
+    }
+    if node_count > 1 {
+        return "Lineage includes all executions linked via root_execution_id.".to_string();
+    }
+    // One node: the arm that used to say "standalone run".
+    let base = "This execution has no parent or child EXECUTION rows";
+    match (child_runs_count, ledger_has_started) {
+        (Some(0), true) => format!(
+            "{base}, and the child-run ledger records no child runs for it — see \
+             `child_runs_note` for what that zero does and does not cover."
+        ),
+        (Some(n), true) if n > 0 => format!(
+            "{base}; {n} child RUN(S) are recorded in the ledger. A sub-workflow runs \
+             in-process and records NO execution row, so `lineage` structurally cannot \
+             show them — see `child_runs`."
+        ),
+        // `None` (the ledger could not be read) and a ledger with no rows at
+        // all are both UNKNOWN here. They are told apart in `child_runs_note`;
+        // what this sentence must not do is call either of them standalone.
+        _ => format!(
+            "{base}; whether it dispatched any child RUNS is UNKNOWN — the ledger has not \
+             started, or could not be read. See `child_runs_note`."
+        ),
+    }
+}
+
 async fn handle_get_execution_lineage(
     req_id: Option<serde_json::Value>,
     args: &Value,
@@ -6101,17 +6164,13 @@ async fn handle_get_execution_lineage(
             ledger_since.is_some(),
             child_runs_error,
         ),
-        "note": if tree_degraded {
-            "The lineage tree could not be read; only the requested execution is shown. \
-             This is NOT a statement that it has no parent or children."
-        } else if archived_in_lineage > 0 {
-            "Lineage includes all executions linked via root_execution_id, across the live \
-             table AND workflow_executions_archive — see each node's `archived` flag."
-        } else if nodes.len() == 1 {
-            "This execution has no parent or child executions — it is a standalone run."
-        } else {
-            "Lineage includes all executions linked via root_execution_id."
-        }
+        "note": lineage_note(
+            tree_degraded,
+            archived_in_lineage,
+            nodes.len(),
+            child_runs_count,
+            ledger_since.is_some(),
+        )
     });
     // The ANCHOR's own archival provenance, stamped the same way every other
     // archived read stamps it.
@@ -7294,6 +7353,64 @@ mod child_runs_note_tests {
         ] {
             assert!(note.contains("agent_loop"), "{note}");
             assert!(note.contains("capability_dispatch"), "{note}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod lineage_note_tests {
+    use super::lineage_note;
+
+    /// The defect, pinned: a single-node tree whose ledger records child runs
+    /// must NOT be called standalone, and must name the count.
+    #[test]
+    fn a_single_node_tree_with_child_runs_is_not_standalone() {
+        let note = lineage_note(false, 0, 1, Some(1), true);
+        assert!(
+            !note.contains("standalone"),
+            "a run that dispatched a child is not standalone: {note}"
+        );
+        assert!(note.contains("1 child RUN(S)"), "{note}");
+        assert!(
+            note.contains("EXECUTION rows"),
+            "the note must say which population it is about: {note}"
+        );
+    }
+
+    /// A measured zero, on a ledger that has started. Still not "standalone" —
+    /// the word claims more than the two facts support (the four dispatch
+    /// kinds the ledger cannot see are named in `child_runs_note`).
+    #[test]
+    fn a_measured_zero_says_zero_without_saying_standalone() {
+        let note = lineage_note(false, 0, 1, Some(0), true);
+        assert!(note.contains("no child runs"), "{note}");
+        assert!(!note.contains("standalone"), "{note}");
+        assert!(note.contains("EXECUTION rows"), "{note}");
+    }
+
+    /// UNKNOWN is not zero. Both a failed read (`None`) and a ledger with no
+    /// rows must render as UNKNOWN, never as an absence of child runs.
+    #[test]
+    fn an_unreadable_or_unstarted_ledger_renders_unknown_not_zero() {
+        for (count, started) in [(None, false), (None, true), (Some(0), false)] {
+            let note = lineage_note(false, 0, 1, count, started);
+            assert!(note.contains("UNKNOWN"), "{count:?}/{started}: {note}");
+            assert!(!note.contains("standalone"), "{count:?}/{started}: {note}");
+        }
+    }
+
+    /// The three arms that speak about the EXECUTION tree are untouched by the
+    /// ledger: whatever the child-run count says, a degraded read, an archived
+    /// member and a multi-node tree keep their pre-#768 wording.
+    #[test]
+    fn the_tree_arms_are_independent_of_the_ledger() {
+        for count in [None, Some(0), Some(7)] {
+            assert!(lineage_note(true, 0, 1, count, true).contains("could not be read"));
+            assert!(lineage_note(false, 2, 3, count, true).contains("workflow_executions_archive"));
+            assert_eq!(
+                lineage_note(false, 0, 4, count, true),
+                "Lineage includes all executions linked via root_execution_id."
+            );
         }
     }
 }

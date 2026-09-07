@@ -1127,7 +1127,17 @@ fn mutation_profile_for_world(capability_world: Option<&str>) -> serde_json::Val
                  and so appears in NO world's profile — an empty list here (every \
                  minimal-node module) does NOT mean the module cannot write memory. \
                  That route is gated by the SAME ceiling, controller-side, and \
-                 audits under the same `agent-memory-set` / `write-ceiling` labels.",
+                 audits under the same `agent-memory-set` / `write-ceiling` labels. \
+                 SCOPE (#768): the ceiling governs the ACTOR's own data plane — \
+                 actor_memory, integration state, and sandbox SQL. TWO further \
+                 output protocols reach the database through the same node-completion \
+                 hook, on the same actor binding, and are DELIBERATELY NOT \
+                 ceiling-gated: `__ops_alert__` (writes `ops_alerts`) and \
+                 `__ml_distill__` (appends ML dataset rows). Both are PLATFORM \
+                 ingestion keyed on the actor for TENANCY only, not the actor's own \
+                 data, and a `readonly` actor emitting either still lands its rows. \
+                 So a module returning one of those two writes for a readonly actor \
+                 by design, and this profile says nothing about it.",
     })
 }
 

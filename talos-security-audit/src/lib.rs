@@ -1059,6 +1059,34 @@ impl ControllerGateProbe {
 ///
 /// [`RoundTrip`]: Verification::RoundTrip
 /// [`Unknown`]: talos_worker_identity_repository::FleetWriteCeilingState::Unknown
+/// The output protocols that reach the database on the actor's binding and are
+/// DELIBERATELY outside `actors.max_write_ceiling` (decision 2026-09-06).
+///
+/// #750 recorded that three output protocols share one node-completion hook,
+/// one module-returned value and one actor binding, and that it gated exactly
+/// one of them — leaving whether `readonly` should bar the other two as "an
+/// operator policy call". It is now called: the ceiling governs the ACTOR's own
+/// DATA PLANE (actor_memory, integration state, sandbox SQL). These two are
+/// PLATFORM ingestion that takes the actor id for TENANCY, not because the rows
+/// are the actor's data — a diagnostic and a training-example append.
+///
+/// Named in the report because "enforced" without a scope is read as "nothing
+/// this actor emits reaches the database", which is false and always was.
+pub const UNGATED_OUTPUT_PROTOCOLS: [&str; 2] = [
+    "__ops_alert__ -> ops_alerts (platform diagnostic; actor id is tenancy only)",
+    "__ml_distill__ -> ML dataset rows (teacher signal; actor id is tenancy only)",
+];
+
+/// One sentence stating the scope, for the `detail` string. Every arm that
+/// reports on the control carries it, so the word "enforced" never appears in
+/// this check without its bounds.
+pub const UNGATED_OUTPUT_PROTOCOLS_NOTE: &str =
+    "SCOPE: the ceiling governs the ACTOR's data plane (actor_memory, integration state, \
+     sandbox SQL). The `__ops_alert__` and `__ml_distill__` output protocols travel the same \
+     node-completion hook on the same actor binding and are OUTSIDE it by decision — a \
+     readonly actor still lands those rows, which is how the alert-triage and teacher-loop \
+     actors are meant to run.";
+
 #[must_use]
 pub fn check_write_ceiling_enforcement(
     fleet: Option<talos_worker_identity_repository::WriteCeilingFleetSummary>,
@@ -1106,6 +1134,12 @@ pub fn check_write_ceiling_enforcement(
         "unreadable_rule": "refused (fail closed)",
         "enforcement_disabled": "permitted",
         "routes": ["__memory_write__ envelope (#750)", "signed-RPC mutation (#757)"],
+        // A reader of "enforced" needs the SCOPE, or the word is read as
+        // "nothing this actor emits reaches the database". Two output
+        // protocols travel the same node-completion hook on the same actor
+        // binding and are outside the control by decision (#768) — named
+        // here so the scope is a fact in the report rather than folklore.
+        "ungated_output_protocols": UNGATED_OUTPUT_PROTOCOLS,
     });
 
     let Some(f) = fleet else {
@@ -1113,11 +1147,12 @@ pub fn check_write_ceiling_enforcement(
             name: "write_ceiling_enforcement",
             status: Status::Warn,
             detail: format!(
-                "PARTLY VERIFIED. Controller half, EXERCISED this run: {} Fleet half, NOT \
+                "PARTLY VERIFIED. Controller half, EXERCISED this run: {} {} Fleet half, NOT \
                  VERIFIED: the worker-identity registry query failed, so this run did not \
                  establish whether any WORKER enforces the ceiling — a database problem, not a \
                  finding about the ceiling.",
-                controller_posture(probe.enforced)
+                controller_posture(probe.enforced),
+                UNGATED_OUTPUT_PROTOCOLS_NOTE,
             ),
             verification: Verification::NotVerified,
             points: 0,
@@ -1166,11 +1201,12 @@ pub fn check_write_ceiling_enforcement(
         status,
         detail: format!(
             "{} Worker-self-reported at registration and UNSIGNED — diagnostic only, never an \
-             authorization input.{} CONTROLLER HALF, EXERCISED this run: {} Reported, not \
+             authorization input.{} CONTROLLER HALF, EXERCISED this run: {} {} Reported, not \
              scored.",
             f.note(),
             split_note,
             controller_posture(probe.enforced),
+            UNGATED_OUTPUT_PROTOCOLS_NOTE,
         ),
         verification,
         points: 0,
