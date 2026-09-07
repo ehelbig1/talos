@@ -680,7 +680,15 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                 the last 24 hours), an HTTP POST is fired to notification_webhook if configured. \
                 At least one of p95_latency_ms or success_rate_pct must be provided. \
                 Thresholds without a notification_webhook are still visible in get_workflow_sla_report \
-                and list_workflow_sla_thresholds — useful for API-polled monitoring stacks.",
+                and list_workflow_sla_thresholds — useful for API-polled monitoring stacks. \
+                SUB-WORKFLOWS ARE MEASURED (RFC 0012 P3, 2026-09-07): a workflow a parent dispatches \
+                into runs in-process and records no workflow_executions row, so a threshold set on \
+                one used to be silently inert. The monitor now measures over workflow_executions AND \
+                the child-run ledger (sub_workflow_runs). Two caveats it will state rather than hide: \
+                when child runs are the ONLY evidence at least 3 of them are required before any \
+                verdict is reached (one failed run is not a 0% success rate), and the ledger has a \
+                first row — any period before it is UNKNOWN, never counted as zero. Every breach \
+                webhook now carries a `sources` object with the execution/child-run split.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -694,7 +702,10 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "list_workflow_sla_thresholds",
-            "description": "List all SLA threshold configurations for the current user's workflows.",
+            "description": "List all SLA threshold configurations for the current user's workflows. \
+                A threshold with no notification_webhook is an API-polling configuration: the \
+                background monitor evaluates nothing for it and fires nothing — read \
+                get_workflow_sla_report instead.",
             "inputSchema": {
                 "type": "object",
                 "properties": {}

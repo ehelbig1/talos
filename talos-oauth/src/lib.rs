@@ -2733,7 +2733,8 @@ mod oauth2_v5_exchange_wire_contract {
         )
         .await;
         let err = outcome.expect_err(
-            "a 400 carrying an otherwise-valid token body must still be rejected              on the status alone",
+            "a 400 carrying an otherwise-valid token body must still be rejected \
+              on the status alone",
         );
         assert!(
             !format!("{err:#}").contains("okta-SECRET-must-not-leak"),

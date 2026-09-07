@@ -1774,7 +1774,9 @@ async fn handle_resolve_disagreement(
             req_id,
             -32602,
             &format!(
-                "'{provided}' is not a class of this model's dataset. Valid labels: {}.                  A correction re-labels an existing class; to introduce a NEW class use                  ml_append_examples.",
+                "'{provided}' is not a class of this model's dataset. Valid labels: {}. \
+                  A correction re-labels an existing class; to introduce a NEW class use \
+                  ml_append_examples.",
                 known.join(", ")
             ),
         ),

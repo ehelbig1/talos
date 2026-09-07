@@ -3628,14 +3628,50 @@ pub(crate) fn spawn_analytics_tasks(
             };
 
             for (wf_id, wf_user_id, wf_name, target_rate, target_p95, webhook) in &sla_rows {
-                // Use centralized AnalyticsRepository::get_sla_window_stats so
-                // SLA alerting and readiness scoring share identical PERCENTILE
-                // computations.
-                let stats = match analytics_repo.get_sla_window_stats(*wf_id, 24).await {
-                    Some(s) if s.total >= 3 => s, // Minimum volume: 3 executions
-                    _ => continue,
+                // RFC 0012 P3: one shared read, so this loop and the 5-min
+                // breach monitor cannot answer the same question differently —
+                // and it now sees `sub_workflow_runs`, so a degradation alert
+                // on a sub-workflow is no longer silently impossible.
+                //
+                // The old `_ => continue` folded THREE states into one silent
+                // skip: a failed read, an empty window, and a window with one
+                // or two runs. `docs/swallowed-results-inventory.md` records it
+                // as fails-OPEN. Split, with the unmeasurable case named.
+                let stats = match analytics_repo
+                    .sla_window_sources(
+                        *wf_id,
+                        *wf_user_id,
+                        talos_analytics_repository::SLA_WINDOW_HOURS,
+                    )
+                    .await
+                {
+                    Ok(s) if s.combined.total >= 3 => s, // Minimum volume: 3 runs
+                    Ok(s) => {
+                        tracing::debug!(
+                            workflow_id = %wf_id,
+                            execution_rows = s.executions.total,
+                            child_runs = s.child_runs.total,
+                            "SLA degradation: fewer than 3 settled runs in the window — not evaluated"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "talos_audit",
+                            event_kind = "sla_stats_unreadable",
+                            workflow_id = %wf_id,
+                            error_class = talos_analytics_repository::sla_read_error_class(&e),
+                            "SLA degradation: could not measure this workflow's window — no verdict was reached for it this tick"
+                        );
+                        tracing::debug!(workflow_id = %wf_id, "SLA degradation stats read failed: {e:#}");
+                        continue;
+                    }
                 };
-                let (total, successes, p95_ms) = (stats.total, stats.successes, stats.p95_ms);
+                let (total, successes, p95_ms) = (
+                    stats.combined.total,
+                    stats.combined.succeeded,
+                    stats.combined.p95_ms,
+                );
 
                 let actual_rate = (successes as f64 / total as f64) * 100.0;
 
@@ -4818,10 +4854,22 @@ pub(crate) fn spawn_late_background_tasks(
     }
 
     // ---------- Start SLA threshold breach check task (Round 43) ----------
-    // MCP-1045: subscribe to bg_shutdown_rx — issues per-threshold
-    // INSERTs into workflow_sla_alerts on breach detection. Outer
-    // 5-min ticker gated; inner per-threshold INSERT runs to natural
-    // completion within one tick.
+    // MCP-1045: subscribe to bg_shutdown_rx. Outer 5-min ticker gated; the
+    // per-threshold work runs to natural completion within one tick.
+    //
+    // The comment here used to say this task "issues per-threshold INSERTs
+    // into `workflow_sla_alerts` on breach detection". There is no such INSERT
+    // and no such table — the 15-min sibling writes `workflow_alerts`. This
+    // task's only side effect is a fire-and-forget webhook POST. Corrected
+    // 2026-09-07 (RFC 0012 P3) rather than left to be trusted.
+    //
+    // RFC 0012 P3: the stats read is now the SHARED
+    // `talos_analytics_repository::read_sla_window_sources`, which measures
+    // over `workflow_executions` AND `sub_workflow_runs` in one statement, and
+    // the breach DECISION is the shared pure `decide_sla_breaches`. This loop
+    // is bin-private (`mod bootstrap` inside `main.rs`), so no integration test
+    // can drive it — keeping only the wiring here is what makes the decision
+    // testable at all.
     let sla_pool = db_pool.clone();
     let sla_breach_shutdown = bg_shutdown_rx.clone();
     tokio::spawn(async move {
@@ -4874,11 +4922,52 @@ pub(crate) fn spawn_late_background_tasks(
 
             for row in &thresholds {
                 use sqlx::Row;
-                let workflow_id: uuid::Uuid = row.get("workflow_id");
-                let user_id: uuid::Uuid = row.get("user_id");
-                let p95_threshold: Option<i64> = row.get("p95_latency_ms");
-                let success_threshold: Option<f64> = row.get("success_rate_pct");
-                let webhook: String = row.get("notification_webhook");
+                // EVERY column is read with `try_get`, and a decode failure
+                // skips ONE row instead of killing the task.
+                //
+                // `notification_webhook` was `row.get::<String, _>(..)` and the
+                // column is NULLABLE by design (migration
+                // `20260404000001_nullable_sla_notification_webhook.sql`);
+                // `set_workflow_sla_threshold` stores NULL for an omitted
+                // webhook and its tool description advertises that as the
+                // API-polling configuration. `Row::get` PANICS on a decode
+                // failure, and this loop is a spawned task, so ONE such row
+                // ended the SLA monitor for the whole process lifetime,
+                // silently — the documented configuration disabled the
+                // alerter. Measured 2026-09-07 by driving the exact statement
+                // and the exact decode against a real row
+                // (`controller/tests/sla_ledger_tests.rs`).
+                let decoded = (|| -> Result<_, sqlx::Error> {
+                    Ok((
+                        row.try_get::<uuid::Uuid, _>("workflow_id")?,
+                        row.try_get::<uuid::Uuid, _>("user_id")?,
+                        row.try_get::<Option<i64>, _>("p95_latency_ms")?,
+                        row.try_get::<Option<f64>, _>("success_rate_pct")?,
+                        row.try_get::<Option<String>, _>("notification_webhook")?,
+                    ))
+                })();
+                let (workflow_id, user_id, p95_threshold, success_threshold, webhook) =
+                    match decoded {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "talos_audit",
+                                event_kind = "sla_threshold_row_undecodable",
+                                error = %e,
+                                "SLA monitor: skipping one threshold row it could not decode"
+                            );
+                            continue;
+                        }
+                    };
+                // A threshold with no webhook is the DOCUMENTED API-polling
+                // configuration: there is nothing for this task to deliver.
+                let Some(webhook) = webhook else {
+                    tracing::debug!(
+                        workflow_id = %workflow_id,
+                        "SLA monitor: threshold has no notification_webhook (API-polling only)"
+                    );
+                    continue;
+                };
 
                 // Re-validate at fire time. Stored URLs that predate the
                 // r285 SSRF hardening (obfuscated IPv4 — octal/hex/integer
@@ -4892,150 +4981,155 @@ pub(crate) fn spawn_late_background_tasks(
                     continue;
                 }
 
-                // Query last-24h stats
-                let stats = sqlx::query(
-                    "SELECT \
-                        COUNT(*) FILTER (WHERE status = 'completed')::bigint AS succeeded, \
-                        COUNT(*)::bigint AS total, \
-                        PERCENTILE_CONT(0.95) WITHIN GROUP \
-                            (ORDER BY EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000) \
-                            AS p95_ms \
-                     FROM workflow_executions \
-                     WHERE workflow_id = $1 AND user_id = $2 \
-                       AND started_at > NOW() - INTERVAL '24 hours' \
-                       AND completed_at IS NOT NULL",
+                // The SHARED read: both populations, one statement, plus the
+                // ledger's floor. Before RFC 0012 P3 this was inline SQL over
+                // `workflow_executions` alone, so a threshold set on a
+                // sub-workflow was SILENTLY INERT — a child records no
+                // execution row, so `total == 0` fired on every tick.
+                let sources = match talos_analytics_repository::read_sla_window_sources(
+                    &sla_pool,
+                    workflow_id,
+                    user_id,
+                    talos_analytics_repository::SLA_WINDOW_HOURS,
                 )
-                .bind(workflow_id)
-                .bind(user_id)
-                .fetch_one(&sla_pool)
-                .await;
-
-                let stats = match stats {
-                    Ok(r) => r,
-                    Err(_) => continue,
+                .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        // An alerter that could not measure must SAY SO. This
+                        // arm was a bare `Err(_) => continue`: a database
+                        // problem was indistinguishable, in every channel, from
+                        // a workflow that met its SLA. The CLASS goes to WARN
+                        // (a WARN carrying a whole error chain is a WARN nobody
+                        // reads); the chain goes to DEBUG.
+                        tracing::warn!(
+                            target: "talos_audit",
+                            event_kind = "sla_stats_unreadable",
+                            workflow_id = %workflow_id,
+                            error_class = talos_analytics_repository::sla_read_error_class(&e),
+                            "SLA monitor: could not measure this workflow's window — no verdict was reached for it this tick"
+                        );
+                        tracing::debug!(workflow_id = %workflow_id, "SLA monitor stats read failed: {e:#}");
+                        continue;
+                    }
                 };
 
-                let total: i64 = stats.get("total");
-                if total == 0 {
+                let thresholds = talos_analytics_repository::SlaThresholds {
+                    p95_latency_ms: p95_threshold,
+                    success_rate_pct: success_threshold,
+                };
+                let decision =
+                    talos_analytics_repository::decide_sla_breaches(&sources, &thresholds);
+                if let Some(reason) = decision.not_evaluated {
+                    // Not a breach and not compliance — the same
+                    // UNKNOWN-is-not-zero rule every RFC 0012 consumer applies,
+                    // in the one channel an alerter has.
+                    tracing::debug!(
+                        workflow_id = %workflow_id,
+                        reason = reason.as_str(),
+                        execution_rows = sources.executions.total,
+                        child_runs = sources.child_runs.total,
+                        "SLA monitor: window not evaluated"
+                    );
                     continue;
                 }
-                let succeeded: i64 = stats.get("succeeded");
-                let p95_ms: Option<f64> = stats.get("p95_ms");
-                let actual_success_pct = (succeeded as f64 / total as f64) * 100.0;
-
-                let now = chrono::Utc::now().to_rfc3339();
-
-                // Check p95 latency breach
-                if let (Some(threshold), Some(actual)) = (p95_threshold, p95_ms) {
-                    if actual > threshold as f64 {
-                        let payload = serde_json::json!({
-                            "event": "sla_breach",
-                            "workflow_id": workflow_id,
-                            "metric": "p95_latency_ms",
-                            "threshold": threshold,
-                            "actual": actual as i64,
-                            "timestamp": now,
-                        });
-                        tracing::warn!(
-                            workflow_id = %workflow_id,
-                            threshold = threshold,
-                            actual = actual as i64,
-                            "SLA breach: p95 latency exceeded"
-                        );
-                        let client = client.clone();
-                        let webhook = webhook.clone();
-                        // MCP-809 (2026-05-14): canonical 3-arm match.
-                        // Pre-fix this fire only logged on Err — an
-                        // operator-supplied webhook returning 4xx/5xx
-                        // (e.g. PagerDuty rate-limited / Slack 503 /
-                        // OpsGenie 502) was silently treated as
-                        // success. The sibling 15-min SLA-degradation
-                        // fire at ~line 2209 already follows the canonical
-                        // shape (MCP-774); this 5-min SLA-breach task
-                        // had drifted. Same misleading-success class as
-                        // MCP-737/738/800/801. WARN+target talos_rpc so
-                        // dashboards correlate delivery-failure rate
-                        // with controller health.
-                        tokio::spawn(async move {
-                            match client.post(&webhook).json(&payload).send().await {
-                                Ok(resp) if resp.status().is_success() => {
-                                    tracing::debug!(
-                                        webhook = %webhook,
-                                        status = resp.status().as_u16(),
-                                        "SLA-breach (p95) webhook delivered"
-                                    );
-                                }
-                                Ok(resp) => {
-                                    tracing::warn!(
-                                        target: "talos_rpc",
-                                        webhook = %webhook,
-                                        status = resp.status().as_u16(),
-                                        "SLA-breach (p95) webhook returned non-success status — operator notification may not have reached its destination"
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        target: "talos_rpc",
-                                        webhook = %webhook,
-                                        error = %e,
-                                        "SLA-breach (p95) webhook POST failed — operator notification undelivered"
-                                    );
-                                }
-                            }
-                        });
-                    }
+                if !decision.fired() {
+                    continue;
                 }
 
-                // Check success rate breach
-                if let Some(threshold) = success_threshold {
-                    if actual_success_pct < threshold {
-                        let payload = serde_json::json!({
-                            "event": "sla_breach",
-                            "workflow_id": workflow_id,
-                            "metric": "success_rate_pct",
-                            "threshold": threshold,
-                            "actual": (actual_success_pct * 100.0).round() / 100.0,
-                            "timestamp": now,
-                        });
-                        tracing::warn!(
-                            workflow_id = %workflow_id,
-                            threshold = threshold,
-                            actual = actual_success_pct,
-                            "SLA breach: success rate below threshold"
-                        );
-                        let client = client.clone();
-                        let webhook = webhook.clone();
-                        // MCP-809 (2026-05-14): same misleading-success drift
-                        // as the p95 sibling above; mirror the canonical
-                        // 3-arm match. See p95 comment for rationale.
-                        tokio::spawn(async move {
-                            match client.post(&webhook).json(&payload).send().await {
-                                Ok(resp) if resp.status().is_success() => {
-                                    tracing::debug!(
-                                        webhook = %webhook,
-                                        status = resp.status().as_u16(),
-                                        "SLA-breach (success-rate) webhook delivered"
-                                    );
-                                }
-                                Ok(resp) => {
-                                    tracing::warn!(
-                                        target: "talos_rpc",
-                                        webhook = %webhook,
-                                        status = resp.status().as_u16(),
-                                        "SLA-breach (success-rate) webhook returned non-success status — operator notification may not have reached its destination"
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        target: "talos_rpc",
-                                        webhook = %webhook,
-                                        error = %e,
-                                        "SLA-breach (success-rate) webhook POST failed — operator notification undelivered"
-                                    );
-                                }
+                let now = chrono::Utc::now().to_rfc3339();
+                // The population SPLIT travels with every fire, so a receiver
+                // can tell a breach measured from 40 execution rows from one
+                // measured from 3 child runs. Ids, counts and timestamps only —
+                // nothing here is a name or a payload, matching what this
+                // webhook has always carried.
+                let sources_payload = serde_json::json!({
+                    "execution_rows": sources.executions.total,
+                    "child_runs": sources.child_runs.total,
+                    "child_runs_since": sources.ledger_since.map(|t| t.to_rfc3339()),
+                    "window_hours": talos_analytics_repository::SLA_WINDOW_HOURS,
+                });
+
+                for breach in &decision.breaches {
+                    // Both payload shapes are preserved key-for-key: `event`,
+                    // `workflow_id`, `metric`, `threshold`, `actual`,
+                    // `timestamp`. `actual` keeps its per-metric rendering —
+                    // whole milliseconds for latency, two decimals for a
+                    // percentage — because a receiver may already parse them.
+                    let actual = match breach.metric {
+                        talos_analytics_repository::SlaMetric::P95LatencyMs => {
+                            serde_json::json!(breach.actual as i64)
+                        }
+                        talos_analytics_repository::SlaMetric::SuccessRatePct => {
+                            serde_json::json!((breach.actual * 100.0).round() / 100.0)
+                        }
+                    };
+                    let threshold = match breach.metric {
+                        talos_analytics_repository::SlaMetric::P95LatencyMs => {
+                            serde_json::json!(breach.threshold as i64)
+                        }
+                        talos_analytics_repository::SlaMetric::SuccessRatePct => {
+                            serde_json::json!(breach.threshold)
+                        }
+                    };
+                    let metric = breach.metric.as_str();
+                    let payload = serde_json::json!({
+                        "event": "sla_breach",
+                        "workflow_id": workflow_id,
+                        "metric": metric,
+                        "threshold": threshold,
+                        "actual": actual,
+                        "timestamp": now,
+                        "sources": sources_payload,
+                    });
+                    tracing::warn!(
+                        workflow_id = %workflow_id,
+                        metric = metric,
+                        threshold = breach.threshold,
+                        actual = breach.actual,
+                        execution_rows = sources.executions.total,
+                        child_runs = sources.child_runs.total,
+                        "SLA breach detected"
+                    );
+                    let client = client.clone();
+                    let webhook = webhook.clone();
+                    // MCP-809 (2026-05-14): canonical 3-arm match. Pre-fix this
+                    // fire only logged on Err — an operator-supplied webhook
+                    // returning 4xx/5xx (PagerDuty rate-limited / Slack 503 /
+                    // OpsGenie 502) was silently treated as success. Same
+                    // misleading-success class as MCP-737/738/800/801.
+                    // WARN + target talos_rpc so dashboards correlate
+                    // delivery-failure rate with controller health.
+                    tokio::spawn(async move {
+                        match client.post(&webhook).json(&payload).send().await {
+                            Ok(resp) if resp.status().is_success() => {
+                                tracing::debug!(
+                                    webhook = %webhook,
+                                    status = resp.status().as_u16(),
+                                    metric = metric,
+                                    "SLA-breach webhook delivered"
+                                );
                             }
-                        });
-                    }
+                            Ok(resp) => {
+                                tracing::warn!(
+                                    target: "talos_rpc",
+                                    webhook = %webhook,
+                                    status = resp.status().as_u16(),
+                                    metric = metric,
+                                    "SLA-breach webhook returned non-success status — operator notification may not have reached its destination"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: "talos_rpc",
+                                    webhook = %webhook,
+                                    error = %e,
+                                    metric = metric,
+                                    "SLA-breach webhook POST failed — operator notification undelivered"
+                                );
+                            }
+                        }
+                    });
                 }
             }
         }

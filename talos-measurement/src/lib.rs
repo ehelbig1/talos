@@ -187,17 +187,20 @@ impl Coverage {
         }
         match self.omitted() {
             Some(0) => format!(
-                "at the cap of {}: the read returned exactly its limit and the population was                  measured at the same value, so nothing is known to be missing",
+                "at the cap of {}: the read returned exactly its limit and the population was \
+                  measured at the same value, so nothing is known to be missing",
                 self.cap
             ),
             Some(n) => format!(
-                "TRUNCATED: read {} of {} row(s) under a cap of {}; {n} row(s) were not examined                  and are not reflected in any count derived from this read",
+                "TRUNCATED: read {} of {} row(s) under a cap of {}; {n} row(s) were not examined \
+                  and are not reflected in any count derived from this read",
                 self.returned,
                 self.available.unwrap_or(self.returned),
                 self.cap
             ),
             None => format!(
-                "TRUNCATED: the read hit its cap of {}, so the true population was not measured                  and is AT LEAST {}. Counts derived from this read are lower bounds, not totals",
+                "TRUNCATED: the read hit its cap of {}, so the true population was not measured \
+                  and is AT LEAST {}. Counts derived from this read are lower bounds, not totals",
                 self.cap, self.returned
             ),
         }

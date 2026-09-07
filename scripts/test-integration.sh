@@ -431,6 +431,17 @@ CTRL_TESTS=(
     # retention purge selects. Uses the `common` DATABASE_URL harness, so
     # CTRL_TESTS and not TC_TESTS (sub-leg 64b).
     "child_run_ledger_tests"
+    # RFC 0012 P3. The cascading-failure check's verdict is now a UNION of two
+    # tables, and the half that matters is the DATABASE's: which rows the
+    # grouped ledger query returns under RLS for the CALLER, what an absent key
+    # means, and where the seven-day window cuts. `common` (DATABASE_URL)
+    # harness, so CTRL_TESTS and not TC_TESTS (64b).
+    "cascading_risk_ledger_tests"
+    # RFC 0012 P3. The SLA monitor and the SLA report now measure over both
+    # tables through one repository read; the UNION SQL, its window and its
+    # per-source split can only be observed against a real Postgres. Also pins
+    # the NULL-webhook threshold row that used to panic the monitor's decode.
+    "sla_ledger_tests"
     "execution_archive_read_tests"
     # The same question one table over (2026-08-31). `execution_events.
     # duration_ms` was derived by a BEFORE INSERT trigger from two event

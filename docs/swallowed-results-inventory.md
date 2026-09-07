@@ -504,7 +504,13 @@ HINCRBY pre-charge, so narrow), the four capability-grant sites above,
 `analytics.rs:4626` (the high-severity `repeated_auth_failures` finding is
 silently omitted from the risk assessment), `analytics-repository:1955` (the
 background SLA loop's `_ => continue` **skips SLA-violation alerting**,
-indistinguishable from "fewer than 3 executions"), `analytics-repository:4329`
+indistinguishable from "fewer than 3 executions" — **CLOSED 2026-09-07, RFC 0012
+P3**: `get_sla_window_stats` is now a projection of a `Result`-returning read,
+and the 15-min loop's arm is split three ways, with the unreadable case logged
+under `event_kind = "sla_stats_unreadable"` and an error CLASS. The sibling
+5-min breach monitor's `Err(_) => continue` — never inventoried here, because it
+is inline SQL in a bin-private loop rather than a repository call — was closed
+in the same change), `analytics-repository:4329`
 (the hygiene report claims no module holds a `*` secret grant),
 `oauth/credentials.rs:550` (the provider-side revoke is skipped while the local
 rows are deleted, leaving a live OAuth grant the platform has forgotten),

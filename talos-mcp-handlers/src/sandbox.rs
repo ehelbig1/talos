@@ -937,12 +937,13 @@ async fn handle_compile_custom_sandbox(
             "python" | "py" => Some(talos_compilation::ModuleLanguage::Python),
             other => {
                 return mcp_error(
-                        req_id,
-                        -32602,
-                        &format!(
-                            "Unsupported language '{other}'. Supported: rust (default),                              javascript, python. (TypeScript must be transpiled to JS first.)"
-                        ),
-                    );
+                    req_id,
+                    -32602,
+                    &format!(
+                        "Unsupported language '{other}'. Supported: rust (default), \
+                              javascript, python. (TypeScript must be transpiled to JS first.)"
+                    ),
+                );
             }
         },
         Some(v) => {
@@ -1029,7 +1030,8 @@ async fn handle_compile_custom_sandbox(
         return mcp_error(
             req_id,
             -32602,
-            "dependencies is Rust-only (cargo crates). JavaScript/Python modules              must be self-contained — the sandbox has no network at componentize time.",
+            "dependencies is Rust-only (cargo crates). JavaScript/Python modules \
+              must be self-contained — the sandbox has no network at componentize time.",
         );
     }
 
@@ -3339,7 +3341,8 @@ async fn handle_test_module(
                 tracing::warn!(
                     actor_id = %aid,
                     error = %e,
-                    "test_module: could not read the actor's write ceiling —                      failing closed to readonly for this run"
+                    "test_module: could not read the actor's write ceiling — \
+                      failing closed to readonly for this run"
                 );
                 (talos_workflow_job_protocol::WriteCeiling::ReadOnly, true)
             }
