@@ -236,13 +236,49 @@ pub async fn login_test_user(auth_service: &AuthService, email: &str) -> (String
     (access, refresh)
 }
 
+/// Create an organization owned by `owner_id` and return its id.
+///
+/// Routed through the PRODUCTION `OrganizationService::create_org` rather than
+/// a hand-written INSERT, per the Testing Conventions rule ("don't shadow
+/// production logic with a test-local copy — it drifts"). It had drifted: until
+/// 2026-09-07 this helper issued
+/// `INSERT INTO organizations (name) VALUES ($1) RETURNING id`, which omits
+/// **two** NOT NULL columns (`slug` and `owner_id`) and fails on every call —
+/// verified directly against a migrated database:
+/// `null value in column "slug" of relation "organizations" violates
+/// not-null constraint`. Nothing noticed because the helper's only caller,
+/// `create_authenticated_org_client`, itself had zero callers, so the whole
+/// chain was dead code that had never once executed.
+///
+/// `create_org` also inserts the owner's `organization_members` row, which is
+/// why `add_user_to_organization` below is an UPSERT.
 #[allow(dead_code)]
-pub async fn create_test_organization(db_pool: &Pool<Postgres>, name: &str) -> Uuid {
-    sqlx::query_scalar("INSERT INTO organizations (name) VALUES ($1) RETURNING id")
-        .bind(name)
-        .fetch_one(db_pool)
+pub async fn create_test_organization(
+    db_pool: &Pool<Postgres>,
+    name: &str,
+    owner_id: Uuid,
+) -> Uuid {
+    // Slug rules (enforced by `create_org`): 3-100 chars, lowercase ASCII
+    // alphanumeric + hyphen. Derive from the name and suffix a UUID so
+    // concurrent tests in one database cannot collide on `organizations.slug`.
+    let stem: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .take(40)
+        .collect();
+    let slug = format!("{}-{}", stem.trim_matches('-'), Uuid::new_v4().as_simple());
+    let slug = &slug[..slug.len().min(100)];
+
+    controller::organizations::OrganizationService::create_org(db_pool, name, slug, owner_id)
         .await
         .expect("Failed to create organization")
+        .id
 }
 
 #[allow(dead_code)]
@@ -255,16 +291,24 @@ pub async fn add_user_to_organization(
     // MCP-595/596 sibling: `organization_members` column is `org_id`,
     // not `organization_id`. This test helper would fail at runtime
     // ("column 'organization_id' does not exist") the moment any test
-    // exercised it. Currently the helper has zero callers but keep it
-    // accurate so a future user of the harness doesn't get a confusing
-    // surprise.
-    sqlx::query("INSERT INTO organization_members (user_id, org_id, role) VALUES ($1, $2, $3)")
-        .bind(user_id)
-        .bind(organization_id)
-        .bind(role)
-        .execute(db_pool)
-        .await
-        .expect("Failed to add user to organization");
+    // exercised it.
+    //
+    // UPSERT, not INSERT (2026-09-07): `create_test_organization` now goes
+    // through `OrganizationService::create_org`, which already inserts the
+    // owner's membership row, so a plain INSERT for that same user violates
+    // `organization_members_org_id_user_id_key`. The helper's contract is
+    // "this user holds this role in this org", which an upsert states and an
+    // insert only states for a user who is not already a member.
+    sqlx::query(
+        "INSERT INTO organization_members (user_id, org_id, role) VALUES ($1, $2, $3) \
+         ON CONFLICT (org_id, user_id) DO UPDATE SET role = EXCLUDED.role",
+    )
+    .bind(user_id)
+    .bind(organization_id)
+    .bind(role)
+    .execute(db_pool)
+    .await
+    .expect("Failed to add user to organization");
 }
 
 #[allow(dead_code)]
@@ -276,7 +320,7 @@ pub async fn create_authenticated_org_client(
     scopes: Vec<ApiKeyScope>,
 ) -> AuthenticatedClient {
     let user_id = create_test_user(&ctx.auth_service, email).await;
-    let organization_id = create_test_organization(&ctx.db_pool, org_name).await;
+    let organization_id = create_test_organization(&ctx.db_pool, org_name, user_id).await;
     add_user_to_organization(&ctx.db_pool, user_id, organization_id, role).await;
 
     AuthenticatedClient::new(user_id, Some(organization_id), scopes, ctx.schema.clone())

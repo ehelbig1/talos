@@ -1262,6 +1262,202 @@ wider-population clause unconditionally. **No lint** — the population is one r
 and the guard is four unit tests over the real pure function; `--count` moves to 87
 for leg X1's check only.
 
+## 2026-09-07 — the population behind checks 74 / 76 / 79 / 81: 210 collapsed reads, 110 of them claims
+
+Every prior entry in this family repaired a SITE and named a class. This one
+MEASURED the class. `talos-mcp-handlers/src` + `talos-api/src` hold **210**
+awaited repository/service reads collapsed into a default, and **110 of them
+are CLAIMS** — the default becomes a count, a list, a verdict or a "not found"
+that a caller reads and acts on. The full per-site table (file, line, function,
+spelling, verdict, the field it feeds) is in the branch's `AGENT_NOTES.md`; the
+counts and the decisions are here so nobody re-measures.
+
+**The inventory is statement-aware, and that is why it is bigger than a grep.**
+Comment and string content is masked first (so a doc comment quoting the banned
+expression cannot self-report — check 73's trap), then the POSTFIX METHOD CHAIN
+after each `.await` is walked, so the house style's broken chain is one
+statement; a collapse counts only if it precedes any `?`. Per spelling:
+`.unwrap_or_default()` **66**, `.unwrap_or(<literal>)` **55**, `.ok()` **32**,
+`match … { Err(_)/_ => <default> }` **26**, `if let Ok(..) = ….await` /
+`let Ok(..) = … else` **24**, `.unwrap_or_else(…)` **7**.
+
+**Classification: 110 claim / 67 decorative / 32 fail-closed / 1 detector false
+positive.** `fail-closed` is dominated by ONE shape —
+**15** of the 32 are `is_platform_admin(uid).await.unwrap_or(false)`, which
+check 74's opt-out already names as correct. The false positive is
+`handle_trigger_workflow_as_actors`, a correct three-way match whose INNER
+`actor.status` arm the window matched: stated rather than dropped, because a
+detector's limits are worth as much as its findings.
+
+**ELEVEN sites were fixed, in three SHAPES, and 99 claim sites were not.**
+Saying so plainly is the point — a fix set chosen as a prefix of a list teaches
+nothing, and half-fixing a class to satisfy a gate is how the glob got its
+blind spot.
+
+* **A refusal that asserts NON-EXISTENCE on a read that failed.**
+  `actor::resolve_actor_via_repo` is the ownership gate behind **20+** actor
+  tools and its `Err(_)` arm rendered *"Actor not found or access denied"* —
+  false on both clauses while the database is the broken thing. The correct
+  three-way shape was already in the same crate
+  (`evaluation::ensure_actor_owner` splits `Err(_) => "actor ownership check
+  failed"`), so this is a rule that failed to REPLICATE, exactly as check 79
+  records about the four integration handlers.
+  `knowledge_graph::require_owned_actor` is the byte-identical twin.
+  `ml::require_dataset_owner` needed the CALLEE fixed first — check 79's leg (b)
+  verbatim: `DatasetService::dataset_tenancy` folds absence INTO `Err`, so
+  `Ok(None)` was structurally unreachable and no call-site split was possible.
+  `lookup_dataset_tenancy` is the three-way read; `dataset_tenancy` stays as a
+  documented FLATTENING projection because its eight in-crate callers propagate
+  with `?`, i.e. FAIL rather than claim.
+* **A swallowed read driving a DESTRUCTIVE or inventory decision.**
+  `handle_cleanup_module_versions` read `refs.is_empty()` as "nothing points at
+  this module → deletable", and its reference read was `.unwrap_or_default()` —
+  so with `dry_run: false` an IRREVERSIBLE delete was decided by a query that
+  did not answer (check 86's shape on a path that deletes rather than
+  recommends). Held-back modules are excluded from `deletable` AND disclosed
+  under `unknown_references`, with the sentence saying why its count is short.
+  `handle_batch_delete_modules`'s classification default is fail-closed for the
+  DELETE and NOT for the REPORT — it told the caller, by name, that each of
+  their modules does not exist — and now refuses. `handle_list_templates` /
+  `handle_list_modules` refuse too: an empty listing is the premise of every
+  next step an operator takes, and there is no partial answer to give.
+* **A COUNT or LIST rendered as a report field.**
+  `handle_get_workflow_summary` answered a database failure with the four most
+  reassuring numbers it can produce — `total: 0`, `versions: 0`,
+  `active_schedules: 0`, `active_webhooks: 0`, i.e. *never run, never published,
+  nothing triggers it*, which is the reading an operator uses to decide a
+  workflow is safe to retire. **That handler already had a DOCUMENTED case of
+  this swallow hiding a real bug**: `get_workflow_schedule_count`'s own comment
+  records that the query named a column that does not exist (`is_active` vs
+  `is_enabled`) and *"handler `unwrap_or(0)` swallowed the column-not-found
+  error and `get_workflow_summary` reported `active_schedules: 0` for every
+  workflow, including ones with active schedules"* — the QUERY was fixed in May
+  2026 and the SWALLOW was left in place, the sixth local repair of a class with
+  no population sweep behind it. `handle_list_executions` fell back to
+  `rows.len()` — the PAGE LENGTH — so an unreadable count over 4 000 executions
+  rendered `total: 20, has_more: false` and a caller paging on that envelope
+  stops at the first page believing it has everything.
+  `handle_get_catalog_status` is a DIFF, so an unreadable `list_catalog_rows`
+  put every disk template in `on_disk_not_in_db` and emitted *"restart the
+  controller to seed"* — specific, actionable, wrong advice about a healthy
+  catalog. `handle_get_execution_replay_chain`'s empty `ancestors` /
+  `descendants` are the same determinate negatives #771 removed from
+  `get_execution_lineage`'s "standalone run" sentence one tool over.
+
+**Three of the eleven are pinned by a DB test that drives the REAL
+`McpState` and the production `dispatch`**
+(`controller/tests/swallowed_read_disclosure_tests`, CTRL_TESTS per check 64b —
+it is a `mod common` binary). The failure mechanism is package 22's: the
+RELATION the read names is DROPPED in the per-test isolated database, so the
+statement cannot run. It builds a real state rather than a stand-in because the
+defect is what the handler BODY renders — checks 74b and 79b both state, as
+their own limit, that a guard at the READ cannot see an answer classified
+correctly and discarded further down. Every test carries its CONTROL in the same
+run (a fresh user really does have zero modules; a workflow with no schedules
+really does report `0`; an actor that is genuinely absent keeps the not-found
+sentence), because a healthy response must stay byte-identical and only a
+degraded one may change shape. Three mutations reinstating main's expressions
+are all RED — and M2's response was literally `{"count": 0, "modules": []}` with
+the view DROPPED.
+
+**The lint candidate was BUILT, MEASURED and REJECTED — `--count` stays 87.**
+Widening check 74 from its name glob to EVERY handler for
+`.unwrap_or_default()` / `.unwrap_or(Vec::new())` / `.unwrap_or(0)` over an
+awaited read reports **73 on pristine main, 61 of them claims — 83.6 %
+precision**, which sits between check 74's #730 group (81.8 %) and its
+2026-09-02 group (94.1 %). Precision is not the problem. It would ship at
+**62** on this tree, i.e. as a ratchet with a baseline, and "do NOT re-add a
+baseline" is check 52's own rule (#760: *"a check cannot ship at 21"*). The
+twelve false positives are the same shape every time — a display name or a
+suggestion list beside untouched counts. **What ships instead costs no check
+number: sub-leg 74b covers the three repaired report handlers AUTOMATICALLY**,
+because its scope is DERIVED ("any function constructing a `Readings`") and they
+enrolled themselves by adopting the ledger. That is not a theoretical
+convenience — **74b fired on the first lint run after the fixes**, at
+`handle_get_catalog_status`'s disk scan, where a `JoinError` defaulted to an
+EMPTY template list that reads as "this image carries no catalog templates". A
+filesystem read inside a catalog tool is exactly what a hand-maintained glob
+would never have looked at. The way to extend the coverage is to fix a handler,
+not to widen a regex.
+
+**Two fail-OPEN gates are RECORDED and not fixed**, and they outrank the
+remaining report sites for whoever takes the next pass:
+`search::handle_tag_workflow` skips the 100-tag cap when the count read fails,
+and `sandbox::handle_run_sandbox` skips the LINT step entirely on
+`if let Ok(lint_errors)`. And `analytics::handle_get_workflow_dependencies_list`
+(`schedules`, `webhooks`) is deliberately untouched: it is the site the sibling
+PR #775 fixes.
+
+### The whitespace-run artefact, and why no lint guards it
+
+Four operator-facing string literals carried mid-sentence runs of up to 22
+spaces — a `\`-continuation that lost its `\` and kept the indentation. All
+four are from #771's dispatch-attempt work and all say the same thing in four
+places: an audit-ledger WARN read during a tamper investigation, a Prometheus
+**HELP** string, and two `security_audit` disclosure sentences. A line grep
+cannot see the shape (the run spans the continuation join), so the measurement
+used a literal-aware walker: **9 literals with a ≥5-space run on main, 3 SQL
+column alignments, 6 prose, 4 of them defects; 0 defects after.** The two
+surviving prose hits are the CLI's aligned help columns and are correct.
+
+**Both candidate guards were measured and rejected.** A grep scoped to literals
+with no SQL keyword reports 6 on main (66.7 % precision) and **2 on the fixed
+tree**, both legitimate — it would ship above zero with markers on correct code,
+and adding a prose-punctuation clause does not separate an aligned help column
+from a sentence (`"… List the DB worker-identity registry."` has a full stop).
+A render-time collapse at `mcp_text`'s JSON boundary is rejected on two grounds,
+one of them measured: it hides the defect rather than preventing it (the source
+literal stays wrong and the next reader copies it), and **it would have covered
+two of these four at most** — the Prometheus HELP text and the tracing WARN
+never pass through `mcp_text`.
+
+### `remove_member` refused every caller, and that is why the mutation survived
+
+The brief for this package recorded a redundant last-owner arm in
+`talos_organizations::remove_member` and asked for the reachability enumerated.
+It is enumerable and the second arm was DEAD: `check_org_access(.., Admin)`
+admits only Admin or Owner; the rank rule refuses a caller below the target and
+`Owner` is the maximum, so a target of Owner implies a caller of Owner; two
+DIFFERENT owner rows make `owner_count >= 2`. So the guard is reachable only
+when `caller_id == user_id`, which the first arm already answers — the second
+was a strict subset behind a `return`.
+
+**But the enumeration is not why the mutation survived.** Writing the test for
+the surviving arm turned it RED with `Failed to count owners`:
+
+    SELECT COUNT(*) FROM organization_members
+    WHERE org_id = $1 AND role = 'owner' FOR UPDATE
+    -- ERROR:  FOR UPDATE is not allowed with aggregate functions
+
+Postgres refuses the statement outright, so **`remove_member` failed for EVERY
+caller and every target** — the member-removal path has been entirely
+non-functional since MCP-996 added the TOCTOU hardening in May 2026, and
+NEITHER last-owner arm was ever reachable. No test could have distinguished the
+arms however it was written. The same statement appears a second time in
+`update_member_role`'s demotion guard, where it fires only when demoting an
+Owner. Both now put the aggregate OUTSIDE the locking subquery
+(`SELECT COUNT(*) FROM (SELECT 1 … FOR UPDATE) locked_owners`), which takes the
+same row locks. **LATENT on this deployment**: the live database holds 1
+`organization_members` row and 0 non-personal organizations.
+`organization_tests::the_sole_owner_cannot_remove_themselves` asserts the
+MESSAGE and not merely the refusal — asserting `is_err()` is precisely what let
+the dead arm stand in for the live one — with a control proving the guard keys
+on the owner COUNT rather than on self-removal.
+
+### A harness helper that had never once executed
+
+`controller/tests/common::create_test_organization` issued
+`INSERT INTO organizations (name) VALUES ($1) RETURNING id`, omitting **two**
+NOT NULL columns (`slug` and `owner_id`), so it failed on every call. Nothing
+noticed because its only caller, `create_authenticated_org_client`, had zero
+callers: three helpers deep, all dead, so the first test to reach for the
+harness would have failed on the harness rather than on its subject. It now
+routes through the production `OrganizationService::create_org` (the Testing
+Conventions rule — and it had drifted), `add_user_to_organization` became an
+UPSERT because `create_org` already inserts the owner's membership row, and
+`api_auth_integration_test::org_scoped_client_helper_actually_provisions_an_org`
+drives the chain end to end. Reinstating main's helper body is RED.
+
 ## The verifier that could never read the ledger it verified (#767)
 
 **Measured live 2026-09-06, and the shape is "presence is not function" at the

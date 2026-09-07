@@ -254,19 +254,42 @@ impl DatasetService {
 
     /// Read the parent dataset's tenancy — the ONLY source of the
     /// `user_id`/`org_id` stamped on example rows.
-    pub async fn dataset_tenancy(
+    /// Three-way tenancy read: `Ok(Some)` the row exists, `Ok(None)` there is
+    /// no such dataset, `Err` the read did not answer.
+    ///
+    /// Added 2026-09-07 for the reason check 79(b) records about
+    /// `integration_helpers::get_entry`: `dataset_tenancy` below folds absence
+    /// INTO `Err`, so a caller that wants to say "no such dataset" and a caller
+    /// that wants to say "we could not look" are handed one value and must
+    /// guess. `require_dataset_owner` in `talos-mcp-handlers` guessed
+    /// "not found", which during a database incident told the operator their
+    /// dataset was gone.
+    pub async fn lookup_dataset_tenancy(
         &self,
         conn: &mut PgConnection,
         dataset_id: Uuid,
-    ) -> Result<DatasetTenancy> {
+    ) -> Result<Option<DatasetTenancy>> {
         let row: Option<(Uuid, Option<Uuid>)> =
             sqlx::query_as("SELECT user_id, org_id FROM ml_datasets WHERE id = $1")
                 .bind(dataset_id)
                 .fetch_optional(&mut *conn)
                 .await?;
-        let (user_id, org_id) =
-            row.ok_or_else(|| anyhow::anyhow!("dataset {dataset_id} not found"))?;
-        Ok(DatasetTenancy { user_id, org_id })
+        Ok(row.map(|(user_id, org_id)| DatasetTenancy { user_id, org_id }))
+    }
+
+    /// FLATTENING projection over `lookup_dataset_tenancy`: absence becomes an
+    /// `Err`. Correct for the in-crate callers, every one of which propagates
+    /// with `?` and so FAILS rather than making a claim about the dataset. Do
+    /// NOT reach for it from a surface that renders a message to a caller —
+    /// take `lookup_dataset_tenancy` and classify.
+    pub async fn dataset_tenancy(
+        &self,
+        conn: &mut PgConnection,
+        dataset_id: Uuid,
+    ) -> Result<DatasetTenancy> {
+        self.lookup_dataset_tenancy(conn, dataset_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("dataset {dataset_id} not found"))
     }
 
     /// Connection-free preparation: AEAD-encrypt and locally-embed each

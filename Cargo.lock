@@ -1827,6 +1827,7 @@ dependencies = [
  "talos-integration-state",
  "talos-integrations",
  "talos-jobs",
+ "talos-judge-probe",
  "talos-llm",
  "talos-mcp",
  "talos-mcp-handlers",

@@ -354,6 +354,15 @@ CTRL_TESTS=(
     # `security_audit`'s candidate query against real seeded rows; `common`
     # harness, so CTRL_TESTS (64b).
     "audit_chain_population_tests"
+    # A read that FAILED must not render as a read that found nothing. Package
+    # 23 inventoried 210 collapsed awaited reads across the MCP + GraphQL
+    # handler surface and classified 110 of them as CLAIMS. This binary builds a
+    # REAL `McpState` and drives the production `dispatch` for three of the
+    # repaired ones with the relation the read names DROPPED, because the defect
+    # is what the handler BODY renders — checks 74b/79b both state that a guard
+    # at the read cannot see an answer discarded further down. `common`
+    # harness, so CTRL_TESTS (64b).
+    "swallowed_read_disclosure_tests"
     "api_key_tests"
     "api_auth_integration_test"
     "integration_mcp_tests"

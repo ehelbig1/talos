@@ -1134,6 +1134,18 @@ async fn resolve_actor_via_repo(
         .parse()
         .map_err(|_| mcp_error(req_id.clone(), -32602, "Invalid actor_id UUID"))?;
 
+    // Three-way, not two (2026-09-07). `Ok(None)` is "no such actor, or it is
+    // not yours" — the deliberate single message that stops this surface being
+    // an actor-id enumeration oracle. `Err` is a pool timeout, a Postgres
+    // restart or projection drift, and telling the operator their actor DOES
+    // NOT EXIST is false on both clauses while the database is the thing that
+    // is broken. Same split checks 79/79b/81 make for integrations, workflow
+    // graphs and executions; `evaluation::ensure_actor_owner` — ONE crate over
+    // — has had the correct shape all along, which is what makes this a rule
+    // that failed to replicate rather than a rule nobody knew.
+    //
+    // This is the resolver behind 20+ actor tools, so the wrong diagnosis was
+    // the platform's default answer during any database incident.
     match actor_repo.find_actor_for_user(actor_id, user_id).await {
         Ok(Some(id)) => Ok(id),
         Ok(None) => Err(mcp_error(
@@ -1141,11 +1153,20 @@ async fn resolve_actor_via_repo(
             -32000,
             "Actor not found or access denied",
         )),
-        Err(_) => Err(mcp_error(
-            req_id.clone(),
-            -32000,
-            "Actor not found or access denied",
-        )),
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                actor_id = %actor_id,
+                "actor ownership lookup failed"
+            );
+            Err(mcp_error(
+                req_id.clone(),
+                -32000,
+                "Could not verify actor ownership — the actor registry is \
+                 unavailable. This is NOT a statement that the actor is absent \
+                 or that access was denied; retry, and check controller logs.",
+            ))
+        }
     }
 }
 

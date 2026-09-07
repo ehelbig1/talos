@@ -383,6 +383,60 @@ async fn make_dummy_pool() -> sqlx::PgPool {
         .expect("lazy pool creation should not fail")
 }
 
+/// The last-owner guard has ONE arm, and this test is why it can stay that
+/// way: it asserts the MESSAGE, not merely that the removal was refused.
+///
+/// Before 2026-09-07 `remove_member` carried TWO last-owner refusals — a
+/// general one and a `caller_id == user_id` one immediately after it. The
+/// second was DEAD (its condition is a strict subset of the first's and the
+/// first returns), so a mutation of the FIRST was invisible to any test that
+/// only checked `is_err()`: the dead arm caught the same case under a
+/// different sentence. Asserting the sentence is what makes the mutation red.
+#[tokio::test]
+async fn the_sole_owner_cannot_remove_themselves() {
+    let pool = test_helpers::get_test_db_pool().await;
+    let owner_id = ensure_test_user(&pool).await;
+
+    let slug = format!("last-owner-{}", Uuid::new_v4().as_simple());
+    let slug = &slug[..slug.len().min(100)];
+    let org = OrganizationService::create_org(&pool, "Last Owner Org", slug, owner_id)
+        .await
+        .expect("create_org should succeed");
+
+    // The ONLY reachable shape of the guard: caller == target == the sole owner.
+    let err = OrganizationService::remove_member(&pool, org.id, owner_id, owner_id)
+        .await
+        .expect_err("the sole owner must not be removable");
+    assert!(
+        err.to_string()
+            .contains("Cannot remove the last owner; transfer ownership first"),
+        "the surviving arm must be the one that answers, and it must say so: {err}"
+    );
+
+    // Control, and it is the half that proves the enumeration rather than the
+    // refusal: with a SECOND owner the same call succeeds, so the guard keys on
+    // the owner COUNT and not on self-removal.
+    let second_owner = ensure_test_user(&pool).await;
+    sqlx::query(
+        "INSERT INTO organization_members (org_id, user_id, role) VALUES ($1, $2, 'owner')",
+    )
+    .bind(org.id)
+    .bind(second_owner)
+    .execute(&pool)
+    .await
+    .expect("second owner insert");
+    let removed = OrganizationService::remove_member(&pool, org.id, owner_id, owner_id)
+        .await
+        .expect("with two owners the removal is permitted");
+    assert!(removed, "the row should have been deleted");
+
+    sqlx::query("DELETE FROM organizations WHERE id = $1")
+        .bind(org.id)
+        .execute(&pool)
+        .await
+        .ok();
+}
+
 /// Insert a minimal test user and return its ID.
 /// Uses the `users` table — assumes the standard Talos schema.
 async fn ensure_test_user(pool: &sqlx::PgPool) -> Uuid {

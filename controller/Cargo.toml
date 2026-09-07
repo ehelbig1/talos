@@ -287,6 +287,14 @@ talos-draft-heuristics = { path = "../talos-draft-heuristics" }
 # policy, and the retention purge's pinned-parent exemption cannot be observed
 # from Rust alone.
 talos-child-run-ledger = { path = "../talos-child-run-ledger" }
+# swallowed_read_disclosure_tests: builds a REAL `McpState` and drives the
+# production MCP `dispatch` for three repaired swallowed-read sites, because
+# the defect is what the HANDLER BODY renders — a test against the repository
+# read alone cannot see a `Result` that is classified correctly and then
+# discarded three hundred lines later (checks 74b / 79b state that limit).
+# `talos-judge-probe` is the one `McpState` field with no other route into
+# this crate's dev graph.
+talos-judge-probe = { path = "../talos-judge-probe" }
 
 [features]
 default = []

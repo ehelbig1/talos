@@ -449,11 +449,25 @@ async fn handle_list_templates(
             Ok(b) => b,
             Err(resp) => return resp,
         };
-    let templates = state
-        .registry
-        .list_templates(None)
-        .await
-        .unwrap_or_default();
+    // REFUSE, do not default (2026-09-07). "There are no templates" is a
+    // determinate negative an operator acts on — it is the answer that sends
+    // them to check whether seeding ran, whether the image carries
+    // `module-templates/`, or whether the OCI sync is broken. A registry read
+    // that FAILED renders identically to a genuinely empty catalog, so the
+    // failure is the one thing they cannot see.
+    let templates = match state.registry.list_templates(None).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!(error = %e, "list_templates: registry read failed");
+            return mcp_error(
+                req_id,
+                -32000,
+                "Could not read the template catalog — this is NOT a statement that \
+                 the catalog is empty. Retry, and check controller logs; \
+                 get_catalog_status reports the disk half separately.",
+            );
+        }
+    };
 
     // MCP-59 + MCP-60 (2026-05-07):
     //   * MCP-59: include_sandboxes=false should hide every non-platform
@@ -550,11 +564,26 @@ async fn handle_list_modules(
     // wasm_modules (custom sandboxes) and user-owned node_templates (catalog
     // installs) with deduplication. This ensures list_modules, list_module_catalog,
     // and get_system_status.modules all agree on what a "module" is.
-    let rows = state
+    // REFUSE, do not default (2026-09-07): an empty `modules` list is what an
+    // operator reads as "I have nothing installed", and it is the premise of
+    // every next step (compile one, install from the catalog, check the other
+    // tenant). A failed read must not be able to say that.
+    let rows = match state
         .module_repo
         .list_user_modules_view_filtered(user_id, name_like.as_deref(), 100)
         .await
-        .unwrap_or_default();
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!(error = %e, user_id = %user_id, "list_modules: view read failed");
+            return mcp_error(
+                req_id,
+                -32000,
+                "Could not read your modules — this is NOT a statement that you have \
+                 none. Retry, and check controller logs.",
+            );
+        }
+    };
 
     // Normalize capability_world to the "-node" suffix form used throughout
     // the platform. wasm_modules stores bare names ("minimal", "trusted") while
@@ -1603,12 +1632,40 @@ async fn handle_cleanup_module_versions(
     // still_referenced so the caller can rebind manually.
     let mut deletable: Vec<(uuid::Uuid, String, chrono::DateTime<chrono::Utc>)> = Vec::new();
     let mut still_referenced: Vec<serde_json::Value> = Vec::new();
+    // Modules held back because their reference set could not be READ. UNKNOWN
+    // is not zero (2026-09-07): `.unwrap_or_default()` here turned a failed
+    // reference query into an EMPTY reference list, and the very next line
+    // reads an empty list as "nothing points at this module, delete it". With
+    // `dry_run: false` that is an irreversible delete decided by a query that
+    // did not answer — the shape check 86 gates for the stale-draft sweep, on a
+    // path that deletes rather than recommends. A module whose references are
+    // unreadable is now EXCLUDED from `deletable` and disclosed by name.
+    let mut unknown_references: Vec<serde_json::Value> = Vec::new();
     for (id, name, compiled_at) in older {
-        let refs = state
+        let refs = match state
             .module_repo
             .find_workflows_referencing_module(user_id, *id, 25)
             .await
-            .unwrap_or_default();
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    module_id = %id,
+                    user_id = %user_id,
+                    "cleanup_module_versions: reference lookup failed; module held back"
+                );
+                unknown_references.push(serde_json::json!({
+                    "module_id": id,
+                    "name": name,
+                    "compiled_at": compiled_at.to_rfc3339(),
+                    "reason": "reference lookup failed — this module was NOT deleted and NOT \
+                               reported as unreferenced. An unreadable reference set is not an \
+                               empty one; re-run once the database is answering.",
+                }));
+                continue;
+            }
+        };
         if refs.is_empty() {
             deletable.push((*id, name.clone(), *compiled_at));
         } else {
@@ -1670,11 +1727,22 @@ async fn handle_cleanup_module_versions(
             },
             "deleted": deleted_summary,
             "still_referenced": still_referenced,
+            "unknown_references": unknown_references,
             "message": format!(
-                "{}: {} would be deleted, {} still referenced (kept {}).",
+                "{}: {} would be deleted, {} still referenced{} (kept {}).",
                 action,
                 deleted_summary.len(),
                 still_referenced.len(),
+                if unknown_references.is_empty() {
+                    String::new()
+                } else {
+                    format!(
+                        ", {} HELD BACK because their reference set could not be read \
+                         (see unknown_references — this is not a claim that they are \
+                         unreferenced, and they were not deleted)",
+                        unknown_references.len()
+                    )
+                },
                 keeper_name
             ),
         }))
@@ -2059,11 +2127,35 @@ async fn handle_batch_delete_modules(
     // at node_templates entries are correctly classified as access_denied, not not_found.
     let actually_delete: Vec<uuid::Uuid> = if !to_delete.is_empty() {
         // source: 'wasm' → wasm_modules row (check user_id), 'template' → node_templates row
-        let existing = state
+        // REFUSE rather than default (2026-09-07). An empty classification is
+        // fail-closed for the DELETE — every id falls through to the
+        // `not_found` arm below and nothing is removed — but it is NOT
+        // fail-closed for the REPORT: the caller is told, by name, that each of
+        // their modules "not found", which is false about a module that exists
+        // and unactionable during a database incident. The delete-side safety
+        // is kept and the false statement is not made.
+        let existing = match state
             .module_repo
             .classify_modules_for_delete(&to_delete)
             .await
-            .unwrap_or_default();
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    user_id = %user_id,
+                    "batch_delete_modules: pre-delete classification failed"
+                );
+                return mcp_error(
+                    req_id,
+                    -32000,
+                    "Could not classify the requested modules for deletion — the module \
+                     registry is unavailable, so NOTHING was deleted. This is not a \
+                     statement that those modules are absent; retry once the database \
+                     is answering.",
+                );
+            }
+        };
 
         // Build a presence map: id → (source, owner). wasm_modules takes precedence
         // over node_templates when both happen to have the same UUID.
@@ -4299,12 +4391,22 @@ async fn handle_get_catalog_status(
         "disk"
     };
 
+    // Every read below is DISCLOSED, not defaulted (2026-09-07) — see the DB
+    // half below for the argument. The ledger is opened HERE, above the disk
+    // scan, because check 74b fired on that scan the first time this handler
+    // adopted `Readings` and it was right to: a `JoinError` from the blocking
+    // walk defaulted to an EMPTY template list, which reads as "this image
+    // carries no catalog templates" and puts every DB row in
+    // `in_db_not_on_disk`. The scan is a filesystem read rather than a query,
+    // and it makes the same claim.
+    let mut readings = talos_measurement::Readings::new();
+
     // Disk truth: slug (dir name) + display_name + category per template.
     let catalog_dir = std::path::PathBuf::from("/app/module-templates");
     let dir_exists = catalog_dir.is_dir();
-    let disk: Vec<(String, String, String)> = if dir_exists {
+    let disk_read: Option<Vec<(String, String, String)>> = if dir_exists {
         let dir = catalog_dir.clone();
-        tokio::task::spawn_blocking(move || {
+        let scan = tokio::task::spawn_blocking(move || {
             let mut out = Vec::new();
             if let Ok(entries) = std::fs::read_dir(&dir) {
                 for entry in entries.flatten() {
@@ -4338,36 +4440,44 @@ async fn handle_get_catalog_status(
             }
             out.sort();
             out
-        })
-        .await
-        .unwrap_or_default()
+        });
+        readings.record("disk", scan.await)
     } else {
-        Vec::new()
+        // Not a failure: `dir_exists` is false and the report SAYS so, which is
+        // a measured answer about an image with no catalog dir.
+        Some(Vec::new())
     };
+    let disk: Vec<(String, String, String)> = disk_read.clone().unwrap_or_default();
 
     // DB catalog rows (name = display_name at seed time, catalog_slug when
     // stamped) + the caller's installed catalog modules.
-    let db_rows = state
-        .module_repo
-        .list_catalog_rows()
-        .await
-        .unwrap_or_default();
-    let installed = state
-        .module_repo
-        .list_user_template_names(user_id)
-        .await
-        .unwrap_or_default();
+    //
+    // DISCLOSED, not defaulted (2026-09-07). This tool's whole output is a DIFF
+    // between disk and the DB, so an unreadable `list_catalog_rows` did not
+    // merely blank a field: it made every disk template read as
+    // `on_disk_not_in_db` and emitted the tip "N disk template(s) are not in
+    // the DB catalog — restart the controller to seed", i.e. specific,
+    // actionable, wrong advice about a healthy catalog, computed from a query
+    // that never answered. Both halves are now nulled on failure and the diff
+    // is suppressed unless BOTH answered.
+    let mut readings = talos_measurement::Readings::new();
+    let db_rows_read = readings.record("db_catalog", state.module_repo.list_catalog_rows().await);
+    let db_rows = db_rows_read.clone().unwrap_or_default();
+    let installed = readings.record(
+        "installed_by_you",
+        state.module_repo.list_user_template_names(user_id).await,
+    );
 
     // Catalog rows that have NO compiled WASM. Until 2026-08-11 the only
     // evidence of this condition was a boot-time WARN whose own text
     // ("keeping existing wasm_bytes") implied there were bytes to keep —
     // there were not. Three shipped templates sat at NULL indefinitely, so
     // every workflow node pointing at one had nothing to dispatch.
-    let never_compiled = state
-        .module_repo
-        .list_catalog_rows_without_wasm()
-        .await
-        .unwrap_or_default();
+    let never_compiled_read = readings.record(
+        "never_compiled",
+        state.module_repo.list_catalog_rows_without_wasm().await,
+    );
+    let never_compiled = never_compiled_read.clone().unwrap_or_default();
 
     // Diff disk ↔ DB. A DB row matches a disk template when its stamped
     // slug equals the dir slug, or (pre-backfill rows) its name equals the
@@ -4413,7 +4523,14 @@ async fn handle_get_catalog_status(
                 .to_string(),
         );
     }
-    if mode == "disk" && !on_disk_not_in_db.is_empty() {
+    // Gated on the DB read having ANSWERED: with `db_rows` unreadable every
+    // disk template lands in `on_disk_not_in_db` and this tip would tell the
+    // operator to restart a controller whose catalog is fine.
+    if mode == "disk"
+        && db_rows_read.is_some()
+        && disk_read.is_some()
+        && !on_disk_not_in_db.is_empty()
+    {
         tips.push(format!(
             "{} disk template(s) are not in the DB catalog — seeding runs at \
              every controller boot (idempotent upsert); restart the controller \
@@ -4430,7 +4547,7 @@ async fn handle_get_catalog_status(
                 .to_string(),
         );
     }
-    if !hidden_by_category.is_empty() {
+    if db_rows_read.is_some() && !hidden_by_category.is_empty() {
         tips.push(format!(
             "{} seeded template(s) are hidden from list_templates' default view \
              by the platform-category allowlist — pass include_sandboxes: true \
@@ -4438,7 +4555,7 @@ async fn handle_get_catalog_status(
             hidden_by_category.len()
         ));
     }
-    if !never_compiled.is_empty() {
+    if never_compiled_read.is_some() && !never_compiled.is_empty() {
         // The repository query excludes rows carrying an `oci_url`, so this
         // means the same thing in both modes: neither local bytes nor a
         // registry reference. The REMEDY differs, though — in OCI mode there
@@ -4475,28 +4592,32 @@ async fn handle_get_catalog_status(
     let report = serde_json::json!({
         "mode": mode,
         "registry_url_set": registry_url.is_some(),
-        "disk": {
+        "disk": disk_read.as_ref().map(|d| serde_json::json!({
             "dir_exists": dir_exists,
-            "template_count": disk.len(),
-            "slugs": disk.iter().map(|(s, _, _)| s.as_str()).collect::<Vec<_>>(),
-        },
-        "db_catalog": {
-            "row_count": db_rows.len(),
+            "template_count": d.len(),
+            "slugs": d.iter().map(|(s, _, _)| s.as_str()).collect::<Vec<_>>(),
+        })),
+        "db_catalog": db_rows_read.as_ref().map(|rows| serde_json::json!({
+            "row_count": rows.len(),
             "list_templates_visible": visible,
             "hidden_by_category": hidden_by_category,
             // Seeded but unbuildable. A row here is strictly worse than a
             // missing row: it appears in list_templates and in the dynamic
             // tool surface, and fails only when something tries to run it.
-            "never_compiled": never_compiled
+            "never_compiled": never_compiled_read.as_ref().map(|nc| nc
                 .iter()
                 .map(|(name, slug)| serde_json::json!({ "name": name, "catalog_slug": slug }))
-                .collect::<Vec<_>>(),
-        },
-        "diff": {
+                .collect::<Vec<_>>()),
+        })),
+        // The diff is a statement about BOTH halves, so it is null unless both
+        // halves were read — an "on disk but not in the DB" list computed
+        // against a DB nobody could read is not a partial answer, it is a wrong
+        // one.
+        "diff": db_rows_read.as_ref().zip(disk_read.as_ref()).map(|_| serde_json::json!({
             "on_disk_not_in_db": on_disk_not_in_db,
             "in_db_not_on_disk": in_db_not_on_disk,
-        },
-        "installed_by_you": installed.len(),
+        })),
+        "installed_by_you": installed.as_ref().map(|i| i.len()),
         "surfaces": {
             "list_templates": "DB modules table (kind='catalog'); default view filters to platform categories",
             "list_module_catalog": "baked disk dir /app/module-templates (cached per process)",
@@ -4506,6 +4627,8 @@ async fn handle_get_catalog_status(
         "seeding": "Disk seeding runs at EVERY controller boot as an idempotent upsert into the modules table; it is skipped only when TALOS_REGISTRY_URL is set (OCI owns the catalog) or module-templates/ is missing.",
         "tips": tips,
     });
+    let mut report = report;
+    readings.attach(&mut report);
     mcp_text(
         req_id,
         &serde_json::to_string_pretty(&report).unwrap_or_default(),

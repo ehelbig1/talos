@@ -1536,7 +1536,13 @@ impl TalosMetrics {
 
         let audit_chain_multi_attempt_jobs_total = Counter::new(
             "talos_audit_chain_multi_attempt_jobs_total",
-            "Job chains the offline audit-chain sweep found holding more than one              CONTROLLER DISPATCH ATTEMPT. A re-dispatch re-uses the job_id and the              credential-free worker cannot read the prior dispatch's ledger, so it opens              a fresh chain at sequence 1 — a retry, not tamper evidence. Such a chain              VERIFIES and is counted in jobs_verified_ok; nothing alerts on this series.              Registration alone exports it at 0 so absent and zero do not render alike.",
+            "Job chains the offline audit-chain sweep found holding more than one \
+             CONTROLLER DISPATCH ATTEMPT. A re-dispatch re-uses the job_id and the \
+             credential-free worker cannot read the prior dispatch's ledger, so it \
+             opens a fresh chain at sequence 1 — a retry, not tamper evidence. Such \
+             a chain VERIFIES and is counted in jobs_verified_ok; nothing alerts on \
+             this series. Registration alone exports it at 0 so absent and zero do \
+             not render alike.",
         )?;
         registry.register(Box::new(audit_chain_multi_attempt_jobs_total.clone()))?;
 
