@@ -3250,6 +3250,72 @@ pub(crate) fn spawn_analytics_tasks(
                 }
             }
 
+            // ── What can the child-run ledger measure? (RFC 0012 P2) ──────
+            //
+            // Reliability and freshness are read from `workflow_executions`,
+            // which records nothing for an in-process child — so before RFC
+            // 0012 a child could only be scored on the 30-point measurable
+            // basis. `sub_workflow_runs` can now answer, and a child with at
+            // least `LEDGER_MIN_RUNS` recorded runs goes back on the full
+            // scale with both components MEASURED (never scaled up from the
+            // other two — see `readiness_basis`).
+            //
+            // ONE batched read per USER per tick, the same shape as the child
+            // scan above and for the same reason: the batch spans every user,
+            // it is grouped, and the candidate list is that user's ids. Cost
+            // measured on the reference deployment is in AGENT_NOTES.md.
+            //
+            // A FAILED read leaves that user's map empty, i.e. every child
+            // scored on the 30-point basis exactly as before this change —
+            // the conservative direction, and logged. It must not abort the
+            // tick: a readiness recompute that stops because the ledger was
+            // briefly unreadable is worse than one that under-scores a child
+            // for an hour.
+            let mut child_ledger: std::collections::HashMap<
+                uuid::Uuid,
+                talos_analytics_repository::ChildLedgerEvidence,
+            > = std::collections::HashMap::new();
+            {
+                let ledger_now = chrono::Utc::now();
+                let mut child_ids_by_user: std::collections::HashMap<uuid::Uuid, Vec<uuid::Uuid>> =
+                    std::collections::HashMap::new();
+                for (wf_id, wf_user_id, _, _, _) in &workflows {
+                    // Only rows the scan says are somebody's child. A page
+                    // with no children costs no query at all.
+                    if child_scans
+                        .get(wf_user_id)
+                        .is_some_and(|scan| !scan.parents_of(*wf_id).is_empty())
+                    {
+                        child_ids_by_user
+                            .entry(*wf_user_id)
+                            .or_default()
+                            .push(*wf_id);
+                    }
+                }
+                for (owner, ids) in child_ids_by_user {
+                    match talos_analytics_repository::child_ledger_evidence(
+                        &readiness_pool,
+                        owner,
+                        &ids,
+                        ledger_now,
+                    )
+                    .await
+                    {
+                        Ok(map) => child_ledger.extend(map),
+                        Err(e) => {
+                            tracing::warn!(
+                                user_id = %owner,
+                                error = %e,
+                                child_candidates = ids.len(),
+                                "readiness: child-run ledger read failed — this user's \
+                                 parent-dispatched workflows stay on the measurable-components \
+                                 basis for this tick (the pre-RFC-0012-P2 answer)"
+                            );
+                        }
+                    }
+                }
+            }
+
             let mut updated = 0u64;
             // MCP-778 (2026-05-13): track UPDATE failures alongside successes
             // so the operator-facing summary surfaces partial-batch DB issues.
@@ -3404,8 +3470,28 @@ pub(crate) fn spawn_analytics_tasks(
                 // would be three denominators under one column.
                 let basis = child_scans.get(wf_user_id).map_or(
                     talos_analytics_repository::ReadinessBasis::FullScale,
-                    |scan| talos_analytics_repository::ReadinessBasis::from_scan(scan, *wf_id),
+                    |scan| {
+                        talos_analytics_repository::ReadinessBasis::from_scan_with_ledger(
+                            scan,
+                            *wf_id,
+                            child_ledger.get(wf_id).copied(),
+                        )
+                    },
                 );
+                // On a ledger-measured basis the two execution components are
+                // recomputed from `sub_workflow_runs` through the SAME shared
+                // functions — the INPUT moves, the arithmetic does not, so a
+                // child and a top-level workflow with the same evidence score
+                // identically.
+                let (reliability, freshness) = match basis.ledger() {
+                    Some(ev)
+                        if basis.max_points() == talos_analytics_repository::FULL_MAX
+                            && basis.is_parent_dispatched() =>
+                    {
+                        ev.components(chrono::Utc::now())
+                    }
+                    _ => (reliability, freshness),
+                };
                 let outcome = talos_analytics_repository::score_readiness(
                     talos_analytics_repository::ReadinessComponents {
                         reliability,

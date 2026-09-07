@@ -182,7 +182,7 @@ async fn a_parent_dispatched_workflow_is_scored_on_the_measurable_components_onl
 
     let outcome = score_readiness(
         documented_but_unobserved(),
-        ReadinessBasis::from_scan(&scan, child),
+        ReadinessBasis::from_scan_with_ledger(&scan, child, None),
     );
     assert_eq!(
         outcome.max_points, CHILD_MEASURABLE_MAX,
@@ -231,7 +231,7 @@ async fn a_top_level_workflow_with_no_runs_is_still_scored_zero_reliability_out_
         .scan_child_parents_for(user, &[orphan])
         .await
         .expect("child scan");
-    let basis = ReadinessBasis::from_scan(&scan, orphan);
+    let basis = ReadinessBasis::from_scan_with_ledger(&scan, orphan, None);
     assert_eq!(basis, ReadinessBasis::FullScale);
 
     let outcome = score_readiness(documented_but_unobserved(), basis);
@@ -278,7 +278,7 @@ async fn a_retired_parent_does_not_make_a_workflow_a_child() {
         .expect("child scan");
     assert!(scan.parents_of(child).is_empty());
     assert_eq!(
-        ReadinessBasis::from_scan(&scan, child),
+        ReadinessBasis::from_scan_with_ledger(&scan, child, None),
         ReadinessBasis::FullScale
     );
 }

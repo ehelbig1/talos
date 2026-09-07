@@ -16,11 +16,14 @@ type SqlxResult<T> = std::result::Result<T, sqlx::Error>;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+pub mod child_ledger;
 pub mod readiness_basis;
 pub mod readiness_state;
+pub use child_ledger::{child_ledger_evidence, readiness_window_start, READINESS_WINDOW_DAYS};
 pub use readiness_basis::{
-    child_exclusion_is_complete, score_readiness, ReadinessBasis, ReadinessComponents,
-    ReadinessOutcome, CHILD_MEASURABLE_MAX, CHILD_UNMEASURED_REASON, FULL_MAX,
+    child_exclusion_is_complete, score_readiness, ChildLedgerEvidence, ReadinessBasis,
+    ReadinessComponents, ReadinessOutcome, CHILD_MEASURABLE_MAX, CHILD_UNMEASURED_REASON, FULL_MAX,
+    LEDGER_MIN_RUNS,
 };
 pub use readiness_state::{classify_readiness_state, ReadinessScorer, ReadinessState};
 
@@ -924,7 +927,58 @@ pub struct DormantWorkflowRow {
     /// Most recent `execution_cost_rollup.recorded_at` attributed to this
     /// workflow id. A LOWER BOUND on child activity, never a run record — see
     /// [`DORMANT_CHILD_ACTIVITY_CAVEAT`].
+    ///
+    /// **Superseded by [`Self::last_child_run_at`] for any period after the
+    /// child-run ledger's floor, and KEPT rather than deleted.** See
+    /// [`DORMANT_CHILD_ACTIVITY_CAVEAT`] for the measurement and
+    /// [`ChildRunEvidence`] for why both are rendered.
     pub last_child_activity_at: Option<DateTime<Utc>>,
+    /// What the child-run ledger says about this workflow (RFC 0012 P2).
+    /// `None` when the ledger was not read; the variant inside says whether
+    /// the ledger could speak for the period at all.
+    pub child_runs: Option<ChildRunEvidence>,
+}
+
+/// What the child-run ledger holds for one workflow on a HYGIENE row.
+///
+/// Separate from `readiness_basis::ChildLedgerEvidence` on purpose: that one
+/// carries the two SCORE inputs over the readiness window, this one carries
+/// the two REPORT facts over the dormancy window. Merging them would put a
+/// scoring window on a hygiene row, and the two windows are not the same
+/// number.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChildRunEvidence {
+    /// Recorded runs since [`Self::ledger_since`]. Meaningless without it —
+    /// which is why they are one struct and not two fields.
+    pub runs: i64,
+    /// The newest recorded run. `None` with `ledger_since: Some` means the
+    /// ledger WAS recording and saw none; `None` with `ledger_since: None`
+    /// means nobody was recording, i.e. UNKNOWN.
+    pub last_run_at: Option<DateTime<Utc>>,
+    /// The earliest run the ledger still holds, across the deployment.
+    /// `None` = the table is empty, so every count here is UNKNOWN, not zero.
+    pub ledger_since: Option<DateTime<Utc>>,
+}
+
+impl ChildRunEvidence {
+    /// One sentence an operator can act on. Never a bare count.
+    #[must_use]
+    pub fn note(&self) -> String {
+        match (self.ledger_since, self.last_run_at) {
+            (None, _) => "The child-run ledger (sub_workflow_runs) holds no rows at all, so it                           cannot say whether this workflow ran. UNKNOWN, not zero."
+                .to_string(),
+            (Some(since), None) => format!(
+                "The child-run ledger has been recording since {} and has recorded NO run of                  this workflow. Anything before that date is UNKNOWN — nobody was recording.",
+                since.to_rfc3339()
+            ),
+            (Some(since), Some(last)) => format!(
+                "{} child run(s) recorded since {}, most recently {}. This workflow RUNS; its                  silence in workflow_executions is the expected shape for a sub-workflow.",
+                self.runs,
+                since.to_rfc3339(),
+                last.to_rfc3339()
+            ),
+        }
+    }
 }
 
 /// Why `last_execution: null` on a child row is not evidence of anything.
@@ -946,9 +1000,15 @@ pub const DORMANT_CHILD_NOTE: &str =
 /// 30-day window the child had ONE attributed row while its parent ran ~21
 /// times. Roughly 5% recall.
 pub const DORMANT_CHILD_ACTIVITY_CAVEAT: &str =
-    "Lower bound only. execution_cost_rollup records a row per node that burned fuel, and \
-     an in-process sub-workflow run usually lands under a synthetic workflow id \
-     (measured coverage ~5%), so a null here is NOT evidence the child never ran.";
+    "Lower bound only, and SUPERSEDED by last_child_run_at for any period after ledger_since. \
+     execution_cost_rollup records a row per node that burned fuel, and an in-process \
+     sub-workflow run usually lands under a synthetic workflow id, so a null here is NOT \
+     evidence the child never ran. Measured on the reference deployment 2026-09-07, the worst \
+     case is 0% and not 5%: one child whose parent ran 5085 times in 30 days (461 of them in \
+     48 h) has ZERO rollup rows in the whole window and a proxy timestamp 45 days old. This \
+     field is retained ONLY because it can speak for the period BEFORE the child-run ledger's \
+     first row; once ledger_since is older than this list's 30-day window it adds nothing and \
+     can be removed.";
 
 /// The child-reference scan — who dispatches into whom — re-exported from the
 /// crate that owns it.
@@ -990,6 +1050,12 @@ pub struct StaleDraftRow {
     /// back, because UNKNOWN is not "no". See
     /// [`talos_child_workflow_refs::ChildProtection`].
     pub child_protection_reason: Option<String>,
+    /// What the child-run ledger says about this draft (RFC 0012 P2). Same
+    /// field, same meaning and same fill site as
+    /// [`DormantWorkflowRow::child_runs`] — and on this list it answers the
+    /// query's own premise directly: "never executed" is a statement about
+    /// `workflow_executions`, and a non-zero count here refutes it.
+    pub child_runs: Option<ChildRunEvidence>,
 }
 
 /// Why `stale_draft_workflows` is not, on its own, a list of scaffolding
@@ -3569,6 +3635,26 @@ impl AnalyticsRepository {
     /// Callers MUST NOT default a failure to an empty scan: an empty index
     /// reads as "nobody is anybody's child", which puts every child back on the
     /// full 100-point scale with reliability and freshness at zero.
+    /// What the child-run ledger holds for `child_workflow_ids` inside the
+    /// readiness window — RFC 0012 P2.
+    ///
+    /// The repository-side door onto [`crate::child_ledger::child_ledger_evidence`],
+    /// same shape and same reason as [`Self::scan_child_parents_for`] above.
+    /// Callers MUST NOT default a failure to an empty map: an absent key means
+    /// *the ledger recorded nothing for this child*, and an `Err` means *the
+    /// ledger could not be read* — collapsing the second into the first turns
+    /// "we could not look" into "it never ran", which is the reading this
+    /// whole phase exists to remove. Pass `None` for the basis instead.
+    pub async fn child_ledger_evidence_for(
+        &self,
+        user_id: Uuid,
+        child_workflow_ids: &[Uuid],
+        now: DateTime<Utc>,
+    ) -> Result<std::collections::HashMap<Uuid, readiness_basis::ChildLedgerEvidence>> {
+        crate::child_ledger::child_ledger_evidence(&self.db_pool, user_id, child_workflow_ids, now)
+            .await
+    }
+
     pub async fn scan_child_parents_for(
         &self,
         user_id: Uuid,
@@ -5015,6 +5101,10 @@ impl AnalyticsRepository {
                         runs_as_child_of: Vec::new(),
                         last_child_activity_at: r
                             .try_get::<Option<_>, _>("last_child_activity_at")?,
+                        // Filled in at the join site from the child-run
+                        // ledger — a `workflows` row cannot answer "did I
+                        // run?" from its own table, which is the whole point.
+                        child_runs: None,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -5056,6 +5146,7 @@ impl AnalyticsRepository {
                         // own table.
                         runs_as_child_of: Vec::new(),
                         child_protection_reason: None,
+                        child_runs: None,
                     })
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -5249,6 +5340,71 @@ impl AnalyticsRepository {
             for row in &mut stale_draft_workflows {
                 row.runs_as_child_of = scan.parents_of(row.id).to_vec();
                 row.child_protection_reason = scan.protection_for(row.id).map(|p| p.reason());
+            }
+
+            // ── The child-run ledger (RFC 0012 P2) ────────────────────────
+            //
+            // The proxy this replaces — `MAX(execution_cost_rollup.recorded_at)`
+            // — is a LOWER BOUND on fuel-burning node activity that usually
+            // lands under a synthetic workflow id. Measured 2026-09-07 on the
+            // reference deployment: one child whose parent ran 461 times in
+            // 48 h has ZERO rollup rows in the whole 30-day window and a proxy
+            // timestamp 45 days old. `sub_workflow_runs` records the RUN.
+            //
+            // ONE batched read over the DORMANT ∪ STALE-DRAFT children — the
+            // same candidate set the scan just ran over, narrowed to the rows
+            // the scan says are somebody's child, so a report with no children
+            // costs no query. A read FAILURE leaves `child_runs: None` on
+            // every row, which renders as "the ledger was not read" and never
+            // as a count of zero.
+            let mut ledger_candidates: Vec<Uuid> = dormant_workflows
+                .iter()
+                .filter(|r| !r.runs_as_child_of.is_empty())
+                .map(|r| r.id)
+                .chain(
+                    stale_draft_workflows
+                        .iter()
+                        .filter(|r| !r.runs_as_child_of.is_empty())
+                        .map(|r| r.id),
+                )
+                .collect();
+            ledger_candidates.sort_unstable();
+            ledger_candidates.dedup();
+            if !ledger_candidates.is_empty() {
+                match crate::child_ledger::child_ledger_evidence(
+                    &self.db_pool,
+                    user_id,
+                    &ledger_candidates,
+                    Utc::now(),
+                )
+                .await
+                {
+                    Ok(map) => {
+                        let stamp = |row_id: Uuid| -> Option<ChildRunEvidence> {
+                            map.get(&row_id).map(|ev| ChildRunEvidence {
+                                runs: ev.runs,
+                                last_run_at: ev.last_started_at,
+                                ledger_since: ev.ledger_since,
+                            })
+                        };
+                        for row in &mut dormant_workflows {
+                            row.child_runs = stamp(row.id);
+                        }
+                        for row in &mut stale_draft_workflows {
+                            row.child_runs = stamp(row.id);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            %user_id,
+                            error = %e,
+                            event_kind = "hygiene_child_ledger_read_failed",
+                            "hygiene: child-run ledger unreadable — the dormant and \
+                             stale-draft child rows fall back to the execution_cost_rollup \
+                             proxy alone, which is a lower bound and not a run record"
+                        );
+                    }
+                }
             }
         }
         let idle_actors = readings.record_rows("idle_actors", idle_actors?);

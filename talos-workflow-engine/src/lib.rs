@@ -40,6 +40,7 @@ const _LLM_PRIMITIVES_FEATURE_COHERENCE_CHECK: () = assert!(
 );
 
 mod chain_detect;
+mod child_run_report;
 mod condition_eval;
 mod dispatch_bytes;
 pub mod dispatcher_coverage;

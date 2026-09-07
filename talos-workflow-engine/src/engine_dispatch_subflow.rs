@@ -1477,111 +1477,42 @@ impl ParallelWorkflowEngine {
         // that risk for. Best-effort by construction — `record` returns `()`,
         // so a ledger failure has nowhere to go and can never change what this
         // function returns.
-        self.record_child_run(
-            origin,
-            sub_wf_id,
-            user_id,
-            child_actor_id,
-            started_at_unix_ms,
-            i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
-            &outcome,
-        )
-        .await;
-
-        outcome
-    }
-
-    /// Persist one child run to the ledger. Called from exactly one place —
-    /// the tail of [`Self::execute_subworkflow_graph`] — so the five dispatch
-    /// kinds that route through it cannot each remember or forget.
-    ///
-    /// Silent no-op when there is no recorder wired, when the origin is
-    /// [`ChildRunOrigin::Untracked`](talos_workflow_engine_core::ChildRunOrigin::Untracked)
-    /// (the `test_subworkflow_contract` probe, a one-off embedder call), or
-    /// when this engine has no `workflow_id` — `parent_workflow_id` is NOT
-    /// NULL and there is nothing honest to put there. Same three-guard shape
-    /// as `record_judge_score`.
-    async fn record_child_run(
-        &self,
-        origin: talos_workflow_engine_core::ChildRunOrigin,
-        child_workflow_id: Uuid,
-        user_id: Uuid,
-        child_actor_id: Option<Uuid>,
-        started_at_unix_ms: i64,
-        duration_ms: i64,
-        outcome: &Result<JsonValue, SubflowError>,
-    ) {
-        let Some(recorder) = self.child_run_recorder.as_ref() else {
-            return;
-        };
-        let talos_workflow_engine_core::ChildRunOrigin::Node {
-            execution_id,
-            node_id,
-            kind,
-        } = origin
-        else {
-            return;
-        };
-        let Some(parent_workflow_id) = self.workflow_id else {
-            return;
-        };
-
-        // Redaction: `run_scheduler_loop` DLP-scrubs the whole results map on
-        // its way out, so an `Ok(collapsed)` message has already had one pass
-        // and this is a second. On the `Err` branch it is the ONLY pass — that
-        // text is an engine error string that never went near the sanitizer —
-        // which is why it is applied on both arms rather than only where a
-        // mutation would be caught.
         //
         // A child whose engine returned `Ok` can still have FAILED: its
         // collapsed output may carry an error envelope, which is exactly what
         // the reactor's own `route_system_node_output` reads to decide the
         // parent node's fate. Classify with check 77's shared classifier, not
         // with a second `as_bool()` opinion, so the ledger and the run can
-        // never disagree about whether a child failed.
-        let (status, error_class) = match outcome {
-            Ok(collapsed) if output_reports_error(collapsed) => (
-                talos_workflow_engine_core::ChildRunStatus::Failed,
-                collapsed
-                    .get("error_message")
-                    .and_then(JsonValue::as_str)
-                    .map(|m| self.redact_str(m)),
-            ),
-            Ok(_) => (talos_workflow_engine_core::ChildRunStatus::Completed, None),
-            Err(e) => (
-                talos_workflow_engine_core::ChildRunStatus::Failed,
-                Some(self.redact_str(&e.clone().message(kind.as_str()))),
-            ),
+        // never disagree.
+        let settled = match &outcome {
+            Ok(collapsed) => crate::child_run_report::classify_collapsed(collapsed),
+            Err(e) => crate::child_run_report::ChildRunOutcome {
+                status: talos_workflow_engine_core::ChildRunStatus::Failed,
+                error: Some(e.clone().message(Self::origin_kind_label(origin))),
+            },
         };
-
-        // The graph-facing node id ("n3", "team_gather") — resolved from the
-        // engine's own label map so the mapping has one home, falling back to
-        // the node UUID when the label is unknown.
-        let parent_node_id = self
-            .node_labels
-            .get(&node_id)
-            .cloned()
-            .unwrap_or_else(|| node_id.to_string());
-
-        recorder
-            .record(talos_workflow_engine_core::ChildRunRecord {
-                parent_execution_id: execution_id,
-                parent_workflow_id,
-                parent_node_id,
-                dispatch_kind: kind,
-                child_workflow_id,
+        self.child_run_reporter(origin)
+            .record(
+                sub_wf_id,
                 user_id,
-                actor_id: child_actor_id,
-                // This engine is the PARENT; the child ran one level deeper.
-                // `AdapterSet::into_engine` computes the same `+1`.
-                depth: i16::try_from(self.current_subflow_depth.saturating_add(1))
-                    .unwrap_or(i16::MAX),
+                child_actor_id,
                 started_at_unix_ms,
-                duration_ms,
-                status,
-                error_class,
-            })
+                i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+                settled,
+            )
             .await;
+
+        outcome
+    }
+
+    /// The dispatch kind's label, for the error text a failed child gets in
+    /// the ledger. `Untracked` never reaches a write, so its label is only
+    /// ever a placeholder.
+    fn origin_kind_label(origin: talos_workflow_engine_core::ChildRunOrigin) -> &'static str {
+        match origin {
+            talos_workflow_engine_core::ChildRunOrigin::Node { kind, .. } => kind.as_str(),
+            talos_workflow_engine_core::ChildRunOrigin::Untracked => "sub_workflow",
+        }
     }
 
     /// Resolve the binding a sub-workflow should run under: its OWN actor

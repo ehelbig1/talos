@@ -2510,6 +2510,7 @@ impl ParallelWorkflowEngine {
                     .try_dispatch_agent_loop(
                         node_idx,
                         node_id,
+                        execution_id,
                         &dispatcher,
                         &worker_shared_key,
                         &results,
@@ -2670,6 +2671,7 @@ impl ParallelWorkflowEngine {
                     .try_dispatch_dynamic_dispatch(
                         node_idx,
                         node_id,
+                        execution_id,
                         &dispatcher,
                         &worker_shared_key,
                         &results,
@@ -2709,6 +2711,7 @@ impl ParallelWorkflowEngine {
                     .try_dispatch_capability_dispatch(
                         node_idx,
                         node_id,
+                        execution_id,
                         &dispatcher,
                         &worker_shared_key,
                         &results,
