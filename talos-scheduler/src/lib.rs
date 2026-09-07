@@ -2803,6 +2803,82 @@ mod startup_herd_tests {
              nothing"
         );
     }
+
+    /// The instrument site count itself, per outcome.
+    ///
+    /// **Why this exists, and it is a measurement rather than a hunch.** On
+    /// 2026-09-07 every one of the seventeen `record_dispatch(` call sites in
+    /// the dispatch region was deleted in turn and the crate's tests re-run.
+    /// **SIX SURVIVED**: the two semaphore-closed arms and the graph-`Err`
+    /// arm, where the sibling arm's own call sits inside
+    /// `every_terminal_path_records_an_outcome`'s 20-line lookback and vouches
+    /// for a `return;` that no longer has one (that test states the limit; this
+    /// is it happening), and the three tail arms — `completed`, `fenced` and
+    /// the terminal `failed` — plus the wall-clock-timeout arm, which reach
+    /// their end without a bare `return;` at all and are therefore invisible to
+    /// a return-anchored scan.
+    ///
+    /// `record_dispatch_moves_every_seeded_series` cannot see any of them
+    /// either: it proves the WRAPPER moves its series, which is exactly the
+    /// property that stays true when every call site is deleted (check 58's
+    /// stated wrapper limit, one crate over).
+    ///
+    /// So: pin the count. A deletion at ANY of the seventeen sites turns this
+    /// red and names the outcome that lost one. **Stated limits**: it is a
+    /// SNAPSHOT of a hand-maintained number, so adding a legitimate new
+    /// terminal path is a deliberate edit here (which is the point — the
+    /// counter is documented as a PARTITION and its runbook reconciles against
+    /// it); it counts calls TEXTUALLY, so it cannot see whether a site sits on
+    /// the path it claims; and a deletion PLUS an addition of the same outcome
+    /// elsewhere passes. The lookback test above covers the shape this one
+    /// cannot (a newly added terminal `return;` with no instrumentation), and
+    /// neither alone covers the population.
+    const EXPECTED_RECORD_SITES: &[(&str, usize)] = &[
+        ("SCHEDULER_OUTCOME_COMPLETED", 1),
+        ("SCHEDULER_OUTCOME_FAILED", 10),
+        ("SCHEDULER_OUTCOME_SKIPPED", 3),
+        // 3, not 2, since 2026-09-07: the archived-only dispatch gate added a
+        // third DENIED terminal path (a due fire refused because the workflow is
+        // archived) beside the two pre-existing refusals. Found by this pin on
+        // the rebase that brought the two changes together.
+        ("SCHEDULER_OUTCOME_DENIED", 3),
+        ("SCHEDULER_OUTCOME_FENCED", 1),
+    ];
+
+    #[test]
+    fn every_recording_site_is_still_there() {
+        let src = include_str!("lib.rs");
+        let region = src
+            .split("    fn spawn_workflow_execution(")
+            .nth(1)
+            .expect("spawn_workflow_execution must exist")
+            .split("mod startup_herd_tests")
+            .next()
+            .expect("the dispatch region ends at this crate's tests");
+
+        let mut total = 0usize;
+        for (outcome, want) in EXPECTED_RECORD_SITES {
+            let needle = format!("record_dispatch(phase, talos_metrics::{outcome});");
+            let got = region.matches(needle.as_str()).count();
+            assert_eq!(
+                got, *want,
+                "the dispatch region must hold exactly {want} `record_dispatch`                  call site(s) for {outcome}, found {got}. A deleted site does not                  fail a test that drives the WRAPPER, and six of the seventeen are                  invisible to the return-anchored scan above — measured, not                  assumed. If you added or removed a terminal path deliberately,                  update EXPECTED_RECORD_SITES and say why."
+            );
+            total += got;
+        }
+        // The scan must be scanning something (checks 64/65: a check that
+        // matches nothing is a green tick over nothing). `record_dispatch(phase,`
+        // and not `record_dispatch(` — the function's own DEFINITION sits inside
+        // this region (`fn record_dispatch(phase: &'static str, …)`), so the bare
+        // spelling counts eighteen where there are seventeen call sites, and the
+        // tripwire would fail on a healthy tree. Measured, not reasoned: the
+        // first version of this assertion did exactly that.
+        assert_eq!(
+            region.matches("record_dispatch(phase,").count(),
+            total,
+            "a `record_dispatch(` call in the region uses an outcome constant              EXPECTED_RECORD_SITES does not enumerate — an unenumerated site is              one this test cannot protect"
+        );
+    }
 }
 
 #[cfg(test)]

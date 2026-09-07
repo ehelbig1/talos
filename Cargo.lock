@@ -1867,6 +1867,7 @@ dependencies = [
  "talos-slack",
  "talos-subworkflow-contract",
  "talos-system-repo",
+ "talos-task-supervision",
  "talos-templates",
  "talos-tenancy",
  "talos-text-util",
@@ -9455,6 +9456,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "talos-task-supervision"
+version = "0.1.0"
+dependencies = [
+ "prometheus",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "talos-templates"
 version = "0.1.0"
 dependencies = [
@@ -12090,6 +12101,7 @@ dependencies = [
  "talos-memory",
  "talos-nats-tls",
  "talos-shutdown",
+ "talos-task-supervision",
  "talos-worker-runtime",
  "talos-workflow-engine-core",
  "talos-workflow-job-protocol",

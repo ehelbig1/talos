@@ -1650,3 +1650,104 @@ tests:
                    Tampering is the residual after both are excluded; a scattered
                    handful of failures against a same-build fleet is the real shape.
                 3. Check S3/MinIO Object Lock is still enforced on the audit bucket.
+
+  # ══════════════════════════════════════════════════════════════════════
+  # Package twenty-five (2026-09-07): a background task that stops running.
+  #
+  # Both counters are PRE-SEEDED at 0 by `talos_task_supervision::
+  # register_metrics`, and the pre-seed is the load-bearing half: this whole
+  # class is one where the ABSENT series and the healthy series render
+  # identically to `increase(...) > 0`. The first case below drives a
+  # permanently-zero series and asserts SILENCE — the shape a healthy
+  # controller has for its whole lifetime.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: a healthy process with a pre-seeded zero panic counter alerts on nothing
+    input_series:
+      - series: 'talos_task_panics_total{process="controller"}'
+        values: "0+0x60"
+      - series: 'talos_background_task_exits_total{task="scheduler",outcome="completed"}'
+        values: "0+0x60"
+      - series: 'talos_background_task_exits_total{task="scheduler",outcome="panicked"}'
+        values: "0+0x60"
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: TalosTaskPanic
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: TalosBackgroundTaskExited
+        exp_alerts: []
+
+  - interval: 1m
+    name: one panic fires the warning
+    input_series:
+      - series: 'talos_task_panics_total{process="controller"}'
+        values: "0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: TalosTaskPanic
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: reliability
+              process: controller
+            exp_annotations:
+              summary: A task panicked in the controller process
+              description: |
+                1 panic(s) in the last 15m. A panicking spawned task
+                leaves no caller to observe it and is never restarted; the
+                subsystem it was running is simply off for the rest of the
+                process lifetime while every status surface still reports it as
+                configured.
+              action: |
+                1. Logs, target `talos_audit`, `event_kind=task_panicked` — one
+                   structured line per panic carrying `process`, `thread`,
+                   `location` and the (scrubbed, 300-char) panic message.
+                2. If a supervised background loop was the victim,
+                   `talos_background_task_exits_total{outcome="panicked"}` names
+                   it and TalosBackgroundTaskExited fires alongside.
+                3. A panic in a REQUEST handler is caught by axum and shows up
+                   here without an exit counter — the location field is then the
+                   only pointer.
+
+  # The case a panic hook structurally cannot see. `outcome="completed"` on a
+  # loop that is meant to run forever, with the panic counter FLAT — so this
+  # fires alone, which is exactly the discrimination the two alerts buy.
+  - interval: 1m
+    name: a clean exit fires without any panic
+    input_series:
+      - series: 'talos_task_panics_total{process="controller"}'
+        values: "0+0x60"
+      - series: 'talos_background_task_exits_total{task="job_result_subscriber",outcome="completed"}'
+        values: "0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: TalosTaskPanic
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: TalosBackgroundTaskExited
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: reliability
+              task: job_result_subscriber
+              outcome: completed
+            exp_annotations:
+              summary: Background task job_result_subscriber stopped (completed)
+              description: |
+                The supervised loop `job_result_subscriber` terminated
+                (completed). Nothing restarts it. Until the
+                controller is restarted, whatever that loop maintains — a sweep,
+                a gauge, a renewal, a subscriber — is not happening, and the
+                tools that report on it will keep reporting the last value it
+                wrote.
+              action: |
+                1. `outcome="completed"` is the quiet one: the loop RETURNED. Look
+                   for a closed channel or a `break` on a condition the author
+                   did not expect to be reachable.
+                2. `outcome="panicked"` pairs with TalosTaskPanic; the
+                   `task_panicked` log line carries the location.
+                3. `outcome="cancelled"` means the task was aborted — expected
+                   only during shutdown.
+                4. There is no supervisor: restart the controller to bring the
+                   loop back.

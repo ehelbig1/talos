@@ -39,6 +39,7 @@ talos-idempotency = { path = "../talos-idempotency" }
 talos-cost-attribution = { path = "../talos-cost-attribution" }
 talos-errors = { path = "../talos-errors" }
 talos-metrics = { path = "../talos-metrics" }
+talos-task-supervision = { path = "../talos-task-supervision" }
 talos-http-utils = { path = "../talos-http-utils" }
 talos-shutdown = { path = "../talos-shutdown" }
 talos-tenancy = { path = "../talos-tenancy" }
