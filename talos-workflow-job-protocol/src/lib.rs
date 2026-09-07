@@ -7123,7 +7123,9 @@ mod tests {
                     "name": format!("workflow-{i}"),
                     "avg_score": 0.927_272_727_272_727_2_f64,
                     "ci95": [0.329_942_360_025_097_3_f64, 0.644_311_954_041_314_1_f64],
-                    "note": "every run scored identically at the maximum — this judge                              has not been observed to fail anything, so it may be a                              shape check rather than a quality gate",
+                    "note": "every run scored identically at the maximum — this judge \
+                              has not been observed to fail anything, so it may be a \
+                              shape check rather than a quality gate",
                     "nested": { "by_label": [["archive", 538], ["to_read", 409]] },
                 }));
             }
@@ -7831,7 +7833,11 @@ mod tests {
     #[test]
     fn worker_public_keys_empty_input_is_empty() {
         assert!(parse_worker_public_keys("").is_empty());
-        assert!(parse_worker_public_keys("   ,  , ").is_empty());
+        assert!(parse_worker_public_keys(
+            "   , \
+                                           , "
+        )
+        .is_empty());
     }
 
     /// The fleet-report enumerator: worker ids + key COUNTS, sorted, and never

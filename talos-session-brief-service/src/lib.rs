@@ -852,7 +852,12 @@ impl SessionBriefService {
                 }
                 if !outcome.skipped_children.is_empty() || !outcome.skipped_substantive.is_empty() {
                     report["auto_archive_note"] = serde_json::json!(
-                        "auto_archived_stale_drafts counts only rows this sweep MOVED. Drafts                          listed under auto_archive_skipped_children /                          auto_archive_skipped_substantive were eligible by age and by                          'never executed' and were deliberately left alone — there is no flag                          that widens the sweep to include them, by design. Archive one                          explicitly with archive_workflow, or publish it with publish_version."
+                        "auto_archived_stale_drafts counts only rows this sweep MOVED. Drafts \
+                          listed under auto_archive_skipped_children / \
+                          auto_archive_skipped_substantive were eligible by age and by \
+                          'never executed' and were deliberately left alone — there is no flag \
+                          that widens the sweep to include them, by design. Archive one \
+                          explicitly with archive_workflow, or publish it with publish_version."
                     );
                 }
             }

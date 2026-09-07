@@ -1774,7 +1774,9 @@ async fn process_batch(
                 .map(|d| d.execution_id.as_str())
                 .collect::<HashSet<&str>>()
                 .len(),
-            "dropped {} byte-identical audit event copy(ies) from this batch —              at-least-once delivery, NOT tamper evidence; the surviving copy is              written and every copy is acknowledged",
+            "dropped {} byte-identical audit event copy(ies) from this batch — \
+              at-least-once delivery, NOT tamper evidence; the surviving copy is \
+              written and every copy is acknowledged",
             dropped_duplicates.len()
         );
         let keep: HashSet<usize> = keep_indices.into_iter().collect();

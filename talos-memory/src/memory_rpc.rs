@@ -671,7 +671,8 @@ mod write_ceiling_wire_compat_tests {
         let decoded: Result<LegacyMemoryRpcReply, _> = serde_json::from_slice(&bytes);
         assert!(
             decoded.is_err(),
-            "an old worker must FAIL to decode the new variant — a successful              decode into some other variant would be the dangerous outcome"
+            "an old worker must FAIL to decode the new variant — a successful \
+              decode into some other variant would be the dangerous outcome"
         );
         // The decode error is what `call_memory_op` turns into
         // `MemoryRpcError::Internal("reply decode: …")`, whose guest-visible

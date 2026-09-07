@@ -289,7 +289,16 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_workflow_sla_report",
-            "description": "SLA compliance report for a workflow. Compares actual success rate and latency percentiles (p50/p95/p99) against configurable targets.",
+            "description": "SLA compliance report for a workflow. Compares actual success rate and \
+                latency percentiles (p50/p95/p99) against configurable targets. The success rate is \
+                measured over workflow_executions AND the RFC 0012 child-run ledger, so a workflow \
+                that only ever runs as somebody's SUB-WORKFLOW is measurable here (it records no \
+                workflow_executions row, and before 2026-09-07 reported not_measurable however often \
+                it ran). Two caveats the response states rather than hides: when child runs are the \
+                ONLY evidence at least 3 of them are required before a verdict is reached, and a \
+                period before the ledger's first row is UNKNOWN, never zero. The p50/p95/p99 \
+                percentiles stay EXECUTION-ONLY — `child_runs.p95_ms` reports the child population's \
+                separately — and `total_executions` still counts execution rows only.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2182,6 +2191,27 @@ async fn handle_get_workflow_sla_report(
             .await,
     );
 
+    // RFC 0012 P3. A sub-workflow runs in-process and records no
+    // `workflow_executions` row, so before this every child reported
+    // `total_executions: 0` and `in_compliance: null` however often it ran.
+    // The CHILD half comes from the same shared reader the SLA monitor uses,
+    // over this report's own window, so the two surfaces cannot disagree about
+    // how many child runs there were or from when the ledger can speak.
+    //
+    // The EXECUTION half is deliberately NOT taken from that reader: this
+    // report's denominator includes runs still IN FLIGHT and says so in its
+    // `population` string (a considered decision, pinned by
+    // `sla_absence_disclosure_tests`), while an alerter must not fire on an
+    // open run. Two different questions, and folding them would silently move
+    // a number an operator reads.
+    let child_sources = readings.record(
+        "success_rate.child_runs",
+        state
+            .analytics_repo
+            .sla_window_sources(wf_id, user_id, i64::from(days) * 24)
+            .await,
+    );
+
     let result = render_sla_report(
         &SlaTargets {
             success_rate_pct: target_success_rate,
@@ -2196,6 +2226,8 @@ async fn handle_get_workflow_sla_report(
             p95_ms: lat.p95_ms,
             p99_ms: lat.p99_ms,
             violations_count,
+            child_runs: child_sources.map(|s| s.child_runs),
+            ledger_since: child_sources.and_then(|s| s.ledger_since),
         },
         &readings,
     );
@@ -2236,6 +2268,13 @@ pub(crate) struct SlaReads {
     pub p99_ms: Option<f64>,
     /// `None` when the violations count could not be read.
     pub violations_count: Option<i64>,
+    /// Recorded runs of this workflow AS SOMEBODY'S CHILD in the window (RFC
+    /// 0012). `None` means the ledger was NOT consulted on this path — a third
+    /// state, deliberately not the same value as "consulted and holds nothing".
+    pub child_runs: Option<talos_analytics_repository::SlaSourceStats>,
+    /// The ledger's floor. `None` with `child_runs: Some` means the table is
+    /// EMPTY, so a count of 0 there is UNKNOWN rather than zero.
+    pub ledger_since: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Pure: render the `get_workflow_sla_report` response.
@@ -2276,8 +2315,28 @@ pub(crate) fn render_sla_report(
     // does not exist. `Measurement::rate` returns `None` at n == 0 for exactly
     // this reason; the percentage here is the same judgement, kept as a plain
     // f64 because this surface renders percentages, not fractions.
-    let actual_success_rate: Option<f64> = if reads.total > 0 {
-        Some((reads.succeeded as f64 / reads.total as f64) * 100.0)
+    //
+    // RFC 0012 P3: the population is the UNION of `workflow_executions` and the
+    // child-run ledger, because both hold real runs of this workflow. A child
+    // that ran two hundred times used to report `total_executions: 0` and
+    // `in_compliance: null` — the determinate negative this class is about, on
+    // a compliance surface.
+    //
+    // The FLOOR (`LEDGER_MIN_RUNS`) applies only when the ledger is the ONLY
+    // evidence: one recorded failure is not a 0% success rate. When execution
+    // rows exist the report already had a population it was willing to render,
+    // and the ledger only widens it.
+    let child = reads.child_runs.unwrap_or_default();
+    let ledger_below_floor = reads.total == 0
+        && child.total > 0
+        && child.total < talos_analytics_repository::LEDGER_MIN_RUNS;
+    let (rate_total, rate_succeeded) = if ledger_below_floor {
+        (0, 0)
+    } else {
+        (reads.total + child.total, reads.succeeded + child.succeeded)
+    };
+    let actual_success_rate: Option<f64> = if rate_total > 0 {
+        Some((rate_succeeded as f64 / rate_total as f64) * 100.0)
     } else {
         None
     };
@@ -2320,6 +2379,45 @@ pub(crate) fn render_sla_report(
     let target_success_rate = targets.success_rate_pct;
     let total = reads.total;
 
+    // NOTHING TO SAY ⇒ NO KEY. When the ledger was not consulted, or holds no
+    // run of this workflow, every string below is EMPTY and the response is
+    // byte-identical to the pre-P3 one.
+    let ledger_since_str = reads
+        .ledger_since
+        .map_or_else(|| "an unknown date".to_string(), |t| t.to_rfc3339());
+    let child_population_clause = if child.total > 0 {
+        if ledger_below_floor {
+            format!(
+                " Plus {} recorded child run(s) since {} (RFC 0012 ledger) — BELOW the \
+                 {}-run floor at which a rate is a rate, so the verdict above stays \
+                 unmeasured rather than being computed from them.",
+                child.total,
+                ledger_since_str,
+                talos_analytics_repository::LEDGER_MIN_RUNS
+            )
+        } else {
+            format!(
+                " PLUS {} child run(s) recorded by the RFC 0012 ledger since {} ({} of them \
+                 reached 'completed'), which are runs of this workflow as somebody's \
+                 sub-workflow and leave no workflow_executions row; the rate above is over \
+                 both populations, and any period before {} is UNKNOWN — nobody was recording.",
+                child.total, ledger_since_str, child.succeeded, ledger_since_str
+            )
+        }
+    } else {
+        String::new()
+    };
+    let duration_child_clause = if child.total > 0 {
+        format!(
+            " The {} child run(s) in `child_runs` are NOT in these percentiles: they are a \
+             different population (every ledger row is settled, and the ledger records no \
+             p50/p99), and `child_runs.p95_ms` reports theirs separately.",
+            child.total
+        )
+    } else {
+        String::new()
+    };
+
     let mut result = serde_json::json!({
         "in_compliance": in_compliance,
         "compliance_status": compliance_status,
@@ -2331,11 +2429,15 @@ pub(crate) fn render_sla_report(
             // is every execution STARTED in the window, so a run still in
             // flight counts against the rate until it completes.
             "population": format!(
-                "{total} execution(s) started in the trailing {days} day(s), all statuses;                  {succeeded} reached 'completed' and {running} are still running (an in-flight                  run is in the denominator but not the numerator, so the rate is a lower bound                  while runs are open)",
+                "{total} execution(s) started in the trailing {days} day(s), all statuses; \
+                  {succeeded} reached 'completed' and {running} are still running (an in-flight \
+                  run is in the denominator but not the numerator, so the rate is a lower bound \
+                  while runs are open).{child_clause}",
                 total = total,
                 days = days,
                 succeeded = reads.succeeded,
                 running = reads.running,
+                child_clause = child_population_clause,
             ),
         },
         "duration": {
@@ -2345,15 +2447,54 @@ pub(crate) fn render_sla_report(
             "p99": round_1dp_opt(reads.p99_ms),
             "met": duration_met,
             "violations_count": reads.violations_count,
-            "population": "percentiles and violations_count cover COMPLETED executions in the                            window only; failed, cancelled and in-flight runs contribute no                            duration",
+            "population": format!(
+                "percentiles and violations_count cover COMPLETED executions in the window \
+                 only; failed, cancelled and in-flight runs contribute no duration.{}",
+                duration_child_clause
+            ),
         },
         "period_days": days,
         "total_executions": total,
     });
 
+    // The child-run block: emitted only when the ledger contributed a run, or
+    // when it was consulted and this workflow has NO execution rows at all —
+    // in that second case the block is what explains the verdict.
+    if child.total > 0 || (reads.total == 0 && reads.child_runs.is_some()) {
+        result["child_runs"] = serde_json::json!({
+            "runs": child.total,
+            "succeeded": child.succeeded,
+            "failed": child.failed(),
+            "p95_ms": round_1dp_opt(child.p95_ms),
+            "ledger_since": reads.ledger_since.map(|t| t.to_rfc3339()),
+            "ledger_min_runs": talos_analytics_repository::LEDGER_MIN_RUNS,
+            "counted_in_success_rate": child.total > 0 && !ledger_below_floor,
+            "note": if reads.ledger_since.is_none() {
+                "The child-run ledger holds no rows at all, so `runs: 0` here is UNKNOWN, not \
+                 zero.".to_string()
+            } else if child.total == 0 {
+                format!(
+                    "The child-run ledger has been recording since {ledger_since_str} and \
+                     recorded no run of this workflow in this window. Anything before that \
+                     date is UNKNOWN — nobody was recording."
+                )
+            } else {
+                format!(
+                    "Runs of this workflow as somebody's SUB-WORKFLOW. A sub-workflow runs \
+                     in-process and records no workflow_executions row, so these are invisible \
+                     to `total_executions` and to every percentile above. Recorded since \
+                     {ledger_since_str}; any period before that is UNKNOWN, not zero."
+                )
+            },
+        });
+    }
+
     if in_compliance.is_none() {
         result["compliance_note"] = serde_json::json!(
-            "NOT MEASURABLE, not compliant. At least one SLA component had no data in this              window, so no compliance verdict was reached: a null `met` means nobody could              look, never that the target was cleared. An empty window is not a perfect              window."
+            "NOT MEASURABLE, not compliant. At least one SLA component had no data in this \
+              window, so no compliance verdict was reached: a null `met` means nobody could \
+              look, never that the target was cleared. An empty window is not a perfect \
+              window."
         );
     }
 
@@ -2389,8 +2530,30 @@ pub(crate) fn render_sla_report(
     // warning (check 21).
     let total_u = u64::try_from(total).unwrap_or(0);
     if total_u == 0 {
+        // The trailing clause is EMPTY unless the ledger was consulted, so a
+        // caller that does not read the ledger sees the exact pre-P3 sentence.
+        let ledger_clause = match reads.child_runs {
+            None => String::new(),
+            Some(_) if child.total == 0 => format!(
+                " The RFC 0012 child-run ledger was also consulted and holds no run of this \
+                 workflow{}.",
+                if reads.ledger_since.is_some() {
+                    format!(" since {ledger_since_str}; anything before that is UNKNOWN")
+                } else {
+                    " (the ledger is empty, so that is UNKNOWN rather than zero)".to_string()
+                }
+            ),
+            Some(_) => format!(
+                " The RFC 0012 child-run ledger DOES hold {} run(s) of this workflow since \
+                 {ledger_since_str} — see `child_runs`.",
+                child.total
+            ),
+        };
         result["sample_size_warning"] = serde_json::json!(format!(
-            "No executions at all in the trailing {days} day(s), so nothing about this              workflow's SLA was measured. The success rate, the latency percentiles and the              compliance verdict are all null — a workflow that has never run is UNMEASURED,              not compliant. Trigger it, or widen `days`, before reading any verdict here."
+            "No executions at all in the trailing {days} day(s), so nothing about this \
+              workflow's SLA was measured. The success rate, the latency percentiles and the \
+              compliance verdict are all null — a workflow that has never run is UNMEASURED, \
+              not compliant. Trigger it, or widen `days`, before reading any verdict here.{ledger_clause}"
         ));
         if let Some(m) = min_n_for_target {
             result["min_n_for_meaningful_target"] = serde_json::json!(m);
@@ -2407,7 +2570,11 @@ pub(crate) fn render_sla_report(
     } else if min_n_for_target.is_none() {
         // target is 0% or 100%: no finite sample size makes the verdict robust.
         result["sample_size_warning"] = serde_json::json!(format!(
-            "A {target_success_rate}% target has NO finite sufficiency threshold, so no sample              size makes this verdict robust: at 100% a single failure fails the target no              matter how many runs precede it, and at 0% the target is met unconditionally.              `min_n_for_meaningful_target` is omitted because none exists — that omission is              not a statement that the sample is large enough.",
+            "A {target_success_rate}% target has NO finite sufficiency threshold, so no sample \
+              size makes this verdict robust: at 100% a single failure fails the target no \
+              matter how many runs precede it, and at 0% the target is met unconditionally. \
+              `min_n_for_meaningful_target` is omitted because none exists — that omission is \
+              not a statement that the sample is large enough.",
             target_success_rate = target_success_rate,
         ));
     }
@@ -5562,43 +5729,86 @@ async fn handle_get_workflow_risk_assessment(
                 .await,
         )
         .unwrap_or_default();
-    // A sub-workflow's failure rate is UNMEASURABLE from `workflow_executions`
-    // — an `execute_subworkflow_graph` run is in-process and records no row —
-    // so `continue`-ing on a zero-row population is not "this child is fine",
-    // it is "nothing here can tell you". Measured platform-wide 2026-09-05:
-    // ZERO execution rows carry a `parent_execution_id`, so on the reference
-    // fleet this HIGH-severity check can never fire for ANY child. No risk
-    // entry is pushed for it (an `info` row on every parent that has a judge
-    // node would be noise on three of this fleet's workflows); the population
-    // is DISCLOSED instead, so "no cascading-failure risk found" is legible as
-    // a statement about what was measurable rather than about the children.
-    let mut unmeasurable_sub_workflows: Vec<String> = Vec::new();
+    // RFC 0012 P3: the ledger is read over the check's OWN window, and the
+    // decision is the shared, pure `classify_sub_workflow_risk`.
+    //
+    // Until this change a sub-workflow's failure rate was UNMEASURABLE from
+    // `workflow_executions` — an `execute_subworkflow_graph` run is in-process
+    // and records no row — so every child landed in
+    // `sub_workflows_unmeasurable` and this HIGH-severity check could not fire
+    // for any of them. Measured 2026-09-07 driving the real reads: a child with
+    // THREE recorded runs in the window, ALL FAILED, returned an EMPTY map from
+    // `get_risk_exec_counts_for_ids`.
+    //
+    // Tenancy: the ledger read is scoped by the AUTHENTICATED `user_id`, the
+    // same predicate `get_risk_exec_counts_for_ids` applies, on a
+    // `begin_user_scoped` transaction so RLS is the backstop. A foreign
+    // `child_workflow_id` embedded in this graph therefore reads as UNKNOWN
+    // rather than leaking another tenant's counts.
+    let ledger_window_start = talos_analytics_repository::risk_window_start(chrono::Utc::now());
+    let ledger_evidence = readings
+        .record(
+            "high_failure_sub_workflow.child_runs",
+            state
+                .analytics_repo
+                .child_ledger_evidence_since_for(user_id, &sub_wf_ids, ledger_window_start)
+                .await,
+        )
+        .unwrap_or_default();
+    let mut unmeasurable_sub_workflows: Vec<serde_json::Value> = Vec::new();
+    let mut ledger_measured_count = 0usize;
     for sub_wf_id in &sub_wf_ids {
-        let (failed, total) = match exec_counts.get(sub_wf_id) {
-            Some(t) => *t,
-            None => {
-                // No executions in window, OR not user-owned. The two are
-                // indistinguishable here, and the note below says so rather
-                // than claiming every id in this list is a healthy child.
-                unmeasurable_sub_workflows.push(sub_wf_id.to_string());
-                continue;
+        match talos_analytics_repository::classify_sub_workflow_risk(
+            exec_counts.get(sub_wf_id).copied(),
+            ledger_evidence.get(sub_wf_id).copied(),
+        ) {
+            talos_analytics_repository::SubWorkflowRiskVerdict::Measured(m) => {
+                if m.ledger_contributed() {
+                    ledger_measured_count += 1;
+                }
+                if !m.breaches() {
+                    continue;
+                }
+                // NOTHING TO SAY ⇒ NO KEY: when the ledger contributed no run
+                // the finding is byte-identical to the pre-P3 one.
+                let mut risk = serde_json::json!({
+                    "risk_level": "high",
+                    "category": "high_failure_sub_workflow",
+                    "description": format!(
+                        "Sub-workflow {} has {:.0}% failure rate ({}/{} in last 7 days)",
+                        sub_wf_id, m.fail_rate_pct(), m.failed, m.total
+                    ),
+                    "recommendation": "Investigate and fix the sub-workflow before it causes cascading failures."
+                });
+                if let Some(note) = m.population_note() {
+                    risk["measured_over"] = serde_json::json!({
+                        "source": m.population.as_str(),
+                        "execution_rows": m.execution_rows,
+                        "execution_failed": m.execution_failed,
+                        "child_runs": m.child_runs,
+                        "child_runs_failed": m.child_runs_failed,
+                        "ledger_since": m.ledger_since.map(|t| t.to_rfc3339()),
+                        "note": note,
+                    });
+                }
+                risks.push(risk);
             }
-        };
-        if total <= 0 {
-            unmeasurable_sub_workflows.push(sub_wf_id.to_string());
-            continue;
-        }
-        let fail_rate = (failed as f64 / total as f64) * 100.0;
-        if fail_rate > 20.0 {
-            risks.push(serde_json::json!({
-                "risk_level": "high",
-                "category": "high_failure_sub_workflow",
-                "description": format!(
-                    "Sub-workflow {} has {:.0}% failure rate ({}/{} in last 7 days)",
-                    sub_wf_id, fail_rate, failed, total
-                ),
-                "recommendation": "Investigate and fix the sub-workflow before it causes cascading failures."
-            }));
+            talos_analytics_repository::SubWorkflowRiskVerdict::Unmeasurable(u) => {
+                // An OBJECT, not a bare id string (RFC 0012 P3). The id alone
+                // could not say whether the ledger had been read, whether it
+                // held rows, or from when — so a reader could not tell "no
+                // evidence" from "some evidence, below the floor".
+                unmeasurable_sub_workflows.push(serde_json::json!({
+                    "workflow_id": sub_wf_id.to_string(),
+                    "reason": u.reason.as_str(),
+                    "child_runs": u.child_runs,
+                    "child_runs_failed": u.child_runs_failed,
+                    "ledger_since": u.ledger_since.map(|t| t.to_rfc3339()),
+                    "window_start": u.window_start.map(|t| t.to_rfc3339()),
+                    "ledger_min_runs": talos_analytics_repository::LEDGER_MIN_RUNS,
+                    "note": u.note(),
+                }));
+            }
         }
     }
 
@@ -5900,14 +6110,30 @@ async fn handle_get_workflow_risk_assessment(
         "low": risks.iter().filter(|r| r.get("risk_level").and_then(|l| l.as_str()) == Some("low")).count(),
         "risks": risks,
     });
-    // NOTHING TO SAY ⇒ NO KEY: a workflow that dispatches into nothing, or
-    // whose children all have counted executions, is byte-identical to the
-    // pre-#762 response.
-    if !unmeasurable_sub_workflows.is_empty() {
+    // NOTHING TO SAY ⇒ NO KEY: a workflow that dispatches into nothing keeps
+    // a response byte-identical to the pre-#762 one. The key now also appears
+    // when every child WAS measurable but the ledger contributed a run to at
+    // least one of them, because "measured, and here is what from" is the
+    // claim `sub_workflows_measured_from_ledger` exists to make.
+    if !unmeasurable_sub_workflows.is_empty() || ledger_measured_count > 0 {
         result["cascading_failure_check"] = serde_json::json!({
             "sub_workflows_checked": sub_wf_ids.len(),
+            "sub_workflows_measured_from_ledger": ledger_measured_count,
             "sub_workflows_unmeasurable": unmeasurable_sub_workflows,
-            "note": "The cascading-failure check reads workflow_executions, and a sub-workflow                      run is IN-PROCESS and records no row there — measured platform-wide                      2026-09-05: zero execution rows carry a parent_execution_id, live table or                      archive. So for the workflows listed here the check could not run at all,                      and their ABSENCE from `risks` is not evidence that they are healthy.                      (An id can also appear here because it is not yours or no longer exists;                      the two are indistinguishable from this query.)",
+            "ledger_min_runs": talos_analytics_repository::LEDGER_MIN_RUNS,
+            "note": "The cascading-failure check reads workflow_executions AND the RFC 0012 \
+                     child-run ledger (sub_workflow_runs). A sub-workflow run is IN-PROCESS and \
+                     records no workflow_executions row — measured platform-wide 2026-09-05, \
+                     zero execution rows carry a parent_execution_id, live table or archive — \
+                     so the ledger is the only table that can see one. Each entry under \
+                     sub_workflows_unmeasurable carries its own `reason` and `note`: the check \
+                     could not judge it, and its ABSENCE from `risks` is NOT evidence that it \
+                     is healthy. (An id can also appear there because it is not yours or no \
+                     longer exists; the two are indistinguishable from these queries.) A count \
+                     of 0 for any period before `ledger_since` is UNKNOWN — nobody was \
+                     recording — and is never rendered as zero.",
+            "unrecorded_dispatch_kinds": talos_child_run_ledger::UNRECORDED_DISPATCH_KINDS,
+            "unrecorded_dispatch_kinds_note": talos_child_run_ledger::UNRECORDED_DISPATCH_KINDS_NOTE,
         });
     }
     readings.attach(&mut result);
@@ -9820,6 +10046,23 @@ mod sla_absence_disclosure_tests {
         }
     }
 
+    /// The child half, as `sla_window_sources` would return it.
+    fn child(
+        total: i64,
+        succeeded: i64,
+        p95: Option<f64>,
+    ) -> talos_analytics_repository::SlaSourceStats {
+        talos_analytics_repository::SlaSourceStats {
+            total,
+            succeeded,
+            p95_ms: p95,
+        }
+    }
+
+    fn a_ledger_floor() -> Option<chrono::DateTime<chrono::Utc>> {
+        Some(chrono::Utc::now() - chrono::Duration::days(9))
+    }
+
     fn empty_reads() -> SlaReads {
         SlaReads {
             total: 0,
@@ -9829,6 +10072,10 @@ mod sla_absence_disclosure_tests {
             p95_ms: None,
             p99_ms: None,
             violations_count: Some(0),
+            // RFC 0012 P3: the ledger was NOT consulted on this path — a third
+            // state, and the one every pre-P3 assertion below was written under.
+            child_runs: None,
+            ledger_since: None,
         }
     }
 
@@ -9892,6 +10139,10 @@ mod sla_absence_disclosure_tests {
                 p95_ms: Some(200.0),
                 p99_ms: Some(300.0),
                 violations_count: Some(0),
+                // RFC 0012 P3: the ledger was NOT consulted on this path — a third
+                // state, and the one every pre-P3 assertion below was written under.
+                child_runs: None,
+                ledger_since: None,
             },
         ] {
             let total = reads.total;
@@ -9928,6 +10179,10 @@ mod sla_absence_disclosure_tests {
                 p95_ms: None,
                 p99_ms: None,
                 violations_count: Some(0),
+                // RFC 0012 P3: the ledger was NOT consulted on this path — a third
+                // state, and the one every pre-P3 assertion below was written under.
+                child_runs: None,
+                ledger_since: None,
             },
             &Readings::new(),
         );
@@ -9960,6 +10215,10 @@ mod sla_absence_disclosure_tests {
                 p95_ms: None,
                 p99_ms: None,
                 violations_count: Some(0),
+                // RFC 0012 P3: the ledger was NOT consulted on this path — a third
+                // state, and the one every pre-P3 assertion below was written under.
+                child_runs: None,
+                ledger_since: None,
             },
             &Readings::new(),
         );
@@ -9996,6 +10255,10 @@ mod sla_absence_disclosure_tests {
                 p95_ms: Some(200.0),
                 p99_ms: Some(300.0),
                 violations_count: violations,
+                // RFC 0012 P3: the ledger was NOT consulted on this path — a third
+                // state, and the one every pre-P3 assertion below was written under.
+                child_runs: None,
+                ledger_since: None,
             },
             &readings,
         );
@@ -10036,6 +10299,10 @@ mod sla_absence_disclosure_tests {
                 p95_ms: Some(200.0),
                 p99_ms: Some(4999.0),
                 violations_count: Some(0),
+                // RFC 0012 P3: the ledger was NOT consulted on this path — a third
+                // state, and the one every pre-P3 assertion below was written under.
+                child_runs: None,
+                ledger_since: None,
             },
             &Readings::new(),
         );
@@ -10071,6 +10338,10 @@ mod sla_absence_disclosure_tests {
                 p95_ms: Some(20.0),
                 p99_ms: Some(30.0),
                 violations_count: Some(0),
+                // RFC 0012 P3: the ledger was NOT consulted on this path — a third
+                // state, and the one every pre-P3 assertion below was written under.
+                child_runs: None,
+                ledger_since: None,
             },
             &Readings::new(),
         );
@@ -10082,6 +10353,154 @@ mod sla_absence_disclosure_tests {
         assert!(pop.contains("3 are still running"), "{out}");
         let dpop = out["duration"]["population"].as_str().unwrap_or_default();
         assert!(dpop.contains("COMPLETED executions"), "{out}");
+    }
+    // ── RFC 0012 P3 ─────────────────────────────────────────────────────────
+
+    /// THE P3 regression for this surface. A workflow that runs only as a
+    /// SUB-WORKFLOW recorded no `workflow_executions` row, so a compliance
+    /// report about it was permanently `not_measurable` however often it ran
+    /// and however badly it failed.
+    ///
+    /// MUTATION that turns it red: drop `child.total` from `rate_total`.
+    #[test]
+    fn a_child_only_workflow_is_now_measurable() {
+        let out = render_sla_report(
+            &targets(99.0),
+            &SlaReads {
+                child_runs: Some(child(20, 10, Some(4_000.0))),
+                ledger_since: a_ledger_floor(),
+                ..empty_reads()
+            },
+            &Readings::new(),
+        );
+        assert_eq!(out["success_rate"]["actual"], serde_json::json!(50.0));
+        assert_eq!(out["success_rate"]["met"], serde_json::json!(false));
+        assert_eq!(out["in_compliance"], serde_json::json!(false));
+        assert_eq!(out["compliance_status"], "out_of_compliance");
+        assert_eq!(out["child_runs"]["runs"], serde_json::json!(20));
+        assert_eq!(
+            out["child_runs"]["counted_in_success_rate"],
+            serde_json::json!(true)
+        );
+        // `total_executions` keeps its name's meaning.
+        assert_eq!(out["total_executions"], serde_json::json!(0));
+        assert!(out["success_rate"]["population"]
+            .as_str()
+            .unwrap()
+            .contains("PLUS 20 child run(s)"));
+    }
+
+    /// BELOW the floor, child runs are DISCLOSED but do not produce a verdict.
+    /// One failed child run is not a 0% success rate on a compliance surface.
+    ///
+    /// MUTATION: `LEDGER_MIN_RUNS = 1`, or drop the `ledger_below_floor` guard.
+    #[test]
+    fn below_the_floor_child_runs_are_disclosed_but_not_scored() {
+        let out = render_sla_report(
+            &targets(99.0),
+            &SlaReads {
+                child_runs: Some(child(1, 0, Some(4_000.0))),
+                ledger_since: a_ledger_floor(),
+                ..empty_reads()
+            },
+            &Readings::new(),
+        );
+        assert_eq!(out["success_rate"]["actual"], serde_json::Value::Null);
+        assert_eq!(out["in_compliance"], serde_json::Value::Null);
+        assert_eq!(out["compliance_status"], "not_measurable");
+        assert_eq!(out["child_runs"]["runs"], serde_json::json!(1));
+        assert_eq!(
+            out["child_runs"]["counted_in_success_rate"],
+            serde_json::json!(false)
+        );
+        assert!(out["success_rate"]["population"]
+            .as_str()
+            .unwrap()
+            .contains("BELOW the 3-run floor"));
+    }
+
+    /// An EMPTY ledger renders `runs: 0` as UNKNOWN, never as evidence.
+    ///
+    /// MUTATION: drop the `ledger_since.is_none()` arm of the note.
+    #[test]
+    fn an_empty_ledger_is_unknown_not_zero_runs() {
+        let out = render_sla_report(
+            &targets(99.0),
+            &SlaReads {
+                child_runs: Some(child(0, 0, None)),
+                ledger_since: None,
+                ..empty_reads()
+            },
+            &Readings::new(),
+        );
+        assert_eq!(out["child_runs"]["runs"], serde_json::json!(0));
+        assert!(out["child_runs"]["note"]
+            .as_str()
+            .unwrap()
+            .contains("UNKNOWN, not"));
+        assert!(out["sample_size_warning"]
+            .as_str()
+            .unwrap()
+            .contains("the ledger is empty"));
+    }
+
+    /// A HYBRID workflow is scored over both populations, and the percentiles
+    /// say what they do NOT cover.
+    ///
+    /// MUTATION: drop `duration_child_clause`.
+    #[test]
+    fn a_hybrid_workflow_unions_the_rate_and_the_percentiles_say_so() {
+        let out = render_sla_report(
+            &targets(90.0),
+            &SlaReads {
+                total: 10,
+                succeeded: 10,
+                p50_ms: Some(100.0),
+                p95_ms: Some(200.0),
+                p99_ms: Some(300.0),
+                child_runs: Some(child(10, 8, Some(900.0))),
+                ledger_since: a_ledger_floor(),
+                ..empty_reads()
+            },
+            &Readings::new(),
+        );
+        assert_eq!(out["success_rate"]["actual"], serde_json::json!(90.0));
+        assert_eq!(out["success_rate"]["met"], serde_json::json!(true));
+        assert_eq!(out["total_executions"], serde_json::json!(10));
+        assert_eq!(out["child_runs"]["p95_ms"], serde_json::json!(900.0));
+        assert!(out["duration"]["population"]
+            .as_str()
+            .unwrap()
+            .contains("NOT in these percentiles"));
+    }
+
+    /// NOTHING TO SAY ⇒ NO KEY: a workflow with execution rows and no child
+    /// runs renders exactly what it rendered before P3.
+    ///
+    /// MUTATION: emit `child_runs` unconditionally.
+    #[test]
+    fn a_consulted_ledger_with_nothing_to_say_adds_no_key() {
+        let out = render_sla_report(
+            &targets(90.0),
+            &SlaReads {
+                total: 10,
+                succeeded: 10,
+                p99_ms: Some(300.0),
+                child_runs: Some(child(0, 0, None)),
+                ledger_since: a_ledger_floor(),
+                ..empty_reads()
+            },
+            &Readings::new(),
+        );
+        assert!(out.get("child_runs").is_none());
+        assert!(!out["success_rate"]["population"]
+            .as_str()
+            .unwrap()
+            .contains("child run"));
+        assert!(!out["duration"]["population"]
+            .as_str()
+            .unwrap()
+            .contains("child run"));
     }
 }
 

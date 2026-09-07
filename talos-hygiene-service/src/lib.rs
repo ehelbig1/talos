@@ -1026,7 +1026,9 @@ pub fn build_report(h: &talos_analytics_repository::HygieneReport) -> HygieneRep
             // presenting a short exclusion list as a full one. Named parents,
             // not a count: the operator can go look at them.
             action.push_str(&format!(
-                " NOTE: the child-reference scan could not parse the graph of {} enabled                  workflow(s) ({}), so a workflow dispatched only by one of those may be listed                  here in error — check before deleting.",
+                " NOTE: the child-reference scan could not parse the graph of {} enabled \
+                  workflow(s) ({}), so a workflow dispatched only by one of those may be listed \
+                  here in error — check before deleting.",
                 h.child_scan_unreadable_parents.len(),
                 h.child_scan_unreadable_parents.join(", "),
             ));
@@ -1036,7 +1038,9 @@ pub fn build_report(h: &talos_analytics_repository::HygieneReport) -> HygieneRep
             // recommendation whose number silently excludes rows the reader
             // can see above it is its own small misleading report.
             action.push_str(&format!(
-                " {dormant_children_excluded} further listed workflow(s) are EXCLUDED from this                  count: an enabled parent dispatches into them as sub-workflows, which leaves no                  execution row — deleting one would remove a node its parent runs."
+                " {dormant_children_excluded} further listed workflow(s) are EXCLUDED from this \
+                  count: an enabled parent dispatches into them as sub-workflows, which leaves no \
+                  execution row — deleting one would remove a node its parent runs."
             ));
         }
         recommendations.push(serde_json::json!({

@@ -67,10 +67,13 @@ impl DraftIntent {
         match self {
             Self::Scaffolding => None,
             Self::Substantive => Some(
-                "Has SYSTEM_PROMPT/OUTPUT_SCHEMA/retry/description markers — automated cleanup                  refused. Use publish_version, or archive it explicitly via archive_workflow.",
+                "Has SYSTEM_PROMPT/OUTPUT_SCHEMA/retry/description markers — automated cleanup \
+                  refused. Use publish_version, or archive it explicitly via archive_workflow.",
             ),
             Self::Unreadable => Some(
-                "graph_json could not be read, so nothing here says whether a human shaped this                  draft — automated cleanup refused. Archive it explicitly via archive_workflow                  if it really is a leftover.",
+                "graph_json could not be read, so nothing here says whether a human shaped this \
+                  draft — automated cleanup refused. Archive it explicitly via archive_workflow \
+                  if it really is a leftover.",
             ),
         }
     }

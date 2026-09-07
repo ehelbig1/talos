@@ -660,7 +660,11 @@ risk found" is legible as a statement about what was measurable. **The backgroun
 SLA-breach monitor is RECORDED and NOT changed**: it is an ALERTER with no
 operator-facing field to disclose into, its `stats.total >= 3` gate can never
 pass for a child, and the honest fix is a per-run record it does not have. So
-`set_workflow_sla_threshold` on a child is silently inert.
+`set_workflow_sla_threshold` on a child is silently inert. **BOTH sentences are
+SUPERSEDED by the RFC 0012 P3 entry below (2026-09-07)**: the per-run record now
+exists, the check reads it, and the alerter both reads it and has a channel to
+say when it could not measure. Read them as the state before that entry, not as
+current behaviour.
 
 **What #762 could NOT guard, stated rather than implied.**
 `controller/src/bootstrap/background.rs` is `mod bootstrap` inside `main.rs`,
@@ -819,7 +823,11 @@ two to five. The migration therefore adds `(started_at)`, measured at
 **0.036–0.045 ms** (Index Only Scan) on the same 135 000 rows, i.e. ~400x, for
 one more b-tree on an append-only table.
 
-**What is NOT covered, measured rather than implied.** Deleting the `record`
+**What is NOT covered, measured rather than implied.** (SUPERSEDED for the two
+write sites by the P3 entry below — the mutation named here is now CAUGHT by
+`talos-workflow-engine/tests/child_run_dispatch_recording.rs`, and it was
+re-run against the pre-existing suite to confirm this paragraph was true when
+written.) Deleting the `record`
 call at the tail of `run_dispatched_subworkflow` leaves every
 `talos-workflow-engine` unit test AND both ledger DB binaries GREEN — a measured
 SURVIVOR, not a hypothetical. That function is private and the loop body sits
@@ -931,6 +939,171 @@ never met the sanitizer. **No lint check was added and the count stays 86**: the
 one write site is a chokepoint the compiler already funnels every caller
 through, so a "the ledger must be written" detector would have a population of
 ONE and nothing to say.
+
+**2026-09-07 — P3: the ALERTER and the ASSESSOR read the ledger, and the two P2
+write sites get a test.** P2 taught the READERS; the two surfaces #762 recorded
+as "disclosed, not fixed" and "recorded and NOT changed" are the ones a person
+is paged by, and they are closed here.
+
+**The cascading-failure check was blind to a child failing 100% of its runs, and
+that was MEASURED before anything was written.** Driving the real reads against
+a scratch database: a child with THREE recorded runs inside the check's own
+7-day window, ALL FAILED, returns an EMPTY map from
+`get_risk_exec_counts_for_ids` while `child_run_stats_since` returns
+`runs: 3, failed: 3`. The check took its `None =>` arm, listed the id under
+`sub_workflows_unmeasurable` and pushed no risk — indistinguishable from a child
+that never ran. The read is now `child_ledger_evidence_since`, which is P2's
+readiness read **SPLIT, not copied** (the 30-day entry point is a one-line
+projection over it), so the floor arithmetic — read `since()`, clamp the window
+to `max(window, floor)`, turn an ABSENT key into a zero-WITH-a-floor — keeps ONE
+home while the WINDOW moves to the check's seven days. The decision is the pure
+`talos_analytics_repository::cascading_risk::classify_sub_workflow_risk`.
+
+A HYBRID child is judged over the UNION of both tables with the split disclosed
+(`measured_over`), because both hold real runs of one workflow and the check
+renders ONE `description` per child — two rates under one category would have to
+be recombined by the reader with no denominator to do it on.
+`LEDGER_MIN_RUNS` gates the CHILD-ONLY population and nothing else: where
+execution rows exist the check already had a population it was willing to judge,
+so a floor there would be a NEW refusal on a finding that fires today.
+`sub_workflows_unmeasurable` changes SHAPE — id strings become objects carrying
+`reason`/`child_runs`/`child_runs_failed`/`ledger_since`/`window_start`/`note` —
+and every reader was checked (there is exactly one, and none in the frontend).
+`UnmeasurableReason` is FOUR-valued: `ledger_not_consulted` is a statement about
+the CODE PATH and stays distinct so a wiring regression cannot render as a fact
+about the workflow. That distinction earns its keep below.
+
+**"This workflow's SLA-window stats" had FOUR implementations and they
+DISAGREED** — check 85's class, and the disagreement moves a verdict. The 5-min
+breach monitor's inline SQL and `get_sla_window_stats` (the 15-min degradation
+loop) ask the identical question over the identical 24-hour window; only the
+first filters `completed_at IS NOT NULL`, so an execution still IN FLIGHT sat in
+the second's denominator and never in its numerator, making its success rate
+systematically LOWER. One stored threshold row, two loops, opposite verdicts on
+one tick. `sla_window::read_sla_window_sources` is now the one read: BOTH
+populations in ONE statement, a `UNION ALL` with `GROUP BY ROLLUP(src)` so the
+per-source split and the COMBINED percentile come from one pass (a p95 over a
+union is not a function of the two sub-p95s and must never be averaged).
+`get_sla_window_stats` and its `SlaWindowStats` are DELETED rather than kept as
+a projection, for the reason P2 deleted `ReadinessBasis::from_scan`: they
+returned `Option`, so a failed read and an empty window were one value, and a
+future caller reaching for the convenient name would silently re-acquire the
+collapse this change removes. Its one caller reads the new function and handles
+three outcomes — **a behaviour change to the 15-min loop, and it is the fix**: the unified definition is the monitor's (runs that
+SETTLED in the window), the direction is strictly fewer false success-rate
+alerts, and it gains a `user_id` it never had (its docstring called SLA alerting
+"platform-wide"; its caller already reads `w.user_id`). `get_latency_percentiles_ms`
+and `get_performance_metrics` are deliberately NOT collapsed in: they answer the
+latency DISTRIBUTION of SUCCESSFUL runs over a days-window, and folding a failed
+run's duration into `duration.p50` would move a number an operator reads without
+being asked.
+
+The BREACH DECISION is the pure `decide_sla_breaches`; the loop keeps only
+wiring, which is the only thing that makes it testable —
+`controller/src/bootstrap/background.rs` is `mod bootstrap` inside `main.rs`, so
+no integration test can reach the loop itself (#762 recorded the same fact for
+the readiness loop). `LEDGER_MIN_RUNS` gates BOTH metrics when child runs are
+the only evidence, and the p95 argument is not weaker than the success-rate one:
+a p95 over n=1 IS that one run's latency, so one slow cold start would page
+somebody. `not_evaluated` is three-valued, so "no breach" and "could not judge"
+are different log lines. The webhook keeps every key AND its per-metric
+rendering and gains `sources: {execution_rows, child_runs, child_runs_since,
+window_hours}` — counts, a timestamp and an integer, the kinds of value it has
+always carried.
+
+**An alerter that cannot measure must say so.** `Err(_) => continue` became a
+WARN with `event_kind = "sla_stats_unreadable"` and an error CLASS
+(`sla_read_error_class`), once per threshold per tick, full chain at DEBUG; the
+same treatment went to the 15-min loop's `_ => continue`, which
+`docs/swallowed-results-inventory.md` records as fails-OPEN and which folded
+THREE states (read failed / empty window / 1–2 runs) into one silent skip.
+**No metric was added, and that is a measurement rather than an omission**: that
+function has no `TalosMetrics` handle, so a series would mean threading the
+registry into `spawn_late_background_tasks` for a loop that is LATENT on this
+fleet. Declined, which means the unreadable-window signal is prose-only and
+cannot be alerted on.
+
+**A NULL webhook KILLED the monitor, and the documented configuration is what
+produced one.** The threshold row was decoded with `sqlx::Row::get::<String, _>`;
+the column is nullable by design (`20260404000001`) and
+`set_workflow_sla_threshold` stores NULL for an omitted webhook — its tool
+description advertises that as the API-polling configuration. `Row::get` PANICS
+on a decode failure and this loop is a spawned task, so ONE such row ended the
+SLA monitor for the whole process lifetime, silently. Every column now decodes
+through `try_get` in one closure and a bad row skips ITSELF with
+`event_kind = "sla_threshold_row_undecodable"`. Also corrected in the same
+block: a comment claiming the task "issues per-threshold INSERTs into
+`workflow_sla_alerts`". There is no such INSERT and no such table — the 15-min
+sibling writes `workflow_alerts` — and a comment asserting a side effect the
+code does not have is #732's class.
+
+**`get_workflow_sla_report` measures a child.** `success_rate` is the union
+(floored when the ledger is the only evidence), so a workflow that only ever
+runs as a sub-workflow stops reporting `not_measurable` however often it ran.
+`total_executions` keeps its name's meaning, p50/p95/p99 stay EXECUTION-ONLY and
+`duration.population` says so, and `child_runs` appears only when the ledger
+contributed or when there are no execution rows at all. Note one disagreement
+KEPT and disclosed: this report's denominator includes runs still IN FLIGHT (a
+considered decision, pinned by `sla_absence_disclosure_tests`) while the alerter
+must not fire on an open run — two different questions, and the response says
+which it is answering. The compiler forced all 7 pre-existing tests to state
+`child_runs: None` ("not consulted"), which is P2's `from_scan` shape for the
+same reason; all 7 pass unchanged.
+
+**Leg C: the two P2 write sites now have a reactor-driven test, and P2's own
+mutation was re-run rather than assumed.**
+`talos-workflow-engine/tests/child_run_dispatch_recording.rs` drives
+`run_with_transport` over `dispatch`, `capability_dispatch`, `agent_loop` and
+`react_loop` nodes against a hand-written capturing `ChildRunRecorder` (the
+workspace has exactly ONE recorder impl and test-utils has none). Deleting the
+`record` call at the tail of `run_dispatched_subworkflow` — P2's M8 — still
+SURVIVES the pre-existing engine suite (exit 0, re-measured) and is CAUGHT by
+the new binary. Also caught: recording once instead of once per agent-loop
+iteration, a `ReActLoop` filed as `agent_loop`, and a `CapabilityDispatch` filed
+as `dispatch`. **No LLM stub was needed and that was measured**: the loop body is
+the body workflow's graph run through the ordinary `NodeDispatcher`, so a fixed
+output controls the iteration count exactly. **One expectation of mine was wrong
+and the code was right**: a dispatch child whose terminal MODULE returns
+`{"__error": "…"}` is recorded `Completed`, because a dispatch envelope is a
+LABEL-KEYED map rather than the collapsed terminal value — and the PARENT node
+applies `output_reports_error` to the identical envelope and reaches the
+identical answer, which is exactly the invariant the write site claims.
+
+**TWO measured SURVIVORS, both handler-body call sites, and they are not equally
+silent.** Setting the SLA report's `child_runs`/`ledger_since` to `None`, and
+passing `None` instead of the ledger evidence in the risk check, both leave every
+test green — the shape checks 74b and 79b already state as their own limit: the
+DB tests drive the repository read, the unit tests drive the pure decision and
+the pure renderer, and none can see a call site that computes the right answer
+and discards it. The RISK one SELF-DISCLOSES (every entry then reads
+`reason: "ledger_not_consulted"` and says so in words, which is why that variant
+exists); the REPORT one is SILENT and is left open, with the live read after
+deploy as its honest guard — the position #767 and #769 took about their own
+call sites. No lint: the population is TWO, and "the handler must pass the read
+it just recorded" is a dataflow question, not a textual one.
+
+**A cosmetic defect that reached operator-facing JSON, swept.** The house style
+for a long literal is a `\`-continuation, which renders as ONE space because
+`\<newline>` skips the newline AND the next line's indentation. Twenty-seven
+lines had lost the `\` and kept the indentation, so runs of up to 30 spaces
+reached the rendered string — including the cascading check's own note, five of
+the SLA report's disclosure strings and four of P2's child-run notes. Measured
+workspace-wide with a literal-aware walker: **44 lines**, of which **17 are
+legitimate** (aligned `println!` columns, embedded code samples, tests matching
+source text, one SQL literal) and 27 were prose. All 27 fixed.
+**A lint was BUILT, MEASURED and REJECTED**: the brief's candidate rule (a `\`
+continuation followed by ≥2 spaces) describes the CORRECT house style and would
+fire everywhere; the rule that does describe the defect still reports the 17
+legitimate sites on the fixed tree, i.e. 0% precision at zero and 17 markers on
+correct code. Telling prose from an aligned column is a judgement a grep cannot
+make. `--count` stays **86**.
+
+**What was measured and NOT changed.** `set_workflow_sla_threshold` still
+accepts a row with BOTH thresholds NULL (the invariant lives in the handler and
+the tool description, not in a CHECK), and such a row is now evaluated and fires
+nothing rather than being a special case. The report's in-flight denominator
+stays as it is, disclosed. And the two latency-percentile readers stay separate,
+for the reason above.
 
 ## The verifier that could never read the ledger it verified (#767)
 

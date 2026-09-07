@@ -16,16 +16,31 @@ type SqlxResult<T> = std::result::Result<T, sqlx::Error>;
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
+pub mod cascading_risk;
 pub mod child_ledger;
 pub mod readiness_basis;
 pub mod readiness_state;
-pub use child_ledger::{child_ledger_evidence, readiness_window_start, READINESS_WINDOW_DAYS};
+pub mod sla_window;
+pub use cascading_risk::{
+    classify_sub_workflow_risk, risk_window_start, MeasuredSubWorkflow, RiskPopulation,
+    SubWorkflowRiskVerdict, UnmeasurableReason, UnmeasurableSubWorkflow, HIGH_FAILURE_RATE_PCT,
+    RISK_WINDOW_DAYS,
+};
+pub use child_ledger::{
+    child_ledger_evidence, child_ledger_evidence_since, readiness_window_start,
+    READINESS_WINDOW_DAYS,
+};
 pub use readiness_basis::{
     child_exclusion_is_complete, score_readiness, ChildLedgerEvidence, ReadinessBasis,
     ReadinessComponents, ReadinessOutcome, CHILD_MEASURABLE_MAX, CHILD_UNMEASURED_REASON, FULL_MAX,
     LEDGER_MIN_RUNS,
 };
 pub use readiness_state::{classify_readiness_state, ReadinessScorer, ReadinessState};
+pub use sla_window::{
+    decide_sla_breaches, read_sla_window_sources, sla_read_error_class, SlaBreach,
+    SlaBreachDecision, SlaMetric, SlaNotEvaluated, SlaSourceStats, SlaThresholds, SlaWindowSources,
+    SLA_WINDOW_HOURS,
+};
 
 // ------------------------------------------------------------------
 // Row DTOs
@@ -250,14 +265,6 @@ pub struct LatencyPercentilesMs {
     pub p50_ms: Option<f64>,
     pub p95_ms: Option<f64>,
     pub p99_ms: Option<f64>,
-}
-
-/// Compact stats returned by `get_sla_window_stats` for SLA evaluation.
-#[derive(Debug, Clone, Copy)]
-pub struct SlaWindowStats {
-    pub total: i64,
-    pub successes: i64,
-    pub p95_ms: Option<f64>,
 }
 
 /// Per-module fuel statistics aggregated from `execution_cost_rollup`.
@@ -965,14 +972,17 @@ impl ChildRunEvidence {
     #[must_use]
     pub fn note(&self) -> String {
         match (self.ledger_since, self.last_run_at) {
-            (None, _) => "The child-run ledger (sub_workflow_runs) holds no rows at all, so it                           cannot say whether this workflow ran. UNKNOWN, not zero."
+            (None, _) => "The child-run ledger (sub_workflow_runs) holds no rows at all, so it \
+                           cannot say whether this workflow ran. UNKNOWN, not zero."
                 .to_string(),
             (Some(since), None) => format!(
-                "The child-run ledger has been recording since {} and has recorded NO run of                  this workflow. Anything before that date is UNKNOWN — nobody was recording.",
+                "The child-run ledger has been recording since {} and has recorded NO run of \
+                  this workflow. Anything before that date is UNKNOWN — nobody was recording.",
                 since.to_rfc3339()
             ),
             (Some(since), Some(last)) => format!(
-                "{} child run(s) recorded since {}, most recently {}. This workflow RUNS; its                  silence in workflow_executions is the expected shape for a sub-workflow.",
+                "{} child run(s) recorded since {}, most recently {}. This workflow RUNS; its \
+                  silence in workflow_executions is the expected shape for a sub-workflow.",
                 self.runs,
                 since.to_rfc3339(),
                 last.to_rfc3339()
@@ -1061,7 +1071,13 @@ pub struct StaleDraftRow {
 /// Why `stale_draft_workflows` is not, on its own, a list of scaffolding
 /// leftovers.
 pub const STALE_DRAFT_CHILD_NOTE: &str =
-    "A sub-workflow runs in-process via execute_subworkflow_graph and records NO      workflow_executions row, so this list's \"never executed\" premise says nothing about      it. Excluded from the cleanup recommendation's count and from fix_all's auto-delete      set: deleting it would remove a node its parent dispatches into. Its `draft` status is      also not a runtime fact — a parent dispatches the child's `graph_json` column directly,      with no version join and no status filter, so publish_version changes nothing about how      the parent runs it.";
+    "A sub-workflow runs in-process via execute_subworkflow_graph and records NO \
+      workflow_executions row, so this list's \"never executed\" premise says nothing about \
+      it. Excluded from the cleanup recommendation's count and from fix_all's auto-delete \
+      set: deleting it would remove a node its parent dispatches into. Its `draft` status is \
+      also not a runtime fact — a parent dispatches the child's `graph_json` column directly, \
+      with no version join and no status filter, so publish_version changes nothing about how \
+      the parent runs it.";
 
 #[derive(Debug)]
 pub struct IdleActorRow {
@@ -2513,45 +2529,19 @@ impl AnalyticsRepository {
 
     // -- Latency ----------------------------------------------------------
 
-    /// Compact stats for SLA threshold evaluation: total execution count,
-    /// completed count, and p95 latency over a time window. Used by the
-    /// background SLA task in `main.rs` (formerly an inline query that
-    /// duplicated the latency percentile logic from
-    /// `get_latency_percentiles_ms`).
+    /// Both SLA populations for one workflow over `hours`, with the per-source
+    /// split and the ledger's floor. The ONE read behind every SLA verdict.
     ///
-    /// **`None` means the query FAILED, not "no executions."** The docstring
-    /// used to claim the opposite, and it was wrong for a structural reason:
-    /// this is an UNGROUPED aggregate, so Postgres always returns exactly one
-    /// row and `fetch_optional`'s `None` was unreachable. The empty window is
-    /// `Some(SlaWindowStats { total: 0, .. })` — `total == 0` is the "no
-    /// executions" signal. `fetch_one` makes that structural fact visible
-    /// instead of leaving a `None` arm that reads as a handled case.
-    ///
-    /// `p95_ms` stays `Option<f64>`: a percentile over zero completed runs is
-    /// genuinely absent and has no meaningful zero.
-    ///
-    /// Unlike `get_latency_percentiles_ms`, this method does NOT filter by
-    /// user_id — SLA alerting runs as a platform-wide background task.
-    pub async fn get_sla_window_stats(&self, wf_id: Uuid, hours: i32) -> Option<SlaWindowStats> {
-        let row: Option<(i64, i64, Option<f64>)> = sqlx::query_as(
-            "SELECT COUNT(*), \
-                    COUNT(*) FILTER (WHERE status = 'completed'), \
-                    PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY \
-                        EXTRACT(EPOCH FROM (completed_at - started_at)) * 1000) \
-             FROM workflow_executions \
-             WHERE workflow_id = $1 \
-               AND started_at > NOW() - make_interval(hours => $2::int)",
-        )
-        .bind(wf_id)
-        .bind(hours)
-        .fetch_one(&self.db_pool)
-        .await
-        .ok();
-        row.map(|(total, successes, p95_ms)| SlaWindowStats {
-            total,
-            successes,
-            p95_ms,
-        })
+    /// # Errors
+    /// Any database failure — deliberately NOT collapsed, so an alerter that
+    /// could not measure can say so.
+    pub async fn sla_window_sources(
+        &self,
+        wf_id: Uuid,
+        user_id: Uuid,
+        hours: i64,
+    ) -> Result<sla_window::SlaWindowSources> {
+        sla_window::read_sla_window_sources(&self.db_pool, wf_id, user_id, hours).await
     }
 
     pub async fn get_latency_percentiles_ms(
@@ -3653,6 +3643,29 @@ impl AnalyticsRepository {
     ) -> Result<std::collections::HashMap<Uuid, readiness_basis::ChildLedgerEvidence>> {
         crate::child_ledger::child_ledger_evidence(&self.db_pool, user_id, child_workflow_ids, now)
             .await
+    }
+
+    /// Ledger evidence over an ARBITRARY window — the cascading-failure
+    /// check's seven days, not readiness's thirty.
+    ///
+    /// Same function, same floor arithmetic, same absence-is-not-zero contract
+    /// as [`Self::child_ledger_evidence_for`]; only the window moves.
+    ///
+    /// # Errors
+    /// Any database failure.
+    pub async fn child_ledger_evidence_since_for(
+        &self,
+        user_id: Uuid,
+        child_workflow_ids: &[Uuid],
+        window_start: DateTime<Utc>,
+    ) -> Result<std::collections::HashMap<Uuid, readiness_basis::ChildLedgerEvidence>> {
+        crate::child_ledger::child_ledger_evidence_since(
+            &self.db_pool,
+            user_id,
+            child_workflow_ids,
+            window_start,
+        )
+        .await
     }
 
     pub async fn scan_child_parents_for(

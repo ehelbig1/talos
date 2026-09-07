@@ -65,7 +65,33 @@ pub async fn child_ledger_evidence(
     child_workflow_ids: &[Uuid],
     now: DateTime<Utc>,
 ) -> anyhow::Result<HashMap<Uuid, ChildLedgerEvidence>> {
-    let window_start = readiness_window_start(now);
+    child_ledger_evidence_since(
+        pool,
+        user_id,
+        child_workflow_ids,
+        readiness_window_start(now),
+    )
+    .await
+}
+
+/// The same read over an ARBITRARY window start.
+///
+/// [`child_ledger_evidence`] is the readiness projection of this function, and
+/// this is the one place the floor arithmetic lives. RFC 0012 P3 needed it
+/// because the cascading-failure check in `get_workflow_risk_assessment` asks
+/// the same question over ITS window — seven days, not thirty — and a second
+/// implementation of "read the floor, clamp the window to it, turn an absent
+/// key into a zero-WITH-a-floor" is exactly the drift #762 and check 85
+/// record. The WINDOW moves; the arithmetic does not.
+///
+/// # Errors
+/// Any database failure, from either the floor read or the batched count.
+pub async fn child_ledger_evidence_since(
+    pool: &sqlx::PgPool,
+    user_id: Uuid,
+    child_workflow_ids: &[Uuid],
+    window_start: DateTime<Utc>,
+) -> anyhow::Result<HashMap<Uuid, ChildLedgerEvidence>> {
     if child_workflow_ids.is_empty() {
         return Ok(HashMap::new());
     }

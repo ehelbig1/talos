@@ -5895,7 +5895,9 @@ fn child_runs_note(count: Option<usize>, ledger_has_started: bool, error: Option
              execution dispatched no sub-workflows."
         );
     }
-    let base = "A sub-workflow runs in-process and records NO workflow_executions                 row, so it never appears in `lineage`. `child_runs` is the RFC 0012                 ledger's record of what this execution dispatched.";
+    let base = "A sub-workflow runs in-process and records NO workflow_executions \
+                 row, so it never appears in `lineage`. `child_runs` is the RFC 0012 \
+                 ledger's record of what this execution dispatched.";
     match (count, ledger_has_started) {
         (Some(0) | None, false) => format!(
             "{base} The ledger holds no rows at all, so `ledger_since` is null and \
