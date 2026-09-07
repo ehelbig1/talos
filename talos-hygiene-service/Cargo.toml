@@ -20,6 +20,10 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # Talos crates — repositories
 talos-analytics-repository = { path = "../talos-analytics-repository" }
+# RFC 0012 P2 — the UNRECORDED_DISPATCH_KINDS disclosure. A hygiene row that
+# renders a ledger count must also say which dispatch kinds the ledger cannot
+# see, or a zero for such a child reads as "it never ran".
+talos-child-run-ledger = { path = "../talos-child-run-ledger" }
 talos-execution-repository = { path = "../talos-execution-repository" }
 talos-module-repository = { path = "../talos-module-repository" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }

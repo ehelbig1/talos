@@ -4019,6 +4019,13 @@ pub(crate) struct ReadinessReads<E> {
     /// scored full-scale (the pre-#762 behaviour) and the failure is
     /// disclosed, never silently absorbed.
     pub child_scan: Result<talos_analytics_repository::ChildReferenceScan, E>,
+    /// RFC 0012 P2 — what `sub_workflow_runs` holds for this workflow inside
+    /// the readiness window, when it is somebody's child. `Ok(None)` means the
+    /// ledger was not consulted (this workflow is nobody's child, so it was
+    /// not asked); `Err` means it could NOT be read. The renderer keeps the
+    /// two apart, because "we did not look" and "it never ran" are the two
+    /// sentences this phase exists to stop merging.
+    pub child_ledger: Result<Option<talos_analytics_repository::ChildLedgerEvidence>, E>,
     pub now: chrono::DateTime<chrono::Utc>,
 }
 
@@ -4174,6 +4181,7 @@ pub(crate) fn render_validate_workflow<E: std::fmt::Display>(
         expiring_secrets: expiring_res,
         wf_meta: wf_meta_res,
         child_scan: child_scan_res,
+        child_ledger: child_ledger_res,
         now,
     } = reads;
 
@@ -4244,9 +4252,30 @@ pub(crate) fn render_validate_workflow<E: std::fmt::Display>(
             degraded_inputs.push("child_reference_scan");
         })
         .ok();
+    // The SIXTH input. Degrades exactly like the other five: an unreadable
+    // ledger leaves the basis without evidence — which renders as "the ledger
+    // was NOT consulted", never as a count of zero — and is disclosed.
+    let child_ledger = child_ledger_res
+        .map_err(|e| {
+            tracing::error!(
+                target: "talos_mcp",
+                %wf_id, error = %e, event_kind = "readiness_input_read_failed",
+                "readiness: child-run ledger unreadable — reliability and freshness stay \
+                 unmeasurable for a child, i.e. the pre-RFC-0012-P2 answer"
+            );
+            degraded_inputs.push("child_run_ledger");
+        })
+        .ok()
+        .flatten();
     let basis = child_scan.as_ref().map_or(
         talos_analytics_repository::ReadinessBasis::FullScale,
-        |scan| talos_analytics_repository::ReadinessBasis::from_scan(scan, wf_id),
+        |scan| {
+            talos_analytics_repository::ReadinessBasis::from_scan_with_ledger(
+                scan,
+                wf_id,
+                child_ledger,
+            )
+        },
     );
     let unreadable_parents: Vec<String> = child_scan
         .as_ref()
@@ -4274,16 +4303,27 @@ pub(crate) fn render_validate_workflow<E: std::fmt::Display>(
         talos_analytics_repository::compute_documentation_score(has_desc, has_node_desc, has_caps);
 
     // Reliability (50 pts) — shared formula with get_readiness_breakdown.
-    let reliability = talos_analytics_repository::compute_reliability_score(
-        exec_data.success_rate,
-        exec_data.total_count,
-    );
+    // On a LEDGER-MEASURED basis the INPUT is `sub_workflow_runs` rather than
+    // `workflow_executions`; the arithmetic is the same function either way,
+    // so the two scales cannot drift apart.
+    let ledger_measured =
+        basis.max_points() == talos_analytics_repository::FULL_MAX && basis.is_parent_dispatched();
+    let reliability = match basis.ledger() {
+        Some(ev) if ledger_measured => ev.components(now).0,
+        _ => talos_analytics_repository::compute_reliability_score(
+            exec_data.success_rate,
+            exec_data.total_count,
+        ),
+    };
 
     // Freshness (20 pts). The clock is the caller's `now`, not
     // `chrono::Utc::now()` — a wall-clock read here would make this function
     // untestable in exactly the component that depends on it.
     let days_since_last = last_exec_at.map(|t| now.signed_duration_since(t).num_days());
-    let freshness = talos_analytics_repository::compute_freshness_score(days_since_last);
+    let freshness = match basis.ledger() {
+        Some(ev) if ledger_measured => ev.components(now).1,
+        _ => talos_analytics_repository::compute_freshness_score(days_since_last),
+    };
 
     // Risk (10 pts): deduct for missing safeguards and expiring secrets
     let has_timeout = graph.get("execution_timeout_secs").is_some();
@@ -4552,15 +4592,28 @@ pub(crate) fn render_validate_workflow<E: std::fmt::Display>(
     // healthy shape is pinned by a test: an "all clear" block would change
     // every response on the fleet to report the absence of a condition.
     if outcome.basis.is_parent_dispatched() {
-        // The DENOMINATOR, which is 30 here and not 100. A caller comparing
-        // this number to another workflow's must be able to see they are on
-        // different scales; `get_readiness_breakdown` renders the same pair.
+        // The DENOMINATOR — 30 for a child the ledger cannot measure, 100 for
+        // one it can. A caller comparing this number to another workflow's
+        // must be able to see which; `get_readiness_breakdown` renders the
+        // same pair.
         result["readiness_max_points"] = serde_json::json!(max_points);
         result["readiness_score_basis"] = serde_json::json!(outcome.basis.as_str());
-        result["readiness_comparable_to_fleet"] = serde_json::json!(false);
+        result["readiness_comparable_to_fleet"] = serde_json::json!(outcome.comparable_to_fleet());
         result["readiness_unmeasured_components"] = serde_json::json!(outcome.unmeasured);
         result["runs_as_child_of"] = serde_json::json!(outcome.basis.parents());
         result["readiness_basis_note"] = serde_json::json!(outcome.note());
+        // RFC 0012 P2. The count and the FLOOR always travel together: a count
+        // alone cannot be told apart from the period nobody was recording.
+        if let Some(ev) = outcome.basis.ledger() {
+            result["readiness_ledger_runs"] = serde_json::json!(ev.runs);
+            result["readiness_ledger_failed_runs"] = serde_json::json!(ev.failed);
+            result["readiness_ledger_since"] =
+                serde_json::json!(ev.ledger_since.map(|t| t.to_rfc3339()));
+            result["readiness_ledger_min_runs"] =
+                serde_json::json!(talos_analytics_repository::LEDGER_MIN_RUNS);
+        }
+        result["readiness_unrecorded_dispatch_kinds"] =
+            serde_json::json!(talos_child_run_ledger::UNRECORDED_DISPATCH_KINDS);
     }
     if !unreadable_parents.is_empty() {
         // A parent whose graph could not be read names nobody, so a workflow it
@@ -4628,7 +4681,7 @@ async fn handle_validate_workflow(
     // and this one, and one decision site for "refuse vs disclose" is worth
     // more than saving four reads on a race.
     let candidates = [wf_id];
-    let (exec_data, last_exec_at, expiring_secrets, wf_meta, child_scan) = tokio::join!(
+    let (exec_data, last_exec_at, expiring_secrets, wf_meta, child_scan, child_ledger) = tokio::join!(
         state.analytics_repo.get_readiness_exec_data(wf_id),
         state.analytics_repo.get_max_execution_started_at(wf_id),
         state.analytics_repo.count_expiring_secrets(user_id),
@@ -4638,6 +4691,15 @@ async fn handle_validate_workflow(
         state
             .analytics_repo
             .scan_child_parents_for(user_id, &candidates),
+        // RFC 0012 P2. Read UNCONDITIONALLY rather than after the scan says
+        // "this is a child": the five reads above already run on a path that
+        // may refuse, and the same reasoning applies — one join, one decision
+        // site. Measured cost is in AGENT_NOTES.md; the floor read is
+        // process-cached for 60 s and the count is one grouped index probe on
+        // ONE id. The renderer discards it for a non-child.
+        state
+            .analytics_repo
+            .child_ledger_evidence_for(user_id, &candidates, chrono::Utc::now()),
     );
 
     match render_validate_workflow(
@@ -4650,6 +4712,7 @@ async fn handle_validate_workflow(
             expiring_secrets,
             wf_meta,
             child_scan: child_scan.map_err(anyhow::Error::from),
+            child_ledger: child_ledger.map(|m| m.get(&wf_id).copied()),
             now: chrono::Utc::now(),
         },
     ) {
@@ -4729,6 +4792,8 @@ mod validate_workflow_render_tests {
                 })),
                 // Scan ran, nobody dispatches into it: full scale.
                 child_scan: Ok(talos_analytics_repository::ChildReferenceScan::default()),
+                // Not a child, so the ledger says nothing about it.
+                child_ledger: Ok(None),
                 now,
             },
             now,

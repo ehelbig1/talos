@@ -1347,6 +1347,7 @@ impl ParallelWorkflowEngine {
         &self,
         node_idx: NodeIndex,
         node_id: Uuid,
+        execution_id: Uuid,
         dispatcher: &Arc<dyn NodeDispatcher>,
         worker_shared_key: &Option<WorkerSharedKey>,
         results: &HashMap<Uuid, JsonValue>,
@@ -1438,6 +1439,10 @@ impl ParallelWorkflowEngine {
                                 DispatchedOrigin::DynamicDispatch {
                                     resolved_target: target_id_or_name.clone(),
                                 },
+                                talos_workflow_engine_core::ChildRunSite::Node {
+                                    execution_id,
+                                    node_id,
+                                },
                             )
                             .await;
                         // `run_dispatched_subworkflow` returns a JsonValue that
@@ -1470,6 +1475,7 @@ impl ParallelWorkflowEngine {
         &self,
         node_idx: NodeIndex,
         node_id: Uuid,
+        execution_id: Uuid,
         dispatcher: &Arc<dyn NodeDispatcher>,
         worker_shared_key: &Option<WorkerSharedKey>,
         results: &HashMap<Uuid, JsonValue>,
@@ -1568,6 +1574,10 @@ impl ParallelWorkflowEngine {
                     matched_capabilities: caps,
                     is_fallback,
                 },
+                talos_workflow_engine_core::ChildRunSite::Node {
+                    execution_id,
+                    node_id,
+                },
             )
             .await,
         )
@@ -1586,6 +1596,13 @@ impl ParallelWorkflowEngine {
         dispatcher: &Arc<dyn NodeDispatcher>,
         worker_shared_key: &Option<WorkerSharedKey>,
         origin: DispatchedOrigin,
+        // RFC 0012 P2. This function hydrates its OWN sub-engine rather than
+        // going through `execute_subworkflow_graph`, which is exactly why P1
+        // could not see it. The site is threaded in for the same reason it is
+        // threaded through the five chokepoint dispatchers: the engine has no
+        // `execution_id` field and nodes dispatch concurrently, so it cannot
+        // be read off `&self`.
+        run_site: talos_workflow_engine_core::ChildRunSite,
     ) -> JsonValue {
         if !self.has_module_fetcher() {
             return serde_json::json!({
@@ -1658,7 +1675,18 @@ impl ParallelWorkflowEngine {
         initial_results.insert(trigger_node_id, clean_input);
         let sub_labels = sub_engine.node_labels.clone();
         let sub_execution_id = Uuid::new_v4();
-        match sub_engine
+
+        // RFC 0012 P2 — the ledger clock starts HERE, at the moment the child
+        // engine begins running, exactly as at the P1 chokepoint. A missing
+        // graph or a build failure above is not a child RUN and gets no row.
+        let reporter = self.child_run_reporter(run_site.with_kind(origin.child_dispatch_kind()));
+        let started = std::time::Instant::now();
+        let started_at_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+        let child_actor_id = sub_engine.actor_id;
+
+        let out = match sub_engine
             .run_with_seed_with_transport(
                 dispatcher.clone(),
                 worker_shared_key.clone(),
@@ -1690,7 +1718,25 @@ impl ParallelWorkflowEngine {
                 serde_json::Value::Object(sub_outputs)
             }
             Err(e) => origin.run_error(sub_wf_id, e),
-        }
+        };
+
+        // ONE write site for the whole ledger — the same
+        // `ChildRunReporter::record` the P1 chokepoint uses. `out` is the
+        // envelope this function is about to return, and `classify_collapsed`
+        // is check 77's shared classifier, so the ledger and the parent node's
+        // routing decision (`output_reports_error`, applied by both callers
+        // below) cannot disagree about whether the child failed.
+        reporter
+            .record(
+                sub_wf_id,
+                user_id,
+                child_actor_id,
+                started_at_unix_ms,
+                i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+                crate::child_run_report::classify_collapsed(&out),
+            )
+            .await;
+        out
     }
 
     /// [`SystemNodeKind::AgentLoop`] and [`SystemNodeKind::ReActLoop`]
@@ -1719,6 +1765,7 @@ impl ParallelWorkflowEngine {
         &self,
         node_idx: NodeIndex,
         node_id: Uuid,
+        execution_id: Uuid,
         dispatcher: &Arc<dyn NodeDispatcher>,
         worker_shared_key: &Option<WorkerSharedKey>,
         results: &HashMap<Uuid, JsonValue>,
@@ -1795,6 +1842,29 @@ impl ParallelWorkflowEngine {
         // into the closure by value; the per-iteration apply is an associated
         // fn (no `self` capture).
         let sub_binding = self.resolve_subworkflow_binding(body_wf_id, user_id).await;
+        // RFC 0012 P2. The `async move` below captures `adapter_set_al` and
+        // NOT `self`, so `&self` is unavailable at the moment an iteration
+        // settles — which is precisely why P1 could not record this site.
+        // `ChildRunReporter` is the resolved-value answer, captured here for
+        // the same reason and in the same place as `sub_binding` above; the
+        // INSERT still happens in the one `ChildRunReporter::record`.
+        //
+        // The KIND is the AUTHORED one: `ReActLoop` shares this dispatcher at
+        // runtime but is a distinct node kind, and the ledger records what the
+        // author wrote rather than what the two share.
+        let loop_kind = match self.node_meta.get(&node_id) {
+            Some((_, _, Some(SystemNodeKind::ReActLoop { .. }))) => {
+                talos_workflow_engine_core::ChildDispatchKind::ReactLoop
+            }
+            _ => talos_workflow_engine_core::ChildDispatchKind::AgentLoop,
+        };
+        let reporter = self.child_run_reporter(
+            talos_workflow_engine_core::ChildRunSite::Node {
+                execution_id,
+                node_id,
+            }
+            .with_kind(loop_kind),
+        );
         let agent_result =
             match tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async move {
                 let mut history: Vec<JsonValue> = Vec::new();
@@ -1833,6 +1903,19 @@ impl ParallelWorkflowEngine {
                     let hydrated = adapter_set_al
                         .clone()
                         .into_engine_with_graph(body_wf_id, &graph_json);
+                    // The ledger clock starts at the moment THIS iteration's
+                    // engine is hydrated. A build failure below yields an
+                    // error envelope that IS recorded here, unlike at the P1
+                    // chokepoint — the difference is deliberate: there, a
+                    // build failure happens before any child engine exists and
+                    // the node fails outright; here the loop CONTINUES to the
+                    // next iteration, so an unrecorded failed iteration would
+                    // make the ledger's count disagree with `iterations_run`.
+                    let iter_started = std::time::Instant::now();
+                    let iter_started_at_unix_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX));
+                    let mut iter_actor_id = None;
                     let iter_result = match hydrated {
                         Ok(mut sub_engine) => {
                             // Fail-closed binding (H2 + identity): the
@@ -1847,6 +1930,11 @@ impl ParallelWorkflowEngine {
                                     &binding,
                                 );
                             }
+                            // The EFFECTIVE actor, read AFTER the rebind — a
+                            // body bound to its own actor ran as that actor,
+                            // and recording the parent's would be wrong in the
+                            // one field an operator uses to attribute a run.
+                            iter_actor_id = sub_engine.actor_id;
                             let sub_execution_id = Uuid::new_v4();
                             let trigger_node_id = Uuid::new_v4();
                             sub_engine.add_node(trigger_node_id, None, None, None);
@@ -1965,6 +2053,27 @@ impl ParallelWorkflowEngine {
                             "error_message": format!("Failed to build agent body: {e}"),
                         }),
                     };
+
+                    // ONE ROW PER ITERATION (RFC 0012 P2). Five iterations
+                    // are five child runs; folding them into one would make
+                    // the ledger disagree with `iterations_run` and with the
+                    // fuel and durations those same iterations produced.
+                    //
+                    // AWAITED, not spawned — the same rule the chokepoint
+                    // follows, and the same reason: a spawned write is the
+                    // orphaning shape the platform-primitive checklist warns
+                    // about. It runs inside the loop's own `tokio::time::timeout`
+                    // envelope, so it cannot extend the node past its budget.
+                    reporter
+                        .record(
+                            body_wf_id,
+                            user_id,
+                            iter_actor_id,
+                            iter_started_at_unix_ms,
+                            i64::try_from(iter_started.elapsed().as_millis()).unwrap_or(i64::MAX),
+                            crate::child_run_report::classify_collapsed(&iter_result),
+                        )
+                        .await;
 
                     // Check for finish signals in the iteration output.
                     let iter_finished = iter_result
@@ -2785,6 +2894,18 @@ enum DispatchedOrigin {
 }
 
 impl DispatchedOrigin {
+    /// Which `ChildDispatchKind` the ledger records for this origin (RFC 0012
+    /// P2). Derived from the origin rather than passed alongside it, so the
+    /// two cannot disagree about which node kind ran the child.
+    fn child_dispatch_kind(&self) -> talos_workflow_engine_core::ChildDispatchKind {
+        match self {
+            Self::DynamicDispatch { .. } => talos_workflow_engine_core::ChildDispatchKind::Dispatch,
+            Self::CapabilityDispatch { .. } => {
+                talos_workflow_engine_core::ChildDispatchKind::CapabilityDispatch
+            }
+        }
+    }
+
     fn not_found_error(&self, sub_wf_id: Uuid) -> JsonValue {
         match self {
             Self::DynamicDispatch { .. } => serde_json::json!({

@@ -398,6 +398,44 @@ impl PartialCount {
 /// Insert `*_lower_bound` + `*_note` beside each nulled severity count.
 ///
 /// A no-op for any count that is not null, so a healthy report gains nothing.
+/// Render the child-run ledger's answer onto a hygiene row — RFC 0012 P2.
+///
+/// THREE outcomes, and the third is the one the whole phase is about:
+///
+/// * `None` — the ledger was NOT READ (a failed batched read, or the row is
+///   nobody's child). No keys are emitted; nothing here claims anything.
+/// * `ledger_since: None` — the ledger holds no rows at all, so the count is
+///   UNKNOWN. `child_runs_since_ledger` renders `null`, never `0`.
+/// * `ledger_since: Some(_)` — the count is a MEASUREMENT over
+///   `[ledger_since, now]`, with `ledger_since` beside it so the uncovered
+///   part of the window is visible.
+///
+/// `last_child_run_at` is the field that supersedes the
+/// `execution_cost_rollup` proxy: the proxy timestamps a node that burned
+/// fuel, this timestamps the RUN.
+fn attach_child_run_evidence(
+    entry: &mut serde_json::Value,
+    evidence: Option<&talos_analytics_repository::ChildRunEvidence>,
+) {
+    let Some(ev) = evidence else {
+        return;
+    };
+    entry["last_child_run_at"] = serde_json::json!(ev.last_run_at.map(|t| t.to_rfc3339()));
+    // UNKNOWN is not zero: with no ledger floor there is nothing to count
+    // against, so the count is `null` and the note says why.
+    entry["child_runs_since_ledger"] = if ev.ledger_since.is_some() {
+        serde_json::json!(ev.runs)
+    } else {
+        serde_json::Value::Null
+    };
+    entry["ledger_since"] = serde_json::json!(ev.ledger_since.map(|t| t.to_rfc3339()));
+    entry["child_run_note"] = serde_json::json!(ev.note());
+    entry["unrecorded_dispatch_kinds"] =
+        serde_json::json!(talos_child_run_ledger::UNRECORDED_DISPATCH_KINDS);
+    entry["unrecorded_dispatch_kinds_note"] =
+        serde_json::json!(talos_child_run_ledger::UNRECORDED_DISPATCH_KINDS_NOTE);
+}
+
 fn attach_partial_counts(
     report: &mut serde_json::Value,
     total: &PartialCount,
@@ -697,6 +735,11 @@ pub fn build_report(h: &talos_analytics_repository::HygieneReport) -> HygieneRep
                 entry["runs_as_child_of"] = serde_json::json!(r.runs_as_child_of);
                 entry["last_execution_note"] =
                     serde_json::json!(talos_analytics_repository::DORMANT_CHILD_NOTE);
+                // RFC 0012 P2: the LEDGER first — it records the run — with
+                // the fuel-rollup proxy kept beneath it and demoted, because
+                // it is the only thing that can speak for the period BEFORE
+                // the ledger's first row.
+                attach_child_run_evidence(&mut entry, r.child_runs.as_ref());
                 entry["last_child_activity_at"] =
                     serde_json::json!(r.last_child_activity_at.map(|t| t.to_rfc3339()));
                 entry["last_child_activity_caveat"] =
@@ -736,6 +779,10 @@ pub fn build_report(h: &talos_analytics_repository::HygieneReport) -> HygieneRep
                     serde_json::json!(talos_analytics_repository::STALE_DRAFT_CHILD_NOTE);
                 entry["excluded_from_cleanup_reason"] = serde_json::json!(reason);
             }
+            // RFC 0012 P2. On THIS list the ledger answers the query's own
+            // premise: "never executed" is a claim about `workflow_executions`,
+            // and a non-zero `child_runs_since_ledger` refutes it outright.
+            attach_child_run_evidence(&mut entry, r.child_runs.as_ref());
             entry
         })
         .collect();
@@ -2236,6 +2283,7 @@ mod partial_report_disclosure_tests {
             last_execution: None,
             runs_as_child_of: Vec::new(),
             last_child_activity_at: None,
+            child_runs: None,
         }
     }
 }
@@ -2334,6 +2382,7 @@ mod partition_stale_drafts_tests {
                 .map(|_| vec!["parent".to_string()])
                 .unwrap_or_default(),
             child_protection_reason: child_reason.map(str::to_string),
+            child_runs: None,
         }
     }
 

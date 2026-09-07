@@ -320,6 +320,13 @@ CTRL_TESTS=(
     # background writer's verbatim UPDATE and the (previously dead) schedule
     # exclusion; `common` harness, so CTRL_TESTS (64b).
     "child_readiness_tests"
+    # RFC 0012 P2: the ANSWER to what child_readiness_tests could only disclose.
+    # A child with enough recorded runs in `sub_workflow_runs` is scored on the
+    # FULL scale with reliability and freshness MEASURED, and the hygiene rows
+    # read the ledger instead of the 5%-recall fuel-rollup proxy. Drives the
+    # real batched ledger read, the real basis decision, the real shared
+    # scorer and the real hygiene report; `common` harness, so CTRL_TESTS (64b).
+    "child_readiness_ledger_tests"
     # The remainder #760 recorded and did not fix: the auto-archive sweep did
     # not know about `is_substantive_workflow`, so ONE session_start response
     # recommended publish_version for a draft and archived it. Drives the REAL

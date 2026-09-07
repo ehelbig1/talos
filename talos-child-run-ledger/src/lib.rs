@@ -27,9 +27,12 @@
 //!
 //! # What this ledger does NOT see
 //!
-//! [`UNRECORDED_DISPATCH_KINDS`]. Four node kinds run a child through a
-//! DIFFERENT engine-hydration site and are not recorded in P1. That is
-//! disclosed by every consumer rather than left to look like silence.
+//! [`UNRECORDED_DISPATCH_KINDS`] — EMPTY as of RFC 0012 P2, when the four node
+//! kinds P1 was blind to (`dispatch`, `capability_dispatch`, `agent_loop`,
+//! `react_loop`) gained writers through the shared `ChildRunReporter`. The
+//! constant is kept and still rendered by every consumer, because an empty
+//! list is a CLAIM and a reader is entitled to see it stated rather than
+//! inferred from silence.
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -40,34 +43,38 @@ use std::time::{Duration, Instant};
 use talos_workflow_engine_core::{ChildDispatchKind, ChildRunRecord};
 use uuid::Uuid;
 
-/// Node kinds that dispatch a child workflow but are **not** recorded by P1.
+/// Node kinds that dispatch a child workflow and are **not** recorded.
 ///
-/// Measured, not assumed: every `AdapterSet::into_engine_with_graph` site in
-/// the workspace was enumerated (2026-09-06). Three exist — the chokepoint
-/// `execute_subworkflow_graph`, `run_dispatched_subworkflow`
-/// (`DynamicDispatch` + `CapabilityDispatch`) and the agent-loop body's
-/// per-iteration hydration — and only the first routes through the recorder.
+/// **EMPTY as of RFC 0012 P2, and the emptiness is a measurement rather than
+/// an aspiration.** P1 named four (`agent_loop`, `react_loop`, `dispatch`,
+/// `capability_dispatch`): every `AdapterSet::into_engine_with_graph` site in
+/// the workspace was enumerated — that call is the only way a child graph
+/// becomes a running engine — and three exist, of which P1's chokepoint was
+/// one. P2 routes the other two (`run_dispatched_subworkflow`, and the
+/// agent-loop body's per-iteration hydration) through the same
+/// `ChildRunReporter`, so all nine kinds now have a live writer.
 ///
-/// On the reference fleet these kinds are LATENT: of 36 workflows, the only
-/// child-dispatching node kinds present are `sub_workflow` (3) and `judge`
-/// (3), both recorded. "Latent is not live" cuts both ways, so the gap is
-/// NAMED here and disclosed by every consumer instead of being left to read as
-/// "this child never ran".
-pub const UNRECORDED_DISPATCH_KINDS: &[&str] = &[
-    "agent_loop",
-    "react_loop",
-    "dispatch",
-    "capability_dispatch",
-];
+/// **This constant is kept, not deleted**, and every consumer still renders it.
+/// A TENTH dispatch kind added without a writer belongs here on the day it is
+/// added: an empty list is a claim ("the ledger sees every dispatch kind") that
+/// a reader is entitled to see stated, and deleting the constant would remove
+/// the only place that claim can be contradicted. `recorded_and_unrecorded_kinds_do_not_overlap`
+/// keeps the two sets disjoint whatever this holds.
+pub const UNRECORDED_DISPATCH_KINDS: &[&str] = &[];
 
 /// The disclosure every consumer renders beside a ledger count, so a reader can
 /// tell "no runs" from "this dispatch kind is not recorded yet".
+///
+/// Written to stay TRUE whether or not [`UNRECORDED_DISPATCH_KINDS`] is empty:
+/// it names the recorded set explicitly, so a reader can check a kind against
+/// it rather than trusting an adjective.
 pub const UNRECORDED_DISPATCH_KINDS_NOTE: &str =
-    "The ledger records the five node kinds that dispatch through \
-     execute_subworkflow_graph (sub_workflow, judge, ensemble, reflective_retry, \
-     llm_dispatch). A child dispatched ONLY by agent_loop, react_loop, dispatch or \
-     capability_dispatch hydrates its engine at a different site and is not recorded \
-     in RFC 0012 P1, so a zero count for such a workflow says nothing about it.";
+    "The ledger records every node kind that dispatches a child workflow: sub_workflow, \
+     judge, ensemble, reflective_retry, llm_dispatch, dispatch, capability_dispatch, \
+     agent_loop and react_loop (the last two record ONE ROW PER ITERATION). RFC 0012 P1 \
+     was blind to the last four; P2 routes them through the same writer. A zero count for \
+     a workflow is therefore evidence — for the period since ledger_since, and for no \
+     period before it.";
 
 /// How long [`ChildRunLedger::since`] is cached per process.
 ///
@@ -111,6 +118,28 @@ pub struct ChildRunRow {
     pub error_class: Option<String>,
     /// Wall time of the run.
     pub duration_ms: i64,
+}
+
+/// What the ledger knows about one child inside a window — the two
+/// execution-derived readiness components, from the one table that can see a
+/// sub-workflow run.
+///
+/// `runs` and `failed` are counts over `[since, now]`, NOT over the caller's
+/// nominal window: the ledger has a first row, so a window that starts before
+/// [`ChildRunLedger::since`] is only partially covered and the uncovered part
+/// is UNKNOWN. The caller renders the floor beside the count; this struct
+/// carries no opinion about it because the floor is a deployment fact and this
+/// is a per-child one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChildRunStats {
+    /// Recorded runs of this child in the window.
+    pub runs: i64,
+    /// How many of them the ledger classified `failed` — check 77's
+    /// classifier at the write site, not a second opinion.
+    pub failed: i64,
+    /// The newest recorded run's `started_at`. `None` is impossible when
+    /// `runs > 0` and is treated as "no evidence" if it ever happens.
+    pub last_started_at: Option<DateTime<Utc>>,
 }
 
 /// Postgres-backed child-run ledger.
@@ -340,6 +369,62 @@ impl ChildRunLedger {
         Ok(out)
     }
 
+    /// Reliability and freshness inputs for a batch of children, since
+    /// `since`, as ONE query.
+    ///
+    /// The readiness scorers ask this for a whole page (or a whole user's
+    /// hourly batch) at once — `= ANY($1)` and a single `GROUP BY`, never one
+    /// query per child, which is where an N+1 is born in a list renderer.
+    ///
+    /// A child with no rows in the window is **ABSENT from the map, never
+    /// present as a zero**. That is the whole point: the caller decides what
+    /// an absence means, and before [`Self::since`] it means UNKNOWN. Same
+    /// contract as [`Self::count_for_children_since`].
+    ///
+    /// # Errors
+    /// Any database failure.
+    pub async fn child_run_stats_since(
+        &self,
+        child_workflow_ids: &[Uuid],
+        user_id: Uuid,
+        since: DateTime<Utc>,
+    ) -> Result<HashMap<Uuid, ChildRunStats>> {
+        if child_workflow_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut tx = talos_db::begin_user_scoped(&self.pool, user_id).await?;
+        let rows = sqlx::query(
+            "SELECT child_workflow_id, \
+                    COUNT(*)::bigint AS runs, \
+                    COUNT(*) FILTER (WHERE status = 'failed')::bigint AS failed, \
+                    MAX(started_at) AS last_started_at \
+             FROM sub_workflow_runs \
+             WHERE child_workflow_id = ANY($1) AND user_id = $2 AND started_at >= $3 \
+             GROUP BY child_workflow_id",
+        )
+        .bind(child_workflow_ids)
+        .bind(user_id)
+        .bind(since)
+        .fetch_all(&mut *tx)
+        .await
+        .context("child_run_stats_since")?;
+        tx.commit().await?;
+
+        let mut out = HashMap::with_capacity(rows.len());
+        for r in &rows {
+            let id: Uuid = r.try_get("child_workflow_id")?;
+            out.insert(
+                id,
+                ChildRunStats {
+                    runs: r.try_get::<Option<i64>, _>("runs")?.unwrap_or_default(),
+                    failed: r.try_get::<Option<i64>, _>("failed")?.unwrap_or_default(),
+                    last_started_at: r.try_get::<Option<DateTime<Utc>>, _>("last_started_at")?,
+                },
+            );
+        }
+        Ok(out)
+    }
+
     /// Delete ledger rows older than `days`, in `SKIP LOCKED` batches,
     /// EXEMPTING any row whose parent execution is pinned in EITHER tier.
     ///
@@ -430,10 +515,14 @@ mod tests {
         }
     }
 
-    /// The disclosure must NAME every kind it claims is unrecorded. A note
-    /// that drifts from the constant is a disclosure that misleads.
+    /// The disclosure must NAME every kind on both sides. A note that drifts
+    /// from the constants is a disclosure that misleads.
+    ///
+    /// The unrecorded half is VACUOUS today (the list is empty), which is
+    /// exactly why the recorded half is asserted too: with nothing unrecorded,
+    /// a note naming no kinds at all would still pass the first loop.
     #[test]
-    fn the_disclosure_names_every_unrecorded_kind() {
+    fn the_disclosure_names_every_dispatch_kind() {
         for kind in UNRECORDED_DISPATCH_KINDS {
             assert!(
                 UNRECORDED_DISPATCH_KINDS_NOTE.contains(kind),
@@ -446,5 +535,11 @@ mod tests {
                 "the operator-facing note does not name the recorded kind {kind}"
             );
         }
+        assert_eq!(
+            recorded_dispatch_kinds().len(),
+            9,
+            "RFC 0012 P2 records nine dispatch kinds; a tenth needs a writer, a CHECK \
+             widening and a line in the note"
+        );
     }
 }
