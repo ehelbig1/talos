@@ -1018,7 +1018,7 @@ pub fn build_report(h: &talos_analytics_repository::HygieneReport) -> HygieneRep
 
     if !deletable_dormant.is_empty() {
         let mut action = format!(
-            "{} enabled workflow(s) have had no executions in 30+ days. Consider disabling or deleting them with batch_delete_workflows to reduce registry noise.",
+            "{} workflow(s) that are enabled and NOT retired have had no executions in 30+ days. Consider disabling or deleting them with batch_delete_workflows to reduce registry noise.",
             deletable_dormant.len()
         );
         if !h.child_scan_unreadable_parents.is_empty() {
@@ -1032,6 +1032,20 @@ pub fn build_report(h: &talos_analytics_repository::HygieneReport) -> HygieneRep
                 h.child_scan_unreadable_parents.len(),
                 h.child_scan_unreadable_parents.join(", "),
             ));
+        }
+        if let Some(archived) = &h.dormant_archived_excluded {
+            if archived.total > 0 {
+                // The count and the LIST agree here — these rows are not shown
+                // above — so what has to be said is that they exist, and that
+                // "consider disabling or deleting them" was being said ABOUT
+                // them until 2026-09-07.
+                action.push_str(&format!(
+                    " A further {} dormant workflow(s) are EXCLUDED from this list and this                       count because an operator has already retired them (status = \'archived\'):                       {}{}. They still read `is_enabled = true` — archiving does not clear that                       column — so a reader of `is_enabled` alone would recommend deleting                       workflows that are already retired.",
+                    archived.total,
+                    archived.names.join(", "),
+                    if archived.truncated { ", …" } else { "" },
+                ));
+            }
         }
         if dormant_children_excluded > 0 {
             // The count and the list deliberately disagree, so say why. A
@@ -1049,6 +1063,11 @@ pub fn build_report(h: &talos_analytics_repository::HygieneReport) -> HygieneRep
             "action": action,
             "affected_count": deletable_dormant.len(),
             "excluded_child_workflows": dormant_children_excluded,
+            // null, never 0, when the retired half could not be read.
+            "excluded_archived_workflows": h
+                .dormant_archived_excluded
+                .as_ref()
+                .map(|x| x.total),
             "deletable": deletable_dormant.iter().map(|r| r.name.clone()).collect::<Vec<_>>(),
         }));
     }
@@ -1442,6 +1461,22 @@ pub fn build_report(h: &talos_analytics_repository::HygieneReport) -> HygieneRep
                 })
             } else {
                 serde_json::Value::Null
+            },
+            // 2026-09-07. The dormant list is a statement about workflows the
+            // operator has NOT retired, and this says how many it stopped
+            // speaking about. Rendered as an object, and NULL rather than 0
+            // when the read failed: `archived_excluded: 0` would claim the
+            // operator has retired nothing, which is the exact shape of the
+            // defect the exclusion exists to fix (the list previously claimed
+            // 8 retired workflows were live enabled ones).
+            "archived_excluded": match &h.dormant_archived_excluded {
+                Some(x) => serde_json::json!({
+                    "count": x.total,
+                    "names": x.names,
+                    "names_truncated": x.truncated,
+                    "note": talos_analytics_repository::DORMANT_ARCHIVED_NOTE,
+                }),
+                None => serde_json::Value::Null,
             },
             "orphaned_secrets_count": count_of("orphaned_secrets", orphaned_secrets.len()),
             "secrets_without_expiry_count": count_of("secrets_without_expiry", secrets_without_expiry.len()),
@@ -2277,6 +2312,46 @@ mod partial_report_disclosure_tests {
         ok.orphaned_secrets = h.orphaned_secrets;
         let r2 = build_report(&ok).report;
         assert_eq!(r2["orphaned_secrets"].as_array().map(Vec::len), Some(1));
+    }
+
+    /// An UNREADABLE retired-half read renders NULL, never 0.
+    ///
+    /// A `0` there says "the operator has retired nothing", which is one word
+    /// away from the sentence this whole exclusion exists to stop the report
+    /// making. The DB test beside this one cannot reach the failed-read arm —
+    /// it would have to break a query mid-report — so this is the instrument
+    /// that covers it.
+    ///
+    /// MUTATION: render `None` as `{"count": 0}`.
+    #[test]
+    fn an_unreadable_archived_exclusion_is_null_not_zero() {
+        let r = report_for(&["summary.archived_excluded"]);
+        assert!(
+            r["summary"]["archived_excluded"].is_null(),
+            "a failed read must not claim nothing is archived: {r}"
+        );
+        assert!(
+            r["measurement"]["not_measured"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|v| v == "summary.archived_excluded")),
+            "…and the failure must be NAMED, not merely nulled: {r}"
+        );
+    }
+
+    /// The other direction: a clean read of an empty retired half renders a
+    /// measured ZERO with the note, so "nothing is retired" and "we could not
+    /// look" are different responses.
+    #[test]
+    fn a_measured_empty_archived_exclusion_is_a_zero_with_its_note() {
+        let r = report_for(&[]);
+        let block = &r["summary"]["archived_excluded"];
+        assert_eq!(block["count"], 0, "{r}");
+        assert!(
+            block["note"]
+                .as_str()
+                .is_some_and(|n| n.contains("is_enabled = true")),
+            "{r}"
+        );
     }
 
     fn dormant(name: &str) -> talos_analytics_repository::DormantWorkflowRow {

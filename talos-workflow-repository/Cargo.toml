@@ -7,6 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+talos-workflow-liveness = { path = "../talos-workflow-liveness" }
 anyhow.workspace = true
 async-trait = "0.1"
 chrono.workspace = true

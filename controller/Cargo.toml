@@ -273,6 +273,7 @@ talos-workflow-engine-test-utils = { path = "../talos-workflow-engine-test-utils
 # a test against the repository row alone cannot see the sentence that names
 # `batch_delete_workflows`.
 talos-hygiene-service = { path = "../talos-hygiene-service" }
+talos-child-workflow-refs = { path = "../talos-child-workflow-refs" }
 # session_start_substantive_draft_tests: drives the REAL `SessionBriefService`,
 # because the defect is what ONE RESPONSE says — the archive sweep and the
 # "ready for publish_version" list are assembled in the same function, and a

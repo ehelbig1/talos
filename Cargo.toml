@@ -6,6 +6,7 @@ members = [
     "talos-audit-event",
     "talos-ssrf-classify",
     "talos-sql-classify",
+    "talos-workflow-liveness",
     # The controller-side home for the worker's `[reason_class=…]` marker:
     # closed token set + remediation-family map. A zero-dependency leaf so
     # the retry classifier, the failure analyser and the ops-alert reconciler

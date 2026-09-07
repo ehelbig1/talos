@@ -8628,6 +8628,120 @@ else
 fi
 echo
 
+bold "▶ check 87: a workflows liveness predicate must name the shared home"
+
+# `workflows` carries TWO columns that both claim to say whether a workflow is
+# live, and they are not the same fact. `is_enabled` is the OPERATOR's pause
+# toggle; `status` is the LIFECYCLE (draft/active/archived). Neither writer
+# touches the other column — the six `UPDATE workflows SET status = 'archived'`
+# sites never clear `is_enabled` and `set_workflow_enabled` never moves
+# `status` — so, measured on the reference fleet 2026-09-07, ALL EIGHT archived
+# rows still read `is_enabled = true`. The hygiene report's dormant query
+# predicated `w.is_enabled = true` with no status clause and listed every one of
+# them under "Consider disabling or deleting them with batch_delete_workflows":
+# of the ten workflows that advice named, EIGHT had already been retired by the
+# operator it was advising.
+#
+# The predicate now has ONE home, `talos_workflow_liveness`, which renders the
+# Rust predicate and its exact SQL twin.
+#
+# WINDOW-scoped, not file-scoped, and that is the whole design. The four
+# sibling queries in `talos-analytics-repository/src/lib.rs` spelled the SAME
+# predicate correctly a fourth way
+# (`is_enabled = true AND (status IS NULL OR status != 'archived')`) in the SAME
+# FILE as the defect, so a file-scoped rule — check 86(a)'s shape — would have
+# been GREEN over it: four correct siblings vouching for a fifth site that
+# forgot. Measured: file-scoped reports 6 on pristine main, of which 3 are the
+# schedules false positive (50% precision) and it ships at 3 markers on correct
+# code; window-scoped reports SEVEN, every one a real `workflows` liveness
+# predicate, 0 false positives, and 0 on the fixed tree.
+#
+# Stated honestly: 7-of-7 against the RULE, 1-of-7 as a BUG detector — the
+# other six were CORRECT and merely unrouted (check 85(b)'s framing).
+#
+# `workflow_schedules.is_enabled` is a DIFFERENT column on a different table
+# (~55 references) and is excluded by the window's `workflow_schedules` test;
+# `webhook_triggers`' column is spelled `enabled`, so it is out of range by
+# name.
+#
+# Stated limits, each confirmed by mutation: TEXTUAL and WINDOW-bounded
+# (1400 chars back, 400 forward), so a statement reflowed past the window, or
+# one assembled with `format!()` from a fragment in another file, reads as
+# ungated — a FALSE POSITIVE, the loud direction; whole-line comments are
+# stripped first, because this crate's own doc block quotes the predicate
+# (check 73's self-report trap, measured: 1 finding before stripping); it proves
+# the home is NAMED in the window, never that the rendered fragment is the one
+# actually bound into the query; and it says nothing about the `status`-only
+# sites, deliberately — 48 of them exist and nearly all are lifecycle filters
+# (`status = 'draft'` for the stale-draft list) rather than liveness decisions,
+# so a wider regex would be enforcement-shaped noise.
+LIVENESS_HOME_FAIL=0
+LIVENESS_HOME_OUT="$(
+    perl -e '
+        use strict; use warnings;
+        my $seen = 0;
+        for my $f (@ARGV) {
+            next if $f =~ m{/tests/} || $f =~ /_tests\.rs$/;
+            open my $fh, "<", $f or next;
+            local $/; my $raw = <$fh>; close $fh;
+            # Strip whole-line comments so a doc block quoting the predicate
+            # cannot self-report, and so a commented-out gate cannot vouch.
+            my @keep = map { /^\s*(\/\/|\*|\/\*)/ ? "" : $_ } split /\n/, $raw, -1;
+            my $src = join "\n", @keep;
+            while ($src =~ /is_enabled = true/g) {
+                my $pos = pos($src);
+                my $start = $pos - 1400; $start = 0 if $start < 0;
+                my $win = substr($src, $start, 1400 + 400);
+                next unless $win =~ /(FROM|JOIN|UPDATE)\s+workflows\b/;
+                next if $win =~ /workflow_schedules/;
+                $seen++;
+                next if $win =~ /talos_workflow_liveness/;
+                next if $win =~ /allow-split-liveness-predicate:/;
+                my $line = 1 + (() = substr($src,0,$pos) =~ /\n/g);
+                print "HIT $f:$line\n";
+            }
+        }
+        print "SEEN $seen\n";
+    ' $(grep -rl --include='*.rs' --exclude-dir=target --exclude-dir=vendor \
+          --exclude-dir=node_modules "${TREE_PRUNE_GREP[@]}" \
+          -F 'is_enabled = true' . 2>/dev/null || true) 2>/dev/null || true
+)"
+# The tripwire has to count BOTH halves. Once a site is routed, the literal
+# `is_enabled = true` disappears from it (the fragment is rendered), so a
+# raw-literal-only tripwire would report "found nothing" on a fully-fixed tree —
+# measured, and it did exactly that on the first version of this check.
+LIVENESS_HOME_RAW="$(printf '%s\n' "$LIVENESS_HOME_OUT" | sed -n 's/^SEEN //p' | head -1)"
+LIVENESS_HOME_ROUTED="$(grep -rl --include='*.rs' --exclude-dir=target --exclude-dir=vendor \
+                          --exclude-dir=node_modules "${TREE_PRUNE_GREP[@]}" \
+                          -E 'talos_workflow_liveness::(live|dispatchable|retired)_sql\(' . 2>/dev/null \
+                        | grep -vc '/tests/' || true)"
+LIVENESS_HOME_SEEN=$(( ${LIVENESS_HOME_RAW:-0} + ${LIVENESS_HOME_ROUTED:-0} ))
+while IFS= read -r hit; do
+    case "$hit" in
+        HIT\ *)
+            red "✗ ${hit#HIT } predicates on workflows.is_enabled without naming talos_workflow_liveness"
+            LIVENESS_HOME_FAIL=$((LIVENESS_HOME_FAIL + 1))
+            ;;
+    esac
+done <<< "$LIVENESS_HOME_OUT"
+if [ "${LIVENESS_HOME_SEEN:-0}" -eq 0 ]; then
+    red "✗ check 87 found neither a raw workflows.is_enabled predicate nor a rendered one"
+    yellow "  → the shape was reworded or the walk is looking in the wrong place;"
+    yellow "    a check that matches nothing is a green tick over zero statements."
+    LIVENESS_HOME_FAIL=$((LIVENESS_HOME_FAIL + 1))
+fi
+if [ "$LIVENESS_HOME_FAIL" -gt 0 ]; then
+    yellow "  → workflows.is_enabled is the OPERATOR's pause toggle and workflows.status is"
+    yellow "    the LIFECYCLE; archiving never clears is_enabled, so a reader of one column"
+    yellow "    calls every retired workflow live. Render the predicate from"
+    yellow "    talos_workflow_liveness::{live_sql,dispatchable_sql,retired_sql}."
+    yellow "  → opt out with // allow-split-liveness-predicate: <reason>."
+    EXIT_CODE=1
+else
+    green "✓ every workflows liveness predicate reads the shared home"
+fi
+echo
+
 bold "▶ check 54: lint self-consistency (check numbering + documented count)"
 ACTUAL_NUMS="$(grep -oE '^bold "▶ check [0-9]+:' "${BASH_SOURCE[0]}" | grep -oE '[0-9]+' | sort -n)"
 EXPECTED_NUMS="$(seq 1 "$CHECK_COUNT")"

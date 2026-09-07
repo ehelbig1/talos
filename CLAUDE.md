@@ -703,6 +703,119 @@ including every fleet total, error rate and cost aggregate. That is a
 platform-wide change, not a report fix, and it is recorded here rather than
 attempted.
 
+**2026-09-07 — a third pair, and the report read one half of it: `workflows.status`
+vs `workflows.is_enabled`.** `get_platform_hygiene_report` recommended *"10 enabled
+workflow(s) have had no executions in 30+ days. Consider disabling or deleting them
+with `batch_delete_workflows`"* and listed them under `deletable`. **EIGHT of the ten
+were `status = 'archived'`** — the operator it was advising had already retired them.
+
+**The mechanism is the readiness-timestamp one exactly.** `is_enabled`
+(`20260314001600`) is the OPERATOR's pause toggle; `status` (`20260318000000`) is
+the LIFECYCLE. Two writers, and neither touches the other's column: the six
+`UPDATE workflows SET status = 'archived'` sites
+(`talos-workflow-repository/src/workflows.rs:963,1346,1357`,
+`talos-advanced-repository/src/lib.rs:1880,2362`,
+`talos-actor-repository/src/lib.rs:1071`) never clear `is_enabled`, and
+`set_workflow_enabled` never moves `status`. Measured on the reference fleet
+2026-09-07: `active/t 17, archived/t 8, draft/t 11` — **every archived row still
+reads `is_enabled = true`**. The dormant query predicated `w.is_enabled = true`
+with NO status clause; reproduced verbatim against the live database it returns 13
+rows, 8 of them archived, and minus #760's three child exclusions that is the 10
+the recommendation named.
+
+**The columns are deliberately NOT collapsed and there is NO migration flipping
+`is_enabled` on archived rows** — the readiness-timestamp argument applies
+unchanged: the two writers record two different operator acts, one column cannot
+say which happened, and a backfill would relabel eight archives as pauses that
+never occurred. The READER changed.
+
+**The predicate has ONE home**, the leaf crate `talos-workflow-liveness`
+(no dependencies), and it is TWO predicates rather than one, because the second is
+not a weaker version of the first:
+* `is_live` = `status = 'active' AND is_enabled` — published and not paused.
+* `is_dispatchable` = `status <> 'archived' AND is_enabled` — what the PLATFORM can
+  still run. A DRAFT counts: a parent dispatches a child's `graph_json` column with
+  no version join and no status predicate (the "does a child's `draft` status mean
+  anything at runtime?" entry above), and **4 draft workflows on this fleet carry
+  enabled schedules and fire today**, so folding draft into "not live" for an
+  operational population would be wrong in the loud direction.
+
+The Rust predicates are EXACT twins of `live_sql` / `dispatchable_sql` /
+`retired_sql`, including on an unrecognised `status` — the column has **no CHECK
+constraint**, so `WorkflowLifecycle::Unknown` is a real state (one live query still
+filters `status = 'published'`, a value nothing writes, and the pre-existing
+`dormant_child_workflow_tests` seeds exactly that). An unknown status is NOT live
+and IS dispatchable on both sides; `rust_and_sql_agree_on_every_status` EVALUATES
+the rendered fragment rather than comparing strings, so the asymmetry is pinned as
+the SQL's rather than quietly fixed on one side.
+
+**Five sites now read it**, and the count is the point: the analytics file already
+spelled the same predicate correctly FOUR times
+(`is_enabled = true AND (status IS NULL OR status != 'archived')` — the `status IS
+NULL` arm dead, since the column is `NOT NULL`, verified against the live catalog)
+while the fifth, the dormant query, forgot. `scan_child_parents` and
+`list_enabled_graph_json_for_boot_warmup` were right too and spelled it a fifth and
+sixth way (`!=` and `<>`, in two crates). Six correct sites, three spellings, one
+defect between them.
+
+**EXCLUDED is not DROPPED.** `summary.archived_excluded` carries the count, up to 25
+names, `names_truncated` and a note; the cleanup recommendation's sentence names
+them and says why its list is shorter; `affected_count` now equals what `deletable`
+contains. The read is a SEPARATE statement over the SAME window and the SAME
+dormancy test with `status = 'archived'` instead — a subset of what the list
+scanned, by construction — and `count(*) OVER ()` carries the true total past the
+name cap. A FAILED read renders **null, never 0**: `archived_excluded: 0` claims the
+operator has retired nothing, which is one word away from the sentence this
+exclusion exists to stop the report making. That arm is unreachable from a DB test,
+so `an_unreadable_archived_exclusion_is_null_not_zero` drives the pure renderer with
+a ledger that marks the field unmeasured — it was a **measured SURVIVOR** of the DB
+suite before that test existed.
+
+**What was measured and NOT changed, and it is the severity of the whole class.**
+No execution path in this workspace filters on `workflows.status` at all. Proved
+with a scratch row — an archived workflow with `is_enabled = true`, an enabled
+schedule due one minute ago and an enabled webhook — driven through the VERBATIM
+production SQL: the scheduler due query (`talos-scheduler/src/lib.rs:1104`), the
+post-due workflow load (`:1584`), the webhook dispatch read
+(`talos-webhooks/src/router.rs:1763`), `resolve_by_capabilities` and
+`WorkflowGraphStore::get_graph` **ALL returned it**. So archiving does not stop a
+workflow being scheduled, webhook-triggered, capability-dispatched,
+chain-dispatched, sub-workflow-dispatched, called, triggered or enqueued;
+`is_enabled` is the only execution-path gate and it is enforced in RUST, never in
+SQL, at four places (`trigger.rs:203`, `call_workflow`, `trigger_workflow_as_actors`,
+`is_workflow_enabled` for retry/replay), while `bulk_trigger_workflow` and
+`enqueue_workflow` have none. The SCHEDULER reads neither `workflows` column, so
+`disable_workflow` does not stop a scheduled run either — the schedule's own
+`is_enabled` is the pause control there. **LATENT on this fleet**, stated plainly:
+the 8 archived rows have 0 enabled schedules and 0 enabled webhooks. Closing it is a
+fleet-wide behaviour change with its own blast radius (those 4 draft schedules among
+them), not a report fix, and it is recorded rather than attempted. `fix_all` and
+`session_start`'s draft sweep were checked and are unaffected: both key on
+`status = 'draft'`, a lifecycle filter that excludes archived rows by construction.
+
+**Check 87 was BUILT, MEASURED and SHIPPED, and the numbers say why it is
+window-scoped.** *"A `workflows` liveness predicate must name the shared home."*
+FILE-scoped it reports **6** on pristine main of which **3** are the
+`workflow_schedules.is_enabled` false positive (50% precision, shipping at 3 markers
+on correct code) — and worse, it would have been GREEN over the defect once any one
+of the four correct siblings in the same file named the home, which is check 86(a)'s
+stated limit becoming fatal. WINDOW-scoped (1400 chars back, 400 forward, whole-line
+comments stripped, `workflow_schedules` windows excluded) it reports **SEVEN on
+pristine main, every one a real `workflows` liveness predicate, 0 false positives,
+and 0 on the fixed tree**. Stated honestly: **7-of-7 against the RULE, 1-of-7 as a
+BUG detector** — the other six were correct and merely unrouted (check 85(b)'s
+framing). `--count` moves to **87**.
+
+Three mutations, all red: reinstating the dormant defect reports it at that exact
+line; a COMMENTED-OUT gate does not vouch (whole-line comments are stripped first —
+check 73's trap, which cost this check one false finding on its own doc block before
+the strip went in); and a tree where the shape has vanished FAILS LOUDLY rather than
+passing. That third one needed a two-part tripwire and the first version got it
+wrong in the reassuring direction: once a site is ROUTED the literal
+`is_enabled = true` disappears from it, so a raw-literal-only tripwire reported
+"found nothing" on the fully-fixed tree — measured, not imagined. It now counts raw
+windows PLUS rendered `*_sql(` call sites.
+
 **2026-09-06 — the ANSWER: `sub_workflow_runs`, the child-run ledger (RFC 0012 P1).**
 Everything above this line teaches a reader to say *"no evidence"* instead of
 *"never ran"*. None of it can ANSWER the question, and the structural question
@@ -1104,6 +1217,50 @@ the tool description, not in a CHECK), and such a row is now evaluated and fires
 nothing rather than being a special case. The report's in-flight denominator
 stays as it is, disclosed. And the two latency-percentile readers stay separate,
 for the reason above.
+
+**2026-09-07 — the report contradicted itself the moment child runs crossed the
+floor.** P3 gave `get_workflow_sla_report` a population that spans both tables;
+`sample_size_warning` was left keyed on `total_executions == 0`. Two decisions, one
+response. Measured live on `pa-quality-judge` (0 execution rows, 3 ledger runs,
+floor 3) and reproduced against the real pure renderer: `success_rate.actual: 100.0`,
+`met: true`, `child_runs.counted_in_success_rate: true`, and fourteen lines below,
+*"No executions at all in the trailing 30 day(s), so nothing about this workflow's
+SLA was measured. The success rate, the latency percentiles and the compliance
+verdict are all null"* — then, appended, *"The RFC 0012 child-run ledger DOES hold 3
+run(s)"*. Below the floor (n = 2) the same sentence is CORRECT, because
+`rate_total` is 0 there by construction, which is why nothing looked wrong.
+
+The warning is now derived from `rate_total`, the success-rate block's own
+denominator. `sample_n == 0` keeps today's wording **byte-identical**; `sample_n > 0
+&& total_executions == 0` gets a new sentence saying the rate WAS measured over N
+child runs, that the LATENCY half is what the empty execution table costs, and what
+`compliance_status` is — every clause derived from the values actually rendered
+(`p99_ms`, `in_compliance`), never asserted, so a caller who passes a p99 with no
+execution rows is not told a falsehood about it.
+
+**A second defect of the same keying, found by the same measurement**: `total_u == 0`
+short-circuited the whole `else if` chain, so at n = 3 against a 99% target the
+STATISTICAL qualification (`min_n_for_meaningful_target` = 100) was unreachable — the
+one measured verdict on the surface was rendered with no sufficiency qualification at
+all. The sufficiency sentence now has ONE home, a local closure consulted by both
+branches, and its denominator is `sample_n`; where that is wider than
+`total_executions` the population is NAMED, and where they are equal the sentence is
+byte-identical to the pre-fix one (pinned by
+`an_execution_only_report_keeps_the_pre_fix_sufficiency_sentence`, which asserts the
+whole string).
+
+**The rest of the response was grepped against the basis**, per the brief. Four other
+sites read `reads.total == 0`: `ledger_below_floor` (the population decision itself),
+the `child_runs` block's emission condition, and the two `population` strings — each
+states its OWN population and is correct. `compliance_note` keys on
+`in_compliance.is_none()`, i.e. on the basis, and at the floor it correctly reports
+the LATENCY component as the unmeasured one. Nothing else changed.
+
+Four mutations, all red: keying the first branch on `total_u == 0` again; keying it
+on `child.total == 0`; passing `total_u` to the sufficiency closure; emitting the
+wider-population clause unconditionally. **No lint** — the population is one renderer
+and the guard is four unit tests over the real pure function; `--count` moves to 87
+for leg X1's check only.
 
 ## The verifier that could never read the ledger it verified (#767)
 
@@ -2162,7 +2319,7 @@ shared across MCP and GraphQL ctx. Remaining structural work below:
 - **Tests that hit async code** need `#[tokio::test]`, not `#[test]`. `sqlx::PgPoolOptions::connect_lazy` panics outside a Tokio runtime.
 
 ## Pre-deploy validation
-- **`make lint` enforces structural rules** via `scripts/lint-structural.sh`. 86 checks today (the authoritative, inline-documented list lives in the script; `bash scripts/lint-structural.sh --count` prints the live number, and check 54 fails the lint if this sentence's count goes stale), each tied to a specific past regression so it catches at PR-time the class of bug that survives `cargo check` cleanly but breaks at CI or request time:
+- **`make lint` enforces structural rules** via `scripts/lint-structural.sh`. 87 checks today (the authoritative, inline-documented list lives in the script; `bash scripts/lint-structural.sh --count` prints the live number, and check 54 fails the lint if this sentence's count goes stale), each tied to a specific past regression so it catches at PR-time the class of bug that survives `cargo check` cleanly but breaks at CI or request time:
   1. raw `actor_memory` writes + legacy `value`-column projections outside `talos-memory/`
   2. bidirectional `controller/src/main.rs` route ↔ `deploy/helm/talos/templates/frontend/configmap.yaml` location alignment (opt-outs: `// no-nginx-route`, `# no-controller-route`)
   3. legacy `__agent_context__` key regressions (canonical is `__actor_context__`; opt-out `// allow-agent-context-key`)
@@ -2264,6 +2421,8 @@ shared across MCP and GraphQL ctx. Remaining structural work below:
   75. whole-tree lint scans must prune second checkouts — a repo-root `find .` / `grep -r … .` inside this script descends into `.claude/worktrees/<session>/`, which holds OTHER branches' source. It is not merely noise: every path-anchored exemption here names a path relative to the repo root, so under a worktree prefix the ONE legal implementation stops being recognised and BYTE-IDENTICAL code is reported as a violation. **Measured 2026-09-02 on a tree with six sibling worktrees (5,518 extra `.rs` files): 110 red lines where the same tree alone produces 0 — 108 prefixed `.claude/worktrees/`, and the two that were not were the INFLATED summary count (`41 private copy(ies) of a SHA-256 → UUID derivation`, true value 0) and the failure verdict.** So the number an operator would act on is wrong in the same direction as the noise, and the run cost 4:05 instead of 2:10. This is a CLASS: eleven scans pruned `.claude` by hand and the ten added after them did not — checks 58/65(c), 68, 69, 71, 73 and 74b, the last of them two days old; three fired falsely and the other seven were latent, with 58/65(c) failing in the QUIET direction (a worktree copy supplies registration evidence, so an alert on a metric this tree never registers reads as covered). All 21 repo-root scans now share ONE definition — `TREE_PRUNE_FIND` / `TREE_PRUNE_GREP` at the top of the script — so the next scan inherits the answer instead of re-deciding it; per-check prunes (`target`, `vendor`, `node_modules`) stay at the site because they vary by check and are not about second checkouts. Three directions, because "uses the shared list" is worth only as much as the list being real and the detector seeing anything: **(a)** every repo-root scan statement names one of the arrays; **(b)** both arrays are non-empty and both name `.claude` (an emptied array would silence (a) at every site at once); **(c)** the detector must MATCH SOMETHING — a scan-shape change that made the walk unrecognisable would otherwise leave a green tick over zero statements, checks 64/65's lesson. **Verified by running the check against the ORIGINAL script: it reports all 21 repo-root scans and 0 after.** That 21 is the honest number and worth stating plainly rather than quoting the 10: the rule is the SHARED LIST, not "some prune", so the 11 hand-pruned sites are findings too — they spell the same intent four different ways (`'*/.claude/*'`, `'./.claude/*'`, `--exclude-dir=.claude`, and one that pruned `.git` but not `.claude`) and each spelling is a place the next copy can drift. Ten of the 21 were genuinely blind to `.claude`; the other eleven were correct and are now unable to become incorrect independently. Stated limits, confirmed by mutation: it is TEXTUAL and statement-scoped (line plus backslash continuations), so a scan whose root arrives in a VARIABLE (`find "$dir"`) is invisible — deliberately, since a scoped `$dir` is the common and correct case; it proves the array is REFERENCED, never that the reference sits in an effective position (`"${TREE_PRUNE_FIND[@]}"` after a `-print0` would satisfy it); and `rg` / `fd` / `git grep` are out of range — `git grep` needs no prune because it reads TRACKED files and a worktree checkout is not tracked here, which is why check 72 is not on the list. `.claude` is pruned WHOLESALE rather than just `.claude/worktrees/`: only two files under it are tracked (`hooks/session-start.sh`, `settings.json`) and neither is `.rs`, so the coverage cost is nil. Opt-out `# allow-unpruned-tree-scan: <reason>` on the statement's first line.
   85. "does this SQL mutate?" must have exactly ONE implementation — the question is asked on BOTH sides of `talos.database.query`, and the two sides answered it DIFFERENTLY. #757 fixed the CONTROLLER (an AST walk breaking on any nested non-`Query` statement) and left the WORKER — the documented PRIMARY fence — matching the STRING `"SELECT" | "EXPLAIN"` against `sql_validator`'s TOP-LEVEL statement label. sqlparser 0.53 + `PostgreSqlDialect` parses `WITH ins AS (INSERT INTO t VALUES (1) RETURNING a) SELECT * FROM ins` as a `Statement::Query`, so that label is `"SELECT"`, so the worker classified a `readonly` actor's INSERT as a READ and forwarded it; only the controller's newer gate stopped it. **Measured on pristine main, driving the real path (`validate_sql_with_policy` → the gate's own predicate): the INSERT and UPDATE CTE forms both returned "permitted as read", with plain `SELECT`/`INSERT` as passing controls.** The classification now lives in `talos-sql-classify` (a leaf crate: `sqlparser` and nothing else, `SqlAccess::{ReadOnly, Mutates{nested}, Unclassified}`, `Unclassified` failing closed) and both consumers call in; the worker gets its verdict from `ValidatedStmt.access`, computed off the AST the validator already parsed, so the classifier costs a tree walk and not a second parse. **The same measurement found a SECOND, wider hole in the same function family, on a different control**: `enforce_cte_mutation_policy` guarded its allowlist test behind `if !allowed_operations.is_empty()`, so an EMPTY allowlist fell through to `Ok(())` and admitted a writable CTE — while the top-level path refuses a bare `INSERT` under the identical configuration, `EmptyAllowlistPolicy::DenyMutations` being the production default whose documented contract is "only SELECT passes when the allowlist is empty". Not a corner case: `allowed_sql_operations` is hardcoded `vec![]` at EVERY dispatch site in the workspace, so the empty allowlist is the ONLY configuration the fleet has, and the bypass was live for every database-world module INDEPENDENT of the actor's write ceiling. Five legs: **(a)** the deleted private predicate `sql_stmt_type_is_read_only` must stay deleted (check 68(c)'s shape); **(b)** a file CALLING the `database-query` write-ceiling gate must name `talos_sql_classify` — without it, (a) is defeated in one line by re-deriving the verdict under a new name at the same call site (check 69(a)'s shape); **(c)** `sqlparser` may be a direct dependency of only the three crates that legitimately parse SQL, because a fourth classifier would be born in a fourth crate (check 67(b)'s shape); **(d)** no non-comment line may pair the literals `"SELECT"` and `"EXPLAIN"`; **(e)** the worker's SQL host file may not build a predicate out of `validated.stmt_type`. **Legs (d) and (e) exist because MUTATIONS beat everything else here, and that is the part of this entry worth remembering.** The first version of the worker tests drove a helper that RE-DERIVED `!validated.access.is_read_only()` instead of calling the gate, so reverting the gate's CALL SITE to the old inline `matches!(validated.stmt_type.as_str(), "SELECT" | "EXPLAIN")` passed all 635 crate tests and legs (a)–(c) — (a) pins an identifier the inline form never mentions, and (b) was satisfied because the file still named the crate elsewhere. That is `guard_that_passes_its_own_mutation` in this project's own notes. Three things closed it, and each covers what the others cannot: the decision was EXTRACTED into `write_ceiling_audit_target` so the expression the tests drive IS the expression `execute_query` evaluates (mutation M4, gutting that function, fails 2 tests); the call site's invertible boolean was REMOVED — the gate is now an `if let` over a function returning the audit LABEL, which also ties the string handed to `write_ceiling_refuses` to the call that decided to refuse, instead of fetching it separately from a field that means something else; and legs (d)/(e) grep for the two spellings a call-site revert takes, because a test can always be bypassed by inlining a different expression at the call site while a grep for that expression cannot. **A SECOND survivor was then measured and closed the same way**: a single-literal revert (`!matches!(validated.stmt_type.as_str(), "SELECT")`) beat the tests AND legs (a)–(d); leg (e) reports it at the mutated line, as it reports the `.then_some(...)` variant that survives the `if let` restructure. **Measured in both directions against a `git archive` extract of a4caecf9, reported as they came out: leg (a) 9 lines in 1 file there / 0 after; leg (b) 2 files there — of which only ONE is a defect, the worker's, the controller's being a correct implementation reported only because the shared crate did not yet exist for it to name — so 2-of-2 against the RULE, 1-of-2 as a BUG detector, 0 after; leg (d) 1 there / 0 after / 1 on the mutated tree; leg (e) 0 there (the pre-fix predicate took its argument as a bare `&str`, so leg (e) would NOT have caught the original bug — it is a REGRESSION guard for a seam the fix created, not a detector of what was there) / 0 after / 1 on each of the two mutated trees. Leg (c) ships at ZERO and is PROPHYLACTIC: it found nothing on either tree**, which is worth saying plainly rather than implying it caught something. **What was BUILT AND REJECTED on measurement**, so it is not rebuilt: the obvious detector — a `matches!` over `Statement::Insert | Update | Delete | Merge` outside the classifier crate — reports **20 lines across 2 files on the FIXED tree and every one is legitimate** (`statement_type`, `always_blocked_label`, `statement_returns_rows`, `is_ddl`, `controller_permits_data_statement`, `statement_type_label`), because those answer a DIFFERENT question — which statement KIND is this, for the allowlist, the audit target and the error text — whose right answer really is top-level only. 0% precision; enforcement-shaped noise. **Stated limits, each confirmed by mutation rather than inferred:** all five legs are TEXTUAL; (a) pins ONE identifier, so a differently-named private copy is invisible; (b) fires on the FILE not the call, so its opt-out also blinds that file to a future gate, and it proves the classifier is NAMED, never that the decision flows from it; (c) sees only direct `[dependencies]`, so a re-export is invisible; (d) pins the two-literal spelling, which the single-literal survivor above walked straight past — that is why (e) exists — and (e) is scoped to ONE file and pins the receiver `validated.stmt_type`, so a revert routed through a local binding (`let t = validated.stmt_type.as_str();`) evades it; closing THAT needs dataflow, not a grep, and the honest position is that the gate's shape (no boolean, one named decision, tests on that decision) is the primary guard and these legs are the cheap second copy. And NO leg can see the shape that already exists and is correct — `sql_validator::check_query_for_mutations` is a hand-rolled recursive walk over `SetExpr`, and a read-only verdict rebuilt in that style would evade all three (the guard against that is the shared crate's pinned `CORPUS`, not this grep). Two decisions are RECORDED rather than assumed, in named tests: `SELECT … FOR UPDATE` is `ReadOnly` (it takes row locks but writes no rows, and the enclosing transaction commits immediately), and function side effects (`SELECT nextval('s')`) are OUT OF RANGE for a statement-shape classifier — the worker's expression-level `check_disallowed_functions` deny-list is the surface that can see those. `EXPLAIN` moves from read to non-read, which changes NO live decision because `always_blocked_label` refuses every EXPLAIN before the gate (pinned by `explain_never_reaches_the_ceiling_gate`). F4, measured not asserted: sqlparser's own `DEFAULT_REMAINING_DEPTH = 50` refuses nesting past depth ~48, and in a RELEASE build a 3 500-deep 124 KB input parses to `Err` with no stack overflow on a 2 MiB (tokio worker default) or 8 MiB stack — the same input DOES overflow a 2 MiB stack under a DEBUG build, a `cargo test`/dev-binary hazard rather than a production one, which is why the depth test pins the RECURSION LIMIT (identical in both profiles) instead of asserting "no overflow" under a small stack, an assertion whose outcome the build profile would decide. Opt-outs `// allow-forked-sql-classifier: <reason>` (b), `# allow-new-sqlparser-dep: <reason>` (c); leg (a) has none — a second copy of this predicate has no legitimate form.
   86. a "never executed" predicate must not drive a destructive draft path — `execute_subworkflow_graph` runs a child IN-PROCESS and records no `workflow_executions` row (measured 2026-09-05: zero rows carrying `parent_execution_id`, live table and archive, platform-wide), so `NOT EXISTS (SELECT 1 FROM workflow_executions …)` does not mean *this workflow never ran*, it means *nothing in that table can tell you*. Three statements are built on it and two of them ACT: `fix_all confirm=true` DELETES irreversibly, and `session_start`'s auto-archive ARCHIVES with no confirmation. #758 fixed the 30-day dormant list, classified these two as "latent today — no draft child on the fleet", and **the first live report after it deployed listed the flagship's daily `team_gather` sub-workflow under a delete instruction** — the latency claim had been measured with the query that was already fixed. Two legs, because either alone is defeated: **(a)** FILE-scoped — any non-test file carrying the predicate must name the child-reference chokepoint (`scan_child_parents` / `talos_child_workflow_refs` / `ChildReferenceScan` / `child_protection_reason`). File-scoped and not windowed because the analytics SELECT feeds a delete decision made ~180 lines later and three crates away, which no window can see. **(b)** SITE-scoped on the DESTRUCTIVE verb — an `UPDATE`/`DELETE` statement carrying the predicate must have the chokepoint within 40 lines; without it, (a) lets a new destructive statement ride into an already-gated file. **Measured in both directions against a `git archive` of `origin/main`: leg (a) 2 findings (`talos-advanced-repository`, `talos-analytics-repository`), leg (b) 1 (`archive_stale_drafts`'s UPDATE) — every one real, 0 false positives — and 0 on the fixed tree.** Leg (b)'s statement-head walk starts ABOVE the predicate line and had to: the predicate's own `SELECT 1 FROM workflow_executions` was matching as the statement head, and **the first version of this leg therefore reported 0 on the pre-fix tree** — the gate-that-doesn't-gate shape (#624, checks 64/65) inside the guard for it, caught only because the leg was run against the real pre-fix tree instead of a mutation. Mutation-proved three further ways on the fixed tree: renaming the chokepoint away from the archive UPDATE fires (b) at that exact line while (a) stays silent (the file still names it elsewhere — which is precisely why (b) exists); a new destructive statement in a brand-new crate fires BOTH; and a tree where the predicate matches nothing at all FAILS LOUDLY rather than passing, since a check that matches nothing is a green tick over zero statements. **Stated limits, each confirmed rather than inferred:** both legs are TEXTUAL, so a predicate assembled with `format!()` or spelled differently (`NOT EXISTS(SELECT`, a `LEFT JOIN … IS NULL`) is invisible; **(a)'s file scope means one gated site vouches for every site in that file, and there is such a site TODAY** — `AdvancedRepository::get_draft_workflows`, deliberately left child-blind as a report-only path, sits in the same file as the gated archive method, so a fourth DESTRUCTIVE statement added to that file would be seen by (b) but not by (a) (it carries no opt-out marker precisely because (a) matches one file-globally); (b)'s 40-line window and 25-line head walk mean a reflowed statement reads as ungated — a FALSE POSITIVE, the loud direction; and neither leg can prove the scan's ANSWER is honoured, only that the chokepoint is named — a `protection_for(id)` whose result is discarded satisfies both, which is why the behaviour is pinned by `controller/tests/stale_draft_child_workflow_tests` driving the real `fix_all` planning path AND `confirm=true` against a real row. Opt-out `// allow-execution-blind-draft-path: <reason>` — file-globally for (a), within the 40-line window for (b).
+
+  87. a `workflows` liveness predicate must name the shared home — `workflows` carries TWO columns that both claim to say whether a workflow is live and they are not the same fact: `is_enabled` (`20260314001600`) is the OPERATOR's pause toggle, `status` (`20260318000000`) is the LIFECYCLE. Neither writer touches the other's column — the six `UPDATE workflows SET status = 'archived'` sites never clear `is_enabled` and `set_workflow_enabled` never moves `status` — so, measured on the reference fleet 2026-09-07, **all eight archived rows still read `is_enabled = true`** (`active/t 17, archived/t 8, draft/t 11`). The hygiene report's dormant query predicated `w.is_enabled = true` with no status clause and listed every one of them under *"Consider disabling or deleting them with `batch_delete_workflows`"*: of the TEN workflows that advice named, EIGHT had already been retired by the operator it was advising. The predicate now has ONE home, the leaf crate `talos-workflow-liveness`, which renders the Rust predicate and its exact SQL twin (`live_sql` / `dispatchable_sql` / `retired_sql`), with `rust_and_sql_agree_on_every_status` EVALUATING the rendered fragment rather than comparing strings. **WINDOW-scoped, not file-scoped, and that is the whole design**: the four sibling queries in `talos-analytics-repository/src/lib.rs` already spelled the same predicate correctly a FOURTH way (`is_enabled = true AND (status IS NULL OR status != 'archived')` — the `status IS NULL` arm dead, the column being `NOT NULL`) in the SAME FILE as the defect, so a file-scoped rule — check 86(a)'s shape — would have been GREEN over it: four correct siblings vouching for a fifth site that forgot. **Measured in both directions: file-scoped reports 6 on pristine `origin/main` of which 3 are the `workflow_schedules.is_enabled` false positive (50% precision, shipping at 3 markers on correct code); window-scoped reports SEVEN, every one a real `workflows` liveness predicate, 0 false positives, and 0 on the fixed tree.** Stated honestly, and it matters: **7-of-7 against the RULE, 1-of-7 as a BUG detector** — the other six were CORRECT and merely unrouted (check 85(b)'s framing). Mutation-proved three ways: reinstating the dormant defect reports it at that exact line; a COMMENTED-OUT gate does not vouch (whole-line comments are stripped first — check 73's self-report trap, which cost this check one false finding on its own doc block before the strip went in); and a tree where the shape has vanished FAILS LOUDLY. That third leg needed a two-part tripwire and the first version got it wrong in the REASSURING direction — once a site is routed the literal `is_enabled = true` disappears from it, so a raw-literal-only tripwire reported "found nothing" on the fully-fixed tree (measured, not imagined); it now counts raw windows PLUS rendered `*_sql(` call sites. **Stated limits, each confirmed by mutation**: TEXTUAL and WINDOW-bounded, so a reflowed statement or one assembled from a fragment in another file reads as ungated — a FALSE POSITIVE, the loud direction; `workflow_schedules.is_enabled` (~55 references) is excluded by the window's own `workflow_schedules` test and `webhook_triggers`' column is spelled `enabled`, so both are out of range; it proves the home is NAMED in the window, never that the rendered fragment is the one bound into the query; and it says NOTHING about the 48 `status`-only sites, deliberately — nearly all are lifecycle filters (`status = 'draft'` for the stale-draft list) rather than liveness decisions, so a wider regex would be enforcement-shaped noise. **What it cannot reach, recorded rather than implied**: no EXECUTION path filters on `workflows.status` at all — proved with a scratch row against the verbatim scheduler due query, the post-due load, the webhook dispatch read, `resolve_by_capabilities` and `WorkflowGraphStore::get_graph`, all five of which returned an archived workflow. Latent on this fleet (the 8 archived rows have 0 enabled schedules and 0 enabled webhooks) and left alone as a fleet-wide behaviour change, not a report fix. Opt-out `// allow-split-liveness-predicate: <reason>` within the window.
 
 - **Deleting a test file? Grep the CI workflows first.** `quality.yml` names individual integration targets by hand (`cargo nextest run -p controller --test <name>`), so removing a test file makes `cargo test --no-run` fail with `no test target named <name>` (exit 101) even though the code is fine — it failed the whole Rust-unit check in PR #567 after the circuit-breaker self-test was deleted. `grep -rn "<test_name>" .github/ Makefile` before deleting.
 - **A registered Prometheus metric with zero increment sites is DEAD — an alert on it silently never fires.** `talos_workflow_executions_total` was registered in `talos-metrics` but never incremented anywhere, so the failure-rate alert built on it would never have fired (found + fixed 2026-07-24: wired it at the `mark_execution_completed`/`_failed` chokepoints in both repo crates, counted only on a real row transition). When adding an alert, confirm the metric has a live `.with_label_values(&[…]).inc()` (or `.inc()`) call site — not just a `CounterVec::new` + `registry.register`. Now enforced by structural lint **check 58**.

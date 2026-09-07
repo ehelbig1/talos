@@ -308,6 +308,13 @@ CTRL_TESTS=(
     # Renders the REAL recommendation from a REAL HygieneReport; `common`
     # harness, so CTRL_TESTS (64b).
     "dormant_child_workflow_tests"
+    # The OTHER column. `workflows` carries two liveness columns and the dormant
+    # query read one: archiving never clears `is_enabled`, so 8 already-retired
+    # workflows were listed under a delete recommendation. Drives the REAL
+    # hygiene query, the REAL rendered recommendation, the child scan and the
+    # boot warmup, each with its own control; `common` harness, so CTRL_TESTS
+    # (64b).
+    "workflow_liveness_hygiene_tests"
     # The same blindness on the OTHER draft population #758 called latent: the
     # 7-day `stale_draft_workflows` list, which feeds fix_all's IRREVERSIBLE
     # auto-delete and session_start's auto-archive. Drives the REAL fix_all

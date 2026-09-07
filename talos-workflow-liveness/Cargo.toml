@@ -1,0 +1,13 @@
+[package]
+name = "talos-workflow-liveness"
+description = "The one home for 'is this workflow live?' — the workflows.status / workflows.is_enabled pair, as a Rust predicate and as the SQL twin of it"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true
