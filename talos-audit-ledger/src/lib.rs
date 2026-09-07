@@ -15,7 +15,8 @@ use std::time::Duration;
 // `pub use` so consumers (e.g. the talos-api GraphQL admin query) can name the
 // report types without a direct dep on talos-audit-event.
 pub use talos_audit_event::{
-    audit_verify_keys, verify_chain, AuditEvent, ChainBreak, ChainVerificationReport,
+    audit_verify_keys, verify_chain, AttemptChainReport, AuditEvent, ChainBreak,
+    ChainVerificationReport,
 };
 
 pub mod batch_dedupe;
@@ -842,6 +843,21 @@ pub struct ChainSweepStats {
     /// landed in, so a chain with a REAL break AND a redelivery shows up in
     /// both numbers rather than having the redelivery hidden by the break.
     pub duplicate_delivery: usize,
+    /// Chains holding MORE THAN ONE controller dispatch attempt.
+    ///
+    /// A re-dispatch re-uses the `job_id`, and the worker that picks it up is
+    /// credential-free — it cannot read the prior dispatch's ledger, so it
+    /// opens a fresh chain at `sequence_num` 1 under the same prefix. Before
+    /// the attempt reached the wire that shape was reported as
+    /// `DuplicateSequence`, i.e. CRITICAL tamper evidence, for a job that had
+    /// merely been retried. Now it is a partition, and this is the number that
+    /// says how often it happens.
+    ///
+    /// Reported BESIDE the verdict, never inside it: such a chain verifies and
+    /// lands in `verified_ok`. Counted independently of the arm the job landed
+    /// in, so a chain with a REAL break AND two attempts shows up in both
+    /// numbers — the same rule `duplicate_delivery` follows.
+    pub multi_attempt: usize,
     /// Executions whose chain could not be read (S3/IO error) — unverified.
     pub errored: usize,
     /// The row cap bound: there were AT LEAST `scanned` executions in the
@@ -1060,6 +1076,23 @@ fn record_chain_verification_outcome(
     // break must still report the redelivery rather than have it swallowed by
     // the louder finding.
     if let Ok(report) = &outcome {
+        // Counted BEFORE the arms and independently of them, for the same
+        // reason as the redelivery count below it: how many dispatches a job
+        // took is a property of the chain, not of the verdict.
+        let attempts = report.dispatch_attempt_count();
+        if attempts > 1 {
+            stats.multi_attempt += 1;
+            inc_chain_multi_attempt();
+            tracing::info!(
+                target: "talos_audit",
+                event_kind = "audit_chain_multi_attempt",
+                module_execution_id = %target.module_execution_id,
+                workflow_execution_id = %target.workflow_execution_id,
+                ledger_key_space = LEDGER_KEY_SPACE,
+                dispatch_attempts = attempts,
+                "a job's audit prefix holds one chain PER CONTROLLER DISPATCH ATTEMPT —                  the controller re-dispatched this job_id and the credential-free worker                  could not know it, so each dispatch opened a fresh chain at sequence 1                  against the same genesis. Each is verified as its own chain. This is a                  RETRY, not tamper evidence."
+            );
+        }
         let duplicates = report
             .breaks
             .iter()
@@ -1177,6 +1210,15 @@ fn inc_chain_duplicate_delivery() {
     }
 }
 
+/// Count one job chain found holding more than one controller dispatch attempt.
+///
+/// No alert selects this series, deliberately: see the counter's HELP text.
+fn inc_chain_multi_attempt() {
+    if let Some(m) = talos_metrics::global() {
+        m.audit_chain_multi_attempt_jobs_total.inc();
+    }
+}
+
 /// Count one unverifiable chain, by classified reason.
 ///
 /// Inert when `talos_metrics::set_global` has not run, per the
@@ -1288,6 +1330,7 @@ fn publish_sweep_snapshot(stats: &ChainSweepStats) {
         empty: stats.empty,
         failed: stats.failed,
         duplicate_delivery: stats.duplicate_delivery,
+        multi_attempt: stats.multi_attempt,
         errored: stats.errored,
         unbound: stats.unbound,
         cap_hit: stats.cap_hit,
@@ -2322,6 +2365,7 @@ mod inline_verify_tests {
             payload: "p".into(),
             previous_hash: "g".into(),
             hmac_signature: None,
+            dispatch_attempt: 0,
         }
     }
 
@@ -2400,9 +2444,29 @@ mod inline_verify_tests {
 mod audit_verification_metric_tests {
     use super::*;
 
+    /// Serialises every test in this module that reads a global counter DELTA.
+    ///
+    /// Asserting deltas rather than absolutes — the rule the doc below states —
+    /// is necessary and NOT sufficient: the registry is process-global and
+    /// `cargo test` runs these on parallel threads, so another test crossing
+    /// the window between `before` and `after` moves the delta regardless.
+    /// That was latent while the module held four such tests and became a
+    /// reproducible flake at six (measured 2026-09-07: 12/12 green without the
+    /// two added here, 1 failure in 6 runs with them). One lock, taken for the
+    /// whole body, is the fix; poison is recovered from so one failing test
+    /// does not cascade into the rest.
+    fn metric_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// `set_global` is a process-wide one-shot `OnceLock` shared with sibling
     /// tests in this binary, so assert DELTAS read back through
-    /// `talos_metrics::global()`, never absolutes.
+    /// `talos_metrics::global()`, never absolutes — and hold
+    /// [`metric_guard`] for the whole test, or a parallel sibling crosses the
+    /// window and moves the delta anyway.
     fn stage_count(stage: &str) -> f64 {
         talos_metrics::global()
             .expect("global installed")
@@ -2422,6 +2486,7 @@ mod audit_verification_metric_tests {
             payload: "p".into(),
             previous_hash: "g".into(),
             hmac_signature: None,
+            dispatch_attempt: 0,
         }
     }
 
@@ -2433,11 +2498,18 @@ mod audit_verification_metric_tests {
             ok,
             signatures_checked: true,
             breaks: Vec::new(),
+            attempts: vec![talos_audit_event::AttemptChainReport {
+                dispatch_attempt: 0,
+                total_events: 3,
+                ok,
+                breaks: Vec::new(),
+            }],
         }
     }
 
     #[test]
     fn event_stage_counts_on_the_real_ingest_verification_path() {
+        let _guard = metric_guard();
         talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
 
         // A rejected message — the ingest loop quarantines this and never
@@ -2469,6 +2541,7 @@ mod audit_verification_metric_tests {
 
     #[test]
     fn chain_stage_counts_only_broken_chains_not_unreadable_ones() {
+        let _guard = metric_guard();
         talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
         let mut stats = ChainSweepStats::default();
 
@@ -2504,6 +2577,82 @@ mod audit_verification_metric_tests {
         assert_eq!(stats.errored, 1);
     }
 
+    /// A chain holding TWO controller dispatch attempts is VERIFIED, counted in
+    /// `verified_ok`, counted separately in `multi_attempt`, and moves the
+    /// pre-seeded `talos_audit_chain_multi_attempt_jobs_total` — never
+    /// `talos_audit_verification_failures_total`.
+    ///
+    /// The counter has ONE increment site and this drives it. Check 58 proves
+    /// an `.inc()` site EXISTS; only a test that walks the production
+    /// classification proves anything reaches it.
+    #[test]
+    fn a_re_dispatched_job_verifies_and_is_counted_as_a_retry_not_a_failure() {
+        let _guard = metric_guard();
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
+        let mut stats = ChainSweepStats::default();
+
+        // Two attempts of one job, built by the REAL producer path so the
+        // partitioning under test is the one production writes.
+        let mut a0 = talos_audit_event::ExecutionLedger::new_for_attempt("wf", "ex", 0);
+        let mut a1 = talos_audit_event::ExecutionLedger::new_for_attempt("wf", "ex", 1);
+        let events = vec![
+            a0.append("worker", "act", "one"),
+            a0.append_terminal_anchor("worker"),
+            a1.append("worker", "act", "two"),
+            a1.append_terminal_anchor("worker"),
+        ];
+        let report = verify_chain("wf", "ex", &events, &[]);
+        assert!(report.ok, "breaks: {:?}", report.breaks);
+
+        let multi_before = talos_metrics::global()
+            .expect("global installed")
+            .audit_chain_multi_attempt_jobs_total
+            .get();
+        let fail_before = stage_count(AUDIT_STAGE_CHAIN);
+        record_chain_verification_outcome(&mut stats, Ok(report), &nil_target());
+
+        assert_eq!(stats.verified_ok, 1, "a retried job still verifies");
+        assert_eq!(stats.failed, 0, "a retry is not a break");
+        assert_eq!(stats.multi_attempt, 1);
+        assert_eq!(
+            talos_metrics::global()
+                .expect("global installed")
+                .audit_chain_multi_attempt_jobs_total
+                .get()
+                - multi_before,
+            1.0,
+            "the multi-attempt counter must move exactly once"
+        );
+        assert_eq!(
+            stage_count(AUDIT_STAGE_CHAIN) - fail_before,
+            0.0,
+            "a retry must never touch the tamper counter"
+        );
+    }
+
+    /// The control: an ORDINARY single-attempt chain moves neither the tally
+    /// nor the counter, so a non-zero reading means what it says.
+    #[test]
+    fn a_single_attempt_chain_moves_neither_the_tally_nor_the_counter() {
+        let _guard = metric_guard();
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
+        let mut stats = ChainSweepStats::default();
+        let before = talos_metrics::global()
+            .expect("global installed")
+            .audit_chain_multi_attempt_jobs_total
+            .get();
+        record_chain_verification_outcome(&mut stats, Ok(report(true)), &nil_target());
+        assert_eq!(stats.multi_attempt, 0);
+        assert_eq!(
+            talos_metrics::global()
+                .expect("global installed")
+                .audit_chain_multi_attempt_jobs_total
+                .get()
+                - before,
+            0.0
+        );
+    }
+
     /// The whole point, at the sweep's classification site: a chain whose ONLY
     /// finding is a byte-identical redelivery is VERIFIED. It counts in
     /// `verified_ok`, it counts in the separate `duplicate_delivery` tally, and
@@ -2512,6 +2661,7 @@ mod audit_verification_metric_tests {
     /// 1 of the 102 jobs in the first sweep that ever completed.
     #[test]
     fn a_redelivered_chain_is_verified_not_a_tamper_failure() {
+        let _guard = metric_guard();
         talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
         let mut stats = ChainSweepStats::default();
         let mut r = report(true);
@@ -2537,6 +2687,7 @@ mod audit_verification_metric_tests {
     /// swallow the other.
     #[test]
     fn a_broken_chain_that_also_redelivered_reports_both() {
+        let _guard = metric_guard();
         talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
         let mut stats = ChainSweepStats::default();
         let mut r = report(false);
@@ -2565,6 +2716,7 @@ mod audit_verification_metric_tests {
     /// `deploy/helm/talos/files/alerts.yaml` selects on.
     #[test]
     fn stage_label_values_are_the_ones_the_alerts_select() {
+        let _guard = metric_guard();
         assert_eq!(AUDIT_STAGE_EVENT, "event");
         assert_eq!(AUDIT_STAGE_CHAIN, "chain");
     }
@@ -2597,6 +2749,7 @@ mod audit_verification_metric_tests {
     /// is asserted.
     #[test]
     fn an_unreadable_chain_counts_under_its_classified_reason() {
+        let _guard = metric_guard();
         talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
         let mut stats = ChainSweepStats::default();
 
@@ -2628,6 +2781,7 @@ mod audit_verification_metric_tests {
     /// window's coverage on a transient blip.
     #[test]
     fn a_transient_fault_does_not_abort_the_sweep() {
+        let _guard = metric_guard();
         talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
         let mut stats = ChainSweepStats::default();
 
@@ -2659,6 +2813,7 @@ mod audit_verification_metric_tests {
     /// space is enumerated, which is why it is a variant and not a comment.
     #[test]
     fn an_empty_prefix_is_not_a_verified_chain() {
+        let _guard = metric_guard();
         talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
         let gauge = || {
             talos_metrics::global()
@@ -2697,6 +2852,7 @@ mod audit_verification_metric_tests {
     /// report the absent case.
     #[test]
     fn a_verified_chain_stamps_the_last_verified_ok_gauge() {
+        let _guard = metric_guard();
         talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
         let gauge = || {
             talos_metrics::global()
@@ -2774,6 +2930,7 @@ mod sweep_coverage_pins {
             verified_ok: 500,
             failed: 0,
             duplicate_delivery: 0,
+            multi_attempt: 0,
             errored: 0,
             unbound: 0,
             cap_hit: true,

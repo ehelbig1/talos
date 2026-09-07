@@ -104,6 +104,7 @@ fn deterministic_job_request() -> JobRequest {
         dry_run: false,
         reply_topic: None,
         idempotency_key: None,
+        dispatch_attempt: 0,
     }
 }
 
@@ -161,7 +162,7 @@ fn sign_request_with_fixed_nonce(req: &mut JobRequest, key: &[u8]) {
     fn lp(s: &str) -> String {
         format!("{}:{}", s.len(), s)
     }
-    let payload = format!(
+    let mut payload = format!(
         "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
         req.job_id,
         req.workflow_execution_id,
@@ -192,6 +193,12 @@ fn sign_request_with_fixed_nonce(req: &mut JobRequest, key: &[u8]) {
         // Write-ceiling appended AT THE END (mirrors JobRequest::signing_payload).
         req.max_write_ceiling.as_signing_str(),
     );
+    // Conditional appends, in the production order. Each contributes NOTHING at
+    // its default, which is what keeps an all-default request byte-identical.
+    // `dispatch_attempt` is last and mirrors the `:attempt=` segment.
+    if req.dispatch_attempt != 0 {
+        payload.push_str(&format!(":attempt={}", req.dispatch_attempt));
+    }
     let mut mac = <HmacSha256 as Mac>::new_from_slice(key).unwrap();
     mac.update(payload.as_bytes());
     req.signature = mac.finalize().into_bytes().to_vec();
@@ -371,4 +378,148 @@ fn encrypted_secrets_json_snapshot() {
     let actual = serde_json::to_string(&es).expect("serialize");
     let expected = r#"{"ciphertext":[170,187,204],"nonce":[1,1,1,1,1,1,1,1,1,1,1,1]}"#;
     assert_eq!(actual, expected);
+}
+
+// ============================================================================
+// dispatch_attempt (the re-dispatch partition key)
+// ============================================================================
+
+/// A NON-DEFAULT `dispatch_attempt` changes the wire JSON and the MAC.
+///
+/// The all-default snapshots above are the other half of this pair and must NOT
+/// move: attempt 0 appends nothing to the signing payload and is omitted from
+/// the JSON, so every deployed worker keeps verifying every ordinary dispatch.
+/// This test pins the shape of the one message that is NOT byte-identical.
+#[test]
+fn job_request_non_default_dispatch_attempt_snapshot() {
+    let mut req = deterministic_job_request();
+    req.dispatch_attempt = 2;
+    // A DISTINCT fixed nonce per test that calls the production `verify()`:
+    // the nonce cache is process-global and admits each nonce exactly once, so
+    // two tests sharing the fixture's nonce make the second one fail as a
+    // replay (verify-once rule, one level down).
+    req.job_nonce = "0:0000000000000000000000000000000a".into();
+    sign_request_with_fixed_nonce(&mut req, &TEST_KEY);
+
+    let actual = serde_json::to_string(&req).expect("serialize");
+    let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000001","workflow_execution_id":"00000000-0000-0000-0000-000000000002","module_uri":"redis:wasm:00000000-0000-0000-0000-000000000003","input_payload":{"key":"value"},"encrypted_secrets":{"ciphertext":[170,187,204],"nonce":[1,1,1,1,1,1,1,1,1,1,1,1]},"timeout_ms":30000,"priority":100,"deadline_unix_secs":0,"allowed_hosts":["api.example.com"],"allowed_methods":["GET","POST"],"allowed_secrets":["foo/*"],"allowed_sql_operations":[],"allow_tier2_exposure":false,"signature":[51,236,184,92,40,199,215,64,6,179,242,133,80,245,10,251,18,139,219,146,210,207,94,31,66,205,156,78,176,120,25,34],"job_nonce":"0:0000000000000000000000000000000a","expected_wasm_hash":"deadbeef","max_fuel":1000000,"user_id":"00000000-0000-0000-0000-000000000009","max_llm_tier":"tier2","max_write_ceiling":"write","dry_run":false,"crypto_scheme":0,"dispatch_attempt":2}"#;
+    assert_eq!(
+        actual, expected,
+        "JobRequest wire format drifted for a re-dispatched job — see the module docstring"
+    );
+
+    let actual_hex = hex::encode(&req.signature);
+    let expected_hex = "33ecb85c28c7d74006b3f28550f50afb128bdb92d2cf5e1f42cd9c4eb0781922";
+    assert_eq!(
+        actual_hex, expected_hex,
+        "the `:attempt=` signing segment drifted — see the module docstring"
+    );
+
+    // The production verify path accepts the hand-rolled signature, so the
+    // formula above cannot have drifted from `signing_payload` unnoticed.
+    req.verify(&TEST_KEY, u64::MAX)
+        .expect("hand-rolled signature must verify against production verify()");
+}
+
+/// The attempt is HMAC-BOUND: stripping it (re-merging two dispatches into one
+/// audit chain, which manufactures a false `DuplicateSequence` tamper finding)
+/// or moving it (splitting a tampered chain into partitions that each verify)
+/// must fail verification.
+#[test]
+fn dispatch_attempt_is_hmac_bound_against_strip_and_swap() {
+    let mut signed = deterministic_job_request();
+    signed.dispatch_attempt = 2;
+    signed.job_nonce = "0:0000000000000000000000000000000b".into();
+    sign_request_with_fixed_nonce(&mut signed, &TEST_KEY);
+    signed
+        .verify(&TEST_KEY, u64::MAX)
+        .expect("the honest message verifies");
+
+    let mut stripped = signed.clone();
+    stripped.dispatch_attempt = 0;
+    assert!(
+        stripped.verify(&TEST_KEY, u64::MAX).is_err(),
+        "stripping the attempt must invalidate the signature"
+    );
+
+    let mut swapped = signed.clone();
+    swapped.dispatch_attempt = 3;
+    assert!(
+        swapped.verify(&TEST_KEY, u64::MAX).is_err(),
+        "moving a job to another attempt must invalidate the signature"
+    );
+
+    // And the reverse direction: an attempt-0 message cannot have one forged
+    // onto it.
+    let mut zero = deterministic_job_request();
+    zero.job_nonce = "0:0000000000000000000000000000000c".into();
+    sign_request_with_fixed_nonce(&mut zero, &TEST_KEY);
+    zero.verify(&TEST_KEY, u64::MAX)
+        .expect("attempt 0 verifies");
+    let mut forged = zero.clone();
+    forged.dispatch_attempt = 1;
+    assert!(
+        forged.verify(&TEST_KEY, u64::MAX).is_err(),
+        "forging an attempt onto a first dispatch must invalidate the signature"
+    );
+}
+
+/// DEPLOY ORDERING, measured rather than asserted.
+///
+/// An OLD worker (one built before `dispatch_attempt` existed) computes a
+/// signing payload that CANNOT contain the `:attempt=` segment. A new
+/// controller's RETRY does contain it. So the two disagree and the old worker
+/// refuses the retry. Simulated here by rebuilding the pre-field payload
+/// exactly — the same bytes the fixture builds, minus the conditional append —
+/// and checking the MACs differ.
+///
+/// The FIRST dispatch is unaffected in both directions: attempt 0 appends
+/// nothing, so old and new produce identical bytes.
+#[test]
+fn an_old_worker_refuses_a_new_controllers_retry_but_accepts_its_first_dispatch() {
+    // What a NEW controller signs for a retry.
+    let mut retry = deterministic_job_request();
+    retry.dispatch_attempt = 2;
+    retry.job_nonce = "0:0000000000000000000000000000000d".into();
+    sign_request_with_fixed_nonce(&mut retry, &TEST_KEY);
+
+    // What an OLD worker would compute for the very same message: the same
+    // fixture with the conditional segment removed, i.e. what
+    // `sign_request_with_fixed_nonce` produces at attempt 0.
+    let mut as_old_sees_it = retry.clone();
+    as_old_sees_it.dispatch_attempt = 0;
+    sign_request_with_fixed_nonce(&mut as_old_sees_it, &TEST_KEY);
+
+    assert_ne!(
+        retry.signature, as_old_sees_it.signature,
+        "if these matched, binding the attempt would be a no-op"
+    );
+
+    // Driven through the PRODUCTION verifier, not only the fixture: hand the
+    // real `verify()` the retry carrying the signature an old worker would have
+    // computed, and it must refuse. (The fixture alone would still pass if
+    // `signing_payload` stopped appending the segment, which is exactly the
+    // mutation this pairing closes.)
+    let mut old_signature_on_a_new_retry = retry.clone();
+    old_signature_on_a_new_retry.signature = as_old_sees_it.signature.clone();
+    assert!(
+        old_signature_on_a_new_retry
+            .verify(&TEST_KEY, u64::MAX)
+            .is_err(),
+        "an old worker's signature over a stamped retry must not verify"
+    );
+    retry
+        .verify(&TEST_KEY, u64::MAX)
+        .expect("the honest new-controller retry verifies against production verify()");
+
+    // And the first dispatch: identical bytes on both sides.
+    let mut first = deterministic_job_request();
+    first.job_nonce = "0:0000000000000000000000000000000e".into();
+    sign_request_with_fixed_nonce(&mut first, &TEST_KEY);
+    let mut same = first.clone();
+    sign_request_with_fixed_nonce(&mut same, &TEST_KEY);
+    assert_eq!(
+        first.signature, same.signature,
+        "attempt 0 must be byte-identical to the pre-field format"
+    );
 }

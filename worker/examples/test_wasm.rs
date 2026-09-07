@@ -47,6 +47,7 @@ async fn main() -> anyhow::Result<()> {
             None,                                             // egress_scope: tier default
             None,                                             // llm_usage_out — not collected
             None,                                             // host_diag_out — not collected
+            0, // dispatch_attempt — a hand-run example, no controller retry loop
         )
         .await
     {

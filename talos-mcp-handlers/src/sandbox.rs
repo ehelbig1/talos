@@ -1895,6 +1895,7 @@ async fn handle_run_sandbox(
             None,                     // egress_scope — internal path: tier-derived default
             None,                     // llm_usage_out — internal sandbox path doesn't collect usage
             Some(host_diags.clone()), // host_diag_out — no execution row, so this is the ONLY route
+            0, // dispatch_attempt — an operator-invoked run, no controller retry loop above it
         )
         .await;
 
@@ -3401,6 +3402,7 @@ async fn handle_test_module(
             None,                     // egress_scope — internal path: tier-derived default
             None,                     // llm_usage_out — internal sandbox path doesn't collect usage
             Some(host_diags.clone()), // host_diag_out — no execution row, so this is the ONLY route
+            0, // dispatch_attempt — an operator-invoked run, no controller retry loop above it
         )
         .await;
     let duration_ms = start.elapsed().as_millis();

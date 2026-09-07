@@ -1593,6 +1593,7 @@ fn sweep(
         empty: 0,
         failed: 0,
         duplicate_delivery: 0,
+        multi_attempt: 0,
         errored,
         unbound: 0,
         cap_hit,
@@ -1610,6 +1611,80 @@ fn sweep(
     }
 }
 
+/// A re-dispatched job is a PASS, and the report must SAY it was a
+/// re-dispatch. "4 events, verified" and "two dispatches of two events each"
+/// render identically otherwise — and the second is the shape that, before the
+/// attempt reached the wire, was reported as CRITICAL tamper evidence.
+#[test]
+fn a_multi_attempt_chain_passes_and_names_the_re_dispatch() {
+    let c = check_audit_chain_verification(
+        &AuditChainProbe::Verified {
+            execution_id: "ex-1".to_string(),
+            workflow_execution_id: "wfx-1".to_string(),
+            total_events: 4,
+            signatures_checked: true,
+            duplicate_deliveries: 0,
+            dispatch_attempts: 2,
+        },
+        Some(sweep(37, 0, None, false)),
+    );
+    assert_eq!(c.status, Status::Pass);
+    assert!(
+        c.detail.contains("2 CONTROLLER DISPATCH ATTEMPTS"),
+        "{}",
+        c.detail
+    );
+    assert!(
+        c.detail.contains("RETRY, not tamper evidence"),
+        "{}",
+        c.detail
+    );
+}
+
+/// A single-attempt chain says NOTHING about attempts — nothing to disclose
+/// means no sentence, so an ordinary report is unchanged.
+#[test]
+fn a_single_attempt_chain_makes_no_attempt_claim() {
+    let c = check_audit_chain_verification(
+        &AuditChainProbe::Verified {
+            execution_id: "ex-1".to_string(),
+            workflow_execution_id: "wfx-1".to_string(),
+            total_events: 4,
+            signatures_checked: true,
+            duplicate_deliveries: 0,
+            dispatch_attempts: 1,
+        },
+        Some(sweep(37, 0, None, false)),
+    );
+    assert!(!c.detail.contains("DISPATCH ATTEMPTS"), "{}", c.detail);
+}
+
+/// The standing sweep discloses its own re-dispatch count, for the same
+/// reason: a clean pass over chains that were partitioned is a different fact
+/// from a clean pass over chains that never needed to be.
+#[test]
+fn the_sweep_note_discloses_multi_attempt_jobs() {
+    let mut snap = sweep(37, 0, None, false);
+    snap.multi_attempt = 3;
+    let c = check_audit_chain_verification(
+        &AuditChainProbe::Verified {
+            execution_id: "ex-1".to_string(),
+            workflow_execution_id: "wfx-1".to_string(),
+            total_events: 1,
+            signatures_checked: true,
+            duplicate_deliveries: 0,
+            dispatch_attempts: 1,
+        },
+        Some(snap),
+    );
+    assert!(
+        c.detail
+            .contains("3 of those job chain(s) hold MORE THAN ONE controller dispatch attempt"),
+        "{}",
+        c.detail
+    );
+}
+
 #[test]
 fn a_verified_chain_passes_as_a_round_trip() {
     let c = check_audit_chain_verification(
@@ -1619,6 +1694,7 @@ fn a_verified_chain_passes_as_a_round_trip() {
             total_events: 12,
             signatures_checked: true,
             duplicate_deliveries: 0,
+            dispatch_attempts: 1,
         },
         Some(sweep(37, 0, None, false)),
     );
@@ -1641,6 +1717,7 @@ fn a_verified_chain_without_keys_states_what_it_did_not_check() {
             total_events: 3,
             signatures_checked: false,
             duplicate_deliveries: 0,
+            dispatch_attempts: 1,
         },
         None,
     );
@@ -1661,6 +1738,7 @@ fn a_redelivered_chain_passes_with_the_count_disclosed() {
             total_events: 2,
             signatures_checked: true,
             duplicate_deliveries: 1,
+            dispatch_attempts: 1,
         },
         Some(sweep(37, 0, None, false)),
     );
@@ -1686,6 +1764,7 @@ fn a_clean_chain_says_nothing_about_redelivery() {
             total_events: 2,
             signatures_checked: true,
             duplicate_deliveries: 0,
+            dispatch_attempts: 1,
         },
         None,
     );
@@ -1837,6 +1916,7 @@ fn an_aborted_sweep_is_not_a_clean_bill_of_health() {
             total_events: 1,
             signatures_checked: true,
             duplicate_deliveries: 0,
+            dispatch_attempts: 1,
         },
         Some(sweep(500, 0, None, true)),
     );
@@ -1854,6 +1934,7 @@ fn an_absent_sweep_snapshot_reads_as_not_yet_run() {
             total_events: 1,
             signatures_checked: true,
             duplicate_deliveries: 0,
+            dispatch_attempts: 1,
         },
         None,
     );
@@ -1882,6 +1963,7 @@ fn the_chain_check_costs_nothing_in_every_arm() {
             total_events: 1,
             signatures_checked: true,
             duplicate_deliveries: 0,
+            dispatch_attempts: 1,
         },
         AuditChainProbe::Broken {
             execution_id: "e".to_string(),
@@ -1969,6 +2051,7 @@ fn the_pass_names_the_id_space_it_verified() {
             total_events: 3,
             signatures_checked: true,
             duplicate_deliveries: 0,
+            dispatch_attempts: 1,
         },
         Some(sweep(4, 0, None, false)),
     );
@@ -2034,6 +2117,7 @@ fn the_sweep_note_reports_both_grains() {
         empty: 1,
         failed: 1,
         duplicate_delivery: 0,
+        multi_attempt: 0,
         errored: 1,
         unbound: 0,
         cap_hit: false,
@@ -2054,6 +2138,7 @@ fn the_sweep_note_reports_both_grains() {
             total_events: 1,
             signatures_checked: true,
             duplicate_deliveries: 0,
+            dispatch_attempts: 1,
         },
         Some(snapshot),
     );
@@ -2075,6 +2160,7 @@ fn unbound_jobs_are_disclosed_not_absorbed() {
         empty: 0,
         failed: 0,
         duplicate_delivery: 0,
+        multi_attempt: 0,
         errored: 0,
         unbound: 2,
         cap_hit: false,
@@ -2093,6 +2179,7 @@ fn unbound_jobs_are_disclosed_not_absorbed() {
             total_events: 1,
             signatures_checked: true,
             duplicate_deliveries: 0,
+            dispatch_attempts: 1,
         },
         Some(snapshot),
     );

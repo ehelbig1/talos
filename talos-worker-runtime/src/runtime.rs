@@ -1526,6 +1526,38 @@ pub struct RetryPolicy {
 ///     attempt whose guest call RETURNED. A job killed by the wall clock never
 ///     completed and keeps the deliberately-soft `Unanchored` verdict, exactly
 ///     as it did when the anchor was appended inline.
+/// Mint the ONE audit ledger this job's chain is written to.
+///
+/// Two grains, and only one of them is knowable inside this process. ONE ledger
+/// per JOB is #769's rule (a per-ATTEMPT ledger anchored every in-worker retry,
+/// producing several `sequence_num` 1 anchors under one prefix). ONE CHAIN per
+/// controller DISPATCH is the rule this function encodes: the worker holds no
+/// credentials and cannot read what a previous dispatch of the same `job_id`
+/// wrote, so a re-dispatch necessarily starts again at sequence 1 against the
+/// same genesis. The attempt index — signed and HMAC-bound on the `JobRequest`,
+/// never inferred here — is what lets the offline verifier tell that fresh
+/// chain from a duplicated sequence in the first one.
+///
+/// Extracted from `execute_job_with_full_features` so the decision a test can
+/// drive IS the expression production evaluates: the enclosing function needs a
+/// wasmtime engine, a compiled component and a NATS server, so nothing could
+/// otherwise observe that the attempt reaches the ledger. (Measured: before the
+/// extraction, replacing `new_for_attempt` with `new` here left all 639 tests
+/// in this crate green.)
+///
+/// A `None` execution context — the id-less `run_sandbox` / `test_module`
+/// surfaces — means no chain at all, unchanged.
+pub(crate) fn build_job_ledger(
+    execution_context: Option<&(String, String, String)>,
+    dispatch_attempt: u32,
+) -> Option<Arc<tokio::sync::Mutex<crate::audit::ExecutionLedger>>> {
+    execution_context.map(|(workflow_id, exec_id, _)| {
+        Arc::new(tokio::sync::Mutex::new(
+            crate::audit::ExecutionLedger::new_for_attempt(workflow_id, exec_id, dispatch_attempt),
+        ))
+    })
+}
+
 pub(crate) async fn seal_job_audit_chain(
     ledger: Option<Arc<tokio::sync::Mutex<crate::audit::ExecutionLedger>>>,
     anchor_eligible: &std::sync::atomic::AtomicBool,
@@ -3241,6 +3273,7 @@ impl TalosRuntime {
             None, // egress_scope — legacy helper: tier-derived default
             None, // llm_usage_out — legacy helper doesn't collect usage
             None, // host_diag_out — legacy helper has a real execution id (NATS route)
+            0,    // dispatch_attempt — legacy helper has no controller retry loop above it
         )
         .await
     }
@@ -3311,6 +3344,24 @@ impl TalosRuntime {
         // attempts (each attempt builds a fresh context) and bounded inside
         // `emit_host_diagnostic`. `None` = unchanged behaviour.
         host_diag_out: Option<crate::context::HostDiagSink>,
+        // Which CONTROLLER DISPATCH of this job this call is running. `0` for
+        // the first dispatch and for every caller with no controller retry loop
+        // above it (`run_sandbox`, `test_module`, replay). Read from the signed,
+        // HMAC-bound `JobRequest::dispatch_attempt`.
+        //
+        // It reaches exactly ONE thing: the audit ledger's partition key. The
+        // controller re-dispatches the same `job_id` on a retry, and this
+        // process cannot read the previous dispatch's ledger — it is
+        // credential-free — so it opens a NEW chain at `sequence_num` 1 against
+        // the SAME genesis. Without the attempt on the events, the offline
+        // verifier saw two chains as one with a duplicated sequence and reported
+        // tamper evidence for a job that had merely been retried.
+        //
+        // A plain parameter rather than a fourth element of `execution_context`
+        // because that tuple is destructured in a dozen places and none of them
+        // wants this; passing it explicitly makes every call site state its
+        // answer.
+        dispatch_attempt: u32,
     ) -> Result<JsonValue> {
         // Per-job fuel override: use the controller-supplied value when non-zero,
         // otherwise fall back to the runtime's global fuel_limit.
@@ -3478,13 +3529,7 @@ impl TalosRuntime {
         // conflicting. Sharing the ledger makes the chain what it claims to
         // be: ONE monotonic sequence over the whole job, whatever it took to
         // finish, with exactly one terminal anchor at the end.
-        let job_ledger: Option<std::sync::Arc<tokio::sync::Mutex<crate::audit::ExecutionLedger>>> =
-            execution_context.as_ref().map(|(workflow_id, exec_id, _)| {
-                std::sync::Arc::new(tokio::sync::Mutex::new(crate::audit::ExecutionLedger::new(
-                    workflow_id,
-                    exec_id,
-                )))
-            });
+        let job_ledger = build_job_ledger(execution_context.as_ref(), dispatch_attempt);
         // Whether ANY attempt's guest call returned — the condition the
         // per-attempt anchor used to be guarded by, hoisted rather than
         // reinvented. An execution killed by the wall clock never completed,

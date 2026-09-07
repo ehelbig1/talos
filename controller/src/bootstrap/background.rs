@@ -2082,6 +2082,12 @@ pub(crate) fn spawn_maintenance_sweeps(
                                     // a job in `failed` and does not by itself
                                     // put this pass in the WITH-findings branch.
                                     jobs_with_duplicate_delivery = stats.duplicate_delivery,
+                                    // A re-dispatched job carries one chain per
+                                    // controller dispatch attempt, each verified
+                                    // separately. Beside the verdict, never inside
+                                    // it: a retry is not a finding, and this shape
+                                    // used to be reported as tamper evidence.
+                                    jobs_with_multiple_attempts = stats.multi_attempt,
                                     jobs_errored = stats.errored,
                                     jobs_unbound = stats.unbound,
                                     workflow_executions_covered = stats.rollup.covered,
@@ -2125,6 +2131,7 @@ pub(crate) fn spawn_maintenance_sweeps(
                                     jobs_scanned = stats.scanned,
                                     jobs_verified_ok = stats.verified_ok,
                                     jobs_with_duplicate_delivery = stats.duplicate_delivery,
+                                    jobs_with_multiple_attempts = stats.multi_attempt,
                                     workflow_executions_covered = stats.rollup.covered,
                                     workflow_executions_verified_ok = stats.rollup.verified_ok,
                                     "audit chain verification sweep completed clean"

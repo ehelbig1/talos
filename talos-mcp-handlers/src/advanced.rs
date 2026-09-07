@@ -1643,6 +1643,7 @@ async fn handle_run_scratch_session(
             None,              // egress_scope — internal path: tier-derived default
             None,              // llm_usage_out — internal test path doesn't collect usage
             None,              // host_diag_out — no in-process diagnostic sink on this path
+            0, // dispatch_attempt — an operator-invoked run, no controller retry loop above it
         )
         .await;
 
