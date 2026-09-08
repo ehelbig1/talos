@@ -17,6 +17,11 @@ and "the read failed".
 Scope: `talos-mcp-handlers/src` + `talos-api/src`, non-test files, with
 `#[cfg(test)] mod` regions excluded.
 
+The table below is PINNED to `0c962874`: it records what was measured there,
+including line numbers, and the disposition sections say what has been repaired
+since. The LIVE count on the current tree is **164** (2026-09-08); re-derive it
+with the classifier command above.
+
 **193 sites**, closed and classified: **65 claim**, **5 fail-open**, **37 fail-closed**, **60 decorative**, **26 false-positive**.
 
 **claim** — the default becomes a count, a list, a verdict or a "not found" that a caller reads and acts on.
@@ -88,6 +93,52 @@ Corroboration: run against the tree at `38175869` (the commit before #776,
 i.e. the tree package 23 measured) this detector reports **208** sites
 against package 23's reported **210**. Package 23's detector was lost with
 its worktree; the rebuild agrees with it to within 1%.
+
+## Disposition (2026-09-08)
+
+**Eleven more collapses removed**, measured by running the classifier over the
+tree before and after: **175 sites -> 164**, 11 removed and 0 added. They are the
+five highest-ranked `claim` sites the table above still carried, plus the two
+ENTITY lookups inside those same handlers and the four sibling reads that
+adopting a `Readings` ledger enrolled in check 74b.
+
+Sites:
+
+* `talos-mcp-handlers/src/analytics.rs::handle_get_workflow_audit_trail` — claim x2: a failed version read removed every `version_published` event and a failed execution read every `execution_triggered` one, so a tool NAMED for auditability read as "never published" / "never ran" — and `count` / `event_count` reported the shortened list as the total. `list_executions_for_audit` carries a comment recording that this same swallow once hid a query naming a column that does not exist; the QUERY was fixed in May 2026 and the SWALLOW was left
+* `talos-mcp-handlers/src/executions.rs::handle_get_execution_lineage` — claim: a failed ROOT lookup substituted the execution's own id, the tree query then matched `id = $1` and came back NON-empty, so the degraded flag stayed false and the response rendered the standalone-run claim #771 built `lineage_note` to remove
+* `talos-mcp-handlers/src/executions.rs::handle_watch_execution` — claim x2: `events: [], events_count: 0` on a failed read, beside a `current_status` that WAS measured, on the tool an operator polls during an incident — a poller reads 0 as "no progress"
+* `talos-mcp-handlers/src/modules.rs::handle_list_module_catalog` — claim: a failed visibility read made every entry read `needs_install` — an instruction to install modules the caller already has — and with `installed_only: true` the whole listing rendered as `[]`
+* `talos-mcp-handlers/src/ml.rs::handle_get_model_card` — claim: `has_pending_disagreements: false` — "no human corrections are waiting" — immediately before a promotion decision; plus its model ENTITY lookup, which answered a failed registry read with "Model not found", and the four sibling reads that adopting a ledger enrolled in check 74b
+
+`handle_get_execution_lineage`'s root lookup still appears in the table, for
+the same reason `dlq_updates` does: the fix SUBSTITUTES a value (it still walks
+from the anchor, because there is no better anchor) and DISCLOSES the
+substitution — `root_execution_id: null` plus a new first arm in `lineage_note`
+— so the detector correctly still sees a default. Its verdict on the fixed tree
+is `false-positive`: the arm yields an explicit UNKNOWN.
+
+The same 2026-09-08 change added ONE TEST PER SITE for the nine fixes #779
+shipped with none (`controller/tests/unguarded_gate_survivor_tests`), and moved
+the hand-copied test `McpState` constructor into `controller/tests/common/mcp.rs`
+so the four binaries that build one cannot drift apart.
+
+**What remains, with counts, so the next pass starts from a number rather than
+a sweep.** 164 sites: **46 claim**, 55 decorative, 37 fail-closed, 25
+false-positive, and the 1 nominal fail-open that is #779's repaired
+`dlq_updates` narrowing. One of the 46 is the lineage-root row above, whose
+verdict on this tree is `false-positive`, so 45 claims are genuinely open. By
+file: `advanced.rs` 5, `analytics.rs` 5, `executions.rs` 5, `modules.rs` 5,
+`workflows.rs` 5, `platform.rs` 4, `actor.rs` 3, `configuration.rs` 3,
+`graph.rs` 3, `search.rs` 3, and 5 in `talos-api`. The highest-severity
+members still open are:
+`executions.rs::handle_get_execution_timeline` and
+`handle_get_execution_waterfall` (the same `list_execution_events` swallow this
+change repaired in `watch_execution`, in two more surfaces),
+`modules.rs::handle_list_module_catalog`'s SECOND site (a `spawn_blocking`
+`JoinError` defaulting the disk walk to an empty catalog — and it is cached in a
+process-wide `OnceCell`, so one failure is permanent for the pod's lifetime),
+and `actor.rs::handle_suggest_actor_for_task` ("No active actors found. Create
+actors with create_actor first." from a failed listing).
 
 
 ## claim — 65 sites

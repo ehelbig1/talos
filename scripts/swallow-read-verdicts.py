@@ -266,6 +266,39 @@ FIXED = [
 ]
 
 
+# Package 29 (2026-09-08). The five highest-ranked `claim` sites the table
+# still carried, plus the two entity lookups inside the same handlers. The
+# table above stays pinned to `0c962874` — it is a record of what was
+# MEASURED there, and rewriting its rows would destroy the population the
+# disposition sections are about.
+FIXED_2026_09_08 = [
+    ("talos-mcp-handlers/src/analytics.rs", "handle_get_workflow_audit_trail",
+     "claim x2: a failed version read removed every `version_published` event and a failed "
+     "execution read every `execution_triggered` one, so a tool NAMED for auditability read "
+     "as \"never published\" / \"never ran\" — and `count` / `event_count` reported the "
+     "shortened list as the total. `list_executions_for_audit` carries a comment recording "
+     "that this same swallow once hid a query naming a column that does not exist; the QUERY "
+     "was fixed in May 2026 and the SWALLOW was left"),
+    ("talos-mcp-handlers/src/executions.rs", "handle_get_execution_lineage",
+     "claim: a failed ROOT lookup substituted the execution's own id, the tree query then "
+     "matched `id = $1` and came back NON-empty, so the degraded flag stayed false and the "
+     "response rendered the standalone-run claim #771 built `lineage_note` to remove"),
+    ("talos-mcp-handlers/src/executions.rs", "handle_watch_execution",
+     "claim x2: `events: [], events_count: 0` on a failed read, beside a `current_status` "
+     "that WAS measured, on the tool an operator polls during an incident — a poller reads "
+     "0 as \"no progress\""),
+    ("talos-mcp-handlers/src/modules.rs", "handle_list_module_catalog",
+     "claim: a failed visibility read made every entry read `needs_install` — an instruction "
+     "to install modules the caller already has — and with `installed_only: true` the whole "
+     "listing rendered as `[]`"),
+    ("talos-mcp-handlers/src/ml.rs", "handle_get_model_card",
+     "claim: `has_pending_disagreements: false` — \"no human corrections are waiting\" — "
+     "immediately before a promotion decision; plus its model ENTITY lookup, which answered "
+     "a failed registry read with \"Model not found\", and the four sibling reads that "
+     "adopting a ledger enrolled in check 74b"),
+]
+
+
 VERDICTS = ("claim", "fail-open", "fail-closed", "decorative", "false-positive")
 
 BLURB = {
@@ -302,6 +335,11 @@ def render():
     print()
     print("Scope: `talos-mcp-handlers/src` + `talos-api/src`, non-test files, with")
     print("`#[cfg(test)] mod` regions excluded.")
+    print()
+    print("The table below is PINNED to `0c962874`: it records what was measured there,")
+    print("including line numbers, and the disposition sections say what has been repaired")
+    print("since. The LIVE count on the current tree is **164** (2026-09-08); re-derive it")
+    print("with the classifier command above.")
     print()
     print("**%d sites**, closed and classified: " % len(V)
           + ", ".join("**%d %s**" % (counts[k], k) for k in VERDICTS) + ".")
@@ -362,6 +400,49 @@ def render():
     print("i.e. the tree package 23 measured) this detector reports **208** sites")
     print("against package 23's reported **210**. Package 23's detector was lost with")
     print("its worktree; the rebuild agrees with it to within 1%.")
+    print()
+    print("## Disposition (2026-09-08)")
+    print()
+    print("**Eleven more collapses removed**, measured by running the classifier over the")
+    print("tree before and after: **175 sites -> 164**, 11 removed and 0 added. They are the")
+    print("five highest-ranked `claim` sites the table above still carried, plus the two")
+    print("ENTITY lookups inside those same handlers and the four sibling reads that")
+    print("adopting a `Readings` ledger enrolled in check 74b.")
+    print()
+    print("Sites:")
+    print()
+    for f, fn, why in FIXED_2026_09_08:
+        print("* `%s::%s` — %s" % (f, fn, why))
+    print()
+    print("`handle_get_execution_lineage`'s root lookup still appears in the table, for")
+    print("the same reason `dlq_updates` does: the fix SUBSTITUTES a value (it still walks")
+    print("from the anchor, because there is no better anchor) and DISCLOSES the")
+    print("substitution — `root_execution_id: null` plus a new first arm in `lineage_note`")
+    print("— so the detector correctly still sees a default. Its verdict on the fixed tree")
+    print("is `false-positive`: the arm yields an explicit UNKNOWN.")
+    print()
+    print("The same 2026-09-08 change added ONE TEST PER SITE for the nine fixes #779")
+    print("shipped with none (`controller/tests/unguarded_gate_survivor_tests`), and moved")
+    print("the hand-copied test `McpState` constructor into `controller/tests/common/mcp.rs`")
+    print("so the four binaries that build one cannot drift apart.")
+    print()
+    print("**What remains, with counts, so the next pass starts from a number rather than")
+    print("a sweep.** 164 sites: **46 claim**, 55 decorative, 37 fail-closed, 25")
+    print("false-positive, and the 1 nominal fail-open that is #779's repaired")
+    print("`dlq_updates` narrowing. One of the 46 is the lineage-root row above, whose")
+    print("verdict on this tree is `false-positive`, so 45 claims are genuinely open. By")
+    print("file: `advanced.rs` 5, `analytics.rs` 5, `executions.rs` 5, `modules.rs` 5,")
+    print("`workflows.rs` 5, `platform.rs` 4, `actor.rs` 3, `configuration.rs` 3,")
+    print("`graph.rs` 3, `search.rs` 3, and 5 in `talos-api`. The highest-severity")
+    print("members still open are:")
+    print("`executions.rs::handle_get_execution_timeline` and")
+    print("`handle_get_execution_waterfall` (the same `list_execution_events` swallow this")
+    print("change repaired in `watch_execution`, in two more surfaces),")
+    print("`modules.rs::handle_list_module_catalog`'s SECOND site (a `spawn_blocking`")
+    print("`JoinError` defaulting the disk walk to an empty catalog — and it is cached in a")
+    print("process-wide `OnceCell`, so one failure is permanent for the pod's lifetime),")
+    print("and `actor.rs::handle_suggest_actor_for_task` (\"No active actors found. Create")
+    print("actors with create_actor first.\" from a failed listing).")
     print()
     for k in VERDICTS:
         rows = [r for r in V if r[2] == k]

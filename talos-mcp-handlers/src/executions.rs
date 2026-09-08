@@ -3579,6 +3579,11 @@ async fn handle_watch_execution(
         .unwrap_or(0);
 
     // Build UUID → label mapping and UUID → redacted config mapping from graph_json.
+    //
+    // allow-benign-default: label prettification and redacted-config context
+    // only. A failed graph read renders each node as its bare UUID beside
+    // counts and statuses that are untouched — it makes no claim about the
+    // execution. Same disposition as `handle_get_error_report`'s label read.
     let graph_json_opt = state
         .execution_repo
         .get_workflow_graph_for_user(workflow_id, user_id)
@@ -3629,19 +3634,29 @@ async fn handle_watch_execution(
             .collect()
     };
 
-    // Load events since the given timestamp (or all events)
-    let events = match since {
-        Some(since_ts) => state
-            .execution_repo
-            .list_execution_events_since(exec_id, since_ts)
-            .await
-            .unwrap_or_default(),
-        None => state
-            .execution_repo
-            .list_execution_events(exec_id)
-            .await
-            .unwrap_or_default(),
-    };
+    // Load events since the given timestamp (or all events).
+    //
+    // 2026-09-08: `.unwrap_or_default()` here rendered a failed read as
+    // `events: [], events_count: 0` — "nothing has happened yet" — on the one
+    // tool an operator polls DURING an incident, beside a `current_status`
+    // that WAS measured, so the response looked entirely healthy. The status
+    // fields come from the execution row and stay exactly as they were; only
+    // the event half is nulled and disclosed. `Readings::attach` is a no-op
+    // when the read succeeds, so a healthy response is byte-identical.
+    let mut readings = talos_measurement::Readings::new();
+    let events = readings.record_rows(
+        "events",
+        match since {
+            Some(since_ts) => {
+                state
+                    .execution_repo
+                    .list_execution_events_since(exec_id, since_ts)
+                    .await
+            }
+            None => state.execution_repo.list_execution_events(exec_id).await,
+        },
+    );
+    let events_measured = readings.complete();
 
     // First pass: count retry events per node so node_error events can show
     // "attempt 3/3 — retries exhausted" vs "attempt 1/3 — first failure".
@@ -3716,14 +3731,18 @@ async fn handle_watch_execution(
         obj
     }).collect();
 
-    let response = serde_json::json!({
+    // NULL, never `[]` and never `0`: a poller comparing `events_count`
+    // against its last value reads 0 as "no progress", which is the single
+    // most misleading answer this tool can give while a run is in trouble.
+    let mut response = serde_json::json!({
         "execution_id": exec_id.to_string(),
         "current_status": status,
         "is_complete": is_complete,
         "elapsed_ms": elapsed_ms,
-        "events_count": event_list.len(),
-        "events": event_list,
+        "events_count": if events_measured { Some(event_list.len()) } else { None },
+        "events": if events_measured { Some(event_list) } else { None },
     });
+    readings.attach(&mut response);
     mcp_text(
         req_id,
         &serde_json::to_string_pretty(&response).unwrap_or_default(),
@@ -6086,12 +6105,37 @@ fn child_runs_note(count: Option<usize>, ledger_has_started: bool, error: Option
 /// * `None`, or a ledger with no rows at all — UNKNOWN. Never rendered as
 ///   zero, and never as "standalone".
 fn lineage_note(
+    root_unreadable: bool,
     tree_degraded: bool,
     archived_in_lineage: usize,
     node_count: usize,
     child_runs_count: Option<usize>,
     ledger_has_started: bool,
 ) -> String {
+    // 2026-09-08: the ROOT lookup's own failure, which used to be invisible.
+    // A failed `get_execution_lineage_root` substituted the requested
+    // execution's OWN id as the tree root; the tree query then matched at
+    // least that row (`id = $1`), so `tree_degraded` stayed FALSE and the
+    // single-node arm below rendered "This execution has no parent or child
+    // EXECUTION rows" — a determinate negative derived from a read that never
+    // answered, which is the exact claim #771 built this function to remove,
+    // reintroduced one read earlier. Ranked FIRST because it is the widest:
+    // when the root is unknown, every other fact here is about a tree that may
+    // not be the right one.
+    if root_unreadable {
+        return format!(
+            "The lineage ROOT could not be read, so `root_execution_id` is null and the \
+             tree below was walked from the REQUESTED execution instead. Whether this \
+             execution has a parent is UNKNOWN — it is NOT a standalone run, and \
+             `total_executions_in_lineage` counts only what a walk from the wrong \
+             anchor could reach.{}",
+            if tree_degraded {
+                " The tree read failed as well, so only the requested execution is shown."
+            } else {
+                ""
+            }
+        );
+    }
     if tree_degraded {
         return "The lineage tree could not be read; only the requested execution is shown. \
                 This is NOT a statement that it has no parent or children."
@@ -6167,18 +6211,27 @@ async fn handle_get_execution_lineage(
     // Step 2: Determine the tree root using lineage columns (added in migration 20260326000002).
     // These columns are plain UUID DEFAULT NULL — no FK constraints. If the migration has not yet
     // been applied, the query fails; we fall back to standalone view.
-    let lineage_root: Uuid = match state
+    //
+    // 2026-09-08: the `Err` arm is CLASSIFIED, not collapsed. It still walks
+    // from `exec_id` — there is no better anchor to use — but the substitution
+    // is now DISCLOSED (`root_execution_id: null`, plus the note's first arm)
+    // rather than rendered as a measured fact. Pre-fix a failed root read
+    // reported the execution as its own root, and because the tree query
+    // matches `id = $1` the walk came back NON-empty, so `tree_degraded`
+    // stayed false and the response said "no parent or child EXECUTION rows".
+    let (lineage_root, root_unreadable): (Uuid, bool) = match state
         .execution_repo
         .get_execution_lineage_root(exec_id, user_id)
         .await
     {
-        Ok(Some((Some(root), _))) => root, // has an explicit root → use it
-        Ok(Some((None, Some(parent)))) => parent, // parent is the root (no root set on it)
-        Ok(Some((None, None))) | Ok(None) => exec_id, // standalone or not found
+        Ok(Some((Some(root), _))) => (root, false), // has an explicit root → use it
+        Ok(Some((None, Some(parent)))) => (parent, false), // parent is the root (no root set on it)
+        Ok(Some((None, None))) | Ok(None) => (exec_id, false), // standalone or not found
         Err(e) => {
-            // Lineage columns likely don't exist yet — fall back to standalone view
-            tracing::warn!(execution_id = %exec_id, "get_execution_lineage: lineage columns unavailable ({}), returning standalone view", e);
-            exec_id
+            // Lineage columns likely don't exist yet — walk from the anchor,
+            // and SAY that the root is unknown.
+            tracing::warn!(execution_id = %exec_id, event_kind = "lineage_root_unreadable", "get_execution_lineage: lineage root unreadable ({}), walking from the requested execution and disclosing it", e);
+            (exec_id, true)
         }
     };
 
@@ -6297,7 +6350,10 @@ async fn handle_get_execution_lineage(
     let child_runs_count = child_run_items.as_ref().map(Vec::len);
 
     let mut report = serde_json::json!({
-        "root_execution_id": lineage_root.to_string(),
+        // NULL, never the anchor's own id, when the root lookup failed: an id
+        // here is read as "this is the top of the tree", and that is precisely
+        // what an unreadable root cannot establish.
+        "root_execution_id": if root_unreadable { None } else { Some(lineage_root.to_string()) },
         "requested_execution_id": exec_id.to_string(),
         "total_executions_in_lineage": nodes.len(),
         "archived_executions_in_lineage": archived_in_lineage,
@@ -6315,6 +6371,7 @@ async fn handle_get_execution_lineage(
             child_runs_error,
         ),
         "note": lineage_note(
+            root_unreadable,
             tree_degraded,
             archived_in_lineage,
             nodes.len(),
@@ -7536,7 +7593,7 @@ mod lineage_note_tests {
     /// must NOT be called standalone, and must name the count.
     #[test]
     fn a_single_node_tree_with_child_runs_is_not_standalone() {
-        let note = lineage_note(false, 0, 1, Some(1), true);
+        let note = lineage_note(false, false, 0, 1, Some(1), true);
         assert!(
             !note.contains("standalone"),
             "a run that dispatched a child is not standalone: {note}"
@@ -7553,7 +7610,7 @@ mod lineage_note_tests {
     /// kinds the ledger cannot see are named in `child_runs_note`).
     #[test]
     fn a_measured_zero_says_zero_without_saying_standalone() {
-        let note = lineage_note(false, 0, 1, Some(0), true);
+        let note = lineage_note(false, false, 0, 1, Some(0), true);
         assert!(note.contains("no child runs"), "{note}");
         assert!(!note.contains("standalone"), "{note}");
         assert!(note.contains("EXECUTION rows"), "{note}");
@@ -7564,7 +7621,7 @@ mod lineage_note_tests {
     #[test]
     fn an_unreadable_or_unstarted_ledger_renders_unknown_not_zero() {
         for (count, started) in [(None, false), (None, true), (Some(0), false)] {
-            let note = lineage_note(false, 0, 1, count, started);
+            let note = lineage_note(false, false, 0, 1, count, started);
             assert!(note.contains("UNKNOWN"), "{count:?}/{started}: {note}");
             assert!(!note.contains("standalone"), "{count:?}/{started}: {note}");
         }
@@ -7576,12 +7633,78 @@ mod lineage_note_tests {
     #[test]
     fn the_tree_arms_are_independent_of_the_ledger() {
         for count in [None, Some(0), Some(7)] {
-            assert!(lineage_note(true, 0, 1, count, true).contains("could not be read"));
-            assert!(lineage_note(false, 2, 3, count, true).contains("workflow_executions_archive"));
+            assert!(lineage_note(false, true, 0, 1, count, true).contains("could not be read"));
+            assert!(lineage_note(false, false, 2, 3, count, true)
+                .contains("workflow_executions_archive"));
             assert_eq!(
-                lineage_note(false, 0, 4, count, true),
+                lineage_note(false, false, 0, 4, count, true),
                 "Lineage includes all executions linked via root_execution_id."
             );
         }
+    }
+
+    /// 2026-09-08, the defect this arm exists for. Pre-fix a failed
+    /// `get_execution_lineage_root` substituted the anchor's own id, the tree
+    /// query then matched `id = $1` and came back NON-empty, so
+    /// `tree_degraded` was FALSE and this single-node case rendered the
+    /// no-parent sentence. Reinstating that (passing `false` here) makes this
+    /// test fail on the standalone assertion.
+    #[test]
+    fn an_unreadable_root_never_claims_the_execution_has_no_parent() {
+        // The exact combination the defect produced: root read failed, tree
+        // read SUCCEEDED (one node, because the walk anchored on itself).
+        let note = lineage_note(true, false, 0, 1, Some(0), true);
+        assert!(
+            note.contains("ROOT could not be read"),
+            "the root failure must be named: {note}"
+        );
+        assert!(
+            note.contains("UNKNOWN"),
+            "whether it has a parent is unknown, not answered: {note}"
+        );
+        assert!(
+            !note.contains("no parent or child EXECUTION rows"),
+            "an unreadable root must not render the no-parent claim: {note}"
+        );
+        assert!(
+            note.contains("NOT a standalone run"),
+            "and it must refuse the standalone reading in words: {note}"
+        );
+    }
+
+    /// The root failure OUTRANKS every other arm, including the ones that
+    /// would otherwise answer confidently — an archived member and a
+    /// multi-node tree are both facts about a tree walked from the wrong
+    /// anchor.
+    #[test]
+    fn an_unreadable_root_outranks_the_archived_and_multi_node_arms() {
+        for (archived, nodes) in [(0usize, 1usize), (2, 3), (0, 4)] {
+            let note = lineage_note(true, false, archived, nodes, Some(3), true);
+            assert!(
+                note.contains("ROOT could not be read"),
+                "{archived}/{nodes}: {note}"
+            );
+        }
+    }
+
+    /// Both reads failing is ONE sentence, not two contradictory ones: the
+    /// root arm wins and appends the tree failure rather than being shadowed
+    /// by it.
+    #[test]
+    fn an_unreadable_root_and_an_unreadable_tree_are_reported_together() {
+        let note = lineage_note(true, true, 0, 1, None, false);
+        assert!(note.contains("ROOT could not be read"), "{note}");
+        assert!(note.contains("tree read failed as well"), "{note}");
+    }
+
+    /// The CONTROL: a healthy root read leaves every pre-fix sentence
+    /// byte-identical, so the new arm cannot be reached by a working system.
+    #[test]
+    fn a_readable_root_keeps_the_pre_fix_wording() {
+        assert_eq!(
+            lineage_note(false, false, 0, 4, Some(0), true),
+            "Lineage includes all executions linked via root_execution_id."
+        );
+        assert!(!lineage_note(false, false, 0, 1, Some(0), true).contains("ROOT could not be read"));
     }
 }

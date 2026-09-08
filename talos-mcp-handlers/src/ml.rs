@@ -1129,16 +1129,42 @@ async fn handle_get_model_card(
         Ok(tx) => tx,
         Err(e) => return internal(req_id, "get_model_card", &e),
     };
-    let Ok(Some(model)) = ModelRegistry::resolve_by_name(&mut tx, name, user_id).await else {
-        return mcp_error(req_id, -32000, "Model not found");
+    // A read that FAILED is not a model that is absent. Pre-fix both landed on
+    // "Model not found", which during a database incident sends an operator to
+    // look for a deletion that never happened (check 79's shape, and the same
+    // split `require_dataset_owner` already makes above).
+    let model = match ModelRegistry::resolve_by_name(&mut tx, name, user_id).await {
+        Ok(Some(m)) => m,
+        Ok(None) => return mcp_error(req_id, -32000, "Model not found"),
+        Err(e) => {
+            tracing::error!(error = %e, model_name = %name, "get_model_card: model lookup failed");
+            return mcp_error(
+                req_id,
+                -32000,
+                "Could not look up this model — the model registry is unavailable. This \
+                 is NOT a statement that the model is absent; retry, and check \
+                 controller logs.",
+            );
+        }
     };
     let versions = match ModelRegistry::list_versions(&mut tx, model.model_id).await {
         Ok(v) => v,
         Err(e) => return internal(req_id, "get_model_card", &e),
     };
+    // 2026-09-08: the card is read immediately before a PROMOTION decision, so
+    // every one of its five reads used to answer a database failure with the
+    // most reassuring value available — `shadow: null` ("no shadow traffic"),
+    // `teacher_audit: null` ("never audited") and, worst,
+    // `has_pending_disagreements: false` ("no human corrections are waiting").
+    // The ledger nulls each field it could not read and names it, so `null`
+    // means the same thing in all five places and "we did not look" is
+    // distinguishable from "there is nothing there".
+    let mut readings = talos_measurement::Readings::new();
     let dataset_stats = match model.dataset_id {
         Some(did) => match require_dataset_owner(&svc, &mut tx, did, user_id).await {
-            Ok(_) => svc.stats(&mut tx, did).await.ok(),
+            Ok(_) => readings.record("dataset_stats", svc.stats(&mut tx, did).await),
+            // A tenancy refusal, not a read failure: `require_dataset_owner`
+            // is already three-valued and has logged and classified it.
             Err(_) => None,
         },
         None => None,
@@ -1149,36 +1175,54 @@ async fn handle_get_model_card(
     // drift guard judges); the lifetime aggregate rides alongside for
     // context, clearly labeled so nobody feeds it back into a decision.
     let lsvc = lifecycle_service(state);
-    let epoch = talos_ml::shadow_epoch(&mut tx, model.model_id).await.ok();
+    // The epoch NAMES the population the `shadow` block below is computed
+    // over, so an unreadable epoch is a gap in that block's provenance rather
+    // than a decoration — it is recorded, not defaulted.
+    let epoch = readings.record(
+        "shadow.epoch",
+        talos_ml::shadow_epoch(&mut tx, model.model_id).await,
+    );
     // Band floor for BOTH card figures. Deliberately 0 (every band) — the card
     // is a description of all shadow traffic, not a reconstruction of the
     // drift guard's decision, which restricts to the served bands. The value
     // is threaded into the blocks so the rendered `population` string is
     // derived from the query rather than asserted in prose.
     const CARD_MIN_BAND: i16 = 0;
-    let shadow = lsvc
-        .shadow_agreement(&mut tx, model.model_id, CARD_MIN_BAND)
-        .await
-        .ok()
+    let shadow = readings
+        .record(
+            "shadow",
+            lsvc.shadow_agreement(&mut tx, model.model_id, CARD_MIN_BAND)
+                .await,
+        )
         .flatten()
         .map(|(agreement, total)| shadow_epoch_block(agreement, total, epoch, CARD_MIN_BAND));
-    let shadow_lifetime = lsvc
-        .shadow_agreement_lifetime(&mut tx, model.model_id, CARD_MIN_BAND)
-        .await
-        .ok()
+    let shadow_lifetime = readings
+        .record(
+            "shadow_lifetime",
+            lsvc.shadow_agreement_lifetime(&mut tx, model.model_id, CARD_MIN_BAND)
+                .await,
+        )
         .flatten()
         .map(|(agreement, total)| shadow_lifetime_block(agreement, total, CARD_MIN_BAND));
-    let pending_disagreements = lsvc
-        .pending_disagreements(&mut tx, model.model_id, user_id, 1)
-        .await
-        .map(|v| !v.is_empty())
-        .unwrap_or(false);
+    // THREE-valued, and the middle value is the point: `false` here reads as
+    // "no human corrections are waiting", which is exactly the clearance an
+    // operator wants before `ml_promote_model`. A read that did not answer
+    // must not be able to grant it.
+    let pending_disagreements: Option<bool> = readings
+        .record(
+            "has_pending_disagreements",
+            lsvc.pending_disagreements(&mut tx, model.model_id, user_id, 1)
+                .await,
+        )
+        .map(|v| !v.is_empty());
     // Latest teacher-vs-gold audit (null until ml_teacher_audit runs).
-    let teacher_audit = talos_ml::stored_teacher_audit(&mut tx, model.model_id, user_id)
-        .await
-        .ok()
+    let teacher_audit = readings
+        .record(
+            "teacher_audit",
+            talos_ml::stored_teacher_audit(&mut tx, model.model_id, user_id).await,
+        )
         .flatten();
-    let card = serde_json::json!({
+    let mut card = serde_json::json!({
         "model_id": model.model_id.to_string(),
         "name": name,
         "lifecycle_state": model.lifecycle_state,
@@ -1200,6 +1244,9 @@ async fn handle_get_model_card(
         "provenance_note": talos_ml::METRICS_PROVENANCE_NOTE,
         "coverage_curve_note": talos_ml::COVERAGE_CURVE_POPULATION_NOTE,
     });
+    // No-op when all five reads answered, so a healthy card is byte-identical
+    // to the pre-fix one.
+    readings.attach(&mut card);
     mcp_text(
         req_id,
         &serde_json::to_string_pretty(&card).unwrap_or_default(),

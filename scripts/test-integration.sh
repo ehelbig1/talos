@@ -387,6 +387,24 @@ CTRL_TESTS=(
     # end, because the defect is what the create RETURNS and what the report
     # SAYS. `common` (DATABASE_URL) harness, so CTRL_TESTS, not TC_TESTS (64b).
     "push_channel_binding_tests"
+    # ONE TEST PER SITE for the nine fixes #779 shipped with none — it recorded
+    # in its own notes that reverting any of them left every test green. The
+    # rule here is per-SITE rather than per-SHAPE, because "the shape is pinned
+    # elsewhere" is what let `cleanup_module_versions` survive package 23's
+    # mutation. Drives the production dispatch for both halves of
+    # `add_node_to_workflow`'s capability-world gate, the approval WRITE,
+    # export/import, the webhook uniqueness pre-flight, `whoami`, the execution
+    # trace and RFC 0012 P3's own recorded call-site survivor, each with its
+    # control. `common` harness, so CTRL_TESTS (64b).
+    "unguarded_gate_survivor_tests"
+    # The five highest-ranked CLAIM sites the same inventory still carried: the
+    # workflow AUDIT TRAIL (a failed history read reading as "never published" /
+    # "never ran"), the lineage ROOT (a failed lookup substituting the
+    # execution's own id and rendering the standalone claim #771 removed),
+    # `watch_execution`'s event list, the module catalog's install advice, and
+    # the model card's promotion clearance. `common` harness, so CTRL_TESTS
+    # (64b).
+    "claim_read_disclosure_tier3_tests"
     "api_key_tests"
     "api_auth_integration_test"
     "integration_mcp_tests"
