@@ -419,11 +419,27 @@ impl super::WorkflowCreationService {
         } else {
             format!("{}-node", world)
         };
-        if let Ok(lint_errors) = self
+        // The `Err` arm WARNs and proceeds (2026-09-07). Refusing would be
+        // wrong: the full compile below re-runs the identical
+        // `analyze::lint_source_code` static pass and is the enforcing one, so
+        // a lint-runner outage costs compile budget, not a check. What was
+        // wrong was the SILENCE — `talos_inline_compile_service` logs this
+        // (its L-32 arm) and the other two call sites of `lint_code` did not.
+        let lint_outcome = self
             .compiler
             .lint_code(Some(user_id), node_id, &wrapped, &lint_world, None)
-            .await
-        {
+            .await;
+        if let Err(e) = &lint_outcome {
+            tracing::warn!(
+                node_id = %node_id,
+                error = %e,
+                event_kind = "lint_preflight_unavailable",
+                surface = "create_workflow_from_spec",
+                "lint pre-flight could not run; proceeding to the full compile, which \
+                 re-runs the same static analysis and is the enforcing pass"
+            );
+        }
+        if let Ok(lint_errors) = lint_outcome {
             if !lint_errors.is_empty() {
                 let msgs: Vec<String> = lint_errors
                     .iter()

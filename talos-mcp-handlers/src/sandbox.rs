@@ -1000,7 +1000,23 @@ async fn handle_compile_custom_sandbox(
             Err(resp) => return resp,
         };
     if let Some(agent_id) = agent_id_opt {
-        if let Some(max_world) = crate::actor::get_actor_max_world(&state.db_pool, agent_id).await {
+        // 2026-09-07: the ceiling read is three-valued and REFUSES on `Err`.
+        // See `crate::utils::read_actor_ceiling_or_refuse` — pre-fix a DB
+        // fault answered `None` and this whole block was SKIPPED, compiling at
+        // whatever world the role RBAC above allowed. MCP-545 fixed the same
+        // shape on the two runtime gates and did not reach here.
+        let ceiling = match crate::utils::read_actor_ceiling_or_refuse(
+            &state.actor_repo,
+            agent_id,
+            &req_id,
+            "compile_custom_sandbox",
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
+        if let Some(max_world) = ceiling {
             // MCP-462: same asymmetric-unknown closure as MCP-461 in
             // workflow-authorization. The actor side must use the strict
             // rank lookup; unknown ceilings pin to rank 0 so this
@@ -1583,7 +1599,23 @@ async fn handle_run_sandbox(
             Err(resp) => return resp,
         };
     if let Some(agent_id) = agent_id_opt {
-        if let Some(max_world) = crate::actor::get_actor_max_world(&state.db_pool, agent_id).await {
+        // 2026-09-07: three-valued ceiling read; `Err` REFUSES. This is the
+        // highest-blast-radius member of the class — `run_sandbox` compiles
+        // AND EXECUTES caller-supplied Rust at the requested world, so a
+        // skipped ceiling is not an authoring mistake that can be reviewed
+        // later, it is a run. See `crate::utils::read_actor_ceiling_or_refuse`.
+        let ceiling = match crate::utils::read_actor_ceiling_or_refuse(
+            &state.actor_repo,
+            agent_id,
+            &req_id,
+            "run_sandbox",
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
+        if let Some(max_world) = ceiling {
             // MCP-462: actor-side strict rank lookup — same fix as
             // the compile path above (and MCP-461 in
             // workflow-authorization).
@@ -1628,7 +1660,24 @@ async fn handle_run_sandbox(
     } else {
         format!("{}-node", capability_world)
     };
-    if let Ok(lint_errors) = state
+    //
+    // The `Err` arm is a WARN, not a refusal, and that is a MEASURED decision
+    // rather than an omission (2026-09-07). This step was carried as a
+    // "security pre-flight that silently does not run"; it is not one. Every
+    // check `lint_code` performs, the FULL compile performs again:
+    // `compile_to_wasm_with_config` runs the identical
+    // `analyze::lint_source_code` static pass at step 0a and refuses on its
+    // errors, and it alone enforces the dependency allowlist and cargo-audit.
+    // So a skipped pre-flight costs the caller ~30-60 s of compile budget and
+    // nothing else — and refusing here would take `run_sandbox` off the air on
+    // the most likely error this call produces, "Lint queue full. Try again
+    // shortly." (the 60 s compilation-semaphore timeout), for a request the
+    // full compile would have served. What WAS wrong is that the skip left no
+    // trace at all. `talos_inline_compile_service` already reached this
+    // conclusion for the same call (its L-32 arm) and logs; this site and
+    // `talos_workflow_creation::spec` did not — a rule that failed to
+    // replicate across three call sites of one function.
+    let lint_outcome = state
         .compiler
         .lint_code(
             agent.user_id,
@@ -1637,26 +1686,37 @@ async fn handle_run_sandbox(
             &lint_world,
             None,
         )
-        .await
-    {
-        if !lint_errors.is_empty() {
-            let error_msgs: Vec<String> = lint_errors
-                .iter()
-                .map(|e| {
-                    if let (Some(line), Some(col)) = (e.line, e.column) {
-                        format!("Line {}:{}: {}", line, col, e.message)
-                    } else {
-                        e.message.clone()
-                    }
-                })
-                .collect();
-            return mcp_text(
-                req_id,
-                &format!(
+        .await;
+    match lint_outcome {
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                event_kind = "lint_preflight_unavailable",
+                surface = "run_sandbox",
+                "lint pre-flight could not run; proceeding to the full compile, which \
+                 re-runs the same static analysis and is the enforcing pass"
+            );
+        }
+        Ok(lint_errors) => {
+            if !lint_errors.is_empty() {
+                let error_msgs: Vec<String> = lint_errors
+                    .iter()
+                    .map(|e| {
+                        if let (Some(line), Some(col)) = (e.line, e.column) {
+                            format!("Line {}:{}: {}", line, col, e.message)
+                        } else {
+                            e.message.clone()
+                        }
+                    })
+                    .collect();
+                return mcp_text(
+                    req_id,
+                    &format!(
                     "Lint check failed — fix these errors before compiling (saved ~30-60s):\n{}",
                     error_msgs.join("\n")
                 ),
-            );
+                );
+            }
         }
     }
 

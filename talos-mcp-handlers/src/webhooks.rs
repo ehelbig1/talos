@@ -350,10 +350,32 @@ async fn handle_create_webhook(
     // There is no DB-level unique constraint on webhook_triggers.name, so a
     // plain INSERT would silently create two webhooks with the same name —
     // confusing any name-based lookup or dispatch expression.
-    let name_exists = webhook_repo
-        .name_exists_for_user(&name, user_id)
-        .await
-        .unwrap_or(false);
+    //
+    // 2026-09-07: fail CLOSED. Pre-fix this read was `.unwrap_or(false)`, so a
+    // DB fault read as "no webhook has that name" and the uniqueness bound was
+    // lifted by the very fault that made it unreadable — and, as the paragraph
+    // above says, nothing downstream catches it: `webhook_triggers.name`
+    // carries no unique index (verified against the live catalog), so the
+    // duplicate is created and persists. The per-user CAP three lines below
+    // already fails closed for the same reason (MCP-367, "so the cap isn't
+    // silently bypassed"); the two gates in one function disagreed.
+    let name_exists = match webhook_repo.name_exists_for_user(&name, user_id).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                event_kind = "webhook_name_uniqueness_unreadable",
+                "create_webhook: could not check webhook-name uniqueness; refusing rather \
+                 than creating a possibly-duplicate webhook"
+            );
+            return mcp_error(
+                req_id,
+                -32000,
+                "Could not check whether a webhook with this name already exists, so \
+                 uniqueness could not be enforced. No webhook was created. Retry shortly.",
+            );
+        }
+    };
     if name_exists {
         return mcp_error(
             req_id,

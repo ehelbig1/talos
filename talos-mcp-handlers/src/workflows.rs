@@ -2282,8 +2282,20 @@ async fn handle_add_node_to_workflow(
     // the actor's max_capability_world. This catches mismatches at authoring time
     // (rather than failing at execution time after burning retry slots).
     if let Some(actor_id) = workflow_actor_id {
-        let actor_world: Option<String> =
-            crate::actor::get_actor_max_world(&state.db_pool, actor_id).await;
+        // 2026-09-07: three-valued ceiling read; `Err` REFUSES rather than
+        // skipping the gate. See `crate::utils::read_actor_ceiling_or_refuse`
+        // for why (and for why `Ok(None)` deliberately keeps proceeding).
+        let actor_world: Option<String> = match crate::utils::read_actor_ceiling_or_refuse(
+            &state.actor_repo,
+            actor_id,
+            &req_id,
+            "add_node_to_workflow",
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
         if let Some(actor_max) = actor_world {
             // Check inline code world
             let node_world = args
@@ -2316,10 +2328,39 @@ async fn handle_add_node_to_workflow(
             // Check existing module's world (for module_id path)
             if !module_id_str.is_empty() && node_world.is_empty() {
                 if let Ok(tid) = module_id_str.parse::<uuid::Uuid>() {
-                    if let Ok(world_map) = state
+                    // 2026-09-07: the OTHER half of this same ceiling gate. The
+                    // module-world read REFUSES on `Err` — pre-fix
+                    // `if let Ok(world_map)` skipped the check on a DB fault
+                    // and the node was added at whatever world the module
+                    // declares. `talos_workflow_authorization` propagates this
+                    // exact read with `.map_err(CreatorAuthError::Database)?`;
+                    // repairing only the actor-ceiling read above and leaving
+                    // this one is how the class survived MCP-545 in the first
+                    // place.
+                    let world_map = match state
                         .workflow_repo
                         .get_module_capability_worlds(&[tid])
                         .await
+                    {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::error!(
+                                module_id = %tid,
+                                error = %e,
+                                event_kind = "capability_ceiling_unreadable",
+                                surface = "add_node_to_workflow.module_world",
+                                "module capability-world read failed; refusing rather than \
+                                 adding a node without the ceiling check"
+                            );
+                            return mcp_error(
+                                req_id,
+                                -32000,
+                                "Could not read this module's capability world, so the actor's \
+                                 capability-world ceiling could not be enforced. The node was \
+                                 not added. Retry shortly.",
+                            );
+                        }
+                    };
                     {
                         let module_world = world_map
                             .get(&tid)
@@ -2413,10 +2454,36 @@ async fn handle_add_node_to_workflow(
                     tid
                 }
             };
-            if let Ok(templates) = state
+            // 2026-09-07: this read gates the ONLY pre-flight validation a node
+            // config gets — `validate_config_against_schema`,
+            // `validate_config_patterns`, the vault-grant report and the
+            // template's `effective_max_retries`. Pre-fix `if let Ok(templates)`
+            // skipped all four on a DB fault and persisted the node, so an
+            // out-of-enum or wrong-typed config failed opaquely inside the WASM
+            // guest at run time instead of being rejected here. Refuse.
+            let templates = match state
                 .workflow_repo
                 .get_templates_by_ids(&[resolved_tid])
                 .await
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!(
+                        template_id = %resolved_tid,
+                        error = %e,
+                        event_kind = "node_config_validation_unreadable",
+                        surface = "add_node_to_workflow",
+                        "template read failed; refusing rather than persisting a node whose \
+                         config was never validated against its schema"
+                    );
+                    return mcp_error(
+                        req_id,
+                        -32000,
+                        "Could not read this module's template, so the node config could not \
+                         be validated against its schema. The node was not added. Retry shortly.",
+                    );
+                }
+            };
             {
                 if let Some(template) = templates.first() {
                     template_max_retries = Some(template.effective_max_retries());
@@ -5697,8 +5764,26 @@ async fn handle_export_workflow(
     {
         Ok(m) => m,
         Err(e) => {
-            tracing::error!("export_workflow module fetch failed: {}", e);
-            vec![]
+            // 2026-09-07: REFUSE. `export_workflow` is the platform's backup
+            // and portability primitive, and pre-fix a failed metadata read
+            // shipped a bundle carrying `modules: []` with no flag of any kind
+            // — a corrupt backup byte-indistinguishable from a legitimate
+            // module-less workflow, which `import_workflow` would then happily
+            // reconstitute without the modules. There is no partial answer to
+            // give here: a bundle is either complete or it is not a bundle.
+            tracing::error!(
+                error = %e,
+                event_kind = "export_module_metadata_unreadable",
+                "export_workflow: module metadata fetch failed; refusing rather than emitting \
+                 a bundle whose empty module list is indistinguishable from a real one"
+            );
+            return Some(mcp_error(
+                req_id.clone(),
+                -32000,
+                "Could not read this workflow's module metadata, so the export bundle would \
+                 have been incomplete with no way for you to tell. No bundle was produced. \
+                 Retry shortly.",
+            ));
         }
     };
 
@@ -5791,11 +5876,29 @@ async fn handle_import_workflow(
     let module_ids = talos_workflow_repository::extract_module_ids_from_graph_value(&graph_json);
 
     if !module_ids.is_empty() {
-        let existing_ids = state
-            .workflow_repo
-            .modules_exist(&module_ids)
-            .await
-            .unwrap_or_default();
+        // 2026-09-07: REFUSE rather than call every module missing. Pre-fix
+        // `.unwrap_or_default()` turned a failed existence read into an empty
+        // "these exist" set, so EVERY referenced module was classified missing
+        // and the branch below recompiled each one from the bundle and wrote
+        // new module rows — a database fault answered with a pile of compiles
+        // and overwrites — or, for modules with no bundled source, refused the
+        // import with "modules missing" naming modules that exist. The
+        // correct handling of this exact read is already in this file:
+        // `ensure_modules_exist` (l.1500) matches and returns
+        // `crate::utils::database_error`.
+        let existing_ids = match state.workflow_repo.modules_exist(&module_ids).await {
+            Ok(ids) => ids,
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    event_kind = "module_existence_unreadable",
+                    surface = "import_workflow",
+                    "could not determine which referenced modules already exist; refusing \
+                     rather than treating all of them as missing and recompiling"
+                );
+                return Some(crate::utils::database_error(req_id.clone()));
+            }
+        };
         let existing: std::collections::HashSet<uuid::Uuid> = existing_ids.into_iter().collect();
 
         let missing: Vec<uuid::Uuid> = module_ids

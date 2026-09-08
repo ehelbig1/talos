@@ -134,9 +134,24 @@ impl WorkflowRepository {
     // ── Tagging ───────────────────────────────────────────────────────────
 
     /// Get the current tag count for a workflow.
+    ///
+    /// The `::bigint` cast is load-bearing (2026-09-07). `array_length` returns
+    /// `integer`, so `coalesce(array_length(tags, 1), 0)` is INT4 and decoding
+    /// it into `i64` fails with
+    /// `ColumnDecode { .. "Rust type `i64` (as SQL type `INT8`) is not
+    /// compatible with SQL type `INT4`" }` — on EVERY call that finds a row.
+    /// The statement PREPAREs and PLANs perfectly (so check 88 cannot see it)
+    /// and `fetch_optional` returns `Ok(None)` when nothing matches (so a
+    /// nonexistent workflow looked fine), which is why this survived: the only
+    /// caller, `handle_tag_workflow`'s 100-tag cap, read the error through
+    /// `.unwrap_or(0)`. So the cap was not merely fail-OPEN during a database
+    /// fault — it had never once been evaluated. Measured live 2026-09-07 by
+    /// the CONTROL arm of `fail_open_gate_tests`, which is the whole argument
+    /// for a control: the degraded arm alone would have looked correct.
     pub async fn get_tag_count(&self, workflow_id: Uuid, user_id: Uuid) -> Result<i64> {
         let count: i64 = sqlx::query_scalar(
-            "SELECT coalesce(array_length(tags, 1), 0) FROM workflows WHERE id = $1 AND user_id = $2",
+            "SELECT coalesce(array_length(tags, 1), 0)::bigint FROM workflows \
+             WHERE id = $1 AND user_id = $2",
         )
         .bind(workflow_id)
         .bind(user_id)

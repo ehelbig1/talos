@@ -270,20 +270,42 @@ async fn handle_whoami(
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
     let repo = &state.actor_repo;
+    // Every read here is DISCLOSED, not defaulted (2026-09-07).
+    //
+    // `whoami` is the tool an operator reaches for when something is already
+    // wrong, so it must not REFUSE the way `get_wasm_config` does (MCP-552,
+    // 40 lines below) — but nor may it answer a database fault with an
+    // identity. Pre-fix a failed ceiling read rendered
+    // `capability_ceiling: "http-node"`, a hardcoded literal presented as this
+    // user's authorization ceiling, and a failed admin read rendered
+    // `is_platform_admin: false`. Both are statements about authority, and
+    // both were indistinguishable from the measured answer.
+    //
+    // `Ok(None)` on the ceiling KEEPS `"http-node"`: no grant row is the
+    // documented permissive default (`user_capability_grants
+    // .max_capability_world NOT NULL DEFAULT 'http-node'`), and it is a
+    // measured answer. Only `Err` is unmeasured.
+    let mut readings = talos_measurement::Readings::new();
     let (email, org, ceiling, is_admin) = match agent.user_id {
         Some(uid) => {
-            let email = repo.get_user_email(uid).await.ok().flatten();
-            let org = repo.get_user_org_summary(uid).await.ok().flatten();
-            let ceiling = repo
-                .get_user_max_capability_world(uid)
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| "http-node".to_string());
-            let is_admin = repo.is_platform_admin(uid).await.unwrap_or(false);
+            let email = readings
+                .record("email", repo.get_user_email(uid).await)
+                .flatten();
+            let org = readings
+                .record("organization", repo.get_user_org_summary(uid).await)
+                .flatten();
+            let ceiling = readings
+                .record(
+                    "capability_ceiling",
+                    repo.get_user_max_capability_world(uid).await,
+                )
+                .map(|opt| opt.unwrap_or_else(|| "http-node".to_string()));
+            let is_admin = readings.record("is_platform_admin", repo.is_platform_admin(uid).await);
             (email, org, ceiling, is_admin)
         }
-        None => (None, None, "http-node".to_string(), false),
+        // No user id on the token: nothing to read, and the pre-existing
+        // answer is a measured one about an unbound agent.
+        None => (None, None, Some("http-node".to_string()), Some(false)),
     };
     let body = serde_json::json!({
         "agent": {
@@ -308,6 +330,8 @@ async fn handle_whoami(
                             create the MCP token under your own account (UI → API keys / MCP agents) \
                             so ownership matches.",
     });
+    let mut body = body;
+    readings.attach(&mut body);
     mcp_text(
         req_id,
         &serde_json::to_string_pretty(&body).unwrap_or_default(),

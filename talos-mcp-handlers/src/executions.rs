@@ -4678,6 +4678,11 @@ async fn handle_get_execution_cost(
     //      `__node_timings__` stamping landed (commit 0085b3d) — those
     //      have no `__node_timings__` key, but the events still exist,
     //      so we should never report `node_count: 0` for them.
+    // Every read in this handler is DISCLOSED, not defaulted (2026-09-07). The
+    // ledger is opened HERE, above the event fallback, for the reason check 74b
+    // already recorded against `handle_get_catalog_status`: a guard placed
+    // below the first swallow cannot see it.
+    let mut readings = talos_measurement::Readings::new();
     let mut per_node: Vec<serde_json::Value> = output_json
         .get("__node_timings__")
         .and_then(|v| v.as_object())
@@ -4691,11 +4696,21 @@ async fn handle_get_execution_cost(
 
     if per_node.is_empty() {
         // Event fallback — reconstruct durations from execution_events.
-        let events = state
-            .execution_repo
-            .list_execution_events(exec_id)
-            .await
+        // The event FALLBACK is the only timing source left when the
+        // node-timings stamp is absent, so an unreadable event list is not an
+        // execution with no nodes — it is an execution whose timings nobody
+        // could take. Disclosed rather than defaulted (2026-09-07), and the
+        // ledger was already open above.
+        let events = readings
+            .record(
+                "per_node_timings",
+                state.execution_repo.list_execution_events(exec_id).await,
+            )
             .unwrap_or_default();
+        // allow-benign-default: the graph is read ONLY to prettify node UUIDs
+        // into authored labels. On failure every label falls back to the bare
+        // UUID beside numbers that are untouched — the label-prettification
+        // shape check 79b excludes for the same reason.
         let graph_str = state
             .execution_repo
             .get_workflow_graph_for_user(workflow_id, user_id)
@@ -4753,13 +4768,22 @@ async fn handle_get_execution_cost(
     // mathematically identical to `total_node_time_ms` (the average
     // is total/count) — emitting both was redundant and misleading
     // operators about what compute_units measured.
-    let total_fuel_consumed: i64 = state
-        .analytics_repo
-        .get_execution_node_fuel(exec_id, user_id)
-        .await
-        .ok()
-        .map(|rows| rows.iter().map(|(_, _, fuel, _, _)| *fuel).sum())
-        .unwrap_or(0);
+    //
+    // DISCLOSED, not defaulted (2026-09-07). Pre-fix the `.ok() … unwrap_or(0)`
+    // answered a failed rollup read with `total_fuel_consumed: 0` and
+    // `compute_units: 0` — "this execution cost nothing", on the tool an
+    // operator opens to find out what an execution cost. A cost of zero is a
+    // measurable outcome (a run that burned no fuel), so zero cannot also mean
+    // "we could not read it".
+    let total_fuel_consumed: Option<i64> = readings
+        .record(
+            "total_fuel_consumed",
+            state
+                .analytics_repo
+                .get_execution_node_fuel(exec_id, user_id)
+                .await,
+        )
+        .map(|rows| rows.iter().map(|(_, _, fuel, _, _)| *fuel).sum());
 
     // MCP-19: emit numeric values directly rather than format!-strings.
     // Round to 2 decimals via the same shape format_percent uses (×100 for
@@ -4771,7 +4795,7 @@ async fn handle_get_execution_cost(
             0.0
         }
     };
-    let result = serde_json::json!({
+    let mut result = serde_json::json!({
         "execution_id": exec_id.to_string(),
         "total_duration_ms": total_duration_ms,
         "node_count": node_count,
@@ -4783,6 +4807,7 @@ async fn handle_get_execution_cost(
         "per_node_timings": per_node,
         "timing_source": timing_source,
     });
+    readings.attach(&mut result);
 
     respond_maybe_archived(
         req_id,
@@ -5310,6 +5335,11 @@ pub async fn build_execution_trace_json(
     let actor_id = exec.actor_id;
     let provenance = exec.provenance.clone();
 
+    // Every read below is DISCLOSED, not defaulted (2026-09-07). The ledger is
+    // opened here, above the first of them.
+    let mut readings = talos_measurement::Readings::new();
+    // allow-benign-default: label prettification only — a failed graph read
+    // renders bare node UUIDs beside untouched counts.
     let graph_str = state
         .execution_repo
         .get_workflow_graph_for_user(workflow_id, user_id)
@@ -5318,11 +5348,15 @@ pub async fn build_execution_trace_json(
         .flatten();
     let node_label_map = build_node_label_map(graph_str);
 
-    let event_rows = state
-        .execution_repo
-        .list_execution_events(exec_id)
-        .await
-        .unwrap_or_default();
+    // The event rows ARE this trace: `nodes` and every `summary` count are
+    // derived from them, so an unreadable list rendered as "this execution ran
+    // no nodes". Disclosed (2026-09-07).
+    let events_read = readings.record(
+        "nodes",
+        state.execution_repo.list_execution_events(exec_id).await,
+    );
+    let events_measured = events_read.is_some();
+    let event_rows = events_read.unwrap_or_default();
 
     struct NodeTrace {
         order: usize,
@@ -5432,11 +5466,14 @@ pub async fn build_execution_trace_json(
         wall_time_ms: i64,
         effective_max_fuel: i64,
     }
-    let fuel_by_label: std::collections::HashMap<String, NodeFuel> = state
-        .analytics_repo
-        .get_execution_node_fuel(exec_id, user_id)
-        .await
-        .ok()
+    let fuel_by_label: std::collections::HashMap<String, NodeFuel> = readings
+        .record(
+            "per_node_fuel",
+            state
+                .analytics_repo
+                .get_execution_node_fuel(exec_id, user_id)
+                .await,
+        )
         .unwrap_or_default()
         .into_iter()
         .map(|(label, mid, fuel, wall, ceiling)| {
@@ -5623,11 +5660,22 @@ pub async fn build_execution_trace_json(
     //
     // Bounded: list_child_executions caps at 64 rows. Cheap join over an
     // indexed column; no unbounded scan even for fan-out-heavy parents.
-    let sub_executions: Vec<serde_json::Value> = state
-        .execution_repo
-        .list_child_executions(exec_id, user_id)
-        .await
-        .ok()
+    //
+    // DISCLOSED, not defaulted (2026-09-07). Pre-fix `.ok().unwrap_or_default()`
+    // rendered `sub_executions: []` and `summary.sub_execution_count: 0` on a
+    // failed read — "this execution dispatched no children" — and this helper
+    // backs THREE surfaces (`get_execution_trace`,
+    // `get_execution_status(detail: true)` and `trigger_workflow(wait_ms)`), so
+    // one swallow makes the same false claim in three places.
+    let sub_read = readings.record(
+        "sub_executions",
+        state
+            .execution_repo
+            .list_child_executions(exec_id, user_id)
+            .await,
+    );
+    let sub_measured = sub_read.is_some();
+    let sub_executions: Vec<serde_json::Value> = sub_read
         .unwrap_or_default()
         .into_iter()
         .map(|c| {
@@ -5647,7 +5695,9 @@ pub async fn build_execution_trace_json(
             })
         })
         .collect();
-    let sub_execution_count = sub_executions.len();
+    // `null`, never `0`: an unreadable child list is UNKNOWN, and zero children
+    // is a real and common answer that must stay distinguishable from it.
+    let sub_execution_count = sub_measured.then_some(sub_executions.len());
 
     let warning_count = warnings.len();
     let result = serde_json::json!({
@@ -5661,13 +5711,16 @@ pub async fn build_execution_trace_json(
         "total_duration_ms": total_duration_ms,
         "error": error_message,
         "nodes": nodes_json,
-        "sub_executions": sub_executions,
+        "sub_executions": sub_measured.then_some(sub_executions),
         "warnings": warnings,
         "summary": {
-            "total_nodes": total_nodes,
-            "completed": completed,
-            "failed": failed,
-            "skipped": skipped,
+            // `null`, never `0`: these four are counted from `event_rows`, and
+            // "this execution ran no nodes" must not be what an unreadable
+            // event list looks like.
+            "total_nodes": events_measured.then_some(total_nodes),
+            "completed": events_measured.then_some(completed),
+            "failed": events_measured.then_some(failed),
+            "skipped": events_measured.then_some(skipped),
             "sub_execution_count": sub_execution_count,
             "warning_count": warning_count,
         }
@@ -5680,6 +5733,7 @@ pub async fn build_execution_trace_json(
     // this stamp that reads as "the workflow ran no nodes", which is a
     // statement about the workflow rather than about retention.
     let mut result = result;
+    readings.attach(&mut result);
     stamp_archived(&mut result, archived_at);
 
     Ok(serde_json::to_string_pretty(&result).unwrap_or_default())
@@ -6612,8 +6666,29 @@ async fn handle_submit_workflow_approval(
     {
         Ok(rows) => rows,
         Err(e) => {
-            tracing::error!(%exec_id, "submit_workflow_approval: DB update failed: {:#}", e);
-            0
+            // 2026-09-07: REFUSE with the right diagnosis. Pre-fix a failed
+            // approval WRITE defaulted to `0` rows, which fell into the
+            // `db_rows_updated == 0` arm below and told the operator
+            // "No pending approval found for this execution. It may have
+            // already been decided" — a specific, confident, WRONG diagnosis
+            // on a human-approval gate, and the one that stops a retry: an
+            // operator who believes the decision already landed does not
+            // submit it again, and the execution stays parked. Zero rows and
+            // an unwritable row are different facts.
+            tracing::error!(
+                %exec_id,
+                error = %format!("{e:#}"),
+                event_kind = "approval_decision_unwritable",
+                "submit_workflow_approval: DB update failed; refusing rather than reporting \
+                 'no pending approval'"
+            );
+            return mcp_error(
+                req_id,
+                -32000,
+                "Could not record the approval decision — the write failed. This is NOT a \
+                 statement that the approval was already decided or that none is pending; \
+                 the decision has not been recorded. Retry shortly.",
+            );
         }
     };
 
