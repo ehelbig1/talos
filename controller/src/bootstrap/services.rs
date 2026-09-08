@@ -707,6 +707,34 @@ pub(crate) async fn build_platform_services(
         }
     };
 
+    // ---------- Push-channel inventories (operator surfaces) ----------
+    //
+    // Built UNCONDITIONALLY, and deliberately not from the watch SERVICES: each
+    // inventory holds a bare pool, so it cannot create a watch (and cannot race
+    // the create lock), and it can be built whether or not that integration's
+    // push RECEIVER is wired. That matters — a watch ROW survives
+    // `GCP_PUBSUB_AUDIENCE` being unset, and a channel invisible to the operator
+    // because a receiver env var is absent is exactly the failure this reports.
+    //
+    // All THREE integrations are enrolled even though `google_calendar` has zero
+    // channels on the reference fleet: a survey that silently covers two of
+    // three is the misleading-report class one level up.
+    let push_channel_inventories = Some(std::sync::Arc::new(
+        talos_push_channel_inventory::PushChannelInventorySet::new(vec![
+            std::sync::Arc::new(
+                gmail::watch_channel_service::GmailPushChannelInventory::new(db_pool.clone()),
+            ),
+            std::sync::Arc::new(
+                google_calendar::watch_channel_service::GcalPushChannelInventory::new(
+                    db_pool.clone(),
+                ),
+            ),
+            std::sync::Arc::new(
+                google_cloud::watch_channel_service::GcpPushChannelInventory::new(db_pool.clone()),
+            ),
+        ]),
+    ));
+
     // ---------- Initialize Atlassian (Jira) integration service ----------
     let atlassian_integration_service = std::sync::Arc::new(
         atlassian::AtlassianIntegrationService::new(db_pool.clone())
@@ -1166,6 +1194,7 @@ pub(crate) async fn build_platform_services(
         oauth_service,
         auth_rate_limiter,
         idempotency_service,
+        push_channel_inventories,
     })
 }
 

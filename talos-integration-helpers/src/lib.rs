@@ -38,6 +38,7 @@ pub mod audit;
 pub mod google_jwt;
 pub mod renewal;
 pub mod state_store;
+pub mod watch_binding;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;

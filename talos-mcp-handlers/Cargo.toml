@@ -64,6 +64,10 @@ talos-memory = { path = "../talos-memory" }
 talos-memory-ranking = { path = "../talos-memory-ranking" }
 talos-module-repository = { path = "../talos-module-repository" }
 talos-oauth = { path = "../talos-oauth" }
+# The push-channel inventory TRAIT. LEAF (types + one pure classification):
+# this crate must NOT depend on talos-gmail / talos-google-calendar /
+# talos-google-cloud, which sit above it.
+talos-push-channel-inventory = { path = "../talos-push-channel-inventory" }
 talos-registry = { path = "../talos-registry" }
 talos-rate-limit = { path = "../talos-rate-limit" }
 talos-replay-diff = { path = "../talos-replay-diff" }

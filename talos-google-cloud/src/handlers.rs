@@ -489,21 +489,26 @@ pub async fn create_watch_channel_handler(
             .into_response()
         }
         Err(e) => {
-            // Log full chain server-side, generic to client. create_watch
-            // failures carry SA-validation / integration-lookup / sqlx
-            // detail — none of which is safe for the API surface.
-            tracing::error!(
+            // CLASSIFIED, not collapsed. Pre-2026-09-08 every failure rendered
+            // `500 "Failed to create watch channel"`, so "the module you named
+            // does not exist" — a request the caller can fix — was
+            // indistinguishable from a database fault. `Internal` still
+            // collapses to the generic string: those carry integration-lookup
+            // and sqlx detail that must not reach an API surface.
+            tracing::warn!(
+                target: "talos_audit",
+                event_kind = e.event_kind(),
                 user_id = %user_id,
                 integration_id = %req.integration_id,
-                error = %e,
-                "Failed to create GCP watch channel"
+                error = %format!("{e:#}"),
+                "GCP watch channel create refused"
             );
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                e.status_code(),
                 Json(ApiResponse::<serde_json::Value> {
                     success: false,
                     data: None,
-                    error: Some("Failed to create watch channel".to_string()),
+                    error: Some(e.user_facing_message()),
                 }),
             )
                 .into_response()

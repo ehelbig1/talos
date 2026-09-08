@@ -48,7 +48,7 @@ use talos_memory::integration_state_rpc::{
 };
 use uuid::Uuid;
 
-pub(crate) const GCAL_INTEGRATION_NAME: &str = "gcal";
+pub const GCAL_INTEGRATION_NAME: &str = "gcal";
 
 /// Serialized form of a `WatchChannel` stored in
 /// `integration_state.value`. Kept separate from the `WatchChannel`
@@ -59,22 +59,22 @@ pub(crate) const GCAL_INTEGRATION_NAME: &str = "gcal";
 /// rows will have the old shape. Prefer adding new fields with
 /// `#[serde(default)]` over renaming or removing existing ones.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct WatchChannelRow {
-    pub(crate) id: Uuid,
-    pub(crate) integration_id: Uuid,
-    pub(crate) calendar_id: String,
-    pub(crate) channel_id: String,
-    pub(crate) resource_id: String,
-    pub(crate) webhook_url: String,
-    pub(crate) expiration_ms: i64,
+pub struct WatchChannelRow {
+    pub id: Uuid,
+    pub integration_id: Uuid,
+    pub calendar_id: String,
+    pub channel_id: String,
+    pub resource_id: String,
+    pub webhook_url: String,
+    pub expiration_ms: i64,
     #[serde(default)]
-    pub(crate) sync_token: Option<String>,
+    pub sync_token: Option<String>,
     #[serde(default)]
-    pub(crate) module_id: Option<Uuid>,
+    pub module_id: Option<Uuid>,
     #[serde(default)]
-    pub(crate) last_message_number: i64,
-    pub(crate) created_at_ms: i64,
-    pub(crate) updated_at_ms: i64,
+    pub last_message_number: i64,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
 }
 
 impl WatchChannelRow {
@@ -163,6 +163,27 @@ impl GoogleCalendarService {
         }
 
         let user_id = user_id_for_integration(&self.db_pool, integration_id).await?;
+
+        // Refuse a binding to a module this user cannot load, BEFORE the lock
+        // and before any Google-side call, so a refusal leaves nothing behind.
+        //
+        // The refusal is flattened into `anyhow` here rather than typed the way
+        // gmail's and google_cloud's are, and the reason is measured rather than
+        // stylistic: this integration's REST create passes a literal `None`
+        // (`handlers.rs`), so the ONLY caller that supplies a `module_id` is the
+        // GraphQL `create_module_from_template`, which passes a module it created
+        // three statements earlier. There is no caller for whom a 400-vs-503
+        // distinction is actionable, and typing it would ripple through the
+        // GraphQL mutation for a distinction nobody can act on. The DECISION and
+        // the operator `event_kind` are still the shared ones.
+        talos_integration_helpers::watch_binding::check_module_binding(
+            &self.db_pool,
+            user_id,
+            module_id,
+            GCAL_INTEGRATION_NAME,
+        )
+        .await
+        .map_err(|refusal| anyhow::anyhow!("{}", refusal.user_facing_message()))?;
 
         // Serialize creation per (user, integration, calendar) so two
         // concurrent callers can't both pass the "no existing channel"

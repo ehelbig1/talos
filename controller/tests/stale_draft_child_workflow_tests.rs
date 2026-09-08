@@ -117,6 +117,7 @@ fn hygiene_service(pool: &Pool<Postgres>) -> talos_hygiene_service::HygieneServi
             pool.clone(),
         )),
         Arc::new(talos_module_repository::ModuleRepository::new(pool.clone())),
+        None,
     )
 }
 

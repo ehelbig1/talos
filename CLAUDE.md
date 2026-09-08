@@ -2951,6 +2951,166 @@ the in-file count test is stronger and costs no check number. "Every
 `BackgroundTask` must be pre-seeded" is not expressible as a defect: the enum
 and the seed list come from one macro table.
 
+### 2026-09-08 — the channel nobody could see, validate, or be told was dead
+
+Package 25 (2026-09-07) made every failed push to the dangling GCP channel write
+an audit row and log the ids, and recorded three remainders WITH REASONS: no MCP
+tool lists push channels, `create_watch` never validates the `module_id` it
+binds, and the hygiene report does not know push channels exist. All three are
+closed here, and each reason held — none was re-argued.
+
+**What was refuted before anything changed.** The brief said the GCP watch row's
+`idx_ts_1` was unused; it is `last_push_received_ms` (the storage table in
+`watch.rs` says so, `upsert_row` binds it) and BOTH live watch rows carry it.
+That makes the rejection of "write the module id into an index slot" STRONGER,
+not weaker: all three usable slots are occupied and the fourth (`idx_int_1`) is
+a `bigint`. And the brief's "GCP is the only module-binding channel" is a fact
+about the FLEET, not the code — **gmail's create takes a caller-supplied
+`module_id` and validated it no more than GCP did**, while its summary resolved
+module names with `.unwrap_or_default()`, the exact collapse #778's
+`classify_module_binding` had removed one integration over. GCal's REST create
+passes a literal `None`, so its only module-binding caller is the GraphQL
+`create_module_from_template`, which binds a module it created three statements
+earlier — safe by CONSTRUCTION, not by validation, and one refactor away from
+not being.
+
+**The RED measurement.** On pristine `origin/main`, driving the production REST
+handler: a create naming a random uuid returned `200 OK` and landed a row, with
+both controls (a real module; no module at all) green. The live row that
+motivated all of this — `integration_state (google_cloud, watch/43773540-…)`,
+display name "sandbox-monitoring", created 2026-07-17 — names a module matching
+**0** of 112 rows in `modules`, 0 `module_executions` and 0 `admin_event_log`
+entries.
+
+**The gate has ONE home**, `talos_integration_helpers::watch_binding::
+check_module_binding`, because the mapping from a three-valued visibility read
+to a refusal IS the decision and two copies of a decision is two answers. The
+READ it consults is new: `talos_registry::module_visibility::{module_visibility,
+visible_module_names}`, sited beside the dispatch-time `get_module` whose
+predicate it is pinned equal to — `get_module` folds "no such row" and "the
+query failed" into one `Err`, which is correct for a dispatcher and is exactly
+why package 25 could not build this gate. `ModuleVisibility` is `#[must_use]`
+with no `Into<Option>`, no `is_visible()` boolean and no `.ok()` (the
+`ExecutionLookup` / `WorkflowDispatchLookup` shape).
+
+**The two refusals are ONE caller sentence and TWO operator `event_kind`s.**
+Splitting "no such module" from "not yours" in the reply is a module-existence
+oracle for anyone who can guess a uuid (`caller_facing_unauthorized`'s argument,
+#754's collapsed `write_ceiling_unreadable`). `Unreadable` is a SEPARATE,
+retryable refusal at 503: refusing with "that module does not exist" while the
+database is the broken thing is the determinate negative checks 74 / 79 / 81
+exist to remove, and the create is still refused because a channel minted on an
+unverified binding is what the gate is for. The gate runs ABOVE the create lock
+and above any upstream API call, so a refusal leaves nothing behind — asserted
+on ROWS, not on the returned status, because a status assertion alone passes on
+a tree where the write would have failed anyway. `CreateWatchError` is a typed
+enum rather than one `anyhow::Error`, so the compiler asked both GCP call sites
+and both gmail ones how they render it; pre-fix every failure rendered
+`500 "Failed to create watch channel"`, which is right for an internal error and
+wrong for a request the caller can fix.
+
+**Deliberately NOT gated: the RENEWAL path.** `create_fresh_watch_locked` /
+`create_fresh_watch_channel_locked` re-use an already-admitted binding, and
+refusing a renewal because the module was deleted meanwhile takes a LIVE watch
+off the air rather than stopping a new one being created wrong — #777's resume
+argument. GCal's refusal is flattened into `anyhow` rather than typed, and the
+reason is measured: it has no caller for whom 400-vs-503 is actionable.
+
+**The operator surface is ONE trait in a NEW leaf crate**,
+`talos-push-channel-inventory` — `PushChannelInventory`, `PushChannelRow`, the
+four-valued `ModuleBinding`, `classify_module_binding` (MOVED from
+`talos-google-cloud`, not copied) and the `PushChannelInventorySet` newtype that
+hides the `dyn`. It is leaf on purpose: `talos-mcp-handlers` and
+`talos-hygiene-service` sit BELOW the integration crates and the edge the other
+way is the layering inversion package 25 refused. It deliberately does not
+depend on `talos-integration-helpers` either — that pulls in secrets-manager,
+envelope-seal, memory and reqwest — so `RenewalFailure` is re-expressed as a
+three-field `PushChannelFailure` and converted at each integration. **A
+`PushChannelRow` carries no push token, no endpoint (the GCP endpoint embeds the
+raw token) and no payload**, pinned by a unit test AND by a DB test over a real
+row.
+
+**All THREE integrations are enrolled**, including gcal, whose channel count on
+this fleet is ZERO. A survey that silently covers two of three is the
+misleading-report class one level up. Each impl is a POOL-ONLY struct rather
+than the watch service: it can then be built whether or not that integration's
+push RECEIVER is wired (a watch ROW outlives `GCP_PUBSUB_AUDIENCE`, and a
+channel invisible because a receiver env var is absent is exactly the failure
+being reported), and it cannot create a watch, so it can never race the create
+lock. `list_rows_for_user` became a free function in each `watch.rs` and the
+service method delegates, so the two readers cannot drift.
+
+**`list_push_channels` is a tool of its own, and the default was argued.**
+`list_workflow_triggers` is keyed by WORKFLOW; a push channel binds a MODULE and
+carries no workflow id at all, so this fleet's one live example would have
+appeared under no workflow however that tool was extended. The hygiene report
+carries the FINDING; the tool carries the INVENTORY, including the healthy
+channels the report deliberately says nothing about. `None` inventory renders
+`channels: null, measured: false` — never `[]`.
+
+**The hygiene section obeys "nothing to say ⇒ no key" (#762).**
+`PushChannelReadout` is THREE-valued: `NotConsulted` (this process wired no
+inventory — SILENCE, not zero, and it contributes nothing to `total_issues`,
+which has never spoken about push channels) and `Surveyed`, which emits
+`dangling_push_channels` + `push_channel_survey` only when there is a finding, an
+unclassifiable binding, or an unreadable integration. A fleet whose channels are
+all healthy gets a byte-identical report — pinned by a test that compares every
+key. `unclassifiable` (the module lookup did not answer) is disclosed SEPARATELY
+and is not counted as dangling: that would put a pool timeout in the same bucket
+as a permanently dead channel. An integration whose LIST read failed goes in the
+`Readings` ledger, so `total_issues` and the severity buckets NULL and
+`degraded_recommendation` names the field. Severity is `critical` in BOTH the
+bucket and the recommendation — a bucket and a recommendation disagreeing about
+one finding is the contradiction-in-one-response class, and the first draft here
+had exactly that (bucket `high`, recommendation `critical`).
+
+**`build_report` and `HygieneService::new` both take the readout as a REQUIRED
+parameter, and that is a measurement rather than taste.** With a
+`with_push_channels(..)` builder, deleting the two lines in `create_router` that
+called it left EVERY test in the workspace green while the report silently
+stopped mentioning push channels — mutation M9, the call-site class checks 74b
+and 79b name as their own limit. As a parameter the compiler asks every site.
+It still cannot stop a caller answering `None`, so `push_channel_wiring_tests`
+pins the wiring in `create_router`'s source (the `task_supervision_wiring_tests`
+shape), with a tripwire that fails loudly if the scanned region ever vanishes.
+
+**Eleven mutations, two initial SURVIVORS, both closed.** M4 — reverting the
+classifier's argument to an already-flattened map, the one-line collapse its own
+doc warns about — survived until a DB test dropped the `modules` relation and
+asserted `Unreadable` rather than `Missing`. M10 — deleting gmail's gate —
+survived because gmail's create calls Google and cannot be driven end to end;
+closed by a test that asserts WHICH refusal comes back, with a control that gets
+PAST the gate and fails downstream instead. M5 (a module name rendered beside a
+`missing` binding) is recorded as a NO-OP mutation, not a survivor: the name map
+cannot contain a non-`Bound` id by construction, so the guard is defence in
+depth and no test can distinguish it.
+
+**No lint check was added and `--count` stays 88.** The candidate — "a watch
+create that accepts a caller-supplied `module_id` must consult the gate" — was
+BUILT (`scripts/lint-watch-module-binding-candidate.sh`, kept so the numbers can
+be re-derived) and MEASURED on both trees. On pristine `origin/main` it reports
+**19 sites of which 3 are the real create entry points — 15.8% precision** (the
+other 16 are struct fields, summary projections, admin JSON parsing, the
+classifier's own signature and a test helper), and on the FIXED tree it still
+reports **10, every one legitimate**, so it would ship at ten markers on correct
+code. Worse, 3 of the 8 it calls "gated" are the `_locked` renewal helpers that
+must NOT be gated and read as gated only because they share a file with the gate
+— check 86(a)'s file-scope limit in a name-glob's clothing. The structural
+answers are stronger: one `pub` gate, `ModuleVisibility` with no boolean
+projection, a typed `CreateWatchError` whose `ModuleBinding` variant can only
+come from the shared gate, and DB tests driving all three integrations.
+
+**What is NOT covered, stated rather than implied.** `list_push_channels` has no
+test through the production MCP `dispatch` — that needs a full `McpState`, which
+this binary does not build; its pure halves (the survey, the classification, the
+row's redaction) are covered by DB tests and the handler body is not. Gmail's
+and gcal's `module_binding` field on their REST summaries has no test. The gcal
+inventory attaches no `recent_failure` (that enrichment is a method on the full
+service handle); stated on the impl rather than silently omitted. And on THIS
+fleet the audit table holds **zero** `gcp_%` rows, so package 25's
+`recent_failure` enrichment has nothing to show yet — `module_binding: "missing"`
+is the only signal the dangling channel will produce after deploy.
+
 ## Sub-workflow dispatch (engine)
 
 Every parent node that runs a sub-workflow (judge, ensemble, reflective-retry, llm-dispatch, sub_workflow) uses the shared dispatcher pattern in `controller/src/engine/parallel.rs`:

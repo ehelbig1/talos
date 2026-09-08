@@ -44,7 +44,11 @@ talos-memory = { path = "../talos-memory" }
 talos-module-executions = { path = "../talos-module-executions" }
 talos-actor-repository = { path = "../talos-actor-repository" }
 talos-oauth = { path = "../talos-oauth" }
+talos-push-channel-inventory = { path = "../talos-push-channel-inventory" }
 talos-registry = { path = "../talos-registry" }
+# Re-added 2026-09-08 (the comment above records it leaving in 2026-07): the
+# typed `CreateWatchError` that renders the module-binding refusal.
+thiserror = "2.0"
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 talos-text-util = { path = "../talos-text-util" }
 talos-trace-nats = { path = "../talos-trace-nats" }

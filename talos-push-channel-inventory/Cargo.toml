@@ -1,0 +1,27 @@
+[package]
+name = "talos-push-channel-inventory"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# LEAF, deliberately. This crate is the bridge that lets
+# `talos-mcp-handlers` and `talos-hygiene-service` report on push channels
+# WITHOUT taking a dependency edge on `talos-gmail` / `talos-google-calendar`
+# / `talos-google-cloud` — the layering inversion the 2026-09-07 package
+# refused to make. Everything here is a type or a pure decision: no sqlx, no
+# reqwest, no repository, and in particular no `talos-integration-helpers`
+# (which pulls in secrets-manager, envelope-seal, memory and reqwest and would
+# land all of that in the hygiene service).
+[dependencies]
+anyhow.workspace = true
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[lints]
+workspace = true

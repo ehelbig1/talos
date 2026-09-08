@@ -52,10 +52,11 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use talos_integration_helpers::audit::{insert_channel_audit, ChannelAuditEvent};
 use talos_integration_helpers::state_store::{ChannelStore, CreateLockMap};
+use talos_integration_helpers::watch_binding::{check_module_binding, ModuleBindingRefusal};
 use talos_memory::integration_state_rpc::{IndexedSlots, ListFilter, StoredEntry};
 use uuid::Uuid;
 
-pub(crate) const GOOGLE_CLOUD_INTEGRATION_NAME: &str = "google_cloud";
+pub const GOOGLE_CLOUD_INTEGRATION_NAME: &str = "google_cloud";
 const WATCH_KEY_PREFIX: &str = "watch/";
 
 /// Max accepted length of a raw push token BEFORE hashing, on the
@@ -74,7 +75,7 @@ const PUSH_RECEIVED_THROTTLE_MS: i64 = 60_000;
 /// facing struct so controller-private fields (the raw `push_token`)
 /// never leak through a summary projection.
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct GcpWatchRow {
+pub struct GcpWatchRow {
     pub id: Uuid,
     pub integration_id: Uuid,
     pub display_name: String,
@@ -142,6 +143,65 @@ pub fn is_valid_sa_email(email: &str) -> bool {
     email.ends_with(".iam.gserviceaccount.com") || domain.ends_with(".gserviceaccount.com")
 }
 
+/// Why a watch create was refused.
+///
+/// A typed enum rather than one `anyhow::Error`, because the two module-binding
+/// refusals must reach the CALLER as different HTTP statuses and different
+/// advice, and reach the OPERATOR as different `event_kind`s. Before this the
+/// handler answered every failure with `500 "Failed to create watch channel"`,
+/// which is the right shape for an internal error and the wrong one for
+/// "the module you named does not exist".
+#[derive(Debug, thiserror::Error)]
+pub enum CreateWatchError {
+    /// The request itself is wrong in a way the caller can see and fix. The
+    /// message is derived from the caller's own input, so it is safe to echo.
+    #[error("{0}")]
+    InvalidRequest(String),
+    /// The `module_id` gate refused. The two reasons, their statuses, their one
+    /// caller-facing sentence and their two operator `event_kind`s all live in
+    /// `talos_integration_helpers::watch_binding` — shared with gmail, so the
+    /// three integrations cannot answer the same question differently.
+    #[error(transparent)]
+    ModuleBinding(#[from] ModuleBindingRefusal),
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+impl CreateWatchError {
+    /// The HTTP status this refusal renders as.
+    #[must_use]
+    pub fn status_code(&self) -> axum::http::StatusCode {
+        match self {
+            Self::InvalidRequest(_) => axum::http::StatusCode::BAD_REQUEST,
+            Self::ModuleBinding(r) => r.status_code(),
+            Self::Internal(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    /// What the caller is told. `Internal` collapses to a generic string —
+    /// create failures carry integration-lookup and sqlx detail, none of which
+    /// is safe for an API surface.
+    #[must_use]
+    pub fn user_facing_message(&self) -> String {
+        match self {
+            Self::InvalidRequest(m) => m.clone(),
+            Self::ModuleBinding(r) => r.user_facing_message().to_string(),
+            Self::Internal(_) => "Failed to create watch channel".to_string(),
+        }
+    }
+
+    /// The operator-facing classification. This is where "absent" and
+    /// "unreadable" stay apart.
+    #[must_use]
+    pub fn event_kind(&self) -> &'static str {
+        match self {
+            Self::InvalidRequest(_) => "gcp_watch_create_invalid_request",
+            Self::ModuleBinding(r) => r.event_kind(),
+            Self::Internal(_) => "gcp_watch_create_failed",
+        }
+    }
+}
+
 /// Service handle. Owns the DB pool, the integration service (OAuth
 /// token access for the read-only test probe), and the create-lock map.
 pub struct GcpWatchService {
@@ -186,20 +246,32 @@ impl GcpWatchService {
     /// NO fast-path "update existing" — a user may run multiple Cloud
     /// Monitoring channels (different service accounts / modules)
     /// against one integration, each an independent watch.
-    pub(crate) async fn create_watch(
+    pub async fn create_watch(
         &self,
         user_id: Uuid,
         integration_id: Uuid,
         expected_sa_email: String,
         display_name: Option<String>,
         module_id: Option<Uuid>,
-    ) -> Result<GcpWatchRow> {
+    ) -> std::result::Result<GcpWatchRow, CreateWatchError> {
         if !is_valid_sa_email(&expected_sa_email) {
-            return Err(anyhow!(
+            return Err(CreateWatchError::InvalidRequest(
                 "expected_sa_email must be a Google service account \
                  (e.g. talos-gcp-pusher@<project>.iam.gserviceaccount.com)"
+                    .to_string(),
             ));
         }
+
+        // The module binding is validated BEFORE the create lock and before any
+        // write: a refused create must leave nothing behind. See
+        // `check_module_binding` for why the two refusals are separate.
+        check_module_binding(
+            &self.pool,
+            user_id,
+            module_id,
+            GOOGLE_CLOUD_INTEGRATION_NAME,
+        )
+        .await?;
 
         let _guard = self.create_locks.acquire((user_id, integration_id)).await;
 
@@ -434,22 +506,7 @@ impl GcpWatchService {
 
     /// List every google_cloud watch row this user owns.
     pub(crate) async fn list_for_user(&self, user_id: Uuid) -> Result<Vec<GcpWatchRow>> {
-        let entries = self
-            .store()
-            .list_entries(user_id, ListFilter::default(), 500)
-            .await?;
-        let mut out = Vec::with_capacity(entries.len());
-        for entry in entries {
-            match decode_row(&entry) {
-                Ok(row) => out.push(row),
-                Err(e) => tracing::warn!(
-                    key = %entry.key,
-                    error = %e,
-                    "skipping malformed google_cloud watch row"
-                ),
-            }
-        }
-        Ok(out)
+        list_rows_for_user(&self.pool, user_id).await
     }
 
     // ------------------------------------------------------------------
@@ -475,6 +532,34 @@ impl GcpWatchService {
             )
             .await
     }
+}
+
+/// List every google_cloud watch row a user owns, from a bare pool.
+///
+/// The pool is all this read needs, so it is a free function rather than a
+/// method: `GcpPushChannelInventory` (the operator-report view) must be
+/// constructible without the OAuth handle and without the create-lock map, and
+/// `GcpWatchService::list_for_user` delegates here so the two cannot drift.
+pub async fn list_rows_for_user(pool: &sqlx::PgPool, user_id: Uuid) -> Result<Vec<GcpWatchRow>> {
+    let entries = ChannelStore::new(
+        pool.clone(),
+        GOOGLE_CLOUD_INTEGRATION_NAME,
+        WATCH_KEY_PREFIX,
+    )
+    .list_entries(user_id, ListFilter::default(), 500)
+    .await?;
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match decode_row(&entry) {
+            Ok(row) => out.push(row),
+            Err(e) => tracing::warn!(
+                key = %entry.key,
+                error = %e,
+                "skipping malformed google_cloud watch row"
+            ),
+        }
+    }
+    Ok(out)
 }
 
 /// Whether a raw push token from the URL is even worth a DB lookup:

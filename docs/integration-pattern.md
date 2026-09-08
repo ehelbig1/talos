@@ -289,6 +289,40 @@ upstream API needs both our internal uuid AND the upstream id
 to cancel the push. gcal lost this and had to document
 "orphan channels expire naturally in 7 days."
 
+**A module-binding channel must VALIDATE and EXPOSE its binding** (added
+2026-09-08, after the third integration paid for it). If your watch row
+carries a `module_id` the caller supplies, two rules are not optional:
+
+* **Validate it at create.** Call
+  `talos_integration_helpers::watch_binding::check_module_binding(pool,
+  user_id, module_id, INTEGRATION_NAME)` BEFORE the create lock and before
+  any upstream API call, so a refused create leaves nothing behind. It reads
+  `talos_registry::module_visibility`, whose predicate is pinned equal to the
+  DISPATCH-time `ModuleRegistry::get_module`, so a create that passes is a
+  load that will succeed. The refusal is TWO-valued —
+  `NotBindable` (400, one sentence for "no such module" AND "not yours", so
+  the reply is not a module-existence oracle) and `Unreadable` (503,
+  retryable) — with two operator `event_kind`s. Do NOT re-run this on the
+  RENEWAL path: a renewal FINISHES a channel that was already admitted, and
+  refusing it because the module was deleted meanwhile takes a live watch off
+  the air.
+* **Expose it, classified.** Implement
+  `talos_push_channel_inventory::PushChannelInventory` on a POOL-ONLY struct
+  (not the watch service — the inventory must be constructible without the
+  OAuth handle and must not be able to create a watch), and register it in
+  `bootstrap/services.rs`. That is what puts the channel in
+  `list_push_channels` and in the hygiene report's `dangling_push_channels`.
+  Resolve module names through
+  `talos_registry::module_visibility::visible_module_names` and classify with
+  `classify_module_binding`, which takes the lookup's OWN `Result` — a
+  `.unwrap_or_default()` here renders a pool timeout as "the module is gone".
+
+Why both: until 2026-09-08 all three integrations copied the caller's
+`module_id` straight into the row and the first thing that ever read it was
+the dispatch. The live fleet's only module-binding channel named a module
+matching zero rows in `modules` and had since the day it was created — every
+push failing at load, invisible from every operator surface.
+
 ### 4. Renewal scheduler — `<integration>/scheduler.rs`
 
 Hourly tokio task. Lists rows with `idx_ts_1 < now + 24h`, renews
@@ -411,8 +445,14 @@ the list-view projection:
   `talos_integration_helpers` (the historical
   `google_calendar::watch_channel_service` path re-exports them).
   Single canonical OAuth-dead heuristic. Do NOT re-implement.
-- Batched module-name resolution via one UNION query filtered by
-  `user_id IS NULL OR user_id = $caller` (defense-in-depth).
+- Batched module-name resolution through
+  `talos_registry::module_visibility::visible_module_names` — the ONE home for
+  the `id = ANY($1) AND (user_id = $2 OR user_id IS NULL)` predicate, pinned
+  equal to the dispatch-time load's. Do NOT hand-roll the query and do NOT end
+  it in `.unwrap_or_default()`: feed the `Result` to
+  `talos_push_channel_inventory::classify_module_binding` so `module_binding`
+  is four-valued (`none` / `bound` / `missing` / `unreadable`) instead of a
+  `module_name: null` that means three different things.
 
 ### 9. Frontend panel
 

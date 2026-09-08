@@ -57,18 +57,19 @@ use talos_integration_helpers::audit::{
     insert_channel_audit, truncate_and_redact_error, ChannelAuditEvent,
 };
 use talos_integration_helpers::state_store::{ttl_with_grace, ChannelStore, CreateLockMap};
+use talos_integration_helpers::watch_binding::{check_module_binding, ModuleBindingRefusal};
 use talos_integration_state::execute_op;
 use talos_memory::integration_state_rpc::{
     IndexedSlots, IntegrationOp, IntegrationOpResult, ListFilter, StoredEntry,
 };
 use uuid::Uuid;
 
-pub(crate) const GMAIL_INTEGRATION_NAME: &str = "gmail";
+pub const GMAIL_INTEGRATION_NAME: &str = "gmail";
 
 /// Row stored in `integration_state.value`. Separate from any API-
 /// facing struct so controller-private fields never leak through.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct GmailWatchRow {
+pub struct GmailWatchRow {
     pub id: Uuid,
     pub integration_id: Uuid,
     pub email_address: String,
@@ -105,6 +106,76 @@ fn decode_row(entry: &StoredEntry) -> Result<GmailWatchRow> {
 /// Service handle. Owns config (topic name, service account), the
 /// integration service (OAuth token access), and the in-memory
 /// concurrency-lock map.
+/// Why a Gmail watch create was refused.
+///
+/// A typed enum rather than one `anyhow::Error`, so the compiler asked every
+/// caller how it renders the new module-binding refusal — and so "the module
+/// you named does not exist", which the caller can fix, stops rendering as the
+/// same 500 as a database fault.
+#[derive(Debug, thiserror::Error)]
+pub enum CreateWatchError {
+    /// The `module_id` gate refused. Reasons, statuses, the one caller-facing
+    /// sentence and the two operator `event_kind`s all live in
+    /// `talos_integration_helpers::watch_binding`, shared with google_cloud.
+    #[error(transparent)]
+    ModuleBinding(#[from] ModuleBindingRefusal),
+    #[error(transparent)]
+    Internal(#[from] anyhow::Error),
+}
+
+impl CreateWatchError {
+    #[must_use]
+    pub fn status_code(&self) -> axum::http::StatusCode {
+        match self {
+            Self::ModuleBinding(r) => r.status_code(),
+            Self::Internal(_) => axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    /// `Internal` collapses to a generic string: create failures carry
+    /// integration-lookup, Google-API and sqlx detail, none of which is safe
+    /// for an API surface.
+    #[must_use]
+    pub fn user_facing_message(&self) -> String {
+        match self {
+            Self::ModuleBinding(r) => r.user_facing_message().to_string(),
+            Self::Internal(_) => "Failed to create watch channel".to_string(),
+        }
+    }
+
+    #[must_use]
+    pub fn event_kind(&self) -> &'static str {
+        match self {
+            Self::ModuleBinding(r) => r.event_kind(),
+            Self::Internal(_) => "gmail_watch_create_failed",
+        }
+    }
+}
+
+/// List every gmail watch row a user owns, from a bare pool.
+///
+/// A free function so `GmailPushChannelInventory` (the operator-report view)
+/// can be built without the Google API client, the OAuth handle or the
+/// create-lock map; `GmailWatchService::list_for_user` delegates here so the
+/// two cannot drift.
+pub async fn list_rows_for_user(pool: &sqlx::PgPool, user_id: Uuid) -> Result<Vec<GmailWatchRow>> {
+    let entries = ChannelStore::new(pool.clone(), GMAIL_INTEGRATION_NAME, "watch/")
+        .list_entries(user_id, ListFilter::default(), 500)
+        .await?;
+    let mut out = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match decode_row(&entry) {
+            Ok(row) => out.push(row),
+            Err(e) => tracing::warn!(
+                key = %entry.key,
+                error = %e,
+                "skipping malformed gmail watch row"
+            ),
+        }
+    }
+    Ok(out)
+}
+
 pub struct GmailWatchService {
     pub(crate) pool: sqlx::PgPool,
     pub(crate) integrations: Arc<GmailIntegrationService>,
@@ -159,14 +230,27 @@ impl GmailWatchService {
 
     /// Create a new watch, or re-point an existing one at a different
     /// module. Exactly one watch exists per mailbox at any time.
-    pub(crate) async fn create_watch(
+    ///
+    /// `pub` since 2026-09-08 so the module-binding gate can be driven
+    /// directly: this create calls Google's `users.watch`, so the refusal is
+    /// the only part of it observable without the network, and it is the part
+    /// that needed a test.
+    pub async fn create_watch(
         &self,
         user_id: Uuid,
         integration_id: Uuid,
         module_id: Option<Uuid>,
         workflow_id: Option<Uuid>,
         label_ids: Option<Vec<String>>,
-    ) -> Result<GmailWatchRow> {
+    ) -> std::result::Result<GmailWatchRow, CreateWatchError> {
+        // The module binding is validated BEFORE the lock and before any write,
+        // so a refused create leaves nothing behind. `renew_watch` deliberately
+        // does NOT re-run this gate: a renewal FINISHES a channel that was
+        // already admitted, and refusing it because the module was deleted
+        // meanwhile would take a live watch off the air rather than stop a new
+        // one being created wrong (#777's resume argument).
+        check_module_binding(&self.pool, user_id, module_id, GMAIL_INTEGRATION_NAME).await?;
+
         let _guard = self.acquire_lock(user_id, integration_id).await;
 
         // Fast path: if there's already a row for this (user,
@@ -195,14 +279,15 @@ impl GmailWatchService {
             return Ok(existing);
         }
 
-        self.create_fresh_watch_locked(
-            user_id,
-            integration_id,
-            module_id,
-            workflow_id,
-            label_ids.unwrap_or_else(|| self.default_label_ids.clone()),
-        )
-        .await
+        Ok(self
+            .create_fresh_watch_locked(
+                user_id,
+                integration_id,
+                module_id,
+                workflow_id,
+                label_ids.unwrap_or_else(|| self.default_label_ids.clone()),
+            )
+            .await?)
     }
 
     /// Delete the old row BEFORE creating fresh, same pattern as gcal —
@@ -627,22 +712,7 @@ impl GmailWatchService {
     /// List every gmail watch row this user owns. Scheduler uses this
     /// enumerated per-user via `get_watches_needing_renewal`.
     pub(crate) async fn list_for_user(&self, user_id: Uuid) -> Result<Vec<GmailWatchRow>> {
-        let entries = self
-            .store()
-            .list_entries(user_id, ListFilter::default(), 500)
-            .await?;
-        let mut out = Vec::with_capacity(entries.len());
-        for entry in entries {
-            match decode_row(&entry) {
-                Ok(row) => out.push(row),
-                Err(e) => tracing::warn!(
-                    key = %entry.key,
-                    error = %e,
-                    "skipping malformed gmail watch row"
-                ),
-            }
-        }
-        Ok(out)
+        list_rows_for_user(&self.pool, user_id).await
     }
 
     /// List `(user_id, row)` pairs needing renewal in the next 24h.

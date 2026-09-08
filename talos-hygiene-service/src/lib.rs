@@ -263,20 +263,42 @@ pub struct HygieneService {
     workflow_repo: Arc<talos_workflow_repository::WorkflowRepository>,
     execution_repo: Arc<talos_execution_repository::ExecutionRepository>,
     module_repo: Arc<talos_module_repository::ModuleRepository>,
+    /// Injected by the controller. `None` means this process wired no
+    /// inventory, which renders as SILENCE — no key, no count, no claim —
+    /// rather than an empty list. See [`PushChannelReadout`].
+    ///
+    /// A trait object rather than a dependency on the integration crates:
+    /// `talos-hygiene-service` sits BELOW them and an edge the other way is the
+    /// layering inversion the 2026-09-07 package refused to make.
+    push_channels: Option<Arc<talos_push_channel_inventory::PushChannelInventorySet>>,
 }
 
 impl HygieneService {
+    /// `push_channels` is a REQUIRED parameter and deliberately not a builder
+    /// method.
+    ///
+    /// Measured 2026-09-08 (mutation M9): with a `with_push_channels(..)`
+    /// builder, deleting the two lines in `create_router` that call it left
+    /// every test in this workspace green while the hygiene report silently
+    /// stopped saying anything about push channels — the wiring half that
+    /// checks 74b and 79b both name as the thing a guard at the read cannot
+    /// see. As a parameter the compiler asks every construction site, and
+    /// `None` is a deliberate statement ("this process wired no inventory")
+    /// rather than an omission. Same reasoning that deleted
+    /// `ReadinessBasis::from_scan` in RFC 0012 P2.
     pub fn new(
         analytics_repo: Arc<talos_analytics_repository::AnalyticsRepository>,
         workflow_repo: Arc<talos_workflow_repository::WorkflowRepository>,
         execution_repo: Arc<talos_execution_repository::ExecutionRepository>,
         module_repo: Arc<talos_module_repository::ModuleRepository>,
+        push_channels: Option<Arc<talos_push_channel_inventory::PushChannelInventorySet>>,
     ) -> Self {
         Self {
             analytics_repo,
             workflow_repo,
             execution_repo,
             module_repo,
+            push_channels,
         }
     }
 
@@ -294,11 +316,37 @@ impl HygieneService {
         &self,
         input: HygieneReportInput,
     ) -> Result<HygieneReportOutcome, HygieneError> {
-        let h = self
+        let mut h = self
             .analytics_repo
             .get_hygiene_report(input.user_id)
             .await?;
-        Ok(build_report(&h))
+
+        // The push-channel survey is the ONE read this service performs beyond
+        // the repository sweep, and it is per-user exactly as the report is.
+        // Cost is one `integration_state` list plus one batched module read per
+        // wired integration — measured on the reference fleet at 2 channel rows
+        // total; see the crate doc for the projection at 100.
+        let readout = match &self.push_channels {
+            None => talos_push_channel_inventory::PushChannelReadout::NotConsulted,
+            Some(set) => {
+                let survey = set.survey(input.user_id).await;
+                // An integration that could not be read makes every count over
+                // this section a floor rather than a total, so it goes in the
+                // ledger — `total_issues` nulls and `degraded_recommendation`
+                // names the field, exactly as for a failed repository check.
+                if !survey.unreadable_integrations.is_empty() {
+                    let _ = h.readings.record::<(), String>(
+                        FIELD_DANGLING_PUSH_CHANNELS,
+                        Err(format!(
+                            "push-channel inventory unreadable for: {}",
+                            survey.unreadable_integrations.join(", ")
+                        )),
+                    );
+                }
+                talos_push_channel_inventory::PushChannelReadout::Surveyed(survey)
+            }
+        };
+        Ok(build_report(&h, &readout))
     }
 }
 
@@ -605,6 +653,91 @@ pub fn degraded_recommendation(
     }))
 }
 
+/// The report key the dangling-push-channel list renders under, and the ledger
+/// key its partial reads are recorded against. One `&'static str` so the
+/// severity tally, the ledger and the JSON cannot spell it three ways.
+pub const FIELD_DANGLING_PUSH_CHANNELS: &str = "dangling_push_channels";
+
+/// Per-integration ceiling on the channel scan. `ChannelStore::list_entries` is
+/// called with `limit = 500` in every inventory, so a user with more than 500
+/// channels on one integration has rows nobody examined. Disclosed rather than
+/// raised: the reference fleet has TWO channels in total.
+const PUSH_CHANNEL_SCAN_LIMIT: usize = 500;
+
+/// How to read the push-channel section.
+pub const PUSH_CHANNEL_NOTE: &str =
+    "dangling_push_channels lists push channels bound to a WASM module that does not exist for \
+     this user: the channel is live, the upstream is pushing to it, and EVERY push fails at \
+     module load. It is not a deletion recommendation and nothing is excluded from it. \
+     unclassifiable_bindings is kept SEPARATE on purpose — those are channels whose module \
+     lookup did not answer, which is a statement about the query and not about the channel; \
+     counting them as dangling would put a pool timeout in the same bucket as a permanently \
+     dead channel. unreadable_integrations names integrations whose channel list could not be \
+     read at all: their channels are ABSENT from this section, not zero.";
+
+/// Render the push-channel section, or `None` when there is nothing to say.
+///
+/// "Nothing to say ⇒ no key" (the #762 rule): a user with no push channels, and
+/// a user whose channels are all healthy, both get a report byte-identical to
+/// the pre-2026-09-08 one. An empty `dangling_push_channels: []` would be a new
+/// permanent key asserting a measured all-clear on every fleet, which is the
+/// opposite of what this section is for.
+#[must_use]
+fn push_channel_section(
+    readout: &talos_push_channel_inventory::PushChannelReadout,
+) -> Option<(Vec<serde_json::Value>, serde_json::Value)> {
+    use talos_push_channel_inventory::PushChannelReadout;
+
+    // NOT CONSULTED is silence, not zero. A process that wired no inventory has
+    // not looked, and `dangling_push_channels: []` from it would be the
+    // determinate negative this whole class is about.
+    let PushChannelReadout::Surveyed(survey) = readout else {
+        return None;
+    };
+    if survey.has_nothing_to_report() {
+        return None;
+    }
+
+    let render = |r: &talos_push_channel_inventory::PushChannelRow| {
+        let mut v = serde_json::to_value(r).unwrap_or(serde_json::Value::Null);
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("repair".to_string(), serde_json::json!(r.repair_hint()));
+        }
+        v
+    };
+
+    let dangling: Vec<serde_json::Value> = survey.dangling().into_iter().map(render).collect();
+    let unclassifiable: Vec<serde_json::Value> = survey
+        .unclassifiable()
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "integration": r.integration,
+                "channel_id": r.channel_id.to_string(),
+                "display_name": r.display_name,
+                "module_id": r.module_id.map(|m| m.to_string()),
+            })
+        })
+        .collect();
+
+    let mut disclosure = serde_json::json!({
+        "surveyed_integrations": survey.surveyed_integrations,
+        "unreadable_integrations": survey.unreadable_integrations,
+        "channels_examined": survey.rows.len(),
+        "channel_scan_limit_per_integration": PUSH_CHANNEL_SCAN_LIMIT,
+        "note": PUSH_CHANNEL_NOTE,
+    });
+    if !unclassifiable.is_empty() {
+        if let Some(obj) = disclosure.as_object_mut() {
+            obj.insert(
+                "unclassifiable_bindings".to_string(),
+                serde_json::json!(unclassifiable),
+            );
+        }
+    }
+    Some((dangling, disclosure))
+}
+
 /// Assemble the operator-facing hygiene report from one sweep's rows.
 ///
 /// PURE — no I/O, no clock beyond `generated_at`. Split out of
@@ -613,7 +746,22 @@ pub fn degraded_recommendation(
 /// when its inputs are missing, and that is not a property a source pin can
 /// check.
 #[must_use]
-pub fn build_report(h: &talos_analytics_repository::HygieneReport) -> HygieneReportOutcome {
+pub fn build_report(
+    h: &talos_analytics_repository::HygieneReport,
+    // EXPLICIT, with no defaulting entry point — the `ReadinessBasis::from_scan`
+    // lesson (RFC 0012 P2): a convenience that silently means "not consulted"
+    // makes a caller that FORGOT the inventory indistinguishable from one that
+    // could not read it. Every call site states which it is.
+    push_channels: &talos_push_channel_inventory::PushChannelReadout,
+) -> HygieneReportOutcome {
+    // Rendered first because the severity tally below needs its length, and
+    // because "no section" and "an empty section" must be decided in ONE place.
+    let (dangling_push_channels, push_channel_disclosure) =
+        match push_channel_section(push_channels) {
+            Some((rows, disclosure)) => (Some(rows), Some(disclosure)),
+            None => (None, None),
+        };
+
     // Auto-classify workflows whose names start with known QA/test prefixes.
     // These should be classified as workflow_type='test' but often aren't — exclude
     // them from readiness warnings and surface them as a separate recommendation.
@@ -925,6 +1073,28 @@ pub fn build_report(h: &talos_analytics_repository::HygieneReport) -> HygieneRep
 
     if let Some(rec) = twin_divergence::twin_recommendation(&twin_analysis) {
         recommendations.push(rec);
+    }
+
+    // A dangling push channel is not a cleanup nicety: the upstream is pushing,
+    // the platform is acking, and every one of those pushes fails at module
+    // load. `critical` because the operator's own configuration is silently not
+    // running — the state the reference fleet's only bound channel had been in
+    // since 2026-07-17, invisible from every surface until this report.
+    if let Some(rows) = dangling_push_channels.as_ref().filter(|r| !r.is_empty()) {
+        recommendations.push(serde_json::json!({
+            "priority": "critical",
+            "category": "integrations",
+            "action": format!(
+                "{} push channel(s) are bound to a WASM module that does not exist for this \
+                 user. Every push to them fails at module load and the failure is only visible \
+                 in the controller log. Re-create each channel bound to a module that exists \
+                 (POST /api/<integration>/watch-channels), or stop the watch. See \
+                 dangling_push_channels for the per-channel repair, and list_push_channels for \
+                 the full inventory including healthy ones.",
+                rows.len()
+            ),
+            "affected_count": rows.len(),
+        }));
     }
 
     if !undescribed.is_empty() {
@@ -1305,8 +1475,23 @@ pub fn build_report(h: &talos_analytics_repository::HygieneReport) -> HygieneRep
     // expressions that happened to be term-for-term identical — a coincidence
     // one edit away from being false).
     let n = |v: usize| i64::try_from(v).unwrap_or(i64::MAX);
-    let critical_sources: Vec<(&'static str, i64)> =
-        vec![("stale_executions", n(stale_executions.len()))];
+    let critical_sources: Vec<(&'static str, i64)> = vec![
+        ("stale_executions", n(stale_executions.len())),
+        // CRITICAL, matching the recommendation's own priority — a bucket and a
+        // recommendation that disagree about the same finding is the
+        // contradiction-in-one-response class. A dangling binding means the
+        // operator's configured automation is silently not running and has not
+        // been since the module went away.
+        //
+        // Contributes only when the section EXISTS. A `NotConsulted` readout
+        // contributes NOTHING rather than 0: `total_issues` has never spoken
+        // about push channels, and a 0 from a process that did not look would
+        // newly claim that it does.
+        (
+            FIELD_DANGLING_PUSH_CHANNELS,
+            n(dangling_push_channels.as_ref().map_or(0, Vec::len)),
+        ),
+    ];
     let high_sources: Vec<(&'static str, i64)> = vec![
         ("undescribed_workflows", n(undescribed.len())),
         ("uncapabilized_workflows", n(uncapabilized.len())),
@@ -1545,6 +1730,21 @@ pub fn build_report(h: &talos_analytics_repository::HygieneReport) -> HygieneRep
         "workflow_twins": workflow_twins,
         "recommendations": recommendations,
     });
+
+    // Nothing to say ⇒ no key (#762). A fleet with no push channels, and one
+    // whose channels are all healthy, get a byte-identical report to the
+    // pre-2026-09-08 one.
+    if let (Some(rows), Some(disclosure)) =
+        (dangling_push_channels.clone(), push_channel_disclosure)
+    {
+        if let Some(obj) = report.as_object_mut() {
+            obj.insert(
+                FIELD_DANGLING_PUSH_CHANNELS.to_string(),
+                serde_json::json!(rows),
+            );
+            obj.insert("push_channel_survey".to_string(), disclosure);
+        }
+    }
 
     // --- Disclosure ---------------------------------------------------------
     //
@@ -1918,7 +2118,11 @@ mod partial_report_disclosure_tests {
     }
 
     fn report_for(fields: &[&'static str]) -> serde_json::Value {
-        build_report(&HygieneReport::empty(ledger(fields))).report
+        build_report(
+            &HygieneReport::empty(ledger(fields)),
+            &talos_push_channel_inventory::PushChannelReadout::NotConsulted,
+        )
+        .report
     }
 
     /// Resolve a `.`-separated path, the way the disclosure asks a reader to.
@@ -2002,7 +2206,11 @@ mod partial_report_disclosure_tests {
     fn the_lower_bound_counts_only_the_checks_that_ran() {
         let mut h = HygieneReport::empty(ledger(&["stale_executions"]));
         h.dormant_workflows = vec![dormant("a"), dormant("b"), dormant("c")];
-        let r = build_report(&h).report;
+        let r = build_report(
+            &h,
+            &talos_push_channel_inventory::PushChannelReadout::NotConsulted,
+        )
+        .report;
         assert!(r["summary"]["total_issues"].is_null());
         assert_eq!(
             r["summary"]["total_issues_lower_bound"],
@@ -2125,7 +2333,11 @@ mod partial_report_disclosure_tests {
     fn embedding_coverage_needs_both_of_its_operands() {
         let mut h = HygieneReport::empty(ledger(&["summary.total_workflows"]));
         h.unembedded_count = Some(3);
-        let r = build_report(&h).report;
+        let r = build_report(
+            &h,
+            &talos_push_channel_inventory::PushChannelReadout::NotConsulted,
+        )
+        .report;
         assert!(r["summary"]["embedding_coverage_percent"].is_null());
         assert!(r["summary"]["total_workflows"].is_null());
         // And the recommendation it feeds must not invent a denominator.
@@ -2185,7 +2397,11 @@ mod partial_report_disclosure_tests {
 
         let mut h = HygieneReport::empty(Readings::new());
         h.dormant_workflows = (0..25).map(|i| dormant(&format!("w{i}"))).collect();
-        let r = build_report(&h).report;
+        let r = build_report(
+            &h,
+            &talos_push_channel_inventory::PushChannelReadout::NotConsulted,
+        )
+        .report;
         let trunc = r["summary"]["coverage"]["truncated_checks"]
             .as_array()
             .expect("an array");
@@ -2231,7 +2447,11 @@ mod partial_report_disclosure_tests {
             key_path: "svc/api_key".into(),
             created_at: chrono::Utc::now(),
         }];
-        let r = build_report(&h).report;
+        let r = build_report(
+            &h,
+            &talos_push_channel_inventory::PushChannelReadout::NotConsulted,
+        )
+        .report;
         let s = &r["summary"];
         let sum: i64 = ["critical", "high", "medium", "low"]
             .iter()
@@ -2290,7 +2510,11 @@ mod partial_report_disclosure_tests {
             created_at: chrono::Utc::now(),
             expires_at: None,
         }];
-        let r = build_report(&h).report;
+        let r = build_report(
+            &h,
+            &talos_push_channel_inventory::PushChannelReadout::NotConsulted,
+        )
+        .report;
         assert_eq!(
             r["orphaned_secrets"],
             serde_json::json!([]),
@@ -2310,7 +2534,11 @@ mod partial_report_disclosure_tests {
         // The same list DOES render once the scan has run and come back clean.
         let mut ok = HygieneReport::empty(Readings::new());
         ok.orphaned_secrets = h.orphaned_secrets;
-        let r2 = build_report(&ok).report;
+        let r2 = build_report(
+            &ok,
+            &talos_push_channel_inventory::PushChannelReadout::NotConsulted,
+        )
+        .report;
         assert_eq!(r2["orphaned_secrets"].as_array().map(Vec::len), Some(1));
     }
 
@@ -2364,6 +2592,173 @@ mod partial_report_disclosure_tests {
             last_child_activity_at: None,
             child_runs: None,
         }
+    }
+    // ------------------------------------------------------------------
+    // Push channels (2026-09-08)
+    // ------------------------------------------------------------------
+
+    use crate::FIELD_DANGLING_PUSH_CHANNELS;
+    use talos_push_channel_inventory::{
+        ModuleBinding, PushChannelReadout, PushChannelRow, PushChannelSurvey,
+    };
+
+    fn channel(binding: ModuleBinding) -> PushChannelRow {
+        PushChannelRow {
+            integration: "google_cloud",
+            channel_id: uuid::Uuid::new_v4(),
+            display_name: "sandbox-monitoring".into(),
+            module_id: Some(uuid::Uuid::new_v4()),
+            module_name: None,
+            module_binding: binding,
+            created_at: None,
+            last_event_at: None,
+            recent_failure: None,
+        }
+    }
+
+    fn surveyed(rows: Vec<PushChannelRow>, unreadable: Vec<&'static str>) -> PushChannelReadout {
+        PushChannelReadout::Surveyed(PushChannelSurvey {
+            rows,
+            surveyed_integrations: vec!["gmail", "gcal", "google_cloud"],
+            unreadable_integrations: unreadable,
+        })
+    }
+
+    fn healthy() -> HygieneReport {
+        HygieneReport::empty(Readings::new())
+    }
+
+    /// The live shape: a channel bound to a module that does not exist is
+    /// LISTED, carries its own repair sentence, and raises a recommendation.
+    #[test]
+    fn a_dangling_channel_is_listed_with_its_repair() {
+        let r = build_report(
+            &healthy(),
+            &surveyed(vec![channel(ModuleBinding::Missing)], vec![]),
+        )
+        .report;
+        let rows = r[FIELD_DANGLING_PUSH_CHANNELS].as_array().expect("list");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["module_binding"], "missing");
+        assert!(rows[0]["repair"]
+            .as_str()
+            .expect("repair sentence")
+            .contains("does not exist"));
+        assert!(r["recommendations"]
+            .as_array()
+            .expect("recs")
+            .iter()
+            .any(|x| x["category"] == "integrations" && x["priority"] == "critical"));
+    }
+
+    /// NOTHING TO SAY ⇒ NO KEY. A user whose channels are all healthy gets a
+    /// report byte-identical to the pre-2026-09-08 one — an empty
+    /// `dangling_push_channels: []` would be a new permanent key asserting a
+    /// measured all-clear on every fleet.
+    #[test]
+    fn a_healthy_survey_adds_no_key_at_all() {
+        let baseline = build_report(&healthy(), &PushChannelReadout::NotConsulted).report;
+        let surveyed_clean = build_report(
+            &healthy(),
+            &surveyed(
+                vec![channel(ModuleBinding::Bound), channel(ModuleBinding::None)],
+                vec![],
+            ),
+        )
+        .report;
+        assert!(surveyed_clean.get(FIELD_DANGLING_PUSH_CHANNELS).is_none());
+        assert!(surveyed_clean.get("push_channel_survey").is_none());
+        // `generated_at` is the only field that differs run to run.
+        for (k, v) in baseline.as_object().expect("obj") {
+            if k == "generated_at" {
+                continue;
+            }
+            assert_eq!(surveyed_clean.get(k), Some(v), "key `{k}` diverged");
+        }
+        assert_eq!(
+            baseline.as_object().expect("obj").len(),
+            surveyed_clean.as_object().expect("obj").len()
+        );
+    }
+
+    /// NOT CONSULTED is silence, not zero. A process that wired no inventory
+    /// must not print a measured all-clear about push channels.
+    #[test]
+    fn a_not_consulted_readout_makes_no_claim() {
+        let r = build_report(&healthy(), &PushChannelReadout::NotConsulted).report;
+        assert!(r.get(FIELD_DANGLING_PUSH_CHANNELS).is_none());
+        assert!(r.get("push_channel_survey").is_none());
+    }
+
+    /// An UNCLASSIFIABLE binding is disclosed and is NOT counted as dangling:
+    /// it is a statement about the query, not about the channel.
+    #[test]
+    fn an_unclassifiable_binding_is_disclosed_but_not_counted() {
+        let r = build_report(
+            &healthy(),
+            &surveyed(vec![channel(ModuleBinding::Unreadable)], vec![]),
+        )
+        .report;
+        assert_eq!(
+            r[FIELD_DANGLING_PUSH_CHANNELS]
+                .as_array()
+                .expect("list")
+                .len(),
+            0
+        );
+        assert_eq!(
+            r["push_channel_survey"]["unclassifiable_bindings"]
+                .as_array()
+                .expect("list")
+                .len(),
+            1
+        );
+        // …and no recommendation, because there is nothing to repair yet.
+        assert!(!r["recommendations"]
+            .as_array()
+            .expect("recs")
+            .iter()
+            .any(|x| x["category"] == "integrations"));
+    }
+
+    /// An integration whose channel list could not be read is NAMED, and the
+    /// section still renders — an all-clear from a read that failed is the
+    /// determinate negative this section exists to remove.
+    #[test]
+    fn an_unreadable_integration_is_named_not_dropped() {
+        let r = build_report(&healthy(), &surveyed(vec![], vec!["gmail"])).report;
+        assert_eq!(
+            r["push_channel_survey"]["unreadable_integrations"][0],
+            "gmail"
+        );
+        assert_eq!(
+            r["push_channel_survey"]["surveyed_integrations"]
+                .as_array()
+                .expect("list")
+                .len(),
+            3
+        );
+    }
+
+    /// …and when the ledger carries that failure, `total_issues` NULLS rather
+    /// than publishing a sum over a partial read. This is the ledger half —
+    /// `generate` records the field; here we drive `build_report` with a report
+    /// whose ledger already names it, which is what `generate` produces.
+    #[test]
+    fn a_partial_survey_nulls_the_headline_count() {
+        let h = HygieneReport::empty(ledger(&[FIELD_DANGLING_PUSH_CHANNELS]));
+        let r = build_report(
+            &h,
+            &surveyed(vec![channel(ModuleBinding::Missing)], vec!["gmail"]),
+        )
+        .report;
+        assert!(
+            r["summary"]["total_issues"].is_null(),
+            "a count over a partially-read survey is not a count"
+        );
+        assert!(r["summary"]["critical"].is_null());
+        // The floor is still published, LABELLED as a floor.
+        assert_eq!(r["summary"]["critical_lower_bound"], 0);
     }
 }
 

@@ -88,6 +88,14 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
+            "name": "list_push_channels",
+            "description": "List every push channel (Gmail watch, Google Calendar watch, Google Cloud Pub/Sub subscription) you own, with its WASM module binding CLASSIFIED. A push channel may bind a module — one inbound event, one dispatched module job — and until 2026-09-08 nothing validated that binding at create time and no operator surface ever read it back, so a channel bound to a module that no longer exists looked healthy while EVERY push to it failed at module load. `module_binding` is four-valued: none (binds no module — pushes are acked and nothing runs), bound, missing (THE FINDING: every push fails), unreadable (the module lookup did not answer — a statement about the query, not about the channel). Returns no push token and no push endpoint; the owning user gets the endpoint from the create response and the per-integration REST list. Deliberately separate from list_workflow_triggers, which is keyed by WORKFLOW: a push channel binds a MODULE and has no workflow.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        serde_json::json!({
             "name": "get_session_context",
             "description": "Get a compact context payload of top workflows for the current session. Designed to fit under 800 tokens for LLM system prompts.",
             "inputSchema": {

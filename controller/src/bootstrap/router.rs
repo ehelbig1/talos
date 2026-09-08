@@ -3627,6 +3627,7 @@ pub(crate) fn build_router(
         failure_analysis_service.clone(),
         actor_lifecycle_service.clone(),
         Some(ollama_client),
+        services.push_channel_inventories.clone(),
     );
 
     // MCP routes are added separately to avoid the global governor rate limiter.

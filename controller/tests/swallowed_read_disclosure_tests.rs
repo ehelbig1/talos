@@ -166,6 +166,7 @@ async fn mcp_state(db_pool: sqlx::PgPool) -> McpState {
             workflow_repo.clone(),
             execution_repo.clone(),
             module_repo.clone(),
+            None,
         )),
         session_brief_service: Arc::new(talos_session_brief_service::SessionBriefService::new(
             advanced_repo.clone(),
@@ -173,6 +174,11 @@ async fn mcp_state(db_pool: sqlx::PgPool) -> McpState {
         judge_probe_service: Arc::new(talos_judge_probe::JudgeProbeService::new(
             advanced_repo.clone(),
         )),
+        // NOT CONSULTED — this harness wires no push-channel inventory, and the
+        // tools it drives make no claim about push channels. The compiler asks
+        // rather than defaulting, which is the point of the field being
+        // `Option` (RFC 0012 P2's `from_scan` lesson).
+        push_channels: None,
     }
 }
 
