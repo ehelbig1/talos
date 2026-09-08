@@ -1728,6 +1728,172 @@ relation each gate's read names removed — one test per distinct SHAPE, each
 carrying its own CONTROL, because the pre-fix tag path ALSO refused, just with
 the wrong diagnosis.
 
+### 2026-09-08 — the nine fixes nothing guarded, and the five claims that outranked the rest
+
+Two halves, and the first is about the SHAPE of a guard rather than about any
+new defect. #779 fixed eight fail-OPEN gates and thirteen claim sites and
+recorded, in its own notes, that reverting NINE of them left every test in the
+workspace green. Its rule was one test per SHAPE; "the shape is pinned
+elsewhere" is exactly the reasoning that let `cleanup_module_versions` survive
+package 23's mutation, so the rule here is **one test per SITE whose
+consequence is irreversible or authorizing**.
+
+**Leg A — `controller/tests/unguarded_gate_survivor_tests` (10 tests,
+CTRL_TESTS per check 64b).** Nine of the ten sites are driven through the
+production `dispatch` over a real `McpState` with the relation the read names
+removed (package 22's mechanism), each carrying its CONTROL in the same run.
+For a GATE the control is the half that matters: a healthy gate must still
+refuse *for the right reason*, because "the tool refused" is not evidence when
+the pre-fix path also refused. Two tests assert on **ROWS** rather than on the
+reply — the stored `graph_json` after a refused `add_node_to_workflow`, and the
+`webhook_triggers` count before and after a refused `create_webhook` — for the
+reason `archived_dispatch_gate_tests` records: a gate whose refusal arrives
+after the write is not a gate, and an earlier version of #754's write-ceiling
+test passed because the INSERT would have failed anyway.
+
+**Ten mutations, ten results, and one of them is the point.** MA1 (the actor
+capability-world ceiling back to the lenient `None`), MA2 (the module-world
+half back to `unwrap_or_default`), MA3 (the approval WRITE back to
+`unwrap_or(0)`), MA4/MA5 (export metadata / module existence), MA6 (webhook
+name uniqueness), MA7a (the dependents DIRECT scan), MA8 (`whoami`'s ceiling
+back to the hardcoded `http-node`) and MA9 (the trace's child list) are all
+**RED**. **MA7b — the dependents INDIRECT scan back to a silent empty —
+SURVIVES this binary and is caught by check 74b**, at `modules.rs:2579`,
+verified by running that leg against the mutated tree rather than assumed. The
+reason it cannot be driven here is structural and worth recording:
+`find_workflows_referencing_module` and `find_workflows_referencing_workflows`
+read the SAME table through the SAME columns (`id`, `name`, `graph_json`,
+`status`, `updated_at`), so no schema-level failure breaks the second without
+breaking the first — and the first already refuses several lines above.
+
+**`dlq_updates` gets NO test, stated rather than implied.** Its permission
+refresh is three lines of local-variable assignment inside an `async_stream!`
+in a GraphQL subscription resolver driven by a `PERM_REFRESH_INTERVAL_SECS =
+60` ticker; reaching it needs a subscription held open past a real minute with
+the org read failing mid-stream, and there is no seam short of restructuring
+the resolver. **Leg C's second candidate was NOT taken for a one-sentence
+reason**: the three `scheduler_readiness_*` publish sites live inside the
+private `SchedulerService::hold_or_degrade`, which no integration test can
+call, and they write through the process-global `talos_metrics::global()`
+`OnceLock` that sibling tests in one binary race — check 82's own objection
+about `DISTILL_CONTEXT`. **Leg C's FIRST candidate WAS taken and is closed**:
+RFC 0012 P3 recorded that `get_workflow_sla_report`'s handler can pass
+`child_runs: None` / `ledger_since: None` and every test stays green, and left
+"the live read after deploy" as its honest guard. That mutation (MC1) is now
+**RED** — a workflow with three recorded `sub_workflow_runs` and zero
+execution rows must report them, with a barren workflow as the control so the
+test cannot pass by making everything look measured.
+
+**Leg B — `controller/tests/claim_read_disclosure_tier3_tests` (7 tests).** The
+five sites `docs/swallowed-reads-inventory.md` ranked highest among its 52
+remaining claims. Every one reproduced RED under a mutation reinstating the
+collapse.
+
+* **The workflow AUDIT TRAIL.** Two `.unwrap_or_default()` history reads on a
+  tool named for auditability: a failed version read removed every
+  `version_published` event, a failed execution read every
+  `execution_triggered` one, and `count` / `event_count` reported the shortened
+  list as the total — while `workflow_created`, synthesised from the row
+  already loaded, kept the response looking well-formed. **This one has form**:
+  `list_executions_for_audit` carries a comment recording that this exact
+  swallow once hid a query naming a column that does not exist, so the trail
+  returned ZERO execution events for EVERY workflow on the platform. The QUERY
+  was fixed in May 2026 and the SWALLOW was left — the same
+  fixed-the-path-not-the-population shape check 74's #730 group records for
+  `get_workflow_schedule_count`. Now a `Readings` ledger, with `events`,
+  `count` and `event_count` marked DERIVED and one extra sentence
+  (`events_incomplete`) saying that an absent class of event is not evidence
+  that it never happened — because `Readings::note` promises a null and what
+  fails here shortens a LIST.
+* **`get_execution_lineage`'s ROOT lookup.** A failed
+  `get_execution_lineage_root` substituted the execution's own id; the tree
+  query then matched `id = $1` and came back NON-empty, so `tree_degraded`
+  stayed FALSE and the single-node arm rendered "This execution has no parent
+  or child EXECUTION rows" — the determinate negative #771 built `lineage_note`
+  to remove, reintroduced one read earlier. `root_execution_id` is now `null`
+  (never the anchor's own id: an id there is read as "this is the top of the
+  tree", which is precisely what an unreadable root cannot establish) and
+  `lineage_note` gains a FIRST arm that outranks every other. The narrow shape
+  the defect took in production — root read fails, tree read succeeds — is not
+  separable by relation (both statements name the same two columns of the same
+  two tables), so it is pinned by unit test and the DB test covers the wiring;
+  saying which instrument covers what matters more than implying one covers
+  both.
+* **`watch_execution`.** `events: [], events_count: 0` from a failed read,
+  beside a `current_status` that WAS measured, on the tool an operator polls
+  during an incident — a poller comparing `events_count` against its last value
+  reads 0 as "no progress". Both are now `null` with the read named; the status
+  half is untouched, so this is a per-field disclosure and not a refusal.
+* **`list_module_catalog`.** A failed visibility read made every entry read
+  `installed: false, module_id: null, availability: "needs_install"` — an
+  instruction to run `install_module_from_catalog` for modules the caller
+  already has — and with `installed_only: true` the whole listing rendered as
+  `[]`. REFUSES, matching the two sibling listings in the same file.
+* **`ml_get_model_card`.** `has_pending_disagreements: false` is a PROMOTION
+  CLEARANCE, and it was defaulted; it is now three-valued. The same read
+  reached its model ENTITY lookup, which answered a failed registry read with
+  "Model not found" (check 79's shape, and the correct split
+  `require_dataset_owner` already makes 800 lines above it) — `Ok(None)` keeps
+  the exact pre-fix wording, pinned. Adopting a ledger enrolled the handler in
+  **check 74b**, so its four sibling `.ok()` reads (`shadow`,
+  `shadow_lifetime`, `shadow.epoch`, `teacher_audit`, `dataset_stats`) are on
+  the ledger too — leaving them beside a ledger that publishes "complete: every
+  field in this report was measured" is the FALSE-COMPLETENESS shape 74b exists
+  for.
+
+**Re-measured, not estimated.** `scripts/lint-swallow-classify.py` over the
+tree before and after: **175 sites → 164**, 11 removed and 0 added, no site
+added anywhere. The verdict split on the fixed tree is **46 claim** (one of
+which is the lineage-root row, now a `false-positive` by verdict because the
+fix discloses rather than propagates — so 45 are genuinely open), 55
+decorative, 37 fail-closed, 25 false-positive, and the 1 nominal fail-open that
+is #779's repaired `dlq_updates` narrowing.
+`docs/swallowed-reads-inventory.md` is re-rendered with a 2026-09-08
+disposition, the per-file remainder and the three highest-severity sites still
+open — including `list_module_catalog`'s SECOND site, a `spawn_blocking`
+`JoinError` defaulting the disk walk to an empty catalog and CACHING it in a
+process-wide `OnceCell`, so one failure is permanent for the pod's lifetime.
+
+**A THIRD defect was found by measuring the lint candidate rather than by
+reading the code, and it is this entry's own subject one level up.**
+`handle_get_catalog_status` — the handler #779's notes name as check 74b's
+first live catch — built a `Readings`, recorded the disk scan into it, and then
+constructed a SECOND ledger fifty lines later that SHADOWED the first. So a
+failed disk scan nulled `disk` in the body while the surviving ledger published
+*"complete: every field in this report was measured"*: the disclosure mechanism
+making the false-completeness claim it exists to prevent. **74b cannot see it**
+— it detects a defaulted read BESIDE a ledger, not a ledger discarded by a
+shadow — and neither can a test: the arm needs `/app/module-templates` to exist
+AND the `spawn_blocking` walk to return a `JoinError`. One ledger per report;
+the second construction is deleted. Measured population of "a function
+constructing more than one `Readings`": **1 on this tree before the fix, 0
+after**, which is the population-of-one this repo does not ship a check at, so
+the guard is the comment at the site and this paragraph.
+
+**One home for the test `McpState`.** `swallowed_read_disclosure_tests` and
+`fail_open_gate_tests` each carried a hand-copied ~130-line struct literal and
+this package would have made it four. Moved (not copied) to
+`controller/tests/common/mcp.rs`, included with
+`#[path = "common/mcp.rs"] mod mcp_common;` only by the binaries that need it,
+so no other test target pays for it. A copy that falls BEHIND fails to compile;
+a copy that constructs a DIFFERENT service fails silently and makes its
+binary's assertions prove nothing about production — that second failure is the
+one a shared home removes.
+
+**No lint check was added and `--count` stays 88.** Two candidates were
+measured first. (i) *"a function may construct at most ONE `Readings`"* — the
+shadowing defect above. Measured across every non-test `.rs` in the workspace:
+**1 site on this tree, 0 after**, a population of one, which is the bar #765's
+own numbers set and this repo does not ship at. Its sibling *"a ledger must be
+attached"* is worse: **30** constructions against **29** `attach` calls, and
+the one difference is legitimate (`AnalyticsRepository::get_hygiene_report`
+builds the ledger and hands it to `talos-hygiene-service`, which attaches it a
+crate away), so the rule reports 1 false positive and 0 real ones. (ii) *"a `mod common`-harness test binary must not hand-roll an
+`McpState`"* — population FOUR, all in one directory, and the structural answer
+is stronger than a grep: there is now exactly one `pub async fn mcp_state`, and
+a second copy would have to be written from scratch against a struct with 30
+fields.
+
 ### The whitespace-run artefact, and why no lint guards it
 
 Four operator-facing string literals carried mid-sentence runs of up to 22

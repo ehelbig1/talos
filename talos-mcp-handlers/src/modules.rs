@@ -3084,11 +3084,36 @@ async fn handle_list_module_catalog(
     // `installed: false, module_id: null` for a global catalog row that
     // `add_node_to_workflow` accepts as-is — the response withheld the very id
     // that would have avoided a pointless `install_module_from_catalog`.
-    let visible = state
+    //
+    // REFUSE, do not default (2026-09-08). Pre-fix `.unwrap_or_default()`
+    // rendered a failed visibility read as an EMPTY map, and this map decides
+    // three things a caller acts on: `installed`, `module_id` and
+    // `availability`. With it empty every catalog entry reads
+    // `installed: false, module_id: null, availability: "needs_install"` —
+    // an instruction to run `install_module_from_catalog` for modules the
+    // caller already has — and with `installed_only: true` the WHOLE listing
+    // renders as `[]`, i.e. "you have installed nothing". The same refusal
+    // shape as `handle_list_templates` and `handle_list_modules` above, for
+    // the same reason: an emptiness claim is the premise of the caller's next
+    // step, and there is no partial answer to give.
+    let visible = match state
         .module_repo
         .list_visible_module_ids(agent.user_id.unwrap_or_else(uuid::Uuid::nil))
         .await
-        .unwrap_or_default();
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(error = %e, "list_module_catalog: visibility read failed");
+            return mcp_error(
+                req_id,
+                -32000,
+                "Could not read which catalog modules you already have, so every entry's \
+                 `installed` / `module_id` / `availability` would be a guess — this is NOT \
+                 a statement that you have installed none of them, and it is NOT an \
+                 instruction to install anything. Retry, and check controller logs.",
+            );
+        }
+    };
 
     // MCP-H8: the catalog walk is heavy sync I/O — opendir, per-dir
     // metadata read + template.rs read. Pre-fix this ran inline on
@@ -4475,7 +4500,17 @@ async fn handle_get_catalog_status(
     // actionable, wrong advice about a healthy catalog, computed from a query
     // that never answered. Both halves are now nulled on failure and the diff
     // is suppressed unless BOTH answered.
-    let mut readings = talos_measurement::Readings::new();
+    //
+    // 2026-09-08: this line used to construct a SECOND ledger, which
+    // SHADOWED the one built above and threw away the `disk` record with
+    // it. The consequence is this file's own subject one level up: a failed
+    // disk scan nulled `disk` in the body while the surviving ledger published
+    // "complete: every field in this report was measured" — the exact
+    // false-completeness claim check 74b exists to prevent, made by the
+    // disclosure mechanism itself. 74b cannot see it (it detects a defaulted
+    // read beside a ledger, not a ledger discarded by a shadow), and the disk
+    // arm needs `/app/module-templates` plus a `spawn_blocking` JoinError, so
+    // no test in this workspace can reach it either. ONE ledger per report.
     let db_rows_read = readings.record("db_catalog", state.module_repo.list_catalog_rows().await);
     let db_rows = db_rows_read.clone().unwrap_or_default();
     let installed = readings.record(

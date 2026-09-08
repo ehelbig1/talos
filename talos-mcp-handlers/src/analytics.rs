@@ -1964,11 +1964,30 @@ async fn handle_get_workflow_audit_trail(
         "details": format!("Workflow '{}' created", wf_name),
     }));
 
-    let version_rows = state
-        .analytics_repo
-        .list_workflow_versions_audit(wf_id, limit)
-        .await
-        .unwrap_or_default();
+    // 2026-09-08: a tool NAMED for auditability must not answer a failed read
+    // with silence. Both history reads below were `.unwrap_or_default()`, so a
+    // database failure removed EVERY `version_published` event, or EVERY
+    // `execution_triggered` event, from `events` — and the response then read
+    // as "this workflow was never published" / "this workflow never ran", with
+    // `count` and `event_count` reporting the shortened list as the total.
+    // `workflow_created` is synthesised from the row already loaded above, so
+    // the degraded response still looks like a well-formed trail.
+    //
+    // The ledger nulls nothing here (the renderers downstream are written
+    // against lists), so what it buys is that the emptiness is ACCOMPANIED:
+    // `events`, `count` and `event_count` are marked DERIVED from an input
+    // that was not measured, and the disclosure names which history could not
+    // be read. `Readings::attach` is a no-op when both reads succeed, so a
+    // healthy response is byte-identical to the pre-fix one.
+    let mut readings = talos_measurement::Readings::new();
+
+    let version_rows = readings.record_rows(
+        "events.version_published",
+        state
+            .analytics_repo
+            .list_workflow_versions_audit(wf_id, limit)
+            .await,
+    );
 
     for row in &version_rows {
         let version_number = row.version_number.unwrap_or(0);
@@ -1989,11 +2008,13 @@ async fn handle_get_workflow_audit_trail(
         }));
     }
 
-    let exec_rows = state
-        .analytics_repo
-        .list_executions_for_audit(wf_id, user_id, limit)
-        .await
-        .unwrap_or_default();
+    let exec_rows = readings.record_rows(
+        "events.execution_triggered",
+        state
+            .analytics_repo
+            .list_executions_for_audit(wf_id, user_id, limit)
+            .await,
+    );
 
     for row in &exec_rows {
         let exec_id = row.id;
@@ -2086,13 +2107,44 @@ async fn handle_get_workflow_audit_trail(
 
     events.truncate(limit as usize);
 
-    let result = serde_json::json!({
+    // A short list and a short COUNT are the same defect wearing two shapes:
+    // an operator who reads `event_count` as the number of events that
+    // HAPPENED is wrong by exactly the class that could not be read. Both are
+    // disclosed as derived rather than silently corrected — there is no
+    // correct number to substitute.
+    if !readings.complete() {
+        readings.mark_derived("events");
+        readings.mark_derived("count");
+        readings.mark_derived("event_count");
+    }
+
+    let mut result = serde_json::json!({
         "workflow_id": wf_id.to_string(),
         "workflow_name": wf_name,
         "count": events.len(),
         "event_count": events.len(),
         "events": events,
     });
+    // `Readings::note` says a disclosed field is "null, NOT zero"; here the
+    // failure shortens a LIST rather than nulling a scalar, so the trail
+    // carries one extra sentence saying what the absence of a class of event
+    // does and does not mean. Emitted only when a read failed, so the healthy
+    // response keeps its exact pre-fix shape.
+    if !readings.complete() {
+        if let Some(obj) = result.as_object_mut() {
+            obj.insert(
+                "events_incomplete".to_string(),
+                serde_json::json!(
+                    "PARTIAL TRAIL: at least one class of event could not be read \
+                     (see `measurement.not_measured`). Its ABSENCE from `events` is \
+                     NOT evidence that it never happened, and `count` / \
+                     `event_count` are the length of what could be read, not the \
+                     number of things that occurred."
+                ),
+            );
+        }
+    }
+    readings.attach(&mut result);
 
     mcp_text(
         req_id,
