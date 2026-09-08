@@ -1091,6 +1091,15 @@ pub(crate) async fn build_platform_services(
     let metrics = metrics::TalosMetrics::new()
         .map_err(|e| anyhow::anyhow!("Failed to initialize metrics: {}", e))?;
     metrics::set_global(metrics.clone());
+    // Register the panic + supervised-task-exit collectors into the SAME
+    // registry `/metrics/prometheus` renders, and pre-seed every series
+    // this process can increment. A duplicate registration (a second
+    // `TalosMetrics::new()` in one process, which only tests do) is not
+    // fatal — the collectors are process-global, so the first registry
+    // already carries them.
+    if let Err(e) = talos_task_supervision::register_metrics(&metrics.registry) {
+        tracing::warn!(error = %e, "task-supervision metrics already registered");
+    }
     tracing::info!("Metrics service initialized");
 
     // ---------- Embedding-provider boot probe (added r239) ----------

@@ -112,7 +112,50 @@ fn dedup_key(watch_uuid: Uuid, incident_id: &str, state: &str, pubsub_message_id
 /// Returns `Ok(())` on a clean ack (no module bound / already
 /// processed) as well as on a successful publish; only a hard failure
 /// (module load, signing, NATS publish) returns `Err`.
+///
+/// **Every failure exit writes ONE `gcp_dispatch_failed` audit row, and
+/// that is what this wrapper is for.** Measured 2026-09-07: the inner
+/// function has six failure exits and only TWO of them — the signing
+/// failure and the NATS publish failure — wrote the row, so the four
+/// that fire in practice (module load, module-bound ceiling refusal,
+/// execution-row create, job serialise) recorded nothing anywhere. On
+/// this fleet the module-load exit had fired on every push since the
+/// channel was created and `google_calendar_audit_log` held ZERO
+/// `gcp_dispatch_failed` rows, so `watch_channel_service`'s
+/// `recent_failure` — the surface designed to show exactly this — was
+/// dark because its input had never been produced. A helper called at
+/// each exit is one forgotten call site away from that state; a wrapper
+/// over the whole body cannot be forgotten.
 pub(crate) async fn dispatch_monitoring_incident(
+    ctx: &GcpDispatchContext,
+    user_id: Uuid,
+    row: &GcpWatchRow,
+    incident: &JsonValue,
+    incident_id: &str,
+    incident_state: &str,
+    pubsub_message_id: &str,
+) -> Result<()> {
+    let outcome = dispatch_monitoring_incident_inner(
+        ctx,
+        user_id,
+        row,
+        incident,
+        incident_id,
+        incident_state,
+        pubsub_message_id,
+    )
+    .await;
+    if let Err(ref e) = outcome {
+        // `{:#}` — the whole anyhow chain. `Display` on an `anyhow::Error`
+        // prints the OUTERMOST context only, which is how four identical
+        // "load module for gcp dispatch" lines said nothing about the
+        // "Module not found or access denied" underneath them.
+        audit_dispatch_failed(ctx, user_id, row, &format!("{e:#}")).await;
+    }
+    outcome
+}
+
+async fn dispatch_monitoring_incident_inner(
     ctx: &GcpDispatchContext,
     user_id: Uuid,
     row: &GcpWatchRow,
@@ -158,11 +201,22 @@ pub(crate) async fn dispatch_monitoring_incident(
     }
 
     // Load the module ONCE. Scoped to user_id enforces ownership.
+    // The `module_id` belongs in the CONTEXT, not only in a log field:
+    // this error is rendered into the audit row and into the handler's
+    // WARN, and on a healthy database the only failure `get_module` has
+    // is "Module not found or access denied" — i.e. the binding names a
+    // module that does not exist for this user. Without the id an
+    // operator cannot tell which module to re-create or re-bind.
     let exec_info = ctx
         .registry
         .get_execution_info(module_id, user_id)
         .await
-        .context("load module for gcp dispatch")?;
+        .with_context(|| {
+            format!(
+                "load module for gcp dispatch (channel {}, module {module_id})",
+                row.id
+            )
+        })?;
     let config = exec_info
         .config
         .clone()
@@ -373,7 +427,8 @@ pub(crate) async fn dispatch_monitoring_incident(
                 Some("signing_error".into()),
             )
             .await;
-        audit_dispatch_failed(ctx, user_id, row, &err_msg).await;
+        // No inline audit call: the wrapper writes exactly one row per
+        // failure, for every exit.
         bail!(err_msg);
     }
 
@@ -437,7 +492,8 @@ pub(crate) async fn dispatch_monitoring_incident(
                     Some("nats_publish".into()),
                 )
                 .await;
-            audit_dispatch_failed(ctx, user_id, row, &err_msg).await;
+            // No inline audit call: the wrapper writes exactly one row
+            // per failure, for every exit.
             bail!(err_msg);
         }
     }
@@ -569,5 +625,70 @@ mod tests {
         let parsed = parse_monitoring_incident(&payload);
         assert_eq!(parsed.incident_id, "");
         assert_eq!(parsed.state, "open");
+    }
+
+    /// **Exactly one `gcp_dispatch_failed` row per failed dispatch, and
+    /// the wrapper is the only thing that writes it.**
+    ///
+    /// Structural, and the reason is a measurement rather than a
+    /// preference: driving `dispatch_monitoring_incident` needs a
+    /// `GcpDispatchContext`, whose `nats` field is a non-optional
+    /// `Arc<async_nats::Client>` — there is no offline constructor — so
+    /// no test in this workspace can exercise the module-load exit that
+    /// fired four times on the live fleet on 2026-09-07. What CAN be
+    /// pinned is the shape that made those four failures leave no trace:
+    /// an audit helper called at each exit, where two exits called it and
+    /// four did not.
+    ///
+    /// Two directions, because either alone is trivially defeated: the
+    /// WRAPPER must still call the helper (delete that and every failure
+    /// goes silent again), and the INNER function must not (re-add an
+    /// inline call and a failure writes two rows, which
+    /// `attach_recent_failures`' `DISTINCT ON` hides while the table
+    /// grows).
+    ///
+    /// **Stated limits**: it is TEXTUAL and split-anchored, so a rename
+    /// of either function misleads it — in the LOUD direction, since the
+    /// split then fails outright; and it proves the call is PRESENT, never
+    /// that it sits on the failure branch. The honest guard for that is
+    /// the live read of `google_calendar_audit_log` after deploy.
+    #[test]
+    fn exactly_one_audit_write_and_it_is_in_the_wrapper() {
+        let src = include_str!("dispatch.rs");
+        let after_wrapper = src
+            .split("pub(crate) async fn dispatch_monitoring_incident(")
+            .nth(1)
+            .expect("the wrapper must exist");
+        let wrapper_body = after_wrapper
+            .split("async fn dispatch_monitoring_incident_inner(")
+            .next()
+            .expect("the inner function must follow the wrapper");
+        let inner_body = after_wrapper
+            .split("async fn dispatch_monitoring_incident_inner(")
+            .nth(1)
+            .expect("the inner function must exist")
+            .split("async fn audit_dispatch_failed(")
+            .next()
+            .expect("the audit helper follows the inner function");
+
+        assert_eq!(
+            wrapper_body.matches("audit_dispatch_failed(").count(),
+            1,
+            "the wrapper must write exactly one audit row on failure — it is \
+             the ONLY thing that covers all six of the inner function's \
+             failure exits"
+        );
+        assert_eq!(
+            inner_body.matches("audit_dispatch_failed(").count(),
+            0,
+            "the inner function must NOT write an audit row: the wrapper \
+             already does, so an inline call is a duplicate row per failure"
+        );
+        // The split must be splitting something (checks 64/65).
+        assert!(
+            inner_body.len() > 1000 && wrapper_body.contains("dispatch_monitoring_incident_inner("),
+            "the function-name anchors have drifted; this test would then be \
+             asserting over the wrong region"
+        );
     }
 }

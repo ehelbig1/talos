@@ -30,6 +30,7 @@ members = [
     "talos-cost-attribution",
     "talos-errors",
     "talos-metrics",
+    "talos-task-supervision",
     "talos-http-utils",
     "talos-shutdown",
     "talos-nats-tls",

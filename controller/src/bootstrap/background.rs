@@ -6,6 +6,12 @@
 //! (`scrub_wasm_log_for_broadcast`), whose only consumer is the NATS
 //! log-subscriber loop below.
 use crate::*;
+// Every long-lived loop below is spawned through `spawn_supervised`, which
+// records HOW it stopped. A panic hook (installed in `main`) covers the
+// panic; only this wrapper can see the other shape — a loop that simply
+// RETURNS, which produces no panic, no stderr line and no trace at all.
+// Nothing is restarted: see the crate docs for why.
+use talos_task_supervision::{spawn_supervised, BackgroundTask};
 
 /// Maximum characters of WASM-emitted log content broadcast on the
 /// `execution_updates` GraphQL subscription. Mirrors the persistence
@@ -700,7 +706,7 @@ pub(crate) fn spawn_worker_fleet_tasks(
 
     {
         let manager = worker_manager.clone();
-        tokio::spawn(async move {
+        spawn_supervised(BackgroundTask::WorkerFleetManagement, async move {
             if let Err(e) =
                 talos_worker_fleet::start_worker_management(manager, (*nats).clone()).await
             {
@@ -716,7 +722,7 @@ pub(crate) fn spawn_worker_fleet_tasks(
     // Gauge sweep. Same 60s cadence as the registry-backed build-skew sweep so
     // the two views of the fleet are never more than one interval apart when an
     // operator reads them side by side.
-    tokio::spawn(async move {
+    spawn_supervised(BackgroundTask::WorkerFleetGauge, async move {
         let controller_build = crate::bootstrap::router::controller_build_version();
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
         ticker.tick().await;
@@ -1041,7 +1047,7 @@ pub(crate) fn spawn_metrics_gauge_tasks(
     // picked up without a controller restart. The interval is intentionally
     // long: even Voyage's free 3 RPM tier loses just ~6% of capacity to
     // these probes.
-    tokio::spawn(async {
+    spawn_supervised(BackgroundTask::EmbeddingProviderProbe, async {
         let mut ticker = tokio::time::interval(crate::mcp::search::PROVIDER_PROBE_INTERVAL);
         // First tick fires immediately — skip it so we don't double-probe at boot.
         ticker.tick().await;
@@ -1063,7 +1069,7 @@ pub(crate) fn spawn_metrics_gauge_tasks(
     // by the 2026-08-20 blindness fix, which adds no query and no round trip.
     {
         let pool = db_pool.clone();
-        tokio::spawn(async move {
+        spawn_supervised(BackgroundTask::CryptoInvariantGauge, async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
             // First tick fires immediately — skip it so startup isn't noisy.
             ticker.tick().await;
@@ -1116,7 +1122,7 @@ pub(crate) fn spawn_metrics_gauge_tasks(
     // is a detector that is off.
     {
         let pool = db_pool.clone();
-        tokio::spawn(async move {
+        spawn_supervised(BackgroundTask::CatalogMissingWasmGauge, async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
             ticker.tick().await;
             loop {
@@ -1153,7 +1159,7 @@ pub(crate) fn spawn_metrics_gauge_tasks(
     // is a detector that is off.
     {
         let pool = db_pool.clone();
-        tokio::spawn(async move {
+        spawn_supervised(BackgroundTask::NodeFuelHeadroomGauge, async move {
             let repo = talos_analytics_repository::AnalyticsRepository::new(pool);
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
             // First tick fires immediately — skip it so the first sweep runs
@@ -1231,7 +1237,7 @@ pub(crate) fn spawn_metrics_gauge_tasks(
     {
         let pool = db_pool.clone();
         let fleet = worker_manager.clone();
-        tokio::spawn(async move {
+        spawn_supervised(BackgroundTask::FleetBuildSkewGauge, async move {
             let repo = talos_worker_identity_repository::WorkerIdentityRepository::new(pool);
             let controller_build = crate::bootstrap::router::controller_build_version();
             let heartbeat_authoritative = heartbeat_silence_is_authoritative();
@@ -1361,7 +1367,7 @@ pub(crate) fn spawn_metrics_gauge_tasks(
     // leaves the fleet exactly as it was).
     {
         let pool = db_pool.clone();
-        tokio::spawn(async move {
+        spawn_supervised(BackgroundTask::WorkerIdentityReaper, async move {
             let repo = talos_worker_identity_repository::WorkerIdentityRepository::new(pool);
             let silence_hours = departed_liveness_cutoff_hours();
 
@@ -1591,7 +1597,7 @@ pub(crate) fn spawn_metrics_gauge_tasks(
             .and_then(|v| v.parse::<i64>().ok())
             .filter(|n| *n > 0)
             .unwrap_or(30);
-        tokio::spawn(async move {
+        spawn_supervised(BackgroundTask::DbPoolGauge, async move {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
             loop {
                 ticker.tick().await;
@@ -1615,7 +1621,7 @@ pub(crate) fn spawn_metrics_gauge_tasks(
 pub(crate) fn spawn_registry_sync(registry: std::sync::Arc<ModuleRegistry>) {
     // ---------- Start OCI Registry background sync loop ----------
     let sync_registry = registry.clone();
-    tokio::spawn(async move {
+    spawn_supervised(BackgroundTask::RegistrySync, async move {
         registry::sync::start_registry_sync_loop(sync_registry).await;
     });
 }
@@ -1648,7 +1654,7 @@ pub(crate) fn spawn_maintenance_sweeps(
         .unwrap_or(300)
         .clamp(60, 3600);
     let llm_sweep_shutdown = bg_shutdown_rx.clone();
-    tokio::spawn(async move {
+    spawn_supervised(BackgroundTask::LlmKeysCacheSweep, async move {
         let mut shutdown = llm_sweep_shutdown;
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(sweep_interval_secs));
         // Burn the immediate first tick so we don't sweep an empty cache at startup.
@@ -1737,7 +1743,7 @@ pub(crate) fn spawn_maintenance_sweeps(
             3600,
         )
         .clamp(300, 86_400);
-        tokio::spawn(async move {
+        spawn_supervised(BackgroundTask::MemoryRankProvenanceSweep, async move {
             let mut shutdown = prov_shutdown;
             let mut ticker =
                 tokio::time::interval(std::time::Duration::from_secs(prov_interval_secs));
@@ -1836,7 +1842,7 @@ pub(crate) fn spawn_maintenance_sweeps(
             talos_ops_alerts_repository::self_monitor::DEFAULT_TICK_INTERVAL_SECS,
         )
         .clamp(5, 3600);
-        tokio::spawn(async move {
+        spawn_supervised(BackgroundTask::OpsAlertsSelfMonitor, async move {
             let mut shutdown = self_monitor_shutdown;
             let mut ticker =
                 tokio::time::interval(std::time::Duration::from_secs(self_monitor_interval));
@@ -1904,7 +1910,7 @@ pub(crate) fn spawn_maintenance_sweeps(
         let worker_id_repo =
             talos_worker_identity_repository::WorkerIdentityRepository::new(db_pool.clone());
         let refresh_shutdown = bg_shutdown_rx.clone();
-        tokio::spawn(async move {
+        spawn_supervised(BackgroundTask::WorkerKeyRefresh, async move {
             let mut shutdown = refresh_shutdown;
             // Immediate load so DB-registered keys go live shortly after boot; a
             // transient error here is non-fatal (env registry stays active, the
@@ -2008,7 +2014,7 @@ pub(crate) fn spawn_maintenance_sweeps(
         // rows the cap drops age out of the sliding window and no later pass
         // picks them up.
         const MAX_JOBS_PER_SWEEP: i64 = 2000;
-        tokio::spawn(async move {
+        spawn_supervised(BackgroundTask::AuditChainVerificationSweep, async move {
             let mut shutdown = audit_sweep_shutdown;
             let mut ticker =
                 tokio::time::interval(std::time::Duration::from_secs(audit_sweep_interval_secs));
@@ -2181,7 +2187,7 @@ pub(crate) fn spawn_maintenance_sweeps(
         // statement issued mid-tick can wedge its connection-pool
         // entry on abort.
         let recon_shutdown = bg_shutdown_rx.clone();
-        tokio::spawn(async move {
+        spawn_supervised(BackgroundTask::ModuleTableReconcile, async move {
             let mut shutdown = recon_shutdown;
             let mut ticker =
                 tokio::time::interval(std::time::Duration::from_secs(recon_interval_secs));
@@ -2272,7 +2278,7 @@ pub(crate) fn spawn_cleanup_tasks(
     // stale_execution_cleanup (MCP-1042) sweeps.
     let cleanup_auth_service = auth_service.clone();
     let session_cleanup_shutdown = bg_shutdown_rx.clone();
-    tokio::spawn(async move {
+    spawn_supervised(BackgroundTask::SessionCleanup, async move {
         let mut shutdown = session_cleanup_shutdown;
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
         loop {
@@ -2303,7 +2309,7 @@ pub(crate) fn spawn_cleanup_tasks(
     // ---------- Start background API key cleanup task ----------
     let cleanup_api_key_service = api_key_service.clone();
     let api_key_cleanup_shutdown = bg_shutdown_rx.clone();
-    tokio::spawn(async move {
+    spawn_supervised(BackgroundTask::ApiKeyCleanup, async move {
         let mut shutdown = api_key_cleanup_shutdown;
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
         loop {
@@ -2334,7 +2340,7 @@ pub(crate) fn spawn_cleanup_tasks(
     // ---------- Start background OAuth state token cleanup task ----------
     let cleanup_oauth_service = oauth_service.clone();
     let oauth_cleanup_shutdown = bg_shutdown_rx.clone();
-    tokio::spawn(async move {
+    spawn_supervised(BackgroundTask::OauthStateCleanup, async move {
         let mut shutdown = oauth_cleanup_shutdown;
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
         loop {
@@ -2431,7 +2437,7 @@ pub(crate) fn spawn_cleanup_tasks(
     // ticks. The inner batched statements still run to natural completion
     // within one tick; the shutdown select gates the OUTER ticker.
     let retention_shutdown = bg_shutdown_rx.clone();
-    tokio::spawn(async move {
+    spawn_supervised(BackgroundTask::ExecutionRetention, async move {
         let mut shutdown = retention_shutdown;
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(6 * 3600));
         loop {
@@ -2477,7 +2483,7 @@ pub(crate) fn spawn_cleanup_tasks(
     let cleanup_secrets = secrets_manager.clone();
     let cleanup_webhooks = webhook_router.clone();
     let audit_cleanup_shutdown = bg_shutdown_rx.clone();
-    tokio::spawn(async move {
+    spawn_supervised(BackgroundTask::AuditLogCleanup, async move {
         let mut shutdown = audit_cleanup_shutdown;
         // Run daily at 2 AM (check every hour, but only execute once per day)
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
@@ -2566,7 +2572,7 @@ pub(crate) fn spawn_cleanup_tasks(
     // connection pool until server-side timeout.
     let suspension_expiry_pool = db_pool.clone();
     let suspension_shutdown = bg_shutdown_rx.clone();
-    tokio::spawn(async move {
+    spawn_supervised(BackgroundTask::SuspensionExpiry, async move {
         let mut shutdown = suspension_shutdown;
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
         loop {
@@ -2603,7 +2609,7 @@ pub(crate) fn spawn_cleanup_tasks(
 
     // ---------- Start WASM module cache cleanup task ----------
     let cleanup_registry = registry.clone();
-    tokio::spawn(async move {
+    spawn_supervised(BackgroundTask::WasmCacheCleanup, async move {
         // Run every 6 hours
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(21600));
 
@@ -2690,7 +2696,7 @@ pub(crate) fn spawn_cleanup_tasks(
     // Prevents unbounded growth of in-memory token buckets and CB records as unique
     // webhook tokens and IPs accumulate over the process lifetime.
     let cleanup_webhook_rl = webhook_router.clone();
-    tokio::spawn(async move {
+    spawn_supervised(BackgroundTask::WebhookRateLimitCleanup, async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300)); // Every 5 min
         loop {
             interval.tick().await;
@@ -2727,7 +2733,7 @@ pub(crate) fn spawn_cleanup_tasks(
     // raw-limiter sweep above without leaking the inner `IpRateLimiter`
     // out of `DistributedRateLimiter`.
     let cleanup_auth_limiter = auth_rate_limiter.clone();
-    tokio::spawn(async move {
+    spawn_supervised(BackgroundTask::AuthRateLimitCleanup, async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
         // First tick fires immediately — burn it so a fresh boot doesn't
         // do an empty-map walk before any request has been admitted.
@@ -2775,7 +2781,7 @@ pub(crate) fn spawn_cleanup_tasks(
     // connection pool. Same MCP-1042/1043 discipline.
     let cleanup_exec_service = module_execution_service.clone();
     let stuck_cleanup_shutdown = bg_shutdown_rx.clone();
-    tokio::spawn(async move {
+    spawn_supervised(BackgroundTask::StuckExecutionCleanup, async move {
         let mut shutdown = stuck_cleanup_shutdown;
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
         loop {
@@ -2841,7 +2847,7 @@ pub(crate) fn spawn_cleanup_tasks(
         let payload_corpus_keep = talos_config::module_payload_retention_corpus_keep();
         let payload_batch = talos_config::module_payload_retention_batch();
         let payload_retention_shutdown = bg_shutdown_rx.clone();
-        tokio::spawn(async move {
+        spawn_supervised(BackgroundTask::ModulePayloadRetention, async move {
             let mut shutdown = payload_retention_shutdown;
             // Same 6-hour cadence as the parent-row retention DELETE it is
             // parity with. Nothing about payload nulling is urgent; a slower
@@ -2938,7 +2944,7 @@ pub(crate) fn spawn_cleanup_tasks(
         let row_corpus_keep = talos_config::module_payload_retention_corpus_keep();
         let row_batch = talos_config::module_execution_retention_batch();
         let row_retention_shutdown = bg_shutdown_rx.clone();
-        tokio::spawn(async move {
+        spawn_supervised(BackgroundTask::ModuleExecutionRowRetention, async move {
             let mut shutdown = row_retention_shutdown;
             // Same 6-hour cadence as the parent-row retention DELETE this is
             // closing the gap behind. Nothing about it is urgent; a slower tick
@@ -3078,7 +3084,7 @@ pub(crate) fn spawn_cleanup_tasks(
     // growth in long-lived processes.  DEK rotation is rare, so the cache stays
     // small in practice, but the cleanup ensures stale entries are released.
     let cleanup_secrets_dek = secrets_manager.clone();
-    tokio::spawn(async move {
+    spawn_supervised(BackgroundTask::DekCacheCleanup, async move {
         // Run every 10 minutes — DEK TTL is 5 min by default, so this evicts
         // entries within one extra TTL period of expiry.
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(600));
@@ -3097,7 +3103,7 @@ pub(crate) fn spawn_cleanup_tasks(
     // table — no inline DELETE queries elsewhere in the codebase.
     let agent_memory_pool = db_pool.clone();
     let actor_memory_shutdown = bg_shutdown_rx.clone();
-    tokio::spawn(async move {
+    spawn_supervised(BackgroundTask::ActorMemoryTtlSweep, async move {
         let mut shutdown = actor_memory_shutdown;
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(900)); // Every 15 min
         loop {
@@ -3155,7 +3161,7 @@ pub(crate) fn spawn_analytics_tasks(
     // connection-pool entry on the in-flight UPDATE.
     let readiness_pool = db_pool.clone();
     let readiness_shutdown = bg_shutdown_rx.clone();
-    tokio::spawn(async move {
+    spawn_supervised(BackgroundTask::WorkflowReadinessRecompute, async move {
         let mut shutdown = readiness_shutdown;
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600)); // Every hour
         loop {
@@ -3566,7 +3572,7 @@ pub(crate) fn spawn_analytics_tasks(
     // completion within one tick.
     let sla_pool = db_pool.clone();
     let sla_degradation_shutdown = bg_shutdown_rx.clone();
-    tokio::spawn(async move {
+    spawn_supervised(BackgroundTask::SlaDegradationMonitor, async move {
         let mut shutdown = sla_degradation_shutdown;
         // Wait 2 minutes after startup before first check to let executions settle
         tokio::time::sleep(std::time::Duration::from_secs(120)).await;
@@ -3890,7 +3896,7 @@ pub(crate) fn spawn_integration_renewal_tasks(
     if let Some(ref gmail_watch) = gmail_watch_service {
         let renewal = gmail_watch.clone();
         let gmail_renewal_shutdown = bg_shutdown_rx.clone();
-        tokio::spawn(async move {
+        spawn_supervised(BackgroundTask::GmailWatchRenewal, async move {
             gmail::scheduler::gmail_renewal_task(renewal, gmail_renewal_shutdown).await;
         });
         tracing::info!("Gmail watch renewal task started (runs every hour)");
@@ -3898,7 +3904,7 @@ pub(crate) fn spawn_integration_renewal_tasks(
         // Sweep the per-(user,integration) create-lock map hourly so
         // it doesn't grow unbounded in a long-running controller.
         let cleanup_gmail = gmail_watch.clone();
-        tokio::spawn(async move {
+        spawn_supervised(BackgroundTask::GmailCreateLockSweep, async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
             loop {
                 interval.tick().await;
@@ -3912,7 +3918,7 @@ pub(crate) fn spawn_integration_renewal_tasks(
     // nothing on our side expires). We only sweep the create-lock map so
     // it can't grow unbounded over the controller's lifetime.
     if let Some(gcp_watch) = services.gcp_watch_service.clone() {
-        tokio::spawn(async move {
+        spawn_supervised(BackgroundTask::GcpCreateLockSweep, async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
             loop {
                 interval.tick().await;
@@ -3925,7 +3931,7 @@ pub(crate) fn spawn_integration_renewal_tasks(
     if google_calendar_service.is_configured() {
         let renewal_service = google_calendar_service.clone();
         let gcal_renewal_shutdown = bg_shutdown_rx.clone();
-        tokio::spawn(async move {
+        spawn_supervised(BackgroundTask::GcalChannelRenewal, async move {
             google_calendar::scheduler::channel_renewal_task(
                 renewal_service,
                 gcal_renewal_shutdown,
@@ -3938,7 +3944,7 @@ pub(crate) fn spawn_integration_renewal_tasks(
         // Also sweeps the create_channel_locks DashMap to prevent
         // unbounded growth over the controller's lifetime.
         let cleanup_gcal_rl = google_calendar_service.clone();
-        tokio::spawn(async move {
+        spawn_supervised(BackgroundTask::GcalRateLimitCleanup, async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
             loop {
                 interval.tick().await;
@@ -4339,7 +4345,7 @@ pub(crate) fn spawn_nats_log_subscribers(
             crate::execution_repository::ExecutionRepository::new(db_pool.clone())
                 .with_workflow_execution_sender(workflow_execution_tx.clone()),
         );
-        tokio::spawn(async move {
+        spawn_supervised(BackgroundTask::WasmLogSubscriber, async move {
             tracing::info!("Starting WASM log subscriber on topic: wasm.log.*");
 
             // MCP-1121 (2026-05-16): supervisor loop wraps the inner
@@ -4424,7 +4430,7 @@ pub(crate) fn spawn_nats_log_subscribers(
                 talos_workflow_job_protocol::load_worker_shared_key_previous().unwrap_or_default(),
             )
         });
-        tokio::spawn(async move {
+        spawn_supervised(BackgroundTask::JobResultSubscriber, async move {
             tracing::info!("Starting job result subscriber on topic: talos.results.*");
 
             // MCP-1122 (2026-05-16): supervisor loop wraps the inner
@@ -4718,7 +4724,7 @@ pub(crate) fn spawn_late_background_tasks(
     // wedging a connection-pool entry on a half-issued statement.
     let cleanup_pool = db_pool.clone();
     let cleanup_shutdown = bg_shutdown_rx.clone();
-    tokio::spawn(async move {
+    spawn_supervised(BackgroundTask::StaleExecutionSweep, async move {
         let mut shutdown = cleanup_shutdown;
         let cleanup_repo =
             crate::execution_repository::ExecutionRepository::new(cleanup_pool.clone());
@@ -4849,7 +4855,7 @@ pub(crate) fn spawn_late_background_tasks(
             nats,
         ));
         let scheduler_shutdown = bg_shutdown_rx.clone();
-        tokio::spawn(async move {
+        spawn_supervised(BackgroundTask::Scheduler, async move {
             scheduler.run_with_shutdown(scheduler_shutdown).await;
         });
         tracing::info!("Workflow scheduler started (polls every 15 seconds, backfills null next_trigger_at on startup; graceful-shutdown enabled)");
@@ -4879,7 +4885,7 @@ pub(crate) fn spawn_late_background_tasks(
     // testable at all.
     let sla_pool = db_pool.clone();
     let sla_breach_shutdown = bg_shutdown_rx.clone();
-    tokio::spawn(async move {
+    spawn_supervised(BackgroundTask::SlaBreachMonitor, async move {
         let mut shutdown = sla_breach_shutdown;
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(300)); // Every 5 min
                                                                                        // MCP-497: same SSRF-via-redirect fix as MCP-469/470 — the
@@ -6731,5 +6737,95 @@ mod crypto_orphan_blindness_tests {
     #[test]
     fn no_collector_is_not_a_panic() {
         publish_crypto_orphan_scan(None, &ok_scan());
+    }
+}
+
+/// The wiring nothing else can see: **a supervised spawn site reverted to a
+/// bare `tokio::spawn` is invisible to every runtime instrument.**
+///
+/// `talos-task-supervision`'s own tests prove the wrapper counts and logs;
+/// they cannot prove that the forty-two long-lived loops in this file go
+/// THROUGH it. Reverting one site is behaviourally identical on a healthy
+/// process and leaves the whole workspace green — measured, not assumed
+/// (2026-09-07). Nor can structural lint check 58 see it: that check asks
+/// whether a `TalosMetrics` field has an increment site somewhere, and its
+/// own stated limit is that "deleting all its call sites is not" caught.
+///
+/// **Stated limits.** This is a hand-maintained COUNT over this one file, so
+/// it is a snapshot: adding a legitimate new background loop is a deliberate
+/// edit here, which is the point. It is TEXTUAL, so it says nothing about
+/// whether a given site wraps the right future or names the right task. And
+/// it cannot see spawn sites in `services.rs` or `main.rs` (eight detached
+/// one-shots and one handle-bound compile task, all deliberately unwrapped).
+#[cfg(test)]
+mod task_supervision_wiring_tests {
+    /// The long-lived loops, all wrapped. 42 = the 45 loop-shaped
+    /// `tokio::spawn` sites this file carried on 2026-09-07 minus the three
+    /// that only LOOK like loops to a windowed scan: the
+    /// `grandfather_embedding_model` one-shot, the crash-recovery startup
+    /// sweep, and the actor-memory embedding backfill — each a single
+    /// awaited call that is meant to finish.
+    const EXPECTED_SUPERVISED: usize = 42;
+
+    /// The remaining bare `tokio::spawn` calls in THIS file, deliberately
+    /// unwrapped because each is a one-shot whose death is bounded to one
+    /// event (and still covered by the process panic hook):
+    ///   1. `grandfather_embedding_model` startup backfill
+    ///   2. crash-recovery startup sweep
+    ///   3. actor-memory embedding backfill
+    ///   4. the per-workflow readiness scan task
+    ///   5. the per-integration renewal kick
+    ///   6. the per-breach SLA webhook POST
+    const EXPECTED_BARE: usize = 6;
+
+    #[test]
+    fn every_long_lived_loop_is_supervised() {
+        let src = include_str!("background.rs");
+        // Drop this test module itself, or its own prose counts.
+        let prod = src
+            .split("mod task_supervision_wiring_tests")
+            .next()
+            .expect("this module's own text must be excluded");
+        let supervised = prod.matches("spawn_supervised(BackgroundTask::").count();
+        let bare = prod
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && t.contains("tokio::spawn(")
+            })
+            .count();
+        assert_eq!(
+            supervised, EXPECTED_SUPERVISED,
+            "a long-lived background loop stopped going through spawn_supervised \
+             (or a new one was added). A reverted site is behaviourally identical \
+             on a healthy process and silent on a dead one — which is the entire \
+             failure this wrapper exists to make sayable."
+        );
+        assert_eq!(
+            bare, EXPECTED_BARE,
+            "the set of deliberately-unsupervised one-shot spawns in this file \
+             changed. If you added a long-lived loop, wrap it; if you added a \
+             genuine one-shot, update EXPECTED_BARE and name it above."
+        );
+    }
+
+    /// The panic hook is installed in exactly one place per binary and its
+    /// collectors registered in exactly one place. Deleting either call
+    /// leaves every test in the workspace green while the process goes back
+    /// to printing one unstructured stderr line per panic.
+    #[test]
+    fn the_panic_hook_is_wired_in_both_binaries() {
+        let controller_main = include_str!("../main.rs");
+        assert!(
+            controller_main.contains("talos_task_supervision::install_panic_hook(\"controller\")"),
+            "controller/src/main.rs must install the process panic hook"
+        );
+        let services = include_str!("services.rs");
+        assert!(
+            services.contains("talos_task_supervision::register_metrics(&metrics.registry)"),
+            "the panic + task-exit collectors must be registered into the registry \
+             /metrics/prometheus renders, or both series are absent — and absent \
+             is not zero for every `increase(...) > 0` alert built on them"
+        );
     }
 }

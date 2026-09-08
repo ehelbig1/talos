@@ -2616,6 +2616,201 @@ counts above.
 call. It is the same class inside the harness; its other callers are outside
 this change and `dead_statement_tests` seeds its own row instead.
 
+## Failures nobody can see: a dead binding, and a loop that stops (2026-09-07)
+
+Three surfaces where the platform could not SAY that something had stopped
+working. Not a misleading report this time — a missing one.
+
+### A push channel bound to a module the load cannot find
+
+**Measured live.** Four Pub/Sub deliveries arrived (19:41Z x3, 19:57Z x1) and
+every one failed with the byte-identical line
+`WARN talos_google_cloud::handlers: gcp pubsub: dispatch failed
+user_id=… error=load module for gcp dispatch`. Three things were wrong at once.
+
+**(a) The log said nothing.** `error = %e` renders `Display` on an `anyhow`
+chain, which prints only the OUTERMOST context — so
+*"Module not found or access denied"*, the `module_id` and the `channel_uuid`
+were all invisible. `{:#}` now renders the chain, the WARN carries
+`channel_uuid`, and the module-load context names the channel and the module.
+
+**(b) The module the channel names does not exist, and reading that took the
+service.** The row is `integration_state (google_cloud,
+watch/43773540-…)`, `value_format = 4`, so `module_id` is not readable from
+psql; a temporary example binary drove the real `SecretsManager` +
+`IntegrationStateService` (since deleted) and returned
+`module_id = 51ff1d27-9e16-49cc-a7cf-92d7d61b495d`,
+`display_name = "sandbox-monitoring"`, created 2026-07-17. That id matches **0
+rows** in `modules`, has **0** `module_executions`, and appears in
+`admin_event_log` **0** times — there is no record of how it went away. The
+INTEGRATION row is healthy. Population: the fleet has 2 push channels
+(`gmail`, `google_cloud`) and `google_calendar_watch_channels` is empty; the
+gmail row binds no module, so **1 of 1 module-binding channels is dangling.**
+
+**(c) Nothing durable was recorded, and the surface built for it was dark
+because its input had never been produced.** `watch_channel_service`'s
+`recent_failure` selects `event_type IN ('gcp_channel_push_rejected',
+'gcp_dispatch_failed')` — and `google_calendar_audit_log` held **zero** rows of
+either, ever, while carrying 18 rows for three other integrations. The cause:
+`dispatch_monitoring_incident` has SIX failure exits and only TWO wrote the
+audit row (signing, NATS publish). The four that fire in practice — module
+load, the module-bound ceiling refusal, execution-row create, job serialise —
+recorded nothing anywhere. **The fix is a wrapper, not a fifth call site**:
+`dispatch_monitoring_incident` is now a thin outer over
+`dispatch_monitoring_incident_inner` that writes exactly one row on any `Err`
+(chain-rendered), and the two inline calls are DELETED so a failure cannot
+write twice. A helper called at each exit is one forgotten call site away from
+this state; a wrapper over the whole body cannot be forgotten.
+
+**`module_name: null` was three states rendered as one**, and the read that
+produced it was `.unwrap_or_default()` (check 74's shape). `module_binding` is
+now four-valued — `none` (no binding) / `bound` / `missing` (set, and names
+nothing this user can load — **every push fails**) / `unreadable` (the lookup
+itself failed; calling that `missing` is a determinate negative over a query
+that did not answer). `classify_module_binding` takes the lookup's own
+`Result`, not a pre-flattened `Option`, and that is structural: with an
+`Option` the classifier is correct and the CALL SITE can still hand it
+`Some(HashMap::new())` on an `Err` — a one-line revert that **every test here
+SURVIVES** (measured). Reading the `Result` makes the collapse a deliberate
+rewrite; it does not make it impossible, and checks 74b/79b state that limit as
+their own.
+
+**What was measured and NOT changed.** `create_watch` gates the INTEGRATION
+(ownership-checked) and accepts ANY `module_id` uuid, so a typo mints a
+permanently-dead channel with no error and no trace — the most likely origin of
+this fleet's state. Not fixed, because a correct create-time gate needs a
+THREE-valued module-visibility read that does not exist: `get_module` folds
+"not found" and "DB error" into one `Err` (check 79's leg (b)), and
+`module_owned_by_user` has no `user_id IS NULL` arm so it DISAGREES with the
+dispatch predicate about a shared catalog module — a gate on either would be a
+third answer to a question that already has two. **No MCP tool lists GCP watch
+channels** (grepped; `get_public_url_status` only prints prose telling the
+operator to "list endpoints via the watch-channels API"), and
+`get_platform_hygiene_report` / `list_workflow_triggers` do not know push
+channels exist. Wiring one in would give `talos-hygiene-service` a dependency
+on `talos-google-cloud`, inverting its layering. Recorded.
+
+### A background loop can panic, or simply stop, and nothing says so
+
+Package 20 (W5) recorded this remainder and left it. **Re-measured with a
+statement-aware inventory** (`scripts/background-task-inventory.py`, added
+here): `controller/src/bootstrap/` + `main.rs` hold **54** `tokio::spawn` call
+sites — not 63; the difference is comment lines plus five uses of
+`tokio::spawn` as a FUNCTION VALUE handed to
+`async_graphql::dataloader::DataLoader::new`, which are not spawn sites — of
+which **45 are loop-shaped** and exactly **one** binds the `JoinHandle` (and
+discards the `JoinError`). `set_hook` occurrences in `controller/`, `worker/`
+and `talos-worker-runtime/`: **0**.
+
+**Two instruments, and they answer different questions.** Both live in the new
+leaf crate `talos-task-supervision`.
+
+* `install_panic_hook(process)` — installed in BOTH binaries immediately after
+  the tracing subscriber, before anything can spawn. One structured line on
+  target `talos_audit`, `event_kind = "task_panicked"`, carrying `process` /
+  `thread` / `location` / a control-char-scrubbed 300-char message, plus
+  `talos_task_panics_total{process}`. It covers EVERY panic in the process,
+  including code nothing wraps. **It cannot name the task**: a tokio worker
+  thread is `tokio-runtime-worker` and the location is wherever the panic was
+  raised, usually a callee. The hook must never panic itself (a double panic
+  ABORTS), so the payload downcast falls back to a fixed string, the message is
+  truncated on a char boundary, and the counter is constructed before the hook
+  is installed.
+* `spawn_supervised(BackgroundTask, fut)` — applied at **42 of the 54** sites,
+  and it sees the shape a panic hook structurally CANNOT: **a clean exit.** A
+  loop that `break`s, or whose `while let Some(_) = rx.recv().await` ends
+  because the channel closed, returns `Ok(())` — no panic, no stderr line, no
+  trace at all, and the subsystem is off for the process lifetime while every
+  status surface still reports it as configured.
+  `talos_background_task_exits_total{task, outcome}`.
+
+The **12 sites not wrapped**, named rather than counted: three one-shot startup
+sweeps in `background.rs` that only LOOK like loops to a windowed scan
+(`grandfather_embedding_model`, the crash-recovery sweep, the actor-memory
+embedding backfill), three detached per-event tasks there, three in `main.rs`,
+two in `services.rs`, and the one handle-bound compile task. Each is a one-shot
+whose death is bounded to one event, and the panic hook still covers it.
+
+**Nothing is restarted, deliberately.** Restarting a loop whose panic is
+deterministic would spin, and deciding per-task whether a restart is safe is a
+separate change. What this buys is that the death is SAYABLE.
+
+**Cardinality.** `BackgroundTask` is an ENUM whose variants, labels and `ALL`
+array come from ONE macro table, so the label set is closed BY THE COMPILER and
+a variant that the pre-seed loop misses is not expressible — no hand-maintained
+parallel list, and therefore no lint. `EXIT_OUTCOMES` is three-valued
+(`panicked` / `completed` / `cancelled`): a `JoinError` is either a panic or a
+cancellation, and folding an abort into "panicked" would report a deliberate
+shutdown as a defect. All 127 series are PRE-SEEDED at 0. **The `process` label
+is seeded with ONE value per process** — a `{process="worker"}` series on a
+controller would be a seeded combination nothing there can increment, which is
+the same defect as a dead metric. The worker registers into
+`prometheus::default_registry()` (what `get_prometheus_metrics` gathers and
+`seed_circuit_breaker_series` already seeds into), so its series survives an
+OTEL exporter-build failure.
+
+**Two alerts, both `warning`, and the argument is not the refusal one.** A
+refusal counter fires when the policy is WORKING; a panic in a spawned task is
+never working as designed, so it has no legitimate steady state above 0 —
+`TalosTaskPanic`. `TalosBackgroundTaskExited` is the same argument for the
+shape the hook cannot see, and it is the one that names WHICH loop.
+`warning` rather than `critical` because the blast radius is one task.
+Three `promtool` cases in `observability/alerts_test.yml` (pinned
+`prom/prometheus:v2.48.0`), the first of which drives permanently-zero
+pre-seeded series and asserts SILENCE — the shape a healthy controller has for
+its whole lifetime, and the one an ABSENT series renders identically.
+
+**The wiring is guarded, because it is the half nothing else can see.** The
+crate's own tests prove the wrapper counts and logs; they cannot prove the 42
+loops go through it, and reverting one site is behaviourally identical on a
+healthy process. `task_supervision_wiring_tests` pins the supervised count, the
+deliberately-bare count, and the two one-per-binary call sites
+(`install_panic_hook`, `register_metrics`) — all three mutations red. Check 58
+cannot see any of this: it asks whether a `TalosMetrics` FIELD has an increment
+site, and these collectors are not `TalosMetrics` fields at all.
+
+### The scheduler refusal counter: six survivors, not one
+
+Package 24 recorded ONE surviving mutation on `talos_dispatch_refused_total`.
+**No such series exists** — the instrument is
+`talos_scheduler_dispatches_total{phase,outcome}`, written through one
+`record_dispatch` helper — and deleting each of its **17** call sites in turn
+found **SIX** survivors, while the `denied` site the note points at was already
+caught. The two existing guards cover different things and neither covers the
+six: `record_dispatch_moves_every_seeded_series` drives the WRAPPER, which is
+exactly the property that stays true when every call site is deleted (check
+58's stated wrapper limit); `every_terminal_path_records_an_outcome` is
+anchored on a bare `return;`, and two of the six are the neighbour-vouching
+limit that test DOCUMENTS actually happening, while the other four — the
+wall-clock-timeout arm and the three tail arms (`completed`, `fenced`, the
+terminal `failed`) — reach their end with no `return;` at all.
+
+`every_recording_site_is_still_there` pins the per-outcome call-site count
+(`completed 1, failed 10, skipped 3, denied 2, fenced 1`) plus a tripwire that
+every call in the region is enumerated. **Re-running all 17 mutations against
+it: 17 caught, 0 survivors.** One thing measured rather than reasoned: the
+tripwire's first version counted `record_dispatch(` and read 18 on a HEALTHY
+tree, because the function's own DEFINITION sits inside the scanned region.
+
+**"The other pre-seeded paths" — the number is 29, and they are RECORDED.**
+`talos-metrics` pre-seeds 29 collectors; mutation-testing all of them is ~80
+build+test cycles and was not attempted. What WAS measured, in the same crate
+and therefore cheap: all three `scheduler_readiness_*` publish sites SURVIVE
+their own deletion — the pure `decide_hold` is well tested, the wiring that
+publishes it is not. The cheap substitute ("does any file referencing the
+collector contain an assertion") was built and REJECTED: it answers yes for 28
+of 29, i.e. it only proves the file has tests somewhere. A grep cannot answer
+"would deleting this call site turn a test red"; only mutation can.
+
+**No lint check was added and `--count` stays 88.** Two candidates were
+considered and both are answered structurally instead. "A long-lived
+`tokio::spawn` must go through `spawn_supervised`" has a population of 54 in
+ONE file and no way to tell a loop from a one-shot textually (the 60-line
+window in the inventory script misclassifies three of 45 in both directions) —
+the in-file count test is stronger and costs no check number. "Every
+`BackgroundTask` must be pre-seeded" is not expressible as a defect: the enum
+and the seed list come from one macro table.
+
 ## Sub-workflow dispatch (engine)
 
 Every parent node that runs a sub-workflow (judge, ensemble, reflective-retry, llm-dispatch, sub_workflow) uses the shared dispatcher pattern in `controller/src/engine/parallel.rs`:

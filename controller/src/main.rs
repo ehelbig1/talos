@@ -362,6 +362,19 @@ async fn main() -> anyhow::Result<()> {
     // Initialise the logger + tracing subscriber (OTLP bridge when configured).
     init_tracing_and_logging();
 
+    // Process-wide panic hook — installed IMMEDIATELY after the subscriber
+    // (its whole output is one structured `tracing` line) and before
+    // anything that can spawn. Until 2026-09-07 there was no
+    // `std::panic::set_hook` anywhere in `controller/` or `worker/`, so a
+    // panicking background loop produced one unstructured stderr line,
+    // incremented nothing, and every operator-facing surface kept reporting
+    // the subsystem as configured. The collectors are registered into the
+    // metrics registry later, in `bootstrap::services` — the split is
+    // deliberate: the hook must be in before the registry exists, and the
+    // counter it touches is the same object either way, so a panic between
+    // the two calls is still counted.
+    talos_task_supervision::install_panic_hook("controller");
+
     // Verify essential environment configuration early (fail-fast gate).
     validate_startup_config()?;
 
