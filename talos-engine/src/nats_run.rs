@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use talos_task_supervision::{spawn_supervised, BackgroundTask, TaskExit};
 
 use serde_json::Value as JsonValue;
 use talos_workflow_engine::{ParallelWorkflowEngine, WorkflowEngineError};
@@ -233,7 +234,7 @@ fn envelope_sealing_handle(
             let nc = nats_client.clone();
             let subject = claim_subject.clone();
             let inf = in_flight.clone();
-            tokio::spawn(async move {
+            spawn_supervised(BackgroundTask::EnvelopeSealClaimResponder, async move {
                 if let Err(e) = talos_envelope_seal::run_claim_responder(
                     nc,
                     subject,
@@ -251,6 +252,12 @@ fn envelope_sealing_handle(
                         "RFC 0010 P3 claim responder exited"
                     );
                 }
+                // Either arm is a loop that STOPPED: the responder's
+                // `while let Some(msg) = sub.next().await` ran out, or it
+                // returned an error. Sealed-secret claims are refused from
+                // here on and every sealing=1 dispatch fails, so this is a
+                // finding whichever way it arrived.
+                TaskExit::LoopEnded
             });
             // RFC 0010 P3 (M4): bound `InFlightSeals` against ORPHANED seals.
             // The engine's request/reply dispatcher removes its context on
@@ -282,7 +289,7 @@ fn envelope_sealing_handle(
             }
             let sweep_interval_secs: u64 =
                 talos_config::positive_env_or_default("TALOS_SEAL_SWEEP_INTERVAL_SECS", 60);
-            tokio::spawn(async move {
+            spawn_supervised(BackgroundTask::EnvelopeSealOrphanSweep, async move {
                 let mut ticker =
                     tokio::time::interval(std::time::Duration::from_secs(sweep_interval_secs));
                 // Skip the immediate first tick — nothing to sweep at startup.

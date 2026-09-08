@@ -1097,7 +1097,10 @@ pub(crate) async fn build_platform_services(
     // `TalosMetrics::new()` in one process, which only tests do) is not
     // fatal — the collectors are process-global, so the first registry
     // already carries them.
-    if let Err(e) = talos_task_supervision::register_metrics(&metrics.registry) {
+    if let Err(e) = talos_task_supervision::register_metrics(
+        &metrics.registry,
+        talos_task_supervision::BackgroundTask::ALL,
+    ) {
         tracing::warn!(error = %e, "task-supervision metrics already registered");
     }
     tracing::info!("Metrics service initialized");

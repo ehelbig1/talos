@@ -2824,12 +2824,25 @@ groups:
                only pointer.
 
       # The shape a panic hook structurally CANNOT see: a long-lived loop
-      # that stops without panicking. Every task in this counter's label set
-      # is meant to run for the process lifetime, so ANY outcome is a
-      # finding — `completed` most of all, because a clean return produces
-      # no panic, no stderr line and no trace of any kind.
+      # that stops without panicking. `completed` is the finding this
+      # alert exists for, because a clean return produces no panic, no
+      # stderr line and no trace of any kind.
+      #
+      # `outcome!~"declined|shutdown"` — added 2026-09-08 after the FIRST
+      # boot under this instrument. Two of the forty-two supervised
+      # bodies returned one second after start and were both recorded
+      # `completed`: `registry_sync` (OCI sync is opt-in and
+      # TALOS_REGISTRY_URL is unset on that fleet — dormant by config is
+      # not broken) and `worker_fleet_management` (a LAUNCHER that spawned
+      # its own two loops and returned). The alert read `inactive` only
+      # because both increments landed BEFORE the first scrape, so every
+      # sample in the series was already 1 and `increase()` saw no rise —
+      # a scrape that caught the seed would have paged on a healthy boot.
+      # The two returns now carry their own outcomes and this selector
+      # excludes them; `completed`, `panicked` and `cancelled` keep
+      # exactly the behaviour they had.
       - alert: TalosBackgroundTaskExited
-        expr: increase(talos_background_task_exits_total[15m]) > 0
+        expr: increase(talos_background_task_exits_total{outcome!~"declined|shutdown"}[15m]) > 0
         for: 0m
         labels:
           severity: warning
@@ -2851,7 +2864,13 @@ groups:
                `task_panicked` log line carries the location.
             3. `outcome="cancelled"` means the task was aborted — expected
                only during shutdown.
-            4. There is no supervisor: restart the controller to bring the
+            4. `outcome="declined"` and `outcome="shutdown"` are NOT
+               selected here and never fire: the first means the task did
+               not start under this configuration (log line
+               `event_kind=background_task_declined`, with a `reason`
+               field), the second means the process is going away
+               (`background_task_shutdown`). Both are INFO.
+            5. There is no supervisor: restart the controller to bring the
                loop back.
 
   # ────────────────────────────────────────────────────────────────────

@@ -12,6 +12,7 @@ use serde_json::Value;
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
+use talos_task_supervision::{spawn_supervised, BackgroundTask};
 // `pub use` so consumers (e.g. the talos-api GraphQL admin query) can name the
 // report types without a direct dep on talos-audit-event.
 pub use talos_audit_event::{
@@ -1427,7 +1428,7 @@ pub async fn start_audit_ledger_subscriber(
     // and runtime toggling would create gaps in the tamper-evident chain.
     let object_lock = load_object_lock_config();
 
-    tokio::spawn(async move {
+    spawn_supervised(BackgroundTask::AuditLedgerSubscriber, async move {
         tracing::info!("🔒 Started WORM Cryptographic Ledger subscriber on 'talos.audit.ledger'");
         let otlp_cache = Arc::new(OTLPCache::new());
 

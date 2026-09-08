@@ -2702,6 +2702,17 @@ which **45 are loop-shaped** and exactly **one** binds the `JoinHandle` (and
 discards the `JoinError`). `set_hook` occurrences in `controller/`, `worker/`
 and `talos-worker-runtime/`: **0**.
 
+**That 54 was a SCOPE, not a population — corrected 2026-09-08, one day
+later.** The same statement-aware walk over `talos-*/src` as well finds **127**
+further bare-spawn call sites in 34 crates, **28 of them long-lived loops**
+that nothing observes. Two of those crates held the loops the controller
+believed it was already supervising. A prior hand count put the library figure
+at 26 across ten crates; re-measured it is **24** for those ten (one site each
+in `talos-audit-ledger` and `talos-envelope-seal` is inside a `#[cfg(test)]`
+module) out of the 127. The inventory script's default roots are now the whole
+workspace, and its output classifies `supervised` / `handle` / `loop` /
+`oneshot` per crate so the remainder is a number rather than a guess.
+
 **Two instruments, and they answer different questions.** Both live in the new
 leaf crate `talos-task-supervision`.
 
@@ -2716,8 +2727,10 @@ leaf crate `talos-task-supervision`.
   ABORTS), so the payload downcast falls back to a fixed string, the message is
   truncated on a char boundary, and the counter is constructed before the hook
   is installed.
-* `spawn_supervised(BackgroundTask, fut)` — applied at **42 of the 54** sites,
-  and it sees the shape a panic hook structurally CANNOT: **a clean exit.** A
+* `spawn_supervised(BackgroundTask, fut)` — applied at **41 of the 54**
+  controller sites plus **7 loops inside library crates** (2026-09-08; it was
+  42 controller sites, one of which was a launcher — see below), and it sees
+  the shape a panic hook structurally CANNOT: **a clean exit.** A
   loop that `break`s, or whose `while let Some(_) = rx.recv().await` ends
   because the channel closed, returns `Ok(())` — no panic, no stderr line, no
   trace at all, and the subsystem is off for the process lifetime while every
@@ -2738,13 +2751,26 @@ separate change. What this buys is that the death is SAYABLE.
 **Cardinality.** `BackgroundTask` is an ENUM whose variants, labels and `ALL`
 array come from ONE macro table, so the label set is closed BY THE COMPILER and
 a variant that the pre-seed loop misses is not expressible — no hand-maintained
-parallel list, and therefore no lint. `EXIT_OUTCOMES` is three-valued
+parallel list, and therefore no lint. `EXIT_OUTCOMES` was three-valued
 (`panicked` / `completed` / `cancelled`): a `JoinError` is either a panic or a
 cancellation, and folding an abort into "panicked" would report a deliberate
-shutdown as a defect. All 127 series are PRE-SEEDED at 0. **The `process` label
+shutdown as a defect. **It is FIVE-valued from 2026-09-08** — `declined` and
+`shutdown` join it; see the correction below. Every series a process can
+increment is PRE-SEEDED at 0. **The `process` label
 is seeded with ONE value per process** — a `{process="worker"}` series on a
 controller would be a seeded combination nothing there can increment, which is
-the same defect as a dead metric. The worker registers into
+the same defect as a dead metric. **That claim was true of `process` and FALSE
+of `task`, measured live 2026-09-08**: `register_metrics` walked the whole
+`BackgroundTask` table regardless of caller, so the WORKER's `/metrics` carried
+all 126 controller-only `(task, outcome)` pairs at 0 while the worker
+supervises nothing — seeded combinations nothing in that process can ever
+increment, which is check 58's own rule and the exact defect this sentence
+claims to avoid. The function now takes the supervised set as a required
+argument: the controller passes `BackgroundTask::ALL`, the worker passes `&[]`,
+and `the_panic_hook_is_wired_in_both_binaries` pins both. The
+count of series in this note was 127 (126 exits + 1 panic) per process; on the
+controller it is now `BackgroundTask::ALL.len() * 5 + 1` and on the worker it
+is **1**. The worker registers into
 `prometheus::default_registry()` (what `get_prometheus_metrics` gathers and
 `seed_circuit_breaker_series` already seeds into), so its series survives an
 OTEL exporter-build failure.
@@ -2761,13 +2787,127 @@ pre-seeded series and asserts SILENCE — the shape a healthy controller has for
 its whole lifetime, and the one an ABSENT series renders identically.
 
 **The wiring is guarded, because it is the half nothing else can see.** The
-crate's own tests prove the wrapper counts and logs; they cannot prove the 42
+crate's own tests prove the wrapper counts and logs; they cannot prove the 41
 loops go through it, and reverting one site is behaviourally identical on a
 healthy process. `task_supervision_wiring_tests` pins the supervised count, the
 deliberately-bare count, and the two one-per-binary call sites
 (`install_panic_hook`, `register_metrics`) — all three mutations red. Check 58
 cannot see any of this: it asks whether a `TalosMetrics` FIELD has an increment
 site, and these collectors are not `TalosMetrics` fields at all.
+
+### 2026-09-08 — the supervisor called two healthy returns a death, on its first boot
+
+**And nothing above could have caught it.** One second after the first boot
+under this instrument the controller logged, at ERROR on target `talos_audit`:
+`background_task_exited task="worker_fleet_management" outcome="completed"` and
+the same for `task="registry_sync"`. `talos_background_task_exits_total` summed
+to 2 across 126 series. **Both were false, and both are the healthy state of
+this fleet.** The correction below amends this entry rather than contradicting
+it: the two instruments, their argument, the no-restart decision and the alert
+severities all stand.
+
+* `registry_sync` awaits `start_registry_sync_loop`, which RETURNS when
+  `TALOS_REGISTRY_URL` is unset — disk seeding is the source of truth here, and
+  "dormant by config is not broken".
+* `worker_fleet_management` awaited a **LAUNCHER**:
+  `talos_worker_fleet::start_worker_management` spawns the heartbeat listener
+  and the prune loop itself and returns `Ok(())` at once. So the wrapper
+  supervised a function that was never going to run long, and the two loops
+  that matter were exactly as unobserved as they had been before it existed.
+
+**The wrapper's own FIRST LIVE READING is what found this**, and that is the
+part worth carrying. A wrapper over a launcher is behaviourally identical to no
+wrapper: no test in this workspace could see it, the count pin was green, and
+the crate's unit tests all passed. The live read after deploy is the guard
+#767/#769/#771 each named for their own changes; here it earned its keep on the
+day the change landed.
+
+**`TalosBackgroundTaskExited` did not fire, and the reason is a coin-flip.**
+`increase(...[15m]) > 0` read `inactive` only because both increments landed
+BEFORE the first scrape, so every sample in the series was already `1` and
+there was no rise to measure (verified against the live Prometheus: 40 samples,
+first and last both `1`). A scrape that caught the seed would have paged on a
+healthy boot. So the shipped state was an ERROR on every boot plus an alert
+whose silence depended on scrape timing — check 69's class, one day old.
+
+**Leg A — a declined start is not a stopped loop, and the TYPE says which.**
+The future's `Output` moves from `()` to `TaskExit`:
+`Declined(DeclineReason)` / `ShuttingDown` / `LoopEnded`. A genuine `loop {}`
+with no `break` has type `!` and coerces, so **every real loop compiled
+unchanged**; every body that CAN return had to say why, and the compiler
+enumerated that population instead of a grep — 20 controller bodies turned out
+to `break` on shutdown, plus the reaper's opt-in-flag return and the four
+delegate sites. `DeclineReason` is a CLOSED enum (`not_configured` /
+`feature_disabled` / `policy_not_explicit`) reaching a log FIELD, never a
+label; `outcome` remains the only label added and now has five compile-time
+values. `declined` and `shutdown` log at **INFO** under their own event kinds
+(`background_task_declined` with the reason, `background_task_shutdown`) and
+are excluded from the alert by `outcome!~"declined|shutdown"`. **`completed`
+keeps everything it had** — the ERROR line and the alert — because a loop that
+falls out is the finding this instrument exists for. `TaskExit::is_finding()`
+is the ONE predicate the log level and the alert selector both rest on.
+
+**`shutdown` is deliberately not folded into `declined`**, and the reason is
+this entry's own class: three of the five delegate bodies (both integration
+renewals and the workflow scheduler) run for the whole process lifetime and
+return only on the shutdown watch. Calling that "declined" would assert they
+never ran.
+
+**Leg B — supervise the loops, not their launchers.** `WorkerFleetManagement`
+is DROPPED from the enum rather than left as a series nothing can increment
+(check 58's rule); `worker_fleet_heartbeat` and `worker_fleet_prune` are
+supervised INSIDE `talos-worker-fleet`, which is allowed because
+`talos-task-supervision` is a leaf (`prometheus` + `tokio` + `tracing`) and
+check 67(b) forbids that crate only `sqlx`, `reqwest` and the identity
+repository. Six more library loops joined them —
+`audit_ledger_subscriber`, `envelope_seal_claim_responder`,
+`envelope_seal_orphan_sweep`, `integration_state_sweeper`, and the seven
+signed-RPC subscribers (one variant per subject, not one shared
+`rpc_subscriber`: the whole value of the `task` label is naming WHICH loop
+stopped, and a dead `talos.memory.op` subscriber times out every actor-memory
+call while `talos.state.write` keeps running).
+
+**The five "delegate" sites were not five launchers — READ, not assumed.**
+Only `start_worker_management` is one. `start_registry_sync_loop` runs forever
+after two config-gated returns; `gmail_renewal_task`, `channel_renewal_task`
+(one shared `run_renewal_scheduler`) and `run_with_shutdown` all run for the
+process lifetime and return only on shutdown.
+
+**The guard for a re-wrapped launcher needed TWO tests, and measuring which
+half each covers is the point.** The controller's count pin DOES catch the
+controller half (re-wrapping the launcher moves supervised 41→42 and bare 7→6,
+so it fails twice — measured). It structurally cannot see the OTHER half, the
+two inner loops reverting to bare `tokio::spawn` inside `talos-worker-fleet`,
+because its count is over `background.rs` alone. That half is pinned by
+`the_two_fleet_loops_are_supervised_not_their_launcher` in that crate, and by
+`the_fleet_launcher_is_not_supervised_here` on the controller side.
+
+**Expected live state on this fleet after deploy**, stated so it can be read
+rather than assumed: **zero** `event_kind="background_task_exited"` lines on a
+healthy boot; **zero** increments at `outcome!~"declined|shutdown"`; exactly
+**one** `talos_background_task_exits_total{task="registry_sync",
+outcome="declined"}` with an INFO `background_task_declined
+reason="not_configured"` line beside it. `worker_identity_reaper` is ENABLED
+here (`TALOS_WORKER_IDENTITY_REAP_ENABLED=1`), so it runs its loop and
+contributes nothing — on a fleet with that flag off it would be a SECOND
+`declined`, which is why the pre-fix boot showed two false exits and not three.
+The worker's `/metrics` loses all 126 exit series and keeps
+`talos_task_panics_total{process="worker"} 0`.
+
+**What was NOT done, with the reason.** 28 long-lived library-crate loops
+remain unsupervised, including six with no shutdown arm at all
+(`talos-actor-policies`' policy-cache sweeper, `talos-worker-runtime`'s epoch
+ticker and circuit-breaker cleanup, `talos-workflow-engine`'s rate-limit
+eviction, the worker's metrics-server rate-limiter cleanup). Each needs a
+`BackgroundTask` variant, a dependency edge and a return-type change in a crate
+whose loop shape has to be read first; they are enumerated with their
+classification in `scripts/background-task-inventory.py`'s output. **No lint
+was added and `--count` stays 88**: the candidate — "a long-lived
+`tokio::spawn` must go through `spawn_supervised`" — cannot tell a loop from a
+one-shot textually (the inventory's 60-line window misclassifies in both
+directions, and it reads 4 loop-shaped bare spawns in `background.rs` that the
+wiring test correctly calls one-shots), so it would ship at 28 markers on
+correct code. The in-file count pins are stronger and cost no check number.
 
 ### The scheduler refusal counter: six survivors, not one
 

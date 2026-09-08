@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use std::sync::Arc;
+use talos_task_supervision::TaskExit;
 use talos_workflow_engine_core::WorkerSharedKey;
 use uuid::Uuid;
 
@@ -802,7 +803,7 @@ impl SchedulerService {
     pub async fn run_with_shutdown(
         self: Arc<Self>,
         mut shutdown: tokio::sync::watch::Receiver<bool>,
-    ) {
+    ) -> TaskExit {
         // One-time backfill: compute next_trigger_at for any enabled schedules
         // that were created before this column was populated (i.e. next_trigger_at IS NULL).
         // Without this they are silently invisible to the scheduler's IS NOT NULL filter.
@@ -848,7 +849,7 @@ impl SchedulerService {
         // edge.
         if *shutdown.borrow() {
             tracing::info!("Scheduler received shutdown while awaiting fleet readiness");
-            return;
+            return TaskExit::ShuttingDown;
         }
         // If it timed out we deliberately do NOTHING here and fall through: the
         // loop's first tick fires immediately and runs the same
@@ -884,7 +885,7 @@ impl SchedulerService {
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
                         tracing::info!("Scheduler loop received shutdown signal");
-                        break;
+                        break TaskExit::ShuttingDown;
                     }
                 }
             }
@@ -893,7 +894,7 @@ impl SchedulerService {
 
     /// Compatibility shim — runs forever with no shutdown awareness.
     /// Prefer [`run_with_shutdown`] for production paths.
-    pub async fn run(self: Arc<Self>) {
+    pub async fn run(self: Arc<Self>) -> TaskExit {
         let (_tx, rx) = tokio::sync::watch::channel::<bool>(false);
         self.run_with_shutdown(rx).await
     }

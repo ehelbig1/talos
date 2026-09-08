@@ -1749,5 +1749,95 @@ tests:
                    `task_panicked` log line carries the location.
                 3. `outcome="cancelled"` means the task was aborted — expected
                    only during shutdown.
-                4. There is no supervisor: restart the controller to bring the
+                4. `outcome="declined"` and `outcome="shutdown"` are NOT
+                   selected here and never fire: the first means the task did
+                   not start under this configuration (log line
+                   `event_kind=background_task_declined`, with a `reason`
+                   field), the second means the process is going away
+                   (`background_task_shutdown`). Both are INFO.
+                5. There is no supervisor: restart the controller to bring the
                    loop back.
+
+  # ══════════════════════════════════════════════════════════════════════
+  # 2026-09-08 — THE BOOT THAT PAGED ON A HEALTHY CONTROLLER.
+  #
+  # `registry_sync` returns immediately when TALOS_REGISTRY_URL is unset
+  # (disk seeding is the source of truth) and `worker_fleet_management`
+  # was a launcher that returned Ok(()) after spawning its own two loops.
+  # Both were recorded `completed` and logged at ERROR one second after
+  # boot. They now carry `outcome="declined"`, which this alert excludes.
+  #
+  # The case below drives BOTH increments in one window: the declined
+  # ones must fire nothing, and a real `completed` alongside them must
+  # still fire — an exclusion that also swallowed the finding would be
+  # the same defect in the other direction.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: a declined start fires nothing and does not mask a real exit
+    input_series:
+      - series: 'talos_task_panics_total{process="controller"}'
+        values: "0+0x60"
+      - series: 'talos_background_task_exits_total{task="registry_sync",outcome="declined"}'
+        values: "0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1"
+      - series: 'talos_background_task_exits_total{task="registry_sync",outcome="completed"}'
+        values: "0+0x60"
+      - series: 'talos_background_task_exits_total{task="scheduler",outcome="shutdown"}'
+        values: "0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1"
+      - series: 'talos_background_task_exits_total{task="job_result_subscriber",outcome="completed"}'
+        values: "0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: TalosTaskPanic
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: TalosBackgroundTaskExited
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: reliability
+              task: job_result_subscriber
+              outcome: completed
+            exp_annotations:
+              summary: Background task job_result_subscriber stopped (completed)
+              description: |
+                The supervised loop `job_result_subscriber` terminated
+                (completed). Nothing restarts it. Until the
+                controller is restarted, whatever that loop maintains — a sweep,
+                a gauge, a renewal, a subscriber — is not happening, and the
+                tools that report on it will keep reporting the last value it
+                wrote.
+              action: |
+                1. `outcome="completed"` is the quiet one: the loop RETURNED. Look
+                   for a closed channel or a `break` on a condition the author
+                   did not expect to be reachable.
+                2. `outcome="panicked"` pairs with TalosTaskPanic; the
+                   `task_panicked` log line carries the location.
+                3. `outcome="cancelled"` means the task was aborted — expected
+                   only during shutdown.
+                4. `outcome="declined"` and `outcome="shutdown"` are NOT
+                   selected here and never fire: the first means the task did
+                   not start under this configuration (log line
+                   `event_kind=background_task_declined`, with a `reason`
+                   field), the second means the process is going away
+                   (`background_task_shutdown`). Both are INFO.
+                5. There is no supervisor: restart the controller to bring the
+                   loop back.
+
+  # The exact live shape of the 2026-09-08 boot, with the fix applied:
+  # the ONLY exits are the two by-config returns. Nothing fires.
+  - interval: 1m
+    name: the first boot of this fleet under the corrected instrument is silent
+    input_series:
+      - series: 'talos_task_panics_total{process="controller"}'
+        values: "0+0x60"
+      - series: 'talos_background_task_exits_total{task="registry_sync",outcome="declined"}'
+        values: "0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1"
+      - series: 'talos_background_task_exits_total{task="worker_identity_reaper",outcome="declined"}'
+        values: "0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: TalosTaskPanic
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: TalosBackgroundTaskExited
+        exp_alerts: []

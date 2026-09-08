@@ -63,6 +63,7 @@
 use futures::StreamExt;
 use std::future::Future;
 use std::sync::Arc;
+use talos_task_supervision::{spawn_supervised, BackgroundTask, TaskExit};
 
 /// Per-subscriber wiring for [`spawn_rpc_subscriber`].
 ///
@@ -72,6 +73,11 @@ use std::sync::Arc;
 /// the same message as the original literal).
 #[derive(Clone, Copy)]
 pub(crate) struct RpcSubscriberSpec {
+    /// The supervised-task identity for this subscriber. A CLOSED enum
+    /// value named at each of the seven call sites — never derived from
+    /// `subject`, which is a `&'static str` and would put a string into
+    /// a metric label.
+    pub task: BackgroundTask,
     /// NATS subject to subscribe on (also the drain/metric label).
     pub subject: &'static str,
     /// Semaphore capacity — the per-subject concurrency cap
@@ -159,7 +165,7 @@ pub(crate) fn spawn_rpc_subscriber<H, Fut>(
     H: Fn(async_nats::Message, Arc<tokio::sync::Semaphore>) -> Fut + Send + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    tokio::spawn(async move {
+    spawn_supervised(spec.task, async move {
         let sem = Arc::new(tokio::sync::Semaphore::new(spec.max_in_flight));
         tracing::info!(
             subject = spec.subject,
@@ -233,6 +239,10 @@ pub(crate) fn spawn_rpc_subscriber<H, Fut>(
 
         // L-24: shared graceful-drain helper.
         graceful_drain(in_flight, DRAIN_DEADLINE_SECS, spec.subject).await;
+        // Every `break 'supervisor` above is shutdown-driven — a stream
+        // end re-binds rather than exiting — so reaching here means the
+        // process is going away, not that the loop fell out.
+        TaskExit::ShuttingDown
     });
 }
 

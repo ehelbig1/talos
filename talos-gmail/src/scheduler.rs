@@ -20,6 +20,7 @@ use talos_integration_helpers::audit::{
     insert_channel_audit, truncate_and_redact_error, ChannelAuditEvent,
 };
 use talos_integration_helpers::renewal::{run_renewal_scheduler, RenewableIntegration};
+use talos_task_supervision::TaskExit;
 use uuid::Uuid;
 
 /// Private adapter so implementing the (public) helper trait doesn't
@@ -151,6 +152,6 @@ impl RenewableIntegration for GmailRenewer {
 pub async fn gmail_renewal_task(
     service: Arc<GmailWatchService>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) {
-    run_renewal_scheduler(Arc::new(GmailRenewer(service)), shutdown_rx).await;
+) -> TaskExit {
+    run_renewal_scheduler(Arc::new(GmailRenewer(service)), shutdown_rx).await
 }

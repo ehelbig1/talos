@@ -33,6 +33,7 @@ use kernel::record_rpc_metric;
 pub use build_skew::{set_controller_build, set_worker_build_cache};
 
 use talos_actor_memory_service as actor_memory_service;
+use talos_task_supervision::{spawn_supervised, BackgroundTask, TaskExit};
 
 // `ms_to_datetime` and `escape_like_pattern` live in
 // `talos_integration_state` — they are utilities of that
@@ -822,6 +823,7 @@ pub fn spawn_graph_rpc_subscriber(
     // AND `sem` live OUTSIDE the supervisor loop so existing in-flight
     // work survives a re-bind.
     let spec = kernel::RpcSubscriberSpec {
+        task: BackgroundTask::GraphRpcSubscriber,
         subject: SUBJECT_GRAPH_SEARCH,
         max_in_flight: MAX_IN_FLIGHT,
         active_msg: "Graph-RPC subscriber active",
@@ -1127,6 +1129,7 @@ pub fn spawn_ml_rpc_subscriber(
     }
 
     let spec = kernel::RpcSubscriberSpec {
+        task: BackgroundTask::MlPredictRpcSubscriber,
         subject: SUBJECT_ML_PREDICT,
         max_in_flight: MAX_IN_FLIGHT,
         active_msg: "ML-predict RPC subscriber active",
@@ -1406,6 +1409,7 @@ pub fn spawn_ml_fewshot_subscriber(
     }
 
     let spec = kernel::RpcSubscriberSpec {
+        task: BackgroundTask::MlFewshotRpcSubscriber,
         subject: SUBJECT_ML_FEWSHOT,
         max_in_flight: MAX_IN_FLIGHT,
         active_msg: "ML-fewshot RPC subscriber active",
@@ -1653,6 +1657,7 @@ pub fn spawn_memory_rpc_subscriber(
     // shape as MCP-1126: in_flight + sem outside supervisor for
     // permit-leak-safe re-binds.
     let spec = kernel::RpcSubscriberSpec {
+        task: BackgroundTask::MemoryRpcSubscriber,
         subject: SUBJECT_MEMORY_OP,
         max_in_flight: MAX_IN_FLIGHT,
         active_msg: "Memory-RPC subscriber active",
@@ -2110,6 +2115,7 @@ pub fn spawn_database_rpc_subscriber(
     // until controller restart, taking down every workflow that
     // uses the database WIT host fn.
     let spec = kernel::RpcSubscriberSpec {
+        task: BackgroundTask::DatabaseRpcSubscriber,
         subject: SUBJECT_DATABASE_QUERY,
         max_in_flight: MAX_IN_FLIGHT,
         active_msg: "Database-RPC subscriber active",
@@ -2591,6 +2597,7 @@ pub fn spawn_state_write_subscriber(
     // gaps. Supervisor re-bind closes that silent-data-loss
     // window on NATS reconnects / subscription handoff.
     let spec = kernel::RpcSubscriberSpec {
+        task: BackgroundTask::StateWriteRpcSubscriber,
         subject: SUBJECT_STATE_WRITE,
         max_in_flight: MAX_IN_FLIGHT,
         active_msg: "State-write subscriber active",
@@ -2873,6 +2880,7 @@ pub fn spawn_integration_state_subscriber(
     // outright (jira filter cursor lost). Re-bind closes that
     // gap on NATS reconnects / subscription handoff.
     let spec = kernel::RpcSubscriberSpec {
+        task: BackgroundTask::IntegrationStateRpcSubscriber,
         subject: SUBJECT_INTEGRATION_STATE_OP,
         max_in_flight: MAX_IN_FLIGHT,
         active_msg: "Integration-state subscriber active",
@@ -3093,14 +3101,14 @@ pub fn spawn_integration_state_sweeper(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     const SWEEP_INTERVAL_SECS: u64 = 300;
-    tokio::spawn(async move {
+    spawn_supervised(BackgroundTask::IntegrationStateSweeper, async move {
         let mut interval =
             tokio::time::interval(std::time::Duration::from_secs(SWEEP_INTERVAL_SECS));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             tokio::select! {
                 biased;
-                _ = shutdown.changed() => break,
+                _ = shutdown.changed() => break TaskExit::ShuttingDown,
                 _ = interval.tick() => {
                     // Bounded per-tick sweep. An unbounded DELETE could
                     // touch arbitrarily many rows in one transaction and
