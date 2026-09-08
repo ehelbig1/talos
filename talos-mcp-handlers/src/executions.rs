@@ -2361,12 +2361,25 @@ async fn handle_get_execution_timeline(
             .flatten(),
     );
 
-    // Load events
-    let event_rows = state
-        .execution_repo
-        .list_execution_events(exec_id)
-        .await
-        .unwrap_or_default();
+    // Load events.
+    //
+    // 2026-09-08: DISCLOSE. `.unwrap_or_default()` printed the header and then
+    // an EMPTY `--- Event Sequence ---`, which on a tool called "timeline"
+    // reads as "nothing happened during this execution". This response is a
+    // text blob rather than a JSON object, so `Readings::attach` has nowhere
+    // to go and the disclosure is a line written into the timeline itself —
+    // the same rule, a different rendering.
+    let events_read = state.execution_repo.list_execution_events(exec_id).await;
+    let events_unreadable = events_read.is_err();
+    if let Err(ref e) = events_read {
+        tracing::error!(
+            execution_id = %exec_id,
+            error = %e,
+            "get_execution_timeline: event read failed — the sequence is disclosed as \
+             unread rather than rendered empty"
+        );
+    }
+    let event_rows = events_read.unwrap_or_default();
 
     // Build timeline text
     let mut timeline = String::new();
@@ -2386,6 +2399,13 @@ async fn handle_get_execution_timeline(
         let _ = writeln!(timeline, "Error: {}", err);
     }
     timeline.push_str("\n--- Event Sequence ---\n");
+    if events_unreadable {
+        timeline.push_str(
+            "  !! NOT MEASURED: the execution's events could not be read, so this \
+             sequence is EMPTY BECAUSE NOBODY COULD LOOK — it is not evidence that \
+             the execution emitted no events. Retry, and check controller logs.\n",
+        );
+    }
 
     for (i, ev) in event_rows.iter().enumerate() {
         let node_label = ev
@@ -4877,12 +4897,26 @@ async fn handle_get_execution_waterfall(
         None => return mcp_error(req_id, -32000, "Execution has no start time"),
     };
 
-    // Load execution events to get per-node start/complete timestamps
-    let events = state
-        .execution_repo
-        .list_execution_events(exec_id)
-        .await
-        .unwrap_or_default();
+    // Load execution events to get per-node start/complete timestamps.
+    //
+    // 2026-09-08: DISCLOSE. Same read, same swallow, second surface — and here
+    // the empty vec falls all the way through to the literal
+    // "No node timing data available for this execution.", which is a
+    // determinate negative about a run whose events nobody read. The
+    // `__node_timings__` fallback below is deliberately still attempted: it
+    // reads `output_data`, which the execution row already carries, so a
+    // failed EVENT read does not make it unavailable.
+    let events_read = state.execution_repo.list_execution_events(exec_id).await;
+    let events_unreadable = events_read.is_err();
+    if let Err(ref e) = events_read {
+        tracing::error!(
+            execution_id = %exec_id,
+            error = %e,
+            "get_execution_waterfall: event read failed — the chart is disclosed as \
+             unmeasured rather than reported as having no timing data"
+        );
+    }
+    let events = events_read.unwrap_or_default();
 
     // Build UUID -> display label mapping from graph_json
     let graph_str = state
@@ -4953,7 +4987,15 @@ async fn handle_get_execution_waterfall(
         return respond_maybe_archived(
             req_id,
             archived_at,
-            "No node timing data available for this execution.",
+            if events_unreadable {
+                "NOT MEASURED: the execution's events could not be read, and the \
+                 output payload carried no `__node_timings__` fallback either, so \
+                 this chart is absent BECAUSE NOBODY COULD LOOK. This is not a \
+                 statement that the execution produced no node timings. Retry, and \
+                 check controller logs."
+            } else {
+                "No node timing data available for this execution."
+            },
         );
     }
 
@@ -5197,9 +5239,30 @@ async fn handle_get_execution_comparison_report(
             .await
         {
             Ok(rows) => rows.into_iter().map(|r| (r.id, r)).collect(),
+            // 2026-09-08: REFUSE. An empty map sends EVERY requested id down
+            // the `not_found_ids` branch below and, when that empties
+            // `executions`, renders "No matching executions found (check IDs
+            // and ownership)" — a database failure reported as the caller's
+            // typo or an ownership problem. The comment block this arm sits
+            // inside (MCP-355) exists to keep those three causes apart; the
+            // swallow put them back together. Note the `Err` here can also be
+            // an AEAD/keyring fault inside `read_output_from_row`, which
+            // touches no table at all, so "check IDs and ownership" is wrong
+            // twice over.
             Err(e) => {
-                tracing::error!("get_execution_comparison_report batch fetch failed: {}", e);
-                std::collections::HashMap::new()
+                tracing::error!(
+                    requested = execution_ids.len(),
+                    error = %e,
+                    "get_execution_comparison_report batch fetch failed — refusing \
+                     rather than reporting every requested id as not-found-or-unowned"
+                );
+                return mcp_error(
+                    req_id,
+                    -32000,
+                    "Could not read the executions, so nothing was compared. This is \
+                     NOT a statement that these ids are missing or not yours. Retry, \
+                     and check controller logs.",
+                );
             }
         };
 
@@ -6915,13 +6978,37 @@ async fn handle_get_node_io(
     };
     let workflow_id = exec.workflow_id;
 
-    // Build UUID -> label mapping from graph_json
-    let graph_json_opt = state
+    // Build UUID -> label mapping from graph_json.
+    //
+    // 2026-09-08: REFUSE on `Err`. This read is NOT the label prettification
+    // its twelve siblings in this file are — check 79b's own exclusion turns
+    // on whether the substitute makes a STATEMENT — because `node_uuid` two
+    // statements below is RESOLVED through this map. With the map empty the
+    // resolution falls through to `engine_node_uuid(node_id_str)`, which for a
+    // label-style argument is a DIFFERENT uuid from the one the executor
+    // wrote, so both queries beneath it match nothing and the response renders
+    // `"input": null, "output": null` — indistinguishable from a node that
+    // recorded no I/O, and arrived at by silently answering about the wrong
+    // node. `Ok(None)` keeps today's behaviour: the workflow row is genuinely
+    // absent or unowned, the fallback resolution is the only one available,
+    // and the execution lookup above has already vouched for ownership.
+    let graph_json_opt = match state
         .execution_repo
         .get_workflow_graph_for_user(workflow_id, user_id)
         .await
-        .ok()
-        .flatten();
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!(
+                execution_id = %exec_id,
+                workflow_id = %workflow_id,
+                error = %e,
+                "get_node_io: graph read failed — refusing rather than resolving the \
+                 node label against an empty map, which answers about a different node"
+            );
+            return crate::utils::database_error(req_id);
+        }
+    };
     let node_label_map = build_node_label_map(graph_json_opt);
 
     // Resolve the user-provided label to a node UUID

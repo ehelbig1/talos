@@ -1578,37 +1578,67 @@ async fn handle_get_agent_card(
         None => ("https://talos.example.com".to_string(), false),
     };
 
-    // Load actor info
+    // Load actor info.
+    //
+    // 2026-09-08: three-way, not two. `.unwrap_or(None)` folded a database
+    // failure into `Ok(None)` and answered "Actor not found or access denied" —
+    // a sentence false on BOTH clauses while the database is the broken thing,
+    // and an authorization claim made on an infrastructure fault. The correct
+    // split is the one `evaluation::ensure_actor_owner` already makes in this
+    // workspace; `Ok(None)` keeps the pre-fix wording byte-for-byte.
     let info = match state
         .actor_repo
         .get_actor_card_info(actor_id, user_id)
         .await
-        .unwrap_or(None)
     {
-        Some(i) => i,
-        None => return mcp_error(req_id, -32000, "Actor not found or access denied"),
+        Ok(Some(i)) => i,
+        Ok(None) => return mcp_error(req_id, -32000, "Actor not found or access denied"),
+        Err(e) => {
+            tracing::error!(
+                actor_id = %actor_id,
+                error = %e,
+                "get_agent_card: actor lookup failed — refusing rather than reporting \
+                 the actor as absent or unowned"
+            );
+            return crate::utils::database_error(req_id);
+        }
     };
     let actor_name = info.name;
     let actor_desc = info.description;
     let actor_status = info.status;
     let actor_world = info.max_capability_world;
 
-    // Load published workflows for this actor
-    let workflows: Vec<serde_json::Value> = state
-        .actor_repo
-        .list_published_workflows_for_actor(actor_id, 20)
-        .await
-        .unwrap_or_default()
-        .iter()
-        .map(|w| {
-            serde_json::json!({
-                "workflow_id": w.id.to_string(),
-                "name": w.name,
-                "description": w.description,
-                "capabilities": w.capabilities,
-            })
-        })
-        .collect();
+    // Load published workflows for this actor.
+    //
+    // 2026-09-08: NULL, never `[]`. This list IS the card's capability
+    // statement, and `.unwrap_or_default()` shipped an unreadable one as an
+    // empty one — a well-formed, `shareable: true` A2A card advertising that
+    // this agent can do nothing, which the surrounding `note` then instructs
+    // the operator to hand to other agents and register in a discovery
+    // registry. The remedy this handler already has for a card that must not
+    // be published is the placeholder-base_url branch below, so an unread
+    // capability list takes the same one.
+    let mut readings = talos_measurement::Readings::new();
+    let workflows: Option<Vec<serde_json::Value>> = readings
+        .record(
+            "available_workflows",
+            state
+                .actor_repo
+                .list_published_workflows_for_actor(actor_id, 20)
+                .await,
+        )
+        .map(|rows| {
+            rows.iter()
+                .map(|w| {
+                    serde_json::json!({
+                        "workflow_id": w.id.to_string(),
+                        "name": w.name,
+                        "description": w.description,
+                        "capabilities": w.capabilities,
+                    })
+                })
+                .collect()
+        });
 
     // Build the A2A Agent Card following Google's A2A spec
     let agent_card = serde_json::json!({
@@ -1642,7 +1672,8 @@ async fn handle_get_agent_card(
             "example_request": {
                 "message": "Process this data",
                 "input": {"data": "..."},
-                "workflow_id": workflows.first()
+                "workflow_id": workflows.as_ref()
+                    .and_then(|ws| ws.first())
                     .and_then(|w| w.get("workflow_id"))
                     .and_then(|v| v.as_str())
                     .map(str::to_string)
@@ -1650,7 +1681,12 @@ async fn handle_get_agent_card(
         }
     });
 
-    let response = if base_url_is_real {
+    // A card whose capability list could not be read MUST NOT be shared, for
+    // the same reason a card rendered against a placeholder host must not be:
+    // the receiving agent would act on it. `shareable` is therefore the AND of
+    // both conditions, and the warning names which one failed.
+    let capabilities_measured = workflows.is_some();
+    let mut response = if base_url_is_real && capabilities_measured {
         serde_json::json!({
             "agent_card": agent_card,
             "well_known_url": format!(
@@ -1659,6 +1695,21 @@ async fn handle_get_agent_card(
             ),
             "shareable": true,
             "note": "Share the endpoint_url with other A2A-compatible agents to enable cross-agent task delegation. The well_known_url can be registered in A2A agent registries for discovery.",
+        })
+    } else if !capabilities_measured {
+        serde_json::json!({
+            "agent_card": agent_card,
+            "well_known_url": format!(
+                "{}/a2a/actors/{}/.well-known/agent.json",
+                base_url.trim_end_matches('/'), actor_id
+            ),
+            "shareable": false,
+            "warning": "The published-workflow list could not be READ, so \
+                        `available_workflows` is null rather than empty. This is NOT a \
+                        statement that this actor publishes nothing, and the card MUST \
+                        NOT be shared in this state — a receiving agent would take the \
+                        absent list as this agent's advertised capability set. Retry, \
+                        and check controller logs.",
         })
     } else {
         serde_json::json!({
@@ -1675,6 +1726,7 @@ async fn handle_get_agent_card(
             },
         })
     };
+    readings.attach(&mut response);
     mcp_text(
         req_id,
         &serde_json::to_string_pretty(&response).unwrap_or_default(),

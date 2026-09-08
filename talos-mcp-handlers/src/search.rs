@@ -518,11 +518,36 @@ async fn handle_bulk_tag_workflows(
     // method is idempotent, so workflows that already have the tag are skipped.
     // Per-workflow 100-tag cap is a soft limit enforced on the single-tag path;
     // bulk operations skip it to avoid N+1 queries.
-    let tagged_count = state
+    //
+    // 2026-09-08: REFUSE. `bulk_add_tag` is a WRITE and `tagged_count` is its
+    // `rows_affected()`, so `.unwrap_or(0)` reported a failed UPDATE as
+    // "nothing needed tagging" — and worse, `already_tagged_count` is derived
+    // from it, so a failed write rendered every owned workflow as ALREADY
+    // CARRYING the tag. There is no partial answer to give here: either the
+    // statement ran or it did not.
+    let tagged_count = match state
         .workflow_repo
         .bulk_add_tag(&workflow_ids, user_id, tag)
         .await
-        .unwrap_or(0);
+    {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::error!(
+                tag = %tag,
+                requested = workflow_ids.len(),
+                error = %e,
+                "bulk_tag_workflows: the tag UPDATE failed — refusing rather than \
+                 reporting tagged_count=0, which this response renders as \
+                 'they were already tagged'"
+            );
+            return mcp_error(
+                req_id,
+                -32000,
+                "Could not apply the tag, so NO workflow was tagged. This is not a \
+                 report that they already carried it. Retry, and check controller logs.",
+            );
+        }
+    };
 
     // MCP-152 (2026-05-08): the previous shape collapsed three cases —
     // workflow doesn't exist, isn't owned by caller, or is already
@@ -533,14 +558,27 @@ async fn handle_bulk_tag_workflows(
     //   tagged_count            — newly tagged
     //   already_tagged_count    — owned & already had the tag
     //   not_found_count         — id missing from workflows OR not owned
-    let owned_count = state
-        .workflow_repo
-        .count_owned_workflows_in_set(&workflow_ids, user_id)
-        .await
-        .unwrap_or(0);
+    //
+    // 2026-09-08: DISCLOSED rather than refused, and the asymmetry with the
+    // write above is the point — the tag HAS been applied by the time this
+    // runs, so a refusal would leave the caller believing it had not. What a
+    // failed probe costs is only the BREAKDOWN, and `.unwrap_or(0)` made that
+    // breakdown maximally accusatory: `owned_count = 0` renders
+    // `not_found_count = total` and fires the warning below telling the
+    // operator that every UUID they supplied was bogus — the exact conflation
+    // MCP-152 added this probe to remove.
+    let mut readings = talos_measurement::Readings::new();
+    let owned_count = readings.record(
+        "owned_count",
+        state
+            .workflow_repo
+            .count_owned_workflows_in_set(&workflow_ids, user_id)
+            .await,
+    );
     let total = workflow_ids.len() as u64;
-    let already_tagged_count = owned_count.saturating_sub(tagged_count);
-    let not_found_count = total.saturating_sub(owned_count);
+    // NULL, never 0: an unmeasured breakdown is not a breakdown of zero.
+    let already_tagged_count = owned_count.map(|c| c.saturating_sub(tagged_count));
+    let not_found_count = owned_count.map(|c| total.saturating_sub(c));
 
     let mut result = serde_json::json!({
         "tag": tag,
@@ -549,17 +587,18 @@ async fn handle_bulk_tag_workflows(
         "not_found_count": not_found_count,
         "total_requested": total,
     });
-    if not_found_count > 0 {
+    if not_found_count.is_some_and(|n| n > 0) {
         if let Some(map) = result.as_object_mut() {
             map.insert(
                 "warning".to_string(),
                 serde_json::json!(format!(
                     "{} workflow id(s) were not found or not owned by you and were skipped. Verify the UUIDs in the workflow_ids array.",
-                    not_found_count
+                    not_found_count.unwrap_or(0)
                 )),
             );
         }
     }
+    readings.attach(&mut result);
     mcp_text(
         req_id,
         &serde_json::to_string_pretty(&result).unwrap_or_default(),

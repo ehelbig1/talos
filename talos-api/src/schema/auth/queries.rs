@@ -37,31 +37,39 @@ impl AuthQueries {
 
         // Check if 2FA is enabled.
         //
-        // MCP-877 (2026-05-14): log the underlying error on the
-        // `.unwrap_or(false)` fallback so operators see when the `me`
-        // response silently lies about 2FA state. Pre-fix a DB error
-        // on `users.totp_enabled` read collapsed to `false`, and the
-        // downstream `is_two_factor_verified = !totp_enabled` fallback
-        // (only fires when the auth middleware didn't set
-        // `IsTwoFactorVerified`) then defaulted to `true`. Combined
-        // failure mode: response says "no 2FA, all verified" while the
-        // user might in reality have 2FA enrolled but un-verified —
-        // misleading frontend gating + zero operator signal. Same
-        // silent-lie observability gap as MCP-872/874/876.
-        let totp_enabled = match totp_service.is_2fa_enabled(*user_id).await {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(
-                    user_id = %user_id,
-                    error = %e,
-                    "me query: is_2fa_enabled lookup failed — \
-                     returning two_factor_enabled=false (the IsTwoFactorVerified \
-                     middleware extension is the authoritative source for the \
-                     verified flag, but this lie can still mislead frontend gating)"
-                );
-                false
-            }
-        };
+        // MCP-877 (2026-05-14) LOGGED this collapse; 2026-09-08 REMOVES it.
+        // The log was the right diagnosis and the wrong remedy, and MCP-877's
+        // own text says why: a DB error on the `users.totp_enabled` read
+        // collapsed to `false`, and `is_two_factor_verified`'s
+        // `.unwrap_or(!totp_enabled)` fallback below then defaulted to `true`.
+        // So ONE unreadable column flipped BOTH security-gating booleans to
+        // their permissive reading — "no 2FA, and you are verified" — which is
+        // the single most reassuring pair this resolver can emit and is exactly
+        // what a frontend gate consumes. A warning in a log the browser cannot
+        // read does not stop that; only refusing to answer does.
+        //
+        // `?`-propagation rather than a `Readings` ledger, and that is forced
+        // rather than chosen: `UserInfo` is a typed `SimpleObject` with no
+        // slot for a disclosure, and `talos-api` carries no `talos-measurement`
+        // dependency. The house shape for an unanswerable read in this crate is
+        // the one three statements above — `.map_err(|e| … .extend_safe())?`
+        // with the cause logged server-side and a generic message on the wire.
+        //
+        // Refusing the WHOLE query, including `id`/`email`, is the deliberate
+        // part: those fields are not what `me` is read for at the moment it
+        // matters, and a partial `me` that omits only the 2FA pair would be
+        // read by an existing consumer as the pair being false.
+        let totp_enabled = totp_service.is_2fa_enabled(*user_id).await.map_err(|e| {
+            tracing::error!(
+                user_id = %user_id,
+                error = %e,
+                "me query: is_2fa_enabled lookup failed — REFUSING rather than \
+                 reporting two_factor_enabled=false, which (with the \
+                 is_two_factor_verified fallback below) would report an \
+                 unreadable 2FA state as 'no 2FA, and verified'"
+            );
+            async_graphql::Error::new("Failed to read two-factor status").extend_safe()
+        })?;
 
         // Get 2FA verification status from context (set by auth middleware)
         let is_two_factor_verified = ctx

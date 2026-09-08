@@ -249,3 +249,144 @@ async fn a_completed_row_is_never_given_a_cause() {
          supplied alongside it"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 2026-09-08 — the two callers #744 did not reach
+// ---------------------------------------------------------------------------
+//
+// #744 derived the cause at the ENGINE's finalizer. It left the OTHER writer,
+// `ModuleExecutionService::fail_execution_from_worker`, taking whatever its two
+// callers passed — and both passed `None` on the non-timeout path:
+//
+//   * `talos-webhooks/src/router.rs` finalizes a MODULE-bound webhook dispatch.
+//     No engine is in that path at all, so nothing else ever closes the row and
+//     every such failure stored NULL — #744's gap, one path over.
+//   * `controller/src/bootstrap/background.rs`'s `talos.results.*` observer,
+//     which stamped a hardcoded `"timeout"` for `JobStatus::TimedOut` and
+//     nothing for a plain `Failed`.
+//
+// Both are LATENT on the reference fleet and that is stated rather than
+// dressed up: measured 2026-09-08, `webhook_triggers` holds ONE row with
+// `module_id IS NULL`, so the webhook module path has no live population; and
+// the observer's own comment records that "every NATS-dispatched code path uses
+// request-reply, so this subscriber is mostly dormant". What the fix buys is
+// that the column's vocabulary has ONE home for every writer that can reach it.
+
+/// The OTHER production writer must carry a derived cause through to the row.
+///
+/// This drives `fail_execution_from_worker` — the method both remaining callers
+/// use — with exactly what those call sites now compute, and reads back what an
+/// operator sees. It is a ROUND TRIP, not a re-derivation: the pure derivation
+/// is unit-tested in `talos_engine::module_error_type`, and what only a real
+/// Postgres can prove is that the value BINDS and SURVIVES this second
+/// statement, whose `error_type = $2` sits in a different UPDATE from
+/// `record_completed`'s `error_type = $8`.
+#[tokio::test]
+async fn the_worker_finalizer_stores_a_derived_cause() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let exec = seed_running_row(&pool).await;
+
+    let observed = "execution failure: Component returned error: request timed out after 30s";
+    let derived = talos_engine::module_error_type::derive_error_type("failed", Some(observed))
+        .map(str::to_string);
+    assert_eq!(
+        derived.as_deref(),
+        Some("timeout"),
+        "control: the derivation itself must answer before the round trip can \
+         say anything about binding"
+    );
+
+    let svc = talos_module_executions::ModuleExecutionService::new(
+        pool.clone(),
+        std::sync::Arc::new(talos_dlp_provider::DlpService::from_env()),
+    );
+    svc.fail_execution_from_worker(exec, observed.to_string(), derived, None)
+        .await
+        .expect("fail_execution_from_worker");
+
+    let (status, error_type, message) = read_back(&pool, exec).await;
+    assert_eq!(status, "failed");
+    assert_eq!(
+        error_type.as_deref(),
+        Some("timeout"),
+        "the derived cause must survive `fail_execution_from_worker`'s own \
+         UPDATE. `None` here is the pre-fix state at both of its callers"
+    );
+    assert!(message.as_deref().is_some_and(|m| m.contains("timed out")));
+}
+
+/// The CONTROL for the test above: an unclassifiable message must still store
+/// NULL through this writer, so the round trip cannot pass by stamping
+/// something on everything.
+#[tokio::test]
+async fn the_worker_finalizer_stores_null_for_an_unclassifiable_message() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let exec = seed_running_row(&pool).await;
+
+    let observed = "zzzz nothing here resembles a known cause";
+    let derived = talos_engine::module_error_type::derive_error_type("failed", Some(observed))
+        .map(str::to_string);
+    assert_eq!(derived, None);
+
+    let svc = talos_module_executions::ModuleExecutionService::new(
+        pool.clone(),
+        std::sync::Arc::new(talos_dlp_provider::DlpService::from_env()),
+    );
+    svc.fail_execution_from_worker(exec, observed.to_string(), derived, None)
+        .await
+        .expect("fail_execution_from_worker");
+
+    let (_status, error_type, _message) = read_back(&pool, exec).await;
+    assert_eq!(
+        error_type, None,
+        "a wrong stored label is worse than an absent one — once written it is \
+         indistinguishable from a real one"
+    );
+}
+
+/// The WIRING, which no round trip can see.
+///
+/// Both remaining call sites are unreachable from an integration test:
+/// `background.rs` is `mod bootstrap` inside `main.rs` (bin-private), and the
+/// webhook one needs a full module-bound webhook dispatch that this fleet has
+/// no row for. So reverting either to `None` is behaviourally identical to
+/// every test in the workspace — the shape checks 74b and 79b state as their
+/// own limit, and the shape `task_supervision_wiring_tests` /
+/// `push_channel_wiring_tests` answer by pinning the SOURCE.
+///
+/// Deliberately asserts on both the derivation AND the absence of the old
+/// spellings, because a site that names the helper and then discards its answer
+/// would satisfy a name-only pin.
+#[test]
+fn both_remaining_worker_finalizers_derive_their_cause() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root");
+
+    let webhooks = std::fs::read_to_string(root.join("talos-webhooks/src/router.rs"))
+        .expect("read talos-webhooks/src/router.rs");
+    assert!(
+        webhooks.contains("module_error_type::derive_error_type(\"failed\", Some(&msg))"),
+        "talos-webhooks' module-dispatch finalizer must derive `error_type` \
+         from the same text it stores. Passing `None` again is the pre-fix \
+         state and nothing else in this workspace can observe it"
+    );
+
+    let background = std::fs::read_to_string(root.join("controller/src/bootstrap/background.rs"))
+        .expect("read controller/src/bootstrap/background.rs");
+    assert!(
+        background.contains("module_error_type::TIMEOUT_BUCKET"),
+        "the job-result observer's TimedOut arm must name the shared constant, \
+         not re-spell the bucket inline"
+    );
+    assert!(
+        background.contains("module_error_type::derive_error_type("),
+        "the job-result observer's plain-Failed arm must derive `error_type` \
+         rather than store nothing"
+    );
+    assert!(
+        !background.contains(".then_some(\"timeout\".to_string())"),
+        "the pre-fix expression must be gone, not merely joined by a sibling: \
+         a file that carries both is a file where the revert is one deletion"
+    );
+}

@@ -1539,15 +1539,37 @@ impl WebhookRouter {
                     )
                     .await
                 } else {
-                    svc.fail_execution_from_worker(
-                        job_id,
-                        error_msg
-                            .clone()
-                            .unwrap_or_else(|| "webhook module execution failed".to_string()),
-                        None,
-                        Some(wasm_duration_ms),
-                    )
-                    .await
+                    // `error_type` — the CAUSE, derived from the SAME text
+                    // bound into `error_message` one argument up.
+                    //
+                    // #744 gave `module_executions.error_type` a derivation at
+                    // the ENGINE's finalizer (`record_completed`) and left the
+                    // two `fail_execution_from_worker` callers passing `None`.
+                    // This is one of them, and it is the one with no engine in
+                    // its path at all: a MODULE-bound webhook dispatches the
+                    // module directly, so nothing else ever closes this row and
+                    // every such failure stored NULL — the exact gap #744
+                    // closed one path over. Same single home
+                    // (`talos_engine::module_error_type`), same vocabulary, so
+                    // the stored column and `analyze_execution_failure` cannot
+                    // give one cause two names.
+                    //
+                    // Stated limit: this derives from the PRE-redaction text,
+                    // because `fail_execution_from_worker` redacts inside the
+                    // callee and the vocabulary lives in a crate that callee
+                    // cannot reach (the dependency edge runs
+                    // webhooks -> engine -> module-executions). #744's own
+                    // engine site derives from the redacted string for exactly
+                    // the "cannot drift from what an operator reads" reason;
+                    // here that is unavailable without inverting an edge.
+                    let msg = error_msg
+                        .clone()
+                        .unwrap_or_else(|| "webhook module execution failed".to_string());
+                    let error_type =
+                        talos_engine::module_error_type::derive_error_type("failed", Some(&msg))
+                            .map(str::to_string);
+                    svc.fail_execution_from_worker(job_id, msg, error_type, Some(wasm_duration_ms))
+                        .await
                 };
                 if let Err(e) = finalize {
                     tracing::warn!(

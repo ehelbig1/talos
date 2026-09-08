@@ -488,6 +488,13 @@ CTRL_TESTS=(
     # bound inside `record_completed`'s UPDATE: a pure-Rust test proves the
     # classifier, only the round trip proves the value is bound and survives.
     "module_execution_error_type_tests"
+    # Package 31 (2026-09-08): the next tier of the read inventory's CLAIM
+    # sites. Nine of the ten repaired sites are driven through the REAL MCP
+    # dispatch (and one through the real GraphQL schema) with the relation each
+    # read names REMOVED, which is the only way to make a production read fail
+    # deterministically. Needs the `common` DATABASE_URL harness, so CTRL_TESTS
+    # and not TC_TESTS (sub-leg 64b).
+    "claim_read_disclosure_tier4_tests"
     # RFC 0012's child-run ledger. A sub-workflow leaves no
     # `workflow_executions` row, so `sub_workflow_runs` is the only evidence it
     # ran — and every question this PR answers is a round trip: which row the

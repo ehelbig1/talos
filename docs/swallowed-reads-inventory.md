@@ -19,7 +19,8 @@ Scope: `talos-mcp-handlers/src` + `talos-api/src`, non-test files, with
 
 The table below is PINNED to `0c962874`: it records what was measured there,
 including line numbers, and the disposition sections say what has been repaired
-since. The LIVE count on the current tree is **164** (2026-09-08); re-derive it
+since. The LIVE count on the current tree is **153** (2026-09-08, package 31);
+re-derive it
 with the classifier command above.
 
 **193 sites**, closed and classified: **65 claim**, **5 fail-open**, **37 fail-closed**, **60 decorative**, **26 false-positive**.
@@ -139,6 +140,72 @@ change repaired in `watch_execution`, in two more surfaces),
 process-wide `OnceCell`, so one failure is permanent for the pod's lifetime),
 and `actor.rs::handle_suggest_actor_for_task` ("No active actors found. Create
 actors with create_actor first." from a failed listing).
+
+## Disposition (2026-09-08, package 31)
+
+**Thirteen more collapses removed**, measured by running the classifier over
+the tree before and after: **164 sites -> 153**, 13 removed and 2 ADDED. The
+two added are both in `handle_list_module_catalog` and are detector artefacts
+of the fix: `get_or_try_init(...).await` followed by a `match` whose `Err` arm
+REFUSES reads to the walker as a binding collapse. Their verdict on this tree
+is `false-positive`, the same reason `dlq_updates` and the lineage root still
+appear — saying so is cheaper than a detector exception that would hide a real
+one later.
+
+The ten sites were chosen by BLAST RADIUS over the 46 the table still
+carried, not by position in it: a decision above a count an operator pages on,
+above a list that feeds a next step, above a label. Two of the ten are WRITES
+misreported as benign counts, and one of those (`compress_actor_context`) is
+the only member of this class found so far whose swallow survived into a
+COMMIT.
+
+Sites:
+
+* `talos-api/src/schema/auth/queries.rs::me` — claim: ONE unreadable column flipped BOTH security-gating booleans to their permissive reading. `is_2fa_enabled` collapsing to `false` made `is_two_factor_verified`'s `.unwrap_or(!totp_enabled)` fallback default to `true`, so a DB fault answered 'no 2FA, and you are verified'. MCP-877 LOGGED this in May 2026 and left the collapse; it now propagates
+* `talos-mcp-handlers/src/actor.rs::handle_compress_actor_context` — claim: the ONLY swallow in this file that survived into a COMMIT. A failed measure-and-forget defaulted to (0, 0) and fell through to `tx.commit()`, so the condensed replacements landed AND the originals stayed — memory GREW — under `status: "compressed", keys_retired: 0`. Now rolls back and refuses
+* `talos-mcp-handlers/src/search.rs::handle_bulk_tag_workflows` — claim x2: `bulk_add_tag` is a WRITE whose `rows_affected()` becomes `tagged_count`, and `already_tagged_count` is derived from it — so a failed UPDATE reported every owned workflow as ALREADY CARRYING the tag. The owned-count probe MCP-152 added to stop that conflation defaulted to 0, rendering `not_found_count = total` and accusing the operator of bad UUIDs
+* `talos-mcp-handlers/src/platform.rs::handle_get_agent_card` — claim x2: `.unwrap_or(None)` answered 'Actor not found or access denied' on a database fault, and an unread workflow list shipped a `shareable: true` A2A card advertising an agent that can do nothing, under a note telling the operator to register it in a discovery registry
+* `talos-mcp-handlers/src/executions.rs::handle_get_execution_comparison_report` — claim: an empty map sent every requested id down `not_found_ids` and rendered 'No matching executions found (check IDs and ownership)' — a database failure reported as the caller's typo, inside the comment block (MCP-355) written to keep those causes apart
+* `talos-mcp-handlers/src/executions.rs::handle_get_node_io` — claim: NOT the label prettification its twelve siblings are — `node_uuid` is RESOLVED through this map, so an empty one silently resolved to a DIFFERENT node's uuid and rendered `input: null, output: null` for it
+* `talos-mcp-handlers/src/executions.rs::handle_get_execution_timeline` — claim: an empty `--- Event Sequence ---` on a tool called 'timeline' reads as 'nothing happened during this execution'. Text response, so the disclosure is a line in the report rather than a `Readings` attachment
+* `talos-mcp-handlers/src/executions.rs::handle_get_execution_waterfall` — claim: the same read, second surface — and here the empty vec reached the literal 'No node timing data available for this execution.'
+* `talos-mcp-handlers/src/actor.rs::handle_suggest_actor_for_task` — claim: 'No active actors found. Create actors with create_actor first.' — not merely a false count but a DIRECTIVE to create actors that may already exist
+* `talos-mcp-handlers/src/modules.rs::handle_list_module_catalog` — claim: the disk walk's `JoinError` defaulted to an empty catalog INSIDE `OnceCell::get_or_init`, so one panicked blocking task made every later call in the pod's lifetime report 'this image ships no templates'. `get_or_try_init` leaves the cell uninitialised on `Err`, so the failure is no longer memoized, and the handler refuses
+
+Nine are pinned by `controller/tests/claim_read_disclosure_tier4_tests` (11
+tests, CTRL_TESTS per check 64b), which drives the REAL MCP dispatch over a
+real `McpState` — and, for the `me` resolver, the REAL compiled GraphQL schema
+— with each read made to fail deterministically. Every test carries its
+CONTROL in the same run, and the two whose pre-fix path ALSO refused
+(`get_agent_card` on an absent actor, `suggest_actor_for_task` for a user with
+none) carry that half explicitly, because "the tool refused" is not evidence
+when the pre-fix path refused too with the wrong diagnosis.
+
+Two failures could not be injected by dropping a relation and are said so
+rather than implied. `me`'s 2FA read shares the `users` row with
+`AuthService::get_user`, which projects `totp_enabled` too and would refuse
+first, so the failure is injected as a POOL that cannot connect — which is
+the shape this defect takes in production. `compress_actor_context`'s failing
+DELETE and the replacement INSERT it must not outlive share ONE relation, so
+the injection is a `BEFORE DELETE` trigger that raises; the assertion is on
+ROWS rather than on the reply, because a refusal that arrives after the write
+is not a rollback and the whole defect was a commit.
+
+**What remains: 153 sites — 34 claim**, 55 decorative, 37 fail-closed, 24
+false-positive, the 1 nominal fail-open that is #779's repaired `dlq_updates`
+narrowing, and the 2 new detector artefacts above. The 34 claims by file:
+`advanced.rs` 5, `analytics.rs` 5, `workflows.rs` 5, `modules.rs` 4,
+`configuration.rs` 3, `graph.rs` 3, `platform.rs` 2, `lib.rs` 2, `talos-api`
+2, `actor.rs` 1, `executions.rs` 1, `search.rs` 1. Ranked highest among them:
+`analytics.rs::handle_get_workflow_performance_report` (three reads, one
+compounding the next, emptying the node-timing breakdown for a workflow that
+ran nodes), `configuration.rs::handle_get_session_context` (three lists an
+agent reads as 'this user has no ready workflows and ran none recently', which
+pushes it to build a duplicate), `graph.rs::handle_preview_capability_dispatch`
+(the tool's whole purpose is answering which workflows match, and a failed
+read answers none), and `workflows.rs::handle_get_workflow_quickstart` (every
+referenced secret rendered unprovisioned, flipping `ready_to_run` false and
+listing blockers for credentials that are already configured).
 
 
 ## claim — 65 sites

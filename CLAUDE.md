@@ -1894,6 +1894,163 @@ is stronger than a grep: there is now exactly one `pub async fn mcp_state`, and
 a second copy would have to be written from scratch against a struct with 30
 fields.
 
+### 2026-09-08 — the column that already had its fix, and the next ten claims
+
+Two halves. The first is a REFUTATION of its own brief, which matters more than
+the code it produced.
+
+**`module_executions.error_type` was already fixed, four days earlier.** The
+brief for this package described a column with "one writer whose callers pass
+nothing" and asked for the classification to be given one home. Measured on
+pristine `origin/main` before anything was touched: `a04dbf4d` (#744,
+2026-09-04, **37 commits behind HEAD**) had already built
+`talos_engine::module_error_type::derive_error_type` over
+`talos_failure_analysis_service::classify_error` — the SAME vocabulary
+`analyze_execution_failure` shows an operator — and bound it into
+`ModuleExecutionStore::record_completed`. And the column has **FOUR** writers,
+not one: two take an `Option<String>` and two stamp SQL literals (`'timeout'`,
+`'stuck'`).
+
+**The live numbers the brief quoted were real and HISTORICAL, and reading them
+is what settled it.** `failed` rows split `NULL 61 / timeout 1` over all time —
+but the newest `failed` row is 2026-09-04 10:53, and the two rows of that minute
+are #744's own live verification probes: a positive path that stored `timeout`
+and a negative control (`probe-744: deterministic module failure`) that stored
+NULL because the classifier fell through, which is the designed behaviour. So
+the deployed controller carries the fix, the writer works, and **no production
+module failure has occurred since**; the 61 NULLs are rows no forward-only fix
+can reach. A distribution is not a defect until you read the newest row.
+
+**What WAS left, and #744's own limits section does not name it**: two callers
+of `fail_execution_from_worker` still passed `None`.
+`talos-webhooks/src/router.rs` finalizes a MODULE-bound webhook dispatch with no
+engine anywhere in its path, so nothing else ever closes that row;
+`controller/src/bootstrap/background.rs`'s `talos.results.*` observer stamped a
+hardcoded `"timeout"` for `JobStatus::TimedOut` and nothing otherwise. Both now
+route through the ONE home — no new crate, no move, and no inverted edge, which
+was measured rather than assumed: `derive_error_type` is already `pub` and
+`talos-webhooks` already depends on `talos-engine` with no edge back. The
+observer's `TimedOut` arm names a new `TIMEOUT_BUCKET` constant instead of
+re-spelling the literal, and `the_timeout_bucket_spelling_is_the_classifiers`
+drives `classify_error` to prove the two agree rather than comparing two
+literals.
+
+**Both remainder sites are LATENT and that is stated rather than dressed up**:
+`webhook_triggers` holds ONE row with `module_id IS NULL`, so the webhook module
+path has no live population, and the observer's own comment records that "every
+NATS-dispatched code path uses request-reply, so this subscriber is mostly
+dormant". What the change buys is that the vocabulary has one home for every
+writer that can reach it.
+
+**And the failure-analysis service still recomputes, for a sharper reason than
+the brief gave.** It is not that 61 historical rows have nothing stored — it is
+that `FailureAnalysisService::analyze` reads `execution_events` (`node_failed`
+rows) and never touches `module_executions` at all. Different table, different
+grain; there is no join to switch to. The shared vocabulary is what keeps the
+stored column and the report an operator opens next from naming one cause twice.
+
+**Guard.** `controller/tests/module_execution_error_type_tests` gains a round
+trip through `fail_execution_from_worker` (a SECOND UPDATE from
+`record_completed`'s, so binding is proved separately) with an unclassifiable
+control, plus a SOURCE pin over the two call sites — neither is reachable from
+an integration test (`background.rs` is `mod bootstrap` inside `main.rs`; the
+webhook one needs a module-bound webhook this fleet has no row for), which is
+the shape `task_supervision_wiring_tests` answers. Four mutations, all RED:
+either call site back to `None`, the shared constant renamed to a spelling the
+classifier does not use, and `derive_error_type` gutted.
+
+**The second half: ten more CLAIM sites, ranked by blast radius.** The read
+inventory carried **46** open claims on this tree. The ten taken are a decision
+above a count an operator pages on, above a list that feeds a next step — not a
+prefix of the list. Re-measured with `scripts/lint-swallow-classify.py`:
+**164 sites -> 153**, 13 removed, 2 added, **46 claims -> 34**.
+
+Two of the ten are WRITES misreported as benign counts, and one of those is the
+sharpest member of this class found so far: **`compress_actor_context`'s swallow
+survived into a COMMIT.** The loop above it rolls back on a failed write, while
+`.unwrap_or((0, 0))` let a failed measure-and-forget CTE reach `tx.commit()`, so
+the committed state was the condensed replacements written AND the originals
+still present — memory GREW — under a response reading `status: "compressed",
+keys_retired: 0`. The other write is `bulk_tag_workflows`, where `tagged_count`
+IS `rows_affected()` and `already_tagged_count` is derived from it, so a failed
+UPDATE reported every owned workflow as ALREADY CARRYING the tag, while the
+owned-count probe MCP-152 added to stop exactly that conflation defaulted to 0
+and accused the operator of typing bad UUIDs.
+
+`talos-api`'s `me` is the one refusal that is a SECURITY posture: one unreadable
+`users.totp_enabled` collapsed to `false`, and `is_two_factor_verified`'s
+`.unwrap_or(!totp_enabled)` fallback then defaulted to `true`, so a DB fault
+answered *"no 2FA, and you are verified"* — the most permissive pair the
+resolver can emit. MCP-877 diagnosed this correctly in May 2026 and LOGGED it; a
+warning in a log the browser cannot read does not stop a frontend gate. It now
+propagates, which is forced rather than chosen: `UserInfo` is a typed
+`SimpleObject` with no disclosure slot and `talos-api` carries no
+`talos-measurement` dependency.
+
+`get_agent_card` takes the remedy the handler already had: a card whose
+CAPABILITY LIST could not be read is `shareable: false` with `available_workflows:
+null`, the same branch a card rendered against a placeholder host takes — pre-fix
+it shipped `shareable: true` advertising an agent that can do nothing, under a
+note telling the operator to register it in a discovery registry.
+`get_node_io`'s graph read is the one member of the twelve-site
+`build_node_label_map` family that is NOT label prettification, because
+`node_uuid` is RESOLVED through that map: an empty one silently answered about a
+DIFFERENT node's uuid and rendered `input: null, output: null` for it.
+`list_module_catalog`'s disk walk moves to `get_or_try_init`, so a failed walk is
+no longer MEMOIZED — one panicked blocking task used to make every later call in
+the pod's lifetime report an empty catalog.
+
+**The two sites the detector ADDED are the fix, not a regression.** Both are in
+`handle_list_module_catalog`: a `get_or_try_init(...).await` followed by a
+`match` whose `Err` arm REFUSES reads to the walker as a binding collapse. Their
+verdict on this tree is `false-positive`, the same reason `dlq_updates` and the
+lineage root still appear; saying so is cheaper than a detector exception that
+would hide a real one later.
+
+**Guard, and the two failures a relation drop cannot inject.**
+`controller/tests/claim_read_disclosure_tier4_tests` (11 tests, CTRL_TESTS per
+check 64b) drives the REAL MCP dispatch over a real `McpState` — and, for `me`,
+the REAL compiled GraphQL schema — with the relation each read names removed.
+Every test carries its control, and the two whose pre-fix path ALSO refused
+(`get_agent_card` on an absent actor, `suggest_actor_for_task` for a user with
+none) carry that half explicitly, because "the tool refused" is not evidence when
+the pre-fix path refused too with the wrong diagnosis. `me`'s 2FA read shares the
+`users` row with `AuthService::get_user`, which projects `totp_enabled` and would
+refuse ABOVE it, so the failure is injected as a POOL that cannot connect — the
+shape this defect takes in production. `compress_actor_context`'s failing DELETE
+and the INSERT it must not outlive share ONE relation, so the injection is a
+`BEFORE DELETE` trigger that raises, and the assertion is on ROWS rather than on
+the reply: a refusal that arrives after the write is not a rollback, and the
+whole defect was a commit.
+
+**Ten mutations, ten RED, and the first six had to be re-run.** The first
+attempt wrapped each reverted expression in scaffolding to keep the surrounding
+code alive; six of the ten then failed to COMPILE, which proves nothing (the
+project's own "a green mutation over an edit that never landed" lesson, in the
+opposite direction — a mutation that cannot build is not a survivor OR a
+catch). Re-run as EXACT reverse replacements of the pre-fix source, all ten are
+red by assertion.
+
+**One out-of-scope defect found and NOT fixed**, recorded so it is not
+rediscovered: `handle_get_execution_waterfall`'s bar renderer does
+`bar_len.clamp(1, chart_width - bar_start)`, which PANICS with `min > max`
+whenever a node's `start_ms` equals the run's `total_ms` — reproduced with a
+fixture whose `node_started` and `node_completed` share a timestamp. A panic in
+an MCP handler unwinds the tokio task, so the caller sees a dropped request
+rather than an error. The test fixture here uses distinct timestamps and says
+why at the seeding helper.
+
+**No lint check was added and `--count` stays 88.** Two candidates were measured
+and both fail on the same ground the last four passes recorded. (i) *"a report
+handler must not default an awaited read"* is the widening #782 already built,
+measured and rejected at 83.6% precision and a baseline of 62 — nothing here
+moves those numbers, and this change takes the population from 46 to 34 without
+changing its shape. (ii) *"a caller of `fail_execution_from_worker` must derive
+`error_type`"* has a population of **two**, both in different crates, which is
+the bar this repo does not ship at (#765's numbers); the structural answer is
+that the vocabulary has one `pub` home and the two call sites are pinned by a
+source assertion in the DB binary that already covers the column.
+
 ### The whitespace-run artefact, and why no lint guards it
 
 Four operator-facing string literals carried mid-sentence runs of up to 22
