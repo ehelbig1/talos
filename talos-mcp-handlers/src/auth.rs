@@ -224,116 +224,123 @@ pub fn spawn_bcrypt_cache_revocation_sweep(
     db_pool: PgPool,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) {
-    tokio::spawn(async move {
-        let mut shutdown = shutdown_rx;
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
-            BCRYPT_CACHE_SWEEP_INTERVAL_SECS,
-        ));
-        // Skip the immediate tick — the cache is empty at startup.
-        interval.tick().await;
-        tracing::info!(
-            target: "talos_audit",
-            sweep_interval_secs = BCRYPT_CACHE_SWEEP_INTERVAL_SECS,
-            "MCP-991: bcrypt cache revocation sweep started"
-        );
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    // MCP-1132 (2026-05-16): TTL-expired eviction.
-                    // Sibling pattern to MCP-1093 (DEK cache sweep).
-                    // Pre-fix the MCP-991 revocation sweep only evicted
-                    // entries whose agents had been DB-deactivated; it
-                    // ignored entries whose timestamp was older than
-                    // `BCRYPT_CACHE_TTL_SECS`. Those entries are
-                    // harmless on the hit path (the TTL check at the
-                    // call site falls through to re-verification) but
-                    // consume memory monotonically with every distinct
-                    // token seen since startup — one-shot test agents,
-                    // rotated tokens, and short-lived OAuth-derived
-                    // agents all leave residue. The only existing
-                    // expired-eviction path was the
-                    // `BCRYPT_CACHE_MAX_ENTRIES = 1000` overflow
-                    // `retain` at the insert site, which fires only
-                    // under cache pressure.
-                    //
-                    // Run expired-eviction BEFORE the revocation query
-                    // so the agent_ids slice we send to Postgres is
-                    // already minus the expired set — smaller batch,
-                    // less DB-side work.
-                    let evict_now = Instant::now();
-                    let before_expired_evict = BCRYPT_VERIFY_CACHE.len();
-                    BCRYPT_VERIFY_CACHE.retain(|_, (cached_at, _)| {
-                        evict_now.duration_since(*cached_at).as_secs() < BCRYPT_CACHE_TTL_SECS
-                    });
-                    let evicted_expired = before_expired_evict.saturating_sub(BCRYPT_VERIFY_CACHE.len());
-                    if evicted_expired > 0 {
-                        tracing::debug!(
-                            target: "talos_audit",
-                            evicted_expired,
-                            cached_after = BCRYPT_VERIFY_CACHE.len(),
-                            "MCP-1132: bcrypt cache sweep evicted TTL-expired entries"
-                        );
-                    }
-
-                    let cached: Vec<(String, Uuid)> = BCRYPT_VERIFY_CACHE
-                        .iter()
-                        .map(|kv| (kv.key().clone(), kv.value().1.agent_id))
-                        .collect();
-                    if cached.is_empty() {
-                        continue;
-                    }
-                    let agent_ids: Vec<Uuid> = cached.iter().map(|(_, id)| *id).collect();
-
-                    // Route through the canonical repository helper —
-                    // keeps raw SQL out of talos-mcp-handlers per the
-                    // architectural mandate (lint check 6).
-                    let sysrepo = talos_system_repo::SystemRepository::new(db_pool.clone());
-                    let active: Vec<Uuid> = match sysrepo.list_active_agent_ids(&agent_ids).await {
-                        Ok(rows) => rows,
-                        Err(e) => {
-                            tracing::warn!(
+    // 2026-09-08: supervised. This loop CAN stop cleanly — the shutdown
+    // arm `break`s — and until now that stop was indistinguishable from
+    // it still running, on the path that bounds the bearer-token
+    // revocation window.
+    talos_task_supervision::spawn_supervised(
+        talos_task_supervision::BackgroundTask::BcryptCacheRevocationSweep,
+        async move {
+            let mut shutdown = shutdown_rx;
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+                BCRYPT_CACHE_SWEEP_INTERVAL_SECS,
+            ));
+            // Skip the immediate tick — the cache is empty at startup.
+            interval.tick().await;
+            tracing::info!(
+                target: "talos_audit",
+                sweep_interval_secs = BCRYPT_CACHE_SWEEP_INTERVAL_SECS,
+                "MCP-991: bcrypt cache revocation sweep started"
+            );
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        // MCP-1132 (2026-05-16): TTL-expired eviction.
+                        // Sibling pattern to MCP-1093 (DEK cache sweep).
+                        // Pre-fix the MCP-991 revocation sweep only evicted
+                        // entries whose agents had been DB-deactivated; it
+                        // ignored entries whose timestamp was older than
+                        // `BCRYPT_CACHE_TTL_SECS`. Those entries are
+                        // harmless on the hit path (the TTL check at the
+                        // call site falls through to re-verification) but
+                        // consume memory monotonically with every distinct
+                        // token seen since startup — one-shot test agents,
+                        // rotated tokens, and short-lived OAuth-derived
+                        // agents all leave residue. The only existing
+                        // expired-eviction path was the
+                        // `BCRYPT_CACHE_MAX_ENTRIES = 1000` overflow
+                        // `retain` at the insert site, which fires only
+                        // under cache pressure.
+                        //
+                        // Run expired-eviction BEFORE the revocation query
+                        // so the agent_ids slice we send to Postgres is
+                        // already minus the expired set — smaller batch,
+                        // less DB-side work.
+                        let evict_now = Instant::now();
+                        let before_expired_evict = BCRYPT_VERIFY_CACHE.len();
+                        BCRYPT_VERIFY_CACHE.retain(|_, (cached_at, _)| {
+                            evict_now.duration_since(*cached_at).as_secs() < BCRYPT_CACHE_TTL_SECS
+                        });
+                        let evicted_expired = before_expired_evict.saturating_sub(BCRYPT_VERIFY_CACHE.len());
+                        if evicted_expired > 0 {
+                            tracing::debug!(
                                 target: "talos_audit",
-                                error = %e,
-                                "bcrypt cache sweep: batch query failed — keeping existing cache (revocation visibility deferred to next tick)"
+                                evicted_expired,
+                                cached_after = BCRYPT_VERIFY_CACHE.len(),
+                                "MCP-1132: bcrypt cache sweep evicted TTL-expired entries"
                             );
+                        }
+
+                        let cached: Vec<(String, Uuid)> = BCRYPT_VERIFY_CACHE
+                            .iter()
+                            .map(|kv| (kv.key().clone(), kv.value().1.agent_id))
+                            .collect();
+                        if cached.is_empty() {
                             continue;
                         }
-                    };
-                    let active_set: std::collections::HashSet<Uuid> = active.into_iter().collect();
+                        let agent_ids: Vec<Uuid> = cached.iter().map(|(_, id)| *id).collect();
 
-                    let mut evicted = 0usize;
-                    for (token_hash, agent_id) in cached {
-                        if !active_set.contains(&agent_id) {
-                            BCRYPT_VERIFY_CACHE.remove(&token_hash);
-                            evicted += 1;
+                        // Route through the canonical repository helper —
+                        // keeps raw SQL out of talos-mcp-handlers per the
+                        // architectural mandate (lint check 6).
+                        let sysrepo = talos_system_repo::SystemRepository::new(db_pool.clone());
+                        let active: Vec<Uuid> = match sysrepo.list_active_agent_ids(&agent_ids).await {
+                            Ok(rows) => rows,
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: "talos_audit",
+                                    error = %e,
+                                    "bcrypt cache sweep: batch query failed — keeping existing cache (revocation visibility deferred to next tick)"
+                                );
+                                continue;
+                            }
+                        };
+                        let active_set: std::collections::HashSet<Uuid> = active.into_iter().collect();
+
+                        let mut evicted = 0usize;
+                        for (token_hash, agent_id) in cached {
+                            if !active_set.contains(&agent_id) {
+                                BCRYPT_VERIFY_CACHE.remove(&token_hash);
+                                evicted += 1;
+                                tracing::info!(
+                                    target: "talos_audit",
+                                    %agent_id,
+                                    "bcrypt cache: evicted revoked agent"
+                                );
+                            }
+                        }
+                        if evicted > 0 {
                             tracing::info!(
                                 target: "talos_audit",
-                                %agent_id,
-                                "bcrypt cache: evicted revoked agent"
+                                evicted,
+                                cached_after = BCRYPT_VERIFY_CACHE.len(),
+                                "MCP-991: bcrypt cache sweep evicted revoked agents"
                             );
                         }
                     }
-                    if evicted > 0 {
-                        tracing::info!(
-                            target: "talos_audit",
-                            evicted,
-                            cached_after = BCRYPT_VERIFY_CACHE.len(),
-                            "MCP-991: bcrypt cache sweep evicted revoked agents"
-                        );
-                    }
-                }
-                _ = shutdown.changed() => {
-                    if *shutdown.borrow() {
-                        tracing::info!(
-                            target: "talos_audit",
-                            "bcrypt cache revocation sweep received shutdown signal"
-                        );
-                        break;
+                    _ = shutdown.changed() => {
+                        if *shutdown.borrow() {
+                            tracing::info!(
+                                target: "talos_audit",
+                                "bcrypt cache revocation sweep received shutdown signal"
+                            );
+                            break talos_task_supervision::TaskExit::ShuttingDown;
+                        }
                     }
                 }
             }
-        }
-    });
+        },
+    );
 }
 
 /// In-memory cache of recent bcrypt verification results.
@@ -897,5 +904,36 @@ mod bcrypt_cache_invalidation_tests {
         assert_eq!(invalidate_agent_token_cache(Uuid::new_v4()), 0);
 
         BCRYPT_VERIFY_CACHE.remove(&h3);
+    }
+}
+
+/// **The wiring nothing else can see.** The bcrypt-cache revocation sweep goes through
+/// `talos_task_supervision::spawn_supervised`; reverting that site to a
+/// bare `tokio::spawn` is behaviourally identical on a healthy process
+/// and completely silent on a dead one — no metric moves, no log line
+/// appears, and every operator surface keeps reporting the subsystem as
+/// configured. Structural lint check 58 cannot see it either: it asks
+/// whether a metric has an increment SITE, not whether anything reaches
+/// one.
+///
+/// The one bare spawn is the per-request `touch_agent_last_connected` fire-and-forget.
+///
+/// The counting rule lives in `talos_task_supervision` so the pins in
+/// the eight crates that carry one cannot drift; its stated limits
+/// (textual, per-file, blind to WHICH task is named) apply here.
+#[cfg(test)]
+mod task_supervision_pin {
+    #[test]
+    fn the_long_lived_loop_is_supervised() {
+        let (supervised, bare) =
+            talos_task_supervision::production_spawn_counts(include_str!("auth.rs"));
+        assert_eq!(
+            supervised, 1,
+            "The bcrypt-cache revocation sweep must still go through spawn_supervised"
+        );
+        assert_eq!(
+            bare, 1,
+            "the set of deliberately-unsupervised one-shot spawns in this file changed"
+        );
     }
 }

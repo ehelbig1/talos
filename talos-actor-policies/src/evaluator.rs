@@ -189,13 +189,22 @@ impl PolicyEvaluator {
     /// (called once at startup).
     pub fn spawn_sweeper(self: Arc<Self>) {
         let cache = self.cache.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(SWEEP_INTERVAL_SECS));
-            loop {
-                interval.tick().await;
-                cache.sweep_expired();
-            }
-        });
+        // Supervised for ATTRIBUTION only, and saying which is the point:
+        // this body is `loop { tick; sweep }` with no `break` and no
+        // shutdown arm, so it has type `!` and CANNOT exit cleanly. The
+        // only termination it can have is a panic, which the process-wide
+        // hook already counts — what the wrapper adds is the `task` label
+        // naming THIS loop rather than `tokio-runtime-worker`.
+        talos_task_supervision::spawn_supervised(
+            talos_task_supervision::BackgroundTask::ActorPolicyCacheSweep,
+            async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(SWEEP_INTERVAL_SECS));
+                loop {
+                    interval.tick().await;
+                    cache.sweep_expired();
+                }
+            },
+        );
     }
 
     /// Main entry — evaluate every policy for `event.actor_id()` and
@@ -774,5 +783,36 @@ mod unevaluable_decision_tests {
                 "{mode:?}"
             );
         }
+    }
+}
+
+/// **The wiring nothing else can see.** The policy-cache sweeper goes through
+/// `talos_task_supervision::spawn_supervised`; reverting that site to a
+/// bare `tokio::spawn` is behaviourally identical on a healthy process
+/// and completely silent on a dead one — no metric moves, no log line
+/// appears, and every operator surface keeps reporting the subsystem as
+/// configured. Structural lint check 58 cannot see it either: it asks
+/// whether a metric has an increment SITE, not whether anything reaches
+/// one.
+///
+/// The one bare spawn is the per-fire policy-notification webhook POST — a one-shot bounded to one event, covered by the process panic hook.
+///
+/// The counting rule lives in `talos_task_supervision` so the pins in
+/// the eight crates that carry one cannot drift; its stated limits
+/// (textual, per-file, blind to WHICH task is named) apply here.
+#[cfg(test)]
+mod task_supervision_pin {
+    #[test]
+    fn the_long_lived_loop_is_supervised() {
+        let (supervised, bare) =
+            talos_task_supervision::production_spawn_counts(include_str!("evaluator.rs"));
+        assert_eq!(
+            supervised, 1,
+            "The policy-cache sweeper must still go through spawn_supervised"
+        );
+        assert_eq!(
+            bare, 1,
+            "the set of deliberately-unsupervised one-shot spawns in this file changed"
+        );
     }
 }

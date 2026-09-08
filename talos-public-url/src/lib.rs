@@ -159,62 +159,73 @@ pub fn spawn_discovery() {
         .and_then(|v| v.parse::<u64>().ok())
         .map_or(60, |v| v.max(10));
 
-    tokio::spawn(async move {
-        let client = talos_http_utils::trusted_client::build_integration_client(
-            std::time::Duration::from_secs(5),
-        );
-        let tunnels_url = format!("{api_base}/api/tunnels");
-        loop {
-            match poll_once(&client, &tunnels_url).await {
-                Ok(Some(url)) => {
-                    API_REACHABLE.store(true, Ordering::Relaxed);
-                    let prev = discovered_cell().swap(Some(Arc::new(url.clone())));
-                    match prev.as_deref() {
-                        None => {
-                            tracing::info!(
-                                public_url = %url,
-                                "🌐 ngrok tunnel discovered — externally-reachable endpoints \
-                                 (Pub/Sub push, watch webhooks, inbound webhooks, approval links) \
-                                 now format with this origin. Run the get_public_url_status MCP \
-                                 tool for per-integration setup instructions."
-                            );
+    // Supervised for ATTRIBUTION only: the body below is an unbounded
+    // poll loop with no `break` and no shutdown arm, so it has type `!`
+    // and cannot exit cleanly. The wrapper's value here is the `task`
+    // label on a panic, not a silent-death signal it does not have.
+    // Note the config gate is ABOVE this spawn, unchanged: on a
+    // deployment with no ngrok agent the loop is never spawned and the
+    // five seeded series stay at 0 — which is a state this process CAN
+    // leave, so seeding it is not check 58's defect.
+    talos_task_supervision::spawn_supervised(
+        talos_task_supervision::BackgroundTask::PublicUrlDiscovery,
+        async move {
+            let client = talos_http_utils::trusted_client::build_integration_client(
+                std::time::Duration::from_secs(5),
+            );
+            let tunnels_url = format!("{api_base}/api/tunnels");
+            loop {
+                match poll_once(&client, &tunnels_url).await {
+                    Ok(Some(url)) => {
+                        API_REACHABLE.store(true, Ordering::Relaxed);
+                        let prev = discovered_cell().swap(Some(Arc::new(url.clone())));
+                        match prev.as_deref() {
+                            None => {
+                                tracing::info!(
+                                    public_url = %url,
+                                    "🌐 ngrok tunnel discovered — externally-reachable endpoints \
+                                     (Pub/Sub push, watch webhooks, inbound webhooks, approval links) \
+                                     now format with this origin. Run the get_public_url_status MCP \
+                                     tool for per-integration setup instructions."
+                                );
+                            }
+                            Some(old) if *old != url => {
+                                tracing::warn!(
+                                    old_url = %old,
+                                    new_url = %url,
+                                    "ngrok tunnel URL CHANGED — Pub/Sub push subscriptions, Google \
+                                     watch channels, and any provider-side registrations still point \
+                                     at the OLD origin and will fail until updated. Run \
+                                     get_public_url_status for the commands (a reserved ngrok domain \
+                                     via NGROK_STATIC_DOMAIN eliminates this class)."
+                                );
+                            }
+                            _ => {}
                         }
-                        Some(old) if *old != url => {
+                    }
+                    Ok(None) => {
+                        // Agent up, no usable tunnel (yet). Keep any previous
+                        // value — a transient agent restart shouldn't flap
+                        // formatted URLs back to localhost.
+                        API_REACHABLE.store(true, Ordering::Relaxed);
+                        tracing::debug!("ngrok agent reachable but no https tunnel found");
+                    }
+                    Err(e) => {
+                        let was_reachable = API_REACHABLE.swap(false, Ordering::Relaxed);
+                        if was_reachable {
                             tracing::warn!(
-                                old_url = %old,
-                                new_url = %url,
-                                "ngrok tunnel URL CHANGED — Pub/Sub push subscriptions, Google \
-                                 watch channels, and any provider-side registrations still point \
-                                 at the OLD origin and will fail until updated. Run \
-                                 get_public_url_status for the commands (a reserved ngrok domain \
-                                 via NGROK_STATIC_DOMAIN eliminates this class)."
+                                error = %e,
+                                "ngrok agent API became unreachable — keeping last-known public URL"
                             );
+                        } else {
+                            tracing::debug!(error = %e, "ngrok agent API not reachable");
                         }
-                        _ => {}
                     }
                 }
-                Ok(None) => {
-                    // Agent up, no usable tunnel (yet). Keep any previous
-                    // value — a transient agent restart shouldn't flap
-                    // formatted URLs back to localhost.
-                    API_REACHABLE.store(true, Ordering::Relaxed);
-                    tracing::debug!("ngrok agent reachable but no https tunnel found");
-                }
-                Err(e) => {
-                    let was_reachable = API_REACHABLE.swap(false, Ordering::Relaxed);
-                    if was_reachable {
-                        tracing::warn!(
-                            error = %e,
-                            "ngrok agent API became unreachable — keeping last-known public URL"
-                        );
-                    } else {
-                        tracing::debug!(error = %e, "ngrok agent API not reachable");
-                    }
-                }
+                tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
-        }
-    });
+        },
+    );
 }
 
 async fn poll_once(client: &reqwest::Client, tunnels_url: &str) -> anyhow::Result<Option<String>> {
@@ -271,5 +282,36 @@ mod tests {
         let (url, source) = resolve(|| "http://localhost:8000".to_string());
         assert_eq!(source, UrlSource::Fallback);
         assert_eq!(url, "http://localhost:8000");
+    }
+}
+
+/// **The wiring nothing else can see.** The ngrok discovery poll loop goes through
+/// `talos_task_supervision::spawn_supervised`; reverting that site to a
+/// bare `tokio::spawn` is behaviourally identical on a healthy process
+/// and completely silent on a dead one — no metric moves, no log line
+/// appears, and every operator surface keeps reporting the subsystem as
+/// configured. Structural lint check 58 cannot see it either: it asks
+/// whether a metric has an increment SITE, not whether anything reaches
+/// one.
+///
+/// No other spawn site exists in this crate.
+///
+/// The counting rule lives in `talos_task_supervision` so the pins in
+/// the eight crates that carry one cannot drift; its stated limits
+/// (textual, per-file, blind to WHICH task is named) apply here.
+#[cfg(test)]
+mod task_supervision_pin {
+    #[test]
+    fn the_long_lived_loop_is_supervised() {
+        let (supervised, bare) =
+            talos_task_supervision::production_spawn_counts(include_str!("lib.rs"));
+        assert_eq!(
+            supervised, 1,
+            "The ngrok discovery poll loop must still go through spawn_supervised"
+        );
+        assert_eq!(
+            bare, 0,
+            "the set of deliberately-unsupervised one-shot spawns in this file changed"
+        );
     }
 }

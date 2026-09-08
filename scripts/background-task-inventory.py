@@ -18,6 +18,47 @@ supervising were in fact launchers or by-config returns, which is only
 visible once the library crates are in range. The roots now default to the
 whole workspace; pass explicit roots to narrow.
 
+REVISED AGAIN the same day, after the 28 `loop` rows this walk then
+reported were classified BY READING each body rather than by window.
+Eleven were supervised (eight with a real exit path, three pure tickers
+admitted for panic ATTRIBUTION at one line each) and the walk now reports
+**17**. Of those 17, **13 are false positives of the window** and are
+listed here so nobody re-classifies them:
+
+  * `controller/src/bootstrap/background.rs` x4 -- three startup one-shots
+    and the deliberately-bare `start_worker_management` launcher, all four
+    already named by `task_supervision_wiring_tests`.
+  * `talos-engine/src/fence.rs:175` -- a PER-EXECUTION epoch-fence
+    heartbeat under an `AbortOnDrop`. Supervising it would record one exit
+    per workflow run.
+  * `talos-mcp-handlers/src/lib.rs` x2 -- per-SSE-CONNECTION tasks.
+  * `talos-worker-runtime/src/host/http_stream.rs:579` -- per-STREAM.
+  * `talos-worker-runtime/src/host/llm_failure_metrics_tests.rs` x2 -- a
+    test-only file the `#[cfg(test)]` strip cannot see (the module has no
+    column-0 attribute).
+  * `worker/src/bin/metrics_demo.rs` x2 -- a hand-run demo binary.
+  * `talos-jobs/src/lib.rs:422` -- `JobProcessor::start_processor`, which
+    has a correct shutdown arm and **zero callers workspace-wide**; its
+    own `process_next_job` is a stub returning `Ok(())`. Supervising dead
+    code would seed five series nothing can increment, which is check 58's
+    rule.
+
+The remaining **4 are real, all in the WORKER process**, all pure
+`loop { tick; f() }` with no exit path:
+`talos-worker-runtime/src/circuit_breaker.rs:325`,
+`talos-worker-runtime/src/runtime.rs:71` (the epoch ticker),
+`worker/src/main.rs:2407` (the job-idempotency sweep) and
+`worker/src/metrics_server.rs:199`. They are NOT supervised, and the
+reason is a cost measurement rather than a shrug: `BackgroundTask::ALL` is
+what the CONTROLLER pre-seeds, so a worker-side variant would seed five
+controller series nothing there can increment -- the exact defect the
+worker's `register_metrics(.., &[])` argument was added to remove. Naming
+them costs a process partition of the shared enum, not one line. The
+epoch ticker additionally returns a `JoinHandle` that four
+`worker/tests/kill_switch_tests.rs` cases `abort()`; `spawn_supervised`
+hands back the OUTER handle, and aborting that does not stop the inner
+task.
+
 Classification per site:
   supervised -- goes through `talos_task_supervision::spawn_supervised`,
                 so its termination is counted and logged
@@ -79,7 +120,17 @@ def drop_test_regions(lines):
     return out
 
 
+# The wrapper's OWN source. Its text necessarily quotes both
+# `spawn_supervised(` and `tokio::spawn(` — in the wrapper's body, in the
+# counting helper's string literals, and in its docs — so scanning it makes
+# the crate that DEFINES the pattern report itself (check 73's self-report
+# trap). It contains no background loop of its own.
+SELF = "talos-task-supervision/src/lib.rs"
+
+
 def scan(path):
+    if path.replace(os.sep, "/").endswith(SELF):
+        return []
     out = []
     with open(path, "r", encoding="utf-8", errors="replace") as fh:
         raw_lines = fh.readlines()

@@ -108,31 +108,35 @@ pub fn spawn_policy_evaluator(
         .and_then(|v| v.parse::<u64>().ok())
         .filter(|v| *v >= 30)
         .unwrap_or(DEFAULT_INTERVAL_SECS);
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        tracing::info!(interval_secs, "ml policy evaluator active");
-        loop {
-            tokio::select! {
-                biased;
-                _ = shutdown.changed() => {
-                    tracing::info!("ml policy evaluator shutting down");
-                    break;
-                }
-                _ = interval.tick() => {
-                    match run_policy_tick(&pool, &dataset_service, &lifecycle_service).await {
-                        Ok(evaluated) if evaluated > 0 => {
-                            tracing::info!(evaluated, "ml policy tick complete");
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::warn!(error = %e, "ml policy tick failed; retrying next interval");
+    // Supervised: the shutdown arm `break`s.
+    talos_task_supervision::spawn_supervised(
+        talos_task_supervision::BackgroundTask::MlPolicyEvaluator,
+        async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tracing::info!(interval_secs, "ml policy evaluator active");
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.changed() => {
+                        tracing::info!("ml policy evaluator shutting down");
+                        break talos_task_supervision::TaskExit::ShuttingDown;
+                    }
+                    _ = interval.tick() => {
+                        match run_policy_tick(&pool, &dataset_service, &lifecycle_service).await {
+                            Ok(evaluated) if evaluated > 0 => {
+                                tracing::info!(evaluated, "ml policy tick complete");
+                            }
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::warn!(error = %e, "ml policy tick failed; retrying next interval");
+                            }
                         }
                     }
                 }
             }
-        }
-    });
+        },
+    );
 }
 
 /// One bounded tick. Public so an integration test (or an operator MCP
@@ -769,5 +773,36 @@ mod tests {
             t(11),
             Duration::zero()
         ));
+    }
+}
+
+/// **The wiring nothing else can see.** The ML policy evaluator loop goes through
+/// `talos_task_supervision::spawn_supervised`; reverting that site to a
+/// bare `tokio::spawn` is behaviourally identical on a healthy process
+/// and completely silent on a dead one — no metric moves, no log line
+/// appears, and every operator surface keeps reporting the subsystem as
+/// configured. Structural lint check 58 cannot see it either: it asks
+/// whether a metric has an increment SITE, not whether anything reaches
+/// one.
+///
+/// No other spawn site exists in this file.
+///
+/// The counting rule lives in `talos_task_supervision` so the pins in
+/// the eight crates that carry one cannot drift; its stated limits
+/// (textual, per-file, blind to WHICH task is named) apply here.
+#[cfg(test)]
+mod task_supervision_pin {
+    #[test]
+    fn the_long_lived_loop_is_supervised() {
+        let (supervised, bare) =
+            talos_task_supervision::production_spawn_counts(include_str!("lifecycle_job.rs"));
+        assert_eq!(
+            supervised, 1,
+            "The ML policy evaluator loop must still go through spawn_supervised"
+        );
+        assert_eq!(
+            bare, 0,
+            "the set of deliberately-unsupervised one-shot spawns in this file changed"
+        );
     }
 }

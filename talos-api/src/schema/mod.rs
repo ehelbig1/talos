@@ -21,7 +21,12 @@ pub mod workflows;
 
 mod mutations;
 mod queries;
-mod subscriptions;
+// `pub` so `refresh_dlq_permissions` — the DLQ subscription's periodic
+// permission refresh, which NARROWS on an unreadable read — can be driven
+// against a real database from `controller/tests/fail_open_gate_tests`.
+// The rest of the module is the `#[Subscription]` impl, which is reachable
+// only through the schema.
+pub mod subscriptions;
 pub mod types;
 
 // Re-export everything for backwards compatibility
