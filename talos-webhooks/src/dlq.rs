@@ -67,52 +67,64 @@ impl DlqService {
         let shutdown_notify = Arc::new(tokio::sync::Notify::new());
         let shutdown_notify_task = shutdown_notify.clone();
 
-        // Spawn background processor
-        tokio::spawn(async move {
-            let mut batch: Vec<DlqEntry> = Vec::with_capacity(100);
-            let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
+        // Spawn background processor.
+        //
+        // 2026-09-08: supervised. This is the (b)/(c) shape the wrapper
+        // exists for — the `Notify` arm flushes and `break`s, so the loop
+        // CAN stop while the process runs on, and every DLQ write after
+        // that point is silently dropped at the channel with no signal
+        // anywhere. Note the `Some(entry) = receiver.recv()` arm does NOT
+        // end the loop when every sender is dropped: an unmatched pattern
+        // disables that branch for one `select!` evaluation only, and the
+        // interval arm can never disable, so the loop keeps running.
+        talos_task_supervision::spawn_supervised(
+            talos_task_supervision::BackgroundTask::DlqBatchProcessor,
+            async move {
+                let mut batch: Vec<DlqEntry> = Vec::with_capacity(100);
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(5));
 
-            loop {
-                tokio::select! {
-                    biased;
-                    // MCP-1131: shutdown arm — flush in-memory batch
-                    // before the tokio runtime aborts this task on
-                    // graceful controller shutdown.
-                    _ = shutdown_notify_task.notified() => {
-                        // Drain any entries already queued but not yet
-                        // delivered to recv() so we don't lose them
-                        // either. try_recv loops until empty.
-                        while let Ok(entry) = receiver.try_recv() {
+                loop {
+                    tokio::select! {
+                        biased;
+                        // MCP-1131: shutdown arm — flush in-memory batch
+                        // before the tokio runtime aborts this task on
+                        // graceful controller shutdown.
+                        _ = shutdown_notify_task.notified() => {
+                            // Drain any entries already queued but not yet
+                            // delivered to recv() so we don't lose them
+                            // either. try_recv loops until empty.
+                            while let Ok(entry) = receiver.try_recv() {
+                                batch.push(entry);
+                            }
+                            if !batch.is_empty() {
+                                tracing::info!(
+                                    target: "talos_webhooks",
+                                    event_kind = "dlq_shutdown_final_flush",
+                                    batch_size = batch.len(),
+                                    "DLQ processor flushing on graceful shutdown"
+                                );
+                                Self::flush_batch(&db_pool, &batch, &metrics_clone, &dlq_tx).await;
+                                batch.clear();
+                            }
+                            break talos_task_supervision::TaskExit::ShuttingDown;
+                        }
+                        Some(entry) = receiver.recv() => {
                             batch.push(entry);
+                            if batch.len() >= 100 {
+                                Self::flush_batch(&db_pool, &batch, &metrics_clone, &dlq_tx).await;
+                                batch.clear();
+                            }
                         }
-                        if !batch.is_empty() {
-                            tracing::info!(
-                                target: "talos_webhooks",
-                                event_kind = "dlq_shutdown_final_flush",
-                                batch_size = batch.len(),
-                                "DLQ processor flushing on graceful shutdown"
-                            );
-                            Self::flush_batch(&db_pool, &batch, &metrics_clone, &dlq_tx).await;
-                            batch.clear();
-                        }
-                        break;
-                    }
-                    Some(entry) = receiver.recv() => {
-                        batch.push(entry);
-                        if batch.len() >= 100 {
-                            Self::flush_batch(&db_pool, &batch, &metrics_clone, &dlq_tx).await;
-                            batch.clear();
-                        }
-                    }
-                    _ = interval.tick() => {
-                        if !batch.is_empty() {
-                            Self::flush_batch(&db_pool, &batch, &metrics_clone, &dlq_tx).await;
-                            batch.clear();
+                        _ = interval.tick() => {
+                            if !batch.is_empty() {
+                                Self::flush_batch(&db_pool, &batch, &metrics_clone, &dlq_tx).await;
+                                batch.clear();
+                            }
                         }
                     }
                 }
-            }
-        });
+            },
+        );
 
         Self {
             sender,
@@ -359,4 +371,35 @@ fn enqueue_webhook_dlq(
             tracing::warn!("Failed to enqueue webhook DLQ entry: {}", e);
         }
     });
+}
+
+/// **The wiring nothing else can see.** The DLQ batch processor goes through
+/// `talos_task_supervision::spawn_supervised`; reverting that site to a
+/// bare `tokio::spawn` is behaviourally identical on a healthy process
+/// and completely silent on a dead one — no metric moves, no log line
+/// appears, and every operator surface keeps reporting the subsystem as
+/// configured. Structural lint check 58 cannot see it either: it asks
+/// whether a metric has an increment SITE, not whether anything reaches
+/// one.
+///
+/// The one bare spawn is the per-drop `webhook_dlq` INSERT, a one-shot.
+///
+/// The counting rule lives in `talos_task_supervision` so the pins in
+/// the eight crates that carry one cannot drift; its stated limits
+/// (textual, per-file, blind to WHICH task is named) apply here.
+#[cfg(test)]
+mod task_supervision_pin {
+    #[test]
+    fn the_long_lived_loop_is_supervised() {
+        let (supervised, bare) =
+            talos_task_supervision::production_spawn_counts(include_str!("dlq.rs"));
+        assert_eq!(
+            supervised, 1,
+            "The DLQ batch processor must still go through spawn_supervised"
+        );
+        assert_eq!(
+            bare, 1,
+            "the set of deliberately-unsupervised one-shot spawns in this file changed"
+        );
+    }
 }

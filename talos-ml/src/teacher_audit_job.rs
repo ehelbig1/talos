@@ -305,32 +305,36 @@ pub fn spawn_teacher_audit_scheduler(
 ) {
     let check_secs = check_interval_secs();
     let days = interval_days();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(check_secs));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        tracing::info!(
-            check_interval_secs = check_secs,
-            interval_days = days,
-            ollama_configured = ollama.is_some(),
-            "ml teacher-audit scheduler active"
-        );
-        loop {
-            tokio::select! {
-                biased;
-                _ = shutdown.changed() => {
-                    tracing::info!("ml teacher-audit scheduler shutting down");
-                    break;
-                }
-                _ = interval.tick() => {
-                    match run_teacher_audit_tick(&pool, &dataset, ollama.as_ref(), days).await {
-                        Ok(Some(_)) => {}
-                        Ok(None) => {}
-                        Err(e) => tracing::warn!(error = %e, "ml teacher-audit tick failed; retrying next interval"),
+    // Supervised: the shutdown arm `break`s.
+    talos_task_supervision::spawn_supervised(
+        talos_task_supervision::BackgroundTask::MlTeacherAudit,
+        async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(check_secs));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tracing::info!(
+                check_interval_secs = check_secs,
+                interval_days = days,
+                ollama_configured = ollama.is_some(),
+                "ml teacher-audit scheduler active"
+            );
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.changed() => {
+                        tracing::info!("ml teacher-audit scheduler shutting down");
+                        break talos_task_supervision::TaskExit::ShuttingDown;
+                    }
+                    _ = interval.tick() => {
+                        match run_teacher_audit_tick(&pool, &dataset, ollama.as_ref(), days).await {
+                            Ok(Some(_)) => {}
+                            Ok(None) => {}
+                            Err(e) => tracing::warn!(error = %e, "ml teacher-audit tick failed; retrying next interval"),
+                        }
                     }
                 }
             }
-        }
-    });
+        },
+    );
 }
 
 #[cfg(test)]
@@ -472,5 +476,36 @@ mod tests {
             1
         );
         assert_eq!(1000i64.clamp(MIN_INTERVAL_DAYS, MAX_INTERVAL_DAYS), 90);
+    }
+}
+
+/// **The wiring nothing else can see.** The ML teacher-audit scheduler goes through
+/// `talos_task_supervision::spawn_supervised`; reverting that site to a
+/// bare `tokio::spawn` is behaviourally identical on a healthy process
+/// and completely silent on a dead one — no metric moves, no log line
+/// appears, and every operator surface keeps reporting the subsystem as
+/// configured. Structural lint check 58 cannot see it either: it asks
+/// whether a metric has an increment SITE, not whether anything reaches
+/// one.
+///
+/// No other spawn site exists in this file.
+///
+/// The counting rule lives in `talos_task_supervision` so the pins in
+/// the eight crates that carry one cannot drift; its stated limits
+/// (textual, per-file, blind to WHICH task is named) apply here.
+#[cfg(test)]
+mod task_supervision_pin {
+    #[test]
+    fn the_long_lived_loop_is_supervised() {
+        let (supervised, bare) =
+            talos_task_supervision::production_spawn_counts(include_str!("teacher_audit_job.rs"));
+        assert_eq!(
+            supervised, 1,
+            "The ML teacher-audit scheduler must still go through spawn_supervised"
+        );
+        assert_eq!(
+            bare, 0,
+            "the set of deliberately-unsupervised one-shot spawns in this file changed"
+        );
     }
 }

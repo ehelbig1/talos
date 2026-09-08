@@ -13,6 +13,93 @@ use talos_engine::events::{ExecutionEvent, ExecutionStatus};
 #[derive(Default)]
 pub struct SubscriptionRoot;
 
+/// One subscriber's DLQ visibility, as re-read on the periodic refresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DlqPermissions {
+    /// Platform admins bypass the tenant filter entirely.
+    pub is_admin: bool,
+    /// Orgs whose DLQ events this subscriber may see. EMPTY when the read
+    /// could not answer — see [`refresh_dlq_permissions`].
+    pub accessible_org_ids: Vec<Uuid>,
+}
+
+/// Re-read one `dlq_updates` subscriber's permissions, NARROWING on any
+/// read that does not answer.
+///
+/// **This is the whole refresh, not a helper beside it.** The refresh exists
+/// to notice a REVOCATION, so keeping the prior permission set on a failed
+/// read is the one outcome that defeats it: the subscriber goes on receiving
+/// another org's DLQ events for as long as the read keeps failing. #779 fixed
+/// that and recorded the narrowing as UNTESTED, because it lived inside an
+/// `async_stream::stream!` body in a GraphQL resolver that needs a schema, a
+/// broadcast channel and a live subscription to reach. Lifting the two reads
+/// and the decision into one function makes the narrowing drivable against a
+/// real database with the relation each read names removed — which is what
+/// `controller/tests/fail_open_gate_tests` now does.
+///
+/// Narrowing degrades to the events the user certainly owns
+/// (`event.user_id == subscriber`) rather than terminating the stream, and it
+/// self-heals on the next successful tick.
+///
+/// **Stated limit**: the stream body still has to USE what this returns. A
+/// mutation that calls this and discards the answer survives every test here
+/// — checks 74b/79b state that limit as their own, and it is a dataflow
+/// question rather than a textual one.
+pub async fn refresh_dlq_permissions(
+    actor_repo: &talos_actor_repository::ActorRepository,
+    db_pool: &sqlx::Pool<sqlx::Postgres>,
+    user_id: Uuid,
+) -> DlqPermissions {
+    match actor_repo.is_platform_admin(user_id).await {
+        Ok(true) => {
+            // Admins bypass the filter; clear the org list so a future
+            // demotion forces a re-fetch.
+            DlqPermissions {
+                is_admin: true,
+                accessible_org_ids: Vec::new(),
+            }
+        }
+        Ok(false) => {
+            match talos_organizations::OrganizationService::list_user_org_ids(db_pool, user_id)
+                .await
+            {
+                Ok(new_ids) => DlqPermissions {
+                    is_admin: false,
+                    accessible_org_ids: new_ids,
+                },
+                Err(e) => {
+                    tracing::warn!(
+                        target: "talos_audit",
+                        %user_id,
+                        error = %e,
+                        event_kind = "subscription_permission_unreadable",
+                        "dlq_updates org-membership refresh failed; NARROWING to own-events only until the next successful refresh"
+                    );
+                    DlqPermissions {
+                        is_admin: false,
+                        accessible_org_ids: Vec::new(),
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            // Same rule one axis over: an unreadable admin flag must not
+            // preserve admin visibility, which bypasses the filter entirely.
+            tracing::warn!(
+                target: "talos_audit",
+                %user_id,
+                error = %e,
+                event_kind = "subscription_permission_unreadable",
+                "dlq_updates is_platform_admin refresh failed; NARROWING to own-events only until the next successful refresh"
+            );
+            DlqPermissions {
+                is_admin: false,
+                accessible_org_ids: Vec::new(),
+            }
+        }
+    }
+}
+
 /// M T6-1: tenant-scope filter for `dlq_updates`. Pulled out as a
 /// pure function so the visibility logic can be unit-tested without
 /// spinning up a broadcast channel.
@@ -349,11 +436,18 @@ impl SubscriptionRoot {
         // execution context, timing). Per-event SQL would burn the
         // broadcast hot loop; 60-second polling is the right middle
         // ground — matches the MCP-699 SSE revalidation cadence in
-        // talos-mcp-handlers/src/lib.rs. On refresh failure (DB
+        // talos-mcp-handlers/src/lib.rs.
+        //
+        // 2026-09-08: this block used to end "on refresh failure (DB
         // hiccup), preserve the previous permission set rather than
-        // failing closed — closing the stream every transient DB blip
-        // would be a worse UX than the small window of stale-perm
-        // residue we already accept between ticks.
+        // failing closed". That has been FALSE since #779 — the refresh
+        // NARROWS on an unreadable read, because preserving is the one
+        // outcome that defeats a refresh whose purpose is to notice a
+        // revocation. A comment asserting a behaviour the code does not
+        // have is its own defect class, so it is corrected here rather
+        // than left. The decision now lives in
+        // [`refresh_dlq_permissions`], which is where it can be driven
+        // against a real database.
         const PERM_REFRESH_INTERVAL_SECS: u64 = 60;
         Ok(async_stream::stream! {
             let mut is_admin = is_admin;
@@ -392,64 +486,9 @@ impl SubscriptionRoot {
                         }
                     }
                     _ = refresh_ticker.tick() => {
-                        match actor_repo.is_platform_admin(user_id).await {
-                            Ok(new_is_admin) => {
-                                is_admin = new_is_admin;
-                                if new_is_admin {
-                                    // Admins bypass the filter; clear the
-                                    // org list so a future demotion forces
-                                    // a re-fetch.
-                                    accessible_org_ids = Vec::new();
-                                } else {
-                                    match talos_organizations::OrganizationService::list_user_org_ids(
-                                        &db_pool, user_id,
-                                    )
-                                    .await
-                                    {
-                                        Ok(new_ids) => accessible_org_ids = new_ids,
-                                        Err(e) => {
-                                            // 2026-09-07: NARROW, do not keep.
-                                            // The refresh exists to notice a
-                                            // REVOCATION, so keeping the prior
-                                            // set on a failed read is the one
-                                            // outcome that defeats it: the
-                                            // subscriber goes on receiving
-                                            // another org's DLQ events for as
-                                            // long as the read keeps failing.
-                                            // Clearing degrades to the events
-                                            // the user certainly owns
-                                            // (`event.user_id == subscriber`),
-                                            // which keeps the stream alive
-                                            // rather than terminating it, and
-                                            // self-heals on the next
-                                            // successful tick.
-                                            accessible_org_ids = Vec::new();
-                                            tracing::warn!(
-                                                target: "talos_audit",
-                                                %user_id,
-                                                error = %e,
-                                                event_kind = "subscription_permission_unreadable",
-                                                "dlq_updates org-membership refresh failed; NARROWING to own-events only until the next successful refresh"
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                // Same rule one axis over: an unreadable admin
-                                // flag must not preserve admin visibility,
-                                // which bypasses the filter entirely.
-                                is_admin = false;
-                                accessible_org_ids = Vec::new();
-                                tracing::warn!(
-                                    target: "talos_audit",
-                                    %user_id,
-                                    error = %e,
-                                    event_kind = "subscription_permission_unreadable",
-                                    "dlq_updates is_platform_admin refresh failed; NARROWING to own-events only until the next successful refresh"
-                                );
-                            }
-                        }
+                        let refreshed = refresh_dlq_permissions(&actor_repo, &db_pool, user_id).await;
+                        is_admin = refreshed.is_admin;
+                        accessible_org_ids = refreshed.accessible_org_ids;
                     }
                 }
             }

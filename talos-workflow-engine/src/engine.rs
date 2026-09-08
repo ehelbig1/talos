@@ -263,19 +263,27 @@ pub(crate) fn evict_stale_rate_limits() {
 pub(crate) fn ensure_rate_limit_eviction_task() {
     static SPAWN_GUARD: OnceLock<()> = OnceLock::new();
     SPAWN_GUARD.get_or_init(|| {
-        tokio::spawn(async {
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(
-                RATE_LIMIT_EVICTION_INTERVAL_SECS,
-            ));
-            // First tick fires immediately; skip it so the very first
-            // scan happens after one full interval rather than at
-            // task start (when the map is guaranteed near-empty).
-            tick.tick().await;
-            loop {
+        // Supervised for ATTRIBUTION only: no `break`, no shutdown arm,
+        // type `!`. A panic here stops rate-limit eviction for the
+        // process lifetime while `check_rate_limit` keeps answering, so
+        // naming the task is worth the one line even though the wrapper
+        // can never report a clean exit for it.
+        talos_task_supervision::spawn_supervised(
+            talos_task_supervision::BackgroundTask::EngineRateLimitEviction,
+            async {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(
+                    RATE_LIMIT_EVICTION_INTERVAL_SECS,
+                ));
+                // First tick fires immediately; skip it so the very first
+                // scan happens after one full interval rather than at
+                // task start (when the map is guaranteed near-empty).
                 tick.tick().await;
-                evict_stale_rate_limits();
-            }
-        });
+                loop {
+                    tick.tick().await;
+                    evict_stale_rate_limits();
+                }
+            },
+        );
     });
 }
 
@@ -2954,3 +2962,34 @@ impl ParallelWorkflowEngine {
 #[cfg(test)]
 #[path = "engine_tests.rs"]
 mod tests;
+
+/// **The wiring nothing else can see.** The module rate-limit eviction loop goes through
+/// `talos_task_supervision::spawn_supervised`; reverting that site to a
+/// bare `tokio::spawn` is behaviourally identical on a healthy process
+/// and completely silent on a dead one — no metric moves, no log line
+/// appears, and every operator surface keeps reporting the subsystem as
+/// configured. Structural lint check 58 cannot see it either: it asks
+/// whether a metric has an increment SITE, not whether anything reaches
+/// one.
+///
+/// No other spawn site exists in this file.
+///
+/// The counting rule lives in `talos_task_supervision` so the pins in
+/// the eight crates that carry one cannot drift; its stated limits
+/// (textual, per-file, blind to WHICH task is named) apply here.
+#[cfg(test)]
+mod task_supervision_pin {
+    #[test]
+    fn the_long_lived_loop_is_supervised() {
+        let (supervised, bare) =
+            talos_task_supervision::production_spawn_counts(include_str!("engine.rs"));
+        assert_eq!(
+            supervised, 1,
+            "The module rate-limit eviction loop must still go through spawn_supervised"
+        );
+        assert_eq!(
+            bare, 0,
+            "the set of deliberately-unsupervised one-shot spawns in this file changed"
+        );
+    }
+}

@@ -677,49 +677,7 @@ impl SchedulerService {
             DEFAULT_SCHEDULER_READINESS_MAX_HOLDS,
         );
 
-        let (holds, max_holds) =
-            match decide_hold(&self.consecutive_holds, &self.readiness_degraded, max_holds) {
-                // Already gave up; don't re-log or re-count every 15 s.
-                HoldDecision::AlreadyDegraded => return true,
-                HoldDecision::Hold { holds } => {
-                    if let Some(m) = talos_metrics::global() {
-                        m.scheduler_readiness_holds_total.inc();
-                    }
-                    tracing::warn!(
-                        target: "talos_scheduler",
-                        event_kind = "scheduler_dispatch_held_fleet_unready",
-                        holds,
-                        max_holds,
-                        "Scheduler: holding dispatch — the controller's NATS fleet heartbeat \
-                         view still contains no live worker. Due schedules are NOT advanced \
-                         and NOT lost; they fire as soon as a worker becomes visible."
-                    );
-                    return false;
-                }
-                HoldDecision::Degrade { holds } => (holds, max_holds),
-            };
-
-        if let Some(m) = talos_metrics::global() {
-            m.scheduler_readiness_degraded.set(1);
-        }
-        tracing::warn!(
-            target: "talos_scheduler",
-            event_kind = "scheduler_readiness_degraded",
-            holds,
-            max_holds,
-            "Scheduler: no worker has become visible after {max_holds} consecutive \
-             polls — dispatching WITHOUT fleet-readiness evidence until one is. A \
-             zero fleet view is ambiguous (empty fleet, a build too old to publish \
-             heartbeats, a broken subscription, or heartbeats disabled outright via \
-             TALOS_WORKER_HEARTBEAT_INTERVAL_SECS=0), and refusing forever would \
-             silently stop every scheduled workflow on a healthy fleet — which is \
-             worse than the boot herd this barrier prevents. Schedules will run; the \
-             startup-herd protection is weakened until heartbeats are seen, and \
-             re-arms by itself the moment one is. If this deployment publishes no \
-             heartbeats by design, set SCHEDULER_FLEET_READINESS_BARRIER=false \
-             rather than leaving a permanently-degraded gauge."
-        );
-        true
+        readiness_hold_or_degrade(&self.consecutive_holds, &self.readiness_degraded, max_holds)
     }
 
     /// Called on every poll that finds the fleet visible: clears the hold
@@ -749,18 +707,7 @@ impl SchedulerService {
     /// return to 1, so a flapping fleet produces at most one transition per
     /// several minutes.
     fn note_fleet_visible(&self) {
-        if clear_holds_and_rearm(&self.consecutive_holds, &self.readiness_degraded) {
-            if let Some(m) = talos_metrics::global() {
-                m.scheduler_readiness_degraded.set(0);
-            }
-            tracing::info!(
-                target: "talos_scheduler",
-                event_kind = "scheduler_readiness_rearmed",
-                "Scheduler: a worker is visible in the NATS fleet heartbeat view again \
-                 — the readiness barrier is back in force and \
-                 talos_scheduler_readiness_degraded has returned to 0."
-            );
-        }
+        readiness_note_fleet_visible(&self.consecutive_holds, &self.readiness_degraded);
     }
 
     /// Whether the fleet-readiness barrier is engaged at all.
@@ -1516,6 +1463,99 @@ fn clear_holds_and_rearm(
 
     consecutive_holds.store(0, Ordering::SeqCst);
     readiness_degraded.swap(false, Ordering::SeqCst)
+}
+
+/// The hold-or-degrade transition AND the two metric writes that publish
+/// it, in ONE function.
+///
+/// **Why the publish does not stay at the `&self` call site.** Package 25
+/// measured all three `scheduler_readiness_*` publish sites as MUTATION
+/// SURVIVORS: [`decide_hold`] is well tested and the wiring that publishes
+/// its verdict was not, so deleting an `.inc()` or a `.set()` left every
+/// test in the workspace green while the two series an alert fires on went
+/// permanently flat. `SchedulerService` needs a pool, a module registry, a
+/// secrets manager, a worker manager, a module-execution service and a NATS
+/// client to construct, so no unit test could reach the call site while the
+/// publish lived inside the method. Moving the DECISION and the PUBLISH into
+/// one free function over the production atomics makes the expression a test
+/// drives the expression the scheduler evaluates — check 58's stated wrapper
+/// limit answered by removing the wrapper rather than by testing it.
+///
+/// The `&self` method is now a one-line delegate. That call site is still
+/// unguarded by construction, and saying so matters: a mutation that deletes
+/// the delegate survives, exactly as checks 74b/79b state for their own call
+/// sites.
+///
+/// Returns `true` to proceed anyway (degraded), `false` to hold.
+fn readiness_hold_or_degrade(
+    consecutive_holds: &std::sync::atomic::AtomicUsize,
+    readiness_degraded: &std::sync::atomic::AtomicBool,
+    max_holds: usize,
+) -> bool {
+    let (holds, max_holds) = match decide_hold(consecutive_holds, readiness_degraded, max_holds) {
+        // Already gave up; don't re-log or re-count every 15 s.
+        HoldDecision::AlreadyDegraded => return true,
+        HoldDecision::Hold { holds } => {
+            if let Some(m) = talos_metrics::global() {
+                m.scheduler_readiness_holds_total.inc();
+            }
+            tracing::warn!(
+                target: "talos_scheduler",
+                event_kind = "scheduler_dispatch_held_fleet_unready",
+                holds,
+                max_holds,
+                "Scheduler: holding dispatch — the controller's NATS fleet heartbeat \
+                 view still contains no live worker. Due schedules are NOT advanced \
+                 and NOT lost; they fire as soon as a worker becomes visible."
+            );
+            return false;
+        }
+        HoldDecision::Degrade { holds } => (holds, max_holds),
+    };
+
+    if let Some(m) = talos_metrics::global() {
+        m.scheduler_readiness_degraded.set(1);
+    }
+    tracing::warn!(
+        target: "talos_scheduler",
+        event_kind = "scheduler_readiness_degraded",
+        holds,
+        max_holds,
+        "Scheduler: no worker has become visible after {max_holds} consecutive \
+         polls — dispatching WITHOUT fleet-readiness evidence until one is. A \
+         zero fleet view is ambiguous (empty fleet, a build too old to publish \
+         heartbeats, a broken subscription, or heartbeats disabled outright via \
+         TALOS_WORKER_HEARTBEAT_INTERVAL_SECS=0), and refusing forever would \
+         silently stop every scheduled workflow on a healthy fleet — which is \
+         worse than the boot herd this barrier prevents. Schedules will run; the \
+         startup-herd protection is weakened until heartbeats are seen, and \
+         re-arms by itself the moment one is. If this deployment publishes no \
+         heartbeats by design, set SCHEDULER_FLEET_READINESS_BARRIER=false \
+         rather than leaving a permanently-degraded gauge."
+    );
+    true
+}
+
+/// The re-arm transition AND the gauge write that publishes it. Same
+/// argument as [`readiness_hold_or_degrade`]: this is the THIRD of package
+/// 25's three measured survivors, and it is the one that returns the gauge
+/// an alert selects on to 0.
+fn readiness_note_fleet_visible(
+    consecutive_holds: &std::sync::atomic::AtomicUsize,
+    readiness_degraded: &std::sync::atomic::AtomicBool,
+) {
+    if clear_holds_and_rearm(consecutive_holds, readiness_degraded) {
+        if let Some(m) = talos_metrics::global() {
+            m.scheduler_readiness_degraded.set(0);
+        }
+        tracing::info!(
+            target: "talos_scheduler",
+            event_kind = "scheduler_readiness_rearmed",
+            "Scheduler: a worker is visible in the NATS fleet heartbeat view again \
+             — the readiness barrier is back in force and \
+             talos_scheduler_readiness_degraded has returned to 0."
+        );
+    }
 }
 
 /// Record one terminal scheduler dispatch outcome on
@@ -2395,13 +2435,37 @@ mod startup_herd_tests {
     /// terminal arms call — against a real registry and assert the series
     /// actually moves, for every (phase, outcome) pair.
     ///
-    /// This is the only test in the crate that installs the process-global
-    /// metrics registry (`set_global` is one-shot per process); keep it that
-    /// way or the others will silently observe each other's increments.
+    /// The process-global `TalosMetrics`, installing it on first use.
+    ///
+    /// `talos_metrics::set_global` is a one-shot `OnceLock`, so a test that
+    /// installs its OWN registry and then asserts against that local `Arc` is
+    /// correct only if it wins the race — every production site writes through
+    /// `talos_metrics::global()`. Returning the INSTALLED one makes the
+    /// assertions order-independent, and every caller must read DELTAS because
+    /// a sibling may have moved the same series first.
+    fn installed_test_metrics() -> std::sync::Arc<talos_metrics::TalosMetrics> {
+        if let Some(m) = talos_metrics::global() {
+            return m.clone();
+        }
+        let m = talos_metrics::TalosMetrics::new().expect("metrics registry");
+        talos_metrics::set_global(m);
+        talos_metrics::global()
+            .cloned()
+            .expect("a global registry is installed by now")
+    }
+
+    /// Goes through [`installed_test_metrics`], which is the ONE installer in
+    /// this crate. It used to install here directly, under a comment saying
+    /// "keep it that way or the others will silently observe each other's
+    /// increments" — and 2026-09-08's `the_readiness_publishers_move_the_series`
+    /// broke exactly that: `set_global` is one-shot, so whichever test won the
+    /// race installed ITS registry while the loser asserted against a local
+    /// `Arc` nothing writes to. The failure was a real flake under
+    /// `cargo test --workspace` and green on a re-run of this crate alone.
+    /// One accessor is a stronger rule than one installer.
     #[test]
     fn record_dispatch_moves_every_seeded_series() {
-        let m = talos_metrics::TalosMetrics::new().expect("metrics registry");
-        talos_metrics::set_global(m.clone());
+        let m = installed_test_metrics();
 
         for phase in talos_metrics::SCHEDULER_DISPATCH_PHASES {
             for outcome in talos_metrics::SCHEDULER_DISPATCH_OUTCOMES {
@@ -2743,6 +2807,96 @@ mod startup_herd_tests {
             super::decide_hold(&holds, &degraded, MAX),
             super::HoldDecision::Degrade { holds: MAX + 1 }
         );
+    }
+
+    /// **Leg B (2026-09-08): the three publish sites now MOVE the series.**
+    ///
+    /// Package 25 measured all three `scheduler_readiness_*` publish sites as
+    /// mutation SURVIVORS — `decide_hold` and `clear_holds_and_rearm` are
+    /// driven by `a_visible_fleet_rearms_the_barrier` directly above, and
+    /// deleting the `.inc()` / `.set(1)` / `.set(0)` beside them left every
+    /// test in the workspace green. That is check 58's stated wrapper limit
+    /// in its sharpest form: the counter HAS an increment site, and nothing
+    /// asked whether anything reaches it.
+    ///
+    /// This drives the REAL publishers — `readiness_hold_or_degrade` and
+    /// `readiness_note_fleet_visible`, the two functions
+    /// `SchedulerService::hold_or_degrade` / `::note_fleet_visible` now
+    /// delegate to in one line each — against a REAL `TalosMetrics`, and
+    /// asserts the series moved. All three mutations are red under it.
+    ///
+    /// DELTAS, never absolutes: `talos_metrics::set_global` is a process-wide
+    /// one-shot `OnceLock`, so a sibling test in this binary may already have
+    /// installed the registry and may already have moved this counter.
+    ///
+    /// **What it still cannot see**, stated rather than implied: the one-line
+    /// delegate inside each `&self` method. `SchedulerService` needs a pool, a
+    /// module registry, a secrets manager, a worker manager, a
+    /// module-execution service and a NATS client, so the method itself is
+    /// unreachable from a unit test — deleting the delegate is a survivor, and
+    /// the honest guard for it is the live read of the two series after
+    /// deploy.
+    #[test]
+    fn the_readiness_publishers_move_the_series() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+        let m = installed_test_metrics();
+
+        let holds = AtomicUsize::new(0);
+        let degraded = AtomicBool::new(false);
+        const MAX: usize = 2;
+
+        // (1) A HOLD increments talos_scheduler_readiness_holds_total.
+        let before = m.scheduler_readiness_holds_total.get();
+        assert!(
+            !super::readiness_hold_or_degrade(&holds, &degraded, MAX),
+            "under the bound the barrier must hold, not dispatch"
+        );
+        assert_eq!(
+            m.scheduler_readiness_holds_total.get() - before,
+            1.0,
+            "a held poll must move talos_scheduler_readiness_holds_total — the \
+             alert on it reconciles against the boot backlog, and a flat series \
+             reads as 'the barrier never held'"
+        );
+
+        // (2) Crossing the bound sets talos_scheduler_readiness_degraded to 1.
+        assert!(!super::readiness_hold_or_degrade(&holds, &degraded, MAX));
+        assert!(
+            super::readiness_hold_or_degrade(&holds, &degraded, MAX),
+            "past the bound the barrier gives up and dispatches"
+        );
+        assert_eq!(
+            m.scheduler_readiness_degraded.get(),
+            1,
+            "giving up must be visible on the gauge TalosSchedulerReadinessDegraded \
+             selects on"
+        );
+
+        // An already-degraded poll must not re-count — the 15 s cadence would
+        // otherwise inflate the holds counter forever.
+        let before_repeat = m.scheduler_readiness_holds_total.get();
+        assert!(super::readiness_hold_or_degrade(&holds, &degraded, MAX));
+        assert_eq!(
+            m.scheduler_readiness_holds_total.get(),
+            before_repeat,
+            "an already-degraded barrier must not re-count every poll"
+        );
+
+        // (3) A visible fleet returns the gauge to 0.
+        super::readiness_note_fleet_visible(&holds, &degraded);
+        assert_eq!(
+            m.scheduler_readiness_degraded.get(),
+            0,
+            "re-arming must publish 0 — a red that cannot go green teaches \
+             operators to ignore red, which is the defect the re-arm exists to \
+             remove"
+        );
+
+        // Re-arming from a healthy state publishes nothing new and must not
+        // panic; the gauge stays 0.
+        super::readiness_note_fleet_visible(&holds, &degraded);
+        assert_eq!(m.scheduler_readiness_degraded.get(), 0);
     }
 
     /// FIX 3's guard: `talos_scheduler_dispatches_total` is documented as a

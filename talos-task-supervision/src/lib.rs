@@ -15,10 +15,24 @@
 //! **That 54 was a SCOPE, not a population.** Re-measured 2026-09-08
 //! over `talos-*/src` + `worker/src` as well: **127** further bare
 //! `tokio::spawn` call sites, **32** of them long-lived loops, in 34
-//! crates the first pass never looked at. Seven of those loops are
-//! supervised here as of this date; the rest are inventoried in
-//! `scripts/background-task-inventory.py` and in that day's
-//! `AGENT_NOTES.md`.
+//! crates the first pass never looked at. Seven of those loops were
+//! supervised in the first pass of that day.
+//!
+//! Later the same day the remaining 28 `loop` rows were classified BY
+//! READING each body. **Eleven more** are supervised — eight with a
+//! real exit path (a `select!` shutdown arm, or a `Notify`-driven
+//! flush-and-break) and three pure `loop { tick; f() }` tickers admitted
+//! for panic ATTRIBUTION at one line each — bringing the library-crate
+//! total to **18**. Of the 17 rows the walk still reports, **13 are
+//! false positives of its 60-line window** (startup one-shots,
+//! per-connection and per-execution tasks, a test-only file, a demo
+//! binary, and `talos-jobs`' `start_processor`, which has zero callers
+//! workspace-wide) and **4 are real, all in the WORKER**, all pure
+//! tickers. Those four are NOT supervised, and the reason is measured:
+//! `BackgroundTask::ALL` is what the CONTROLLER pre-seeds, so a
+//! worker-side variant costs a process partition of this table rather
+//! than one line. The full per-site classification is in
+//! `scripts/background-task-inventory.py`'s docstring.
 //!
 //! # The two instruments answer different questions
 //!
@@ -169,6 +183,33 @@ background_tasks! {
     DatabaseRpcSubscriber       => "database_rpc_subscriber",
     StateWriteRpcSubscriber     => "state_write_rpc_subscriber",
     IntegrationStateRpcSubscriber => "integration_state_rpc_subscriber",
+
+    // ── 2026-09-08 (package thirty): the remaining LIBRARY-crate loops.
+    //
+    // Classified by READING each body, not by a windowed scan. The
+    // eight below all have an exit the compiler can now name — seven a
+    // `select!` shutdown arm, one a `Notify`-driven flush-and-break —
+    // which is the shape `spawn_supervised` exists for: they can stop
+    // WITHOUT panicking, and until now that stop was invisible.
+    BcryptCacheRevocationSweep  => "bcrypt_cache_revocation_sweep",
+    MemoryConsolidationScheduler => "memory_consolidation_scheduler",
+    MemoryReflectionScheduler   => "memory_reflection_scheduler",
+    RankTrainingScheduler       => "rank_training_scheduler",
+    MlDisagreementDigest        => "ml_disagreement_digest",
+    MlPolicyEvaluator           => "ml_policy_evaluator",
+    MlTeacherAudit              => "ml_teacher_audit",
+    DlqBatchProcessor           => "dlq_batch_processor",
+
+    // The three below are `loop { tick; f() }` with NO exit path at
+    // all: they cannot stop cleanly, so supervision buys per-task
+    // ATTRIBUTION of a panic the process hook already counts, and
+    // nothing else. Stated plainly rather than sold as closing a
+    // silent-death gap — see the crate docs. Each cost exactly one
+    // line at the call site (the `loop` has type `!`, which coerces),
+    // which is the bar they were admitted on.
+    ActorPolicyCacheSweep       => "actor_policy_cache_sweep",
+    PublicUrlDiscovery          => "public_url_discovery",
+    EngineRateLimitEviction     => "engine_rate_limit_eviction",
 }
 
 /// Why a supervised body stopped running.
@@ -500,6 +541,50 @@ fn record_join_failure(task: BackgroundTask, outcome: &'static str) {
         outcome = outcome,
         "a long-lived background task stopped; it will not be restarted"
     );
+}
+
+/// Count the supervised and BARE `tokio::spawn` sites in one source
+/// file's PRODUCTION text, so a crate that owns a supervised loop can
+/// pin its own wiring in five lines.
+///
+/// **Why this exists at all.** A supervised spawn site reverted to a
+/// bare `tokio::spawn` is behaviourally identical on a healthy process
+/// and silent on a dead one — no test, no metric and no log can see it,
+/// which is exactly what `task_supervision_wiring_tests` pins for
+/// `controller/src/bootstrap/background.rs` and
+/// `the_two_fleet_loops_are_supervised_not_their_launcher` pins for
+/// `talos-worker-fleet`. From 2026-09-08 eleven more loops in eight
+/// LIBRARY crates go through the wrapper, and each needs the same pin.
+/// The COUNTING RULE lives here so eight copies of it cannot drift; the
+/// ASSERTION stays in the crate that owns the file, because only that
+/// crate knows how many of each its file should have.
+///
+/// Everything from the first column-0 `#[cfg(test)]` onward is dropped —
+/// otherwise a pin's own prose, which necessarily quotes both
+/// expressions, counts itself (check 73's self-report trap). Whole-line
+/// `//` comments are dropped from the bare count for the same reason.
+///
+/// **Stated limits**, so nobody reads more into a green pin than it
+/// carries: this is TEXTUAL and per-FILE. It cannot say whether a site
+/// wraps the RIGHT future or names the right [`BackgroundTask`], it
+/// cannot see a loop moved to another file, and a `#[cfg(test)]`
+/// attribute that is indented rather than at column 0 leaves test text
+/// in the haystack (a false POSITIVE — the loud direction).
+#[must_use]
+pub fn production_spawn_counts(src: &str) -> (usize, usize) {
+    let production = src.split("\n#[cfg(test)]").next().unwrap_or(src);
+    let supervised = production
+        .matches("spawn_supervised(")
+        .count()
+        .saturating_sub(production.matches("fn spawn_supervised(").count());
+    let bare = production
+        .lines()
+        .filter(|l| {
+            let t = l.trim_start();
+            !t.starts_with("//") && t.contains("tokio::spawn(")
+        })
+        .count();
+    (supervised, bare)
 }
 
 /// Test-only read of the panic counter for this process.

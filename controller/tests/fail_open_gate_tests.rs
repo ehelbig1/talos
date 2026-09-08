@@ -415,3 +415,122 @@ async fn execution_cost_reports_unknown_rather_than_zero_when_the_fuel_read_fail
         "the fields that WERE measured are untouched: {body}"
     );
 }
+
+// ───────────────────────────────────────────────────────────────────────────
+// The THIRD shape: a periodic permission refresh on a live subscription.
+//
+// #779 fixed `dlq_updates` to NARROW rather than KEEP the prior permission set
+// when a refresh read fails, and recorded the fix as untested — the decision
+// lived inside an `async_stream::stream!` body in a GraphQL resolver that
+// needs a schema, a broadcast channel and a live subscription to reach. It is
+// now `talos_api::schema::subscriptions::refresh_dlq_permissions`, and these
+// drive it against a real database with the relation each read names removed.
+//
+// The direction matters more here than in the two gates above. A DLQ payload
+// is DLP-scrubbed but still tenant-scoped, and the refresh exists ONLY to
+// notice a revocation: preserving the prior set on a failed read is the one
+// outcome that defeats it, and it does so for as long as the read keeps
+// failing. Both CONTROLS run in the same binary — a healthy non-admin keeps
+// its real org list, a healthy admin still bypasses the filter — because
+// "the refresh returned nothing" is not evidence on its own.
+// ───────────────────────────────────────────────────────────────────────────
+
+/// Provision one org OWNED by `user_id` through the PRODUCTION service, which
+/// inserts the owner's `organization_members` row itself — the Testing
+/// Conventions rule, and the one a hand-rolled INSERT here drifted from
+/// before it was applied (`created_at` is spelled `joined_at` on that table).
+async fn seed_org_membership(pool: &sqlx::PgPool, user_id: Uuid) -> Uuid {
+    let slug = format!("p30-{}", Uuid::new_v4().simple());
+    let org = talos_organizations::OrganizationService::create_org(pool, "p30 org", &slug, user_id)
+        .await
+        .expect("seed org through the production service");
+    org.id
+}
+
+#[tokio::test]
+async fn an_unreadable_org_membership_narrows_to_own_events_only() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let user_id = seed_user(&pool).await;
+    let org_id = seed_org_membership(&pool, user_id).await;
+    let actor_repo = talos_actor_repository::ActorRepository::new(pool.clone());
+
+    // CONTROL: a healthy read returns the org the user really belongs to.
+    let healthy =
+        talos_api::schema::subscriptions::refresh_dlq_permissions(&actor_repo, &pool, user_id)
+            .await;
+    assert!(!healthy.is_admin);
+    assert_eq!(
+        healthy.accessible_org_ids,
+        vec![org_id],
+        "a healthy refresh must return the subscriber's real org list, or the \
+         degraded case below proves nothing"
+    );
+
+    // Now the membership read cannot answer.
+    sqlx::query("DROP TABLE organization_members CASCADE")
+        .execute(&pool)
+        .await
+        .expect("drop membership relation");
+
+    let degraded =
+        talos_api::schema::subscriptions::refresh_dlq_permissions(&actor_repo, &pool, user_id)
+            .await;
+    assert!(
+        !degraded.is_admin,
+        "an unreadable membership must not promote the subscriber"
+    );
+    assert!(
+        degraded.accessible_org_ids.is_empty(),
+        "an unreadable membership refresh must NARROW to own-events-only. \
+         Keeping the prior set is the one outcome that defeats a refresh whose \
+         entire purpose is to notice a revocation: the subscriber goes on \
+         receiving another org's DLQ events for as long as the read keeps \
+         failing. Got: {:?}",
+        degraded.accessible_org_ids
+    );
+}
+
+#[tokio::test]
+async fn an_unreadable_admin_flag_does_not_preserve_admin_visibility() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let user_id = seed_user(&pool).await;
+    let org_id = seed_org_membership(&pool, user_id).await;
+    sqlx::query("UPDATE users SET is_platform_admin = true WHERE id = $1")
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("promote");
+    let actor_repo = talos_actor_repository::ActorRepository::new(pool.clone());
+
+    // CONTROL: a real admin bypasses the filter, and the org list is cleared
+    // deliberately so a later demotion forces a re-fetch.
+    let healthy =
+        talos_api::schema::subscriptions::refresh_dlq_permissions(&actor_repo, &pool, user_id)
+            .await;
+    assert!(healthy.is_admin, "a real platform admin must read as admin");
+    assert!(
+        healthy.accessible_org_ids.is_empty(),
+        "an admin bypasses the tenant filter, so the org list is deliberately \
+         cleared (a demotion then forces a re-fetch) — {org_id} must not linger"
+    );
+
+    // Now the admin read cannot answer.
+    sqlx::query("ALTER TABLE users RENAME COLUMN is_platform_admin TO is_platform_admin_gone")
+        .execute(&pool)
+        .await
+        .expect("rename admin column");
+
+    let degraded =
+        talos_api::schema::subscriptions::refresh_dlq_permissions(&actor_repo, &pool, user_id)
+            .await;
+    assert!(
+        !degraded.is_admin,
+        "an unreadable admin flag must NOT preserve admin visibility — that \
+         bypasses the tenant filter entirely, which is the widest possible \
+         reading of a read that did not answer"
+    );
+    assert!(
+        degraded.accessible_org_ids.is_empty(),
+        "and it must narrow the org list in the same breath"
+    );
+}

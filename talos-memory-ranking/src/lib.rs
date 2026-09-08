@@ -237,29 +237,34 @@ pub fn spawn_rank_training_scheduler(
     }
 
     let interval_secs = talos_config::adaptive_rank_training_interval_secs();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        tracing::info!(
-            target: "talos_memory_ranking",
-            interval_secs,
-            "adaptive rank training scheduler active"
-        );
-        loop {
-            tokio::select! {
-                biased;
-                _ = shutdown_rx.changed() => {
-                    tracing::info!(target: "talos_memory_ranking", "adaptive rank training scheduler shutting down");
-                    break;
-                }
-                _ = interval.tick() => {
-                    if let Err(e) = run_rank_training_tick(&pool, &actor_repo).await {
-                        tracing::warn!(target: "talos_memory_ranking", error = %e, "rank training tick failed; retrying next interval");
+    // Supervised: the shutdown arm `break`s, so a clean stop is real and
+    // was previously invisible.
+    talos_task_supervision::spawn_supervised(
+        talos_task_supervision::BackgroundTask::RankTrainingScheduler,
+        async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tracing::info!(
+                target: "talos_memory_ranking",
+                interval_secs,
+                "adaptive rank training scheduler active"
+            );
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx.changed() => {
+                        tracing::info!(target: "talos_memory_ranking", "adaptive rank training scheduler shutting down");
+                        break talos_task_supervision::TaskExit::ShuttingDown;
+                    }
+                    _ = interval.tick() => {
+                        if let Err(e) = run_rank_training_tick(&pool, &actor_repo).await {
+                            tracing::warn!(target: "talos_memory_ranking", error = %e, "rank training tick failed; retrying next interval");
+                        }
                     }
                 }
             }
-        }
-    });
+        },
+    );
 }
 
 /// One training pass over the fleet. Scans up to
@@ -521,5 +526,36 @@ mod serving_cache_tests {
             "None must round-trip through the cache (fresh entry, value == None)"
         );
         invalidate_serving_weights(actor);
+    }
+}
+
+/// **The wiring nothing else can see.** The adaptive rank-training scheduler goes through
+/// `talos_task_supervision::spawn_supervised`; reverting that site to a
+/// bare `tokio::spawn` is behaviourally identical on a healthy process
+/// and completely silent on a dead one — no metric moves, no log line
+/// appears, and every operator surface keeps reporting the subsystem as
+/// configured. Structural lint check 58 cannot see it either: it asks
+/// whether a metric has an increment SITE, not whether anything reaches
+/// one.
+///
+/// No other spawn site exists in this crate.
+///
+/// The counting rule lives in `talos_task_supervision` so the pins in
+/// the eight crates that carry one cannot drift; its stated limits
+/// (textual, per-file, blind to WHICH task is named) apply here.
+#[cfg(test)]
+mod task_supervision_pin {
+    #[test]
+    fn the_long_lived_loop_is_supervised() {
+        let (supervised, bare) =
+            talos_task_supervision::production_spawn_counts(include_str!("lib.rs"));
+        assert_eq!(
+            supervised, 1,
+            "The adaptive rank-training scheduler must still go through spawn_supervised"
+        );
+        assert_eq!(
+            bare, 0,
+            "the set of deliberately-unsupervised one-shot spawns in this file changed"
+        );
     }
 }

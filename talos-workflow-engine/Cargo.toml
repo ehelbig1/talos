@@ -12,6 +12,12 @@ repository = "https://github.com/aegix-dev/talos-workflow-engine"
 homepage = "https://github.com/aegix-dev/talos-workflow-engine"
 
 [dependencies]
+# The supervision wrapper for the module rate-limit eviction loop (a pure
+# ticker: attribution only — see the call site). `version` is load-bearing
+# for the same reason it is on `talos-workflow-liveness` below: this crate
+# is PUBLISHABLE, and cargo-deny's `wildcard` rule rejects a versionless
+# path dep on a public crate.
+talos-task-supervision = { path = "../talos-task-supervision", version = "0.1.0" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core", version = "0.3", default-features = false }
 # The ONE home for the `workflows.status` / `is_enabled` pair — the narrow
 # dispatch gate reads `not_retired_sql` / `is_not_retired` from here. `version`

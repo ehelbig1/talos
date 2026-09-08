@@ -272,31 +272,38 @@ pub fn spawn_memory_consolidation_scheduler(
     }
 
     let interval_secs = talos_config::memory_consolidation_interval_secs();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        tracing::info!(
-            target: "talos_memory_consolidation",
-            interval_secs,
-            ollama_configured = ollama.is_some(),
-            tier1_local_ok = talos_config::memory_consolidation_tier1_local_ok(),
-            "memory consolidation scheduler active"
-        );
-        loop {
-            tokio::select! {
-                biased;
-                _ = shutdown_rx.changed() => {
-                    tracing::info!(target: "talos_memory_consolidation", "memory consolidation scheduler shutting down");
-                    break;
-                }
-                _ = interval.tick() => {
-                    if let Err(e) = run_consolidation_tick(&pool, &actor_repo, ollama.as_ref(), &secrets_manager).await {
-                        tracing::warn!(target: "talos_memory_consolidation", error = %e, "consolidation tick failed; retrying next interval");
+    // Supervised: the shutdown arm below `break`s, so this loop CAN stop
+    // cleanly. The config gate above stays where it is — when
+    // consolidation is disabled nothing is spawned, which the INFO line
+    // there already says.
+    talos_task_supervision::spawn_supervised(
+        talos_task_supervision::BackgroundTask::MemoryConsolidationScheduler,
+        async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tracing::info!(
+                target: "talos_memory_consolidation",
+                interval_secs,
+                ollama_configured = ollama.is_some(),
+                tier1_local_ok = talos_config::memory_consolidation_tier1_local_ok(),
+                "memory consolidation scheduler active"
+            );
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx.changed() => {
+                        tracing::info!(target: "talos_memory_consolidation", "memory consolidation scheduler shutting down");
+                        break talos_task_supervision::TaskExit::ShuttingDown;
+                    }
+                    _ = interval.tick() => {
+                        if let Err(e) = run_consolidation_tick(&pool, &actor_repo, ollama.as_ref(), &secrets_manager).await {
+                            tracing::warn!(target: "talos_memory_consolidation", error = %e, "consolidation tick failed; retrying next interval");
+                        }
                     }
                 }
             }
-        }
-    });
+        },
+    );
 }
 
 /// One consolidation pass over the fleet. Scans up to
@@ -807,31 +814,36 @@ pub fn spawn_memory_reflection_scheduler(
     }
 
     let interval_secs = talos_config::memory_reflection_interval_secs();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        tracing::info!(
-            target: "talos_memory_reflection",
-            interval_secs,
-            ollama_configured = ollama.is_some(),
-            tier1_local_ok = talos_config::memory_reflection_tier1_local_ok(),
-            "memory reflection scheduler active"
-        );
-        loop {
-            tokio::select! {
-                biased;
-                _ = shutdown_rx.changed() => {
-                    tracing::info!(target: "talos_memory_reflection", "memory reflection scheduler shutting down");
-                    break;
-                }
-                _ = interval.tick() => {
-                    if let Err(e) = run_reflection_tick(&pool, &actor_repo, ollama.as_ref(), &secrets_manager).await {
-                        tracing::warn!(target: "talos_memory_reflection", error = %e, "reflection tick failed; retrying next interval");
+    // Supervised — same shape and same reason as the consolidation
+    // scheduler above.
+    talos_task_supervision::spawn_supervised(
+        talos_task_supervision::BackgroundTask::MemoryReflectionScheduler,
+        async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            tracing::info!(
+                target: "talos_memory_reflection",
+                interval_secs,
+                ollama_configured = ollama.is_some(),
+                tier1_local_ok = talos_config::memory_reflection_tier1_local_ok(),
+                "memory reflection scheduler active"
+            );
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx.changed() => {
+                        tracing::info!(target: "talos_memory_reflection", "memory reflection scheduler shutting down");
+                        break talos_task_supervision::TaskExit::ShuttingDown;
+                    }
+                    _ = interval.tick() => {
+                        if let Err(e) = run_reflection_tick(&pool, &actor_repo, ollama.as_ref(), &secrets_manager).await {
+                            tracing::warn!(target: "talos_memory_reflection", error = %e, "reflection tick failed; retrying next interval");
+                        }
                     }
                 }
             }
-        }
-    });
+        },
+    );
 }
 
 /// One reflection pass over the fleet. Scans up to `max_actors_per_tick` active
@@ -1722,5 +1734,36 @@ mod tests {
     fn reflection_key_is_stable_latest() {
         // The single-latest overwrite key must not drift.
         assert_eq!(REFLECTION_KEY, "reflection/latest");
+    }
+}
+
+/// **The wiring nothing else can see.** The consolidation and reflection schedulers goes through
+/// `talos_task_supervision::spawn_supervised`; reverting that site to a
+/// bare `tokio::spawn` is behaviourally identical on a healthy process
+/// and completely silent on a dead one — no metric moves, no log line
+/// appears, and every operator surface keeps reporting the subsystem as
+/// configured. Structural lint check 58 cannot see it either: it asks
+/// whether a metric has an increment SITE, not whether anything reaches
+/// one.
+///
+/// Both have a `select!` shutdown arm, so both can stop cleanly.
+///
+/// The counting rule lives in `talos_task_supervision` so the pins in
+/// the eight crates that carry one cannot drift; its stated limits
+/// (textual, per-file, blind to WHICH task is named) apply here.
+#[cfg(test)]
+mod task_supervision_pin {
+    #[test]
+    fn the_long_lived_loop_is_supervised() {
+        let (supervised, bare) =
+            talos_task_supervision::production_spawn_counts(include_str!("lib.rs"));
+        assert_eq!(
+            supervised, 2,
+            "The consolidation and reflection schedulers must still go through spawn_supervised"
+        );
+        assert_eq!(
+            bare, 0,
+            "the set of deliberately-unsupervised one-shot spawns in this file changed"
+        );
     }
 }

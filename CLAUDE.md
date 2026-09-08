@@ -2894,7 +2894,8 @@ leaf crate `talos-task-supervision`.
   truncated on a char boundary, and the counter is constructed before the hook
   is installed.
 * `spawn_supervised(BackgroundTask, fut)` — applied at **41 of the 54**
-  controller sites plus **7 loops inside library crates** (2026-09-08; it was
+  controller sites plus **18 loops inside library crates** (7 in the first
+  2026-09-08 pass, 11 more in the second — see the sub-section below; it was
   42 controller sites, one of which was a launcher — see below), and it sees
   the shape a panic hook structurally CANNOT: **a clean exit.** A
   loop that `break`s, or whose `while let Some(_) = rx.recv().await` ends
@@ -3060,7 +3061,10 @@ contributes nothing — on a fleet with that flag off it would be a SECOND
 The worker's `/metrics` loses all 126 exit series and keeps
 `talos_task_panics_total{process="worker"} 0`.
 
-**What was NOT done, with the reason.** 28 long-lived library-crate loops
+**What was NOT done, with the reason** — SUPERSEDED the same day by the
+sub-section below, which classified all 28 by reading them and supervised
+eleven; the paragraph is kept because its LINT reasoning still stands.
+28 long-lived library-crate loops
 remain unsupervised, including six with no shutdown arm at all
 (`talos-actor-policies`' policy-cache sweeper, `talos-worker-runtime`'s epoch
 ticker and circuit-breaker cleanup, `talos-workflow-engine`'s rate-limit
@@ -3074,6 +3078,118 @@ one-shot textually (the inventory's 60-line window misclassifies in both
 directions, and it reads 4 loop-shaped bare spawns in `background.rs` that the
 wiring test correctly calls one-shots), so it would ship at 28 markers on
 correct code. The in-file count pins are stronger and cost no check number.
+
+### 2026-09-08 (second pass) — the loops the wrapper still could not see, classified by reading them
+
+The entry above supervised the loops whose LAUNCHER the controller was
+already wrapping and recorded "28 long-lived library-crate loops remain
+unsupervised" as a remainder. That 28 was the inventory's WINDOW count, not
+a population: classifying every one of them by reading the body gives a very
+different answer, and the difference is the whole point of this pass.
+
+**Classification of the 28, by shape rather than by window.**
+
+| shape | n | verdict |
+|---|---|---|
+| (b)/(c)/(d) — a real exit path (`select!` shutdown arm, or a `Notify`-driven flush-and-break) | 8 | SUPERVISED |
+| (a) — pure `loop { tick; f() }`, no exit path, CONTROLLER process | 3 | SUPERVISED for panic attribution only |
+| (a) — pure ticker, WORKER process | 4 | recorded, NOT supervised |
+| dead code (`talos-jobs::start_processor`, zero callers) | 1 | recorded, NOT supervised |
+| window false positives (startup one-shots, per-connection, per-execution, a test-only file, a demo binary) | 12 | not loops |
+
+**The eight with a real exit path are the ones this instrument exists for**,
+and they are supervised: `bcrypt_cache_revocation_sweep` (the sweep that
+bounds the MCP bearer-token revocation window),
+`memory_consolidation_scheduler`, `memory_reflection_scheduler`,
+`rank_training_scheduler`, `ml_disagreement_digest`, `ml_policy_evaluator`,
+`ml_teacher_audit` and `dlq_batch_processor` — the last of which is the
+sharpest: its `Notify` arm flushes the in-memory batch and `break`s, so a
+premature stop leaves every later DLQ write dropped at the channel with no
+signal anywhere. Each `break` is now `break TaskExit::ShuttingDown`, so the
+compiler named the exit rather than a grep.
+
+**The three controller-side pure tickers are supervised for ATTRIBUTION and
+nothing else, and saying so is the point.** `actor_policy_cache_sweep`,
+`public_url_discovery` and `engine_rate_limit_eviction` have no `break` and
+no shutdown arm; their bodies have type `!`, they cannot exit cleanly, and
+the only death they can have is a panic the process-wide hook ALREADY
+counts. What the wrapper adds is a `task` label instead of
+`tokio-runtime-worker`. That is worth exactly the one line it cost — the bar
+the brief set — and it must not be read as closing a silent-death gap those
+three do not have.
+
+**The four remaining real loops are all in the WORKER and are NOT
+supervised**: `talos-worker-runtime`'s circuit-breaker cleanup
+(`circuit_breaker.rs:325`) and epoch ticker (`runtime.rs:71`), the
+job-idempotency sweep (`worker/src/main.rs:2407`) and the metrics-server
+rate-limiter cleanup (`metrics_server.rs:199`). All four are pure tickers,
+so the same attribution-only argument applies — but the COST is different
+and that is the deciding fact: `BackgroundTask::ALL` is what the CONTROLLER
+pre-seeds, so a worker-side variant seeds five controller series nothing
+there can increment, which is the exact defect the worker's
+`register_metrics(.., &[])` argument was added on 2026-09-08 to remove.
+Supervising them costs a PROCESS PARTITION of the shared enum, not one
+line. The epoch ticker costs more again: it returns a `JoinHandle` that four
+`worker/tests/kill_switch_tests.rs` cases `abort()`, and `spawn_supervised`
+hands back the OUTER handle — aborting that does not stop the inner task, so
+the wrapper would silently leak a ticker per test.
+
+**`talos-jobs::start_processor` has a correct shutdown arm and zero callers
+workspace-wide** — `grep -rn start_processor --include=*.rs` returns its own
+definition and nothing else, and its `process_next_job` is a stub returning
+`Ok(())`. Supervising dead code seeds five series nothing can increment,
+which is check 58's rule read the other way, so it is recorded rather than
+wrapped. The other twelve are the window's false positives and are
+enumerated with their reasons in
+`scripts/background-task-inventory.py`'s docstring, so the next reader
+classifies none of them twice: three startup one-shots plus the
+deliberately-bare fleet launcher in `background.rs`, the PER-EXECUTION
+epoch-fence heartbeat in `talos-engine/src/fence.rs` (supervising it would
+record one exit per workflow run), two per-SSE-connection tasks, one
+per-stream SSE reader, a test-only file the `#[cfg(test)]` strip cannot see,
+and a hand-run demo binary.
+
+**The pins.** `talos-worker-fleet`'s in-crate pin covers its two loops and
+`task_supervision_wiring_tests` covers `background.rs`; neither can see any
+of the eleven new sites, and re-baring one is behaviourally identical on a
+healthy process. Each of the ten touched files now carries a
+`task_supervision_pin` module asserting its own supervised and bare spawn
+counts. The COUNTING RULE has one home —
+`talos_task_supervision::production_spawn_counts`, which strips everything
+from the first column-0 `#[cfg(test)]` so a pin's own prose cannot vouch for
+a deleted call (check 73's self-report trap) — while the ASSERTION stays in
+the crate that owns the file, because only that crate knows how many of each
+it should have. Stated limits, inherited by all ten: TEXTUAL and per-FILE,
+so it cannot say whether a site wraps the RIGHT future or names the right
+`BackgroundTask`, and it cannot see a loop moved to another file.
+
+**Expected live state on this fleet after deploy**, so it can be read rather
+than assumed. **Zero** `event_kind="background_task_exited"` ERROR lines on
+a healthy boot, and zero increments at `outcome!~"declined|shutdown"` — the
+2026-09-08 first-pass expectation is unchanged, because every one of the
+eleven new bodies either runs forever or stops only on the shutdown watch.
+`talos_background_task_exits_total` gains 55 pre-seeded series on the
+CONTROLLER (11 tasks × 5 outcomes) and **none on the worker**, which still
+passes `&[]`. Three of the eleven are config-gated ABOVE their spawn and
+their series therefore sit at 0 on a deployment that has not enabled them —
+`memory_consolidation_scheduler` / `memory_reflection_scheduler`
+(`ENABLE_MEMORY_CONSOLIDATION`), `rank_training_scheduler`
+(`ENABLE_ADAPTIVE_RANK_TRAINING`) and `public_url_discovery`
+(`TALOS_NGROK_API_URL`). That is NOT check 58's defect: this process can
+leave that state by configuration, unlike a `{process="worker"}` label on a
+controller. The gate was deliberately left ABOVE the spawn rather than moved
+inside the body to manufacture a `Declined` — each already logs an INFO
+saying it was not spawned, and moving it would be a behaviour change bought
+for a nicer-looking series.
+
+**No lint was added and `--count` stays 88.** The candidate is the one the
+entry above already measured and rejected — "a long-lived `tokio::spawn`
+must go through `spawn_supervised`" — and this pass makes the rejection
+sharper rather than weaker: of the 28 rows the 60-line window called loops,
+**13 were false positives (46%)**, so a lint on that signal would ship at
+thirteen markers on correct code and would still miss a loop whose `loop {`
+sits past the window. The per-file count pins are stronger, cost no check
+number, and were mutation-proved (see below).
 
 ### The scheduler refusal counter: six survivors, not one
 
@@ -3103,7 +3219,7 @@ tree, because the function's own DEFINITION sits inside the scanned region.
 build+test cycles and was not attempted. What WAS measured, in the same crate
 and therefore cheap: all three `scheduler_readiness_*` publish sites SURVIVE
 their own deletion — the pure `decide_hold` is well tested, the wiring that
-publishes it is not. The cheap substitute ("does any file referencing the
+publishes it is not. **CLOSED 2026-09-08 — see the sub-section below.** The cheap substitute ("does any file referencing the
 collector contain an assertion") was built and REJECTED: it answers yes for 28
 of 29, i.e. it only proves the file has tests somewhere. A grep cannot answer
 "would deleting this call site turn a test red"; only mutation can.
@@ -3116,6 +3232,81 @@ window in the inventory script misclassifies three of 45 in both directions) —
 the in-file count test is stronger and costs no check number. "Every
 `BackgroundTask` must be pre-seeded" is not expressible as a defect: the enum
 and the seed list come from one macro table.
+
+### 2026-09-08 — the three publish sites that survived their own deletion, and one narrowing nothing drove
+
+Two entries above recorded MEASURED SURVIVORS and left them: all three
+`scheduler_readiness_*` publish sites, and `dlq_updates`' permission
+narrowing. Both are the same shape one level under check 58's stated wrapper
+limit — the counter HAS an increment site and nothing asked whether anything
+reaches it — and both are closed by moving the DECISION and the PUBLISH into
+one function a test can drive, rather than by testing a wrapper.
+
+**The scheduler readiness barrier.** `decide_hold` and `clear_holds_and_rearm`
+are pure and well tested; the `.inc()` / `.set(1)` / `.set(0)` beside them sat
+in `SchedulerService::hold_or_degrade` and `::note_fleet_visible`, which need a
+pool, a module registry, a secrets manager, a worker manager, a
+module-execution service and a NATS client to reach — so no unit test could
+touch them and all three deletions were green. The transition AND its publish
+now live in the free `readiness_hold_or_degrade` /
+`readiness_note_fleet_visible` over the production atomics, and the two `&self`
+methods are one-line delegates.
+`the_readiness_publishers_move_the_series` installs a REAL `TalosMetrics` and
+asserts on DELTAS (`set_global` is a process-wide one-shot `OnceLock`) that a
+hold moves `talos_scheduler_readiness_holds_total`, that crossing the bound
+sets `talos_scheduler_readiness_degraded` to 1, that an already-degraded poll
+does NOT re-count, and that a visible fleet returns the gauge to 0. **All three
+previously-surviving mutations are red under it.** The residual is stated
+rather than implied: the one-line delegate inside each method is still
+unreachable from a unit test, so deleting IT survives — the same call-site
+limit checks 74b/79b state as their own, and the honest guard is the live read
+of the two series after deploy.
+
+**A flake this change INTRODUCED and closed, recorded because it was measured
+rather than reasoned.** The first version of that test called
+`talos_metrics::set_global` itself, and the sibling
+`record_dispatch_moves_every_seeded_series` already did — under a comment
+saying *"This is the only test in the crate that installs the process-global
+metrics registry … keep it that way"*. `set_global` is a one-shot `OnceLock`,
+so whichever test won the race installed ITS registry while the loser asserted
+against a local `Arc` no production site writes to: one failure under
+`cargo test --workspace`, green on every re-run of the crate alone. Both tests
+now go through `installed_test_metrics()`, which RETURNS the installed global
+and installs only if there is none — one ACCESSOR is a stronger rule than one
+installer, and it is the rule a third such test will inherit for free.
+
+**`dlq_updates`' permission refresh.** #779 made an unreadable refresh NARROW
+to own-events-only rather than KEEP the prior set — the one outcome that
+defeats a refresh whose entire purpose is to notice a revocation — and recorded
+it as untested, because the decision lived inside an `async_stream::stream!`
+body in a GraphQL resolver needing a schema, a broadcast channel and a live
+subscription. It is now
+`talos_api::schema::subscriptions::refresh_dlq_permissions`, which performs
+both reads and returns the narrowed `DlqPermissions`;
+`controller/tests/fail_open_gate_tests` drives it against a real database with
+`organization_members` DROPPED and, separately, with
+`users.is_platform_admin` RENAMED away, each with its healthy CONTROL in the
+same run (a non-admin keeps its real org list; a real admin still bypasses the
+filter with the list deliberately cleared so a demotion forces a re-fetch).
+Two mutations are red: an `Err` arm that preserves admin visibility, and one
+that returns a non-empty org set. The extraction ALSO makes the pre-fix
+behaviour unrepresentable — the function has no prior set to preserve — which
+is the structural half, the same move `ReadinessBasis::from_scan`'s deletion
+made. Same residual: a stream body that calls it and discards the answer
+survives, and that is a dataflow question rather than a textual one.
+
+**A comment corrected in the same pass.** The block above
+`PERM_REFRESH_INTERVAL_SECS` still read "on refresh failure (DB hiccup),
+preserve the previous permission set rather than failing closed" — false since
+#779, i.e. a comment asserting a safety property the code deliberately dropped
+(#732's class). It now says what the code does and why.
+
+**No lint check was added and `--count` stays 88.** The candidate — "a metric
+publish must have a test that moves the series" — is not expressible as text:
+the defect is that nothing REACHES an increment site that plainly exists,
+which is check 58's own stated limit and needs a call graph rather than a
+grep. The population here is four sites; the structural answer is that the
+decision and the publish are now one function, and mutation is what proved it.
 
 ### 2026-09-08 — the channel nobody could see, validate, or be told was dead
 
