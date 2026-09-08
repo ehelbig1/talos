@@ -4375,21 +4375,40 @@ async fn handle_add_capability_dispatch_node(
     // fail until either a matching workflow is published or the node
     // is reconfigured. Warning, not error — the user may be authoring
     // the dispatcher before the providers intentionally.
+    //
+    // The pre-flight is THREE-valued. `[]` is "nothing matches"; an `Err` is
+    // "the pre-flight could not run", and until 2026-09-08 the
+    // `.unwrap_or_default()` rendered the second as the first — a warning
+    // telling the author that runtime dispatch WILL fail hard, on the strength
+    // of a query that did not answer, which invites them to wire a
+    // `fallback_workflow_id` they may not need.
     let preflight_matches = state
         .workflow_repo
         .find_workflows_for_capability_dispatch_preview(user_id, &required_capabilities, 1)
-        .await
-        .unwrap_or_default();
-    let preflight_warning = if preflight_matches.is_empty() && fallback_wf_id.is_none() {
-        Some(format!(
+        .await;
+    let preflight_warning = match &preflight_matches {
+        Ok(matches) if matches.is_empty() && fallback_wf_id.is_none() => Some(format!(
             "WARNING: no workflows currently match capabilities {:?} AND no fallback_workflow_id is set. \
              Runtime dispatch will fail hard until either (a) a workflow with these capability tags is \
              published, or (b) this node is reconfigured with a fallback_workflow_id. Run \
              preview_capability_dispatch to confirm.",
             required_capabilities
-        ))
-    } else {
-        None
+        )),
+        Ok(_) => None,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                event_kind = "report_field_not_measured",
+                field = "preflight_warning",
+                "add_capability_dispatch_node: capability pre-flight could not be read"
+            );
+            Some(format!(
+                "NOT CHECKED: the capability pre-flight for {:?} could not be read (database failure), \
+                 so whether any workflow matches is UNKNOWN — this is NOT a report that none does. \
+                 The node was created; run preview_capability_dispatch to check.",
+                required_capabilities
+            ))
+        }
     };
 
     let data = serde_json::json!({
@@ -4672,11 +4691,31 @@ async fn handle_add_error_handler(
                     "handler_module_name must be a non-empty, non-whitespace string",
                 );
             }
-            let handler_id = state
+            // THREE-valued. `Ok(None)` is a module name nobody has; `Err` is a
+            // database that could not be asked. Until 2026-09-08 both took the
+            // suggestion path below, so a pool timeout refused with "not found"
+            // and a list of near-miss names — sending the author to rename a
+            // module that was there all along.
+            let handler_id = match state
                 .module_repo
                 .find_template_id_by_name_ci(handler_module_name, user_id)
                 .await
-                .unwrap_or(None);
+            {
+                Ok(found) => found,
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "add_error_handler: handler-module name lookup failed"
+                    );
+                    return mcp_error(
+                        req_id,
+                        -32000,
+                        "Could not read the module catalog, so whether a module with that name \
+                         exists is UNKNOWN. This is a database failure, not a missing module — \
+                         do not rename it. Retry.",
+                    );
+                }
+            };
 
             match handler_id {
                 Some(id) => (id, handler_module_name.to_string()),
@@ -5115,11 +5154,30 @@ async fn handle_preview_capability_dispatch(
     // Match the engine's exact SQL (parallel.rs:2715-2718 and 4519-4522):
     // No status filter — the runtime dispatches to any workflow regardless of status.
     // Ordered by updated_at DESC — most recently updated workflow wins.
-    let rows = state
+    // This tool's ENTIRE output is the answer to "which workflows match these
+    // capabilities". An unread query has no partial answer to give — an empty
+    // `matches` with `match_count: 0` is read, by the `dispatch_note` right
+    // below it, as "dispatch fails hard unless a fallback is set" — so the
+    // read REFUSES rather than defaulting.
+    let rows = match state
         .workflow_repo
         .find_workflows_for_capability_dispatch_preview(user_id, &required_caps, 10)
         .await
-        .unwrap_or_default();
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "preview_capability_dispatch: capability resolution read failed"
+            );
+            return mcp_error(
+                req_id,
+                -32000,
+                "Could not read the capability index, so which workflows would be dispatched is \
+                 UNKNOWN. This is a database failure, not a report that no workflow matches.",
+            );
+        }
+    };
 
     let matches: Vec<serde_json::Value> = rows
         .iter()

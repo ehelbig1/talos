@@ -1261,40 +1261,63 @@ async fn handle_get_platform_info(
     let static_count = super::static_tool_count();
 
     // Count catalog templates visible to this agent (same filter as handle_tools_list).
-    let catalog_count = if let Ok(templates) = state.registry.list_templates(None).await {
-        let template_ids: Vec<uuid::Uuid> = templates.iter().map(|t| t.id).collect();
-        let world_rows = state
-            .module_repo
-            .list_template_world_overrides(&template_ids)
-            .await
-            .unwrap_or_default();
-        let world_map: std::collections::HashMap<uuid::Uuid, String> =
-            world_rows.into_iter().collect();
-
-        templates
-            .iter()
-            .filter(|t| t.category != "sandbox" && t.category != "workflow_template")
-            .filter(|t| {
-                let template_world = world_map
-                    .get(&t.id)
-                    .cloned()
-                    .unwrap_or_else(|| "unknown".to_string());
-                if template_world == "minimal" {
-                    return true;
-                }
-                let world_base = template_world.trim_end_matches("-node").to_string();
-                agent.has_capability(&world_base)
-                    || agent
-                        .allowed_capabilities
-                        .iter()
-                        .any(|c| format!("{}-node", c) == template_world)
-            })
-            .count()
-    } else {
-        0
+    //
+    // Both reads were swallowed and both understate. A failed
+    // `list_templates` rendered `catalog_tool_count: 0` — and therefore
+    // `total_mcp_tools` equal to the static count — beside a
+    // `tool_count_note` asserting that the three numbers add up, which an
+    // agent uses to decide what this deployment can do. A failed world
+    // override read is subtler and worse: it blanks the map, so every
+    // template that ISN'T `minimal` is measured against the literal world
+    // `"unknown"` and drops out of the count for a non-admin agent, i.e. the
+    // count shrinks silently rather than obviously. Both are now null +
+    // named; the counts they feed become null with them.
+    let mut readings = talos_measurement::Readings::new();
+    let templates_read = readings.record(
+        "catalog_tool_count",
+        state.registry.list_templates(None).await,
+    );
+    let world_map: Option<std::collections::HashMap<uuid::Uuid, String>> = match &templates_read {
+        Some(templates) => {
+            let template_ids: Vec<uuid::Uuid> = templates.iter().map(|t| t.id).collect();
+            readings
+                .record(
+                    "catalog_tool_count",
+                    state
+                        .module_repo
+                        .list_template_world_overrides(&template_ids)
+                        .await,
+                )
+                .map(|rows| rows.into_iter().collect())
+        }
+        None => None,
+    };
+    let catalog_count: Option<usize> = match (templates_read, world_map) {
+        (Some(templates), Some(world_map)) => Some({
+            templates
+                .iter()
+                .filter(|t| t.category != "sandbox" && t.category != "workflow_template")
+                .filter(|t| {
+                    let template_world = world_map
+                        .get(&t.id)
+                        .cloned()
+                        .unwrap_or_else(|| "unknown".to_string());
+                    if template_world == "minimal" {
+                        return true;
+                    }
+                    let world_base = template_world.trim_end_matches("-node").to_string();
+                    agent.has_capability(&world_base)
+                        || agent
+                            .allowed_capabilities
+                            .iter()
+                            .any(|c| format!("{}-node", c) == template_world)
+                })
+                .count()
+        }),
+        _ => None,
     };
 
-    let tool_count = static_count + catalog_count;
+    let tool_count = catalog_count.map(|c| static_count + c);
 
     // MCP-27 (2026-05-07): emit `build_version` with the same composite
     // shape session_start uses (`{cargo_pkg}+{git_sha}{-dirty?}`) so
@@ -1365,7 +1388,13 @@ async fn handle_get_platform_info(
         "total_mcp_tools": tool_count,
         "static_tool_count": static_count,
         "catalog_tool_count": catalog_count,
-        "tool_count_note": "total_mcp_tools = static_tool_count + catalog_tool_count. session_start.static_tool_count matches static_tool_count here.",
+        "tool_count_note": if catalog_count.is_some() {
+            "total_mcp_tools = static_tool_count + catalog_tool_count. session_start.static_tool_count matches static_tool_count here."
+        } else {
+            "The catalog listing could not be read, so catalog_tool_count and total_mcp_tools are \
+             null rather than equal to static_tool_count. A null here is NOT a deployment with no \
+             catalog templates; static_tool_count is unaffected and still measured."
+        },
         "database_status": db_status,
         "uptime_seconds": uptime_secs,
         "uptime_human": format!("{}h {}m {}s", uptime_secs / 3600, (uptime_secs % 3600) / 60, uptime_secs % 60),
@@ -1382,6 +1411,8 @@ async fn handle_get_platform_info(
                           could NOT establish rather than defaulting.",
         "fleet": fleet,
     });
+    let mut response = response;
+    readings.attach(&mut response);
     mcp_text(
         req_id,
         &serde_json::to_string_pretty(&response).unwrap_or_default(),

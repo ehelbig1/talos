@@ -3952,24 +3952,33 @@ async fn handle_actor_recall(
             )
         }
         Ok(None) => {
-            let exists_at_all =
-                talos_actor_memory_service::key_exists_at_all(&state.db_pool, actor_id, key)
-                    .await
-                    .unwrap_or(false);
-            let reason = if exists_at_all {
-                "expired"
-            } else {
-                "never_set"
+            // The `reason` field is THREE-valued. `never_set` is a
+            // determinate negative about this actor's whole memory history,
+            // and until 2026-09-08 an unreadable probe produced it: the
+            // `unwrap_or(false)` below answered "the key has never existed"
+            // for a database that could not be asked. `expired` and
+            // `never_set` now mean only what they say; a failed probe says
+            // `unknown` and names itself under `measurement.not_measured`.
+            let mut readings = talos_measurement::Readings::new();
+            let exists_at_all = readings.record(
+                "reason",
+                talos_actor_memory_service::key_exists_at_all(&state.db_pool, actor_id, key).await,
+            );
+            let reason = match exists_at_all {
+                Some(true) => "expired",
+                Some(false) => "never_set",
+                None => "unknown",
             };
+            let mut result = serde_json::json!({
+                "actor_id": actor_id,
+                "found": false,
+                "reason": reason,
+                "memory": null,
+            });
+            readings.attach(&mut result);
             mcp_text(
                 req_id,
-                &serde_json::to_string_pretty(&serde_json::json!({
-                    "actor_id": actor_id,
-                    "found": false,
-                    "reason": reason,
-                    "memory": null,
-                }))
-                .unwrap_or_default(),
+                &serde_json::to_string_pretty(&result).unwrap_or_default(),
             )
         }
         Err(e) => {

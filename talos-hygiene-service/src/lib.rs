@@ -1210,7 +1210,11 @@ pub fn build_report(
                 // "consider disabling or deleting them" was being said ABOUT
                 // them until 2026-09-07.
                 action.push_str(&format!(
-                    " A further {} dormant workflow(s) are EXCLUDED from this list and this                       count because an operator has already retired them (status = \'archived\'):                       {}{}. They still read `is_enabled = true` — archiving does not clear that                       column — so a reader of `is_enabled` alone would recommend deleting                       workflows that are already retired.",
+                    " A further {} dormant workflow(s) are EXCLUDED from this list and this \
+                  count because an operator has already retired them (status = \'archived\'): \
+                  {}{}. They still read `is_enabled = true` — archiving does not clear that \
+                  column — so a reader of `is_enabled` alone would recommend deleting \
+                  workflows that are already retired.",
                     archived.total,
                     archived.names.join(", "),
                     if archived.truncated { ", …" } else { "" },
@@ -1711,6 +1715,10 @@ pub fn build_report(
                 _ => None,
             },
             "embedding_coverage_note": EMBEDDING_COVERAGE_NOTE,
+            // Emitted only when there is something to say — see the removal
+            // below, which is where the "nothing to say ⇒ no key" rule is
+            // applied. Building it here keeps the key's POSITION stable for
+            // the runs that do carry it.
             "note": note,
         },
         "stale_executions": stale_executions,
@@ -1752,6 +1760,24 @@ pub fn build_report(
     // only on a degraded run. A report whose every check ran is byte-identical
     // to the pre-disclosure one plus the coverage block — which is the
     // `Readings::attach` contract, held one level up.
+    // "Nothing to say ⇒ no key" (#762). `summary.note` is prose about
+    // SUPPRESSIONS, and on a fleet with none it rendered as the empty string —
+    // which was observed live on 2026-09-08 as `"note": ""`. An empty string is
+    // not "there were no suppressions"; it is a field a reader cannot tell
+    // apart from a note the report failed to build, and it is the one shape
+    // this whole family of fixes exists to remove. The key is now ABSENT in
+    // that case. Verified before changing it: no frontend consumer exists (the
+    // hygiene report is MCP-only) and the single Rust reader is the
+    // degraded-path test below, where the note is non-empty by construction.
+    if note.is_empty() {
+        if let Some(summary) = report
+            .get_mut("summary")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            summary.remove("note");
+        }
+    }
+
     attach_partial_counts(&mut report, &total_issues, &critical, &high, &medium, &low);
     attach_coverage(&mut report, h);
     h.readings.attach(&mut report);
@@ -2354,6 +2380,66 @@ mod partial_report_disclosure_tests {
             "the recommendation must not print `3 of 0 workflows`: {action}"
         );
         assert!(action.contains("share unknown"));
+    }
+
+    /// "Nothing to say ⇒ no key" (#762). Observed live on 2026-09-08 as
+    /// `"note": ""` — a field a reader cannot tell apart from a note the
+    /// report failed to build.
+    #[test]
+    fn a_summary_with_nothing_to_say_carries_no_note_key() {
+        let clean = report_for(&[]);
+        assert!(
+            clean["summary"].get("note").is_none(),
+            "an empty note must be ABSENT, not \"\": {}",
+            clean["summary"]
+        );
+        // CONTROL: the degraded run still carries it, so the removal cannot
+        // pass by dropping the key unconditionally.
+        let degraded = report_for(&["summary.suppressed_internal_test_workflows"]);
+        assert!(
+            degraded["summary"]["note"]
+                .as_str()
+                .is_some_and(|n| !n.is_empty()),
+            "a note with something to say must survive: {}",
+            degraded["summary"]
+        );
+    }
+
+    /// The `archived_excluded` sentence lost its `\`-continuations at some
+    /// point and shipped runs of ~23 spaces into operator-facing JSON — seen
+    /// live 2026-09-08. A rendered recommendation must carry no mid-sentence
+    /// whitespace run.
+    #[test]
+    fn no_recommendation_carries_a_mid_sentence_whitespace_run() {
+        let mut h = HygieneReport::empty(ledger(&[]));
+        h.dormant_workflows = vec![dormant("a")];
+        h.dormant_archived_excluded = Some(talos_analytics_repository::ArchivedDormantExclusion {
+            total: 8,
+            names: vec!["retired-one".to_string(), "retired-two".to_string()],
+            truncated: false,
+        });
+        let r = build_report(
+            &h,
+            &talos_push_channel_inventory::PushChannelReadout::NotConsulted,
+        )
+        .report;
+        let text = serde_json::to_string(&r).expect("render");
+        assert!(
+            !text.contains("    "),
+            "a rendered report must carry no 4-space run: a lost `\\`-continuation \
+             keeps the source indentation and it reaches the operator verbatim"
+        );
+        let action = r["recommendations"]
+            .as_array()
+            .and_then(|a| {
+                a.iter()
+                    .find_map(|x| x["action"].as_str().filter(|s| s.contains("EXCLUDED")))
+            })
+            .expect("the archived-exclusion sentence must render");
+        assert!(
+            action.contains("EXCLUDED from this list and this count"),
+            "the sentence must read as one sentence: {action}"
+        );
     }
 
     /// An unread suppression count must not read as "nothing was suppressed".

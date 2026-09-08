@@ -1270,14 +1270,20 @@ async fn handle_get_workflow_changelog(
         Err(resp) => return resp,
     };
 
-    // Verify ownership
-    let wf = state
+    // Verify ownership. THREE-valued: `Ok(None)` is "no such workflow, or not
+    // yours"; `Err` is a database that could not be asked, and until 2026-09-08
+    // the `.unwrap_or(None)` rendered it as the first — false on both clauses.
+    match state
         .analytics_repo
         .get_workflow_for_analytics(wf_id, user_id)
         .await
-        .unwrap_or(None);
-    if wf.is_none() {
-        return crate::utils::workflow_not_found_error(req_id);
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => return crate::utils::workflow_not_found_error(req_id),
+        Err(e) => {
+            tracing::error!(workflow_id = %wf_id, error = %e, "get_workflow_changelog: ownership read failed");
+            return crate::utils::workflow_lookup_unreadable_error(req_id);
+        }
     }
 
     let rows = match state
@@ -3020,18 +3026,35 @@ async fn handle_get_workflow_call_tree(
         }
         visited.insert(workflow_id);
 
-        let row = repo
+        // A node in the call tree is one of THREE things: a workflow that was
+        // read, a workflow that is genuinely absent or unowned, and a workflow
+        // nobody could look up. Until 2026-09-08 the second and third rendered
+        // the identical `error` string, so a database fault anywhere in the
+        // walk told the operator their sub-workflow had been deleted or
+        // un-shared — the one diagnosis that starts a hunt for a change nobody
+        // made.
+        let (name, graph_json): (String, Option<String>) = match repo
             .get_workflow_for_analytics(workflow_id, user_id)
             .await
-            .unwrap_or(None);
-
-        let (name, graph_json): (String, Option<String>) = match row {
-            Some(r) => (r.name, r.graph_json),
-            None => {
+        {
+            Ok(Some(r)) => (r.name, r.graph_json),
+            Ok(None) => {
                 return serde_json::json!({
                     "id": workflow_id.to_string(),
                     "error": "Workflow not found or access denied"
                 })
+            }
+            Err(e) => {
+                tracing::error!(
+                    workflow_id = %workflow_id,
+                    error = %e,
+                    "get_workflow_call_tree: sub-workflow read failed"
+                );
+                return serde_json::json!({
+                    "id": workflow_id.to_string(),
+                    "error": "Workflow could not be read (database failure) — whether it exists and whether you own it are both UNKNOWN",
+                    "unreadable": true
+                });
             }
         };
 
@@ -5099,8 +5122,10 @@ pub(crate) const NODE_TIMING_BREAKDOWN_NOTE: &str =
      stamp those timings and the mean is over execution_cost_rollup rows for the whole window. \
      The two populations are NOT interchangeable — compare rows within one report, not across \
      reports with different sources. An empty list means the stamped timings were absent AND the \
-     rollup fallback produced nothing — either it had no rows or its query failed, which this \
-     surface does not distinguish; treat an empty list as NO DATA, never as zero time spent.";
+     rollup fallback produced nothing — and, since 2026-09-08, that it produced nothing because \
+     it HAD no rows: a source that could not be READ nulls this field instead of emptying it, \
+     and names itself under measurement.not_measured. Treat an empty list as NO DATA and a null \
+     as NOBODY LOOKED; neither is zero time spent.";
 
 /// Build one `node_timing_breakdown` row.
 ///
@@ -5218,11 +5243,25 @@ async fn handle_get_workflow_performance_report(
 
     // Per-node timing breakdown from output_data containing __node_timings__.
     // IMPORTANT: scoped to wf_id so node data from other workflows cannot pollute this report.
-    let timing_rows = state
-        .analytics_repo
-        .get_completed_executions_output(wf_id, user_id, days, 50)
-        .await
-        .unwrap_or_default();
+    //
+    // Three reads feed this response and all three were swallowed, each
+    // COMPOUNDING the next: a failed output read emptied the breakdown, the
+    // rollup fallback that exists to repair exactly that was itself skipped on
+    // a failed read (`if let Ok`), and the extremes query rendered
+    // slowest/fastest as `null` beside a NONZERO `total_completed_executions`.
+    // Net: a workflow that demonstrably ran nodes reported "no per-node timing
+    // data" and "no extremes", with the note below vouching for the emptiness.
+    // All three are on the ledger from 2026-09-08.
+    let mut readings = talos_measurement::Readings::new();
+    let timing_rows = readings.record(
+        "node_timing_breakdown",
+        state
+            .analytics_repo
+            .get_completed_executions_output(wf_id, user_id, days, 50)
+            .await,
+    );
+    let timing_rows_measured = timing_rows.is_some();
+    let timing_rows = timing_rows.unwrap_or_default();
 
     let mut node_timing_sums: std::collections::HashMap<String, (f64, usize)> =
         std::collections::HashMap::new();
@@ -5266,20 +5305,53 @@ async fn handle_get_workflow_performance_report(
     // returned [] for any workflow whose engine didn't emit
     // __node_timings__ even when execution_cost_rollup had every
     // node populated.
+    let mut rollup_measured = true;
     if node_breakdown.is_empty() {
-        if let Ok(rollup_rows) = state
+        match state
             .analytics_repo
             .get_workflow_node_timing_breakdown(wf_id, user_id, days)
             .await
         {
-            node_breakdown = rollup_rows
-                .into_iter()
-                .map(|(node_label, avg_ms, sample_count)| {
-                    node_timing_entry(&node_label, avg_ms, sample_count, NODE_TIMING_SOURCE_ROLLUP)
-                })
-                .collect();
+            Ok(rollup_rows) => {
+                node_breakdown = rollup_rows
+                    .into_iter()
+                    .map(|(node_label, avg_ms, sample_count)| {
+                        node_timing_entry(
+                            &node_label,
+                            avg_ms,
+                            sample_count,
+                            NODE_TIMING_SOURCE_ROLLUP,
+                        )
+                    })
+                    .collect();
+            }
+            Err(e) => {
+                rollup_measured = false;
+                tracing::error!(
+                    target: "talos_analytics",
+                    event_kind = "report_field_not_measured",
+                    field = "node_timing_breakdown",
+                    workflow_id = %wf_id,
+                    error = %e,
+                    "get_workflow_performance_report: the rollup fallback for the node-timing breakdown could not be read"
+                );
+                // `mark_derived` rather than a second `record`: both sources
+                // feed ONE field, and naming it twice in `not_measured` would
+                // make one unreadable breakdown look like two.
+                readings.mark_derived("node_timing_breakdown");
+            }
         }
     }
+    // The breakdown is rendered `null`, never `[]`, when NEITHER source could
+    // be read: an empty list here is the report's own evidence that the
+    // workflow ran no nodes, and that is precisely what an unread pair cannot
+    // establish. A breakdown that came from ONE working source is a real
+    // measurement and stays a list.
+    let node_breakdown_json = if timing_rows_measured || rollup_measured {
+        serde_json::json!(node_breakdown)
+    } else {
+        serde_json::Value::Null
+    };
 
     // Slowest + fastest completed executions in the period. Pre-fix
     // these were hardcoded `None` with a "not available via repo"
@@ -5307,8 +5379,14 @@ async fn handle_get_workflow_performance_report(
                 event_kind = "performance_extremes_failed",
                 workflow_id = %wf_id,
                 error = %e,
-                "get_extreme_executions failed; slowest/fastest will be null"
+                "get_extreme_executions failed; slowest/fastest are null AND disclosed"
             );
+            // Null beside a nonzero `total_completed_executions` reads as "there
+            // are no extremes", which is impossible: a period with completed
+            // runs has a slowest one. Naming the field is what tells the two
+            // apart.
+            readings.mark_derived("slowest_execution");
+            readings.mark_derived("fastest_execution");
             (None, None)
         }
     };
@@ -5322,7 +5400,7 @@ async fn handle_get_workflow_performance_report(
         days,
     );
 
-    let result = serde_json::json!({
+    let mut result = serde_json::json!({
         "workflow_name": wf_name,
         "period_days": days,
         "total_completed_executions": total,
@@ -5332,13 +5410,14 @@ async fn handle_get_workflow_performance_report(
             "p99_ms": p99_ms,
             "avg_ms": avg_ms,
         },
-        "node_timing_breakdown": node_breakdown,
+        "node_timing_breakdown": node_breakdown_json,
         "node_timing_breakdown_note": NODE_TIMING_BREAKDOWN_NOTE,
         "slowest_execution": slowest,
         "fastest_execution": fastest,
         "performance_trend": trend,
         "see_also": "For a visual text-based waterfall chart showing parallel execution timing, use get_execution_waterfall(execution_id: <id>) on a recent execution.",
     });
+    readings.attach(&mut result);
 
     mcp_text(
         req_id,
@@ -9428,9 +9507,21 @@ mod node_timing_shape_tests {
         assert!(n.contains(NODE_TIMING_SOURCE_ROLLUP), "{n}");
         assert!(n.contains("sample_count"), "{n}");
         assert!(n.contains("empty list"), "{n}");
-        // The fallback's error is swallowed (`if let Ok(..)`), so the note
-        // must not promise that an empty list proves both sources were empty.
-        assert!(n.contains("its query failed"), "{n}");
+        // 2026-09-08: this assertion is INVERTED, and the comment it replaces
+        // is why. It used to read "The fallback's error is swallowed (`if let
+        // Ok(..)`), so the note must not promise that an empty list proves
+        // both sources were empty", and pinned the literal "its query failed"
+        // — a note DISCLOSING an ambiguity the surface could not resolve. The
+        // rollup fallback no longer swallows: an unread source NULLS the field
+        // and names itself, so `[]` now means the sources were read and there
+        // was nothing. The note must say that, and must NOT go on offering "or
+        // its query failed" as an explanation for an empty LIST.
+        assert!(
+            !n.contains("its query failed"),
+            "an empty list no longer means a failed query — that case is now \
+             `null` plus a named field: {n}"
+        );
+        assert!(n.contains("NOBODY LOOKED"), "{n}");
     }
 }
 

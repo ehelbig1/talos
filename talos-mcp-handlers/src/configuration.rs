@@ -939,19 +939,35 @@ async fn handle_get_session_context(
         }
     }
 
+    // This tool renders PLAIN TEXT, so it has no `measurement` object to
+    // attach a `Readings` ledger to — the disclosure has to be a line in the
+    // report. Each of the three lists below is read by an agent as an
+    // inventory of what the user already has, and an empty one pushes it to
+    // BUILD rather than REUSE: "no ready workflows", "nothing was run
+    // recently", "nothing matches this task". Until 2026-09-08 a database
+    // fault produced all three, silently.
+    // The ledger is the same `talos_measurement::Readings` every JSON report on
+    // this surface uses; only the RENDERING differs, because this tool emits
+    // plain text and has no `measurement` object to attach to.
+    let mut readings = talos_measurement::Readings::new();
+
     // Top N by readiness_score
-    let top_rows = state
-        .workflow_repo
-        .list_top_workflows_by_readiness(user_id, limit)
-        .await
-        .unwrap_or_default();
+    let top_rows = readings.record_rows(
+        "Top Workflows",
+        state
+            .workflow_repo
+            .list_top_workflows_by_readiness(user_id, limit)
+            .await,
+    );
 
     // Top 5 most recently used
-    let recent_rows = state
-        .workflow_repo
-        .list_recently_used_workflows(user_id, 5)
-        .await
-        .unwrap_or_default();
+    let recent_rows = readings.record_rows(
+        "Recently Used",
+        state
+            .workflow_repo
+            .list_recently_used_workflows(user_id, 5)
+            .await,
+    );
 
     let mut lines: Vec<String> = Vec::new();
     lines.push("=== Top Workflows ===".to_string());
@@ -1016,11 +1032,13 @@ async fn handle_get_session_context(
 
         if !words.is_empty() {
             // Search with first word for simplicity (avoids complex dynamic SQL)
-            let matched_rows = state
-                .workflow_repo
-                .match_workflows_by_keyword(user_id, &words[0], 5)
-                .await
-                .unwrap_or_default();
+            let matched_rows = readings.record_rows(
+                "Matched",
+                state
+                    .workflow_repo
+                    .match_workflows_by_keyword(user_id, &words[0], 5)
+                    .await,
+            );
 
             if !matched_rows.is_empty() {
                 lines.push(format!("=== Matched '{}' ===", task));
@@ -1037,6 +1055,20 @@ async fn handle_get_session_context(
                 }
             }
         }
+    }
+
+    if !readings.complete() {
+        lines.push(format!(
+            "=== DEGRADED: {} section(s) could not be read — {} ===",
+            readings.not_measured().len(),
+            readings.not_measured().join(", ")
+        ));
+        lines.push(
+            "An ABSENT or SHORT section above is not evidence that this user has no such \
+             workflows; it means the read failed. Do NOT conclude from this response that a \
+             workflow must be created. Retry, or list workflows explicitly."
+                .to_string(),
+        );
     }
 
     mcp_text(req_id, &lines.join("\n"))

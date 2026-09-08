@@ -649,12 +649,31 @@ async fn handle_find_similar_workflows(
         );
     }
 
-    // Load all other workflows for this user
-    let other_rows = state
+    // Load all other workflows for this user. This read IS the comparison set:
+    // an empty one makes every downstream number zero and the response says
+    // "no similar workflows", which is the answer an agent uses to justify
+    // building a duplicate. There is no partial answer to give, so the read
+    // refuses rather than defaulting.
+    let other_rows = match state
         .workflow_repo
         .list_workflows_for_similarity(user_id, wf_id, 200)
         .await
-        .unwrap_or_default();
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(
+                workflow_id = %wf_id,
+                error = %e,
+                "find_similar_workflows: comparison-set read failed"
+            );
+            return mcp_error(
+                req_id,
+                -32000,
+                "Could not read the comparison set, so whether any workflow is similar is \
+                 UNKNOWN. This is a database failure, not a report that none is.",
+            );
+        }
+    };
 
     let mut similarities: Vec<(uuid::Uuid, String, usize, Vec<String>)> = Vec::new();
 

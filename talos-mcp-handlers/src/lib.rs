@@ -494,24 +494,61 @@ pub fn create_router(
                 let state = local_state.clone();
                 let db = local_db.clone();
                 async move {
+                    // JSON-RPC 2.0 §5: notifications (no `id`) must NOT receive a
+                    // response body. Returning {"id":null,...} causes Zod validation
+                    // failures in bridges that require id to be string|number, not null.
+                    //
+                    // Hoisted ABOVE the identity resolution on 2026-09-08: a
+                    // notification needs no user, and the resolution below can now
+                    // REFUSE, which must not put a body on a notification.
+                    if payload.method.starts_with("notifications/") {
+                        return axum::http::StatusCode::ACCEPTED.into_response();
+                    }
+
                     // Resolve the local dev user: use the first registered user if
                     // one exists (preserves continuity when the web UI was used to
                     // register), otherwise create a synthetic dev user so that FK
-                    // constraints always have a valid user_id.  Without this, a fresh
-                    // database leaves agent.user_id = None, causing every
-                    // user-scoped INSERT to write NULL and every user-scoped SELECT to
-                    // return zero rows — tools appear to succeed but nothing persists.
-                    let dev_user_id: Option<uuid::Uuid> = {
-                        let sysrepo = talos_system_repo::SystemRepository::new(db.clone());
-                        let existing = sysrepo.find_first_user_id().await.ok().flatten();
-
-                        if existing.is_some() {
-                            existing
-                        } else {
+                    // constraints always have a valid user_id.
+                    //
+                    // Both reads were swallowed (`.ok().flatten()`), and the comment
+                    // that stood here NAMED the consequence without preventing it:
+                    // "a fresh database leaves agent.user_id = None, causing every
+                    // user-scoped INSERT to write NULL and every user-scoped SELECT
+                    // to return zero rows — tools appear to succeed but nothing
+                    // persists." That is the reported-success-on-a-failed-read class
+                    // in its purest form, and it is worse than a claim in one field:
+                    // EVERY tool on the endpoint then reports success while writing
+                    // nowhere. `Ok(None)` from the first read is a genuinely fresh
+                    // database and still falls through to creation; an `Err` from
+                    // either read, or a creation that produced no user, now REFUSES
+                    // the request instead of serving it identity-less.
+                    let sysrepo = talos_system_repo::SystemRepository::new(db.clone());
+                    let dev_user_id: uuid::Uuid = match sysrepo.find_first_user_id().await {
+                        Ok(Some(existing)) => existing,
+                        Ok(None) => {
                             tracing::info!(
                                 "Fresh database — creating synthetic dev user for local MCP endpoint"
                             );
-                            sysrepo.ensure_dev_user().await.ok().flatten()
+                            match sysrepo.ensure_dev_user().await {
+                                Ok(Some(id)) => id,
+                                other => {
+                                    tracing::error!(
+                                        event_kind = "local_dev_identity_unresolved",
+                                        created = other.as_ref().map(Option::is_some).unwrap_or(false),
+                                        error = other.as_ref().err().map(ToString::to_string),
+                                        "MCP /local: could not provision the dev user; refusing rather than serving an identity-less request"
+                                    );
+                                    return Json(local_identity_refusal(payload.id)).into_response();
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                event_kind = "local_dev_identity_unresolved",
+                                error = %e,
+                                "MCP /local: could not read the user table; refusing rather than serving an identity-less request"
+                            );
+                            return Json(local_identity_refusal(payload.id)).into_response();
                         }
                     };
 
@@ -521,15 +558,8 @@ pub fn create_router(
                         name: "local-dev".to_string(),
                         role_name: "System Administrator".to_string(),
                         allowed_capabilities: vec!["*".to_string()],
-                        user_id: dev_user_id,
+                        user_id: Some(dev_user_id),
                     });
-
-                    // JSON-RPC 2.0 §5: notifications (no `id`) must NOT receive a
-                    // response body. Returning {"id":null,...} causes Zod validation
-                    // failures in bridges that require id to be string|number, not null.
-                    if payload.method.starts_with("notifications/") {
-                        return axum::http::StatusCode::ACCEPTED.into_response();
-                    }
 
                     let response = match payload.method.as_str() {
                         "initialize" => handle_initialize(payload),
@@ -569,6 +599,28 @@ pub fn create_router(
         );
 
         authenticated.merge(local_route).with_state(state)
+    }
+}
+
+/// The `/mcp/local` refusal when no dev identity could be resolved.
+///
+/// A named constructor rather than an inline literal so the two call sites
+/// above cannot drift: an identity-less request used to be SERVED, and every
+/// tool it reached then reported success while writing nowhere.
+fn local_identity_refusal(id: Option<serde_json::Value>) -> JsonRpcResponse {
+    JsonRpcResponse {
+        jsonrpc: "2.0".to_string(),
+        id,
+        result: None,
+        error: Some(JsonRpcError {
+            code: -32000,
+            message: "Local dev identity could not be resolved, so this request was REFUSED \
+                      rather than run without a user. Running it would have reported success \
+                      while every user-scoped write landed nowhere. Check the database and \
+                      retry."
+                .to_string(),
+            data: None,
+        }),
     }
 }
 

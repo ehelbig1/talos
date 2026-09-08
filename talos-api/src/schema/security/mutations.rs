@@ -627,7 +627,35 @@ impl SecurityMutations {
         // post-rotation count of `encryption_keys` rows — monotonically
         // increasing as long as old DEKs aren't pruned, which preserves
         // the operator's perception of "the number went up".
-        let count: i64 = secrets_manager.count_encryption_keys().await.unwrap_or(1); // best-effort; the rotation itself already succeeded
+        //
+        // 2026-09-08: the count PROPAGATES rather than defaulting to 1. This
+        // mutation returns a bare `i32` — a typed GraphQL scalar with no
+        // disclosure slot — which is the same position `me`'s `UserInfo` was in
+        // on 2026-09-08, and the answer is the same one: propagate. A default
+        // of `1` is not a benign placeholder here, it is the version number the
+        // operator reads ("Key rotated to version 1") and uses to track
+        // rotation history, so an unreadable count silently REWOUND that
+        // history. `0` would have been worse still: `SecretsManager.tsx` does
+        // `if (data.rotateEncryptionKey)`, so a falsy value renders no toast at
+        // all — a rotation with no feedback whatsoever.
+        //
+        // The message names the half that SUCCEEDED, because the one thing an
+        // operator must not conclude from this error is that the key was not
+        // rotated. It carries no schema or query detail (the security rule);
+        // the underlying error is logged server-side only.
+        let count: i64 = secrets_manager.count_encryption_keys().await.map_err(|e| {
+            tracing::error!(
+                new_dek_id = %new_dek_id,
+                error = %e,
+                "rotateEncryptionKey: the key ROTATED but the post-rotation key count could not be read"
+            );
+            async_graphql::Error::new(
+                "The encryption key WAS rotated successfully, but the new key count could not \
+                 be read, so no version number can be reported. Do not rotate again — reload \
+                 to see the current state.",
+            )
+            .extend_safe()
+        })?;
 
         info!(
             new_dek_id = %new_dek_id,
