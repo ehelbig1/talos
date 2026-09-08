@@ -829,7 +829,21 @@ pub async fn pubsub_push_handler(
             )
             .await
             {
-                tracing::warn!(%user_id, error = %e, "gcp pubsub: dispatch failed");
+                // `{:#}` renders the whole anyhow chain. `%e` (Display on
+                // an anyhow::Error) prints only the OUTERMOST context, and
+                // that is not a cosmetic difference: four consecutive
+                // pushes on 2026-09-07 logged the byte-identical line
+                // `error=load module for gcp dispatch`, with the
+                // "Module not found or access denied" underneath it, the
+                // module id and the channel id all invisible. The
+                // `channel_uuid` is the pseudonymous identifier this
+                // integration logs by (never the push token).
+                tracing::warn!(
+                    %user_id,
+                    channel_uuid = %channel_uuid,
+                    error = format!("{e:#}"),
+                    "gcp pubsub: dispatch failed"
+                );
             }
         }
     });

@@ -2369,6 +2369,21 @@ async fn main() -> anyhow::Result<()> {
             .init();
     }
 
+    // Process-wide panic hook, installed immediately after the subscriber
+    // (its whole output is one structured `tracing` line) and before the
+    // job loop can spawn anything. Its collectors go into
+    // `prometheus::default_registry()`, which is the registry
+    // `metrics::get_prometheus_metrics()` gathers for `/metrics` — the
+    // same one `seed_circuit_breaker_series` seeds into — so
+    // `talos_task_panics_total{process="worker"}` is exported by a worker
+    // even when the OTEL exporter build failed. Only THIS process's label
+    // value is seeded: a `{process="controller"}` series on a worker's
+    // `/metrics` would imply a signal nothing here can increment.
+    talos_task_supervision::install_panic_hook("worker");
+    if let Err(e) = talos_task_supervision::register_metrics(prometheus::default_registry()) {
+        eprintln!("Warning: failed to register panic metrics: {e}");
+    }
+
     // MCP-580: spawn the circuit-breaker periodic cleanup task so the
     // per-host `records` DashMap doesn't grow monotonically with
     // distinct hosts seen across the worker's lifetime. Idempotent at

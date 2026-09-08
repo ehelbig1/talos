@@ -22,6 +22,7 @@ talos-worker-runtime = { path = "../talos-worker-runtime" }
 tokio = { version = "1.41", features = ["full"] }
 async-nats = "0.47"
 talos-nats-tls = { path = "../talos-nats-tls" }
+talos-task-supervision = { path = "../talos-task-supervision" }
 
 # Core utilities
 anyhow = "1.0"

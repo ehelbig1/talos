@@ -1,0 +1,20 @@
+[package]
+name = "talos-task-supervision"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Kept in lockstep with talos-metrics / controller / worker (prometheus 0.14).
+prometheus = "0.14"
+tokio = { workspace = true }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time"] }
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+
+[lints]
+workspace = true

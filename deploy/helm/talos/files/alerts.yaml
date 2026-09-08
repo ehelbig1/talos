@@ -2787,6 +2787,73 @@ groups:
             4. `get_catalog_status` → `never_compiled` names any templates the
                gauge would have counted, and does not depend on this sweep.
 
+      # A PANIC IN A SPAWNED TASK IS NEVER "WORKING AS DESIGNED", which is
+      # what makes this alertable where a refusal counter is not. Nobody is
+      # awaiting the task, nothing restarts it, and every operator-facing
+      # surface keeps reporting the subsystem as configured — the SLA
+      # monitor was off for a whole process lifetime that way (a NULL
+      # webhook decoded with `Row::get`, package 22).
+      #
+      # `warning`, not `critical`: the blast radius is one task, and the
+      # sibling TalosBackgroundTaskExited names WHICH one. Both counters are
+      # PRE-SEEDED at 0 for this process, so `increase(...)` has a series to
+      # measure — absence, not zero, is how this class stays quiet.
+      - alert: TalosTaskPanic
+        expr: increase(talos_task_panics_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          category: reliability
+        annotations:
+          summary: "A task panicked in the {{ $labels.process }} process"
+          description: |
+            {{ $value }} panic(s) in the last 15m. A panicking spawned task
+            leaves no caller to observe it and is never restarted; the
+            subsystem it was running is simply off for the rest of the
+            process lifetime while every status surface still reports it as
+            configured.
+          action: |
+            1. Logs, target `talos_audit`, `event_kind=task_panicked` — one
+               structured line per panic carrying `process`, `thread`,
+               `location` and the (scrubbed, 300-char) panic message.
+            2. If a supervised background loop was the victim,
+               `talos_background_task_exits_total{outcome="panicked"}` names
+               it and TalosBackgroundTaskExited fires alongside.
+            3. A panic in a REQUEST handler is caught by axum and shows up
+               here without an exit counter — the location field is then the
+               only pointer.
+
+      # The shape a panic hook structurally CANNOT see: a long-lived loop
+      # that stops without panicking. Every task in this counter's label set
+      # is meant to run for the process lifetime, so ANY outcome is a
+      # finding — `completed` most of all, because a clean return produces
+      # no panic, no stderr line and no trace of any kind.
+      - alert: TalosBackgroundTaskExited
+        expr: increase(talos_background_task_exits_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          category: reliability
+        annotations:
+          summary: "Background task {{ $labels.task }} stopped ({{ $labels.outcome }})"
+          description: |
+            The supervised loop `{{ $labels.task }}` terminated
+            ({{ $labels.outcome }}). Nothing restarts it. Until the
+            controller is restarted, whatever that loop maintains — a sweep,
+            a gauge, a renewal, a subscriber — is not happening, and the
+            tools that report on it will keep reporting the last value it
+            wrote.
+          action: |
+            1. `outcome="completed"` is the quiet one: the loop RETURNED. Look
+               for a closed channel or a `break` on a condition the author
+               did not expect to be reachable.
+            2. `outcome="panicked"` pairs with TalosTaskPanic; the
+               `task_panicked` log line carries the location.
+            3. `outcome="cancelled"` means the task was aborted — expected
+               only during shutdown.
+            4. There is no supervisor: restart the controller to bring the
+               loop back.
+
   # ────────────────────────────────────────────────────────────────────
   - name: talos.backups
     interval: 1m
