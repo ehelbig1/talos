@@ -38,6 +38,7 @@ talos-continuation-trigger = { path = "../talos-continuation-trigger" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-http-body = { path = "../talos-http-body" }
 talos-integration-helpers = { path = "../talos-integration-helpers" }
+talos-task-supervision = { path = "../talos-task-supervision" }
 talos-integration-state = { path = "../talos-integration-state" }
 talos-memory = { path = "../talos-memory" }
 talos-module-executions = { path = "../talos-module-executions" }

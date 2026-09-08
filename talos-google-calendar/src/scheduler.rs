@@ -24,6 +24,7 @@ use talos_integration_helpers::audit::{
     insert_channel_audit, truncate_and_redact_error, ChannelAuditEvent,
 };
 use talos_integration_helpers::renewal::{run_renewal_scheduler, RenewableIntegration};
+use talos_task_supervision::TaskExit;
 use uuid::Uuid;
 
 /// Private adapter so implementing the (public) helper trait doesn't
@@ -157,6 +158,6 @@ impl RenewableIntegration for GcalRenewer {
 pub async fn channel_renewal_task(
     service: Arc<GoogleCalendarService>,
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) {
-    run_renewal_scheduler(Arc::new(GcalRenewer(service)), shutdown_rx).await;
+) -> TaskExit {
+    run_renewal_scheduler(Arc::new(GcalRenewer(service)), shutdown_rx).await
 }

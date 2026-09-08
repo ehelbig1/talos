@@ -11,7 +11,7 @@ use crate::*;
 // panic; only this wrapper can see the other shape — a loop that simply
 // RETURNS, which produces no panic, no stderr line and no trace at all.
 // Nothing is restarted: see the crate docs for why.
-use talos_task_supervision::{spawn_supervised, BackgroundTask};
+use talos_task_supervision::{spawn_supervised, BackgroundTask, DeclineReason, TaskExit};
 
 /// Maximum characters of WASM-emitted log content broadcast on the
 /// `execution_updates` GraphQL subscription. Mirrors the persistence
@@ -706,7 +706,14 @@ pub(crate) fn spawn_worker_fleet_tasks(
 
     {
         let manager = worker_manager.clone();
-        spawn_supervised(BackgroundTask::WorkerFleetManagement, async move {
+        // NOT `spawn_supervised`: `start_worker_management` is a LAUNCHER
+        // — it spawns the heartbeat listener and the prune loop and
+        // returns `Ok(())` at once. Wrapping it recorded a healthy launch
+        // as `outcome="completed"` at ERROR one second after every boot
+        // (measured live 2026-09-08), while the two loops that matter went
+        // unsupervised. They are now supervised inside `talos-worker-fleet`
+        // as `worker_fleet_heartbeat` / `worker_fleet_prune`.
+        tokio::spawn(async move {
             if let Err(e) =
                 talos_worker_fleet::start_worker_management(manager, (*nats).clone()).await
             {
@@ -1402,7 +1409,7 @@ pub(crate) fn spawn_metrics_gauge_tasks(
                      departed workers' keys stay in the trusted verify ring until an operator \
                      runs deactivate-worker-identity"
                 );
-                return;
+                return TaskExit::Declined(DeclineReason::FeatureDisabled);
             }
             tracing::info!(
                 target: "worker_registry",
@@ -1622,7 +1629,11 @@ pub(crate) fn spawn_registry_sync(registry: std::sync::Arc<ModuleRegistry>) {
     // ---------- Start OCI Registry background sync loop ----------
     let sync_registry = registry.clone();
     spawn_supervised(BackgroundTask::RegistrySync, async move {
-        registry::sync::start_registry_sync_loop(sync_registry).await;
+        // Returns `TaskExit::Declined(..)` when OCI sync is not
+        // configured (or its Sigstore policy was not made explicit in
+        // production) — disk seeding is the source of truth then, and
+        // "dormant by config" is not a loop that stopped.
+        registry::sync::start_registry_sync_loop(sync_registry).await
     });
 }
 
@@ -1704,7 +1715,7 @@ pub(crate) fn spawn_maintenance_sweeps(
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
                         tracing::info!("LLM-keys cache sweep loop received shutdown signal");
-                        break;
+                        break TaskExit::ShuttingDown;
                     }
                 }
             }
@@ -1778,7 +1789,7 @@ pub(crate) fn spawn_maintenance_sweeps(
                             tracing::info!(
                                 "memory-rank provenance sweep loop received shutdown signal"
                             );
-                            break;
+                            break TaskExit::ShuttingDown;
                         }
                     }
                 }
@@ -1870,7 +1881,7 @@ pub(crate) fn spawn_maintenance_sweeps(
                     _ = shutdown.changed() => {
                         if *shutdown.borrow() {
                             tracing::info!("self-monitoring reconciler received shutdown signal");
-                            break;
+                            break TaskExit::ShuttingDown;
                         }
                     }
                 }
@@ -1948,7 +1959,7 @@ pub(crate) fn spawn_maintenance_sweeps(
                             tracing::info!(
                                 "worker-identity key refresh loop received shutdown signal"
                             );
-                            break;
+                            break TaskExit::ShuttingDown;
                         }
                     }
                 }
@@ -2148,7 +2159,7 @@ pub(crate) fn spawn_maintenance_sweeps(
                     _ = shutdown.changed() => {
                         if *shutdown.borrow() {
                             tracing::info!("Audit-chain verification sweep loop received shutdown signal");
-                            break;
+                            break TaskExit::ShuttingDown;
                         }
                     }
                 }
@@ -2224,7 +2235,7 @@ pub(crate) fn spawn_maintenance_sweeps(
                                 target: "talos_engine",
                                 "modules-table reconciliation sweep received shutdown signal"
                             );
-                            break;
+                            break TaskExit::ShuttingDown;
                         }
                     }
                 }
@@ -2298,7 +2309,7 @@ pub(crate) fn spawn_cleanup_tasks(
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
                         tracing::info!("Session cleanup loop received shutdown signal");
-                        break;
+                        break TaskExit::ShuttingDown;
                     }
                 }
             }
@@ -2329,7 +2340,7 @@ pub(crate) fn spawn_cleanup_tasks(
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
                         tracing::info!("API key cleanup loop received shutdown signal");
-                        break;
+                        break TaskExit::ShuttingDown;
                     }
                 }
             }
@@ -2360,7 +2371,7 @@ pub(crate) fn spawn_cleanup_tasks(
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
                         tracing::info!("OAuth state token cleanup loop received shutdown signal");
-                        break;
+                        break TaskExit::ShuttingDown;
                     }
                 }
             }
@@ -2461,7 +2472,7 @@ pub(crate) fn spawn_cleanup_tasks(
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
                         tracing::info!("Execution retention loop received shutdown signal");
-                        break;
+                        break TaskExit::ShuttingDown;
                     }
                 }
             }
@@ -2496,7 +2507,7 @@ pub(crate) fn spawn_cleanup_tasks(
             };
             if !should_proceed {
                 tracing::info!("Audit log cleanup loop received shutdown signal");
-                break;
+                break TaskExit::ShuttingDown;
             }
 
             // Only run cleanup once per day at 2 AM
@@ -2599,7 +2610,7 @@ pub(crate) fn spawn_cleanup_tasks(
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
                         tracing::info!("Suspension expiry loop received shutdown signal");
-                        break;
+                        break TaskExit::ShuttingDown;
                     }
                 }
             }
@@ -2808,7 +2819,7 @@ pub(crate) fn spawn_cleanup_tasks(
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
                         tracing::info!("Stuck execution cleanup loop received shutdown signal");
-                        break;
+                        break TaskExit::ShuttingDown;
                     }
                 }
             }
@@ -2884,7 +2895,7 @@ pub(crate) fn spawn_cleanup_tasks(
                             tracing::info!(
                                 "Module-payload retention loop received shutdown signal"
                             );
-                            break;
+                            break TaskExit::ShuttingDown;
                         }
                     }
                 }
@@ -2989,7 +3000,7 @@ pub(crate) fn spawn_cleanup_tasks(
                             tracing::info!(
                                 "Module-execution row retention loop received shutdown signal"
                             );
-                            break;
+                            break TaskExit::ShuttingDown;
                         }
                     }
                 }
@@ -3121,7 +3132,7 @@ pub(crate) fn spawn_cleanup_tasks(
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
                         tracing::info!("Actor-memory TTL sweep loop received shutdown signal");
-                        break;
+                        break TaskExit::ShuttingDown;
                     }
                 }
             }
@@ -3171,7 +3182,7 @@ pub(crate) fn spawn_analytics_tasks(
             };
             if !should_proceed {
                 tracing::info!("Readiness recomputation loop received shutdown signal");
-                break;
+                break TaskExit::ShuttingDown;
             }
 
             // Fetch all workflows with stale or missing readiness scores
@@ -3611,7 +3622,7 @@ pub(crate) fn spawn_analytics_tasks(
             };
             if !should_proceed {
                 tracing::info!("SLA degradation alerting loop received shutdown signal");
-                break;
+                break TaskExit::ShuttingDown;
             }
 
             // 1. Check workflows with explicit SLA thresholds
@@ -3897,7 +3908,7 @@ pub(crate) fn spawn_integration_renewal_tasks(
         let renewal = gmail_watch.clone();
         let gmail_renewal_shutdown = bg_shutdown_rx.clone();
         spawn_supervised(BackgroundTask::GmailWatchRenewal, async move {
-            gmail::scheduler::gmail_renewal_task(renewal, gmail_renewal_shutdown).await;
+            gmail::scheduler::gmail_renewal_task(renewal, gmail_renewal_shutdown).await
         });
         tracing::info!("Gmail watch renewal task started (runs every hour)");
 
@@ -3932,11 +3943,8 @@ pub(crate) fn spawn_integration_renewal_tasks(
         let renewal_service = google_calendar_service.clone();
         let gcal_renewal_shutdown = bg_shutdown_rx.clone();
         spawn_supervised(BackgroundTask::GcalChannelRenewal, async move {
-            google_calendar::scheduler::channel_renewal_task(
-                renewal_service,
-                gcal_renewal_shutdown,
-            )
-            .await;
+            google_calendar::scheduler::channel_renewal_task(renewal_service, gcal_renewal_shutdown)
+                .await
         });
         tracing::info!("Google Calendar channel renewal task started (runs every hour)");
 
@@ -4832,7 +4840,7 @@ pub(crate) fn spawn_late_background_tasks(
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
                         tracing::info!("Stale execution cleanup loop received shutdown signal");
-                        break;
+                        break TaskExit::ShuttingDown;
                     }
                 }
             }
@@ -4856,7 +4864,7 @@ pub(crate) fn spawn_late_background_tasks(
         ));
         let scheduler_shutdown = bg_shutdown_rx.clone();
         spawn_supervised(BackgroundTask::Scheduler, async move {
-            scheduler.run_with_shutdown(scheduler_shutdown).await;
+            scheduler.run_with_shutdown(scheduler_shutdown).await
         });
         tracing::info!("Workflow scheduler started (polls every 15 seconds, backfills null next_trigger_at on startup; graceful-shutdown enabled)");
     } else {
@@ -4912,7 +4920,7 @@ pub(crate) fn spawn_late_background_tasks(
             };
             if !should_proceed {
                 tracing::info!("SLA threshold breach loop received shutdown signal");
-                break;
+                break TaskExit::ShuttingDown;
             }
 
             // Load all thresholds with their workflow's user_id for scoped queries
@@ -6759,13 +6767,14 @@ mod crypto_orphan_blindness_tests {
 /// one-shots and one handle-bound compile task, all deliberately unwrapped).
 #[cfg(test)]
 mod task_supervision_wiring_tests {
-    /// The long-lived loops, all wrapped. 42 = the 45 loop-shaped
+    /// The long-lived loops, all wrapped. 41 = the 45 loop-shaped
     /// `tokio::spawn` sites this file carried on 2026-09-07 minus the three
-    /// that only LOOK like loops to a windowed scan: the
+    /// that only LOOK like loops to a windowed scan (the
     /// `grandfather_embedding_model` one-shot, the crash-recovery startup
     /// sweep, and the actor-memory embedding backfill — each a single
-    /// awaited call that is meant to finish.
-    const EXPECTED_SUPERVISED: usize = 42;
+    /// awaited call that is meant to finish) minus, from 2026-09-08,
+    /// `start_worker_management`, which was never a loop at all.
+    const EXPECTED_SUPERVISED: usize = 41;
 
     /// The remaining bare `tokio::spawn` calls in THIS file, deliberately
     /// unwrapped because each is a one-shot whose death is bounded to one
@@ -6776,7 +6785,15 @@ mod task_supervision_wiring_tests {
     ///   4. the per-workflow readiness scan task
     ///   5. the per-integration renewal kick
     ///   6. the per-breach SLA webhook POST
-    const EXPECTED_BARE: usize = 6;
+    ///   7. `talos_worker_fleet::start_worker_management` — a LAUNCHER,
+    ///      not a loop. It spawns the heartbeat listener and the prune
+    ///      loop and returns `Ok(())` at once; supervising IT recorded a
+    ///      healthy launch as a death on every boot (measured live
+    ///      2026-09-08) while the two loops that matter stayed
+    ///      unobserved. They are supervised inside `talos-worker-fleet`,
+    ///      and `the_fleet_launcher_is_not_supervised_here` below is what
+    ///      stops the wrapper migrating back up.
+    const EXPECTED_BARE: usize = 7;
 
     #[test]
     fn every_long_lived_loop_is_supervised() {
@@ -6809,10 +6826,51 @@ mod task_supervision_wiring_tests {
         );
     }
 
+    /// **The launcher must not come back.** Wrapping a function that
+    /// spawns its own loops and returns is behaviourally identical to
+    /// not wrapping it — on a healthy process it produces a `completed`
+    /// exit and an ERROR line one second after boot, and on a DEAD inner
+    /// loop it produces nothing at all.
+    ///
+    /// Measured before this test was written: the count pin above ALONE
+    /// does catch the controller half of that mutation (re-wrapping the
+    /// launcher moves `supervised` 41→42 and `bare` 7→6, so
+    /// `every_long_lived_loop_is_supervised` fails twice). It cannot see
+    /// the OTHER half — the two inner loops reverting to bare spawns in
+    /// `talos-worker-fleet` — which is why that crate carries its own
+    /// pin, `the_two_fleet_loops_are_supervised_not_their_launcher`.
+    /// Neither test covers the other's file; both are needed.
+    #[test]
+    fn the_fleet_launcher_is_not_supervised_here() {
+        let src = include_str!("background.rs");
+        let prod = src
+            .split("mod task_supervision_wiring_tests")
+            .next()
+            .expect("this module's own text must be excluded");
+        let call = prod
+            .find("talos_worker_fleet::start_worker_management")
+            .expect("the fleet launcher must still be started from here");
+        let window = &prod[call.saturating_sub(600)..call];
+        assert!(
+            !window.contains("spawn_supervised(BackgroundTask::"),
+            "`start_worker_management` is a LAUNCHER — it returns Ok(()) as soon as it \
+             has spawned the heartbeat listener and the prune loop. Supervising the \
+             CALL records a healthy boot as `outcome=\"completed\"` at ERROR and leaves \
+             the two loops that matter unobserved. Supervise them inside \
+             talos-worker-fleet instead (worker_fleet_heartbeat / worker_fleet_prune)."
+        );
+    }
+
     /// The panic hook is installed in exactly one place per binary and its
     /// collectors registered in exactly one place. Deleting either call
     /// leaves every test in the workspace green while the process goes back
     /// to printing one unstructured stderr line per panic.
+    ///
+    /// The registration ALSO decides what gets pre-seeded, and each
+    /// binary must name the set it can actually increment: the worker
+    /// supervises nothing and must pass `&[]`. Until 2026-09-08 it
+    /// passed the whole table implicitly and exposed 126 exit series it
+    /// could never move.
     #[test]
     fn the_panic_hook_is_wired_in_both_binaries() {
         let controller_main = include_str!("../main.rs");
@@ -6822,10 +6880,22 @@ mod task_supervision_wiring_tests {
         );
         let services = include_str!("services.rs");
         assert!(
-            services.contains("talos_task_supervision::register_metrics(&metrics.registry)"),
+            services.contains("talos_task_supervision::register_metrics(")
+                && services.contains("talos_task_supervision::BackgroundTask::ALL"),
             "the panic + task-exit collectors must be registered into the registry \
-             /metrics/prometheus renders, or both series are absent — and absent \
-             is not zero for every `increase(...) > 0` alert built on them"
+             /metrics/prometheus renders, seeded over the FULL task table — or the \
+             series are absent, and absent is not zero for every `increase(...) > 0` \
+             alert built on them"
+        );
+        let worker_main = include_str!("../../../worker/src/main.rs");
+        assert!(
+            worker_main.contains(
+                "talos_task_supervision::register_metrics(prometheus::default_registry(), &[])"
+            ),
+            "the worker supervises no BackgroundTask, so it must seed NO exit series. \
+             Passing the whole table there exposes 126 `(task, outcome)` pairs at 0 \
+             that nothing in that process can increment — the mirror of the \
+             absent-is-not-zero defect, and check 58's own rule."
         );
     }
 }

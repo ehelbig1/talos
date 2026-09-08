@@ -25,6 +25,7 @@ talos-execution-repository = { path = "../talos-execution-repository" }
 talos-module-executions = { path = "../talos-module-executions" }
 talos-registry = { path = "../talos-registry" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
+talos-task-supervision = { path = "../talos-task-supervision" }
 talos-worker-fleet = { path = "../talos-worker-fleet" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }

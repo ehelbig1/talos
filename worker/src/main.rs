@@ -2380,7 +2380,15 @@ async fn main() -> anyhow::Result<()> {
     // value is seeded: a `{process="controller"}` series on a worker's
     // `/metrics` would imply a signal nothing here can increment.
     talos_task_supervision::install_panic_hook("worker");
-    if let Err(e) = talos_task_supervision::register_metrics(prometheus::default_registry()) {
+    // The worker supervises NO `BackgroundTask`, so it seeds NO
+    // `talos_background_task_exits_total` series. Until 2026-09-08 it
+    // passed the whole table implicitly and its `/metrics` carried all
+    // 126 controller-only `(task, outcome)` pairs at 0 — measured live —
+    // i.e. seeded combinations nothing in this process can ever
+    // increment, which is check 58's own rule and the very claim the
+    // comment above makes about the `process` label. If a worker loop is
+    // ever supervised, name it here.
+    if let Err(e) = talos_task_supervision::register_metrics(prometheus::default_registry(), &[]) {
         eprintln!("Warning: failed to register panic metrics: {e}");
     }
 

@@ -12,6 +12,14 @@
 //! configured. Package 22 fixed the one such panic that was found (the
 //! SLA monitor's NULL webhook decode); the CLASS stayed open.
 //!
+//! **That 54 was a SCOPE, not a population.** Re-measured 2026-09-08
+//! over `talos-*/src` + `worker/src` as well: **127** further bare
+//! `tokio::spawn` call sites, **32** of them long-lived loops, in 34
+//! crates the first pass never looked at. Seven of those loops are
+//! supervised here as of this date; the rest are inventoried in
+//! `scripts/background-task-inventory.py` and in that day's
+//! `AGENT_NOTES.md`.
+//!
 //! # The two instruments answer different questions
 //!
 //! * [`install_panic_hook`] covers **every** panic in the process —
@@ -25,6 +33,18 @@
 //!   `break`s, or whose `while let Some(_) = rx.recv().await` ends
 //!   because the channel closed, returns `Ok(())` — no panic, no log,
 //!   no trace, and the subsystem is simply off for the process lifetime.
+//!
+//! # A clean exit is not one thing ([`TaskExit`])
+//!
+//! Shipped 2026-09-07, the wrapper's future returned `()`, so "the loop
+//! stopped" and "this task chose not to start under this configuration"
+//! were the SAME VALUE. Its own first boot proved that mattered: two of
+//! the forty-two supervised bodies returned within a second and both
+//! were logged at ERROR as loops that had died. The future now returns
+//! [`TaskExit`]. A genuine `loop {}` has type `!` and coerces, so every
+//! real loop compiles unchanged; every body that CAN return must say
+//! which of the three things happened, and the compiler — not a grep —
+//! enumerates that population.
 //!
 //! Neither is a supervisor: nothing is restarted. Restarting a loop
 //! whose panic is deterministic would spin; deciding per-task whether a
@@ -79,7 +99,7 @@ macro_rules! background_tasks {
 }
 
 background_tasks! {
-    WorkerFleetManagement       => "worker_fleet_management",
+    // ── Controller bootstrap loops (controller/src/bootstrap/background.rs) ──
     WorkerFleetGauge            => "worker_fleet_gauge",
     EmbeddingProviderProbe      => "embedding_provider_probe",
     CryptoInvariantGauge        => "crypto_invariant_gauge",
@@ -121,12 +141,134 @@ background_tasks! {
     StaleExecutionSweep         => "stale_execution_sweep",
     Scheduler                   => "scheduler",
     SlaBreachMonitor            => "sla_breach_monitor",
+
+    // ── Loops owned by LIBRARY crates (2026-09-08). ──
+    //
+    // These are the loops whose LAUNCHER the controller used to
+    // supervise, plus their siblings in the same crates. Supervision
+    // belongs where the loop is: `WorkerFleetManagement` (dropped
+    // above) named a function that spawned these two and returned
+    // `Ok(())` at once, so the wrapper recorded a healthy launch as a
+    // death and the two loops that matter stayed exactly as
+    // unobserved as they were before the wrapper existed.
+    WorkerFleetHeartbeat        => "worker_fleet_heartbeat",
+    WorkerFleetPrune            => "worker_fleet_prune",
+    AuditLedgerSubscriber       => "audit_ledger_subscriber",
+    EnvelopeSealClaimResponder  => "envelope_seal_claim_responder",
+    EnvelopeSealOrphanSweep     => "envelope_seal_orphan_sweep",
+    IntegrationStateSweeper     => "integration_state_sweeper",
+    // One variant per signed-RPC subject rather than one shared
+    // `rpc_subscriber`: the whole value of the `task` label is naming
+    // WHICH loop stopped, and the seven subjects fail independently
+    // (a dead `talos.memory.op` subscriber times out every actor-memory
+    // call while `talos.state.write` keeps running).
+    GraphRpcSubscriber          => "graph_rpc_subscriber",
+    MlPredictRpcSubscriber      => "ml_predict_rpc_subscriber",
+    MlFewshotRpcSubscriber      => "ml_fewshot_rpc_subscriber",
+    MemoryRpcSubscriber         => "memory_rpc_subscriber",
+    DatabaseRpcSubscriber       => "database_rpc_subscriber",
+    StateWriteRpcSubscriber     => "state_write_rpc_subscriber",
+    IntegrationStateRpcSubscriber => "integration_state_rpc_subscriber",
 }
 
-/// How a supervised task stopped. Three values, not two: a `JoinError`
-/// is either a panic or a cancellation, and folding an abort into
-/// "panicked" would report a deliberate shutdown as a defect.
-pub const EXIT_OUTCOMES: &[&str] = &["panicked", "completed", "cancelled"];
+/// Why a supervised body stopped running.
+///
+/// This is the return type of every supervised future, and the point is
+/// that **the compiler enumerates the population**. A genuine
+/// `loop { .. }` with no `break` has type `!`, which coerces to this
+/// enum, so every task that really does run for the process lifetime
+/// compiles unchanged and says nothing. Every body that CAN return must
+/// now say why — which is the fact [`spawn_supervised`] could not
+/// represent when its future returned `()`.
+///
+/// Measured live 2026-09-08, on the first boot after the wrapper
+/// shipped: two of the forty-two supervised bodies returned one second
+/// after boot and were both recorded `completed` and logged at ERROR —
+/// `registry_sync` (OCI sync is opt-in and `TALOS_REGISTRY_URL` is
+/// unset on this fleet) and `worker_fleet_management` (a LAUNCHER that
+/// spawned its own two loops and returned `Ok(())`). Neither is a loop
+/// that stopped; both read exactly like one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[must_use = "a supervised body's exit must be reported, not dropped"]
+pub enum TaskExit {
+    /// The task deliberately did not start under this configuration.
+    /// Not a failure: logged at INFO, recorded under the `declined`
+    /// outcome, and EXCLUDED from `TalosBackgroundTaskExited`.
+    Declined(DeclineReason),
+    /// The task ran and stopped because the process is shutting down.
+    /// Also not a failure — but deliberately NOT folded into
+    /// [`TaskExit::Declined`], which is a statement about configuration
+    /// at START. Calling a shutdown "declined" would assert the task
+    /// never ran, which is the same false-report class this type
+    /// removes.
+    ShuttingDown,
+    /// The task's own loop ended. Recorded `completed`, logged at ERROR
+    /// and alerted — this is the finding the instrument exists for, and
+    /// it keeps every property it had.
+    LoopEnded,
+}
+
+impl TaskExit {
+    /// The `outcome` label value for this exit.
+    #[must_use]
+    pub const fn outcome(self) -> &'static str {
+        match self {
+            TaskExit::Declined(_) => "declined",
+            TaskExit::ShuttingDown => "shutdown",
+            TaskExit::LoopEnded => "completed",
+        }
+    }
+
+    /// Whether this exit is a finding an operator should be woken by.
+    /// Kept as ONE predicate so the log level and the alert's own
+    /// `outcome!~` selector cannot drift apart.
+    #[must_use]
+    pub const fn is_finding(self) -> bool {
+        matches!(self, TaskExit::LoopEnded)
+    }
+}
+
+/// Why a task declined to start. A CLOSED enum, not a `&str`: the reason
+/// reaches a log FIELD (never a metric label — `outcome` is the only
+/// label this adds, and it has five compile-time values), and a closed
+/// set means the population of "tasks that can legitimately not start"
+/// is enumerable from the type rather than by grep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DeclineReason {
+    /// A required endpoint, URL or credential is not configured, so the
+    /// subsystem this task maintains is not in use on this deployment.
+    NotConfigured,
+    /// An opt-in feature flag is off. The task exists; the operator has
+    /// not asked for it.
+    FeatureDisabled,
+    /// A policy choice this task refuses to guess was not made
+    /// explicitly, so it withholds itself rather than run unverified.
+    PolicyNotExplicit,
+}
+
+impl DeclineReason {
+    /// The `reason` log-field value.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            DeclineReason::NotConfigured => "not_configured",
+            DeclineReason::FeatureDisabled => "feature_disabled",
+            DeclineReason::PolicyNotExplicit => "policy_not_explicit",
+        }
+    }
+}
+
+/// How a supervised task stopped. FIVE values, and each split is a
+/// distinction some reader acts on:
+/// * a `JoinError` is either a panic or a cancellation, and folding an
+///   abort into "panicked" would report a deliberate shutdown as a
+///   defect;
+/// * `declined` and `shutdown` are the two ways a body returns WITHOUT
+///   anything having gone wrong, and until 2026-09-08 both rendered as
+///   `completed` — an ERROR line and an alertable increment on a
+///   healthy boot, which is precisely the train-the-operator-to-ignore-it
+///   defect (check 69's class) inside the instrument built to remove it.
+pub const EXIT_OUTCOMES: &[&str] = &["panicked", "completed", "cancelled", "declined", "shutdown"];
 
 /// Longest panic message kept in the log line. A panic payload is
 /// arbitrary caller text — it can carry a whole formatted struct — and
@@ -158,19 +300,43 @@ fn instruments() -> &'static Instruments {
             &["process"],
         )
         .expect("static metric opts"),
-        exits: CounterVec::new(
-            Opts::new(
-                "talos_background_task_exits_total",
-                "Terminations of a supervised long-lived background task, by \
+        exits: exits_collector(),
+    })
+}
+
+/// The exits collector's construction, split out so a test can build a
+/// FRESH one: `INSTRUMENTS` is a process-global `OnceLock`, so a sibling
+/// test that records an exit leaves that child present in every later
+/// `Registry` the same collector is registered into — an assertion about
+/// what seeding does could not otherwise be made in one test binary.
+fn exits_collector() -> CounterVec {
+    CounterVec::new(
+        Opts::new(
+            "talos_background_task_exits_total",
+            "Terminations of a supervised long-lived background task, by \
                  task and outcome. Every one of these loops is meant to run \
                  for the process lifetime, so ANY outcome here is a finding — \
                  'completed' most of all, because a clean exit is the one a \
                  panic hook structurally cannot see.",
-            ),
-            &["task", "outcome"],
-        )
-        .expect("static metric opts"),
-    })
+        ),
+        &["task", "outcome"],
+    )
+    .expect("static metric opts")
+}
+
+/// Pre-seed every `(task, outcome)` pair the CALLING process can produce
+/// at 0. `increase(...) > 0` over an ABSENT series matches nothing, so
+/// an unseeded pair makes "this loop has never exited" and "this
+/// instrument was never wired" render identically; seeding a pair the
+/// process CANNOT produce is the mirror defect (check 58).
+fn seed_exits(exits: &CounterVec, supervised: &[BackgroundTask]) {
+    for task in supervised {
+        for outcome in EXIT_OUTCOMES {
+            exits
+                .with_label_values(&[task.as_str(), outcome])
+                .inc_by(0.0);
+        }
+    }
 }
 
 /// Install the process-wide panic hook.
@@ -216,7 +382,19 @@ pub fn install_panic_hook(process: &'static str) {
 }
 
 /// Register both collectors into `registry` and PRE-SEED every series
-/// this process can increment at 0.
+/// **this process can increment** at 0.
+///
+/// `supervised` is the set of tasks THIS binary wraps, and it is a
+/// required argument rather than `BackgroundTask::ALL` because seeding
+/// more than that is the defect the seeding exists to avoid. Measured
+/// live 2026-09-08: the worker calls this function and supervises
+/// nothing, so its `/metrics` exposed all 126 controller-only
+/// `talos_background_task_exits_total` series at 0 — a seeded
+/// combination nothing in that process can ever increment, which is
+/// check 58's own rule, and the same claim this crate's docs made about
+/// the `process` label while breaking it for `task`. The controller
+/// passes [`BackgroundTask::ALL`]; the worker passes `&[]` and exposes
+/// only its (live) panic counter.
 ///
 /// Split from [`install_panic_hook`] deliberately: the hook must go in
 /// before anything can panic, which is earlier than the metrics registry
@@ -225,20 +403,17 @@ pub fn install_panic_hook(process: &'static str) {
 ///
 /// # Errors
 /// Propagates a duplicate-registration error from `prometheus`.
-pub fn register_metrics(registry: &Registry) -> prometheus::Result<()> {
+pub fn register_metrics(
+    registry: &Registry,
+    supervised: &[BackgroundTask],
+) -> prometheus::Result<()> {
     let inst = instruments();
     registry.register(Box::new(inst.panics.clone()))?;
     registry.register(Box::new(inst.exits.clone()))?;
     if let Some(p) = PROCESS.get() {
         inst.panics.with_label_values(&[p]).inc_by(0.0);
     }
-    for task in BackgroundTask::ALL {
-        for outcome in EXIT_OUTCOMES {
-            inst.exits
-                .with_label_values(&[task.as_str(), outcome])
-                .inc_by(0.0);
-        }
-    }
+    seed_exits(&inst.exits, supervised);
     Ok(())
 }
 
@@ -251,23 +426,69 @@ pub fn register_metrics(registry: &Registry) -> prometheus::Result<()> {
 /// Nothing is restarted — see the crate docs for why.
 pub fn spawn_supervised<F>(task: BackgroundTask, fut: F) -> tokio::task::JoinHandle<()>
 where
-    F: Future<Output = ()> + Send + 'static,
+    F: Future<Output = TaskExit> + Send + 'static,
 {
     tokio::spawn(async move {
         let inner = tokio::spawn(fut);
-        let outcome = match inner.await {
-            Ok(()) => "completed",
-            Err(e) if e.is_panic() => "panicked",
-            Err(_) => "cancelled",
-        };
-        record_exit(task, outcome);
+        match inner.await {
+            Ok(exit) => record_exit(task, exit),
+            Err(e) if e.is_panic() => record_join_failure(task, "panicked"),
+            Err(_) => record_join_failure(task, "cancelled"),
+        }
     })
 }
 
-/// Record one supervised-task termination. Public so a task that owns
-/// its own join plumbing can report through the same instrument rather
-/// than inventing a second one.
-pub fn record_exit(task: BackgroundTask, outcome: &'static str) {
+/// Record one supervised-task termination that the body itself
+/// classified. Public so a task that owns its own join plumbing can
+/// report through the same instrument rather than inventing a second
+/// one.
+pub fn record_exit(task: BackgroundTask, exit: TaskExit) {
+    instruments()
+        .exits
+        .with_label_values(&[task.as_str(), exit.outcome()])
+        .inc();
+    if exit.is_finding() {
+        tracing::error!(
+            target: "talos_audit",
+            event_kind = "background_task_exited",
+            task = task.as_str(),
+            outcome = exit.outcome(),
+            "a long-lived background task stopped; it will not be restarted"
+        );
+        return;
+    }
+    // NOT a finding: INFO, under its OWN event_kind so a log-based
+    // detector keyed on `background_task_exited` keeps meaning exactly
+    // what it meant. An ERROR that fires on every healthy boot trains
+    // operators to ignore ERROR — the exact defect this instrument was
+    // built to make visible, one level up.
+    match exit {
+        TaskExit::Declined(reason) => tracing::info!(
+            target: "talos_audit",
+            event_kind = "background_task_declined",
+            task = task.as_str(),
+            outcome = exit.outcome(),
+            reason = reason.as_str(),
+            "a supervised background task did not start under this configuration"
+        ),
+        TaskExit::ShuttingDown => tracing::info!(
+            target: "talos_audit",
+            event_kind = "background_task_shutdown",
+            task = task.as_str(),
+            outcome = exit.outcome(),
+            "a supervised background task stopped because the process is shutting down"
+        ),
+        // Unreachable: `is_finding()` returned above for this variant.
+        // Written as an exhaustive arm rather than a `_` so a sixth
+        // variant cannot silently inherit the INFO path.
+        TaskExit::LoopEnded => {}
+    }
+}
+
+/// Record a termination the BODY could not classify because it never
+/// returned: a panic or an abort observed through the `JoinError`.
+/// Always a finding.
+fn record_join_failure(task: BackgroundTask, outcome: &'static str) {
     instruments()
         .exits
         .with_label_values(&[task.as_str(), outcome])
@@ -360,18 +581,60 @@ mod tests {
         }
     }
 
+    /// A process that supervises NOTHING must expose NO exit series.
+    ///
+    /// Measured live 2026-09-08: the worker did — all 126 of them, at 0
+    /// — because it called `register_metrics` and the seeding walked the
+    /// whole `BackgroundTask` table regardless of caller. Those are
+    /// seeded combinations nothing in that process can ever increment,
+    /// which is check 58's own rule and exactly the claim this crate's
+    /// docs made about the `process` label while breaking it for `task`.
+    ///
+    /// Driven against a FRESH collector rather than through
+    /// `register_metrics`: `INSTRUMENTS` is a process-global `OnceLock`,
+    /// so a sibling test that records one exit leaves that child in
+    /// every later registry and the assertion would be order-dependent.
+    /// The seeding routine under test is the same one `register_metrics`
+    /// calls.
+    #[test]
+    fn a_process_that_supervises_nothing_seeds_no_exit_series() {
+        let empty = exits_collector();
+        seed_exits(&empty, &[]);
+        let reg = Registry::new();
+        reg.register(Box::new(empty)).expect("register");
+        assert!(
+            !render(&reg).contains("talos_background_task_exits_total{"),
+            "a non-supervising process must export no `(task, outcome)` series"
+        );
+
+        // Positive control on the same fresh collector: the seeding IS
+        // wired, so an empty result means "nothing asked for", not
+        // "seeding is broken".
+        let full = exits_collector();
+        seed_exits(&full, BackgroundTask::ALL);
+        let reg2 = Registry::new();
+        reg2.register(Box::new(full)).expect("register");
+        let n = render(&reg2)
+            .lines()
+            .filter(|l| l.starts_with("talos_background_task_exits_total{"))
+            .count();
+        assert_eq!(n, BackgroundTask::ALL.len() * EXIT_OUTCOMES.len());
+    }
+
+    fn render(reg: &Registry) -> String {
+        use prometheus::Encoder as _;
+        let mut buf = Vec::new();
+        prometheus::TextEncoder::new()
+            .encode(&reg.gather(), &mut buf)
+            .expect("encode");
+        String::from_utf8(buf).expect("utf8")
+    }
+
     #[test]
     fn registering_seeds_every_pair_at_zero() {
         let reg = Registry::new();
-        register_metrics(&reg).expect("register");
-        let rendered = {
-            use prometheus::Encoder as _;
-            let mut buf = Vec::new();
-            prometheus::TextEncoder::new()
-                .encode(&reg.gather(), &mut buf)
-                .expect("encode");
-            String::from_utf8(buf).expect("utf8")
-        };
+        register_metrics(&reg, BackgroundTask::ALL).expect("register");
+        let rendered = render(&reg);
         // Absent is not zero: every pair must be present in the
         // exposition BEFORE anything has ever exited.
         for t in BackgroundTask::ALL {
@@ -384,6 +647,32 @@ mod tests {
                     "missing pre-seeded series for {want}"
                 );
             }
+        }
+    }
+
+    /// The one predicate the log level AND the alert's `outcome!~`
+    /// selector both rest on. If these two ever disagree, an ERROR line
+    /// exists with no alert behind it, or an alert fires on a line
+    /// nobody logged at ERROR.
+    #[test]
+    fn only_a_stopped_loop_is_a_finding() {
+        assert!(TaskExit::LoopEnded.is_finding());
+        assert!(!TaskExit::ShuttingDown.is_finding());
+        for r in [
+            DeclineReason::NotConfigured,
+            DeclineReason::FeatureDisabled,
+            DeclineReason::PolicyNotExplicit,
+        ] {
+            assert!(!TaskExit::Declined(r).is_finding());
+            assert_eq!(TaskExit::Declined(r).outcome(), "declined");
+        }
+        assert_eq!(TaskExit::ShuttingDown.outcome(), "shutdown");
+        assert_eq!(TaskExit::LoopEnded.outcome(), "completed");
+        // Every outcome a body can produce must be in the seeded set,
+        // or its series is ABSENT until the first one happens — and
+        // absent is not zero for `increase(...) > 0`.
+        for o in ["declined", "shutdown", "completed"] {
+            assert!(EXIT_OUTCOMES.contains(&o), "{o} is not pre-seeded");
         }
     }
 
@@ -521,7 +810,7 @@ mod hook_tests {
         let _guard = HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let before_panics = panic_count_for_tests();
         let before = exit_count_for_tests(BackgroundTask::RegistrySync, "completed");
-        spawn_supervised(BackgroundTask::RegistrySync, async {})
+        spawn_supervised(BackgroundTask::RegistrySync, async { TaskExit::LoopEnded })
             .await
             .expect("supervisor task");
         assert_eq!(
@@ -533,5 +822,136 @@ mod hook_tests {
             before_panics,
             "a clean exit must not touch the panic counter"
         );
+    }
+
+    /// **THE REGRESSION.** `registry_sync` is a by-config return on this
+    /// fleet — `TALOS_REGISTRY_URL` is unset, so the loop declines to
+    /// start and disk seeding remains the source of truth. Until
+    /// 2026-09-08 that landed on `outcome="completed"` and an ERROR line
+    /// one second after every boot, alongside `worker_fleet_management`.
+    ///
+    /// The pre-fix code could not have been given this test: the future
+    /// returned `()`, so a declined start and a dead loop were literally
+    /// the same value and no assertion could separate them. What stood
+    /// in for it was the live read — `talos_background_task_exits_total`
+    /// summing to 2 across 126 series on a healthy controller, and two
+    /// `event_kind="background_task_exited"` ERROR lines at
+    /// 2026-09-08T11:53:14Z. This test is what that reading is worth
+    /// now: the declined outcome moves, `completed` does NOT, and the
+    /// log line is an INFO carrying the reason.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_by_config_return_is_declined_not_completed() {
+        let _guard = HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = capture();
+        let before_completed = exit_count_for_tests(BackgroundTask::RegistrySync, "completed");
+        let before_declined = exit_count_for_tests(BackgroundTask::RegistrySync, "declined");
+        if let Ok(mut g) = cap.0.lock() {
+            g.clear();
+        }
+
+        spawn_supervised(BackgroundTask::RegistrySync, async {
+            TaskExit::Declined(DeclineReason::NotConfigured)
+        })
+        .await
+        .expect("supervisor task");
+
+        assert_eq!(
+            exit_count_for_tests(BackgroundTask::RegistrySync, "declined") - before_declined,
+            1.0,
+            "a declined start must be recorded under its own outcome"
+        );
+        assert_eq!(
+            exit_count_for_tests(BackgroundTask::RegistrySync, "completed"),
+            before_completed,
+            "a declined start must NOT move `completed` — that is the series \
+             TalosBackgroundTaskExited fires on, and this is a healthy boot"
+        );
+
+        let lines = cap.0.lock().expect("capture").clone();
+        assert!(
+            !lines.iter().any(|l| l.contains("background_task_exited")),
+            "a declined start must emit no `background_task_exited` line at all: {lines:?}"
+        );
+        let declined = lines
+            .iter()
+            .find(|l| l.contains("background_task_declined"))
+            .unwrap_or_else(|| panic!("no decline event in {lines:?}"));
+        assert!(declined.contains("target=talos_audit"), "{declined}");
+        assert!(declined.contains("task=registry_sync"), "{declined}");
+        assert!(declined.contains("outcome=declined"), "{declined}");
+        assert!(declined.contains("reason=not_configured"), "{declined}");
+    }
+
+    /// A loop that stops because the PROCESS is stopping is the other
+    /// healthy return, and it is deliberately not spelled `declined`:
+    /// three of the five bodies the 2026-09-08 measurement examined
+    /// (both integration renewals and the workflow scheduler) run for
+    /// the whole process lifetime and return only on the shutdown watch.
+    /// Calling that "declined" would assert they never ran.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_shutdown_return_is_neither_completed_nor_declined() {
+        let _guard = HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = capture();
+        let before_completed = exit_count_for_tests(BackgroundTask::Scheduler, "completed");
+        let before_declined = exit_count_for_tests(BackgroundTask::Scheduler, "declined");
+        let before_shutdown = exit_count_for_tests(BackgroundTask::Scheduler, "shutdown");
+        if let Ok(mut g) = cap.0.lock() {
+            g.clear();
+        }
+
+        spawn_supervised(BackgroundTask::Scheduler, async { TaskExit::ShuttingDown })
+            .await
+            .expect("supervisor task");
+
+        assert_eq!(
+            exit_count_for_tests(BackgroundTask::Scheduler, "shutdown") - before_shutdown,
+            1.0
+        );
+        assert_eq!(
+            exit_count_for_tests(BackgroundTask::Scheduler, "completed"),
+            before_completed
+        );
+        assert_eq!(
+            exit_count_for_tests(BackgroundTask::Scheduler, "declined"),
+            before_declined
+        );
+        let lines = cap.0.lock().expect("capture").clone();
+        assert!(
+            !lines.iter().any(|l| l.contains("background_task_exited")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("background_task_shutdown")),
+            "{lines:?}"
+        );
+    }
+
+    /// `completed` KEEPS everything it had: the ERROR line and the
+    /// alertable increment. The point of the split is that the finding
+    /// stays a finding.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_loop_that_fell_out_still_errors() {
+        let _guard = HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = capture();
+        let before = exit_count_for_tests(BackgroundTask::JobResultSubscriber, "completed");
+        if let Ok(mut g) = cap.0.lock() {
+            g.clear();
+        }
+        spawn_supervised(BackgroundTask::JobResultSubscriber, async {
+            TaskExit::LoopEnded
+        })
+        .await
+        .expect("supervisor task");
+        assert_eq!(
+            exit_count_for_tests(BackgroundTask::JobResultSubscriber, "completed") - before,
+            1.0
+        );
+        let lines = cap.0.lock().expect("capture").clone();
+        let exited = lines
+            .iter()
+            .find(|l| l.contains("background_task_exited"))
+            .unwrap_or_else(|| panic!("no exit event in {lines:?}"));
+        assert!(exited.contains("task=job_result_subscriber"), "{exited}");
+        assert!(exited.contains("outcome=completed"), "{exited}");
     }
 }

@@ -31,6 +31,7 @@
 
 use async_trait::async_trait;
 use std::sync::Arc;
+use talos_task_supervision::TaskExit;
 use tokio::time::{interval, Duration};
 use uuid::Uuid;
 
@@ -97,14 +98,14 @@ pub trait RenewableIntegration: Send + Sync + 'static {
 pub async fn run_renewal_scheduler<P: RenewableIntegration>(
     provider: Arc<P>,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) {
+) -> TaskExit {
     let mut tick = interval(Duration::from_secs(provider.tick_seconds()));
 
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => {
                 provider.log_shutdown();
-                return;
+                return TaskExit::ShuttingDown;
             }
             _ = tick.tick() => {}
         }

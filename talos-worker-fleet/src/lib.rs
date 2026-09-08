@@ -155,6 +155,7 @@
 use dashmap::DashMap;
 use futures::StreamExt;
 use std::sync::Arc;
+use talos_task_supervision::{spawn_supervised, BackgroundTask};
 use talos_workflow_job_protocol::{WorkerHeartbeat, WORKER_HEARTBEAT_MAX_AGE_SECS};
 use tokio::time::{Duration, Instant};
 
@@ -631,6 +632,28 @@ impl WorkerManager {
 }
 
 /// Spawns the background tasks for heartbeat subscription and stale worker pruning.
+///
+/// This function is a LAUNCHER: it spawns the two long-lived loops and
+/// returns `Ok(())` at once. That distinction was invisible until
+/// 2026-09-08, when the controller wrapped THIS CALL in
+/// `spawn_supervised(BackgroundTask::WorkerFleetManagement, ..)` and the
+/// first boot logged `background_task_exited task="worker_fleet_management"
+/// outcome="completed"` at ERROR, one second in — a wrapper over a
+/// launcher is behaviourally identical to no wrapper, and the two loops
+/// that matter were left exactly as unobserved as they had been.
+///
+/// So the supervision moved INSIDE, onto the loops themselves
+/// ([`BackgroundTask::WorkerFleetHeartbeat`] and
+/// [`BackgroundTask::WorkerFleetPrune`]). `talos-task-supervision` is a
+/// leaf crate (`prometheus` + `tokio` + `tracing`), so this edge does not
+/// touch structural lint check 67(b), which forbids this crate `sqlx`,
+/// `reqwest` and the worker-identity repository — the three ways it could
+/// reach the identity trust boundary.
+///
+/// The coupling worth knowing when reading the two counters: if the
+/// heartbeat listener dies while the prune loop survives, every worker
+/// ages past `STALE_AFTER` and the fleet view reports the entire fleet
+/// down.
 pub async fn start_worker_management(
     manager: Arc<WorkerManager>,
     nats: async_nats::Client,
@@ -654,7 +677,7 @@ pub async fn start_worker_management(
     // re-init). The supervisor re-binds on that boundary.
     let manager_hb = manager.clone();
     let nats_hb = nats.clone();
-    tokio::spawn(async move {
+    spawn_supervised(BackgroundTask::WorkerFleetHeartbeat, async move {
         tracing::info!(
             target: "talos_worker_fleet",
             event_kind = "heartbeat_listener_started",
@@ -711,7 +734,7 @@ pub async fn start_worker_management(
     //    eviction window: a worker that stops heartbeating leaves the view
     //    within STALE_AFTER + PRUNE_INTERVAL.
     let manager_prune = manager.clone();
-    tokio::spawn(async move {
+    spawn_supervised(BackgroundTask::WorkerFleetPrune, async move {
         let mut interval = tokio::time::interval(PRUNE_INTERVAL);
         loop {
             interval.tick().await;
@@ -773,6 +796,53 @@ mod tests {
     /// re-exported alias, or performed by ANOTHER crate holding an
     /// `Arc<WorkerManager>`, would not show up. The dependency leg below is
     /// what turns that from "unlikely" into "has no path at all".
+    /// **The two loops must be supervised HERE, not their launcher.**
+    ///
+    /// `start_worker_management` spawns the heartbeat listener and the
+    /// prune loop and returns `Ok(())` at once. On 2026-09-08 the
+    /// controller wrapped the CALL: the first boot logged
+    /// `background_task_exited task="worker_fleet_management"
+    /// outcome="completed"` at ERROR one second in, and the two loops
+    /// were exactly as unobserved as before the wrapper existed.
+    ///
+    /// This pin is the half the controller's own wiring test cannot
+    /// see. Reverting these two to bare `tokio::spawn` is invisible
+    /// there (its count is over `background.rs` alone) and invisible at
+    /// runtime on a healthy process, which is the whole failure mode.
+    ///
+    /// Textual, single-function, and it says nothing about which
+    /// `BackgroundTask` variant is named or whether the future is the
+    /// right one — only that the launcher itself spawns nothing
+    /// unsupervised.
+    #[test]
+    fn the_two_fleet_loops_are_supervised_not_their_launcher() {
+        let full = include_str!("lib.rs");
+        let production = full.split("\n#[cfg(test)]").next().unwrap_or(full);
+        let body = production
+            .split("pub async fn start_worker_management")
+            .nth(1)
+            .expect("start_worker_management must still exist");
+        let supervised = body.matches("spawn_supervised(BackgroundTask::").count();
+        let bare = body
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && t.contains("tokio::spawn(")
+            })
+            .count();
+        assert_eq!(
+            supervised, 2,
+            "the heartbeat listener and the prune loop must BOTH go through \
+             spawn_supervised. Supervising the launcher instead records a healthy \
+             boot as a death and leaves a real death silent."
+        );
+        assert_eq!(
+            bare, 0,
+            "start_worker_management must spawn nothing unsupervised: it returns \
+             Ok(()) immediately, so nothing upstream can observe what it spawned."
+        );
+    }
+
     #[test]
     fn heartbeat_never_touches_the_trust_boundary() {
         let full = include_str!("lib.rs");

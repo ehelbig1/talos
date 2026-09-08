@@ -35,6 +35,7 @@ talos-http-utils = { path = "../talos-http-utils" }
 talos-integration-state = { path = "../talos-integration-state" }
 talos-memory = { path = "../talos-memory" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
+talos-task-supervision = { path = "../talos-task-supervision" }
 talos-text-util = { path = "../talos-text-util" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 thiserror = "2.0"

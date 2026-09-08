@@ -32,6 +32,7 @@ use reqwest::Client as HttpClient;
 use serde::Deserialize;
 use std::env;
 use std::sync::Arc;
+use talos_task_supervision::{DeclineReason, TaskExit};
 use tokio::time::{sleep, Duration};
 
 // ───────────────────────────────────────────────────────────────────────
@@ -307,7 +308,7 @@ struct TagsResponse {
     tags: Option<Vec<String>>,
 }
 
-pub async fn start_registry_sync_loop(registry: Arc<ModuleRegistry>) {
+pub async fn start_registry_sync_loop(registry: Arc<ModuleRegistry>) -> TaskExit {
     // OCI registry sync is opt-in via TALOS_REGISTRY_URL. Without an
     // explicit value, the loop doesn't start — disk-seeded templates from
     // `module-templates/` remain the source of truth.
@@ -327,7 +328,7 @@ pub async fn start_registry_sync_loop(registry: Arc<ModuleRegistry>) {
             "TALOS_REGISTRY_URL not set — OCI registry sync disabled. \
              Templates will be served from the disk-seeded set only."
         );
-        return;
+        return TaskExit::Declined(DeclineReason::NotConfigured);
     };
 
     // R3 (Sigstore-policy parity): OCI sync is active, so the Sigstore policy
@@ -353,7 +354,7 @@ pub async fn start_registry_sync_loop(registry: Arc<ModuleRegistry>) {
              during a migration window), or `disabled` (explicitly accept the risk of \
              unsigned artifacts). Disk-seeded templates remain the source of truth meanwhile."
         );
-        return;
+        return TaskExit::Declined(DeclineReason::PolicyNotExplicit);
     };
 
     // MCP-766 (2026-05-13): filter empty so a helm-rendered
