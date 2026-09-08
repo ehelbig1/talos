@@ -22,6 +22,9 @@ use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 use talos_integration_state::execute_op;
 use talos_memory::integration_state_rpc::{IntegrationOp, IntegrationOpResult, ListFilter};
+use talos_push_channel_inventory::{
+    classify_module_binding, ModuleBinding, PushChannelInventory, PushChannelRow,
+};
 use uuid::Uuid;
 
 /// Public API shape — distinct from the internal `WatchChannelRow`.
@@ -314,6 +317,115 @@ fn truncate_error(s: &str, cap: usize) -> String {
         let mut out = s.chars().take(cap).collect::<String>();
         out.push('…');
         out
+    }
+}
+
+/// The operator-report view of this integration's push channels.
+///
+/// Holds a `PgPool` and nothing else — the gmail / google_cloud shape, and for
+/// the same reasons.
+///
+/// Note this integration is LATENT on the reference fleet: measured 2026-09-08,
+/// `google_calendar_watch_channels` holds 0 rows and `integration_state` holds
+/// no `gcal` row at all. It is implemented anyway because the alternative is a
+/// survey that silently covers two integrations of three — which is the
+/// misleading-report class this whole package is about, one level up.
+pub struct GcalPushChannelInventory {
+    pool: sqlx::PgPool,
+}
+
+impl GcalPushChannelInventory {
+    #[must_use]
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait::async_trait]
+impl PushChannelInventory for GcalPushChannelInventory {
+    fn integration_name(&self) -> &'static str {
+        super::watch::GCAL_INTEGRATION_NAME
+    }
+
+    async fn list_channels(&self, user_id: Uuid) -> anyhow::Result<Vec<PushChannelRow>> {
+        let entries = match execute_op(
+            &self.pool,
+            super::watch::GCAL_INTEGRATION_NAME,
+            user_id,
+            IntegrationOp::List {
+                filter: ListFilter::default(),
+                limit: 500,
+            },
+        )
+        .await
+        {
+            Ok(IntegrationOpResult::Entries { entries }) => entries,
+            Ok(_) => vec![],
+            // Err, not an empty list: an unreadable integration is disclosed by
+            // name, never rendered as "this user has no calendar watches".
+            Err(e) => anyhow::bail!("gcal push-channel inventory list failed: {e:?}"),
+        };
+
+        let mut rows: Vec<super::watch::WatchChannelRow> = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            match serde_json::from_str::<super::watch::WatchChannelRow>(&entry.value) {
+                Ok(r) => rows.push(r),
+                Err(e) => tracing::warn!(
+                    key = %entry.key,
+                    %user_id,
+                    error = %e,
+                    "skipping malformed gcal watch row in push-channel inventory"
+                ),
+            }
+        }
+        if rows.is_empty() {
+            return Ok(vec![]);
+        }
+
+        let module_ids: Vec<Uuid> = rows.iter().filter_map(|r| r.module_id).collect();
+        let module_names = talos_registry::module_visibility::visible_module_names(
+            &self.pool,
+            &module_ids,
+            user_id,
+        )
+        .await;
+        if let Err(ref e) = module_names {
+            tracing::warn!(
+                %user_id,
+                error = %e,
+                "gcal push-channel inventory: module lookup failed; \
+                 bindings reported as unreadable"
+            );
+        }
+        let names = module_names.as_ref().cloned().unwrap_or_default();
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let binding = classify_module_binding(r.module_id, &module_names);
+                PushChannelRow {
+                    integration: super::watch::GCAL_INTEGRATION_NAME,
+                    channel_id: r.id,
+                    // The calendar IS the identity here; there is no
+                    // operator-chosen display name on a gcal watch.
+                    display_name: r.calendar_id,
+                    module_id: r.module_id,
+                    module_name: (binding == ModuleBinding::Bound)
+                        .then(|| r.module_id.and_then(|id| names.get(&id).cloned()))
+                        .flatten(),
+                    module_binding: binding,
+                    created_at: DateTime::<Utc>::from_timestamp_millis(r.created_at_ms),
+                    last_event_at: DateTime::<Utc>::from_timestamp_millis(r.updated_at_ms),
+                    // The gcal renewal-failure enrichment is a method on
+                    // `WatchChannelService`, which needs the full service
+                    // handle. Left unattached rather than duplicated: the
+                    // finding this inventory exists for is the BINDING, and a
+                    // renewal failure is already surfaced on the owner-facing
+                    // REST list. Stated rather than silently omitted.
+                    recent_failure: None,
+                }
+            })
+            .collect())
     }
 }
 

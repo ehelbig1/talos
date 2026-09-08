@@ -1848,6 +1848,7 @@ dependencies = [
  "talos-ops-alerts-repository",
  "talos-organizations",
  "talos-public-url",
+ "talos-push-channel-inventory",
  "talos-rate-limit",
  "talos-registry",
  "talos-replay-diff",
@@ -8251,6 +8252,7 @@ dependencies = [
  "talos-memory",
  "talos-module-executions",
  "talos-oauth",
+ "talos-push-channel-inventory",
  "talos-registry",
  "talos-secrets-manager",
  "talos-task-supervision",
@@ -8258,6 +8260,7 @@ dependencies = [
  "talos-trace-nats",
  "talos-workflow-engine-core",
  "talos-workflow-job-protocol",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "urlencoding",
@@ -8296,6 +8299,7 @@ dependencies = [
  "talos-module-executions",
  "talos-oauth",
  "talos-public-url",
+ "talos-push-channel-inventory",
  "talos-registry",
  "talos-secrets-manager",
  "talos-task-supervision",
@@ -8342,6 +8346,7 @@ dependencies = [
  "talos-module-executions",
  "talos-oauth",
  "talos-public-url",
+ "talos-push-channel-inventory",
  "talos-registry",
  "talos-secrets-manager",
  "talos-text-util",
@@ -8440,6 +8445,7 @@ dependencies = [
  "talos-execution-repository",
  "talos-measurement",
  "talos-module-repository",
+ "talos-push-channel-inventory",
  "talos-workflow-liveness",
  "talos-workflow-repository",
  "thiserror 1.0.69",
@@ -8511,6 +8517,7 @@ dependencies = [
  "talos-http-utils",
  "talos-integration-state",
  "talos-memory",
+ "talos-registry",
  "talos-secrets-manager",
  "talos-task-supervision",
  "talos-text-util",
@@ -8683,6 +8690,7 @@ dependencies = [
  "talos-operator-digest",
  "talos-ops-alerts-repository",
  "talos-public-url",
+ "talos-push-channel-inventory",
  "talos-rate-limit",
  "talos-registry",
  "talos-replay-diff",
@@ -9056,6 +9064,19 @@ dependencies = [
  "talos-http-utils",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "talos-push-channel-inventory"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

@@ -12,6 +12,11 @@ talos-workflow-liveness = { path = "../talos-workflow-liveness" }
 # display AND its auto-archive sweep (leaf: serde_json only).
 talos-draft-heuristics = { path = "../talos-draft-heuristics" }
 talos-measurement = { path = "../talos-measurement" }
+# The push-channel inventory TRAIT (leaf: types + one pure classification, no
+# sqlx and no integration crate). This is the bridge that lets the report say
+# a push channel is bound to a module that does not exist WITHOUT this crate
+# depending on talos-gmail / talos-google-calendar / talos-google-cloud.
+talos-push-channel-inventory = { path = "../talos-push-channel-inventory" }
 anyhow.workspace = true
 chrono = { version = "0.4", features = ["serde"] }
 serde_json.workspace = true

@@ -34,6 +34,9 @@ talos-http-body = { path = "../talos-http-body" }
 talos-http-utils = { path = "../talos-http-utils" }
 talos-integration-state = { path = "../talos-integration-state" }
 talos-memory = { path = "../talos-memory" }
+# The ONE three-valued module-visibility read, beside the dispatch-time load
+# whose predicate it is pinned equal to (see `watch_binding`).
+talos-registry = { path = "../talos-registry" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 talos-task-supervision = { path = "../talos-task-supervision" }
 talos-text-util = { path = "../talos-text-util" }

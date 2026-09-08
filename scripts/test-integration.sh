@@ -380,6 +380,13 @@ CTRL_TESTS=(
     # relation the gate's read names removed. `common` harness, so CTRL_TESTS
     # (64b).
     "fail_open_gate_tests"
+    # A push channel bound to a module that is not there. The create gate (a
+    # `200 OK` on pristine main, with a row landed), the shared three-valued
+    # visibility read pinned against the DISPATCH-time load over the SAME rows,
+    # the operator inventory, and the hygiene finding — every one driven end to
+    # end, because the defect is what the create RETURNS and what the report
+    # SAYS. `common` (DATABASE_URL) harness, so CTRL_TESTS, not TC_TESTS (64b).
+    "push_channel_binding_tests"
     "api_key_tests"
     "api_auth_integration_test"
     "integration_mcp_tests"

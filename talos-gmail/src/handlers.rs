@@ -371,21 +371,27 @@ pub async fn create_watch_channel_handler(
         })
         .into_response(),
         Err(e) => {
-            // MCP-924: log server-side, generic to client.
-            tracing::error!(
+            // CLASSIFIED, not collapsed (2026-09-08). MCP-924 made every
+            // failure render `500 "Failed to create watch channel"`, which is
+            // right for an internal error and wrong for "the module you named
+            // does not exist" — a request the caller can fix. `Internal` still
+            // collapses to the generic string.
+            tracing::warn!(
+                target: "talos_audit",
+                event_kind = e.event_kind(),
                 user_id = %user_id,
                 integration_id = %req.integration_id,
                 module_id = ?req.module_id,
                 workflow_id = ?req.workflow_id,
-                error = %e,
-                "Failed to create Gmail watch channel"
+                error = %format!("{e:#}"),
+                "Gmail watch channel create refused"
             );
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                e.status_code(),
                 Json(ApiResponse::<serde_json::Value> {
                     success: false,
                     data: None,
-                    error: Some("Failed to create watch channel".to_string()),
+                    error: Some(e.user_facing_message()),
                 }),
             )
                 .into_response()

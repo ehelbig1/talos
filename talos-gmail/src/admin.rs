@@ -10,7 +10,7 @@
 //! exist for operator tooling: live-test harnesses, bulk cleanup,
 //! creating watches on behalf of a user who's hit an edge case.
 
-use super::watch::GmailWatchService;
+use super::watch::{CreateWatchError, GmailWatchService};
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
@@ -125,23 +125,31 @@ pub async fn create_watch(
             )
         }
         Err(e) => {
-            // create_watch failures may carry Gmail API responses,
-            // Pub/Sub topic errors, or sqlx errors with table names.
-            // Log full chain server-side; return a generic message to
-            // the admin caller per the controller-wide error-hygiene
-            // rule.
-            tracing::error!(
+            // `Internal` still collapses — those failures carry Gmail API
+            // responses, Pub/Sub topic errors, or sqlx errors with table names.
+            // The module-binding refusal does NOT: an operator creating a watch
+            // on a user's behalf is exactly who needs to be told that the module
+            // id they were handed does not exist.
+            tracing::warn!(
+                target: "talos_audit",
+                event_kind = e.event_kind(),
                 user_id = %user_id,
                 ?integration_id,
                 ?module_id,
                 ?workflow_id,
-                "gmail admin: create_watch failed: {:#}",
+                "gmail admin: create_watch refused: {:#}",
                 e
             );
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "Failed to create Gmail watch. Check controller logs."})),
-            )
+            match e {
+                CreateWatchError::Internal(_) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "Failed to create Gmail watch. Check controller logs."})),
+                ),
+                other => (
+                    other.status_code(),
+                    Json(json!({ "error": other.user_facing_message() })),
+                ),
+            }
         }
     }
 }

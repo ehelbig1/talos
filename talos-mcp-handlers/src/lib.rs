@@ -165,6 +165,8 @@ pub mod modules;
 pub mod ollama;
 pub mod ops_alerts;
 pub mod platform;
+#[cfg(test)]
+mod push_channel_wiring_tests;
 pub mod resources;
 pub mod sandbox;
 pub mod schedules;
@@ -337,6 +339,19 @@ pub struct McpState {
     /// `ProbeError` with stable `jsonrpc_code()` and a generic
     /// `user_facing_message()` for internal errors.
     pub judge_probe_service: std::sync::Arc<talos_judge_probe::JudgeProbeService>,
+    /// Push-channel inventories, injected by the controller (2026-09-08).
+    ///
+    /// A trait-object SET rather than a dependency on `talos-gmail` /
+    /// `talos-google-calendar` / `talos-google-cloud`: this crate sits BELOW
+    /// them and the edge the other way is the layering inversion the 2026-09-07
+    /// package refused to make. The newtype hides the `dyn`, following the
+    /// `talos_dlp_provider::DlpService` precedent — this is the only field here
+    /// backed by one.
+    ///
+    /// `None` means this process wired no inventory, and `list_push_channels`
+    /// renders that as `not_measured` — never as an empty list.
+    pub push_channels:
+        Option<std::sync::Arc<talos_push_channel_inventory::PushChannelInventorySet>>,
 }
 
 pub fn create_router(
@@ -374,6 +389,10 @@ pub fn create_router(
     // `talos_config::get_env` so a Helm placeholder `ollamaUrl: ""` falls
     // through to the in-cluster default instead of a base-URL-less client.
     ollama_client: Option<std::sync::Arc<talos_llm::OllamaClient>>,
+    // Built in `bootstrap/services.rs` from the three integration crates, which
+    // only the controller bin may depend on. `None` is a real state and renders
+    // as `not_measured`, so it is threaded rather than defaulted.
+    push_channels: Option<std::sync::Arc<talos_push_channel_inventory::PushChannelInventorySet>>,
 ) -> Router {
     // Construct the actor-policy evaluator with the same repos the
     // MCP handlers use. The sweeper task is started below.
@@ -394,6 +413,7 @@ pub fn create_router(
         workflow_repo.clone(),
         execution_repo.clone(),
         module_repo.clone(),
+        push_channels.clone(),
     ));
     let session_brief_service = std::sync::Arc::new(
         talos_session_brief_service::SessionBriefService::new(advanced_repo.clone()),
@@ -436,6 +456,7 @@ pub fn create_router(
         hygiene_service,
         session_brief_service,
         judge_probe_service,
+        push_channels,
     };
 
     // Authenticated routes (Bearer token required)

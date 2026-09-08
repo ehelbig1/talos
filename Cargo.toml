@@ -44,6 +44,7 @@ members = [
     "talos-schedule-repo",
     "talos-ops-alerts-repository",
     "talos-public-url",
+    "talos-push-channel-inventory",
     "talos-config",
     "talos-integration-state",
     "talos-ml",

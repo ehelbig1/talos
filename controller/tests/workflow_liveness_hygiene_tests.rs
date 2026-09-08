@@ -81,17 +81,20 @@ fn sub_workflow_graph(child: Uuid) -> String {
 fn dormant_recommendation(
     report: &talos_analytics_repository::HygieneReport,
 ) -> Option<serde_json::Value> {
-    talos_hygiene_service::build_report(report)
-        .report
-        .get("recommendations")?
-        .as_array()?
-        .iter()
-        .find(|r| {
-            r.get("action")
-                .and_then(|a| a.as_str())
-                .is_some_and(|a| a.contains("no executions in 30+ days"))
-        })
-        .cloned()
+    talos_hygiene_service::build_report(
+        report,
+        &talos_push_channel_inventory::PushChannelReadout::NotConsulted,
+    )
+    .report
+    .get("recommendations")?
+    .as_array()?
+    .iter()
+    .find(|r| {
+        r.get("action")
+            .and_then(|a| a.as_str())
+            .is_some_and(|a| a.contains("no executions in 30+ days"))
+    })
+    .cloned()
 }
 
 // ───────────── the defect, and the control that keeps it honest ─────────────
@@ -189,7 +192,11 @@ async fn the_archived_exclusion_is_disclosed_with_its_names() {
     names.sort();
     assert_eq!(names, vec!["retired-a", "retired-b"]);
 
-    let rendered = talos_hygiene_service::build_report(&report).report;
+    let rendered = talos_hygiene_service::build_report(
+        &report,
+        &talos_push_channel_inventory::PushChannelReadout::NotConsulted,
+    )
+    .report;
     let block = &rendered["summary"]["archived_excluded"];
     assert_eq!(block["count"], 2, "{block}");
     assert_eq!(block["names_truncated"], false, "{block}");

@@ -14,6 +14,14 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use std::collections::HashMap;
 use talos_integration_helpers::{looks_like_oauth_failure, RenewalFailure};
+// The four binding states and the ONE decision about them moved to
+// `talos-push-channel-inventory` (2026-09-08) so the operator surfaces — which
+// must not depend on this crate — can read the same classification the REST
+// list renders. This crate keeps the projection; the leaf crate keeps the rule.
+use talos_push_channel_inventory::{
+    classify_module_binding, ModuleBinding, PushChannelFailure, PushChannelInventory,
+    PushChannelRow,
+};
 use uuid::Uuid;
 
 #[derive(Serialize, Debug, Clone)]
@@ -30,9 +38,10 @@ pub struct GcpWatchSummary {
     pub push_endpoint: String,
     pub module_id: Option<Uuid>,
     pub module_name: Option<String>,
-    /// THREE-VALUED, plus the no-binding case — because `module_name:
-    /// null` is not one state but three, and until 2026-09-07 they were
-    /// rendered identically.
+    /// FOUR-VALUED — because `module_name: null` is not one state, and
+    /// until 2026-09-07 they were rendered identically. The variants and the
+    /// classifier live in `talos_push_channel_inventory`; the four wire
+    /// spellings below are unchanged and pinned there.
     ///
     /// * `none`       — the watch binds no module; a push is acked and
     ///                  nothing is dispatched. Deliberate configuration.
@@ -49,7 +58,7 @@ pub struct GcpWatchSummary {
     ///                  answer (checks 74 / 79's class), and this read
     ///                  used to be `.unwrap_or_default()`, which
     ///                  produced precisely that.
-    pub module_binding: &'static str,
+    pub module_binding: ModuleBinding,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_push_received: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -81,30 +90,16 @@ pub async fn list_for_user(
     // CLASSIFIED, not defaulted. `Ok(map)` — a definite answer, so an id
     // absent from the map really is a module this user cannot load;
     // `Err` — we could not look, and no claim about any binding is
-    // available. The predicate is deliberately the same
-    // `id = $1 AND (user_id IS NULL OR user_id = $2)` the DISPATCH load
-    // applies (`ModuleRegistry::get_module`), so this surface and the
-    // thing it reports on answer with one rule.
-    let module_names: Result<HashMap<Uuid, String>, sqlx::Error> = if module_ids.is_empty() {
-        Ok(HashMap::new())
-    } else {
-        #[derive(sqlx::FromRow)]
-        struct Row {
-            id: Uuid,
-            name: String,
-        }
-        sqlx::query_as::<_, Row>(
-            "SELECT id, name \
-               FROM modules \
-              WHERE id = ANY($1) \
-                AND (user_id IS NULL OR user_id = $2)",
-        )
-        .bind(&module_ids)
-        .bind(user_id)
-        .fetch_all(&service.pool)
-        .await
-        .map(|db_rows| db_rows.into_iter().map(|r| (r.id, r.name)).collect())
-    };
+    // available. The predicate has ONE home in
+    // `talos_registry::module_visibility`, which pins it equal to the one the
+    // DISPATCH load applies (`ModuleRegistry::get_module`) — this surface and
+    // the thing it reports on answer with one rule.
+    let module_names = talos_registry::module_visibility::visible_module_names(
+        &service.pool,
+        &module_ids,
+        user_id,
+    )
+    .await;
     if let Err(ref e) = module_names {
         tracing::warn!(
             %user_id,
@@ -156,9 +151,25 @@ async fn attach_recent_failures(
         .iter()
         .map(|s| s.channel_uuid.to_string())
         .collect();
+    let mut latest = latest_channel_failures(&service.pool, user_id, &channel_uuids).await;
+    for s in summaries.iter_mut() {
+        if let Some(f) = latest.remove(&s.channel_uuid.to_string()) {
+            s.recent_failure = Some(f);
+        }
+    }
+}
 
-    // Latest push-reject / dispatch-failure audit event per channel_uuid
-    // in the last 25h. Same DISTINCT ON pattern as gmail/gcal.
+/// Latest push-reject / dispatch-failure audit event per `channel_uuid` in the
+/// last 25 h. ONE home for the query, shared by the owner-facing REST summary
+/// and the operator-report inventory — two windows or two event-type lists
+/// would make the same channel look failing on one surface and healthy on the
+/// other.
+async fn latest_channel_failures(
+    pool: &sqlx::PgPool,
+    user_id: Uuid,
+    channel_uuids: &[String],
+) -> HashMap<String, RenewalFailure> {
+    // Same DISTINCT ON pattern as gmail/gcal.
     let rows: Vec<(String, String, bool, Option<String>, DateTime<Utc>)> = sqlx::query_as(
         "SELECT DISTINCT ON (metadata->>'channel_uuid') \
                 metadata->>'channel_uuid' AS channel_uuid, \
@@ -174,8 +185,8 @@ async fn attach_recent_failures(
          ORDER BY metadata->>'channel_uuid', created_at DESC",
     )
     .bind(user_id)
-    .bind(&channel_uuids)
-    .fetch_all(&service.pool)
+    .bind(channel_uuids)
+    .fetch_all(pool)
     .await
     .unwrap_or_default();
 
@@ -194,40 +205,107 @@ async fn attach_recent_failures(
             );
         }
     }
-    for s in summaries.iter_mut() {
-        if let Some(f) = latest.remove(&s.channel_uuid.to_string()) {
-            s.recent_failure = Some(f);
-        }
+    latest
+}
+
+/// The operator-report view of this integration's push channels.
+///
+/// Holds a `PgPool` and nothing else — deliberately NOT a `GcpWatchService`,
+/// which carries the OAuth integration handle and a create-lock map. Two
+/// consequences, both wanted: the inventory can be constructed unconditionally
+/// (a channel ROW survives `GCP_PUBSUB_AUDIENCE` being unset, and an operator
+/// asking "what push channels do I have?" must still be told about it), and it
+/// cannot be used to create a watch, so it can never race the create lock.
+pub struct GcpPushChannelInventory {
+    pool: sqlx::PgPool,
+}
+
+impl GcpPushChannelInventory {
+    #[must_use]
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self { pool }
     }
 }
 
-/// The one place the four binding states are decided, so the REST list
-/// and any future reader cannot disagree about what a `null`
-/// `module_name` means.
-///
-/// It takes the LOOKUP'S OWN `Result`, not a pre-flattened `Option`, and
-/// that is structural rather than stylistic. With an `Option` parameter
-/// the classifier is perfectly correct and the CALL SITE can still hand
-/// it `Some(HashMap::new())` on an `Err` — a one-line revert to the
-/// pre-fix `.unwrap_or_default()` behaviour that every test here
-/// SURVIVES (measured 2026-09-07: mutation M-V1d). Reading the `Result`
-/// makes that collapse take a deliberate rewrite of the read instead of
-/// a defaulted argument. It does not make it impossible; checks 74b and
-/// 79b both state that a guard at the read cannot see an answer computed
-/// correctly and then discarded.
-pub fn classify_module_binding<E>(
-    module_id: Option<Uuid>,
-    names: &Result<HashMap<Uuid, String>, E>,
-) -> &'static str {
-    match (module_id, names) {
-        (None, _) => "none",
-        (Some(_), Err(_)) => "unreadable",
-        (Some(id), Ok(map)) => {
-            if map.contains_key(&id) {
-                "bound"
-            } else {
-                "missing"
-            }
+#[async_trait::async_trait]
+impl PushChannelInventory for GcpPushChannelInventory {
+    fn integration_name(&self) -> &'static str {
+        super::watch::GOOGLE_CLOUD_INTEGRATION_NAME
+    }
+
+    async fn list_channels(&self, user_id: Uuid) -> anyhow::Result<Vec<PushChannelRow>> {
+        let rows = super::watch::list_rows_for_user(&self.pool, user_id).await?;
+        if rows.is_empty() {
+            return Ok(vec![]);
+        }
+        let module_ids: Vec<Uuid> = rows.iter().filter_map(|r| r.module_id).collect();
+        // Same classified read the REST list uses — see `list_for_user`.
+        let module_names = talos_registry::module_visibility::visible_module_names(
+            &self.pool,
+            &module_ids,
+            user_id,
+        )
+        .await;
+        if let Err(ref e) = module_names {
+            tracing::warn!(
+                %user_id,
+                error = %e,
+                "gcp push-channel inventory: module lookup failed; \
+                 bindings reported as unreadable"
+            );
+        }
+        let names = module_names.as_ref().cloned().unwrap_or_default();
+
+        let mut out: Vec<PushChannelRow> = rows
+            .into_iter()
+            .map(|r| {
+                let binding = classify_module_binding(r.module_id, &module_names);
+                PushChannelRow {
+                    integration: super::watch::GOOGLE_CLOUD_INTEGRATION_NAME,
+                    channel_id: r.id,
+                    display_name: r.display_name,
+                    module_id: r.module_id,
+                    // A name only for a binding we actually resolved — a name
+                    // beside `missing` would be a fabrication.
+                    module_name: (binding == ModuleBinding::Bound)
+                        .then(|| r.module_id.and_then(|id| names.get(&id).cloned()))
+                        .flatten(),
+                    module_binding: binding,
+                    created_at: DateTime::<Utc>::from_timestamp_millis(r.created_at_ms),
+                    last_event_at: r
+                        .last_push_received_ms
+                        .and_then(DateTime::<Utc>::from_timestamp_millis),
+                    recent_failure: None,
+                }
+            })
+            .collect();
+
+        attach_recent_failures_to_rows(&self.pool, user_id, &mut out).await;
+        Ok(out)
+    }
+}
+
+/// The `DISTINCT ON (channel_uuid)` failure enrichment, over the operator-report
+/// row shape. Shares the query text with [`attach_recent_failures`] via
+/// [`latest_channel_failures`] so the two cannot look back over different
+/// windows or different event types.
+async fn attach_recent_failures_to_rows(
+    pool: &sqlx::PgPool,
+    user_id: Uuid,
+    rows: &mut [PushChannelRow],
+) {
+    if rows.is_empty() {
+        return;
+    }
+    let ids: Vec<String> = rows.iter().map(|r| r.channel_id.to_string()).collect();
+    let mut latest = latest_channel_failures(pool, user_id, &ids).await;
+    for r in rows.iter_mut() {
+        if let Some(f) = latest.remove(&r.channel_id.to_string()) {
+            r.recent_failure = Some(PushChannelFailure {
+                likely_oauth_failure: f.likely_oauth_failure,
+                error_message: f.error_message,
+                failed_at: f.failed_at,
+            });
         }
     }
 }
@@ -268,38 +346,6 @@ mod tests {
         assert!(looks_like_oauth_failure("HTTP 401 Unauthorized"));
         assert!(looks_like_oauth_failure("invalid_grant: token revoked"));
         assert!(!looks_like_oauth_failure("NATS publish failed: timeout"));
-    }
-
-    /// A `module_name` of `null` is not one state. Before 2026-09-07 the
-    /// three below rendered identically, and the live fleet's one bound
-    /// channel was in the `missing` one — every push to it failing, and
-    /// no field anywhere saying so.
-    #[test]
-    fn module_binding_is_three_valued_plus_unbound() {
-        let id = Uuid::new_v4();
-        let mut map = HashMap::new();
-        map.insert(id, "GCP: Alert Normalize".to_string());
-        let known: Result<HashMap<Uuid, String>, &str> = Ok(map);
-        let unreadable: Result<HashMap<Uuid, String>, &str> = Err("pool timeout");
-
-        assert_eq!(classify_module_binding(None, &known), "none");
-        assert_eq!(classify_module_binding(Some(id), &known), "bound");
-        // Set, and absent from a map the query DID answer.
-        assert_eq!(
-            classify_module_binding(Some(Uuid::new_v4()), &known),
-            "missing"
-        );
-        // The query did not answer. Reporting `missing` here would be a
-        // determinate negative over a read that failed — which is exactly
-        // what the pre-fix `.unwrap_or_default()` produced.
-        assert_eq!(classify_module_binding(Some(id), &unreadable), "unreadable");
-        // …and an unreadable lookup must NOT claim the unbound case away
-        // either: no binding is still no binding.
-        assert_eq!(classify_module_binding(None, &unreadable), "none");
-        // An EMPTY but ANSWERED map is `missing`, not `unreadable` — the
-        // two must not be collapsed in either direction.
-        let empty: Result<HashMap<Uuid, String>, &str> = Ok(HashMap::new());
-        assert_eq!(classify_module_binding(Some(id), &empty), "missing");
     }
 
     #[test]

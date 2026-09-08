@@ -14,7 +14,7 @@
 //! Pub/Sub subscription upstream, so there is no orphaned Google-side
 //! resource for us to cancel; deleting our row is the whole cleanup.
 
-use super::watch::GcpWatchService;
+use super::watch::{CreateWatchError, GcpWatchService};
 use axum::{
     extract::State,
     http::{HeaderMap, StatusCode},
@@ -123,19 +123,30 @@ pub async fn create_watch(
             )
         }
         Err(e) => {
-            // create_watch failures carry SA-validation / integration-
-            // lookup / sqlx detail. Log full chain server-side; return a
-            // generic message to the admin caller.
-            tracing::error!(
+            // The admin caller is an OPERATOR, so the module-binding refusals
+            // are rendered with their own status and sentence rather than the
+            // generic "check the logs" — an operator creating a watch on a
+            // user's behalf is exactly who needs to be told that the module id
+            // they were handed does not exist. `Internal` still collapses:
+            // those carry SA-validation / integration-lookup / sqlx detail.
+            tracing::warn!(
+                target: "talos_audit",
+                event_kind = e.event_kind(),
                 user_id = %user_id,
                 ?integration_id,
-                "gcp admin: create_watch failed: {:#}",
+                "gcp admin: create_watch refused: {:#}",
                 e
             );
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "Failed to create GCP watch. Check controller logs."})),
-            )
+            match e {
+                CreateWatchError::Internal(_) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": "Failed to create GCP watch. Check controller logs."})),
+                ),
+                other => (
+                    other.status_code(),
+                    Json(json!({ "error": other.user_facing_message() })),
+                ),
+            }
         }
     }
 }

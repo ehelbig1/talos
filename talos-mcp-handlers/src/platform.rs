@@ -241,6 +241,7 @@ pub async fn dispatch(
         }
         "get_platform_info" => Some(handle_get_platform_info(req_id, state, agent).await),
         "get_public_url_status" => Some(handle_get_public_url_status(req_id)),
+        "list_push_channels" => Some(handle_list_push_channels(req_id, state, user_id).await),
         "set_concurrency_limit" => {
             Some(handle_set_concurrency_limit(req_id, args, state, user_id).await)
         }
@@ -2599,4 +2600,130 @@ mod fleet_report_tests {
         assert_eq!(workers(&report).len(), cap);
         assert_eq!(report["truncated"], false);
     }
+}
+
+/// `list_push_channels` — every push channel this user owns, with its module
+/// binding CLASSIFIED.
+///
+/// # Why a tool of its own rather than a field on `list_workflow_triggers`
+///
+/// That tool is keyed by WORKFLOW: a caller names a workflow and gets the
+/// schedules and webhooks that fire it. A push channel binds a **module**, not
+/// a workflow — `integration_state`'s watch row carries a `module_id` and no
+/// workflow id at all — so it has no workflow to be listed under, and the one
+/// live example on this fleet would have appeared under no workflow in that
+/// tool however it was extended. The hygiene report carries the FINDING (a
+/// dangling binding); this carries the INVENTORY, including the healthy
+/// channels the report deliberately says nothing about.
+///
+/// Renders no push token and no push endpoint: the owning user gets the
+/// endpoint once from the create response and from the per-integration REST
+/// list, and an operator inventory is not that surface.
+async fn handle_list_push_channels(
+    req_id: Option<serde_json::Value>,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    // NOT CONSULTED is not an empty list. A process that wired no inventory has
+    // not looked, and `channels: []` from it would be the determinate negative
+    // (checks 74 / 79 / 81) this tool exists to remove one layer down.
+    let Some(set) = state.push_channels.as_ref() else {
+        return mcp_text(
+            req_id,
+            &serde_json::to_string_pretty(&serde_json::json!({
+                "channels": serde_json::Value::Null,
+                "measured": false,
+                "note": "This controller wired no push-channel inventory, so nothing was \
+                         examined. `channels: null` means NOT MEASURED, not zero.",
+            }))
+            .unwrap_or_default(),
+        );
+    };
+
+    let survey = set.survey(user_id).await;
+    let channels: Vec<serde_json::Value> = survey
+        .rows
+        .iter()
+        .map(|r| {
+            let mut v = serde_json::to_value(r).unwrap_or(serde_json::Value::Null);
+            if let Some(obj) = v.as_object_mut() {
+                if r.module_binding.is_dangling() {
+                    obj.insert("repair".to_string(), serde_json::json!(r.repair_hint()));
+                }
+            }
+            v
+        })
+        .collect();
+
+    let dangling = survey.dangling().len();
+    let unclassifiable = survey.unclassifiable().len();
+    let bound = survey
+        .rows
+        .iter()
+        .filter(|r| r.module_binding == talos_push_channel_inventory::ModuleBinding::Bound)
+        .count();
+    let unbound = survey
+        .rows
+        .iter()
+        .filter(|r| r.module_binding == talos_push_channel_inventory::ModuleBinding::None)
+        .count();
+
+    // Findings, worded once — the repair sentence has ONE home on the row.
+    let findings: Vec<serde_json::Value> = survey
+        .dangling()
+        .into_iter()
+        .map(|r| {
+            serde_json::json!({
+                "severity": "critical",
+                "integration": r.integration,
+                "channel_id": r.channel_id.to_string(),
+                "display_name": r.display_name,
+                "module_id": r.module_id.map(|m| m.to_string()),
+                "finding": "This channel is bound to a module that does not exist for you. \
+                            Every push to it fails at module load, and the failure appears \
+                            only in the controller log.",
+                "repair": r.repair_hint(),
+            })
+        })
+        .collect();
+
+    let mut out = serde_json::json!({
+        "channels": channels,
+        "summary": {
+            "total": survey.rows.len(),
+            "bound": bound,
+            "no_module_bound": unbound,
+            "dangling": dangling,
+            "unclassifiable": unclassifiable,
+        },
+        "findings": findings,
+        "surveyed_integrations": survey.surveyed_integrations,
+        "unreadable_integrations": survey.unreadable_integrations,
+        "note": talos_hygiene_service::PUSH_CHANNEL_NOTE,
+    });
+
+    // An integration whose channel list could not be read makes every count
+    // here a FLOOR. Say so rather than letting `total` read as a total.
+    if !survey.unreadable_integrations.is_empty() {
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert(
+                "counts_are_lower_bounds".to_string(),
+                serde_json::json!(true),
+            );
+            obj.insert(
+                "counts_note".to_string(),
+                serde_json::json!(format!(
+                    "{} integration(s) could not be listed ({}). Their channels are ABSENT from \
+                     this response, not zero, so every count above is a floor.",
+                    survey.unreadable_integrations.len(),
+                    survey.unreadable_integrations.join(", ")
+                )),
+            );
+        }
+    }
+
+    mcp_text(
+        req_id,
+        &serde_json::to_string_pretty(&out).unwrap_or_default(),
+    )
 }

@@ -210,6 +210,15 @@ struct PlatformServices {
     oauth_service: std::sync::Arc<OAuthService>,
     auth_rate_limiter: std::sync::Arc<rate_limit::DistributedRateLimiter>,
     idempotency_service: Option<std::sync::Arc<idempotency::IdempotencyService>>,
+    /// Push-channel inventories for the operator surfaces (`list_push_channels`,
+    /// the hygiene report's `dangling_push_channels`). Always `Some` here: the
+    /// inventories read `integration_state` from a bare pool and a channel ROW
+    /// outlives whatever env var wires its RECEIVER, so gating this on
+    /// `GCP_PUBSUB_AUDIENCE` would hide exactly the channels an operator most
+    /// needs to be told about. `Option` survives only so that a consumer with no
+    /// inventory renders `not_measured` rather than an empty list.
+    push_channel_inventories:
+        Option<std::sync::Arc<talos_push_channel_inventory::PushChannelInventorySet>>,
 }
 
 /// Per-IP / global rate limiters + proxy trust config shared between the

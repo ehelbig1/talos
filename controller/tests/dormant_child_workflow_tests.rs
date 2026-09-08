@@ -97,7 +97,10 @@ async fn dormant_names(repo: &AnalyticsRepository, user: Uuid) -> Vec<String> {
 fn dormant_recommendation(
     report: &talos_analytics_repository::HygieneReport,
 ) -> Option<serde_json::Value> {
-    let outcome = talos_hygiene_service::build_report(report);
+    let outcome = talos_hygiene_service::build_report(
+        report,
+        &talos_push_channel_inventory::PushChannelReadout::NotConsulted,
+    );
     outcome
         .report
         .get("recommendations")?

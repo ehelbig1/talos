@@ -1,5 +1,6 @@
 pub mod api;
 pub mod module_fetcher;
+pub mod module_visibility;
 pub mod reconcile;
 pub mod sync;
 use anyhow::{Context, Result};
