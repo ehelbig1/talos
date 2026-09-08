@@ -97,6 +97,22 @@ fn strip_diag_appendix(msg: &str) -> &str {
     }
 }
 
+/// The classifier's bucket for "the module exceeded its execution-time limit".
+///
+/// Named here rather than spelled inline at the one caller that knows the
+/// cause from the STATUS rather than from the prose
+/// (`controller/src/bootstrap/background.rs`'s job-result observer, whose
+/// `JobStatus::TimedOut` arm needs no guess). Two spellings of one bucket is
+/// the drift this module exists to prevent, and
+/// `the_timeout_bucket_spelling_is_the_classifiers` pins the agreement
+/// against the classifier rather than leaving it to coincidence.
+///
+/// Note the two SQL writers in `talos-module-executions` — `timeout_execution`
+/// and the stuck sweep — spell their own literals in SQL and cannot reach this
+/// crate (the edge runs the other way). The pin covers the spelling; it cannot
+/// cover those two statements, and that is stated rather than implied.
+pub const TIMEOUT_BUCKET: &str = "timeout";
+
 /// The bucket `classify_error` answers with when NO gate matched.
 ///
 /// Derived by PROBE rather than by naming the literal, so that a rename in the
@@ -162,6 +178,25 @@ mod tests {
              maps the fall-through to NULL by probe, so this test failing does \
              NOT mean the mapping broke — it means someone should confirm the \
              new fall-through is still 'nothing matched' and not a real bucket."
+        );
+    }
+
+    /// `TIMEOUT_BUCKET` must BE the classifier's answer, not merely look like
+    /// it. Driven through `classify_error` rather than compared to a literal,
+    /// so a rename in the classifier crate fails here instead of silently
+    /// giving one cause two names across two writers.
+    #[test]
+    fn the_timeout_bucket_spelling_is_the_classifiers() {
+        assert_eq!(
+            talos_failure_analysis_service::classify_error("execution timed out after 30 seconds")
+                .0,
+            TIMEOUT_BUCKET
+        );
+        // And the derivation agrees, so a caller that derives and a caller
+        // that names the constant cannot disagree about one row.
+        assert_eq!(
+            derive_error_type("failed", Some("execution timed out after 30 seconds")),
+            Some(TIMEOUT_BUCKET)
         );
     }
 

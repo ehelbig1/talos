@@ -4619,11 +4619,38 @@ pub(crate) fn spawn_nats_log_subscribers(
                                         .and_then(|v| v.as_str())
                                         .unwrap_or("Worker reported failure")
                                         .to_string();
-                                    let error_type = matches!(
+                                    // `error_type` — the CAUSE. #744 derived it
+                                    // at the ENGINE's finalizer and left this
+                                    // observer's non-timeout arm passing
+                                    // `None`, so a plain `Failed` result whose
+                                    // text names its own cause stored nothing.
+                                    //
+                                    // TimedOut takes the STATUS, which is a
+                                    // harder fact than the prose and needs no
+                                    // guess — through the named constant, not a
+                                    // second inline literal, because
+                                    // `classify_error` answers with that exact
+                                    // spelling and two spellings of one bucket
+                                    // is the drift the shared home exists to
+                                    // prevent (pinned by
+                                    // `the_timeout_bucket_spelling_is_the_classifiers`).
+                                    // Everything else derives from the same
+                                    // text this call is about to store.
+                                    let error_type = if matches!(
                                         result.status,
                                         talos_workflow_job_protocol::JobStatus::TimedOut
-                                    )
-                                    .then_some("timeout".to_string());
+                                    ) {
+                                        Some(
+                                            talos_engine::module_error_type::TIMEOUT_BUCKET
+                                                .to_string(),
+                                        )
+                                    } else {
+                                        talos_engine::module_error_type::derive_error_type(
+                                            "failed",
+                                            Some(&error_msg),
+                                        )
+                                        .map(str::to_string)
+                                    };
 
                                     if let Err(e) = exec_service_for_results
                                         .fail_execution_from_worker(

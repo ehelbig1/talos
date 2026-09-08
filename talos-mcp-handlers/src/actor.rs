@@ -5551,12 +5551,34 @@ async fn handle_suggest_actor_for_task(
             Err(resp) => return resp,
         };
 
-    // Load all active actors for this user
-    let actors = state
-        .actor_repo
-        .list_active_actors_basic(user_id, 50)
-        .await
-        .unwrap_or_default();
+    // Load all active actors for this user.
+    //
+    // 2026-09-08: REFUSE. `.unwrap_or_default()` fed the emptiness check three
+    // lines down, so a failed listing rendered
+    // "No active actors found. Create actors with create_actor first." — not
+    // merely a false count but a DIRECTIVE to create actors that may already
+    // exist. This list is also the entire candidate set for both the vector
+    // and the keyword branch, so there is no partial suggestion to make from
+    // it; the sibling handlers in this file (`handle_get_actor_budget`,
+    // `handle_clone_actor`) disclose because they still have measured fields
+    // to report, and this one does not.
+    let actors = match state.actor_repo.list_active_actors_basic(user_id, 50).await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "suggest_actor_for_task: active-actor listing failed — refusing rather \
+                 than telling the caller to create actors they may already have"
+            );
+            return mcp_error(
+                req_id,
+                -32000,
+                "Could not read your actors, so no suggestion was computed. This is \
+                 NOT a report that you have none, and it is NOT an instruction to \
+                 create one. Retry, and check controller logs.",
+            );
+        }
+    };
 
     if actors.is_empty() {
         return mcp_text(
@@ -6145,10 +6167,52 @@ async fn handle_compress_actor_context(
     // + DELETE) to one statement; CTE evaluation order in Postgres
     // guarantees the SELECT runs against the pre-DELETE snapshot, so byte
     // total and rows-affected count match the prior loop semantics.
+    //
+    // 2026-09-08: REFUSE, do not default. This statement is the RETIREMENT
+    // half of the compression, and the swallow it replaces was the only one
+    // in this handler that survived into a COMMIT: the loop above rolls back
+    // on a failed write, while `.unwrap_or((0, 0))` here let a failed DELETE
+    // reach `tx.commit()` three lines down. The committed state was then the
+    // worst of both — the condensed replacements written AND the originals
+    // still present, i.e. memory GREW — under a response reading
+    // `status: "compressed", keys_retired: 0, bytes_saved_estimate: 0`.
+    // Five rendered fields wrong at once, and `keys_retired: 0` is
+    // indistinguishable from the legitimate case where the archive set was
+    // already empty.
+    //
+    // The direction is a refusal rather than a disclosure because the tx is
+    // still open: rolling back restores the pre-call state exactly, which is
+    // an answer the caller can act on, where a disclosed partial commit is a
+    // state nobody asked for.
     let (bytes_removed_i64, keys_deleted) =
-        talos_actor_memory_service::measure_and_forget_keys_in_tx(&mut tx, actor_id, &archive_keys)
-            .await
-            .unwrap_or((0, 0));
+        match talos_actor_memory_service::measure_and_forget_keys_in_tx(
+            &mut tx,
+            actor_id,
+            &archive_keys,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::error!(
+                    actor_id = %actor_id,
+                    error = %e,
+                    "compress_actor_context: measure-and-forget failed — rolling back \
+                     rather than committing the replacements without retiring the \
+                     originals, which would report status=compressed while memory grew"
+                );
+                // allow-swallowed-result: rollback on a path that is already returning an error; a failed rollback is followed by the tx being dropped, which rolls back anyway.
+                let _ = tx.rollback().await;
+                return mcp_error(
+                    req_id,
+                    -32000,
+                    "Could not retire the archived memory keys, so the condensed \
+                     replacements were NOT committed either — this actor's memory is \
+                     unchanged. This is not a report that nothing needed retiring. \
+                     Retry, and check controller logs.",
+                );
+            }
+        };
     let bytes_removed = bytes_removed_i64 as usize;
 
     if let Err(e) = tx.commit().await {

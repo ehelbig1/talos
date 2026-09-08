@@ -3130,11 +3130,28 @@ async fn handle_list_module_catalog(
     // call pays the I/O cost.
     let catalog_dir_owned = catalog_dir.to_path_buf();
     let entries: Vec<serde_json::Value> = if catalog_dir.is_dir() {
-        CATALOG_CACHE
-            .get_or_init(|| async move {
+        // 2026-09-08: a FAILED walk must not be MEMOIZED.
+        //
+        // `get_or_init` + `.unwrap_or_default()` cached the empty vec a
+        // `JoinError` produced, so ONE panicked or cancelled blocking task
+        // made every later `list_module_catalog` call in this pod's lifetime
+        // report `catalog_total_count: 0, catalog: []` — "this image ships no
+        // modules" — with no retry path short of a restart. The inner
+        // `if let Ok(read_dir)` had the same shape for an `io::Error`
+        // (EACCES on the baked template directory), and it too was cached.
+        //
+        // `get_or_try_init` is the whole fix for the caching half: on `Err`
+        // the cell stays UNINITIALISED, so the next call walks again. The
+        // handler then refuses, matching the sibling visibility read ~30
+        // lines above, whose refusal text this one is written against.
+        match CATALOG_CACHE
+            .get_or_try_init(|| async move {
                 tokio::task::spawn_blocking(move || {
                     let mut items: Vec<serde_json::Value> = Vec::new();
-                    if let Ok(read_dir) = std::fs::read_dir(&catalog_dir_owned) {
+                    let read_dir = std::fs::read_dir(&catalog_dir_owned).map_err(|e| {
+                        format!("read_dir({}) failed: {e}", catalog_dir_owned.display())
+                    })?;
+                    {
                         for entry in read_dir.flatten() {
                             let path = entry.path();
                             if !path.is_dir() {
@@ -3216,13 +3233,30 @@ async fn handle_list_module_catalog(
                         let name_b = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
                         cat_a.cmp(cat_b).then(name_a.cmp(name_b))
                     });
-                    items
+                    Ok::<_, String>(items)
                 })
                 .await
-                .unwrap_or_default()
+                .map_err(|e| format!("catalog walk task failed: {e}"))?
             })
             .await
-            .clone()
+        {
+            Ok(v) => v.clone(),
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    "list_module_catalog: the on-disk template walk failed — refusing \
+                     rather than reporting an empty catalog, and NOT caching the failure"
+                );
+                return mcp_error(
+                    req_id,
+                    -32000,
+                    "Could not read the on-disk module catalog, so this listing would \
+                     be empty BECAUSE NOBODY COULD LOOK — that is not a statement that \
+                     this deployment ships no templates. Retry, and check controller \
+                     logs.",
+                );
+            }
+        }
     } else {
         // Test/dev environment: return a minimal representative list
         vec![
