@@ -5048,6 +5048,7 @@ async fn handle_get_execution_waterfall(
         }
     }
 
+    let mut rows_beyond_total: usize = 0;
     let mut waterfall = String::new();
     waterfall.push_str(&format!("=== Execution Waterfall: {} ===\n", exec_id));
     waterfall.push_str(&format!("Status: {} | Total: {}ms\n\n", status, total_ms));
@@ -5063,35 +5064,112 @@ async fn handle_get_execution_waterfall(
             t.label.clone()
         };
 
-        let bar_start = ((t.start_ms as f64 / total_ms as f64) * chart_width as f64) as usize;
-        let bar_len =
-            ((t.duration_ms as f64 / total_ms as f64) * chart_width as f64).ceil() as usize;
-        let bar_start = bar_start.min(chart_width);
-        let bar_len = bar_len.clamp(1, chart_width - bar_start);
+        let geom = bar_geometry(t.start_ms, t.duration_ms, total_ms, chart_width);
+        if geom.beyond_total {
+            rows_beyond_total += 1;
+        }
 
         let mut bar = String::new();
-        for _ in 0..bar_start {
+        for _ in 0..geom.start {
             bar.push('\u{2591}'); // light shade for idle
         }
-        for _ in 0..bar_len {
+        for _ in 0..geom.len {
             bar.push('\u{2588}'); // full block for active
         }
-        let remaining = chart_width.saturating_sub(bar_start + bar_len);
+        let remaining = chart_width.saturating_sub(geom.start + geom.len);
         for _ in 0..remaining {
             bar.push('\u{2591}');
         }
 
         waterfall.push_str(&format!(
-            "{:<width$}  {}  ({}ms, started at {}ms)\n",
+            "{:<width$}  {}  ({}ms, started at {}ms){}\n",
             truncated_label,
             bar,
             t.duration_ms,
             t.start_ms,
+            if geom.beyond_total {
+                "  [!] starts past the run's recorded end"
+            } else {
+                ""
+            },
             width = max_label_len
         ));
     }
 
+    if rows_beyond_total > 0 {
+        waterfall.push_str(&format!(
+            "\n[!] {rows_beyond_total} row(s) marked above start at or after {total_ms}ms, the \n\
+             run's total. Their bars are PINNED to the right edge and are NOT drawn to scale — \n\
+             the chart cannot place a node outside the window it is drawn against. This is not a \n\
+             rendering artefact: `total_ms` comes from the EXECUTION's completed_at while each \n\
+             start offset comes from that node's own event, so a node whose event was written \n\
+             after the execution was finalized reads as starting past the end. Measured on the \n\
+             reference fleet 2026-09-09, both instances were `failed` long-running executions \n\
+             whose last node_started landed 21s and 30s after completed_at.\n"
+        ));
+    }
+
     respond_maybe_archived(req_id, archived_at, waterfall)
+}
+
+/// Where one waterfall bar sits, and whether the row is representable at all.
+///
+/// `beyond_total` is the honest half. `total_ms` is derived from the
+/// EXECUTION's `completed_at` while every `start_ms` is an offset computed from
+/// that node's OWN event, so the two come from different writers and a node
+/// event written after the execution was finalized yields
+/// `start_ms >= total_ms`. Measured on the reference fleet 2026-09-09: 2 of
+/// 10,729 completed executions, both `failed` and long-running, whose last
+/// `node_started` landed 21 s and 30 s past `completed_at`.
+///
+/// Before this existed the caller did
+/// `bar_len.clamp(1, chart_width - bar_start)` with `bar_start` clamped to
+/// `chart_width`, so that exact shape evaluated `clamp(1, 0)` — **min > max,
+/// which panics**. A panic in an MCP handler unwinds the tokio task, so the
+/// caller saw a dropped request rather than an error, on precisely the
+/// executions (failed, long-running) an operator is most likely to open a
+/// waterfall for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BarGeometry {
+    start: usize,
+    len: usize,
+    /// The row starts at or past `total_ms`; its bar is pinned to the right
+    /// edge and is NOT to scale. The renderer must SAY so — a chart that
+    /// silently pins such a bar asserts the node ran at the end, when what the
+    /// data says is that it started past the end.
+    beyond_total: bool,
+}
+
+/// Pure, total, and panic-free for every input including `total_ms <= 0` and
+/// `chart_width == 0`.
+fn bar_geometry(start_ms: i64, duration_ms: i64, total_ms: i64, chart_width: usize) -> BarGeometry {
+    if chart_width == 0 {
+        return BarGeometry {
+            start: 0,
+            len: 0,
+            beyond_total: start_ms >= total_ms.max(1),
+        };
+    }
+    // `total_ms` is `.max(1)` at its only call site; re-assert it here so this
+    // function is total on its own terms rather than on its caller's.
+    let total = total_ms.max(1);
+    let beyond_total = start_ms >= total;
+
+    let ratio = (start_ms.max(0) as f64) / (total as f64);
+    let raw_start = (ratio * chart_width as f64) as usize;
+    // Cap at chart_width - 1, NOT chart_width: a bar of zero width renders a
+    // row that claims the node did not run, and the clamp below would then
+    // invert its own bounds.
+    let start = raw_start.min(chart_width - 1);
+
+    let raw_len = ((duration_ms.max(0) as f64 / total as f64) * chart_width as f64).ceil() as usize;
+    let len = raw_len.clamp(1, chart_width - start);
+
+    BarGeometry {
+        start,
+        len,
+        beyond_total,
+    }
 }
 
 async fn handle_get_execution_replay_chain(
@@ -7793,5 +7871,103 @@ mod lineage_note_tests {
             "Lineage includes all executions linked via root_execution_id."
         );
         assert!(!lineage_note(false, false, 0, 1, Some(0), true).contains("ROOT could not be read"));
+    }
+}
+
+#[cfg(test)]
+mod waterfall_bar_geometry_tests {
+    use super::{bar_geometry, BarGeometry};
+
+    const W: usize = 50; // the handler's chart_width
+
+    /// THE REGRESSION. Both shapes are REAL: measured on the reference fleet
+    /// 2026-09-09 by driving the handler's own arithmetic over
+    /// `workflow_executions` joined to `execution_events`, 2 of 10,729
+    /// completed executions have a `node_started` past their own
+    /// `completed_at`. Pre-fix these evaluated `clamp(1, 0)` and PANICKED,
+    /// which in an MCP handler unwinds the tokio task and drops the request.
+    #[test]
+    fn a_node_starting_past_the_recorded_end_does_not_panic() {
+        // execution aba4c8ef…: total 5_368_116 ms, last node_started 5_389_386 ms (+21 s).
+        let g = bar_geometry(5_389_386, 1, 5_368_116, W);
+        assert!(
+            g.beyond_total,
+            "a start past total must be REPORTED, not silently pinned"
+        );
+        assert_eq!(
+            g.start,
+            W - 1,
+            "pinned to the right edge, leaving room for one cell"
+        );
+        assert!(g.len >= 1, "a row that ran must never render as zero width");
+        assert!(g.start + g.len <= W, "the bar must fit the chart");
+
+        // execution 9a6a2879…: total 3_910_571 ms, last node_started 3_940_881 ms (+30 s).
+        let g = bar_geometry(3_940_881, 1, 3_910_571, W);
+        assert!(g.beyond_total);
+        assert_eq!(g.start, W - 1);
+        assert!(g.start + g.len <= W);
+    }
+
+    /// The exact boundary the old code tripped on: `start_ms == total_ms`
+    /// makes `bar_start == chart_width`, so `chart_width - bar_start` is 0 and
+    /// `clamp(1, 0)` inverts its own bounds.
+    #[test]
+    fn the_equal_boundary_is_the_one_that_used_to_invert_the_clamp() {
+        let g = bar_geometry(1000, 1, 1000, W);
+        assert!(g.beyond_total);
+        assert_eq!(g.start, W - 1);
+        assert_eq!(g.len, 1);
+    }
+
+    /// CONTROL. An ordinary row must be unchanged and must NOT be flagged —
+    /// a fix that marks everything is as useless as one that marks nothing.
+    #[test]
+    fn an_ordinary_row_is_unflagged_and_to_scale() {
+        let g = bar_geometry(0, 500, 1000, W);
+        assert_eq!(
+            g,
+            BarGeometry {
+                start: 0,
+                len: 25,
+                beyond_total: false
+            }
+        );
+
+        let mid = bar_geometry(500, 500, 1000, W);
+        assert_eq!(
+            mid,
+            BarGeometry {
+                start: 25,
+                len: 25,
+                beyond_total: false
+            }
+        );
+
+        // A sub-tick node still gets one visible cell.
+        let tiny = bar_geometry(500, 0, 1000, W);
+        assert_eq!(tiny.len, 1, "a zero-duration node must still be visible");
+        assert!(!tiny.beyond_total);
+    }
+
+    /// TOTALITY. The function is called once per row on operator-supplied
+    /// executions, so it must be panic-free on every input rather than on the
+    /// inputs the caller happens to produce today.
+    #[test]
+    fn it_is_total_over_hostile_inputs() {
+        for &(s, d, t, w) in &[
+            (0i64, 0i64, 0i64, 50usize), // total 0 — the `.max(1)` guard
+            (-5, -5, 1000, 50),          // negative offsets
+            (i64::MAX, i64::MAX, 1, 50), // saturating ratio
+            (1000, 1, 1000, 0),          // zero-width chart
+            (0, i64::MAX, 1000, 50),     // duration far past the window
+            (i64::MIN, 1, 1000, 50),     // negative extreme
+        ] {
+            let g = bar_geometry(s, d, t, w);
+            assert!(
+                g.start + g.len <= w,
+                "bar must fit: {s},{d},{t},{w} -> {g:?}"
+            );
+        }
     }
 }
