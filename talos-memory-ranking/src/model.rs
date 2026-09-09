@@ -62,6 +62,15 @@ pub const STATUS_SAMPLE_WEIGHT: f64 = 0.3;
 /// logistic coefficients (logit scale — CAN be negative). The non-negative,
 /// clamped fused weights are derived at serve time by [`rank_weights_to_fused`];
 /// storing the raw coefficients keeps this a faithful model record.
+/// How far the effective training window must fall short of the configured one
+/// before [`FetchProvenance::lookback_inert`] calls the knob inert.
+///
+/// One whole day. `configured_lookback_days` is derived from the `since` the
+/// tick computed, `oldest_fetched_age_days` from a clock read after the fetch
+/// returned, so the two disagree by the fetch's own duration even when nothing
+/// was dropped. A `> 0.0` test would report every unbound fetch as inert.
+pub const INERT_LOOKBACK_MIN_SHORTFALL_DAYS: f64 = 1.0;
+
 /// Accounting for the FETCH that produced a fit's examples — the disclosure that
 /// makes [`RankWeights::n_examples`] legible.
 ///
@@ -73,7 +82,7 @@ pub const STATUS_SAMPLE_WEIGHT: f64 = 0.3;
 /// population. Carrying this struct alongside the model is what closes that gap,
 /// and it is a required argument of [`fit_rank_weights`] so a fit cannot be
 /// produced without declaring where its rows came from.
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
 pub struct FetchProvenance {
     /// Rows the training fetch returned, BEFORE labeling. Always
     /// `>= RankWeights::n_examples`.
@@ -93,16 +102,48 @@ pub struct FetchProvenance {
     /// is an accurate order of magnitude, not an exact ledger — and saying so is
     /// cheaper than a transaction the fit does not otherwise need.
     pub n_available: Option<i64>,
+    /// `ADAPTIVE_RANK_LOOKBACK_DAYS` as it stood for this fit — the window the
+    /// operator ASKED for. `None` on artifacts written before this field
+    /// existed: unknown, not zero.
+    #[serde(default)]
+    pub configured_lookback_days: Option<i64>,
+    /// Age, in days, of the OLDEST row the fetch actually returned.
+    ///
+    /// Free to compute — the rows are already in memory and each carries
+    /// `created_at` — so this costs no query even when the cap binds.
+    /// `None` means either a pre-disclosure artifact or a fetch that returned
+    /// nothing; both are UNKNOWN, and neither is "the whole window".
+    ///
+    /// Read it through [`Self::effective_lookback_days`], never on its own: on
+    /// an UNBOUND fetch the oldest row is simply the oldest row that exists, and
+    /// reporting that as the window would understate a window the fetch really
+    /// did search to its end.
+    #[serde(default)]
+    pub oldest_fetched_age_days: Option<f64>,
 }
 
 impl FetchProvenance {
     /// Declare a fetch that ran under `cap` and returned `n_fetched` rows, with
     /// `n_available` measured only when it had to be.
-    pub fn new(n_fetched: i64, fetch_cap: i64, n_available: Option<i64>) -> Self {
+    ///
+    /// `configured_lookback_days` and `oldest_fetched_age_days` are REQUIRED
+    /// arguments for the same reason `fetch` itself is a required argument of
+    /// [`fit_rank_weights`]: the window in DAYS is the unit the operator
+    /// configured, and a constructor that let a caller omit it would let a fit
+    /// be produced that cannot say what window it ran over.
+    pub fn new(
+        n_fetched: i64,
+        fetch_cap: i64,
+        n_available: Option<i64>,
+        configured_lookback_days: Option<i64>,
+        oldest_fetched_age_days: Option<f64>,
+    ) -> Self {
         Self {
             n_fetched,
             fetch_cap,
             n_available,
+            configured_lookback_days,
+            oldest_fetched_age_days: oldest_fetched_age_days.filter(|d| d.is_finite()),
         }
     }
 
@@ -122,6 +163,51 @@ impl FetchProvenance {
     /// `n_available` is unknown — an unmeasurable gap is not a zero gap.
     pub fn n_dropped(&self) -> Option<i64> {
         self.n_available.map(|a| (a - self.n_fetched).max(0))
+    }
+
+    /// The window the fit ACTUALLY saw, in days — the operator's own unit.
+    ///
+    /// * not truncated ⇒ the CONFIGURED window: the fetch reached the end of it,
+    ///   so that is what was searched even if the oldest surviving row is
+    ///   younger. Reporting the oldest row here would report an empty tail as a
+    ///   narrower window.
+    /// * truncated ⇒ the age of the oldest row the fetch returned, because
+    ///   everything older was left unread.
+    /// * `None` ⇒ genuinely unknown (pre-disclosure artifact, or a truncated
+    ///   fetch whose oldest row could not be dated). Never a number.
+    pub fn effective_lookback_days(&self) -> Option<f64> {
+        if self.truncated() {
+            self.oldest_fetched_age_days
+        } else {
+            self.configured_lookback_days.map(|d| d as f64)
+        }
+    }
+
+    /// Days of the CONFIGURED window that this fit could not reach. `None` when
+    /// either end of the subtraction is unknown.
+    ///
+    /// This is the number that says `ADAPTIVE_RANK_LOOKBACK_DAYS` is not doing
+    /// what its documentation advertises. Clamped at 0 — the effective window
+    /// can exceed the configured one by a fraction of a second because
+    /// `oldest_fetched_age_days` is measured after the fetch, against a clock
+    /// that has moved on from the one that computed `since`.
+    pub fn lookback_shortfall_days(&self) -> Option<f64> {
+        let configured = self.configured_lookback_days? as f64;
+        let effective = self.effective_lookback_days()?;
+        Some((configured - effective).max(0.0))
+    }
+
+    /// True when the configured window is materially wider than the one the fit
+    /// saw — i.e. RAISING `ADAPTIVE_RANK_LOOKBACK_DAYS` would not widen this
+    /// fit, and LOWERING it towards the effective window would not narrow it.
+    ///
+    /// The threshold is a whole day rather than `> 0.0` on purpose: the two
+    /// numbers come from clocks read moments apart, so a sub-day difference is
+    /// measurement noise and calling it an inert knob would cry wolf on every
+    /// unbound fetch.
+    pub fn lookback_inert(&self) -> bool {
+        self.lookback_shortfall_days()
+            .is_some_and(|s| s >= INERT_LOOKBACK_MIN_SHORTFALL_DAYS)
     }
 }
 
@@ -390,8 +476,27 @@ pub fn rank_weights_to_fused(rw: &RankWeights) -> (talos_memory::actor_context::
 mod tests {
     use super::*;
 
+    /// A fetch whose WINDOW accounting is unknown — the pre-#37 shape, used by
+    /// every test that is about the ROW accounting only.
     fn prov(n_fetched: i64, fetch_cap: i64, n_available: Option<i64>) -> FetchProvenance {
-        FetchProvenance::new(n_fetched, fetch_cap, n_available)
+        FetchProvenance::new(n_fetched, fetch_cap, n_available, None, None)
+    }
+
+    /// A fetch that also declares the window it ran over, in days.
+    fn prov_days(
+        n_fetched: i64,
+        fetch_cap: i64,
+        n_available: Option<i64>,
+        configured_days: i64,
+        oldest_age_days: Option<f64>,
+    ) -> FetchProvenance {
+        FetchProvenance::new(
+            n_fetched,
+            fetch_cap,
+            n_available,
+            Some(configured_days),
+            oldest_age_days,
+        )
     }
 
     fn ex(

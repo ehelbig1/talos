@@ -758,6 +758,29 @@ pub fn adaptive_rank_training_interval_secs() -> u64 {
 /// consumes provenance rows newer than `now - lookback_days`, so weights adapt
 /// to recent outcomes and a poisoned old batch ages out. Default 30, clamped to
 /// `[1, 3650]`. `=0`/negative falls back to the default.
+///
+/// **The clamp is what this variable ACCEPTS, not what the fit can USE. This
+/// knob is effective DOWNWARD only.** Three ceilings bind before 3650 and the
+/// narrowest is hardcoded:
+/// * `talos_memory_ranking::TRAINING_FETCH_CAP` (20 000 rows per actor). The
+///   Phase-1 fetch is `ORDER BY created_at DESC LIMIT $cap`, so widening the
+///   window adds only OLDER rows, which sort last and are never read. Measured
+///   on the reference fleet 2026-09-09 at ~2 900 provenance rows/day: the
+///   configured 30-day window was a fitted **6.56 days**, and the fetched row
+///   set was byte-identical at 7, 30, 60, 90, 365 and 3650 days.
+/// * `talos_memory::RANK_TRAINING_EXAMPLE_MAX` (50 000) — a second clamp on the
+///   caller's `limit`, ~17 days at that rate.
+/// * Execution ARCHIVAL at [`archive_after_days`] (default 30). Past it the
+///   fetch's `LEFT JOIN workflow_executions` finds nothing, so the row carries
+///   no outcome label and is dropped. **This one binds even with no row cap**,
+///   which is why lifting the cap would not restore the advertised range.
+///
+/// Raising this past the effective window does not change the model. It DOES
+/// widen `FetchProvenance::n_available`, so the truncation disclosure's dropped
+/// count grows — which reads as the change taking effect, and is why the
+/// disclosure now also reports the window in DAYS
+/// (`FetchProvenance::effective_lookback_days`, the digest's
+/// `lookback_knob_inert`, and `talos_rank_training_lookback_shortfall_days`).
 pub fn adaptive_rank_lookback_days() -> i64 {
     positive_env_or_default::<i64>("ADAPTIVE_RANK_LOOKBACK_DAYS", 30).clamp(1, 3650)
 }

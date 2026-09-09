@@ -301,6 +301,14 @@ CTRL_TESTS=(
     # statement-count fixes the measurements justified. `common` (DATABASE_URL)
     # harness, so CTRL_TESTS and not TC_TESTS (64b).
     "mcp_tool_instrument_tests"
+    # ADAPTIVE_RANK_LOOKBACK_DAYS is documented as a [1, 3650]-day training
+    # window and a hardcoded row cap binds first — measured on the reference
+    # fleet, the configured 30 days was a fitted 6.56 and every value from 7 to
+    # 3650 produced a bit-identical model. The fit now records the window in
+    # DAYS as well as in rows; this pins the `sqlx::query_as` that carries it to
+    # the operator digest, whose failure mode is a silent NULL (check 88's
+    # class). `common` (DATABASE_URL) harness, so CTRL_TESTS and not TC_TESTS (64b).
+    "rank_training_window_disclosure_tests"
     # A `sqlx::query("…")` statement is never schema-checked, so one naming a
     # renamed column or a relation that never existed fails only at request
     # time. Drives the REAL repository methods and the REAL statements against

@@ -977,6 +977,159 @@ all of them is ~80 build+test cycles, not attempted; of the 17
 survivors (not the one previously recorded), now pinned by a per-outcome call-site
 count with its own tripwire — 17 caught, 0 survivors on the re-run.
 
+### A documented knob whose advertised range is inert → [`2026-09-09-a-documented-knob-whose-range-is-inert.md`](docs/engineering-log/2026-09-09-a-documented-knob-whose-range-is-inert.md)
+
+**The class.** A HARDCODED constant binds before a documented tunable's
+advertised range, so most of that range does nothing and no operator-facing
+surface says so. `ADAPTIVE_RANK_LOOKBACK_DAYS` is documented in TWO places as a
+training window clamped to `[1, 3650]` days; `TRAINING_FETCH_CAP = 20_000` binds
+first, because the Phase-1 fetch is `ORDER BY created_at DESC LIMIT $cap`.
+Measured on the reference fleet 2026-09-09: **the configured 30 days was a
+fitted 6.555, and the fetched row set was byte-identical at 7, 30, 60, 90, 365
+and 3650 — every value from 7 up, i.e. 99.8 % of the advertised range.** Through
+the production fit the coefficients agree to SIX DECIMAL PLACES at 30/60/90. The
+knob is effective DOWNWARD only. This is the model that decides which memories
+reach `__actor_context__`, and its learned weights are live and materially
+different from the global blend (recency 1.23 vs 0.30, importance 1.66 vs 0.50
+normalised to relevance).
+
+**The disclosure already existed and was in the WRONG UNIT — that is the defect.**
+#654 shipped the truncation WARN, `FetchProvenance` on the stored model, and the
+operator digest's `n_fetched` / `window_available` / `window_rows_dropped` /
+`population_note`. All ROWS. And `n_available` is counted with the operator's own
+`since`, so it MOVES when the inert knob is turned: raising 30 → 90 grows
+`window_rows_dropped` from 52 642 to 90 805 while every coefficient stays
+bit-identical. **The report does not merely fail to say the knob is inert; it
+reacts to the inert knob in the direction that reads as "the change took
+effect".** So `FetchProvenance` now also carries `configured_lookback_days` and
+`oldest_fetched_age_days` — the latter free, since the fetch's rows are already
+in memory and its LAST element is the oldest row read — and every surface reports
+`effective_lookback_days` / `lookback_shortfall_days` / `lookback_inert` beside
+the row counts.
+
+**Decisions.**
+* **The cap stays 20 000 and is deliberately NOT made tunable**, and COST IS NOT
+  THE REASON — measured, the production fetch is ~18 ms at 20 000 rows and ~59 ms
+  at 50 000, on a six-hourly tick over ≤50 actors. The reason is that **a cap knob
+  would not restore the advertised range.** There are FOUR ceilings, not one:
+  `TRAINING_FETCH_CAP` (6.6 days), `RANK_TRAINING_EXAMPLE_MAX = 50_000` (~17
+  days), execution ARCHIVAL at `ARCHIVE_AFTER_DAYS` (~30 days), and provenance
+  retention at 90. **The third binds even with NO cap**: past archival the
+  fetch's `LEFT JOIN workflow_executions` finds nothing, so the row carries no
+  outcome label and `build_training_set` drops it — measured, rows with a live
+  execution SATURATE at 72 712 from 30 days on while the raw count climbs to
+  110 812 at 60, and at an unbounded cap days=60 and days=90 fit the same model.
+  Shipping a knob that still could not reach its documented range would be this
+  same defect with an extra step.
+* **Training on RECENT outcomes is now DECIDED rather than an accident of the
+  `ORDER BY`** — and the load-bearing half is the LABEL HORIZON, not the cap: past
+  ~30 days this corpus has no labels at all, so a recency-weighted fit is the only
+  thing it can support. The cap chooses 6.5 over 30; archival chooses 30 over
+  3650, and that half was never a choice anybody could have made differently.
+* **`n_examples` keeps its meaning** ("usable labeled rows this fit consumed").
+  #654 decided that; renaming it would break the stored artifact,
+  `recent_rank_fits`' SQL and the digest's shape for no gain. What changed is that
+  it can no longer be read alone.
+* **Nothing alerts on the new series**, argued: on a fleet with one busy actor
+  the cap binds every tick forever, so an alert would fire permanently and train
+  operators to ignore it (check 69's trap). `talos_rank_training_fetches_total
+  {coverage=complete|truncated}` is a closed compile-time PARTITION with **no
+  `actor_id`** — caller-influenced, so it stays a log FIELD — both values
+  pre-seeded. `talos_rank_training_lookback_shortfall_days` is the WORST case
+  across a tick, because `actor_id` cannot be a label; **its zero is ambiguous
+  ("no shortfall" vs "no tick yet") and the seeded counter pair is what resolves
+  it**, which is stated in the gauge's own HELP text rather than left implicit.
+* **`lookback_inert` needs a whole-DAY threshold**, not `> 0.0`: the configured
+  window comes from the `since` the tick computed and the effective one from a
+  clock read after the fetch returned, so a sub-day gap is measurement noise and
+  a `> 0.0` test would report every unbound fetch as inert.
+* **Unknown stays unknown.** A truncated fetch whose oldest row cannot be dated
+  yields `None`, never the configured window; `lookback_inert` is FALSE on
+  unknown, because it drives a sentence telling the operator their knob does
+  nothing and asserting that from an unmeasured fit is the determinate negative
+  this whole disclosure exists to remove.
+
+**Is it a class? FOUR sites, TWO undisclosed — not 117 and not 1.** Measured by
+enumerating every call site of every documented numeric `talos_config::` knob and
+reading each: (A) this one; (B) `HISTORY_MAX_EXECUTIONS = 50` vs
+`history_window_days()`; (C) `HISTORY_WINDOW_DAYS.min(archive_after_days())`;
+(D) hardcoded candidate-row counts (`10`/`20`/`clamp(1,50)`) vs
+`SMART_MEMORY_CONTEXT_BYTE_BUDGET`, which has no upper clamp — **D is
+undisclosed anywhere and is left for a later package.** **B is the instructive
+one**: its doc comment already says *"on a high-frequency one it covers roughly
+the last twelve hours, so the check is strongly recency-biased there"* — the
+sentence this package had to write for A. **The repo already knows how to write
+this disclosure; it writes it where the reader of the CONSTANT will see it, and
+not where the operator reading `docs/configuration-reference.md` will.** That
+asymmetry is the generalizable finding, and it is why the interaction is now
+documented at BOTH ends (the knob's own `talos_config` doc comment, both docs
+files, AND the const). The contrast that proves the shape: `stale_sweep`'s
+`STALE_SWEEP_BATCH = 500` beside `STALE_EXECUTION_MINUTES` is the same query
+shape and is NOT a defect, because it orders `started_at ASC` and repeats, so the
+backlog drains. **`DESC` + a cap + no cursor is what makes A one.**
+
+**Measured and NOT changed.** The fitted weights on this fleet are UNCHANGED —
+this package is disclosure only, and the refit delta is recorded so the trade is
+on the record rather than taken: an unbounded 30-day fit moves relevance −11.2 %,
+recency −10.1 %, importance −4.8 %, access +2.3 %, i.e. ~7 % harder on importance
+normalised to relevance. #654 measured the downstream effect (top-1 injected
+memory moved in 1.07 % of executions, a LOWER bound since the provenance table
+sees only ALREADY-INJECTED memories) and **neither fit is known to be the better
+one — there is no held-out evaluation of this ranker.** Two ADJACENT findings
+verified and left alone, both "a documented knob that does nothing" in a
+different shape: **`DB_EXECUTION_TIMEOUT_SECS` is fully inert** (two hits
+workspace-wide, both in `talos-db/src/lib.rs`, and the value reaches only a
+`tracing::info!` — it is applied to no pool) and **`EXECUTION_MAX_ROWS` has no
+consumer at all** (referenced only by `talos-config`'s own tests). Each is a
+behaviour change with its own blast radius.
+
+**Lints: none added, `--count` stays 88.** Two candidates built and measured over
+`controller/src`, `worker/src` and every `talos-*/src`. *"a ±5-line window
+carrying both a `talos_config::` read and a bare SCREAMING_SNAKE const"* reports
+**116 sites in 50 files**, nearly all env-var NAME STRINGS and `DEFAULT_*`
+constants that ARE the knob's default — and, decisively, **it does not report
+this package's own site at all**, because the knob is read 200 lines from where
+the const is consumed. A detector green over the defect it was written for is the
+gate-that-doesn't-gate shape (#624, checks 64/65). *"an explicit clamp of a
+`talos_config::` value against a const"* reports **2 sites, 1 real** — 50 %
+precision over a population of two, below #765's bar, and it structurally cannot
+see A, B or D, which are argument-position rather than clamp-position. Deciding
+which of two bounds binds FIRST needs the `ORDER BY`, whether the reader repeats
+with a cursor, and the fleet's row rate; that is a judgement, not a grep.
+
+**Guards, and what they do NOT cover.** `observe()` is protected STRUCTURALLY —
+it is the tick's only source of the `FetchProvenance` that `fit_rank_weights`
+REQUIRES (#654's rule), so deleting the coverage counter means deleting the fit.
+`publish()` is an ordinary call site and is a **MEASURED SURVIVOR**: a tick that
+computes every shortfall correctly and never publishes leaves the gauge at its
+seed, compiles clean and looks like a healthy fleet. A `Drop`-based publish was
+REJECTED — it would fire on the tick's early-`?` return and publish `0.0` for a
+tick that measured nothing. What partially mitigates it is that the gauge and the
+counter are documented as a PAIR, so `truncated` climbing beside a 0 shortfall is
+self-contradictory. Two other survivors were found and CLOSED rather than
+recorded: the digest READ (`recent_rank_fits` is a `sqlx::query_as` over a
+runtime `&str`, so a projection that yields NULL is check 88's class — closed by
+`controller/tests/rank_training_window_disclosure_tests`, CTRL_TESTS per 64b,
+whose CONTROL is a pre-disclosure artifact that must still read as UNKNOWN), and
+the digest RENDERER, which computed the whole disclosure and dropped it while
+every test stayed green until `rank_fit_row` was extracted out of an `async`
+method over four repositories — checks 74b/79b's stated limit, and extraction is
+the only thing that closes it.
+
+**The trailing-space item (#788's footer).** Seven lines in
+`talos-mcp-handlers/src/executions.rs` ended `... the \n\`, so every wrapped line
+of the waterfall's beyond-total footer carried a trailing blank. Fixed. **The
+lint was measured and REJECTED**: #785's checker looks for runs of ≥5 spaces and
+is structurally blind to a single one; extending its literal resolver to find a
+rendered line ENDING in whitespace gives **13 hits / 5 files pre-fix (7 real) and
+6 / 4 after** — 53.8 % precision, six markers on correct code (three trailing
+spaces inside multi-line SQL raw strings, a regex character class `[^ \t\n]`, and
+a deliberate whitespace fixture). **One measurement error worth carrying**: the
+first detector used `[^\S\n]+\n`, which matches `\r\n` — `\r` is whitespace and
+is not `\n` — and reported **82 hits across 23 files**, every HTTP and MIME
+header among them.
+
+
 ## Sub-workflow dispatch (engine)
 
 Every parent node that runs a sub-workflow (judge, ensemble, reflective-retry, llm-dispatch, sub_workflow) uses the shared dispatcher pattern in `controller/src/engine/parallel.rs`:

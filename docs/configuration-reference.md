@@ -431,9 +431,39 @@ Several default **ON** as of the 2026-07 "Tier 3" learning-loops cutover.
 | `MEMORY_RANK_PROVENANCE_RETENTION_DAYS` | `90` | Provenance row retention | |
 | `ADAPTIVE_RANK_MIN_EXAMPLES` | `50` | Min examples before training | |
 | `ADAPTIVE_RANK_TRAINING_INTERVAL_SECS` | `21600` | Training cadence | |
-| `ADAPTIVE_RANK_LOOKBACK_DAYS` | `30` | Training lookback window | |
+| `ADAPTIVE_RANK_LOOKBACK_DAYS` | `30` | Training lookback window. **Effective DOWNWARD only** — see the note below | |
 | `ADAPTIVE_RANK_MAX_ACTORS_PER_TICK` | `50` | Actor fan-out cap per tick | |
 | `MEMORY_LOOP_MAX_ACTORS_PER_ORG_PER_TICK` | `0` (disabled) | Shared per-org fan-out cap across memory loops | |
+
+**`ADAPTIVE_RANK_LOOKBACK_DAYS` is bounded by four things, and it is the
+weakest of them.** The clamp on the variable itself is `[1, 3650]` days, but the
+fit cannot see anything like 3650 days, and raising the knob past the ceilings
+below changes nothing about the model — it only widens the population the
+truncation disclosure reports as dropped, which reads as the change taking
+effect. Measured on the reference deployment 2026-09-09 with the knob at its
+default 30: the fit saw **6.56 days**, and every value from 7 to 3650 produced a
+bit-identical model.
+
+| ceiling | value | effective window at ~2 900 provenance rows/day |
+| --- | --- | --- |
+| per-actor training row cap (`TRAINING_FETCH_CAP`, hardcoded) | 20 000 rows | **~6.6 days** |
+| the fetch's own hard clamp (`RANK_TRAINING_EXAMPLE_MAX`, hardcoded) | 50 000 rows | ~17 days |
+| execution **archival** (`ARCHIVE_AFTER_DAYS`) | 30 days | **~30 days** |
+| provenance retention (`MEMORY_RANK_PROVENANCE_RETENTION_DAYS`) | 90 days | 90 days |
+
+The third is the one to understand before changing the first two: past
+`ARCHIVE_AFTER_DAYS` a provenance row's execution has moved to
+`workflow_executions_archive`, which the training fetch does not read, so the
+row arrives with no status and no judge verdict and is dropped as UNLABELED.
+Measured: rows-with-a-live-execution saturates at 72 712 from 30 days onward
+while the raw row count keeps climbing to 110 812 at 60 days. **So lifting the
+row cap alone would not extend the training window past ~30 days.**
+
+Where to SEE the effective window rather than infer it:
+`get_operator_digest`'s learned panel (`configured_lookback_days`,
+`effective_lookback_days`, `lookback_knob_inert`, `window_note`), the
+`rank_training_truncated` WARN, the stored model's `fetch` object, and the
+`talos_rank_training_*` Prometheus series.
 
 ### ML lifecycle jobs (`talos-ml`; controller-side)
 

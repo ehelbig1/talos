@@ -84,6 +84,106 @@ fn rank_fit_population(n_fetched: Option<i64>, n_available: Option<i64>) -> (Opt
     }
 }
 
+/// Put the fetch accounting into the unit the operator CONFIGURED — days.
+///
+/// [`rank_fit_population`] answers it in ROWS, and rows are the wrong unit for
+/// the decision an operator makes here. `ADAPTIVE_RANK_LOOKBACK_DAYS` is
+/// documented as a training window clamped to `[1, 3650]` days; a hardcoded
+/// per-actor row cap binds first, so on a busy actor the configured 30 days is
+/// a fitted ~6.6 and every value from 7 upward produces the SAME model.
+///
+/// The row note alone cannot say that. Worse, `n_available` is counted with the
+/// operator's own `since`, so it MOVES when the inert knob is turned: raising
+/// 30 → 90 grows `window_rows_dropped` while the fitted coefficients stay
+/// bit-identical, which reads as the change taking effect.
+///
+/// Returns `(effective_lookback_days, lookback_inert, note)`.
+/// * NOT truncated ⇒ the effective window IS the configured one; the fetch
+///   reached the end of it. Reporting the oldest surviving row here would
+///   report an empty tail as a narrower window.
+/// * Truncated ⇒ the age of the oldest row read, because everything older was
+///   left unread.
+/// * Either input unknown ⇒ `(None, false, …)`. **`inert` is false on unknown
+///   deliberately**: it drives a sentence telling the operator their knob does
+///   nothing, and asserting that from an unmeasured fit is the determinate
+///   negative this whole disclosure exists to remove. The note says unknown.
+fn rank_fit_window(
+    truncated: bool,
+    configured_days: Option<i64>,
+    oldest_age_days: Option<f64>,
+) -> (Option<f64>, bool, String) {
+    let effective = if truncated {
+        oldest_age_days
+    } else {
+        configured_days.map(|d| d as f64)
+    };
+    let (Some(configured), Some(effective)) = (configured_days, effective) else {
+        return (
+            None,
+            false,
+            "training-window coverage in DAYS is unknown for this fit (the model \
+             predates the disclosure, or the fetch returned no rows to date)"
+                .to_string(),
+        );
+    };
+    let shortfall = (configured as f64 - effective).max(0.0);
+    let inert = shortfall >= talos_memory_ranking::INERT_LOOKBACK_MIN_SHORTFALL_DAYS;
+    let note = if inert {
+        format!(
+            "ADAPTIVE_RANK_LOOKBACK_DAYS is {configured}, but the per-actor row \
+             cap bound first and this fit saw only the newest {effective:.1} \
+             days. The knob is effective DOWNWARD ONLY here: RAISING it adds no \
+             rows to the fit and only widens the population reported as dropped."
+        )
+    } else {
+        format!("fit saw the whole configured {configured}-day training window")
+    };
+    (Some(effective), inert, note)
+}
+
+/// One learned-rank fit as the digest renders it.
+///
+/// A PURE function rather than a closure inside `learned_panel`, and that is
+/// deliberate: the panel is an `async` method over four repositories, so
+/// nothing could drive it, and a version that computed the whole disclosure
+/// and then dropped it on the floor passed every test in this crate (mutation
+/// M11 in `AGENT_NOTES.md`). Checks 74b/79b state that limit — a guard at the
+/// READ cannot see an answer computed correctly and discarded — and extracting
+/// the renderer is the only thing that closes it.
+///
+/// `n_examples` is the LABELED subset of a CAPPED fetch. On a truncating actor
+/// it equals the cap, so presenting it alone reads as "learned from everything
+/// available" when it is a measurement of the limit. Both accountings ship
+/// beside it — rows, and the DAYS the operator actually configured — and "we
+/// could not tell" is encoded as absent rather than as a reassuring number.
+fn rank_fit_row(f: talos_actor_repository::RankFitSummary) -> JsonValue {
+    let (rows_dropped, note) = rank_fit_population(f.n_fetched, f.n_available);
+    // `truncated` is DERIVED from the two row counts rather than stored, so it
+    // agrees with `rows_dropped` by construction — the model's own
+    // `truncated()` uses the conservative `n_fetched >= cap` rule, and two
+    // same-named flags that disagreed on the exactly-at-cap case would be this
+    // disclosure committing the very defect it exists to fix.
+    let truncated = rows_dropped.is_some_and(|d| d > 0);
+    let (effective_days, inert, window_note) = rank_fit_window(
+        truncated,
+        f.configured_lookback_days,
+        f.oldest_fetched_age_days,
+    );
+    json!({
+        "actor": f.actor,
+        "n_examples": f.n_examples,
+        "n_fetched": f.n_fetched,
+        "window_available": f.n_available,
+        "window_rows_dropped": rows_dropped,
+        "population_note": note,
+        "configured_lookback_days": f.configured_lookback_days,
+        "effective_lookback_days": effective_days,
+        "lookback_knob_inert": inert,
+        "window_note": window_note,
+        "fitted_at": f.fitted_at,
+    })
+}
+
 fn is_autonomous(trigger_type: &str) -> bool {
     AUTONOMOUS_TRIGGERS.contains(&trigger_type)
 }
@@ -263,24 +363,7 @@ impl OperatorDigestService {
             .await
             .unwrap_or_default()
             .into_iter()
-            .map(|f| {
-                // `n_examples` is the LABELED subset of a CAPPED fetch. On a
-                // truncating actor it equals the cap, so presenting it alone
-                // reads as "learned from everything available" when it is a
-                // measurement of the limit. Ship the accounting beside it, and
-                // encode "we could not tell" as absent rather than as a
-                // reassuring number.
-                let (rows_dropped, note) = rank_fit_population(f.n_fetched, f.n_available);
-                json!({
-                    "actor": f.actor,
-                    "n_examples": f.n_examples,
-                    "n_fetched": f.n_fetched,
-                    "window_available": f.n_available,
-                    "window_rows_dropped": rows_dropped,
-                    "population_note": note,
-                    "fitted_at": f.fitted_at,
-                })
-            })
+            .map(rank_fit_row)
             .collect::<Vec<_>>();
 
         // ML loop health (per-model lifecycle, promoted version, shadow
@@ -1312,6 +1395,144 @@ mod tests {
         let (dropped, note) = rank_fit_population(Some(20_000), Some(19_000));
         assert_eq!(dropped, Some(0));
         assert!(!note.contains('-'), "{note}");
+    }
+
+    // ── The DAYS half of the same disclosure ────────────────────────────
+    //
+    // `rank_fit_population` above answers in ROWS. Its counts MOVE when
+    // `ADAPTIVE_RANK_LOOKBACK_DAYS` is turned even though the fitted model does
+    // not — measured on the reference fleet 2026-09-09, raising 30 → 90 grew
+    // `window_rows_dropped` from 52 642 to 90 805 with bit-identical
+    // coefficients. These assertions are about the number that cannot do that.
+
+    #[test]
+    fn a_capped_fit_says_the_configured_window_was_not_the_one_used() {
+        // The live shape: knob at 30, oldest row read 6.56 days back.
+        let (effective, inert, note) = rank_fit_window(true, Some(30), Some(6.56));
+        assert_eq!(effective, Some(6.56));
+        assert!(inert);
+        assert!(note.contains("ADAPTIVE_RANK_LOOKBACK_DAYS is 30"), "{note}");
+        assert!(note.contains("6.6 days"), "{note}");
+        assert!(
+            note.contains("DOWNWARD ONLY") && note.contains("RAISING it adds no"),
+            "the note must say which DIRECTION is inert — an operator who reads \
+             only 'the window was short' turns the knob up: {note}"
+        );
+    }
+
+    /// **The control half.** Without it the assertion above passes on a
+    /// renderer that calls every fit inert, which is a disclosure crying wolf.
+    #[test]
+    fn an_unbound_fit_reports_the_configured_window_and_is_not_inert() {
+        let (effective, inert, note) = rank_fit_window(false, Some(30), Some(2.0));
+        assert_eq!(
+            effective,
+            Some(30.0),
+            "an unbound fetch SEARCHED the whole window; the oldest surviving \
+             row is not the edge of it"
+        );
+        assert!(!inert);
+        assert!(note.contains("whole configured 30-day"), "{note}");
+        assert!(
+            !note.contains("DOWNWARD"),
+            "a healthy fit must not be told its knob is inert: {note}"
+        );
+    }
+
+    #[test]
+    fn an_undated_window_is_unknown_never_zero_and_never_inert() {
+        for (truncated, configured, oldest) in [
+            (true, Some(30), None),  // capped, oldest row undatable
+            (true, None, Some(6.5)), // pre-disclosure artifact
+            (false, None, None),     // pre-disclosure artifact
+        ] {
+            let (effective, inert, note) = rank_fit_window(truncated, configured, oldest);
+            assert_eq!(effective, None, "unknown must stay unknown");
+            assert!(
+                !inert,
+                "asserting 'your knob does nothing' from an unmeasured fit is \
+                 the determinate negative this disclosure exists to remove"
+            );
+            assert!(note.contains("unknown"), "{note}");
+        }
+    }
+
+    /// The two halves of one row must not disagree. A fit the ROW note calls
+    /// complete must not have the DAY note calling its knob inert, and vice
+    /// versa — two contradictory sentences in one response is the defect this
+    /// whole disclosure exists to prevent.
+    #[test]
+    fn the_row_note_and_the_day_note_agree_about_one_fit() {
+        for (fetched, available, configured, oldest) in [
+            (Some(20_000), Some(72_642), Some(30), Some(6.56)),
+            (Some(95), Some(95), Some(30), Some(4.0)),
+        ] {
+            let (dropped, row_note) = rank_fit_population(fetched, available);
+            let truncated = dropped.is_some_and(|d| d > 0);
+            let (_, inert, day_note) = rank_fit_window(truncated, configured, oldest);
+            assert_eq!(
+                row_note.contains("dropped"),
+                inert,
+                "row note {row_note:?} and day note {day_note:?} disagree"
+            );
+        }
+    }
+
+    fn fit(
+        n_fetched: Option<i64>,
+        n_available: Option<i64>,
+        configured: Option<i64>,
+        oldest: Option<f64>,
+    ) -> talos_actor_repository::RankFitSummary {
+        talos_actor_repository::RankFitSummary {
+            actor: "a".to_string(),
+            n_examples: 20_000,
+            n_fetched,
+            n_available,
+            configured_lookback_days: configured,
+            oldest_fetched_age_days: oldest,
+            fitted_at: chrono::Utc::now(),
+        }
+    }
+
+    /// The rendered ROW must carry the window, not merely compute it. The
+    /// panel that used to build this inline is an `async` method over four
+    /// repositories, so a version that computed the whole disclosure and
+    /// dropped it passed every test in this crate until the renderer was
+    /// extracted (mutation M11).
+    #[test]
+    fn a_rendered_fit_carries_the_window_it_saw() {
+        let row = rank_fit_row(fit(Some(20_000), Some(72_642), Some(30), Some(6.56)));
+        assert_eq!(row["configured_lookback_days"], json!(30));
+        assert_eq!(row["effective_lookback_days"], json!(6.56));
+        assert_eq!(row["lookback_knob_inert"], json!(true));
+        assert!(row["window_note"]
+            .as_str()
+            .unwrap()
+            .contains("DOWNWARD ONLY"));
+        // The pre-existing row accounting must still be there beside it.
+        assert_eq!(row["window_rows_dropped"], json!(52_642));
+        assert_eq!(row["n_examples"], json!(20_000));
+    }
+
+    /// The control: a healthy fit renders every key and claims nothing.
+    #[test]
+    fn a_rendered_complete_fit_claims_no_inert_knob() {
+        let row = rank_fit_row(fit(Some(95), Some(95), Some(30), Some(4.0)));
+        assert_eq!(row["effective_lookback_days"], json!(30.0));
+        assert_eq!(row["lookback_knob_inert"], json!(false));
+        assert_eq!(row["window_rows_dropped"], json!(0));
+    }
+
+    /// A pre-disclosure artifact renders the window as NULL, never as a
+    /// number, and never as a claim that the knob is inert.
+    #[test]
+    fn a_rendered_pre_disclosure_fit_renders_unknown_as_null() {
+        let row = rank_fit_row(fit(None, None, None, None));
+        assert_eq!(row["configured_lookback_days"], JsonValue::Null);
+        assert_eq!(row["effective_lookback_days"], JsonValue::Null);
+        assert_eq!(row["lookback_knob_inert"], json!(false));
+        assert_eq!(row["window_rows_dropped"], JsonValue::Null);
     }
 
     /// Build a `JudgeScoreStat` for signal tests.
