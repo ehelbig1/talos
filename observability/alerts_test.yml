@@ -1841,3 +1841,133 @@ tests:
       - eval_time: 10m
         alertname: TalosBackgroundTaskExited
         exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
+  # Package thirty-four (2026-09-09): a signed-RPC subject alive and failing.
+  #
+  # All 64 (subject, outcome) pairs are PRE-SEEDED at 0 by
+  # `TalosMetrics::new`, and the seed is load-bearing in the usual direction —
+  # an `increase(...) > 0` over an ABSENT series matches nothing. But this
+  # alert is a RATIO, so the seed cuts the other way too: on an idle fleet
+  # every rate is 0, the denominator is 0, and 0/0 is NaN. The first case
+  # drives permanently-zero seeded series and asserts SILENCE, which is the
+  # shape a controller serving no RPCs has for its whole lifetime.
+  #
+  # The second case is the one this package exists for: a DESIGNED decline
+  # (`not_promoted` from an `llm_only` model) firing steadily must page
+  # nobody. On the reference fleet that one state produced 17 of the
+  # controller's 32 WARN lines, hourly and unbroken.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: an idle fleet with pre-seeded zero RPC series alerts on nothing
+    input_series:
+      - series: 'talos_rpc_calls_total{subject="talos.memory.op",outcome="ok",class="served"}'
+        values: "0+0x60"
+      - series: 'talos_rpc_calls_total{subject="talos.memory.op",outcome="internal",class="finding"}'
+        values: "0+0x60"
+      - series: 'talos_rpc_calls_total{subject="talos.memory.op",outcome="timeout",class="finding"}'
+        values: "0+0x60"
+      - series: 'talos_rpc_calls_total{subject="talos.graph.search",outcome="ok",class="served"}'
+        values: "0+0x60"
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: TalosRPCSubjectFailing
+        exp_alerts: []
+
+  - interval: 1m
+    name: a designed decline firing steadily pages nobody
+    input_series:
+      # `not_promoted` is the whole traffic of this subject and climbs on
+      # every sample. Its class is `declined`, so the numerator stays 0 while
+      # the denominator is large — the exact inverse of a firing condition.
+      - series: 'talos_rpc_calls_total{subject="talos.ml.predict",outcome="not_promoted",class="declined"}'
+        values: "0+1x60"
+      - series: 'talos_rpc_calls_total{subject="talos.ml.predict",outcome="ok",class="served"}'
+        values: "0+0x60"
+      - series: 'talos_rpc_calls_total{subject="talos.ml.predict",outcome="internal",class="finding"}'
+        values: "0+0x60"
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: TalosRPCSubjectFailing
+        exp_alerts: []
+
+  - interval: 1m
+    name: one failure among healthy traffic is a blip, not an alert
+    input_series:
+      - series: 'talos_rpc_calls_total{subject="talos.memory.op",outcome="ok",class="served"}'
+        values: "0+1x60"
+      - series: 'talos_rpc_calls_total{subject="talos.memory.op",outcome="timeout",class="finding"}'
+        values: "0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1"
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: TalosRPCSubjectFailing
+        exp_alerts: []
+
+  - interval: 1m
+    name: a minority of failures below the volume floor stays silent
+    input_series:
+      # 3 findings in the window against 3 successes: the RATIO arm is
+      # satisfied (50% is not > 50%, so make it 4 vs 3) but the `>= 5` floor
+      # is not. This is the arm that stops a quiet subject alerting on a
+      # handful of errors.
+      - series: 'talos_rpc_calls_total{subject="talos.graph.search",outcome="ok",class="served"}'
+        values: "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
+      - series: 'talos_rpc_calls_total{subject="talos.graph.search",outcome="internal",class="finding"}'
+        values: "0 1 2 3 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4 4"
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: TalosRPCSubjectFailing
+        exp_alerts: []
+
+  - interval: 1m
+    name: a subject failing every call fires the warning
+    input_series:
+      - series: 'talos_rpc_calls_total{subject="talos.memory.op",outcome="ok",class="served"}'
+        values: "0+0x60"
+      - series: 'talos_rpc_calls_total{subject="talos.memory.op",outcome="internal",class="finding"}'
+        values: "0+1x60"
+    alert_rule_test:
+      - eval_time: 40m
+        alertname: TalosRPCSubjectFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: data-plane
+              subject: talos.memory.op
+            exp_annotations:
+              summary: "Most signed-RPC calls on talos.memory.op are failing (100%)"
+              description: |
+                Over the last 15 minutes, more than half of the calls the
+                controller served on talos.memory.op ended in the `finding`
+                class — the platform could not serve them, or they should not have
+                arrived in the shape they did. The subscriber itself is ALIVE
+                (a dead one shows up as talos_background_task_exits_total instead).
+
+                Every credential-free worker reaches Postgres, Neo4j, the sandbox
+                SQL surface and model inference through these seven subjects, so a
+                subject at this failure rate means the corresponding capability is
+                effectively off for the whole fleet.
+
+                NOTE this alert can co-fire with TalosRPCWriteCeilingRefusals when
+                the finding class is dominated by outcome="write_ceiling". They say
+                different things — that one names a worker whose own gate is not
+                running; this one says the subject is mostly not working — and
+                neither is a duplicate of the other.
+              action: |
+                1. Break the ratio down by outcome:
+                   `sum by (subject, outcome) (increase(talos_rpc_calls_total{class="finding"}[15m]))`.
+                2. outcome="internal" / "connection_failed" / "query_error": the
+                   controller's Postgres (or Neo4j, for talos.graph.search) is the
+                   suspect. Check `talos_db_pool_*` and the controller log on the
+                   `talos_rpc` target.
+                3. outcome="timeout" / "stale_deadline": the subject is saturated.
+                   `stale_deadline` specifically means the semaphore queue outran
+                   the caller's own deadline — compare against the per-subject
+                   in-flight cap (memory 16, state-write 32, the rest 8).
+                4. outcome="unauthorized" / "replay": a signing problem, not a
+                   capacity one. Suspect a half-rotated WORKER_SHARED_KEY, clock
+                   skew, or a sender that should not be there.
+                5. outcome="not_available": a model backend cannot serve
+                   (dataset gone, unsupported backend, embedder down). This is the
+                   LOUD lifecycle failure — distinct from `not_promoted`, which is
+                   a designed state and is not selected by this alert.

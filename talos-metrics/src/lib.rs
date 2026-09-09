@@ -13,6 +13,9 @@ use prometheus::{
 };
 use std::sync::{Arc, OnceLock};
 
+pub mod rpc;
+pub use rpc::{seeded_pairs as rpc_seeded_pairs, RpcOutcome, RpcOutcomeClass, RpcSubject};
+
 /// The complete, closed set of `subject` label values on
 /// `talos_rpc_write_ceiling_refusals_total` — the NATS subjects on which the
 /// controller serves a ceiling-gated mutation.
@@ -177,6 +180,35 @@ pub fn record_mcp_tool_call(
     }
 }
 
+/// Record one signed-RPC call on the process-global registry.
+///
+/// ONE increment site for both series, so a new observation point cannot move
+/// one and forget the other. Inert when metrics are not wired (unit tests, any
+/// process without [`set_global`]) — never unwraps, mirroring [`global`]'s
+/// contract.
+///
+/// Both parameters are ENUMS, not `&'static str`. The `subject` label is the
+/// NATS subject and the `outcome` label is the subscriber's own classification
+/// of its reply; `actor_id` is a LOG FIELD on the caller and must NEVER become
+/// a label — it is caller-supplied and unbounded, i.e. a cardinality DoS
+/// surface reachable by anything that can publish to the subject. With the
+/// enums, a caller-derived label value is not expressible.
+///
+/// `queue` and `exec` are passed as `Duration`s rather than pre-rounded
+/// milliseconds: every call site used to round to `as_millis()`, and every
+/// `queue_ms`/`exec_ms` this fleet has ever logged is `0`, so a histogram fed
+/// the rounded value would put every observation in its bottom bucket.
+pub fn record_rpc_call(
+    subject: RpcSubject,
+    outcome: RpcOutcome,
+    queue: std::time::Duration,
+    exec: std::time::Duration,
+) {
+    if let Some(m) = global() {
+        record_rpc_call_on(m, subject, outcome, queue, exec);
+    }
+}
+
 /// The recording itself, against an EXPLICIT registry.
 ///
 /// Split out from [`record_mcp_tool_call`] so a test can drive the real
@@ -199,6 +231,27 @@ pub fn record_mcp_tool_call_on(
         .mcp_tool_duration_seconds
         .with_label_values(&labels)
         .observe(elapsed.as_secs_f64());
+}
+
+/// The recording itself, against an EXPLICIT registry.
+///
+/// Split out from [`record_rpc_call`] so a test can drive the real recording
+/// without racing `set_global` (a process-wide `OnceLock` that sibling tests in
+/// one binary share — CLAUDE.md's 2026-09-08 entry records the flake and its
+/// `installed_test_metrics()` fix).
+pub fn record_rpc_call_on(
+    metrics: &TalosMetrics,
+    subject: RpcSubject,
+    outcome: RpcOutcome,
+    queue: std::time::Duration,
+    exec: std::time::Duration,
+) {
+    let labels = [subject.as_str(), outcome.as_str(), outcome.class().as_str()];
+    metrics.rpc_calls_total.with_label_values(&labels).inc();
+    metrics
+        .rpc_duration_seconds
+        .with_label_values(&labels)
+        .observe((queue + exec).as_secs_f64());
 }
 
 /// Record an archived-workflow dispatch refusal on the process-global
@@ -1212,6 +1265,56 @@ pub struct TalosMetrics {
     /// database the enforcement path cannot reach — not a policy working as
     /// configured, which is why it is a separate label rather than folded in.
     pub rpc_write_ceiling_refusals_total: CounterVec,
+
+    /// Signed-RPC calls the controller served for credential-free workers, by
+    /// `subject` × `outcome` × `class`. THE instrument for the whole data
+    /// plane: every actor-memory read and write, every graph-RAG search, every
+    /// sandbox SQL statement and every model inference crosses one of these
+    /// seven subjects.
+    ///
+    /// Until 2026-09-09 there was none. `record_rpc_metric`'s name asserted a
+    /// metric and its body was one `tracing` call, so `curl /metrics/prometheus
+    /// | grep '^talos_rpc'` returned only #760's six write-ceiling series —
+    /// "how many memory RPCs did we serve, and how fast" was unanswerable in
+    /// every channel at once, because the SUCCESS arm logged at `debug!` and
+    /// nothing counted it.
+    ///
+    /// **Cardinality is the design.** All three labels are closed
+    /// compile-time sets: `subject` is [`RpcSubject`], `outcome` is
+    /// [`RpcOutcome`], and `class` is a pure FUNCTION of `outcome`
+    /// ([`RpcOutcomeClass`]) so it adds no series. `actor_id` is a log field
+    /// on `record_rpc_metric` and must never be added here — it is
+    /// caller-supplied and unbounded.
+    ///
+    /// **Pre-seeded, and only over the reachable pairs.** All 64 pairs a call
+    /// site can pass are seeded at 0 from `rpc::seeded_pairs()`, which IS the
+    /// per-subject table; the cross product would be 7 × 18 = 126 and would
+    /// seed 62 combinations nothing can increment (check 58's defect). Seeding
+    /// matters because `TalosRPCSubjectFailing` selects on this counter and
+    /// `increase(...) > 0` over an ABSENT series matches nothing — the
+    /// detector silenced by exactly the condition it detects.
+    ///
+    /// Useful queries: failure share of a subject is
+    /// `sum by (subject) (rate(…{class="finding"}[15m])) / sum by (subject)
+    /// (rate(…[15m]))`; a signature-failure burst — deliberately NOT alerted
+    /// on, because this fleet has produced zero and any threshold would be a
+    /// guess that fires on a rolling deploy's clock skew — is
+    /// `sum by (subject) (increase(…{outcome="unauthorized"}[15m]))`;
+    /// backpressure on a subject is `{outcome="stale_deadline"}`, the queue
+    /// outrunning the caller's own deadline.
+    pub rpc_calls_total: CounterVec,
+    /// Wall-clock duration (semaphore queue + execution) of one signed-RPC
+    /// call, same labels and same closed-set rule as [`Self::rpc_calls_total`].
+    ///
+    /// **Deliberately NOT pre-seeded**, and the reason is narrower than "it is
+    /// expensive": the absent-≠-zero rule is a rule about COUNTS. A seeded
+    /// histogram over zero observations renders every bucket 0, `_sum` 0 and
+    /// `_count` 0 — exactly what the seeded counter at 0 already says — and
+    /// `histogram_quantile` over it is NaN either way. It costs 21 lines per
+    /// pair against the counter's 1. If an alert is ever written on this
+    /// histogram, seed the pairs THAT alert selects, not the table.
+    pub rpc_duration_seconds: HistogramVec,
+
     /// Dispatches refused because the workflow is ARCHIVED — the narrow
     /// lifecycle gate (2026-09-07). Labels: `path` (which dispatch surface
     /// refused, from `talos_workflow_liveness::dispatch::DispatchPath`) ×
@@ -2322,6 +2425,66 @@ impl TalosMetrics {
             }
         }
 
+        // ── The signed-RPC data-plane instrument (2026-09-09) ────────────
+        //
+        // Labels are `subject` × `outcome` × `class`, all three closed
+        // compile-time sets from `crate::rpc`. `class` is a pure function of
+        // `outcome`, so it costs no series and buys the one thing a PromQL
+        // selector cannot do for itself: rest the alert on the SAME decision
+        // the log level rests on, instead of a hand-maintained
+        // `outcome=~"internal|timeout|…"` alternation that a nineteenth
+        // outcome would silently fall outside of.
+        let rpc_calls_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_rpc_calls_total",
+                "Signed-NATS-RPC calls the controller served for credential-free \
+                 workers. Labels: subject (one of seven NATS subjects) × outcome \
+                 (the subscriber's own classification of its reply) × class \
+                 (served | declined | finding — a pure function of outcome). \
+                 `declined` is the platform answering CORRECTLY by declining: a \
+                 policy refusal, a designed lifecycle state such as \
+                 outcome=not_promoted, a configured cap, or a caller error the \
+                 caller was told about — do NOT alert on it. `finding` means \
+                 someone should look: the platform could not serve the call, or \
+                 the call should not have arrived in the shape it did. All 64 \
+                 reachable (subject, outcome) pairs are pre-seeded at 0; a pair \
+                 outside the per-subject table cannot be emitted.",
+            ),
+            &["subject", "outcome", "class"],
+        )?;
+        registry.register(Box::new(rpc_calls_total.clone()))?;
+        // The pre-seed loop IS the table (`rpc::seeded_pairs`), so a pair the
+        // loop misses is not expressible — there is no parallel list to rot
+        // (#778's `BackgroundTask` shape). Seeded because
+        // `TalosRPCSubjectFailing` selects on this counter, and the healthy
+        // steady state of the `finding` class is zero forever.
+        for (subject, outcome) in rpc::seeded_pairs() {
+            rpc_calls_total
+                .with_label_values(&[subject.as_str(), outcome.as_str(), outcome.class().as_str()])
+                .inc_by(0.0);
+        }
+
+        // Buckets: 0.5 ms … 65.5 s, doubling (18 finite buckets). The bottom
+        // is 0.5 ms because the sub-millisecond end is where this subsystem
+        // actually lives — every `exec_ms` on the reference fleet is 0. The
+        // top is chosen against the real ceiling rather than the house
+        // default: `kernel::PERMIT_GUARD_TIMEOUT_SECS` is 30 s and the
+        // semaphore queue wait sits OUTSIDE it, so one call can exceed the
+        // 16-bucket 32.768 s top and would then be unmeasurable above it.
+        let rpc_duration_seconds = HistogramVec::new(
+            prometheus::HistogramOpts::new(
+                "talos_rpc_duration_seconds",
+                "Wall-clock duration (semaphore queue + execution) of one signed-RPC \
+                 call. Same labels and same closed-set rule as talos_rpc_calls_total. \
+                 NOT pre-seeded: an absent (subject, outcome) here means that pair has \
+                 not occurred since process start, which is what the pre-seeded 0 on \
+                 talos_rpc_calls_total already says.",
+            )
+            .buckets(exponential_buckets(0.0005, 2.0, 18).expect("valid exponential buckets")),
+            &["subject", "outcome", "class"],
+        )?;
+        registry.register(Box::new(rpc_duration_seconds.clone()))?;
+
         let dispatch_refused_total = CounterVec::new(
             prometheus::Opts::new(
                 "talos_dispatch_refused_total",
@@ -2512,6 +2675,8 @@ impl TalosMetrics {
             registry,
             mcp_tool_duration_seconds,
             mcp_tool_calls_total,
+            rpc_calls_total,
+            rpc_duration_seconds,
             webhook_requests_total,
             webhook_request_duration_seconds,
             webhook_dlq_drops_total,
@@ -2606,6 +2771,7 @@ impl TalosMetrics {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::time::Duration;
 
     /// The premise of the "do NOT pre-seed the MCP instrument" decision,
@@ -2684,7 +2850,6 @@ mod tests {
             "a second outcome on the same tool must add series, not fold in"
         );
     }
-    use super::*;
 
     #[test]
     fn test_metrics_creation() {
@@ -2781,11 +2946,167 @@ mod tests {
     /// This test asserts the seeds on a FRESH registry with nothing recorded,
     /// which is the state that matters (`crypto_invariant_metrics_render`
     /// above increments first, so it cannot see this).
+    /// The pre-seed, in BOTH directions.
+    ///
+    /// #778's worker regression was seeded pairs nothing in that process could
+    /// increment, and the `absent != zero` rule is the mirror of it, so this
+    /// asserts (a) every pair the table declares is present at exactly 0 on a
+    /// cold registry, and (b) NO pair outside the table exists. Direction (b)
+    /// is the one that catches a widening to the 7 x 18 cross product.
+    #[test]
+    fn the_rpc_instrument_seeds_exactly_the_reachable_pairs() {
+        let m = TalosMetrics::new().unwrap();
+        let rendered = m.render_prometheus().expect("render");
+
+        // (a) every declared pair is present, at zero.
+        let mut declared = std::collections::HashSet::new();
+        for (subject, outcome) in rpc::seeded_pairs() {
+            let line = format!(
+                r#"talos_rpc_calls_total{{class="{}",outcome="{}",subject="{}"}} 0"#,
+                outcome.class().as_str(),
+                outcome.as_str(),
+                subject.as_str()
+            );
+            assert!(
+                rendered.contains(&line),
+                "reachable pair not seeded: {line}\n\
+                 An absent series is not a zero: `increase(...) > 0` over it matches \
+                 nothing, which is how the RPC plane stayed uninstrumented for a year."
+            );
+            declared.insert(line);
+        }
+        assert_eq!(declared.len(), 64, "the table changed; re-derive it");
+
+        // (b) nothing outside the table. A seeded combination nothing can
+        // increment reads as a wired signal that does not exist (check 58).
+        let exported: Vec<&str> = rendered
+            .lines()
+            .filter(|l| l.starts_with("talos_rpc_calls_total{"))
+            .collect();
+        assert_eq!(
+            exported.len(),
+            64,
+            "expected exactly the 64 reachable pairs, got {}:\n{}",
+            exported.len(),
+            exported.join("\n")
+        );
+        for line in exported {
+            assert!(
+                declared.contains(line),
+                "exported a pair the table does not declare: {line}"
+            );
+        }
+
+        // The histogram is deliberately unseeded — see its field docs. A
+        // seeded histogram over zero observations says nothing the seeded
+        // counter at 0 does not, at 21 lines per pair instead of 1.
+        assert!(
+            !rendered.contains("talos_rpc_duration_seconds{"),
+            "the duration histogram must export no series before the first call"
+        );
+    }
+
+    /// The histogram observes the WHOLE call, queue wait included.
+    ///
+    /// This is a measured SURVIVOR closed. `record_rpc_call_on`'s observed
+    /// VALUE is not visible to the wiring test in
+    /// `controller/tests/rpc_instrument_tests` — that one proves the series
+    /// MOVED, and on the reference fleet every `queue_ms`/`exec_ms` is 0, so a
+    /// mutation dropping the queue wait would leave it green. The queue is the
+    /// per-subject semaphore wait, i.e. the only part of an RPC that grows
+    /// under backpressure; observing `exec` alone would make a saturated
+    /// subject look fast.
+    #[test]
+    fn the_duration_histogram_observes_queue_plus_exec() {
+        let m = TalosMetrics::new().unwrap();
+        record_rpc_call_on(
+            &m,
+            RpcSubject::MemoryOp,
+            RpcOutcome::Ok,
+            Duration::from_millis(1500),
+            Duration::from_millis(2500),
+        );
+        let rendered = m.render_prometheus().expect("render");
+        let sum_line = rendered
+            .lines()
+            .find(|l| l.starts_with("talos_rpc_duration_seconds_sum{"))
+            .expect("the histogram exported a _sum after one observation");
+        let sum: f64 = sum_line
+            .rsplit(' ')
+            .next()
+            .and_then(|v| v.parse().ok())
+            .expect("parse _sum");
+        assert!(
+            (sum - 4.0).abs() < 1e-9,
+            "expected 1.5s queue + 2.5s exec = 4s, got {sum} from `{sum_line}`"
+        );
+        // Sub-millisecond resolution survives, which is why the call sites
+        // pass `Duration` rather than the pre-rounded `as_millis()` they used
+        // to: every exec time on the reference fleet rounds to 0 ms.
+        let m2 = TalosMetrics::new().unwrap();
+        record_rpc_call_on(
+            &m2,
+            RpcSubject::MemoryOp,
+            RpcOutcome::Ok,
+            Duration::ZERO,
+            Duration::from_micros(700),
+        );
+        let sum2: f64 = m2
+            .render_prometheus()
+            .expect("render")
+            .lines()
+            .find(|l| l.starts_with("talos_rpc_duration_seconds_sum{"))
+            .and_then(|l| l.rsplit(' ').next().and_then(|v| v.parse().ok()))
+            .expect("parse _sum");
+        assert!(
+            sum2 > 0.0,
+            "a 700 microsecond call must be observable; it rounds to 0 ms, which \
+             is what the pre-2026-09-09 signature would have recorded"
+        );
+    }
+
+    /// The measured per-pair scrape cost, which is the premise of the
+    /// seed-the-counter / do-not-seed-the-histogram split. Measured rather
+    /// than asserted from memory: if the bucket count changes, the numbers in
+    /// the field docs and in CLAUDE.md are stale and this says so.
+    #[test]
+    fn the_rpc_instrument_costs_the_lines_the_seed_decision_assumes() {
+        let m = TalosMetrics::new().unwrap();
+        let cold = m.render_prometheus().expect("render");
+        record_rpc_call_on(
+            &m,
+            RpcSubject::MemoryOp,
+            RpcOutcome::Ok,
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_millis(2),
+        );
+        let warm = m.render_prometheus().expect("render");
+        let lines = |body: &str, needle: &str| {
+            body.lines()
+                .filter(|l| !l.starts_with('#') && l.starts_with(needle))
+                .count()
+        };
+        // 18 finite buckets + le="+Inf" + _sum + _count = 21 lines per pair.
+        assert_eq!(
+            lines(&warm, "talos_rpc_duration_seconds"),
+            21,
+            "bucket layout changed; the no-seed cost argument is stale"
+        );
+        // The counter is seeded, so its line count does not move.
+        assert_eq!(lines(&cold, "talos_rpc_calls_total"), 64);
+        assert_eq!(lines(&warm, "talos_rpc_calls_total"), 64);
+    }
+
     #[test]
     fn alerted_counter_vecs_are_seeded_at_zero_on_a_cold_registry() {
         let m = TalosMetrics::new().unwrap();
         let rendered = m.render_prometheus().expect("render");
 
+        // `talos_rpc_calls_total` is alerted (`TalosRPCSubjectFailing`) and
+        // seeded too, but its 64 pairs are asserted EXHAUSTIVELY and in BOTH
+        // directions by `the_rpc_instrument_seeds_exactly_the_reachable_pairs`
+        // below — listing them here would be a second, hand-maintained copy of
+        // the table, which is the drift the table exists to remove.
         for expected in [
             r#"talos_auth_attempts_total{method="password"} 0"#,
             r#"talos_auth_attempts_total{method="oauth"} 0"#,

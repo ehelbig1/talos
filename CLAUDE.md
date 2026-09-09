@@ -47,7 +47,7 @@ Efficient flow for Claude Code specifically: (a) spawn an **Explore** subagent i
 - Exact-wire-bytes signing via `RawSigned<T>` for Value-bearing ops (`MemoryOp::Set`, `IntegrationOp::Set` — the whole op is wrapped, so `value`/`metadata`/`ttl_hours`/`min_score` are all bound as the literal wire text, never re-derived); fixed-tag LE concat for scalar ops. This replaced the old `canonical_json_bytes` sorted-key re-serialisation, which hit serde_json's non-idempotent f64 round trip and made honest sender/receiver disagree (#598, the memory-RPC twin of job-protocol's `SignedJson`). **`RawSigned<T>` has ONE home: `talos_workflow_job_protocol`** — `talos_memory::rpc_auth::RawSigned` is a `pub use` of it, and `SignedJson` is the `pub type SignedJson = RawSigned<serde_json::Value>` alias (with `value()`/`into_value()` as the Value-flavoured spellings of `get()`/`into_inner()`). Do NOT reimplement it: the per-caller SIGNING FORMULAS (`memory_rpc::sign_body_bytes`, `integration_state_rpc::sign_body_bytes`) and the sign-time `validate_finite`/`validate_op` gates stay in their own crates; only the raw-text binding is shared
 - NaN/Inf rejected in signed numeric fields (non-deterministic encoding otherwise)
 - Depth is bounded by **serde_json's own 128-deep recursion limit** at `from_slice`/`from_str` (a deeper payload is a deserialize error, so it never reaches a signature check). There is no longer a Talos-side `MAX_CANONICAL_DEPTH` — it was deleted with `canonical_json_bytes` in #600, since nothing walks the tree to canonicalise it any more
-- Per-subject concurrency semaphore + structured `target: "talos_rpc"` metric events with split `queue_ms` / `exec_ms`
+- Per-subject concurrency semaphore; every completion is COUNTED on `talos_rpc_calls_total{subject,outcome,class}` + `talos_rpc_duration_seconds` and logged on `target: "talos_rpc"` with split `queue_ms` / `exec_ms` at a level derived from `RpcOutcome::class()` (see the 2026-09-09 entry — until then this line said "metric events" and there was no metric)
 
 **Verify-once rule for signed NATS messages** (`talos-workflow-engine/talos-workflow-job-protocol`, learned the hard way r300 / r301, 2026-05-05). Every signed message type (`JobResult`, `PipelineJobResult`, …) MUST have **exactly one primary `verify()` caller per controller process**. Passive observers (audit subscribers, metrics emitters, anything whose only side effect is an idempotent DB write) MUST use `verify_no_replay()` — HMAC + freshness without touching the process-local `JOB_NONCE_CACHE`. Two `verify()` calls against the same signed message will deterministically fail with `"result_nonce already seen"` because both insert into the same shared cache. The worker MUST single-publish each result to ONE NATS subject (reply inbox OR global audit topic, branched on `reply_topic` presence) — dual-publishing primes the cache race even when both consumers correctly use the split API. Background incident: see `memory/rpc_dual_verify_pattern.md`. Adding a new signed message type? Add both `verify()` and `verify_no_replay()` together up front; the prophylactic split is cheap, the regression is total (every job fails).
 
@@ -4103,6 +4103,230 @@ service handle); stated on the impl rather than silently omitted. And on THIS
 fleet the audit table holds **zero** `gcp_%` rows, so package 25's
 `recent_failure` enrichment has nothing to show yet — `module_binding: "missing"`
 is the only signal the dangling channel will produce after deploy.
+
+### 2026-09-09 — the data plane had no instrument, and its log partition called a designed state a failure
+
+**`record_rpc_metric` recorded no metric.** The function's NAME asserted one;
+its body was two `tracing` calls. Measured live: `curl /metrics/prometheus |
+grep '^talos_rpc'` returned exactly SIX series, all of them #760's
+`talos_rpc_write_ceiling_refusals_total`, all at 0 — nothing counted a call, an
+outcome or a latency on ANY of the seven subjects, while 1317
+`module_executions` in 24 h drove the memory / database / graph ones. #760's own
+entry had already MEASURED this ("`talos_rpc` is a TRACING TARGET ONLY … no RPC
+counter was registered") and then added a counter for ONE outcome on THREE
+subjects — the fixed-the-path-not-the-population shape this file names
+repeatedly. And the gap is the other half of a question #783 closed one side of:
+a subscriber that DIES is sayable (`talos_background_task_exits_total`); one
+ALIVE and erroring every call was invisible in every machine-readable channel.
+
+**The partition was binary, and its own comment described one the code did not
+have.** `outcome == "ok"` -> `debug!`, everything else -> `warn!`, under a
+comment reading *"Failure outcomes stay at warn!/info!"* — there was no `info!`
+arm and `git log -S` shows there never had been (#732's class). Two
+consequences. (a) The whole SUCCESS volume was at `debug!`, which this
+deployment enables for exactly one target and it is not this one, AND uncounted
+— so **zero** `rpc completed` lines exist in the controller's entire log. (b)
+Every non-ok outcome was an alarm: **17 of the controller's 32 WARN lines (53%)
+were ONE designed state**, `talos.ml.predict` / `not_promoted`, one per hour for
+seventeen consecutive hours, unbroken, and it is the only non-ok outcome this
+fleet has ever produced. The producer is identifiable: the fleet's ONLY
+hourly-on-the-hour schedule classifies against the `ops-severity` model, whose
+`lifecycle_state` is **`llm_only`** — the FIRST position on the documented ladder
+(`llm_only -> shadow -> hybrid -> fast_primary`), where
+`serve::state_serves_production` is false and every prediction falls back to the
+LLM by construction. `MlRpcError::NotPromoted`'s own doc is a statement of fact
+("Model exists but has no promoted version to serve"); its sibling
+`NotAvailable`'s is *"the RFC's loud lifecycle failure mode"*. **The enum
+already separated the designed state from the failure; only the log level did
+not.** Check 69's harm, on the one channel this subsystem had.
+
+**The instrument.** `talos_rpc_calls_total{subject,outcome,class}` (counter,
+PRE-SEEDED) and `talos_rpc_duration_seconds{subject,outcome,class}` (histogram,
+deliberately NOT seeded). `record_rpc_metric` now takes `RpcSubject` /
+`RpcOutcome` and two `Duration`s; the LOG LINE is byte-identical (same field
+names, same integer milliseconds, same messages for the served and finding
+arms), so no operator's saved filter breaks.
+
+**The label sets are closed BY THE COMPILER, not by convention.** The brief
+recorded that both parameters were already `&'static str` and every argument at
+every call site was a literal or a `match`-bound local — true, and not the same
+thing: `&'static str` also accepts `Box::leak(caller_supplied.into())`, which is
+#786's own stated caveat about its `tool` label — that instrument is the same
+shape on the other half of the request surface, and it types its OUTCOME as an
+enum for this reason while leaving `tool` a `&'static str` because ~320 tools
+make an enum impractical there. With 7 subjects and 18 outcomes BOTH axes are
+affordable here, so `talos-metrics/src/rpc.rs` carries ONE macro
+table per axis from which the enum, the label, the class and the pre-seed loop
+all derive. `actor_id` stays a LOG FIELD and must NEVER become a label — it is
+caller-supplied and unbounded, i.e. a cardinality DoS surface reachable by
+anything that can publish to the subject.
+
+**The seed set is 64 pairs, not 126, and both numbers were measured.** Each
+subject's declared outcomes are exactly what ITS subscriber can pass — its own
+literals plus every arm of its own exhaustive terminal `match`. The cross
+product would seed 62 combinations no call site can reach, which is check 58's
+own defect (the one the worker's `register_metrics(.., &[])` argument was added
+to remove). Every one of the 64 was checked for a live PRODUCER rather than
+merely an exhaustive arm; the ones worth naming are `memory.op`/`write_ceiling`
+(reachable only through the terminal match, produced at `lib.rs:1915`/`:1965`)
+and both `storage_full`s. **Two of the brief's own counts were refuted**: 41
+production call sites, not 49, and **18** distinct outcome literals, not 13.
+
+**The HISTOGRAM is deliberately unseeded, and the reason is narrower than
+"expensive".** The absent-vs-zero rule is a rule about COUNTS: a seeded
+histogram over zero observations renders every bucket 0, `_sum` 0 and `_count`
+0 — exactly what the seeded counter at 0 already says — and
+`histogram_quantile` over it is NaN either way. Measured cost is 21 lines per
+observed pair against the counter's 1 (pinned by
+`the_rpc_instrument_costs_the_lines_the_seed_decision_assumes`, so the number in
+this paragraph cannot go stale silently). Buckets are
+`exponential_buckets(0.0005, 2.0, 18)` = 0.5 ms … 65.5 s: the house default of
+15 tops out at 16.4 s, BELOW `PERMIT_GUARD_TIMEOUT_SECS` (30 s), and the
+semaphore queue sits OUTSIDE that guard, so one call can exceed it.
+
+**Timings are `Duration`, not the pre-rounded milliseconds the call sites used
+to pass**, and that is a measurement rather than taste: every `queue_ms` and
+`exec_ms` this fleet has ever logged is `0`, so a histogram fed `as_millis()`
+would put 100% of observations in its bottom bucket — an instrument that reports
+nothing, which is the defect this change exists to remove.
+
+**Three labels, and the third one is what stops an alert regex rotting.**
+`class` is a pure FUNCTION of `outcome`, so it adds ZERO series (each pair has
+exactly one class) and it buys the one thing PromQL cannot do for itself: rest
+`TalosRPCSubjectFailing` on the SAME `RpcOutcome::class()` the log level rests
+on. Without it the alert would spell `outcome=~"internal|timeout|…"`, a
+hand-maintained alternation that a nineteenth outcome would be added to the
+enum, classified correctly, logged correctly and silently fall outside — check
+74's own recorded rot mode.
+
+**The classification, derived per outcome from its enum's own documentation.**
+Names follow #780's `TaskExit::is_finding()`, because the question is not "did
+the platform fail" but "should someone look". `Served` (`ok`) -> `debug!`.
+`Declined` -> `info!` — the arm the old comment CLAIMED: `not_promoted`,
+`not_found`, `invalid`, `too_large`, `storage_full`, `always_blocked`,
+`disallowed_function`, `statement_not_permitted`. `Finding` -> `warn!`:
+`unauthorized`, `replay`, `write_ceiling`, `stale_deadline`, `not_available`,
+`query_error`, `connection_failed`, `timeout`, `internal`.
+
+Four of those are worth the argument. **`unauthorized` is a Finding**, not a
+decline: it IS a refusal, but on a transport where every legitimate sender holds
+the fleet-shared `WORKER_SHARED_KEY` it means clock skew, a half-rotated key, or
+a sender that should not be there — the brief's own class-2 definition ("a
+designed state the operator has not misconfigured") excludes it. Live count on
+this fleet: **0, ever**, so keeping it loud costs nothing today. The
+caller-facing reply is UNTOUCHED — `caller_facing_unauthorized` still collapses
+every rejection reason and `every_unauthorized_arm_blinds_its_reply` still binds
+all seven arms. **`replay` is a Finding** on the same argument. **`not_found` /
+`invalid` are Declined**: caller errors, the caller is told (identically for
+every reason), and the calling module's own execution fails through the ordinary
+channel, so the operator is not blind — and nothing about the reply changes.
+**`query_error` is a Finding on BOTH its producers even though one of them is a
+caller error, and that is a compromise stated rather than hidden**: on
+`database.query` it is the GUEST's SQL failing, but on `state.write` it is the
+CONTROLLER's own `execution_state` UPSERT failing — silent to the guest by
+contract, and MCP-733 deliberately made it WARN *"so SIEM / dashboard alerting
+can fire on sustained query_error outcomes"*. One label cannot say both;
+classifying it Declined would silence a live decision. The counter separates
+them by `subject`. **`write_ceiling` is a Finding** because #760 already decided
+this exact question in this exact direction and ships a `warning` alert on it.
+
+**ONE alert, `TalosRPCSubjectFailing`, `warning`, and the refusal class gets
+none.** The established position — a counter on the policy WORKING gets no alert
+— covers `Declined` entirely, and the promtool case that matters drives
+`not_promoted` climbing on every sample and asserts SILENCE. The FINDING class
+is the open question C6 names, and it is alerted: a subject whose calls are
+>50% findings, with >=5 findings in the window, sustained 10 minutes. A RATIO
+because every one of these subjects has failure modes that are normal at low
+rates; the `>=5` floor because a single timeout on a quiet subject would
+otherwise hold the ratio at 1.0 for a whole rate window. **It cannot fire on an
+idle fleet**: the seeds make the series exist, their rate is 0, the denominator
+is 0, and 0/0 is NaN. Five `promtool` cases pin all of that, including the
+permanently-zero one, and the FIRING case was mutation-proved non-vacuous.
+**`unauthorized` gets NO alert of its own**, argued rather than omitted: this
+fleet has produced zero, so any threshold is a guess and the obvious one fires
+on a rolling deploy's clock skew — the counter makes it graphable and the
+metric's HELP carries the query. The alert can CO-FIRE with
+`TalosRPCWriteCeilingRefusals` when the finding class is dominated by
+`write_ceiling`; that is disclosed in its own annotation rather than papered
+over with a hand-maintained exclusion that would rot.
+
+**Guards, and what each covers.** `the_declared_table_matches_the_source`
+(in `talos-rpc-subscribers`, where both the table and the call sites are
+visible) splits `lib.rs` at the seven subscriber headers and compares the
+`RpcOutcome::` tokens per region against `RpcSubject::outcomes()` in BOTH
+directions — an undeclared outcome would be an ABSENT series, a declared one
+nothing emits is check 58's defect. It fails LOUDLY if the scan finds fewer than
+60 pairs or if a subscriber is renamed away.
+`the_rpc_instrument_seeds_exactly_the_reachable_pairs` asserts all 64 present at
+0 on a cold registry and NO pair outside the table.
+`controller/tests/rpc_instrument_tests` (CTRL_TESTS, sub-leg 64b) drives the
+REAL `spawn_memory_rpc_subscriber` over real NATS against real Postgres and
+asserts the counter moved by EXACTLY one on a served call, that a decline lands
+on its own series, that a refusal ABOVE the handler is counted, that a subject
+nothing was sent to did not move, and that the actor id appears NOWHERE in the
+exposition.
+
+**Two measured SURVIVORS, both closed rather than recorded.** (1) The
+histogram's OBSERVED VALUE: reverting it to `exec` alone — dropping the
+semaphore queue wait, i.e. the only part of an RPC that grows under
+backpressure — left every test in the workspace green, because every observed
+duration on this fleet is 0 either way. Closed by
+`the_duration_histogram_observes_queue_plus_exec`, which also pins the
+sub-millisecond resolution and therefore makes the pre-rounded-milliseconds
+revert red. (2) The LOG LEVEL had no test at all: the class table is pinned by
+name, and nothing pinned that the level rests on it, so both shapes of "put the
+designed state back on the alarm channel" were silent. Closed by
+`the_log_level_rests_on_the_outcome_class`, which captures `target: "talos_rpc"`
+events and asserts the mapping for all 18 outcomes (a new dev-only
+`tracing-subscriber` dependency; the production graph is unchanged).
+
+**What was measured and deliberately NOT changed.** A THIRD metric family,
+`talos_rpc_queue_duration_seconds{subject}`, was considered and declined: the
+existing doc comment says the queue/exec split exists so operators can tell
+backpressure from downstream slowdown, and the histogram measures the TOTAL, so
+that split now lives in the log alone. Three reasons. Backpressure is
+structurally unreachable at the measured volume (1317 module executions per 24 h
+≈ 0.9/min against per-subject in-flight caps of 8 / 16 / 32, and every observed
+`queue_ms` is 0); the saturation signal SURVIVES the collapse as its own outcome
+label, because `stale_deadline` IS the queue outrunning the caller's deadline;
+and the split is unchanged in the log line. Stated as a limit rather than sold:
+an operator who wants queue-vs-exec attribution still has to read the log.
+`talos-metrics` gained NO new dependency — it was already a direct dependency of
+`talos-rpc-subscribers` (#754 added it), verified by reading the manifest — and
+the seven subject strings are DUPLICATED into `talos-metrics` rather than
+imported, because `talos-memory` would invert the layering; they are pinned to
+their originals by `the_subject_table_matches_the_wire_constants`, exactly
+#760's `RPC_WRITE_CEILING_SUBJECTS` precedent. `TalosMetrics::new()` is
+CONTROLLER-only (`grep` finds it nowhere in `worker/` or
+`talos-worker-runtime/`, neither of which depends on the crate), so these 64
+series cannot be seeded into a process that can never increment them — #778's
+worker regression is not reachable here.
+
+**No lint check was added and `--count` stays 88.** The brief's own candidate —
+*"a call site must pass an outcome from the closed table"* — is answered by the
+TYPE SYSTEM: mutating one to `Box::leak(req.actor_id.to_string().into_boxed_str())`
+does not compile. The GENERALISATION was built and measured instead
+(`scripts/lint-rpc-label-closure-candidate.sh`, kept per #781 so the numbers can
+be re-derived): *"every Prometheus label value must come from a closed
+compile-time set"* inspects **121** `with_label_values` arguments workspace-wide
+and flags **73** as not provably closed — and essentially every one is CORRECT
+(a `&'static str` parameter bound by an enum's `as_str()` one frame up, a
+`pub const`, or a `kind.metric_label()` helper). It reports the same 73 on
+pristine `origin/main` and on the fixed tree, i.e. 0-for-0 as a bug detector,
+and would ship at seventy-three markers on correct code. It cannot be narrowed,
+because the defect it exists for is a `&'static str` whose VALUE came from the
+caller and no textual rule can tell that from one whose value came from an enum
+one frame up — a dataflow question. The structural answer is what shipped.
+
+**Expected live state on this fleet after deploy**, so it can be read rather
+than assumed. `/metrics/prometheus` gains **64** `talos_rpc_calls_total` lines,
+all at 0 until traffic; the histogram exports NOTHING until a first call.
+`talos.memory.op` / `talos.database.query` / `talos.graph.search` should show
+`{outcome="ok"}` climbing. The hourly `talos.ml.predict` line moves from WARN to
+INFO and starts incrementing `{outcome="not_promoted",class="declined"}` — so
+the controller's WARN volume should fall from 32 to about 15, and
+`TalosRPCSubjectFailing` should stay silent: `not_promoted` is `declined` and
+the finding class is expected to remain 0 on every subject.
 
 ## Sub-workflow dispatch (engine)
 

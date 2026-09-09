@@ -564,6 +564,13 @@ CTRL_TESTS=(
     # the `common` DATABASE_URL harness, so CTRL_TESTS and not TC_TESTS
     # (sub-leg 64b). Fails on pristine main by assertion (`left: 1, right: 0`).
     "rpc_write_ceiling_tests"
+    # The signed-RPC data plane must be COUNTED, not only logged. Same harness
+    # and same reason as the binary above (real NATS + `common` DATABASE_URL,
+    # so CTRL_TESTS not TC_TESTS), but it asserts on the SERIES rather than on
+    # the database: `record_rpc_metric` recorded no metric at all until
+    # 2026-09-09, and check 58's stated limit is that it proves an increment
+    # SITE exists and never that anything reaches it.
+    "rpc_instrument_tests"
     "env_vars"
     # The hygiene report's stale-draft ADVICE and the DECISION it recommends
     # (`fix_all`) were built on the same rows and disagreed: `fix_all` has

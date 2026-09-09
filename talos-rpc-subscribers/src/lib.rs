@@ -29,6 +29,7 @@ mod build_skew;
 mod kernel;
 pub mod write_ceiling;
 use kernel::record_rpc_metric;
+use talos_metrics::{RpcOutcome, RpcSubject};
 
 pub use build_skew::{set_controller_build, set_worker_build_cache};
 
@@ -856,11 +857,11 @@ pub fn spawn_graph_rpc_subscriber(
                         )
                         .await;
                     record_rpc_metric(
-                        SUBJECT_GRAPH_SEARCH,
+                        RpcSubject::GraphSearch,
                         uuid::Uuid::nil(),
-                        "invalid",
-                        start.elapsed().as_millis() as u64,
-                        0,
+                        RpcOutcome::Invalid,
+                        start.elapsed(),
+                        std::time::Duration::ZERO,
                     );
                     return;
                 }
@@ -890,11 +891,11 @@ pub fn spawn_graph_rpc_subscriber(
                         )
                         .await;
                     record_rpc_metric(
-                        SUBJECT_GRAPH_SEARCH,
+                        RpcSubject::GraphSearch,
                         req.actor_id,
-                        "unauthorized",
-                        start.elapsed().as_millis() as u64,
-                        0,
+                        RpcOutcome::Unauthorized,
+                        start.elapsed(),
+                        std::time::Duration::ZERO,
                     );
                     return;
                 }
@@ -917,11 +918,11 @@ pub fn spawn_graph_rpc_subscriber(
                         )
                         .await;
                     record_rpc_metric(
-                        SUBJECT_GRAPH_SEARCH,
+                        RpcSubject::GraphSearch,
                         req.actor_id,
-                        "replay",
-                        start.elapsed().as_millis() as u64,
-                        0,
+                        RpcOutcome::Replay,
+                        start.elapsed(),
+                        std::time::Duration::ZERO,
                     );
                     return;
                 }
@@ -1054,12 +1055,12 @@ pub fn spawn_graph_rpc_subscriber(
             };
 
             let outcome = match &reply.result {
-                Ok(_) => "ok",
-                Err(GraphRpcError::Unauthorized) => "unauthorized",
-                Err(GraphRpcError::InvalidInput(_)) => "invalid",
-                Err(GraphRpcError::NotAvailable) => "not_available",
-                Err(GraphRpcError::Timeout) => "timeout",
-                Err(GraphRpcError::Internal(_)) => "internal",
+                Ok(_) => RpcOutcome::Ok,
+                Err(GraphRpcError::Unauthorized) => RpcOutcome::Unauthorized,
+                Err(GraphRpcError::InvalidInput(_)) => RpcOutcome::Invalid,
+                Err(GraphRpcError::NotAvailable) => RpcOutcome::NotAvailable,
+                Err(GraphRpcError::Timeout) => RpcOutcome::Timeout,
+                Err(GraphRpcError::Internal(_)) => RpcOutcome::Internal,
             };
             let _ = nats_client
                 .publish(
@@ -1068,11 +1069,11 @@ pub fn spawn_graph_rpc_subscriber(
                 )
                 .await;
             record_rpc_metric(
-                SUBJECT_GRAPH_SEARCH,
+                RpcSubject::GraphSearch,
                 req.actor_id,
                 outcome,
-                permit_at.saturating_duration_since(start).as_millis() as u64,
-                permit_at.elapsed().as_millis() as u64,
+                permit_at.saturating_duration_since(start),
+                permit_at.elapsed(),
             );
         }
     });
@@ -1161,11 +1162,11 @@ pub fn spawn_ml_rpc_subscriber(
                     )
                     .await;
                     record_rpc_metric(
-                        SUBJECT_ML_PREDICT,
+                        RpcSubject::MlPredict,
                         uuid::Uuid::nil(),
-                        "invalid",
-                        start.elapsed().as_millis() as u64,
-                        0,
+                        RpcOutcome::Invalid,
+                        start.elapsed(),
+                        std::time::Duration::ZERO,
                     );
                     return;
                 }
@@ -1191,11 +1192,11 @@ pub fn spawn_ml_rpc_subscriber(
                     )
                     .await;
                     record_rpc_metric(
-                        SUBJECT_ML_PREDICT,
+                        RpcSubject::MlPredict,
                         req.actor_id,
-                        "unauthorized",
-                        start.elapsed().as_millis() as u64,
-                        0,
+                        RpcOutcome::Unauthorized,
+                        start.elapsed(),
+                        std::time::Duration::ZERO,
                     );
                     return;
                 }
@@ -1214,11 +1215,11 @@ pub fn spawn_ml_rpc_subscriber(
                     )
                     .await;
                     record_rpc_metric(
-                        SUBJECT_ML_PREDICT,
+                        RpcSubject::MlPredict,
                         req.actor_id,
-                        "replay",
-                        start.elapsed().as_millis() as u64,
-                        0,
+                        RpcOutcome::Replay,
+                        start.elapsed(),
+                        std::time::Duration::ZERO,
                     );
                     return;
                 }
@@ -1232,11 +1233,11 @@ pub fn spawn_ml_rpc_subscriber(
                 )
                 .await;
                 record_rpc_metric(
-                    SUBJECT_ML_PREDICT,
+                    RpcSubject::MlPredict,
                     req.actor_id,
-                    "not_available",
-                    start.elapsed().as_millis() as u64,
-                    0,
+                    RpcOutcome::NotAvailable,
+                    start.elapsed(),
+                    std::time::Duration::ZERO,
                 );
                 return;
             };
@@ -1267,11 +1268,11 @@ pub fn spawn_ml_rpc_subscriber(
                 )
                 .await;
                 record_rpc_metric(
-                    SUBJECT_ML_PREDICT,
+                    RpcSubject::MlPredict,
                     req.actor_id,
-                    "stale_deadline",
-                    permit_at.saturating_duration_since(start).as_millis() as u64,
-                    0,
+                    RpcOutcome::StaleDeadline,
+                    permit_at.saturating_duration_since(start),
+                    std::time::Duration::ZERO,
                 );
                 return;
             }
@@ -1361,22 +1362,22 @@ pub fn spawn_ml_rpc_subscriber(
             };
 
             let outcome = match &resp {
-                MlPredictResponse::Ok(_) => "ok",
-                MlPredictResponse::Err(MlRpcError::Unauthorized) => "unauthorized",
-                MlPredictResponse::Err(MlRpcError::NotFound) => "not_found",
-                MlPredictResponse::Err(MlRpcError::NotPromoted) => "not_promoted",
-                MlPredictResponse::Err(MlRpcError::NotAvailable) => "not_available",
-                MlPredictResponse::Err(MlRpcError::Invalid) => "invalid",
-                MlPredictResponse::Err(MlRpcError::Timeout) => "timeout",
-                MlPredictResponse::Err(MlRpcError::Internal) => "internal",
+                MlPredictResponse::Ok(_) => RpcOutcome::Ok,
+                MlPredictResponse::Err(MlRpcError::Unauthorized) => RpcOutcome::Unauthorized,
+                MlPredictResponse::Err(MlRpcError::NotFound) => RpcOutcome::NotFound,
+                MlPredictResponse::Err(MlRpcError::NotPromoted) => RpcOutcome::NotPromoted,
+                MlPredictResponse::Err(MlRpcError::NotAvailable) => RpcOutcome::NotAvailable,
+                MlPredictResponse::Err(MlRpcError::Invalid) => RpcOutcome::Invalid,
+                MlPredictResponse::Err(MlRpcError::Timeout) => RpcOutcome::Timeout,
+                MlPredictResponse::Err(MlRpcError::Internal) => RpcOutcome::Internal,
             };
             publish_reply(&nats_client, reply_to, &resp).await;
             record_rpc_metric(
-                SUBJECT_ML_PREDICT,
+                RpcSubject::MlPredict,
                 req.actor_id,
                 outcome,
-                permit_at.saturating_duration_since(start).as_millis() as u64,
-                permit_at.elapsed().as_millis() as u64,
+                permit_at.saturating_duration_since(start),
+                permit_at.elapsed(),
             );
         }
     });
@@ -1438,11 +1439,11 @@ pub fn spawn_ml_fewshot_subscriber(
                     )
                     .await;
                     record_rpc_metric(
-                        SUBJECT_ML_FEWSHOT,
+                        RpcSubject::MlFewShot,
                         uuid::Uuid::nil(),
-                        "invalid",
-                        start.elapsed().as_millis() as u64,
-                        0,
+                        RpcOutcome::Invalid,
+                        start.elapsed(),
+                        std::time::Duration::ZERO,
                     );
                     return;
                 }
@@ -1468,11 +1469,11 @@ pub fn spawn_ml_fewshot_subscriber(
                     )
                     .await;
                     record_rpc_metric(
-                        SUBJECT_ML_FEWSHOT,
+                        RpcSubject::MlFewShot,
                         req.actor_id,
-                        "unauthorized",
-                        start.elapsed().as_millis() as u64,
-                        0,
+                        RpcOutcome::Unauthorized,
+                        start.elapsed(),
+                        std::time::Duration::ZERO,
                     );
                     return;
                 }
@@ -1491,11 +1492,11 @@ pub fn spawn_ml_fewshot_subscriber(
                     )
                     .await;
                     record_rpc_metric(
-                        SUBJECT_ML_FEWSHOT,
+                        RpcSubject::MlFewShot,
                         req.actor_id,
-                        "replay",
-                        start.elapsed().as_millis() as u64,
-                        0,
+                        RpcOutcome::Replay,
+                        start.elapsed(),
+                        std::time::Duration::ZERO,
                     );
                     return;
                 }
@@ -1509,11 +1510,11 @@ pub fn spawn_ml_fewshot_subscriber(
                 )
                 .await;
                 record_rpc_metric(
-                    SUBJECT_ML_FEWSHOT,
+                    RpcSubject::MlFewShot,
                     req.actor_id,
-                    "not_available",
-                    start.elapsed().as_millis() as u64,
-                    0,
+                    RpcOutcome::NotAvailable,
+                    start.elapsed(),
+                    std::time::Duration::ZERO,
                 );
                 return;
             };
@@ -1537,11 +1538,11 @@ pub fn spawn_ml_fewshot_subscriber(
                 )
                 .await;
                 record_rpc_metric(
-                    SUBJECT_ML_FEWSHOT,
+                    RpcSubject::MlFewShot,
                     req.actor_id,
-                    "stale_deadline",
-                    permit_at.saturating_duration_since(start).as_millis() as u64,
-                    0,
+                    RpcOutcome::StaleDeadline,
+                    permit_at.saturating_duration_since(start),
+                    std::time::Duration::ZERO,
                 );
                 return;
             }
@@ -1614,22 +1615,22 @@ pub fn spawn_ml_fewshot_subscriber(
             };
 
             let outcome = match &resp {
-                MlFewShotResponse::Ok(_) => "ok",
-                MlFewShotResponse::Err(MlRpcError::Unauthorized) => "unauthorized",
-                MlFewShotResponse::Err(MlRpcError::NotFound) => "not_found",
-                MlFewShotResponse::Err(MlRpcError::NotPromoted) => "not_promoted",
-                MlFewShotResponse::Err(MlRpcError::NotAvailable) => "not_available",
-                MlFewShotResponse::Err(MlRpcError::Invalid) => "invalid",
-                MlFewShotResponse::Err(MlRpcError::Timeout) => "timeout",
-                MlFewShotResponse::Err(MlRpcError::Internal) => "internal",
+                MlFewShotResponse::Ok(_) => RpcOutcome::Ok,
+                MlFewShotResponse::Err(MlRpcError::Unauthorized) => RpcOutcome::Unauthorized,
+                MlFewShotResponse::Err(MlRpcError::NotFound) => RpcOutcome::NotFound,
+                MlFewShotResponse::Err(MlRpcError::NotPromoted) => RpcOutcome::NotPromoted,
+                MlFewShotResponse::Err(MlRpcError::NotAvailable) => RpcOutcome::NotAvailable,
+                MlFewShotResponse::Err(MlRpcError::Invalid) => RpcOutcome::Invalid,
+                MlFewShotResponse::Err(MlRpcError::Timeout) => RpcOutcome::Timeout,
+                MlFewShotResponse::Err(MlRpcError::Internal) => RpcOutcome::Internal,
             };
             publish_reply(&nats_client, reply_to, &resp).await;
             record_rpc_metric(
-                SUBJECT_ML_FEWSHOT,
+                RpcSubject::MlFewShot,
                 req.actor_id,
                 outcome,
-                permit_at.saturating_duration_since(start).as_millis() as u64,
-                permit_at.elapsed().as_millis() as u64,
+                permit_at.saturating_duration_since(start),
+                permit_at.elapsed(),
             );
         }
     });
@@ -1698,11 +1699,11 @@ pub fn spawn_memory_rpc_subscriber(
                     )))
                     .await;
                     record_rpc_metric(
-                        SUBJECT_MEMORY_OP,
+                        RpcSubject::MemoryOp,
                         uuid::Uuid::nil(),
-                        "invalid",
-                        start.elapsed().as_millis() as u64,
-                        0,
+                        RpcOutcome::Invalid,
+                        start.elapsed(),
+                        std::time::Duration::ZERO,
                     );
                     return;
                 }
@@ -1724,11 +1725,11 @@ pub fn spawn_memory_rpc_subscriber(
                     ))
                     .await;
                     record_rpc_metric(
-                        SUBJECT_MEMORY_OP,
+                        RpcSubject::MemoryOp,
                         req.actor_id,
-                        "unauthorized",
-                        start.elapsed().as_millis() as u64,
-                        0,
+                        RpcOutcome::Unauthorized,
+                        start.elapsed(),
+                        std::time::Duration::ZERO,
                     );
                     return;
                 }
@@ -1742,11 +1743,11 @@ pub fn spawn_memory_rpc_subscriber(
                     );
                     send_err(MemoryRpcError::Unauthorized).await;
                     record_rpc_metric(
-                        SUBJECT_MEMORY_OP,
+                        RpcSubject::MemoryOp,
                         req.actor_id,
-                        "replay",
-                        start.elapsed().as_millis() as u64,
-                        0,
+                        RpcOutcome::Replay,
+                        start.elapsed(),
+                        std::time::Duration::ZERO,
                     );
                     return;
                 }
@@ -1774,21 +1775,21 @@ pub fn spawn_memory_rpc_subscriber(
                     }
                 };
 
-            let outcome_tag: &'static str = match &op_result {
-                Ok(_) => "ok",
+            let outcome_tag: RpcOutcome = match &op_result {
+                Ok(_) => RpcOutcome::Ok,
                 // Distinct from "ok" so dashboards can alert on a
                 // spike (replay lag, actor-id mismatch, cache wipe)
                 // without being confused by normal traffic.
-                Err(MemoryRpcError::KeyNotFound) => "not_found",
-                Err(MemoryRpcError::Unauthorized) => "unauthorized",
-                Err(MemoryRpcError::InvalidInput(_)) => "invalid",
-                Err(MemoryRpcError::Timeout) => "timeout",
-                Err(MemoryRpcError::StorageFull) => "storage_full",
+                Err(MemoryRpcError::KeyNotFound) => RpcOutcome::NotFound,
+                Err(MemoryRpcError::Unauthorized) => RpcOutcome::Unauthorized,
+                Err(MemoryRpcError::InvalidInput(_)) => RpcOutcome::Invalid,
+                Err(MemoryRpcError::Timeout) => RpcOutcome::Timeout,
+                Err(MemoryRpcError::StorageFull) => RpcOutcome::StorageFull,
                 // Distinct tag: reaching this on the RPC route means a worker
                 // sent a mutation its OWN gate should have refused — a
                 // fleet-configuration signal, unlike the envelope refusal.
-                Err(MemoryRpcError::WriteCeiling) => "write_ceiling",
-                _ => "internal",
+                Err(MemoryRpcError::WriteCeiling) => RpcOutcome::WriteCeiling,
+                _ => RpcOutcome::Internal,
             };
             let reply = match op_result {
                 Ok(r) => MemoryRpcReply { result: Ok(r) },
@@ -1808,11 +1809,11 @@ pub fn spawn_memory_rpc_subscriber(
                 )
                 .await;
             record_rpc_metric(
-                SUBJECT_MEMORY_OP,
+                RpcSubject::MemoryOp,
                 req.actor_id,
                 outcome_tag,
-                permit_at.saturating_duration_since(start).as_millis() as u64,
-                permit_at.elapsed().as_millis() as u64,
+                permit_at.saturating_duration_since(start),
+                permit_at.elapsed(),
             );
         }
     });
@@ -2156,11 +2157,11 @@ pub fn spawn_database_rpc_subscriber(
                     ))))
                     .await;
                     record_rpc_metric(
-                        SUBJECT_DATABASE_QUERY,
+                        RpcSubject::DatabaseQuery,
                         uuid::Uuid::nil(),
-                        "invalid",
-                        start.elapsed().as_millis() as u64,
-                        0,
+                        RpcOutcome::Invalid,
+                        start.elapsed(),
+                        std::time::Duration::ZERO,
                     );
                     return;
                 }
@@ -2183,11 +2184,11 @@ pub fn spawn_database_rpc_subscriber(
                     ))
                     .await;
                     record_rpc_metric(
-                        SUBJECT_DATABASE_QUERY,
+                        RpcSubject::DatabaseQuery,
                         req.actor_id,
-                        "unauthorized",
-                        start.elapsed().as_millis() as u64,
-                        0,
+                        RpcOutcome::Unauthorized,
+                        start.elapsed(),
+                        std::time::Duration::ZERO,
                     );
                     return;
                 }
@@ -2202,11 +2203,11 @@ pub fn spawn_database_rpc_subscriber(
                     );
                     send(Err(DatabaseRpcError::Unauthorized)).await;
                     record_rpc_metric(
-                        SUBJECT_DATABASE_QUERY,
+                        RpcSubject::DatabaseQuery,
                         req.actor_id,
-                        "replay",
-                        start.elapsed().as_millis() as u64,
-                        0,
+                        RpcOutcome::Replay,
+                        start.elapsed(),
+                        std::time::Duration::ZERO,
                     );
                     return;
                 }
@@ -2246,11 +2247,11 @@ pub fn spawn_database_rpc_subscriber(
                         )))
                         .await;
                         record_rpc_metric(
-                            SUBJECT_DATABASE_QUERY,
+                            RpcSubject::DatabaseQuery,
                             req.actor_id,
-                            "invalid",
-                            start.elapsed().as_millis() as u64,
-                            0,
+                            RpcOutcome::Invalid,
+                            start.elapsed(),
+                            std::time::Duration::ZERO,
                         );
                         return;
                     }
@@ -2268,11 +2269,11 @@ pub fn spawn_database_rpc_subscriber(
                     )))
                     .await;
                     record_rpc_metric(
-                        SUBJECT_DATABASE_QUERY,
+                        RpcSubject::DatabaseQuery,
                         req.actor_id,
-                        "invalid",
-                        start.elapsed().as_millis() as u64,
-                        0,
+                        RpcOutcome::Invalid,
+                        start.elapsed(),
+                        std::time::Duration::ZERO,
                     );
                     return;
                 }
@@ -2377,11 +2378,11 @@ pub fn spawn_database_rpc_subscriber(
                     ))))
                     .await;
                     record_rpc_metric(
-                        SUBJECT_DATABASE_QUERY,
+                        RpcSubject::DatabaseQuery,
                         req.actor_id,
-                        "always_blocked",
-                        start.elapsed().as_millis() as u64,
-                        0,
+                        RpcOutcome::AlwaysBlocked,
+                        start.elapsed(),
+                        std::time::Duration::ZERO,
                     );
                     return;
                 }
@@ -2420,11 +2421,11 @@ pub fn spawn_database_rpc_subscriber(
                         ))))
                         .await;
                     record_rpc_metric(
-                        SUBJECT_DATABASE_QUERY,
+                        RpcSubject::DatabaseQuery,
                         req.actor_id,
-                        "disallowed_function",
-                        start.elapsed().as_millis() as u64,
-                        0,
+                        RpcOutcome::DisallowedFunction,
+                        start.elapsed(),
+                        std::time::Duration::ZERO,
                     );
                     return;
                 }
@@ -2466,11 +2467,11 @@ pub fn spawn_database_rpc_subscriber(
                     )))
                     .await;
                     record_rpc_metric(
-                        SUBJECT_DATABASE_QUERY,
+                        RpcSubject::DatabaseQuery,
                         req.actor_id,
-                        "statement_not_permitted",
-                        start.elapsed().as_millis() as u64,
-                        0,
+                        RpcOutcome::StatementNotPermitted,
+                        start.elapsed(),
+                        std::time::Duration::ZERO,
                     );
                     return;
                 }
@@ -2503,11 +2504,11 @@ pub fn spawn_database_rpc_subscriber(
                 {
                     send(Err(DatabaseRpcError::WriteCeiling)).await;
                     record_rpc_metric(
-                        SUBJECT_DATABASE_QUERY,
+                        RpcSubject::DatabaseQuery,
                         req.actor_id,
-                        "write_ceiling",
-                        start.elapsed().as_millis() as u64,
-                        0,
+                        RpcOutcome::WriteCeiling,
+                        start.elapsed(),
+                        std::time::Duration::ZERO,
                     );
                     return;
                 }
@@ -2549,26 +2550,26 @@ pub fn spawn_database_rpc_subscriber(
             .await;
 
             let outcome = match &result {
-                Ok(_) => "ok",
-                Err(DatabaseRpcError::Unauthorized) => "unauthorized",
-                Err(DatabaseRpcError::InvalidQuery(_)) => "invalid",
-                Err(DatabaseRpcError::ConnectionFailed(_)) => "connection_failed",
-                Err(DatabaseRpcError::ResultTooLarge(_)) => "too_large",
-                Err(DatabaseRpcError::Timeout) => "timeout",
-                Err(DatabaseRpcError::QueryError(_)) => "query_error",
+                Ok(_) => RpcOutcome::Ok,
+                Err(DatabaseRpcError::Unauthorized) => RpcOutcome::Unauthorized,
+                Err(DatabaseRpcError::InvalidQuery(_)) => RpcOutcome::Invalid,
+                Err(DatabaseRpcError::ConnectionFailed(_)) => RpcOutcome::ConnectionFailed,
+                Err(DatabaseRpcError::ResultTooLarge(_)) => RpcOutcome::TooLarge,
+                Err(DatabaseRpcError::Timeout) => RpcOutcome::Timeout,
+                Err(DatabaseRpcError::QueryError(_)) => RpcOutcome::QueryError,
                 // Unreachable from `execute_guest_query` (the gate above
                 // returns before it), but the match is exhaustive by design so
                 // a new variant forces a decision rather than falling into a
                 // catch-all.
-                Err(DatabaseRpcError::WriteCeiling) => "write_ceiling",
+                Err(DatabaseRpcError::WriteCeiling) => RpcOutcome::WriteCeiling,
             };
             send(result).await;
             record_rpc_metric(
-                SUBJECT_DATABASE_QUERY,
+                RpcSubject::DatabaseQuery,
                 req.actor_id,
                 outcome,
-                permit_at.saturating_duration_since(start).as_millis() as u64,
-                permit_at.elapsed().as_millis() as u64,
+                permit_at.saturating_duration_since(start),
+                permit_at.elapsed(),
             );
         }
     });
@@ -2616,11 +2617,11 @@ pub fn spawn_state_write_subscriber(
                 Err(admission::AdmitError::Malformed(e)) => {
                     tracing::debug!(error = %e, "state-write: malformed payload dropped");
                     record_rpc_metric(
-                        SUBJECT_STATE_WRITE,
+                        RpcSubject::StateWrite,
                         uuid::Uuid::nil(),
-                        "invalid",
-                        start.elapsed().as_millis() as u64,
-                        0,
+                        RpcOutcome::Invalid,
+                        start.elapsed(),
+                        std::time::Duration::ZERO,
                     );
                     return;
                 }
@@ -2641,11 +2642,11 @@ pub fn spawn_state_write_subscriber(
                         "state-write: HMAC or freshness verification failed — request dropped"
                     );
                     record_rpc_metric(
-                        SUBJECT_STATE_WRITE,
+                        RpcSubject::StateWrite,
                         req.actor_id,
-                        "unauthorized",
-                        start.elapsed().as_millis() as u64,
-                        0,
+                        RpcOutcome::Unauthorized,
+                        start.elapsed(),
+                        std::time::Duration::ZERO,
                     );
                     return;
                 }
@@ -2659,11 +2660,11 @@ pub fn spawn_state_write_subscriber(
                         "state-write: nonce replay rejected"
                     );
                     record_rpc_metric(
-                        SUBJECT_STATE_WRITE,
+                        RpcSubject::StateWrite,
                         req.actor_id,
-                        "replay",
-                        start.elapsed().as_millis() as u64,
-                        0,
+                        RpcOutcome::Replay,
+                        start.elapsed(),
+                        std::time::Duration::ZERO,
                     );
                     return;
                 }
@@ -2721,11 +2722,11 @@ pub fn spawn_state_write_subscriber(
                     "state-write: rejecting oversized/empty key (possible worker bypass)"
                 );
                 record_rpc_metric(
-                    SUBJECT_STATE_WRITE,
+                    RpcSubject::StateWrite,
                     req.actor_id,
-                    "invalid",
-                    permit_at.saturating_duration_since(start).as_millis() as u64,
-                    permit_at.elapsed().as_millis() as u64,
+                    RpcOutcome::Invalid,
+                    permit_at.saturating_duration_since(start),
+                    permit_at.elapsed(),
                 );
                 return;
             }
@@ -2738,11 +2739,11 @@ pub fn spawn_state_write_subscriber(
                     "state-write: rejecting oversized value (possible worker bypass)"
                 );
                 record_rpc_metric(
-                    SUBJECT_STATE_WRITE,
+                    RpcSubject::StateWrite,
                     req.actor_id,
-                    "too_large",
-                    permit_at.saturating_duration_since(start).as_millis() as u64,
-                    permit_at.elapsed().as_millis() as u64,
+                    RpcOutcome::TooLarge,
+                    permit_at.saturating_duration_since(start),
+                    permit_at.elapsed(),
                 );
                 return;
             }
@@ -2776,7 +2777,7 @@ pub fn spawn_state_write_subscriber(
                     .execute(&pool)
                     .await
                     {
-                        Ok(_) => "ok",
+                        Ok(_) => RpcOutcome::Ok,
                         Err(e) => {
                             tracing::warn!(
                                 target: "talos_rpc",
@@ -2785,7 +2786,7 @@ pub fn spawn_state_write_subscriber(
                                 error = %e,
                                 "state-write DELETE failed — guest sees no error (fire-and-forget)"
                             );
-                            "query_error"
+                            RpcOutcome::QueryError
                         }
                     }
                 } else {
@@ -2803,7 +2804,7 @@ pub fn spawn_state_write_subscriber(
                     .execute(&pool)
                     .await
                     {
-                        Ok(_) => "ok",
+                        Ok(_) => RpcOutcome::Ok,
                         Err(e) => {
                             tracing::warn!(
                                 target: "talos_rpc",
@@ -2812,12 +2813,12 @@ pub fn spawn_state_write_subscriber(
                                 error = %e,
                                 "state-write UPSERT failed — guest sees no error (fire-and-forget)"
                             );
-                            "query_error"
+                            RpcOutcome::QueryError
                         }
                     }
                 }
             };
-            let outcome: &'static str = match kernel::guard_op(db_work).await {
+            let outcome: RpcOutcome = match kernel::guard_op(db_work).await {
                 Ok(tag) => tag,
                 Err(_elapsed) => {
                     tracing::warn!(
@@ -2827,15 +2828,15 @@ pub fn spawn_state_write_subscriber(
                         timeout_secs = kernel::PERMIT_GUARD_TIMEOUT_SECS,
                         "state-write: DB op exceeded permit-guard timeout — write dropped (fire-and-forget), permit released"
                     );
-                    "timeout"
+                    RpcOutcome::Timeout
                 }
             };
             record_rpc_metric(
-                SUBJECT_STATE_WRITE,
+                RpcSubject::StateWrite,
                 req.actor_id,
                 outcome,
-                permit_at.saturating_duration_since(start).as_millis() as u64,
-                permit_at.elapsed().as_millis() as u64,
+                permit_at.saturating_duration_since(start),
+                permit_at.elapsed(),
             );
         }
     });
@@ -2923,11 +2924,11 @@ pub fn spawn_integration_state_subscriber(
                     )))
                     .await;
                     record_rpc_metric(
-                        SUBJECT_INTEGRATION_STATE_OP,
+                        RpcSubject::IntegrationStateOp,
                         uuid::Uuid::nil(),
-                        "invalid",
-                        start.elapsed().as_millis() as u64,
-                        0,
+                        RpcOutcome::Invalid,
+                        start.elapsed(),
+                        std::time::Duration::ZERO,
                     );
                     return;
                 }
@@ -2951,11 +2952,11 @@ pub fn spawn_integration_state_subscriber(
                     ))
                     .await;
                     record_rpc_metric(
-                        SUBJECT_INTEGRATION_STATE_OP,
+                        RpcSubject::IntegrationStateOp,
                         req.actor_id,
-                        "unauthorized",
-                        start.elapsed().as_millis() as u64,
-                        0,
+                        RpcOutcome::Unauthorized,
+                        start.elapsed(),
+                        std::time::Duration::ZERO,
                     );
                     return;
                 }
@@ -2971,11 +2972,11 @@ pub fn spawn_integration_state_subscriber(
                     );
                     send_err(IntegrationStateError::Unauthorized).await;
                     record_rpc_metric(
-                        SUBJECT_INTEGRATION_STATE_OP,
+                        RpcSubject::IntegrationStateOp,
                         req.actor_id,
-                        "replay",
-                        start.elapsed().as_millis() as u64,
-                        0,
+                        RpcOutcome::Replay,
+                        start.elapsed(),
+                        std::time::Duration::ZERO,
                     );
                     return;
                 }
@@ -3018,11 +3019,11 @@ pub fn spawn_integration_state_subscriber(
                 {
                     send_err(IntegrationStateError::WriteCeiling).await;
                     record_rpc_metric(
-                        SUBJECT_INTEGRATION_STATE_OP,
+                        RpcSubject::IntegrationStateOp,
                         req.actor_id,
-                        "write_ceiling",
-                        permit_at.saturating_duration_since(start).as_millis() as u64,
-                        permit_at.elapsed().as_millis() as u64,
+                        RpcOutcome::WriteCeiling,
+                        permit_at.saturating_duration_since(start),
+                        permit_at.elapsed(),
                     );
                     return;
                 }
@@ -3052,18 +3053,18 @@ pub fn spawn_integration_state_subscriber(
                 }
             };
 
-            let outcome_tag: &'static str = match &op_result {
-                Ok(_) => "ok",
-                Err(IntegrationStateError::KeyNotFound) => "not_found",
-                Err(IntegrationStateError::Unauthorized) => "unauthorized",
-                Err(IntegrationStateError::InvalidInput(_)) => "invalid",
-                Err(IntegrationStateError::Timeout) => "timeout",
-                Err(IntegrationStateError::StorageFull) => "storage_full",
+            let outcome_tag: RpcOutcome = match &op_result {
+                Ok(_) => RpcOutcome::Ok,
+                Err(IntegrationStateError::KeyNotFound) => RpcOutcome::NotFound,
+                Err(IntegrationStateError::Unauthorized) => RpcOutcome::Unauthorized,
+                Err(IntegrationStateError::InvalidInput(_)) => RpcOutcome::Invalid,
+                Err(IntegrationStateError::Timeout) => RpcOutcome::Timeout,
+                Err(IntegrationStateError::StorageFull) => RpcOutcome::StorageFull,
                 // Unreachable from `execute_op` (the gate above returns
                 // before it), spelled so a future producer inside the op
                 // executor is not silently tagged "internal".
-                Err(IntegrationStateError::WriteCeiling) => "write_ceiling",
-                _ => "internal",
+                Err(IntegrationStateError::WriteCeiling) => RpcOutcome::WriteCeiling,
+                _ => RpcOutcome::Internal,
             };
             let reply = match op_result {
                 Ok(r) => IntegrationStateReply { result: Ok(r) },
@@ -3084,11 +3085,11 @@ pub fn spawn_integration_state_subscriber(
                 )
                 .await;
             record_rpc_metric(
-                SUBJECT_INTEGRATION_STATE_OP,
+                RpcSubject::IntegrationStateOp,
                 req.actor_id,
                 outcome_tag,
-                permit_at.saturating_duration_since(start).as_millis() as u64,
-                permit_at.elapsed().as_millis() as u64,
+                permit_at.saturating_duration_since(start),
+                permit_at.elapsed(),
             );
         }
     });
@@ -3836,5 +3837,222 @@ mod unauthorized_reply_pins {
                  arm body:\n{body}"
             );
         }
+    }
+}
+
+/// The RPC instrument's table, checked against the source that feeds it.
+///
+/// `talos_metrics::rpc` declares, per subject, the outcomes that subject's
+/// subscriber can pass to `record_rpc_metric`; that declaration IS the
+/// pre-seed set. It lives in a crate that cannot see this one (the dependency
+/// runs the other way), so nothing but this module can tell whether it still
+/// describes the code.
+///
+/// Both directions matter and they fail for opposite reasons:
+/// an outcome a subscriber can emit but the table omits has an ABSENT series
+/// until its first occurrence, and `increase(...) > 0` over an absent series
+/// matches nothing — which is exactly how this whole data plane stayed
+/// uninstrumented. An outcome the table declares but no subscriber can emit is
+/// a seeded combination nothing can increment, which is check 58's own defect.
+#[cfg(test)]
+mod rpc_instrument_table_pins {
+    use std::collections::{BTreeMap, BTreeSet};
+    use talos_metrics::{RpcOutcome, RpcSubject};
+
+    /// The seven subscriber entry points, paired with the `RpcSubject` each
+    /// one records under. Assembled at runtime so this list is not itself a
+    /// match when the scan reads this file's own source.
+    fn subscriber_fns() -> Vec<(RpcSubject, String)> {
+        let f = |n: &str| format!("pub fn {n}(");
+        vec![
+            (RpcSubject::GraphSearch, f("spawn_graph_rpc_subscriber")),
+            (RpcSubject::MlPredict, f("spawn_ml_rpc_subscriber")),
+            (RpcSubject::MlFewShot, f("spawn_ml_fewshot_subscriber")),
+            (RpcSubject::MemoryOp, f("spawn_memory_rpc_subscriber")),
+            (
+                RpcSubject::DatabaseQuery,
+                f("spawn_database_rpc_subscriber"),
+            ),
+            (RpcSubject::StateWrite, f("spawn_state_write_subscriber")),
+            (
+                RpcSubject::IntegrationStateOp,
+                f("spawn_integration_state_subscriber"),
+            ),
+        ]
+    }
+
+    /// Every `RpcOutcome::Variant` token, per subscriber region.
+    ///
+    /// A region runs from one subscriber's header to the next in SOURCE order,
+    /// and the last one ends at the first column-0 `#[cfg(test)]` below it —
+    /// so this module's own tokens are outside every region. Whole-line `//`
+    /// comments are dropped first: a doc comment naming a variant must not
+    /// vouch for a call that does not exist (check 73's self-report trap).
+    fn outcomes_by_region() -> BTreeMap<String, BTreeSet<String>> {
+        const SRC: &str = include_str!("lib.rs");
+        let src: String = SRC
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let mut starts: Vec<(usize, RpcSubject)> = subscriber_fns()
+            .iter()
+            .map(|(s, header)| {
+                let at = src.find(header.as_str()).unwrap_or_else(|| {
+                    panic!(
+                        "subscriber entry point `{header}` not found in lib.rs — if it was \
+                         renamed, update this list DELIBERATELY; a scan that matches nothing \
+                         is a green tick over nothing"
+                    )
+                });
+                (at, *s)
+            })
+            .collect();
+        starts.sort_by_key(|(at, _)| *at);
+        let tail = src[starts[starts.len() - 1].0..]
+            .find("\n#[cfg(test)]")
+            .map(|off| starts[starts.len() - 1].0 + off)
+            .expect("no test module below the last subscriber — the region scan is unbounded");
+
+        let mut map = BTreeMap::new();
+        for (i, (at, subject)) in starts.iter().enumerate() {
+            let end = starts.get(i + 1).map_or(tail, |(next, _)| *next);
+            let region = &src[*at..end];
+            let mut found = BTreeSet::new();
+            for variant in RpcOutcome::ALL {
+                // Variant names are distinct and none is a prefix of another
+                // (asserted below), so a substring test is exact enough.
+                let token = format!("RpcOutcome::{}", variant_ident(*variant));
+                if region.contains(&token) {
+                    found.insert(variant.as_str().to_string());
+                }
+            }
+            map.insert(subject.as_str().to_string(), found);
+        }
+        map
+    }
+
+    /// The Rust identifier for a variant, derived from its label rather than
+    /// hand-listed: `not_promoted` -> `NotPromoted`.
+    fn variant_ident(o: RpcOutcome) -> String {
+        o.as_str()
+            .split('_')
+            .map(|w| {
+                let mut c = w.chars();
+                match c.next() {
+                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                    None => String::new(),
+                }
+            })
+            .collect()
+    }
+
+    /// The identifier derivation must round-trip, or the scan silently looks
+    /// for tokens no call site contains and reports every subject as empty.
+    #[test]
+    fn the_variant_identifiers_are_derivable_and_unambiguous() {
+        const SRC: &str = include_str!("lib.rs");
+        for o in RpcOutcome::ALL {
+            let ident = variant_ident(*o);
+            assert!(
+                SRC.contains(&format!("RpcOutcome::{ident}")),
+                "derived identifier `RpcOutcome::{ident}` for label `{}` appears nowhere in \
+                 lib.rs — either the derivation is wrong (and the scan below is vacuous) or \
+                 the outcome has no call site at all, which makes its 7 x 1 slice of the \
+                 pre-seed table a set of series nothing can increment",
+                o.as_str()
+            );
+        }
+        // No variant name is a prefix of another, so `contains` cannot let one
+        // variant vouch for a different one.
+        for a in RpcOutcome::ALL {
+            for b in RpcOutcome::ALL {
+                if a != b {
+                    assert!(
+                        !variant_ident(*a).starts_with(&variant_ident(*b)),
+                        "`{}` is a prefix of `{}`; the substring scan is unsound",
+                        variant_ident(*b),
+                        variant_ident(*a)
+                    );
+                }
+            }
+        }
+    }
+
+    /// THE PIN. The declared per-subject table must equal what the source can
+    /// actually emit — in BOTH directions.
+    #[test]
+    fn the_declared_table_matches_the_source() {
+        let from_source = outcomes_by_region();
+        // Tripwire: a scan that found nothing is a green tick over nothing.
+        let total: usize = from_source.values().map(BTreeSet::len).sum();
+        assert!(
+            total >= 60,
+            "the region scan found only {total} (subject, outcome) pairs across {} regions — \
+             the subscriber layout changed and this scan no longer sees the call sites",
+            from_source.len()
+        );
+
+        for subject in RpcSubject::ALL {
+            let declared: BTreeSet<String> = subject
+                .outcomes()
+                .iter()
+                .map(|o| o.as_str().to_string())
+                .collect();
+            let emitted = from_source
+                .get(subject.as_str())
+                .expect("every subject has a region");
+            let missing: Vec<_> = emitted.difference(&declared).collect();
+            let extra: Vec<_> = declared.difference(emitted).collect();
+            assert!(
+                missing.is_empty(),
+                "`{}` can emit {missing:?} but `talos_metrics::rpc` does not declare them: \
+                 those series would be ABSENT until the first occurrence, and an absent \
+                 series matches no `increase(...) > 0`",
+                subject.as_str()
+            );
+            assert!(
+                extra.is_empty(),
+                "`talos_metrics::rpc` declares {extra:?} for `{}` and no call site in that \
+                 subscriber can emit them: a seeded pair nothing increments reads as a wired \
+                 signal that does not exist (check 58)",
+                subject.as_str()
+            );
+        }
+    }
+
+    /// The duplicated wire strings must equal the constants the subscribers
+    /// actually subscribe to. `talos-metrics` cannot import `talos-memory`
+    /// (that crate depends on this one's dependency chain and pulls in sqlx,
+    /// the crypto stack and the memory service), so the seven subjects are
+    /// copied there and pinned HERE, where both are visible — #760's
+    /// `RPC_WRITE_CEILING_SUBJECTS` precedent, same cycle reason.
+    #[test]
+    fn the_subject_table_matches_the_wire_constants() {
+        use talos_memory::{
+            database_rpc::SUBJECT_DATABASE_QUERY, graph_rpc::SUBJECT_GRAPH_SEARCH,
+            integration_state_rpc::SUBJECT_INTEGRATION_STATE_OP, memory_rpc::SUBJECT_MEMORY_OP,
+            ml_rpc::SUBJECT_ML_FEWSHOT, ml_rpc::SUBJECT_ML_PREDICT, state_rpc::SUBJECT_STATE_WRITE,
+        };
+        for (subject, wire) in [
+            (RpcSubject::GraphSearch, SUBJECT_GRAPH_SEARCH),
+            (RpcSubject::MlPredict, SUBJECT_ML_PREDICT),
+            (RpcSubject::MlFewShot, SUBJECT_ML_FEWSHOT),
+            (RpcSubject::MemoryOp, SUBJECT_MEMORY_OP),
+            (RpcSubject::DatabaseQuery, SUBJECT_DATABASE_QUERY),
+            (RpcSubject::StateWrite, SUBJECT_STATE_WRITE),
+            (RpcSubject::IntegrationStateOp, SUBJECT_INTEGRATION_STATE_OP),
+        ] {
+            assert_eq!(
+                subject.as_str(),
+                wire,
+                "the metrics-crate copy of a NATS subject has drifted from the constant the \
+                 subscriber subscribes to; the `subject` label would then name a subject \
+                 nothing publishes on"
+            );
+        }
+        // And every subject the subscriber trait declares is in the table.
+        assert_eq!(RpcSubject::ALL.len(), 7);
     }
 }
