@@ -2363,6 +2363,103 @@ groups:
                write_ceiling_read_failed` on the talos_rpc target — a dangling
                actor_id, or Postgres unreachable from the enforcement path.
 
+      # A signed-RPC subject is ALIVE and failing most of what it is asked.
+      #
+      # #783 made a subscriber that DIES sayable
+      # (talos_background_task_exits_total). A subscriber that is alive and
+      # erroring every call was invisible in every machine-readable channel
+      # until 2026-09-09, because `record_rpc_metric` recorded no metric at
+      # all — its name asserted one and its body was two tracing calls.
+      #
+      # WHY A RATIO AND NOT A COUNT. Every one of these subjects has failure
+      # modes that are normal at low rates (a caller error, a designed cap, a
+      # model that is not promoted). What is never normal is MOST of a
+      # subject's traffic being a finding: that is a dead Neo4j, an exhausted
+      # pool, a half-rotated WORKER_SHARED_KEY, or a model backend that cannot
+      # serve. The `>= 5` arm is the noise floor — with 1317 module executions
+      # in 24 h on the reference fleet, five findings inside fifteen minutes is
+      # not a blip, and without it a single timeout on a quiet subject would
+      # hold the ratio at 1.0 for a whole rate window.
+      #
+      # WHY class="finding" AND NOT AN OUTCOME REGEX. `class` is a pure
+      # function of `outcome`, computed by `RpcOutcome::class()` — the same
+      # decision the LOG LEVEL rests on. An `outcome=~"internal|timeout|…"`
+      # alternation here would be a SECOND copy of that judgement, and a
+      # nineteenth outcome would be added to the enum, classified correctly,
+      # logged correctly and silently fall outside this alert. That is check
+      # 74's hand-maintained-glob rot mode, and the label costs no extra
+      # series (each (subject, outcome) has exactly one class).
+      #
+      # IT CANNOT FIRE ON AN IDLE FLEET. All 64 (subject, outcome) pairs are
+      # pre-seeded at 0, so the series EXIST — which is what makes the
+      # `increase()` arm able to fire on a first occurrence — but their rate is
+      # 0, the denominator is 0, and 0/0 is NaN, which matches nothing. A
+      # deployment serving no RPCs is silent by construction.
+      #
+      # DECLINED IS NOT SELECTED, deliberately. `not_promoted` on
+      # talos.ml.predict fires hourly on this fleet from an `llm_only` model
+      # that by definition serves nothing — 17 of the controller's 32 WARN
+      # lines when this was written. An alert on the policy working is check
+      # 69's harm, and `talos_ml::loop_health::gold_promoted_serving_note` is
+      # the surface that already reports that state properly.
+      #
+      # UNAUTHORIZED IS COUNTED HERE BUT HAS NO ALERT OF ITS OWN, and that is
+      # a decision rather than an omission: this fleet has produced ZERO
+      # unauthorized RPCs, ever, so any threshold would be a guess, and the
+      # obvious one ("any in 15m") fires on the clock skew of a rolling deploy
+      # or a half-rotated key. The counter makes it graphable; see the metric's
+      # HELP for the query.
+      - alert: TalosRPCSubjectFailing
+        expr: |
+          (
+            sum by (subject) (rate(talos_rpc_calls_total{class="finding"}[15m]))
+            /
+            sum by (subject) (rate(talos_rpc_calls_total[15m]))
+          ) > 0.5
+          and
+          sum by (subject) (increase(talos_rpc_calls_total{class="finding"}[15m])) >= 5
+        for: 10m
+        labels:
+          severity: warning
+          category: data-plane
+        annotations:
+          summary: "Most signed-RPC calls on {{ $labels.subject }} are failing ({{ $value | humanizePercentage }})"
+          description: |
+            Over the last 15 minutes, more than half of the calls the
+            controller served on {{ $labels.subject }} ended in the `finding`
+            class — the platform could not serve them, or they should not have
+            arrived in the shape they did. The subscriber itself is ALIVE
+            (a dead one shows up as talos_background_task_exits_total instead).
+
+            Every credential-free worker reaches Postgres, Neo4j, the sandbox
+            SQL surface and model inference through these seven subjects, so a
+            subject at this failure rate means the corresponding capability is
+            effectively off for the whole fleet.
+
+            NOTE this alert can co-fire with TalosRPCWriteCeilingRefusals when
+            the finding class is dominated by outcome="write_ceiling". They say
+            different things — that one names a worker whose own gate is not
+            running; this one says the subject is mostly not working — and
+            neither is a duplicate of the other.
+          action: |
+            1. Break the ratio down by outcome:
+               `sum by (subject, outcome) (increase(talos_rpc_calls_total{class="finding"}[15m]))`.
+            2. outcome="internal" / "connection_failed" / "query_error": the
+               controller's Postgres (or Neo4j, for talos.graph.search) is the
+               suspect. Check `talos_db_pool_*` and the controller log on the
+               `talos_rpc` target.
+            3. outcome="timeout" / "stale_deadline": the subject is saturated.
+               `stale_deadline` specifically means the semaphore queue outran
+               the caller's own deadline — compare against the per-subject
+               in-flight cap (memory 16, state-write 32, the rest 8).
+            4. outcome="unauthorized" / "replay": a signing problem, not a
+               capacity one. Suspect a half-rotated WORKER_SHARED_KEY, clock
+               skew, or a sender that should not be there.
+            5. outcome="not_available": a model backend cannot serve
+               (dataset gone, unsupported backend, embedder down). This is the
+               LOUD lifecycle failure — distinct from `not_promoted`, which is
+               a designed state and is not selected by this alert.
+
   # ────────────────────────────────────────────────────────────────────
   - name: talos.integrations
     interval: 30s

@@ -9224,6 +9224,7 @@ dependencies = [
  "talos-workflow-job-protocol",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

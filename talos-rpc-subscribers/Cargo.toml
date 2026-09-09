@@ -80,6 +80,12 @@ uuid.workspace = true
 # #754 parity test: the ops the controller gates must be spelled exactly as the
 # worker spells them. Test-only, so the production dep graph is unchanged.
 talos-capability-world = { path = "../talos-capability-world" }
+# Captures the `target: "talos_rpc"` completion events so the LOG-LEVEL
+# partition (`RpcOutcome::class()` -> debug / info / warn) is asserted against
+# rather than assumed. Without it, moving a designed decline back to `warn!` —
+# the defect this package removed — leaves every test green. Dev-only, so the
+# production dep graph is unchanged; this crate never installs a subscriber.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry"] }
 
 [lints]
 workspace = true

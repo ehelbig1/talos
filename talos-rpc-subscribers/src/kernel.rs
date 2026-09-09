@@ -63,6 +63,7 @@
 use futures::StreamExt;
 use std::future::Future;
 use std::sync::Arc;
+use talos_metrics::{RpcOutcome, RpcOutcomeClass, RpcSubject};
 use talos_task_supervision::{spawn_supervised, BackgroundTask, TaskExit};
 
 /// Per-subscriber wiring for [`spawn_rpc_subscriber`].
@@ -283,59 +284,179 @@ pub(crate) async fn graceful_drain(
     }
 }
 
-/// Emit a structured completion event for an RPC subscriber. Fields
-/// are tagged `target = "talos_rpc"` so ops can filter logs or
-/// aggregate them into Prometheus/OTel pipelines without each
-/// subscriber growing its own metrics code path.
+/// Emit a structured completion event for an RPC subscriber, and record it on
+/// `talos_rpc_calls_total` / `talos_rpc_duration_seconds`.
 ///
-/// `queue_ms` measures time from request receipt to semaphore
-/// permit acquisition; `exec_ms` measures permit-to-reply. Splitting
-/// these lets operators distinguish backpressure (queue rising) from
-/// downstream slowdowns (exec rising). For handlers that never
-/// acquire a permit (fast-path rejections like HMAC failure),
-/// `queue_ms == total` and `exec_ms == 0`.
+/// Fields are tagged `target = "talos_rpc"` so ops can filter logs; the metric
+/// is what makes the same facts machine-readable. Until 2026-09-09 this
+/// function's NAME asserted a metric and its body was two `tracing` calls, so
+/// `curl /metrics/prometheus | grep '^talos_rpc'` returned only #760's six
+/// write-ceiling series and the whole data plane — every actor-memory access,
+/// every graph search, every sandbox statement, every inference — was
+/// uncounted.
+///
+/// `queue` measures time from request receipt to semaphore permit acquisition;
+/// `exec` measures permit-to-reply. Splitting these lets operators distinguish
+/// backpressure (queue rising) from downstream slowdowns (exec rising). For
+/// handlers that never acquire a permit (fast-path rejections like HMAC
+/// failure), `queue == total` and `exec` is zero. **The split lives in the LOG
+/// only**: the histogram observes the total. The saturation signal survives
+/// that collapse as its own outcome — `stale_deadline` is the queue outrunning
+/// the caller's own deadline.
+///
+/// Both are `Duration`, not pre-rounded milliseconds, because a histogram fed
+/// `as_millis()` could not resolve anything below 1 ms and every `exec_ms`
+/// this fleet has logged is 0. The log fields are still rendered as
+/// milliseconds, so the line is byte-identical to the pre-2026-09-09 one.
+///
+/// `actor_id` is a LOG FIELD and is deliberately NOT a metric label: it is
+/// caller-supplied and unbounded, i.e. a cardinality DoS surface reachable by
+/// anything that can publish to the subject.
 pub(crate) fn record_rpc_metric(
-    subject: &'static str,
+    subject: RpcSubject,
     actor_id: uuid::Uuid,
-    outcome: &'static str, // "ok" | "not_found" | "unauthorized" | "invalid" | "internal" | "timeout" | …
-    queue_ms: u64,
-    exec_ms: u64,
+    outcome: RpcOutcome,
+    queue: std::time::Duration,
+    exec: std::time::Duration,
 ) {
-    // L-22: success outcomes are high-volume and routine; demote to
-    // debug! so production INFO logs aren't dominated by `rpc completed`
-    // baseline noise. Failure outcomes stay at warn!/info! so they
-    // remain visible without a level filter — failures are the
-    // operationally interesting class. Operators who want every-RPC
-    // tracing for capacity planning enable debug! for the talos_rpc
-    // target.
-    if outcome == "ok" {
-        tracing::debug!(
+    talos_metrics::record_rpc_call(subject, outcome, queue, exec);
+
+    let outcome_class = outcome.class();
+    let subject = subject.as_str();
+    let queue_ms = queue.as_millis() as u64;
+    let exec_ms = exec.as_millis() as u64;
+    let duration_ms = queue_ms + exec_ms;
+    let outcome = outcome.as_str();
+
+    // THE LEVEL PARTITION, and it rests on exactly one decision:
+    // `RpcOutcome::class()`, which is also the `class` metric label and
+    // therefore what `TalosRPCSubjectFailing` selects on. A second copy of
+    // this judgement is how a log level and an alert come to disagree.
+    //
+    // Before 2026-09-09 the partition was binary — `ok` was `debug!` and
+    // EVERYTHING else was `warn!` — and the comment here claimed a
+    // `warn!/info!` split the code did not have. The cost was measured: of 32
+    // WARN lines in the controller's whole log, 17 were one designed
+    // pre-promotion state (`talos.ml.predict` / `not_promoted`, from an
+    // `llm_only` model that by definition serves nothing), one per hour,
+    // unbroken. That is check 69's harm — a level that fires forever on a
+    // healthy fleet trains operators to ignore that level — on the only
+    // channel this subsystem had.
+    //
+    // `Served` stays at `debug!` because it is the high-volume routine case
+    // and it is now COUNTED, which is the half that was missing: the question
+    // "how many memory RPCs did we serve, and how fast" is answerable from
+    // `talos_rpc_calls_total` / `talos_rpc_duration_seconds` without turning
+    // on a log level.
+    match outcome_class {
+        RpcOutcomeClass::Served => tracing::debug!(
             target: "talos_rpc",
-            subject,
-            actor_id = %actor_id,
-            outcome,
-            queue_ms,
-            exec_ms,
-            duration_ms = queue_ms + exec_ms,
+            subject, actor_id = %actor_id, outcome, queue_ms, exec_ms, duration_ms,
             "rpc completed"
-        );
-    } else {
-        tracing::warn!(
+        ),
+        RpcOutcomeClass::Declined => tracing::info!(
             target: "talos_rpc",
-            subject,
-            actor_id = %actor_id,
-            outcome,
-            queue_ms,
-            exec_ms,
-            duration_ms = queue_ms + exec_ms,
+            subject, actor_id = %actor_id, outcome, queue_ms, exec_ms, duration_ms,
+            "rpc declined"
+        ),
+        RpcOutcomeClass::Finding => tracing::warn!(
+            target: "talos_rpc",
+            subject, actor_id = %actor_id, outcome, queue_ms, exec_ms, duration_ms,
             "rpc completed (non-ok outcome)"
-        );
+        ),
     }
 }
 
 #[cfg(test)]
 mod kernel_tests {
     use super::*;
+
+    use std::sync::{Arc, Mutex};
+    use tracing::level_filters::LevelFilter;
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+    use tracing_subscriber::Registry;
+
+    /// Captures `(level, target, message)` for every event on the
+    /// `talos_rpc` target.
+    #[derive(Clone, Default)]
+    struct LevelCapture(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl<S: tracing::Subscriber> Layer<S> for LevelCapture {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
+            let meta = event.metadata();
+            if meta.target() == "talos_rpc" {
+                self.0
+                    .lock()
+                    .expect("capture lock")
+                    .push((*meta.level(), meta.name().to_string()));
+            }
+        }
+    }
+
+    /// THE LEVEL PARTITION, driven through the production function.
+    ///
+    /// The class table is pinned by name in `talos_metrics::rpc`; this pins
+    /// the OTHER half — that the level actually rests on it. Moving a
+    /// `Declined` outcome back to `warn!` is the exact defect this package
+    /// removed (a designed pre-promotion state producing 53% of the
+    /// controller's WARN volume, hourly), and without this test that revert
+    /// is behaviourally invisible to every other guard in the workspace.
+    #[test]
+    fn the_log_level_rests_on_the_outcome_class() {
+        let cap = LevelCapture::default();
+        let subscriber = Registry::default()
+            .with(LevelFilter::TRACE)
+            .with(cap.clone());
+        let actor = uuid::Uuid::nil();
+        let z = std::time::Duration::ZERO;
+
+        tracing::subscriber::with_default(subscriber, || {
+            // One outcome per class, chosen as the three this package argued
+            // about rather than three arbitrary ones.
+            record_rpc_metric(RpcSubject::MemoryOp, actor, RpcOutcome::Ok, z, z);
+            record_rpc_metric(RpcSubject::MlPredict, actor, RpcOutcome::NotPromoted, z, z);
+            record_rpc_metric(RpcSubject::MemoryOp, actor, RpcOutcome::Internal, z, z);
+        });
+
+        let seen: Vec<tracing::Level> = cap
+            .0
+            .lock()
+            .expect("capture lock")
+            .iter()
+            .map(|(l, _)| *l)
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                tracing::Level::DEBUG,
+                tracing::Level::INFO,
+                tracing::Level::WARN
+            ],
+            "served must stay at debug (high-volume, and now COUNTED); a DESIGNED \
+             decline must be info, not an alarm; and a platform failure must stay \
+             loud. If this moved, so did the `class` label and therefore the alert."
+        );
+
+        // And the mapping is exhaustive over the class enum: every outcome the
+        // table declares must land on one of those three levels, so a fourth
+        // class cannot be added without deciding its level here.
+        for outcome in RpcOutcome::ALL {
+            let expected = match outcome.class() {
+                RpcOutcomeClass::Served => tracing::Level::DEBUG,
+                RpcOutcomeClass::Declined => tracing::Level::INFO,
+                RpcOutcomeClass::Finding => tracing::Level::WARN,
+            };
+            let cap = LevelCapture::default();
+            let subscriber = Registry::default()
+                .with(LevelFilter::TRACE)
+                .with(cap.clone());
+            tracing::subscriber::with_default(subscriber, || {
+                record_rpc_metric(RpcSubject::MemoryOp, actor, *outcome, z, z);
+            });
+            let got = cap.0.lock().expect("capture lock")[0].0;
+            assert_eq!(got, expected, "wrong level for `{}`", outcome.as_str());
+        }
+    }
 
     #[test]
     fn backoff_doubles_and_caps_at_sixty() {
