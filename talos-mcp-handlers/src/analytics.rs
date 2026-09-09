@@ -55,17 +55,16 @@ async fn maintenance_clock_cutover(pool: &sqlx::PgPool) -> Option<chrono::DateTi
         .await
 }
 
-/// Derive capability tag suggestions from a workflow's graph JSON.
-/// Pure computation: parse graph → extract module_ids → DB queries → return tags.
-async fn compute_capability_suggestions(graph_json: &str, pool: &sqlx::PgPool) -> Vec<String> {
-    let repo = talos_analytics_repository::AnalyticsRepository::new(pool.clone());
-    let graph: serde_json::Value =
-        serde_json::from_str(graph_json).unwrap_or(serde_json::json!({"nodes":[],"edges":[]}));
-
-    let nodes = graph.get("nodes").and_then(|n| n.as_array());
-    let edges = graph.get("edges").and_then(|e| e.as_array());
-
-    let module_ids: Vec<Uuid> = nodes
+/// The module ids a graph's nodes name, in node order.
+///
+/// ONE reader of the `node.type`-is-a-module-uuid convention, shared by the
+/// single-workflow path and the batched page path below — two readers of one
+/// convention is how the two paths would come to disagree about which modules
+/// a workflow uses.
+fn module_ids_in_graph(graph: &serde_json::Value) -> Vec<Uuid> {
+    graph
+        .get("nodes")
+        .and_then(|n| n.as_array())
         .map(|ns| {
             ns.iter()
                 .filter_map(|n| {
@@ -75,17 +74,35 @@ async fn compute_capability_suggestions(graph_json: &str, pool: &sqlx::PgPool) -
                 })
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+/// Derive capability tag suggestions from a workflow's graph JSON.
+///
+/// PURE — no pool, no `.await`. The two DB-shaped inputs (the distinct
+/// capability worlds and the distinct lowercased kinds of the graph's
+/// modules) are passed in, so the per-workflow path and the batched page path
+/// share this one decision. Order of `worlds` / `tmpl_cats` does not affect
+/// the answer: everything is sorted and deduped before it is returned.
+fn capability_suggestions_from(
+    graph_json: &str,
+    worlds: &[String],
+    tmpl_cats: &[String],
+) -> Vec<String> {
+    let graph: serde_json::Value =
+        serde_json::from_str(graph_json).unwrap_or(serde_json::json!({"nodes":[],"edges":[]}));
+
+    let nodes = graph.get("nodes").and_then(|n| n.as_array());
+    let edges = graph.get("edges").and_then(|e| e.as_array());
+
+    let module_ids: Vec<Uuid> = module_ids_in_graph(&graph);
 
     let mut suggestions: Vec<String> = Vec::new();
 
     if !module_ids.is_empty() {
-        let world_rows = repo
-            .get_capability_worlds_for_modules(&module_ids)
-            .await
-            .unwrap_or_default();
+        let world_rows = worlds;
 
-        for world in &world_rows {
+        for world in world_rows {
             let w = talos_capability_world::world_short(world);
             // Always surface the world short-name as a tag — gives capability-based
             // search a deterministic handle even for worlds without a flavor mapping
@@ -113,12 +130,7 @@ async fn compute_capability_suggestions(graph_json: &str, pool: &sqlx::PgPool) -
             }
         }
 
-        let tmpl_cats = repo
-            .get_template_categories_lower(&module_ids)
-            .await
-            .unwrap_or_default();
-
-        for cat in &tmpl_cats {
+        for cat in tmpl_cats {
             match cat.as_str() {
                 "network" | "http" if !suggestions.iter().any(|s| s == "http") => {
                     suggestions.push("http".to_string());
@@ -163,13 +175,167 @@ async fn compute_capability_suggestions(graph_json: &str, pool: &sqlx::PgPool) -
     suggestions
 }
 
-/// Best-effort: derive capability tags from a workflow's graph and apply them if none are set.
-/// Runs in a background tokio::spawn — never panics.
-pub(crate) async fn auto_suggest_capabilities(
-    workflow_id: Uuid,
+/// The single-workflow wrapper: two reads, then the pure decision above.
+///
+/// Two statements per workflow, which is why the page-shaped caller
+/// ([`auto_suggest_capabilities_bulk`]) does not use it.
+async fn compute_capability_suggestions(graph_json: &str, pool: &sqlx::PgPool) -> Vec<String> {
+    let repo = talos_analytics_repository::AnalyticsRepository::new(pool.clone());
+    let graph: serde_json::Value =
+        serde_json::from_str(graph_json).unwrap_or(serde_json::json!({"nodes":[],"edges":[]}));
+    let module_ids = module_ids_in_graph(&graph);
+    if module_ids.is_empty() {
+        return capability_suggestions_from(graph_json, &[], &[]);
+    }
+    let worlds = repo
+        .get_capability_worlds_for_modules(&module_ids)
+        .await
+        .unwrap_or_default();
+    let cats = repo
+        .get_template_categories_lower(&module_ids)
+        .await
+        .unwrap_or_default();
+    capability_suggestions_from(graph_json, &worlds, &cats)
+}
+
+/// Best-effort capability tagging for a PAGE of workflows in a constant
+/// number of statements (2026-09-08).
+///
+/// The loop this replaces cost `1 + 4N` statements — measured at **27 for
+/// N = 6** on a fleet-shaped scratch database, and
+/// `get_ids_without_capabilities` is `LIMIT 100`, so the worst case was 401.
+/// Every one of those statements ran serially inside a background
+/// `tokio::spawn` against the same pool a live request is competing for,
+/// which is the N+1 shape the Performance Rules name.
+///
+/// After: THREE statements regardless of page size — one `= ANY($1)` graph
+/// read, one `= ANY($1)` module-attribute read over the UNION of every
+/// member's module ids, and one bulk `UPDATE … FROM jsonb_array_elements`.
+///
+/// The DECISION is unchanged: `capability_suggestions_from` is the same pure
+/// function the per-workflow path calls, fed the same distinct world/kind
+/// sets, and the write keeps the same "only if still empty" guard. A
+/// workflow whose capabilities were set between the read and the write keeps
+/// the operator's tags, exactly as before.
+pub async fn auto_suggest_capabilities_bulk(
+    workflow_ids: &[Uuid],
     user_id: Uuid,
     pool: &sqlx::PgPool,
 ) {
+    if workflow_ids.is_empty() {
+        return;
+    }
+    let repo = talos_analytics_repository::AnalyticsRepository::new(pool.clone());
+
+    let rows = match repo
+        .get_workflow_graphs_and_capabilities(workflow_ids, user_id)
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                count = workflow_ids.len(),
+                "auto_suggest_capabilities_bulk: graph read failed; the page stays untagged \
+                 for capability search"
+            );
+            return;
+        }
+    };
+
+    // Parse once, keep the parsed graph, and collect the union of module ids.
+    let mut parsed: Vec<(Uuid, String, Vec<Uuid>)> = Vec::with_capacity(rows.len());
+    let mut all_module_ids: Vec<Uuid> = Vec::new();
+    for (id, graph_json, caps) in rows {
+        // Same guard as the per-workflow path: never overwrite an explicit tag.
+        if !caps.is_empty() {
+            continue;
+        }
+        let graph: serde_json::Value =
+            serde_json::from_str(&graph_json).unwrap_or(serde_json::json!({"nodes":[],"edges":[]}));
+        let ids = module_ids_in_graph(&graph);
+        all_module_ids.extend(ids.iter().copied());
+        parsed.push((id, graph_json, ids));
+    }
+    if parsed.is_empty() {
+        return;
+    }
+    all_module_ids.sort_unstable();
+    all_module_ids.dedup();
+
+    // ABORT rather than degrade, and this is a decision BATCHING forced.
+    //
+    // The per-workflow path this replaces swallowed the same read
+    // (`.unwrap_or_default()` on both of its module lookups) and, on a
+    // failure, wrote the graph-STRUCTURE tags alone — losing every
+    // module-derived one. That was a per-workflow accident. Batched, one
+    // failed read would do it to the WHOLE PAGE at once, and the
+    // "only if still empty" guard makes it PERMANENT: a workflow that
+    // received structure-only tags is no longer uncapabilized, so the heal
+    // never revisits it. So a failed attribute read writes NOTHING, and says
+    // so; the page stays uncapabilized and the next `session_start` retries
+    // it. The per-workflow path's own swallow is pre-existing and is
+    // deliberately left alone — it is not this change's to rewrite, and its
+    // blast radius is one workflow.
+    let attrs = match repo.get_module_worlds_and_kinds(&all_module_ids).await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                workflows = parsed.len(),
+                modules = all_module_ids.len(),
+                "auto_suggest_capabilities_bulk: module-attribute read failed; writing NO tags \
+                 for this page rather than structure-only ones, which the if-empty guard would \
+                 make permanent. The page stays uncapabilized and the next session_start retries."
+            );
+            return;
+        }
+    };
+    let by_module: std::collections::HashMap<Uuid, (String, String)> = attrs
+        .into_iter()
+        .map(|(id, world, kind)| (id, (world, kind)))
+        .collect();
+
+    let mut assignments: Vec<(Uuid, Vec<String>)> = Vec::new();
+    for (id, graph_json, module_ids) in &parsed {
+        // The per-workflow reads were `SELECT DISTINCT …`, so the grouped
+        // sets must be distinct too — otherwise a graph naming two modules of
+        // the same world would push its tags twice. `suggestions.dedup()`
+        // would hide that, but the equality is the point.
+        let mut worlds: Vec<String> = Vec::new();
+        let mut kinds: Vec<String> = Vec::new();
+        for mid in module_ids {
+            if let Some((world, kind)) = by_module.get(mid) {
+                worlds.push(world.clone());
+                kinds.push(kind.clone());
+            }
+        }
+        worlds.sort();
+        worlds.dedup();
+        kinds.sort();
+        kinds.dedup();
+        let suggestions = capability_suggestions_from(graph_json, &worlds, &kinds);
+        if !suggestions.is_empty() {
+            assignments.push((*id, suggestions));
+        }
+    }
+
+    if let Err(e) = repo
+        .set_capabilities_if_empty_bulk(&assignments, user_id)
+        .await
+    {
+        tracing::warn!(
+            error = %e,
+            count = assignments.len(),
+            "auto_suggest_capabilities_bulk: capability write failed; the page stays untagged \
+             for capability search"
+        );
+    }
+}
+
+/// Best-effort: derive capability tags from a workflow's graph and apply them if none are set.
+/// Runs in a background tokio::spawn — never panics.
+pub async fn auto_suggest_capabilities(workflow_id: Uuid, user_id: Uuid, pool: &sqlx::PgPool) {
     let repo = talos_analytics_repository::AnalyticsRepository::new(pool.clone());
 
     // Only apply if capabilities are currently empty
@@ -1748,14 +1914,23 @@ async fn handle_get_system_health(
         );
     }
 
-    // Use a simple repo call as DB connectivity check
-    let db_ok = state
-        .analytics_repo
-        .get_system_status_counts(user_id)
-        .await
-        .is_ok();
-
-    let counts = match state.analytics_repo.get_system_status_counts(user_id).await {
+    // ONE read, used for BOTH the connectivity verdict and the counts
+    // (2026-09-08). It used to be issued twice — once discarded to `.is_ok()`
+    // as a "simple repo call as DB connectivity check", then again for its
+    // value — and it is not a cheap probe: it carries
+    // `(SELECT COUNT(*)::bigint FROM workflow_executions WHERE user_id = $1)`
+    // with no time bound, measured at 10.3 ms + 5.7 ms of this tool's 31.9 ms
+    // on a fleet-shaped scratch database (10 500 executions). Not a cache: the
+    // second call was the SAME statement with the same binds in the same
+    // request, so one read answers both questions.
+    //
+    // The only shape whose behaviour changes is a TRANSIENT failure where the
+    // first read failed and the second succeeded: that used to render a report
+    // stamped `database_connected: false` from a read that had, in fact,
+    // succeeded. `db_ok` now reports the read the counts came from.
+    let counts_read = state.analytics_repo.get_system_status_counts(user_id).await;
+    let db_ok = counts_read.is_ok();
+    let counts = match counts_read {
         Ok(c) => c,
         Err(_) => return mcp_error(req_id, -32000, "Failed to fetch system health"),
     };

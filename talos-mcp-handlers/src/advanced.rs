@@ -3357,9 +3357,12 @@ async fn handle_agent_session_start(
                 .get_ids_without_capabilities(user_id)
                 .await
                 .unwrap_or_default();
-            for wf_id in ids {
-                crate::analytics::auto_suggest_capabilities(wf_id, user_id, &pool).await;
-            }
+            // BATCHED (2026-09-08). This was `for wf_id in ids { … }` over the
+            // per-workflow helper, i.e. `1 + 4N` statements — measured at 27
+            // for N = 6 on a fleet-shaped scratch database, worst case 401 at
+            // the reader's own `LIMIT 100`. The page now costs FOUR, and the
+            // decision is the same pure function.
+            crate::analytics::auto_suggest_capabilities_bulk(&ids, user_id, &pool).await;
         });
     }
 

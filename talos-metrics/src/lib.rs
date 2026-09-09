@@ -110,6 +110,97 @@ pub fn global() -> Option<&'static Arc<TalosMetrics>> {
     METRICS.get()
 }
 
+/// The outcome of one MCP `tools/call`, decided from the RESPONSE SHAPE and
+/// never from the handler that produced it.
+///
+/// An ENUM rather than a `&str` for the same reason
+/// [`talos_workflow_liveness::dispatch::DispatchPath`] is one: the `outcome`
+/// label set is then closed BY THE COMPILER, and a fifth outcome cannot be
+/// spelled at a call site without being added here — where its meaning, and
+/// its effect on anything selecting on the label, is visible.
+///
+/// The split that matters is `refused` vs `error`: `refused` is the CALLER's
+/// fault (JSON-RPC `-32602`, invalid or missing arguments, the code 411 of
+/// this workspace's `mcp_error` sites use), `error` is the SERVER's
+/// (`-32000` / `-32603` / anything else, plus a JSON-RPC `error` object).
+/// Folded into one value, a client looping on a typo'd argument and a
+/// database outage move the same series.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpToolOutcome {
+    /// The response carries a result with no `isError`.
+    Ok,
+    /// `isError` with a SERVER-side code (`-32000`, `-32603`, …), or a
+    /// JSON-RPC `error` object.
+    Error,
+    /// `isError` with `-32602` — invalid params. The caller can fix it.
+    Refused,
+    /// `isError` with `-32601` — no dispatch arm claimed the name.
+    UnknownTool,
+}
+
+impl McpToolOutcome {
+    /// The label value. One `&'static str` per variant, exhaustively matched.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Error => "error",
+            Self::Refused => "refused",
+            Self::UnknownTool => "unknown_tool",
+        }
+    }
+
+    /// Every variant, for tests and for any future pre-seed loop.
+    pub const ALL: [Self; 4] = [Self::Ok, Self::Error, Self::Refused, Self::UnknownTool];
+}
+
+/// Record one MCP `tools/call` on the process-global registry.
+///
+/// ONE increment site for both series, so a new observation point cannot
+/// move one and forget the other. Inert when metrics are not wired (unit
+/// tests, any process without [`set_global`]) — never unwraps, mirroring
+/// [`global`]'s contract.
+///
+/// `tool` is `&'static str` DELIBERATELY. The only values the chokepoint can
+/// pass are borrowed from the process-lifetime tool-schema registry or are
+/// one of two `const` sentinels; a `String` parameter would accept the
+/// request's own `params.name` and make the label set unbounded. The type is
+/// not a proof on its own (`Box::leak` also yields `&'static str`), so the
+/// rule is pinned by `talos_mcp_handlers::tool_labels`' tests.
+pub fn record_mcp_tool_call(
+    tool: &'static str,
+    outcome: McpToolOutcome,
+    elapsed: std::time::Duration,
+) {
+    if let Some(m) = global() {
+        record_mcp_tool_call_on(m, tool, outcome, elapsed);
+    }
+}
+
+/// The recording itself, against an EXPLICIT registry.
+///
+/// Split out from [`record_mcp_tool_call`] so a test can drive the real
+/// recording without racing `set_global` (a process-wide `OnceLock` that
+/// sibling tests in one binary share). The 2026-09-08 scheduler-readiness
+/// entry records what happens without this split: the publish site is
+/// unreachable from a unit test and survives its own deletion.
+pub fn record_mcp_tool_call_on(
+    metrics: &TalosMetrics,
+    tool: &'static str,
+    outcome: McpToolOutcome,
+    elapsed: std::time::Duration,
+) {
+    let labels = [tool, outcome.as_str()];
+    metrics
+        .mcp_tool_calls_total
+        .with_label_values(&labels)
+        .inc();
+    metrics
+        .mcp_tool_duration_seconds
+        .with_label_values(&labels)
+        .observe(elapsed.as_secs_f64());
+}
+
 /// Record an archived-workflow dispatch refusal on the process-global
 /// `talos_dispatch_refused_total{path,reason}` counter.
 ///
@@ -1215,6 +1306,37 @@ pub struct TalosMetrics {
     /// a gauge so alerts can compute a saturation RATIO
     /// (`in_use / max`) without hardcoding the limit in PromQL.
     pub db_pool_max_connections: IntGauge,
+
+    /// Per-tool latency of the ONE MCP `tools/call` chokepoint
+    /// (`talos_mcp_handlers::handle_tools_call`), labelled
+    /// `tool` × `outcome`.
+    ///
+    /// **Cardinality is the design.** `tool` is NEVER the request's own
+    /// string: the chokepoint resolves it against the static tool-schema
+    /// registry and passes a `&'static str` borrowed from that registry, or
+    /// one of two fixed sentinels. A caller-derived label value here would be
+    /// an unbounded-cardinality DoS surface reachable by anyone who can reach
+    /// `/mcp` — check 58's rule, and the reason
+    /// [`record_mcp_tool_call`] takes `&'static str` and an ENUM rather than
+    /// two strings.
+    ///
+    /// **Deliberately NOT pre-seeded, and the number is why.** The label
+    /// product is ~320 tools × 4 outcomes, and a 16-bucket histogram series
+    /// renders 19 lines, so seeding the product would add ~24 000 lines
+    /// (~1.9 MB) to a `/metrics/prometheus` body measured at 567 lines /
+    /// 61 128 bytes — a 30× scrape. Seeding only the pairs a live call site
+    /// can reach is still ~960 series. Nothing alerts on these two, so the
+    /// absent-≠-zero argument that seeds `dispatch_refused_total` does not
+    /// apply: an absent `(tool, outcome)` here means "this tool has not been
+    /// called since boot", which is what a seeded 0 would have said anyway.
+    /// If an alert is ever written on these, seed the pairs THAT alert
+    /// selects, not the product.
+    pub mcp_tool_duration_seconds: HistogramVec,
+    /// Call count for the same chokepoint, same labels, same cardinality
+    /// rule. The histogram's `_count` carries the same number; this exists
+    /// so a dashboard or alert can rate the calls without depending on the
+    /// histogram's bucket layout.
+    pub mcp_tool_calls_total: CounterVec,
 }
 
 impl TalosMetrics {
@@ -2349,8 +2471,47 @@ impl TalosMetrics {
         )?;
         registry.register(Box::new(db_pool_max_connections.clone()))?;
 
+        // ── MCP tools/call instrument (2026-09-08) ───────────────────────
+        //
+        // Buckets: 1 ms … 32.768 s, doubling (16 finite buckets). The brief's
+        // target range is 1 ms … 30 s and the house style elsewhere in this
+        // file is `exponential_buckets(0.001, 2.0, 15)` — 15 tops out at
+        // 16.384 s, BELOW 30 s, so every call slower than 16 s would land in
+        // `+Inf` and its latency would be unmeasurable above the top bucket.
+        // 16 puts the top finite bucket at 32.768 s, above the range, so a
+        // 30-second report is still bounded from above. The bottom bucket is
+        // 1 ms because the fastest tools here (`whoami`, `describe_capability_world`)
+        // are pure in-process work and would otherwise all pile into one bucket.
+        let mcp_tool_duration_seconds = HistogramVec::new(
+            prometheus::HistogramOpts::new(
+                "talos_mcp_tool_duration_seconds",
+                "Wall-clock duration of one MCP tools/call, measured at the single \
+                 dispatch chokepoint. Labels: tool (a value from the static tool-schema \
+                 registry, or the fixed sentinels 'catalog_template' / 'unknown' — NEVER \
+                 the caller's own string) × outcome (ok | error | refused | unknown_tool, \
+                 decided from the response shape). NOT pre-seeded: an absent (tool, outcome) \
+                 means that tool has not been called since process start.",
+            )
+            .buckets(exponential_buckets(0.001, 2.0, 16).expect("valid exponential buckets")),
+            &["tool", "outcome"],
+        )?;
+        registry.register(Box::new(mcp_tool_duration_seconds.clone()))?;
+
+        let mcp_tool_calls_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_mcp_tool_calls_total",
+                "MCP tools/call invocations served, by tool and outcome. Same labels and \
+                 same closed-set rule as talos_mcp_tool_duration_seconds. NOT pre-seeded \
+                 (see that metric's HELP and the field docs for the measured scrape cost).",
+            ),
+            &["tool", "outcome"],
+        )?;
+        registry.register(Box::new(mcp_tool_calls_total.clone()))?;
+
         Ok(Arc::new(Self {
             registry,
+            mcp_tool_duration_seconds,
+            mcp_tool_calls_total,
             webhook_requests_total,
             webhook_request_duration_seconds,
             webhook_dlq_drops_total,
@@ -2445,6 +2606,84 @@ impl TalosMetrics {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    /// The premise of the "do NOT pre-seed the MCP instrument" decision,
+    /// pinned so it cannot silently stop being true.
+    ///
+    /// Both series are documented as unseeded because the label PRODUCT is
+    /// large and a histogram series is expensive to render. This measures the
+    /// per-series cost rather than asserting it from memory: if someone
+    /// halves the bucket count, or adds a third series to the pair, the
+    /// numbers in the field docs and in CLAUDE.md are wrong and this test
+    /// says so.
+    #[test]
+    fn the_mcp_instrument_costs_the_lines_the_no_preseed_decision_assumes() {
+        let m = TalosMetrics::new().expect("metrics");
+
+        // Nothing before the first call: an absent (tool, outcome) is the
+        // documented meaning of "not called since boot".
+        let cold = m.render_prometheus().expect("render");
+        assert!(
+            !cold.contains("talos_mcp_tool_duration_seconds{"),
+            "the instrument must export no per-tool series before any call"
+        );
+        assert!(
+            !cold.contains("talos_mcp_tool_calls_total{"),
+            "the instrument must export no per-tool series before any call"
+        );
+
+        record_mcp_tool_call_on(&m, "whoami", McpToolOutcome::Ok, Duration::from_millis(3));
+        let warm = m.render_prometheus().expect("render");
+        let lines = |needle: &str| {
+            warm.lines()
+                .filter(|l| !l.starts_with('#') && l.starts_with(needle))
+                .count()
+        };
+        // 16 finite buckets + `le="+Inf"` + `_sum` + `_count` = 19 lines.
+        assert_eq!(
+            lines("talos_mcp_tool_duration_seconds"),
+            19,
+            "bucket layout changed; the pre-seed cost argument is stale"
+        );
+        assert_eq!(lines("talos_mcp_tool_calls_total"), 1);
+        // First pair also pays the two families' HELP/TYPE preamble once.
+        let first_pair_bytes = warm.len() - cold.len();
+        record_mcp_tool_call_on(
+            &m,
+            "whoami",
+            McpToolOutcome::Refused,
+            Duration::from_millis(3),
+        );
+        let two = m.render_prometheus().expect("render");
+        let marginal_bytes = two.len() - warm.len();
+        assert_eq!(
+            (first_pair_bytes, marginal_bytes),
+            (2356, 1656),
+            "per-(tool, outcome) scrape cost changed; the numbers in the field \
+             docs and in CLAUDE.md's no-pre-seed argument are now stale"
+        );
+    }
+
+    /// A second pair adds a second set of series — i.e. the label product is
+    /// what it looks like, which is the other half of the same premise.
+    #[test]
+    fn each_tool_outcome_pair_is_its_own_series() {
+        let m = TalosMetrics::new().expect("metrics");
+        record_mcp_tool_call_on(&m, "whoami", McpToolOutcome::Ok, Duration::from_millis(1));
+        let one = m.render_prometheus().expect("render").len();
+        record_mcp_tool_call_on(
+            &m,
+            "whoami",
+            McpToolOutcome::Refused,
+            Duration::from_millis(1),
+        );
+        let two = m.render_prometheus().expect("render").len();
+        assert!(
+            two > one,
+            "a second outcome on the same tool must add series, not fold in"
+        );
+    }
     use super::*;
 
     #[test]

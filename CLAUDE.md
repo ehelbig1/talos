@@ -2051,6 +2051,272 @@ the bar this repo does not ship at (#765's numbers); the structural answer is
 that the vocabulary has one `pub` home and the two call sites are pinned by a
 source assertion in the DB binary that already covers the column.
 
+### 2026-09-08 — nothing could say which operator surface is slow, and the two things that were
+
+Every prior entry in this file is about a report that says the wrong thing.
+This one is about a report that does not exist: **no per-tool latency series,
+no per-tool error series, no per-call line, no per-statement attribution.**
+Measured live, read-only, before anything was written: `/metrics/prometheus`
+is **61 128 bytes / 567 lines / 445 series**, and the only `talos_*` names
+matching `mcp|tool|handler|request|graphql|query|db|pool` are the four
+`talos_db_pool_*` gauges and `talos_dlq_db_errors_total`; the controller log
+holds **one** line matching `talos_mcp|tools/call|mcp_tool_call` in 1 675, and
+it is the BOOT line `MCP local endpoint ENABLED`; and `SHOW
+shared_preload_libraries` answers with the empty string, so there is no
+`pg_stat_statements` either. "Performant by default" was unverifiable for a
+single operator surface.
+
+**The chokepoint is `handle_tools_call`, and it is a CHAIN, not a table.**
+Twenty-one domain `dispatch` functions, each an `Option`-returning `match`
+over its own tool names, tried in order, with a `-v1` catalog-template
+fallback at the tail — so there is no dispatch table further in to hang a
+measurement off. Three call sites reach it (the SSE message endpoint and the
+two POST transports) and nothing else dispatches a tool, so one measurement
+covers the whole surface and a NEW transport inherits it. It is now a thin
+wrapper over `handle_tools_call_inner`: resolve the label, time the inner
+call, classify the response, record, log one line. It OBSERVES and never
+alters — `the_instrument_leaves_the_response_byte_identical` compares its
+answer with the domain dispatch's own.
+
+**`talos_mcp_tool_duration_seconds{tool,outcome}` +
+`talos_mcp_tool_calls_total{tool,outcome}`, and CARDINALITY is the whole
+design.** `params.name` arrives from the wire; a `CounterVec` keyed on it
+grows one series per distinct value, so anyone who can reach `/mcp` could mint
+unbounded series in the controller's registry and in every Prometheus that
+scrapes it. `tool_labels::canonical_tool_label` therefore resolves the name
+against `tool_hints::declared_tool_params()` — the `&'static` map built once
+from the `tool_schemas()` functions — and returns a `&'static str` **borrowed
+from that map's own key**, so no interning table and no `Box::leak` is needed
+and the set cannot grow at runtime. Two `const` sentinels: `catalog_template`
+for any `*-v1` name (the catalog is DATA — rows, not literals in this binary —
+so a catalog name is as caller-influenced as any other string) and `unknown`.
+The guard is POINTER equality, not string equality: three invented names must
+return the SAME pointer, which is what bounds the whole unrecognised
+population at one series. `outcome` is an ENUM (`McpToolOutcome`), so that
+half of the label set is closed by the compiler, and it is decided from the
+RESPONSE SHAPE — 21 dispatch functions and ~320 arms would be 320 places to
+forget. `-32602` is `refused` and everything else is `error` because a client
+looping on a typo'd argument and a database outage must not move the same
+series (census: `-32602` 411 sites, `-32000` 409, `-32603` 5, `-32004` 2,
+`-32003` 2).
+
+**Buckets are `exponential_buckets(0.001, 2.0, 16)` — 1 ms … 32.768 s.** The
+house style in this file is `(0.001, 2.0, 15)`, which tops out at **16.384 s,
+below the 30 s target**, so every call slower than 16 s would land in `+Inf`
+with no upper bound at all.
+
+**NOT pre-seeded, and the decision is measured rather than asserted.**
+`the_mcp_instrument_costs_the_lines_the_no_preseed_decision_assumes` pins the
+premise: **19 lines per histogram series** (16 finite buckets + `+Inf` +
+`_sum` + `_count`), **2 356 bytes for the first `(tool, outcome)` pair**
+(which pays both families' HELP/TYPE preamble) and **1 656 for each
+additional** one. The full ~320 × 4 product is ≈ 1 280 pairs ≈ **2.1 MB and
+~25 600 lines — a 35× scrape**; even seeding only the pairs a live call site
+can reach (~960) is ≈ 1.6 MB. Nothing alerts on these two series, so the
+absent-≠-zero argument that seeds `dispatch_refused_total` does not apply: an
+absent `(tool, outcome)` here means "this tool has not been called since
+boot", which is what a seeded 0 would have said. Realistic growth on a
+controller that has served the nine tools below is 61 KB → **77 KB (+25 %)**.
+If an alert is ever written on these, seed the pairs THAT alert selects, never
+the product.
+
+**The instrument costs 619 ns, measured rather than asserted.** Release
+build, 200 000 iterations, with a `tracing` fmt layer actually formatting and
+writing the line (a no-subscriber measurement would understate it): **619 ns**
+for the whole wrapper, **108 ns** without the log line, **40 ns** for the label
+lookup alone. The fastest tool on this surface (`whoami`) measures 2.3 ms, so
+the instrument is **0.027 %** of it; the slowest measured is 189 ms. Most of
+the cost is the log line, i.e. the half an operator reads.
+
+**The per-call line carries `tool`, `outcome`, `duration_ms` and the request
+id, and nothing else** — never the arguments, never the response, never a
+token. The request id is caller-controlled, so it is capped at 64 chars on a
+char boundary and an absent one renders `-`.
+
+**Stated blind spot, measured rather than implied.** The registry is the
+ADVERTISED set. **29** identifier-shaped names appear in a `dispatch` body and
+in no schema — the deprecated `agent_*` aliases (`agent_recall`,
+`create_agent`, `list_agents`, …) and unadvertised siblings
+(`bulk_tag_workflows`, `get_workflow_summary`, `get_workflow_topology`, …).
+Those calls ARE instrumented, under `unknown` rather than their own name. The
+alternative is a hand-maintained alias list, which is the rot mode check 74's
+name glob and check 64's runner list already cost this repo; a client that
+discovered its tools from `tools/list` can reach none of the 29.
+
+#### The baseline the instrument bought, and what it says
+
+Driven ONCE each through the real chokepoint against an isolated clone of a
+fleet-shaped scratch template (36 workflows 17/11/8, 112 modules, 10 500
+executions with one at 5 540 — the live fleet's shape, read read-only).
+**Statements are counted from sqlx's own `sqlx::query` tracing events**, one
+per executed statement including a scoped transaction's `BEGIN`/`COMMIT`, so
+they are ROUND TRIPS; there is no `pg_stat_statements` to ask (see below).
+Background spawns are drained and counted SEPARATELY — the first run
+attributed `session_start`'s heal statements to whichever tool ran next.
+
+| tool | ms | statements | background |
+|---|---|---|---|
+| **get_platform_hygiene_report** | **189.0** | 21 | 0 |
+| session_start | 41.5 | 26 | **27** |
+| get_system_health | 26.3 | **17** | 0 |
+| get_all_readiness_scores | 19.1 | 7 | 0 |
+| get_workflow_performance_report | 17.6 | 6 | 0 |
+| list_executions | 15.5 | 9 | 0 |
+| get_workflow_health | 10.6 | 7 | 0 |
+| security_audit | 8.5 | 3 | 0 |
+| *whoami (control)* | 2.3 | 4 | 0 |
+
+**The slowest surface has no N+1 and no unbounded read**, which is worth
+saying because it is the opposite of what a 189 ms report invites you to
+assume. `get_platform_hygiene_report` issues 21 statements, constant in fleet
+size, every list LIMITed; its cost is four individually slow statements inside
+`tokio::join!` batches — the `uncapabilized` list at **53.0 ms**, the
+`undescribed` list at **52.9 ms**, the idle-actor scan at **25.9 ms** and the
+dormant `WITH last_run AS (…)` at **24.0 ms**. Neither fix this change is
+allowed to make (`= ANY($1)` batching, a disclosed cap) addresses a statement
+that is slow on its own, so it is RECORDED with its four statements named
+rather than half-fixed.
+
+**Two things were fixed.**
+
+**(1) `session_start`'s capability heal was a real N+1.**
+`for wf_id in ids { auto_suggest_capabilities(…).await }` over
+`get_ids_without_capabilities` (`LIMIT 100`), four statements each — one
+graph+capabilities read, one world read, one kind read and one UPDATE — run
+serially inside a background `tokio::spawn` against the same pool a live
+request is competing for. **Before: 27 statements for N = 6, worst case 401.
+After: 6, and CONSTANT** — 6 at N = 100 too. Three new `AnalyticsRepository`
+methods (`get_workflow_graphs_and_capabilities` and
+`get_module_worlds_and_kinds`, both `= ANY($1)`, and
+`set_capabilities_if_empty_bulk`, one `UPDATE … FROM jsonb_array_elements`
+because ragged per-row arrays cannot ride `UNNEST`). **The DECISION did not
+move**: `capability_suggestions_from` is now a PURE function called by both
+paths and `module_ids_in_graph` is one reader of the
+`node.type`-is-a-module-uuid convention, so the two cannot come to disagree
+about which modules a workflow uses. The test asserts the tags are IDENTICAL
+to the per-workflow path's own answer on an identical population — a
+count-only assertion passes over a batched path that tags everything `[]` —
+and a second test pins that an operator's explicit tag set between the read
+and the write still survives.
+
+**Batching changed a BLAST RADIUS, and the batched path answers for it.** The
+per-workflow path swallowed its module reads (`.unwrap_or_default()`) and, on
+failure, wrote the graph-STRUCTURE tags alone. One workflow at a time that is
+an accident; batched, one failed read does it to the WHOLE PAGE, and the
+`if empty` guard makes it PERMANENT — a structure-only-tagged workflow is no
+longer uncapabilized, so the heal never revisits it. The batched path ABORTS on
+that read with a WARN and writes nothing; the page stays uncapabilized and the
+next `session_start` retries. Pinned by a test that renames the column the read
+names (leaving `workflows` untouched, so the healthy control is meaningful);
+the mutation that restores the swallow fails it with
+`[["parallel"], ["parallel"], ["parallel"]]` in the assertion output — the
+degraded tag set, in so many words. The per-workflow path's own swallow is
+pre-existing and deliberately untouched: not this change's to rewrite, and its
+blast radius is one row.
+
+**(2) `get_system_health` issued the SAME statement twice**, once discarded to
+`.is_ok()` under the comment *"Use a simple repo call as DB connectivity
+check"* and once for its value, and that statement carries an unbounded
+`(SELECT COUNT(*)::bigint FROM workflow_executions WHERE user_id = $1)`:
+**10.3 ms + 5.7 ms of the tool's 31.9 ms**. One read now answers both
+questions — **17 → 14 statements** (the statement plus its scoped
+transaction's BEGIN and COMMIT). Not a cache: same statement, same binds, same
+request. The only behavioural difference is a TRANSIENT failure where the
+first read failed and the second succeeded, which used to render a report
+stamped `database_connected: false` from a read that had in fact succeeded.
+
+**The apparent byte difference in that response was checked, not waved away.**
+`get_system_health`'s body measured 566 bytes before and 565 after — and two
+consecutive runs of the SAME post-fix code render
+`recent_failure_rate.total_executions` as **92** then **90**, because the seed
+spreads executions over a rolling window and that field counts the last hour.
+Seed drift, not a behaviour change.
+
+**What was measured and NOT changed.** The embedding half of the same heal has
+the identical N+1 shape and a ready-made fully batched sibling
+(`handle_generate_workflow_embeddings` = one read + `generate_embeddings_batch`
++ `bulk_set_workflow_embeddings_from_str`), and it is left alone: it needs a
+live embedding provider to exercise, this environment has none (the spawn does
+not even fire — `provider_status: "unavailable"`), and an unexercised rewrite
+of an HTTP fan-out is worse than the N+1 it replaces. **Both heal loops are
+LATENT on the reference fleet**, stated plainly: `embedding IS NULL` = **0**
+and `capabilities = '{}'` = **0** today. They fire on freshly created or
+imported workflows — the state immediately after `create_workflow` — not on
+this fleet. And `get_system_health` / `list_executions` each carry an unbounded
+`COUNT(*)` over the user's execution partition; neither is a collection held in
+memory, so neither is the unbounded-collection shape, and capping a COUNT
+changes its meaning.
+
+#### `pg_stat_statements`, and the guard whose premise was false
+
+`docker-compose.yml`'s postgres gains
+`command: [postgres, -c, shared_preload_libraries=pg_stat_statements]` (the
+image and its pinned digest are untouched — check 80), and migration
+`20260908120000` creates the extension where that preload is present.
+
+**The obvious guard — "catch the error `CREATE EXTENSION` raises without the
+preload" — was refuted by measuring it.** On this server (PG 17.10,
+`shared_preload_libraries` empty) `CREATE EXTENSION pg_stat_statements`
+**succeeds**. What fails is the first READ:
+`SELECT count(*) FROM pg_stat_statements` →
+`ERROR: pg_stat_statements must be loaded via "shared_preload_libraries"`. So
+an unguarded migration leaves every non-preloaded deployment carrying an
+extension whose only view raises on every query — a catalog entry that lies
+about a working instrument, which is this file's usual subject. The gate is
+therefore on the GUC itself, and the EXCEPTION block is kept for the SECOND
+measured failure mode: a non-superuser migration role gets
+`permission denied to create extension … Must be superuser` (measured with a
+plain LOGIN role — the extension is not `trusted`), which is exactly the shape
+a managed Postgres takes, and a migration that ERRORS there stops the whole
+chain including every migration after it.
+
+**Both arms proved, on the same pinned image.** No preload: the full
+`sqlx migrate run` applies it at exit 0, a direct psql apply prints one
+`NOTICE … skipping` and `DO`, `pg_extension` count is **0**, and the
+`_sqlx_migrations` row is present with `success = t`. With the preload (a
+throwaway container started with the exact `command:` the compose change adds):
+`NOTICE: pg_stat_statements is enabled.`, `pg_extension` count **1**, and
+`SELECT count(*) >= 0 FROM pg_stat_statements` actually READS. The positive arm
+matters as much as the negative one — a guard that skips everywhere is a no-op
+that proves nothing.
+
+**The Helm chart is deliberately NOT changed, with the cost stated.**
+`shared_preload_libraries` is a POSTMASTER GUC, so adding it to the in-cluster
+Postgres ConfigMap takes effect only on a server RESTART — on that chart's
+single-replica StatefulSet, a full database outage for the length of a pod
+restart — and the extension takes a fixed shared-memory allocation
+(`pg_stat_statements.max` × ~1 KB, default 5 000 entries) out of a deployment
+tuned there for a 4 GiB VM. An operator's decision, not a migration's side
+effect.
+
+#### Guards, and no lint
+
+`controller/tests/mcp_tool_instrument_tests.rs` (7 tests, CTRL_TESTS per check
+64b) drives the REAL `handle_tools_call`: the counter and the histogram each
+move exactly once; three invented names mint exactly ONE `unknown` series and
+none of the three strings reaches the label set; the response is byte-identical
+to the domain dispatch's own; a missing required argument records `refused`;
+the capability heal is constant in page size AND answers identically; an
+operator tag survives the bulk heal; `get_system_health` reads the status
+counts once. **Cardinality assertions read the registry's own `gather()`
+output, never `with_label_values(..).get()`** — that method CREATES the series
+it is asked about, so a cardinality test written that way manufactures the
+evidence it then checks.
+
+**No lint check was added and `--count` stays 88.** Two candidates were
+measured first. (i) *"a metric label value must be `&'static`"* is not
+expressible: `Box::leak` yields `&'static str` from a request string, so the
+type is not the property — the guard is the pointer-equality test, and the
+population is ONE label pair. (ii) *"a new `tools/call` transport must call the
+instrument"* has a population of THREE call sites in one file, all of which
+already funnel through the one `pub` wrapper — the structural answer (an inner
+function nothing else calls, and a wrapper that cannot be bypassed without
+deleting it) is stronger than a grep over three lines. What is NOT guarded, and
+is said rather than implied: nothing stops a future edit from computing the
+right label and then passing a different one to `record_mcp_tool_call`; that is
+a dataflow question, and the honest guard for it is the live read of
+`/metrics/prometheus` after deploy.
+
 ### The whitespace-run artefact, and why no lint guards it
 
 Four operator-facing string literals carried mid-sentence runs of up to 22
