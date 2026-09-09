@@ -4254,7 +4254,15 @@ async fn handle_find_module_alternatives(
         let target_description = target.description.clone().unwrap_or_default();
         let search_text = format!("{} {}", target_name, target_description);
 
-        // Try pg_trgm similarity search first; fall back to category + alphabetical
+        // Try pg_trgm similarity search first; fall back to category +
+        // alphabetical. The FALLBACK is the honest part of this shape — a
+        // deployment without the `pg_trgm` extension really does have a
+        // second, worse way to answer. What was not honest was the fallback's
+        // OWN failure: `.unwrap_or_default()` rendered `count: 0`,
+        // `alternatives: []` and a tip pointing at `list_module_catalog`, i.e.
+        // "there is nothing else like this module", from two queries that
+        // neither of them answered. When BOTH sources fail there is no answer
+        // left to give, so the tool refuses.
         let (rows, search_method) = match state
             .module_repo
             .find_template_alternatives_trgm(
@@ -4267,9 +4275,9 @@ async fn handle_find_module_alternatives(
             .await
         {
             Ok(rows) => (rows, "trigram"),
-            Err(_) => {
+            Err(trgm_err) => {
                 // pg_trgm not available — fall back to category-priority ordering
-                let fallback = state
+                match state
                     .module_repo
                     .find_template_alternatives_by_category(
                         target_id,
@@ -4278,8 +4286,24 @@ async fn handle_find_module_alternatives(
                         limit,
                     )
                     .await
-                    .unwrap_or_default();
-                (fallback, "category")
+                {
+                    Ok(fallback) => (fallback, "category"),
+                    Err(e) => {
+                        tracing::error!(
+                            module_name = %target_name,
+                            trigram_error = %trgm_err,
+                            error = %e,
+                            "find_module_alternatives: both the trigram search and the category fallback failed"
+                        );
+                        return mcp_error(
+                            req_id,
+                            -32000,
+                            "Could not search for alternatives — both the similarity search and the \
+                             category fallback failed to read. This is a database failure, NOT a \
+                             report that no alternative module exists.",
+                        );
+                    }
+                }
             }
         };
 
@@ -4327,19 +4351,39 @@ async fn handle_find_module_alternatives(
     };
     let ilike_pattern = format!("%{}%", cap.replace('%', "\\%").replace('_', "\\_"));
 
+    // Same three-valued shape as the name-based branch above: an ilike
+    // fallback that itself could not be read has no answer, and rendering
+    // `count: 0` with "No modules matched" is a determinate negative over two
+    // queries that both failed.
     let (rows, search_method) = match state
         .module_repo
         .find_templates_by_capability_trgm(&cap, &ilike_pattern, user_id, limit)
         .await
     {
         Ok(rows) => (rows, "trigram"),
-        Err(_) => {
-            let fallback = state
+        Err(trgm_err) => {
+            match state
                 .module_repo
                 .find_templates_by_capability_ilike(&ilike_pattern, user_id, limit)
                 .await
-                .unwrap_or_default();
-            (fallback, "ilike")
+            {
+                Ok(fallback) => (fallback, "ilike"),
+                Err(e) => {
+                    tracing::error!(
+                        capability = %cap,
+                        trigram_error = %trgm_err,
+                        error = %e,
+                        "find_module_alternatives: both the capability trigram search and the ilike fallback failed"
+                    );
+                    return mcp_error(
+                        req_id,
+                        -32000,
+                        "Could not search the module catalog by capability — both the similarity \
+                         search and the ilike fallback failed to read. This is a database failure, \
+                         NOT a report that no module provides this capability.",
+                    );
+                }
+            }
         }
     };
 

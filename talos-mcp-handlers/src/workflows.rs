@@ -3064,11 +3064,37 @@ async fn handle_dispatch_to_actor(
             Ok(None) => {
                 // 0 workflows or 2+ workflows. Render the candidates so the
                 // caller can pick.
-                let candidates = state
+                // This branch is reached ONLY when the solo-workflow lookup
+                // above answered "0 or 2+", so `candidates` is being read to
+                // tell those two apart. An unread listing rendered the
+                // ZERO-workflow message — "Actor X owns no active workflows.
+                // Create one with create_workflow" — for an actor that may own
+                // several, which is why the branch was entered.
+                let candidates = match state
                     .actor_repo
                     .list_active_workflows_for_actor_brief(actor_id, user_id, 20)
                     .await
-                    .unwrap_or_default();
+                {
+                    Ok(rows) => rows,
+                    Err(e) => {
+                        tracing::error!(
+                            actor_id = %actor_id,
+                            error = %e,
+                            "dispatch_to_actor: candidate listing read failed"
+                        );
+                        return mcp_error(
+                            req_id,
+                            -32000,
+                            &format!(
+                                "Actor {} owns 0 or 2+ active workflows and the candidate listing \
+                                 could not be read, so which is UNKNOWN. This is a database \
+                                 failure, not an actor with no workflows — do not create one on \
+                                 the strength of this. Pass an explicit workflow_id, or retry.",
+                                actor_id
+                            ),
+                        );
+                    }
+                };
                 if candidates.is_empty() {
                     return mcp_error(
                         req_id,
@@ -5914,7 +5940,14 @@ async fn handle_import_workflow(
                 .and_then(|m| m.as_array())
                 .cloned()
                 .unwrap_or_default();
-            let mut still_missing: Vec<String> = Vec::new();
+            // Every push into `still_missing` used to be reported with ONE
+            // sentence — "missing (no source in bundle)" — and FOUR of the
+            // five reasons are something else entirely: the compile produced
+            // no bytes, the compile failed, the compile errored, or the INSERT
+            // of a successfully compiled module failed. The last is the sharp
+            // one: a database write failure told the operator to go and fix
+            // their bundle. Each reason now travels with the id it belongs to.
+            let mut still_missing: Vec<(String, &'static str)> = Vec::new();
             let mut auto_compiled: Vec<String> = Vec::new();
 
             for mid in &missing {
@@ -5956,7 +5989,10 @@ async fn handle_import_workflow(
                                         "import_workflow: compilation produced no WASM bytes for module {}",
                                         mid
                                     );
-                                    still_missing.push(mid_str.clone());
+                                    still_missing.push((
+                                        mid_str.clone(),
+                                        "compiled, but the compiler produced no WASM bytes",
+                                    ));
                                     continue;
                                 }
                             };
@@ -5972,7 +6008,10 @@ async fn handle_import_workflow(
                                         mid,
                                         e
                                     );
-                                    still_missing.push(mid_str);
+                                    still_missing.push((
+                                        mid_str,
+                                        "compiled successfully, but the module could not be WRITTEN (database failure) — the bundle is fine",
+                                    ));
                                 }
                             }
                         }
@@ -5982,7 +6021,7 @@ async fn handle_import_workflow(
                                 mid,
                                 res.errors
                             );
-                            still_missing.push(mid_str);
+                            still_missing.push((mid_str, "compilation failed"));
                         }
                         Err(e) => {
                             tracing::error!(
@@ -5990,22 +6029,26 @@ async fn handle_import_workflow(
                                 mid,
                                 e
                             );
-                            still_missing.push(mid_str);
+                            still_missing.push((mid_str, "the compiler could not be run"));
                         }
                     }
                 } else {
-                    still_missing.push(mid_str);
+                    still_missing.push((mid_str, "no source in bundle"));
                 }
             }
 
             if !still_missing.is_empty() {
+                let detail = still_missing
+                    .iter()
+                    .map(|(id, why)| format!("{id} ({why})"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
                 return Some(mcp_error(
                     req_id.clone(),
                     -32000,
                     &format!(
-                    "Import failed: the following modules are missing (no source in bundle): {}",
-                    still_missing.join(", ")
-                ),
+                        "Import failed: the following modules could not be reconstituted: {detail}"
+                    ),
                 ));
             }
 
@@ -9222,11 +9265,34 @@ async fn handle_instantiate_workflow_pattern(
         // Use the compiled-aware lookup so patterns don't produce
         // workflows that look "ready_to_run" but fail at the first
         // execution because the template has no `wasm_modules` row.
-        let template_id = state
+        // THREE-valued. `Ok(None)` is a module that is genuinely not installed
+        // (or not yet compiled); `Err` is a catalog that could not be read, and
+        // the refusal below tells the operator to go and INSTALL a module they
+        // may already have — a remediation that is wrong and not free.
+        let template_id = match state
             .workflow_repo
             .find_compiled_template_by_name(&module_name, user_id)
             .await
-            .unwrap_or(None);
+        {
+            Ok(found) => found,
+            Err(e) => {
+                tracing::error!(
+                    module_name = %module_name,
+                    error = %e,
+                    "instantiate_workflow_pattern: compiled-template lookup failed"
+                );
+                return Some(mcp_error(
+                    req_id,
+                    -32000,
+                    &format!(
+                        "Could not read the module catalog while resolving '{module_name}', so \
+                         whether the pattern's modules are installed is UNKNOWN. This is a \
+                         database failure, not a missing module — do not install anything on \
+                         the strength of this. Retry."
+                    ),
+                ));
+            }
+        };
 
         match template_id {
             Some(id) => resolved.push((label, id, module_name)),
@@ -9339,13 +9405,20 @@ async fn handle_instantiate_workflow_pattern(
                 .unwrap_or(serde_json::json!([]));
             let suggested_schedule = pattern.get("suggested_schedule").cloned();
 
-            // Batch-fetch config schemas to surface required fields + secrets inline
+            // Batch-fetch config schemas to surface required fields + secrets
+            // inline. The workflow is ALREADY CREATED at this point, so a
+            // failed read must not refuse — but an empty schema map made every
+            // node report no required fields and no required secrets, i.e.
+            // "this pattern is ready as instantiated", which is the one thing
+            // the read cannot establish. Null + named instead.
+            let mut readings = talos_measurement::Readings::new();
             let tid_list: Vec<uuid::Uuid> = resolved.iter().map(|(_, tid, _)| *tid).collect();
-            let schema_rows = state
-                .workflow_repo
-                .get_templates_by_ids(&tid_list)
-                .await
-                .unwrap_or_default();
+            let schema_read = readings.record(
+                "node_configs_needed",
+                state.workflow_repo.get_templates_by_ids(&tid_list).await,
+            );
+            let schemas_measured = schema_read.is_some();
+            let schema_rows = schema_read.unwrap_or_default();
             let schema_map: std::collections::HashMap<
                 uuid::Uuid,
                 (serde_json::Value, Vec<String>),
@@ -9432,9 +9505,24 @@ async fn handle_instantiate_workflow_pattern(
                 }
             }
             // Zero-node workflows fail at dispatch — reflect that in ready_to_run.
-            let ready_to_run = !resolved.is_empty()
-                && missing_config.is_empty()
-                && required_secrets_set.is_empty();
+            //
+            // `ready_to_run` is a VERDICT built entirely on the schema map. An
+            // unread map empties `missing_config` and `required_secrets`, so
+            // the verdict flips to TRUE for a pattern whose required fields
+            // were never looked at. It is three-valued now: `null` when the
+            // schemas could not be read.
+            let ready_to_run = if schemas_measured {
+                serde_json::json!(
+                    !resolved.is_empty()
+                        && missing_config.is_empty()
+                        && required_secrets_set.is_empty()
+                )
+            } else {
+                readings.mark_derived("ready_to_run");
+                readings.mark_derived("missing_config");
+                readings.mark_derived("required_secrets");
+                serde_json::Value::Null
+            };
 
             let wf_id_str = wf_id.to_string();
             let mut ip_step = 1usize;
@@ -9502,6 +9590,7 @@ async fn handle_instantiate_workflow_pattern(
             if let Some(sched) = suggested_schedule {
                 result["suggested_schedule"] = sched;
             }
+            readings.attach(&mut result);
 
             Some(mcp_text(
                 req_id,
@@ -9820,18 +9909,30 @@ async fn handle_get_workflow_quickstart(
     let mut secrets_status: Vec<serde_json::Value> = Vec::new();
     let paths: Vec<String> = all_secret_paths.into_iter().collect();
 
+    // `provisioned` drives a BLOCKER and `blockers.is_empty()` drives
+    // `ready_to_run`. An unread vault listing marked EVERY referenced secret
+    // unprovisioned, so a workflow whose credentials are all in place reported
+    // `ready_to_run: false` with a blocker per secret telling the operator to
+    // provision what they already have. Three-valued now: `provisioned: null`,
+    // no fabricated blocker, and `ready_to_run` null rather than a verdict
+    // computed from an unread field.
+    let mut readings = talos_measurement::Readings::new();
+    let mut secrets_measured = true;
     if !paths.is_empty() {
-        let provisioned_paths = state
-            .workflow_repo
-            .get_provisioned_secrets(&paths, user_id)
-            .await
-            .unwrap_or_default();
+        let provisioned_read = readings.record(
+            "secrets_status",
+            state
+                .workflow_repo
+                .get_provisioned_secrets(&paths, user_id)
+                .await,
+        );
+        secrets_measured = provisioned_read.is_some();
         let provisioned_set: std::collections::HashSet<String> =
-            provisioned_paths.into_iter().collect();
+            provisioned_read.unwrap_or_default().into_iter().collect();
 
         for key_path in &paths {
             let provisioned = provisioned_set.contains(key_path);
-            if !provisioned {
+            if !provisioned && secrets_measured {
                 blockers.push(serde_json::json!({
                     "type": "missing_secret",
                     "key_path": key_path,
@@ -9842,7 +9943,7 @@ async fn handle_get_workflow_quickstart(
             }
             secrets_status.push(serde_json::json!({
                 "key_path": key_path,
-                "provisioned": provisioned,
+                "provisioned": if secrets_measured { serde_json::json!(provisioned) } else { serde_json::Value::Null },
             }));
         }
         // Sort for stable output
@@ -9854,7 +9955,13 @@ async fn handle_get_workflow_quickstart(
         });
     }
 
-    let ready_to_run = blockers.is_empty();
+    let ready_to_run = if secrets_measured {
+        serde_json::json!(blockers.is_empty())
+    } else {
+        readings.mark_derived("ready_to_run");
+        readings.mark_derived("blockers");
+        serde_json::Value::Null
+    };
     let wf_id_str = wf_id.to_string();
 
     // Build numbered next_steps
@@ -9948,9 +10055,7 @@ async fn handle_get_workflow_quickstart(
     }
     let _ = step;
 
-    Some(mcp_text(
-        req_id,
-        &serde_json::to_string_pretty(&serde_json::json!({
+    let mut result = serde_json::json!({
             "workflow_id": wf_id_str,
             "name": wf_name,
             "ready_to_run": ready_to_run,
@@ -9965,8 +10070,12 @@ async fn handle_get_workflow_quickstart(
             "node_configs_needed": node_configs_needed,
             "secrets_status": secrets_status,
             "next_steps": next_steps,
-        }))
-        .unwrap_or_default(),
+    });
+    readings.attach(&mut result);
+
+    Some(mcp_text(
+        req_id,
+        &serde_json::to_string_pretty(&result).unwrap_or_default(),
     ))
 }
 

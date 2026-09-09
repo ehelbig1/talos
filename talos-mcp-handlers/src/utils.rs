@@ -1097,6 +1097,25 @@ pub fn workflow_not_found_error(req_id: Option<serde_json::Value>) -> JsonRpcRes
     mcp_error(req_id, -32000, "Workflow not found or access denied")
 }
 
+/// Standard response for a workflow lookup that could not be READ.
+///
+/// The three-valued sibling of [`workflow_not_found_error`]. `Ok(None)` from an
+/// owner-scoped read is a workflow that does not exist or is not yours; `Err`
+/// is a database that could not be asked. Answering the first for the second is
+/// the determinate-negative class checks 74 / 79 / 81 exist to remove — "not
+/// found or access denied" is false on BOTH clauses while the database is the
+/// broken thing, and it sends an operator to look at permissions during a
+/// database incident. ONE home, so the sentence cannot drift between the
+/// handlers that need it.
+pub fn workflow_lookup_unreadable_error(req_id: Option<serde_json::Value>) -> JsonRpcResponse {
+    mcp_error(
+        req_id,
+        -32000,
+        "Could not read the workflow, so whether it exists and whether you own it are \
+         both UNKNOWN. This is a database failure, not a missing or inaccessible workflow.",
+    )
+}
+
 /// Standard response for "execution not found or access denied".
 pub fn execution_not_found_error(req_id: Option<serde_json::Value>) -> JsonRpcResponse {
     mcp_error(req_id, -32000, "Execution not found or access denied")

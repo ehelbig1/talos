@@ -1474,21 +1474,39 @@ async fn handle_run_scratch_session(
         },
     }
 
-    // Load session
-    let session = state
+    // Load session. The lookup is THREE-valued: `Ok(None)` is a session that
+    // does not exist, `Err` is a database that could not be asked. Until
+    // 2026-09-08 the `.unwrap_or(None)` folded the second into the first, so a
+    // pool timeout told the caller their session was gone — false, and the one
+    // diagnosis that sends an operator to re-create work that is still there.
+    // The REFUSAL direction was already right (running possibly-stale code
+    // would be worse); only the sentence was wrong.
+    let (code, world) = match state
         .advanced_repo
         .get_scratch_session(user_id, session_name)
         .await
-        .unwrap_or(None);
-
-    let (code, world) = match session {
-        Some(s) => s,
-        None => {
+    {
+        Ok(Some(s)) => s,
+        Ok(None) => {
             return mcp_error(
                 req_id,
                 -32000,
                 &format!("Scratch session '{}' not found", session_name),
             )
+        }
+        Err(e) => {
+            tracing::error!(
+                session_name = %session_name,
+                error = %e,
+                "run_scratch_session: scratch-session lookup failed"
+            );
+            return mcp_error(
+                req_id,
+                -32000,
+                "Could not read the scratch session, so it was NOT run. This is a \
+                 database failure, not a missing session — the saved code may still \
+                 be there. Retry.",
+            );
         }
     };
 
@@ -2545,43 +2563,64 @@ async fn handle_get_marketplace_stats(
             return mcp_error(req_id, -32000, "Failed to fetch marketplace stats");
         }
     };
-    let top_rows = state
-        .advanced_repo
-        .get_marketplace_top_modules()
-        .await
-        .unwrap_or_default();
+    // `top_modules_note` below tells the reader, in so many words, that an
+    // empty list means no module has been downloaded — "a real signal, not an
+    // error". That made the swallow WORSE than a bare default: the response
+    // affirmatively vouched for the emptiness it could not measure. The read is
+    // now on the ledger, and an unread list renders `null`, never `[]`.
+    let mut readings = talos_measurement::Readings::new();
+    let top_rows = readings.record(
+        "top_modules",
+        state.advanced_repo.get_marketplace_top_modules().await,
+    );
 
     // MCP-75 (2026-05-07): filter to modules with at least one download.
     // Pre-fix the underlying SQL fell back to alphabetical order when fewer
     // than 5 modules had downloads, which surfaced 0-download entries as
     // "top" — misleading. If fewer than 5 qualify the list is shorter; the
     // tool description ("up to 5 most-downloaded") matches this behavior.
-    let top_modules: Vec<serde_json::Value> = top_rows
-        .into_iter()
-        .filter(|r| r.downloads > 0)
-        .map(|r| {
-            serde_json::json!({
-                "name": r.name,
-                "publisher_id": r.publisher_id.to_string(),
-                "downloads": r.downloads,
-                "capability_world": r.capability_world,
+    let top_modules: Option<Vec<serde_json::Value>> = top_rows.map(|rows| {
+        rows.into_iter()
+            .filter(|r| r.downloads > 0)
+            .map(|r| {
+                serde_json::json!({
+                    "name": r.name,
+                    "publisher_id": r.publisher_id.to_string(),
+                    "downloads": r.downloads,
+                    "capability_world": r.capability_world,
+                })
             })
-        })
-        .collect();
+            .collect()
+    });
 
-    let result = serde_json::json!({
+    let mut result = serde_json::json!({
         "total_listings": stats.total_listings,
         "total_downloads": stats.total_downloads,
         "unique_publishers": stats.unique_publishers,
         "world_count": stats.world_count,
         "top_modules": top_modules,
-        "top_modules_note": "Modules with at least one download, ordered by download count (descending). Empty if no module has been downloaded yet — that is a real signal, not an error.",
+        "top_modules_note": if top_modules_unmeasured(&readings) {
+            "The top-modules query could not be read, so this field is null rather than an empty list. \
+             A null here is not evidence that nothing has been downloaded."
+        } else {
+            "Modules with at least one download, ordered by download count (descending). Empty if no module has been downloaded yet — that is a real signal, not an error."
+        },
     });
+    readings.attach(&mut result);
 
     mcp_text(
         req_id,
         &serde_json::to_string_pretty(&result).unwrap_or_default(),
     )
+}
+
+/// True when the `top_modules` read is on the ledger as not measured.
+///
+/// A free function rather than an inline `!readings.complete()` because the
+/// note must speak about ITS OWN field: a future second read on the same ledger
+/// must not silently rewrite this sentence.
+fn top_modules_unmeasured(readings: &talos_measurement::Readings) -> bool {
+    readings.not_measured().contains(&"top_modules")
 }
 
 async fn handle_list_published_modules(
@@ -2776,22 +2815,27 @@ async fn handle_star_module(
     };
 
     if already_starred {
-        // Return current count without re-incrementing.
-        let count: i32 = state
-            .advanced_repo
-            .get_star_count(listing_id)
-            .await
-            .unwrap_or(0);
+        // Return current count without re-incrementing. `star_count` is a
+        // NUMBER a caller reads as the listing's popularity, and until
+        // 2026-09-08 an unreadable count rendered `0` — "nobody has starred
+        // this", on the one branch that is only reached because SOMEBODY (this
+        // caller) already has. It is now null and named.
+        let mut readings = talos_measurement::Readings::new();
+        let count = readings.record(
+            "star_count",
+            state.advanced_repo.get_star_count(listing_id).await,
+        );
 
+        let mut result = serde_json::json!({
+            "listing_id": listing_id.to_string(),
+            "star_count": count,
+            "already_starred": true,
+            "message": "You have already starred this module.",
+        });
+        readings.attach(&mut result);
         return mcp_text(
             req_id,
-            &serde_json::to_string_pretty(&serde_json::json!({
-                "listing_id": listing_id.to_string(),
-                "star_count": count,
-                "already_starred": true,
-                "message": "You have already starred this module.",
-            }))
-            .unwrap_or_default(),
+            &serde_json::to_string_pretty(&result).unwrap_or_default(),
         );
     }
 
@@ -2914,11 +2958,35 @@ async fn handle_get_config_suggestions(
         })
         .collect();
 
-    let tmpl_rows = state
+    // This read is LOAD-BEARING for every answer below it: the target module's
+    // name, its canonical `allowed_secrets`, its config schema and therefore
+    // `missing_fields`. Until 2026-09-08 a failed read defaulted to an empty
+    // map, and the very next block returned "No missing required fields for
+    // this node." — a determinate negative computed entirely from a query that
+    // did not answer, on a tool whose whole job is telling an operator what is
+    // unset. An EMPTY result stays a legitimate answer (a node whose `type` is
+    // not a template id); only the `Err` refuses.
+    let tmpl_rows = match state
         .advanced_repo
         .get_node_templates_for_config(&all_relevant_ids)
         .await
-        .unwrap_or_default();
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(
+                workflow_id = %wf_id,
+                error = %e,
+                "get_config_suggestions: node-template schema read failed"
+            );
+            return mcp_error(
+                req_id,
+                -32000,
+                "Could not read the module config schemas, so nothing can be said about \
+                 which fields are missing. This is a database failure, not a node whose \
+                 required fields are all set.",
+            );
+        }
+    };
 
     let tmpl_map: std::collections::HashMap<String, (String, serde_json::Value)> = tmpl_rows
         .iter()
@@ -3058,11 +3126,18 @@ async fn handle_get_config_suggestions(
 
     // Vault cross-reference: for any suggestion that looks like a secret reference
     // (_SECRET / _KEY / _TOKEN suffix), check whether the path is already provisioned.
-    let provisioned_list: Vec<String> = state
-        .advanced_repo
-        .get_user_secret_paths(user_id)
-        .await
-        .unwrap_or_default();
+    // `provisioned` is a per-field boolean the caller acts on: `false` sends
+    // them to provision a credential. An unreadable vault listing made EVERY
+    // already-provisioned path report `false`, so the suggestion payload told
+    // the operator to re-create secrets they already have. It is now
+    // three-valued — `null` on an unread listing — and named on the ledger.
+    let mut readings = talos_measurement::Readings::new();
+    let provisioned_read = readings.record(
+        "provisioned",
+        state.advanced_repo.get_user_secret_paths(user_id).await,
+    );
+    let provisioned_measured = provisioned_read.is_some();
+    let provisioned_list: Vec<String> = provisioned_read.unwrap_or_default();
     let provisioned_paths: std::collections::HashSet<String> =
         provisioned_list.iter().cloned().collect();
 
@@ -3085,8 +3160,27 @@ async fn handle_get_config_suggestions(
                 let provisioned = !path.is_empty() && provisioned_paths.contains(&path);
                 let mut entry = serde_json::Map::new();
                 entry.insert("value".to_string(), value.clone());
-                entry.insert("provisioned".to_string(), serde_json::json!(provisioned));
-                if !provisioned {
+                entry.insert(
+                    "provisioned".to_string(),
+                    if provisioned_measured {
+                        serde_json::json!(provisioned)
+                    } else {
+                        serde_json::Value::Null
+                    },
+                );
+                if !provisioned_measured {
+                    // An unread vault listing cannot say a path is missing, and
+                    // the advice below ("add it in the dashboard") is precisely
+                    // the instruction an operator must not be given about a
+                    // credential they may already hold.
+                    entry.insert(
+                        "provisioned_note".to_string(),
+                        serde_json::json!(
+                            "The provisioned-secret listing could not be read, so whether this \
+                             path is already in the vault is UNKNOWN, not false."
+                        ),
+                    );
+                } else if !provisioned {
                     // Surface module's canonical paths first (highest confidence hint)
                     if !target_allowed_secrets.is_empty() {
                         // Check if any canonical path is already provisioned
@@ -3152,7 +3246,7 @@ async fn handle_get_config_suggestions(
         }
     }
 
-    mcp_text(req_id, &serde_json::to_string_pretty(&serde_json::json!({
+    let mut result = serde_json::json!({
         "workflow_id": wf_id.to_string(),
         "node_id": target_node_id,
         "module": target_module_name,
@@ -3162,7 +3256,12 @@ async fn handle_get_config_suggestions(
             "Call update_node_config with workflow_id={} node_id={} and the suggested values above.",
             wf_id, target_node_id
         ),
-    })).unwrap_or_default())
+    });
+    readings.attach(&mut result);
+    mcp_text(
+        req_id,
+        &serde_json::to_string_pretty(&result).unwrap_or_default(),
+    )
 }
 
 /// Thin wrapper (architectural-mandate extraction, 2026-07): validate the

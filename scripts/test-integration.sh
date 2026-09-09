@@ -495,6 +495,13 @@ CTRL_TESTS=(
     # deterministically. Needs the `common` DATABASE_URL harness, so CTRL_TESTS
     # and not TC_TESTS (sub-leg 64b).
     "claim_read_disclosure_tier4_tests"
+    # The LAST tier of the read inventory's CLAIM sites. Almost every one needs
+    # one read of a table to succeed and the NEXT read of the same table to
+    # fail, so the injection is `ALTER TABLE … DROP COLUMN` rather than a table
+    # drop (package 31 measured that a CASCADE can break an unrelated lookup and
+    # pass a test for the wrong reason). `common` (DATABASE_URL) harness, so
+    # CTRL_TESTS and not TC_TESTS (64b).
+    "claim_read_disclosure_tier5_tests"
     # RFC 0012's child-run ledger. A sub-workflow leaves no
     # `workflow_executions` row, so `sub_workflow_runs` is the only evidence it
     # ran — and every question this PR answers is a round trip: which row the

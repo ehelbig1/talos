@@ -3017,7 +3017,12 @@ mod startup_herd_tests {
             let got = region.matches(needle.as_str()).count();
             assert_eq!(
                 got, *want,
-                "the dispatch region must hold exactly {want} `record_dispatch`                  call site(s) for {outcome}, found {got}. A deleted site does not                  fail a test that drives the WRAPPER, and six of the seventeen are                  invisible to the return-anchored scan above — measured, not                  assumed. If you added or removed a terminal path deliberately,                  update EXPECTED_RECORD_SITES and say why."
+                "the dispatch region must hold exactly {want} `record_dispatch` \
+                 call site(s) for {outcome}, found {got}. A deleted site does not \
+                 fail a test that drives the WRAPPER, and six of the seventeen are \
+                 invisible to the return-anchored scan above — measured, not \
+                 assumed. If you added or removed a terminal path deliberately, \
+                 update EXPECTED_RECORD_SITES and say why."
             );
             total += got;
         }
@@ -3031,7 +3036,9 @@ mod startup_herd_tests {
         assert_eq!(
             region.matches("record_dispatch(phase,").count(),
             total,
-            "a `record_dispatch(` call in the region uses an outcome constant              EXPECTED_RECORD_SITES does not enumerate — an unenumerated site is              one this test cannot protect"
+            "a `record_dispatch(` call in the region uses an outcome constant \
+             EXPECTED_RECORD_SITES does not enumerate — an unenumerated site is \
+             one this test cannot protect"
         );
     }
 }

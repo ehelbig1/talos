@@ -19,11 +19,11 @@ Scope: `talos-mcp-handlers/src` + `talos-api/src`, non-test files, with
 
 The table below is PINNED to `0c962874`: it records what was measured there,
 including line numbers, and the disposition sections say what has been repaired
-since. The LIVE count on the current tree is **153** (2026-09-08, package 31);
-re-derive it
-with the classifier command above.
+since. The LIVE count on the current tree is **121** (2026-09-08, package 32),
+of which **zero** carry the `claim` verdict; re-derive it with the classifier
+command above.
 
-**193 sites**, closed and classified: **65 claim**, **5 fail-open**, **37 fail-closed**, **60 decorative**, **26 false-positive**.
+**196 sites**, closed and classified: **63 claim**, **5 fail-open**, **37 fail-closed**, **60 decorative**, **31 false-positive**.
 
 **claim** — the default becomes a count, a list, a verdict or a "not found" that a caller reads and acts on.
 **fail-open** — the default LIFTS an enforcement bound. Ranked first: these are not misleading reports, they are gates that stop gating.
@@ -207,8 +207,120 @@ read answers none), and `workflows.rs::handle_get_workflow_quickstart` (every
 referenced secret rendered unprovisioned, flipping `ready_to_run` false and
 listing blockers for credentials that are already configured).
 
+## Disposition (2026-09-08, package 32) — the class closes at zero
 
-## claim — 65 sites
+**The remaining 34 `claim` sites are all closed**, measured by running the
+classifier over the tree before and after: **153 sites -> 121**, 32 removed and 0
+added. Thirty-two were REPAIRED and two were RECLASSIFIED — and the two
+reclassifications are stated with the field they feed, because the goal is a
+claim count of zero by MEASUREMENT and not by relabelling:
+
+* `executions.rs::handle_get_execution_lineage`'s root lookup was repaired by
+  #782 and never re-verdicted. Its `Err` arm still substitutes the anchor —
+  there is no better id to walk from — but it sets `root_unreadable`, which
+  renders `root_execution_id` as `null` and takes `lineage_note`'s FIRST arm.
+  The substitution is DISCLOSED, so no field claims anything.
+* `workflows.rs::handle_import_workflow`'s `upsert_wasm_module` write still
+  pushes the module onto `still_missing` — it genuinely is not importable — but
+  it now carries its REASON, one of five, and the refusal renders it. The
+  one-sentence-for-five-causes claim ("no source in bundle", said about a
+  DATABASE WRITE that failed) is gone; what is left is a classified list.
+
+Sites repaired:
+
+* `talos-api/src/schema/actors/mutations.rs::clone_actor` — `memories_copied` is an `Option`, matching the MCP twin fixed on 2026-09-02. `Some(0)` is a source with nothing to copy; `None` is a copy that could not be MEASURED. The mutation returns an `ActorSummary` with no field for it, so the difference lands where an operator actually reads it — the action-log line, which said "(0 memories copied)" for a copy that failed. An UNKNOWN count now also RUNS the embedding backfill (bounded at the cap) instead of skipping it, so rows that did land are not left permanently invisible to semantic recall.
+* `talos-api/src/schema/security/mutations.rs::rotate_encryption_key` — the post-rotation key count PROPAGATES. A bare `i32` return has no disclosure slot — the position `me`'s `UserInfo` was in — and `1` is not a placeholder here, it is the version number the toast prints and an operator tracks. `0` would be worse: the frontend's `if (data.rotateEncryptionKey)` renders no toast at all. The error names the half that SUCCEEDED so nobody re-rotates.
+* `talos-mcp-handlers/src/actor.rs::handle_actor_recall` — `reason` is three-valued. `never_set` is a determinate negative about an actor's whole memory history and an unreadable probe produced it; `unknown` is now its own answer, named on the ledger.
+* `talos-mcp-handlers/src/advanced.rs::handle_run_scratch_session` — an unreadable session is no longer reported as absent. The REFUSAL direction was always right — running possibly-stale code is worse — but "not found" is the one diagnosis that sends an operator to re-create work that is still there.
+* `talos-mcp-handlers/src/advanced.rs::handle_get_marketplace_stats` — `top_modules` is null, never `[]`. The swallow was worse than a bare default here: `top_modules_note` told the reader in so many words that an empty list means nothing has been downloaded, "a real signal, not an error" — the response affirmatively vouched for an emptiness it could not measure. The note is now conditional on its own field.
+* `talos-mcp-handlers/src/advanced.rs::handle_star_module` — `star_count` is null, never `0`. Zero reads as "nobody has starred this" on the one branch that is reached only because this caller already has.
+* `talos-mcp-handlers/src/advanced.rs::handle_get_config_suggestions` — TWO sites. The node-template read is LOAD-BEARING — the module name, its canonical `allowed_secrets`, its schema and therefore `missing_fields` all come from it — and an unread map made the very next block answer "No missing required fields for this node." on a tool whose whole job is naming what is unset; it REFUSES. The vault listing makes `provisioned` three-valued instead of marking every already-held credential missing and telling the operator to create it again.
+* `talos-mcp-handlers/src/analytics.rs::handle_get_workflow_changelog` — the ownership read is three-valued through the new shared `utils::workflow_lookup_unreadable_error`, so "not found or access denied" — false on BOTH clauses during a database incident — is no longer the answer to a read that did not happen.
+* `talos-mcp-handlers/src/analytics.rs::handle_get_workflow_call_tree` — the same read one tool over, rendered per NODE: a database fault while walking the tree told the operator their sub-workflow had been deleted or un-shared, which starts a hunt for a change nobody made. The node now carries `unreadable: true`.
+* `talos-mcp-handlers/src/analytics.rs::handle_get_workflow_performance_report` — THREE reads, each COMPOUNDING the next: a failed output read emptied the node-timing breakdown, the rollup fallback that exists to repair exactly that was skipped on its own failed read, and the extremes query rendered slowest/fastest null beside a NONZERO `total_completed_executions`. The breakdown is null only when BOTH sources failed — one working source is a real measurement — and the two failures name the field ONCE, so an unreadable pair does not look like two.
+* `talos-mcp-handlers/src/configuration.rs::handle_get_session_context` — THREE lists an agent reads as an inventory of what the user already has. This tool renders PLAIN TEXT and has no `measurement` object, so the ledger is the same `Readings` every JSON report uses and only the RENDERING differs: the unread sections are NAMED in a DEGRADED line, and the response says not to conclude from it that a workflow must be created.
+* `talos-mcp-handlers/src/graph.rs::handle_add_capability_dispatch_node` — the capability pre-flight is three-valued: `[]` is "nothing matches", an `Err` is "the pre-flight could not run". The warning no longer tells an author that runtime dispatch WILL fail hard on the strength of a query that did not answer.
+* `talos-mcp-handlers/src/graph.rs::handle_add_error_handler` — the handler-module lookup is three-valued; a pool timeout used to refuse with "not found" AND a list of near-miss names, sending the author to rename a module that was there all along.
+* `talos-mcp-handlers/src/graph.rs::handle_preview_capability_dispatch` — REFUSES. This tool's entire output is the answer to "which workflows match", and `match_count: 0` is read — by the `dispatch_note` directly below it — as "dispatch fails hard unless a fallback is set".
+* `talos-mcp-handlers/src/lib.rs::create_router` — TWO sites. `/mcp/local` REFUSES when no dev identity resolves. The comment that stood here NAMED the consequence without preventing it: "tools appear to succeed but nothing persists" — reported-success-on-a-failed-read for EVERY tool on the endpoint at once. `Ok(None)` from the first read is still a genuinely fresh database and still creates the user; the notification check moved ABOVE the resolution so a refusal cannot put a body on a notification.
+* `talos-mcp-handlers/src/modules.rs::handle_find_module_alternatives` — FOUR sites, two pairs. The trigram-to-fallback shape is honest — a deployment without `pg_trgm` really does have a second, worse way to answer — but the FALLBACK's own failure rendered `count: 0` and a tip pointing at `list_module_catalog`, i.e. "there is nothing else like this module", from two queries neither of which answered. When both fail there is no answer left, so both branches refuse.
+* `talos-mcp-handlers/src/platform.rs::handle_get_platform_info` — TWO sites, both understating. A failed catalog listing rendered `catalog_tool_count: 0` and `total_mcp_tools` silently equal to the static count, beside a note asserting the three numbers add up. The world-override read is subtler: a blank map measures every non-`minimal` template against the literal world `unknown`, so the count shrinks quietly rather than obviously. Both counts are null and named; `static_tool_count` is untouched.
+* `talos-mcp-handlers/src/search.rs::handle_find_similar_workflows` — REFUSES. The comparison set IS the answer, and "no similar workflows" is what an agent uses to justify building a duplicate.
+* `talos-mcp-handlers/src/workflows.rs::handle_dispatch_to_actor` — the candidate listing is read only to tell "0 workflows" from "2+", and an unread one rendered the ZERO message — "Actor X owns no active workflows. Create one" — for an actor that may own several, which is why the branch was entered.
+* `talos-mcp-handlers/src/workflows.rs::handle_instantiate_workflow_pattern` — TWO sites. The compiled-template lookup is three-valued, so a failed catalog read no longer tells the operator to INSTALL a module it could not establish is absent. The post-create schema fetch cannot refuse — the workflow already exists — so `ready_to_run` becomes null rather than a verdict computed from an empty schema map, which made every pattern look ready as instantiated.
+* `talos-mcp-handlers/src/workflows.rs::handle_get_workflow_quickstart` — `provisioned` is three-valued and an unread vault fabricates no `missing_secret` blocker; `ready_to_run` is null rather than `false`. Pre-fix a workflow whose credentials were all in place reported not-ready with one blocker per secret, each telling the operator to provision what they already had.
+
+Fourteen of them are pinned by
+`controller/tests/claim_read_disclosure_tier5_tests` (CTRL_TESTS per check 64b),
+which drives the REAL MCP dispatch over a real `McpState`. The injection is
+`ALTER TABLE … DROP COLUMN` rather than a table drop at almost every site,
+because these handlers need one read of a table to SUCCEED and the NEXT read of
+the SAME table to FAIL — a column named by the second statement and not the
+first is the only instrument that separates them, and it is what makes the
+tests prove a per-FIELD disclosure rather than a blanket refusal. Every test
+carries its CONTROL in the same run.
+
+**Falsification: 12 main-vocabulary twins were run against a `git worktree` of
+`origin/main` (1ded89ac) with its own migrated database, and 12 of 12 FAILED BY
+ASSERTION** — none by compile error. Main answered, verbatim: `"Scratch session
+'p32-scratch' not found"` for a session it could not read; `"Workflow not found
+or access denied"` for a workflow whose ownership row it could not read;
+`star_count: 0` on the branch reached only because somebody had starred it;
+`top_modules: []` beside a note calling the emptiness "a real signal, not an
+error"; `catalog_tool_count: 0` with `total_mcp_tools` silently equal to the
+static count; `node_timing_breakdown: []` for a workflow with a completed run;
+a bare `=== Top Workflows ===` header with nothing under it; `match_count: 0`
+from `preview_capability_dispatch`; `count: 0` with a tip pointing at
+`list_module_catalog`; `"Actor … owns no active workflows"` for an actor that
+owns two; and `ready_to_run: false` with a fabricated `missing_secret` blocker.
+
+**Six sites have no round trip and are said so rather than implied.**
+`get_config_suggestions` (2) refuses at its top for want of an LLM client;
+`import_workflow`'s write needs a real compile; `instantiate_workflow_pattern`
+(2) needs an installed AND compiled built-in pattern; `create_router`'s
+`/mcp/local` identity resolution is a closure inside the router builder. Those
+carry a SOURCE pin, which proves the expression is present and never that it
+produces the right answer. `talos-api`'s two sites have no injection either:
+`clone_actor`'s copy and `rotateEncryptionKey`'s count both read the same
+relation as the operation that must succeed before them.
+
+**Leg B — the CLAIM verdict as a lint leg was BUILT, MEASURED and REJECTED;
+`--count` stays 88.** On the fixed tree it reports **0 claim and 0
+unclassified**, which is the zero baseline check 52's rule demands, and on
+pristine main it reports **32 of the 34** (the two misses are the sites whose
+verdict row now describes the REPAIRED expression). It fails on three
+independent measurements. (i) A revert at a site this package reclassified is
+**completely green** — the key is `(file, function, callee, spelling)`, which
+cannot tell the pre-fix expression from the post-fix one at the same call site.
+(ii) The two mutations it DOES catch (`unwrap_or_default`, `if let Ok`) are
+caught only because the table still carries the PRE-fix verdict for the 32
+repaired rows; simulated with those rows maintained — which is what "what the
+default CLAIMS" means once the default is gone — the `unwrap_or_default`
+mutation SURVIVES with a fully green report. (iii) A `.ok()` revert never
+reaches the CLAIM arm at all, because the spelling is part of the key. What is
+left is the ratchet arm, which fires on every NEW collapsed read whatever its
+verdict: packages 29 and 31 each ADDED two detector artefacts on correct code,
+so it would have fired four times across the two most recent changes in this
+family, against a 196-row hand-maintained table — check 74's own recorded rot
+mode and check 64's "a sweep is a snapshot, not a gate", one level up.
+
+What guards the class instead is what already guards it: sub-leg **74b**, whose
+scope is DERIVED (any function constructing a `Readings`), so the eight
+handlers that adopted a ledger in this change enrolled themselves; the
+`#[must_use]` three-valued lookups; and the DB tests above.
+
+**What remains: 121 sites — 0 claim**, 60 decorative, 37 fail-closed, 31
+false-positive (which now includes the three detector artefacts packages 29 and
+31 left unrowed, plus this change's two reclassifications), and the 1 nominal
+`fail-open` that is #779's repaired `dlq_updates` narrowing. By file:
+`executions.rs` 18, `sandbox.rs` 15, `actor.rs` 12, `workflows.rs` 11,
+`analytics.rs` 9, `modules.rs` 8, `graph.rs` 8, `advanced.rs` 8,
+`configuration.rs` 5, `platform.rs` 4, and 20 across fourteen more files. None
+of them makes a claim; every one is a label, a fail-closed refusal or a
+disclosed substitution.
+
+
+## claim — 63 sites
 
 ### `talos-api/src/schema/actors/mutations.rs`
 
@@ -280,7 +392,6 @@ listing blockers for credentials that are already configured).
 | 5324 | `build_execution_trace_json` | `list_execution_events` | `unwrap_or_default` | per-node trace (node_traces) | On a LIVE (non-archived) execution a failed events read empties the per-node trace with no disclosure, reading as "this workflow ran no nodes". |
 | 5438 | `build_execution_trace_json` | `get_execution_node_fuel` | `ok` | per-node fuel_consumed / wall_time_ms (trace) | A failed fuel-rollup read leaves every node's fuel_consumed and wall_time_ms fields absent in the execution trace, understating real cost. |
 | 5629 | `build_execution_trace_json` | `list_child_executions` | `ok` | sub_executions / sub_execution_count | A failed child-executions read renders sub_execution_count as 0, a false "this execution has no children" claim in the trace summary. |
-| 6119 | `handle_get_execution_lineage` | `get_execution_lineage_root` | `match_default` | lineage_root fallback feeding the "standalone run" note | Root-lookup DB error silently substitutes exec_id as its own root with no disclosure flag, masquerading as a genuine standalone execution. |
 | 6611 | `handle_submit_workflow_approval` | `update_execution_approval_decision` | `match_default` | "No pending approval found" refusal message | DB write failure defaults db_rows_updated to 0, misreported to the caller as "no pending approval" rather than a DB error. |
 | 6790 | `handle_get_node_io` | `get_workflow_graph_for_user` | `ok` | node_uuid resolution (get_node_io) | Graph read also drives functional label-to-UUID resolution, not just display; on failure a label-based lookup silently mis-resolves and returns empty/wrong node I/O. |
 
@@ -345,7 +456,6 @@ listing blockers for credentials that are already configured).
 | 3003 | `handle_dispatch_to_actor` | `list_active_workflows_for_actor_brief` | `unwrap_or_default` | "candidates" listing / error text (dispatch_to_actor) | Failed candidate listing renders "Actor owns no active workflows" even when 2+ active workflows exist (that ambiguity is why this branch was reached). |
 | 5696 | `handle_export_workflow` | `get_module_export_metadata` | `match_default` | exported bundle "modules" array | DB error empties modules_meta; the export bundle silently ships with zero modules and no error flag, an incomplete backup reported as success. |
 | 5797 | `handle_import_workflow` | `modules_exist` | `unwrap_or_default` | "missing" modules list (import_workflow) | A failed modules_exist check marks every referenced module "missing", triggering needless recompilation or an "Import failed: modules missing" refusal for modules that actually exist. |
-| 5863 | `handle_import_workflow` | `upsert_wasm_module` | `match_default` | "Import failed: modules missing (no source in bundle)" message | DB write failure after a successful compile is misreported as missing bundle source, misdirecting the operator's remediation. |
 | 9125 | `handle_instantiate_workflow_pattern` | `find_compiled_template_by_name` | `unwrap_or_literal` | "missing_modules" list (instantiate_workflow_pattern) | A failed per-node template lookup marks a module "not installed (or not yet compiled)" and refuses to instantiate the pattern even when the module is actually installed and compiled. |
 | 9244 | `handle_instantiate_workflow_pattern` | `get_templates_by_ids` | `unwrap_or_default` | "missing_config"/"required" fields (instantiate_workflow_pattern) | Failed post-create schema fetch yields empty required-field lists, so the quickstart-style response reports nothing missing when required config may in fact be unset. |
 | 9724 | `handle_get_workflow_quickstart` | `get_provisioned_secrets` | `unwrap_or_default` | "ready_to_run"/"missing_secret" blockers (get_workflow_quickstart) | Failed provisioned-secrets fetch marks every referenced secret unprovisioned, flipping ready_to_run to false and listing missing_secret blockers for secrets that are already configured. |
@@ -627,13 +737,19 @@ listing blockers for credentials that are already configured).
 | 12059 | `handle_write_semantic_cache` | `clone` | `if_let_ok` | background embedding fill (write_semantic_cache) | Fire-and-forget embedding backfill for the semantic cache; failure only means this entry stays findable by exact-hash, not fuzzy match — the cache write itself already succeeded. |
 
 
-## false-positive — 26 sites
+## false-positive — 31 sites
 
 ### `talos-api/src/schema/modules/mutations.rs`
 
 | line | function | read | spelling | consumer | what a failed read produces |
 |---|---|---|---|---|---|
 | 489 | `create_module_from_template` | `join_all` | `if_let_ok` | orphaned watch-channel cleanup | join_all awaits best-effort cleanup tasks whose own errors are already logged per-task; not a benign-default collapse of a decision-relevant read. |
+
+### `talos-api/src/schema/subscriptions.rs`
+
+| line | function | read | spelling | consumer | what a failed read produces |
+|---|---|---|---|---|---|
+| 64 | `refresh_dlq_permissions` | `list_user_org_ids` | `match_default` | the returned DlqPermissions | #783 extracted the refresh into a pure function whose Err arm NARROWS to own-events-only. The detector sees a substituted value; the value is the most restrictive one available, so it grants nothing — fail-closed by outcome and a false positive as a claim. |
 
 ### `talos-mcp-handlers/src/actor.rs`
 
@@ -657,6 +773,7 @@ listing blockers for credentials that are already configured).
 
 | line | function | read | spelling | consumer | what a failed read produces |
 |---|---|---|---|---|---|
+| 6119 | `handle_get_execution_lineage` | `get_execution_lineage_root` | `match_default` | root_execution_id / lineage_note | RECLASSIFIED 2026-09-08: repaired by #782. The Err arm still substitutes the anchor (there is no better id to walk from) but it sets root_unreadable, which renders root_execution_id as null and takes lineage_note's FIRST arm — an explicit "could not be read" that outranks every other. The substitution is DISCLOSED, so no field claims anything; the detector correctly still sees a default. Same shape as dlq_updates. |
 | 6145 | `handle_get_execution_lineage` | `get_execution_lineage_tree` | `match_default` | tree_degraded flag consumed by lineage_note | Err arm sets tree_degraded=true, which lineage_note renders as an explicit "could not be read" disclosure, not a claim. |
 | 6176 | `handle_get_execution_lineage` | `list_for_parent` | `match_default` | child_runs (None) / child_runs_error consumed by child_runs_note | Err arm yields None (never []) plus an explicit error string, rendered as UNKNOWN via child_runs_note, not a claim. |
 
@@ -671,6 +788,8 @@ listing blockers for credentials that are already configured).
 | line | function | read | spelling | consumer | what a failed read produces |
 |---|---|---|---|---|---|
 | 3184 | `handle_list_module_catalog` | `unwrap_or_default` | `if_let_ok` | CATALOG_CACHE get_or_init clone | get_or_init returns the cached Vec directly (no Result at this line); the only fallible collapse is the inner unwrap_or_default already counted at 3181. |
+| 3238 | `handle_list_module_catalog` | `cmp` | `if_let_ok` | the catalog listing | #784 moved the disk walk to get_or_try_init so a failure is no longer MEMOIZED; the following match REFUSES. The binding leg reads the sort comparator inside the initialiser as a collapse. |
+| 3241 | `handle_list_module_catalog` | `map_err` | `if_let_ok` | the catalog listing | The other half of the same get_or_try_init artefact: the Err arm refuses, so nothing is defaulted. |
 | 3771 | `handle_install_module_from_catalog` | `pin_user_module` | `match_default` | pinned flag + pin_warning text | Err correctly sets pinned=false and returns an explicit pin_warning message disclosing the pin failure. |
 | 3957 | `handle_restore_pinned_modules` | `update_template_precompiled_wasm` | `match_default` | failed[] entry with reason string | Err arm pushes a failed-module entry naming "compilation succeeded but failed to save", an explicit disclosed failure. |
 
@@ -708,5 +827,6 @@ listing blockers for credentials that are already configured).
 | line | function | read | spelling | consumer | what a failed read produces |
 |---|---|---|---|---|---|
 | 1677 | `handle_create_workflow` | `get_templates_by_ids` | `match_default` | template_max_retries_map fallback (create_workflow) | Empty map on read failure falls through to the engine's own documented method-aware absent-policy default at dispatch time; no fleet-wide retry-disabling regression. |
+| 5863 | `handle_import_workflow` | `upsert_wasm_module` | `match_default` | the per-module reason in the "could not be reconstituted" refusal | RECLASSIFIED 2026-09-08: the arm still pushes onto still_missing — the module genuinely is not importable — but it now carries its REASON, and the refusal renders "<id> (compiled successfully, but the module could not be WRITTEN (database failure) — the bundle is fine)". The one-sentence-for-five-causes claim is gone; what is left is a classified failure list, not a claim. |
 | 11919 | `handle_check_semantic_cache` | `unwrap_or_default` | `ok` | outgoing JSON serialization (check_semantic_cache) | unwrap_or_default sits on to_string_pretty of a hard-coded json! literal for the response body, not on a collapsed data read at all. |
 

@@ -2121,6 +2121,219 @@ UPSERT because `create_org` already inserts the owner's membership row, and
 `api_auth_integration_test::org_scoped_client_helper_actually_provisions_an_org`
 drives the chain end to end. Reinstating main's helper body is RED.
 
+### 2026-09-08 — the class closes at ZERO, and the gate that would have guarded it does not work
+
+The swallowed-READ family ends here. Package 31 left **34** `claim` sites — a
+read whose default becomes a count, a list, a verdict or a "not found" that a
+caller acts on. All 34 are closed: **32 repaired, 2 reclassified**, and the
+classifier now reports **121 sites, 0 claim** (from 153). The count is by
+MEASUREMENT, not by relabelling — both reclassifications quote the field they
+feed and why nothing there claims anything any more.
+
+**Falsification first.** Twelve main-vocabulary twins were run in a real
+`git worktree` of `origin/main` (`1ded89ac`) against its own migrated database:
+**12 of 12 FAILED BY ASSERTION, none by compile error.** Main answered, verbatim
+— `"Scratch session 'p32-scratch' not found"` for a session it could not read;
+`"Workflow not found or access denied"` for a workflow whose ownership row it
+could not read; `star_count: 0` on the branch reached only because this caller
+had already starred it; `top_modules: []` beside a note calling the emptiness
+*"a real signal, not an error"*; `catalog_tool_count: 0` with `total_mcp_tools`
+silently equal to the static count; `node_timing_breakdown: []` for a workflow
+with a completed run; a bare `=== Top Workflows ===` header with nothing under
+it; `match_count: 0` from `preview_capability_dispatch`; `count: 0` with a tip
+pointing at `list_module_catalog`; `"Actor … owns no active workflows. Create
+one"` for an actor that owns two; and `ready_to_run: false` with a fabricated
+`missing_secret` blocker for a credential that was provisioned.
+
+**Three repairs are worth carrying, because each is the class in a shape the
+earlier passes did not have.**
+
+**(a) A note that VOUCHED for the emptiness.** `get_marketplace_stats` rendered
+`top_modules: []` from `.unwrap_or_default()` under
+`top_modules_note: "…Empty if no module has been downloaded yet — that is a real
+signal, not an error."` That is worse than a bare default: the response
+affirmatively certified the one thing the failed read could not establish. The
+note is now conditional on its OWN field (a free `top_modules_unmeasured`
+helper, not an inline `!readings.complete()`, so a future second read on the
+same ledger cannot silently rewrite this sentence).
+
+**(b) A load-bearing read whose failure produced an ALL-CLEAR.**
+`get_config_suggestions`' node-template read feeds the module name, its
+canonical `allowed_secrets`, its schema and therefore `missing_fields` — and the
+very next block returns *"No missing required fields for this node."* on a tool
+whose entire job is naming what is unset. An EMPTY result stays a legitimate
+answer (a node whose `type` is not a template id); only the `Err` refuses.
+
+**(c) A report that had ALREADY admitted the ambiguity in prose.**
+`get_workflow_performance_report`'s `NODE_TIMING_BREAKDOWN_NOTE` said an empty
+list means the rollup fallback *"had no rows or its query failed, which this
+surface does not distinguish"*. Now it does: `null` when BOTH sources failed,
+`[]` when they were read and there was nothing. One working source is a real
+measurement and stays a list, and the two failures name the field ONCE — a
+second `record` would make one unreadable breakdown look like two. Note the
+three reads COMPOUNDED: the primary emptied the breakdown, the rollup fallback
+that exists to repair exactly that was skipped by its own `if let Ok`, and the
+extremes query rendered slowest/fastest `null` beside a NONZERO
+`total_completed_executions`.
+
+**A refusal that had no field to disclose into, twice, and the answers differ.**
+`talos-api` has no `talos-measurement` dependency and both its sites return a
+typed value. `rotateEncryptionKey` returns a bare `i32` and now PROPAGATES — the
+position `me`'s `UserInfo` was in one package ago, and the same answer. `1` was
+never a placeholder: it is the version number the toast prints and an operator
+tracks, so an unreadable count silently REWOUND that history; `0` would have
+been worse still, because `SecretsManager.tsx` does
+`if (data.rotateEncryptionKey)` and a falsy value renders no toast at all. The
+error names the half that SUCCEEDED so nobody re-rotates. `clone_actor` does
+NOT propagate — the actor is already committed — so `memories_copied` becomes an
+`Option` and the difference lands where an operator actually reads it, the
+action-log line that said *"(0 memories copied)"* for a copy that failed. That
+fix also closes a second, silent gap the MCP twin had already closed: an UNKNOWN
+count now RUNS the embedding backfill (bounded at the cap) instead of skipping
+it, so rows that DID land before the error are not left permanently invisible to
+semantic recall.
+
+**A plain-text report gets the same ledger.** `get_session_context` renders text
+and has no `measurement` object, so an earlier draft hand-rolled a
+`Vec<&'static str>` of unread sections. That was replaced by
+`talos_measurement::Readings` with only the RENDERING different — one home for
+the disclosure sentence and for the `report_field_not_measured` log event. Its
+three lists are what an agent reads as an inventory of what the user already
+has, and three empty ones say *"no ready workflows, nothing run recently,
+nothing matches"*, which is what pushes it to BUILD instead of REUSE.
+
+**`/mcp/local` now REFUSES, and the comment that stood there is why.** It read:
+*"a fresh database leaves agent.user_id = None, causing every user-scoped INSERT
+to write NULL and every user-scoped SELECT to return zero rows — tools appear to
+succeed but nothing persists."* The consequence was NAMED and not prevented —
+reported-success-on-a-failed-read for EVERY tool on the endpoint at once, which
+is the widest blast radius in this whole family. `Ok(None)` from the first read
+is still a genuinely fresh database and still creates the dev user; an `Err` from
+either read, or a creation that produced no user, refuses. The JSON-RPC
+notification check moved ABOVE the resolution so a refusal cannot put a body on a
+notification.
+
+**Two RECLASSIFICATIONS, stated with the field.** `get_execution_lineage`'s root
+lookup was repaired by the 2026-09-08 package and never re-verdicted: its `Err`
+arm still substitutes the anchor — there is no better id to walk from — but it
+sets `root_unreadable`, which renders `root_execution_id` as `null` and takes
+`lineage_note`'s FIRST arm. `import_workflow`'s `upsert_wasm_module` write still
+pushes the module onto `still_missing`, because it genuinely is not importable,
+but it now carries its REASON: FOUR of that list's five push sites are something
+other than "no source in bundle", and the sharpest is a DATABASE WRITE failure
+after a successful compile, which sent the operator to fix a bundle that was
+fine.
+
+**The DB tests are per-COLUMN, not per-table, and that is the design.**
+`controller/tests/claim_read_disclosure_tier5_tests` (14 tests, CTRL_TESTS per
+check 64b) drives the REAL MCP dispatch over a real `McpState`. Almost every
+site here needs one read of a table to SUCCEED and the NEXT read of the SAME
+table to FAIL, so the injection is `ALTER TABLE … DROP COLUMN <c>` where `<c>` is
+named by the second statement and not the first — `module_marketplace.name`
+(the leaderboard, not the aggregate), `module_marketplace.star_count`,
+`workflows.is_enabled` (the ownership read, not the version history),
+`workflows.readiness_score` (one session-context section, not the other two),
+`workflows.name` (the comparison set, not the source graph; the candidate
+listing, not the solo probe), `modules.category` (the two fallbacks, not the
+target lookup, which spells it `kind AS category`), `modules.config_schema` (the
+catalog listing, not the static tool count). That is a sharper instrument than a
+table drop and it is what makes these tests prove a per-FIELD disclosure rather
+than a blanket refusal. Every test carries its CONTROL in the same run, and the
+quickstart fixture asserts that its `vault://` reference actually REACHES the
+secrets branch, because a conditional assertion over a branch nobody entered
+proves nothing.
+
+**Six sites have no round trip and are said so rather than implied.**
+`get_config_suggestions` (2) refuses at its top for want of an LLM client;
+`import_workflow`'s write needs a real compile; `instantiate_workflow_pattern`
+(2) needs an installed AND compiled built-in pattern; `create_router`'s
+`/mcp/local` resolution is a closure inside the router builder. Those carry a
+SOURCE pin, which proves the expression is present and never that it produces
+the right answer. `talos-api`'s two have no injection either: `clone_actor`'s
+copy and `rotateEncryptionKey`'s count each read the same relation as the
+operation that must succeed before them. And `actor_recall`'s `key_exists_at_all`
+probe names NO column `recall_exact` does not, so no drop separates them — its
+two MEASURED arms are pinned and the `unknown` arm is not reachable from a
+relation-level injection.
+
+**Leg B — the CLAIM verdict as a lint leg was BUILT, MEASURED and REJECTED;
+`--count` stays 88.** On the fixed tree the candidate reports **0 claim and 0
+unclassified**, which is the zero baseline check 52's rule demands, and on
+pristine main it reports **32 of the 34**. It still fails, on three independent
+measurements. **(i)** A revert at a site this package RECLASSIFIED is completely
+green: the opt-out key is `(file, function, callee, spelling)`, which cannot tell
+the pre-fix expression from the post-fix one at the same call site — a verdict is
+a property of the CODE and the table can only name a LOCATION. **(ii)** The two
+mutations it does catch (`unwrap_or_default`, `if let Ok`) are caught ONLY
+because the table still carries the PRE-fix verdict for the 32 repaired rows.
+Simulated with those rows maintained — which is what *"what the default CLAIMS"*
+means once the default is gone — the `unwrap_or_default` mutation SURVIVES with a
+fully green report. **(iii)** A `.ok()` revert never reaches the CLAIM arm at all,
+because the spelling is part of the key; it lands in the ratchet arm. And the
+ratchet arm is the whole cost: it fires on every NEW collapsed read whatever its
+verdict, and packages 29 and 31 each ADDED two detector artefacts on CORRECT code,
+so it would have fired four times across the two most recent changes in this
+family against a 196-row hand-maintained table — check 74's own recorded rot mode
+and check 64's "a sweep is a snapshot, not a gate", one level up.
+
+What guards the class instead is what already guards it, and it is stronger than
+the grep would have been: sub-leg **74b**, whose scope is DERIVED (any function
+constructing a `Readings`), so the eight handlers that adopted a ledger here
+enrolled themselves; the `#[must_use]` three-valued lookups; the shared
+`utils::workflow_lookup_unreadable_error` so the "we could not read it" sentence
+has ONE home; and the DB tests above.
+
+**The whitespace-run artefact, third occurrence, and the mechanism is now
+known.** `get_platform_hygiene_report` rendered, live, *"A further 8 dormant
+workflow(s) are EXCLUDED from this list and this&nbsp;&nbsp;…&nbsp;&nbsp;count
+because an operator has already retired them"* with runs of 23 spaces — the
+`\`-continuation that lost its `\` and kept the indentation. The literal-aware
+walker is CHECKED IN as `scripts/lint-whitespace-runs.py` — a MEASUREMENT tool,
+not a lint, shipped because the previous two occurrences of this class each lost
+their detector with a worktree and a CLAUDE.md sentence must not cite an
+artefact the merge discards (the same reason `lint-swallow-classify.py` exists).
+It (escapes resolved, `\n` treated as a newline so
+embedded WAT and ASCII art do not read as prose, runs that FOLLOW a newline
+excluded as deliberate multi-line indentation) reports, on pristine
+`origin/main`, **200 literals carrying a ≥5-space run**, of which **14 hits fall
+on 6 DISTINCT literals that are mid-sentence prose** — **5 genuine defects**:
+this one, two in `talos-scheduler`'s `record_dispatch` call-site assertions, and
+two in the 2026-09-08 `compress_actor_context` test messages — and **1
+legitimate**, `talos-offhost-backup`'s aligned CLI help column. All five fixed;
+on the fixed tree the walker reports **185 literals and exactly 1 mid-sentence
+candidate**, which is that help column. **The CAUSE, found by making it twice in this very
+change**: a `\` at the end of a line inside a Python `'''…'''` string is a Python
+line continuation, so an edit script that writes Rust `\`-continuations through a
+non-raw triple-quoted string silently EATS them. Use a raw string. That is the
+first time this class has had a mechanism rather than a description, and it is
+why CLAUDE.md's earlier entries could only say "a continuation that lost its
+`\`". **No lint**: the measurement says the same thing package 23's did — 200
+literals carry a run and only 5 of them are defects, so a rule scoped by the run
+alone is ~2.5% precision, and even the mid-sentence narrowing ships at 1 marker
+on correct code. Telling prose from an aligned column is a judgement a grep
+cannot make.
+
+**`summary.note` renders as no key when there is nothing to say.** It was
+observed live as `"note": ""` — a field a reader cannot tell apart from a note
+the report failed to build, which is the shape this whole family removes.
+Verified before changing it: the hygiene report is MCP-only (no frontend
+consumer at all) and the single Rust reader is the degraded-path unit test,
+where the note is non-empty by construction. Both halves are pinned, and both
+mutations (re-emitting the key unconditionally; reinstating the broken literal)
+are RED.
+
+**What was measured and NOT changed.** The 121 remaining sites are 60
+decorative, 37 fail-closed, 31 false-positive and the 1 nominal `fail-open` that
+is the 2026-09-07 `dlq_updates` narrowing. None makes a claim. The detector's
+stated limits are unchanged and still bound what "zero" means: it is TEXTUAL, so
+a collapse reached through a helper in another crate or applied to an
+already-resolved local one statement later is invisible; `if let Some(..)` over
+an Option-returning read is structurally out of range (measured at ~6% precision
+when widened, and it is the shape the three worst fail-open gates took); and a
+verdict is a judgement about the RESPONSE, so it can be wrong where the response
+shape is not obvious from the call site. "Zero claims" means zero of the
+population this detector can see.
+
 ## The verifier that could never read the ledger it verified (#767)
 
 **Measured live 2026-09-06, and the shape is "presence is not function" at the

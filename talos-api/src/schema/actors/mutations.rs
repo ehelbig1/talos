@@ -1075,12 +1075,32 @@ impl ActorsMutations {
         // source-actor-ownership probe from the actual call could let a
         // ciphertext-passthrough cross-user clone slip through; the DEK
         // lineage is per-user and the wrapper fails closed on mismatch.
+        //
+        // 2026-09-08: `memories_copied` is an `Option`, matching the MCP twin
+        // `handle_clone_actor`, which took the same fix on 2026-09-02. `None`
+        // means the copy could not be MEASURED; `Some(0)` means the source had
+        // nothing to copy. Two things turned on the difference and both were
+        // wrong here:
+        //
+        //  * the action-log line an operator later reads in
+        //    `get_actor_action_log` said "(0 memories copied)" for a copy that
+        //    FAILED, which is indistinguishable from a source actor with an
+        //    empty memory — and this mutation returns an `ActorSummary`, which
+        //    carries no field the caller could have checked instead;
+        //  * the backfill below was SKIPPED on failure, so any rows that DID
+        //    land before the error stayed permanently invisible to semantic
+        //    recall. An UNKNOWN count now runs it, bounded at the cap — the
+        //    MCP twin's rule, verbatim.
+        /// Same cap the MCP twin uses for an UNKNOWN copy count — a bounded
+        /// backfill is right when the number of rows that landed is unknown.
+        const MAX_CLONE_BACKFILL_ROWS_GQL: i64 = 10_000;
+
         let actor_repo_for_clone = talos_actor_repository::ActorRepository::new(db_pool.clone());
-        let memories_copied: i64 = match actor_repo_for_clone
+        let memories_copied: Option<i64> = match actor_repo_for_clone
             .clone_actor_memories(user_id, new_id, id)
             .await
         {
-            Ok(n) => n,
+            Ok(n) => Some(n),
             Err(e) => {
                 tracing::warn!(
                     source_actor_id = %id,
@@ -1088,19 +1108,20 @@ impl ActorsMutations {
                     error = %e,
                     "clone_actor (gql): bulk memory copy failed"
                 );
-                0
+                None
             }
         };
 
         // The bulk copy skips embedding — trigger a targeted backfill
         // so cloned memories are immediately searchable.
-        if memories_copied > 0 {
+        if memories_copied != Some(0) {
+            let backfill_cap = memories_copied.unwrap_or(MAX_CLONE_BACKFILL_ROWS_GQL);
             let pool = db_pool.clone();
             tokio::spawn(async move {
                 if let Err(e) = talos_actor_memory_service::backfill_embeddings_for_actor(
                     &pool,
                     new_id,
-                    memories_copied.min(10_000),
+                    backfill_cap.min(MAX_CLONE_BACKFILL_ROWS_GQL),
                 )
                 .await
                 {
@@ -1119,11 +1140,21 @@ impl ActorsMutations {
             "created",
             None,
             None,
-            format!(
-                "Actor cloned from '{}' ({} memories copied) via dashboard",
-                src_name, memories_copied
-            ),
-            Some(serde_json::json!({ "cloned_from": id, "memories_copied": memories_copied })),
+            match memories_copied {
+                Some(n) => format!(
+                    "Actor cloned from '{}' ({} memories copied) via dashboard",
+                    src_name, n
+                ),
+                None => format!(
+                    "Actor cloned from '{}' (memory copy FAILED — count unknown, not zero) via dashboard",
+                    src_name
+                ),
+            },
+            Some(serde_json::json!({
+                "cloned_from": id,
+                "memories_copied": memories_copied,
+                "memory_copy_failed": memories_copied.is_none(),
+            })),
         );
         talos_actor_repository::spawn_log_action(
             db_pool.clone(),

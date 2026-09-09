@@ -815,7 +815,9 @@ async fn a_failed_key_retirement_rolls_back_rather_than_reporting_compressed() {
     let msg = error_message(&degraded);
     assert!(
         msg.contains("this actor's memory is unchanged"),
-        "a failed retirement must REFUSE. Pre-fix it defaulted to (0, 0) and          fell through to tx.commit(), answering status=compressed with          keys_retired=0. Got: {msg}"
+        "a failed retirement must REFUSE. Pre-fix it defaulted to (0, 0) and \
+         fell through to tx.commit(), answering status=compressed with \
+         keys_retired=0. Got: {msg}"
     );
 
     // Asserted on ROWS, not on the reply: a refusal that arrives after the
@@ -823,7 +825,9 @@ async fn a_failed_key_retirement_rolls_back_rather_than_reporting_compressed() {
     assert_eq!(
         count_memories(&pool, actor_id).await,
         before,
-        "the replacement must NOT have been committed without the retirement —          that committed state is memory GROWING under a response claiming it          shrank"
+        "the replacement must NOT have been committed without the retirement — \
+         that committed state is memory GROWING under a response claiming it \
+         shrank"
     );
     let orphan: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM actor_memory WHERE actor_id = $1 AND key = 'p31/condensed-2'",
