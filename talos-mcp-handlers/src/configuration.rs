@@ -1,5 +1,5 @@
 use super::types::JsonRpcResponse;
-use super::utils::{mcp_error, mcp_text, update_workflow_search_text};
+use super::utils::{mcp_denied, mcp_error, mcp_text, update_workflow_search_text};
 use super::{auth, McpState};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -339,7 +339,7 @@ async fn handle_get_workflow_graph_render(
         .await
     {
         Ok(Some(r)) => r,
-        Ok(None) => return mcp_error(req_id, -32000, "Workflow not found or access denied"),
+        Ok(None) => return mcp_denied(req_id, -32000, "Workflow not found or access denied"),
         Err(e) => {
             tracing::error!(workflow_id = %wf_id, error = %e, "get_session_context: workflow lookup failed");
             return crate::utils::database_error(req_id);

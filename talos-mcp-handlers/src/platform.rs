@@ -1,5 +1,5 @@
 use super::types::JsonRpcResponse;
-use super::utils::{mcp_error, mcp_text};
+use super::utils::{mcp_denied, mcp_error, mcp_text};
 use super::{auth, McpState};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -469,7 +469,7 @@ async fn handle_set_wasm_config(
         .await
         .unwrap_or(false);
     if !is_platform_admin {
-        return mcp_error(
+        return mcp_denied(
             req_id,
             -32601,
             "set_wasm_config requires platform-admin privileges. \
@@ -1623,7 +1623,7 @@ async fn handle_get_agent_card(
         .await
     {
         Ok(Some(i)) => i,
-        Ok(None) => return mcp_error(req_id, -32000, "Actor not found or access denied"),
+        Ok(None) => return mcp_denied(req_id, -32000, "Actor not found or access denied"),
         Err(e) => {
             tracing::error!(
                 actor_id = %actor_id,
@@ -2229,7 +2229,7 @@ async fn handle_get_secret_access_log(
         .await
         .unwrap_or(false);
     if !is_platform_admin {
-        return mcp_error(
+        return mcp_denied(
             req_id,
             -32601,
             "get_secret_access_log requires platform-admin privileges. \

@@ -312,7 +312,12 @@ pub fn load_worker_shared_key_logged(
 // MCP response helpers — re-exported from `talos-mcp` so callers retain
 // the existing `crate::utils::{mcp_error, mcp_text}` import path
 // while the canonical implementation lives in the shared crate.
-pub use talos_mcp::{mcp_error, mcp_text};
+//
+// `mcp_denied` / `mcp_not_found` / `mcp_failed` build the SAME BYTES as
+// `mcp_error` and additionally tell the instrument what the site meant —
+// see `talos_mcp::McpErrorKind` for why that statement cannot live in the
+// reply, and `crate::tool_labels::classify_outcome` for what reads it.
+pub use talos_mcp::{mcp_denied, mcp_error, mcp_failed, mcp_not_found, mcp_text};
 
 /// Map a `talos_execution_orchestration::OrchestrationError` to a
 /// JSON-RPC error response with the canonical user-facing message
@@ -1094,7 +1099,7 @@ pub fn require_node_id(
 /// prevents information disclosure (an attacker can't probe workflow IDs
 /// for existence by comparing error messages).
 pub fn workflow_not_found_error(req_id: Option<serde_json::Value>) -> JsonRpcResponse {
-    mcp_error(req_id, -32000, "Workflow not found or access denied")
+    mcp_denied(req_id, -32000, "Workflow not found or access denied")
 }
 
 /// Standard response for a workflow lookup that could not be READ.
@@ -1118,14 +1123,18 @@ pub fn workflow_lookup_unreadable_error(req_id: Option<serde_json::Value>) -> Js
 
 /// Standard response for "execution not found or access denied".
 pub fn execution_not_found_error(req_id: Option<serde_json::Value>) -> JsonRpcResponse {
-    mcp_error(req_id, -32000, "Execution not found or access denied")
+    mcp_denied(req_id, -32000, "Execution not found or access denied")
 }
 
 /// Standard generic database error. Keep the caller's DB error in the log
 /// (via tracing) but return this generic message to avoid leaking DB schema
 /// details to MCP clients.
 pub fn database_error(req_id: Option<serde_json::Value>) -> JsonRpcResponse {
-    mcp_error(req_id, -32000, "Database error")
+    // `mcp_failed`, not `mcp_error`: this is the canonical FAILURE funnel —
+    // 50 call sites — so saying so at the one home means every one of them
+    // is classified without a per-site edit, and means a `Failed` statement
+    // exists that is not merely defensive. Same bytes.
+    mcp_failed(req_id, -32000, "Database error")
 }
 
 /// Block dispatch handlers when the operator has paused the execution
@@ -1140,7 +1149,7 @@ pub async fn enforce_executions_not_paused(
 ) -> Result<(), JsonRpcResponse> {
     match workflow_repo.is_execution_paused().await {
         Ok(false) => Ok(()),
-        Ok(true) => Err(mcp_error(
+        Ok(true) => Err(mcp_denied(
             req_id,
             -32000,
             "Execution queue is paused. Use resume_executions to re-enable.",
@@ -1277,17 +1286,17 @@ pub fn actor_dispatch_lifecycle_to_response(
     use talos_workflow_authorization::ActorDispatchLifecycle;
     match result {
         Ok(ActorDispatchLifecycle::Ok) => Ok(()),
-        Ok(ActorDispatchLifecycle::Archived) => Err(mcp_error(
+        Ok(ActorDispatchLifecycle::Archived) => Err(mcp_denied(
             req_id,
             -32000,
             "Actor is archived — archived actors cannot dispatch executions.",
         )),
-        Ok(ActorDispatchLifecycle::Terminated) => Err(mcp_error(
+        Ok(ActorDispatchLifecycle::Terminated) => Err(mcp_denied(
             req_id,
             -32000,
             "Actor is terminated — terminated actors cannot dispatch executions.",
         )),
-        Ok(ActorDispatchLifecycle::NotFound) => Err(mcp_error(
+        Ok(ActorDispatchLifecycle::NotFound) => Err(mcp_denied(
             req_id,
             -32000,
             "Actor not found or access denied",
@@ -1317,12 +1326,12 @@ pub fn creator_auth_error_to_response(
 ) -> JsonRpcResponse {
     use talos_workflow_authorization::CreatorAuthError;
     match err {
-        CreatorAuthError::ActorNotFoundOrInactive => mcp_error(
+        CreatorAuthError::ActorNotFoundOrInactive => mcp_denied(
             req_id,
             -32002,
             "Actor not found, not active, or belongs to a different user",
         ),
-        CreatorAuthError::BudgetExhausted { limit } => mcp_error(
+        CreatorAuthError::BudgetExhausted { limit } => mcp_denied(
             req_id,
             -32000,
             &format!(
@@ -1335,7 +1344,7 @@ pub fn creator_auth_error_to_response(
             max_world,
             req_rank,
             max_rank,
-        } => mcp_error(
+        } => mcp_denied(
             req_id,
             -32003,
             &format!(
@@ -1368,29 +1377,29 @@ pub fn trigger_auth_error_to_response(
 ) -> JsonRpcResponse {
     use talos_workflow_authorization::TriggerAuthError;
     match err {
-        TriggerAuthError::ActorArchived => mcp_error(
+        TriggerAuthError::ActorArchived => mcp_denied(
             req_id,
             -32000,
             "Actor is archived — this is an IRREVERSIBLE terminal state. \
              Archived actors cannot dispatch executions. Create a new actor instead.",
         ),
-        TriggerAuthError::ActorTerminated => mcp_error(
+        TriggerAuthError::ActorTerminated => mcp_denied(
             req_id,
             -32000,
             "Actor is terminated — this is an IRREVERSIBLE terminal state. \
              Terminated actors cannot dispatch executions. Create a new actor instead.",
         ),
         TriggerAuthError::ActorNotFoundOrInactive => {
-            mcp_error(req_id, -32000, "Actor not found or access denied")
+            mcp_denied(req_id, -32000, "Actor not found or access denied")
         }
-        TriggerAuthError::ExecutionDenied(msg) => mcp_error(req_id, -32000, &msg),
+        TriggerAuthError::ExecutionDenied(msg) => mcp_denied(req_id, -32000, &msg),
         TriggerAuthError::CapabilityCeilingViolation {
             module_id,
             module_world,
             max_world,
             req_rank,
             max_rank,
-        } => mcp_error(
+        } => mcp_denied(
             req_id,
             -32003,
             &format!(
@@ -1469,6 +1478,7 @@ pub fn resource_not_found_error(id: Option<serde_json::Value>, uri: &str) -> Jso
             message: format!("Resource not found: {}", uri),
             data: None,
         }),
+        error_kind: None,
     }
 }
 
@@ -2042,6 +2052,7 @@ pub(crate) fn mcp_text_with_json(
             ]
         })),
         error: None,
+        error_kind: None,
     }
 }
 
@@ -2966,6 +2977,71 @@ mod auth_error_response_tests {
         assert_eq!(result["isError"], serde_json::Value::Bool(true));
         assert!(resp.error.is_none());
         (code, text)
+    }
+
+    // ── The package-35 invariant, at the two funnels that matter ─────────
+
+    /// THE REPLY-BYTE PIN for the two shared authorization funnels.
+    ///
+    /// These are behind every `create_*` and every trigger/call/bulk/enqueue
+    /// path, so they are the highest-leverage sites the classification
+    /// touched. The pin is on the SERIALIZED reply and it is checked in the
+    /// same test as the classification, so the two claims — "the operator can
+    /// now tell them apart" and "the caller cannot" — cannot be satisfied
+    /// separately.
+    #[test]
+    fn the_auth_funnels_classify_without_moving_a_single_reply_byte() {
+        use talos_metrics::{McpToolOutcome, OutcomeClass};
+        let id = || Some(serde_json::json!(4));
+        let cases: Vec<(talos_mcp::JsonRpcResponse, McpToolOutcome, &str)> = vec![
+            (
+                trigger_auth_error_to_response(TriggerAuthError::ActorNotFoundOrInactive, id()),
+                McpToolOutcome::Denied,
+                r#"{"jsonrpc":"2.0","id":4,"result":{"content":[{"text":"Actor not found or access denied","type":"text"}],"errorCode":-32000,"isError":true}}"#,
+            ),
+            (
+                trigger_auth_error_to_response(
+                    TriggerAuthError::ExecutionDenied("Execution queue is paused.".to_string()),
+                    id(),
+                ),
+                McpToolOutcome::Denied,
+                r#"{"jsonrpc":"2.0","id":4,"result":{"content":[{"text":"Execution queue is paused.","type":"text"}],"errorCode":-32000,"isError":true}}"#,
+            ),
+            (
+                creator_auth_error_to_response(CreatorAuthError::ActorNotFoundOrInactive, id()),
+                McpToolOutcome::Denied,
+                r#"{"jsonrpc":"2.0","id":4,"result":{"content":[{"text":"Actor not found, not active, or belongs to a different user","type":"text"}],"errorCode":-32002,"isError":true}}"#,
+            ),
+            (
+                super::database_error(id()),
+                McpToolOutcome::Error,
+                r#"{"jsonrpc":"2.0","id":4,"result":{"content":[{"text":"Database error","type":"text"}],"errorCode":-32000,"isError":true}}"#,
+            ),
+        ];
+        for (resp, outcome, wire) in cases {
+            assert_eq!(
+                serde_json::to_string(&resp).expect("serialize"),
+                wire,
+                "a funnel's reply bytes moved — an MCP client sees a different \
+                 response than it did before package 35"
+            );
+            assert_eq!(crate::tool_labels::classify_outcome(&resp), outcome);
+        }
+        // The two `-32000` funnels above answer OPPOSITE class questions on
+        // the SAME code and with an indistinguishable reply. That is the
+        // whole package in four lines.
+        assert_eq!(
+            crate::tool_labels::classify_outcome(&trigger_auth_error_to_response(
+                TriggerAuthError::ActorNotFoundOrInactive,
+                None
+            ))
+            .class(),
+            OutcomeClass::Declined
+        );
+        assert_eq!(
+            crate::tool_labels::classify_outcome(&super::database_error(None)).class(),
+            OutcomeClass::Finding
+        );
     }
 
     // ── Creator-side ──────────────────────────────────────────────────────

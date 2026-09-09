@@ -63,7 +63,7 @@
 use futures::StreamExt;
 use std::future::Future;
 use std::sync::Arc;
-use talos_metrics::{RpcOutcome, RpcOutcomeClass, RpcSubject};
+use talos_metrics::{OutcomeClass, RpcOutcome, RpcSubject};
 use talos_task_supervision::{spawn_supervised, BackgroundTask, TaskExit};
 
 /// Per-subscriber wiring for [`spawn_rpc_subscriber`].
@@ -349,17 +349,17 @@ pub(crate) fn record_rpc_metric(
     // `talos_rpc_calls_total` / `talos_rpc_duration_seconds` without turning
     // on a log level.
     match outcome_class {
-        RpcOutcomeClass::Served => tracing::debug!(
+        OutcomeClass::Served => tracing::debug!(
             target: "talos_rpc",
             subject, actor_id = %actor_id, outcome, queue_ms, exec_ms, duration_ms,
             "rpc completed"
         ),
-        RpcOutcomeClass::Declined => tracing::info!(
+        OutcomeClass::Declined => tracing::info!(
             target: "talos_rpc",
             subject, actor_id = %actor_id, outcome, queue_ms, exec_ms, duration_ms,
             "rpc declined"
         ),
-        RpcOutcomeClass::Finding => tracing::warn!(
+        OutcomeClass::Finding => tracing::warn!(
             target: "talos_rpc",
             subject, actor_id = %actor_id, outcome, queue_ms, exec_ms, duration_ms,
             "rpc completed (non-ok outcome)"
@@ -442,9 +442,9 @@ mod kernel_tests {
         // class cannot be added without deciding its level here.
         for outcome in RpcOutcome::ALL {
             let expected = match outcome.class() {
-                RpcOutcomeClass::Served => tracing::Level::DEBUG,
-                RpcOutcomeClass::Declined => tracing::Level::INFO,
-                RpcOutcomeClass::Finding => tracing::Level::WARN,
+                OutcomeClass::Served => tracing::Level::DEBUG,
+                OutcomeClass::Declined => tracing::Level::INFO,
+                OutcomeClass::Finding => tracing::Level::WARN,
             };
             let cap = LevelCapture::default();
             let subscriber = Registry::default()

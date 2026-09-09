@@ -12,7 +12,7 @@
 //!   provenance (correlation of memory relevance with judge outcome). Read-only.
 
 use super::types::JsonRpcResponse;
-use super::utils::{mcp_error, mcp_text};
+use super::utils::{mcp_denied, mcp_error, mcp_text};
 use super::McpState;
 use serde_json::Value;
 use std::sync::Arc;
@@ -61,7 +61,7 @@ pub async fn dispatch(
         return None;
     }
     let Some(user_id) = agent.user_id else {
-        return Some(mcp_error(
+        return Some(mcp_denied(
             req_id,
             -32000,
             "memory evaluation tools require a user-bound agent identity",
@@ -88,15 +88,45 @@ fn eval_service(state: &McpState) -> EvaluationService {
     )
 }
 
+/// A refusal from the tenancy gate below: the caller-facing message
+/// (unchanged, and deliberately reason-blind) plus what the gate MEANT.
+///
+/// The two arms were already split for the operator reading the REPLY — this
+/// helper is the one CLAUDE.md names as having "had the correct shape all
+/// along" — but both went out through one `mcp_error(req_id, -32004, &m)`, so
+/// the instrument could not tell a tenancy refusal from a database fault.
+/// BOTH `-32004` sites in this workspace are that one call, which is why the
+/// wire code alone can never classify them.
+struct ActorOwnerRefusal {
+    kind: talos_mcp::McpErrorKind,
+    msg: &'static str,
+}
+
+impl ActorOwnerRefusal {
+    fn response(&self, req_id: Option<Value>) -> JsonRpcResponse {
+        talos_mcp::mcp_error_kind(req_id, -32004, self.kind, self.msg)
+    }
+}
+
 /// Tenancy gate: the actor must be owned by the calling user. Both eval tools
 /// read/act on actor-scoped data, so a foreign `actor_id` must be refused
 /// (defense in depth alongside the user-scoped execution reads). A single
 /// not-found/foreign message avoids enumerating other tenants' actor ids.
-async fn ensure_actor_owner(state: &McpState, actor_id: Uuid, user_id: Uuid) -> Result<(), String> {
+async fn ensure_actor_owner(
+    state: &McpState,
+    actor_id: Uuid,
+    user_id: Uuid,
+) -> Result<(), ActorOwnerRefusal> {
     match state.actor_repo.get_actor_owner_user_id(actor_id).await {
         Ok(Some(owner)) if owner == user_id => Ok(()),
-        Ok(_) => Err("actor not found or not owned by you".to_string()),
-        Err(_) => Err("actor ownership check failed".to_string()),
+        Ok(_) => Err(ActorOwnerRefusal {
+            kind: talos_mcp::McpErrorKind::Denied,
+            msg: "actor not found or not owned by you",
+        }),
+        Err(_) => Err(ActorOwnerRefusal {
+            kind: talos_mcp::McpErrorKind::Failed,
+            msg: "actor ownership check failed",
+        }),
     }
 }
 
@@ -127,7 +157,7 @@ async fn handle_run_ab_eval(
         Err(m) => return mcp_error(req_id, -32602, &m),
     };
     if let Err(m) = ensure_actor_owner(state, actor_id, user_id).await {
-        return mcp_error(req_id, -32004, &m);
+        return m.response(req_id);
     }
     let Some(task_vals) = args.get("tasks").and_then(|v| v.as_array()) else {
         return mcp_error(req_id, -32602, "missing 'tasks' array");
@@ -189,7 +219,7 @@ async fn handle_grounding_report(
         Err(m) => return mcp_error(req_id, -32602, &m),
     };
     if let Err(m) = ensure_actor_owner(state, actor_id, user_id).await {
-        return mcp_error(req_id, -32004, &m);
+        return m.response(req_id);
     }
     let since_days = args
         .get("since_days")

@@ -1,5 +1,5 @@
 use super::types::JsonRpcResponse;
-use super::utils::{mcp_error, mcp_text};
+use super::utils::{mcp_denied, mcp_error, mcp_text};
 use super::{auth, McpState};
 use serde_json::Value;
 use std::sync::Arc;
@@ -419,7 +419,7 @@ async fn handle_pause_schedule(
     let sched_repo = talos_schedule_repo::ScheduleRepository::new(state.db_pool.clone());
     match sched_repo.set_enabled(schedule_id, user_id, false).await {
         Ok(rows) if rows > 0 => mcp_text(req_id, &format!("Schedule {} paused.", schedule_id)),
-        Ok(_) => mcp_error(req_id, -32000, "Schedule not found or access denied"),
+        Ok(_) => mcp_denied(req_id, -32000, "Schedule not found or access denied"),
         Err(e) => {
             tracing::error!("pause_schedule failed: {:#}", e);
             mcp_error(req_id, -32000, "Failed to pause schedule")
@@ -441,7 +441,7 @@ async fn handle_resume_schedule(
     let sched_repo = talos_schedule_repo::ScheduleRepository::new(state.db_pool.clone());
     match sched_repo.set_enabled(schedule_id, user_id, true).await {
         Ok(rows) if rows > 0 => mcp_text(req_id, &format!("Schedule {} resumed.", schedule_id)),
-        Ok(_) => mcp_error(req_id, -32000, "Schedule not found or access denied"),
+        Ok(_) => mcp_denied(req_id, -32000, "Schedule not found or access denied"),
         Err(e) => {
             tracing::error!("resume_schedule failed: {:#}", e);
             mcp_error(req_id, -32000, "Failed to resume schedule")
@@ -463,7 +463,7 @@ async fn handle_delete_schedule(
     let sched_repo = talos_schedule_repo::ScheduleRepository::new(state.db_pool.clone());
     match sched_repo.delete(schedule_id, user_id).await {
         Ok(rows) if rows > 0 => mcp_text(req_id, &format!("Schedule {} deleted.", schedule_id)),
-        Ok(_) => mcp_error(req_id, -32000, "Schedule not found or access denied"),
+        Ok(_) => mcp_denied(req_id, -32000, "Schedule not found or access denied"),
         Err(e) => {
             tracing::error!("delete_schedule failed: {:#}", e);
             mcp_error(req_id, -32000, "Failed to delete schedule")
@@ -574,7 +574,7 @@ async fn handle_get_schedule_health(
         .await
     {
         Ok(Some(r)) => r,
-        Ok(None) => return mcp_error(req_id, -32000, "Schedule not found or access denied"),
+        Ok(None) => return mcp_denied(req_id, -32000, "Schedule not found or access denied"),
         Err(e) => {
             tracing::error!(
                 target: "talos_schedules",

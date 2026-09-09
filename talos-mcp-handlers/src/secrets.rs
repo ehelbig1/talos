@@ -1,5 +1,5 @@
 use super::types::JsonRpcResponse;
-use super::utils::{mcp_error, mcp_text};
+use super::utils::{mcp_denied, mcp_error, mcp_text};
 use super::{auth, McpState};
 use serde_json::Value;
 use std::sync::Arc;
@@ -305,7 +305,7 @@ async fn handle_list_secret_usage(
     // template required path that the operator hasn't created yet —
     // operator wants to see those references).
     if secret_lookup.is_none() && modules.is_empty() {
-        return mcp_error(req_id, -32000, "Secret not found or access denied");
+        return mcp_denied(req_id, -32000, "Secret not found or access denied");
     }
     let key_path = secret_lookup
         .as_ref()
@@ -906,7 +906,7 @@ async fn handle_refresh_oauth_token(
     };
     if path_user_id != user_id {
         // Do not reveal whether the target user exists — generic message.
-        return mcp_error(
+        return mcp_denied(
             req_id,
             -32601,
             "cannot refresh OAuth tokens for another user — path user_id does not match caller",

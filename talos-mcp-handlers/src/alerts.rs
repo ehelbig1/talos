@@ -1,5 +1,5 @@
 use super::types::JsonRpcResponse;
-use super::utils::{mcp_error, mcp_text};
+use super::utils::{mcp_denied, mcp_error, mcp_text};
 use super::{auth, McpState};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -222,7 +222,7 @@ async fn handle_acknowledge_alert(
             .unwrap_or_default(),
         ),
         Ok(AckOutcome::NotFound) => {
-            mcp_error(req_id, -32000, "Alert not found or access denied")
+            mcp_denied(req_id, -32000, "Alert not found or access denied")
         }
         Err(e) => {
             tracing::error!("acknowledge_alert failed: {:#}", e);

@@ -1,5 +1,5 @@
 use super::types::JsonRpcResponse;
-use super::utils::{mcp_error, mcp_text};
+use super::utils::{mcp_denied, mcp_error, mcp_failed, mcp_text};
 use super::{auth, McpState};
 use serde_json::Value;
 use std::sync::Arc;
@@ -104,7 +104,7 @@ async fn require_owned_actor(
         .await
     {
         Ok(Some(_)) => Ok(actor_id),
-        Ok(None) => Err(mcp_error(
+        Ok(None) => Err(mcp_denied(
             req_id,
             -32000,
             "Actor not found or access denied",
@@ -119,7 +119,7 @@ async fn require_owned_actor(
                 actor_id = %actor_id,
                 "knowledge-graph actor ownership lookup failed"
             );
-            Err(mcp_error(
+            Err(mcp_failed(
                 req_id,
                 -32000,
                 "Could not verify actor ownership — the actor registry is \

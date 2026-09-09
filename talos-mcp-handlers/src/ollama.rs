@@ -1,5 +1,5 @@
 use super::types::JsonRpcResponse;
-use super::utils::{mcp_error, mcp_text};
+use super::utils::{mcp_denied, mcp_error, mcp_text};
 use super::McpState;
 use serde_json::Value;
 use std::sync::Arc;
@@ -151,7 +151,7 @@ async fn handle_pull_model(
         .await
         .unwrap_or(false);
     if !is_platform_admin {
-        return mcp_error(
+        return mcp_denied(
             req_id,
             -32601,
             "ollama_pull_model requires platform-admin privileges. \
@@ -244,7 +244,7 @@ async fn handle_delete_model(
         .await
         .unwrap_or(false);
     if !is_platform_admin {
-        return mcp_error(
+        return mcp_denied(
             req_id,
             -32601,
             "ollama_delete_model requires platform-admin privileges. \

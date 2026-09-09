@@ -1,5 +1,5 @@
 use super::types::JsonRpcResponse;
-use super::utils::{mcp_error, mcp_text, validate_dependencies};
+use super::utils::{mcp_denied, mcp_error, mcp_text, validate_dependencies};
 use super::{auth, McpState};
 use serde_json::Value;
 use std::sync::Arc;
@@ -797,7 +797,7 @@ async fn handle_generate_typed_scaffold(
             .await
         {
             Ok(true) => {}
-            Ok(false) => return mcp_error(req_id, -32000, "Module not found or access denied"),
+            Ok(false) => return mcp_denied(req_id, -32000, "Module not found or access denied"),
             Err(e) => {
                 tracing::error!(
                     "generate_typed_scaffold module ownership check failed: {:#}",
@@ -1193,6 +1193,7 @@ async fn handle_compile_custom_sandbox(
                     ]
                 })),
                 error: None,
+                error_kind: None,
             };
         }
         // User wants a different name — fall through to normal compilation
@@ -1443,6 +1444,7 @@ async fn handle_compile_custom_sandbox(
                     ]
                 })),
                 error: None,
+                error_kind: None,
             }
         }
         Ok(res) => {
@@ -1470,6 +1472,7 @@ async fn handle_compile_custom_sandbox(
                     "isError": true
                 })),
                 error: None,
+                error_kind: None,
             }
         }
         Err(e) => mcp_error(
@@ -2669,7 +2672,7 @@ async fn handle_update_module_secrets(
     };
 
     if nt_rows == 0 && wm_rows == 0 {
-        return Some(mcp_error(
+        return Some(mcp_denied(
             req_id,
             -32000,
             "Module not found or access denied",
@@ -2832,7 +2835,7 @@ async fn handle_update_module_hosts(
     };
 
     if rows == 0 {
-        return Some(mcp_error(
+        return Some(mcp_denied(
             req_id,
             -32000,
             "Module not found or access denied",
@@ -2972,7 +2975,7 @@ async fn handle_update_module_methods(
     };
 
     if rows == 0 {
-        return Some(mcp_error(
+        return Some(mcp_denied(
             req_id,
             -32000,
             "Module not found or access denied",
@@ -3232,7 +3235,7 @@ async fn handle_test_module(
                 }
                 Err(e) => {
                     tracing::error!("Failed to load module/template {}: {}", module_id, e);
-                    return Some(mcp_error(
+                    return Some(mcp_denied(
                         req_id.clone(),
                         -32000,
                         "Module not found or access denied",

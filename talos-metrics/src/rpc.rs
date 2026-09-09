@@ -27,60 +27,12 @@
 //! originals by `the_subject_table_matches_the_wire_constants` in
 //! `talos-rpc-subscribers`, where both are visible. Same shape, same reason,
 //! as [`crate::RPC_WRITE_CEILING_SUBJECTS`] (#760).
+//!
+//! The class partition itself moved to [`crate::outcome_class`] when the MCP
+//! surface needed the same three values; see that module for why it is one
+//! type and not one per surface.
 
-/// What an outcome means to an OPERATOR, which is a different question from
-/// what it means to the caller.
-///
-/// This is the ONE home the `talos_rpc` log level rests on, the `class` label
-/// on [`crate::TalosMetrics::rpc_calls_total`], and therefore the one home a
-/// future alert selector rests on too. Modelled on
-/// `talos_task_supervision::TaskExit::is_finding` (#780): the question is not
-/// "did the platform fail" but "should someone look at this".
-///
-/// Before this existed the partition was binary — `outcome == "ok"` was
-/// `debug!` and EVERYTHING else was `warn!` — so a designed pre-promotion
-/// state produced 53% of the controller's entire WARN volume, hourly,
-/// forever. That is check 69's harm: a level that fires forever on a healthy
-/// fleet trains operators to ignore that level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum RpcOutcomeClass {
-    /// The call was answered. High volume, routine, uninteresting on its own.
-    Served,
-    /// The platform answered CORRECTLY by declining: a policy refusal, a
-    /// designed lifecycle state, a configured cap, or a caller error the
-    /// caller was told about. A healthy fleet produces these and no operator
-    /// action follows from one of them.
-    Declined,
-    /// Someone should look: either the platform could not serve the call, or
-    /// the call should not have arrived in the shape it did.
-    Finding,
-}
-
-impl RpcOutcomeClass {
-    /// The one predicate. Named for #780's precedent so the two read alike.
-    #[must_use]
-    pub const fn is_finding(self) -> bool {
-        matches!(self, Self::Finding)
-    }
-
-    /// The `class` label value.
-    ///
-    /// Three compile-time values, and `class` is a pure function of `outcome`,
-    /// so this label adds NO series: every `(subject, outcome)` has exactly
-    /// one class.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Served => "served",
-            Self::Declined => "declined",
-            Self::Finding => "finding",
-        }
-    }
-
-    /// Every variant, for the tests and for anything that must enumerate the
-    /// partition.
-    pub const ALL: &'static [Self] = &[Self::Served, Self::Declined, Self::Finding];
-}
+use crate::OutcomeClass;
 
 macro_rules! rpc_outcome_table {
     ($( $(#[$m:meta])* $variant:ident = $label:literal => $class:ident ; )+) => {
@@ -108,11 +60,11 @@ macro_rules! rpc_outcome_table {
             }
 
             /// What this outcome means to an operator. See
-            /// [`RpcOutcomeClass`]; the per-variant argument is on each
+            /// [`OutcomeClass`]; the per-variant argument is on each
             /// variant's own doc comment.
             #[must_use]
-            pub const fn class(self) -> RpcOutcomeClass {
-                match self { $( Self::$variant => RpcOutcomeClass::$class, )+ }
+            pub const fn class(self) -> OutcomeClass {
+                match self { $( Self::$variant => OutcomeClass::$class, )+ }
             }
         }
     };
@@ -338,7 +290,7 @@ mod tests {
         assert_eq!(outs.len(), RpcOutcome::ALL.len());
         let subs: HashSet<&str> = RpcSubject::ALL.iter().map(|s| s.as_str()).collect();
         assert_eq!(subs.len(), RpcSubject::ALL.len());
-        let classes: HashSet<&str> = RpcOutcomeClass::ALL.iter().map(|c| c.as_str()).collect();
+        let classes: HashSet<&str> = OutcomeClass::ALL.iter().map(|c| c.as_str()).collect();
         assert_eq!(classes.len(), 3);
     }
 
@@ -350,7 +302,7 @@ mod tests {
     /// alert, in one edit, silently.
     #[test]
     fn the_partition_is_the_one_that_was_argued() {
-        let of = |c: RpcOutcomeClass| {
+        let of = |c: OutcomeClass| {
             let mut v: Vec<&str> = RpcOutcome::ALL
                 .iter()
                 .filter(|o| o.class() == c)
@@ -359,9 +311,9 @@ mod tests {
             v.sort_unstable();
             v
         };
-        assert_eq!(of(RpcOutcomeClass::Served), vec!["ok"]);
+        assert_eq!(of(OutcomeClass::Served), vec!["ok"]);
         assert_eq!(
-            of(RpcOutcomeClass::Declined),
+            of(OutcomeClass::Declined),
             vec![
                 "always_blocked",
                 "disallowed_function",
@@ -374,7 +326,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            of(RpcOutcomeClass::Finding),
+            of(OutcomeClass::Finding),
             vec![
                 "connection_failed",
                 "internal",
@@ -391,7 +343,7 @@ mod tests {
         for o in RpcOutcome::ALL {
             assert_eq!(
                 o.class().is_finding(),
-                o.class() == RpcOutcomeClass::Finding,
+                o.class() == OutcomeClass::Finding,
                 "{}",
                 o.as_str()
             );

@@ -592,6 +592,7 @@ pub fn create_router(
                                 message: "Method not found".to_string(),
                                 data: None,
                             }),
+                            error_kind: None,
                         },
                     };
                     Json(response).into_response()
@@ -622,6 +623,7 @@ fn local_identity_refusal(id: Option<serde_json::Value>) -> JsonRpcResponse {
                 .to_string(),
             data: None,
         }),
+        error_kind: None,
     }
 }
 
@@ -846,6 +848,7 @@ async fn message_handler(
                     .to_string(),
                 data: None,
             }),
+            error_kind: None,
         };
         // Send rate-limited response via SSE to this agent only
         {
@@ -883,6 +886,7 @@ async fn message_handler(
                 message: "Method not found".to_string(),
                 data: None,
             }),
+            error_kind: None,
         },
     };
 
@@ -925,6 +929,7 @@ async fn streamable_http_handler(
                 message: "Rate limit exceeded".to_string(),
                 data: None,
             }),
+            error_kind: None,
         };
         return (
             [(axum::http::header::CONTENT_TYPE, "application/json")],
@@ -967,6 +972,7 @@ async fn streamable_http_handler(
                 message: "Method not found".to_string(),
                 data: None,
             }),
+            error_kind: None,
         },
     };
 
@@ -1160,6 +1166,7 @@ pub(crate) fn handle_initialize(req: JsonRpcRequest) -> JsonRpcResponse {
         id: req.id,
         result: Some(result),
         error: None,
+        error_kind: None,
     }
 }
 
@@ -1212,6 +1219,7 @@ async fn handle_tools_list(
                             .to_string(),
                     data: None,
                 }),
+                error_kind: None,
             };
         }
     };
@@ -1364,6 +1372,7 @@ async fn handle_tools_list(
         id: req.id,
         result: Some(serde_json::json!({ "tools": tools })),
         error: None,
+        error_kind: None,
     }
 }
 
@@ -1411,18 +1420,28 @@ pub async fn handle_tools_call(
     let outcome = crate::tool_labels::classify_outcome(&response);
     talos_metrics::record_mcp_tool_call(tool, outcome, elapsed);
 
-    // ONE structured line per call. `tool`, `outcome`, `duration_ms` and the
-    // request id ONLY: never the arguments, never the response, never a
-    // token. The arguments are the caller's payload and this line reaches
-    // container stdout, which is as public as the log pipeline that ships it.
+    // ONE structured line per call. `tool`, `outcome`, `class`,
+    // `duration_ms` and the request id ONLY: never the arguments, never the
+    // response, never a token. The arguments are the caller's payload and
+    // this line reaches container stdout, which is as public as the log
+    // pipeline that ships it.
+    //
+    // The MESSAGE is "MCP tool call", not "MCP tool call served": the live
+    // line for this fleet's first refusal read `"MCP tool call served" …
+    // outcome="error"`, i.e. fixed prose asserting the call was served next
+    // to a field saying it was not. Same defect as this package's subject,
+    // one field over. `class` rides beside `outcome` for the same reason it
+    // rides on the metric — it is what an operator greps when the question is
+    // "is the platform declining, or failing?".
     tracing::info!(
         target: "talos_mcp",
         event_kind = "mcp_tool_call",
         tool,
         outcome = outcome.as_str(),
+        class = outcome.class().as_str(),
         duration_ms = elapsed.as_secs_f64() * 1000.0,
         request_id = %request_id,
-        "MCP tool call served"
+        "MCP tool call"
     );
 
     response
