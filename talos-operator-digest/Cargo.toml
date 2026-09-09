@@ -16,6 +16,10 @@ tracing.workspace = true
 talos-analytics-repository = { path = "../talos-analytics-repository" }
 talos-execution-repository = { path = "../talos-execution-repository" }
 talos-actor-repository = { path = "../talos-actor-repository" }
+# For INERT_LOOKBACK_MIN_SHORTFALL_DAYS — the threshold at which the digest calls
+# the lookback knob inert must be the SAME constant the training tick's own WARN
+# uses, or the log and the report can disagree about one fit.
+talos-memory-ranking = { path = "../talos-memory-ranking" }
 talos-memory = { path = "../talos-memory" }
 talos-ops-alerts-repository = { path = "../talos-ops-alerts-repository" }
 talos-schedule-repo = { path = "../talos-schedule-repo" }

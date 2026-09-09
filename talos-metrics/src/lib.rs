@@ -46,6 +46,25 @@ pub const RPC_WRITE_CEILING_SUBJECTS: [&str; 3] = [
 /// unfireable on the one series that matters.
 pub const SCHEDULER_DISPATCH_PHASES: [&str; 2] = [SCHEDULER_PHASE_STARTUP, SCHEDULER_PHASE_STEADY];
 
+/// The complete, closed set of `coverage` label values on
+/// `talos_rank_training_fetches_total`.
+///
+/// The two values PARTITION every per-actor training fetch: the fetch either
+/// reached the end of the configured lookback window or it hit its row cap
+/// first. Shared by the pre-seed loop in [`TalosMetrics::new`] and by the one
+/// emitting site in `talos_memory_ranking`, so a value cannot be emitted
+/// without also being seeded.
+pub const RANK_TRAINING_FETCH_COVERAGES: [&str; 2] = [
+    RANK_TRAINING_COVERAGE_COMPLETE,
+    RANK_TRAINING_COVERAGE_TRUNCATED,
+];
+
+/// The fetch read every row in the configured lookback window.
+pub const RANK_TRAINING_COVERAGE_COMPLETE: &str = "complete";
+/// The fetch hit its per-actor row cap, so the OLDEST part of the configured
+/// window was never read.
+pub const RANK_TRAINING_COVERAGE_TRUNCATED: &str = "truncated";
+
 /// The startup backlog: schedules found due by the FIRST poll after boot.
 pub const SCHEDULER_PHASE_STARTUP: &str = "startup";
 /// Every poll after the first one.
@@ -115,6 +134,44 @@ pub fn set_global(metrics: Arc<TalosMetrics>) {
 /// use `.map(|m| m.counter.inc())` idiom — never unwrap.
 pub fn global() -> Option<&'static Arc<TalosMetrics>> {
     METRICS.get()
+}
+
+/// Record one per-actor adaptive-rank training fetch on the process-global
+/// registry, classified by whether it read the whole configured lookback window.
+///
+/// ONE increment site for the counter, so a new classification point cannot be
+/// added without going through the closed label set. `coverage` is
+/// `&'static str` DELIBERATELY and the only values a caller can pass are the two
+/// [`RANK_TRAINING_FETCH_COVERAGES`] constants — the actor id must NOT appear
+/// here (caller-influenced, unbounded cardinality) and stays a log field.
+///
+/// Inert when metrics are not wired (unit tests, any process without
+/// [`set_global`]) — never unwraps, mirroring [`global`]'s contract.
+pub fn record_rank_training_fetch(coverage: &'static str) {
+    if let Some(m) = global() {
+        m.rank_training_fetches_total
+            .with_label_values(&[coverage])
+            .inc();
+    }
+}
+
+/// Publish the worst rank-training lookback shortfall observed in one completed
+/// training tick, in days. `0.0` when every fetch read its whole configured
+/// window.
+///
+/// A `set`, not an `inc`: this is the state as of the last tick, and it must
+/// fall back to 0 when a previously-truncating actor stops truncating. Call it
+/// ONCE per tick, after the whole fleet has been classified — a value published
+/// mid-loop would report a partial maximum as a completed measurement.
+pub fn set_rank_training_lookback_shortfall_days(days: f64) {
+    if let Some(m) = global() {
+        // A non-finite gauge renders as `NaN` and every comparison against it is
+        // false, so a corrupt reading would silence rather than alarm. Refuse it
+        // and leave the previous tick's value standing.
+        if days.is_finite() {
+            m.rank_training_lookback_shortfall_days.set(days.max(0.0));
+        }
+    }
 }
 
 /// Record one MCP `tools/call` on the process-global registry.
@@ -1049,6 +1106,48 @@ pub struct TalosMetrics {
     /// Deliberately carries NO workflow name, schedule id or user id — those
     /// are unbounded cardinality.
     pub scheduler_dispatches_total: CounterVec,
+
+    // ---- Adaptive rank-training window (2026-09) ----
+    //
+    // `ADAPTIVE_RANK_LOOKBACK_DAYS` is documented as a training window clamped
+    // to [1, 3650] days, and a hardcoded per-actor row cap binds first. On the
+    // reference fleet the configured 30 days is a fitted 6.6, and EVERY value
+    // from 7 to 3650 produces a bit-identical model. Until these two series
+    // there was no machine-readable signal at all: the only disclosure was a
+    // WARN, plus row counts on the stored artifact and in the operator digest
+    // — and row counts MOVE when the inert knob is turned, which reads as the
+    // change taking effect.
+    /// Per-actor training fetches by whether they read the whole configured
+    /// lookback window. Labels: `coverage=complete|truncated`
+    /// ([`RANK_TRAINING_FETCH_COVERAGES`]) — a PARTITION of every fetch, so the
+    /// two reconcile against the actors examined per tick.
+    ///
+    /// Both series are PRE-SEEDED, and the zero is meaningful in both
+    /// directions: `complete=0 AND truncated=0` means no tick has fit anything
+    /// yet (training off, or no active actor), which is a different state from
+    /// "nothing truncates".
+    ///
+    /// Deliberately carries NO `actor_id` — it is caller-influenced and stays a
+    /// log FIELD. **Nothing alerts on this**: on a fleet with one busy actor the
+    /// cap binds on every tick forever, so an alert here would fire
+    /// permanently and train operators to ignore it (check 69's trap). It is a
+    /// dashboard/questions series, not a page.
+    pub rank_training_fetches_total: CounterVec,
+
+    /// Days of the CONFIGURED rank-training window that the NARROWEST fit in
+    /// the last completed tick could not reach — `ADAPTIVE_RANK_LOOKBACK_DAYS`
+    /// minus the widest window that fit actually saw. `0` when every fetch read
+    /// its whole window.
+    ///
+    /// WORST CASE across the tick, not a per-actor value, because `actor_id`
+    /// cannot be a label. One actor whose window is short pulls this up while
+    /// every other actor's fit is complete; the counter above is what says how
+    /// MANY were affected.
+    ///
+    /// **Its zero is ambiguous and the counter beside it resolves that**: a
+    /// gauge at 0 means either "no fit fell short" or "no tick has run".
+    /// `talos_rank_training_fetches_total` summing to 0 distinguishes them.
+    pub rank_training_lookback_shortfall_days: Gauge,
 
     // ---- Fuel-headroom detector (2026-08) ----
     //
@@ -2173,6 +2272,49 @@ impl TalosMetrics {
             &["phase", "outcome"],
         )?;
         registry.register(Box::new(scheduler_dispatches_total.clone()))?;
+
+        let rank_training_fetches_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_rank_training_fetches_total",
+                "Per-actor adaptive-rank training fetches by whether they read \
+                 the WHOLE configured lookback window. Labels: \
+                 coverage=complete|truncated. truncated = the per-actor row cap \
+                 (TRAINING_FETCH_CAP) bound first, so the OLDEST part of \
+                 ADAPTIVE_RANK_LOOKBACK_DAYS was never read and raising that \
+                 knob will not widen the fit. The two values PARTITION every \
+                 fetch. Both pre-seeded: a sum of 0 means no tick has fit \
+                 anything, which is NOT the same as nothing truncating. Never \
+                 labelled by actor — unbounded cardinality, and the actor id is \
+                 caller-influenced. NOT alerted on: on a fleet with one busy \
+                 actor this truncates every tick forever.",
+            ),
+            &["coverage"],
+        )?;
+        registry.register(Box::new(rank_training_fetches_total.clone()))?;
+        // Seed both. Absent and zero diverge here in the usual way — an absent
+        // `truncated` series reads as "nothing has ever been truncated" to
+        // every `increase(...) > 0` expression — and, more sharply, the PAIR is
+        // what makes the gauge below legible: without seeded counters a gauge
+        // of 0 cannot be told apart from a controller that has not ticked yet.
+        for coverage in RANK_TRAINING_FETCH_COVERAGES {
+            rank_training_fetches_total
+                .with_label_values(&[coverage])
+                .inc_by(0.0);
+        }
+
+        let rank_training_lookback_shortfall_days = Gauge::new(
+            "talos_rank_training_lookback_shortfall_days",
+            "ADAPTIVE_RANK_LOOKBACK_DAYS minus the widest window any single \
+             adaptive-rank fit actually saw in the last completed training \
+             tick, i.e. how many days of the CONFIGURED window the worst-off \
+             actor's model could not reach. 0 when every fetch read its whole \
+             window. WORST CASE across the tick (actor_id cannot be a label); \
+             talos_rank_training_fetches_total says how many fits were \
+             affected, and also disambiguates this gauge's zero, which means \
+             'no shortfall' OR 'no tick yet'. NOT alerted on — a chronic \
+             shortfall is the row cap working as designed.",
+        )?;
+        registry.register(Box::new(rank_training_lookback_shortfall_days.clone()))?;
         // Seed all ten. The healthy steady state of every startup-phase
         // series is 0 forever, which is exactly the case where absent and
         // zero diverge: the herd alert is built on `increase(...)` — a
@@ -2696,6 +2838,8 @@ impl TalosMetrics {
             fuel_high_utilisation_nodes,
             fuel_utilisation_observed_nodes,
             scheduler_dispatches_total,
+            rank_training_fetches_total,
+            rank_training_lookback_shortfall_days,
             scheduler_readiness_holds_total,
             scheduler_readiness_degraded,
             rate_limit_hits_total,
@@ -3159,6 +3303,17 @@ mod tests {
             // "how often does the controller re-dispatch?" with "never" when
             // the truth is "nothing has looked".
             "talos_audit_chain_multi_attempt_jobs_total 0",
+            // The adaptive-rank training-window pair. Neither is alerted on
+            // (a cap that binds every tick on a busy fleet is a permanent
+            // state, and an alert on it would fire forever), but the SEEDING
+            // is what makes the gauge beside them legible: a shortfall gauge
+            // of 0 means "no fit fell short" OR "no tick has run", and only a
+            // seeded pair of counters summing to 0 tells those apart. An
+            // absent `truncated` series answers "has the training window ever
+            // been cut short?" with "no" when the truth is "nothing has
+            // looked".
+            r#"talos_rank_training_fetches_total{coverage="complete"} 0"#,
+            r#"talos_rank_training_fetches_total{coverage="truncated"} 0"#,
             r#"talos_module_payload_encryption_failures_total{op="encrypt",stage="input"} 0"#,
             r#"talos_module_payload_encryption_failures_total{op="encrypt",stage="output"} 0"#,
             r#"talos_module_payload_encryption_failures_total{op="encrypt",stage="trigger_metadata"} 0"#,

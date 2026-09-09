@@ -14,6 +14,10 @@ serde.workspace = true
 serde_json.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-config = { path = "../talos-config" }
+# The truncation disclosure's machine-readable half. `talos-metrics` is a
+# near-leaf (prometheus + talos-workflow-liveness), so this edge introduces no
+# cycle — the same argument `talos-task-supervision` makes above it.
+talos-metrics = { path = "../talos-metrics" }
 talos-memory = { path = "../talos-memory" }
 talos-actor-repository = { path = "../talos-actor-repository" }
 tokio = { version = "1", features = ["rt", "sync", "time"] }

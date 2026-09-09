@@ -500,6 +500,15 @@ pub struct RankFitSummary {
     /// pre-disclosure artifact or a window count that failed). Never "zero
     /// dropped".
     pub n_available: Option<i64>,
+    /// `ADAPTIVE_RANK_LOOKBACK_DAYS` as it stood for this fit — the window the
+    /// operator ASKED for. `None` = pre-disclosure artifact.
+    pub configured_lookback_days: Option<i64>,
+    /// Age in days of the oldest row the fetch actually returned. Meaningful
+    /// only on a TRUNCATED fetch (on an unbound one it is the oldest row that
+    /// exists, not the far edge of the window that was searched), which is why
+    /// the effective window is derived in the renderer rather than stored here.
+    /// `None` = pre-disclosure artifact or an empty fetch.
+    pub oldest_fetched_age_days: Option<f64>,
     /// When the fit ran.
     pub fitted_at: chrono::DateTime<chrono::Utc>,
 }
@@ -2652,6 +2661,12 @@ impl ActorRepository {
                         AS n_fetched, \
                     (metadata->'rank_weights'->'fetch'->>'n_available')::bigint \
                         AS n_available, \
+                    (metadata->'rank_weights'->'fetch' \
+                        ->>'configured_lookback_days')::bigint \
+                        AS configured_lookback_days, \
+                    (metadata->'rank_weights'->'fetch' \
+                        ->>'oldest_fetched_age_days')::double precision \
+                        AS oldest_fetched_age_days, \
                     (metadata->'rank_weights'->>'fitted_at')::timestamptz AS fitted_at \
              FROM actors \
              WHERE user_id = $1 \

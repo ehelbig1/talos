@@ -5098,13 +5098,13 @@ async fn handle_get_execution_waterfall(
 
     if rows_beyond_total > 0 {
         waterfall.push_str(&format!(
-            "\n[!] {rows_beyond_total} row(s) marked above start at or after {total_ms}ms, the \n\
-             run's total. Their bars are PINNED to the right edge and are NOT drawn to scale — \n\
-             the chart cannot place a node outside the window it is drawn against. This is not a \n\
-             rendering artefact: `total_ms` comes from the EXECUTION's completed_at while each \n\
-             start offset comes from that node's own event, so a node whose event was written \n\
-             after the execution was finalized reads as starting past the end. Measured on the \n\
-             reference fleet 2026-09-09, both instances were `failed` long-running executions \n\
+            "\n[!] {rows_beyond_total} row(s) marked above start at or after {total_ms}ms, the\n\
+             run's total. Their bars are PINNED to the right edge and are NOT drawn to scale —\n\
+             the chart cannot place a node outside the window it is drawn against. This is not a\n\
+             rendering artefact: `total_ms` comes from the EXECUTION's completed_at while each\n\
+             start offset comes from that node's own event, so a node whose event was written\n\
+             after the execution was finalized reads as starting past the end. Measured on the\n\
+             reference fleet 2026-09-09, both instances were `failed` long-running executions\n\
              whose last node_started landed 21s and 30s after completed_at.\n"
         ));
     }

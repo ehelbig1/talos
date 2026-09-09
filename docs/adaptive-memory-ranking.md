@@ -259,5 +259,47 @@ unchanged.
 | `ENABLE_ADAPTIVE_RANK_TRAINING` | off | spawn the scheduled fit job |
 | `ADAPTIVE_RANK_MIN_EXAMPLES` | 50 (`[10, 100000]`) | min usable examples to fit / trust |
 | `ADAPTIVE_RANK_TRAINING_INTERVAL_SECS` | 21600 (`[300, 604800]`) | fit-job wake interval |
-| `ADAPTIVE_RANK_LOOKBACK_DAYS` | 30 (`[1, 3650]`) | training window |
+| `ADAPTIVE_RANK_LOOKBACK_DAYS` | 30 (`[1, 3650]`) | training window — **effective downward only**, see below |
 | `ADAPTIVE_RANK_MAX_ACTORS_PER_TICK` | 50 (`[1, 500]`) | actors fit per tick |
+
+### The lookback knob's advertised range is mostly inert
+
+`[1, 3650]` is what the clamp permits, not what the fit can use. Three ceilings
+bind before it, and the narrowest is a hardcoded constant:
+
+* **`TRAINING_FETCH_CAP = 20_000`** (`talos-memory-ranking/src/lib.rs`) — the
+  per-actor row cap. The Phase-1 fetch is `ORDER BY created_at DESC LIMIT $cap`,
+  so widening the window adds only OLDER rows, which sort last and are never
+  read. Measured on the reference fleet 2026-09-09 at ~2 900 rows/day for the
+  busiest actor: **the configured 30-day window was a fitted 6.56 days, and the
+  fetched row set was byte-identical at 7, 30, 60, 90, 365 and 3650 days.**
+* **`RANK_TRAINING_EXAMPLE_MAX = 50_000`** (`talos-memory/src/lib.rs`) — a
+  second, higher clamp on the caller's `limit`, i.e. ~17 days at that rate. A
+  tunable cap would stop here.
+* **execution archival at `ARCHIVE_AFTER_DAYS` (default 30)** — past it the
+  fetch's `LEFT JOIN workflow_executions` finds nothing, the row has no status
+  and no judge verdict, and `build_training_set` drops it as unlabeled.
+  Measured: rows joined to a live execution saturate at 72 712 from 30 days on
+  while the raw count climbs to 110 812 at 60. **This one binds even with no cap
+  at all.**
+
+**The cap is deliberately NOT tunable** (decided 2026-09-09). Making it a knob
+would not restore the advertised range — the two ceilings above still bind at
+~17 and ~30 days — so it would be the same defect with an extra step, which is
+precisely what this section exists to stop. Cost is not the reason: the
+production fetch measures 18 ms at 20 000 rows and 59 ms at 50 000, on a
+six-hourly tick over at most 50 actors.
+
+**Training on recent outcomes is therefore a DECISION, not an accident of the
+`ORDER BY`.** The load-bearing half is the label horizon rather than the cap:
+past ~30 days this corpus has no labels, so a recency-weighted fit is the only
+thing it can support.
+
+**What the fit would look like without the cap**, so the trade is on the record
+rather than assumed. Refitting through the production `fit_rank_weights` over
+the whole 30-day window instead of the newest 20 000 rows moves the raw
+coefficients by relevance −11.2 %, recency −10.1 %, importance −4.8 %, access
++2.3 % — normalised to relevance, ~7 % harder on importance. Real, modest, and
+**neither fit is known to be the better one**: there is no held-out evaluation
+of this ranker.
+
