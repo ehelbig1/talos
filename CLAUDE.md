@@ -4328,6 +4328,57 @@ the controller's WARN volume should fall from 32 to about 15, and
 `TalosRPCSubjectFailing` should stay silent: `not_promoted` is `declined` and
 the finding class is expected to remain 0 on every subject.
 
+### 2026-09-09 — a chart that crashed on the runs an operator most wants to see
+
+`get_execution_waterfall` computed `bar_len.clamp(1, chart_width - bar_start)`
+with `bar_start` capped at `chart_width`, so a row where
+`start_ms >= total_ms` evaluated `clamp(1, 0)` — **min > max, which panics**. A
+panic in an MCP handler unwinds the tokio task, so the caller gets a DROPPED
+REQUEST rather than an error, and nothing in the response says why.
+
+**Reachable, and not on the shape the earlier note guessed.** That note recorded
+it as "a node's start equals the run's total". Measured against the live fleet
+2026-09-09 by driving the handler's own arithmetic over `workflow_executions`
+joined to `execution_events`: **2 of 10,729** completed executions trip it, and
+both are `failed` long-running runs whose last `node_started` landed **21 s and
+30 s AFTER `completed_at`** — not a tie, an inversion. The cause is two writers:
+`total_ms` comes from the EXECUTION's `completed_at` while every `start_ms` is an
+offset from that NODE's own event, so a node event written after the execution
+was finalized reads as starting past the end. So the tool crashed precisely on
+the class of execution — failed, long-running — an operator is most likely to
+open a waterfall for.
+
+The geometry moved to the pure, total `bar_geometry`, which is panic-free for
+every input including `total_ms <= 0` and `chart_width == 0`. `start` now caps at
+`chart_width - 1` rather than `chart_width`: a zero-width bar renders a row
+claiming the node did not run, and it is what inverted the clamp.
+
+**Not panicking is only half of it.** `BarGeometry::beyond_total` is the other
+half, because a bar silently pinned to the right edge asserts the node ran AT the
+end when the data says it started PAST the end — the misleading-report class
+(checks 74/76/79/81) in a chart. Such rows are marked inline and the chart
+carries a footer naming the count, the total it is drawn against, and the
+two-writer reason, so the reader is not sent hunting a rendering bug.
+
+**What was measured and NOT changed.** The finalization ordering itself — a
+`node_started` written after its execution's `completed_at` — is left alone. It
+is a real ordering fact about the engine's failure path, not a rendering
+question, and fixing it is a change to how executions finalize rather than to
+how they are drawn. The population is the 2 rows above.
+
+**No lint check was added and `--count` stays 88.** The candidate — "a `clamp`
+whose bounds are both computed must have its min <= max proved" — is a dataflow
+question, not a textual one, and the structural answer is already stronger: the
+arithmetic has ONE home, it is `#[must_use]`-free but total by construction, and
+the totality is pinned by a test over hostile inputs (`i64::MIN`, `i64::MAX`,
+`total_ms == 0`, `chart_width == 0`). Guards, and their limits: the four unit
+tests drive the PURE function and are RED on the pre-fix arithmetic (3 of 4
+panic) with an ordinary-row CONTROL that stays green, and a second mutation
+silencing `beyond_total` is red too. Neither can see the HANDLER BODY — a caller
+that computes the geometry correctly and discards `beyond_total` survives, which
+is checks 74b/79b's stated limit and is the honest position here.
+
+
 ## Sub-workflow dispatch (engine)
 
 Every parent node that runs a sub-workflow (judge, ensemble, reflective-retry, llm-dispatch, sub_workflow) uses the shared dispatcher pattern in `controller/src/engine/parallel.rs`:
