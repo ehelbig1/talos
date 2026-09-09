@@ -1,5 +1,7 @@
 use super::types::JsonRpcResponse;
-use super::utils::{compute_mcp_graph_diff, mcp_error, mcp_text, update_workflow_search_text};
+use super::utils::{
+    compute_mcp_graph_diff, mcp_denied, mcp_error, mcp_text, update_workflow_search_text,
+};
 use super::{auth, McpState};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -1270,7 +1272,7 @@ async fn handle_get_workflow_dependencies_list(
         .await
     {
         Ok(Some(gj)) => gj,
-        Ok(None) => return mcp_error(req_id, -32000, "Workflow not found or access denied"),
+        Ok(None) => return mcp_denied(req_id, -32000, "Workflow not found or access denied"),
         Err(e) => {
             tracing::error!("get_workflow_dependencies graph query failed: {}", e);
             return mcp_error(req_id, -32000, "Failed to fetch workflow");
@@ -2126,7 +2128,7 @@ async fn handle_get_workflow_audit_trail(
         .await
     {
         Ok(Some(r)) => r,
-        Ok(None) => return mcp_error(req_id, -32000, "Workflow not found or access denied"),
+        Ok(None) => return mcp_denied(req_id, -32000, "Workflow not found or access denied"),
         Err(e) => {
             tracing::error!("get_workflow_audit_trail: {}", e);
             return mcp_error(req_id, -32000, "Failed to fetch workflow");
@@ -4767,7 +4769,7 @@ pub(crate) async fn handle_get_workflow_topology(
         .await
     {
         Ok(Some(gj)) => gj,
-        Ok(None) => return mcp_error(req_id, -32000, "Workflow not found or access denied"),
+        Ok(None) => return mcp_denied(req_id, -32000, "Workflow not found or access denied"),
         Err(e) => {
             tracing::error!("get_workflow_topology query failed: {}", e);
             return mcp_error(req_id, -32000, "Failed to fetch workflow");
@@ -4995,7 +4997,7 @@ async fn handle_get_node_failure_breakdown(
         .await
     {
         Ok(Some(gj)) => gj,
-        Ok(None) => return mcp_error(req_id, -32000, "Workflow not found or access denied"),
+        Ok(None) => return mcp_denied(req_id, -32000, "Workflow not found or access denied"),
         Err(e) => {
             tracing::error!("get_node_failure_breakdown graph query failed: {}", e);
             return mcp_error(req_id, -32000, "Failed to fetch workflow");
@@ -5359,7 +5361,7 @@ async fn handle_get_workflow_performance_report(
         .await
     {
         Ok(Some(r)) => r,
-        Ok(None) => return mcp_error(req_id, -32000, "Workflow not found or access denied"),
+        Ok(None) => return mcp_denied(req_id, -32000, "Workflow not found or access denied"),
         Err(e) => {
             tracing::error!(
                 "get_workflow_performance_report workflow lookup failed: {}",
@@ -5726,7 +5728,7 @@ async fn handle_get_workflow_risk_assessment(
     // Load workflow graph + metadata for documentation checks
     let wf_full = match state.analytics_repo.get_workflow_full(wf_id, user_id).await {
         Ok(Some(r)) => r,
-        Ok(None) => return mcp_error(req_id, -32000, "Workflow not found or access denied"),
+        Ok(None) => return mcp_denied(req_id, -32000, "Workflow not found or access denied"),
         Err(e) => {
             tracing::error!("get_workflow_risk_assessment workflow lookup failed: {}", e);
             return mcp_error(req_id, -32000, "Failed to fetch workflow");
@@ -7288,7 +7290,7 @@ async fn handle_suggest_capabilities(
         .await
     {
         Ok(Some(gj)) => gj,
-        Ok(None) => return mcp_error(req_id, -32000, "Workflow not found or access denied"),
+        Ok(None) => return mcp_denied(req_id, -32000, "Workflow not found or access denied"),
         Err(e) => {
             tracing::error!("suggest_capabilities graph lookup failed: {}", e);
             return mcp_error(req_id, -32000, "Failed to fetch workflow");
@@ -8248,7 +8250,7 @@ async fn handle_get_readiness_breakdown(
     // Load workflow metadata
     let wf_full = match state.analytics_repo.get_workflow_full(wf_id, user_id).await {
         Ok(Some(r)) => r,
-        Ok(None) => return mcp_error(req_id, -32000, "Workflow not found or access denied"),
+        Ok(None) => return mcp_denied(req_id, -32000, "Workflow not found or access denied"),
         Err(e) => {
             tracing::error!("get_readiness_breakdown: {}", e);
             return mcp_error(req_id, -32000, "Failed to fetch workflow");

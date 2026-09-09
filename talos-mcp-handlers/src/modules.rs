@@ -1,5 +1,5 @@
 use super::types::JsonRpcResponse;
-use super::utils::{mcp_error, mcp_text};
+use super::utils::{mcp_denied, mcp_error, mcp_text};
 use super::{auth, McpState};
 use std::sync::Arc;
 use tokio::sync::OnceCell;
@@ -539,6 +539,7 @@ async fn handle_list_templates(
             serde_json::json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&envelope).unwrap_or_default() }] }),
         ),
         error: None,
+        error_kind: None,
     }
 }
 
@@ -738,7 +739,7 @@ async fn handle_delete_module(
         // across tenants. Drop the extra DB call AND the split
         // message; return the uniform error every other module
         // surface returns.
-        Ok(_) => mcp_error(req_id, -32000, "Module not found or access denied"),
+        Ok(_) => mcp_denied(req_id, -32000, "Module not found or access denied"),
         Err(e) => {
             tracing::error!(err = ?e, module_id = %mod_id, "delete_module failed");
             mcp_error(req_id, -32000, "Delete failed")
@@ -1115,7 +1116,7 @@ async fn handle_get_module_info(
         );
     }
 
-    mcp_error(req_id, -32000, "Module not found or access denied")
+    mcp_denied(req_id, -32000, "Module not found or access denied")
 }
 
 /// Surface external access that the HOST grants implicitly based on
@@ -1385,7 +1386,7 @@ async fn handle_test_secret_access(
                     tmpl.allowed_secrets,
                     tmpl.category,
                 ),
-                None => return mcp_error(req_id, -32000, "Module not found or access denied"),
+                None => return mcp_denied(req_id, -32000, "Module not found or access denied"),
             }
         }
     };
@@ -1896,7 +1897,7 @@ async fn handle_list_module_usage(
     {
         Ok(true) => {}
         Ok(false) => {
-            return mcp_error(req_id, -32000, "Module not found or access denied");
+            return mcp_denied(req_id, -32000, "Module not found or access denied");
         }
         Err(e) => {
             tracing::error!("list_module_usage existence check failed: {:#}", e);
@@ -2336,7 +2337,7 @@ async fn handle_rename_module(
         // attacker whether a UUID existed in the platform. Mirrors the
         // uniform error every other module surface returns
         // ("Module not found or access denied").
-        Ok(_) => mcp_error(req_id, -32000, "Module not found or access denied"),
+        Ok(_) => mcp_denied(req_id, -32000, "Module not found or access denied"),
         Err(e) => {
             tracing::error!("rename_module failed: {}", e);
             mcp_error(req_id, -32000, "Failed to rename module")
@@ -2370,7 +2371,7 @@ async fn handle_get_module_history(
         .await
     {
         Ok(true) => {}
-        Ok(false) => return mcp_error(req_id, -32000, "Module not found or access denied"),
+        Ok(false) => return mcp_denied(req_id, -32000, "Module not found or access denied"),
         Err(e) => {
             tracing::error!("get_module_history existence check failed: {:#}", e);
             return mcp_error(req_id, -32000, "Failed to query module history");
@@ -2493,7 +2494,7 @@ async fn handle_get_module_source(
                 &serde_json::to_string_pretty(&result).unwrap_or_default(),
             )
         }
-        Ok(None) => mcp_error(req_id, -32000, "Module not found or access denied"),
+        Ok(None) => mcp_denied(req_id, -32000, "Module not found or access denied"),
         Err(e) => {
             tracing::error!("get_module_source failed: {:#}", e);
             mcp_error(req_id, -32000, "Failed to fetch module source")
@@ -2525,7 +2526,7 @@ async fn handle_get_module_dependents(
     {
         Ok(true) => {}
         Ok(false) => {
-            return mcp_error(req_id, -32000, "Module not found or access denied");
+            return mcp_denied(req_id, -32000, "Module not found or access denied");
         }
         Err(e) => {
             tracing::error!("get_module_dependents existence check failed: {:#}", e);
@@ -2668,7 +2669,7 @@ async fn handle_get_module_compatibility(
     {
         Ok(Some((world, _src))) => world,
         // MCP-159 (2026-05-08): uniform message — see delete_module fix.
-        Ok(None) => return mcp_error(req_id, -32000, "Module not found or access denied"),
+        Ok(None) => return mcp_denied(req_id, -32000, "Module not found or access denied"),
         Err(e) => {
             tracing::error!("get_module_compatibility query failed: {:#}", e);
             return mcp_error(req_id, -32000, "Failed to fetch module");
@@ -2813,7 +2814,7 @@ async fn handle_set_module_rate_limit(
         };
         mcp_text(req_id, &msg)
     } else {
-        mcp_error(req_id, -32000, "Module not found or access denied")
+        mcp_denied(req_id, -32000, "Module not found or access denied")
     }
 }
 
@@ -2924,7 +2925,7 @@ async fn handle_share_module_with_org(
             req_id,
             &format!("Module {} shared with organization {}", module_id, org_id),
         ),
-        Ok(_) => mcp_error(req_id, -32000, "Module not found or access denied"),
+        Ok(_) => mcp_denied(req_id, -32000, "Module not found or access denied"),
         Err(e) => {
             tracing::error!("share_module_with_org update failed: {}", e);
             mcp_error(req_id, -32000, "Failed to share module")
@@ -3968,7 +3969,7 @@ async fn handle_restore_pinned_modules(
 ) -> JsonRpcResponse {
     let user_id = match agent.user_id {
         Some(uid) => uid,
-        None => return mcp_error(req_id, -32000, "User identity required"),
+        None => return mcp_denied(req_id, -32000, "User identity required"),
     };
 
     // Fetch pinned modules and whether WASM is currently present

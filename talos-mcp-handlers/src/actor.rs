@@ -1,5 +1,5 @@
 use super::types::JsonRpcResponse;
-use super::utils::{mcp_error, mcp_text};
+use super::utils::{mcp_denied, mcp_error, mcp_failed, mcp_text};
 /// MCP tools for managing workflow runtime actors.
 ///
 /// A runtime actor is a named autonomous entity (distinct from `mcp_agents`, which are
@@ -1148,7 +1148,12 @@ async fn resolve_actor_via_repo(
     // the platform's default answer during any database incident.
     match actor_repo.find_actor_for_user(actor_id, user_id).await {
         Ok(Some(id)) => Ok(id),
-        Ok(None) => Err(mcp_error(
+        // The two arms below are the reason package 35 exists. #782 split
+        // them so the OPERATOR reading the reply could tell a refusal from a
+        // database fault; both still render `-32000`, deliberately, so the
+        // CALLER cannot. Until now the instrument read only the code, so the
+        // two carefully-separated arms landed on one series.
+        Ok(None) => Err(mcp_denied(
             req_id.clone(),
             -32000,
             "Actor not found or access denied",
@@ -1159,7 +1164,7 @@ async fn resolve_actor_via_repo(
                 actor_id = %actor_id,
                 "actor ownership lookup failed"
             );
-            Err(mcp_error(
+            Err(mcp_failed(
                 req_id.clone(),
                 -32000,
                 "Could not verify actor ownership — the actor registry is \
@@ -1637,7 +1642,7 @@ async fn handle_create_actor(
     // `world_rank` comparison wrongly admitted incomparable siblings.
     let user_ceiling = user_ceiling_or_error!(req_id, &state.db_pool, user_id);
     if !talos_capability_world::ceiling_permits(&user_ceiling, max_world) {
-        return mcp_error(
+        return mcp_denied(
             req_id, -32603,
             &format!(
                 "Your capability ceiling is '{}'. Creating an Actor with '{}' requires a higher grant. \
@@ -2003,7 +2008,7 @@ async fn handle_suspend_actor(
 
     match current_status.as_deref() {
         Some("archived") => {
-            return mcp_error(
+            return mcp_denied(
                 req_id,
                 -32000,
                 "Actor is archived — this is an IRREVERSIBLE terminal state. \
@@ -2011,7 +2016,7 @@ async fn handle_suspend_actor(
             )
         }
         Some("terminated") => {
-            return mcp_error(
+            return mcp_denied(
                 req_id,
                 -32000,
                 "Actor is terminated — this is an IRREVERSIBLE terminal state. \
@@ -2030,7 +2035,7 @@ async fn handle_suspend_actor(
             // via unwrap_or, fell through the catch-all). Surface the
             // terminal-state error so the operator sees the same
             // message the handler-side guard would have produced.
-            mcp_error(
+            mcp_denied(
                 req_id,
                 -32000,
                 "Suspend refused — actor is in a terminal state (archived \
@@ -2211,7 +2216,7 @@ async fn handle_archive_actor(
                 .to_string(),
             )
         }
-        Ok(_) => mcp_error(
+        Ok(_) => mcp_denied(
             req_id,
             -32000,
             "Actor not found, not owned, or already terminated (use terminate_actor for terminated actors)",
@@ -2275,7 +2280,7 @@ async fn handle_update_actor_status(
 
     match current_status.as_deref() {
         Some("archived") => {
-            return mcp_error(
+            return mcp_denied(
                 req_id,
                 -32000,
                 "Actor is archived — this is an IRREVERSIBLE terminal state. \
@@ -2283,7 +2288,7 @@ async fn handle_update_actor_status(
             )
         }
         Some("terminated") => {
-            return mcp_error(
+            return mcp_denied(
                 req_id,
                 -32000,
                 "Actor is terminated — this is an IRREVERSIBLE terminal state. \
@@ -2306,7 +2311,7 @@ async fn handle_update_actor_status(
             // DB error and returned None. Surface the operator-facing
             // terminal-state error rather than the misleading success
             // message the pre-fix `Ok(_)` arm produced.
-            mcp_error(
+            mcp_denied(
                 req_id,
                 -32000,
                 "Actor status update refused — actor is in a terminal state \
@@ -3564,7 +3569,7 @@ async fn handle_remove_approval_policy(
             );
             mcp_text(req_id, &format!("Approval policy {} removed.", policy_id))
         }
-        Ok(None) => mcp_error(req_id, -32000, "Policy not found or access denied"),
+        Ok(None) => mcp_denied(req_id, -32000, "Policy not found or access denied"),
         Err(e) => {
             tracing::error!("remove_actor_approval_policy: {}", e);
             mcp_error(req_id, -32000, "Failed to remove approval policy")
@@ -4800,7 +4805,7 @@ async fn handle_grant_capability_ceiling(
     // (lower rank, but lattice-incomparable) to another user.
     let granter_ceiling = user_ceiling_or_error!(req_id, &state.db_pool, granter_id);
     if !talos_capability_world::ceiling_permits(&granter_ceiling, grant_world) {
-        return mcp_error(
+        return mcp_denied(
             req_id,
             -32603,
             &format!(
@@ -4919,7 +4924,7 @@ async fn handle_revoke_capability_ceiling(
         .unwrap_or(false);
 
     if !is_admin && revoker_id != target_user_id {
-        return mcp_error(
+        return mcp_denied(
             req_id,
             -32603,
             "Only platform admins can revoke another user's capability grant",
@@ -5026,7 +5031,7 @@ async fn handle_list_capability_grants(
         .unwrap_or(false);
 
     if !is_admin {
-        return mcp_error(
+        return mcp_denied(
             req_id,
             -32603,
             "list_capability_grants requires platform admin role",
@@ -5173,7 +5178,7 @@ async fn handle_update_actor(
         .update_actor_name_description(actor_id, user_id, new_name, new_description)
         .await
     {
-        Ok(0) => return mcp_error(req_id, -32000, "Actor not found or access denied"),
+        Ok(0) => return mcp_denied(req_id, -32000, "Actor not found or access denied"),
         Ok(_) => {}
         Err(e) => {
             let err_str = e.to_string();
@@ -5269,7 +5274,7 @@ async fn handle_clone_actor(
         .await
     {
         Ok(Some(r)) => r,
-        Ok(None) => return mcp_error(req_id, -32000, "Source actor not found or access denied"),
+        Ok(None) => return mcp_denied(req_id, -32000, "Source actor not found or access denied"),
         Err(e) => {
             tracing::error!("clone_actor fetch source: {:#}", e);
             return crate::utils::database_error(req_id);
@@ -5328,7 +5333,7 @@ async fn handle_clone_actor(
     // sibling of (not a subset of) their own.
     let user_ceiling = user_ceiling_or_error!(req_id, &state.db_pool, user_id);
     if !talos_capability_world::ceiling_permits(&user_ceiling, &source_max_world) {
-        return mcp_error(
+        return mcp_denied(
             req_id,
             -32603,
             &format!(

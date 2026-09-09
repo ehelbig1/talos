@@ -10,7 +10,7 @@
 //! correction→few-shot loop.
 
 use super::types::JsonRpcResponse;
-use super::utils::{mcp_error, mcp_text};
+use super::utils::{mcp_denied, mcp_error, mcp_text};
 use super::{auth, McpState};
 use std::sync::Arc;
 use talos_ops_alerts_repository::{OpsAlertFilter, OpsAlertRepository, ASSIGNABLE_SEVERITIES};
@@ -220,7 +220,7 @@ async fn handle_set_status(
             req_id,
             &serde_json::json!({ "alert_id": alert_id, "status": status }).to_string(),
         ),
-        Ok(false) => mcp_error(
+        Ok(false) => mcp_denied(
             req_id,
             -32000,
             "Alert not found, not yours, or not in a state that allows this transition \
@@ -277,7 +277,7 @@ async fn handle_correct(
                 .to_string(),
             )
         }
-        Ok(None) => mcp_error(req_id, -32000, "Alert not found or not yours"),
+        Ok(None) => mcp_denied(req_id, -32000, "Alert not found or not yours"),
         Err(e) => {
             tracing::error!("correct_ops_alert_severity failed: {:#}", e);
             crate::utils::database_error(req_id)

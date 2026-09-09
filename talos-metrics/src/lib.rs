@@ -13,8 +13,12 @@ use prometheus::{
 };
 use std::sync::{Arc, OnceLock};
 
+pub mod mcp;
+pub mod outcome_class;
 pub mod rpc;
-pub use rpc::{seeded_pairs as rpc_seeded_pairs, RpcOutcome, RpcOutcomeClass, RpcSubject};
+pub use mcp::McpToolOutcome;
+pub use outcome_class::OutcomeClass;
+pub use rpc::{seeded_pairs as rpc_seeded_pairs, RpcOutcome, RpcSubject};
 
 /// The complete, closed set of `subject` label values on
 /// `talos_rpc_write_ceiling_refusals_total` — the NATS subjects on which the
@@ -113,50 +117,6 @@ pub fn global() -> Option<&'static Arc<TalosMetrics>> {
     METRICS.get()
 }
 
-/// The outcome of one MCP `tools/call`, decided from the RESPONSE SHAPE and
-/// never from the handler that produced it.
-///
-/// An ENUM rather than a `&str` for the same reason
-/// [`talos_workflow_liveness::dispatch::DispatchPath`] is one: the `outcome`
-/// label set is then closed BY THE COMPILER, and a fifth outcome cannot be
-/// spelled at a call site without being added here — where its meaning, and
-/// its effect on anything selecting on the label, is visible.
-///
-/// The split that matters is `refused` vs `error`: `refused` is the CALLER's
-/// fault (JSON-RPC `-32602`, invalid or missing arguments, the code 411 of
-/// this workspace's `mcp_error` sites use), `error` is the SERVER's
-/// (`-32000` / `-32603` / anything else, plus a JSON-RPC `error` object).
-/// Folded into one value, a client looping on a typo'd argument and a
-/// database outage move the same series.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum McpToolOutcome {
-    /// The response carries a result with no `isError`.
-    Ok,
-    /// `isError` with a SERVER-side code (`-32000`, `-32603`, …), or a
-    /// JSON-RPC `error` object.
-    Error,
-    /// `isError` with `-32602` — invalid params. The caller can fix it.
-    Refused,
-    /// `isError` with `-32601` — no dispatch arm claimed the name.
-    UnknownTool,
-}
-
-impl McpToolOutcome {
-    /// The label value. One `&'static str` per variant, exhaustively matched.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Ok => "ok",
-            Self::Error => "error",
-            Self::Refused => "refused",
-            Self::UnknownTool => "unknown_tool",
-        }
-    }
-
-    /// Every variant, for tests and for any future pre-seed loop.
-    pub const ALL: [Self; 4] = [Self::Ok, Self::Error, Self::Refused, Self::UnknownTool];
-}
-
 /// Record one MCP `tools/call` on the process-global registry.
 ///
 /// ONE increment site for both series, so a new observation point cannot
@@ -222,7 +182,7 @@ pub fn record_mcp_tool_call_on(
     outcome: McpToolOutcome,
     elapsed: std::time::Duration,
 ) {
-    let labels = [tool, outcome.as_str()];
+    let labels = [tool, outcome.as_str(), outcome.class().as_str()];
     metrics
         .mcp_tool_calls_total
         .with_label_values(&labels)
@@ -1282,7 +1242,7 @@ pub struct TalosMetrics {
     /// **Cardinality is the design.** All three labels are closed
     /// compile-time sets: `subject` is [`RpcSubject`], `outcome` is
     /// [`RpcOutcome`], and `class` is a pure FUNCTION of `outcome`
-    /// ([`RpcOutcomeClass`]) so it adds no series. `actor_id` is a log field
+    /// ([`OutcomeClass`]) so it adds no series. `actor_id` is a log field
     /// on `record_rpc_metric` and must never be added here — it is
     /// caller-supplied and unbounded.
     ///
@@ -1412,7 +1372,16 @@ pub struct TalosMetrics {
 
     /// Per-tool latency of the ONE MCP `tools/call` chokepoint
     /// (`talos_mcp_handlers::handle_tools_call`), labelled
-    /// `tool` × `outcome`.
+    /// `tool` × `outcome` × `class`.
+    ///
+    /// `outcome` is a [`McpToolOutcome`] and `class` is a pure function of it
+    /// ([`OutcomeClass`]) so the third label adds NO series — verified by
+    /// `mcp::tests::the_class_label_adds_no_series`, not assumed. It exists
+    /// so a dashboard or an alert can ask "is the platform declining, or
+    /// failing?" of this surface in the SAME words it asks the signed-RPC one
+    /// ([`rpc_calls_total`](Self::rpc_calls_total)), and so that a future
+    /// seventh outcome does not silently fall outside a selector spelled as
+    /// an outcome alternation.
     ///
     /// **Cardinality is the design.** `tool` is NEVER the request's own
     /// string: the chokepoint resolves it against the static tool-schema
@@ -1424,7 +1393,7 @@ pub struct TalosMetrics {
     /// two strings.
     ///
     /// **Deliberately NOT pre-seeded, and the number is why.** The label
-    /// product is ~320 tools × 4 outcomes, and a 16-bucket histogram series
+    /// product is ~320 tools × 6 outcomes, and a 16-bucket histogram series
     /// renders 19 lines, so seeding the product would add ~24 000 lines
     /// (~1.9 MB) to a `/metrics/prometheus` body measured at 567 lines /
     /// 61 128 bytes — a 30× scrape. Seeding only the pairs a live call site
@@ -2651,23 +2620,27 @@ impl TalosMetrics {
                 "Wall-clock duration of one MCP tools/call, measured at the single \
                  dispatch chokepoint. Labels: tool (a value from the static tool-schema \
                  registry, or the fixed sentinels 'catalog_template' / 'unknown' — NEVER \
-                 the caller's own string) × outcome (ok | error | refused | unknown_tool, \
-                 decided from the response shape). NOT pre-seeded: an absent (tool, outcome) \
-                 means that tool has not been called since process start.",
+                 the caller's own string) × outcome (ok | error | refused | unknown_tool | \
+                 denied | not_found) × class (served | declined | finding, a pure function \
+                 of outcome, so it adds no series). NOT pre-seeded: an absent \
+                 (tool, outcome) means that tool has not been called since process start.",
             )
             .buckets(exponential_buckets(0.001, 2.0, 16).expect("valid exponential buckets")),
-            &["tool", "outcome"],
+            &["tool", "outcome", "class"],
         )?;
         registry.register(Box::new(mcp_tool_duration_seconds.clone()))?;
 
         let mcp_tool_calls_total = CounterVec::new(
             prometheus::Opts::new(
                 "talos_mcp_tool_calls_total",
-                "MCP tools/call invocations served, by tool and outcome. Same labels and \
-                 same closed-set rule as talos_mcp_tool_duration_seconds. NOT pre-seeded \
-                 (see that metric's HELP and the field docs for the measured scrape cost).",
+                "MCP tools/call invocations, by tool, outcome and class. Same labels and \
+                 same closed-set rule as talos_mcp_tool_duration_seconds. class is served \
+                 | declined | finding: a REFUSAL the platform issued correctly is declined, \
+                 not finding, so a client looping on a tool it lacks the capability for no \
+                 longer moves the same series as an outage. NOT pre-seeded (see that \
+                 metric's HELP and the field docs for the measured scrape cost).",
             ),
-            &["tool", "outcome"],
+            &["tool", "outcome", "class"],
         )?;
         registry.register(Box::new(mcp_tool_calls_total.clone()))?;
 
@@ -2783,6 +2756,12 @@ mod tests {
     /// halves the bucket count, or adds a third series to the pair, the
     /// numbers in the field docs and in CLAUDE.md are wrong and this test
     /// says so.
+    ///
+    /// The numbers moved once, deliberately: package 35 added the `class`
+    /// label, which adds no SERIES (it is a pure function of `outcome`) but
+    /// does add ~19 bytes to each of the 20 rendered lines — 2356/1656 →
+    /// 2941/1996 bytes, i.e. the no-pre-seed argument gets ~24 % stronger
+    /// rather than weaker.
     #[test]
     fn the_mcp_instrument_costs_the_lines_the_no_preseed_decision_assumes() {
         let m = TalosMetrics::new().expect("metrics");
@@ -2825,7 +2804,7 @@ mod tests {
         let marginal_bytes = two.len() - warm.len();
         assert_eq!(
             (first_pair_bytes, marginal_bytes),
-            (2356, 1656),
+            (2941, 1996),
             "per-(tool, outcome) scrape cost changed; the numbers in the field \
              docs and in CLAUDE.md's no-pre-seed argument are now stale"
         );

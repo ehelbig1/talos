@@ -1,5 +1,5 @@
 use super::types::JsonRpcResponse;
-use super::utils::{mcp_error, mcp_text};
+use super::utils::{mcp_denied, mcp_error, mcp_not_found, mcp_text};
 use super::{auth, McpState};
 use chrono::{DateTime, Utc};
 use serde_json::Value;
@@ -830,7 +830,7 @@ async fn handle_get_execution_status(
         // unlabelled archived row would read as a live one.
         Ok(ExecutionLookup::Archived { row, archived_at }) => (row, Some(archived_at)),
         Ok(ExecutionLookup::Absent) => {
-            return mcp_error(req_id, -32000, "Execution not found or access denied")
+            return mcp_denied(req_id, -32000, "Execution not found or access denied")
         }
         Err(e) => {
             tracing::error!(execution_id = %exec_id, "get_execution_status query failed: {}", e);
@@ -934,7 +934,7 @@ async fn handle_list_executions(
     // error message, leaking existence. user-scoped check makes both states return the
     // same response.
     if !state.workflow_repo.workflow_exists(wf_id, user_id).await {
-        return mcp_error(req_id, -32000, "Workflow not found or access denied");
+        return mcp_denied(req_id, -32000, "Workflow not found or access denied");
     }
 
     let limit = match crate::utils::validate_range_i64(args, "limit", 1, 200, 60, &req_id) {
@@ -1309,7 +1309,7 @@ async fn handle_cancel_execution(
                 // cancel path used "already in terminal state" while
                 // sibling action tools used "current status" — same
                 // class of error, two different operator-facing strings.
-                Ok(ExecutionLookup::Live(exec)) => mcp_error(
+                Ok(ExecutionLookup::Live(exec)) => mcp_denied(
                     req_id,
                     -32000,
                     &format!(
@@ -1324,17 +1324,17 @@ async fn handle_cancel_execution(
                 // `workflow_executions`. Saying "not found or access
                 // denied" here would send an operator to the permissions
                 // model for a retention event.
-                Ok(ExecutionLookup::Archived { archived_at, .. }) => mcp_error(
+                Ok(ExecutionLookup::Archived { archived_at, .. }) => mcp_denied(
                     req_id,
                     -32000,
                     &archived_refusal("cancel execution", exec_id, archived_at),
                 ),
                 Ok(ExecutionLookup::Absent) => {
-                    mcp_error(req_id, -32000, "Execution not found or access denied")
+                    mcp_denied(req_id, -32000, "Execution not found or access denied")
                 }
                 Err(e) => {
                     tracing::error!(execution_id = %exec_id, "cancel_execution post-check fetch failed: {}", e);
-                    mcp_error(req_id, -32000, "Execution not found or access denied")
+                    mcp_denied(req_id, -32000, "Execution not found or access denied")
                 }
             }
         }
@@ -1439,7 +1439,7 @@ async fn handle_get_execution_logs(
         // unlabelled archived row would read as a live one.
         Ok(ExecutionLookup::Archived { row, archived_at }) => (row, Some(archived_at)),
         Ok(ExecutionLookup::Absent) => {
-            return mcp_error(req_id, -32000, "Execution not found or access denied")
+            return mcp_denied(req_id, -32000, "Execution not found or access denied")
         }
         Err(e) => {
             tracing::error!(execution_id = %exec_id, "get_execution_logs: load failed: {}", e);
@@ -1774,7 +1774,7 @@ async fn handle_tail_worker_logs(
             // Both denial verdicts render the SAME message — distinguishing
             // them would leak existence across tenants.
             OwnerVerdict::Foreign | OwnerVerdict::Absent => {
-                return mcp_error(
+                return mcp_denied(
                     req_id,
                     -32000,
                     "Execution not found or access denied. tail_worker_logs only supports \
@@ -1884,7 +1884,7 @@ async fn handle_get_node_output(
         // unlabelled archived row would read as a live one.
         Ok(ExecutionLookup::Archived { row, archived_at }) => (row, Some(archived_at)),
         Ok(ExecutionLookup::Absent) => {
-            return mcp_error(req_id, -32000, "Execution not found or access denied")
+            return mcp_denied(req_id, -32000, "Execution not found or access denied")
         }
         Err(e) => {
             tracing::error!("get_node_output query failed: {}", e);
@@ -1977,7 +1977,7 @@ async fn handle_get_node_output(
                 .collect()
         })
         .unwrap_or_default();
-    mcp_error(
+    mcp_not_found(
         req_id,
         -32000,
         &format!(
@@ -2154,7 +2154,7 @@ async fn handle_compare_executions_summary(
     let (exec_a, exec_b) = match (exec_a, exec_b) {
         (Some(a), Some(b)) => (a, b),
         _ => {
-            return mcp_error(
+            return mcp_denied(
                 req_id,
                 -32000,
                 "One or both executions not found or access denied",
@@ -2337,7 +2337,7 @@ async fn handle_get_execution_timeline(
         // unlabelled archived row would read as a live one.
         Ok(ExecutionLookup::Archived { row, archived_at }) => (row, Some(archived_at)),
         Ok(ExecutionLookup::Absent) => {
-            return mcp_error(req_id, -32000, "Execution not found or access denied")
+            return mcp_denied(req_id, -32000, "Execution not found or access denied")
         }
         Err(e) => {
             tracing::error!(execution_id = %exec_id, "get_execution_timeline: load failed: {}", e);
@@ -2727,7 +2727,7 @@ async fn handle_pause_executions(
         .await
         .unwrap_or(false);
     if !is_platform_admin {
-        return mcp_error(
+        return mcp_denied(
             req_id,
             -32601,
             "pause_executions requires platform-admin privileges. \
@@ -2785,7 +2785,7 @@ async fn handle_resume_executions(
         .await
         .unwrap_or(false);
     if !is_platform_admin {
-        return mcp_error(
+        return mcp_denied(
             req_id,
             -32601,
             "resume_executions requires platform-admin privileges. \
@@ -2909,7 +2909,7 @@ async fn handle_enqueue_workflow(
     // the same `graph_json`) and makes the shared decision reachable.
     let wf_record = match state.workflow_repo.get_workflow(wf_id, user_id).await {
         Ok(Some(r)) => r,
-        Ok(None) => return mcp_error(req_id, -32000, "Workflow not found or access denied"),
+        Ok(None) => return mcp_denied(req_id, -32000, "Workflow not found or access denied"),
         Err(e) => {
             tracing::error!(
                 workflow_id = %wf_id,
@@ -3394,7 +3394,7 @@ async fn handle_get_sub_workflow_output(
         // unlabelled archived row would read as a live one.
         Ok(ExecutionLookup::Archived { row, archived_at }) => (row, Some(archived_at)),
         Ok(ExecutionLookup::Absent) => {
-            return mcp_error(req_id, -32000, "Execution not found or access denied")
+            return mcp_denied(req_id, -32000, "Execution not found or access denied")
         }
         Err(e) => {
             tracing::error!("get_sub_workflow_output: load failed: {}", e);
@@ -3450,7 +3450,7 @@ async fn handle_get_sub_workflow_output(
                             .collect()
                     })
                     .unwrap_or_default();
-                mcp_error(
+                mcp_not_found(
                     req_id,
                     -32000,
                     &format!(
@@ -3491,14 +3491,14 @@ async fn handle_watch_execution(
             // `execution_events` were CASCADEd away by the move, so there
             // is nothing to watch — a genuine refusal, but not an absence.
             Ok(ExecutionLookup::Archived { archived_at, .. }) => {
-                return mcp_error(
+                return mcp_denied(
                     req_id,
                     -32000,
                     &archived_refusal("watch this execution", exec_id, archived_at),
                 )
             }
             Ok(ExecutionLookup::Absent) => {
-                return mcp_error(req_id, -32000, "Execution not found or access denied")
+                return mcp_denied(req_id, -32000, "Execution not found or access denied")
             }
             Err(e) => {
                 tracing::error!("watch_execution failed: {}", e);
@@ -3528,7 +3528,7 @@ async fn handle_watch_execution(
             // execution is terminal and its `execution_events` were CASCADEd
             // away, so there is genuinely nothing to watch.
             Ok(ExecutionLookup::Archived { row, archived_at }) => {
-                return mcp_error(
+                return mcp_denied(
                     req_id,
                     -32000,
                     &format!(
@@ -3822,7 +3822,7 @@ async fn handle_get_execution_output(
         // unlabelled archived row would read as a live one.
         Ok(ExecutionLookup::Archived { row, archived_at }) => (row, Some(archived_at)),
         Ok(ExecutionLookup::Absent) => {
-            return mcp_error(req_id, -32000, "Execution not found or access denied")
+            return mcp_denied(req_id, -32000, "Execution not found or access denied")
         }
         Err(e) => {
             tracing::error!("get_execution_output: load failed: {}", e);
@@ -3967,7 +3967,7 @@ async fn handle_get_execution_diff(
     let (exec_a, exec_b) = match (exec_a, exec_b) {
         (Some(a), Some(b)) => (a, b),
         _ => {
-            return mcp_error(
+            return mcp_denied(
                 req_id,
                 -32000,
                 "One or both executions not found or access denied",
@@ -4689,7 +4689,7 @@ async fn handle_get_execution_cost(
         // unlabelled archived row would read as a live one.
         Ok(ExecutionLookup::Archived { row, archived_at }) => (row, Some(archived_at)),
         Ok(ExecutionLookup::Absent) => {
-            return mcp_error(req_id, -32000, "Execution not found or access denied")
+            return mcp_denied(req_id, -32000, "Execution not found or access denied")
         }
         Err(e) => {
             tracing::error!("get_execution_cost query failed: {}", e);
@@ -4878,7 +4878,7 @@ async fn handle_get_execution_waterfall(
         // unlabelled archived row would read as a live one.
         Ok(ExecutionLookup::Archived { row, archived_at }) => (row, Some(archived_at)),
         Ok(ExecutionLookup::Absent) => {
-            return mcp_error(req_id, -32000, "Execution not found or access denied")
+            return mcp_denied(req_id, -32000, "Execution not found or access denied")
         }
         Err(e) => {
             tracing::error!(execution_id = %exec_id, "get_execution_waterfall fetch failed: {}", e);
@@ -5195,7 +5195,7 @@ async fn handle_get_execution_replay_chain(
         // unlabelled archived row would read as a live one.
         Ok(ExecutionLookup::Archived { row, archived_at }) => (row, Some(archived_at)),
         Ok(ExecutionLookup::Absent) => {
-            return mcp_error(req_id, -32000, "Execution not found or access denied")
+            return mcp_denied(req_id, -32000, "Execution not found or access denied")
         }
         Err(e) => {
             tracing::error!(execution_id = %exec_id, "get_execution_replay_chain fetch failed: {}", e);
@@ -6063,14 +6063,14 @@ async fn handle_acknowledge_execution_failure(
     {
         Ok(ExecutionLookup::Live(e)) => e,
         Ok(ExecutionLookup::Archived { archived_at, .. }) => {
-            return mcp_error(
+            return mcp_denied(
                 req_id,
                 -32000,
                 &archived_refusal("acknowledge this failure", exec_id, archived_at),
             )
         }
         Ok(ExecutionLookup::Absent) => {
-            return mcp_error(req_id, -32000, "Execution not found or access denied")
+            return mcp_denied(req_id, -32000, "Execution not found or access denied")
         }
         Err(e) => {
             tracing::error!(execution_id = %exec_id, "acknowledge_execution_failure fetch failed: {}", e);
@@ -6092,7 +6092,7 @@ async fn handle_acknowledge_execution_failure(
     // Idempotency guard — acknowledgements are immutable for audit integrity.
     // A second call with a different reason could silently overwrite the audit trail.
     if let Some(ref ack_at) = exec.acknowledged_at {
-        return mcp_error(
+        return mcp_denied(
             req_id,
             -32000,
             &format!(
@@ -6341,7 +6341,7 @@ async fn handle_get_execution_lineage(
         Ok(ExecutionBaseLookup::Live(base)) => (base, None),
         Ok(ExecutionBaseLookup::Archived { base, archived_at }) => (base, Some(archived_at)),
         Ok(ExecutionBaseLookup::Absent) => {
-            return mcp_error(req_id, -32000, "Execution not found or access denied")
+            return mcp_denied(req_id, -32000, "Execution not found or access denied")
         }
         Err(e) => {
             tracing::error!(execution_id = %exec_id, "get_execution_lineage: DB error: {}", e);
@@ -6729,14 +6729,14 @@ async fn handle_submit_workflow_approval(
                 "submit_workflow_approval: could not read execution owner — denying, but \
                  this is a READ FAILURE, not an ownership decision"
             );
-            return mcp_error(req_id, -32000, "Execution not found or access denied");
+            return mcp_denied(req_id, -32000, "Execution not found or access denied");
         }
     };
 
     match verdict {
         OwnerVerdict::LiveOwned => {} // authorised
         OwnerVerdict::ArchivedOwned(archived_at) => {
-            return mcp_error(
+            return mcp_denied(
                 req_id,
                 -32000,
                 &archived_refusal("submit an approval for", exec_id, archived_at),
@@ -6751,10 +6751,10 @@ async fn handle_submit_workflow_approval(
                 %exec_id,
                 "submit_workflow_approval: execution belongs to a different user"
             );
-            return mcp_error(req_id, -32000, "Execution not found or access denied");
+            return mcp_denied(req_id, -32000, "Execution not found or access denied");
         }
         OwnerVerdict::Absent => {
-            return mcp_error(req_id, -32000, "Execution not found or access denied");
+            return mcp_denied(req_id, -32000, "Execution not found or access denied");
         }
     }
 
@@ -7047,7 +7047,7 @@ async fn handle_get_node_io(
         // unlabelled archived row would read as a live one.
         Ok(ExecutionLookup::Archived { row, archived_at }) => (row, Some(archived_at)),
         Ok(ExecutionLookup::Absent) => {
-            return mcp_error(req_id, -32000, "Execution not found or access denied")
+            return mcp_denied(req_id, -32000, "Execution not found or access denied")
         }
         Err(e) => {
             tracing::error!(execution_id = %exec_id, "get_node_io: load failed: {}", e);

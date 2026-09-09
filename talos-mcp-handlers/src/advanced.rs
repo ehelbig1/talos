@@ -1,5 +1,5 @@
 use super::types::JsonRpcResponse;
-use super::utils::{check_outbound_url_no_ssrf, mcp_error, mcp_text};
+use super::utils::{check_outbound_url_no_ssrf, mcp_denied, mcp_error, mcp_not_found, mcp_text};
 use super::{auth, McpState};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -931,7 +931,7 @@ async fn handle_query_paginated(
         .await
         .unwrap_or(false);
     if !is_platform_admin {
-        return mcp_error(
+        return mcp_denied(
             req_id,
             -32601,
             "query_paginated requires platform-admin privileges. \
@@ -1940,7 +1940,7 @@ async fn handle_set_archive_policy(
         .await
         .unwrap_or(false);
     if !is_platform_admin {
-        return mcp_error(
+        return mcp_denied(
             req_id,
             -32601,
             "set_archive_policy requires platform-admin privileges. \
@@ -2090,7 +2090,7 @@ async fn handle_list_archived_executions(
     // with "Workflow not found or access denied"; match that.
     if let Some(wf_id) = workflow_filter {
         if !state.workflow_repo.workflow_exists(wf_id, user_id).await {
-            return mcp_error(req_id, -32000, "Workflow not found or access denied");
+            return mcp_denied(req_id, -32000, "Workflow not found or access denied");
         }
     }
     let limit = match crate::utils::validate_range_i64(args, "limit", 1, 100, 20, &req_id) {
@@ -2281,7 +2281,7 @@ async fn handle_publish_to_marketplace(
             }
 
             if source_code.is_none() {
-                return mcp_error(
+                return mcp_denied(
                     req_id,
                     -32000,
                     "Module has no source code and cannot be published to the marketplace",
@@ -2311,7 +2311,7 @@ async fn handle_publish_to_marketplace(
                     let wasm_bytes = sandbox.wasm_bytes;
 
                     if wasm_bytes.is_none() {
-                        return mcp_error(
+                        return mcp_denied(
                             req_id,
                             -32000,
                             "Sandbox module has no compiled WASM and cannot be published",
@@ -2348,7 +2348,7 @@ async fn handle_publish_to_marketplace(
                         }
                     }
                 }
-                Ok(None) => mcp_error(req_id, -32000, "Module not found or access denied"),
+                Ok(None) => mcp_denied(req_id, -32000, "Module not found or access denied"),
                 Err(e) => {
                     tracing::error!("publish_to_marketplace sandbox lookup failed: {}", e);
                     mcp_error(req_id, -32000, "Failed to look up module")
@@ -2529,7 +2529,7 @@ async fn handle_install_from_marketplace(
                                 mcp_error(req_id, -32000, "Failed to install module")
                             }
                         },
-                        InstallDispatch::Reject => mcp_error(
+                        InstallDispatch::Reject => mcp_denied(
                             req_id,
                             -32000,
                             "Marketplace listing has no installable artifact: the source module has \
@@ -2767,7 +2767,7 @@ async fn handle_archive_workflow(
             }))
             .unwrap_or_default(),
         ),
-        Ok(_) => mcp_error(req_id, -32000, "Workflow not found, access denied, or already archived"),
+        Ok(_) => mcp_denied(req_id, -32000, "Workflow not found, access denied, or already archived"),
         Err(e) => {
             tracing::error!(workflow_id = %wf_id, "archive_workflow failed: {}", e);
             mcp_error(req_id, -32000, "Failed to archive workflow")
@@ -2799,7 +2799,7 @@ async fn handle_star_module(
     let listing_exists = state.advanced_repo.check_listing_exists(listing_id).await;
 
     match listing_exists {
-        Ok(false) | Err(_) => return mcp_error(req_id, -32000, "Listing not found or not public"),
+        Ok(false) | Err(_) => return mcp_denied(req_id, -32000, "Listing not found or not public"),
         Ok(true) => {}
     }
 
@@ -2853,7 +2853,7 @@ async fn handle_star_module(
                 .unwrap_or_default(),
             )
         }
-        Ok(None) => mcp_error(req_id, -32000, "Listing not found or not public"),
+        Ok(None) => mcp_denied(req_id, -32000, "Listing not found or not public"),
         Err(e) => {
             tracing::error!(listing_id = %listing_id, "star_module update failed: {}", e);
             mcp_error(req_id, -32000, "Failed to star module")
@@ -2904,7 +2904,7 @@ async fn handle_get_config_suggestions(
         .await
     {
         Ok(Some(pair)) => pair,
-        Ok(None) => return mcp_error(req_id, -32000, "Workflow not found or access denied"),
+        Ok(None) => return mcp_denied(req_id, -32000, "Workflow not found or access denied"),
         Err(e) => {
             tracing::error!("get_config_suggestions fetch failed: {}", e);
             return mcp_error(req_id, -32000, "Failed to fetch workflow");
@@ -2926,7 +2926,7 @@ async fn handle_get_config_suggestions(
     // Find target node and its upstream nodes
     let target_node = match talos_workflow_repository::find_node_in_array(&nodes, &target_node_id) {
         Some(n) => n.clone(),
-        None => return mcp_error(req_id, -32000, "Node not found in workflow graph"),
+        None => return mcp_not_found(req_id, -32000, "Node not found in workflow graph"),
     };
 
     let upstream_node_ids: Vec<String> = edges
@@ -3465,7 +3465,7 @@ async fn handle_create_approval_gate(
             .unwrap_or(false);
 
         if !exists {
-            return mcp_error(
+            return mcp_denied(
                 req_id,
                 -32000,
                 "continuation_workflow_id not found or access denied",
@@ -3794,7 +3794,7 @@ async fn handle_resolve_approval_gate(
         .await
     {
         Ok(Some(g)) => g,
-        Ok(None) => return mcp_error(req_id, -32000, "Approval gate not found or access denied"),
+        Ok(None) => return mcp_denied(req_id, -32000, "Approval gate not found or access denied"),
         Err(e) => {
             tracing::error!("resolve_approval_gate fetch failed: {}", e);
             return mcp_error(req_id, -32000, "Failed to fetch approval gate");
@@ -3802,7 +3802,7 @@ async fn handle_resolve_approval_gate(
     };
 
     if gate.status != "pending" {
-        return mcp_error(
+        return mcp_denied(
             req_id,
             -32000,
             &format!(
@@ -3827,7 +3827,7 @@ async fn handle_resolve_approval_gate(
         .await
     {
         Ok(0) => {
-            return mcp_error(
+            return mcp_denied(
                 req_id,
                 -32000,
                 "Gate was resolved by another request — not resolving again",
@@ -3925,7 +3925,7 @@ async fn handle_cancel_approval_gate(
             req_id,
             &format!("Approval gate {} has been cancelled.", gate_id),
         ),
-        Ok(_) => mcp_error(
+        Ok(_) => mcp_denied(
             req_id,
             -32000,
             "Gate not found, access denied, or not in pending status",
@@ -4067,7 +4067,7 @@ async fn handle_deploy_workflow(
         .await
     {
         Ok(Some(row)) => row,
-        Ok(None) => return mcp_error(req_id, -32000, "Workflow not found or access denied"),
+        Ok(None) => return mcp_denied(req_id, -32000, "Workflow not found or access denied"),
         Err(e) => {
             tracing::error!(workflow_id = %wf_id, "deploy_workflow fetch failed: {}", e);
             return mcp_error(req_id, -32000, "Failed to fetch workflow");
@@ -4075,7 +4075,7 @@ async fn handle_deploy_workflow(
     };
 
     if wf_status.as_deref() == Some("archived") {
-        return mcp_error(req_id, -32000, "Cannot deploy an archived workflow");
+        return mcp_denied(req_id, -32000, "Cannot deploy an archived workflow");
     }
 
     // Publish version
@@ -4341,7 +4341,9 @@ async fn handle_promote_workflow(
 
     let src = match src_row {
         Ok(Some(r)) => r,
-        Ok(None) => return mcp_error(req_id, -32000, "Source workflow not found or access denied"),
+        Ok(None) => {
+            return mcp_denied(req_id, -32000, "Source workflow not found or access denied")
+        }
         Err(e) => {
             tracing::error!(workflow_id = %src_id, "promote_workflow fetch failed: {}", e);
             return mcp_error(req_id, -32000, "Failed to fetch source workflow");
@@ -4742,7 +4744,7 @@ async fn handle_publish_built_in_templates(
         .await
         .unwrap_or(false);
     if !is_platform_admin {
-        return mcp_error(
+        return mcp_denied(
             req_id,
             -32601,
             "publish_built_in_templates requires platform-admin privileges. \
@@ -4839,7 +4841,7 @@ async fn handle_test_sla_webhook(
     // Load SLA threshold config for this workflow
     let threshold_row = match state.advanced_repo.get_sla_threshold(wf_id, user_id).await {
         Ok(Some(r)) => r,
-        Ok(None) => return mcp_error(
+        Ok(None) => return mcp_denied(
             req_id,
             -32000,
             "No SLA threshold configured for this workflow. Use set_workflow_sla_threshold first.",
@@ -5039,7 +5041,7 @@ async fn handle_test_approval_webhook(
         .await
     {
         Ok(Some((title, wh))) => (title, wh),
-        Ok(None) => return mcp_error(req_id, -32000, "Approval gate not found or access denied"),
+        Ok(None) => return mcp_denied(req_id, -32000, "Approval gate not found or access denied"),
         Err(e) => {
             tracing::error!("test_approval_webhook: DB lookup failed: {}", e);
             return mcp_error(req_id, -32000, "Failed to load approval gate");
@@ -5048,7 +5050,7 @@ async fn handle_test_approval_webhook(
 
     let webhook_url = match webhook_url {
         Some(url) if !url.is_empty() => url,
-        _ => return mcp_error(
+        _ => return mcp_denied(
             req_id,
             -32000,
             "This approval gate has no notification_webhook configured. Re-create it with a notification_webhook parameter.",
@@ -5253,7 +5255,7 @@ async fn handle_create_workflow_suspension(
             .unwrap_or(false);
 
         if !exists {
-            return mcp_error(
+            return mcp_denied(
                 req_id,
                 -32000,
                 "continuation_workflow_id not found or access denied",
@@ -5457,7 +5459,7 @@ async fn handle_resume_workflow_by_correlation_id(
     {
         Ok(Some(claim)) => claim,
         Ok(None) => {
-            return mcp_error(
+            return mcp_denied(
                 req_id,
                 -32000,
                 "Suspension not found, access denied, or no longer waiting",
@@ -5537,7 +5539,7 @@ async fn handle_cancel_workflow_suspension(
             }))
             .unwrap_or_default(),
         ),
-        Ok(_) => mcp_error(
+        Ok(_) => mcp_denied(
             req_id,
             -32000,
             "Suspension not found, access denied, or not in waiting status",

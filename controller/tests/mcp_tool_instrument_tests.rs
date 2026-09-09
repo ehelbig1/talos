@@ -108,6 +108,22 @@ fn label_pairs(
     m: &talos_metrics::TalosMetrics,
     family: &str,
 ) -> std::collections::BTreeMap<(String, String), f64> {
+    label_triples(m, family)
+        .into_iter()
+        .map(|((t, o, _c), v)| ((t, o), v))
+        .collect()
+}
+
+/// The same read, keeping the `class` label package 35 added.
+///
+/// `class` is a pure function of `outcome`, so this map has exactly as many
+/// entries as `label_pairs` — which is the property
+/// `talos_metrics::mcp::tests::the_class_label_adds_no_series` pins and this
+/// binary then observes on a REAL registry.
+fn label_triples(
+    m: &talos_metrics::TalosMetrics,
+    family: &str,
+) -> std::collections::BTreeMap<(String, String, String), f64> {
     let mut out = std::collections::BTreeMap::new();
     for mf in m.registry.gather() {
         if mf.name() != family {
@@ -116,10 +132,12 @@ fn label_pairs(
         for metric in mf.get_metric() {
             let mut tool = String::new();
             let mut outcome = String::new();
+            let mut class = String::new();
             for l in metric.get_label() {
                 match l.name() {
                     "tool" => tool = l.value().to_string(),
                     "outcome" => outcome = l.value().to_string(),
+                    "class" => class = l.value().to_string(),
                     _ => {}
                 }
             }
@@ -130,10 +148,28 @@ fn label_pairs(
             } else {
                 metric.get_histogram().get_sample_count() as f64
             };
-            out.insert((tool, outcome), v);
+            out.insert((tool, outcome, class), v);
         }
     }
     out
+}
+
+/// Serialises the Leg D tests that measure a DELTA on a series a SIBLING in
+/// this binary also moves.
+///
+/// `installed_metrics()` returns the process-global registry, so two tests
+/// probing `(get_workflow, denied)` concurrently each see the other's
+/// increment. The obvious repair — relaxing the assertion to `>= 1` — throws
+/// away the property that matters: "exactly once" is what proves ONE record
+/// site writes both the counter and the histogram, which is the invariant
+/// `the_chokepoint_records_a_series_for_a_real_tool_call` was written for.
+/// So the window is serialised instead. Poison is recovered from, because a
+/// panicking sibling must fail on its OWN assertion rather than turn every
+/// other test in this binary red.
+static SHARED_SERIES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn shared_series_guard() -> std::sync::MutexGuard<'static, ()> {
+    SHARED_SERIES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 fn call(tool: &str, args: serde_json::Value) -> controller::mcp::types::JsonRpcRequest {
@@ -167,6 +203,9 @@ async fn the_chokepoint_records_a_series_for_a_real_tool_call() {
     let user_id = seed_user(&pool).await;
     let state = mcp_state(pool.clone()).await;
     let m = installed_metrics();
+    // `(whoami, ok)` is also moved by `the_exported_series_carry_one_class_
+    // _per_outcome`; see `SHARED_SERIES`.
+    let _serial = shared_series_guard();
 
     let before = label_pairs(&m, "talos_mcp_tool_calls_total")
         .get(&("whoami".to_string(), "ok".to_string()))
@@ -298,12 +337,20 @@ async fn the_instrument_leaves_the_response_byte_identical() {
     );
 }
 
+/// A caller fault records `refused`.
+///
+/// The name said "and a server fault records error" until 2026-09-09 and the
+/// body never drove one — a test asserting half of what it claims, which is
+/// the class this repo keeps repairing one surface over. The server-fault
+/// half is `a_read_failure_records_error_and_classes_finding` in Leg D, which
+/// injects a real read failure rather than naming one.
 #[tokio::test]
-async fn a_caller_fault_records_refused_and_a_server_fault_records_error() {
+async fn a_caller_fault_records_refused() {
     let (pool, _db) = common::isolated_db_pool().await;
     let user_id = seed_user(&pool).await;
     let state = mcp_state(pool.clone()).await;
     let m = installed_metrics();
+    let _serial = shared_series_guard();
 
     // A missing required argument is -32602 — the CALLER can fix it. Folding
     // it into `error` would make a client looping on a typo indistinguishable
@@ -751,5 +798,308 @@ async fn the_batched_graph_read_refuses_another_tenants_ids() {
     assert_eq!(
         got[0].0, owned[0],
         "and it must be the caller's own workflow"
+    );
+}
+
+// ── Leg D: the refusal/failure partition, through the production dispatch ──
+//
+// Package 35. `talos_mcp_handlers::tool_labels`' unit tests prove the RULE and
+// `talos_metrics::mcp`'s prove the partition; neither can prove that a real
+// `tools/call` moves the series with the right label, which is check 58's
+// stated limit (an increment site existing says nothing about anything
+// reaching it) applied to a label VALUE rather than to a counter.
+//
+// The pair below is deliberately ONE tool, ONE JSON-RPC code and TWO
+// meanings: `get_workflow` on an id that is not the caller's answers
+// `-32000 "Workflow not found or access denied"`, and `get_workflow` with the
+// `workflows` relation removed answers `-32000` too. Before this package both
+// moved `outcome="error"`; the reply bytes of the first are unchanged and are
+// pinned in `talos_mcp` and `talos_mcp_handlers::utils`.
+
+/// A REFUSAL records `denied` / `declined`, and its CONTROL — a healthy call
+/// on the same tool — still records `ok` / `served`.
+#[tokio::test]
+async fn a_tenancy_refusal_records_denied_and_classes_declined() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let user_id = seed_user(&pool).await;
+    let state = mcp_state(pool.clone()).await;
+    let m = installed_metrics();
+    let _serial = shared_series_guard();
+
+    let key = (
+        "get_workflow".to_string(),
+        "denied".to_string(),
+        "declined".to_string(),
+    );
+    let before = label_triples(&m, "talos_mcp_tool_calls_total")
+        .get(&key)
+        .copied()
+        .unwrap_or(0.0);
+
+    let resp = controller::mcp::handle_tools_call(
+        call(
+            "get_workflow",
+            serde_json::json!({ "workflow_id": Uuid::new_v4().to_string() }),
+        ),
+        state.clone(),
+        agent(user_id),
+    )
+    .await;
+
+    // The reply the CALLER sees is the collapsed one, and stays collapsed.
+    let text = resp
+        .result
+        .as_ref()
+        .and_then(|r| r.pointer("/content/0/text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        text.contains("not found or access denied"),
+        "the caller-facing wording must not gain the distinction the operator \
+         just gained; got {text:?}"
+    );
+    assert_eq!(
+        resp.result
+            .as_ref()
+            .and_then(|r| r.get("errorCode"))
+            .and_then(serde_json::Value::as_i64),
+        Some(-32000),
+        "the wire code must not move — MCP clients may depend on it"
+    );
+
+    let after = label_triples(&m, "talos_mcp_tool_calls_total")
+        .get(&key)
+        .copied()
+        .unwrap_or(0.0);
+    assert_eq!(
+        after - before,
+        1.0,
+        "a tenancy refusal must move talos_mcp_tool_calls_total\
+         {{tool=\"get_workflow\",outcome=\"denied\",class=\"declined\"}} exactly once"
+    );
+
+    // CONTROL, in the same run: the tool is not simply always answering
+    // `denied`. Without this the assertion above passes on a build where every
+    // call is refused.
+    let wf = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workflows (id, user_id, name, description, module_uri, graph_json, \
+         status, is_enabled, created_at, updated_at) \
+         VALUES ($1, $2, $3, '', '', '{\"nodes\":[],\"edges\":[]}', 'active', true, NOW(), NOW())",
+    )
+    .bind(wf)
+    .bind(user_id)
+    .bind(format!("p35-{wf}"))
+    .execute(&pool)
+    .await
+    .expect("seed workflow");
+
+    let ok_key = (
+        "get_workflow".to_string(),
+        "ok".to_string(),
+        "served".to_string(),
+    );
+    let ok_before = label_triples(&m, "talos_mcp_tool_calls_total")
+        .get(&ok_key)
+        .copied()
+        .unwrap_or(0.0);
+    let ok_resp = controller::mcp::handle_tools_call(
+        call(
+            "get_workflow",
+            serde_json::json!({ "workflow_id": wf.to_string() }),
+        ),
+        state.clone(),
+        agent(user_id),
+    )
+    .await;
+    assert_eq!(
+        talos_mcp_handlers::tool_labels::classify_outcome(&ok_resp),
+        McpToolOutcome::Ok,
+        "control: the caller's own workflow must read"
+    );
+    let ok_after = label_triples(&m, "talos_mcp_tool_calls_total")
+        .get(&ok_key)
+        .copied()
+        .unwrap_or(0.0);
+    assert_eq!(ok_after - ok_before, 1.0, "control must move the ok series");
+}
+
+/// The OWNERSHIP FUNNEL behind 20+ actor tools records `denied` too.
+///
+/// `get_workflow`'s refusal above is an inline site; this one goes through
+/// `actor::resolve_actor_via_repo`, whose `Ok(None)` and `Err` arms render
+/// the SAME `-32000` reply and were separated for the operator's PROSE by
+/// #782 without the instrument being able to see it. Reverting that one arm
+/// to `mcp_error` survives every other test in this workspace (measured), so
+/// this case is what makes the highest-leverage funnel non-optional.
+#[tokio::test]
+async fn the_actor_ownership_funnel_records_denied() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let user_id = seed_user(&pool).await;
+    let state = mcp_state(pool.clone()).await;
+    let m = installed_metrics();
+
+    let key = (
+        "get_actor_summary".to_string(),
+        "denied".to_string(),
+        "declined".to_string(),
+    );
+    let before = label_triples(&m, "talos_mcp_tool_calls_total")
+        .get(&key)
+        .copied()
+        .unwrap_or(0.0);
+
+    let resp = controller::mcp::handle_tools_call(
+        call(
+            "get_actor_summary",
+            serde_json::json!({ "actor_id": Uuid::new_v4().to_string() }),
+        ),
+        state.clone(),
+        agent(user_id),
+    )
+    .await;
+
+    let text = resp
+        .result
+        .as_ref()
+        .and_then(|r| r.pointer("/content/0/text"))
+        .and_then(|t| t.as_str())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        text.contains("Actor not found or access denied"),
+        "the collapsed wording is the anti-enumeration property and must not \
+         move; got {text:?}"
+    );
+    let after = label_triples(&m, "talos_mcp_tool_calls_total")
+        .get(&key)
+        .copied()
+        .unwrap_or(0.0);
+    assert_eq!(
+        after - before,
+        1.0,
+        "the ownership funnel's refusal arm must record denied/declined"
+    );
+}
+
+/// A FAILURE on the SAME tool and the SAME wire code records `error` /
+/// `finding`.
+///
+/// The failure is injected the way package 22's binaries do it: the RELATION
+/// the read names is dropped in this test's own isolated database, so the
+/// statement cannot run. That is the shape a database incident takes at this
+/// handler, and it is the state the pre-package-35 instrument reported
+/// identically to the refusal above.
+#[tokio::test]
+async fn a_read_failure_records_error_and_classes_finding() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let user_id = seed_user(&pool).await;
+    let state = mcp_state(pool.clone()).await;
+    let m = installed_metrics();
+    let _serial = shared_series_guard();
+
+    // CONTROL FIRST, on the intact schema: a refusal here is `denied`, so the
+    // assertion below cannot pass merely because everything is refused.
+    let control = controller::mcp::handle_tools_call(
+        call(
+            "get_workflow",
+            serde_json::json!({ "workflow_id": Uuid::new_v4().to_string() }),
+        ),
+        state.clone(),
+        agent(user_id),
+    )
+    .await;
+    assert_eq!(
+        talos_mcp_handlers::tool_labels::classify_outcome(&control),
+        McpToolOutcome::Denied,
+        "control: on a healthy database this is a refusal"
+    );
+
+    sqlx::query("DROP TABLE workflows CASCADE")
+        .execute(&pool)
+        .await
+        .expect("drop the relation the read names");
+
+    let key = (
+        "get_workflow".to_string(),
+        "error".to_string(),
+        "finding".to_string(),
+    );
+    let before = label_triples(&m, "talos_mcp_tool_calls_total")
+        .get(&key)
+        .copied()
+        .unwrap_or(0.0);
+
+    let resp = controller::mcp::handle_tools_call(
+        call(
+            "get_workflow",
+            serde_json::json!({ "workflow_id": Uuid::new_v4().to_string() }),
+        ),
+        state.clone(),
+        agent(user_id),
+    )
+    .await;
+    assert_eq!(
+        talos_mcp_handlers::tool_labels::classify_outcome(&resp),
+        McpToolOutcome::Error,
+        "an unreadable relation is a FINDING, not a refusal"
+    );
+
+    let after = label_triples(&m, "talos_mcp_tool_calls_total")
+        .get(&key)
+        .copied()
+        .unwrap_or(0.0);
+    assert_eq!(
+        after - before,
+        1.0,
+        "a read failure must move the error/finding series exactly once"
+    );
+}
+
+/// `class` is a pure function of `outcome` ON A REAL REGISTRY.
+///
+/// The unit test asserts it over the TABLE; this asserts it over the series
+/// the process actually exported, which is where a hand-written
+/// `with_label_values(&[tool, outcome, "finding"])` at some future call site
+/// would show up as a second class for one outcome.
+#[tokio::test]
+async fn the_exported_series_carry_one_class_per_outcome() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let user_id = seed_user(&pool).await;
+    let state = mcp_state(pool.clone()).await;
+    let m = installed_metrics();
+    let _serial = shared_series_guard();
+
+    for (tool, args) in [
+        ("whoami", serde_json::json!({})),
+        (
+            "get_workflow",
+            serde_json::json!({ "workflow_id": Uuid::new_v4().to_string() }),
+        ),
+        ("get_workflow", serde_json::json!({})),
+    ] {
+        let _ = controller::mcp::handle_tools_call(call(tool, args), state.clone(), agent(user_id))
+            .await;
+    }
+
+    let mut seen: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for ((_tool, outcome, class), _v) in label_triples(&m, "talos_mcp_tool_calls_total") {
+        assert!(
+            !class.is_empty(),
+            "every exported series must carry a class label"
+        );
+        if let Some(prev) = seen.insert(outcome.clone(), class.clone()) {
+            assert_eq!(
+                prev, class,
+                "outcome {outcome:?} exported under two classes, so the class \
+                 label is NOT a pure function of the outcome and it multiplies \
+                 the series count"
+            );
+        }
+    }
+    assert!(
+        seen.len() >= 3,
+        "the probe should have produced at least ok / denied / refused; got {seen:?}"
     );
 }

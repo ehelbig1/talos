@@ -10,7 +10,7 @@
 //! `talos-search-service` post-r305.
 
 use super::types::JsonRpcResponse;
-use super::utils::{mcp_error, mcp_text};
+use super::utils::{mcp_denied, mcp_error, mcp_text};
 use super::{auth, McpState};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -623,7 +623,7 @@ async fn handle_find_similar_workflows(
         .await
     {
         Ok(Some(s)) => s,
-        Ok(None) => return mcp_error(req_id, -32000, "Workflow not found or access denied"),
+        Ok(None) => return mcp_denied(req_id, -32000, "Workflow not found or access denied"),
         Err(e) => {
             tracing::error!("find_similar_workflows source query failed: {:#}", e);
             return mcp_error(req_id, -32000, "Failed to fetch workflow");

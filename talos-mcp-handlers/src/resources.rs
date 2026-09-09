@@ -15,6 +15,7 @@ pub async fn handle_resources_list(
                 id: req.id,
                 result: Some(serde_json::json!({ "resources": [] })),
                 error: None,
+                error_kind: None,
             };
         }
     };
@@ -56,6 +57,7 @@ pub async fn handle_resources_list(
             "resources": resources
         })),
         error: None,
+        error_kind: None,
     }
 }
 
@@ -134,6 +136,7 @@ pub async fn handle_resources_read(
                 ]
             })),
             error: None,
+            error_kind: None,
         };
     } else if uri.starts_with("talos://executions/") {
         let exec_id_str = uri.trim_start_matches("talos://executions/");
@@ -179,6 +182,7 @@ pub async fn handle_resources_read(
                     ]
                 })),
                 error: None,
+                error_kind: None,
             };
         } else {
             return resource_not_found_error(req.id, uri);

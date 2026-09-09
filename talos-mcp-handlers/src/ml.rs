@@ -14,7 +14,7 @@
 //! embedder never holds a connection.
 
 use super::types::JsonRpcResponse;
-use super::utils::{mcp_error, mcp_text};
+use super::utils::{mcp_denied, mcp_error, mcp_failed, mcp_not_found, mcp_text};
 use super::McpState;
 use serde_json::Value;
 use std::sync::Arc;
@@ -209,7 +209,7 @@ pub async fn dispatch(
         return None;
     }
     let Some(user_id) = agent.user_id else {
-        return Some(mcp_error(
+        return Some(mcp_denied(
             req_id,
             -32000,
             "ML lifecycle tools require a user-bound agent identity",
@@ -298,12 +298,31 @@ fn internal(req_id: Option<Value>, context: &str, e: &anyhow::Error) -> JsonRpcR
 /// Ownership gate: the dataset's tenancy row must name the caller.
 /// Defense in depth alongside RLS (which only enforces under
 /// TALOS_RLS_SET_ROLE).
+/// A refusal from the dataset ownership gate, carrying BOTH the caller-facing
+/// message (unchanged, and deliberately reason-blind) and what the gate MEANT.
+///
+/// The two halves are separate for the reason `talos_mcp::McpErrorKind`
+/// exists: `Ok(_)` is a tenancy refusal and `Err` is a read that did not
+/// answer, the reply must not distinguish them, and the instrument must.
+struct DatasetOwnerRefusal {
+    kind: talos_mcp::McpErrorKind,
+    msg: &'static str,
+}
+
+impl DatasetOwnerRefusal {
+    /// The response, byte-identical to the `mcp_error(req_id, -32000, &m)`
+    /// every call site used to build.
+    fn response(&self, req_id: Option<Value>) -> JsonRpcResponse {
+        talos_mcp::mcp_error_kind(req_id, -32000, self.kind, self.msg)
+    }
+}
+
 async fn require_dataset_owner(
     svc: &DatasetService,
     conn: &mut sqlx::PgConnection,
     dataset_id: Uuid,
     user_id: Uuid,
-) -> Result<talos_ml::DatasetTenancy, String> {
+) -> Result<talos_ml::DatasetTenancy, DatasetOwnerRefusal> {
     match svc.lookup_dataset_tenancy(conn, dataset_id).await {
         Ok(Some(t)) if t.user_id == user_id => Ok(t),
         // Single message for not-found AND foreign rows so the surface
@@ -314,15 +333,18 @@ async fn require_dataset_owner(
         // (2026-09-07). The refusal stays; only the diagnosis changes, and the
         // enumeration property is untouched because the new message is
         // dataset-independent.
-        Ok(_) => Err("Dataset not found".to_string()),
+        Ok(_) => Err(DatasetOwnerRefusal {
+            kind: talos_mcp::McpErrorKind::Denied,
+            msg: "Dataset not found",
+        }),
         Err(e) => {
             tracing::error!(error = %e, %dataset_id, "dataset tenancy lookup failed");
-            Err(
-                "Could not verify dataset ownership — the dataset registry is \
-                 unavailable. This is NOT a statement that the dataset is absent; \
-                 retry, and check controller logs."
-                    .to_string(),
-            )
+            Err(DatasetOwnerRefusal {
+                kind: talos_mcp::McpErrorKind::Failed,
+                msg: "Could not verify dataset ownership — the dataset registry is \
+                      unavailable. This is NOT a statement that the dataset is absent; \
+                      retry, and check controller logs.",
+            })
         }
     }
 }
@@ -416,7 +438,7 @@ async fn handle_append_examples(
         };
         match require_dataset_owner(&svc, &mut tx, dataset_id, user_id).await {
             Ok(t) => t,
-            Err(m) => return mcp_error(req_id, -32000, &m),
+            Err(m) => return m.response(req_id),
         }
     };
     let prepared = match svc.prepare_examples(dataset_id, tenancy, examples).await {
@@ -459,7 +481,7 @@ async fn handle_dataset_stats(
         Err(e) => return internal(req_id, "dataset_stats", &e),
     };
     if let Err(m) = require_dataset_owner(&svc, &mut tx, dataset_id, user_id).await {
-        return mcp_error(req_id, -32000, &m);
+        return m.response(req_id);
     }
     match svc.stats(&mut tx, dataset_id).await {
         Ok(stats) => mcp_text(
@@ -498,7 +520,7 @@ async fn handle_dedupe_dataset(
         Err(e) => return internal(req_id, "dedupe_dataset", &e),
     };
     if let Err(m) = require_dataset_owner(&svc, &mut tx, dataset_id, user_id).await {
-        return mcp_error(req_id, -32000, &m);
+        return m.response(req_id);
     }
     match svc
         .dedupe_by_content(&mut tx, dataset_id, !apply, !include_corrections)
@@ -567,7 +589,7 @@ async fn handle_sample_examples(
         Err(e) => return internal(req_id, "sample_examples", &e),
     };
     if let Err(m) = require_dataset_owner(&svc, &mut tx, dataset_id, user_id).await {
-        return mcp_error(req_id, -32000, &m);
+        return m.response(req_id);
     }
     match svc.sample_examples(&mut tx, dataset_id, per_label).await {
         Ok(samples) => mcp_text(
@@ -605,7 +627,7 @@ async fn handle_create_model(
     };
     // The model's dataset must be the caller's own.
     if let Err(m) = require_dataset_owner(&svc, &mut tx, dataset_id, user_id).await {
-        return mcp_error(req_id, -32000, &m);
+        return m.response(req_id);
     }
     let created = ModelRegistry::create_model(
         &mut tx,
@@ -796,7 +818,7 @@ async fn handle_eval_model(
         );
     };
     if let Err(m) = require_dataset_owner(&svc, &mut tx, dataset_id, user_id).await {
-        return mcp_error(req_id, -32000, &m);
+        return m.response(req_id);
     }
     // Split + score + record inside ONE tx: the advisory lock taken by
     // run_knn_eval holds until commit, so a concurrent eval can't thrash
@@ -958,7 +980,7 @@ async fn handle_promote_model(
     };
     if let Some(dataset_id) = model.dataset_id {
         if let Err(m) = require_dataset_owner(&svc, &mut tx, dataset_id, user_id).await {
-            return mcp_error(req_id, -32000, &m);
+            return m.response(req_id);
         }
     }
     match ModelRegistry::promote_version(&mut tx, model_id, version_id).await {
@@ -1135,10 +1157,10 @@ async fn handle_get_model_card(
     // split `require_dataset_owner` already makes above).
     let model = match ModelRegistry::resolve_by_name(&mut tx, name, user_id).await {
         Ok(Some(m)) => m,
-        Ok(None) => return mcp_error(req_id, -32000, "Model not found"),
+        Ok(None) => return mcp_not_found(req_id, -32000, "Model not found"),
         Err(e) => {
             tracing::error!(error = %e, model_name = %name, "get_model_card: model lookup failed");
-            return mcp_error(
+            return mcp_failed(
                 req_id,
                 -32000,
                 "Could not look up this model — the model registry is unavailable. This \
@@ -1825,7 +1847,7 @@ async fn handle_resolve_disagreement(
             .to_string(),
         ),
         Err(talos_ml::ResolveError::NotFound) => {
-            mcp_error(req_id, -32000, "Disagreement not found or already handled")
+            mcp_denied(req_id, -32000, "Disagreement not found or already handled")
         }
         Err(talos_ml::ResolveError::NoDataset) => {
             mcp_error(req_id, -32000, "Model has no dataset to correct into")
@@ -1917,7 +1939,7 @@ async fn handle_provision_classifier(
         ),
         Err(talos_ml::ProvisionError::InvalidInput(m)) => mcp_error(req_id, -32602, &m),
         Err(talos_ml::ProvisionError::InvalidActor) => {
-            mcp_error(req_id, -32000, "actor not found or not owned by you")
+            mcp_denied(req_id, -32000, "actor not found or not owned by you")
         }
         Err(talos_ml::ProvisionError::Internal(e)) => internal(req_id, "provision_classifier", &e),
     }
@@ -1950,7 +1972,7 @@ async fn handle_delete_model(
             .to_string(),
         ),
         Err(talos_ml::DeleteError::NotFound) => {
-            mcp_error(req_id, -32000, "model not found or not owned by you")
+            mcp_denied(req_id, -32000, "model not found or not owned by you")
         }
         Err(talos_ml::DeleteError::ReferencedByWorkflows(n)) => mcp_error(
             req_id,

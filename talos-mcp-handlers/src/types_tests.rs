@@ -38,6 +38,7 @@ mod tests {
             id: Some(serde_json::json!(1)),
             result: Some(serde_json::json!({"success": true})),
             error: None,
+            error_kind: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();
@@ -59,6 +60,7 @@ mod tests {
             id: Some(serde_json::json!(1)),
             result: None,
             error: Some(error),
+            error_kind: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();

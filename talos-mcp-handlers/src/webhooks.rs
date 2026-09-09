@@ -1,5 +1,5 @@
 use super::types::JsonRpcResponse;
-use super::utils::{mcp_error, mcp_text};
+use super::utils::{mcp_denied, mcp_error, mcp_text};
 use super::{auth, McpState};
 use serde_json::Value;
 use std::sync::Arc;
@@ -564,7 +564,7 @@ async fn handle_delete_webhook(
             req_id,
             &format!("Webhook {} deleted successfully.", webhook_id),
         ),
-        Ok(_) => mcp_error(req_id, -32000, "Webhook not found or access denied"),
+        Ok(_) => mcp_denied(req_id, -32000, "Webhook not found or access denied"),
         Err(e) => {
             tracing::error!("delete_webhook failed: {:#}", e);
             mcp_error(req_id, -32000, "Failed to delete webhook")
@@ -586,7 +586,7 @@ async fn handle_enable_webhook(
     let webhook_repo = talos_webhook_repository::WebhookRepository::new(state.db_pool.clone());
     match webhook_repo.set_enabled(webhook_id, user_id, true).await {
         Ok(rows) if rows > 0 => mcp_text(req_id, &format!("Webhook {} enabled.", webhook_id)),
-        Ok(_) => mcp_error(req_id, -32000, "Webhook not found or access denied"),
+        Ok(_) => mcp_denied(req_id, -32000, "Webhook not found or access denied"),
         Err(e) => {
             tracing::error!("enable_webhook failed: {:#}", e);
             mcp_error(req_id, -32000, "Failed to enable webhook")
@@ -608,7 +608,7 @@ async fn handle_disable_webhook(
     let webhook_repo = talos_webhook_repository::WebhookRepository::new(state.db_pool.clone());
     match webhook_repo.set_enabled(webhook_id, user_id, false).await {
         Ok(rows) if rows > 0 => mcp_text(req_id, &format!("Webhook {} disabled.", webhook_id)),
-        Ok(_) => mcp_error(req_id, -32000, "Webhook not found or access denied"),
+        Ok(_) => mcp_denied(req_id, -32000, "Webhook not found or access denied"),
         Err(e) => {
             tracing::error!("disable_webhook failed: {:#}", e);
             mcp_error(req_id, -32000, "Failed to disable webhook")
@@ -641,7 +641,7 @@ async fn handle_list_workflow_webhooks(
         .await
     {
         Ok(Some(g)) => g,
-        Ok(None) => return mcp_error(req_id, -32000, "Workflow not found or access denied"),
+        Ok(None) => return mcp_denied(req_id, -32000, "Workflow not found or access denied"),
         Err(e) => {
             tracing::error!(
                 target: "talos_mcp_handlers::webhooks",
@@ -862,7 +862,7 @@ async fn handle_reset_webhook_circuit_breaker(
         .await
         .unwrap_or(false);
     if !is_platform_admin {
-        return mcp_error(
+        return mcp_denied(
             req_id,
             -32601,
             "reset_webhook_circuit_breaker requires platform-admin privileges. \

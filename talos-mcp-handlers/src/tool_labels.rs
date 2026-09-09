@@ -1,7 +1,9 @@
-//! The closed label set for the MCP `tools/call` instrument (2026-09-08).
+//! The closed label set for the MCP `tools/call` instrument (2026-09-08,
+//! extended 2026-09-09).
 //!
-//! Two decisions live here, and both are about what a caller can make the
-//! controller export.
+//! Three decisions live here. Two are about what a caller can make the
+//! controller export; the third is about what the controller can say about
+//! the caller WITHOUT saying it to the caller.
 //!
 //! **The `tool` label is never the caller's string.** `params.name` arrives
 //! from the wire; a `CounterVec`/`HistogramVec` keyed on it grows one series
@@ -21,6 +23,15 @@
 //! `dispatch` functions and ~320 arms; a per-handler decision would be 320
 //! places to forget. The response is one value with one shape.
 //!
+//! **…and the SHAPE is not enough on its own, so the site may state what it
+//! meant.** The wire code is the only thing the shape carries, and measured
+//! on this tree `-32000` (648 sites), `-32601`, `-32603` and `-32004` each
+//! carry BOTH a refusal and a failure. The site says which through
+//! [`talos_mcp::McpErrorKind`], which never reaches the wire — the reply for
+//! `"Actor not found or access denied"` is deliberately collapsed and must
+//! stay so. Absence of a statement is a real third value and falls back to
+//! the code table, whose default is the LOUD one.
+//!
 //! # Stated blind spot, measured rather than implied
 //!
 //! The registry this borrows from is the ADVERTISED set —
@@ -37,7 +48,7 @@
 //! repo. A client that discovered its tools from `tools/list` cannot reach
 //! any of the 29.
 
-use talos_mcp::JsonRpcResponse;
+use talos_mcp::{JsonRpcResponse, McpErrorKind};
 use talos_metrics::McpToolOutcome;
 
 /// The one label value for every name no schema advertises.
@@ -76,17 +87,52 @@ pub fn canonical_tool_label(name: &str) -> &'static str {
     TOOL_LABEL_UNKNOWN
 }
 
+/// The site's own statement, mapped to the outcome label.
+///
+/// Exhaustive by construction: a fourth [`McpErrorKind`] cannot be added
+/// without deciding here what it records as.
+#[must_use]
+const fn outcome_for_kind(kind: McpErrorKind) -> McpToolOutcome {
+    match kind {
+        McpErrorKind::Denied => McpToolOutcome::Denied,
+        McpErrorKind::NotFound => McpToolOutcome::NotFound,
+        McpErrorKind::Failed => McpToolOutcome::Error,
+    }
+}
+
 /// Classify one `tools/call` response into the closed outcome set.
 ///
-/// Shape only. `mcp_error` renders a refusal INSIDE `result`
-/// (`isError: true`, the JSON-RPC code preserved as `errorCode`) rather than
-/// in the JSON-RPC `error` member — the MCP tool-error convention — so
-/// reading `resp.error` alone would classify all ~820 refusal sites in this
-/// crate as `ok`.
+/// Shape first, then two sources in a fixed order.
+///
+/// `mcp_error` renders a refusal INSIDE `result` (`isError: true`, the
+/// JSON-RPC code preserved as `errorCode`) rather than in the JSON-RPC
+/// `error` member — the MCP tool-error convention — so reading `resp.error`
+/// alone would classify all ~1590 error sites in this crate as `ok`.
 ///
 /// A response carrying NEITHER member is malformed and classified `Error`,
 /// never `Ok`: an unclassifiable answer is not a successful one (check 77's
 /// rule for `__error`, applied to the response envelope).
+///
+/// # Why the code alone cannot do this (measured, 2026-09-09)
+///
+/// `scripts/mcp-error-inventory.py` walks every `mcp_error` argument list
+/// with comments and string content masked first. Of the **1590** production
+/// call sites, **648** are `-32000`, and that code carries `"Workflow not
+/// found or access denied"` (123 sites in that family) beside `"Failed to
+/// fetch workflow"`. Three more codes are mixed the same way: **11 of 12**
+/// `-32601` sites are platform-admin refusals, **7 of 15** `-32603` sites are
+/// capability-ceiling refusals, and BOTH `-32004` sites carry both arms of
+/// one helper. Re-assigning codes is not available either — the reply bytes
+/// are an interface MCP clients may depend on, and the "not found or access
+/// denied" collapse is a deliberate anti-enumeration property that must not
+/// be split in a reply.
+///
+/// So the SITE says what it meant, out of band, via
+/// [`JsonRpcResponse::error_kind`], and that statement WINS over the code.
+/// The code table below is the fallback for the 1363 sites that carry no
+/// statement — 883 of them `-32602`, which the table answers correctly — and
+/// its default is the LOUD one: a site nobody has read is not evidence the
+/// caller was at fault.
 #[must_use]
 pub fn classify_outcome(resp: &JsonRpcResponse) -> McpToolOutcome {
     if resp.error.is_some() {
@@ -100,18 +146,43 @@ pub fn classify_outcome(resp: &JsonRpcResponse) -> McpToolOutcome {
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
     {
+        // Deliberately BEFORE the kind is read: a success response carrying
+        // a stale kind (a handler that built a refusal, discarded it and
+        // reused the envelope) must still record `ok`.
         return McpToolOutcome::Ok;
     }
+    if let Some(kind) = resp.error_kind {
+        return outcome_for_kind(kind);
+    }
     match result.get("errorCode").and_then(serde_json::Value::as_i64) {
-        // -32601 MethodNotFound: no dispatch arm claimed the name.
+        // -32601 MethodNotFound: the ONE site that means it is
+        // `handle_tools_call_inner`'s tail. The eleven platform-admin
+        // refusals that also use this code say `Denied` explicitly above.
         Some(-32601) => McpToolOutcome::UnknownTool,
-        // -32602 InvalidParams: the caller can fix it. 411 of this crate's
-        // `mcp_error` sites use this code; folding them into `error` would
-        // make a client looping on a typo indistinguishable from an outage.
+        // -32602 InvalidParams: the caller can fix it. 883 of this crate's
+        // `mcp_error` sites use this code (NOT the 411 this comment used to
+        // claim — that number came from a single-line regex and the house
+        // call style breaks the call across lines); folding them into `error`
+        // would make a client looping on a typo indistinguishable from an
+        // outage.
         Some(-32602) => McpToolOutcome::Refused,
-        // -32000 (409 sites), -32603, -32003, -32004 and anything else are
-        // server-side. Unknown codes land here deliberately: a code nobody
-        // classified is not evidence the caller was at fault.
+        // Codes whose whole population is a refusal, verified site by site
+        // with the inventory — so these need no per-site statement and
+        // changed no reply. -32003 (13 sites: admin capability, capability
+        // ceiling, org membership, a workflow that is not dispatchable),
+        // -32001 (2: "requires an authenticated user context"), -32002 (1:
+        // "Actor not found, not active, or belongs to a different user"),
+        // -32600 (1: "Agent must have a bound user_id").
+        //
+        // This is a statement about TODAY's population, which is why
+        // `McpErrorKind::Failed` exists: a future failure on one of these
+        // codes says so at the site rather than needing this table changed.
+        Some(-32003 | -32002 | -32001 | -32600) => McpToolOutcome::Denied,
+        // -32000 (648 sites), -32603 (15), -32004 (2) and anything else are
+        // UNCLASSIFIED, and unclassified records as `error`. Deliberately the
+        // loud default: a code nobody has read is not evidence the caller was
+        // at fault. Roughly 250 of the -32000 sites are in fact refusals and
+        // are counted, by file, in this package's notes.
         _ => McpToolOutcome::Error,
     }
 }
@@ -144,7 +215,7 @@ pub fn request_id_field(id: Option<&serde_json::Value>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use talos_mcp::{mcp_error, mcp_text, JsonRpcError};
+    use talos_mcp::{mcp_denied, mcp_error, mcp_failed, mcp_not_found, mcp_text, JsonRpcError};
 
     #[test]
     fn every_advertised_tool_interns_to_the_registry_key() {
@@ -220,6 +291,7 @@ mod tests {
                 id: None,
                 result: None,
                 error: None,
+                error_kind: None,
             }),
             McpToolOutcome::Error
         );
@@ -234,6 +306,7 @@ mod tests {
                     message: "parse error".to_string(),
                     data: None,
                 }),
+                error_kind: None,
             }),
             McpToolOutcome::Error
         );
@@ -256,8 +329,145 @@ mod tests {
     }
 
     #[test]
-    fn the_outcome_label_set_is_four_closed_values() {
+    fn the_outcome_label_set_is_six_closed_values() {
         let values: Vec<&str> = McpToolOutcome::ALL.iter().map(|o| o.as_str()).collect();
-        assert_eq!(values, ["ok", "error", "refused", "unknown_tool"]);
+        assert_eq!(
+            values,
+            [
+                "ok",
+                "refused",
+                "unknown_tool",
+                "denied",
+                "not_found",
+                "error"
+            ]
+        );
+    }
+
+    /// The SITE's statement wins over the code. This is the whole mechanism:
+    /// `-32000` cannot classify itself, so the handler says what it meant.
+    #[test]
+    fn the_sites_own_statement_overrides_the_code() {
+        // The live C1 case: a capability refusal that USED to record `error`.
+        assert_eq!(
+            classify_outcome(&mcp_error(
+                None,
+                -32003,
+                "Unauthorized: get_system_health requires admin capability"
+            )),
+            McpToolOutcome::Denied,
+            "-32003's whole population is refusals, so the code alone suffices \
+             there and no site had to change"
+        );
+        // The two arms of one ownership gate, on ONE code, with ONE reply
+        // shape. Nothing but the out-of-band kind can separate them.
+        assert_eq!(
+            classify_outcome(&mcp_denied(
+                None,
+                -32000,
+                "Actor not found or access denied"
+            )),
+            McpToolOutcome::Denied
+        );
+        assert_eq!(
+            classify_outcome(&mcp_failed(
+                None,
+                -32000,
+                "Could not verify actor ownership — the actor registry is unavailable."
+            )),
+            McpToolOutcome::Error
+        );
+        assert_eq!(
+            classify_outcome(&mcp_not_found(
+                None,
+                -32000,
+                "Node 'x' not found in workflow"
+            )),
+            McpToolOutcome::NotFound
+        );
+        // A platform-admin refusal that used to record `unknown_tool`.
+        assert_eq!(
+            classify_outcome(&mcp_denied(
+                None,
+                -32601,
+                "query_paginated requires platform-admin privileges."
+            )),
+            McpToolOutcome::Denied
+        );
+        // …while the ONE site that really means it still does.
+        assert_eq!(
+            classify_outcome(&mcp_error(None, -32601, "Unknown tool: 'x'")),
+            McpToolOutcome::UnknownTool
+        );
+    }
+
+    /// A kind on a SUCCESS response must not be honoured. The shape check
+    /// runs first, so a handler that built a refusal, discarded it and reused
+    /// the envelope cannot record its call as declined.
+    #[test]
+    fn a_kind_on_a_success_response_is_ignored() {
+        let mut ok = mcp_text(None, "{}");
+        ok.error_kind = Some(McpErrorKind::Denied);
+        assert_eq!(classify_outcome(&ok), McpToolOutcome::Ok);
+    }
+
+    /// The kind → outcome mapping, pinned by NAME. Exhaustive over the enum,
+    /// so a fourth kind cannot be added without deciding what it records as.
+    #[test]
+    fn every_kind_maps_to_the_outcome_that_was_argued() {
+        let pairs: Vec<(&str, &str)> = McpErrorKind::ALL
+            .iter()
+            .map(|k| {
+                (
+                    match k {
+                        McpErrorKind::Denied => "Denied",
+                        McpErrorKind::NotFound => "NotFound",
+                        McpErrorKind::Failed => "Failed",
+                    },
+                    outcome_for_kind(*k).as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            pairs,
+            vec![
+                ("Denied", "denied"),
+                ("NotFound", "not_found"),
+                ("Failed", "error"),
+            ]
+        );
+    }
+
+    /// The class partition reaching THIS surface, pinned by name here too —
+    /// `talos_metrics::mcp` owns the table, and this asserts that the
+    /// classifier's answers land where the operator expects.
+    #[test]
+    fn a_refusal_classes_declined_and_a_failure_classes_finding() {
+        use talos_metrics::OutcomeClass;
+        for (resp, class) in [
+            (
+                mcp_denied(None, -32000, "Workflow not found or access denied"),
+                OutcomeClass::Declined,
+            ),
+            (
+                mcp_error(None, -32602, "missing 'workflow_id'"),
+                OutcomeClass::Declined,
+            ),
+            (
+                mcp_not_found(None, -32000, "Node 'x' not found in workflow"),
+                OutcomeClass::Declined,
+            ),
+            (
+                mcp_error(None, -32601, "Unknown tool: 'x'"),
+                OutcomeClass::Declined,
+            ),
+            (
+                mcp_error(None, -32000, "Failed to fetch workflow"),
+                OutcomeClass::Finding,
+            ),
+            (mcp_text(None, "{}"), OutcomeClass::Served),
+        ] {
+            assert_eq!(classify_outcome(&resp).class(), class);
+        }
     }
 }

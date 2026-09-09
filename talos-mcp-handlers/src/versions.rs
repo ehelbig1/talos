@@ -1,5 +1,5 @@
 use super::types::JsonRpcResponse;
-use super::utils::{compute_mcp_graph_diff, mcp_error, mcp_text};
+use super::utils::{compute_mcp_graph_diff, mcp_denied, mcp_error, mcp_text};
 use super::{auth, McpState};
 use serde_json::Value;
 use std::sync::Arc;
@@ -207,7 +207,7 @@ async fn handle_publish_version(
             .await
         {
             Ok(0) => {
-                return mcp_error(
+                return mcp_denied(
                     req_id,
                     -32000,
                     "Workflow not found or access denied; intent/capabilities were not \
@@ -753,7 +753,7 @@ async fn handle_get_version_diff_summary(
     };
     let draft_json = match draft_read {
         Some(g) => g,
-        None => return mcp_error(req_id, -32000, "Workflow not found or access denied"),
+        None => return mcp_denied(req_id, -32000, "Workflow not found or access denied"),
     };
 
     // Get active published version.

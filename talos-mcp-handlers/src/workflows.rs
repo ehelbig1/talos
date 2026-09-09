@@ -1,5 +1,5 @@
 use super::types::JsonRpcResponse;
-use super::utils::{mcp_error, mcp_text, update_workflow_search_text};
+use super::utils::{mcp_denied, mcp_error, mcp_not_found, mcp_text, update_workflow_search_text};
 use super::{auth, McpState};
 use serde_json::Value;
 use std::sync::Arc;
@@ -2049,7 +2049,7 @@ async fn handle_add_node_to_workflow(
 
     let graph_json_str = match state.workflow_repo.get_workflow_graph(wf_id, user_id).await {
         Ok(Some(gj)) => gj,
-        Ok(None) => return mcp_error(req_id, -32000, "Workflow not found or access denied"),
+        Ok(None) => return mcp_denied(req_id, -32000, "Workflow not found or access denied"),
         Err(e) => {
             tracing::error!("get_workflow_graph error: {}", e);
             return crate::utils::database_error(req_id);
@@ -2314,7 +2314,7 @@ async fn handle_add_node_to_workflow(
                 // talos_workflow_authorization::check_capability_ceiling so
                 // authoring-time rejection matches execution-time enforcement.
                 if !talos_capability_world::ceiling_permits(&actor_max, &node_world_full) {
-                    return mcp_error(
+                    return mcp_denied(
                         req_id,
                         -32603,
                         &format!(
@@ -2368,7 +2368,7 @@ async fn handle_add_node_to_workflow(
                             .unwrap_or("minimal-node");
                         // Lattice check (⊆), NOT linear world_rank (see above).
                         if !talos_capability_world::ceiling_permits(&actor_max, module_world) {
-                            return mcp_error(
+                            return mcp_denied(
                                 req_id,
                                 -32603,
                                 &format!(
@@ -2658,7 +2658,7 @@ async fn handle_add_node_to_workflow(
                 "add_node_to_workflow: UPDATE matched 0 rows — workflow missing or not owned at \
                  write time; node NOT persisted"
             );
-            return mcp_error(req_id, -32000, "Workflow not found or access denied");
+            return mcp_denied(req_id, -32000, "Workflow not found or access denied");
         }
         Err(e) => {
             tracing::error!(workflow_id = %wf_id, "add_node_to_workflow save failed: {}", e);
@@ -3179,7 +3179,7 @@ async fn handle_test_workflow_draft(
     let (graph_json, wf_agent_id, wf_description) = {
         match state.workflow_repo.get_workflow(wf_id, user_id).await {
             Ok(Some(wf)) => (wf.graph_json, wf.actor_id, wf.description),
-            Ok(None) => return mcp_error(req_id, -32000, "Workflow not found or access denied"),
+            Ok(None) => return mcp_denied(req_id, -32000, "Workflow not found or access denied"),
             Err(e) => {
                 tracing::error!("get_workflow error: {}", e);
                 return crate::utils::database_error(req_id);
@@ -3579,7 +3579,7 @@ async fn handle_delete_workflow(
         Ok(outcome) if !outcome.blocked_referenced.is_empty() => {
             mcp_error(req_id, -32000, &outcome.blocked_referenced[0].reason)
         }
-        Ok(outcome) if !outcome.blocked_running.is_empty() => mcp_error(
+        Ok(outcome) if !outcome.blocked_running.is_empty() => mcp_denied(
             req_id,
             -32000,
             "Cannot delete workflow with running or queued executions. Cancel them first.",
@@ -3652,7 +3652,7 @@ async fn handle_rename_workflow(
             }))
             .unwrap_or_default(),
         ),
-        Ok(false) => mcp_error(req_id, -32000, "Workflow not found or access denied"),
+        Ok(false) => mcp_denied(req_id, -32000, "Workflow not found or access denied"),
         Err(e) => {
             // Log the full error chain (potentially including DB
             // table/column names + Postgres error codes) for operators;
@@ -3754,7 +3754,7 @@ async fn handle_get_workflow_full(
 
     let wf = match state.workflow_repo.get_workflow(wf_id, user_id).await {
         Ok(Some(r)) => r,
-        Ok(None) => return mcp_error(req_id, -32000, "Workflow not found or access denied"),
+        Ok(None) => return mcp_denied(req_id, -32000, "Workflow not found or access denied"),
         Err(e) => {
             tracing::error!("get_workflow error: {}", e);
             return crate::utils::database_error(req_id);
@@ -4809,7 +4809,7 @@ async fn handle_validate_workflow(
             now: chrono::Utc::now(),
         },
     ) {
-        ValidateWorkflowOutcome::WorkflowMissing => Some(mcp_error(
+        ValidateWorkflowOutcome::WorkflowMissing => Some(mcp_denied(
             req_id.clone(),
             -32000,
             "Workflow not found or access denied",
@@ -5143,7 +5143,7 @@ async fn handle_call_workflow(
     let wf_record = match state.workflow_repo.get_workflow(wf_id, user_id).await {
         Ok(Some(r)) => r,
         Ok(None) => {
-            return Some(mcp_error(
+            return Some(mcp_denied(
                 req_id.clone(),
                 -32000,
                 "Workflow not found or access denied",
@@ -5155,7 +5155,7 @@ async fn handle_call_workflow(
         }
     };
     if !wf_record.is_enabled {
-        return Some(mcp_error(
+        return Some(mcp_denied(
             req_id.clone(),
             -32000,
             "Workflow is disabled. Use enable_workflow to re-enable.",
@@ -5212,7 +5212,7 @@ async fn handle_call_workflow(
     {
         Ok(Some(pair)) => pair,
         Ok(None) => {
-            return Some(mcp_error(
+            return Some(mcp_denied(
                 req_id.clone(),
                 -32000,
                 "Workflow not found or access denied",
@@ -5298,7 +5298,7 @@ async fn handle_call_workflow(
             ));
         }
         Ok(talos_workflow_repository::ConcurrencyAdmission::LimitReached { limit, running }) => {
-            return Some(mcp_error(
+            return Some(mcp_denied(
                 req_id.clone(),
                 -32000,
                 &format!(
@@ -5312,7 +5312,7 @@ async fn handle_call_workflow(
             limit,
             count,
         }) => {
-            return Some(mcp_error(
+            return Some(mcp_denied(
                 req_id.clone(),
                 -32000,
                 &talos_workflow_repository::actor_budget_exceeded_message(kind, limit, count),
@@ -5657,7 +5657,7 @@ async fn handle_clone_workflow(
     let wf = match state.workflow_repo.get_workflow(wf_id, user_id).await {
         Ok(Some(w)) => w,
         Ok(None) => {
-            return Some(mcp_error(
+            return Some(mcp_denied(
                 req_id.clone(),
                 -32000,
                 "Workflow not found or access denied",
@@ -5761,7 +5761,7 @@ async fn handle_export_workflow(
     let wf = match state.workflow_repo.get_workflow(wf_id, user_id).await {
         Ok(Some(w)) => w,
         Ok(None) => {
-            return Some(mcp_error(
+            return Some(mcp_denied(
                 req_id.clone(),
                 -32000,
                 "Workflow not found or access denied",
@@ -6334,7 +6334,7 @@ async fn handle_bulk_trigger_workflow(
     let wf_record = match state.workflow_repo.get_workflow(wf_id, user_id).await {
         Ok(Some(r)) => r,
         Ok(None) => {
-            return Some(mcp_error(
+            return Some(mcp_denied(
                 req_id.clone(),
                 -32000,
                 "Workflow not found or access denied",
@@ -6370,7 +6370,7 @@ async fn handle_bulk_trigger_workflow(
     {
         Ok(Some(pair)) => pair,
         Ok(None) => {
-            return Some(mcp_error(
+            return Some(mcp_denied(
                 req_id.clone(),
                 -32000,
                 "Workflow not found or access denied",
@@ -6749,7 +6749,7 @@ async fn handle_trigger_workflow_as_actors(
     let wf_record = match state.workflow_repo.get_workflow(wf_id, user_id).await {
         Ok(Some(r)) => r,
         Ok(None) => {
-            return Some(mcp_error(
+            return Some(mcp_denied(
                 req_id.clone(),
                 -32000,
                 "Workflow not found or access denied",
@@ -6762,7 +6762,7 @@ async fn handle_trigger_workflow_as_actors(
     };
 
     if !wf_record.is_enabled {
-        return Some(mcp_error(
+        return Some(mcp_denied(
             req_id.clone(),
             -32000,
             "Workflow is disabled. Enable it with enable_workflow before triggering.",
@@ -6777,7 +6777,7 @@ async fn handle_trigger_workflow_as_actors(
     {
         Ok(Some(pair)) => pair,
         Ok(None) => {
-            return Some(mcp_error(
+            return Some(mcp_denied(
                 req_id.clone(),
                 -32000,
                 "No published version found. Publish the workflow before triggering.",
@@ -6805,7 +6805,7 @@ async fn handle_trigger_workflow_as_actors(
         match state.workflow_repo.get_actor(actor_id, user_id).await {
             Ok(Some(actor)) => match actor.status.as_str() {
                 "archived" => {
-                    return Some(mcp_error(
+                    return Some(mcp_denied(
                         req_id.clone(),
                         -32000,
                         &format!(
@@ -6815,7 +6815,7 @@ async fn handle_trigger_workflow_as_actors(
                     ))
                 }
                 "terminated" => {
-                    return Some(mcp_error(
+                    return Some(mcp_denied(
                         req_id.clone(),
                         -32000,
                         &format!(
@@ -6825,7 +6825,7 @@ async fn handle_trigger_workflow_as_actors(
                     ))
                 }
                 "suspended" => {
-                    return Some(mcp_error(
+                    return Some(mcp_denied(
                         req_id.clone(),
                         -32000,
                         &format!(
@@ -6837,7 +6837,7 @@ async fn handle_trigger_workflow_as_actors(
                 _ => {}
             },
             Ok(None) => {
-                return Some(mcp_error(
+                return Some(mcp_denied(
                     req_id.clone(),
                     -32000,
                     &format!("Actor {} not found or access denied", actor_id),
@@ -7201,7 +7201,7 @@ async fn handle_set_workflow_actor_id(
                 }
             }
             Ok(None) => {
-                return Some(mcp_error(
+                return Some(mcp_denied(
                     req_id.clone(),
                     -32000,
                     "Actor not found or access denied",
@@ -7276,7 +7276,7 @@ async fn handle_set_workflow_actor_id(
             };
             Some(mcp_text(req_id.clone(), &msg))
         }
-        Ok(false) => Some(mcp_error(
+        Ok(false) => Some(mcp_denied(
             req_id.clone(),
             -32000,
             "Workflow not found or access denied",
@@ -7372,7 +7372,7 @@ async fn handle_set_workflow_description(
                 &format!("Description updated for workflow {}.", wf_id),
             ))
         }
-        Ok(false) => Some(mcp_error(
+        Ok(false) => Some(mcp_denied(
             req_id.clone(),
             -32000,
             "Workflow not found or access denied",
@@ -7642,7 +7642,7 @@ async fn handle_test_workflow(
     let test_wf_record = match state.workflow_repo.get_workflow(wf_id, user_id).await {
         Ok(Some(r)) => r,
         Ok(None) => {
-            return Some(mcp_error(
+            return Some(mcp_denied(
                 req_id.clone(),
                 -32000,
                 "Workflow not found or access denied",
@@ -7660,7 +7660,7 @@ async fn handle_test_workflow(
     {
         Ok(Some(pair)) => pair,
         Ok(None) => {
-            return Some(mcp_error(
+            return Some(mcp_denied(
                 req_id.clone(),
                 -32000,
                 "Workflow not found or access denied",
@@ -8033,7 +8033,7 @@ async fn handle_get_workflow_health(
     let wf = match state.workflow_repo.get_workflow(wf_id, user_id).await {
         Ok(Some(w)) => w,
         Ok(None) => {
-            return Some(mcp_error(
+            return Some(mcp_denied(
                 req_id.clone(),
                 -32000,
                 "Workflow not found or access denied",
@@ -8203,7 +8203,7 @@ async fn handle_get_workflow_summary(
     let wf = match state.workflow_repo.get_workflow(wf_id, user_id).await {
         Ok(Some(w)) => w,
         Ok(None) => {
-            return mcp_error(
+            return mcp_denied(
                 req_id.clone(),
                 -32000,
                 "Workflow not found or access denied",
@@ -8413,7 +8413,7 @@ async fn handle_disable_workflow(
             req_id.clone(),
             &format!("Workflow {} disabled.", wf_id),
         )),
-        Ok(false) => Some(mcp_error(
+        Ok(false) => Some(mcp_denied(
             req_id.clone(),
             -32000,
             "Workflow not found or access denied",
@@ -8450,7 +8450,7 @@ async fn handle_enable_workflow(
             req_id.clone(),
             &format!("Workflow {} enabled.", wf_id),
         )),
-        Ok(false) => Some(mcp_error(
+        Ok(false) => Some(mcp_denied(
             req_id.clone(),
             -32000,
             "Workflow not found or access denied",
@@ -9641,7 +9641,7 @@ async fn handle_get_workflow_quickstart(
     let wf = match state.workflow_repo.get_workflow(wf_id, user_id).await {
         Ok(Some(w)) => w,
         Ok(None) => {
-            return Some(mcp_error(
+            return Some(mcp_denied(
                 req_id,
                 -32000,
                 "Workflow not found or access denied",
@@ -10158,7 +10158,7 @@ async fn handle_add_edge_to_workflow(
     // or distinguish "not found" from "bad syntax" without owning the resource.
     let graph_json_str = match state.workflow_repo.get_workflow_graph(wf_id, user_id).await {
         Ok(Some(g)) => g,
-        Ok(None) => return mcp_error(req_id, -32000, "Workflow not found or access denied"),
+        Ok(None) => return mcp_denied(req_id, -32000, "Workflow not found or access denied"),
         Err(e) => {
             tracing::error!(workflow_id = %wf_id, "add_edge_to_workflow graph fetch failed: {}", e);
             return mcp_error(req_id, -32000, "Database error fetching workflow");
@@ -10350,7 +10350,7 @@ async fn handle_add_edge_to_workflow(
                 "add_edge_to_workflow: UPDATE matched 0 rows — workflow missing or not owned at \
                  write time; edge NOT persisted"
             );
-            return mcp_error(req_id, -32000, "Workflow not found or access denied");
+            return mcp_denied(req_id, -32000, "Workflow not found or access denied");
         }
         Err(e) => {
             tracing::error!(workflow_id = %wf_id, "add_edge_to_workflow save failed: {}", e);
@@ -10523,7 +10523,7 @@ async fn handle_swap_node_module(
     // ── Fetch workflow graph_json ────────────────────────────────────────────
     let graph_json_str = match state.workflow_repo.get_workflow_graph(wf_id, user_id).await {
         Ok(Some(s)) => s,
-        Ok(None) => return mcp_error(req_id, -32000, "Workflow not found or access denied"),
+        Ok(None) => return mcp_denied(req_id, -32000, "Workflow not found or access denied"),
         Err(e) => {
             tracing::error!("swap_node_module workflow fetch failed: {}", e);
             return mcp_error(req_id, -32000, "Database error fetching workflow");
@@ -10551,7 +10551,7 @@ async fn handle_swap_node_module(
     let node_obj = match target_node {
         Some(n) => n,
         None => {
-            return mcp_error(
+            return mcp_not_found(
                 req_id,
                 -32000,
                 &format!(
@@ -11421,7 +11421,7 @@ async fn handle_set_workflow_execution_timeout(
     // Load current graph_json (ownership-gated).
     let graph_str = match state.workflow_repo.get_workflow_graph(wf_id, user_id).await {
         Ok(Some(s)) => s,
-        Ok(None) => return mcp_error(req_id, -32000, "Workflow not found or access denied"),
+        Ok(None) => return mcp_denied(req_id, -32000, "Workflow not found or access denied"),
         Err(e) => {
             tracing::error!(workflow_id = %wf_id, "get_workflow_graph failed: {}", e);
             return crate::utils::database_error(req_id);
@@ -12376,7 +12376,7 @@ async fn handle_create_tree_of_thoughts_workflow(
         .workflow_exists(child_workflow_id, user_id)
         .await
     {
-        return mcp_error(
+        return mcp_denied(
             req_id,
             -32000,
             "child_workflow_id not found or access denied",
@@ -12387,7 +12387,7 @@ async fn handle_create_tree_of_thoughts_workflow(
         .workflow_exists(judge_workflow_id, user_id)
         .await
     {
-        return mcp_error(
+        return mcp_denied(
             req_id,
             -32000,
             "judge_workflow_id not found or access denied",
@@ -12661,7 +12661,7 @@ async fn handle_export_yaml_workflow(
 
     let wf = match state.workflow_repo.get_workflow(wf_id, user_id).await {
         Ok(Some(r)) => r,
-        Ok(None) => return mcp_error(req_id, -32000, "Workflow not found or access denied"),
+        Ok(None) => return mcp_denied(req_id, -32000, "Workflow not found or access denied"),
         Err(e) => {
             tracing::error!("get_workflow error: {}", e);
             return crate::utils::database_error(req_id);

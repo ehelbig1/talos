@@ -1,5 +1,7 @@
 use super::types::JsonRpcResponse;
-use super::utils::{compute_mcp_graph_diff, mcp_error, mcp_text, mcp_text_with_json};
+use super::utils::{
+    compute_mcp_graph_diff, mcp_denied, mcp_error, mcp_not_found, mcp_text, mcp_text_with_json,
+};
 use super::{auth, McpState};
 use serde_json::json;
 use std::sync::Arc;
@@ -291,7 +293,7 @@ async fn fetch_graph_json(
 ) -> Result<String, JsonRpcResponse> {
     match state.workflow_repo.get_workflow_graph(wf_id, user_id).await {
         Ok(Some(gj)) => Ok(gj),
-        Ok(None) => Err(mcp_error(
+        Ok(None) => Err(mcp_denied(
             req_id.clone(),
             -32000,
             "Workflow not found or access denied",
@@ -410,7 +412,7 @@ async fn save_graph_json(
                 "save_graph_json: UPDATE matched 0 rows — workflow missing or not owned by the \
                  caller at write time; graph NOT persisted"
             );
-            Err(mcp_error(
+            Err(mcp_denied(
                 req_id.clone(),
                 -32000,
                 "Workflow not found or access denied",
@@ -1981,7 +1983,7 @@ async fn handle_set_speculative_prefetch(
     }
 
     if !found {
-        return mcp_error(req_id, -32000, "Node not found in workflow");
+        return mcp_not_found(req_id, -32000, "Node not found in workflow");
     }
 
     if let Err(e) = save_graph_json(
@@ -2142,7 +2144,7 @@ async fn handle_update_node_config(
             }
 
             if !found {
-                return mcp_error(req_id, -32000, &format!("Node '{}' not found in workflow", node_id));
+                return mcp_not_found(req_id, -32000, &format!("Node '{}' not found in workflow", node_id));
             }
         }
         "merge_config" => {
@@ -2222,7 +2224,7 @@ async fn handle_update_node_config(
             }
 
             if !found {
-                return mcp_error(req_id, -32000, &format!("Node '{}' not found in workflow", node_id));
+                return mcp_not_found(req_id, -32000, &format!("Node '{}' not found in workflow", node_id));
             }
         }
         "update_retry" => {
@@ -2358,7 +2360,7 @@ async fn handle_update_node_config(
             }
 
             if !found {
-                return mcp_error(req_id, -32000, &format!("Node '{}' not found in workflow", node_id));
+                return mcp_not_found(req_id, -32000, &format!("Node '{}' not found in workflow", node_id));
             }
         }
         "update_position" => {
@@ -2433,7 +2435,7 @@ async fn handle_update_node_config(
             }
 
             if !found {
-                return mcp_error(req_id, -32000, &format!("Node '{}' not found in workflow", node_id));
+                return mcp_not_found(req_id, -32000, &format!("Node '{}' not found in workflow", node_id));
             }
         }
         "remove_node" => {
@@ -2886,7 +2888,7 @@ async fn handle_duplicate_node(
     let source_node = match talos_workflow_repository::find_node_by_id(&graph, &source_node_id) {
         Some(n) => n.clone(),
         None => {
-            return mcp_error(
+            return mcp_not_found(
                 req_id,
                 -32000,
                 &format!("Source node '{}' not found in workflow", source_node_id),
@@ -3052,14 +3054,14 @@ async fn handle_add_edge(
 
     // Validate both nodes exist
     if !talos_workflow_repository::graph_contains_node_id(&graph, &source) {
-        return mcp_error(
+        return mcp_not_found(
             req_id,
             -32000,
             &format!("Source node '{}' not found in workflow", source),
         );
     }
     if !talos_workflow_repository::graph_contains_node_id(&graph, &target) {
-        return mcp_error(
+        return mcp_not_found(
             req_id,
             -32000,
             &format!("Target node '{}' not found in workflow", target),
@@ -3152,7 +3154,7 @@ async fn handle_remove_edge(
     let removed = talos_workflow_repository::remove_edge_by_endpoints(&mut graph, &source, &target);
 
     if !removed {
-        return mcp_error(
+        return mcp_not_found(
             req_id,
             -32000,
             &format!("Edge {} -> {} not found in workflow", source, target),
@@ -3625,7 +3627,7 @@ async fn handle_add_sub_workflow_node(
         .workflow_exists(sub_workflow_id, user_id)
         .await
     {
-        return mcp_error(req_id, -32000, "Sub-workflow not found or access denied");
+        return mcp_denied(req_id, -32000, "Sub-workflow not found or access denied");
     }
     // MCP-237 (2026-05-08): MCP-227 family — pre-fix as_u64-then-
     // unwrap_or silently substituted 30 for negative / fractional /
@@ -3724,7 +3726,7 @@ async fn handle_copy_node(
         match talos_workflow_repository::find_node_by_id(&source_graph, &source_node_id) {
             Some(n) => n.clone(),
             None => {
-                return mcp_error(
+                return mcp_not_found(
                     req_id,
                     -32000,
                     &format!("Node '{}' not found in source workflow", source_node_id),
@@ -3877,7 +3879,7 @@ async fn handle_set_node_description(
     }
 
     if !found {
-        return mcp_error(
+        return mcp_not_found(
             req_id,
             -32000,
             &format!("Node '{}' not found in workflow", node_id),
@@ -3937,7 +3939,7 @@ async fn handle_duplicate_workflow(
         .await
     {
         Ok(Some(r)) => r,
-        Ok(None) => return mcp_error(req_id, -32000, "Workflow not found or access denied"),
+        Ok(None) => return mcp_denied(req_id, -32000, "Workflow not found or access denied"),
         Err(e) => {
             tracing::error!("duplicate_workflow fetch failed: {:#}", e);
             return mcp_error(req_id, -32000, "Failed to fetch workflow");
@@ -4232,7 +4234,7 @@ async fn handle_add_skip_condition(
     }
 
     if !found {
-        return mcp_error(
+        return mcp_not_found(
             req_id,
             -32000,
             &format!("Node '{}' not found in workflow graph", node_id),
@@ -4578,7 +4580,7 @@ async fn handle_set_continue_on_error(
     }
 
     if !found {
-        return mcp_error(
+        return mcp_not_found(
             req_id,
             -32000,
             &format!("Node '{}' not found in workflow graph", node_id),
@@ -5611,7 +5613,7 @@ async fn handle_add_judge_node(
         .workflow_exists(judge_workflow_id, user_id)
         .await
     {
-        return mcp_error(
+        return mcp_denied(
             req_id,
             -32000,
             "judge_workflow_id not found or access denied",
@@ -5997,7 +5999,7 @@ async fn handle_add_ensemble_node(
         .workflow_exists(child_workflow_id, user_id)
         .await
     {
-        return mcp_error(
+        return mcp_denied(
             req_id,
             -32000,
             "child_workflow_id not found or access denied",
@@ -6035,7 +6037,7 @@ async fn handle_add_ensemble_node(
         {
             Some(id) => {
                 if !state.workflow_repo.workflow_exists(id, user_id).await {
-                    return mcp_error(
+                    return mcp_denied(
                         req_id,
                         -32000,
                         "judge_workflow_id not found or access denied",
@@ -6204,7 +6206,7 @@ async fn handle_add_reflective_retry_node(
         .workflow_exists(child_workflow_id, user_id)
         .await
     {
-        return mcp_error(
+        return mcp_denied(
             req_id,
             -32000,
             "child_workflow_id not found or access denied",
@@ -6215,7 +6217,7 @@ async fn handle_add_reflective_retry_node(
         .workflow_exists(reflection_workflow_id, user_id)
         .await
     {
-        return mcp_error(
+        return mcp_denied(
             req_id,
             -32000,
             "reflection_workflow_id not found or access denied",
@@ -6289,7 +6291,7 @@ async fn handle_add_llm_dispatch_node(
         .workflow_exists(classifier_workflow_id, user_id)
         .await
     {
-        return mcp_error(
+        return mcp_denied(
             req_id,
             -32000,
             "classifier_workflow_id not found or access denied",
@@ -6348,7 +6350,7 @@ async fn handle_add_llm_dispatch_node(
             .workflow_exists(route_uuid, user_id)
             .await
         {
-            return mcp_error(
+            return mcp_denied(
                 req_id,
                 -32000,
                 &format!(
@@ -6376,7 +6378,7 @@ async fn handle_add_llm_dispatch_node(
                 }
             };
             if !state.workflow_repo.workflow_exists(id, user_id).await {
-                return mcp_error(
+                return mcp_denied(
                     req_id,
                     -32000,
                     "fallback_workflow_id not found or access denied",

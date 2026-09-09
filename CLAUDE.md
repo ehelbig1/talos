@@ -2317,6 +2317,238 @@ right label and then passing a different one to `record_mcp_tool_call`; that is
 a dataflow question, and the honest guard for it is the live read of
 `/metrics/prometheus` after deploy.
 
+### 2026-09-09 — the instrument counted the platform's authorization as a server error, and the two instruments spoke two vocabularies
+
+**The first thing the MCP instrument ever recorded on this fleet was a
+refusal, filed as a fault.** Minutes after #786 deployed, `get_system_health`
+without the admin capability was refused (`-32003`, "Unauthorized:
+get_system_health requires admin capability") and the registry recorded
+`talos_mcp_tool_calls_total{outcome="error",tool="get_system_health"} 1` in
+33 µs. Nothing was wrong with the refusal; the LABEL was wrong. Read live
+again 2026-09-09, unchanged, and it is one of THREE calls in the instrument's
+entire history — so `error` is 33 % of every MCP call this platform has ever
+recorded and the one `error` is the platform working as designed. The
+matching log line reads `"MCP tool call served" … outcome="error"`: fixed
+prose asserting the call was served, beside a field saying it was not.
+
+**The population is not what the shipped comment says, and the correction is
+the reason a lot of this was invisible.** `tool_labels.rs` claimed "411 of
+this crate's `mcp_error` sites" use `-32602` and "-32000 (409 sites)". A
+STATEMENT-AWARE inventory (`scripts/mcp-error-inventory.py`, new: comment and
+string CONTENT masked first — check 73's trap — then the argument list walked
+by a depth-aware paren matcher so a `)` inside a message cannot end it) counts
+**1590 production call sites**, of which **883** are `-32602` and **648** are
+`-32000`. The shipped numbers come from a single-line regex
+(`grep -c "mcp_error(.*-32602"` returns 412, `-32000` returns 410) and the
+house call style breaks the call across lines, so they saw 46.6 % and 63.3 %
+of their own populations. Cross-checked in the safe direction: a raw
+`grep -o` over the same tree returns 1602 against the inventory's 1595
+including test sites, the seven-site difference being occurrences inside
+comments and literals.
+
+**`-32000` cannot classify itself, and neither can three other codes.** Of the
+648 `-32000` sites, roughly **250 are refusals** — `"Workflow not found or
+access denied"` and its family alone is **123** — beside `"Failed to fetch
+workflow"`. Worse and not previously noticed: **11 of the 12 `-32601` sites
+are platform-admin refusals** (`query_paginated`, `pause_executions`,
+`ollama_pull_model`, `set_wasm_config`, `get_secret_access_log`, …), recorded
+as `unknown_tool`, so a non-admin looping on an admin-gated tool moved the
+series an operator reads as "clients are calling tools that do not exist";
+**7 of 15 `-32603` sites** are capability-ceiling refusals recorded as
+`error`; and **both `-32004` sites** are one call carrying BOTH arms of
+`evaluation::ensure_actor_owner`.
+
+**The constraint that shaped the design: the OPERATOR needs the split and the
+CALLER must not get it.** `"Actor not found or access denied"` is one sentence
+on purpose — a reply distinguishing "no such actor" from "not yours" is an
+existence oracle for anyone who can guess a uuid, an argument this file
+already records at `resolve_actor_via_repo`, at `caller_facing_unauthorized`
+and at #754's collapsed `write_ceiling_unreadable`. Re-assigning wire codes is
+out too: the reply bytes are an interface MCP clients may depend on. **So the
+meaning travels OUT OF BAND on the response value.**
+`talos_mcp::JsonRpcResponse` gains `error_kind: Option<McpErrorKind>` with
+`#[serde(skip)]`, and `McpErrorKind::{Denied, NotFound, Failed}` says what the
+site meant. `None` is a real third state — *no site said* — and classifies
+from the code exactly as before.
+
+**Three storage locations exist and the other two rest on discipline.** A
+`tokio::task_local` is lost by any `tokio::spawn` (a silent miss) and
+MISLABELS when a site constructs a refusal and discards it. A reserved key
+inside `result`, stripped at the chokepoint, rests on the strip running — and
+a leak IS the invariant being broken. With `#[serde(skip)]` a leak is not
+expressible, and the marker travels with the VALUE so construct-and-discard
+cannot mislabel and a decorated response keeps it. **That option was nearly
+rejected on a bad number**: `grep -rn "JsonRpcResponse {"` reports 398, which
+counts `-> JsonRpcResponse {` RETURN TYPES; masked and excluding those, the
+workspace holds **31** struct literals. A line grep over Rust is not a
+population — the same lesson as the `-32602` count above, twice in one change.
+
+**The byte-identity is STRUCTURAL, not a promise.** `mcp_error`,
+`mcp_error_kind`, `mcp_denied`, `mcp_not_found` and `mcp_failed` share ONE
+private `build_error` body, so there is no second literal to drift.
+`mcp_error_kind_matches_mcp_error_byte_for_byte` drives all three kinds
+through `serde_json::to_string` and compares; `the_kind_never_crosses_the_wire`
+asserts the rendered string carries neither the field name nor the value AND
+that a parsed response carries `None`. **The reply-byte snapshot was written
+BEFORE the refactor** and passed on the pre-change tree, so it proves the
+bytes did not move rather than describing where they landed.
+
+**Six outcomes, three classes, and the class is one TYPE across both
+surfaces.** `talos_metrics::mcp` is the new table (the `rpc.rs` macro shape):
+`ok | refused | unknown_tool | denied | not_found | error`, with #786's four
+spellings byte-identical so no log filter breaks. `denied` is the platform
+refusing a WELL-FORMED request (authorization, capability ceiling, org
+membership, a lifecycle or policy state, and the deliberately collapsed "not
+found or access denied"); the line against `refused` is the REQUEST — *your
+arguments are wrong* versus *your arguments were fine and the answer is no*.
+`not_found` is its own outcome and folds into `Declined` on #787's own ground
+(`RpcOutcome::NotFound => Declined`: a `get` on a key never written is the
+normal path). #787's `RpcOutcomeClass` was **MOVED, not copied**, to
+`talos_metrics::outcome_class::OutcomeClass` and lost its `Rpc` prefix — 20
+references, 3 files — so `served|declined|finding` is ONE type with ONE
+`as_str` on both surfaces and the three spellings cannot drift. The
+per-surface OUTCOME vocabularies stay legitimately different.
+
+**`class` is a third label and it adds NO series — verified, not assumed**
+(the brief's instruction, and #787's omission), in two places: over the table
+(`the_class_label_adds_no_series` asserts the `(outcome, class)` pair count
+equals the outcome count) and over a REAL registry after a real dispatch
+(`the_exported_series_carry_one_class_per_outcome`), which is where a future
+hand-written `with_label_values(&[tool, outcome, "finding"])` would surface.
+Measured scrape cost: the first `(tool, outcome)` pair moves 2356 → 2941 bytes
+and each marginal pair 1656 → 1996, ~19 bytes per rendered line, so the
+no-pre-seed argument gets ~24 % STRONGER; the pin carries the new numbers and
+the reason.
+
+**What was fixed, ranked by blast radius rather than taken as a prefix.**
+*Tier 0, the CODE table — zero site edits, zero reply bytes moved*: `-32003`
+(13 sites), `-32001` (2), `-32002` (1) and `-32600` (1) were verified
+site-by-site to be refusals in their WHOLE population, so one match arm covers
+17 sites and C1's exact case. *Tier 1, the shared funnels*:
+`trigger_auth_error_to_response` and `creator_auth_error_to_response` (behind
+every trigger and every `create_*`), `database_error` (**50 call sites**, the
+canonical failure funnel, now saying so at one home),
+`actor::resolve_actor_via_repo` (behind 20+ actor tools) and
+`knowledge_graph::require_owned_actor` — **both of which already had #782's
+three-way read, with a refusal arm and a failure arm rendering the SAME
+`-32000`; the two arms separated for the operator's PROSE landed on one
+series** — plus `ml::require_dataset_owner` (9 call sites) and
+`evaluation::ensure_actor_owner` (2), which returned `Result<_, String>` and
+now return a typed refusal carrying the kind AND the unchanged message.
+*Tier 2*: the 11 `-32601` admin refusals (the one genuine unknown-tool site is
+untouched). *Tier 3*: 7 `-32603` ceiling refusals. *Tier 4*: the 124
+tenancy-collapsed `-32000` sites. *Tier 5*: 44 more `-32000` policy and
+lifecycle refusals. *Tier 6*: 17 `not_found` sites, and the criterion is
+narrow on purpose — only IN-MEMORY lookups (`"Node 'x' not found in
+workflow"`), where the value is already in hand so no read could have failed.
+196 `Denied`, 18 `NotFound`, 4 `Failed`, 2 through the typed gates.
+
+**What was measured and deliberately NOT changed.** The ~363 `-32000` genuine
+FAILURES were not marked `mcp_failed`: their default is already `error`, so it
+is 363 lines of diff for no behaviour change. **The nine remaining `"Model not
+found"` sites in `ml.rs` were NOT marked `NotFound`, and this is the sharpest
+limit of the package**: they are written `let Ok(Some(m)) = … else { … }`,
+which routes a READ FAILURE into the not-found branch, so marking them would
+assert a determinate negative in the instrument — the class checks 74 / 76 /
+79 / 81 exist for — in a new place. **The instrument cannot be more precise
+than the handler's own read**, so the sites where classification is blocked
+are exactly the sites #782's read-splitting has not reached, and that is a
+better criterion for the next pass than the next N lines of a list. The 11
+`e.jsonrpc_code()` sites build their code from a service-error enum at
+runtime; routing them through the kind is a per-enum change in five service
+crates and is counted rather than attempted.
+
+**The remainder, so the next pass starts from a number.** 1363 constructor
+sites remain unclassified, of which 883 are `-32602` (already correct via the
+code arm), 363 are failures (correct as `error`), 14 are `denied` via the pure
+codes and 1 is the genuine `unknown_tool`. **102 are OPEN** — 25 not-founds,
+10 refusals, and 67 whose message is a runtime variable (`msg`, `err_str`,
+`hint`) — by file: `workflows.rs` 21, `ml.rs` 19, `sandbox.rs` 13,
+`executions.rs` 11, `actor.rs` 10, `advanced.rs` 7, `versions.rs` 5,
+`modules.rs` 4, `graph.rs` 3, `search.rs` 3, `utils.rs` 3, `analytics.rs` 2,
+`evaluation.rs` 1.
+
+**The LOG LEVEL was measured and deliberately NOT partitioned.** #787's shape
+is one predicate under BOTH the `talos_rpc` log level and the `class` label;
+here `class` joins the log line as a FIELD and the level stays INFO for every
+call. The argument that made #787 change a level does not transfer: there, a
+designed state was 53 % of the controller's entire WARN volume, so the level
+was fixing NOISE. The MCP line is one per call at one level by #786's
+deliberate choice — a per-call trace, not an alert — and an operator who wants
+the failures now filters `class=finding` on the field rather than on the
+level. Promoting `finding` to WARN is defensible and is a log-volume decision
+of its own; it is recorded rather than smuggled in.
+
+**NO alert, argued.** Nothing selects on this instrument today
+(`grep -rn "talos_mcp_tool" observability/ deploy/helm/talos/files/` is empty),
+which is exactly why the partition had to be fixed BEFORE a rule was built on
+a label whose meaning would then have to change under it. But the instrument's
+entire live population is THREE calls, and a rule with no baseline either
+fires forever or never — check 69's harm in both directions, and #787 declined
+an alert on `unauthorized` for the same reason two days earlier. What the
+partition buys is that the eventual rule is `class="finding"` rather than an
+outcome alternation a seventh outcome would silently fall outside of. Still
+NOT pre-seeded: ~320 tools × 6 outcomes is almost entirely unreachable, so
+seeding it is check 58's own defect.
+
+**Mutations, worst first, with the survivor and the no-op reported as such.**
+Reclassifying `denied` to `Finding` — the QUIET direction — is RED on the
+name-pinned partition. Leaking the kind to the wire is RED twice, printing the
+leaked payload. Deleting the chokepoint increment is RED seven times. Making
+`classify_outcome` ignore the kind is RED three times; honouring it BEFORE the
+success-shape check is RED on
+`a_kind_on_a_success_response_is_ignored`; dropping the pure-code arm and
+hardcoding the class label are RED. **M1b — reverting
+`resolve_actor_via_repo`'s refusal arm — SURVIVED on its first run**, because
+the round-trip test drove an INLINE site; that is what
+`the_actor_ownership_funnel_records_denied` was then written for, and the
+mutation is red. **M9 SURVIVES and is left stated**: reverting one of the
+eleven `-32601` admin refusals is invisible to every test here, because
+driving those needs a non-`*` `AgentIdentity` plus platform-admin state. With
+196 classified sites the guard is one test per SHAPE plus one per the
+highest-leverage FUNNEL, and the honest guard for the rest is the live read
+after deploy — #767, #769 and #771's position about their own changes. **M8 is
+a NO-OP, not a survivor**: `mcp_failed` at a `-32000` site changes nothing,
+because that code's default already IS `error`, which is true of all four
+`Failed` sites — the variant is DEFENCE IN DEPTH so a future addition to the
+pure-code arm cannot silently reclassify a failure. And one limit was found BY
+a mutation rather than reasoned: `the_exported_series_carry_one_class_per_outcome`
+does NOT catch a hardcoded `"finding"` — it proves PURITY, never CORRECTNESS,
+which is what the two delta tests assert.
+
+**A flake this change introduced and closed.** The new class-purity probe
+calls `whoami` and `get_workflow`, which two pre-existing tests measure
+"exactly once" deltas on through the process-global registry; one run in three
+turned a sibling red. Relaxing to `>= 1.0` was REJECTED — "exactly once" is
+what proves ONE record site writes both series — so a `SHARED_SERIES` mutex
+serialises the five tests that share a `(tool, outcome)`, recovering from
+poison so a panicking sibling fails on its own assertion. Five consecutive
+full runs green. Also corrected in the same file:
+`a_caller_fault_records_refused_and_a_server_fault_records_error` never drove a
+server fault; it is renamed to what it does, and the other half is a real
+injected read failure in Leg D.
+
+**No lint check was added and `--count` stays 88.** The candidate — *"a
+refusal must not be constructed with the failure constructor"* —
+was BUILT (`scripts/lint-mcp-refusal-constructor-candidate.py`, kept so the
+numbers can be re-derived) and MEASURED on both trees in a real `git
+worktree` of `origin/main`: **258 sites there, ~225 of them real (≈ 87 %,
+the band checks 74 and 87 shipped at) — and 68 on the FIXED tree**, of which
+43 are false positives by construction (`-32602`, `-32003`, `-32001` are codes
+the classifier's own arm already handles). So it ships as a ratchet with a
+baseline, which is check 52's rule. And narrowing it to the codes the table
+does not classify still leaves ~28, **which are precisely the sites this
+package deliberately left alone** — the `ml.rs`-style two-valued reads. A
+check demanding a classification there would push a future author into
+asserting a determinate negative in the instrument: **a gate that pressures
+you toward the defect it is named after is worse than no gate.** The
+structural alternative was priced too — making the kind a REQUIRED parameter
+of the only constructor is **1583 call sites**, 883 of them `-32602` where the
+author would be inventing a kind to satisfy a signature. What ships
+structurally instead: a closed `McpErrorKind`, an exhaustive `const fn`
+mapping with no wildcard, `#[must_use]` on the classified constructor, and one
+private body behind all four spellings.
+
 ### The whitespace-run artefact, and why no lint guards it
 
 Four operator-facing string literals carried mid-sentence runs of up to 22

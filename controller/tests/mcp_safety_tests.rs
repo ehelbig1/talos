@@ -51,6 +51,7 @@ fn json_rpc_response_omits_null_error() {
         id: Some(json!(1)),
         result: Some(json!({"ok": true})),
         error: None,
+        error_kind: None,
     };
     let json_str = serde_json::to_string(&resp).unwrap();
     assert!(
@@ -70,6 +71,7 @@ fn json_rpc_response_omits_null_result() {
             message: "Method not found".to_string(),
             data: None,
         }),
+        error_kind: None,
     };
     let json_str = serde_json::to_string(&resp).unwrap();
     assert!(
