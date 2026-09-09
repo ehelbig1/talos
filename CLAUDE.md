@@ -321,4295 +321,661 @@ instead of the bare `search`. The filter is applied at the DB layer
 (`talos_memory::recall_semantic_filtered`, parameterized `text[]` bind)
 — not post-hoc in Rust, so it composes with limit + min_score cleanly.
 
-## Two columns for one fact; a child that leaves no trace
-
-Two operator-facing reports asserted a determinate negative for a state the
-reader could not represent — the misleading-report class (checks 74, 76, 79/79b,
-81) in two fresh shapes, both measured live 2026-09-05.
-
-**"Unscored" over a score written an hour ago.** `workflows` carries TWO
-readiness timestamps and TWO writers that each stamp only their own: the hourly
-recompute in `controller/src/bootstrap/background.rs` writes
-`readiness_computed_at`; the on-demand `get_readiness_breakdown` write-back
-(`AnalyticsRepository::set_workflow_readiness_score`) writes
-`readiness_scored_at`. Every reader anchored on the second, so with
-`readiness_computed_at` set on 36 of 36 dev-fleet rows and `readiness_scored_at`
-on **1**, `get_all_readiness_scores` answered `unscored_count: 27` of 28 and
-per-row `score_state: "unscored"` **beside a `readiness_score` of 87**, telling
-the operator to run a tool to compute a score that already existed; the flagship
-reported `score_age_hours: 986` against a score recomputed that afternoon. The
-previous fix here (MCP-1211) collapsed a two-STATEMENT write into one atomic
-UPDATE — correct, and it left the predicate intact because it never saw the
-**second writer**. The decision now has ONE home,
-`talos_analytics_repository::readiness_state::classify_readiness_state`, which
-reads BOTH columns, returns the EFFECTIVE (more recent) timestamp and NAMES the
-scorer. **The columns are deliberately NOT collapsed**, and the reason is
-measured rather than assumed: the two scorers are not the same function — the
-arithmetic is shared (`compute_reliability_score` IS the background loop's
-inline expression) but `get_readiness_exec_data` adds
-`AND NOT (status = 'failed' AND acknowledged_at IS NOT NULL)`, so the background
-number is the lower one on any workflow with an acknowledged failure in the
-window. One timestamp cannot say which scorer produced the stored number, and a
-`readiness_scored_at = COALESCE(...)` migration would relabel 35 background
-scores as breakdown scores. So the READER was taught to read both, and
-`readiness_population`'s `unscored` predicate now requires BOTH to be NULL.
-
-**A daily sub-workflow "recommended for deletion".** `execute_subworkflow_graph`
-runs a child IN-PROCESS and records no `workflow_executions` row — measured:
-ZERO rows carrying `parent_execution_id` across the live table AND the archive,
-platform-wide. `get_platform_hygiene_report`'s dormant query read that table
-alone, so 3 of its 13 findings were children of ENABLED parents
-(`cos-team-recall` — the flagship `pa-chief-of-staff`'s daily `team_gather`
-sub-workflow — `pa-quality-judge`, and `pa-ask`), listed under *"Consider
-disabling or deleting them with `batch_delete_workflows`"*. The row now carries
-`runs_as_child_of: [parent names]` plus the note that `last_execution: null`
-means NO EVIDENCE, and is EXCLUDED from the recommendation's count with the
-exclusion disclosed (`excluded_child_workflows`, and the deletable names
-enumerated) — it stays in the LIST, because an operator asking "what has no
-executions?" should still see it. The exclusion is graph-derived and keyed on an
-ENABLED parent; a self-reference does not protect a workflow, or every recursive
-one would be permanently immune. The same query now reads
-`workflow_executions_archive` too: the dormant window and `ARCHIVE_AFTER_DAYS`
-are both 30 by default, so a live-only read is right by COINCIDENCE, and at
-`ARCHIVE_AFTER_DAYS=7` every workflow that ran 8 days ago reads as never-run.
-
-**The child-reference set has ONE implementation**, moved (not copied) into
-`talos_workflow_engine_core::child_workflow_refs`, which
-`talos_workflow_validation::collect_subworkflow_references` now re-exports. The
-move closed the gap that function's own doc comment declared: the
-`*_workflow_id` suffix convention covers seven of the engine's EIGHT
-child-naming sites and structurally cannot see the eighth — `llm_dispatch`'s
-`data.routes`, whose arbitrary class labels key the workflow ids — so
-`get_workflow_risk_assessment` was blind to every route target too.
-`child_workflow_ids_checked` is three-valued: `None` = the graph did not parse
-(UNKNOWN), `Some(vec![])` = parsed and names nobody. A report that suppresses a
-DELETE recommendation on the strength of "this is somebody's child" must not
-read an unparseable parent as one that references nothing, so unreadable parents
-are NAMED in `summary.child_workflow_exclusion.unreadable_parents` and in the
-recommendation's own prose.
-
-**What was measured and NOT changed** (stated so the population is visible
-rather than rediscovered — the same discipline as the write-ceiling entry
-above). A graph-blind execution read misleads **26** surfaces, not one. Two more
-are DESTRUCTIVE and share the exact blindness: `stale_draft_workflows` (whose
-`fix_all confirm=true` DELETES) and `session_start`'s `archive_stale_drafts`
-(which ARCHIVES without confirmation), both keyed on
-`status='draft' AND NOT EXISTS (SELECT 1 FROM workflow_executions …)`.
-
-**That "latent today (no draft child on the fleet)" claim was refuted by this
-report's own output, in the first run after it deployed** (2026-09-05 17:20Z).
-`cos-team-recall` is `status = 'draft'`, and it appeared TWICE in one response:
-in `dormant_workflows` annotated `runs_as_child_of: ["pa-chief-of-staff"]` and
-excluded from the delete count, and two sections down in `stale_draft_workflows`
-with no annotation, under *"1 draft workflow(s) have never been published or
-executed in 7+ days — likely scaffolding leftovers … delete with
-`batch_delete_workflows`"*. The graph scan that produced the first was scoped to
-the DORMANT candidate list; nothing widened it. **A latency claim about a
-population is only as good as the query that measured it, and the query used
-was the one already fixed.**
-
-Corrected severity, because "a `confirm=true` `fix_all` would have deleted the
-flagship's child" is ALSO not what was measured. On the live fleet the preview
-showed `stale_draft_workflows_to_delete: []` and
-`substantive_drafts_skipped: [cos-team-recall]` — spared by
-`is_substantive_workflow`, an authored-INTENT predicate that asks whether a
-human shaped the draft and knows nothing about who runs it. So the delete was
-blocked by COINCIDENCE, and a child with a bare graph was fully exposed:
-verified against a pristine `origin/main` tree, where the same fixture with a
-one-node empty-`data` graph puts the child in `draft_ids` with
-`substantive_drafts_skipped` EMPTY. What WAS live and unconditional:
-`session_start(auto_archive_stale_days: 7)` archived it, and
-`batch_delete_workflows` removed it with no refusal of any kind.
-
-Now: the same graph scan runs over dormant ∪ stale-draft candidates, the draft
-row carries `runs_as_child_of` + `excluded_from_cleanup_reason`, the
-recommendation's count excludes it with the exclusion disclosed
-(`excluded_child_workflows`, `summary.child_workflow_exclusion
-.excluded_stale_drafts_count`, and prose saying why count and list disagree),
-`fix_all` gains a THIRD bucket `child_drafts_skipped` ahead of both existing
-ones, and `archive_stale_drafts_excluding_children` SELECTs candidates → scans
-→ UPDATEs **by id**, so the write is a subset of what was scanned by
-construction. **The scan has ONE implementation** in the leaf crate
-`talos-child-workflow-refs` (moved out of `talos-analytics-repository`, which
-re-exports it): its three consumers — the hygiene report, the auto-archive, and
-the delete-time guard — sit in three crates with no edge between them.
-
-**REPORT and DECISION are different rules, and conflating them is how #758
-stopped one section short.** A report row stays LISTED with its parents named;
-a decision EXCLUDES it. They also disagree on the UNKNOWN case, deliberately:
-`ChildReferenceScan::parents_of` (report) names only parents whose graph
-PARSED, while `protection_for` (decision) additionally holds back a candidate
-whose id merely appears in the text of a parent nobody could read — the scan is
-scoped by a mention prefilter, so such a parent demonstrably mentions it, and
-"I could not read the parent" is not "no parent dispatches into it". #758's
-`octet_length(graph_json) <= $3` filter DROPPED an oversized parent from the
-scan entirely, so its children read as unreferenced and it was not even named
-under `unreadable_parents`; the row is now returned with a NULL body and
-classified unreadable.
-
-**Second finding, and it is the last line of defence: `delete_workflows` had no
-reference guard at all.** It blocked only on running/queued executions — which
-a sub-workflow never has — so every guard in this class lived in a report that
-RECOMMENDS calling the tool, and the tool itself would remove a live child
-without comment. The reference lives inside `workflows.graph_json` as TEXT, so
-no foreign key can express it. `delete_workflows_checked` returns
-`WorkflowDeleteOutcome { deleted, blocked_running, blocked_referenced }` — the
-type change is the point, since it forces all three call sites to notice the
-new refusal — and a parent that is ITSELF in the delete set does not block
-(deleting a retired tree in one call must stay possible). `fix_all` consults it
-even though its `draft_ids` were already filtered upstream: the preview an
-operator confirmed may be minutes old, and a `sub_workflow` node added in
-between is exactly what a graph-derived exclusion cannot see.
-
-**Does a child's `draft` status mean anything at runtime? No, and this is worth
-knowing before anyone "fixes" it by publishing.** `execute_subworkflow_graph` →
-`WorkflowGraphStore::get_graph` reads the child's DRAFT `graph_json` column with
-no version join, so `publish_version` changes nothing about how the parent runs
-it and the "publish or delete" advice is half no-op and half destructive. That
-half of the paragraph stands.
-
-**Its other half was TRUE UNTIL 2026-09-07 and is now FALSE — it is rewritten
-rather than left.** It read: *"ARCHIVING a child does not break dispatch either
-(status is not read there), which is why the archive path is the least severe of
-the three even though it is the only unattended one"*. The narrow dispatch gate
-below closed exactly that: `get_graph` now returns `GraphLookup::Archived` and
-the parent node FAILS naming the child and the word "archived". So **archiving a
-child DOES stop it being dispatched**, and the auto-archive sweep is no longer
-the least severe of the three destructive draft paths — it is now the one that
-can take a live sub-workflow off the air unattended. The child-reference
-exclusions #758/#760/#764 added to that sweep are what keep it from doing so,
-and they are load-bearing in a way they were not when this paragraph was
-written.
-
-**What was measured and NOT changed here.** `AdvancedRepository::get_draft_workflows`
-shares the same blind predicate and is left as-is: its only consumer is
-`session_start`'s draft DISPLAY, which takes no destructive action (its
-reasoning is in that method's doc comment, along with why it carries no lint
-marker). And `__ops_alert__` / `__ml_distill__` remain ungated — no longer a
-remainder but a DECISION, argued and reported above.
-
-**The auto-archive remainder is now CLOSED (2026-09-05).** #758 recorded that
-`session_start`'s auto-archive "still archives SUBSTANTIVE drafts — the exact
-contradiction M-I fixed for `fix_all` in 2026-05" and left it, because it is a
-behaviour change to an existing opt-in flag and archiving is reversible.
-Measured on pristine `origin/main` before it was fixed, driving the REAL
-`SessionBriefService`: the brief listed a shaped draft under
-`unpublished_substantive_drafts` with `next_step: "publish_version with
-workflow_id=…"` and reported `auto_archived_stale_drafts: 1` for that same row,
-**in one response** — because `get_draft_workflows` was read BEFORE the sweep.
-Both halves are fixed: the sweep now refuses a shaped draft, and the display
-read moved BELOW the sweep, so neither list can name a row the same call
-archived (that second half matters on its own — a STUB was listed with
-`next_step: get_workflow_quickstart` moments after being archived, and no
-substantive-ness rule would have closed that).
-
-The predicate MOVED (not copied) to the leaf crate `talos-draft-heuristics`
-(`serde_json` only), the reason `talos-child-workflow-refs` exists: the archive
-sweep lives in `talos-advanced-repository`, which must not depend on a service
-crate that pulls in four repositories. Three consumers, three crates, no edge
-between them: `fix_all`'s auto-DELETE partition, the auto-ARCHIVE sweep, and
-the draft DISPLAY. **The old home's doc comment claimed *"Both `session_start`
-… AND `get_platform_hygiene_report fix_all` consult this helper so the two
-surfaces never disagree"*, and it was FALSE — `session_start` carried an INLINE
-COPY of the same 20-line walk.** Behaviourally identical, which is why nothing
-caught it; an ALL-sites claim is worth only as much as the sites being unable
-to drift.
-
-`DraftIntent` is THREE-valued and `is_substantive_workflow` is a thin two-valued
-view over it, byte-for-byte the old behaviour. The third value is for the paths
-that WRITE: `is_substantive_workflow` answers `false` for "no markers" and for
-"`graph_json` would not parse" alike, and on a sweep those are not the same
-answer — `graph_json` is `text NOT NULL`, so an unparseable graph is storable,
-and it is now held back under its own distinct reason. Same UNKNOWN-is-not-NO
-rule the parent scan applies. Both exclusions run at the ONE chokepoint,
-child-FIRST (matching `fix_all`'s partition — publishing a draft retires the
-substantive reason and leaves the child reason standing), each skipped id
-reported under its own reason (`auto_archive_skipped_children` /
-`auto_archive_skipped_substantive`, with the `substantive_drafts_skipped`
-wording `fix_all` already prints), and the UPDATE stays by-id over what was
-classified.
-
-**Deliberately NO force flag**, mirroring `fix_all`, which has had this
-exclusion since 2026-05 with no override: the escape hatch is an EXPLICIT
-operator action (`publish_version`, or `archive_workflow` /
-`batch_delete_workflows` naming the workflow). An `include_substantive: true`
-would re-enable an unattended destructive sweep over exactly the population the
-rule exists to protect. The skip is disclosed in every response, so a draft
-cannot quietly acquire permanent immunity, and the tool schema now says so
-instead of promising to "archive draft workflows that have never been published
-or executed".
-
-**Blast radius, measured on the dev fleet 2026-09-05: ZERO additional skips
-today.** 36 workflows, 11 drafts, 2 with no execution row; at any window ≥7 days
-there is exactly ONE candidate, `cos-team-recall`, and #760's child rule already
-spares it. So the substantive rule is LATENT on this fleet — stated plainly
-rather than dressed up, since "latent is not live" cuts both ways and the
-previous entry in this section was written the same way one day before the
-condition it called latent went live.
-
-**What was measured and NOT changed here.** The hygiene REPORT's stale-draft
-recommendation counts a substantive draft as `deletable` and names
-`batch_delete_workflows`, while `fix_all` — the DECISION built on the same rows
-— excludes it. That is the report/decision split running the other way from the
-child case (where the report lists and the decision excludes), it is advice a
-human reads rather than an unattended write, and the sentence already offers
-`publish_version` first; changing it would move a count an operator may have
-wired up, so it is recorded. And a NON-substantive draft is still listed under
-`in_progress_drafts` and swept in the same session — that is the flag doing
-exactly what it was asked to do, and the ordering change means it is no longer
-listed and archived in the same RESPONSE.
-
-**No lint check was added, and the numbers are here so a future session need not
-re-measure.** A "the substantive predicate has one home" detector — a file
-naming both `retry_delay_expression` and `"SYSTEM_PROMPT"` outside the leaf
-crate — reports exactly the duplicate on pristine `origin/main` and 0 on the
-fixed tree: 1/1, trivially 100% precision, population ONE. That is a
-single-instance historical class already answered structurally (one `pub` home,
-`#[must_use]` on every entry point, and a DB test that drives both surfaces over
-the same rows), so it is left unwritten rather than shipped as a check that has
-never had anything to say. Note what that DB test does and does not cover,
-because it was proven by mutation and not by reasoning: reducing the DISPLAY
-half to branch 1 alone SURVIVED the first version of it, since every seeded row
-agreed on both branches — the test now seeds a branch-1-only and a
-branch-2-only shape, and the branch-2-only one (`data: {}` plus `retry_count`)
-is the shape the live fleet's only stale-draft candidate actually has.
-
-**#762 — the SCORING half: a child's reliability and freshness are UNMEASURABLE,
-not zero.** #758/#760 fixed the DESTRUCTIVE readers; the same blindness also fed
-three readiness scorers, the reuse report and a dead schedule-suggestion filter,
-and those are fixed here. Reliability (50 pts) and freshness (20 pts) are read
-from `workflow_executions` and from nothing else, so 70 of a child's 100 points
-were scored from a table that is structurally silent about it. Measured on the
-reference fleet 2026-09-05 — the WHOLE population of children, not a sample:
-`cos-team-recall` 19 (the flagship's daily team gather), `pa-ask` 19 (runs per
-inbound email), `pa-quality-judge` 19 (judge of three workflows),
-`stress-05-child` 14, against a fleet otherwise at 40–87. The hourly loop
-PERSISTS those numbers and `get_all_readiness_scores` sorts ascending, so the
-flagship's own daily sub-workflow read as the least production-ready workflow on
-the platform and `below_50_count` counted it.
-
-**The DENOMINATOR shrinks; the score is not renormalised.** Two renderings were
-rejected before this one and the rejection is the design: scoring the two
-components 0 out of 100 is the determinate negative this whole class is about;
-scoring the measurable 30 and SCALING IT UP to 100 fabricates — a documented,
-low-risk child would report **100/100, fully production-ready** on zero execution
-evidence, which is worse than the zero it replaces because it is confident in the
-reassuring direction. So a child scores *N of `CHILD_MEASURABLE_MAX` (=30)*, its
-unmeasurable components are NAMED, and `comparable_to_fleet` is false. The
-shrunken denominator is what tells a reader the two numbers are not on one scale;
-a number out of 100 does not, however it was derived. ONE home:
-`talos_analytics_repository::readiness_basis::{ReadinessBasis, score_readiness}`,
-called by all three scorers — what is unified is the BASIS, deliberately NOT the
-reliability INPUT (the breakdown excludes acknowledged failures, the loop counts
-them; #758 chose to disclose that and that decision stands). Child-ness comes
-from `parents_of` (REPORT semantics), so an UNREADABLE parent leaves the workflow
-on the full scale and the incompleteness travels by NAME
-(`unreadable_parent_graphs` / `readiness_unreadable_parent_graphs`) rather than
-silently. **Nothing to say ⇒ no key**: a full-scale workflow's response is
-byte-identical to the pre-#762 one, except `get_all_readiness_scores`, which
-emits `max_possible` on EVERY row — that list exists to rank rows against each
-other, and a denominator present on some rows and absent on others is read as
-"the others are out of 100" by exactly the caller who needs telling otherwise.
-`below_50_count` EXCLUDES children with the exclusion disclosed
-(`below_50_count_raw`, names, `measured`, `complete`), because a child is below
-50 by construction; `avg_score` is deliberately NOT adjusted (it is a
-population-wide SQL mean that the page cannot correct) and says so. The
-page-scoped exclusion's COMPLETENESS is checked, not assumed: a child is ≤30, the
-page is the ascending prefix, so a page reaching past 30 has already swallowed
-every child — `child_exclusion_is_complete` computes that condition and the
-summary says PARTIAL when it does not hold.
-
-**Cost, measured rather than assumed.** The scan is one `LIKE`-prefiltered parent
-read: **0.40 ms** at one candidate (the breakdown / `validate_workflow` path) and
-**3.8–4.6 ms** with the whole 36-workflow fleet as candidates. The hourly loop
-runs ONE scan per USER per tick — the 500-row batch is grouped by `user_id` and
-each group's ids are the candidate list — against a loop that already issues
-THREE queries per workflow; a per-workflow scan would have been 36 of these. A
-failed scan falls back to full-scale (the pre-#762 answer) and is logged, never
-aborts the tick.
-
-**`get_workflow_reuse_stats` INNER-JOINs executions**, so `pa-ask` — dispatched
-per inbound email, 0 rows live and archived — was ABSENT from the reuse tool, not
-shown as zero. It now carries a SECOND list, `parent_dispatched`, with
-`total_invocations: null` and `runs_as_child_of`: folding those rows into the
-main list with a count of 0 was rejected because that list is RANKED by the count
-they do not have. Bounded by `REUSE_ZERO_INVOCATION_SCAN_LIMIT` with truncation
-disclosed.
-
-**`get_frequently_executed_unscheduled`'s sub-workflow exclusion was DEAD for two
-years and its own comment recorded the wrong lesson twice.** r242 wrote
-`node.kind` / `data.sub_workflow_id`; r243 "corrected" it to
-`module_id = 'system:sub_workflow'` / `config.sub_workflow_id` and wrote down
-*"the lesson: verify the actual JSON shape via `get_workflow`"* — having done
-exactly that and landed on a second shape the engine also does not write; r244
-then fixed a real `::jsonb` cast on top, which made the query RUN, which is why
-nothing looked broken. Measured live, both predicates as SQL against the real
-column: r243's matched **0** nodes, the engine's `type` / `data.*_workflow_id`
-shape matched **6** across 5 parents. The real lesson is that a hand-written
-`graph_json` predicate is a SECOND IMPLEMENTATION of a question the engine
-already answers — reading one workflow's JSON tells you one node kind's shape,
-and the engine names a child through EIGHT keys, one of which
-(`llm_dispatch`'s `routes`) is keyed by arbitrary class labels no key-name rule
-can see at all. The exclusion now runs through the ONE scan, in Rust over a
-widened page so removing a child does not under-fill the list of ten, and
-`child_reference_shape_tests` pins it against the engine's parser rather than
-against a string. Stated rather than sold: this exclusion is **vacuous on the
-reference fleet today** — `HAVING COUNT(we.id) >= 3` already excludes every pure
-child, so it bites only a HYBRID (dispatched AND directly triggered ≥3), of
-which there are currently zero.
-
-**`get_workflow_risk_assessment`'s cascading-failure check is DISCLOSED, not
-fixed.** It `continue`s on a zero-row population, so on this fleet the
-HIGH-severity check can never fire for any child. No risk entry is pushed (an
-`info` row on every parent with a judge node would be noise on three of this
-fleet's workflows); the population is emitted as
-`cascading_failure_check.sub_workflows_unmeasurable` so "no cascading-failure
-risk found" is legible as a statement about what was measurable. **The background
-SLA-breach monitor is RECORDED and NOT changed**: it is an ALERTER with no
-operator-facing field to disclose into, its `stats.total >= 3` gate can never
-pass for a child, and the honest fix is a per-run record it does not have. So
-`set_workflow_sla_threshold` on a child is silently inert. **BOTH sentences are
-SUPERSEDED by the RFC 0012 P3 entry below (2026-09-07)**: the per-run record now
-exists, the check reads it, and the alerter both reads it and has a channel to
-say when it could not measure. Read them as the state before that entry, not as
-current behaviour.
-
-**What #762 could NOT guard, stated rather than implied.**
-`controller/src/bootstrap/background.rs` is `mod bootstrap` inside `main.rs`,
-i.e. bin-private, so no integration test can call its loop: deleting the loop's
-`child_scans` lookup leaves every test green. What is covered by construction is
-the shared decision — all three scorers call `score_readiness`, so removing the
-classification from it turns three tests red (mutation-proved). The handler-level
-wiring of the reuse list and the risk disclosure likewise has no test; the
-repository methods and pure renderers behind them do.
-
-**A lint for this class was BUILT, MEASURED and REJECTED — count stays 86.** The
-candidate rule was *"a reader that scores or counts from `workflow_executions`
-must consult the child scan"*. File-scoped, it reports **23 of 27** non-test
-files on the FIXED tree and nearly all are legitimate (`checkpoint_store`,
-`fence`, `stale_sweep`, `approval_gate`, the audit ledger, the secrets manager) —
-those read execution rows for durability, authorization and crypto, not to make a
-claim about use. Narrowed to an alternation of the five per-workflow reader
-methods it reaches **7 call sites**, ~71% precision against pristine main, and
-would ship at 2 with opt-out markers on the two surfaces deliberately left
-disclosed — but its recall against the ~26 graph-blind surfaces is **27%**, the
-alternation is the hand-maintained name list check 74 records as its own rot mode
-(there is no derived method family here — the six readers have six unrelated
-names in three crates), and, decisively, **it does not see the background loop at
-all**: that scorer reads executions with raw `sqlx::query_as`, not a repository
-method, so the lint would be green over the one writer whose number every other
-reader reads back. A gate blind to the most consequential site in its own class
-is the gate-that-doesn't-gate shape (#624, checks 64/65). The population is
-recorded here instead. **The structural question these all share is
-whether `execute_subworkflow_graph` should record a child `workflow_executions`
-row** (`parent_execution_id` / `root_execution_id` exist and are written only by
-replay today). Measured before deciding: ~225 estimated child runs/day, 98.6% of
-them one workflow; **163** `FROM workflow_executions` occurrences across 28
-non-test files, of which exactly **2** carry a `parent_execution_id IS [NOT]
-NULL` filter — so recording children would silently double-count in 161 places,
-including every fleet total, error rate and cost aggregate. That is a
-platform-wide change, not a report fix, and it is recorded here rather than
-attempted.
-
-**2026-09-07 — a third pair, and the report read one half of it: `workflows.status`
-vs `workflows.is_enabled`.** `get_platform_hygiene_report` recommended *"10 enabled
-workflow(s) have had no executions in 30+ days. Consider disabling or deleting them
-with `batch_delete_workflows`"* and listed them under `deletable`. **EIGHT of the ten
-were `status = 'archived'`** — the operator it was advising had already retired them.
-
-**The mechanism is the readiness-timestamp one exactly.** `is_enabled`
-(`20260314001600`) is the OPERATOR's pause toggle; `status` (`20260318000000`) is
-the LIFECYCLE. Two writers, and neither touches the other's column: the six
-`UPDATE workflows SET status = 'archived'` sites
-(`talos-workflow-repository/src/workflows.rs:963,1346,1357`,
-`talos-advanced-repository/src/lib.rs:1880,2362`,
-`talos-actor-repository/src/lib.rs:1071`) never clear `is_enabled`, and
-`set_workflow_enabled` never moves `status`. Measured on the reference fleet
-2026-09-07: `active/t 17, archived/t 8, draft/t 11` — **every archived row still
-reads `is_enabled = true`**. The dormant query predicated `w.is_enabled = true`
-with NO status clause; reproduced verbatim against the live database it returns 13
-rows, 8 of them archived, and minus #760's three child exclusions that is the 10
-the recommendation named.
-
-**The columns are deliberately NOT collapsed and there is NO migration flipping
-`is_enabled` on archived rows** — the readiness-timestamp argument applies
-unchanged: the two writers record two different operator acts, one column cannot
-say which happened, and a backfill would relabel eight archives as pauses that
-never occurred. The READER changed.
-
-**The predicate has ONE home**, the leaf crate `talos-workflow-liveness`
-(no dependencies), and it is TWO predicates rather than one, because the second is
-not a weaker version of the first:
-* `is_live` = `status = 'active' AND is_enabled` — published and not paused.
-* `is_dispatchable` = `status <> 'archived' AND is_enabled` — what the PLATFORM can
-  still run. A DRAFT counts: a parent dispatches a child's `graph_json` column with
-  no version join and no status predicate (the "does a child's `draft` status mean
-  anything at runtime?" entry above), and **4 draft workflows on this fleet carry
-  enabled schedules and fire today**, so folding draft into "not live" for an
-  operational population would be wrong in the loud direction.
-
-The Rust predicates are EXACT twins of `live_sql` / `dispatchable_sql` /
-`retired_sql`, including on an unrecognised `status` — the column has **no CHECK
-constraint**, so `WorkflowLifecycle::Unknown` is a real state (one live query still
-filters `status = 'published'`, a value nothing writes, and the pre-existing
-`dormant_child_workflow_tests` seeds exactly that). An unknown status is NOT live
-and IS dispatchable on both sides; `rust_and_sql_agree_on_every_status` EVALUATES
-the rendered fragment rather than comparing strings, so the asymmetry is pinned as
-the SQL's rather than quietly fixed on one side.
-
-**Five sites now read it**, and the count is the point: the analytics file already
-spelled the same predicate correctly FOUR times
-(`is_enabled = true AND (status IS NULL OR status != 'archived')` — the `status IS
-NULL` arm dead, since the column is `NOT NULL`, verified against the live catalog)
-while the fifth, the dormant query, forgot. `scan_child_parents` and
-`list_enabled_graph_json_for_boot_warmup` were right too and spelled it a fifth and
-sixth way (`!=` and `<>`, in two crates). Six correct sites, three spellings, one
-defect between them.
-
-**EXCLUDED is not DROPPED.** `summary.archived_excluded` carries the count, up to 25
-names, `names_truncated` and a note; the cleanup recommendation's sentence names
-them and says why its list is shorter; `affected_count` now equals what `deletable`
-contains. The read is a SEPARATE statement over the SAME window and the SAME
-dormancy test with `status = 'archived'` instead — a subset of what the list
-scanned, by construction — and `count(*) OVER ()` carries the true total past the
-name cap. A FAILED read renders **null, never 0**: `archived_excluded: 0` claims the
-operator has retired nothing, which is one word away from the sentence this
-exclusion exists to stop the report making. That arm is unreachable from a DB test,
-so `an_unreadable_archived_exclusion_is_null_not_zero` drives the pure renderer with
-a ledger that marks the field unmeasured — it was a **measured SURVIVOR** of the DB
-suite before that test existed.
-
-**What was measured and NOT changed, and it is the severity of the whole class.**
-No execution path in this workspace filters on `workflows.status` at all. Proved
-with a scratch row — an archived workflow with `is_enabled = true`, an enabled
-schedule due one minute ago and an enabled webhook — driven through the VERBATIM
-production SQL: the scheduler due query (`talos-scheduler/src/lib.rs:1104`), the
-post-due workflow load (`:1584`), the webhook dispatch read
-(`talos-webhooks/src/router.rs:1763`), `resolve_by_capabilities` and
-`WorkflowGraphStore::get_graph` **ALL returned it**. So archiving does not stop a
-workflow being scheduled, webhook-triggered, capability-dispatched,
-chain-dispatched, sub-workflow-dispatched, called, triggered or enqueued;
-`is_enabled` is the only execution-path gate and it is enforced in RUST, never in
-SQL, at four places (`trigger.rs:203`, `call_workflow`, `trigger_workflow_as_actors`,
-`is_workflow_enabled` for retry/replay), while `bulk_trigger_workflow` and
-`enqueue_workflow` have none. The SCHEDULER reads neither `workflows` column, so
-`disable_workflow` does not stop a scheduled run either — the schedule's own
-`is_enabled` is the pause control there. **LATENT on this fleet**, stated plainly:
-the 8 archived rows have 0 enabled schedules and 0 enabled webhooks. Closing it is a
-fleet-wide behaviour change with its own blast radius (those 4 draft schedules among
-them), not a report fix, and it is recorded rather than attempted. `fix_all` and
-`session_start`'s draft sweep were checked and are unaffected: both key on
-`status = 'draft'`, a lifecycle filter that excludes archived rows by construction.
-
-**Check 87 was BUILT, MEASURED and SHIPPED, and the numbers say why it is
-window-scoped.** *"A `workflows` liveness predicate must name the shared home."*
-FILE-scoped it reports **6** on pristine main of which **3** are the
-`workflow_schedules.is_enabled` false positive (50% precision, shipping at 3 markers
-on correct code) — and worse, it would have been GREEN over the defect once any one
-of the four correct siblings in the same file named the home, which is check 86(a)'s
-stated limit becoming fatal. WINDOW-scoped (1400 chars back, 400 forward, whole-line
-comments stripped, `workflow_schedules` windows excluded) it reports **SEVEN on
-pristine main, every one a real `workflows` liveness predicate, 0 false positives,
-and 0 on the fixed tree**. Stated honestly: **7-of-7 against the RULE, 1-of-7 as a
-BUG detector** — the other six were correct and merely unrouted (check 85(b)'s
-framing). `--count` moves to **87**.
-
-Three mutations, all red: reinstating the dormant defect reports it at that exact
-line; a COMMENTED-OUT gate does not vouch (whole-line comments are stripped first —
-check 73's trap, which cost this check one false finding on its own doc block before
-the strip went in); and a tree where the shape has vanished FAILS LOUDLY rather than
-passing. That third one needed a two-part tripwire and the first version got it
-wrong in the reassuring direction: once a site is ROUTED the literal
-`is_enabled = true` disappears from it, so a raw-literal-only tripwire reported
-"found nothing" on the fully-fixed tree — measured, not imagined. It now counts raw
-windows PLUS rendered `*_sql(` call sites.
-
-### "Archived" must mean "will not run" — the NARROW dispatch gate (2026-09-07)
-
-**The entry above closed the REPORT half and recorded the other half without
-fixing it**: *"No execution path in this workspace filters on `workflows.status`
-at all"*, proved with a scratch row that an archived workflow with an enabled
-schedule and an enabled webhook was returned by all five verbatim production
-reads. This closes it. The operator's decision is the NARROW gate and nothing
-wider: **every dispatch path refuses `status = 'archived'`, and nothing else
-changes.** A DRAFT still dispatches — 4 drafts on the reference fleet carry
-enabled schedules and fire today — and `is_enabled` keeps exactly the meaning
-each path already gave it, including the paths that have never consulted it.
-`dispatchable_sql` is deliberately NOT the predicate used here: it also requires
-`is_enabled`, which would have been a second, unauthorised behaviour change
-wearing a one-word diff. The gate is `talos_workflow_liveness::not_retired_sql`
-/ `is_not_retired`, and `not_retired_is_weaker_than_dispatchable` pins the two
-apart so a future edit cannot quietly promote one to the other.
-
-**The five paths that entry named were not the population; there are 35, and
-two of its five descriptions were wrong.** The due query
-(`talos-scheduler:1103`) reads `workflow_schedules` ALONE and never joins
-`workflows`, so there was no predicate to add there and the gate had to sit at
-the post-due load; and the named `talos-schedule-repo` join is a LISTING, not
-the due query. More importantly, **"no execution path filters on `status`" was
-itself false by one site**: `ActorRepository::get_workflow_graph_for_user`
-(`talos-actor-repository/src/lib.rs:2050`) has carried
-`AND (status IS NULL OR status != 'archived')` in SQL all along, and its only
-caller is `handoff_to_actor`. So handoff was the one dispatch surface that
-refused — while REPORTING the refusal as *"Workflow not found or access denied"*,
-false on both clauses, because the filtered read returned `None` and the caller
-had nothing else to say. That claim is corrected in the crate's own module doc,
-in check 87's entry, and the read now returns the status so the caller can
-classify it (`HandoffError::WorkflowArchived`).
-
-**One gate covers seven surfaces because the enum forces it to.** The scheduler,
-the webhook router, `trigger_workflow`, `call_workflow`, `bulk_trigger_workflow`,
-`trigger_workflow_as_actors` and `enqueue_workflow` all mint their execution row
-through `create_execution_under_concurrency_limit` (or its batch twin), whose
-`SELECT … FOR UPDATE` on `workflows` was already there — so `status` rides along
-on that read, the gate costs **no extra query**, and it is atomic with the INSERT
-it guards. `ConcurrencyAdmission::WorkflowArchived` is a NEW VARIANT rather than
-a boolean, and that is the point: the enum is matched exhaustively at all seven
-sites, so the compiler asked each of them how it renders the refusal. Same move
-`WorkflowDeleteOutcome` made in #758. The batch twin gets a `archived: bool`
-FIELD instead, and the asymmetry is argued rather than sloppy: there
-`inserted == 0` already refuses whether or not the caller reads the flag, so the
-flag buys the caller the ability to say WHY — "throttled" invites a wait for
-capacity that will never arrive.
-
-**The paths that mint no row, or mint it elsewhere, carry their own gate.**
-`retry` and `replay` reuse an existing row; the continuation trigger (approval
-resumes, suspension resumes, and the Gmail push-notification WORKFLOW branch)
-writes elsewhere; the sub-workflow child dispatch mints none by design. Those
-read `WorkflowRepository::dispatch_lifecycle` — one PK read of `workflows`, the
-same shape and cost as #754's `read_actor_write_ceiling` — returning
-`WorkflowDispatchLookup::{Dispatchable, Retired, Absent}`, `#[must_use]`, with no
-`Into<bool>`: a boolean gate is one `unwrap_or(true)` from fail-open, and its
-caller could not tell a retired workflow from a deleted one when it renders the
-refusal. Note `replay` already read `is_workflow_enabled` — the OTHER column —
-directly above, and would have passed a retired workflow on the strength of it.
-
-**CLASSIFY where there is one named workflow; FILTER IN SQL where there are
-candidates.** `get_graph` is classified (`GraphLookup::{Found, Archived, Absent}`,
-the `ExecutionLookup` shape from #748) so a parent node fails with a message
-naming the child and the word "archived" instead of "not found", which would send
-its author hunting a deletion that never happened. The chain fan-out,
-`resolve_by_capabilities`, `resolve_by_name` and the `get_graphs` cache prefill
-filter in SQL, and each has a reason: the fan-out's `LIMIT` must be applied over
-real candidates or retired rows displace live ones from the chain set; the two
-resolvers are `ORDER BY … LIMIT 1`, so a read-then-refuse would let a retired
-candidate SHADOW a live one; and the cache prefill is only a warm-up, so an
-archived child misses it and falls through to `get_graph`, which reports the
-refusal once, with one wording.
-
-**`resolve_by_capabilities` is the one site here that is NOT latent, and it is
-the reason this shipped as more than tidying.** Measured on the reference fleet
-2026-09-07: all 8 archived rows carry non-empty `capabilities`
-(`email-delivery`, `sub-workflow`, `world-http`, `actor-memory-read`, …), and
-that resolver is `WHERE capabilities @> $2 ORDER BY updated_at DESC, id DESC
-LIMIT 1` with no lifecycle predicate — so a retired workflow was not merely a
-candidate for capability dispatch and A2A, it could be the WINNING one. The DB
-test seeds the retired row with the NEWER `updated_at` for exactly that reason,
-and the main-vocabulary twin fails on pristine main by returning it.
-
-**Everything else is latent, and saying so plainly is the point.** The 8 archived
-rows have **zero schedule rows** (not merely zero enabled ones) and **zero
-webhook triggers**. And the child question the brief asked to measure: **ZERO
-archived children under enabled parents** — in fact zero archived workflows are
-mentioned in ANY workflow's `graph_json`, whatever the parent's status. That was
-measured WITH A CONTROL, because a query that finds nothing proves nothing until
-it is shown able to find something: dropping the archived filter returns 6 real
-parent→child mentions (`cos-team-recall`, `pa-ask`, `pa-quality-judge` ×3,
-`stress-05-child`). So the sub-workflow half of this change can alter no live
-behaviour today.
-
-**Refusals are VISIBLE to the OPERATOR and OPAQUE to an unauthenticated caller.**
-`talos_dispatch_refused_total{path, reason="archived"}` is pre-seeded at 0 for
-all 12 paths that classify in Rust, incremented at one helper
-(`talos_metrics::record_dispatch_refusal`) taking a TYPED
-`DispatchPath` so a new surface cannot spell a label the constructor never
-seeded. **Nothing alerts on it**: a refusal is the policy working, and an alert
-here would train operators to ignore the one series that answers *a schedule
-stopped firing — is the platform refusing it, or is the scheduler broken?* The
-scheduler's per-tick line is **DEBUG**, not WARN, for check 69's reason (an ERROR
-that fires forever on a healthy fleet trains operators to ignore ERROR); its
-durable signal is the counter plus `scheduler_dispatches_total{outcome="denied"}`
-— **`DENIED`, not `SKIPPED`, and the existing partition already made that call**:
-that label's own doc says it is for a fire "refused by POLICY … chronic
-configuration states that are unchanged by how many schedules came due at once",
-which is this exactly, and folding it into `SKIPPED` would put a permanent
-configuration state inside the startup-herd alert.
-
-**The scheduler DOES NOT disable the schedule row, and that was a decision.**
-Option (b) in the brief was to disable it on first refusal with a WARN. Rejected:
-archiving is REVERSIBLE, so a self-disabling schedule would make un-archiving
-silently not resume — a second, invisible operator act the platform performs on
-the operator's behalf, which is the same two-columns-disagreeing asymmetry this
-whole class is about. A permanently-firing WARN is check 69's shape. So option
-(a), with the per-tick line at DEBUG.
-
-**The webhook tells the caller nothing.** It answers exactly what it answers for
-a workflow that is not there — `404 "Workflow not found"`, byte-identical — and
-that is the one place in this change where a refusal is deliberately rendered as
-an absence: an inbound webhook caller is unauthenticated with respect to the
-workflow, and a reply that distinguishes "archived" from "no such workflow" is an
-existence oracle for anyone who can guess a trigger id (the
-`caller_facing_unauthorized` argument, and #754's collapsed
-`write_ceiling_unreadable` reply). The operator keeps the distinction in the
-counter and a WARN — WARN rather than the scheduler's DEBUG because a webhook
-refusal is one inbound request rather than a recurring tick, so it cannot become
-permanent noise. **There was no paused-workflow response to mirror, and that was
-MEASURED rather than assumed**: the webhook path consults `workflows.is_enabled`
-NOWHERE, in SQL or in Rust, so a disabled workflow still fires by webhook today.
-The narrow gate does not change that — it is the other column.
-
-**Sites deliberately NOT gated, argued rather than omitted.** (1) **Resume and
-crash recovery** (`claim_stuck_execution_for_resume`,
-`claim_waiting_execution_for_resume`, the resume auth gate): these FINISH a run
-that was already admitted, and refusing would strand a waiting approval gate the
-moment an operator archived the workflow — turning a reversible lifecycle change
-into permanent loss for an in-flight run. The gate is about what the platform
-will START. (2) **`test_workflow`, `test_workflow_draft`, GraphQL
-`testWorkflow`**: an operator explicitly asking to test ONE named workflow is not
-the platform deciding to run it, and refusing would remove the only way to check
-a workflow before un-archiving it. This is the place a reader might reasonably
-expect a refusal and not find one, so it is stated rather than left to be
-discovered. (3) **Module replay**: replays a MODULE against recorded inputs; the
-graph is read to rebuild a node's config, not to run the workflow.
-
-**The chain fan-out's refusal is SILENT, and that is a stated limit rather than
-an oversight.** `talos_dispatch_refused_total` has no `chain` label because that
-site is a capped SET read, not a per-request refusal — there is no one workflow
-being refused to count, and seeding a label nothing increments is the defect
-check 58 exists for. The same applies to the two resolvers and the cache
-prefill. Four of the sixteen gate sites are therefore uncounted, by construction.
-
-**Guard, and what it does and does not cover.**
-`controller/tests/archived_dispatch_gate_tests` (8 tests, CTRL_TESTS) drives the
-REAL admission chokepoint, the REAL `WorkflowGraphStore` reads, the REAL
-`dispatch_lifecycle` and the REAL handoff read. Two properties are deliberate:
-it asserts on **ROWS**, not just on the returned variant — an earlier version of
-#754's write-ceiling test passed because the INSERT would have failed anyway and
-survived the gate being deleted, and the first draft of THIS file reproduced that
-exactly (passing `actor_id: None` made both CONTROLS die on a NOT NULL constraint
-while the archived case "passed") — and every test carries an **ACTIVE and a
-DRAFT control**, so a gate widened to `status = 'active'` fails here rather than
-looking like a stricter version of the same thing.
-
-**Measured RED on pristine `origin/main`, by assertion and not by compile
-error**: six main-vocabulary twins were run in a real `git worktree` of `1a13ad6b`
-against its own migrated database, and **6 of 6 FAILED BY ASSERTION** — the
-admission gate admitted an archived workflow and wrote the row, the batch twin
-queued 3, `get_graph` handed back the archived child's graph, the capability
-resolver returned the RETIRED workflow as the winner, name resolution resolved
-it, and the handoff read hid the row. Zero failed by compile error. The twins are
-a scratch artefact and are not committed.
-
-**No lint check was added and `--count` stays 87.** The candidate — *"a
-`workflows` read that feeds dispatch must name the liveness home"* — was measured
-before it was written and REJECTED twice over. It cannot be scoped by SQL shape:
-the 35 dispatch reads share no predicate (`WHERE id = $1 AND user_id = $2` is
-also how ~40 report and authoring reads spell themselves), so a shape-scoped rule
-is ~50% precision at best. Scoped instead to the FILES that dispatch, it reports
-the 33 files carrying any `FROM workflows` and would ship at ~25 markers on
-correct code. And decisively, it would be **green over the very defect it is for**:
-every gate site in this change now names `talos_workflow_liveness`, so a
-file-scoped rule is satisfied by ONE gated read vouching for every other read in
-the same file — check 86(a)'s stated limit, which check 87 already had to
-window-scope around. Check 87 does not cover this either: its window looks for a
-LIVENESS predicate over both columns, and the dispatch gate is one column. The
-structural answers that ARE stronger than a grep: `ConcurrencyAdmission` and
-`GraphLookup` and `WorkflowDispatchLookup` are exhaustively-matched enums, so a
-new dispatch surface cannot be added without the compiler asking what it does
-with a retired workflow; `record_dispatch_refusal` takes a typed `DispatchPath`;
-and the DB tests carry a DRAFT control at every site.
-
-**2026-09-06 — the ANSWER: `sub_workflow_runs`, the child-run ledger (RFC 0012 P1).**
-Everything above this line teaches a reader to say *"no evidence"* instead of
-*"never ran"*. None of it can ANSWER the question, and the structural question
-#762 recorded — *should `execute_subworkflow_graph` write a `workflow_executions`
-row?* — is answered NO for the reasons measured there (161 of 163 reads carry no
-`parent_execution_id` filter; `budget_precheck` counts execution rows, so a
-parent with a child would be billed twice; the retention sweep would split one
-tree across two tiers). RFC 0012 takes shape B: a separate, narrow table written
-at the dispatcher chokepoint, with no payload columns, RLS from its first
-migration, and its own retention tier in the existing pass at
-`archive_after_days + purge_after_days` (no FK, because archival is a DELETE plus
-an INSERT and a CASCADE would erase the ledger at day 30 while the parent lives
-to day 60).
-
-**P1 covers**: the migration + RLS, `ChildRunRecorder` in
-`talos-workflow-engine-core`, the leaf repo `talos-child-run-ledger`, the ONE
-chokepoint write, retention, `since()`, and the two smallest honest consumers —
-`get_execution_lineage` gains `child_runs` under the anchor, and
-`get_workflow_reuse_stats.parent_dispatched` gains `child_runs_since_ledger`
-beside `ledger_since`. **P2** is the four uncovered dispatch kinds plus
-readiness / hygiene / the dormant lists; **P3** the SLA monitor and the
-cascading-failure check.
-
-**The RFC's own premise was REFUTED before anything was written, and the
-correction is the part to remember.** `execute_subworkflow_graph` is NOT the one
-path every child takes. Enumerating every `AdapterSet::into_engine_with_graph`
-site — the only way a child graph becomes a running engine — finds THREE: the
-chokepoint, `run_dispatched_subworkflow` (`dispatch`, `capability_dispatch`) and
-the agent-loop body's per-iteration hydration. So P1 records five node kinds
-(`sub_workflow`, `judge`, `ensemble`, `reflective_retry`, `llm_dispatch`) and is
-structurally blind to four. On the reference fleet those four are LATENT — of 36
-workflows the only child-dispatching node kinds present are `sub_workflow` (3)
-and `judge` (3) — and *"latent is not live"* cuts both ways, so the gap is NAMED
-in `talos_child_run_ledger::UNRECORDED_DISPATCH_KINDS` and DISCLOSED by both
-consumers rather than left to read as "this child never ran". The table's CHECK
-admits exactly the five kinds that have a writer: `agent_loop` was in the RFC's
-draft list and is deliberately absent, because a value nothing writes is the same
-defect as a seeded metric label nothing increments.
-
-**2026-09-07 — P2: the readers learn to read the ledger, and the four blind
-dispatch kinds are closed.** P1 could ANSWER "did this child run"; nothing
-asked it. Four readiness surfaces and two hygiene lists now do.
-
-**Readiness.** `ReadinessBasis` gains `LedgerMeasured`. A child with ≥
-`LEDGER_MIN_RUNS` (**3**) recorded runs in the 30-day window is scored on the
-FULL 100 with reliability = the ledger's success rate and freshness = the age
-of its newest recorded run, both through the SAME `compute_reliability_score` /
-`compute_freshness_score` the fleet uses — the INPUT moves, the arithmetic does
-not. Below the floor the child KEEPS the 30-point denominator and the shortfall
-is disclosed with the count and `ledger_since`; it is NEVER scaled up, which is
-#762's second rejected rendering and stays rejected. **Why 3, argued from
-#762's own reasoning**: 1 promotes on one observation, so a single failure
-reports reliability `0/50` as a fleet-comparable fact — the determinate
-negative in a new shape; 10 (the ramp's saturation point) keeps a child that has
-demonstrably run nine times on a denominator whose stated reason is "nothing can
-measure this"; 3 is the smallest number from which a success RATE is a rate, and
-the ramp already discounts it (a perfect child at n=3 earns 15 of 50). The floor
-protects the DENOMINATOR claim, not the arithmetic. **`ReadinessBasis::from_scan`
-was DELETED**: it had zero production callers by the end of P2 and exactly one
-behaviour — silently scoring every child on 30 — so a scorer that FORGOT the
-ledger would have been indistinguishable from one that could not READ it.
-Callers pass an explicit `Option<ChildLedgerEvidence>`; `None` STATES "not
-consulted", the same reason P1 made `ChildRunSite` an enum and not an `Option`.
-All FOUR surfaces read it — the three `score_readiness` callers plus
-`get_all_readiness_scores`, which derives `max_possible` from the basis instead
-— and the `below_50` exclusion follows the BASIS
-(`ReadinessBasis::is_unmeasurable_child`), not child-ness: a ledger-measured
-child scoring 47 is a REAL below-50 finding, and excluding it would hide the
-platform's most-used sub-workflows from the one count that would notice them
-degrading.
-
-**Hygiene.** The dormant and stale-draft child rows gain `last_child_run_at`,
-`child_runs_since_ledger` (null, never 0, before `ledger_since`) and the
-`ChildRunEvidence::note` that refutes the stale-draft list's own "never
-executed" premise. The `execution_cost_rollup` proxy is **KEPT and DEMOTED, not
-deleted**, and the reason is a measurement: it is the only thing that can speak
-for the period BEFORE the ledger's first row, which was **~11 h old against a
-30-day window** the day this shipped. Its caveat now records the number that
-supersedes it — measured 2026-09-07, the worst case is **0%** recall and not the
-~5% P1 recorded: one child whose parent ran **5085** times in 30 days (461 of
-them in 48 h) has ZERO rollup rows in the whole window and a proxy timestamp 45
-days old. Once `ledger_since` is older than the 30-day window the proxy adds
-nothing and can be removed — an operator loses nothing then, and everything
-before the floor now.
-
-**The four uncovered dispatch kinds are RECORDED, and the "different shape" the
-RFC predicted was the shape the file already used.** `dispatch` /
-`capability_dispatch` (`run_dispatched_subworkflow`) and the per-iteration
-`agent_loop` / `react_loop` body now write. `execution_id` was already in scope
-at all three reactor call sites, so threading was never the obstacle; the
-obstacle was that the loop body's `async move` captures the adapter set and NOT
-`self`. `ChildRunReporter` — a small `Clone` value carrying the recorder, the
-sanitizer, the parent workflow id, the RESOLVED node label and the depth — is
-built from `&self` and captured beside `sub_binding`, which the same function
-had been doing for the same reason since #504. **The INSERT is still in exactly
-one function**; what moved is where its inputs come from. The loop records ONE
-ROW PER ITERATION (five iterations are five child runs; folding them would make
-the ledger disagree with `iterations_run` and with the fuel those iterations
-burned), and `ReActLoop` records `react_loop` even though it shares
-`try_dispatch_agent_loop` — the ledger records what the AUTHOR wrote.
-`UNRECORDED_DISPATCH_KINDS` is now EMPTY and is **kept rather than deleted**: an
-empty list is a CLAIM, and deleting the constant removes the only place that
-claim can be contradicted when a tenth kind arrives without a writer. Migration
-`20260907020000` widens the CHECK to nine values (a NEW migration, never an edit
-of the applied one).
-
-**Cost, measured rather than assumed.** The hourly loop adds **two queries per
-USER per tick** — a cached floor read and one grouped `= ANY($1)` count over
-that user's child ids, narrowed to rows the child scan already calls somebody's
-child, so a batch with no children costs no query at all. Against a loop already
-issuing THREE queries per workflow (108 for the 36-workflow fleet) that is ~2%
-more statements. On a standalone replica carrying P1's three indexes: at 13 500
-rows (60 days at ~225 runs/day) the batched count is 0.96–1.17 ms and
-`since()` is **1.7–1.9 ms as a SEQ SCAN**; at 135 000 rows they are 9.0 ms and
-**14.4–15.5 ms**. None of the three P1 indexes leads with `started_at`, so
-`MIN(started_at)` is linear in the table — and P2 takes that read's callers from
-two to five. The migration therefore adds `(started_at)`, measured at
-**0.036–0.045 ms** (Index Only Scan) on the same 135 000 rows, i.e. ~400x, for
-one more b-tree on an append-only table.
-
-**What is NOT covered, measured rather than implied.** (SUPERSEDED for the two
-write sites by the P3 entry below — the mutation named here is now CAUGHT by
-`talos-workflow-engine/tests/child_run_dispatch_recording.rs`, and it was
-re-run against the pre-existing suite to confirm this paragraph was true when
-written.) Deleting the `record`
-call at the tail of `run_dispatched_subworkflow` leaves every
-`talos-workflow-engine` unit test AND both ledger DB binaries GREEN — a measured
-SURVIVOR, not a hypothetical. That function is private and the loop body sits
-inside a `tokio::time::timeout`'d `async move`, so driving either needs a full
-reactor run over a graph with a `dispatch` or `agent_loop` node, which the P1
-harness does not build. What IS covered by construction is the SHARED write site
-every path now routes through: gutting `ChildRunReporter::record` turns four
-`child_run_ledger_tests` red. The reference fleet has **zero** nodes of those
-four kinds, so there is nothing to read live yet either — both halves stated
-rather than left to look like coverage. **No lint was added and `--count` stays
-86**: the candidate ("a readiness scorer must consult the ledger") has a
-production population of FOUR and the structural answer is stronger than a grep
-over them — `from_scan` no longer exists, so the forgetful spelling does not
-compile.
-
-**Two non-negotiables, recorded so nobody "fixes" them.** (1) A child run is NOT
-charged to the actor's hourly execution budget — the parent's run was budgeted
-when it was created, and `budget_precheck` counts `workflow_executions` rows,
-which this adds none of (pinned by a DB round trip, not a comment). (2) UNKNOWN
-is not zero: the table has a first row, so a count of 0 for a period before
-`ChildRunLedger::since()` is *nobody was recording*, and every consumer renders
-`null` with the reason rather than `0`. `since()` is deliberately NOT user-scoped
-— the question is a deployment fact, and a per-user `MIN` would render UNKNOWN
-forever for a user who has legitimately never dispatched a child, turning a real
-zero into a permanent "we cannot tell".
-
-**Three implementation facts the code forced, all measured first.** The engine
-has NO `execution_id` field (it is a parameter of `run_inner`, and nodes dispatch
-concurrently), so `ChildRunSite { execution_id, node_id }` is threaded from the
-reactor loop through the five `dispatch_*` handlers — an ENUM with an explicit
-`Untracked` variant, not an `Option`, so a sixth handler cannot be added without
-the compiler asking; the WRITE still happens in one place. `org_id` was DROPPED
-from the RFC's table: the engine has no org handle, and the RLS policy joins
-`workflows` for the org exactly as `20260904210000` does, so the column would
-have been decorative and wrong. And `status` is CLASSIFIED with check 77's
-`output_reports_error`, never `.as_bool()` — a child whose engine returned `Ok`
-can still have failed, and the ledger must not disagree with the run about it.
-
-**this change (2026-09-06) — the two smallest consumers say what they measured.** Two report
-surfaces asserted a determinate negative for a state the reader could not
-represent — checks 74/76/79's class again, in the two places RFC 0012 P1 had
-just made representable.
-
-**(B) `get_execution_lineage` contradicted itself in one response.** Its note
-read *"This execution has no parent or child executions — it is a standalone
-run."* fourteen lines below `child_runs_count`, which since #766 can be ≥ 1.
-Both halves were true: the note is a statement about `workflow_executions` ROWS
-and was worded as a statement about the RUN, and "standalone" is exactly the
-reading the ledger exists to remove. `lineage_note` is now a pure function of
-the four facts it may speak about, and the single-node arm is three-valued like
-`child_runs_note` beside it: a measured zero, a count with the reason `lineage`
-cannot show it, and UNKNOWN for an unreadable or not-yet-started ledger — never
-zero, never "standalone". **Latent on this fleet at the time of writing, and the
-brief's own observation could not be re-run**: `sub_workflow_runs` holds exactly
-ONE row, its parent execution row and both workflow rows were deleted (the
-ledger has no FK, by design), so no live execution can currently exhibit
-`count ≥ 1` beside that sentence. The defect is pinned by unit test rather than
-reproduced live, which is worth saying rather than implying otherwise.
-
-**(D) `get_archive_policy` reported one of the two retention windows and
-re-derived it itself.** An execution's readable lifetime is
-`ARCHIVE_AFTER_DAYS` (live → archive) PLUS `EXECUTION_RETENTION_DAYS` (archive →
-gone), 30 + 30 = **60 days** on the default this deployment runs — kept
-deliberately (decision 2026-09-06). The tool rendered the archive tier alone,
-so the purge window and the lifetime were invisible in every tool response,
-while `EXECUTION_RETENTION_DAYS`' NAME reads like the total it is not.
-`docs/configuration-reference.md` explained the 30 + 30 and nothing
-machine-readable did. The handler ALSO carried its own
-`talos_config::archive_after_days()` read, its own JSON parse and its own
-`d > 0` filter — a second implementation of `resolve_retention_windows`, whose
-own doc comment claims to be *"the ONLY place that decides which configured
-number governs which tier"* — and the two had drifted. It now renders from
-`talos_advanced_repository::resolve_retention_policy`, of which
-`resolve_retention_windows` is a projection, so the REPORT and the SWEEP cannot
-answer differently; every pre-existing key keeps its name and value, and
-`set_archive_policy` now states in its response and its description that it
-moves ONE of two windows. **The drift shape was narrower than it looked and the
-first test for it was green over the mutation** — serde strips the JSON
-delimiters, so `'"45"'::jsonb` reaches `as_str()` as `45` and the handler's
-`trim_matches('"')` is a no-op there; it bites only on a jsonb string whose
-CONTENT carries quote characters (`'"\"45\""'::jsonb` → `"45"`), which the
-resolver rejected and the handler accepted. Live population of ANY override on
-the reference fleet 2026-09-06: **ZERO** — `system_settings` held no rows at all
-— so the drift was latent, and the fix is that there is now one parse rather
-than that a live row was wrong. An unreadable setting still REFUSES (#730)
-rather than rendering the windows as null: it makes both reported sources wrong
-at once, and the one number still producible (the env default) is precisely the
-misleading one.
-
-**No lint check was added and `--count` stays 86.** The candidate for (D) —
-*"`talos_config::archive_after_days()` may be read only inside the resolver"* —
-was measured in both directions before it was written: on pristine `origin/main`
-it reports **2** non-test production sites outside `talos-advanced-repository`,
-of which **1** is the real defect and **1** is legitimate
-(`talos_workflow_validation::history_window_days`, which CAPS a display window
-at the archive boundary and decides no retention), i.e. 50% precision over a
-population of two, shipping at one-with-a-marker. Below the bar #765's own
-numbers set, and the structural answer is already stronger: one `pub` resolver,
-the projection above it, and a DB test driving BOTH entry points over the same
-rows. For (A) the guard already exists and is check 56 itself; for (B) the
-population is one.
-
-**What is NOT guarded, stated rather than implied.** The chokepoint's own
-`redact_str` on `error_class` is defence in depth on the `Ok` branch —
-`run_scheduler_loop` DLP-scrubs the whole results map on its way out, so
-removing the chokepoint's call does NOT turn the DB test red (measured). It is
-the ONLY pass on the `Err` branch, where the text is an engine error string that
-never met the sanitizer. **No lint check was added and the count stays 86**: the
-one write site is a chokepoint the compiler already funnels every caller
-through, so a "the ledger must be written" detector would have a population of
-ONE and nothing to say.
-
-**2026-09-07 — P3: the ALERTER and the ASSESSOR read the ledger, and the two P2
-write sites get a test.** P2 taught the READERS; the two surfaces #762 recorded
-as "disclosed, not fixed" and "recorded and NOT changed" are the ones a person
-is paged by, and they are closed here.
-
-**The cascading-failure check was blind to a child failing 100% of its runs, and
-that was MEASURED before anything was written.** Driving the real reads against
-a scratch database: a child with THREE recorded runs inside the check's own
-7-day window, ALL FAILED, returns an EMPTY map from
-`get_risk_exec_counts_for_ids` while `child_run_stats_since` returns
-`runs: 3, failed: 3`. The check took its `None =>` arm, listed the id under
-`sub_workflows_unmeasurable` and pushed no risk — indistinguishable from a child
-that never ran. The read is now `child_ledger_evidence_since`, which is P2's
-readiness read **SPLIT, not copied** (the 30-day entry point is a one-line
-projection over it), so the floor arithmetic — read `since()`, clamp the window
-to `max(window, floor)`, turn an ABSENT key into a zero-WITH-a-floor — keeps ONE
-home while the WINDOW moves to the check's seven days. The decision is the pure
-`talos_analytics_repository::cascading_risk::classify_sub_workflow_risk`.
-
-A HYBRID child is judged over the UNION of both tables with the split disclosed
-(`measured_over`), because both hold real runs of one workflow and the check
-renders ONE `description` per child — two rates under one category would have to
-be recombined by the reader with no denominator to do it on.
-`LEDGER_MIN_RUNS` gates the CHILD-ONLY population and nothing else: where
-execution rows exist the check already had a population it was willing to judge,
-so a floor there would be a NEW refusal on a finding that fires today.
-`sub_workflows_unmeasurable` changes SHAPE — id strings become objects carrying
-`reason`/`child_runs`/`child_runs_failed`/`ledger_since`/`window_start`/`note` —
-and every reader was checked (there is exactly one, and none in the frontend).
-`UnmeasurableReason` is FOUR-valued: `ledger_not_consulted` is a statement about
-the CODE PATH and stays distinct so a wiring regression cannot render as a fact
-about the workflow. That distinction earns its keep below.
-
-**"This workflow's SLA-window stats" had FOUR implementations and they
-DISAGREED** — check 85's class, and the disagreement moves a verdict. The 5-min
-breach monitor's inline SQL and `get_sla_window_stats` (the 15-min degradation
-loop) ask the identical question over the identical 24-hour window; only the
-first filters `completed_at IS NOT NULL`, so an execution still IN FLIGHT sat in
-the second's denominator and never in its numerator, making its success rate
-systematically LOWER. One stored threshold row, two loops, opposite verdicts on
-one tick. `sla_window::read_sla_window_sources` is now the one read: BOTH
-populations in ONE statement, a `UNION ALL` with `GROUP BY ROLLUP(src)` so the
-per-source split and the COMBINED percentile come from one pass (a p95 over a
-union is not a function of the two sub-p95s and must never be averaged).
-`get_sla_window_stats` and its `SlaWindowStats` are DELETED rather than kept as
-a projection, for the reason P2 deleted `ReadinessBasis::from_scan`: they
-returned `Option`, so a failed read and an empty window were one value, and a
-future caller reaching for the convenient name would silently re-acquire the
-collapse this change removes. Its one caller reads the new function and handles
-three outcomes — **a behaviour change to the 15-min loop, and it is the fix**: the unified definition is the monitor's (runs that
-SETTLED in the window), the direction is strictly fewer false success-rate
-alerts, and it gains a `user_id` it never had (its docstring called SLA alerting
-"platform-wide"; its caller already reads `w.user_id`). `get_latency_percentiles_ms`
-and `get_performance_metrics` are deliberately NOT collapsed in: they answer the
-latency DISTRIBUTION of SUCCESSFUL runs over a days-window, and folding a failed
-run's duration into `duration.p50` would move a number an operator reads without
-being asked.
-
-The BREACH DECISION is the pure `decide_sla_breaches`; the loop keeps only
-wiring, which is the only thing that makes it testable —
-`controller/src/bootstrap/background.rs` is `mod bootstrap` inside `main.rs`, so
-no integration test can reach the loop itself (#762 recorded the same fact for
-the readiness loop). `LEDGER_MIN_RUNS` gates BOTH metrics when child runs are
-the only evidence, and the p95 argument is not weaker than the success-rate one:
-a p95 over n=1 IS that one run's latency, so one slow cold start would page
-somebody. `not_evaluated` is three-valued, so "no breach" and "could not judge"
-are different log lines. The webhook keeps every key AND its per-metric
-rendering and gains `sources: {execution_rows, child_runs, child_runs_since,
-window_hours}` — counts, a timestamp and an integer, the kinds of value it has
-always carried.
-
-**An alerter that cannot measure must say so.** `Err(_) => continue` became a
-WARN with `event_kind = "sla_stats_unreadable"` and an error CLASS
-(`sla_read_error_class`), once per threshold per tick, full chain at DEBUG; the
-same treatment went to the 15-min loop's `_ => continue`, which
-`docs/swallowed-results-inventory.md` records as fails-OPEN and which folded
-THREE states (read failed / empty window / 1–2 runs) into one silent skip.
-**No metric was added, and that is a measurement rather than an omission**: that
-function has no `TalosMetrics` handle, so a series would mean threading the
-registry into `spawn_late_background_tasks` for a loop that is LATENT on this
-fleet. Declined, which means the unreadable-window signal is prose-only and
-cannot be alerted on.
-
-**A NULL webhook KILLED the monitor, and the documented configuration is what
-produced one.** The threshold row was decoded with `sqlx::Row::get::<String, _>`;
-the column is nullable by design (`20260404000001`) and
-`set_workflow_sla_threshold` stores NULL for an omitted webhook — its tool
-description advertises that as the API-polling configuration. `Row::get` PANICS
-on a decode failure and this loop is a spawned task, so ONE such row ended the
-SLA monitor for the whole process lifetime, silently. Every column now decodes
-through `try_get` in one closure and a bad row skips ITSELF with
-`event_kind = "sla_threshold_row_undecodable"`. Also corrected in the same
-block: a comment claiming the task "issues per-threshold INSERTs into
-`workflow_sla_alerts`". There is no such INSERT and no such table — the 15-min
-sibling writes `workflow_alerts` — and a comment asserting a side effect the
-code does not have is #732's class.
-
-**`get_workflow_sla_report` measures a child.** `success_rate` is the union
-(floored when the ledger is the only evidence), so a workflow that only ever
-runs as a sub-workflow stops reporting `not_measurable` however often it ran.
-`total_executions` keeps its name's meaning, p50/p95/p99 stay EXECUTION-ONLY and
-`duration.population` says so, and `child_runs` appears only when the ledger
-contributed or when there are no execution rows at all. Note one disagreement
-KEPT and disclosed: this report's denominator includes runs still IN FLIGHT (a
-considered decision, pinned by `sla_absence_disclosure_tests`) while the alerter
-must not fire on an open run — two different questions, and the response says
-which it is answering. The compiler forced all 7 pre-existing tests to state
-`child_runs: None` ("not consulted"), which is P2's `from_scan` shape for the
-same reason; all 7 pass unchanged.
-
-**Leg C: the two P2 write sites now have a reactor-driven test, and P2's own
-mutation was re-run rather than assumed.**
-`talos-workflow-engine/tests/child_run_dispatch_recording.rs` drives
-`run_with_transport` over `dispatch`, `capability_dispatch`, `agent_loop` and
-`react_loop` nodes against a hand-written capturing `ChildRunRecorder` (the
-workspace has exactly ONE recorder impl and test-utils has none). Deleting the
-`record` call at the tail of `run_dispatched_subworkflow` — P2's M8 — still
-SURVIVES the pre-existing engine suite (exit 0, re-measured) and is CAUGHT by
-the new binary. Also caught: recording once instead of once per agent-loop
-iteration, a `ReActLoop` filed as `agent_loop`, and a `CapabilityDispatch` filed
-as `dispatch`. **No LLM stub was needed and that was measured**: the loop body is
-the body workflow's graph run through the ordinary `NodeDispatcher`, so a fixed
-output controls the iteration count exactly. **One expectation of mine was wrong
-and the code was right**: a dispatch child whose terminal MODULE returns
-`{"__error": "…"}` is recorded `Completed`, because a dispatch envelope is a
-LABEL-KEYED map rather than the collapsed terminal value — and the PARENT node
-applies `output_reports_error` to the identical envelope and reaches the
-identical answer, which is exactly the invariant the write site claims.
-
-**TWO measured SURVIVORS, both handler-body call sites, and they are not equally
-silent.** Setting the SLA report's `child_runs`/`ledger_since` to `None`, and
-passing `None` instead of the ledger evidence in the risk check, both leave every
-test green — the shape checks 74b and 79b already state as their own limit: the
-DB tests drive the repository read, the unit tests drive the pure decision and
-the pure renderer, and none can see a call site that computes the right answer
-and discards it. The RISK one SELF-DISCLOSES (every entry then reads
-`reason: "ledger_not_consulted"` and says so in words, which is why that variant
-exists); the REPORT one is SILENT and is left open, with the live read after
-deploy as its honest guard — the position #767 and #769 took about their own
-call sites. No lint: the population is TWO, and "the handler must pass the read
-it just recorded" is a dataflow question, not a textual one.
-
-**A cosmetic defect that reached operator-facing JSON, swept.** The house style
-for a long literal is a `\`-continuation, which renders as ONE space because
-`\<newline>` skips the newline AND the next line's indentation. Twenty-seven
-lines had lost the `\` and kept the indentation, so runs of up to 30 spaces
-reached the rendered string — including the cascading check's own note, five of
-the SLA report's disclosure strings and four of P2's child-run notes. Measured
-workspace-wide with a literal-aware walker: **44 lines**, of which **17 are
-legitimate** (aligned `println!` columns, embedded code samples, tests matching
-source text, one SQL literal) and 27 were prose. All 27 fixed.
-**A lint was BUILT, MEASURED and REJECTED**: the brief's candidate rule (a `\`
-continuation followed by ≥2 spaces) describes the CORRECT house style and would
-fire everywhere; the rule that does describe the defect still reports the 17
-legitimate sites on the fixed tree, i.e. 0% precision at zero and 17 markers on
-correct code. Telling prose from an aligned column is a judgement a grep cannot
-make. `--count` stays **86**.
-
-**What was measured and NOT changed.** `set_workflow_sla_threshold` still
-accepts a row with BOTH thresholds NULL (the invariant lives in the handler and
-the tool description, not in a CHECK), and such a row is now evaluated and fires
-nothing rather than being a special case. The report's in-flight denominator
-stays as it is, disclosed. And the two latency-percentile readers stay separate,
-for the reason above.
-
-**2026-09-07 — the report contradicted itself the moment child runs crossed the
-floor.** P3 gave `get_workflow_sla_report` a population that spans both tables;
-`sample_size_warning` was left keyed on `total_executions == 0`. Two decisions, one
-response. Measured live on `pa-quality-judge` (0 execution rows, 3 ledger runs,
-floor 3) and reproduced against the real pure renderer: `success_rate.actual: 100.0`,
-`met: true`, `child_runs.counted_in_success_rate: true`, and fourteen lines below,
-*"No executions at all in the trailing 30 day(s), so nothing about this workflow's
-SLA was measured. The success rate, the latency percentiles and the compliance
-verdict are all null"* — then, appended, *"The RFC 0012 child-run ledger DOES hold 3
-run(s)"*. Below the floor (n = 2) the same sentence is CORRECT, because
-`rate_total` is 0 there by construction, which is why nothing looked wrong.
-
-The warning is now derived from `rate_total`, the success-rate block's own
-denominator. `sample_n == 0` keeps today's wording **byte-identical**; `sample_n > 0
-&& total_executions == 0` gets a new sentence saying the rate WAS measured over N
-child runs, that the LATENCY half is what the empty execution table costs, and what
-`compliance_status` is — every clause derived from the values actually rendered
-(`p99_ms`, `in_compliance`), never asserted, so a caller who passes a p99 with no
-execution rows is not told a falsehood about it.
-
-**A second defect of the same keying, found by the same measurement**: `total_u == 0`
-short-circuited the whole `else if` chain, so at n = 3 against a 99% target the
-STATISTICAL qualification (`min_n_for_meaningful_target` = 100) was unreachable — the
-one measured verdict on the surface was rendered with no sufficiency qualification at
-all. The sufficiency sentence now has ONE home, a local closure consulted by both
-branches, and its denominator is `sample_n`; where that is wider than
-`total_executions` the population is NAMED, and where they are equal the sentence is
-byte-identical to the pre-fix one (pinned by
-`an_execution_only_report_keeps_the_pre_fix_sufficiency_sentence`, which asserts the
-whole string).
-
-**The rest of the response was grepped against the basis**, per the brief. Four other
-sites read `reads.total == 0`: `ledger_below_floor` (the population decision itself),
-the `child_runs` block's emission condition, and the two `population` strings — each
-states its OWN population and is correct. `compliance_note` keys on
-`in_compliance.is_none()`, i.e. on the basis, and at the floor it correctly reports
-the LATENCY component as the unmeasured one. Nothing else changed.
-
-Four mutations, all red: keying the first branch on `total_u == 0` again; keying it
-on `child.total == 0`; passing `total_u` to the sufficiency closure; emitting the
-wider-population clause unconditionally. **No lint** — the population is one renderer
-and the guard is four unit tests over the real pure function; `--count` moves to 87
-for leg X1's check only.
-
-## 2026-09-07 — the population behind checks 74 / 76 / 79 / 81: 210 collapsed reads, 110 of them claims
-
-Every prior entry in this family repaired a SITE and named a class. This one
-MEASURED the class. `talos-mcp-handlers/src` + `talos-api/src` hold **210**
-awaited repository/service reads collapsed into a default, and **110 of them
-are CLAIMS** — the default becomes a count, a list, a verdict or a "not found"
-that a caller reads and acts on. The full per-site table (file, line, function,
-spelling, verdict, the field it feeds) is in the branch's `AGENT_NOTES.md`; the
-counts and the decisions are here so nobody re-measures.
-
-**The inventory is statement-aware, and that is why it is bigger than a grep.**
-Comment and string content is masked first (so a doc comment quoting the banned
-expression cannot self-report — check 73's trap), then the POSTFIX METHOD CHAIN
-after each `.await` is walked, so the house style's broken chain is one
-statement; a collapse counts only if it precedes any `?`. Per spelling:
-`.unwrap_or_default()` **66**, `.unwrap_or(<literal>)` **55**, `.ok()` **32**,
-`match … { Err(_)/_ => <default> }` **26**, `if let Ok(..) = ….await` /
-`let Ok(..) = … else` **24**, `.unwrap_or_else(…)` **7**.
-
-**Classification: 110 claim / 67 decorative / 32 fail-closed / 1 detector false
-positive.** `fail-closed` is dominated by ONE shape —
-**15** of the 32 are `is_platform_admin(uid).await.unwrap_or(false)`, which
-check 74's opt-out already names as correct. The false positive is
-`handle_trigger_workflow_as_actors`, a correct three-way match whose INNER
-`actor.status` arm the window matched: stated rather than dropped, because a
-detector's limits are worth as much as its findings.
-
-**ELEVEN sites were fixed, in three SHAPES, and 99 claim sites were not.**
-Saying so plainly is the point — a fix set chosen as a prefix of a list teaches
-nothing, and half-fixing a class to satisfy a gate is how the glob got its
-blind spot.
-
-* **A refusal that asserts NON-EXISTENCE on a read that failed.**
-  `actor::resolve_actor_via_repo` is the ownership gate behind **20+** actor
-  tools and its `Err(_)` arm rendered *"Actor not found or access denied"* —
-  false on both clauses while the database is the broken thing. The correct
-  three-way shape was already in the same crate
-  (`evaluation::ensure_actor_owner` splits `Err(_) => "actor ownership check
-  failed"`), so this is a rule that failed to REPLICATE, exactly as check 79
-  records about the four integration handlers.
-  `knowledge_graph::require_owned_actor` is the byte-identical twin.
-  `ml::require_dataset_owner` needed the CALLEE fixed first — check 79's leg (b)
-  verbatim: `DatasetService::dataset_tenancy` folds absence INTO `Err`, so
-  `Ok(None)` was structurally unreachable and no call-site split was possible.
-  `lookup_dataset_tenancy` is the three-way read; `dataset_tenancy` stays as a
-  documented FLATTENING projection because its eight in-crate callers propagate
-  with `?`, i.e. FAIL rather than claim.
-* **A swallowed read driving a DESTRUCTIVE or inventory decision.**
-  `handle_cleanup_module_versions` read `refs.is_empty()` as "nothing points at
-  this module → deletable", and its reference read was `.unwrap_or_default()` —
-  so with `dry_run: false` an IRREVERSIBLE delete was decided by a query that
-  did not answer (check 86's shape on a path that deletes rather than
-  recommends). Held-back modules are excluded from `deletable` AND disclosed
-  under `unknown_references`, with the sentence saying why its count is short.
-  `handle_batch_delete_modules`'s classification default is fail-closed for the
-  DELETE and NOT for the REPORT — it told the caller, by name, that each of
-  their modules does not exist — and now refuses. `handle_list_templates` /
-  `handle_list_modules` refuse too: an empty listing is the premise of every
-  next step an operator takes, and there is no partial answer to give.
-* **A COUNT or LIST rendered as a report field.**
-  `handle_get_workflow_summary` answered a database failure with the four most
-  reassuring numbers it can produce — `total: 0`, `versions: 0`,
-  `active_schedules: 0`, `active_webhooks: 0`, i.e. *never run, never published,
-  nothing triggers it*, which is the reading an operator uses to decide a
-  workflow is safe to retire. **That handler already had a DOCUMENTED case of
-  this swallow hiding a real bug**: `get_workflow_schedule_count`'s own comment
-  records that the query named a column that does not exist (`is_active` vs
-  `is_enabled`) and *"handler `unwrap_or(0)` swallowed the column-not-found
-  error and `get_workflow_summary` reported `active_schedules: 0` for every
-  workflow, including ones with active schedules"* — the QUERY was fixed in May
-  2026 and the SWALLOW was left in place, the sixth local repair of a class with
-  no population sweep behind it. `handle_list_executions` fell back to
-  `rows.len()` — the PAGE LENGTH — so an unreadable count over 4 000 executions
-  rendered `total: 20, has_more: false` and a caller paging on that envelope
-  stops at the first page believing it has everything.
-  `handle_get_catalog_status` is a DIFF, so an unreadable `list_catalog_rows`
-  put every disk template in `on_disk_not_in_db` and emitted *"restart the
-  controller to seed"* — specific, actionable, wrong advice about a healthy
-  catalog. `handle_get_execution_replay_chain`'s empty `ancestors` /
-  `descendants` are the same determinate negatives #771 removed from
-  `get_execution_lineage`'s "standalone run" sentence one tool over.
-
-**Three of the eleven are pinned by a DB test that drives the REAL
-`McpState` and the production `dispatch`**
-(`controller/tests/swallowed_read_disclosure_tests`, CTRL_TESTS per check 64b —
-it is a `mod common` binary). The failure mechanism is package 22's: the
-RELATION the read names is DROPPED in the per-test isolated database, so the
-statement cannot run. It builds a real state rather than a stand-in because the
-defect is what the handler BODY renders — checks 74b and 79b both state, as
-their own limit, that a guard at the READ cannot see an answer classified
-correctly and discarded further down. Every test carries its CONTROL in the same
-run (a fresh user really does have zero modules; a workflow with no schedules
-really does report `0`; an actor that is genuinely absent keeps the not-found
-sentence), because a healthy response must stay byte-identical and only a
-degraded one may change shape. Three mutations reinstating main's expressions
-are all RED — and M2's response was literally `{"count": 0, "modules": []}` with
-the view DROPPED.
-
-**The lint candidate was BUILT, MEASURED and REJECTED — `--count` stays 87.**
-Widening check 74 from its name glob to EVERY handler for
-`.unwrap_or_default()` / `.unwrap_or(Vec::new())` / `.unwrap_or(0)` over an
-awaited read reports **73 on pristine main, 61 of them claims — 83.6 %
-precision**, which sits between check 74's #730 group (81.8 %) and its
-2026-09-02 group (94.1 %). Precision is not the problem. It would ship at
-**62** on this tree, i.e. as a ratchet with a baseline, and "do NOT re-add a
-baseline" is check 52's own rule (#760: *"a check cannot ship at 21"*). The
-twelve false positives are the same shape every time — a display name or a
-suggestion list beside untouched counts. **What ships instead costs no check
-number: sub-leg 74b covers the three repaired report handlers AUTOMATICALLY**,
-because its scope is DERIVED ("any function constructing a `Readings`") and they
-enrolled themselves by adopting the ledger. That is not a theoretical
-convenience — **74b fired on the first lint run after the fixes**, at
-`handle_get_catalog_status`'s disk scan, where a `JoinError` defaulted to an
-EMPTY template list that reads as "this image carries no catalog templates". A
-filesystem read inside a catalog tool is exactly what a hand-maintained glob
-would never have looked at. The way to extend the coverage is to fix a handler,
-not to widen a regex.
-
-**Two fail-OPEN gates are RECORDED and not fixed**, and they outrank the
-remaining report sites for whoever takes the next pass:
-`search::handle_tag_workflow` skips the 100-tag cap when the count read fails,
-and `sandbox::handle_run_sandbox` skips the LINT step entirely on
-`if let Ok(lint_errors)`. (**Both CLOSED 2026-09-07 — see the fail-OPEN entry
-below, which also refutes the second one's framing: the lint step is duplicated
-by the full compile and was never a gate.**) And
-`analytics::handle_get_workflow_dependencies_list`
-(`schedules`, `webhooks`) is deliberately untouched: it is the site the sibling
-PR #775 fixes.
-
-### 2026-09-07 — the fail-OPEN half: eight gates that stopped gating, and one that had never gated at all
-
-The entry above closed eleven CLAIM sites and recorded two fail-OPEN gates as
-"not fixed". Both were wrong about what they were, and the class was bigger than
-two. **A gate that cannot read its rule must REFUSE; it must never GRANT.**
-
-**The inventory was REBUILT as a checked-in artefact**, because package 23's
-detector and its classification table were lost with its worktree and a
-CLAUDE.md sentence must not cite an artefact the merge discards.
-`scripts/lint-swallow-classify.py` (statement-aware: comment and string CONTENT
-masked first — check 73's trap — then the postfix chain after each `.await`
-walked, a collapse counted only before any `?`) plus
-`scripts/swallow-read-verdicts.py` render `docs/swallowed-reads-inventory.md`,
-the read-side companion to `docs/swallowed-results-inventory.md`. Run against
-`38175869` — the tree package 23 measured — the rebuild reports **208** against
-its reported **210**, so the two independent detectors agree to within 1%. On
-`origin/main` `0c962874` it reports **193** sites: **65 claim, 60 decorative,
-37 fail-closed, 5 fail-open, 26 false-positive**.
-
-**The lint pre-flight was NOT a security gate, and the measurement changed the
-fix.** `handle_run_sandbox`'s `if let Ok(lint_errors) = …lint_code(..)` was
-carried as "the sandbox runs unlinted". It does not:
-`compile_to_wasm_with_config`, which runs immediately afterwards, executes the
-IDENTICAL `analyze::lint_source_code` static pass at its step 0a and refuses on
-its errors, and it alone enforces the dependency allowlist and cargo-audit. So
-nothing `lint_code` checks is unique to it, and refusing would take
-`run_sandbox` off the air on the most likely `Err` this call produces — "Lint
-queue full. Try again shortly.", the 60 s compilation-semaphore timeout — for a
-request the full compile would have served. What was wrong is the SILENCE:
-`talos_inline_compile_service` already reached this conclusion for the same call
-and logs it (its L-32 arm), while this site and `talos_workflow_creation::spec`
-did not. One function, three call sites, one disclosing. Both now WARN.
-
-**The real fail-open the brief did not name is the CAPABILITY-WORLD CEILING, and
-it is MCP-545 unswept.** `talos_actor_repository::get_actor_max_world` returns
-`Option<String>` and answers `None` on a database error; its own body logs
-*"caller may default to permissive ceiling — wire try_get_actor_max_world to
-fail closed"*, and the strict sibling's doc says *"New code that gates
-authorisation on the ceiling should call this"*. MCP-545 wired the two RUNTIME
-gates in `talos-workflow-authorization` and never reached the three
-authoring/compile-time siblings, each of which wrapped the whole gate in
-`if let Some(max_world) = …`: `run_sandbox` (which COMPILES AND EXECUTES
-caller-supplied Rust at the requested world — the highest blast radius in the
-package), `compile_custom_sandbox`, and `add_node_to_workflow`. One home now:
-`crate::utils::read_actor_ceiling_or_refuse`. `Ok(None)` deliberately keeps
-today's behaviour, **matching MCP-545's own decision** —
-`actors.max_capability_world` is `TEXT NOT NULL DEFAULT 'minimal-node'`, so
-`Ok(None)` can only mean "no such actor row", and refusing it would make the
-authoring gate stricter than the runtime one, which is the same defect in the
-other direction.
-
-**All EIGHT fail-open sites are fixed**: the three ceilings above, plus
-`add_node_to_workflow`'s module-world read (the OTHER half of the same gate) and
-its `get_templates_by_ids` read (which gates the ONLY pre-flight a node config
-gets — schema, patterns, vault grants and the template's retry policy),
-`tag_workflow`'s 100-tag cap, `create_webhook`'s name-uniqueness pre-flight
-(nothing downstream backs it: `webhook_triggers.name` carries no unique index,
-and the per-user CAP three lines below already fails closed under MCP-367 — two
-gates in one function disagreeing), and `dlq_updates`'s periodic permission
-refresh, which on a failed read KEPT the prior org set, so a subscriber whose
-access had just been revoked went on receiving another org's DLQ events. That
-last one now NARROWS to own-events-only rather than terminating the stream, and
-self-heals on the next successful tick.
-
-**The tag cap had never once been evaluated, and its own swallow is why.** With
-the swallow removed, the CONTROL arm of the new DB test failed on an INTACT
-schema. Measured: `get_tag_count` selects `coalesce(array_length(tags, 1), 0)`,
-which is INT4, into an `i64`, so it returns
-`ColumnDecode { "Rust type `i64` (as SQL type `INT8`) is not compatible with SQL
-type `INT4`" }` **on every call that finds a row**. `fetch_optional` answers
-`Ok(None)` when nothing matches, so a nonexistent workflow looked healthy; the
-statement PREPAREs and PLANs perfectly, so **check 88 cannot see it**. This is
-check 88's `COUNT(*) … FOR UPDATE` finding in a second shape: a swallow hiding a
-query that could never run. Fixed on both sides (`::bigint` in the repository,
-refusal at the handler). No sibling: every other `array_length` in the workspace
-sits in a boolean predicate or a `COUNT(*)`.
-
-**Thirteen CLAIM sites were fixed on top, chosen by BLAST RADIUS rather than by
-position in the list.** Ranked: `submit_workflow_approval` answered a failed
-approval WRITE with *"No pending approval found for this execution. It may have
-already been decided"* — the one diagnosis that stops a retry, on a
-human-approval gate; `export_workflow` shipped a bundle carrying `modules: []`
-with no flag, a corrupt backup byte-indistinguishable from a module-less
-workflow that `import_workflow` would reconstitute without the modules;
-`import_workflow` marked EVERY referenced module missing on a failed existence
-read and recompiled each from the bundle (the correct handling of that exact
-read is 4300 lines up in the same file); `get_module_dependents` answered
-`indirect_count: 0` — "nothing depends on this" — on the tool an operator
-consults before deleting a module; `whoami` rendered the hardcoded literal
-`http-node` as the user's authorization ceiling and `false` for admin;
-`get_execution_cost` rendered `total_fuel_consumed: 0`, "this execution cost
-nothing"; and `build_execution_trace_json` rendered `sub_execution_count: 0` in
-three surfaces at once. **Check 74b then found three more in the two functions
-that had just adopted `Readings`, which is the leg working exactly as its own
-entry describes** — a handler enrols itself by adopting the ledger, so the way
-to extend the coverage is to fix a handler rather than widen a regex. Two are
-the execution-EVENT reads that `nodes` and every `summary` count are derived
-from ("this execution ran no nodes"); the third is per-node fuel enrichment. The
-two graph reads beside them are label prettification and carry
-`allow-benign-default` with the reason, which is the marker's documented second
-clause. The report sites use the `Readings` ledger and render
-`null`, never `0`; the decision sites refuse.
-
-**What is LEFT, with counts, so the next pass starts from a number rather than a
-sweep.** 175 sites remain: **52 claim**, 60 decorative, 37 fail-closed, 25
-false-positive, and 1 nominal fail-open that is the repaired `dlq_updates`
-narrowing (the detector correctly still sees a default; its verdict on the fixed
-tree is fail-closed). The 52 claims by file: `analytics.rs` 7,
-`executions.rs` 7, `modules.rs` 6, `advanced.rs` 5, `workflows.rs` 5,
-`platform.rs` 4, `actor.rs` 3, `configuration.rs` 3, `graph.rs` 3, `search.rs`
-3, `lib.rs` 2, `ml.rs` 1, and 3 in `talos-api`. Ranked highest among them by the
-inventory: `analytics.rs`'s workflow AUDIT TRAIL (a failed read silently drops
-every version-published and execution-triggered event, so a workflow reads as
-never published and never run on a tool named for auditability),
-`executions.rs`'s `get_execution_lineage_root` (a failed root lookup
-substitutes the execution's own id, so the tree read comes back empty and
-renders the false-standalone-run claim #771 built `lineage_note` to remove),
-`executions.rs`'s `watch_execution` events, `modules.rs`'s catalog listing, and
-`ml.rs`'s `has_pending_disagreements`.
-
-**No lint check was added and `--count` stays 88.** The candidate — "an
-enforcement decision may not be taken from a defaulted read" — cannot be spelled
-textually: the three most severe members of this class were `if let Some(..)`
-over an Option-returning read, and widening the detector's binding leg to
-`Some(..)` was BUILT and MEASURED: it takes that leg from **20 to 69** sites on
-pristine main, of which **3** are the gates — ~6% precision, enforcement-shaped
-noise. The structural answer is stronger and is what shipped: one
-`read_actor_ceiling_or_refuse`, and `controller/tests/fail_open_gate_tests`
-(CTRL_TESTS per check 64b) drives `run_sandbox`, `compile_custom_sandbox`,
-`tag_workflow` and `get_execution_cost` through the production dispatch with the
-relation each gate's read names removed — one test per distinct SHAPE, each
-carrying its own CONTROL, because the pre-fix tag path ALSO refused, just with
-the wrong diagnosis.
-
-### 2026-09-08 — the nine fixes nothing guarded, and the five claims that outranked the rest
-
-Two halves, and the first is about the SHAPE of a guard rather than about any
-new defect. #779 fixed eight fail-OPEN gates and thirteen claim sites and
-recorded, in its own notes, that reverting NINE of them left every test in the
-workspace green. Its rule was one test per SHAPE; "the shape is pinned
-elsewhere" is exactly the reasoning that let `cleanup_module_versions` survive
-package 23's mutation, so the rule here is **one test per SITE whose
-consequence is irreversible or authorizing**.
-
-**Leg A — `controller/tests/unguarded_gate_survivor_tests` (10 tests,
-CTRL_TESTS per check 64b).** Nine of the ten sites are driven through the
-production `dispatch` over a real `McpState` with the relation the read names
-removed (package 22's mechanism), each carrying its CONTROL in the same run.
-For a GATE the control is the half that matters: a healthy gate must still
-refuse *for the right reason*, because "the tool refused" is not evidence when
-the pre-fix path also refused. Two tests assert on **ROWS** rather than on the
-reply — the stored `graph_json` after a refused `add_node_to_workflow`, and the
-`webhook_triggers` count before and after a refused `create_webhook` — for the
-reason `archived_dispatch_gate_tests` records: a gate whose refusal arrives
-after the write is not a gate, and an earlier version of #754's write-ceiling
-test passed because the INSERT would have failed anyway.
-
-**Ten mutations, ten results, and one of them is the point.** MA1 (the actor
-capability-world ceiling back to the lenient `None`), MA2 (the module-world
-half back to `unwrap_or_default`), MA3 (the approval WRITE back to
-`unwrap_or(0)`), MA4/MA5 (export metadata / module existence), MA6 (webhook
-name uniqueness), MA7a (the dependents DIRECT scan), MA8 (`whoami`'s ceiling
-back to the hardcoded `http-node`) and MA9 (the trace's child list) are all
-**RED**. **MA7b — the dependents INDIRECT scan back to a silent empty —
-SURVIVES this binary and is caught by check 74b**, at `modules.rs:2579`,
-verified by running that leg against the mutated tree rather than assumed. The
-reason it cannot be driven here is structural and worth recording:
-`find_workflows_referencing_module` and `find_workflows_referencing_workflows`
-read the SAME table through the SAME columns (`id`, `name`, `graph_json`,
-`status`, `updated_at`), so no schema-level failure breaks the second without
-breaking the first — and the first already refuses several lines above.
-
-**`dlq_updates` gets NO test, stated rather than implied.** Its permission
-refresh is three lines of local-variable assignment inside an `async_stream!`
-in a GraphQL subscription resolver driven by a `PERM_REFRESH_INTERVAL_SECS =
-60` ticker; reaching it needs a subscription held open past a real minute with
-the org read failing mid-stream, and there is no seam short of restructuring
-the resolver. **Leg C's second candidate was NOT taken for a one-sentence
-reason**: the three `scheduler_readiness_*` publish sites live inside the
-private `SchedulerService::hold_or_degrade`, which no integration test can
-call, and they write through the process-global `talos_metrics::global()`
-`OnceLock` that sibling tests in one binary race — check 82's own objection
-about `DISTILL_CONTEXT`. **Leg C's FIRST candidate WAS taken and is closed**:
-RFC 0012 P3 recorded that `get_workflow_sla_report`'s handler can pass
-`child_runs: None` / `ledger_since: None` and every test stays green, and left
-"the live read after deploy" as its honest guard. That mutation (MC1) is now
-**RED** — a workflow with three recorded `sub_workflow_runs` and zero
-execution rows must report them, with a barren workflow as the control so the
-test cannot pass by making everything look measured.
-
-**Leg B — `controller/tests/claim_read_disclosure_tier3_tests` (7 tests).** The
-five sites `docs/swallowed-reads-inventory.md` ranked highest among its 52
-remaining claims. Every one reproduced RED under a mutation reinstating the
-collapse.
-
-* **The workflow AUDIT TRAIL.** Two `.unwrap_or_default()` history reads on a
-  tool named for auditability: a failed version read removed every
-  `version_published` event, a failed execution read every
-  `execution_triggered` one, and `count` / `event_count` reported the shortened
-  list as the total — while `workflow_created`, synthesised from the row
-  already loaded, kept the response looking well-formed. **This one has form**:
-  `list_executions_for_audit` carries a comment recording that this exact
-  swallow once hid a query naming a column that does not exist, so the trail
-  returned ZERO execution events for EVERY workflow on the platform. The QUERY
-  was fixed in May 2026 and the SWALLOW was left — the same
-  fixed-the-path-not-the-population shape check 74's #730 group records for
-  `get_workflow_schedule_count`. Now a `Readings` ledger, with `events`,
-  `count` and `event_count` marked DERIVED and one extra sentence
-  (`events_incomplete`) saying that an absent class of event is not evidence
-  that it never happened — because `Readings::note` promises a null and what
-  fails here shortens a LIST.
-* **`get_execution_lineage`'s ROOT lookup.** A failed
-  `get_execution_lineage_root` substituted the execution's own id; the tree
-  query then matched `id = $1` and came back NON-empty, so `tree_degraded`
-  stayed FALSE and the single-node arm rendered "This execution has no parent
-  or child EXECUTION rows" — the determinate negative #771 built `lineage_note`
-  to remove, reintroduced one read earlier. `root_execution_id` is now `null`
-  (never the anchor's own id: an id there is read as "this is the top of the
-  tree", which is precisely what an unreadable root cannot establish) and
-  `lineage_note` gains a FIRST arm that outranks every other. The narrow shape
-  the defect took in production — root read fails, tree read succeeds — is not
-  separable by relation (both statements name the same two columns of the same
-  two tables), so it is pinned by unit test and the DB test covers the wiring;
-  saying which instrument covers what matters more than implying one covers
-  both.
-* **`watch_execution`.** `events: [], events_count: 0` from a failed read,
-  beside a `current_status` that WAS measured, on the tool an operator polls
-  during an incident — a poller comparing `events_count` against its last value
-  reads 0 as "no progress". Both are now `null` with the read named; the status
-  half is untouched, so this is a per-field disclosure and not a refusal.
-* **`list_module_catalog`.** A failed visibility read made every entry read
-  `installed: false, module_id: null, availability: "needs_install"` — an
-  instruction to run `install_module_from_catalog` for modules the caller
-  already has — and with `installed_only: true` the whole listing rendered as
-  `[]`. REFUSES, matching the two sibling listings in the same file.
-* **`ml_get_model_card`.** `has_pending_disagreements: false` is a PROMOTION
-  CLEARANCE, and it was defaulted; it is now three-valued. The same read
-  reached its model ENTITY lookup, which answered a failed registry read with
-  "Model not found" (check 79's shape, and the correct split
-  `require_dataset_owner` already makes 800 lines above it) — `Ok(None)` keeps
-  the exact pre-fix wording, pinned. Adopting a ledger enrolled the handler in
-  **check 74b**, so its four sibling `.ok()` reads (`shadow`,
-  `shadow_lifetime`, `shadow.epoch`, `teacher_audit`, `dataset_stats`) are on
-  the ledger too — leaving them beside a ledger that publishes "complete: every
-  field in this report was measured" is the FALSE-COMPLETENESS shape 74b exists
-  for.
-
-**Re-measured, not estimated.** `scripts/lint-swallow-classify.py` over the
-tree before and after: **175 sites → 164**, 11 removed and 0 added, no site
-added anywhere. The verdict split on the fixed tree is **46 claim** (one of
-which is the lineage-root row, now a `false-positive` by verdict because the
-fix discloses rather than propagates — so 45 are genuinely open), 55
-decorative, 37 fail-closed, 25 false-positive, and the 1 nominal fail-open that
-is #779's repaired `dlq_updates` narrowing.
-`docs/swallowed-reads-inventory.md` is re-rendered with a 2026-09-08
-disposition, the per-file remainder and the three highest-severity sites still
-open — including `list_module_catalog`'s SECOND site, a `spawn_blocking`
-`JoinError` defaulting the disk walk to an empty catalog and CACHING it in a
-process-wide `OnceCell`, so one failure is permanent for the pod's lifetime.
-
-**A THIRD defect was found by measuring the lint candidate rather than by
-reading the code, and it is this entry's own subject one level up.**
-`handle_get_catalog_status` — the handler #779's notes name as check 74b's
-first live catch — built a `Readings`, recorded the disk scan into it, and then
-constructed a SECOND ledger fifty lines later that SHADOWED the first. So a
-failed disk scan nulled `disk` in the body while the surviving ledger published
-*"complete: every field in this report was measured"*: the disclosure mechanism
-making the false-completeness claim it exists to prevent. **74b cannot see it**
-— it detects a defaulted read BESIDE a ledger, not a ledger discarded by a
-shadow — and neither can a test: the arm needs `/app/module-templates` to exist
-AND the `spawn_blocking` walk to return a `JoinError`. One ledger per report;
-the second construction is deleted. Measured population of "a function
-constructing more than one `Readings`": **1 on this tree before the fix, 0
-after**, which is the population-of-one this repo does not ship a check at, so
-the guard is the comment at the site and this paragraph.
-
-**One home for the test `McpState`.** `swallowed_read_disclosure_tests` and
-`fail_open_gate_tests` each carried a hand-copied ~130-line struct literal and
-this package would have made it four. Moved (not copied) to
-`controller/tests/common/mcp.rs`, included with
-`#[path = "common/mcp.rs"] mod mcp_common;` only by the binaries that need it,
-so no other test target pays for it. A copy that falls BEHIND fails to compile;
-a copy that constructs a DIFFERENT service fails silently and makes its
-binary's assertions prove nothing about production — that second failure is the
-one a shared home removes.
-
-**No lint check was added and `--count` stays 88.** Two candidates were
-measured first. (i) *"a function may construct at most ONE `Readings`"* — the
-shadowing defect above. Measured across every non-test `.rs` in the workspace:
-**1 site on this tree, 0 after**, a population of one, which is the bar #765's
-own numbers set and this repo does not ship at. Its sibling *"a ledger must be
-attached"* is worse: **30** constructions against **29** `attach` calls, and
-the one difference is legitimate (`AnalyticsRepository::get_hygiene_report`
-builds the ledger and hands it to `talos-hygiene-service`, which attaches it a
-crate away), so the rule reports 1 false positive and 0 real ones. (ii) *"a `mod common`-harness test binary must not hand-roll an
-`McpState`"* — population FOUR, all in one directory, and the structural answer
-is stronger than a grep: there is now exactly one `pub async fn mcp_state`, and
-a second copy would have to be written from scratch against a struct with 30
-fields.
-
-### 2026-09-08 — the column that already had its fix, and the next ten claims
-
-Two halves. The first is a REFUTATION of its own brief, which matters more than
-the code it produced.
-
-**`module_executions.error_type` was already fixed, four days earlier.** The
-brief for this package described a column with "one writer whose callers pass
-nothing" and asked for the classification to be given one home. Measured on
-pristine `origin/main` before anything was touched: `a04dbf4d` (#744,
-2026-09-04, **37 commits behind HEAD**) had already built
-`talos_engine::module_error_type::derive_error_type` over
-`talos_failure_analysis_service::classify_error` — the SAME vocabulary
-`analyze_execution_failure` shows an operator — and bound it into
-`ModuleExecutionStore::record_completed`. And the column has **FOUR** writers,
-not one: two take an `Option<String>` and two stamp SQL literals (`'timeout'`,
-`'stuck'`).
-
-**The live numbers the brief quoted were real and HISTORICAL, and reading them
-is what settled it.** `failed` rows split `NULL 61 / timeout 1` over all time —
-but the newest `failed` row is 2026-09-04 10:53, and the two rows of that minute
-are #744's own live verification probes: a positive path that stored `timeout`
-and a negative control (`probe-744: deterministic module failure`) that stored
-NULL because the classifier fell through, which is the designed behaviour. So
-the deployed controller carries the fix, the writer works, and **no production
-module failure has occurred since**; the 61 NULLs are rows no forward-only fix
-can reach. A distribution is not a defect until you read the newest row.
-
-**What WAS left, and #744's own limits section does not name it**: two callers
-of `fail_execution_from_worker` still passed `None`.
-`talos-webhooks/src/router.rs` finalizes a MODULE-bound webhook dispatch with no
-engine anywhere in its path, so nothing else ever closes that row;
-`controller/src/bootstrap/background.rs`'s `talos.results.*` observer stamped a
-hardcoded `"timeout"` for `JobStatus::TimedOut` and nothing otherwise. Both now
-route through the ONE home — no new crate, no move, and no inverted edge, which
-was measured rather than assumed: `derive_error_type` is already `pub` and
-`talos-webhooks` already depends on `talos-engine` with no edge back. The
-observer's `TimedOut` arm names a new `TIMEOUT_BUCKET` constant instead of
-re-spelling the literal, and `the_timeout_bucket_spelling_is_the_classifiers`
-drives `classify_error` to prove the two agree rather than comparing two
-literals.
-
-**Both remainder sites are LATENT and that is stated rather than dressed up**:
-`webhook_triggers` holds ONE row with `module_id IS NULL`, so the webhook module
-path has no live population, and the observer's own comment records that "every
-NATS-dispatched code path uses request-reply, so this subscriber is mostly
-dormant". What the change buys is that the vocabulary has one home for every
-writer that can reach it.
-
-**And the failure-analysis service still recomputes, for a sharper reason than
-the brief gave.** It is not that 61 historical rows have nothing stored — it is
-that `FailureAnalysisService::analyze` reads `execution_events` (`node_failed`
-rows) and never touches `module_executions` at all. Different table, different
-grain; there is no join to switch to. The shared vocabulary is what keeps the
-stored column and the report an operator opens next from naming one cause twice.
-
-**Guard.** `controller/tests/module_execution_error_type_tests` gains a round
-trip through `fail_execution_from_worker` (a SECOND UPDATE from
-`record_completed`'s, so binding is proved separately) with an unclassifiable
-control, plus a SOURCE pin over the two call sites — neither is reachable from
-an integration test (`background.rs` is `mod bootstrap` inside `main.rs`; the
-webhook one needs a module-bound webhook this fleet has no row for), which is
-the shape `task_supervision_wiring_tests` answers. Four mutations, all RED:
-either call site back to `None`, the shared constant renamed to a spelling the
-classifier does not use, and `derive_error_type` gutted.
-
-**The second half: ten more CLAIM sites, ranked by blast radius.** The read
-inventory carried **46** open claims on this tree. The ten taken are a decision
-above a count an operator pages on, above a list that feeds a next step — not a
-prefix of the list. Re-measured with `scripts/lint-swallow-classify.py`:
-**164 sites -> 153**, 13 removed, 2 added, **46 claims -> 34**.
-
-Two of the ten are WRITES misreported as benign counts, and one of those is the
-sharpest member of this class found so far: **`compress_actor_context`'s swallow
-survived into a COMMIT.** The loop above it rolls back on a failed write, while
-`.unwrap_or((0, 0))` let a failed measure-and-forget CTE reach `tx.commit()`, so
-the committed state was the condensed replacements written AND the originals
-still present — memory GREW — under a response reading `status: "compressed",
-keys_retired: 0`. The other write is `bulk_tag_workflows`, where `tagged_count`
-IS `rows_affected()` and `already_tagged_count` is derived from it, so a failed
-UPDATE reported every owned workflow as ALREADY CARRYING the tag, while the
-owned-count probe MCP-152 added to stop exactly that conflation defaulted to 0
-and accused the operator of typing bad UUIDs.
-
-`talos-api`'s `me` is the one refusal that is a SECURITY posture: one unreadable
-`users.totp_enabled` collapsed to `false`, and `is_two_factor_verified`'s
-`.unwrap_or(!totp_enabled)` fallback then defaulted to `true`, so a DB fault
-answered *"no 2FA, and you are verified"* — the most permissive pair the
-resolver can emit. MCP-877 diagnosed this correctly in May 2026 and LOGGED it; a
-warning in a log the browser cannot read does not stop a frontend gate. It now
-propagates, which is forced rather than chosen: `UserInfo` is a typed
-`SimpleObject` with no disclosure slot and `talos-api` carries no
-`talos-measurement` dependency.
-
-`get_agent_card` takes the remedy the handler already had: a card whose
-CAPABILITY LIST could not be read is `shareable: false` with `available_workflows:
-null`, the same branch a card rendered against a placeholder host takes — pre-fix
-it shipped `shareable: true` advertising an agent that can do nothing, under a
-note telling the operator to register it in a discovery registry.
-`get_node_io`'s graph read is the one member of the twelve-site
-`build_node_label_map` family that is NOT label prettification, because
-`node_uuid` is RESOLVED through that map: an empty one silently answered about a
-DIFFERENT node's uuid and rendered `input: null, output: null` for it.
-`list_module_catalog`'s disk walk moves to `get_or_try_init`, so a failed walk is
-no longer MEMOIZED — one panicked blocking task used to make every later call in
-the pod's lifetime report an empty catalog.
-
-**The two sites the detector ADDED are the fix, not a regression.** Both are in
-`handle_list_module_catalog`: a `get_or_try_init(...).await` followed by a
-`match` whose `Err` arm REFUSES reads to the walker as a binding collapse. Their
-verdict on this tree is `false-positive`, the same reason `dlq_updates` and the
-lineage root still appear; saying so is cheaper than a detector exception that
-would hide a real one later.
-
-**Guard, and the two failures a relation drop cannot inject.**
-`controller/tests/claim_read_disclosure_tier4_tests` (11 tests, CTRL_TESTS per
-check 64b) drives the REAL MCP dispatch over a real `McpState` — and, for `me`,
-the REAL compiled GraphQL schema — with the relation each read names removed.
-Every test carries its control, and the two whose pre-fix path ALSO refused
-(`get_agent_card` on an absent actor, `suggest_actor_for_task` for a user with
-none) carry that half explicitly, because "the tool refused" is not evidence when
-the pre-fix path refused too with the wrong diagnosis. `me`'s 2FA read shares the
-`users` row with `AuthService::get_user`, which projects `totp_enabled` and would
-refuse ABOVE it, so the failure is injected as a POOL that cannot connect — the
-shape this defect takes in production. `compress_actor_context`'s failing DELETE
-and the INSERT it must not outlive share ONE relation, so the injection is a
-`BEFORE DELETE` trigger that raises, and the assertion is on ROWS rather than on
-the reply: a refusal that arrives after the write is not a rollback, and the
-whole defect was a commit.
-
-**Ten mutations, ten RED, and the first six had to be re-run.** The first
-attempt wrapped each reverted expression in scaffolding to keep the surrounding
-code alive; six of the ten then failed to COMPILE, which proves nothing (the
-project's own "a green mutation over an edit that never landed" lesson, in the
-opposite direction — a mutation that cannot build is not a survivor OR a
-catch). Re-run as EXACT reverse replacements of the pre-fix source, all ten are
-red by assertion.
-
-**One out-of-scope defect found and NOT fixed**, recorded so it is not
-rediscovered: `handle_get_execution_waterfall`'s bar renderer does
-`bar_len.clamp(1, chart_width - bar_start)`, which PANICS with `min > max`
-whenever a node's `start_ms` equals the run's `total_ms` — reproduced with a
-fixture whose `node_started` and `node_completed` share a timestamp. A panic in
-an MCP handler unwinds the tokio task, so the caller sees a dropped request
-rather than an error. The test fixture here uses distinct timestamps and says
-why at the seeding helper.
-
-**No lint check was added and `--count` stays 88.** Two candidates were measured
-and both fail on the same ground the last four passes recorded. (i) *"a report
-handler must not default an awaited read"* is the widening #782 already built,
-measured and rejected at 83.6% precision and a baseline of 62 — nothing here
-moves those numbers, and this change takes the population from 46 to 34 without
-changing its shape. (ii) *"a caller of `fail_execution_from_worker` must derive
-`error_type`"* has a population of **two**, both in different crates, which is
-the bar this repo does not ship at (#765's numbers); the structural answer is
-that the vocabulary has one `pub` home and the two call sites are pinned by a
-source assertion in the DB binary that already covers the column.
-
-### 2026-09-08 — nothing could say which operator surface is slow, and the two things that were
-
-Every prior entry in this file is about a report that says the wrong thing.
-This one is about a report that does not exist: **no per-tool latency series,
-no per-tool error series, no per-call line, no per-statement attribution.**
-Measured live, read-only, before anything was written: `/metrics/prometheus`
-is **61 128 bytes / 567 lines / 445 series**, and the only `talos_*` names
-matching `mcp|tool|handler|request|graphql|query|db|pool` are the four
-`talos_db_pool_*` gauges and `talos_dlq_db_errors_total`; the controller log
-holds **one** line matching `talos_mcp|tools/call|mcp_tool_call` in 1 675, and
-it is the BOOT line `MCP local endpoint ENABLED`; and `SHOW
-shared_preload_libraries` answers with the empty string, so there is no
-`pg_stat_statements` either. "Performant by default" was unverifiable for a
-single operator surface.
-
-**The chokepoint is `handle_tools_call`, and it is a CHAIN, not a table.**
-Twenty-one domain `dispatch` functions, each an `Option`-returning `match`
-over its own tool names, tried in order, with a `-v1` catalog-template
-fallback at the tail — so there is no dispatch table further in to hang a
-measurement off. Three call sites reach it (the SSE message endpoint and the
-two POST transports) and nothing else dispatches a tool, so one measurement
-covers the whole surface and a NEW transport inherits it. It is now a thin
-wrapper over `handle_tools_call_inner`: resolve the label, time the inner
-call, classify the response, record, log one line. It OBSERVES and never
-alters — `the_instrument_leaves_the_response_byte_identical` compares its
-answer with the domain dispatch's own.
-
-**`talos_mcp_tool_duration_seconds{tool,outcome}` +
-`talos_mcp_tool_calls_total{tool,outcome}`, and CARDINALITY is the whole
-design.** `params.name` arrives from the wire; a `CounterVec` keyed on it
-grows one series per distinct value, so anyone who can reach `/mcp` could mint
-unbounded series in the controller's registry and in every Prometheus that
-scrapes it. `tool_labels::canonical_tool_label` therefore resolves the name
-against `tool_hints::declared_tool_params()` — the `&'static` map built once
-from the `tool_schemas()` functions — and returns a `&'static str` **borrowed
-from that map's own key**, so no interning table and no `Box::leak` is needed
-and the set cannot grow at runtime. Two `const` sentinels: `catalog_template`
-for any `*-v1` name (the catalog is DATA — rows, not literals in this binary —
-so a catalog name is as caller-influenced as any other string) and `unknown`.
-The guard is POINTER equality, not string equality: three invented names must
-return the SAME pointer, which is what bounds the whole unrecognised
-population at one series. `outcome` is an ENUM (`McpToolOutcome`), so that
-half of the label set is closed by the compiler, and it is decided from the
-RESPONSE SHAPE — 21 dispatch functions and ~320 arms would be 320 places to
-forget. `-32602` is `refused` and everything else is `error` because a client
-looping on a typo'd argument and a database outage must not move the same
-series (census: `-32602` 411 sites, `-32000` 409, `-32603` 5, `-32004` 2,
-`-32003` 2).
-
-**Buckets are `exponential_buckets(0.001, 2.0, 16)` — 1 ms … 32.768 s.** The
-house style in this file is `(0.001, 2.0, 15)`, which tops out at **16.384 s,
-below the 30 s target**, so every call slower than 16 s would land in `+Inf`
-with no upper bound at all.
-
-**NOT pre-seeded, and the decision is measured rather than asserted.**
-`the_mcp_instrument_costs_the_lines_the_no_preseed_decision_assumes` pins the
-premise: **19 lines per histogram series** (16 finite buckets + `+Inf` +
-`_sum` + `_count`), **2 356 bytes for the first `(tool, outcome)` pair**
-(which pays both families' HELP/TYPE preamble) and **1 656 for each
-additional** one. The full ~320 × 4 product is ≈ 1 280 pairs ≈ **2.1 MB and
-~25 600 lines — a 35× scrape**; even seeding only the pairs a live call site
-can reach (~960) is ≈ 1.6 MB. Nothing alerts on these two series, so the
-absent-≠-zero argument that seeds `dispatch_refused_total` does not apply: an
-absent `(tool, outcome)` here means "this tool has not been called since
-boot", which is what a seeded 0 would have said. Realistic growth on a
-controller that has served the nine tools below is 61 KB → **77 KB (+25 %)**.
-If an alert is ever written on these, seed the pairs THAT alert selects, never
-the product.
-
-**The instrument costs 619 ns, measured rather than asserted.** Release
-build, 200 000 iterations, with a `tracing` fmt layer actually formatting and
-writing the line (a no-subscriber measurement would understate it): **619 ns**
-for the whole wrapper, **108 ns** without the log line, **40 ns** for the label
-lookup alone. The fastest tool on this surface (`whoami`) measures 2.3 ms, so
-the instrument is **0.027 %** of it; the slowest measured is 189 ms. Most of
-the cost is the log line, i.e. the half an operator reads.
-
-**The per-call line carries `tool`, `outcome`, `duration_ms` and the request
-id, and nothing else** — never the arguments, never the response, never a
-token. The request id is caller-controlled, so it is capped at 64 chars on a
-char boundary and an absent one renders `-`.
-
-**Stated blind spot, measured rather than implied.** The registry is the
-ADVERTISED set. **29** identifier-shaped names appear in a `dispatch` body and
-in no schema — the deprecated `agent_*` aliases (`agent_recall`,
-`create_agent`, `list_agents`, …) and unadvertised siblings
-(`bulk_tag_workflows`, `get_workflow_summary`, `get_workflow_topology`, …).
-Those calls ARE instrumented, under `unknown` rather than their own name. The
-alternative is a hand-maintained alias list, which is the rot mode check 74's
-name glob and check 64's runner list already cost this repo; a client that
-discovered its tools from `tools/list` can reach none of the 29.
-
-#### The baseline the instrument bought, and what it says
-
-Driven ONCE each through the real chokepoint against an isolated clone of a
-fleet-shaped scratch template (36 workflows 17/11/8, 112 modules, 10 500
-executions with one at 5 540 — the live fleet's shape, read read-only).
-**Statements are counted from sqlx's own `sqlx::query` tracing events**, one
-per executed statement including a scoped transaction's `BEGIN`/`COMMIT`, so
-they are ROUND TRIPS; there is no `pg_stat_statements` to ask (see below).
-Background spawns are drained and counted SEPARATELY — the first run
-attributed `session_start`'s heal statements to whichever tool ran next.
-
-| tool | ms | statements | background |
-|---|---|---|---|
-| **get_platform_hygiene_report** | **189.0** | 21 | 0 |
-| session_start | 41.5 | 26 | **27** |
-| get_system_health | 26.3 | **17** | 0 |
-| get_all_readiness_scores | 19.1 | 7 | 0 |
-| get_workflow_performance_report | 17.6 | 6 | 0 |
-| list_executions | 15.5 | 9 | 0 |
-| get_workflow_health | 10.6 | 7 | 0 |
-| security_audit | 8.5 | 3 | 0 |
-| *whoami (control)* | 2.3 | 4 | 0 |
-
-**The slowest surface has no N+1 and no unbounded read**, which is worth
-saying because it is the opposite of what a 189 ms report invites you to
-assume. `get_platform_hygiene_report` issues 21 statements, constant in fleet
-size, every list LIMITed; its cost is four individually slow statements inside
-`tokio::join!` batches — the `uncapabilized` list at **53.0 ms**, the
-`undescribed` list at **52.9 ms**, the idle-actor scan at **25.9 ms** and the
-dormant `WITH last_run AS (…)` at **24.0 ms**. Neither fix this change is
-allowed to make (`= ANY($1)` batching, a disclosed cap) addresses a statement
-that is slow on its own, so it is RECORDED with its four statements named
-rather than half-fixed.
-
-**Two things were fixed.**
-
-**(1) `session_start`'s capability heal was a real N+1.**
-`for wf_id in ids { auto_suggest_capabilities(…).await }` over
-`get_ids_without_capabilities` (`LIMIT 100`), four statements each — one
-graph+capabilities read, one world read, one kind read and one UPDATE — run
-serially inside a background `tokio::spawn` against the same pool a live
-request is competing for. **Before: 27 statements for N = 6, worst case 401.
-After: 6, and CONSTANT** — 6 at N = 100 too. Three new `AnalyticsRepository`
-methods (`get_workflow_graphs_and_capabilities` and
-`get_module_worlds_and_kinds`, both `= ANY($1)`, and
-`set_capabilities_if_empty_bulk`, one `UPDATE … FROM jsonb_array_elements`
-because ragged per-row arrays cannot ride `UNNEST`). **The DECISION did not
-move**: `capability_suggestions_from` is now a PURE function called by both
-paths and `module_ids_in_graph` is one reader of the
-`node.type`-is-a-module-uuid convention, so the two cannot come to disagree
-about which modules a workflow uses. The test asserts the tags are IDENTICAL
-to the per-workflow path's own answer on an identical population — a
-count-only assertion passes over a batched path that tags everything `[]` —
-and a second test pins that an operator's explicit tag set between the read
-and the write still survives.
-
-**Batching changed a BLAST RADIUS, and the batched path answers for it.** The
-per-workflow path swallowed its module reads (`.unwrap_or_default()`) and, on
-failure, wrote the graph-STRUCTURE tags alone. One workflow at a time that is
-an accident; batched, one failed read does it to the WHOLE PAGE, and the
-`if empty` guard makes it PERMANENT — a structure-only-tagged workflow is no
-longer uncapabilized, so the heal never revisits it. The batched path ABORTS on
-that read with a WARN and writes nothing; the page stays uncapabilized and the
-next `session_start` retries. Pinned by a test that renames the column the read
-names (leaving `workflows` untouched, so the healthy control is meaningful);
-the mutation that restores the swallow fails it with
-`[["parallel"], ["parallel"], ["parallel"]]` in the assertion output — the
-degraded tag set, in so many words. The per-workflow path's own swallow is
-pre-existing and deliberately untouched: not this change's to rewrite, and its
-blast radius is one row.
-
-**(2) `get_system_health` issued the SAME statement twice**, once discarded to
-`.is_ok()` under the comment *"Use a simple repo call as DB connectivity
-check"* and once for its value, and that statement carries an unbounded
-`(SELECT COUNT(*)::bigint FROM workflow_executions WHERE user_id = $1)`:
-**10.3 ms + 5.7 ms of the tool's 31.9 ms**. One read now answers both
-questions — **17 → 14 statements** (the statement plus its scoped
-transaction's BEGIN and COMMIT). Not a cache: same statement, same binds, same
-request. The only behavioural difference is a TRANSIENT failure where the
-first read failed and the second succeeded, which used to render a report
-stamped `database_connected: false` from a read that had in fact succeeded.
-
-**The apparent byte difference in that response was checked, not waved away.**
-`get_system_health`'s body measured 566 bytes before and 565 after — and two
-consecutive runs of the SAME post-fix code render
-`recent_failure_rate.total_executions` as **92** then **90**, because the seed
-spreads executions over a rolling window and that field counts the last hour.
-Seed drift, not a behaviour change.
-
-**What was measured and NOT changed.** The embedding half of the same heal has
-the identical N+1 shape and a ready-made fully batched sibling
-(`handle_generate_workflow_embeddings` = one read + `generate_embeddings_batch`
-+ `bulk_set_workflow_embeddings_from_str`), and it is left alone: it needs a
-live embedding provider to exercise, this environment has none (the spawn does
-not even fire — `provider_status: "unavailable"`), and an unexercised rewrite
-of an HTTP fan-out is worse than the N+1 it replaces. **Both heal loops are
-LATENT on the reference fleet**, stated plainly: `embedding IS NULL` = **0**
-and `capabilities = '{}'` = **0** today. They fire on freshly created or
-imported workflows — the state immediately after `create_workflow` — not on
-this fleet. And `get_system_health` / `list_executions` each carry an unbounded
-`COUNT(*)` over the user's execution partition; neither is a collection held in
-memory, so neither is the unbounded-collection shape, and capping a COUNT
-changes its meaning.
-
-#### `pg_stat_statements`, and the guard whose premise was false
-
-`docker-compose.yml`'s postgres gains
-`command: [postgres, -c, shared_preload_libraries=pg_stat_statements]` (the
-image and its pinned digest are untouched — check 80), and migration
-`20260908120000` creates the extension where that preload is present.
-
-**The obvious guard — "catch the error `CREATE EXTENSION` raises without the
-preload" — was refuted by measuring it.** On this server (PG 17.10,
-`shared_preload_libraries` empty) `CREATE EXTENSION pg_stat_statements`
-**succeeds**. What fails is the first READ:
-`SELECT count(*) FROM pg_stat_statements` →
-`ERROR: pg_stat_statements must be loaded via "shared_preload_libraries"`. So
-an unguarded migration leaves every non-preloaded deployment carrying an
-extension whose only view raises on every query — a catalog entry that lies
-about a working instrument, which is this file's usual subject. The gate is
-therefore on the GUC itself, and the EXCEPTION block is kept for the SECOND
-measured failure mode: a non-superuser migration role gets
-`permission denied to create extension … Must be superuser` (measured with a
-plain LOGIN role — the extension is not `trusted`), which is exactly the shape
-a managed Postgres takes, and a migration that ERRORS there stops the whole
-chain including every migration after it.
-
-**Both arms proved, on the same pinned image.** No preload: the full
-`sqlx migrate run` applies it at exit 0, a direct psql apply prints one
-`NOTICE … skipping` and `DO`, `pg_extension` count is **0**, and the
-`_sqlx_migrations` row is present with `success = t`. With the preload (a
-throwaway container started with the exact `command:` the compose change adds):
-`NOTICE: pg_stat_statements is enabled.`, `pg_extension` count **1**, and
-`SELECT count(*) >= 0 FROM pg_stat_statements` actually READS. The positive arm
-matters as much as the negative one — a guard that skips everywhere is a no-op
-that proves nothing.
-
-**The Helm chart is deliberately NOT changed, with the cost stated.**
-`shared_preload_libraries` is a POSTMASTER GUC, so adding it to the in-cluster
-Postgres ConfigMap takes effect only on a server RESTART — on that chart's
-single-replica StatefulSet, a full database outage for the length of a pod
-restart — and the extension takes a fixed shared-memory allocation
-(`pg_stat_statements.max` × ~1 KB, default 5 000 entries) out of a deployment
-tuned there for a 4 GiB VM. An operator's decision, not a migration's side
-effect.
-
-#### Guards, and no lint
-
-`controller/tests/mcp_tool_instrument_tests.rs` (7 tests, CTRL_TESTS per check
-64b) drives the REAL `handle_tools_call`: the counter and the histogram each
-move exactly once; three invented names mint exactly ONE `unknown` series and
-none of the three strings reaches the label set; the response is byte-identical
-to the domain dispatch's own; a missing required argument records `refused`;
-the capability heal is constant in page size AND answers identically; an
-operator tag survives the bulk heal; `get_system_health` reads the status
-counts once. **Cardinality assertions read the registry's own `gather()`
-output, never `with_label_values(..).get()`** — that method CREATES the series
-it is asked about, so a cardinality test written that way manufactures the
-evidence it then checks.
-
-**No lint check was added and `--count` stays 88.** Two candidates were
-measured first. (i) *"a metric label value must be `&'static`"* is not
-expressible: `Box::leak` yields `&'static str` from a request string, so the
-type is not the property — the guard is the pointer-equality test, and the
-population is ONE label pair. (ii) *"a new `tools/call` transport must call the
-instrument"* has a population of THREE call sites in one file, all of which
-already funnel through the one `pub` wrapper — the structural answer (an inner
-function nothing else calls, and a wrapper that cannot be bypassed without
-deleting it) is stronger than a grep over three lines. What is NOT guarded, and
-is said rather than implied: nothing stops a future edit from computing the
-right label and then passing a different one to `record_mcp_tool_call`; that is
-a dataflow question, and the honest guard for it is the live read of
-`/metrics/prometheus` after deploy.
-
-### 2026-09-09 — the instrument counted the platform's authorization as a server error, and the two instruments spoke two vocabularies
-
-**The first thing the MCP instrument ever recorded on this fleet was a
-refusal, filed as a fault.** Minutes after #786 deployed, `get_system_health`
-without the admin capability was refused (`-32003`, "Unauthorized:
-get_system_health requires admin capability") and the registry recorded
-`talos_mcp_tool_calls_total{outcome="error",tool="get_system_health"} 1` in
-33 µs. Nothing was wrong with the refusal; the LABEL was wrong. Read live
-again 2026-09-09, unchanged, and it is one of THREE calls in the instrument's
-entire history — so `error` is 33 % of every MCP call this platform has ever
-recorded and the one `error` is the platform working as designed. The
-matching log line reads `"MCP tool call served" … outcome="error"`: fixed
-prose asserting the call was served, beside a field saying it was not.
-
-**The population is not what the shipped comment says, and the correction is
-the reason a lot of this was invisible.** `tool_labels.rs` claimed "411 of
-this crate's `mcp_error` sites" use `-32602` and "-32000 (409 sites)". A
-STATEMENT-AWARE inventory (`scripts/mcp-error-inventory.py`, new: comment and
-string CONTENT masked first — check 73's trap — then the argument list walked
-by a depth-aware paren matcher so a `)` inside a message cannot end it) counts
-**1590 production call sites**, of which **883** are `-32602` and **648** are
-`-32000`. The shipped numbers come from a single-line regex
-(`grep -c "mcp_error(.*-32602"` returns 412, `-32000` returns 410) and the
-house call style breaks the call across lines, so they saw 46.6 % and 63.3 %
-of their own populations. Cross-checked in the safe direction: a raw
-`grep -o` over the same tree returns 1602 against the inventory's 1595
-including test sites, the seven-site difference being occurrences inside
-comments and literals.
-
-**`-32000` cannot classify itself, and neither can three other codes.** Of the
-648 `-32000` sites, roughly **250 are refusals** — `"Workflow not found or
-access denied"` and its family alone is **123** — beside `"Failed to fetch
-workflow"`. Worse and not previously noticed: **11 of the 12 `-32601` sites
-are platform-admin refusals** (`query_paginated`, `pause_executions`,
-`ollama_pull_model`, `set_wasm_config`, `get_secret_access_log`, …), recorded
-as `unknown_tool`, so a non-admin looping on an admin-gated tool moved the
-series an operator reads as "clients are calling tools that do not exist";
-**7 of 15 `-32603` sites** are capability-ceiling refusals recorded as
-`error`; and **both `-32004` sites** are one call carrying BOTH arms of
-`evaluation::ensure_actor_owner`.
-
-**The constraint that shaped the design: the OPERATOR needs the split and the
-CALLER must not get it.** `"Actor not found or access denied"` is one sentence
-on purpose — a reply distinguishing "no such actor" from "not yours" is an
-existence oracle for anyone who can guess a uuid, an argument this file
-already records at `resolve_actor_via_repo`, at `caller_facing_unauthorized`
-and at #754's collapsed `write_ceiling_unreadable`. Re-assigning wire codes is
-out too: the reply bytes are an interface MCP clients may depend on. **So the
-meaning travels OUT OF BAND on the response value.**
-`talos_mcp::JsonRpcResponse` gains `error_kind: Option<McpErrorKind>` with
-`#[serde(skip)]`, and `McpErrorKind::{Denied, NotFound, Failed}` says what the
-site meant. `None` is a real third state — *no site said* — and classifies
-from the code exactly as before.
-
-**Three storage locations exist and the other two rest on discipline.** A
-`tokio::task_local` is lost by any `tokio::spawn` (a silent miss) and
-MISLABELS when a site constructs a refusal and discards it. A reserved key
-inside `result`, stripped at the chokepoint, rests on the strip running — and
-a leak IS the invariant being broken. With `#[serde(skip)]` a leak is not
-expressible, and the marker travels with the VALUE so construct-and-discard
-cannot mislabel and a decorated response keeps it. **That option was nearly
-rejected on a bad number**: `grep -rn "JsonRpcResponse {"` reports 398, which
-counts `-> JsonRpcResponse {` RETURN TYPES; masked and excluding those, the
-workspace holds **31** struct literals. A line grep over Rust is not a
-population — the same lesson as the `-32602` count above, twice in one change.
-
-**The byte-identity is STRUCTURAL, not a promise.** `mcp_error`,
-`mcp_error_kind`, `mcp_denied`, `mcp_not_found` and `mcp_failed` share ONE
-private `build_error` body, so there is no second literal to drift.
-`mcp_error_kind_matches_mcp_error_byte_for_byte` drives all three kinds
-through `serde_json::to_string` and compares; `the_kind_never_crosses_the_wire`
-asserts the rendered string carries neither the field name nor the value AND
-that a parsed response carries `None`. **The reply-byte snapshot was written
-BEFORE the refactor** and passed on the pre-change tree, so it proves the
-bytes did not move rather than describing where they landed.
-
-**Six outcomes, three classes, and the class is one TYPE across both
-surfaces.** `talos_metrics::mcp` is the new table (the `rpc.rs` macro shape):
-`ok | refused | unknown_tool | denied | not_found | error`, with #786's four
-spellings byte-identical so no log filter breaks. `denied` is the platform
-refusing a WELL-FORMED request (authorization, capability ceiling, org
-membership, a lifecycle or policy state, and the deliberately collapsed "not
-found or access denied"); the line against `refused` is the REQUEST — *your
-arguments are wrong* versus *your arguments were fine and the answer is no*.
-`not_found` is its own outcome and folds into `Declined` on #787's own ground
-(`RpcOutcome::NotFound => Declined`: a `get` on a key never written is the
-normal path). #787's `RpcOutcomeClass` was **MOVED, not copied**, to
-`talos_metrics::outcome_class::OutcomeClass` and lost its `Rpc` prefix — 20
-references, 3 files — so `served|declined|finding` is ONE type with ONE
-`as_str` on both surfaces and the three spellings cannot drift. The
-per-surface OUTCOME vocabularies stay legitimately different.
-
-**`class` is a third label and it adds NO series — verified, not assumed**
-(the brief's instruction, and #787's omission), in two places: over the table
-(`the_class_label_adds_no_series` asserts the `(outcome, class)` pair count
-equals the outcome count) and over a REAL registry after a real dispatch
-(`the_exported_series_carry_one_class_per_outcome`), which is where a future
-hand-written `with_label_values(&[tool, outcome, "finding"])` would surface.
-Measured scrape cost: the first `(tool, outcome)` pair moves 2356 → 2941 bytes
-and each marginal pair 1656 → 1996, ~19 bytes per rendered line, so the
-no-pre-seed argument gets ~24 % STRONGER; the pin carries the new numbers and
-the reason.
-
-**What was fixed, ranked by blast radius rather than taken as a prefix.**
-*Tier 0, the CODE table — zero site edits, zero reply bytes moved*: `-32003`
-(13 sites), `-32001` (2), `-32002` (1) and `-32600` (1) were verified
-site-by-site to be refusals in their WHOLE population, so one match arm covers
-17 sites and C1's exact case. *Tier 1, the shared funnels*:
-`trigger_auth_error_to_response` and `creator_auth_error_to_response` (behind
-every trigger and every `create_*`), `database_error` (**50 call sites**, the
-canonical failure funnel, now saying so at one home),
-`actor::resolve_actor_via_repo` (behind 20+ actor tools) and
-`knowledge_graph::require_owned_actor` — **both of which already had #782's
-three-way read, with a refusal arm and a failure arm rendering the SAME
-`-32000`; the two arms separated for the operator's PROSE landed on one
-series** — plus `ml::require_dataset_owner` (9 call sites) and
-`evaluation::ensure_actor_owner` (2), which returned `Result<_, String>` and
-now return a typed refusal carrying the kind AND the unchanged message.
-*Tier 2*: the 11 `-32601` admin refusals (the one genuine unknown-tool site is
-untouched). *Tier 3*: 7 `-32603` ceiling refusals. *Tier 4*: the 124
-tenancy-collapsed `-32000` sites. *Tier 5*: 44 more `-32000` policy and
-lifecycle refusals. *Tier 6*: 17 `not_found` sites, and the criterion is
-narrow on purpose — only IN-MEMORY lookups (`"Node 'x' not found in
-workflow"`), where the value is already in hand so no read could have failed.
-196 `Denied`, 18 `NotFound`, 4 `Failed`, 2 through the typed gates.
-
-**What was measured and deliberately NOT changed.** The ~363 `-32000` genuine
-FAILURES were not marked `mcp_failed`: their default is already `error`, so it
-is 363 lines of diff for no behaviour change. **The nine remaining `"Model not
-found"` sites in `ml.rs` were NOT marked `NotFound`, and this is the sharpest
-limit of the package**: they are written `let Ok(Some(m)) = … else { … }`,
-which routes a READ FAILURE into the not-found branch, so marking them would
-assert a determinate negative in the instrument — the class checks 74 / 76 /
-79 / 81 exist for — in a new place. **The instrument cannot be more precise
-than the handler's own read**, so the sites where classification is blocked
-are exactly the sites #782's read-splitting has not reached, and that is a
-better criterion for the next pass than the next N lines of a list. The 11
-`e.jsonrpc_code()` sites build their code from a service-error enum at
-runtime; routing them through the kind is a per-enum change in five service
-crates and is counted rather than attempted.
-
-**The remainder, so the next pass starts from a number.** 1363 constructor
-sites remain unclassified, of which 883 are `-32602` (already correct via the
-code arm), 363 are failures (correct as `error`), 14 are `denied` via the pure
-codes and 1 is the genuine `unknown_tool`. **102 are OPEN** — 25 not-founds,
-10 refusals, and 67 whose message is a runtime variable (`msg`, `err_str`,
-`hint`) — by file: `workflows.rs` 21, `ml.rs` 19, `sandbox.rs` 13,
-`executions.rs` 11, `actor.rs` 10, `advanced.rs` 7, `versions.rs` 5,
-`modules.rs` 4, `graph.rs` 3, `search.rs` 3, `utils.rs` 3, `analytics.rs` 2,
-`evaluation.rs` 1.
-
-**The LOG LEVEL was measured and deliberately NOT partitioned.** #787's shape
-is one predicate under BOTH the `talos_rpc` log level and the `class` label;
-here `class` joins the log line as a FIELD and the level stays INFO for every
-call. The argument that made #787 change a level does not transfer: there, a
-designed state was 53 % of the controller's entire WARN volume, so the level
-was fixing NOISE. The MCP line is one per call at one level by #786's
-deliberate choice — a per-call trace, not an alert — and an operator who wants
-the failures now filters `class=finding` on the field rather than on the
-level. Promoting `finding` to WARN is defensible and is a log-volume decision
-of its own; it is recorded rather than smuggled in.
-
-**NO alert, argued.** Nothing selects on this instrument today
-(`grep -rn "talos_mcp_tool" observability/ deploy/helm/talos/files/` is empty),
-which is exactly why the partition had to be fixed BEFORE a rule was built on
-a label whose meaning would then have to change under it. But the instrument's
-entire live population is THREE calls, and a rule with no baseline either
-fires forever or never — check 69's harm in both directions, and #787 declined
-an alert on `unauthorized` for the same reason two days earlier. What the
-partition buys is that the eventual rule is `class="finding"` rather than an
-outcome alternation a seventh outcome would silently fall outside of. Still
-NOT pre-seeded: ~320 tools × 6 outcomes is almost entirely unreachable, so
-seeding it is check 58's own defect.
-
-**Mutations, worst first, with the survivor and the no-op reported as such.**
-Reclassifying `denied` to `Finding` — the QUIET direction — is RED on the
-name-pinned partition. Leaking the kind to the wire is RED twice, printing the
-leaked payload. Deleting the chokepoint increment is RED seven times. Making
-`classify_outcome` ignore the kind is RED three times; honouring it BEFORE the
-success-shape check is RED on
-`a_kind_on_a_success_response_is_ignored`; dropping the pure-code arm and
-hardcoding the class label are RED. **M1b — reverting
-`resolve_actor_via_repo`'s refusal arm — SURVIVED on its first run**, because
-the round-trip test drove an INLINE site; that is what
-`the_actor_ownership_funnel_records_denied` was then written for, and the
-mutation is red. **M9 SURVIVES and is left stated**: reverting one of the
-eleven `-32601` admin refusals is invisible to every test here, because
-driving those needs a non-`*` `AgentIdentity` plus platform-admin state. With
-196 classified sites the guard is one test per SHAPE plus one per the
-highest-leverage FUNNEL, and the honest guard for the rest is the live read
-after deploy — #767, #769 and #771's position about their own changes. **M8 is
-a NO-OP, not a survivor**: `mcp_failed` at a `-32000` site changes nothing,
-because that code's default already IS `error`, which is true of all four
-`Failed` sites — the variant is DEFENCE IN DEPTH so a future addition to the
-pure-code arm cannot silently reclassify a failure. And one limit was found BY
-a mutation rather than reasoned: `the_exported_series_carry_one_class_per_outcome`
-does NOT catch a hardcoded `"finding"` — it proves PURITY, never CORRECTNESS,
-which is what the two delta tests assert.
-
-**A flake this change introduced and closed.** The new class-purity probe
-calls `whoami` and `get_workflow`, which two pre-existing tests measure
-"exactly once" deltas on through the process-global registry; one run in three
-turned a sibling red. Relaxing to `>= 1.0` was REJECTED — "exactly once" is
-what proves ONE record site writes both series — so a `SHARED_SERIES` mutex
-serialises the five tests that share a `(tool, outcome)`, recovering from
-poison so a panicking sibling fails on its own assertion. Five consecutive
-full runs green. Also corrected in the same file:
-`a_caller_fault_records_refused_and_a_server_fault_records_error` never drove a
-server fault; it is renamed to what it does, and the other half is a real
-injected read failure in Leg D.
-
-**No lint check was added and `--count` stays 88.** The candidate — *"a
-refusal must not be constructed with the failure constructor"* —
-was BUILT (`scripts/lint-mcp-refusal-constructor-candidate.py`, kept so the
-numbers can be re-derived) and MEASURED on both trees in a real `git
-worktree` of `origin/main`: **258 sites there, ~225 of them real (≈ 87 %,
-the band checks 74 and 87 shipped at) — and 68 on the FIXED tree**, of which
-43 are false positives by construction (`-32602`, `-32003`, `-32001` are codes
-the classifier's own arm already handles). So it ships as a ratchet with a
-baseline, which is check 52's rule. And narrowing it to the codes the table
-does not classify still leaves ~28, **which are precisely the sites this
-package deliberately left alone** — the `ml.rs`-style two-valued reads. A
-check demanding a classification there would push a future author into
-asserting a determinate negative in the instrument: **a gate that pressures
-you toward the defect it is named after is worse than no gate.** The
-structural alternative was priced too — making the kind a REQUIRED parameter
-of the only constructor is **1583 call sites**, 883 of them `-32602` where the
-author would be inventing a kind to satisfy a signature. What ships
-structurally instead: a closed `McpErrorKind`, an exhaustive `const fn`
-mapping with no wildcard, `#[must_use]` on the classified constructor, and one
-private body behind all four spellings.
-
-### The whitespace-run artefact, and why no lint guards it
-
-Four operator-facing string literals carried mid-sentence runs of up to 22
-spaces — a `\`-continuation that lost its `\` and kept the indentation. All
-four are from #771's dispatch-attempt work and all say the same thing in four
-places: an audit-ledger WARN read during a tamper investigation, a Prometheus
-**HELP** string, and two `security_audit` disclosure sentences. A line grep
-cannot see the shape (the run spans the continuation join), so the measurement
-used a literal-aware walker: **9 literals with a ≥5-space run on main, 3 SQL
-column alignments, 6 prose, 4 of them defects; 0 defects after.** The two
-surviving prose hits are the CLI's aligned help columns and are correct.
-
-**Both candidate guards were measured and rejected.** A grep scoped to literals
-with no SQL keyword reports 6 on main (66.7 % precision) and **2 on the fixed
-tree**, both legitimate — it would ship above zero with markers on correct code,
-and adding a prose-punctuation clause does not separate an aligned help column
-from a sentence (`"… List the DB worker-identity registry."` has a full stop).
-A render-time collapse at `mcp_text`'s JSON boundary is rejected on two grounds,
-one of them measured: it hides the defect rather than preventing it (the source
-literal stays wrong and the next reader copies it), and **it would have covered
-two of these four at most** — the Prometheus HELP text and the tracing WARN
-never pass through `mcp_text`.
-
-### `remove_member` refused every caller, and that is why the mutation survived
-
-The brief for this package recorded a redundant last-owner arm in
-`talos_organizations::remove_member` and asked for the reachability enumerated.
-It is enumerable and the second arm was DEAD: `check_org_access(.., Admin)`
-admits only Admin or Owner; the rank rule refuses a caller below the target and
-`Owner` is the maximum, so a target of Owner implies a caller of Owner; two
-DIFFERENT owner rows make `owner_count >= 2`. So the guard is reachable only
-when `caller_id == user_id`, which the first arm already answers — the second
-was a strict subset behind a `return`.
-
-**But the enumeration is not why the mutation survived.** Writing the test for
-the surviving arm turned it RED with `Failed to count owners`:
-
-    SELECT COUNT(*) FROM organization_members
-    WHERE org_id = $1 AND role = 'owner' FOR UPDATE
-    -- ERROR:  FOR UPDATE is not allowed with aggregate functions
-
-Postgres refuses the statement outright, so **`remove_member` failed for EVERY
-caller and every target** — the member-removal path has been entirely
-non-functional since MCP-996 added the TOCTOU hardening in May 2026, and
-NEITHER last-owner arm was ever reachable. No test could have distinguished the
-arms however it was written. The same statement appears a second time in
-`update_member_role`'s demotion guard, where it fires only when demoting an
-Owner. Both now put the aggregate OUTSIDE the locking subquery
-(`SELECT COUNT(*) FROM (SELECT 1 … FOR UPDATE) locked_owners`), which takes the
-same row locks. **LATENT on this deployment**: the live database holds 1
-`organization_members` row and 0 non-personal organizations.
-`organization_tests::the_sole_owner_cannot_remove_themselves` asserts the
-MESSAGE and not merely the refusal — asserting `is_err()` is precisely what let
-the dead arm stand in for the live one — with a control proving the guard keys
-on the owner COUNT rather than on self-removal.
-
-### A harness helper that had never once executed
-
-`controller/tests/common::create_test_organization` issued
-`INSERT INTO organizations (name) VALUES ($1) RETURNING id`, omitting **two**
-NOT NULL columns (`slug` and `owner_id`), so it failed on every call. Nothing
-noticed because its only caller, `create_authenticated_org_client`, had zero
-callers: three helpers deep, all dead, so the first test to reach for the
-harness would have failed on the harness rather than on its subject. It now
-routes through the production `OrganizationService::create_org` (the Testing
-Conventions rule — and it had drifted), `add_user_to_organization` became an
-UPSERT because `create_org` already inserts the owner's membership row, and
-`api_auth_integration_test::org_scoped_client_helper_actually_provisions_an_org`
-drives the chain end to end. Reinstating main's helper body is RED.
-
-### 2026-09-08 — the class closes at ZERO, and the gate that would have guarded it does not work
-
-The swallowed-READ family ends here. Package 31 left **34** `claim` sites — a
-read whose default becomes a count, a list, a verdict or a "not found" that a
-caller acts on. All 34 are closed: **32 repaired, 2 reclassified**, and the
-classifier now reports **121 sites, 0 claim** (from 153). The count is by
-MEASUREMENT, not by relabelling — both reclassifications quote the field they
-feed and why nothing there claims anything any more.
-
-**Falsification first.** Twelve main-vocabulary twins were run in a real
-`git worktree` of `origin/main` (`1ded89ac`) against its own migrated database:
-**12 of 12 FAILED BY ASSERTION, none by compile error.** Main answered, verbatim
-— `"Scratch session 'p32-scratch' not found"` for a session it could not read;
-`"Workflow not found or access denied"` for a workflow whose ownership row it
-could not read; `star_count: 0` on the branch reached only because this caller
-had already starred it; `top_modules: []` beside a note calling the emptiness
-*"a real signal, not an error"*; `catalog_tool_count: 0` with `total_mcp_tools`
-silently equal to the static count; `node_timing_breakdown: []` for a workflow
-with a completed run; a bare `=== Top Workflows ===` header with nothing under
-it; `match_count: 0` from `preview_capability_dispatch`; `count: 0` with a tip
-pointing at `list_module_catalog`; `"Actor … owns no active workflows. Create
-one"` for an actor that owns two; and `ready_to_run: false` with a fabricated
-`missing_secret` blocker for a credential that was provisioned.
-
-**Three repairs are worth carrying, because each is the class in a shape the
-earlier passes did not have.**
-
-**(a) A note that VOUCHED for the emptiness.** `get_marketplace_stats` rendered
-`top_modules: []` from `.unwrap_or_default()` under
-`top_modules_note: "…Empty if no module has been downloaded yet — that is a real
-signal, not an error."` That is worse than a bare default: the response
-affirmatively certified the one thing the failed read could not establish. The
-note is now conditional on its OWN field (a free `top_modules_unmeasured`
-helper, not an inline `!readings.complete()`, so a future second read on the
-same ledger cannot silently rewrite this sentence).
-
-**(b) A load-bearing read whose failure produced an ALL-CLEAR.**
-`get_config_suggestions`' node-template read feeds the module name, its
-canonical `allowed_secrets`, its schema and therefore `missing_fields` — and the
-very next block returns *"No missing required fields for this node."* on a tool
-whose entire job is naming what is unset. An EMPTY result stays a legitimate
-answer (a node whose `type` is not a template id); only the `Err` refuses.
-
-**(c) A report that had ALREADY admitted the ambiguity in prose.**
-`get_workflow_performance_report`'s `NODE_TIMING_BREAKDOWN_NOTE` said an empty
-list means the rollup fallback *"had no rows or its query failed, which this
-surface does not distinguish"*. Now it does: `null` when BOTH sources failed,
-`[]` when they were read and there was nothing. One working source is a real
-measurement and stays a list, and the two failures name the field ONCE — a
-second `record` would make one unreadable breakdown look like two. Note the
-three reads COMPOUNDED: the primary emptied the breakdown, the rollup fallback
-that exists to repair exactly that was skipped by its own `if let Ok`, and the
-extremes query rendered slowest/fastest `null` beside a NONZERO
-`total_completed_executions`.
-
-**A refusal that had no field to disclose into, twice, and the answers differ.**
-`talos-api` has no `talos-measurement` dependency and both its sites return a
-typed value. `rotateEncryptionKey` returns a bare `i32` and now PROPAGATES — the
-position `me`'s `UserInfo` was in one package ago, and the same answer. `1` was
-never a placeholder: it is the version number the toast prints and an operator
-tracks, so an unreadable count silently REWOUND that history; `0` would have
-been worse still, because `SecretsManager.tsx` does
-`if (data.rotateEncryptionKey)` and a falsy value renders no toast at all. The
-error names the half that SUCCEEDED so nobody re-rotates. `clone_actor` does
-NOT propagate — the actor is already committed — so `memories_copied` becomes an
-`Option` and the difference lands where an operator actually reads it, the
-action-log line that said *"(0 memories copied)"* for a copy that failed. That
-fix also closes a second, silent gap the MCP twin had already closed: an UNKNOWN
-count now RUNS the embedding backfill (bounded at the cap) instead of skipping
-it, so rows that DID land before the error are not left permanently invisible to
-semantic recall.
-
-**A plain-text report gets the same ledger.** `get_session_context` renders text
-and has no `measurement` object, so an earlier draft hand-rolled a
-`Vec<&'static str>` of unread sections. That was replaced by
-`talos_measurement::Readings` with only the RENDERING different — one home for
-the disclosure sentence and for the `report_field_not_measured` log event. Its
-three lists are what an agent reads as an inventory of what the user already
-has, and three empty ones say *"no ready workflows, nothing run recently,
-nothing matches"*, which is what pushes it to BUILD instead of REUSE.
-
-**`/mcp/local` now REFUSES, and the comment that stood there is why.** It read:
-*"a fresh database leaves agent.user_id = None, causing every user-scoped INSERT
-to write NULL and every user-scoped SELECT to return zero rows — tools appear to
-succeed but nothing persists."* The consequence was NAMED and not prevented —
-reported-success-on-a-failed-read for EVERY tool on the endpoint at once, which
-is the widest blast radius in this whole family. `Ok(None)` from the first read
-is still a genuinely fresh database and still creates the dev user; an `Err` from
-either read, or a creation that produced no user, refuses. The JSON-RPC
-notification check moved ABOVE the resolution so a refusal cannot put a body on a
-notification.
-
-**Two RECLASSIFICATIONS, stated with the field.** `get_execution_lineage`'s root
-lookup was repaired by the 2026-09-08 package and never re-verdicted: its `Err`
-arm still substitutes the anchor — there is no better id to walk from — but it
-sets `root_unreadable`, which renders `root_execution_id` as `null` and takes
-`lineage_note`'s FIRST arm. `import_workflow`'s `upsert_wasm_module` write still
-pushes the module onto `still_missing`, because it genuinely is not importable,
-but it now carries its REASON: FOUR of that list's five push sites are something
-other than "no source in bundle", and the sharpest is a DATABASE WRITE failure
-after a successful compile, which sent the operator to fix a bundle that was
-fine.
-
-**The DB tests are per-COLUMN, not per-table, and that is the design.**
-`controller/tests/claim_read_disclosure_tier5_tests` (14 tests, CTRL_TESTS per
-check 64b) drives the REAL MCP dispatch over a real `McpState`. Almost every
-site here needs one read of a table to SUCCEED and the NEXT read of the SAME
-table to FAIL, so the injection is `ALTER TABLE … DROP COLUMN <c>` where `<c>` is
-named by the second statement and not the first — `module_marketplace.name`
-(the leaderboard, not the aggregate), `module_marketplace.star_count`,
-`workflows.is_enabled` (the ownership read, not the version history),
-`workflows.readiness_score` (one session-context section, not the other two),
-`workflows.name` (the comparison set, not the source graph; the candidate
-listing, not the solo probe), `modules.category` (the two fallbacks, not the
-target lookup, which spells it `kind AS category`), `modules.config_schema` (the
-catalog listing, not the static tool count). That is a sharper instrument than a
-table drop and it is what makes these tests prove a per-FIELD disclosure rather
-than a blanket refusal. Every test carries its CONTROL in the same run, and the
-quickstart fixture asserts that its `vault://` reference actually REACHES the
-secrets branch, because a conditional assertion over a branch nobody entered
-proves nothing.
-
-**Six sites have no round trip and are said so rather than implied.**
-`get_config_suggestions` (2) refuses at its top for want of an LLM client;
-`import_workflow`'s write needs a real compile; `instantiate_workflow_pattern`
-(2) needs an installed AND compiled built-in pattern; `create_router`'s
-`/mcp/local` resolution is a closure inside the router builder. Those carry a
-SOURCE pin, which proves the expression is present and never that it produces
-the right answer. `talos-api`'s two have no injection either: `clone_actor`'s
-copy and `rotateEncryptionKey`'s count each read the same relation as the
-operation that must succeed before them. And `actor_recall`'s `key_exists_at_all`
-probe names NO column `recall_exact` does not, so no drop separates them — its
-two MEASURED arms are pinned and the `unknown` arm is not reachable from a
-relation-level injection.
-
-**Leg B — the CLAIM verdict as a lint leg was BUILT, MEASURED and REJECTED;
-`--count` stays 88.** On the fixed tree the candidate reports **0 claim and 0
-unclassified**, which is the zero baseline check 52's rule demands, and on
-pristine main it reports **32 of the 34**. It still fails, on three independent
-measurements. **(i)** A revert at a site this package RECLASSIFIED is completely
-green: the opt-out key is `(file, function, callee, spelling)`, which cannot tell
-the pre-fix expression from the post-fix one at the same call site — a verdict is
-a property of the CODE and the table can only name a LOCATION. **(ii)** The two
-mutations it does catch (`unwrap_or_default`, `if let Ok`) are caught ONLY
-because the table still carries the PRE-fix verdict for the 32 repaired rows.
-Simulated with those rows maintained — which is what *"what the default CLAIMS"*
-means once the default is gone — the `unwrap_or_default` mutation SURVIVES with a
-fully green report. **(iii)** A `.ok()` revert never reaches the CLAIM arm at all,
-because the spelling is part of the key; it lands in the ratchet arm. And the
-ratchet arm is the whole cost: it fires on every NEW collapsed read whatever its
-verdict, and packages 29 and 31 each ADDED two detector artefacts on CORRECT code,
-so it would have fired four times across the two most recent changes in this
-family against a 196-row hand-maintained table — check 74's own recorded rot mode
-and check 64's "a sweep is a snapshot, not a gate", one level up.
-
-What guards the class instead is what already guards it, and it is stronger than
-the grep would have been: sub-leg **74b**, whose scope is DERIVED (any function
-constructing a `Readings`), so the eight handlers that adopted a ledger here
-enrolled themselves; the `#[must_use]` three-valued lookups; the shared
-`utils::workflow_lookup_unreadable_error` so the "we could not read it" sentence
-has ONE home; and the DB tests above.
-
-**The whitespace-run artefact, third occurrence, and the mechanism is now
-known.** `get_platform_hygiene_report` rendered, live, *"A further 8 dormant
-workflow(s) are EXCLUDED from this list and this&nbsp;&nbsp;…&nbsp;&nbsp;count
-because an operator has already retired them"* with runs of 23 spaces — the
-`\`-continuation that lost its `\` and kept the indentation. The literal-aware
-walker is CHECKED IN as `scripts/lint-whitespace-runs.py` — a MEASUREMENT tool,
-not a lint, shipped because the previous two occurrences of this class each lost
-their detector with a worktree and a CLAUDE.md sentence must not cite an
-artefact the merge discards (the same reason `lint-swallow-classify.py` exists).
-It (escapes resolved, `\n` treated as a newline so
-embedded WAT and ASCII art do not read as prose, runs that FOLLOW a newline
-excluded as deliberate multi-line indentation) reports, on pristine
-`origin/main`, **200 literals carrying a ≥5-space run**, of which **14 hits fall
-on 6 DISTINCT literals that are mid-sentence prose** — **5 genuine defects**:
-this one, two in `talos-scheduler`'s `record_dispatch` call-site assertions, and
-two in the 2026-09-08 `compress_actor_context` test messages — and **1
-legitimate**, `talos-offhost-backup`'s aligned CLI help column. All five fixed;
-on the fixed tree the walker reports **185 literals and exactly 1 mid-sentence
-candidate**, which is that help column. **The CAUSE, found by making it twice in this very
-change**: a `\` at the end of a line inside a Python `'''…'''` string is a Python
-line continuation, so an edit script that writes Rust `\`-continuations through a
-non-raw triple-quoted string silently EATS them. Use a raw string. That is the
-first time this class has had a mechanism rather than a description, and it is
-why CLAUDE.md's earlier entries could only say "a continuation that lost its
-`\`". **No lint**: the measurement says the same thing package 23's did — 200
-literals carry a run and only 5 of them are defects, so a rule scoped by the run
-alone is ~2.5% precision, and even the mid-sentence narrowing ships at 1 marker
-on correct code. Telling prose from an aligned column is a judgement a grep
-cannot make.
-
-**`summary.note` renders as no key when there is nothing to say.** It was
-observed live as `"note": ""` — a field a reader cannot tell apart from a note
-the report failed to build, which is the shape this whole family removes.
-Verified before changing it: the hygiene report is MCP-only (no frontend
-consumer at all) and the single Rust reader is the degraded-path unit test,
-where the note is non-empty by construction. Both halves are pinned, and both
-mutations (re-emitting the key unconditionally; reinstating the broken literal)
-are RED.
-
-**What was measured and NOT changed.** The 121 remaining sites are 60
-decorative, 37 fail-closed, 31 false-positive and the 1 nominal `fail-open` that
-is the 2026-09-07 `dlq_updates` narrowing. None makes a claim. The detector's
-stated limits are unchanged and still bound what "zero" means: it is TEXTUAL, so
-a collapse reached through a helper in another crate or applied to an
-already-resolved local one statement later is invisible; `if let Some(..)` over
-an Option-returning read is structurally out of range (measured at ~6% precision
-when widened, and it is the shape the three worst fail-open gates took); and a
-verdict is a judgement about the RESPONSE, so it can be wrong where the response
-shape is not obvious from the call site. "Zero claims" means zero of the
-population this detector can see.
-
-## The verifier that could never read the ledger it verified (#767)
-
-**Measured live 2026-09-06, and the shape is "presence is not function" at the
-identity layer.** The WORM audit bucket has one job that needs `PutObject` and
-another that needs `ListBucket`+`GetObject`, and until this change ONE identity
-served both. `build_audit_s3_client` resolved credentials through
-`aws_config::load_defaults` — the `AWS_*` chain — for the write path AND the
-read path, and on every deployment of this platform `AWS_*` is
-`MINIO_CONTROLLER_USER`, whose policy is `audit_write_only` (`s3:PutObject` and
-nothing else). So: `mc ls` under those credentials answers **Access Denied**;
-the bucket held **48,946** execution prefixes written since 2026-07-08 with the
-newest minutes old (the WRITER works); the hourly sweep logged **37**
-`audit_chain_verification_errored` lines in one hour and the controller's ENTIRE
-history contained **zero** `audit_chain_verification_failed` and zero verified
-chains. Chain verification had never once succeeded.
-
-**Why nothing said so.** `record_chain_verification_outcome` incremented
-`talos_audit_verification_failures_total{stage="chain"}` only on `Ok(report)`
-with breaks; the `Err` arm incremented NOTHING and logged one WARN. The single
-alert on that series names the gap in its own comment. `security_audit` had no
-chain check at all — `audit_event_signing` signs a probe in memory,
-`audit_immutability_triggers` counts `pg_trigger` rows. And the log said
-`error = list_objects_v2 failed for <exec>/: service error`, because `Display`
-on an `SdkError` drops the S3 code: AccessDenied, NoSuchBucket and a reset
-connection are the same four words. **And the identity was only half of it** —
-the sweep was also naming an id space the writer has never used, which the
-population section below establishes with a live positive control.
-
-**The two identities are now separate and the writer stays write-only.** The
-verifier is `MINIO_VERIFIER_USER` under a new `audit_read_only` policy
-(`s3:ListBucket` on the bucket + `s3:GetObject` on its objects; NO Put, NO
-Delete), reaching the controller as `AUDIT_VERIFIER_ACCESS_KEY_ID` /
-`AUDIT_VERIFIER_SECRET_ACCESS_KEY`. `talos_audit_ledger::verifier`
-builds that client from an EXPLICIT `Credentials` provider with **no
-`load_defaults` on the path**, so there is no environment chain for the writer's
-key to be picked up from. Absent verifier credentials are `VerifierClient::
-NoCredentials` — three-valued against `NoEndpoint`, because "there is no WORM
-store here" and "there is one and nothing can read it" are different findings —
-and the sweep then refuses to start with one ERROR rather than silently retrying
-a key that cannot work. **Do not widen the writer's policy to "fix"
-verification**: a writer that can also list and get is a writer that can survey
-and target what it wrote.
-
-**Failure is CLASSIFIED, and the classification decides the sweep's shape.**
-`ChainVerifyErrorKind::{AccessDenied, NoSuchBucket, NotFound, Transport, Other,
-NoCredentials}`, derived from the SDK's typed `ProvideErrorMetadata::code`
-rather than from the rendered string, with the full chain captured via
-`DisplayErrorContext`. `AccessDenied`/`NoSuchBucket`/`NoCredentials` are
-DEPLOYMENT-WIDE facts — one identity, one bucket — so the 2nd..Nth jobs in a
-sweep cannot answer differently; the sweep ABORTS on the first, records
-`ChainSweepStats::aborted`, and emits ONE `audit_chain_sweep_aborted` ERROR
-instead of up to `MAX_JOBS_PER_SWEEP` identical WARNs. `NotFound`/`Transport` are per-object and do NOT
-abort. The abort flag is a CLAIM ABOUT COVERAGE in the same family as
-`cap_hit`: after an abort `failed == 0 && errored == 1` is true and means
-nothing.
-
-**Instruments.** `talos_audit_chain_unverifiable_total{reason}` (all six values
-PRE-SEEDED at 0 — `increase(...) > 0` over an absent series matches nothing, which
-is exactly how this stayed quiet) is deliberately a SEPARATE series from
-`talos_audit_verification_failures_total`: unverifiable is not verified-bad
-(#578), and folding an object-store blip into the CRITICAL tamper alert would
-train operators to ignore it. Two GAUGES, and they answer different questions
-that disagreed for two months on this stack:
-`talos_audit_chain_last_verified_ok_timestamp_seconds` (the control works) and
-`talos_audit_chain_sweep_timestamp_seconds` (the loop is alive). The first is
-deliberately NOT pre-seeded — a zero seed reads as 1970 and would fire every
-staleness rule on a healthy cold boot — so `TalosAuditChainNeverVerified`
-carries an explicit `absent()` arm and is GATED on the sweep having run, so a
-deployment with no object store is not permanently red.
-`TalosAuditChainUnverifiable` is `warning`, not critical: it says the CONTROL is
-not working, not that the ledger is bad.
-
-**`security_audit` gains `audit_chain_verification` (`control`, `round_trip`),
-WEIGHT 0 — and the zero is argued from scratch rather than borrowed.** Of
-`write_ceiling_enforcement`'s three reasons exactly ONE applies: the grade bands
-are ABSOLUTE against a 100-point total (`weights_sum_to_max_score`, and
-`MAX_SCORE`'s own doc block leans on a dev stack topping out at exactly
-`GRADE_A`), so an eleventh weighted check would re-grade every deployment and
-make every score recorded before today incomparable. Reason 1 ("default-OFF by
-design") does NOT apply — the sweep defaults ON. Reason 3 ("conditional") does
-NOT apply — where a ledger is written and never verified the compliance artifact
-is unbacked unconditionally. The zero is not decorative: an unverifiable control
-and a broken chain both render `Status::Fail` with CRITICAL, so both land in
-`status_counts.fail` and in `recommendation_for`, which names failing checks by
-name. The check runs the REAL verifier on the most recent terminal execution
-outside the settle window (`CHAIN_SETTLE_SECS`, now shared with the sweep so the
-two grade the same population), increments no counter (an operator re-running
-the audit must not move a series an alert fires on), and renders five outcomes
-including `NothingToVerify` split three-valued so a failed candidate query never
-reads as "there is nothing to verify".
-
-**The chart NEVER provisioned any of this, and that is fixed here too.**
-`grep -rn "mc admin" deploy/` matched nothing: the MinIO StatefulSet set only
-ROOT credentials, `install.sh` generated a controller user+password no `mc`
-invocation ever created, and README.md called it a "least-privilege write-only
-user". On a k3s deploy the bucket would not exist and the writer's key would
-name no principal — the ledger dark end to end. The new `minio-provisioning`
-Job (post-install/post-upgrade hook, idempotent) creates the bucket and BOTH
-identities, mirroring the compose recipe. This remains **LATENT**: there is no
-production environment (memory `no_production_environment`), so nothing was
-observed failing this way — stated rather than dressed up.
-
-**What was measured and NOT changed.** The compose `minio-init` container
-receives `MINIO_WORKER_USER`/`_PASSWORD` and has never created that user —
-`mc admin user list` on the live MinIO returns exactly ONE user. Dead env, a
-separate finding, and the worker does not touch S3 (it publishes to
-`talos.audit.ledger`). **CLOSED 2026-09-07** — see "A credential for a
-principal that does not exist" below; the pair is gone from compose, the chart,
-`values.yaml`, `install.sh`, `.env.example` and both `.env` generators, and
-`mc admin user list` now returns exactly TWO users, neither of them a
-worker. The GraphQL `verifyAuditChain` error message is generic
-and correctly directed and is unchanged; what DID change is that it now builds
-its client from the verifier identity, so the operator's on-demand path was
-broken by the same defect and is fixed by the same line.
-
-**No lint check was added and `--count` stays 86.** The obvious guard — "the
-verifier must not use the writer's credentials" — has a population of ONE, which
-is the bar this repo does not ship at (#765's own numbers), and the structural
-answer is already stronger: a distinct env name, an explicit credentials
-provider with no `load_defaults` on the path, and
-`verifier_client_signs_with_the_explicit_credentials`, which drives a real
-`list_objects_v2` at a one-shot TCP listener and reads the access key id out of
-the SigV4 `Authorization` header the SDK actually put on the wire. That test
-exists because `aws_sdk_s3::Config::credentials_provider()` is DEPRECATED and
-returns `None` unconditionally, so the obvious config-readback assertion would
-have passed vacuously against a client carrying no credentials at all — the
-exact mutation it is there to catch.
-
-**The fix would have made the report WORSE, and that was found by driving the
-real verifier against the live store rather than by reasoning.** With
-read-capable credentials the SAME execution the writer's key was denied came
-back `ok=true, total_events=0` — because `verify_chain` over an EMPTY event set
-answers `ok == true` (there are no gaps, no broken links and no bad signatures
-in nothing). Then the id-space, measured in BOTH directions: **200 of 200**
-recent ledger prefixes are `module_executions.id` and **0 of 200** are
-`workflow_executions.id`, live table AND archive; **0 of 200** recent
-`workflow_executions.id` appear as a prefix; **34 of 34** terminal executions
-inside the sweep's own 2 h window have an empty prefix — against a WRITER that
-is healthy (2,686 objects in 2 days, 49,239 / 23 MiB total). The writer keys on
-the `execution_id` carried by the audit EVENT, which is the module execution;
-`run_chain_verification_sweep` enumerated `workflow_executions`. So repairing
-the identity alone would have turned 37 loud WARNs into 37 silent
-`verified_ok`, stamped the new "last verified ok" gauge, rendered
-`security_audit` PASS and kept `TalosAuditChainNeverVerified` quiet — strictly
-worse than the AccessDenied, which at least logged. `ChainVerifyErrorKind::
-EmptyChain` (7th reason, seeded, does NOT abort — one execution may legitimately
-emit no events and the VOLUME is the finding), `ChainSweepStats::empty` counted
-separately from `verified_ok`, no gauge stamp on an empty read, and the check
-renders `Warn`/`NotVerified` saying *the identity is working and the prefix is
-empty* so nobody chases a permission fault that no longer exists. Note
-`verified_ok`'s meaning moved (it now requires ≥1 event).
-
-**And the POPULATION is fixed in the same change, because a verifier that
-enumerates an id space the writer never uses verifies nothing forever.** An
-honest `empty` on 100% of rows is a report nobody can act on and a control that
-still does not work — the gate-that-doesn't-gate class (#624, checks 64/65) one
-level up. **The binding was ESTABLISHED, not guessed**, and the guess was wrong:
-`worker/src/main.rs` builds the worker's `execution_context` as
-`(req.workflow_execution_id, req.job_id, req.module_uri)`, `runtime.rs` turns
-the first two into `ExecutionLedger::new(workflow_id, execution_id)`, and
-`job_id` IS `module_executions.id` (`engine_dispatch_single.rs` mints it and
-passes it as `ExecutionStartedContext { id: job_id, .. }`, the primary key of
-the row it inserts). So the genesis pair is
-`(module_executions.workflow_execution_id, module_executions.id)` — the FIRST
-half is a workflow EXECUTION id, not `workflows.id`, even though the ledger
-field is named `workflow_id`. **The live positive control settles it**, driving
-the real `verify_execution_chain` against the live MinIO with read-capable
-credentials (one temporary example binary, since deleted): the established pair
-returns `ok=true total_events=1 breaks=0 sigs_checked=true` (6 of 6 sampled, 50
-of 50 in a wider run); the pair a reader would GUESS from the field name
-(`workflows.id`) returns `ok=false breaks=1`, a genesis mismatch on a healthy
-chain; and the pre-fix sweep's own shape returns `ok=true total_events=0`.
-`ChainVerifyErrorKind::EmptyChain` was therefore load-bearing for one day and is
-kept: an empty prefix stays a distinct outcome whichever id space is
-enumerated — but its EXPECTED frequency has inverted, and the prose says so.
-Sampled 200 recent settled module executions: **0 have an empty prefix**, so a
-non-zero `empty` is now a real per-job finding (the worker emitted nothing, or
-its batch never reached the store) rather than the whole population.
-
-**The ledger is keyed per JOB; the operator asks per RUN; both grains are
-reported and neither is folded into the other.** `run_chain_verification_sweep`
-enumerates `module_executions` through ONE query with NO join — that table
-carries both halves of the pair, so the join a reader expects is not batched
-away, it is unnecessary — and `roll_up_by_workflow_execution` lifts the per-job
-outcomes to workflow executions with WORST OUTCOME WINS (`Failed > Errored >
-Empty > VerifiedOk`, the `Ord` derive on `JobChainOutcome` IS the precedence).
-One broken chain among a run's four jobs makes that run's audit trail broken,
-not three-quarters clean. The summary line, the `security_audit` sweep note and
-the admin `verifyAuditChain` query all carry both numbers plus
-`LEDGER_KEY_SPACE`, so nobody has to guess which table an id belongs to.
-`security_audit`'s round-trip check picks the most recent settled MODULE
-execution and names both ids and the key space in its detail.
-**`verifyAuditChain` was the THIRD surface with this defect** and was doubly
-wrong — it used the caller's `workflow_executions.id` as the S3 prefix AND
-`workflows.id` as the genesis half, i.e. both of the two negative controls
-above. It now resolves the execution to its jobs, verifies each, and returns
-per-job reports under an aggregate whose `ok` requires **at least one** verified
-chain: `jobs.iter().all(..)` over an empty iterator is `true`, which is this
-whole change's defect in one line.
-
-**Cost and cap, measured rather than assumed.** The population is ~3.3x larger:
-101 module executions in the sweep's own 2 h window against 32 workflow
-executions, peak 150 vs 45 per 2 h bucket over 7 days, 1,342/day. A verification
-is one `list_objects_v2` + one `get_object`; 50 real ones against the live store
-took 1.6 s wall including process start (~30 ms each). `MAX_JOBS_PER_SWEEP` moves
-500 → **2000**, restoring the ~11x headroom the old cap had and costing ~60 s of
-an HOURLY tick at the cap. `cap_hit` is exactly as honest as before: the sweep
-keeps no cursor, so rows the cap drops age out of the sliding window and no
-later pass picks them up.
-
-**What was measured and NOT changed.** `module_executions.workflow_execution_id`
-is NULLABLE and a row without one has no genesis pair, so it cannot be verified —
-measured at **0 of 48,577 rows platform-wide**, i.e. LATENT, and stated as such
-rather than dressed up. It is COUNTED (`ChainSweepStats::unbound`, disclosed in
-the summary and in the sweep note) rather than filtered out of sight, and that
-decision needed a structural move: with the increment inside the S3-dependent
-sweep loop, deleting it left **all 45 ledger tests and all 84 security-audit
-tests green** (measured, not inferred). `partition_sweep_rows` returns
-`(targets, unbound)` so the caller cannot obtain the targets without the count it
-must disclose, and the mutation now fails. The same discipline put the sweep's
-enumeration statement in `enumerate_sweep_jobs`: a DB test drives the EXACT
-statement the sweep issues, because the defect was a SELECT naming the wrong
-table and no amount of testing the verification logic could see it. And the
-sweep still runs on the BARE POOL — a platform-wide system task with no caller
-and no tenant to scope to; a tenant-scoped tx would verify one tenant's chains
-and silently certify the rest.
-
-**Adjacent fix in the same change (#765's class, one sentence over).**
-`describe_disabled_retry_protection`'s zero-ceiling arm said *"even its single
-first attempt can outrun the budget"* — the TRUNCATED wording — for BOTH shapes
-a zero ceiling can take, because `max_retries_within_budget` returns `Some(0)`
-whenever the retries=0 sequence is not `AttemptFit::Full`, which is true of a
-CLAMPED single attempt too. Measured on the reference fleet 2026-09-06: that arm
-fires on exactly TWO nodes and BOTH are clamped, so **2 of 2 live occurrences
-were false** — and both nodes emitted the sibling `attempt-window-clamped`
-finding saying *"Every configured attempt starts, but attempt 1 is CLAMPED to
-118s of the 125s"* in the SAME `validate_workflow` response, five lines apart.
-`NodeRetryBudget` now carries the ceiling and the single-attempt fit as one
-value from one function, so a caller cannot supply a pair that disagrees, and
-`zero_ceiling_reason()` has ONE home — `get_workflow_risk_assessment` carried
-its own copy of the truncated wording in its `recommendation` string and now
-reads the same clause.
-
-**2026-09-07 — the first sweep that ever ran called an identical redelivery
-"possible tampering".** #767 gave the verifier an identity that can read; the
-FIRST completed pass then reported `jobs_scanned=102 jobs_verified_ok=101
-jobs_failed=1`, and the one failure was a prefix holding ONE object whose two
-lines were BYTE-IDENTICAL — same `sequence_num` 1, same `previous_hash`, same
-`hash`, same `hmac_signature`, same `timestamp` — logged at ERROR as *"possible
-tampering, deletion, reorder, or corruption"* and incrementing
-`talos_audit_verification_failures_total{stage="chain"}`, the series whose HELP
-text says "positive tamper/corruption evidence" and whose whole value is that
-its steady state is 0. A false CRITICAL on the one control that exists to raise
-a true one (check 69's class, on the audit control).
-
-**Two duplicate kinds, and only one says anything about integrity.**
-`verify_chain` sorted by `sequence_num` and reported `DuplicateSequence`
-whenever two adjacent events shared one, WITHOUT comparing their content. Now:
-BYTE-IDENTICAL (equal recomputed hash AND equal signature — hash covers every
-field but the signature, so the pair is equal iff the events are) is
-`ChainBreak::DuplicateDelivery`, which is REPORTED and does not clear `ok`;
-CONFLICTING content stays `DuplicateSequence`, still tamper evidence, still
-CRITICAL. `ChainBreak::is_tamper_evidence` is the one predicate `ok` is computed
-from, so a NEW variant must decide which it is at the point it is added instead
-of inheriting "break". Chain continuity was ALREADY computed over the deduped
-sequence — the pre-existing `continue` left `prev_hash` and `expected_seq`
-untouched — and that is recorded as a no-op rather than claimed as a fix.
-`anchor_verdict` now dedupes too: without it one identical redelivery produced
-TWO hard failures (`CountMismatch`, because the anchor commits 1 and the
-verifier counted 2; and a phantom `MultipleAnchors`).
-
-**The writer/verifier split is asymmetric ON PURPOSE.** `process_batch` drops an
-exact duplicate that shares a batch (`talos_audit_ledger::batch_dedupe`,
-`talos_audit_ledger_duplicate_deliveries_total{scope="batch"}`, one INFO line
-per batch, every dropped copy still ACKed — an unacked message is redelivered
-forever). It CANNOT dedupe across batches, because that means LISTING and
-READING the execution's prefix and the ledger writer's S3 identity is
-**write-only by design** — the read-only verifier is a separate credential
-precisely so a compromised writer cannot survey what it wrote. **Do not widen
-it.** Cross-batch copies are classified at the verifier instead, where the
-read-only identity already belongs.
-
-**The cause was the PRODUCER, and the population says so.** Measured over the
-whole bucket 2026-09-07 (49,720 objects / 49,461 prefixes): **196 prefixes
-(0.40 %) carried more than one terminal anchor — 35 byte-identical, 161
-CONFLICTING**. So the verifier classification covers 18 % of the historical
-population and the producer fix covers all of it. Mechanism, from the worker log
-(one `Received job`, one `Job completed`, **two** `wasm-execution` spans):
-`execute_job_with_full_features`' retry loop called the internal attempt
-function up to `RetryPolicy::max_attempts + 1 = 4` times, and EACH attempt built
-a fresh `ExecutionLedger::new(workflow_id, exec_id)` and appended its own
-terminal anchor — every attempt restarting at `current_sequence = 0` and at the
-deterministic genesis hash, so every attempt emitted an `execution_complete`
-event claiming `sequence_num` 1. `AuditEvent::timestamp` is WHOLE SECONDS, so
-two attempts inside one second are byte-identical and two either side of a
-second boundary are not: **a second boundary is the whole difference between the
-35 and the 161**, not any property of the transport. The object size classes
-match the attempt ceiling exactly (2, 3 and 4 copies; none above 4 in the recent
-population).
-
-Now: ONE ledger per JOB, minted above the retry loop and shared by every
-attempt, so the chain is one monotonic sequence over the whole job; and ONE
-anchor, appended by `seal_job_audit_chain` after the last attempt. The retry
-loop's four terminal exits were wrapped in a labelled block so the anchor has
-exactly ONE emission site — a helper called at each of four exits is one
-forgotten call site away from the defect being reintroduced. The anchor is still
-EARNED, not automatic: `anchor_eligible` is set at the same point the inline
-anchor used to be appended (below the wall-clock timeout's `?`), so a job killed
-by the wall clock still earns nothing and keeps the deliberately-soft
-`Unanchored` verdict.
-
-**What #769 did NOT close, and it is 150 of the 196 prefixes.** The anchor is one
-per DISPATCH, not one per JOB-ID. A controller-level retry re-dispatches the SAME
-`job_id` (`talos-workflow-engine-nats::execute_job_with_retry`, whose own doc
-notes the worker re-sees it), and each re-dispatch is a fresh
-`execute_job_with_full_features` call with a fresh ledger — which is why the
-ledger holds prefixes with far more copies than the in-worker ceiling of 4 (one
-has ELEVEN objects written 5 s apart across 55 s). Reconstructing a prior
-dispatch's ledger needs persisted state the credential-free worker cannot read.
-That is the next entry.
-
-## A re-dispatched job is a second chain, and the wire says so
-
-**`JobRequest.dispatch_attempt` — the partition key a credential-free worker
-cannot derive.** #769 fixed the in-WORKER retry (one ledger per job). The
-remainder it recorded is the CONTROLLER re-dispatching the same `job_id`: each
-re-dispatch is a fresh worker job with a fresh ledger, so two dispatches write
-two chains that both start at `sequence_num` 1 against the same genesis, under
-one S3 prefix. `verify_chain` sorted by `sequence_num` alone and had no key to
-tell them apart, so it reported `DuplicateSequence` — positive tamper evidence,
-ERROR, `talos_audit_verification_failures_total{stage="chain"}` — every time a
-controller retry followed a completed-but-unanswered attempt. A worker with no
-credentials cannot know it is a re-dispatch unless the controller tells it.
-
-**Measured on the live bucket 2026-09-07** (49,863 objects / 49,604 prefixes):
-**150 prefixes hold more than one object** (111×2, 23×3, 5×4, 3×5, 1×7, 1×8,
-1×10, 2×11, 3×12) plus **41 single-object prefixes at 960 B under a `1_1_` key**
-(two seq-1 events in one object), i.e. ~191, consistent with #769's 196. The
-largest are provably controller retries, not in-worker ones: the 12-object
-prefix's `workflow_executions` row carries `node_started` + **two
-`node_retrying`** + `node_failed`, i.e. **3 controller dispatches × 4 in-worker
-attempts = exactly 12 objects**, and 11–12 copies exceed the worker's own
-`RetryPolicy::default().max_attempts = 3` ceiling. Rate: ~1,300
-`module_executions`/day against 0–4 `node_retrying` events/day.
-
-**#769's mechanism sentence was wrong and the correction matters**: this is not
-"after a timeout". `execute_job_with_retry`'s `Err(_timeout)` arm RETURNS; the
-two arms that loop are an application-level failure and a NATS delivery/reply
-error. A reader sent to the timeout branch finds nothing.
-
-**The design.** `JobRequest.dispatch_attempt: u32`, `#[serde(default,
-skip_serializing_if)]`, appended to `signing_payload` as `:attempt=<n>` ONLY when
-non-zero and at the very END — so an all-default request is byte-identical on the
-wire AND in its MAC (pinned by the unchanged
-`job_request_signature_snapshot` hex plus a NEW non-default snapshot with its own
-JSON + MAC). `AuditEvent.dispatch_attempt` follows the same idiom into
-`calculate_hash`, so an attempt-0 event's hash and HMAC are byte-for-byte what
-they were and **every object already in the bucket keeps verifying** —
-`attempt_zero_event_hash_and_hmac_are_pinned` locks the literals, and the formula
-was additionally re-derived by an INDEPENDENT Python implementation against a real
-bucket object (stored `hash` and `previous_hash` both reproduced exactly), because
-a fixture that pins the code against the code cannot see a both-sides drift.
-`verify_chain` PARTITIONS by attempt and verifies each partition as its own chain
-**from the same genesis** — the attempt is a partition key, NEVER a genesis
-input, so an old chain and a new one are verified by one rule — and
-`verify_chain_anchored` partitions its anchor verdict the same way (two attempts
-carry two terminal anchors, which as one set read `MultipleAnchors`, a HARD
-failure, on a retried job). Within one attempt `DuplicateDelivery` and
-`DuplicateSequence` keep #769's meanings exactly; the CONTROL test proves a
-conflicting pair at ONE attempt still fails.
-
-**ONE stamping site, and that is structural rather than tidy.**
-`resign_payload_for_retry` sets the attempt before signing. Both call sites sit
-inside `if let Some(key) = worker_shared_key`, so a deployment with no WSK
-re-sends the ORIGINAL bytes — and that path **cannot produce a second chain at
-all**: `req.verify_dispatch` (nonce-replay included) runs in the worker ABOVE the
-ledger, so a replayed nonce fails before `execute_job_with_full_features` is
-reached. Every path that can write a second chain re-signs, and that is exactly
-the path that stamps.
-
-**Deploy ordering — measured in both directions, and the two are NOT symmetric.
-WORKERS ROLL FIRST OR TOGETHER**, the same rule the envelope-seal note carries,
-and the first draft of this paragraph got it backwards before the test was
-written. **Old controller + new workers is completely inert**: nothing stamps
-anything, every message is attempt 0, every byte identical. **New controller +
-old workers is safe for FIRST dispatches and refuses RETRIES.** Attempt 0 appends
-nothing, so an ordinary dispatch is byte-identical and an old worker verifies it
-exactly as before. A RETRY, though, is signed by the new controller over a
-payload ending `:attempt=1`, and an old worker's `signing_payload` cannot produce
-that segment — it does not know the field — so the two MACs differ and the old
-worker REFUSES the retry. Pinned by
-`an_old_worker_refuses_a_new_controllers_retry_but_accepts_its_first_dispatch`,
-which rebuilds the pre-field payload and asserts the signatures diverge (if they
-matched, binding the attempt would be a no-op). This is **fail-CLOSED and
-bounded**: the failure is a refused retry of an already-failing job, not a
-mis-verified one, and it lasts only for the width of the rollout — measured
-0–4 `node_retrying` events/day on the reference fleet. Roll workers first and it
-never arises.
-
-**Disclosed, never silent.** The sweep counts `ChainSweepStats::multi_attempt`
-and logs `jobs_with_multiple_attempts`; `security_audit`'s round-trip check names
-the attempt count on the chain it probed (because "4 events, verified" and "two
-dispatches of two" otherwise render identically — the same argument the
-`duplicate_deliveries` disclosure makes one axis over) and the sweep note carries
-the fleet count; the GraphQL job report gains `dispatchAttempts` and the
-aggregate `jobsWithMultipleAttempts`; `talos_audit_chain_multi_attempt_jobs_total`
-is pre-seeded at 0. **Nothing alerts on it** — a re-dispatch is the platform
-working as designed, and an alert here would train operators to ignore the one
-control that raises a true finding, which is the defect this change removes.
-
-**What is NOT closed, stated rather than implied.** (a) **Historical prefixes
-stay CONFLICTING.** Both copies carry no attempt field, so they partition into
-ONE attempt and `DuplicateSequence` is the correct answer for them — the fix is
-forward-only. They age out of the sweep's 2 h window; the ~191 already in the
-bucket are reachable only by an on-demand `verifyAuditChain`. (b)
-**`PipelineJobRequest` is deliberately unchanged.** The chain path CAN re-dispatch
-(`dispatch_with_retry` loops on a transport error), but it writes NO audit chain
-at all: the only non-test `ExecutionLedger::new` is in
-`execute_job_with_full_features` and the only `set_audit_ledger` is on the
-single-node path, so `execute_pipeline` mints neither — and every production
-entry point passes `ChainDispatch::Disabled` besides. A `dispatch_attempt` there
-would partition nothing that exists. (c) **The partition is only as good as the
-stamp reaching the worker.** No test in this workspace can drive
-controller-dispatch → NATS → worker → S3 end to end; the guard is the live read
-of the ledger after deploy, the position #767 and #769 both took about their own
-changes.
-
-**No lint check was added and `--count` stays 86.** Two candidates were measured
-first and both have a population of ONE, the bar this repo does not ship at. (i)
+## Engineering log — the decisions, kept
+
+Everything below is a DIGEST. The narrative that produced each decision moved
+VERBATIM to `docs/engineering-log/` (index: `docs/engineering-log/README.md`)
+because at 5,109 lines this file cost ~137k tokens at every session start and
+every agent brief, and it was growing ~200 lines per package. **The split is by
+KIND, not by age**: a rejected lint, a measured population, a `latent on this
+fleet` claim and a `deliberately NOT` are the record that stops the next session
+redoing work already done, so they stay HERE; the story of how each was found
+moved out. `scripts/check-engineering-log.py` proves mechanically that no line
+was lost and that every decision marker in the archive is named below.
+
+**What the split bought, measured rather than claimed** (so nobody re-measures):
+5,109 → 1,465 lines but 549,796 → 307,742 BYTES, i.e. **44%**, not the 71% the
+line count suggests — the removed narrative is hard-wrapped at ~78 columns while
+what stayed is not. ~137k → ~77k tokens per read. And the honest consequence:
+the 88 lint checks are now **52% of this file's bytes** (114 lines of ~1,400-char
+paragraphs), so the next attempt to halve this file has to start there, where the
+inline documentation IS the specification. An age-based archive was REJECTED and
+must stay rejected: 124 lines of this file carried a decision marker and they are
+woven into the prose, so cutting by date takes the decision with the story.
+
+**Rules for adding to this file.** A new package writes its decisions into the
+digest that owns the class, and its narrative into that class's archive file (or
+a new one, with a README row). If you cannot tell whether a paragraph is a rule
+or a story, it is a rule — leave it here.
+
+### The workflow-liveness / child-run family → [`2026-09-05-workflow-liveness-and-child-run-ledger.md`](docs/engineering-log/2026-09-05-workflow-liveness-and-child-run-ledger.md)
+
+**The class.** Operator-facing reports asserted a determinate negative for a
+state the reader could not represent — the misleading-report class (checks 74,
+76, 79/79b, 81) applied to `workflows`. Three pairs of columns/tables each
+carried two facts under one reading: `readiness_computed_at` vs
+`readiness_scored_at`; `workflows.status` vs `workflows.is_enabled`; and
+`workflow_executions` vs a sub-workflow child that writes no row there. RFC 0012
+(`sub_workflow_runs`, P1/P2/P3) is the answer to the third.
+
+**Decisions that must not be re-litigated.**
+* **The readiness columns are deliberately NOT collapsed** and the reason is
+  measured: the two scorers are not the same function (`get_readiness_exec_data`
+  excludes acknowledged failures, the background loop counts them), one timestamp
+  cannot say which produced the stored number, and a
+  `readiness_scored_at = COALESCE(...)` migration would relabel 35 background
+  scores as breakdown scores. The READER was taught to read both
+  (`classify_readiness_state`, one home).
+* **`workflows.status` and `workflows.is_enabled` are deliberately NOT collapsed
+  and there is NO migration flipping `is_enabled` on archived rows** — same
+  argument: two writers record two different operator acts, and a backfill would
+  relabel eight archives as pauses that never occurred. The predicate has ONE
+  home, the leaf crate `talos-workflow-liveness` (`is_live` / `is_dispatchable` /
+  `not_retired`); `dispatchable_sql` is deliberately NOT the dispatch gate's
+  predicate (it also requires `is_enabled`, an unauthorised second behaviour
+  change), and `not_retired_is_weaker_than_dispatchable` pins the two apart.
+* **Should `execute_subworkflow_graph` record a child `workflow_executions` row?
+  Answered NO**, measured before deciding: ~225 child runs/day (98.6% one
+  workflow); **163** `FROM workflow_executions` occurrences across 28 non-test
+  files of which exactly **2** filter on `parent_execution_id`, so recording
+  children would silently double-count in 161 places (every fleet total, error
+  rate and cost aggregate); `budget_precheck` counts execution rows, so a parent
+  with a child would be billed twice; and the retention sweep would split one
+  tree across two tiers. Shape B — a separate narrow table — shipped instead.
+* **A child's unmeasurable components are NOT renormalised.** Two renderings were
+  rejected and stay rejected: scoring the two components 0 of 100 (the
+  determinate negative), and scaling the measurable 30 up to 100 (which would
+  report a documented child as **100/100 fully production-ready** on zero
+  evidence — worse, because it is confident in the reassuring direction). A child
+  scores *N of `CHILD_MEASURABLE_MAX` (=30)*. What is unified is the BASIS,
+  deliberately NOT the reliability INPUT. `below_50_count` excludes unmeasurable
+  children with the exclusion disclosed; **`avg_score` is deliberately NOT
+  adjusted** (a population-wide SQL mean the page cannot correct) and says so.
+* **`LEDGER_MIN_RUNS` is 3**, argued from #762's own reasoning: 1 promotes on one
+  observation; 10 keeps a child that has demonstrably run nine times on a
+  denominator whose stated reason is "nothing can measure this"; 3 is the
+  smallest number from which a success RATE is a rate. The floor protects the
+  DENOMINATOR claim, not the arithmetic.
+* **Does a child's `draft` status mean anything at runtime? No, and this is worth
+  knowing before anyone "fixes" it by publishing.** `execute_subworkflow_graph` →
+  `WorkflowGraphStore::get_graph` reads the child's DRAFT `graph_json` column with
+  no version join, so `publish_version` changes nothing about how the parent runs
+  it and the "publish or delete" advice is half no-op and half destructive.
+  ARCHIVING a child, by contrast, DOES stop it being dispatched since the narrow
+  gate — so the unattended auto-archive sweep is now the most severe of the three
+  destructive draft paths, and the child-reference exclusions on it are
+  load-bearing.
+* **`ChildRunLedger::since()` is deliberately NOT user-scoped** — the question is
+  a deployment fact; a per-user `MIN` would render UNKNOWN forever for a user who
+  has legitimately never dispatched a child. **UNKNOWN is not zero** and **a child
+  run is NOT charged to the actor's hourly execution budget** — two
+  non-negotiables, recorded so nobody "fixes" them.
+* **`execution_cost_rollup` as a child-run proxy is KEPT and DEMOTED, not
+  deleted**: it is the only thing that can speak for the period before the
+  ledger's first row. Its measured worst case is **0%** recall (one child whose
+  parent ran 5085 times in 30 days has ZERO rollup rows and a proxy timestamp 45
+  days old). Once `ledger_since` predates the 30-day window it can be removed.
+* **`get_latency_percentiles_ms` / `get_performance_metrics` are deliberately NOT
+  collapsed into the unified SLA read** — they answer the latency DISTRIBUTION of
+  SUCCESSFUL runs, and folding a failed run's duration into `duration.p50` moves
+  a number an operator reads without being asked. `get_sla_window_stats` and
+  `SlaWindowStats` were DELETED rather than kept as a projection (they returned
+  `Option`, so a failed read and an empty window were one value).
+* **Folding zero-invocation children into `get_workflow_reuse_stats`' main list
+  was rejected** — that list is RANKED by the count they do not have; they get a
+  second list, `parent_dispatched`.
+* **The scheduler does NOT disable a schedule row on an archived-workflow
+  refusal.** Option (b) — disable on first refusal with a WARN — was rejected:
+  archiving is REVERSIBLE, so a self-disabling schedule makes un-archiving
+  silently not resume. The per-tick line is DEBUG (check 69's reason), the
+  durable signal is `talos_dispatch_refused_total` plus
+  `scheduler_dispatches_total{outcome="denied"}` — **DENIED, not SKIPPED**.
+* **Sites deliberately NOT gated by the archived-dispatch gate**, argued rather
+  than omitted: (1) resume and crash recovery (refusing would strand a waiting
+  approval gate — the gate is about what the platform will START); (2)
+  `test_workflow` / `test_workflow_draft` / GraphQL `testWorkflow` (an operator
+  testing one named workflow is not the platform deciding to run it, and refusing
+  removes the only way to check before un-archiving); (3) module replay.
+* **`__ops_alert__` and `__ml_distill__` remain ungated by the write ceiling** —
+  a DECISION, argued in the RPC-layer section above, not a remainder.
+* `AdvancedRepository::get_draft_workflows` is deliberately left child-blind
+  (report-only, no destructive action) and carries no lint marker; the reasoning
+  is in its own doc comment. **Deliberately NO force flag** on the auto-archive
+  sweep, mirroring `fix_all` — the escape hatch is an explicit operator action.
+* **30 + 30 = 60 days** is the execution lifetime and is kept deliberately
+  (decision 2026-09-06); `get_archive_policy` renders both tiers from
+  `resolve_retention_policy`, one parse.
+
+**Measured and NOT changed** (so the population is visible rather than
+rediscovered):
+* A graph-blind execution read misleads **26** surfaces, not one.
+* **No execution path in this workspace filtered on `workflows.status` at all**
+  before the narrow gate — proved with a scratch row against five verbatim
+  production reads. `is_enabled` is enforced in RUST, never in SQL, at four
+  places, and `bulk_trigger_workflow` / `enqueue_workflow` had none.
+* The hygiene REPORT counts a substantive draft as `deletable` while `fix_all`
+  excludes it — report/decision running the other way, advice a human reads,
+  recorded rather than changed.
+* `set_workflow_sla_threshold` still accepts a row with BOTH thresholds NULL;
+  the SLA report's denominator includes runs still IN FLIGHT, disclosed.
+* `controller/src/bootstrap/background.rs` is `mod bootstrap` inside `main.rs`,
+  so no integration test can call the readiness or SLA loop — deleting the loop's
+  `child_scans` lookup leaves every test green. Stated, not implied.
+
+**Latent on this fleet, stated plainly** (latent is not live, and it cuts both
+ways — the "no draft child on the fleet" claim was **refuted by the report's own
+output in the first run after it deployed**, because the query used to measure it
+was the one already fixed):
+* The substantive-draft rule: ZERO additional skips (36 workflows, 11 drafts, 2
+  with no execution row, one candidate at any window ≥7 days).
+* The archived-dispatch gate: the 8 archived rows have zero schedule rows and
+  zero webhook triggers, and there are **ZERO archived children under enabled
+  parents** — measured WITH A CONTROL (dropping the archived filter returns 6
+  real parent→child mentions). `resolve_by_capabilities` is the ONE site that is
+  NOT latent: all 8 archived rows carry non-empty `capabilities` and that
+  resolver is `ORDER BY updated_at DESC LIMIT 1`, so a retired workflow could be
+  the WINNING candidate.
+* The four RFC-0012 dispatch kinds P1 could not record; the `is_enabled` trigger
+  gate (nothing is currently disabled); the `get_archive_policy` jsonb drift
+  (`system_settings` held no rows at all); the lineage `child_runs ≥ 1` case; the
+  15-minute SLA loop.
+* `get_frequently_executed_unscheduled`'s sub-workflow exclusion is **vacuous on
+  the reference fleet today** — `HAVING COUNT(we.id) >= 3` already excludes every
+  pure child, so it bites only a hybrid, of which there are zero.
+
+**Lints: one shipped, five measured and rejected.**
+* **Check 87 SHIPPED** (`--count` moved to 87): *a `workflows` liveness predicate
+  must name the shared home*. FILE-scoped it reports 6 on pristine main of which
+  3 are the `workflow_schedules.is_enabled` false positive (50% precision) and it
+  would have been GREEN over the defect once any one of four correct siblings in
+  the same file named the home. WINDOW-scoped it reports **7 on pristine main,
+  0 false positives, 0 on the fixed tree** — **7-of-7 against the RULE, 1-of-7 as
+  a BUG detector**.
+* REJECTED — *"a reader that scores or counts from `workflow_executions` must
+  consult the child scan"* (`--count` stays 86): file-scoped 23 of 27 non-test
+  files, nearly all legitimate; narrowed to five reader methods it reaches 7 call
+  sites at ~71% precision and would ship at 2 markers; recall against the ~26
+  graph-blind surfaces is **27%**; and decisively it is blind to the background
+  loop, which reads executions with raw `sqlx::query_as` — a gate green over the
+  most consequential site in its own class.
+* REJECTED — *"a `workflows` read that feeds dispatch must name the liveness
+  home"* (`--count` stays 87): the 35 dispatch reads share no SQL shape with ~40
+  report reads (~50% precision at best); file-scoped it reports the 33 files
+  carrying any `FROM workflows` and ships at ~25 markers; and it is green over
+  its own defect, because every gate site now names the crate.
+* REJECTED — *"the substantive predicate has one home"* (`--count` stays 86):
+  1/1, trivially 100% precision, population ONE.
+* REJECTED — *"`talos_config::archive_after_days()` may be read only inside the
+  resolver"* (`--count` stays 86): 2 non-test sites, 1 real, 1 legitimate
+  (`history_window_days`), 50% precision over a population of two.
+* REJECTED — *"the ledger must be written"* (`--count` stays 86): population ONE
+  chokepoint. And the whitespace-run candidate: the correct-house-style rule fires
+  everywhere; the defect rule still reports the 17 legitimate sites on the fixed
+  tree — 0% precision at zero, 17 markers on correct code.
+* **No metric was added** to the 15-minute SLA loop and that is a measurement,
+  not an omission: the function has no `TalosMetrics` handle, so a series means
+  threading the registry into `spawn_late_background_tasks` for a loop that is
+  latent here. The unreadable-window signal is therefore prose-only and cannot be
+  alerted on.
+
+**Two measured SURVIVORS left open**: setting the SLA report's
+`child_runs`/`ledger_since` to `None`, and passing `None` for the risk check's
+ledger evidence, both leave every test green. The RISK one self-discloses
+(`reason: "ledger_not_consulted"`); the REPORT one is SILENT and its honest guard
+is the live read after deploy.
+
+### The swallowed-read / fail-open family → [`2026-09-07-swallowed-reads-and-fail-open-gates.md`](docs/engineering-log/2026-09-07-swallowed-reads-and-fail-open-gates.md)
+
+**The class.** An awaited repository read collapsed into a default, where the
+default becomes a count, a list, a verdict or a "not found" that a caller acts
+on. Measured, classified and burned to zero over five passes; the read-side
+companion inventory is `docs/swallowed-reads-inventory.md`, rendered by the
+checked-in `scripts/lint-swallow-classify.py` + `scripts/swallow-read-verdicts.py`
+(checked in because two earlier detectors were lost with their worktrees, and a
+CLAUDE.md sentence must not cite an artefact the merge discards). Also here: the
+MCP per-tool instrument (#786) and its outcome/class partition (#789).
+
+**The population, so nobody re-measures.** 210 collapsed reads at the start
+(110 claims / 67 decorative / 32 fail-closed / 1 detector FP; per spelling
+`.unwrap_or_default()` 66, `.unwrap_or(<literal>)` 55, `.ok()` 32,
+`match { Err(_) => default }` 26, `if let Ok(..)` 24, `.unwrap_or_else` 7) →
+193 → 175 → 164 → 153 → **121 sites, 0 claim**. The residue is 60 decorative,
+37 fail-closed, 31 false-positive and 1 nominal fail-open that is the repaired
+`dlq_updates` narrowing. **"Zero claims" means zero of the population this
+detector can see** — it is TEXTUAL, so a collapse reached through a helper in
+another crate or applied to an already-resolved local is invisible, and
+`if let Some(..)` over an Option-returning read is out of range.
+
+**The rule the class produced.** A gate that cannot read its rule must REFUSE; it
+must never GRANT. A report that cannot read a field renders `null`, never `0` or
+`[]`, through `talos_measurement::Readings`. One `Readings` per report — a second
+construction SHADOWS the first and publishes "complete: every field in this
+report was measured" over a nulled field.
+
+**Decisions.**
+* **The MCP instrument's labels are NOT pre-seeded**, and the cost is pinned by a
+  test so the argument cannot go stale: 19 lines per histogram series; 2356 bytes
+  for the first `(tool, outcome)` pair and 1656 for each additional one, moving to
+  2941 / 1996 when #789 added the `class` label; the full **~320 × 4** product
+  measured at #786 is ≈ 1,280 pairs ≈ 2.1 MB / ~25,600 lines, a 35× scrape — and
+  six outcomes since #789 make it worse, not better. Nothing alerts on
+  the series, so absent ≠ zero does not apply. If an alert is ever written, seed
+  the pairs THAT alert selects, never the product.
+* **Cardinality is closed by the COMPILER, not by convention**:
+  `canonical_tool_label` returns a `&'static str` borrowed from
+  `declared_tool_params()`'s own key, with `catalog_template` and `unknown`
+  sentinels; the guard is POINTER equality. `outcome` is an enum. Buckets are
+  `exponential_buckets(0.001, 2.0, 16)` — the house 15 tops out at 16.384 s,
+  below the 30 s target.
+* **`class` is a third label that adds NO series** (a pure function of `outcome`),
+  and it exists so an alert rests on the same predicate the log level does rather
+  than on a hand-maintained outcome alternation a seventh outcome would fall
+  outside of. Verified over the table AND over a real registry.
+* **The MCP error KIND travels out of band** (`#[serde(skip)]` on
+  `JsonRpcResponse::error_kind`): the OPERATOR needs the denied/failed split and
+  the CALLER must not get it (an existence oracle), and re-assigning wire codes
+  would move bytes MCP clients depend on. A `task_local` is lost by `tokio::spawn`
+  and mislabels a construct-and-discard; a reserved key inside `result` rests on
+  a strip running. **The LOG LEVEL was measured and deliberately NOT partitioned**
+  — #787 changed a level to fix NOISE (53% of WARN volume); the MCP line is one
+  per call at one level by design, and `class` joins it as a FIELD.
+* **The Helm chart is deliberately NOT changed for `pg_stat_statements`**, with
+  the cost stated: `shared_preload_libraries` is a POSTMASTER GUC, so on that
+  chart's single-replica StatefulSet enabling it is a full database outage for a
+  pod restart, plus a fixed shared-memory allocation. An operator's decision.
+* **`rotateEncryptionKey` PROPAGATES** an unreadable count (`1` was never a
+  placeholder — it is the version number an operator tracks, and `0` renders no
+  toast at all); **`clone_actor` does NOT** (the actor is already committed), so
+  `memories_copied` becomes an `Option` and an UNKNOWN count now RUNS the
+  embedding backfill rather than skipping it.
+* **The ~363 genuine `-32000` failures were deliberately NOT marked
+  `mcp_failed`** — their default is already `error`, so it is 363 lines of diff
+  for no behaviour change. **The nine `"Model not found"` sites in `ml.rs` were
+  NOT marked `NotFound`** and this is the sharpest limit of that package: they are
+  written `let Ok(Some(m)) = … else`, which routes a READ FAILURE into the
+  not-found branch, so marking them would assert a determinate negative in the
+  instrument. **The instrument cannot be more precise than the handler's own
+  read.** 102 constructor sites remain open (25 not-founds, 10 refusals, 67 with a
+  runtime-variable message).
+* **The lint pre-flight in `run_sandbox` was never a gate** —
+  `compile_to_wasm_with_config` runs the identical `analyze::lint_source_code`
+  pass and alone enforces the dependency allowlist and cargo-audit — so refusing
+  would take the tool off the air on its most likely `Err` (the 60 s compilation
+  semaphore). What was wrong was the SILENCE; it WARNs now.
+* `Ok(None)` from the capability-world ceiling read deliberately keeps today's
+  behaviour, matching MCP-545: the column is `TEXT NOT NULL DEFAULT
+  'minimal-node'`, so `Ok(None)` can only mean "no such actor row", and refusing
+  would make the authoring gate stricter than the runtime one.
+
+**Latent, stated plainly.** Both `fail_execution_from_worker` remainder sites
+(`webhook_triggers` holds ONE row with `module_id IS NULL`; the `talos.results.*`
+observer is "mostly dormant"). Both capability/embedding heal loops
+(`embedding IS NULL` = 0, `capabilities = '{}'` = 0 today — they fire on freshly
+created or imported workflows). `remove_member`'s last-owner guard, on a
+deployment with 1 `organization_members` row and 0 non-personal organizations.
+
+**Lints: none added, `--count` stays 88.** Every candidate, with its numbers:
+* *"a report handler must not default an awaited read"* (widening check 74's glob
+  to every handler): **73 on pristine main, 61 claims — 83.6% precision**, which
+  is not the problem; it would ship at **62**, i.e. a ratchet with a baseline,
+  and check 52's own rule is do NOT re-add a baseline. What ships instead costs no
+  check number: **sub-leg 74b's scope is DERIVED** (any function constructing a
+  `Readings`), so a handler enrols itself by adopting the ledger — and 74b fired
+  on the first lint run after the fixes, at a `JoinError` defaulting a filesystem
+  scan. The way to extend the coverage is to fix a handler, not widen a regex.
+* *"an enforcement decision may not be taken from a defaulted read"*: cannot be
+  spelled textually — the three worst gates were `if let Some(..)`, and widening
+  the binding leg to `Some(..)` takes it from **20 to 69** sites of which **3**
+  are the gates, ~6% precision.
+* *"a function may construct at most ONE `Readings`"*: population **1 → 0**.
+  Its sibling *"a ledger must be attached"* is worse: 30 constructions against 29
+  `attach` calls, and the one difference is legitimate — 1 false positive, 0 real.
+* *"a `mod common`-harness test binary must not hand-roll an `McpState`"*:
+  population FOUR in one directory; there is now exactly one `pub async fn
+  mcp_state`.
+* *"a caller of `fail_execution_from_worker` must derive `error_type`"*:
+  population TWO.
+* *"a metric label value must be `&'static`"*: not expressible — `Box::leak`
+  yields `&'static str` from a request string, so the type is not the property.
+* *"a new `tools/call` transport must call the instrument"*: population THREE
+  call sites already funnelled through one `pub` wrapper.
+* *"a refusal must not be constructed with the failure constructor"* (BUILT as
+  `scripts/lint-mcp-refusal-constructor-candidate.py`, kept so the numbers can be
+  re-derived): **258 sites on main, ~225 real (≈87%) — and 68 on the FIXED tree**,
+  43 false by construction. It ships as a ratchet with a baseline; narrowed it
+  still leaves ~28, **which are precisely the sites deliberately left alone** —
+  so it would pressure a future author into asserting a determinate negative in
+  the instrument. **A gate that pressures you toward the defect it is named after
+  is worse than no gate.** The structural alternative was priced too: making the
+  kind a REQUIRED parameter is **1583 call sites**.
+* *"the CLAIM verdict as a lint leg"*: 0 claim / 0 unclassified on the fixed tree
+  and 32 of 34 on main, and it still fails on three independent measurements — a
+  revert at a RECLASSIFIED site is completely green (the opt-out key is
+  `(file, function, callee, spelling)`, which cannot tell the pre-fix expression
+  from the post-fix one); the two mutations it catches are caught only because
+  the table still carries the PRE-fix verdict; and the ratchet arm fires on every
+  new collapsed read whatever its verdict — packages 29 and 31 each ADDED two
+  detector artefacts on CORRECT code.
+* The whitespace-run guards were measured and rejected twice: a literal-scoped
+  grep reports 6 on main (66.7%) and **2 on the fixed tree**, both legitimate; a
+  render-time collapse at `mcp_text` hides the defect rather than preventing it
+  and **would have covered two of the four at most**. Later re-measured with the
+  checked-in `scripts/lint-whitespace-runs.py`: **200 literals carry a ≥5-space
+  run and only 5 are defects** — ~2.5% precision, and even the mid-sentence
+  narrowing ships at 1 marker on correct code. **The CAUSE is now known**: a `\`
+  at the end of a line inside a Python `'''…'''` string is a Python line
+  continuation, so an edit script writing Rust `\`-continuations through a
+  non-raw triple-quoted string silently EATS them. Use a raw string.
+* Relaxing an "exactly once" metric-delta assertion to `>= 1.0` was REJECTED —
+  "exactly once" is what proves ONE record site writes both series; a
+  `SHARED_SERIES` mutex serialises the tests instead.
+
+**Measured SURVIVORS.** `MA7b` (the module-dependents INDIRECT scan) survives its
+DB binary and is caught only by check 74b — the two reads name the same columns
+of the same table, so no schema failure separates them. `M9` (reverting one of
+eleven `-32601` admin refusals) survives every test, because driving those needs
+a non-`*` `AgentIdentity` plus platform-admin state; the honest guard is the live
+read after deploy. `M8` is a NO-OP, not a survivor. `dlq_updates` gets no test.
+
+### The audit-chain verifier → [`2026-09-06-audit-chain-verifier-identity.md`](docs/engineering-log/2026-09-06-audit-chain-verifier-identity.md) and [`2026-09-07-dispatch-attempt-chain-partition.md`](docs/engineering-log/2026-09-07-dispatch-attempt-chain-partition.md)
+
+**The class.** PRESENCE IS NOT FUNCTION at the identity layer: the WORM audit
+bucket's verifier resolved credentials through the `AWS_*` chain, which on every
+deployment is the WRITE-ONLY controller identity, so chain verification had
+NEVER once succeeded — 48,946 prefixes written, 37 errored sweeps per hour, zero
+verified chains, and the `Err` arm incremented nothing. Then: the first sweep
+that ever ran called an identical redelivery "possible tampering", and a
+controller re-dispatch of one `job_id` wrote a second chain under one prefix.
+
+**Decisions.**
+* **Do NOT widen the writer's policy to "fix" verification.** A writer that can
+  also list and get is a writer that can survey and target what it wrote. The
+  verifier is a separate identity (`MINIO_VERIFIER_USER`, `audit_read_only`)
+  built from an EXPLICIT credentials provider with **no `load_defaults` on the
+  path**. The writer/verifier split is asymmetric ON PURPOSE: `process_batch`
+  dedupes within a batch and CANNOT dedupe across batches, because that means
+  reading the prefix. Cross-batch copies are classified at the verifier.
+* **`security_audit`'s `audit_chain_verification` weight is 0**, argued from
+  scratch: the grade bands are ABSOLUTE against a 100-point total, so an
+  eleventh weighted check re-grades every deployment and makes every earlier
+  score incomparable. The zero is not decorative — a broken arm is `Fail` +
+  `RoundTrip` + CRITICAL and lands in `status_counts.fail`.
+* **`talos_audit_chain_last_verified_ok_timestamp_seconds` is deliberately NOT
+  pre-seeded** — a zero seed reads as 1970 and would fire every staleness rule on
+  a healthy cold boot; `TalosAuditChainNeverVerified` carries an explicit
+  `absent()` arm instead and is gated on the sweep having run.
+* **Unverifiable is not verified-bad**: `talos_audit_chain_unverifiable_total` is
+  a SEPARATE series from `talos_audit_verification_failures_total`, and
+  `TalosAuditChainUnverifiable` is `warning` — it says the CONTROL is not
+  working, not that the ledger is bad. **Nothing alerts** on duplicate deliveries
+  or on multi-attempt jobs: at-least-once delivery and a re-dispatch are the
+  transport and the platform working as designed.
+* **The ledger is keyed per JOB and the operator asks per RUN; both grains are
+  reported and neither is folded into the other** (`roll_up_by_workflow_execution`,
+  WORST OUTCOME WINS). `LEDGER_KEY_SPACE` is named in every report so nobody has
+  to guess which table an id belongs to.
+* **`dispatch_attempt` is a PARTITION key, NEVER a genesis input** — an old chain
+  and a new one are verified by one rule from the same genesis. It uses the
+  conditional-append signing idiom, so an all-default request is byte-identical
+  on the wire AND in its MAC and **every object already in the bucket keeps
+  verifying**. **Deploy ordering: WORKERS ROLL FIRST OR TOGETHER.** Old controller
+  + new workers is completely inert; new controller + old workers is safe for
+  first dispatches and REFUSES retries (fail-closed, bounded by the rollout
+  width, 0–4 `node_retrying` events/day).
+* `PipelineJobRequest` is deliberately unchanged — the chain path writes no audit
+  chain at all, so a `dispatch_attempt` there would partition nothing.
+
+**Measured and NOT changed / latent.** `module_executions.workflow_execution_id`
+is NULLABLE and such a row cannot be verified — **0 of 48,577 rows platform-wide**,
+so LATENT; it is COUNTED (`ChainSweepStats::unbound`) rather than filtered out of
+sight, and `partition_sweep_rows` returns `(targets, unbound)` so a caller cannot
+obtain the targets without the count. The compose `minio-init` never created
+`MINIO_WORKER_USER` — dead env, closed separately. The chart's `minio-provisioning`
+Job remains LATENT: there is no production environment. Historical prefixes stay
+CONFLICTING — both copies carry no attempt field, so `DuplicateSequence` is the
+correct answer for them and the fix is forward-only.
+
+**Populations worth keeping.** 196 prefixes (0.40%) carried more than one
+terminal anchor — 35 byte-identical, 161 conflicting, and **a second boundary is
+the whole difference**, because `AuditEvent::timestamp` is whole seconds. Of
+those, ~150 are CONTROLLER re-dispatches, not in-worker retries. `MAX_JOBS_PER_SWEEP`
+moved 500 → **2000** (population is ~3.3× larger; a verification is ~30 ms).
+
+**Lints: none added, `--count` stays 86.** *"the verifier must not use the
+writer's credentials"* — population ONE, and the structural answer is stronger
+(a distinct env name, an explicit provider, and a test that reads the access key
+id out of the SigV4 header the SDK actually put on the wire, because
+`Config::credentials_provider()` is DEPRECATED and returns `None` unconditionally,
+so the obvious config-readback assertion would have passed vacuously).
 *"a conditional-append signing segment must have a non-default wire snapshot"* —
-`signing_payload` holds FOUR conditional segments (`:egress=`, the sealing block,
-`:idem=`, `:attempt=`) and exactly ONE has a non-default snapshot (the one added
-here), so the check would ship at 3 and the repo does not re-add baselines
-(check 52's own rule). (ii) *"`ExecutionLedger::new_for_attempt` must be the
-producer's constructor"* — `ExecutionLedger::new*` occurs ONCE in non-test worker
-code, which is the same population #769 measured and rejected for the same
-reason. The structural answers are stronger than a grep in both cases: the
-snapshot pair is in the same file with a docstring saying why there are two, and
-the ledger has one construction site the compiler funnels every caller through.
-
-**Instruments, and deliberately no alert.** Both counters are PRE-SEEDED
-(`talos_audit_ledger_duplicate_deliveries_total{scope="batch"}` — the only scope
-with a live increment site, because the writer cannot see a cross-batch copy —
-and `talos_audit_chain_duplicate_deliveries_total`). NOTHING alerts on either:
-at-least-once delivery is the transport working as designed, and an alert here
-would be the same train-the-operator-to-ignore-it defect the classification
-removes. `TalosAuditVerificationFailures` was REVIEWED and left unchanged
-because the change made it strictly MORE selective — a duplicate delivery now
-touches no series it selects — with two promtool cases pinning both directions
-(duplicates climbing fires nothing; a real break still pages while they climb).
-The sweep reports `jobs_with_duplicate_delivery` beside the verdict and never
-inside `failed`; `security_audit`'s `audit_chain_verification` renders a
-duplicate-only chain as PASS with the count DISCLOSED, because "2 events,
-verified" and "1 event delivered twice" otherwise render identically. The
-GraphQL surface exposes `duplicate_delivery` as a `kind` and a per-job
-`duplicateDeliveries` count.
-
-**No lint check was added and the count stays 86.** TWO candidates were
-measured first, and both have a population of ONE, which is the bar this repo
-does not ship at. (i) *"a `ChainBreak` consumer must branch on
-`is_tamper_evidence`, not `breaks.is_empty()`"* — measured workspace-wide,
-`breaks.is_empty()`/`breaks.len()` appears at **3 lines and none is a verdict**
-(two test assertions and `security_audit`'s Broken-arm count, itself fixed here
-to count tamper evidence only); `ok` is computed in exactly ONE place. (ii)
-*"the worker runtime may mint an `ExecutionLedger` only above the retry loop"* —
-`ExecutionLedger::new` occurs **once** in non-test worker code and
-`append_terminal_anchor` **once**. The structural answers are already stronger
-than a grep: `ok` has one home, `seal_job_audit_chain` is the one place an
-anchor is appended and the labelled block gives it one call site, and the
-`From<&ChainBreak>` GraphQL mapping is an EXHAUSTIVE match that FAILED TO
-COMPILE until the new variant was classified — which is the guard that a grep
-would only imitate.
-
-**The one measured SURVIVOR, stated rather than implied.** Reinstating a
-per-attempt `ExecutionLedger` inside
-`execute_job_with_context_and_timeout_internal` — i.e. the original defect —
-leaves all 639 `talos-worker-runtime` tests green. Nothing in the suite can
-observe it: the anchor's only externally visible effect is a NATS publish, and
-the retry loop needs a wasmtime engine, a compiled component and a NATS server
-to drive. What IS covered is the sealing RULE (`seal_job_audit_chain`'s four
-tests, three of which fail under their own mutations) and the classification the
-defect used to trip (`verify_chain`'s). The honest guard for the call site is
-the live read of the ledger after deploy — the same position #767 took about its
-sweep — not a test that does not exist.
-
-## Three artefacts that described a system that does not exist (2026-09-07)
-
-**PRESENCE IS NOT FUNCTION at the config and documentation layer** — the class
-"The verifier that could never read the ledger it verified" records one level
-up. A credential, a documented variable and a checked-in snapshot each LOOKED
-like the thing they named and were not it. None is a vulnerability; each is a
-statement an operator acts on that has been false for weeks or months, and in
-every case the artefact and the code drifted apart with nothing able to say so.
-
-### (W1) A credential for a principal that does not exist
-
-`docker-compose.yml` handed the WORKER `AWS_ENDPOINT_URL`,
-`AWS_ACCESS_KEY_ID = ${MINIO_WORKER_USER}`, `AWS_SECRET_ACCESS_KEY`,
-`AWS_DEFAULT_REGION`, `AWS_S3_FORCE_PATH_STYLE` and `MINIO_BUCKET` under the
-comment *"MinIO / S3 for audit ledger"*; the Helm worker Deployment mounted the
-same pair out of the bootstrap Secret as **REQUIRED** `secretKeyRef`s;
-`install.sh` generated and stored them; `values.yaml` declared them;
-`.env.example`, `QUICKSTART.md`, `scripts/setup-dev.sh` and `ci.yml` all
-carried them; and `deploy/helm/talos/README.md` called it a *"least-privilege
-worker writer"*. Three independent things were wrong at once, measured
-2026-09-07:
-
-* **The worker has no reader for those names.** `grep -rn 'AWS_\|MINIO_'
-  worker/src talos-worker-runtime/src` → nothing. The worker publishes audit
-  events to the NATS subject `talos.audit.ledger`; the CONTROLLER is the only
-  process that writes the object store.
-* **The principal does not exist.** `mc admin user list` on the live MinIO
-  (READ-ONLY) returns exactly two users — `talos-controller`
-  (`audit_write_only`) and `verifier-…` (`audit_read_only`). `minio-init`'s
-  script issues `mc admin user add` twice and names `$$MINIO_WORKER_USER`
-  nowhere; #767's `minio-provisioning` Job likewise.
-* **It was a REQUIRED key for an unread value.** Unlike the `OCI_REGISTRY_*`
-  refs three lines above it, the worker's `secretKeyRef` carried no
-  `optional: true`, so a bootstrap Secret without those keys wedges the Pod in
-  `CreateContainerConfigError`.
-
-Removed end to end. **On upgrade an existing bootstrap Secret keeps the two
-stale keys and nothing selects on them** — the only chart-wide consumer of that
-Secret's CONTENT is `talos.secretChecksum`, which hashes the live Secret, so
-unchanged extra keys keep the hash stable and trigger no bounce. They can be
-dropped at the next rotation.
-
-**The brief's own premise was partly refuted and the refutation matters**: the
-worker DOES have an S3 code path. `talos-worker-runtime/src/context.rs` reads
-`S3_ENDPOINT` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` / `S3_REGION` for
-the `talos:core/object-storage` WIT host functions, which only the
-`automation-node` (`Trusted`) world may import. Different names, different
-subsystem, deliberately unset everywhere — see (W2).
-
-**Adjacent break found in the same files and fixed here.** `scripts/setup-dev.sh`
-and `.github/workflows/ci.yml` both write a `.env` naming the DEAD worker pair
-and **not** `MINIO_VERIFIER_USER`/`_PASSWORD`, which #767 made a `${VAR:?}`
-requirement in `docker-compose.yml`. Compose interpolation is FILE-GLOBAL —
-verified empirically, `docker compose build a` on a two-service file fails on a
-`:?` in service `b` — so a fresh `make setup` produced a `.env` that could not
-bring the stack up at all, and `ci.yml`'s image build would have failed the
-same way. Latent only because both are `workflow_dispatch`/manual paths that
-have not run since #767.
-
-### (W2) Four documented variables that configure a different subsystem
-
-`docs/deployment.md`'s env table and its "S3 / MinIO Configuration" section
-both listed `S3_ENDPOINT` / `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY` /
-`S3_REGION` under the sentence *"Talos uses S3-compatible object storage for
-the audit ledger and module artifact storage"*. **Both halves are false and the
-failure is silent**: an operator on AWS who set exactly those four gets no
-error and a dark ledger. Measured: the ledger reads
-`AWS_ENDPOINT_URL`/`MINIO_ENDPOINT`, `MINIO_BUCKET`, `AWS_S3_FORCE_PATH_STYLE`,
-the SDK's `AWS_*` chain for the writer and `AUDIT_VERIFIER_*` for the verifier;
-and NOTHING in the workspace writes a module artifact to an object store
-(compiled WASM lives in `modules.wasm_bytes` and the OCI registry, and the only
-`put_object` callers are the audit ledger and `talos-offhost-backup`). The
-two-identities table twelve lines below was correct the whole time — the
-section contradicted itself.
-
-`docs/configuration-reference.md` already had it right (*"worker | S3 endpoint
-for module host storage"*), so it is now stated to be the AUTHORITATIVE list
-and `docs/deployment.md` points at it. Both files gained the region asymmetry
-that neither recorded: the VERIFIER resolves `AWS_REGION`/`AWS_DEFAULT_REGION`
-itself with a `us-east-1` fallback, while the WRITER takes whatever
-`aws_config::load_defaults` resolves — so a deployment setting neither can have
-a writer that errors on region and a verifier that quietly assumes one.
-
-**A lint was built, MEASURED and REJECTED; `--count` stays 86.** The candidate:
-*every backticked `UPPER_SNAKE` token in `docs/deployment.md`'s env tables must
-be read somewhere in `.rs`, compose, helm or a script.* Run against pristine
-`origin/main` it reports **2 of 49 tokens**, and neither is an `S3_*` — because
-the `S3_*` four DO have a reader, just not the one the doc claimed. **The
-detector is green over the entire defect it was written for**, which is the
-gate-that-doesn't-gate shape (#624, checks 64/65). It reports the same 2 on the
-fixed tree, so it would also ship above zero. What it DID surface is a third
-instance of the class, now corrected in the doc: `GRAPHQL_MAX_DEPTH` and
-`GRAPHQL_MAX_COMPLEXITY` are documented as tunables with defaults `10`/`5000`
-and are **hardcoded** `limit_depth(15)` / `limit_complexity(5000)` in
-`controller/src/bootstrap/services.rs` — so the name is not a knob and the
-documented depth default was not even the live value. No knob was invented
-(that is a behaviour change); the rows now say what is true.
-
-### (W3) A snapshot with a regeneration command and no gate
-
-`frontend/schema.graphql` is graphql-codegen's offline input. Measured: last
-regenerated 2026-07-27 (`aa173fa9`); the compiled schema is 2030 lines against
-the snapshot's 1870, a **186-line diff — 173 added, 13 removed** (the removals
-are doc-comment rewordings, not dropped fields, so the brief's "additive only"
-was close but not exact). Nothing in `frontend/src` queried a drifted name, so
-nothing was broken — it was a snapshot that stopped being true six weeks
-earlier and had no way to say so. Check 64's lesson: a sweep is a snapshot, not
-a gate.
-
-`talos_api::schema_sdl()` is now the ONE construction and both the
-`dump_schema` binary and
-`schema_snapshot_tests::the_checked_in_snapshot_matches_the_compiled_schema`
-call it — two expressions for "the schema" is how a writer and a checker drift
-apart. **Why a TEST and not a lint, argued rather than assumed**: the
-comparison needs the COMPILED schema, and `scripts/lint-structural.sh` has no
-Rust build on its default path (check 7's clippy is gated behind
-`TALOS_LINT_CLIPPY=1` precisely because a 60-90s build is too much), so a lint
-leg could only compare text to text — it could say the file exists and never
-that it is current. A `#[cfg(test)] mod` inside `src/` also runs in CI's
-ordinary unit job with no runner registration, so it cannot rot the way check
-64's hand-maintained `tests/`-binary lists do. Mutation-proved twice: one
-flipped field nullability, and the REAL pre-fix snapshot restored from `HEAD` —
-both red, restore green, and the failure message prints the exact regeneration
-command.
-
-**`schema.ts` needed its OWN gate, and the measurement is why.** It has zero
-direct importers but reaches 49 files through `graphql.ts`'s
-`export * from "./schema"`. Pinning `schema.graphql` proves the INPUT is
-current and says nothing about whether the derived output was regenerated —
-and on this tree both were stale TOGETHER, which is exactly why neither
-noticed. Nothing else in the frontend gate can see it: eslint EXCLUDES
-`src/generated/**`, and `tsc --noEmit` only fails when some file references a
-type the stale output is MISSING, so a snapshot that merely lacks new types
-typechecks perfectly. `quality.yml`'s frontend job gains a
-`npm run codegen && git diff --exit-code -- src/generated` step. Deliberately
-NOT in `make lint-frontend`: that target skips itself when
-`frontend/node_modules` is absent, and a gate that skips is not a gate.
-Determinism was verified rather than assumed — codegen run from two different
-starting states produced byte-identical output.
-
-### (W4) An improvements list that contradicted its own components
-
-Found LIVE 2026-09-07 12:03Z. The moment `pa-quality-judge` crossed RFC 0012
-P2's 3-run ledger floor, `get_readiness_breakdown` scored it `54/100`,
-`basis: "ledger"`, reliability `15/50` from `executions_30d: 3,
-source: "sub_workflow_runs"` — and `improvements[0]` in the SAME response read
-*"Execute the workflow at least once to establish reliability baseline"*,
-`points_available: 50`, `measured: true`. Check 74's contradiction shape, and
-both halves were computed correctly from DIFFERENT inputs: P2 moved the SCORE
-onto the child-run ledger and left the ADVICE keyed on the
-`workflow_executions` count, which is 0 for a sub-workflow by construction.
-
-`build_readiness_improvements` is now a PURE function that **does not receive
-that count at all** — its reliability and freshness inputs are the ones the
-score was computed from and the basis says which table they came from, so a
-caller cannot hand it a pair that disagrees with the score. Three more things
-the same reading fixed:
-
-* Two arms were gated on `!is_child`, so a LEDGER-measured child — back on the
-  full 100-point scale — was the only kind of row scored out of 100 that was
-  never told how to move 70 of those points. The gate is now
-  `is_unmeasurable_child`, the same predicate #770 chose for the `below_50`
-  exclusion and for the same reason.
-* `points_available` is `max − score` per component. The freshness arm fired
-  only at `freshness == 0.0` and offered a literal `10` where the gap is 20,
-  and said nothing at `freshness == 10.0` (8-30 days old) where the gap is 10 —
-  so `total_points_available` understated the real gap in both directions.
-* Every reliability/freshness line now names its `source` table. Two numbers
-  under one field name from two tables is how this stayed invisible.
-
-**`CHILD_UNMEASURED_REASON` was one release behind the ledger too.** It asserts
-reliability is *"read from that table and from nothing else"* — false the
-moment `sub_workflow_runs` holds a row, and `get_all_readiness_scores` prints
-`ledger_runs: 1` two fields above it in the same object. The per-workflow
-surfaces now call `child_unmeasured_reason(ledger)`, which is three-valued: no
-evidence → the constant verbatim; runs below `LEDGER_MIN_RUNS` → a sentence
-that says the ledger IS a second source and the shortfall is the COUNT, not the
-source; at or above the floor there is no unmeasured reason at all. The
-constant is KEPT for the population-level `why` in `get_all_readiness_scores`,
-where there is no one child's evidence to speak about.
-
-Reproduced before it was fixed: the renderer was extracted PRESERVING the
-pre-fix logic, the test seeded `ReadinessBasis::LedgerMeasured` at n=3 and
-failed with the live sentence in the assertion output, and only then was the
-logic replaced. Three mutations on the fixed tree are red (re-blinding ledger
-children via `is_parent_dispatched`; the literal-10 freshness arm; the
-below-floor reason reverted to the constant). `retry_warning_for` was lifted to
-one home in the same pass — it is rendered BOTH as an `improvements` entry and
-as `components.risk.detail.retry_warning`, and two copies of a predicate is two
-answers to one question in one response.
-
-### (W5) Check 55 stopped at the crates a background loop does not live in
-
-The SLA-breach monitor in `controller/src/bootstrap/background.rs` decoded the
-NULLABLE `workflow_sla_thresholds.notification_webhook` with
-`Row::get::<String, _>(..)` inside a `tokio::spawn`ed loop. `Row::get` PANICS
-on a decode failure; the NULL is not a corner case but the DOCUMENTED
-API-polling configuration that migration
-`20260404000001_nullable_sla_notification_webhook.sql` exists to allow. **A
-panic in a spawned background task is worse than one in a request handler**:
-nobody is waiting, nothing restarts it, nothing logs it beyond tokio's default
-stderr line — the alerter is simply off for the process lifetime while every
-surface still reports the thresholds as configured. Check 55's scope is
-DB-LAYER CRATES, so it structurally could not see a controller-bin file: the
-population was 5 and the check was green.
-
-Scope widened to `controller/src/bootstrap/` + `controller/src/main.rs`, and
-the qualification is measured on the same evidence the DB-layer crates were:
-`r`/`row`.get("…") in those paths is a sqlx row read in **5 of 5** occurrences
-and a serde_json `.get` in 0 — which is why mcp-handlers and the engine stay
-OUT of scope. Run against the real pre-fix file it reports exactly those 5 and
-0 on the fixed tree; two mutations (a reinstated bare read in `background.rs`,
-a fresh one in `main.rs`) are reported by line.
-
-**Note for whoever merges this**: `origin/main` advanced to #772 (RFC 0012 P3)
-mid-session and independently burned the same 5 sites down with the same
-warn-and-continue shape. This change carries the fix too so its own lint is
-green; the merge resolution there is "take either side". #772 did NOT widen the
-check, and did not touch the improvements renderer either — (W4) is still live
-on `origin/main`.
-
-**Recorded remainder, NOT fixed here: a spawned loop's death is invisible.**
-Measured 2026-09-07 — `controller/src/bootstrap/` + `main.rs` hold **63**
-`tokio::spawn` sites and **62** discard the `JoinHandle` outright. The
-sixty-third (`spawn_catalog_missing_wasm_gauge`) collects handles only to
-sequence a metrics gauge and awaits them as `let _ = h.await;`, discarding the
-`JoinError` as well. There is **no `std::panic::set_hook`** anywhere in
-`controller/` or `worker/`. So a panicking background loop produces one
-unstructured stderr line, no metric, no audit event and no restart, and every
-operator-facing surface keeps reporting the subsystem as configured. Building a
-supervisor is a separate change; what this one buys is that the most likely
-CAUSE of such a panic — a bare `.get` on a nullable column — can no longer be
-added to that directory silently.
-
-## A statement that has never once executed, rendered as "nothing here" (2026-09-07)
-
-Three surfaces asserted a determinate negative — the misleading-report class
-(checks 74, 76, 79/79b, 81) — with a cause none of those checks can see: **the
-SQL never ran.** `sqlx::query("…")` takes a runtime `&str`, so a statement
-naming a renamed column is invisible to rustc, to clippy and to CI's sqlx
-offline cache (which covers only the `query!` MACRO forms). The population is
-now measured and gated by **check 88**.
-
-**(Y1) `webhooks: []` from a statement that cannot PREPARE.**
-`AnalyticsRepository::list_workflow_webhooks` asked `webhook_triggers` for
-`endpoint_path` and `is_enabled`. That table's flag column is `enabled`, and
-there has never been an `endpoint_path` column **at all** — the endpoint is
-DERIVED from the id (`/webhooks/{id}`), which is why the statement could not be
-repaired by a rename and why `webhook_endpoint_path` now has ONE home. Its
-caller `get_workflow_dependencies` did `.unwrap_or_default()`, so `webhooks: []`
-and `webhook_count: 0` were a determinate negative on every call. **The brief
-named one statement; there were two** — `list_webhooks_for_modules` is
-byte-identical in its column list and feeds `list_workflow_triggers`, which DOES
-route the read through a `Readings` ledger, so that tool has been honestly
-reporting `webhooks: not_measured` forever. Both now bind `user_id` as well:
-the callers do gate ownership upstream, but `workflow_id` is not the tenant half
-and check 70's lesson is that a statement should not rely on caller discipline.
-All three reads in `handle_get_workflow_dependencies_list` now go through a
-`Readings` ledger, and each COUNT is marked derived exactly when ITS OWN source
-read failed — not whenever anything failed, because `module_count` comes from
-the graph and is still measured when the NAME lookup is not.
-
-**(Y2) A filter on a status the schema does not have.** `workflows_needing_schema`
-filtered `w.status = 'published'`. The lifecycle enum is `draft | active |
-archived` (migration `20260318000000`) and `handle_list_workflows` **refuses
-`published` as a filter value in so many words** — *"the schema has no rows with
-that value so accepting it would silently return an empty list"* — so the
-hygiene check reported `[]` and `count: 0` for every operator on every run.
-**The brief said nothing has ever written that value; that is refuted.** Exactly
-one writer does — `insert_published_internal_workflow`, used by
-`plan_and_execute_workflow` — and it writes `workflow_type = 'internal'` in the
-SAME INSERT, which the predicate's very next clause EXCLUDES. So the filter was
-not merely unmatched, it was **self-contradictory**: the only rows the status
-clause admits are rows the type clause rejects. (Live fleet: 0 at
-`status='published'`, 0 at `workflow_type='internal'`; 17 active / 11 draft / 8
-archived.) The same literal was in a SECOND reader the brief did not name —
-`ActorRepository::list_published_workflows_for_actor`, the **A2A agent card**,
-so every actor's card advertised ZERO workflows and an empty card was
-indistinguishable from an actor that owns none. Both now read
-`talos_workflow_liveness::live_sql`.
-
-**And the writer itself could never have written a row.** Driving
-`insert_published_internal_workflow` in a DB test fails `23502`: it omits
-`workflows.module_uri`, which is `NOT NULL` with no default, while every other
-graph-workflow INSERT in that file binds `''`. So `plan_and_execute_workflow`
-failed at its first write. **A PREPARE probe cannot see this** — the statement
-parses and plans perfectly and only a real INSERT trips the constraint — which
-is the sharpest statement of check 88's limits, and it was found by a test
-rather than by the probe.
-
-**(Y3) Three trigger paths, three different answers.** `trigger_workflow`
-refused `is_enabled = false` and nothing else; `bulk_trigger_workflow` and
-`enqueue_workflow` applied **no liveness predicate at all**. So an ARCHIVED
-workflow was dispatchable from all three and a DISABLED one from two — check
-78's "three of four entry points refused", one tool over. Archiving does **not**
-clear `is_enabled` (none of the five `SET status = 'archived'` statements touch
-that column), so on the reference fleet **all 8 archived workflows are
-`is_enabled = true`** and nothing protected them incidentally. The decision is
-`talos_workflow_liveness::is_dispatchable` — **deliberately NOT
-`not_live_reason`**, which the brief named: a DRAFT must stay dispatchable
-(`trigger_workflow` has always run one, a parent dispatches a child's draft
-`graph_json` with no status predicate, and 11 of 36 workflows here are drafts,
-4 with enabled schedules), so gating on LIVENESS would refuse those and create a
-NEW disagreement in place of the one this closes. `not_live_reason` answers a
-REPORTING question; a trigger gate is a DISPATCH question.
-`OrchestrationError::WorkflowNotLive` is a new variant rather than a reuse, and
-the exhaustive matches made the compiler name all four mapping sites — including
-`talos-evaluation`'s, whose `_` arm would have rendered a deliberate policy
-refusal as *"execution dispatch failed"* and sent an operator to look at NATS
-(check 81(c)'s shape). `WorkflowDisabled` is KEPT for `replay`, which asks the
-narrower question off a boolean it reads directly.
-
-**Two behaviour changes, both new refusals, both stated plainly**: an archived
-workflow can no longer be triggered from any of the three paths (it could from
-all three), and a disabled one can no longer be bulk-triggered or enqueued. Both
-gates sit ABOVE the graph load and the per-input loop, so a refusal costs no
-dispatch and no partial batch an operator has to cancel.
-
-**What was measured and NOT done.** The `is_enabled` gate is functional but
-LATENT on this fleet — nothing is currently disabled — so the only refusal this
-change can produce today is the archived one. The scheduler / webhook /
-capability-resolution dispatch paths are deliberately untouched. And no live
-trigger was fired against an archived workflow to demonstrate the pre-fix
-behaviour, because doing so would EXECUTE it on the operator's only
-environment; the evidence is the code (no path reads `status`, and
-`WorkflowRecord` has carried it the whole time), the schema, and the fleet
-counts above.
-
-**One finding recorded and NOT fixed**: `controller/tests/common`'s
-`create_test_organization` omits the `NOT NULL` `slug`, so it fails on every
-call. It is the same class inside the harness; its other callers are outside
-this change and `dead_statement_tests` seeds its own row instead.
-
-## Failures nobody can see: a dead binding, and a loop that stops (2026-09-07)
-
-Three surfaces where the platform could not SAY that something had stopped
-working. Not a misleading report this time — a missing one.
-
-### A push channel bound to a module the load cannot find
-
-**Measured live.** Four Pub/Sub deliveries arrived (19:41Z x3, 19:57Z x1) and
-every one failed with the byte-identical line
-`WARN talos_google_cloud::handlers: gcp pubsub: dispatch failed
-user_id=… error=load module for gcp dispatch`. Three things were wrong at once.
-
-**(a) The log said nothing.** `error = %e` renders `Display` on an `anyhow`
-chain, which prints only the OUTERMOST context — so
-*"Module not found or access denied"*, the `module_id` and the `channel_uuid`
-were all invisible. `{:#}` now renders the chain, the WARN carries
-`channel_uuid`, and the module-load context names the channel and the module.
-
-**(b) The module the channel names does not exist, and reading that took the
-service.** The row is `integration_state (google_cloud,
-watch/43773540-…)`, `value_format = 4`, so `module_id` is not readable from
-psql; a temporary example binary drove the real `SecretsManager` +
-`IntegrationStateService` (since deleted) and returned
-`module_id = 51ff1d27-9e16-49cc-a7cf-92d7d61b495d`,
-`display_name = "sandbox-monitoring"`, created 2026-07-17. That id matches **0
-rows** in `modules`, has **0** `module_executions`, and appears in
-`admin_event_log` **0** times — there is no record of how it went away. The
-INTEGRATION row is healthy. Population: the fleet has 2 push channels
-(`gmail`, `google_cloud`) and `google_calendar_watch_channels` is empty; the
-gmail row binds no module, so **1 of 1 module-binding channels is dangling.**
-
-**(c) Nothing durable was recorded, and the surface built for it was dark
-because its input had never been produced.** `watch_channel_service`'s
-`recent_failure` selects `event_type IN ('gcp_channel_push_rejected',
-'gcp_dispatch_failed')` — and `google_calendar_audit_log` held **zero** rows of
-either, ever, while carrying 18 rows for three other integrations. The cause:
-`dispatch_monitoring_incident` has SIX failure exits and only TWO wrote the
-audit row (signing, NATS publish). The four that fire in practice — module
-load, the module-bound ceiling refusal, execution-row create, job serialise —
-recorded nothing anywhere. **The fix is a wrapper, not a fifth call site**:
-`dispatch_monitoring_incident` is now a thin outer over
-`dispatch_monitoring_incident_inner` that writes exactly one row on any `Err`
-(chain-rendered), and the two inline calls are DELETED so a failure cannot
-write twice. A helper called at each exit is one forgotten call site away from
-this state; a wrapper over the whole body cannot be forgotten.
-
-**`module_name: null` was three states rendered as one**, and the read that
-produced it was `.unwrap_or_default()` (check 74's shape). `module_binding` is
-now four-valued — `none` (no binding) / `bound` / `missing` (set, and names
-nothing this user can load — **every push fails**) / `unreadable` (the lookup
-itself failed; calling that `missing` is a determinate negative over a query
-that did not answer). `classify_module_binding` takes the lookup's own
-`Result`, not a pre-flattened `Option`, and that is structural: with an
-`Option` the classifier is correct and the CALL SITE can still hand it
-`Some(HashMap::new())` on an `Err` — a one-line revert that **every test here
-SURVIVES** (measured). Reading the `Result` makes the collapse a deliberate
-rewrite; it does not make it impossible, and checks 74b/79b state that limit as
-their own.
-
-**What was measured and NOT changed.** `create_watch` gates the INTEGRATION
-(ownership-checked) and accepts ANY `module_id` uuid, so a typo mints a
-permanently-dead channel with no error and no trace — the most likely origin of
-this fleet's state. Not fixed, because a correct create-time gate needs a
-THREE-valued module-visibility read that does not exist: `get_module` folds
-"not found" and "DB error" into one `Err` (check 79's leg (b)), and
-`module_owned_by_user` has no `user_id IS NULL` arm so it DISAGREES with the
-dispatch predicate about a shared catalog module — a gate on either would be a
-third answer to a question that already has two. **No MCP tool lists GCP watch
-channels** (grepped; `get_public_url_status` only prints prose telling the
-operator to "list endpoints via the watch-channels API"), and
-`get_platform_hygiene_report` / `list_workflow_triggers` do not know push
-channels exist. Wiring one in would give `talos-hygiene-service` a dependency
-on `talos-google-cloud`, inverting its layering. Recorded.
-
-### A background loop can panic, or simply stop, and nothing says so
-
-Package 20 (W5) recorded this remainder and left it. **Re-measured with a
-statement-aware inventory** (`scripts/background-task-inventory.py`, added
-here): `controller/src/bootstrap/` + `main.rs` hold **54** `tokio::spawn` call
-sites — not 63; the difference is comment lines plus five uses of
-`tokio::spawn` as a FUNCTION VALUE handed to
-`async_graphql::dataloader::DataLoader::new`, which are not spawn sites — of
-which **45 are loop-shaped** and exactly **one** binds the `JoinHandle` (and
-discards the `JoinError`). `set_hook` occurrences in `controller/`, `worker/`
-and `talos-worker-runtime/`: **0**.
-
-**That 54 was a SCOPE, not a population — corrected 2026-09-08, one day
-later.** The same statement-aware walk over `talos-*/src` as well finds **127**
-further bare-spawn call sites in 34 crates, **28 of them long-lived loops**
-that nothing observes. Two of those crates held the loops the controller
-believed it was already supervising. A prior hand count put the library figure
-at 26 across ten crates; re-measured it is **24** for those ten (one site each
-in `talos-audit-ledger` and `talos-envelope-seal` is inside a `#[cfg(test)]`
-module) out of the 127. The inventory script's default roots are now the whole
-workspace, and its output classifies `supervised` / `handle` / `loop` /
-`oneshot` per crate so the remainder is a number rather than a guess.
-
-**Two instruments, and they answer different questions.** Both live in the new
-leaf crate `talos-task-supervision`.
-
-* `install_panic_hook(process)` — installed in BOTH binaries immediately after
-  the tracing subscriber, before anything can spawn. One structured line on
-  target `talos_audit`, `event_kind = "task_panicked"`, carrying `process` /
-  `thread` / `location` / a control-char-scrubbed 300-char message, plus
-  `talos_task_panics_total{process}`. It covers EVERY panic in the process,
-  including code nothing wraps. **It cannot name the task**: a tokio worker
-  thread is `tokio-runtime-worker` and the location is wherever the panic was
-  raised, usually a callee. The hook must never panic itself (a double panic
-  ABORTS), so the payload downcast falls back to a fixed string, the message is
-  truncated on a char boundary, and the counter is constructed before the hook
-  is installed.
-* `spawn_supervised(BackgroundTask, fut)` — applied at **41 of the 54**
-  controller sites plus **18 loops inside library crates** (7 in the first
-  2026-09-08 pass, 11 more in the second — see the sub-section below; it was
-  42 controller sites, one of which was a launcher — see below), and it sees
-  the shape a panic hook structurally CANNOT: **a clean exit.** A
-  loop that `break`s, or whose `while let Some(_) = rx.recv().await` ends
-  because the channel closed, returns `Ok(())` — no panic, no stderr line, no
-  trace at all, and the subsystem is off for the process lifetime while every
-  status surface still reports it as configured.
-  `talos_background_task_exits_total{task, outcome}`.
-
-The **12 sites not wrapped**, named rather than counted: three one-shot startup
-sweeps in `background.rs` that only LOOK like loops to a windowed scan
-(`grandfather_embedding_model`, the crash-recovery sweep, the actor-memory
-embedding backfill), three detached per-event tasks there, three in `main.rs`,
-two in `services.rs`, and the one handle-bound compile task. Each is a one-shot
-whose death is bounded to one event, and the panic hook still covers it.
-
-**Nothing is restarted, deliberately.** Restarting a loop whose panic is
-deterministic would spin, and deciding per-task whether a restart is safe is a
-separate change. What this buys is that the death is SAYABLE.
-
-**Cardinality.** `BackgroundTask` is an ENUM whose variants, labels and `ALL`
-array come from ONE macro table, so the label set is closed BY THE COMPILER and
-a variant that the pre-seed loop misses is not expressible — no hand-maintained
-parallel list, and therefore no lint. `EXIT_OUTCOMES` was three-valued
-(`panicked` / `completed` / `cancelled`): a `JoinError` is either a panic or a
-cancellation, and folding an abort into "panicked" would report a deliberate
-shutdown as a defect. **It is FIVE-valued from 2026-09-08** — `declined` and
-`shutdown` join it; see the correction below. Every series a process can
-increment is PRE-SEEDED at 0. **The `process` label
-is seeded with ONE value per process** — a `{process="worker"}` series on a
-controller would be a seeded combination nothing there can increment, which is
-the same defect as a dead metric. **That claim was true of `process` and FALSE
-of `task`, measured live 2026-09-08**: `register_metrics` walked the whole
-`BackgroundTask` table regardless of caller, so the WORKER's `/metrics` carried
-all 126 controller-only `(task, outcome)` pairs at 0 while the worker
-supervises nothing — seeded combinations nothing in that process can ever
-increment, which is check 58's own rule and the exact defect this sentence
-claims to avoid. The function now takes the supervised set as a required
-argument: the controller passes `BackgroundTask::ALL`, the worker passes `&[]`,
-and `the_panic_hook_is_wired_in_both_binaries` pins both. The
-count of series in this note was 127 (126 exits + 1 panic) per process; on the
-controller it is now `BackgroundTask::ALL.len() * 5 + 1` and on the worker it
-is **1**. The worker registers into
-`prometheus::default_registry()` (what `get_prometheus_metrics` gathers and
-`seed_circuit_breaker_series` already seeds into), so its series survives an
-OTEL exporter-build failure.
-
-**Two alerts, both `warning`, and the argument is not the refusal one.** A
-refusal counter fires when the policy is WORKING; a panic in a spawned task is
-never working as designed, so it has no legitimate steady state above 0 —
-`TalosTaskPanic`. `TalosBackgroundTaskExited` is the same argument for the
-shape the hook cannot see, and it is the one that names WHICH loop.
-`warning` rather than `critical` because the blast radius is one task.
-Three `promtool` cases in `observability/alerts_test.yml` (pinned
-`prom/prometheus:v2.48.0`), the first of which drives permanently-zero
-pre-seeded series and asserts SILENCE — the shape a healthy controller has for
-its whole lifetime, and the one an ABSENT series renders identically.
-
-**The wiring is guarded, because it is the half nothing else can see.** The
-crate's own tests prove the wrapper counts and logs; they cannot prove the 41
-loops go through it, and reverting one site is behaviourally identical on a
-healthy process. `task_supervision_wiring_tests` pins the supervised count, the
-deliberately-bare count, and the two one-per-binary call sites
-(`install_panic_hook`, `register_metrics`) — all three mutations red. Check 58
-cannot see any of this: it asks whether a `TalosMetrics` FIELD has an increment
-site, and these collectors are not `TalosMetrics` fields at all.
-
-### 2026-09-08 — the supervisor called two healthy returns a death, on its first boot
-
-**And nothing above could have caught it.** One second after the first boot
-under this instrument the controller logged, at ERROR on target `talos_audit`:
-`background_task_exited task="worker_fleet_management" outcome="completed"` and
-the same for `task="registry_sync"`. `talos_background_task_exits_total` summed
-to 2 across 126 series. **Both were false, and both are the healthy state of
-this fleet.** The correction below amends this entry rather than contradicting
-it: the two instruments, their argument, the no-restart decision and the alert
-severities all stand.
-
-* `registry_sync` awaits `start_registry_sync_loop`, which RETURNS when
-  `TALOS_REGISTRY_URL` is unset — disk seeding is the source of truth here, and
-  "dormant by config is not broken".
-* `worker_fleet_management` awaited a **LAUNCHER**:
-  `talos_worker_fleet::start_worker_management` spawns the heartbeat listener
-  and the prune loop itself and returns `Ok(())` at once. So the wrapper
-  supervised a function that was never going to run long, and the two loops
-  that matter were exactly as unobserved as they had been before it existed.
-
-**The wrapper's own FIRST LIVE READING is what found this**, and that is the
-part worth carrying. A wrapper over a launcher is behaviourally identical to no
-wrapper: no test in this workspace could see it, the count pin was green, and
-the crate's unit tests all passed. The live read after deploy is the guard
-#767/#769/#771 each named for their own changes; here it earned its keep on the
-day the change landed.
-
-**`TalosBackgroundTaskExited` did not fire, and the reason is a coin-flip.**
-`increase(...[15m]) > 0` read `inactive` only because both increments landed
-BEFORE the first scrape, so every sample in the series was already `1` and
-there was no rise to measure (verified against the live Prometheus: 40 samples,
-first and last both `1`). A scrape that caught the seed would have paged on a
-healthy boot. So the shipped state was an ERROR on every boot plus an alert
-whose silence depended on scrape timing — check 69's class, one day old.
-
-**Leg A — a declined start is not a stopped loop, and the TYPE says which.**
-The future's `Output` moves from `()` to `TaskExit`:
-`Declined(DeclineReason)` / `ShuttingDown` / `LoopEnded`. A genuine `loop {}`
-with no `break` has type `!` and coerces, so **every real loop compiled
-unchanged**; every body that CAN return had to say why, and the compiler
-enumerated that population instead of a grep — 20 controller bodies turned out
-to `break` on shutdown, plus the reaper's opt-in-flag return and the four
-delegate sites. `DeclineReason` is a CLOSED enum (`not_configured` /
-`feature_disabled` / `policy_not_explicit`) reaching a log FIELD, never a
-label; `outcome` remains the only label added and now has five compile-time
-values. `declined` and `shutdown` log at **INFO** under their own event kinds
-(`background_task_declined` with the reason, `background_task_shutdown`) and
-are excluded from the alert by `outcome!~"declined|shutdown"`. **`completed`
-keeps everything it had** — the ERROR line and the alert — because a loop that
-falls out is the finding this instrument exists for. `TaskExit::is_finding()`
-is the ONE predicate the log level and the alert selector both rest on.
-
-**`shutdown` is deliberately not folded into `declined`**, and the reason is
-this entry's own class: three of the five delegate bodies (both integration
-renewals and the workflow scheduler) run for the whole process lifetime and
-return only on the shutdown watch. Calling that "declined" would assert they
-never ran.
-
-**Leg B — supervise the loops, not their launchers.** `WorkerFleetManagement`
-is DROPPED from the enum rather than left as a series nothing can increment
-(check 58's rule); `worker_fleet_heartbeat` and `worker_fleet_prune` are
-supervised INSIDE `talos-worker-fleet`, which is allowed because
-`talos-task-supervision` is a leaf (`prometheus` + `tokio` + `tracing`) and
-check 67(b) forbids that crate only `sqlx`, `reqwest` and the identity
-repository. Six more library loops joined them —
-`audit_ledger_subscriber`, `envelope_seal_claim_responder`,
-`envelope_seal_orphan_sweep`, `integration_state_sweeper`, and the seven
-signed-RPC subscribers (one variant per subject, not one shared
-`rpc_subscriber`: the whole value of the `task` label is naming WHICH loop
-stopped, and a dead `talos.memory.op` subscriber times out every actor-memory
-call while `talos.state.write` keeps running).
-
-**The five "delegate" sites were not five launchers — READ, not assumed.**
-Only `start_worker_management` is one. `start_registry_sync_loop` runs forever
-after two config-gated returns; `gmail_renewal_task`, `channel_renewal_task`
-(one shared `run_renewal_scheduler`) and `run_with_shutdown` all run for the
-process lifetime and return only on shutdown.
-
-**The guard for a re-wrapped launcher needed TWO tests, and measuring which
-half each covers is the point.** The controller's count pin DOES catch the
-controller half (re-wrapping the launcher moves supervised 41→42 and bare 7→6,
-so it fails twice — measured). It structurally cannot see the OTHER half, the
-two inner loops reverting to bare `tokio::spawn` inside `talos-worker-fleet`,
-because its count is over `background.rs` alone. That half is pinned by
-`the_two_fleet_loops_are_supervised_not_their_launcher` in that crate, and by
-`the_fleet_launcher_is_not_supervised_here` on the controller side.
-
-**Expected live state on this fleet after deploy**, stated so it can be read
-rather than assumed: **zero** `event_kind="background_task_exited"` lines on a
-healthy boot; **zero** increments at `outcome!~"declined|shutdown"`; exactly
-**one** `talos_background_task_exits_total{task="registry_sync",
-outcome="declined"}` with an INFO `background_task_declined
-reason="not_configured"` line beside it. `worker_identity_reaper` is ENABLED
-here (`TALOS_WORKER_IDENTITY_REAP_ENABLED=1`), so it runs its loop and
-contributes nothing — on a fleet with that flag off it would be a SECOND
-`declined`, which is why the pre-fix boot showed two false exits and not three.
-The worker's `/metrics` loses all 126 exit series and keeps
-`talos_task_panics_total{process="worker"} 0`.
-
-**What was NOT done, with the reason** — SUPERSEDED the same day by the
-sub-section below, which classified all 28 by reading them and supervised
-eleven; the paragraph is kept because its LINT reasoning still stands.
-28 long-lived library-crate loops
-remain unsupervised, including six with no shutdown arm at all
-(`talos-actor-policies`' policy-cache sweeper, `talos-worker-runtime`'s epoch
-ticker and circuit-breaker cleanup, `talos-workflow-engine`'s rate-limit
-eviction, the worker's metrics-server rate-limiter cleanup). Each needs a
-`BackgroundTask` variant, a dependency edge and a return-type change in a crate
-whose loop shape has to be read first; they are enumerated with their
-classification in `scripts/background-task-inventory.py`'s output. **No lint
-was added and `--count` stays 88**: the candidate — "a long-lived
-`tokio::spawn` must go through `spawn_supervised`" — cannot tell a loop from a
-one-shot textually (the inventory's 60-line window misclassifies in both
-directions, and it reads 4 loop-shaped bare spawns in `background.rs` that the
-wiring test correctly calls one-shots), so it would ship at 28 markers on
-correct code. The in-file count pins are stronger and cost no check number.
-
-### 2026-09-08 (second pass) — the loops the wrapper still could not see, classified by reading them
-
-The entry above supervised the loops whose LAUNCHER the controller was
-already wrapping and recorded "28 long-lived library-crate loops remain
-unsupervised" as a remainder. That 28 was the inventory's WINDOW count, not
-a population: classifying every one of them by reading the body gives a very
-different answer, and the difference is the whole point of this pass.
-
-**Classification of the 28, by shape rather than by window.**
-
-| shape | n | verdict |
-|---|---|---|
-| (b)/(c)/(d) — a real exit path (`select!` shutdown arm, or a `Notify`-driven flush-and-break) | 8 | SUPERVISED |
-| (a) — pure `loop { tick; f() }`, no exit path, CONTROLLER process | 3 | SUPERVISED for panic attribution only |
-| (a) — pure ticker, WORKER process | 4 | recorded, NOT supervised |
-| dead code (`talos-jobs::start_processor`, zero callers) | 1 | recorded, NOT supervised |
-| window false positives (startup one-shots, per-connection, per-execution, a test-only file, a demo binary) | 12 | not loops |
-
-**The eight with a real exit path are the ones this instrument exists for**,
-and they are supervised: `bcrypt_cache_revocation_sweep` (the sweep that
-bounds the MCP bearer-token revocation window),
-`memory_consolidation_scheduler`, `memory_reflection_scheduler`,
-`rank_training_scheduler`, `ml_disagreement_digest`, `ml_policy_evaluator`,
-`ml_teacher_audit` and `dlq_batch_processor` — the last of which is the
-sharpest: its `Notify` arm flushes the in-memory batch and `break`s, so a
-premature stop leaves every later DLQ write dropped at the channel with no
-signal anywhere. Each `break` is now `break TaskExit::ShuttingDown`, so the
-compiler named the exit rather than a grep.
-
-**The three controller-side pure tickers are supervised for ATTRIBUTION and
-nothing else, and saying so is the point.** `actor_policy_cache_sweep`,
-`public_url_discovery` and `engine_rate_limit_eviction` have no `break` and
-no shutdown arm; their bodies have type `!`, they cannot exit cleanly, and
-the only death they can have is a panic the process-wide hook ALREADY
-counts. What the wrapper adds is a `task` label instead of
-`tokio-runtime-worker`. That is worth exactly the one line it cost — the bar
-the brief set — and it must not be read as closing a silent-death gap those
-three do not have.
-
-**The four remaining real loops are all in the WORKER and are NOT
-supervised**: `talos-worker-runtime`'s circuit-breaker cleanup
-(`circuit_breaker.rs:325`) and epoch ticker (`runtime.rs:71`), the
-job-idempotency sweep (`worker/src/main.rs:2407`) and the metrics-server
-rate-limiter cleanup (`metrics_server.rs:199`). All four are pure tickers,
-so the same attribution-only argument applies — but the COST is different
-and that is the deciding fact: `BackgroundTask::ALL` is what the CONTROLLER
-pre-seeds, so a worker-side variant seeds five controller series nothing
-there can increment, which is the exact defect the worker's
-`register_metrics(.., &[])` argument was added on 2026-09-08 to remove.
-Supervising them costs a PROCESS PARTITION of the shared enum, not one
-line. The epoch ticker costs more again: it returns a `JoinHandle` that four
-`worker/tests/kill_switch_tests.rs` cases `abort()`, and `spawn_supervised`
-hands back the OUTER handle — aborting that does not stop the inner task, so
-the wrapper would silently leak a ticker per test.
-
-**`talos-jobs::start_processor` has a correct shutdown arm and zero callers
-workspace-wide** — `grep -rn start_processor --include=*.rs` returns its own
-definition and nothing else, and its `process_next_job` is a stub returning
-`Ok(())`. Supervising dead code seeds five series nothing can increment,
-which is check 58's rule read the other way, so it is recorded rather than
-wrapped. The other twelve are the window's false positives and are
-enumerated with their reasons in
-`scripts/background-task-inventory.py`'s docstring, so the next reader
-classifies none of them twice: three startup one-shots plus the
-deliberately-bare fleet launcher in `background.rs`, the PER-EXECUTION
-epoch-fence heartbeat in `talos-engine/src/fence.rs` (supervising it would
-record one exit per workflow run), two per-SSE-connection tasks, one
-per-stream SSE reader, a test-only file the `#[cfg(test)]` strip cannot see,
-and a hand-run demo binary.
-
-**The pins.** `talos-worker-fleet`'s in-crate pin covers its two loops and
-`task_supervision_wiring_tests` covers `background.rs`; neither can see any
-of the eleven new sites, and re-baring one is behaviourally identical on a
-healthy process. Each of the ten touched files now carries a
-`task_supervision_pin` module asserting its own supervised and bare spawn
-counts. The COUNTING RULE has one home —
-`talos_task_supervision::production_spawn_counts`, which strips everything
-from the first column-0 `#[cfg(test)]` so a pin's own prose cannot vouch for
-a deleted call (check 73's self-report trap) — while the ASSERTION stays in
-the crate that owns the file, because only that crate knows how many of each
-it should have. Stated limits, inherited by all ten: TEXTUAL and per-FILE,
-so it cannot say whether a site wraps the RIGHT future or names the right
-`BackgroundTask`, and it cannot see a loop moved to another file.
-
-**Expected live state on this fleet after deploy**, so it can be read rather
-than assumed. **Zero** `event_kind="background_task_exited"` ERROR lines on
-a healthy boot, and zero increments at `outcome!~"declined|shutdown"` — the
-2026-09-08 first-pass expectation is unchanged, because every one of the
-eleven new bodies either runs forever or stops only on the shutdown watch.
-`talos_background_task_exits_total` gains 55 pre-seeded series on the
-CONTROLLER (11 tasks × 5 outcomes) and **none on the worker**, which still
-passes `&[]`. Three of the eleven are config-gated ABOVE their spawn and
-their series therefore sit at 0 on a deployment that has not enabled them —
-`memory_consolidation_scheduler` / `memory_reflection_scheduler`
-(`ENABLE_MEMORY_CONSOLIDATION`), `rank_training_scheduler`
-(`ENABLE_ADAPTIVE_RANK_TRAINING`) and `public_url_discovery`
-(`TALOS_NGROK_API_URL`). That is NOT check 58's defect: this process can
-leave that state by configuration, unlike a `{process="worker"}` label on a
-controller. The gate was deliberately left ABOVE the spawn rather than moved
-inside the body to manufacture a `Declined` — each already logs an INFO
-saying it was not spawned, and moving it would be a behaviour change bought
-for a nicer-looking series.
-
-**No lint was added and `--count` stays 88.** The candidate is the one the
-entry above already measured and rejected — "a long-lived `tokio::spawn`
-must go through `spawn_supervised`" — and this pass makes the rejection
-sharper rather than weaker: of the 28 rows the 60-line window called loops,
-**13 were false positives (46%)**, so a lint on that signal would ship at
-thirteen markers on correct code and would still miss a loop whose `loop {`
-sits past the window. The per-file count pins are stronger, cost no check
-number, and were mutation-proved (see below).
-
-### The scheduler refusal counter: six survivors, not one
-
-Package 24 recorded ONE surviving mutation on `talos_dispatch_refused_total`.
-**No such series exists** — the instrument is
-`talos_scheduler_dispatches_total{phase,outcome}`, written through one
-`record_dispatch` helper — and deleting each of its **17** call sites in turn
-found **SIX** survivors, while the `denied` site the note points at was already
-caught. The two existing guards cover different things and neither covers the
-six: `record_dispatch_moves_every_seeded_series` drives the WRAPPER, which is
-exactly the property that stays true when every call site is deleted (check
-58's stated wrapper limit); `every_terminal_path_records_an_outcome` is
-anchored on a bare `return;`, and two of the six are the neighbour-vouching
-limit that test DOCUMENTS actually happening, while the other four — the
-wall-clock-timeout arm and the three tail arms (`completed`, `fenced`, the
-terminal `failed`) — reach their end with no `return;` at all.
-
-`every_recording_site_is_still_there` pins the per-outcome call-site count
-(`completed 1, failed 10, skipped 3, denied 2, fenced 1`) plus a tripwire that
-every call in the region is enumerated. **Re-running all 17 mutations against
-it: 17 caught, 0 survivors.** One thing measured rather than reasoned: the
-tripwire's first version counted `record_dispatch(` and read 18 on a HEALTHY
-tree, because the function's own DEFINITION sits inside the scanned region.
-
-**"The other pre-seeded paths" — the number is 29, and they are RECORDED.**
-`talos-metrics` pre-seeds 29 collectors; mutation-testing all of them is ~80
-build+test cycles and was not attempted. What WAS measured, in the same crate
-and therefore cheap: all three `scheduler_readiness_*` publish sites SURVIVE
-their own deletion — the pure `decide_hold` is well tested, the wiring that
-publishes it is not. **CLOSED 2026-09-08 — see the sub-section below.** The cheap substitute ("does any file referencing the
-collector contain an assertion") was built and REJECTED: it answers yes for 28
-of 29, i.e. it only proves the file has tests somewhere. A grep cannot answer
-"would deleting this call site turn a test red"; only mutation can.
-
-**No lint check was added and `--count` stays 88.** Two candidates were
-considered and both are answered structurally instead. "A long-lived
-`tokio::spawn` must go through `spawn_supervised`" has a population of 54 in
-ONE file and no way to tell a loop from a one-shot textually (the 60-line
-window in the inventory script misclassifies three of 45 in both directions) —
-the in-file count test is stronger and costs no check number. "Every
-`BackgroundTask` must be pre-seeded" is not expressible as a defect: the enum
-and the seed list come from one macro table.
-
-### 2026-09-08 — the three publish sites that survived their own deletion, and one narrowing nothing drove
-
-Two entries above recorded MEASURED SURVIVORS and left them: all three
-`scheduler_readiness_*` publish sites, and `dlq_updates`' permission
-narrowing. Both are the same shape one level under check 58's stated wrapper
-limit — the counter HAS an increment site and nothing asked whether anything
-reaches it — and both are closed by moving the DECISION and the PUBLISH into
-one function a test can drive, rather than by testing a wrapper.
-
-**The scheduler readiness barrier.** `decide_hold` and `clear_holds_and_rearm`
-are pure and well tested; the `.inc()` / `.set(1)` / `.set(0)` beside them sat
-in `SchedulerService::hold_or_degrade` and `::note_fleet_visible`, which need a
-pool, a module registry, a secrets manager, a worker manager, a
-module-execution service and a NATS client to reach — so no unit test could
-touch them and all three deletions were green. The transition AND its publish
-now live in the free `readiness_hold_or_degrade` /
-`readiness_note_fleet_visible` over the production atomics, and the two `&self`
-methods are one-line delegates.
-`the_readiness_publishers_move_the_series` installs a REAL `TalosMetrics` and
-asserts on DELTAS (`set_global` is a process-wide one-shot `OnceLock`) that a
-hold moves `talos_scheduler_readiness_holds_total`, that crossing the bound
-sets `talos_scheduler_readiness_degraded` to 1, that an already-degraded poll
-does NOT re-count, and that a visible fleet returns the gauge to 0. **All three
-previously-surviving mutations are red under it.** The residual is stated
-rather than implied: the one-line delegate inside each method is still
-unreachable from a unit test, so deleting IT survives — the same call-site
-limit checks 74b/79b state as their own, and the honest guard is the live read
-of the two series after deploy.
-
-**A flake this change INTRODUCED and closed, recorded because it was measured
-rather than reasoned.** The first version of that test called
-`talos_metrics::set_global` itself, and the sibling
-`record_dispatch_moves_every_seeded_series` already did — under a comment
-saying *"This is the only test in the crate that installs the process-global
-metrics registry … keep it that way"*. `set_global` is a one-shot `OnceLock`,
-so whichever test won the race installed ITS registry while the loser asserted
-against a local `Arc` no production site writes to: one failure under
-`cargo test --workspace`, green on every re-run of the crate alone. Both tests
-now go through `installed_test_metrics()`, which RETURNS the installed global
-and installs only if there is none — one ACCESSOR is a stronger rule than one
-installer, and it is the rule a third such test will inherit for free.
-
-**`dlq_updates`' permission refresh.** #779 made an unreadable refresh NARROW
-to own-events-only rather than KEEP the prior set — the one outcome that
-defeats a refresh whose entire purpose is to notice a revocation — and recorded
-it as untested, because the decision lived inside an `async_stream::stream!`
-body in a GraphQL resolver needing a schema, a broadcast channel and a live
-subscription. It is now
-`talos_api::schema::subscriptions::refresh_dlq_permissions`, which performs
-both reads and returns the narrowed `DlqPermissions`;
-`controller/tests/fail_open_gate_tests` drives it against a real database with
-`organization_members` DROPPED and, separately, with
-`users.is_platform_admin` RENAMED away, each with its healthy CONTROL in the
-same run (a non-admin keeps its real org list; a real admin still bypasses the
-filter with the list deliberately cleared so a demotion forces a re-fetch).
-Two mutations are red: an `Err` arm that preserves admin visibility, and one
-that returns a non-empty org set. The extraction ALSO makes the pre-fix
-behaviour unrepresentable — the function has no prior set to preserve — which
-is the structural half, the same move `ReadinessBasis::from_scan`'s deletion
-made. Same residual: a stream body that calls it and discards the answer
-survives, and that is a dataflow question rather than a textual one.
-
-**A comment corrected in the same pass.** The block above
-`PERM_REFRESH_INTERVAL_SECS` still read "on refresh failure (DB hiccup),
-preserve the previous permission set rather than failing closed" — false since
-#779, i.e. a comment asserting a safety property the code deliberately dropped
-(#732's class). It now says what the code does and why.
-
-**No lint check was added and `--count` stays 88.** The candidate — "a metric
-publish must have a test that moves the series" — is not expressible as text:
-the defect is that nothing REACHES an increment site that plainly exists,
-which is check 58's own stated limit and needs a call graph rather than a
-grep. The population here is four sites; the structural answer is that the
-decision and the publish are now one function, and mutation is what proved it.
-
-### 2026-09-08 — the channel nobody could see, validate, or be told was dead
-
-Package 25 (2026-09-07) made every failed push to the dangling GCP channel write
-an audit row and log the ids, and recorded three remainders WITH REASONS: no MCP
-tool lists push channels, `create_watch` never validates the `module_id` it
-binds, and the hygiene report does not know push channels exist. All three are
-closed here, and each reason held — none was re-argued.
-
-**What was refuted before anything changed.** The brief said the GCP watch row's
-`idx_ts_1` was unused; it is `last_push_received_ms` (the storage table in
-`watch.rs` says so, `upsert_row` binds it) and BOTH live watch rows carry it.
-That makes the rejection of "write the module id into an index slot" STRONGER,
-not weaker: all three usable slots are occupied and the fourth (`idx_int_1`) is
-a `bigint`. And the brief's "GCP is the only module-binding channel" is a fact
-about the FLEET, not the code — **gmail's create takes a caller-supplied
-`module_id` and validated it no more than GCP did**, while its summary resolved
-module names with `.unwrap_or_default()`, the exact collapse #778's
-`classify_module_binding` had removed one integration over. GCal's REST create
-passes a literal `None`, so its only module-binding caller is the GraphQL
-`create_module_from_template`, which binds a module it created three statements
-earlier — safe by CONSTRUCTION, not by validation, and one refactor away from
-not being.
-
-**The RED measurement.** On pristine `origin/main`, driving the production REST
-handler: a create naming a random uuid returned `200 OK` and landed a row, with
-both controls (a real module; no module at all) green. The live row that
-motivated all of this — `integration_state (google_cloud, watch/43773540-…)`,
-display name "sandbox-monitoring", created 2026-07-17 — names a module matching
-**0** of 112 rows in `modules`, 0 `module_executions` and 0 `admin_event_log`
-entries.
-
-**The gate has ONE home**, `talos_integration_helpers::watch_binding::
-check_module_binding`, because the mapping from a three-valued visibility read
-to a refusal IS the decision and two copies of a decision is two answers. The
-READ it consults is new: `talos_registry::module_visibility::{module_visibility,
-visible_module_names}`, sited beside the dispatch-time `get_module` whose
-predicate it is pinned equal to — `get_module` folds "no such row" and "the
-query failed" into one `Err`, which is correct for a dispatcher and is exactly
-why package 25 could not build this gate. `ModuleVisibility` is `#[must_use]`
-with no `Into<Option>`, no `is_visible()` boolean and no `.ok()` (the
-`ExecutionLookup` / `WorkflowDispatchLookup` shape).
-
-**The two refusals are ONE caller sentence and TWO operator `event_kind`s.**
-Splitting "no such module" from "not yours" in the reply is a module-existence
-oracle for anyone who can guess a uuid (`caller_facing_unauthorized`'s argument,
-#754's collapsed `write_ceiling_unreadable`). `Unreadable` is a SEPARATE,
-retryable refusal at 503: refusing with "that module does not exist" while the
-database is the broken thing is the determinate negative checks 74 / 79 / 81
-exist to remove, and the create is still refused because a channel minted on an
-unverified binding is what the gate is for. The gate runs ABOVE the create lock
-and above any upstream API call, so a refusal leaves nothing behind — asserted
-on ROWS, not on the returned status, because a status assertion alone passes on
-a tree where the write would have failed anyway. `CreateWatchError` is a typed
-enum rather than one `anyhow::Error`, so the compiler asked both GCP call sites
-and both gmail ones how they render it; pre-fix every failure rendered
-`500 "Failed to create watch channel"`, which is right for an internal error and
-wrong for a request the caller can fix.
-
-**Deliberately NOT gated: the RENEWAL path.** `create_fresh_watch_locked` /
-`create_fresh_watch_channel_locked` re-use an already-admitted binding, and
-refusing a renewal because the module was deleted meanwhile takes a LIVE watch
-off the air rather than stopping a new one being created wrong — #777's resume
-argument. GCal's refusal is flattened into `anyhow` rather than typed, and the
-reason is measured: it has no caller for whom 400-vs-503 is actionable.
-
-**The operator surface is ONE trait in a NEW leaf crate**,
-`talos-push-channel-inventory` — `PushChannelInventory`, `PushChannelRow`, the
-four-valued `ModuleBinding`, `classify_module_binding` (MOVED from
-`talos-google-cloud`, not copied) and the `PushChannelInventorySet` newtype that
-hides the `dyn`. It is leaf on purpose: `talos-mcp-handlers` and
-`talos-hygiene-service` sit BELOW the integration crates and the edge the other
-way is the layering inversion package 25 refused. It deliberately does not
-depend on `talos-integration-helpers` either — that pulls in secrets-manager,
-envelope-seal, memory and reqwest — so `RenewalFailure` is re-expressed as a
-three-field `PushChannelFailure` and converted at each integration. **A
-`PushChannelRow` carries no push token, no endpoint (the GCP endpoint embeds the
-raw token) and no payload**, pinned by a unit test AND by a DB test over a real
-row.
-
-**All THREE integrations are enrolled**, including gcal, whose channel count on
-this fleet is ZERO. A survey that silently covers two of three is the
-misleading-report class one level up. Each impl is a POOL-ONLY struct rather
-than the watch service: it can then be built whether or not that integration's
-push RECEIVER is wired (a watch ROW outlives `GCP_PUBSUB_AUDIENCE`, and a
-channel invisible because a receiver env var is absent is exactly the failure
-being reported), and it cannot create a watch, so it can never race the create
-lock. `list_rows_for_user` became a free function in each `watch.rs` and the
-service method delegates, so the two readers cannot drift.
-
-**`list_push_channels` is a tool of its own, and the default was argued.**
-`list_workflow_triggers` is keyed by WORKFLOW; a push channel binds a MODULE and
-carries no workflow id at all, so this fleet's one live example would have
-appeared under no workflow however that tool was extended. The hygiene report
-carries the FINDING; the tool carries the INVENTORY, including the healthy
-channels the report deliberately says nothing about. `None` inventory renders
-`channels: null, measured: false` — never `[]`.
-
-**The hygiene section obeys "nothing to say ⇒ no key" (#762).**
-`PushChannelReadout` is THREE-valued: `NotConsulted` (this process wired no
-inventory — SILENCE, not zero, and it contributes nothing to `total_issues`,
-which has never spoken about push channels) and `Surveyed`, which emits
-`dangling_push_channels` + `push_channel_survey` only when there is a finding, an
-unclassifiable binding, or an unreadable integration. A fleet whose channels are
-all healthy gets a byte-identical report — pinned by a test that compares every
-key. `unclassifiable` (the module lookup did not answer) is disclosed SEPARATELY
-and is not counted as dangling: that would put a pool timeout in the same bucket
-as a permanently dead channel. An integration whose LIST read failed goes in the
-`Readings` ledger, so `total_issues` and the severity buckets NULL and
-`degraded_recommendation` names the field. Severity is `critical` in BOTH the
-bucket and the recommendation — a bucket and a recommendation disagreeing about
-one finding is the contradiction-in-one-response class, and the first draft here
-had exactly that (bucket `high`, recommendation `critical`).
-
-**`build_report` and `HygieneService::new` both take the readout as a REQUIRED
-parameter, and that is a measurement rather than taste.** With a
-`with_push_channels(..)` builder, deleting the two lines in `create_router` that
-called it left EVERY test in the workspace green while the report silently
-stopped mentioning push channels — mutation M9, the call-site class checks 74b
-and 79b name as their own limit. As a parameter the compiler asks every site.
-It still cannot stop a caller answering `None`, so `push_channel_wiring_tests`
-pins the wiring in `create_router`'s source (the `task_supervision_wiring_tests`
-shape), with a tripwire that fails loudly if the scanned region ever vanishes.
-
-**Eleven mutations, two initial SURVIVORS, both closed.** M4 — reverting the
-classifier's argument to an already-flattened map, the one-line collapse its own
-doc warns about — survived until a DB test dropped the `modules` relation and
-asserted `Unreadable` rather than `Missing`. M10 — deleting gmail's gate —
-survived because gmail's create calls Google and cannot be driven end to end;
-closed by a test that asserts WHICH refusal comes back, with a control that gets
-PAST the gate and fails downstream instead. M5 (a module name rendered beside a
-`missing` binding) is recorded as a NO-OP mutation, not a survivor: the name map
-cannot contain a non-`Bound` id by construction, so the guard is defence in
-depth and no test can distinguish it.
-
-**No lint check was added and `--count` stays 88.** The candidate — "a watch
-create that accepts a caller-supplied `module_id` must consult the gate" — was
-BUILT (`scripts/lint-watch-module-binding-candidate.sh`, kept so the numbers can
-be re-derived) and MEASURED on both trees. On pristine `origin/main` it reports
-**19 sites of which 3 are the real create entry points — 15.8% precision** (the
-other 16 are struct fields, summary projections, admin JSON parsing, the
-classifier's own signature and a test helper), and on the FIXED tree it still
-reports **10, every one legitimate**, so it would ship at ten markers on correct
-code. Worse, 3 of the 8 it calls "gated" are the `_locked` renewal helpers that
-must NOT be gated and read as gated only because they share a file with the gate
-— check 86(a)'s file-scope limit in a name-glob's clothing. The structural
-answers are stronger: one `pub` gate, `ModuleVisibility` with no boolean
-projection, a typed `CreateWatchError` whose `ModuleBinding` variant can only
-come from the shared gate, and DB tests driving all three integrations.
-
-**What is NOT covered, stated rather than implied.** `list_push_channels` has no
-test through the production MCP `dispatch` — that needs a full `McpState`, which
-this binary does not build; its pure halves (the survey, the classification, the
-row's redaction) are covered by DB tests and the handler body is not. Gmail's
-and gcal's `module_binding` field on their REST summaries has no test. The gcal
-inventory attaches no `recent_failure` (that enrichment is a method on the full
-service handle); stated on the impl rather than silently omitted. And on THIS
-fleet the audit table holds **zero** `gcp_%` rows, so package 25's
-`recent_failure` enrichment has nothing to show yet — `module_binding: "missing"`
-is the only signal the dangling channel will produce after deploy.
-
-### 2026-09-09 — the data plane had no instrument, and its log partition called a designed state a failure
-
-**`record_rpc_metric` recorded no metric.** The function's NAME asserted one;
-its body was two `tracing` calls. Measured live: `curl /metrics/prometheus |
-grep '^talos_rpc'` returned exactly SIX series, all of them #760's
-`talos_rpc_write_ceiling_refusals_total`, all at 0 — nothing counted a call, an
-outcome or a latency on ANY of the seven subjects, while 1317
-`module_executions` in 24 h drove the memory / database / graph ones. #760's own
-entry had already MEASURED this ("`talos_rpc` is a TRACING TARGET ONLY … no RPC
-counter was registered") and then added a counter for ONE outcome on THREE
-subjects — the fixed-the-path-not-the-population shape this file names
-repeatedly. And the gap is the other half of a question #783 closed one side of:
-a subscriber that DIES is sayable (`talos_background_task_exits_total`); one
-ALIVE and erroring every call was invisible in every machine-readable channel.
-
-**The partition was binary, and its own comment described one the code did not
-have.** `outcome == "ok"` -> `debug!`, everything else -> `warn!`, under a
-comment reading *"Failure outcomes stay at warn!/info!"* — there was no `info!`
-arm and `git log -S` shows there never had been (#732's class). Two
-consequences. (a) The whole SUCCESS volume was at `debug!`, which this
-deployment enables for exactly one target and it is not this one, AND uncounted
-— so **zero** `rpc completed` lines exist in the controller's entire log. (b)
-Every non-ok outcome was an alarm: **17 of the controller's 32 WARN lines (53%)
-were ONE designed state**, `talos.ml.predict` / `not_promoted`, one per hour for
-seventeen consecutive hours, unbroken, and it is the only non-ok outcome this
-fleet has ever produced. The producer is identifiable: the fleet's ONLY
-hourly-on-the-hour schedule classifies against the `ops-severity` model, whose
-`lifecycle_state` is **`llm_only`** — the FIRST position on the documented ladder
-(`llm_only -> shadow -> hybrid -> fast_primary`), where
-`serve::state_serves_production` is false and every prediction falls back to the
-LLM by construction. `MlRpcError::NotPromoted`'s own doc is a statement of fact
-("Model exists but has no promoted version to serve"); its sibling
-`NotAvailable`'s is *"the RFC's loud lifecycle failure mode"*. **The enum
-already separated the designed state from the failure; only the log level did
-not.** Check 69's harm, on the one channel this subsystem had.
-
-**The instrument.** `talos_rpc_calls_total{subject,outcome,class}` (counter,
-PRE-SEEDED) and `talos_rpc_duration_seconds{subject,outcome,class}` (histogram,
-deliberately NOT seeded). `record_rpc_metric` now takes `RpcSubject` /
-`RpcOutcome` and two `Duration`s; the LOG LINE is byte-identical (same field
-names, same integer milliseconds, same messages for the served and finding
-arms), so no operator's saved filter breaks.
-
-**The label sets are closed BY THE COMPILER, not by convention.** The brief
-recorded that both parameters were already `&'static str` and every argument at
-every call site was a literal or a `match`-bound local — true, and not the same
-thing: `&'static str` also accepts `Box::leak(caller_supplied.into())`, which is
-#786's own stated caveat about its `tool` label — that instrument is the same
-shape on the other half of the request surface, and it types its OUTCOME as an
-enum for this reason while leaving `tool` a `&'static str` because ~320 tools
-make an enum impractical there. With 7 subjects and 18 outcomes BOTH axes are
-affordable here, so `talos-metrics/src/rpc.rs` carries ONE macro
-table per axis from which the enum, the label, the class and the pre-seed loop
-all derive. `actor_id` stays a LOG FIELD and must NEVER become a label — it is
-caller-supplied and unbounded, i.e. a cardinality DoS surface reachable by
-anything that can publish to the subject.
-
-**The seed set is 64 pairs, not 126, and both numbers were measured.** Each
-subject's declared outcomes are exactly what ITS subscriber can pass — its own
-literals plus every arm of its own exhaustive terminal `match`. The cross
-product would seed 62 combinations no call site can reach, which is check 58's
-own defect (the one the worker's `register_metrics(.., &[])` argument was added
-to remove). Every one of the 64 was checked for a live PRODUCER rather than
-merely an exhaustive arm; the ones worth naming are `memory.op`/`write_ceiling`
-(reachable only through the terminal match, produced at `lib.rs:1915`/`:1965`)
-and both `storage_full`s. **Two of the brief's own counts were refuted**: 41
-production call sites, not 49, and **18** distinct outcome literals, not 13.
-
-**The HISTOGRAM is deliberately unseeded, and the reason is narrower than
-"expensive".** The absent-vs-zero rule is a rule about COUNTS: a seeded
-histogram over zero observations renders every bucket 0, `_sum` 0 and `_count`
-0 — exactly what the seeded counter at 0 already says — and
-`histogram_quantile` over it is NaN either way. Measured cost is 21 lines per
-observed pair against the counter's 1 (pinned by
-`the_rpc_instrument_costs_the_lines_the_seed_decision_assumes`, so the number in
-this paragraph cannot go stale silently). Buckets are
-`exponential_buckets(0.0005, 2.0, 18)` = 0.5 ms … 65.5 s: the house default of
-15 tops out at 16.4 s, BELOW `PERMIT_GUARD_TIMEOUT_SECS` (30 s), and the
-semaphore queue sits OUTSIDE that guard, so one call can exceed it.
-
-**Timings are `Duration`, not the pre-rounded milliseconds the call sites used
-to pass**, and that is a measurement rather than taste: every `queue_ms` and
-`exec_ms` this fleet has ever logged is `0`, so a histogram fed `as_millis()`
-would put 100% of observations in its bottom bucket — an instrument that reports
-nothing, which is the defect this change exists to remove.
-
-**Three labels, and the third one is what stops an alert regex rotting.**
-`class` is a pure FUNCTION of `outcome`, so it adds ZERO series (each pair has
-exactly one class) and it buys the one thing PromQL cannot do for itself: rest
-`TalosRPCSubjectFailing` on the SAME `RpcOutcome::class()` the log level rests
-on. Without it the alert would spell `outcome=~"internal|timeout|…"`, a
-hand-maintained alternation that a nineteenth outcome would be added to the
-enum, classified correctly, logged correctly and silently fall outside — check
-74's own recorded rot mode.
-
-**The classification, derived per outcome from its enum's own documentation.**
-Names follow #780's `TaskExit::is_finding()`, because the question is not "did
-the platform fail" but "should someone look". `Served` (`ok`) -> `debug!`.
-`Declined` -> `info!` — the arm the old comment CLAIMED: `not_promoted`,
-`not_found`, `invalid`, `too_large`, `storage_full`, `always_blocked`,
-`disallowed_function`, `statement_not_permitted`. `Finding` -> `warn!`:
-`unauthorized`, `replay`, `write_ceiling`, `stale_deadline`, `not_available`,
-`query_error`, `connection_failed`, `timeout`, `internal`.
-
-Four of those are worth the argument. **`unauthorized` is a Finding**, not a
-decline: it IS a refusal, but on a transport where every legitimate sender holds
-the fleet-shared `WORKER_SHARED_KEY` it means clock skew, a half-rotated key, or
-a sender that should not be there — the brief's own class-2 definition ("a
-designed state the operator has not misconfigured") excludes it. Live count on
-this fleet: **0, ever**, so keeping it loud costs nothing today. The
-caller-facing reply is UNTOUCHED — `caller_facing_unauthorized` still collapses
-every rejection reason and `every_unauthorized_arm_blinds_its_reply` still binds
-all seven arms. **`replay` is a Finding** on the same argument. **`not_found` /
-`invalid` are Declined**: caller errors, the caller is told (identically for
-every reason), and the calling module's own execution fails through the ordinary
-channel, so the operator is not blind — and nothing about the reply changes.
-**`query_error` is a Finding on BOTH its producers even though one of them is a
-caller error, and that is a compromise stated rather than hidden**: on
-`database.query` it is the GUEST's SQL failing, but on `state.write` it is the
-CONTROLLER's own `execution_state` UPSERT failing — silent to the guest by
-contract, and MCP-733 deliberately made it WARN *"so SIEM / dashboard alerting
-can fire on sustained query_error outcomes"*. One label cannot say both;
-classifying it Declined would silence a live decision. The counter separates
-them by `subject`. **`write_ceiling` is a Finding** because #760 already decided
-this exact question in this exact direction and ships a `warning` alert on it.
-
-**ONE alert, `TalosRPCSubjectFailing`, `warning`, and the refusal class gets
-none.** The established position — a counter on the policy WORKING gets no alert
-— covers `Declined` entirely, and the promtool case that matters drives
-`not_promoted` climbing on every sample and asserts SILENCE. The FINDING class
-is the open question C6 names, and it is alerted: a subject whose calls are
->50% findings, with >=5 findings in the window, sustained 10 minutes. A RATIO
-because every one of these subjects has failure modes that are normal at low
-rates; the `>=5` floor because a single timeout on a quiet subject would
-otherwise hold the ratio at 1.0 for a whole rate window. **It cannot fire on an
-idle fleet**: the seeds make the series exist, their rate is 0, the denominator
-is 0, and 0/0 is NaN. Five `promtool` cases pin all of that, including the
-permanently-zero one, and the FIRING case was mutation-proved non-vacuous.
-**`unauthorized` gets NO alert of its own**, argued rather than omitted: this
-fleet has produced zero, so any threshold is a guess and the obvious one fires
-on a rolling deploy's clock skew — the counter makes it graphable and the
-metric's HELP carries the query. The alert can CO-FIRE with
-`TalosRPCWriteCeilingRefusals` when the finding class is dominated by
-`write_ceiling`; that is disclosed in its own annotation rather than papered
-over with a hand-maintained exclusion that would rot.
-
-**Guards, and what each covers.** `the_declared_table_matches_the_source`
-(in `talos-rpc-subscribers`, where both the table and the call sites are
-visible) splits `lib.rs` at the seven subscriber headers and compares the
-`RpcOutcome::` tokens per region against `RpcSubject::outcomes()` in BOTH
-directions — an undeclared outcome would be an ABSENT series, a declared one
-nothing emits is check 58's defect. It fails LOUDLY if the scan finds fewer than
-60 pairs or if a subscriber is renamed away.
-`the_rpc_instrument_seeds_exactly_the_reachable_pairs` asserts all 64 present at
-0 on a cold registry and NO pair outside the table.
-`controller/tests/rpc_instrument_tests` (CTRL_TESTS, sub-leg 64b) drives the
-REAL `spawn_memory_rpc_subscriber` over real NATS against real Postgres and
-asserts the counter moved by EXACTLY one on a served call, that a decline lands
-on its own series, that a refusal ABOVE the handler is counted, that a subject
-nothing was sent to did not move, and that the actor id appears NOWHERE in the
-exposition.
-
-**Two measured SURVIVORS, both closed rather than recorded.** (1) The
-histogram's OBSERVED VALUE: reverting it to `exec` alone — dropping the
-semaphore queue wait, i.e. the only part of an RPC that grows under
-backpressure — left every test in the workspace green, because every observed
-duration on this fleet is 0 either way. Closed by
-`the_duration_histogram_observes_queue_plus_exec`, which also pins the
-sub-millisecond resolution and therefore makes the pre-rounded-milliseconds
-revert red. (2) The LOG LEVEL had no test at all: the class table is pinned by
-name, and nothing pinned that the level rests on it, so both shapes of "put the
-designed state back on the alarm channel" were silent. Closed by
-`the_log_level_rests_on_the_outcome_class`, which captures `target: "talos_rpc"`
-events and asserts the mapping for all 18 outcomes (a new dev-only
-`tracing-subscriber` dependency; the production graph is unchanged).
-
-**What was measured and deliberately NOT changed.** A THIRD metric family,
-`talos_rpc_queue_duration_seconds{subject}`, was considered and declined: the
-existing doc comment says the queue/exec split exists so operators can tell
-backpressure from downstream slowdown, and the histogram measures the TOTAL, so
-that split now lives in the log alone. Three reasons. Backpressure is
-structurally unreachable at the measured volume (1317 module executions per 24 h
-≈ 0.9/min against per-subject in-flight caps of 8 / 16 / 32, and every observed
-`queue_ms` is 0); the saturation signal SURVIVES the collapse as its own outcome
-label, because `stale_deadline` IS the queue outrunning the caller's deadline;
-and the split is unchanged in the log line. Stated as a limit rather than sold:
-an operator who wants queue-vs-exec attribution still has to read the log.
-`talos-metrics` gained NO new dependency — it was already a direct dependency of
-`talos-rpc-subscribers` (#754 added it), verified by reading the manifest — and
-the seven subject strings are DUPLICATED into `talos-metrics` rather than
-imported, because `talos-memory` would invert the layering; they are pinned to
-their originals by `the_subject_table_matches_the_wire_constants`, exactly
-#760's `RPC_WRITE_CEILING_SUBJECTS` precedent. `TalosMetrics::new()` is
-CONTROLLER-only (`grep` finds it nowhere in `worker/` or
-`talos-worker-runtime/`, neither of which depends on the crate), so these 64
-series cannot be seeded into a process that can never increment them — #778's
-worker regression is not reachable here.
-
-**No lint check was added and `--count` stays 88.** The brief's own candidate —
-*"a call site must pass an outcome from the closed table"* — is answered by the
-TYPE SYSTEM: mutating one to `Box::leak(req.actor_id.to_string().into_boxed_str())`
-does not compile. The GENERALISATION was built and measured instead
-(`scripts/lint-rpc-label-closure-candidate.sh`, kept per #781 so the numbers can
-be re-derived): *"every Prometheus label value must come from a closed
-compile-time set"* inspects **121** `with_label_values` arguments workspace-wide
-and flags **73** as not provably closed — and essentially every one is CORRECT
-(a `&'static str` parameter bound by an enum's `as_str()` one frame up, a
-`pub const`, or a `kind.metric_label()` helper). It reports the same 73 on
-pristine `origin/main` and on the fixed tree, i.e. 0-for-0 as a bug detector,
-and would ship at seventy-three markers on correct code. It cannot be narrowed,
-because the defect it exists for is a `&'static str` whose VALUE came from the
-caller and no textual rule can tell that from one whose value came from an enum
-one frame up — a dataflow question. The structural answer is what shipped.
-
-**Expected live state on this fleet after deploy**, so it can be read rather
-than assumed. `/metrics/prometheus` gains **64** `talos_rpc_calls_total` lines,
-all at 0 until traffic; the histogram exports NOTHING until a first call.
-`talos.memory.op` / `talos.database.query` / `talos.graph.search` should show
-`{outcome="ok"}` climbing. The hourly `talos.ml.predict` line moves from WARN to
-INFO and starts incrementing `{outcome="not_promoted",class="declined"}` — so
-the controller's WARN volume should fall from 32 to about 15, and
-`TalosRPCSubjectFailing` should stay silent: `not_promoted` is `declined` and
-the finding class is expected to remain 0 on every subject.
-
-### 2026-09-09 — a chart that crashed on the runs an operator most wants to see
-
-`get_execution_waterfall` computed `bar_len.clamp(1, chart_width - bar_start)`
-with `bar_start` capped at `chart_width`, so a row where
-`start_ms >= total_ms` evaluated `clamp(1, 0)` — **min > max, which panics**. A
-panic in an MCP handler unwinds the tokio task, so the caller gets a DROPPED
-REQUEST rather than an error, and nothing in the response says why.
-
-**Reachable, and not on the shape the earlier note guessed.** That note recorded
-it as "a node's start equals the run's total". Measured against the live fleet
-2026-09-09 by driving the handler's own arithmetic over `workflow_executions`
-joined to `execution_events`: **2 of 10,729** completed executions trip it, and
-both are `failed` long-running runs whose last `node_started` landed **21 s and
-30 s AFTER `completed_at`** — not a tie, an inversion. The cause is two writers:
-`total_ms` comes from the EXECUTION's `completed_at` while every `start_ms` is an
-offset from that NODE's own event, so a node event written after the execution
-was finalized reads as starting past the end. So the tool crashed precisely on
-the class of execution — failed, long-running — an operator is most likely to
-open a waterfall for.
-
-The geometry moved to the pure, total `bar_geometry`, which is panic-free for
-every input including `total_ms <= 0` and `chart_width == 0`. `start` now caps at
-`chart_width - 1` rather than `chart_width`: a zero-width bar renders a row
-claiming the node did not run, and it is what inverted the clamp.
-
-**Not panicking is only half of it.** `BarGeometry::beyond_total` is the other
-half, because a bar silently pinned to the right edge asserts the node ran AT the
-end when the data says it started PAST the end — the misleading-report class
-(checks 74/76/79/81) in a chart. Such rows are marked inline and the chart
-carries a footer naming the count, the total it is drawn against, and the
-two-writer reason, so the reader is not sent hunting a rendering bug.
-
-**What was measured and NOT changed.** The finalization ordering itself — a
-`node_started` written after its execution's `completed_at` — is left alone. It
-is a real ordering fact about the engine's failure path, not a rendering
-question, and fixing it is a change to how executions finalize rather than to
-how they are drawn. The population is the 2 rows above.
-
-**No lint check was added and `--count` stays 88.** The candidate — "a `clamp`
-whose bounds are both computed must have its min <= max proved" — is a dataflow
-question, not a textual one, and the structural answer is already stronger: the
-arithmetic has ONE home, it is `#[must_use]`-free but total by construction, and
-the totality is pinned by a test over hostile inputs (`i64::MIN`, `i64::MAX`,
-`total_ms == 0`, `chart_width == 0`). Guards, and their limits: the four unit
-tests drive the PURE function and are RED on the pre-fix arithmetic (3 of 4
-panic) with an ordinary-row CONTROL that stays green, and a second mutation
-silencing `beyond_total` is red too. Neither can see the HANDLER BODY — a caller
-that computes the geometry correctly and discards `beyond_total` survives, which
-is checks 74b/79b's stated limit and is the honest position here.
-
+4 segments, 1 has one, so it ships at 3. *"`ExecutionLedger::new*` must be the
+producer's constructor"* / *"only above the retry loop"* — occurs ONCE in
+non-test worker code. *"a `ChainBreak` consumer must branch on
+`is_tamper_evidence`"* — 3 lines, none a verdict; `ok` is computed in one place.
+
+**The measured SURVIVOR**: reinstating a per-attempt `ExecutionLedger` inside the
+worker's retry loop leaves all 639 crate tests green — the anchor's only visible
+effect is a NATS publish. The honest guard is the live read after deploy.
+
+**And the fix would have made the report WORSE**, found by driving the real
+verifier rather than by reasoning: with read-capable credentials the same
+execution returned `ok=true, total_events=0`, because `verify_chain` over an
+EMPTY set answers `ok == true`. The sweep was enumerating `workflow_executions`
+while the writer keys on `module_executions.id` — **200 of 200** recent prefixes
+are module-execution ids, **0 of 200** workflow-execution ids. Repairing the
+identity alone would have turned 37 loud WARNs into 37 silent `verified_ok`.
+
+### Artefacts that describe a system that does not exist → [`2026-09-07-artefacts-describing-a-system-that-does-not-exist.md`](docs/engineering-log/2026-09-07-artefacts-describing-a-system-that-does-not-exist.md)
+
+**The class.** A credential, four documented env vars, a checked-in GraphQL
+snapshot and an improvements list each LOOKED like the thing they named and were
+not it. None is a vulnerability; each is a statement an operator acts on that had
+been false for weeks. (W1) a REQUIRED `secretKeyRef` for a principal that does
+not exist and a value the worker has no reader for — removed end to end, and on
+upgrade the stale Secret keys select on nothing. (W2) `S3_ENDPOINT` and friends
+configure the WIT object-storage host functions, NOT the audit ledger;
+`docs/configuration-reference.md` is now stated to be the AUTHORITATIVE list.
+(W3) `frontend/schema.graphql` was six weeks stale with a 186-line diff;
+`talos_api::schema_sdl()` is now the ONE construction and a TEST pins it —
+**a lint could only compare text to text**, because the comparison needs the
+COMPILED schema and `scripts/lint-structural.sh` has no Rust build on its default
+path. `schema.ts` needed its OWN gate (`npm run codegen && git diff --exit-code`),
+deliberately NOT in `make lint-frontend`, which skips itself when
+`node_modules` is absent — and a gate that skips is not a gate. (W4) the
+readiness improvements list told a ledger-measured child to "execute the workflow
+at least once"; `build_readiness_improvements` no longer receives the execution
+count at all. (W5) check 55's scope widened to `controller/src/bootstrap/` +
+`main.rs` (5 of 5 occurrences there are sqlx row reads, 0 serde_json).
+
+**Latent**: the `.env`-generator break is reachable only from
+`workflow_dispatch`/manual paths that have not run since #767.
+
+**A lint was built, MEASURED and REJECTED; `--count` stays 86.** *Every backticked
+`UPPER_SNAKE` token in `docs/deployment.md`'s env tables must be read somewhere.*
+It reports **2 of 49 tokens** on pristine main and neither is an `S3_*` — because
+the `S3_*` four DO have a reader, just not the one the doc claimed. **The detector
+is green over the entire defect it was written for**, and it reports the same 2 on
+the fixed tree. What it DID surface: `GRAPHQL_MAX_DEPTH` / `GRAPHQL_MAX_COMPLEXITY`
+are documented as tunables and are hardcoded `limit_depth(15)` /
+`limit_complexity(5000)` — the documented depth default was not even the live
+value. No knob was invented; the rows now say what is true.
+
+**Recorded remainder**: `controller/src/bootstrap/` + `main.rs` hold 63
+`tokio::spawn` sites and 62 discard the `JoinHandle`; there is no
+`std::panic::set_hook` anywhere. (Closed by the supervision work below, which also
+corrects that 63 to 54.)
+
+### SQL that has never once executed → [`2026-09-07-statements-that-never-executed.md`](docs/engineering-log/2026-09-07-statements-that-never-executed.md)
+
+**The class.** `sqlx::query("…")` takes a runtime `&str`, so a statement naming a
+renamed column is invisible to rustc, to clippy and to CI's sqlx offline cache
+(which covers only the `query!` MACRO forms). Three surfaces asserted a
+determinate negative because the SQL never ran: `webhooks: []` from a statement
+that cannot PREPARE (`webhook_triggers` has no `endpoint_path` column and never
+did — the endpoint is DERIVED from the id, which is why `webhook_endpoint_path`
+now has one home); a hygiene filter on `w.status = 'published'`, a value whose
+only writer stamps `workflow_type = 'internal'` in the SAME INSERT that the next
+clause EXCLUDES — **self-contradictory, not merely unmatched**, and the same
+literal was in the A2A agent card; and three trigger paths giving three different
+answers. Now gated by **check 88**.
+
+**Decisions.** `talos_workflow_liveness::is_dispatchable` is the trigger gate —
+**deliberately NOT `not_live_reason`**, because a DRAFT must stay dispatchable
+(11 of 36 workflows are drafts, 4 with enabled schedules) and gating on liveness
+would create a NEW disagreement in place of the one being closed.
+`OrchestrationError::WorkflowNotLive` is a new variant rather than a reuse so the
+exhaustive matches name all four mapping sites. `WorkflowDisabled` is KEPT for
+`replay`. Two behaviour changes, both new refusals, both stated plainly.
+
+**Latent / not done.** The `is_enabled` gate is functional but latent — nothing is
+currently disabled, so the only refusal this can produce today is the archived
+one. No live trigger was fired against an archived workflow to demonstrate the
+pre-fix behaviour, because that would EXECUTE it on the operator's only
+environment; the evidence is the code, the schema and the fleet counts.
+**A PREPARE probe cannot see a constraint**: `insert_published_internal_workflow`
+omits the `NOT NULL` `workflows.module_uri`, so `plan_and_execute_workflow` failed
+at its first write — found by a DB test, not by the probe.
+
+### Failures nobody can see → [`2026-09-07-failures-nobody-can-see.md`](docs/engineering-log/2026-09-07-failures-nobody-can-see.md)
+
+**The class.** Not a misleading report — a MISSING one. A push channel bound to a
+module that no longer exists failed every delivery with a log line that said
+nothing; a background loop can panic or simply stop with no metric, no audit
+event and no restart; and the signed-RPC data plane had a function named
+`record_rpc_metric` that recorded no metric.
+
+**Decisions.**
+* **Nothing is restarted, deliberately.** Restarting a loop whose panic is
+  deterministic would spin, and deciding per-task whether a restart is safe is a
+  separate change. What the instruments buy is that the death is SAYABLE.
+* **A declined start is not a stopped loop, and the TYPE says which.**
+  `TaskExit::{Declined(DeclineReason), ShuttingDown, LoopEnded}` — a genuine
+  `loop {}` has type `!` and coerced, so every real loop compiled unchanged and
+  the COMPILER enumerated the population that could return. `declined` and
+  `shutdown` log at INFO and are excluded from the alert;
+  **`shutdown` is deliberately not folded into `declined`**, because three
+  delegate bodies run for the whole process lifetime and calling that "declined"
+  would assert they never ran. `completed` keeps the ERROR and the alert.
+* **Supervise the loops, not their launchers.** `WorkerFleetManagement` was
+  DROPPED from the enum rather than left as a series nothing can increment. Four
+  WORKER-side pure tickers are recorded and NOT supervised: `BackgroundTask::ALL`
+  is what the CONTROLLER pre-seeds, so a worker-side variant seeds five
+  controller series nothing there can increment — supervising them costs a
+  PROCESS PARTITION of the shared enum, not one line, and the epoch ticker costs
+  more again (four tests `abort()` its handle, and `spawn_supervised` returns the
+  OUTER handle). `talos-jobs::start_processor` has zero callers workspace-wide and
+  is recorded rather than wrapped. Three controller-side pure tickers ARE
+  supervised for panic ATTRIBUTION only, and that must not be read as closing a
+  silent-death gap they do not have.
+* **Three of the eleven supervised loops are config-gated ABOVE their spawn**, so
+  their series sit at 0 on a deployment that has not enabled them. That is NOT
+  check 58's defect — this process can leave that state by configuration. The
+  gate was deliberately left above the spawn rather than moved inside the body to
+  manufacture a `Declined`.
+* **`create_watch`'s module-binding gate: two operator `event_kind`s, ONE caller
+  sentence** — splitting "no such module" from "not yours" in the reply is a
+  module-existence oracle. `Unreadable` is a SEPARATE, retryable 503. **The
+  RENEWAL path is deliberately NOT gated**: it re-uses an already-admitted
+  binding, and refusing because the module was deleted meanwhile takes a LIVE
+  watch off the air rather than stopping a new one being created wrong.
+* **`build_report` and `HygieneService::new` take the push-channel readout as a
+  REQUIRED parameter** — with a builder, deleting the two wiring lines left every
+  test in the workspace green while the report silently stopped mentioning push
+  channels. `PushChannelReadout::NotConsulted` is SILENCE, not zero. A
+  `PushChannelRow` carries no push token, no endpoint and no payload.
+* **The RPC instrument's seed set is 64 pairs, not 126**: each subject's declared
+  outcomes are exactly what ITS subscriber can pass. The cross product would seed
+  62 combinations no call site can reach — check 58's own defect. The HISTOGRAM is
+  deliberately NOT seeded (the absent-vs-zero rule is a rule about COUNTS; a
+  seeded histogram over zero observations says what the seeded counter already
+  says, at 21 lines per pair against 1). Buckets are
+  `exponential_buckets(0.0005, 2.0, 18)` = 0.5 ms … 65.5 s, because the house 15
+  tops out below `PERMIT_GUARD_TIMEOUT_SECS`, and timings are `Duration` rather
+  than the pre-rounded milliseconds — every `queue_ms`/`exec_ms` this fleet has
+  logged is `0`, so `as_millis()` would put 100% of observations in one bucket.
+  `actor_id` stays a LOG FIELD and must NEVER become a label.
+* **The RPC outcome classification**, derived per outcome from its enum's own
+  docs: `unauthorized` and `replay` are FINDINGS, not declines — on a
+  fleet-shared-key transport they mean clock skew, a half-rotated key, or a sender
+  that should not be there (live count: 0 ever). `not_found` / `invalid` are
+  DECLINED. `query_error` is a Finding on BOTH producers even though one is a
+  caller error — a compromise stated rather than hidden, separated by `subject`.
+  `write_ceiling` is a Finding because #760 already decided it that way.
+* **ONE alert, `TalosRPCSubjectFailing`, warning; the refusal class gets none.**
+  A ratio (>50% findings) with a `>=5` floor, sustained 10 minutes, and it cannot
+  fire on an idle fleet (0/0 is NaN). `unauthorized` gets no alert of its own: zero
+  observed, so any threshold is a guess and the obvious one fires on a rolling
+  deploy's clock skew.
+* **A THIRD metric family `talos_rpc_queue_duration_seconds` was declined**:
+  backpressure is structurally unreachable at the measured volume (~0.9 calls/min
+  against caps of 8/16/32, every observed `queue_ms` 0), the saturation signal
+  survives as the `stale_deadline` outcome, and the split is unchanged in the log.
+  Stated as a limit: queue-vs-exec attribution now lives in the log alone.
+* The seven subject strings are DUPLICATED into `talos-metrics` rather than
+  imported (importing would invert the layering) and pinned to their originals by
+  a test — #760's `RPC_WRITE_CEILING_SUBJECTS` precedent.
+* **The finalization ordering that makes a waterfall row start past the run's end
+  is left alone** — it is a real ordering fact about the engine's failure path,
+  not a rendering question. Population: 2 of 10,729 completed executions.
+
+**Measured and NOT changed.** `create_watch` accepted ANY `module_id` uuid with
+no error and no trace — the most likely origin of this fleet's dangling channel —
+and a correct create-time gate needed a THREE-valued module-visibility read that
+did not exist (`get_module` folds "not found" and "DB error" into one `Err`;
+`module_owned_by_user` has no `user_id IS NULL` arm). Closed later by
+`talos_registry::module_visibility`. No MCP tool listed GCP watch channels, and
+wiring one into the hygiene report would have inverted `talos-hygiene-service`'s
+layering — closed later by the leaf crate `talos-push-channel-inventory`.
+
+**Latent.** 1 of 1 module-binding channels on this fleet is dangling; the audit
+table holds **zero** `gcp_%` rows, so the `recent_failure` enrichment has nothing
+to show yet. `gcal`'s channel count is ZERO and it is enrolled anyway — a survey
+that silently covers two of three is the misleading-report class one level up.
+
+**Populations, so nobody re-measures.** The `tokio::spawn` inventory
+(`scripts/background-task-inventory.py`, checked in): 54 controller sites (not
+63 — the difference is comments plus five uses of `tokio::spawn` as a FUNCTION
+VALUE), 45 loop-shaped, exactly 1 binding the handle; plus **127** further
+library-crate sites in 34 crates. Of the 28 the 60-line window called loops,
+**13 were false positives (46%)** once classified by reading them. The
+`talos_rpc` inventory: **1590** production `mcp_error` call sites (883 `-32602`,
+648 `-32000`), against shipped comments claiming 411/409 — the house call style
+breaks the call across lines, so a single-line regex saw 46.6% and 63.3% of its
+own populations; and `grep -rn "JsonRpcResponse {"` reports 398 where the real
+struct-literal count is **31**. **A line grep over Rust is not a population.**
+
+**Lints: none added, `--count` stays 88.**
+* *"a long-lived `tokio::spawn` must go through `spawn_supervised`"*: cannot tell
+  a loop from a one-shot textually; would ship at 28 markers on correct code and
+  still miss a loop whose `loop {` sits past the window. The per-file
+  `task_supervision_pin` count assertions are stronger and cost no check number.
+* *"every `BackgroundTask` must be pre-seeded"*: not expressible — the enum and
+  the seed list come from one macro table.
+* *"a metric publish must have a test that moves the series"*: not expressible —
+  the defect is that nothing REACHES an increment site that plainly exists, which
+  needs a call graph. The cheap substitute ("does any file referencing the
+  collector contain an assertion") was built and REJECTED: it answers yes for 28
+  of 29 pre-seeded collectors, i.e. it only proves the file has tests somewhere.
+* *"a watch create that accepts a caller-supplied `module_id` must consult the
+  gate"* (BUILT as `scripts/lint-watch-module-binding-candidate.sh`, kept):
+  **19 sites on main of which 3 are real — 15.8% precision** — and **10 on the
+  fixed tree, every one legitimate**; worse, 3 of the 8 it calls gated are the
+  `_locked` renewal helpers that must NOT be gated.
+* *"every Prometheus label value must come from a closed compile-time set"*
+  (BUILT as `scripts/lint-rpc-label-closure-candidate.sh`, kept): inspects 121
+  `with_label_values` arguments and flags **73** as not provably closed, and
+  essentially every one is correct — the same 73 on both trees, **0-for-0 as a
+  bug detector**, 73 markers on correct code. It cannot be narrowed: no textual
+  rule tells a `&'static str` whose value came from the caller from one whose
+  value came from an enum a frame up.
+* *"a `clamp` whose bounds are both computed must have its min <= max proved"*: a
+  dataflow question.
+
+**The mutation that mattered.** 29 pre-seeded collectors exist and mutation-testing
+all of them is ~80 build+test cycles, not attempted; of the 17
+`talos_scheduler_dispatches_total` call sites, deleting each in turn found **SIX**
+survivors (not the one previously recorded), now pinned by a per-outcome call-site
+count with its own tripwire — 17 caught, 0 survivors on the re-run.
 
 ## Sub-workflow dispatch (engine)
 
