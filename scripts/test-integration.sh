@@ -294,6 +294,13 @@ fi
 # needed here. 64 hex = 32 bytes, non-zero.
 CTRL_MASTER_KEY="00000000000000000000000000000000000000000000000000000000deadbeef"
 CTRL_TESTS=(
+    # Nothing on this platform could say which operator surface is slow: no
+    # per-tool series, no per-call line, no pg_stat_statements. Drives the REAL
+    # `tools/call` chokepoint and asserts the series moved, that three invented
+    # tool names mint ONE `unknown` series (the cardinality guard), and the two
+    # statement-count fixes the measurements justified. `common` (DATABASE_URL)
+    # harness, so CTRL_TESTS and not TC_TESTS (64b).
+    "mcp_tool_instrument_tests"
     # A `sqlx::query("…")` statement is never schema-checked, so one naming a
     # renamed column or a relation that never existed fails only at request
     # time. Drives the REAL repository methods and the REAL statements against

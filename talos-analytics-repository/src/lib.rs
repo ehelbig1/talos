@@ -3497,6 +3497,121 @@ impl AnalyticsRepository {
         Ok(())
     }
 
+    /// Batched sibling of [`Self::get_workflow_graph_and_capabilities`].
+    ///
+    /// One statement for a whole page of ids instead of one per id. The
+    /// per-id form stays for the single-workflow callers; this exists because
+    /// `session_start`'s capability heal reads up to 100 of them in a loop
+    /// (`get_ids_without_capabilities` is `LIMIT 100`).
+    ///
+    /// Rows are returned for the ids that EXIST and belong to `user_id`; a
+    /// missing id is simply absent, which is what the per-id form's
+    /// `Ok(None)` meant at the call site.
+    pub async fn get_workflow_graphs_and_capabilities(
+        &self,
+        wf_ids: &[Uuid],
+        user_id: Uuid,
+    ) -> Result<Vec<(Uuid, String, Vec<String>)>> {
+        if wf_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT id, graph_json::text AS graph_json, COALESCE(capabilities, '{}') AS capabilities \
+             FROM workflows WHERE id = ANY($1) AND user_id = $2",
+        )
+        .bind(wf_ids)
+        .bind(user_id)
+        .fetch_all(&self.db_pool)
+        .await?;
+        rows.into_iter()
+            .map(|r| -> Result<(Uuid, String, Vec<String>)> {
+                let id: Uuid = r.try_get("id")?;
+                let gj: String = r.try_get::<Option<_>, _>("graph_json")?.unwrap_or_default();
+                let caps: Vec<String> = r
+                    .try_get::<Option<_>, _>("capabilities")?
+                    .unwrap_or_default();
+                Ok((id, gj, caps))
+            })
+            .collect()
+    }
+
+    /// Per-module `(id, capability_world, lower(kind))` for a set of modules.
+    ///
+    /// The two DISTINCT-returning readers above
+    /// ([`Self::get_capability_worlds_for_modules`],
+    /// [`Self::get_template_categories_lower`]) answer "which worlds/kinds
+    /// does THIS workflow's module set contain", so a page of workflows costs
+    /// 2N statements. This returns the MAPPING once for the union of every
+    /// page member's module ids, and the caller groups per workflow in
+    /// memory — 1 statement for the page, and the same distinct sets fall out
+    /// of the grouping.
+    pub async fn get_module_worlds_and_kinds(
+        &self,
+        module_ids: &[Uuid],
+    ) -> Result<Vec<(Uuid, String, String)>> {
+        if module_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "SELECT id, capability_world, LOWER(kind) AS kind_lower FROM modules \
+             WHERE id = ANY($1)",
+        )
+        .bind(module_ids)
+        .fetch_all(&self.db_pool)
+        .await?;
+        rows.into_iter()
+            .map(|r| -> Result<(Uuid, String, String)> {
+                let id: Uuid = r.try_get("id")?;
+                let world: String = r
+                    .try_get::<Option<_>, _>("capability_world")?
+                    .unwrap_or_default();
+                let kind: String = r.try_get::<Option<_>, _>("kind_lower")?.unwrap_or_default();
+                Ok((id, world, kind))
+            })
+            .collect()
+    }
+
+    /// Batched sibling of [`Self::set_capabilities_if_empty`], carrying a
+    /// DIFFERENT capability list per workflow.
+    ///
+    /// `UNNEST` cannot carry a ragged array-of-arrays, so the payload travels
+    /// as one bound `jsonb` value and is expanded server-side. The
+    /// "only if still empty" guard is preserved EXACTLY — it is what makes
+    /// the heal idempotent and stops it overwriting a tag an operator set
+    /// between the read and the write.
+    ///
+    /// Returns the number of rows actually written.
+    pub async fn set_capabilities_if_empty_bulk(
+        &self,
+        assignments: &[(Uuid, Vec<String>)],
+        user_id: Uuid,
+    ) -> Result<u64> {
+        if assignments.is_empty() {
+            return Ok(0);
+        }
+        let payload = serde_json::Value::Array(
+            assignments
+                .iter()
+                .map(|(id, caps)| serde_json::json!({ "id": id.to_string(), "caps": caps }))
+                .collect(),
+        );
+        let res = sqlx::query(
+            "UPDATE workflows w SET capabilities = x.caps \
+             FROM ( \
+               SELECT (e->>'id')::uuid AS id, \
+                      ARRAY(SELECT jsonb_array_elements_text(e->'caps')) AS caps \
+               FROM jsonb_array_elements($1::jsonb) AS e \
+             ) x \
+             WHERE w.id = x.id AND w.user_id = $2 \
+               AND (w.capabilities IS NULL OR w.capabilities = '{}')",
+        )
+        .bind(payload)
+        .bind(user_id)
+        .execute(&self.db_pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     // -- Reuse stats ------------------------------------------------------
 
     /// Non-archived workflows of `user_id` with ZERO executions in the window —

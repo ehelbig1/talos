@@ -21,6 +21,26 @@ services:
     # `migrate_db()` fails and `make test-integration` is unrunnable locally.
     image: pgvector/pgvector:pg17@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f
     container_name: talos-postgres
+    # `pg_stat_statements` needs the library PRELOADED at postmaster start —
+    # it cannot be turned on by a `SET` or by `CREATE EXTENSION` alone. Added
+    # 2026-09-08 because nothing on this stack could attribute cost to a
+    # statement: the live server answered `SHOW shared_preload_libraries` with
+    # the empty string, so every per-statement number package 33 needed had to
+    # be counted client-side from sqlx's tracing events.
+    #
+    # This overrides the image's CMD; the official postgres entrypoint passes
+    # these straight to `postgres`, so initdb and every other default are
+    # untouched. The image itself (and its pinned digest — check 80) is NOT
+    # changed. `migrations/20260908120000_pg_stat_statements_when_preloaded.sql`
+    # creates the extension where this preload is present and emits a NOTICE
+    # where it is not, so a production server without it is unaffected.
+    #
+    # Takes effect on the next `docker compose up -d --force-recreate postgres`
+    # (a POSTMASTER-level GUC — a running container keeps the old value).
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
     environment:
       POSTGRES_USER: talos
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD required in .env}
