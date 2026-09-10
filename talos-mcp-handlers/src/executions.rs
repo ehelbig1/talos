@@ -2937,6 +2937,27 @@ async fn handle_enqueue_workflow(
             &talos_workflow_repository::not_dispatchable_message(reason),
         );
     }
+
+    // Input schema enforcement over EVERY element, before ANY `queued` row
+    // is created. `trigger_workflow` refuses one payload that fails the
+    // declared `input_schema`; this path enqueued up to 10,000 of them with
+    // no gate. One read, one classification, above the loop — a bad element
+    // refuses the whole batch rather than leaving a partial one somebody has
+    // to cancel. FAILS CLOSED (check 76): an unreadable schema is refused,
+    // never treated as "no schema declared".
+    if let Some(resp) = crate::workflows::enforce_declared_input_schema_batch(
+        crate::workflows::classify_input_schema_read(
+            state
+                .workflow_repo
+                .get_workflow_input_schema_scoped(wf_id, user_id)
+                .await,
+        ),
+        &inputs,
+        req_id.clone(),
+        "enqueue_workflow",
+    ) {
+        return resp;
+    }
     let wf_graph = wf_record.graph_json;
 
     // Try active published version first, fall back to draft graph.

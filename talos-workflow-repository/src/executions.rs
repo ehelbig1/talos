@@ -574,8 +574,20 @@ impl WorkflowRepository {
                     }
                 }
                 if let Some(limit) = total {
+                    // LIFETIME cap, so it must count the archive tier too.
+                    // The retention sweep (#746) moves terminal rows out of
+                    // `workflow_executions` after `ARCHIVE_AFTER_DAYS`; a
+                    // live-table-only count therefore RESET this budget every
+                    // archive window, and an actor capped at N total runs
+                    // could run N per window forever. The per-minute /
+                    // per-hour counts above stay on the live table: nothing
+                    // that recent has been archived (the sweep's floor is
+                    // days, not hours). Two COUNTs summed rather than a UNION
+                    // — both tables carry `actor_id`, and a summed pair is
+                    // one index probe each with no row materialisation.
                     let count: i64 = sqlx::query_scalar(
-                        "SELECT COUNT(*) FROM workflow_executions WHERE actor_id = $1",
+                        "SELECT (SELECT COUNT(*) FROM workflow_executions WHERE actor_id = $1) \
+                              + (SELECT COUNT(*) FROM workflow_executions_archive WHERE actor_id = $1)",
                     )
                     .bind(aid)
                     .fetch_one(&mut *tx)

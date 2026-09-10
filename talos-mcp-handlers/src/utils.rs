@@ -1129,6 +1129,31 @@ pub fn execution_not_found_error(req_id: Option<serde_json::Value>) -> JsonRpcRe
 /// Standard generic database error. Keep the caller's DB error in the log
 /// (via tracing) but return this generic message to avoid leaking DB schema
 /// details to MCP clients.
+/// The ONE caller-facing sentence for a module id the caller may not bind:
+/// absent AND foreign collapse into it deliberately. Splitting "no such
+/// module" from "not yours" hands every caller a module-UUID existence oracle
+/// across tenants (the same argument `workflow_not_found_error` makes for
+/// workflows). The DECISION comes from
+/// `ModuleRepository::module_accessible_by_user` /
+/// `WorkflowRepository::modules_accessible_by_user` (catalog rows OR rows the
+/// caller owns); this is only its sentence. A DB failure on that read is NOT
+/// this error — it is `database_error`, because "we could not look" and "you
+/// may not have it" are different answers and the operator acts on them
+/// differently.
+pub fn module_not_accessible_error(
+    req_id: Option<serde_json::Value>,
+    module_id: uuid::Uuid,
+) -> JsonRpcResponse {
+    mcp_error(
+        req_id,
+        -32602,
+        &format!(
+            "Module {} not found or not accessible. Use list_modules to see your modules.",
+            module_id
+        ),
+    )
+}
+
 pub fn database_error(req_id: Option<serde_json::Value>) -> JsonRpcResponse {
     // `mcp_failed`, not `mcp_error`: this is the canonical FAILURE funnel —
     // 50 call sites — so saying so at the one home means every one of them

@@ -1169,9 +1169,11 @@ async fn handle_list_workflows(
         Ok(n) => n,
         Err(resp) => return resp,
     };
-    // Offset has no documented upper bound; use i64::MAX so the helper
-    // only enforces the non-negative floor and the wrong-type rejection.
-    let offset = match crate::utils::validate_range_i64(args, "offset", 0, i64::MAX, 0, &req_id) {
+    // 2026-09-10: capped at 10_000. `i64::MAX` was accepted and passed
+    // straight into `OFFSET $n`, so a caller could make Postgres walk the
+    // whole result set to skip past its end on every call; no tenant has ten
+    // thousand workflows, so the cap costs nobody a page.
+    let offset = match crate::utils::validate_range_i64(args, "offset", 0, 10_000, 0, &req_id) {
         Ok(n) => n,
         Err(resp) => return resp,
     };
@@ -1480,10 +1482,18 @@ async fn validate_structural_nodes(
     Ok(())
 }
 
-/// Confirm every supplied module UUID exists in `wasm_modules` (i.e. has been
-/// compiled and registered). Returns Ok(()) when the list is empty or all
-/// ids resolve; Err(JsonRpcResponse) with a -32602 body and an
-/// install/compile hint on the first missing id.
+/// Confirm every supplied module UUID is one this user may bind: a catalog
+/// module or one they own, compiled and registered. Returns Ok(()) when the
+/// list is empty or all ids resolve; Err(JsonRpcResponse) with a -32602 body
+/// and an install/compile hint on the first id that does not.
+///
+/// 2026-09-10: SCOPED. This used the unscoped `modules_exist`, so a foreign
+/// tenant's module id passed authoring and the workflow validated green
+/// until its first run refused the module — and "not found" for an absent id
+/// versus "proceed" for a foreign one was a module-UUID existence oracle.
+/// Absent and foreign now collapse into ONE sentence
+/// (`crate::utils::module_not_accessible_error`'s rule); a failed read is
+/// `database_error`, never "not found".
 ///
 /// The hint references both `install_module_from_catalog` and
 /// `compile_template` because the missing id is most often a raw
@@ -1492,15 +1502,20 @@ async fn validate_structural_nodes(
 async fn verify_module_ids_exist(
     req_id: &Option<serde_json::Value>,
     module_ids: &[uuid::Uuid],
+    user_id: uuid::Uuid,
     state: &McpState,
 ) -> Result<(), JsonRpcResponse> {
     if module_ids.is_empty() {
         return Ok(());
     }
-    let existing_ids = match state.workflow_repo.modules_exist(module_ids).await {
+    let existing_ids = match state
+        .workflow_repo
+        .modules_accessible_by_user(module_ids, user_id)
+        .await
+    {
         Ok(ids) => ids,
         Err(e) => {
-            tracing::error!("modules_exist error: {}", e);
+            tracing::error!("modules_accessible_by_user error: {}", e);
             return Err(crate::utils::database_error(req_id.clone()));
         }
     };
@@ -1511,7 +1526,7 @@ async fn verify_module_ids_exist(
                 req_id.clone(),
                 -32602,
                 &format!(
-                    "Module '{}' not found or not ready for execution. \
+                    "Module '{}' not found or not accessible, or not ready for execution. \
                      Catalog template IDs from list_templates must be installed first — \
                      call install_module_from_catalog(template_id=\"{}\") to compile and install it, \
                      then use the returned module_id in your workflow. \
@@ -1660,7 +1675,8 @@ async fn handle_create_workflow(
         })
         .collect();
 
-    if let Err(resp) = verify_module_ids_exist(&req_id, &module_ids, state.as_ref()).await {
+    if let Err(resp) = verify_module_ids_exist(&req_id, &module_ids, user_id, state.as_ref()).await
+    {
         return resp;
     }
 
@@ -2276,6 +2292,39 @@ async fn handle_add_node_to_workflow(
         }
         mid
     };
+
+    // ── Module visibility gate ────────────────────────────────────────────────
+    // 2026-09-10: a caller-supplied `module_id` was accepted at authoring time
+    // if it existed for ANY tenant. The runtime refuses a foreign module at
+    // dispatch, so this was never an execution hole — but the template read
+    // below echoed the foreign module's `config_schema` / `allowed_secrets`
+    // back in validation errors, and "not found" for an absent id versus
+    // "added" for a foreign one was a module-UUID existence oracle. Same
+    // predicate as `create_webhook` (`module_accessible_by_user`); absent and
+    // foreign collapse into ONE sentence; a failed read is `database_error`.
+    // The inline-`rust_code` path lands here too with the module it just
+    // compiled for THIS user, so the gate is one indexed read and passes.
+    if let Ok(tid) = module_id_str.parse::<uuid::Uuid>() {
+        match state
+            .module_repo
+            .module_accessible_by_user(tid, user_id)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => return crate::utils::module_not_accessible_error(req_id, tid),
+            Err(e) => {
+                tracing::error!(
+                    module_id = %tid,
+                    error = %e,
+                    event_kind = "module_visibility_unreadable",
+                    surface = "add_node_to_workflow",
+                    "module visibility read failed; refusing rather than reporting the \
+                     module as inaccessible"
+                );
+                return crate::utils::database_error(req_id);
+            }
+        }
+    }
 
     // ── Actor capability world validation ─────────────────────────────────────────────
     // If the workflow is owned by an actor, ensure the node being added does not exceed
@@ -2997,21 +3046,34 @@ async fn handle_dispatch_to_actor(
         Ok(id) => id,
         Err(resp) => return resp,
     };
-    let actor_owned = state
+    // 2026-09-10: three-valued. `.unwrap_or(None).is_some()` rendered a
+    // DATABASE FAILURE as "not found or not owned by you" — right direction,
+    // wrong diagnosis (checks 74/79's class). `Err` is `database_error`.
+    match state
         .actor_repo
         .find_actor_for_user(actor_id, user_id)
         .await
-        .unwrap_or(None)
-        .is_some();
-    if !actor_owned {
-        return mcp_error(
-            req_id,
-            -32602,
-            &format!(
-                "Actor {} not found or not owned by you. Use list_actors to see your actors.",
-                actor_id
-            ),
-        );
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return mcp_error(
+                req_id,
+                -32602,
+                &format!(
+                    "Actor {} not found or not owned by you. Use list_actors to see your actors.",
+                    actor_id
+                ),
+            );
+        }
+        Err(e) => {
+            tracing::error!(
+                actor_id = %actor_id,
+                error = %e,
+                "dispatch_to_actor: actor ownership read failed; refusing rather than \
+                 reporting the actor as not owned"
+            );
+            return crate::utils::database_error(req_id);
+        }
     }
 
     // 2. Resolve workflow_id — explicit OR auto-detect solo workflow.
@@ -3173,6 +3235,24 @@ async fn handle_test_workflow_draft(
 
     let mut input_payload = args.get("input").cloned().unwrap_or(serde_json::json!({}));
     if let Err(resp) = crate::utils::enforce_payload_size_limit(&input_payload, req_id.clone()) {
+        return resp;
+    }
+
+    // Input schema enforcement — `test_workflow` applies the declared
+    // `input_schema` so a green test is not silently less strict than a real
+    // trigger; the DRAFT twin did not, so the same payload could pass here
+    // and fail on publish. FAILS CLOSED (check 76).
+    if let Some(resp) = enforce_declared_input_schema(
+        classify_input_schema_read(
+            state
+                .workflow_repo
+                .get_workflow_input_schema_scoped(wf_id, user_id)
+                .await,
+        ),
+        &input_payload,
+        req_id.clone(),
+        "test_workflow_draft",
+    ) {
         return resp;
     }
 
@@ -5154,11 +5234,18 @@ async fn handle_call_workflow(
             return Some(crate::utils::database_error(req_id.clone()));
         }
     };
-    if !wf_record.is_enabled {
-        return Some(mcp_denied(
+    // 2026-09-10: the shared trigger-time liveness rule (one home:
+    // `talos_workflow_liveness::is_dispatchable`, via the record's
+    // `not_dispatchable_reason`). This site gated on `is_enabled` ALONE, so an
+    // ARCHIVED workflow — whose `is_enabled` the archive path never clears —
+    // was dispatchable through `call_workflow` while `bulk_trigger_workflow`
+    // and `enqueue_workflow` refused it (check 78's "three of four entry
+    // points" asymmetry). The disabled sentence now comes from the same home.
+    if let Some(reason) = wf_record.not_dispatchable_reason() {
+        return Some(mcp_error(
             req_id.clone(),
-            -32000,
-            "Workflow is disabled. Use enable_workflow to re-enable.",
+            -32003,
+            &talos_workflow_repository::not_dispatchable_message(reason),
         ));
     }
 
@@ -5785,7 +5872,7 @@ async fn handle_export_workflow(
     // Batch-fetch module metadata from both tables
     let modules_meta = match state
         .workflow_repo
-        .get_module_export_metadata(&module_ids, include_source)
+        .get_module_export_metadata(&module_ids, user_id, include_source)
         .await
     {
         Ok(m) => m,
@@ -5912,7 +5999,18 @@ async fn handle_import_workflow(
         // correct handling of this exact read is already in this file:
         // `ensure_modules_exist` (l.1500) matches and returns
         // `crate::utils::database_error`.
-        let existing_ids = match state.workflow_repo.modules_exist(&module_ids).await {
+        //
+        // 2026-09-10: SCOPED to what this user may bind (catalog OR own). The
+        // unscoped `modules_exist` accepted a foreign tenant's module id as
+        // "present", so the imported workflow referenced a module the runtime
+        // then refused — and, with `include_source` on export, the id was a
+        // route to that tenant's `source_code` (see
+        // `get_module_export_metadata`).
+        let existing_ids = match state
+            .workflow_repo
+            .modules_accessible_by_user(&module_ids, user_id)
+            .await
+        {
             Ok(ids) => ids,
             Err(e) => {
                 tracing::error!(
@@ -5935,6 +6033,27 @@ async fn handle_import_workflow(
 
         // If bundle includes source code for missing modules, compile and create them
         if !missing.is_empty() {
+            // INTERNAL existence read over the not-visible set: an id that
+            // exists but is not visible belongs to another tenant. Compiling
+            // the bundle's source into it would hit `upsert_wasm_module`'s
+            // `ON CONFLICT (id) DO NOTHING`, silently no-op, and leave the
+            // imported graph pointing at the foreign module. Such ids are
+            // refused up front with the SAME sentence an absent-with-no-source
+            // id gets below, so the caller cannot tell the two apart.
+            let taken: std::collections::HashSet<uuid::Uuid> =
+                match state.workflow_repo.modules_exist(&missing).await {
+                    Ok(ids) => ids.into_iter().collect(),
+                    Err(e) => {
+                        tracing::error!(
+                            error = %e,
+                            event_kind = "module_existence_unreadable",
+                            surface = "import_workflow",
+                            "could not check whether a not-visible module id is already \
+                             taken; refusing rather than compiling into it"
+                        );
+                        return Some(crate::utils::database_error(req_id.clone()));
+                    }
+                };
             let bundle_modules = bundle
                 .get("modules")
                 .and_then(|m| m.as_array())
@@ -5952,6 +6071,10 @@ async fn handle_import_workflow(
 
             for mid in &missing {
                 let mid_str = mid.to_string();
+                if taken.contains(mid) {
+                    still_missing.push((mid_str, "not found or not accessible"));
+                    continue;
+                }
                 let bundle_mod = bundle_modules
                     .iter()
                     .find(|m| m.get("id").and_then(|v| v.as_str()) == Some(&mid_str));
@@ -6360,6 +6483,26 @@ async fn handle_bulk_trigger_workflow(
         ));
     }
 
+    // Input schema enforcement over EVERY element, before any dispatch.
+    // `trigger_workflow` refuses one payload that fails the declared
+    // `input_schema`; this path dispatched up to 20 of them with no gate.
+    // One read, one classification, ABOVE the loop — a bad element refuses
+    // the whole batch rather than leaving a partial one. FAILS CLOSED
+    // (check 76).
+    if let Some(resp) = enforce_declared_input_schema_batch(
+        classify_input_schema_read(
+            state
+                .workflow_repo
+                .get_workflow_input_schema_scoped(wf_id, user_id)
+                .await,
+        ),
+        &inputs,
+        req_id.clone(),
+        "bulk_trigger_workflow",
+    ) {
+        return Some(resp);
+    }
+
     let bulk_wf_agent_id = wf_record.actor_id;
 
     // Try active published version first, fall back to draft.
@@ -6761,12 +6904,34 @@ async fn handle_trigger_workflow_as_actors(
         }
     };
 
-    if !wf_record.is_enabled {
-        return Some(mcp_denied(
+    // 2026-09-10: shared liveness rule — see `handle_call_workflow` for why
+    // `is_enabled` alone let an ARCHIVED workflow through here.
+    if let Some(reason) = wf_record.not_dispatchable_reason() {
+        return Some(mcp_error(
             req_id.clone(),
-            -32000,
-            "Workflow is disabled. Enable it with enable_workflow before triggering.",
+            -32003,
+            &talos_workflow_repository::not_dispatchable_message(reason),
         ));
+    }
+
+    // Input schema enforcement — `trigger_workflow` / `call_workflow` refuse
+    // a payload that fails the workflow's declared `input_schema`; this path
+    // dispatched the SAME payload up to 10 times with no gate at all. One read,
+    // one classification, ABOVE the actor loop, so a refusal costs no
+    // dispatch. FAILS CLOSED (check 76): an unreadable schema is refused, never
+    // treated as "no schema declared".
+    if let Some(resp) = enforce_declared_input_schema(
+        classify_input_schema_read(
+            state
+                .workflow_repo
+                .get_workflow_input_schema_scoped(wf_id, user_id)
+                .await,
+        ),
+        &shared_input,
+        req_id.clone(),
+        "trigger_workflow_as_actors",
+    ) {
+        return Some(resp);
     }
 
     // Load graph once — shared across all actor executions
@@ -10995,6 +11160,47 @@ pub(crate) fn enforce_declared_input_schema(
     }
 }
 
+/// [`enforce_declared_input_schema`] over a BATCH of payloads, for the two
+/// fan-out triggers (`bulk_trigger_workflow`, `enqueue_workflow`).
+///
+/// One lookup, every element validated, the FIRST failing element named by
+/// index so the caller can fix it. The refusal arms (`Unreadable`, `NotFound`)
+/// are delegated to the single-payload gate so the two cannot disagree about
+/// which outcomes refuse; `NoSchema` proceeds for every element, exactly as
+/// it does for one. Called ABOVE the dispatch loop at both sites, so a bad
+/// element refuses the whole batch rather than leaving a partial one behind.
+#[must_use]
+pub(crate) fn enforce_declared_input_schema_batch(
+    lookup: InputSchemaLookup,
+    inputs: &[serde_json::Value],
+    req_id: Option<serde_json::Value>,
+    surface: &'static str,
+) -> Option<JsonRpcResponse> {
+    match lookup {
+        InputSchemaLookup::NoSchema => None,
+        InputSchemaLookup::Present(schema) => {
+            for (i, input) in inputs.iter().enumerate() {
+                let errors =
+                    talos_workflow_validation::validate_input_against_schema(&schema, input);
+                if !errors.is_empty() {
+                    return Some(mcp_error(
+                        req_id,
+                        -32602,
+                        &format!(
+                            "Input schema validation failed for inputs[{i}]: {}",
+                            errors.join("; ")
+                        ),
+                    ));
+                }
+            }
+            None
+        }
+        refusal @ (InputSchemaLookup::Unreadable(_) | InputSchemaLookup::NotFound) => {
+            enforce_declared_input_schema(refusal, &serde_json::Value::Null, req_id, surface)
+        }
+    }
+}
+
 /// Render the two REPORTABLE outcomes. The refusals never reach here — passing
 /// one yields a body that says so rather than a reassuring default, so a future
 /// miswiring is loud instead of silent.
@@ -13317,6 +13523,78 @@ mod input_schema_enforcement_tests {
             .map(|(label, _)| label)
             .collect();
         assert_eq!(proceeding, vec!["no schema"]);
+    }
+
+    /// The batch gate (bulk_trigger / enqueue) must refuse on the SAME two
+    /// read outcomes as the single-payload gate, validate EVERY element, and
+    /// name the first failing index.
+    #[test]
+    fn the_batch_gate_refuses_the_same_outcomes_and_names_the_failing_element() {
+        use super::enforce_declared_input_schema_batch;
+        let good = json!({"to": "a"});
+        let bad = json!({"nope": 1});
+
+        // Refusals do not depend on the payloads at all.
+        let resp = enforce_declared_input_schema_batch(
+            classify_input_schema_read(Err("boom".to_string()) as Read),
+            &[good.clone()],
+            Some(json!(1)),
+            "unit_test",
+        )
+        .expect("a failed read must refuse the batch");
+        assert_eq!(code_of(&resp), -32000);
+        assert_eq!(message_of(&resp), "Database error");
+        let resp = enforce_declared_input_schema_batch(
+            classify_input_schema_read(Ok(None) as Read),
+            &[good.clone()],
+            Some(json!(1)),
+            "unit_test",
+        )
+        .expect("an unknown workflow must refuse the batch");
+        assert_eq!(message_of(&resp), "Workflow not found or access denied");
+
+        // No schema: every element proceeds, including one no schema would
+        // accept.
+        assert!(enforce_declared_input_schema_batch(
+            classify_input_schema_read(Ok(Some(None)) as Read),
+            &[good.clone(), bad.clone()],
+            Some(json!(1)),
+            "unit_test",
+        )
+        .is_none());
+
+        // Schema present: all-good proceeds; a bad element ANYWHERE refuses
+        // and is named by index — the third of four here, so a gate that
+        // checked only `inputs[0]` would pass this batch.
+        assert!(enforce_declared_input_schema_batch(
+            classify_input_schema_read(Ok(Some(Some(schema()))) as Read),
+            &[good.clone(), good.clone()],
+            Some(json!(1)),
+            "unit_test",
+        )
+        .is_none());
+        let resp = enforce_declared_input_schema_batch(
+            classify_input_schema_read(Ok(Some(Some(schema()))) as Read),
+            &[good.clone(), good.clone(), bad, good],
+            Some(json!(1)),
+            "unit_test",
+        )
+        .expect("one bad element must refuse the batch");
+        assert_eq!(code_of(&resp), -32602);
+        assert!(
+            message_of(&resp).starts_with("Input schema validation failed for inputs[2]:"),
+            "got: {}",
+            message_of(&resp)
+        );
+        // An EMPTY batch with a schema present proceeds (nothing to reject);
+        // the callers refuse empty batches before reaching the gate.
+        assert!(enforce_declared_input_schema_batch(
+            classify_input_schema_read(Ok(Some(Some(schema()))) as Read),
+            &[],
+            Some(json!(1)),
+            "unit_test",
+        )
+        .is_none());
     }
 
     /// The two enforcement handlers and the reporting handler must agree

@@ -433,11 +433,16 @@ async fn handle_get_workflow_graph_render(
                         .and_then(|d| d.get("sub_workflow_id"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("?");
-                    // Try to resolve sub-workflow name
+                    // Try to resolve sub-workflow name. SCOPED to the caller
+                    // (2026-09-10): `sub_workflow_id` is caller-authored node
+                    // data, so the unscoped `get_workflow_name_by_id` this
+                    // used was a workflow-name oracle over every tenant. A
+                    // child the caller cannot see renders as its bare UUID —
+                    // the same rendering as an id that does not exist.
                     let sub_name = if let Ok(uid) = sub_id.parse::<uuid::Uuid>() {
                         state
                             .workflow_repo
-                            .get_workflow_name_by_id(uid)
+                            .get_workflow_name_for_user(uid, user_id)
                             .await
                             .unwrap_or_else(|e| {
                                 tracing::warn!(error = %e, "DB error resolving sub-workflow name");

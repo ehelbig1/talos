@@ -4666,10 +4666,37 @@ async fn handle_add_error_handler(
     // Resolve handler module template ID — prefer handler_module_id (UUID), fall back to handler_module_name
     let (handler_template_id, handler_display): (Uuid, String) =
         if let Some(id_str) = args.get("handler_module_id").and_then(|v| v.as_str()) {
-            match id_str.parse::<Uuid>() {
-                Ok(id) => (id, id_str.to_string()),
+            let id = match id_str.parse::<Uuid>() {
+                Ok(id) => id,
                 Err(_) => return mcp_error(req_id, -32602, "Invalid 'handler_module_id' UUID"),
+            };
+            // 2026-09-10 review: a caller-supplied module UUID must be visible
+            // to the caller (own row or catalog) BEFORE it is persisted into the
+            // graph. The runtime fetch is already user-scoped, so this closes
+            // the authoring-time path only — a foreign id used to be accepted
+            // here (and in add_node_to_workflow) and then echoed back through
+            // export_workflow's module metadata. THREE-valued, like the sibling
+            // gate in create_webhook: `Ok(false)` is the one uniform
+            // not-found-or-not-accessible sentence, `Err` is a database that
+            // could not be asked and is never rendered as a denial.
+            match state
+                .module_repo
+                .module_accessible_by_user(id, user_id)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => return crate::utils::module_not_accessible_error(req_id, id),
+                Err(e) => {
+                    tracing::error!(
+                        module_id = %id,
+                        error = %e,
+                        "add_error_handler: module visibility read failed; refusing rather \
+                         than reporting the module as inaccessible"
+                    );
+                    return crate::utils::database_error(req_id);
+                }
             }
+            (id, id_str.to_string())
         } else if let Some(handler_module_name_raw) =
             args.get("handler_module_name").and_then(|v| v.as_str())
         {
