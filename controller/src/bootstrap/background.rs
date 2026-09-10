@@ -2655,37 +2655,57 @@ pub(crate) fn spawn_cleanup_tasks(
             let max_size_mb =
                 talos_config::positive_env_or_default::<i64>("WASM_CACHE_MAX_SIZE_MB", 500);
 
-            // Clean up old modules
+            // Retention sweep. Since 2026-09-10 BOTH sweeps evict BYTES, not
+            // rows (`UPDATE modules SET wasm_bytes = NULL, wasm_evicted_at =
+            // NOW()`), and both share one exemption fragment: a module that
+            // any workflow / webhook / active gcal channel references, or that
+            // was dispatched within `retention_days`, is never evicted. The
+            // knob is live because `last_used_at` is now stamped on every
+            // dispatch read (throttled) and was backfilled once from
+            // `module_executions` by migration 20260910140000.
             match cleanup_registry.cleanup_old_modules(retention_days).await {
-                Ok(count) => {
-                    if count > 0 {
+                Ok(outcome) => {
+                    if outcome.modules_evicted > 0 {
                         tracing::info!(
-                            "Cleaned up {} old WASM modules (>{}d)",
-                            count,
-                            retention_days
+                            event_kind = "wasm_cache_evicted",
+                            sweep = "retention",
+                            modules_evicted = outcome.modules_evicted,
+                            bytes_freed = outcome.bytes_freed,
+                            retention_days,
+                            "Evicted WASM bytes of idle modules (rows and source kept; \
+                             hot_update_module restores a module on demand)"
                         );
                     }
                 }
-                Err(e) => tracing::error!("Failed to cleanup old WASM modules: {}", e),
+                Err(e) => tracing::error!("Failed to run WASM cache retention sweep: {}", e),
             }
 
-            // Enforce cache size limits
+            // Enforce cache size limits. The idle window is the SAME
+            // `retention_days`, so after the retention sweep above this pass
+            // can only report what it may not evict — a cap the in-use set
+            // alone exceeds is a signal to raise the cap, never a licence to
+            // break a workflow that runs.
             match cleanup_registry
-                .enforce_cache_limits(max_modules, max_size_mb)
+                .enforce_cache_limits(max_modules, max_size_mb, retention_days)
                 .await
             {
                 Ok(outcome) => {
-                    if outcome.modules_deleted > 0 {
+                    if outcome.modules_evicted > 0 {
                         tracing::info!(
-                            modules_deleted = outcome.modules_deleted,
+                            event_kind = "wasm_cache_evicted",
+                            sweep = "cap",
+                            modules_evicted = outcome.modules_evicted,
                             bytes_freed = outcome.bytes_freed,
-                            "Evicted WASM cache modules"
+                            max_modules,
+                            max_size_mb,
+                            "Evicted WASM bytes to meet the cache caps (rows and source kept)"
                         );
                     }
-                    // A cap that cannot be met without deleting rows this sweep
-                    // does not own (the shared catalog) is a real operational
-                    // condition, not a no-op. Surface it — counts only, never a
-                    // module name, tenant id, or per-row size.
+                    // A cap that cannot be met without evicting rows this sweep
+                    // does not own (the shared catalog) or must not touch (a
+                    // referenced or recently-dispatched module) is a real
+                    // operational condition, not a no-op. Surface it — counts
+                    // only, never a module name, tenant id, or per-row size.
                     if outcome.unevictable_count_overage > 0
                         || outcome.unevictable_size_overage_bytes > 0
                     {
@@ -2695,9 +2715,11 @@ pub(crate) fn spawn_cleanup_tasks(
                             unevictable_size_overage_bytes = outcome.unevictable_size_overage_bytes,
                             max_modules,
                             max_size_mb,
+                            retention_days,
                             "WASM cache is over cap but the excess is not evictable \
-                             (shared catalog rows are not cache entries); raise the cap \
-                             or prune the catalog"
+                             (shared catalog rows, referenced modules and modules \
+                             dispatched within the retention window are exempt); \
+                             raise the cap or prune unused modules"
                         );
                     }
                 }
@@ -2708,7 +2730,7 @@ pub(crate) fn spawn_cleanup_tasks(
             match cleanup_registry.get_cache_stats().await {
                 Ok(stats) => {
                     tracing::debug!(
-                        "WASM cache stats: {} modules, {:.2} MB, {} total uses",
+                        "WASM cache stats: {} modules with bytes, {:.2} MB, {} usage touches (hours-with-a-dispatch, not dispatches)",
                         stats.module_count,
                         stats.total_size_mb,
                         stats.total_usage_count
