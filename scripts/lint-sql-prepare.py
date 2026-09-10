@@ -126,7 +126,25 @@ def main():
               file=sys.stderr)
         return 2
 
-    probes, script = {}, ['\\set VERBOSITY verbose']
+    # Do not churn the operator's `pg_stat_statements` (2026-09-10). Every
+    # probe below is TWO utility statements (`PREPARE sN AS …`, `DEALLOCATE
+    # sN`) carrying a unique name, so neither normalises: measured on the
+    # reference stack, ONE run of this check mints ~1900 entries against a
+    # default `pg_stat_statements.max = 5000`. That was invisible until #786's
+    # preload went live on 2026-09-10 and this package gave the view a reader;
+    # the first lint run after it pushed the cluster over the cap and evicted
+    # 9 of the operator's real entries.
+    #
+    # `track_utility` is a `superuser`-context GUC. A non-superuser lint role
+    # gets `42501`, and a server without the extension gets `42704
+    # unrecognized configuration parameter` — both harmless here: psql runs
+    # with ON_ERROR_STOP=0, and the attribution loop below ignores every ERROR
+    # that arrives before the first `@@@` marker (`cur` is still None), so a
+    # refused SET cannot be blamed on a statement.
+    probes, script = {}, [
+        '\\set VERBOSITY verbose',
+        'SET pg_stat_statements.track_utility = off;',
+    ]
     skipped_kind = 0
     for n, r in enumerate(static, 1):
         sql = r['sql'].strip().rstrip(';').strip()

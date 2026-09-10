@@ -1130,6 +1130,219 @@ is not `\n` — and reported **82 hits across 23 files**, every HTTP and MIME
 header among them.
 
 
+### The database was the last unmeasured layer → [`2026-09-10-the-collection-nobody-read.md`](docs/engineering-log/2026-09-10-the-collection-nobody-read.md)
+
+**The class.** A COLLECTION turned on with no READER. #786 added
+`shared_preload_libraries=pg_stat_statements` and the guarded migration
+`20260908120000_pg_stat_statements_when_preloaded.sql`, whose own header ends
+*"Nothing in the application reads this extension."* Because that GUC is
+POSTMASTER-level the preload took effect only at the **2026-09-10 02:14 UTC**
+restart; from that minute every statement the platform issues has been timed by
+the server and read by nothing. #786 gave MCP tools
+`talos_mcp_tool_duration_seconds`, #787 the signed-RPC data plane
+`talos_rpc_duration_seconds`, `get_fuel_usage_report` covers module fuel — SQL
+had no equivalent, and it is where an N+1 or a missing index shows up.
+
+**Worth building, and the evidence is not an argument.** The first fifteen
+minutes of that window independently reproduced a documented N+1 with no code
+read: `SELECT MAX(started_at) …`, the reliability ratio and
+`UPDATE workflows SET readiness_score …` each at **36 calls**, which is the
+workflow count, against a loop this file already records as "THREE queries per
+workflow (108 for the 36-workflow fleet)".
+
+**Every premise of the brief was REFUTED, and each refutation changed the
+design.**
+* **`talos_guest` has ZERO rows in the view, and not for want of sandbox
+  traffic.** The `SET LOCAL ROLE` fence is gated on `TALOS_RPC_GUEST_ROLE`,
+  which is UNSET here (`enforce_production_db_sandbox_posture` forces it only in
+  production), so guest SQL runs as the APP USER and is **indistinguishable in
+  this view from the controller's own statements**. "Exclude the sandbox role"
+  would have been a control that does not exist.
+* **`pg_stat_statements` NORMALISES CONSTANTS**, including literals embedded in
+  the SQL text — measured: two statements differing only in a string literal
+  collapse to ONE entry with `calls = 2`, and the sandbox CTE wrap normalises
+  down to `note = $1 … LIMIT $3`. Jumbling replaces `Const` nodes and does not
+  care how the constant reached the parser.
+* **What it does NOT normalise is the risk**: IDENTIFIERS (above all column
+  ALIASES — `SELECT $1 AS "<anything>"`), COMMENTS, and UTILITY statements
+  (`track_utility` defaults ON). So query text here is, in the general case,
+  **arbitrary caller-authorable bytes**.
+* **Tenant data was already in it**, from a path with nothing to do with the
+  sandbox: `SET LOCAL app.current_user_id = '<uuid>'`, because `SET LOCAL`
+  cannot bind parameters and `TenantReadScope::set_local_user_sql` formats the
+  UUID in — correct for injection safety, and it means every distinct acting
+  user mints its own entry.
+* **A state nobody had named: Postgres redacts the text itself.** A
+  non-superuser without `pg_read_all_stats` reads the literal
+  `<insufficient privilege>` in `query` (measured: **239 of 252** as
+  `talos_app`), which the migration's own header calls the common managed-Postgres
+  posture.
+* **C2's literal grep claim was false too**: three `.rs`/`.sh` prose sites said
+  "there is no `pg_stat_statements` on this stack", true on 2026-09-08 and false
+  from the restart. Corrected in place rather than deleted — they are why the
+  MCP instrument's statement counting is CLIENT-side, and that reason stands.
+
+**Decisions.**
+* **A read-only MCP tool `get_sql_statement_report`; NO metric, NO alert, NO
+  Helm change, NO `pg_stat_statements_reset()`.** The metric rejection is NOT
+  about cost — the view scans in **0.15–0.20 ms warm at 259 entries**, ~3–4 ms
+  at the 5000 cap, which a 15 s scrape can afford. It is about the LABEL: the
+  only actionable content is PER-STATEMENT, `query` is unbounded
+  caller-authorable text (check 58's DoS rule, #787's closed-compile-time-set
+  rule) and `queryid` is an unbounded int. Every aggregate that IS expressible
+  is unactionable or duplicates the tool, nothing would alert on it
+  (`dealloc`, the one real "the instrument stopped measuring" signal, is **0**
+  here), and on most deployments it would be permanently 0 because the
+  extension is absent by design — the absent-vs-zero defect this package
+  removes.
+* **PLATFORM-ADMIN ONLY, and a REFUSAL rather than a narrowed answer.**
+  `pg_stat_statements` has NO tenancy dimension — `userid` is a Postgres ROLE,
+  not a Talos user — so there is no correct per-tenant slice of the text OR of
+  the aggregates: the entry COUNT alone discloses how many distinct users a
+  deployment has. `handle_query_paginated` is the precedent, gated on the same
+  flag for the same reason. A platform admin can already read every tenant row.
+* **Text is SANITISED even for that admin**, and not for confidentiality: a
+  `database`-world module must not be able to plant an ANSI escape, an RTL
+  override or a forged line break in an operator's console. Deliberately NOT
+  `talos_validation::reject_control_chars` — that REJECTS an input about to be
+  stored, this SANITISES a value already on disk that cannot be rejected.
+* **Availability is FIVE-valued**, and PRESENCE is read from `pg_extension`
+  rather than by classifying a `42P01`, so "not installed" is a positive
+  finding. `NotLoaded` (`55000`) was reproduced in a throwaway
+  `pgvector/pgvector:pg17` container with no preload (`CREATE EXTENSION`
+  SUCCEEDS; the first read raises) — not read out of a header.
+* **`entries_evicted: None` is not `0`.** `pg_stat_statements_info` is 1.9+ (PG
+  14), so a server below that cannot say whether eviction happened. Reproduced
+  rather than stubbed: PG 17 still ships the 1.8 script, so
+  `CREATE EXTENSION … VERSION '1.8'` is a real pre-`_info` install and the DB
+  test drives one. The reader names only the STABLE column subset for the same
+  reason — `toplevel` is 1.9+ and the block-timing columns were RENAMED in 1.11.
+* **`talos-statement-stats` is deliberately OUTSIDE check 88's PREPARE roots.**
+  Every statement in it names a relation ABSENT BY DESIGN on most servers, so a
+  gate whose premise is "this relation must exist" would go red on correct code.
+  The guard is `controller/tests/statement_stats_tests` (CTRL_TESTS per 64b),
+  which drives the real statements against a database WITH the view and one
+  WITHOUT it.
+* **`guest_role_for_query` becomes `pub` rather than being re-implemented.** A
+  second reader of `TALOS_RPC_GUEST_ROLE` that skipped
+  `is_valid_pg_role_identifier` would report a control as working when an
+  invalid value has silently switched it off.
+
+**Measured and NOT changed.**
+* **`SET LOCAL app.current_user_id = '<uuid>'` stays as it is.** `SET LOCAL`
+  cannot bind parameters; `SELECT set_config($1,$2,true)` would normalise, at
+  the cost of changing the RLS scoping chokepoint (one simple-query round trip
+  today, by design) — a behaviour change with fleet-wide blast radius, not a
+  report fix. The consequence is recorded instead: on a multi-tenant deployment
+  each distinct user mints its own entry against the shared 5000 cap.
+* **`talos-db-monitor` (`QueryMonitor`, slow-query threshold, per-query
+  metrics) still has ZERO callers** — `controller/src/bootstrap/services.rs`
+  records it as one of four dead-binding scaffolds removed by MCP-704. The
+  workspace already contained a statement-timing reader that has never recorded
+  a statement; it was left alone.
+* **Check 88 covers 77% of the population its name claims.** Its
+  `SQL_PREPARE_ROOTS` is a HARDCODED crate list — check 74's glob and check 64's
+  runner list are the same rot mode. Counted over every non-test `.rs`: **934
+  static sqlx statements INSIDE the roots, 274 OUTSIDE across 28 crates**
+  (`talos-ml` 77, `controller` 20, `talos-engine` 19, `talos-webhooks` 17,
+  `talos-oauth` 17, `talos-scheduler` 17, `talos-system-repo` 15,
+  `talos-workflow-versions` 14 …), at least four of them repositories BY ROLE
+  and not by name. Widening means proving 274 statements PREPARE — its own
+  package. Recorded with numbers.
+* **`talos_guest` is unreachable on this deployment and that is the DEFAULT**,
+  not a local misconfiguration.
+* **The first thing the new instrument measured was the repo's own lint, and
+  that WAS changed.** Check 88 emits `PREPARE sN AS <sql>;` + `DEALLOCATE sN;`
+  per statement — both UTILITY statements carrying a UNIQUE NAME, so neither
+  normalises — which at its 951 statements is **~1900 `pg_stat_statements`
+  entries per run against a default `max = 5000`, ~38% of the cap, every run.**
+  Measured either side of one `TALOS_LINT_SQL_PREPARE=1 make lint`:
+  `4640 → 4392` entries, `dealloc 0 → 1`, and **nine of the operator's real
+  `talos` entries evicted**. Attribution stated precisely: the cap pressure was
+  ~74% this session's own test clones, so on a clean instrument the lint alone
+  (438 + 1900) would not have evicted — the CHURN is unconditional, the
+  eviction was the combination. Fixed with one line,
+  `SET pg_stat_statements.track_utility = off;` at the head of the psql script:
+  re-measured, a full run now adds **2** entries (the two measuring queries),
+  leaves `dealloc` unchanged and leaves ZERO `prepare s%` entries, and still
+  reports `scanned 951 static statement(s) … ✓`. The refusal paths were
+  REPRODUCED rather than assumed — `track_utility` is a `superuser`-context
+  GUC, so a non-superuser role gets `42501` and a server without the extension
+  `42704`; pointing the SET at a nonexistent GUC and re-running gives normal
+  counts and exit 0, because psql runs `ON_ERROR_STOP=0` and the attribution
+  loop ignores every `ERROR:` before the first `@@@` marker.
+* **A side effect of this work, disclosed rather than left to be found.** An
+  entry OUTLIVES the database that minted it, and the controller harness gives
+  every test its own `CREATE DATABASE … TEMPLATE` clone. After this session's
+  runs the live cluster held **3462 entries with 1538 headroom, 2552 of them
+  (73.7%) from databases that no longer exist**. `dealloc` is still 0, so
+  nothing real was evicted. `pg_stat_statements_reset()` was NOT called — shared
+  operator state, and it would destroy the 421 real `talos` entries too. The
+  measurement is why `coverage.entries_for_dropped_databases` exists in the
+  report; it was added after it, not before.
+
+**Latent on this fleet, stated plainly.** The one user on this deployment has
+`is_platform_admin = false`, so the tool **refuses every caller here today**. It
+joins ~14 existing tools in exactly that state (`query_paginated`,
+`pause_executions`, `set_wasm_config`, `get_secret_access_log`,
+`set_archive_policy`, …), all gated on the same column; enabling it is one
+operator `UPDATE`. And the collection window is only as old as the last
+Postgres restart, which is why `window_is_since_server_start` is a field.
+
+**Lints: none added, `--count` stays 88.** Every candidate, measured:
+* *"a file naming `pg_stat_statements` must name the availability
+  classification"* — population **4 files**: the crate, its DB test, the handler
+  (which names it) and one prose-only test header. ONE production site, below
+  #765's bar; the structural answer is stronger — `StatementStatsRead` is
+  `#[must_use]` with no `Into<Option>`, no `.ok()` and no `is_available()`
+  boolean, so the collapse the check would look for does not compile into a
+  one-liner.
+* *"a report reading an OPTIONAL relation must classify availability"* —
+  population **2 files**, one a test.
+* *"a caller-authorable string reaching a report must be sanitised"* — the
+  workspace already holds **30** `sanitize_*` functions, every one correct, and
+  "is this string caller-authorable?" is a dataflow question. Zero-for-zero as a
+  bug detector.
+
+**Mutations: 14 applied worst-first, 14 caught — one of them only after it
+SURVIVED, and one only after the stub it was measured against was made
+faithful.** M1 (absent extension → an empty `Available` report) fails loudly;
+so do the gate deletion, the gate failing OPEN, the bypassed sanitiser,
+Postgres' redaction marker rendered as a statement, the dropped `dbid` filter,
+a silently-defaulted `order_by`, `truncated` pinned false, the withheld-text
+count, and the dropped-database count.
+**M12 was a real SURVIVOR**: `classify_view_error`'s SQLSTATE arms are the ONE
+place a deployment fact is asserted from an error and nothing drove them — the
+DB suite runs on a cluster that HAS the preload, so it cannot produce `55000`,
+and the unit tests built `NotLoaded` directly. `55000 => NotInstalled` ("you
+never installed this", to a server that only needs a restart) passed
+everything. Closed with a test-only `sqlx::error::DatabaseError` stub, because
+`PgDatabaseError` has no public constructor.
+**M14 was a NO-OP before it was a catch**, and that is the sharper lesson: a
+message-based shortcut ahead of the SQLSTATE match never fired, because the
+stub's `Display` did not render its MESSAGE the way a real `PgDatabaseError`
+does. **A stub that does not render like the thing it stands in for makes every
+assertion against it prove less than it appears to.**
+**M7's first form was a correct non-survivor**: it mutated the `Ok(None)` arm
+of the `_info` read, which is essentially unreachable because the view returns
+exactly one row whenever it exists — the REACHABLE unknown path is the
+`Err(42P01)` arm, and that one is caught.
+**And the harness itself produced a FALSE result before it was fixed**:
+`shutil.copy` does not preserve mtime, so a reverted file came back OLDER than
+the mutated build's fingerprint and cargo reused the MUTATED artifact — one
+mutation's failures reappeared verbatim under the next one's run. The rule
+"print the diff and confirm the mutation landed" needs a second clause —
+confirm the REVERT landed too — and a baseline probe that must be green now
+runs first every time.
+
+**Stated limits.** The `NotLoaded` and `denied` / `view_missing` arms are
+covered by UNIT test on the SQLSTATE, not by the DB suite: producing `55000`
+needs a postmaster without the preload, which this cluster is not. The tool was
+never called through a deployed controller (the running image predates it), so
+the live read after deploy is the honest guard for the wiring — the position
+#767, #769 and #771 each took about their own changes. And the reader's own
+statements appear in its own report, which is honest but can surprise.
+
 ### A per-call timeout spent on somebody else's inference → [`2026-09-09-the-timeout-that-was-not-per-call.md`](docs/engineering-log/2026-09-09-the-timeout-that-was-not-per-call.md)
 
 **The class, and it is a new one for this series: a resource bound whose

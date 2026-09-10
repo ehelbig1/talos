@@ -7,6 +7,10 @@ members = [
     "talos-ssrf-classify",
     "talos-sql-classify",
     "talos-workflow-liveness",
+    # The one reader of `pg_stat_statements` — an OPTIONAL relation whose query
+    # text is caller-authorable, so availability is a five-valued
+    # classification and the text is sanitised on the way out.
+    "talos-statement-stats",
     # The controller-side home for the worker's `[reason_class=…]` marker:
     # closed token set + remediation-family map. A zero-dependency leaf so
     # the retry classifier, the failure analyser and the ops-alert reconciler

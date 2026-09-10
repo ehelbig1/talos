@@ -497,6 +497,15 @@ fn controller_statement_mutates(stmt: &sqlparser::ast::Statement) -> bool {
 /// lookup happens once at startup, not on every RPC.
 ///
 /// **Validation.** The role name is the operator's input but is
+/// **`pub` since 2026-09-10, for a SECOND, READ-ONLY consumer.**
+/// `get_sql_statement_report` renders the Postgres ROLE each tracked
+/// statement ran as, and that name is only provenance when this fence is
+/// ON: unfenced, guest SQL runs as the app user and is indistinguishable
+/// from the controller's own. The report therefore calls THIS function
+/// rather than reading the env itself — a second reader that skipped
+/// [`is_valid_pg_role_identifier`] would report a control as working when
+/// an invalid value has silently switched it off.
+///
 /// substituted into SQL via Postgres's `quote_ident` semantics
 /// (`SET LOCAL ROLE "..."`) so injection is bounded to the role
 /// namespace — the worst case is the SET failing with "role does not
@@ -507,7 +516,7 @@ fn controller_statement_mutates(stmt: &sqlparser::ast::Statement) -> bool {
 /// produce a startup-time warning and the wrap is disabled (fail-
 /// open is acceptable because the role wrap is itself defense-in-
 /// depth; the validator is the primary fence).
-pub(crate) fn guest_role_for_query() -> Option<&'static str> {
+pub fn guest_role_for_query() -> Option<&'static str> {
     use std::sync::OnceLock;
     static ROLE: OnceLock<Option<String>> = OnceLock::new();
     ROLE.get_or_init(|| {

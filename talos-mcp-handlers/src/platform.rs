@@ -213,6 +213,30 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                 "required": ["endpoint_url", "message"]
             }
         }),
+        serde_json::json!({
+            "name": "get_sql_statement_report",
+            "description": "Per-statement DATABASE cost, read from pg_stat_statements. The layer nothing \
+                else on this platform measures: talos_mcp_tool_duration_seconds covers the MCP surface, \
+                talos_rpc_duration_seconds the signed-RPC data plane and get_fuel_usage_report module \
+                fuel — this is where an N+1 or a missing index shows up. Order by total_time (cost), \
+                calls (the N+1 lens — look for rows_per_call ≈ 1 at a high call count) or mean_time (the \
+                missing-index lens; pair it with shared_blks_read).\n\n\
+                PLATFORM-ADMIN ONLY. pg_stat_statements has NO tenancy dimension — its userid is a \
+                Postgres role, not a Talos user — so there is no correct per-tenant slice of it, and \
+                query text can carry other tenants' identifiers. Non-admin callers are refused rather \
+                than given a narrowed answer.\n\n\
+                The extension is OPTIONAL: shared_preload_libraries is a postmaster GUC, so it is off \
+                unless an operator turned it on and restarted Postgres. Where it is absent the response \
+                says so with available=false and a distinct reason — it never renders as an empty list \
+                of slow statements.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "order_by": { "type": "string", "description": "One of total_time (default), calls, mean_time. An unrecognised value is refused, never silently defaulted." },
+                    "limit": { "type": "number", "description": "Statements to return (default 20, max 50)." }
+                }
+            }
+        }),
     ]
 }
 
@@ -257,6 +281,9 @@ pub async fn dispatch(
         }
         "get_agent_card" => Some(handle_get_agent_card(req_id, args, state, user_id).await),
         "call_a2a_agent" => Some(handle_call_a2a_agent(req_id, args, state).await),
+        "get_sql_statement_report" => {
+            Some(handle_get_sql_statement_report(req_id, args, state, user_id).await)
+        }
         _ => None,
     }
 }
@@ -2809,4 +2836,113 @@ async fn handle_list_push_channels(
         req_id,
         &serde_json::to_string_pretty(&out).unwrap_or_default(),
     )
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Package 39: per-statement database cost (pg_stat_statements)
+// ────────────────────────────────────────────────────────────────────────────
+
+/// `get_sql_statement_report` — the reader `#786` did not ship.
+///
+/// #786 added `shared_preload_libraries=pg_stat_statements` and the guarded
+/// migration; nothing read the result, so every statement the platform issues
+/// has been timed by the server and seen by nobody. The classification, the
+/// SQL and the pure renderer live in `talos-statement-stats`; this handler is
+/// the gate and the wiring.
+///
+/// # The tenancy decision, and why it is a refusal rather than a narrowed answer
+///
+/// `pg_stat_statements` has **no tenancy dimension at all** — its `userid` is
+/// a Postgres ROLE, not a Talos user — so there is no correct per-tenant slice
+/// of it, of the text or of the aggregates. Three measurements settle it:
+///
+/// 1. **Query text is caller-authorable.** The view normalises CONSTANTS
+///    (measured: two statements differing only in an embedded string literal
+///    collapse to one entry) but NOT identifiers, comments or utility
+///    statements — so `SELECT $1 AS "<anything>"` and `/* anything */` are
+///    stored verbatim, and a `database`-world module chooses both.
+/// 2. **Other tenants' identifiers are already in it.** `SET LOCAL` cannot
+///    bind parameters, so `talos_tenancy::TenantReadScope::set_local_user_sql`
+///    formats a user UUID into the statement text; that entry is in this
+///    deployment's view now.
+/// 3. **Sandbox SQL is not separable on a default deployment.**
+///    `TALOS_RPC_GUEST_ROLE` is unset unless an operator set it (it is forced
+///    only in production), and unfenced guest SQL runs as the app user — the
+///    same `userid` as the controller's own statements.
+///
+/// Even the AGGREGATES are deployment-wide: the entry COUNT discloses how many
+/// distinct users a deployment has, because each mints its own
+/// `SET LOCAL app.current_user_id` entry. So there is no honest non-admin
+/// mode, and a narrowed answer would be a worse lie than a refusal.
+///
+/// A platform admin can already read every row of every tenant's data
+/// (`handle_query_paginated` is gated on exactly this flag for exactly this
+/// reason), so the text discloses nothing to them that they could not read
+/// directly.
+async fn handle_get_sql_statement_report(
+    req_id: Option<serde_json::Value>,
+    args: &serde_json::Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    // Same `require_platform_admin` family as `query_paginated` /
+    // `pause_executions`. Fail-CLOSED on an unreadable flag: a gate that
+    // cannot read its rule must refuse, never grant.
+    // allow-benign-default: `false` costs the caller a refusal; it grants
+    // nothing.
+    let is_platform_admin = state
+        .actor_repo
+        .is_platform_admin(user_id)
+        .await
+        .unwrap_or(false);
+    if !is_platform_admin {
+        return mcp_denied(
+            req_id,
+            -32601,
+            "get_sql_statement_report requires platform-admin privileges. \
+             pg_stat_statements has no tenancy dimension — its userid is a Postgres role, not a \
+             Talos user — so there is no per-tenant slice of it, and its query text can carry \
+             other tenants' identifiers. Use get_fuel_usage_report / \
+             get_workflow_performance_report for user-scoped cost instead.",
+        );
+    }
+
+    let order_by = match args.get("order_by").and_then(|v| v.as_str()) {
+        None => talos_statement_stats::OrderBy::TotalTime,
+        Some(s) => match talos_statement_stats::OrderBy::parse(s) {
+            Some(o) => o,
+            // Refused, never silently defaulted: a typo'd ordering that
+            // quietly became `total_time` would be read as a ranking the
+            // caller asked for.
+            None => {
+                return mcp_error(
+                    req_id,
+                    -32602,
+                    "order_by must be one of: total_time, calls, mean_time",
+                )
+            }
+        },
+    };
+    let limit = args
+        .get("limit")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(talos_statement_stats::DEFAULT_ROWS)
+        .clamp(1, talos_statement_stats::MAX_ROWS);
+
+    let read = talos_statement_stats::read_statement_stats(
+        &state.db_pool,
+        talos_statement_stats::ReadOptions { order_by, limit },
+    )
+    .await;
+
+    // The ONE reader of `TALOS_RPC_GUEST_ROLE` — see that function's docs for
+    // why this is not read here directly.
+    let guest = match talos_rpc_subscribers::guest_role_for_query() {
+        Some(role) => talos_statement_stats::GuestAttribution::Fenced(role.to_string()),
+        None => talos_statement_stats::GuestAttribution::Unfenced,
+    };
+
+    let summary = talos_statement_stats::summary_line(&read);
+    let machine = talos_statement_stats::render(&read, &guest);
+    crate::utils::mcp_text_with_json(req_id, &summary, machine)
 }

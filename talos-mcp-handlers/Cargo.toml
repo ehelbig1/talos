@@ -77,6 +77,15 @@ talos-inline-compile-service = { path = "../talos-inline-compile-service" }
 talos-search-service = { path = "../talos-search-service" }
 # Verifying security audit — `security_audit` is a thin wrapper over this crate.
 talos-security-audit = { path = "../talos-security-audit" }
+talos-statement-stats = { path = "../talos-statement-stats" }
+# `get_sql_statement_report` renders the Postgres ROLE each tracked statement
+# ran as, and that is only provenance when the sandbox guest-role fence is on.
+# `guest_role_for_query` is the ONE reader of TALOS_RPC_GUEST_ROLE (it also
+# applies the identifier validation, without which an invalid value would be
+# reported as a working fence). The edge already exists transitively via
+# talos-security-audit, so this direct path adds no compile time and inverts
+# nothing.
+talos-rpc-subscribers = { path = "../talos-rpc-subscribers" }
 # `latest_verifiable_execution` + `CHAIN_SETTLE_SECS` — the eligibility
 # predicate `security_audit`'s audit-chain probe must share with the standing
 # sweep. Resolved HERE rather than inside talos-security-audit so that crate
