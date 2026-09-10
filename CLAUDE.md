@@ -1130,6 +1130,122 @@ is not `\n` — and reported **82 hits across 23 files**, every HTTP and MIME
 header among them.
 
 
+### A per-call timeout spent on somebody else's inference → [`2026-09-09-the-timeout-that-was-not-per-call.md`](docs/engineering-log/2026-09-09-the-timeout-that-was-not-per-call.md)
+
+**The class, and it is a new one for this series: a resource bound whose
+denominator is not what its name says.** `LOCAL_LLM_EXCHANGE_TIMEOUT_SECS` (60 s)
+is documented as bounding **one call** — *"a cold-start with a 7B+ model can take
+20–40 s while the model loads into VRAM. 60 s gives headroom without masking an
+actually-stuck call."* Nothing made that true. Talos issued an unbounded number of
+simultaneous `/api/chat` requests to a backend that serves them **one at a time**,
+so the 60 s was **shared across every request in flight**. Reconstructed to the
+second on 2026-09-09: the second of two calls fired 1.2 s apart spent its ENTIRE
+60 s budget queued and timed out having been sent nothing to wait for.
+
+**Where the serialization actually is: NOT in Talos.** `OLLAMA_NUM_PARALLEL:1` on a
+NATIVE host Ollama 0.31.2 that this repo does not ship, does not configure and
+cannot read. **And the `talos-ollama` CONTAINER is not that Ollama** — it publishes
+no ports and serves `EMBEDDING_API_URL` only (3 810 `/v1/embeddings`, **0
+`/api/chat`** across every log line `docker logs` will surrender). Anyone debugging
+this from the container's logs sees an idle Ollama and concludes there is no herd.
+Both the worker and the controller carry `OLLAMA_URL=http://host.docker.internal:11434`.
+
+**The dose-response curve is the finding**, and the eleven-call anecdote that
+motivated the package badly undersold it. All 1 194 completed LLM module executions
+over 31 days, bucketed by concurrent LLM siblings: **0 → p50 8.5 s, 1.3 % over
+60 s; 1 → p50 37.8 s, 20 %; 2 → p50 83.3 s, 58 %; 3 → p50 1106 s, 86 %.** The
+consequence that decides the fix: **serializing is FASTER in aggregate, not merely
+fairer** — two calls whose solo p50 is 8.5 s finish in ~17 s back to back against a
+measured 37.8 s when they run together. Concurrency on a compute-saturated
+inference backend is pure overhead.
+
+**The fix is `talos-worker-runtime/src/host/llm_gate.rs`**, applied at both gated
+sites (`complete*` and `complete-with-tools`) **BEFORE** the exchange timeout
+starts, so queue time is not charged to a budget that measures one call's own
+service time. Cap `TALOS_LOCAL_LLM_MAX_IN_FLIGHT`, default **1**.
+
+**Decisions, so they are not re-litigated.**
+* **The gate QUEUES and has no error variant.** It cannot refuse, by construction —
+  the in-house precedent is every signed-RPC subject's `acquire_owned().await`, not
+  one of which has a `try_acquire`. On wait expiry
+  (`LOCAL_LLM_QUEUE_WAIT_SECS = 120`, deliberately equal to the job timeout so the
+  gate never decides a job's fate) the call **proceeds UNGATED**, i.e. degrades to
+  the pre-gate behaviour. That is what makes it a Pareto change: **there is no input
+  for which it turns a call that would have succeeded into one that is declined.**
+* **JITTER was measured and NOT shipped.** 116 of the 165 overlapping executions are
+  OUTSIDE the 12:00–12:14 UTC window and the busiest single minute is **10:00 UTC
+  (36 overlapping) — more than 12:00 (34)**, so there are at least two herds and 12
+  LLM-bearing schedules, several colliding by construction (`35 7` vs `37 7`;
+  `20 7-23/2` vs `25 7-23/2`). Jitter reaches ~30 % of the population, changes WHEN
+  a user's workflows run, and opt-in-default-off fixes nothing on the fleet that has
+  the problem. **Both would be better than either**; jitter is out of scope for a
+  package that does not touch the user's schedules, not ruled out.
+* **RAISING the timeout was DECLINED**, and the reason is epistemic rather than
+  cautious: it helps only if the killed calls' true service time is under the new
+  value, and every one of the 48 was aborted at 60 s, so that quantity is
+  unmeasurable from outside. The gate's benefit is structural instead — queue time
+  is not the call's fault.
+* **Deliberately NOT gated**: `llm_streaming.rs` (a permit held for the life of an
+  SSE stream deadlocks the two gated paths behind it); EXTERNAL providers (they
+  serve in parallel and bill per token — serializing is a latency regression for
+  nothing); and the CONTROLLER's `talos_llm::OllamaClient` (different process; this
+  package's evidence is about the worker).
+* **No alert** on `wasm_llm_gate_total{outcome}` (3 values, all PRE-SEEDED at 0) or
+  `wasm_llm_queue_wait_ms`: `acquired` climbing is the gate working, `disabled` is a
+  steady state an operator chose, and `wait_expired` degrades rather than breaks —
+  an alert on a control working as designed is check 69's trap. The wait histogram
+  records **every** local call including zero-waits, so its `_count` is the local
+  call count and a ratio can be formed.
+* **The cap cannot be right for every backend and the knob says so.** Talos cannot
+  read `OLLAMA_NUM_PARALLEL`; on a GPU host serving 4 in parallel a cap of 1
+  serializes work that could have overlapped. Default 1 matches the single-slot
+  Ollama the bundled compose file provides. An unparseable value falls back to the
+  DEFAULT, never to 0 — a typo must not silently switch a control off.
+
+**Measured and NOT changed.** `wasm_llm_duration_ms` now INCLUDES gate wait
+(`llm_start` predates the acquire) — the honest number from the guest's point of
+view, with `wasm_llm_queue_wait_ms` separating the two; stated because it is a
+meaning change to an existing series. The **attempt-window clamp is not the harm
+vector**, checked over every node of every non-archived workflow: 11 nodes in 3
+workflows, the already-documented population, none LLM-bearing, neither herd
+workflow present. Three of the brief's five named workflows have **no LLM node at
+all**.
+
+**NOT latent — live, daily, and it has already failed a workflow.** 48 sixty-second
+timeouts over 31 days (0.146 % of 32 972 `/api/chat`), **21 of them at exactly
+12:01 UTC** and 24 in the twelve minutes after 12:00. the hourly alert-triage workflow failed outright on 2026-08-27 with `workflow execution timed out after 300 seconds` in a
+window carrying six of them, and `pa-chief-of-staff` spent **174.5 s of its 180 s
+budget** on 2026-09-07 — 97 %, of which 120 s was two timeouts that bought nothing.
+
+**Guards, and what they do NOT cover.** Seven unit cases over the gate's own
+semaphore (each with a control proving a wider cap really does overlap) plus
+**three PRODUCTION-path cases** driving `wit_llm::Host::complete` and
+`wit_llm_tools::Host::complete_with_tools` against the mock provider, reading peak
+concurrency out of the **BACKEND** — with a raw-request control proving the mock and
+the runtime can serve two at once, without which "peak == 1" proves nothing. **Nine
+mutations, worst blast radius first; M8 was a SURVIVOR** — reverting the SECOND call
+site left all 651 crate tests green, because a guard at the primitive cannot see a
+call site (checks 74b/79b) — and it is now closed, so 9 of 9 are caught. **A
+correction to this package's own first draft, measured rather than assumed:
+`#[must_use]` on `LocalLlmSlot` does NOT protect the call sites** — both bind
+`Option<LocalLlmSlot>`, the attribute does not propagate through `Option`, and a
+probe reducing a site to a bare expression statement produced no clippy diagnostic
+under `-D warnings`; the doc comment now says so rather than claiming a guard it
+does not give. **No test drives worker → real Ollama**; the honest guard for the
+live path is the read after deploy. The gate is **per-PROCESS**, so the fleet
+ceiling is `WORKER_REPLICAS x cap`.
+
+**Lint: BUILT, MEASURED, REJECTED. `--count` stays 88.** *A file applying
+`LOCAL_LLM_EXCHANGE_TIMEOUT_SECS` must name `llm_gate`* reports **2 on a real
+`git worktree` of pristine `origin/main`, both real, and 0 on the fixed tree** —
+100 % precision over a population of TWO, which is the bar #765's own numbers
+rejected. Decisively it is FILE-scoped, so it would be satisfied by a file naming
+`llm_gate` in a comment while its call site discards the permit — **green over
+exactly the two quiet mutations (M2, M8) this package exists to prevent**, the
+gate-that-doesn't-gate shape (#624, checks 64/65). The second candidate — *a
+`tokio::time::timeout` over a local-LLM exchange must be preceded by an acquire* —
+is a dataflow question, not a textual one.
+
 ## Sub-workflow dispatch (engine)
 
 Every parent node that runs a sub-workflow (judge, ensemble, reflective-retry, llm-dispatch, sub_workflow) uses the shared dispatcher pattern in `controller/src/engine/parallel.rs`:

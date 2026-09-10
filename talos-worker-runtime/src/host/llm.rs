@@ -620,6 +620,26 @@ impl TalosContext {
         // `.json()` / `.text()` could hang indefinitely on a slow
         // body stream. Real prod symptom: daily-brief synthesize hung
         // 5+ minutes after the MCP-1212 re-sign fix unmasked it.
+        // Local-LLM in-flight gate. Taken BEFORE the exchange timeout starts,
+        // which is the entire point: `LOCAL_LLM_EXCHANGE_TIMEOUT_SECS` is
+        // documented as a bound on ONE call's own service time, and while this
+        // worker could issue unbounded simultaneous requests to a backend that
+        // serves them one at a time it was nothing of the sort — a call could
+        // spend the whole 60 s waiting for somebody else's inference and time
+        // out having been sent nothing. See `crate::host::llm_gate` for the
+        // measured queueing curve and for why the gate queues rather than
+        // refuses. `_llm_slot` is BOUND, never `_`: the permit is released on
+        // drop, so `let _ = …` would hold the slot for zero time and gate
+        // nothing.
+        let _llm_slot = if is_local {
+            let (slot, waited) = crate::host::llm_gate::acquire_local_llm_slot().await;
+            if let Some(ref m) = self.metrics {
+                m.record_llm_gate(slot.outcome_label(), waited.as_secs_f64() * 1000.0);
+            }
+            Some(slot)
+        } else {
+            None
+        };
         let timeout_secs: u64 = if is_local {
             LOCAL_LLM_EXCHANGE_TIMEOUT_SECS
         } else {

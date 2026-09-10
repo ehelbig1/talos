@@ -210,6 +210,19 @@ impl wit_llm_tools::Host for TalosContext {
         } else {
             self.http_client.clone()
         };
+        // Local-LLM in-flight gate — sibling of the `complete_impl` site; see
+        // `crate::host::llm_gate`. Taken BEFORE the exchange timeout so queue
+        // time is not charged to a budget that measures one call's own service
+        // time. BOUND, never `_`: dropping the value releases the permit.
+        let _llm_slot_tools = if is_local_tools {
+            let (slot, waited) = crate::host::llm_gate::acquire_local_llm_slot().await;
+            if let Some(ref m) = self.metrics {
+                m.record_llm_gate(slot.outcome_label(), waited.as_secs_f64() * 1000.0);
+            }
+            Some(slot)
+        } else {
+            None
+        };
         let timeout_secs_tools: u64 = if is_local_tools {
             LOCAL_LLM_EXCHANGE_TIMEOUT_SECS
         } else {

@@ -684,6 +684,21 @@ impl LlmFailure {
 /// variants of the WIT `Provider` enum, normalized. Deliberately NOT including
 /// `"other"`: with all four arms present in `normalize_llm_provider`, no call
 /// from `complete_impl` can reach it.
+/// Explicit bucket boundaries (milliseconds) for `wasm.llm.queue_wait_ms`.
+///
+/// Chosen against the measured shape rather than the defaults. The healthy
+/// case is a zero wait, so the first boundary is **0** — without it every
+/// un-queued call lands in the same bucket as a 100 ms one and the series
+/// cannot answer *what fraction of local calls waited at all*, which is the
+/// first question anybody asks of it. Above that the boundaries bracket the
+/// measured solo service times that a queued call is waiting behind (p50
+/// 8.5 s, p90 18 s, and the ~25 s a contended call actually takes), then
+/// climb to `LOCAL_LLM_QUEUE_WAIT_SECS` (120 s) so the fallback arm is
+/// visible as the top finite bucket rather than only as `+Inf`.
+pub(crate) const LLM_QUEUE_WAIT_BOUNDARIES_MS: &[f64] = &[
+    0.0, 10.0, 100.0, 1000.0, 5000.0, 10000.0, 20000.0, 30000.0, 60000.0, 120000.0,
+];
+
 pub(crate) const LLM_PROVIDER_LABELS: [&str; 4] = ["anthropic", "openai", "gemini", "ollama"];
 
 /// The `(provider, outcome)` pairs a live code path can actually write, and
@@ -832,6 +847,33 @@ pub struct RuntimeMetrics {
     /// Buckets: `LLM_DURATION_BOUNDARIES_MS`, whose header explains why a
     /// timeout contributes nothing here.
     pub llm_duration: Histogram<f64>,
+
+    /// Outcome of asking [`crate::host::llm_gate`] for a LOCAL-LLM slot, by
+    /// `outcome` ∈ `GATE_OUTCOME_LABELS`. → `wasm_llm_gate_total`.
+    ///
+    /// This is the series that answers *is the gate on, and is it holding?*
+    /// All three values are pre-seeded at 0, because the two that matter are
+    /// read as `increase(...) > 0` and an absent series matches nothing —
+    /// which is how "the control was never wired" and "the control has never
+    /// had to act" would otherwise render identically.
+    ///
+    /// Deliberately NOT alerted on. `acquired` climbing is the gate working;
+    /// `disabled` is a steady state an operator chose. `wait_expired` is the
+    /// only one that is a load signal, and it is bounded above by the job
+    /// timeout that already exists, so it degrades rather than breaks.
+    pub llm_gate: Counter<u64>,
+
+    /// Time a LOCAL-LLM call spent waiting for a gate permit (milliseconds).
+    /// → `wasm_llm_queue_wait_ms`.
+    ///
+    /// The point of the gate is to make the queue explicit and measurable
+    /// instead of implicit inside the inference backend, and this is the half
+    /// that measures it. Recorded on EVERY local call including the ones that
+    /// waited zero — a histogram over only the waits would have no
+    /// denominator, so `queue_wait_ms_count` would stop matching the local
+    /// call count and no ratio could be formed. Buckets start at 0 for that
+    /// reason.
+    pub llm_queue_wait: Histogram<f64>,
 
     /// `llm::complete*` calls that did NOT return a completion, by
     /// `(provider, outcome)`. → `wasm_llm_failures_total`.
@@ -1074,6 +1116,22 @@ impl RuntimeMetrics {
                 .with_description("Successful llm::complete* duration in milliseconds")
                 .with_boundaries(LLM_DURATION_BOUNDARIES_MS.to_vec())
                 .build(),
+            llm_gate: meter
+                .u64_counter("wasm.llm.gate")
+                .with_description(
+                    "Local-LLM in-flight gate outcomes by outcome \
+                     (acquired | disabled | wait_expired); local providers only",
+                )
+                .build(),
+            llm_queue_wait: meter
+                .f64_histogram("wasm.llm.queue_wait_ms")
+                .with_description(
+                    "Time a local-LLM call waited for an in-flight permit, in \
+                     milliseconds; recorded for every local call including \
+                     zero-waits, so its count is the local call count",
+                )
+                .with_boundaries(LLM_QUEUE_WAIT_BOUNDARIES_MS.to_vec())
+                .build(),
             // → `wasm_llm_failures_total`. See the field doc for the scope
             // this does and does not cover.
             llm_failures: meter
@@ -1220,6 +1278,12 @@ impl RuntimeMetrics {
                     KeyValue::new("outcome", outcome.label()),
                 ],
             );
+        }
+        // All three gate outcomes. `wait_expired` is the one an operator
+        // watches and its healthy value is 0 forever, which is exactly the
+        // shape an ABSENT series renders as too.
+        for outcome in crate::host::llm_gate::GATE_OUTCOME_LABELS {
+            self.llm_gate.add(0, &[KeyValue::new("outcome", outcome)]);
         }
     }
 
@@ -1385,6 +1449,19 @@ impl RuntimeMetrics {
         let normalized = normalize_token_direction(direction);
         self.llm_token_usage
             .add(count, &[KeyValue::new("direction", normalized)]);
+    }
+
+    /// Record the outcome of one local-LLM gate acquisition, and the wait it
+    /// cost.
+    ///
+    /// SECURITY: `outcome` comes from `LocalLlmSlot::outcome_label`, a closed
+    /// compile-time set of three `&'static str`. No model name, module id,
+    /// provider string or guest-derived value reaches a label here — an LLM
+    /// call's inputs are user data and none of them may become metric
+    /// cardinality.
+    pub fn record_llm_gate(&self, outcome: &'static str, wait_ms: f64) {
+        self.llm_gate.add(1, &[KeyValue::new("outcome", outcome)]);
+        self.llm_queue_wait.record(wait_ms, &[]);
     }
 
     /// Record an execution cancellation.
