@@ -227,7 +227,10 @@ bounds (e.g. `max_iterations` caps at 50 for agent loops).
 // is bounded by the run's remaining budget (minus a 2 s reserve) and fails as
 // a clean NODE error instead of the whole run being dropped. The same pair
 // applies to judge / ensemble / reflective_retry / llm_dispatch /
-// capability_dispatch / agent_loop children.
+// capability_dispatch / dispatch (expression) children; agent_loop and
+// react_loop ALWAYS enforce their per-iteration `timeout_secs` and have no
+// opt-in. The `add_*_node` MCP tools accept `enforce_timeout` and persist it
+// only when supplied.
 { "sub_workflow_id": "uuid", "timeout_secs": 30, "enforce_timeout": true }
 ```
 

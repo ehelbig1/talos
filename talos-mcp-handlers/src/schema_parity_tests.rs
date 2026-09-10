@@ -225,3 +225,67 @@ fn every_advertised_tool_has_a_dispatch_arm() {
         "advertised tools with NO dispatch arm (clients get -32601): {orphans:?}"
     );
 }
+
+/// #796 / 2026-09-10: child-node `timeout_secs` is enforced only with the
+/// `enforce_timeout` opt-in, and the engine applies that rule to exactly the
+/// seven kinds routed through `graph_parser::child_timeout_secs`
+/// (sub_workflow, dispatch, capability_dispatch, judge, ensemble,
+/// reflective_retry, llm_dispatch). Agent/ReAct loops always enforce theirs.
+/// Three drifts this kills: a tool that advertises the opt-in for a kind the
+/// engine does not read it on; a tool whose `timeout_secs` description still
+/// reads as unconditionally enforced; and an eighth child kind added without
+/// either half.
+#[test]
+fn child_timeout_opt_in_is_advertised_exactly_where_the_engine_reads_it() {
+    let expected: BTreeSet<&str> = [
+        "add_sub_workflow_node",
+        "add_expression_dispatch_node",
+        "add_capability_dispatch_node",
+        "add_judge_node",
+        "add_ensemble_node",
+        "add_reflective_retry_node",
+        "add_llm_dispatch_node",
+    ]
+    .into_iter()
+    .collect();
+    let mut found: BTreeSet<String> = BTreeSet::new();
+    for (module, schemas) in all_static_schemas() {
+        for schema in schemas {
+            let name = schema["name"].as_str().unwrap_or("");
+            let props = &schema["inputSchema"]["properties"];
+            let Some(props) = props.as_object() else {
+                continue;
+            };
+            if let Some(enforce) = props.get("enforce_timeout") {
+                found.insert(name.to_string());
+                assert_eq!(
+                    enforce["type"].as_str(),
+                    Some("boolean"),
+                    "{module}::{name}: enforce_timeout must be a boolean"
+                );
+                let desc = props
+                    .get("timeout_secs")
+                    .and_then(|p| p["description"].as_str())
+                    .unwrap_or_else(|| {
+                        panic!("{module}::{name}: enforce_timeout without timeout_secs")
+                    });
+                assert!(
+                    desc.contains("enforce_timeout"),
+                    "{module}::{name}: timeout_secs description must state the opt-in, got {desc:?}"
+                );
+            } else if let Some(ts) = props.get("timeout_secs") {
+                // A child kind that never gained the flag must not READ as opt-in.
+                let desc = ts["description"].as_str().unwrap_or("");
+                assert!(
+                    !desc.contains("enforce_timeout") || desc.contains("no enforce_timeout"),
+                    "{module}::{name}: timeout_secs mentions enforce_timeout but the tool does not accept it"
+                );
+            }
+        }
+    }
+    let found_refs: BTreeSet<&str> = found.iter().map(String::as_str).collect();
+    assert_eq!(
+        found_refs, expected,
+        "tools advertising enforce_timeout must be exactly the engine's child_timeout_secs kinds"
+    );
+}
