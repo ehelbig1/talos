@@ -26,6 +26,254 @@ use uuid::Uuid;
 // full engine's policy adapters and (b) has to inspect `rf_to_module`
 // mapping after the fact.
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Pure planning: what this walker will and will not chain (2026-09-10).
+//
+// The chain walker executes the MODULE-ONLY subgraph of a workflow: it adds
+// one engine node per distinct module UUID and wires only the edges whose
+// BOTH endpoints are module nodes. `system:*` nodes (collect, sub_workflow,
+// judge, …) are not chained here — they belong to the full engine load path.
+// Before this planner existed the walker resolved the actor, built the
+// engine, spawned the `workflow_executions` INSERT and only THEN learned, from
+// the engine's own cycle check, that the graph could not run — so every
+// module-bound dispatch left a WARN and a `failed` execution row per
+// unrunnable workflow. Measured on the dev fleet 2026-09-10: one webhook POST
+// bound to the echo module matched five draft stress workflows; 5 of their 6
+// edges touch a `system:*` node (each logged as a WARN "edge skipped"), and
+// one — `stress-03-conditional`, two nodes running the SAME module with an
+// edge between them — collapsed into a self-loop and failed as "workflow
+// graph contains a cycle" on every dispatch.
+//
+// That collapse is a stated LIMIT of this walker, not a graph defect: engine
+// nodes are keyed by module id because the seeded trigger result is keyed by
+// `trigger_module_id`, so two nodes running one module become one node and an
+// edge between them a self-loop. The planner dedupes such nodes (first rf id
+// wins) and reports the cyclic case ONCE, before any DB work, as a skip.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A module-backed node this walker will add to the chain engine.
+#[derive(Debug, Clone)]
+pub struct ChainModuleNode {
+    /// React Flow node id (the graph's string id).
+    pub rf_id: String,
+    /// The module the node runs — also the engine node id on this path.
+    pub module_id: Uuid,
+    /// The node's JSON, retained so the retry policy can be read from it.
+    pub node: Value,
+}
+
+/// How one graph edge relates to the module-only subgraph.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainEdgeClass {
+    /// Both endpoints are module nodes — wired into the chain engine.
+    ModuleToModule { src: Uuid, tgt: Uuid },
+    /// At least one endpoint is a node the graph DECLARES but this walker
+    /// does not chain (a `system:*` node, or a node with no module id).
+    /// EXPECTED on this path — logged at DEBUG, never WARN.
+    SystemEndpoint { src_rf: String, tgt_rf: String },
+    /// An endpoint names an rf id that appears in no node at all — a
+    /// genuinely broken graph, still worth a WARN.
+    Dangling {
+        src_rf: String,
+        tgt_rf: String,
+        src_found: bool,
+        tgt_found: bool,
+    },
+}
+
+/// Why a matched workflow is NOT dispatched by the chain walker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChainSkip {
+    /// The module id matched the graph text but no node runs it (an id
+    /// embedded in a description or config, not a module node).
+    NoTriggerNode,
+    /// The module-only subgraph has a cycle, so the engine would refuse it
+    /// at `run_with_seed`. `collapsed_self_loops` counts the edges that
+    /// became self-loops because both endpoints run the same module — the
+    /// walker's keying limit rather than an authored loop.
+    CyclicModuleGraph { collapsed_self_loops: usize },
+}
+
+impl ChainSkip {
+    /// Stable `event_kind` token for the skip log line.
+    pub fn event_kind(&self) -> &'static str {
+        match self {
+            ChainSkip::NoTriggerNode => "chain_skipped_no_trigger_node",
+            ChainSkip::CyclicModuleGraph { .. } => "chain_skipped_cyclic_module_graph",
+        }
+    }
+}
+
+/// The plan for one matched workflow: nodes to add, edges classified, and
+/// the verdict on whether to dispatch at all.
+#[derive(Debug, Clone)]
+pub struct ChainPlan {
+    /// Distinct module nodes, deduped by `module_id` (first rf id wins).
+    pub module_nodes: Vec<ChainModuleNode>,
+    /// `(rf_id, module_id)` of nodes dropped by the dedupe — the trigger
+    /// result is keyed by module id, so a second node on the same module
+    /// cannot be represented on this path.
+    pub collapsed_duplicates: Vec<(String, Uuid)>,
+    /// Every edge in the graph, classified.
+    pub edges: Vec<ChainEdgeClass>,
+    /// The trigger module runs in this graph.
+    pub has_trigger: bool,
+    /// At least one OTHER module node exists (something to chain into).
+    pub has_downstream: bool,
+    /// `Some` when the walker must not dispatch this workflow.
+    pub skip: Option<ChainSkip>,
+}
+
+/// Read the module UUID a graph node runs, if any. May be stored under
+/// `type` (save v1) or `data.moduleId` (save v2); a non-UUID `type` such as
+/// `talosNode` or `system:collect` is not a module.
+fn node_module_id(node: &Value) -> Option<Uuid> {
+    node.get("type")
+        .and_then(|v| v.as_str())
+        .and_then(|s| Uuid::parse_str(s).ok())
+        .or_else(|| {
+            node.get("data")
+                .and_then(|d| d.get("moduleId"))
+                .and_then(|v| v.as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+        })
+}
+
+/// Kahn's algorithm over the deduped module-id graph. Self-loops count as
+/// cycles (a node with a self-edge never reaches in-degree zero).
+fn module_graph_is_cyclic(nodes: &[Uuid], edges: &[(Uuid, Uuid)]) -> bool {
+    let mut indeg: HashMap<Uuid, usize> = nodes.iter().map(|n| (*n, 0)).collect();
+    let mut out: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+    for (s, t) in edges {
+        if !indeg.contains_key(s) || !indeg.contains_key(t) {
+            continue;
+        }
+        *indeg.get_mut(t).expect("target present") += 1;
+        out.entry(*s).or_default().push(*t);
+    }
+    let mut ready: Vec<Uuid> = indeg
+        .iter()
+        .filter(|(_, d)| **d == 0)
+        .map(|(n, _)| *n)
+        .collect();
+    let mut visited = 0usize;
+    while let Some(n) = ready.pop() {
+        visited += 1;
+        if let Some(ts) = out.get(&n) {
+            for t in ts {
+                let d = indeg.get_mut(t).expect("target present");
+                *d -= 1;
+                if *d == 0 {
+                    ready.push(*t);
+                }
+            }
+        }
+    }
+    visited != nodes.len()
+}
+
+/// Classify a workflow graph for the chain walker. Pure: no I/O, no logging.
+///
+/// `graph` is the parsed `workflows.graph_json`. Nodes with a missing `id`
+/// are ignored, so an edge naming them reads as dangling.
+pub fn plan_workflow_chain(graph: &Value, trigger_module_id: Uuid) -> ChainPlan {
+    use std::collections::HashSet;
+    let empty = vec![];
+    let nodes = graph
+        .get("nodes")
+        .and_then(|n| n.as_array())
+        .unwrap_or(&empty);
+    let edges = graph
+        .get("edges")
+        .and_then(|e| e.as_array())
+        .unwrap_or(&empty);
+
+    let mut rf_to_module: HashMap<String, Uuid> = HashMap::new();
+    let mut declared: HashSet<String> = HashSet::new();
+    let mut module_nodes: Vec<ChainModuleNode> = Vec::new();
+    let mut seen_modules: HashSet<Uuid> = HashSet::new();
+    let mut collapsed_duplicates: Vec<(String, Uuid)> = Vec::new();
+
+    for node in nodes {
+        let rf_id = node.get("id").and_then(|v| v.as_str()).unwrap_or("");
+        if rf_id.is_empty() {
+            continue;
+        }
+        declared.insert(rf_id.to_string());
+        if let Some(module_id) = node_module_id(node) {
+            rf_to_module.insert(rf_id.to_string(), module_id);
+            if seen_modules.insert(module_id) {
+                module_nodes.push(ChainModuleNode {
+                    rf_id: rf_id.to_string(),
+                    module_id,
+                    node: node.clone(),
+                });
+            } else {
+                collapsed_duplicates.push((rf_id.to_string(), module_id));
+            }
+        }
+    }
+
+    let has_trigger = seen_modules.contains(&trigger_module_id);
+    let has_downstream = seen_modules.iter().any(|m| *m != trigger_module_id);
+
+    let mut classified = Vec::with_capacity(edges.len());
+    let mut module_edges: Vec<(Uuid, Uuid)> = Vec::new();
+    let mut collapsed_self_loops = 0usize;
+    for edge in edges {
+        let src_rf = edge.get("source").and_then(|v| v.as_str()).unwrap_or("");
+        let tgt_rf = edge.get("target").and_then(|v| v.as_str()).unwrap_or("");
+        match (rf_to_module.get(src_rf), rf_to_module.get(tgt_rf)) {
+            (Some(&src), Some(&tgt)) => {
+                if src == tgt && src_rf != tgt_rf {
+                    collapsed_self_loops += 1;
+                }
+                module_edges.push((src, tgt));
+                classified.push(ChainEdgeClass::ModuleToModule { src, tgt });
+            }
+            _ => {
+                let src_found = declared.contains(src_rf);
+                let tgt_found = declared.contains(tgt_rf);
+                if src_found && tgt_found {
+                    classified.push(ChainEdgeClass::SystemEndpoint {
+                        src_rf: src_rf.to_string(),
+                        tgt_rf: tgt_rf.to_string(),
+                    });
+                } else {
+                    classified.push(ChainEdgeClass::Dangling {
+                        src_rf: src_rf.to_string(),
+                        tgt_rf: tgt_rf.to_string(),
+                        src_found,
+                        tgt_found,
+                    });
+                }
+            }
+        }
+    }
+
+    let skip = if !has_trigger {
+        Some(ChainSkip::NoTriggerNode)
+    } else {
+        let ids: Vec<Uuid> = module_nodes.iter().map(|n| n.module_id).collect();
+        if module_graph_is_cyclic(&ids, &module_edges) {
+            Some(ChainSkip::CyclicModuleGraph {
+                collapsed_self_loops,
+            })
+        } else {
+            None
+        }
+    };
+
+    ChainPlan {
+        module_nodes,
+        collapsed_duplicates,
+        edges: classified,
+        has_trigger,
+        has_downstream,
+        skip,
+    }
+}
+
 /// Find all workflows that contain `trigger_module_id` and execute their
 /// downstream nodes in-process, with `event_data` pre-seeded as the trigger
 /// module's output.
@@ -35,6 +283,20 @@ use uuid::Uuid;
 ///
 /// This function is best-effort — errors are logged as warnings and do not
 /// propagate to the caller.
+///
+/// # Bounds
+///
+/// Every caller (`talos-webhooks` router step 12, the three
+/// `talos-google-calendar` push handlers) runs this inside `tokio::spawn`, so
+/// it is never awaited on an HTTP response path. Within it: at most
+/// `TALOS_CHAIN_MAX_WORKFLOWS` (default 50) workflows per dispatch, at most
+/// `TALOS_CHAIN_CONCURRENCY` (default 8) chains in flight, and each chain
+/// engine carries the engine defaults — `DEFAULT_WORKFLOW_EXECUTION_TIMEOUT_SECS`
+/// (300 s) and `DEFAULT_MAX_WORKFLOW_NODES` (500) — because `for_skip_load`
+/// uses `TimeoutPolicy::Honor` with no graph-level override on this path.
+/// Unrunnable graphs (no trigger node, cyclic module subgraph) are skipped by
+/// [`plan_workflow_chain`] BEFORE the auth resolve, the engine build and the
+/// execution-row INSERT.
 pub async fn run_workflow_chains(
     nats_client: Arc<async_nats::Client>,
     secrets_manager: Arc<SecretsManager>,
@@ -70,21 +332,39 @@ pub async fn run_workflow_chains(
         .filter(|n| *n > 0)
         .unwrap_or(50);
 
-    // The NARROW lifecycle gate (2026-09-07), in SQL rather than classified in
-    // Rust — and the reason is the LIMIT directly below it. This is a capped
-    // FAN-OUT, not a by-id dispatch: filtering after the read would let
-    // retired workflows consume cap slots and silently displace live ones from
-    // the chain set, so the predicate has to be inside the query the cap is
-    // applied to. The consequence, stated rather than glossed: an archived
-    // workflow simply is not in the fan-out and NO per-workflow refusal is
-    // counted here (`talos_dispatch_refused_total` has no `chain` label for
-    // exactly that reason). This is also the path every Google Calendar push
-    // notification and every webhook MODULE dispatch fans out through.
-    let not_retired = talos_workflow_liveness::not_retired_sql(None);
+    // The liveness predicate has ONE home — `talos_workflow_liveness`
+    // (check 87). It is in SQL rather than classified in Rust because of the
+    // LIMIT directly below: this is a capped FAN-OUT, not a by-id dispatch, so
+    // filtering after the read would let retired or paused workflows consume
+    // cap slots and silently displace live ones from the chain set.
+    //
+    // 2026-09-10: moved from `not_retired_sql` (archived-only) to
+    // `dispatchable_sql` (`status <> 'archived' AND is_enabled`), which is the
+    // predicate the workflow-bound trigger gate already applies
+    // (`OrchestrationError::WorkflowNotLive`). Before this an operator's
+    // `disable_workflow` stopped the workflow's own webhook/schedule but NOT a
+    // module-bound webhook chaining into it. Latent on the reference fleet
+    // (no workflow is disabled) and stated as a behaviour change. As before,
+    // an excluded workflow is simply not in the fan-out and NO per-workflow
+    // refusal is counted (`talos_dispatch_refused_total` has no `chain`
+    // label). This is the path every Google Calendar push notification and
+    // every webhook MODULE dispatch fans out through.
+    //
+    // Why `graph_json LIKE` and not the `workflow_module_refs` junction: the
+    // junction is written only by the GraphQL save hook
+    // (`sync_workflow_module_refs`) — the MCP graph mutations do not maintain
+    // it — so keying the fan-out on it would silently drop chains for every
+    // MCP-authored workflow. The LIKE is a text prefilter (a UUID has no
+    // false positives worth the name) and `plan_workflow_chain` then requires
+    // an actual module NODE running the trigger before anything is dispatched.
+    // Measured 2026-09-10: 0.2 ms over 36 workflows — the scan is not the cost
+    // on this path; the per-workflow auth resolve and engine build are, which
+    // is why the plan runs before both.
+    let dispatchable = talos_workflow_liveness::dispatchable_sql(None);
     let workflows = match sqlx::query_as::<_, (Uuid, String, Option<Uuid>)>(&format!(
         "SELECT id, graph_json, actor_id \
          FROM workflows \
-         WHERE user_id = $1 AND graph_json LIKE $2 AND {not_retired} \
+         WHERE user_id = $1 AND graph_json LIKE $2 AND {dispatchable} \
          ORDER BY updated_at DESC, id DESC \
          LIMIT $3"
     ))
@@ -199,6 +479,161 @@ pub async fn run_workflow_chains(
     Ok(())
 }
 
+/// Read a chain node's retry policy from its graph JSON, applying the
+/// unbudgeted / budgeted caps. Lifted verbatim out of the node loop so the
+/// loop can iterate a [`ChainPlan`]; every constant and comment is unchanged.
+fn read_chain_retry_policy(node: &Value, workflow_actor_id: Option<Uuid>) -> Option<RetryPolicy> {
+    // MCP-814 (2026-05-14): mirror the sibling
+    // `talos-workflow-engine::graph_parser::read_node_retry_policy_with_actor_cap`
+    // cap on unbudgeted (actor-less) chain dispatch.
+    // Pre-fix this reimplemented retry-policy reader
+    // accepted any `retry_count` value verbatim — a
+    // workflow with `retry_count: 999999` (whether
+    // operator typo or LLM-generated malformed JSON)
+    // would loop ~1M times per node, saturating worker
+    // fuel before the actor budget gate could fire.
+    // The cap only applies when this chain has no
+    // actor binding (`workflow_actor_id.is_none()`);
+    // actor-bound chains rely on the per-actor budget
+    // ceiling to bound retry cost at a higher layer,
+    // matching the sibling helper's policy.
+    //
+    // Helper is `pub(crate)` in the sibling repo so it
+    // can't be imported here; inlining the constant
+    // matches the cross-repo convention until the
+    // helper is promoted to `pub`.
+    const MAX_RETRIES_UNBUDGETED: u32 = 3;
+
+    // MCP-1174 (2026-05-17): absolute ceiling on retry
+    // count even when an owning actor is present.
+    // Pre-fix the actor-budgeted path applied no upper
+    // cap — `retry_count: 4_000_000_000` (close to
+    // u32::MAX from MCP-962's saturation) was accepted
+    // verbatim. Combined with MCP-1173's
+    // retry_backoff_ms ≤ 1 hour cap, the worst-case
+    // workflow stall is ~450,000 years; but if
+    // `retry_backoff_ms = 0` is configured (no
+    // floor-check), the engine thrashes through retries
+    // at ~1000/sec, with each iteration costing one
+    // DB UPDATE + one audit-log row. 1000 is generous
+    // for legitimate exponential-backoff schemes
+    // (10^10 attempts at 100ms each = ~11 days, too
+    // long for any sane workflow) — past this the
+    // operator should redesign the workflow rather
+    // than crank a counter. Same family as MCP-1173,
+    // MCP-962, MCP-960/961.
+    const MAX_RETRIES_BUDGETED: u32 = 1000;
+
+    // MCP-962 (2026-05-15): saturate u64 → u32 instead
+    // of wrapping. Pre-fix `v as u32` on `retry_count:
+    // 5_000_000_000` wrapped to ~705M, asking the
+    // engine to retry 705 million times. Saturating
+    // at u32::MAX caps the worst case to the
+    // already-cooked retry budget (still bounded by
+    // MAX_RETRIES_UNBUDGETED downstream when no
+    // budget is set). Same family as MCP-960/961.
+    let retry_count = node
+        .get("retry_count")
+        .or_else(|| node.get("data").and_then(|d| d.get("retry_count")))
+        .and_then(|v| v.as_u64())
+        .map(|v| u32::try_from(v).unwrap_or(u32::MAX));
+    // MCP-1173 (2026-05-17): cap retry_backoff_ms at 1
+    // hour. Pre-fix the value was read with no upper
+    // bound — a misconfigured node could set
+    // `retry_backoff_ms: 999_999_999_999` (~31 years)
+    // which the retry executor would sleep on between
+    // attempts. Realistic operator values: 100 ms to
+    // a few minutes; legitimate exponential-backoff
+    // ceilings don't exceed 1 hour per attempt. Same
+    // family as MCP-962 (retry_count saturation) and
+    // MCP-960/961 (signed/unsigned cast guards). Cap
+    // at u64-clamp via `.min()` so the saturation
+    // produces a finite, operator-recognisable
+    // worst-case sleep instead of "the workflow froze
+    // forever".
+    //
+    // MCP-1175 (2026-05-17): floor at MIN_RETRY_BACKOFF_MS.
+    // `retry_backoff_ms: 0` (or missing-then-floored)
+    // combined with MCP-1174's MAX_RETRIES_BUDGETED=1000
+    // produces a tight-loop retry path: ~1000 DB UPDATEs
+    // (mark_execution_running) + 1000 audit-log INSERTs
+    // (execution_events) per execution within ~1 second.
+    // Sustained for a misconfigured workflow this hits
+    // the controller's connection pool and the audit-log
+    // table's write rate. 50 ms is below any sane
+    // exponential-backoff floor for an external service
+    // (typical: 100 ms - 1 s) and above the threshold
+    // where the retry path becomes DB-write-bound. Same
+    // floor-cap-on-tight-loop class as MCP-663
+    // (MCP_TOKEN_REVALIDATION_INTERVAL_SECS positive
+    // floor) and the rate-limit-window busy-loop class.
+    const MAX_RETRY_BACKOFF_MS: u64 = 60 * 60 * 1000; // 1 hour
+    const MIN_RETRY_BACKOFF_MS: u64 = 50;
+    let retry_backoff = node
+        .get("retry_backoff_ms")
+        .or_else(|| node.get("data").and_then(|d| d.get("retry_backoff_ms")))
+        .and_then(|v| v.as_u64())
+        .map(|v| v.clamp(MIN_RETRY_BACKOFF_MS, MAX_RETRY_BACKOFF_MS));
+    let retry_condition = node
+        .get("retry_condition")
+        .or_else(|| node.get("data").and_then(|d| d.get("retry_condition")))
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let retry_delay_expression = node
+        .get("retry_delay_expression")
+        .or_else(|| {
+            node.get("data")
+                .and_then(|d| d.get("retry_delay_expression"))
+        })
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let has_any = retry_count.is_some()
+        || retry_backoff.is_some()
+        || retry_condition.is_some()
+        || retry_delay_expression.is_some();
+    if has_any {
+        // Only `retry_count` answers "how many". The other
+        // three keys answer "how far apart" or "when", so
+        // a node declaring only those leaves the count
+        // UNDECLARED (`None`) and the method-aware
+        // classifier answers it at dispatch, exactly as it
+        // does for a node with no retry keys at all.
+        // Pre-fix this synthesised 2 for ANY capability
+        // world — including governance / messaging /
+        // database, which fail closed to 0 precisely so a
+        // retry cannot double-fire a non-idempotent send.
+        // Sibling of the same defect in
+        // `talos-workflow-engine::graph_parser`.
+        //
+        // Both caps below clamp a DECLARED value only:
+        // they exist to bound an absurd author-supplied
+        // count, and there is nothing to bound when the
+        // author supplied nothing. Clamping `None` into a
+        // number here would reintroduce the invented
+        // count. The classifier's own answers (0 or 2) sit
+        // under both caps, so no resolved value moves.
+        let max_retries = retry_count.map(|n| {
+            if workflow_actor_id.is_none() {
+                n.min(MAX_RETRIES_UNBUDGETED)
+            } else {
+                // MCP-1174: even with an owning actor, cap
+                // the absolute count to prevent the
+                // 4-billion-retry foot-gun the MCP-962
+                // saturation alone left exposed.
+                n.min(MAX_RETRIES_BUDGETED)
+            }
+        });
+        Some(RetryPolicy {
+            max_retries,
+            backoff_ms: retry_backoff.unwrap_or(talos_workflow_engine_core::DEFAULT_BACKOFF_MS),
+            retry_condition,
+            retry_delay_expression,
+        })
+    } else {
+        None
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_single_workflow_chain(
     nats_client: Arc<async_nats::Client>,
@@ -225,6 +660,55 @@ async fn run_single_workflow_chain(
     trigger_execution_id: Uuid,
     trigger_error: Option<String>,
 ) -> Result<(), String> {
+    // Plan FIRST — pure, no I/O. A workflow the walker cannot run (no node
+    // runs the trigger module; cyclic module subgraph) is skipped here, before
+    // the auth resolve, the engine build and the execution-row INSERT that
+    // used to precede the engine's own cycle check.
+    let graph: Value =
+        serde_json::from_str(graph_json).map_err(|e| format!("Invalid graph_json: {}", e))?;
+    let plan = plan_workflow_chain(&graph, trigger_module_id);
+    if let Some(skip) = &plan.skip {
+        match skip {
+            ChainSkip::NoTriggerNode => {
+                // The module id matched the graph TEXT but no node runs it.
+                tracing::debug!(
+                    workflow_id = %workflow_id,
+                    trigger_module_id = %trigger_module_id,
+                    "workflow_chains: workflow mentions the trigger module but no node runs it — nothing to chain"
+                );
+            }
+            ChainSkip::CyclicModuleGraph {
+                collapsed_self_loops,
+            } => {
+                // ONE line per (workflow, dispatch), with the id, and no
+                // `failed` execution row. `collapsed_self_loops > 0` means the
+                // cycle is this walker's module-id keying (two nodes on one
+                // module with an edge between them), not an authored loop.
+                tracing::warn!(
+                    target: "talos_engine",
+                    event_kind = skip.event_kind(),
+                    workflow_id = %workflow_id,
+                    trigger_module_id = %trigger_module_id,
+                    trigger_context_id = %trigger_context_id,
+                    module_nodes = plan.module_nodes.len(),
+                    collapsed_self_loops,
+                    "workflow_chains: module subgraph is cyclic — workflow skipped for this dispatch \
+                     (an edge between two nodes running the SAME module collapses to a self-loop on \
+                     the chain path; give each chained step its own module or route the workflow \
+                     through its own trigger instead of a module-bound one)"
+                );
+            }
+        }
+        return Ok(());
+    }
+    if !plan.collapsed_duplicates.is_empty() {
+        tracing::debug!(
+            workflow_id = %workflow_id,
+            collapsed = ?plan.collapsed_duplicates,
+            "workflow_chains: nodes sharing a module id collapsed into one engine node"
+        );
+    }
+
     // MCP-708 (2026-05-13): upgraded from MCP-555's budget-only
     // `check_execution_allowed` to the full
     // `authorize_workflow_trigger` gate (status + budget + capability-
@@ -354,17 +838,6 @@ async fn run_single_workflow_chain(
         }
     };
 
-    let graph: Value =
-        serde_json::from_str(graph_json).map_err(|e| format!("Invalid graph_json: {}", e))?;
-
-    let empty_vec = vec![];
-    let nodes = graph
-        .get("nodes")
-        .and_then(|n| n.as_array())
-        .unwrap_or(&empty_vec);
-
-    // Build React Flow node ID → module UUID mapping.
-    let mut rf_to_module: HashMap<String, Uuid> = HashMap::new();
     let registry = Arc::new(ModuleRegistry::new(db_pool.clone(), redis_client.clone()));
     // Build via the canonical EngineBuilder. `for_skip_load` because the
     // chain runner assembles the graph programmatically below via
@@ -405,237 +878,72 @@ async fn run_single_workflow_chain(
                 return Err(format!("engine build failed: {}", engine_err));
             }
         };
-    let mut has_trigger = false;
-    let mut has_downstream = false;
-
-    for node in nodes {
-        let rf_id = node.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        // Module UUID may be stored under "type" (save v1) or "data.moduleId" (save v2).
-        let module_id_str = node
-            .get("type")
-            .and_then(|v| v.as_str())
-            .filter(|s| Uuid::parse_str(s).is_ok()) // skip non-UUID "type" values like "talosNode"
-            .or_else(|| {
-                node.get("data")
-                    .and_then(|d| d.get("moduleId"))
-                    .and_then(|v| v.as_str())
-            });
-        if let Some(module_id_str) = module_id_str {
-            if let Ok(module_id) = Uuid::parse_str(module_id_str) {
-                tracing::debug!(
-                    rf_id,
-                    module_id = %module_id,
-                    "workflow_chains: mapped node"
-                );
-                rf_to_module.insert(rf_id.to_string(), module_id);
-                let retry_policy = {
-                    // MCP-814 (2026-05-14): mirror the sibling
-                    // `talos-workflow-engine::graph_parser::read_node_retry_policy_with_actor_cap`
-                    // cap on unbudgeted (actor-less) chain dispatch.
-                    // Pre-fix this reimplemented retry-policy reader
-                    // accepted any `retry_count` value verbatim — a
-                    // workflow with `retry_count: 999999` (whether
-                    // operator typo or LLM-generated malformed JSON)
-                    // would loop ~1M times per node, saturating worker
-                    // fuel before the actor budget gate could fire.
-                    // The cap only applies when this chain has no
-                    // actor binding (`workflow_actor_id.is_none()`);
-                    // actor-bound chains rely on the per-actor budget
-                    // ceiling to bound retry cost at a higher layer,
-                    // matching the sibling helper's policy.
-                    //
-                    // Helper is `pub(crate)` in the sibling repo so it
-                    // can't be imported here; inlining the constant
-                    // matches the cross-repo convention until the
-                    // helper is promoted to `pub`.
-                    const MAX_RETRIES_UNBUDGETED: u32 = 3;
-
-                    // MCP-1174 (2026-05-17): absolute ceiling on retry
-                    // count even when an owning actor is present.
-                    // Pre-fix the actor-budgeted path applied no upper
-                    // cap — `retry_count: 4_000_000_000` (close to
-                    // u32::MAX from MCP-962's saturation) was accepted
-                    // verbatim. Combined with MCP-1173's
-                    // retry_backoff_ms ≤ 1 hour cap, the worst-case
-                    // workflow stall is ~450,000 years; but if
-                    // `retry_backoff_ms = 0` is configured (no
-                    // floor-check), the engine thrashes through retries
-                    // at ~1000/sec, with each iteration costing one
-                    // DB UPDATE + one audit-log row. 1000 is generous
-                    // for legitimate exponential-backoff schemes
-                    // (10^10 attempts at 100ms each = ~11 days, too
-                    // long for any sane workflow) — past this the
-                    // operator should redesign the workflow rather
-                    // than crank a counter. Same family as MCP-1173,
-                    // MCP-962, MCP-960/961.
-                    const MAX_RETRIES_BUDGETED: u32 = 1000;
-
-                    // MCP-962 (2026-05-15): saturate u64 → u32 instead
-                    // of wrapping. Pre-fix `v as u32` on `retry_count:
-                    // 5_000_000_000` wrapped to ~705M, asking the
-                    // engine to retry 705 million times. Saturating
-                    // at u32::MAX caps the worst case to the
-                    // already-cooked retry budget (still bounded by
-                    // MAX_RETRIES_UNBUDGETED downstream when no
-                    // budget is set). Same family as MCP-960/961.
-                    let retry_count = node
-                        .get("retry_count")
-                        .or_else(|| node.get("data").and_then(|d| d.get("retry_count")))
-                        .and_then(|v| v.as_u64())
-                        .map(|v| u32::try_from(v).unwrap_or(u32::MAX));
-                    // MCP-1173 (2026-05-17): cap retry_backoff_ms at 1
-                    // hour. Pre-fix the value was read with no upper
-                    // bound — a misconfigured node could set
-                    // `retry_backoff_ms: 999_999_999_999` (~31 years)
-                    // which the retry executor would sleep on between
-                    // attempts. Realistic operator values: 100 ms to
-                    // a few minutes; legitimate exponential-backoff
-                    // ceilings don't exceed 1 hour per attempt. Same
-                    // family as MCP-962 (retry_count saturation) and
-                    // MCP-960/961 (signed/unsigned cast guards). Cap
-                    // at u64-clamp via `.min()` so the saturation
-                    // produces a finite, operator-recognisable
-                    // worst-case sleep instead of "the workflow froze
-                    // forever".
-                    //
-                    // MCP-1175 (2026-05-17): floor at MIN_RETRY_BACKOFF_MS.
-                    // `retry_backoff_ms: 0` (or missing-then-floored)
-                    // combined with MCP-1174's MAX_RETRIES_BUDGETED=1000
-                    // produces a tight-loop retry path: ~1000 DB UPDATEs
-                    // (mark_execution_running) + 1000 audit-log INSERTs
-                    // (execution_events) per execution within ~1 second.
-                    // Sustained for a misconfigured workflow this hits
-                    // the controller's connection pool and the audit-log
-                    // table's write rate. 50 ms is below any sane
-                    // exponential-backoff floor for an external service
-                    // (typical: 100 ms - 1 s) and above the threshold
-                    // where the retry path becomes DB-write-bound. Same
-                    // floor-cap-on-tight-loop class as MCP-663
-                    // (MCP_TOKEN_REVALIDATION_INTERVAL_SECS positive
-                    // floor) and the rate-limit-window busy-loop class.
-                    const MAX_RETRY_BACKOFF_MS: u64 = 60 * 60 * 1000; // 1 hour
-                    const MIN_RETRY_BACKOFF_MS: u64 = 50;
-                    let retry_backoff = node
-                        .get("retry_backoff_ms")
-                        .or_else(|| node.get("data").and_then(|d| d.get("retry_backoff_ms")))
-                        .and_then(|v| v.as_u64())
-                        .map(|v| v.clamp(MIN_RETRY_BACKOFF_MS, MAX_RETRY_BACKOFF_MS));
-                    let retry_condition = node
-                        .get("retry_condition")
-                        .or_else(|| node.get("data").and_then(|d| d.get("retry_condition")))
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-                    let retry_delay_expression = node
-                        .get("retry_delay_expression")
-                        .or_else(|| {
-                            node.get("data")
-                                .and_then(|d| d.get("retry_delay_expression"))
-                        })
-                        .and_then(|v| v.as_str())
-                        .map(String::from);
-                    let has_any = retry_count.is_some()
-                        || retry_backoff.is_some()
-                        || retry_condition.is_some()
-                        || retry_delay_expression.is_some();
-                    if has_any {
-                        // Only `retry_count` answers "how many". The other
-                        // three keys answer "how far apart" or "when", so
-                        // a node declaring only those leaves the count
-                        // UNDECLARED (`None`) and the method-aware
-                        // classifier answers it at dispatch, exactly as it
-                        // does for a node with no retry keys at all.
-                        // Pre-fix this synthesised 2 for ANY capability
-                        // world — including governance / messaging /
-                        // database, which fail closed to 0 precisely so a
-                        // retry cannot double-fire a non-idempotent send.
-                        // Sibling of the same defect in
-                        // `talos-workflow-engine::graph_parser`.
-                        //
-                        // Both caps below clamp a DECLARED value only:
-                        // they exist to bound an absurd author-supplied
-                        // count, and there is nothing to bound when the
-                        // author supplied nothing. Clamping `None` into a
-                        // number here would reintroduce the invented
-                        // count. The classifier's own answers (0 or 2) sit
-                        // under both caps, so no resolved value moves.
-                        let max_retries = retry_count.map(|n| {
-                            if workflow_actor_id.is_none() {
-                                n.min(MAX_RETRIES_UNBUDGETED)
-                            } else {
-                                // MCP-1174: even with an owning actor, cap
-                                // the absolute count to prevent the
-                                // 4-billion-retry foot-gun the MCP-962
-                                // saturation alone left exposed.
-                                n.min(MAX_RETRIES_BUDGETED)
-                            }
-                        });
-                        Some(RetryPolicy {
-                            max_retries,
-                            backoff_ms: retry_backoff
-                                .unwrap_or(talos_workflow_engine_core::DEFAULT_BACKOFF_MS),
-                            retry_condition,
-                            retry_delay_expression,
-                        })
-                    } else {
-                        None
-                    }
-                };
-                engine.add_node(module_id, None, retry_policy, None);
-                if module_id == trigger_module_id {
-                    has_trigger = true;
-                } else {
-                    has_downstream = true;
-                }
-            }
-        }
+    for n in &plan.module_nodes {
+        tracing::debug!(
+            rf_id = %n.rf_id,
+            module_id = %n.module_id,
+            "workflow_chains: mapped node"
+        );
+        let retry_policy = read_chain_retry_policy(&n.node, workflow_actor_id);
+        engine.add_node(n.module_id, None, retry_policy, None);
     }
 
     tracing::debug!(
-        has_trigger,
-        has_downstream,
-        nodes_mapped = rf_to_module.len(),
+        has_trigger = plan.has_trigger,
+        has_downstream = plan.has_downstream,
+        nodes_mapped = plan.module_nodes.len(),
         "workflow_chains: node mapping complete"
     );
 
-    if !has_trigger {
-        // Workflow contains the module but has no other nodes connected — nothing to chain.
-        return Ok(());
-    }
-
-    // Add directed edges between nodes.
-    let empty_edges = vec![];
-    let edges = graph
-        .get("edges")
-        .and_then(|e| e.as_array())
-        .unwrap_or(&empty_edges);
-
+    // Wire only module→module edges. A `system:*` endpoint is EXPECTED here
+    // (this walker chains the module subgraph only) and is DEBUG; a dangling
+    // endpoint is a broken graph and stays WARN.
     let mut edges_added = 0usize;
-    for edge in edges {
-        let src_rf = edge.get("source").and_then(|v| v.as_str()).unwrap_or("");
-        let tgt_rf = edge.get("target").and_then(|v| v.as_str()).unwrap_or("");
-        tracing::debug!(src_rf, tgt_rf, "workflow_chains: resolving edge");
-        if let (Some(&src), Some(&tgt)) = (rf_to_module.get(src_rf), rf_to_module.get(tgt_rf)) {
-            tracing::debug!(src = %src, tgt = %tgt, "workflow_chains: edge wired");
-            let _ = engine.add_edge(
-                src,
-                tgt,
-                EdgeLogic {
-                    source_handle: "output".to_string(),
-                    target_handle: "input".to_string(),
-                    mapping: None,
-                    condition: None,
-                    edge_type: Default::default(),
-                },
-            );
-            edges_added += 1;
-        } else {
-            tracing::warn!(
+    for edge in &plan.edges {
+        match edge {
+            ChainEdgeClass::ModuleToModule { src, tgt } => {
+                tracing::debug!(src = %src, tgt = %tgt, "workflow_chains: edge wired");
+                if let Err(e) = engine.add_edge(
+                    *src,
+                    *tgt,
+                    EdgeLogic {
+                        source_handle: "output".to_string(),
+                        target_handle: "input".to_string(),
+                        mapping: None,
+                        condition: None,
+                        edge_type: Default::default(),
+                    },
+                ) {
+                    // Both endpoints were just added above; unreachable in
+                    // practice, but a dropped edge changes the run and must
+                    // not be silent.
+                    tracing::warn!(src = %src, tgt = %tgt, error = %e, "workflow_chains: add_edge refused");
+                } else {
+                    edges_added += 1;
+                }
+            }
+            ChainEdgeClass::SystemEndpoint { src_rf, tgt_rf } => {
+                tracing::debug!(
+                    src_rf,
+                    tgt_rf,
+                    "workflow_chains: edge touches a non-module node — not chained on this path"
+                );
+            }
+            ChainEdgeClass::Dangling {
                 src_rf,
                 tgt_rf,
-                src_found = rf_to_module.contains_key(src_rf),
-                tgt_found = rf_to_module.contains_key(tgt_rf),
-                "workflow_chains: edge source/target not found in node map — edge skipped"
-            );
+                src_found,
+                tgt_found,
+            } => {
+                tracing::warn!(
+                    workflow_id = %workflow_id,
+                    src_rf,
+                    tgt_rf,
+                    src_found,
+                    tgt_found,
+                    "workflow_chains: edge endpoint names no node in the graph — edge skipped"
+                );
+            }
         }
     }
     tracing::debug!(edges_added, "workflow_chains: edge wiring complete");
@@ -852,5 +1160,212 @@ async fn run_single_workflow_chain(
             }
             Err(e.to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod plan_tests {
+    //! Pure classification tests for [`plan_workflow_chain`]. The graph shapes
+    //! below are the ones measured on the dev fleet 2026-09-10 (five draft
+    //! `stress-*` workflows matched by one echo-module webhook), so a
+    //! regression here reproduces the WARN storm the planner exists to stop.
+    use super::*;
+    use serde_json::json;
+
+    const ECHO: &str = "0dc4dd90-4b57-4f25-bfd8-b0faa4e1e683";
+    const OTHER: &str = "8aa34ddb-3b15-494f-a6be-3fb9a2980572";
+
+    fn echo() -> Uuid {
+        Uuid::parse_str(ECHO).unwrap()
+    }
+
+    fn module_node(id: &str, module: &str) -> Value {
+        json!({ "id": id, "type": "talosNode", "data": { "moduleId": module } })
+    }
+
+    fn system_node(id: &str, kind: &str) -> Value {
+        json!({ "id": id, "type": format!("system:{kind}"), "data": {} })
+    }
+
+    fn edge(s: &str, t: &str) -> Value {
+        json!({ "source": s, "target": t })
+    }
+
+    /// `stress-01-echo`: echo → system:collect. The edge is EXPECTED on this
+    /// path (the walker chains modules only) — a system endpoint, not a
+    /// dangling one, and the workflow still dispatches.
+    #[test]
+    fn an_edge_into_a_system_node_is_classified_as_system_endpoint_not_dangling() {
+        let g = json!({
+            "nodes": [module_node("echo", ECHO), system_node("verify_collect", "collect")],
+            "edges": [edge("echo", "verify_collect")],
+        });
+        let plan = plan_workflow_chain(&g, echo());
+        assert_eq!(plan.skip, None);
+        assert!(plan.has_trigger);
+        assert!(!plan.has_downstream);
+        assert_eq!(
+            plan.edges,
+            vec![ChainEdgeClass::SystemEndpoint {
+                src_rf: "echo".into(),
+                tgt_rf: "verify_collect".into(),
+            }]
+        );
+    }
+
+    /// An endpoint that names NO node at all is a broken graph and keeps WARN.
+    #[test]
+    fn an_edge_naming_an_undeclared_node_is_dangling_with_per_side_flags() {
+        let g = json!({
+            "nodes": [module_node("echo", ECHO)],
+            "edges": [edge("echo", "ghost")],
+        });
+        let plan = plan_workflow_chain(&g, echo());
+        assert_eq!(
+            plan.edges,
+            vec![ChainEdgeClass::Dangling {
+                src_rf: "echo".into(),
+                tgt_rf: "ghost".into(),
+                src_found: true,
+                tgt_found: false,
+            }]
+        );
+        assert_eq!(plan.skip, None);
+    }
+
+    /// A module → module DAG wires and has something downstream.
+    #[test]
+    fn a_module_to_module_dag_is_wired_and_not_skipped() {
+        let g = json!({
+            "nodes": [module_node("a", ECHO), module_node("b", OTHER)],
+            "edges": [edge("a", "b")],
+        });
+        let plan = plan_workflow_chain(&g, echo());
+        assert_eq!(plan.skip, None);
+        assert!(plan.has_downstream);
+        assert_eq!(
+            plan.edges,
+            vec![ChainEdgeClass::ModuleToModule {
+                src: echo(),
+                tgt: Uuid::parse_str(OTHER).unwrap(),
+            }]
+        );
+        assert_eq!(plan.module_nodes.len(), 2);
+    }
+
+    /// `stress-03-conditional`: two nodes running the SAME module with an edge
+    /// between them. On this path both collapse into one engine node and the
+    /// edge becomes a self-loop — the real cause of the live "workflow graph
+    /// contains a cycle" WARN. The planner must say so ONCE and dispatch
+    /// nothing, and must attribute the cycle to the collapse.
+    #[test]
+    fn two_nodes_on_one_module_with_an_edge_collapse_into_a_cyclic_skip() {
+        let g = json!({
+            "nodes": [module_node("gate", ECHO), module_node("maybe_skipped", ECHO)],
+            "edges": [edge("gate", "maybe_skipped")],
+        });
+        let plan = plan_workflow_chain(&g, echo());
+        assert_eq!(
+            plan.skip,
+            Some(ChainSkip::CyclicModuleGraph {
+                collapsed_self_loops: 1
+            })
+        );
+        assert_eq!(plan.module_nodes.len(), 1, "deduped to one engine node");
+        assert_eq!(
+            plan.collapsed_duplicates,
+            vec![("maybe_skipped".to_string(), echo())]
+        );
+        assert_eq!(
+            plan.skip.as_ref().unwrap().event_kind(),
+            "chain_skipped_cyclic_module_graph"
+        );
+    }
+
+    /// An authored cycle between two DIFFERENT modules is also a skip, with
+    /// zero collapsed self-loops so the log line does not blame the keying.
+    #[test]
+    fn an_authored_two_cycle_between_distinct_modules_is_a_cyclic_skip() {
+        let g = json!({
+            "nodes": [module_node("a", ECHO), module_node("b", OTHER)],
+            "edges": [edge("a", "b"), edge("b", "a")],
+        });
+        let plan = plan_workflow_chain(&g, echo());
+        assert_eq!(
+            plan.skip,
+            Some(ChainSkip::CyclicModuleGraph {
+                collapsed_self_loops: 0
+            })
+        );
+    }
+
+    /// `stress-05-parent`: echo ⇄ system:sub_workflow. The cycle runs THROUGH
+    /// a system node, which this walker does not chain, so the module
+    /// subgraph is a single node and NOT cyclic — both edges are system
+    /// endpoints and the workflow dispatches as a single-node chain.
+    #[test]
+    fn a_cycle_through_a_system_node_is_not_a_module_cycle() {
+        let g = json!({
+            "nodes": [module_node("loop_back", ECHO), system_node("call_child", "sub_workflow")],
+            "edges": [edge("loop_back", "call_child"), edge("call_child", "loop_back")],
+        });
+        let plan = plan_workflow_chain(&g, echo());
+        assert_eq!(plan.skip, None);
+        assert!(plan
+            .edges
+            .iter()
+            .all(|e| matches!(e, ChainEdgeClass::SystemEndpoint { .. })));
+    }
+
+    /// The LIKE prefilter matches graph TEXT; a uuid embedded in a description
+    /// is not a node running the module and must skip quietly.
+    #[test]
+    fn a_module_id_mentioned_but_not_run_is_a_no_trigger_skip() {
+        let g = json!({
+            "nodes": [json!({ "id": "n", "type": "talosNode", "data": {
+                "moduleId": OTHER, "description": format!("was {ECHO}") } })],
+            "edges": [],
+        });
+        let plan = plan_workflow_chain(&g, echo());
+        assert_eq!(plan.skip, Some(ChainSkip::NoTriggerNode));
+        assert!(!plan.has_trigger);
+        assert_eq!(
+            plan.skip.as_ref().unwrap().event_kind(),
+            "chain_skipped_no_trigger_node"
+        );
+    }
+
+    /// Save-v1 graphs carry the module uuid under `type`; save-v2 under
+    /// `data.moduleId`. Both are module nodes; `talosNode`/`system:*` are not.
+    #[test]
+    fn module_id_is_read_from_type_or_data_module_id() {
+        let g = json!({
+            "nodes": [
+                json!({ "id": "v1", "type": ECHO }),
+                module_node("v2", OTHER),
+                system_node("sys", "collect"),
+                json!({ "id": "plain", "type": "talosNode", "data": {} }),
+            ],
+            "edges": [edge("v1", "v2"), edge("v2", "plain")],
+        });
+        let plan = plan_workflow_chain(&g, echo());
+        assert_eq!(plan.module_nodes.len(), 2);
+        assert_eq!(plan.skip, None);
+        assert!(matches!(
+            plan.edges[0],
+            ChainEdgeClass::ModuleToModule { .. }
+        ));
+        assert!(matches!(
+            plan.edges[1],
+            ChainEdgeClass::SystemEndpoint { .. }
+        ));
+    }
+
+    /// A graph with no `edges` key and no `nodes` key is empty, not an error.
+    #[test]
+    fn a_graph_without_nodes_or_edges_is_a_quiet_no_trigger_skip() {
+        let plan = plan_workflow_chain(&json!({}), echo());
+        assert_eq!(plan.skip, Some(ChainSkip::NoTriggerNode));
+        assert!(plan.edges.is_empty());
     }
 }

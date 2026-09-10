@@ -6348,46 +6348,62 @@ impl AnalyticsRepository {
     ///
     /// ## Bounds
     ///
-    /// `LIMIT $N` on the aggregate (one row per pair). At 24k rollup rows the
-    /// query plans as a seq scan over the window and measures ~33 ms; it runs
-    /// once per sweep interval (300 s), so it is deliberately NOT given its own
-    /// index — the fleet-wide form has no `workflow_id` predicate for
-    /// `idx_cost_rollup_workflow` to serve, and an index earned by one caller
-    /// every five minutes is not worth the write amplification on a hot
-    /// insert path.
+    /// `LIMIT $N` on the aggregate (one row per pair). It runs once per sweep
+    /// interval (300 s) and is deliberately NOT given its own index: measured
+    /// 2026-09-10 on 53 703 rollup rows, 62 % of them inside the 30-day window,
+    /// the seq scan over the table is ~7 ms of the total and a `recorded_at`
+    /// index would still plan as a seq scan at that selectivity; the
+    /// fleet-wide form has no `workflow_id` predicate for
+    /// `idx_cost_rollup_workflow` to serve. What DID cost was the query
+    /// shape — a twice-scanned CTE, two 33k-row sorts and a nested loop — and
+    /// `pg_stat_statements` had it as the slowest recurring statement on the
+    /// dev database (164 calls, 92.6 ms mean). The single-pass rewrite below
+    /// measured 74.9 ms → 24.1 ms by `EXPLAIN (ANALYZE, BUFFERS)` with
+    /// identical output; the doc-comment measurement of "~33 ms at 24k rows"
+    /// from 2026-08-17 was of the old shape on a smaller table.
     pub async fn get_node_fuel_headroom(
         &self,
         user_id: Option<Uuid>,
         days: i32,
         limit: i64,
     ) -> Result<Vec<NodeFuelHeadroom>> {
+        // ONE aggregation pass, hash-aggregated (2026-09-10). The previous
+        // shape was a materialised CTE scanned twice (once for a
+        // `DISTINCT ON (workflow_id, node_id) … ORDER BY recorded_at DESC,
+        // max_fuel DESC` that sorted every window row, once for the GROUP BY,
+        // which sorted them again on a collated `w.name`), joined back to
+        // `workflows` through a mis-estimated nested loop (33k index probes).
+        // `MAX(ARRAY[epoch, max_fuel])` is the same "latest row's ceiling,
+        // ties → highest ceiling" answer expressed as an ordinary aggregate:
+        // array comparison is lexicographic, `EXTRACT(EPOCH …)` is exact to
+        // the microsecond, so element 1 orders by `recorded_at` and element 2
+        // breaks ties by `max_fuel` — and being unordered it lets the planner
+        // hash-aggregate instead of sorting. `workflows` is joined for
+        // `user_id` inside the scan (`$2`) and for `name` only AFTER the
+        // aggregate (one row per pair). Measured on the dev database, 33 553
+        // window rows / 57 pairs: 74.9 ms → 24.1 ms, same 57 rows.
         let rows = sqlx::query_as::<_, (Uuid, String, String, i64, i64, i64)>(
-            "WITH scoped AS ( \
-                SELECT r.workflow_id, r.node_id, r.fuel_consumed, r.max_fuel, r.recorded_at \
+            "SELECT agg.workflow_id, w.name, agg.node_id, \
+                    agg.samples, agg.peak_fuel, agg.current_ceiling \
+             FROM ( \
+                SELECT r.workflow_id, r.node_id, \
+                       COUNT(*) AS samples, \
+                       MAX(r.fuel_consumed) AS peak_fuel, \
+                       (MAX(ARRAY[EXTRACT(EPOCH FROM r.recorded_at)::numeric, \
+                                  r.max_fuel::numeric]))[2]::bigint AS current_ceiling \
                 FROM execution_cost_rollup r \
                 LEFT JOIN workflow_executions we ON we.id = r.execution_id \
-                JOIN workflows w ON w.id = r.workflow_id \
+                JOIN workflows wf ON wf.id = r.workflow_id \
                 WHERE r.recorded_at > NOW() - make_interval(days => $1::int) \
                   AND r.max_fuel > 0 \
                   AND r.fuel_consumed > 0 \
                   AND NOT COALESCE(we.is_test_execution, false) \
-                  AND ($2::uuid IS NULL OR w.user_id = $2) \
-             ), latest AS ( \
-                SELECT DISTINCT ON (workflow_id, node_id) \
-                       workflow_id, node_id, max_fuel AS current_ceiling \
-                FROM scoped \
-                ORDER BY workflow_id, node_id, recorded_at DESC, max_fuel DESC \
-             ) \
-             SELECT s.workflow_id, w.name, s.node_id, \
-                    COUNT(*) AS samples, \
-                    MAX(s.fuel_consumed) AS peak_fuel, \
-                    l.current_ceiling \
-             FROM scoped s \
-             JOIN latest l ON l.workflow_id = s.workflow_id AND l.node_id = s.node_id \
-             JOIN workflows w ON w.id = s.workflow_id \
-             GROUP BY s.workflow_id, w.name, s.node_id, l.current_ceiling \
-             ORDER BY MAX(s.fuel_consumed)::numeric / l.current_ceiling DESC, \
-                      s.workflow_id, s.node_id \
+                  AND ($2::uuid IS NULL OR wf.user_id = $2) \
+                GROUP BY r.workflow_id, r.node_id \
+             ) agg \
+             JOIN workflows w ON w.id = agg.workflow_id \
+             ORDER BY agg.peak_fuel::numeric / agg.current_ceiling DESC, \
+                      agg.workflow_id, agg.node_id \
              LIMIT $3",
         )
         .bind(days)

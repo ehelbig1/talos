@@ -1,6 +1,7 @@
 use super::types::JsonRpcResponse;
 use super::utils::{
     compute_mcp_graph_diff, mcp_denied, mcp_error, mcp_not_found, mcp_text, mcp_text_with_json,
+    validate_optional_bool,
 };
 use super::{auth, McpState};
 use serde_json::json;
@@ -241,6 +242,45 @@ pub(crate) fn json_merge_patch(target: &mut serde_json::Value, patch: &serde_jso
 /// the next scheduled run failing with "Missing X config". Returns an
 /// empty `Vec` when `old` isn't an object (nothing meaningful was
 /// "present" to drop).
+/// #796 (2026-09-10): child-node `timeout_secs` is ENFORCED by the engine
+/// only when the node also carries `enforce_timeout: true`
+/// (`talos_workflow_engine::graph_parser::child_timeout_secs`). These tools
+/// stamp a default `timeout_secs` into every node they author, so a stored
+/// 30/60 cannot be told from an author's choice — which is why the marker is
+/// opt-in and why it is persisted ONLY when the caller supplied it: an absent
+/// flag leaves the node byte-identical to what the tool wrote before.
+/// Present-but-wrong-type is a loud `-32602` (MCP-227 family), never a silent
+/// default. `update_node_config` strips only `__`-prefixed keys, so the flag
+/// survives a later config replace.
+fn parse_enforce_timeout(
+    args: &serde_json::Value,
+    req_id: &Option<serde_json::Value>,
+) -> Result<Option<bool>, JsonRpcResponse> {
+    match args.get("enforce_timeout") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(_) => validate_optional_bool(args, "enforce_timeout", false, req_id).map(Some),
+    }
+}
+
+/// Persist the opt-in read by [`parse_enforce_timeout`] into a node's `data`.
+/// `None` writes nothing (see above); `Some(false)` IS written — an explicit
+/// "advisory" is the author's statement and the engine reads it as such.
+fn stamp_enforce_timeout(data: &mut serde_json::Value, flag: Option<bool>) {
+    if let Some(b) = flag {
+        data["enforce_timeout"] = serde_json::Value::Bool(b);
+    }
+}
+
+/// Reply-text rendering of a child timeout, honest about whether it binds.
+fn describe_child_timeout(timeout_secs: u64, enforce_timeout: Option<bool>) -> String {
+    match enforce_timeout {
+        Some(true) => format!("{timeout_secs}s (enforced)"),
+        _ => format!(
+            "{timeout_secs}s (advisory — bounded by the run's remaining budget; pass enforce_timeout: true to enforce)"
+        ),
+    }
+}
+
 fn dropped_top_level_keys(old: &serde_json::Value, new: &serde_json::Value) -> Vec<String> {
     let Some(old_obj) = old.as_object() else {
         return Vec::new();
@@ -1301,8 +1341,9 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     },
                     "timeout_secs": {
                         "type": "number",
-                        "description": "Execution timeout in seconds for the sub-workflow (default: 60). Per-node timeouts are honored as-set — there is no implicit clamp against the global ceiling."
+                        "description": "Execution timeout in seconds for the sub-workflow (default: 30). Enforced ONLY when enforce_timeout is true (#796); otherwise this number is advisory and the child is bounded by the run's remaining budget (minus a 2 s reserve), failing as a clean node error when that runs out."
                     },
+                    "enforce_timeout": { "type": "boolean", "description": "Opt-in: enforce timeout_secs as a hard per-child deadline. Omit (default) to leave timeout_secs advisory — the authoring default of 30/60 s is not an author's choice, and LLM-bearing children legitimately run for minutes." },
                     "connect_from": {
                         "type": "string",
                         "description": "Optional: ID of an existing node to connect FROM into this sub-workflow node (adds a default edge). Avoids a separate add_edge call."
@@ -1414,8 +1455,9 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     },
                     "timeout_secs": {
                         "type": "number",
-                        "description": "Execution timeout in seconds for the dispatched sub-workflow (default: 60). Per-node timeouts are honored as-set — there is no implicit clamp against the global ceiling."
+                        "description": "Execution timeout in seconds for the dispatched sub-workflow (default: 30). Enforced ONLY when enforce_timeout is true (#796); otherwise this number is advisory and the child is bounded by the run's remaining budget (minus a 2 s reserve), failing as a clean node error when that runs out."
                     },
+                    "enforce_timeout": { "type": "boolean", "description": "Opt-in: enforce timeout_secs as a hard per-child deadline. Omit (default) to leave timeout_secs advisory — the authoring default of 30/60 s is not an author's choice, and LLM-bearing children legitimately run for minutes." },
                     "fallback_workflow_id": {
                         "type": "string",
                         "description": "Optional UUID of a workflow to dispatch to when no registered workflow matches all required_capabilities at runtime. Without this, unmatched dispatch fails hard. Use a no-op or error-logging workflow as a safe default."
@@ -1452,8 +1494,9 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     },
                     "timeout_secs": {
                         "type": "number",
-                        "description": "Execution timeout in seconds for the dispatched sub-workflow (default: 60). Per-node timeouts are honored as-set — there is no implicit clamp against the global ceiling."
-                    }
+                        "description": "Execution timeout in seconds for the dispatched sub-workflow (default: 30). Enforced ONLY when enforce_timeout is true (#796); otherwise this number is advisory and the child is bounded by the run's remaining budget (minus a 2 s reserve), failing as a clean node error when that runs out."
+                    },
+                    "enforce_timeout": { "type": "boolean", "description": "Opt-in: enforce timeout_secs as a hard per-child deadline. Omit (default) to leave timeout_secs advisory — the authoring default of 30/60 s is not an author's choice, and LLM-bearing children legitimately run for minutes." }
                 },
                 "required": ["workflow_id", "node_id", "dispatch_expression"]
             }
@@ -1576,7 +1619,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "body_workflow_id": { "type": "string", "description": "UUID of the workflow to execute on each iteration (must contain the LLM/reasoning node)" },
                     "max_iterations": { "type": "number", "description": "Maximum iterations before forced termination (1–50, default 10)" },
                     "inject_history": { "type": "boolean", "description": "Inject __agent_history__ array into each iteration input (default: true)" },
-                    "timeout_secs": { "type": "number", "description": "Per-iteration execution timeout in seconds (default: 60)" },
+                    "timeout_secs": { "type": "number", "description": "Per-iteration execution timeout in seconds (default: 60). Always enforced — loop bodies have no enforce_timeout opt-in." },
                     "connect_from": { "type": "string", "description": "Optional: ID of an existing node to connect FROM into this agent loop node." },
                     "connect_to": { "type": "string", "description": "Optional: ID of an existing node to connect this agent loop node TO." }
                 },
@@ -1594,7 +1637,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "body_workflow_id": { "type": "string", "description": "UUID of the workflow to execute on each iteration" },
                     "max_iterations": { "type": "number", "description": "Maximum iterations before forced termination (1–50, default 10)" },
                     "inject_history": { "type": "boolean", "description": "Inject prior iteration outputs as history into each iteration input (default: true)" },
-                    "timeout_secs": { "type": "number", "description": "Per-iteration execution timeout in seconds (default: 60)" },
+                    "timeout_secs": { "type": "number", "description": "Per-iteration execution timeout in seconds (default: 60). Always enforced — loop bodies have no enforce_timeout opt-in." },
                     "connect_from": { "type": "string", "description": "Optional: ID of an existing node to connect FROM into this ReActLoop node." },
                     "connect_to": { "type": "string", "description": "Optional: ID of an existing node to connect this ReActLoop node TO." }
                 },
@@ -1670,7 +1713,8 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                         "enum": ["error", "passthrough"],
                         "description": "Behavior when the verdict is rejected. 'error' (default) emits an __error envelope that fails the node unless continue_on_error is set — the conservative default. 'passthrough' forwards the parent output enriched with __judge_passed__: false (plus score, reasoning, feedback, __judge_rejected__: true) so downstream edges can conditional-route on the verdict without tripping the error path. Mirrors verify's on_failure field."
                     },
-                    "timeout_secs": { "type": "number", "description": "Execution timeout for the judge workflow in seconds (default: 60)" },
+                    "timeout_secs": { "type": "number", "description": "Execution timeout for the judge workflow in seconds (default: 60). Enforced ONLY when enforce_timeout is true (#796); otherwise this number is advisory and the child is bounded by the run's remaining budget (minus a 2 s reserve), failing as a clean node error when that runs out." },
+                    "enforce_timeout": { "type": "boolean", "description": "Opt-in: enforce timeout_secs as a hard per-child deadline. Omit (default) to leave timeout_secs advisory — the authoring default of 30/60 s is not an author's choice, and LLM-bearing children legitimately run for minutes." },
                     "connect_from": {
                         "description": "Optional node_id(s) to wire an edge from. Accepts a single string or an array of strings.",
                         "oneOf": [
@@ -1747,7 +1791,8 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "count": { "type": "number", "description": "Number of parallel executions (2–10, default: 3)" },
                     "consensus": { "type": "string", "enum": ["majority_vote", "best_of_n", "first_pass"], "description": "How to select the final output" },
                     "judge_workflow_id": { "type": "string", "description": "Required for best_of_n: judge workflow that scores each candidate" },
-                    "timeout_secs": { "type": "number", "description": "Timeout per child execution in seconds (default: 60)" },
+                    "timeout_secs": { "type": "number", "description": "Timeout per child execution in seconds (default: 60). Enforced ONLY when enforce_timeout is true (#796); otherwise this number is advisory and the child is bounded by the run's remaining budget (minus a 2 s reserve), failing as a clean node error when that runs out." },
+                    "enforce_timeout": { "type": "boolean", "description": "Opt-in: enforce timeout_secs as a hard per-child deadline. Omit (default) to leave timeout_secs advisory — the authoring default of 30/60 s is not an author's choice, and LLM-bearing children legitimately run for minutes." },
                     "connect_from": {
                         "description": "Optional node_id(s) to wire an edge from. Accepts a single string or an array of strings.",
                         "oneOf": [
@@ -1794,7 +1839,8 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "child_workflow_id": { "type": "string", "description": "Workflow to attempt" },
                     "reflection_workflow_id": { "type": "string", "description": "Workflow that analyzes failures and returns corrective input fields" },
                     "max_retries": { "type": "number", "description": "Max retry attempts after initial failure (1–5, default: 2)" },
-                    "timeout_secs": { "type": "number", "description": "Timeout per attempt in seconds (default: 60)" },
+                    "timeout_secs": { "type": "number", "description": "Timeout per attempt in seconds (default: 60). Enforced ONLY when enforce_timeout is true (#796); otherwise this number is advisory and the child is bounded by the run's remaining budget (minus a 2 s reserve), failing as a clean node error when that runs out." },
+                    "enforce_timeout": { "type": "boolean", "description": "Opt-in: enforce timeout_secs as a hard per-child deadline. Omit (default) to leave timeout_secs advisory — the authoring default of 30/60 s is not an author's choice, and LLM-bearing children legitimately run for minutes." },
                     "connect_from": {
                         "description": "Optional node_id(s) to wire an edge from. Accepts a single string or an array of strings.",
                         "oneOf": [
@@ -1818,7 +1864,8 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "classifier_workflow_id": { "type": "string", "description": "Workflow that classifies input and returns {class: string}" },
                     "routes": { "type": "object", "description": "Map of class label → workflow UUID to dispatch to", "additionalProperties": { "type": "string" } },
                     "fallback_workflow_id": { "type": "string", "description": "Optional workflow to execute when class doesn't match any route" },
-                    "timeout_secs": { "type": "number", "description": "Timeout per sub-workflow execution in seconds (default: 60)" },
+                    "timeout_secs": { "type": "number", "description": "Timeout per sub-workflow execution in seconds (default: 60). Enforced ONLY when enforce_timeout is true (#796); otherwise this number is advisory and the child is bounded by the run's remaining budget (minus a 2 s reserve), failing as a clean node error when that runs out." },
+                    "enforce_timeout": { "type": "boolean", "description": "Opt-in: enforce timeout_secs as a hard per-child deadline. Omit (default) to leave timeout_secs advisory — the authoring default of 30/60 s is not an author's choice, and LLM-bearing children legitimately run for minutes." },
                     "connect_from": {
                         "description": "Optional node_id(s) to wire an edge from. Accepts a single string or an array of strings.",
                         "oneOf": [
@@ -3638,10 +3685,16 @@ async fn handle_add_sub_workflow_node(
             Ok(v) => v,
             Err(resp) => return resp,
         };
-    let data = serde_json::json!({
+    let enforce_timeout = match parse_enforce_timeout(args, &req_id) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let mut data = serde_json::json!({
         "sub_workflow_id": sub_workflow_id.to_string(),
         "timeout_secs": timeout_secs,
     });
+    stamp_enforce_timeout(&mut data, enforce_timeout);
+    let timeout_display = describe_child_timeout(timeout_secs, enforce_timeout);
 
     let connect_from = args
         .get("connect_from")
@@ -3672,10 +3725,11 @@ async fn handle_add_sub_workflow_node(
             "node_type": "sub_workflow",
             "sub_workflow_id": sub_workflow_id.to_string(),
             "timeout_secs": timeout_secs,
+            "enforce_timeout": enforce_timeout,
             "edges_wired": edges_wired,
             "message": format!(
-                "Sub-workflow node '{}' added to workflow {}. Invokes workflow {} with {}s timeout.{}",
-                added.node_id, added.workflow_id, sub_workflow_id, timeout_secs, added.auto_publish_note
+                "Sub-workflow node '{}' added to workflow {}. Invokes workflow {} with {} timeout.{}",
+                added.node_id, added.workflow_id, sub_workflow_id, timeout_display, added.auto_publish_note
             ),
         }))
         .unwrap_or_default(),
@@ -4343,6 +4397,10 @@ async fn handle_add_capability_dispatch_node(
             Ok(v) => v,
             Err(resp) => return resp,
         };
+    let enforce_timeout = match parse_enforce_timeout(args, &req_id) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     // MCP-386 (2026-05-11): strict-parse so a typo'd or wrong-type
     // `fallback_workflow_id` doesn't silently drop the fallback. Pre-fix
     // `optional_uuid` returned None for both ABSENT and INVALID — the
@@ -4413,11 +4471,13 @@ async fn handle_add_capability_dispatch_node(
         }
     };
 
-    let data = serde_json::json!({
+    let mut data = serde_json::json!({
         "required_capabilities": required_capabilities,
         "timeout_secs": timeout_secs,
         "fallback_workflow_id": fallback_wf_id.map(|u| u.to_string()),
     });
+    stamp_enforce_timeout(&mut data, enforce_timeout);
+    let timeout_display = describe_child_timeout(timeout_secs, enforce_timeout);
 
     let connect_from = args
         .get("connect_from")
@@ -4444,8 +4504,8 @@ async fn handle_add_capability_dispatch_node(
         .map(|w| format!("\n\n{}", w))
         .unwrap_or_default();
     mcp_text(req_id, &format!(
-        "Capability dispatch node '{}' added to workflow {}.\nRequired capabilities: {:?}\nTimeout: {}s\n\nAt runtime, the engine will find the best-matching workflow with ALL required capabilities and execute it as a sub-workflow.{}{}{}",
-        added.node_id, added.workflow_id, required_capabilities, timeout_secs, wiring, warning_line, added.auto_publish_note
+        "Capability dispatch node '{}' added to workflow {}.\nRequired capabilities: {:?}\nTimeout: {}\n\nAt runtime, the engine will find the best-matching workflow with ALL required capabilities and execute it as a sub-workflow.{}{}{}",
+        added.node_id, added.workflow_id, required_capabilities, timeout_display, wiring, warning_line, added.auto_publish_note
     ))
 }
 
@@ -4500,10 +4560,16 @@ async fn handle_add_dispatch_node(
             Ok(v) => v,
             Err(resp) => return resp,
         };
-    let data = serde_json::json!({
+    let enforce_timeout = match parse_enforce_timeout(args, &req_id) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let mut data = serde_json::json!({
         "dispatch_expression": dispatch_expression,
         "timeout_secs": timeout_secs,
     });
+    stamp_enforce_timeout(&mut data, enforce_timeout);
+    let timeout_display = describe_child_timeout(timeout_secs, enforce_timeout);
 
     let added = match upsert_system_node(&req_id, args, state, &agent, "dispatch", data).await {
         Ok(a) => a,
@@ -4511,8 +4577,8 @@ async fn handle_add_dispatch_node(
     };
 
     mcp_text(req_id, &format!(
-        "Dynamic dispatch node '{}' added to workflow {}.\nExpression: {}\nTimeout: {}s\n\nAt runtime, the expression is evaluated against the node's input to determine which workflow to invoke.{}",
-        added.node_id, added.workflow_id, dispatch_expression, timeout_secs, added.auto_publish_note
+        "Dynamic dispatch node '{}' added to workflow {}.\nExpression: {}\nTimeout: {}\n\nAt runtime, the expression is evaluated against the node's input to determine which workflow to invoke.{}",
+        added.node_id, added.workflow_id, dispatch_expression, timeout_display, added.auto_publish_note
     ))
 }
 
@@ -5721,12 +5787,18 @@ async fn handle_add_judge_node(
             Ok(v) => v,
             Err(resp) => return resp,
         };
+    let enforce_timeout = match parse_enforce_timeout(args, &req_id) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     let mut data = serde_json::json!({
         "judge_workflow_id": judge_workflow_id.to_string(),
         "rubric": rubric,
         "on_failure": on_failure,
         "timeout_secs": timeout_secs,
     });
+    stamp_enforce_timeout(&mut data, enforce_timeout);
+    let timeout_display = describe_child_timeout(timeout_secs, enforce_timeout);
     if let Some(threshold) = pass_threshold {
         data["pass_threshold"] = serde_json::Value::from(threshold);
     }
@@ -5745,13 +5817,13 @@ async fn handle_add_judge_node(
             "Judge node '{}' added to workflow {}.\n\
              Judge workflow: {}\n\
              Rubric: {}{}\n\
-             Timeout: {}s\n\
+             Timeout: {}\n\
              Parent output is forwarded enriched with __judge_score__, __judge_passed__, __judge_reasoning__, and __judge_feedback__.\n\
              Abstention: a verdict may also set not_applicable: true when the run had nothing to judge — it is then \
              recorded as an abstention and excluded from the quality trend rather than scored. It does NOT change routing; \
              'passed' still drives the gate, so set it to what you want downstream edges to do.{}{}",
             added.node_id, added.workflow_id, judge_workflow_id,
-            rubric, threshold_str, timeout_secs,
+            rubric, threshold_str, timeout_display,
             added.wiring_in, added.wiring_out
         ),
     )
@@ -6089,12 +6161,18 @@ async fn handle_add_ensemble_node(
             Ok(v) => v,
             Err(resp) => return resp,
         };
+    let enforce_timeout = match parse_enforce_timeout(args, &req_id) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     let mut data = serde_json::json!({
         "child_workflow_id": child_workflow_id.to_string(),
         "count": count,
         "consensus": consensus,
         "timeout_secs": timeout_secs,
     });
+    stamp_enforce_timeout(&mut data, enforce_timeout);
+    let timeout_display = describe_child_timeout(timeout_secs, enforce_timeout);
     data["judge_workflow_id"] = match judge_workflow_id {
         Some(id) => serde_json::Value::String(id.to_string()),
         None => serde_json::Value::Null,
@@ -6109,10 +6187,10 @@ async fn handle_add_ensemble_node(
         "Ensemble node '{}' added to workflow {}.\n\
          Child workflow: {} (runs {} times)\n\
          Consensus: {}\n\
-         Timeout: {}s per execution\n\
+         Timeout: {} per execution\n\
          Output includes __ensemble_method__, __ensemble_size__, and __ensemble_votes__ metadata.{}{}",
         added.node_id, added.workflow_id, child_workflow_id, count,
-        consensus, timeout_secs,
+        consensus, timeout_display,
         added.wiring_in, added.wiring_out
     ))
 }
@@ -6263,12 +6341,18 @@ async fn handle_add_reflective_retry_node(
             Ok(v) => v,
             Err(resp) => return resp,
         };
-    let data = serde_json::json!({
+    let enforce_timeout = match parse_enforce_timeout(args, &req_id) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+    let mut data = serde_json::json!({
         "child_workflow_id": child_workflow_id.to_string(),
         "reflection_workflow_id": reflection_workflow_id.to_string(),
         "max_retries": max_retries,
         "timeout_secs": timeout_secs,
     });
+    stamp_enforce_timeout(&mut data, enforce_timeout);
+    let timeout_display = describe_child_timeout(timeout_secs, enforce_timeout);
 
     let added =
         match upsert_system_node(&req_id, args, state, &agent, "reflective_retry", data).await {
@@ -6280,12 +6364,12 @@ async fn handle_add_reflective_retry_node(
         "Reflective retry node '{}' added to workflow {}.\n\
          Child workflow: {}\n\
          Reflection workflow: {}\n\
-         Max retries: {} | Timeout: {}s per attempt\n\
+         Max retries: {} | Timeout: {} per attempt\n\
          On failure: reflection workflow receives {{input, error, attempt}} and returns corrective fields.\n\
          On success: output includes __reflective_retry_attempts__ metadata.{}{}",
         added.node_id, added.workflow_id,
         child_workflow_id, reflection_workflow_id,
-        max_retries, timeout_secs,
+        max_retries, timeout_display,
         added.wiring_in, added.wiring_out
     ))
 }
@@ -6421,12 +6505,18 @@ async fn handle_add_llm_dispatch_node(
             Ok(v) => v,
             Err(resp) => return resp,
         };
+    let enforce_timeout = match parse_enforce_timeout(args, &req_id) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
     let route_count = routes_map.len();
     let mut data = serde_json::json!({
         "classifier_workflow_id": classifier_workflow_id.to_string(),
         "routes": serde_json::Value::Object(routes_map),
         "timeout_secs": timeout_secs,
     });
+    stamp_enforce_timeout(&mut data, enforce_timeout);
+    let timeout_display = describe_child_timeout(timeout_secs, enforce_timeout);
     data["fallback_workflow_id"] = match fallback_workflow_id {
         Some(id) => serde_json::Value::String(id.to_string()),
         None => serde_json::Value::Null,
@@ -6442,13 +6532,13 @@ async fn handle_add_llm_dispatch_node(
          Classifier workflow: {}\n\
          Routes: {} class labels configured\n\
          Fallback: {}\n\
-         Timeout: {}s per sub-workflow\n\
+         Timeout: {} per sub-workflow\n\
          The classifier workflow receives the input and must return {{\"class\": \"<label>\"}} to select a route.{}{}",
         added.node_id, added.workflow_id,
         classifier_workflow_id,
         route_count,
         fallback_workflow_id.map_or_else(|| "(none — unmatched class causes error)".to_string(), |id| id.to_string()),
-        timeout_secs,
+        timeout_display,
         added.wiring_in, added.wiring_out
     ))
 }
