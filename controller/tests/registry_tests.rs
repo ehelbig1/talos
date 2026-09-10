@@ -222,33 +222,43 @@ async fn test_cache_limits_eviction() {
             integration_name: None,
         };
         let id = registry.store_module(m).await.unwrap();
-        // Manually set last_used_at to ensure deterministic eviction order
-        // (enforce_cache_limits evicts ORDER BY last_used_at ASC NULLS FIRST).
-        // Modules added with i=0 (oldest), i=1, i=2 (newest).
+        // Stamp `last_used_at` PAST the 30-day idle window so every row is a
+        // candidate, with a deterministic order: i=0 coldest (40 d), i=2
+        // warmest (38 d). Within the window a row is EXEMPT — see the
+        // `..._exempts_recently_dispatched_modules` guard below.
         sqlx::query(
-            "UPDATE modules SET last_used_at = NOW() - INTERVAL '1 hour' * $1 WHERE id = $2",
+            "UPDATE modules SET last_used_at = NOW() - INTERVAL '1 day' * $1 WHERE id = $2",
         )
-        .bind(10 - i)
+        .bind(40 - i)
         .bind(id)
         .execute(&db)
         .await
         .unwrap();
     }
 
-    // Enforce limit of 2 modules. Should delete the oldest one (i=0).
-    let outcome = registry.enforce_cache_limits(2, 500).await.unwrap();
-    assert_eq!(outcome.modules_deleted, 1);
+    // Enforce limit of 2 modules. Should evict the coldest one's BYTES (i=0).
+    let outcome = registry.enforce_cache_limits(2, 500, 30).await.unwrap();
+    assert_eq!(outcome.modules_evicted, 1);
     assert_eq!(outcome.unevictable_count_overage, 0);
 
     let stats = registry.get_cache_stats().await.unwrap();
     assert_eq!(stats.module_count, 2);
 
-    // Verify M0 is deleted
-    let remaining = sqlx::query_scalar::<_, String>("SELECT name FROM modules ORDER BY name ASC")
-        .fetch_all(&db)
-        .await
-        .unwrap();
-    assert_eq!(remaining, vec!["M1", "M2"]);
+    // All three ROWS survive; only M0 lost its bytes and carries the marker.
+    let rows = sqlx::query_as::<_, (String, bool, bool)>(
+        "SELECT name, wasm_bytes IS NULL, wasm_evicted_at IS NOT NULL FROM modules ORDER BY name",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("M0".to_string(), true, true),
+            ("M1".to_string(), false, false),
+            ("M2".to_string(), false, false),
+        ]
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -259,11 +269,11 @@ async fn test_cache_limits_eviction() {
 // shared catalog every tenant installs from — they are not cache entries and
 // no tenant owns them, so aggregate cache pressure must never delete one.
 //
-// Both guards below reproduce the PRODUCTION state faithfully: every row is
-// left with `last_used_at IS NULL`, because nothing in the workspace ever
-// writes that column (`ModuleRegistry::increment_usage` has zero callers).
-// Do NOT "fix" these tests by stamping `last_used_at` — that manufactures a
-// precondition production never supplies and is exactly what hid this defect.
+// Both guards below leave `last_used_at IS NULL` and carry no execution rows,
+// so recency falls back to `created_at`, which is set PAST the idle window —
+// that is what makes the user rows candidates at all. (Until 2026-09-10 no
+// writer of `last_used_at` existed; it is now stamped throttled on every
+// dispatch read by `ModuleRegistry::touch_last_used`.)
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Insert a shared catalog row: `user_id IS NULL`, `kind = 'catalog'`,
@@ -325,31 +335,33 @@ async fn enforce_cache_limits_never_evicts_shared_catalog_rows() {
         catalog_ids.push(insert_catalog_row(&db, &format!("Shared Template {}", i), 1024).await);
     }
     for i in 0..2 {
-        insert_user_row(&db, user_id, &format!("User Module {}", i), 1024).await;
+        insert_user_row_created_at(&db, user_id, &format!("User Module {}", i), 1024, 60).await;
     }
 
-    let outcome = registry.enforce_cache_limits(2, 500).await.unwrap();
+    let outcome = registry.enforce_cache_limits(2, 500, 30).await.unwrap();
 
     // The cap asked for 6 rows to go; only the 2 user rows are evictable. The
     // shortfall must SURFACE as a value rather than vanish — an over-cap
     // registry whose excess is all shared catalog is a real operational
     // condition, and silently doing nothing about it is how the pre-fix code
     // would have "passed" a naive check.
-    assert_eq!(outcome.modules_deleted, 2);
+    assert_eq!(outcome.modules_evicted, 2);
     assert_eq!(outcome.unevictable_count_overage, 4);
 
-    let surviving: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM modules WHERE id = ANY($1) AND user_id IS NULL")
-            .bind(&catalog_ids)
-            .fetch_one(&db)
-            .await
-            .unwrap();
+    let surviving: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM modules \
+         WHERE id = ANY($1) AND user_id IS NULL AND wasm_bytes IS NOT NULL",
+    )
+    .bind(&catalog_ids)
+    .fetch_one(&db)
+    .await
+    .unwrap();
 
     assert_eq!(
         surviving,
         6,
-        "cache eviction deleted {} shared catalog row(s); a sweep driven by \
-         aggregate cache pressure must never delete a row no tenant owns",
+        "cache eviction touched {} shared catalog row(s); a sweep driven by \
+         aggregate cache pressure must never evict a row no tenant owns",
         6 - surviving
     );
 }
@@ -370,10 +382,10 @@ async fn enforce_cache_limits_size_cap_sheds_bytes_when_keys_tie() {
 
     // 4 evictable rows of 1 MiB each = 4 MiB against a 2 MiB cap.
     for i in 0..4 {
-        insert_user_row(&db, user_id, &format!("Bulky {}", i), 1_048_576).await;
+        insert_user_row_created_at(&db, user_id, &format!("Bulky {}", i), 1_048_576, 60).await;
     }
 
-    registry.enforce_cache_limits(1000, 2).await.unwrap();
+    registry.enforce_cache_limits(1000, 2, 30).await.unwrap();
 
     let remaining_bytes: i64 = sqlx::query_scalar(
         "SELECT COALESCE(SUM(size_bytes), 0)::bigint FROM modules WHERE wasm_bytes IS NOT NULL",
@@ -392,10 +404,9 @@ async fn enforce_cache_limits_size_cap_sheds_bytes_when_keys_tie() {
 // ─────────────────────────────────────────────────────────────────────────
 // Cache-eviction ORDER guards.
 //
-// #681 scoped WHAT this sweep may delete. These two guard WHICH. The sort key
-// is now derived from `module_executions` (the engine writes a row per
-// dispatch) because `modules.last_used_at` has no writer — see
-// `evictable_candidates!` / `eviction_order!`.
+// #681 scoped WHAT this sweep may evict. These two guard WHICH. The sort key
+// is the newer of `modules.last_used_at` (dispatch-side stamp) and the latest
+// `module_executions` row — see `module_recency_key!` / `eviction_order!`.
 //
 // As in the scoping guards above, every row is left with
 // `last_used_at IS NULL`, faithfully reproducing production. Do NOT "fix"
@@ -496,20 +507,21 @@ async fn enforce_cache_limits_evicts_the_least_recently_executed() {
     record_execution_days_ago(&db, mid, user_id, 10).await;
     record_execution_days_ago(&db, cold, user_id, 45).await;
 
-    let outcome = registry.enforce_cache_limits(2, 500).await.unwrap();
-    assert_eq!(outcome.modules_deleted, 1);
+    let outcome = registry.enforce_cache_limits(2, 500, 30).await.unwrap();
+    assert_eq!(outcome.modules_evicted, 1);
     assert_eq!(outcome.unevictable_count_overage, 0);
 
-    let survivors: Vec<String> = sqlx::query_scalar("SELECT name FROM modules ORDER BY name")
-        .fetch_all(&db)
-        .await
-        .unwrap();
+    let survivors: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM modules WHERE wasm_bytes IS NOT NULL ORDER BY name")
+            .fetch_all(&db)
+            .await
+            .unwrap();
 
     assert_eq!(
         survivors,
         vec!["Hot".to_string(), "Mid".to_string()],
-        "eviction deleted the wrong row: ordering on creation time rather than \
-         on last execution deletes the module that ran today and keeps the one \
+        "eviction chose the wrong row: ordering on creation time rather than \
+         on last execution evicts the module that ran today and keeps the one \
          idle for 45 days"
     );
 }
@@ -539,18 +551,21 @@ async fn enforce_cache_limits_does_not_treat_missing_execution_rows_as_coldest()
     let stale = insert_user_row_created_at(&db, user_id, "Stale", 1024, 90).await;
     record_execution_days_ago(&db, stale, user_id, 50).await;
 
-    // In active use, but its execution rows are gone (pruned) — or it was
-    // compiled a moment ago and has not run yet. Both look identical here, and
-    // both must be protected.
-    insert_user_row_created_at(&db, user_id, "EvidenceLost", 1024, 0).await;
+    // Its execution rows are gone (pruned), and it was created 35 days ago —
+    // PAST the 30-day idle window, so the window does not protect it and the
+    // ORDER has to: `COALESCE(…, created_at)` puts it at 35 d, behind Stale at
+    // 50 d. A bare `last_exec ASC NULLS FIRST` would evict it first. (A row
+    // created inside the window is exempt outright — see the next guard.)
+    insert_user_row_created_at(&db, user_id, "EvidenceLost", 1024, 35).await;
 
-    let outcome = registry.enforce_cache_limits(1, 500).await.unwrap();
-    assert_eq!(outcome.modules_deleted, 1);
+    let outcome = registry.enforce_cache_limits(1, 500, 30).await.unwrap();
+    assert_eq!(outcome.modules_evicted, 1);
 
-    let survivors: Vec<String> = sqlx::query_scalar("SELECT name FROM modules ORDER BY name")
-        .fetch_all(&db)
-        .await
-        .unwrap();
+    let survivors: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM modules WHERE wasm_bytes IS NOT NULL ORDER BY name")
+            .fetch_all(&db)
+            .await
+            .unwrap();
 
     assert_eq!(
         survivors,
@@ -559,4 +574,338 @@ async fn enforce_cache_limits_does_not_treat_missing_execution_rows_as_coldest()
          evidence is not evidence of disuse, and this sweep's deletions are \
          irreversible"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 2026-09-10: the sweep evicts BYTES, never rows, and never touches a module
+// that is referenced or was dispatched inside the idle window. Until then
+// `enforce_cache_limits` ran `DELETE FROM modules` with no reference check —
+// `module_executions.module_id` is ON DELETE CASCADE, so a module's whole
+// execution history went with it and `source_code` was lost.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// A minimal workflow row whose `graph_json` mentions `module_id`.
+async fn insert_workflow_referencing(
+    db: &Pool<Postgres>,
+    user_id: Uuid,
+    module_id: Uuid,
+    status: &str,
+) -> Uuid {
+    let wf = Uuid::new_v4();
+    let graph = json!({
+        "nodes": [{"id": "n1", "type": "module", "data": {"module_id": module_id}}],
+        "edges": []
+    });
+    sqlx::query(
+        "INSERT INTO workflows (id, user_id, name, module_uri, graph_json, status) \
+         VALUES ($1, $2, $3, 'test', $4, $5)",
+    )
+    .bind(wf)
+    .bind(user_id)
+    .bind(format!("wf-{wf}"))
+    .bind(graph.to_string())
+    .bind(status)
+    .execute(db)
+    .await
+    .unwrap();
+    wf
+}
+
+/// Every reference surface the exemption fragment names, plus one unreferenced
+/// control — and the row count before/after, because "the referenced module
+/// survived" proves nothing if the sweep deleted it and the assertion looked
+/// at the wrong table.
+#[tokio::test]
+async fn enforce_cache_limits_keeps_rows_and_exempts_referenced_modules() {
+    let (registry, db) = setup_isolated_registry().await;
+    sqlx::query("DELETE FROM modules")
+        .execute(&db)
+        .await
+        .unwrap();
+    let user_id = create_test_user_with_default_actor(&db).await;
+
+    // All four created 60 days ago with no recent dispatch, so recency alone
+    // makes every one a candidate; only the references separate them.
+    let junction = insert_user_row_created_at(&db, user_id, "Junction", 1024, 60).await;
+    let in_graph = insert_user_row_created_at(&db, user_id, "InGraphOnly", 1024, 60).await;
+    let webhooked = insert_user_row_created_at(&db, user_id, "Webhooked", 1024, 60).await;
+    let unreferenced = insert_user_row_created_at(&db, user_id, "Unreferenced", 1024, 60).await;
+
+    // 1. junction row (the hot path) — the workflow is ARCHIVED on purpose:
+    //    archiving is reversible and must not cost the module its bytes.
+    let wf_j = insert_workflow_referencing(&db, user_id, junction, "archived").await;
+    sqlx::query("INSERT INTO workflow_module_refs (workflow_id, module_id) VALUES ($1, $2)")
+        .bind(wf_j)
+        .bind(junction)
+        .execute(&db)
+        .await
+        .unwrap();
+    // 2. graph text ONLY — the junction lagged (MCP graph mutations do not
+    //    maintain it). This is the leg that has to catch it.
+    insert_workflow_referencing(&db, user_id, in_graph, "active").await;
+    // 3. webhook binding, disabled — a paused hook is still a binding.
+    sqlx::query(
+        "INSERT INTO webhook_triggers (id, name, verification_token, module_id, user_id, enabled) \
+         VALUES ($1, 'hook', 'tok', $2, $3, false)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(webhooked)
+    .bind(user_id)
+    .execute(&db)
+    .await
+    .unwrap();
+    // The control has execution history OLDER than the window: still a
+    // candidate, and its rows must SURVIVE the eviction (no CASCADE).
+    record_execution_days_ago(&db, unreferenced, user_id, 45).await;
+
+    // Cap 1 against 4 → wanted 3; only the control is evictable.
+    let outcome = registry.enforce_cache_limits(1, 500, 30).await.unwrap();
+    assert_eq!(outcome.modules_evicted, 1, "{outcome:?}");
+    assert_eq!(outcome.bytes_freed, 1024);
+    assert_eq!(outcome.unevictable_count_overage, 2, "{outcome:?}");
+
+    let rows = sqlx::query_as::<_, (String, bool, bool, Option<String>)>(
+        "SELECT name, wasm_bytes IS NULL, wasm_evicted_at IS NOT NULL, source_code \
+         FROM modules ORDER BY name",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 4, "a row was DELETED: {rows:?}");
+    assert_eq!(
+        rows,
+        vec![
+            (
+                "InGraphOnly".to_string(),
+                false,
+                false,
+                Some("user source".to_string())
+            ),
+            (
+                "Junction".to_string(),
+                false,
+                false,
+                Some("user source".to_string())
+            ),
+            (
+                "Unreferenced".to_string(),
+                true,
+                true,
+                Some("user source".to_string())
+            ),
+            (
+                "Webhooked".to_string(),
+                false,
+                false,
+                Some("user source".to_string())
+            ),
+        ]
+    );
+
+    let history: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM module_executions WHERE module_id = $1")
+            .bind(unreferenced)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(
+        history, 1,
+        "eviction must not take the execution history with it"
+    );
+}
+
+/// The idle window is an exemption, not just a sort key: a module dispatched
+/// yesterday is not a candidate however far over cap the registry is — the
+/// shortfall is REPORTED instead.
+#[tokio::test]
+async fn enforce_cache_limits_exempts_recently_dispatched_modules() {
+    let (registry, db) = setup_isolated_registry().await;
+    sqlx::query("DELETE FROM modules")
+        .execute(&db)
+        .await
+        .unwrap();
+    let user_id = create_test_user_with_default_actor(&db).await;
+
+    let by_stamp = insert_user_row_created_at(&db, user_id, "ByStamp", 1024, 60).await;
+    let by_exec = insert_user_row_created_at(&db, user_id, "ByExec", 1024, 60).await;
+    insert_user_row_created_at(&db, user_id, "Cold", 1024, 60).await;
+
+    // Recent via the dispatch-side stamp (the throttled touch) …
+    assert!(registry.touch_last_used(by_stamp).await.unwrap());
+    // … recent via an execution row alone (stamp never written).
+    record_execution_days_ago(&db, by_exec, user_id, 1).await;
+
+    let outcome = registry.enforce_cache_limits(1, 500, 30).await.unwrap();
+    assert_eq!(outcome.modules_evicted, 1);
+    assert_eq!(outcome.unevictable_count_overage, 1);
+
+    let evicted: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM modules WHERE wasm_evicted_at IS NOT NULL")
+            .fetch_all(&db)
+            .await
+            .unwrap();
+    assert_eq!(evicted, vec!["Cold".to_string()]);
+}
+
+/// The retention knob, live: same exemptions, same byte-only eviction.
+#[tokio::test]
+async fn cleanup_old_modules_evicts_idle_bytes_and_keeps_rows() {
+    let (registry, db) = setup_isolated_registry().await;
+    sqlx::query("DELETE FROM modules")
+        .execute(&db)
+        .await
+        .unwrap();
+    let user_id = create_test_user_with_default_actor(&db).await;
+
+    let recent = insert_user_row_created_at(&db, user_id, "Recent", 2048, 60).await;
+    let idle = insert_user_row_created_at(&db, user_id, "Idle", 2048, 60).await;
+    let referenced = insert_user_row_created_at(&db, user_id, "Referenced", 2048, 60).await;
+    insert_catalog_row(&db, "Shared", 2048).await;
+
+    sqlx::query("UPDATE modules SET last_used_at = NOW() - INTERVAL '5 days' WHERE id = $1")
+        .bind(recent)
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE modules SET last_used_at = NOW() - INTERVAL '45 days' WHERE id = $1")
+        .bind(idle)
+        .execute(&db)
+        .await
+        .unwrap();
+    // Idle for the same 45 days AND referenced — the reference wins.
+    sqlx::query("UPDATE modules SET last_used_at = NOW() - INTERVAL '45 days' WHERE id = $1")
+        .bind(referenced)
+        .execute(&db)
+        .await
+        .unwrap();
+    insert_workflow_referencing(&db, user_id, referenced, "active").await;
+
+    let outcome = registry.cleanup_old_modules(30).await.unwrap();
+    assert_eq!(outcome.modules_evicted, 1, "{outcome:?}");
+    assert_eq!(outcome.bytes_freed, 2048);
+
+    let rows = sqlx::query_as::<_, (String, bool)>(
+        "SELECT name, wasm_bytes IS NULL FROM modules ORDER BY name",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![
+            ("Idle".to_string(), true),
+            ("Recent".to_string(), false),
+            ("Referenced".to_string(), false),
+            ("Shared".to_string(), false),
+        ]
+    );
+}
+
+/// The dispatch-side stamp writes at most once per hour per module.
+#[tokio::test]
+async fn touch_last_used_is_throttled_to_one_write_per_hour() {
+    let (registry, db) = setup_isolated_registry().await;
+    let user_id = create_test_user(&db).await;
+    let id = insert_user_row(&db, user_id, "Touched", 8).await;
+
+    assert!(
+        registry.touch_last_used(id).await.unwrap(),
+        "first touch must write"
+    );
+    assert!(
+        !registry.touch_last_used(id).await.unwrap(),
+        "second touch within the hour must NOT write"
+    );
+
+    let (usage, stamped): (i64, bool) = sqlx::query_as(
+        "SELECT usage_count, last_used_at > NOW() - INTERVAL '1 minute' FROM modules WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(usage, 1);
+    assert!(stamped);
+
+    // Once the hour has passed the next dispatch stamps again.
+    sqlx::query("UPDATE modules SET last_used_at = NOW() - INTERVAL '2 hours' WHERE id = $1")
+        .bind(id)
+        .execute(&db)
+        .await
+        .unwrap();
+    assert!(registry.touch_last_used(id).await.unwrap());
+    let usage: i64 = sqlx::query_scalar("SELECT usage_count FROM modules WHERE id = $1")
+        .bind(id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(usage, 2);
+
+    // No such row: not an error, just nothing stamped.
+    assert!(!registry.touch_last_used(Uuid::new_v4()).await.unwrap());
+}
+
+/// An evicted module READS as evicted — not as missing — on both the graph
+/// dispatch resolver and the bytes-only read, and a recompile clears the marker
+/// through the migration's trigger whichever writer performs it.
+#[tokio::test]
+async fn evicted_module_reads_as_evicted_not_missing_and_recompile_clears_it() {
+    let (registry, db) = setup_isolated_registry().await;
+    sqlx::query("DELETE FROM modules")
+        .execute(&db)
+        .await
+        .unwrap();
+    let user_id = create_test_user_with_default_actor(&db).await;
+    let id = insert_user_row_created_at(&db, user_id, "Evictee", 1024, 60).await;
+
+    let outcome = registry.cleanup_old_modules(30).await.unwrap();
+    assert_eq!(outcome.modules_evicted, 1);
+
+    let err = registry
+        .get_module_for_execution(id, user_id)
+        .await
+        .expect_err("evicted module must not resolve to bytes");
+    let msg = err.to_string();
+    assert!(msg.contains("evicted"), "{msg}");
+    assert!(msg.contains("hot_update_module"), "{msg}");
+    assert!(
+        !msg.contains("not found"),
+        "an evicted module EXISTS: {msg}"
+    );
+    assert!(
+        err.downcast_ref::<controller::registry::ModuleBytesEvicted>()
+            .is_some(),
+        "the dispatch resolver must surface the typed error, not fall through"
+    );
+
+    let err = registry
+        .get_module_bytes(id, user_id)
+        .await
+        .expect_err("bytes read");
+    assert!(err.to_string().contains("evicted"), "{err}");
+
+    // Recompile through a writer OUTSIDE talos-registry (the shape
+    // hot_update_module issues) — the trigger clears the marker.
+    sqlx::query(
+        "UPDATE modules SET wasm_bytes = $1, size_bytes = 3, compiled_at = NOW() WHERE id = $2",
+    )
+    .bind(vec![1u8, 2, 3])
+    .bind(id)
+    .execute(&db)
+    .await
+    .unwrap();
+    let (has_bytes, evicted_at): (bool, Option<chrono::DateTime<chrono::Utc>>) =
+        sqlx::query_as("SELECT wasm_bytes IS NOT NULL, wasm_evicted_at FROM modules WHERE id = $1")
+            .bind(id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert!(has_bytes);
+    assert_eq!(evicted_at, None, "a recompile must clear wasm_evicted_at");
+
+    let m = registry
+        .get_module_for_execution(id, user_id)
+        .await
+        .unwrap();
+    assert_eq!(m.wasm_bytes, vec![1u8, 2, 3]);
 }
