@@ -715,3 +715,249 @@ async fn dek_migration_status_reports_and_tracks_pending() {
         "after the sweep, our row is no longer pending"
     );
 }
+
+// ── Domain-tagged AAD for user-keyed columns (2026-09-10) ────────────────────
+//
+// `users.totp_secret` and `user_audit_settings.auth_headers_encrypted` both
+// bound the BARE `user_id` as AAD, so for one user they derived the SAME
+// per-context subkey and a TOTP blob was a valid ciphertext for the header
+// column (the swap failed only at the JSON parse). New writes bind
+// `aad_for(<column tag>, user_id)`; readers try the tag first and accept the
+// bare id for pre-tag rows. These drive the REAL SecretsManager against a
+// real DEK, not the pure derivation the unit tests in `talos-secrets-manager`
+// cover.
+
+use controller::secrets::aad::{aad_for, AadPath, OTLP_AUTH_HEADERS_TAG, TOTP_SECRET_TAG};
+
+#[tokio::test]
+async fn tagged_write_decrypts_under_tagged_reader_and_reports_tagged_path() {
+    set_master_key_for_dek_tests();
+    let pool = test_helpers::get_test_db_pool().await;
+    let manager = SecretsManager::new(pool.clone()).unwrap();
+    manager.initialize().await.unwrap();
+    let (uid, _org) = create_user_with_personal_org(&pool).await;
+
+    let (kid, ct, ver) = manager
+        .encrypt_value_aad_v4_for_user("JBSWY3DPEHPK3PXP", uid, &aad_for(TOTP_SECRET_TAG, uid))
+        .await
+        .unwrap();
+    assert_eq!(ver, 4);
+    let (pt, path) = manager
+        .decrypt_versioned_tagged(kid, &ct, TOTP_SECRET_TAG, uid, ver)
+        .await
+        .unwrap();
+    assert_eq!(pt.as_str(), "JBSWY3DPEHPK3PXP");
+    assert_eq!(path, AadPath::Tagged);
+}
+
+#[tokio::test]
+async fn pre_tag_bare_id_rows_still_decrypt_and_report_legacy_path() {
+    set_master_key_for_dek_tests();
+    let pool = test_helpers::get_test_db_pool().await;
+    let manager = SecretsManager::new(pool.clone()).unwrap();
+    manager.initialize().await.unwrap();
+    let (uid, _org) = create_user_with_personal_org(&pool).await;
+
+    // A v4 row written before the tag existed: AAD = bare user_id.
+    let (kid4, ct4, ver4) = manager
+        .encrypt_value_aad_v4_for_user("legacy-v4-seed", uid, uid.as_bytes())
+        .await
+        .unwrap();
+    let (pt, path) = manager
+        .decrypt_versioned_tagged(kid4, &ct4, TOTP_SECRET_TAG, uid, ver4)
+        .await
+        .expect("a legacy bare-id row must never be failed by the tagged reader");
+    assert_eq!(pt.as_str(), "legacy-v4-seed");
+    assert_eq!(path, AadPath::LegacyBareId);
+
+    // A v3 (global-DEK) row from before the per-org cutover, same bare AAD.
+    let (kid3, ct3, ver3) = manager
+        .encrypt_value_aad_v3("legacy-v3-headers", uid.as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(ver3, 3);
+    let (pt, path) = manager
+        .decrypt_versioned_tagged(kid3, &ct3, OTLP_AUTH_HEADERS_TAG, uid, ver3)
+        .await
+        .unwrap();
+    assert_eq!(pt.as_str(), "legacy-v3-headers");
+    assert_eq!(path, AadPath::LegacyBareId);
+}
+
+#[tokio::test]
+async fn cross_column_swap_fails_under_tagged_readers_in_both_directions() {
+    set_master_key_for_dek_tests();
+    let pool = test_helpers::get_test_db_pool().await;
+    let manager = SecretsManager::new(pool.clone()).unwrap();
+    manager.initialize().await.unwrap();
+    let (uid, _org) = create_user_with_personal_org(&pool).await;
+
+    let (kid_t, ct_totp, ver) = manager
+        .encrypt_value_aad_v4_for_user("JBSWY3DPEHPK3PXP", uid, &aad_for(TOTP_SECRET_TAG, uid))
+        .await
+        .unwrap();
+    let (kid_o, ct_otlp, _) = manager
+        .encrypt_value_aad_v4_for_user(
+            r#"{"authorization":"Bearer x"}"#,
+            uid,
+            &aad_for(OTLP_AUTH_HEADERS_TAG, uid),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        kid_t, kid_o,
+        "same user ⇒ same personal-org DEK; only the AAD separates them"
+    );
+
+    // TOTP blob transposed into the OTLP column: the tagged attempt fails AND
+    // the bare-id fallback fails (the blob was written under the TOTP tag).
+    let err = manager
+        .decrypt_versioned_tagged(kid_t, &ct_totp, OTLP_AUTH_HEADERS_TAG, uid, ver)
+        .await
+        .err()
+        .expect("TOTP blob must NOT open as OTLP headers");
+    assert!(
+        matches!(err, controller::secrets::SecretsError::Aead),
+        "must be the AEAD tag mismatch, not a DEK/format error: {err}"
+    );
+    // And the reverse.
+    let err = manager
+        .decrypt_versioned_tagged(kid_o, &ct_otlp, TOTP_SECRET_TAG, uid, ver)
+        .await
+        .err()
+        .expect("OTLP blob must NOT open as a TOTP secret");
+    assert!(matches!(err, controller::secrets::SecretsError::Aead));
+
+    // Control: each opens under its own reader.
+    assert!(manager
+        .decrypt_versioned_tagged(kid_t, &ct_totp, TOTP_SECRET_TAG, uid, ver)
+        .await
+        .is_ok());
+    assert!(manager
+        .decrypt_versioned_tagged(kid_o, &ct_otlp, OTLP_AUTH_HEADERS_TAG, uid, ver)
+        .await
+        .is_ok());
+
+    // Stated limit, pinned so it is not mistaken for a guarantee: a PRE-TAG
+    // (bare-id) blob still opens under BOTH tagged readers via the fallback —
+    // the tag closes the swap for rows written after it, and the legacy row
+    // closes it on its column's next write.
+    let (kid_l, ct_legacy, ver_l) = manager
+        .encrypt_value_aad_v4_for_user("legacy-bare", uid, uid.as_bytes())
+        .await
+        .unwrap();
+    for tag in [TOTP_SECRET_TAG, OTLP_AUTH_HEADERS_TAG] {
+        let (_, path) = manager
+            .decrypt_versioned_tagged(kid_l, &ct_legacy, tag, uid, ver_l)
+            .await
+            .unwrap();
+        assert_eq!(path, AadPath::LegacyBareId);
+    }
+}
+
+#[tokio::test]
+async fn tagged_reader_does_not_retry_non_aead_errors() {
+    set_master_key_for_dek_tests();
+    let pool = test_helpers::get_test_db_pool().await;
+    let manager = SecretsManager::new(pool.clone()).unwrap();
+    manager.initialize().await.unwrap();
+    let uid = Uuid::new_v4();
+
+    // Unknown format: fails at classification, before either AAD attempt.
+    let err = manager
+        .decrypt_versioned_tagged(Uuid::new_v4(), &[0u8; 28], TOTP_SECRET_TAG, uid, 99)
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(
+        err,
+        controller::secrets::SecretsError::UnknownFormat(99)
+    ));
+
+    // Missing DEK: independent of the AAD, surfaced as-is rather than masked
+    // by a fallback that could not succeed either.
+    let err = manager
+        .decrypt_versioned_tagged(Uuid::new_v4(), &[0u8; 28], TOTP_SECRET_TAG, uid, 4)
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        matches!(err, controller::secrets::SecretsError::MissingDek { .. }),
+        "got {err}"
+    );
+}
+
+// ── webhook_triggers.signing_secret_enc: MCP writer now v4 like GraphQL ──────
+
+#[tokio::test]
+async fn webhook_try_create_under_cap_writes_v4_under_owner_personal_org_dek() {
+    set_master_key_for_dek_tests();
+    let pool = test_helpers::get_test_db_pool().await;
+    let manager = SecretsManager::new(pool.clone()).unwrap();
+    manager.initialize().await.unwrap();
+    let (uid, personal_org) = create_user_with_personal_org(&pool).await;
+
+    // A workflow for the trigger to fire (exactly one of module_id/workflow_id).
+    let wf = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO workflows (id, user_id, name, module_uri, graph_json, org_id) \
+         VALUES ($1, $2, 'wf', 'm', '{}', $3)",
+    )
+    .bind(wf)
+    .bind(uid)
+    .bind(personal_org)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let repo = talos_webhook_repository::WebhookRepository::new(pool.clone());
+    let webhook_id = Uuid::new_v4();
+    let created = repo
+        .try_create_under_cap(
+            webhook_id,
+            uid,
+            "hmac-hook",
+            None,
+            Some(wf),
+            "verification-token",
+            60,
+            false,
+            30,
+            Some("whsec_super_secret"),
+            None,
+            &manager,
+            10,
+        )
+        .await
+        .unwrap();
+    assert!(created.is_some(), "under the cap ⇒ inserted");
+
+    let (fmt, kid, ct): (i16, Uuid, Vec<u8>) = sqlx::query_as(
+        "SELECT signing_secret_format, signing_key_id, signing_secret_enc \
+         FROM webhook_triggers WHERE id = $1",
+    )
+    .bind(webhook_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        fmt, 4,
+        "MCP-created webhook signing secret must be v4, as the GraphQL writer's is"
+    );
+    let org_dek = manager
+        .get_active_dek_for_org(personal_org)
+        .await
+        .unwrap()
+        .expect("personal-org DEK lazily provisioned by the write");
+    assert_eq!(
+        kid, org_dek.id,
+        "must be keyed by the owner's personal-org DEK"
+    );
+
+    // Decrypts under the fire path's exact call (AAD = webhook_id, per-row format).
+    let pt = manager
+        .decrypt_versioned(kid, &ct, webhook_id.as_bytes(), fmt)
+        .await
+        .unwrap();
+    assert_eq!(pt.as_str(), "whsec_super_secret");
+}

@@ -20,6 +20,7 @@
 //! inside workflow node configs) lives in `talos-workflow-engine` and is
 //! re-exported by `controller::secrets::vault_resolver` for convenience.
 
+pub mod aad;
 pub mod errors;
 pub mod integration_state_crypto;
 pub mod kek_provider;

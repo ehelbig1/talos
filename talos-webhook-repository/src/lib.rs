@@ -144,9 +144,10 @@ impl WebhookRepository {
     ///
     /// Caller MUST pass exactly one of `module_id` (single-module fire) or
     /// `workflow_id` (full-workflow fire). When `signing_secret` is provided,
-    /// it is envelope-encrypted via `SecretsManager::encrypt_value` (done
-    /// OUTSIDE the transaction so the per-user advisory lock isn't held
-    /// across the slow KMS round-trip).
+    /// it is envelope-encrypted via
+    /// `SecretsManager::encrypt_value_aad_v4_for_user` (done OUTSIDE the
+    /// transaction so the per-user advisory lock isn't held across the slow
+    /// KMS round-trip).
     #[allow(clippy::too_many_arguments)]
     pub async fn try_create_under_cap(
         &self,
@@ -176,6 +177,16 @@ impl WebhookRepository {
         // thinking HMAC is enabled when it isn't. Done BEFORE the
         // transaction so the advisory lock is held for milliseconds, not
         // seconds.
+        //
+        // Per-org DEK arc (2026-09-10): v4 under the OWNER's personal-org
+        // root DEK — `webhook_triggers.org_id` is stamped from the owner's
+        // personal org by `set_org_id_from_personal_org`, so this keeps the
+        // DEK scope equal to the row's org, and it is what the GraphQL
+        // `createWebhook` writer (`talos-api/src/schema/webhooks/mutations.rs`)
+        // already did for the SAME column while this MCP path wrote v3 under
+        // the GLOBAL DEK. AAD stays = webhook_id; only the IKM changes. The
+        // RETURNED format is bound, never a hardcoded 3/4. Fails closed if the
+        // owner has no personal org (an invariant violation, same as GraphQL).
         let (signing_secret_enc, signing_key_id, signing_secret_format): (
             Option<Vec<u8>>,
             Option<Uuid>,
@@ -183,7 +194,7 @@ impl WebhookRepository {
         ) = match signing_secret {
             Some(s) if !s.is_empty() => {
                 let (key_id, ciphertext, version) = secrets_manager
-                    .encrypt_value_aad_v3(s, webhook_id.as_bytes())
+                    .encrypt_value_aad_v4_for_user(s, user_id, webhook_id.as_bytes())
                     .await
                     .map_err(|e| {
                         anyhow::anyhow!("Failed to encrypt webhook signing_secret: {}", e)

@@ -1111,3 +1111,138 @@ platform `LlmClient` default through here is a separate change. NOT tested again
    "or call `talos_memory::spotlight::{with_security_directive, wrap_untrusted}`" — optional.
 3. CLAUDE.md "metadata.kind convention": add `consolidated` to the list of labels in use and note
    its grounding exclusion — not mine to edit.
+
+## Fix package C (encryption tenancy — distinct from the workflow-engine package C above)
+
+# fix-C (encryption tenancy) — one column, two DEK scopes; two columns, one AEAD context
+
+Narrative for the encryption-tenancy follow-ups from the whole-codebase review
+(fix package C). Two defects, both in the per-context AEAD layer described in
+`CLAUDE.md` § "Per-context AEAD subkeys + per-ORG root DEKs (formats v3/v4)",
+and both the same shape as each other seen from one level up: a rule that had
+been applied at SOME of the sites that needed it, with nothing that could say
+which.
+
+## C1 — three writers of one column, two DEK scopes
+
+`workflow_executions.output_data_enc` is written by three repositories.
+`ExecutionRepository::encrypt_output` resolved the workflow's org through the
+`workflow_executions → workflows` join and wrote **v4** under that org's root
+DEK; `WorkflowRepository::maybe_encrypt_execution_output` and
+`ActorRepository::complete_execution` skipped the lookup and wrote **v3** under
+the GLOBAL DEK. Same column, same AAD (`exec_id`), same read path — and the DEK
+an execution's output sat under depended on which repository happened to
+finalise the run. The per-org cutover (`2026062625*`) had converted the
+execution repository and its sweep (`re_encrypt_outputs_to_org`) and left the
+other two, so `dekMigrationStatus` kept reporting `workflow_executions.output`
+pending rows that the sweep would clear and the next completion would re-mint.
+
+`webhook_triggers.signing_secret_enc` had the same split by PROTOCOL rather
+than by repository: the GraphQL `createWebhook` mutation wrote v4 under the
+owner's personal-org DEK (`encrypt_value_aad_v4_for_user`), the MCP
+`create_webhook` path (`WebhookRepository::try_create_under_cap`) wrote v3
+under the global DEK. Check 68's lesson (the MCP and GraphQL twins of
+`createModuleFromTemplate` diverging) in the crypto layer.
+
+**What changed.** The org resolution has ONE home,
+`SecretsManager::resolve_workflow_execution_org_id(exec_id)` — the same JOIN
+`ExecutionRepository::encrypt_output` runs, but on the SecretsManager's own
+pool so neither repository crate has to grow a dependency edge on the third.
+Both non-execution writers call it and then `encrypt_value_aad_v4_or_global`,
+binding the RETURNED format; an org-less workflow still yields `None` → v3,
+byte-identical to before. The webhook repository now calls
+`encrypt_value_aad_v4_for_user(secret, user_id, webhook_id.as_bytes())` — the
+AAD stays the row id; only the IKM changes — and fails closed if the owner has
+no personal org, exactly as the GraphQL writer already did.
+`ExecutionRepository::encrypt_output` itself was deliberately NOT touched (it
+was the correct reference implementation; consolidating it onto the new
+resolver is a follow-up that changes no bytes).
+
+**Verified.** Both tables' `*_format` CHECK constraints already admitted 4
+(`20260626220000`, `20260626250000`; the archive table's column carries no
+CHECK), so **no migration was needed**. `controller/tests/workflow_output_dek_tests`
+gains three cases — each of the two repaired writers lands `format = 4` keyed
+by the workflow's org DEK and reads back through the execution repository's
+versioned decrypt, and an org-less workflow stays v3/global from the workflow
+repository (the `None` arm). `controller/tests/secrets_tests` gains the MCP
+webhook path: `try_create_under_cap` lands `format = 4` keyed by the owner's
+personal-org DEK and the fire path's exact `decrypt_versioned(kid, ct,
+webhook_id, fmt)` opens it.
+
+**`manager.rs:4837` (`re_encrypt_secrets`) — read and left alone.** It is the
+GLOBAL-DEK rotation sweep for the `secrets` table and its SELECT already
+excludes `encryption_format_version = 4`, so it re-keys only rows that are
+already global; writing v3 there is correct by construction, not an oversight.
+`:2314` is the `None` arm of `encrypt_value_aad_v4_or_global` itself.
+
+## C2 — two columns, one AEAD context
+
+Every v3/v4 blob derives its key as `HKDF(ikm = DEK, salt = fixed label, info =
+aad)` and binds `aad` into the GCM tag. That partitions the key space per
+context — **but only as finely as the AAD bytes distinguish contexts.**
+`users.totp_secret` and `user_audit_settings.auth_headers_encrypted` both bound
+the bare `user_id`, so for one user they derived the SAME subkey and bound the
+SAME AAD: a TOTP seed blob was a valid ciphertext for the OTLP header column
+and vice versa. The swap failed today only because a base32 seed does not parse
+as a JSON header map — a parser standing where the AEAD should have stood. (In
+the other direction the header JSON would have been handed to the TOTP
+verifier as a "secret"; a real-world attacker needs DB write access to either
+column, so this is a defence-in-depth gap, not a live bypass.)
+
+The pure test `same_user_two_columns_bare_id_aad_shares_one_subkey` in
+`talos-secrets-manager` states the defect as a property rather than assuming
+it: two `derive_per_context_subkey` calls with the bare id agree, and the
+"OTLP reader" opens the TOTP blob.
+
+**What changed.** New writes bind a DOMAIN-TAGGED AAD: `b"totp\0" || user_id`
+and `b"otlp-auth-headers\0" || user_id`. The two tags are `pub const`s in ONE
+place, `talos_secrets_manager::aad` (`TOTP_SECRET_TAG`, `OTLP_AUTH_HEADERS_TAG`,
+`aad_for(tag, id)`), so a third user-keyed column cannot re-derive one under a
+different spelling. The NUL terminator keeps the tag prefix-free against the id
+bytes that follow. Readers go through ONE function,
+`SecretsManager::decrypt_versioned_tagged(key_id, ct, tag, id, format)`, which
+tries the tagged AAD first and — ONLY on `SecretsError::Aead`, the one error
+the AAD can cause — retries with the bare `id.as_bytes()`, returning which
+`AadPath` opened the row (`Tagged` / `LegacyBareId` / `LegacyNoAad` for v0,
+where no AAD is bound at all). A missing DEK or unknown format is returned
+as-is rather than masked by a fallback that could not succeed either. Both
+callers (`talos-totp-2fa::decrypt_totp_secret`, `talos-audit-ledger`
+`get_tracer`) log the path at DEBUG with no plaintext. **Neither attempt logs
+or counts anything below that**: `decrypt_versioned` and the AEAD primitives
+are silent — the `secret_decrypt_failures_total` counter is bumped only by the
+`secrets`-table callers — so a legacy row's expected first-attempt miss cannot
+show up as a failure metric or a `talos_secrets` WARN on every login. That was
+checked before the fallback order was chosen, not after.
+
+**Re-encryption is lazy, by the column's own next write, and nothing sweeps.**
+`enable_2fa` writes a fresh tagged blob (2FA has no rotate path; `disable_2fa`
+clears the column); `update_audit_settings` rewrites the header blob on every
+save. Stated limit, pinned by a test so it is not mistaken for a guarantee: a
+PRE-TAG blob still opens under BOTH tagged readers via the fallback — the tag
+closes the swap for rows written after it, and each legacy row closes it on its
+column's next write. `dekMigrationStatus` counts formats, not AAD contexts, so
+it cannot report how many rows are still on the bare-id context; nothing can,
+short of attempting the decrypt.
+
+**Verified.** `talos-secrets-manager` unit tests (pure, no DB): the tag layout,
+distinctness, the pre-fix shared-subkey property, and the cross-column swap
+failing in both directions under tagged AADs while each blob still opens under
+its own. `controller/tests/secrets_tests` against a real DEK: a tagged write
+decrypts and reports `Tagged`; a v4 bare-id row and a v3 bare-id row both
+still decrypt and report `LegacyBareId`; a TOTP-tagged blob presented to the
+OTLP reader (and the reverse) fails with `SecretsError::Aead` — not a DEK or
+format error — while the controls pass; `UnknownFormat` and `MissingDek` are
+not retried. **No end-to-end test drives `TotpService::verify_2fa_login` or
+`OTLPCache::get_tracer`**: the former needs Redis for its replay cache and a
+live TOTP window, the latter builds a real OTLP exporter; both wrappers are a
+handful of lines around the one function the DB tests drive, and that is the
+stated limit of this package's evidence.
+
+**The inventory, so nobody re-greps.** Every `encrypt_value_aad_*` call in the
+workspace was read for the shape of its AAD. Row-ID contexts (`secret_id`,
+`webhook_id`/`trigger.id`, `exec_id` for `workflow_executions.output_data_enc`
+and its four readers, `module_execution_id` — slot-tagged since v2) are unique
+across tables by construction and do not need a tag. Already-tagged contexts:
+`integration_state_aad(name, user_id, key)`, `example_aad(dataset, key, id)`,
+`disagreement_aad(model, id)`, actor_memory's `(actor_id, key)`. The bare
+shared-foreign-id shape existed at exactly the two sites this package fixed.
