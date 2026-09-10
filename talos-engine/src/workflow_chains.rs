@@ -972,7 +972,18 @@ async fn run_single_workflow_chain(
     // completes), and the trigger handler doesn't depend on their
     // success — best-effort with WARN logging is correct.
     let execution_id = Uuid::new_v4();
-    {
+    // The JoinHandle is KEPT (2026-09-10): the INSERT still overlaps the
+    // engine run, but it is awaited before any finalize UPDATE below. Without
+    // that ordering a chain with ZERO downstream module nodes — which
+    // `run_with_seed_via_nats` completes in microseconds — ran
+    // `mark_execution_completed` BEFORE this INSERT committed; the guarded
+    // UPDATE matched no row, the INSERT then landed as 'running', and the
+    // row sat there until the stale sweep force-failed it an hour later.
+    // Observed live on the dev fleet: three stress-* chains stuck 'running'
+    // after one module-bound webhook. The trigger-error path below already
+    // defends itself with an upsert; the success and engine-error paths did
+    // not.
+    let row_insert = {
         let pool = db_pool.clone();
         let trigger_exec_id = trigger_execution_id;
         tokio::spawn(async move {
@@ -1022,8 +1033,8 @@ async fn run_single_workflow_chain(
                     "Failed to link trigger module_execution to chain workflow_execution"
                 );
             }
-        });
-    }
+        })
+    };
 
     if let Some(err_msg) = trigger_error {
         // MCP-451: DLP-redact the trigger error string before
@@ -1060,15 +1071,33 @@ async fn run_single_workflow_chain(
         return Ok(());
     }
 
-    match crate::nats_run::run_with_seed_via_nats(
+    let run_result = crate::nats_run::run_with_seed_via_nats(
         &engine,
         nats_client.clone(),
         worker_shared_key.clone(),
         initial_results,
         execution_id,
     )
-    .await
-    {
+    .await;
+
+    // Ordering guard (see the JoinHandle comment above): the 'running' row
+    // must exist before any of the finalize writes below, or a fast chain
+    // finalizes nothing and the row is orphaned at 'running'. A JoinError here
+    // means the INSERT task panicked; the finalize is still attempted (the
+    // failure branch upserts) and the panic is reported rather than hidden.
+    if let Err(join_err) = row_insert.await {
+        tracing::warn!(
+            target: "talos_engine",
+            event_kind = "chain_dispatch_db_error",
+            op = "await_insert_workflow_execution",
+            %execution_id,
+            %workflow_id,
+            error = %join_err,
+            "chain execution-row INSERT task did not complete; finalize may orphan the row"
+        );
+    }
+
+    match run_result {
         Ok(ctx) => {
             // Subtract 1 for the pre-seeded trigger node itself.
             let downstream_count = ctx.results.len().saturating_sub(1);
