@@ -3,7 +3,31 @@ use super::utils::{mcp_denied, mcp_error, mcp_failed, mcp_text};
 use super::{auth, McpState};
 use serde_json::Value;
 use std::sync::Arc;
+use std::time::Duration;
 use uuid::Uuid;
+
+/// Upper bound on one Neo4j round-trip from these handlers (2026-09-10).
+/// Matches the `talos.graph.search` RPC leg's budget so a wedged Bolt
+/// connection or an expensive traversal cannot park an MCP request slot
+/// indefinitely — before this, none of the three graph tools had any
+/// timeout at all.
+const NEO4J_CALL_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Run one graph call under [`NEO4J_CALL_TIMEOUT`]; a timeout becomes an
+/// `anyhow::Error` so every handler's existing `Err` arm logs and answers the
+/// same way (the caller-facing text stays generic — check 14/74's rule).
+async fn with_graph_timeout<T, F>(what: &'static str, fut: F) -> anyhow::Result<T>
+where
+    F: std::future::Future<Output = anyhow::Result<T>>,
+{
+    match tokio::time::timeout(NEO4J_CALL_TIMEOUT, fut).await {
+        Ok(res) => res,
+        Err(_) => Err(anyhow::anyhow!(
+            "{what} timed out after {}s",
+            NEO4J_CALL_TIMEOUT.as_secs()
+        )),
+    }
+}
 
 pub fn tool_schemas() -> Vec<serde_json::Value> {
     vec![
@@ -210,9 +234,11 @@ async fn handle_graph_query(
         Err(resp) => return resp,
     };
 
-    match graph
-        .get_graph_context(actor_id, query, max_hops, max_nodes)
-        .await
+    match with_graph_timeout(
+        "graph_query",
+        graph.get_graph_context(actor_id, query, max_hops, max_nodes),
+    )
+    .await
     {
         Ok(ctx) => mcp_text(
             req_id,
@@ -241,7 +267,7 @@ async fn handle_graph_stats(
         Err(resp) => return resp,
     };
 
-    match graph.get_stats(actor_id).await {
+    match with_graph_timeout("graph_stats", graph.get_stats(actor_id)).await {
         Ok(stats) => {
             // MCP-70 (2026-05-07): emit `actor_id` echo + scalar
             // total_nodes/total_edges + a `graph_status` so an empty
@@ -430,53 +456,23 @@ async fn handle_graph_entity_context(
         _ => return mcp_error(req_id, -32602, "Missing required 'entity_name' argument"),
     };
 
-    let actor_str = actor_id.to_string();
-
-    // Find the entity and all its direct relationships.
-    let cypher = "MATCH (n {actor_id: $actor_id, name: $name}) \
-         OPTIONAL MATCH (n)-[r]-(m {actor_id: $actor_id}) \
-         RETURN labels(n) AS node_labels, n.name AS node_name, \
-                n.source_key AS source_key, n.updated_at AS updated_at, \
-                collect(DISTINCT { \
-                    direction: CASE WHEN startNode(r) = n THEN 'outgoing' ELSE 'incoming' END, \
-                    type: type(r), \
-                    related_name: m.name, \
-                    related_labels: labels(m), \
-                    related_source: m.source_key \
-                }) AS relationships";
-
-    match graph
-        .graph_ref()
-        .execute(
-            neo4rs::query(cypher)
-                .param("actor_id", actor_str.as_str())
-                .param("name", entity_name),
-        )
-        .await
+    // The Cypher lives in `talos_graph_rag::get_entity_context` (no query
+    // text in a handler — Architectural Mandate); it is label-constrained,
+    // actor-scoped on both ends and bounded at
+    // `MAX_ENTITY_CONTEXT_RELATIONSHIPS`, which is disclosed below so a full
+    // page reads as a page rather than as "every relationship".
+    match with_graph_timeout(
+        "graph_entity_context",
+        graph.get_entity_context(actor_id, entity_name),
+    )
+    .await
     {
-        Ok(mut result) => {
-            let mut entities: Vec<serde_json::Value> = Vec::new();
-            while let Ok(Some(row)) = result.next().await {
-                let labels: Vec<String> = row.get("node_labels").unwrap_or_default();
-                let name: String = row.get("node_name").unwrap_or_default();
-                let source: String = row.get("source_key").unwrap_or_default();
-                let updated: String = row.get("updated_at").unwrap_or_default();
-                let rels: Vec<serde_json::Value> = row.get("relationships").unwrap_or_default();
-
-                entities.push(serde_json::json!({
-                    "type": labels.first().unwrap_or(&"Unknown".to_string()),
-                    "name": name,
-                    "source_key": source,
-                    "updated_at": updated,
-                    "relationships": rels,
-                    "relationship_count": rels.len(),
-                }));
-            }
-
+        Ok(entities) => {
             let response = serde_json::json!({
                 "entity_name": entity_name,
                 "found": !entities.is_empty(),
                 "entities": entities,
+                "relationship_limit": talos_graph_rag::MAX_ENTITY_CONTEXT_RELATIONSHIPS,
             });
             mcp_text(
                 req_id,
