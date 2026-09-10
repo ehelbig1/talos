@@ -11,22 +11,46 @@
 //! reply was lost on the wire) causes the retry to **re-execute the module** —
 //! a double side effect (double HTTP POST / webhook / DB write).
 //!
-//! ## Why a simple completed-result cache is sufficient
+//! ## What the dispatcher retries — and what this cache must therefore hold
 //!
-//! The dispatcher does NOT retry on timeout — only on a transport error
-//! (`dispatcher::dispatch_with_retry`). A transport-error retry therefore
-//! arrives only AFTER the original request's send failed, by which time the
-//! original execution has finished and produced its terminal `JobResult`. So
-//! the retry is **sequential** with the original: a cache of recently-completed
-//! results, checked before execution and populated after the result is signed
-//! (but before publish, so a retry-after-publish-failure still finds it), turns
-//! the re-execution into a cheap re-publish of the identical signed result.
+//! The dispatcher retries on TWO conditions, both under the SAME `job_id`
+//! (`dispatcher::execute_job_with_retry`): a **transport error**, and an
+//! **application-level failure** — `JobStatus::Failed`, or `Success` whose
+//! payload carries `success: false` (the `database-query` shape). It does NOT
+//! retry a timeout. Each retry re-signs with a fresh nonce and bumps
+//! `JobRequest::dispatch_attempt`.
+//!
+//! That second condition is why this cache holds **only terminal successes**
+//! (`JobResult::is_terminal_success`, the dispatcher's own predicate, ONE
+//! home in the protocol crate). An application-failure retry is the
+//! controller asking for a FRESH RUN: until 2026-09-10 the cache stored every
+//! terminal result, so the retry found the first attempt's `Failed` result
+//! and re-published it verbatim — every engine retry was a no-op replay of
+//! one transient failure, and the whole retry budget was spent re-reading it.
+//! The old header here said the dispatcher retried "only on a transport
+//! error", which was the false premise the caching decision rested on.
+//! Belt-and-braces at the hit site: a re-dispatch (`dispatch_attempt > 0`)
+//! whose cached result is not a terminal success is treated as a MISS, which
+//! covers an entry a pre-fix worker wrote to Redis during a rolling upgrade.
+//!
+//! For a transport-error retry the cached SUCCESS is exactly right: the
+//! original execution has finished (the send that failed was the reply), so
+//! the retry is **sequential** with it and a cache of recently-completed
+//! results — checked before execution, populated after the result is signed
+//! but before publish, so a retry-after-publish-failure still finds it —
+//! turns the re-execution into a cheap re-publish of the identical signed
+//! result.
 //!
 //! The cached result is re-published **as-is** (no re-signing): `JobResult`
 //! verification at the controller allows a 300 s freshness window
 //! (`max_age_secs = 300`), which dwarfs the bounded retry window (a few retries
 //! × per-call timeout + backoff, with timeouts not retried at all), so a
 //! re-published result is always comfortably fresh.
+//!
+//! The PIPELINE cache is not success-gated: `dispatcher::dispatch_with_retry`
+//! returns the first parsed reply whatever its status (no application-level
+//! retry on the chain path), so a cached failed pipeline result is never
+//! replayed against a retry that wanted a fresh run.
 //!
 //! ## Two tiers: in-process + Redis (fleet-wide)
 //!
@@ -42,7 +66,9 @@
 //!
 //! **Trust model for Redis-sourced entries**: the worker does NOT blindly
 //! re-publish bytes from Redis. The caller deserializes and re-verifies the
-//! result's own HMAC (`verify_no_replay_with_ring`) + `job_id` match before
+//! result's own signature (`verify_no_replay_dispatch`, routing on the
+//! result's `crypto_scheme` — Ed25519 or legacy HMAC, the same routing the
+//! controller applies) + `job_id` match before
 //! publishing, so a Redis compromise can't inject forged results (they'd also
 //! fail controller-side verification — this is defense in depth) and can't
 //! cross-wire job A's retry to job B's result. Verification failure falls

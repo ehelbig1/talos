@@ -64,6 +64,49 @@ fn max_concurrent_pipeline_jobs() -> usize {
     )
 }
 
+/// Ceiling on the per-job fuel THIS worker will honour from a dispatch's
+/// `max_fuel` (single-node) or a pipeline step's `max_fuel`.
+///
+/// Default [`talos_workflow_job_protocol::MAX_JOB_FUEL`] (50 M, the
+/// controller's own per-node cap); `TALOS_WORKER_MAX_JOB_FUEL` lowers or raises
+/// it per fleet. Defence in depth behind the signature: since 2026-09-10
+/// `JobRequest.max_fuel` is signature-bound, so an on-wire rewrite fails
+/// verification — this clamp is for the OTHER sender, a controller that
+/// mis-caps (or a future controller whose cap is raised without the fleet's
+/// consent). Cached: fixed for the process lifetime.
+fn worker_max_job_fuel() -> u64 {
+    static CACHE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        worker::runtime::nonzero_env_or_default(
+            "TALOS_WORKER_MAX_JOB_FUEL",
+            talos_workflow_job_protocol::MAX_JOB_FUEL,
+        )
+    })
+}
+
+/// Resolve the fuel override a dispatch asked for against this worker's
+/// ceiling. `0` means "use the runtime default" and stays `None`; anything
+/// else is `Some(min(requested, ceiling))`. Logs when it actually clamps, so
+/// a controller handing out more than the fleet allows is visible rather
+/// than silently honoured at the lower number. Pure apart from the log.
+fn clamp_job_fuel(job_id: uuid::Uuid, requested: u64, ceiling: u64) -> Option<u64> {
+    if requested == 0 {
+        return None;
+    }
+    if requested > ceiling {
+        ::tracing::warn!(
+            target: "talos_security",
+            job_id = %job_id,
+            requested_fuel = requested,
+            ceiling_fuel = ceiling,
+            event_kind = "job_fuel_clamped",
+            "dispatch asked for more fuel than this worker's ceiling — clamping"
+        );
+        return Some(ceiling);
+    }
+    Some(requested)
+}
+
 // ============================================================================
 // RELIABILITY: Result Publishing with Retry
 // ============================================================================
@@ -166,12 +209,13 @@ async fn publish_bytes_with_retry(
 /// - (Some(signed), None) → publish to the signed value. Indicates
 ///   the wire header was stripped in transit (rare; treat the
 ///   signed value as authoritative).
-/// - (None, Some(wire)) → publish to the wire value. Backward-compat
-///   path for controllers / transports that don't pre-allocate
-///   inboxes. The legacy "trust msg.reply" exposure remains but
-///   only when reply_topic isn't bound.
-/// - (None, None) → no reply path; the worker logs the result
-///   elsewhere (e.g. fire-and-forget topic).
+/// - (None, Some(wire)) → IGNORE the wire value and return `None`
+///   (2026-09-10). Until then this arm trusted the unsigned header as a
+///   backward-compat path; the last controller dispatcher that relied
+///   on it (the live webhook path) now signs its inbox, so an unsigned
+///   header with no signed twin is treated exactly like no header.
+/// - (None, None) → no reply path; the worker publishes to the
+///   fire-and-forget `talos.results.{job_id}` topic.
 ///
 /// Pure function so the policy is unit-testable without a NATS
 /// broker. The `job_id` parameter is for log correlation only.
@@ -201,7 +245,25 @@ pub(crate) fn pick_trusted_reply_topic(
             );
             Some(s.to_string())
         }
-        (None, Some(w)) => Some(w.to_string()),
+        (None, Some(w)) => {
+            // 2026-09-10 review: this arm used to return `Some(w)` — the one
+            // place the worker still honoured an UNSIGNED wire reply header.
+            // With the webhook dispatcher now signing its inbox (H-1 parity),
+            // no controller path in this workspace sends `reply_topic: None`
+            // AND awaits a wire reply; the remaining `None` senders
+            // (gmail/gcal/gcp push, DLQ replay) are fire-and-forget and read
+            // `talos.results.<job_id>`. A wire header with no signed twin is
+            // therefore either a stale controller or a bus participant
+            // steering a replayed job's output to itself — the result goes
+            // to the audit topic, never to the header.
+            ::tracing::debug!(
+                job_id = %job_id,
+                wire_reply_len = w.len(),
+                "reply_topic unsigned (None) but a wire msg.reply was present — \
+                 ignoring the wire header; result goes to talos.results.<job_id>"
+            );
+            None
+        }
         (None, None) => {
             // L-12 (2026-05-22): the result will be published to the
             // global `talos.results.{job_id}` topic by the caller
@@ -1097,6 +1159,27 @@ fn sign_job_result(
     }
 }
 
+/// Ed25519 verifying keys that may vouch for a CACHED result signed by
+/// `worker_id` (the idempotency cache's Redis tier re-verifies before it
+/// re-publishes). The fleet's registered keys (`TALOS_WORKER_PUBLIC_KEYS`, a
+/// controller-side setting that is usually absent on a worker) plus THIS
+/// worker's own key when the result is its own — so a same-identity restart or
+/// a same-worker Redis hit re-admits its own Ed25519 result. A sibling's
+/// Ed25519 result with no registered key fails re-verification and falls
+/// through to re-execution: the safe direction, and no worse than the HMAC-only
+/// verifier this replaced, which could re-admit NO Ed25519 result at all.
+fn cached_result_verify_keys(
+    worker_id: &str,
+) -> Vec<talos_workflow_job_protocol::DispatchVerifyingKey> {
+    let mut keys = talos_workflow_job_protocol::worker_public_keys(worker_id);
+    if worker_id == worker_identity() {
+        if let Some(sk) = worker_result_signing_key() {
+            keys.push(sk.verifying_key());
+        }
+    }
+    keys
+}
+
 /// Ed25519-preferring signer for `PipelineJobResult`; see [`sign_job_result`].
 fn sign_pipeline_result(
     result: &mut PipelineJobResult,
@@ -1485,11 +1568,9 @@ async fn execute_job(
             None, // No result caching for NATS jobs — each execution must be fresh
             security_policy,
             capability_world_hint,
-            if req.max_fuel > 0 {
-                Some(req.max_fuel)
-            } else {
-                None
-            },
+            // Signature-bound (2026-09-10) AND clamped to this worker's own
+            // ceiling — see `clamp_job_fuel` for why both.
+            clamp_job_fuel(req.job_id, req.max_fuel, worker_max_job_fuel()),
             req.dry_run,
             req.actor_id,
             req.user_id,
@@ -1815,7 +1896,9 @@ async fn execute_pipeline_job(
             allowed_hosts: step.allowed_hosts.clone(),
             allowed_methods: step.allowed_methods.clone(),
             secrets,
-            max_fuel: step.max_fuel,
+            // Same ceiling as the single-node path (`clamp_job_fuel`); `0`
+            // stays `0` ("runtime default"), which `min` preserves.
+            max_fuel: clamp_job_fuel(req.job_id, step.max_fuel, worker_max_job_fuel()).unwrap_or(0),
             max_memory_mb: step.max_memory_mb,
             timeout: std::time::Duration::from_millis(step.timeout_ms),
             security_policy: SecurityPolicy {
@@ -2839,12 +2922,25 @@ async fn main() -> anyhow::Result<()> {
                                 // bypassing the "no result leaves the worker without a valid
                                 // HMAC" invariant. We pre-verify with the NO-REPLAY variant
                                 // (HMAC + freshness, but NOT the nonce cache) so the cache-miss
-                                // path's `execute_job` → `verify_with_ring` still records the
+                                // path's `execute_job` → `verify_dispatch` still records the
                                 // nonce exactly once. A forged request fails this pre-check and
                                 // falls through to `execute_job`, which returns the signed
                                 // verification-failure diagnostic without running the module.
-                                let request_authentic =
-                                    req.verify_no_replay_with_ring(&key_clone, 300).is_ok();
+                                //
+                                // SCHEME-ROUTING (2026-09-10): this pre-check used the HMAC-only
+                                // `verify_no_replay_with_ring`, so under an Ed25519 dispatch
+                                // (`crypto_scheme = 1`, the dev fleet's posture) it was ALWAYS
+                                // false and the idempotency layer was dead. Route on the
+                                // scheme exactly as the primary verifier below does.
+                                let dvc = dispatch_verify_config();
+                                let request_authentic = req
+                                    .verify_no_replay_dispatch(
+                                        &key_clone,
+                                        &dvc.ed_keys,
+                                        300,
+                                        dvc.accept_legacy_hmac,
+                                    )
+                                    .is_ok();
                                 if request_authentic && !req.dry_run {
                                     // Tier 1: in-process (same-worker retry, free).
                                     // Tier 2: Redis (queue-group retry landed on a
@@ -2866,10 +2962,18 @@ async fn main() -> anyhow::Result<()> {
                                         .await
                                         .and_then(|bytes| {
                                             match serde_json::from_slice::<JobResult>(&bytes) {
+                                                // Scheme-routing observer verify (never the
+                                                // replay cache): Ed25519 against the keys that
+                                                // can vouch for `r.worker_id`, or legacy HMAC
+                                                // against the ring — same routing the
+                                                // controller applies to this result.
                                                 Ok(r)
                                                     if r.job_id == req.job_id
-                                                        && r.verify_no_replay_with_ring(
-                                                            &key_clone, 300,
+                                                        && r.verify_no_replay_dispatch(
+                                                            &key_clone,
+                                                            &cached_result_verify_keys(&r.worker_id),
+                                                            300,
+                                                            talos_workflow_job_protocol::result_accept_legacy_hmac(),
                                                         )
                                                         .is_ok() =>
                                                 {
@@ -2886,6 +2990,27 @@ async fn main() -> anyhow::Result<()> {
                                             }
                                         }),
                                     };
+                                    // A RE-DISPATCH (`dispatch_attempt > 0`) of a job whose
+                                    // cached result is NOT a terminal success is the
+                                    // controller's application-failure retry asking for a
+                                    // fresh run — serving the cached failure would spend the
+                                    // whole retry budget re-reading one transient error. The
+                                    // put-site below no longer caches such results at all;
+                                    // this guard covers an entry a pre-fix worker wrote to
+                                    // Redis during a rolling upgrade.
+                                    let cached = cached.filter(|c| {
+                                        let stale_failure =
+                                            req.dispatch_attempt > 0 && !c.is_terminal_success();
+                                        if stale_failure {
+                                            ::tracing::debug!(
+                                                job_id = %req.job_id,
+                                                dispatch_attempt = req.dispatch_attempt,
+                                                "idempotency: cached result is not a terminal \
+                                                 success and this is a re-dispatch — re-executing"
+                                            );
+                                        }
+                                        !stale_failure
+                                    });
                                     if let Some(cached) = cached {
                                         ::tracing::info!(
                                             job_id = %req.job_id,
@@ -2918,7 +3043,22 @@ async fn main() -> anyhow::Result<()> {
                                 // count (see `job_idempotency`). Written to BOTH tiers: the
                                 // in-process map (same-worker retry) and Redis (retry landing on
                                 // a sibling queue-group worker).
-                                if !req.dry_run {
+                                //
+                                // ONLY a result the controller would NOT retry is cached
+                                // (`JobResult::is_terminal_success`, the dispatcher's own
+                                // predicate, one home). The dispatcher retries `Failed` and
+                                // `success:false` results under the SAME job_id, so caching
+                                // those made every engine retry a no-op replay of the first
+                                // failure (2026-09-10).
+                                if !req.dry_run && !result.is_terminal_success() {
+                                    ::tracing::debug!(
+                                        job_id = %result.job_id,
+                                        status = ?result.status,
+                                        "idempotency: not caching a non-success result — the \
+                                         controller's retry must re-execute, not replay it"
+                                    );
+                                }
+                                if !req.dry_run && result.is_terminal_success() {
                                     match serde_json::to_vec(&result) {
                                         Ok(bytes) => {
                                             worker::job_idempotency::JOB_RESULT_CACHE.put(
@@ -3049,8 +3189,16 @@ async fn main() -> anyhow::Result<()> {
                                 // with the NO-REPLAY variant (so the miss-path's full verify still
                                 // records the nonce once); a forged request falls through to
                                 // execute_pipeline_job, which returns a signed verification failure.
-                                let request_authentic =
-                                    req.verify_no_replay_with_ring(&key_clone, 300).is_ok();
+                                // Scheme-routing (2026-09-10) — see the single-job site.
+                                let dvc = dispatch_verify_config();
+                                let request_authentic = req
+                                    .verify_no_replay_dispatch(
+                                        &key_clone,
+                                        &dvc.ed_keys,
+                                        300,
+                                        dvc.accept_legacy_hmac,
+                                    )
+                                    .is_ok();
                                 if request_authentic {
                                     // Tier 1: in-process; tier 2: Redis (retry on a
                                     // sibling queue-group worker). Redis bytes are
@@ -3070,8 +3218,11 @@ async fn main() -> anyhow::Result<()> {
                                             match serde_json::from_slice::<PipelineJobResult>(&bytes) {
                                                 Ok(r)
                                                     if r.job_id == req.job_id
-                                                        && r.verify_no_replay_with_ring(
-                                                            &key_clone, 300,
+                                                        && r.verify_no_replay_dispatch(
+                                                            &key_clone,
+                                                            &cached_result_verify_keys(&r.worker_id),
+                                                            300,
+                                                            talos_workflow_job_protocol::result_accept_legacy_hmac(),
                                                         )
                                                         .is_ok() =>
                                                 {
@@ -3450,6 +3601,56 @@ mod result_publish_tests {
         );
     }
 
+    // ─── D3 (2026-09-10): per-job fuel clamp ──────────────────────────────
+
+    #[test]
+    fn clamp_job_fuel_zero_means_runtime_default() {
+        assert_eq!(clamp_job_fuel(uuid::Uuid::nil(), 0, 50_000_000), None);
+    }
+
+    #[test]
+    fn clamp_job_fuel_honours_a_request_within_the_ceiling() {
+        assert_eq!(
+            clamp_job_fuel(uuid::Uuid::nil(), 5_000_000, 50_000_000),
+            Some(5_000_000)
+        );
+        assert_eq!(
+            clamp_job_fuel(uuid::Uuid::nil(), 50_000_000, 50_000_000),
+            Some(50_000_000),
+            "exactly the ceiling is not a clamp"
+        );
+    }
+
+    #[test]
+    fn clamp_job_fuel_caps_an_oversized_request() {
+        assert_eq!(
+            clamp_job_fuel(uuid::Uuid::nil(), u64::MAX, 50_000_000),
+            Some(50_000_000)
+        );
+        assert_eq!(
+            clamp_job_fuel(uuid::Uuid::nil(), 50_000_001, 50_000_000),
+            Some(50_000_000)
+        );
+    }
+
+    #[test]
+    fn worker_fuel_ceiling_default_is_the_protocol_constant() {
+        // Unless an operator set the env var in this test process, the ceiling
+        // is the shared constant — the same number the controller caps at.
+        // Check 73: an EMPTY value is "unset" everywhere in this workspace, so
+        // the guard must read the value, not merely its presence.
+        if std::env::var("TALOS_WORKER_MAX_JOB_FUEL")
+            .ok()
+            .filter(|v| !v.is_empty())
+            .is_none()
+        {
+            assert_eq!(
+                worker_max_job_fuel(),
+                talos_workflow_job_protocol::MAX_JOB_FUEL
+            );
+        }
+    }
+
     // ─── H-1: pick_trusted_reply_topic decision matrix ────────────────────
     //
     // The whole point of H-1 is that a NATS-channel attacker who
@@ -3487,14 +3688,14 @@ mod result_publish_tests {
     }
 
     #[test]
-    fn pick_reply_wire_only_backward_compat() {
-        // Legacy controller / non-NATS transport that doesn't
-        // pre-allocate inboxes. The worker accepts msg.reply
-        // verbatim — this is the path the H-1 binding closes for
-        // upgraded controllers but keeps available for old ones.
+    fn pick_reply_wire_only_is_ignored() {
+        // 2026-09-10: an unsigned wire header with no signed twin is NOT a
+        // reply path. Pre-fix this returned `Some("_INBOX.legacy")` — the
+        // one arm through which a replayed job's signed output could be
+        // steered to an attacker-chosen inbox.
         let jid = uuid::Uuid::new_v4();
         let r = pick_trusted_reply_topic(jid, None, Some("_INBOX.legacy"));
-        assert_eq!(r.as_deref(), Some("_INBOX.legacy"));
+        assert_eq!(r, None);
     }
 
     #[test]
