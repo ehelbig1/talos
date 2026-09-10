@@ -284,9 +284,96 @@ pub struct ReadPathCounters {
     pub miss_new: std::sync::atomic::AtomicU64,
 }
 
+/// A module whose compiled bytes were NULLed by the WASM cache sweep
+/// (`modules.wasm_evicted_at IS NOT NULL`). The row, its `source_code` and its
+/// execution history are intact; only the artifact is gone, and
+/// `hot_update_module` restores it. Typed (rather than a bare `anyhow!`) so
+/// `get_module_for_execution` can tell it apart from "not found" and refuse to
+/// fall through to the stale-name lookup, which would otherwise report a module
+/// that exists as missing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleBytesEvicted {
+    pub module_id: Uuid,
+    pub name: String,
+    pub evicted_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl std::fmt::Display for ModuleBytesEvicted {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Module '{}' ({}) has no compiled WASM: its bytes were evicted from the \
+             WASM cache at {} (idle past WASM_CACHE_RETENTION_DAYS). The source is \
+             retained — recompile with hot_update_module to restore it.",
+            self.name,
+            self.module_id,
+            self.evicted_at.to_rfc3339()
+        )
+    }
+}
+
+impl std::error::Error for ModuleBytesEvicted {}
+
+/// The ONE reading of a `modules` row whose `wasm_bytes` is NULL/empty, shared
+/// by `get_module` and the bytes-only reads. Three states, three sentences:
+/// OCI-served (fine — the worker pulls), EVICTED (typed, actionable),
+/// NEVER COMPILED (the metadata-only catalog shape from the 2026-07-21 defect).
+/// Callers pass `oci_url` so an OCI row is never reported as anything else.
+fn classify_absent_wasm_bytes(
+    module_id: Uuid,
+    name: &str,
+    evicted_at: Option<chrono::DateTime<chrono::Utc>>,
+    oci_url: Option<&str>,
+) -> anyhow::Error {
+    if oci_url.is_some_and(|u| !u.is_empty()) {
+        // Not reachable from `get_module` (it returns before asking), kept so
+        // the bytes-only reads cannot misreport an OCI row.
+        return anyhow::anyhow!(
+            "Module '{}' ({}) is served from its OCI registry and holds no inline bytes",
+            name,
+            module_id
+        );
+    }
+    match evicted_at {
+        Some(evicted_at) => anyhow::Error::new(ModuleBytesEvicted {
+            module_id,
+            name: name.to_string(),
+            evicted_at,
+        }),
+        None => anyhow::anyhow!(
+            "Module '{}' has no compiled WASM yet (metadata-only catalog row). \
+             Run install_module_from_catalog to compile it before use.",
+            name
+        ),
+    }
+}
+
+/// The dispatch-side recency stamp — see [`ModuleRegistry::touch_last_used`].
+///
+/// The `AND (last_used_at IS NULL OR last_used_at < NOW() - INTERVAL '1 hour')`
+/// clause is the THROTTLE: without it this is one row write per dispatch,
+/// contending on a single tuple per module (35,793 executions in the 2026-08
+/// corpus). With it, the PK probe finds the row and the predicate declines it
+/// for the rest of the hour — an index-only no-op. Pinned by
+/// `wasm_cache_sweep_sql_tests::touch_sql_is_throttled_and_keyed_on_pk`.
+pub const LAST_USED_TOUCH_SQL: &str = "UPDATE modules \
+     SET last_used_at = NOW(), usage_count = usage_count + 1 \
+     WHERE id = $1 \
+       AND (last_used_at IS NULL OR last_used_at < NOW() - INTERVAL '1 hour')";
+
 pub struct ModuleRegistry {
     pub db_pool: Pool<Postgres>,
     pub redis_client: Option<std::sync::Arc<redis::Client>>,
+    /// ONE lazily-built, auto-reconnecting multiplexed Redis connection shared
+    /// by every cache read/write in this registry (the `wasm:{user}:{module}`
+    /// SETEX / GET / EXISTS sites). Until 2026-09-10 each of those five sites
+    /// called `client.get_multiplexed_async_connection()` per call — a fresh
+    /// TCP (+TLS) handshake on every dispatch-time cache fill. Same shape as
+    /// `talos-node-cache` / `talos-idempotency`; `Arc` so the fire-and-forget
+    /// fill task (`cache_wasm_bytes_under`) can share it without borrowing
+    /// `self`. `get_or_try_init` does not cache a failed init, so a Redis
+    /// outage at first use is retried on the next call.
+    redis_conn: std::sync::Arc<tokio::sync::OnceCell<redis::aio::ConnectionManager>>,
     /// Phase 2 fall-through counters (see ReadPathCounters docs).
     pub(crate) read_path_counters: std::sync::Arc<ReadPathCounters>,
     /// Process-start instant — operator tool reports "uptime" alongside
@@ -318,6 +405,18 @@ pub struct ModuleExecutionInfo {
     pub integration_name: Option<String>,
 }
 
+/// Free-function twin of [`ModuleRegistry::redis_conn`] for tasks that hold an
+/// `Arc` to the cell rather than `&self` (the spawned cache fill).
+async fn redis_conn_from(
+    cell: &tokio::sync::OnceCell<redis::aio::ConnectionManager>,
+    client: &redis::Client,
+) -> Result<redis::aio::ConnectionManager, redis::RedisError> {
+    let mgr = cell
+        .get_or_try_init(|| async { redis::aio::ConnectionManager::new(client.clone()).await })
+        .await?;
+    Ok(mgr.clone())
+}
+
 impl ModuleRegistry {
     /// Snapshot the Phase 2 read-path counters. Returns
     /// (hit_new, hit_legacy, miss_new, uptime_secs).
@@ -338,9 +437,19 @@ impl ModuleRegistry {
         Self {
             db_pool,
             redis_client,
+            redis_conn: std::sync::Arc::new(tokio::sync::OnceCell::new()),
             read_path_counters: std::sync::Arc::new(ReadPathCounters::default()),
             started_at: std::time::Instant::now(),
         }
+    }
+
+    /// A clone of the shared [`redis::aio::ConnectionManager`], building it
+    /// on first use. `None` when no Redis is configured; `Err` when Redis is
+    /// configured but unreachable right now (the cell stays empty so the
+    /// next call retries).
+    async fn redis_conn(&self) -> Option<Result<redis::aio::ConnectionManager, redis::RedisError>> {
+        let client = self.redis_client.as_ref()?;
+        Some(redis_conn_from(&self.redis_conn, client).await)
     }
 
     /// List all templates, optionally filtered by category.
@@ -817,7 +926,8 @@ impl ModuleRegistry {
                    id AS template_id, config, size_bytes, max_fuel,
                    max_memory_mb, allowed_hosts, allowed_methods, allowed_secrets,
                    requires_approval_for, user_id, capability_world,
-                   imported_interfaces, dependencies, oci_url, language, integration_name
+                   imported_interfaces, dependencies, oci_url, language, integration_name,
+                   wasm_evicted_at
             FROM modules
             WHERE id = $1
               AND (user_id = $2 OR user_id IS NULL)
@@ -866,9 +976,14 @@ impl ModuleRegistry {
             .try_get("capability_world")
             .context("modules.capability_world: try_get failed (schema drift?)")?;
         let capability_world = parse_capability_world(&cap_str);
+        // `wasm_bytes` is NULLABLE — and since 2026-09-10 a NULL has TWO
+        // meanings, which is why it is read as `Option` and classified below
+        // rather than decoded straight into `Vec<u8>` (a NULL there is a
+        // decode error that reads as "not found").
         let wasm_bytes: Vec<u8> = row
-            .try_get("wasm_bytes")
-            .context("modules.wasm_bytes: try_get failed (schema drift?)")?;
+            .try_get::<Option<Vec<u8>>, _>("wasm_bytes")
+            .context("modules.wasm_bytes: try_get failed (schema drift?)")?
+            .unwrap_or_default();
 
         // 2026-07-21 defect: a catalog registration path could leave a
         // metadata-only row (NULL wasm_bytes, no oci_url) — advertised as a
@@ -877,20 +992,29 @@ impl ModuleRegistry {
         // caller (or the resolve-fallback chain) reports what to do rather
         // than shipping an empty binary to the worker. A row with an
         // `oci_url` is fine — the worker fetches its bytes from the registry.
-        let oci_url_present = row
-            .try_get::<Option<String>, _>("oci_url")
-            .context("modules.oci_url: try_get failed (schema drift?)")?
-            .map(|u| !u.is_empty())
-            .unwrap_or(false);
+        //
+        // 2026-09-10: the SECOND way to have NULL bytes — the WASM cache sweep
+        // evicted them (`wasm_evicted_at IS NOT NULL`; row, source and history
+        // kept). That one is a typed `ModuleBytesEvicted` so the dispatch
+        // resolver does not fall through to "not found" — see
+        // `classify_absent_wasm_bytes`.
+        let oci_url: Option<String> = row
+            .try_get("oci_url")
+            .context("modules.oci_url: try_get failed (schema drift?)")?;
+        let oci_url_present = oci_url.as_deref().is_some_and(|u| !u.is_empty());
         if wasm_bytes.is_empty() && !oci_url_present {
             let module_name: String = row
-                .try_get::<Option<String>, _>("name")?
-                .unwrap_or_default();
-            anyhow::bail!(
-                "Module '{}' has no compiled WASM yet (metadata-only catalog row). \
-                 Run install_module_from_catalog to compile it before use.",
-                module_name
-            );
+                .try_get("name")
+                .context("modules.name: try_get failed (schema drift?)")?;
+            let evicted_at: Option<chrono::DateTime<chrono::Utc>> = row
+                .try_get("wasm_evicted_at")
+                .context("modules.wasm_evicted_at: try_get failed (schema drift?)")?;
+            return Err(classify_absent_wasm_bytes(
+                module_id,
+                &module_name,
+                evicted_at,
+                None,
+            ));
         }
 
         if !wasm_bytes.is_empty() {
@@ -1019,8 +1143,21 @@ impl ModuleRegistry {
         //          (new modules.id, same name), in-flight executions may
         //          carry the OLD id in their workflow's graph_json. Resolve
         //          via name + user_id to find the latest row by that name.
-        if let Ok(m) = self.get_module(module_id, user_id).await {
-            return Ok(m);
+        match self.get_module(module_id, user_id).await {
+            Ok(m) => {
+                // The graph-dispatch read: stamp recency here (throttled, off
+                // the critical path). `get_execution_info` is the module-bound
+                // twin. These two are the ONLY writers of `last_used_at`.
+                self.spawn_touch_last_used(module_id);
+                return Ok(m);
+            }
+            // An EVICTED module exists — its bytes were NULLed by the cache
+            // sweep and its source is intact. Falling through to the
+            // stale-name lookup would find no row with bytes under that name
+            // and report "Module not found", which is false on both clauses.
+            // Surface the actionable error instead.
+            Err(e) if e.downcast_ref::<ModuleBytesEvicted>().is_some() => return Err(e),
+            Err(_) => {}
         }
 
         // Level 2: stale module ref by name. Look up the OLD module's name
@@ -1112,6 +1249,9 @@ impl ModuleRegistry {
                 } else {
                     self.cache_wasm_bytes_under(user_id, module_id, &m.wasm_bytes);
                 }
+                // The row that will actually run is the SUCCESSOR — stamp it,
+                // not the stale id the graph still carries.
+                self.spawn_touch_last_used(new_id);
                 return Ok(m);
             }
         }
@@ -1149,18 +1289,25 @@ impl ModuleRegistry {
         let Some(ref redis_client) = self.redis_client else {
             return;
         };
-        // Clone Arc + bytes for the background task. Small modules
-        // (~80 KB typical Rust component) ride INLINE in the dispatch and
-        // never need this key on the worker's read path, so a lost race
-        // is harmless — the fire-and-forget keeps the dispatch hot path
-        // free of a Redis round-trip. Oversized components DON'T take this
-        // path (they go through `ensure_wasm_bytes_cached` — see the call
-        // sites), so the async fill is only ever used where a miss is
+        // Clone the shared connection cell + client + bytes for the background
+        // task. Small modules (~80 KB typical Rust component) ride INLINE in
+        // the dispatch and never need this key on the worker's read path, so
+        // a lost race is harmless — the fire-and-forget keeps the dispatch hot
+        // path free of a Redis round-trip. Oversized components DON'T take
+        // this path (they go through `ensure_wasm_bytes_cached` — see the
+        // call sites), so the async fill is only ever used where a miss is
         // recoverable.
         let client = redis_client.clone();
+        let cell = self.redis_conn.clone();
         let bytes = wasm_bytes.to_vec();
         tokio::spawn(async move {
-            Self::set_wasm_key(&client, user_id, module_id, &bytes).await;
+            match redis_conn_from(&cell, &client).await {
+                Ok(conn) => Self::set_wasm_key(conn, user_id, module_id, &bytes).await,
+                Err(e) => tracing::debug!(
+                    user_id = %user_id, module_id = %module_id, error = %e,
+                    "Redis connect failed during cache fill — read path will fall back"
+                ),
+            }
         });
     }
 
@@ -1179,21 +1326,26 @@ impl ModuleRegistry {
     /// closes it: the key exists before `fetch` returns to the engine, so
     /// it exists before the JobRequest is even built.
     async fn ensure_wasm_bytes_cached(&self, user_id: Uuid, module_id: Uuid, wasm_bytes: &[u8]) {
-        let Some(ref client) = self.redis_client else {
-            return;
-        };
-        Self::set_wasm_key(client, user_id, module_id, wasm_bytes).await;
+        match self.redis_conn().await {
+            None => {}
+            Some(Ok(conn)) => Self::set_wasm_key(conn, user_id, module_id, wasm_bytes).await,
+            Some(Err(e)) => tracing::debug!(
+                user_id = %user_id, module_id = %module_id, error = %e,
+                "Redis connect failed during cache fill — read path will fall back"
+            ),
+        }
     }
 
     /// Shared SETEX body for both the fire-and-forget (`cache_wasm_bytes_under`)
     /// and awaited (`ensure_wasm_bytes_cached`) pre-warm paths. Writes the
     /// canonical user-scoped key so it can never drift from the URI the
     /// engine emits — both derive from `talos_workflow_engine_core`.
-    async fn set_wasm_key(client: &redis::Client, user_id: Uuid, module_id: Uuid, bytes: &[u8]) {
-        let Ok(mut conn) = client.get_multiplexed_async_connection().await else {
-            tracing::debug!(user_id = %user_id, module_id = %module_id, "Redis connect failed during cache fill — read path will fall back");
-            return;
-        };
+    async fn set_wasm_key(
+        mut conn: redis::aio::ConnectionManager,
+        user_id: Uuid,
+        module_id: Uuid,
+        bytes: &[u8],
+    ) {
         let key = scoped_wasm_cache_key(user_id, module_id);
         // SETEX (vs SET): bound stale exposure if a downstream rotation
         // path forgets to DEL. 24h matches `get_module_bytes`.
@@ -1208,37 +1360,22 @@ impl ModuleRegistry {
         }
     }
 
-    pub async fn get_module_bytes(&self, module_id: Uuid, user_id: Uuid) -> Result<Vec<u8>> {
-        // SECURITY: Use user-scoped cache key to prevent cross-tenant cache leakage
-        let cache_key = scoped_wasm_cache_key(user_id, module_id);
-
-        // 1. Try to fetch from Redis cache
-        if let Some(ref client) = self.redis_client {
-            match client.get_multiplexed_async_connection().await {
-                Ok(mut conn) => {
-                    match redis::cmd("GET")
-                        .arg(&cache_key)
-                        .query_async::<Option<Vec<u8>>>(&mut conn)
-                        .await
-                    {
-                        Ok(Some(bytes)) if !bytes.is_empty() => {
-                            tracing::debug!("Cache hit for module {}/{}", user_id, module_id);
-                            return Ok(bytes);
-                        }
-                        Ok(_) => tracing::debug!("Cache miss for module {}/{}", user_id, module_id),
-                        Err(e) => tracing::warn!("Redis GET error for module {}: {}", module_id, e),
-                    }
-                }
-                Err(e) => tracing::warn!("Redis connection error: {}", e),
-            }
-        }
-
-        // 2. Fetch from Postgres (enforces authorization).
-        //    Phase 5.1: reads from the unified `modules` table by canonical id.
-        //    Catalog rows (user_id IS NULL) are accessible to every
-        //    authenticated user; sandbox rows are scoped to the owning user.
-        let bytes = sqlx::query_scalar::<_, Vec<u8>>(
-            "SELECT wasm_bytes FROM modules \
+    /// The Postgres half of every bytes-only read (`get_module_bytes`,
+    /// `fetch_and_cache_scoped`): ONE statement, and a THREE-way answer rather
+    /// than the `query_scalar::<Vec<u8>>` + `fetch_one` it replaced. That
+    /// shape decoded a NULL `wasm_bytes` as a sqlx decode ERROR and then
+    /// labelled it "Module not found or access denied" — which, once the
+    /// cache sweep started NULLing bytes on evicted rows (2026-09-10), would
+    /// have told the caller their module does not exist when it plainly does.
+    ///
+    /// * row absent → not found / access denied
+    /// * bytes NULL, `wasm_evicted_at` set → [`ModuleBytesEvicted`]
+    /// * bytes NULL, not evicted → never compiled (the metadata-only shape)
+    /// * bytes present → `Ok(bytes)`
+    async fn fetch_wasm_bytes_from_db(&self, module_id: Uuid, user_id: Uuid) -> Result<Vec<u8>> {
+        use sqlx::Row;
+        let row = sqlx::query(
+            "SELECT name, wasm_bytes, wasm_evicted_at, oci_url FROM modules \
              WHERE id = $1 \
                AND (user_id = $2 OR user_id IS NULL) \
              ORDER BY compiled_at DESC NULLS LAST \
@@ -1246,36 +1383,80 @@ impl ModuleRegistry {
         )
         .bind(module_id)
         .bind(user_id)
-        .fetch_one(&self.db_pool)
+        .fetch_optional(&self.db_pool)
         .await
-        .context("Module not found or access denied")?;
+        .context("Failed to query modules table")?
+        .ok_or_else(|| anyhow::anyhow!("Module not found or access denied"))?;
+        let bytes: Option<Vec<u8>> = row.try_get("wasm_bytes")?;
+        let name: String = row.try_get("name")?;
+        let evicted_at: Option<chrono::DateTime<chrono::Utc>> = row.try_get("wasm_evicted_at")?;
+        let oci_url: Option<String> = row.try_get("oci_url")?;
+        match bytes {
+            Some(b) if !b.is_empty() => Ok(b),
+            _ => Err(classify_absent_wasm_bytes(
+                module_id,
+                &name,
+                evicted_at,
+                oci_url.as_deref(),
+            )),
+        }
+    }
+
+    pub async fn get_module_bytes(&self, module_id: Uuid, user_id: Uuid) -> Result<Vec<u8>> {
+        // SECURITY: Use user-scoped cache key to prevent cross-tenant cache leakage
+        let cache_key = scoped_wasm_cache_key(user_id, module_id);
+
+        // 1. Try to fetch from Redis cache (over the shared connection manager)
+        let mut redis = match self.redis_conn().await {
+            None => None,
+            Some(Ok(conn)) => Some(conn),
+            Some(Err(e)) => {
+                tracing::warn!("Redis connection error: {}", e);
+                None
+            }
+        };
+        if let Some(conn) = redis.as_mut() {
+            match redis::cmd("GET")
+                .arg(&cache_key)
+                .query_async::<Option<Vec<u8>>>(conn)
+                .await
+            {
+                Ok(Some(bytes)) if !bytes.is_empty() => {
+                    tracing::debug!("Cache hit for module {}/{}", user_id, module_id);
+                    return Ok(bytes);
+                }
+                Ok(_) => tracing::debug!("Cache miss for module {}/{}", user_id, module_id),
+                Err(e) => tracing::warn!("Redis GET error for module {}: {}", module_id, e),
+            }
+        }
+
+        // 2. Fetch from Postgres (enforces authorization).
+        //    Phase 5.1: reads from the unified `modules` table by canonical id.
+        //    Catalog rows (user_id IS NULL) are accessible to every
+        //    authenticated user; sandbox rows are scoped to the owning user.
+        let bytes = self.fetch_wasm_bytes_from_db(module_id, user_id).await?;
 
         // 3. Populate Redis cache with user-scoped key
-        if let Some(ref client) = self.redis_client {
-            match client.get_multiplexed_async_connection().await {
-                Ok(mut conn) => {
-                    // Set with 24-hour expiration
-                    // MCP-745 (2026-05-13): see store_module for rationale.
-                    // Cache-fill failure on the GET path means every
-                    // subsequent dispatch round-trips to the DB — silent
-                    // capacity hit until operator notices DB load.
-                    if let Err(e) = redis::cmd("SETEX")
-                        .arg(&cache_key)
-                        .arg(86400)
-                        .arg(&bytes)
-                        .query_async::<()>(&mut conn)
-                        .await
-                    {
-                        tracing::warn!(
-                            target: "talos_rpc",
-                            module_id = %module_id,
-                            user_id = %user_id,
-                            error = %e,
-                            "Redis SETEX failed in get_module_bytes cache-fill — subsequent reads will miss cache",
-                        );
-                    }
-                }
-                Err(e) => tracing::warn!("Redis connection error during SET: {}", e),
+        if let Some(conn) = redis.as_mut() {
+            // Set with 24-hour expiration
+            // MCP-745 (2026-05-13): see store_module for rationale.
+            // Cache-fill failure on the GET path means every
+            // subsequent dispatch round-trips to the DB — silent
+            // capacity hit until operator notices DB load.
+            if let Err(e) = redis::cmd("SETEX")
+                .arg(&cache_key)
+                .arg(86400)
+                .arg(&bytes)
+                .query_async::<()>(conn)
+                .await
+            {
+                tracing::warn!(
+                    target: "talos_rpc",
+                    module_id = %module_id,
+                    user_id = %user_id,
+                    error = %e,
+                    "Redis SETEX failed in get_module_bytes cache-fill — subsequent reads will miss cache",
+                );
             }
         }
 
@@ -1298,12 +1479,17 @@ impl ModuleRegistry {
     /// inbound-event processing wrap the module in a workflow node (which then
     /// carries `data.max_fuel`) — the module row is the correct, only source of
     /// truth for a bare module fire.
+    ///
+    /// This is the module-bound DISPATCH read, so it stamps `last_used_at`
+    /// (throttled, off the critical path — see [`Self::spawn_touch_last_used`]);
+    /// its graph-dispatch twin is `get_module_for_execution`.
     pub async fn get_execution_info(
         &self,
         module_id: Uuid,
         user_id: Uuid,
     ) -> Result<ModuleExecutionInfo> {
         let module = self.get_module(module_id, user_id).await?;
+        self.spawn_touch_last_used(module.template_id.unwrap_or(module_id));
 
         let module_uri = if let Some(ref url) = module.oci_url {
             url.clone()
@@ -1341,25 +1527,22 @@ impl ModuleRegistry {
         })
     }
 
-    /// Track module usage
     /// Ensures the module is loaded into the Redis cache without downloading it into memory if it already exists.
     /// SECURITY: Uses user-scoped cache key to prevent cross-tenant access.
     pub async fn ensure_module_in_cache(&self, module_id: Uuid, user_id: Uuid) -> Result<()> {
-        if let Some(ref client) = self.redis_client {
+        if let Some(Ok(mut conn)) = self.redis_conn().await {
             // SECURITY (L-27): user-scoped cache key prevents cross-tenant
             // leakage. This is the only key shape the worker resolves now —
             // the engine emits `redis:wasm:{user_id}:{module_id}` for every
             // dispatch shape (single / pipeline-step / loop-body).
             let user_key = scoped_wasm_cache_key(user_id, module_id);
-            if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
-                let user_exists: bool = redis::cmd("EXISTS")
-                    .arg(&user_key)
-                    .query_async(&mut conn)
-                    .await
-                    .unwrap_or(false);
-                if user_exists {
-                    return Ok(());
-                }
+            let user_exists: bool = redis::cmd("EXISTS")
+                .arg(&user_key)
+                .query_async(&mut conn)
+                .await
+                .unwrap_or(false);
+            if user_exists {
+                return Ok(());
             }
         }
 
@@ -1377,61 +1560,79 @@ impl ModuleRegistry {
     async fn fetch_and_cache_scoped(&self, module_id: Uuid, user_id: Uuid) -> Result<Vec<u8>> {
         // Phase 5.1: reads from `modules` by canonical id. See
         // `get_module_bytes` for the ownership-scope rationale.
-        let bytes = sqlx::query_scalar::<_, Vec<u8>>(
-            "SELECT wasm_bytes FROM modules \
-             WHERE id = $1 \
-               AND (user_id = $2 OR user_id IS NULL) \
-             ORDER BY compiled_at DESC NULLS LAST \
-             LIMIT 1",
-        )
-        .bind(module_id)
-        .bind(user_id)
-        .fetch_one(&self.db_pool)
-        .await
-        .context("Module not found or access denied")?;
+        let bytes = self.fetch_wasm_bytes_from_db(module_id, user_id).await?;
 
-        if let Some(ref client) = self.redis_client {
-            if let Ok(mut conn) = client.get_multiplexed_async_connection().await {
-                let user_key = scoped_wasm_cache_key(user_id, module_id);
-                // 24h TTL — matches existing get_module_bytes behaviour.
-                // MCP-745 (2026-05-13): log SETEX failures. ensure_module_in_cache
-                // is the prefetch path called before dispatch — silent failure
-                // here means the subsequent execution incurs the DB-read
-                // fallback even though the operator believed the cache was warm.
-                if let Err(e) = redis::cmd("SETEX")
-                    .arg(&user_key)
-                    .arg(86400)
-                    .arg(&bytes)
-                    .query_async::<()>(&mut conn)
-                    .await
-                {
-                    tracing::warn!(
-                        target: "talos_rpc",
-                        module_id = %module_id,
-                        user_id = %user_id,
-                        error = %e,
-                        "Redis SETEX failed in ensure_module_in_cache — prefetch incomplete",
-                    );
-                }
+        if let Some(Ok(mut conn)) = self.redis_conn().await {
+            let user_key = scoped_wasm_cache_key(user_id, module_id);
+            // 24h TTL — matches existing get_module_bytes behaviour.
+            // MCP-745 (2026-05-13): log SETEX failures. ensure_module_in_cache
+            // is the prefetch path called before dispatch — silent failure
+            // here means the subsequent execution incurs the DB-read
+            // fallback even though the operator believed the cache was warm.
+            if let Err(e) = redis::cmd("SETEX")
+                .arg(&user_key)
+                .arg(86400)
+                .arg(&bytes)
+                .query_async::<()>(&mut conn)
+                .await
+            {
+                tracing::warn!(
+                    target: "talos_rpc",
+                    module_id = %module_id,
+                    user_id = %user_id,
+                    error = %e,
+                    "Redis SETEX failed in ensure_module_in_cache — prefetch incomplete",
+                );
             }
         }
         Ok(bytes)
     }
 
-    /// Phase 5.1: single-mutate usage_count + last_used_at on the unified
-    /// `modules` table by canonical id. Best-effort; usage telemetry is
-    /// non-critical.
-    pub async fn increment_usage(&self, module_id: Uuid) -> Result<()> {
-        sqlx::query(
-            "UPDATE modules \
-             SET usage_count = usage_count + 1, last_used_at = NOW() \
-             WHERE id = $1",
-        )
-        .bind(module_id)
-        .execute(&self.db_pool)
-        .await?;
+    /// Stamp `modules.last_used_at` / `usage_count` for a module that is about
+    /// to be DISPATCHED — the one implementation (it replaced `increment_usage`,
+    /// which wrote unconditionally and had zero callers, so the column was
+    /// never written and `WASM_CACHE_RETENTION_DAYS` was inert; see
+    /// `docs/engineering-log/2026-09-10-whole-codebase-review.md`).
+    ///
+    /// THROTTLED by [`LAST_USED_TOUCH_SQL`]'s predicate: the row is written at
+    /// most once per hour, so on a module dispatched every minute this is one
+    /// PK-indexed UPDATE in sixty and fifty-nine index probes that match no
+    /// row. `usage_count` therefore counts HOURS-WITH-A-DISPATCH, not
+    /// dispatches — `module_executions` is the dispatch count.
+    ///
+    /// Returns whether the row was actually stamped (false = throttled or no
+    /// such row), so a test can pin the throttle without inspecting the table.
+    pub async fn touch_last_used(&self, module_id: Uuid) -> Result<bool> {
+        let result = sqlx::query(LAST_USED_TOUCH_SQL)
+            .bind(module_id)
+            .execute(&self.db_pool)
+            .await
+            .context("modules.last_used_at touch failed")?;
+        Ok(result.rows_affected() > 0)
+    }
 
-        Ok(())
+    /// Fire-and-forget-but-COUNTED wrapper around [`Self::touch_last_used`]
+    /// for the dispatch hot path: never awaited by the caller (a workflow node
+    /// must not wait on usage telemetry), never `let _ =` either — a failure
+    /// is logged at WARN with the module id so an unreadable `modules` table
+    /// does not silently make every module look idle to the cache sweep.
+    pub fn spawn_touch_last_used(&self, module_id: Uuid) {
+        let pool = self.db_pool.clone();
+        tokio::spawn(async move {
+            if let Err(e) = sqlx::query(LAST_USED_TOUCH_SQL)
+                .bind(module_id)
+                .execute(&pool)
+                .await
+            {
+                tracing::warn!(
+                    target: "talos_rpc",
+                    module_id = %module_id,
+                    error = %e,
+                    "modules.last_used_at touch failed — this module will look \
+                     idle to the WASM cache sweep until a later dispatch succeeds"
+                );
+            }
+        });
     }
 
     /// Get module configuration (enforces ownership via user_id).
@@ -1572,55 +1773,112 @@ pub struct NodeTemplateMetadata {
     pub is_compiled: bool,
 }
 
-/// SQL fragment: the rows this cache sweep is permitted to delete.
+/// SQL fragment: the rows this cache sweep is permitted to EVICT (NULL the
+/// bytes of — never delete; see [`EVICT_BYTES_RETURNING`]).
 ///
 /// `modules` is a module REGISTRY that a cache sweep happens to run over, not a
 /// cache. Every row carries `source_code`, and rows with `user_id IS NULL` are
 /// the shared catalog every tenant installs from. A sweep driven by AGGREGATE
-/// footprint — pressure that ANY tenant can create — must never delete a row
-/// that no tenant owns; doing so is a cross-tenant data-loss event, not a
-/// tuning artefact.
+/// footprint — pressure that ANY tenant can create — must never touch a row
+/// that no tenant owns.
 ///
 /// `kind = 'catalog'` rows that DO carry a `user_id` are excluded for a second
 /// reason: they are a user's INSTALL of a shared template, and re-installing
 /// mints a NEW id while workflows bind modules by raw UUID inside `graph_json`
-/// with no foreign key. Deleting one leaves a dangling reference that
-/// re-installing does not repair. They are definitions, not artifacts.
-///
-/// Sibling precedent on this same table: all three `DELETE FROM modules`
-/// statements in `talos-module-repository` carry a `user_id` predicate. This
-/// sweep was the only one in the workspace that did not.
+/// with no foreign key. They are definitions, not artifacts.
 ///
 /// **Measured on the live deployment 2026-08-26:** 112 of 112 cached rows carry
 /// `source_code`; **0 of 112 carry an `oci_url`**; 29 are evictable under this
-/// predicate. **The condition that would reverse the exclusion:** if a row class
-/// is introduced whose bytes are re-fetchable from a durable source (a populated
-/// `oci_url`), that class genuinely IS a cache entry and belongs here.
+/// predicate alone (before [`module_eviction_exemptions!`] is applied).
 /// Re-measure `count(*) FILTER (WHERE oci_url IS NOT NULL)` before assuming it
 /// is still 0 — the predicate this one replaced (`wasm_bytes IS NOT NULL`, on
 /// the reasoning that catalog rows are OCI-served and hold no bytes) was true
 /// when written and excluded nothing by the time it mattered.
 macro_rules! evictable_module_predicate {
     () => {
-        "wasm_bytes IS NOT NULL AND user_id IS NOT NULL AND kind <> 'catalog'"
+        "m.wasm_bytes IS NOT NULL AND m.user_id IS NOT NULL AND m.kind <> 'catalog'"
+    };
+}
+
+/// SQL fragment: the recency key of a candidate row — the LATEST of the
+/// dispatch-side stamp (`m.last_used_at`, written throttled by
+/// [`ModuleRegistry::touch_last_used`] and backfilled once from
+/// `module_executions` by migration `20260910140000`) and the newest surviving
+/// `module_executions.started_at` (`e.last_exec`, the LATERAL below), falling
+/// back to `m.created_at` when neither exists.
+///
+/// **`COALESCE(…, m.created_at)`, not `NULLS FIRST`.** Absence of evidence is
+/// not evidence of coldness: a just-compiled module has no execution rows yet
+/// and no stamp, and `module_executions` has no retention policy *today* — if
+/// one is added, a hot module could present as never-used. Falling back to
+/// `created_at` keeps such a row in its creation position instead of sending
+/// it to the front of the eviction queue.
+///
+/// `GREATEST` ignores NULLs in Postgres, so a row with a stamp and no
+/// execution rows (or the reverse) resolves to the one it has.
+macro_rules! module_recency_key {
+    () => {
+        "COALESCE(GREATEST(m.last_used_at, e.last_exec), m.created_at)"
+    };
+}
+
+/// SQL fragment: the EXEMPTIONS — rows that pass [`evictable_module_predicate!`]
+/// and must still not be evicted. Written ONCE and consumed by BOTH sweep
+/// paths ([`CLEANUP_OLD_MODULES_SQL`] and the two cap statements), which is
+/// what `wasm_cache_sweep_sql_tests::both_sweep_paths_share_one_exemption_fragment`
+/// pins: before 2026-09-10 the two paths had DIFFERENT predicates and neither
+/// asked whether anything still referenced the module.
+///
+/// `$window` is the placeholder (`"$1"`) for the idle window in DAYS. A module
+/// is exempt when ANY of:
+///
+/// 1. A workflow references it through the `workflow_module_refs` junction
+///    (indexed on `module_id`; one probe per candidate). This is the HOT path.
+/// 2. Its id appears in ANY workflow's `graph_json` text. The junction is
+///    maintained only by the GraphQL save hook (`sync_workflow_module_refs`)
+///    — the MCP graph mutations do not write it — so it CAN lag, and this leg
+///    is the safety net. Cost: `candidates × workflows` substring scans of
+///    graph text (~30 × ~40 × ~20 kB ≈ 25 MB of text on the reference fleet)
+///    on a six-hourly sweep. Deliberately NOT filtered on `workflows.status`:
+///    archiving is reversible, and un-archiving must not find its module's
+///    bytes gone. (Static text also keeps this statement inside lint check 88's
+///    PREPARE coverage.)
+/// 3. A `webhook_triggers.module_id` names it (indexed).
+/// 4. An ACTIVE `google_calendar_watch_channels.module_id` names it (the
+///    index is partial on `is_active`, hence the predicate). Gmail and GCP
+///    push bindings are NOT covered here: they live inside
+///    `integration_state.value` (`GmailWatchRow.module_id`, the GCP push
+///    subscription row), which is JSON that may be ENCRYPTED (`value_enc`),
+///    so SQL cannot see the binding — stated as a limit rather than
+///    approximated. A module bound only to a gmail/gcp push channel is
+///    protected by leg 5 for as long as it keeps firing.
+/// 5. It was used within the window — [`module_recency_key!`] is newer than
+///    `NOW() - $window days`. This is the leg that makes `WASM_CACHE_RETENTION_DAYS`
+///    mean what it says on BOTH paths.
+///
+/// `workflow_nodes.module_id` is NOT consulted: that table has no INSERT
+/// writer anywhere in the workspace.
+macro_rules! module_eviction_exemptions {
+    ($window:literal) => {
+        concat!(
+            " AND NOT EXISTS (SELECT 1 FROM workflow_module_refs r WHERE r.module_id = m.id) \
+              AND NOT EXISTS (SELECT 1 FROM workflows w \
+                              WHERE w.graph_json LIKE '%' || m.id::text || '%') \
+              AND NOT EXISTS (SELECT 1 FROM webhook_triggers t WHERE t.module_id = m.id) \
+              AND NOT EXISTS (SELECT 1 FROM google_calendar_watch_channels c \
+                              WHERE c.module_id = m.id AND c.is_active = true) \
+              AND ",
+            module_recency_key!(),
+            " < NOW() - INTERVAL '1 day' * ",
+            $window
+        )
     };
 }
 
 /// SQL fragment: the evictable candidate relation, carrying a REAL recency key.
 ///
-/// `modules.last_used_at` is not that key and cannot be: nothing in this
-/// workspace writes it (`increment_usage` has zero callers) and live
-/// `count(*) FILTER (WHERE last_used_at IS NOT NULL)` is 0 across all 112 rows.
-/// Ordering on it ties every row, and `LIMIT` over a total tie deletes an
-/// ARBITRARY subset.
-///
-/// The signal lives in `module_executions` instead, so recency is DERIVED here
-/// rather than maintained on the hot path — `increment_usage` would add a write
-/// per execution (35,793 in this corpus) contending on one row per module, to
-/// populate a column nothing else reads.
-///
 /// **Shape matters more than the usual "no correlated subquery" rule.** Measured
-/// on the live DB with `EXPLAIN (ANALYZE, BUFFERS)`:
+/// on the live DB with `EXPLAIN (ANALYZE, BUFFERS)` (2026-08-26, 29 candidates):
 ///
 /// | shape | time | buffers | scaling |
 /// |---|---|---|---|
@@ -1633,10 +1891,10 @@ macro_rules! evictable_module_predicate {
 /// history table. `module_executions` grows ~730 rows/day with no retention, so
 /// the `GROUP BY` form degrades without bound while this one does not.
 ///
-/// `e` exposes only `last_exec`, so every unqualified column in the predicate
-/// still resolves unambiguously to `m`.
+/// `e` exposes only `last_exec`, so every column in the predicate is
+/// `m.`-qualified and unambiguous.
 macro_rules! evictable_candidates {
-    () => {
+    ($window:literal) => {
         concat!(
             "FROM modules m \
              LEFT JOIN LATERAL ( \
@@ -1644,22 +1902,16 @@ macro_rules! evictable_candidates {
                WHERE x.module_id = m.id ORDER BY x.started_at DESC LIMIT 1 \
              ) e ON true \
              WHERE ",
-            evictable_module_predicate!()
+            evictable_module_predicate!(),
+            module_eviction_exemptions!($window)
         )
     };
 }
 
-/// SQL fragment: a TOTAL eviction order over [`evictable_candidates`].
-///
-/// **`COALESCE(e.last_exec, m.created_at)`, not `last_exec ASC NULLS FIRST`.**
-/// Absence of execution rows is not evidence of coldness: a just-compiled module
-/// has none yet, and `module_executions` is CASCADE-deleted with its module and
-/// has no retention policy *today* — if one is added, a hot module could present
-/// as never-used. Falling back to `created_at` keeps such a row in its creation
-/// position instead of sending it to the front of the delete queue.
-///
-/// `m.created_at, m.id` keep the order TOTAL so both `LIMIT` (pass 1) and
-/// `ROWS UNBOUNDED PRECEDING` (pass 2) are reproducible.
+/// SQL fragment: a TOTAL eviction order over [`evictable_candidates!`] —
+/// coldest first by [`module_recency_key!`], then `m.created_at, m.id` so both
+/// `LIMIT` (count cap) and `ROWS UNBOUNDED PRECEDING` (size cap) are
+/// reproducible.
 ///
 /// What this replaced was worse than a neutral tiebreaker. Over the live
 /// evictable set, `created_at ASC` is close to an ANTI-LRU — the modules built
@@ -1668,93 +1920,183 @@ macro_rules! evictable_candidates {
 /// against a true-recency order whose first five were last used five weeks ago.
 macro_rules! eviction_order {
     () => {
-        "ORDER BY COALESCE(e.last_exec, m.created_at) ASC, m.created_at ASC, m.id ASC"
+        concat!(
+            "ORDER BY ",
+            module_recency_key!(),
+            " ASC, m.created_at ASC, m.id ASC"
+        )
     };
 }
 
-/// Outcome of one cache-limit sweep.
+/// SQL statement head/tail: the ONE mutation the sweep performs. It NULLs the
+/// compiled bytes and stamps `wasm_evicted_at`; the row, `source_code`,
+/// `content_hash`, `size_bytes` (so an operator can still see how large the
+/// artifact was) and every FK child stay. Until 2026-09-10 this was
+/// `DELETE FROM modules`, and `module_executions.module_id` is
+/// `ON DELETE CASCADE` — the module's whole execution history and its
+/// `module_execution_logs` went with it, `workflow_nodes.module_id` was SET
+/// NULL, and `source_code` was lost. A reader that meets the NULL bytes gets
+/// [`ModuleBytesEvicted`] and recompiles with `hot_update_module`; migration
+/// `20260910140000`'s trigger clears the marker when bytes land again.
+macro_rules! evict_bytes_where_id_in {
+    ($select:expr) => {
+        concat!(
+            "UPDATE modules SET wasm_bytes = NULL, wasm_evicted_at = NOW() \
+             WHERE id IN ( ",
+            $select,
+            " ) RETURNING COALESCE(size_bytes, 0)"
+        )
+    };
+}
+
+/// The candidate relation with the idle window bound at `$1` — exposed so the
+/// SQL tests can assert every sweep statement embeds this exact text.
+pub const EVICTION_CANDIDATES_SQL: &str = evictable_candidates!("$1");
+
+/// Retention sweep: evict the bytes of EVERY candidate idle past `$1` days.
+pub const CLEANUP_OLD_MODULES_SQL: &str =
+    evict_bytes_where_id_in!(concat!("SELECT m.id ", evictable_candidates!("$1")));
+
+/// Count-cap sweep: evict the `$2` coldest candidates idle past `$1` days.
+pub const ENFORCE_COUNT_CAP_SQL: &str = evict_bytes_where_id_in!(concat!(
+    "SELECT m.id ",
+    evictable_candidates!("$1"),
+    " ",
+    eviction_order!(),
+    " LIMIT $2"
+));
+
+/// Size-cap sweep: evict the smallest coldest-first prefix of candidates idle
+/// past `$1` days whose bytes COVER an excess of `$2` bytes.
+///
+/// Two corrections carried over from the DELETE form this replaced:
+///  * `ROWS UNBOUNDED PRECEDING` — the default `RANGE` frame gives every row
+///    that TIES on the ordering key the sum of the whole peer group, not a
+///    prefix sum; with every `last_used_at` NULL (the pre-2026-09-10 state)
+///    ALL rows tied and the size cap shed nothing at all.
+///  * `running_total - size_bytes < $2` selects the SMALLEST prefix that
+///    COVERS the excess; `running_total <= excess` selected the largest prefix
+///    that fits WITHIN it and freed nothing whenever the excess was smaller
+///    than the first candidate row.
+pub const ENFORCE_SIZE_CAP_SQL: &str = concat!(
+    "WITH candidates AS ( \
+       SELECT m.id, \
+              COALESCE(m.size_bytes, 0) AS size_bytes, \
+              SUM(COALESCE(m.size_bytes, 0)) OVER ( ",
+    eviction_order!(),
+    " ROWS UNBOUNDED PRECEDING ) AS running_total ",
+    evictable_candidates!("$1"),
+    " ) ",
+    evict_bytes_where_id_in!("SELECT id FROM candidates WHERE running_total - size_bytes < $2")
+);
+
+/// Outcome of one cache sweep (either path).
 ///
 /// `unevictable_*_overage` is the part of the cap that could NOT be met without
-/// deleting rows this sweep does not own. It is a returned value rather than
-/// only a log line so it is unit-testable: a registry whose excess is entirely
-/// shared catalog must SURFACE that, not silently do nothing.
+/// evicting rows this sweep is not allowed to touch — the shared catalog, or,
+/// since 2026-09-10, any module that is referenced or was used inside the idle
+/// window. It is a returned value rather than only a log line so it is
+/// unit-testable: a registry whose excess is entirely in-use must SURFACE
+/// that, not silently do nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CacheEvictionOutcome {
-    /// Rows actually deleted, across both passes.
-    pub modules_deleted: u64,
+    /// Rows whose bytes were evicted (rows themselves are KEPT).
+    pub modules_evicted: u64,
     /// Bytes actually reclaimed — real `size_bytes`, not a row count.
     pub bytes_freed: i64,
-    /// Rows still over the count cap that this sweep is not allowed to delete.
+    /// Rows still over the count cap that this sweep is not allowed to evict.
     pub unevictable_count_overage: i64,
-    /// Bytes still over the size cap that this sweep is not allowed to delete.
+    /// Bytes still over the size cap that this sweep is not allowed to evict.
     pub unevictable_size_overage_bytes: i64,
 }
 
 impl ModuleRegistry {
-    /// Clean up old unused WASM modules (default: 30 days).
+    /// Retention sweep: evict the compiled bytes of every candidate module idle
+    /// for more than `retention_days` (`WASM_CACHE_RETENTION_DAYS`, default 30).
     ///
-    /// Phase 5: operates on the unified `modules` table. Scoped to rows
-    /// that actually carry a compiled artifact (`wasm_bytes IS NOT NULL`)
-    /// so catalog rows served via OCI pull — which naturally never update
-    /// `last_used_at` on controller-side dispatch — don't get swept. The
-    /// legacy column rename `wasm_modules.last_used` → `modules.last_used_at`
-    /// is reflected in the predicate.
-    pub async fn cleanup_old_modules(&self, retention_days: i64) -> anyhow::Result<u64> {
+    /// "Idle" is [`module_recency_key!`] — the newer of the dispatch-side
+    /// `last_used_at` stamp and the latest surviving `module_executions` row,
+    /// falling back to `created_at`. Referenced modules (workflow junction,
+    /// graph text, webhook, active gcal channel) are exempt whatever their age
+    /// — see [`module_eviction_exemptions!`]. Rows are never deleted; see
+    /// [`evict_bytes_where_id_in!`].
+    ///
+    /// History, so the knob's past is not re-discovered: until 2026-09-10 this
+    /// was `DELETE … WHERE last_used_at < NOW() - N days`, and `last_used_at`
+    /// had no live writer, so it matched nothing — the knob was inert. It is
+    /// now written (throttled) on every dispatch read and was backfilled once
+    /// from `module_executions` by migration `20260910140000`.
+    pub async fn cleanup_old_modules(
+        &self,
+        retention_days: i64,
+    ) -> anyhow::Result<CacheEvictionOutcome> {
         // MCP-997 (2026-05-15): refuse non-positive `retention_days`.
         // Sibling caller-supplied-negative class as MCP-767/811/812 —
         // a negative value would convert
         // `NOW() - INTERVAL '1 day' * -N` into `NOW() + INTERVAL`,
-        // matching every row with a non-null `last_used_at` and
-        // purging the entire WASM cache. Recoverable (re-pull from
-        // OCI) but operationally costly. Defense-in-depth refuse at
-        // the function boundary.
+        // matching every unreferenced row and evicting the entire cache.
+        // Recoverable (recompile) but operationally costly. Defense-in-depth
+        // refuse at the function boundary.
         if retention_days <= 0 {
             tracing::warn!(
                 target: "talos_audit",
                 retention_days,
-                "wasm-cache cleanup refused: retention_days must be positive (would purge entire cache)"
+                "wasm-cache cleanup refused: retention_days must be positive (would evict entire cache)"
             );
-            return Ok(0);
+            return Ok(CacheEvictionOutcome::default());
         }
-        let result = sqlx::query(
-            "DELETE FROM modules \
-             WHERE wasm_bytes IS NOT NULL \
-               AND last_used_at IS NOT NULL \
-               AND last_used_at < NOW() - INTERVAL '1 day' * $1",
-        )
-        .bind(retention_days)
-        .execute(&self.db_pool)
-        .await?;
+        let freed = sqlx::query_as::<_, (i32,)>(CLEANUP_OLD_MODULES_SQL)
+            .bind(retention_days)
+            .fetch_all(&self.db_pool)
+            .await
+            .context("wasm-cache retention sweep failed")?;
 
-        Ok(result.rows_affected())
+        Ok(CacheEvictionOutcome {
+            modules_evicted: freed.len() as u64,
+            bytes_freed: freed.iter().map(|r| i64::from(r.0)).sum::<i64>(),
+            unevictable_count_overage: 0,
+            unevictable_size_overage_bytes: 0,
+        })
     }
 
-    /// Enforce the cache caps by deleting the least recently used **evictable**
-    /// modules.
+    /// Enforce the cache caps by evicting the bytes of the least recently used
+    /// **evictable** modules — those that pass [`evictable_module_predicate!`]
+    /// AND every exemption in [`module_eviction_exemptions!`], including
+    /// "not used within `idle_window_days`".
     ///
     /// Stats are taken over the FULL cached set, because the caps are about real
-    /// footprint; only the DELETEs are restricted to
-    /// [`evictable_module_predicate!`]. Restricting the STATS instead would be
-    /// the silent failure — an over-cap registry whose excess is all catalog
-    /// would simply report itself as under cap. Whatever overage cannot be met
-    /// is returned in [`CacheEvictionOutcome`] for the caller to surface.
+    /// footprint; only the UPDATEs are restricted. Restricting the STATS instead
+    /// would be the silent failure — an over-cap registry whose excess is all
+    /// catalog or all in-use would simply report itself as under cap. Whatever
+    /// overage cannot be met is returned in [`CacheEvictionOutcome`] for the
+    /// caller to surface.
+    ///
+    /// **Consequence an operator must know:** the caps can no longer evict a
+    /// module that is referenced or was used inside the window. When the
+    /// in-use set alone exceeds `WASM_CACHE_MAX_MODULES` / `_MAX_SIZE_MB`, the
+    /// sweep REPORTS the overage (`unevictable_*`) and evicts nothing — the
+    /// cap is a signal to raise, not a promise to hold, because the only way
+    /// to hold it would be to break a workflow that runs.
     pub async fn enforce_cache_limits(
         &self,
         max_modules: i64,
         max_size_mb: i64,
+        idle_window_days: i64,
     ) -> anyhow::Result<CacheEvictionOutcome> {
         // Defense-in-depth at the function boundary, mirroring
         // `cleanup_old_modules` (MCP-643): a non-positive cap makes
-        // `current > max` trivially true with an unbounded `to_delete`, purging
-        // every evictable row. No caller can reach this today — the sweep reads
-        // both caps through `talos_config::positive_env_or_default` — but this
-        // is a `pub` API and the sibling guards the identical shape.
-        if max_modules <= 0 || max_size_mb <= 0 {
+        // `current > max` trivially true with an unbounded `to_delete`, evicting
+        // every evictable row; a non-positive window would exempt nothing on
+        // recency. No caller can reach this today — the sweep reads all three
+        // through `talos_config::positive_env_or_default` — but this is a `pub`
+        // API and the sibling guards the identical shape.
+        if max_modules <= 0 || max_size_mb <= 0 || idle_window_days <= 0 {
             tracing::warn!(
                 target: "talos_audit",
                 max_modules,
                 max_size_mb,
-                "wasm-cache eviction refused: caps must be positive (would purge every evictable row)"
+                idle_window_days,
+                "wasm-cache eviction refused: caps and idle window must be positive (would evict every evictable row)"
             );
             return Ok(CacheEvictionOutcome::default());
         }
@@ -1765,7 +2107,8 @@ impl ModuleRegistry {
              FROM modules WHERE wasm_bytes IS NOT NULL",
         )
         .fetch_one(&self.db_pool)
-        .await?;
+        .await
+        .context("wasm-cache footprint read failed")?;
 
         let mut outcome = CacheEvictionOutcome::default();
 
@@ -1775,66 +2118,38 @@ impl ModuleRegistry {
             // RETURNING the real sizes: pass 2 needs to know what this pass
             // actually freed (see below), and the caller needs bytes rather
             // than a row count mislabelled as bytes.
-            let freed = sqlx::query_as::<_, (i32,)>(concat!(
-                "DELETE FROM modules WHERE id IN ( \
-                   SELECT m.id ",
-                evictable_candidates!(),
-                " ",
-                eviction_order!(),
-                " LIMIT $1 \
-                 ) RETURNING COALESCE(size_bytes, 0)"
-            ))
-            .bind(wanted)
-            .fetch_all(&self.db_pool)
-            .await?;
+            let freed = sqlx::query_as::<_, (i32,)>(ENFORCE_COUNT_CAP_SQL)
+                .bind(idle_window_days)
+                .bind(wanted)
+                .fetch_all(&self.db_pool)
+                .await
+                .context("wasm-cache count-cap sweep failed")?;
 
-            let deleted = freed.len() as i64;
-            outcome.modules_deleted += deleted as u64;
+            let evicted = freed.len() as i64;
+            outcome.modules_evicted += evicted as u64;
             outcome.bytes_freed += freed.iter().map(|r| i64::from(r.0)).sum::<i64>();
-            outcome.unevictable_count_overage = wanted - deleted;
+            outcome.unevictable_count_overage = wanted - evicted;
         }
 
         // ── Pass 2: size cap ─────────────────────────────────────────────
         // `current_size` was read BEFORE pass 1 ran, and pass 1 mutates the very
         // set this pass measures — so reusing it over-states the live footprint
-        // by whatever pass 1 freed and over-deletes by that amount. This needs
+        // by whatever pass 1 freed and over-evicts by that amount. This needs
         // no concurrent writer to go wrong. Subtract what was actually freed.
         // (A concurrent writer can still move the set between the stats read and
-        // either DELETE; that residual window is narrowed, not closed.)
+        // either UPDATE; that residual window is narrowed, not closed.)
         let live_size = current_size - outcome.bytes_freed;
         if live_size > max_size_bytes {
             let excess = live_size - max_size_bytes;
-            // Two corrections against the previous form:
-            //  * `ROWS UNBOUNDED PRECEDING` — the default `RANGE` frame gives
-            //    every row that TIES on the ordering key the sum of the whole
-            //    peer group, not a prefix sum. With `last_used_at` never
-            //    written, ALL rows tie, every `running_total` equals the entire
-            //    cache size, and `running_total <= excess` is false for every
-            //    row: the size cap shed nothing at all.
-            //  * `running_total - size_bytes < excess` — selects the SMALLEST
-            //    prefix that COVERS the excess. The old `running_total <=
-            //    excess` selects the largest prefix that fits WITHIN it, which
-            //    always frees less than needed, and frees nothing whenever the
-            //    excess is smaller than the first candidate row.
-            let freed = sqlx::query_as::<_, (i32,)>(concat!(
-                "WITH candidates AS ( \
-                   SELECT m.id, \
-                          COALESCE(m.size_bytes, 0) AS size_bytes, \
-                          SUM(COALESCE(m.size_bytes, 0)) OVER ( ",
-                eviction_order!(),
-                " ROWS UNBOUNDED PRECEDING ) AS running_total ",
-                evictable_candidates!(),
-                " ) \
-                 DELETE FROM modules WHERE id IN ( \
-                   SELECT id FROM candidates WHERE running_total - size_bytes < $1 \
-                 ) RETURNING COALESCE(size_bytes, 0)"
-            ))
-            .bind(excess)
-            .fetch_all(&self.db_pool)
-            .await?;
+            let freed = sqlx::query_as::<_, (i32,)>(ENFORCE_SIZE_CAP_SQL)
+                .bind(idle_window_days)
+                .bind(excess)
+                .fetch_all(&self.db_pool)
+                .await
+                .context("wasm-cache size-cap sweep failed")?;
 
             let bytes = freed.iter().map(|r| i64::from(r.0)).sum::<i64>();
-            outcome.modules_deleted += freed.len() as u64;
+            outcome.modules_evicted += freed.len() as u64;
             outcome.bytes_freed += bytes;
             outcome.unevictable_size_overage_bytes = (excess - bytes).max(0);
         }
@@ -1932,10 +2247,14 @@ impl ModuleRegistry {
             // Compile outputs only — `compiled_at` already dates the artifact.
             // Stamping `updated_at` would date the module as edited by an AOT
             // precompile that changed nothing the operator authored.
+            // `wasm_evicted_at = NULL` is also what migration 20260910140000's
+            // trigger does on any write landing non-NULL bytes; stated here so
+            // the one writer in this crate reads correctly without the schema.
             "UPDATE modules \
              SET wasm_bytes = $1, \
                  size_bytes = LENGTH($1)::INTEGER, \
-                 compiled_at = NOW() \
+                 compiled_at = NOW(), \
+                 wasm_evicted_at = NULL \
              WHERE id = $2",
         )
         .bind(&precompiled)
@@ -2278,5 +2597,133 @@ mod validate_allowed_secrets_tests {
     #[test]
     fn accepts_non_ascii_rejected() {
         assert!(validate_allowed_secrets(&["anthropic/münchen".into()]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod wasm_cache_sweep_sql_tests {
+    //! Pins on the RENDERED sweep SQL. These are text assertions on purpose:
+    //! the two sweep paths (`cleanup_old_modules`, `enforce_cache_limits`) had
+    //! DIFFERENT predicates until 2026-09-10 and neither asked whether anything
+    //! still referenced the module; the guard against that drifting back is
+    //! that every statement embeds ONE candidate fragment verbatim.
+    use super::*;
+
+    const ALL_SWEEP_STATEMENTS: [(&str, &str); 3] = [
+        ("cleanup_old_modules", CLEANUP_OLD_MODULES_SQL),
+        ("enforce_cache_limits/count", ENFORCE_COUNT_CAP_SQL),
+        ("enforce_cache_limits/size", ENFORCE_SIZE_CAP_SQL),
+    ];
+
+    #[test]
+    fn both_sweep_paths_share_one_exemption_fragment() {
+        for (name, sql) in ALL_SWEEP_STATEMENTS {
+            assert!(
+                sql.contains(EVICTION_CANDIDATES_SQL),
+                "{name} does not embed the shared candidate relation verbatim:\n{sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn exemptions_name_every_reference_surface_and_the_window() {
+        for needle in [
+            "NOT EXISTS (SELECT 1 FROM workflow_module_refs r WHERE r.module_id = m.id)",
+            "FROM workflows w",
+            "w.graph_json LIKE '%' || m.id::text || '%'",
+            "NOT EXISTS (SELECT 1 FROM webhook_triggers t WHERE t.module_id = m.id)",
+            "FROM google_calendar_watch_channels c",
+            "c.module_id = m.id AND c.is_active = true",
+            "COALESCE(GREATEST(m.last_used_at, e.last_exec), m.created_at) < NOW() - INTERVAL '1 day' * $1",
+        ] {
+            assert!(
+                EVICTION_CANDIDATES_SQL.contains(needle),
+                "exemption fragment lost `{needle}`:\n{EVICTION_CANDIDATES_SQL}"
+            );
+        }
+        // Base predicate still present: never the catalog, never an unowned row.
+        assert!(EVICTION_CANDIDATES_SQL.contains(
+            "m.wasm_bytes IS NOT NULL AND m.user_id IS NOT NULL AND m.kind <> 'catalog'"
+        ));
+        // The graph-text leg is deliberately NOT status-filtered (archiving is
+        // reversible) — a `status` predicate appearing here is a regression.
+        assert!(
+            !EVICTION_CANDIDATES_SQL.contains("status"),
+            "graph-text exemption must protect archived workflows' modules too"
+        );
+    }
+
+    #[test]
+    fn the_sweep_evicts_bytes_and_never_deletes_rows() {
+        for (name, sql) in ALL_SWEEP_STATEMENTS {
+            assert!(
+                !sql.contains("DELETE"),
+                "{name} deletes rows — the sweep must NULL bytes only:\n{sql}"
+            );
+            assert!(
+                sql.contains("UPDATE modules SET wasm_bytes = NULL, wasm_evicted_at = NOW()"),
+                "{name} is not the byte-eviction UPDATE:\n{sql}"
+            );
+            assert!(sql.contains("RETURNING COALESCE(size_bytes, 0)"), "{name}");
+        }
+    }
+
+    #[test]
+    fn statements_bind_the_window_first_and_the_cap_second() {
+        // Binding order is what the Rust callers rely on; a reordered
+        // placeholder would bind the cap as the window (days) silently.
+        assert!(CLEANUP_OLD_MODULES_SQL.contains("$1"));
+        assert!(!CLEANUP_OLD_MODULES_SQL.contains("$2"));
+        assert!(ENFORCE_COUNT_CAP_SQL.contains(" LIMIT $2"));
+        assert!(ENFORCE_SIZE_CAP_SQL.contains("running_total - size_bytes < $2"));
+        assert!(ENFORCE_SIZE_CAP_SQL.contains("ROWS UNBOUNDED PRECEDING"));
+    }
+
+    #[test]
+    fn touch_sql_is_throttled_and_keyed_on_pk() {
+        assert!(LAST_USED_TOUCH_SQL.starts_with("UPDATE modules"));
+        assert!(LAST_USED_TOUCH_SQL.contains("WHERE id = $1"));
+        assert!(
+            LAST_USED_TOUCH_SQL
+                .contains("(last_used_at IS NULL OR last_used_at < NOW() - INTERVAL '1 hour')"),
+            "throttle predicate missing — this would be one row write per dispatch"
+        );
+        assert!(LAST_USED_TOUCH_SQL.contains("last_used_at = NOW()"));
+        assert!(LAST_USED_TOUCH_SQL.contains("usage_count = usage_count + 1"));
+        assert!(!LAST_USED_TOUCH_SQL.contains("updated_at"));
+    }
+
+    #[test]
+    fn evicted_error_is_typed_and_actionable() {
+        let id = Uuid::new_v4();
+        let at = chrono::Utc::now();
+        let err = classify_absent_wasm_bytes(id, "csv-parser", Some(at), None);
+        let typed = err
+            .downcast_ref::<ModuleBytesEvicted>()
+            .expect("evicted rows must produce the typed error");
+        assert_eq!(typed.module_id, id);
+        assert_eq!(typed.name, "csv-parser");
+        let msg = err.to_string();
+        assert!(msg.contains("evicted"), "{msg}");
+        assert!(msg.contains("hot_update_module"), "{msg}");
+        assert!(!msg.contains("not found"), "{msg}");
+    }
+
+    #[test]
+    fn never_compiled_is_not_reported_as_evicted() {
+        let err = classify_absent_wasm_bytes(Uuid::new_v4(), "x", None, None);
+        assert!(err.downcast_ref::<ModuleBytesEvicted>().is_none());
+        assert!(err.to_string().contains("install_module_from_catalog"));
+    }
+
+    #[test]
+    fn oci_rows_are_never_reported_as_evicted_or_uncompiled() {
+        let at = chrono::Utc::now();
+        let err = classify_absent_wasm_bytes(Uuid::new_v4(), "x", Some(at), Some("oci://r/x:1"));
+        assert!(err.downcast_ref::<ModuleBytesEvicted>().is_none());
+        assert!(err.to_string().contains("OCI"));
+        // Empty oci_url is "no oci_url".
+        let err = classify_absent_wasm_bytes(Uuid::new_v4(), "x", Some(at), Some(""));
+        assert!(err.downcast_ref::<ModuleBytesEvicted>().is_some());
     }
 }

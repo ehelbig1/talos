@@ -101,9 +101,9 @@ The production overlay:
 | `EXECUTION_MAX_ROWS` | `100000` | Max execution rows before eviction |
 | `AUDIT_LOG_RETENTION_DAYS` | `90` | Days to keep audit logs |
 | `AUDIT_CHAIN_SWEEP_INTERVAL_SECS` | `3600` | Cadence of the continuous WORM audit-chain verification sweep (clamped [300, 86400]; `0` disables). No-op without a WORM S3/MinIO endpoint; verification also needs `TALOS_AUDIT_SIGNING_KEY`. Each pass verifies up to 2000 JOB chains (`module_executions`) whose `completed_at` falls in the last 2× the interval, and logs `audit_chain_verification_failed` on any break. Lower the interval if your completion rate puts more than 2000 module executions in one window — the sweep keeps no cursor, so rows past the cap age out unverified and say so via `audit_chain_sweep_incomplete`. |
-| `WASM_CACHE_RETENTION_DAYS` | `30` | Days to keep unused WASM modules |
-| `WASM_CACHE_MAX_MODULES` | `1000` | Max cached WASM modules |
-| `WASM_CACHE_MAX_SIZE_MB` | `500` | Max WASM cache size in MB |
+| `WASM_CACHE_RETENTION_DAYS` | `30` | Idle window after which an UNREFERENCED user module's compiled bytes are evicted (`wasm_bytes` set NULL; the row, its source and its execution history are kept). Modules named by a workflow graph, a webhook trigger or a calendar watch channel, or dispatched inside the window, are exempt. Live since 2026-09-10 — before that nothing wrote `last_used_at`, so the knob was inert. |
+| `WASM_CACHE_MAX_MODULES` | `1000` | Count cap for compiled user modules; over the cap, bytes are evicted from the same exempt-aware candidate set (never rows). An over-cap set that is entirely in use WARNs and evicts nothing. |
+| `WASM_CACHE_MAX_SIZE_MB` | `500` | Byte cap for compiled user modules; same eviction semantics as the count cap. |
 | `STUCK_EXECUTION_TIMEOUT_MINS` | `30` | Minutes before marking stuck executions |
 | `EXECUTION_CHECKPOINTING_ENABLED` | `false` | Persist per-node checkpoints so an interrupted run resumes from the last node instead of restarting (see RFC 0003). Requires `WORKER_SHARED_KEY`. |
 | `CHECKPOINT_EVERY_N_NODES` | `1` | Checkpoint cadence when enabled — save every Nth node completion. Raise on large graphs to cut re-encryption cost (resume then re-runs up to N trailing nodes). |
