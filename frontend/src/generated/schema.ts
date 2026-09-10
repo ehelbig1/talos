@@ -953,6 +953,7 @@ export type MutationRoot = {
   deleteSecret: Scalars["Boolean"]["output"];
   deleteWorkflow: Scalars["Boolean"]["output"];
   denyExecution: Scalars["Boolean"]["output"];
+  /** Disable two-factor authentication. API-key callers must supply a current TOTP or backup `code`. */
   disableTwoFactor: Scalars["Boolean"]["output"];
   disconnectServiceIntegration: Scalars["Boolean"]["output"];
   enableTwoFactor: TwoFactorEnrollment;
@@ -1156,6 +1157,10 @@ export type MutationRootDeleteWorkflowArgs = {
 export type MutationRootDenyExecutionArgs = {
   id: Scalars["UUID"]["input"];
   reason?: InputMaybe<Scalars["String"]["input"]>;
+};
+
+export type MutationRootDisableTwoFactorArgs = {
+  code?: InputMaybe<Scalars["String"]["input"]>;
 };
 
 export type MutationRootDisconnectServiceIntegrationArgs = {

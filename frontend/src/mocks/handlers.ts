@@ -7,12 +7,19 @@ interface GraphQLBody {
 }
 
 export const handlers = [
-  // CSRF seed handler
-  http.get("*/graphql", () => {
+  // CSRF seed handler — mirrors the controller's `GET /auth/csrf`, which is
+  // where `lib/authedFetch.ts` and `lib/graphqlClient.ts` seed the cookie
+  // (a GET on /graphql is 405 in production and was the old, wrong seed).
+  // The cookie NAME must match what `lib/csrf.ts` reads (`talos_csrf_token`);
+  // the previous handler set `csrf_token`, so `getCsrfToken()` never saw it
+  // and every authed call re-seeded. With the REST helpers now seeding
+  // before each mutation, an unhandled seed request made the watch-channel
+  // panels sit in "Syncing…" long enough for their tests to time out.
+  http.get("*/auth/csrf", () => {
     return new HttpResponse(null, {
-      status: 200,
+      status: 204,
       headers: {
-        "Set-Cookie": "csrf_token=test-csrf-token; Path=/; SameSite=Lax",
+        "Set-Cookie": "talos_csrf_token=test-csrf-token; Path=/; SameSite=Lax",
       },
     });
   }),
