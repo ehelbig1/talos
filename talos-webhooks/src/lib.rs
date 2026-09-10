@@ -37,6 +37,7 @@ pub(crate) fn html_escape(s: &str) -> String {
         .replace('\'', "&#39;")
 }
 mod correction;
+mod dispatch_failure;
 mod dlq;
 #[allow(
     clippy::needless_borrow,
@@ -59,6 +60,7 @@ pub use approval::{
 };
 pub use approval_actions::{approval_action_apply, approval_action_preview};
 pub use correction::{correction_apply, correction_preview};
+pub use dispatch_failure::{drop_reason as dlq_drop_reason, ModuleDispatchFailure};
 pub use dlq::{
     dlq_entry_was_authenticated, DlqMetrics, DlqService, ReplayRefused, DLQ_AUTHENTICATED_KEY,
 };

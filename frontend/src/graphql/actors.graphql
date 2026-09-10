@@ -86,8 +86,8 @@ query GetActorActionLog($actorId: UUID!, $limit: Int) {
   }
 }
 
-query GetActorWorkflows($actorId: UUID!) {
-  actorWorkflows(actorId: $actorId) {
+query GetActorWorkflows($actorId: UUID!, $limit: Int) {
+  actorWorkflows(actorId: $actorId, limit: $limit) {
     id
     name
     status
@@ -162,8 +162,8 @@ mutation CloneActor($id: UUID!, $name: String) {
   }
 }
 
-query GetActorMemories($actorId: UUID!, $memoryType: String) {
-  actorMemories(actorId: $actorId, memoryType: $memoryType) {
+query GetActorMemories($actorId: UUID!, $memoryType: String, $limit: Int) {
+  actorMemories(actorId: $actorId, memoryType: $memoryType, limit: $limit) {
     key
     value
     memoryType

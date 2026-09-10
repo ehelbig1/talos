@@ -154,6 +154,11 @@ impl MlQueries {
 
     /// Pending disagreements for one model (owner-scoped, decrypted),
     /// plus lifecycle + shadow context for the review header.
+    // B1-3: price the fan-out — cost = 1 + child × effective limit,
+    // clamped exactly as the resolver clamps (see `types::list_complexity`).
+    #[graphql(
+        complexity = "crate::schema::types::list_complexity(child_complexity, limit, 20, 100)"
+    )]
     async fn ml_model_disagreements(
         &self,
         ctx: &Context<'_>,

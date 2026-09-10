@@ -19,6 +19,11 @@ pub struct WebhooksQueries;
 
 #[async_graphql::Object]
 impl WebhooksQueries {
+    // B1-3: price the fan-out — cost = 1 + child × effective limit,
+    // clamped exactly as the resolver clamps (see `types::list_complexity`).
+    #[graphql(
+        complexity = "crate::schema::types::pagination_complexity(child_complexity, pagination.as_ref(), 100, 1000)"
+    )]
     async fn webhook_triggers(
         &self,
         ctx: &Context<'_>,

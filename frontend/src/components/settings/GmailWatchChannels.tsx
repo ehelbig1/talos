@@ -29,18 +29,15 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Dialog } from "@/components/ui";
-import { getCsrfToken } from "@/lib/csrf";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { cn } from "@/lib/utils";
-
-function authedFetch(url: string, init: RequestInit = {}): Promise<Response> {
-  const csrf = getCsrfToken();
-  const headers: Record<string, string> = {
-    ...((init.headers as Record<string, string>) ?? {}),
-  };
-  if (csrf) headers["X-CSRF-Token"] = csrf;
-  return fetch(url, { ...init, credentials: "include", headers });
-}
+// Shared CSRF-aware fetch: seeds the CSRF cookie via GET /auth/csrf before
+// attaching X-CSRF-Token, and returns the raw Response so the ApiJson
+// envelope ({ success, data, error }) is still read off non-2xx bodies
+// below. The inline copy this replaced attached whatever token was already
+// present — on a fresh session that was NONE, and the cookie-CSRF gate on
+// REST mutations refused the panel's first POST/DELETE.
+import { authedFetch } from "./watch-channels/api";
 
 interface GmailWatchSummary {
   channel_uuid: string;

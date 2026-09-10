@@ -390,6 +390,12 @@ impl WorkflowsMutations {
     ) -> Result<CreateWorkflowFromDescriptionResult> {
         crate::schema::require_2fa(ctx)?;
         crate::schema::require_scope(ctx, talos_api_keys::ApiKeyScope::WorkflowsWrite)?;
+        // B1-3: an LLM round trip per call — per-user token bucket
+        // (`GRAPHQL_HEAVY_MUTATION_PER_USER_PER_MIN`, default 10).
+        crate::schema::throttle::enforce_user_throttle(
+            ctx,
+            crate::schema::throttle::ThrottleClass::HeavyMutation,
+        )?;
 
         validate_payload_size("description", &input.description)?;
 
@@ -1129,6 +1135,14 @@ impl WorkflowsMutations {
     ) -> Result<TestWorkflowResult> {
         require_2fa(ctx)?;
         require_scope(ctx, talos_api_keys::ApiKeyScope::WorkflowsWrite)?;
+        // B1-3: a full real-LLM / real-HTTP execution per call. The MCP-672
+        // actor-budget gate below only runs for a workflow WITH a bound
+        // actor; this per-user bucket is the floor under both cases
+        // (`GRAPHQL_HEAVY_MUTATION_PER_USER_PER_MIN`, default 10).
+        crate::schema::throttle::enforce_user_throttle(
+            ctx,
+            crate::schema::throttle::ThrottleClass::HeavyMutation,
+        )?;
 
         let user_id = ctx
             .data_opt::<Uuid>()

@@ -27,6 +27,7 @@ mod queries;
 // The rest of the module is the `#[Subscription]` impl, which is reachable
 // only through the schema.
 pub mod subscriptions;
+pub mod throttle;
 pub mod types;
 
 // Re-export everything for backwards compatibility

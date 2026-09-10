@@ -243,12 +243,19 @@ export const getActorActionLog = async (
   return response.actorActionLog;
 };
 
+// Default page for the actor-detail lists. The resolvers' complexity is
+// priced as `fields × limit`, so omitting the limit (which the server reads
+// as the 1000-row cap) would exceed the 5000 ceiling for the fields these
+// pages select; 200 keeps every shipped query well under it.
+const ACTOR_LIST_DEFAULT_LIMIT = 200;
+
 export const getActorWorkflows = async (
   actorId: string,
+  limit: number = ACTOR_LIST_DEFAULT_LIMIT,
 ): Promise<ActorWorkflowItem[]> => {
   const response = await graphqlRequest<{
     actorWorkflows: ActorWorkflowItem[];
-  }>(GetActorWorkflowsDocument, { actorId });
+  }>(GetActorWorkflowsDocument, { actorId, limit });
   return response.actorWorkflows;
 };
 
@@ -297,10 +304,11 @@ export interface ActorMemoryEntry {
 export const listActorMemories = async (
   actorId: string,
   memoryType?: string,
+  limit: number = ACTOR_LIST_DEFAULT_LIMIT,
 ): Promise<ActorMemoryEntry[]> => {
   const response = await graphqlRequest<{ actorMemories: ActorMemoryEntry[] }>(
     GetActorMemoriesDocument,
-    { actorId, memoryType: memoryType ?? null },
+    { actorId, memoryType: memoryType ?? null, limit },
   );
   return response.actorMemories ?? [];
 };

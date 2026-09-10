@@ -13,6 +13,11 @@ pub struct ModulesQueries;
 
 #[async_graphql::Object]
 impl ModulesQueries {
+    // B1-3: price the fan-out — cost = 1 + child × effective limit,
+    // clamped exactly as the resolver clamps (see `types::list_complexity`).
+    #[graphql(
+        complexity = "crate::schema::types::pagination_complexity(child_complexity, pagination.as_ref(), 50, 1000)"
+    )]
     async fn module_execution_history(
         &self,
         ctx: &Context<'_>,
@@ -91,6 +96,11 @@ impl ModulesQueries {
         Ok(logs.into_iter().map(Into::into).collect())
     }
 
+    // B1-3: price the fan-out — cost = 1 + child × effective limit,
+    // clamped exactly as the resolver clamps (see `types::list_complexity`).
+    #[graphql(
+        complexity = "crate::schema::types::pagination_complexity(child_complexity, pagination.as_ref(), 100, 1000)"
+    )]
     async fn node_templates(
         &self,
         ctx: &Context<'_>,
@@ -227,6 +237,11 @@ impl ModulesQueries {
             .collect())
     }
 
+    // B1-3: price the fan-out — cost = 1 + child × effective limit,
+    // clamped exactly as the resolver clamps (see `types::list_complexity`).
+    #[graphql(
+        complexity = "crate::schema::types::pagination_complexity(child_complexity, pagination.as_ref(), 100, 1000)"
+    )]
     async fn my_modules(
         &self,
         ctx: &Context<'_>,
