@@ -214,6 +214,16 @@ pub struct TalosContext {
 
     /// Optional Redis client for the `cache` interface.
     pub redis_client: Option<Arc<redis::Client>>,
+    /// ONE lazily-built `redis::aio::ConnectionManager` shared by every job on
+    /// this runtime (2026-09-10). Until then all nine `wit_cache` host
+    /// functions and the tier-2 `expose_secret` daily counter called
+    /// `get_multiplexed_async_connection()` PER GUEST CALL — a TCP (+TLS+AUTH)
+    /// handshake each time. The cell is cloned from `TalosRuntime` into each
+    /// per-job context (`TalosRuntime::attach_shared_redis`), so the manager
+    /// outlives the job; `TalosContext::new` seeds a private empty cell so the
+    /// ~80 direct constructors in tests keep compiling. See
+    /// [`Self::redis_conn`]. Same shape as `talos-node-cache` / `talos-rate-limit`.
+    pub redis_conn_mgr: Arc<tokio::sync::OnceCell<redis::aio::ConnectionManager>>,
     /// Optional NATS client for the `messaging` and `logging` interfaces.
     pub nats_client: Option<Arc<async_nats::Client>>,
 
@@ -1382,6 +1392,7 @@ impl TalosContext {
             user_id: None,
             state_store: Arc::new(std::sync::Mutex::new(HashMap::new())),
             redis_client,
+            redis_conn_mgr: Arc::new(tokio::sync::OnceCell::new()),
             nats_client,
             audit_ledger: None,
             last_db_error: String::new(),
@@ -3105,5 +3116,42 @@ mod stream_registry_abort_tests {
             .await
             .expect("s2 aborted on drop")
             .expect("guard dropped");
+    }
+}
+
+impl TalosContext {
+    /// The runtime's shared Redis connection, built on first use and reused
+    /// by every subsequent guest call on every job (2026-09-10).
+    ///
+    /// `get_or_try_init` does NOT cache a failed init, so a Redis outage at
+    /// first use leaves the cell empty and the next call retries; once built,
+    /// `ConnectionManager` reconnects on its own. Cloning a manager is a
+    /// handle clone, not a connection. `Err` when no Redis client is
+    /// configured — the same `Connectionfailed` the host functions already
+    /// return for that case.
+    ///
+    /// Returns an OWNED `'static + Send` future rather than borrowing `self`
+    /// across the await: `TalosContext` is not `Sync` (it holds a
+    /// `Box<dyn Any + Send>`), so a `&self` held across an `.await` would make
+    /// every bindgen host method that calls this non-`Send`. The two `Arc`s
+    /// are cloned up front and the borrow ends before anything is awaited.
+    pub(crate) fn redis_conn(
+        &self,
+    ) -> impl std::future::Future<Output = Result<redis::aio::ConnectionManager, redis::RedisError>>
+           + Send
+           + 'static {
+        let client = self.redis_client.clone();
+        let cell = self.redis_conn_mgr.clone();
+        async move {
+            let client = client.ok_or_else(|| {
+                redis::RedisError::from((redis::ErrorKind::IoError, "Redis not configured"))
+            })?;
+            let mgr = cell
+                .get_or_try_init(|| async {
+                    redis::aio::ConnectionManager::new((*client).clone()).await
+                })
+                .await?;
+            Ok(mgr.clone())
+        }
     }
 }

@@ -1207,52 +1207,82 @@ impl TalosContext {
         }
     }
 
-    /// Check global daily exposure limit using Redis.
-    /// Returns true if the call is allowed, false if rate limited.
-    pub(crate) async fn check_global_expose_limit(
-        redis: &std::sync::Arc<redis::Client>,
+    /// Count one tier-2 `expose_secret` call against the user's daily window
+    /// and say whether it is within [`MAX_TIER2_EXPOSES_PER_USER_PER_DAY`].
+    ///
+    /// **Atomic since 2026-09-10.** This was GET-then-INCR / SET EX — two round
+    /// trips with a window between them, so two concurrent exposes at
+    /// `limit - 1` both read `limit - 1`, both passed, and the cap was
+    /// exceeded by one per racing caller; a fresh key was `SET EX 1` with no
+    /// atomicity against a sibling's `INCR`. Its three sibling limiters
+    /// (`talos-rate-limit`, `talos-api-keys`, `talos-auth`) already used the
+    /// one-EVAL `INCR` + conditional `EXPIRE` script (MCP-442, "either both
+    /// succeed or neither modifies state"); this is the fourth. The count is
+    /// taken AFTER the increment, so `count <= limit` admits exactly `limit`
+    /// calls per window — the same admission the old `c >= limit → deny`
+    /// pre-increment test gave. A denied call still advances the counter,
+    /// which changes nothing the caller can observe (it stays denied).
+    ///
+    /// Generic over the connection so the caller hands it the runtime's
+    /// shared `ConnectionManager` (`TalosContext::redis_conn`) and the test
+    /// hands it a plain connection.
+    ///
+    /// #661 still holds: a command failure is `Err`, never a verdict, and the
+    /// key is untouched by it — `INCR` on a WRONGTYPE key modifies nothing,
+    /// where the old `None` branch ran `SET EX` and erased the day's count.
+    pub(crate) async fn check_global_expose_limit<C>(
+        conn: &mut C,
         key: &str,
-    ) -> anyhow::Result<bool> {
-        let mut conn = redis
-            .get_multiplexed_async_connection()
+    ) -> anyhow::Result<bool>
+    where
+        C: redis::aio::ConnectionLike + Send,
+    {
+        const EXPOSE_LIMIT_SCRIPT: &str = r#"
+            local count = redis.call('INCR', KEYS[1])
+            if count == 1 then
+                redis.call('EXPIRE', KEYS[1], ARGV[1])
+            end
+            return count
+        "#;
+        let count: i64 = redis::cmd("EVAL")
+            .arg(EXPOSE_LIMIT_SCRIPT)
+            .arg(1)
+            .arg(key)
+            .arg(TIER2_EXPOSE_WINDOW_SECS)
+            .query_async(conn)
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to get Redis connection: {}", e))?;
+            .map_err(|e| {
+                anyhow::anyhow!("Redis INCR/EXPIRE for tier-2 expose counter failed: {}", e)
+            })?;
+        Ok(expose_count_within_limit(count))
+    }
+}
 
-        // Get current count.
-        //
-        // #661 (error-as-absence): this GET must NOT swallow its error. `.ok()`
-        // turned a failed read into `None`, which is the SAME value as "no
-        // counter yet today" — and the `None` branch below runs
-        // `set_ex(key, 1, 86400)`. So a single failed GET both skipped the cap
-        // for that call AND overwrote the day's accumulated count with 1,
-        // restarting the 24 h window: a user at 99/100 went back to 1/100. The
-        // guard erased its own state on the way past.
-        //
-        // The caller already handles this correctly and was never given the
-        // chance: `host/secrets.rs` routes `Err(_)` to the in-memory
-        // `global_expose_fallback`, preserving MCP-722's invariant that
-        // "never-configured = the same fail-closed path as an outage". Because
-        // the connection acquisition above propagates but the command did not,
-        // a full Redis outage took that fallback while a PER-COMMAND failure
-        // (timeout, connection dropped mid-command, WRONGTYPE, response parse)
-        // was laundered into `Ok(true)` and reached neither arm.
-        let count: Option<u64> = redis::AsyncCommands::get(&mut conn, key)
-            .await
-            .map_err(|e| anyhow::anyhow!("Redis GET for tier-2 expose counter failed: {}", e))?;
+/// The daily window the tier-2 expose counter lives in (seconds).
+const TIER2_EXPOSE_WINDOW_SECS: i64 = 86_400;
 
-        if let Some(c) = count {
-            if c >= MAX_TIER2_EXPOSES_PER_USER_PER_DAY {
-                return Ok(false); // Rate limit exceeded
-            }
-            // Increment existing counter
-            let _: redis::RedisResult<()> = redis::AsyncCommands::incr(&mut conn, key, 1).await;
-        } else {
-            // Set new counter with 24h expiry (daily window)
-            let _: redis::RedisResult<()> =
-                redis::AsyncCommands::set_ex(&mut conn, key, 1, 86400).await;
-        }
+/// The admission rule for a POST-increment count: at most
+/// [`MAX_TIER2_EXPOSES_PER_USER_PER_DAY`] calls per window. A negative count
+/// (impossible from `INCR`, but the type allows it) is refused rather than
+/// wrapped into a huge `u64`.
+pub(crate) fn expose_count_within_limit(count: i64) -> bool {
+    u64::try_from(count).is_ok_and(|c| c <= MAX_TIER2_EXPOSES_PER_USER_PER_DAY)
+}
 
-        Ok(true) // Rate limit OK
+#[cfg(test)]
+mod expose_limit_admission_tests {
+    use super::{expose_count_within_limit, MAX_TIER2_EXPOSES_PER_USER_PER_DAY};
+
+    /// Exactly `limit` calls are admitted per window — the same admission the
+    /// pre-2026-09-10 GET-then-INCR gave, now over a post-increment count.
+    #[test]
+    fn exactly_the_limit_is_admitted() {
+        let limit = MAX_TIER2_EXPOSES_PER_USER_PER_DAY as i64;
+        assert!(expose_count_within_limit(1));
+        assert!(expose_count_within_limit(limit));
+        assert!(!expose_count_within_limit(limit + 1));
+        assert!(!expose_count_within_limit(i64::MAX));
+        assert!(!expose_count_within_limit(-1));
     }
 }
 
@@ -1260,8 +1290,9 @@ impl TalosContext {
 mod expose_limit_absence_tests {
     use super::*;
 
-    /// #661 — a Redis GET **failure** must not be reported as "no counter yet
-    /// today".
+    /// #661 — a Redis command **failure** must not be reported as "no counter yet
+    /// today". (Since 2026-09-10 the command is the atomic INCR+EXPIRE EVAL;
+    /// WRONGTYPE still fails it before any write.)
     ///
     /// Reproduced against a real Redis with a real per-command failure: the key
     /// is made a LIST, so `GET` returns `WRONGTYPE` while the connection itself
@@ -1303,10 +1334,10 @@ mod expose_limit_absence_tests {
             .await
             .unwrap();
 
-        let verdict = TalosContext::check_global_expose_limit(&client, &key).await;
+        let verdict = TalosContext::check_global_expose_limit(&mut conn, &key).await;
         assert!(
             verdict.is_err(),
-            "a failed Redis GET must not be laundered into an allow/deny verdict; got {:?}",
+            "a failed Redis INCR must not be laundered into an allow/deny verdict; got {:?}",
             verdict.as_ref().ok()
         );
 

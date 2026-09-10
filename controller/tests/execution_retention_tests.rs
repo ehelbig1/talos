@@ -532,7 +532,7 @@ async fn sweep_moves_an_aged_execution_into_the_archive() {
     let id = seed_execution(&f, 40, "completed", false).await;
     let fresh = seed_execution(&f, 1, "completed", false).await;
 
-    f.repo.sweep_archive_executions(30).await.unwrap();
+    let _moved = f.repo.sweep_archive_executions(30).await.unwrap();
 
     assert!(
         !live_exists(&f, id).await,
@@ -566,7 +566,7 @@ async fn sweep_moves_an_aged_execution_into_the_archive() {
 async fn sweep_refuses_a_pinned_execution() {
     let f = fixture_exclusive().await;
     let pinned = seed_execution(&f, 400, "completed", true).await;
-    f.repo.sweep_archive_executions(30).await.unwrap();
+    let _moved = f.repo.sweep_archive_executions(30).await.unwrap();
     assert!(
         live_exists(&f, pinned).await,
         "a pinned execution must stay exactly where the operator pinned it"
@@ -587,7 +587,7 @@ async fn sweep_refuses_a_non_terminal_execution() {
     // change does NOT close, and one the column-parity test cannot see).
     for status in ["running", "resuming", "waiting", "queued"] {
         let id = seed_execution(&f, 400, status, false).await;
-        f.repo.sweep_archive_executions(30).await.unwrap();
+        let _moved = f.repo.sweep_archive_executions(30).await.unwrap();
         assert!(
             live_exists(&f, id).await,
             "a `{status}` execution must never be archived, however old it is"
@@ -607,14 +607,14 @@ async fn sweep_refuses_a_non_terminal_execution() {
 async fn purge_is_clocked_on_time_kept_not_on_completion() {
     let f = fixture_exclusive().await;
     let id = seed_execution(&f, 400, "completed", false).await;
-    f.repo.sweep_archive_executions(30).await.unwrap();
+    let _moved = f.repo.sweep_archive_executions(30).await.unwrap();
     assert!(archived_exists(&f, id).await);
 
     // Completed 400 days ago, archived seconds ago. A completed_at clock would
     // delete it; the archived_at clock must not.
     let purged = f.repo.purge_archived_executions(30).await.unwrap();
     assert_eq!(
-        purged, 0,
+        purged.rows, 0,
         "a freshly archived row has been KEPT for zero days"
     );
     assert!(archived_exists(&f, id).await);
@@ -629,7 +629,7 @@ async fn purge_is_clocked_on_time_kept_not_on_completion() {
     .await
     .unwrap();
     let purged = f.repo.purge_archived_executions(30).await.unwrap();
-    assert_eq!(purged, 1);
+    assert_eq!(purged.rows, 1);
     assert!(!archived_exists(&f, id).await);
 }
 
@@ -640,7 +640,7 @@ async fn purge_is_clocked_on_time_kept_not_on_completion() {
 async fn purge_refuses_a_pinned_archived_execution() {
     let f = fixture_exclusive().await;
     let id = seed_execution(&f, 400, "completed", false).await;
-    f.repo.sweep_archive_executions(30).await.unwrap();
+    let _moved = f.repo.sweep_archive_executions(30).await.unwrap();
     sqlx::query(
         "UPDATE workflow_executions_archive SET archived_at = NOW() - INTERVAL '400 days', \
          is_pinned = true WHERE id = $1",
@@ -652,7 +652,7 @@ async fn purge_refuses_a_pinned_archived_execution() {
 
     let purged = f.repo.purge_archived_executions(30).await.unwrap();
     assert_eq!(
-        purged, 0,
+        purged.rows, 0,
         "a pinned archived execution must never be purged"
     );
     assert!(archived_exists(&f, id).await);
@@ -665,7 +665,7 @@ async fn purge_refuses_a_pinned_archived_execution() {
 async fn purge_refuses_a_non_terminal_archived_row() {
     let f = fixture_exclusive().await;
     let id = seed_execution(&f, 400, "completed", false).await;
-    f.repo.sweep_archive_executions(30).await.unwrap();
+    let _moved = f.repo.sweep_archive_executions(30).await.unwrap();
     sqlx::query(
         "UPDATE workflow_executions_archive SET archived_at = NOW() - INTERVAL '400 days', \
          status = 'running' WHERE id = $1",
@@ -675,7 +675,7 @@ async fn purge_refuses_a_non_terminal_archived_row() {
     .await
     .unwrap();
 
-    assert_eq!(f.repo.purge_archived_executions(30).await.unwrap(), 0);
+    assert_eq!(f.repo.purge_archived_executions(30).await.unwrap().rows, 0);
     assert!(archived_exists(&f, id).await);
 }
 
@@ -694,8 +694,8 @@ async fn a_pin_survives_the_entire_retention_path() {
 
     // Many passes, as the background tasks would run them.
     for _ in 0..3 {
-        f.repo.sweep_archive_executions(30).await.unwrap();
-        f.repo.purge_archived_executions(30).await.unwrap();
+        let _moved = f.repo.sweep_archive_executions(30).await.unwrap();
+        let _purged = f.repo.purge_archived_executions(30).await.unwrap();
     }
     // Age the doomed row's keep clock and purge again.
     sqlx::query(
@@ -706,7 +706,7 @@ async fn a_pin_survives_the_entire_retention_path() {
     .execute(&f.pool)
     .await
     .unwrap();
-    f.repo.purge_archived_executions(30).await.unwrap();
+    let _purged = f.repo.purge_archived_executions(30).await.unwrap();
 
     assert!(
         live_exists(&f, pinned).await,
@@ -727,8 +727,11 @@ async fn both_tiers_refuse_a_nonpositive_window() {
     let id = seed_execution(&f, 400, "completed", false).await;
 
     for days in [0, -1, -365] {
-        assert_eq!(f.repo.sweep_archive_executions(days).await.unwrap(), 0);
-        assert_eq!(f.repo.purge_archived_executions(days).await.unwrap(), 0);
+        assert_eq!(f.repo.sweep_archive_executions(days).await.unwrap().rows, 0);
+        assert_eq!(
+            f.repo.purge_archived_executions(days).await.unwrap().rows,
+            0
+        );
         assert_eq!(f.repo.archive_executions(days, f.user).await.unwrap(), 0);
     }
     assert!(
@@ -1351,4 +1354,294 @@ async fn the_report_and_the_pass_resolve_the_same_two_windows() {
     );
 
     clear().await;
+}
+
+// ── 2026-09-10: the tables that had a writer and no reaper ──────────────────
+//
+// `execution_state` (no FK, no TTL — every `state::set` persisted forever),
+// `llm_usage`, `judge_scores`, `actor_action_log`, `module_update_history` and
+// resolved `ops_alerts`. Tier one now deletes a victim's state in the SAME
+// statement as the move; tier four reaps `llm_usage` / `judge_scores` /
+// orphaned state on the TOTAL lifetime; tier five reaps the three audit-shaped
+// tables on `TALOS_AUDIT_TABLE_RETENTION_DAYS`. `admin_event_log` is NOT
+// reaped — it carries `prevent_audit_modification` — and the last test pins
+// that the reaper never names it (a DELETE there raises 42501, which would
+// surface here as an `Err`).
+
+async fn seed_state(f: &Fixture, exec: Uuid, key: &str, age_days: i32) {
+    sqlx::query(
+        "INSERT INTO execution_state (execution_id, key, value, org_id, updated_at) \
+         VALUES ($1, $2, 'v', $3, NOW() - make_interval(days => $4::int))",
+    )
+    .bind(exec)
+    .bind(key)
+    .bind(f.org)
+    .bind(age_days)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+}
+
+async fn state_rows(f: &Fixture, exec: Uuid) -> i64 {
+    sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM execution_state WHERE execution_id = $1")
+        .bind(exec)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap()
+}
+
+async fn row_exists(f: &Fixture, table: &str, id: Uuid) -> bool {
+    // `table` is a compile-time literal from the tests below, never input.
+    sqlx::query_scalar::<_, i64>(&format!("SELECT COUNT(*) FROM {table} WHERE id = $1"))
+        .bind(id)
+        .fetch_one(&f.pool)
+        .await
+        .unwrap()
+        > 0
+}
+
+async fn seed_llm_usage(f: &Fixture, age_days: i32) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO llm_usage (user_id, org_id, provider, model, recorded_at) \
+         VALUES ($1, $2, 'ollama', 'test', NOW() - make_interval(days => $3::int)) RETURNING id",
+    )
+    .bind(f.user)
+    .bind(f.org)
+    .bind(age_days)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap()
+}
+
+async fn seed_judge_score(f: &Fixture, age_days: i32) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO judge_scores (workflow_id, node_id, execution_id, score, passed, created_at) \
+         VALUES ($1, $2, $3, 0.5, true, NOW() - make_interval(days => $4::int)) RETURNING id",
+    )
+    .bind(f.workflow)
+    .bind(Uuid::new_v4())
+    .bind(Uuid::new_v4())
+    .bind(age_days)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap()
+}
+
+async fn seed_action_log(f: &Fixture, age_days: i32) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO actor_action_log (actor_id, \"timestamp\", action_type, summary, org_id) \
+         VALUES ($1, NOW() - make_interval(days => $2::int), 'test', 's', $3) RETURNING id",
+    )
+    .bind(f.actor)
+    .bind(age_days)
+    .bind(f.org)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap()
+}
+
+async fn seed_module_history(f: &Fixture, age_days: i32) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO module_update_history (module_id, user_id, new_hash, size_bytes, created_at, org_id) \
+         VALUES ($1, $2, 'h', 1, NOW() - make_interval(days => $3::int), $4) RETURNING id",
+    )
+    .bind(Uuid::new_v4())
+    .bind(f.user)
+    .bind(age_days)
+    .bind(f.org)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap()
+}
+
+/// `resolved_age_days = None` seeds an ACTIVE (`new`) alert whose `first_seen`
+/// is `first_seen_age_days` old — the row the reaper must never touch.
+async fn seed_ops_alert(
+    f: &Fixture,
+    first_seen_age_days: i32,
+    resolved_age_days: Option<i32>,
+) -> Uuid {
+    let status = if resolved_age_days.is_some() {
+        "resolved"
+    } else {
+        "new"
+    };
+    sqlx::query_scalar(
+        "INSERT INTO ops_alerts (user_id, org_id, source, dedup_key, title, status, \
+                                 first_seen, last_seen, resolved_at) \
+         VALUES ($1, $2, 'test', $3, 't', $4, \
+                 NOW() - make_interval(days => $5::int), \
+                 NOW() - make_interval(days => $5::int), \
+                 CASE WHEN $6::int IS NULL THEN NULL \
+                      ELSE NOW() - make_interval(days => $6::int) END) \
+         RETURNING id",
+    )
+    .bind(f.user)
+    .bind(f.org)
+    .bind(Uuid::new_v4().to_string())
+    .bind(status)
+    .bind(first_seen_age_days)
+    .bind(resolved_age_days)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap()
+}
+
+/// Tier one: the victim's `execution_state` rows leave in the SAME statement
+/// as the execution, and a live execution's state is untouched.
+#[tokio::test]
+async fn archival_move_deletes_the_victims_execution_state() {
+    let f = fixture_exclusive().await;
+    let old = seed_execution(&f, 40, "completed", false).await;
+    let fresh = seed_execution(&f, 1, "completed", false).await;
+    seed_state(&f, old, "cursor", 40).await;
+    seed_state(&f, old, "page", 40).await;
+    seed_state(&f, fresh, "cursor", 1).await;
+
+    let moved = f.repo.sweep_archive_executions(30).await.unwrap();
+    assert!(moved.rows >= 1, "the aged execution must have moved");
+    assert!(archived_exists(&f, old).await);
+    assert_eq!(
+        state_rows(&f, old).await,
+        0,
+        "an archived execution's durable state must not outlive the move"
+    );
+    assert_eq!(
+        state_rows(&f, fresh).await,
+        1,
+        "a live execution's state must be untouched"
+    );
+}
+
+/// Tier four: `llm_usage` / `judge_scores` past the total lifetime go,
+/// recent rows stay; an orphaned state row older than the grace goes, a
+/// young orphan and a live execution's state stay; non-positive days refuse.
+#[tokio::test]
+async fn side_table_reap_is_clocked_on_total_lifetime_and_spares_the_young() {
+    let f = fixture_exclusive().await;
+    let old_llm = seed_llm_usage(&f, 100).await;
+    let new_llm = seed_llm_usage(&f, 5).await;
+    let old_judge = seed_judge_score(&f, 100).await;
+    let new_judge = seed_judge_score(&f, 5).await;
+    let live = seed_execution(&f, 1, "completed", false).await;
+    seed_state(&f, live, "k", 3).await;
+    let orphan_old = Uuid::new_v4();
+    seed_state(&f, orphan_old, "k", 3).await;
+    let orphan_young = Uuid::new_v4();
+    seed_state(&f, orphan_young, "k", 0).await;
+
+    let refused = f.repo.reap_execution_side_tables(0).await.unwrap();
+    assert_eq!(
+        refused,
+        talos_advanced_repository::SideTableReap::default(),
+        "non-positive days must delete nothing"
+    );
+    assert!(row_exists(&f, "llm_usage", old_llm).await);
+
+    let reap = f.repo.reap_execution_side_tables(60).await.unwrap();
+    assert!(reap.llm_usage >= 1, "{reap:?}");
+    assert!(reap.judge_scores >= 1, "{reap:?}");
+    assert!(reap.execution_state_orphans >= 1, "{reap:?}");
+    assert!(!row_exists(&f, "llm_usage", old_llm).await);
+    assert!(row_exists(&f, "llm_usage", new_llm).await);
+    assert!(!row_exists(&f, "judge_scores", old_judge).await);
+    assert!(row_exists(&f, "judge_scores", new_judge).await);
+    assert_eq!(
+        state_rows(&f, orphan_old).await,
+        0,
+        "aged orphan state is reaped"
+    );
+    assert_eq!(
+        state_rows(&f, orphan_young).await,
+        1,
+        "a state row younger than the grace is not an orphan yet"
+    );
+    assert_eq!(
+        state_rows(&f, live).await,
+        1,
+        "a live execution's state is kept"
+    );
+}
+
+/// Tier five: old rows go, recent rows stay, ACTIVE alerts stay however old,
+/// and a window below the 30-day floor is refused outright.
+#[tokio::test]
+async fn audit_table_reap_spares_recent_and_active_rows_and_refuses_below_floor() {
+    let f = fixture_exclusive().await;
+    let old_action = seed_action_log(&f, 200).await;
+    let new_action = seed_action_log(&f, 10).await;
+    let old_hist = seed_module_history(&f, 200).await;
+    let new_hist = seed_module_history(&f, 10).await;
+    let old_resolved = seed_ops_alert(&f, 200, Some(200)).await;
+    let new_resolved = seed_ops_alert(&f, 10, Some(10)).await;
+    let old_active = seed_ops_alert(&f, 200, None).await;
+
+    let refused = f.repo.reap_audit_tables(29).await.unwrap();
+    assert_eq!(
+        refused,
+        talos_advanced_repository::AuditTableReap::default(),
+        "below the floor nothing may be deleted"
+    );
+    assert!(row_exists(&f, "actor_action_log", old_action).await);
+
+    let reap = f.repo.reap_audit_tables(180).await.unwrap();
+    assert!(reap.actor_action_log >= 1, "{reap:?}");
+    assert!(reap.module_update_history >= 1, "{reap:?}");
+    assert!(reap.ops_alerts_resolved >= 1, "{reap:?}");
+    assert!(!row_exists(&f, "actor_action_log", old_action).await);
+    assert!(row_exists(&f, "actor_action_log", new_action).await);
+    assert!(!row_exists(&f, "module_update_history", old_hist).await);
+    assert!(row_exists(&f, "module_update_history", new_hist).await);
+    assert!(!row_exists(&f, "ops_alerts", old_resolved).await);
+    assert!(row_exists(&f, "ops_alerts", new_resolved).await);
+    assert!(
+        row_exists(&f, "ops_alerts", old_active).await,
+        "an ACTIVE alert is never reaped, however old"
+    );
+}
+
+/// The pass wires both new tiers, clamps the audit window UP to the floor,
+/// and — because `admin_event_log` is append-only by trigger — proves the
+/// reaper never names it: a DELETE there raises 42501, which would land in
+/// `audit_table_error`.
+#[tokio::test]
+async fn the_retention_pass_runs_the_new_tiers_and_clamps_the_audit_window() {
+    let f = fixture_exclusive().await;
+    let old_action = seed_action_log(&f, 200).await;
+    sqlx::query(
+        "INSERT INTO admin_event_log (user_id, event_type, resource_type, summary, created_at) \
+         VALUES ($1, 'test', 'test', 's', NOW() - make_interval(days => 400))",
+    )
+    .bind(f.user)
+    .execute(&f.pool)
+    .await
+    .unwrap();
+
+    let outcome = talos_advanced_repository::run_retention_pass_with_audit_retention(
+        &f.repo,
+        talos_advanced_repository::RetentionWindows {
+            archive_after_days: 30,
+            purge_after_days: 30,
+        },
+        7,
+    )
+    .await;
+    assert_eq!(
+        outcome.audit_retention_days,
+        Some(talos_advanced_repository::MIN_AUDIT_TABLE_RETENTION_DAYS),
+        "7 days is a typo-shaped window and must be raised to the floor"
+    );
+    assert!(!outcome.failed(), "{outcome:?}");
+    assert!(outcome.side_tables.is_some());
+    assert!(outcome
+        .audit_tables
+        .is_some_and(|a| a.actor_action_log >= 1));
+    assert!(!row_exists(&f, "actor_action_log", old_action).await);
+    let admin_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM admin_event_log WHERE user_id = $1")
+            .bind(f.user)
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+    assert_eq!(admin_rows, 1, "admin_event_log is permanent by policy");
 }

@@ -848,12 +848,13 @@ impl ParallelWorkflowEngine {
                 rubric,
                 pass_threshold,
                 on_failure,
-                timeout_secs: _,
+                timeout_secs,
             }),
         ) = self.node_meta.get(&node_id)?
         else {
             return None;
         };
+        let timeout_secs = *timeout_secs;
         let judge_wf_id = *judge_workflow_id;
         let rubric = rubric.clone();
         let pass_threshold = *pass_threshold;
@@ -864,21 +865,23 @@ impl ParallelWorkflowEngine {
         // the thing it is scoring was assembled from partial evidence.
         self.apply_degraded_inputs_to_value(node_idx, results, &mut parent_inputs);
 
+        let child = self.dispatch_judge(
+            parent_inputs,
+            judge_wf_id,
+            rubric,
+            pass_threshold,
+            &on_failure,
+            dispatcher.clone(),
+            worker_shared_key.clone(),
+            talos_workflow_engine_core::ChildRunSite::Node {
+                execution_id,
+                node_id,
+            },
+        );
         Some(
-            self.dispatch_judge(
-                parent_inputs,
-                judge_wf_id,
-                rubric,
-                pass_threshold,
-                &on_failure,
-                dispatcher.clone(),
-                worker_shared_key.clone(),
-                talos_workflow_engine_core::ChildRunSite::Node {
-                    execution_id,
-                    node_id,
-                },
-            )
-            .await,
+            self.bounded_child(node_id, "judge", timeout_secs, child)
+                .await
+                .unwrap_or_else(child_timeout_envelope),
         )
     }
 
@@ -901,31 +904,34 @@ impl ParallelWorkflowEngine {
                 child_workflow_id,
                 reflection_workflow_id,
                 max_retries,
-                timeout_secs: _,
+                timeout_secs,
             }),
         ) = self.node_meta.get(&node_id)?
         else {
             return None;
         };
+        let timeout_secs = *timeout_secs;
         let child_wf_id = *child_workflow_id;
         let reflection_wf_id = *reflection_workflow_id;
         let max_retries = *max_retries;
         let initial_input = self.gather_inputs(node_idx, results);
 
+        let child = self.dispatch_reflective_retry(
+            initial_input,
+            child_wf_id,
+            reflection_wf_id,
+            max_retries,
+            dispatcher.clone(),
+            worker_shared_key.clone(),
+            talos_workflow_engine_core::ChildRunSite::Node {
+                execution_id,
+                node_id,
+            },
+        );
         Some(
-            self.dispatch_reflective_retry(
-                initial_input,
-                child_wf_id,
-                reflection_wf_id,
-                max_retries,
-                dispatcher.clone(),
-                worker_shared_key.clone(),
-                talos_workflow_engine_core::ChildRunSite::Node {
-                    execution_id,
-                    node_id,
-                },
-            )
-            .await,
+            self.bounded_child(node_id, "reflective_retry", timeout_secs, child)
+                .await
+                .unwrap_or_else(child_timeout_envelope),
         )
     }
 
@@ -954,31 +960,34 @@ impl ParallelWorkflowEngine {
                 classifier_workflow_id,
                 routes,
                 fallback_workflow_id,
-                timeout_secs: _,
+                timeout_secs,
             }),
         ) = self.node_meta.get(&node_id)?
         else {
             return None;
         };
+        let timeout_secs = *timeout_secs;
         let classifier_wf_id = *classifier_workflow_id;
         let routes = routes.clone();
         let fallback_wf_id = *fallback_workflow_id;
         let inputs = self.gather_inputs(node_idx, results);
 
+        let child = self.dispatch_llm_dispatch(
+            inputs,
+            classifier_wf_id,
+            routes,
+            fallback_wf_id,
+            dispatcher.clone(),
+            worker_shared_key.clone(),
+            talos_workflow_engine_core::ChildRunSite::Node {
+                execution_id,
+                node_id,
+            },
+        );
         Some(
-            self.dispatch_llm_dispatch(
-                inputs,
-                classifier_wf_id,
-                routes,
-                fallback_wf_id,
-                dispatcher.clone(),
-                worker_shared_key.clone(),
-                talos_workflow_engine_core::ChildRunSite::Node {
-                    execution_id,
-                    node_id,
-                },
-            )
-            .await,
+            self.bounded_child(node_id, "llm_dispatch", timeout_secs, child)
+                .await
+                .unwrap_or_else(child_timeout_envelope),
         )
     }
 
@@ -1041,12 +1050,13 @@ impl ParallelWorkflowEngine {
             _,
             Some(SystemNodeKind::SubWorkflow {
                 workflow_id: sub_wf_id,
-                timeout_secs: _,
+                timeout_secs,
             }),
         ) = self.node_meta.get(&node_id)?
         else {
             return None;
         };
+        let timeout_secs = *timeout_secs;
         let sub_wf_id = *sub_wf_id;
         let inputs = self.gather_inputs(node_idx, results);
         // Propagate the parent's `__trigger_input__` into the child's
@@ -1105,18 +1115,20 @@ impl ParallelWorkflowEngine {
             },
         );
         let dispatch_started = std::time::Instant::now();
+        let child = self.dispatch_subworkflow(
+            child_trigger,
+            sub_wf_id,
+            dispatcher.clone(),
+            worker_shared_key.clone(),
+            talos_workflow_engine_core::ChildRunSite::Node {
+                execution_id,
+                node_id,
+            },
+        );
         let output = self
-            .dispatch_subworkflow(
-                child_trigger,
-                sub_wf_id,
-                dispatcher.clone(),
-                worker_shared_key.clone(),
-                talos_workflow_engine_core::ChildRunSite::Node {
-                    execution_id,
-                    node_id,
-                },
-            )
-            .await;
+            .bounded_child(node_id, "sub_workflow", timeout_secs, child)
+            .await
+            .unwrap_or_else(child_timeout_envelope);
         let elapsed_ms = dispatch_started.elapsed().as_millis() as u64;
         // Awaited completion event preserves ordering with the next
         // dispatch loop's node_started — without it, a fast downstream
@@ -1357,12 +1369,13 @@ impl ParallelWorkflowEngine {
             _,
             Some(SystemNodeKind::DynamicDispatch {
                 dispatch_expression,
-                timeout_secs: _,
+                timeout_secs,
             }),
         ) = self.node_meta.get(&node_id)?
         else {
             return None;
         };
+        let timeout_secs = *timeout_secs;
         let expression = dispatch_expression.clone();
         let inputs = self.gather_inputs(node_idx, results);
 
@@ -1430,21 +1443,23 @@ impl ParallelWorkflowEngine {
                             dispatched_workflow_id = %sub_wf_id,
                             "DynamicDispatch resolved to workflow"
                         );
+                        let child = self.run_dispatched_subworkflow(
+                            sub_wf_id,
+                            &inputs,
+                            dispatcher,
+                            worker_shared_key,
+                            DispatchedOrigin::DynamicDispatch {
+                                resolved_target: target_id_or_name.clone(),
+                            },
+                            talos_workflow_engine_core::ChildRunSite::Node {
+                                execution_id,
+                                node_id,
+                            },
+                        );
                         let sub_result = self
-                            .run_dispatched_subworkflow(
-                                sub_wf_id,
-                                &inputs,
-                                dispatcher,
-                                worker_shared_key,
-                                DispatchedOrigin::DynamicDispatch {
-                                    resolved_target: target_id_or_name.clone(),
-                                },
-                                talos_workflow_engine_core::ChildRunSite::Node {
-                                    execution_id,
-                                    node_id,
-                                },
-                            )
-                            .await;
+                            .bounded_child(node_id, "dispatch", timeout_secs, child)
+                            .await
+                            .unwrap_or_else(child_timeout_envelope);
                         // `run_dispatched_subworkflow` returns a JsonValue that
                         // may itself carry `__error: true` when the child
                         // failed. Promote that into the Err variant so the
@@ -1486,12 +1501,13 @@ impl ParallelWorkflowEngine {
             Some(SystemNodeKind::CapabilityDispatch {
                 required_capabilities,
                 fallback_workflow_id,
-                timeout_secs: _,
+                timeout_secs,
             }),
         ) = self.node_meta.get(&node_id)?
         else {
             return None;
         };
+        let timeout_secs = *timeout_secs;
         let caps = required_capabilities.clone();
         let fallback = *fallback_workflow_id;
         let inputs = self.gather_inputs(node_idx, results);
@@ -1563,23 +1579,25 @@ impl ParallelWorkflowEngine {
             "CapabilityDispatch resolved to workflow"
         );
 
+        let child = self.run_dispatched_subworkflow(
+            sub_wf_id,
+            &inputs,
+            dispatcher,
+            worker_shared_key,
+            DispatchedOrigin::CapabilityDispatch {
+                workflow_name: sub_wf_name,
+                matched_capabilities: caps,
+                is_fallback,
+            },
+            talos_workflow_engine_core::ChildRunSite::Node {
+                execution_id,
+                node_id,
+            },
+        );
         Some(
-            self.run_dispatched_subworkflow(
-                sub_wf_id,
-                &inputs,
-                dispatcher,
-                worker_shared_key,
-                DispatchedOrigin::CapabilityDispatch {
-                    workflow_name: sub_wf_name,
-                    matched_capabilities: caps,
-                    is_fallback,
-                },
-                talos_workflow_engine_core::ChildRunSite::Node {
-                    execution_id,
-                    node_id,
-                },
-            )
-            .await,
+            self.bounded_child(node_id, "capability_dispatch", timeout_secs, child)
+                .await
+                .unwrap_or_else(child_timeout_envelope),
         )
     }
 
@@ -2857,34 +2875,181 @@ impl ParallelWorkflowEngine {
                 count,
                 consensus,
                 judge_workflow_id,
-                timeout_secs: _,
+                timeout_secs,
             }),
         ) = self.node_meta.get(&node_id)?
         else {
             return None;
         };
+        let timeout_secs = *timeout_secs;
         let child_wf_id = *child_workflow_id;
         let run_count = *count;
         let consensus_strategy = consensus.clone();
         let judge_wf_id_opt = *judge_workflow_id;
         let inputs = self.gather_inputs(node_idx, results);
 
+        let child = self.dispatch_ensemble(
+            inputs,
+            child_wf_id,
+            run_count,
+            consensus_strategy,
+            judge_wf_id_opt,
+            dispatcher.clone(),
+            worker_shared_key.clone(),
+            talos_workflow_engine_core::ChildRunSite::Node {
+                execution_id,
+                node_id,
+            },
+        );
         Some(
-            self.dispatch_ensemble(
-                inputs,
-                child_wf_id,
-                run_count,
-                consensus_strategy,
-                judge_wf_id_opt,
-                dispatcher.clone(),
-                worker_shared_key.clone(),
-                talos_workflow_engine_core::ChildRunSite::Node {
-                    execution_id,
-                    node_id,
-                },
-            )
-            .await,
+            self.bounded_child(node_id, "ensemble", timeout_secs, child)
+                .await
+                .unwrap_or_else(child_timeout_envelope),
         )
+    }
+}
+
+// ── Child-dispatch wall-clock bound (2026-09-10) ─────────────────────────────
+
+/// How long a child dispatch may run, derived from the node's own cap and
+/// the run's remaining budget by [`child_dispatch_window`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildDispatchWindow {
+    /// No node cap and no run deadline: the child runs unbounded — byte-for-
+    /// byte the pre-2026-09-10 behaviour for a run without
+    /// `execution_timeout_secs`.
+    Unbounded,
+    /// Wait at most `secs`. `from_node_cap` is `true` when the bound is the
+    /// node's own enforced `timeout_secs` and `false` when the run's remaining
+    /// budget (minus `BUDGET_RESERVE_SECS`) was the tighter of the two — the
+    /// error message names which, so an operator reading "timed out after
+    /// 28s" on a node configured at 120 knows it was the budget.
+    Wait { secs: u64, from_node_cap: bool },
+    /// Fewer than `MIN_REMAINING_FOR_ATTEMPT_SECS` remain: do not start the
+    /// child at all. Same refusal the module dispatcher makes for an attempt.
+    BudgetExhausted { remaining_secs: u64 },
+}
+
+/// The ONE derivation of a child dispatch's wall-clock bound. Reuses core's
+/// `attempt_window_for_remaining` — the arithmetic that already governs a
+/// module attempt against the same deadline — rather than a second copy: the
+/// dispatcher and the validator once disagreed by 7 s at the boundary, and
+/// a third implementation is how that comes back.
+///
+/// `node_timeout_secs == CHILD_TIMEOUT_NOT_ENFORCED` (the parser's answer for
+/// a node without `enforce_timeout: true`) means the node contributes no cap
+/// of its own; the child is then bounded by the remaining budget alone, so a
+/// child that would otherwise be cut off by the run's outer timeout — which
+/// drops the whole reactor future — fails as an ordinary NODE (error edges,
+/// `continue_on_error`, sibling results kept) a reserve ahead of it.
+pub(crate) fn child_dispatch_window(
+    node_timeout_secs: u64,
+    deadline: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> ChildDispatchWindow {
+    use talos_workflow_engine_core::{attempt_window_for_remaining, AttemptWindow};
+    let enforced = node_timeout_secs != crate::graph_parser::CHILD_TIMEOUT_NOT_ENFORCED;
+    let Some(deadline) = deadline else {
+        return if enforced {
+            ChildDispatchWindow::Wait {
+                secs: node_timeout_secs,
+                from_node_cap: true,
+            }
+        } else {
+            ChildDispatchWindow::Unbounded
+        };
+    };
+    let remaining_secs = deadline.saturating_duration_since(now).as_secs();
+    let allowance = if enforced {
+        node_timeout_secs
+    } else {
+        remaining_secs
+    };
+    match attempt_window_for_remaining(allowance, remaining_secs) {
+        AttemptWindow::BudgetExhausted { remaining_secs } => {
+            ChildDispatchWindow::BudgetExhausted { remaining_secs }
+        }
+        AttemptWindow::Wait { secs, clamped } => ChildDispatchWindow::Wait {
+            secs,
+            from_node_cap: enforced && !clamped,
+        },
+    }
+}
+
+/// The `{__error, error_message}` envelope a timed-out or refused child
+/// dispatch hands back. `route_system_node_output` classifies it through
+/// `output_reports_error` and fails the NODE (the #734 routing rules apply:
+/// error edges, `continue_on_error`, DLQ), never the whole run directly.
+pub(crate) fn child_timeout_envelope(message: String) -> JsonValue {
+    json!({
+        "__error": true,
+        "error_message": message,
+    })
+}
+
+impl ParallelWorkflowEngine {
+    /// Run `child` under the bound [`child_dispatch_window`] derives for
+    /// `node_timeout_secs` and this run's deadline. `Err(message)` on expiry
+    /// or refusal; the message names the kind, the seconds, and whether the
+    /// node's cap or the run's budget decided it.
+    ///
+    /// **A dropped child is a dropped future.** On expiry the in-flight
+    /// sub-engine (and any NATS job it awaited) is abandoned exactly as the
+    /// run's outer `tokio::time::timeout` would abandon it a reserve later;
+    /// the worker finishes the job and nobody reads the result. The child-run
+    /// ledger writes its ONE row at child completion, so a timed-out child
+    /// leaves NO `sub_workflow_runs` row — unknown, not half-written — which
+    /// is the same gap the outer timeout already had.
+    pub(crate) async fn bounded_child<T>(
+        &self,
+        node_id: Uuid,
+        kind: &'static str,
+        node_timeout_secs: u64,
+        child: impl std::future::Future<Output = T>,
+    ) -> Result<T, String> {
+        use talos_workflow_engine_core::MIN_REMAINING_FOR_ATTEMPT_SECS;
+        match child_dispatch_window(
+            node_timeout_secs,
+            self.progress.deadline(),
+            std::time::Instant::now(),
+        ) {
+            ChildDispatchWindow::Unbounded => Ok(child.await),
+            ChildDispatchWindow::BudgetExhausted { remaining_secs } => {
+                tracing::warn!(
+                    %node_id,
+                    kind,
+                    remaining_secs,
+                    "child dispatch refused: the workflow's wall-clock budget is exhausted"
+                );
+                Err(format!(
+                    "{kind} not started: {remaining_secs}s of the workflow's wall-clock budget \
+                     remain, below the {MIN_REMAINING_FOR_ATTEMPT_SECS}s floor"
+                ))
+            }
+            ChildDispatchWindow::Wait {
+                secs,
+                from_node_cap,
+            } => match tokio::time::timeout(std::time::Duration::from_secs(secs), child).await {
+                Ok(v) => Ok(v),
+                Err(_) => {
+                    tracing::warn!(
+                        %node_id,
+                        kind,
+                        timeout_secs = secs,
+                        from_node_cap,
+                        "child dispatch timed out"
+                    );
+                    Err(if from_node_cap {
+                        format!("{kind} timed out after {secs}s (node timeout_secs)")
+                    } else {
+                        format!(
+                            "{kind} timed out after {secs}s (the workflow's remaining \
+                                 wall-clock budget)"
+                        )
+                    })
+                }
+            },
+        }
     }
 }
 
@@ -3750,5 +3915,92 @@ mod loop_iteration_execution_row_tests {
             )
             .await;
         assert!(dispatcher.jobs()[0].job_id.is_some());
+    }
+}
+
+#[cfg(test)]
+mod child_dispatch_window_tests {
+    //! The derivation is pure, so every arm is pinned here; the dispatch
+    //! sites are covered end-to-end in `tests/system_node_failure_routing.rs`.
+    use super::{child_dispatch_window, ChildDispatchWindow};
+    use std::time::{Duration, Instant};
+    use talos_workflow_engine_core::{BUDGET_RESERVE_SECS, MIN_REMAINING_FOR_ATTEMPT_SECS};
+
+    const NOT_ENFORCED: u64 = crate::graph_parser::CHILD_TIMEOUT_NOT_ENFORCED;
+
+    #[test]
+    fn no_cap_and_no_deadline_is_unbounded() {
+        assert_eq!(
+            child_dispatch_window(NOT_ENFORCED, None, Instant::now()),
+            ChildDispatchWindow::Unbounded
+        );
+    }
+
+    #[test]
+    fn an_enforced_cap_with_no_deadline_is_the_cap() {
+        assert_eq!(
+            child_dispatch_window(45, None, Instant::now()),
+            ChildDispatchWindow::Wait {
+                secs: 45,
+                from_node_cap: true
+            }
+        );
+    }
+
+    #[test]
+    fn an_enforced_cap_that_fits_the_budget_is_the_cap() {
+        let now = Instant::now();
+        assert_eq!(
+            child_dispatch_window(45, Some(now + Duration::from_secs(300)), now),
+            ChildDispatchWindow::Wait {
+                secs: 45,
+                from_node_cap: true
+            }
+        );
+    }
+
+    #[test]
+    fn an_enforced_cap_wider_than_the_budget_is_clamped_and_says_so() {
+        let now = Instant::now();
+        let w = child_dispatch_window(120, Some(now + Duration::from_secs(60)), now);
+        assert_eq!(
+            w,
+            ChildDispatchWindow::Wait {
+                secs: 60 - BUDGET_RESERVE_SECS,
+                from_node_cap: false
+            }
+        );
+    }
+
+    #[test]
+    fn no_cap_with_a_deadline_is_the_remaining_budget_minus_the_reserve() {
+        let now = Instant::now();
+        let w = child_dispatch_window(NOT_ENFORCED, Some(now + Duration::from_secs(100)), now);
+        assert_eq!(
+            w,
+            ChildDispatchWindow::Wait {
+                secs: 100 - BUDGET_RESERVE_SECS,
+                from_node_cap: false
+            }
+        );
+    }
+
+    #[test]
+    fn an_exhausted_budget_refuses_to_start_the_child() {
+        let now = Instant::now();
+        let near = Some(now + Duration::from_secs(MIN_REMAINING_FOR_ATTEMPT_SECS - 1));
+        assert!(matches!(
+            child_dispatch_window(45, near, now),
+            ChildDispatchWindow::BudgetExhausted { .. }
+        ));
+        assert!(matches!(
+            child_dispatch_window(NOT_ENFORCED, near, now),
+            ChildDispatchWindow::BudgetExhausted { .. }
+        ));
+        // A deadline already in the past saturates to zero remaining.
+        assert!(matches!(
+            child_dispatch_window(45, Some(now - Duration::from_secs(5)), now),
+            ChildDispatchWindow::BudgetExhausted { remaining_secs: 0 }
+        ));
     }
 }

@@ -6,6 +6,94 @@ use chrono::{DateTime, Duration, Utc};
 use jsonwebtoken::{decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use sha2::{Digest, Sha256};
 use sqlx::{Pool, Postgres};
+
+/// Rows per DELETE statement in this crate's cleanups
+/// ([`AuthService::cleanup_expired_sessions`],
+/// [`AuthService::cleanup_audit_logs`]) (2026-09-10). Per-crate constant,
+/// deliberately: the five crates carrying a batched sweep share no leaf
+/// dependency that could host it; the value matches
+/// `talos-advanced-repository`'s `RETENTION_BATCH`.
+const SWEEP_BATCH: i64 = 5000;
+
+/// Batches one cleanup call will issue before reporting `truncated`. Matches
+/// `talos-advanced-repository`'s `MAX_BATCHES_PER_SWEEP`.
+const MAX_SWEEP_BATCHES: u32 = 20;
+
+/// Outcome of an audit-log cleanup call. See the secrets-manager twin: the
+/// two arms are different answers and must not be collapsed into a count.
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditLogCleanup {
+    /// The table carries the `prevent_audit_modification` trigger: it is
+    /// append-only by security policy and no DELETE was attempted.
+    ImmutableByPolicy,
+    /// Rows deleted, and whether the per-call batch cap stopped the sweep
+    /// with a full last batch.
+    Deleted { rows: u64, truncated: bool },
+}
+
+/// What one [`AuthService::cleanup_expired_sessions`] call did.
+#[must_use]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SessionCleanup {
+    /// Expired `user_sessions` rows deleted.
+    pub sessions: u64,
+    /// Expired `rotated_session_audit` rows deleted (best-effort; a failure
+    /// here is logged and does not fail the call).
+    pub rotated_audit: u64,
+    /// Either sweep stopped at the per-call batch cap with a full last batch.
+    pub truncated: bool,
+}
+
+/// Run one `DELETE … WHERE <pk> IN (SELECT … LIMIT SWEEP_BATCH)` statement
+/// with no binds until a batch comes back short or the cap is reached.
+/// Returns `(rows, truncated)`.
+async fn run_batched_delete(
+    pool: &Pool<Postgres>,
+    sql: &str,
+    context: &'static str,
+) -> Result<(u64, bool)> {
+    let mut rows = 0u64;
+    for batch in 0..MAX_SWEEP_BATCHES {
+        let n = sqlx::query(sql)
+            .execute(pool)
+            .await
+            .map(|r| r.rows_affected())
+            .context(context)?;
+        rows += n;
+        if n < SWEEP_BATCH as u64 {
+            return Ok((rows, false));
+        }
+        if batch + 1 == MAX_SWEEP_BATCHES {
+            return Ok((rows, true));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Ok((rows, false))
+}
+
+/// Does `table` carry an enabled, non-internal trigger bound to
+/// `prevent_audit_modification()`? Catalog read, so the policy is a positive
+/// finding and no DELETE is issued against a table that would refuse it.
+/// (Twin of the secrets-manager probe; the two crates share no leaf
+/// dependency that could host one copy.)
+async fn audit_table_is_immutable(pool: &Pool<Postgres>, table: &str) -> Result<bool> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM pg_trigger t \
+             JOIN pg_class c ON c.oid = t.tgrelid \
+             JOIN pg_proc p ON p.oid = t.tgfoid \
+             WHERE c.relname::text = $1 \
+               AND p.proname = 'prevent_audit_modification' \
+               AND NOT t.tgisinternal \
+               AND t.tgenabled <> 'D' \
+         )",
+    )
+    .bind(table)
+    .fetch_one(pool)
+    .await
+    .context("audit_table_is_immutable")
+}
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
@@ -1641,20 +1729,52 @@ impl AuthService {
     /// together. Tracking the audit table beyond its meaningful window
     /// just costs disk; reuse detection past 7d is moot because the
     /// original token would have expired anyway.
-    pub async fn cleanup_expired_sessions(&self) -> Result<u64> {
-        let result = sqlx::query!("DELETE FROM user_sessions WHERE expires_at < NOW()")
-            .execute(&self.db_pool)
-            .await?;
+    /// Delete expired sessions. Batched (2026-09-10, see [`SWEEP_BATCH`]):
+    /// `idx_user_sessions_expires_at` and
+    /// `rotated_session_audit_expires_at_idx` serve the two selections, so a
+    /// backlog after an outage is many short deletes rather than one long
+    /// lock hold. The `sqlx::query!` macro form was replaced by the function
+    /// form because the macro's compile-time check cannot express the
+    /// `LIMIT` subselect without a fresh offline-cache round trip.
+    pub async fn cleanup_expired_sessions(&self) -> Result<SessionCleanup> {
+        let sessions_sql = format!(
+            "DELETE FROM user_sessions WHERE id IN ( \
+                 SELECT id FROM user_sessions \
+                 WHERE expires_at < NOW() \
+                 ORDER BY expires_at, id \
+                 LIMIT {SWEEP_BATCH} \
+                 FOR UPDATE SKIP LOCKED \
+             )"
+        );
+        let (sessions, sessions_truncated) =
+            run_batched_delete(&self.db_pool, &sessions_sql, "cleanup_expired_sessions").await?;
 
         // Best-effort prune of the reuse-detection audit table.
-        if let Err(e) = sqlx::query("DELETE FROM rotated_session_audit WHERE expires_at < NOW()")
-            .execute(&self.db_pool)
-            .await
-        {
-            tracing::warn!("Failed to prune rotated_session_audit (non-fatal): {}", e);
-        }
+        let rotated_sql = format!(
+            "DELETE FROM rotated_session_audit WHERE lookup_hash IN ( \
+                 SELECT lookup_hash FROM rotated_session_audit \
+                 WHERE expires_at < NOW() \
+                 ORDER BY expires_at, lookup_hash \
+                 LIMIT {SWEEP_BATCH} \
+                 FOR UPDATE SKIP LOCKED \
+             )"
+        );
+        let (rotated_audit, rotated_truncated) =
+            match run_batched_delete(&self.db_pool, &rotated_sql, "prune_rotated_session_audit")
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("Failed to prune rotated_session_audit (non-fatal): {}", e);
+                    (0, false)
+                }
+            };
 
-        Ok(result.rows_affected())
+        Ok(SessionCleanup {
+            sessions,
+            rotated_audit,
+            truncated: sessions_truncated || rotated_truncated,
+        })
     }
 
     /// Clean up old audit logs (default retention: 90 days).
@@ -1666,23 +1786,64 @@ impl AuthService {
     /// purging the entire `auth_audit_log` table. Sibling fix to
     /// `talos-secrets-manager::cleanup_audit_logs` and
     /// `talos-webhooks::cleanup_request_logs`.
-    pub async fn cleanup_audit_logs(&self, retention_days: i64) -> Result<u64> {
+    ///
+    /// **`auth_audit_log` is append-only by policy (2026-09-10 finding).**
+    /// Migration `20260408000001` put the `prevent_audit_modification`
+    /// BEFORE DELETE trigger on it, so every call this function has made
+    /// since then raised `42501` — logged as an ERROR at 02:00 daily and
+    /// deleting nothing. The policy is now READ from the catalog first and
+    /// reported as [`AuditLogCleanup::ImmutableByPolicy`] with no DELETE
+    /// issued; if an operator has deliberately dropped the trigger, the
+    /// delete runs batched and capped.
+    pub async fn cleanup_audit_logs(&self, retention_days: i64) -> Result<AuditLogCleanup> {
         if retention_days <= 0 {
             tracing::warn!(
                 target: "talos_audit",
                 retention_days,
                 "auth-audit cleanup refused: retention_days must be positive (would purge entire log)"
             );
-            return Ok(0);
+            return Ok(AuditLogCleanup::Deleted {
+                rows: 0,
+                truncated: false,
+            });
         }
-        let result = sqlx::query(
-            "DELETE FROM auth_audit_log WHERE created_at < NOW() - INTERVAL '1 day' * $1",
-        )
-        .bind(retention_days)
-        .execute(&self.db_pool)
-        .await?;
-
-        Ok(result.rows_affected())
+        if audit_table_is_immutable(&self.db_pool, "auth_audit_log").await? {
+            return Ok(AuditLogCleanup::ImmutableByPolicy);
+        }
+        let days: i32 = retention_days.clamp(1, i32::MAX as i64) as i32;
+        let sql = format!(
+            "DELETE FROM auth_audit_log WHERE id IN ( \
+                 SELECT id FROM auth_audit_log \
+                 WHERE created_at < NOW() - make_interval(days => $1::int) \
+                 ORDER BY created_at, id \
+                 LIMIT {SWEEP_BATCH} \
+                 FOR UPDATE SKIP LOCKED \
+             )"
+        );
+        let mut rows = 0u64;
+        for batch in 0..MAX_SWEEP_BATCHES {
+            let n = sqlx::query(&sql)
+                .bind(days)
+                .execute(&self.db_pool)
+                .await
+                .map(|r| r.rows_affected())
+                .context("cleanup_auth_audit_logs")?;
+            rows += n;
+            if n < SWEEP_BATCH as u64 {
+                break;
+            }
+            if batch + 1 == MAX_SWEEP_BATCHES {
+                return Ok(AuditLogCleanup::Deleted {
+                    rows,
+                    truncated: true,
+                });
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        Ok(AuditLogCleanup::Deleted {
+            rows,
+            truncated: false,
+        })
     }
 
     /// Verify and decode JWT token.

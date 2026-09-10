@@ -88,6 +88,30 @@ pub const SINCE_CACHE_TTL: Duration = Duration::from_secs(60);
 /// statement, `SKIP LOCKED` so a concurrent purge never blocks.
 pub const LEDGER_PURGE_BATCH: i64 = 1_000;
 
+/// Upper bound on the batches ONE purge call will issue (2026-09-10). Before
+/// this the loop ran to exhaustion, so a backlog was one long hold on the
+/// pool; now it drains across the caller's ticks. 100 × 1 000 = 100 000 rows
+/// per call — the same per-tick ceiling the execution tiers in
+/// `talos-advanced-repository` use (`MAX_BATCHES_PER_SWEEP` there is 20 × a
+/// 5 000-row batch). Per-crate constant, deliberately: the crates carrying a
+/// batched sweep share no leaf dependency that could host one.
+pub const LEDGER_PURGE_MAX_BATCHES: u32 = 100;
+
+/// What one [`ChildRunLedger::purge_older_than`] call did.
+///
+/// `#[must_use]`: dropping this drops the truncation verdict — a purge that
+/// stops short of its backlog every tick is a table that grows while the log
+/// says "purged".
+#[must_use]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LedgerPurge {
+    /// Rows deleted (sum over batches).
+    pub rows: u64,
+    /// `true` when [`LEDGER_PURGE_MAX_BATCHES`] batches were issued and the
+    /// last one was full — there is (probably) more to do next call.
+    pub truncated: bool,
+}
+
 /// The largest page any ledger read will return, whatever a caller asks for.
 pub const MAX_LIST_LIMIT: i64 = 500;
 
@@ -445,16 +469,20 @@ impl ChildRunLedger {
     /// * `ORDER BY … LIMIT … FOR UPDATE SKIP LOCKED`, so a concurrent purge
     ///   never blocks and no statement is unbounded.
     ///
+    /// * a per-call cap of [`LEDGER_PURGE_MAX_BATCHES`] batches, reported as
+    ///   [`LedgerPurge::truncated`] so the caller can tell "drained" from
+    ///   "stopped at the cap" (2026-09-10).
+    ///
     /// # Errors
-    /// Any database failure. Returns the number of rows deleted.
-    pub async fn purge_older_than(&self, days: i32) -> Result<u64> {
+    /// Any database failure. Returns the rows deleted and the cap verdict.
+    pub async fn purge_older_than(&self, days: i32) -> Result<LedgerPurge> {
         if days <= 0 {
             tracing::warn!(
                 target: "talos_audit",
                 days,
                 "child-run ledger purge refused: days must be positive (would delete the whole ledger)"
             );
-            return Ok(0);
+            return Ok(LedgerPurge::default());
         }
         let sql = format!(
             "DELETE FROM sub_workflow_runs WHERE id IN ( \
@@ -473,23 +501,27 @@ impl ChildRunLedger {
                  FOR UPDATE SKIP LOCKED \
              )"
         );
-        let mut total = 0u64;
-        loop {
+        let mut out = LedgerPurge::default();
+        for batch in 0..LEDGER_PURGE_MAX_BATCHES {
             let deleted = sqlx::query(&sql)
                 .bind(days)
                 .execute(&self.pool)
                 .await
                 .map(|r| r.rows_affected())
                 .context("purge_child_run_ledger")?;
-            total += deleted;
+            out.rows += deleted;
             if deleted < LEDGER_PURGE_BATCH as u64 {
+                break;
+            }
+            if batch + 1 == LEDGER_PURGE_MAX_BATCHES {
+                out.truncated = true;
                 break;
             }
             // Yield between batches so a large first sweep does not monopolise
             // the pool — same courtesy the execution purge extends.
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        Ok(total)
+        Ok(out)
     }
 }
 

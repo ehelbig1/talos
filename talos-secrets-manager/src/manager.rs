@@ -27,6 +27,56 @@ use anyhow::{anyhow, Context, Result};
 use dashmap::DashMap;
 use rand::RngCore;
 use sqlx::{Pool, Postgres, Row};
+
+/// Rows per DELETE statement in [`SecretsManager::cleanup_audit_logs`]
+/// (2026-09-10). Per-crate constant, deliberately: the five crates carrying
+/// a batched sweep share no leaf dependency that could host it; the value
+/// matches `talos-advanced-repository`'s `RETENTION_BATCH`.
+const SWEEP_BATCH: i64 = 5000;
+
+/// Batches one cleanup call will issue before reporting `truncated`. Matches
+/// `talos-advanced-repository`'s `MAX_BATCHES_PER_SWEEP`.
+const MAX_SWEEP_BATCHES: u32 = 20;
+
+/// Outcome of an audit-log cleanup call.
+///
+/// The two arms are DIFFERENT answers and must not be collapsed: one says
+/// "nothing may ever be deleted here, by policy", the other says how much
+/// was. Rendering the first as `rows: 0` would read as "nothing was old
+/// enough".
+#[must_use]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuditLogCleanup {
+    /// The table carries the `prevent_audit_modification` trigger: it is
+    /// append-only by security policy and no DELETE was attempted.
+    ImmutableByPolicy,
+    /// Rows deleted, and whether the per-call batch cap stopped the sweep
+    /// with a full last batch (more to do next call).
+    Deleted { rows: u64, truncated: bool },
+}
+
+/// Does `table` carry an enabled, non-internal trigger bound to
+/// `prevent_audit_modification()`? Read from the catalog rather than
+/// classified from a `42501` after the fact — presence is a positive finding
+/// (the `pg_stat_statements` package's rule), and the DELETE is never issued
+/// against a table that would refuse it.
+async fn audit_table_is_immutable(pool: &Pool<Postgres>, table: &str) -> Result<bool> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS ( \
+             SELECT 1 FROM pg_trigger t \
+             JOIN pg_class c ON c.oid = t.tgrelid \
+             JOIN pg_proc p ON p.oid = t.tgfoid \
+             WHERE c.relname::text = $1 \
+               AND p.proname = 'prevent_audit_modification' \
+               AND NOT t.tgisinternal \
+               AND t.tgenabled <> 'D' \
+         )",
+    )
+    .bind(table)
+    .fetch_one(pool)
+    .await
+    .context("audit_table_is_immutable")
+}
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -3157,23 +3207,67 @@ impl SecretsManager {
     /// boundary so future callsites can't reintroduce the destructive
     /// shape — current production callers route through
     /// `positive_env_or_default` so this branch is unreachable today.
-    pub async fn cleanup_audit_logs(&self, retention_days: i64) -> Result<u64> {
+    ///
+    /// **`secret_audit_log` is append-only by policy (2026-09-10 finding).**
+    /// Migration `20260408000001` put the `prevent_audit_modification`
+    /// BEFORE DELETE trigger on it, so every call this function has made
+    /// since then raised `42501` — logged as an ERROR at 02:00 daily and
+    /// deleting nothing. This function now READS that policy from the
+    /// catalog first and returns [`AuditLogCleanup::ImmutableByPolicy`]
+    /// without issuing a DELETE, so the caller can log the fact once at
+    /// INFO instead of an ERROR that fires forever on a healthy fleet (the
+    /// check-69 class). If an operator has deliberately DROPPED the trigger,
+    /// the delete runs — batched, `SWEEP_BATCH` rows per statement, capped
+    /// per call — and reports its count.
+    pub async fn cleanup_audit_logs(&self, retention_days: i64) -> Result<AuditLogCleanup> {
         if retention_days <= 0 {
             tracing::warn!(
                 target: "talos_audit",
                 retention_days,
                 "secret-audit cleanup refused: retention_days must be positive (would purge entire log)"
             );
-            return Ok(0);
+            return Ok(AuditLogCleanup::Deleted {
+                rows: 0,
+                truncated: false,
+            });
         }
-        let result = sqlx::query(
-            "DELETE FROM secret_audit_log WHERE timestamp < NOW() - INTERVAL '1 day' * $1",
-        )
-        .bind(retention_days)
-        .execute(&self.db_pool)
-        .await?;
-
-        Ok(result.rows_affected())
+        if audit_table_is_immutable(&self.db_pool, "secret_audit_log").await? {
+            return Ok(AuditLogCleanup::ImmutableByPolicy);
+        }
+        let days: i32 = retention_days.clamp(1, i32::MAX as i64) as i32;
+        let sql = format!(
+            "DELETE FROM secret_audit_log WHERE id IN ( \
+                 SELECT id FROM secret_audit_log \
+                 WHERE \"timestamp\" < NOW() - make_interval(days => $1::int) \
+                 ORDER BY \"timestamp\", id \
+                 LIMIT {SWEEP_BATCH} \
+                 FOR UPDATE SKIP LOCKED \
+             )"
+        );
+        let mut rows = 0u64;
+        for batch in 0..MAX_SWEEP_BATCHES {
+            let n = sqlx::query(&sql)
+                .bind(days)
+                .execute(&self.db_pool)
+                .await
+                .map(|r| r.rows_affected())
+                .context("cleanup_secret_audit_logs")?;
+            rows += n;
+            if n < SWEEP_BATCH as u64 {
+                break;
+            }
+            if batch + 1 == MAX_SWEEP_BATCHES {
+                return Ok(AuditLogCleanup::Deleted {
+                    rows,
+                    truncated: true,
+                });
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        Ok(AuditLogCleanup::Deleted {
+            rows,
+            truncated: false,
+        })
     }
 
     // ── Namespace + expiry management ───────────────────────────────────────

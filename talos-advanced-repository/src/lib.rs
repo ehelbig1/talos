@@ -440,6 +440,75 @@ pub const TERMINAL_EXECUTION_STATUSES: &[&str] = &["completed", "failed", "cance
 /// outage, without an N+1.
 const RETENTION_BATCH: i64 = 5000;
 
+/// Upper bound on the number of batches ONE tick will issue per statement
+/// family (2026-09-10). Before this cap every loop in this file ran to
+/// exhaustion, so the first tick after a long outage — or after an operator
+/// shortened a window — held the pool for as long as the backlog took.
+/// 20 × 5000 = 100 000 rows per tier per 6-hourly tick; the reference fleet
+/// writes ~5 000 executions / 30 days, so the cap binds only on a backlog,
+/// and a backlog now drains ACROSS ticks instead of inside one.
+///
+/// Every sweep reports whether it stopped here ([`BatchedSweep::truncated`])
+/// so the caller can tell "nothing left" from "stopped at the cap" — the two
+/// were one number before, and one of them means the table is still growing.
+///
+/// Per-crate constant, deliberately: the five crates carrying a batched sweep
+/// (`talos-memory`, `talos-auth`, `talos-secrets-manager`,
+/// `talos-child-run-ledger`, this one) share no leaf dependency that could
+/// host it, and adding a dependency edge for one integer is the wrong trade.
+/// The value is the same in each and each says so.
+const MAX_BATCHES_PER_SWEEP: u32 = 20;
+
+/// Rows affected by one batched sweep, and whether it stopped at
+/// [`MAX_BATCHES_PER_SWEEP`] with the last batch still FULL — i.e. there is
+/// (probably) more to do next tick.
+///
+/// `#[must_use]`: dropping this drops the truncation verdict, and a sweep that
+/// silently stops short of its backlog every tick is a table that grows while
+/// the log says "swept".
+#[must_use]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BatchedSweep {
+    /// Rows moved or deleted by this sweep (sum over its batches).
+    pub rows: u64,
+    /// `true` when the sweep issued [`MAX_BATCHES_PER_SWEEP`] batches and the
+    /// last one was full. `false` means the backlog was drained.
+    pub truncated: bool,
+}
+
+/// Run `sql` — a DELETE / move statement whose ONLY bind is `$1 = days` and
+/// whose row selection carries `LIMIT {RETENTION_BATCH}` — until a batch comes
+/// back short or the per-tick cap is reached. The one loop every tier in this
+/// file uses, so the cap cannot be forgotten on a new tier.
+async fn run_batched(
+    pool: &PgPool,
+    sql: &str,
+    days: i32,
+    context: &'static str,
+) -> Result<BatchedSweep> {
+    let mut out = BatchedSweep::default();
+    for batch in 0..MAX_BATCHES_PER_SWEEP {
+        let n = sqlx::query(sql)
+            .bind(days)
+            .execute(pool)
+            .await
+            .map(|r| r.rows_affected())
+            .context(context)?;
+        out.rows += n;
+        if n < RETENTION_BATCH as u64 {
+            return Ok(out);
+        }
+        if batch + 1 == MAX_BATCHES_PER_SWEEP {
+            out.truncated = true;
+            return Ok(out);
+        }
+        // Yield between batches so a large sweep does not monopolise the
+        // pool.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Ok(out)
+}
+
 /// The archival column list as SQL. Used verbatim on BOTH sides of the
 /// `INSERT ... SELECT`, so the two halves cannot drift from each other.
 ///
@@ -457,6 +526,21 @@ pub fn archived_execution_column_sql() -> String {
 /// `extra_predicate` is appended to the victim selection; it is only ever a
 /// compile-time literal from this module (the user-scoped path adds an
 /// owner clause), never caller input.
+///
+/// **`execution_state` rides along (2026-09-10).** The table is written by the
+/// `talos.state.write` subscriber, keyed `(execution_id, key)`, and carries
+/// NO foreign key to `workflow_executions` — so the archival move, which
+/// CASCADEs `execution_events` and `workflow_execution_logs`, left every
+/// state row of every archived execution behind forever. A terminal
+/// execution never reads its durable state again (resume is for in-flight
+/// rows, and the victim predicate is terminal-only), so the rows are dead the
+/// moment the move commits. They are deleted in the SAME statement, on the
+/// SAME `victims` set, so an execution can never be archived with its state
+/// left live nor have its state deleted while it stays live. The
+/// data-modifying CTE runs to completion whether or not the outer INSERT
+/// reads it (Postgres executes every `WITH` DML exactly once).
+/// `rows_affected` is still the outer INSERT's count — the batch-termination
+/// test above it is unchanged.
 fn archive_move_sql(extra_predicate: &str) -> String {
     let cols = archived_execution_column_sql();
     let statuses = TERMINAL_EXECUTION_STATUSES
@@ -478,6 +562,9 @@ fn archive_move_sql(extra_predicate: &str) -> String {
              DELETE FROM workflow_executions \
              WHERE id IN (SELECT id FROM victims) \
              RETURNING {cols} \
+         ), state_gone AS ( \
+             DELETE FROM execution_state \
+             WHERE execution_id IN (SELECT id FROM victims) \
          ) \
          INSERT INTO workflow_executions_archive ({cols}) SELECT {cols} FROM archived",
         batch = RETENTION_BATCH
@@ -759,6 +846,125 @@ pub struct RetentionPassOutcome {
     /// two above: `Some(_)` with `0` and `None` with `0` are different
     /// answers, and collapsing them is what hid a five-month outage.
     pub ledger_purge_error: Option<String>,
+    /// The archival tier stopped at [`MAX_BATCHES_PER_SWEEP`] with a full
+    /// last batch — the live table is still over its window and the next
+    /// tick continues. Reported rather than looped-to-exhaustion so a
+    /// backlog costs many short holds on the pool, not one long one.
+    pub archive_truncated: bool,
+    /// Same verdict for the purge tier.
+    pub purge_truncated: bool,
+    /// Same verdict for the child-run ledger tier.
+    pub ledger_truncated: bool,
+    /// Tier FOUR (2026-09-10): the execution side tables that had a writer
+    /// and no reaper — `llm_usage`, `judge_scores` (both clocked on the
+    /// TOTAL execution lifetime, because `JUDGE_SCORE_MAX_WINDOW_DAYS` = 31
+    /// is wider than the 30-day archive window and the weekly reports read
+    /// across it) and orphaned `execution_state` rows left behind by
+    /// executions archived BEFORE the move started deleting state.
+    pub side_tables: Option<SideTableReap>,
+    /// Why tier four could not run, if it could not.
+    pub side_table_error: Option<String>,
+    /// Tier FIVE (2026-09-10): the age-based audit-table reaper
+    /// (`actor_action_log`, `module_update_history`, resolved `ops_alerts`),
+    /// clocked on [`audit_table_retention_days`]. `admin_event_log` is NOT
+    /// here: it carries the `prevent_audit_modification` trigger and is
+    /// permanent by policy — see [`AuditTableReap`].
+    pub audit_tables: Option<AuditTableReap>,
+    /// Why tier five could not run, if it could not.
+    pub audit_table_error: Option<String>,
+    /// The retention tier five ran under (after the ≥ 30-day clamp), or
+    /// `None` if the pass did not run.
+    pub audit_retention_days: Option<i32>,
+}
+
+/// What tier four deleted. Each field is a separate table so a failure in
+/// one statement (they run in sequence, and the first error aborts the tier)
+/// leaves the counts of the tables that DID sweep visible.
+#[must_use]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SideTableReap {
+    /// `execution_state` rows whose execution is in neither the live table
+    /// nor in flight — left behind before the archival move started
+    /// deleting state, or written by a sandbox run that has no execution
+    /// row. Age-guarded by [`ORPHAN_STATE_GRACE_DAYS`] so a row written a
+    /// moment before its execution row commits is never mistaken for one.
+    pub execution_state_orphans: u64,
+    /// `llm_usage` rows older than the total execution lifetime.
+    pub llm_usage: u64,
+    /// `judge_scores` rows older than the total execution lifetime.
+    pub judge_scores: u64,
+    /// Any of the three stopped at the per-tick cap with a full last batch.
+    pub truncated: bool,
+}
+
+/// What tier five deleted.
+///
+/// **What is deliberately NOT in this struct.** `admin_event_log`,
+/// `auth_audit_log`, `secret_audit_log` and `audit_events` carry the
+/// `prevent_audit_modification` BEFORE DELETE trigger (migration
+/// `20260408000001`): a DELETE against any of them raises `42501` by security
+/// policy. They are permanent, and this reaper does not fight the trigger.
+#[must_use]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AuditTableReap {
+    /// `actor_action_log` rows older than the retention (clocked on
+    /// `"timestamp"`).
+    pub actor_action_log: u64,
+    /// `module_update_history` rows older than the retention (`created_at`).
+    pub module_update_history: u64,
+    /// `ops_alerts` rows in `status = 'resolved'` whose `resolved_at` is
+    /// older than the retention. Active (`new` / `acked`) alerts are never
+    /// touched, however old.
+    pub ops_alerts_resolved: u64,
+    /// Any of the three stopped at the per-tick cap with a full last batch.
+    pub truncated: bool,
+}
+
+/// Default for `TALOS_AUDIT_TABLE_RETENTION_DAYS`.
+pub const DEFAULT_AUDIT_TABLE_RETENTION_DAYS: i32 = 180;
+
+/// Floor for `TALOS_AUDIT_TABLE_RETENTION_DAYS`. A typo (`18` for `180`) must
+/// not wipe six months of an actor's action history: any configured value
+/// below this is raised to it, with a WARN naming both numbers.
+pub const MIN_AUDIT_TABLE_RETENTION_DAYS: i32 = 30;
+
+/// Age below which an `execution_state` row with no live execution is NOT
+/// treated as an orphan. The state RPC can land a row in the same second the
+/// execution row is being created; one day is three orders of magnitude of
+/// margin over that.
+pub const ORPHAN_STATE_GRACE_DAYS: i32 = 1;
+
+/// Resolve tier five's window: `TALOS_AUDIT_TABLE_RETENTION_DAYS`, default
+/// [`DEFAULT_AUDIT_TABLE_RETENTION_DAYS`], never below
+/// [`MIN_AUDIT_TABLE_RETENTION_DAYS`]. Non-positive and unparseable values
+/// fall to the default through `positive_env_or_default` (which warns);
+/// values in `1..30` are clamped UP here (which also warns).
+#[must_use]
+pub fn audit_table_retention_days() -> i32 {
+    let configured = talos_config::positive_env_or_default::<i32>(
+        "TALOS_AUDIT_TABLE_RETENTION_DAYS",
+        DEFAULT_AUDIT_TABLE_RETENTION_DAYS,
+    );
+    clamp_audit_table_retention_days(configured)
+}
+
+/// The clamp half of [`audit_table_retention_days`], separated so it can be
+/// tested without touching the process environment.
+#[must_use]
+pub fn clamp_audit_table_retention_days(configured: i32) -> i32 {
+    if configured < MIN_AUDIT_TABLE_RETENTION_DAYS {
+        tracing::warn!(
+            target: "talos_config",
+            event_kind = "audit_table_retention_clamped",
+            configured,
+            floor = MIN_AUDIT_TABLE_RETENTION_DAYS,
+            "TALOS_AUDIT_TABLE_RETENTION_DAYS={configured} is below the {MIN_AUDIT_TABLE_RETENTION_DAYS}-day floor; \
+             using the floor so a typo cannot wipe an audit trail"
+        );
+        MIN_AUDIT_TABLE_RETENTION_DAYS
+    } else {
+        configured
+    }
 }
 
 impl RetentionPassOutcome {
@@ -851,16 +1057,103 @@ impl RetentionPassOutcome {
                  trimmed and will grow without bound until this succeeds"
             );
         }
+        // Tier four / five (2026-09-10). Same rule as above: a count and an
+        // error are different answers and both are reported.
+        if let Some(s) = &self.side_tables {
+            if s.execution_state_orphans + s.llm_usage + s.judge_scores > 0 {
+                tracing::info!(
+                    target: "talos_engine",
+                    event_kind = "execution_side_tables_reaped",
+                    execution_state_orphans = s.execution_state_orphans,
+                    llm_usage = s.llm_usage,
+                    judge_scores = s.judge_scores,
+                    lifetime_days = self
+                        .windows
+                        .map_or(-1, |w| w.archive_after_days.saturating_add(w.purge_after_days)),
+                    "reaped execution side-table rows past the total execution lifetime"
+                );
+            }
+        }
+        if let Some(e) = &self.side_table_error {
+            tracing::error!(
+                target: "talos_engine",
+                event_kind = "execution_side_tables_reap_failed",
+                error = %e,
+                "execution side-table reap FAILED — llm_usage / judge_scores / orphaned \
+                 execution_state are NOT being trimmed until this succeeds"
+            );
+        }
+        if let Some(a) = &self.audit_tables {
+            if a.actor_action_log + a.module_update_history + a.ops_alerts_resolved > 0 {
+                tracing::info!(
+                    target: "talos_engine",
+                    event_kind = "audit_tables_reaped",
+                    actor_action_log = a.actor_action_log,
+                    module_update_history = a.module_update_history,
+                    ops_alerts_resolved = a.ops_alerts_resolved,
+                    retention_days = self.audit_retention_days.unwrap_or(-1),
+                    "reaped audit-table rows past TALOS_AUDIT_TABLE_RETENTION_DAYS"
+                );
+            }
+        }
+        if let Some(e) = &self.audit_table_error {
+            tracing::error!(
+                target: "talos_engine",
+                event_kind = "audit_tables_reap_failed",
+                error = %e,
+                "audit-table reap FAILED — actor_action_log / module_update_history / \
+                 resolved ops_alerts are NOT being trimmed until this succeeds"
+            );
+        }
+        // Truncation is INFO, not WARN: it means the cap did its job. It is
+        // logged because "swept N" with a backlog behind it reads as "done".
+        let truncated: Vec<&str> = [
+            (self.archive_truncated, "archive"),
+            (self.purge_truncated, "purge"),
+            (self.ledger_truncated, "child_run_ledger"),
+            (self.side_tables.is_some_and(|s| s.truncated), "side_tables"),
+            (
+                self.audit_tables.is_some_and(|a| a.truncated),
+                "audit_tables",
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(t, name)| t.then_some(name))
+        .collect();
+        if !truncated.is_empty() {
+            tracing::info!(
+                target: "talos_engine",
+                event_kind = "retention_tier_truncated",
+                truncated = true,
+                tiers = ?truncated,
+                max_batches = MAX_BATCHES_PER_SWEEP,
+                batch = RETENTION_BATCH,
+                "retention tier(s) stopped at the per-tick batch cap with a full last \
+                 batch; the backlog continues next tick"
+            );
+        }
     }
 }
 
 impl RetentionPassOutcome {
-    /// Did either tier fail?
+    /// Did any tier fail?
     #[must_use]
     pub fn failed(&self) -> bool {
         self.archive_error.is_some()
             || self.purge_error.is_some()
             || self.ledger_purge_error.is_some()
+            || self.side_table_error.is_some()
+            || self.audit_table_error.is_some()
+    }
+
+    /// Did any tier stop at the per-tick batch cap with work left?
+    #[must_use]
+    pub fn truncated(&self) -> bool {
+        self.archive_truncated
+            || self.purge_truncated
+            || self.ledger_truncated
+            || self.side_tables.is_some_and(|s| s.truncated)
+            || self.audit_tables.is_some_and(|a| a.truncated)
     }
 }
 
@@ -877,8 +1170,21 @@ pub async fn run_retention_pass(
     repo: &AdvancedRepository,
     windows: RetentionWindows,
 ) -> RetentionPassOutcome {
+    run_retention_pass_with_audit_retention(repo, windows, audit_table_retention_days()).await
+}
+
+/// [`run_retention_pass`] with tier five's window passed in rather than read
+/// from the environment — the form the tests drive, so the ≥ 30-day clamp
+/// and the reaper can be exercised without touching process env.
+pub async fn run_retention_pass_with_audit_retention(
+    repo: &AdvancedRepository,
+    windows: RetentionWindows,
+    audit_retention_days: i32,
+) -> RetentionPassOutcome {
+    let audit_retention_days = clamp_audit_table_retention_days(audit_retention_days);
     let mut outcome = RetentionPassOutcome {
         windows: Some(windows),
+        audit_retention_days: Some(audit_retention_days),
         ..RetentionPassOutcome::default()
     };
 
@@ -886,14 +1192,20 @@ pub async fn run_retention_pass(
         .sweep_archive_executions(windows.archive_after_days)
         .await
     {
-        Ok(n) => outcome.archived = n,
+        Ok(s) => {
+            outcome.archived = s.rows;
+            outcome.archive_truncated = s.truncated;
+        }
         Err(e) => outcome.archive_error = Some(format!("{e:#}")),
     }
     match repo
         .purge_archived_executions(windows.purge_after_days)
         .await
     {
-        Ok(n) => outcome.purged = n,
+        Ok(s) => {
+            outcome.purged = s.rows;
+            outcome.purge_truncated = s.truncated;
+        }
         Err(e) => outcome.purge_error = Some(format!("{e:#}")),
     }
     // RFC 0012's third tier. Clocked on the TOTAL lifetime, not on either
@@ -902,16 +1214,29 @@ pub async fn run_retention_pass(
     // `archive_after_days` would delete the record of a child run while its
     // parent is still readable in the archive. Its failure does not abort the
     // others and is reported like theirs.
-    match repo
-        .purge_child_run_ledger(
-            windows
-                .archive_after_days
-                .saturating_add(windows.purge_after_days),
-        )
-        .await
-    {
-        Ok(n) => outcome.ledger_purged = n,
+    let total_lifetime_days = windows
+        .archive_after_days
+        .saturating_add(windows.purge_after_days);
+    match repo.purge_child_run_ledger(total_lifetime_days).await {
+        Ok(s) => {
+            outcome.ledger_purged = s.rows;
+            outcome.ledger_truncated = s.truncated;
+        }
         Err(e) => outcome.ledger_purge_error = Some(format!("{e:#}")),
+    }
+    // Tier four (2026-09-10): the execution side tables, on the same total
+    // lifetime and for the same reason — `llm_usage` and `judge_scores` have
+    // no FK and no archive, and the weekly judge report reads a 31-day window
+    // that the 30-day archive window would cut into.
+    match repo.reap_execution_side_tables(total_lifetime_days).await {
+        Ok(s) => outcome.side_tables = Some(s),
+        Err(e) => outcome.side_table_error = Some(format!("{e:#}")),
+    }
+    // Tier five (2026-09-10): the age-based audit-table reaper, on its OWN
+    // window — these tables are not keyed on an execution's lifetime.
+    match repo.reap_audit_tables(audit_retention_days).await {
+        Ok(a) => outcome.audit_tables = Some(a),
+        Err(e) => outcome.audit_table_error = Some(format!("{e:#}")),
     }
 
     outcome
@@ -1207,33 +1532,22 @@ impl AdvancedRepository {
     /// wrote `if let Ok(r) = result`, which discarded a parse error that had
     /// been raised on every tick for five months; the whole defect was
     /// invisible because of that one line.
-    pub async fn sweep_archive_executions(&self, days: i32) -> Result<u64> {
+    pub async fn sweep_archive_executions(&self, days: i32) -> Result<BatchedSweep> {
         if days <= 0 {
             tracing::warn!(
                 target: "talos_audit",
                 days,
                 "archival sweep refused: days must be positive (would archive every non-pinned execution)"
             );
-            return Ok(0);
+            return Ok(BatchedSweep::default());
         }
-        let sql = archive_move_sql("");
-        let mut total = 0u64;
-        loop {
-            let moved = sqlx::query(&sql)
-                .bind(days)
-                .execute(&self.db_pool)
-                .await
-                .map(|r| r.rows_affected())
-                .context("sweep_archive_executions")?;
-            total += moved;
-            if moved < RETENTION_BATCH as u64 {
-                break;
-            }
-            // Yield between batches so a large first sweep does not
-            // monopolise the pool.
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        Ok(total)
+        run_batched(
+            &self.db_pool,
+            &archive_move_sql(""),
+            days,
+            "sweep_archive_executions",
+        )
+        .await
     }
 
     /// Fleet-wide purge: delete archived executions kept longer than
@@ -1250,14 +1564,14 @@ impl AdvancedRepository {
     ///   whole path (the cleanup loop had no `is_pinned` reference at all);
     /// * terminal statuses only, so a `running` / `resuming` / `pending`
     ///   row can never be purged even if one somehow reached the archive.
-    pub async fn purge_archived_executions(&self, days: i32) -> Result<u64> {
+    pub async fn purge_archived_executions(&self, days: i32) -> Result<BatchedSweep> {
         if days <= 0 {
             tracing::warn!(
                 target: "talos_audit",
                 days,
                 "archive purge refused: days must be positive (would delete the whole archive)"
             );
-            return Ok(0);
+            return Ok(BatchedSweep::default());
         }
         let statuses = TERMINAL_EXECUTION_STATUSES
             .iter()
@@ -1276,21 +1590,7 @@ impl AdvancedRepository {
              )",
             batch = RETENTION_BATCH
         );
-        let mut total = 0u64;
-        loop {
-            let deleted = sqlx::query(&sql)
-                .bind(days)
-                .execute(&self.db_pool)
-                .await
-                .map(|r| r.rows_affected())
-                .context("purge_archived_executions")?;
-            total += deleted;
-            if deleted < RETENTION_BATCH as u64 {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        Ok(total)
+        run_batched(&self.db_pool, &sql, days, "purge_archived_executions").await
     }
 
     /// Tier three of the retention path: trim the child-run ledger
@@ -1308,10 +1608,167 @@ impl AdvancedRepository {
     /// # Errors
     /// Any database failure, propagated rather than swallowed — the same
     /// reason the two tiers above propagate theirs.
-    pub async fn purge_child_run_ledger(&self, days: i32) -> Result<u64> {
-        talos_child_run_ledger::ChildRunLedger::new(self.db_pool.clone())
+    pub async fn purge_child_run_ledger(&self, days: i32) -> Result<BatchedSweep> {
+        let purge = talos_child_run_ledger::ChildRunLedger::new(self.db_pool.clone())
             .purge_older_than(days)
-            .await
+            .await?;
+        Ok(BatchedSweep {
+            rows: purge.rows,
+            truncated: purge.truncated,
+        })
+    }
+
+    /// Tier four of the retention path (2026-09-10): the execution side
+    /// tables that had a writer and no reaper.
+    ///
+    /// * `llm_usage` (clocked on `recorded_at`) and `judge_scores`
+    ///   (`created_at`) are deleted past `days` = the TOTAL execution
+    ///   lifetime. Neither has an FK to `workflow_executions` nor an archive,
+    ///   and both are read by trailing-window reports — the widest,
+    ///   `JUDGE_SCORE_MAX_WINDOW_DAYS` = 31, exceeds the 30-day archive
+    ///   window, which is why they are NOT reaped at archival time. Rows with
+    ///   `execution_id IS NULL` (controller-side scaffolding usage) age out on
+    ///   the same clock, so nothing in either table is permanent.
+    /// * `execution_state` rows with no LIVE execution and older than
+    ///   [`ORPHAN_STATE_GRACE_DAYS`]: the population left behind by every
+    ///   execution archived before the move started deleting state (see
+    ///   [`archive_move_sql`]), plus any sandbox run that wrote state without
+    ///   an execution row. `days` is not used for this statement.
+    ///
+    /// Statements run in sequence; the first `Err` aborts the tier and is
+    /// propagated, with the counts of the tables that DID sweep lost for that
+    /// tick — acceptable, since the next tick repeats them.
+    pub async fn reap_execution_side_tables(&self, days: i32) -> Result<SideTableReap> {
+        if days <= 0 {
+            tracing::warn!(
+                target: "talos_audit",
+                days,
+                "side-table reap refused: days must be positive (would delete every llm_usage / judge_scores row)"
+            );
+            return Ok(SideTableReap::default());
+        }
+        let llm_sql = format!(
+            "DELETE FROM llm_usage WHERE id IN ( \
+                 SELECT id FROM llm_usage \
+                 WHERE recorded_at < NOW() - make_interval(days => $1::int) \
+                 ORDER BY recorded_at, id \
+                 LIMIT {batch} \
+                 FOR UPDATE SKIP LOCKED \
+             )",
+            batch = RETENTION_BATCH
+        );
+        let judge_sql = format!(
+            "DELETE FROM judge_scores WHERE id IN ( \
+                 SELECT id FROM judge_scores \
+                 WHERE created_at < NOW() - make_interval(days => $1::int) \
+                 ORDER BY created_at, id \
+                 LIMIT {batch} \
+                 FOR UPDATE SKIP LOCKED \
+             )",
+            batch = RETENTION_BATCH
+        );
+        // Anti-join on the LIVE table only: an archived execution's state is
+        // dead (terminal, never resumed), which is exactly why the archival
+        // move deletes it — this statement is the backfill for rows archived
+        // before it did, and the catch-all for rows with no execution at all.
+        let orphan_sql = format!(
+            "DELETE FROM execution_state WHERE (execution_id, key) IN ( \
+                 SELECT es.execution_id, es.key FROM execution_state es \
+                 WHERE es.updated_at < NOW() - make_interval(days => $1::int) \
+                   AND NOT EXISTS ( \
+                       SELECT 1 FROM workflow_executions e WHERE e.id = es.execution_id \
+                   ) \
+                 ORDER BY es.execution_id, es.key \
+                 LIMIT {batch} \
+                 FOR UPDATE SKIP LOCKED \
+             )",
+            batch = RETENTION_BATCH
+        );
+        let llm = run_batched(&self.db_pool, &llm_sql, days, "reap_llm_usage").await?;
+        let judge = run_batched(&self.db_pool, &judge_sql, days, "reap_judge_scores").await?;
+        let orphans = run_batched(
+            &self.db_pool,
+            &orphan_sql,
+            ORPHAN_STATE_GRACE_DAYS,
+            "reap_execution_state_orphans",
+        )
+        .await?;
+        Ok(SideTableReap {
+            execution_state_orphans: orphans.rows,
+            llm_usage: llm.rows,
+            judge_scores: judge.rows,
+            truncated: llm.truncated || judge.truncated || orphans.truncated,
+        })
+    }
+
+    /// Tier five of the retention path (2026-09-10): age-based reaper for the
+    /// audit-shaped tables that grow forever and are NOT immutable by policy.
+    ///
+    /// `days` is refused below [`MIN_AUDIT_TABLE_RETENTION_DAYS`] as a second
+    /// belt under the env clamp in [`audit_table_retention_days`] — a caller
+    /// that bypasses the clamp still cannot wipe an audit trail.
+    ///
+    /// **Not reaped, by design**: `admin_event_log` (and `auth_audit_log`,
+    /// `secret_audit_log`, `audit_events`) carry `prevent_audit_modification`
+    /// and refuse every DELETE with `42501`. This function never names them.
+    pub async fn reap_audit_tables(&self, days: i32) -> Result<AuditTableReap> {
+        if days < MIN_AUDIT_TABLE_RETENTION_DAYS {
+            tracing::warn!(
+                target: "talos_audit",
+                days,
+                floor = MIN_AUDIT_TABLE_RETENTION_DAYS,
+                "audit-table reap refused: days is below the retention floor"
+            );
+            return Ok(AuditTableReap::default());
+        }
+        let action_sql = format!(
+            "DELETE FROM actor_action_log WHERE id IN ( \
+                 SELECT id FROM actor_action_log \
+                 WHERE \"timestamp\" < NOW() - make_interval(days => $1::int) \
+                 ORDER BY \"timestamp\", id \
+                 LIMIT {batch} \
+                 FOR UPDATE SKIP LOCKED \
+             )",
+            batch = RETENTION_BATCH
+        );
+        let history_sql = format!(
+            "DELETE FROM module_update_history WHERE id IN ( \
+                 SELECT id FROM module_update_history \
+                 WHERE created_at < NOW() - make_interval(days => $1::int) \
+                 ORDER BY created_at, id \
+                 LIMIT {batch} \
+                 FOR UPDATE SKIP LOCKED \
+             )",
+            batch = RETENTION_BATCH
+        );
+        let alerts_sql = format!(
+            "DELETE FROM ops_alerts WHERE id IN ( \
+                 SELECT id FROM ops_alerts \
+                 WHERE status = 'resolved' \
+                   AND resolved_at < NOW() - make_interval(days => $1::int) \
+                 ORDER BY resolved_at, id \
+                 LIMIT {batch} \
+                 FOR UPDATE SKIP LOCKED \
+             )",
+            batch = RETENTION_BATCH
+        );
+        let actions =
+            run_batched(&self.db_pool, &action_sql, days, "reap_actor_action_log").await?;
+        let history = run_batched(
+            &self.db_pool,
+            &history_sql,
+            days,
+            "reap_module_update_history",
+        )
+        .await?;
+        let alerts =
+            run_batched(&self.db_pool, &alerts_sql, days, "reap_resolved_ops_alerts").await?;
+        Ok(AuditTableReap {
+            actor_action_log: actions.rows,
+            module_update_history: history.rows,
+            ops_alerts_resolved: alerts.rows,
+            truncated: actions.truncated || history.truncated || alerts.truncated,
+        })
     }
 
     /// List archived executions, optionally filtered by workflow_id.
@@ -3898,6 +4355,64 @@ pub struct RecentExecutionRow {
 }
 
 #[cfg(test)]
+mod audit_retention_clamp_tests {
+    use super::*;
+
+    /// A typo (`18` for `180`) must not wipe six months of an actor's action
+    /// history: the floor wins. Values at or above it pass through.
+    #[test]
+    fn the_audit_retention_floor_wins_over_a_short_window() {
+        assert_eq!(
+            clamp_audit_table_retention_days(1),
+            MIN_AUDIT_TABLE_RETENTION_DAYS
+        );
+        assert_eq!(
+            clamp_audit_table_retention_days(18),
+            MIN_AUDIT_TABLE_RETENTION_DAYS
+        );
+        assert_eq!(
+            clamp_audit_table_retention_days(29),
+            MIN_AUDIT_TABLE_RETENTION_DAYS
+        );
+        assert_eq!(clamp_audit_table_retention_days(30), 30);
+        assert_eq!(clamp_audit_table_retention_days(180), 180);
+        assert_eq!(clamp_audit_table_retention_days(3650), 3650);
+    }
+
+    /// The default sits above the floor, so an unset env is never clamped.
+    #[test]
+    fn the_default_is_above_the_floor() {
+        assert!(DEFAULT_AUDIT_TABLE_RETENTION_DAYS >= MIN_AUDIT_TABLE_RETENTION_DAYS);
+    }
+
+    /// `truncated()` and `failed()` see every tier, including the two added
+    /// 2026-09-10 — a new tier that only one of them knows about is a report
+    /// that lies in one direction.
+    #[test]
+    fn outcome_verdicts_cover_the_new_tiers() {
+        let mut o = RetentionPassOutcome::default();
+        assert!(!o.failed() && !o.truncated());
+        o.side_table_error = Some("x".into());
+        assert!(o.failed());
+        let mut o = RetentionPassOutcome::default();
+        o.audit_table_error = Some("x".into());
+        assert!(o.failed());
+        let mut o = RetentionPassOutcome::default();
+        o.side_tables = Some(SideTableReap {
+            truncated: true,
+            ..SideTableReap::default()
+        });
+        assert!(o.truncated() && !o.failed());
+        let mut o = RetentionPassOutcome::default();
+        o.audit_tables = Some(AuditTableReap {
+            truncated: true,
+            ..AuditTableReap::default()
+        });
+        assert!(o.truncated() && !o.failed());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -4010,16 +4525,57 @@ mod retention_report_tests {
     }
 
     fn quiet() -> RetentionPassOutcome {
-        RetentionPassOutcome {
-            windows: None,
-            skipped_window: None,
-            archived: 0,
-            purged: 0,
-            archive_error: None,
-            purge_error: None,
-            ledger_purged: 0,
-            ledger_purge_error: None,
-        }
+        RetentionPassOutcome::default()
+    }
+
+    /// Tiers four and five (2026-09-10) report like the first three: a
+    /// failure is an ERROR event with its own `event_kind`, so deleting either
+    /// branch of `report()` fails here rather than going quiet in production.
+    #[test]
+    fn a_failed_side_table_or_audit_reap_is_reported_at_error_level() {
+        let out = captured(&RetentionPassOutcome {
+            side_table_error: Some("boom".into()),
+            ..quiet()
+        });
+        assert!(
+            out.contains("ERROR") && out.contains("execution_side_tables_reap_failed"),
+            "{out:?}"
+        );
+        let out = captured(&RetentionPassOutcome {
+            audit_table_error: Some("boom".into()),
+            ..quiet()
+        });
+        assert!(
+            out.contains("ERROR") && out.contains("audit_tables_reap_failed"),
+            "{out:?}"
+        );
+    }
+
+    /// A tier that stopped at the per-tick cap says so — `truncated = true`
+    /// at INFO, naming the tier — and a drained pass emits no such event.
+    #[test]
+    fn a_truncated_tier_is_named_at_info_and_a_drained_pass_is_silent_about_it() {
+        let out = captured(&RetentionPassOutcome {
+            archive_truncated: true,
+            audit_tables: Some(AuditTableReap {
+                truncated: true,
+                ..AuditTableReap::default()
+            }),
+            ..quiet()
+        });
+        assert!(out.contains("retention_tier_truncated"), "{out:?}");
+        assert!(out.contains("truncated=true"), "{out:?}");
+        assert!(
+            out.contains("archive") && out.contains("audit_tables"),
+            "{out:?}"
+        );
+        assert!(
+            !out.contains("ERROR"),
+            "truncation is not a failure: {out:?}"
+        );
+
+        let out = captured(&quiet());
+        assert!(!out.contains("retention_tier_truncated"), "{out:?}");
     }
 
     /// The M6 guard. Reinstating the historical swallow — dropping the

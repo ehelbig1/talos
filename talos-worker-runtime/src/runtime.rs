@@ -2266,6 +2266,9 @@ pub struct TalosRuntime {
 
     /// Redis client for distributed caching (optional)
     redis_client: Option<Arc<redis::Client>>,
+    /// One lazily-built Redis connection shared by every job (2026-09-10) —
+    /// cloned into each per-job `TalosContext::redis_conn_mgr`. See that field.
+    redis_conn_mgr: Arc<tokio::sync::OnceCell<redis::aio::ConnectionManager>>,
     /// In‑process result cache (fast path before Redis).
     ///
     /// Uses `DashMap` for lock-free concurrent reads (no write lock needed).
@@ -3205,6 +3208,7 @@ impl TalosRuntime {
             agent_cache,
             trusted_cache,
             redis_client,
+            redis_conn_mgr: Arc::new(tokio::sync::OnceCell::new()),
             nats_client,
             fs_dir,
             in_memory_result_cache: Arc::new(DashMap::with_capacity(result_cache_cap)),
@@ -3990,6 +3994,8 @@ impl TalosRuntime {
             max_llm_tier,
             egress_scope,
         )?;
+        // Share the runtime's one Redis connection with this job (2026-09-10).
+        context.redis_conn_mgr = self.redis_conn_mgr.clone();
 
         // Adopt the JOB-scoped cancellation flag in place of the private
         // per-attempt one `TalosContext::new` minted. Done FIRST — before any
@@ -4566,6 +4572,8 @@ impl TalosRuntime {
             // No actor → no egress override; tier-derived default (public).
             None,
         )?;
+        // Share the runtime's one Redis connection with this job (2026-09-10).
+        context.redis_conn_mgr = self.redis_conn_mgr.clone();
 
         // Attach OpenTelemetry metrics so host functions can record events.
         if let Some(ref m) = self.metrics {
@@ -5034,6 +5042,8 @@ impl TalosRuntime {
                 max_llm_tier,
                 egress_scope,
             )?;
+            // Share the runtime's one Redis connection with this job (2026-09-10).
+            context.redis_conn_mgr = self.redis_conn_mgr.clone();
             // Adopt the PIPELINE-scoped cancellation flag in place of the
             // private per-step one `TalosContext::new` minted. Done FIRST,
             // before any host wiring, so the very first egress guard in this
@@ -5720,6 +5730,8 @@ impl TalosRuntime {
             // Actor-less AOT path → tier-derived egress default (public).
             None,
         )?;
+        // Share the runtime's one Redis connection with this job (2026-09-10).
+        context.redis_conn_mgr = self.redis_conn_mgr.clone();
 
         // Attach OpenTelemetry metrics so host functions can record events.
         if let Some(ref m) = self.metrics {
