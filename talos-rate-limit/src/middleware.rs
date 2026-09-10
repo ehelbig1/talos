@@ -201,6 +201,12 @@ impl TrustedProxies {
         Self(whitelist)
     }
 
+    /// Build from an explicit whitelist (tests, and callers that resolve the
+    /// CIDR list themselves). `from_env` is the production constructor.
+    pub fn from_whitelist(whitelist: IpWhitelist) -> Self {
+        Self(whitelist)
+    }
+
     /// Returns `true` if `ip` is a trusted proxy.
     pub fn is_trusted(&self, ip: &IpAddr) -> bool {
         self.0.is_whitelisted(ip)

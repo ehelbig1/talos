@@ -20,12 +20,13 @@ use talos_secrets_manager::SecretsManager;
 use talos_worker_fleet::WorkerManager;
 use talos_workflow_engine_core::WorkerSharedKey;
 
-use crate::dlq::{DlqEntry, DlqService};
+use crate::dlq::{self, DlqEntry, DlqService};
 use crate::rate_limiter;
 use crate::rate_limiter::RateLimiter;
+use crate::signature::{self, WebhookAuthOutcome};
 use crate::types::{
     build_module_dispatch_payload, build_webhook_trigger_payload, event_filter_matches,
-    webhook_must_fail_closed_on_hmac, webhook_timestamp_skew_secs, WebhookTrigger,
+    webhook_must_fail_closed_on_hmac, WebhookTrigger,
 };
 use crate::{CircuitBreaker, CircuitBreakerFailureType};
 
@@ -192,6 +193,15 @@ impl WebhookRouter {
 
     /// Enqueue a dropped webhook payload into the dead-letter queue.
     /// Uses the bounded DLQ service with backpressure — never blocks the response path.
+    ///
+    /// `authenticated` records whether the request had passed the auth gate
+    /// (HMAC / verification token / IP allowlist) when it was dropped. It is
+    /// stamped into the stored header map under
+    /// [`dlq::DLQ_AUTHENTICATED_KEY`] and read back by `dispatch_replay`,
+    /// which REFUSES to re-dispatch an unauthenticated entry (F2). Both live
+    /// call sites today are ABOVE the auth gate (circuit-breaker and
+    /// rate-limit drops), so they pass `false`; a future post-auth site is
+    /// the only way an entry becomes replayable.
     fn enqueue_dlq(
         &self,
         trigger_id: Option<Uuid>,
@@ -199,24 +209,13 @@ impl WebhookRouter {
         drop_reason: &'static str,
         headers: &axum::http::HeaderMap,
         body: &axum::body::Bytes,
+        authenticated: bool,
     ) {
-        // Build a sanitized header map (strip auth material).
-        // Rather than maintaining an exact allowlist, pattern-match on substrings that
-        // commonly appear in sensitive headers — this catches custom auth schemes too.
-        fn header_is_sensitive(name: &str) -> bool {
-            let n = name.to_lowercase();
-            n == "cookie"
-                || n.contains("auth")
-                || n.contains("token")
-                || n.contains("secret")
-                || n.contains("key")
-                || n.contains("credential")
-                || n.contains("password")
-                || n.contains("signature")
-        }
+        // Build a sanitized header map (strip auth material). The classifier
+        // is shared with `log_request` — see `signature::header_is_sensitive`.
         let mut header_map = serde_json::Map::new();
         for (name, value) in headers.iter() {
-            if header_is_sensitive(name.as_str()) {
+            if signature::header_is_sensitive(name.as_str()) {
                 // Record presence but not value, so the DLQ entry is debuggable without leaking secrets.
                 header_map.insert(
                     name.to_string(),
@@ -239,6 +238,14 @@ impl WebhookRouter {
                 header_map.insert(name.to_string(), serde_json::Value::String(scrubbed));
             }
         }
+        // Stamped LAST so a sender-supplied header of the same name (header
+        // tokens may contain `_`) is overwritten by the engine's verdict, and
+        // stored as a JSON bool so a string "true" from such a header can
+        // never satisfy the strict `Value::Bool(true)` check on replay.
+        header_map.insert(
+            dlq::DLQ_AUTHENTICATED_KEY.to_string(),
+            serde_json::Value::Bool(authenticated),
+        );
         let headers_json = serde_json::Value::Object(header_map);
 
         // Parse and DLP-scrub the payload
@@ -360,7 +367,9 @@ impl WebhookRouter {
                     ip = %ip,
                     "Circuit breaker open: blocking request from repeatedly-failing IP"
                 );
-                // Persist to DLQ so the payload can be replayed later
+                // Persist to DLQ as a record of the drop. This is ABOVE the
+                // auth gate, so the entry is stamped unauthenticated and
+                // `dispatch_replay` will refuse to re-dispatch it (F2).
                 if !body.is_empty() {
                     self.enqueue_dlq(
                         Some(trigger_id),
@@ -368,6 +377,7 @@ impl WebhookRouter {
                         "circuit_breaker",
                         headers,
                         &body,
+                        false,
                     );
                 }
                 return Ok((StatusCode::TOO_MANY_REQUESTS, "Too many requests").into_response());
@@ -382,11 +392,13 @@ impl WebhookRouter {
                 trigger_id = %trigger_id,
                 "Webhook trigger is disabled"
             );
-            // Trigger disabled counts as auth failure for CB tracking
-            if let Some(ip) = source_ip {
-                self.circuit_breaker
-                    .record_failure_with_type(ip, CircuitBreakerFailureType::TriggerDisabled);
-            }
+            // F3: a disabled trigger is NOT an authentication failure and is
+            // deliberately NOT counted toward the circuit breaker. The
+            // breaker is keyed by source IP, and GitHub / Slack deliver every
+            // tenant's webhooks from one shared IP range — an operator
+            // pausing a trigger that its sender keeps posting to would trip
+            // the breaker for every other tenant behind that IP.
+            // `record_failure_with_type` also refuses non-auth types itself.
             // Same status AND body as the trigger-not-found path so a caller
             // can't distinguish "disabled" from "never existed" (trims the
             // existence/enabled-state oracle; sibling of the MCP-1102
@@ -432,14 +444,22 @@ impl WebhookRouter {
                     "Webhook per-user aggregate rate limit exceeded"
                 );
             }
-            // Sustained hammering indicates abuse; count as a CB failure.
-            if let Some(ip) = source_ip {
-                self.circuit_breaker
-                    .record_failure_with_type(ip, CircuitBreakerFailureType::RateLimitExceeded);
-            }
-            // Persist to DLQ so the payload can be replayed later
+            // F3: a rate-limit hit is NOT an authentication failure and is
+            // deliberately NOT counted toward the IP-keyed circuit breaker —
+            // the per-trigger / per-user limits are already the throttle, and
+            // a shared sender IP (GitHub, Slack) exceeding ONE tenant's
+            // per-trigger limit must not open the breaker for every tenant.
+            // Persist to DLQ as a record of the drop. Pre-auth ⇒ stamped
+            // unauthenticated ⇒ not replayable (F2).
             if !body.is_empty() {
-                self.enqueue_dlq(Some(trigger_id), source_ip, "rate_limit", headers, &body);
+                self.enqueue_dlq(
+                    Some(trigger_id),
+                    source_ip,
+                    "rate_limit",
+                    headers,
+                    &body,
+                    false,
+                );
             }
             self.log_request(
                 trigger_id,
@@ -602,7 +622,12 @@ impl WebhookRouter {
             }
             _ => None,
         };
-        if let Some(ref signing_secret) = decrypted_signing_secret {
+        // F1: the outcome of this gate — WHICH format verified, or that none
+        // was checked — is what the dedup fingerprint below is derived from.
+        // Every failure arm returns, so the chain's value is the outcome.
+        let auth_outcome: WebhookAuthOutcome = if let Some(ref signing_secret) =
+            decrypted_signing_secret
+        {
             // MCP-1100 (2026-05-16): GitHub-format webhooks include no
             // timestamp header, so their HMAC signature is replayable
             // indefinitely without the deduplication store. Slack
@@ -649,30 +674,36 @@ impl WebhookRouter {
                 .await;
                 return Ok((StatusCode::UNAUTHORIZED, "Invalid signature").into_response());
             }
-            // HMAC path — verifies integrity and authenticity of the full payload.
-            if !self.verify_hmac_signature(headers, &body, signing_secret) {
-                tracing::warn!(
-                    trigger_id = %trigger_id,
-                    "HMAC signature verification failed"
-                );
-                if let Some(ip) = source_ip {
-                    self.circuit_breaker
-                        .record_failure_with_type(ip, CircuitBreakerFailureType::InvalidSignature);
+            // HMAC path — verifies integrity and authenticity of the full payload,
+            // and reports WHICH format did so.
+            match signature::verify_hmac_signature(headers, &body, signing_secret) {
+                Some(format) => WebhookAuthOutcome::Hmac(format),
+                None => {
+                    tracing::warn!(
+                        trigger_id = %trigger_id,
+                        "HMAC signature verification failed"
+                    );
+                    if let Some(ip) = source_ip {
+                        self.circuit_breaker.record_failure_with_type(
+                            ip,
+                            CircuitBreakerFailureType::InvalidSignature,
+                        );
+                    }
+                    self.log_request(
+                        trigger_id,
+                        headers,
+                        &body,
+                        source_ip,
+                        StatusCode::UNAUTHORIZED.as_u16() as i32,
+                        None,
+                        0,
+                        0,
+                        false,
+                        Some("Invalid signature"),
+                    )
+                    .await;
+                    return Ok((StatusCode::UNAUTHORIZED, "Invalid signature").into_response());
                 }
-                self.log_request(
-                    trigger_id,
-                    headers,
-                    &body,
-                    source_ip,
-                    StatusCode::UNAUTHORIZED.as_u16() as i32,
-                    None,
-                    0,
-                    0,
-                    false,
-                    Some("Invalid signature"),
-                )
-                .await;
-                return Ok((StatusCode::UNAUTHORIZED, "Invalid signature").into_response());
             }
         } else if webhook_must_fail_closed_on_hmac(
             hmac_configured,
@@ -780,7 +811,12 @@ impl WebhookRouter {
                 .await;
                 return Ok((StatusCode::UNAUTHORIZED, "Invalid verification token").into_response());
             }
-        }
+            WebhookAuthOutcome::StaticToken
+        } else {
+            // Neither a signing secret nor a verification token: the webhook
+            // is open (documented at the top of step 4).
+            WebhookAuthOutcome::Open
+        };
 
         // 4b. RFC 0007 event filter. Evaluated AFTER all signature / verification-
         //     token auth (so unverified input never reaches filter logic) and
@@ -820,9 +856,14 @@ impl WebhookRouter {
         }
 
         // 5. Deduplication: suppress re-delivery of the same webhook within the window.
-        //    Event fingerprint = first recognizable signature header, else SHA-256 of body.
-        //    Using the signature ensures that retries with the same payload are suppressed
-        //    without false-positives for intentionally repeated payloads with different content.
+        //    Event fingerprint = the VERIFIED format's own signature value, else
+        //    SHA-256 of the body (F1). It used to be the first recognisable
+        //    header in a fixed precedence list starting with `x-signature`, so a
+        //    captured GitHub delivery replayed with a fresh random `X-Signature`
+        //    verified via the GitHub branch and deduplicated on the attacker's
+        //    header — every replay a "new" event, against the one format whose
+        //    ONLY replay defence is this lookup. `signature::dedup_fingerprint`
+        //    can only name a header the verifier actually checked.
         //
         // R2-4: `Some(event_id)` once we've taken (recorded) a dedup claim, so a
         // PRE-EXECUTION failure below can release it (begin/abandon) and let the
@@ -830,21 +871,7 @@ impl WebhookRouter {
         // when no dedup backend is configured or the claim wasn't taken.
         let mut dedup_claim: Option<String> = None;
         if let Some(ref dedup) = self.dedup {
-            let raw_event_id: String = headers
-                .get("x-signature")
-                .or_else(|| headers.get("x-hub-signature-256"))
-                .or_else(|| headers.get("x-slack-signature"))
-                .or_else(|| headers.get("x-github-delivery"))
-                .or_else(|| headers.get("x-request-id"))
-                .and_then(|h| h.to_str().ok())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| {
-                    // Fall back to SHA-256 of the body as a stable fingerprint.
-                    use sha2::{Digest, Sha256};
-                    let mut hasher = Sha256::new();
-                    hasher.update(&body);
-                    hex::encode(hasher.finalize())
-                });
+            let raw_event_id: String = signature::dedup_fingerprint(auth_outcome, headers, &body);
 
             // MCP-1101 (2026-05-16): bound the Redis key length by
             // hashing oversized event_ids. Legitimate signature/delivery
@@ -1259,6 +1286,10 @@ impl WebhookRouter {
                         sealing_handle.as_ref(),
                     )
                     .await;
+                    // Reply inbox allocated BEFORE the request is built so it
+                    // is bound into the signature (H-1 parity, see
+                    // `reply_topic` below).
+                    let reply_inbox = nats.new_inbox();
                     // Placeholder secret-delivery fields; `delivery.apply_to`
                     // below writes all four in one drift-proof mapping.
                     let mut req = talos_workflow_job_protocol::JobRequest {
@@ -1305,7 +1336,18 @@ impl WebhookRouter {
                         // MCP-1089: propagate per-module max_fuel.
                         max_fuel: exec_info.max_fuel,
                         dry_run: false,
-                        reply_topic: None,
+                        // 2026-09-10 review (H-1 parity): this was the LAST
+                        // request/reply dispatcher that sent `reply_topic:
+                        // None` and relied on the UNSIGNED NATS wire reply
+                        // header — the one arm the worker still honoured "for
+                        // backward compat". The engine dispatcher has signed
+                        // its inbox since H-1; a bus participant could replay
+                        // a captured webhook job to a sibling worker with its
+                        // OWN reply header and receive the signed module
+                        // output. The inbox is allocated here so it is bound
+                        // into the signature below, and the worker now ignores
+                        // the wire header whenever the signed field is absent.
+                        reply_topic: Some(reply_inbox.clone()),
                         idempotency_key: None,
                         dispatch_attempt: 0,
                         actor_id: resolved_actor,
@@ -1326,7 +1368,11 @@ impl WebhookRouter {
                     }
                     let payload = serde_json::to_vec(&req).map_err(|e| anyhow::anyhow!(e))?;
 
-                    // Request-reply pattern via NATS.
+                    // Request-reply pattern via NATS, on the SIGNED inbox:
+                    // subscribe first, then publish with that inbox as the
+                    // wire reply (the worker publishes to the signed field,
+                    // which equals the wire header here, so either reading
+                    // lands on this subscription).
                     // MCP-1065 (2026-05-15): canonical edge-routing resolver.
                     let topic_to_use = if talos_config::edge_routing_enabled() {
                         talos_workflow_job_protocol::subjects::jobs_for(user_id)
@@ -1334,12 +1380,24 @@ impl WebhookRouter {
                         talos_workflow_job_protocol::subjects::JOBS.to_string()
                     };
 
+                    let mut reply_sub = nats
+                        .subscribe(reply_inbox.clone())
+                        .await
+                        .map_err(|e| anyhow::anyhow!("reply inbox subscribe failed: {}", e))?;
+                    nats.publish_with_reply(topic_to_use, reply_inbox.clone(), payload.into())
+                        .await
+                        .map_err(|e| anyhow::anyhow!("job publish failed: {}", e))?;
+                    // Best-effort flush so the publish does not sit in the
+                    // local outbox while we wait; a failure here surfaces as
+                    // the timeout below.
+                    let _flushed = nats.flush().await;
                     let response = tokio::time::timeout(
                         std::time::Duration::from_secs(3),
-                        nats.request(topic_to_use, payload.into()),
+                        futures::StreamExt::next(&mut reply_sub),
                     )
                     .await
-                    .map_err(|_| anyhow::anyhow!("WASM execution timed out after 3s"))??;
+                    .map_err(|_| anyhow::anyhow!("WASM execution timed out after 3s"))?
+                    .ok_or_else(|| anyhow::anyhow!("reply inbox closed before a result arrived"))?;
 
                     let result: talos_workflow_job_protocol::JobResult =
                         serde_json::from_slice(&response.payload)
@@ -2409,9 +2467,14 @@ impl WebhookRouter {
         .ok_or_else(|| anyhow::anyhow!("Webhook trigger not found"))
     }
 
-    /// Verify HMAC signature from webhook request
-    /// Supports multiple header formats (Slack, GitHub, etc.)
-    // Made public to enable external testing of HMAC verification logic.
+    /// Verify HMAC signature from webhook request.
+    /// Supports multiple header formats (Slack, GitHub, generic).
+    ///
+    /// Thin `bool` wrapper kept for external callers
+    /// (`controller/tests/webhooks_hmac_test.rs`). The live auth gate calls
+    /// `signature::verify_hmac_signature` directly because it needs to know
+    /// WHICH format verified — the dedup fingerprint is derived from that
+    /// format's own header (F1). A caller that only wants yes/no gets it here.
     #[must_use]
     pub fn verify_hmac_signature(
         &self,
@@ -2419,186 +2482,7 @@ impl WebhookRouter {
         body: &Bytes,
         signing_secret: &str,
     ) -> bool {
-        use hmac::{Hmac, Mac};
-        use sha2::Sha256;
-        use subtle::ConstantTimeEq;
-
-        // MCP-628 (2026-05-12): defense-in-depth empty-secret rejection.
-        // `Hmac::<Sha256>::new_from_slice` accepts ANY length key
-        // (including empty) — for HMAC-SHA256 the spec defines the
-        // computation deterministically on every key length. So with
-        // `signing_secret = ""`, the verifier would happily compute
-        // `HMAC-SHA256("", body)` and an attacker who knows the body
-        // could trivially forge a "valid" signature.
-        //
-        // The storage path (MCP `create_webhook` handler) enforces a
-        // 16-char minimum (MCP-202), so empty secrets cannot be stored
-        // via that path. But the runtime should still fail closed in
-        // case a legacy migration / direct-SQL write / future code path
-        // produces an empty secret — the verify function is the last
-        // line of defense and shouldn't trust the storage invariant.
-        if signing_secret.is_empty() {
-            tracing::warn!(
-                target: "talos_webhooks",
-                event_kind = "webhook_hmac_secret_empty",
-                "HMAC signing_secret is empty — failing closed (storage path enforces ≥16 chars; \
-                 a non-empty-then-empty value here means storage was bypassed)"
-            );
-            return false;
-        }
-
-        // Try Slack signature format first (X-Slack-Signature)
-        if let Some(signature) = headers.get("x-slack-signature") {
-            if let Ok(sig_str) = signature.to_str() {
-                // Slack format: v0=<hash>
-                if let Some(hash_hex) = sig_str.strip_prefix("v0=") {
-                    if let Some(timestamp) = headers.get("x-slack-request-timestamp") {
-                        if let Ok(ts_str) = timestamp.to_str() {
-                            // Enforce timestamp freshness (±5 minutes) to prevent replay attacks.
-                            // Slack's own documentation recommends this check.
-                            if let Ok(ts_secs) = ts_str.parse::<i64>() {
-                                let now_secs = std::time::SystemTime::now()
-                                    .duration_since(std::time::UNIX_EPOCH)
-                                    .map(|d| d.as_secs() as i64)
-                                    .unwrap_or(0);
-                                // Overflow-free skew (see webhook_timestamp_skew_secs).
-                                if webhook_timestamp_skew_secs(now_secs, ts_secs) > 300 {
-                                    tracing::warn!(
-                                        timestamp = ts_secs,
-                                        now = now_secs,
-                                        "Slack request timestamp is outside the ±5 minute window — replay attack?"
-                                    );
-                                    return false;
-                                }
-                            } else {
-                                tracing::warn!(
-                                    "Slack X-Slack-Request-Timestamp is not a valid integer"
-                                );
-                                return false;
-                            }
-
-                            // Create basestring: version:timestamp:body
-                            let base_string = format!("v0:{}:", ts_str);
-                            let mut full_message = base_string.into_bytes();
-                            full_message.extend_from_slice(body);
-
-                            // Compute HMAC
-                            let mut mac =
-                                match Hmac::<Sha256>::new_from_slice(signing_secret.as_bytes()) {
-                                    Ok(m) => m,
-                                    Err(_) => {
-                                        tracing::error!("Invalid HMAC secret size");
-                                        return false;
-                                    }
-                                };
-                            mac.update(&full_message);
-                            let result = mac.finalize();
-                            let expected = hex::encode(result.into_bytes());
-
-                            return expected.as_bytes().ct_eq(hash_hex.as_bytes()).unwrap_u8() == 1;
-                        }
-                    }
-                }
-            }
-        }
-
-        // Try GitHub signature format (X-Hub-Signature-256)
-        if let Some(signature) = headers.get("x-hub-signature-256") {
-            if let Ok(sig_str) = signature.to_str() {
-                if let Some(hash_hex) = sig_str.strip_prefix("sha256=") {
-                    let mut mac = match Hmac::<Sha256>::new_from_slice(signing_secret.as_bytes()) {
-                        Ok(m) => m,
-                        Err(_) => {
-                            tracing::error!("Invalid HMAC secret size");
-                            return false;
-                        }
-                    };
-                    mac.update(body);
-                    let result = mac.finalize();
-                    let expected = hex::encode(result.into_bytes());
-
-                    return expected.as_bytes().ct_eq(hash_hex.as_bytes()).unwrap_u8() == 1;
-                }
-            }
-        }
-
-        // Try generic X-Signature header
-        if let Some(signature) = headers.get("x-signature") {
-            if let Ok(sig_str) = signature.to_str() {
-                // Enforce timestamp freshness (±5 minutes) to prevent replay attacks.
-                // Senders must include X-Webhook-Timestamp (Unix seconds, UTC).
-                // Requests without a timestamp header are rejected — this is a breaking
-                // change for callers that do not send the header, but prevents indefinite
-                // replay of any captured signed request.
-                let timestamp_valid = if let Some(ts_hdr) = headers.get("x-webhook-timestamp") {
-                    if let Ok(ts_str) = ts_hdr.to_str() {
-                        if let Ok(ts_secs) = ts_str.parse::<i64>() {
-                            let now_secs = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs() as i64)
-                                .unwrap_or(0);
-                            // Overflow-free skew (see webhook_timestamp_skew_secs):
-                            // the timestamp-bound HMAC below is the primary replay
-                            // defense, but the freshness gate must hold on its own.
-                            let skew = webhook_timestamp_skew_secs(now_secs, ts_secs);
-                            if skew > 300 {
-                                tracing::warn!(
-                                    timestamp = ts_secs,
-                                    now = now_secs,
-                                    skew_secs = skew,
-                                    "Generic webhook timestamp outside ±5 minute window — replay attack?"
-                                );
-                                false
-                            } else {
-                                true
-                            }
-                        } else {
-                            tracing::warn!("X-Webhook-Timestamp is not a valid integer");
-                            false
-                        }
-                    } else {
-                        tracing::warn!("X-Webhook-Timestamp header contains non-UTF8 bytes");
-                        false
-                    }
-                } else {
-                    tracing::warn!("Generic webhook HMAC request missing X-Webhook-Timestamp header — replay protection requires this header");
-                    false
-                };
-
-                if !timestamp_valid {
-                    return false;
-                }
-
-                // Include timestamp in the HMAC to bind the signature to a specific
-                // point in time (prevents timestamp-stripping attacks).
-                let ts_bytes = headers
-                    .get("x-webhook-timestamp")
-                    .and_then(|h| h.to_str().ok())
-                    .unwrap_or("")
-                    .as_bytes();
-
-                let mut mac = match Hmac::<Sha256>::new_from_slice(signing_secret.as_bytes()) {
-                    Ok(m) => m,
-                    Err(_) => {
-                        tracing::error!("Invalid HMAC secret size");
-                        return false;
-                    }
-                };
-                // Sign timestamp + body so the signature commits to when the request was made.
-                // Senders must use the same construction: HMAC-SHA256(secret, timestamp + "." + body)
-                mac.update(ts_bytes);
-                mac.update(b".");
-                mac.update(body);
-                let result = mac.finalize();
-                let expected = hex::encode(result.into_bytes());
-
-                return expected.as_bytes().ct_eq(sig_str.as_bytes()).unwrap_u8() == 1;
-            }
-        }
-
-        // No recognized signature header found
-        tracing::warn!("No recognized signature header found in request");
-        false
+        signature::verify_hmac_signature(headers, body, signing_secret).is_some()
     }
 
     async fn update_trigger_stats(
@@ -2666,14 +2550,23 @@ impl WebhookRouter {
         success: bool,
         error_message: Option<&str>,
     ) {
-        // Convert headers to JSON
+        // Convert headers to JSON. F7d: credential-bearing headers
+        // (`X-Verification-Token`, every signature header, Authorization,
+        // cookies, API keys — `signature::header_is_sensitive`, the SAME
+        // classifier `enqueue_dlq` uses) are recorded as PRESENT but never
+        // by value. Pre-fix this map landed the static verification token and
+        // the HMAC signatures in plaintext in `webhook_request_log.headers`,
+        // queryable via `webhookRequestLog`; the DLP pass below is value-shape
+        // based and does not recognise a bare UUID token or a hex signature.
         let headers_json: HashMap<String, String> = headers
             .iter()
             .map(|(k, v)| {
-                (
-                    k.as_str().to_string(),
-                    v.to_str().unwrap_or("[binary]").to_string(),
-                )
+                let value = if signature::header_is_sensitive(k.as_str()) {
+                    "[redacted]".to_string()
+                } else {
+                    v.to_str().unwrap_or("[binary]").to_string()
+                };
+                (k.as_str().to_string(), value)
             })
             .collect();
 
@@ -2840,11 +2733,40 @@ impl WebhookRouter {
     }
 
     /// Re-dispatch a DLQ payload directly to the workflow/module execution path.
-    /// Bypasses circuit-breaker, rate-limiter, IP allowlist, and HMAC verification
-    /// (the payload was already authenticated when first received; it was dropped
-    /// only due to a transient CB/rate-limit condition).
-    pub async fn dispatch_replay(&self, trigger_id: Uuid, body: Vec<u8>) -> Result<()> {
+    /// Bypasses circuit-breaker, rate-limiter, IP allowlist, and HMAC verification —
+    /// which is exactly why it must be handed the entry's stored header map:
+    /// the ONLY thing standing between an attacker's unsigned POST and an
+    /// execution is the [`dlq::DLQ_AUTHENTICATED_KEY`] stamp `enqueue_dlq`
+    /// wrote when the request was dropped (F2).
+    ///
+    /// The old doc comment said "the payload was already authenticated when
+    /// first received; it was dropped only due to a transient CB/rate-limit
+    /// condition". That was false: BOTH live enqueue sites (circuit-breaker,
+    /// rate-limit) sit ABOVE the auth gate, so every row this replayed had
+    /// never had its signature or token checked. A caller who could reach a
+    /// rate-limited trigger's URL could park an arbitrary body in the DLQ and
+    /// wait for an operator to replay it as the trigger's owner.
+    ///
+    /// Two gates, both refusals with a caller-readable reason and NO force
+    /// flag: (1) the entry must carry `authenticated: true` — a legacy row
+    /// (no marker) is treated as unauthenticated, which is also what it was;
+    /// (2) the trigger must be `enabled`, the check the live path has at step
+    /// 1 and replay lacked.
+    pub async fn dispatch_replay(
+        &self,
+        trigger_id: Uuid,
+        body: Vec<u8>,
+        dlq_headers: Option<&serde_json::Value>,
+    ) -> Result<()> {
+        if !dlq::dlq_entry_was_authenticated(dlq_headers) {
+            return Err(anyhow::Error::new(dlq::ReplayRefused::Unauthenticated));
+        }
+
         let trigger = self.get_trigger(trigger_id).await?;
+
+        if !trigger.enabled {
+            return Err(anyhow::Error::new(dlq::ReplayRefused::TriggerDisabled));
+        }
 
         let body_str = std::str::from_utf8(&body).unwrap_or("");
 

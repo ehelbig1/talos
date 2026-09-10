@@ -229,6 +229,20 @@ impl GoogleCalendarService {
         self.create_channel_locks.cleanup();
     }
 
+    /// The per-channel limiter key: `(user_id, channel_id)`, both VERIFIED.
+    ///
+    /// F8: the limiter used to be keyed on the bare `X-Goog-Channel-ID` and
+    /// run BEFORE `verify_channel_token`, so an unauthenticated sender could
+    /// (a) exhaust any channel's 60/min budget by guessing or observing its
+    /// id — the id is not a secret, it appears in Google's own requests — and
+    /// drop the real notifications behind it, and (b) fill the map with
+    /// arbitrary unbounded keys. The key is now built only AFTER the signed
+    /// token has attested `user_id` for that `channel_id`, so a request can
+    /// only ever spend the budget of a channel it can prove it belongs to.
+    pub fn webhook_channel_limit_key(user_id: Uuid, channel_id: &str) -> String {
+        format!("{user_id}:{channel_id}")
+    }
+
     /// Per-channel rate limiter for incoming Google Calendar webhook notifications.
     ///
     /// Google sends up to a few notifications per second in high-activity windows
@@ -236,6 +250,10 @@ impl GoogleCalendarService {
     ///
     /// Returns `true` if the notification is within the rate limit (allow), `false` if it
     /// should be dropped.  The limit is 60 notifications per channel per minute by default.
+    ///
+    /// `channel_id` here is the LIMITER KEY — in production
+    /// [`Self::webhook_channel_limit_key`] over a token-verified `(user_id,
+    /// channel_id)`; never the raw header.
     pub fn allow_webhook_channel(&self, channel_id: &str) -> bool {
         const MAX_PER_MINUTE: u32 = 60;
         const WINDOW_SECS: u64 = 60;

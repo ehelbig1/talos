@@ -17,6 +17,11 @@ ipnetwork = "0.21"
 redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }
 talos-config = { path = "../talos-config" }
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+# F4: the production governor layer keys on the trusted-proxy-resolved client
+# IP via `governor_key::TrustedProxyClientIpKeyExtractor`. `tracing` is forced
+# on so the `KeyExtractor::{name,key_name}` impls are unconditional — cargo
+# unifies features workspace-wide, so this cannot flip underneath the impl.
+tower_governor = { version = "0.8.0", features = ["tracing"] }
 
 [lints]
 workspace = true

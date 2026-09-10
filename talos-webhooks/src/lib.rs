@@ -47,6 +47,7 @@ mod dlq;
 )]
 mod rate_limiter;
 mod router;
+mod signature;
 mod suspension;
 mod types;
 
@@ -58,7 +59,13 @@ pub use approval::{
 };
 pub use approval_actions::{approval_action_apply, approval_action_preview};
 pub use correction::{correction_apply, correction_preview};
-pub use dlq::{DlqMetrics, DlqService};
+pub use dlq::{
+    dlq_entry_was_authenticated, DlqMetrics, DlqService, ReplayRefused, DLQ_AUTHENTICATED_KEY,
+};
 pub use router::{insert_webhook_module_execution, webhook_handler, WebhookRouter};
-pub use suspension::suspension_callback_handler;
+pub use signature::{
+    body_fingerprint, dedup_fingerprint, header_is_sensitive, VerifiedSignatureFormat,
+    WebhookAuthOutcome,
+};
+pub use suspension::{suspension_callback_handler, SUSPENSION_CALLBACK_MAX_BODY_BYTES};
 pub use types::{validate_event_filter, WebhookTrigger};

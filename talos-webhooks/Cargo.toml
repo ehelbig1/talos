@@ -10,6 +10,10 @@ publish.workspace = true
 talos-task-supervision = { path = "../talos-task-supervision" }
 anyhow.workspace = true
 async-nats = "0.47"
+# 2026-09-10: `StreamExt::next` on the signed reply-inbox subscription in
+# `handle_webhook` (the last request/reply dispatcher to stop relying on the
+# unsigned NATS wire reply header).
+futures = "0.3"
 axum = { version = "0.8", features = ["json"] }
 chrono.workspace = true
 dashmap = "6.1"

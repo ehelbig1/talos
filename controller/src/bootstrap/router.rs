@@ -1098,6 +1098,18 @@ pub(crate) async fn cors_middleware(req: Request<axum::body::Body>, next: Next) 
 ///
 /// SECURITY: Returns minimal information to prevent information leakage.
 /// Detailed status is logged server-side only.
+///
+/// F6: `/health` is publicly routed (the frontend's `seedCsrfCookie` and
+/// ad-hoc curl use it), sits in `probe_routes` OUTSIDE every rate limiter,
+/// and is exempted a second time by `is_rate_limit_exempt_path`. Pre-fix each
+/// call did a Postgres round trip AND opened a NEW multiplexed Redis
+/// connection — an unauthenticated, unthrottled amplifier onto both stores.
+/// Now the composite verdict is cached in-process for
+/// [`HEALTH_CACHE_TTL`] and concurrent callers coalesce onto ONE
+/// computation (the cache lock is held across it), and the Redis PING goes
+/// through ONE process-wide `ConnectionManager` that is built lazily and
+/// reconnects on its own. `/live` and `/ready` are untouched: they are the
+/// kubelet's, and a cached answer there would delay a restart.
 pub(crate) async fn health_check(
     Extension(db_pool): Extension<sqlx::PgPool>,
     Extension(redis_client): Extension<Option<std::sync::Arc<redis::Client>>>,
@@ -1105,50 +1117,119 @@ pub(crate) async fn health_check(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     use serde_json::json;
-    use std::time::Duration;
 
+    // Held across the computation on purpose: a probe storm during a slow
+    // (up to 2 s) check waits for that ONE check and then reads its result,
+    // instead of each caller running its own round trips.
+    let mut cache = HEALTH_CACHE.lock().await;
+    let (http_status, status_str) = match cache.as_ref() {
+        Some(snap) if snap.taken_at.elapsed() < HEALTH_CACHE_TTL => (snap.status, snap.body),
+        _ => {
+            let fresh =
+                compute_composite_health(&db_pool, redis_client.as_ref(), nats_client.as_ref())
+                    .await;
+            *cache = Some(HealthSnapshot {
+                status: fresh.0,
+                body: fresh.1,
+                taken_at: std::time::Instant::now(),
+            });
+            fresh
+        }
+    };
+    drop(cache);
+
+    // Return minimal information to prevent information leakage
+    let body = json!({
+        "status": status_str,
+    });
+
+    (http_status, axum::Json(body)).into_response()
+}
+
+/// How long one composite `/health` verdict is served before the stores are
+/// asked again. Two seconds is below any probe or dashboard cadence and
+/// bounds the unauthenticated load on Postgres/Redis to ≤0.5 round trips/s
+/// regardless of request rate.
+const HEALTH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
+struct HealthSnapshot {
+    status: axum::http::StatusCode,
+    body: &'static str,
+    taken_at: std::time::Instant,
+}
+
+static HEALTH_CACHE: tokio::sync::Mutex<Option<HealthSnapshot>> =
+    tokio::sync::Mutex::const_new(None);
+
+/// The ONE Redis connection the health check PINGs over. Built on first use
+/// from the configured client; `ConnectionManager` reconnects transparently,
+/// so a failed PING does not orphan a connection and a later PING recovers.
+/// A construction failure leaves the cell empty (`get_or_try_init`) so the
+/// next probe retries rather than caching the outage forever.
+static HEALTH_REDIS_CONN: tokio::sync::OnceCell<redis::aio::ConnectionManager> =
+    tokio::sync::OnceCell::const_new();
+
+/// The uncached composite check. Each sub-check has a 2-second timeout; the
+/// three run concurrently so the worst case is ~2 s, not 6 s.
+async fn compute_composite_health(
+    db_pool: &sqlx::PgPool,
+    redis_client: Option<&std::sync::Arc<redis::Client>>,
+    nats_client: Option<&std::sync::Arc<async_nats::Client>>,
+) -> (axum::http::StatusCode, &'static str) {
+    use std::time::Duration;
     let check_timeout = Duration::from_secs(2);
 
     // --- Database check (2s timeout) ---
-    let db_ok = tokio::time::timeout(check_timeout, async {
-        sqlx::query("SELECT 1").execute(&db_pool).await.is_ok()
-    })
-    .await
-    .unwrap_or(false);
+    let db_check = tokio::time::timeout(check_timeout, async {
+        sqlx::query("SELECT 1").execute(db_pool).await.is_ok()
+    });
 
-    // --- Redis check (2s timeout) ---
-    let redis_ok = if let Some(ref client) = redis_client {
-        tokio::time::timeout(check_timeout, async {
-            match client.get_multiplexed_async_connection().await {
-                Ok(mut conn) => redis::cmd("PING")
-                    .query_async::<String>(&mut conn)
-                    .await
-                    .is_ok(),
-                Err(_) => false,
-            }
-        })
-        .await
-        .unwrap_or(false)
-    } else {
-        // Not configured is not a failure
-        true
+    // --- Redis check (2s timeout) over the shared ConnectionManager ---
+    let redis_check = async {
+        match redis_client {
+            Some(client) => tokio::time::timeout(check_timeout, async {
+                let conn = HEALTH_REDIS_CONN
+                    .get_or_try_init(|| client.get_connection_manager())
+                    .await;
+                match conn {
+                    Ok(shared) => {
+                        // Clone is cheap (Arc-backed) and is the documented
+                        // way to use one manager from many tasks.
+                        let mut conn = shared.clone();
+                        redis::cmd("PING")
+                            .query_async::<String>(&mut conn)
+                            .await
+                            .is_ok()
+                    }
+                    Err(_) => false,
+                }
+            })
+            .await
+            .unwrap_or(false),
+            // Not configured is not a failure
+            None => true,
+        }
     };
 
     // --- NATS check (2s timeout) ---
-    let nats_ok = if let Some(ref client) = nats_client {
-        tokio::time::timeout(check_timeout, async {
-            client.connection_state() == async_nats::connection::State::Connected
-        })
-        .await
-        .unwrap_or(false)
-    } else {
-        // Not configured is not a failure
-        true
+    let nats_check = async {
+        match nats_client {
+            Some(client) => tokio::time::timeout(check_timeout, async {
+                client.connection_state() == async_nats::connection::State::Connected
+            })
+            .await
+            .unwrap_or(false),
+            // Not configured is not a failure
+            None => true,
+        }
     };
+
+    let (db_ok, redis_ok, nats_ok) = tokio::join!(db_check, redis_check, nats_check);
+    let db_ok = db_ok.unwrap_or(false);
 
     // Database is critical - if it's down, return 503
     // Redis/NATS are optional - if down but DB is up, return 200 with degraded status
-    let (http_status, status_str) = if !db_ok {
+    let verdict = if !db_ok {
         (axum::http::StatusCode::SERVICE_UNAVAILABLE, "degraded")
     } else if !redis_ok || !nats_ok {
         (axum::http::StatusCode::OK, "degraded")
@@ -1167,12 +1248,7 @@ pub(crate) async fn health_check(
         tracing::warn!("Health check: NATS connectivity failed");
     }
 
-    // Return minimal information to prevent information leakage
-    let body = json!({
-        "status": status_str,
-    });
-
-    (http_status, axum::Json(body)).into_response()
+    verdict
 }
 
 // ---------- Redis health check endpoint ----------
@@ -1710,6 +1786,57 @@ pub(crate) async fn rest_auth_middleware(
     // If no valid authentication, return 401
     tracing::debug!("REST auth - Returning 401");
     Err(axum::http::StatusCode::UNAUTHORIZED)
+}
+
+// ---------- REST cookie-session CSRF gate ----------
+/// F5: double-submit CSRF for cookie-authenticated REST mutations.
+///
+/// `rest_auth_middleware` accepts the ambient `talos_access_token` cookie, and
+/// `csrf::csrf_protection` was layered on NO REST sub-router — only the
+/// GraphQL variant was wired. So a cross-site page could ride a victim's
+/// session cookie into every `POST`/`DELETE` behind REST auth (approval
+/// decisions, Slack app creation, watch-channel create/delete/renew, …).
+/// `SameSite=Strict` on the session cookie is the only thing that stood in the
+/// way, and one cookie attribute is not a CSRF design.
+///
+/// Shape: run the canonical non-GraphQL `csrf::csrf_protection` (rotation,
+/// grace cache, empty-value rejection — ONE implementation) but ONLY when the
+/// request is cookie-authenticated. The cookie test mirrors
+/// `rest_auth_middleware`'s precedence exactly: the session cookie wins
+/// whenever it is present, so that is exactly when CSRF applies. A
+/// Bearer-only caller (scripts, `Authorization: Bearer <jwt>` with no cookie)
+/// cannot be riding ambient credentials and is untouched, which is why this is
+/// a wrapper rather than layering `csrf_protection` bare — that middleware
+/// skips `X-API-Key` but NOT Bearer, and would have 403'd every headless
+/// caller for lack of a CSRF cookie. Safe methods pass through unchanged
+/// (`csrf_protection` would only seed a cookie there).
+///
+/// Every frontend REST mutation caller already sends `X-CSRF-Token`
+/// (`lib/authedFetch.ts`, `settings/watch-channels/api.ts`, and the two local
+/// `authedFetch` copies in `GmailWatchChannels.tsx` /
+/// `GoogleCalendarSelector.tsx`) — EXCEPT `builder/SlackBrowser.tsx`, whose
+/// bare `fetch` POSTs to `/api/slack/channels` and `/api/slack/users`. Those
+/// two routes are therefore split into their own sub-router WITHOUT this gate
+/// (see `slack_browse_routes`) until the frontend sends the header; the
+/// exemption is recorded there, not hidden here.
+pub(crate) async fn rest_cookie_csrf_gate(
+    cookies: tower_cookies::Cookies,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Result<Response, (axum::http::StatusCode, String)> {
+    use axum::http::Method;
+    if matches!(
+        request.method(),
+        &Method::GET | &Method::HEAD | &Method::OPTIONS
+    ) {
+        return Ok(next.run(request).await);
+    }
+    // Same cookie name and precedence as `rest_auth_middleware`: present ⇒
+    // the request authenticates via ambient credentials ⇒ CSRF applies.
+    if cookies.get("talos_access_token").is_none() {
+        return Ok(next.run(request).await);
+    }
+    csrf::csrf_protection(cookies, request, next).await
 }
 
 // ---------- GraphQL HTTP handler ----------
@@ -2679,10 +2806,24 @@ pub(crate) fn build_router(
     // ---------- Rate limiting configuration ----------
     // Global rate limit configuration using tower_governor
     // Recommended: 10 requests per second per IP to prevent brute-force attacks
+    //
+    // F4: keyed on the REAL client IP, not the socket peer.
+    // `GovernorConfigBuilder::default()` is `PeerIpKeyExtractor`; behind the
+    // chart's nginx frontend the peer is the proxy pod for every request, so
+    // in production every user shared ONE 10 req/s bucket — a platform-wide
+    // 429 any single user could trip. The extractor reuses the SAME RFC 7239
+    // trusted-proxy walk (`extract_client_ip`, same `trusted_proxies`) that
+    // `rate_limit_middleware` and `global_rate_limit_middleware` already key
+    // on, so the three limiters agree on who a request is from; it is NOT
+    // `SmartIpKeyExtractor`, which reads the attacker-controllable leftmost
+    // forwarded entry from any peer.
     let governor_conf = std::sync::Arc::new(
         tower_governor::governor::GovernorConfigBuilder::default()
             .per_second(10)
             .burst_size(20)
+            .key_extractor(rate_limit::TrustedProxyClientIpKeyExtractor::new(
+                trusted_proxies.clone(),
+            ))
             .finish()
             .ok_or_else(|| anyhow::anyhow!("Failed to build rate limiter"))?,
     );
@@ -2795,6 +2936,7 @@ pub(crate) fn build_router(
         )
         .layer(DefaultBodyLimit::max(4096))
         .layer(from_fn(rest_auth_middleware))
+        .layer(from_fn(rest_cookie_csrf_gate)) // F5: CSRF for cookie-session mutations
         .layer(Extension(auth_service.clone()))
         .layer(from_fn(rate_limit::rate_limit_middleware))
         .layer(Extension(api_limiter.clone()))
@@ -2821,16 +2963,20 @@ pub(crate) fn build_router(
     // axum's 2 MiB default. Same audit class as the approval_routes
     // fix above — authenticated REST POSTs with tiny payloads.
     let slack_api_routes = Router::new()
-        // MCP-976: POST so the bot_token in the JSON body doesn't land
-        // in nginx access logs / browser history / referer headers
-        // as it would on a GET ?bot_token= query. Also matches the
-        // frontend (SlackBrowser.tsx) which has always POSTed JSON.
+        .route("/api/slack/apps/create", post(slack::create_app_handler))
+        // MCP-976: POST so the bot_token in the JSON body doesn't land in
+        // nginx access logs / browser history / referer headers as it would
+        // on a GET ?bot_token= query. 2026-09-10 review: these two were
+        // briefly split into an ungated `slack_browse_routes` because
+        // `builder/SlackBrowser.tsx` POSTed with a bare `fetch`; that
+        // component was mounted nowhere (0 references) and has been deleted,
+        // so the routes live under the CSRF gate with their siblings again.
         .route("/api/slack/channels", post(slack::list_channels_handler))
         .route("/api/slack/users", post(slack::list_users_handler))
-        .route("/api/slack/apps/create", post(slack::create_app_handler))
         .with_state(slack_api_client.clone())
         .layer(DefaultBodyLimit::max(8192))
         .layer(from_fn(rest_auth_middleware)) // Runs 5th (last) - needs auth_service extension
+        .layer(from_fn(rest_cookie_csrf_gate)) // F5: CSRF for cookie-session mutations
         .layer(Extension(auth_service.clone())) // Runs 4th - provides auth_service to middleware above
         .layer(from_fn(rate_limit::rate_limit_middleware)) // Runs 3rd
         .layer(Extension(api_limiter.clone())) // Runs 2nd
@@ -2855,6 +3001,7 @@ pub(crate) fn build_router(
         .route("/api/slack/connect", get(slack::connect_slack_handler))
         .with_state(slack_integration_service.clone())
         .layer(from_fn(rest_auth_middleware)) // Runs 5th (last) - needs auth_service extension
+        .layer(from_fn(rest_cookie_csrf_gate)) // F5: CSRF for cookie-session mutations
         .layer(Extension(auth_service.clone())) // Runs 4th - provides auth_service to middleware above
         .layer(from_fn(rate_limit::rate_limit_middleware)) // Runs 3rd
         .layer(Extension(api_limiter.clone())) // Runs 2nd
@@ -2892,6 +3039,7 @@ pub(crate) fn build_router(
         .route("/api/gmail/connect", get(gmail::connect_gmail_handler))
         .with_state(gmail_integration_service.clone())
         .layer(from_fn(rest_auth_middleware)) // Runs 5th (last) - needs auth_service extension
+        .layer(from_fn(rest_cookie_csrf_gate)) // F5: CSRF for cookie-session mutations
         .layer(Extension(auth_service.clone())) // Runs 4th - provides auth_service to middleware above
         .layer(from_fn(rate_limit::rate_limit_middleware)) // Runs 3rd
         .layer(Extension(api_limiter.clone())) // Runs 2nd
@@ -2949,6 +3097,7 @@ pub(crate) fn build_router(
                 .with_state(google_cloud_full_service.clone()),
         )
         .layer(from_fn(rest_auth_middleware)) // Runs 5th (last) - needs auth_service extension
+        .layer(from_fn(rest_cookie_csrf_gate)) // F5: CSRF for cookie-session mutations
         .layer(Extension(auth_service.clone())) // Runs 4th - provides auth_service to middleware above
         .layer(from_fn(rate_limit::rate_limit_middleware)) // Runs 3rd
         .layer(Extension(api_limiter.clone())) // Runs 2nd
@@ -2983,6 +3132,7 @@ pub(crate) fn build_router(
         )
         .with_state(github_connect_service.clone())
         .layer(from_fn(rest_auth_middleware)) // injects Extension<Uuid>
+        .layer(from_fn(rest_cookie_csrf_gate)) // F5: CSRF for cookie-session mutations
         .layer(Extension(auth_service.clone()))
         .layer(from_fn(rate_limit::rate_limit_middleware))
         .layer(Extension(api_limiter.clone()))
@@ -3035,6 +3185,7 @@ pub(crate) fn build_router(
             .with_state(svc.clone())
             .layer(DefaultBodyLimit::max(16 * 1024))
             .layer(from_fn(rest_auth_middleware))
+            .layer(from_fn(rest_cookie_csrf_gate)) // F5: CSRF for cookie-session mutations
             .layer(Extension(auth_service.clone()))
             .layer(from_fn(rate_limit::rate_limit_middleware))
             .layer(Extension(api_limiter.clone()))
@@ -3151,6 +3302,7 @@ pub(crate) fn build_router(
             .with_state(svc.clone())
             .layer(DefaultBodyLimit::max(16 * 1024))
             .layer(from_fn(rest_auth_middleware))
+            .layer(from_fn(rest_cookie_csrf_gate)) // F5: CSRF for cookie-session mutations
             .layer(Extension(auth_service.clone()))
             .layer(from_fn(rate_limit::rate_limit_middleware))
             .layer(Extension(api_limiter.clone()))
@@ -3249,6 +3401,7 @@ pub(crate) fn build_router(
         .route("/api/gmail/profile", get(gmail::get_profile_handler))
         .with_state(gmail_api_client.clone())
         .layer(from_fn(rest_auth_middleware)) // Runs 5th (last) - needs auth_service extension
+        .layer(from_fn(rest_cookie_csrf_gate)) // F5: CSRF for cookie-session mutations
         .layer(Extension(auth_service.clone())) // Runs 4th - provides auth_service to middleware above
         .layer(from_fn(rate_limit::rate_limit_middleware)) // Runs 3rd
         .layer(Extension(api_limiter.clone())) // Runs 2nd
@@ -3268,6 +3421,7 @@ pub(crate) fn build_router(
         .route("/api/atlassian/connect", get(atlassian::connect_handler))
         .with_state(atlassian_integration_service.clone())
         .layer(from_fn(rest_auth_middleware))
+        .layer(from_fn(rest_cookie_csrf_gate)) // F5: CSRF for cookie-session mutations
         .layer(Extension(auth_service.clone()))
         .layer(from_fn(rate_limit::rate_limit_middleware))
         .layer(Extension(api_limiter.clone()))
@@ -3293,6 +3447,7 @@ pub(crate) fn build_router(
             get(integrations::latest_briefing_handler),
         )
         .layer(from_fn(rest_auth_middleware))
+        .layer(from_fn(rest_cookie_csrf_gate)) // F5: CSRF for cookie-session mutations
         .layer(Extension(auth_service.clone()))
         .layer(from_fn(rate_limit::rate_limit_middleware))
         .layer(Extension(api_limiter.clone()))
@@ -3355,6 +3510,7 @@ pub(crate) fn build_router(
         // watch-channel routes above (MCP-1158 / MCP-1159 family).
         .layer(DefaultBodyLimit::max(8 * 1024))
         .layer(from_fn(rest_auth_middleware)) // Runs 5th (last) - needs auth_service extension
+        .layer(from_fn(rest_cookie_csrf_gate)) // F5: CSRF for cookie-session mutations
         .layer(Extension(auth_service.clone())) // Runs 4th - provides auth_service to middleware above
         .layer(from_fn(rate_limit::rate_limit_middleware)) // Runs 3rd
         .layer(Extension(api_limiter.clone())) // Runs 2nd
@@ -3413,12 +3569,16 @@ pub(crate) fn build_router(
     // Public suspension callback routes.
     // Auth is the 64-hex correlation_id (256-bit random) embedded in the URL.
     // Rate-limited to prevent enumeration brute-force.
+    // F9: body cap is the handler's own constant (64 KiB) so the two layers
+    // cannot drift; the payload is a resume signal, not a document.
     let suspension_callback_routes = Router::new()
         .route(
             "/api/callbacks/{correlation_id}",
             post(webhooks::suspension_callback_handler),
         )
-        .layer(DefaultBodyLimit::max(1024 * 1024))
+        .layer(DefaultBodyLimit::max(
+            webhooks::SUSPENSION_CALLBACK_MAX_BODY_BYTES,
+        ))
         .layer(from_fn(rate_limit::rate_limit_middleware))
         .layer(Extension(webhook_limiter.clone()))
         .layer(Extension(whitelist.clone()));
@@ -3699,9 +3859,9 @@ pub(crate) fn build_router(
         );
         Router::new()
             .route(
-                "/internal/worker-key",
+                "/internal/worker-key", // no-nginx-route: RFC0010 in-cluster worker self-registration
                 axum::routing::post(register_worker_key_handler),
-            ) // no-nginx-route: RFC0010 in-cluster worker self-registration
+            )
             .layer(axum::extract::DefaultBodyLimit::max(4096))
             .layer(Extension(db_pool.clone()))
             .layer(Extension(WorkerRegAuth {
@@ -3726,9 +3886,9 @@ pub(crate) fn build_router(
     // ping is a worker whose key can never be reaped.
     let worker_liveness_routes = Router::new()
         .route(
-            "/internal/worker-liveness",
+            "/internal/worker-liveness", // no-nginx-route: in-cluster worker liveness ping, worker pods only
             axum::routing::post(worker_liveness_handler),
-        ) // no-nginx-route: in-cluster worker liveness ping, worker pods only
+        )
         .layer(axum::extract::DefaultBodyLimit::max(4096))
         .layer(Extension(db_pool.clone()));
 

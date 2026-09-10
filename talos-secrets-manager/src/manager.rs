@@ -5062,6 +5062,29 @@ impl SecretsManager {
         // provider drops. The original Zeroizing wrapper wipes when
         // this function returns.
         let old_provider = self.current_kek()?;
+        // F7a: this function ALWAYS builds an `EnvKekProvider` from the new
+        // bytes, so it is an env→env rotation and nothing else. Pre-fix it
+        // never looked at what the ACTIVE provider was: on a
+        // `KEK_PROVIDER=vault` deployment it would have rewrapped every DEK
+        // under an in-memory env KEK and published that as the active
+        // provider — a silent Vault-transit → env downgrade, with the new
+        // master key living in process memory, which `docs/deployment.md`
+        // says production must never do. Refuse unless the active provider
+        // is `env`; the cross-provider path is the dual-wrap migration
+        // (`SecretsManager::with_kek_providers(new, Some(legacy))` — see
+        // its doc comment and Phase 3 of the KEK→KMS plan), not this call.
+        if !master_key_rotation_permitted_for_provider(old_provider.name()) {
+            return Err(anyhow!(
+                "rotate_master_key only performs an env→env rotation, but the active KEK \
+                 provider is `{}`. Rotating it here would silently downgrade DEK wrapping to \
+                 an in-memory env KEK. Cross-provider (or Vault key) rotation goes through \
+                 the dual-wrap migration path: boot with the NEW provider active and the \
+                 OLD one as `kek_legacy` (`SecretsManager::with_kek_providers`), let rows \
+                 rewrap, then drop the legacy provider. For Vault transit, rotate the key \
+                 in Vault itself (`vault write -f transit/keys/<name>/rotate`).",
+                old_provider.name()
+            ));
+        }
         let new_provider: Arc<dyn kek_provider::KekProvider> = Arc::new(
             kek_provider::EnvKekProvider::from_raw_bytes_owned(new_master_key.to_vec())?,
         );
@@ -5315,6 +5338,46 @@ impl SecretsManager {
         }
         drop(lock_conn);
 
+        // F7a: audit the rotation the way sibling operator actions are
+        // audited (`DEK_CACHE_INVALIDATED` above) — a `secret_audit_log` row
+        // that names the actor and the count, never the key. Pre-fix the only
+        // record was a tracing line. Written for SUCCESS only: a refused or
+        // failed rotation changed nothing and the caller already sees the
+        // error. Fire-and-warn, as the sibling does — the rotation itself is
+        // committed and must not be reported as failed because the audit row
+        // was not.
+        if let Ok(count) = &rotation_result {
+            let (actor_type, actor_id) = match auditor {
+                Some(id) => ("user", Some(id)),
+                None => ("system", None),
+            };
+            if let Err(e) = sqlx::query(
+                "INSERT INTO secret_audit_log (action, actor_type, actor_id, success, \
+                 error_message) VALUES ($1, $2, $3, true, $4)",
+            )
+            .bind("MASTER_KEY_ROTATED")
+            .bind(actor_type)
+            .bind(actor_id)
+            // `error_message` doubles as the free-text detail column on
+            // success rows (it is nullable); the count is the one fact an
+            // auditor wants beside "who".
+            .bind(format!(
+                "env→env master key rotation: {count} DEK(s) rewrapped"
+            ))
+            .execute(&self.db_pool)
+            .await
+            {
+                tracing::warn!(
+                    target: "talos_audit",
+                    actor_type,
+                    actor_id = ?actor_id,
+                    error = %e,
+                    "secret_audit_log INSERT for MASTER_KEY_ROTATED failed — the rotation \
+                     committed but the audit trail lost the event"
+                );
+            }
+        }
+
         rotation_result
     }
 
@@ -5495,6 +5558,40 @@ pub fn resolve_secret_references<'a>(
             other => Ok(other),
         }
     })
+}
+
+/// F7a: `rotate_master_key` is an env→env rotation by construction (it always
+/// builds an `EnvKekProvider` from the new bytes), so it may run only while the
+/// ACTIVE provider is `env`. `KekProvider::name()` is `"env"` for
+/// `EnvKekProvider` and `vault://…` for `VaultTransitProvider`.
+pub fn master_key_rotation_permitted_for_provider(active_provider_name: &str) -> bool {
+    active_provider_name == "env"
+}
+
+#[cfg(test)]
+mod master_key_rotation_gate_tests {
+    use super::kek_provider::KekProvider;
+    use super::*;
+
+    #[test]
+    fn only_the_env_provider_may_be_rotated_in_place() {
+        assert!(master_key_rotation_permitted_for_provider("env"));
+        assert!(!master_key_rotation_permitted_for_provider(
+            "vault://https://vault.internal:8200/v1/transit/keys/talos-kek"
+        ));
+        assert!(!master_key_rotation_permitted_for_provider(""));
+        assert!(!master_key_rotation_permitted_for_provider("ENV"));
+    }
+
+    /// The name the gate tests for must be the one the env provider reports;
+    /// a rename of either side would silently disable the gate (rotation
+    /// refused everywhere) — loud, but pinned here so it is caught at PR time.
+    #[test]
+    fn gate_matches_the_env_providers_own_name() {
+        let env = kek_provider::EnvKekProvider::from_raw_bytes_owned(vec![7u8; 32])
+            .expect("32-byte env provider");
+        assert!(master_key_rotation_permitted_for_provider(env.name()));
+    }
 }
 
 #[cfg(test)]

@@ -507,10 +507,15 @@ pub async fn webhook_notification_handler(
     // Order matters, from cheapest to most expensive so a flood of
     // malformed / unauthorised webhooks never reaches the database:
     //
-    //   1. Header presence (channel_id, channel_token)
-    //   2. Per-channel rate-limit (in-memory DashMap; no I/O)
-    //   3. Signed-token verify (constant-time HMAC, no I/O) — also
+    //   1. Header presence (channel_id, channel_token) + channel-id SHAPE
+    //      (≤64 chars of [A-Za-z0-9_-]; Talos mints UUIDs).
+    //   2. Signed-token verify (constant-time HMAC, no I/O) — also
     //      recovers the bound user_id without any lookup.
+    //   3. Per-channel rate-limit keyed on the VERIFIED (user_id,
+    //      channel_id) (in-memory DashMap; no I/O). F8: this used to run
+    //      before step 2 on the bare header, so anyone who knew a channel
+    //      id — it is in every Google request — could burn that channel's
+    //      budget and drop the real notifications, with no token at all.
     //   4. integration_state lookup scoped to (gcal, user_id).
     //   5. Dedup of X-Goog-Message-Number (read-modify-write).
     //   6. Dispatch in a spawned task.
@@ -524,16 +529,19 @@ pub async fn webhook_notification_handler(
         return StatusCode::OK;
     };
 
-    if !service.allow_webhook_channel(&ch_id) {
+    if !crate::webhook_token::channel_id_shape_ok(&ch_id) {
+        // Not something Talos minted; refuse before it can become a map key
+        // or a log line. Length is logged, never the value.
         tracing::warn!(
-            channel_id = %ch_id,
-            "Google Calendar webhook rate limit exceeded — notification dropped"
+            channel_id_len = ch_id.len(),
+            "🚨 Malformed X-Goog-Channel-ID (not a Talos channel id shape) — refused"
         );
-        return StatusCode::OK;
+        return StatusCode::BAD_REQUEST;
     }
 
-    // Signed-token verification happens BEFORE any database work. The
-    // HMAC key must be present at this point (wired at startup).
+    // Signed-token verification happens BEFORE any database work AND before
+    // the per-channel limiter. The HMAC key must be present at this point
+    // (wired at startup).
     let Some(token_str) = channel_token else {
         tracing::warn!(channel_id = %ch_id, "🚨 Missing X-Goog-Channel-Token");
         return StatusCode::FORBIDDEN;
@@ -551,6 +559,18 @@ pub async fn webhook_notification_handler(
         );
         return StatusCode::FORBIDDEN;
     };
+
+    // Per-channel rate limit, keyed on the token-attested (user_id, channel).
+    if !service.allow_webhook_channel(&GoogleCalendarService::webhook_channel_limit_key(
+        user_id, &ch_id,
+    )) {
+        tracing::warn!(
+            channel_id = %ch_id,
+            user_id = %user_id,
+            "Google Calendar webhook rate limit exceeded — notification dropped"
+        );
+        return StatusCode::OK;
+    }
 
     // Look up the channel in integration_state scoped to the user the
     // token attested to. `None` means the row has been renewed/deleted

@@ -116,12 +116,121 @@ pub trait DlpProvider: Send + Sync {
             Value::Object(map) => {
                 let mut new_map = serde_json::Map::with_capacity(map.len());
                 for (k, v) in map {
-                    new_map.insert(k.clone(), self.redact_json_depth(v, depth + 1));
+                    // F7c: the value under a credential-shaped KEY is
+                    // redacted whatever its shape. The leaf pass below is
+                    // value-pattern based, so `{"access_token": "opaque"}`
+                    // or `{"password": "hunter2"}` sailed through when the
+                    // value matched no regex.
+                    let redacted = if is_credential_key(k) {
+                        redact_credential_value(v, depth + 1)
+                    } else {
+                        self.redact_json_depth(v, depth + 1)
+                    };
+                    new_map.insert(k.clone(), redacted);
                 }
                 Value::Object(new_map)
             }
             other => other.clone(),
         }
+    }
+}
+
+/// Placeholder written over every string / number leaf that sits under a
+/// credential-shaped key (see [`is_credential_key`]).
+pub const REDACTED_CREDENTIAL: &str = "[REDACTED:CREDENTIAL]";
+
+/// Credential-shaped key SUFFIXES, matched against the normalised key
+/// (`camelCase`/`kebab-case` → `snake_case`, lower-cased) as either the whole
+/// key or a `_`-delimited final segment run. Suffix-anchored ON PURPOSE:
+/// `talos-dlp`'s `is_sensitive_key` (the operator-facing scaffold sample
+/// redactor) matches `_KEY` / `_TOKEN` as SUBSTRINGS, which is right for a
+/// config field name and wrong for persisted module OUTPUT, where
+/// `primary_key`, `public_key`, `partition_key`, `next_page_token` and
+/// `token_count` are ordinary data — `redact_json` runs on every stored node
+/// output and the `OutputSanitizer` contract says callers rely on its shape.
+/// So this list names credentials, not the words "key" and "token".
+const CREDENTIAL_KEY_SUFFIXES: &[&str] = &[
+    "password",
+    "passwd",
+    "passphrase",
+    "secret",
+    "client_secret",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "auth_token",
+    "bearer_token",
+    "session_token",
+    "verification_token",
+    "api_key",
+    "apikey",
+    "private_key",
+    "secret_key",
+    "secret_access_key",
+    "signing_key",
+    "signing_secret",
+    "authorization",
+    "credential",
+    "credentials",
+];
+
+/// Normalise a JSON key for suffix matching: `-` → `_`, a `_` inserted before
+/// each upper-case letter that follows a lower-case one or a digit
+/// (`accessToken` → `access_token`, `APIKey` → `apikey`), then lower-cased.
+fn normalise_key(key: &str) -> String {
+    let mut out = String::with_capacity(key.len() + 4);
+    let mut prev_lower_or_digit = false;
+    for c in key.chars() {
+        if c == '-' || c == '.' || c == ' ' {
+            out.push('_');
+            prev_lower_or_digit = false;
+            continue;
+        }
+        if c.is_ascii_uppercase() && prev_lower_or_digit {
+            out.push('_');
+        }
+        prev_lower_or_digit = c.is_ascii_lowercase() || c.is_ascii_digit();
+        out.push(c.to_ascii_lowercase());
+    }
+    out
+}
+
+/// Is this JSON object key one whose value is a credential regardless of the
+/// value's shape? Engine-authored `__…` keys are never credentials.
+pub fn is_credential_key(key: &str) -> bool {
+    if key.starts_with("__") {
+        return false;
+    }
+    let norm = normalise_key(key);
+    CREDENTIAL_KEY_SUFFIXES.iter().any(|suffix| {
+        norm == *suffix
+            || norm
+                .strip_suffix(suffix)
+                .is_some_and(|prefix| prefix.ends_with('_'))
+    })
+}
+
+/// Redact everything under a credential-shaped key, SHAPE-PRESERVING: string
+/// and number leaves become [`REDACTED_CREDENTIAL`]; `bool`/`null` stay;
+/// arrays and objects are walked (an `{"credentials": {"user": …, "pass": …}}`
+/// blob keeps its keys, loses its values). Same depth cap as the main walk.
+fn redact_credential_value(value: &Value, depth: usize) -> Value {
+    if depth > MAX_DLP_REDACT_DEPTH {
+        return value.clone();
+    }
+    match value {
+        Value::String(_) | Value::Number(_) => Value::String(REDACTED_CREDENTIAL.to_string()),
+        Value::Array(arr) => Value::Array(
+            arr.iter()
+                .map(|v| redact_credential_value(v, depth + 1))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), redact_credential_value(v, depth + 1)))
+                .collect(),
+        ),
+        other => other.clone(),
     }
 }
 
@@ -1044,6 +1153,144 @@ pub fn redact_json_bounded(v: &Value) -> Option<Value> {
 // ============================================================================
 // Tests
 // ============================================================================
+
+#[cfg(test)]
+mod credential_key_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn credential_keys_are_recognised_in_every_casing() {
+        for k in [
+            "access_token",
+            "accessToken",
+            "AccessToken",
+            "access-token",
+            "ACCESS_TOKEN",
+            "refresh_token",
+            "id_token",
+            "password",
+            "user_password",
+            "db.password",
+            "client_secret",
+            "webhook_secret",
+            "api_key",
+            "apiKey",
+            "APIKey",
+            "x-api-key",
+            "private_key",
+            "aws_secret_access_key",
+            "authorization",
+            "credentials",
+            "x-verification-token",
+        ] {
+            assert!(is_credential_key(k), "{k} must be a credential key");
+        }
+    }
+
+    /// The false-positive population this classifier is shaped to avoid —
+    /// every one of these is ordinary module output. (`has_secret`-style
+    /// booleans DO match the `_secret` suffix, and that is harmless: a bool
+    /// under a credential key is left as-is by `redact_credential_value`.)
+    #[test]
+    fn data_plane_keys_are_not_credentials() {
+        for k in [
+            "primary_key",
+            "public_key",
+            "foreign_key",
+            "partition_key",
+            "idempotency_key",
+            "s3_key",
+            "key",
+            "token",
+            "next_page_token",
+            "nextPageToken",
+            "token_count",
+            "tokens",
+            "password_reset_requested",
+            "secret_count",
+            "secrets_total",
+            "secrets",
+            "api_keys",
+            "__memory_write__",
+            "__actor_context__",
+            "username",
+            "email",
+        ] {
+            assert!(!is_credential_key(k), "{k} must NOT be a credential key");
+        }
+    }
+
+    /// F7c reproducer: an opaque token no regex recognises is still redacted
+    /// because of its KEY — and a sibling key with a similar value is not.
+    #[test]
+    fn opaque_credential_values_are_redacted_by_key() {
+        let p = BuiltinDlpProvider;
+        let v = json!({
+            "access_token": "opaque-value-with-no-known-shape",
+            "refresh_token": 1234567890u64,
+            "password": "hunter2",
+            "note": "opaque-value-with-no-known-shape",
+            "user": "alice"
+        });
+        let r = p.redact_json(&v);
+        assert_eq!(r["access_token"], REDACTED_CREDENTIAL);
+        assert_eq!(r["refresh_token"], REDACTED_CREDENTIAL);
+        assert_eq!(r["password"], REDACTED_CREDENTIAL);
+        assert_eq!(r["note"], "opaque-value-with-no-known-shape");
+        assert_eq!(r["user"], "alice");
+    }
+
+    /// Shape is preserved under a credential key (the `OutputSanitizer`
+    /// contract): nested objects keep their keys, arrays their length,
+    /// bools and nulls their value.
+    #[test]
+    fn credential_subtrees_keep_their_shape() {
+        let p = BuiltinDlpProvider;
+        // Note: PLURAL list keys (`secrets`, `api_keys`) are deliberately NOT
+        // credential keys — `list_secrets`-style outputs carry metadata
+        // (names, namespaces) under them, not values. A list OF credentials
+        // is redacted only under a singular credential key, as here.
+        let v = json!({
+            "credentials": {"user": "svc", "pass": "x", "mfa": true, "expires": null},
+            "private_key": ["k1", "k2", 3]
+        });
+        let r = p.redact_json(&v);
+        assert_eq!(r["credentials"]["user"], REDACTED_CREDENTIAL);
+        assert_eq!(r["credentials"]["pass"], REDACTED_CREDENTIAL);
+        assert_eq!(r["credentials"]["mfa"], true);
+        assert_eq!(r["credentials"]["expires"], serde_json::Value::Null);
+        assert_eq!(r["private_key"].as_array().unwrap().len(), 3);
+        assert!(r["private_key"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|x| *x == REDACTED_CREDENTIAL));
+    }
+
+    #[test]
+    fn nested_and_array_of_objects_are_covered() {
+        let p = BuiltinDlpProvider;
+        let v = json!({
+            "config": {"endpoint": "https://api.example.com", "client_secret": "abc"},
+            "accounts": [{"name": "a", "password": "p1"}, {"name": "b", "password": "p2"}]
+        });
+        let r = p.redact_json(&v);
+        assert_eq!(r["config"]["endpoint"], "https://api.example.com");
+        assert_eq!(r["config"]["client_secret"], REDACTED_CREDENTIAL);
+        assert_eq!(r["accounts"][0]["name"], "a");
+        assert_eq!(r["accounts"][0]["password"], REDACTED_CREDENTIAL);
+        assert_eq!(r["accounts"][1]["password"], REDACTED_CREDENTIAL);
+    }
+
+    /// The global free function is the one most call sites use; pin that it
+    /// carries the key-aware rule too (it delegates to the trait default).
+    #[test]
+    fn free_function_redact_json_is_key_aware() {
+        let r = redact_json(&json!({"id_token": "opaque"}));
+        assert_eq!(r["id_token"], REDACTED_CREDENTIAL);
+    }
+}
 
 #[cfg(test)]
 mod tests {

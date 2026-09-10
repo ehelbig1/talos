@@ -13,6 +13,59 @@ const DLQ_MAX_PENDING: usize = 10_000;
 /// DLQ channel capacity for async processing.
 const DLQ_CHANNEL_CAPACITY: usize = 1_000;
 
+/// Key under which `enqueue_dlq` records, INSIDE the stored `headers` JSONB
+/// map, whether the dropped request had passed the auth gate. A JSON field on
+/// an existing column rather than a schema change. The value is a JSON `bool`
+/// written LAST by the engine, so a sender-supplied header of the same name
+/// (header tokens may contain `_`) is overwritten and could only ever have
+/// been a string anyway.
+pub const DLQ_AUTHENTICATED_KEY: &str = "__talos_dlq_authenticated";
+
+/// Was this DLQ entry captured AFTER the request authenticated?
+///
+/// Strict: only a JSON `true` under [`DLQ_AUTHENTICATED_KEY`] counts. A
+/// missing map, a missing key (every row written before the marker existed —
+/// all of which were captured above the auth gate), a string `"true"`, or
+/// `false` all answer `false`, and `dispatch_replay` refuses on `false`.
+pub fn dlq_entry_was_authenticated(headers: Option<&serde_json::Value>) -> bool {
+    matches!(
+        headers.and_then(|h| h.get(DLQ_AUTHENTICATED_KEY)),
+        Some(serde_json::Value::Bool(true))
+    )
+}
+
+/// Why `dispatch_replay` refused to re-dispatch an entry. Carried inside the
+/// `anyhow::Error` so the GraphQL mutation can `downcast_ref` and show the
+/// operator the actual reason (both are caller-safe: neither names a table, a
+/// query or a secret) while every OTHER failure keeps the generic
+/// "Replay failed" that hides internals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayRefused {
+    /// The entry was captured above the auth gate (F2).
+    Unauthenticated,
+    /// The trigger is disabled; the live path refuses it at step 1.
+    TriggerDisabled,
+}
+
+impl std::fmt::Display for ReplayRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ReplayRefused::Unauthenticated => f.write_str(
+                "DLQ entry was captured before the request was authenticated (dropped at the \
+                 circuit-breaker or rate-limit gate, ahead of signature / verification-token \
+                 checks) — replaying it would dispatch a never-verified payload as the trigger's \
+                 owner. Refused; if the sender is legitimate, have it re-deliver.",
+            ),
+            ReplayRefused::TriggerDisabled => f.write_str(
+                "Webhook trigger is disabled — the live delivery path refuses this trigger, so \
+                 replay does too. Enable the trigger before replaying.",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ReplayRefused {}
+
 /// DLQ entry for failed webhook payloads.
 #[derive(Debug, Clone)]
 pub(crate) struct DlqEntry {
@@ -387,6 +440,40 @@ fn enqueue_webhook_dlq(
 /// The counting rule lives in `talos_task_supervision` so the pins in
 /// the eight crates that carry one cannot drift; its stated limits
 /// (textual, per-file, blind to WHICH task is named) apply here.
+#[cfg(test)]
+mod authenticity_marker_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn only_a_json_true_under_the_marker_counts() {
+        assert!(dlq_entry_was_authenticated(Some(&json!({
+            DLQ_AUTHENTICATED_KEY: true,
+            "content-type": "application/json"
+        }))));
+    }
+
+    #[test]
+    fn legacy_rows_and_forgeries_read_as_unauthenticated() {
+        // No headers at all.
+        assert!(!dlq_entry_was_authenticated(None));
+        // Pre-marker row: a header map with no stamp.
+        assert!(!dlq_entry_was_authenticated(Some(&json!({
+            "content-type": "application/json"
+        }))));
+        // Explicitly unauthenticated (both live enqueue sites today).
+        assert!(!dlq_entry_was_authenticated(Some(&json!({
+            DLQ_AUTHENTICATED_KEY: false
+        }))));
+        // A sender-supplied header of the same name can only be a string.
+        assert!(!dlq_entry_was_authenticated(Some(&json!({
+            DLQ_AUTHENTICATED_KEY: "true"
+        }))));
+        // Not an object.
+        assert!(!dlq_entry_was_authenticated(Some(&json!("true"))));
+    }
+}
+
 #[cfg(test)]
 mod task_supervision_pin {
     #[test]
