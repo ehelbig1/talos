@@ -220,7 +220,15 @@ bounds (e.g. `max_iterations` caps at 50 for agent loops).
 
 ### `sub_workflow`
 ```jsonc
-{ "sub_workflow_id": "uuid", "timeout_secs": 30 }
+// `timeout_secs` is ENFORCED only when `enforce_timeout` is true (2026-09-10):
+// the authoring tools stamp `timeout_secs: 30` into every child node, so a
+// stored 30 cannot be told from intent, and enforcing it blind would fail
+// children that legitimately run for minutes. Without the marker the child
+// is bounded by the run's remaining budget (minus a 2 s reserve) and fails as
+// a clean NODE error instead of the whole run being dropped. The same pair
+// applies to judge / ensemble / reflective_retry / llm_dispatch /
+// capability_dispatch / agent_loop children.
+{ "sub_workflow_id": "uuid", "timeout_secs": 30, "enforce_timeout": true }
 ```
 
 ### `loop`

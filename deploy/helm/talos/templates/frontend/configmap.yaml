@@ -21,6 +21,21 @@ metadata:
     {{- include "talos.componentLabels" (list . "frontend") | nindent 4 }}
 data:
   default.conf: |
+    # Query-string-FREE access-log format for /mcp. This file is included
+    # from the image's `http {}` block (conf.d), so `log_format` is legal
+    # here. The default `main`/combined format writes `$request` — method +
+    # FULL request-target, query string included — and the controller's MCP
+    # auth (`talos-mcp-handlers/src/auth.rs`) accepts the bearer token as
+    # `?token=` for SSE clients that cannot set headers, promising it is
+    # never logged. Under the default format every such request wrote the
+    # long-lived bearer token into this pod's access log. `$uri` is the
+    # normalised PATH only. `$http_referer` is deliberately omitted too
+    # (a Referer can carry a query string). Applied per-location below;
+    # every other location keeps the default format.
+    log_format talos_no_query '$remote_addr - $remote_user [$time_local] '
+                              '"$request_method $uri $server_protocol" '
+                              '$status $body_bytes_sent "$http_user_agent"';
+
     server {
         listen {{ .Values.frontend.service.port }};
         server_name _;
@@ -216,6 +231,9 @@ data:
         # so the MCP client gets HTML/405 instead of a JSON-RPC reply
         # and reports "Failed to reconnect to talos".
         location /mcp {
+            # Path-only log line: the MCP bearer token may travel as
+            # `?token=` (see `log_format talos_no_query` at the top).
+            access_log /var/log/nginx/access.log talos_no_query;
             proxy_pass http://{{ include "talos.componentName" (list . "controller") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.controller.service.port }};
             proxy_http_version 1.1;
             proxy_set_header Host $host;

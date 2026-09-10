@@ -512,6 +512,9 @@ fn serialize_system_node_kind(kind: &SystemNodeKind) -> (&'static str, JsonValue
             json!({
                 "sub_workflow_id": workflow_id.to_string(),
                 "timeout_secs": timeout_secs,
+                // A typed, non-zero timeout is an author's choice: opt the
+                // node into enforcement (see `graph_parser::child_timeout_secs`).
+                "enforce_timeout": *timeout_secs > 0,
             }),
         ),
         SystemNodeKind::Loop {
@@ -560,6 +563,9 @@ fn serialize_system_node_kind(kind: &SystemNodeKind) -> (&'static str, JsonValue
             json!({
                 "dispatch_expression": dispatch_expression,
                 "timeout_secs": timeout_secs,
+                // A typed, non-zero timeout is an author's choice: opt the
+                // node into enforcement (see `graph_parser::child_timeout_secs`).
+                "enforce_timeout": *timeout_secs > 0,
             }),
         ),
         SystemNodeKind::CapabilityDispatch {
@@ -572,6 +578,9 @@ fn serialize_system_node_kind(kind: &SystemNodeKind) -> (&'static str, JsonValue
                 "required_capabilities": required_capabilities,
                 "fallback_workflow_id": fallback_workflow_id.map(|u| u.to_string()),
                 "timeout_secs": timeout_secs,
+                // A typed, non-zero timeout is an author's choice: opt the
+                // node into enforcement (see `graph_parser::child_timeout_secs`).
+                "enforce_timeout": *timeout_secs > 0,
             }),
         ),
         #[cfg(feature = "llm-primitives")]
@@ -604,6 +613,9 @@ fn serialize_system_node_kind(kind: &SystemNodeKind) -> (&'static str, JsonValue
                 "pass_threshold": pass_threshold,
                 "on_failure": on_failure,
                 "timeout_secs": timeout_secs,
+                // A typed, non-zero timeout is an author's choice: opt the
+                // node into enforcement (see `graph_parser::child_timeout_secs`).
+                "enforce_timeout": *timeout_secs > 0,
             }),
         ),
         #[cfg(feature = "llm-primitives")]
@@ -634,6 +646,9 @@ fn serialize_system_node_kind(kind: &SystemNodeKind) -> (&'static str, JsonValue
                 "consensus": consensus,
                 "judge_workflow_id": judge_workflow_id.map(|id| id.to_string()),
                 "timeout_secs": timeout_secs,
+                // A typed, non-zero timeout is an author's choice: opt the
+                // node into enforcement (see `graph_parser::child_timeout_secs`).
+                "enforce_timeout": *timeout_secs > 0,
             }),
         ),
         #[cfg(feature = "llm-primitives")]
@@ -677,6 +692,9 @@ fn serialize_system_node_kind(kind: &SystemNodeKind) -> (&'static str, JsonValue
                 "reflection_workflow_id": reflection_workflow_id.to_string(),
                 "max_retries": max_retries,
                 "timeout_secs": timeout_secs,
+                // A typed, non-zero timeout is an author's choice: opt the
+                // node into enforcement (see `graph_parser::child_timeout_secs`).
+                "enforce_timeout": *timeout_secs > 0,
             }),
         ),
         #[cfg(feature = "llm-primitives")]
@@ -692,6 +710,9 @@ fn serialize_system_node_kind(kind: &SystemNodeKind) -> (&'static str, JsonValue
                 "routes": routes.iter().map(|(k, v)| (k.clone(), v.to_string())).collect::<std::collections::HashMap<_, _>>(),
                 "fallback_workflow_id": fallback_workflow_id.map(|id| id.to_string()),
                 "timeout_secs": timeout_secs,
+                // A typed, non-zero timeout is an author's choice: opt the
+                // node into enforcement (see `graph_parser::child_timeout_secs`).
+                "enforce_timeout": *timeout_secs > 0,
             }),
         ),
     }

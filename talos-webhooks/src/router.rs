@@ -16,6 +16,8 @@ use uuid::Uuid;
 use talos_engine::events::ExecutionEvent;
 use talos_module_executions::ModuleExecutionService;
 use talos_registry::ModuleRegistry;
+
+use crate::dispatch_failure::{self, ModuleDispatchFailure};
 use talos_secrets_manager::SecretsManager;
 use talos_worker_fleet::WorkerManager;
 use talos_workflow_engine_core::WorkerSharedKey;
@@ -123,6 +125,16 @@ pub async fn insert_webhook_module_execution(
     .map(|_| ())
 }
 
+/// The inbound request material a post-auth DLQ capture needs
+/// (`WebhookRouter::capture_post_auth_drop`). Borrowed from `handle_webhook`
+/// and threaded into `trigger_workflow_execution` so its pre-dispatch exits
+/// can record a replayable row; the DLQ replay path passes `None`.
+pub struct DlqCapture<'a> {
+    pub headers: &'a axum::http::HeaderMap,
+    pub body: &'a axum::body::Bytes,
+    pub source_ip: Option<std::net::IpAddr>,
+}
+
 /// Webhook router manages incoming webhook requests
 #[derive(Clone)]
 pub struct WebhookRouter {
@@ -198,10 +210,18 @@ impl WebhookRouter {
     /// (HMAC / verification token / IP allowlist) when it was dropped. It is
     /// stamped into the stored header map under
     /// [`dlq::DLQ_AUTHENTICATED_KEY`] and read back by `dispatch_replay`,
-    /// which REFUSES to re-dispatch an unauthenticated entry (F2). Both live
-    /// call sites today are ABOVE the auth gate (circuit-breaker and
-    /// rate-limit drops), so they pass `false`; a future post-auth site is
-    /// the only way an entry becomes replayable.
+    /// which REFUSES to re-dispatch an unauthenticated entry (F2).
+    ///
+    /// The DLQ therefore holds TWO classes of row (see `dispatch_failure`):
+    /// * pre-auth DROPS — the circuit-breaker and rate-limit sites, ABOVE the
+    ///   gate, pass `false`. A record, never replayable.
+    /// * post-auth DISPATCH FAILURES — every site below the gate where the
+    ///   module or engine never observed the delivery (registry read, tracking
+    ///   row, signing, publish, reply window) passes `true` via
+    ///   `capture_post_auth_drop`. These are what replay is for. A module that
+    ///   RAN and returned an error is deliberately NOT captured — that is an
+    ///   execution failure `module_executions` already records, and a replay
+    ///   would double its side effects.
     fn enqueue_dlq(
         &self,
         trigger_id: Option<Uuid>,
@@ -284,6 +304,34 @@ impl WebhookRouter {
                 trigger_id = ?trigger_id,
                 drop_reason = drop_reason,
                 "DLQ entry dropped due to channel capacity"
+            );
+        }
+    }
+
+    /// Record a POST-AUTH dispatch failure in the DLQ as a REPLAYABLE row.
+    ///
+    /// The request had already passed the auth gate, so the row is stamped
+    /// `authenticated: true` and `dispatch_replay` will accept it. Call this
+    /// ONLY at a site where the module / engine never observed the delivery
+    /// (`dispatch_failure` names the partition); `drop_reason` should be one
+    /// of `dispatch_failure::drop_reason::*` so the DLQ list says where the
+    /// platform failed. `capture` is `None` on the replay path itself, which
+    /// has no inbound request to record — a replay that fails is reported to
+    /// the operator directly and its row stays unreplayed.
+    fn capture_post_auth_drop(
+        &self,
+        trigger_id: Uuid,
+        capture: Option<&DlqCapture<'_>>,
+        drop_reason: &'static str,
+    ) {
+        if let Some(c) = capture {
+            self.enqueue_dlq(
+                Some(trigger_id),
+                c.source_ip,
+                drop_reason,
+                c.headers,
+                c.body,
+                true,
             );
         }
     }
@@ -1003,6 +1051,17 @@ impl WebhookRouter {
                     .await;
                     // R2-4: transient pre-execution failure — the module never
                     // ran, so abandon the dedup claim and let the sender retry.
+                    // Post-auth dispatch failure: the module never ran, so this
+                    // delivery is REPLAYABLE (`dispatch_failure` partition).
+                    self.capture_post_auth_drop(
+                        trigger_id,
+                        Some(&DlqCapture {
+                            headers,
+                            body: &body,
+                            source_ip,
+                        }),
+                        dispatch_failure::drop_reason::MODULE_LOAD_FAILED,
+                    );
                     self.release_dedup_claim(trigger_id, &dedup_claim).await;
                     return Ok((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
                         .into_response());
@@ -1038,6 +1097,17 @@ impl WebhookRouter {
                     .await;
                     // R2-4: transient pre-execution failure — the module never
                     // ran, so abandon the dedup claim and let the sender retry.
+                    // Post-auth dispatch failure: the module never ran, so this
+                    // delivery is REPLAYABLE (`dispatch_failure` partition).
+                    self.capture_post_auth_drop(
+                        trigger_id,
+                        Some(&DlqCapture {
+                            headers,
+                            body: &body,
+                            source_ip,
+                        }),
+                        dispatch_failure::drop_reason::MODULE_CONFIG_FAILED,
+                    );
                     self.release_dedup_claim(trigger_id, &dedup_claim).await;
                     return Ok((StatusCode::INTERNAL_SERVER_ERROR, "Internal server error")
                         .into_response());
@@ -1103,45 +1173,53 @@ impl WebhookRouter {
                         // the retry would be swallowed as a duplicate, turning a
                         // deferral back into a loss. Same shape as the R2-4
                         // transient-failure branch below.
-                        let (tier, write_ceiling, egress) = match actor_repo
-                            .read_module_bound_ceilings(aid)
-                            .await
-                            .resolve_for(
-                                aid,
-                                talos_actor_repository::DispatchSite::WebhookModuleDispatch,
-                            ) {
-                            Ok(triple) => triple,
-                            Err(refusal) => {
-                                tracing::error!(
-                                    trigger_id = %trigger_id,
-                                    actor_id = %aid,
-                                    error = %refusal,
-                                    "webhook dispatch: refusing rather than dispatching at a \
-                                     posture we never read"
-                                );
-                                self.log_request(
+                        let (tier, write_ceiling, egress) =
+                            match actor_repo
+                                .read_module_bound_ceilings(aid)
+                                .await
+                                .resolve_for(
+                                    aid,
+                                    talos_actor_repository::DispatchSite::WebhookModuleDispatch,
+                                ) {
+                                Ok(triple) => triple,
+                                Err(refusal) => {
+                                    tracing::error!(
+                                        trigger_id = %trigger_id,
+                                        actor_id = %aid,
+                                        error = %refusal,
+                                        "webhook dispatch: refusing rather than dispatching at a \
+                                         posture we never read"
+                                    );
+                                    self.log_request(
+                                        trigger_id,
+                                        headers,
+                                        &body,
+                                        source_ip,
+                                        StatusCode::INTERNAL_SERVER_ERROR.as_u16() as i32,
+                                        None,
+                                        0,
+                                        0,
+                                        false,
+                                        Some("Failed to resolve actor ceilings"),
+                                    )
+                                    .await;
+                                    // R2-4: the module never ran, so abandon the
+                                    // dedup claim and let the sender retry.
+                                    // Post-auth dispatch failure: the module never ran, so this
+                                    // delivery is REPLAYABLE (`dispatch_failure` partition).
+                                    self.capture_post_auth_drop(
                                     trigger_id,
-                                    headers,
-                                    &body,
-                                    source_ip,
-                                    StatusCode::INTERNAL_SERVER_ERROR.as_u16() as i32,
-                                    None,
-                                    0,
-                                    0,
-                                    false,
-                                    Some("Failed to resolve actor ceilings"),
-                                )
-                                .await;
-                                // R2-4: the module never ran, so abandon the
-                                // dedup claim and let the sender retry.
-                                self.release_dedup_claim(trigger_id, &dedup_claim).await;
-                                return Ok((
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    "Internal server error",
-                                )
-                                    .into_response());
-                            }
-                        };
+                                    Some(&DlqCapture { headers, body: &body, source_ip }),
+                                    dispatch_failure::drop_reason::MODULE_ACTOR_CEILINGS_UNREADABLE,
+                                );
+                                    self.release_dedup_claim(trigger_id, &dedup_claim).await;
+                                    return Ok((
+                                        StatusCode::INTERNAL_SERVER_ERROR,
+                                        "Internal server error",
+                                    )
+                                        .into_response());
+                                }
+                            };
                         (Some(aid), tier, write_ceiling, egress)
                     }
                     Err(e) => {
@@ -1219,6 +1297,17 @@ impl WebhookRouter {
                 .await;
                 // R2-4: transient pre-execution failure — the module never
                 // ran, so abandon the dedup claim and let the sender retry.
+                // Post-auth dispatch failure: the module never ran, so this
+                // delivery is REPLAYABLE (`dispatch_failure` partition).
+                self.capture_post_auth_drop(
+                    trigger_id,
+                    Some(&DlqCapture {
+                        headers,
+                        body: &body,
+                        source_ip,
+                    }),
+                    dispatch_failure::drop_reason::MODULE_EXECUTION_ROW_FAILED,
+                );
                 self.release_dedup_claim(trigger_id, &dedup_claim).await;
                 return Ok(
                     (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
@@ -1258,7 +1347,10 @@ impl WebhookRouter {
                                 module_id,
                                 e
                             );
-                            return Err(anyhow::anyhow!("Module not available"));
+                            return Err(ModuleDispatchFailure::NotDispatched {
+                                drop_reason: dispatch_failure::drop_reason::MODULE_EXEC_INFO_FAILED,
+                                detail: "Module not available".to_string(),
+                            });
                         }
                     };
 
@@ -1359,14 +1451,27 @@ impl WebhookRouter {
                     // else the legacy HMAC path.
                     if let Some(signer) = talos_workflow_job_protocol::configured_dispatch_signer()
                     {
-                        signer
-                            .sign_job(&mut req)
-                            .map_err(|e| anyhow::anyhow!("Failed to sign job request: {}", e))?;
+                        signer.sign_job(&mut req).map_err(|e| {
+                            ModuleDispatchFailure::NotDispatched {
+                                drop_reason: dispatch_failure::drop_reason::MODULE_SIGN_FAILED,
+                                detail: format!("Failed to sign job request: {}", e),
+                            }
+                        })?;
                     } else if let Some(key) = &worker_shared_key_clone {
-                        req.sign(key.as_bytes())
-                            .map_err(|e| anyhow::anyhow!("Failed to sign job request: {}", e))?;
+                        req.sign(key.as_bytes()).map_err(|e| {
+                            ModuleDispatchFailure::NotDispatched {
+                                drop_reason: dispatch_failure::drop_reason::MODULE_SIGN_FAILED,
+                                detail: format!("Failed to sign job request: {}", e),
+                            }
+                        })?;
                     }
-                    let payload = serde_json::to_vec(&req).map_err(|e| anyhow::anyhow!(e))?;
+                    let payload = serde_json::to_vec(&req).map_err(|e| {
+                        ModuleDispatchFailure::NotDispatched {
+                            drop_reason:
+                                dispatch_failure::drop_reason::MODULE_REQUEST_ENCODE_FAILED,
+                            detail: e.to_string(),
+                        }
+                    })?;
 
                     // Request-reply pattern via NATS, on the SIGNED inbox:
                     // subscribe first, then publish with that inbox as the
@@ -1380,13 +1485,25 @@ impl WebhookRouter {
                         talos_workflow_job_protocol::subjects::JOBS.to_string()
                     };
 
-                    let mut reply_sub = nats
-                        .subscribe(reply_inbox.clone())
-                        .await
-                        .map_err(|e| anyhow::anyhow!("reply inbox subscribe failed: {}", e))?;
+                    // Every failure from here to the reply is TYPED
+                    // (`dispatch_failure`): before the publish the worker saw
+                    // nothing (`NotDispatched`); a silent reply window is
+                    // `ReplyLost`; anything the worker actually answered is
+                    // `Answered`. The caller captures the first two classes
+                    // into the DLQ as replayable rows and never the third.
+                    let mut reply_sub = nats.subscribe(reply_inbox.clone()).await.map_err(|e| {
+                        ModuleDispatchFailure::NotDispatched {
+                            drop_reason:
+                                dispatch_failure::drop_reason::MODULE_REPLY_SUBSCRIBE_FAILED,
+                            detail: format!("reply inbox subscribe failed: {}", e),
+                        }
+                    })?;
                     nats.publish_with_reply(topic_to_use, reply_inbox.clone(), payload.into())
                         .await
-                        .map_err(|e| anyhow::anyhow!("job publish failed: {}", e))?;
+                        .map_err(|e| ModuleDispatchFailure::NotDispatched {
+                            drop_reason: dispatch_failure::drop_reason::MODULE_PUBLISH_FAILED,
+                            detail: format!("job publish failed: {}", e),
+                        })?;
                     // Best-effort flush so the publish does not sit in the
                     // local outbox while we wait; a failure here surfaces as
                     // the timeout below.
@@ -1396,12 +1513,23 @@ impl WebhookRouter {
                         futures::StreamExt::next(&mut reply_sub),
                     )
                     .await
-                    .map_err(|_| anyhow::anyhow!("WASM execution timed out after 3s"))?
-                    .ok_or_else(|| anyhow::anyhow!("reply inbox closed before a result arrived"))?;
+                    .map_err(|_| ModuleDispatchFailure::ReplyLost {
+                        drop_reason: dispatch_failure::drop_reason::MODULE_REPLY_TIMEOUT,
+                        detail: "WASM execution timed out after 3s".to_string(),
+                    })?
+                    .ok_or_else(|| ModuleDispatchFailure::ReplyLost {
+                        drop_reason: dispatch_failure::drop_reason::MODULE_REPLY_INBOX_CLOSED,
+                        detail: "reply inbox closed before a result arrived".to_string(),
+                    })?;
 
+                    // From here on the worker (or something on the bus) has
+                    // ANSWERED — nothing below is replayable.
                     let result: talos_workflow_job_protocol::JobResult =
-                        serde_json::from_slice(&response.payload)
-                            .map_err(|e| anyhow::anyhow!(e))?;
+                        serde_json::from_slice(&response.payload).map_err(|e| {
+                            ModuleDispatchFailure::Answered {
+                                detail: e.to_string(),
+                            }
+                        })?;
 
                     // SECURITY: Verify the JobResult HMAC signature before
                     // treating its `output_payload` as authoritative. Without
@@ -1450,12 +1578,12 @@ impl WebhookRouter {
                                     &e,
                                 )
                             );
-                            return Err(anyhow::anyhow!(
-                                talos_workflow_job_protocol::describe_verify_failure(
+                            return Err(ModuleDispatchFailure::Answered {
+                                detail: talos_workflow_job_protocol::describe_verify_failure(
                                     "Job result",
                                     &e,
-                                )
-                            ));
+                                ),
+                            });
                         }
                     }
 
@@ -1502,10 +1630,9 @@ impl WebhookRouter {
                         talos_workflow_job_protocol::JobStatus::Success => {
                             Ok(result.output_payload.value().to_string())
                         }
-                        _ => Err(anyhow::anyhow!(
-                            "Execution failed: {}",
-                            result.output_payload.value()
-                        )),
+                        _ => Err(ModuleDispatchFailure::Answered {
+                            detail: format!("Execution failed: {}", result.output_payload.value()),
+                        }),
                     }
                 }
             })
@@ -1540,8 +1667,35 @@ impl WebhookRouter {
                     tracing::error!(
                         trigger_id = %trigger_id,
                         error = %e,
+                        replayable = e.worker_never_saw_job(),
                         "WASM execution failed"
                     );
+                    // Post-auth DLQ capture, decided by TYPE: a publish
+                    // failure or a silent reply window leaves a REPLAYABLE
+                    // row; a module that ran and reported an error does not
+                    // (`module_executions` already records it, and a replay
+                    // would double its side effects).
+                    if let Some(reason) = e.dlq_drop_reason() {
+                        self.capture_post_auth_drop(
+                            trigger_id,
+                            Some(&DlqCapture {
+                                headers,
+                                body: &body,
+                                source_ip,
+                            }),
+                            reason,
+                        );
+                    }
+                    // R2-4 invariant extended one step: when the job never
+                    // reached NATS the module never ran, so the dedup claim
+                    // is abandoned and the sender's redelivery is honoured.
+                    // Pre-fix this arm held the claim for EVERY task error, so
+                    // a publish failure suppressed the retry as a "duplicate"
+                    // for the whole window. `ReplyLost` deliberately keeps the
+                    // claim — the worker may still be executing.
+                    if matches!(e, ModuleDispatchFailure::NotDispatched { .. }) {
+                        self.release_dedup_claim(trigger_id, &dedup_claim).await;
+                    }
                     (String::new(), false, Some(e.to_string()))
                 }
                 Err(e) => {
@@ -1777,6 +1931,13 @@ impl WebhookRouter {
                 trigger.auto_respond,
                 trigger.sync_timeout_secs,
                 &dedup_claim,
+                // Post-auth: the three pre-dispatch exits inside record a
+                // REPLAYABLE DLQ row (`dispatch_failure::drop_reason::WORKFLOW_*`).
+                Some(&DlqCapture {
+                    headers,
+                    body: &body,
+                    source_ip,
+                }),
             )
             .await
         } else {
@@ -1823,6 +1984,7 @@ impl WebhookRouter {
         auto_respond: bool,
         sync_timeout_secs: i32,
         dedup_claim: &Option<String>,
+        dlq_capture: Option<&DlqCapture<'_>>,
     ) -> Result<Response> {
         let execution_id = Uuid::new_v4();
 
@@ -1961,6 +2123,11 @@ impl WebhookRouter {
                     // FU-3: transient pre-dispatch failure — engine never ran;
                     // release the dedup claim so the sender's retry is honored.
                     self.release_dedup_claim(trigger_id, dedup_claim).await;
+                    self.capture_post_auth_drop(
+                        trigger_id,
+                        dlq_capture,
+                        dispatch_failure::drop_reason::WORKFLOW_AUTH_DB_ERROR,
+                    );
                     return Err(anyhow::anyhow!("Internal authorization error"));
                 }
             }
@@ -2006,6 +2173,11 @@ impl WebhookRouter {
                 tracing::error!("Failed to create execution record: {}", e);
                 // FU-3: transient pre-dispatch failure — engine never ran.
                 self.release_dedup_claim(trigger_id, dedup_claim).await;
+                self.capture_post_auth_drop(
+                    trigger_id,
+                    dlq_capture,
+                    dispatch_failure::drop_reason::WORKFLOW_EXECUTION_ROW_FAILED,
+                );
                 return Err(anyhow::anyhow!("Internal server error"));
             }
         };
@@ -2162,6 +2334,11 @@ impl WebhookRouter {
                 // FU-3: transient pre-dispatch failure (registry/secrets/graph
                 // build hiccup) — engine never ran; release the dedup claim.
                 self.release_dedup_claim(trigger_id, dedup_claim).await;
+                self.capture_post_auth_drop(
+                    trigger_id,
+                    dlq_capture,
+                    dispatch_failure::drop_reason::WORKFLOW_GRAPH_LOAD_FAILED,
+                );
                 return Ok((
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Failed to load workflow graph",
@@ -2739,13 +2916,19 @@ impl WebhookRouter {
     /// execution is the [`dlq::DLQ_AUTHENTICATED_KEY`] stamp `enqueue_dlq`
     /// wrote when the request was dropped (F2).
     ///
-    /// The old doc comment said "the payload was already authenticated when
-    /// first received; it was dropped only due to a transient CB/rate-limit
-    /// condition". That was false: BOTH live enqueue sites (circuit-breaker,
-    /// rate-limit) sit ABOVE the auth gate, so every row this replayed had
-    /// never had its signature or token checked. A caller who could reach a
-    /// rate-limited trigger's URL could park an arbitrary body in the DLQ and
-    /// wait for an operator to replay it as the trigger's owner.
+    /// The DLQ holds two classes of row and only one is replayable (see the
+    /// `dispatch_failure` module doc). PRE-AUTH DROPS — the circuit-breaker
+    /// and rate-limit sites, which sit ABOVE the auth gate — carry
+    /// `authenticated: false`: nothing ever checked their signature or token,
+    /// so a caller who could reach a rate-limited trigger's URL could park an
+    /// arbitrary body in the DLQ and wait for an operator to replay it as the
+    /// trigger's owner. POST-AUTH DISPATCH FAILURES — a registry read, the
+    /// tracking-row INSERT, signing, the NATS publish or a silent reply
+    /// window, at every site where the module / engine never observed the
+    /// delivery — carry `authenticated: true` and are what this method is
+    /// for. Until 2026-09-10 only the first class was ever written, so the
+    /// former doc comment ("the payload was already authenticated when first
+    /// received") described rows that did not exist.
     ///
     /// Two gates, both refusals with a caller-readable reason and NO force
     /// flag: (1) the entry must carry `authenticated: true` — a legacy row
@@ -2806,6 +2989,9 @@ impl WebhookRouter {
                 trigger.sync_timeout_secs,
                 // DLQ replay has no inbound dedup claim to release.
                 &None,
+                // …and no inbound request to re-capture: a failed replay is
+                // reported to the operator and the row stays unreplayed.
+                None,
             )
             .await?;
         } else if let Some(module_id) = trigger.module_id {

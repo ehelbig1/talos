@@ -112,6 +112,11 @@ impl OpsAlertsQueries {
     /// The caller's alerts, owner-scoped, newest activity first. With no
     /// explicit `status` the triage default excludes resolved rows; an
     /// explicit `status` filter overrides that.
+    // B1-3: price the fan-out — cost = 1 + child × effective limit,
+    // clamped exactly as the resolver clamps (see `types::list_complexity`).
+    #[graphql(
+        complexity = "crate::schema::types::list_complexity(child_complexity, limit, 50, 200)"
+    )]
     async fn ops_alerts(
         &self,
         ctx: &Context<'_>,

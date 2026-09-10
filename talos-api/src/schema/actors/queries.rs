@@ -324,6 +324,11 @@ impl ActorsQueries {
         })
     }
 
+    // B1-3: price the fan-out — cost = 1 + child × effective limit,
+    // clamped exactly as the resolver clamps (see `types::list_complexity`).
+    #[graphql(
+        complexity = "crate::schema::types::list_complexity(child_complexity, limit, 50, 200)"
+    )]
     async fn actor_action_log(
         &self,
         ctx: &Context<'_>,
@@ -399,6 +404,15 @@ impl ActorsQueries {
     /// `graphJson` so the full blob comes back per row — caller can't
     /// opt out via projection. Sibling fix to MCP-1188 (actor_memories
     /// 1000-row cap).
+    // B1-3: price the fan-out — cost = 1 + child × effective limit,
+    // clamped exactly as the resolver clamps. `actors.graphql` passes
+    // `limit: 200` (`graphqlApi.ts::ACTOR_LIST_DEFAULT_LIMIT`), so the
+    // shipped actor-detail query costs 1 + 7 × 200 = 1401; a caller that
+    // omits the limit is priced at the 1000-row default (7001) and refused,
+    // which is the honest price of that query.
+    #[graphql(
+        complexity = "crate::schema::types::list_complexity(child_complexity, limit, 1000, 1000)"
+    )]
     async fn actor_workflows(
         &self,
         ctx: &Context<'_>,
@@ -479,6 +493,14 @@ impl ActorsQueries {
     /// memory-heavy actor could trash the controller on repeated calls
     /// via the dashboard. The MCP sibling `handle_list_actor_memories`
     /// has always had a 200-row cap; this query was the holdout.
+    // B1-3: price the fan-out — cost = 1 + child × effective limit,
+    // clamped exactly as the resolver clamps. `actors.graphql` passes
+    // `limit: 200` (`graphqlApi.ts::ACTOR_LIST_DEFAULT_LIMIT`): the
+    // actor-detail query costs 1 + 5 × 200 = 1001; omitting the limit is
+    // priced at the 1000-row default (5001) and refused.
+    #[graphql(
+        complexity = "crate::schema::types::list_complexity(child_complexity, limit, 1000, 1000)"
+    )]
     async fn actor_memories(
         &self,
         ctx: &Context<'_>,
@@ -714,6 +736,11 @@ impl ActorsQueries {
     /// fetch-all audit class as MCP-1188 / MCP-1189; here per-row
     /// size is small (Uuid + name + two timestamps) so the worst-
     /// case is dominated by row count rather than per-row weight.
+    // B1-3: price the fan-out — cost = 1 + child × effective limit,
+    // clamped exactly as the resolver clamps (see `types::list_complexity`).
+    #[graphql(
+        complexity = "crate::schema::types::list_complexity(child_complexity, limit, 100, 1000)"
+    )]
     async fn mcp_agents(
         &self,
         ctx: &Context<'_>,

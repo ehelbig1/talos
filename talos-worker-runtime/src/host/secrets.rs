@@ -382,11 +382,44 @@ impl wit_secrets::Host for TalosContext {
             // Redis-error and Redis-absent paths route through the
             // same fallback helper — keeping MCP-722's "never-configured
             // = same fail-closed path as outage" invariant intact.
+            // 2026-09-10: ATOMIC (one-EVAL INCR + conditional EXPIRE, like the
+            // three sibling limiters), over the runtime's ONE shared
+            // `ConnectionManager` instead of a handshake per call, and
+            // FAIL-CLOSED in production. The in-memory fallback is per-POD:
+            // during a Redis outage a fleet of N workers honoured N× the daily
+            // cap, so in production a tier-2 exposure the platform cannot
+            // count fleet-wide is REFUSED. Outside production (dev / test,
+            // where Redis is routinely absent) the per-pod fallback stays so
+            // the path remains exercisable. MCP-722's invariant is kept in
+            // BOTH modes: never-configured takes the same path as an outage —
+            // which in production now means refusal.
             use crate::expose_fallback::FallbackVerdict;
-            let global_allowed = if let Some(ref redis) = self.redis_client {
-                match Self::check_global_expose_limit(redis, &key).await {
-                    Ok(allowed) => allowed,
-                    Err(e) => {
+            let redis_verdict: Option<anyhow::Result<bool>> = if self.redis_client.is_some() {
+                Some(match self.redis_conn().await {
+                    Ok(mut conn) => Self::check_global_expose_limit(&mut conn, &key).await,
+                    Err(e) => Err(anyhow::anyhow!("Failed to get Redis connection: {}", e)),
+                })
+            } else {
+                None
+            };
+            let global_allowed = match redis_verdict {
+                Some(Ok(allowed)) => allowed,
+                unavailable => {
+                    let cause = match &unavailable {
+                        Some(Err(e)) => format!("Redis global expose limit check failed: {e}"),
+                        _ => "Redis not configured for global expose limit".to_string(),
+                    };
+                    if redis_unavailable_refuses_expose(talos_config::is_production()) {
+                        tracing::warn!(
+                            target: "talos_audit",
+                            user_id = %user_id,
+                            cause = %cause,
+                            limit = MAX_TIER2_EXPOSES_PER_USER_PER_DAY,
+                            "tier-2 expose_secret REFUSED: the daily cap cannot be counted \
+                             fleet-wide, and a per-pod count is not a cap (fail closed in production)"
+                        );
+                        false
+                    } else {
                         let verdict = self.global_expose_fallback.check_and_increment(
                             user_id,
                             today_naive,
@@ -398,40 +431,15 @@ impl wit_secrets::Host for TalosContext {
                         };
                         tracing::warn!(
                             user_id = %user_id,
-                            error = %e,
+                            cause = %cause,
                             fallback_count,
-                            "Redis global expose limit check failed, using in-memory fallback ({}/{})",
+                            "{cause}; using the in-memory PER-POD fallback ({}/{}) — non-production only",
                             fallback_count,
                             MAX_TIER2_EXPOSES_PER_USER_PER_DAY
                         );
                         allowed
                     }
                 }
-            } else {
-                // MCP-722 (2026-05-13): Redis ABSENT (env-unconfigured)
-                // must follow the same fallback path as Redis-ERROR.
-                // Pre-fix this arm returned `true` unconditionally,
-                // silently bypassing the daily per-user cap whenever
-                // an operator ran the worker without Redis configured.
-                // M-2 (2026-05-22): the fallback is now per-user, not
-                // process-wide — see expose_fallback.rs.
-                let verdict = self.global_expose_fallback.check_and_increment(
-                    user_id,
-                    today_naive,
-                    MAX_TIER2_EXPOSES_PER_USER_PER_DAY,
-                );
-                let (allowed, fallback_count) = match verdict {
-                    FallbackVerdict::Allowed { count } => (true, count),
-                    FallbackVerdict::Denied { count } => (false, count),
-                };
-                tracing::warn!(
-                    user_id = %user_id,
-                    fallback_count,
-                    "Redis not configured for global expose limit; using in-memory fallback ({}/{})",
-                    fallback_count,
-                    MAX_TIER2_EXPOSES_PER_USER_PER_DAY
-                );
-                allowed
             };
 
             if !global_allowed {
@@ -589,5 +597,28 @@ impl wit_secrets::Host for TalosContext {
             }
         };
         self.get_secret(path).await
+    }
+}
+
+/// When the fleet-wide tier-2 expose counter cannot be reached (Redis down
+/// or not configured), is the exposure REFUSED rather than counted per pod?
+///
+/// `true` in production: the in-memory fallback is per-pod, so N workers
+/// would honour N× the daily cap — a limit the platform cannot enforce is
+/// not a limit. `false` elsewhere, where Redis is routinely absent and the
+/// path must stay exercisable. Pure so the decision is pinned without a
+/// process-wide `RUST_ENV` flip.
+pub(crate) fn redis_unavailable_refuses_expose(is_production: bool) -> bool {
+    is_production
+}
+
+#[cfg(test)]
+mod expose_redis_unavailable_policy_tests {
+    use super::redis_unavailable_refuses_expose;
+
+    #[test]
+    fn production_fails_closed_and_development_falls_back() {
+        assert!(redis_unavailable_refuses_expose(true));
+        assert!(!redis_unavailable_refuses_expose(false));
     }
 }

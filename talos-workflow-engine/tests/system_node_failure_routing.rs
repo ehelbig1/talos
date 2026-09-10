@@ -568,3 +568,179 @@ async fn agent_loop_failure_is_survivable_with_continue_on_error() {
         Some(true)
     );
 }
+
+// ── Child-dispatch timeout (2026-09-10) ──────────────────────────────────────
+//
+// `timeout_secs` on every child-running kind was parsed and never applied
+// (destructured `timeout_secs: _` at seven dispatch sites). It is applied now,
+// OPT-IN via `enforce_timeout: true`, because the `add_sub_workflow_node`
+// tool stamps `timeout_secs: 30` on every node it authors and the fleet's
+// LLM-bearing children legitimately run past 30 s. The typed builder emits
+// the marker for a non-zero timeout; a raw node without it is bounded by the
+// run's remaining budget only. On expiry the NODE fails through the reactor's
+// one system-node failure path — the same route the tests above pin.
+
+/// Sleeps, then answers. The child workflow's only node uses it, so the
+/// test controls exactly how long the child takes.
+struct SleepingDispatcher(Duration, serde_json::Value);
+
+#[async_trait]
+impl NodeDispatcher for SleepingDispatcher {
+    async fn dispatch(&self, _job: DispatchJob) -> Result<DispatchResult, BoxError> {
+        tokio::time::sleep(self.0).await;
+        Ok(DispatchResult {
+            output: self.1.clone(),
+        })
+    }
+
+    async fn dispatch_chain(
+        &self,
+        request: ChainDispatchRequest,
+    ) -> Result<ChainDispatchResult, BoxError> {
+        tokio::time::sleep(self.0).await;
+        let steps: Vec<ChainStepResult> = request
+            .steps
+            .iter()
+            .map(|j| ChainStepResult {
+                module_id: j.module_id,
+                status: StepStatus::Success,
+                output: self.1.clone(),
+                error: None,
+                execution_time_ms: 0,
+            })
+            .collect();
+        Ok(ChainDispatchResult {
+            steps,
+            final_output: self.1.clone(),
+            overall_status: StepStatus::Success,
+        })
+    }
+}
+
+/// A child that sleeps past an EXPLICIT (typed-builder) `timeout_secs` fails
+/// the node, the run's error names the kind and the cap, and it does so well
+/// before the 30 s run budget — i.e. the per-node cap, not the outer timeout,
+/// decided it.
+#[tokio::test]
+async fn subworkflow_child_past_an_explicit_timeout_fails_the_node() {
+    let sub_wf_id = Uuid::new_v4();
+    let module_id = Uuid::new_v4();
+    let parent = WorkflowGraphBuilder::new()
+        .add_system_node(
+            "call_child",
+            SystemNodeKind::SubWorkflow {
+                workflow_id: sub_wf_id,
+                timeout_secs: 1,
+            },
+        )
+        .build()
+        .expect("parent graph builds");
+    assert_eq!(
+        parent["nodes"][0]["data"]["enforce_timeout"],
+        json!(true),
+        "a typed non-zero timeout is an author's choice and must opt in"
+    );
+
+    let engine = engine_for(&parent, Some(child_graph(module_id)), module_id, None);
+    let started = std::time::Instant::now();
+    let result = engine
+        .run_with_transport(
+            Arc::new(SleepingDispatcher(
+                Duration::from_secs(4),
+                json!({ "ok": true }),
+            )),
+            None,
+            Uuid::new_v4(),
+        )
+        .await;
+    let elapsed = started.elapsed();
+
+    let err = match result {
+        Ok(_) => panic!("a child that outlives its enforced timeout must fail the run"),
+        Err(e) => e.to_string(),
+    };
+    assert!(
+        err.contains("sub_workflow timed out after 1s"),
+        "the run's error must name the kind and the cap, got: {err}"
+    );
+    assert!(
+        err.contains("node timeout_secs"),
+        "the message must say the NODE cap decided it, got: {err}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "the node cap (1 s), not the child's 4 s sleep or the 30 s run budget, must end it; took {elapsed:?}"
+    );
+}
+
+/// The control: a child that finishes under its explicit timeout succeeds
+/// and the run completes.
+#[tokio::test]
+async fn subworkflow_child_under_an_explicit_timeout_succeeds() {
+    let sub_wf_id = Uuid::new_v4();
+    let module_id = Uuid::new_v4();
+    let parent = WorkflowGraphBuilder::new()
+        .add_system_node(
+            "call_child",
+            SystemNodeKind::SubWorkflow {
+                workflow_id: sub_wf_id,
+                timeout_secs: 5,
+            },
+        )
+        .build()
+        .expect("parent graph builds");
+
+    let engine = engine_for(&parent, Some(child_graph(module_id)), module_id, None);
+    let result = engine
+        .run_with_transport(
+            Arc::new(SleepingDispatcher(
+                Duration::from_millis(200),
+                json!({ "ok": true }),
+            )),
+            None,
+            Uuid::new_v4(),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "a child under its timeout must not be failed: {:?}",
+        result.err()
+    );
+}
+
+/// The MCP-stamped shape: `timeout_secs: 1` with NO `enforce_timeout` marker
+/// — exactly what `add_sub_workflow_node` writes for every node with its
+/// default of 30. It must NOT be enforced; the child runs past it and the run
+/// completes (bounded only by the 30 s run budget the harness sets).
+#[tokio::test]
+async fn subworkflow_stored_timeout_without_the_marker_is_not_enforced() {
+    let sub_wf_id = Uuid::new_v4();
+    let module_id = Uuid::new_v4();
+    let parent = WorkflowGraphBuilder::new()
+        .add_raw_node(json!({
+            "id": "call_child",
+            "type": "system:sub_workflow",
+            "kind": "sub_workflow",
+            "data": { "sub_workflow_id": sub_wf_id.to_string(), "timeout_secs": 1 }
+        }))
+        .build()
+        .expect("parent graph builds");
+
+    let engine = engine_for(&parent, Some(child_graph(module_id)), module_id, None);
+    let result = engine
+        .run_with_transport(
+            Arc::new(SleepingDispatcher(
+                Duration::from_secs(2),
+                json!({ "ok": true }),
+            )),
+            None,
+            Uuid::new_v4(),
+        )
+        .await;
+    assert!(
+        result.is_ok(),
+        "a tool-stamped timeout_secs with no enforce_timeout marker must not fail a \
+         legitimate child: {:?}",
+        result.err()
+    );
+}

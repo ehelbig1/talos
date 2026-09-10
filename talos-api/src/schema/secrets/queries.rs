@@ -12,6 +12,11 @@ pub struct SecretsQueries;
 
 #[Object]
 impl SecretsQueries {
+    // B1-3: price the fan-out — cost = 1 + child × effective limit,
+    // clamped exactly as the resolver clamps (see `types::list_complexity`).
+    #[graphql(
+        complexity = "crate::schema::types::pagination_complexity(child_complexity, pagination.as_ref(), 100, 1000)"
+    )]
     async fn secrets(
         &self,
         ctx: &Context<'_>,
@@ -128,6 +133,11 @@ impl SecretsQueries {
         })
     }
 
+    // B1-3: price the fan-out — cost = 1 + child × effective limit,
+    // clamped exactly as the resolver clamps (see `types::list_complexity`).
+    #[graphql(
+        complexity = "crate::schema::types::pagination_complexity(child_complexity, pagination.as_ref(), 100, 1000)"
+    )]
     async fn secret_audit_log(
         &self,
         ctx: &Context<'_>,

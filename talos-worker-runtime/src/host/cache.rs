@@ -1,4 +1,10 @@
 //! `cache` (Redis) host interface with per-user key namespacing.
+//!
+//! Every host function here takes its connection from
+//! `TalosContext::redis_conn()` — ONE lazily-built `ConnectionManager` shared
+//! across every job on the runtime (2026-09-10). Before that each of the nine
+//! functions opened `get_multiplexed_async_connection()` per guest call, i.e. a
+//! TCP (+TLS+AUTH) handshake per `cache::get`.
 
 use super::*;
 
@@ -98,15 +104,10 @@ impl wit_cache::Host for TalosContext {
                 return Err(wit_cache::Error::Operationfailed);
             }
 
-            let redis = self
-                .redis_client
-                .as_ref()
-                .ok_or(wit_cache::Error::Connectionfailed)?;
-
             let ns_key = namespaced_cache_key(self, &key);
             use redis::AsyncCommands;
-            let mut conn = redis
-                .get_multiplexed_async_connection()
+            let mut conn = self
+                .redis_conn()
                 .await
                 .map_err(|_| wit_cache::Error::Connectionfailed)?;
             conn.get::<_, String>(&ns_key)
@@ -158,15 +159,10 @@ impl wit_cache::Host for TalosContext {
                 return Err(wit_cache::Error::Operationfailed);
             }
 
-            let redis = self
-                .redis_client
-                .as_ref()
-                .ok_or(wit_cache::Error::Connectionfailed)?;
-
             let ns_key = namespaced_cache_key(self, &key);
             use redis::AsyncCommands;
-            let mut conn = redis
-                .get_multiplexed_async_connection()
+            let mut conn = self
+                .redis_conn()
                 .await
                 .map_err(|_| wit_cache::Error::Connectionfailed)?;
             match ttl {
@@ -208,15 +204,10 @@ impl wit_cache::Host for TalosContext {
                 return Err(wit_cache::Error::Operationfailed);
             }
 
-            let redis = self
-                .redis_client
-                .as_ref()
-                .ok_or(wit_cache::Error::Connectionfailed)?;
-
             let ns_key = namespaced_cache_key(self, &key);
             use redis::AsyncCommands;
-            let mut conn = redis
-                .get_multiplexed_async_connection()
+            let mut conn = self
+                .redis_conn()
                 .await
                 .map_err(|_| wit_cache::Error::Connectionfailed)?;
             conn.del::<_, ()>(&ns_key)
@@ -255,13 +246,9 @@ impl wit_cache::Host for TalosContext {
         if key.is_empty() || key.len() > MAX_CACHE_KEY_BYTES {
             return false;
         }
-        let Some(redis) = &self.redis_client else {
-            return false;
-        };
-
         let ns_key = namespaced_cache_key(self, &key);
         use redis::AsyncCommands;
-        let Ok(mut conn) = redis.get_multiplexed_async_connection().await else {
+        let Ok(mut conn) = self.redis_conn().await else {
             return false;
         };
         conn.exists::<_, bool>(&ns_key).await.unwrap_or(false)
@@ -284,15 +271,10 @@ impl wit_cache::Host for TalosContext {
             return Err(wit_cache::Error::Operationfailed);
         }
 
-        let redis = self
-            .redis_client
-            .as_ref()
-            .ok_or(wit_cache::Error::Connectionfailed)?;
-
         let ns_key = namespaced_cache_key(self, &key);
         use redis::AsyncCommands;
-        let mut conn = redis
-            .get_multiplexed_async_connection()
+        let mut conn = self
+            .redis_conn()
             .await
             .map_err(|_| wit_cache::Error::Connectionfailed)?;
         conn.incr::<_, _, i64>(&ns_key, amount)
@@ -403,15 +385,10 @@ impl wit_cache::Host for TalosContext {
             }
         }
 
-        let redis = self
-            .redis_client
-            .as_ref()
-            .ok_or(wit_cache::Error::Connectionfailed)?;
-
         let ns_keys: Vec<String> = keys.iter().map(|k| namespaced_cache_key(self, k)).collect();
         use redis::AsyncCommands;
-        let mut conn = redis
-            .get_multiplexed_async_connection()
+        let mut conn = self
+            .redis_conn()
             .await
             .map_err(|_| wit_cache::Error::Connectionfailed)?;
         conn.mget::<_, Vec<Option<String>>>(ns_keys)
@@ -475,18 +452,13 @@ impl wit_cache::Host for TalosContext {
             }
         }
 
-        let redis = self
-            .redis_client
-            .as_ref()
-            .ok_or(wit_cache::Error::Connectionfailed)?;
-
         let ns_pairs: Vec<(String, String)> = pairs
             .into_iter()
             .map(|(k, v)| (namespaced_cache_key(self, &k), v))
             .collect();
         use redis::AsyncCommands;
-        let mut conn = redis
-            .get_multiplexed_async_connection()
+        let mut conn = self
+            .redis_conn()
             .await
             .map_err(|_| wit_cache::Error::Connectionfailed)?;
         conn.mset::<_, _, ()>(&ns_pairs)
@@ -511,15 +483,10 @@ impl wit_cache::Host for TalosContext {
             return Err(wit_cache::Error::Operationfailed);
         }
 
-        let redis = self
-            .redis_client
-            .as_ref()
-            .ok_or(wit_cache::Error::Connectionfailed)?;
-
         let ns_key = namespaced_cache_key(self, &key);
         use redis::AsyncCommands;
-        let mut conn = redis
-            .get_multiplexed_async_connection()
+        let mut conn = self
+            .redis_conn()
             .await
             .map_err(|_| wit_cache::Error::Connectionfailed)?;
         conn.expire::<_, ()>(&ns_key, ttl as i64)

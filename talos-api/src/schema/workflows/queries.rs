@@ -92,6 +92,11 @@ impl WorkflowsQueries {
             .collect())
     }
 
+    // B1-3: price the fan-out — cost = 1 + child × effective limit,
+    // clamped exactly as the resolver clamps (see `types::list_complexity`).
+    #[graphql(
+        complexity = "crate::schema::types::pagination_complexity(child_complexity, pagination.as_ref(), 50, 1000)"
+    )]
     async fn workflow_execution_history(
         &self,
         ctx: &Context<'_>,
@@ -248,6 +253,11 @@ impl WorkflowsQueries {
         })
     }
 
+    // B1-3: price the fan-out — cost = 1 + child × effective limit,
+    // clamped exactly as the resolver clamps (see `types::list_complexity`).
+    #[graphql(
+        complexity = "crate::schema::types::pagination_complexity(child_complexity, pagination.as_ref(), 100, 1000)"
+    )]
     async fn workflows(
         &self,
         ctx: &Context<'_>,
@@ -323,6 +333,12 @@ impl WorkflowsQueries {
         input: AnalyzeRhaiInput,
     ) -> Result<AnalyzeCustomModuleResult> {
         require_scope(ctx, talos_api_keys::ApiKeyScope::WorkflowsRead)?;
+        // B1-3: inline analysis of a caller-supplied script (≤100 KB) —
+        // per-user token bucket (`GRAPHQL_RHAI_PER_USER_PER_MIN`, default 60).
+        crate::schema::throttle::enforce_user_throttle(
+            ctx,
+            crate::schema::throttle::ThrottleClass::RhaiEval,
+        )?;
 
         let compiler = ctx.data::<Arc<CompilationService>>()?;
 
@@ -357,6 +373,13 @@ impl WorkflowsQueries {
         input: TestRhaiExpressionInput,
     ) -> Result<TestRhaiExpressionResult> {
         require_scope(ctx, talos_api_keys::ApiKeyScope::WorkflowsRead)?;
+        // B1-3: inline evaluation of a caller-supplied script (≤100 KB) over
+        // up to 1 MB of context — per-user token bucket
+        // (`GRAPHQL_RHAI_PER_USER_PER_MIN`, default 60).
+        crate::schema::throttle::enforce_user_throttle(
+            ctx,
+            crate::schema::throttle::ThrottleClass::RhaiEval,
+        )?;
 
         const MAX_RHAI_SCRIPT_BYTES: usize = 100_000; // 100 KB
         const MAX_RHAI_CONTEXT_BYTES: usize = 1_000_000; // 1 MB
@@ -375,6 +398,11 @@ impl WorkflowsQueries {
         Ok(eval_rhai_preview(&input.script, &mock_context))
     }
 
+    // B1-3: price the fan-out — cost = 1 + child × effective limit,
+    // clamped exactly as the resolver clamps (see `types::list_complexity`).
+    #[graphql(
+        complexity = "crate::schema::types::list_complexity(child_complexity, limit, 50, 1000)"
+    )]
     async fn workflow_versions(
         &self,
         ctx: &Context<'_>,
@@ -594,6 +622,11 @@ impl WorkflowsQueries {
         }))
     }
 
+    // B1-3: price the fan-out — cost = 1 + child × effective limit,
+    // clamped exactly as the resolver clamps (see `types::list_complexity`).
+    #[graphql(
+        complexity = "crate::schema::types::list_complexity(child_complexity, limit, 100, 1000)"
+    )]
     async fn my_schedules(
         &self,
         ctx: &Context<'_>,
@@ -794,6 +827,11 @@ impl WorkflowsQueries {
         })
     }
 
+    // B1-3: price the fan-out — cost = 1 + child × effective limit,
+    // clamped exactly as the resolver clamps (see `types::list_complexity`).
+    #[graphql(
+        complexity = "crate::schema::types::list_complexity(child_complexity, limit, 10, 100)"
+    )]
     async fn get_workflow_changelog(
         &self,
         ctx: &Context<'_>,
@@ -913,6 +951,11 @@ impl WorkflowsQueries {
     /// get a huge response on every dashboard `pendingApprovals` call;
     /// repeated polls trash controller heap. Same cross-protocol
     /// GraphQL-must-mirror-MCP class as MCP-1188/1189.
+    // B1-3: price the fan-out — cost = 1 + child × effective limit,
+    // clamped exactly as the resolver clamps (see `types::list_complexity`).
+    #[graphql(
+        complexity = "crate::schema::types::list_complexity(child_complexity, limit, 20, 100)"
+    )]
     async fn pending_approvals(
         &self,
         ctx: &Context<'_>,

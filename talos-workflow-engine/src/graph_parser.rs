@@ -138,6 +138,48 @@ pub(crate) fn read_node_retry_policy_with_actor_cap(
 /// builder serializer in [`crate::graph_builder`] and this decoder
 /// can't drift.
 ///
+/// Sentinel value of `SystemNodeKind::*::timeout_secs` on the kinds that RUN a
+/// child workflow (`sub_workflow`, `dispatch`, `capability_dispatch`,
+/// `judge`, `ensemble`, `reflective_retry`, `llm_dispatch`): **no per-node
+/// timeout is enforced**; the child is bounded only by the run's remaining
+/// wall-clock budget. See [`child_timeout_secs`] for why the default is NOT
+/// the number in the node's `data.timeout_secs`.
+pub(crate) const CHILD_TIMEOUT_NOT_ENFORCED: u64 = 0;
+
+/// Read a child-dispatch node's enforced timeout (2026-09-10).
+///
+/// Until this change `data.timeout_secs` was parsed for all seven child
+/// kinds and then destructured as `timeout_secs: _` at every dispatch site —
+/// documented as "Hard timeout for the sub-workflow in seconds" and applied
+/// nowhere (only `AgentLoop` / `ReActLoop` honoured theirs). Applying it verbatim
+/// was measured and REJECTED: the `add_sub_workflow_node` MCP tool stamps
+/// `timeout_secs: 30` into EVERY node it authors (`validate_range_u64(args,
+/// "timeout_secs", 1, 600, 30)`), so on the reference fleet a stored `30` is
+/// indistinguishable from an author's choice, and the flagship's LLM-bearing
+/// sub-workflows run 8.5 s at p50 solo and 37.8–83 s with one or two
+/// concurrent siblings (see the 2026-09-09 gate entry) — a suddenly-enforced
+/// 30 s would fail legitimate children that succeed today.
+///
+/// So enforcement is OPT-IN: the node must carry `enforce_timeout: true`
+/// beside `timeout_secs`. Absent that marker the value is
+/// [`CHILD_TIMEOUT_NOT_ENFORCED`] and the child is bounded by the run's
+/// remaining budget only (which the dispatch site now applies as a clean
+/// NODE failure instead of letting the run's outer timeout drop everything).
+/// `WorkflowGraphBuilder::add_system_node` emits the marker whenever the typed
+/// kind carries a non-zero `timeout_secs`, because a typed value IS an
+/// author's choice — so builder round-trips are unchanged.
+///
+/// `default_secs` applies only when the marker is set and `timeout_secs` is
+/// absent (the pre-change per-kind default, kept for that case).
+pub(crate) fn child_timeout_secs(data: &JsonValue, default_secs: u64) -> u64 {
+    if data.get("enforce_timeout").and_then(|v| v.as_bool()) != Some(true) {
+        return CHILD_TIMEOUT_NOT_ENFORCED;
+    }
+    data.get("timeout_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(default_secs)
+}
+
 /// Returns `None` when `k` is unknown or the `data` payload is missing
 /// required fields — the caller treats that as "no system-kind
 /// decoded" and the node runs as a plain module / presentation-only
@@ -156,10 +198,7 @@ pub(crate) fn parse_system_node_kind(k: &str, node: &JsonValue) -> Option<System
         let data = node.get("data")?;
         Some(SystemNodeKind::SubWorkflow {
             workflow_id: data.get("sub_workflow_id")?.as_str()?.parse().ok()?,
-            timeout_secs: data
-                .get("timeout_secs")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(30),
+            timeout_secs: child_timeout_secs(data, 30),
         })
     } else if k == "loop" {
         let data = node.get("data")?;
@@ -275,10 +314,7 @@ pub(crate) fn parse_system_node_kind(k: &str, node: &JsonValue) -> Option<System
         let data = node.get("data")?;
         Some(SystemNodeKind::DynamicDispatch {
             dispatch_expression: data.get("dispatch_expression")?.as_str()?.to_string(),
-            timeout_secs: data
-                .get("timeout_secs")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(30),
+            timeout_secs: child_timeout_secs(data, 30),
         })
     } else if k == "capability_dispatch" {
         let data = node.get("data")?;
@@ -298,10 +334,7 @@ pub(crate) fn parse_system_node_kind(k: &str, node: &JsonValue) -> Option<System
         Some(SystemNodeKind::CapabilityDispatch {
             required_capabilities: caps,
             fallback_workflow_id,
-            timeout_secs: data
-                .get("timeout_secs")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(30),
+            timeout_secs: child_timeout_secs(data, 30),
         })
     } else {
         // LLM/agent-specific kinds (feature-gated).
@@ -352,10 +385,7 @@ fn parse_llm_system_node_kind(k: &str, node: &JsonValue) -> Option<SystemNodeKin
             .unwrap_or("")
             .to_string();
         let pass_threshold = data.get("pass_threshold").and_then(|v| v.as_f64());
-        let timeout_secs = data
-            .get("timeout_secs")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(60);
+        let timeout_secs = child_timeout_secs(data, 60);
         let on_failure = data
             .get("on_failure")
             .and_then(|v| v.as_str())
@@ -413,10 +443,7 @@ fn parse_llm_system_node_kind(k: &str, node: &JsonValue) -> Option<SystemNodeKin
             .get("judge_workflow_id")
             .and_then(|v| v.as_str())
             .and_then(|s| uuid::Uuid::parse_str(s).ok());
-        let timeout_secs = data
-            .get("timeout_secs")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(60);
+        let timeout_secs = child_timeout_secs(data, 60);
         Some(SystemNodeKind::Ensemble {
             child_workflow_id,
             count,
@@ -464,10 +491,7 @@ fn parse_llm_system_node_kind(k: &str, node: &JsonValue) -> Option<SystemNodeKin
             .unwrap_or(2)
             .min(5)
             .max(1) as u32;
-        let timeout_secs = data
-            .get("timeout_secs")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(60);
+        let timeout_secs = child_timeout_secs(data, 60);
         Some(SystemNodeKind::ReflectiveRetry {
             child_workflow_id,
             reflection_workflow_id,
@@ -498,10 +522,7 @@ fn parse_llm_system_node_kind(k: &str, node: &JsonValue) -> Option<SystemNodeKin
             .get("fallback_workflow_id")
             .and_then(|v| v.as_str())
             .and_then(|s| uuid::Uuid::parse_str(s).ok());
-        let timeout_secs = data
-            .get("timeout_secs")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(60);
+        let timeout_secs = child_timeout_secs(data, 60);
         Some(SystemNodeKind::LlmDispatch {
             classifier_workflow_id,
             routes,
@@ -537,6 +558,98 @@ fn parse_llm_system_node_kind(k: &str, node: &JsonValue) -> Option<SystemNodeKin
 #[cfg(not(feature = "llm-primitives"))]
 fn parse_llm_system_node_kind(_k: &str, _node: &JsonValue) -> Option<SystemNodeKind> {
     None
+}
+
+#[cfg(test)]
+mod child_timeout_secs_tests {
+    //! `enforce_timeout` is the opt-in; without it the stored number — which
+    //! the `add_sub_workflow_node` tool stamps as `30` on every node — is not
+    //! a cap. See `child_timeout_secs` for the measurement behind that.
+    use super::{child_timeout_secs, parse_system_node_kind, CHILD_TIMEOUT_NOT_ENFORCED};
+    use serde_json::json;
+    use talos_workflow_engine_core::SystemNodeKind;
+
+    #[test]
+    fn a_stored_timeout_without_the_marker_is_not_enforced() {
+        assert_eq!(
+            child_timeout_secs(&json!({ "timeout_secs": 30 }), 30),
+            CHILD_TIMEOUT_NOT_ENFORCED
+        );
+        assert_eq!(
+            child_timeout_secs(&json!({}), 60),
+            CHILD_TIMEOUT_NOT_ENFORCED
+        );
+        assert_eq!(
+            child_timeout_secs(&json!({ "timeout_secs": 30, "enforce_timeout": false }), 30),
+            CHILD_TIMEOUT_NOT_ENFORCED
+        );
+        // A non-boolean marker is not a marker.
+        assert_eq!(
+            child_timeout_secs(&json!({ "timeout_secs": 30, "enforce_timeout": "yes" }), 30),
+            CHILD_TIMEOUT_NOT_ENFORCED
+        );
+    }
+
+    #[test]
+    fn the_marker_enforces_the_stored_timeout_or_the_kind_default() {
+        assert_eq!(
+            child_timeout_secs(&json!({ "timeout_secs": 90, "enforce_timeout": true }), 30),
+            90
+        );
+        assert_eq!(
+            child_timeout_secs(&json!({ "enforce_timeout": true }), 60),
+            60
+        );
+    }
+
+    #[test]
+    fn every_child_kind_reads_through_the_same_rule() {
+        let wf = uuid::Uuid::new_v4();
+        let sub = parse_system_node_kind(
+            "sub_workflow",
+            &json!({ "data": { "sub_workflow_id": wf.to_string(), "timeout_secs": 30 } }),
+        );
+        assert!(matches!(
+            sub,
+            Some(SystemNodeKind::SubWorkflow {
+                timeout_secs: CHILD_TIMEOUT_NOT_ENFORCED,
+                ..
+            })
+        ));
+        let sub = parse_system_node_kind(
+            "sub_workflow",
+            &json!({ "data": { "sub_workflow_id": wf.to_string(), "timeout_secs": 30, "enforce_timeout": true } }),
+        );
+        assert!(matches!(
+            sub,
+            Some(SystemNodeKind::SubWorkflow {
+                timeout_secs: 30,
+                ..
+            })
+        ));
+        let judge = parse_system_node_kind(
+            "judge",
+            &json!({ "data": { "judge_workflow_id": wf.to_string(), "timeout_secs": 15 } }),
+        );
+        assert!(matches!(
+            judge,
+            Some(SystemNodeKind::Judge {
+                timeout_secs: CHILD_TIMEOUT_NOT_ENFORCED,
+                ..
+            })
+        ));
+        let dispatch = parse_system_node_kind(
+            "dispatch",
+            &json!({ "data": { "dispatch_expression": "x", "enforce_timeout": true } }),
+        );
+        assert!(matches!(
+            dispatch,
+            Some(SystemNodeKind::DynamicDispatch {
+                timeout_secs: 30,
+                ..
+            })
+        ));
+    }
 }
 
 #[cfg(test)]

@@ -453,6 +453,72 @@ impl PaginationInput {
     }
 }
 
+/// Query-complexity of a LIST field whose row count is caller-bounded
+/// (B1-3, 2026-09-10 review).
+///
+/// async-graphql prices a field at `1 + child_complexity` regardless of how
+/// many rows it returns, so `workflows(pagination: {limit: 1000}) { … }`
+/// cost the same as `limit: 1` and `limit_complexity(5000)` never saw the
+/// fan-out. This is the `#[graphql(complexity = …)]` expression for every
+/// list resolver that takes a `limit` / `pagination.limit` argument: cost =
+/// `1 + child_complexity × effective_rows`, where `effective_rows` is the
+/// SAME `unwrap_or(default).clamp(1, max)` the resolver applies, so the price
+/// tracks what would actually be fetched. `Into<i64>` because the resolvers
+/// declare `limit` as either `i32` or `i64`.
+pub fn list_complexity<T: Into<i64>>(
+    child_complexity: usize,
+    requested: Option<T>,
+    default: i64,
+    max: i64,
+) -> usize {
+    let rows = requested.map(Into::into).unwrap_or(default).clamp(1, max);
+    // `rows >= 1` after the clamp, so the cast cannot truncate a negative.
+    1 + child_complexity.saturating_mul(rows as usize)
+}
+
+/// [`list_complexity`] for resolvers that take `pagination: Option<PaginationInput>`.
+pub fn pagination_complexity(
+    child_complexity: usize,
+    pagination: Option<&PaginationInput>,
+    default: i64,
+    max: i64,
+) -> usize {
+    list_complexity(
+        child_complexity,
+        pagination.and_then(|p| p.limit),
+        default,
+        max,
+    )
+}
+
+#[cfg(test)]
+mod list_complexity_tests {
+    use super::*;
+
+    #[test]
+    fn scales_with_the_effective_row_count() {
+        // Two scalar children, default 100, max 1000.
+        assert_eq!(list_complexity(2, None::<i32>, 100, 1000), 201);
+        assert_eq!(list_complexity(2, Some(10i32), 100, 1000), 21);
+        assert_eq!(list_complexity(2, Some(1000i32), 100, 1000), 2001);
+        // Clamped exactly like the resolver: over-ask prices at the cap,
+        // a negative or zero prices at one row.
+        assert_eq!(list_complexity(2, Some(5000i32), 100, 1000), 2001);
+        assert_eq!(list_complexity(2, Some(-7i32), 100, 1000), 3);
+        assert_eq!(list_complexity(3, Some(50i64), 50, 200), 151);
+    }
+
+    #[test]
+    fn pagination_variant_reads_the_nested_limit() {
+        let p = PaginationInput {
+            limit: Some(20),
+            offset: None,
+        };
+        assert_eq!(pagination_complexity(4, Some(&p), 100, 1000), 81);
+        assert_eq!(pagination_complexity(4, None, 100, 1000), 401);
+    }
+}
+
 #[derive(InputObject)]
 pub struct GenerateCodeInput {
     pub prompt: String,

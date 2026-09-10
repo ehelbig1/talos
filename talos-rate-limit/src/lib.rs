@@ -10,6 +10,10 @@
 //!   for cross-pod limits (per-user, per-tenant, per-endpoint). Atomic via
 //!   Redis Lua scripts.
 //!
+//! * [`user_throttle`] — in-memory per-USER token bucket for expensive
+//!   authenticated operations (the GraphQL LLM / compile / Rhai resolvers),
+//!   self-sweeping so it can live in a `LazyLock` with no wiring.
+//!
 //! The middleware module's contents are re-exported at the crate root so
 //! existing controller call sites that wrote `rate_limit::Foo` continue to
 //! resolve. Distributed types are accessed through the `distributed::`
@@ -19,9 +23,11 @@
 pub mod distributed;
 pub mod governor_key;
 mod middleware;
+pub mod user_throttle;
 
 pub use governor_key::TrustedProxyClientIpKeyExtractor;
 pub use middleware::*;
+pub use user_throttle::{PerUserThrottle, ThrottleExceeded};
 
 // `is_production` now lives in `talos-config`; re-exported here as
 // `pub(crate)` so the `crate::is_production()` callsites in middleware.rs

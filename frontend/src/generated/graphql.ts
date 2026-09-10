@@ -565,6 +565,7 @@ export type GetActorActionLogQuery = {
 
 export type GetActorWorkflowsQueryVariables = Exact<{
   actorId: string;
+  limit?: number | null | undefined;
 }>;
 
 export type GetActorWorkflowsQuery = {
@@ -655,6 +656,7 @@ export type CloneActorMutation = {
 export type GetActorMemoriesQueryVariables = Exact<{
   actorId: string;
   memoryType?: string | null | undefined;
+  limit?: number | null | undefined;
 }>;
 
 export type GetActorMemoriesQuery = {
@@ -2833,8 +2835,8 @@ export const useGetActorActionLogQuery = <
 };
 
 export const GetActorWorkflowsDocument = new TypedDocumentString(`
-    query GetActorWorkflows($actorId: UUID!) {
-  actorWorkflows(actorId: $actorId) {
+    query GetActorWorkflows($actorId: UUID!, $limit: Int) {
+  actorWorkflows(actorId: $actorId, limit: $limit) {
     id
     name
     status
@@ -3038,8 +3040,8 @@ export const useCloneActorMutation = <TError = unknown, TContext = unknown>(
 };
 
 export const GetActorMemoriesDocument = new TypedDocumentString(`
-    query GetActorMemories($actorId: UUID!, $memoryType: String) {
-  actorMemories(actorId: $actorId, memoryType: $memoryType) {
+    query GetActorMemories($actorId: UUID!, $memoryType: String, $limit: Int) {
+  actorMemories(actorId: $actorId, memoryType: $memoryType, limit: $limit) {
     key
     value
     memoryType

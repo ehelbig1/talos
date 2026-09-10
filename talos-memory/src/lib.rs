@@ -2721,23 +2721,89 @@ pub async fn fetch_execution_memory_outcomes(
     Ok(out)
 }
 
+/// Rows per DELETE statement in this crate's two retention sweeps
+/// ([`sweep_expired`], [`sweep_execution_memory_context`]).
+///
+/// Until 2026-09-10 both sweeps were ONE unbounded statement — fine on a
+/// routine tick that deletes a handful of rows, and a single long-held lock
+/// + WAL burst on the first tick after an outage or after a shortened TTL,
+/// where the whole backlog went in one transaction against the shared pool's
+/// 60 s `statement_timeout` (a statement that hits it rolls back and repeats
+/// every tick, never progressing). Per-crate constant, deliberately: the five
+/// crates carrying a batched sweep share no leaf dependency that could host
+/// it; the value matches `talos-advanced-repository`'s `RETENTION_BATCH`.
+const SWEEP_BATCH: i64 = 5000;
+
+/// Batches ONE sweep call will issue before stopping and reporting
+/// [`MemorySweep::truncated`]. 20 × 5000 = 100 000 rows per call; a larger
+/// backlog drains across the caller's ticks. Matches
+/// `talos-advanced-repository`'s `MAX_BATCHES_PER_SWEEP`.
+const MAX_SWEEP_BATCHES: u32 = 20;
+
+/// What one batched sweep did.
+///
+/// `#[must_use]`: dropping this drops the truncation verdict, and a sweep that
+/// silently stops short of its backlog every tick is a table that grows while
+/// the log says "swept".
+#[must_use]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemorySweep {
+    /// Rows deleted (sum over batches).
+    pub rows: u64,
+    /// `true` when [`MAX_SWEEP_BATCHES`] batches were issued and the last one
+    /// was full — there is (probably) more to do next tick.
+    pub truncated: bool,
+}
+
+/// The one batched-DELETE loop both sweeps use. `sql` binds exactly `$1 =
+/// arg` (an int4) and selects at most [`SWEEP_BATCH`] rows.
+async fn run_batched_sweep(
+    pool: &Pool<Postgres>,
+    sql: &str,
+    arg: i32,
+    context: &'static str,
+) -> Result<MemorySweep> {
+    let mut out = MemorySweep::default();
+    for batch in 0..MAX_SWEEP_BATCHES {
+        let n = sqlx::query(sql)
+            .bind(arg)
+            .execute(pool)
+            .await
+            .map(|r| r.rows_affected())
+            .context(context)?;
+        out.rows += n;
+        if n < SWEEP_BATCH as u64 {
+            return Ok(out);
+        }
+        if batch + 1 == MAX_SWEEP_BATCHES {
+            out.truncated = true;
+            return Ok(out);
+        }
+        // Yield between batches so a large sweep does not monopolise the pool.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Ok(out)
+}
+
 /// Delete provenance rows older than `retention_days`. Bound as `i32` and cast
-/// `$1::int` per lint 27 (`make_interval` args are int4-only). Returns the
-/// number of rows deleted. Harmless when the table is empty.
+/// `$1::int` per lint 27 (`make_interval` args are int4-only). Batched
+/// (2026-09-10, see [`SWEEP_BATCH`]) — `idx_emc_created` serves the
+/// selection. Harmless when the table is empty.
 pub async fn sweep_execution_memory_context(
     pool: &Pool<Postgres>,
     retention_days: i64,
-) -> Result<u64> {
+) -> Result<MemorySweep> {
     let days: i32 = retention_days.clamp(1, i32::MAX as i64) as i32;
-    let result = sqlx::query(
-        "DELETE FROM execution_memory_context \
-         WHERE created_at < now() - make_interval(days => $1::int)",
-    )
-    .bind(days)
-    .execute(pool)
-    .await
-    .context("sweep_execution_memory_context")?;
-    Ok(result.rows_affected())
+    let sql = format!(
+        "DELETE FROM execution_memory_context WHERE id IN ( \
+             SELECT id FROM execution_memory_context \
+             WHERE created_at < now() - make_interval(days => $1::int) \
+             ORDER BY created_at, id \
+             LIMIT {SWEEP_BATCH} \
+             FOR UPDATE SKIP LOCKED \
+         )"
+    );
+    run_batched_sweep(pool, &sql, days, "sweep_execution_memory_context").await
 }
 
 pub async fn forget(pool: &Pool<Postgres>, actor_id: Uuid, key: &str) -> Result<ForgetOutcome> {
@@ -3707,18 +3773,27 @@ async fn backfill_embeddings_filtered(
     Ok(embedded)
 }
 
-pub async fn sweep_expired(pool: &Pool<Postgres>, grace_hours: i64) -> Result<u64> {
-    let grace = format!("{} hours", grace_hours.max(0));
-    let result = sqlx::query(
-        "DELETE FROM actor_memory \
-         WHERE expires_at IS NOT NULL \
-           AND expires_at < now() - ($1::text)::interval",
-    )
-    .bind(&grace)
-    .execute(pool)
-    .await
-    .context("sweep_expired")?;
-    Ok(result.rows_affected())
+/// Delete `actor_memory` rows whose TTL expired more than `grace_hours` ago.
+///
+/// Batched (2026-09-10, see [`SWEEP_BATCH`]): the partial index
+/// `idx_actor_memory_expires (expires_at) WHERE expires_at IS NOT NULL`
+/// serves the selection, so each batch is an index-range read plus a
+/// bounded delete. The grace is bound as an int4 hour count through
+/// `make_interval(hours => $1::int)` (lint 27) rather than a formatted
+/// interval string.
+pub async fn sweep_expired(pool: &Pool<Postgres>, grace_hours: i64) -> Result<MemorySweep> {
+    let grace: i32 = grace_hours.clamp(0, i32::MAX as i64) as i32;
+    let sql = format!(
+        "DELETE FROM actor_memory WHERE id IN ( \
+             SELECT id FROM actor_memory \
+             WHERE expires_at IS NOT NULL \
+               AND expires_at < now() - make_interval(hours => $1::int) \
+             ORDER BY expires_at, id \
+             LIMIT {SWEEP_BATCH} \
+             FOR UPDATE SKIP LOCKED \
+         )"
+    );
+    run_batched_sweep(pool, &sql, grace, "sweep_expired").await
 }
 
 // ============================================================================

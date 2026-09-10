@@ -698,7 +698,8 @@ async fn the_purge_spares_a_recent_row_and_a_pinned_parents_row_in_both_tiers() 
         .purge_older_than(90)
         .await
         .expect("purge runs");
-    assert_eq!(purged, 1, "exactly the one deletable row");
+    assert_eq!(purged.rows, 1, "exactly the one deletable row");
+    assert!(!purged.truncated, "one row is nowhere near the batch cap");
 
     for (id, why) in [
         (
@@ -742,7 +743,8 @@ async fn the_purge_refuses_a_non_positive_window() {
             ChildRunLedger::new(pool.clone())
                 .purge_older_than(days)
                 .await
-                .expect("purge returns Ok(0) rather than erroring"),
+                .expect("purge returns Ok(0) rather than erroring")
+                .rows,
             0,
             "days = {days} must delete nothing"
         );

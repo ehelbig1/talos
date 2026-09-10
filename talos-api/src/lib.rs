@@ -74,3 +74,101 @@ mod schema_snapshot_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod list_complexity_schema_tests {
+    use async_graphql::Schema;
+
+    /// The controller's production ceiling
+    /// (`controller/src/bootstrap/services.rs`, `.limit_complexity(5000)`).
+    /// Duplicated here as a literal because the controller is a bin crate
+    /// this library cannot import; if that number moves, this test says so
+    /// by failing in the `limit: 10` direction (a schema-wide price change)
+    /// or the `limit: 1000` direction (the ceiling was raised past the
+    /// fan-out this pins).
+    const PRODUCTION_COMPLEXITY_LIMIT: usize = 5000;
+
+    fn schema() -> crate::TalosSchema {
+        Schema::build(
+            crate::schema::QueryRoot::default(),
+            crate::schema::MutationRoot::default(),
+            crate::schema::SubscriptionRoot,
+        )
+        .limit_complexity(PRODUCTION_COMPLEXITY_LIMIT)
+        .finish()
+    }
+
+    fn is_complexity_error(errors: &[async_graphql::ServerError]) -> bool {
+        errors.iter().any(|e| e.message.contains("too complex"))
+    }
+
+    /// B1-3: `workflows(limit: 1000)` with a handful of scalar children plus
+    /// one nested object must be priced as 1 + 7 × 1000 and refused by the
+    /// production ceiling, while the same selection at `limit: 10` (71) is
+    /// admitted past complexity validation. Complexity is checked BEFORE any
+    /// resolver runs, so the admitted query then fails at `require_scope`
+    /// with an authentication error — that is the expected NON-complexity
+    /// outcome for a request carrying no user, and it proves the query got
+    /// past the ceiling without touching a database.
+    #[tokio::test]
+    async fn workflows_fan_out_is_priced_by_limit() {
+        let schema = schema();
+        let selection =
+            "{ id name graphJson actorId maxConcurrentExecutions latestExecution { id } }";
+
+        let big = schema
+            .execute(format!(
+                "{{ workflows(pagination: {{ limit: 1000 }}) {selection} }}"
+            ))
+            .await;
+        assert!(
+            is_complexity_error(&big.errors),
+            "limit 1000 must exceed the {PRODUCTION_COMPLEXITY_LIMIT} ceiling, got {:?}",
+            big.errors
+        );
+
+        let small = schema
+            .execute(format!(
+                "{{ workflows(pagination: {{ limit: 10 }}) {selection} }}"
+            ))
+            .await;
+        assert!(
+            !is_complexity_error(&small.errors),
+            "limit 10 must pass complexity validation, got {:?}",
+            small.errors
+        );
+        assert!(
+            small
+                .errors
+                .iter()
+                .any(|e| e.message.contains("Authentication required")),
+            "the admitted query should fail at the auth gate, not before it: {:?}",
+            small.errors
+        );
+    }
+
+    /// The `limit`-typed (non-pagination) shape: `workflowVersions(limit: 1000)`
+    /// with its eight scalar fields prices at 8001; `limit: 10` at 81.
+    /// (`actorMemories` / `actorWorkflows` are deliberately NOT priced — see
+    /// the comment on those resolvers — so they are not the example here.)
+    #[tokio::test]
+    async fn workflow_versions_fan_out_is_priced_by_limit() {
+        let schema = schema();
+        let wf = uuid::Uuid::nil();
+        let selection = "{ id workflowId versionNumber graphJson description publishedAt \
+                         publishedBy isActive }";
+        let big = schema
+            .execute(format!(
+                "{{ workflowVersions(workflowId: \"{wf}\", limit: 1000) {selection} }}"
+            ))
+            .await;
+        assert!(is_complexity_error(&big.errors), "{:?}", big.errors);
+
+        let small = schema
+            .execute(format!(
+                "{{ workflowVersions(workflowId: \"{wf}\", limit: 10) {selection} }}"
+            ))
+            .await;
+        assert!(!is_complexity_error(&small.errors), "{:?}", small.errors);
+    }
+}

@@ -1787,10 +1787,13 @@ pub(crate) fn spawn_maintenance_sweeps(
                         )
                         .await
                         {
-                            Ok(n) if n > 0 => tracing::info!(
+                            Ok(s) if s.rows > 0 => tracing::info!(
                                 target: "talos_engine",
                                 event_kind = "memory_rank_provenance_sweep",
-                                deleted = n,
+                                deleted = s.rows,
+                                // `true` = stopped at the per-tick batch cap with
+                                // a full last batch; the backlog continues next tick.
+                                truncated = s.truncated,
                                 retention_days,
                                 "swept expired memory-rank provenance rows"
                             ),
@@ -2313,9 +2316,17 @@ pub(crate) fn spawn_cleanup_tasks(
             tokio::select! {
                 _ = interval.tick() => {
                     match cleanup_auth_service.cleanup_expired_sessions().await {
-                        Ok(count) => {
-                            if count > 0 {
-                                tracing::info!("Cleaned up {} expired sessions", count);
+                        Ok(c) => {
+                            if c.sessions + c.rotated_audit > 0 {
+                                tracing::info!(
+                                    sessions = c.sessions,
+                                    rotated_audit = c.rotated_audit,
+                                    // `true` = stopped at the per-tick batch cap with a
+                                    // full last batch; the backlog continues next tick.
+                                    truncated = c.truncated,
+                                    "Cleaned up {} expired sessions",
+                                    c.sessions
+                                );
                             }
                         }
                         Err(e) => {
@@ -2544,11 +2555,34 @@ pub(crate) fn spawn_cleanup_tasks(
                     retention_days
                 );
 
-                // Clean up auth audit logs
+                // Clean up auth audit logs.
+                //
+                // 2026-09-10: `auth_audit_log` and `secret_audit_log` are
+                // append-only by policy (`prevent_audit_modification`,
+                // migration 20260408000001), so until this change BOTH calls
+                // below raised 42501 at 02:00 every day and logged it as an
+                // ERROR — an error that fires forever on a healthy fleet is
+                // the check-69 class. The services now read the policy from
+                // the catalog and report `ImmutableByPolicy`, which is logged
+                // ONCE per run at INFO. `AUDIT_LOG_RETENTION_DAYS` therefore
+                // governs only tables that are NOT immutable (the webhook
+                // request log and DLQ below); the two audit logs are permanent
+                // until an operator drops the trigger, at which point the
+                // batched delete runs.
                 match cleanup_auth.cleanup_audit_logs(retention_days).await {
-                    Ok(count) => {
-                        if count > 0 {
-                            tracing::info!("Cleaned up {} auth audit log entries", count);
+                    Ok(talos_auth::AuditLogCleanup::ImmutableByPolicy) => tracing::info!(
+                        table = "auth_audit_log",
+                        "audit log is append-only by policy (prevent_audit_modification); \
+                         AUDIT_LOG_RETENTION_DAYS does not apply and nothing was deleted"
+                    ),
+                    Ok(talos_auth::AuditLogCleanup::Deleted { rows, truncated }) => {
+                        if rows > 0 {
+                            tracing::info!(
+                                rows,
+                                truncated,
+                                "Cleaned up {} auth audit log entries",
+                                rows
+                            );
                         }
                     }
                     Err(e) => tracing::error!("Failed to cleanup auth audit logs: {}", e),
@@ -2556,9 +2590,21 @@ pub(crate) fn spawn_cleanup_tasks(
 
                 // Clean up secret audit logs
                 match cleanup_secrets.cleanup_audit_logs(retention_days).await {
-                    Ok(count) => {
-                        if count > 0 {
-                            tracing::info!("Cleaned up {} secret audit log entries", count);
+                    Ok(talos_secrets_manager::AuditLogCleanup::ImmutableByPolicy) => {
+                        tracing::info!(
+                            table = "secret_audit_log",
+                            "audit log is append-only by policy (prevent_audit_modification); \
+                             AUDIT_LOG_RETENTION_DAYS does not apply and nothing was deleted"
+                        )
+                    }
+                    Ok(talos_secrets_manager::AuditLogCleanup::Deleted { rows, truncated }) => {
+                        if rows > 0 {
+                            tracing::info!(
+                                rows,
+                                truncated,
+                                "Cleaned up {} secret audit log entries",
+                                rows
+                            );
                         }
                     }
                     Err(e) => tracing::error!("Failed to cleanup secret audit logs: {}", e),
@@ -3163,8 +3209,16 @@ pub(crate) fn spawn_cleanup_tasks(
                     // tick. Override here if we ever want to retain
                     // tombstones longer than their TTL for forensics.
                     match talos_memory::sweep_expired(&agent_memory_pool, 0).await {
-                        Ok(0) => {}
-                        Ok(n) => tracing::debug!(count = n, "Cleaned up expired actor_memory entries"),
+                        Ok(s) if s.rows == 0 => {}
+                        // Stopped at the per-tick batch cap with a full last
+                        // batch: INFO (not debug) because the table is still
+                        // over its TTL and the backlog continues next tick.
+                        Ok(s) if s.truncated => tracing::info!(
+                            count = s.rows,
+                            truncated = true,
+                            "Cleaned up expired actor_memory entries (batch cap reached; more next tick)"
+                        ),
+                        Ok(s) => tracing::debug!(count = s.rows, "Cleaned up expired actor_memory entries"),
                         Err(e) => tracing::error!("Failed to cleanup actor_memory TTL: {}", e),
                     }
                 }

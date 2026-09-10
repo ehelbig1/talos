@@ -553,6 +553,12 @@ impl ModulesMutations {
     ) -> Result<TestModuleResult> {
         require_2fa(ctx)?;
         require_scope(ctx, talos_api_keys::ApiKeyScope::WorkflowsWrite)?;
+        // B1-3: a synchronous WASM run of up to 120 s per call — per-user
+        // token bucket (`GRAPHQL_HEAVY_MUTATION_PER_USER_PER_MIN`, default 10).
+        crate::schema::throttle::enforce_user_throttle(
+            ctx,
+            crate::schema::throttle::ThrottleClass::HeavyMutation,
+        )?;
 
         let user_id = ctx
             .data_opt::<Uuid>()
