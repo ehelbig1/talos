@@ -351,10 +351,16 @@ async fn wait_without_message_omits_message_key() {
     // Locks in the documented "no `message` key when absent" shape so
     // resume orchestration can't accidentally start expecting it.
     let start_mod = Uuid::new_v4();
+    let sibling_mod = Uuid::new_v4();
     let after_mod = Uuid::new_v4();
+    // `sibling` used to be neither seeded in the fetcher nor scripted — and
+    // the test passed, because the reactor DROPPED the sibling's in-flight
+    // future when it paused at `wait`. The pause now drains in-flight
+    // siblings through the completion handler, so an unfetchable sibling is
+    // (correctly) a run failure rather than an invisible one.
     let graph = WorkflowGraphBuilder::new()
         .add_module("start", start_mod, None)
-        .add_module("sibling", Uuid::new_v4(), None)
+        .add_module("sibling", sibling_mod, None)
         .add_system_node("wait", SystemNodeKind::Wait { message: None })
         .add_module("after", after_mod, None)
         .edge("start", "wait")
@@ -368,6 +374,7 @@ async fn wait_without_message_omits_message_key() {
     engine.set_module_fetcher(Arc::new(
         InMemoryModuleFetcher::new()
             .with_module(start_mod, stub_artifact(start_mod))
+            .with_module(sibling_mod, stub_artifact(sibling_mod))
             .with_module(after_mod, stub_artifact(after_mod)),
     ));
     engine
@@ -378,6 +385,7 @@ async fn wait_without_message_omits_message_key() {
     let dispatcher = Arc::new(
         ScriptedDispatcher::new()
             .with_response(start_mod, json!({"output": "start"}))
+            .with_response(sibling_mod, json!({"output": "sibling"}))
             .with_response(after_mod, json!({"output": "after"})),
     );
 
@@ -396,4 +404,140 @@ async fn wait_without_message_omits_message_key() {
         envelope.get("message").is_none(),
         "envelope unexpectedly carries `message`: {envelope}"
     );
+}
+
+/// A pause must not lose siblings that are already IN FLIGHT.
+///
+/// Shape:
+///
+/// ```text
+///   a ─→ wait ─→ after
+///   b ─→ c
+///     ─→ d
+/// ```
+///
+/// `a` and `b` are both roots and dispatch in the same pass. Whichever
+/// completes first, the reactor reaches `wait` while a module future from
+/// the OTHER branch is still in `executing` — dispatched (the job is on the
+/// wire; here the `ScriptedDispatcher` has counted it) but not yet yielded.
+/// Pre-fix the pause `return`ed with that future un-awaited: side effects
+/// happened, the result was never committed, the checkpoint recorded the
+/// node as never run, and the resume dispatched it AGAIN. The invariant
+/// this pins: **every module the dispatcher was asked to run has its
+/// result in the paused context**, and the resume re-runs none of them.
+#[tokio::test]
+async fn pause_commits_in_flight_siblings_instead_of_dropping_them() {
+    let a_mod = Uuid::new_v4();
+    let b_mod = Uuid::new_v4();
+    let c_mod = Uuid::new_v4();
+    let d_mod = Uuid::new_v4();
+    let after_mod = Uuid::new_v4();
+    let graph = WorkflowGraphBuilder::new()
+        .add_module("a", a_mod, None)
+        .add_module("b", b_mod, None)
+        .add_module("c", c_mod, None)
+        .add_module("d", d_mod, None)
+        .add_system_node(
+            "wait",
+            SystemNodeKind::Wait {
+                message: Some("hold".into()),
+            },
+        )
+        .add_module("after", after_mod, None)
+        .edge("a", "wait")
+        .edge("wait", "after")
+        .edge("b", "c")
+        .edge("b", "d")
+        .build()
+        .expect("graph builds");
+
+    let mut engine = minimal_engine();
+    engine.set_user_id(Uuid::new_v4());
+    let mut fetcher = InMemoryModuleFetcher::new();
+    for m in [a_mod, b_mod, c_mod, d_mod, after_mod] {
+        fetcher = fetcher.with_module(m, stub_artifact(m));
+    }
+    engine.set_module_fetcher(Arc::new(fetcher));
+    engine
+        .load_graph_from_json(&serde_json::to_string(&graph).unwrap())
+        .await
+        .expect("graph loads");
+
+    let dispatcher = Arc::new(
+        ScriptedDispatcher::new()
+            .with_response(a_mod, json!({"output": "a"}))
+            .with_response(b_mod, json!({"output": "b"}))
+            .with_response(c_mod, json!({"output": "c"}))
+            .with_response(d_mod, json!({"output": "d"}))
+            .with_response(after_mod, json!({"output": "after"})),
+    );
+
+    let label_id = |engine: &ParallelWorkflowEngine, name: &str| -> Uuid {
+        engine
+            .node_labels()
+            .iter()
+            .find_map(|(id, label)| (label == name).then_some(*id))
+            .unwrap_or_else(|| panic!("missing label {name}"))
+    };
+
+    let exec_id = Uuid::new_v4();
+    let paused = engine
+        .run_with_transport(dispatcher.clone(), None, exec_id)
+        .await
+        .expect("the run pauses rather than failing");
+    assert!(paused.waiting);
+    let wait_id = label_id(&engine, "wait");
+    assert!(paused.results.contains_key(&wait_id));
+
+    // The invariant: dispatched ⇒ committed. Which of b/c/d were dispatched
+    // before the pause depends on completion order (both are legal); what is
+    // NOT legal is a dispatched module whose result is missing.
+    let mut dispatched_before_pause = 0;
+    for (name, module) in [("a", a_mod), ("b", b_mod), ("c", c_mod), ("d", d_mod)] {
+        let count = dispatcher.dispatch_count(module);
+        assert!(
+            count <= 1,
+            "{name} dispatched {count} times before the pause"
+        );
+        if count == 1 {
+            dispatched_before_pause += 1;
+            assert!(
+                paused.results.contains_key(&label_id(&engine, name)),
+                "{name} was dispatched before the pause but its result was dropped: {:?}",
+                paused.results.keys().collect::<Vec<_>>()
+            );
+        }
+    }
+    // `a` completed (it unblocked `wait`) and `b` was pushed in the same
+    // pass as `a`, so at least those two were dispatched.
+    assert!(dispatched_before_pause >= 2);
+    assert_eq!(
+        dispatcher.dispatch_count(after_mod),
+        0,
+        "nothing past the Wait runs before the resume"
+    );
+
+    // Resume from the paused snapshot: every previously-dispatched module
+    // keeps a count of exactly 1 — the resume re-runs none of them.
+    let mut seed: HashMap<Uuid, serde_json::Value> = paused.results.clone();
+    seed.insert(wait_id, json!({"approved_by": "ops"}));
+    let done = engine
+        .run_with_seed_with_transport(dispatcher.clone(), None, seed, exec_id)
+        .await
+        .expect("resume completes");
+    assert!(!done.waiting);
+    for (name, module) in [
+        ("a", a_mod),
+        ("b", b_mod),
+        ("c", c_mod),
+        ("d", d_mod),
+        ("after", after_mod),
+    ] {
+        assert_eq!(
+            dispatcher.dispatch_count(module),
+            1,
+            "{name} must run exactly once across pause + resume"
+        );
+        assert!(done.results.contains_key(&label_id(&engine, name)));
+    }
 }

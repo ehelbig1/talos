@@ -817,6 +817,100 @@ pub const LOOP_ITERATION: &str = "__loop_iteration";
 /// can read the trigger payload even after intermediate transforms.
 pub const TRIGGER_INPUT: &str = "__trigger_input__";
 
+// ── Engine-authored INPUT keys: the strip list ───────────────────────
+
+/// Every `__`-prefixed key the ENGINE writes onto a node's INPUT and a
+/// downstream consumer TRUSTS without further checking.
+///
+/// This is the strip list — the ONE home for it. Each key here is
+/// DERIVED by the engine (from the actor binding, the results map, the
+/// graph topology, the trigger seed) and would be BELIEVED if a caller
+/// or an upstream module supplied its own copy:
+///
+/// * [`ACTOR_CONTEXT`] — the per-actor memory view; a supplied copy is a
+///   context spoof that steers an LLM with memories the actor never had.
+/// * [`ACCUMULATED`] — the prior-node context snapshot.
+/// * [`TRIGGER_INPUT`] — the root trigger payload every hop preserves.
+/// * [`STALENESS`] — the freshness verdict ("inputs verified fresh").
+/// * [`DEGRADED_INPUTS`] — the completeness verdict, spoofable both ways.
+///
+/// Three places apply it, and the reason there are three is the reason
+/// the list has one home:
+///
+/// 1. **Inbound trigger / test payloads** — [`strip_engine_authored_keys`]
+///    at the controller seam (`inject_actor_context_into_input`) AND at the
+///    engine's own trigger-seed install, so a caller that reaches the engine
+///    by any path cannot pass a spoofed value through.
+/// 2. **Committed module output** — the same function at node completion,
+///    so an upstream module cannot smuggle a reserved key to its successors
+///    through the gathered-inputs merge.
+/// 3. **The assembled per-dispatch input** — every key is written
+///    set-or-REMOVE (see `apply_degraded_inputs`), never set-or-inherit.
+///    The merge is built on top of caller data, so a merely-conditional
+///    insert would leave a caller-authored key in place exactly when the
+///    engine declined to write its own (injection off for a send-world
+///    node, kill-switch off, no actor context, no freshness contract).
+///    Set-or-REMOVE closes that at the merge; the strips above close it
+///    at the two boundaries data crosses to reach the merge.
+///
+/// A child-workflow trigger seed is the ONE deliberate exception, and it
+/// is narrow: the parent dispatcher wraps the child's trigger as
+/// `{..upstream, "__trigger_input__": <root trigger>}` so the root
+/// payload survives sub-workflow composition. That wrapper is
+/// ENGINE-authored, so [`strip_engine_authored_keys_for_child_seed`]
+/// keeps [`TRIGGER_INPUT`] and strips the other four.
+///
+/// This is a FIXED list, not a blanket `__`-prefix sweep: `__error`,
+/// `__continued`, `__memory_write__`, `__ops_alert__`, `__ml_distill__`,
+/// `__fuel_consumed__` and the `__judge_*` / `__confidence_*` families are
+/// OUTPUT-side protocol the engine reads FROM a module, and stripping them
+/// would silence the protocols they carry.
+pub const ENGINE_AUTHORED_INPUT_KEYS: &[&str] = &[
+    ACTOR_CONTEXT,
+    ACCUMULATED,
+    TRIGGER_INPUT,
+    STALENESS,
+    DEGRADED_INPUTS,
+];
+
+/// Remove every [`ENGINE_AUTHORED_INPUT_KEYS`] key from `input`.
+///
+/// A non-object `input` is left alone (a bare string trigger carries no
+/// keys). Unconditional by design: callers apply it AHEAD of every early
+/// return so a skipped injection can never pass a spoofed value through.
+pub fn strip_engine_authored_keys(input: &mut serde_json::Value) {
+    if let Some(obj) = input.as_object_mut() {
+        strip_engine_authored_keys_from_map(obj);
+    }
+}
+
+/// [`strip_engine_authored_keys`] over an already-borrowed object map.
+pub fn strip_engine_authored_keys_from_map(obj: &mut serde_json::Map<String, serde_json::Value>) {
+    for reserved in ENGINE_AUTHORED_INPUT_KEYS {
+        obj.remove(*reserved);
+    }
+}
+
+/// The child-seed variant: strips every engine-authored input key EXCEPT
+/// [`TRIGGER_INPUT`], which the parent dispatcher legitimately wraps into a
+/// sub-workflow's trigger envelope (see [`ENGINE_AUTHORED_INPUT_KEYS`]).
+///
+/// The child engine re-derives the other four from its OWN actor binding,
+/// results map and graph, so a copy riding in from the parent's upstream
+/// output would be inherited by the child's root nodes exactly when the
+/// child declines to inject (a send-world root, the kill-switch, no bound
+/// actor).
+pub fn strip_engine_authored_keys_for_child_seed(input: &mut serde_json::Value) {
+    let Some(obj) = input.as_object_mut() else {
+        return;
+    };
+    for reserved in ENGINE_AUTHORED_INPUT_KEYS {
+        if *reserved != TRIGGER_INPUT {
+            obj.remove(*reserved);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1404,5 +1498,91 @@ mod tests {
                 assert!(output_reports_error(&v), "reason without a failure: {v}");
             }
         }
+    }
+    // ── The strip list ──────────────────────────────────────────────
+
+    #[test]
+    fn every_engine_authored_key_is_removed_and_user_data_survives() {
+        let mut input = json!({
+            "__actor_context__": { "spoofed": true },
+            "__accumulated__": { "spoofed": true },
+            "__trigger_input__": { "spoofed": true },
+            "__staleness__": { "verified": true, "any_stale": false },
+            "__degraded_inputs__": {
+                "any_degraded": true,
+                "entries": [{ "node": "a_branch_that_never_ran" }]
+            },
+            "question": "what is on my plate today?",
+            "__not_reserved__": 1
+        });
+        strip_engine_authored_keys(&mut input);
+        let obj = input.as_object().expect("object");
+        for k in ENGINE_AUTHORED_INPUT_KEYS {
+            assert!(!obj.contains_key(*k), "{k} survived the strip");
+        }
+        assert_eq!(obj["question"], json!("what is on my plate today?"));
+        assert_eq!(
+            obj["__not_reserved__"],
+            json!(1),
+            "the strip is a fixed list, not a blanket `__`-prefix sweep"
+        );
+    }
+
+    #[test]
+    fn the_strip_list_never_names_an_output_protocol_key() {
+        // These are read FROM a module; stripping them would silence the
+        // protocol they carry. Pinned so a future addition to the list is a
+        // deliberate act.
+        for output_key in [
+            ERROR_FLAG,
+            CONTINUED,
+            MEMORY_WRITE,
+            MEMORY_WRITE_REFUSED,
+            OPS_ALERT,
+            FUEL_CONSUMED,
+            SKIPPED,
+            WAITING,
+            JUDGE_SCORE,
+            JUDGE_PASSED,
+        ] {
+            assert!(
+                !ENGINE_AUTHORED_INPUT_KEYS.contains(&output_key),
+                "{output_key} is output-side protocol and must not be stripped"
+            );
+        }
+    }
+
+    #[test]
+    fn a_degradation_record_cannot_be_supplied_by_the_caller() {
+        let mut input = json!({ "__degraded_inputs__": { "any_degraded": true } });
+        strip_engine_authored_keys(&mut input);
+        assert_eq!(input, json!({}));
+    }
+
+    #[test]
+    fn a_non_object_payload_is_left_alone() {
+        let mut input = json!("a bare string trigger");
+        strip_engine_authored_keys(&mut input);
+        assert_eq!(input, json!("a bare string trigger"));
+    }
+
+    #[test]
+    fn the_child_seed_variant_keeps_only_the_trigger_input_wrapper() {
+        let mut seed = json!({
+            "__trigger_input__": { "question": "root" },
+            "__actor_context__": { "spoofed": true },
+            "__accumulated__": { "spoofed": true },
+            "__staleness__": { "any_stale": false },
+            "__degraded_inputs__": { "any_degraded": true },
+            "upstream": "value"
+        });
+        strip_engine_authored_keys_for_child_seed(&mut seed);
+        assert_eq!(
+            seed,
+            json!({ "__trigger_input__": { "question": "root" }, "upstream": "value" })
+        );
+        let mut bare = json!(7);
+        strip_engine_authored_keys_for_child_seed(&mut bare);
+        assert_eq!(bare, json!(7));
     }
 }

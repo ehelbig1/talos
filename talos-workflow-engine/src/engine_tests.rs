@@ -822,6 +822,62 @@ fn add_node_respects_configured_max_workflow_nodes() {
 }
 
 #[test]
+fn loading_an_over_cap_graph_is_a_load_error_not_a_silent_prefix() {
+    // Pre-fix: `add_node` WARNed and dropped every node past the cap, so a
+    // 4-node graph under a cap of 3 loaded as its first 2 nodes (+ the
+    // trigger slot) with the dropped nodes' edges skipped — and ran.
+    let mut engine = ParallelWorkflowEngine::new();
+    engine.set_max_workflow_nodes(3);
+    let ids: Vec<String> = (0..4).map(|i| format!("n{i}")).collect();
+    let module = Uuid::new_v4();
+    let nodes: Vec<serde_json::Value> = ids
+        .iter()
+        .map(|id| serde_json::json!({ "id": id, "type": module.to_string(), "data": {} }))
+        .collect();
+    let edges: Vec<serde_json::Value> = ids
+        .windows(2)
+        .map(|w| serde_json::json!({ "source": w[0], "target": w[1] }))
+        .collect();
+    let graph = serde_json::json!({ "nodes": nodes, "edges": edges });
+
+    let err = engine
+        .load_from_graph_json(&graph)
+        .expect_err("an over-cap graph must refuse to load");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("declares 4 nodes") && msg.contains("cap is 3"),
+        "the error names both numbers: {msg}"
+    );
+
+    // Exactly `cap - 1` nodes fit, because the synthetic trigger root needs
+    // the last slot at run time.
+    let mut engine = ParallelWorkflowEngine::new();
+    engine.set_max_workflow_nodes(3);
+    let graph = serde_json::json!({
+        "nodes": [
+            { "id": "a", "type": module.to_string(), "data": {} },
+            { "id": "b", "type": module.to_string(), "data": {} }
+        ],
+        "edges": [ { "source": "a", "target": "b" } ]
+    });
+    engine
+        .load_from_graph_json(&graph)
+        .expect("a graph that leaves the trigger slot free loads");
+    assert_eq!(engine.graph().node_count(), 2);
+    let trigger = engine
+        .ensure_trigger_node_wired_to_roots()
+        .expect("the trigger takes the reserved slot");
+    assert_eq!(engine.graph().node_count(), 3);
+    assert!(engine.node_map().contains_key(&trigger));
+    // And a graph already AT the cap refuses the trigger loudly instead of
+    // dropping it and panicking on the index that follows.
+    let mut full = ParallelWorkflowEngine::new();
+    full.set_max_workflow_nodes(1);
+    full.add_node(Uuid::new_v4(), Some(module), None, None);
+    assert!(full.ensure_trigger_node_wired_to_roots().is_err());
+}
+
+#[test]
 fn into_engine_preserves_max_llm_tier() {
     use talos_workflow_engine_core::LlmTier;
 

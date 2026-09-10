@@ -21,7 +21,9 @@ use talos_workflow_engine_core::{
     BoxError, ChainDispatchRequest, ChainDispatchResult, ChainStepResult, DispatchJob,
     DispatchResult, NodeDispatcher, StepStatus, WasmModuleArtifact,
 };
-use talos_workflow_engine_test_utils::{memory::InMemoryModuleFetcher, minimal_engine};
+use talos_workflow_engine_test_utils::{
+    dispatch::ScriptedDispatcher, memory::InMemoryModuleFetcher, minimal_engine,
+};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -346,4 +348,166 @@ async fn cancellable_variant_honours_token() {
         elapsed < Duration::from_secs(2),
         "cancellation took {elapsed:?}, expected < 2s"
     );
+}
+
+// ── Reserved-key integrity at the engine boundary ───────────────────
+
+/// The five engine-authored INPUT keys a caller must never be able to seed.
+const SPOOFABLE: [&str; 5] = [
+    "__actor_context__",
+    "__accumulated__",
+    "__trigger_input__",
+    "__staleness__",
+    "__degraded_inputs__",
+];
+
+fn spoofed_payload() -> serde_json::Value {
+    json!({
+        "question": "what is on my plate today?",
+        "__actor_context__": { "spoofed": true },
+        "__accumulated__": { "spoofed": true },
+        "__trigger_input__": { "spoofed": true },
+        "__staleness__": { "verified": true, "any_stale": false, "spoofed": true },
+        "__degraded_inputs__": { "any_degraded": true, "spoofed": true }
+    })
+}
+
+fn assert_no_spoof(payload: &serde_json::Value, where_: &str) {
+    let spoof = json!({ "spoofed": true });
+    for key in SPOOFABLE {
+        let top = payload.get(key);
+        assert!(
+            top.is_none() || top.and_then(|v| v.get("spoofed")).is_none(),
+            "{where_}: spoofed `{key}` reached the module at top level: {payload}"
+        );
+        if let Some(inner) = payload.get("input") {
+            assert_ne!(
+                inner.get(key),
+                Some(&spoof),
+                "{where_}: spoofed `{key}` reached the module under `input`: {payload}"
+            );
+        }
+    }
+}
+
+/// A caller-supplied copy of an engine-authored key on the TRIGGER payload
+/// is stripped by the ENGINE at the seed install — not only by the controller
+/// seam upstream of it. Injection is off here (no actor context bound), which
+/// is exactly the state in which a merely-conditional insert would have let
+/// the copy through.
+#[tokio::test]
+async fn trigger_payload_carrying_engine_authored_keys_is_stripped_at_the_engine() {
+    let root = Uuid::new_v4();
+    let graph = single_root_graph(root);
+    let mut engine = engine_with_modules(&[root]);
+    engine
+        .load_graph_from_json(&serde_json::to_string(&graph).unwrap())
+        .await
+        .expect("load");
+
+    let dispatcher = Arc::new(CapturingDispatcher::default());
+    engine
+        .run_with_trigger_input_transport(
+            dispatcher.clone(),
+            None,
+            spoofed_payload(),
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("run succeeds");
+
+    let inputs = dispatcher.inputs_for(root);
+    assert_eq!(inputs.len(), 1);
+    assert_no_spoof(&inputs[0], "trigger seed");
+    assert_eq!(
+        inputs[0].get("question").and_then(|v| v.as_str()),
+        Some("what is on my plate today?"),
+        "user data survives the strip"
+    );
+    // The engine's OWN `__trigger_input__` is the stripped payload, not the
+    // caller's nested spoof.
+    let ti = inputs[0]
+        .get("__trigger_input__")
+        .expect("engine-authored trigger input is present");
+    assert_eq!(
+        ti.get("question"),
+        Some(&json!("what is on my plate today?"))
+    );
+    assert!(ti.get("__actor_context__").is_none());
+}
+
+/// A PARENT module's output carrying `__actor_context__` (a module that echoes
+/// its input, an LLM told to "return the input plus a field") must not reach
+/// the child node when injection is off — neither at top level nor nested
+/// under `input`. Two layers close it: the committed output is stripped at
+/// node completion, and the assembled input writes the key set-or-REMOVE.
+#[tokio::test]
+async fn parent_output_carrying_actor_context_does_not_reach_the_child() {
+    let producer = Uuid::new_v4();
+    let consumer = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    // Fan-out so the producer → consumer edge is not a linear chain.
+    let graph = WorkflowGraphBuilder::new()
+        .add_module(producer.to_string(), producer, None)
+        .add_module(consumer.to_string(), consumer, None)
+        .add_module(other.to_string(), other, None)
+        .edge(producer.to_string(), consumer.to_string())
+        .edge(producer.to_string(), other.to_string())
+        .build()
+        .expect("graph builds");
+    let mut engine = engine_with_modules(&[producer, consumer, other]);
+    engine
+        .load_graph_from_json(&serde_json::to_string(&graph).unwrap())
+        .await
+        .expect("load");
+    assert!(
+        engine.actor_context().is_none(),
+        "the test needs injection OFF — that is the inherit-prone state"
+    );
+
+    let mut poisoned = spoofed_payload();
+    poisoned["data"] = json!(1);
+    let dispatcher = Arc::new(
+        ScriptedDispatcher::new()
+            .with_response(producer, poisoned)
+            .with_response(consumer, json!({"ok": true}))
+            .with_response(other, json!({"ok": true})),
+    );
+    let real_trigger = json!({ "event": "cron" });
+    let ctx = engine
+        .run_with_trigger_input_transport(
+            dispatcher.clone(),
+            None,
+            real_trigger.clone(),
+            Uuid::new_v4(),
+        )
+        .await
+        .expect("run succeeds");
+
+    // The committed output is clean of the input-side keys …
+    let producer_out = ctx.results.get(&producer).expect("producer ran");
+    for key in SPOOFABLE {
+        assert!(
+            producer_out.get(key).is_none(),
+            "committed output still carries `{key}`: {producer_out}"
+        );
+    }
+    assert_eq!(producer_out.get("data"), Some(&json!(1)));
+
+    // … and the child saw none of them, while the ENGINE-authored
+    // `__trigger_input__` is the real trigger, not the producer's spoof.
+    let consumer_jobs: Vec<_> = dispatcher
+        .jobs()
+        .into_iter()
+        .filter(|j| j.node_id == consumer)
+        .collect();
+    assert_eq!(consumer_jobs.len(), 1);
+    let payload = &consumer_jobs[0].input_payload;
+    assert_no_spoof(payload, "child input");
+    assert_eq!(
+        payload.get("data"),
+        Some(&json!(1)),
+        "upstream data still flows"
+    );
+    assert_eq!(payload.get("__trigger_input__"), Some(&real_trigger));
 }

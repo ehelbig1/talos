@@ -61,6 +61,26 @@ impl ParallelWorkflowEngine {
             Err(e) => return (node_idx, Err(e)),
         };
 
+        // Capability-world ceiling — the actor's, enforced HERE so a module
+        // reached through a sub-workflow / judge / ensemble child (which the
+        // trigger-time gate never saw) cannot run above it. The ceiling on a
+        // sub-engine is the parent's, copied by `AdapterSet`.
+        if let Err(e) = crate::capability_ceiling::refuse_module_over_ceiling(
+            self.max_capability_world.as_deref(),
+            wasm_module.module_id,
+            &wasm_module.capability_world,
+        ) {
+            tracing::warn!(
+                target: "talos_security",
+                %node_id,
+                module_id = %wasm_module.module_id,
+                module_world = %wasm_module.capability_world,
+                ceiling = ?self.max_capability_world,
+                "dispatch refused: module world exceeds the actor's capability ceiling"
+            );
+            return (node_idx, Err(e));
+        }
+
         // Absent-count fallback is METHOD-AWARE, not a blanket count:
         // a node that did not declare `retry_count` retries transient
         // failures only when its module is read-only / pure compute
@@ -236,30 +256,59 @@ impl ParallelWorkflowEngine {
             if !inputs.is_null() && !is_empty_object {
                 merged.insert("input".to_string(), inputs.clone());
             }
-            if let Some(acc) = &accumulated_snapshot {
-                // Deep-clone the shared snapshot only here, at the single point
-                // it is materialized into the dispatched envelope. The snapshot
-                // itself was built once per node-step and shared by `Arc` across
-                // every concurrent in-flight dispatch.
-                merged.insert("__accumulated__".to_string(), (**acc).clone());
+            // Every engine-authored key below is written **set-or-REMOVE**,
+            // never set-or-inherit. `merged` was built on top of CALLER DATA
+            // (the upstream module's output, the trigger payload), so a
+            // merely-conditional insert leaves a caller-authored copy of the
+            // key in place precisely when the engine declines to write its
+            // own — injection off for a send-world node, the kill-switch,
+            // `actor_context == None`, no freshness contract, no `__trigger__`
+            // seed. `apply_degraded_inputs` has always done this; the other
+            // four now do too. `ENGINE_AUTHORED_INPUT_KEYS` is the list.
+            match &accumulated_snapshot {
+                Some(acc) => {
+                    // Deep-clone the shared snapshot only here, at the single
+                    // point it is materialized into the dispatched envelope. The
+                    // snapshot itself was built once per node-step and shared by
+                    // `Arc` across every concurrent in-flight dispatch.
+                    merged.insert(
+                        talos_workflow_engine_core::reserved_keys::ACCUMULATED.to_string(),
+                        (**acc).clone(),
+                    );
+                }
+                None => {
+                    merged.remove(talos_workflow_engine_core::reserved_keys::ACCUMULATED);
+                }
             }
-            if let Some(ref ctx) = self.actor_context {
-                // Node-scoped injection: OFF → inject into every node
-                // (byte-identical to the legacy path); ON → only nodes that
-                // declare `needs_memory` — which now defaults to `false` for
-                // pure-egress/send worlds (http/network/messaging) so curated
-                // memory doesn't reach the delivery-pattern "send" leg by
-                // default (an explicit `needs_memory: true` still injects).
-                // The fleet-wide `ENABLE_ACTOR_CONTEXT_INJECTION` kill-switch is
-                // the OUTERMOST gate — off ⇒ no node ever receives context,
-                // regardless of how `self.actor_context` got set.
-                if talos_config::actor_context_injection_enabled()
-                    && talos_workflow_engine_core::reserved_keys::should_inject_actor_context(
-                        talos_config::smart_memory_context_enabled(),
-                        self.node_needs_memory_for_world(node_id, &wasm_module.capability_world),
-                    )
-                {
-                    merged.insert("__actor_context__".to_string(), ctx.clone());
+            // Node-scoped injection: OFF → inject into every node
+            // (byte-identical to the legacy path); ON → only nodes that
+            // declare `needs_memory` — which now defaults to `false` for
+            // pure-egress/send worlds (http/network/messaging) so curated
+            // memory doesn't reach the delivery-pattern "send" leg by
+            // default (an explicit `needs_memory: true` still injects).
+            // The fleet-wide `ENABLE_ACTOR_CONTEXT_INJECTION` kill-switch is
+            // the OUTERMOST gate — off ⇒ no node ever receives context,
+            // regardless of how `self.actor_context` got set.
+            let inject_actor_context = self.actor_context.is_some()
+                && talos_config::actor_context_injection_enabled()
+                && talos_workflow_engine_core::reserved_keys::should_inject_actor_context(
+                    talos_config::smart_memory_context_enabled(),
+                    self.node_needs_memory_for_world(node_id, &wasm_module.capability_world),
+                );
+            match (&self.actor_context, inject_actor_context) {
+                (Some(ctx), true) => {
+                    merged.insert(
+                        talos_workflow_engine_core::reserved_keys::ACTOR_CONTEXT.to_string(),
+                        ctx.clone(),
+                    );
+                }
+                _ => {
+                    // The no-inject arm is the security-relevant half: a
+                    // send-world node whose upstream output (or the trigger
+                    // payload) carried its own `__actor_context__` used to
+                    // receive that copy verbatim — the exfil surface the
+                    // world-aware default exists to close.
+                    merged.remove(talos_workflow_engine_core::reserved_keys::ACTOR_CONTEXT);
                 }
             }
             // Input-freshness contract: when this node declares `requires_fresh`,
@@ -267,18 +316,32 @@ impl ParallelWorkflowEngine {
             // memory as current. `None` = no contract (zero cost, unchanged
             // behavior). `on_stale: "fail"` short-circuits the dispatch with a
             // real error instead of a plausible-looking wrong answer.
-            if let Some((report, must_fail)) = self.resolve_node_staleness(node_id).await {
-                if must_fail {
-                    let detail =
-                        talos_workflow_engine_core::reserved_keys::describe_stale_entries(&report);
-                    return (
-                        node_idx,
-                        Err(format!(
-                            "input freshness contract violated (on_stale=fail): {detail}"
-                        )),
+            match self.resolve_node_staleness(node_id).await {
+                Some((report, must_fail)) => {
+                    if must_fail {
+                        let detail =
+                            talos_workflow_engine_core::reserved_keys::describe_stale_entries(
+                                &report,
+                            );
+                        return (
+                            node_idx,
+                            Err(format!(
+                                "input freshness contract violated (on_stale=fail): {detail}"
+                            )),
+                        );
+                    }
+                    merged.insert(
+                        talos_workflow_engine_core::reserved_keys::STALENESS.to_string(),
+                        report,
                     );
                 }
-                merged.insert("__staleness__".to_string(), report);
+                // No contract ⇒ no verdict — and no INHERITED verdict either. A
+                // caller-supplied `__staleness__` claiming "verified fresh" on
+                // data the engine never checked is the spoof this key's docs
+                // name.
+                None => {
+                    merged.remove(talos_workflow_engine_core::reserved_keys::STALENESS);
+                }
             }
             // Input-COMPLETENESS contract, the twin of the freshness one
             // above: when an upstream node FAILED and the run was allowed to
@@ -297,8 +360,18 @@ impl ParallelWorkflowEngine {
             // trigger with `__trigger_input__: parent_ti`. Injecting it
             // here keeps the scaffold's "always preserved" contract true
             // for every node in every workflow.
-            if let Some(ref ti) = trigger_input {
-                merged.insert("__trigger_input__".to_string(), ti.clone());
+            match trigger_input {
+                Some(ref ti) => {
+                    merged.insert(
+                        talos_workflow_engine_core::reserved_keys::TRIGGER_INPUT.to_string(),
+                        ti.clone(),
+                    );
+                }
+                // No `__trigger__` seed (a bare `run()`) ⇒ an upstream-authored
+                // `__trigger_input__` must not pose as the root payload.
+                None => {
+                    merged.remove(talos_workflow_engine_core::reserved_keys::TRIGGER_INPUT);
+                }
             }
             serde_json::Value::Object(merged)
         };
@@ -1404,5 +1477,243 @@ mod oauth_repair_tests {
             vec!["resolve"],
             "one resolve, no forced refresh"
         );
+    }
+}
+
+#[cfg(test)]
+mod reserved_key_set_or_remove_tests {
+    //! The assembled per-dispatch input is built on top of CALLER DATA, so
+    //! every engine-authored key must be written set-or-REMOVE. These drive
+    //! the REAL `run_single_node_dispatch` and read the payload the
+    //! dispatcher received.
+
+    use std::sync::Arc;
+
+    use petgraph::graph::NodeIndex;
+    use serde_json::json;
+    use talos_workflow_engine_core::{NodeDispatcher, WasmModuleArtifact};
+    use talos_workflow_engine_test_utils::dispatch::ScriptedDispatcher;
+    use talos_workflow_engine_test_utils::memory::InMemoryModuleFetcher;
+    use uuid::Uuid;
+
+    use crate::engine::ParallelWorkflowEngine;
+
+    fn stub_artifact(module_id: Uuid) -> WasmModuleArtifact {
+        WasmModuleArtifact {
+            module_id,
+            content_hash: "stub".into(),
+            wasm_bytes: vec![1, 2, 3],
+            oci_url: None,
+            max_fuel: 1_000_000,
+            // A send world: the world-aware default declines memory here, so
+            // even WITH an actor context bound the engine must REMOVE, not
+            // inherit, a caller-supplied `__actor_context__`.
+            capability_world: "http-node".into(),
+            allowed_hosts: vec![],
+            allowed_methods: vec![],
+            allowed_secrets: vec![],
+            requires_approval_for: vec![],
+            integration_name: None,
+            config: None,
+        }
+    }
+
+    fn poisoned_inputs() -> serde_json::Value {
+        json!({
+            "data": 1,
+            "__actor_context__": { "spoofed": true },
+            "__accumulated__": { "spoofed": true },
+            "__trigger_input__": { "spoofed": true },
+            "__staleness__": { "spoofed": true },
+            "__degraded_inputs__": { "spoofed": true }
+        })
+    }
+
+    async fn dispatch_with(
+        engine: &ParallelWorkflowEngine,
+        node_id: Uuid,
+        module_id: Uuid,
+        trigger_input: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        let dispatcher = Arc::new(ScriptedDispatcher::new().with_response(module_id, json!({})));
+        let (_, res) = engine
+            .run_single_node_dispatch(
+                NodeIndex::new(0),
+                node_id,
+                Uuid::new_v4(),
+                dispatcher.clone() as Arc<dyn NodeDispatcher>,
+                None,
+                poisoned_inputs(),
+                None,
+                trigger_input,
+                None,
+                None,
+            )
+            .await;
+        res.expect("dispatch succeeds");
+        let jobs = dispatcher.jobs();
+        assert_eq!(jobs.len(), 1);
+        jobs[0].input_payload.clone()
+    }
+
+    fn engine_for(node_id: Uuid, module_id: Uuid) -> ParallelWorkflowEngine {
+        let mut engine = ParallelWorkflowEngine::new();
+        engine.set_user_id(Uuid::new_v4());
+        engine.set_actor_id(Uuid::new_v4());
+        engine.set_module_fetcher(Arc::new(
+            InMemoryModuleFetcher::new().with_module(module_id, stub_artifact(module_id)),
+        ));
+        engine.add_node(node_id, Some(module_id), None, None);
+        engine
+    }
+
+    #[tokio::test]
+    async fn with_nothing_to_inject_every_engine_authored_key_is_removed() {
+        let (node_id, module_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let engine = engine_for(node_id, module_id);
+        let payload = dispatch_with(&engine, node_id, module_id, None).await;
+        for key in talos_workflow_engine_core::reserved_keys::ENGINE_AUTHORED_INPUT_KEYS {
+            assert!(
+                payload.get(*key).is_none(),
+                "`{key}` was INHERITED from caller data: {payload}"
+            );
+        }
+        assert_eq!(payload.get("data"), Some(&json!(1)));
+        // The caller data is also mirrored under `input` verbatim — that
+        // nested copy is the committed-output strip's job, not this one's;
+        // pin that it is at least not promoted back to the top level.
+        assert!(payload.get("input").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_send_world_node_never_inherits_a_spoofed_actor_context() {
+        let (node_id, module_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut engine = engine_for(node_id, module_id);
+        engine.set_actor_context(json!({ "memories": ["real"] }));
+        let payload = dispatch_with(&engine, node_id, module_id, None).await;
+        // Whatever the injection gates decide for an http-node under the
+        // current env, the value can only ever be the ENGINE's context or
+        // absent — never the caller's.
+        match payload.get("__actor_context__") {
+            None => {}
+            Some(v) => assert_eq!(v, &json!({ "memories": ["real"] })),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_trigger_input_written_is_the_engines_not_the_callers() {
+        let (node_id, module_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let engine = engine_for(node_id, module_id);
+        let payload =
+            dispatch_with(&engine, node_id, module_id, Some(json!({ "real": true }))).await;
+        assert_eq!(
+            payload.get("__trigger_input__"),
+            Some(&json!({ "real": true }))
+        );
+    }
+}
+
+#[cfg(test)]
+mod capability_ceiling_dispatch_tests {
+    //! The ceiling gate at the REAL single-node dispatch site, and its
+    //! inheritance into a sub-engine — the two halves that together close
+    //! the child-workflow bypass.
+
+    use std::sync::Arc;
+
+    use petgraph::graph::NodeIndex;
+    use serde_json::json;
+    use talos_workflow_engine_core::{NodeDispatcher, WasmModuleArtifact};
+    use talos_workflow_engine_test_utils::dispatch::ScriptedDispatcher;
+    use talos_workflow_engine_test_utils::memory::InMemoryModuleFetcher;
+    use uuid::Uuid;
+
+    use crate::engine::ParallelWorkflowEngine;
+
+    fn artifact(module_id: Uuid, world: &str) -> WasmModuleArtifact {
+        WasmModuleArtifact {
+            module_id,
+            content_hash: "stub".into(),
+            wasm_bytes: vec![1],
+            oci_url: None,
+            max_fuel: 1_000_000,
+            capability_world: world.into(),
+            allowed_hosts: vec![],
+            allowed_methods: vec![],
+            allowed_secrets: vec![],
+            requires_approval_for: vec![],
+            integration_name: None,
+            config: None,
+        }
+    }
+
+    async fn dispatch(
+        ceiling: Option<&str>,
+        world: &str,
+    ) -> (Result<serde_json::Value, String>, Arc<ScriptedDispatcher>) {
+        let (node_id, module_id) = (Uuid::new_v4(), Uuid::new_v4());
+        let mut engine = ParallelWorkflowEngine::new();
+        engine.set_user_id(Uuid::new_v4());
+        engine.set_actor_id(Uuid::new_v4());
+        engine.set_max_capability_world(ceiling.map(str::to_string));
+        engine.set_module_fetcher(Arc::new(
+            InMemoryModuleFetcher::new().with_module(module_id, artifact(module_id, world)),
+        ));
+        engine.add_node(node_id, Some(module_id), None, None);
+        let dispatcher = Arc::new(ScriptedDispatcher::new().with_response(module_id, json!({})));
+        let (_, res) = engine
+            .run_single_node_dispatch(
+                NodeIndex::new(0),
+                node_id,
+                Uuid::new_v4(),
+                dispatcher.clone() as Arc<dyn NodeDispatcher>,
+                None,
+                json!({}),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+        (res, dispatcher)
+    }
+
+    #[tokio::test]
+    async fn a_module_above_the_actors_ceiling_is_refused_before_dispatch() {
+        let (res, dispatcher) = dispatch(Some("minimal-node"), "automation-node").await;
+        let err = res.expect_err("automation-node must not run under a minimal-node ceiling");
+        assert!(err.contains("capability ceiling violation"), "{err}");
+        assert_eq!(
+            dispatcher.total_dispatches(),
+            0,
+            "the refusal happens BEFORE the job reaches the dispatcher"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_module_within_the_ceiling_dispatches() {
+        let (res, dispatcher) = dispatch(Some("automation-node"), "http-node").await;
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(dispatcher.total_dispatches(), 1);
+    }
+
+    #[tokio::test]
+    async fn no_ceiling_means_no_gate() {
+        let (res, dispatcher) = dispatch(None, "automation-node").await;
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(dispatcher.total_dispatches(), 1);
+    }
+
+    #[test]
+    fn a_sub_engine_inherits_the_parents_ceiling_verbatim() {
+        // The child-workflow bypass: the trigger gate saw only the parent
+        // graph. The sub-engine must carry the ceiling so ITS dispatches are
+        // gated too — and `None` must round-trip as `None`, not as a default.
+        let mut parent = ParallelWorkflowEngine::new();
+        parent.set_max_capability_world(Some("minimal-node".into()));
+        let child = parent.adapter_set().into_engine();
+        assert_eq!(child.max_capability_world(), Some("minimal-node"));
+        let unbounded = ParallelWorkflowEngine::new().adapter_set().into_engine();
+        assert_eq!(unbounded.max_capability_world(), None);
     }
 }

@@ -316,6 +316,24 @@ impl ParallelWorkflowEngine {
             return Err(crate::WorkflowEngineError::EmptyGraph);
         }
 
+        // The node cap is a LOAD ERROR, not a silent truncation. `add_node`
+        // used to WARN and drop every node past `max_workflow_nodes`, so an
+        // over-cap graph loaded as a PREFIX of itself: nodes 501+ vanished,
+        // every edge naming one was skipped by the endpoint lookup below, and
+        // the run "completed" over a graph the author never drew. `+ 1`
+        // reserves the slot the synthetic `__trigger__` root takes at run
+        // time — a graph of exactly `max` nodes otherwise loads and then
+        // panics at the trigger install (`node_map[&trigger]` on a node the
+        // cap dropped).
+        if nodes.len() + 1 > self.max_workflow_nodes {
+            return Err(crate::WorkflowEngineError::load_graph(format!(
+                "Workflow graph declares {} nodes; the engine cap is {} (including the \
+                 synthetic trigger root). Raise `max_workflow_nodes` or split the workflow.",
+                nodes.len(),
+                self.max_workflow_nodes
+            )));
+        }
+
         if let Some(timeout) = graph
             .get("execution_timeout_secs")
             .and_then(JsonValue::as_u64)
@@ -429,7 +447,7 @@ impl ParallelWorkflowEngine {
                     .and_then(|k| k.as_str())
                     .and_then(|k| parse_system_node_kind(k, node));
                 let retry_policy = read_node_retry_policy_with_actor_cap(node, self.actor_id);
-                self.add_node(node_id, Some(module_id), retry_policy, kind);
+                self.try_add_node(node_id, Some(module_id), retry_policy, kind)?;
                 let node_timeout_secs: Option<u64> = node
                     .get("data")
                     .and_then(|d| d.get("timeout_secs"))
@@ -496,7 +514,7 @@ impl ParallelWorkflowEngine {
                             .and_then(|t| t.strip_prefix("system:"))
                     });
                 let kind = kind_str.and_then(|k| parse_system_node_kind(k, node));
-                self.add_node(node_id, None, None, kind);
+                self.try_add_node(node_id, None, None, kind)?;
             }
         }
 
@@ -510,7 +528,10 @@ impl ParallelWorkflowEngine {
             let src_rf = edge.get("source").and_then(|v| v.as_str()).unwrap_or("");
             let tgt_rf = edge.get("target").and_then(|v| v.as_str()).unwrap_or("");
             if let (Some(&src), Some(&tgt)) = (rf_to_node.get(src_rf), rf_to_node.get(tgt_rf)) {
-                let _ = self.add_edge(
+                // Propagated, not discarded: with the cap now refused above,
+                // the only way this fails is a node the loader itself lost,
+                // and a graph missing an edge it declared must not run.
+                self.add_edge(
                     src,
                     tgt,
                     EdgeLogic {
@@ -535,7 +556,7 @@ impl ParallelWorkflowEngine {
                             .unwrap_or("default")
                             .to_string(),
                     },
-                );
+                )?;
             }
         }
 
@@ -596,9 +617,13 @@ impl ParallelWorkflowEngine {
     /// `None` for plain module nodes).
     ///
     /// Calls past [`max_workflow_nodes`](Self::max_workflow_nodes)
-    /// emit a `tracing::warn!` and are silently dropped — by
-    /// design, so a misbehaving graph generator can't exhaust
-    /// memory before dispatch starts. Raise the cap via
+    /// emit a `tracing::warn!` and are silently dropped — the LOSSY
+    /// convenience for programmatic builders and tests. The graph
+    /// LOADER does not use it: `parse_graph_document` and the trigger
+    /// install go through [`try_add_node`](Self::try_add_node) so an
+    /// over-cap graph is a load ERROR rather than a silently truncated
+    /// graph (which ran as a prefix of itself with its edges skipped).
+    /// Raise the cap via
     /// [`set_max_workflow_nodes`](Self::set_max_workflow_nodes) if
     /// the limit is too low for legitimate use.
     pub fn add_node(
@@ -608,17 +633,37 @@ impl ParallelWorkflowEngine {
         retry_policy: Option<talos_workflow_engine_core::RetryPolicy>,
         kind: Option<SystemNodeKind>,
     ) {
-        if self.graph.node_count() >= self.max_workflow_nodes {
+        if let Err(e) = self.try_add_node(id, module_id, retry_policy, kind) {
             tracing::warn!(
                 node_count = self.graph.node_count(),
                 max = self.max_workflow_nodes,
+                error = %e,
                 "Workflow graph exceeds maximum node count — ignoring add_node"
             );
-            return;
+        }
+    }
+
+    /// Fallible twin of [`add_node`](Self::add_node): returns
+    /// `Err(WorkflowEngineError::LoadGraph)` instead of dropping the node
+    /// when the graph is at [`max_workflow_nodes`](Self::max_workflow_nodes).
+    /// The graph loader and the synthetic-trigger install use this one.
+    pub fn try_add_node(
+        &mut self,
+        id: Uuid,
+        module_id: Option<Uuid>,
+        retry_policy: Option<talos_workflow_engine_core::RetryPolicy>,
+        kind: Option<SystemNodeKind>,
+    ) -> Result<(), crate::WorkflowEngineError> {
+        if self.graph.node_count() >= self.max_workflow_nodes {
+            return Err(crate::WorkflowEngineError::load_graph(format!(
+                "Workflow graph exceeds the maximum node count ({}); node {} not added",
+                self.max_workflow_nodes, id
+            )));
         }
         let idx = self.graph.add_node(id);
         self.node_map.insert(id, idx);
         self.node_meta.insert(id, (module_id, retry_policy, kind));
+        Ok(())
     }
 
     /// Add a directed edge between two nodes already present in the
@@ -652,7 +697,10 @@ impl ParallelWorkflowEngine {
     /// produce the same wiring without stacking parallel triggers.
     ///
     /// Returns the Uuid of the trigger node so the caller can seed
-    /// `initial_results` with it before dispatching the engine.
+    /// `initial_results` with it before dispatching the engine, or
+    /// `Err(LoadGraph)` when the graph is already at its node cap (the
+    /// trigger's `add_node` used to be silently dropped there, and the
+    /// `node_map[&trigger]` index two statements later then PANICKED).
     ///
     /// Shared by [`execute_subworkflow_graph`](Self::execute_subworkflow_graph)
     /// (operating on a fresh sub-engine) and
@@ -661,7 +709,9 @@ impl ParallelWorkflowEngine {
     /// `__trigger__` mechanism stays an implementation detail of the
     /// crate — future refactors can replace it with a native seeding
     /// path without a public-API break.
-    pub(crate) fn ensure_trigger_node_wired_to_roots(&mut self) -> Uuid {
+    pub(crate) fn ensure_trigger_node_wired_to_roots(
+        &mut self,
+    ) -> Result<Uuid, crate::WorkflowEngineError> {
         // Reuse an existing synthetic trigger if one is already
         // registered. The label is the authoritative marker — the
         // Uuid itself is engine-generated and opaque to callers.
@@ -675,7 +725,7 @@ impl ParallelWorkflowEngine {
             Some(id) => id,
             None => {
                 let id = Uuid::new_v4();
-                self.add_node(id, None, None, None);
+                self.try_add_node(id, None, None, None)?;
                 self.node_labels.insert(
                     id,
                     talos_workflow_engine_core::reserved_keys::TRIGGER.to_string(),
@@ -727,7 +777,7 @@ impl ParallelWorkflowEngine {
                 .next()
                 .is_some();
             if !already_wired {
-                let _ = self.add_edge(
+                self.add_edge(
                     trigger_node_id,
                     root_id,
                     EdgeLogic {
@@ -737,10 +787,10 @@ impl ParallelWorkflowEngine {
                         condition: None,
                         edge_type: "default".to_string(),
                     },
-                );
+                )?;
             }
         }
 
-        trigger_node_id
+        Ok(trigger_node_id)
     }
 }

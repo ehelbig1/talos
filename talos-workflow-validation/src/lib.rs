@@ -2415,6 +2415,166 @@ pub struct PreparedValidation {
     pub history: std::result::Result<NodeRunHistory, String>,
 }
 
+// ── Cross-workflow cycles ───────────────────────────────────────────────────
+
+/// Cap on the number of child graphs the cycle walk loads. A deployment's
+/// whole workflow set is well under this; the cap exists so a pathological
+/// reference web cannot turn one `validate_workflow` into a full-table read.
+pub const MAX_SUB_WORKFLOW_GRAPHS: usize = 256;
+
+/// Cap on the reference depth the cycle walk follows — the engine's own
+/// sub-workflow depth bound, so the check can see every cycle the engine
+/// could reach before refusing.
+pub const MAX_SUB_WORKFLOW_DEPTH: usize = 16;
+
+/// Load, transitively and tenancy-scoped, the graph of every workflow
+/// reachable from `root_graph_json` through child references, bounded by
+/// [`MAX_SUB_WORKFLOW_DEPTH`] levels and [`MAX_SUB_WORKFLOW_GRAPHS`] graphs.
+/// One batched read per level. Ids that do not resolve for `user_id` are
+/// simply absent (the walk treats them as leaves).
+pub async fn load_child_graphs(
+    workflow_repo: &WorkflowRepository,
+    root_id: Uuid,
+    root_graph_json: &str,
+    user_id: Uuid,
+) -> Result<HashMap<Uuid, String>> {
+    let mut loaded: HashMap<Uuid, String> = HashMap::new();
+    let mut seen: HashSet<Uuid> = HashSet::from([root_id]);
+    let mut frontier: Vec<Uuid> = talos_workflow_engine_core::child_workflow_ids(root_graph_json)
+        .into_iter()
+        .filter(|id| seen.insert(*id))
+        .collect();
+    let mut depth = 0;
+    while !frontier.is_empty()
+        && depth < MAX_SUB_WORKFLOW_DEPTH
+        && loaded.len() < MAX_SUB_WORKFLOW_GRAPHS
+    {
+        frontier.truncate(MAX_SUB_WORKFLOW_GRAPHS - loaded.len());
+        let graphs = workflow_repo
+            .get_workflow_graphs(&frontier, user_id)
+            .await?;
+        let mut next: Vec<Uuid> = Vec::new();
+        for (id, graph_json) in graphs {
+            for child in talos_workflow_engine_core::child_workflow_ids(&graph_json) {
+                if seen.insert(child) {
+                    next.push(child);
+                }
+            }
+            loaded.insert(id, graph_json);
+        }
+        frontier = next;
+        depth += 1;
+    }
+    Ok(loaded)
+}
+
+/// Pure: find a reference cycle reachable from `root_id`, as the path that
+/// closes it (`[A, B, A]`), or `None`.
+///
+/// `graph_for(id)` is `root_graph_json` for the root and `child_graphs[id]`
+/// otherwise; an id with no graph is a leaf (not visible to `user_id`, or
+/// past the loader's bounds). Iterative DFS with an explicit path stack and a
+/// `done` set, so every workflow is expanded at most once and the walk is
+/// bounded by the size of `child_graphs` whatever shape the references take.
+#[must_use]
+pub fn find_sub_workflow_cycle(
+    root_id: Uuid,
+    root_graph_json: &str,
+    child_graphs: &HashMap<Uuid, String>,
+) -> Option<Vec<Uuid>> {
+    let children_of = |id: Uuid| -> Vec<Uuid> {
+        if id == root_id {
+            talos_workflow_engine_core::child_workflow_ids(root_graph_json)
+        } else {
+            child_graphs
+                .get(&id)
+                .map(|g| talos_workflow_engine_core::child_workflow_ids(g))
+                .unwrap_or_default()
+        }
+    };
+    // (workflow, its children, next child index) per frame.
+    let mut stack: Vec<(Uuid, Vec<Uuid>, usize)> = vec![(root_id, children_of(root_id), 0)];
+    let mut on_path: HashSet<Uuid> = HashSet::from([root_id]);
+    let mut done: HashSet<Uuid> = HashSet::new();
+    while let Some(frame) = stack.last_mut() {
+        let (id, children, next) = (frame.0, &frame.1, &mut frame.2);
+        if *next >= children.len() {
+            done.insert(id);
+            on_path.remove(&id);
+            stack.pop();
+            continue;
+        }
+        let child = children[*next];
+        *next += 1;
+        if on_path.contains(&child) {
+            let mut path: Vec<Uuid> = stack.iter().map(|f| f.0).collect();
+            // Trim to the cycle proper: from the first occurrence of `child`.
+            if let Some(start) = path.iter().position(|w| *w == child) {
+                path.drain(..start);
+            }
+            path.push(child);
+            return Some(path);
+        }
+        if done.contains(&child) || stack.len() > MAX_SUB_WORKFLOW_DEPTH {
+            continue;
+        }
+        on_path.insert(child);
+        stack.push((child, children_of(child), 0));
+    }
+    None
+}
+
+/// The `sub-workflow-cycle` finding for `root_id`, or nothing.
+///
+/// `node_id` is the ROOT-graph node whose reference starts the cycle when the
+/// cycle passes through the root (the common `A → B → A`), so the editor can
+/// point at the node to fix; a cycle entirely below the root (`A → B → C → B`)
+/// is still an error for `A` — it cannot run — but names no root node.
+#[must_use]
+pub fn sub_workflow_cycle_issues(
+    root_id: Uuid,
+    root_graph_json: &str,
+    child_graphs: &HashMap<Uuid, String>,
+) -> Vec<ValidationIssue> {
+    let Some(cycle) = find_sub_workflow_cycle(root_id, root_graph_json, child_graphs) else {
+        return Vec::new();
+    };
+    let first_hop = if cycle.first() == Some(&root_id) {
+        cycle.get(1).copied()
+    } else {
+        None
+    };
+    let node_id = first_hop.and_then(|hop| {
+        let graph: serde_json::Value = serde_json::from_str(root_graph_json).ok()?;
+        graph
+            .get("nodes")?
+            .as_array()?
+            .iter()
+            .find(|n| {
+                talos_workflow_engine_core::collect_child_workflow_references(n)
+                    .iter()
+                    .any(|(_, id)| *id == hop)
+            })
+            .and_then(|n| n.get("id"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    });
+    let rendered: Vec<String> = cycle.iter().map(Uuid::to_string).collect();
+    vec![ValidationIssue {
+        severity: ValidationSeverity::Error,
+        message: format!(
+            "Sub-workflow cycle: {}. Each graph is acyclic on its own, but the child \
+             references form a loop; at run time the engine recurses to its \
+             sub-workflow depth bound ({}) with every level's fan-out in flight before \
+             failing. Remove one of the child references.",
+            rendered.join(" → "),
+            MAX_SUB_WORKFLOW_DEPTH,
+        ),
+        node_id,
+        category: "sub-workflow-cycle".into(),
+    }]
+}
+
 pub struct WorkflowValidationService;
 
 impl WorkflowValidationService {
@@ -2434,9 +2594,10 @@ impl WorkflowValidationService {
         workflow_id: Uuid,
         user_id: Uuid,
     ) -> Result<ValidationResult> {
-        Ok(validate_prepared(
-            Self::prepare(workflow_repo, workflow_id, user_id).await?,
-        ))
+        let prepared = Self::prepare(workflow_repo, workflow_id, user_id).await?;
+        let child_graphs =
+            load_child_graphs(workflow_repo, workflow_id, &prepared.graph_json, user_id).await?;
+        Ok(validate_prepared_with_children(prepared, &child_graphs))
     }
 
     /// Per-node retry advice for one workflow, over the SAME inputs
@@ -2559,6 +2720,27 @@ impl WorkflowValidationService {
 /// Pure: no I/O, so the whole check set is unit-testable from a graph literal.
 #[must_use]
 pub fn validate_prepared(prepared: PreparedValidation) -> ValidationResult {
+    // No child graphs ⇒ the cross-workflow cycle check has nothing to walk
+    // and reports nothing. A caller that CAN load the transitive child set
+    // (`WorkflowValidationService::validate` does; the fleet sweep in
+    // `talos-mcp-handlers` should) calls
+    // [`validate_prepared_with_children`] so that check runs.
+    validate_prepared_with_children(prepared, &HashMap::new())
+}
+
+/// [`validate_prepared`] plus the cross-workflow cycle check, which needs the
+/// graphs of every workflow reachable from this one through its child
+/// references (`child_graphs`, keyed by workflow id — see
+/// [`load_child_graphs`]).
+///
+/// Kept as a second entry point rather than a new `PreparedValidation` field
+/// so an existing struct-literal constructor of `PreparedValidation` keeps
+/// compiling; the check is the same one implementation either way.
+#[must_use]
+pub fn validate_prepared_with_children(
+    prepared: PreparedValidation,
+    child_graphs: &HashMap<Uuid, String>,
+) -> ValidationResult {
     {
         let PreparedValidation {
             workflow_id,
@@ -2647,6 +2829,19 @@ pub fn validate_prepared(prepared: PreparedValidation) -> ValidationResult {
                 category: "cycle".into(),
             });
         }
+
+        // ── Cross-workflow cycle (A → B → A through child references) ────
+        // The intra-graph check above cannot see this: each graph is
+        // acyclic on its own. At run time the engine recurses until its
+        // sub-workflow depth bound (16), with the parallel fan-out of every
+        // level in flight, before failing — a run that burns the whole
+        // execution budget to report a shape the author could have been
+        // told about here.
+        issues.extend(sub_workflow_cycle_issues(
+            workflow_id,
+            &graph_json,
+            child_graphs,
+        ));
 
         // ── Probable-intent hint: multiple parallel roots (sweep DX
         // finding, 2026-07-07). Multiple nodes with no incoming edges are
@@ -7792,5 +7987,113 @@ mod trigger_input_failclosed_tests {
             .map(|(label, _)| label)
             .collect();
         assert_eq!(skipping, vec!["exists, no schema"]);
+    }
+}
+
+#[cfg(test)]
+mod sub_workflow_cycle_tests {
+    //! The cross-workflow cycle check, pure. The loader is one batched
+    //! repository read per level and is exercised by the DB suite; what is
+    //! pinned here is the WALK: what counts as a cycle, what the finding
+    //! names, and that the walk is bounded.
+
+    use super::{find_sub_workflow_cycle, sub_workflow_cycle_issues};
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    fn refs(children: &[(&str, Uuid)]) -> String {
+        let nodes: Vec<serde_json::Value> = children
+            .iter()
+            .map(|(label, id)| {
+                serde_json::json!({
+                    "id": label, "type": "system:sub_workflow",
+                    "data": { "sub_workflow_id": id.to_string() }
+                })
+            })
+            .collect();
+        serde_json::json!({ "nodes": nodes, "edges": [] }).to_string()
+    }
+
+    #[test]
+    fn a_to_b_to_a_is_a_cycle_attributed_to_the_root_node_that_starts_it() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let root = refs(&[("call_b", b)]);
+        let children = HashMap::from([(b, refs(&[("call_a", a)]))]);
+        assert_eq!(
+            find_sub_workflow_cycle(a, &root, &children),
+            Some(vec![a, b, a])
+        );
+        let issues = sub_workflow_cycle_issues(a, &root, &children);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].category, "sub-workflow-cycle");
+        assert_eq!(issues[0].node_id.as_deref(), Some("call_b"));
+        assert!(issues[0].message.contains(&a.to_string()));
+        assert!(issues[0].message.contains(&b.to_string()));
+    }
+
+    #[test]
+    fn a_self_reference_is_a_cycle() {
+        let a = Uuid::new_v4();
+        let root = refs(&[("call_self", a)]);
+        assert_eq!(
+            find_sub_workflow_cycle(a, &root, &HashMap::new()),
+            Some(vec![a, a])
+        );
+    }
+
+    #[test]
+    fn a_chain_and_a_diamond_are_not_cycles() {
+        let (a, b, c, d) = (
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+        );
+        // a → b → c, and a → d → c: c reached twice is reuse, not a loop.
+        let root = refs(&[("call_b", b), ("call_d", d)]);
+        let children = HashMap::from([
+            (b, refs(&[("call_c", c)])),
+            (d, refs(&[("call_c", c)])),
+            (c, refs(&[])),
+        ]);
+        assert_eq!(find_sub_workflow_cycle(a, &root, &children), None);
+        assert!(sub_workflow_cycle_issues(a, &root, &children).is_empty());
+    }
+
+    #[test]
+    fn a_cycle_below_the_root_is_still_an_error_for_the_root_but_names_no_root_node() {
+        let (a, b, c) = (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4());
+        let root = refs(&[("call_b", b)]);
+        let children = HashMap::from([(b, refs(&[("call_c", c)])), (c, refs(&[("call_b", b)]))]);
+        assert_eq!(
+            find_sub_workflow_cycle(a, &root, &children),
+            Some(vec![b, c, b])
+        );
+        let issues = sub_workflow_cycle_issues(a, &root, &children);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].node_id, None);
+    }
+
+    #[test]
+    fn an_unloaded_child_is_a_leaf_and_the_walk_terminates_on_a_wide_web() {
+        let a = Uuid::new_v4();
+        let unknown = Uuid::new_v4();
+        assert_eq!(
+            find_sub_workflow_cycle(a, &refs(&[("call_x", unknown)]), &HashMap::new()),
+            None
+        );
+        // 300 children each referencing every other: bounded by the `done` set.
+        let ids: Vec<Uuid> = (0..300).map(|_| Uuid::new_v4()).collect();
+        let root = refs(&ids.iter().map(|id| ("n", *id)).collect::<Vec<_>>());
+        let children: HashMap<Uuid, String> = ids
+            .iter()
+            .map(|id| {
+                let others: Vec<(&str, Uuid)> =
+                    ids.iter().filter(|o| *o != id).map(|o| ("n", *o)).collect();
+                (*id, refs(&others))
+            })
+            .collect();
+        // Every child references every other, so a 2-cycle exists among them.
+        assert!(find_sub_workflow_cycle(a, &root, &children).is_some());
     }
 }

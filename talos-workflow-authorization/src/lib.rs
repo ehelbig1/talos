@@ -439,12 +439,45 @@ pub fn extract_graph_module_ids(graph_json: &str) -> Vec<Uuid> {
         .collect()
 }
 
+/// Cap on the number of child graphs the trigger gate descends into. A
+/// parent naming more children than this is gated on the first
+/// `MAX_CHILD_GRAPHS_AT_TRIGGER` (sorted, deduplicated ids); the rest are
+/// still gated by the engine at dispatch.
+pub const MAX_CHILD_GRAPHS_AT_TRIGGER: usize = 64;
+
+/// Pure: the child-workflow ids a graph names, bounded by
+/// [`MAX_CHILD_GRAPHS_AT_TRIGGER`]. One home for the reference set —
+/// `talos_workflow_engine_core::child_workflow_ids` — so the gate and the
+/// engine's parser agree on WHICH `data` keys name a child.
+pub fn child_workflow_ids_for_ceiling(graph_json: &str) -> Vec<Uuid> {
+    let mut ids = talos_workflow_engine_core::child_workflow_ids(graph_json);
+    ids.truncate(MAX_CHILD_GRAPHS_AT_TRIGGER);
+    ids
+}
+
+/// Pure: the deduplicated module ids of a parent graph and its child graphs.
+pub fn union_module_ids<'a>(
+    parent_graph_json: &str,
+    child_graphs: impl IntoIterator<Item = &'a str>,
+) -> Vec<Uuid> {
+    let mut ids = extract_graph_module_ids(parent_graph_json);
+    for child in child_graphs {
+        ids.extend(extract_graph_module_ids(child));
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 /// Run trigger-time authorization checks in sequence:
 /// 1. Actor exists, is owned by `user_id`, is not in a terminal state.
 /// 2. `ActorRepository::check_execution_allowed` (budget + status broader gate).
-/// 3. Every module in the workflow's graph fits under the actor's
-///    `max_capability_world` ceiling — SKIPPED for the auto-provisioned default
-///    actor (ceiling-exempt; see step 3 in the body).
+/// 3. Every module in the workflow's graph — and in the child graphs it
+///    names one level down — fits under the actor's `max_capability_world`
+///    ceiling — SKIPPED for the auto-provisioned default actor
+///    (ceiling-exempt; see step 3 in the body). Deeper / run-time-resolved
+///    children are gated by the engine at dispatch (the same ceiling is
+///    stamped by `apply_actor_to_engine` and copied into every sub-engine).
 ///
 /// Phase D: when `trigger_agent_id` is `None` the gate falls back to the user's
 /// **default actor** (`get_or_create_default_actor`) rather than skipping —
@@ -534,11 +567,30 @@ pub async fn authorize_workflow_trigger(
             Err(e) => return Err(TriggerAuthError::Database(e)),
         };
         if let Some(max_world) = max_world_opt {
-            let module_ids = extract_graph_module_ids(graph_json);
+            // The parent graph's modules PLUS one level of child workflows
+            // (`sub_workflow` / judge / ensemble / llm-dispatch routes / …),
+            // resolved in ONE batched, tenancy-scoped read. Deeper nesting and
+            // run-time-resolved children (capability dispatch) are covered by
+            // the ENGINE's dispatch-time gate, which carries the ceiling into
+            // every sub-engine — this descent exists so the common one-hop
+            // shape is refused at trigger time with the trigger-time message
+            // rather than failing a node mid-run.
+            let child_ids = child_workflow_ids_for_ceiling(graph_json);
+            let child_graphs = if child_ids.is_empty() {
+                std::collections::HashMap::new()
+            } else {
+                workflow_repo
+                    .get_workflow_graphs(&child_ids, user_id)
+                    .await
+                    .map_err(TriggerAuthError::Database)?
+            };
+            let module_ids =
+                union_module_ids(graph_json, child_graphs.values().map(String::as_str));
             tracing::debug!(
                 agent_id = %agent_id,
                 max_world = %max_world,
                 graph_module_count = module_ids.len(),
+                child_graphs = child_graphs.len(),
                 "trigger_workflow: enforcing capability ceiling"
             );
             if !module_ids.is_empty() {
@@ -940,5 +992,73 @@ mod tests {
             classify_actor_dispatch_status(""),
             ActorDispatchLifecycle::Ok
         );
+    }
+}
+
+#[cfg(test)]
+mod child_graph_ceiling_tests {
+    //! The one-hop descent the trigger gate makes into child graphs. Pure —
+    //! the DB read is the repository's; what is pinned here is WHICH ids are
+    //! asked for and that the union is what the ceiling check then sees.
+
+    use super::{child_workflow_ids_for_ceiling, union_module_ids, MAX_CHILD_GRAPHS_AT_TRIGGER};
+    use uuid::Uuid;
+
+    fn graph(nodes: Vec<serde_json::Value>) -> String {
+        serde_json::json!({ "nodes": nodes, "edges": [] }).to_string()
+    }
+
+    #[test]
+    fn a_sub_workflow_node_names_its_child_and_the_union_carries_the_childs_modules() {
+        let child_wf = Uuid::new_v4();
+        let parent_mod = Uuid::new_v4();
+        let child_mod = Uuid::new_v4();
+        let parent = graph(vec![
+            serde_json::json!({ "id": "p", "type": parent_mod.to_string(), "data": {} }),
+            serde_json::json!({
+                "id": "s", "type": "system:sub_workflow",
+                "data": { "sub_workflow_id": child_wf.to_string() }
+            }),
+        ]);
+        let child = graph(vec![serde_json::json!({
+            "id": "c", "type": child_mod.to_string(), "data": {}
+        })]);
+
+        assert_eq!(child_workflow_ids_for_ceiling(&parent), vec![child_wf]);
+        let mut expected = vec![parent_mod, child_mod];
+        expected.sort_unstable();
+        assert_eq!(union_module_ids(&parent, [child.as_str()]), expected);
+        // Without the descent the child's module is invisible to the gate —
+        // the bypass this closes.
+        assert_eq!(super::extract_graph_module_ids(&parent), vec![parent_mod]);
+    }
+
+    #[test]
+    fn the_descent_is_bounded_and_the_union_is_deduplicated() {
+        let nodes: Vec<serde_json::Value> = (0..(MAX_CHILD_GRAPHS_AT_TRIGGER + 5))
+            .map(|i| {
+                serde_json::json!({
+                    "id": format!("s{i}"), "type": "system:sub_workflow",
+                    "data": { "sub_workflow_id": Uuid::new_v4().to_string() }
+                })
+            })
+            .collect();
+        let parent = graph(nodes);
+        assert_eq!(
+            child_workflow_ids_for_ceiling(&parent).len(),
+            MAX_CHILD_GRAPHS_AT_TRIGGER
+        );
+
+        let shared = Uuid::new_v4();
+        let g = graph(vec![
+            serde_json::json!({ "id": "x", "type": shared.to_string(), "data": {} }),
+        ]);
+        assert_eq!(union_module_ids(&g, [g.as_str(), g.as_str()]), vec![shared]);
+    }
+
+    #[test]
+    fn malformed_graphs_contribute_nothing() {
+        assert!(child_workflow_ids_for_ceiling("not json").is_empty());
+        assert!(union_module_ids("not json", ["also not json"]).is_empty());
     }
 }

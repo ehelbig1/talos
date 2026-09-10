@@ -15,6 +15,10 @@ talos-capability-world = { path = "../talos-capability-world" }
 # MCP-1030: bounded_preview for caller-supplied reflection in error messages.
 talos-text-util = { path = "../talos-text-util" }
 talos-workflow-creation-helpers = { path = "../talos-workflow-creation-helpers" }
+# One-hop descent into child graphs at the trigger gate: the child-workflow
+# reference set (`child_workflow_ids`) is read from the crate the ENGINE's own
+# parser shares rather than restated here. `-core` is a leaf.
+talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
 tracing.workspace = true
 uuid.workspace = true

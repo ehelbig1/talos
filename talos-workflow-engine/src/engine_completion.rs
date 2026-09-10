@@ -295,6 +295,17 @@ impl ParallelWorkflowEngine {
         };
         let mut output = output;
         sanitize_node_output(&mut output);
+        // A module's committed output is the next node's gathered INPUT, so an
+        // engine-authored INPUT key riding on it (a module that echoes its
+        // input, a custom dispatcher, an LLM asked to "return the input plus a
+        // field") would be inherited by every successor whose own dispatch
+        // declines to write that key. Strip the fixed list here — ONE list,
+        // the same one the trigger-seed install and the controller seam use.
+        // Output-side protocol keys (`__error`, `__continued`,
+        // `__memory_write__`, `__ops_alert__`, `__ml_distill__`,
+        // `__fuel_consumed__`, `__judge_*`, …) are NOT on that list and pass
+        // through untouched — see `ENGINE_AUTHORED_INPUT_KEYS`.
+        talos_workflow_engine_core::reserved_keys::strip_engine_authored_keys(&mut output);
 
         // ── Write ceiling on the `__memory_write__` envelope (#750) ──
         // A module reaches actor_memory two ways: an `agent_memory::set` host

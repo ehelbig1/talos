@@ -680,6 +680,17 @@ pub struct ParallelWorkflowEngine {
     /// from `actors.egress_scope` (independent of `max_llm_tier`). `None` =
     /// tier-derived default. Propagated to every `DispatchJob`/`JobRequest`.
     pub(crate) egress_scope: Option<talos_workflow_engine_core::EgressScope>,
+    /// The bound actor's `max_capability_world` ceiling, stamped by
+    /// `apply_actor_to_engine`. `None` = no ceiling (the auto-provisioned
+    /// default actor is ceiling-exempt, and an actor-less engine has no
+    /// principal to bound). Enforced at EVERY module dispatch (single-node
+    /// and pipeline-step) with `talos_capability_world::ceiling_permits`,
+    /// and copied verbatim into every sub-engine via `AdapterSet` — which
+    /// is what closes the child-workflow bypass: `authorize_workflow_trigger`
+    /// reads only the PARENT graph's modules, so a `minimal-node` actor could
+    /// reach an `automation-node` module through a `sub_workflow` / judge /
+    /// ensemble child. The engine is the fail-closed enforcement point.
+    pub(crate) max_capability_world: Option<String>,
     /// Parent workflow definition id. Threaded into the
     /// [`NodeLifecycleHook::on_node_completed`] context so per-workflow
     /// cost rollups attribute to the right workflow row, not the
@@ -902,6 +913,9 @@ pub struct AdapterSet {
     max_llm_tier: talos_workflow_engine_core::LlmTier,
     max_write_ceiling: talos_workflow_engine_core::WriteCeiling,
     egress_scope: Option<talos_workflow_engine_core::EgressScope>,
+    /// Capability-world ceiling — travels into every sub-engine verbatim
+    /// (see the field on `ParallelWorkflowEngine`).
+    max_capability_world: Option<String>,
     sandbox_root: Option<std::path::PathBuf>,
     agent_loop_max_history: usize,
     max_prefetch_successors: usize,
@@ -1006,6 +1020,10 @@ impl AdapterSet {
         engine.max_llm_tier = self.max_llm_tier;
         engine.max_write_ceiling = self.max_write_ceiling;
         engine.egress_scope = self.egress_scope;
+        // The capability-world ceiling travels too — dropping it here would
+        // let a sub-workflow's modules run above the parent actor's ceiling,
+        // the exact bypass the field exists to close.
+        engine.max_capability_world = self.max_capability_world;
         engine.dry_run = self.dry_run;
         engine.sandbox_root = self.sandbox_root;
         engine.agent_loop_max_history = self.agent_loop_max_history;
@@ -1075,6 +1093,9 @@ impl ParallelWorkflowEngine {
             // the engine→dispatch chain is uniformly fail-closed.
             max_llm_tier: talos_workflow_engine_core::LlmTier::Tier1,
             egress_scope: None,
+            // No ceiling until an actor is bound: an actor-less engine has no
+            // principal to bound, and the default actor is ceiling-exempt.
+            max_capability_world: None,
             // Permissive default; actor binding stamps `ReadOnly` for new
             // actors. Unlike Tier1 above, a `ReadOnly` default would break
             // trusted actor-less system writes (see DispatchJob::default).
@@ -1148,6 +1169,7 @@ impl ParallelWorkflowEngine {
             max_llm_tier: self.max_llm_tier,
             max_write_ceiling: self.max_write_ceiling,
             egress_scope: self.egress_scope,
+            max_capability_world: self.max_capability_world.clone(),
             sandbox_root: self.sandbox_root.clone(),
             agent_loop_max_history: self.agent_loop_max_history,
             max_prefetch_successors: self.max_prefetch_successors,
@@ -1642,7 +1664,16 @@ impl ParallelWorkflowEngine {
         trigger_input: JsonValue,
         execution_id: Uuid,
     ) -> Result<WorkflowContext, crate::WorkflowEngineError> {
-        let trigger_node_id = self.ensure_trigger_node_wired_to_roots();
+        let trigger_node_id = self.ensure_trigger_node_wired_to_roots()?;
+        // The ENGINE is the strip chokepoint for engine-authored reserved keys
+        // on an inbound trigger payload. The controller seam
+        // (`inject_actor_context_into_input`) strips the same list, but a
+        // caller that reaches the engine by any other path — or a future seam
+        // that forgets — must not be able to seed `__actor_context__`,
+        // `__staleness__` or `__degraded_inputs__` onto the root nodes' input.
+        // Same function, one list: `reserved_keys::ENGINE_AUTHORED_INPUT_KEYS`.
+        let mut trigger_input = trigger_input;
+        talos_workflow_engine_core::reserved_keys::strip_engine_authored_keys(&mut trigger_input);
         let mut initial_results = HashMap::new();
         initial_results.insert(trigger_node_id, trigger_input);
         // THE PRODUCTION ENTRY POINT, and the reason `ChainDispatch` exists as
@@ -1678,7 +1709,16 @@ impl ParallelWorkflowEngine {
         execution_id: Uuid,
         cancel: tokio_util::sync::CancellationToken,
     ) -> Result<WorkflowContext, crate::WorkflowEngineError> {
-        let trigger_node_id = self.ensure_trigger_node_wired_to_roots();
+        let trigger_node_id = self.ensure_trigger_node_wired_to_roots()?;
+        // The ENGINE is the strip chokepoint for engine-authored reserved keys
+        // on an inbound trigger payload. The controller seam
+        // (`inject_actor_context_into_input`) strips the same list, but a
+        // caller that reaches the engine by any other path — or a future seam
+        // that forgets — must not be able to seed `__actor_context__`,
+        // `__staleness__` or `__degraded_inputs__` onto the root nodes' input.
+        // Same function, one list: `reserved_keys::ENGINE_AUTHORED_INPUT_KEYS`.
+        let mut trigger_input = trigger_input;
+        talos_workflow_engine_core::reserved_keys::strip_engine_authored_keys(&mut trigger_input);
         let mut initial_results = HashMap::new();
         initial_results.insert(trigger_node_id, trigger_input);
         // Same policy as the non-cancellable twin, and stated HERE for the same
@@ -2005,6 +2045,48 @@ impl ParallelWorkflowEngine {
             }};
         }
 
+        // A PAUSE (Wait node, ConfidenceGate below its threshold) returns from
+        // INSIDE the dispatch loop, and at that moment `executing` may still
+        // hold sibling module futures that were pushed earlier in this very
+        // pass — a fan-out `start → {wait, sibling}` pushes `sibling` and then
+        // meets `wait`. Returning with them un-awaited drops the futures:
+        // their side effects (the worker job is already on the wire) happen,
+        // their results are never committed, the checkpoint records them as
+        // never run, and the resume re-dispatches them. This drains the pool
+        // through the SAME completion handler the loop uses, so a sibling's
+        // result lands in `results` (and the checkpoint) exactly as it would
+        // have had the pause come one iteration later. A sibling FAILURE during
+        // the drain propagates as the run's error (`?`) rather than pausing —
+        // a run that has already failed must not be parked as "waiting".
+        macro_rules! drain_in_flight_before_pause {
+            () => {{
+                while let Some((finished_idx, exec_result)) = executing.next().await {
+                    self.progress.mark_finished(self.graph[finished_idx]);
+                    let wall_time_ms = node_start_times
+                        .remove(&finished_idx)
+                        .map(|start| start.elapsed().as_millis() as u64)
+                        .unwrap_or(0);
+                    let chains_ctx = if chains_live {
+                        Some((chains.as_slice(), &node_to_chain))
+                    } else {
+                        None
+                    };
+                    self.handle_completed_future(
+                        finished_idx,
+                        exec_result,
+                        execution_id,
+                        wall_time_ms,
+                        chains_ctx,
+                        &exec_ctx,
+                        &mut results,
+                        &mut pending,
+                        &mut ready,
+                    )
+                    .await?;
+                }
+            }};
+        }
+
         // M5: ceiling on concurrent node-dispatch futures (see
         // MAX_CONCURRENT_NODE_DISPATCH). Resolved once per run.
         let max_concurrent_nodes = *MAX_CONCURRENT_NODE_DISPATCH;
@@ -2280,6 +2362,7 @@ impl ParallelWorkflowEngine {
                     use crate::scheduler_handlers::WaitOutcome;
                     let WaitOutcome::Pause { waiting_output } = outcome;
                     commit_result!(node_id, waiting_output);
+                    drain_in_flight_before_pause!();
                     return Ok(WorkflowContext {
                         results,
                         waiting: true,
@@ -2397,6 +2480,7 @@ impl ParallelWorkflowEngine {
                         }
                         ConfidenceGateOutcome::Pause { waiting_output } => {
                             commit_result!(node_id, waiting_output);
+                            drain_in_flight_before_pause!();
                             return Ok(WorkflowContext {
                                 results,
                                 waiting: true,

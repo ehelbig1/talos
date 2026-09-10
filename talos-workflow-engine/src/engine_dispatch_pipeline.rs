@@ -138,6 +138,28 @@ impl ParallelWorkflowEngine {
                 None => (None, serde_json::json!({})),
             };
 
+            // Capability-world ceiling, per step — the same gate the
+            // single-node path applies after its module fetch. A chain is
+            // dispatched as one job, so ONE over-ceiling step refuses the
+            // whole chain before anything reaches the worker.
+            if let Some(a) = artifact.as_ref() {
+                if let Err(e) = crate::capability_ceiling::refuse_module_over_ceiling(
+                    self.max_capability_world.as_deref(),
+                    a.module_id,
+                    &a.capability_world,
+                ) {
+                    tracing::warn!(
+                        target: "talos_security",
+                        %step_node_id,
+                        module_id = %a.module_id,
+                        module_world = %a.capability_world,
+                        ceiling = ?self.max_capability_world,
+                        "pipeline step refused: module world exceeds the actor's capability ceiling"
+                    );
+                    return (chain_tail, Err(e));
+                }
+            }
+
             // Capture the head node's capability world for the memory-injection
             // gate below (see `head_capability_world`).
             if step_node_id == chain_head_id {

@@ -1467,7 +1467,20 @@ impl ParallelWorkflowEngine {
         // wired to every root so root-level modules actually execute.
         // Delegates to the shared helper so this path and the public
         // `run_with_trigger_input_transport` can't drift.
-        let trigger_node_id = sub_engine.ensure_trigger_node_wired_to_roots();
+        let trigger_node_id = sub_engine
+            .ensure_trigger_node_wired_to_roots()
+            .map_err(|e| SubflowError::BuildFailed(e.to_string()))?;
+        // Child-seed strip: the parent's upstream output rides into the child
+        // as its trigger envelope, so a parent-side `__actor_context__` /
+        // `__accumulated__` / `__staleness__` / `__degraded_inputs__` would be
+        // INHERITED by the child's root nodes whenever the child declines to
+        // inject its own (a send-world root, the kill-switch, no bound actor).
+        // `__trigger_input__` is KEPT — the parent dispatcher wraps it here
+        // deliberately so the root payload survives composition.
+        let mut trigger_input = trigger_input;
+        talos_workflow_engine_core::reserved_keys::strip_engine_authored_keys_for_child_seed(
+            &mut trigger_input,
+        );
         let mut initial_results = HashMap::new();
         initial_results.insert(trigger_node_id, trigger_input);
 

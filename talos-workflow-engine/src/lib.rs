@@ -39,6 +39,7 @@ const _LLM_PRIMITIVES_FEATURE_COHERENCE_CHECK: () = assert!(
      variants that the engine cannot dispatch."
 );
 
+mod capability_ceiling;
 mod chain_detect;
 mod child_run_report;
 mod condition_eval;
