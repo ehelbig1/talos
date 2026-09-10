@@ -72,7 +72,13 @@ pub(crate) const RESERVED_PUBLISH_PREFIXES: &[&str] = &[
     talos_workflow_job_protocol::subjects::NAMESPACE_PREFIX,
     "wasm.",   // wasm.log.* — controller WASM-log subscriber
     "$",       // NATS system subjects: $SYS.*, $JS.API.*, $KV, $OBJ, …
-    "_INBOX.", // NATS request/reply inboxes
+    "_INBOX.", // NATS request/reply inboxes (the controller's prefix)
+    // The WORKER's request/reply inboxes (`nats_permissions::WORKER_INBOX_PREFIX`).
+    // The broker denies the worker credential publish on `_WINBOX.>` too, but
+    // that refusal is an async `-ERR` the guest never sees; refusing here gives
+    // the guest an error and the ledger a `reserved-subject-prefix` denial.
+    // Pinned to the const by `reserved_prefixes_cover_the_worker_inbox`.
+    "_WINBOX.",
 ];
 
 /// Returns `true` when `topic` is on the platform-reserved prefix
@@ -763,5 +769,38 @@ mod email_recipient_cap_constants {
         let worst_case =
             (MAX_EMAIL_SENDS_PER_EXECUTION as usize) * MAX_EMAIL_RECIPIENTS_PER_MESSAGE;
         assert_eq!(worst_case, 2500);
+    }
+}
+
+#[cfg(test)]
+mod reserved_prefix_pins {
+    //! The deny-list is spelled as literals (a `const` array cannot `format!`
+    //! a prefix from another crate); these pins keep the literals equal to
+    //! the consts they stand for.
+    use super::{reject_reserved_topic_prefix, RESERVED_PUBLISH_PREFIXES};
+    use talos_workflow_job_protocol::nats_permissions::{
+        CONTROLLER_INBOX_PREFIX, WORKER_INBOX_PREFIX,
+    };
+
+    #[test]
+    fn reserved_prefixes_cover_the_worker_inbox() {
+        let worker = format!("{WORKER_INBOX_PREFIX}.");
+        let controller = format!("{CONTROLLER_INBOX_PREFIX}.");
+        assert!(
+            RESERVED_PUBLISH_PREFIXES.contains(&worker.as_str()),
+            "{worker} missing"
+        );
+        assert!(
+            RESERVED_PUBLISH_PREFIXES.contains(&controller.as_str()),
+            "{controller} missing"
+        );
+        assert!(reject_reserved_topic_prefix(&format!(
+            "{WORKER_INBOX_PREFIX}.abc.1"
+        )));
+        assert!(reject_reserved_topic_prefix(&format!(
+            "{CONTROLLER_INBOX_PREFIX}.abc.1"
+        )));
+        // A guest topic that merely CONTAINS the token is not a prefix hit.
+        assert!(!reject_reserved_topic_prefix("acme._WINBOX.x"));
     }
 }

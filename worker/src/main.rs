@@ -111,6 +111,63 @@ fn clamp_job_fuel(job_id: uuid::Uuid, requested: u64, ceiling: u64) -> Option<u6
 // RELIABILITY: Result Publishing with Retry
 // ============================================================================
 
+/// Connection options every worker connect branch starts from.
+///
+/// Two things the broker-side permission model needs from the CLIENT:
+///
+/// 1. **The worker's own inbox prefix.** async-nats derives every
+///    request/reply inbox from one connection-level prefix (`_INBOX` by
+///    default — which the controller keeps). The worker's NATS credential
+///    is granted subscribe on `_WINBOX.>` and NOT on `_INBOX.>`
+///    (`talos_workflow_job_protocol::nats_permissions`), so a worker whose
+///    requests still used `_INBOX` would never see a reply. Deploy note:
+///    a worker built with this prefix against a NATS with no permissions
+///    block works unchanged (the prefix is just a subject).
+/// 2. **An event callback.** A publish or subscribe the broker refuses is
+///    reported as an ASYNCHRONOUS `-ERR Permissions Violation …` on the
+///    connection — `publish()` still returns `Ok`, the subscription still
+///    exists locally and simply never delivers. Without a callback that is
+///    a silent drop; with one it is a WARN naming the subject, which is the
+///    only operator-visible signal that a credential and a code path have
+///    drifted apart.
+fn worker_connect_options() -> async_nats::ConnectOptions {
+    async_nats::ConnectOptions::new()
+        .custom_inbox_prefix(talos_workflow_job_protocol::nats_permissions::WORKER_INBOX_PREFIX)
+        .event_callback(|event| async move {
+            match &event {
+                async_nats::Event::ServerError(err) => ::tracing::warn!(
+                    target: "talos_nats",
+                    error = %err,
+                    "NATS server error on the worker connection — a `Permissions Violation` \
+                     here means this credential is not granted that subject (see \
+                     talos_workflow_job_protocol::nats_permissions); the operation was \
+                     dropped by the broker, not by the worker"
+                ),
+                async_nats::Event::ClientError(err) => ::tracing::warn!(
+                    target: "talos_nats",
+                    error = %err,
+                    "NATS client error on the worker connection"
+                ),
+                async_nats::Event::SlowConsumer(sid) => ::tracing::warn!(
+                    target: "talos_nats",
+                    subscription = sid,
+                    "NATS slow consumer on the worker connection"
+                ),
+                async_nats::Event::Connected => {
+                    ::tracing::info!(target: "talos_nats", "NATS connected")
+                }
+                async_nats::Event::Disconnected
+                | async_nats::Event::LameDuckMode
+                | async_nats::Event::Draining
+                | async_nats::Event::Closed => ::tracing::warn!(
+                    target: "talos_nats",
+                    event = %event,
+                    "NATS connection state change on the worker connection"
+                ),
+            }
+        })
+}
+
 /// Publish a serialized payload to a NATS topic with exponential backoff retry.
 async fn publish_bytes_with_retry(
     nc: &async_nats::Client,
@@ -2567,7 +2624,7 @@ async fn main() -> anyhow::Result<()> {
         (Some(user), Some(pass)) => {
             // apply_nats_ca adds the in-cluster NATS CA + requires TLS when
             // NATS_CA_FILE is set (tls:// URL); no-op otherwise.
-            let opts = async_nats::ConnectOptions::new().user_and_password(user, pass);
+            let opts = worker_connect_options().user_and_password(user, pass);
             match talos_nats_tls::apply_nats_ca(opts).connect(&nats_url).await {
                 Ok(c) => {
                     println!(
@@ -2599,7 +2656,7 @@ async fn main() -> anyhow::Result<()> {
                 "NATS_USER/NATS_PASSWORD not set — connecting without authentication. \
                  This is acceptable for development but MUST NOT be used in production."
             );
-            let opts = talos_nats_tls::apply_nats_ca(async_nats::ConnectOptions::new());
+            let opts = talos_nats_tls::apply_nats_ca(worker_connect_options());
             match opts.connect(&nats_url).await {
                 Ok(c) => {
                     println!(
@@ -3726,5 +3783,31 @@ mod result_publish_tests {
                 "H-1 regression: wire subject {bad:?} leaked through"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod nats_connect_options_tests {
+    //! The inbox prefix is the one client-side half of the broker permission
+    //! model: the worker credential is granted subscribe on `_WINBOX.>` and
+    //! not `_INBOX.>`, so a worker that drifted back to the default prefix
+    //! would issue RPCs whose replies it can never receive. `ConnectOptions`
+    //! exposes no getter; its `Debug` output names the field, which is the
+    //! only observation available short of a live broker (the live check is
+    //! `talos-workflow-engine-nats/tests/nats_worker_permissions.rs`).
+    use super::worker_connect_options;
+    use talos_workflow_job_protocol::nats_permissions::{
+        CONTROLLER_INBOX_PREFIX, WORKER_INBOX_PREFIX,
+    };
+
+    #[test]
+    fn worker_connect_options_use_the_worker_inbox_prefix() {
+        let dbg = format!("{:?}", worker_connect_options());
+        // `ConnectOptions` renders as a map of quoted keys: `"inbox_prefix": "_WINBOX"`.
+        assert!(
+            dbg.contains(&format!("\"inbox_prefix\": {WORKER_INBOX_PREFIX:?}")),
+            "ConnectOptions must carry the worker inbox prefix; got: {dbg}"
+        );
+        assert!(!dbg.contains(&format!("\"inbox_prefix\": {CONTROLLER_INBOX_PREFIX:?}")));
     }
 }

@@ -1246,3 +1246,139 @@ across tables by construction and do not need a tag. Already-tagged contexts:
 `integration_state_aad(name, user_id, key)`, `example_aad(dataset, key, id)`,
 `disagreement_aad(model, id)`, actor_memory's `(actor_id, key)`. The bare
 shared-foreign-id shape existed at exactly the two sites this package fixed.
+
+## Package F — the worker's own NATS credential (2026-09-10, follow-up PR)
+
+**What G4c recorded, and why it was right to skip.** The deploy/infra review
+found one NATS user with no `permissions` block shared by every process, so a
+worker was indistinguishable from the controller at the broker. G4 closed the
+route port (authorization + mTLS, NetworkPolicy split) and skipped the client
+credential because "the worker's publish set is NOT confidently enumerable":
+besides the platform subjects, the worker forwards guest-authored topics from
+the `messaging` WIT (`context.rs`, `host/messaging.rs`), and the catalog's
+`message-publisher` template takes its topic from module config. That fact did
+not change; what changed is that it decides the SHAPE of the publish rule
+rather than whether there is one.
+
+**The inventory, redone from the call sites** (`grep` over `worker/src` and
+`talos-worker-runtime/src` for every `publish`/`subscribe`/`queue_subscribe`/
+`request`, then each site read for its subject expression). SUBSCRIBE: the
+single-job queue (`talos.jobs`, or `NATS_JOB_TOPIC` — the per-user edge child
+`talos.jobs.<user>`), the pipeline queue (`talos.pipeline.jobs` and child),
+`talos.workers.cmd.cancel` (plain, fleet-wide), `talos.approvals.wait.<exec>`
+(the governance host, keyed on the node's exec id), and the connection's own
+request inboxes. Seven call sites; a closed set. PUBLISH: `talos.results.<job>`
+/ `talos.pipeline.results.<job>` and the signed reply inbox from the
+`JobRequest` body, `talos.audit.ledger` (five sites), `talos.approvals.pending`,
+`talos.workers.heartbeat.<id>`, the seven signed RPC requests, `wasm.log.<exec>`
+(five sites), `talos.agent.<target>.{invoke,message}`, `talos.events.<exec>.<ty>`,
+the secret-claim inbox, and whatever a guest hands `messaging::publish` /
+`publish_with_headers` / `request` — bounded only by the runtime's
+`RESERVED_PUBLISH_PREFIXES` deny-list. An open set.
+
+**Decision.** Subscribe is an ALLOW-list and publish is a DENY-list, and the
+asymmetry is forced by how nats-server reports a violation: an asynchronous
+`-ERR Permissions Violation for Publish to "…"` on the connection, while
+`publish()` has already returned `Ok`. An allow-list on publish would therefore
+have turned every guest publish to an unlisted subject into a message the broker
+dropped and `messaging::publish` reported as delivered — the misleading-report
+class at the transport. The deny-list is the set of subjects the worker must
+never AUTHOR: both job families, `talos.workers.cmd.>`, `talos.alerts.>` (the
+one consumer-trusted UNSIGNED subject a worker could have written into),
+`talos.approvals.wait.>` (a worker publishing there could approve a sibling's
+suspended node), `talos.llm.stream.>` (no worker publisher exists — measured,
+and the pin says so if one is added), `_WINBOX.>` (other workers' inboxes) and
+the `$SYS`/`$JS`/`$KV`/`$O` namespaces (the worker uses no JetStream). The
+allow-list is the seven subscribe sites above, spelled as patterns. The
+controller keeps an unrestricted credential: it is the trusted party and it
+replies to worker RPCs into the worker's inboxes.
+
+**The inbox prefix is the client-side half.** async-nats derives every request
+inbox from one connection-level prefix, `_INBOX` by default. With a shared
+prefix the allow-list could not admit the worker's own replies without admitting
+the controller's; `ConnectOptions::custom_inbox_prefix("_WINBOX")` on the worker
+(`worker_connect_options`, used by both connect branches) is what makes
+`_WINBOX.>` allowed and `_INBOX.>` refused. `_WINBOX.` also joined the guest
+reserved-prefix deny-list, pinned to the const. The same options install an
+event callback: a broker refusal is otherwise a silent drop, and with it a WARN
+on `target: "talos_nats"` naming the subject.
+
+**One home, two rendered copies, pinned.** `talos_workflow_job_protocol::
+nats_permissions` holds the two arrays, a NATS subject matcher (`*` one token,
+`>` one-or-more trailing), `worker_may_publish` / `worker_may_subscribe`, and
+`render_worker_permissions_conf`, which emits the nats-server fragment defining
+`WORKER_PERMISSIONS`. Helm's `.Files.Get` cannot read outside the chart and
+compose cannot read inside it, so the fragment is checked in twice —
+`deploy/nats/worker-permissions.conf` and
+`deploy/helm/talos/files/nats-worker-permissions.conf` — and
+`rendered_conf_files_match_the_code` fails on any byte of drift
+(`TALOS_NATS_PERMISSIONS_WRITE=1` regenerates). The seven RPC subjects live in
+`talos-memory`, ABOVE the protocol crate, so they are literals in the model and
+cross-pinned from `talos-memory`'s own tests. The chart ConfigMap includes the
+fragment as a second key and `include`s it; compose bind-mounts `deploy/nats/`
+as a directory (check 66) and `-c /etc/nats/nats.conf`. Both rendered configs
+were parsed by `nats-server -t` before anything else was written — including
+the fact that an unresolved `$NATS_WORKER_USER` is a parse failure, which is
+what makes the StatefulSet's REQUIRED secretKeyRefs the right shape.
+
+**Proved on a live broker, and the test was wrong three times before the model
+was right once.** `talos-workflow-engine-nats/tests/nats_worker_permissions.rs`
+runs the compose `nats.conf` on a second, permissioned NATS container in
+`make test-integration` and asserts the broker agrees with the model on 29
+concrete subjects — each probe with a CONTROL on the unrestricted credential,
+so a missing message is a refusal and not a broken wire — plus both
+request/reply shapes (controller→worker job on `_INBOX`, worker→controller RPC
+on `_WINBOX`). Run 1 reported two disagreements and a timed-out request: the
+three tests run in parallel on ONE broker and share `talos.jobs` by
+construction, so the job-request test's queue subscriber swallowed the probe
+test's control publish. A lock fixed that, and run 2 still reported two
+disagreements — different subjects, always an ALLOWED subscribe directly after
+a DENIED publish. The server trace (`-DV`) settled it: the worker's `SUB
+talos.jobs` arrived at .801146, the controller's `PUB` at .801332, and the
+fan-out went to the controller's subscription only. `Client::flush()` drains
+the client's write buffer and returns; it is not a server round trip, so
+"subscribe, flush, have the OTHER connection publish" is not ordered. NATS
+processes one connection's commands in order, so a request/reply on the
+subscribing connection after its `SUB` is a real barrier. The third defect was
+in the barrier itself: its responder subscribed on the controller connection
+while the first barrier request came from the worker connection — nothing
+orders those — and one run in eight got "no responders"; the helper now proves
+its own `SUB` with a same-connection round trip before returning. With all
+three fixed the binary passed ten consecutive runs. Every `-ERR` line in the
+trace was a modelled deny row and no connection was ever closed — the broker
+had agreed with the model on every refusal from the first run; only the test's
+reading of allowed rows was racing. The general lesson is the one already in
+this file's title: in a two-connection test, "I sent it" proves nothing about
+the other connection's view, and the only ordering NATS gives you is within one
+connection.
+
+**Deploy.** install.sh mints `NATS_WORKER_USER=talos-worker` plus a random
+password and back-fills both into a reused bootstrap Secret; `make up`
+back-fills `.env`; `scripts/setup-dev.sh` writes them for a fresh stack; the
+worker Deployment maps the worker Secret keys onto the env names the binary
+already reads (`NATS_USER`/`NATS_PASSWORD` — it does not care what its user is
+called). Rolling is safe in either order: an old worker keeps the unrestricted
+controller pair against the new config; a new worker against an old single-user
+config fails authentication loudly at boot. The one upgrade duty is the
+External-Secrets operator's — add both keys BEFORE upgrading, because the NATS
+pods will not start without them — and values.yaml says so.
+
+**Stated limits.** The prefix is per process KIND: every worker shares
+`_WINBOX.>`, so a compromised worker can still read a sibling's RPC replies
+(decrypted memory values in flight); per-worker isolation needs NATS accounts or
+auth callout, which a static config cannot mint. `talos.jobs` is the queue and
+is visible to every worker by design, so the `encrypted_secrets` envelope under
+the fleet-shared `WORKER_SHARED_KEY` is readable fleet-wide; the control for that
+is `TALOS_ENVELOPE_SEALING=required`, not permissions. The publish deny-list
+leaves the guest set open on purpose, so a compromised worker can still publish
+to any subject not on it; what the model closes is every subject the CONTROLLER
+consumes without a signature check. The controller credential is unrestricted,
+and a future restriction must allow `_WINBOX.>`.
+
+**Registry facts found on the way, recorded in `docs/nats-subjects.md` rather
+than fixed:** `talos.workers.cmd.cancel` — the one command subject the worker
+actually subscribes to — was missing from the table while the inert
+`talos.workers.cmd.shutdown` was listed with a producer and consumer;
+`<prefix>.jobs.priority` / `<prefix>.pipeline.jobs.priority` have NO subscriber;
+`talos.llm.stream.*` has no publisher; the engine's `WORKFLOW_NATS_PREFIX`
+defaults to `workflow` and every deployment overrides it to `talos`.

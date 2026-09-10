@@ -58,6 +58,23 @@ spec:
                 secretKeyRef:
                   name: {{ include "talos.bootstrapSecretName" . }}
                   key: NATS_PASSWORD
+            # The WORKER credential (nats.conf binds it to WORKER_PERMISSIONS).
+            # REQUIRED, not `optional: true`, for the same reason as the
+            # cluster pair below: an absent key leaves `$NATS_WORKER_USER`
+            # unresolved and nats-server fails at config parse. install.sh
+            # mints both and back-fills them into a pre-existing bootstrap
+            # Secret on re-run; External-Secrets operators add them beside
+            # NATS_USER (values.yaml bootstrapSecret.data) BEFORE upgrading.
+            - name: NATS_WORKER_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: NATS_WORKER_USER
+            - name: NATS_WORKER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: NATS_WORKER_PASSWORD
             {{- if gt (int .Values.nats.replicaCount) 1 }}
             # Route-port credentials for `cluster { authorization {} }` in
             # nats.conf — only rendered when there IS a cluster. REQUIRED

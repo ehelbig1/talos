@@ -22,6 +22,10 @@ use uuid::Uuid;
 /// subject shared across process boundaries.
 pub mod subjects;
 
+/// Broker-level permission sets for the worker's NATS credential — the one
+/// home the two rendered `nats.conf` fragments are pinned to.
+pub mod nats_permissions;
+
 /// RFC 0010 P3 (D3b) — per-execution ephemeral secret-envelope sealing.
 pub mod envelope_seal;
 

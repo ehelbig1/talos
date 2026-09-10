@@ -223,12 +223,24 @@ services:
   nats:
     image: nats:2.10-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927
     container_name: talos-nats
-    # SECURITY: Require username/password authentication on all connections.
+    # SECURITY: username/password on every connection, TWO credentials
+    # (2026-09-10): the controller's NATS_USER pair (unrestricted) and the
+    # worker's NATS_WORKER_USER pair, bound in deploy/nats/nats.conf to the
+    # WORKER_PERMISSIONS set generated from
+    # talos_workflow_job_protocol::nats_permissions (subscribe allow-list,
+    # publish deny-list). Until then the worker held the controller's
+    # credential and could read every controller reply inbox on the bus.
+    # `make up` back-fills the worker pair into an existing .env.
     environment:
       - NATS_USER=${NATS_USER:?NATS_USER required in .env}
       - NATS_PASSWORD=${NATS_PASSWORD:?NATS_PASSWORD required in .env}
-    command: >
-      sh -c "echo 'max_payload: 8388608' > /nats.conf && exec nats-server --jetstream --store_dir=/data -m 8222 --user \"$$NATS_USER\" --pass \"$$NATS_PASSWORD\" -c /nats.conf"
+      - NATS_WORKER_USER=${NATS_WORKER_USER:?NATS_WORKER_USER required in .env — run `make up` (back-fills it) or `make setup`}
+      - NATS_WORKER_PASSWORD=${NATS_WORKER_PASSWORD:?NATS_WORKER_PASSWORD required in .env — run `make up` (back-fills it) or `make setup`}
+    # The config (max_payload + authorization + the include of the generated
+    # permission fragment) lives in deploy/nats/, bind-mounted as a DIRECTORY
+    # below — never the file (check 66). JetStream + monitoring stay on the
+    # command line so the file carries no `jetstream {}` block.
+    command: ["--jetstream", "--store_dir=/data", "-m", "8222", "-c", "/etc/nats/nats.conf"]
     ports:
       # DEVELOPMENT: Port exposed for debugging
       # PRODUCTION: Remove this port mapping
@@ -236,6 +248,7 @@ services:
       - "127.0.0.1:8222:8222"  # HTTP monitoring
     volumes:
       - nats_data:/data
+      - ./deploy/nats:/etc/nats:ro
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8222/healthz"]
       interval: 10s
@@ -893,8 +906,11 @@ services:
       # same table without any host call.
       TALOS_WRITE_CEILING_ENFORCED: "1"
       NATS_URL: nats://nats:4222
-      NATS_USER: ${NATS_USER:?NATS_USER required in .env}
-      NATS_PASSWORD: ${NATS_PASSWORD:?NATS_PASSWORD required in .env}
+      # The WORKER credential (see the nats service). The binary reads
+      # NATS_USER/NATS_PASSWORD whatever the user is called; the VALUES are
+      # the worker pair, which nats.conf binds to WORKER_PERMISSIONS.
+      NATS_USER: ${NATS_WORKER_USER:?NATS_WORKER_USER required in .env — run `make up` (back-fills it) or `make setup`}
+      NATS_PASSWORD: ${NATS_WORKER_PASSWORD:?NATS_WORKER_PASSWORD required in .env — run `make up` (back-fills it) or `make setup`}
       # Worker caches compiled WASM bytes in Redis so sub-workflow invocations
       # and loop re-dispatches don't re-fetch from the controller each time.
       # Without this, the second iteration of any loop node fails with

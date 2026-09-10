@@ -1620,9 +1620,22 @@ bootstrapSecret:
     # Postgres + Redis URIs (full connection strings)
     DATABASE_URL: ""
     REDIS_URL: ""
-    # NATS basic auth
+    # NATS basic auth — the CONTROLLER credential (unrestricted).
     NATS_USER: ""
     NATS_PASSWORD: ""
+    # NATS WORKER credential (2026-09-10). Every worker pod mounts this pair
+    # (as its NATS_USER/NATS_PASSWORD env) and nats.conf binds it to
+    # WORKER_PERMISSIONS — subscribe allow-list, publish deny-list, generated
+    # from `talos_workflow_job_protocol::nats_permissions`. REQUIRED: the NATS
+    # StatefulSet mounts both as non-optional secretKeyRefs (an unresolved
+    # `$NATS_WORKER_USER` is a nats-server config-parse failure), so a Secret
+    # without them wedges the NATS pods in CreateContainerConfigError — loud,
+    # and the message names the key. install.sh mints both and back-fills them
+    # into a pre-existing bootstrap Secret on re-run; External-Secrets
+    # operators MUST add them before upgrading to a chart that reads them.
+    # Generate with: openssl rand -base64 32 | tr -d '+=/' | head -c 32
+    NATS_WORKER_USER: ""
+    NATS_WORKER_PASSWORD: ""
     # Neo4j credentials
     NEO4J_USER: "neo4j"
     NEO4J_PASSWORD: ""

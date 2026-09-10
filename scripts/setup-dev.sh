@@ -51,6 +51,11 @@ POSTGRES_PASSWORD=$(openssl rand -hex 16)
 REDIS_PASSWORD=$(openssl rand -hex 16)
 NATS_USER=talos
 NATS_PASSWORD=$(openssl rand -hex 16)
+# Worker NATS credential — a SEPARATE pair the broker binds to the worker
+# permission set (deploy/nats/worker-permissions.conf). The controller keeps
+# NATS_USER; every worker gets this one.
+NATS_WORKER_USER=talos-worker
+NATS_WORKER_PASSWORD=$(openssl rand -hex 16)
 NEO4J_PASSWORD=$(openssl rand -hex 16)
 
 # ─── Object store (MinIO) ───────────────────────────────────────────────────

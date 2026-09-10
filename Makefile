@@ -52,6 +52,13 @@ up: ## Build + start the full dev stack, wait for health
 	    printf '\033[1;31m✗ no .env found.\033[0m Run `make setup` to generate one (or see QUICKSTART.md).\n'; \
 	    exit 1; \
 	}
+	@# Back-fill keys the compose file has learned to REQUIRE since this .env
+	@# was minted (the k3s installer does the same for the bootstrap Secret).
+	@# Only ABSENT keys are added; an existing value is never touched.
+	@grep -Eq '^NATS_WORKER_USER=' .env || { \
+	    printf 'NATS_WORKER_USER=talos-worker\nNATS_WORKER_PASSWORD=%s\n' "$$(openssl rand -hex 16)" >> .env; \
+	    printf '\033[1;33m⚠ back-filled NATS_WORKER_USER / NATS_WORKER_PASSWORD into .env\033[0m (worker NATS credential, 2026-09-10)\n'; \
+	}
 	@# Refuse to build onto a full Docker VM disk: Postgres PANICs on ENOSPC
 	@# mid-checkpoint and crash-loops (2026-07-29). Advisory unless >=95% —
 	@# skips silently when docker is unavailable. TALOS_UP_SKIP_DISK_CHECK=1
