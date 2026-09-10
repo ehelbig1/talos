@@ -17,6 +17,11 @@ pub struct AuthQueries;
 
 #[async_graphql::Object]
 impl AuthQueries {
+    // allow-public-query: `me` is deliberately reachable by a pre-2FA session
+    // (the 2FA login flow needs it) and is self-scoped to the caller's own
+    // row — see the pre-2FA allowlist in `schema/mod.rs`. An API-key scope
+    // gate here would only ever be satisfied by a key that has already
+    // proven itself to `graphql_handler`.
     async fn me(&self, ctx: &Context<'_>) -> Result<UserInfo> {
         let auth_service = ctx
             .data::<Arc<talos_auth::AuthService>>()

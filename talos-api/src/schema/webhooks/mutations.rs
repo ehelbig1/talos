@@ -367,13 +367,28 @@ impl WebhooksMutations {
             .map(|v| serde_json::to_vec(v).unwrap_or_default())
             .unwrap_or_default();
 
+        // F2: the router refuses an entry that was captured above the auth
+        // gate (the stamp travels in the stored header map) and a disabled
+        // trigger. Those two refusals are caller-safe and are surfaced
+        // verbatim so the operator knows WHY nothing ran; every other
+        // failure keeps the generic message. Note `replayed_at` is stamped
+        // only after `Ok`, so a refused entry stays visible in the DLQ.
         webhook_router
-            .dispatch_replay(trigger_id, payload_bytes)
+            .dispatch_replay(trigger_id, payload_bytes, row.headers.as_ref())
             .await
-            .map_err(|e| {
-                tracing::error!(dlq_id = %id, "DLQ replay failed: {}", e);
-                async_graphql::Error::new("Replay failed").extend_safe()
-            })?;
+            .map_err(
+                |e| match e.downcast_ref::<talos_webhooks::ReplayRefused>() {
+                    Some(refusal) => {
+                        tracing::warn!(dlq_id = %id, %refusal, "DLQ replay refused");
+                        async_graphql::Error::new(format!("Replay refused: {refusal}"))
+                            .extend_safe()
+                    }
+                    None => {
+                        tracing::error!(dlq_id = %id, "DLQ replay failed: {}", e);
+                        async_graphql::Error::new("Replay failed").extend_safe()
+                    }
+                },
+            )?;
 
         // Mark replayed
         webhook_repo

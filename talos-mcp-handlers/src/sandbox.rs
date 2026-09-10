@@ -581,6 +581,180 @@ pub(crate) fn reject_non_compilable_world(world: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Does this agent's ROLE permit compiling / executing code at
+/// `capability_world`? (2026-09-10, the composed-RBAC-bypass class.)
+///
+/// `compile_custom_sandbox` and `run_sandbox` each carried an inline copy of
+/// this predicate; `install_module_from_catalog`, `hot_update_module`,
+/// `test_module` and `compile_template` carried NONE — so an agent whose role
+/// allowed only `["http"]` could not compile a `secrets-node` module directly
+/// but could install one from the catalog (default world `automation-node`),
+/// hot-update an existing module's source at its stored world, or execute a
+/// stored `secrets-node` module through `test_module`. One predicate, one home;
+/// every surface that turns a capability world into running code calls it.
+///
+/// `minimal` (either spelling) is always permitted — it imports no host
+/// capability. `admin` and `*` are admin per `AgentIdentity::is_admin`, which
+/// is also what `tools/list` uses to decide which catalog templates the agent
+/// sees, so the two surfaces now agree. Either spelling of a capability
+/// (`http` / `http-node`) matches either spelling of the world.
+pub(crate) fn agent_role_permits_world(
+    agent: &auth::AgentIdentity,
+    capability_world: &str,
+) -> bool {
+    let world_base = talos_capability_world::world_short(capability_world);
+    if world_base == "minimal" {
+        return true;
+    }
+    agent.has_capability(world_base)
+        || agent
+            .allowed_capabilities
+            .iter()
+            .any(|c| talos_capability_world::world_short(c) == world_base)
+}
+
+/// [`agent_role_permits_world`] as a refusal. `verb` names the operation for
+/// the message ("compile tools for", "run sandbox code in", ...). Refuses with
+/// `-32003`, the code the two original inline gates used.
+pub(crate) fn require_agent_role_permits_world(
+    req_id: &Option<serde_json::Value>,
+    agent: &auth::AgentIdentity,
+    capability_world: &str,
+    verb: &str,
+) -> Result<(), JsonRpcResponse> {
+    if agent_role_permits_world(agent, capability_world) {
+        return Ok(());
+    }
+    Err(mcp_denied(
+        req_id.clone(),
+        -32003,
+        &format!(
+            "Unauthorized: agent role '{}' lacks capability to {} the '{}' world. \
+             Allowed capabilities: {:?}",
+            agent.role_name, verb, capability_world, agent.allowed_capabilities
+        ),
+    ))
+}
+
+/// What the in-process runtime was told about the bound actor's egress scope.
+pub(crate) enum ActorEgressRead {
+    /// No actor bound — the synthetic per-user binding.
+    Unbound,
+    /// An actor is bound; this is its `egress_scope` column (`None` = SQL NULL
+    /// = tier-derived default).
+    Bound(Option<talos_workflow_job_protocol::EgressScope>),
+    /// An actor is bound but its scope could not be read (DB error / row gone).
+    Unreadable,
+}
+
+/// The egress posture handed to `execute_job_with_full_features` for a run
+/// that happens INSIDE THE CONTROLLER PROCESS.
+pub(crate) struct InProcessEgress {
+    pub egress_scope: Option<talos_workflow_job_protocol::EgressScope>,
+    pub allowed_hosts: Vec<String>,
+    /// True when the actor's own posture was local-only and this run therefore
+    /// denies ALL network egress (see [`in_process_egress_posture`]).
+    pub air_gapped: bool,
+}
+
+/// Resolve the egress posture for an IN-PROCESS run (`run_sandbox`,
+/// `test_module`, `run_scratch_session`) — 2026-09-10.
+///
+/// The worker's SSRF gate has two modes, keyed off `resolve_local_egress_only`:
+/// `local_egress_only = true` DENIES public hosts and ALLOWS loopback /
+/// private / link-local ones (it exists so a credential-free worker can reach
+/// a LAN Ollama); `false` is the inverse (public allowed, private denied).
+/// `egress_scope: None` + `LlmTier::Tier1` resolves to the FIRST mode — and
+/// every in-process surface passed exactly that pair. Inside the controller
+/// pod, "private allowed" means a caller-supplied module can `http::fetch`
+/// Postgres, Redis, NATS, Vault and the cloud metadata endpoint by hostname.
+///
+/// So for in-process execution `Some(Public)` is the FAIL-CLOSED choice, not
+/// the permissive one: it is the only value that makes the SSRF gate deny the
+/// private ranges, and it leaves the LLM-provider deny untouched because that
+/// is keyed to `max_llm_tier` alone (the documented `tier1 + egress=public`
+/// pattern). A caller with no bound actor gets that posture with its declared
+/// `allowed_hosts`.
+///
+/// When an actor IS bound, its real scope is honoured — with one translation.
+/// An actor whose resolved posture is LOCAL-ONLY (explicit `local`, or NULL on a
+/// Tier-1 actor) must not reach the public internet, but honouring `Local`
+/// in-process would open the pod's private network to it. There is no
+/// "deny both" value in the runtime signature, so we compose one: `Some(Public)`
+/// (private denied) PLUS an EMPTY `allowed_hosts` (every host denied — empty
+/// `allowed_hosts` is deny-all, see CLAUDE.md "Engine retry & wire-format
+/// rules"). The actor's air-gap is kept and the controller's network is not
+/// exposed. An unreadable scope gets the same treatment: a gate that cannot
+/// read its rule refuses.
+pub(crate) fn in_process_egress_posture(
+    actor: ActorEgressRead,
+    tier: talos_workflow_job_protocol::LlmTier,
+    allowed_hosts: Vec<String>,
+) -> InProcessEgress {
+    use talos_workflow_job_protocol::{EgressScope, LlmTier};
+    let local_only = match actor {
+        ActorEgressRead::Unbound => false,
+        ActorEgressRead::Bound(Some(EgressScope::Public)) => false,
+        ActorEgressRead::Bound(Some(_)) => true,
+        ActorEgressRead::Bound(None) => matches!(tier, LlmTier::Tier1),
+        ActorEgressRead::Unreadable => true,
+    };
+    InProcessEgress {
+        egress_scope: Some(EgressScope::Public),
+        allowed_hosts: if local_only {
+            Vec::new()
+        } else {
+            allowed_hosts
+        },
+        air_gapped: local_only,
+    }
+}
+
+/// Read a bound actor's egress scope for an in-process run and classify it —
+/// `Err` and "no such row" both become [`ActorEgressRead::Unreadable`], which
+/// the posture resolver treats as local-only (deny-all). `None` actor →
+/// [`ActorEgressRead::Unbound`].
+pub(crate) async fn read_actor_egress_for_in_process(
+    actor_repo: &talos_actor_repository::ActorRepository,
+    actor_id: Option<uuid::Uuid>,
+    surface: &str,
+) -> ActorEgressRead {
+    let Some(aid) = actor_id else {
+        return ActorEgressRead::Unbound;
+    };
+    match actor_repo.get_actor_egress_scope(aid).await {
+        Ok(Some(scope)) => ActorEgressRead::Bound(scope),
+        Ok(None) => {
+            tracing::warn!(
+                actor_id = %aid,
+                surface,
+                "in-process run: bound actor row not found while reading egress_scope — \
+                 denying all network egress for this run"
+            );
+            ActorEgressRead::Unreadable
+        }
+        Err(e) => {
+            tracing::warn!(
+                actor_id = %aid,
+                surface,
+                error = %e,
+                "in-process run: could not read the actor's egress_scope — \
+                 denying all network egress for this run"
+            );
+            ActorEgressRead::Unreadable
+        }
+    }
+}
+
+/// The note appended to an in-process run's diagnostics when
+/// [`InProcessEgress::air_gapped`] is set, so "networkerror" has an explanation
+/// beside it.
+pub(crate) const AIR_GAPPED_RUN_NOTE: &str = "[host:egress] network egress DENIED for this run: \
+    the bound actor's egress posture is local-only (egress_scope=local, or a tier-1 actor with \
+    no override), and an in-process run cannot honour 'local' without exposing the controller's \
+    private network. Set the actor's egress_scope to 'public' (set_actor_egress_scope) to allow \
+    its declared allowed_hosts, or run the module through a workflow on a worker.";
+
 /// Fetch the most recent completed module_executions row for the caller's
 /// module and return its scrubbed `(input_data, output_data)` samples.
 ///
@@ -964,22 +1138,13 @@ async fn handle_compile_custom_sandbox(
         Err(reason) => return mcp_error(req_id, -32602, reason),
     };
 
-    // RBAC CHECK 1: Ensure agent is allowed to compile/use this capability world
-    let world_base = capability_world.trim_end_matches("-node");
-    let has_cap = agent
-        .allowed_capabilities
-        .iter()
-        .any(|c| c == "*" || c == world_base || format!("{}-node", c) == capability_world);
-
-    if !has_cap && capability_world != "minimal" {
-        return mcp_error(
-            req_id,
-            -32003,
-            &format!(
-                "Unauthorized: Agent role '{}' lacks capability to compile tools for the '{}' world. Allowed capabilities: {:?}",
-                agent.role_name, capability_world, agent.allowed_capabilities
-            ),
-        );
+    // RBAC CHECK 1: Ensure agent is allowed to compile/use this capability world.
+    // One shared predicate (`require_agent_role_permits_world`) — the inline
+    // copy that stood here was one of two, and four sibling surfaces had none.
+    if let Err(resp) =
+        require_agent_role_permits_world(&req_id, &agent, capability_world, "compile tools for")
+    {
+        return resp;
     }
 
     // RBAC CHECK 2: Actor capability world ceiling
@@ -1475,11 +1640,19 @@ async fn handle_compile_custom_sandbox(
                 error_kind: None,
             }
         }
-        Err(e) => mcp_error(
-            req_id,
-            -32000,
-            &format!("Compilation service error: {:#}", e),
-        ),
+        Err(e) => {
+            // 2026-09-10: the chain used to be returned verbatim. A
+            // `CompilationService` error can carry host paths (the per-user
+            // `CARGO_TARGET_DIR`, the scaffold dir) and cargo's own stderr;
+            // log it, hand the caller the generic message `hot_update_module`
+            // already uses.
+            tracing::error!(error = %format!("{e:#}"), "compile_custom_sandbox: compilation service error");
+            mcp_error(
+                req_id,
+                -32000,
+                "Compilation service error — see server logs",
+            )
+        }
     }
 }
 
@@ -1575,21 +1748,10 @@ async fn handle_run_sandbox(
     // role-based gate that compile_custom_sandbox enforces. The downstream
     // actor-ceiling check below is optional (skipped when `agent_id` omitted),
     // so it cannot stand in for this primary gate.
-    let world_base = capability_world.trim_end_matches("-node");
-    let has_cap = agent
-        .allowed_capabilities
-        .iter()
-        .any(|c| c == "*" || c == world_base || format!("{}-node", c) == capability_world);
-    if !has_cap && capability_world != "minimal" && capability_world != "minimal-node" {
-        return mcp_error(
-            req_id,
-            -32003,
-            &format!(
-                "Unauthorized: agent role '{}' lacks capability to run sandbox code in the '{}' world. \
-                 Allowed capabilities: {:?}",
-                agent.role_name, capability_world, agent.allowed_capabilities
-            ),
-        );
+    if let Err(resp) =
+        require_agent_role_permits_world(&req_id, &agent, capability_world, "run sandbox code in")
+    {
+        return resp;
     }
 
     // Actor capability world ceiling check.
@@ -1777,7 +1939,9 @@ async fn handle_run_sandbox(
             );
         }
         Err(e) => {
-            return mcp_text(req_id, &format!("Compilation service error: {:#}", e));
+            // 2026-09-10: generic message, chain logged (see compile_custom_sandbox).
+            tracing::error!(error = %format!("{e:#}"), "run_sandbox: compilation service error");
+            return mcp_text(req_id, "Compilation service error — see server logs");
         }
     };
 
@@ -1924,21 +2088,38 @@ async fn handle_run_sandbox(
     let host_diags: talos_worker_runtime::context::HostDiagSink =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 
+    // Egress posture for an IN-PROCESS run (2026-09-10). Pre-fix this passed
+    // `egress_scope: None` beside `LlmTier::Tier1`, which the runtime resolves
+    // to `local_egress_only = true` — the SSRF mode that ALLOWS loopback /
+    // private / link-local hosts — inside the controller pod. See
+    // `in_process_egress_posture` for why `Some(Public)` is the fail-closed
+    // choice here and how a bound actor's real scope is honoured.
+    let egress = in_process_egress_posture(
+        read_actor_egress_for_in_process(&state.actor_repo, actor_id_opt, "run_sandbox").await,
+        llm_tier,
+        allowed_hosts,
+    );
+    if egress.air_gapped {
+        if let Ok(mut sink) = host_diags.lock() {
+            sink.push(AIR_GAPPED_RUN_NOTE.to_string());
+        }
+    }
+
     let execution_result = state
         .runtime
         .execute_job_with_full_features(
             &wasm_bytes,
-            allowed_hosts,                                         // allowed_hosts
-            vec![],                                                // allowed_methods
-            128,                                                   // max_memory_mb
-            payload,                                               // input
-            None,                                                  // execution_fs_dir
-            None,                                                  // execution_context
-            secrets,                                               // secrets from vault
-            None,                                                  // token_sender
-            Duration::from_secs(30),                               // timeout
+            egress.allowed_hosts,    // allowed_hosts (posture-narrowed)
+            vec![],                  // allowed_methods
+            128,                     // max_memory_mb
+            payload,                 // input
+            None,                    // execution_fs_dir
+            None,                    // execution_context
+            secrets,                 // secrets from vault
+            None,                    // token_sender
+            Duration::from_secs(30), // timeout
             talos_worker_runtime::runtime::RetryPolicy::default(), // retry_policy
-            None,                                                  // result_cache_ttl_secs
+            None,                    // result_cache_ttl_secs
             talos_worker_runtime::runtime::SecurityPolicy::default(),
             None,  // capability_world_hint
             None,  // max_fuel_override
@@ -1957,8 +2138,8 @@ async fn handle_run_sandbox(
             // means resolving a ceiling for a path whose actor binding is a
             // synthetic per-user fallback, which is a separate decision.
             talos_workflow_job_protocol::WriteCeiling::Write,
-            None,                     // egress_scope — internal path: tier-derived default
-            None,                     // llm_usage_out — internal sandbox path doesn't collect usage
+            egress.egress_scope, // egress_scope — Some(Public): private ranges DENIED in-process
+            None,                // llm_usage_out — internal sandbox path doesn't collect usage
             Some(host_diags.clone()), // host_diag_out — no execution row, so this is the ONLY route
             0, // dispatch_attempt — an operator-invoked run, no controller retry loop above it
         )
@@ -2096,6 +2277,19 @@ async fn handle_compile_template(
         Ok(t) => t,
         Err(_) => return mcp_error(req_id, -32000, "Template not found"),
     };
+
+    // Role RBAC gate (2026-09-10): the template's stored `capability_world` is
+    // the world the compiled module will run at. `compile_custom_sandbox`
+    // refuses a caller whose role lacks that capability; compiling the same
+    // world FROM A TEMPLATE was ungated. Same predicate, same refusal.
+    if let Err(resp) = require_agent_role_permits_world(
+        &req_id,
+        &agent,
+        &template.capability_world,
+        "compile a template for",
+    ) {
+        return resp;
+    }
 
     // Distinguish user-provided name from template default so we can guard
     // against duplicate names only when the caller intentionally named the module.
@@ -2471,11 +2665,13 @@ async fn handle_lint_sandbox(
             ))
         }
         Err(e) => {
-            tracing::error!("lint_sandbox failed: {:#}", e);
+            // 2026-09-10: chain logged (it can carry host paths), generic
+            // message returned — same rule as the compile surfaces.
+            tracing::error!(error = %format!("{e:#}"), "lint_sandbox: lint service error");
             Some(mcp_error(
                 req_id.clone(),
                 -32000,
-                &format!("Lint service error: {:#}", e),
+                "Lint service error — see server logs",
             ))
         }
     }
@@ -2521,6 +2717,50 @@ async fn handle_hot_update_module(
         dependencies: args.get("dependencies").cloned(),
         fuel_budget: parse_fuel_budget_arg(args),
     };
+
+    // Role RBAC gate (2026-09-10). The EFFECTIVE world of a hot-update is the
+    // explicit `capability_world` arg, else the module's STORED world — the
+    // same resolution `HotUpdateService::execute` performs. Either way the
+    // agent is putting new source into a module that runs at that world, which
+    // `compile_custom_sandbox` would refuse for a role lacking the capability;
+    // this surface refused nothing. The stored world needs a row read the
+    // service will repeat (one PK lookup); an unreadable row REFUSES here
+    // rather than letting the service decide, because a gate that cannot read
+    // its rule must not grant. The absent-row answer is the service's own
+    // `ModuleNotFound` text so the two paths render one sentence.
+    let effective_world: String = match input.capability_world.clone() {
+        Some(w) => w,
+        None => match state
+            .module_repo
+            .get_hot_update_context(module_id, user_id)
+            .await
+        {
+            Ok(Some(ctx)) => ctx.capability_world,
+            Ok(None) => {
+                return Some(mcp_denied(
+                    req_id.clone(),
+                    -32000,
+                    "Module not found or access denied",
+                ))
+            }
+            Err(e) => {
+                tracing::error!(
+                    error = %e,
+                    %module_id,
+                    "hot_update_module: could not read the module's stored capability world — refusing"
+                );
+                return Some(crate::utils::database_error(req_id.clone()));
+            }
+        },
+    };
+    if let Err(resp) = require_agent_role_permits_world(
+        &req_id,
+        &agent,
+        &effective_world,
+        "hot-update a module in",
+    ) {
+        return Some(resp);
+    }
 
     match state.hot_update_service.execute(input).await {
         Ok(out) => {
@@ -3245,6 +3485,18 @@ async fn handle_test_module(
         }
     };
 
+    // Role RBAC gate (2026-09-10): `test_module` EXECUTES a stored module at
+    // its stored world, so it is the same authority as `run_sandbox` at that
+    // world — which refuses when the agent's role lacks the capability. This
+    // surface had no such gate: an `["http"]`-role agent could run a stored
+    // `secrets-node` module here. Same predicate, same refusal.
+    let stored_world = module.capability_world.to_string();
+    if let Err(resp) =
+        require_agent_role_permits_world(&req_id, &agent, &stored_world, "execute a module in")
+    {
+        return Some(resp);
+    }
+
     // governance-node requires the full workflow engine and cannot run in test_module.
     // Unknown means the WIT inspector couldn't identify the world — also unrunnable.
     if matches!(
@@ -3424,12 +3676,26 @@ async fn handle_test_module(
     // to go. Collect them in-process and return them in the response.
     let host_diags: talos_worker_runtime::context::HostDiagSink =
         std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    // In-process egress posture (2026-09-10) — same resolution as run_sandbox;
+    // see `in_process_egress_posture`. The module's declared `allowed_hosts`
+    // are kept unless the bound actor is local-only, in which case the run is
+    // air-gapped (deny-all) rather than handed the controller's LAN.
+    let egress = in_process_egress_posture(
+        read_actor_egress_for_in_process(&state.actor_repo, actor_id_opt, "test_module").await,
+        llm_tier,
+        module.allowed_hosts.clone(),
+    );
+    if egress.air_gapped {
+        if let Ok(mut sink) = host_diags.lock() {
+            sink.push(AIR_GAPPED_RUN_NOTE.to_string());
+        }
+    }
     let start = std::time::Instant::now();
     let execution_result = state
         .runtime
         .execute_job_with_full_features(
             &module.wasm_bytes,
-            module.allowed_hosts.clone(),
+            egress.allowed_hosts,
             module.allowed_methods.clone(),
             module.max_memory_mb as usize,
             payload,
@@ -3465,8 +3731,8 @@ async fn handle_test_module(
             // readonly actor's memory that a workflow would refuse. See the
             // resolution above for the fail-closed contract.
             write_ceiling,
-            None,                     // egress_scope — internal path: tier-derived default
-            None,                     // llm_usage_out — internal sandbox path doesn't collect usage
+            egress.egress_scope, // egress_scope — Some(Public): private ranges DENIED in-process
+            None,                // llm_usage_out — internal sandbox path doesn't collect usage
             Some(host_diags.clone()), // host_diag_out — no execution row, so this is the ONLY route
             0, // dispatch_attempt — an operator-invoked run, no controller retry loop above it
         )
@@ -4569,5 +4835,112 @@ mod host_diagnostic_response_tests {
             "…and not into the structured response either: {}",
             json[0]
         );
+    }
+}
+
+#[cfg(test)]
+mod in_process_egress_posture_tests {
+    use super::{in_process_egress_posture, ActorEgressRead};
+    use talos_workflow_job_protocol::{EgressScope, LlmTier};
+
+    fn hosts() -> Vec<String> {
+        vec!["api.example.com".to_string()]
+    }
+
+    #[test]
+    fn an_unbound_run_is_public_with_its_declared_hosts() {
+        // The pre-fix pair (None + Tier1) resolves to local_egress_only=true in
+        // the runtime; the in-process posture must never hand that pair over.
+        let p = in_process_egress_posture(ActorEgressRead::Unbound, LlmTier::Tier1, hosts());
+        assert_eq!(p.egress_scope, Some(EgressScope::Public));
+        assert_eq!(p.allowed_hosts, hosts());
+        assert!(!p.air_gapped);
+    }
+
+    #[test]
+    fn a_public_actor_keeps_its_hosts() {
+        let p = in_process_egress_posture(
+            ActorEgressRead::Bound(Some(EgressScope::Public)),
+            LlmTier::Tier1,
+            hosts(),
+        );
+        assert_eq!(p.egress_scope, Some(EgressScope::Public));
+        assert_eq!(p.allowed_hosts, hosts());
+        assert!(!p.air_gapped);
+    }
+
+    #[test]
+    fn a_local_actor_is_air_gapped_not_handed_the_lan() {
+        let p = in_process_egress_posture(
+            ActorEgressRead::Bound(Some(EgressScope::Local)),
+            LlmTier::Tier2,
+            hosts(),
+        );
+        // Public so the SSRF gate denies private ranges; empty so every host
+        // is denied — both halves of the actor's air-gap, neither half of the
+        // controller's network.
+        assert_eq!(p.egress_scope, Some(EgressScope::Public));
+        assert!(p.allowed_hosts.is_empty());
+        assert!(p.air_gapped);
+    }
+
+    #[test]
+    fn a_null_scope_follows_the_tier() {
+        let t1 = in_process_egress_posture(ActorEgressRead::Bound(None), LlmTier::Tier1, hosts());
+        assert!(t1.air_gapped && t1.allowed_hosts.is_empty());
+        let t2 = in_process_egress_posture(ActorEgressRead::Bound(None), LlmTier::Tier2, hosts());
+        assert!(!t2.air_gapped);
+        assert_eq!(t2.allowed_hosts, hosts());
+        assert_eq!(t2.egress_scope, Some(EgressScope::Public));
+    }
+
+    #[test]
+    fn an_unreadable_scope_fails_closed() {
+        let p = in_process_egress_posture(ActorEgressRead::Unreadable, LlmTier::Tier2, hosts());
+        assert!(p.air_gapped);
+        assert!(p.allowed_hosts.is_empty());
+        assert_eq!(p.egress_scope, Some(EgressScope::Public));
+    }
+}
+
+#[cfg(test)]
+mod agent_role_permits_world_tests {
+    use super::agent_role_permits_world;
+    use crate::auth::AgentIdentity;
+
+    fn agent(caps: &[&str]) -> AgentIdentity {
+        AgentIdentity {
+            agent_id: uuid::Uuid::nil(),
+            name: "t".into(),
+            role_name: "r".into(),
+            allowed_capabilities: caps.iter().map(|s| s.to_string()).collect(),
+            user_id: None,
+        }
+    }
+
+    #[test]
+    fn minimal_is_always_permitted() {
+        assert!(agent_role_permits_world(&agent(&[]), "minimal-node"));
+        assert!(agent_role_permits_world(&agent(&[]), "minimal"));
+    }
+
+    #[test]
+    fn a_role_lacking_the_world_is_refused_in_either_spelling() {
+        let a = agent(&["http"]);
+        assert!(!agent_role_permits_world(&a, "secrets-node"));
+        assert!(!agent_role_permits_world(&a, "secrets"));
+        assert!(!agent_role_permits_world(&a, "automation-node"));
+    }
+
+    #[test]
+    fn either_spelling_of_the_capability_matches_either_spelling_of_the_world() {
+        assert!(agent_role_permits_world(&agent(&["http"]), "http-node"));
+        assert!(agent_role_permits_world(&agent(&["http-node"]), "http"));
+    }
+
+    #[test]
+    fn wildcard_and_admin_permit_everything() {
+        assert!(agent_role_permits_world(&agent(&["*"]), "automation-node"));
+        assert!(agent_role_permits_world(&agent(&["admin"]), "secrets-node"));
     }
 }

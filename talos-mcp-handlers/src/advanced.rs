@@ -818,10 +818,10 @@ pub async fn dispatch(
     match name {
         "query_paginated" => Some(handle_query_paginated(req_id, args, state, user_id).await),
         "create_scratch_session" => {
-            Some(handle_create_scratch_session(req_id, args, state, user_id).await)
+            Some(handle_create_scratch_session(req_id, args, state, agent.clone()).await)
         }
         "run_scratch_session" => {
-            Some(handle_run_scratch_session(req_id, args, state, user_id).await)
+            Some(handle_run_scratch_session(req_id, args, state, agent.clone()).await)
         }
         "list_scratch_sessions" => Some(handle_list_scratch_sessions(req_id, state, user_id).await),
         "delete_scratch_session" => {
@@ -1289,12 +1289,48 @@ async fn handle_query_paginated(
     }
 }
 
+/// The two gates a scratch session's `capability_world` must pass, at create
+/// AND at run (2026-09-10): a compilable WIT world (the `is_compilable_world`
+/// + `reject_non_compilable_world` pair `compile_custom_sandbox` applies), and
+/// the agent's ROLE permitting that world (`require_agent_role_permits_world`,
+/// the shared predicate). The actor-ceiling check `compile_custom_sandbox`
+/// also runs is keyed on an `agent_id` argument scratch sessions do not take —
+/// no actor is bound, so there is no actor ceiling to consult.
+fn validate_scratch_world(
+    req_id: &Option<serde_json::Value>,
+    agent: &auth::AgentIdentity,
+    world: &str,
+) -> Result<(), JsonRpcResponse> {
+    if let Err(msg) = crate::sandbox::reject_non_compilable_world(world) {
+        return Err(mcp_error(req_id.clone(), -32602, &msg));
+    }
+    if !crate::capability_worlds::is_compilable_world(world) {
+        let preview = talos_text_util::bounded_preview(world, 64);
+        return Err(mcp_error(
+            req_id.clone(),
+            -32602,
+            &format!(
+                "capability_world '{}' is not a compilable world. Valid: {}",
+                preview,
+                crate::capability_worlds::compilable_worlds_csv()
+            ),
+        ));
+    }
+    crate::sandbox::require_agent_role_permits_world(
+        req_id,
+        agent,
+        world,
+        "run scratch-session code in",
+    )
+}
+
 async fn handle_create_scratch_session(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
     state: &McpState,
-    user_id: Uuid,
+    agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
+    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
     // MCP-169 (2026-05-08): reject whitespace-only session names.
     // Pre-fix `!n.is_empty()` accepted "                " and persisted
     // it in upsert_scratch_session, polluting list_scratch_sessions.
@@ -1363,6 +1399,15 @@ async fn handle_create_scratch_session(
     if world.len() > 100 {
         return mcp_error(req_id, -32602, "capability_world must be ≤ 100 characters");
     }
+    // 2026-09-10: the world a scratch session is SAVED at is the world
+    // `run_scratch_session` will compile and execute it at, so it takes the
+    // same two gates `compile_custom_sandbox` applies at its boundary — a
+    // compilable WIT world, and one the agent's ROLE permits. Pre-fix any
+    // string was accepted and later run at Tier-2 with a permissive write
+    // ceiling. The run path re-checks (a stored row may predate this gate).
+    if let Err(resp) = validate_scratch_world(&req_id, &agent, world) {
+        return resp;
+    }
 
     match state
         .advanced_repo
@@ -1387,8 +1432,9 @@ async fn handle_run_scratch_session(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
     state: &McpState,
-    user_id: Uuid,
+    agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
+    let user_id = agent.user_id.unwrap_or_else(uuid::Uuid::nil);
     // MCP-169 (2026-05-08): reject whitespace-only session names.
     // Pre-fix `!n.is_empty()` accepted "                " and persisted
     // it in upsert_scratch_session, polluting list_scratch_sessions.
@@ -1510,6 +1556,13 @@ async fn handle_run_scratch_session(
         }
     };
 
+    // 2026-09-10: the STORED world is about to be compiled and executed in
+    // this process. Re-apply the create-time gates here — the row may predate
+    // them, and the gate that matters is the one at the run.
+    if let Err(resp) = validate_scratch_world(&req_id, &agent, &world) {
+        return resp;
+    }
+
     let input = args
         .get("input")
         .cloned()
@@ -1616,7 +1669,17 @@ async fn handle_run_scratch_session(
             return mcp_text(req_id, &err_str);
         }
         Err(e) => {
-            let err_str = format!("Compilation error: {}", e);
+            // 2026-09-10: the chain used to be returned AND persisted verbatim.
+            // A `CompilationService` error carries host paths (the per-user
+            // CARGO_TARGET_DIR, the scaffold dir) and cargo's stderr; log it,
+            // store and return the generic sentence the other compile
+            // surfaces use.
+            tracing::error!(
+                %user_id, session = %session_name,
+                error = %format!("{e:#}"),
+                "run_scratch_session: compilation service error"
+            );
+            let err_str = "Compilation service error — see server logs".to_string();
             if let Err(e) = state
                 .advanced_repo
                 .update_scratch_error(&err_str, user_id, session_name)
@@ -1646,11 +1709,29 @@ async fn handle_run_scratch_session(
         serde_json::Value::Object(merged)
     };
 
+    // 2026-09-10: this call used to run at `LlmTier::default()` (Tier-2),
+    // `WriteCeiling::Write`, `user_id: Uuid::nil()` and `egress_scope: None`
+    // — every axis at its most permissive, for caller-supplied code, with no
+    // tenant identity. It now mirrors `test_module`'s post-MCP-692 shape for
+    // a run with NO bound actor: Tier-1 (external LLM providers refused),
+    // `ReadOnly` (no agent-memory / integration-state / sandbox-SQL mutation
+    // under enforcement), the caller's REAL user_id (fuel/cost accounting and
+    // the RPC layer's per-tenant nonce cache), and the in-process egress
+    // posture from `in_process_egress_posture` — `Some(Public)` so the SSRF
+    // gate DENIES the controller pod's private ranges (`None` + Tier-1 would
+    // have ALLOWED them). `allowed_hosts` stays empty (deny-all), as before.
+    // `llm_usage_out` stays `None`: `test_module` and `run_sandbox` pass
+    // `None` too — nothing on the in-process path drains the ledger.
+    let scratch_egress = crate::sandbox::in_process_egress_posture(
+        crate::sandbox::ActorEgressRead::Unbound,
+        talos_workflow_job_protocol::LlmTier::Tier1,
+        vec![],
+    );
     let execution_result = state
         .runtime
         .execute_job_with_full_features(
             &wasm_bytes,
-            vec![],
+            scratch_egress.allowed_hosts, // deny-all, as before
             vec![],
             128,
             payload,
@@ -1662,17 +1743,17 @@ async fn handle_run_scratch_session(
             talos_worker_runtime::runtime::RetryPolicy::default(),
             None,
             talos_worker_runtime::runtime::SecurityPolicy::default(),
-            None,                                             // capability_world_hint
-            None,                                             // max_fuel_override
-            false,                                            // dry_run
-            None,                                             // actor_id
-            uuid::Uuid::nil(), // user_id (controller-internal test path)
-            talos_workflow_job_protocol::LlmTier::default(), // tier2 for internal tests
-            talos_workflow_job_protocol::WriteCeiling::Write, // permissive: internal test path
-            None,              // egress_scope — internal path: tier-derived default
-            None,              // llm_usage_out — internal test path doesn't collect usage
-            None,              // host_diag_out — no in-process diagnostic sink on this path
-            0, // dispatch_attempt — an operator-invoked run, no controller retry loop above it
+            None,                                                // capability_world_hint
+            None,                                                // max_fuel_override
+            false,                                               // dry_run
+            None,    // actor_id — scratch sessions bind no actor
+            user_id, // the caller's real tenant identity (was Uuid::nil())
+            talos_workflow_job_protocol::LlmTier::Tier1, // no actor ⇒ fail-closed tier (was Tier-2)
+            talos_workflow_job_protocol::WriteCeiling::ReadOnly, // no actor ⇒ no mutation (was Write)
+            scratch_egress.egress_scope, // Some(Public): private ranges DENIED in-process
+            None, // llm_usage_out — no in-process caller drains it (matches test_module)
+            None, // host_diag_out — no in-process diagnostic sink on this path
+            0,    // dispatch_attempt — an operator-invoked run, no controller retry loop above it
         )
         .await;
 

@@ -236,6 +236,21 @@ pub struct ActorCloneSourceRow {
     pub name: String,
     pub description: Option<String>,
     pub max_capability_world: Option<String>,
+    /// See [`ActorCeilingColumns`] — copied verbatim onto the clone.
+    pub max_llm_tier: String,
+    pub egress_scope: Option<String>,
+    pub max_write_ceiling: String,
+}
+
+impl ActorCloneSourceRow {
+    /// The three ceilings as one value for `insert_actor_clone_scoped`.
+    pub fn ceilings(&self) -> ActorCeilingColumns {
+        ActorCeilingColumns {
+            max_llm_tier: self.max_llm_tier.clone(),
+            egress_scope: self.egress_scope.clone(),
+            max_write_ceiling: self.max_write_ceiling.clone(),
+        }
+    }
 }
 
 /// Action-log listing row (no `details` payload) returned by
@@ -307,6 +322,24 @@ pub struct SourceActorCloneRow {
     pub max_capability_world: String,
     pub description: Option<String>,
     pub secret_grants: Vec<String>,
+    /// The source actor's privacy / mutation ceilings, copied VERBATIM onto the
+    /// clone (2026-09-10). Pre-fix a clone of a `tier1` + `readonly` actor was
+    /// inserted at the column defaults — `tier2`, `write`, no egress override —
+    /// i.e. the widest posture, while the memories copied beside it were the
+    /// data those ceilings existed to protect.
+    pub ceilings: ActorCeilingColumns,
+}
+
+/// The three per-actor ceiling columns as their DB strings — `max_llm_tier`,
+/// `egress_scope` (nullable) and `max_write_ceiling` — read from one row and
+/// written to another without re-interpretation. Used by both clone paths
+/// (`get_source_actor_for_clone` → `insert_actor_with_grants_and_limit_check`,
+/// `get_actor_clone_source_scoped` → `insert_actor_clone_scoped`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorCeilingColumns {
+    pub max_llm_tier: String,
+    pub egress_scope: Option<String>,
+    pub max_write_ceiling: String,
 }
 
 /// Lightweight actor projection returned by `get_actor_basic_info` — used by
@@ -1866,6 +1899,37 @@ impl ActorRepository {
         Ok(())
     }
 
+    /// `insert_actor_scoped` for a CLONE: the same org-scoped INSERT carrying
+    /// the source actor's three ceilings verbatim (2026-09-10). Kept separate
+    /// from the create path, which correctly takes the column defaults.
+    pub async fn insert_actor_clone_scoped(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        actor_id: Uuid,
+        user_id: Uuid,
+        name: &str,
+        description: Option<&str>,
+        max_capability_world: &str,
+        ceilings: &ActorCeilingColumns,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO actors (id, user_id, name, description, max_capability_world, status, \
+                                 max_llm_tier, egress_scope, max_write_ceiling) \
+             VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, $8)",
+        )
+        .bind(actor_id)
+        .bind(user_id)
+        .bind(name)
+        .bind(description)
+        .bind(max_capability_world)
+        .bind(&ceilings.max_llm_tier)
+        .bind(&ceilings.egress_scope)
+        .bind(&ceilings.max_write_ceiling)
+        .execute(conn)
+        .await?;
+        Ok(())
+    }
+
     /// Set an actor's status (ownership-gated), refusing terminal-state
     /// rows — the `status NOT IN ('archived','terminated')` guard makes
     /// the IRREVERSIBLE contract on terminate/archive unconditional
@@ -1995,7 +2059,9 @@ impl ActorRepository {
         user_id: Uuid,
     ) -> Result<Option<ActorCloneSourceRow>> {
         let row = sqlx::query_as::<_, ActorCloneSourceRow>(
-            "SELECT name, description, max_capability_world FROM actors \
+            "SELECT name, description, max_capability_world, \
+                    max_llm_tier, egress_scope, max_write_ceiling \
+             FROM actors \
              WHERE id = $1 AND user_id = $2 AND status != 'terminated'",
         )
         .bind(actor_id)
@@ -3068,7 +3134,8 @@ impl ActorRepository {
         user_id: Uuid,
     ) -> Result<Option<SourceActorCloneRow>> {
         let row = sqlx::query(
-            "SELECT name, description, max_capability_world, secret_grants \
+            "SELECT name, description, max_capability_world, secret_grants, \
+                    max_llm_tier, egress_scope, max_write_ceiling \
              FROM actors WHERE id = $1 AND user_id = $2",
         )
         .bind(source_actor_id)
@@ -3083,6 +3150,11 @@ impl ActorRepository {
                 secret_grants: r
                     .try_get::<Option<_>, _>("secret_grants")?
                     .unwrap_or_default(),
+                ceilings: ActorCeilingColumns {
+                    max_llm_tier: r.try_get("max_llm_tier")?,
+                    egress_scope: r.try_get::<Option<String>, _>("egress_scope")?,
+                    max_write_ceiling: r.try_get("max_write_ceiling")?,
+                },
             })
         })
         .transpose()
@@ -3144,14 +3216,19 @@ impl ActorRepository {
         description: Option<&str>,
         max_capability_world: &str,
         secret_grants: &[String],
+        ceilings: &ActorCeilingColumns,
         max_actors_per_user: i64,
     ) -> Result<u64> {
         // RFC 0006 / RFC 0005 S3: scope to the owner's personal org so the
         // org-pin WITH CHECK enforces (org_id is trigger-stamped, not bound).
         let mut tx = self.begin_personal_org_write(user_id).await?;
+        // `ceilings` (2026-09-10): the source actor's `max_llm_tier` /
+        // `egress_scope` / `max_write_ceiling`, copied verbatim. See
+        // `SourceActorCloneRow::ceilings`.
         let result = sqlx::query(
-            "INSERT INTO actors (id, user_id, name, description, max_capability_world, secret_grants) \
-             SELECT $1, $2, $3, $4, $5, $6 \
+            "INSERT INTO actors (id, user_id, name, description, max_capability_world, secret_grants, \
+                                 max_llm_tier, egress_scope, max_write_ceiling) \
+             SELECT $1, $2, $3, $4, $5, $6, $8, $9, $10 \
              WHERE (SELECT COUNT(*) FROM actors WHERE user_id = $2) < $7",
         )
         .bind(actor_id)
@@ -3161,6 +3238,9 @@ impl ActorRepository {
         .bind(max_capability_world)
         .bind(secret_grants)
         .bind(max_actors_per_user)
+        .bind(&ceilings.max_llm_tier)
+        .bind(&ceilings.egress_scope)
+        .bind(&ceilings.max_write_ceiling)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;

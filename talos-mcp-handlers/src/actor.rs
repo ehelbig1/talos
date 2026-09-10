@@ -5284,6 +5284,11 @@ async fn handle_clone_actor(
     let source_max_world = source.max_capability_world;
     let source_description = source.description;
     let source_secret_grants = source.secret_grants;
+    // 2026-09-10: the source's privacy / mutation ceilings travel with the
+    // clone. Pre-fix the INSERT omitted them, so a clone of a `tier1` +
+    // `egress=local` + `readonly` actor came up `tier2` / public / `write` —
+    // while its memories were copied beside it.
+    let source_ceilings = source.ceilings;
 
     // Override description if caller provided one.
     //
@@ -5372,6 +5377,7 @@ async fn handle_clone_actor(
             new_description.as_deref(),
             &source_max_world,
             &source_secret_grants,
+            &source_ceilings,
             MAX_ACTORS_PER_USER,
         )
         .await

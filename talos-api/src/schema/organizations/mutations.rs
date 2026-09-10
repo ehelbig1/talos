@@ -4,7 +4,7 @@ use async_graphql::{Context, Object, Result};
 use uuid::Uuid;
 
 use crate::schema::types::*;
-use crate::schema::{require_2fa, SafeErrorExtensions};
+use crate::schema::{require_2fa, require_scope, SafeErrorExtensions};
 
 #[derive(Default)]
 pub struct OrganizationsMutations;
@@ -18,6 +18,12 @@ impl OrganizationsMutations {
         slug: String,
     ) -> Result<OrganizationObj> {
         require_2fa(ctx)?;
+        // 2026-09-10: organization membership and ownership are ADMIN-scope
+        // operations for an API key. `require_2fa` alone passed every scoped key,
+        // because API-key requests inject `IsTwoFactorVerified(true)` by
+        // construction; a session (no `ApiKeyScopes`) passes `require_scope`
+        // unchanged — that bypass is the deliberate session semantics.
+        require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
         let user_id = ctx
             .data_opt::<Uuid>()
             .copied()
@@ -66,6 +72,12 @@ impl OrganizationsMutations {
         role: String,
     ) -> Result<OrgMemberObj> {
         require_2fa(ctx)?;
+        // 2026-09-10: organization membership and ownership are ADMIN-scope
+        // operations for an API key. `require_2fa` alone passed every scoped key,
+        // because API-key requests inject `IsTwoFactorVerified(true)` by
+        // construction; a session (no `ApiKeyScopes`) passes `require_scope`
+        // unchanged — that bypass is the deliberate session semantics.
+        require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
         let user_id = ctx
             .data_opt::<Uuid>()
             .copied()
@@ -138,6 +150,12 @@ impl OrganizationsMutations {
         target_user_id: Uuid,
     ) -> Result<bool> {
         require_2fa(ctx)?;
+        // 2026-09-10: organization membership and ownership are ADMIN-scope
+        // operations for an API key. `require_2fa` alone passed every scoped key,
+        // because API-key requests inject `IsTwoFactorVerified(true)` by
+        // construction; a session (no `ApiKeyScopes`) passes `require_scope`
+        // unchanged — that bypass is the deliberate session semantics.
+        require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
         let user_id = ctx
             .data_opt::<Uuid>()
             .copied()
@@ -180,6 +198,12 @@ impl OrganizationsMutations {
         role: String,
     ) -> Result<OrgMemberObj> {
         require_2fa(ctx)?;
+        // 2026-09-10: organization membership and ownership are ADMIN-scope
+        // operations for an API key. `require_2fa` alone passed every scoped key,
+        // because API-key requests inject `IsTwoFactorVerified(true)` by
+        // construction; a session (no `ApiKeyScopes`) passes `require_scope`
+        // unchanged — that bypass is the deliberate session semantics.
+        require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
         let user_id = ctx
             .data_opt::<Uuid>()
             .copied()
@@ -248,6 +272,12 @@ impl OrganizationsMutations {
         new_owner_id: Uuid,
     ) -> Result<OrganizationObj> {
         require_2fa(ctx)?;
+        // 2026-09-10: organization membership and ownership are ADMIN-scope
+        // operations for an API key. `require_2fa` alone passed every scoped key,
+        // because API-key requests inject `IsTwoFactorVerified(true)` by
+        // construction; a session (no `ApiKeyScopes`) passes `require_scope`
+        // unchanged — that bypass is the deliberate session semantics.
+        require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
         let user_id = ctx
             .data_opt::<Uuid>()
             .copied()

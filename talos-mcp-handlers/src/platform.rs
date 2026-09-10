@@ -273,7 +273,7 @@ pub async fn dispatch(
         "import_platform_state" => {
             Some(handle_import_platform_state(req_id, args, state, user_id).await)
         }
-        "security_audit" => Some(handle_security_audit(req_id, state).await),
+        "security_audit" => Some(handle_security_audit(req_id, state, user_id).await),
         "get_js_scaffold" => Some(handle_get_js_scaffold(req_id, args)),
         "get_python_scaffold" => Some(handle_get_python_scaffold(req_id, args)),
         "get_secret_access_log" => {
@@ -1300,9 +1300,13 @@ async fn handle_get_platform_info(
     // count shrinks silently rather than obviously. Both are now null +
     // named; the counts they feed become null with them.
     let mut readings = talos_measurement::Readings::new();
+    // 2026-09-10: tenant-scoped, metadata-only (see `handle_tools_list`).
     let templates_read = readings.record(
         "catalog_tool_count",
-        state.registry.list_templates(None).await,
+        state
+            .registry
+            .list_template_metadata_for_user(agent.user_id.unwrap_or_else(uuid::Uuid::nil), None)
+            .await,
     );
     let world_map: Option<std::collections::HashMap<uuid::Uuid, String>> = match &templates_read {
         Some(templates) => {
@@ -1373,7 +1377,41 @@ async fn handle_get_platform_info(
     // RPC #600, envelope sealing), so this belongs next to `build_version`.
     //
     // The read goes through the repository (no raw sqlx in a handler — check 6).
-    let fleet = build_fleet_report(&state.db_pool, &build_version).await;
+    //
+    // 2026-09-10: PLATFORM-ADMIN ONLY. The fleet report names every registered
+    // worker, its build, and its write-ceiling ENFORCEMENT posture — i.e. which
+    // workers a readonly actor's mutation would slip past. That is a
+    // deployment-wide security fact with no tenancy dimension, and it was
+    // handed to any authenticated agent. The tenant-safe remainder of this
+    // response (build version, tool counts, DB status, uptime, the compile-time
+    // features list) is unchanged for everyone; `fleet` is rendered `null` with
+    // `fleet_note` saying why for a non-admin. Fail-CLOSED on an unreadable
+    // flag: a gate that cannot read its rule withholds, never grants.
+    // allow-benign-default: `false` costs the caller the fleet block; it
+    // grants nothing.
+    let caller_is_platform_admin = match agent.user_id {
+        Some(uid) => state
+            .actor_repo
+            .is_platform_admin(uid)
+            .await
+            .unwrap_or(false),
+        None => false,
+    };
+    let (fleet, fleet_note) = if caller_is_platform_admin {
+        (
+            build_fleet_report(&state.db_pool, &build_version).await,
+            serde_json::Value::Null,
+        )
+    } else {
+        (
+            serde_json::Value::Null,
+            serde_json::json!(
+                "Withheld: the fleet report (registered workers, their builds and their \
+                 write-ceiling enforcement posture) is a deployment-wide security fact and \
+                 requires platform-admin privileges. null here means NOT SHOWN, not 'no workers'."
+            ),
+        )
+    };
 
     // A COMPILE-TIME list of what this BUILD contains. Nothing here reads
     // runtime state, and the accompanying `features_note` says so — because
@@ -1437,6 +1475,7 @@ async fn handle_get_platform_info(
                           get_system_health, and security_audit, each of which reports what it \
                           could NOT establish rather than defaulting.",
         "fleet": fleet,
+        "fleet_note": fleet_note,
     });
     let mut response = response;
     readings.attach(&mut response);
@@ -1577,7 +1616,31 @@ async fn handle_import_platform_state(
 async fn handle_security_audit(
     req_id: Option<serde_json::Value>,
     state: &McpState,
+    user_id: Uuid,
 ) -> JsonRpcResponse {
+    // 2026-09-10: PLATFORM-ADMIN ONLY — the same `is_platform_admin` gate, in
+    // the same fail-closed shape, as `get_sql_statement_report` below. The
+    // audit reports the deployment's security posture check by check (which
+    // key providers are configured, whether TLS/RLS/sealing are on, the fleet's
+    // write-ceiling enforcement, the audit-chain verifier's state) — a map of
+    // exactly where the controls are weakest, with no tenancy dimension, and it
+    // was handed to any authenticated agent. Fail-CLOSED on an unreadable
+    // flag: a gate that cannot read its rule must refuse, never grant.
+    // allow-benign-default: `false` costs the caller a refusal; it grants
+    // nothing.
+    let is_platform_admin = state
+        .actor_repo
+        .is_platform_admin(user_id)
+        .await
+        .unwrap_or(false);
+    if !is_platform_admin {
+        return mcp_denied(
+            req_id,
+            -32601,
+            "security_audit requires platform-admin privileges. It reports the deployment's \
+             security posture control by control, which has no per-tenant slice.",
+        );
+    }
     let sysrepo = talos_system_repo::SystemRepository::new(state.db_pool.clone());
     let write_ceiling_fleet = read_write_ceiling_fleet(&state.db_pool).await;
     let audit_chain_candidate = read_audit_chain_candidate(&state.db_pool).await;

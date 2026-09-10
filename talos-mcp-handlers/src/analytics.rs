@@ -1751,7 +1751,8 @@ async fn handle_validate_all_workflows(
     user_id: Uuid,
 ) -> JsonRpcResponse {
     use talos_workflow_validation::{
-        graph_module_ids, validate_prepared, PreparedValidation, HISTORY_MAX_EXECUTIONS,
+        graph_module_ids, validate_prepared_with_children, PreparedValidation,
+        HISTORY_MAX_EXECUTIONS,
     };
 
     let workflows = match state
@@ -1841,6 +1842,13 @@ async fn handle_validate_all_workflows(
 
     let mut tally = FleetValidationTally::default();
 
+    // One map of every graph the sweep loaded, keyed by id — the child-graph
+    // set for the cross-workflow cycle check inside the loop below.
+    let fleet_graphs: std::collections::HashMap<uuid::Uuid, String> = workflows
+        .iter()
+        .filter_map(|w| w.graph_json.clone().map(|g| (w.id, g)))
+        .collect();
+
     for (wf_row, module_ids) in workflows.iter().zip(per_workflow_modules.iter()) {
         // Narrow every fleet-wide map to the modules THIS workflow dispatches
         // before handing it over. Two reasons, and the second is the load-
@@ -1881,15 +1889,25 @@ async fn handle_validate_all_workflows(
             Err(e) => Err(e.clone()),
         };
 
-        let result = validate_prepared(PreparedValidation {
-            workflow_id: wf_row.id,
-            graph_json: wf_row.graph_json.clone().unwrap_or_default(),
-            existing_modules: existing,
-            templates,
-            installed_secrets: installed,
-            has_actor: bound_actors.contains(&wf_row.id),
-            history: wf_history,
-        });
+        // 2026-09-10 review: the cross-workflow cycle check
+        // (`sub-workflow-cycle`) walks child graphs by id. A sub_workflow
+        // child is always one of the CALLER's own workflows (the runtime
+        // child load is user-scoped), and this sweep already holds every
+        // one of them in memory — so the whole fleet map IS the child-graph
+        // set, at no extra read. `validate_prepared` (no children) would
+        // silently report nothing for that check.
+        let result = validate_prepared_with_children(
+            PreparedValidation {
+                workflow_id: wf_row.id,
+                graph_json: wf_row.graph_json.clone().unwrap_or_default(),
+                existing_modules: existing,
+                templates,
+                installed_secrets: installed,
+                has_actor: bound_actors.contains(&wf_row.id),
+                history: wf_history,
+            },
+            &fleet_graphs,
+        );
 
         tally.record(wf_row.id, &wf_row.name, &result);
     }
