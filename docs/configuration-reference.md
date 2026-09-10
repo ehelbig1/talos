@@ -54,8 +54,8 @@ value, log presence only.
 | `DB_EXECUTION_TIMEOUT_SECS` | `300` | both | Longer statement timeout for the execution-path pool | |
 | `REDIS_URL` | none (optional) | both | Redis connection; Redis-backed features disabled when unset | 🔒 |
 | `NATS_URL` | none (controller) / effectively required (worker) | both | NATS server URL | |
-| `NATS_USER` | none (optional) | both | NATS username | |
-| `NATS_PASSWORD` (+`_FILE`) | none (optional) | both | NATS password | 🔒 |
+| `NATS_USER` | none (optional) | both | NATS username. In the chart and both compose files the WORKER receives the worker credential (Secret / `.env` keys `NATS_WORKER_USER`) under this name — the binary does not care what its user is called; the broker binds that user to the worker permission set (`docs/nats-subjects.md` § Broker permissions) | |
+| `NATS_PASSWORD` (+`_FILE`) | none (optional) | both | NATS password (the worker's is `NATS_WORKER_PASSWORD` at the deployment layer) | 🔒 |
 | `NATS_CA_FILE` | none (optional) | both | PEM path added as trusted root for NATS TLS (`talos-nats-tls`) | 🔒 |
 | `NATS_JOB_TOPIC` | built-in topic | worker | Single-job subscription subject | |
 | `NATS_PIPELINE_TOPIC` | built-in topic | worker | Pipeline-job subscription subject | |

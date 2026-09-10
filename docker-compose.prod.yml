@@ -42,24 +42,32 @@
 #   - Set FRONTEND_URL and BASE_URL environment variables
 
 services:
-  # ✅ SECURITY: NATS with mandatory authentication
+  # ✅ SECURITY: NATS with mandatory authentication and TWO credentials —
+  # the controller's (unrestricted) and the worker's, bound in
+  # deploy/nats/nats.conf to the generated WORKER_PERMISSIONS set
+  # (talos_workflow_job_protocol::nats_permissions). Same config file as
+  # docker-compose.yml; the directory is bind-mounted (check 66).
   nats:
     image: nats:2.10-alpine
     container_name: talos-nats-prod
+    environment:
+      NATS_USER: ${NATS_USER:?NATS_USER required in .env.production}
+      NATS_PASSWORD: ${NATS_PASSWORD:?NATS_PASSWORD required in .env.production}
+      NATS_WORKER_USER: ${NATS_WORKER_USER:?NATS_WORKER_USER required in .env.production}
+      NATS_WORKER_PASSWORD: ${NATS_WORKER_PASSWORD:?NATS_WORKER_PASSWORD required in .env.production}
     command:
       - "--jetstream"
       - "--store_dir=/data"
       - "-m"
       - "8222"
-      - "--user"
-      - "${NATS_USER:?NATS_USER required in .env.production}"
-      - "--pass"
-      - "${NATS_PASSWORD:?NATS_PASSWORD required in .env.production}"
+      - "-c"
+      - "/etc/nats/nats.conf"
     # ✅ SECURITY: NO port exposure — internal Docker network only
     security_opt:
       - "no-new-privileges:true"
     volumes:
       - nats_data:/data
+      - ./deploy/nats:/etc/nats:ro
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8222/healthz"]
       interval: 10s
@@ -249,8 +257,9 @@ services:
       RUST_ENV: staging
       NATS_URL: nats://nats:4222
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
-      NATS_USER: ${NATS_USER:?NATS_USER required in .env}
-      NATS_PASSWORD: ${NATS_PASSWORD:?NATS_PASSWORD required in .env}
+      # The WORKER NATS credential (nats.conf binds it to WORKER_PERMISSIONS).
+      NATS_USER: ${NATS_WORKER_USER:?NATS_WORKER_USER required in .env.production}
+      NATS_PASSWORD: ${NATS_WORKER_PASSWORD:?NATS_WORKER_PASSWORD required in .env.production}
       WORKER_SHARED_KEY: ${WORKER_SHARED_KEY:?WORKER_SHARED_KEY required in .env.production}
       RUST_LOG: info
       # Metrics server configuration

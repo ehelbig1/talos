@@ -14,10 +14,29 @@ data:
     # Monitoring
     http_port: {{ .Values.nats.service.monitorPort }}
 
-    # Auth — user/password enforced on every connection.
+    # Auth — user/password enforced on every connection, TWO credentials
+    # (2026-09-10). Until then a single user with no `permissions` block
+    # made a worker indistinguishable from the controller at the broker: it
+    # could subscribe to `_INBOX.>` (every reply the controller awaits),
+    # `talos.results.*` (other workers' output) and `wasm.log.*`, and publish
+    # forged jobs / cancels / approvals that signing would reject only AFTER
+    # a verify. The worker credential now carries WORKER_PERMISSIONS — a
+    # subscribe ALLOW-list and a publish DENY-list — rendered from the ONE
+    # source of truth, `talos_workflow_job_protocol::nats_permissions`, into
+    # files/nats-worker-permissions.conf (byte-pinned by that crate's tests)
+    # and mounted beside this file as worker-permissions.conf. The
+    # controller keeps an unrestricted credential: it is the trusted party,
+    # and it replies to worker RPCs into the worker's `_WINBOX.>` inboxes.
+    # Both pairs come from the bootstrap Secret (install.sh mints them; see
+    # values.yaml bootstrapSecret.data.NATS_WORKER_*). A missing variable is
+    # a config-parse failure — the server refuses to start rather than admit
+    # an unrestricted worker.
+    include "worker-permissions.conf"
     authorization {
-      user: $NATS_USER
-      password: $NATS_PASSWORD
+      users = [
+        { user: $NATS_USER, password: $NATS_PASSWORD }
+        { user: $NATS_WORKER_USER, password: $NATS_WORKER_PASSWORD, permissions: $WORKER_PERMISSIONS }
+      ]
     }
 {{- if $.Values.tls.inCluster.enabled }}
 
@@ -99,4 +118,11 @@ data:
       ]
     }
     {{- end }}
+  # GENERATED fragment — `talos_workflow_job_protocol::nats_permissions::
+  # render_worker_permissions_conf`, checked in at files/nats-worker-permissions.conf
+  # and byte-pinned by `cargo test -p talos-workflow-job-protocol nats_permissions`.
+  # Referenced by the `include` in nats.conf above (relative includes resolve
+  # against the config file's own directory, /etc/nats).
+  worker-permissions.conf: |
+{{ .Files.Get "files/nats-worker-permissions.conf" | indent 4 }}
 {{- end }}

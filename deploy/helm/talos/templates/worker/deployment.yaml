@@ -104,16 +104,28 @@ spec:
             #   - TALOS_AUDIT_SIGNING_KEY.
             # No Postgres, no Neo4j, no LLM provider keys — those are
             # reserved host-only paths and are denied even with `allowed_secrets: ["*"]`.
+            # The worker authenticates as the WORKER NATS credential (2026-09-10):
+            # the env-var NAMES the binary reads are unchanged (NATS_USER /
+            # NATS_PASSWORD — it does not care what its user is called), the
+            # Secret KEYS they come from are the worker pair, which nats.conf
+            # binds to WORKER_PERMISSIONS (subscribe allow-list, publish
+            # deny-list; see templates/nats/configmap.yaml). Until this date the
+            # worker mounted the controller's NATS_USER/NATS_PASSWORD and was
+            # indistinguishable from it on the bus. Rolling safety: an old
+            # worker still holding the controller pair keeps working against
+            # the new nats.conf (that credential is unrestricted), and a new
+            # worker against an old single-user nats.conf fails auth LOUDLY at
+            # boot rather than silently connecting.
             - name: NATS_USER
               valueFrom:
                 secretKeyRef:
                   name: {{ include "talos.bootstrapSecretName" . }}
-                  key: NATS_USER
+                  key: NATS_WORKER_USER
             - name: NATS_PASSWORD
               valueFrom:
                 secretKeyRef:
                   name: {{ include "talos.bootstrapSecretName" . }}
-                  key: NATS_PASSWORD
+                  key: NATS_WORKER_PASSWORD
             - name: REDIS_URL
               valueFrom:
                 secretKeyRef:

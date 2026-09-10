@@ -336,6 +336,10 @@ if [[ $HAS_BOOTSTRAP -eq 1 && $HAS_NEO4J -eq 1 ]]; then
     }
     backfill_secret_key NATS_CLUSTER_USER "talos-route"
     backfill_secret_key NATS_CLUSTER_PASSWORD "$(openssl rand -base64 32 | tr -d '+=/' | head -c 32)"
+    # Worker NATS credential (2026-09-10) — the NATS StatefulSet and the
+    # worker Deployment both mount it as REQUIRED keys.
+    backfill_secret_key NATS_WORKER_USER "talos-worker"
+    backfill_secret_key NATS_WORKER_PASSWORD "$(openssl rand -base64 32 | tr -d '+=/' | head -c 32)"
     backfill_secret_key PROMETHEUS_SCRAPE_TOKEN "$(openssl rand -hex 32)"
 elif [[ $HAS_BOOTSTRAP -ne $HAS_NEO4J ]]; then
     die "secret state is inconsistent — exactly one of $SECRET_NAME / $NEO4J_SECRET_NAME exists. Delete both and rerun."
@@ -366,6 +370,15 @@ else
     # (the StatefulSet mounts them as required secretKeyRefs).
     NATS_CLUSTER_USER="talos-route"
     NATS_CLUSTER_PASSWORD=$(rand_b64_pw)
+    # WORKER client credential — a THIRD pair, distinct from the controller's
+    # NATS_USER above. nats.conf binds it to WORKER_PERMISSIONS (subscribe
+    # allow-list / publish deny-list rendered from
+    # talos_workflow_job_protocol::nats_permissions), so a credential lifted
+    # from a worker pod cannot read controller reply inboxes or other workers'
+    # results, nor publish forged jobs. Every worker shares this one pair;
+    # per-worker isolation would need NATS accounts / auth callout.
+    NATS_WORKER_USER="talos-worker"
+    NATS_WORKER_PASSWORD=$(rand_b64_pw)
 
     NEO4J_PASSWORD=$(rand_b64_pw)
 
@@ -408,6 +421,8 @@ else
         --from-literal=NATS_PASSWORD="$NATS_PASSWORD"
         --from-literal=NATS_CLUSTER_USER="$NATS_CLUSTER_USER"
         --from-literal=NATS_CLUSTER_PASSWORD="$NATS_CLUSTER_PASSWORD"
+        --from-literal=NATS_WORKER_USER="$NATS_WORKER_USER"
+        --from-literal=NATS_WORKER_PASSWORD="$NATS_WORKER_PASSWORD"
         --from-literal=NEO4J_USER="neo4j"
         --from-literal=NEO4J_PASSWORD="$NEO4J_PASSWORD"
         --from-literal=TALOS_MASTER_KEY="$TALOS_MASTER_KEY"

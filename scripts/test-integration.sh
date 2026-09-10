@@ -21,9 +21,17 @@ set -euo pipefail
 REDIS_PORT="${TALOS_IT_REDIS_PORT:-16399}"
 PG_PORT="${TALOS_IT_PG_PORT:-15435}"
 NATS_PORT="${TALOS_IT_NATS_PORT:-14222}"
+# A SECOND broker running the real compose config (deploy/nats/nats.conf +
+# the generated worker permission fragment) with two credentials, for the
+# broker-agreement test in talos-workflow-engine-nats. Kept separate from the
+# unauthenticated broker above so the existing claim-protocol tests, which
+# connect with no credentials, are untouched.
+NATS_PERM_PORT="${TALOS_IT_NATS_PERM_PORT:-14223}"
 REDIS_NAME="talos-it-redis"
 PG_NAME="talos-it-pgvector"
 NATS_NAME="talos-it-nats"
+NATS_PERM_NAME="talos-it-nats-perm"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PG_USER="postgres"
 PG_PASS="test"
 
@@ -53,7 +61,7 @@ TALOS_TEST_RUN_ID="it-$$-$(date +%s)"
 export TALOS_TEST_RUN_ID
 
 cleanup() {
-    docker rm -f "$REDIS_NAME" "$PG_NAME" "$NATS_NAME" >/dev/null 2>&1 || true
+    docker rm -f "$REDIS_NAME" "$PG_NAME" "$NATS_NAME" "$NATS_PERM_NAME" >/dev/null 2>&1 || true
     local ids
     ids=$(docker ps -aq --filter "label=talos.test-run=${TALOS_TEST_RUN_ID}" 2>/dev/null) || return 0
     [ -n "$ids" ] || return 0
@@ -92,6 +100,14 @@ docker run -d --rm --name "$PG_NAME" \
 # NATS for the RFC 0010 P3 (D3b) claim-protocol integration tests (envelope-seal
 # responder↔worker handshake + the engine-nats full dispatch→claim→open loop).
 docker run -d --rm --name "$NATS_NAME" -p "${NATS_PORT}:4222" nats:2.10-alpine >/dev/null
+# The permissioned broker: the compose nats.conf, byte-for-byte, with the worker
+# fragment it includes. Credentials are throwaway literals; what is under test
+# is the PERMISSION SET, not the secrets. `-c` only — no JetStream needed here.
+docker run -d --rm --name "$NATS_PERM_NAME" -p "${NATS_PERM_PORT}:4222" \
+    -v "${REPO_ROOT}/deploy/nats:/etc/nats:ro" \
+    -e NATS_USER=it-controller -e NATS_PASSWORD=it-controller-pw \
+    -e NATS_WORKER_USER=it-worker -e NATS_WORKER_PASSWORD=it-worker-pw \
+    nats:2.10-alpine -c /etc/nats/nats.conf >/dev/null
 
 # ── Readiness gates ─────────────────────────────────────────────────────────
 #
@@ -147,6 +163,8 @@ wait_for "Redis (TCP ${REDIS_PORT})" 30 \
 # published, so probe the client port's TCP reachability from the host instead.
 wait_for "NATS (TCP ${NATS_PORT})" 30 \
     bash -c "printf '' >/dev/tcp/127.0.0.1/${NATS_PORT}" || exit 1
+wait_for "NATS-perm (TCP ${NATS_PERM_PORT})" 30 \
+    bash -c "printf '' >/dev/tcp/127.0.0.1/${NATS_PERM_PORT}" || exit 1
 
 PG_BASE="postgres://${PG_USER}:${PG_PASS}@127.0.0.1:${PG_PORT}"
 MIGRATED_URL="${PG_BASE}/talos"
@@ -188,6 +206,11 @@ migrate_db talos_ctl "$CTL_URL"
 
 export TALOS_TEST_REDIS_URL="redis://127.0.0.1:${REDIS_PORT}"
 export TALOS_TEST_NATS_URL="nats://127.0.0.1:${NATS_PORT}"
+export TALOS_TEST_NATS_PERM_URL="nats://127.0.0.1:${NATS_PERM_PORT}"
+export TALOS_TEST_NATS_PERM_CONTROLLER_USER=it-controller
+export TALOS_TEST_NATS_PERM_CONTROLLER_PASSWORD=it-controller-pw
+export TALOS_TEST_NATS_PERM_WORKER_USER=it-worker
+export TALOS_TEST_NATS_PERM_WORKER_PASSWORD=it-worker-pw
 
 # crate : integration-test-binary : datastore (redis | migrated | selfcontained)
 TESTS=(
@@ -272,6 +295,21 @@ fi
 echo
 echo "▶ RFC 0010 P3 claim protocol :: talos-workflow-engine-nats full loop  [nats]"
 if ! cargo test -p talos-workflow-engine-nats --lib full_claim_loop; then
+    rc=1
+fi
+
+# ── Worker NATS credential :: the broker agrees with the Rust model  [nats-perm]
+# `talos_workflow_job_protocol::nats_permissions` is the one home of the worker
+# credential's subscribe allow-list and publish deny-list, and its unit tests
+# pin the two checked-in `.conf` fragments to it byte-for-byte. Only a live
+# nats-server reading that fragment can prove the broker REFUSES what the model
+# says it refuses (a permission violation is an async -ERR, invisible to unit
+# tests), which is what this binary does — every subject in the table, each
+# with a control on the unrestricted credential, plus the two request/reply
+# shapes (controller→worker job on `_INBOX`, worker→controller RPC on `_WINBOX`).
+echo
+echo "▶ worker NATS credential permissions :: talos-workflow-engine-nats  [nats-perm]"
+if ! cargo test -p talos-workflow-engine-nats --test nats_worker_permissions; then
     rc=1
 fi
 

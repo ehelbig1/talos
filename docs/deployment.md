@@ -112,7 +112,8 @@ The production overlay:
 | `TRUSTED_IPS` | (none) | IPs that bypass rate limiting |
 | `TRUSTED_PROXY_CIDRS` | (none) | Reverse proxy CIDRs for X-Forwarded-For |
 | `COMPILE_DIR` | `/tmp/talos-compilations` | Directory for WASM compilation artifacts |
-| `NATS_USER` / `NATS_PASSWORD` | (none) | NATS authentication credentials |
+| `NATS_USER` / `NATS_PASSWORD` | (none) | NATS authentication credentials — the CONTROLLER pair (unrestricted) |
+| `NATS_WORKER_USER` / `NATS_WORKER_PASSWORD` | (none) | Deployment-layer keys (bootstrap Secret / compose `.env`) for the WORKER's NATS credential, handed to the worker as its `NATS_USER`/`NATS_PASSWORD`. The broker binds this user to the worker permission set generated from `talos_workflow_job_protocol::nats_permissions` (subscribe allow-list, publish deny-list — `docs/nats-subjects.md`). `install.sh` mints and back-fills both; `make up` back-fills `.env`; External-Secrets operators must add them BEFORE upgrading (the NATS StatefulSet mounts them as required keys) |
 | `ANTHROPIC_API_KEY` | (none) | Enable LLM features (Anthropic Claude) |
 | `OPENAI_API_KEY` | (none) | Enable LLM features (OpenAI GPT) |
 | `GEMINI_API_KEY` | (none) | Enable LLM features (Google Gemini) |
@@ -194,6 +195,7 @@ Before deploying to production:
 - [ ] `DANGER_DISABLE_*` flags are NOT set
 - [ ] `ALLOW_DEV_UNSAFE_CSRF_BYPASS` is NOT set
 - [ ] NATS authentication is enabled (`NATS_USER`/`NATS_PASSWORD`)
+- [ ] The worker uses its OWN NATS credential (`NATS_WORKER_USER`/`NATS_WORKER_PASSWORD`), not the controller's — check the worker pod's env resolves to the worker Secret keys
 - [ ] `WORKER_SHARED_KEY` is set on both controller and worker
 - [ ] PostgreSQL uses strong credentials (not defaults)
 - [ ] Redis requires authentication in production
