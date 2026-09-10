@@ -2315,6 +2315,100 @@ impl SecretsManager {
         }
     }
 
+    /// Resolve the org that owns a `workflow_executions` row — the WORKFLOW's
+    /// `org_id`, via the join. This is the tenant an execution's output must be
+    /// encrypted under (RFC 0004/0005): `workflows.org_id` is stamped at every
+    /// insert site, whereas `workflow_executions.org_id` is deliberately NOT
+    /// auto-stamped (high-write perf exclusion, migration 20260529140000) and
+    /// is usually NULL on new rows, so reading it directly would route nearly
+    /// every output to the global DEK.
+    ///
+    /// ONE home for the three repositories that write
+    /// `workflow_executions.output_data_enc` (`ExecutionRepository`,
+    /// `WorkflowRepository`, `ActorRepository`): before this existed the first
+    /// resolved the org and wrote v4 while the other two skipped the lookup
+    /// and wrote v3 under the GLOBAL DEK — three writers of one column, two
+    /// DEK scopes. `Ok(None)` when the execution row is absent OR its workflow
+    /// carries no org; callers feed that straight into
+    /// [`Self::encrypt_value_aad_v4_or_global`], which maps `None` → v3, so an
+    /// org-less workflow keeps today's format and a scoped one gets its org DEK.
+    pub async fn resolve_workflow_execution_org_id(&self, exec_id: Uuid) -> Result<Option<Uuid>> {
+        let org_row: Option<Option<Uuid>> = sqlx::query_scalar(
+            "SELECT w.org_id FROM workflow_executions we \
+             JOIN workflows w ON w.id = we.workflow_id WHERE we.id = $1",
+        )
+        .bind(exec_id)
+        .fetch_optional(&self.db_pool)
+        .await?;
+        Ok(org_row.flatten())
+    }
+
+    /// Decrypt a row whose AAD is a DOMAIN-TAGGED user id (see [`crate::aad`]),
+    /// accepting the pre-tag bare-id AAD for rows written before the tag
+    /// existed. Returns the plaintext AND which [`crate::aad::AadPath`] opened
+    /// it, so the caller can log the path at debug and a test can assert it.
+    ///
+    /// Order and fallback rule:
+    /// 1. If the row is **v0** (`LegacyNoAad` route) no AAD is bound at all —
+    ///    decrypt once with empty AAD and report [`AadPath::LegacyNoAad`].
+    /// 2. Otherwise try `aad_for(tag, id)` first. Success ⇒ [`AadPath::Tagged`].
+    /// 3. **Only** on [`SecretsError::Aead`] (tag mismatch — the one error the
+    ///    AAD can cause) retry with the bare `id.as_bytes()`. Success ⇒
+    ///    [`AadPath::LegacyBareId`]. Any other error from the first attempt
+    ///    (missing DEK, unknown format, DB) is independent of the AAD and is
+    ///    returned as-is — retrying would only mask it.
+    ///
+    /// A row that decrypts under the legacy AAD is NEVER failed; it is the
+    /// column's next write that moves it onto the tagged context (the TOTP
+    /// path rewrites on enrol, OTLP on settings save — no sweep). Stated limit:
+    /// until that write, a legacy blob is still a valid ciphertext for every
+    /// OTHER column keyed on the same bare id, which is exactly the pre-tag
+    /// state; the tag closes the gap for NEW writes and does not claim to
+    /// close it for old rows.
+    ///
+    /// Neither attempt logs or counts anything — `decrypt_versioned` and the
+    /// AEAD primitives beneath it are silent (the `secret_decrypt_failures`
+    /// counter is bumped only by the `secrets`-table callers), so a legacy
+    /// row's expected first-attempt miss cannot show up as a failure metric
+    /// or a `talos_secrets` WARN on every login.
+    ///
+    /// [`AadPath::LegacyNoAad`]: crate::aad::AadPath::LegacyNoAad
+    /// [`AadPath::Tagged`]: crate::aad::AadPath::Tagged
+    /// [`AadPath::LegacyBareId`]: crate::aad::AadPath::LegacyBareId
+    pub async fn decrypt_versioned_tagged(
+        &self,
+        key_id: Uuid,
+        encrypted: &[u8],
+        tag: &[u8],
+        id: Uuid,
+        format_version: i16,
+    ) -> Result<(Zeroizing<String>, crate::aad::AadPath), SecretsError> {
+        use crate::aad::AadPath;
+        if matches!(
+            crate::SecretFormat::from_version(format_version)?.decrypt_route(),
+            crate::DecryptRoute::LegacyNoAad
+        ) {
+            let pt = self
+                .decrypt_versioned(key_id, encrypted, &[], format_version)
+                .await?;
+            return Ok((pt, AadPath::LegacyNoAad));
+        }
+        let tagged = crate::aad::aad_for(tag, id);
+        match self
+            .decrypt_versioned(key_id, encrypted, &tagged, format_version)
+            .await
+        {
+            Ok(pt) => Ok((pt, AadPath::Tagged)),
+            Err(SecretsError::Aead) => {
+                let pt = self
+                    .decrypt_versioned(key_id, encrypted, id.as_bytes(), format_version)
+                    .await?;
+                Ok((pt, AadPath::LegacyBareId))
+            }
+            Err(other) => Err(other),
+        }
+    }
+
     /// Decrypt a v3 (`AAD_FORMAT_V3_DERIVED`) blob: re-derive the
     /// per-context subkey from the DEK named by `key_id` and the `aad`,
     /// then AES-GCM-decrypt with that subkey and the same AAD bound into
@@ -6491,6 +6585,143 @@ mod per_context_subkey_tests {
                 .is_err(),
             "org B's root-derived key must not open org A's v4 ciphertext"
         );
+    }
+
+    #[test]
+    fn same_user_two_columns_bare_id_aad_shares_one_subkey() {
+        // The DEFECT, stated as a property rather than assumed: with the bare
+        // `user_id` as AAD, `users.totp_secret` and
+        // `user_audit_settings.auth_headers_encrypted` derive the SAME
+        // per-context subkey and bind the SAME AAD, so a TOTP blob is a valid
+        // ciphertext for the header column of the same user. GCM accepts it;
+        // only the JSON parser downstream rejects it.
+        let dek = root_dek();
+        let uid = Uuid::new_v4();
+        let totp_key = SecretsManager::derive_per_context_subkey(&dek, uid.as_bytes()).unwrap();
+        let otlp_key = SecretsManager::derive_per_context_subkey(&dek, uid.as_bytes()).unwrap();
+        assert_eq!(
+            &*totp_key, &*otlp_key,
+            "bare-id AAD: one subkey for two columns"
+        );
+
+        let cipher = Aes256Gcm::new_from_slice(totp_key.as_slice()).unwrap();
+        let nonce = Nonce::from_slice(&[3u8; 12]);
+        let totp_blob = cipher
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: b"JBSWY3DPEHPK3PXP",
+                    aad: uid.as_bytes(),
+                },
+            )
+            .unwrap();
+        // The "OTLP reader" — same key, same AAD — opens the TOTP blob.
+        let opened = Aes256Gcm::new_from_slice(otlp_key.as_slice())
+            .unwrap()
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: totp_blob.as_ref(),
+                    aad: uid.as_bytes(),
+                },
+            );
+        assert!(opened.is_ok(), "pre-tag: the cross-column swap DECRYPTS");
+    }
+
+    #[test]
+    fn domain_tagged_aad_makes_the_cross_column_swap_fail() {
+        // The FIX: `aad_for(TOTP_SECRET_TAG, uid)` and
+        // `aad_for(OTLP_AUTH_HEADERS_TAG, uid)` derive DIFFERENT subkeys and
+        // bind DIFFERENT AADs, so the transposed blob fails the GCM tag in
+        // both directions — before any parser sees it.
+        use crate::aad::{aad_for, OTLP_AUTH_HEADERS_TAG, TOTP_SECRET_TAG};
+        let dek = root_dek();
+        let uid = Uuid::new_v4();
+        let totp_aad = aad_for(TOTP_SECRET_TAG, uid);
+        let otlp_aad = aad_for(OTLP_AUTH_HEADERS_TAG, uid);
+        let totp_key = SecretsManager::derive_per_context_subkey(&dek, &totp_aad).unwrap();
+        let otlp_key = SecretsManager::derive_per_context_subkey(&dek, &otlp_aad).unwrap();
+        assert_ne!(
+            &*totp_key, &*otlp_key,
+            "tagged AAD: distinct subkey per column"
+        );
+
+        let nonce = Nonce::from_slice(&[4u8; 12]);
+        let totp_blob = Aes256Gcm::new_from_slice(totp_key.as_slice())
+            .unwrap()
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: b"JBSWY3DPEHPK3PXP",
+                    aad: &totp_aad,
+                },
+            )
+            .unwrap();
+        let otlp_blob = Aes256Gcm::new_from_slice(otlp_key.as_slice())
+            .unwrap()
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: br#"{"authorization":"Bearer x"}"#,
+                    aad: &otlp_aad,
+                },
+            )
+            .unwrap();
+
+        // TOTP blob presented to the OTLP reader (its key, its AAD).
+        assert!(
+            Aes256Gcm::new_from_slice(otlp_key.as_slice())
+                .unwrap()
+                .decrypt(
+                    nonce,
+                    Payload {
+                        msg: totp_blob.as_ref(),
+                        aad: &otlp_aad,
+                    },
+                )
+                .is_err(),
+            "TOTP blob must not open under the OTLP column's context"
+        );
+        // OTLP blob presented to the TOTP reader.
+        assert!(
+            Aes256Gcm::new_from_slice(totp_key.as_slice())
+                .unwrap()
+                .decrypt(
+                    nonce,
+                    Payload {
+                        msg: otlp_blob.as_ref(),
+                        aad: &totp_aad,
+                    },
+                )
+                .is_err(),
+            "OTLP blob must not open under the TOTP column's context"
+        );
+        // And the legacy-fallback context (bare uid) opens NEITHER tagged
+        // blob — a tagged write is not reachable from the pre-tag reader.
+        let bare_key = SecretsManager::derive_per_context_subkey(&dek, uid.as_bytes()).unwrap();
+        let bare = Aes256Gcm::new_from_slice(bare_key.as_slice()).unwrap();
+        for blob in [&totp_blob, &otlp_blob] {
+            assert!(bare
+                .decrypt(
+                    nonce,
+                    Payload {
+                        msg: blob.as_ref(),
+                        aad: uid.as_bytes(),
+                    },
+                )
+                .is_err());
+        }
+        // Control: each blob still opens under its OWN tagged context.
+        assert!(Aes256Gcm::new_from_slice(totp_key.as_slice())
+            .unwrap()
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: totp_blob.as_ref(),
+                    aad: &totp_aad,
+                },
+            )
+            .is_ok());
     }
 }
 

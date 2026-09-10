@@ -514,11 +514,25 @@ impl TotpService {
     /// the personal org by `set_org_id_from_personal_org`, so the DEK scope
     /// matches). Decrypt is unchanged: v4 routes through the same per-context
     /// derived path as v3 (the row's `key_id` names the org DEK).
+    ///
+    /// AAD is DOMAIN-TAGGED (2026-09-10): `aad_for(TOTP_SECRET_TAG, user_id)`
+    /// = `b"totp\0" || user_id`, not the bare `user_id`. With the bare id,
+    /// this column and `user_audit_settings.auth_headers_encrypted` (also
+    /// AAD = bare `user_id`) derived the SAME per-context subkey for one
+    /// user, so a TOTP blob was a valid ciphertext for the header column and
+    /// vice versa — the swap failed only at the JSON parse. The tag lives in
+    /// `talos_secrets_manager::aad` (one home). Rows written before the tag
+    /// still decrypt via the bare-id fallback in `decrypt_totp_secret` and
+    /// are moved onto the tagged context by the next enrol — no sweep.
     async fn encrypt_totp_secret(&self, secret: &str, user_id: Uuid) -> Result<(String, i16)> {
         use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let aad = talos_secrets_manager::aad::aad_for(
+            talos_secrets_manager::aad::TOTP_SECRET_TAG,
+            user_id,
+        );
         let (key_id, encrypted_bytes, version) = self
             .secrets_manager
-            .encrypt_value_aad_v4_for_user(secret, user_id, user_id.as_bytes())
+            .encrypt_value_aad_v4_for_user(secret, user_id, &aad)
             .await?;
         // Encode as: key_id_hex:base64(nonce||ciphertext)
         let encoded = format!("{}:{}", key_id, STANDARD.encode(&encrypted_bytes));
@@ -527,7 +541,10 @@ impl TotpService {
 
     /// Decrypt a TOTP secret that was encrypted with `encrypt_totp_secret`.
     /// Dispatches on the per-row `totp_secret_format` column (0 = legacy
-    /// no-AAD, 1 = AAD-bound to `user_id` bytes).
+    /// no-AAD; 1/3/4 = AAD-bound), trying the domain-tagged AAD first and
+    /// falling back to the pre-tag bare `user_id` AAD for existing rows
+    /// (`SecretsManager::decrypt_versioned_tagged`). Which path opened the
+    /// row is logged at DEBUG only; a legacy row is never failed.
     ///
     /// Returns the plaintext wrapped in [`zeroize::Zeroizing<String>`]
     /// so the heap allocation backing the TOTP shared-secret bytes is
@@ -550,12 +567,25 @@ impl TotpService {
         let encrypted_bytes = STANDARD
             .decode(parts[1])
             .map_err(|_| anyhow!("Invalid base64 in encrypted TOTP secret"))?;
-        // `decrypt_versioned` now returns `Result<_, SecretsError>`; this
+        // `decrypt_versioned_tagged` returns `Result<_, SecretsError>`; this
         // method's contract is `anyhow::Result`, so map into anyhow.
-        self.secrets_manager
-            .decrypt_versioned(key_id, &encrypted_bytes, user_id.as_bytes(), format_version)
-            .await
-            .map_err(Into::into)
+        let (plaintext, aad_path) = self
+            .secrets_manager
+            .decrypt_versioned_tagged(
+                key_id,
+                &encrypted_bytes,
+                talos_secrets_manager::aad::TOTP_SECRET_TAG,
+                user_id,
+                format_version,
+            )
+            .await?;
+        tracing::debug!(
+            user_id = %user_id,
+            aad_path = aad_path.as_str(),
+            format_version,
+            "TOTP secret decrypted"
+        );
+        Ok(plaintext)
     }
 
     /// Enable 2FA for a user.
