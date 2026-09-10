@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use talos_workflow_job_protocol::LlmTier;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use super::{llm_provider_label, wit_llm, TalosContext};
+use super::{llm_provider_label, wit_llm, wit_llm_tools, TalosContext};
 use crate::metrics::{
     get_prometheus_metrics, init_telemetry_for_tests, LlmFailure, RuntimeMetrics,
     LLM_PROVIDER_LABELS,
@@ -81,6 +81,23 @@ fn stall_signal() -> &'static tokio::sync::Semaphore {
 }
 
 static REQUESTS_SERVED: AtomicU64 = AtomicU64::new(0);
+
+/// Requests the MOCK currently has in flight, and the high-water mark.
+///
+/// Server-side, deliberately: the gate's claim is about how many exchanges
+/// reach the backend at once, and the only place that can be observed without
+/// trusting the code under test is the backend itself.
+static MOCK_LIVE: AtomicU64 = AtomicU64::new(0);
+static MOCK_PEAK: AtomicU64 = AtomicU64::new(0);
+
+fn note_mock_arrival() {
+    let now = MOCK_LIVE.fetch_add(1, Ordering::SeqCst) + 1;
+    MOCK_PEAK.fetch_max(now, Ordering::SeqCst);
+}
+
+fn note_mock_departure() {
+    MOCK_LIVE.fetch_sub(1, Ordering::SeqCst);
+}
 
 /// Start the mock provider (once) and point `OLLAMA_URL` at it.
 ///
@@ -167,6 +184,21 @@ async fn serve_one(mut stream: tokio::net::TcpStream) {
             stall_signal().add_permits(1);
             std::future::pending::<()>().await
         }
+        // Holds the connection open long enough that a SECOND simultaneous
+        // request would overlap it, and records the overlap server-side.
+        "mock-slow" => {
+            note_mock_arrival();
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            note_mock_departure();
+            write_simple(
+                &mut stream,
+                200,
+                "OK",
+                r#"{"message":{"role":"assistant","content":"OK"},"done":true,
+                    "done_reason":"stop","prompt_eval_count":3,"eval_count":1}"#,
+            )
+            .await
+        }
         "mock-429" => write_simple(&mut stream, 429, "Too Many Requests", "{}").await,
         "mock-500" => {
             write_simple(&mut stream, 500, "Internal Server Error", "upstream boom").await
@@ -223,9 +255,15 @@ async fn write_oversized(stream: &mut tokio::net::TcpStream) {
 // ---------------------------------------------------------------------------
 
 fn context_with_metrics(tier: LlmTier) -> TalosContext {
+    context_with_metrics_in_world(tier, CapabilityWorld::Minimal)
+}
+
+/// `complete_with_tools` is capability-gated to {Secrets, Database, Agent,
+/// Trusted}, so the tools case cannot reuse the `Minimal` fixture.
+fn context_with_metrics_in_world(tier: LlmTier, world: CapabilityWorld) -> TalosContext {
     init_telemetry_for_tests();
     let mut ctx = TalosContext::new(
-        CapabilityWorld::Minimal,
+        world,
         vec![],
         vec![],
         128,
@@ -587,4 +625,173 @@ fn provider_labels_cover_the_closed_wit_enum() {
             "provider `{l}` reaches complete_impl but normalizes to `other`"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// The local-LLM in-flight gate, driven through the PRODUCTION entry point
+// ---------------------------------------------------------------------------
+//
+// `llm_gate_tests.rs` proves the gate's BEHAVIOUR against its own semaphore.
+// It structurally cannot prove that `complete_impl` takes a permit and HOLDS
+// it across the exchange — that is a call-site property, and checks 74b/79b
+// state exactly this as their own limit: a guard at the primitive cannot see a
+// caller that computes the right answer and discards it. So these two cases
+// drive `wit_llm::Host::complete` — the method the WASM guest calls — and read
+// the peak concurrency out of the MOCK PROVIDER rather than out of the gate.
+
+/// Read one `wasm_llm_gate_total{outcome}` series out of the exposition.
+/// `None` means ABSENT, which is a different thing from 0.
+fn gate_count(outcome: &str) -> Option<u64> {
+    let needle = format!("outcome=\"{outcome}\"");
+    get_prometheus_metrics()
+        .lines()
+        .filter(|l| l.starts_with("wasm_llm_gate_total{"))
+        .find(|l| l.contains(&needle))
+        .and_then(|l| l.rsplit(' ').next().map(str::to_string))
+        .and_then(|v| v.parse::<f64>().ok())
+        .map(|v| v as u64)
+}
+
+/// Four simultaneous local completions must reach the backend ONE AT A TIME,
+/// and the gate counter must move once per call.
+///
+/// The default cap is `DEFAULT_LOCAL_LLM_MAX_IN_FLIGHT` = 1 and
+/// `TALOS_LOCAL_LLM_MAX_IN_FLIGHT` is unset in this binary, so this exercises
+/// the shipped configuration rather than a fixture.
+#[test]
+fn four_concurrent_local_completions_reach_the_backend_one_at_a_time() {
+    let _g = guard();
+    rt().block_on(async {
+        ensure_mock_provider().await;
+        MOCK_PEAK.store(0, Ordering::SeqCst);
+        MOCK_LIVE.store(0, Ordering::SeqCst);
+        let before = gate_count("acquired").unwrap_or(0);
+
+        let mut ctxs: Vec<TalosContext> = (0..4)
+            .map(|_| context_with_metrics(LlmTier::Tier1))
+            .collect();
+        let mut futs = Vec::new();
+        for ctx in ctxs.iter_mut() {
+            futs.push(<TalosContext as wit_llm::Host>::complete(
+                ctx,
+                request(wit_llm::Provider::Ollama, "mock-slow"),
+            ));
+        }
+        let results = futures_util::future::join_all(futs).await;
+        for r in &results {
+            assert!(
+                r.is_ok(),
+                "the gate must never turn a slow call into a failed one: {r:?}"
+            );
+        }
+
+        assert_eq!(
+            MOCK_PEAK.load(Ordering::SeqCst),
+            1,
+            "the backend observed more than one simultaneous exchange; the gate \
+             is not being held across the exchange"
+        );
+        assert_eq!(
+            gate_count("acquired").unwrap_or(0),
+            before + 4,
+            "every local call must record a gate outcome"
+        );
+    });
+}
+
+/// THE CONTROL. Without it, `MOCK_PEAK == 1` above is equally consistent with
+/// a mock that cannot serve two requests at once or a current-thread runtime
+/// that never interleaves them — which is the shape that lets a gate test pass
+/// over a gate that does nothing.
+///
+/// Four RAW requests, bypassing `complete` and therefore the gate, against the
+/// same mock in the same runtime, must overlap.
+#[test]
+fn the_control_the_mock_really_can_serve_two_at_once() {
+    let _g = guard();
+    rt().block_on(async {
+        ensure_mock_provider().await;
+        MOCK_PEAK.store(0, Ordering::SeqCst);
+        MOCK_LIVE.store(0, Ordering::SeqCst);
+
+        let url = format!("{}/api/chat", super::ollama_base_url());
+        let client = super::local_llm_http_client().clone();
+        let body = serde_json::json!({
+            "model": "mock-slow",
+            "messages": [{"role": "user", "content": "ping"}],
+            "stream": false
+        });
+        let mut futs = Vec::new();
+        for _ in 0..4 {
+            futs.push(client.post(&url).json(&body).send());
+        }
+        let results = futures_util::future::join_all(futs).await;
+        for r in &results {
+            assert!(r.is_ok(), "raw control request failed: {r:?}");
+        }
+        assert!(
+            MOCK_PEAK.load(Ordering::SeqCst) > 1,
+            "the mock served four ungated requests without ever overlapping, so \
+             the serialization assertion above proves nothing"
+        );
+    });
+}
+
+/// The SECOND gated call site: `llm::complete-with-tools`.
+///
+/// It exists because M8 was a MEASURED SURVIVOR — reverting `llm_tools.rs`'s
+/// binding to `let _ =` left all 651 crate tests green while that path went
+/// straight back to unbounded concurrency. One test per SITE whose consequence
+/// is a real behaviour change, not one per shape.
+#[test]
+fn the_tool_use_path_is_gated_too() {
+    let _g = guard();
+    rt().block_on(async {
+        ensure_mock_provider().await;
+        MOCK_PEAK.store(0, Ordering::SeqCst);
+        MOCK_LIVE.store(0, Ordering::SeqCst);
+
+        let tool_req = || wit_llm_tools::ToolCompletionRequest {
+            provider: Some(wit_llm_tools::Provider::Ollama),
+            model: Some("mock-slow".to_string()),
+            messages: vec![wit_llm_tools::RichMessage {
+                role: wit_llm_tools::Role::User,
+                content: vec![wit_llm_tools::ContentBlock::Text("ping".to_string())],
+            }],
+            tools: vec![wit_llm_tools::ToolDefinition {
+                name: "noop".to_string(),
+                description: "does nothing".to_string(),
+                input_schema: r#"{"type":"object","properties":{}}"#.to_string(),
+            }],
+            max_tokens: Some(16),
+            temperature: None,
+            system_prompt: None,
+            force_tool: None,
+            response_schema: None,
+        };
+
+        let mut ctxs: Vec<TalosContext> = (0..4)
+            .map(|_| context_with_metrics_in_world(LlmTier::Tier1, CapabilityWorld::Secrets))
+            .collect();
+        let mut futs = Vec::new();
+        for ctx in ctxs.iter_mut() {
+            futs.push(<TalosContext as wit_llm_tools::Host>::complete_with_tools(
+                ctx,
+                tool_req(),
+            ));
+        }
+        let results = futures_util::future::join_all(futs).await;
+        for r in &results {
+            assert!(
+                r.is_ok(),
+                "the gate must never turn a slow tool call into a failed one: {r:?}"
+            );
+        }
+        assert_eq!(
+            MOCK_PEAK.load(Ordering::SeqCst),
+            1,
+            "the backend observed more than one simultaneous tool-use exchange; \
+             the llm_tools call site is not holding the permit"
+        );
+    });
 }

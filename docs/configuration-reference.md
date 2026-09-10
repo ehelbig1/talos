@@ -220,6 +220,7 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | `ANTHROPIC_API_KEY` | none (vault-first; env is fallback) | both | Anthropic key fallback for LLM + graph-RAG | 🔒 |
 | `OPENAI_API_KEY` | none (optional) | controller | OpenAI key for embeddings fallback | 🔒 |
 | `OLLAMA_URL` | `http://ollama:11434` | both | Local Ollama endpoint (Tier-1 local LLM) | |
+| `TALOS_LOCAL_LLM_MAX_IN_FLIGHT` | `1` | worker | Simultaneous LOCAL (ollama) `llm::complete*` exchanges permitted PER WORKER PROCESS. The gate QUEUES and never refuses: a call that cannot get a permit within 120 s proceeds ungated, i.e. degrades to the pre-gate behaviour. `0` disables it entirely; an unparseable value falls back to `1`, never to `0`. **Raise it to match a backend that genuinely serves requests in parallel** — Talos cannot see the backend's `OLLAMA_NUM_PARALLEL`, and the default is set for the single-slot Ollama the bundled `docker-compose.yml` provides. The effective fleet ceiling against a shared backend is `WORKER_REPLICAS x this`. | |
 | `TALOS_LLM_BOOT_WARMUP` | `true` | controller | Warm the ≤3 most-referenced local (ollama) generation models at boot, after the reachability probe, so the first scheduled run doesn't pay the cold model load. Fail-soft, spawned, never delays boot. Local provider only. | |
 | `EMBEDDING_API_URL` | none (optional) | both | Embedding service URL | |
 | `EMBEDDING_API_KEY` | none (optional) | both | Embedding API key | 🔒 |

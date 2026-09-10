@@ -352,6 +352,15 @@ mod tests {
             r#"wasm_executions_total{status="retry_exhausted""#,
             "wasm_cache_hits_total{",
             "wasm_cache_misses_total{",
+            // The local-LLM in-flight gate. All three outcomes are seeded
+            // because the two an operator watches are read as
+            // `increase(...) > 0`, over which an ABSENT series matches
+            // nothing — so "the gate was never wired" and "the gate has never
+            // had to act" would render identically.
+            r#"wasm_llm_gate_total{"#,
+            r#"outcome="acquired""#,
+            r#"outcome="disabled""#,
+            r#"outcome="wait_expired""#,
         ] {
             assert!(
                 cold.contains(expected),
@@ -360,6 +369,13 @@ mod tests {
             );
         }
         for line in cold.lines() {
+            // `wasm_llm_gate_total` is deliberately NOT in this loop even
+            // though it IS in the presence list above. The registry is
+            // process-global and the gate cases in
+            // `host::llm::llm_failure_metrics_tests` increment it, so a
+            // zero-VALUE assertion here is order-dependent — it passed in
+            // isolation and failed under `--lib`. Presence is monotone and so
+            // is safe; the value is not.
             if line.starts_with("wasm_executions_total{") || line.starts_with("wasm_cache_") {
                 assert!(
                     line.ends_with(" 0"),
