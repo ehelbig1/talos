@@ -101,6 +101,7 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | `VAULT_TRANSIT_KEY_NAME` (+`_FILE`) | none | both | Vault transit key name | 🔒 |
 | `VAULT_TRANSIT_MOUNT` (+`_FILE`) | none | both | Vault transit mount path | 🔒 |
 | `VAULT_CACERT` | none (optional) | controller | Vault CA certificate path | 🔒 |
+| `TALOS_ALLOW_PLAINTEXT_VAULT` | unset | controller | Escape hatch for the production `https://`-only gate on `VAULT_ADDR` (`tls-prod-gate-vault`, check 44). Every DEK wrap/unwrap carries the plaintext DEK and `X-Vault-Token`, so a plaintext `VAULT_ADDR` in production refuses to boot unless this is set; intended for an in-pod Vault agent sidecar on loopback only. Setting it writes an audit WARN at boot. | 🔒 |
 
 ### Admin / network-edge gates
 
@@ -194,6 +195,8 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | `CIRCUIT_BREAKER_CLEANUP_SECS` | `300` | worker | Circuit-breaker cleanup interval | |
 | `CIRCUIT_BREAKER_MAX_AGE_SECS` | `1800` | worker | Max age before breaker state is pruned | |
 | `CIRCUIT_BREAKER_SUCCESS_RATE` | built-in default (f64) | worker | Success-rate threshold to close the breaker | |
+| `TALOS_WORKER_MAX_JOB_FUEL` | `50000000` (`MAX_JOB_FUEL`) | worker | Ceiling the worker clamps a dispatch's `max_fuel` (and every pipeline step's) to, whatever the signed request asks for. The controller caps at the same constant; this is the worker-side belt (2026-09-10 review — `max_fuel` was the one policy field not bound into the dispatch signature). | 🔒 |
+| `TALOS_SSE_IDLE_TIMEOUT_SECS` | `900` | worker | Idle timeout for a guest `http_stream` (SSE) reader task: a stream that delivers nothing for this long is closed with `IdleTimeout`. Reader tasks are also aborted when their job's Store drops, so this is a backstop for a stream nothing ever reads, not the primary bound. `0` disables. | |
 
 ## 4. Module compilation / build toolchain
 
