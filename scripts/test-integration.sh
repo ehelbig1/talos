@@ -80,9 +80,15 @@ command -v sqlx >/dev/null 2>&1 \
 
 echo "▶ starting disposable Redis + pgvector + NATS…"
 docker run -d --rm --name "$REDIS_NAME" -p "${REDIS_PORT}:6379" redis:7-alpine >/dev/null
+# `pg_stat_statements` must be PRELOADED at postmaster start, exactly as
+# docker-compose.yml does: without it migration 20260908120000 no-ops, the
+# talos_ctl template has no extension, and `statement_stats_tests` sees only
+# `not_installed`. It is a POSTMASTER GUC, so it can only be set here. (Keep
+# this comment ABOVE the command: a `#` line inside a `\` continuation ends it.)
 docker run -d --rm --name "$PG_NAME" \
     -e "POSTGRES_USER=${PG_USER}" -e "POSTGRES_PASSWORD=${PG_PASS}" -e POSTGRES_DB=talos \
-    -p "${PG_PORT}:5432" pgvector/pgvector:pg17 >/dev/null
+    -p "${PG_PORT}:5432" pgvector/pgvector:pg17 \
+    -c shared_preload_libraries=pg_stat_statements >/dev/null
 # NATS for the RFC 0010 P3 (D3b) claim-protocol integration tests (envelope-seal
 # responder↔worker handshake + the engine-nats full dispatch→claim→open loop).
 docker run -d --rm --name "$NATS_NAME" -p "${NATS_PORT}:4222" nats:2.10-alpine >/dev/null
@@ -295,12 +301,26 @@ fi
 CTRL_MASTER_KEY="00000000000000000000000000000000000000000000000000000000deadbeef"
 CTRL_TESTS=(
     # Nothing on this platform could say which operator surface is slow: no
-    # per-tool series, no per-call line, no pg_stat_statements. Drives the REAL
+    # per-tool series, no per-call line, and no pg_stat_statements (that last
+    # one is live from 2026-09-10; the counting here stays client-side because
+    # a cluster-wide cumulative view cannot attribute statements to ONE test).
+    # Drives the REAL
     # `tools/call` chokepoint and asserts the series moved, that three invented
     # tool names mint ONE `unknown` series (the cardinality guard), and the two
     # statement-count fixes the measurements justified. `common` (DATABASE_URL)
     # harness, so CTRL_TESTS and not TC_TESTS (64b).
     "mcp_tool_instrument_tests"
+    # #786 turned pg_stat_statements COLLECTION on and shipped no reader.
+    # `get_sql_statement_report` is it, and the relation it reads is OPTIONAL by
+    # design — so the arm that regresses silently is the one where the extension
+    # is DROPPED and the report must say `available: false` rather than render
+    # an empty list of slow statements. Also drives the sanitiser END TO END: a
+    # real ANSI escape planted in a real column ALIAS (one of the three things
+    # pg_stat_statements does not normalise) must not reach the report. The
+    # crate is deliberately outside check 88's PREPARE roots, so this binary is
+    # the only thing that can say its SQL runs at all. `common` (DATABASE_URL)
+    # harness, so CTRL_TESTS and not TC_TESTS (64b).
+    "statement_stats_tests"
     # ADAPTIVE_RANK_LOOKBACK_DAYS is documented as a [1, 3650]-day training
     # window and a hardcoded row cap binds first — measured on the reference
     # fleet, the configured 30 days was a fitted 6.56 and every value from 7 to

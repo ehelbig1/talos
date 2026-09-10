@@ -290,6 +290,11 @@ talos-draft-heuristics = { path = "../talos-draft-heuristics" }
 # policy, and the retention purge's pinned-parent exemption cannot be observed
 # from Rust alone.
 talos-child-run-ledger = { path = "../talos-child-run-ledger" }
+# statement_stats_tests: the crate is deliberately OUTSIDE check 88's PREPARE
+# roots (its relation is absent by design on most servers), so this binary is
+# the only thing that can say the SQL runs — and the arm it exists for is the
+# one where the extension is DROPPED, which no unit test can reach.
+talos-statement-stats = { path = "../talos-statement-stats" }
 # swallowed_read_disclosure_tests: builds a REAL `McpState` and drives the
 # production MCP `dispatch` for three repaired swallowed-read sites, because
 # the defect is what the HANDLER BODY renders — a test against the repository

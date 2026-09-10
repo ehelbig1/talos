@@ -1,0 +1,27 @@
+[package]
+name = "talos-statement-stats"
+description = "The one reader of pg_stat_statements — an OPTIONAL relation, so availability is classified rather than defaulted, and query text is sanitised because it is caller-authorable"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Deliberately NOT in check 88's PREPARE roots and NOT a `*-repository` crate:
+# every statement here names a relation that is ABSENT on most deployments by
+# design (the migration no-ops without the preload), so a PREPARE gate whose
+# premise is "this relation must exist" would go red on correct code. The guard
+# is `controller/tests/statement_stats_tests` instead, which drives the real
+# read against a database WITH the view and against one WITHOUT it.
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "chrono"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[lints]
+workspace = true

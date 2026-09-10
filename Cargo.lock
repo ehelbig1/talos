@@ -1866,6 +1866,7 @@ dependencies = [
  "talos-session-brief-service",
  "talos-shutdown",
  "talos-slack",
+ "talos-statement-stats",
  "talos-subworkflow-contract",
  "talos-system-repo",
  "talos-task-supervision",
@@ -8696,12 +8697,14 @@ dependencies = [
  "talos-registry",
  "talos-replay-diff",
  "talos-replay-service",
+ "talos-rpc-subscribers",
  "talos-schedule-repo",
  "talos-scheduler",
  "talos-search-service",
  "talos-secrets-manager",
  "talos-security-audit",
  "talos-session-brief-service",
+ "talos-statement-stats",
  "talos-subworkflow-contract",
  "talos-system-repo",
  "talos-task-supervision",
@@ -9459,6 +9462,18 @@ dependencies = [
 [[package]]
 name = "talos-ssrf-classify"
 version = "0.1.0"
+
+[[package]]
+name = "talos-statement-stats"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "talos-subworkflow-contract"

@@ -5,8 +5,13 @@
 //! surface is slow: `/metrics/prometheus` carried no per-tool series (the
 //! only `talos_*` names matching `mcp|tool|handler|request` were the four
 //! `talos_db_pool_*` gauges), the controller log carried no per-call line,
-//! and the live Postgres has no `pg_stat_statements`. So a report built from
-//! two dozen independent reads had no measured cost anywhere.
+//! and the live Postgres had no `pg_stat_statements`. So a report built from
+//! two dozen independent reads had no measured cost anywhere. (That last
+//! clause stopped being true on 2026-09-10, when the Postgres this stack runs
+//! restarted with the preload #786 added; the DATABASE layer is now measured
+//! by `pg_stat_statements` and read by `get_sql_statement_report`. The
+//! sentence is kept in the past tense rather than deleted, because it is why
+//! the counting below is CLIENT-side.)
 //!
 //! What this binary pins, and why each needs a ROUND TRIP rather than a unit
 //! test:
@@ -34,8 +39,13 @@
 //! ROUND TRIPS, which is what latency is paid in. The counter is a
 //! THREAD-LOCAL and `#[tokio::test]` builds a CURRENT-THREAD runtime, so
 //! each test counts only its own work even when libtest runs the binary's
-//! tests in parallel. There is no `pg_stat_statements` on this stack (checked
-//! 2026-09-08, live) and adding it is a separate leg of the same change.
+//! tests in parallel. The counting stays CLIENT-side even now that
+//! `pg_stat_statements` is live on this stack (it was not when this was
+//! written — the preload #786 added took effect at the 2026-09-10 restart,
+//! because `shared_preload_libraries` is a postmaster GUC): the view is
+//! cluster-wide and cumulative, so it cannot attribute statements to ONE test
+//! running beside its parallel siblings, which is exactly what these
+//! assertions need.
 
 #[path = "common/mod.rs"]
 mod common;
