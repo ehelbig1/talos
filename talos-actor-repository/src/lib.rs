@@ -2274,10 +2274,19 @@ impl ActorRepository {
             // MCP-S2: bind the output ciphertext to exec_id so an
             // attacker with DB write capability can't swap user B's
             // execution output onto user A's row to leak it through
-            // the GraphQL read path. v3 = AAD-bound + per-context-derived
+            // the GraphQL read path. AAD-bound + per-context-derived
             // key; per-row format column dispatches so legacy rows still read.
+            //
+            // Per-org DEK arc (2026-09-10): encrypt under the WORKFLOW's
+            // org root DEK (v4) — the same resolution
+            // `ExecutionRepository::encrypt_output` uses for this column.
+            // This path previously wrote v3 under the GLOBAL DEK, so the
+            // DEK scope of `output_data_enc` depended on which repository
+            // finalised the execution. `None` org → v3 as before. The
+            // RETURNED format is bound below, never a hardcoded 3/4.
+            let org_id = sm.resolve_workflow_execution_org_id(exec_id).await?;
             let (key_id, enc_bytes, format_version) = sm
-                .encrypt_value_aad_v3(&json_str, exec_id.as_bytes())
+                .encrypt_value_aad_v4_or_global(&json_str, org_id, exec_id.as_bytes())
                 .await?;
             sqlx::query(
                 "UPDATE workflow_executions \

@@ -365,6 +365,16 @@ impl WorkflowRepository {
     /// (key_id, ciphertext, format_version) so the caller can persist
     /// all three in lockstep — without the format column write, the
     /// read path would dispatch via v0 and fail to decrypt.
+    ///
+    /// Per-org DEK arc (2026-09-10): encrypts under the WORKFLOW's org root
+    /// DEK (v4) via `SecretsManager::resolve_workflow_execution_org_id` — the
+    /// same resolution `ExecutionRepository::encrypt_output` uses for the
+    /// SAME column. Until then this writer (and `ActorRepository::
+    /// complete_execution`) wrote v3 under the GLOBAL DEK while the
+    /// execution repository wrote v4, so one column carried two DEK scopes
+    /// depending on which repository finalised the run. `None` org (org-less
+    /// workflow, or no row yet) → v3, byte-identical to before. The RETURNED
+    /// format is bound, never a hardcoded 3/4.
     async fn maybe_encrypt_execution_output(
         &self,
         exec_id: Uuid,
@@ -374,8 +384,9 @@ impl WorkflowRepository {
             return Ok(None);
         };
         let json_str = serde_json::to_string(output)?;
+        let org_id = sm.resolve_workflow_execution_org_id(exec_id).await?;
         let (key_id, enc_bytes, version) = sm
-            .encrypt_value_aad_v3(&json_str, exec_id.as_bytes())
+            .encrypt_value_aad_v4_or_global(&json_str, org_id, exec_id.as_bytes())
             .await?;
         Ok(Some((key_id, enc_bytes, version)))
     }

@@ -152,7 +152,8 @@ fn classify_audit_message(
 // The per-tenant OTLP streaming auth headers are sealed with the canonical
 // SecretsManager v3 envelope: a KEK-backed DEK (unwrapped through whatever
 // KekProvider is configured — env OR Vault transit) + a per-context HKDF subkey
-// + the tenant's `user_id` bound as AAD. This is the SAME envelope every other
+// + the tenant's `user_id` bound as AAD under the `otlp-auth-headers\0` domain
+// tag (`talos_secrets_manager::aad`). This is the SAME envelope every other
 // AAD-bound column uses, so it carries no bespoke crypto and — critically — does
 // NOT depend on the env master key: a Vault-only deployment that has dropped
 // TALOS_MASTER_KEY still encrypts and decrypts these headers.
@@ -160,8 +161,9 @@ fn classify_audit_message(
 // Write path: `talos-api` update_audit_settings → `encrypt_otlp_auth_headers`.
 // Read path: `OTLPCache::get_tracer` → `SecretsManager::decrypt_versioned`,
 // keyed on the stored `auth_headers_enc_key_id` + `auth_headers_format`. The
-// `user_id` AAD means a DB-write attacker can't transpose one tenant's header
-// blob into another's `user_audit_settings` row and have it decrypt.
+// tagged `user_id` AAD means a DB-write attacker can't transpose one tenant's
+// header blob into another's `user_audit_settings` row — nor another COLUMN's
+// blob (a TOTP seed) into this one — and have it decrypt.
 //
 // (The earlier bespoke env-master-key HKDF scheme was removed once it had no
 // rows to support — there is exactly one encryption path now.)
@@ -182,8 +184,17 @@ fn classify_audit_message(
 /// Returns `(key_id, ciphertext_blob, format_version)` for the
 /// `auth_headers_enc_key_id` / `auth_headers_encrypted` / `auth_headers_format`
 /// columns. The blob is `[12-byte nonce][AES-256-GCM ciphertext+tag]` — the
-/// nonce is embedded in the blob, never stored separately. AAD = the owning
-/// tenant's `user_id` bytes, so a blob can't be transposed between tenants.
+/// nonce is embedded in the blob, never stored separately.
+///
+/// AAD is DOMAIN-TAGGED (2026-09-10): `aad_for(OTLP_AUTH_HEADERS_TAG, user_id)`
+/// = `b"otlp-auth-headers\0" || user_id`, so a blob can't be transposed
+/// between tenants (the id) OR between COLUMNS of one tenant (the tag). With
+/// the bare `user_id` as AAD this column and `users.totp_secret` derived the
+/// same per-context subkey for one user, so a TOTP seed was a valid ciphertext
+/// here and the swap failed only at the JSON parse below. The tag lives in
+/// `talos_secrets_manager::aad` (one home). Rows written before the tag still
+/// decrypt via the bare-id fallback in `get_tracer` and move onto the tagged
+/// context on the next settings save — no sweep.
 ///
 /// [`SecretsManager`]: talos_secrets_manager::SecretsManager
 pub async fn encrypt_otlp_auth_headers(
@@ -191,8 +202,12 @@ pub async fn encrypt_otlp_auth_headers(
     plaintext: &str,
     user_id: Uuid,
 ) -> Result<(Uuid, Vec<u8>, i16), String> {
+    let aad = talos_secrets_manager::aad::aad_for(
+        talos_secrets_manager::aad::OTLP_AUTH_HEADERS_TAG,
+        user_id,
+    );
     secrets_manager
-        .encrypt_value_aad_v4_for_user(plaintext, user_id, user_id.as_bytes())
+        .encrypt_value_aad_v4_for_user(plaintext, user_id, &aad)
         .await
         .map_err(|e| format!("OTLP auth-header encrypt failed: {e}"))
 }
@@ -448,21 +463,33 @@ impl OTLPCache {
         let mut metadata = tonic::metadata::MetadataMap::new();
 
         if let Some(encrypted) = settings.auth_headers_encrypted {
-            // Decrypt the SecretsManager v3 envelope (KEK-backed DEK + per-context
-            // HKDF subkey + user_id AAD). Do NOT silently swallow failures — a
-            // decrypt error means the exporter would stream WITHOUT auth, which
-            // operators must be able to see.
+            // Decrypt the SecretsManager v3/v4 envelope (KEK-backed DEK +
+            // per-context HKDF subkey + domain-tagged user_id AAD, with the
+            // pre-tag bare-user_id AAD accepted for rows written before the
+            // tag — see `encrypt_otlp_auth_headers`). Do NOT silently swallow
+            // failures — a decrypt error means the exporter would stream
+            // WITHOUT auth, which operators must be able to see.
             let decrypted: Result<Zeroizing<String>, String> =
                 match (settings.auth_headers_enc_key_id, secrets_manager) {
                     (Some(key_id), Some(sm)) => sm
-                        .decrypt_versioned(
+                        .decrypt_versioned_tagged(
                             key_id,
                             &encrypted,
-                            user_id.as_bytes(),
+                            talos_secrets_manager::aad::OTLP_AUTH_HEADERS_TAG,
+                            user_id,
                             settings.auth_headers_format,
                         )
                         .await
-                        .map_err(|e| format!("v3 envelope decrypt failed: {e}")),
+                        .map(|(pt, aad_path)| {
+                            tracing::debug!(
+                                user_id = %user_id,
+                                aad_path = aad_path.as_str(),
+                                format_version = settings.auth_headers_format,
+                                "OTLP auth headers decrypted"
+                            );
+                            pt
+                        })
+                        .map_err(|e| format!("envelope decrypt failed: {e}")),
                     (Some(_), None) => Err("no SecretsManager is wired into the audit \
                          subscriber — cannot decrypt OTLP auth headers"
                         .to_string()),
