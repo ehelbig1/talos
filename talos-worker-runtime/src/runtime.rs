@@ -590,22 +590,35 @@ fn aot_hmac_input(cap: &crate::wit_inspector::CapabilityWorld, serialized: &[u8]
 /// `allowed_hosts` containment/exfiltration bypass that contradicted the
 /// documented layer-3 invariant at `select_tier`. Funnel every call site
 /// here so the three paths cannot diverge again.
+///
+/// `egress_scope` joined the predicate in 2026-09: the grant used to gate on
+/// the TIER alone, so a Tier-2 actor pinned to `egress_scope = local` (the
+/// operator's "data must not leave the host" override, independent of the LLM
+/// tier since the 2026-07-23 split) still got raw TCP to any public IP — the
+/// one egress surface the `local_egress_only` resolver could not see. The grant
+/// now denies whenever `resolve_local_egress_only(egress_scope, tier)` says the
+/// actor is local-egress-only, AND still denies every Tier-1 actor regardless of
+/// scope (a `Tier1 + Public` actor reaches its declared hosts through the
+/// allowlisted host-fn path; raw sockets bypass that allowlist and stay off).
+/// `socket_addr_permitted` in `context.rs` is the belt to this suspender.
 fn socket_grant(
     cap: &crate::wit_inspector::CapabilityWorld,
     max_llm_tier: talos_workflow_job_protocol::LlmTier,
+    egress_scope: Option<talos_workflow_job_protocol::EgressScope>,
 ) -> bool {
     use crate::wit_inspector::CapabilityWorld;
     matches!(
         cap,
         CapabilityWorld::Network | CapabilityWorld::Database | CapabilityWorld::Trusted
     ) && !matches!(max_llm_tier, talos_workflow_job_protocol::LlmTier::Tier1)
+        && !crate::context::resolve_local_egress_only(egress_scope, max_llm_tier)
 }
 
 #[cfg(test)]
 mod socket_grant_tests {
     use super::socket_grant;
     use crate::wit_inspector::CapabilityWorld;
-    use talos_workflow_job_protocol::LlmTier;
+    use talos_workflow_job_protocol::{EgressScope, LlmTier};
 
     #[test]
     fn only_network_database_trusted_get_sockets_at_tier2() {
@@ -614,7 +627,10 @@ mod socket_grant_tests {
             CapabilityWorld::Database,
             CapabilityWorld::Trusted,
         ] {
-            assert!(socket_grant(&cap, LlmTier::Tier2), "{cap:?} should grant");
+            assert!(
+                socket_grant(&cap, LlmTier::Tier2, None),
+                "{cap:?} should grant"
+            );
         }
         // Every other world — including Http, the one the pipeline path
         // used to over-grant — must NOT get raw sockets.
@@ -629,7 +645,10 @@ mod socket_grant_tests {
             CapabilityWorld::Governance,
             CapabilityWorld::Unknown,
         ] {
-            assert!(!socket_grant(&cap, LlmTier::Tier2), "{cap:?} must deny");
+            assert!(
+                !socket_grant(&cap, LlmTier::Tier2, None),
+                "{cap:?} must deny"
+            );
         }
     }
 
@@ -641,9 +660,41 @@ mod socket_grant_tests {
             CapabilityWorld::Trusted,
         ] {
             assert!(
-                !socket_grant(&cap, LlmTier::Tier1),
+                !socket_grant(&cap, LlmTier::Tier1, None),
                 "Tier-1 must deny raw sockets even for {cap:?}"
             );
+            // An explicit `Public` override does not re-open raw sockets for
+            // a Tier-1 actor: its egress goes through the allowlisted host-fn
+            // path, never raw TCP.
+            assert!(
+                !socket_grant(&cap, LlmTier::Tier1, Some(EgressScope::Public)),
+                "Tier-1 + egress_scope=public must still deny raw sockets for {cap:?}"
+            );
+        }
+    }
+
+    /// The 2026-09 defect: a Tier-2 actor pinned to `egress_scope = local`
+    /// was granted raw sockets, and the socket SSRF check only classifies
+    /// PRIVATE addresses — so the actor could open TCP to any public IP.
+    #[test]
+    fn tier2_local_egress_scope_never_gets_sockets() {
+        for cap in [
+            CapabilityWorld::Network,
+            CapabilityWorld::Database,
+            CapabilityWorld::Trusted,
+        ] {
+            assert!(
+                !socket_grant(&cap, LlmTier::Tier2, Some(EgressScope::Local)),
+                "Tier-2 + egress_scope=local must deny raw sockets for {cap:?}"
+            );
+            // Control: the same actor with the default (public) scope keeps
+            // the grant, so the test above is not passing vacuously.
+            assert!(socket_grant(
+                &cap,
+                LlmTier::Tier2,
+                Some(EgressScope::Public)
+            ));
+            assert!(socket_grant(&cap, LlmTier::Tier2, None));
         }
     }
 }
@@ -3917,7 +3968,7 @@ impl TalosRuntime {
         // worlds; operators who need host-level egress confinement for such a module
         // must run it Tier-1 (raw sockets denied, forcing traffic through the
         // host-fn allowlist) or not grant it a socket-capable world.
-        let allow_wasi_network = socket_grant(&cap, max_llm_tier);
+        let allow_wasi_network = socket_grant(&cap, max_llm_tier, egress_scope);
 
         // Select the correct linker + cache for this tier.
         let (linker, cache) = self.select_tier(&cap)?;
@@ -4494,7 +4545,8 @@ impl TalosRuntime {
         // allow-wasi-network-no-tier: run_sandbox / test_module path — operator-invoked,
         // actor-less, runs Tier2-default (no max_llm_tier param). Not a tier-1 actor
         // execution path; raw sockets are still SSRF-gated by socket_addr_check.
-        let allow_wasi_network = socket_grant(&cap, talos_workflow_job_protocol::LlmTier::Tier2);
+        let allow_wasi_network =
+            socket_grant(&cap, talos_workflow_job_protocol::LlmTier::Tier2, None);
         let (linker, cache) = self.select_tier(&cap)?;
 
         let mut context = TalosContext::new(
@@ -4785,7 +4837,7 @@ impl TalosRuntime {
             // `Agent`/… pipeline steps that the single-node path denies —
             // letting a Tier-2 module bypass its `allowed_hosts` confinement by
             // running as a pipeline step. Do not re-inline the predicate here.
-            let allow_wasi_network = socket_grant(&cap, max_llm_tier);
+            let allow_wasi_network = socket_grant(&cap, max_llm_tier, egress_scope);
             let (linker, cache) = self.select_tier(&cap)?;
 
             // Get or compile InstancePre.

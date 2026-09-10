@@ -288,10 +288,21 @@ pub(crate) const LLM_STREAM_CONNECT_TIMEOUT_SECS: u64 = 30;
 /// events ~every 15 s as keep-alive, OpenAI streams chunks
 /// continuously during generation. 60 s is generous headroom that
 /// still catches a genuinely-stuck stream within one node timeout
-/// window. The general-purpose SSE path (`wit_http_stream`) does NOT
-/// get this cap — it serves push-notification use cases that
-/// legitimately stay quiet for hours.
+/// window. The general-purpose SSE path (`wit_http_stream`) has its own,
+/// much longer, default — see `SSE_STREAM_IDLE_TIMEOUT_SECS`.
 pub(crate) const LLM_STREAM_IDLE_TIMEOUT_SECS: u64 = 60;
+/// Idle-between-bytes window for a `wit_http_stream` SSE reader, in
+/// seconds; env override `TALOS_SSE_IDLE_TIMEOUT_SECS` (`=0`-safe, falls
+/// to this default). Sibling of `LLM_STREAM_IDLE_TIMEOUT_SECS`, but 15×
+/// longer: general SSE serves push-notification shapes that legitimately
+/// go quiet, and well-behaved servers emit a `:` keep-alive comment every
+/// 15–30 s. Until 2026-09 this path had NO idle bound at all — the reader's
+/// only exits were upstream close, cancellation and a byte cap — so a
+/// silent-but-open upstream held the task and its connection for as long as
+/// it liked. The reader task is now also ABORTED when the execution's
+/// `StreamRegistry` drops, so this window is the backstop for a job that is
+/// still running, not the mechanism that ends an orphan.
+pub(crate) const SSE_STREAM_IDLE_TIMEOUT_SECS: u64 = 900;
 /// Maximum events per execution for the events interface.
 pub(crate) const MAX_EVENTS_PER_EXECUTION: u64 = 100;
 

@@ -381,6 +381,10 @@ pub struct TalosContext {
     /// host denials can't consume the guest's log budget.
     pub(crate) host_diag_count: AtomicU64,
 
+    /// Policy denials appended to the audit ledger (and replicated over NATS)
+    /// this execution. See [`Self::DENIAL_LEDGER_CAP`].
+    pub(crate) denial_ledger_count: AtomicU64,
+
     /// The [`crate::reason_class`] token of the most recent host-side HTTP
     /// OUTCOME in this execution, or `None` if the most recent outcome was a
     /// success (or there has been none).
@@ -713,6 +717,9 @@ pub(crate) enum SseStreamEnd {
     EventBytesCap,
     /// The execution was cancelled while the stream was open.
     Cancelled,
+    /// No bytes arrived within `TALOS_SSE_IDLE_TIMEOUT_SECS`
+    /// (`SSE_STREAM_IDLE_TIMEOUT_SECS` default).
+    IdleTimeout,
 }
 
 impl SseStreamEnd {
@@ -741,6 +748,13 @@ impl SseStreamEnd {
             Self::Cancelled => (
                 "sse-stream-cancelled",
                 "the SSE stream was closed because the execution was cancelled.",
+            ),
+            Self::IdleTimeout => (
+                "sse-stream-idle-timeout",
+                "the SSE stream was closed because the endpoint sent nothing for longer \
+                 than the idle window (TALOS_SSE_IDLE_TIMEOUT_SECS). Events already \
+                 delivered are complete; ask the endpoint for keep-alive comments or \
+                 raise the window.",
             ),
         }
     }
@@ -776,6 +790,14 @@ pub struct StreamRegistry {
     /// Active HTTP SSE streams indexed by stream ID. Each holds a
     /// receiver for parsed SSE events (`None` = stream ended).
     pub(crate) sse: std::sync::Mutex<HashMap<String, tokio::sync::mpsc::Receiver<SseChannelItem>>>,
+    /// The spawned SSE reader task behind each entry of `sse`, keyed by the
+    /// same stream id. Held so the task can be ABORTED — on `close`, and on
+    /// registry drop (= execution end). Until 2026-09 the handle was
+    /// discarded: nothing set `cancelled` on a NORMAL completion, so a reader
+    /// blocked on a quiet upstream outlived its job for as long as the
+    /// upstream kept the connection open, holding a worker connection slot
+    /// and a tokio task with no owner.
+    pub(crate) sse_tasks: std::sync::Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
 }
 
 impl StreamRegistry {
@@ -783,6 +805,45 @@ impl StreamRegistry {
         Self {
             llm: std::sync::Mutex::new(HashMap::new()),
             sse: std::sync::Mutex::new(HashMap::new()),
+            sse_tasks: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Record the reader task for `stream_id`.
+    pub(crate) fn register_sse_task(&self, stream_id: &str, handle: tokio::task::JoinHandle<()>) {
+        if let Ok(mut tasks) = self.sse_tasks.lock() {
+            tasks.insert(stream_id.to_string(), handle);
+        }
+    }
+
+    /// Abort and forget the reader task for `stream_id` (no-op if it already
+    /// finished — aborting a completed task is harmless).
+    pub(crate) fn abort_sse_task(&self, stream_id: &str) {
+        if let Ok(mut tasks) = self.sse_tasks.lock() {
+            if let Some(h) = tasks.remove(stream_id) {
+                h.abort();
+            }
+        }
+    }
+
+    /// Number of reader tasks currently held (test/introspection).
+    #[cfg(test)]
+    pub(crate) fn sse_task_count(&self) -> usize {
+        self.sse_tasks.lock().map(|t| t.len()).unwrap_or(0)
+    }
+}
+
+impl Drop for StreamRegistry {
+    /// The execution is over (the `Store` owning this `TalosContext` is being
+    /// dropped): every SSE reader still running is aborted so no task outlives
+    /// its job. `is_poisoned`-safe — a poisoned mutex still yields its data.
+    fn drop(&mut self) {
+        let tasks = match self.sse_tasks.lock() {
+            Ok(t) => t,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for (_, h) in tasks.iter() {
+            h.abort();
         }
     }
 }
@@ -822,6 +883,13 @@ fn build_per_execution_http_client(
         .user_agent("Talos-Worker/1.0")
         .connect_timeout(std::time::Duration::from_secs(5))
         .redirect(reqwest::redirect::Policy::none())
+        // No system-proxy detection. reqwest honours `HTTP(S)_PROXY` /
+        // `ALL_PROXY` by default, and a proxied request is connected BY THE
+        // PROXY — the `SsrfFilteringResolver` below never sees the target's
+        // address, so with a proxy env var set on the worker every SSRF /
+        // local-egress decision was bypassed. Explicit, so a future env
+        // change on the pod cannot switch the resolver off.
+        .no_proxy()
         .pool_max_idle_per_host(10)
         .dns_resolver(std::sync::Arc::new(
             crate::ssrf_resolver::SsrfFilteringResolver::for_allowed_hosts(
@@ -1184,6 +1252,10 @@ impl TalosContext {
         // `inherit_network()` lets the guest use std::net::TcpStream et al.
         // The Talos `allowed_hosts` list still governs the HTTP host function;
         // raw TCP is gated here at the WasiCtx level.
+        // Computed HERE (before the socket check closure) and reused for the
+        // reqwest resolver below, so the two egress surfaces are built from
+        // ONE answer and cannot disagree about the actor's posture.
+        let local_egress_only = resolve_local_egress_only(egress_scope, max_llm_tier);
         if allow_wasi_network {
             builder.inherit_network();
             builder.allow_ip_name_lookup(true);
@@ -1197,7 +1269,7 @@ impl TalosContext {
             // raw WASI sockets bypass it entirely because they resolve directly to IPs.
             // To ensure the WASM sandbox cannot be used to scan internal network infrastructure,
             // we actively block connections to private, loopback, and link-local IP addresses.
-            builder.socket_addr_check(|addr, _use| {
+            builder.socket_addr_check(move |addr, _use| {
                 Box::pin(async move {
                     // Route raw WASI sockets through the SAME shared SSRF
                     // classifier the WIT-http literal-IP gate and the controller
@@ -1220,17 +1292,25 @@ impl TalosContext {
                     //     as public (see talos_http_utils::ssrf). Aligning removes
                     //     the lone divergence.
                     let ip = addr.ip();
-                    if let Some(policy) = talos_ssrf_classify::classify_private_ip(ip) {
-                        tracing::warn!(
-                            %ip,
-                            policy,
-                            "SECURITY: blocked WASI socket connection to a non-public IP"
-                        );
-                        return false; // deny
+                    match socket_addr_permitted(ip, local_egress_only) {
+                        SocketAddrVerdict::Permit => true,
+                        SocketAddrVerdict::DenyPrivate(policy) => {
+                            tracing::warn!(
+                                %ip,
+                                policy,
+                                "SECURITY: blocked WASI socket connection to a non-public IP"
+                            );
+                            false
+                        }
+                        SocketAddrVerdict::DenyPublicLocalEgressOnly => {
+                            tracing::warn!(
+                                %ip,
+                                "SECURITY: blocked WASI socket connection to a PUBLIC IP — \
+                                 this actor is local-egress-only (egress_scope=local / tier-1)"
+                            );
+                            false
+                        }
                     }
-                    // Public destination — allowed (the http host fn's
-                    // `allowed_hosts` list still governs `talos:core/http`).
-                    true
                 })
             });
         }
@@ -1272,7 +1352,6 @@ impl TalosContext {
         // `egress_scope = Public` — reaching declared `allowed_hosts` like
         // Gmail while its LLM stays on-host. Fail-closed: an unset scope on a
         // Tier1 actor stays air-gapped exactly as before (byte-identical).
-        let local_egress_only = resolve_local_egress_only(egress_scope, max_llm_tier);
         let http_client = build_per_execution_http_client(&allowed_hosts, local_egress_only);
 
         Ok(Self {
@@ -1328,6 +1407,7 @@ impl TalosContext {
             fs_bytes_written: AtomicU64::new(0),
             log_message_count: AtomicU64::new(0),
             host_diag_count: AtomicU64::new(0),
+            denial_ledger_count: AtomicU64::new(0),
             last_network_reason: Arc::new(std::sync::Mutex::new(None)),
             event_emit_count: AtomicU64::new(0),
             streams: StreamRegistry::new(),
@@ -1616,6 +1696,17 @@ impl TalosContext {
     /// denial count while keeping worst-case volume trivial.
     pub(crate) const HOST_DIAG_CAP: u64 = 100;
 
+    /// Cap on policy-denial AUDIT events per execution. Each denial appends a
+    /// hash-chained ledger row and spawns a NATS publish; the guest-visible
+    /// diagnostic was capped at [`Self::HOST_DIAG_CAP`] but the ledger/publish
+    /// beneath it was NOT — a module looping a denied call was bounded only by
+    /// its own fuel, minting one spawned task and one WORM row per iteration.
+    /// At the cap ONE more event (`wasi:capability_denied_suppressed`) is
+    /// appended saying so, and every later denial in this execution is
+    /// refused-but-unrecorded. 200 is twice the diagnostic cap: far above any
+    /// legitimate run's denial count, and a bounded worst case for the ledger.
+    pub(crate) const DENIAL_LEDGER_CAP: u64 = 200;
+
     /// Publish a sanitized host-side diagnostic into the per-execution
     /// log stream — the same `wasm.log.{execution_id}` channel guest
     /// `logging::log` uses, marked `source: "host"` — so it lands in
@@ -1826,18 +1917,53 @@ impl TalosContext {
             return;
         };
 
-        let payload = serde_json::json!({
-            "capability": capability,
-            "policy": policy,
-            "target": target,
-            "actor_id": self.actor_id.map(|u| u.to_string()),
-            "module_id": self.module_id.as_deref(),
-        })
-        .to_string();
+        // Bound the ledger + publish fan-out (see `DENIAL_LEDGER_CAP`). The
+        // DENY itself is unconditional and already happened at the call site;
+        // only the RECORDING is capped. At exactly the cap one suppression
+        // event is appended so the ledger says "more happened than is here"
+        // rather than ending at a round number.
+        let n = self
+            .denial_ledger_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (action, payload) = if n < Self::DENIAL_LEDGER_CAP {
+            (
+                "wasi:capability_denied",
+                serde_json::json!({
+                    "capability": capability,
+                    "policy": policy,
+                    "target": target,
+                    "actor_id": self.actor_id.map(|u| u.to_string()),
+                    "module_id": self.module_id.as_deref(),
+                })
+                .to_string(),
+            )
+        } else if n == Self::DENIAL_LEDGER_CAP {
+            tracing::warn!(
+                module_id = ?self.module_id,
+                cap = Self::DENIAL_LEDGER_CAP,
+                capability,
+                policy,
+                "policy-denial audit cap reached — further denials in this execution are \
+                 refused but not individually recorded"
+            );
+            (
+                "wasi:capability_denied_suppressed",
+                serde_json::json!({
+                    "suppressed_after": Self::DENIAL_LEDGER_CAP,
+                    "last_capability": capability,
+                    "last_policy": policy,
+                    "actor_id": self.actor_id.map(|u| u.to_string()),
+                    "module_id": self.module_id.as_deref(),
+                })
+                .to_string(),
+            )
+        } else {
+            return;
+        };
 
         let event = {
             let mut ledger = ledger_mutex.lock().await;
-            ledger.append("worker", "wasi:capability_denied", &payload)
+            ledger.append("worker", action, &payload)
         };
 
         if let Some(n) = &self.nats_client {
@@ -2277,7 +2403,99 @@ mod fs_preopen_policy_tests {
 /// LLM-provider deny is NOT decided here — it stays keyed to `max_llm_tier` in
 /// `tier1_egress_deny_reason`, so a `Tier1 + Public` actor reaches public hosts
 /// like Gmail but STILL cannot reach an external LLM provider.
-fn resolve_local_egress_only(
+/// The raw `wasi:sockets` destination verdict — the socket-path twin of the
+/// `SsrfFilteringResolver`'s address filter, so both egress surfaces answer
+/// from one rule: a PRIVATE address is always denied (SSRF), and under
+/// `local_egress_only` a PUBLIC address is denied too. Net effect for a
+/// local-egress-only actor: raw sockets reach nothing — which is also what
+/// `runtime::socket_grant` now decides one layer up; this is the belt to that
+/// suspender for any store that reaches the check with the grant on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SocketAddrVerdict {
+    Permit,
+    /// Private / loopback / link-local / CGNAT / transition-form — the policy
+    /// token names which range (`talos_ssrf_classify::classify_private_ip`).
+    DenyPrivate(&'static str),
+    /// Globally-routable, but the actor is local-egress-only.
+    DenyPublicLocalEgressOnly,
+}
+
+pub(crate) fn socket_addr_permitted(
+    ip: std::net::IpAddr,
+    local_egress_only: bool,
+) -> SocketAddrVerdict {
+    if let Some(policy) = talos_ssrf_classify::classify_private_ip(ip) {
+        return SocketAddrVerdict::DenyPrivate(policy);
+    }
+    if local_egress_only {
+        return SocketAddrVerdict::DenyPublicLocalEgressOnly;
+    }
+    SocketAddrVerdict::Permit
+}
+
+#[cfg(test)]
+mod socket_addr_verdict_tests {
+    use super::{socket_addr_permitted, SocketAddrVerdict};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn public_address_is_denied_only_under_local_egress_only() {
+        let public = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        assert_eq!(
+            socket_addr_permitted(public, false),
+            SocketAddrVerdict::Permit,
+            "control: a public IP is reachable for a public-egress actor"
+        );
+        assert_eq!(
+            socket_addr_permitted(public, true),
+            SocketAddrVerdict::DenyPublicLocalEgressOnly,
+            "the defect: a local-egress-only actor could open raw TCP to a public IP"
+        );
+        let public6 = IpAddr::V6(
+            "2606:2800:220:1:248:1893:25c8:1946"
+                .parse::<Ipv6Addr>()
+                .unwrap(),
+        );
+        assert_eq!(
+            socket_addr_permitted(public6, true),
+            SocketAddrVerdict::DenyPublicLocalEgressOnly
+        );
+    }
+
+    #[test]
+    fn private_address_is_denied_under_both_postures() {
+        for ip in [
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)),
+            IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254)),
+            IpAddr::V4(Ipv4Addr::new(100, 64, 0, 1)),
+        ] {
+            assert!(
+                matches!(
+                    socket_addr_permitted(ip, false),
+                    SocketAddrVerdict::DenyPrivate(_)
+                ),
+                "{ip} must be SSRF-denied for a public-egress actor"
+            );
+            assert!(
+                matches!(
+                    socket_addr_permitted(ip, true),
+                    SocketAddrVerdict::DenyPrivate(_)
+                ),
+                "{ip} must be SSRF-denied for a local-egress-only actor too"
+            );
+        }
+    }
+}
+
+pub(crate) fn resolve_local_egress_only(
+    egress_scope: Option<talos_workflow_job_protocol::EgressScope>,
+    max_llm_tier: talos_workflow_job_protocol::LlmTier,
+) -> bool {
+    resolve_local_egress_only_impl(egress_scope, max_llm_tier)
+}
+
+fn resolve_local_egress_only_impl(
     egress_scope: Option<talos_workflow_job_protocol::EgressScope>,
     max_llm_tier: talos_workflow_job_protocol::LlmTier,
 ) -> bool {
@@ -2742,5 +2960,150 @@ mod llm_usage_acc_tests {
             drain_llm_usage_entries(&a).len(),
             talos_workflow_job_protocol::MAX_LLM_USAGE_ENTRIES
         );
+    }
+}
+
+#[cfg(test)]
+mod denial_ledger_cap_tests {
+    //! E4 (2026-09): every policy denial appended a hash-chained ledger row and
+    //! spawned a NATS publish with no bound — the guest-visible diagnostic was
+    //! capped at `HOST_DIAG_CAP`, the recording beneath it was not.
+    use super::*;
+    use crate::wit_inspector::CapabilityWorld;
+    use talos_workflow_job_protocol::LlmTier;
+
+    fn ctx() -> TalosContext {
+        TalosContext::new(
+            CapabilityWorld::Http,
+            vec![],
+            vec![],
+            128,
+            HashMap::new(),
+            None,
+            None,
+            false,
+            None,
+            Arc::new(crate::expose_fallback::ExposeFallback::new()),
+            LlmTier::Tier2,
+            None,
+        )
+        .expect("context builds")
+    }
+
+    #[tokio::test]
+    async fn denials_past_the_cap_collapse_into_one_suppression_event() {
+        let mut c = ctx();
+        let ledger = Arc::new(tokio::sync::Mutex::new(crate::audit::ExecutionLedger::new(
+            "wf", "ex",
+        )));
+        c.set_audit_ledger(ledger.clone());
+        let n = TalosContext::DENIAL_LEDGER_CAP + 50;
+        for i in 0..n {
+            c.record_capability_denied("http-fetch", "allowed-hosts", &format!("h{i}"))
+                .await;
+        }
+        // CAP individual rows + exactly ONE `wasi:capability_denied_suppressed`.
+        assert_eq!(
+            ledger.lock().await.current_sequence,
+            TalosContext::DENIAL_LEDGER_CAP + 1,
+            "the ledger must hold the cap plus one suppression marker, no more"
+        );
+        assert_eq!(
+            c.denial_ledger_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            n
+        );
+    }
+
+    #[tokio::test]
+    async fn under_the_cap_every_denial_is_recorded() {
+        let mut c = ctx();
+        let ledger = Arc::new(tokio::sync::Mutex::new(crate::audit::ExecutionLedger::new(
+            "wf", "ex",
+        )));
+        c.set_audit_ledger(ledger.clone());
+        for _ in 0..10 {
+            c.record_capability_denied("webhook", "allowed-hosts", "h")
+                .await;
+        }
+        assert_eq!(ledger.lock().await.current_sequence, 10);
+    }
+}
+
+#[cfg(test)]
+mod stream_registry_abort_tests {
+    //! E5 (2026-09): the SSE reader's `JoinHandle` was discarded, so a reader
+    //! blocked on a quiet upstream outlived its execution. The registry now
+    //! owns the handles and aborts them on `close` and on drop.
+    use super::StreamRegistry;
+    use std::time::Duration;
+
+    /// Fires its oneshot when dropped — i.e. when the task is aborted.
+    struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    fn forever_task() -> (
+        tokio::task::JoinHandle<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        // Built OUTSIDE the async block and moved in, so the signal fires when
+        // the FUTURE is dropped — including an abort that lands before the
+        // task was ever polled (a first draft built it inside, and an abort
+        // that early dropped the captured `tx` unsent: `RecvError`, i.e. the
+        // abort working and the test misreading it).
+        let guard = DropSignal(Some(tx));
+        let h = tokio::spawn(async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
+        (h, rx)
+    }
+
+    #[tokio::test]
+    async fn dropping_the_registry_aborts_every_reader() {
+        let reg = StreamRegistry::new();
+        let (h1, rx1) = forever_task();
+        let (h2, rx2) = forever_task();
+        reg.register_sse_task("s1", h1);
+        reg.register_sse_task("s2", h2);
+        assert_eq!(reg.sse_task_count(), 2);
+        drop(reg);
+        for (name, rx) in [("s1", rx1), ("s2", rx2)] {
+            tokio::time::timeout(Duration::from_secs(2), rx)
+                .await
+                .unwrap_or_else(|_| panic!("{name}: reader still running 2 s after registry drop"))
+                .expect("guard dropped");
+        }
+    }
+
+    #[tokio::test]
+    async fn abort_sse_task_stops_one_reader_and_leaves_the_rest() {
+        let reg = StreamRegistry::new();
+        let (h1, rx1) = forever_task();
+        let (h2, mut rx2) = forever_task();
+        reg.register_sse_task("s1", h1);
+        reg.register_sse_task("s2", h2);
+        reg.abort_sse_task("s1");
+        tokio::time::timeout(Duration::from_secs(2), rx1)
+            .await
+            .expect("s1 aborted")
+            .expect("guard dropped");
+        tokio::task::yield_now().await;
+        assert!(rx2.try_recv().is_err(), "s2 must still be running");
+        assert_eq!(reg.sse_task_count(), 1);
+        // Aborting an unknown id is a no-op.
+        reg.abort_sse_task("nope");
+        drop(reg);
+        tokio::time::timeout(Duration::from_secs(2), rx2)
+            .await
+            .expect("s2 aborted on drop")
+            .expect("guard dropped");
     }
 }

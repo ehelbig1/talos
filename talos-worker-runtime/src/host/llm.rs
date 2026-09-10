@@ -46,6 +46,10 @@ pub(crate) fn local_llm_http_client() -> &'static reqwest::Client {
             .user_agent("Talos-Worker/1.0")
             .connect_timeout(std::time::Duration::from_secs(5))
             .redirect(reqwest::redirect::Policy::none())
+            // The whole point of this client is that it talks to the LOCAL
+            // provider; an `HTTPS_PROXY` on the pod would route the request
+            // — prompt included — off-host through the proxy.
+            .no_proxy()
             .build()
             .expect("worker: failed to build local-LLM reqwest client")
     })

@@ -1131,10 +1131,12 @@ impl TalosContext {
                 Ok(resp) => {
                     let gql_status = resp.status().as_u16();
                     if let Ok(gql_parsed) = url::Url::parse(&url) {
+                        // Host + path LENGTH only — paths carry capability
+                        // tokens and presigned keys.
                         tracing::info!(
                             method = "POST",
                             host = %gql_parsed.host_str().unwrap_or("unknown"),
-                            path = %gql_parsed.path(),
+                            path_len = gql_parsed.path().len(),
                             status = gql_status,
                             "HTTP audit"
                         );

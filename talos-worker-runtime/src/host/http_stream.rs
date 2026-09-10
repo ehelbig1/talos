@@ -575,8 +575,13 @@ impl wit_http_stream::Host for TalosContext {
         // bytes — leaving the connection / spawned task alive past
         // execution-end and consuming a worker connection slot.
         let cancelled = self.cancelled.clone();
+        let idle_timeout =
+            std::time::Duration::from_secs(talos_config::positive_env_or_default::<u64>(
+                "TALOS_SSE_IDLE_TIMEOUT_SECS",
+                SSE_STREAM_IDLE_TIMEOUT_SECS,
+            ));
 
-        tokio::spawn(async move {
+        let reader = tokio::spawn(async move {
             use crate::context::{SseChannelItem, SseStreamEnd};
 
             // Why an abnormal ending is ANNOUNCED rather than just logged: a
@@ -622,6 +627,7 @@ impl wit_http_stream::Host for TalosContext {
             let mut data_lines: Vec<String> = Vec::new();
             let mut data_bytes: usize = 0;
             let mut event_id: Option<String> = None;
+            let mut last_byte_at = std::time::Instant::now();
 
             loop {
                 // Wasm-security review 2026-05-23 (M): bound the
@@ -647,9 +653,22 @@ impl wit_http_stream::Host for TalosContext {
                             announce(&tx, SseStreamEnd::Cancelled).await;
                             return;
                         }
+                        // Idle window (see `SSE_STREAM_IDLE_TIMEOUT_SECS`):
+                        // checked on the same tick, so a silent-but-open
+                        // upstream cannot hold this task past the window.
+                        if last_byte_at.elapsed() >= idle_timeout {
+                            tracing::warn!(
+                                url = %url_owned,
+                                idle_secs = idle_timeout.as_secs(),
+                                "SSE stream idle timeout — no bytes received within window; closing"
+                            );
+                            announce(&tx, SseStreamEnd::IdleTimeout).await;
+                            return;
+                        }
                         continue;
                     }
                 };
+                last_byte_at = std::time::Instant::now();
                 let chunk_result = match chunk_result {
                     // Clean upstream close: the ONLY ending that announces
                     // nothing, because it is the only one where an empty tail
@@ -728,6 +747,9 @@ impl wit_http_stream::Host for TalosContext {
                 }
             }
         });
+        // Keep the handle so `close()` and registry drop (execution end) can
+        // ABORT the reader — see `StreamRegistry::sse_tasks`.
+        self.streams.register_sse_task(&stream_id, reader);
 
         Ok(stream_id)
     }
@@ -748,6 +770,10 @@ impl wit_http_stream::Host for TalosContext {
             if let Ok(mut streams) = self.streams.sse.lock() {
                 streams.insert(stream_id, rx);
             }
+        } else {
+            // Ended: the reader has returned (or is about to); drop its
+            // handle so the registry does not hold finished tasks.
+            self.streams.abort_sse_task(&stream_id);
         }
 
         match item {
@@ -776,9 +802,12 @@ impl wit_http_stream::Host for TalosContext {
 
     async fn close(&mut self, stream_id: String) {
         // Removing the receiver causes the spawned task's tx.send() to fail,
-        // which makes it exit cleanly.
+        // which makes it exit cleanly — but only once it has something to
+        // send. A reader blocked on a quiet upstream never reaches that
+        // `send`, so the task is also ABORTED outright.
         if let Ok(mut streams) = self.streams.sse.lock() {
             streams.remove(&stream_id);
         }
+        self.streams.abort_sse_task(&stream_id);
     }
 }
