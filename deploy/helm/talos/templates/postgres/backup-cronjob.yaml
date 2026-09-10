@@ -78,8 +78,19 @@ spec:
                   value: "5432"
                 - name: RETENTION_COUNT
                   value: {{ .Values.postgres.backup.retentionCount | default 7 | quote }}
+              # /bin/bash, NOT /bin/sh. The pgvector image is Debian-based, so
+              # /bin/sh is dash, and dash has no `pipefail`: `set -euo pipefail`
+              # dies with "set: Illegal option -o pipefail" (exit 2) before the
+              # first real line runs. Reproduced 2026-09-10 — every scheduled
+              # backup Job of this CronJob had failed at line one, and nothing
+              # alerted (see TalosPostgresBackupJobFailed / ...Stale in
+              # files/alerts.yaml, added with this fix). bash ships in the image
+              # (the postgres entrypoint itself is a bash script), and pipefail
+              # is load-bearing here: without it a failed `pg_dump` still leaves
+              # `gzip` exiting 0, so the Job would report SUCCESS over an empty
+              # or truncated dump.
               command:
-                - /bin/sh
+                - /bin/bash
                 - -c
                 - |
                   set -euo pipefail
@@ -96,7 +107,15 @@ spec:
                       --no-privileges \
                       --quote-all-identifiers \
                       | gzip -c > "${dump}"
-                  echo "[pg-dump] $(date -u): dump complete, size $(wc -c < "${dump}") bytes"
+                  # Belt to pipefail's braces: a dump that gzips to (almost)
+                  # nothing is not a backup. An empty gzip stream is 20 bytes.
+                  size="$(wc -c < "${dump}")"
+                  if [ "${size}" -lt 1024 ]; then
+                      echo "[pg-dump] $(date -u): ERROR dump is only ${size} bytes — refusing to count this as a backup" >&2
+                      rm -f "${dump}"
+                      exit 1
+                  fi
+                  echo "[pg-dump] $(date -u): dump complete, size ${size} bytes"
                   # Retention — keep the newest N files, delete the rest.
                   # `ls -1t` sorts newest-first; tail -n+$((N+1)) skips
                   # the first N and removes the rest.

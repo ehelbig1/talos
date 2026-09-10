@@ -49,7 +49,22 @@ Postgres (-14/-11) and Neo4j StatefulSets mount it.
 {{- $crt = index $existing.data "tls.crt" }}
 {{- $key = index $existing.data "tls.key" }}
 {{- else }}
-{{- $cert := genSelfSignedCert $dns nil (list $dns $cn (printf "%s-0.%s" $cn $dns)) (int $.Values.tls.inCluster.validityDays) }}
+{{- /* SANs: the ClusterIP Service FQDN, its short name, and pod-0 under it.
+        For NATS additionally every pod's name under the HEADLESS Service
+        (`<nats>-N.<nats>-headless.<ns>.svc.cluster.local`, as a wildcard plus
+        the headless FQDN) — that is what the cluster `routes = [...]` URLs
+        resolve to, and route TLS with `verify: true` (nats/configmap.yaml)
+        checks the peer's hostname against it. Added 2026-09-10; a nats-tls
+        Secret minted before then lacks the wildcard and is REUSED by the
+        lookup above, so route TLS on an existing cluster needs the Secret
+        deleted once and re-issued on the next upgrade. */ -}}
+{{- $sans := list $dns $cn (printf "%s-0.%s" $cn $dns) }}
+{{- if eq $svc "nats" }}
+{{- $headless := printf "%s.%s.svc.cluster.local" (include "talos.componentName" (list $ "nats-headless")) $.Release.Namespace }}
+{{- $sans = append $sans $headless }}
+{{- $sans = append $sans (printf "*.%s" $headless) }}
+{{- end }}
+{{- $cert := genSelfSignedCert $dns nil $sans (int $.Values.tls.inCluster.validityDays) }}
 {{- $crt = b64enc $cert.Cert }}
 {{- $key = b64enc $cert.Key }}
 {{- end }}

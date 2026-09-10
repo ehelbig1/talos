@@ -81,6 +81,25 @@ controller:
   service:
     type: ClusterIP
     port: 8000
+
+  # Postgres pool sizing — rendered as DB_MAX_CONNECTIONS (talos-db reads it;
+  # its code default is 30, which the chart never overrode until 2026-09-10).
+  # THE ARITHMETIC, because the in-cluster Postgres has a hard ceiling:
+  #   postgres.config.maxConnections (60)
+  #     ≥ controller replicas × maxConnections
+  #       + migrations Job (1) + postgres-backup pg_dump (1) + superuser
+  #         reserved (3, Postgres default) + interactive debugging.
+  # With the code default of 30 and `controller.replicaCount: 2` the two pods
+  # alone could hold 60 — the entire ceiling — and the HPA
+  # (`controller.autoscaling.maxReplicas: 6`) could ask for 180. At 20:
+  # 2 × 20 = 40 steady state, 6 × 20 = 120 at HPA max — STILL over 60, so an
+  # operator who scales the controller past 2 replicas on in-cluster Postgres
+  # must lower this or raise postgres.config.maxConnections (and its RAM
+  # budget: work_mem × connections). Managed Postgres (the default topology)
+  # has its own ceiling; size against that instead. The pool is also
+  # lazily-filled, so this is a cap, not a reservation.
+  database:
+    maxConnections: 20
     # Controller exposes /metrics on the same port.
     metricsPath: /metrics
 
@@ -148,7 +167,11 @@ controller:
   # and are mounted via secretKeyRef. Names must match what the Rust code
   # reads via std::env::var (see controller/src/).
   env:
-    RUST_LOG: "info,controller=debug,audit_ledger=info"
+    # `info`, not `controller=debug`: a production deployment logged every
+    # request at debug for months. Debug is a per-incident override
+    # (`--set controller.env.RUST_LOG=...`), not a default an operator
+    # inherits.
+    RUST_LOG: "info,audit_ledger=info"
     # Per-actor write ceiling — the CONTROLLER's half of a two-surface gate
     # (#750). Keep in lockstep with `worker.env.TALOS_WRITE_CEILING_ENFORCED`,
     # where the rationale and the corrected "worker-only" claim live. On the
@@ -181,6 +204,22 @@ controller:
     # ingress controller pods AND the frontend's nginx.
     # Override per-cluster if your CNI uses different CIDRs (Calico,
     # Cilium, GKE, EKS).
+    #
+    # RISK, stated (2026-09-10): this default trusts the ENTIRE pod and
+    # Service CIDR. Every pod in the cluster — not just Traefik and the
+    # frontend nginx — can then set X-Forwarded-For and be believed, so a
+    # compromised or hostile pod can spoof its client IP past the per-IP
+    # rate limiter (`extract_client_ip` walks XFF right-to-left and stops
+    # at the first UNTRUSTED hop; if every hop is trusted it takes the
+    # leftmost, attacker-written value). On a single-tenant k3s box that
+    # is an acceptable trade for "the chart works with no cluster
+    # knowledge"; on a shared cluster it is not. Narrow it to the actual
+    # proxy hops: the ingress controller's pod CIDR slice or, better,
+    # give Traefik a static egress and list only that, plus the frontend
+    # Service's ClusterIP (`kubectl get svc <release>-frontend`). The
+    # chart cannot compute a narrower default without knowing the CNI
+    # and the ingress controller's placement, which is why the value is
+    # left as-is and the risk is written here instead of hidden.
     TRUSTED_PROXY_CIDRS: "10.42.0.0/16,10.43.0.0/16"
     # Upstream subject prefix for the workflow engine; Talos controller and
     # worker both use `talos.*` (see docker-compose.yml comment).
@@ -704,7 +743,8 @@ worker:
   tolerations: []
 
   env:
-    RUST_LOG: "info,worker=debug"
+    # `info`, not `worker=debug` — same reasoning as controller.env.RUST_LOG.
+    RUST_LOG: "info"
     RUST_ENV: "production"
     # AWS_DEFAULT_REGION + AWS_S3_FORCE_PATH_STYLE are read transparently
     # by the AWS SDK when modules use the object_storage WIT capability
@@ -783,16 +823,27 @@ worker:
   # tampered artifacts are rejected when `required: true`.
   #
   # Modes (TALOS_SIGSTORE_REQUIRED env value):
-  #   "" / "false"  → Disabled — don't verify (dev / first-deploy).
+  #   "disabled"    → Don't verify (dev / first-deploy). An EXPLICIT choice.
   #   "audit"       → Verify, log on failure, continue. Migration window.
-  #   "true"        → Verify, refuse on failure. Production.
+  #   "required"    → Verify, refuse on failure. Production. ("true" also works.)
   #
-  # `identityRegexp` MUST be set when not Disabled. It's matched against
+  # "" is NOT a mode. The worker REFUSES TO BOOT under RUST_ENV=production
+  # (the chart default) when TALOS_SIGSTORE_REQUIRED is unset or empty —
+  # `enforce_production_sigstore_policy_explicit` demands an explicit
+  # value so a forgotten env var cannot silently mean "unverified". Until
+  # 2026-09-10 this chart rendered `required: ""` as NO env var at all
+  # (`with` skips empty), so a default install's worker CrashLooped with
+  # "CRITICAL: TALOS_SIGSTORE_REQUIRED must be set explicitly in
+  # production" while this comment called "" a valid mode. The deployment
+  # now renders an empty value as the literal `disabled`, which is what an
+  # empty value always MEANT here — stated to the worker instead of implied.
+  #
+  # `identityRegexp` MUST be set when not disabled. It's matched against
   # the SAN URI of the Fulcio cert; pin to the workflow URL pattern so
   # only artifacts signed by THIS repo's publish workflow are accepted.
   # Default `oidcIssuer` is the GitHub Actions OIDC endpoint.
   sigstore:
-    required: ""              # "" | "audit" | "true"
+    required: ""              # "" (→ disabled) | "disabled" | "audit" | "required"
     identityRegexp: ""        # e.g. "^https://github\\.com/OWNER/talos/\\.github/workflows/template-publish\\.yml@"
     oidcIssuer: "https://token.actions.githubusercontent.com"
 
@@ -1054,6 +1105,14 @@ redis:
 # ----------------------------------------------------------------------------
 nats:
   enabled: true
+  # 3 replicas = a CLUSTER, and a cluster has a route port (6222) as well as
+  # the client port. The route port carries every subject's traffic between
+  # peers, so it gets its own credentials (bootstrapSecret.data
+  # NATS_CLUSTER_USER / NATS_CLUSTER_PASSWORD — REQUIRED whenever
+  # replicaCount > 1) and, under tls.inCluster, its own mutual-TLS block.
+  # See templates/nats/configmap.yaml `cluster {}`. Until 2026-09-10 the
+  # route port had neither, and the NetworkPolicy let controller + worker
+  # pods reach it.
   replicaCount: 3
 
   image:
@@ -1310,21 +1369,30 @@ minio:
 # resource request). Add when Phase 2 adds GPU nodes.
 # ----------------------------------------------------------------------------
 ollama:
+  # THE CHART SHIPS NO OLLAMA WORKLOAD. There is no templates/ollama/ and
+  # there never has been; the `image` / `persistence` / `resources` knobs
+  # that used to sit here were read by NOTHING and are removed (2026-09-10).
+  #
+  # What `enabled: true` actually does: (a) points OLLAMA_URL on the
+  # controller and worker at `<release>-ollama.<ns>.svc.cluster.local:11434`,
+  # and (b) opens controller/worker NetworkPolicy egress to pods labelled
+  # `app.kubernetes.io/component: ollama`. That is correct ONLY if you run
+  # such a Service yourself. values-phase1.yaml shipped `enabled: true`
+  # against that phantom Service, so every tier-1 LLM call on a phase-1
+  # cluster failed DNS resolution while the chart looked configured.
+  #
+  # So: `enabled: true` now REFUSES TO RENDER unless `externalWorkload: true`
+  # is also set — your attestation that a Service by that name, with that
+  # label, exists in the release namespace (controller/deployment.yaml
+  # carries the `fail`). For an Ollama anywhere else (the node itself,
+  # another namespace, a GPU box), leave `enabled: false` and set OLLAMA_URL
+  # via controller.env + worker.env; NetworkPolicy egress to a non-pod
+  # target then needs networkPolicy.externalEgressCIDRs to cover it.
+  #
+  # no-render-toggle: structural check 5(b) flips every `enabled: false` on
+  # to render the gated blocks; this one gates a `fail`, which is the point.
   enabled: false
-  image:
-    repository: ollama/ollama
-    tag: "latest"
-    digest: "sha256:PLACEHOLDER_OLLAMA_DIGEST_REPLACE_ME"
-  persistence:
-    enabled: true
-    size: "50Gi"
-  resources:
-    requests:
-      cpu: "1"
-      memory: 2Gi
-    limits:
-      cpu: "4"
-      memory: 8Gi
+  externalWorkload: false
 
 # ----------------------------------------------------------------------------
 # Graph-RAG (Neo4j knowledge-graph triple extraction)
@@ -1573,6 +1641,17 @@ bootstrapSecret:
     # JWT signing (HS256 secret, or see JWT_PRIVATE_KEY/JWT_PUBLIC_KEY
     # for RS256 — set JWT_ALGORITHM accordingly in controller.extraEnv).
     JWT_SECRET: ""
+    # NATS ROUTE-port credentials (`cluster { authorization {} }` in
+    # templates/nats/configmap.yaml). REQUIRED whenever nats.replicaCount > 1
+    # — the StatefulSet mounts them as non-optional secretKeyRefs, so a
+    # Secret without them wedges the NATS pods in CreateContainerConfigError
+    # (loud, and the message names the key). Deliberately a DIFFERENT pair
+    # from NATS_USER/NATS_PASSWORD: a client credential leaked from a worker
+    # must not be replayable as a cluster peer. install.sh mints both and
+    # back-fills them into a pre-existing bootstrap Secret on re-run.
+    # Generate with: openssl rand -base64 32 | tr -d '+=/' | head -c 32
+    NATS_CLUSTER_USER: ""
+    NATS_CLUSTER_PASSWORD: ""
     # Worker ↔ controller NATS-RPC HMAC key
     # Generate with: openssl rand -hex 32
     WORKER_SHARED_KEY: ""
@@ -1693,7 +1772,10 @@ bootstrapSecret:
     # the handler returns 403 for every scrape (controller/main.rs
     # ::prometheus_metrics_handler). Configure your ServiceMonitor /
     # Prometheus client to add `Authorization: Bearer <token>`.
-    # Generate with: openssl rand -hex 32
+    # Generate with: openssl rand -hex 32. install.sh mints this beside
+    # METRICS_AUTH_TOKENS (2026-09-10 — until then it minted only the
+    # worker's token, so the controller answered 403 to every production
+    # scrape while the ServiceMonitor looked wired).
     PROMETHEUS_SCRAPE_TOKEN: ""
     # REGISTRY_PUBLISH_TOKEN — shared-secret bearer for
     # POST /api/registry/publish (operator-only OCI catalog publish).

@@ -23,9 +23,14 @@ on:
   workflow_dispatch:
     inputs:
       controller_image:
-        description: "Controller image to use as the template builder (default: ghcr.io/{owner}/talos-controller:latest)"
+        description: "Controller image to use as the template builder (default: ghcr.io/{owner}/talos-controller:latest). Resolved to a digest and cosign-verified against main-publish.yml's identity before it runs."
         required: false
         type: string
+      allow_unverified_builder:
+        description: "Skip cosign verification of the builder image. ONLY for a locally-published image signed with a personal identity (scripts/publish-images.sh); the run summary says so loudly."
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -38,6 +43,8 @@ env:
   # Concurrency group keyed by branch — back-to-back commits cancel any
   # in-flight run so we don't race on registry pushes.
   ORAS_VERSION: "1.2.0"
+  # sha256 of oras_1.2.0_linux_amd64.tar.gz from the release's checksums file.
+  ORAS_SHA256_LINUX_AMD64: "5b3f1cbb86d869eee68120b9b45b9be983f3738442f87ee5f06b00edd0bab336"
 
 concurrency:
   group: template-publish-${{ github.ref }}
@@ -62,10 +69,19 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install ORAS
+        # Pinned version AND checksum. `curl | tar` with no verification
+        # trusted whatever GitHub served for that URL at that moment — a
+        # release-asset swap or an in-path TLS proxy would have landed an
+        # arbitrary binary that then PUSHES every signed artifact. The
+        # sha256 is the `linux_amd64` line of the release's own
+        # oras_${ORAS_VERSION}_checksums.txt; bump both together.
         run: |
           set -euxo pipefail
-          curl -fsSL "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz" \
-            | sudo tar -xz -C /usr/local/bin oras
+          curl -fsSL -o /tmp/oras.tar.gz \
+            "https://github.com/oras-project/oras/releases/download/v${ORAS_VERSION}/oras_${ORAS_VERSION}_linux_amd64.tar.gz"
+          echo "${ORAS_SHA256_LINUX_AMD64}  /tmp/oras.tar.gz" | sha256sum --check --strict
+          sudo tar -xz -C /usr/local/bin -f /tmp/oras.tar.gz oras
+          rm -f /tmp/oras.tar.gz
           oras version
 
       - name: Install Cosign
@@ -76,16 +92,59 @@ jobs:
         with:
           cosign-release: "v2.4.1"
 
-      - name: Resolve controller builder image
+      - name: Resolve controller builder image to a digest
         id: builder
+        # The builder image COMPILES every template this job then signs, so it
+        # is the most trusted input in the pipeline. Until 2026-09-10 it was a
+        # MUTABLE tag (`:latest`) pulled and run with no verification: anyone
+        # who could push that tag could ship a compiler that plants whatever
+        # it likes in every "signed" WASM artifact — and the signature would
+        # be genuine, because this workflow's own identity signs the OUTPUT.
+        # Resolve the tag to the digest actually pulled, verify THAT digest,
+        # and run by digest so the verified bytes are the executed bytes
+        # (no tag re-point between verify and run).
         run: |
           set -euxo pipefail
           IMAGE="${{ inputs.controller_image }}"
           if [ -z "$IMAGE" ]; then
             IMAGE="${REGISTRY}/${{ github.repository_owner }}/talos-controller:latest"
           fi
-          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
-          echo "Using builder image: $IMAGE"
+          docker pull "$IMAGE"
+          DIGEST_REF="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE")"
+          if [ -z "$DIGEST_REF" ]; then
+            echo "::error::could not resolve $IMAGE to a repository digest"; exit 1
+          fi
+          echo "image=$DIGEST_REF" >> "$GITHUB_OUTPUT"
+          echo "Resolved builder image: $IMAGE -> $DIGEST_REF"
+
+      - name: Verify builder image signature (cosign keyless)
+        # Identity: THIS repository's main-publish.yml on refs/heads/main —
+        # the CI OIDC publish path (CLAUDE.md "Image publishing"), which is
+        # the only identity that should ever have signed talos-controller.
+        # Trailing `$` after the ref is load-bearing (an attacker cannot mint
+        # `refs/heads/main-evil`), and the issuer pin restricts to GitHub
+        # Actions tokens. A locally-published image (scripts/publish-images.sh)
+        # carries the operator's personal OAuth identity and will FAIL this —
+        # by design; pass allow_unverified_builder=true for that case and
+        # accept that the run says so in its summary.
+        if: ${{ !inputs.allow_unverified_builder }}
+        run: |
+          set -euxo pipefail
+          cosign verify \
+            --certificate-identity-regexp '^https://github\.com/${{ github.repository }}/\.github/workflows/main-publish\.yml@refs/heads/main$' \
+            --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+            "${{ steps.builder.outputs.image }}"
+          echo "builder image signature verified: ${{ steps.builder.outputs.image }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Record UNVERIFIED builder in the run summary
+        if: ${{ inputs.allow_unverified_builder }}
+        run: |
+          {
+            echo "## WARNING: builder image signature NOT verified"
+            echo ""
+            echo "allow_unverified_builder=true — templates in this run were compiled by"
+            echo "\`${{ steps.builder.outputs.image }}\` without cosign verification."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Compile templates via controller binary
         run: |
@@ -94,7 +153,8 @@ jobs:
           # Run the controller binary as a one-shot CLI. The binary's
           # `publish-templates` subcommand reuses the same CompilationService
           # the running server uses, so what CI builds == what production runs.
-          docker pull "${{ steps.builder.outputs.image }}"
+          # `steps.builder.outputs.image` is the DIGEST reference verified above
+          # (already pulled), never the tag.
           docker run --rm \
             -v "$GITHUB_WORKSPACE/module-templates:/app/module-templates:ro" \
             -v "$GITHUB_WORKSPACE/templates-out:/out" \

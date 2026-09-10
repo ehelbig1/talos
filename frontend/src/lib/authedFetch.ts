@@ -70,21 +70,41 @@ async function attemptTokenRefresh(): Promise<boolean> {
   return activeRefreshPromise;
 }
 
+// Seed the CSRF cookie by GET-ing /auth/csrf — the dedicated endpoint that
+// builds its Set-Cookie header by hand (see graphqlClient.seedCsrfCookie for
+// the full history). This helper used to GET /graphql, which is 405 in
+// production and sets no cookie, so the first REST call from a fresh session
+// went out with no X-CSRF-Token and failed CSRF — the GraphQL client had
+// already moved to /auth/csrf; this one had not.
 async function seedCsrfCookie(): Promise<void> {
   if (activeSeedPromise) return activeSeedPromise;
   activeSeedPromise = (async () => {
     try {
-      await fetch(`${API_URL}/graphql`, {
+      await fetch(`${API_URL}/auth/csrf`, {
         method: "GET",
         credentials: "include",
       });
     } catch {
-      // Best-effort
+      // Best-effort — if this fails the subsequent request surfaces a clear error.
     }
   })().finally(() => {
     activeSeedPromise = null;
   });
   return activeSeedPromise;
+}
+
+/**
+ * Make sure the CSRF cookie exists before a state-changing REST call.
+ * Exported so thin fetch helpers that keep their own response-handling
+ * semantics (e.g. the watch-channel panels, which read `body.success` off
+ * non-2xx ApiJson envelopes and so cannot use `authedFetch`'s throw-on-!ok
+ * contract) still seed through the ONE correct endpoint instead of
+ * re-deriving it.
+ */
+export async function ensureCsrfCookie(): Promise<void> {
+  if (!getCsrfToken()) {
+    await seedCsrfCookie();
+  }
 }
 
 /**
@@ -95,9 +115,7 @@ export async function authedFetch(
   options: RequestInit = {},
   isRetry = false,
 ): Promise<Response> {
-  if (!getCsrfToken()) {
-    await seedCsrfCookie();
-  }
+  await ensureCsrfCookie();
 
   const csrfToken = getCsrfToken();
   const headers: Record<string, string> = {

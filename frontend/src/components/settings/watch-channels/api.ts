@@ -7,12 +7,26 @@
  * ApiJson envelope shape.
  */
 
+import { ensureCsrfCookie } from "@/lib/authedFetch";
 import { getCsrfToken } from "@/lib/csrf";
 
-export function authedFetch(
+/**
+ * CSRF-aware fetch for the watch-channel panels.
+ *
+ * Deliberately NOT a re-export of `@/lib/authedFetch`: that helper throws on
+ * any non-2xx response, while every caller here reads the ApiJson envelope
+ * (`{ success, data, error }`) off the body — including 4xx bodies — and
+ * renders `body.error` itself. What it DOES share is the CSRF seed: before
+ * this change a fresh session's first watch-channel POST went out with no
+ * X-CSRF-Token at all (the cookie is only minted by GET /auth/csrf, which
+ * nothing on this path had called yet) and failed CSRF. `ensureCsrfCookie`
+ * seeds through the one correct endpoint, then the token is attached.
+ */
+export async function authedFetch(
   url: string,
   init: RequestInit = {},
 ): Promise<Response> {
+  await ensureCsrfCookie();
   const csrf = getCsrfToken();
   const headers: Record<string, string> = {
     ...((init.headers as Record<string, string>) ?? {}),

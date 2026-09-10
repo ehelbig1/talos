@@ -162,7 +162,7 @@ else
 fi
 echo
 
-# ── 2. Top-level controller routes vs nginx ConfigMap ────────────────
+# ── 2. Top-level controller routes vs nginx locations (chart + image) ──
 bold "▶ check 2: top-level controller routes vs nginx locations (info-only)"
 
 ROUTES_FILE="$(mktemp)"
@@ -175,7 +175,14 @@ trap 'rm -f "$ROUTES_FILE" "$NGINX_FILE"' EXIT
 # normalise to the first path segment. Skip routes annotated
 # `// no-nginx-route`. Both `route` and `nest` register a top-level path;
 # nesting matters for things like `Router::new().nest("/mcp", …)`.
-grep -nhE '\.(route|nest)\("/' controller/src/main.rs controller/src/bootstrap/router.rs \
+# The house call style breaks long registrations across lines —
+# `.route(\n    "/corrections/{token}/{severity}",\n    get(…))` — and a
+# single-line grep never saw those (2026-09-10: /corrections and
+# /approval-actions were reported as nginx EXTRAS on every run while being
+# real controller routes). Join `.route(`/`.nest(` with the following line
+# first so the path literal lands on the same line as the call.
+perl -0777 -pe 's/\.(route|nest)\(\s*\n\s*"/.$1("/g' controller/src/main.rs controller/src/bootstrap/router.rs \
+    | grep -nhE '\.(route|nest)\("/' \
     | grep -v 'no-nginx-route' \
     | grep -oE '\.(route|nest)\("/[^"]*"' \
     | grep -oE '"/[^"]*"' \
@@ -183,63 +190,118 @@ grep -nhE '\.(route|nest)\("/' controller/src/main.rs controller/src/bootstrap/r
     | awk -F/ '{ if ($2 != "") print "/" $2 }' \
     | sort -u > "$ROUTES_FILE"
 
-# Extract `location /X` from the chart-rendered nginx ConfigMap.
-# Use awk so we're not fighting BSD vs GNU sed escapes.
-# Skip locations marked `# no-controller-route` — typically /favicon.ico
-# served directly by nginx with no upstream. The marker may be on the
-# location line itself or any of the 3 lines preceding it.
-awk '
-    {
-        # Buffer the last 3 non-empty lines to check for opt-out marker.
-        recent_lines[NR % 4] = $0
-    }
-    /^[[:space:]]*location[[:space:]]/ {
-        opt_out = 0
-        for (j = NR - 3; j <= NR; j++) {
-            if (j < 1) continue
-            if (recent_lines[j % 4] ~ /no-controller-route/) {
-                opt_out = 1
-            }
-        }
-        if (opt_out) next
+# TWO nginx configs serve the SPA and both must know every controller
+# route (2026-09-10):
+#   * deploy/helm/talos/templates/frontend/configmap.yaml — what the Helm
+#     chart mounts over the image default in Kubernetes;
+#   * frontend/nginx.conf — what frontend/Dockerfile bakes into the image,
+#     i.e. what docker-compose.prod.yml actually serves.
+# Until this date only the chart file was reconciled, and the image file
+# had drifted to proxying /graphql ALONE: the compose-prod deploy 404'd
+# /ws, every /api/* integration route, /auth/csrf (so every mutation then
+# failed CSRF), /webhooks, /mcp, and the one-click /corrections +
+# /approval-actions email links — a location set that "passed" this check
+# because the check never looked at it. Both are now scanned with the same
+# extractor and reported separately, so a route added to one and not the
+# other is named with the file that forgot.
+NGINX_CONFIGS=(
+    deploy/helm/talos/templates/frontend/configmap.yaml
+    frontend/nginx.conf
+)
 
-        for (i = 1; i <= NF; i++) {
-            if ($i ~ /^\//) {
-                # First path segment only — strip nested levels.
-                split($i, parts, "/")
-                if (parts[2] != "") {
-                    print "/" parts[2]
-                } else {
-                    print "/"
+# Extract `location /X` (also `location = /X`) from an nginx config and
+# normalise to the first path segment. Use awk so we're not fighting BSD
+# vs GNU sed escapes. Skip locations marked `# no-controller-route` —
+# typically /favicon.ico served directly by nginx with no upstream. The
+# marker may be on the location line itself or any of the 3 lines
+# preceding it. Regex locations (`location ~* …`) never carry a leading
+# `/` field, so the static-asset block is out of range by shape.
+nginx_locations() {
+    awk '
+        {
+            # Buffer the last 3 non-empty lines to check for opt-out marker.
+            recent_lines[NR % 4] = $0
+        }
+        /^[[:space:]]*location[[:space:]]/ {
+            opt_out = 0
+            for (j = NR - 3; j <= NR; j++) {
+                if (j < 1) continue
+                if (recent_lines[j % 4] ~ /no-controller-route/) {
+                    opt_out = 1
                 }
-                break
+            }
+            if (opt_out) next
+
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^\//) {
+                    # First path segment only — strip nested levels.
+                    split($i, parts, "/")
+                    if (parts[2] != "") {
+                        print "/" parts[2]
+                    } else {
+                        print "/"
+                    }
+                    break
+                }
             }
         }
-    }
-' deploy/helm/talos/templates/frontend/configmap.yaml | sort -u > "$NGINX_FILE"
+    ' "$1" | sort -u
+}
 
-# Diff. `/` (SPA catch-all) is always fine on both sides.
-MISSING="$(comm -23 "$ROUTES_FILE" "$NGINX_FILE" | grep -v '^/$' || true)"
-EXTRA="$(comm -13 "$ROUTES_FILE" "$NGINX_FILE" | grep -v '^/$' || true)"
+ROUTE_NGINX_ALIGNED=1
+for cfg in "${NGINX_CONFIGS[@]}"; do
+    if [ ! -f "$cfg" ]; then
+        # A config that has moved is not a config that is aligned — say so
+        # rather than silently checking one file (checks 64/65's lesson).
+        yellow "⚠ nginx config $cfg not found — cannot reconcile routes against it"
+        ROUTE_NGINX_ALIGNED=0
+        continue
+    fi
+    nginx_locations "$cfg" > "$NGINX_FILE"
 
-if [ -n "$MISSING" ]; then
-    yellow "⚠ controller routes missing a matching top-level nginx location:"
-    while IFS= read -r r; do printf '  %s\n' "$r"; done <<<"$MISSING"
-    yellow "  → if intentionally internal (probes, scrape token, etc.), add"
-    yellow "    // no-nginx-route on the .route() line (main.rs / bootstrap/router.rs)"
-    yellow "  → otherwise add a matching location block to"
-    yellow "    deploy/helm/talos/templates/frontend/configmap.yaml"
+    # Diff. `/` (SPA catch-all) is always fine on both sides.
+    MISSING="$(comm -23 "$ROUTES_FILE" "$NGINX_FILE" | grep -v '^/$' || true)"
+    EXTRA="$(comm -13 "$ROUTES_FILE" "$NGINX_FILE" | grep -v '^/$' || true)"
+
+    if [ -n "$MISSING" ]; then
+        ROUTE_NGINX_ALIGNED=0
+        yellow "⚠ $cfg: controller routes missing a matching top-level nginx location:"
+        while IFS= read -r r; do printf '  %s\n' "$r"; done <<<"$MISSING"
+        yellow "  → if intentionally internal (probes, scrape token, etc.), add"
+        yellow "    // no-nginx-route on the .route() line (main.rs / bootstrap/router.rs)"
+        yellow "  → otherwise add a matching location block to $cfg"
+        yellow "    (and to its sibling — the chart ConfigMap and frontend/nginx.conf"
+        yellow "    must carry the same location set)"
+    fi
+
+    if [ -n "$EXTRA" ]; then
+        ROUTE_NGINX_ALIGNED=0
+        yellow "⚠ $cfg: nginx locations with no matching top-level controller route:"
+        while IFS= read -r r; do printf '  %s\n' "$r"; done <<<"$EXTRA"
+        yellow "  → likely safe (handler may live in a merged sub-router) but"
+        yellow "    worth a sanity-check that the proxy target actually exists"
+    fi
+done
+
+# The two nginx files must ALSO agree with each other — a route the
+# controller registers via a merged sub-router (invisible to the .route()
+# grep above) can be present in one and absent from the other, and the
+# route-vs-nginx legs would call both files "extra" without noticing they
+# differ. Compare the two location sets directly.
+if [ -f "${NGINX_CONFIGS[0]}" ] && [ -f "${NGINX_CONFIGS[1]}" ]; then
+    CHART_LOCS="$(nginx_locations "${NGINX_CONFIGS[0]}")"
+    IMAGE_LOCS="$(nginx_locations "${NGINX_CONFIGS[1]}")"
+    if [ "$CHART_LOCS" != "$IMAGE_LOCS" ]; then
+        ROUTE_NGINX_ALIGNED=0
+        yellow "⚠ the chart ConfigMap and frontend/nginx.conf proxy DIFFERENT location sets:"
+        diff <(echo "$CHART_LOCS") <(echo "$IMAGE_LOCS") | sed 's/^/  /' || true
+        yellow "  → (< only in the chart ConfigMap, > only in frontend/nginx.conf)"
+        yellow "  → the image config is what docker-compose.prod.yml serves; keep both in lockstep"
+    fi
 fi
 
-if [ -n "$EXTRA" ]; then
-    yellow "⚠ nginx locations with no matching top-level controller route:"
-    while IFS= read -r r; do printf '  %s\n' "$r"; done <<<"$EXTRA"
-    yellow "  → likely safe (handler may live in a merged sub-router) but"
-    yellow "    worth a sanity-check that the proxy target actually exists"
-fi
-
-if [ -z "$MISSING" ] && [ -z "$EXTRA" ]; then
-    green "✓ controller routes ↔ nginx locations are aligned"
+if [ "$ROUTE_NGINX_ALIGNED" -eq 1 ]; then
+    green "✓ controller routes ↔ nginx locations are aligned (chart ConfigMap + frontend/nginx.conf)"
 fi
 echo
 
@@ -387,6 +449,15 @@ else
     # values.yaml gets flipped to true. Misses gated-on-other-fields
     # blocks but catches the common "is the key under the right parent"
     # bug class, which is what r253 shipped broken.
+    #
+    # `# no-render-toggle: <reason>` on a comment line directly above an
+    # `enabled: false` EXCLUDES that toggle from the flip (2026-09-10). One
+    # toggle qualifies today: `ollama.enabled`, which gates a deliberate
+    # `fail` (the chart ships no Ollama workload, so enabling it without
+    # `ollama.externalWorkload` must refuse to render). Flipping it here
+    # would exercise exactly that refusal and paint the whole check red
+    # over a correct chart. The marker is a comment on the values line, so
+    # it is visible to the operator reading the knob, not hidden here.
     SET_ARGS=()
     # Walk the YAML keeping a path stack indexed by indent column.
     # When we see `enabled: false`, emit the dotted path to its parent.
@@ -398,6 +469,7 @@ else
             sub(/[^ ].*$/, "", s)
             return length(s)
         }
+        /^[[:space:]]*#.*no-render-toggle:/ { skip_next = 1; next }
         /^[[:space:]]*#/ { next }
         /^[[:space:]]*$/ { next }
         # A scalar key:value or a parent map.
@@ -412,14 +484,17 @@ else
             top++
             stack[top] = key
             stack_indent[top] = ind
-            # If this line is `enabled: false`, emit the parent path.
+            # If this line is `enabled: false`, emit the parent path —
+            # unless the line above carried `# no-render-toggle:`.
             if ($0 ~ /^[[:space:]]*enabled:[[:space:]]*false[[:space:]]*$/) {
+                if (skip_next) { skip_next = 0; next }
                 parent = ""
                 for (i = 1; i < top; i++) {
                     parent = parent (i == 1 ? "" : ".") stack[i]
                 }
                 if (parent != "") print parent
             }
+            skip_next = 0
         }
     ' "$CHART_DIR/values.yaml")
 
@@ -1888,8 +1963,21 @@ for domain_dir in talos-api/src/schema/*/; do
     [ -f "$mutations" ] || continue
     [ -f "$queries" ] || continue
 
-    # Does mutations.rs use require_scope at all?
+    # Does mutations.rs use require_scope at all? Until 2026-09-10 a domain
+    # with ZERO gates on its WRITE surface was silently `continue`d — the
+    # check only compared queries against mutations, so a mutations.rs that
+    # gated nothing made its whole domain invisible to the parity rule and
+    # read as a pass. A write surface with no scope gate at all is the
+    # LARGER defect, not an exemption. Fail and name the file. A domain whose
+    # every mutation is genuinely pre-auth (login, register, password reset)
+    # opts out with `// allow-ungated-mutations-file: <reason>` anywhere in
+    # that mutations.rs — the reason is the review record.
     if ! grep -q "require_scope(" "$mutations" 2>/dev/null; then
+        if grep -q "// allow-ungated-mutations-file:" "$mutations" 2>/dev/null; then
+            continue
+        fi
+        printf '  %s — mutations.rs has NO require_scope call at all (whole write surface ungated)\n' "$mutations"
+        PARITY_VIOLATIONS=$((PARITY_VIOLATIONS + 1))
         continue
     fi
 
@@ -1932,6 +2020,8 @@ if [ "$PARITY_VIOLATIONS" -gt 0 ]; then
     yellow '  → add crate::schema::require_scope(ctx, ApiKeyScope::Admin)? (or appropriate scope)'
     yellow '    at the top of the resolver. Session-authenticated callers pass through unchanged.'
     yellow "  → legitimate pre-auth queries opt out with: // allow-public-query: <reason>"
+    yellow "  → a mutations.rs whose EVERY mutation is pre-auth opts out with:"
+    yellow "      // allow-ungated-mutations-file: <reason>   (anywhere in that file)"
     yellow "  → See MCP-757 + 2026-05-28 audit (linked_oauth_accounts / service_integrations /"
     yellow "    resource_quotas / capability_grants)."
     EXIT_CODE=1
@@ -2164,44 +2254,56 @@ bold "▶ check 25: bare-pool queries on RLS tables in talos-api/src/schema"
 # query that runs inside a tenant-scoped transaction (begin_tenant_read_scoped
 # / begin_org_scoped / begin_user_scoped / UnitOfWork) — that is what issues
 # the per-tx `SET LOCAL ROLE talos_app` + the app.current_user_id/org_ids
-# GUCs. A resolver that runs a query on the bare pool (`.fetch_*(db_pool)` /
-# `.execute(db_pool)`) NEVER sets the role, so even with TALOS_RLS_SET_ROLE
-# on it runs as the base role and the RLS policy is a NO-OP for that read /
-# write — a silent backstop gap that survives the enforcement flip.
+# GUCs. A resolver that runs on the bare pool NEVER sets the role, so even
+# with TALOS_RLS_SET_ROLE on it runs as the base role and the RLS policy is
+# a NO-OP for that read / write — a silent backstop gap that survives the
+# enforcement flip.
 #
-# This check flags any bare-pool executor in talos-api/src/schema whose
-# enclosing `sqlx::query*` block references one of the RLS-enabled tables
-# (workflows, workflow_executions, actors, secrets, scratch_sessions,
-# user_module_pins) — including via JOIN, the dominant ownership-gate
-# shape. The ~22-PR S2/S3 conversion reduced this to ZERO; the lint freezes
-# it so new code can't silently regress.
+# TWO LEGS, and the second is the one that does the work now.
 #
-# Executor-match widening (2026-06-23): the original executor pattern only
-# matched the by-value `(db_pool|pool|&self.db_pool)` forms and was BLIND to
-# the `&`-borrowed shapes — `.execute(&db_pool)` / `.fetch_one(&pool)` /
-# `.fetch_all(& self.db_pool)` — which are the dominant
-# `sqlx::query(...).execute(&db_pool)` idiom and run on the bare pool just
-# the same (RLS is an equal no-op). The grep pattern below makes the leading
-# `&`/whitespace optional and folds `self.` into an optional prefix so
-# `&db_pool`, `&pool`, and the `& self.db_pool` spacing variant are all
-# caught, while `conn_pool` / `pool_handle` / `&mut *tx` stay out (the `(`
-# must be immediately followed by `&?[[:space:]]*(self\.)?` then exactly
-# `db_pool` or `pool`).
+# (a) LEGACY — a raw `sqlx::query*(...).fetch_*/execute(<pool>)` in
+#     talos-api/src/schema whose block names an RLS table. This is what the
+#     check WAS, and it has been VACUOUS since check 50 graduated: there is
+#     no raw sqlx in talos-api/src/schema at all (must be 0), so this leg's
+#     haystack is empty and it has been a green tick over nothing since
+#     2026-07-06. Kept as a one-line backstop for the day check 50 regresses;
+#     it can no longer be the check's claim.
 #
-# Opt out — for a query that MUST run unscoped (a genuine cross-tenant
-# platform-admin op, or an internal cross-cutting reader whose
-# authorization is established upstream) — with `// allow-bare-pool-rls:
-# <reason>` anywhere in the query block.
+# (b) REPOSITORY TWINS (2026-09-10). Resolver SQL now lives in repository
+#     crates, and check 50's extraction rule was: a scoped-tx resolver keeps
+#     its executor by calling a `_scoped` repo method (`&mut PgConnection`)
+#     while the resolver owns begin/commit. Every such method therefore
+#     exists in TWO spellings — `foo(&self, pool …)` on the bare pool, and
+#     `foo_scoped(conn, …)` — and a resolver that calls the UN-suffixed one
+#     has silently dropped the RLS backstop the twin exists to keep. So: the
+#     twin list is DERIVED (never hand-maintained — check 74's rot mode) by
+#     grepping `pub async fn <name>_scoped(` across every
+#     `talos-*-repository` crate, and any `.<name>(` call in
+#     talos-api/src/schema to a name that HAS a `_scoped` twin is flagged.
+#     Stated limits: TEXTUAL — a call routed through a service crate, or a
+#     twin whose bare form is named differently, is invisible; and it proves
+#     the scoped SPELLING is used, never that the tx it is handed is the
+#     right tenant's (checks 42/70's business). Method names shorter than 4
+#     chars are skipped to avoid `get(`/`run(` noise.
+#
+# TRIPWIRE: if the derived twin list is EMPTY the check FAILS rather than
+# passes — a check that matches nothing is a green tick over nothing (checks
+# 64/65, and leg (a)'s own history one paragraph up).
+#
+# Opt-outs: leg (a) `// allow-bare-pool-rls: <reason>` anywhere in the query
+# block (unchanged); leg (b) `// allow-bare-pool-read: <reason>` on the call
+# line or within the 8 lines above — for a genuine cross-tenant
+# platform-admin read, or a call whose caller has already established a
+# scoped tx the bare method is handed via `&mut *tx` deref (rare; say so).
 
 RLS_TABLE_RE='workflows|workflow_executions|actors|secrets|scratch_sessions|user_module_pins'
 BARE_POOL_RLS_VIOLATIONS=0
 
 if [ -d talos-api/src/schema ]; then
+    # (a) legacy raw-sqlx leg.
     while IFS=: read -r file lineno _; do
         [ -f "$file" ] || continue
         start=$((lineno > 40 ? lineno - 40 : 1))
-        # Take the text from the LAST `sqlx::query` opening up to the
-        # executor line — i.e. the actual enclosing query block.
         qblock=$(sed -n "${start},${lineno}p" "$file" 2>/dev/null \
             | awk '/sqlx::query/{buf=""} {buf=buf"\n"$0} END{print buf}')
         echo "$qblock" | grep -q "sqlx::query" || continue
@@ -2210,38 +2312,55 @@ if [ -d talos-api/src/schema ]; then
         echo "$qblock" | grep -q "// allow-bare-pool-rls:" && continue
         tbl=$(echo "$qblock" | grep -oiE \
             "(FROM|JOIN|INTO|UPDATE)[[:space:]]+(${RLS_TABLE_RE})" | head -1)
-        printf '  %s:%s — bare-pool executor on an RLS-table query [%s]\n' \
+        printf '  %s:%s — (a) bare-pool executor on an RLS-table query [%s]\n' \
             "$file" "$lineno" "$tbl"
         BARE_POOL_RLS_VIOLATIONS=$((BARE_POOL_RLS_VIOLATIONS + 1))
-        # Executor-match pattern (2026-06-23): an `&`/whitespace-prefixed
-        # borrow of the pool — `.execute(&db_pool)`, `.fetch_one(&pool)`,
-        # `.fetch_all(& self.db_pool)` — runs on the bare pool just like the
-        # by-value `db_pool` form, so RLS is an equal no-op for it. The
-        # original pattern only matched `(db_pool|pool|&self.db_pool)` and was
-        # blind to the `&db_pool` / `&pool` borrow shapes that dominate the
-        # `sqlx::query(...).execute(&db_pool)` idiom. The leading
-        # `&?[[:space:]]*` makes the borrow optional and tolerates the
-        # `& self.db_pool` spacing variant. `db_pool` is matched with a
-        # word-boundary-ish prefix so `&self.db_pool` collapses into the same
-        # alternative (the `self\.` is optional) without also matching unrelated
-        # identifiers like `conn_pool`.
     done < <(grep -rnE '\.(fetch_optional|fetch_one|fetch_all|execute)\(&?[[:space:]]*(self\.)?(db_pool|pool)\)' \
         talos-api/src/schema 2>/dev/null || true)
+
+    # (b) repository-twin leg. Derive the twin list.
+    SCOPED_TWINS="$(grep -rhoE 'pub async fn [A-Za-z0-9_]+_scoped[[:space:]]*[(<]' \
+            --include='*.rs' $(ls -d talos-*-repository/src 2>/dev/null) 2>/dev/null \
+        | sed -E 's/pub async fn ([A-Za-z0-9_]+)_scoped.*/\1/' \
+        | awk 'length($0) >= 4' | sort -u || true)"
+    SCOPED_TWIN_COUNT="$(printf '%s\n' "$SCOPED_TWINS" | grep -c . || true)"
+    if [ "$SCOPED_TWIN_COUNT" -eq 0 ]; then
+        red "✗ derived ZERO `_scoped` repository twins — the check's haystack is empty (a check that matches nothing is a green tick over nothing)"
+        yellow "  → expected `pub async fn <name>_scoped(` definitions under talos-*-repository/src; has the naming convention or crate layout moved?"
+        BARE_POOL_RLS_VIOLATIONS=$((BARE_POOL_RLS_VIOLATIONS + 1))
+    else
+        TWIN_ALT="$(printf '%s\n' "$SCOPED_TWINS" | paste -sd'|' -)"
+        while IFS=: read -r file lineno text; do
+            [ -f "$file" ] || continue
+            # The matched line must not itself be the `_scoped` call.
+            echo "$text" | grep -qE "\.(${TWIN_ALT})_scoped[[:space:]]*\(" && continue
+            # Whole-line comments don't call anything.
+            echo "$text" | grep -qE '^[[:space:]]*//' && continue
+            start=$((lineno > 8 ? lineno - 8 : 1))
+            if sed -n "${start},${lineno}p" "$file" 2>/dev/null | grep -q '// allow-bare-pool-read:'; then
+                continue
+            fi
+            m="$(echo "$text" | grep -oE "\.(${TWIN_ALT})[[:space:]]*\(" | head -1 | tr -d ' (.')"
+            printf '  %s:%s — (b) calls repo method `%s(` which has a `%s_scoped(` twin; the bare form runs on the pool (no RLS)\n' \
+                "$file" "$lineno" "$m" "$m"
+            BARE_POOL_RLS_VIOLATIONS=$((BARE_POOL_RLS_VIOLATIONS + 1))
+        done < <(grep -rnE "\.(${TWIN_ALT})[[:space:]]*\(" talos-api/src/schema 2>/dev/null || true)
+    fi
 fi
 
 if [ "$BARE_POOL_RLS_VIOLATIONS" -gt 0 ]; then
-    red "✗ $BARE_POOL_RLS_VIOLATIONS bare-pool quer(ies) on RLS tables in talos-api resolvers"
+    red "✗ $BARE_POOL_RLS_VIOLATIONS bare-pool read(s)/write(s) on RLS tables in talos-api resolvers"
     yellow '  → run the query on a tenant-scoped tx so RLS enforces under talos_app:'
     yellow '      let mut tx = talos_db::begin_user_scoped(db_pool, user_id).await?;     // personal'
     yellow '      let mut tx = talos_db::begin_tenant_read_scoped(db_pool, &scope).await?; // org-shared'
     yellow '      let mut uow = talos_db::UnitOfWork::begin(db_pool, &scope).await?;       // multi-call'
-    yellow '    then .fetch_*/.execute(&mut *tx) (or uow.conn()) and tx.commit()/uow.commit().'
+    yellow '    then call the repo method'"'"'s `_scoped` twin with `&mut *tx` (or uow.conn()) and commit.'
     yellow '  → genuine cross-tenant / upstream-authorized reads opt out with:'
-    yellow '      // allow-bare-pool-rls: <reason>'
-    yellow '  → See RFC 0005 (SET-ROLE enforcement) + the S2/S3 conversion PRs.'
+    yellow '      // allow-bare-pool-rls: <reason>   (leg a)   // allow-bare-pool-read: <reason>   (leg b)'
+    yellow '  → See RFC 0005 (SET-ROLE enforcement) + the S2/S3 conversion PRs + check 50.'
     EXIT_CODE=1
 else
-    green "✓ no bare-pool reads/writes on RLS tables in talos-api resolvers"
+    green "✓ no bare-pool reads/writes on RLS tables in talos-api resolvers (${SCOPED_TWIN_COUNT:-0} _scoped repo twins derived)"
 fi
 echo
 
@@ -3255,12 +3374,16 @@ TLS_GATE_VIOLATIONS=0
 # same PHI/credential exposure as the controller's, so its plaintext-scheme gate
 # must fail closed too. EVERY marker occurrence is validated (not just the
 # first) so a second gate softened back to warn-only is still caught.
-for gate in redis nats postgres neo4j; do
+# `vault` added 2026-09-10: the Vault transit KEK provider is the fifth
+# cleartext-capable backend (it carries the master-key wrap/unwrap calls), and
+# `talos-secrets-manager/src/vault_kek_provider.rs` now gates a plaintext
+# `http://` VAULT_ADDR in production under `// tls-prod-gate-vault`.
+for gate in redis nats postgres neo4j vault; do
     # Match STANDALONE marker lines (`    // tls-prod-gate-<name>`) only — this
     # is the comment placed directly above each gate. A mid-sentence mention in
     # a `///` doc comment (e.g. "See `tls-prod-gate-postgres`.") is a reference,
     # not a gate, and must not be validated for a fail-closed action.
-    hits=$(grep -rnE "^[[:space:]]*//[[:space:]]*tls-prod-gate-${gate}\b" --include='*.rs' controller/src talos-db/src worker/src talos-worker-runtime/src 2>/dev/null || true)
+    hits=$(grep -rnE "^[[:space:]]*//[[:space:]]*tls-prod-gate-${gate}\b" --include='*.rs' controller/src talos-db/src worker/src talos-worker-runtime/src talos-secrets-manager/src 2>/dev/null || true)
     if [ -z "$hits" ]; then
         red "✗ missing production TLS gate marker: tls-prod-gate-${gate}"
         TLS_GATE_VIOLATIONS=$((TLS_GATE_VIOLATIONS + 1))
@@ -3273,9 +3396,25 @@ for gate in redis nats postgres neo4j; do
         # The marker line + the 12 lines following it must contain a fail-closed
         # action. A gate softened back to `tracing::warn!` (no return/panic/bail)
         # is exactly the regression this check exists to catch.
+        # Two fail-closed shapes are accepted (2026-09-10 widened the second in):
+        #   * an inline `return Err(..)` / `panic!` / `bail!` in the window;
+        #   * a call to an EXTRACTED decision function named `*gate(` whose
+        #     Err is propagated with `?;` — the vault gate is written
+        #     `plaintext_vault_addr_gate(&addr, is_production(), allow)?;` so
+        #     the refusal lives in a unit-testable pure function rather than
+        #     inline, which is the better shape and must not read as
+        #     "softened to warn". A bare `?;` anywhere is NOT enough: the
+        #     window must also contain the `*gate(` call, so an unrelated
+        #     fallible call next to a warn-only gate still fails the check.
         window=$(sed -n "${lineno},$((lineno + 12))p" "$file" 2>/dev/null || true)
-        if ! echo "$window" | grep -qE 'return Err|panic!|bail!'; then
-            red "✗ TLS gate '${gate}' at ${file}:${lineno} does not fail closed (no return Err/panic/bail within 12 lines)"
+        fails_closed=0
+        if echo "$window" | grep -qE 'return Err|panic!|bail!'; then
+            fails_closed=1
+        elif echo "$window" | grep -qE '^[[:space:]]*[a-z_]*gate\(' && echo "$window" | grep -qE '\)\?;'; then
+            fails_closed=1
+        fi
+        if [ "$fails_closed" -eq 0 ]; then
+            red "✗ TLS gate '${gate}' at ${file}:${lineno} does not fail closed (no return Err/panic/bail, nor a propagated *gate(..)?; call, within 12 lines)"
             yellow "  → a production no-TLS condition must refuse boot, not tracing::warn!"
             TLS_GATE_VIOLATIONS=$((TLS_GATE_VIOLATIONS + 1))
         fi
@@ -3284,10 +3423,10 @@ done
 
 if [ "$TLS_GATE_VIOLATIONS" -gt 0 ]; then
     red "✗ $TLS_GATE_VIOLATIONS production TLS gate(s) missing or not fail-closed"
-    yellow "  → Redis/NATS/Postgres/Neo4j prod connections must reject plaintext URLs at boot."
+    yellow "  → Redis/NATS/Postgres/Neo4j/Vault prod connections must reject plaintext URLs at boot."
     EXIT_CODE=1
 else
-    green "✓ production in-transit TLS gates (redis/nats/postgres/neo4j) all fail closed"
+    green "✓ production in-transit TLS gates (redis/nats/postgres/neo4j/vault) all fail closed"
 fi
 echo
 
@@ -7869,6 +8008,9 @@ echo
 #
 # Opt-out: `# allow-postgres-image-drift: <reason>` on the referencing line.
 bold "▶ check 80: one pinned Postgres image across compose, CI, tests and drills"
+# Four legs: (a) same major everywhere, (b) digest-pinned on reproducibility
+# surfaces, (c) the chart's split repository/tag agrees, (d) NO stock
+# `postgres:` image anywhere (added 2026-09-10 — see the leg).
 # Only ACTUAL image references count, never prose. A doc line, a README, or a
 # comment explaining how to bump the pin all mention the string — including
 # this fix's own comments, which is check 73's lesson. So the line must be an
@@ -7937,6 +8079,22 @@ else
         fi
     done <<< "$(grep -rl "${TREE_PRUNE_GREP[@]}" --exclude-dir=target --include='values.yaml' 'repository:[[:space:]]*pgvector/pgvector' . 2>/dev/null || true)"
 fi
+# (d) A STOCK `postgres:` image is wrong on EVERY surface, whatever its major
+#     (2026-09-10). The schema needs pgvector compiled in — `vector(N)` columns
+#     from migration 20260406000001 onward — and the stock image has none, so
+#     migrations fail at "type vector does not exist". docker-compose.prod.yml
+#     carried `postgres:16-alpine` (wrong image AND wrong major) and legs
+#     (a)–(c) never saw it, because they only ever matched `pgvector/pgvector:`.
+#     Same assignment-only matching as leg (a) (image:/IMAGE=), so prose that
+#     says "not stock postgres:17" — including the values.yaml comment that
+#     does — is out of range.
+while IFS= read -r ref; do
+    [ -z "$ref" ] && continue
+    red "✗ ${ref%%:image*} references a STOCK postgres image (${ref##*image:}) — the schema needs pgvector; use ${PG_CANON:-pgvector/pgvector:pgNN@sha256:…}"
+    PG_FAIL=1
+done <<< "$(grep -rn "${TREE_PRUNE_GREP[@]}" --exclude-dir=target --include='*.yml' --include='*.yaml' --include='*.sh' \
+    -E '^[^#]*(image:[[:space:]]*|IMAGE=|IMAGE:-)["'"'"']?postgres:[0-9]' . 2>/dev/null \
+    | grep -v 'allow-postgres-image-drift' || true)"
 if [ "$PG_FAIL" -gt 0 ]; then
     yellow "  → production (deploy/helm values.yaml) and migrations/.baseline/schema.sql are pg17."
     yellow "    A pg16 server cannot apply that baseline (PG17-only \`transaction_timeout\` GUC),"
