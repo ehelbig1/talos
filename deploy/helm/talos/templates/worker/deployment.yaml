@@ -49,15 +49,24 @@ spec:
           env:
             # --- Static config ---
             {{- include "talos.envFromMap" .Values.worker.env | nindent 12 }}
-            # --- Sigstore enforcement (only emitted when configured) ---
+            # --- Sigstore enforcement — ALWAYS emitted ---
             # See values.yaml § worker.sigstore for the operator-facing
-            # config and worker/src/main.rs::SigstorePolicy for runtime
-            # enforcement. Verification happens BEFORE OCI pull, so an
-            # unsigned/tampered artifact never enters the cache.
-            {{- with .Values.worker.sigstore.required }}
+            # config and talos-worker-runtime/src/module_fetcher.rs
+            # (SigstorePolicy + enforce_production_sigstore_policy_explicit)
+            # for runtime enforcement. Verification happens BEFORE OCI pull,
+            # so an unsigned/tampered artifact never enters the cache.
+            #
+            # An EMPTY `required` renders the literal `disabled`, it does not
+            # skip the env var. Until 2026-09-10 this used a `with` guard,
+            # which omits the entry for "" — and the worker REFUSES TO BOOT
+            # under RUST_ENV=production (the chart default) when the variable
+            # is unset or empty, precisely so a forgotten setting cannot
+            # silently mean "unverified". The chart's own default therefore
+            # CrashLooped the worker with "TALOS_SIGSTORE_REQUIRED must be set
+            # explicitly in production" while values.yaml called "" a mode.
+            # "disabled" is what "" always meant here; now it is said.
             - name: TALOS_SIGSTORE_REQUIRED
-              value: {{ . | quote }}
-            {{- end }}
+              value: {{ .Values.worker.sigstore.required | default "disabled" | quote }}
             {{- with .Values.worker.sigstore.identityRegexp }}
             - name: TALOS_SIGSTORE_IDENTITY_REGEXP
               value: {{ . | quote }}

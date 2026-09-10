@@ -109,8 +109,17 @@ export default defineConfig({
     // Terser options for production optimization
     terserOptions: {
       compress: {
-        // Remove console.log in production for security and performance
-        drop_console: process.env.NODE_ENV === 'production',
+        // Strip the CHATTY console methods in production — but NOT
+        // console.error / console.warn. `drop_console: true` removed every
+        // console.* call including console.error, so a production bundle
+        // reported nothing at all when a request failed or a component threw
+        // outside an ErrorBoundary: the one signal a user can paste into a bug
+        // report, gone. `pure_funcs` marks only the listed calls as
+        // side-effect-free (so terser drops them along with their arguments).
+        pure_funcs:
+          process.env.NODE_ENV === 'production'
+            ? ['console.log', 'console.debug', 'console.info', 'console.trace']
+            : [],
         drop_debugger: true,
         // Remove unreachable code
         dead_code: true,

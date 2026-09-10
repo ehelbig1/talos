@@ -735,6 +735,15 @@ impl ParallelWorkflowEngine {
         self.actor_context = Some(context);
     }
 
+    /// The actor context bound via [`set_actor_context`](Self::set_actor_context),
+    /// or `None` when no per-actor memory view is bound. Read-only; a test
+    /// asserting on the "injection off" state reads it here rather than
+    /// inferring it from a dispatched payload.
+    #[must_use]
+    pub fn actor_context(&self) -> Option<&serde_json::Value> {
+        self.actor_context.as_ref()
+    }
+
     /// Enable dry-run mode for this engine.
     ///
     /// When set, every dispatched [`DispatchJob`](talos_workflow_engine_core::DispatchJob) carries
@@ -771,6 +780,22 @@ impl ParallelWorkflowEngine {
     /// `actors.max_write_ceiling` before `run()` / `run_with_seed()`.
     pub fn set_max_write_ceiling(&mut self, ceiling: talos_workflow_engine_core::WriteCeiling) {
         self.max_write_ceiling = ceiling;
+    }
+
+    /// Stamp the actor's capability-world ceiling (`actors.max_capability_world`).
+    /// Called by `talos_engine::actor_binding::apply_actor_to_engine` — `None`
+    /// for the ceiling-exempt default actor. Every module dispatch, in this
+    /// engine AND in every sub-engine it builds, refuses a module whose world
+    /// the ceiling does not permit (`talos_capability_world::ceiling_permits`).
+    pub fn set_max_capability_world(&mut self, world: Option<String>) {
+        self.max_capability_world = world;
+    }
+
+    /// The capability-world ceiling this engine enforces at dispatch, or
+    /// `None` when unbounded. See [`set_max_capability_world`](Self::set_max_capability_world).
+    #[must_use]
+    pub fn max_capability_world(&self) -> Option<&str> {
+        self.max_capability_world.as_deref()
     }
 
     /// Emit a `node_started` + `node_completed` pair through the engine's

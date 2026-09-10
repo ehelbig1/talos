@@ -973,21 +973,19 @@ impl CompilationService {
                 .await
             }
             Err(e) => {
-                tracing::warn!(
-                    target: "talos_compilation",
-                    event_kind = "lockfile_container_unavailable",
-                    error = %e,
-                    "Container build_command unavailable for lockfile gen — \
-                     falling back to direct cargo (same as audit_command's fallback policy)"
+                // 2026-09-10: PROPAGATE. `build_command` returns `Err` for
+                // exactly three reasons — the production fail-closed gate
+                // (no runtime, no host-fallback ack), an invalid
+                // `TALOS_BUILDER_IMAGE`, or an unresolvable mount path — and
+                // every one of them is a reason NOT to run cargo on the host.
+                // The pre-fix arm did precisely that ("same as audit_command's
+                // fallback policy", which had the same hole), so the gate the
+                // operator thought they had was one `Err` away from a host
+                // spawn inheriting the controller's environment.
+                return Err(e).context(
+                    "Pre-audit lockfile generation requires the compilation sandbox \
+                     (container::build_command refused to build a host command)",
                 );
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
-                    Command::new("cargo")
-                        .args(["generate-lockfile", "--offline", "--quiet"])
-                        .current_dir(workspace)
-                        .output(),
-                )
-                .await
             }
         };
         match &lockfile_result {
@@ -1063,16 +1061,16 @@ impl CompilationService {
                 .await
             }
             Err(e) => {
-                tracing::warn!(error = %e, "Failed to build audit container command");
-                // Fall back to direct cargo
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
-                    Command::new("cargo")
-                        .args(audit_args)
-                        .current_dir(&workspace)
-                        .output(),
-                )
-                .await
+                // 2026-09-10: PROPAGATE rather than fall back to host cargo —
+                // see the lockfile arm above for why every `Err` here is a
+                // reason not to spawn on the host. cargo-audit is the gate
+                // that refuses known-vulnerable dependencies; running it
+                // unsandboxed on the credential-bearing host to "keep the
+                // gate" is the wrong trade.
+                return Err(e).context(
+                    "Dependency audit requires the compilation sandbox \
+                     (container::audit_command refused to build a host command)",
+                );
             }
         };
 
@@ -2874,28 +2872,17 @@ impl CompilationService {
                 // production unless the operator opted into host
                 // fallback. Non-production stays on the legacy direct
                 // cargo path.
-                if talos_config::is_production() && !container::host_fallback_allowed() {
-                    return Err(e)
-                        .context("Lint check requires container compilation in production");
-                }
-                tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
-                    Command::new("cargo")
-                        .args(&[
-                            "component",
-                            "check",
-                            "--target",
-                            "wasm32-wasip2",
-                            "--manifest-path",
-                            workspace
-                                .join("Cargo.toml")
-                                .to_str()
-                                .unwrap_or("Cargo.toml"),
-                        ])
-                        .output(),
-                )
-                .await
-                .context("Lint check timed out after 30 seconds")?
+                // 2026-09-10: the non-production arm no longer runs a bare
+                // host `cargo` either. `build_command` already returns a
+                // scrubbed host command whenever host mode is CONFIGURED
+                // (container disabled, or dev without a runtime), so an `Err`
+                // here is a genuine refusal or misconfiguration, and the
+                // pre-fix fallback would have masked it with an unscrubbed
+                // host spawn.
+                return Err(e).context(
+                    "Lint check requires the compilation sandbox (container::build_command \
+                     refused to build a host command)",
+                );
             }
         }?;
 

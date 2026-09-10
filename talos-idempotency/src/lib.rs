@@ -845,13 +845,42 @@ pub enum DedupCheck {
     /// and, on a successful response, call [`InMemoryIdempotencyStore::complete`].
     Proceed,
     /// This key already completed successfully in this process within the TTL
-    /// window — return this cached response verbatim instead of re-firing.
+    /// window AND the caller's request hash matches the one recorded — return
+    /// this cached response verbatim instead of re-firing.
     Completed(DedupResponse),
+    /// This key already completed within the TTL window but for a DIFFERENT
+    /// request (method / URL / body hash differ). The caller MUST refuse the
+    /// send rather than serve the cached response: replaying one request's
+    /// response to another is a data-leak, and firing the new request under a
+    /// key the destination has already honoured is the double-send the key
+    /// exists to prevent. Mirrors the Redis store's `mismatch` outcome.
+    Mismatch,
 }
 
 struct DedupEntry {
     stored_at: std::time::Instant,
+    /// Hash of the request that produced `response` — see
+    /// [`dedup_request_hash`]. A later `check` under the same key with a
+    /// different hash is a [`DedupCheck::Mismatch`], never a hit.
+    request_hash: String,
     response: DedupResponse,
+}
+
+/// Hash of the request identity a dedup record is bound to: method, URL and
+/// body, each length-prefixed so `("POST","a","b")` and `("POST","ab","")`
+/// cannot collide. Full SHA-256, hex. Binding the hash to the key is what makes
+/// the in-memory store refuse (rather than serve) a key reused for a different
+/// request — the same protection the Redis-backed `IdempotencyService` has via
+/// `request_hash`.
+#[must_use]
+pub fn dedup_request_hash(method: &str, url: &str, body: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for part in [method.as_bytes(), url.as_bytes(), body] {
+        hasher.update((part.len() as u64).to_le_bytes());
+        hasher.update(part);
+    }
+    hex::encode(hasher.finalize())
 }
 
 /// Per-process, in-memory, TTL-bounded idempotency dedup store. Cheap: a single
@@ -898,10 +927,16 @@ impl InMemoryIdempotencyStore {
     }
 
     /// Check for a fresh completed record. Returns [`DedupCheck::Completed`]
-    /// with the cached response when this key completed within the TTL, else
+    /// with the cached response when this key completed within the TTL for
+    /// the SAME request (`request_hash` matches the recorded one),
+    /// [`DedupCheck::Mismatch`] when it completed for a DIFFERENT request, else
     /// [`DedupCheck::Proceed`]. A stale (expired) record is treated as a miss.
+    ///
+    /// `key` must already be namespaced by the caller's tenancy principal
+    /// (see the worker's `scoped_dedup_key`) — this store is process-global
+    /// and knows nothing about who is asking.
     #[must_use]
-    pub fn check(&self, key: &str) -> DedupCheck {
+    pub fn check(&self, key: &str, request_hash: &str) -> DedupCheck {
         let now = std::time::Instant::now();
         let mut inner = match self.inner.lock() {
             Ok(g) => g,
@@ -913,7 +948,11 @@ impl InMemoryIdempotencyStore {
         self.maybe_sweep(&mut inner, now);
         match inner.entries.get(key) {
             Some(e) if now.duration_since(e.stored_at) < self.ttl => {
-                DedupCheck::Completed(e.response.clone())
+                if e.request_hash == request_hash {
+                    DedupCheck::Completed(e.response.clone())
+                } else {
+                    DedupCheck::Mismatch
+                }
             }
             _ => DedupCheck::Proceed,
         }
@@ -925,7 +964,7 @@ impl InMemoryIdempotencyStore {
     /// hard entry cap is enforced here: when full, an expired-entry sweep runs
     /// first, and if the map is still at capacity the record is dropped
     /// (best-effort — the header remains the primary dedup mechanism).
-    pub fn complete(&self, key: &str, response: DedupResponse) {
+    pub fn complete(&self, key: &str, request_hash: &str, response: DedupResponse) {
         let now = std::time::Instant::now();
         let mut inner = match self.inner.lock() {
             Ok(g) => g,
@@ -955,6 +994,7 @@ impl InMemoryIdempotencyStore {
             key.to_string(),
             DedupEntry {
                 stored_at: now,
+                request_hash: request_hash.to_string(),
                 response,
             },
         );
@@ -1316,8 +1356,11 @@ mod middleware_tests {
 
 #[cfg(test)]
 mod in_memory_dedup_tests {
-    use super::{DedupCheck, DedupResponse, InMemoryIdempotencyStore};
+    use super::{dedup_request_hash, DedupCheck, DedupResponse, InMemoryIdempotencyStore};
     use std::time::Duration;
+
+    /// A fixed request identity for the tests that are not about the hash.
+    const H: &str = "hash-of-request-a";
 
     fn resp(status: u16) -> DedupResponse {
         DedupResponse {
@@ -1331,48 +1374,82 @@ mod in_memory_dedup_tests {
     fn miss_then_complete_then_hit_short_circuits() {
         let store = InMemoryIdempotencyStore::new(Duration::from_secs(60), 100);
         // First check: no record → Proceed.
-        assert!(matches!(store.check("k1"), DedupCheck::Proceed));
+        assert!(matches!(store.check("k1", H), DedupCheck::Proceed));
         // Record a success.
-        store.complete("k1", resp(200));
+        store.complete("k1", H, resp(200));
         // Second check: same key → Completed with the cached response.
-        match store.check("k1") {
+        match store.check("k1", H) {
             DedupCheck::Completed(r) => {
                 assert_eq!(r.status, 200);
                 assert_eq!(r.body, b"{\"ok\":true}");
             }
-            DedupCheck::Proceed => panic!("expected a completed short-circuit"),
+            other => panic!("expected a completed short-circuit, got {other:?}"),
         }
     }
 
     #[test]
     fn distinct_keys_are_independent() {
         let store = InMemoryIdempotencyStore::new(Duration::from_secs(60), 100);
-        store.complete("a", resp(200));
-        assert!(matches!(store.check("a"), DedupCheck::Completed(_)));
+        store.complete("a", H, resp(200));
+        assert!(matches!(store.check("a", H), DedupCheck::Completed(_)));
         // A DIFFERENT key (the non-declaring / different-send case) is
         // unaffected — no dedup, must Proceed.
-        assert!(matches!(store.check("b"), DedupCheck::Proceed));
+        assert!(matches!(store.check("b", H), DedupCheck::Proceed));
     }
 
     #[test]
     fn expired_record_is_a_miss() {
         // Zero TTL → any stored record is immediately stale.
         let store = InMemoryIdempotencyStore::new(Duration::from_millis(0), 100);
-        store.complete("k", resp(200));
+        store.complete("k", H, resp(200));
         // `now - stored_at < 0ms` is false → treated as a miss.
-        assert!(matches!(store.check("k"), DedupCheck::Proceed));
+        assert!(matches!(store.check("k", H), DedupCheck::Proceed));
     }
 
     #[test]
     fn entry_cap_is_bounded() {
         let store = InMemoryIdempotencyStore::new(Duration::from_secs(600), 4);
         for i in 0..50 {
-            store.complete(&format!("k{i}"), resp(200));
+            store.complete(&format!("k{i}"), H, resp(200));
         }
         assert!(
             store.len() <= 4,
             "store must stay within its hard entry cap (was {})",
             store.len()
+        );
+    }
+
+    /// The defect this hash exists for: the same key reused for a DIFFERENT
+    /// request must be REFUSED, not served the first request's response.
+    #[test]
+    fn same_key_different_request_is_a_mismatch_not_a_hit() {
+        let store = InMemoryIdempotencyStore::new(Duration::from_secs(60), 100);
+        let h_a = dedup_request_hash("POST", "https://api.example/charges", b"{\"amount\":1}");
+        let h_b = dedup_request_hash("POST", "https://api.example/charges", b"{\"amount\":2}");
+        assert_ne!(h_a, h_b);
+        store.complete("k", &h_a, resp(200));
+        assert!(matches!(store.check("k", &h_a), DedupCheck::Completed(_)));
+        assert!(
+            matches!(store.check("k", &h_b), DedupCheck::Mismatch),
+            "a different body under the same key must be refused"
+        );
+        // Method and URL are part of the identity too.
+        let h_put = dedup_request_hash("PUT", "https://api.example/charges", b"{\"amount\":1}");
+        let h_url = dedup_request_hash("POST", "https://api.example/refunds", b"{\"amount\":1}");
+        assert!(matches!(store.check("k", &h_put), DedupCheck::Mismatch));
+        assert!(matches!(store.check("k", &h_url), DedupCheck::Mismatch));
+    }
+
+    /// Length-prefixing: shifting bytes between fields must not collide.
+    #[test]
+    fn request_hash_is_length_prefixed() {
+        assert_ne!(
+            dedup_request_hash("POST", "ab", b""),
+            dedup_request_hash("POST", "a", b"b"),
+        );
+        assert_ne!(
+            dedup_request_hash("POSTa", "", b""),
+            dedup_request_hash("POST", "a", b""),
         );
     }
 }

@@ -8377,6 +8377,7 @@ dependencies = [
  "talos-http-body",
  "talos-llm",
  "talos-measurement",
+ "talos-memory",
  "talos-secrets-manager",
  "talos-workflow-job-protocol",
  "tokio",
@@ -9102,6 +9103,7 @@ dependencies = [
  "serde_json",
  "talos-config",
  "tokio",
+ "tower_governor",
  "tracing",
  "uuid",
 ]
@@ -9625,6 +9627,7 @@ dependencies = [
  "axum",
  "chrono",
  "dashmap 6.2.1",
+ "futures",
  "hex",
  "hmac 0.12.1",
  "http 1.4.0",
@@ -9774,6 +9777,7 @@ dependencies = [
  "talos-capability-world",
  "talos-text-util",
  "talos-workflow-creation-helpers",
+ "talos-workflow-engine-core",
  "talos-workflow-repository",
  "tracing",
  "uuid",
@@ -9873,6 +9877,7 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]

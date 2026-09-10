@@ -192,6 +192,19 @@ impl VaultTransitProvider {
     pub fn from_env() -> Result<Self> {
         let addr = talos_config::read_env_or_file("VAULT_ADDR")
             .ok_or_else(|| anyhow!("VAULT_ADDR must be set when KEK_PROVIDER=vault"))?;
+        // F7b: every request to this address carries `X-Vault-Token` — the
+        // transit token that IS the master-KEK capability — and a plaintext
+        // `http://` VAULT_ADDR puts it on the wire unencrypted. Redis, NATS,
+        // Postgres and Neo4j all refuse plaintext in production
+        // (`tls-prod-gate-*`); Vault did not. Refuse unless the operator has
+        // explicitly accepted it for an in-pod sidecar over the loopback
+        // (`TALOS_ALLOW_PLAINTEXT_VAULT=1`), which is logged at WARN.
+        // tls-prod-gate-vault
+        plaintext_vault_addr_gate(
+            &addr,
+            talos_config::is_production(),
+            talos_config::bool_env_or_default("TALOS_ALLOW_PLAINTEXT_VAULT", false),
+        )?;
         let token = talos_config::read_env_or_file("VAULT_TOKEN")
             .ok_or_else(|| anyhow!("VAULT_TOKEN must be set when KEK_PROVIDER=vault (use VAULT_TOKEN_FILE for Docker secrets)"))?;
         // Refuse the chart's pre-init placeholder. install.sh seeds this
@@ -414,6 +427,75 @@ impl KekProvider for VaultTransitProvider {
 
     fn name(&self) -> &str {
         &self.display_name
+    }
+}
+
+/// The pure decision behind `tls-prod-gate-vault`, unit-tested without env.
+///
+/// * not production → `Ok` (dev stacks run `http://vault:8200`);
+/// * production + `https://` → `Ok`;
+/// * production + plaintext + escape hatch → `Ok` with a WARN naming the risk;
+/// * production + plaintext, no escape hatch → `Err` naming the variable.
+///
+/// Scheme comparison is case-insensitive and tolerates surrounding whitespace
+/// (an env value of `" https://…"` is a config typo, not a downgrade).
+pub fn plaintext_vault_addr_gate(
+    addr: &str,
+    is_production: bool,
+    allow_plaintext: bool,
+) -> Result<()> {
+    let is_tls = addr.trim().to_ascii_lowercase().starts_with("https://");
+    if !is_production || is_tls {
+        return Ok(());
+    }
+    if allow_plaintext {
+        tracing::warn!(
+            target: "talos_audit",
+            event_kind = "vault_plaintext_addr_allowed",
+            "VAULT_ADDR is not https:// in production and TALOS_ALLOW_PLAINTEXT_VAULT is set — \
+             the Vault transit token (master-KEK capability) travels unencrypted to this \
+             address. Acceptable ONLY for an in-pod sidecar over loopback."
+        );
+        return Ok(());
+    }
+    Err(anyhow!(
+        "SECURITY: VAULT_ADDR must use https:// in production (got scheme '{}'). Every \
+         request carries the Vault transit token, which is the master-KEK capability. Set \
+         TALOS_ALLOW_PLAINTEXT_VAULT=1 ONLY for an in-pod Vault agent sidecar reached over \
+         loopback.",
+        addr.trim().split("://").next().unwrap_or("<none>")
+    ))
+}
+
+#[cfg(test)]
+mod plaintext_gate_tests {
+    use super::plaintext_vault_addr_gate;
+
+    #[test]
+    fn dev_accepts_plaintext() {
+        assert!(plaintext_vault_addr_gate("http://vault:8200", false, false).is_ok());
+    }
+
+    #[test]
+    fn production_accepts_tls_in_any_case_with_whitespace() {
+        assert!(plaintext_vault_addr_gate("https://vault.internal:8200", true, false).is_ok());
+        assert!(plaintext_vault_addr_gate("  HTTPS://vault.internal:8200 ", true, false).is_ok());
+    }
+
+    #[test]
+    fn production_refuses_plaintext_without_the_escape_hatch() {
+        let err = plaintext_vault_addr_gate("http://vault:8200", true, false)
+            .expect_err("plaintext must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("TALOS_ALLOW_PLAINTEXT_VAULT"), "{msg}");
+        assert!(msg.contains("'http'"), "{msg}");
+        // A scheme-less value is also not TLS.
+        assert!(plaintext_vault_addr_gate("vault:8200", true, false).is_err());
+    }
+
+    #[test]
+    fn production_escape_hatch_admits_plaintext() {
+        assert!(plaintext_vault_addr_gate("http://127.0.0.1:8200", true, true).is_ok());
     }
 }
 

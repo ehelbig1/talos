@@ -167,7 +167,9 @@ fn current_block_duration() -> Duration {
 fn current_block_duration() -> Duration {
     CB_BLOCK_DURATION
 }
-/// Types of authentication/authorization failures tracked by the circuit breaker.
+/// Types of failures a webhook request can end in. Only the AUTHENTICATION
+/// failures count toward the IP-keyed circuit breaker — see
+/// [`CircuitBreakerFailureType::counts_toward_breaker`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CircuitBreakerFailureType {
     RateLimitExceeded,
@@ -177,6 +179,28 @@ pub enum CircuitBreakerFailureType {
     TriggerDisabled,
     TriggerNotFound,
     InternalError,
+}
+
+impl CircuitBreakerFailureType {
+    /// Does this failure say something about the SENDER's credentials?
+    ///
+    /// F3: the breaker is keyed by source IP, and GitHub / Slack / most SaaS
+    /// senders deliver EVERY tenant's webhooks from one shared IP range. A
+    /// failure that is about the TRIGGER's state (disabled, deleted, its
+    /// per-trigger rate limit, an internal error on our side) therefore
+    /// says nothing about the sender and, counted, would let one tenant's
+    /// paused trigger — or one tenant's burst past ITS limit — open the
+    /// breaker against every other tenant behind that IP. Only a wrong
+    /// signature, a wrong verification token, or a disallowed source IP is
+    /// evidence about the sender itself.
+    pub fn counts_toward_breaker(self) -> bool {
+        matches!(
+            self,
+            CircuitBreakerFailureType::InvalidSignature
+                | CircuitBreakerFailureType::InvalidVerificationToken
+                | CircuitBreakerFailureType::IpNotAllowed
+        )
+    }
 }
 
 impl fmt::Display for CircuitBreakerFailureType {
@@ -230,11 +254,23 @@ impl CircuitBreaker {
     /// Record an authentication failure for an IP with specific failure type.
     /// If failures reach the threshold, block the IP.
     /// Returns true if this failure caused the circuit breaker to open.
+    ///
+    /// Non-authentication failure types are IGNORED here (logged at debug,
+    /// return `false`) — the ONE chokepoint for F3, so a new call site cannot
+    /// reintroduce a trigger-state failure into the sender-keyed breaker.
     pub fn record_failure_with_type(
         &self,
         ip: IpAddr,
         failure_type: CircuitBreakerFailureType,
     ) -> bool {
+        if !failure_type.counts_toward_breaker() {
+            tracing::debug!(
+                ip = %ip,
+                failure_type = %failure_type,
+                "Circuit breaker: non-auth failure type not counted (shared sender IPs)"
+            );
+            return false;
+        }
         let now = Instant::now();
         let mut entry = self.records.entry(ip).or_insert_with(|| CbRecord {
             consecutive_failures: 0,
@@ -477,18 +513,48 @@ mod tests {
     }
 
     #[test]
-    fn test_circuit_breaker_records_different_failure_types() {
+    fn test_circuit_breaker_counts_only_auth_failures() {
+        // F3: trigger-state failures (not found / disabled / rate-limited /
+        // internal) are NOT evidence about the sender and must not move the
+        // IP-keyed breaker. Pre-fix this test asserted the opposite
+        // ("all should count toward threshold").
         let cb = CircuitBreaker::new();
         let ip: IpAddr = "192.168.1.1".parse().unwrap();
 
-        // Record failures of different types - all should count toward threshold
         for _ in 0..5 {
-            cb.record_failure_with_type(ip, CircuitBreakerFailureType::TriggerNotFound);
+            assert!(!cb.record_failure_with_type(ip, CircuitBreakerFailureType::TriggerNotFound));
+            assert!(!cb.record_failure_with_type(ip, CircuitBreakerFailureType::TriggerDisabled));
+            assert!(!cb.record_failure_with_type(ip, CircuitBreakerFailureType::RateLimitExceeded));
+            assert!(!cb.record_failure_with_type(ip, CircuitBreakerFailureType::InternalError));
             cb.record_failure_with_type(ip, CircuitBreakerFailureType::InvalidSignature);
         }
+        // 20 non-auth + 5 auth failures: below the 10-auth-failure threshold.
+        assert!(!cb.is_blocked(ip));
 
-        // Should now be blocked
+        // Five more AUTH failures of the other two counted kinds open it.
+        for _ in 0..3 {
+            cb.record_failure_with_type(ip, CircuitBreakerFailureType::InvalidVerificationToken);
+        }
+        for _ in 0..2 {
+            cb.record_failure_with_type(ip, CircuitBreakerFailureType::IpNotAllowed);
+        }
         assert!(cb.is_blocked(ip));
+    }
+
+    #[test]
+    fn breaker_partition_is_exactly_the_three_auth_failures() {
+        use CircuitBreakerFailureType::*;
+        for t in [InvalidSignature, InvalidVerificationToken, IpNotAllowed] {
+            assert!(t.counts_toward_breaker(), "{t} is an auth failure");
+        }
+        for t in [
+            RateLimitExceeded,
+            TriggerDisabled,
+            TriggerNotFound,
+            InternalError,
+        ] {
+            assert!(!t.counts_toward_breaker(), "{t} is a trigger-state failure");
+        }
     }
 
     #[test]

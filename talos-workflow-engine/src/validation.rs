@@ -139,23 +139,112 @@ pub fn validate_config_patterns(
 /// `__`-prefixed keys are intentionally *not* stripped — several are
 /// load-bearing internally (`__memory_write__`, `__fuel_consumed__`,
 /// etc.).
+///
+/// The cut is walked back to a UTF-8 char boundary. `&s[..N]` on a
+/// `String` PANICS when byte `N` lands inside a multi-byte character, and
+/// this function runs inside the spawned reactor over LLM-authored text —
+/// an em-dash (3 bytes) or an emoji (4 bytes) straddling the cap took the
+/// whole run down. The single-node input preview already had the same fix
+/// (`engine_dispatch_single.rs`, the 2026-04-29 prod symptom); this is the
+/// output-side twin.
 pub(crate) fn sanitize_node_output(output: &mut serde_json::Value) {
-    /// 10 KiB per string field. A workflow with hundreds of nodes and
-    /// unbounded per-field strings can easily OOM the controller.
-    const MAX_STRING_FIELD_BYTES: usize = 10240;
-
     if let Some(obj) = output.as_object_mut() {
         for val in obj.values_mut() {
             if let Some(s) = val.as_str() {
-                if s.len() > MAX_STRING_FIELD_BYTES {
-                    *val = serde_json::Value::String(format!(
-                        "{}...[truncated at {}B]",
-                        &s[..MAX_STRING_FIELD_BYTES],
-                        MAX_STRING_FIELD_BYTES
-                    ));
+                if let Some(truncated) = truncate_string_field(s) {
+                    *val = serde_json::Value::String(truncated);
                 }
             }
         }
+    }
+}
+
+/// Per-string-field cap on a node output, in BYTES.
+///
+/// 64 KiB, raised from 10 KiB (2026-09-10). The 10 KiB cap silently cut a
+/// legitimate rendered HTML briefing on the delivery pattern (compose →
+/// send) mid-tag, and the send leg mailed the fragment; nothing failed,
+/// the reader got half a page. The cap is a SECONDARY defence — the
+/// per-node output is already bounded by `max_node_output_bytes` (5 MiB
+/// default), which is what actually protects the controller's memory —
+/// so 64 KiB keeps the per-field guard against a runaway single string
+/// while fitting every briefing shape observed on the reference fleet.
+pub(crate) const MAX_STRING_FIELD_BYTES: usize = 64 * 1024;
+
+/// Truncate `s` to at most [`MAX_STRING_FIELD_BYTES`] bytes on a char
+/// boundary, appending a disclosure suffix. `None` when no cut is needed.
+///
+/// The disclosure names the cap so a downstream reader (or an operator
+/// looking at a node's output) can tell "the model wrote this much" from
+/// "the engine cut it here".
+pub(crate) fn truncate_string_field(s: &str) -> Option<String> {
+    if s.len() <= MAX_STRING_FIELD_BYTES {
+        return None;
+    }
+    let mut safe_end = MAX_STRING_FIELD_BYTES;
+    while safe_end > 0 && !s.is_char_boundary(safe_end) {
+        safe_end -= 1;
+    }
+    Some(format!(
+        "{}...[truncated at {}B]",
+        &s[..safe_end],
+        MAX_STRING_FIELD_BYTES
+    ))
+}
+
+#[cfg(test)]
+mod sanitize_node_output_tests {
+    use super::{sanitize_node_output, truncate_string_field, MAX_STRING_FIELD_BYTES};
+    use serde_json::json;
+
+    /// The panic this fixes: a 3-byte em-dash straddling the byte cap.
+    /// `"—".repeat(n)` puts a boundary every 3 bytes; the cap (a power of
+    /// two) is not a multiple of 3, so byte `MAX_STRING_FIELD_BYTES` lands
+    /// INSIDE a character by construction.
+    #[test]
+    fn a_multibyte_char_across_the_cap_is_walked_back_not_panicked() {
+        assert_ne!(
+            MAX_STRING_FIELD_BYTES % 3,
+            0,
+            "the fixture must straddle the cap"
+        );
+        let dashes = "\u{2014}".repeat(MAX_STRING_FIELD_BYTES / 3 + 10);
+        assert!(dashes.len() > MAX_STRING_FIELD_BYTES);
+        assert!(!dashes.is_char_boundary(MAX_STRING_FIELD_BYTES));
+
+        let mut output = json!({ "body": dashes });
+        sanitize_node_output(&mut output);
+
+        let body = output["body"].as_str().expect("still a string");
+        assert!(body.ends_with(&format!("...[truncated at {MAX_STRING_FIELD_BYTES}B]")));
+        let kept = body.trim_end_matches(&format!("...[truncated at {MAX_STRING_FIELD_BYTES}B]"));
+        // Walked back to the LAST boundary at or below the cap: every kept
+        // char is intact, and fewer than 3 bytes were given up.
+        assert!(kept.chars().all(|c| c == '\u{2014}'));
+        assert!(kept.len() <= MAX_STRING_FIELD_BYTES);
+        assert!(kept.len() > MAX_STRING_FIELD_BYTES - 3);
+    }
+
+    #[test]
+    fn a_string_at_or_under_the_cap_is_untouched() {
+        let exact = "a".repeat(MAX_STRING_FIELD_BYTES);
+        assert!(truncate_string_field(&exact).is_none());
+        let mut output = json!({ "body": exact.clone(), "n": 1, "__error": false });
+        sanitize_node_output(&mut output);
+        assert_eq!(output["body"].as_str(), Some(exact.as_str()));
+        assert_eq!(output["n"], json!(1));
+        assert_eq!(output["__error"], json!(false));
+    }
+
+    #[test]
+    fn an_ascii_overrun_is_cut_exactly_at_the_cap_and_disclosed() {
+        let long = "b".repeat(MAX_STRING_FIELD_BYTES + 1);
+        let cut = truncate_string_field(&long).expect("over the cap");
+        assert!(cut.starts_with(&"b".repeat(MAX_STRING_FIELD_BYTES)));
+        assert_eq!(
+            cut.len(),
+            MAX_STRING_FIELD_BYTES + format!("...[truncated at {MAX_STRING_FIELD_BYTES}B]").len()
+        );
     }
 }
 

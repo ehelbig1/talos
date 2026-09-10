@@ -72,9 +72,19 @@ impl WorkflowRepository {
         Ok(rows.into_iter().collect())
     }
 
-    /// Return the subset of module_ids that are resolvable at execution time.
+    /// Return the subset of module_ids that EXIST, regardless of owner.
     ///
     /// Phase 5.1: single SELECT against unified modules table by canonical id.
+    ///
+    /// UNSCOPED — this answers "is this id taken?", not "may this user run
+    /// it?". Its result must never reach a caller-facing message on its own
+    /// (that would be a module-existence oracle across tenants). Authoring
+    /// paths that accept caller-supplied module ids use
+    /// [`Self::modules_accessible_by_user`]; the one remaining consumer of
+    /// this reader is `import_workflow`, which uses it INTERNALLY to avoid
+    /// compiling a bundle module into an id another tenant already holds
+    /// (the `ON CONFLICT (id) DO NOTHING` upsert would silently no-op and the
+    /// imported graph would reference a module the runtime then refuses).
     pub async fn modules_exist(&self, module_ids: &[Uuid]) -> Result<Vec<Uuid>> {
         if module_ids.is_empty() {
             return Ok(vec![]);
@@ -83,6 +93,38 @@ impl WorkflowRepository {
             .bind(module_ids)
             .fetch_all(&self.db_pool)
             .await?;
+
+        Ok(rows)
+    }
+
+    /// Return the subset of `module_ids` this user may bind into a workflow:
+    /// catalog rows (`user_id IS NULL`) OR rows they own.
+    ///
+    /// 2026-09-10: the batch twin of
+    /// `ModuleRepository::module_accessible_by_user` — same predicate, same
+    /// reason. The runtime (`Registry::get_module_bytes`) already refuses a
+    /// foreign module at dispatch, so an authoring path that accepted any
+    /// existing id was not an execution hole; it was (a) a UUID-existence
+    /// oracle across tenants (`create_workflow` / `import_workflow` answered
+    /// "not found" for absent ids and proceeded for foreign ones) and (b) a
+    /// path to a workflow that validates green and fails at first run.
+    /// Mirror the visibility rule here rather than re-deriving it.
+    pub async fn modules_accessible_by_user(
+        &self,
+        module_ids: &[Uuid],
+        user_id: Uuid,
+    ) -> Result<Vec<Uuid>> {
+        if module_ids.is_empty() {
+            return Ok(vec![]);
+        }
+        let rows: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM modules \
+             WHERE id = ANY($1) AND (user_id = $2 OR user_id IS NULL)",
+        )
+        .bind(module_ids)
+        .bind(user_id)
+        .fetch_all(&self.db_pool)
+        .await?;
 
         Ok(rows)
     }
@@ -513,9 +555,20 @@ impl WorkflowRepository {
     /// `category` (from Phase 1.5 column) or fall back to "template" and
     /// expose `code_template` (also from `modules.source_code`, where inline
     /// catalog templates originally lived).
+    ///
+    /// TENANCY (2026-09-10): the projection carries `source_code`, and the
+    /// ids come from the caller's graph — which `add_node_to_workflow` /
+    /// `import_workflow` used to accept unchecked. An unscoped read here
+    /// therefore let a user export ANOTHER tenant's module source by
+    /// binding its UUID into their own workflow and calling
+    /// `export_workflow(include_source: true)`. The predicate is the same
+    /// visibility rule as `ModuleRepository::module_accessible_by_user`
+    /// (catalog rows OR rows the caller owns); a module outside it is simply
+    /// absent from the bundle, exactly as a non-existent id is.
     pub async fn get_module_export_metadata(
         &self,
         module_ids: &[Uuid],
+        user_id: Uuid,
         include_source: bool,
     ) -> Result<Vec<ModuleExportInfo>> {
         if module_ids.is_empty() {
@@ -527,10 +580,11 @@ impl WorkflowRepository {
                     wasm_bytes IS NOT NULL AND octet_length(wasm_bytes) > 0 AS is_compiled, \
                     category, source_code \
              FROM modules \
-             WHERE id = ANY($1) \
+             WHERE id = ANY($1) AND (user_id = $2 OR user_id IS NULL) \
              ORDER BY id, (wasm_bytes IS NOT NULL) DESC",
         )
         .bind(module_ids)
+        .bind(user_id)
         .fetch_all(&self.db_pool)
         // FAIL CLOSED: a query error must propagate, not silently yield an
         // empty set. This feeds export_platform_state / export_workflow — a

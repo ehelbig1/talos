@@ -17,8 +17,10 @@
 //! that would otherwise collide at the root namespace.
 
 pub mod distributed;
+pub mod governor_key;
 mod middleware;
 
+pub use governor_key::TrustedProxyClientIpKeyExtractor;
 pub use middleware::*;
 
 // `is_production` now lives in `talos-config`; re-exported here as

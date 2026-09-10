@@ -634,11 +634,61 @@ fn check_disallowed_functions(stmt: &Statement) -> Result<(), SqlValidationError
 ///
 /// Does NOT match calls into other schemas (`public.pg_sleep`,
 /// `myapp.pg_sleep`) — see the rationale on `check_disallowed_functions`.
+/// Worker-local supplement to the canonical
+/// `talos_workflow_job_protocol::DISALLOWED_SQL_FUNCTIONS` deny-list.
+///
+/// The SQL/XML mapping family (`xml.c`) takes a QUERY or a TABLE/SCHEMA/
+/// DATABASE name and executes SQL on the caller's behalf through SPI —
+/// `query_to_xml('DELETE FROM …', …)` runs the string it is handed, and
+/// `database_to_xml(...)` walks every table the role can read. That is a
+/// second SQL interpreter inside a statement the AST walker has already
+/// classified as a plain `SELECT`, so the statement-shape classifier, the
+/// CTE-mutation walker and the allowlist all see a read while the server
+/// performs whatever the string says. Denied by name, both bare and
+/// `pg_catalog`-qualified, exactly like the canonical list.
+///
+/// `xmltable` is included for the same conservatism: it is an XML/XPath
+/// evaluator over caller-shaped input rather than an SPI executor, but it has
+/// no place in guest SQL and shares the family's surface.
+///
+/// Lives HERE rather than in the protocol crate only because that crate is
+/// owned separately; fold it into `DISALLOWED_SQL_FUNCTIONS` when that list is
+/// next edited, and delete this one.
+#[cfg(test)]
+pub(crate) const WORKER_DISALLOWED_SQL_FUNCTIONS: &[&str] = &[
+    "query_to_xml",
+    "query_to_xmlschema",
+    "query_to_xml_and_xmlschema",
+    "cursor_to_xml",
+    "cursor_to_xmlschema",
+    "table_to_xml",
+    "table_to_xmlschema",
+    "table_to_xml_and_xmlschema",
+    "schema_to_xml",
+    "schema_to_xmlschema",
+    "schema_to_xml_and_xmlschema",
+    "database_to_xml",
+    "database_to_xmlschema",
+    "database_to_xml_and_xmlschema",
+    "xmltable",
+];
+
+/// Canonical list only, case-insensitively. The SQL/XML SPI family that
+/// `WORKER_DISALLOWED_SQL_FUNCTIONS` names was FOLDED INTO
+/// `talos_workflow_job_protocol::DISALLOWED_SQL_FUNCTIONS` on 2026-09-10 so
+/// the controller-side `talos.database.query` subscriber denies the same
+/// names; the worker list is kept only as a PIN (see
+/// `worker_supplement_is_in_the_canonical_list`) so a future edit to either
+/// side cannot let the two fences drift.
+fn is_denied_sql_function(fn_name: &str) -> bool {
+    talos_workflow_job_protocol::is_disallowed_sql_function(fn_name)
+}
+
 fn denied_function_name(name: &ast::ObjectName) -> Option<String> {
     let segments: Vec<&str> = name.0.iter().map(|ident| ident.value.as_str()).collect();
     match segments.as_slice() {
         [bare] => {
-            if talos_workflow_job_protocol::is_disallowed_sql_function(bare) {
+            if is_denied_sql_function(bare) {
                 Some(bare.to_ascii_lowercase())
             } else {
                 None
@@ -649,9 +699,7 @@ fn denied_function_name(name: &ast::ObjectName) -> Option<String> {
             // user-defined) name-collide are out of scope: the validator
             // can't disambiguate the user's intent from the AST and the
             // role-wrap (M-2) is the fence for that case.
-            if schema.eq_ignore_ascii_case("pg_catalog")
-                && talos_workflow_job_protocol::is_disallowed_sql_function(fn_name)
-            {
+            if schema.eq_ignore_ascii_case("pg_catalog") && is_denied_sql_function(fn_name) {
                 Some(format!("pg_catalog.{}", fn_name.to_ascii_lowercase()))
             } else {
                 None
@@ -1802,6 +1850,72 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, SqlValidationError::DisallowedFunction(_)));
+    }
+
+    /// E8 (2026-09): the SQL/XML family executes the SQL it is handed via
+    /// SPI, inside a statement the walker classifies as a SELECT. Every
+    /// member, bare and `pg_catalog`-qualified, in an expression AND as a
+    /// FROM-clause table function.
+    /// The worker-local list is a PIN on the canonical protocol list, not a
+    /// supplement: `is_denied_sql_function` consults the protocol list only,
+    /// so a name present here but absent there would be a silent gap on
+    /// BOTH fences. This test makes that gap a red build.
+    #[test]
+    fn worker_supplement_is_in_the_canonical_list() {
+        for f in super::WORKER_DISALLOWED_SQL_FUNCTIONS {
+            assert!(
+                talos_workflow_job_protocol::is_disallowed_sql_function(f),
+                "{f} is named by the worker list but missing from \
+                 talos_workflow_job_protocol::DISALLOWED_SQL_FUNCTIONS"
+            );
+        }
+    }
+
+    #[test]
+    fn function_deny_list_covers_the_sql_xml_spi_family() {
+        for f in super::WORKER_DISALLOWED_SQL_FUNCTIONS {
+            let err = validate_sql(
+                &format!("SELECT {f}('DELETE FROM users', true, false, '')"),
+                &[],
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, SqlValidationError::DisallowedFunction(_)),
+                "{f} must be denied in an expression, got {err:?}"
+            );
+            let err = validate_sql(
+                &format!("SELECT pg_catalog.{f}('DELETE FROM users', true, false, '')"),
+                &[],
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, SqlValidationError::DisallowedFunction(_)),
+                "pg_catalog.{f} must be denied, got {err:?}"
+            );
+            let upper = f.to_ascii_uppercase();
+            let err =
+                validate_sql(&format!("SELECT {upper}('x', true, false, '')"), &[]).unwrap_err();
+            assert!(
+                matches!(err, SqlValidationError::DisallowedFunction(_)),
+                "{upper} (case-insensitive) must be denied, got {err:?}"
+            );
+        }
+        // The nested-SPI shape the family exists for: a "read" that deletes.
+        let err = validate_sql(
+            "SELECT query_to_xml('DELETE FROM users', true, false, '') AS x",
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(err, SqlValidationError::DisallowedFunction(_)));
+        // FROM-clause form.
+        let err = validate_sql(
+            "SELECT * FROM query_to_xml('DELETE FROM users', true, false, '')",
+            &[],
+        )
+        .unwrap_err();
+        assert!(matches!(err, SqlValidationError::DisallowedFunction(_)));
+        // Control: an ordinary function of similar shape still passes.
+        assert!(validate_sql("SELECT xmlcomment('hi')", &[]).is_ok());
     }
 
     #[test]

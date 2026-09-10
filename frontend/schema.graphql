@@ -994,7 +994,15 @@ type MutationRoot {
 	logoutAllSessions: Boolean!
 	setupTwoFactor: TwoFactorSetup!
 	enableTwoFactor(input: Enable2FAInput!): TwoFactorEnrollment!
-	disableTwoFactor: Boolean!
+	"""
+	Disable two-factor authentication. API-key callers must supply a current TOTP or backup `code`.
+	"""
+	disableTwoFactor(
+		"""
+		Current TOTP or backup code. Required when authenticating with an API key; ignored for a 2FA-verified browser session.
+		"""
+		code: String
+	): Boolean!
 	verifyTwoFactor(input: Verify2FAInput!): AuthPayload!
 	unlinkOauthAccount(provider: String!): Boolean!
 	retryExecution(executionId: UUID!): UUID!

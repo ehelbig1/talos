@@ -1020,6 +1020,11 @@ impl ActorsMutations {
                 async_graphql::Error::new("Actor not found or access denied").extend_safe()
             })?;
 
+        // 2026-09-10: the source's `max_llm_tier` / `egress_scope` /
+        // `max_write_ceiling` travel with the clone (see the MCP twin
+        // `handle_clone_actor`). Pre-fix the INSERT took the column defaults —
+        // the widest posture — while the memories were copied beside it.
+        let src_ceilings = src.ceilings();
         let src_name: String = src.name;
         let src_description: Option<String> = src.description;
         let src_world: Option<String> = src.max_capability_world;
@@ -1035,13 +1040,14 @@ impl ActorsMutations {
         let world = src_world.as_deref().unwrap_or("minimal-node");
 
         actor_repo
-            .insert_actor_scoped(
+            .insert_actor_clone_scoped(
                 &mut tx,
                 new_id,
                 user_id,
                 &clone_name,
                 src_description.as_deref(),
                 world,
+                &src_ceilings,
             )
             .await
             .map_err(|e| {

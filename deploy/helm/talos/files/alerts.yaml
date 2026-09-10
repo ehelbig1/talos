@@ -3628,6 +3628,80 @@ groups:
             blocks DEK unwrap (controller CrashLoops); minio blocks the
             WORM audit sink. Restore the pod, then check its PVC.
 
+      # In-cluster Postgres backup CronJob (templates/postgres/backup-cronjob.yaml).
+      #
+      # WHY TWO RULES, AND WHY HERE. Until 2026-09-10 the CronJob's script ran
+      # under /bin/sh in a Debian image — dash — and died on `set -o pipefail`
+      # with exit 2 before its first real line. Every scheduled backup Job had
+      # failed, forever, and NOTHING said so: the CronJob object looked healthy,
+      # `successfulJobsHistoryLimit: 1` kept no successful Job around to be
+      # missed, and the drill alert above (TalosBackupRestoreDrillFailed) is
+      # explicitly not satisfiable in-cluster. A backup that has never run is
+      # the failure an operator most needs told about, and only kube-state-
+      # metrics can see it from Prometheus — so these live in the `kube_*`
+      # group, under the header that explains why they carry NO absent() arm:
+      # a cluster on managed Postgres has no such CronJob, and its absence is
+      # topology, not an outage.
+      #
+      # (1) A Job of the CronJob FAILED — `kube_job_status_failed` is 1 per
+      #     failed Job object. `failedJobsHistoryLimit: 3` keeps them around,
+      #     so this stays firing until an operator looks (or three later Jobs
+      #     succeed and age the failed ones out — the CronJob's own record of
+      #     the failure is what clears it, deliberately).
+      - alert: TalosPostgresBackupJobFailed
+        expr: |
+          kube_job_status_failed{job_name=~".*postgres-backup.*"} > 0
+        for: 5m
+        labels:
+          severity: warning
+          category: ops-hygiene
+        annotations:
+          summary: "Postgres backup Job {{ $labels.job_name }} failed"
+          description: |
+            A pg_dump Job spawned by the postgres-backup CronJob failed.
+            `kubectl -n {{ $labels.namespace }} logs job/{{ $labels.job_name }}`
+            has the script output — the script is /bin/bash with pipefail and
+            refuses a dump under 1 KiB, so a "success" here is a real dump.
+            Until this fires cleanly at least once, assume the daily backup is
+            NOT happening.
+
+      # (2) NO SUCCESSFUL BACKUP IN 26 HOURS. Two arms, joined by `or`, both
+      #     scoped to a CronJob that EXISTS (so managed-Postgres clusters match
+      #     nothing — see the group header):
+      #       * the CronJob is older than 26 h and has NEVER succeeded —
+      #         `kube_cronjob_status_last_successful_time` is emitted only once
+      #         the field is set, so a bare `time() - last_success > 26h` is
+      #         SILENCED by exactly the condition it should detect (the same
+      #         absent-vs-zero trap TalosBackupRestoreDrillFailed documents).
+      #         `kube_cronjob_created` is emitted for every CronJob, so it is
+      #         the anchor the never-succeeded arm can stand on;
+      #       * the CronJob has succeeded before, but not in the last 26 h
+      #         (the schedule is daily at 03:00; 26 h absorbs one slow run).
+      - alert: TalosPostgresBackupStale
+        expr: |
+          (
+            (time() - kube_cronjob_created{cronjob=~".*postgres-backup.*"}) > 26*3600
+            unless on (namespace, cronjob)
+            kube_cronjob_status_last_successful_time{cronjob=~".*postgres-backup.*"}
+          )
+          or
+          (
+            (time() - kube_cronjob_status_last_successful_time{cronjob=~".*postgres-backup.*"}) > 26*3600
+          )
+        for: 30m
+        labels:
+          severity: warning
+          category: ops-hygiene
+        annotations:
+          summary: "No successful Postgres backup from {{ $labels.cronjob }} in 26h"
+          description: |
+            The in-cluster postgres-backup CronJob has not completed a
+            successful pg_dump in the last 26 hours (or has never completed one
+            since it was created). Check `kubectl -n {{ $labels.namespace }} get
+            jobs -l app.kubernetes.io/component=postgres-backup` and the most
+            recent Job's logs. Restore-ability is a separate question answered
+            by the drill (scripts/drills/README.md), not by this rule.
+
       # NATS is the only HA stateful component (3-replica quorum). Below
       # quorum (<2 ready) JetStream loses write availability.
       - alert: TalosNatsBelowQuorum

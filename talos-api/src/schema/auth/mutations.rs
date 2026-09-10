@@ -6,7 +6,9 @@ use tower_cookies::Cookies;
 use uuid::Uuid;
 
 use crate::schema::types::*;
-use crate::schema::{require_2fa, RequestMetadata, SafeErrorExtensions};
+use crate::schema::{
+    require_2fa, require_scope, ApiKeyScopes, RequestMetadata, SafeErrorExtensions,
+};
 
 #[derive(Default)]
 pub struct AuthMutations;
@@ -258,6 +260,10 @@ impl AuthMutations {
     /// Use this after a suspected account compromise or when a user wants to
     /// sign out everywhere. Clears the current device's cookies as well.
     async fn logout_all_sessions(&self, ctx: &Context<'_>) -> Result<bool> {
+        // 2026-09-10: an API key may revoke every session of its owner only
+        // with the Admin scope. Session callers (no `ApiKeyScopes`) pass
+        // unchanged — the deliberate session semantics of `require_scope`.
+        require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
         let auth_service = ctx.data::<Arc<talos_auth::AuthService>>()?;
         let cookies = ctx.data::<Cookies>()?;
 
@@ -387,14 +393,63 @@ impl AuthMutations {
         Ok(TwoFactorEnrollment { backup_codes })
     }
 
-    async fn disable_two_factor(&self, ctx: &Context<'_>) -> Result<bool> {
+    /// Disable two-factor authentication. API-key callers must supply a current TOTP or backup `code`.
+    //
+    // `code` (2026-09-10) is a CURRENT TOTP or backup code. It is OPTIONAL in
+    // the schema so the frontend's existing `mutation Disable2FA {
+    // disableTwoFactor }` keeps working unchanged, and it is ENFORCED only
+    // when the caller is API-key authenticated: an API key is a long-lived
+    // bearer token with no second factor of its own, and API-key requests
+    // inject `IsTwoFactorVerified(true)` by construction — so `require_2fa`
+    // alone let any Admin-scoped key strip the account's second factor. A
+    // browser session reached this mutation by completing TOTP already and
+    // is not asked twice. Verification goes through `verify_2fa_login`, which
+    // carries the brute-force lockout and atomic backup-code consumption.
+    // (Plain `//` so the rationale stays out of the public SDL description.)
+    async fn disable_two_factor(
+        &self,
+        ctx: &Context<'_>,
+        #[graphql(
+            desc = "Current TOTP or backup code. Required when authenticating with an API key; ignored for a 2FA-verified browser session."
+        )]
+        code: Option<String>,
+    ) -> Result<bool> {
         require_2fa(ctx)?;
+        // Admin scope for an API key; sessions pass unchanged.
+        require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
         let totp_service = ctx.data::<Arc<talos_totp_2fa::TotpService>>()?;
 
         // Get authenticated user
         let user_id = ctx
             .data_opt::<Uuid>()
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
+
+        if ctx.data::<ApiKeyScopes>().is_ok() {
+            let code =
+                match code.as_deref().map(str::trim) {
+                    Some(c) if !c.is_empty() => c.to_string(),
+                    _ => return Err(async_graphql::Error::new(
+                        "Invalid request: a current TOTP or backup code is required to disable \
+                         two-factor authentication with an API key",
+                    )
+                    .extend_safe()),
+                };
+            let auth_service = ctx.data::<Arc<talos_auth::AuthService>>()?;
+            let user = auth_service.get_user(*user_id).await.map_err(|e| {
+                tracing::error!("Failed to get user: {}", e);
+                async_graphql::Error::new("Failed to get user").extend_safe()
+            })?;
+            let valid = totp_service
+                .verify_2fa_login(*user_id, &code, &user.email)
+                .await
+                .map_err(|e| {
+                    tracing::error!("2FA verification failed: {}", e);
+                    async_graphql::Error::new("2FA verification failed").extend_safe()
+                })?;
+            if !valid {
+                return Err(async_graphql::Error::new("Invalid 2FA code").extend_safe());
+            }
+        }
 
         totp_service.disable_2fa(*user_id).await.map_err(|e| {
             tracing::error!("Failed to disable 2FA: {}", e);
@@ -514,6 +569,9 @@ impl AuthMutations {
         // be able to remove the user's Google/Okta login as part of an
         // account-takeover squat.
         require_2fa(ctx)?;
+        // 2026-09-10: Admin scope for an API key (removing a login path is an
+        // account-security change); sessions pass unchanged.
+        require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
         let oauth_service = ctx.data::<Arc<talos_oauth::OAuthService>>()?;
 
         // Get authenticated user_id from context

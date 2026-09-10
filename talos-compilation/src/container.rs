@@ -37,6 +37,91 @@ const DEFAULT_MEMORY: &str = "2g";
 /// Default CPU limit for the compilation container.
 const DEFAULT_CPUS: &str = "2";
 
+/// Process-count ceiling inside every sandbox container (2026-09-10). The
+/// memory and CPU limits bound how MUCH a fork bomb can consume, not how
+/// many processes it can spawn before the OOM killer notices; `--pids-limit`
+/// is the control that does. 512 is generous for `cargo` (rustc + a proc-
+/// macro server per crate, sccache, linker) and for jco / componentize-py.
+const CONTAINER_PIDS_LIMIT: &str = "512";
+
+/// Environment variables a HOST-side fallback spawn (`cargo`, `jco`,
+/// `componentize-py` running directly on the controller host) may inherit.
+///
+/// Everything else is dropped by `env_clear()` in [`host_command`]
+/// (2026-09-10). Before this, every host fallback inherited the controller's
+/// WHOLE environment — `WORKER_SHARED_KEY`, `TALOS_MASTER_KEY`,
+/// `DATABASE_URL`, `ANTHROPIC_API_KEY`, the vault token, … — and a
+/// user-supplied `build.rs`, proc-macro, or `env!("TALOS_MASTER_KEY")` runs
+/// in that process. The container path never had this problem (`podman run`
+/// starts from an empty environment); this makes the fallback match it.
+///
+/// The list is what the toolchains demonstrably need: process basics (PATH,
+/// HOME, user, locale, temp dir, XDG cache roots — jco's wizer step writes a
+/// wasmtime cache there), cargo/rustup discovery + caches, the sccache wrapper
+/// this workspace's dev boxes use, TLS roots, the Talos WIT/SDK fixture
+/// overrides the scaffold reads, and the host-language toolchain roots. No
+/// `*_KEY`, `*_URL`, `*_TOKEN`, `*SECRET*` or `*PASSWORD*` name is on it, and
+/// a test pins that shape.
+const HOST_SPAWN_ENV_ALLOWLIST: &[&str] = &[
+    // Process basics.
+    "PATH",
+    "HOME",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    // Rust toolchain discovery + caches. `CARGO_TARGET_DIR` is re-set by
+    // the caller when a per-user cache is in play (see `build_command`).
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "CARGO_TARGET_DIR",
+    "CARGO_BUILD_JOBS",
+    "CARGO_NET_OFFLINE",
+    "CARGO_HTTP_CAINFO",
+    "RUSTC_WRAPPER",
+    "SCCACHE_DIR",
+    "SCCACHE_CACHE_SIZE",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    // Talos scaffold fixture overrides (paths, not secrets).
+    "TALOS_WIT_PATH",
+    "TALOS_SDK_MACROS_PATH",
+    "TALOS_DEFAULT_WIT_WORLD",
+    // Host-language toolchains (jco / componentize-py).
+    "NODE_PATH",
+    "NPM_CONFIG_CACHE",
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "VIRTUAL_ENV",
+];
+
+/// Build a HOST-side `Command` whose environment is `env_clear()`ed and then
+/// re-populated ONLY from [`HOST_SPAWN_ENV_ALLOWLIST`]. Every host-fallback
+/// spawn in this crate goes through here — `build_command`, `audit_command`,
+/// `tool_command` — so a fourth spawn site cannot quietly inherit the
+/// controller's credentials again. Callers may still `.env(...)` on top
+/// (e.g. `CARGO_TARGET_DIR`).
+pub fn host_command(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    cmd.env_clear();
+    for key in HOST_SPAWN_ENV_ALLOWLIST {
+        if let Some(v) = std::env::var_os(key) {
+            cmd.env(key, v);
+        }
+    }
+    cmd
+}
+
 /// MCP-753 (2026-05-13): read an env var and treat empty strings as
 /// unset. Helm placeholder pattern (`TALOS_BUILDER_MEMORY: ""` in
 /// values.yaml when the operator hasn't overridden the override)
@@ -216,7 +301,7 @@ pub fn build_command(
 ) -> Result<Command> {
     if !container_enabled() {
         tracing::debug!("Container compilation disabled — using direct cargo");
-        let mut cmd = Command::new("cargo");
+        let mut cmd = host_command("cargo");
         if let Some(cache) = target_cache {
             cmd.env("CARGO_TARGET_DIR", cache);
         }
@@ -273,7 +358,7 @@ pub fn build_command(
                      falling back to direct cargo in non-production mode"
                 );
             }
-            let mut cmd = Command::new("cargo");
+            let mut cmd = host_command("cargo");
             if let Some(cache) = target_cache {
                 cmd.env("CARGO_TARGET_DIR", cache);
             }
@@ -352,6 +437,10 @@ pub fn build_command(
         // SECURITY: CPU limit to prevent resource starvation
         "--cpus",
         &cpus,
+        // SECURITY: process-count ceiling — memory/cpu bound consumption,
+        // this bounds fork-bomb fan-out (see CONTAINER_PIDS_LIMIT).
+        "--pids-limit",
+        CONTAINER_PIDS_LIMIT,
         // SECURITY: Run as non-root user (matches builder user in Dockerfile)
         "--user",
         "1000:1000",
@@ -397,7 +486,7 @@ pub fn build_command(
 pub fn audit_command(workspace: &Path, cargo_registry_cache: &Path) -> Result<Command> {
     if !container_enabled() {
         tracing::debug!("Container compilation disabled — using direct cargo for audit");
-        return Ok(Command::new("cargo"));
+        return Ok(host_command("cargo"));
     }
 
     let runtime = match detect_runtime() {
@@ -429,7 +518,7 @@ pub fn audit_command(workspace: &Path, cargo_registry_cache: &Path) -> Result<Co
             } else {
                 tracing::warn!("No container runtime found — falling back to direct cargo audit");
             }
-            return Ok(Command::new("cargo"));
+            return Ok(host_command("cargo"));
         }
     };
 
@@ -472,6 +561,10 @@ pub fn audit_command(workspace: &Path, cargo_registry_cache: &Path) -> Result<Co
         &memory,
         "--cpus",
         &cpus,
+        // SECURITY: process-count ceiling — memory/cpu bound consumption,
+        // this bounds fork-bomb fan-out (see CONTAINER_PIDS_LIMIT).
+        "--pids-limit",
+        CONTAINER_PIDS_LIMIT,
         "--user",
         "1000:1000",
         "--cap-drop=ALL",
@@ -528,7 +621,7 @@ pub fn tool_command(tool: &str, workspace: &Path) -> Result<Command> {
             tool,
             "Container compilation disabled — using direct host tool"
         );
-        let mut cmd = Command::new(tool);
+        let mut cmd = host_command(tool);
         cmd.current_dir(workspace);
         return Ok(cmd);
     }
@@ -541,7 +634,7 @@ pub fn tool_command(tool: &str, workspace: &Path) -> Result<Command> {
             "Container compilation enabled but no runtime found — \
              falling back to direct host tool"
         );
-        let mut cmd = Command::new(tool);
+        let mut cmd = host_command(tool);
         cmd.current_dir(workspace);
         return Ok(cmd);
     };
@@ -579,6 +672,10 @@ pub fn tool_command(tool: &str, workspace: &Path) -> Result<Command> {
         &memory,
         "--cpus",
         &cpus,
+        // SECURITY: process-count ceiling — memory/cpu bound consumption,
+        // this bounds fork-bomb fan-out (see CONTAINER_PIDS_LIMIT).
+        "--pids-limit",
+        CONTAINER_PIDS_LIMIT,
         "--user",
         "1000:1000",
         "--cap-drop=ALL",
@@ -882,6 +979,83 @@ mod tests {
             "host fallback must run from the workspace so relative args resolve"
         );
 
+        std::env::remove_var("TALOS_COMPILATION_CONTAINER");
+    }
+
+    #[tokio::test]
+    async fn host_command_does_not_inherit_the_controller_env() {
+        let _g = env_lock();
+        // A stand-in for WORKER_SHARED_KEY / TALOS_MASTER_KEY / DATABASE_URL:
+        // present in the controller process, must be ABSENT in the child.
+        std::env::set_var("TALOS_TEST_SECRET_SHOULD_NOT_LEAK", "leak-canary-9f3a");
+        let out = host_command("env")
+            .output()
+            .await
+            .expect("`env` must be spawnable in the test environment");
+        std::env::remove_var("TALOS_TEST_SECRET_SHOULD_NOT_LEAK");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !text.contains("leak-canary-9f3a"),
+            "host fallback leaked a non-allowlisted env var:\n{text}"
+        );
+        // …while the toolchain still finds its binaries.
+        assert!(
+            text.lines().any(|l| l.starts_with("PATH=")),
+            "PATH must survive the scrub:\n{text}"
+        );
+    }
+
+    #[test]
+    fn host_env_allowlist_carries_no_secret_shaped_names() {
+        for k in HOST_SPAWN_ENV_ALLOWLIST {
+            let upper = k.to_ascii_uppercase();
+            assert!(
+                !upper.ends_with("_KEY")
+                    && !upper.ends_with("_URL")
+                    && !upper.ends_with("_TOKEN")
+                    && !upper.contains("SECRET")
+                    && !upper.contains("PASSWORD")
+                    && !upper.contains("CREDENTIAL"),
+                "{k} looks like a credential name and must not be inherited by a host spawn"
+            );
+        }
+    }
+
+    #[test]
+    fn build_and_audit_host_mode_use_the_scrubbed_env() {
+        let _g = env_lock();
+        std::env::set_var("TALOS_COMPILATION_CONTAINER", "false");
+        std::env::set_var("RUST_ENV", "development");
+        std::env::set_var("TALOS_TEST_SECRET_SHOULD_NOT_LEAK", "leak-canary-9f3a");
+        let ws = PathBuf::from("/tmp/test-host-workspace");
+        let cache = PathBuf::from("/tmp/test-host-cache");
+        for cmd in [
+            build_command(&ws, &ws, &ws, Some(&cache)).unwrap(),
+            audit_command(&ws, &ws).unwrap(),
+        ] {
+            let envs: Vec<(String, Option<String>)> = cmd
+                .as_std()
+                .get_envs()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().into_owned(),
+                        v.map(|v| v.to_string_lossy().into_owned()),
+                    )
+                })
+                .collect();
+            // `env_clear` + explicit re-add means the explicit set IS the
+            // whole child env: PATH is on it, the canary is not.
+            assert!(envs.iter().any(|(k, _)| k == "PATH"));
+            assert!(envs
+                .iter()
+                .all(|(k, _)| k != "TALOS_TEST_SECRET_SHOULD_NOT_LEAK"));
+        }
+        let build = build_command(&ws, &ws, &ws, Some(&cache)).unwrap();
+        assert!(build
+            .as_std()
+            .get_envs()
+            .any(|(k, v)| k == "CARGO_TARGET_DIR" && v == Some(cache.as_os_str())));
+        std::env::remove_var("TALOS_TEST_SECRET_SHOULD_NOT_LEAK");
         std::env::remove_var("TALOS_COMPILATION_CONTAINER");
     }
 

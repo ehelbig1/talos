@@ -1,7 +1,6 @@
 use super::{CompilationError, CompilationService};
 use anyhow::{Context, Result};
 use std::process::Stdio;
-use tokio::process::Command;
 use uuid::Uuid;
 
 /// Static source-level lint that detects known WASM fuel anti-patterns.
@@ -168,6 +167,21 @@ pub fn lint_source_code(source: &str) -> Vec<CompilationError> {
 ///     "cannot find function `Command::new` in module `process`"
 ///     when the std feature isn't even compiled in. Opt-out:
 ///     `// lint-allow: std-process`.
+///   * `env!(` / `option_env!(` (incl. `concat!(env!(`) — COMPILE-TIME
+///     environment capture. The build runs on the controller host (or in
+///     the sandbox with whatever env the runtime hands it), so
+///     `env!("TALOS_MASTER_KEY")` bakes a controller credential into the
+///     module bytes, which the author then reads back at runtime. Nothing
+///     a WASM module legitimately needs is in the BUILD environment.
+///     Opt-out: `// lint-allow: build-env`.
+///   * `include_str!(` / `include_bytes!(` / `include!(` — compile-time
+///     FILE embedding. The path is resolved on the build host relative to
+///     the source file, so `include_bytes!("/etc/talos/master.key")` or
+///     `include_str!("../../.env")` reads the host filesystem into the
+///     module. Opt-out: `// lint-allow: include-file`.
+///   * `#[path = "..."]` — points a `mod` at an arbitrary file on the
+///     build host, the same read primitive as `include!` with a module
+///     wrapper. Opt-out: `// lint-allow: path-attr`.
 ///
 /// Each lint suppresses on lines that are line-comments or contain
 /// the opt-out marker. String literals containing the keyword (e.g.
@@ -254,6 +268,77 @@ pub(crate) fn scan_forbidden_patterns(source: &str) -> Vec<CompilationError> {
                 severity: "error".to_string(),
             });
         }
+
+        // 4. Compile-time environment capture: env!(…) / option_env!(…).
+        //    `find_keyword_outside_string` requires a non-word char on the
+        //    LEFT, so `option_env!` does NOT double-fire the `env!` arm (the
+        //    `_` before `env` is a word char) and `my_env!` is not matched.
+        for kw in ["env!", "option_env!"] {
+            if find_keyword_outside_string(line, kw).is_some()
+                && !line.contains("// lint-allow: build-env")
+            {
+                out.push(CompilationError {
+                    line: Some(line_no),
+                    column: None,
+                    end_line: None,
+                    end_column: None,
+                    message: format!(
+                        "forbidden-build-env: `{kw}(...)` captures the BUILD HOST's environment \
+                         at compile time. The module is compiled on the controller (or in its \
+                         sandbox), so this would bake controller-side configuration or \
+                         credentials into the module bytes. Runtime configuration reaches a \
+                         module through its `config` input; secrets through \
+                         `talos::core::secrets`. If you have a documented justification, add \
+                         `// lint-allow: build-env` to this line."
+                    ),
+                    severity: "error".to_string(),
+                });
+                break;
+            }
+        }
+
+        // 5. Compile-time file embedding: include_str! / include_bytes! / include!.
+        for kw in ["include_str!", "include_bytes!", "include!"] {
+            if find_keyword_outside_string(line, kw).is_some()
+                && !line.contains("// lint-allow: include-file")
+            {
+                out.push(CompilationError {
+                    line: Some(line_no),
+                    column: None,
+                    end_line: None,
+                    end_column: None,
+                    message: format!(
+                        "forbidden-include: `{kw}(...)` reads a file from the BUILD HOST's \
+                         filesystem into the module at compile time. A module is a single \
+                         source file; there is nothing legitimate for it to embed, and the \
+                         path resolves on the controller. If you have a documented \
+                         justification, add `// lint-allow: include-file` to this line."
+                    ),
+                    severity: "error".to_string(),
+                });
+                break;
+            }
+        }
+
+        // 6. `#[path = "..."]` on a `mod` — the same host-file read as
+        //    `include!`, with a module wrapper.
+        if let Some(pos) = find_keyword_outside_string(line, "#[path") {
+            let after = line[pos + "#[path".len()..].trim_start();
+            if after.starts_with('=') && !line.contains("// lint-allow: path-attr") {
+                out.push(CompilationError {
+                    line: Some(line_no),
+                    column: None,
+                    end_line: None,
+                    end_column: None,
+                    message: "forbidden-path-attr: `#[path = \"...\"]` points a module at an \
+                         arbitrary file on the BUILD HOST. A module is a single source file. \
+                         If you have a documented justification, add `// lint-allow: path-attr` \
+                         to this line."
+                        .to_string(),
+                    severity: "error".to_string(),
+                });
+            }
+        }
     }
     out
 }
@@ -335,10 +420,36 @@ impl CompilationService {
         // than build → 30s matches audit. Timeout error wraps via
         // `.context(...)` so the GraphQL error mapping retains an
         // operator-readable reason without leaking source-code detail.
+        //
+        // 2026-09-10: routed through `container::build_command` like every
+        // other cargo spawn in this crate. Pre-fix this was a bare
+        // `Command::new("cargo")` — it ran on the HOST even with the sandbox
+        // enabled, inherited the controller's whole environment, and skipped
+        // the production fail-closed gate that `build_command` applies. A
+        // `build_command` refusal (production without a runtime and without
+        // the host-fallback ack) is PROPAGATED, never worked around.
+        let cargo_registry_cache = dirs_next::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("/tmp"))
+            .join(".cargo/registry");
+        let wit_dir = self
+            .wit_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let mut cmd =
+            match crate::container::build_command(&workspace, &cargo_registry_cache, wit_dir, None)
+            {
+                Ok(cmd) => cmd,
+                Err(e) => {
+                    tokio::fs::remove_dir_all(&workspace).await.ok();
+                    return Err(e).context(
+                        "Source analysis requires the compilation sandbox (or an explicit \
+                     host-fallback opt-in); refusing to run `cargo component check` on the host",
+                    );
+                }
+            };
         let output = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            Command::new("cargo")
-                .arg("component")
+            cmd.arg("component")
                 .arg("check")
                 .arg("--message-format=json")
                 .current_dir(&workspace)
@@ -547,5 +658,98 @@ mod forbidden_pattern_tests {
     fn skips_line_comments() {
         let errs = err_msgs("// example: unsafe { x }");
         assert!(errs.is_empty());
+    }
+
+    // ── Compile-time host capture (2026-09-10) ────────────────────────
+
+    #[test]
+    fn flags_env_macro_and_option_env_and_concat_env() {
+        for src in [
+            r#"const K: &str = env!("TALOS_MASTER_KEY");"#,
+            r#"const K: Option<&str> = option_env!("WORKER_SHARED_KEY");"#,
+            r#"const K: &str = concat!(env!("DATABASE_URL"), "/x");"#,
+            r#"let k = std::env!("HOME");"#,
+        ] {
+            let errs = err_msgs(src);
+            assert_eq!(
+                errs.iter()
+                    .filter(|m| m.contains("forbidden-build-env"))
+                    .count(),
+                1,
+                "{src} → {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn flags_include_macros() {
+        for src in [
+            r#"const S: &str = include_str!("../../.env");"#,
+            r#"const B: &[u8] = include_bytes!("/etc/talos/master.key");"#,
+            r#"include!("/etc/passwd");"#,
+        ] {
+            let errs = err_msgs(src);
+            assert_eq!(
+                errs.iter()
+                    .filter(|m| m.contains("forbidden-include"))
+                    .count(),
+                1,
+                "{src} → {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn flags_path_attribute() {
+        let errs = err_msgs(r#"#[path = "/etc/talos/secrets.rs"] mod leak;"#);
+        assert!(errs.iter().any(|m| m.contains("forbidden-path-attr")));
+        let errs = err_msgs(r#"#[path="../../x.rs"] mod leak;"#);
+        assert!(errs.iter().any(|m| m.contains("forbidden-path-attr")));
+    }
+
+    #[test]
+    fn host_capture_lints_respect_string_literals_and_comments() {
+        for src in [
+            r#"let s = "call env!(\"X\") here";"#,
+            r#"let s = "docs mention include_str!(...)";"#,
+            r##"let s = "#[path = \"x\"]";"##,
+            "// env!(\"X\") in a comment",
+            "// include_bytes!(\"x\") in a comment",
+        ] {
+            let errs = err_msgs(src);
+            assert!(
+                errs.iter().all(|m| {
+                    !m.contains("forbidden-build-env")
+                        && !m.contains("forbidden-include")
+                        && !m.contains("forbidden-path-attr")
+                }),
+                "{src} → {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_capture_lints_do_not_fire_on_runtime_env_or_similar_names() {
+        // `std::env::var` is a RUNTIME read (and unavailable in WASM anyway,
+        // but it is not the compile-time capture this lint is about).
+        let errs = err_msgs(r#"let v = std::env::var("X");"#);
+        assert!(errs.iter().all(|m| !m.contains("forbidden-build-env")));
+        // Identifiers that merely end in the keyword.
+        let errs = err_msgs("my_env!(x); reinclude!(y); path = 3;");
+        assert!(errs.iter().all(|m| {
+            !m.contains("forbidden-build-env")
+                && !m.contains("forbidden-include")
+                && !m.contains("forbidden-path-attr")
+        }));
+    }
+
+    #[test]
+    fn honours_host_capture_opt_outs() {
+        let errs = err_msgs(r#"const K: &str = env!("X"); // lint-allow: build-env"#);
+        assert!(errs.iter().all(|m| !m.contains("forbidden-build-env")));
+        let errs = err_msgs(r#"const S: &str = include_str!("x"); // lint-allow: include-file"#);
+        assert!(errs.iter().all(|m| !m.contains("forbidden-include")));
+        let errs = err_msgs(r#"#[path = "x.rs"] mod m; // lint-allow: path-attr"#);
+        assert!(errs.iter().all(|m| !m.contains("forbidden-path-attr")));
     }
 }

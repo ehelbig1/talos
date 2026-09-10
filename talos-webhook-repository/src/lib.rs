@@ -68,10 +68,16 @@ pub struct WebhookDlqRow {
 /// marker) returned by `get_dlq_entry_for_replay`. Ownership is enforced
 /// by the INNER JOIN on the trigger's `user_id` — orphaned entries
 /// (trigger deleted, FK SET NULL) are deliberately inaccessible (MCP-675).
+///
+/// `headers` is the DLP-scrubbed header map `enqueue_dlq` stored, which also
+/// carries the engine-stamped `talos_webhooks::DLQ_AUTHENTICATED_KEY` bool —
+/// `dispatch_replay` REFUSES an entry that was captured above the auth gate,
+/// so the replay path must be handed the map, not just the payload.
 #[derive(Debug, sqlx::FromRow)]
 pub struct WebhookDlqReplayRow {
     pub trigger_id: Option<Uuid>,
     pub payload: Option<serde_json::Value>,
+    pub headers: Option<serde_json::Value>,
     pub replayed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
@@ -295,7 +301,7 @@ impl WebhookRepository {
         user_id: Uuid,
     ) -> Result<Option<WebhookDlqReplayRow>> {
         let row = sqlx::query_as::<_, WebhookDlqReplayRow>(
-            "SELECT d.trigger_id, d.payload, d.replayed_at \
+            "SELECT d.trigger_id, d.payload, d.headers, d.replayed_at \
              FROM webhook_dlq d \
              INNER JOIN webhook_triggers t ON t.id = d.trigger_id \
              WHERE d.id = $1 AND t.user_id = $2",

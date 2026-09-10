@@ -14,7 +14,11 @@ spec:
     - Ingress
     - Egress
   ingress:
-    # Controller + worker clients, plus peer NATS (for clustering).
+    # Controller + worker are CLIENTS: client port only. Until 2026-09-10
+    # this rule also opened the ROUTE port (clusterPort) to both, so any
+    # controller or worker pod could dial 6222 and — with the route port
+    # then carrying no authorization at all — join the cluster as a peer
+    # and receive every subject's traffic. Clients never need 6222.
     - from:
         - podSelector:
             matchLabels:
@@ -24,13 +28,16 @@ spec:
             matchLabels:
               app.kubernetes.io/component: worker
               app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.nats.service.clientPort }}
+    # Peer NATS servers: route port only. Peers do not use the client port.
+    - from:
         - podSelector:
             matchLabels:
               app.kubernetes.io/component: nats
               app.kubernetes.io/instance: {{ .Release.Name }}
       ports:
-        - protocol: TCP
-          port: {{ .Values.nats.service.clientPort }}
         - protocol: TCP
           port: {{ .Values.nats.service.clusterPort }}
     # MCP-896 (2026-05-14): scrape from a scoped monitoring namespace.

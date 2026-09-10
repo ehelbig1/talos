@@ -493,6 +493,12 @@ impl async_graphql::dataloader::Loader<Uuid> for ModuleLoader {
         // Phase 5.1: unified `modules` table; bare-pool read preserved
         // (the loader's own pool backs the per-call repository).
         let repo = talos_module_repository::ModuleRepository::new(self.0.clone());
+        // allow-bare-pool-read: batch loader keyed by module ids that every
+        // consumer (`WebhookTrigger.module`, `ModuleExecution.module`) has
+        // already resolved through a user-scoped parent read; modules are
+        // also legitimately referenced across users via
+        // `workflow_module_refs`, so the unscoped twin is the documented
+        // choice here (see the doc comment above), not a missed `_scoped`.
         let modules = repo
             .get_modules_by_ids(keys)
             .await

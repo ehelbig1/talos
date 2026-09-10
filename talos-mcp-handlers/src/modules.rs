@@ -439,7 +439,7 @@ async fn handle_list_templates(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
     state: &McpState,
-    _agent: Arc<auth::AgentIdentity>,
+    agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
     // MCP-192 (2026-05-08): reject wrong-type include_sandboxes
     // loudly. Pre-fix `include_sandboxes: "true"` (string) silently
@@ -455,7 +455,17 @@ async fn handle_list_templates(
     // `module-templates/`, or whether the OCI sync is broken. A registry read
     // that FAILED renders identically to a genuinely empty catalog, so the
     // failure is the one thing they cannot see.
-    let templates = match state.registry.list_templates(None).await {
+    //
+    // 2026-09-10: TENANT-SCOPED and METADATA-ONLY. `list_templates(None)` read
+    // every row of `modules` — every tenant's private modules, with their
+    // `wasm_bytes` and `source_code` — for a listing that rendered six
+    // metadata fields. An agent with no user scope passes `Uuid::nil()` and
+    // sees the shared catalog alone.
+    let templates = match state
+        .registry
+        .list_template_metadata_for_user(agent.user_id.unwrap_or_else(uuid::Uuid::nil), None)
+        .await
+    {
         Ok(t) => t,
         Err(e) => {
             tracing::error!(error = %e, "list_templates: registry read failed");
@@ -485,7 +495,7 @@ async fn handle_list_templates(
     //     collapsed so they can detect drift in the underlying registry.
     let is_platform = is_platform_category;
 
-    let pre_filter: Vec<&talos_registry::NodeTemplate> = templates
+    let pre_filter: Vec<&talos_registry::NodeTemplateMetadata> = templates
         .iter()
         // Always exclude legacy workflow_template rows (feature removed).
         .filter(|t| t.category != "workflow_template")
@@ -3009,6 +3019,116 @@ fn default_allowed_hosts_for_world(world: &str) -> Vec<String> {
     }
 }
 
+/// Narrow a template's secret grant by a caller-supplied `allowed_secrets`
+/// list (2026-09-10). Returns `(granted, not_granted)`.
+///
+/// The template's grant is the CEILING. A caller entry is honoured when it is
+/// inside that ceiling by the one allowlist matcher controller and worker
+/// share (`vault_path_permitted`): an exact template path, a path under a
+/// template prefix or glob, or the whole grant (`"*"`, which narrows to the
+/// template's own list rather than widening to every vault path). A caller
+/// prefix or glob that some template paths fall UNDER is narrowed to exactly
+/// those template paths. Anything else the caller asked for is returned in
+/// `not_granted` so the response can say so instead of silently dropping it.
+/// An empty caller list is an explicit deny-all and grants nothing.
+pub(crate) fn narrow_secret_grant(
+    template_secrets: &[String],
+    caller_secrets: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let mut granted: Vec<String> = Vec::new();
+    let mut not_granted: Vec<String> = Vec::new();
+    let push_unique = |v: &mut Vec<String>, s: &str| {
+        if !v.iter().any(|x| x == s) {
+            v.push(s.to_string());
+        }
+    };
+    for c in caller_secrets {
+        if c == "*" {
+            for t in template_secrets {
+                push_unique(&mut granted, t);
+            }
+            continue;
+        }
+        if talos_workflow_job_protocol::vault_path_permitted(template_secrets, c) {
+            push_unique(&mut granted, c);
+            continue;
+        }
+        let under_caller: Vec<&String> = template_secrets
+            .iter()
+            .filter(|t| {
+                talos_workflow_job_protocol::vault_path_permitted(std::slice::from_ref(c), t)
+            })
+            .collect();
+        if under_caller.is_empty() {
+            push_unique(&mut not_granted, c);
+        } else {
+            for t in under_caller {
+                push_unique(&mut granted, t);
+            }
+        }
+    }
+    (granted, not_granted)
+}
+
+#[cfg(test)]
+mod narrow_secret_grant_tests {
+    use super::narrow_secret_grant;
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn a_caller_path_outside_the_template_grant_is_not_granted() {
+        let (granted, not) = narrow_secret_grant(&v(&["slack/token"]), &v(&["anthropic/api_key"]));
+        assert!(granted.is_empty(), "{granted:?}");
+        assert_eq!(not, v(&["anthropic/api_key"]));
+    }
+
+    #[test]
+    fn a_caller_subset_narrows() {
+        let (granted, not) =
+            narrow_secret_grant(&v(&["slack/token", "slack/signing"]), &v(&["slack/token"]));
+        assert_eq!(granted, v(&["slack/token"]));
+        assert!(not.is_empty());
+    }
+
+    #[test]
+    fn caller_wildcard_yields_the_template_list_not_every_path() {
+        let (granted, not) = narrow_secret_grant(&v(&["slack/token", "slack/signing"]), &v(&["*"]));
+        assert_eq!(granted, v(&["slack/token", "slack/signing"]));
+        assert!(not.is_empty());
+    }
+
+    #[test]
+    fn a_path_under_a_template_glob_is_granted_as_named() {
+        let (granted, _) = narrow_secret_grant(&v(&["slack/*"]), &v(&["slack/token"]));
+        assert_eq!(granted, v(&["slack/token"]));
+    }
+
+    #[test]
+    fn a_caller_prefix_over_template_paths_narrows_to_those_paths() {
+        let (granted, not) =
+            narrow_secret_grant(&v(&["slack/token", "jira/token"]), &v(&["slack"]));
+        assert_eq!(granted, v(&["slack/token"]));
+        assert!(not.is_empty());
+    }
+
+    #[test]
+    fn template_wildcard_honours_the_caller_list_verbatim() {
+        let (granted, not) = narrow_secret_grant(&v(&["*"]), &v(&["anthropic/api_key"]));
+        assert_eq!(granted, v(&["anthropic/api_key"]));
+        assert!(not.is_empty());
+    }
+
+    #[test]
+    fn an_empty_caller_list_is_deny_all() {
+        let (granted, not) = narrow_secret_grant(&v(&["slack/token"]), &v(&[]));
+        assert!(granted.is_empty());
+        assert!(not.is_empty());
+    }
+}
+
 // ── list_module_catalog ──────────────────────────────────────────────────────
 
 async fn handle_list_module_catalog(
@@ -3629,6 +3749,21 @@ async fn handle_install_module_from_catalog(
         .unwrap_or_else(|| "automation-node".to_string());
     let capability_world = capability_world_owned.as_str();
 
+    // Role RBAC gate (2026-09-10): the module this installs runs at
+    // `capability_world` — defaulting to `automation-node`, the WIDEST
+    // compilable world, when the manifest declares none. `compile_custom_sandbox`
+    // refuses a role lacking that capability; this surface refused nothing, so
+    // an `["http"]`-role agent could install and then run an automation-node
+    // module. One shared predicate, same refusal.
+    if let Err(resp) = crate::sandbox::require_agent_role_permits_world(
+        &req_id,
+        &agent,
+        capability_world,
+        "install a catalog module for",
+    ) {
+        return resp;
+    }
+
     // Honor an explicit `allowed_hosts: []` (deny-all) — only fall back to
     // defaults when the field is missing or not an array.
     let allowed_hosts: Vec<String> = if meta
@@ -3665,16 +3800,9 @@ async fn handle_install_module_from_catalog(
     // secrets, not just whether the operator's grant is empty.
     let template_requires_secrets = !catalog_secrets.is_empty() || !talos_json_secrets.is_empty();
 
-    // Principle of least privilege: if the caller explicitly provides allowed_secrets,
-    // use ONLY the caller's list — do NOT merge with template defaults.
-    // This lets operators restrict a module to exactly the secrets it needs for a
-    // specific use case, without being over-privileged by the template's broad defaults.
-    //
-    // Without a caller override: build from template defaults (requires_secrets ∪ talos.json
-    // allowed_secrets), which preserves backwards-compatible behaviour for plain reinstalls.
-    let allowed_secrets: Vec<String> = if caller_provided_allowed_secrets {
-        caller_secrets
-    } else {
+    // The template's own grant: requires_secrets (legacy) ∪ talos.json
+    // allowed_secrets. This is the CEILING for the installed module.
+    let template_secrets: Vec<String> = {
         let mut merged = catalog_secrets;
         for s in talos_json_secrets {
             if !merged.contains(&s) {
@@ -3683,6 +3811,27 @@ async fn handle_install_module_from_catalog(
         }
         merged
     };
+    // Principle of least privilege: a caller-supplied `allowed_secrets` may
+    // only NARROW the template's list, never replace it. Pre-2026-09-10 the
+    // caller's list was used VERBATIM ("use ONLY the caller's list"), which
+    // reads as least-privilege but is its inverse: the template author's grant
+    // is the only review any of these vault paths ever had, and a caller who
+    // passed `["*"]` or a path the template never named got a module that
+    // could resolve it. The installed grant is therefore the INTERSECTION of
+    // the caller's request with the template's grant, via the one allowlist
+    // matcher both controller and worker use (`vault_path_permitted`), so a
+    // caller may narrow with a glob the template's exact paths fall under but
+    // can never name a path the template did not. Paths the caller asked for
+    // and did not get are reported below rather than silently dropped.
+    //
+    // Without a caller override the template's grant is installed as-is,
+    // which preserves backwards-compatible behaviour for plain reinstalls.
+    let (allowed_secrets, secrets_not_granted): (Vec<String>, Vec<String>) =
+        if caller_provided_allowed_secrets {
+            narrow_secret_grant(&template_secrets, &caller_secrets)
+        } else {
+            (template_secrets, Vec::new())
+        };
     let requires_approval_for =
         crate::utils::json_string_array_field(&meta, "requires_approval_for");
     let display_name = args
@@ -3926,6 +4075,14 @@ async fn handle_install_module_from_catalog(
             if let Some(w) = pin_warning {
                 resp["pin_warning"] = serde_json::json!(w);
             }
+            if !secrets_not_granted.is_empty() {
+                resp["secrets_not_granted"] = serde_json::json!(secrets_not_granted);
+                resp["secrets_not_granted_note"] = serde_json::json!(
+                    "These caller-supplied allowed_secrets paths are OUTSIDE the template's own \
+                     grant and were not installed. A caller may only NARROW a template's secret \
+                     grant, never widen it; the template author's list is the ceiling."
+                );
+            }
             mcp_text(
                 req_id,
                 &serde_json::to_string_pretty(&resp).unwrap_or_default(),
@@ -3950,11 +4107,14 @@ async fn handle_install_module_from_catalog(
             )
         }
         Err(e) => {
-            tracing::error!(err = ?e, "compile_module: compilation service error");
+            // 2026-09-10: chain logged (it can carry host paths and cargo's
+            // stderr), generic message returned — the sentence
+            // `hot_update_module` already uses.
+            tracing::error!(error = %format!("{e:#}"), "compile_module: compilation service error");
             mcp_error(
                 req_id,
                 -32000,
-                &format!("Compilation service error: {:#}", e),
+                "Compilation service error — see server logs",
             )
         }
     }

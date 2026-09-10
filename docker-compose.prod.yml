@@ -1,14 +1,40 @@
-# Production Docker Compose Configuration
+# Production-SHAPED Docker Compose Configuration (single host, TLS-terminating
+# reverse proxy in front). READ THE RUST_ENV NOTE BEFORE USING THIS.
 #
 # Security Features:
 # ✅ PostgreSQL port NOT exposed (internal network only)
-# ✅ RUST_ENV=production (enables strict CSP, HSTS, global rate limiter)
 # ✅ Production rate limits (60 API req/min, 30 webhook req/min)
-# ✅ HSTS enabled by default
+# ✅ HSTS enabled (ENABLE_HSTS=true — independent of RUST_ENV)
 # ✅ Controller only accessible via reverse proxy
+# ✅ Frontend nginx proxies the FULL controller route set (frontend/nginx.conf)
+#
+# ⚠️  RUST_ENV IS "staging", NOT "production" — DELIBERATELY, AND HERE IS WHY.
+# Under RUST_ENV=production the controller and worker FAIL CLOSED at boot on
+# any plaintext backend URL (structural lint check 44: `tls-prod-gate-{redis,
+# nats,postgres,neo4j}` — HIPAA §164.312(e) / SOC2 CC6.7 transmission
+# security). This file's DATABASE_URL (`postgres://…` with no sslmode),
+# REDIS_URL (`redis://`) and NATS_URL (`nats://`) are all plaintext, because
+# the three data services below terminate no TLS. Until 2026-09-10 this file
+# said `RUST_ENV: production` anyway, so it could not boot at all — and its
+# `additional_contexts: ../talos-workflow-engine` referenced a sibling repo
+# that was folded into this workspace in May 2026, so it could not BUILD
+# either. Two honest options existed: give postgres, redis and nats each a
+# cert and a TLS listener here (three services' worth of cert generation and
+# config that the Helm chart already does — see deploy/helm/talos/templates/
+# tls/), or state that this compose file is not a production-TLS deployment.
+# The second is the smaller change and the true one. What "staging" gives up
+# relative to "production" is exactly the `talos_config::is_production()`
+# gates: the plaintext-URL refusals above, the env-KEK guard (check 45), the
+# explicit-Sigstore-policy demand on the worker, the PROMETHEUS_SCRAPE_TOKEN
+# / REGISTRY_PUBLISH_TOKEN fail-closed 403s, and production-only CSP/cookie
+# strictness. Rate limits, HSTS, CSRF and the reverse-proxy posture do NOT
+# depend on RUST_ENV and stay on. If you need RUST_ENV=production, put TLS
+# on all three backends first (or deploy the Helm chart, which does), then
+# change the three URLs to `postgres://…?sslmode=require`, `rediss://` and
+# `tls://` and flip this value — it will refuse to boot until you have.
 #
 # Usage:
-#   docker-compose -f docker-compose.prod.yml up -d
+#   docker compose -f docker-compose.prod.yml up -d --build
 #
 # Prerequisites:
 #   - .env.production file with required secrets
@@ -62,9 +88,15 @@ services:
       - talos-network
     restart: always
 
-  # PostgreSQL Database
+  # PostgreSQL Database — pgvector's image, pinned to the SAME digest as
+  # docker-compose.yml (structural lint check 80 requires every compose file
+  # to agree). Stock `postgres:16-alpine` was wrong twice over: no pgvector
+  # (migration 20260406000001 needs `vector(N)` — "type vector does not
+  # exist") and the wrong major (production and the schema baseline are
+  # pg17; a pg16 server cannot apply the baseline). See CLAUDE.md "Postgres
+  # deployment modes".
   postgres:
-    image: postgres:16-alpine
+    image: pgvector/pgvector:pg17@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f
     container_name: talos-postgres-prod
     environment:
       POSTGRES_USER: talos
@@ -97,11 +129,13 @@ services:
 
   # Controller Service (GraphQL API)
   controller:
+    # No `additional_contexts`: the workflow-engine crates live IN this
+    # workspace since May 2026 (talos-workflow-engine*/), and the Dockerfile
+    # builds from the repo root alone — the sibling-repo context this file
+    # used to name no longer exists.
     build:
       context: .
       dockerfile: controller/Dockerfile
-      additional_contexts:
-        workflow_engine: ../talos-workflow-engine
     container_name: talos-controller-prod
     environment:
       # Database connection (internal network)
@@ -111,9 +145,10 @@ services:
       NATS_USER: ${NATS_USER:?NATS_USER required}
       NATS_PASSWORD: ${NATS_PASSWORD:?NATS_PASSWORD required}
 
-      # ✅ PRODUCTION MODE: Enables strict CSP, HSTS, global rate limiter, disables GraphiQL
-      RUST_ENV: production
-      RUST_LOG: info,controller=info
+      # NOT "production" — see the header. Plaintext backend URLs below are
+      # refused at boot under RUST_ENV=production (check 44 gates).
+      RUST_ENV: staging
+      RUST_LOG: info
 
       # Production domain
       BASE_URL: ${BASE_URL:?BASE_URL required (e.g., https://api.talos.example.com)}
@@ -207,17 +242,17 @@ services:
     build:
       context: .
       dockerfile: worker/Dockerfile
-      additional_contexts:
-        workflow_engine: ../talos-workflow-engine
     # Remove container_name to allow scaling workers
     # container_name: talos-worker-prod
     environment:
+      # Same RUST_ENV as the controller, for the same reason (header).
+      RUST_ENV: staging
       NATS_URL: nats://nats:4222
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
       NATS_USER: ${NATS_USER:?NATS_USER required in .env}
       NATS_PASSWORD: ${NATS_PASSWORD:?NATS_PASSWORD required in .env}
       WORKER_SHARED_KEY: ${WORKER_SHARED_KEY:?WORKER_SHARED_KEY required in .env.production}
-      RUST_LOG: info,worker=info
+      RUST_LOG: info
       # Metrics server configuration
       METRICS_PORT: "9091"
       METRICS_AUTH_TOKENS: ${METRICS_AUTH_TOKENS:?METRICS_AUTH_TOKENS required in .env.production}

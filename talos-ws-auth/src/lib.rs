@@ -257,6 +257,50 @@ async fn handle_graphql_ws(
                                                 payload.clone(),
                                             )
                                         {
+                                            // 2026-09-10: the WebSocket lane
+                                            // executes SUBSCRIPTIONS only.
+                                            // `execute_stream` will happily run
+                                            // a query or a mutation as a
+                                            // one-item stream, which made `/ws`
+                                            // a second mutation transport
+                                            // without the HTTP lane's CSRF
+                                            // discipline. An operation that
+                                            // does not parse or cannot be
+                                            // classified is refused too.
+                                            match talos_api::schema::operation_is_subscription(
+                                                &request.query,
+                                                request.operation_name.as_deref(),
+                                            ) {
+                                                Ok(true) => {}
+                                                Ok(false) | Err(_) => {
+                                                    tracing::warn!(
+                                                        target: "talos_audit",
+                                                        event_kind = "ws_non_subscription_refused",
+                                                        %user_id,
+                                                        "WebSocket lane refused a non-subscription operation"
+                                                    );
+                                                    let err_msg = serde_json::json!({
+                                                        "type": "error",
+                                                        "id": id,
+                                                        "payload": [{
+                                                            "message": "Only subscription \
+                                                                operations may be executed \
+                                                                over the WebSocket transport. \
+                                                                Send queries and mutations to \
+                                                                POST /graphql."
+                                                        }]
+                                                    });
+                                                    if let Ok(err_text) =
+                                                        serde_json::to_string(&err_msg)
+                                                    {
+                                                        let _ = sink
+                                                            .send(Message::Text(err_text.into()))
+                                                            .await;
+                                                    }
+                                                    continue;
+                                                }
+                                            }
+
                                             // Security review 2026-07-19 (P3):
                                             // a pre-2FA (password-only) session
                                             // may not open subscriptions — none
@@ -300,8 +344,15 @@ async fn handle_graphql_ws(
                                             let mut response_stream = schema.execute_stream(req);
 
                                             // Send data messages
-                                            while let Some(response) = response_stream.next().await
+                                            while let Some(mut response) =
+                                                response_stream.next().await
                                             {
+                                                // 2026-09-10: same production
+                                                // error scrubber as the HTTP
+                                                // `graphql_handler` — one home.
+                                                talos_api::schema::scrub_response_errors(
+                                                    &mut response,
+                                                );
                                                 let data_msg = serde_json::json!({
                                                     "type": "data",
                                                     "id": id,

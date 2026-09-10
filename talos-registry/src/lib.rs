@@ -345,6 +345,17 @@ impl ModuleRegistry {
 
     /// List all templates, optionally filtered by category.
     ///
+    /// **UNSCOPED and BLOB-HEAVY — internal callers only.** This reads EVERY
+    /// row of `modules` regardless of `user_id` (every tenant's private
+    /// modules alongside the shared catalog) and projects `source_code` AND
+    /// `wasm_bytes` for each, so one call loads every compiled binary on the
+    /// deployment into memory. No caller-facing surface may use it: a
+    /// per-user listing is `list_template_metadata_for_user`, which carries
+    /// the tenancy predicate and no blobs. (2026-09-10: `list_templates`,
+    /// `tools/list` and `get_platform_info` all called this, i.e. any
+    /// authenticated MCP agent enumerated every other tenant's module names,
+    /// descriptions, config schemas, allowed hosts and secret paths.)
+    ///
     /// Phase 5: reads from the unified `modules` table. The legacy
     /// `node_templates.icon` column has no equivalent on `modules` and is
     /// surfaced as `None`; `code_template` maps to `modules.source_code`;
@@ -374,6 +385,59 @@ impl ModuleRegistry {
         };
 
         Ok(templates.into_iter().map(|row| row.into()).collect())
+    }
+
+    /// Tenant-scoped, metadata-only template listing (2026-09-10).
+    ///
+    /// Rows visible to `user_id` are the shared catalog (`user_id IS NULL`)
+    /// plus the caller's own — the same predicate `get_template_for_user` /
+    /// `list_templates_paginated_for_user` use (there is no org-share arm on
+    /// `modules` in those readers, so none is added here). `Uuid::nil()` is
+    /// the documented spelling for an agent with no user scope and yields the
+    /// catalog alone.
+    ///
+    /// The projection carries NO `wasm_bytes` and NO `source_code`; whether a
+    /// compiled binary exists is answered by `is_compiled`
+    /// (`wasm_bytes IS NOT NULL AND octet_length(wasm_bytes) > 0`), computed
+    /// server-side so the blob never crosses the wire. This is the listing
+    /// every caller-facing surface must use; `list_templates` is unscoped and
+    /// loads every binary.
+    pub async fn list_template_metadata_for_user(
+        &self,
+        user_id: Uuid,
+        category: Option<&str>,
+    ) -> Result<Vec<NodeTemplateMetadata>> {
+        // Two static literals rather than one `format!`-assembled statement,
+        // so check 88 can PREPARE both against the real schema.
+        let rows = if let Some(cat) = category {
+            sqlx::query_as::<_, NodeTemplateMetadata>(
+                "SELECT id, name, COALESCE(category, kind) AS category, description, \
+                        config_schema, allowed_hosts, allowed_methods, allowed_secrets, \
+                        requires_approval_for, capability_world, \
+                        (wasm_bytes IS NOT NULL AND octet_length(wasm_bytes) > 0) AS is_compiled \
+                 FROM modules \
+                 WHERE COALESCE(category, kind) = $1 AND (user_id IS NULL OR user_id = $2) \
+                 ORDER BY name ASC, id ASC",
+            )
+            .bind(cat)
+            .bind(user_id)
+            .fetch_all(&self.db_pool)
+            .await?
+        } else {
+            sqlx::query_as::<_, NodeTemplateMetadata>(
+                "SELECT id, name, COALESCE(category, kind) AS category, description, \
+                        config_schema, allowed_hosts, allowed_methods, allowed_secrets, \
+                        requires_approval_for, capability_world, \
+                        (wasm_bytes IS NOT NULL AND octet_length(wasm_bytes) > 0) AS is_compiled \
+                 FROM modules \
+                 WHERE user_id IS NULL OR user_id = $1 \
+                 ORDER BY name ASC, id ASC",
+            )
+            .bind(user_id)
+            .fetch_all(&self.db_pool)
+            .await?
+        };
+        Ok(rows)
     }
 
     /// List templates with pagination, optionally filtered by category.
@@ -1486,6 +1550,26 @@ impl From<NodeTemplateRow> for NodeTemplate {
             dependencies: row.dependencies,
         }
     }
+}
+
+/// Metadata-only template row returned by
+/// [`ModuleRegistry::list_template_metadata_for_user`] — every field a
+/// listing surface renders, and neither blob (`wasm_bytes`, `source_code`).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct NodeTemplateMetadata {
+    pub id: Uuid,
+    pub name: String,
+    pub category: String,
+    pub description: Option<String>,
+    pub config_schema: JsonValue,
+    pub allowed_hosts: Vec<String>,
+    pub allowed_methods: Vec<String>,
+    pub allowed_secrets: Vec<String>,
+    pub requires_approval_for: Vec<String>,
+    pub capability_world: String,
+    /// `wasm_bytes IS NOT NULL AND octet_length(wasm_bytes) > 0`, computed in
+    /// SQL so a listing never loads the binary to ask whether it exists.
+    pub is_compiled: bool,
 }
 
 /// SQL fragment: the rows this cache sweep is permitted to delete.

@@ -313,21 +313,28 @@ async fn handle_create_webhook(
     // trigger row and confirm the target UUID exists via the error message
     // ("Module {} not found" only fires for non-existent UUIDs, not for
     // unauthorised ones).
+    //
+    // 2026-09-10: three-valued. `.unwrap_or(false)` rendered a DATABASE
+    // FAILURE as "not found or not accessible" — the refusal direction was
+    // right, the diagnosis sent the operator to check module ownership during
+    // a database incident (checks 74/79's class). `Err` is `database_error`.
     if let Some(module_id) = module_id_opt {
-        let accessible = state
+        match state
             .module_repo
             .module_accessible_by_user(module_id, user_id)
             .await
-            .unwrap_or(false);
-        if !accessible {
-            return mcp_error(
-                req_id,
-                -32602,
-                &format!(
-                    "Module {} not found or not accessible. Use list_modules to see your modules.",
-                    module_id
-                ),
-            );
+        {
+            Ok(true) => {}
+            Ok(false) => return crate::utils::module_not_accessible_error(req_id, module_id),
+            Err(e) => {
+                tracing::error!(
+                    module_id = %module_id,
+                    error = %e,
+                    "create_webhook: module visibility read failed; refusing rather than \
+                     reporting the module as inaccessible"
+                );
+                return crate::utils::database_error(req_id);
+            }
         }
     }
     if let Some(wf_id) = workflow_id_opt {

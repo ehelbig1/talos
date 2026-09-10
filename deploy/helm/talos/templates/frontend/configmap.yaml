@@ -1,10 +1,17 @@
 {{- if .Values.frontend.enabled -}}
 # Chart-rendered nginx config for the frontend pod. The frontend image
-# bakes in nginx.conf with `proxy_pass http://controller:8000` (the
-# docker-compose service name); in Kubernetes the controller Service is
-# named via talos.componentName so the upstream resolves to a different
-# DNS name. Mount this ConfigMap over /etc/nginx/conf.d/default.conf in
-# the deployment to override the image default for K8s deploys.
+# bakes in frontend/nginx.conf with an `upstream talos_controller` of
+# `controller:8000` (the docker-compose service name); in Kubernetes the
+# controller Service is named via talos.componentName so the upstream
+# resolves to a different DNS name. Mount this ConfigMap over
+# /etc/nginx/conf.d/default.conf in the deployment to override the image
+# default for K8s deploys.
+#
+# KEEP THE LOCATION SET IN LOCKSTEP WITH frontend/nginx.conf. Structural
+# lint check 2 reconciles the controller's top-level routes against BOTH
+# files (2026-09-10; before that the image config had drifted to proxying
+# /graphql alone, so the compose-prod deploy 404'd /ws, /api, /auth/csrf,
+# /webhooks, /mcp and every one-click email link).
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -30,13 +37,25 @@ data:
         # HSTS unconditional — browsers ignore over HTTP per RFC 6797 §8.1.
         add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
         # Cross-origin isolation + clickjacking — parity with the controller's
-        # talos-security-headers middleware. COOP same-origin isolates the SPA's
-        # browsing context (XS-Leaks / cross-window); CORP same-origin blocks
-        # other origins from no-cors loading our resources; X-Frame-Options is
-        # the legacy clickjacking belt to CSP's frame-ancestors 'none' braces.
+        # talos-security-headers middleware. COOP isolates the SPA's browsing
+        # context (XS-Leaks / cross-window); CORP same-origin blocks other
+        # origins from no-cors loading our resources; X-Frame-Options is the
+        # legacy clickjacking belt to CSP's frame-ancestors 'none' braces.
         # COEP is intentionally omitted — require-corp would break the
         # cross-origin Google Fonts / `img-src https:` the CSP above permits.
-        add_header Cross-Origin-Opener-Policy "same-origin" always;
+        #
+        # COOP is `same-origin-allow-popups`, NOT `same-origin`. The SPA opens
+        # TWO OAuth flows in a popup and reads the result back through
+        # `window.opener` (integrations/useConnectHandlers.ts and
+        # builder/SlackAppSelector.tsx both `window.open(...)` and poll the
+        # popup). Under plain `same-origin` the browser severs the opener
+        # relationship the moment the popup navigates cross-origin to the
+        # provider, so `popup.closed` / postMessage back to the opener never
+        # work and the flow hangs "waiting". `same-origin-allow-popups` keeps
+        # the SPA's own browsing-context group isolated from documents that
+        # OPEN it, while letting documents it opens keep their opener — the
+        # documented COOP value for exactly this popup-OAuth shape.
+        add_header Cross-Origin-Opener-Policy "same-origin-allow-popups" always;
         add_header Cross-Origin-Resource-Policy "same-origin" always;
         add_header X-Frame-Options "DENY" always;
         # Permissions-Policy: deny invasive hardware/sensor/tracking APIs the
@@ -51,9 +70,8 @@ data:
         gzip_min_length 1024;
         gzip_types text/plain text/css text/xml text/javascript application/javascript application/xml+rss application/json;
 
-        # Proxy GraphQL HTTP + REST + WebSocket subscriptions to the controller.
-        # /graphql handles POST queries and GETs (CSRF cookie seed via /health
-        # was the proper fix; legacy bundles may still GET /graphql).
+        # /graphql — GraphQL HTTP. POST only in production (GET is 405); the
+        # CSRF cookie is seeded by `= /auth/csrf` below, not here.
         location /graphql {
             proxy_pass http://{{ include "talos.componentName" (list . "controller") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.controller.service.port }};
             proxy_http_version 1.1;
@@ -101,9 +119,31 @@ data:
             proxy_set_header X-Forwarded-Proto $scheme;
         }
 
-        # /auth/oauth/* — OAuth flow callback URIs configured in the
-        # controller (Google, Okta, Snyk redirect_uri values).
-        location /auth/ {
+        # /auth/oauth/* — OAuth flow login + callback URIs configured in the
+        # controller (`/auth/oauth/{provider}/{login,callback}`: Google, Okta,
+        # Snyk redirect_uri values).
+        #
+        # DELIBERATELY NOT `location /auth/`. The controller owns exactly TWO
+        # things under /auth — `/auth/oauth/…` and `/auth/csrf` — while the SPA
+        # owns `/auth/callback` (App.tsx renders it for the Okta / Snyk /
+        # Atlassian / Gmail popup flows). A `/auth/` prefix proxied that SPA
+        # route to the controller, which 404s it, so every popup OAuth flow
+        # landed on a controller 404 instead of the SPA's OAuthCallback view.
+        # Mirrors frontend/vite.config.ts's dev proxy list exactly.
+        location /auth/oauth/ {
+            proxy_pass http://{{ include "talos.componentName" (list . "controller") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.controller.service.port }};
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # /auth/csrf — the CSRF cookie seed (graphqlClient.seedCsrfCookie and
+        # authedFetch both GET it before the first POST). Exact match: it is a
+        # single endpoint, and an exact `=` location cannot be widened by a
+        # later sibling into swallowing the SPA's /auth/callback again.
+        location = /auth/csrf {
             proxy_pass http://{{ include "talos.componentName" (list . "controller") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.controller.service.port }};
             proxy_http_version 1.1;
             proxy_set_header Host $host;
@@ -131,6 +171,22 @@ data:
         # the controller; must reach it from the frontend host too, not
         # fall through to the SPA shell.
         location /corrections/ {
+            proxy_pass http://{{ include "talos.componentName" (list . "controller") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.controller.service.port }};
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # /approvals — the approval-GATE one-click links (`/approvals/{token}/
+        # {approve,reject}`, PR #217: GET renders a confirmation page, POST acts;
+        # token looked up by hash, constant-time compared). A DIFFERENT route
+        # from /approval-actions below (confidence-gate suspensions). Neither
+        # nginx config proxied it until 2026-09-10 — check 2's single-line grep
+        # never saw the multi-line `.route(` that registers it, so every
+        # approval-gate email link fell through to the SPA shell.
+        location /approvals/ {
             proxy_pass http://{{ include "talos.componentName" (list . "controller") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.controller.service.port }};
             proxy_http_version 1.1;
             proxy_set_header Host $host;
@@ -172,8 +228,9 @@ data:
             proxy_send_timeout 3600;
         }
 
-        # /health — controller health probe. Also the path the frontend
-        # GETs to seed its CSRF cookie (see graphqlClient.seedCsrfCookie).
+        # /health — controller health probe (also what scripts/smoke.sh GETs).
+        # NOT the CSRF seed — that is `= /auth/csrf` above; /health sits in a
+        # router branch with no CSRF middleware and sets no cookie.
         location /health {
             proxy_pass http://{{ include "talos.componentName" (list . "controller") }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.controller.service.port }};
             proxy_http_version 1.1;
@@ -223,7 +280,8 @@ data:
             # the meaningful one here — it stops other origins from no-cors
             # hotlinking/embedding our JS/CSS/image assets; COOP / X-Frame-Options
             # are document-scoped and harmless-but-uniform on sub-resources.
-            add_header Cross-Origin-Opener-Policy "same-origin" always;
+            # Same COOP value as the server block (popup OAuth needs the opener).
+            add_header Cross-Origin-Opener-Policy "same-origin-allow-popups" always;
             add_header Cross-Origin-Resource-Policy "same-origin" always;
             add_header X-Frame-Options "DENY" always;
             add_header Permissions-Policy "geolocation=(), microphone=(), camera=(), payment=(), usb=(), serial=(), bluetooth=(), hid=(), midi=(), magnetometer=(), gyroscope=(), accelerometer=(), display-capture=(), browsing-topics=(), interest-cohort=()" always;

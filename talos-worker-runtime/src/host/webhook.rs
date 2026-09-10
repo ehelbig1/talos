@@ -7,10 +7,12 @@ use crate::reason_class;
 /// Latch `class` against the `sendfailed` discriminant and return it.
 ///
 /// `wit_webhook::Error` is `{ invalidurl, sendfailed, timeout }` — no deny
-/// variant — so 16 sites return `Sendfailed` and **15 of them are
-/// deterministic**: a write-ceiling refusal, four caps, a URL parse failure,
-/// five policy denials, a rate-limit, two cancellations and a secret-slot
-/// failure. Exactly ONE is the genuine transport failure.
+/// variant — so every refusal on this surface returns `Sendfailed` and all
+/// but ONE are deterministic: a write-ceiling refusal, four caps, a URL parse
+/// failure, the policy denials (host allowlist, SSRF, tier-1 egress, method
+/// allowlist, idempotency-key reuse), two rate-limits, a circuit-open, two
+/// cancellations and a secret-slot failure. Exactly ONE is the genuine
+/// transport failure.
 ///
 /// Measured before it was written: `sendfailed` matches no arm in ANY of the
 /// four downstream classifiers, so every one of those 16 already read
@@ -206,6 +208,29 @@ impl wit_webhook::Host for TalosContext {
             return Err(webhook_deny(self, reason_class::ALLOWED_HOSTS));
         }
 
+        // Method allowlist. A webhook send is always a POST, and until 2026-09
+        // this surface never consulted `allowed_methods` at all — so a module
+        // declared `allowed_methods: ["GET"]` (the read-only shape the engine's
+        // method-aware retry default keys on) could still POST through
+        // `webhook::send`. Same rule `graphql::execute` applies to its own
+        // implicit POST; empty = allow all (the documented `allowed_methods`
+        // semantics — see the engine retry rules).
+        if !self.allowed_methods.is_empty()
+            && !self
+                .allowed_methods
+                .iter()
+                .any(|m| m.eq_ignore_ascii_case("POST"))
+        {
+            self.record_capability_denied("webhook", "method-allowlist", &format!("POST {host}"))
+                .await;
+            tracing::warn!(
+                host = %host,
+                allowed_methods = ?self.allowed_methods,
+                "WASM module attempted a webhook POST but POST is not in allowed_methods"
+            );
+            return Err(webhook_deny(self, reason_class::METHOD_ALLOWLIST));
+        }
+
         // DNS rebinding — for hostname-based URLs, resolve and reject when
         // any answer falls in the private deny-list. Skipped for IP literals
         // (already handled by classify_private_ip above).
@@ -257,6 +282,26 @@ impl wit_webhook::Host for TalosContext {
             }
             return Err(webhook_deny(self, reason_class::EXECUTION_RATE_LIMIT));
         }
+        // Per-host limit, sharing `http_calls_per_host` with `http::fetch` /
+        // `fetch_all` so a module cannot use `webhook::send` as a second
+        // 200-call lane against one upstream. Charged after the global cap
+        // admits, for the reason `fetch` gives at its M-6 site.
+        let host_for_limit = match parsed_url.port_or_known_default() {
+            Some(port) => format!("{host}:{port}"),
+            None => host.clone(),
+        };
+        if !self.check_per_host_rate_limit(&host_for_limit, MAX_HTTP_CALLS_PER_HOST_PER_EXECUTION) {
+            tracing::warn!(
+                module_id = ?self.module_id,
+                host = %host,
+                limit = MAX_HTTP_CALLS_PER_HOST_PER_EXECUTION,
+                "webhook per-host rate limit exceeded — refusing to amplify load to a single upstream"
+            );
+            if let Some(ref m) = self.metrics {
+                m.record_rate_limit_exceeded("webhook_per_host");
+            }
+            return Err(webhook_deny(self, reason_class::PER_HOST_RATE_LIMIT));
+        }
         if self.is_cancelled() {
             tracing::info!(module_id = ?self.module_id, "Execution cancelled before webhook send");
             if let Some(ref m) = self.metrics {
@@ -299,28 +344,75 @@ impl wit_webhook::Host for TalosContext {
             if guest_set {
                 None
             } else {
-                Some(idem.clone())
+                // Tenancy-scoped, or `None` when the job carries no user_id
+                // (see `http::scoped_dedup_key`) — the header still goes out.
+                crate::host::http::scoped_dedup_key(self.user_id, self.actor_id, &host, idem)
             }
         });
+        // The request identity the record is bound to — a hit is served only
+        // for the same URL + body; the same key with a different request is
+        // REFUSED (mirrors the Redis store's request_hash).
+        let request_hash = crate::host::http::dedup_request_hash("POST", &url, body.as_bytes());
         // Short-circuit if this key already completed successfully in-process.
         if let Some(ref k) = dedup_key {
-            if let talos_idempotency::DedupCheck::Completed(cached) =
-                crate::host::http::get_global_idempotency_store().check(k)
-            {
-                tracing::info!(
-                    "idempotent webhook send short-circuited: returning cached response \
-                     for a previously-completed idempotency key (worker-side dedup)"
-                );
-                return Ok(wit_webhook::WebhookResponse {
-                    status: cached.status,
-                    body: String::from_utf8_lossy(&cached.body).into_owned(),
-                    retries: 0,
-                });
+            match crate::host::http::get_global_idempotency_store().check(k, &request_hash) {
+                talos_idempotency::DedupCheck::Completed(cached) => {
+                    tracing::info!(
+                        "idempotent webhook send short-circuited: returning cached response \
+                         for a previously-completed idempotency key (worker-side dedup)"
+                    );
+                    return Ok(wit_webhook::WebhookResponse {
+                        status: cached.status,
+                        body: String::from_utf8_lossy(&cached.body).into_owned(),
+                        retries: 0,
+                    });
+                }
+                talos_idempotency::DedupCheck::Mismatch => {
+                    // Same key, different request: refuse rather than replay
+                    // another request's response or double-send under a key
+                    // the destination already honoured. `sendfailed` is
+                    // non-transient in every classifier (see `webhook_deny`),
+                    // and no `reason_class` token is minted — `ALL` is a
+                    // closed set pinned cross-crate — so the cause travels on
+                    // the audit ledger + `[host:…]` diagnostic and the latch
+                    // is CLEARED.
+                    self.record_capability_denied("webhook", "idempotency-key-reuse", &host)
+                        .await;
+                    tracing::warn!(
+                        host = %host,
+                        module_id = ?self.module_id,
+                        "idempotency key reused for a different webhook request (url/body \
+                         differ from the completed send) — refusing rather than replaying"
+                    );
+                    self.record_network_outcome(None);
+                    return Err(wit_webhook::Error::Sendfailed);
+                }
+                talos_idempotency::DedupCheck::Proceed => {}
             }
         }
 
         let mut retries = 0u32;
         loop {
+            // Circuit breaker — one permit per ATTEMPT, settled with the
+            // status or the transport failure exactly as `http::fetch` does.
+            // Until 2026-09 this surface never consulted the breaker, so a
+            // dead webhook destination that `fetch` had already opened the
+            // circuit against was still POSTed to `1 + max_retries` times per
+            // send. Refused here = `sendfailed` (non-transient), latched
+            // `circuit-open` so the operator sees why nothing went out.
+            let Some(mut permit) = get_global_circuit_breaker().begin_request(&host) else {
+                tracing::warn!(host = %host, "Circuit breaker open - rejecting webhook send");
+                self.emit_network_failure(
+                    reason_class::CIRCUIT_OPEN,
+                    reason_class::WIT_SENDFAILED,
+                    &format!(
+                        "circuit breaker open for '{host}' after recent failures — \
+                         webhook not sent; it closes automatically"
+                    ),
+                )
+                .await;
+                return Err(wit_webhook::Error::Sendfailed);
+            };
             let mut req_builder = client
                 .post(&url)
                 .body(body.clone())
@@ -350,10 +442,13 @@ impl wit_webhook::Host for TalosContext {
             match req_builder.send().await {
                 Ok(resp) => {
                     let status = resp.status().as_u16();
+                    permit.settle_response(status);
+                    // Host + path LENGTH only — paths carry capability tokens
+                    // and presigned keys.
                     tracing::info!(
                         method = "POST",
                         host = %parsed_url.host_str().unwrap_or("unknown"),
-                        path = %parsed_url.path(),
+                        path_len = parsed_url.path().len(),
                         status = status,
                         "HTTP audit"
                     );
@@ -383,6 +478,7 @@ impl wit_webhook::Host for TalosContext {
                         if crate::host::http::dedup_cacheable_status(status) {
                             crate::host::http::get_global_idempotency_store().complete(
                                 k,
+                                &request_hash,
                                 talos_idempotency::DedupResponse {
                                     status,
                                     headers: Vec::new(),
@@ -398,6 +494,13 @@ impl wit_webhook::Host for TalosContext {
                     });
                 }
                 Err(e) if retries < max_retries => {
+                    // Same accounting as `fetch`: a builder error never left
+                    // the process and says nothing about the host.
+                    if e.is_builder() {
+                        permit.settle_no_evidence();
+                    } else {
+                        permit.settle_transport_failure();
+                    }
                     retries += 1;
                     if e.is_timeout() {
                         // Same reasoning as the terminal transport arm below:
@@ -424,6 +527,11 @@ impl wit_webhook::Host for TalosContext {
                     tokio::time::sleep(std::time::Duration::from_millis(retry_delay_ms)).await;
                 }
                 Err(e) => {
+                    if e.is_builder() {
+                        permit.settle_no_evidence();
+                    } else {
+                        permit.settle_transport_failure();
+                    }
                     // THE transport site. It CLEARS rather than latching — the
                     // totality rule requires every failing return to DECIDE
                     // the latch, not that every one names a class. Clearing is
@@ -443,5 +551,103 @@ impl wit_webhook::Host for TalosContext {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod webhook_gate_tests {
+    //! E6 (2026-09): `webhook::send` had no `allowed_methods` gate, no per-host
+    //! limit and no circuit breaker. Public IP literals skip DNS, so each test
+    //! reaches its gate with no network.
+    use super::*;
+    use crate::bindings::talos::core::webhook::Host as _;
+    use crate::circuit_breaker::get_global_circuit_breaker;
+    use crate::context::TalosContext;
+    use crate::wit_inspector::CapabilityWorld;
+    use std::collections::HashMap;
+    use talos_workflow_job_protocol::LlmTier;
+
+    fn ctx(host: &str, allowed_methods: &[&str], dry_run: bool) -> TalosContext {
+        let mut c = TalosContext::new(
+            CapabilityWorld::Http,
+            vec![host.to_string()],
+            allowed_methods.iter().map(|s| s.to_string()).collect(),
+            128,
+            HashMap::new(),
+            None,
+            None,
+            false,
+            None,
+            std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+            LlmTier::Tier2,
+            None,
+        )
+        .expect("test context");
+        c.dry_run = dry_run;
+        c
+    }
+
+    fn req(host: &str) -> wit_webhook::WebhookRequest {
+        wit_webhook::WebhookRequest {
+            url: format!("https://{host}/hook"),
+            headers: vec![],
+            body: "{}".to_string(),
+            max_retries: Some(0),
+            retry_delay_ms: Some(1),
+        }
+    }
+
+    fn latched(c: &TalosContext) -> Option<&'static str> {
+        c.network_reason_handle().lock().unwrap().map(|r| r.class)
+    }
+
+    #[tokio::test]
+    async fn post_not_in_allowed_methods_is_refused() {
+        let host = "1.0.0.1";
+        let mut c = ctx(host, &["GET"], true);
+        let r = c.send(req(host)).await;
+        assert!(matches!(r, Err(wit_webhook::Error::Sendfailed)), "{r:?}");
+        assert_eq!(latched(&c), Some(reason_class::METHOD_ALLOWLIST));
+
+        // Controls: POST listed, and the empty (allow-all) list, both pass the
+        // gate — dry-run mocks the send before any socket.
+        for allowed in [&["POST"][..], &[][..]] {
+            let mut c = ctx(host, allowed, true);
+            let r = c.send(req(host)).await;
+            assert!(
+                matches!(&r, Ok(resp) if resp.status == 200),
+                "{allowed:?}: {r:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn per_host_limit_is_shared_with_http_fetch() {
+        let host = "1.0.0.2";
+        let mut c = ctx(host, &[], true);
+        // Spend the host's budget the way `fetch` would.
+        for _ in 0..MAX_HTTP_CALLS_PER_HOST_PER_EXECUTION {
+            assert!(c.check_per_host_rate_limit(
+                &format!("{host}:443"),
+                MAX_HTTP_CALLS_PER_HOST_PER_EXECUTION
+            ));
+        }
+        let r = c.send(req(host)).await;
+        assert!(matches!(r, Err(wit_webhook::Error::Sendfailed)), "{r:?}");
+        assert_eq!(latched(&c), Some(reason_class::PER_HOST_RATE_LIMIT));
+    }
+
+    #[tokio::test]
+    async fn an_open_circuit_refuses_the_send_before_it_leaves() {
+        let host = "1.0.0.3";
+        let cb = get_global_circuit_breaker();
+        cb.force_half_open(host, 0);
+        // dry_run = false: the breaker sits AFTER the dry-run mock, and a
+        // refusal returns before any socket is opened.
+        let mut c = ctx(host, &[], false);
+        let r = c.send(req(host)).await;
+        assert!(matches!(r, Err(wit_webhook::Error::Sendfailed)), "{r:?}");
+        assert_eq!(latched(&c), Some(reason_class::CIRCUIT_OPEN));
+        assert_eq!(cb.trial_tally(host), Some((0, 0)));
     }
 }

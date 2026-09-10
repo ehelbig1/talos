@@ -58,6 +58,27 @@ spec:
                 secretKeyRef:
                   name: {{ include "talos.bootstrapSecretName" . }}
                   key: NATS_PASSWORD
+            {{- if gt (int .Values.nats.replicaCount) 1 }}
+            # Route-port credentials for `cluster { authorization {} }` in
+            # nats.conf — only rendered when there IS a cluster. REQUIRED
+            # (not `optional: true`): an absent key would leave `$NATS_CLUSTER_USER`
+            # unresolved and nats-server fails at config parse with "variable
+            # reference … can not be found" — a CrashLoop with a worse message
+            # than the kubelet's CreateContainerConfigError naming the key.
+            # install.sh mints both and back-fills them into a pre-existing
+            # bootstrap Secret on re-run; External-Secrets operators add them
+            # beside NATS_USER (values.yaml bootstrapSecret.data).
+            - name: NATS_CLUSTER_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: NATS_CLUSTER_USER
+            - name: NATS_CLUSTER_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "talos.bootstrapSecretName" . }}
+                  key: NATS_CLUSTER_PASSWORD
+            {{- end }}
           ports:
             - name: client
               containerPort: {{ .Values.nats.service.clientPort }}

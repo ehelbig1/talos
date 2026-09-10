@@ -100,7 +100,13 @@ fn deterministic_job_request() -> JobRequest {
         expected_wasm_hash: Some("deadbeef".into()),
         integration_name: None,
         user_id: det_uuid(0x0000_0000_0000_0000_0000_0000_0000_0009),
-        max_fuel: 1_000_000,
+        // ZERO, deliberately (changed from 1_000_000 on 2026-09-10 when
+        // `max_fuel` became signature-bound). Zero is the field's DEFAULT and
+        // appends nothing to the signing payload, so this fixture stays the
+        // "all-default" half of every conditional-append pair and EVERY MAC hex
+        // below is unchanged from before the binding. The fuel-carrying shape
+        // has its own snapshot: `job_request_non_default_max_fuel_snapshot`.
+        max_fuel: 0,
         dry_run: false,
         reply_topic: None,
         idempotency_key: None,
@@ -199,6 +205,11 @@ fn sign_request_with_fixed_nonce(req: &mut JobRequest, key: &[u8]) {
     if req.dispatch_attempt != 0 {
         payload.push_str(&format!(":attempt={}", req.dispatch_attempt));
     }
+    // `max_fuel` is the LAST conditional segment (2026-09-10): appended only
+    // when non-zero, after `:attempt=`.
+    if req.max_fuel != 0 {
+        payload.push_str(&format!(":fuel={}", req.max_fuel));
+    }
     let mut mac = <HmacSha256 as Mac>::new_from_slice(key).unwrap();
     mac.update(payload.as_bytes());
     req.signature = mac.finalize().into_bytes().to_vec();
@@ -224,7 +235,12 @@ fn job_request_json_snapshot() {
     // Only the `signature` bytes change here (None options are
     // omitted from the JSON via `skip_serializing_if`, and the
     // numeric fields were already in the JSON shape).
-    let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000001","workflow_execution_id":"00000000-0000-0000-0000-000000000002","module_uri":"redis:wasm:00000000-0000-0000-0000-000000000003","input_payload":{"key":"value"},"encrypted_secrets":{"ciphertext":[170,187,204],"nonce":[1,1,1,1,1,1,1,1,1,1,1,1]},"timeout_ms":30000,"priority":100,"deadline_unix_secs":0,"allowed_hosts":["api.example.com"],"allowed_methods":["GET","POST"],"allowed_secrets":["foo/*"],"allowed_sql_operations":[],"allow_tier2_exposure":false,"signature":[148,43,32,127,38,9,195,99,190,123,65,37,13,194,131,37,142,141,251,4,22,121,109,44,38,100,86,186,141,95,191,50],"job_nonce":"0:00000000000000000000000000000000","expected_wasm_hash":"deadbeef","max_fuel":1000000,"user_id":"00000000-0000-0000-0000-000000000009","max_llm_tier":"tier2","max_write_ceiling":"write","dry_run":false,"crypto_scheme":0}"#;
+    // Updated 2026-09-10: the fixture's `max_fuel` moved 1_000_000 → 0 when
+    // the field became signature-bound, so that this snapshot keeps pinning
+    // the ALL-DEFAULT bytes. Only the `"max_fuel"` value changed here — the
+    // `signature` bytes are IDENTICAL to the previous snapshot, which is the
+    // proof that a zero fuel appends nothing to the signed payload.
+    let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000001","workflow_execution_id":"00000000-0000-0000-0000-000000000002","module_uri":"redis:wasm:00000000-0000-0000-0000-000000000003","input_payload":{"key":"value"},"encrypted_secrets":{"ciphertext":[170,187,204],"nonce":[1,1,1,1,1,1,1,1,1,1,1,1]},"timeout_ms":30000,"priority":100,"deadline_unix_secs":0,"allowed_hosts":["api.example.com"],"allowed_methods":["GET","POST"],"allowed_secrets":["foo/*"],"allowed_sql_operations":[],"allow_tier2_exposure":false,"signature":[148,43,32,127,38,9,195,99,190,123,65,37,13,194,131,37,142,141,251,4,22,121,109,44,38,100,86,186,141,95,191,50],"job_nonce":"0:00000000000000000000000000000000","expected_wasm_hash":"deadbeef","max_fuel":0,"user_id":"00000000-0000-0000-0000-000000000009","max_llm_tier":"tier2","max_write_ceiling":"write","dry_run":false,"crypto_scheme":0}"#;
     assert_eq!(
         actual, expected,
         "JobRequest wire format drifted — see test docstring for resolution"
@@ -402,7 +418,7 @@ fn job_request_non_default_dispatch_attempt_snapshot() {
     sign_request_with_fixed_nonce(&mut req, &TEST_KEY);
 
     let actual = serde_json::to_string(&req).expect("serialize");
-    let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000001","workflow_execution_id":"00000000-0000-0000-0000-000000000002","module_uri":"redis:wasm:00000000-0000-0000-0000-000000000003","input_payload":{"key":"value"},"encrypted_secrets":{"ciphertext":[170,187,204],"nonce":[1,1,1,1,1,1,1,1,1,1,1,1]},"timeout_ms":30000,"priority":100,"deadline_unix_secs":0,"allowed_hosts":["api.example.com"],"allowed_methods":["GET","POST"],"allowed_secrets":["foo/*"],"allowed_sql_operations":[],"allow_tier2_exposure":false,"signature":[51,236,184,92,40,199,215,64,6,179,242,133,80,245,10,251,18,139,219,146,210,207,94,31,66,205,156,78,176,120,25,34],"job_nonce":"0:0000000000000000000000000000000a","expected_wasm_hash":"deadbeef","max_fuel":1000000,"user_id":"00000000-0000-0000-0000-000000000009","max_llm_tier":"tier2","max_write_ceiling":"write","dry_run":false,"crypto_scheme":0,"dispatch_attempt":2}"#;
+    let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000001","workflow_execution_id":"00000000-0000-0000-0000-000000000002","module_uri":"redis:wasm:00000000-0000-0000-0000-000000000003","input_payload":{"key":"value"},"encrypted_secrets":{"ciphertext":[170,187,204],"nonce":[1,1,1,1,1,1,1,1,1,1,1,1]},"timeout_ms":30000,"priority":100,"deadline_unix_secs":0,"allowed_hosts":["api.example.com"],"allowed_methods":["GET","POST"],"allowed_secrets":["foo/*"],"allowed_sql_operations":[],"allow_tier2_exposure":false,"signature":[51,236,184,92,40,199,215,64,6,179,242,133,80,245,10,251,18,139,219,146,210,207,94,31,66,205,156,78,176,120,25,34],"job_nonce":"0:0000000000000000000000000000000a","expected_wasm_hash":"deadbeef","max_fuel":0,"user_id":"00000000-0000-0000-0000-000000000009","max_llm_tier":"tier2","max_write_ceiling":"write","dry_run":false,"crypto_scheme":0,"dispatch_attempt":2}"#;
     assert_eq!(
         actual, expected,
         "JobRequest wire format drifted for a re-dispatched job — see the module docstring"
@@ -522,4 +538,114 @@ fn an_old_worker_refuses_a_new_controllers_retry_but_accepts_its_first_dispatch(
         first.signature, same.signature,
         "attempt 0 must be byte-identical to the pre-field format"
     );
+}
+
+// ============================================================================
+// max_fuel (the per-job fuel bound, signature-bound since 2026-09-10)
+// ============================================================================
+
+/// A NON-DEFAULT `max_fuel` changes the MAC (the JSON already carried the
+/// field). The all-default snapshots above are the other half of the pair and
+/// did NOT move: zero appends nothing, so every deployed worker keeps verifying
+/// every fuel-less dispatch. This pins the shape of the fuel-carrying message.
+///
+/// The expected hex was captured by running the production `sign()` over this
+/// fixture once and is then cross-checked here against BOTH the hand-rolled
+/// formula (which must agree) and the production `verify()`.
+#[test]
+fn job_request_non_default_max_fuel_snapshot() {
+    let mut req = deterministic_job_request();
+    req.max_fuel = 1_000_000;
+    // Distinct fixed nonce — the nonce cache is process-global (see the
+    // dispatch_attempt snapshot for the rule).
+    req.job_nonce = "0:0000000000000000000000000000000f".into();
+    sign_request_with_fixed_nonce(&mut req, &TEST_KEY);
+
+    let actual = serde_json::to_string(&req).expect("serialize");
+    let expected = r#"{"job_id":"00000000-0000-0000-0000-000000000001","workflow_execution_id":"00000000-0000-0000-0000-000000000002","module_uri":"redis:wasm:00000000-0000-0000-0000-000000000003","input_payload":{"key":"value"},"encrypted_secrets":{"ciphertext":[170,187,204],"nonce":[1,1,1,1,1,1,1,1,1,1,1,1]},"timeout_ms":30000,"priority":100,"deadline_unix_secs":0,"allowed_hosts":["api.example.com"],"allowed_methods":["GET","POST"],"allowed_secrets":["foo/*"],"allowed_sql_operations":[],"allow_tier2_exposure":false,"signature":[142,159,68,155,1,42,13,77,249,250,205,103,112,249,124,169,127,228,133,25,99,153,90,105,87,44,80,34,79,244,131,38],"job_nonce":"0:0000000000000000000000000000000f","expected_wasm_hash":"deadbeef","max_fuel":1000000,"user_id":"00000000-0000-0000-0000-000000000009","max_llm_tier":"tier2","max_write_ceiling":"write","dry_run":false,"crypto_scheme":0}"#;
+    assert_eq!(
+        actual, expected,
+        "JobRequest wire format drifted for a fuel-carrying job — see the module docstring"
+    );
+
+    let actual_hex = hex::encode(&req.signature);
+    let expected_hex = "8e9f449b012a0d4df9facd6770f97ca97fe4851963995a69572c50224ff48326";
+    assert_eq!(
+        actual_hex, expected_hex,
+        "the `:fuel=` signing segment drifted — see the module docstring"
+    );
+
+    req.verify(&TEST_KEY, u64::MAX)
+        .expect("hand-rolled signature must verify against production verify()");
+}
+
+/// `max_fuel` is MAC-BOUND: inflating it (more CPU on the worker than the
+/// controller granted), deflating it (an honest node fails with "fuel
+/// exhausted") and stripping it (falling back to the worker's default) must
+/// all fail verification, and a fuel-less message cannot have fuel forged on.
+#[test]
+fn max_fuel_is_hmac_bound_against_inflate_deflate_strip_and_forge() {
+    let mut signed = deterministic_job_request();
+    signed.max_fuel = 1_000_000;
+    signed.job_nonce = "0:00000000000000000000000000000010".into();
+    sign_request_with_fixed_nonce(&mut signed, &TEST_KEY);
+    signed
+        .verify(&TEST_KEY, u64::MAX)
+        .expect("the honest message verifies");
+
+    for (label, tampered_fuel) in [
+        ("inflated", 50_000_000u64),
+        ("deflated", 1),
+        ("stripped", 0),
+    ] {
+        let mut t = signed.clone();
+        t.max_fuel = tampered_fuel;
+        assert!(
+            t.verify(&TEST_KEY, u64::MAX).is_err(),
+            "{label} max_fuel must invalidate the signature"
+        );
+    }
+
+    let mut zero = deterministic_job_request();
+    zero.job_nonce = "0:00000000000000000000000000000011".into();
+    sign_request_with_fixed_nonce(&mut zero, &TEST_KEY);
+    let mut forged = zero.clone();
+    forged.max_fuel = 1_000_000;
+    assert!(
+        forged.verify(&TEST_KEY, u64::MAX).is_err(),
+        "forging fuel onto a fuel-less dispatch must invalidate the signature"
+    );
+    zero.verify(&TEST_KEY, u64::MAX)
+        .expect("fuel-less dispatch verifies");
+}
+
+/// DEPLOY ORDERING for `max_fuel`, measured. Unlike `dispatch_attempt`, a
+/// non-zero fuel is the COMMON case, so an OLD worker (pre-binding) refuses a
+/// NEW controller's ordinary fuel-carrying dispatch and vice versa: the pair
+/// must roll together. A fuel-less dispatch is identical on both sides.
+#[test]
+fn an_old_worker_and_a_new_controller_disagree_on_a_fuel_carrying_dispatch() {
+    let mut new_side = deterministic_job_request();
+    new_side.max_fuel = 1_000_000;
+    new_side.job_nonce = "0:00000000000000000000000000000012".into();
+    sign_request_with_fixed_nonce(&mut new_side, &TEST_KEY);
+
+    // What an OLD worker computes for the SAME message: the fixture minus the
+    // conditional fuel segment, i.e. the bytes at fuel 0.
+    let mut as_old_sees_it = new_side.clone();
+    as_old_sees_it.max_fuel = 0;
+    sign_request_with_fixed_nonce(&mut as_old_sees_it, &TEST_KEY);
+    assert_ne!(
+        new_side.signature, as_old_sees_it.signature,
+        "if these matched, binding max_fuel would be a no-op"
+    );
+    let mut old_sig_on_new_msg = new_side.clone();
+    old_sig_on_new_msg.signature = as_old_sees_it.signature.clone();
+    assert!(
+        old_sig_on_new_msg.verify(&TEST_KEY, u64::MAX).is_err(),
+        "an old worker's signature over a fuel-carrying dispatch must not verify"
+    );
+    new_side
+        .verify(&TEST_KEY, u64::MAX)
+        .expect("the honest new-side message verifies");
 }

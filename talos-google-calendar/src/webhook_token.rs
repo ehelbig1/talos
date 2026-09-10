@@ -142,6 +142,43 @@ pub fn verify_channel_token(token: &str, channel_id: &str, key: &[u8]) -> Option
     }
 }
 
+/// Is this an `X-Goog-Channel-ID` Talos could have minted? Channel ids are
+/// UUIDs generated at watch creation (`Uuid::new_v4().to_string()`), so the
+/// legitimate population is 36 chars of `[0-9a-f-]`. The check is
+/// deliberately a little wider — ≤64 chars of `[A-Za-z0-9_-]` — so it never
+/// rejects a real channel and still refuses the header being used as a free
+/// string: it bounds the per-channel rate-limiter key (F8) and the log line,
+/// and a 64 KiB header cannot become a 64 KiB `DashMap` key.
+pub fn channel_id_shape_ok(channel_id: &str) -> bool {
+    !channel_id.is_empty()
+        && channel_id.len() <= 64
+        && channel_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+#[cfg(test)]
+mod channel_id_shape_tests {
+    use super::channel_id_shape_ok;
+
+    #[test]
+    fn accepts_the_uuids_talos_mints() {
+        assert!(channel_id_shape_ok(&uuid::Uuid::new_v4().to_string()));
+        assert!(channel_id_shape_ok("A1b2-C3_d4"));
+    }
+
+    #[test]
+    fn rejects_empty_oversized_and_free_text() {
+        assert!(!channel_id_shape_ok(""));
+        assert!(!channel_id_shape_ok(&"a".repeat(65)));
+        assert!(channel_id_shape_ok(&"a".repeat(64)));
+        assert!(!channel_id_shape_ok("has space"));
+        assert!(!channel_id_shape_ok("semi;colon"));
+        assert!(!channel_id_shape_ok("new\nline"));
+        assert!(!channel_id_shape_ok("ünïcode"));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -293,14 +293,33 @@ fn nonce_retention_secs(max_age_secs: u64) -> u64 {
     previous.max(clamped).max(NONCE_RETENTION_FLOOR_SECS)
 }
 
+/// How many inserts the nonce cache accepts between two expiry sweeps once it
+/// is past the small-size threshold. Before 2026-09-10 the cache ran
+/// `HashMap::retain` on EVERY insert above 1024 entries — an O(n) walk per
+/// verify on exactly the busy processes that hold many nonces, so the cost
+/// grew with load in the worst direction. Sweeping every 256 inserts bounds
+/// the amortised cost to O(1) per verify while keeping the map within
+/// `256` entries of where the every-insert sweep would have left it. The
+/// hard-cap emergency valve below is unchanged and still runs on every insert
+/// that finds the map at [`NONCE_CACHE_HARD_CAP`], so memory stays bounded.
+/// Sweep frequency has no bearing on correctness: a stale-but-unswept entry
+/// can only ever collide with the SAME nonce string, which is the replay the
+/// cache exists to refuse.
+const NONCE_SWEEP_EVERY_N_INSERTS: u32 = 256;
+
 struct JobNonceCache {
     seen: std::sync::Mutex<HashMap<String, u64>>,
+    /// Inserts since the last expiry sweep (see [`NONCE_SWEEP_EVERY_N_INSERTS`]).
+    /// Only ever read/written under `seen`'s lock, so `Relaxed` is enough; it
+    /// is atomic purely so the struct stays `Sync` without a second mutex.
+    inserts_since_sweep: std::sync::atomic::AtomicU32,
 }
 
 impl JobNonceCache {
     fn new() -> Self {
         Self {
             seen: std::sync::Mutex::new(HashMap::new()),
+            inserts_since_sweep: std::sync::atomic::AtomicU32::new(0),
         }
     }
 
@@ -328,10 +347,19 @@ impl JobNonceCache {
         // boundary.
         let retention = nonce_retention_secs(max_age_secs);
         let cutoff = now.saturating_sub(retention.saturating_mul(2));
-        if g.len() > 1024 {
-            // Skip the sweep at small sizes — pure overhead. Above 1k
-            // entries it's worth it.
+        // Skip the sweep at small sizes — pure overhead. Above 1k entries it
+        // is worth it, but not on EVERY insert (an O(n) walk per verify on a
+        // busy process): amortise it to one sweep per
+        // `NONCE_SWEEP_EVERY_N_INSERTS` inserts. See the constant's docs.
+        if g.len() > 1024
+            && self
+                .inserts_since_sweep
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= NONCE_SWEEP_EVERY_N_INSERTS
+        {
             g.retain(|_, t| *t > cutoff);
+            self.inserts_since_sweep
+                .store(0, std::sync::atomic::Ordering::Relaxed);
         }
         if g.contains_key(nonce) {
             return false;
@@ -346,6 +374,8 @@ impl JobNonceCache {
             g.retain(|_, t| *t > aggressive_cutoff);
         }
         g.insert(nonce.to_string(), ts);
+        self.inserts_since_sweep
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         true
     }
 }
@@ -1288,6 +1318,25 @@ trait SignedMessage {
     /// Set the signature field (called by [`Self::sign_core`]).
     fn set_signature(&mut self, signature: Vec<u8>);
 
+    /// Structural precondition every verify path checks BEFORE touching the
+    /// nonce or the signature. Default: nothing to check.
+    ///
+    /// The result types override this to run [`validate_worker_id`] on the
+    /// RECEIVED `worker_id`. Until 2026-09-10 that charset rule was enforced
+    /// only at SIGN time (`sign_with_worker_id`), i.e. only against a worker
+    /// that was already honest. `worker_id` is the last UNPREFIXED field in
+    /// the result signing payload and the `:llm_usage:<hash>` segment is
+    /// conditionally appended right after it, so a forged
+    /// `worker_id = "w1:llm_usage:<h>"` on a result with EMPTY `llm_usage`
+    /// produced byte-identical signing bytes to an honest `worker_id = "w1"`
+    /// carrying the usage that hashes to `<h>` — one valid MAC, two readings
+    /// of the payload. Refusing the ambiguous shape at the verifier closes it
+    /// with no wire change. Classed as [`VerifyFailureKind::BadSignature`]:
+    /// it is a SECURITY finding about the message, not a liveness one.
+    fn check_payload_shape(&self) -> Result<(), VerifyError> {
+        Ok(())
+    }
+
     /// Shared signing core: build a fresh nonce
     /// (`"<unix_seconds>:<16 random hex bytes>"`), then HMAC-SHA256 the
     /// canonical payload with the pre-shared `key`. Sets both fields.
@@ -1376,6 +1425,7 @@ trait SignedMessage {
     /// observer half of the verify-once split. Returns the parsed nonce
     /// timestamp on success.
     fn verify_no_replay_core(&self, key: &[u8], max_age_secs: u64) -> Result<u64, VerifyError> {
+        self.check_payload_shape()?;
         let ts = self.check_freshness_window(max_age_secs)?;
 
         // Constant-time HMAC verification.
@@ -1431,6 +1481,7 @@ trait SignedMessage {
         keys: &[DispatchVerifyingKey],
         max_age_secs: u64,
     ) -> Result<u64, VerifyError> {
+        self.check_payload_shape()?;
         let ts = self.check_freshness_window(max_age_secs)?;
         if keys.is_empty() {
             return Err(VerifyError::new(
@@ -2079,6 +2130,33 @@ pub const DISALLOWED_SQL_FUNCTIONS: &[&str] = &[
     // side channel the NOTIFY block exists to close. Denied fail-closed; a
     // WASM data query has no legitimate need to emit NOTIFY traffic.
     "pg_notify",
+    // ── SQL-in-a-string evaluators (SPI) ────────────────────────────────
+    // 2026-09-10 review. These take a QUERY as a string argument and run it
+    // through SPI, so the expression-level deny-list above is blind to
+    // whatever is inside the string: `query_to_xml('SELECT pg_sleep(29)',…)`
+    // executes the sleep. Under the guest-role fence privileges are
+    // unchanged (SPI inherits the role, and read-only SPI refuses DML), so
+    // the effect there is budget burn — but on a deployment where
+    // `TALOS_RPC_GUEST_ROLE` is unset the whole validator is bypassed.
+    // The worker carried these as a local supplement first; this is the ONE
+    // home now so the controller-side `talos.database.query` subscriber
+    // denies the same family. `xmltable` is XPath rather than SPI and is
+    // kept out of conservatism.
+    "query_to_xml",
+    "query_to_xmlschema",
+    "query_to_xml_and_xmlschema",
+    "cursor_to_xml",
+    "cursor_to_xmlschema",
+    "table_to_xml",
+    "table_to_xmlschema",
+    "table_to_xml_and_xmlschema",
+    "schema_to_xml",
+    "schema_to_xmlschema",
+    "schema_to_xml_and_xmlschema",
+    "database_to_xml",
+    "database_to_xmlschema",
+    "database_to_xml_and_xmlschema",
+    "xmltable",
 ];
 
 /// True iff `name` (case-insensitive, schema component already stripped)
@@ -3302,6 +3380,20 @@ impl RawSigned<serde_json::Value> {
 // Job request / result
 // ============================================================================
 
+/// Upper bound on the per-job fuel a worker will honour from
+/// [`JobRequest::max_fuel`] (and from [`PipelineStep::max_fuel`]).
+///
+/// Mirrors the controller's `talos_workflow_engine::DEFAULT_MAX_FUEL_PER_NODE`
+/// (50 M instructions, ~5 s of dense numeric work) — pinned equal by a test in
+/// `talos-workflow-engine-nats`, the one crate that depends on both. Lives here
+/// rather than being imported from the engine because the worker is
+/// deliberately engine-free. A worker may LOWER its ceiling via
+/// `TALOS_WORKER_MAX_JOB_FUEL`; it never raises it above what the request
+/// asked for. The clamp is defence in depth behind the signature binding: the
+/// signed value stops an on-wire rewrite, the clamp stops a mis-capping
+/// controller.
+pub const MAX_JOB_FUEL: u64 = 50_000_000;
+
 /// A job dispatched by the Controller to a Worker via NATS.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct JobRequest {
@@ -3437,8 +3529,12 @@ pub struct JobRequest {
     /// Set by the controller from the node's `max_fuel` config key or the
     /// module's stored `max_fuel` column.  When non-zero the worker SHOULD use
     /// this value instead of its global `WASM_FUEL_LIMIT` default.
-    /// Capped at 50_000_000 (50M) by the controller to prevent abuse.
+    /// Capped at [`MAX_JOB_FUEL`] (50M) by the controller to prevent abuse,
+    /// and clamped to the worker's own ceiling again on receipt.
     /// Zero means "use the worker's default fuel limit".
+    ///
+    /// Bound into the signing payload as a trailing `:fuel=<n>` segment ONLY
+    /// when non-zero (since 2026-09-10; see `signing_payload`).
     #[serde(default)]
     pub max_fuel: u64,
 
@@ -3876,6 +3972,29 @@ impl JobRequest {
             let _ = write!(payload, ":attempt={}", self.dispatch_attempt);
         }
 
+        // Per-job fuel appended AT THE VERY END (after `:attempt=`), ONLY when
+        // non-zero, per the wire-format stability rule. Zero — "use the
+        // worker's default" — appends nothing, so a fuel-less message is
+        // byte-identical to the pre-field format. Until 2026-09-10 this was
+        // the ONE resource bound on `JobRequest` an on-wire attacker could
+        // rewrite without invalidating the signature (`PipelineStep.max_fuel`
+        // has been bound since C-2): inflating it turns a 5 M-instruction node
+        // into a 50 M one on the worker's CPU, deflating it fails an honest
+        // node with "fuel exhausted". The worker ALSO clamps the value to its
+        // own ceiling (`MAX_JOB_FUEL` by default) so the bound holds even
+        // against a controller that mis-caps.
+        //
+        // DEPLOY ORDERING: unlike `:attempt=`, a NON-zero `max_fuel` is the
+        // COMMON case (the controller stamps it from node config / the
+        // module's column), so this segment changes the signed bytes of most
+        // live dispatches. Controller and worker must roll TOGETHER for it;
+        // a mixed pair refuses every fuel-carrying dispatch on both sides
+        // (fail-closed, never a silent acceptance).
+        if self.max_fuel != 0 {
+            use std::fmt::Write as _;
+            let _ = write!(payload, ":fuel={}", self.max_fuel);
+        }
+
         payload.into_bytes()
     }
 
@@ -4050,6 +4169,47 @@ impl JobRequest {
             )),
         }
     }
+
+    /// Scheme-dispatching **Observer** verify: freshness + signature only,
+    /// NEVER touching the process-local replay cache. Routes on
+    /// `self.crypto_scheme` exactly like [`Self::verify_dispatch`] (same
+    /// `accept_legacy_hmac` P4 semantics) but uses the no-replay primitive on
+    /// both arms. Returns the parsed nonce timestamp.
+    ///
+    /// Use at a pre-check that runs BEFORE the primary `verify_dispatch` on
+    /// the same message in the same process — the worker's idempotency-cache
+    /// gate is the motivating site. Until 2026-09-10 that gate called the
+    /// HMAC-only `verify_no_replay_with_ring`, so under an Ed25519 dispatch
+    /// (`crypto_scheme = 1`) it was ALWAYS false and the whole idempotency
+    /// layer was dead on exactly the fleet posture (`TALOS_DISPATCH_SCHEME=
+    /// ed25519`) the dev stack runs. The verify-once rule is preserved: this
+    /// method records nothing, so the downstream primary still records the
+    /// nonce exactly once.
+    pub fn verify_no_replay_dispatch(
+        &self,
+        hmac_ring: &talos_workflow_engine_core::WorkerKeyRing,
+        ed_keys: &[DispatchVerifyingKey],
+        max_age_secs: u64,
+        accept_legacy_hmac: bool,
+    ) -> Result<u64, VerifyError> {
+        match self.crypto_scheme {
+            CRYPTO_SCHEME_ED25519 => self.verify_no_replay_ed25519_core(ed_keys, max_age_secs),
+            CRYPTO_SCHEME_HMAC => {
+                if !accept_legacy_hmac {
+                    return Err(VerifyError::new(
+                        VerifyFailureKind::SchemeRefused,
+                        "legacy HMAC dispatch refused (Ed25519-only enforcement enabled)"
+                            .to_string(),
+                    ));
+                }
+                self.verify_no_replay_with_ring_core(hmac_ring, max_age_secs)
+            }
+            other => Err(VerifyError::new(
+                VerifyFailureKind::SchemeRefused,
+                format!("unknown dispatch crypto_scheme: {other}"),
+            )),
+        }
+    }
 }
 
 impl SignedMessage for JobRequest {
@@ -4171,6 +4331,19 @@ fn llm_usage_signing_hash(entries: &[LlmUsageEntry]) -> Option<String> {
     Some(hex::encode(Sha256::digest(lines.join("\n").as_bytes())))
 }
 
+/// [`SignedMessage::check_payload_shape`] body shared by [`JobResult`] and
+/// [`PipelineJobResult`]: the received `worker_id` must satisfy the same
+/// charset rule the signer enforces, or the colon-delimited signing payload
+/// is ambiguous (see the trait method's docs for the concrete collision).
+fn check_result_worker_id_shape(worker_id: &str) -> Result<(), VerifyError> {
+    validate_worker_id(worker_id).map_err(|m| {
+        VerifyError::new(
+            VerifyFailureKind::BadSignature,
+            format!("result worker_id rejected before signature check: {m}"),
+        )
+    })
+}
+
 /// Result returned by a Worker to the Controller via NATS.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct JobResult {
@@ -4227,6 +4400,41 @@ pub struct JobResult {
 }
 
 impl JobResult {
+    /// Does the output payload carry an application-level `success: false`?
+    ///
+    /// WASM modules like `database-query` return [`JobStatus::Success`] but
+    /// include `{"success": false, "error": "..."}` in the payload when the
+    /// query itself fails. Only a JSON **boolean** `false` counts — a string
+    /// `"false"`, `null` or an absent key all read as "not a failure", which
+    /// is exactly the dispatcher's historical `as_bool() == Some(false)` test.
+    #[must_use]
+    pub fn payload_reports_failure(&self) -> bool {
+        self.output_payload
+            .value()
+            .get("success")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+    }
+
+    /// Would the controller's dispatcher accept this result as a TERMINAL
+    /// success — i.e. return it to the engine rather than retry the job?
+    ///
+    /// `status == Success` AND NOT [`Self::payload_reports_failure`]. This is
+    /// the predicate `talos_workflow_engine_nats::execute_job_with_retry` has
+    /// always applied inline; it now lives HERE because the worker needs the
+    /// SAME answer on the other side of the wire. The worker's idempotency
+    /// cache (`worker::job_idempotency`) may re-publish a cached result for a
+    /// re-seen `job_id` ONLY when that result is one the controller would not
+    /// retry: the dispatcher's application-failure retry keeps the `job_id`
+    /// and bumps `dispatch_attempt`, so a cached `Failed` (or `success:false`)
+    /// result would be replayed verbatim on every retry and the whole retry
+    /// budget would be spent re-reading one transient failure. Two copies of
+    /// this test drifting apart is precisely that bug, so there is one.
+    #[must_use]
+    pub fn is_terminal_success(&self) -> bool {
+        matches!(self.status, JobStatus::Success) && !self.payload_reports_failure()
+    }
+
     /// Canonical byte string signed / verified by HMAC-SHA256.
     ///
     /// Format:
@@ -4526,6 +4734,9 @@ impl SignedMessage for JobResult {
 
     fn payload_bytes(&self) -> Vec<u8> {
         self.signing_payload()
+    }
+    fn check_payload_shape(&self) -> Result<(), VerifyError> {
+        check_result_worker_id_shape(&self.worker_id)
     }
     fn nonce(&self) -> &str {
         &self.result_nonce
@@ -5106,6 +5317,35 @@ impl PipelineJobRequest {
             )),
         }
     }
+
+    /// Scheme-dispatching Observer verify (no replay-cache write). See
+    /// [`JobRequest::verify_no_replay_dispatch`] — same contract, same
+    /// motivating site (the worker's pipeline idempotency-cache pre-check).
+    pub fn verify_no_replay_dispatch(
+        &self,
+        hmac_ring: &talos_workflow_engine_core::WorkerKeyRing,
+        ed_keys: &[DispatchVerifyingKey],
+        max_age_secs: u64,
+        accept_legacy_hmac: bool,
+    ) -> Result<u64, VerifyError> {
+        match self.crypto_scheme {
+            CRYPTO_SCHEME_ED25519 => self.verify_no_replay_ed25519_core(ed_keys, max_age_secs),
+            CRYPTO_SCHEME_HMAC => {
+                if !accept_legacy_hmac {
+                    return Err(VerifyError::new(
+                        VerifyFailureKind::SchemeRefused,
+                        "legacy HMAC dispatch refused (Ed25519-only enforcement enabled)"
+                            .to_string(),
+                    ));
+                }
+                self.verify_no_replay_with_ring_core(hmac_ring, max_age_secs)
+            }
+            other => Err(VerifyError::new(
+                VerifyFailureKind::SchemeRefused,
+                format!("unknown dispatch crypto_scheme: {other}"),
+            )),
+        }
+    }
 }
 
 impl SignedMessage for PipelineJobRequest {
@@ -5430,6 +5670,41 @@ impl PipelineJobResult {
             )),
         }
     }
+
+    /// Scheme-dispatching **Observer** verify — the pipeline twin of
+    /// [`JobResult::verify_no_replay_dispatch`]. Freshness + signature only,
+    /// never touching the replay cache. Added 2026-09-10 alongside the
+    /// worker's idempotency-cache re-verify of a Redis-sourced pipeline
+    /// result, which until then used the HMAC-only observer and so could not
+    /// re-admit an Ed25519-signed cached result (verify-once rule: add the
+    /// observer half BEFORE the second consumer lands).
+    pub fn verify_no_replay_dispatch(
+        &self,
+        hmac_ring: &talos_workflow_engine_core::WorkerKeyRing,
+        worker_ed_keys: &[DispatchVerifyingKey],
+        max_age_secs: u64,
+        accept_legacy_hmac: bool,
+    ) -> Result<(), VerifyError> {
+        match self.crypto_scheme {
+            CRYPTO_SCHEME_ED25519 => self
+                .verify_no_replay_ed25519_core(worker_ed_keys, max_age_secs)
+                .map(|_| ()),
+            CRYPTO_SCHEME_HMAC => {
+                if !accept_legacy_hmac {
+                    return Err(VerifyError::new(
+                        VerifyFailureKind::SchemeRefused,
+                        "legacy HMAC result refused (Ed25519-only enforcement enabled)".to_string(),
+                    ));
+                }
+                self.verify_no_replay_with_ring_core(hmac_ring, max_age_secs)
+                    .map(|_| ())
+            }
+            other => Err(VerifyError::new(
+                VerifyFailureKind::SchemeRefused,
+                format!("unknown result crypto_scheme: {other}"),
+            )),
+        }
+    }
 }
 
 impl SignedMessage for PipelineJobResult {
@@ -5437,6 +5712,9 @@ impl SignedMessage for PipelineJobResult {
 
     fn payload_bytes(&self) -> Vec<u8> {
         self.signing_payload()
+    }
+    fn check_payload_shape(&self) -> Result<(), VerifyError> {
+        check_result_worker_id_shape(&self.worker_id)
     }
     fn nonce(&self) -> &str {
         &self.result_nonce
@@ -9797,5 +10075,397 @@ mod worker_shared_key_precedence_tests {
             hex::decode(VALID_HEX).unwrap().as_slice(),
             "a non-empty env var must keep precedence over the file"
         );
+    }
+}
+
+/// 2026-09-10 protocol review (tasks D1/D2/D3/D4/D8). Each test names the
+/// defect it pins; the fixtures are local so this module does not depend on
+/// the private helpers of `mod tests`.
+#[cfg(test)]
+mod protocol_review_2026_09_tests {
+    use super::*;
+
+    const KEY: [u8; 32] = [0x42; 32];
+
+    fn ring() -> talos_workflow_engine_core::WorkerKeyRing {
+        talos_workflow_engine_core::WorkerKeyRing::single(
+            talos_workflow_engine_core::WorkerSharedKey::new(KEY.to_vec()),
+        )
+    }
+
+    fn request() -> JobRequest {
+        JobRequest {
+            crypto_scheme: 0,
+            sealing: 0,
+            secret_paths: Vec::new(),
+            claim_inbox: None,
+            job_id: Uuid::new_v4(),
+            workflow_execution_id: Uuid::new_v4(),
+            module_uri: "wasm://m/v1".to_string(),
+            input_payload: serde_json::json!({"k": 1}).into(),
+            encrypted_secrets: EncryptedSecrets::empty(),
+            timeout_ms: 30_000,
+            priority: 100,
+            deadline_unix_secs: 0,
+            cancellation_token: None,
+            allowed_hosts: vec![],
+            allowed_methods: vec![],
+            allowed_secrets: vec![],
+            allowed_sql_operations: vec![],
+            allow_tier2_exposure: false,
+            signature: vec![],
+            max_llm_tier: LlmTier::default(),
+            max_write_ceiling: WriteCeiling::default(),
+            egress_scope: None,
+            job_nonce: String::new(),
+            actor_id: None,
+            wasm_bytes: None,
+            capability_world: None,
+            integration_name: None,
+            user_id: Uuid::nil(),
+            expected_wasm_hash: None,
+            max_fuel: 0,
+            dry_run: false,
+            reply_topic: None,
+            idempotency_key: None,
+            dispatch_attempt: 0,
+        }
+    }
+
+    fn result(status: JobStatus, payload: serde_json::Value) -> JobResult {
+        JobResult {
+            llm_usage: vec![],
+            crypto_scheme: 0,
+            job_id: Uuid::new_v4(),
+            status,
+            output_payload: payload.into(),
+            logs: vec![],
+            execution_time_ms: 1,
+            signature: vec![],
+            result_nonce: String::new(),
+            worker_id: String::new(),
+        }
+    }
+
+    fn fresh_nonce() -> String {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        let r: [u8; 16] = rand::thread_rng().gen();
+        format!("{ts}:{}", hex::encode(r))
+    }
+
+    /// HMAC over whatever `signing_payload()` yields, with NO sign-time
+    /// validation — the shape an attacker (or a buggy worker) can put on the
+    /// wire, which `sign_with_worker_id` refuses to produce.
+    fn raw_hmac_sign<M: SignedMessage>(m: &mut M) {
+        m.set_nonce(fresh_nonce());
+        let mut mac = <HmacSha256 as Mac>::new_from_slice(&KEY).expect("key");
+        mac.update(&m.payload_bytes());
+        m.set_signature(mac.finalize().into_bytes().to_vec());
+    }
+
+    // ── D1: ONE home for the controller's success test ─────────────────────
+
+    #[test]
+    fn terminal_success_mirrors_the_dispatcher_predicate_exactly() {
+        // Success with no `success` key → terminal success.
+        assert!(result(JobStatus::Success, serde_json::json!({"ok": true})).is_terminal_success());
+        // Success with `success: true` → terminal success.
+        assert!(
+            result(JobStatus::Success, serde_json::json!({"success": true})).is_terminal_success()
+        );
+        // Success with `success: false` → the application failed; the
+        // dispatcher retries this, so it must NOT be a terminal success.
+        let app_failed = result(
+            JobStatus::Success,
+            serde_json::json!({"success": false, "error": "query failed"}),
+        );
+        assert!(app_failed.payload_reports_failure());
+        assert!(!app_failed.is_terminal_success());
+        // Only a JSON boolean counts — a string "false" or null is not a
+        // failure marker (the dispatcher's `as_bool() == Some(false)`).
+        assert!(
+            result(JobStatus::Success, serde_json::json!({"success": "false"}))
+                .is_terminal_success()
+        );
+        assert!(
+            result(JobStatus::Success, serde_json::json!({"success": null})).is_terminal_success()
+        );
+        // Non-Success statuses are never terminal successes, whatever the
+        // payload says.
+        assert!(
+            !result(JobStatus::Failed, serde_json::json!({"success": true})).is_terminal_success()
+        );
+        assert!(
+            !result(JobStatus::TimedOut, serde_json::json!({"ok": true})).is_terminal_success()
+        );
+    }
+
+    // ── D2: scheme-routing OBSERVER verifier on the request types ──────────
+
+    #[test]
+    fn request_observer_verify_routes_by_scheme_and_records_no_nonce() {
+        let _serial = NONCE_CACHE_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let ring = ring();
+        let sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        let pk = sk.verifying_key();
+
+        // Ed25519-signed request: the OLD pre-check (`verify_no_replay_with_ring`,
+        // HMAC only) is false for it — the defect — while the scheme-routing
+        // observer accepts it.
+        let mut ed = request();
+        ed.sign_ed25519(&sk).unwrap();
+        assert!(
+            ed.verify_no_replay_with_ring(&ring, 300).is_err(),
+            "control: the HMAC-only observer cannot see an Ed25519 dispatch"
+        );
+        ed.verify_no_replay_dispatch(&ring, &[pk], 300, false)
+            .expect("Ed25519 dispatch verifies at the observer");
+        // Observer recorded NOTHING: the primary still admits the nonce once…
+        ed.verify_dispatch(&ring, &[pk], 300, false)
+            .expect("primary verify after the observer must not see a replay");
+        // …and exactly once.
+        assert!(ed.verify_dispatch(&ring, &[pk], 300, false).is_err());
+
+        // HMAC-signed request: accepted while legacy HMAC is accepted, refused
+        // under P4 enforcement — same semantics as `verify_dispatch`.
+        let mut hm = request();
+        hm.sign(&KEY).unwrap();
+        hm.verify_no_replay_dispatch(&ring, &[pk], 300, true)
+            .expect("HMAC dispatch verifies at the observer during rollout");
+        let refused = hm
+            .verify_no_replay_dispatch(&ring, &[pk], 300, false)
+            .expect_err("P4: legacy HMAC refused");
+        assert_eq!(refused.kind(), VerifyFailureKind::SchemeRefused);
+
+        // Unknown scheme byte → refused, not silently treated as HMAC.
+        let mut unk = request();
+        unk.sign(&KEY).unwrap();
+        unk.crypto_scheme = 77;
+        assert!(unk
+            .verify_no_replay_dispatch(&ring, &[pk], 300, true)
+            .is_err());
+
+        // Pipeline twin.
+        let mut pipe = PipelineJobRequest {
+            crypto_scheme: 0,
+            sealing: 0,
+            secret_paths: Vec::new(),
+            claim_inbox: None,
+            job_id: Uuid::new_v4(),
+            workflow_execution_id: Uuid::new_v4(),
+            user_id: Uuid::nil(),
+            steps: vec![],
+            signature: vec![],
+            job_nonce: String::new(),
+            total_timeout_ms: 1000,
+            share_sandbox: false,
+            max_llm_tier: LlmTier::default(),
+            max_write_ceiling: WriteCeiling::default(),
+            egress_scope: None,
+            reply_topic: None,
+        };
+        pipe.sign_ed25519(&sk).unwrap();
+        assert!(pipe.verify_no_replay_with_ring(&ring, 300).is_err());
+        pipe.verify_no_replay_dispatch(&ring, &[pk], 300, false)
+            .expect("Ed25519 pipeline dispatch verifies at the observer");
+        pipe.verify_dispatch(&ring, &[pk], 300, false)
+            .expect("observer left the nonce unrecorded");
+    }
+
+    // ── D3: max_fuel is signature-bound ─────────────────────────────────────
+
+    #[test]
+    fn max_fuel_is_bound_against_inflate_deflate_strip_and_forge() {
+        let mut signed = request();
+        signed.max_fuel = 1_000_000;
+        signed.sign(&KEY).unwrap();
+        signed
+            .verify_no_replay(&KEY, 300)
+            .expect("the honest message verifies");
+
+        let mut inflated = signed.clone();
+        inflated.max_fuel = 50_000_000;
+        assert!(
+            inflated.verify_no_replay(&KEY, 300).is_err(),
+            "inflating max_fuel must invalidate the signature"
+        );
+        let mut deflated = signed.clone();
+        deflated.max_fuel = 1;
+        assert!(
+            deflated.verify_no_replay(&KEY, 300).is_err(),
+            "deflating max_fuel must invalidate the signature"
+        );
+        let mut stripped = signed.clone();
+        stripped.max_fuel = 0;
+        assert!(
+            stripped.verify_no_replay(&KEY, 300).is_err(),
+            "stripping max_fuel (falling back to the worker default) must invalidate the signature"
+        );
+
+        // Reverse direction: a fuel-less message cannot have fuel forged on.
+        let mut zero = request();
+        zero.sign(&KEY).unwrap();
+        let mut forged = zero.clone();
+        forged.max_fuel = 50_000_000;
+        assert!(forged.verify_no_replay(&KEY, 300).is_err());
+        zero.verify_no_replay(&KEY, 300)
+            .expect("attempt-0/fuel-0 verifies");
+    }
+
+    /// All-default bytes are UNCHANGED: `max_fuel == 0` appends nothing, so
+    /// the payload is byte-identical to the pre-field format. Asserted by
+    /// rebuilding the payload with the field's segment removed by hand.
+    #[test]
+    fn zero_max_fuel_appends_nothing_to_the_signing_payload() {
+        let mut a = request();
+        a.job_nonce = "0:00000000000000000000000000000000".into();
+        let bytes = a.signing_payload();
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains(":fuel="),
+            "a zero max_fuel must not appear in the signed bytes"
+        );
+        a.max_fuel = 7;
+        let with = String::from_utf8_lossy(&a.signing_payload()).to_string();
+        assert!(
+            with.ends_with(":fuel=7"),
+            "fuel segment is appended LAST: {with}"
+        );
+        // And it sits AFTER the attempt segment when both are present.
+        a.dispatch_attempt = 2;
+        let both = String::from_utf8_lossy(&a.signing_payload()).to_string();
+        assert!(both.ends_with(":attempt=2:fuel=7"), "{both}");
+    }
+
+    // ── D4: worker_id field-boundary collision ──────────────────────────────
+
+    /// The collision itself, spelled out: a result with EMPTY `llm_usage` and
+    /// `worker_id = "w1:llm_usage:<h>"` has the SAME signing bytes as an honest
+    /// `worker_id = "w1"` result whose usage hashes to `<h>`. One MAC verifies
+    /// both readings. The verifier must therefore refuse the malformed
+    /// `worker_id` before it ever compares a MAC.
+    #[test]
+    fn job_result_with_colon_in_worker_id_is_refused_at_every_verifier() {
+        let _serial = NONCE_CACHE_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let usage = vec![LlmUsageEntry {
+            provider: "ollama".into(),
+            model: "qwen".into(),
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            calls: 1,
+        }];
+        let h = llm_usage_signing_hash(&usage).expect("non-empty usage hashes");
+
+        // The honest result: real usage, clean worker id.
+        let mut honest = result(JobStatus::Success, serde_json::json!({"ok": true}));
+        honest.worker_id = "w1".into();
+        honest.llm_usage = usage;
+        honest.result_nonce = "0:00000000000000000000000000000000".into();
+
+        // The forgery: NO usage, the usage segment smuggled into worker_id.
+        let mut forged = honest.clone();
+        forged.llm_usage = vec![];
+        forged.worker_id = format!("w1:llm_usage:{h}");
+        assert_eq!(
+            honest.signing_payload(),
+            forged.signing_payload(),
+            "this IS the collision: two messages, one set of signed bytes"
+        );
+
+        // Sign the forgery raw (bypassing sign-time validation, as an attacker
+        // holding the fleet key or a buggy worker would).
+        raw_hmac_sign(&mut forged);
+        let ring = ring();
+        let e = forged
+            .verify_no_replay(&KEY, 300)
+            .expect_err("observer must refuse a colon-bearing worker_id");
+        assert!(e.contains("worker_id"), "{e}");
+        assert!(forged.verify(&KEY, 300).is_err());
+        assert!(forged.verify_no_replay_with_ring(&ring, 300).is_err());
+        assert!(forged.verify_with_ring(&ring, 300).is_err());
+        let ve = forged
+            .verify_dispatch(&ring, &[], 300, true)
+            .expect_err("scheme-routing primary refuses too");
+        assert_eq!(ve.kind(), VerifyFailureKind::BadSignature);
+        assert!(forged
+            .verify_no_replay_dispatch(&ring, &[], 300, true)
+            .is_err());
+        // Ed25519 arm as well (the shape check runs before the key lookup).
+        forged.crypto_scheme = CRYPTO_SCHEME_ED25519;
+        let sk = DispatchSigningKey::generate(&mut rand::rngs::OsRng);
+        assert!(forged
+            .verify_no_replay_ed25519(&[sk.verifying_key()], 300)
+            .is_err());
+
+        // POSITIVE CONTROL: the same raw signing over a CLEAN worker_id
+        // verifies, so the refusals above are about the worker_id and not
+        // about the hand-rolled signature.
+        let mut clean = result(JobStatus::Success, serde_json::json!({"ok": true}));
+        clean.worker_id = "w1".into();
+        raw_hmac_sign(&mut clean);
+        clean
+            .verify_no_replay(&KEY, 300)
+            .expect("control: a clean worker_id still verifies");
+    }
+
+    #[test]
+    fn pipeline_result_with_colon_in_worker_id_is_refused() {
+        let mut r = PipelineJobResult {
+            llm_usage: vec![],
+            crypto_scheme: 0,
+            job_id: Uuid::new_v4(),
+            step_results: vec![],
+            final_output: serde_json::json!({"ok": true}).into(),
+            overall_status: JobStatus::Success,
+            total_time_ms: 1,
+            signature: vec![],
+            result_nonce: String::new(),
+            worker_id: "w1:llm_usage:deadbeef".into(),
+        };
+        raw_hmac_sign(&mut r);
+        assert!(r.verify_no_replay(&KEY, 300).is_err());
+        assert!(r
+            .verify_no_replay_dispatch(&ring(), &[], 300, true)
+            .is_err());
+        // Control.
+        r.worker_id = "w1".into();
+        raw_hmac_sign(&mut r);
+        r.verify_no_replay(&KEY, 300).expect("clean id verifies");
+    }
+
+    // ── D8: throttled sweep still reclaims ──────────────────────────────────
+
+    /// The sweep now runs once per `NONCE_SWEEP_EVERY_N_INSERTS` inserts above
+    /// the 1024 threshold instead of on every insert. It must still RECLAIM:
+    /// a flood of already-expired nonces cannot grow the map past
+    /// `1024 + NONCE_SWEEP_EVERY_N_INSERTS` live entries.
+    #[test]
+    fn the_throttled_sweep_still_reclaims_expired_nonces() {
+        let _serial = NONCE_CACHE_TEST_SERIAL
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        clear_job_nonce_cache_for_test();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        // Far older than 2× any retention window this crate will compute.
+        let ancient = now.saturating_sub(10 * NONCE_RETENTION_CEILING_SECS);
+        let bound = 1024 + NONCE_SWEEP_EVERY_N_INSERTS as usize;
+        for i in 0..5_000u32 {
+            JOB_NONCE_CACHE.check_and_record(&format!("expired-{i}"), ancient, 300);
+            assert!(
+                job_nonce_cache_size() <= bound,
+                "insert {i}: {} live entries — the throttled sweep stopped reclaiming",
+                job_nonce_cache_size()
+            );
+        }
+        clear_job_nonce_cache_for_test();
     }
 }

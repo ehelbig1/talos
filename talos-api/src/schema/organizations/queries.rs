@@ -20,6 +20,11 @@ pub struct OrganizationsQueries;
 #[async_graphql::Object]
 impl OrganizationsQueries {
     async fn my_organizations(&self, ctx: &Context<'_>) -> Result<Vec<OrganizationObj>> {
+        // 2026-09-10 review: the org mutations gained `require_scope(Admin)`;
+        // the reads take the baseline read scope so an API key with no
+        // scopes at all cannot enumerate memberships (check 22 parity).
+        // Session callers bypass `require_scope` by design.
+        crate::schema::require_scope(ctx, talos_api_keys::ApiKeyScope::WorkflowsRead)?;
         let user_id = ctx
             .data_opt::<Uuid>()
             .copied()
@@ -37,6 +42,7 @@ impl OrganizationsQueries {
     }
 
     async fn organization(&self, ctx: &Context<'_>, org_id: Uuid) -> Result<OrganizationObj> {
+        crate::schema::require_scope(ctx, talos_api_keys::ApiKeyScope::WorkflowsRead)?;
         let user_id = ctx
             .data_opt::<Uuid>()
             .copied()
@@ -71,6 +77,7 @@ impl OrganizationsQueries {
         ctx: &Context<'_>,
         org_id: Uuid,
     ) -> Result<Vec<OrgMemberObj>> {
+        crate::schema::require_scope(ctx, talos_api_keys::ApiKeyScope::WorkflowsRead)?;
         let user_id = ctx
             .data_opt::<Uuid>()
             .copied()

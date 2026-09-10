@@ -136,6 +136,74 @@ pub fn is_safe_error_substring(msg: &str) -> bool {
         .any(|substr| msg.contains(substr))
 }
 
+/// Scrub a GraphQL response's errors for a NON-development deployment, in
+/// place. ONE home for the policy `graphql_handler` applies (2026-09-10 — the
+/// WebSocket lane streamed responses to the client UNSCRUBBED, so a resolver
+/// error carrying a schema name or query text reached a browser over `/ws`
+/// while the same error over `/graphql` was collapsed).
+///
+/// Two-layer policy, unchanged from the HTTP handler:
+///   1. EXPLICIT MARKER (preferred): an error carrying `extensions.safe = true`
+///      (set by `.extend_safe()`) passes through verbatim — [`is_safe_error`].
+///   2. SUBSTRING FALLBACK: [`is_safe_error_substring`] keeps legacy
+///      user-facing messages that have not migrated to `.extend_safe()`.
+/// Everything else becomes `"Internal server error"`; the original is logged
+/// server-side. `is_development` is a parameter so the policy is testable;
+/// callers use [`scrub_response_errors`], which reads `talos_config`.
+pub fn scrub_response_errors_with(response: &mut async_graphql::Response, is_development: bool) {
+    if is_development {
+        return;
+    }
+    for error in &mut response.errors {
+        tracing::error!("GraphQL Error: {:?}", error);
+        if is_safe_error(error) {
+            continue;
+        }
+        if !is_safe_error_substring(error.message.as_str()) {
+            error.message = "Internal server error".to_string();
+        }
+    }
+}
+
+/// [`scrub_response_errors_with`] under the process's own environment.
+pub fn scrub_response_errors(response: &mut async_graphql::Response) {
+    scrub_response_errors_with(response, talos_config::is_development());
+}
+
+/// Is the operation this request selects a `subscription`? (2026-09-10.)
+///
+/// The graphql-ws `subscribe` / `start` frames were handed to
+/// `Schema::execute_stream` unexamined, and `execute_stream` runs QUERIES and
+/// MUTATIONS too — one-item streams — so the WebSocket lane was a second
+/// mutation transport with none of the HTTP lane's CSRF discipline. Returns
+/// `Ok(false)` for a query or mutation and `Err` when the document does not
+/// parse or names no single operation (an operation that cannot be classified
+/// must be refused, not executed); the caller rejects both.
+pub fn operation_is_subscription(
+    query: &str,
+    operation_name: Option<&str>,
+) -> Result<bool, String> {
+    use async_graphql::parser::types::{DocumentOperations, OperationType};
+
+    let doc = async_graphql::parser::parse_query(query).map_err(|e| e.to_string())?;
+    let op = match &doc.operations {
+        DocumentOperations::Single(op) => &op.node,
+        DocumentOperations::Multiple(ops) => match operation_name {
+            Some(name) => ops
+                .get(name)
+                .map(|op| &op.node)
+                .ok_or_else(|| format!("operation '{name}' not found in document"))?,
+            None if ops.len() == 1 => &ops.values().next().expect("len==1").node,
+            None => {
+                return Err(
+                    "operationName is required when a document has several operations".into(),
+                )
+            }
+        },
+    };
+    Ok(op.ty == OperationType::Subscription)
+}
+
 pub fn require_scope(ctx: &Context<'_>, required_scope: talos_api_keys::ApiKeyScope) -> Result<()> {
     if let Ok(scopes) = ctx.data::<ApiKeyScopes>() {
         if !scopes.0.contains(&required_scope)
@@ -958,5 +1026,74 @@ mod tests {
         // Legitimate whitelisted prose still passes (regression guard).
         assert!(is_safe_error_substring("Not found"));
         assert!(is_safe_error_substring("Access denied"));
+    }
+}
+
+#[cfg(test)]
+mod ws_lane_guard_tests {
+    use super::{operation_is_subscription, scrub_response_errors_with, SafeErrorExtensions};
+
+    #[test]
+    fn a_subscription_is_classified_as_one() {
+        assert_eq!(
+            operation_is_subscription("subscription { executionUpdates { id } }", None),
+            Ok(true)
+        );
+    }
+
+    #[test]
+    fn a_query_and_a_mutation_are_not() {
+        assert_eq!(operation_is_subscription("{ me { id } }", None), Ok(false));
+        assert_eq!(
+            operation_is_subscription("mutation { deleteWorkflow(id: \"x\") }", None),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn the_named_operation_decides_in_a_multi_operation_document() {
+        let doc =
+            "subscription S { executionUpdates { id } } mutation M { deleteWorkflow(id: \"x\") }";
+        assert_eq!(operation_is_subscription(doc, Some("S")), Ok(true));
+        assert_eq!(operation_is_subscription(doc, Some("M")), Ok(false));
+        // No name over several operations: cannot classify ⇒ Err (refused).
+        assert!(operation_is_subscription(doc, None).is_err());
+        assert!(operation_is_subscription(doc, Some("Nope")).is_err());
+    }
+
+    #[test]
+    fn an_unparseable_document_is_an_error_not_a_pass() {
+        assert!(operation_is_subscription("subscription {", None).is_err());
+    }
+
+    fn response_with(errors: Vec<async_graphql::ServerError>) -> async_graphql::Response {
+        let mut r = async_graphql::Response::new(async_graphql::Value::Null);
+        r.errors = errors;
+        r
+    }
+
+    #[test]
+    fn production_scrub_collapses_unmarked_errors_and_keeps_safe_ones() {
+        let leaky = async_graphql::ServerError::new(
+            "relation \"secrets\" does not exist at query SELECT value_enc FROM secrets",
+            None,
+        );
+        let marked: async_graphql::ServerError = async_graphql::Error::new("anything at all")
+            .extend_safe()
+            .into_server_error(async_graphql::Pos::default());
+        let legacy = async_graphql::ServerError::new("Not found", None);
+        let mut resp = response_with(vec![leaky, marked, legacy]);
+        scrub_response_errors_with(&mut resp, false);
+        assert_eq!(resp.errors[0].message, "Internal server error");
+        assert_eq!(resp.errors[1].message, "anything at all");
+        assert_eq!(resp.errors[2].message, "Not found");
+    }
+
+    #[test]
+    fn development_is_left_verbatim() {
+        let leaky = async_graphql::ServerError::new("relation does not exist", None);
+        let mut resp = response_with(vec![leaky]);
+        scrub_response_errors_with(&mut resp, true);
+        assert_eq!(resp.errors[0].message, "relation does not exist");
     }
 }

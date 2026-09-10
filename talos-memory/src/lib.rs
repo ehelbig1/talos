@@ -31,6 +31,7 @@ pub mod integration_state_rpc;
 pub mod memory_rpc;
 pub mod ml_rpc;
 pub mod rpc_auth;
+pub mod spotlight;
 pub mod state_rpc;
 pub mod write_error;
 
@@ -465,9 +466,13 @@ pub async fn decrypt_row_value(row: &sqlx::postgres::PgRow) -> anyhow::Result<se
 /// the graph ONLY via a deliberate, curated path (the reflection loop's
 /// entity synthesis in `talos_memory_consolidation`).
 ///
-/// NOTE: `"consolidated"` is deliberately NOT synthetic — a consolidated
-/// summary is condensed REAL content (episodic rows collapsed into a
-/// semantic memory), so it SHOULD still auto-extract. Verified in
+/// NOTE (revised 2026-09-10): `"consolidated"` IS synthetic. It used to be
+/// deliberately absent ("condensed REAL content, so it should still
+/// auto-extract"), but the summary is text an LLM wrote over a batch that
+/// may have contained a poisoned row, and it carries no provenance — so it
+/// is neither a trustworthy grounding source nor a trustworthy graph source.
+/// The source rows already ran extraction when they were written, so the
+/// graph loses only the re-extraction of a summary. Verified in
 /// `spawn_graph_extraction_synthetic_kind_tests`.
 pub fn is_synthetic_memory_kind(kind: &str) -> bool {
     SYNTHETIC_MEMORY_KINDS.contains(&kind)
@@ -494,7 +499,7 @@ pub fn metadata_kind(metadata: Option<&serde_json::Value>) -> Option<&str> {
 /// (reflections, briefs, judge verdicts, digests) must not be auto-mined
 /// into the entity graph (feedback-amplification guard). Real source
 /// memories (`kind = None` or a non-synthetic kind such as
-/// `"consolidated"`) still extract.
+/// `"jira_work_context"`) still extract.
 ///
 /// Safe no-op when no hook is registered.
 pub fn spawn_graph_extraction(
@@ -767,6 +772,17 @@ pub async fn persist_memory_with_metadata_typed(
     let serialized = serde_json::to_string(value)
         .context("memory value JSON serialization")
         .map_err(MemoryWriteError::Validation)?;
+    // 2026-09-10: a key or value carrying a prompt-spotlighting CLOSING
+    // delimiter (`</agent_memory` / `</untrusted_data`) is refused at the
+    // one write chokepoint. Such a token has exactly one effect — it
+    // terminates the wrapper the llm-inference template puts around
+    // `__actor_context__` and lets the rest of the row read as the operator's
+    // system prompt — and no legitimate use. Memory rows are module-writable
+    // (`__memory_write__` needs no capability) and carry no provenance, so
+    // this is the layer that can say no. The template ALSO neutralises the
+    // token at render time (defence in depth; it cannot import this crate).
+    spotlight::validate_no_delimiter_tokens(key, &serialized)
+        .map_err(|e| MemoryWriteError::Validation(anyhow::anyhow!("{}", e)))?;
     // Enforce the canonical per-value size ceiling here so every writer —
     // MCP, GraphQL, engine __memory_write__, and the worker RPC — observes
     // the same limit. Prior inconsistency (worker accepted 1 MiB, MCP
@@ -953,6 +969,10 @@ pub async fn persist_memory_in_tx_with_metadata<'c>(
     // Single JSON serialization, reused for size check + embedding text +
     // encryption (mirrors the non-tx path).
     let serialized = serde_json::to_string(value).context("memory value JSON serialization")?;
+    // Same closing-delimiter refusal as the non-tx sibling (see the comment
+    // there) — every writer, tx or not, observes the same rule.
+    spotlight::validate_no_delimiter_tokens(key, &serialized)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
     if serialized.len() > MAX_VALUE_BYTES {
         anyhow::bail!(
             "value too large ({} bytes). Maximum allowed is {} bytes (64 KiB).",
@@ -1287,6 +1307,16 @@ pub const SYNTHETIC_MEMORY_KINDS: &[&str] = &[
     // remain accessible via explicit `actor_recall`/`actor_recall_semantic`,
     // which do NOT apply this exclusion.
     "reflection",
+    // Consolidation summaries (`talos-memory-consolidation`): an LLM rewrote
+    // a batch of older rows into one summary. Excluded from GROUNDING recall
+    // (2026-09-10) because the summary is LLM-laundered text — a poisoned
+    // row in the source batch re-enters the prompt as a clean-looking
+    // summary with no provenance. The summary stays reachable through the
+    // explicit `actor_recall*` tools, which do not apply this exclusion.
+    // Trade-off recorded in the consolidation loop's own comment: the
+    // sources were RETIRED when the summary was written, so grounding no
+    // longer sees that content at all until it is re-learned.
+    "consolidated",
 ];
 
 /// [`SYNTHETIC_MEMORY_KINDS`] as an owned `Vec<String>` for the
@@ -2898,9 +2928,11 @@ pub async fn consolidate_memory(
     tx.commit().await.context("consolidate_memory: commit")?;
 
     // Post-commit only — running graph extraction inside the tx would corrupt
-    // the graph if the tx rolled back. A consolidated summary is condensed
-    // REAL content (not a synthetic self-output), so it STILL auto-extracts —
-    // `"consolidated"` is deliberately absent from `SYNTHETIC_MEMORY_KINDS`.
+    // the graph if the tx rolled back. Since 2026-09-10 `"consolidated"` is in
+    // `SYNTHETIC_MEMORY_KINDS`, so this call is a policy no-op (the summary is
+    // LLM-laundered text with no provenance; the retired sources already ran
+    // extraction at their own write time). Kept as a call so the kind is
+    // stamped through the one chokepoint and the policy stays in one place.
     spawn_graph_extraction(
         actor_id,
         semantic_key.to_string(),
@@ -3718,13 +3750,14 @@ mod spawn_graph_extraction_synthetic_kind_tests {
     }
 
     #[test]
-    fn consolidated_is_not_synthetic_still_extracts() {
-        // A consolidated summary is condensed REAL content — it MUST remain
-        // eligible for auto-extraction (verifies the deliberate omission of
-        // "consolidated" from SYNTHETIC_MEMORY_KINDS).
+    fn consolidated_is_synthetic_and_skips_extraction() {
+        // 2026-09-10: a consolidated summary is LLM-written text over a batch
+        // that may have carried a poisoned row, with no provenance — it is
+        // excluded from grounding recall AND from graph auto-extraction.
+        // (Reverses the earlier "condensed real content still extracts" pin.)
         assert!(
-            !is_synthetic_memory_kind("consolidated"),
-            "consolidated summaries are real condensed content and must still extract"
+            is_synthetic_memory_kind("consolidated"),
+            "consolidated summaries are LLM-laundered and must not re-enter grounding or the graph"
         );
     }
 

@@ -1064,23 +1064,40 @@ pub(crate) fn spawn_metrics_gauge_tasks(
         }
     });
 
-    // Background task: crypto-invariant orphan counts. Runs every 60s
-    // and updates three gauges the alerts in
-    // deploy/observability/alerts.yaml page on. A value > 0 for any of
+    // Background task: crypto-invariant orphan counts. Runs once at boot
+    // and then HOURLY, updating three gauges the alerts in
+    // deploy/helm/talos/files/alerts.yaml page on. A value > 0 for any of
     // them means at-rest encrypted data is unrecoverable — the same
     // failure mode that silently bit us on 2026-04-24 before Vault
     // persistence was wired up. See docs/security/operational-runbook.md.
     //
-    // COST, stated: three `SELECT COUNT(*)` with a `NOT EXISTS` anti-join
-    // against `encryption_keys(id)` (primary key), once a minute — unchanged
-    // by the 2026-08-20 blindness fix, which adds no query and no round trip.
+    // COST, stated — and it is why the cadence is an hour, not a minute
+    // (2026-09-10): each tick is three `SELECT COUNT(*)` with a `NOT EXISTS`
+    // anti-join against `encryption_keys(id)`, and the OUTER side of each is
+    // a FULL SCAN of `actor_memory`, `module_executions` and
+    // `workflow_executions` respectively — the three largest tables on the
+    // platform, with no index that can answer "rows whose key id is not in
+    // encryption_keys" without visiting every row. At 60 s that was ~4 300
+    // full scans of each per month on a gauge whose population moves only
+    // when a DEK is deleted or a writer mis-stamps a key id, i.e. on an
+    // operator action or a deploy. An hour is still ~8 × faster than the
+    // 8-hour `for:` window on the alerts that read these gauges, so
+    // detection latency is unchanged in practice.
+    //
+    // The FIRST tick runs at boot, deliberately. `tokio::time::interval`'s
+    // first tick completes immediately; the old code skipped it "so startup
+    // isn't noisy", which was harmless at a 60 s cadence and would leave the
+    // three gauges at their pre-seeded 0 for a full HOUR after every restart
+    // at this one — an hour in which "no orphans" and "not measured yet"
+    // render identically (the absent-vs-zero shape, with zero playing
+    // absent). Boot pays one scan; every gauge then means what it says from
+    // the first scrape.
     {
         let pool = db_pool.clone();
         spawn_supervised(BackgroundTask::CryptoInvariantGauge, async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
-            // First tick fires immediately — skip it so startup isn't noisy.
-            ticker.tick().await;
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
             loop {
+                // First iteration: immediate (interval's initial tick).
                 ticker.tick().await;
                 let scan = run_crypto_orphan_scan(&pool).await;
                 publish_crypto_orphan_scan(metrics::global().map(|m| m.as_ref()), &scan);

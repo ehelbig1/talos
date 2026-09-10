@@ -1961,16 +1961,15 @@ impl WorkflowRepository {
         Ok(())
     }
 
-    /// Get a workflow's name by id, NOT scoped to user. Used by the
-    /// `get_workflow_graph` sub-workflow label resolver — sub-workflow names
-    /// are visible from a workflow that already passed ownership check.
-    pub async fn get_workflow_name_by_id(&self, workflow_id: Uuid) -> Result<Option<String>> {
-        let name: Option<String> = sqlx::query_scalar("SELECT name FROM workflows WHERE id = $1")
-            .bind(workflow_id)
-            .fetch_optional(&self.db_pool)
-            .await?;
-        Ok(name)
-    }
+    // 2026-09-10: deleted `get_workflow_name_by_id(workflow_id)` — an
+    // UNSCOPED `SELECT name FROM workflows WHERE id = $1`. Its one caller, the
+    // `get_workflow_graph` sub-workflow label resolver, justified it as
+    // "sub-workflow names are visible from a workflow that already passed
+    // ownership check" — but the `sub_workflow_id` in a node's `data` is
+    // caller-authored, so the resolver was a name oracle over every tenant's
+    // workflows. The resolver now uses the scoped
+    // [`Self::get_workflow_name_for_user`] and renders the bare UUID when the
+    // referenced workflow is not visible to the caller.
 
     /// Update the raw `graph_json` column for a workflow scoped to user.
     /// Used by handlers that mutate the JSON in-Rust then write it back

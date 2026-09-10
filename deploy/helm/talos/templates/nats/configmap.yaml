@@ -24,9 +24,11 @@ data:
     # In-transit TLS on the client port (PR #243 transmission security). The
     # cert+key are mounted at /etc/nats-tls from the chart-generated
     # <release>-nats-tls Secret. Clients (controller + worker) connect with a
-    # tls:// URL and trust this self-signed cert via NATS_CA_FILE. NOTE: for a
-    # multi-replica NATS cluster the route port would also need cluster-level
-    # TLS; the default is a single replica (no routes), so client TLS suffices.
+    # tls:// URL and trust this self-signed cert via NATS_CA_FILE. The ROUTE
+    # port (6222) gets its own `tls` block inside `cluster {}` below — the
+    # comment that used to sit here said "the default is a single replica (no
+    # routes), so client TLS suffices"; values.yaml's default has been
+    # replicaCount: 3 the whole time, so routes existed and ran plaintext.
     tls {
       cert_file: "/etc/nats-tls/tls.crt"
       key_file:  "/etc/nats-tls/tls.key"
@@ -47,12 +49,52 @@ data:
     {{- end }}
 
     {{- if gt (int .Values.nats.replicaCount) 1 }}
+    # Route (server↔server) port. Until 2026-09-10 this block carried NO
+    # `authorization` and NO `tls`: any pod that could reach 6222 — and the
+    # NetworkPolicy admitted the controller and every worker to it — could
+    # join the cluster as a peer, and peers exchange every subject's traffic
+    # (decrypted memory values, signed job payloads) in plaintext. The client
+    # port had auth + TLS from PR #243; the route port had neither.
     cluster {
       name: "talos-nats"
       listen: 0.0.0.0:{{ .Values.nats.service.clusterPort }}
+      # Route credentials — a SEPARATE pair from NATS_USER/NATS_PASSWORD, so
+      # a client credential leaked from a worker cannot be replayed as a
+      # peer. Per the nats-server docs, `cluster.authorization` with a single
+      # user/password "defines the authentication mechanism this server
+      # expects, AND how this server will authenticate itself when
+      # establishing a connection to a discovered route", so the route URLs
+      # below carry no credentials and this ConfigMap stays secret-free. Both
+      # values come from the bootstrap Secret (install.sh mints them beside
+      # NATS_USER; see values.yaml bootstrapSecret.data.NATS_CLUSTER_*).
+      authorization {
+        user: $NATS_CLUSTER_USER
+        password: $NATS_CLUSTER_PASSWORD
+        timeout: 2
+      }
+{{- if $.Values.tls.inCluster.enabled }}
+      # Route TLS. Same chart-generated cert as the client port; `ca_file`
+      # is that self-signed cert itself, and `verify: true` makes every
+      # route connection MUTUAL — a peer must present a cert chaining to
+      # it, so holding the route password alone is not enough to join. The
+      # cert's SANs include `*.<nats-headless>.<ns>.svc.cluster.local`
+      # (templates/tls/incluster-certs.yaml), which is what the route URLs
+      # below resolve to. Certs are REUSED across upgrades: a cluster whose
+      # nats-tls Secret predates the wildcard SAN must rotate it (delete the
+      # Secret and `helm upgrade`) or route TLS handshakes fail hostname
+      # verification and the cluster does not form — the failure is loud
+      # (routes never connect; JetStream reports no quorum), not silent.
+      tls {
+        cert_file: "/etc/nats-tls/tls.crt"
+        key_file:  "/etc/nats-tls/tls.key"
+        ca_file:   "/etc/nats-tls/tls.crt"
+        verify: true
+        timeout: 2
+      }
+{{- end }}
       routes = [
         {{- range $i, $_ := until (int $.Values.nats.replicaCount) }}
-        "nats://{{ include "talos.componentName" (list $ "nats") }}-{{ $i }}.{{ include "talos.componentName" (list $ "nats-headless") }}.{{ $.Release.Namespace }}.svc.cluster.local:{{ $.Values.nats.service.clusterPort }}",
+        "nats-route://{{ include "talos.componentName" (list $ "nats") }}-{{ $i }}.{{ include "talos.componentName" (list $ "nats-headless") }}.{{ $.Release.Namespace }}.svc.cluster.local:{{ $.Values.nats.service.clusterPort }}",
         {{- end }}
       ]
     }

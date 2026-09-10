@@ -1192,7 +1192,15 @@ async fn handle_tools_list(
     registry: std::sync::Arc<ModuleRegistry>,
     agent: std::sync::Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
-    let templates: Vec<talos_registry::NodeTemplate> = match registry.list_templates(None).await {
+    // 2026-09-10: TENANT-SCOPED and METADATA-ONLY. `list_templates(None)`
+    // read every tenant's `modules` rows WITH their `wasm_bytes` and
+    // `source_code` on every `tools/list` — a cross-tenant enumeration and a
+    // full-catalog blob load per call. An agent with no user scope passes
+    // `Uuid::nil()`, which yields the shared catalog alone.
+    let templates: Vec<talos_registry::NodeTemplateMetadata> = match registry
+        .list_template_metadata_for_user(agent.user_id.unwrap_or_else(uuid::Uuid::nil), None)
+        .await
+    {
         Ok(t) => t,
         Err(e) => {
             // MCP-337 (2026-05-11): pre-fix the error response embedded

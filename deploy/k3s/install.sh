@@ -49,9 +49,11 @@
 #                              least once, otherwise the Library / Catalog will be empty.
 #   TALOS_REGISTRY_NAMESPACE   Path prefix within the registry. Default: $TALOS_GHCR_OWNER/talos-tools
 #   TALOS_SIGSTORE_REQUIRED    Worker-side cosign verification of OCI templates.
-#                              "" or "false" → disabled (dev / first-deploy).
-#                              "audit"       → verify, log on failure, continue (migration).
-#                              "true"        → verify, refuse on failure (production).
+#                              Unset → "disabled" is rendered EXPLICITLY (the worker
+#                                      refuses to boot in production on an empty value —
+#                                      it demands an explicit choice, and "disabled" is one).
+#                              "audit"    → verify, log on failure, continue (migration).
+#                              "required" → verify, refuse on failure (production).
 #   TALOS_SIGSTORE_IDENTITY_REGEXP  Required when TALOS_SIGSTORE_REQUIRED is set. Regex matched
 #                                   against the SAN URI of the Fulcio cert. For GitHub Actions
 #                                   keyless, pin to the workflow URL pattern. Example:
@@ -312,6 +314,29 @@ fi
 if [[ $HAS_BOOTSTRAP -eq 1 && $HAS_NEO4J -eq 1 ]]; then
     ok "bootstrap + neo4j secrets already exist — reusing"
     warn "  to rotate: kubectl -n $TALOS_NAMESPACE delete secret $SECRET_NAME $NEO4J_SECRET_NAME && rerun this script."
+
+    # Back-fill keys the chart has learned to REQUIRE since this Secret was
+    # first minted. A reused Secret is the normal upgrade path, and a chart
+    # that now mounts a non-optional secretKeyRef for a key an older
+    # install.sh never wrote would wedge that pod in
+    # CreateContainerConfigError (NATS_CLUSTER_* on a multi-replica NATS) or
+    # silently refuse every scrape (PROMETHEUS_SCRAPE_TOKEN → 403). Only
+    # ABSENT keys are added; an existing value is never touched, so this is
+    # safe to run on every invocation. `kubectl patch` with stringData
+    # merges into the existing Secret (base64 handled server-side).
+    backfill_secret_key() {
+        local key="$1" value="$2"
+        if k3s kubectl -n "$TALOS_NAMESPACE" get secret "$SECRET_NAME" \
+                -o "jsonpath={.data.${key}}" 2>/dev/null | grep -q .; then
+            return 0
+        fi
+        k3s kubectl -n "$TALOS_NAMESPACE" patch secret "$SECRET_NAME" --type merge \
+            -p "$(printf '{"stringData":{"%s":"%s"}}' "$key" "$value")" >/dev/null
+        ok "  back-filled missing bootstrap key $key (chart now requires it)"
+    }
+    backfill_secret_key NATS_CLUSTER_USER "talos-route"
+    backfill_secret_key NATS_CLUSTER_PASSWORD "$(openssl rand -base64 32 | tr -d '+=/' | head -c 32)"
+    backfill_secret_key PROMETHEUS_SCRAPE_TOKEN "$(openssl rand -hex 32)"
 elif [[ $HAS_BOOTSTRAP -ne $HAS_NEO4J ]]; then
     die "secret state is inconsistent — exactly one of $SECRET_NAME / $NEO4J_SECRET_NAME exists. Delete both and rerun."
 else
@@ -333,6 +358,14 @@ else
 
     NATS_USER="talos"
     NATS_PASSWORD=$(rand_b64_pw)
+    # Route-port (server↔server, 6222) credentials for a multi-replica NATS
+    # cluster — `cluster { authorization {} }` in the chart's nats.conf. A
+    # SEPARATE pair from the client credentials above, so a leaked worker
+    # credential cannot be replayed as a peer. Phase-1 runs one replica and
+    # does not use them, but the keys must exist for `nats.replicaCount > 1`
+    # (the StatefulSet mounts them as required secretKeyRefs).
+    NATS_CLUSTER_USER="talos-route"
+    NATS_CLUSTER_PASSWORD=$(rand_b64_pw)
 
     NEO4J_PASSWORD=$(rand_b64_pw)
 
@@ -357,6 +390,13 @@ else
     # add more (e.g. for separate Prometheus and Grafana scrapers) by
     # rotating the secret in place.
     METRICS_AUTH_TOKENS=$(rand_hex32)
+    # CONTROLLER scrape token — a separate token for GET /metrics/prometheus.
+    # Under RUST_ENV=production the controller answers 403 to every scrape
+    # when this is unset/empty; until 2026-09-10 this script minted only the
+    # worker's METRICS_AUTH_TOKENS, so a Prometheus wired through the chart's
+    # ServiceMonitor (which reads this exact Secret key) was refused on every
+    # production scrape while the dashboard looked configured.
+    PROMETHEUS_SCRAPE_TOKEN=$(rand_hex32)
 
     # Build the kubectl create-secret args. Optional/empty values are
     # included as empty strings so the chart's `optional: true` secretKeyRef
@@ -366,6 +406,8 @@ else
         --from-literal=REDIS_URL="$TALOS_REDIS_URL"
         --from-literal=NATS_USER="$NATS_USER"
         --from-literal=NATS_PASSWORD="$NATS_PASSWORD"
+        --from-literal=NATS_CLUSTER_USER="$NATS_CLUSTER_USER"
+        --from-literal=NATS_CLUSTER_PASSWORD="$NATS_CLUSTER_PASSWORD"
         --from-literal=NEO4J_USER="neo4j"
         --from-literal=NEO4J_PASSWORD="$NEO4J_PASSWORD"
         --from-literal=TALOS_MASTER_KEY="$TALOS_MASTER_KEY"
@@ -387,6 +429,7 @@ else
         --from-literal=MINIO_VERIFIER_USER="$MINIO_VERIFIER_USER"
         --from-literal=MINIO_VERIFIER_PASSWORD="$MINIO_VERIFIER_PASSWORD"
         --from-literal=METRICS_AUTH_TOKENS="$METRICS_AUTH_TOKENS"
+        --from-literal=PROMETHEUS_SCRAPE_TOKEN="$PROMETHEUS_SCRAPE_TOKEN"
         --from-literal=ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
         --from-literal=OPENAI_API_KEY="${OPENAI_API_KEY:-}"
         --from-literal=EMBEDDING_API_URL="${EMBEDDING_API_URL:-}"
@@ -531,12 +574,16 @@ worker:
   image:
     repository: "ghcr.io/${TALOS_GHCR_OWNER}/talos-worker"
     digest: "${TALOS_WORKER_DIGEST}"
-  # Sigstore enforcement for OCI template signatures. See worker/src/main.rs
-  # for the runtime check + worker.sigstore in values.yaml for the chart key.
-  # Defaults to disabled — operators flip on after running the publish
-  # workflow at least once and confirming the identity regexp matches.
+  # Sigstore enforcement for OCI template signatures. See
+  # talos-worker-runtime/src/module_fetcher.rs (SigstorePolicy) for the
+  # runtime check + worker.sigstore in values.yaml for the chart key.
+  # Defaults to the EXPLICIT "disabled": under RUST_ENV=production the worker
+  # refuses to boot on an unset/empty value ("must be set explicitly"), so an
+  # empty default here was a guaranteed CrashLoop. Operators move to "audit"
+  # then "required" after running the publish workflow at least once and
+  # confirming the identity regexp matches.
   sigstore:
-    required: "${TALOS_SIGSTORE_REQUIRED:-}"
+    required: "${TALOS_SIGSTORE_REQUIRED:-disabled}"
     identityRegexp: "${TALOS_SIGSTORE_IDENTITY_REGEXP:-}"
     oidcIssuer: "https://token.actions.githubusercontent.com"
 

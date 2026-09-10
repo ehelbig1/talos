@@ -2,7 +2,7 @@ use axum::{
     extract::{ConnectInfo, State},
     http::{Request, StatusCode},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use dashmap::DashMap;
 use sha2::{Digest, Sha256};
@@ -484,6 +484,47 @@ fn check_mcp_auth_rate_limit(ip: &str) -> Result<(), ()> {
     }
 }
 
+/// Refuse an authenticated agent whose `mcp_agents.user_id` is NULL
+/// (2026-09-10).
+///
+/// `user_id` is nullable and ~45 handler sites spell the absence
+/// `agent.user_id.unwrap_or_else(Uuid::nil)`. Downstream, the nil UUID is
+/// not "no tenant": it is a tenant that owns nothing and matches the shared
+/// catalog (`user_id IS NULL OR user_id = $1`), that every per-user gate
+/// (`is_platform_admin`, ownership predicates, budgets) answers `false`/empty
+/// for, and that FK-constrained writes try to attribute rows to. Some of those
+/// sites fail closed by accident and some do not, and no reader can tell which
+/// from the row. The one place every authenticated request passes is this
+/// middleware, so the refusal lives here rather than at 45 sites; the
+/// unauthenticated `/mcp/local` dev route resolves its own user and never
+/// reaches this function. The reply is the uniform denial (no hint whether
+/// the token, the agent or its scope was the problem); the agent id goes to
+/// the log where an operator can act on it.
+fn refuse_unscoped_agent(agent: &AgentIdentity) -> Result<(), Response> {
+    if agent.user_id.is_some() {
+        return Ok(());
+    }
+    tracing::warn!(
+        target: "talos_audit",
+        event_kind = "mcp_agent_unscoped_refused",
+        agent_id = %agent.agent_id,
+        agent_name = %agent.name,
+        role = %agent.role_name,
+        "MCP agent has no user_id (mcp_agents.user_id IS NULL); refusing the authenticated \
+         request. Bind the agent to a user before it can call tools."
+    );
+    let body = talos_mcp::mcp_denied(None, -32001, "Unauthorized: agent is not bound to a user");
+    Err((
+        StatusCode::FORBIDDEN,
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        serde_json::to_string(&body).unwrap_or_else(|_| {
+            r#"{"jsonrpc":"2.0","id":null,"error":{"code":-32001,"message":"Unauthorized: agent is not bound to a user"}}"#
+                .to_string()
+        }),
+    )
+        .into_response())
+}
+
 pub async fn mcp_auth_middleware(
     State(db_pool): State<PgPool>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -570,6 +611,9 @@ pub async fn mcp_auth_middleware(
             // expectations and matches the equivalent JWT
             // `last_seen_at` patterns elsewhere in the codebase.
 
+            if let Err(refusal) = refuse_unscoped_agent(&agent) {
+                return Ok(refusal);
+            }
             req.extensions_mut().insert(Arc::new(agent));
             return Ok(next.run(req).await);
         }
@@ -696,6 +740,11 @@ pub async fn mcp_auth_middleware(
         }
         None => return Err(StatusCode::UNAUTHORIZED),
     };
+
+    // 4a. An agent with NO user scope is refused on the authenticated path.
+    if let Err(refusal) = refuse_unscoped_agent(&agent) {
+        return Ok(refusal);
+    }
 
     // 4b. Lazy user-row upsert — ensures FK-constrained writes succeed.
     //

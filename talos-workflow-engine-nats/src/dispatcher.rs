@@ -463,6 +463,11 @@ pub(crate) async fn execute_job_with_retry(
     budget_secs: Option<u64>,
 ) -> Result<serde_json::Value, String> {
     let mut attempts: u32 = 0;
+    // The `job_id` this loop dispatched, read ONCE off the signed payload so
+    // every reply can be checked against it (the retry re-sign keeps the id).
+    // An unparseable payload cannot have been signed by `dispatch_single`, so
+    // failing here is the deterministic-serialization class, not a retry.
+    let expected_job_id = dispatched_job_id(&payload)?;
     let mut current_payload = payload;
     loop {
         // Budget-aware clamp, recomputed on EVERY attempt.
@@ -563,6 +568,29 @@ pub(crate) async fn execute_job_with_retry(
                 let job_result: JobResult = serde_json::from_slice(&response)
                     .map_err(|e| format!("Failed to parse job result: {}", e))?;
 
+                // The reply must be FOR THIS JOB. Checked BEFORE signature
+                // verification so a stray or cross-wired result never records
+                // its nonce into this process's replay cache (a mismatched
+                // result is refused whether or not it is honestly signed).
+                // Until 2026-09-10 nothing here compared the two ids, so a
+                // correctly-signed result for job B landing on job A's inbox
+                // would have been returned as A's output. Not retried: the
+                // worker may already have run job A, and re-dispatching risks
+                // a duplicate side effect for a condition that is a bug or an
+                // attack, never a transient.
+                if job_result.job_id != expected_job_id {
+                    tracing::error!(
+                        target: "talos_security",
+                        expected_job_id = %expected_job_id,
+                        received_job_id = %job_result.job_id,
+                        "job result rejected: reply job_id does not match the dispatched job"
+                    );
+                    return Err(format!(
+                        "Job result rejected: reply carries job_id {} but job_id {} was dispatched",
+                        job_result.job_id, expected_job_id
+                    ));
+                }
+
                 // Verify signature if worker key is available.
                 // L-4: typed Primary verifier — this dispatcher is the
                 // sole inline consumer of the reply on this inbox, and
@@ -644,15 +672,17 @@ pub(crate) async fn execute_job_with_retry(
                 // include {"success": false, "error": "..."} in the payload when
                 // the query itself fails. We treat payload success:false as a
                 // retryable application error.
-                let payload_success_false = job_result
-                    .output_payload
-                    .value()
-                    .get("success")
-                    .and_then(|v| v.as_bool())
-                    == Some(false);
-
-                let is_success =
-                    matches!(job_result.status, JobStatus::Success) && !payload_success_false;
+                //
+                // The predicate has ONE home — `JobResult::is_terminal_success`
+                // — because the WORKER needs the identical answer: its
+                // idempotency cache may re-publish a cached result for a re-seen
+                // `job_id` only when that result is one THIS loop would not
+                // retry. Until 2026-09-10 the worker cached every terminal
+                // result, so the application-failure retry below (same
+                // `job_id`, bumped `dispatch_attempt`) was served the cached
+                // failure verbatim on every attempt — the whole retry budget
+                // spent re-reading one transient error.
+                let is_success = job_result.is_terminal_success();
 
                 if is_success {
                     return Ok(job_result.output_payload.into_value());
@@ -663,9 +693,29 @@ pub(crate) async fn execute_job_with_retry(
                     // evaluate (e.g. the referenced variable isn't in the error payload), the
                     // safer default is to let the retry happen rather than silently dropping it.
                     if let Some(cond) = retry_condition {
-                        let should_retry = expression_evaluator
+                        // 2026-09-10 review: an evaluation ERROR (typo in the
+                        // predicate, unbound variable) used to default to
+                        // RETRY, so a broken `retry_condition` on a
+                        // non-idempotent send turned one POST into
+                        // `max_retries + 1`. The skip-condition gate fails
+                        // closed on the same shape; this one now does too — a
+                        // predicate that cannot be evaluated is a predicate that
+                        // did not grant the retry. The failure is logged with
+                        // the expression so the author can fix it.
+                        let should_retry = match expression_evaluator
                             .try_eval_bool(cond, job_result.output_payload.value())
-                            .unwrap_or(true);
+                        {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::warn!(
+                                    retry_condition = cond,
+                                    error = %e,
+                                    "retry_condition could not be evaluated — treating as \
+                                     'do not retry' (fail closed); fix the expression"
+                                );
+                                false
+                            }
+                        };
                         if !should_retry {
                             let err_msg = job_result
                                 .output_payload
@@ -875,6 +925,16 @@ pub(crate) async fn execute_job_with_retry(
             }
         }
     }
+}
+
+/// The `job_id` a serialized `JobRequest` payload carries. Read at the head of
+/// `execute_job_with_retry` so the reply's `job_id` can be matched against the
+/// job that was actually dispatched. `from_slice` on the exact wire bytes, so
+/// the `SignedJson` payload is not re-derived (see `resign_payload_for_retry`).
+fn dispatched_job_id(payload: &[u8]) -> Result<Uuid, String> {
+    serde_json::from_slice::<JobRequest>(payload)
+        .map(|r| r.job_id)
+        .map_err(|e| format!("Failed to read job_id from the dispatch payload: {e}"))
 }
 
 /// MCP-1212: deserialize a signed JobRequest payload, re-sign it with a
@@ -1666,9 +1726,14 @@ impl NodeDispatcher for NatsNodeDispatcher {
                  is wired — refusing to dispatch (fail-closed, no plaintext on the wire)"
                     .into()
             })?;
-            let bytes = serde_json::to_vec(&per_step_secrets).map_err(|e| -> BoxError {
-                format!("serialize pipeline seal payload: {e}").into()
-            })?;
+            // `Zeroizing`: this Vec holds every step's PLAINTEXT secrets,
+            // serialized, for the whole retry lifetime of the dispatch. The
+            // closure below hands `SealContext::from_bytes` a fresh copy per
+            // attempt (that copy's lifetime belongs to `InFlightSeals`); the
+            // long-lived original is wiped when the closure drops.
+            let bytes = zeroize::Zeroizing::new(serde_json::to_vec(&per_step_secrets).map_err(
+                |e| -> BoxError { format!("serialize pipeline seal payload: {e}").into() },
+            )?);
             req.sealing = talos_workflow_job_protocol::SEALING_CLAIM_ECIES;
             req.claim_inbox = Some(handle.claim_subject.clone());
             req.secret_paths = claim_secret_paths;
@@ -1681,7 +1746,7 @@ impl NodeDispatcher for NatsNodeDispatcher {
                 // not a hot path).
                 in_flight.register(
                     job_id,
-                    talos_envelope_seal::SealContext::from_bytes(bytes.clone()),
+                    talos_envelope_seal::SealContext::from_bytes(bytes.to_vec()),
                 );
             }))
         } else {
@@ -1748,6 +1813,21 @@ impl NodeDispatcher for NatsNodeDispatcher {
         // 7. Parse + verify.
         let result: PipelineJobResult = serde_json::from_slice(&response_bytes)
             .map_err(|e| -> BoxError { format!("Failed to parse pipeline result: {e}").into() })?;
+        // The reply must be FOR THIS PIPELINE — same rule and same ordering
+        // (before signature verification) as the single-job loop.
+        if result.job_id != job_id {
+            tracing::error!(
+                target: "talos_security",
+                expected_job_id = %job_id,
+                received_job_id = %result.job_id,
+                "pipeline result rejected: reply job_id does not match the dispatched pipeline"
+            );
+            return Err(format!(
+                "Pipeline result rejected: reply carries job_id {} but job_id {} was dispatched",
+                result.job_id, job_id
+            )
+            .into());
+        }
         if let Some(ring) = self.worker_key_ring.as_ref() {
             // L-4 / RFC 0010 P2: PipelineJobResult Primary verifier — same role
             // as the JobResult dispatcher above. `verify_dispatch` routes on the
@@ -2665,14 +2745,23 @@ mod budget_clamp_loop_tests {
         succeed: bool,
     }
 
+    /// The `job_id` the loop dispatched, read off the payload the transport was
+    /// handed — a fabricated reply must echo it or the loop (correctly) refuses
+    /// it as cross-wired. See `reply_for_another_job_is_refused_and_not_retried`.
+    fn echo_job_id(payload: &[u8]) -> uuid::Uuid {
+        serde_json::from_slice::<talos_workflow_job_protocol::JobRequest>(payload)
+            .expect("test payload is a JobRequest")
+            .job_id
+    }
+
     #[async_trait]
     impl JobTransport for SlowTransport {
-        async fn request(&self, _topic: &str, _payload: Vec<u8>) -> Result<Vec<u8>, BoxError> {
+        async fn request(&self, _topic: &str, payload: Vec<u8>) -> Result<Vec<u8>, BoxError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             tokio::time::sleep(self.delay).await;
             let jr = JobResult {
                 llm_usage: vec![],
-                job_id: uuid::Uuid::nil(),
+                job_id: echo_job_id(&payload),
                 status: if self.succeed {
                     JobStatus::Success
                 } else {
@@ -2744,10 +2833,13 @@ mod budget_clamp_loop_tests {
     ) -> Result<serde_json::Value, String> {
         let classifier = AlwaysTransient;
         let evaluator = NoExpr;
+        // A REAL signed request, not `b"{}"`: the loop reads the dispatched
+        // `job_id` off the payload to check every reply against it.
+        let payload = super::resign_payload_tests::signed_request(&[9u8; 32]);
         execute_job_with_retry(
             transport,
             "test.topic".to_string(),
-            b"{}".to_vec(),
+            payload,
             timeout_secs,
             max_retries,
             1, // base backoff ms — keep the test fast
@@ -2779,6 +2871,7 @@ mod budget_clamp_loop_tests {
     #[async_trait]
     impl JobTransport for RecordingTransport {
         async fn request(&self, _topic: &str, payload: Vec<u8>) -> Result<Vec<u8>, BoxError> {
+            let job_id = echo_job_id(&payload);
             let n = {
                 let mut g = self.payloads.lock().expect("lock");
                 g.push(payload);
@@ -2787,7 +2880,7 @@ mod budget_clamp_loop_tests {
             let failing = n <= self.fail_first;
             let jr = JobResult {
                 llm_usage: vec![],
-                job_id: uuid::Uuid::nil(),
+                job_id,
                 status: if failing {
                     JobStatus::Failed
                 } else {
@@ -2808,6 +2901,56 @@ mod budget_clamp_loop_tests {
             };
             Ok(serde_json::to_vec(&jr).unwrap())
         }
+    }
+
+    /// Transport that answers with a well-formed `Success` result for a
+    /// DIFFERENT `job_id` than the one it was handed — the cross-wired reply.
+    struct CrossWiredTransport {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl JobTransport for CrossWiredTransport {
+        async fn request(&self, _topic: &str, _payload: Vec<u8>) -> Result<Vec<u8>, BoxError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let jr = JobResult {
+                llm_usage: vec![],
+                job_id: uuid::Uuid::new_v4(), // never the dispatched one
+                status: JobStatus::Success,
+                output_payload: serde_json::json!({"ok": true}).into(),
+                logs: vec![],
+                execution_time_ms: 1,
+                signature: vec![],
+                result_nonce: String::new(),
+                worker_id: String::new(),
+                crypto_scheme: 0,
+            };
+            Ok(serde_json::to_vec(&jr).unwrap())
+        }
+    }
+
+    /// D5 (2026-09-10): a `Success` reply carrying another job's id must NOT
+    /// be returned as this job's output, and must not be retried either (the
+    /// worker may already have run this job). Before the check, this exact
+    /// transport made the loop return `{"ok": true}`.
+    #[tokio::test]
+    async fn reply_for_another_job_is_refused_and_not_retried() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let t = CrossWiredTransport {
+            calls: calls.clone(),
+        };
+        let err = run_loop(&t, 30, 3, None)
+            .await
+            .expect_err("a cross-wired reply must not be accepted as output");
+        assert!(
+            err.contains("does not match") || err.contains("but job_id"),
+            "error must name the mismatch: {err}"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a mismatched reply is refused, not retried"
+        );
     }
 
     /// THE CALL-SITE GUARD. `resign_payload_for_retry` taking an attempt is
@@ -3038,6 +3181,22 @@ mod budget_clamp_loop_tests {
         assert!(
             calls_tight.load(Ordering::SeqCst) <= baseline,
             "a tight budget may only reduce attempts"
+        );
+    }
+}
+
+/// The worker's fuel ceiling lives in the protocol crate (the worker is
+/// engine-free); the controller's per-node cap lives in the engine. This crate
+/// is the one place that depends on both, so it pins them equal — a drift
+/// would let the controller grant fuel the worker silently clamps away.
+#[cfg(test)]
+mod fuel_ceiling_pin_tests {
+    #[test]
+    fn worker_fuel_ceiling_equals_the_controller_per_node_cap() {
+        assert_eq!(
+            talos_workflow_job_protocol::MAX_JOB_FUEL,
+            talos_workflow_engine::DEFAULT_MAX_FUEL_PER_NODE,
+            "MAX_JOB_FUEL (protocol) and DEFAULT_MAX_FUEL_PER_NODE (engine) must agree"
         );
     }
 }

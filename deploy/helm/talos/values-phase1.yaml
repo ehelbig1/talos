@@ -6,7 +6,7 @@
 #   - External Postgres (Neon serverless).
 #   - External Redis (Upstash).
 #   - Self-hosted Neo4j, NATS, Vault, MinIO (single replica each).
-#   - Ollama is optional; enable if this node has a reasonable CPU/RAM budget.
+#   - Ollama is NOT deployed by the chart; point OLLAMA_URL at your own (see § ollama).
 #   - Sigstore ENFORCES signatures (k3s ships the policy-controller via
 #     the chart README install steps).
 
@@ -81,10 +81,14 @@ minio:
   persistence:
     size: "20Gi"
 
+# Ollama: the chart ships no Ollama workload (see values.yaml § ollama), so
+# `enabled: true` here pointed OLLAMA_URL at a Service that did not exist.
+# Run Ollama on the node (or elsewhere) and set OLLAMA_URL via
+# controller.env / worker.env instead; or deploy your own Service named
+# `<release>-ollama` with label `app.kubernetes.io/component: ollama` and set
+# `enabled: true` + `externalWorkload: true`.
 ollama:
-  enabled: true
-  persistence:
-    size: "20Gi"
+  enabled: false
 
 security:
   sigstore:

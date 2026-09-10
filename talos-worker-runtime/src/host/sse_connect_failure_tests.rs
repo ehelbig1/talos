@@ -397,6 +397,7 @@ async fn each_abnormal_stream_ending_yields_one_distinct_operator_line() {
         SseStreamEnd::TransportError,
         SseStreamEnd::EventBytesCap,
         SseStreamEnd::Cancelled,
+        SseStreamEnd::IdleTimeout,
     ] {
         let mut ctx = ctx_with(CapabilityWorld::Http, vec!["*".to_string()]);
         let s = sink();

@@ -4,6 +4,7 @@
 use super::*;
 
 use crate::reason_class;
+pub(crate) use talos_idempotency::dedup_request_hash;
 use talos_idempotency::{DedupCheck, DedupResponse, InMemoryIdempotencyStore};
 
 /// Process-global worker-side idempotency dedup store. Belt-and-suspenders ON
@@ -29,6 +30,36 @@ pub(crate) fn get_global_idempotency_store() -> &'static InMemoryIdempotencyStor
         );
         InMemoryIdempotencyStore::new(std::time::Duration::from_secs(ttl_secs), max_entries)
     })
+}
+
+/// Namespace an engine-stamped idempotency key by the job's TENANCY principal
+/// before it touches the process-global store.
+///
+/// The store is shared by every execution on this worker, and the literal
+/// `idempotency_key` is caller-authored node config. Keyed on the literal
+/// alone (the pre-2026-09 shape) two tenants using the same literal — or two
+/// unrelated workflows of ONE tenant — were served each other's cached 2xx
+/// response. The key is now `{user_id}:{actor_id|-}:{host}:{key}`, all four
+/// taken from the SIGNED `JobRequest` fields already on `TalosContext` (never
+/// from guest args), so a collision needs the same user, actor and host.
+///
+/// Returns `None` when the context carries no `user_id`: with no tenancy
+/// principal there is no namespace to scope to, and the safe direction is to
+/// not engage the store at all (the `Idempotency-Key` header remains the
+/// primary dedup mechanism) rather than share a `-:-:…` bucket across every
+/// principal-less execution on the worker.
+pub(crate) fn scoped_dedup_key(
+    user_id: Option<uuid::Uuid>,
+    actor_id: Option<uuid::Uuid>,
+    host: &str,
+    key: &str,
+) -> Option<String> {
+    let user = user_id?;
+    let actor = actor_id.map_or_else(|| "-".to_string(), |a| a.to_string());
+    Some(format!(
+        "{user}:{actor}:{}:{key}",
+        host.to_ascii_lowercase()
+    ))
 }
 
 /// Whether an HTTP status represents a success worth caching for dedup. Only
@@ -377,6 +408,83 @@ impl wit_http::Host for TalosContext {
             }
         }
 
+        // ── Opt-in idempotency: header decision + worker-side dedup ─────────
+        // Hoisted ABOVE the DNS lookup / breaker / vault-resolve (2026-09):
+        // every input here is pure — the verb, the raw header names, the URL,
+        // the body and the SIGNED tenancy fields — so a cached hit pays no
+        // DNS and strands no breaker permit, and a key-reuse refusal is
+        // decided before any I/O. Dry-run stays ahead of it so a dry-run POST
+        // is still mocked rather than served from the store.
+        let method_str_early = match req.method {
+            wit_http::Method::Get => "GET",
+            wit_http::Method::Post => "POST",
+            wit_http::Method::Put => "PUT",
+            wit_http::Method::Delete => "DELETE",
+            wit_http::Method::Patch => "PATCH",
+        };
+        // The key goes out as a header only on MUTATING verbs (a GET is safe to
+        // retry) and only when the guest has not set the header itself.
+        let idem_header_to_emit: Option<String> = if http_method_mutates(&req.method) {
+            let guest_set = req
+                .headers
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case("idempotency-key"));
+            self.idempotency_key.clone().filter(|_| !guest_set)
+        } else {
+            None
+        };
+        // The worker-side store engages only for the header-emitting case and
+        // only under a tenancy principal (`scoped_dedup_key`); the hash binds
+        // the record to THIS request's method + URL + body.
+        let dedup_key: Option<String> = idem_header_to_emit
+            .as_deref()
+            .and_then(|idem| scoped_dedup_key(self.user_id, self.actor_id, host, idem));
+        let request_hash = dedup_request_hash(method_str_early, &req.url, &req.body);
+        if let Some(ref k) = dedup_key {
+            match get_global_idempotency_store().check(k, &request_hash) {
+                DedupCheck::Completed(cached) => {
+                    tracing::info!(
+                        host,
+                        "idempotent send short-circuited: returning cached response for a \
+                         previously-completed idempotency key (worker-side dedup)"
+                    );
+                    // `return` resolves the enclosing `async move` block — NOT the
+                    // outer fn — so metrics are still recorded once at the tail.
+                    self.consume_async_fuel(async_start.elapsed(), "http::fetch");
+                    return Ok(wit_http::Response {
+                        status: cached.status,
+                        headers: cached.headers,
+                        body: cached.body,
+                    });
+                }
+                DedupCheck::Mismatch => {
+                    // Same key, DIFFERENT request. Serving the cached response
+                    // would hand this request another request's body; firing
+                    // it would double-send under a key the destination has
+                    // already honoured. Refuse. No `reason_class` token is
+                    // minted for this: `reason_class::ALL` is a CLOSED set
+                    // pinned cross-crate by `talos-reason-class`'s
+                    // `closed_set_snapshot`, and a bare `forbiddenhost` is
+                    // already non-transient in every downstream classifier —
+                    // so the latch is CLEARED (the totality rule: every
+                    // failing return decides it) and the cause travels on the
+                    // audit ledger + `[host:…]` diagnostic instead.
+                    self.record_capability_denied("http-fetch", "idempotency-key-reuse", host)
+                        .await;
+                    tracing::warn!(
+                        host,
+                        module_id = ?self.module_id,
+                        "idempotency key reused for a different request (method/url/body \
+                         differ from the completed send) — refusing rather than replaying"
+                    );
+                    self.record_network_outcome(None);
+                    self.consume_async_fuel(async_start.elapsed(), "http::fetch");
+                    return Err(wit_http::Error::Forbiddenhost);
+                }
+                DedupCheck::Proceed => {}
+            }
+        }
+
         // ── DNS resolution validation (SSRF protection) ────────────────────
         // For hostnames (not IP literals), resolve DNS and verify the resolved
         // IP is not a private/internal address. This prevents DNS rebinding attacks
@@ -498,9 +606,10 @@ impl wit_http::Host for TalosContext {
         // HALF-OPEN circuit spends one of that host's three trial tokens, and
         // the permit is the obligation to account for it. Everything between
         // here and `builder.send()` below can exit without reaching the
-        // settle — four statement exits (the header cap, the body cap, the
-        // `?` on `resolve_vault_header`, the idempotency dedup's
-        // `return Ok(cached)`), two `.await` points at which the whole future
+        // settle — three statement exits (the header cap, the body cap, the
+        // `?` on `resolve_vault_header`; the idempotency dedup's
+        // `return Ok(cached)` was a fourth until it was hoisted ahead of the
+        // DNS lookup in 2026-09), two `.await` points at which the whole future
         // can be DROPPED (execution timeout, worker shutdown, a sibling
         // failing a fan-out), and a panic unwinding through any of it. The
         // `?` and the cancellation are the two that no per-`return` patch can
@@ -521,8 +630,8 @@ impl wit_http::Host for TalosContext {
         // conclude" is a third state and why recording a synthetic success or
         // failure instead would each be a distinct bug.
         //
-        // `fetch_all` needs no permit: it never asks for admission at all (see
-        // the note at its `send()`).
+        // `fetch_all` takes ONE permit per distinct host in the batch (see its
+        // admission pass) and settles each after the join.
         let Some(mut permit) = get_global_circuit_breaker().begin_request(&host_str) else {
             tracing::warn!(host = %host, "Circuit breaker open - rejecting HTTP request");
             self.emit_network_failure(
@@ -615,52 +724,13 @@ impl wit_http::Host for TalosContext {
             };
             builder = builder.header(name.as_str(), resolved.as_ref());
         }
-        // Opt-in idempotency (Task 3): when the engine stamped a stable
-        // idempotency key for this dispatch (the node declared
-        // `__idempotency_key__`), emit it as the industry-standard
-        // `Idempotency-Key` header on MUTATING requests so a retried send is
-        // deduplicated at the destination (Stripe-style). Only for mutating
-        // verbs (a GET is already safe to retry and needs no key), and only when
-        // the guest hasn't set the header itself (respect an explicit override).
-        //
-        // `dedup_key` mirrors that decision: when set, this send participates in
-        // the worker-side in-memory dedup store (Task 2) as belt-and-suspenders
-        // for destinations that don't honor the header. We do NOT engage the
-        // store when the guest set its own key (we don't know its dedup
-        // semantics) — only for the engine-stamped, header-emitting case.
-        let mut dedup_key: Option<String> = None;
-        if http_method_mutates(&method) {
-            if let Some(ref idem) = self.idempotency_key {
-                let guest_set = headers
-                    .iter()
-                    .any(|(n, _)| n.eq_ignore_ascii_case("idempotency-key"));
-                if !guest_set {
-                    builder = builder.header("Idempotency-Key", idem.as_str());
-                    dedup_key = Some(idem.clone());
-                }
-            }
-        }
-        // Task 2: short-circuit a mutating send whose engine-stamped key already
-        // COMPLETED successfully in this process — return the cached response
-        // instead of re-firing. Covers destinations with no Idempotency-Key
-        // support. A miss (or a non-declaring send) proceeds normally.
-        if let Some(ref k) = dedup_key {
-            if let DedupCheck::Completed(cached) = get_global_idempotency_store().check(k) {
-                tracing::info!(
-                    host = %host_str,
-                    "idempotent send short-circuited: returning cached response for a \
-                     previously-completed idempotency key (worker-side dedup)"
-                );
-                // `return` here resolves the enclosing `async move` block (whose
-                // value the outer fn records metrics for and returns) — NOT the
-                // outer fn, so metrics are still recorded once at the tail.
-                self.consume_async_fuel(async_start.elapsed(), "http::fetch");
-                return Ok(wit_http::Response {
-                    status: cached.status,
-                    headers: cached.headers,
-                    body: cached.body,
-                });
-            }
+        // Opt-in idempotency (Task 3): emit the engine-stamped key as the
+        // industry-standard `Idempotency-Key` header on MUTATING requests so a
+        // retried send is deduplicated at the destination (Stripe-style). The
+        // decision (mutating verb, guest did not set its own header) was made
+        // ABOVE, before DNS, alongside the worker-side dedup check.
+        if let Some(ref idem) = idem_header_to_emit {
+            builder = builder.header("Idempotency-Key", idem.as_str());
         }
         if !body.is_empty() {
             builder = builder.body(body.clone());
@@ -801,10 +871,12 @@ impl wit_http::Host for TalosContext {
         };
 
         let status = response.status().as_u16();
+        // Host + path LENGTH only: capability tokens and presigned keys live
+        // in paths, and the audit line lands in shared log storage.
         tracing::info!(
             method = %method_str_for_audit,
             host = %url.host_str().unwrap_or("unknown"),
-            path = %url.path(),
+            path_len = url.path().len(),
             status = status,
             "HTTP audit"
         );
@@ -953,6 +1025,7 @@ impl wit_http::Host for TalosContext {
             if dedup_cacheable_status(status) {
                 get_global_idempotency_store().complete(
                     k,
+                    &request_hash,
                     DedupResponse {
                         status,
                         headers: resp_headers.clone(),
@@ -1035,6 +1108,41 @@ impl wit_http::Host for TalosContext {
                 .collect();
         }
 
+        // ── Batch-size cap against the REMAINING per-execution budget ────────
+        // `reqs.len()` is guest-controlled and was unbounded: the per-entry
+        // validation loop below does a URL parse, an allowlist match, a DNS
+        // lookup and a vault resolve for EVERY entry before the budget was
+        // consulted, so a 100 000-entry batch paid all of that work and was
+        // only then refused (MCP-783 moved the charge AFTER validation to stop
+        // denied entries burning budget — correct, but it left the validation
+        // work itself unbounded). Refuse up front when the batch could not fit
+        // in what is left of `MAX_HTTP_CALLS_PER_EXECUTION`: nothing is
+        // validated, nothing is resolved, nothing is charged.
+        let remaining_budget = MAX_HTTP_CALLS_PER_EXECUTION.saturating_sub(
+            self.http_call_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        if reqs.len() as u64 > remaining_budget {
+            tracing::warn!(
+                module_id = ?self.module_id,
+                batch = reqs.len(),
+                remaining = remaining_budget,
+                limit = MAX_HTTP_CALLS_PER_EXECUTION,
+                "fetch_all: batch exceeds the remaining per-execution HTTP call budget — refused up front"
+            );
+            if let Some(ref m) = self.metrics {
+                m.record_rate_limit_exceeded("http");
+            }
+            self.record_http_denial(
+                reason_class::EXECUTION_RATE_LIMIT,
+                reason_class::WIT_FORBIDDENHOST,
+            );
+            return reqs
+                .iter()
+                .map(|_| Err(wit_http::Error::Forbiddenhost))
+                .collect();
+        }
+
         // ── Per-request validation ────────────────────────────────────────
         // Async for-loop (not `.iter().map()`) because every deny path
         // emits an audit event via `record_capability_denied`, and vault
@@ -1050,7 +1158,22 @@ impl wit_http::Host for TalosContext {
             Result<(String, reqwest::Method, Vec<(String, String)>, Vec<u8>, u64), wit_http::Error>,
         > = Vec::with_capacity(reqs.len());
 
+        // Set when an entry observed cancellation during validation; latched
+        // ONCE after the loop so the batch's class is `cancelled` (the
+        // non-transient arm both retry gates carry) rather than a bare
+        // `networkerror` a redispatch would treat as transient.
+        let mut cancelled_during_validation = false;
+
         for req in &reqs {
+            // Per-ENTRY cancellation. The entry check at the top of this fn
+            // covered only the first entry: a cancel arriving while entry 1's
+            // DNS lookup or vault resolve was in flight let entries 2..N keep
+            // resolving and then go out on the wire. Cheap (one atomic load).
+            if self.is_cancelled() {
+                cancelled_during_validation = true;
+                validated.push(Err(wit_http::Error::Networkerror));
+                continue;
+            }
             // MCP-1014 (2026-05-15): cap caller-supplied body size before
             // any URL parse / DNS / vault work. Same sibling-drift class
             // as wit_http::fetch and wit_webhook::send. Each entry in the
@@ -1379,6 +1502,85 @@ impl wit_http::Host for TalosContext {
         // the old overflow path collapsed every return slot to
         // Forbiddenhost regardless of why a particular entry was
         // rejected, losing operator-visibility into the actual cause.
+        if cancelled_during_validation {
+            if let Some(ref m) = self.metrics {
+                m.record_execution_cancelled();
+            }
+            self.emit_network_failure(
+                reason_class::CANCELLED,
+                reason_class::WIT_NETWORKERROR,
+                "the execution was cancelled while the batch was being validated; \
+                 entries not yet validated were not sent",
+            )
+            .await;
+        }
+
+        // ── Circuit-breaker admission: per BATCH, per HOST ───────────────────
+        // Until 2026-09 this path took no permit at all (see the long note at
+        // the `send()` below for the history). The shape argued for there is
+        // the one implemented here: ONE `begin_request` per DISTINCT host in
+        // the batch, one settled permit per distinct host after the join. Per
+        // ENTRY admission was rejected on measurement (a 10-wide batch against
+        // a dead host would trip a 5-consecutive-failure breaker inside one
+        // guest call and spend all three half-open trial tokens at once).
+        //
+        // Refused hosts convert their entries to `Networkerror` HERE, before
+        // the budget charge, so a refused entry costs no budget (the MCP-783
+        // rule). The permits are settled after the join with the WORST outcome
+        // seen for that host — a transport failure beats a status, a 5xx beats
+        // a 2xx — so a batch is one trial, not N.
+        let breaker = get_global_circuit_breaker();
+        let mut host_permits: std::collections::HashMap<
+            String,
+            crate::circuit_breaker::RequestPermit<'static>,
+        > = std::collections::HashMap::new();
+        let mut breaker_refused: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        // Host per input slot — used for admission now and for the settle +
+        // per-failure diagnostics after the join. `None` = the entry failed
+        // validation (already diagnosed at validation time).
+        let request_hosts: Vec<Option<String>> = validated
+            .iter()
+            .map(|v| {
+                v.as_ref().ok().and_then(|(u, _, _, _, _)| {
+                    url::Url::parse(u)
+                        .ok()
+                        .and_then(|p| p.host_str().map(str::to_string))
+                })
+            })
+            .collect();
+        for (v, host) in validated.iter_mut().zip(request_hosts.iter()) {
+            let Some(host) = host else { continue };
+            if v.is_err() {
+                continue;
+            }
+            if !host_permits.contains_key(host) && !breaker_refused.contains(host) {
+                match breaker.begin_request(host) {
+                    Some(permit) => {
+                        host_permits.insert(host.clone(), permit);
+                    }
+                    None => {
+                        breaker_refused.insert(host.clone());
+                    }
+                }
+            }
+            if breaker_refused.contains(host) {
+                *v = Err(wit_http::Error::Networkerror);
+            }
+        }
+        for host in &breaker_refused {
+            tracing::warn!(host = %host, "fetch_all: circuit breaker open — entries to this host refused");
+            self.emit_network_failure(
+                reason_class::CIRCUIT_OPEN,
+                reason_class::WIT_NETWORKERROR,
+                &format!(
+                    "circuit breaker open for '{host}' after recent failures — \
+                     the batch entries to it were rejected without being sent; it closes automatically"
+                ),
+            )
+            .await;
+        }
+
         let actual_calls = validated.iter().filter(|v| v.is_ok()).count() as u64;
         let prev = self
             .http_call_count
@@ -1449,24 +1651,29 @@ impl wit_http::Host for TalosContext {
 
         let self_http_client = self.http_client.clone();
         let dry_run = self.dry_run;
-        // Host per input slot, captured BEFORE the entries move into the
-        // stream — used after the join to emit per-failure diagnostics.
-        // None = the entry already failed validation (its deny was
-        // diagnosed at validation time via record_capability_denied).
-        let request_hosts: Vec<Option<String>> = validated
-            .iter()
-            .map(|v| {
-                v.as_ref().ok().and_then(|(u, _, _, _, _)| {
-                    url::Url::parse(u)
-                        .ok()
-                        .and_then(|p| p.host_str().map(str::to_string))
-                })
-            })
-            .collect();
+        // The execution's cancellation flag, cloned into every entry future:
+        // the moved futures have no `self`, and a cancel arriving mid-batch
+        // must stop the entries that have not been sent yet.
+        let cancelled_flag = self.cancelled.clone();
+        /// What one dispatched entry learned about its host, for the
+        /// per-host permit settle after the join. `None` on the slot = the
+        /// entry never reached `send()` (validation-failed, breaker-refused,
+        /// dry-run).
+        #[derive(Clone, Copy)]
+        enum BatchSendOutcome {
+            Status(u16),
+            Transport,
+            /// `reqwest` never built the request — a guest-authored header
+            /// it refused. Nothing left the process (`settle_no_evidence`).
+            NoEvidence,
+            /// Observed cancellation before its send.
+            Cancelled,
+        }
         let stream =
             futures_util::stream::iter(validated.into_iter().enumerate().map(move |(idx, v)| {
                 let max_r = max_resp;
                 let self_http_client = self_http_client.clone();
+                let cancelled_flag = cancelled_flag.clone();
                 async move {
                     // Tag every future with its INPUT index: buffer_unordered
                     // yields in COMPLETION order, and the WIT contract
@@ -1476,11 +1683,22 @@ impl wit_http::Host for TalosContext {
                     // cross-request data mix-up under the default
                     // concurrency of 10). The post-join sort restores the
                     // documented order.
+                    let mut outcome: Option<BatchSendOutcome> = None;
+                    let outcome_slot = &mut outcome;
                     let result = async move {
                         let (url_str, method, headers, body, timeout_ms) = match v {
                             Err(e) => return Err(e),
                             Ok(params) => params,
                         };
+
+                // Per-ENTRY cancellation at dispatch time. With the default
+                // concurrency of 10, a 100-entry batch has 90 entries queued
+                // behind `buffer_unordered` when a cancel lands; each of them
+                // checks the flag as it is polled for the first time.
+                if cancelled_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                    *outcome_slot = Some(BatchSendOutcome::Cancelled);
+                    return Err(wit_http::Error::Networkerror);
+                }
 
                 // Dry-run mode: mock non-GET HTTP requests
                 if dry_run && method != reqwest::Method::GET {
@@ -1515,75 +1733,26 @@ impl wit_http::Host for TalosContext {
                     builder = builder.body(body);
                 }
 
-                // ── THE CIRCUIT BREAKER DOES NOT PARTICIPATE IN `fetch_all` ──
-                // Deliberate as of 2026-08-11, not an oversight — and the
-                // reason it is written HERE is that this send is the site an
-                // extension would have to touch.
-                //
-                // `wit_http::fetch` takes a `RequestPermit` from
-                // `begin_request` before its send and settles it after. This
-                // path does NEITHER: a batch cannot trip the breaker, cannot be refused
-                // by it, and contributes nothing to
-                // `talos_circuit_breaker_{opens,blocks}_total`.
-                //
-                // SCOPE, corrected 2026-08-12 in review: this is not a
-                // batch-HTTP exception, it is the general case.
-                // `wit_http::fetch` is the ONLY outbound-HTTP surface in this
-                // worker that touches the breaker at all — `wit_webhook::send`,
-                // `wit_graphql::execute`, `host/http_stream.rs`, the four S3
-                // operations in `host/object_storage.rs`, `host/llm_tools.rs`,
-                // `host/llm.rs` and `host/email.rs` all egress without
-                // consulting it or recording an outcome. So the runbook's "if
-                // opens and blocks are both flat, this is not a herd" is a
-                // FALSE NEGATIVE for every one of them, not just for
-                // `fetch_all`. The full list is in `circuit_breaker.rs`'s
-                // header and in the alert description.
-                //
-                // `fetch_all` specifically is still LATENT — no shipped module
-                // template calls it (the name appears only in generated
-                // `bindings.rs`) — but the LLM, webhook and GraphQL paths are
-                // on the hot path today, so the blindness as a whole is live.
-                //
-                // NOT extended in the same change, for two reasons.
-                //
-                // (a) It is a behaviour change to a fail-closed control, and it
-                //     touches the exact token accounting whose leak was fixed
-                //     separately on 2026-08-12 (see `fetch`'s permit note and
-                //     `RequestPermit`). Landing both at once would have made
-                //     neither attributable; the same reasoning still defers
-                //     this one, since the strand fix's own effect on
-                //     `half_open_exhausted` has not been observed in
-                //     production yet.
-                //
-                // (b) The per-request semantics are a DESIGN question, not a
-                //     line. A batch of N requests to one host is not N
-                //     independent trials, and treating it as such is wrong in
-                //     all three breaker states:
-                //       Closed   — `failure_threshold` is 5 CONSECUTIVE
-                //                  failures. One 10-wide batch against a dead
-                //                  host would record 10 and trip the breaker
-                //                  inside a single guest call, where `fetch`
-                //                  needs five separate ones. The breaker would
-                //                  open N× faster on identical guest intent.
-                //       HalfOpen — 3 trial tokens. A 10-wide batch consumes all
-                //                  3 and is refused for the other 7, and the
-                //                  3 outcomes it does record are one instant
-                //                  against one host — a single sample dressed
-                //                  as three, feeding a `success_rate` that then
-                //                  decides close-vs-reopen.
-                //       Open     — the honest count is ONE block per batch, not
-                //                  N. The alert threshold is `> 0`, calibrated
-                //                  on incidents that produced one or two
-                //                  blocks; a single refused 100-wide batch
-                //                  would render as 100 and misstate the size of
-                //                  the outage by two orders of magnitude.
-                //     The defensible shape is per-BATCH-per-HOST admission: one
-                //     `begin_request` per distinct host in the batch, one
-                //     settled permit per distinct host. That needs host
-                //     bookkeeping this moved future cannot reach — it captures
-                //     no `self` (the same constraint the reason-latch comment
-                //     after the join describes).
+                // ── The circuit breaker and `fetch_all` ──────────────────────
+                // Admission happened BEFORE the budget charge, per BATCH per
+                // HOST (`host_permits` above) — this future holds no permit
+                // and no `self`; it only REPORTS what it saw, via
+                // `outcome_slot`, and the settle happens after the join, once
+                // per distinct host. From 2026-08-11 to 2026-09 this path took
+                // no permit at all; the per-batch-per-host shape is the one
+                // the note that sat here argued for (per-ENTRY admission
+                // would trip a 5-consecutive-failure breaker inside one guest
+                // call and spend all three half-open trial tokens on what is
+                // one sample against one host). `wit_webhook::send` now takes
+                // a permit too; `wit_graphql::execute`, `host/http_stream.rs`,
+                // the S3 operations, `llm_tools`, `llm` and `email` still do
+                // not — see `circuit_breaker.rs`'s header for the list.
                 let response = builder.send().await.map_err(|e| {
+                    *outcome_slot = Some(if e.is_builder() {
+                        BatchSendOutcome::NoEvidence
+                    } else {
+                        BatchSendOutcome::Transport
+                    });
                     if e.is_timeout() {
                         wit_http::Error::Timeout
                     } else {
@@ -1592,12 +1761,15 @@ impl wit_http::Host for TalosContext {
                 })?;
 
                 let status = response.status().as_u16();
-                // Audit log: log host + path only (never full URL — query params may contain secrets)
+                *outcome_slot = Some(BatchSendOutcome::Status(status));
+                // Audit log: host + path LENGTH only (never the full URL or the
+                // path — query params AND paths carry secrets: capability
+                // tokens, presigned keys).
                 if let Ok(parsed_url) = url::Url::parse(&url_str) {
                     tracing::info!(
                         method = %method_str_for_audit,
                         host = %parsed_url.host_str().unwrap_or("unknown"),
-                        path = %parsed_url.path(),
+                        path_len = parsed_url.path().len(),
                         status = status,
                         "HTTP audit"
                     );
@@ -1651,15 +1823,54 @@ impl wit_http::Host for TalosContext {
                         })
                     }
                     .await;
-                    (idx, result)
+                    (idx, result, outcome)
                 }
             }));
 
-        let mut indexed: Vec<(usize, Result<wit_http::Response, wit_http::Error>)> =
-            stream.buffer_unordered(concurrency_limit).collect().await;
+        #[allow(clippy::type_complexity)]
+        let mut indexed: Vec<(
+            usize,
+            Result<wit_http::Response, wit_http::Error>,
+            Option<BatchSendOutcome>,
+        )> = stream.buffer_unordered(concurrency_limit).collect().await;
         // Restore the documented input order (see the tagging comment
         // above) — completion order is an implementation detail.
-        indexed.sort_unstable_by_key(|&(i, _)| i);
+        indexed.sort_unstable_by_key(|&(i, _, _)| i);
+
+        // ── Settle the per-host permits with the WORST outcome per host ──────
+        // Transport failure > any status (a 5xx fails a half-open trial, a 2xx
+        // passes it — `settle_response` decides) > builder-only failures (no
+        // evidence about the host). A host whose entries were ALL cancelled
+        // or dry-run has its permit dropped unsettled, which repays any trial
+        // token and records neither outcome (see `RequestPermit`).
+        let mut any_dispatch_cancelled = false;
+        for (host, mut permit) in host_permits.drain() {
+            let mut saw_transport = false;
+            let mut worst_status: Option<u16> = None;
+            let mut saw_no_evidence = false;
+            for (idx, _, outcome) in &indexed {
+                if request_hosts.get(*idx).and_then(|h| h.as_deref()) != Some(host.as_str()) {
+                    continue;
+                }
+                match outcome {
+                    Some(BatchSendOutcome::Transport) => saw_transport = true,
+                    Some(BatchSendOutcome::Status(st)) => {
+                        worst_status = Some(worst_status.map_or(*st, |w| w.max(*st)));
+                    }
+                    Some(BatchSendOutcome::NoEvidence) => saw_no_evidence = true,
+                    Some(BatchSendOutcome::Cancelled) => any_dispatch_cancelled = true,
+                    None => {}
+                }
+            }
+            if saw_transport {
+                permit.settle_transport_failure();
+            } else if let Some(st) = worst_status {
+                permit.settle_response(st);
+            } else if saw_no_evidence {
+                permit.settle_no_evidence();
+            }
+            // else: dropped unsettled → repaid.
+        }
         // Per-failure diagnostics for DISPATCH failures. Validation
         // failures (request_hosts[i] == None) were already diagnosed at
         // validation time; capped globally by HOST_DIAG_CAP.
@@ -1689,8 +1900,21 @@ impl wit_http::Host for TalosContext {
         // the guard below, and keep the class they latched at validation time.
         let mut egress_attributed = false;
         let mut unattributed_dispatch_failure = false;
-        for (idx, r) in &indexed {
+        for (idx, r, outcome) in &indexed {
             if let Err(e) = r {
+                // A cancelled entry is diagnosed once, below, with the class
+                // that keeps it from being redispatched.
+                if matches!(outcome, Some(BatchSendOutcome::Cancelled)) {
+                    continue;
+                }
+                // Breaker-refused entries were diagnosed at admission time.
+                if request_hosts
+                    .get(*idx)
+                    .and_then(|h| h.as_deref())
+                    .is_some_and(|h| breaker_refused.contains(h))
+                {
+                    continue;
+                }
                 if let Some(Some(host)) = request_hosts.get(*idx) {
                     unattributed_dispatch_failure = true;
                     // A Networkerror under a local-egress-only actor is almost
@@ -1743,7 +1967,22 @@ impl wit_http::Host for TalosContext {
         if unattributed_dispatch_failure && !egress_attributed {
             self.record_network_outcome(None);
         }
-        indexed.into_iter().map(|(_, r)| r).collect()
+        // Cancellation last, so it WINS the latch: a batch cut short by a
+        // cancel must classify `cancelled` (non-transient in both gates)
+        // whatever its already-dispatched siblings did.
+        if any_dispatch_cancelled {
+            if let Some(ref m) = self.metrics {
+                m.record_execution_cancelled();
+            }
+            self.emit_network_failure(
+                reason_class::CANCELLED,
+                reason_class::WIT_NETWORKERROR,
+                "the execution was cancelled while the batch was in flight; \
+                 entries not yet sent were not sent",
+            )
+            .await;
+        }
+        indexed.into_iter().map(|(_, r, _)| r).collect()
     }
 
     /// Tier 1 — Fetch with secret injected as `Authorization: Bearer {value}`.
@@ -2021,39 +2260,58 @@ mod breaker_permit_leak_path_tests {
         .await;
     }
 
-    /// Leak path 4 — the idempotency dedup short-circuit. `return Ok(cached)`,
-    /// i.e. a leak on a path that SUCCEEDS, which no failure-shaped audit of
-    /// this function would have looked at.
-    #[tokio::test]
-    async fn idempotency_dedup_short_circuit_repays_the_trial_token() {
-        let host = "203.0.113.14";
-        let key = "breaker-permit-dedup-probe";
+    /// Seed the store the way a completed POST `https://{host}/probe` with body
+    /// `{}` under `user` would (tenancy-scoped key + request hash — E1).
+    fn seed_dedup(user: uuid::Uuid, host: &str, key: &str, status: u16, body: &[u8]) {
+        let scoped = scoped_dedup_key(Some(user), None, host, key).expect("user present");
+        let hash = dedup_request_hash("POST", &format!("https://{host}/probe"), b"{}");
         get_global_idempotency_store().complete(
-            key,
+            &scoped,
+            &hash,
             DedupResponse {
-                status: 200,
+                status,
                 headers: vec![],
-                body: b"cached".to_vec(),
+                body: body.to_vec(),
             },
         );
+    }
 
-        assert_reaches_breaker_and_repays(
-            host,
-            "idempotency dedup short-circuit",
-            || {
-                let mut ctx = ctx_for(host);
-                ctx.idempotency_key = Some(key.to_string());
-                ctx
-            },
-            || {
-                let mut req = get(host);
-                // The dedup store is only consulted for MUTATING verbs.
-                req.method = wit_http::Method::Post;
-                req.body = b"{}".to_vec();
-                req
-            },
-        )
-        .await;
+    /// Former leak path 4 — the idempotency dedup short-circuit, a
+    /// `return Ok(cached)` that USED to sit between the permit and the send.
+    /// Since 2026-09 the dedup check is hoisted ahead of the DNS lookup and the
+    /// breaker, so a cached hit never asks for admission at all: with a
+    /// zero-token half-open circuit (which refuses every request that DOES
+    /// reach the breaker) the cached response is still served and no token
+    /// moves. That is a stronger guarantee than repayment, and this test pins
+    /// it in that direction.
+    #[tokio::test]
+    async fn idempotency_dedup_short_circuit_never_reaches_the_breaker() {
+        let host = "203.0.113.14";
+        let key = "breaker-permit-dedup-probe";
+        let user = uuid::Uuid::new_v4();
+        seed_dedup(user, host, key, 200, b"cached");
+        let cb = get_global_circuit_breaker();
+        cb.force_half_open(host, 0);
+
+        let mut ctx = ctx_for(host);
+        ctx.user_id = Some(user);
+        ctx.idempotency_key = Some(key.to_string());
+        let mut req = get(host);
+        // The dedup store is only consulted for MUTATING verbs.
+        req.method = wit_http::Method::Post;
+        req.body = b"{}".to_vec();
+
+        let resp = ctx
+            .fetch(req)
+            .await
+            .expect("cached hit is served ahead of the breaker");
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            cb.trial_tokens_remaining(host),
+            Some(0),
+            "no token was touched"
+        );
+        assert_eq!(cb.trial_tally(host), Some((0, 0)));
     }
 
     /// The dedup path must still return the cached response — the permit must
@@ -2062,16 +2320,11 @@ mod breaker_permit_leak_path_tests {
     async fn the_dedup_short_circuit_still_returns_the_cached_response() {
         let host = "203.0.113.15";
         let key = "breaker-permit-dedup-passthrough";
-        get_global_idempotency_store().complete(
-            key,
-            DedupResponse {
-                status: 201,
-                headers: vec![],
-                body: b"cached-body".to_vec(),
-            },
-        );
+        let user = uuid::Uuid::new_v4();
+        seed_dedup(user, host, key, 201, b"cached-body");
 
         let mut ctx = ctx_for(host);
+        ctx.user_id = Some(user);
         ctx.idempotency_key = Some(key.to_string());
         let mut req = get(host);
         req.method = wit_http::Method::Post;
@@ -2128,5 +2381,329 @@ mod write_ceiling_http_tests {
         ] {
             assert!(http_method_mutates(&m), "{m:?} must be a mutation");
         }
+    }
+}
+
+#[cfg(test)]
+mod idempotency_dedup_tests {
+    //! E1 (2026-09): the worker-side dedup store is process-global, and until
+    //! this change it was keyed on the LITERAL engine-stamped key with no
+    //! request identity — two tenants (or two unrelated workflows of one
+    //! tenant) using the same literal were served each other's cached 2xx.
+    //! Every test here drives the REAL `fetch` up to the dedup check, which
+    //! now sits ahead of the DNS lookup, so no network is involved.
+    use super::*;
+    use crate::bindings::talos::core::http::Host as _;
+    use crate::context::TalosContext;
+    use crate::wit_inspector::CapabilityWorld;
+    use std::collections::HashMap;
+    use talos_workflow_job_protocol::LlmTier;
+
+    const HOST: &str = "example.invalid";
+
+    fn ctx(user: Option<uuid::Uuid>, key: &str) -> TalosContext {
+        let mut c = TalosContext::new(
+            CapabilityWorld::Http,
+            vec![HOST.to_string()],
+            vec![],
+            128,
+            HashMap::new(),
+            None,
+            None,
+            false,
+            None,
+            std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+            LlmTier::Tier2,
+            None,
+        )
+        .expect("test context");
+        c.user_id = user;
+        c.idempotency_key = Some(key.to_string());
+        c
+    }
+
+    fn post(body: &[u8]) -> wit_http::Request {
+        wit_http::Request {
+            method: wit_http::Method::Post,
+            url: format!("https://{HOST}/charges"),
+            headers: vec![],
+            body: body.to_vec(),
+            timeout_ms: Some(1_000),
+        }
+    }
+
+    /// Seed the global store exactly as a completed send under `user` would.
+    fn seed(user: uuid::Uuid, key: &str, body: &[u8]) {
+        let scoped = scoped_dedup_key(Some(user), None, HOST, key).expect("user present");
+        let hash = dedup_request_hash("POST", &format!("https://{HOST}/charges"), body);
+        get_global_idempotency_store().complete(
+            &scoped,
+            &hash,
+            DedupResponse {
+                status: 201,
+                headers: vec![],
+                body: b"cached".to_vec(),
+            },
+        );
+    }
+
+    #[test]
+    fn scoped_key_is_namespaced_by_tenancy_and_absent_without_a_user() {
+        let u1 = uuid::Uuid::new_v4();
+        let u2 = uuid::Uuid::new_v4();
+        let a = uuid::Uuid::new_v4();
+        let k1 = scoped_dedup_key(Some(u1), None, "Api.Example.com", "lit").unwrap();
+        let k2 = scoped_dedup_key(Some(u2), None, "api.example.com", "lit").unwrap();
+        let k1a = scoped_dedup_key(Some(u1), Some(a), "api.example.com", "lit").unwrap();
+        let k1h = scoped_dedup_key(Some(u1), None, "other.example.com", "lit").unwrap();
+        assert_ne!(k1, k2, "same literal, different user → different key");
+        assert_ne!(k1, k1a, "actor is part of the namespace");
+        assert_ne!(k1, k1h, "host is part of the namespace");
+        assert_eq!(
+            k1,
+            format!("{u1}:-:api.example.com:lit"),
+            "host is lowercased"
+        );
+        assert!(
+            scoped_dedup_key(None, None, "h", "lit").is_none(),
+            "no tenancy principal → the store is not engaged"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_literal_different_user_is_a_miss() {
+        let key = format!("lit-{}", uuid::Uuid::new_v4());
+        let owner = uuid::Uuid::new_v4();
+        seed(owner, &key, b"{\"amount\":1}");
+
+        // Control: the owner IS served the cached response (before any DNS).
+        let r = ctx(Some(owner), &key).fetch(post(b"{\"amount\":1}")).await;
+        match r {
+            Ok(resp) => {
+                assert_eq!(resp.status, 201);
+                assert_eq!(resp.body, b"cached");
+            }
+            other => panic!("owner must be served the cached response, got {other:?}"),
+        }
+
+        // The defect: a DIFFERENT user with the same literal + same request
+        // must NOT see the owner's response. It falls through to DNS on a
+        // `.invalid` host, which fails — anything but the cached 201 proves
+        // the miss.
+        let stranger = uuid::Uuid::new_v4();
+        let r = ctx(Some(stranger), &key)
+            .fetch(post(b"{\"amount\":1}"))
+            .await;
+        assert!(
+            !matches!(&r, Ok(resp) if resp.status == 201),
+            "a different tenant was served the owner's cached response: {r:?}"
+        );
+
+        // No user id at all: the store is not engaged either.
+        let r = ctx(None, &key).fetch(post(b"{\"amount\":1}")).await;
+        assert!(
+            !matches!(&r, Ok(resp) if resp.status == 201),
+            "a principal-less job was served a cached response: {r:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_key_different_request_is_refused_not_served() {
+        let key = format!("lit-{}", uuid::Uuid::new_v4());
+        let owner = uuid::Uuid::new_v4();
+        seed(owner, &key, b"{\"amount\":1}");
+
+        let mut c = ctx(Some(owner), &key);
+        let r = c.fetch(post(b"{\"amount\":2}")).await;
+        assert!(
+            matches!(r, Err(wit_http::Error::Forbiddenhost)),
+            "same key, different body must be REFUSED, got {r:?}"
+        );
+        // Refusal clears the latch (no minted class; `forbiddenhost` is
+        // non-transient by discriminant).
+        assert!(c.network_reason_handle().lock().unwrap().is_none());
+        // And the store still holds the ORIGINAL record — a mismatch must not
+        // overwrite it.
+        let r = ctx(Some(owner), &key).fetch(post(b"{\"amount\":1}")).await;
+        assert!(matches!(r, Ok(resp) if resp.status == 201));
+    }
+
+    /// A GET never engages the store (no header, no dedup), even under a
+    /// stamped key — a read is safe to repeat.
+    #[tokio::test]
+    async fn get_never_touches_the_store() {
+        let key = format!("lit-{}", uuid::Uuid::new_v4());
+        let owner = uuid::Uuid::new_v4();
+        // Seed under the GET's own identity so a wrongly-engaged store WOULD hit.
+        let scoped = scoped_dedup_key(Some(owner), None, HOST, &key).unwrap();
+        let hash = dedup_request_hash("GET", &format!("https://{HOST}/charges"), b"");
+        get_global_idempotency_store().complete(
+            &scoped,
+            &hash,
+            DedupResponse {
+                status: 299,
+                headers: vec![],
+                body: vec![],
+            },
+        );
+        let req = wit_http::Request {
+            method: wit_http::Method::Get,
+            url: format!("https://{HOST}/charges"),
+            headers: vec![],
+            body: vec![],
+            timeout_ms: Some(1_000),
+        };
+        let r = ctx(Some(owner), &key).fetch(req).await;
+        assert!(
+            !matches!(&r, Ok(resp) if resp.status == 299),
+            "GET was served from the store: {r:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod fetch_all_budget_and_breaker_tests {
+    //! E3 (2026-09): `fetch_all` validated an unbounded batch before consulting
+    //! the budget, and took no circuit-breaker permit at all.
+    use super::*;
+    use crate::bindings::talos::core::http::Host as _;
+    use crate::circuit_breaker::get_global_circuit_breaker;
+    use crate::context::TalosContext;
+    use crate::wit_inspector::CapabilityWorld;
+    use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
+    use talos_workflow_job_protocol::LlmTier;
+
+    fn ctx(allowed: &[&str], dry_run: bool) -> TalosContext {
+        let mut c = TalosContext::new(
+            CapabilityWorld::Http,
+            allowed.iter().map(|s| s.to_string()).collect(),
+            vec![],
+            128,
+            HashMap::new(),
+            None,
+            None,
+            false,
+            None,
+            std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+            LlmTier::Tier2,
+            None,
+        )
+        .expect("test context");
+        c.dry_run = dry_run;
+        c
+    }
+
+    fn latched(c: &TalosContext) -> Option<&'static str> {
+        c.network_reason_handle().lock().unwrap().map(|r| r.class)
+    }
+
+    fn bogus() -> wit_http::Request {
+        wit_http::Request {
+            method: wit_http::Method::Get,
+            url: "not a url".to_string(),
+            headers: vec![],
+            body: vec![],
+            timeout_ms: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_batch_larger_than_the_remaining_budget_is_refused_before_validation() {
+        let mut c = ctx(&["*"], false);
+        c.http_call_count
+            .store(MAX_HTTP_CALLS_PER_EXECUTION - 1, Ordering::Relaxed);
+        let out = c.fetch_all(vec![bogus(), bogus()]).await;
+        assert_eq!(out.len(), 2);
+        // Refused as a batch: every slot is `Forbiddenhost` — NOT the
+        // `Invalidurl` per-entry validation would have produced, which is
+        // what proves validation never ran.
+        assert!(
+            out.iter()
+                .all(|r| matches!(r, Err(wit_http::Error::Forbiddenhost))),
+            "{out:?}"
+        );
+        assert_eq!(
+            c.http_call_count.load(Ordering::Relaxed),
+            MAX_HTTP_CALLS_PER_EXECUTION - 1,
+            "a refused batch must not be charged"
+        );
+        assert_eq!(latched(&c), Some(reason_class::EXECUTION_RATE_LIMIT));
+
+        // Control: with room for both, the same batch IS validated (and each
+        // entry fails on its own merits).
+        let mut c = ctx(&["*"], false);
+        c.http_call_count
+            .store(MAX_HTTP_CALLS_PER_EXECUTION - 2, Ordering::Relaxed);
+        let out = c.fetch_all(vec![bogus(), bogus()]).await;
+        assert!(
+            out.iter()
+                .all(|r| matches!(r, Err(wit_http::Error::Invalidurl))),
+            "{out:?}"
+        );
+    }
+
+    fn post_to(host: &str, path: &str) -> wit_http::Request {
+        wit_http::Request {
+            method: wit_http::Method::Post,
+            url: format!("https://{host}/{path}"),
+            headers: vec![],
+            body: b"{}".to_vec(),
+            timeout_ms: Some(1_000),
+        }
+    }
+
+    /// One permit per DISTINCT host per batch: an open circuit refuses every
+    /// entry to that host without charging budget; an admitted batch of two
+    /// entries spends ONE trial token, and (dry-run: nothing sent) repays it.
+    #[tokio::test]
+    async fn breaker_admission_is_per_batch_per_host() {
+        // A public IP literal skips DNS, and dry-run mocks the POST before any
+        // socket is opened — so the only I/O-shaped thing on this path is the
+        // breaker itself. Unique host per test: the breaker is process-global.
+        let host = "8.8.4.4";
+        let cb = get_global_circuit_breaker();
+
+        // Refused: half-open with zero tokens.
+        cb.force_half_open(host, 0);
+        let mut c = ctx(&[host], true);
+        let out = c
+            .fetch_all(vec![post_to(host, "a"), post_to(host, "b")])
+            .await;
+        assert!(
+            out.iter()
+                .all(|r| matches!(r, Err(wit_http::Error::Networkerror))),
+            "an open circuit must refuse every entry to that host: {out:?}"
+        );
+        assert_eq!(
+            c.http_call_count.load(Ordering::Relaxed),
+            0,
+            "refused entries cost no budget"
+        );
+        assert_eq!(latched(&c), Some(reason_class::CIRCUIT_OPEN));
+
+        // Admitted: ONE token for the whole batch, repaid because dry-run
+        // produced no evidence about the host.
+        cb.force_half_open(host, 1);
+        let mut c = ctx(&[host], true);
+        let out = c
+            .fetch_all(vec![post_to(host, "a"), post_to(host, "b")])
+            .await;
+        assert!(
+            out.iter()
+                .all(|r| matches!(r, Ok(resp) if resp.status == 200)),
+            "{out:?}"
+        );
+        assert_eq!(
+            c.http_call_count.load(Ordering::Relaxed),
+            2,
+            "admitted entries are charged"
+        );
+        assert_eq!(
+            cb.trial_tokens_remaining(host),
+            Some(1),
+            "a two-entry batch must spend exactly one trial token and, unsettled, repay it"
+        );
+        assert_eq!(cb.trial_tally(host), Some((0, 0)));
     }
 }

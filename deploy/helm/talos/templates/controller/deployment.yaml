@@ -1,4 +1,15 @@
 {{- if .Values.controller.enabled -}}
+{{- /* The chart ships NO Ollama workload (there is no templates/ollama/).
+       `ollama.enabled: true` only points OLLAMA_URL at
+       `<release>-ollama.<ns>.svc.cluster.local:11434` and opens NetworkPolicy
+       egress to pods labelled component=ollama — correct only if the operator
+       runs that Service. values-phase1.yaml shipped enabled=true against the
+       phantom Service, so every tier-1 LLM call failed DNS while the render
+       looked fine. Refuse at render unless the operator attests the Service
+       exists; the message says what to do in each case. */ -}}
+{{- if and .Values.ollama.enabled (not .Values.ollama.externalWorkload) }}
+{{- fail (printf "ollama.enabled=true but this chart ships NO Ollama workload — OLLAMA_URL would point at %s.%s.svc.cluster.local:11434, a Service nothing deploys. Either (a) run your own Ollama Service under that name with label app.kubernetes.io/component=ollama and set ollama.externalWorkload=true, or (b) set ollama.enabled=false and put your Ollama's URL in controller.env.OLLAMA_URL + worker.env.OLLAMA_URL." (include "talos.componentName" (list . "ollama")) .Release.Namespace) }}
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -56,6 +67,17 @@ spec:
           env:
             # --- Static config from values.yaml ---
             {{- include "talos.envFromMap" .Values.controller.env | nindent 12 }}
+            # Postgres pool cap. talos-db's code default is 30 and the chart
+            # never set this, so two controller replicas could hold the whole
+            # in-cluster `max_connections = 60` between them. Knob + the
+            # arithmetic: values.yaml controller.database.maxConnections. An
+            # explicit controller.env.DB_MAX_CONNECTIONS wins (same hasKey
+            # guard as the EMBEDDING_* block below — a duplicate env name makes
+            # the LATER entry win, silently).
+            {{- if not (hasKey .Values.controller.env "DB_MAX_CONNECTIONS") }}
+            - name: DB_MAX_CONNECTIONS
+              value: {{ .Values.controller.database.maxConnections | default 20 | quote }}
+            {{- end }}
             # --- OCI template registry (only emitted when configured) ---
             # Setting TALOS_REGISTRY_URL switches the controller from disk-
             # bundled template seeding to OCI catalog sync. See
