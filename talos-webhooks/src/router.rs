@@ -2157,7 +2157,9 @@ impl WebhookRouter {
                 workflow_id,
                 user_id,
                 None, // version_id — webhook runs the active graph
-                None, // priority — defaults to "normal"
+                // The priority the graph declares (was `None` → `normal` until
+                // 2026-09-10, disagreeing with the manual-trigger path).
+                talos_workflow_repository::ExecutionPriority::declared_in_graph_json(&graph_json),
                 // Phase D2: the gate-resolved actor so row attribution
                 // matches the engine binding below.
                 effective_actor_id,

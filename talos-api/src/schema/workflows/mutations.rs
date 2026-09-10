@@ -1314,7 +1314,13 @@ impl WorkflowsMutations {
 
         // Create a test execution record (marked as test)
         talos_execution_repository::ExecutionRepository::new(db_pool.clone())
-            .insert_test_execution_row(execution_id, workflow_id, user_id, test_effective_actor)
+            .insert_test_execution_row(
+                execution_id,
+                workflow_id,
+                user_id,
+                test_effective_actor,
+                talos_workflow_repository::ExecutionPriority::declared_in_graph_json(&graph_json),
+            )
             .await
             .map_err(|e| {
                 tracing::error!("Failed to create test execution: {}", e);

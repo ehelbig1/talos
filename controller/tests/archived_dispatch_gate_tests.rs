@@ -211,7 +211,7 @@ async fn the_admission_gate_writes_no_row_for_an_archived_workflow() {
                 wf,
                 user,
                 None,
-                None,
+                talos_workflow_repository::ExecutionPriority::Normal,
                 Some(actor),
                 None,
                 None,

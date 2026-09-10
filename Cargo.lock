@@ -8128,6 +8128,7 @@ dependencies = [
  "talos-module-payload-encryption",
  "talos-secrets-manager",
  "talos-text-util",
+ "talos-workflow-repository",
  "tokio",
  "tracing",
  "uuid",

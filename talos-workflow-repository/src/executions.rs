@@ -8,6 +8,81 @@
 
 use crate::*;
 
+/// The value `workflow_executions.priority` may hold, and the ONE home for the
+/// vocabulary that three surfaces used to spell independently: the graph key
+/// `set_workflow_priority` (MCP) and the builder's priority selector WRITE,
+/// and every execution-creating path READS.
+///
+/// Measured 2026-09-10 before this type existed: of the seven code paths that
+/// INSERT a `workflow_executions` row, THREE parsed the graph key inline (the
+/// manual trigger, `test_workflow_draft`, `test_workflow`), THREE passed
+/// `None` and so recorded `normal` whatever the workflow declared (the
+/// scheduler, the webhook router, and `call_workflow` / `bulk_trigger_workflow`
+/// / `enqueue_workflow`), and the column carries no CHECK constraint. Taking
+/// this type instead of `Option<&str>` makes "every creation path records the
+/// declared priority" a compiler fact: a caller must either derive it from the
+/// graph it already holds or write `ExecutionPriority::Normal` and mean it.
+///
+/// **What the value does NOT do.** Nothing in the platform orders dispatch by
+/// it. The engine stamps `priority: 100` on every `JobRequest` (both dispatch
+/// sites), the dispatcher's `.priority` NATS subject is reachable only from a
+/// library caller's builder and has no subscriber, and the worker has no
+/// priority handling. It is a LABEL on the execution record, visible in
+/// `list_executions`; `set_workflow_priority`'s description says exactly that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExecutionPriority {
+    High,
+    Normal,
+    Low,
+}
+
+impl ExecutionPriority {
+    /// Top-level graph-JSON key the value is declared under.
+    pub const GRAPH_KEY: &'static str = "priority";
+
+    /// Every variant, in the order the selector shows them.
+    pub const ALL: [Self; 3] = [Self::High, Self::Normal, Self::Low];
+
+    /// The stored / wire spelling. Lower-case, matching the column's
+    /// `DEFAULT 'normal'` and the frontend selector's option values.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::Normal => "normal",
+            Self::Low => "low",
+        }
+    }
+
+    /// Exact-spelling parse; anything else is `None` so a caller can refuse
+    /// it (the MCP tool does) rather than silently normalising.
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|p| p.as_str() == s)
+    }
+
+    /// The priority a parsed workflow graph declares. Absent, non-string or
+    /// unknown values are `Normal` — the column default, which is what every
+    /// pre-existing row holds.
+    #[must_use]
+    pub fn declared_in_graph(graph: &serde_json::Value) -> Self {
+        graph
+            .get(Self::GRAPH_KEY)
+            .and_then(serde_json::Value::as_str)
+            .and_then(Self::parse)
+            .unwrap_or(Self::Normal)
+    }
+
+    /// [`Self::declared_in_graph`] over the stored graph text; unparseable
+    /// JSON is `Normal` for the same reason.
+    #[must_use]
+    pub fn declared_in_graph_json(graph_json: &str) -> Self {
+        serde_json::from_str::<serde_json::Value>(graph_json)
+            .ok()
+            .map_or(Self::Normal, |g| Self::declared_in_graph(&g))
+    }
+}
+
 /// Outcome of [`WorkflowRepository::create_execution_under_concurrency_limit`].
 ///
 /// Carrying the limit and the observed running count in
@@ -444,7 +519,7 @@ impl WorkflowRepository {
         workflow_id: Uuid,
         user_id: Uuid,
         version_id: Option<Uuid>,
-        priority: Option<&str>,
+        priority: ExecutionPriority,
         actor_id: Option<Uuid>,
         provenance: Option<&serde_json::Value>,
     ) -> Result<()> {
@@ -498,7 +573,7 @@ impl WorkflowRepository {
         workflow_id: Uuid,
         user_id: Uuid,
         version_id: Option<Uuid>,
-        priority: Option<&str>,
+        priority: ExecutionPriority,
         actor_id: Option<Uuid>,
         provenance: Option<&serde_json::Value>,
         parent_execution_id: Option<Uuid>,
@@ -749,7 +824,7 @@ impl WorkflowRepository {
         .bind(workflow_id)
         .bind(user_id)
         .bind(version_id)
-        .bind(priority.unwrap_or("normal"))
+        .bind(priority.as_str())
         .bind(actor_id)
         .bind(provenance)
         .bind(parent_execution_id)
@@ -910,7 +985,7 @@ impl WorkflowRepository {
         workflow_id: Uuid,
         user_id: Uuid,
         version_id: Option<Uuid>,
-        priority: Option<&str>,
+        priority: ExecutionPriority,
         actor_id: Option<Uuid>,
         provenance: Option<&serde_json::Value>,
         parent_execution_id: Option<Uuid>,
@@ -931,7 +1006,7 @@ impl WorkflowRepository {
         .bind(workflow_id)
         .bind(user_id)
         .bind(version_id)
-        .bind(priority.unwrap_or("normal"))
+        .bind(priority.as_str())
         .bind(actor_id)
         .bind(provenance)
         .bind(parent_execution_id)
@@ -948,7 +1023,7 @@ impl WorkflowRepository {
         workflow_id: Uuid,
         user_id: Uuid,
         version_id: Option<Uuid>,
-        priority: &str,
+        priority: ExecutionPriority,
     ) -> Result<()> {
         sqlx::query(
             "INSERT INTO workflow_executions \
@@ -959,7 +1034,7 @@ impl WorkflowRepository {
         .bind(workflow_id)
         .bind(user_id)
         .bind(version_id)
-        .bind(priority)
+        .bind(priority.as_str())
         .execute(&self.db_pool)
         .await?;
         Ok(())
@@ -2250,5 +2325,64 @@ mod execution_output_cap_tests {
         );
         let bounded = bound_execution_payload(&v);
         assert!(matches!(bounded, std::borrow::Cow::Borrowed(_)));
+    }
+}
+
+#[cfg(test)]
+mod execution_priority_tests {
+    use super::ExecutionPriority;
+
+    #[test]
+    fn spellings_round_trip_and_match_the_column_default() {
+        for p in ExecutionPriority::ALL {
+            assert_eq!(ExecutionPriority::parse(p.as_str()), Some(p));
+        }
+        assert_eq!(ExecutionPriority::Normal.as_str(), "normal");
+        assert_eq!(
+            ExecutionPriority::parse("HIGH"),
+            None,
+            "exact spelling only"
+        );
+        assert_eq!(ExecutionPriority::parse("urgent"), None);
+        assert_eq!(ExecutionPriority::parse(""), None);
+    }
+
+    #[test]
+    fn declared_in_graph_reads_the_top_level_key_and_defaults_to_normal() {
+        let high = serde_json::json!({ "nodes": [], "priority": "high" });
+        assert_eq!(
+            ExecutionPriority::declared_in_graph(&high),
+            ExecutionPriority::High
+        );
+        let low = serde_json::json!({ "priority": "low" });
+        assert_eq!(
+            ExecutionPriority::declared_in_graph(&low),
+            ExecutionPriority::Low
+        );
+        // Absent, wrong type, unknown value, nested under data: all Normal.
+        for g in [
+            serde_json::json!({ "nodes": [] }),
+            serde_json::json!({ "priority": 200 }),
+            serde_json::json!({ "priority": "urgent" }),
+            serde_json::json!({ "data": { "priority": "high" } }),
+        ] {
+            assert_eq!(
+                ExecutionPriority::declared_in_graph(&g),
+                ExecutionPriority::Normal,
+                "{g}"
+            );
+        }
+    }
+
+    #[test]
+    fn declared_in_graph_json_tolerates_unparseable_text() {
+        assert_eq!(
+            ExecutionPriority::declared_in_graph_json(r#"{"priority":"high"}"#),
+            ExecutionPriority::High
+        );
+        assert_eq!(
+            ExecutionPriority::declared_in_graph_json("not json"),
+            ExecutionPriority::Normal
+        );
     }
 }

@@ -1382,3 +1382,61 @@ actually subscribes to — was missing from the table while the inert
 `<prefix>.jobs.priority` / `<prefix>.pipeline.jobs.priority` have NO subscriber;
 `talos.llm.stream.*` has no publisher; the engine's `WORKFLOW_NATS_PREFIX`
 defaults to `workflow` and every deployment overrides it to `talos`.
+
+## Package G — the priority label that was recorded on one path of three (2026-09-10, follow-up PR)
+
+**How it was found.** Verifying the #800 deploy, the NATS inventory's one
+remaining loose end was `<prefix>.jobs.priority`: a subject the dispatcher
+routes to when `JobRequest.priority >= 200` and no worker subscribes to. Tracing
+who could ever set 200 answered "nobody in Talos" — both engine dispatch sites
+hardcode `priority: 100` — and led to the operator-facing knob that sounded
+like it should: `set_workflow_priority`, whose description promised the value
+was "stored on execution records for visibility and dispatch ordering".
+
+**Measured.** Ordering: none, on any path (engine 100 everywhere; `.priority`
+subject reachable only from a library caller's builder, no subscriber; the
+worker's job loop has no priority handling; `JobRequest.priority` IS in the
+signed payload, so the field is honest on the wire and inert in the fleet).
+Visibility: of the NINE call sites that insert a `workflow_executions` row,
+three parsed the graph's `priority` key inline (the manual trigger,
+`test_workflow`, `test_workflow_draft`), FIVE passed `None` and so recorded
+`normal` whatever the workflow declared (the scheduler, the webhook router, and
+`call_workflow` / `bulk_trigger_workflow` / `enqueue_workflow` in the MCP
+handlers), and the GraphQL `testWorkflow` row omitted the column altogether —
+the same result by a different route, and the one this package's first count
+missed until the compiler enumerated the creators. A tenth function,
+`ExecutionRepository::create_test_execution`, had ZERO callers and bound an
+`Option<i32>` to a `text` column. The column has
+no CHECK constraint. The frontend selector writes the same graph key. On the
+reference fleet all 12,275 execution rows (live + archive) read `normal`, so
+every defect here was latent: nobody had set a priority, and the day someone
+did, a `high` workflow would have been recorded `high` when triggered by hand
+and `normal` when its schedule fired.
+
+**Decision.** One home for the vocabulary and the compiler as the sweep:
+`talos_workflow_repository::ExecutionPriority` (`High`/`Normal`/`Low`,
+`as_str`, exact-spelling `parse`, `declared_in_graph[_json]` → `Normal` on
+absent/invalid) and the five creators — four in the workflow repository, the
+GraphQL test row in the execution repository — take the enum instead of
+`Option<&str>` (or, for the GraphQL row, instead of nothing). A caller can no
+longer pass `None`; it derives the value from the graph it already holds —
+every live caller had one in scope — or writes `Normal` and means it. The three inline parses collapse into the one function; the MCP tool
+validates through the same `parse`; the description now says LABEL and says
+what does not happen. The dead integer-typed creator is deleted rather than
+fixed: check 88's PREPARE probe proves a statement PLANS, and a bind-type
+mismatch is invisible to a plan — the same limit the tag-cap finding recorded.
+
+**Deliberately NOT done: making the ordering real.** Mapping `high` → 200 would
+route those jobs to a NEW NATS subject, and during a rolling deploy (new
+controller, old workers) every high-priority workflow would fail with "no
+responders" until the fleet rolled; behind the worker's 100-permit semaphore a
+`biased` select would reorder almost nothing; and the `.priority` subjects
+would need subscribers, permission entries and a documented ordering contract.
+That is a product decision with fleet-wide blast radius. The honest change is
+the smaller one: the label is now recorded everywhere and described as a label.
+
+**Stated limits.** No DB test drives the scheduler or webhook creation path
+end to end — the guard on those two sites is the TYPE (there is no `None` to
+pass), plus the live read after deploy: set a workflow `high`, let its schedule
+fire, read the row. The frontend selector is unchanged (it writes the same key
+and makes no ordering claim in its labels).
