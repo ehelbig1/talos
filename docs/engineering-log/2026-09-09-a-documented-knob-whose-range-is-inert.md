@@ -242,3 +242,20 @@ executions will be dispatched with this priority" after #801 had corrected the
 tool's DESCRIPTION — the same false claim in the second of the two places it
 lived. The live check for #801 (set `high`, run through `call_workflow`, read
 the row: `high`) surfaced it, which is the argument for doing the live check.
+
+
+## Addendum 2026-09-11 — the truncation line is INFO
+
+Eight consecutive dev deploys on 2026-09-10/11 each produced exactly one
+controller WARN at boot, and it was this one: `rank_training_truncated cap=20000
+…`. The entry above declined an alert on this state because the cap is
+deliberately fixed and binds on every tick on any fleet with one busy actor,
+so an alert would fire permanently — check 69's trap. A WARN line on the same
+cadence is the same trap one level down: an operator who learns that the first
+WARN after every boot is noise has learned to skim WARN. The line is now INFO,
+every field intact (`lookback_inert`, `effective_lookback_days`,
+`lookback_shortfall_days`, `n_dropped`), and the machine-readable half —
+`talos_rank_training_fetches_total{coverage}` and the shortfall gauge — is
+what a dashboard or a future alert reads. The neighbouring
+"population count failed" WARN is unchanged: that is a read that did not
+answer, which is a finding, not a steady state.

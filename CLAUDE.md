@@ -1036,7 +1036,13 @@ the row counts.
   it can no longer be read alone.
 * **Nothing alerts on the new series**, argued: on a fleet with one busy actor
   the cap binds every tick forever, so an alert would fire permanently and train
-  operators to ignore it (check 69's trap). `talos_rank_training_fetches_total
+  operators to ignore it (check 69's trap). **The same argument applies to the
+  LOG LEVEL, and was applied 2026-09-11**: the `rank_training_truncated` line
+  was WARN at every tick and every boot — measured, the ONLY WARN a clean
+  controller boot produced on each of the last eight deploys — and is now INFO
+  with every disclosure field kept; the seeded counter pair and the shortfall
+  gauge are the signal anything reactive should read. The population-count
+  FAILURE beside it stays WARN: a read that did not answer is not a steady state. `talos_rank_training_fetches_total
   {coverage=complete|truncated}` is a closed compile-time PARTITION with **no
   `actor_id`** — caller-influenced, so it stays a log FIELD — both values
   pre-seeded. `talos_rank_training_lookback_shortfall_days` is the WORST case
