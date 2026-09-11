@@ -913,3 +913,36 @@ fn the_attempt_is_bound_into_the_event_hash() {
     relabelled.dispatch_attempt = 1;
     assert_eq!(relabelled.verify_signature(&[key]), Some(false));
 }
+
+/// The 2026-09-11 defect, as a test. A standalone dispatch (module-bound
+/// webhook / push) is signed on the wire with `workflow_execution_id = job_id`,
+/// so the WORKER seals its ledger under `genesis(job, job)`. `talos-engine`'s
+/// chain runner then rewrote `module_executions.workflow_execution_id` to the
+/// chain run it fired, and the verifier — which reads that column — expected
+/// `genesis(run, job)`: `GenesisMismatch` at sequence 1, "possible tampering",
+/// on every module-bound dispatch that fired a chain. The chain is untouched
+/// in both arms below; only the verifier's idea of the key space moves.
+#[test]
+fn a_chain_sealed_under_the_standalone_genesis_fails_under_a_reparented_one() {
+    let job = "2d369773-e36d-4258-9166-b6e37b447f4c";
+    let chain_run = "942a8b84-14c1-4332-98ba-0eb21694b36b";
+    let mut ledger = ExecutionLedger::new(job, job);
+    let e1 = ledger.append("worker", "execution_complete", "{\"total_events\":1}");
+    let events = vec![e1];
+
+    let under_contract = verify_chain(job, job, &events, &[]);
+    assert!(under_contract.ok, "{:?}", under_contract.breaks);
+    assert!(under_contract.breaks.is_empty());
+
+    let reparented = verify_chain(chain_run, job, &events, &[]);
+    assert!(!reparented.ok);
+    assert!(
+        matches!(
+            reparented.breaks.as_slice(),
+            [ChainBreak::GenesisMismatch { seq: 1, .. }]
+        ),
+        "moving the key space under a sealed chain reads as tampering: {:?}",
+        reparented.breaks
+    );
+    assert!(reparented.breaks[0].is_tamper_evidence());
+}

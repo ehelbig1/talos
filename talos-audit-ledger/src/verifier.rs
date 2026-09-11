@@ -489,9 +489,9 @@ pub struct ChainSweepSnapshot {
     /// and is counted in `verified_ok`.
     pub multi_attempt: usize,
     pub errored: usize,
-    /// Jobs with no `workflow_execution_id`, so no genesis pair and no
-    /// attempt. Disclosed, never folded into a clean count.
-    pub unbound: usize,
+    /// Jobs with no `workflow_execution_id` — standalone dispatches, verified
+    /// under the `(job_id, job_id)` genesis and disclosed as a count.
+    pub standalone: usize,
     pub cap_hit: bool,
     pub aborted: Option<ChainVerifyErrorKind>,
     /// The same pass rolled up to WORKFLOW EXECUTIONS, worst outcome wins —
@@ -741,7 +741,7 @@ mod verifier_tests {
             duplicate_delivery: 0,
             multi_attempt: 0,
             errored: 1,
-            unbound: 0,
+            standalone: 0,
             cap_hit: false,
             aborted: Some(ChainVerifyErrorKind::AccessDenied),
             rollup: crate::population::WorkflowExecutionRollup {

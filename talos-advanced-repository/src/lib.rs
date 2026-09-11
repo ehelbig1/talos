@@ -423,6 +423,7 @@ pub const ARCHIVED_EXECUTION_COLUMNS: &[&str] = &[
     "org_id",
     "checkpoint_seq",
     "epoch",
+    "triggered_by_module_execution_id",
 ];
 
 /// Statuses an execution must be in before it may be moved or purged.

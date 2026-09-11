@@ -6475,6 +6475,9 @@ async fn handle_get_execution_lineage(
                 "execution_id": n.id.to_string(),
                 "parent_execution_id": n.parent_execution_id.map(|p| p.to_string()),
                 "root_execution_id": n.root_execution_id.map(|r| r.to_string()),
+                // A module → run edge (a workflow CHAIN fired by that module
+                // execution), distinct from the run → run parent edge above.
+                "chain_trigger_module_execution_id": n.triggered_by_module_execution_id.map(|m| m.to_string()),
                 "workflow_id": n.workflow_id,
                 "status": n.status,
                 "trigger_type": n.trigger_type,
@@ -6565,6 +6568,10 @@ fn anchor_lineage_node(
         workflow_id: base.workflow_id.clone(),
         trigger_type: base.trigger_type.clone(),
         actor_id: base.actor_id.clone(),
+        // The anchor fallback carries no chain provenance: `ExecutionBase` is
+        // the stable-column projection, and the link is rendered from the
+        // lineage read, not from here.
+        triggered_by_module_execution_id: None,
         archived_at,
     }
 }

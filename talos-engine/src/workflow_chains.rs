@@ -274,6 +274,52 @@ pub fn plan_workflow_chain(graph: &Value, trigger_module_id: Uuid) -> ChainPlan 
     }
 }
 
+/// The chain run's `workflow_executions` row, recording WHICH module execution
+/// fired it on the run's own row (`triggered_by_module_execution_id`).
+///
+/// Until 2026-09-11 this link was written the other way round — `UPDATE
+/// module_executions SET workflow_execution_id = <chain run> WHERE id =
+/// <trigger>` — and that rewrite broke the WORM audit ledger's key space: the
+/// worker seals a job's chain under `genesis_hash(workflow_execution_id, job_id)`
+/// with the ids ON THE WIRE, and a standalone (module-bound webhook / push)
+/// dispatch is signed with `workflow_execution_id = job_id`. Re-parenting the
+/// row after the seal made the verifier expect `genesis(chain_run, job)` where
+/// the worker had written `genesis(job, job)`, so every module-bound dispatch
+/// that fired a chain verified as `genesis_mismatch` — "possible tampering" —
+/// on a `critical`-guarded control (3 of 3 such rows in the 30-day window,
+/// every one of the fleet's post-partition chain-verification failures).
+///
+/// `module_executions.workflow_execution_id` is therefore WRITE-ONCE: the
+/// value the dispatch carried is the value the ledger was sealed under, and
+/// nothing may move it afterwards. `ON CONFLICT DO NOTHING` because the
+/// trigger-error and engine-error paths upsert the same id with a terminal
+/// status and must win whatever the spawn ordering.
+pub async fn insert_chain_execution_row(
+    pool: &sqlx::Pool<sqlx::Postgres>,
+    execution_id: Uuid,
+    workflow_id: Uuid,
+    user_id: Uuid,
+    effective_actor_id: Option<Uuid>,
+    triggered_by_module_execution_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    // Phase D2: stamp the gate-resolved actor so row attribution matches the
+    // engine binding (pre-fix the DB trigger filled the user's DEFAULT actor
+    // and per-actor budget COUNTs never saw chain runs).
+    sqlx::query(
+        "INSERT INTO workflow_executions \
+             (id, workflow_id, user_id, actor_id, status, started_at, triggered_by_module_execution_id) \
+         VALUES ($1, $2, $3, $4, 'running', NOW(), $5) ON CONFLICT DO NOTHING",
+    )
+    .bind(execution_id)
+    .bind(workflow_id)
+    .bind(user_id)
+    .bind(effective_actor_id)
+    .bind(triggered_by_module_execution_id)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
 /// Find all workflows that contain `trigger_module_id` and execute their
 /// downstream nodes in-process, with `event_data` pre-seeded as the trigger
 /// module's output.
@@ -987,22 +1033,14 @@ async fn run_single_workflow_chain(
         let pool = db_pool.clone();
         let trigger_exec_id = trigger_execution_id;
         tokio::spawn(async move {
-            // Phase D2: stamp the gate-resolved actor so row attribution
-            // matches the engine binding. Pre-fix the column was omitted and
-            // the DB auto-stamp trigger filled the user's DEFAULT actor even
-            // when the chain ran as the workflow's own actor — so per-actor
-            // budget COUNTs (WHERE actor_id = $1) never saw chain runs and
-            // the bound actor's caps were under-enforced on the
-            // highest-amplification dispatch path.
-            if let Err(db_err) = sqlx::query(
-                "INSERT INTO workflow_executions (id, workflow_id, user_id, actor_id, status, started_at) \
-                 VALUES ($1, $2, $3, $4, 'running', NOW()) ON CONFLICT DO NOTHING",
+            if let Err(db_err) = insert_chain_execution_row(
+                &pool,
+                execution_id,
+                workflow_id,
+                user_id,
+                effective_actor_id,
+                trigger_exec_id,
             )
-            .bind(execution_id)
-            .bind(workflow_id)
-            .bind(user_id)
-            .bind(effective_actor_id)
-            .execute(&pool)
             .await
             {
                 tracing::warn!(
@@ -1011,26 +1049,9 @@ async fn run_single_workflow_chain(
                     op = "insert_workflow_execution",
                     %execution_id,
                     %workflow_id,
-                    error = %db_err,
-                    "Failed to insert workflow_executions row for chain dispatch"
-                );
-            }
-            // Link the trigger's module execution to this workflow execution
-            if let Err(db_err) =
-                sqlx::query("UPDATE module_executions SET workflow_execution_id = $1 WHERE id = $2")
-                    .bind(execution_id)
-                    .bind(trigger_exec_id)
-                    .execute(&pool)
-                    .await
-            {
-                tracing::warn!(
-                    target: "talos_engine",
-                    event_kind = "chain_dispatch_db_error",
-                    op = "link_trigger_execution",
-                    %execution_id,
                     %trigger_exec_id,
                     error = %db_err,
-                    "Failed to link trigger module_execution to chain workflow_execution"
+                    "Failed to insert workflow_executions row for chain dispatch"
                 );
             }
         })
@@ -1054,8 +1075,8 @@ async fn run_single_workflow_chain(
         // ordering; the spawned INSERT's `ON CONFLICT DO NOTHING` then preserves
         // it. The conflict-update WHERE keeps the existing terminal-state guard.
         if let Err(db_err) = sqlx::query(
-            "INSERT INTO workflow_executions (id, workflow_id, user_id, actor_id, status, started_at, completed_at, error_message) \
-             VALUES ($2, $3, $4, $5, 'failed', NOW(), NOW(), $1) \
+            "INSERT INTO workflow_executions (id, workflow_id, user_id, actor_id, status, started_at, completed_at, error_message, triggered_by_module_execution_id) \
+             VALUES ($2, $3, $4, $5, 'failed', NOW(), NOW(), $1, $6) \
              ON CONFLICT (id) DO UPDATE SET status = 'failed', completed_at = NOW(), error_message = $1 \
              WHERE workflow_executions.status NOT IN ('completed', 'failed', 'cancelled', 'resuming')"
         )
@@ -1064,6 +1085,7 @@ async fn run_single_workflow_chain(
         .bind(workflow_id)
         .bind(user_id)
         .bind(effective_actor_id)
+        .bind(trigger_execution_id)
         .execute(db_pool)
         .await {
             tracing::error!("Database operation failed in engine: {}", db_err);
@@ -1153,8 +1175,8 @@ async fn run_single_workflow_chain(
             // UPDATE could orphan the row at `'running'`. Upsert is correct in
             // either ordering.
             if let Err(db_err) = sqlx::query(
-                "INSERT INTO workflow_executions (id, workflow_id, user_id, actor_id, status, started_at, completed_at, error_message) \
-                 VALUES ($2, $3, $4, $5, 'failed', NOW(), NOW(), $1) \
+                "INSERT INTO workflow_executions (id, workflow_id, user_id, actor_id, status, started_at, completed_at, error_message, triggered_by_module_execution_id) \
+                 VALUES ($2, $3, $4, $5, 'failed', NOW(), NOW(), $1, $6) \
                  ON CONFLICT (id) DO UPDATE SET status = 'failed', completed_at = NOW(), error_message = $1 \
                  WHERE workflow_executions.status NOT IN ('completed', 'failed', 'cancelled', 'resuming')"
             )
@@ -1163,6 +1185,7 @@ async fn run_single_workflow_chain(
             .bind(workflow_id)
             .bind(user_id)
             .bind(effective_actor_id)
+            .bind(trigger_execution_id)
             .execute(db_pool)
             .await {
     tracing::error!("Database operation failed in engine: {}", db_err);
