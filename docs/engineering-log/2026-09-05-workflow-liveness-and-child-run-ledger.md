@@ -1146,3 +1146,36 @@ on `child.total == 0`; passing `total_u` to the sufficiency closure; emitting th
 wider-population clause unconditionally. **No lint** — the population is one renderer
 and the guard is four unit tests over the real pure function; `--count` moves to 87
 for leg X1's check only.
+
+
+## Addendum 2026-09-11 — the brief recommended a no-op, first thing, every session
+
+`get_draft_workflows` was left child-blind on the argument, written into its
+doc comment, that its only consumer "takes no destructive action and whose
+worst advice is 'publish it': a no-op for a child". That sentence described
+the worst advice accurately and then shipped it: on the reference fleet every
+`session_start` opened with `priority_action: "You have 1 substantive draft
+workflow(s) ready for publish_version"`, naming `cos-team-recall`, a
+sub-workflow of `pa-chief-of-staff` that runs daily and whose `draft` status
+is not a runtime fact (the parent dispatches the `graph_json` column with no
+version join). The hygiene report, on the same platform, listed the same row
+with `excluded_from_cleanup_reason` and a note that publishing changes
+nothing. Two surfaces, one row, opposite advice — the `two_surfaces_contradict`
+shape, found by reading the brief's own output while verifying a deploy.
+
+The read stays child-blind (the report/decision split stands) and the brief
+now runs the same child scan the archive sweep uses over the five ids it is
+about to list. A child is still LISTED — the hygiene report's rule, hiding it
+would be a different misleading report — with `child_status: "child"`,
+`publish_is_no_op: true`, `runs_as_child_of` and a `next_step` that says what
+is true; it never counts toward the publish nudge, and when every substantive
+draft is a child the nudge falls through to the next priority. A scan that
+FAILED is disclosed on every entry as `child_status: "unknown"` and the nudge
+is kept with the caveat in `next_step` — the failure mode of a scan that did
+not answer must not be "the nudge quietly vanished", which is the swallowed-
+read class. An unreadable parent that MENTIONS the id renders unknown too,
+never "not a child". Three DB tests carry controls: the non-child shaped draft
+beside the child keeps its recommendation and its count; and a child whose
+parent is ARCHIVED is publishable again, because the scan's parent predicate
+is `talos_workflow_liveness::dispatchable_sql` — the shared home, so the brief
+and the dispatch gate cannot disagree about whether that parent still runs.

@@ -9379,6 +9379,7 @@ dependencies = [
  "chrono",
  "serde_json",
  "talos-advanced-repository",
+ "talos-child-workflow-refs",
  "talos-hygiene-service",
  "talos-search-service",
  "thiserror 1.0.69",

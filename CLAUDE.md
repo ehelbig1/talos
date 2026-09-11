@@ -444,7 +444,19 @@ carried two facts under one reading: `readiness_computed_at` vs
   a DECISION, argued in the RPC-layer section above, not a remainder.
 * `AdvancedRepository::get_draft_workflows` is deliberately left child-blind
   (report-only, no destructive action) and carries no lint marker; the reasoning
-  is in its own doc comment. **Deliberately NO force flag** on the auto-archive
+  is in its own doc comment. **Its consumer is no longer child-blind (2026-09-11):**
+  the reasoning had said the display's "worst advice is publish it: a no-op for a
+  child" — and that no-op was `session_start`'s `priority_action` on every
+  session of the reference fleet (`cos-team-recall`, child of
+  `pa-chief-of-staff`), while the hygiene report beside it said the opposite.
+  The brief now runs the child scan over the ≤5 listed drafts and ANNOTATES
+  (`child_status`, `publish_is_no_op`, `runs_as_child_of`, a truthful
+  `next_step`) rather than hides; children never count toward the publish
+  nudge; a failed scan renders `child_status: "unknown"` on every entry and
+  keeps the nudge, never a silent "not a child". Pinned by three DB tests with
+  controls (a non-child shaped draft keeps the recommendation; a child of an
+  ARCHIVED parent is publishable again, because the scan's parent predicate is
+  the shared liveness home). **Deliberately NO force flag** on the auto-archive
   sweep, mirroring `fix_all` — the escape hatch is an explicit operator action.
 * **30 + 30 = 60 days** is the execution lifetime and is kept deliberately
   (decision 2026-09-06); `get_archive_policy` renders both tiers from

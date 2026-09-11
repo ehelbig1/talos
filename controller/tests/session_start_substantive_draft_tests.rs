@@ -337,6 +337,159 @@ async fn an_unreadable_graph_is_held_back_under_its_own_reason() {
     );
 }
 
+// ──────────── The display must not recommend a no-op for a child ────────────
+
+/// A shaped draft an enabled parent dispatches into is STILL LISTED under
+/// `unpublished_substantive_drafts` — hiding it would be a different misleading
+/// report — but its `next_step` no longer says `publish_version`, because a
+/// parent dispatches the draft's `graph_json` column directly and publishing
+/// changes nothing at runtime. Until 2026-09-11 this row was the fleet's
+/// `priority_action` on every session (`cos-team-recall`, child of
+/// `pa-chief-of-staff`). The control lives in the same brief: a shaped draft
+/// nobody dispatches into keeps the publish recommendation and the count.
+#[tokio::test]
+async fn a_shaped_child_is_listed_as_not_publishable_and_not_counted() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let user = seed_user(&pool).await;
+    let child = seed_draft(&pool, user, "cos-team-recall", SHAPED_GRAPH).await;
+    seed_workflow(
+        &pool,
+        user,
+        "pa-chief-of-staff",
+        &sub_workflow_graph(child),
+        "published",
+    )
+    .await;
+    let orphan = seed_draft(&pool, user, "weekly-numbers", SHAPED_GRAPH).await;
+
+    let report = brief(&pool, user, None).await;
+    let listed = ids_in(&report, "unpublished_substantive_drafts");
+    assert!(
+        listed.contains(&child.to_string()),
+        "the child must stay LISTED: {report:#}"
+    );
+    assert!(listed.contains(&orphan.to_string()));
+
+    let entry_for = |id: Uuid| -> serde_json::Value {
+        report["unpublished_substantive_drafts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["workflow_id"] == id.to_string())
+            .cloned()
+            .expect("entry present")
+    };
+    let child_entry = entry_for(child);
+    assert_eq!(child_entry["child_status"], "child");
+    assert_eq!(child_entry["publish_is_no_op"], true);
+    assert_eq!(
+        child_entry["runs_as_child_of"],
+        serde_json::json!(["pa-chief-of-staff"])
+    );
+    let step = child_entry["next_step"].as_str().unwrap();
+    assert!(
+        !step.starts_with("publish_version"),
+        "a child must not be told to publish: {step}"
+    );
+    assert!(step.contains("changes nothing at runtime"), "{step}");
+    assert!(child_entry["child_note"].is_string());
+
+    // Control: the orphan is unchanged by the child logic.
+    let orphan_entry = entry_for(orphan);
+    assert_eq!(orphan_entry["child_status"], "not_a_child");
+    assert_eq!(orphan_entry["publish_is_no_op"], false);
+    assert!(orphan_entry["next_step"]
+        .as_str()
+        .is_some_and(|s| s.starts_with("publish_version")));
+    assert!(orphan_entry.get("runs_as_child_of").is_none());
+
+    // The nudge's two inputs are rendered, and the child is in the second
+    // only. (`priority_action` itself may be outranked this session — in this
+    // harness by the unconfigured embedding provider — so the counts are what
+    // the test pins; the text is checked only when drafts ARE the priority.)
+    assert_eq!(
+        report["publishable_substantive_draft_count"], 1,
+        "{report:#}"
+    );
+    assert_eq!(report["child_substantive_draft_count"], 1, "{report:#}");
+    let pa = report["priority_action"].as_str().unwrap();
+    if pa.contains("ready for publish_version") {
+        assert!(pa.contains("1 substantive draft"), "{pa}");
+        assert!(pa.contains("1 more are sub-workflow children"), "{pa}");
+    }
+}
+
+/// When the ONLY substantive draft is a child, "ready for publish_version" is
+/// not the session's priority at all — the nudge falls through to whatever is
+/// next. The pre-fix brief made this the top line of every session on the
+/// reference fleet.
+#[tokio::test]
+async fn a_lone_shaped_child_does_not_become_the_priority_action() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let user = seed_user(&pool).await;
+    let child = seed_draft(&pool, user, "cos-team-recall", SHAPED_GRAPH).await;
+    seed_workflow(
+        &pool,
+        user,
+        "pa-chief-of-staff",
+        &sub_workflow_graph(child),
+        "published",
+    )
+    .await;
+
+    let report = brief(&pool, user, None).await;
+    assert_eq!(
+        ids_in(&report, "unpublished_substantive_drafts"),
+        vec![child.to_string()],
+        "still listed"
+    );
+    // Non-vacuous whatever outranks drafts in this harness: the counts say
+    // there is nothing publishable, and the nudge text — if drafts were the
+    // priority — could not have been the publish one.
+    assert_eq!(
+        report["publishable_substantive_draft_count"], 0,
+        "{report:#}"
+    );
+    assert_eq!(report["child_substantive_draft_count"], 1, "{report:#}");
+    let pa = report["priority_action"].as_str().unwrap_or("");
+    assert!(
+        !pa.contains("ready for publish_version"),
+        "a child-only draft list must not produce the publish nudge: {pa}"
+    );
+}
+
+/// A parent that is ARCHIVED does not make its former child a child: the
+/// scan's parent predicate is `talos_workflow_liveness::dispatchable_sql`, and
+/// since 2026-09-07 an archived workflow is refused at every dispatch path. The
+/// draft is therefore genuinely publishable again, and says so.
+#[tokio::test]
+async fn a_child_of_a_retired_parent_is_publishable_again() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let user = seed_user(&pool).await;
+    let child = seed_draft(&pool, user, "cos-team-recall", SHAPED_GRAPH).await;
+    seed_workflow(
+        &pool,
+        user,
+        "pa-chief-of-staff",
+        &sub_workflow_graph(child),
+        "archived",
+    )
+    .await;
+
+    let report = brief(&pool, user, None).await;
+    let entry = &report["unpublished_substantive_drafts"][0];
+    assert_eq!(entry["workflow_id"], child.to_string());
+    assert_eq!(entry["child_status"], "not_a_child");
+    assert!(entry["next_step"]
+        .as_str()
+        .is_some_and(|s| s.starts_with("publish_version")));
+    assert_eq!(
+        report["publishable_substantive_draft_count"], 1,
+        "{report:#}"
+    );
+    assert_eq!(report["child_substantive_draft_count"], 0, "{report:#}");
+}
+
 // ─────────────────────────── Positive controls ───────────────────────────
 
 /// The sweep still does its job on a fleet of pure scaffolding, and says
