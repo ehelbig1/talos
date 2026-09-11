@@ -55,12 +55,12 @@ async fn queued_execution_requires_running_promotion_before_completion() {
             exec_id,
             workflow_id,
             user_id,
-            None,           // version_id
-            Some("normal"), // priority
-            Some(actor_id), // actor_id
-            None,           // provenance
-            None,           // parent_execution_id
-            None,           // root_execution_id
+            None,                                                 // version_id
+            talos_workflow_repository::ExecutionPriority::Normal, // priority
+            Some(actor_id),                                       // actor_id
+            None,                                                 // provenance
+            None,                                                 // parent_execution_id
+            None,                                                 // root_execution_id
             InitialExecutionStatus::Queued,
         )
         .await
@@ -144,8 +144,8 @@ async fn get_execution_decodes_text_priority_column() {
         exec_id,
         workflow_id,
         user_id,
-        None,           // version_id
-        Some("high"),   // priority: TEXT enum, not an integer
+        None,                                               // version_id
+        talos_workflow_repository::ExecutionPriority::High, // priority: the typed vocabulary, not an integer
         Some(actor_id), // actor_id (NOT NULL post-universalization)
         None,           // provenance
         None,           // parent_execution_id

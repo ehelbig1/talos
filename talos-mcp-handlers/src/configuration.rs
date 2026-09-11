@@ -589,7 +589,11 @@ async fn handle_set_workflow_priority(
     let priority = match args.get("priority") {
         None => return mcp_error(req_id, -32602, "Missing required 'priority' parameter"),
         Some(v) => match v.as_str() {
-            Some(p) if p == "high" || p == "normal" || p == "low" => p.to_string(),
+            // One home for the vocabulary: the same enum every execution-creating
+            // path reads the graph key through (`ExecutionPriority`).
+            Some(p) if talos_workflow_repository::ExecutionPriority::parse(p).is_some() => {
+                p.to_string()
+            }
             Some(other) => {
                 return mcp_error(
                     req_id,
@@ -636,7 +640,10 @@ async fn handle_set_workflow_priority(
 
     let mut graph: serde_json::Value = serde_json::from_str(&gj).unwrap_or(serde_json::json!({}));
     if let Some(obj) = graph.as_object_mut() {
-        obj.insert("priority".to_string(), serde_json::json!(priority));
+        obj.insert(
+            talos_workflow_repository::ExecutionPriority::GRAPH_KEY.to_string(),
+            serde_json::json!(priority),
+        );
     }
     let updated = graph.to_string();
     // MCP-1226 (2026-05-18): mirror the `save_graph_json` chokepoint

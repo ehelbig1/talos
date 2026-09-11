@@ -43,7 +43,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "set_workflow_priority",
-            "description": "Set the execution priority for a workflow. Priority is stored on execution records for visibility and dispatch ordering.",
+            "description": "Set the workflow's declared priority ('high' | 'normal' | 'low'). It is stored as a top-level `priority` key on the workflow graph and copied onto EVERY execution record the workflow produces — manual, scheduled, webhook, call_workflow, bulk and enqueue paths alike (until 2026-09-10 only the manual trigger and the two test tools copied it; scheduled, webhook, call_workflow, bulk and enqueue runs were recorded 'normal' regardless). It is a LABEL: list_executions shows it and you can filter on it. It does NOT order dispatch — the bus has no priority, the engine dispatches every job at the same priority, and the worker has no priority handling. Nothing runs sooner or later because of this value.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

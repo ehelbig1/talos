@@ -1873,7 +1873,10 @@ async fn run_scheduled_execution(
             workflow_id,
             user_id,
             resolved_version_id, // the active published version (or None when running the draft fallback)
-            None,                // priority — defaults to "normal"
+            // The priority the graph declares. Until 2026-09-10 this was `None`,
+            // so a scheduled run of a `high` workflow was recorded `normal` while
+            // the same workflow triggered by hand was recorded `high`.
+            talos_workflow_repository::ExecutionPriority::declared_in_graph_json(&graph_json),
             // Phase D2: the gate-resolved actor (default-actor fallback
             // included) so the row's attribution matches the runtime tier
             // instead of relying on the DB auto-stamp trigger to fill NULL.

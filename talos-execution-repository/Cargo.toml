@@ -22,6 +22,10 @@ talos-metrics = { path = "../talos-metrics" }
 talos-module-payload-encryption = { path = "../talos-module-payload-encryption" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 talos-text-util = { path = "../talos-text-util" }
+# `ExecutionPriority` — the one home for the `workflow_executions.priority`
+# vocabulary; the GraphQL test row below writes the same column the workflow
+# repository's creators do and must not re-spell it.
+talos-workflow-repository = { path = "../talos-workflow-repository" }
 tokio = { version = "1", features = ["sync", "rt", "macros"] }
 tracing.workspace = true
 uuid.workspace = true

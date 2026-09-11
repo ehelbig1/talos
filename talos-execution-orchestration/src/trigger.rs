@@ -399,16 +399,15 @@ impl ExecutionOrchestrationService {
 
         // 11. Mint the execution row. `execution_id` was generated above
         // (step 8) so provenance recording could reference it; the row
-        // INSERT below uses that same id. Priority comes from the graph
-        // metadata if present, defaulting to "normal".
-        let priority = graph_val
-            .as_ref()
-            .and_then(|v| {
-                v.get("priority")
-                    .and_then(|p| p.as_str())
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or_else(|| "normal".to_string());
+        // INSERT below uses that same id. Priority is the value the graph
+        // declares (`set_workflow_priority` / the builder's selector), read
+        // through the one home for that vocabulary — until 2026-09-10 this
+        // path parsed the key inline while the scheduler and webhook paths
+        // recorded `normal` unconditionally.
+        let priority = graph_val.as_ref().map_or(
+            talos_workflow_repository::ExecutionPriority::Normal,
+            talos_workflow_repository::ExecutionPriority::declared_in_graph,
+        );
         let trigger_provenance = trigger_agent_id.map(|a| {
             serde_json::json!({
                 "actor_id": a,
@@ -427,7 +426,7 @@ impl ExecutionOrchestrationService {
                 workflow_id,
                 user_id,
                 version_id,
-                Some(&priority),
+                priority,
                 effective_actor,
                 trigger_provenance.as_ref(),
                 parent_execution_id,
@@ -494,7 +493,7 @@ impl ExecutionOrchestrationService {
                 Some(serde_json::json!({
                     "execution_id": execution_id,
                     "trigger_type": trigger_type_str,
-                    "priority": priority,
+                    "priority": priority.as_str(),
                 })),
             );
         }

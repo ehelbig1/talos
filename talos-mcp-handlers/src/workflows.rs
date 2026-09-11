@@ -3288,17 +3288,11 @@ async fn handle_test_workflow_draft(
     }
 
     let exec_id = uuid::Uuid::new_v4();
-    let priority = serde_json::from_str::<serde_json::Value>(&graph_json)
-        .ok()
-        .and_then(|v| {
-            v.get("priority")
-                .and_then(|p| p.as_str())
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_else(|| "normal".to_string());
+    let priority =
+        talos_workflow_repository::ExecutionPriority::declared_in_graph_json(&graph_json);
     if let Err(e) = state
         .workflow_repo
-        .create_execution(exec_id, wf_id, user_id, None, Some(&priority), None, None)
+        .create_execution(exec_id, wf_id, user_id, None, priority, None, None)
         .await
     {
         tracing::error!(execution_id = %exec_id, "Failed to create execution record: {}", e);
@@ -5358,7 +5352,7 @@ async fn handle_call_workflow(
             wf_id,
             user_id,
             version_id,
-            None,
+            talos_workflow_repository::ExecutionPriority::declared_in_graph_json(&graph_json),
             // The SAME value the engine is built with, twelve lines below.
             // Passing `None` here left the row's actor to the BEFORE-INSERT
             // trigger and also skipped the atomic actor-budget backstop that
@@ -6577,7 +6571,7 @@ async fn handle_bulk_trigger_workflow(
                 wf_id,
                 user_id,
                 version_id,
-                None,
+                talos_workflow_repository::ExecutionPriority::declared_in_graph_json(&graph_json),
                 // Same value the per-input engine is built with, below. The
                 // per-actor advisory lock inside this call is what makes the
                 // batch's own budget accounting atomic — with `None` the
@@ -7042,7 +7036,7 @@ async fn handle_trigger_workflow_as_actors(
                 wf_id,
                 user_id,
                 version_id,
-                None,
+                talos_workflow_repository::ExecutionPriority::declared_in_graph_json(&graph_json),
                 Some(actor_id),
                 None,
                 None,
@@ -7851,13 +7845,11 @@ async fn handle_test_workflow(
 
     // Create execution record with test flag
     let exec_id = uuid::Uuid::new_v4();
-    let priority_str = serde_json::from_str::<serde_json::Value>(&graph_json)
-        .ok()
-        .and_then(|v| v.get("priority").and_then(|p| p.as_str()).map(String::from))
-        .unwrap_or_else(|| "normal".to_string());
+    let priority =
+        talos_workflow_repository::ExecutionPriority::declared_in_graph_json(&graph_json);
     if let Err(e) = state
         .workflow_repo
-        .create_test_execution(exec_id, wf_id, user_id, version_id, &priority_str)
+        .create_test_execution(exec_id, wf_id, user_id, version_id, priority)
         .await
     {
         tracing::error!(execution_id = %exec_id, "test_workflow: failed to create execution record: {}", e);

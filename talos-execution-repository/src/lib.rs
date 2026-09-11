@@ -2069,41 +2069,6 @@ impl ExecutionRepository {
         Ok(())
     }
 
-    /// Test execution — sets is_test_execution = true.
-    pub async fn create_test_execution(
-        &self,
-        exec_id: Uuid,
-        wf_id: Uuid,
-        user_id: Uuid,
-        version_id: Option<Uuid>,
-        priority: Option<i32>,
-    ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO workflow_executions \
-             (id, workflow_id, user_id, status, started_at, workflow_version_id, is_test_execution, priority) \
-             VALUES ($1, $2, $3, 'running', NOW(), $4, true, $5)",
-        )
-        .bind(exec_id)
-        .bind(wf_id)
-        .bind(user_id)
-        .bind(version_id)
-        .bind(priority)
-        .execute(&self.db_pool)
-        .await?;
-
-        if let Some(ref tx) = self.workflow_execution_tx {
-            let _ = tx.send(talos_engine_events::WorkflowExecutionEvent {
-                workflow_id: wf_id,
-                execution_id: exec_id,
-                user_id,
-                status: "running".to_string(),
-                started_at: chrono::Utc::now().to_rfc3339(),
-                error_message: None,
-            });
-        }
-        Ok(())
-    }
-
     // ── Status updates ─────────────────────────────────────────────────────
 
     /// Reset execution back to running (used by retry — clears error/output/completed_at).
@@ -3903,26 +3868,31 @@ impl ExecutionRepository {
 
     /// Insert the GraphQL `testWorkflow` execution row: status 'running',
     /// `is_test_execution = true`, attributed to the resolved effective
-    /// actor. Distinct from `create_test_execution` (the MCP shape, which
-    /// stamps started_at/version/priority and fires the execution-event
-    /// broadcast — the GraphQL path emits its own events). Bare pool by
-    /// design: the row is stamped with the authenticated user_id for a
-    /// workflow already gated by workflow_accessible_for_user +
-    /// authorize_workflow_trigger.
+    /// actor, carrying the priority the graph declares. Distinct from
+    /// `WorkflowRepository::create_test_execution` (the MCP shape, which also
+    /// stamps started_at/version and fires the execution-event broadcast —
+    /// the GraphQL path emits its own events). Until 2026-09-10 this INSERT
+    /// omitted `priority`, so every GraphQL test run was recorded `normal`
+    /// whatever the workflow declared; the typed parameter is what stops a
+    /// caller silently defaulting it. Bare pool by design: the row is
+    /// stamped with the authenticated user_id for a workflow already gated
+    /// by workflow_accessible_for_user + authorize_workflow_trigger.
     pub async fn insert_test_execution_row(
         &self,
         execution_id: Uuid,
         workflow_id: Uuid,
         user_id: Uuid,
         actor_id: Option<Uuid>,
+        priority: talos_workflow_repository::ExecutionPriority,
     ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO workflow_executions (id, workflow_id, user_id, status, is_test_execution, actor_id) VALUES ($1, $2, $3, 'running', true, $4)",
+            "INSERT INTO workflow_executions (id, workflow_id, user_id, status, is_test_execution, actor_id, priority) VALUES ($1, $2, $3, 'running', true, $4, $5)",
         )
         .bind(execution_id)
         .bind(workflow_id)
         .bind(user_id)
         .bind(actor_id)
+        .bind(priority.as_str())
         .execute(&self.db_pool)
         .await?;
         Ok(())
