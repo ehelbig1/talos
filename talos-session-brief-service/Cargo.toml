@@ -16,6 +16,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # Talos crates — repositories
 talos-advanced-repository = { path = "../talos-advanced-repository" }
+# `ChildProtection` — to render WHICH kind of child a listed draft is; the
+# scan itself runs through the advanced repository.
+talos-child-workflow-refs = { path = "../talos-child-workflow-refs" }
 
 # Talos crates — services (embedding-provider health probe; shared
 # draft-substantiveness heuristics live in talos-hygiene-service so

@@ -2619,11 +2619,16 @@ impl AdvancedRepository {
     /// [`Self::archive_stale_drafts_excluding_children`], so it can list a
     /// workflow an enabled parent runs daily — but its only consumer is
     /// `session_start`'s `in_progress_drafts` / `unpublished_substantive_drafts`
-    /// display, which takes no destructive action and whose worst advice is
-    /// "publish it": a no-op for a child, since a parent dispatches the
-    /// `graph_json` COLUMN with no version join and no status filter. The
-    /// exclusion exists to keep a live child out of DELETE and ARCHIVE sets,
-    /// not to hide it from an operator's list.
+    /// display, which takes no destructive action. Until 2026-09-11 that
+    /// display's worst advice was "publish it" — a no-op for a child, since a
+    /// parent dispatches the `graph_json` COLUMN with no version join and no
+    /// status filter — and it was the brief's `priority_action`, i.e. the
+    /// first thing every session told the operator to do. The brief now runs
+    /// [`Self::scan_child_parents_for`] over the listed ids and ANNOTATES a
+    /// child (still listed — hiding it would be a different misleading
+    /// report) rather than recommending the no-op. The exclusion in the
+    /// archive method exists to keep a live child out of DELETE and ARCHIVE
+    /// sets, not to hide it from an operator's list.
     ///
     /// Lint check 85 is FILE-scoped on leg (a), so the archive method above
     /// vouches for this file and leg (a) is silent here; leg (b) does not
@@ -2632,6 +2637,23 @@ impl AdvancedRepository {
     /// deliberately no `allow-execution-blind-draft-path:` marker: leg (a)
     /// matches it file-globally, so adding one would blind the whole file
     /// including the destructive method beside it.
+    /// Which of `candidates` an enabled, non-retired parent dispatches into
+    /// (or MIGHT — an unreadable parent graph that mentions the id is reported
+    /// as unknown, never as "no"). Thin wrapper over the one chokepoint,
+    /// `talos_child_workflow_refs::scan_child_parents`, for callers that hold
+    /// this repository and not a pool. An `Err` must be DISCLOSED by the
+    /// caller, never defaulted to an empty scan — an empty scan reads as
+    /// "nobody is anybody's child", which is the pre-fix behaviour.
+    pub async fn scan_child_parents_for(
+        &self,
+        user_id: Uuid,
+        candidates: &[Uuid],
+    ) -> Result<talos_child_workflow_refs::ChildReferenceScan> {
+        talos_child_workflow_refs::scan_child_parents(&self.db_pool, user_id, candidates)
+            .await
+            .context("child-reference scan for the session brief's draft list")
+    }
+
     pub async fn get_draft_workflows(&self, user_id: Uuid) -> Result<Vec<DraftWorkflowRow>> {
         // RFC 0005 S3: self-scope (workflows + workflow_executions backstop).
         let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;

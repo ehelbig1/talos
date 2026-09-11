@@ -201,6 +201,39 @@ impl SessionBriefService {
         //   - any node has OUTPUT_SCHEMA configured (structured output authored)
         //   - any node has retry_count / retry_condition / retry_delay_expression
         //   - any node has description / skip_condition / continue_on_error set
+        // Which of the drafts about to be listed is somebody's CHILD. The
+        // list's own premise ("never executed") is blind to a sub-workflow —
+        // it runs in-process and leaves no `workflow_executions` row — and
+        // the hygiene report has said so beside the same row since #760. This
+        // brief did not: until 2026-09-11 it listed the fleet's one live
+        // child, `cos-team-recall`, under `unpublished_substantive_drafts`
+        // with `next_step: publish_version …` and made that the
+        // `priority_action` of every session, while `publish_version` on a
+        // child changes NOTHING at runtime (the parent dispatches the draft's
+        // `graph_json` column directly, no version join, no status filter).
+        // Two surfaces, one recommendation, contradicting each other. A child
+        // stays LISTED — hiding it would be a different misleading report —
+        // but its `next_step` says what is true and it does not count toward
+        // the publish nudge. A failed scan is DISCLOSED on every entry as
+        // `child_status: "unknown"` rather than defaulted to "not a child".
+        let listed_ids: Vec<Uuid> = draft_rows.iter().take(5).map(|r| r.id).collect();
+        let child_scan = match self
+            .advanced_repo
+            .scan_child_parents_for(user_id, &listed_ids)
+            .await
+        {
+            Ok(scan) => Some(scan),
+            Err(e) => {
+                tracing::warn!(
+                    %user_id,
+                    error = %e,
+                    "session_start draft list: child-reference scan failed; \
+                     child status is UNKNOWN for every listed draft"
+                );
+                None
+            }
+        };
+
         let mut in_progress_drafts: Vec<serde_json::Value> = Vec::new();
         let mut unpublished_substantive_drafts: Vec<serde_json::Value> = Vec::new();
         for r in draft_rows.iter().take(5) {
@@ -231,13 +264,64 @@ impl SessionBriefService {
             let is_substantive =
                 talos_hygiene_service::is_substantive_workflow(r.graph_json.as_deref());
 
-            let next_step = if is_substantive {
-                format!("publish_version with workflow_id={}", id)
-            } else {
-                format!("get_workflow_quickstart with workflow_id={}", id)
+            let protection = child_scan
+                .as_ref()
+                .and_then(|scan| scan.protection_for(r.id));
+            let (child_status, publish_is_no_op, next_step) = match (&child_scan, &protection) {
+                (None, _) => (
+                    "unknown",
+                    serde_json::Value::Null,
+                    if is_substantive {
+                        format!(
+                            "publish_version with workflow_id={id} — BUT the child-reference \
+                             scan failed this call, so whether an enabled parent dispatches \
+                             this draft (making publish_version a no-op) is UNKNOWN"
+                        )
+                    } else {
+                        format!("get_workflow_quickstart with workflow_id={id}")
+                    },
+                ),
+                (
+                    Some(_),
+                    Some(talos_child_workflow_refs::ChildProtection::ReferencedBy(parents)),
+                ) => (
+                    "child",
+                    serde_json::Value::Bool(true),
+                    format!(
+                        "No publish_version needed: enabled parent(s) {} dispatch this \
+                         workflow's DRAFT graph_json directly (no version join, no status \
+                         filter), so publishing changes nothing at runtime. To change what \
+                         the parent runs, edit this draft.",
+                        parents.join(", ")
+                    ),
+                ),
+                (
+                    Some(_),
+                    Some(talos_child_workflow_refs::ChildProtection::MentionedByUnreadableParent(
+                        parents,
+                    )),
+                ) => (
+                    "unknown",
+                    serde_json::Value::Null,
+                    format!(
+                        "Check before publishing: the graph of enabled workflow(s) {} could not \
+                         be read and mentions this id — if one dispatches it as a child, \
+                         publish_version is a no-op (the parent runs the draft graph directly).",
+                        parents.join(", ")
+                    ),
+                ),
+                (Some(_), None) => (
+                    "not_a_child",
+                    serde_json::Value::Bool(false),
+                    if is_substantive {
+                        format!("publish_version with workflow_id={id}")
+                    } else {
+                        format!("get_workflow_quickstart with workflow_id={id}")
+                    },
+                ),
             };
 
-            let entry = serde_json::json!({
+            let mut entry = serde_json::json!({
                 "workflow_id": id,
                 "name": r.name,
                 "node_count": node_count,
@@ -250,7 +334,18 @@ impl SessionBriefService {
                 "days_old": days_old,
                 "is_substantive": is_substantive,
                 "next_step": next_step,
+                // child | not_a_child | unknown — "unknown" is a statement
+                // about THIS CALL's scan, never a claim about the workflow.
+                "child_status": child_status,
+                // true = an enabled parent runs this draft directly, so
+                // publish_version changes nothing; false = publishable; null =
+                // unknown (scan failed, or an unreadable parent mentions it).
+                "publish_is_no_op": publish_is_no_op,
             });
+            if let Some(p) = &protection {
+                entry["runs_as_child_of"] = serde_json::json!(p.parent_names());
+                entry["child_note"] = serde_json::json!(p.reason());
+            }
             if is_substantive {
                 unpublished_substantive_drafts.push(entry);
             } else {
@@ -561,6 +656,16 @@ impl SessionBriefService {
         // auto-healing branches because we WON'T be auto-healing in that case)
         // → auto-healing in progress → drafts → schedules.
         let embedding_provider_misconfigured = unembedded > 0 && !embedding_provider_available;
+        // Drafts the publish nudge may count: substantive AND known not to be
+        // a child. An UNKNOWN child status counts (the nudge stays, and the
+        // entry's next_step says the scan failed) — the failure mode of a
+        // scan that did not answer must not be "the nudge quietly vanished".
+        let child_substantive_count = unpublished_substantive_drafts
+            .iter()
+            .filter(|e| e["publish_is_no_op"] == serde_json::Value::Bool(true))
+            .count();
+        let publishable_substantive_count =
+            unpublished_substantive_drafts.len() - child_substantive_count;
         let priority_action = if !pinned_needs_restore.is_empty() {
             format!(
                 "{} pinned module(s) need WASM restore: {}. Call restore_pinned_modules.",
@@ -594,14 +699,27 @@ impl SessionBriefService {
                  Capability-based discovery will be available within seconds.",
                 uncap_count
             )
-        } else if !unpublished_substantive_drafts.is_empty() {
+        } else if publishable_substantive_count > 0 {
             // Substantive drafts dominate priority over stub-class drafts —
             // the user has already done the work, just needs publish_version.
-            format!(
-                "You have {} substantive draft workflow(s) ready for publish_version. \
-                 See unpublished_substantive_drafts for the list.",
-                unpublished_substantive_drafts.len()
-            )
+            // A CHILD draft is not "ready for publish_version": its parent
+            // runs the draft graph directly and publishing changes nothing, so
+            // it is counted separately and never makes this the priority.
+            if child_substantive_count > 0 {
+                format!(
+                    "You have {} substantive draft workflow(s) ready for publish_version \
+                     ({} more are sub-workflow children whose parent runs the draft graph \
+                     directly — nothing to publish; see runs_as_child_of). \
+                     See unpublished_substantive_drafts for the list.",
+                    publishable_substantive_count, child_substantive_count
+                )
+            } else {
+                format!(
+                    "You have {} substantive draft workflow(s) ready for publish_version. \
+                     See unpublished_substantive_drafts for the list.",
+                    publishable_substantive_count
+                )
+            }
         } else if !in_progress_drafts.is_empty() {
             format!(
                 "You have {} stub draft workflow(s) (mostly unconfigured nodes). \
@@ -687,6 +805,13 @@ impl SessionBriefService {
             },
             "in_progress_drafts": in_progress_drafts,
             "unpublished_substantive_drafts": unpublished_substantive_drafts,
+            // The two numbers the publish nudge is built from, rendered so a
+            // reader (and a test) can see them whatever else outranks drafts
+            // in `priority_action` this session. A child is substantive AND
+            // not publishable; it is in the list above and in the second
+            // count only.
+            "publishable_substantive_draft_count": publishable_substantive_count,
+            "child_substantive_draft_count": child_substantive_count,
             "duplicate_name_groups": duplicate_name_groups,
             "uncapabilized_count": uncap_count,
             "next_scheduled_run": next_schedule,
