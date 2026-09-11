@@ -161,6 +161,12 @@ pub struct LineageNode {
     pub workflow_id: String,
     pub trigger_type: Option<String>,
     pub actor_id: Option<String>,
+    /// The module execution whose completion fired this run as a WORKFLOW
+    /// CHAIN (`talos-engine` `workflow_chains`); `None` on every other path.
+    /// A module → run edge, distinct from the run → run `parent_execution_id`
+    /// edge above. No FK, so it survives the module row's retirement as a
+    /// dangling id (#749's rule).
+    pub triggered_by_module_execution_id: Option<Uuid>,
     pub archived_at: Option<DateTime<Utc>>,
 }
 
@@ -206,7 +212,8 @@ macro_rules! execution_base_columns {
 macro_rules! lineage_node_columns {
     () => {
         "id, parent_execution_id, root_execution_id, status, workflow_id::text, \
-         COALESCE(provenance->>'trigger_type', 'manual'), actor_id::text"
+         COALESCE(provenance->>'trigger_type', 'manual'), actor_id::text, \
+         triggered_by_module_execution_id"
     };
 }
 
@@ -3325,6 +3332,7 @@ impl ExecutionRepository {
             String,
             Option<String>,
             Option<String>,
+            Option<Uuid>,
             Option<DateTime<Utc>>,
         )> = sqlx::query_as(concat!(
             "SELECT ",
@@ -3357,6 +3365,7 @@ impl ExecutionRepository {
                     workflow_id,
                     trigger_type,
                     actor_id,
+                    triggered_by_module_execution_id,
                     archived_at,
                 )| LineageNode {
                     id,
@@ -3366,6 +3375,7 @@ impl ExecutionRepository {
                     workflow_id,
                     trigger_type,
                     actor_id,
+                    triggered_by_module_execution_id,
                     archived_at,
                 },
             )

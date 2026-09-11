@@ -295,13 +295,14 @@ async fn the_settle_floor_and_lookback_window_still_bound_the_population() {
     );
 }
 
-/// A job with NO workflow execution comes BACK from the query rather than
-/// being filtered out of sight — the sweep counts it under
-/// `ChainSweepStats::unbound` so an unattempted row never arrives inside a
-/// clean count.
+/// A job with NO workflow execution comes BACK from the query with its NULL
+/// intact — it is a STANDALONE dispatch (module-bound webhook / push), which
+/// the sweep verifies under the `(job_id, job_id)` genesis its builder signed
+/// with and discloses as `ChainSweepStats::standalone` (2026-09-11).
 ///
-/// Measured 2026-09-06: 0 of 48,577 rows platform-wide carry a NULL there, so
-/// this shape is LATENT — stated as such rather than dressed up.
+/// "0 of 48,577 rows carry a NULL there" (measured 2026-09-06) was an
+/// artefact: the chain runner re-parented every such row onto the chain it
+/// fired, which is what broke those rows' verification in the first place.
 #[tokio::test]
 async fn a_job_with_no_workflow_execution_is_returned_for_counting() {
     let (pool, _db) = common::isolated_db_pool().await;
@@ -382,7 +383,7 @@ async fn the_security_audit_candidate_is_a_module_execution() {
         target,
         LedgerTarget {
             module_execution_id: newest,
-            workflow_execution_id: wf_exec,
+            workflow_execution_id: Some(wf_exec),
         },
         "the candidate must be the newest settled MODULE execution, paired with its run"
     );
@@ -415,20 +416,29 @@ async fn no_eligible_job_is_ok_none_not_an_error() {
 }
 
 /// A job with no workflow execution cannot be a CANDIDATE — the check would
-/// have no genesis half to bind — and must not be silently substituted by a
-/// fabricated one either. `Ok(None)` here is honest: there is nothing this
-/// check can verify.
+/// carries its own id as the genesis half — the standalone contract every
+/// module-bound builder signs with — so it IS a candidate, under `(job, job)`,
+/// and the target says so rather than fabricating a run id. Until 2026-09-11
+/// the probe excluded these rows as "unbindable".
 #[tokio::test]
-async fn an_unbound_job_is_never_offered_as_a_candidate() {
+async fn a_standalone_job_is_offered_under_its_own_genesis() {
     let (pool, _db) = common::isolated_db_pool().await;
     let t = seed_tenant(&pool).await;
-    seed_module_execution(&pool, &t, None, 600).await;
+    let standalone = seed_module_execution(&pool, &t, None, 600).await;
 
     let target = latest_verifiable_ledger_target(&pool, 120)
         .await
-        .expect("query");
-    assert!(
-        target.is_none(),
-        "a job with no genesis pair must not be handed to the verifier"
+        .expect("query")
+        .expect("a settled standalone job is a verifiable candidate");
+    assert_eq!(target.module_execution_id, standalone);
+    assert_eq!(
+        target.workflow_execution_id, None,
+        "no run id is fabricated"
+    );
+    assert!(target.is_standalone());
+    assert_eq!(
+        target.genesis_workflow_id(),
+        standalone.to_string(),
+        "verified under (job_id, job_id), exactly as the worker sealed it"
     );
 }

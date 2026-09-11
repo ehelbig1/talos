@@ -69,22 +69,30 @@ use uuid::Uuid;
 pub const LEDGER_KEY_SPACE: &str = "module_executions.id";
 
 /// The DB column supplying the genesis `workflow_id` half of the binding.
-pub const LEDGER_GENESIS_WORKFLOW_COLUMN: &str = "module_executions.workflow_execution_id";
+pub const LEDGER_GENESIS_WORKFLOW_COLUMN: &str =
+    "module_executions.workflow_execution_id (NULL = standalone: module_executions.id itself)";
 
 /// One verifiable chain: a module execution and the workflow execution it ran
-/// under.
+/// under — or, for a STANDALONE dispatch, the module execution alone.
 ///
-/// Both halves are required and neither is optional, because `verify_chain`
-/// needs both to re-derive the genesis hash. A module execution with a NULL
-/// `workflow_execution_id` therefore cannot be represented — see
-/// [`ChainSweepStats::unbound`](crate::ChainSweepStats::unbound) for how the
-/// sweep reports those rather than silently dropping them.
+/// `verify_chain` re-derives the genesis hash from `(workflow_id, execution_id)`
+/// exactly as the WORKER computed it from the ids ON THE WIRE. A workflow-run
+/// dispatch carries `workflow_execution_id = <run>`; a standalone dispatch (a
+/// module-bound webhook or push delivery — every builder in `talos-webhooks`,
+/// `talos-gmail`, `talos-google-cloud`, `talos-google-calendar`) carries
+/// `workflow_execution_id = job_id`. So a NULL `module_executions.
+/// workflow_execution_id` is not "cannot verify"; it is the second contract,
+/// and [`LedgerTarget::genesis_workflow_id`] answers it. See
+/// [`ChainSweepStats::standalone`](crate::ChainSweepStats::standalone) for how
+/// the sweep discloses that count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LedgerTarget {
     /// `module_executions.id` — the S3 prefix AND the ledger's `execution_id`.
     pub module_execution_id: Uuid,
-    /// `module_executions.workflow_execution_id` — the ledger's `workflow_id`.
-    pub workflow_execution_id: Uuid,
+    /// `module_executions.workflow_execution_id` — the ledger's `workflow_id`
+    /// for a workflow-run dispatch; `None` for a standalone dispatch, whose
+    /// ledger `workflow_id` is the job id itself.
+    pub workflow_execution_id: Option<Uuid>,
 }
 
 impl LedgerTarget {
@@ -100,7 +108,24 @@ impl LedgerTarget {
     /// that made the guessed binding above return `ok=false`.
     #[must_use]
     pub fn genesis_workflow_id(&self) -> String {
-        self.workflow_execution_id.to_string()
+        // The STANDALONE contract: a job dispatched with no workflow execution
+        // carries its own id in `workflow_execution_id` on the wire, so the
+        // worker sealed the chain under `genesis(job_id, job_id)`. Until
+        // 2026-09-11 these rows were counted as "unbound" and never verified —
+        // and, worse, the chain runner REWROTE their `workflow_execution_id` to
+        // the chain run it fired, so the ones that fired a chain verified as
+        // `genesis_mismatch`. The column is write-once now, and a NULL is read
+        // as the contract rather than as "cannot verify".
+        self.workflow_execution_id
+            .unwrap_or(self.module_execution_id)
+            .to_string()
+    }
+
+    /// `true` when this job was dispatched standalone (no workflow execution)
+    /// and is verified under the `(job_id, job_id)` genesis.
+    #[must_use]
+    pub fn is_standalone(&self) -> bool {
+        self.workflow_execution_id.is_none()
     }
 }
 
@@ -121,17 +146,17 @@ impl LedgerTarget {
 #[must_use]
 pub fn partition_sweep_rows(rows: &[(Uuid, Option<Uuid>)]) -> (Vec<LedgerTarget>, usize) {
     let mut targets = Vec::with_capacity(rows.len());
-    let mut unbound = 0usize;
+    let mut standalone = 0usize;
     for (module_execution_id, workflow_execution_id) in rows {
-        match workflow_execution_id {
-            Some(workflow_execution_id) => targets.push(LedgerTarget {
-                module_execution_id: *module_execution_id,
-                workflow_execution_id: *workflow_execution_id,
-            }),
-            None => unbound += 1,
+        if workflow_execution_id.is_none() {
+            standalone += 1;
         }
+        targets.push(LedgerTarget {
+            module_execution_id: *module_execution_id,
+            workflow_execution_id: *workflow_execution_id,
+        });
     }
-    (targets, unbound)
+    (targets, standalone)
 }
 
 /// What verifying ONE job's chain produced, ordered by SEVERITY.
@@ -299,30 +324,41 @@ mod rollup_tests {
         );
     }
 
-    /// A job with no workflow execution is COUNTED, not dropped.
+    /// A job with no workflow execution is a STANDALONE dispatch: it is
+    /// VERIFIED (under the `(job_id, job_id)` genesis every standalone builder
+    /// signs with) AND counted, never dropped.
     ///
-    /// This test exists because the mutation it guards SURVIVED everything
-    /// else: with the increment inside the S3-dependent sweep loop, deleting
-    /// it left 43 + 84 tests green. Partitioning is where the fact is decided,
-    /// so partitioning is where it is pinned.
+    /// Until 2026-09-11 these rows were dropped from the targets as "unbound";
+    /// that was wrong twice over — the ledger for them exists and is
+    /// verifiable, and the chain runner's re-parenting UPDATE meant the only
+    /// ones that ever reached the verifier did so under the WRONG genesis.
+    /// Partitioning is where the fact is decided, so partitioning is where it
+    /// is pinned.
     #[test]
-    fn an_unbound_job_is_counted_not_dropped() {
+    fn a_standalone_job_is_verified_under_its_own_id_and_counted() {
         let rows = [
             (u(1), Some(u(100))),
             (u(2), None),
             (u(3), Some(u(100))),
             (u(4), None),
         ];
-        let (targets, unbound) = partition_sweep_rows(&rows);
-        assert_eq!(unbound, 2, "an unattempted job must be COUNTED");
-        assert_eq!(targets.len(), 2);
+        let (targets, standalone) = partition_sweep_rows(&rows);
+        assert_eq!(standalone, 2, "a standalone job must be COUNTED");
         assert_eq!(
-            targets.len() + unbound,
+            targets.len(),
             rows.len(),
-            "every enumerated row is either verified or disclosed; none vanishes"
+            "every enumerated row is verified; none vanishes"
         );
         assert_eq!(targets[0].module_execution_id, u(1));
-        assert_eq!(targets[0].workflow_execution_id, u(100));
+        assert_eq!(targets[0].workflow_execution_id, Some(u(100)));
+        assert_eq!(targets[0].genesis_workflow_id(), u(100).to_string());
+        assert!(!targets[0].is_standalone());
+        assert!(targets[1].is_standalone());
+        assert_eq!(
+            targets[1].genesis_workflow_id(),
+            u(2).to_string(),
+            "standalone genesis is (job_id, job_id) — the wire contract"
+        );
     }
 
     /// Order is preserved, because the sweep's `completed_at DESC` ordering is
@@ -344,7 +380,7 @@ mod rollup_tests {
     fn the_target_names_the_module_execution_as_the_prefix() {
         let target = LedgerTarget {
             module_execution_id: u(11),
-            workflow_execution_id: u(22),
+            workflow_execution_id: Some(u(22)),
         };
         assert_eq!(target.execution_id(), u(11).to_string());
         assert_eq!(target.genesis_workflow_id(), u(22).to_string());

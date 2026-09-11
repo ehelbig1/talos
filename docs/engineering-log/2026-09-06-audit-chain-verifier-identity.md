@@ -323,3 +323,78 @@ ledger holds prefixes with far more copies than the in-worker ceiling of 4 (one
 has ELEVEN objects written 5 s apart across 55 s). Reconstructing a prior
 dispatch's ledger needs persisted state the credential-free worker cannot read.
 That is the next entry.
+
+## The key space moved after the seal (2026-09-11)
+
+The 14-day failure-counter sweep that closes every deploy check found
+`talos_audit_verification_failures_total{stage="chain"}` at **6**: two on
+2026-09-07 — the redelivery-as-tampering episode the dispatch-attempt partition
+closed — and **four on 2026-09-10 between 19:00 and 22:00 UTC**, three days
+AFTER that fix. Tamper evidence, on the platform's only tamper signal, with
+the container that logged the details already recreated. Nothing durable
+records which execution failed verification or why; the log line is the
+record, and the log was gone.
+
+The verifier is a library function, so the executions could be re-verified
+by hand: an untracked example under `talos-audit-ledger` fed the 318 module
+executions completed in the three sweeps' windows through the real
+`verify_execution_chain_from_env` with the verifier identity. **315 ok, 3
+failed, all `genesis_mismatch` at sequence 1**, and the first event of each
+failing chain carried `workflow_id == execution_id` — the worker had sealed
+the chain under `genesis(job, job)` while the verifier, reading
+`module_executions.workflow_execution_id`, expected `genesis(run, job)`. The
+arithmetic was checked by hand from `genesis_hash`'s definition: found equals
+`genesis(job, job)`, expected equals `genesis(run, job)`.
+
+Both sides were right about what they saw. The worker hashes the ids ON THE
+WIRE, and every standalone builder — the module-bound webhook path, the DLQ
+replay, gmail, Google Cloud, Google Calendar — signs `workflow_execution_id =
+job_id` ("Standalone webhook uses same ID") and inserts the module row with a
+NULL run. Then `talos-engine/src/workflow_chains.rs`, dispatching the
+workflows that chain off that module, ran `UPDATE module_executions SET
+workflow_execution_id = <chain run> WHERE id = <trigger>` under the comment
+"Link the trigger's module execution to this workflow execution". The link
+was real; the column it used is half of the ledger's genesis key. Every
+module-bound dispatch that fired a chain therefore verified as tampering, and
+the "0 of 48,577 rows platform-wide carry a NULL" measured on 2026-09-06 was
+not a latent population — it was this UPDATE erasing the population before
+anyone counted it. The module rows were created **29 ms before** the run rows
+that later claimed them, which is the fingerprint: a standalone row
+re-parented onto a run minted afterwards.
+
+Attribution took longer than the fix, and the wrong turns are worth one
+paragraph: the engine's own dispatch, the sub-workflow engine, the loop-body
+dispatch, the retry path, the worker's ledger construction across every
+commit deployed that evening, and the DLQ replay were each read and each is
+consistent — the row's run id and the wire's run id come from one variable.
+The `__trigger_input__` key in the echo module's output pointed at the engine
+(it is engine-authored); the `__webhook__` envelope pointed at the router;
+both were true, because the WEBHOOK fired the module and the ENGINE ran the
+chains it triggered. What decided it was the timestamp ordering and a grep for
+`SET workflow_execution_id` that the first pass had filtered out by excluding
+lines containing `WHERE`.
+
+The link now lives where the fact lives: on the chain run's row
+(`workflow_executions.triggered_by_module_execution_id`, on the archive too,
+in `ARCHIVED_EXECUTION_COLUMNS`, rendered by `get_execution_lineage` as
+`chain_trigger_module_execution_id`; no foreign key, so it survives the module
+row's retirement as a dangling id — #749's rule). The UPDATE is deleted and
+the row insert is extracted into `insert_chain_execution_row` so a DB test can
+drive it. And the sweep no longer drops NULL-run rows as "unbound": a NULL is
+the standalone contract, `LedgerTarget::genesis_workflow_id()` returns the job
+id itself, and the row is verified under `(job, job)` and disclosed as
+`ChainSweepStats::standalone`. A standalone job rolls up under its own id — a
+run of one, which is what a module-bound webhook delivery is to an operator.
+
+The security audit's round-trip probe offers a standalone job too, under its
+own genesis — it had excluded them as unbindable. Not changed, stated: the
+three historical rows keep failing if ever re-swept, because their column has
+already been moved — forward-only, like the partition. And the first push of
+this package failed CI twice on test targets my gates never compiled: the
+`--lib` unit runs and a `--no-deps` clippy do not build `controller/tests/*`
+or a crate's `mod tests;` file, and both constructed the type whose field
+became an `Option`. `cargo check --workspace --all-targets` is now in the
+pre-push sequence for a type change. And the log-only record of a verification failure is still
+log-only; the re-verification tool that found these was written for the
+occasion and deleted with it.
+

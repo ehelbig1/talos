@@ -764,13 +764,16 @@ pub async fn latest_verifiable_ledger_target(
     db_pool: &PgPool,
     settle_secs: i64,
 ) -> Result<Option<LedgerTarget>> {
-    let row = sqlx::query_as::<_, (Uuid, Uuid)>(
+    // A NULL `workflow_execution_id` is a STANDALONE dispatch (module-bound
+    // webhook / push), sealed under `genesis(job_id, job_id)` — a verifiable
+    // candidate, not an unbindable one (2026-09-11; until then this excluded
+    // them with `AND workflow_execution_id IS NOT NULL`).
+    let row = sqlx::query_as::<_, (Uuid, Option<Uuid>)>(
         "SELECT id, workflow_execution_id \
          FROM module_executions \
          WHERE status IN ('completed', 'failed', 'cancelled') \
            AND completed_at IS NOT NULL \
            AND completed_at <= NOW() - (INTERVAL '1 second' * $1) \
-           AND workflow_execution_id IS NOT NULL \
          ORDER BY completed_at DESC, id DESC \
          LIMIT 1",
     )
@@ -817,7 +820,7 @@ pub async fn ledger_targets_for_workflow_execution(
         .into_iter()
         .map(|(module_execution_id,)| LedgerTarget {
             module_execution_id,
-            workflow_execution_id,
+            workflow_execution_id: Some(workflow_execution_id),
         })
         .collect())
 }
@@ -934,11 +937,14 @@ pub struct ChainSweepStats {
     /// Jobs in the window whose `workflow_execution_id` is NULL, so no genesis
     /// pair could be formed and NOTHING was attempted for them.
     ///
-    /// Reported rather than filtered away, because "we did not look" must not
-    /// arrive as part of a clean count — the class this whole change is about.
-    /// Measured 2026-09-06: 0 of 48,577 rows platform-wide carry a NULL there,
-    /// so this is LATENT today and is stated as such rather than dressed up.
-    pub unbound: usize,
+    /// Jobs with no `workflow_execution_id` — STANDALONE dispatches (a
+    /// module-bound webhook or push delivery). Since 2026-09-11 these ARE
+    /// verified, under the `(job_id, job_id)` genesis the standalone builders
+    /// sign with; the count is disclosed so a sweep over a webhook-heavy fleet
+    /// says how much of its population took that contract. (Measured 2026-09-06
+    /// as 0 of 48,577 — which was itself an artefact: the chain runner
+    /// re-parented every such row onto the chain it fired.)
+    pub standalone: usize,
     /// The per-job tally lifted to workflow executions, worst outcome wins.
     ///
     /// Present because every OTHER surface on this platform is keyed on
@@ -1002,8 +1008,8 @@ pub async fn run_chain_verification_sweep(
     // row with no genesis pair cannot be obtained-and-forgotten: see
     // `partition_sweep_rows` for the mutation that made this an extracted
     // function rather than an `if let` in this loop.
-    let (targets, unbound) = population::partition_sweep_rows(&rows);
-    stats.unbound = unbound;
+    let (targets, standalone) = population::partition_sweep_rows(&rows);
+    stats.standalone = standalone;
     let mut outcomes: Vec<(Uuid, JobChainOutcome)> = Vec::with_capacity(targets.len());
     for target in targets {
         let outcome = verify_execution_chain(
@@ -1014,7 +1020,15 @@ pub async fn run_chain_verification_sweep(
         )
         .await;
         let (control, class) = record_chain_verification_outcome(&mut stats, outcome, &target);
-        outcomes.push((target.workflow_execution_id, class));
+        // The rollup is keyed by WORKFLOW EXECUTION. A standalone job has none,
+        // so it rolls up under its own id — a run of one, which is what a
+        // module-bound webhook delivery is to an operator.
+        outcomes.push((
+            target
+                .workflow_execution_id
+                .unwrap_or(target.module_execution_id),
+            class,
+        ));
         if control == SweepControl::Abort {
             break;
         }
@@ -1097,7 +1111,9 @@ fn record_chain_verification_outcome(
     // grepping either one finds this line, and nobody has to know that the
     // ledger calls the second half `workflow_id`.
     let exec_id = target.module_execution_id;
-    let wf_id = target.workflow_execution_id;
+    // The ledger's `workflow_id` half as the WORKER sealed it — the run id, or
+    // the job id itself for a standalone dispatch.
+    let wf_id = target.genesis_workflow_id();
     let mut class = JobChainOutcome::VerifiedOk;
     // Counted BEFORE the arms, and independently of them: a redelivery is a
     // property of the chain, not of the verdict, so a job that also has a real
@@ -1115,7 +1131,7 @@ fn record_chain_verification_outcome(
                 target: "talos_audit",
                 event_kind = "audit_chain_multi_attempt",
                 module_execution_id = %target.module_execution_id,
-                workflow_execution_id = %target.workflow_execution_id,
+                workflow_execution_id = %target.genesis_workflow_id(),
                 ledger_key_space = LEDGER_KEY_SPACE,
                 dispatch_attempts = attempts,
                 "a job's audit prefix holds one chain PER CONTROLLER DISPATCH ATTEMPT — \
@@ -1137,7 +1153,7 @@ fn record_chain_verification_outcome(
                 target: "talos_audit",
                 event_kind = "audit_chain_duplicate_delivery",
                 module_execution_id = %target.module_execution_id,
-                workflow_execution_id = %target.workflow_execution_id,
+                workflow_execution_id = %target.genesis_workflow_id(),
                 ledger_key_space = LEDGER_KEY_SPACE,
                 duplicate_events = duplicates,
                 "a job's audit chain carries byte-identical redelivered event(s) — \
@@ -1364,7 +1380,7 @@ fn publish_sweep_snapshot(stats: &ChainSweepStats) {
         duplicate_delivery: stats.duplicate_delivery,
         multi_attempt: stats.multi_attempt,
         errored: stats.errored,
-        unbound: stats.unbound,
+        standalone: stats.standalone,
         cap_hit: stats.cap_hit,
         aborted: stats.aborted,
         rollup: stats.rollup,
@@ -2761,7 +2777,7 @@ mod audit_verification_metric_tests {
     fn nil_target() -> LedgerTarget {
         LedgerTarget {
             module_execution_id: Uuid::nil(),
-            workflow_execution_id: Uuid::nil(),
+            workflow_execution_id: Some(Uuid::nil()),
         }
     }
 
@@ -2966,7 +2982,7 @@ mod sweep_coverage_pins {
             duplicate_delivery: 0,
             multi_attempt: 0,
             errored: 0,
-            unbound: 0,
+            standalone: 0,
             cap_hit: true,
             rollup: crate::WorkflowExecutionRollup::default(),
         };

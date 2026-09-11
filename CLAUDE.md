@@ -770,6 +770,36 @@ controller re-dispatch of one `job_id` wrote a second chain under one prefix.
   width, 0–4 `node_retrying` events/day).
 * `PipelineJobRequest` is deliberately unchanged — the chain path writes no audit
   chain at all, so a `dispatch_attempt` there would partition nothing.
+* **The ledger's key space is WRITE-ONCE, and the chain runner was moving it
+  after the seal (2026-09-11).** Found by re-verifying the 318 chains from the
+  window in which the sweep had counted four `stage="chain"` failures three days
+  after the partition fix: three failed, all `genesis_mismatch` at seq 1, all
+  sealed by the worker under `genesis(job, job)` while the verifier expected
+  `genesis(run, job)`. The worker hashes the ids ON THE WIRE, and every
+  STANDALONE builder (module-bound webhook, DLQ replay, gmail, GCP, gcal push)
+  signs `workflow_execution_id = job_id` with a NULL run on the module row;
+  `talos-engine/src/workflow_chains.rs` then `UPDATE module_executions SET
+  workflow_execution_id = <chain run>` to "link the trigger" — so every
+  module-bound dispatch that fired a chain read as tampering, and the "0 of
+  48,577 unbound rows" measured on 2026-09-06 was itself this rewrite hiding the
+  population. Now: the link lives on the CHAIN RUN's row
+  (`workflow_executions.triggered_by_module_execution_id`, live + archive +
+  `ARCHIVED_EXECUTION_COLUMNS`, rendered by `get_execution_lineage` as
+  `chain_trigger_module_execution_id`; no FK, #749's rule), the UPDATE is gone,
+  and `partition_sweep_rows` reads a NULL run id as the standalone contract —
+  `LedgerTarget::genesis_workflow_id()` returns the job id itself — so those
+  rows are VERIFIED and disclosed as `ChainSweepStats::standalone` rather than
+  dropped as `unbound`. A standalone job rolls up under its own id (a run of
+  one). Guards: `controller/tests/chain_run_linkage_tests` (CTRL_TESTS) drives
+  `insert_chain_execution_row` on a NULL-run module row and asserts the module
+  row is untouched, the run row carries the link, and the sweep verifies the
+  row under `(job, job)`; `talos-audit-event` pins the defect as a unit test
+  (the same sealed chain passes under `(job, job)` and fails with
+  `GenesisMismatch` under `(run, job)`); the security audit's round-trip probe
+  offers a standalone job too, under its own genesis. **Not changed, stated**:
+  the three historical rows keep failing if ever re-swept, since their column
+  was already moved — forward-only, like the partition. Enumerate the ledger's writers by what the WORKER hashes, not
+  by what the database later says.
 
 **Measured and NOT changed / latent.** `module_executions.workflow_execution_id`
 is NULLABLE and such a row cannot be verified — **0 of 48,577 rows platform-wide**,

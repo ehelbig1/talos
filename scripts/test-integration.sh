@@ -484,6 +484,7 @@ CTRL_TESTS=(
     # the finalizing UPDATE itself RETURNS; back-dated rows prove the observed
     # value is the row's own age. `common` harness, so CTRL_TESTS (64b).
     "execution_metrics_tests"
+    "chain_run_linkage_tests"
     "api_auth_integration_test"
     "integration_mcp_tests"
     "auth_concurrency_tests"

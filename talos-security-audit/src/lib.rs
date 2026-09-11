@@ -1633,11 +1633,11 @@ fn describe_last_sweep(sweep: Option<talos_audit_ledger::ChainSweepSnapshot>) ->
         s.empty,
         s.failed,
         s.errored,
-        if s.unbound > 0 {
+        if s.standalone > 0 {
             format!(
-                ", and {} job(s) had no workflow execution to bind a genesis hash to and were \
-                 NOT attempted",
-                s.unbound
+                ", of which {} standalone job(s) (no workflow execution) were verified under \
+                 the (job_id, job_id) genesis their dispatch was signed with",
+                s.standalone
             )
         } else {
             String::new()

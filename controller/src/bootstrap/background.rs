@@ -2108,7 +2108,6 @@ pub(crate) fn spawn_maintenance_sweeps(
                             } else if stats.failed > 0
                                 || stats.errored > 0
                                 || stats.empty > 0
-                                || stats.unbound > 0
                             {
                                 // `empty` counts here: a prefix that read
                                 // cleanly and held NOTHING is not a verified
@@ -2119,11 +2118,13 @@ pub(crate) fn spawn_maintenance_sweeps(
                                 // reads. Now that the sweep enumerates the id
                                 // space the writer keys, an empty prefix is a
                                 // real per-job finding rather than the
-                                // expected reading. `unbound` counts too: a
-                                // job with no workflow execution has no
-                                // genesis pair and was NOT attempted, and an
-                                // unattempted row must never arrive inside a
-                                // clean count.
+                                // expected reading. `standalone` does NOT
+                                // raise the level (2026-09-11): a job with no
+                                // workflow execution is a module-bound webhook
+                                // or push dispatch sealed under the
+                                // (job_id, job_id) genesis, and the sweep now
+                                // VERIFIES it under that contract — it is a
+                                // disclosed count, not an unattempted row.
                                 tracing::warn!(
                                     target: "talos_audit",
                                     event_kind = "audit_chain_sweep_summary",
@@ -2145,7 +2146,7 @@ pub(crate) fn spawn_maintenance_sweeps(
                                     // used to be reported as tamper evidence.
                                     jobs_with_multiple_attempts = stats.multi_attempt,
                                     jobs_errored = stats.errored,
-                                    jobs_unbound = stats.unbound,
+                                    jobs_standalone = stats.standalone,
                                     workflow_executions_covered = stats.rollup.covered,
                                     workflow_executions_verified_ok = stats.rollup.verified_ok,
                                     workflow_executions_empty = stats.rollup.empty,
