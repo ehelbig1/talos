@@ -512,11 +512,15 @@ pub async fn init_pool() -> anyhow::Result<Pool<Postgres>> {
     let statement_timeout_secs =
         talos_config::positive_env_or_default::<u64>("DB_STATEMENT_TIMEOUT_SECS", 60);
 
-    // SECURITY: Execution timeout for complex queries (e.g., report generation)
-    // Default: 5 minutes (300 seconds), can be overridden via DB_EXECUTION_TIMEOUT_SECS.
-    // MCP-679: `=0`-safe env helper, same rationale as above.
-    let execution_timeout_secs =
-        talos_config::positive_env_or_default::<u64>("DB_EXECUTION_TIMEOUT_SECS", 300);
+    // There is deliberately NO second, longer timeout here. Until 2026-09-11
+    // this block also read `DB_EXECUTION_TIMEOUT_SECS` (default 300) and the
+    // connect line below logged it as `execution_timeout=300s`, but the value
+    // reached no `SET` and no pool — every statement on every pool ran under
+    // `statement_timeout` above. A documented knob that is logged as applied
+    // and applied to nothing is the #791 class; it was removed rather than
+    // wired, because there is no "execution-path pool" for it to govern and
+    // the live fleet's slowest application statement is under a second
+    // (pg_stat_statements max_exec_time, 2026-09-11: 274 ms).
 
     // Apply timeout parameters via SET-on-connect rather than libpq `options=`
     // startup parameters. Neon's pooler (and PgBouncer-fronted setups) reject
@@ -527,9 +531,8 @@ pub async fn init_pool() -> anyhow::Result<Pool<Postgres>> {
     // idle_in_transaction_session_timeout: kill idle transactions (connection leaks)
     // application_name: tag connections so DBA tooling can attribute load
     tracing::info!(
-        "Connecting to database with statement_timeout={}s, execution_timeout={}s",
-        statement_timeout_secs,
-        execution_timeout_secs
+        "Connecting to database with statement_timeout={}s, idle_in_transaction_session_timeout=60s",
+        statement_timeout_secs
     );
 
     PgPoolOptions::new()

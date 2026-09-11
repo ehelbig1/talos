@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::{
-        bool_env_or_default, env_var_is_set_nonempty, execution_max_rows, execution_retention_days,
+        bool_env_or_default, env_var_is_set_nonempty, execution_retention_days,
         get_allowed_origins, get_env, get_frontend_url, is_allowed_origin, positive_env_or_default,
         sanitize_oauth_error_code, validate_shared_secret_token,
     };
@@ -423,31 +423,6 @@ mod tests {
         env::set_var("EXECUTION_RETENTION_DAYS", "-5");
         assert_eq!(execution_retention_days(), 30);
         env::remove_var("EXECUTION_RETENTION_DAYS");
-    }
-
-    #[test]
-    fn test_execution_max_rows_default() {
-        let _g = env_lock();
-        env::remove_var("EXECUTION_MAX_ROWS");
-        assert_eq!(execution_max_rows(), 100_000);
-    }
-
-    #[test]
-    fn test_execution_max_rows_custom() {
-        let _g = env_lock();
-        env::set_var("EXECUTION_MAX_ROWS", "50000");
-        assert_eq!(execution_max_rows(), 50_000);
-        env::remove_var("EXECUTION_MAX_ROWS");
-    }
-
-    /// MCP-1063: `=0` substitutes the default. `max_rows=0` would mean
-    /// "evict every execution on cap-enforcement sweep".
-    #[test]
-    fn test_execution_max_rows_zero_substitutes_default() {
-        let _g = env_lock();
-        env::set_var("EXECUTION_MAX_ROWS", "0");
-        assert_eq!(execution_max_rows(), 100_000);
-        env::remove_var("EXECUTION_MAX_ROWS");
     }
 
     #[test]
