@@ -474,12 +474,27 @@ async fn run_rank_training_tick(pool: &PgPool, actor_repo: &ActorRepository) -> 
         let fetch = window.observe(&examples, n_fetched, n_available, lookback_days, now);
 
         if fetch.truncated() {
-            // WARN, and say which direction the truncation runs. Unlike the
-            // fuel-headroom sweep — whose `ORDER BY utilisation DESC` keeps the
-            // numerator complete so only a denominator under-reports — this
-            // fetch orders by `created_at DESC`, so what is dropped is the OLDER
-            // half of the window. That is a recency bias, not a missing tail.
-            tracing::warn!(
+            // INFO (was WARN until 2026-09-11), and say which direction the
+            // truncation runs. Unlike the fuel-headroom sweep — whose `ORDER BY
+            // utilisation DESC` keeps the numerator complete so only a
+            // denominator under-reports — this fetch orders by `created_at
+            // DESC`, so what is dropped is the OLDER half of the window. That is
+            // a recency bias, not a missing tail.
+            //
+            // Why INFO: `TRAINING_FETCH_CAP` is deliberately NOT tunable and on
+            // a fleet with one busy actor it binds on EVERY tick, forever — the
+            // #791 entry declined an ALERT on this exact state because "an alert
+            // would fire permanently and train operators to ignore it (check
+            // 69's trap)". A WARN at every tick and at every boot is the same
+            // trap one level down: measured on the dev stack it was the only
+            // WARN a clean controller boot produced, on every one of the last
+            // eight deploys. The disclosure fields stay on the line and the
+            // machine-readable half is the seeded counter pair
+            // `talos_rank_training_fetches_total{coverage}` plus the shortfall
+            // gauge, which is what anything that wants to react should read.
+            // The count-FAILED branch above stays WARN — that is a read that did
+            // not answer, not a steady state.
+            tracing::info!(
                 target: "talos_memory_ranking",
                 %actor_id,
                 event_kind = "rank_training_truncated",
