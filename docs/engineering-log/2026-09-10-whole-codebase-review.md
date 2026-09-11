@@ -1701,3 +1701,86 @@ once (its `next_trigger_at` is recomputed from now), which is the existing
 and correct behaviour. And a host that suspends for less than 90 s produces
 no catch-up batch at all — by design, since nothing can be six intervals late.
 
+## Package S — the alert kept the cadence the review changed (2026-09-11)
+
+Found while verifying the #815 deploy: ninety seconds after boot,
+`TalosCryptoOrphanDetectorBlind` was FIRING. Its `keep_firing_for: 5m` had
+carried it across the restart, which meant it had been firing before the
+deploy too. The alert's rule reads `time() - stamp > 600` under a THRESHOLDS
+paragraph that says "The sweep runs every 60s, so 600s is ten consecutive
+missed sweeps". Package (b) of this review — the perf fix above, `CryptoInvariantGauge`
+60 s → 3600 s — moved the sweep to an hour for a stated cost (three
+full-table anti-joins per minute) and did not touch the alert or its
+comment. So on a healthy controller the stamp is 601–3600 s old for fifty
+of every sixty minutes; the alert goes `pending` at +10 min and FIRES from
++25 min to +60 min of every hour, on a fleet where the sweep is completing
+on time every time.
+
+Measured rather than inferred. The stamp series in Prometheus advances at
+`x:58:11` every hour (and at each restart, because the first tick now runs
+at boot). The rule group evaluates every 30 s, and `ALERTS{alertname=
+"TalosCryptoOrphanDetectorBlind", alertstate="firing"}` has **1831 samples
+over the 27 hours** since the #794 deploy — 15.3 hours firing, 57 % of the
+time — and **zero** in the thirteen days before it. It is `warning`,
+category `observability`, and it is the ONE alert whose job is to say the
+three `critical` crypto data-loss detectors have gone blind. The rule's own
+comments argue at length against exactly this — "a permanently-red alert
+trains operators to ignore red" — and then the number below the comment
+made it one.
+
+The class is `the_report_described_the_mechanism_the_next_pr_replaced`
+again, one file over: a threshold and the cadence it was derived from lived
+in different files, one of them changed, and nothing coupled them. The
+fix couples them. The cadence is now a named constant at the spawn site
+(`CRYPTO_ORPHAN_SCAN_INTERVAL_SECS = 3600`, with
+`CATALOG_MISSING_WASM_SCAN_INTERVAL_SECS = 300` beside it), the threshold
+is 7800 s (two consecutive missed sweeps plus ten minutes of scrape and
+evaluation slack; with `for: 15m` the detector fires after ~2h25m of
+continuous blindness, still hours ahead of the `for: 8h` on the alerts it
+guards), and `blind_detector_thresholds_match_the_sweep_cadence` reads each
+blind detector's `expr` out of the chart file at compile time (#630's
+rule) and requires the integer after `>` to sit within [2, 8] sweep
+intervals. Two is the defect's guard — an alert that cannot fire between
+two sweeps that both completed. Eight keeps it a detector. The catalog
+missing-WASM detector already sits at 6× (1800 s over a 300 s sweep) and
+passes unchanged.
+
+Five sentences in the crypto rule group still described the 60 s sweep
+and a skipped first tick; all five are corrected, because the next reader
+of "same 60s scan, same 60s unmeasured-zero window" will reason from it.
+The chart's promtool fixture (`observability/alerts_chart_test.yml`, not
+CI-wired, and its header says so) already had three crypto-blind cases —
+and every one fed a stamp advancing every 60 s, `0+60x…`, the cadence the
+ALERT assumed rather than the one the producer had had for a day. They
+passed. A fixture that models the consumer's assumption instead of the
+producer's behaviour proves the consumer is self-consistent and nothing
+more, which is why the compile-time pin against the spawn-site constant
+is the coupling and the fixture is the illustration. The three cases now
+feed the hourly stamp: a stamp that advances exactly once an
+hour must never fire, and a stamp that stops must fire after two missed
+sweeps plus `for`. Against the pre-fix threshold the healthy case FAILS at
+59m, 1h59m and 2h59m and the blind case fires early at 2h20m — the live
+defect reproduced offline with `promtool test rules` on the pinned
+v2.48.0 image.
+
+Running that fixture at all found it ALREADY RED on pristine main: four
+cases — both herd-alert cases and both circuit-breaker cases — expected
+annotation text that #809 had reworded (the herd's summary and
+description for the catch-up phase; the breaker's runbook step 4) without
+re-running `promtool test rules`. The header's own warning — a fixture
+that is not a gate rots — came true within a day of the change, on a
+change I made. All four expectations are brought back to the rule file's
+text here, so the fixture is green again; it is still not a gate, and no
+CI runner has promtool, so the honest position is unchanged: run it by
+hand when an alert's text or numbers move.
+
+Not changed, with the reason: the three data-loss alerts keep `for: 5m`
+and `keep_firing_for: 5m` — an hourly sweep cannot move a count that only
+a DEK deletion or a mis-stamping deploy moves, which is #794's own
+argument for the cadence, and their anti-flap window was about the
+post-boot zero, which the boot tick already closes; the cadence itself
+stays hourly; and no lint was written — the population is two blind
+detectors reading two stamps, and a per-alert compile-time pin against the
+constant the spawn actually uses is stronger than any grep over a YAML
+comment could be.
+

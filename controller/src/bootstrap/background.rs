@@ -947,6 +947,21 @@ impl CryptoOrphanScan {
     }
 }
 
+/// Cadence of the crypto-orphan sweep (`BackgroundTask::CryptoInvariantGauge`).
+/// Hourly since 2026-09-10 (#794) — 60 s before that; the cost argument is at
+/// the spawn site. **The blind-detector alert's threshold is derived from this
+/// number**: `TalosCryptoOrphanDetectorBlind` fires when the freshness stamp is
+/// older than a few of these, and the pin test
+/// `blind_detector_thresholds_match_the_sweep_cadence` fails if the two drift
+/// apart again — #794 moved this from 60 to 3600 and left the alert at `> 600`,
+/// so the alert fired for ~35 minutes of every hour on a healthy fleet.
+pub(crate) const CRYPTO_ORPHAN_SCAN_INTERVAL_SECS: u64 = 3600;
+
+/// Cadence of the catalog missing-WASM sweep
+/// (`BackgroundTask::CatalogMissingWasmGauge`); consumed by
+/// `TalosCatalogMissingWasmDetectorBlind` under the same pin.
+pub(crate) const CATALOG_MISSING_WASM_SCAN_INTERVAL_SECS: u64 = 300;
+
 /// Run the three orphan probes. Each is independent — one failure does not
 /// skip the others, because two measured gauges are strictly better than none
 /// and the freshness stamp records that the sweep was incomplete either way.
@@ -1095,7 +1110,9 @@ pub(crate) fn spawn_metrics_gauge_tasks(
     {
         let pool = db_pool.clone();
         spawn_supervised(BackgroundTask::CryptoInvariantGauge, async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                CRYPTO_ORPHAN_SCAN_INTERVAL_SECS,
+            ));
             loop {
                 // First iteration: immediate (interval's initial tick).
                 ticker.tick().await;
@@ -1147,7 +1164,9 @@ pub(crate) fn spawn_metrics_gauge_tasks(
     {
         let pool = db_pool.clone();
         spawn_supervised(BackgroundTask::CatalogMissingWasmGauge, async move {
-            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(300));
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(
+                CATALOG_MISSING_WASM_SCAN_INTERVAL_SECS,
+            ));
             ticker.tick().await;
             loop {
                 ticker.tick().await;
@@ -6865,6 +6884,75 @@ mod crypto_orphan_blindness_tests {
     #[test]
     fn no_collector_is_not_a_panic() {
         publish_crypto_orphan_scan(None, &ok_scan());
+    }
+
+    /// A blind-detector threshold must sit ABOVE one healthy sweep interval and
+    /// within a few of them — read out of the chart file at compile time (#630's
+    /// rule) against the constant the spawn site actually uses.
+    ///
+    /// The defect this pins: #794 moved the crypto-orphan sweep from 60 s to
+    /// 3600 s for cost and left `TalosCryptoOrphanDetectorBlind` at `> 600`,
+    /// whose own comment still said "the sweep runs every 60s". A healthy
+    /// controller is then 601–3600 s stale for fifty of every sixty minutes,
+    /// and the alert — `warning`, category `observability` — fired for ~35
+    /// minutes of every hour on the reference fleet from the deploy until this
+    /// was measured (15.3 of 27 hours), the permanently-red shape that trains
+    /// operators to ignore red. The lower bound is that defect's guard: at
+    /// least two intervals, so the alert cannot fire between two sweeps that
+    /// both completed. The upper bound keeps it a detector: eight intervals is
+    /// a working shift for the hourly sweep and forty minutes for the
+    /// five-minute one.
+    ///
+    /// Textual, deliberately: it finds the alert's own `expr` and reads the
+    /// integer after `>`. A threshold spelled as an expression (`2 * 3600`)
+    /// would fail this test loudly rather than pass it.
+    #[test]
+    fn blind_detector_thresholds_match_the_sweep_cadence() {
+        const ALERTS: &str = include_str!("../../../deploy/helm/talos/files/alerts.yaml");
+        fn threshold_secs(alert: &str, series: &str) -> u64 {
+            let start = ALERTS
+                .find(&format!("- alert: {alert}"))
+                .unwrap_or_else(|| panic!("{alert} is not defined in alerts.yaml"));
+            let block = &ALERTS[start..];
+            let at = block
+                .find(series)
+                .unwrap_or_else(|| panic!("{alert}'s expr does not read {series}"));
+            let after = &block[at + series.len()..];
+            let gt = after.find('>').expect("a `> <secs>` threshold");
+            after[gt + 1..]
+                .trim_start()
+                .split(|c: char| !c.is_ascii_digit())
+                .next()
+                .and_then(|d| d.parse().ok())
+                .unwrap_or_else(|| panic!("{alert}'s threshold is not a plain integer"))
+        }
+        for (alert, series, interval) in [
+            (
+                "TalosCryptoOrphanDetectorBlind",
+                "time() - talos_crypto_orphan_scan_last_success_timestamp_seconds",
+                super::CRYPTO_ORPHAN_SCAN_INTERVAL_SECS,
+            ),
+            (
+                "TalosCatalogMissingWasmDetectorBlind",
+                "time() - talos_catalog_missing_wasm_scan_last_success_timestamp_seconds",
+                super::CATALOG_MISSING_WASM_SCAN_INTERVAL_SECS,
+            ),
+        ] {
+            let threshold = threshold_secs(alert, series);
+            assert!(
+                threshold >= 2 * interval,
+                "{alert}: threshold {threshold}s is below two sweep intervals \
+                 ({interval}s each) — a healthy controller is up to one interval \
+                 stale between sweeps, so this alert would fire on a fleet whose \
+                 sweep is completing on time"
+            );
+            assert!(
+                threshold <= 8 * interval,
+                "{alert}: threshold {threshold}s is more than eight sweep intervals \
+                 ({interval}s each) — a detector that takes a working shift to \
+                 notice is not one"
+            );
+        }
     }
 }
 
