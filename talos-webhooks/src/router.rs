@@ -509,6 +509,7 @@ impl WebhookRouter {
                     false,
                 );
             }
+            talos_metrics::record_rate_limit_hit(talos_metrics::RateLimitKind::Webhook);
             self.log_request(
                 trigger_id,
                 headers,

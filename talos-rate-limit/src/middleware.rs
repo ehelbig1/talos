@@ -422,6 +422,9 @@ pub async fn rate_limit_middleware(
             Ok(response)
         }
         Err(not_until) => {
+            // Counted whatever the wire shape below (429, or the GraphQL
+            // 200-with-RATE_LIMITED variant): both are one refused request.
+            talos_metrics::record_rate_limit_hit(talos_metrics::RateLimitKind::Ip);
             // MCP-499: compute the actual replenishment time from
             // governor and surface it via `Retry-After`. Pre-fix, the
             // response body said "Wait for 4s" but no `Retry-After`
@@ -536,6 +539,7 @@ pub async fn global_rate_limit_middleware(
             Ok(response)
         }
         Err(not_until) => {
+            talos_metrics::record_rate_limit_hit(talos_metrics::RateLimitKind::Global);
             // MCP-569: dynamic Retry-After from governor's actual
             // replenishment time, matching the per-IP limiter's
             // behavior (MCP-499). Static "Retry-After: 30" was at
@@ -1179,5 +1183,33 @@ mod tests {
         );
         // Should allow — falls back to in-memory limiter
         assert!(limiter.check("test-user").await);
+    }
+
+    /// Both limiter refusals must count on `talos_rate_limit_hits_total`.
+    /// A SOURCE PIN, stated as such: the middleware needs an axum `Next`,
+    /// a `ConnectInfo` and the production env gate to drive, so the
+    /// recorder's own behaviour is proved in `talos-metrics`
+    /// (`security_counters_are_seeded_and_their_recorders_move_them`) and
+    /// this pins that each `Err(not_until)` arm reaches it with the right
+    /// kind — the two lines a revert would delete.
+    #[test]
+    fn both_refusal_arms_record_a_rate_limit_hit() {
+        let src = include_str!("middleware.rs");
+        let per_ip = src
+            .split("pub async fn rate_limit_middleware(")
+            .nth(1)
+            .expect("per-IP middleware")
+            .split("pub fn create_global_rate_limiter(")
+            .next()
+            .expect("per-IP body");
+        assert!(per_ip.contains("record_rate_limit_hit(talos_metrics::RateLimitKind::Ip)"));
+        let global = src
+            .split("pub async fn global_rate_limit_middleware(")
+            .nth(1)
+            .expect("global middleware")
+            .split("\n}\n")
+            .next()
+            .expect("global body");
+        assert!(global.contains("record_rate_limit_hit(talos_metrics::RateLimitKind::Global)"));
     }
 }
