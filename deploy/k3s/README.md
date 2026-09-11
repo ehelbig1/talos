@@ -82,6 +82,9 @@ TALOS_FRONTEND_DIGEST=sha256:0000...
 # TALOS_GHCR_REPO=talos                       # for sigstore identity regex
 # TALOS_DISABLE_SIGSTORE=yes                  # admit unsigned images (first deploy)
 # TALOS_IMAGE_PULL_SECRET=ghcr-pull           # if your ghcr packages are private
+# TALOS_WORKER_TRUST=auto                     # RFC 0010 worker trust: auto (fresh → full; existing
+#                                             # cluster advances one phase per run), hold, off, A..D
+#                                             # — see docs/deployment.md "Worker trust"
 
 # Optional — LLM provider keys. Empty = controller skips that provider.
 # ANTHROPIC_API_KEY=

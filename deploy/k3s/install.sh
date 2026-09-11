@@ -48,6 +48,17 @@
 #                              Set this AFTER you've run the template-publish.yml workflow at
 #                              least once, otherwise the Library / Catalog will be empty.
 #   TALOS_REGISTRY_NAMESPACE   Path prefix within the registry. Default: $TALOS_GHCR_OWNER/talos-tools
+#   TALOS_WORKER_TRUST         RFC 0010 worker trust (Ed25519 dispatch signing, per-worker
+#                              result signing, per-execution envelope sealing). Default
+#                              "auto": a FRESH install gets the full posture (phase D);
+#                              an EXISTING cluster advances ONE phase per run
+#                              (A → B → C → D — each phase distributes a key the next
+#                              one starts signing with, so no upgrade ever has a pod
+#                              that cannot verify its peer; see lib/worker-trust.sh).
+#                              "hold" re-applies the current phase; "off" renders the
+#                              legacy posture; "A".."D" pins a phase (roll back ONE
+#                              step at a time). The applied phase is recorded in
+#                              /etc/talos/worker-trust.phase after a successful upgrade.
 #   TALOS_SIGSTORE_REQUIRED    Worker-side cosign verification of OCI templates.
 #                              Unset → "disabled" is rendered EXPLICITLY (the worker
 #                                      refuses to boot in production on an empty value —
@@ -138,6 +149,10 @@ TALOS_GHCR_REPO="${TALOS_GHCR_REPO:-talos}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHART_DIR="$(cd "$SCRIPT_DIR/../helm/talos" && pwd)"
 [[ -f "$CHART_DIR/Chart.yaml" ]] || die "chart not found at $CHART_DIR — run from a full talos checkout."
+# shellcheck source=lib/worker-trust.sh
+source "$SCRIPT_DIR/lib/worker-trust.sh"
+wt_openssl_supports_ed25519 || die "openssl here cannot generate Ed25519 keys (need OpenSSL 1.1.1+/3.x) — required to mint the worker-trust keypairs."
+WT_MARKER=/etc/talos/worker-trust.phase
 
 # ── 1. Install k3s ───────────────────────────────────────────────
 if command -v k3s >/dev/null 2>&1; then
@@ -260,6 +275,22 @@ HAS_BOOTSTRAP=0; HAS_NEO4J=0
 k3s kubectl -n "$TALOS_NAMESPACE" get secret "$SECRET_NAME"        >/dev/null 2>&1 && HAS_BOOTSTRAP=1
 k3s kubectl -n "$TALOS_NAMESPACE" get secret "$NEO4J_SECRET_NAME"  >/dev/null 2>&1 && HAS_NEO4J=1
 
+# ── Worker-trust phase for THIS run (see lib/worker-trust.sh for the why) ──
+WT_LAST=""
+[[ -f "$WT_MARKER" ]] && WT_LAST="$(tr -d '[:space:]' < "$WT_MARKER")"
+WT_FRESH=no; [[ $HAS_BOOTSTRAP -eq 0 ]] && WT_FRESH=yes
+WT_PHASE="$(wt_next_phase "$WT_LAST" "$WT_FRESH" "${TALOS_WORKER_TRUST:-auto}")" || die "invalid TALOS_WORKER_TRUST"
+log "$(wt_describe "$WT_PHASE")"
+if [[ "$WT_FRESH" = no && "$WT_PHASE" != "$WT_LAST" && "${TALOS_WORKER_TRUST:-auto}" = auto ]]; then
+    log "  (previous run applied '${WT_LAST:-none}'; each run advances one phase — re-run install.sh until D)"
+fi
+
+# secret_get KEY → the decoded value of a bootstrap-Secret key ("" if absent).
+secret_get() {
+    k3s kubectl -n "$TALOS_NAMESPACE" get secret "$SECRET_NAME" \
+        -o "jsonpath={.data.$1}" 2>/dev/null | base64 -d 2>/dev/null || true
+}
+
 # In-cluster Postgres credentials are managed out-of-band from the
 # chart's `postgres.auth.passwordSecret.create=false` path. When the
 # operator opts in, we:
@@ -341,6 +372,25 @@ if [[ $HAS_BOOTSTRAP -eq 1 && $HAS_NEO4J -eq 1 ]]; then
     backfill_secret_key NATS_WORKER_USER "talos-worker"
     backfill_secret_key NATS_WORKER_PASSWORD "$(openssl rand -base64 32 | tr -d '+=/' | head -c 32)"
     backfill_secret_key PROMETHEUS_SCRAPE_TOKEN "$(openssl rand -hex 32)"
+    # Worker-trust keypairs (2026-09-11). Seeds are minted ONCE and kept; the
+    # public halves are stored beside them so every later run can render
+    # them into the overlay without re-deriving. The worker seed lives under
+    # a STAGED key the chart does not mount until phase B promotes it to
+    # TALOS_WORKER_SIGNING_KEY — a worker that holds a signing key starts
+    # signing results with it, and the controller can verify those only after
+    # phase A gave it the public key (lib/worker-trust.sh).
+    backfill_secret_key TALOS_CONTROLLER_SIGNING_KEY "$(wt_ed25519_seed_hex)"
+    backfill_secret_key TALOS_CONTROLLER_PUBLIC_KEY "$(wt_ed25519_pub_hex_from_seed "$(secret_get TALOS_CONTROLLER_SIGNING_KEY)")"
+    if [[ -z "$(secret_get TALOS_WORKER_SIGNING_KEY_STAGED)" && -n "$(secret_get TALOS_WORKER_SIGNING_KEY)" ]]; then
+        # An operator who followed the manual runbook already provisioned the
+        # live key: adopt it as the staged copy rather than minting a second.
+        backfill_secret_key TALOS_WORKER_SIGNING_KEY_STAGED "$(secret_get TALOS_WORKER_SIGNING_KEY)"
+    fi
+    backfill_secret_key TALOS_WORKER_SIGNING_KEY_STAGED "$(wt_ed25519_seed_hex)"
+    backfill_secret_key TALOS_WORKER_PUBLIC_KEY "$(wt_ed25519_pub_hex_from_seed "$(secret_get TALOS_WORKER_SIGNING_KEY_STAGED)")"
+    if wt_worker_key_live "$WT_PHASE"; then
+        backfill_secret_key TALOS_WORKER_SIGNING_KEY "$(secret_get TALOS_WORKER_SIGNING_KEY_STAGED)"
+    fi
 elif [[ $HAS_BOOTSTRAP -ne $HAS_NEO4J ]]; then
     die "secret state is inconsistent — exactly one of $SECRET_NAME / $NEO4J_SECRET_NAME exists. Delete both and rerun."
 else
@@ -379,6 +429,15 @@ else
     # per-worker isolation would need NATS accounts / auth callout.
     NATS_WORKER_USER="talos-worker"
     NATS_WORKER_PASSWORD=$(rand_b64_pw)
+
+    # RFC 0010 worker-trust keypairs — a fresh install has no old pods to
+    # disagree with, so `auto` applies phase D at once (lib/worker-trust.sh).
+    # The worker seed is stored twice: STAGED (always) and live (when the
+    # phase says workers sign) — the same two keys the upgrade path uses.
+    WT_CTL_SEED=$(wt_ed25519_seed_hex)
+    WT_CTL_PUB=$(wt_ed25519_pub_hex_from_seed "$WT_CTL_SEED")
+    WT_WRK_SEED=$(wt_ed25519_seed_hex)
+    WT_WRK_PUB=$(wt_ed25519_pub_hex_from_seed "$WT_WRK_SEED")
 
     NEO4J_PASSWORD=$(rand_b64_pw)
 
@@ -423,6 +482,10 @@ else
         --from-literal=NATS_CLUSTER_PASSWORD="$NATS_CLUSTER_PASSWORD"
         --from-literal=NATS_WORKER_USER="$NATS_WORKER_USER"
         --from-literal=NATS_WORKER_PASSWORD="$NATS_WORKER_PASSWORD"
+        --from-literal=TALOS_CONTROLLER_SIGNING_KEY="$WT_CTL_SEED"
+        --from-literal=TALOS_CONTROLLER_PUBLIC_KEY="$WT_CTL_PUB"
+        --from-literal=TALOS_WORKER_SIGNING_KEY_STAGED="$WT_WRK_SEED"
+        --from-literal=TALOS_WORKER_PUBLIC_KEY="$WT_WRK_PUB"
         --from-literal=NEO4J_USER="neo4j"
         --from-literal=NEO4J_PASSWORD="$NEO4J_PASSWORD"
         --from-literal=TALOS_MASTER_KEY="$TALOS_MASTER_KEY"
@@ -469,6 +532,9 @@ else
         --from-literal=TOTP_ISSUER="${TOTP_ISSUER:-Talos}"
     )
 
+    if wt_worker_key_live "$WT_PHASE"; then
+        args+=(--from-literal=TALOS_WORKER_SIGNING_KEY="$WT_WRK_SEED")
+    fi
     k3s kubectl -n "$TALOS_NAMESPACE" create secret generic "$SECRET_NAME" "${args[@]}"
     ok "bootstrap secret created (${#args[@]} keys)"
 
@@ -546,8 +612,20 @@ else
     POSTGRES_BLOCK="postgres: { enabled: false }"
 fi
 
+# Worker-trust env for this phase, rendered from the PUBLIC halves stored in
+# the bootstrap Secret. Empty for a side that gains no key at this phase, in
+# which case the `env:` map is omitted (Helm deep-merges it with values.yaml).
+WT_CTL_LINES="$(wt_render_controller_env "$WT_PHASE" "$(secret_get TALOS_WORKER_PUBLIC_KEY)")"
+WT_WRK_LINES="$(wt_render_worker_env "$WT_PHASE" "$(secret_get TALOS_CONTROLLER_PUBLIC_KEY)")"
+WT_CONTROLLER_ENV_BLOCK=""; [[ -n "$WT_CTL_LINES" ]] && WT_CONTROLLER_ENV_BLOCK=$(printf '  env:\n%s' "$WT_CTL_LINES")
+WT_WORKER_ENV_BLOCK="";     [[ -n "$WT_WRK_LINES" ]] && WT_WORKER_ENV_BLOCK=$(printf '  env:\n%s' "$WT_WRK_LINES")
+if wt_phase_at_least "$WT_PHASE" A && ! wt_is_hex64 "$(secret_get TALOS_WORKER_PUBLIC_KEY)"; then
+    die "TALOS_WORKER_PUBLIC_KEY missing from $SECRET_NAME — cannot render worker-trust phase $WT_PHASE"
+fi
+
 cat > "$OVERLAY" <<EOF
 # Generated by deploy/k3s/install.sh — do not edit by hand.
+# Worker trust: $(wt_describe "$WT_PHASE")
 # Re-run install.sh to regenerate.
 ${PULL_SECRETS_BLOCK}
 
@@ -561,6 +639,7 @@ controller:
   image:
     repository: "ghcr.io/${TALOS_GHCR_OWNER}/talos-controller"
     digest: "${TALOS_CONTROLLER_DIGEST}"
+${WT_CONTROLLER_ENV_BLOCK}
   # OCI template registry. When TALOS_REGISTRY_URL is set in install.env, the
   # controller skips disk template seeding and pulls catalog metadata from the
   # configured registry. See .github/workflows/template-publish.yml — that
@@ -589,6 +668,7 @@ worker:
   image:
     repository: "ghcr.io/${TALOS_GHCR_OWNER}/talos-worker"
     digest: "${TALOS_WORKER_DIGEST}"
+${WT_WORKER_ENV_BLOCK}
   # Sigstore enforcement for OCI template signatures. See
   # talos-worker-runtime/src/module_fetcher.rs (SigstorePolicy) for the
   # runtime check + worker.sigstore in values.yaml for the chart key.
@@ -651,6 +731,15 @@ helm upgrade --install "$TALOS_RELEASE" "$CHART_DIR" \
     --wait --timeout 10m
 
 ok "Talos installed"
+
+# Record the worker-trust phase that is now RUNNING, so the next `auto` run
+# advances exactly one step. Written only after `helm upgrade --wait`
+# succeeded: a failed upgrade must not claim a phase it did not reach.
+printf '%s\n' "$WT_PHASE" > "$WT_MARKER"; chmod 0600 "$WT_MARKER"
+ok "$(wt_describe "$WT_PHASE") — recorded in $WT_MARKER"
+if [[ "$WT_PHASE" != D && "$WT_PHASE" != off && "${TALOS_WORKER_TRUST:-auto}" = auto ]]; then
+    warn "worker trust is not yet at phase D — re-run install.sh to advance to $(wt_succ "$WT_PHASE") (one phase per run keeps every upgrade loss-free)"
+fi
 
 # ── 8.5 Preserve client source IP through Traefik ────────────────
 # The k3s-bundled Traefik Service ships with externalTrafficPolicy=Cluster,
@@ -718,6 +807,7 @@ printf '  1. Visit  https://%s/  once DNS + LE cert propagates (~2 min).\n' "$TA
 printf '  2. API    https://%s/health\n' "$TALOS_API_HOST"
 printf '  3. Pods   kubectl -n %s get pods\n' "$TALOS_NAMESPACE"
 printf '  4. Logs   kubectl -n %s logs -f deploy/%s\n' "$TALOS_NAMESPACE" "$CONTROLLER_DEPLOY"
+printf '  ·  Worker trust: %s\n' "$(wt_describe "$WT_PHASE")"
 printf '  5. Backup kubectl -n %s get secret %s -o yaml > /root/%s.backup.yaml\n' \
     "$TALOS_NAMESPACE" "$SECRET_NAME" "$SECRET_NAME"
 printf '\n'

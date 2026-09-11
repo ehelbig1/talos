@@ -353,6 +353,15 @@ controller:
     # to "true". Rollback is instant: set "false" and restart.
     JWT_REQUIRE_AUD: "true"
     # ── RFC 0010 worker-trust (P1 Ed25519 + P3 envelope sealing) ─────
+    # deploy/k3s/install.sh APPLIES THIS FOR YOU (2026-09-11): a fresh
+    # install gets the full posture; an existing cluster advances one phase
+    # per run (A: controller learns the worker key → B: workers get their
+    # identity → C: controller signs + seals → D: both sides require it),
+    # because each phase distributes a key the next one starts signing with
+    # and Helm rolls both Deployments together. The installer renders these
+    # env keys into its values overlay from the public halves it stores in
+    # the bootstrap Secret; see deploy/k3s/lib/worker-trust.sh. The manual
+    # runbook below is for bare-helm operators, and it is the SAME sequence.
     # Enablement runbook (canaried on the dev stack 2026-07-06, incl. a
     # sealed-secret round-trip proven end-to-end under "required"):
     #   1. Keys: `controller generate-worker-trust-keypair --role

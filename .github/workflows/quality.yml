@@ -71,6 +71,14 @@ jobs:
         # `// secret-scan-allow:` opt-out marker, so the full gate now runs here.
         run: make audit
 
+      - name: Installer worker-trust state machine + Ed25519 derivation
+        # deploy/k3s/lib/worker-trust.sh is pure bash the k3s installer sources;
+        # its test pins the four-phase order (each phase distributes a key the
+        # next one signs with) and checks the OpenSSL seed→public-key derivation
+        # against RFC 8032 vector 1. Ubuntu's OpenSSL 3 runs the derivation
+        # part that a LibreSSL laptop skips.
+        run: bash deploy/k3s/tests/worker-trust-test.sh
+
   # ── Rust unit tests: library unit tests + the DB-free integration binaries ──
   # The bulk is `--lib` (~1.3k DB-free unit tests). On top of that we explicitly
   # run the two `tests/`-dir integration binaries that are DB-free once their
