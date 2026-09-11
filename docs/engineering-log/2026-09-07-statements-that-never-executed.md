@@ -101,3 +101,32 @@ counts above.
 `create_test_organization` omits the `NOT NULL` `slug`, so it fails on every
 call. It is the same class inside the harness; its other callers are outside
 this change and `dead_statement_tests` seeds its own row instead.
+
+## The roots widened to every crate (2026-09-11)
+
+#786's record of this check said, with numbers, that its `SQL_PREPARE_ROOTS`
+was a hardcoded list covering 77% of the statements its name claimed — 934 in
+the roots, 274 outside across 28 crates, "widening means proving 274
+statements PREPARE — its own package". This is that package, and it is short
+because the measurement decided it.
+
+Run against a fresh migrated `pgvector:pg17` template on 2026-09-11, the probe
+itself (not the grep, which under-counted by 15 on the inside and 4 on the
+outside) reports **949 statements over the 21 listed roots and 1227 over all
+140 crate `src/` roots** — 278 newly covered, led by `talos-ml` (85),
+`talos-oauth` (29), `controller` (24), `talos-engine` (20), `talos-webhooks`
+(19) and `talos-scheduler` (18). **Every one PREPARES. Zero findings.** The
+dynamic count moves 49 → 73 (out of range either way), the one marked opt-out
+and the two indeterminate-type statements are unchanged, and the run costs
+0.9 s against 0.6 s. The roots are now `controller`, `worker` and `talos-*` by
+glob, so the list cannot rot the way check 74's glob and check 64's runner
+list did; the zero-roots and zero-statements arms still fail loudly.
+
+Worth saying plainly: this found nothing, and that is the honest result of a
+gate widening rather than a disappointment. The 2026-09-07 sweep found eleven
+statements that could never run because eleven statements were broken; the
+278 outside the roots were simply never probed, and they happen to be right.
+What the widening buys is the next one — a renamed column in `talos-ml` (85
+statements, none previously gated) now fails the lint, not a request. The
+script's docstring also said "Check 87"; it is check 88.
+
