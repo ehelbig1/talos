@@ -301,4 +301,154 @@ async fn every_finalizer_counts_and_measures_the_row_it_finalized() {
         .await
         .is_err());
     assert_eq!((mod_count(O::Failed), mod_hist(O::Failed)), (c0, h0));
+
+    // ── the ENGINE's finalizer ───────────────────────────────────────────
+    // `PostgresModuleExecutionStore::record_completed` is what every
+    // workflow-dispatched module row is finalized through (sole caller:
+    // `finalize_module_execution_row`), and #814 wired every finalizer but
+    // this one — the post-deploy reconciliation read 14 completed rows
+    // against a counter at 0. Drive it with the three status strings the
+    // engine passes (`classify` in `engine_dispatch_single`).
+    use talos_workflow_engine_core::ModuleExecutionStore as _;
+    let store =
+        talos_engine::module_execution_store::PostgresModuleExecutionStore::new(pool.clone());
+    for (status, outcome) in [
+        ("completed", O::Completed),
+        ("failed", O::Failed),
+        ("timeout", O::Timeout),
+    ] {
+        let (c0, h0) = (mod_count(outcome), mod_hist(outcome));
+        let s0 = m
+            .module_execution_duration_seconds
+            .with_label_values(&[outcome.as_str()])
+            .get_sample_sum();
+        let x = new_module_exec(pool.clone(), ctx.execution_service.clone(), 7).await;
+        store
+            .record_completed(x, status, &json!({"via": "engine"}), Some(7000), None)
+            .await
+            .expect("engine store finalizes the running row");
+        assert_eq!(
+            (mod_count(outcome), mod_hist(outcome)),
+            (c0 + 1.0, h0 + 1),
+            "engine store `{status}` counts and measures exactly once"
+        );
+        let s1 = m
+            .module_execution_duration_seconds
+            .with_label_values(&[outcome.as_str()])
+            .get_sample_sum();
+        assert!(
+            s1 - s0 >= 6.9,
+            "engine store `{status}` observed the row's own age (>= 7 s), got {}",
+            s1 - s0
+        );
+    }
+    // The engine store refuses a row that is not pending/running and counts
+    // nothing for it — a second finalize of the row above is such a refusal.
+    let (c0, h0) = (mod_count(O::Completed), mod_hist(O::Completed));
+    let x = new_module_exec(pool.clone(), ctx.execution_service.clone(), 1).await;
+    store
+        .record_completed(x, "completed", &json!({}), None, None)
+        .await
+        .expect("first finalize");
+    // The store answers `Ok(())` for a refused re-finalize by design (it
+    // logs at debug and lets the engine carry on); what must hold is that
+    // the refusal COUNTED NOTHING.
+    store
+        .record_completed(x, "completed", &json!({}), None, None)
+        .await
+        .expect("a refused re-finalize is Ok(()), not an error");
+    assert_eq!(
+        (mod_count(O::Completed), mod_hist(O::Completed)),
+        (c0 + 1.0, h0 + 1),
+        "the refused re-finalize counted nothing"
+    );
+
+    // ── sibling cancellation: the ONE home for six former copies ─────────
+    // Two running module rows under one workflow execution, back-dated 5 s,
+    // plus a THIRD under a different workflow execution that must be left
+    // alone. Both cancelled rows are counted with their age; the control
+    // row is neither cancelled nor counted.
+    let wf_exec = new_running(pool.clone()).await;
+    let other_exec = new_running(pool.clone()).await;
+    let bound_module_exec =
+        |pool: Pool<Postgres>,
+         svc: std::sync::Arc<talos_module_executions::ModuleExecutionService>,
+         wf_exec: Uuid| async move {
+            let id = svc
+                .create_execution(
+                    module_id,
+                    user,
+                    Uuid::new_v4(),
+                    TriggerType::Manual,
+                    None,
+                    None,
+                    Some(wf_exec),
+                    Some(actor),
+                )
+                .await
+                .expect("create bound module execution");
+            backdate_module_execution(&pool, id, 5).await;
+            id
+        };
+    let a = bound_module_exec(pool.clone(), ctx.execution_service.clone(), wf_exec).await;
+    let b = bound_module_exec(pool.clone(), ctx.execution_service.clone(), wf_exec).await;
+    let control = bound_module_exec(pool.clone(), ctx.execution_service.clone(), other_exec).await;
+    let (c0, h0) = (mod_count(O::Cancelled), mod_hist(O::Cancelled));
+    let s0 = m
+        .module_execution_duration_seconds
+        .with_label_values(&[O::Cancelled.as_str()])
+        .get_sample_sum();
+    let cancelled = talos_workflow_repository::cancel_running_module_executions(
+        &pool,
+        wf_exec,
+        talos_workflow_repository::SiblingCancelReason::WorkflowTimedOut,
+    )
+    .await
+    .expect("cancel siblings");
+    assert_eq!(cancelled, 2, "exactly the two siblings of wf_exec");
+    assert_eq!(
+        (mod_count(O::Cancelled), mod_hist(O::Cancelled)),
+        (c0 + 2.0, h0 + 2),
+        "one count and one observation PER cancelled row"
+    );
+    let s1 = m
+        .module_execution_duration_seconds
+        .with_label_values(&[O::Cancelled.as_str()])
+        .get_sample_sum();
+    assert!(
+        s1 - s0 >= 9.8,
+        "two rows of >= 5 s each were observed, got {}",
+        s1 - s0
+    );
+    let rows: Vec<(Uuid, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, status, error_message FROM module_executions WHERE id = ANY($1) ORDER BY id",
+    )
+    .bind(vec![a, b, control])
+    .fetch_all(&pool)
+    .await
+    .expect("read rows back");
+    for (id, status, err) in &rows {
+        if *id == control {
+            assert_eq!(status, "running", "the other workflow's row is untouched");
+            assert_eq!(err.as_deref(), None);
+        } else {
+            assert_eq!(status, "cancelled");
+            assert_eq!(
+                err.as_deref(),
+                Some(talos_workflow_repository::SiblingCancelReason::WorkflowTimedOut.message()),
+                "the row says WHY it was cancelled"
+            );
+        }
+    }
+    // Idempotent: a second sweep finds no running sibling and counts nothing.
+    let (c0, h0) = (mod_count(O::Cancelled), mod_hist(O::Cancelled));
+    let again = talos_workflow_repository::cancel_running_module_executions(
+        &pool,
+        wf_exec,
+        talos_workflow_repository::SiblingCancelReason::WorkflowFailed,
+    )
+    .await
+    .expect("second sweep");
+    assert_eq!(again, 0);
+    assert_eq!((mod_count(O::Cancelled), mod_hist(O::Cancelled)), (c0, h0));
 }

@@ -7,6 +7,9 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# The ONE home for sibling cancellation (`cancel_running_module_executions`);
+# this crate held one of six byte-identical copies until 2026-09-11.
+talos-workflow-repository = { path = "../talos-workflow-repository" }
 anyhow.workspace = true
 chrono.workspace = true
 serde.workspace = true

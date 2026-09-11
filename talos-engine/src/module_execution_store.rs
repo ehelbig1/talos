@@ -485,7 +485,7 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
         // `module_error_type` for why, and for the under-reporting it costs.
         let error_type =
             crate::module_error_type::derive_error_type(status, redacted_error.as_deref());
-        let refused = sqlx::query(
+        let finalized = sqlx::query(
             "UPDATE module_executions \
              SET status = $1, output_data = $2, output_data_enc = $3, \
                  payload_enc_key_id = COALESCE(payload_enc_key_id, $4), \
@@ -496,7 +496,8 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
                  error_message = $7, \
                  error_type = $8, \
                  fuel_consumed = COALESCE($9, fuel_consumed), completed_at = NOW() \
-             WHERE id = $10 AND status IN ('pending', 'running')",
+             WHERE id = $10 AND status IN ('pending', 'running') \
+             RETURNING EXTRACT(EPOCH FROM (completed_at - started_at))::float8",
         )
         .bind(status)
         .bind(pt_output)
@@ -508,11 +509,34 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
         .bind(error_type)
         .bind(fuel_consumed)
         .bind(id)
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await
-        .map_err(|e| -> BoxError { e.into() })?
-        .rows_affected()
-            == 0;
+        .map_err(|e| -> BoxError { e.into() })?;
+        // THIS is the production finalizer for every workflow-dispatched module
+        // row — `ModuleExecutionService::complete_execution` serves the MCP
+        // test tools and the worker-result paths, not the engine. The first
+        // deploy of the module metrics (#814) wired that service and every
+        // other writer but this one, and the post-deploy reconciliation read
+        // 14 completed rows against a counter at 0. The duration is the row's
+        // own `completed_at - started_at`, RETURNED by this UPDATE; an
+        // unrecognised status string is logged and not counted rather than
+        // mislabelled.
+        if let Some(row) = &finalized {
+            use sqlx::Row as _;
+            let duration_secs = row
+                .try_get::<Option<f64>, _>(0)
+                .map_err(|e| -> BoxError { e.into() })?;
+            match talos_metrics::ModuleExecutionOutcome::from_status(status) {
+                Some(outcome) => talos_metrics::record_module_execution(outcome, duration_secs),
+                None => tracing::debug!(
+                    module_execution_id = %id,
+                    status,
+                    "record_completed: status is not a terminal outcome the module \
+                     instrument knows; row finalized, nothing counted"
+                ),
+            }
+        }
+        let refused = finalized.is_none();
         if refused {
             tracing::debug!(
                 module_execution_id = %id,

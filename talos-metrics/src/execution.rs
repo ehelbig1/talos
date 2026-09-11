@@ -32,6 +32,16 @@ impl ModuleExecutionOutcome {
         Self::Timeout,
         Self::Cancelled,
     ];
+
+    /// The outcome a `module_executions.status` string names, or `None` for a
+    /// non-terminal or unknown spelling. The engine's finalizer hands the
+    /// store a `&str` (`completed` / `failed` / `timeout`, from
+    /// `engine_dispatch_single::classify`), so the mapping lives here — beside
+    /// `as_str`, which it must invert — rather than at that call site.
+    #[must_use]
+    pub fn from_status(status: &str) -> Option<Self> {
+        Self::ALL.iter().copied().find(|o| o.as_str() == status)
+    }
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -39,6 +49,35 @@ impl ModuleExecutionOutcome {
             Self::Failed => "failed",
             Self::Timeout => "timeout",
             Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[cfg(test)]
+mod from_status_tests {
+    use super::ModuleExecutionOutcome;
+
+    #[test]
+    fn from_status_inverts_as_str_over_every_outcome() {
+        for o in ModuleExecutionOutcome::ALL {
+            assert_eq!(ModuleExecutionOutcome::from_status(o.as_str()), Some(*o));
+        }
+    }
+
+    #[test]
+    fn a_non_terminal_or_unknown_spelling_maps_to_nothing() {
+        // The engine's finalizer must not count a `running`/`pending` row
+        // under the nearest label, and a case or whitespace variant is not
+        // the column's spelling.
+        for s in [
+            "running",
+            "pending",
+            "Completed",
+            " completed",
+            "",
+            "success",
+        ] {
+            assert_eq!(ModuleExecutionOutcome::from_status(s), None, "{s:?}");
         }
     }
 }

@@ -7551,6 +7551,7 @@ dependencies = [
  "talos-draft-heuristics",
  "talos-tenancy",
  "talos-text-util",
+ "talos-workflow-repository",
  "tokio",
  "tracing",
  "tracing-subscriber",

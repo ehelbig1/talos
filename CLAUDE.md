@@ -1024,7 +1024,32 @@ event and no restart; and the signed-RPC data plane had a function named
   `fail_execution_unless_terminal` turned out to be the one failure path that
   had never counted on `talos_workflow_executions_total` either.
   `trigger_type` was dropped from the module counter — it reads `webhook` on
-  all 55 279 rows.
+  all 55 279 rows. **"Every finalizer" was wrong for the production module
+  path, and the deploy said so within the hour**: the workflow side reconciled
+  exactly (5 rows ↔ 5 counts ↔ 5 observations) while the module side read 14
+  completed rows against a counter at 0. The engine finalizes a
+  workflow-dispatched module row through `PostgresModuleExecutionStore::
+  record_completed` in `talos-engine` — its own UPDATE, not
+  `ModuleExecutionService` — and the DB test had driven the service. Wired
+  the same way (RETURNING the duration; the status string mapped through
+  `ModuleExecutionOutcome::from_status`, beside `as_str` which it inverts,
+  an unknown spelling logged and NOT counted). The `cancelled` outcome
+  had a second, wider hole: the sibling-cancellation UPDATE existed as SIX
+  byte-identical copies (engine node hook, engine chain runner, both
+  repositories, two scheduler paths) and none counted. ONE home now,
+  `talos_workflow_repository::cancel_running_module_executions(pool, wf_exec,
+  SiblingCancelReason)`, RETURNING each row's age and counting per row; the
+  reason is an enum because it is the row's `error_message`. Enumerate
+  finalizers by `grep "UPDATE module_executions"`, never by crate. Guards:
+  the DB test drives the real store for all three engine statuses, a
+  refused re-finalize (counts nothing), and the shared cancel fn against two
+  siblings plus a control row; four mutations, four caught at the exact
+  assertion (store record arm emptied; every status mapped to `completed`;
+  cancel loop's record removed; loop truncated to one row — that last one
+  is what "per row, not per call" buys); a compile-time source pin in the
+  workflow repository reads the four former copy sites and fails if the
+  literal returns. The archive's first M3 did not compile and was re-run —
+  a mutation that does not build proves nothing.
 
 **Measured and NOT changed.** `create_watch` accepted ANY `module_id` uuid with
 no error and no trace — the most likely origin of this fleet's dangling channel —

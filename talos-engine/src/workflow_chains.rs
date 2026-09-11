@@ -1173,15 +1173,11 @@ async fn run_single_workflow_chain(
             // to 'failed'.  That trigger fires on the UPDATE above and covers every
             // failure path across the codebase.  The explicit UPDATE below is kept as
             // defense-in-depth for environments where the migration hasn't been applied yet.
-            if let Err(db_err) = sqlx::query(
-                "UPDATE module_executions \
-                 SET status = 'cancelled', \
-                     completed_at = NOW(), \
-                     error_message = 'Workflow failed — parallel sibling cancelled' \
-                 WHERE workflow_execution_id = $1 AND status = 'running'",
+            if let Err(db_err) = talos_workflow_repository::cancel_running_module_executions(
+                db_pool,
+                execution_id,
+                talos_workflow_repository::SiblingCancelReason::WorkflowFailed,
             )
-            .bind(execution_id)
-            .execute(db_pool)
             .await
             {
                 tracing::warn!(execution_id = %execution_id, error = %db_err,

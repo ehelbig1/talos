@@ -3553,19 +3553,16 @@ impl AdvancedRepository {
     /// Cancel all still-running module_executions for a workflow execution.
     /// Called after marking a workflow as failed so parallel siblings are cleaned up.
     pub async fn cancel_running_module_executions(&self, execution_id: Uuid) -> Result<()> {
-        let result = sqlx::query(
-            "UPDATE module_executions \
-             SET status = 'cancelled', completed_at = NOW(), \
-                 error_message = 'Workflow failed — parallel sibling cancelled' \
-             WHERE workflow_execution_id = $1 AND status = 'running'",
+        let cancelled = talos_workflow_repository::cancel_running_module_executions(
+            &self.db_pool,
+            execution_id,
+            talos_workflow_repository::SiblingCancelReason::WorkflowFailed,
         )
-        .bind(execution_id)
-        .execute(&self.db_pool)
         .await
         .context("cancel_running_module_executions")?;
         tracing::info!(
             execution_id = %execution_id,
-            cancelled = result.rows_affected(),
+            cancelled,
             "sibling cancellation UPDATE complete"
         );
         Ok(())
