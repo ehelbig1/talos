@@ -1595,7 +1595,7 @@ fn sweep(
         duplicate_delivery: 0,
         multi_attempt: 0,
         errored,
-        unbound: 0,
+        standalone: 0,
         cap_hit,
         aborted,
         // One job per workflow execution in the fixture — enough to prove the
@@ -2119,7 +2119,7 @@ fn the_sweep_note_reports_both_grains() {
         duplicate_delivery: 0,
         multi_attempt: 0,
         errored: 1,
-        unbound: 0,
+        standalone: 0,
         cap_hit: false,
         aborted: None,
         rollup: talos_audit_ledger::WorkflowExecutionRollup {
@@ -2150,10 +2150,12 @@ fn the_sweep_note_reports_both_grains() {
     );
 }
 
-/// A job with no workflow execution was NOT attempted, and the note must say
-/// so rather than let it sit inside a clean count.
+/// A job with no workflow execution is a STANDALONE dispatch, verified under the
+/// `(job_id, job_id)` genesis its builder signed with (2026-09-11); the note
+/// must say how many took that contract rather than let them sit unnamed inside
+/// a clean count.
 #[test]
-fn unbound_jobs_are_disclosed_not_absorbed() {
+fn standalone_jobs_are_disclosed_not_absorbed() {
     let snapshot = talos_audit_ledger::ChainSweepSnapshot {
         scanned: 5,
         verified_ok: 3,
@@ -2162,7 +2164,7 @@ fn unbound_jobs_are_disclosed_not_absorbed() {
         duplicate_delivery: 0,
         multi_attempt: 0,
         errored: 0,
-        unbound: 2,
+        standalone: 2,
         cap_hit: false,
         aborted: None,
         rollup: talos_audit_ledger::WorkflowExecutionRollup {
@@ -2184,11 +2186,16 @@ fn unbound_jobs_are_disclosed_not_absorbed() {
         Some(snapshot),
     );
     assert!(
-        c.detail.contains("NOT attempted"),
-        "an unattempted job must never arrive inside a clean count: {}",
+        c.detail.contains("2 standalone job(s)"),
+        "a standalone job must be NAMED inside the count: {}",
         c.detail
     );
-    assert!(c.detail.contains("2 job(s)"), "{}", c.detail);
+    assert!(
+        c.detail
+            .contains("verified under the (job_id, job_id) genesis"),
+        "and the note must say which genesis it was verified under: {}",
+        c.detail
+    );
 }
 
 /// A candidate the caller could not resolve must NOT be rendered as "there is

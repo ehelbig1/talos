@@ -386,10 +386,15 @@ id itself, and the row is verified under `(job, job)` and disclosed as
 `ChainSweepStats::standalone`. A standalone job rolls up under its own id — a
 run of one, which is what a module-bound webhook delivery is to an operator.
 
-Not changed, stated: the security audit's round-trip probe still selects the
-most recent BOUND job; the three historical rows keep failing if ever
-re-swept, because their column has already been moved — forward-only, like
-the partition. And the log-only record of a verification failure is still
+The security audit's round-trip probe offers a standalone job too, under its
+own genesis — it had excluded them as unbindable. Not changed, stated: the
+three historical rows keep failing if ever re-swept, because their column has
+already been moved — forward-only, like the partition. And the first push of
+this package failed CI twice on test targets my gates never compiled: the
+`--lib` unit runs and a `--no-deps` clippy do not build `controller/tests/*`
+or a crate's `mod tests;` file, and both constructed the type whose field
+became an `Option`. `cargo check --workspace --all-targets` is now in the
+pre-push sequence for a type change. And the log-only record of a verification failure is still
 log-only; the re-verification tool that found these was written for the
 occasion and deleted with it.
 

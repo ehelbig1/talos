@@ -795,11 +795,10 @@ controller re-dispatch of one `job_id` wrote a second chain under one prefix.
   row is untouched, the run row carries the link, and the sweep verifies the
   row under `(job, job)`; `talos-audit-event` pins the defect as a unit test
   (the same sealed chain passes under `(job, job)` and fails with
-  `GenesisMismatch` under `(run, job)`). **Not changed, stated**: the security
-  audit's round-trip probe still selects the most recent BOUND job (`WHERE
-  workflow_execution_id IS NOT NULL`); the three historical rows keep failing
-  if ever re-swept, since their column was already moved — forward-only, like
-  the partition. Enumerate the ledger's writers by what the WORKER hashes, not
+  `GenesisMismatch` under `(run, job)`); the security audit's round-trip probe
+  offers a standalone job too, under its own genesis. **Not changed, stated**:
+  the three historical rows keep failing if ever re-swept, since their column
+  was already moved — forward-only, like the partition. Enumerate the ledger's writers by what the WORKER hashes, not
   by what the database later says.
 
 **Measured and NOT changed / latent.** `module_executions.workflow_execution_id`

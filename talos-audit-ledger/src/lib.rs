@@ -764,13 +764,16 @@ pub async fn latest_verifiable_ledger_target(
     db_pool: &PgPool,
     settle_secs: i64,
 ) -> Result<Option<LedgerTarget>> {
-    let row = sqlx::query_as::<_, (Uuid, Uuid)>(
+    // A NULL `workflow_execution_id` is a STANDALONE dispatch (module-bound
+    // webhook / push), sealed under `genesis(job_id, job_id)` — a verifiable
+    // candidate, not an unbindable one (2026-09-11; until then this excluded
+    // them with `AND workflow_execution_id IS NOT NULL`).
+    let row = sqlx::query_as::<_, (Uuid, Option<Uuid>)>(
         "SELECT id, workflow_execution_id \
          FROM module_executions \
          WHERE status IN ('completed', 'failed', 'cancelled') \
            AND completed_at IS NOT NULL \
            AND completed_at <= NOW() - (INTERVAL '1 second' * $1) \
-           AND workflow_execution_id IS NOT NULL \
          ORDER BY completed_at DESC, id DESC \
          LIMIT 1",
     )
@@ -780,7 +783,7 @@ pub async fn latest_verifiable_ledger_target(
     Ok(row.map(
         |(module_execution_id, workflow_execution_id)| LedgerTarget {
             module_execution_id,
-            workflow_execution_id: Some(workflow_execution_id),
+            workflow_execution_id,
         },
     ))
 }
