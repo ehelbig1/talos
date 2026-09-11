@@ -1123,6 +1123,12 @@ pub(crate) async fn build_platform_services(
     let metrics = metrics::TalosMetrics::new()
         .map_err(|e| anyhow::anyhow!("Failed to initialize metrics: {}", e))?;
     metrics::set_global(metrics.clone());
+    // Pre-seed the per-tool MCP call counter at 0 over the closed
+    // (tool × outcome) product. A counter born at 1 loses its first
+    // increment to increase()/rate() — measured 2026-09-11: session_start
+    // read 0 over 7 days against ~15 real calls. The histogram stays
+    // unseeded (#786); see `seed_tool_call_series` for the cost.
+    talos_mcp_handlers::tool_labels::seed_tool_call_series(&metrics);
     // Register the panic + supervised-task-exit collectors into the SAME
     // registry `/metrics/prometheus` renders, and pre-seed every series
     // this process can increment. A duplicate registration (a second

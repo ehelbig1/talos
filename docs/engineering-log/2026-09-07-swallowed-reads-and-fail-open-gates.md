@@ -1369,3 +1369,57 @@ when widened, and it is the shape the three worst fail-open gates took); and a
 verdict is a judgement about the RESPONSE, so it can be wrong where the response
 shape is not obvious from the call site. "Zero claims" means zero of the
 population this detector can see.
+
+## The counter that was born at one (2026-09-11)
+
+**How it was found.** Reading the #786 instrument for a slow-tail sweep after
+the #811 deploy, `topk(10, sum by (tool) (increase(talos_mcp_tool_duration_seconds_count[7d])))`
+answered **2** calls in seven days — `set_workflow_priority` twice, everything
+else 0 — on a platform this session alone had called hundreds of times.
+`session_start` specifically: instant value 1 (this lifetime), `increase[7d]`
+= 0, `resets[7d]` = 0, 4 425 samples in the window, and a subquery summing
+each lifetime's first sample = **15**. The controller had restarted thirteen
+times in that window; every lifetime's first `session_start` sample was
+already `1`.
+
+**The mechanism.** `increase()` and `rate()` compute from the samples in the
+range. A series that appears with value 1 has no `0 → 1` edge, so its first
+increment is invisible; a counter reset later in the window IS handled, but a
+series BIRTH is not a reset. So an unseeded counter under-counts by exactly
+one per `(tool, outcome)` per process lifetime — negligible on a fleet that
+restarts monthly, total on a fleet that restarts thirteen times in two days,
+and for any tool called once per lifetime it is 100% at any restart rate.
+The instrument's HELP said "an absent (tool, outcome) means that tool has not
+been called since process start", which is true of the instant read and says
+nothing about the rate read that dashboards use. #786's decision not to
+pre-seed was argued from SCRAPE COST and from "nothing alerts on the series,
+so absent ≠ zero does not apply" — both true, and neither is this defect. The
+absent-vs-zero rule is about alerts on an absent series; this is about a
+PRESENT series that reads low.
+
+**What changed and what did not.** `talos_mcp_tool_calls_total` — the plain
+counter #786 registered beside the histogram, one text line per pair — is now
+seeded at 0 over the closed product from the controller bootstrap immediately
+after `set_global`: `declared_tool_params()` ∪ the two sentinels × the six
+outcomes. The seed lives in `talos_mcp_handlers::tool_labels` because the
+closed tool set is that crate's build-time registry; `talos-metrics` cannot
+name it without inverting the layering, and its own cold-registry test — a
+bare `TalosMetrics::new()` exports no per-tool series — stays true. **The
+histogram stays unseeded**, which is the #786 decision intact: 19 lines per
+pair is the 2.1 MB argument, and `_count` was never the right series for
+call volume. Both HELP texts now say which series answers which question.
+Cost is measured in a test rather than asserted — **195 825 bytes over
+2 130 lines, 91 B per line**, so the 76 KB controller scrape becomes ~272 KB,
+a 3.6× scrape where the histogram product would have been 35× — so a seventh
+outcome or a batch of new tools moves a number somebody reads. The
+talos-metrics cost pin's first-pair number moved 2941 → 3459 because both
+HELP texts grew; the marginal 1996 the histogram decision rests on did not.
+
+**Stated limits.** The histogram's `_count` still drops the first call per
+lifetime — by design now, and said so in its HELP. The seed makes the counter
+honest under `increase()` for every pair the chokepoint can emit; a tool
+added to the registry is seeded on the next boot, not before. And the
+under-count was itself only visible because the dev fleet restarts on every
+merge; a production fleet would have carried the same defect at a size nobody
+would notice, which is the usual reason this class survives.
+

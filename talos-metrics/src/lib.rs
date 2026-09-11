@@ -2807,7 +2807,10 @@ impl TalosMetrics {
                  the caller's own string) × outcome (ok | error | refused | unknown_tool | \
                  denied | not_found) × class (served | declined | finding, a pure function \
                  of outcome, so it adds no series). NOT pre-seeded: an absent \
-                 (tool, outcome) means that tool has not been called since process start.",
+                 (tool, outcome) means that tool has not been called since process start \
+                 — and its _count is therefore born at 1, so increase()/rate() drop the \
+                 FIRST call of every pair per process lifetime. Read call VOLUME from \
+                 talos_mcp_tool_calls_total, which IS pre-seeded; read latency here.",
             )
             .buckets(exponential_buckets(0.001, 2.0, 16).expect("valid exponential buckets")),
             &["tool", "outcome", "class"],
@@ -2821,8 +2824,13 @@ impl TalosMetrics {
                  same closed-set rule as talos_mcp_tool_duration_seconds. class is served \
                  | declined | finding: a REFUSAL the platform issued correctly is declined, \
                  not finding, so a client looping on a tool it lacks the capability for no \
-                 longer moves the same series as an outage. NOT pre-seeded (see that \
-                 metric's HELP and the field docs for the measured scrape cost).",
+                 longer moves the same series as an outage. PRE-SEEDED at 0 over every \
+                 declared tool × outcome by talos_mcp_handlers::tool_labels::\
+                 seed_tool_call_series at controller boot (2026-09-11): a counter born at \
+                 1 loses its first increment to increase()/rate(), and on a fleet that \
+                 restarts often a tool called once per lifetime read 0 forever \
+                 (measured: session_start 15 calls / 7 d rendered as 0). One line per \
+                 pair; the HISTOGRAM stays unseeded.",
             ),
             &["tool", "outcome", "class"],
         )?;
@@ -2947,7 +2955,11 @@ mod tests {
     /// label, which adds no SERIES (it is a pure function of `outcome`) but
     /// does add ~19 bytes to each of the 20 rendered lines — 2356/1656 →
     /// 2941/1996 bytes, i.e. the no-pre-seed argument gets ~24 % stronger
-    /// rather than weaker.
+    /// rather than weaker. And once more on 2026-09-11, on the FIRST-pair
+    /// number only: both HELP texts grew (they now say which series to read
+    /// for call volume and why the counter is seeded and the histogram is
+    /// not), so the one-time preamble is 3459 bytes; the MARGINAL 1996 — the
+    /// per-pair cost the histogram decision actually rests on — is unchanged.
     #[test]
     fn the_mcp_instrument_costs_the_lines_the_no_preseed_decision_assumes() {
         let m = TalosMetrics::new().expect("metrics");
@@ -2990,7 +3002,7 @@ mod tests {
         let marginal_bytes = two.len() - warm.len();
         assert_eq!(
             (first_pair_bytes, marginal_bytes),
-            (2941, 1996),
+            (3459, 1996),
             "per-(tool, outcome) scrape cost changed; the numbers in the field \
              docs and in CLAUDE.md's no-pre-seed argument are now stale"
         );

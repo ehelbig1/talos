@@ -212,6 +212,53 @@ pub fn request_id_field(id: Option<&serde_json::Value>) -> String {
     format!("{}…", &raw[..cut])
 }
 
+/// Pre-seed `talos_mcp_tool_calls_total` at 0 for every `(tool, outcome)` the
+/// chokepoint can ever emit, so the first call of a tool is COUNTED.
+///
+/// A Prometheus counter whose first sample is already `1` loses that
+/// increment to `increase()` / `rate()` — the function sees no `0 → 1` edge,
+/// only a series that appears at 1. So an unseeded per-tool counter
+/// under-counts by exactly one per `(tool, outcome)` per process lifetime,
+/// and a tool called ONCE per lifetime reads **zero forever** under the idiom
+/// every dashboard uses. Measured on the reference fleet 2026-09-11, over a
+/// 7-day window with thirteen controller restarts:
+/// `sum(increase(talos_mcp_tool_calls_total{tool="session_start"}[7d]))` =
+/// **0** while the per-lifetime first samples sum to **15** and the current
+/// lifetime's log shows the one call its instant value reports. The
+/// instrument's HELP text said "an absent (tool, outcome) means that tool has
+/// not been called since process start" — true of the INSTANT read and
+/// silent about the rate read.
+///
+/// Seeds the COUNTER only — one text line per pair — over the closed product
+/// `declared_tool_params()` ∪ the two sentinels × [`McpToolOutcome::ALL`].
+/// The HISTOGRAM (`talos_mcp_tool_duration_seconds`, 19 lines per pair) stays
+/// unseeded, exactly as #786 decided: its `_count` has the same born-at-one
+/// defect and is not the series to read call volume from — that is what this
+/// counter is for; latency quantiles do not need the first call. Cost is
+/// pinned by `seeding_costs_what_the_decision_assumes` below rather than
+/// asserted from memory. Idempotent (`inc_by(0.0)` on an existing series is a
+/// no-op), so a second call — only tests make one — changes nothing.
+///
+/// Called once, from the controller bootstrap immediately after
+/// `talos_metrics::set_global`, against the SAME registry `/metrics/prometheus`
+/// renders. It lives in this crate and not in `talos-metrics` because the
+/// closed tool set is this crate's build-time registry; `talos-metrics` cannot
+/// name it without inverting the layering.
+pub fn seed_tool_call_series(metrics: &talos_metrics::TalosMetrics) {
+    let tools = crate::tool_hints::declared_tool_params()
+        .keys()
+        .map(String::as_str)
+        .chain([TOOL_LABEL_CATALOG_TEMPLATE, TOOL_LABEL_UNKNOWN]);
+    for tool in tools {
+        for outcome in McpToolOutcome::ALL {
+            metrics
+                .mcp_tool_calls_total
+                .with_label_values(&[tool, outcome.as_str(), outcome.class().as_str()])
+                .inc_by(0.0);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,5 +516,89 @@ mod tests {
         ] {
             assert_eq!(classify_outcome(&resp).class(), class);
         }
+    }
+
+    /// Every `(tool, outcome)` the chokepoint can emit exists at 0 after the
+    /// seed, both sentinels included, and NOTHING else does — the seed must
+    /// not invent a label value the chokepoint cannot pass.
+    #[test]
+    fn the_seed_covers_the_closed_product_at_zero() {
+        let m = talos_metrics::TalosMetrics::new().expect("metrics");
+        seed_tool_call_series(&m);
+        let text = m.render_prometheus().expect("render");
+        let seeded: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("talos_mcp_tool_calls_total{"))
+            .collect();
+        let tools = crate::tool_hints::declared_tool_params().len() + 2;
+        assert_eq!(
+            seeded.len(),
+            tools * McpToolOutcome::ALL.len(),
+            "one series per (tool, outcome): {tools} tools × {} outcomes",
+            McpToolOutcome::ALL.len()
+        );
+        assert!(
+            seeded.iter().all(|l| l.ends_with(" 0")),
+            "every seeded series is 0"
+        );
+        for sentinel in [TOOL_LABEL_CATALOG_TEMPLATE, TOOL_LABEL_UNKNOWN] {
+            assert!(seeded
+                .iter()
+                .any(|l| l.contains(&format!("tool=\"{sentinel}\""))));
+        }
+        // Idempotent: a second seed changes nothing (tests are the only
+        // second caller, but a boot that seeds twice must not double anything).
+        seed_tool_call_series(&m);
+        let again = m.render_prometheus().expect("render");
+        assert_eq!(
+            again
+                .lines()
+                .filter(|l| l.starts_with("talos_mcp_tool_calls_total{"))
+                .count(),
+            seeded.len()
+        );
+        // And a real call on a seeded pair moves it 0 → 1, which is the edge
+        // `increase()` needs and the unseeded instrument never produced.
+        talos_metrics::record_mcp_tool_call_on(
+            &m,
+            canonical_tool_label("whoami"),
+            McpToolOutcome::Ok,
+            std::time::Duration::from_millis(1),
+        );
+        let moved = m.render_prometheus().expect("render");
+        assert!(moved.contains(
+            "talos_mcp_tool_calls_total{class=\"served\",outcome=\"ok\",tool=\"whoami\"} 1"
+        ));
+    }
+
+    /// The seed's scrape cost, MEASURED so the number in the docs cannot go
+    /// stale: the counter is one line per pair, so seeding the whole product
+    /// is a different magnitude from seeding the histogram #786 priced at
+    /// ~2.1 MB. If a seventh outcome or a large batch of tools lands, this
+    /// moves and the decision should be re-read against the new number.
+    #[test]
+    fn seeding_costs_what_the_decision_assumes() {
+        let m = talos_metrics::TalosMetrics::new().expect("metrics");
+        let cold = m.render_prometheus().expect("render").len();
+        seed_tool_call_series(&m);
+        let warm = m.render_prometheus().expect("render");
+        let added = warm.len() - cold;
+        let lines = warm
+            .lines()
+            .filter(|l| l.starts_with("talos_mcp_tool_calls_total{"))
+            .count();
+        assert!(
+            added < 400 * 1024,
+            "seeding the counter product must stay well under half a megabyte per scrape; \
+             it added {added} bytes over {lines} lines"
+        );
+        // Order of magnitude pinned loosely (tool names vary in length): about
+        // a hundred bytes per line, as the live scrape averages.
+        let per_line = added / lines;
+        eprintln!("seed cost: {added} bytes over {lines} lines ({per_line} B/line)");
+        assert!(
+            (60..160).contains(&per_line),
+            "per-line cost {per_line} B is outside the assumed ~100 B — re-derive the docs"
+        );
     }
 }
