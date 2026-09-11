@@ -375,7 +375,7 @@ dependencies = [
  "futures-lite",
  "parking",
  "polling",
- "rustix",
+ "rustix 1.1.4",
  "slab",
  "windows-sys 0.61.2",
 ]
@@ -1386,7 +1386,7 @@ dependencies = [
  "io-lifetimes 2.0.4",
  "ipnet",
  "maybe-owned",
- "rustix",
+ "rustix 1.1.4",
  "rustix-linux-procfs",
  "windows-sys 0.52.0",
  "winx",
@@ -1404,7 +1404,7 @@ dependencies = [
  "io-lifetimes 3.0.1",
  "ipnet",
  "maybe-owned",
- "rustix",
+ "rustix 1.1.4",
  "rustix-linux-procfs",
  "windows-sys 0.61.2",
  "winx",
@@ -1419,7 +1419,7 @@ dependencies = [
  "cap-primitives 3.4.5",
  "io-extras 0.18.4",
  "io-lifetimes 2.0.4",
- "rustix",
+ "rustix 1.1.4",
 ]
 
 [[package]]
@@ -1431,7 +1431,7 @@ dependencies = [
  "cap-primitives 4.0.3",
  "io-extras 0.19.0",
  "io-lifetimes 3.0.1",
- "rustix",
+ "rustix 1.1.4",
 ]
 
 [[package]]
@@ -3094,7 +3094,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94e7099f6313ecacbe1256e8ff9d617b75d1bcb16a6fddef94866d225a01a14a"
 dependencies = [
  "io-lifetimes 2.0.4",
- "rustix",
+ "rustix 1.1.4",
  "windows-sys 0.52.0",
 ]
 
@@ -4317,6 +4317,12 @@ dependencies = [
 
 [[package]]
 name = "linux-raw-sys"
+version = "0.4.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d26c52dbd32dccf2d10cac7725f8eae5296885fb5703b261f7d0a0739ec807ab"
+
+[[package]]
+name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
@@ -4457,7 +4463,7 @@ version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ad38eb12aea514a0466ea40a80fd8cc83637065948eb4a426e4aa46261175227"
 dependencies = [
- "rustix",
+ "rustix 1.1.4",
 ]
 
 [[package]]
@@ -5420,7 +5426,7 @@ dependencies = [
  "concurrent-queue",
  "hermit-abi",
  "pin-project-lite",
- "rustix",
+ "rustix 1.1.4",
  "windows-sys 0.61.2",
 ]
 
@@ -5555,6 +5561,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "procfs"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc5b72d8145275d844d4b5f6d4e1eef00c8cd889edb6035c21675d1bb1f45c9f"
+dependencies = [
+ "bitflags 2.11.1",
+ "hex",
+ "procfs-core",
+ "rustix 0.38.44",
+]
+
+[[package]]
+name = "procfs-core"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "239df02d8349b06fc07398a3a1697b06418223b1c7725085e801e7c0fc6a12ec"
+dependencies = [
+ "bitflags 2.11.1",
+ "hex",
+]
+
+[[package]]
 name = "profiling"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5582,8 +5610,10 @@ dependencies = [
  "cfg-if",
  "fnv",
  "lazy_static",
+ "libc",
  "memchr",
  "parking_lot",
+ "procfs",
  "protobuf",
  "thiserror 2.0.18",
 ]
@@ -6328,6 +6358,19 @@ dependencies = [
 
 [[package]]
 name = "rustix"
+version = "0.38.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdb5bc1ae2baa591800df16c9ca78619bf65c0488b41b96ccec5d11220d8c154"
+dependencies = [
+ "bitflags 2.11.1",
+ "errno",
+ "libc",
+ "linux-raw-sys 0.4.15",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rustix"
 version = "1.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6fe4565b9518b83ef4f91bb47ce29620ca828bd32cb7e408f0062e9930ba190"
@@ -6335,7 +6378,7 @@ dependencies = [
  "bitflags 2.11.1",
  "errno",
  "libc",
- "linux-raw-sys",
+ "linux-raw-sys 0.12.1",
  "windows-sys 0.61.2",
 ]
 
@@ -6346,7 +6389,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2fc84bf7e9aa16c4f2c758f27412dc9841341e16aa682d9c7ac308fe3ee12056"
 dependencies = [
  "once_cell",
- "rustix",
+ "rustix 1.1.4",
 ]
 
 [[package]]
@@ -10053,7 +10096,7 @@ dependencies = [
  "fastrand",
  "getrandom 0.4.2",
  "once_cell",
- "rustix",
+ "rustix 1.1.4",
  "windows-sys 0.61.2",
 ]
 
@@ -11204,7 +11247,7 @@ dependencies = [
  "postcard",
  "pulley-interpreter",
  "rayon",
- "rustix",
+ "rustix 1.1.4",
  "semver",
  "serde",
  "serde_derive",
@@ -11272,7 +11315,7 @@ dependencies = [
  "directories-next",
  "log",
  "postcard",
- "rustix",
+ "rustix 1.1.4",
  "serde",
  "serde_derive",
  "sha2 0.10.9",
@@ -11351,7 +11394,7 @@ dependencies = [
  "cc",
  "cfg-if",
  "libc",
- "rustix",
+ "rustix 1.1.4",
  "wasmtime-environ",
  "wasmtime-internal-versioned-export-macros",
  "windows-sys 0.61.2",
@@ -11365,7 +11408,7 @@ checksum = "c1d28ff131bc40e11d84bc3a9fa0d264506439ffbbc89f3562fbb529d1caa617"
 dependencies = [
  "cc",
  "object",
- "rustix",
+ "rustix 1.1.4",
  "wasmtime-internal-versioned-export-macros",
 ]
 
@@ -11433,7 +11476,7 @@ dependencies = [
  "futures",
  "io-lifetimes 3.0.1",
  "rand 0.10.1",
- "rustix",
+ "rustix 1.1.4",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -12178,7 +12221,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
 dependencies = [
  "libc",
- "rustix",
+ "rustix 1.1.4",
 ]
 
 [[package]]

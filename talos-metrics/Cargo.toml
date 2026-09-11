@@ -11,7 +11,13 @@ anyhow.workspace = true
 # 0.14 drops the default `protobuf` (2.x) feature, clearing RUSTSEC-2024-0437.
 # talos-metrics only uses the text-exposition API (Registry/Counter/Opts), so no
 # protobuf feature is needed. Kept in lockstep with controller/worker prometheus 0.14.
-prometheus = "0.14"
+# `process` (2026-09-11): the crate's own ProcessCollector — RSS, virtual size,
+# open/max fds, threads, CPU seconds, start time — registered in
+# `TalosMetrics::new`. Linux-only by the crate's cfg (procfs); on macOS the
+# feature is inert. Until this landed NEITHER Talos process exported a single
+# `process_*` series, so a controller leaking memory or file descriptors was
+# invisible to Prometheus and `docker stats` was the only view.
+prometheus = { version = "0.14", features = ["process"] }
 # The closed set of `path` label values on `talos_dispatch_refused_total` is
 # `talos_workflow_liveness::dispatch::DispatchPath::ALL`. Imported rather than
 # duplicated: that crate has NO dependencies, so unlike

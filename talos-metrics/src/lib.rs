@@ -1535,6 +1535,25 @@ impl TalosMetrics {
     pub fn new() -> anyhow::Result<Arc<Self>> {
         let registry = Registry::new();
 
+        // The process itself: `process_resident_memory_bytes`,
+        // `process_virtual_memory_bytes`, `process_open_fds`, `process_max_fds`,
+        // `process_threads`, `process_cpu_seconds_total`,
+        // `process_start_time_seconds`. Measured 2026-09-11: this registry
+        // exported 66 families and NOT ONE of them was about the process — a
+        // controller leaking memory or file descriptors had no series anywhere
+        // (every `process_*` in the dev Prometheus came from Prometheus,
+        // Grafana, Jaeger and node-exporter), so a 26-hour RSS trend could not
+        // be read and `docker stats` was the only view. The collector reads
+        // procfs, so it is Linux-only by the crate's own cfg; a macOS dev
+        // build exports the same 66 families it always did. Not a
+        // `TalosMetrics` field on purpose: check 58 audits fields for a live
+        // increment site, and a collector is sampled by the registry, never
+        // incremented.
+        #[cfg(target_os = "linux")]
+        registry.register(Box::new(
+            prometheus::process_collector::ProcessCollector::for_self(),
+        ))?;
+
         // Webhook metrics
         let webhook_requests_total = CounterVec::new(
             prometheus::Opts::new(
@@ -3024,6 +3043,32 @@ mod tests {
     // here means the alerts in deploy/observability/alerts.yaml would
     // silently never fire.
     #[test]
+    /// The process collector is registered on Linux and its seven families
+    /// render. Deleting the `register` call in `new()` fails this on every CI
+    /// runner; on macOS the collector does not exist and the test is skipped
+    /// rather than passed vacuously — a green tick over a cfg'd-out body
+    /// would be the gate-that-doesn't-gate shape.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_metrics_are_exported_on_linux() {
+        let m = TalosMetrics::new().unwrap();
+        let text = m.render_prometheus().unwrap();
+        for series in [
+            "process_resident_memory_bytes",
+            "process_virtual_memory_bytes",
+            "process_open_fds",
+            "process_max_fds",
+            "process_threads",
+            "process_cpu_seconds_total",
+            "process_start_time_seconds",
+        ] {
+            assert!(
+                text.contains(&format!("\n{series} ")),
+                "{series} must render from the registered ProcessCollector"
+            );
+        }
+    }
+
     fn crypto_invariant_metrics_render() {
         let m = TalosMetrics::new().unwrap();
 

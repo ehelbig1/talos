@@ -874,4 +874,25 @@ mod tests {
             );
         }
     }
+
+    /// The worker's `/metrics` carries the process collector's families on Linux.
+    /// Skipped rather than vacuously green on macOS, where the collector does not
+    /// exist (procfs). Deleting the `register` call in `init_telemetry` fails this
+    /// on every CI runner.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_metrics_are_exported_on_linux() {
+        init_telemetry_for_tests();
+        let text = get_prometheus_metrics();
+        for series in [
+            "process_resident_memory_bytes",
+            "process_open_fds",
+            "process_max_fds",
+        ] {
+            assert!(
+                text.contains(&format!("\n{series} ")),
+                "{series} must render from the ProcessCollector registered in init_telemetry"
+            );
+        }
+    }
 }
