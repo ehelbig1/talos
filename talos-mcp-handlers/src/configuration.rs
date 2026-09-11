@@ -663,7 +663,7 @@ async fn handle_set_workflow_priority(
         .await
     {
         Ok(_) => mcp_text(req_id, &format!(
-            "Workflow {} priority set to '{}'.\nNew executions will be dispatched with this priority.",
+            "Workflow {} priority set to '{}'.\nEvery new execution record of this workflow (manual, scheduled, webhook, call/bulk/enqueue, test) will carry this label; nothing runs sooner or later because of it.",
             wf_id, priority
         )),
         Err(e) => {

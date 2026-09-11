@@ -98,7 +98,7 @@ The production overlay:
 | `GLOBAL_RATE_LIMIT` | `1000` | Total requests/min globally |
 | `ARCHIVE_AFTER_DAYS` | `30` | Days an execution stays live before being moved to `workflow_executions_archive` |
 | `EXECUTION_RETENTION_DAYS` | `30` | Days an **archived** execution is kept before permanent deletion (total lifetime = the two windows summed) |
-| `EXECUTION_MAX_ROWS` | `100000` | Max execution rows before eviction |
+| ~~`EXECUTION_MAX_ROWS`~~ | n/a | **Not a variable.** No count-based eviction exists and nothing read this name (removed 2026-09-11); execution lifetime is the two AGE windows above |
 | `AUDIT_LOG_RETENTION_DAYS` | `90` | Days to keep audit logs |
 | `AUDIT_CHAIN_SWEEP_INTERVAL_SECS` | `3600` | Cadence of the continuous WORM audit-chain verification sweep (clamped [300, 86400]; `0` disables). No-op without a WORM S3/MinIO endpoint; verification also needs `TALOS_AUDIT_SIGNING_KEY`. Each pass verifies up to 2000 JOB chains (`module_executions`) whose `completed_at` falls in the last 2× the interval, and logs `audit_chain_verification_failed` on any break. Lower the interval if your completion rate puts more than 2000 module executions in one window — the sweep keeps no cursor, so rows past the cap age out unverified and say so via `audit_chain_sweep_incomplete`. |
 | `WASM_CACHE_RETENTION_DAYS` | `30` | Idle window after which an UNREFERENCED user module's compiled bytes are evicted (`wasm_bytes` set NULL; the row, its source and its execution history are kept). Modules named by a workflow graph, a webhook trigger or a calendar watch channel, or dispatched inside the window, are exempt. Live since 2026-09-10 — before that nothing wrote `last_used_at`, so the knob was inert. |

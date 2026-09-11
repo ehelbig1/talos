@@ -1085,7 +1085,20 @@ different shape: **`DB_EXECUTION_TIMEOUT_SECS` is fully inert** (two hits
 workspace-wide, both in `talos-db/src/lib.rs`, and the value reaches only a
 `tracing::info!` — it is applied to no pool) and **`EXECUTION_MAX_ROWS` has no
 consumer at all** (referenced only by `talos-config`'s own tests). Each is a
-behaviour change with its own blast radius.
+behaviour change with its own blast radius. **CLOSED 2026-09-11 by DELETION,
+which is not a behaviour change**: nothing read either value, so removing the
+reads, the accessor, its three tests and the connect line's `execution_timeout=`
+claim moves no runtime; both doc rows are struck through (`GRAPHQL_MAX_DEPTH`'s
+precedent). Measured before deleting, so the population is known: of the **331**
+documented tokens in `docs/configuration-reference.md`, exactly ONE has a
+`talos-config` accessor with zero callers (`EXECUTION_MAX_ROWS`), and
+`DB_EXECUTION_TIMEOUT_SECS` is the one read directly by a crate and applied to
+nothing. Wiring either was declined: there is no "execution-path pool" for a
+second timeout to govern (live `pg_stat_statements` max application statement:
+274 ms), and count-based eviction would be a new destructive sweep beside the
+age-based one that already exists. The same package fixed `set_workflow_priority`'s
+success line, which still said "New executions will be dispatched with this
+priority" after #801 had corrected the description.
 
 **Lints: none added, `--count` stays 88.** Two candidates built and measured over
 `controller/src`, `worker/src` and every `talos-*/src`. *"a ±5-line window

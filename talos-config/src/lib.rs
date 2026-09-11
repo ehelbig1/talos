@@ -1344,17 +1344,6 @@ pub fn module_execution_retention_batch() -> i64 {
     positive_env_or_default::<i64>("MODULE_EXECUTION_RETENTION_BATCH", 5000).clamp(1, 20_000)
 }
 
-/// Maximum number of workflow execution rows to keep. Default: 100000.
-///
-/// MCP-1063 (2026-05-15): same `positive_env_or_default` routing as
-/// `execution_retention_days`. `=0` would mean "evict every execution
-/// on cap-enforcement sweep" — sibling destructive failure mode. No
-/// production callers today, but the public API should default-fail
-/// safely.
-pub fn execution_max_rows() -> i64 {
-    positive_env_or_default::<i64>("EXECUTION_MAX_ROWS", 100_000)
-}
-
 /// MCP-1060 (2026-05-15): read a boolean env var with a canonical set
 /// of truthy / falsy tokens. Accepts `true | 1 | yes | on` (truthy) and
 /// `false | 0 | no | off` (falsy), case-insensitive, leading/trailing

@@ -210,3 +210,35 @@ trailing spaces inside multi-line SQL raw strings, a REGEX character class
 which matches `\r\n` — `\r` is whitespace and is not `\n` — and reported **82
 hits across 23 files**, every HTTP and MIME header among them. Narrowing to
 `[ \t]+\n` gives the 13.
+
+
+## Addendum 2026-09-11 — the two adjacent knobs, closed by deletion
+
+The original entry verified `DB_EXECUTION_TIMEOUT_SECS` (read, logged as
+`execution_timeout=300s` on every connect, applied to nothing) and
+`EXECUTION_MAX_ROWS` (a `talos-config` accessor with zero callers, documented
+in two places as "max execution rows before eviction") and left both alone as
+"a behaviour change with its own blast radius". That framing assumed the fix
+was to WIRE them. Deleting them is not a behaviour change — nothing read either
+value — and it is what shipped: the read and the connect-line claim in
+`talos-db`, the accessor and its three tests in `talos-config`, and both doc
+rows struck through in the `GRAPHQL_MAX_DEPTH` style, saying what was never
+true.
+
+Measured first, so the population is on record rather than assumed: the
+authoritative `docs/configuration-reference.md` names **331** tokens; following
+every token that is read only inside `talos-config` to its accessor and then to
+that accessor's callers finds exactly ONE with none (`EXECUTION_MAX_ROWS`). The
+other is read directly by `talos-db`, which the accessor walk cannot see — two
+detectors, two shapes, the same class. Wiring was declined on evidence: there is
+no "execution-path pool" for a second timeout to govern, the live
+`pg_stat_statements` shows the slowest application statement at 274 ms (the
+only entries above a second are the one-off `COPY`s of the pg16→pg17 restore),
+and count-based eviction would add a destructive sweep beside the age-based
+archive/delete pair that already exists.
+
+Found on the way: `set_workflow_priority`'s SUCCESS TEXT still read "New
+executions will be dispatched with this priority" after #801 had corrected the
+tool's DESCRIPTION — the same false claim in the second of the two places it
+lived. The live check for #801 (set `high`, run through `call_workflow`, read
+the row: `high`) surfaced it, which is the argument for doing the live check.
