@@ -1492,19 +1492,16 @@ impl SchedulerService {
                 // etc. The error-path inside run_scheduled_execution already
                 // does this cancellation; mirror it here so timeout-path
                 // parity holds.
-                match sqlx::query(
-                    "UPDATE module_executions \
-                     SET status = 'cancelled', completed_at = NOW(), \
-                         error_message = 'Workflow timed out — parallel sibling cancelled' \
-                     WHERE workflow_execution_id = $1 AND status = 'running'",
+                match talos_workflow_repository::cancel_running_module_executions(
+                    &db_pool_for_timeout,
+                    execution_id,
+                    talos_workflow_repository::SiblingCancelReason::WorkflowTimedOut,
                 )
-                .bind(execution_id)
-                .execute(&db_pool_for_timeout)
                 .await
                 {
-                    Ok(r) => tracing::info!(
+                    Ok(cancelled) => tracing::info!(
                         execution_id = %execution_id,
-                        cancelled = r.rows_affected(),
+                        cancelled,
                         "timeout-path sibling cancellation UPDATE complete"
                     ),
                     Err(e) => tracing::warn!(
@@ -2529,19 +2526,16 @@ async fn run_scheduled_execution(
                 );
             }
             // Cancel any still-running sibling module_executions.
-            match sqlx::query(
-                "UPDATE module_executions \
-                 SET status = 'cancelled', completed_at = NOW(), \
-                     error_message = 'Workflow failed — parallel sibling cancelled' \
-                 WHERE workflow_execution_id = $1 AND status = 'running'",
+            match talos_workflow_repository::cancel_running_module_executions(
+                &db_pool,
+                execution_id,
+                talos_workflow_repository::SiblingCancelReason::WorkflowFailed,
             )
-            .bind(execution_id)
-            .execute(&db_pool)
             .await
             {
-                Ok(r) => tracing::info!(
+                Ok(cancelled) => tracing::info!(
                     execution_id = %execution_id,
-                    cancelled = r.rows_affected(),
+                    cancelled,
                     "sibling cancellation UPDATE complete"
                 ),
                 Err(e) => tracing::warn!(

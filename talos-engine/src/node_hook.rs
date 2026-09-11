@@ -539,14 +539,11 @@ impl NodeLifecycleHook for ControllerNodeHook {
                     "Failed to enqueue DLQ row",
                 );
             }
-            if let Err(e) = sqlx::query(
-                "UPDATE module_executions \
-                 SET status = 'cancelled', completed_at = NOW(), \
-                     error_message = 'Workflow failed — parallel sibling cancelled' \
-                 WHERE workflow_execution_id = $1 AND status = 'running'",
+            if let Err(e) = talos_workflow_repository::cancel_running_module_executions(
+                &pool,
+                execution_id,
+                talos_workflow_repository::SiblingCancelReason::WorkflowFailed,
             )
-            .bind(execution_id)
-            .execute(&pool)
             .await
             {
                 tracing::warn!(

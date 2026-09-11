@@ -1154,3 +1154,64 @@ so**: a new registered-but-unincremented metric is a failure at PR time, not
 a baseline entry. Ten names, one day, three wired and seeded, four deleted,
 three wired with the duration the row already knew.
 
+## The finalizer the list left out (2026-09-11, the deploy after)
+
+The section above says "every finalizer, listed, because the one nobody
+listed was the finding", and then lists the module finalizers by CRATE:
+`talos-module-executions`' service methods, the worker-result paths, the
+sweep, the engine's race-safe INSERT. The deploy's reconciliation read the
+list back against the database within the hour. Workflow side: 5 completed
+rows, counter 5, histogram count 5, sum 32.6 s — exact. Module side: 14
+completed rows, counter **0**.
+
+The engine does not finalize a workflow-dispatched module row through the
+service. `finalize_module_execution_row` calls
+`PostgresModuleExecutionStore::record_completed` in `talos-engine`, which
+issues its own `UPDATE module_executions … WHERE id = $10 AND status IN
+('pending', 'running')`, and that store was not on the list because the
+list was built by crate and the store lives in the ENGINE's crate. The DB
+test that "proved" every finalizer drove `ModuleExecutionService`, so it
+proved the service. This is `the_named_function_was_not_the_chokepoint`
+again: the wrapper was instrumented, the primitive was not, and the way to
+enumerate finalizers is `grep "UPDATE module_executions"` across the
+workspace, not a reading of which crate owns the table.
+
+The store is wired the same way as the others — the UPDATE RETURNS the
+row's own duration — with one addition the others did not need: the engine
+hands the store a `&str` (`completed` / `failed` / `timeout`, from
+`classify` in `engine_dispatch_single`), so the string is mapped through
+`ModuleExecutionOutcome::from_status`, which lives beside `as_str` because it
+must invert it. An unknown spelling is logged at debug and NOT counted,
+rather than filed under the nearest label. The store's `Ok(())` on a refused
+re-finalize (already terminal, or no such row) is kept — it counts nothing.
+
+**The `cancelled` outcome had a second, wider hole.** The race-safe INSERT is
+the only writer of a BORN-cancelled row; it is not the only writer of a
+cancelled row. `UPDATE module_executions SET status = 'cancelled',
+completed_at = NOW(), error_message = 'Workflow failed — parallel sibling
+cancelled' WHERE workflow_execution_id = $1 AND status = 'running'` existed
+as **six byte-identical copies** — the engine's node hook, the engine's
+chain runner, the workflow repository, the advanced repository, and two
+scheduler paths (one with the "timed out" wording) — and none of them
+counted. They are now one free function,
+`talos_workflow_repository::cancel_running_module_executions(pool,
+workflow_execution_id, SiblingCancelReason)`, RETURNING each cancelled row's
+age and recording one `cancelled` count and one observation PER ROW. A free
+function over a pool rather than a repository method because two callers
+hold only a pool and one lives in a crate that had no reason to build a
+`WorkflowRepository` (the advanced repository gains a dependency edge on the
+workflow repository; the reverse edge does not exist, so no cycle). The
+reason is an ENUM because its text is the row's `error_message`, and the two
+spellings the six copies used are exactly its two variants.
+
+**Guards.** The DB test drives the real store on back-dated running rows for
+all three engine statuses (count +1, observation +1, duration ≥ the
+back-date), a refused re-finalize that counts nothing, and the shared cancel
+function against two siblings plus a control row under a different
+workflow execution (2 cancelled and counted with their ages, the control
+untouched, the row's `error_message` equal to the reason's text, a second
+sweep counting nothing). Four mutations, worst first — the store's record
+arm emptied, every status mapped to `completed`, the cancel loop's record
+removed, the loop truncated to one row — are recorded with the result in the
+CLAUDE.md digest rather than claimed here.
+

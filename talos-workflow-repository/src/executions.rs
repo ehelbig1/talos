@@ -1321,18 +1321,15 @@ impl WorkflowRepository {
     /// this atomically, but this explicit call is defence-in-depth for environments
     /// where the trigger has not yet been applied.
     pub async fn cancel_running_module_executions(&self, execution_id: Uuid) -> Result<()> {
-        let result = sqlx::query(
-            "UPDATE module_executions \
-             SET status = 'cancelled', completed_at = NOW(), \
-                 error_message = 'Workflow failed — parallel sibling cancelled' \
-             WHERE workflow_execution_id = $1 AND status = 'running'",
+        let cancelled = cancel_running_module_executions(
+            &self.db_pool,
+            execution_id,
+            SiblingCancelReason::WorkflowFailed,
         )
-        .bind(execution_id)
-        .execute(&self.db_pool)
         .await?;
         tracing::info!(
             execution_id = %execution_id,
-            cancelled = result.rows_affected(),
+            cancelled,
             "sibling cancellation UPDATE complete"
         );
         Ok(())
@@ -2387,6 +2384,110 @@ mod execution_priority_tests {
         assert_eq!(
             ExecutionPriority::declared_in_graph_json("not json"),
             ExecutionPriority::Normal
+        );
+    }
+}
+
+/// Why a workflow's still-running module rows are being cancelled. The
+/// wording is what the row's `error_message` will say, so it is an enum and
+/// not a caller-supplied string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SiblingCancelReason {
+    WorkflowFailed,
+    WorkflowTimedOut,
+}
+
+impl SiblingCancelReason {
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::WorkflowFailed => "Workflow failed — parallel sibling cancelled",
+            Self::WorkflowTimedOut => "Workflow timed out — parallel sibling cancelled",
+        }
+    }
+}
+
+/// Cancel every `running` module execution of one workflow execution — the
+/// ONE home for a statement that existed as SIX byte-identical copies
+/// (engine node hook, engine workflow chains, this repository, the advanced
+/// repository, and two scheduler paths) until 2026-09-11. Each row is
+/// counted on `talos_module_executions_total{status="cancelled"}` with the
+/// age it had reached, RETURNED by this UPDATE by the database clock.
+///
+/// Returns the number of rows cancelled. A free function over a pool rather
+/// than a repository method because two of the six callers hold only a pool
+/// (the engine's node hook and chain runner) and one lives in a crate that
+/// had no reason to construct a `WorkflowRepository`.
+pub async fn cancel_running_module_executions(
+    pool: &sqlx::PgPool,
+    workflow_execution_id: Uuid,
+    reason: SiblingCancelReason,
+) -> std::result::Result<u64, sqlx::Error> {
+    use sqlx::Row as _;
+    let rows = sqlx::query(
+        "UPDATE module_executions \
+         SET status = 'cancelled', completed_at = NOW(), error_message = $2 \
+         WHERE workflow_execution_id = $1 AND status = 'running' \
+         RETURNING EXTRACT(EPOCH FROM (completed_at - started_at))::float8",
+    )
+    .bind(workflow_execution_id)
+    .bind(reason.message())
+    .fetch_all(pool)
+    .await?;
+    for row in &rows {
+        let duration_secs = row.try_get::<Option<f64>, _>(0)?;
+        talos_metrics::record_module_execution(
+            talos_metrics::ModuleExecutionOutcome::Cancelled,
+            duration_secs,
+        );
+    }
+    Ok(rows.len() as u64)
+}
+
+#[cfg(test)]
+mod sibling_cancel_pin {
+    /// The six former copies, read at COMPILE time (#630's rule for a pin
+    /// on another file's text). A copy re-inlined at any of them would
+    /// cancel rows nothing counts, so the literal may appear only in this
+    /// file. Stated as textual: a copy assembled with `format!` or spelled
+    /// with different whitespace is invisible to it.
+    const FORMER_COPIES: &[(&str, &str)] = &[
+        (
+            "talos-engine/src/node_hook.rs",
+            include_str!("../../talos-engine/src/node_hook.rs"),
+        ),
+        (
+            "talos-engine/src/workflow_chains.rs",
+            include_str!("../../talos-engine/src/workflow_chains.rs"),
+        ),
+        (
+            "talos-scheduler/src/lib.rs",
+            include_str!("../../talos-scheduler/src/lib.rs"),
+        ),
+        (
+            "talos-advanced-repository/src/lib.rs",
+            include_str!("../../talos-advanced-repository/src/lib.rs"),
+        ),
+    ];
+
+    #[test]
+    fn the_sibling_cancellation_update_has_one_home() {
+        let needle = "SET status = 'cancelled', completed_at = NOW()";
+        for (name, src) in FORMER_COPIES {
+            assert!(
+                !src.contains(needle),
+                "{name} re-inlines the sibling-cancellation UPDATE; call \
+                 talos_workflow_repository::cancel_running_module_executions"
+            );
+            assert!(
+                src.contains("cancel_running_module_executions("),
+                "{name} no longer calls the shared home at all"
+            );
+        }
+        assert_eq!(
+            include_str!("executions.rs").matches(needle).count(),
+            2,
+            "the statement itself plus this needle — one home"
         );
     }
 }
