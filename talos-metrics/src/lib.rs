@@ -44,7 +44,15 @@ pub const RPC_WRITE_CEILING_SUBJECTS: [&str; 3] = [
 /// site in `talos_scheduler`, so a new value cannot be emitted without also
 /// being seeded — the drift that makes an `increase(...) > 0` alert
 /// unfireable on the one series that matters.
-pub const SCHEDULER_DISPATCH_PHASES: [&str; 2] = [SCHEDULER_PHASE_STARTUP, SCHEDULER_PHASE_STEADY];
+///
+/// The three values PARTITION every poll's batch: `startup` and `catchup`
+/// are the two BACKLOG shapes (both drain under the tighter startup
+/// ceiling), `steady` is everything else.
+pub const SCHEDULER_DISPATCH_PHASES: [&str; 3] = [
+    SCHEDULER_PHASE_STARTUP,
+    SCHEDULER_PHASE_CATCHUP,
+    SCHEDULER_PHASE_STEADY,
+];
 
 /// The complete, closed set of `coverage` label values on
 /// `talos_rank_training_fetches_total`.
@@ -67,7 +75,19 @@ pub const RANK_TRAINING_COVERAGE_TRUNCATED: &str = "truncated";
 
 /// The startup backlog: schedules found due by the FIRST poll after boot.
 pub const SCHEDULER_PHASE_STARTUP: &str = "startup";
-/// Every poll after the first one.
+/// A catch-up backlog: a LATER poll whose batch holds a schedule overdue by
+/// more than `talos_scheduler::CATCHUP_OVERDUE_SECS`, i.e. the scheduler
+/// missed several consecutive polls without the process restarting. Measured
+/// live 2026-09-10: the host was suspended 10:56–12:06 UTC, the controller
+/// resumed with `first_poll_done` already spent, and 10 schedules came due in
+/// one poll — the boot-herd shape, labelled `steady` and drained under the
+/// 16-wide steady ceiling, invisible to the herd alert. A host resume, a
+/// long DB outage and a paused-then-resumed scheduler all produce this
+/// batch; only a boot produces `startup`.
+pub const SCHEDULER_PHASE_CATCHUP: &str = "catchup";
+/// A poll whose batch is neither the boot backlog nor a catch-up backlog:
+/// the schedules that came due since the previous poll, at most one poll
+/// interval late.
 pub const SCHEDULER_PHASE_STEADY: &str = "steady";
 
 /// The complete, closed set of `outcome` label values on
@@ -1102,7 +1122,7 @@ pub struct TalosMetrics {
     /// than a WARN nobody reads.
     ///
     /// The five outcomes are a PARTITION of dispatch attempts, not a sample:
-    /// see [`SCHEDULER_DISPATCH_OUTCOMES`]. Ten closed series, all pre-seeded.
+    /// see [`SCHEDULER_DISPATCH_OUTCOMES`]. Fifteen closed series, all pre-seeded.
     /// Deliberately carries NO workflow name, schedule id or user id — those
     /// are unbounded cardinality.
     pub scheduler_dispatches_total: CounterVec,
@@ -2257,15 +2277,18 @@ impl TalosMetrics {
             prometheus::Opts::new(
                 "talos_scheduler_dispatches_total",
                 "Terminal outcomes of scheduler-driven workflow dispatches. \
-                 Labels: phase=startup|steady (startup = the backlog found \
-                 due by the first poll after a controller boot), \
+                 Labels: phase=startup|catchup|steady (startup = the backlog \
+                 found due by the first poll after a controller boot; catchup \
+                 = a later poll holding a schedule overdue by more than the \
+                 catch-up threshold, e.g. after a host suspend/resume — both \
+                 are BACKLOGS and drain under the startup ceiling), \
                  outcome=completed|failed|skipped|denied|fenced. skipped = \
                  refused for CAPACITY (concurrency cap or actor budget), \
                  which for a daily cron means the run is lost until tomorrow; \
                  denied = refused by POLICY (actor not runnable, capability \
                  ceiling); fenced = superseded by a crash-recovery reclaim. \
                  The five outcomes PARTITION every dispatch attempt, so the \
-                 total reconciles against the boot backlog size. Ten closed \
+                 total reconciles against the boot backlog size. Fifteen closed \
                  series; never labelled by workflow, schedule or user — \
                  unbounded cardinality.",
             ),
@@ -3373,17 +3396,24 @@ mod tests {
             // startup-phase series sit at 0 forever, and the alert on them is
             // built on `increase(...)` — so an absent series is a
             // detector that cannot fire on the very condition it exists to
-            // catch. All ten are asserted, not just the alerted ones: an
-            // operator comparing startup against steady needs both halves to
-            // exist before either number means anything, and the herd alert's
-            // ratio arm divides by the sum over ALL outcomes — an absent
-            // denominator term makes the ratio silently wrong rather than
-            // absent.
+            // catch. All fifteen are asserted, not just the alerted ones: an
+            // operator comparing a backlog phase against steady needs both
+            // halves to exist before either number means anything, and the
+            // herd alert's ratio arm divides by the sum over ALL outcomes — an
+            // absent denominator term makes the ratio silently wrong rather
+            // than absent. The `catchup` five matter most: on a fleet that
+            // never suspends they sit at 0 forever, which is exactly the
+            // series an unseeded registry would omit.
             r#"talos_scheduler_dispatches_total{outcome="completed",phase="startup"} 0"#,
             r#"talos_scheduler_dispatches_total{outcome="failed",phase="startup"} 0"#,
             r#"talos_scheduler_dispatches_total{outcome="skipped",phase="startup"} 0"#,
             r#"talos_scheduler_dispatches_total{outcome="denied",phase="startup"} 0"#,
             r#"talos_scheduler_dispatches_total{outcome="fenced",phase="startup"} 0"#,
+            r#"talos_scheduler_dispatches_total{outcome="completed",phase="catchup"} 0"#,
+            r#"talos_scheduler_dispatches_total{outcome="failed",phase="catchup"} 0"#,
+            r#"talos_scheduler_dispatches_total{outcome="skipped",phase="catchup"} 0"#,
+            r#"talos_scheduler_dispatches_total{outcome="denied",phase="catchup"} 0"#,
+            r#"talos_scheduler_dispatches_total{outcome="fenced",phase="catchup"} 0"#,
             r#"talos_scheduler_dispatches_total{outcome="completed",phase="steady"} 0"#,
             r#"talos_scheduler_dispatches_total{outcome="failed",phase="steady"} 0"#,
             r#"talos_scheduler_dispatches_total{outcome="skipped",phase="steady"} 0"#,

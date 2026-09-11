@@ -485,6 +485,13 @@ CTRL_TESTS=(
     "security_isolation_tests"
     "governance_tests"
     "scheduler_tests"
+    # The scheduler's dispatch PHASE, read from a real clone: a row 70 min
+    # overdue on a non-boot poll is `catchup` (the 2026-09-10 host-resume
+    # herd, which the boot-only classification labelled `steady`); a row 5 s
+    # overdue is `steady`; the boot flag wins over both. Drives the verbatim
+    # due-claim SQL, whose `overdue_secs` projection no unit test can see.
+    # `common` harness, so CTRL_TESTS (64b).
+    "scheduler_catchup_phase_tests"
     "workflow_version_tests"
     # #609's closing provenance test (measurement PR 3, D7). Gated here on
     # arrival rather than later: it is the ONLY coverage of the promoted-vs-

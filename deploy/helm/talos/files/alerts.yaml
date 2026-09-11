@@ -474,7 +474,18 @@ groups:
       # -deploy defect through the other door. "fenced" (superseded by a
       # crash-recovery reclaim) is excluded for the same reason.
       #
-      # All ten talos_scheduler_dispatches_total series are pre-seeded to 0 at
+      # phase=~"startup|catchup": BOTH backlog shapes. `startup` is the batch the
+      # first poll after a boot finds due; `catchup` is a later poll holding a
+      # row overdue by more than the scheduler's catch-up threshold (90 s) —
+      # the scheduler stopped polling without the process restarting. Measured
+      # 2026-09-10: the host was suspended 10:56–12:06 UTC, the controller
+      # resumed with its boot flag already spent, ten schedules came due in one
+      # poll, drained 16-wide under the STEADY ceiling, two failed on the
+      # single-slot LLM — and this alert, then selecting phase="startup" only,
+      # saw a steady-state batch. Both phases drain under the startup ceiling
+      # now and both are selected here; the label says which one it was.
+      #
+      # All fifteen talos_scheduler_dispatches_total series are pre-seeded to 0 at
       # registration, so `increase(...)` is well-defined from the first scrape.
       # Without that seeding this detector would be silenced by exactly the
       # condition it detects — an absent counter matches nothing, so a
@@ -487,14 +498,14 @@ groups:
         expr: |
           (
             sum by (outcome) (
-              increase(talos_scheduler_dispatches_total{phase="startup",outcome=~"failed|skipped"}[30m])
+              increase(talos_scheduler_dispatches_total{phase=~"startup|catchup",outcome=~"failed|skipped"}[30m])
             ) > 1.5
           )
           and on()
           (
-            sum(increase(talos_scheduler_dispatches_total{phase="startup",outcome=~"failed|skipped"}[30m]))
+            sum(increase(talos_scheduler_dispatches_total{phase=~"startup|catchup",outcome=~"failed|skipped"}[30m]))
             /
-            sum(increase(talos_scheduler_dispatches_total{phase="startup"}[30m]))
+            sum(increase(talos_scheduler_dispatches_total{phase=~"startup|catchup"}[30m]))
             > 0.5
           )
         for: 0m
@@ -502,12 +513,18 @@ groups:
           severity: warning
           category: reliability-degraded
         annotations:
-          summary: "Startup schedule backlog not absorbed ({{ $value }} {{ $labels.outcome }})"
+          summary: "Schedule backlog not absorbed ({{ $value }} {{ $labels.outcome }})"
           description: |
-            {{ $value }} scheduled workflow run(s) from the STARTUP BACKLOG —
-            the schedules that came due while the controller was restarting —
-            ended `{{ $labels.outcome }}`, and the failed+skipped runs are a
-            MAJORITY of that backlog.
+            {{ $value }} scheduled workflow run(s) from a BACKLOG batch — the
+            schedules that came due while the controller was restarting
+            (phase=startup) or while it was not polling without a restart
+            (phase=catchup: host suspend/resume, DB outage) — ended
+            `{{ $labels.outcome }}`, and the failed+skipped runs are a MAJORITY
+            of that backlog. Which shape:
+            `sum by (phase) (increase(talos_scheduler_dispatches_total{phase=~"startup|catchup"}[30m]))`,
+            or the controller log's `event_kind="scheduler_startup_backlog"` /
+            `"scheduler_catchup_backlog"` line, which carries the batch size
+            and how late its most overdue row was.
 
             What this number knows: the outcome of each startup-phase dispatch.
             What it does NOT know: why. A broad failure across the boot backlog
@@ -774,8 +791,9 @@ groups:
             3. Confirm the upstream independently before tuning the breaker. Do
                NOT raise CIRCUIT_BREAKER_FAILURE_THRESHOLD to make the alert
                stop; that removes the protection, not the outage.
-            4. If the trips cluster at controller boot, this is the startup herd
-               — see TalosSchedulerStartupHerdNotAbsorbed and lower
+            4. If the trips cluster at controller boot or right after a host
+               resume, this is the backlog herd — see
+               TalosSchedulerStartupHerdNotAbsorbed and lower
                SCHEDULER_STARTUP_MAX_CONCURRENT rather than touching the breaker.
 
       # ── The scheduler is running but dispatching NOTHING.
