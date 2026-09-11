@@ -276,12 +276,31 @@ pub async fn register_worker_identity_at_boot(signing_key: &'static DispatchSign
                     return;
                 }
             }
+            Err(e) if attempt < MAX_ATTEMPTS => {
+                // A transport error on a non-final attempt is the EXPECTED
+                // shape of a normal boot: docker-compose has no worker →
+                // controller `depends_on`, and the chart rolls both
+                // Deployments together, so the first POST almost always races
+                // a controller that is still binding its listener. Measured on
+                // the dev stack: attempt 1 failed and attempt 2 succeeded two
+                // seconds later on every deploy — a WARN that fires on every
+                // healthy boot is check 69's class (it trains operators to
+                // ignore WARN). INFO here; the FINAL attempt below, and the
+                // give-up line after the loop, stay WARN — those are findings.
+                tracing::info!(
+                    target: "talos_security",
+                    attempt,
+                    max_attempts = MAX_ATTEMPTS,
+                    error = %e,
+                    "worker self-registration request failed; retrying (controller not ready yet?)"
+                );
+            }
             Err(e) => {
                 tracing::warn!(
                     target: "talos_security",
                     attempt,
                     error = %e,
-                    "worker self-registration request failed (controller not ready?)"
+                    "worker self-registration request failed on the final attempt (controller not reachable?)"
                 );
             }
         }
