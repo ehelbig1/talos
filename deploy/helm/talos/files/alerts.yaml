@@ -64,9 +64,12 @@ groups:
     rules:
 
       # ── DEK orphan gauges — value > 0 means data loss already occurred.
-      # These gauges are computed by a 60s background loop in controller
-      # main.rs (SELECT COUNT(*) with NOT EXISTS) so we scrape the DB
-      # only indirectly. Paging threshold: ANY non-zero value for 5m.
+      # These gauges are computed by an HOURLY background loop in the
+      # controller (`CryptoInvariantGauge`: three SELECT COUNT(*) with NOT
+      # EXISTS, each a full scan of one of the three largest tables — 60 s
+      # until 2026-09-10, hourly since, cost argued at the spawn site) so we
+      # scrape the DB only indirectly. Paging threshold: ANY non-zero value
+      # for 5m — still ~8x faster than a sweep cadence can move it.
       - alert: TalosActorMemoryDEKOrphaned
         expr: talos_actor_memory_orphaned_rows > 0
         for: 5m
@@ -74,14 +77,15 @@ groups:
         # measures it) — see TalosWorkerBuildSkew for the full mechanism, the
         # 24h episode measurements, the keep_firing_for-vs-max_over_time
         # reasoning and the Prometheus/CRD version floor.
-        # The three crypto-invariant gauges are republished by the 60s orphan scan at
-        # background.rs:913-963, whose first tick is skipped, so for ~60s after every
-        # controller start they serve their registration-time 0. `for: 5m` means a
-        # restart RESOLVES this critical data-loss alert and re-arms the full five
-        # minutes; a controller restarting faster than that can never fire it. 5m
-        # comfortably exceeds the 60s window. The cost is that genuinely-repaired
-        # orphans keep this firing for up to 5 extra minutes, which for a data-loss
-        # alert is the right side to err on.
+        # The three crypto-invariant gauges are republished by the HOURLY orphan
+        # scan in background.rs (`CryptoInvariantGauge`), whose first tick RUNS AT
+        # BOOT since 2026-09-10, so they serve their registration-time 0 only for
+        # the seconds between /metrics coming up and that first scan returning.
+        # `for: 5m` means a restart RESOLVES this critical data-loss alert and
+        # re-arms the full five minutes; a controller restarting faster than that
+        # can never fire it. 5m comfortably exceeds the boot window. The cost is
+        # that genuinely-repaired orphans keep this firing for up to 5 extra
+        # minutes, which for a data-loss alert is the right side to err on.
         keep_firing_for: 5m
         labels:
           severity: critical
@@ -138,7 +142,7 @@ groups:
         # measures it) — see TalosWorkerBuildSkew for the full mechanism, the
         # 24h episode measurements, the keep_firing_for-vs-max_over_time
         # reasoning and the Prometheus/CRD version floor.
-        # Same 60s scan, same 60s unmeasured-zero window as
+        # Same hourly scan, same boot-tick unmeasured-zero window as
         # TalosActorMemoryDEKOrphaned above.
         keep_firing_for: 5m
         labels:
@@ -159,7 +163,7 @@ groups:
         # measures it) — see TalosWorkerBuildSkew for the full mechanism, the
         # 24h episode measurements, the keep_firing_for-vs-max_over_time
         # reasoning and the Prometheus/CRD version floor.
-        # Same 60s scan, same 60s unmeasured-zero window as
+        # Same hourly scan, same boot-tick unmeasured-zero window as
         # TalosActorMemoryDEKOrphaned above.
         keep_firing_for: 5m
         labels:
@@ -211,16 +215,27 @@ groups:
       # controller image, and a permanently-red alert trains operators to
       # ignore red.
       #
-      # THRESHOLDS. The sweep runs every 60s, so 600s is ten consecutive
-      # missed sweeps and `for: 15m` requires the condition to hold across
-      # another fifteen — a total of ~25 minutes of continuous blindness
-      # before this fires. That is deliberately far outside any single DB
-      # blip, a rolling controller restart, or the ~60s post-boot window in
-      # which the stamp still reads 0 because the first tick is skipped.
-      # Chosen over a tighter bound because this is a detector-health alert,
-      # not the data-loss alert itself: the cost of being 25 minutes late is
-      # 25 minutes, and the cost of flapping is that the next real one is
-      # ignored.
+      # THRESHOLDS — DERIVED FROM THE SWEEP CADENCE, AND PINNED TO IT. The
+      # sweep runs HOURLY (`CRYPTO_ORPHAN_SCAN_INTERVAL_SECS` in
+      # background.rs; 60 s until 2026-09-10), so a HEALTHY controller is
+      # anywhere from 0 to 3600 s stale at any instant. 7800 s is two
+      # consecutive missed sweeps plus ten minutes of scrape/eval slack, and
+      # `for: 15m` requires that to hold across another fifteen — ~2h25m of
+      # continuous blindness before this fires, against the `for: 8h` on the
+      # three data-loss alerts it guards, so detector-health still leads the
+      # fault by hours. `blind_detector_thresholds_match_the_sweep_cadence`
+      # (controller bootstrap tests) reads this number out of this file and
+      # fails if it drops below two intervals or rises above eight.
+      #
+      # WHY IT IS PINNED, MEASURED. #794 (2026-09-10) moved the sweep from
+      # 60 s to an hour for cost and left this at `> 600` under a comment that
+      # still said "the sweep runs every 60s". From that deploy until
+      # 2026-09-11 this alert was FIRING for ~35 minutes of every hour on a
+      # healthy fleet — 15.3 of 27 hours measured in Prometheus, 0 in the
+      # thirteen days before — the permanently-red shape that trains
+      # operators to ignore red, on the one `observability` alert guarding
+      # the three `critical` data-loss detectors. A threshold and a cadence
+      # that live in different files drift; the test is the coupling.
       #
       # PER-INSTANCE, NOT `max()`. The subtraction keeps the source series'
       # labels, so a two-replica controller deployment produces one alert per
@@ -240,7 +255,7 @@ groups:
       # it louder should raise it here rather than assume it is already.
       - alert: TalosCryptoOrphanDetectorBlind
         expr: |
-          time() - talos_crypto_orphan_scan_last_success_timestamp_seconds > 600
+          time() - talos_crypto_orphan_scan_last_success_timestamp_seconds > 7800
         for: 15m
         # ANTI-FLAP, same convention as the rest of this file but for a
         # DIFFERENT mechanism, stated rather than implied. The neighbours
@@ -257,10 +272,11 @@ groups:
           severity: warning
           category: observability
         annotations:
-          summary: "Crypto-orphan detector has not completed a sweep in 10+ minutes"
+          summary: "Crypto-orphan detector has not completed a sweep in 2+ hours"
           description: |
-            No crypto-orphan sweep has measured all three tables for over ten
-            minutes, so `talos_actor_memory_orphaned_rows`,
+            No crypto-orphan sweep has measured all three tables for over two
+            hours (at least two consecutive hourly sweeps did not complete),
+            so `talos_actor_memory_orphaned_rows`,
             `talos_module_execution_orphaned_rows` and
             `talos_workflow_execution_orphaned_rows` are holding values
             nothing measured — and their three `critical` data-loss alerts
@@ -268,8 +284,9 @@ groups:
             firing, you will not be told.
 
             A value of 0 for the stamp means the sweep has NEVER completed on
-            this controller: either it has just started (it clears within
-            ~60s) or the sweep task is not running at all.
+            this controller: the first tick runs at boot, so it clears within
+            seconds of start-up, and a persistent 0 means the sweep task is
+            not running at all.
           action: |
             1. Controller log, target=talos_crypto,
                event_kind=crypto_orphan_probe_failed — it names the failing

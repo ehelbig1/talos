@@ -1768,12 +1768,18 @@ tests:
               category: reliability-degraded
               outcome: failed
             exp_annotations:
-              summary: "Startup schedule backlog not absorbed (30 failed)"
+              summary: "Schedule backlog not absorbed (30 failed)"
               description: |
-                30 scheduled workflow run(s) from the STARTUP BACKLOG —
-                the schedules that came due while the controller was restarting —
-                ended `failed`, and the failed+skipped runs are a
-                MAJORITY of that backlog.
+                30 scheduled workflow run(s) from a BACKLOG batch — the
+                schedules that came due while the controller was restarting
+                (phase=startup) or while it was not polling without a restart
+                (phase=catchup: host suspend/resume, DB outage) — ended
+                `failed`, and the failed+skipped runs are a MAJORITY
+                of that backlog. Which shape:
+                `sum by (phase) (increase(talos_scheduler_dispatches_total{phase=~"startup|catchup"}[30m]))`,
+                or the controller log's `event_kind="scheduler_startup_backlog"` /
+                `"scheduler_catchup_backlog"` line, which carries the batch size
+                and how late its most overdue row was.
 
                 What this number knows: the outcome of each startup-phase dispatch.
                 What it does NOT know: why. A broad failure across the boot backlog
@@ -1857,12 +1863,18 @@ tests:
               category: reliability-degraded
               outcome: skipped
             exp_annotations:
-              summary: "Startup schedule backlog not absorbed (30 skipped)"
+              summary: "Schedule backlog not absorbed (30 skipped)"
               description: |
-                30 scheduled workflow run(s) from the STARTUP BACKLOG —
-                the schedules that came due while the controller was restarting —
-                ended `skipped`, and the failed+skipped runs are a
-                MAJORITY of that backlog.
+                30 scheduled workflow run(s) from a BACKLOG batch — the
+                schedules that came due while the controller was restarting
+                (phase=startup) or while it was not polling without a restart
+                (phase=catchup: host suspend/resume, DB outage) — ended
+                `skipped`, and the failed+skipped runs are a MAJORITY
+                of that backlog. Which shape:
+                `sum by (phase) (increase(talos_scheduler_dispatches_total{phase=~"startup|catchup"}[30m]))`,
+                or the controller log's `event_kind="scheduler_startup_backlog"` /
+                `"scheduler_catchup_backlog"` line, which carries the batch size
+                and how late its most overdue row was.
 
                 What this number knows: the outcome of each startup-phase dispatch.
                 What it does NOT know: why. A broad failure across the boot backlog
@@ -2370,8 +2382,9 @@ tests:
                 3. Confirm the upstream independently before tuning the breaker. Do
                    NOT raise CIRCUIT_BREAKER_FAILURE_THRESHOLD to make the alert
                    stop; that removes the protection, not the outage.
-                4. If the trips cluster at controller boot, this is the startup herd
-                   — see TalosSchedulerStartupHerdNotAbsorbed and lower
+                4. If the trips cluster at controller boot or right after a host
+                   resume, this is the backlog herd — see
+                   TalosSchedulerStartupHerdNotAbsorbed and lower
                    SCHEDULER_STARTUP_MAX_CONCURRENT rather than touching the breaker.
 
   # The retry-gate arm reaches the same alert on its OWN label. This is the
@@ -2531,8 +2544,9 @@ tests:
                 3. Confirm the upstream independently before tuning the breaker. Do
                    NOT raise CIRCUIT_BREAKER_FAILURE_THRESHOLD to make the alert
                    stop; that removes the protection, not the outage.
-                4. If the trips cluster at controller boot, this is the startup herd
-                   — see TalosSchedulerStartupHerdNotAbsorbed and lower
+                4. If the trips cluster at controller boot or right after a host
+                   resume, this is the backlog herd — see
+                   TalosSchedulerStartupHerdNotAbsorbed and lower
                    SCHEDULER_STARTUP_MAX_CONCURRENT rather than touching the breaker.
           - exp_labels:
               severity: warning
@@ -2668,8 +2682,9 @@ tests:
                 3. Confirm the upstream independently before tuning the breaker. Do
                    NOT raise CIRCUIT_BREAKER_FAILURE_THRESHOLD to make the alert
                    stop; that removes the protection, not the outage.
-                4. If the trips cluster at controller boot, this is the startup herd
-                   — see TalosSchedulerStartupHerdNotAbsorbed and lower
+                4. If the trips cluster at controller boot or right after a host
+                   resume, this is the backlog herd — see
+                   TalosSchedulerStartupHerdNotAbsorbed and lower
                    SCHEDULER_STARTUP_MAX_CONCURRENT rather than touching the breaker.
 
   # Clearing. The breaker stops refusing work at t=20m; once that leaves the
@@ -4141,8 +4156,21 @@ tests:
   # blind alert is the entire difference.
   #
   # As the file header notes, promtool's clock starts at 0, so `time()` at
-  # eval_time T is T seconds and a "fresh" stamp is a series that tracks
-  # the clock (`0+60x…` at a 1m interval).
+  # eval_time T is T seconds. THE SWEEP IS HOURLY (60 s until 2026-09-10,
+  # #794), so a "fresh" stamp is a series that steps once an hour —
+  # `0x59 3600x59 7200x59` at a 1m interval — and a healthy controller is
+  # anywhere from 0 to 3600 s stale. The threshold is 7800 s (two missed
+  # sweeps + 10 min slack), pinned to the spawn-site constant by
+  # `blind_detector_thresholds_match_the_sweep_cadence`.
+  #
+  # THE FIXTURE WAS GREEN OVER THE DEFECT, and that is worth stating. Until
+  # 2026-09-11 these three cases fed `0+60x…` — the cadence the ALERT
+  # assumed, not the one the producer had — and asserted the 600 s
+  # threshold's transitions against it. Every case passed while the live
+  # alert fired for ~35 minutes of every hour on a healthy fleet. A fixture
+  # that models the consumer's assumption instead of the producer's
+  # behaviour proves the consumer is self-consistent and nothing more; the
+  # pin test is what ties the two together.
   # ══════════════════════════════════════════════════════════════════════
   - interval: 1m
     name: TalosCryptoOrphanDetectorBlind — the sweep has NEVER completed
@@ -4151,20 +4179,20 @@ tests:
       # is the "sweep task never spawned / every probe has always failed"
       # state, and it must be LOUD.
       - series: 'talos_crypto_orphan_scan_last_success_timestamp_seconds{job="talos-controller",instance="controller:8080"}'
-        values: "0x60"
+        values: "0x200"
       # The gauge the operator would otherwise read as a clean bill of health.
       - series: 'talos_actor_memory_orphaned_rows{job="talos-controller",instance="controller:8080"}'
-        values: "0x60"
+        values: "0x200"
     alert_rule_test:
-      # The 600s threshold has not been crossed yet (time() - 0 == 600).
-      - eval_time: 10m
+      # The 7800s threshold has not been crossed yet (time() - 0 == 7800).
+      - eval_time: 2h10m
         alertname: TalosCryptoOrphanDetectorBlind
         exp_alerts: []
-      # Crossed at 10m01s, but `for: 15m` has not elapsed — pending, not firing.
-      - eval_time: 20m
+      # Crossed at 2h10m01s, but `for: 15m` has not elapsed — pending, not firing.
+      - eval_time: 2h20m
         alertname: TalosCryptoOrphanDetectorBlind
         exp_alerts: []
-      - eval_time: 26m
+      - eval_time: 2h26m
         alertname: TalosCryptoOrphanDetectorBlind
         exp_alerts: &talos_crypto_orphan_detector_blind_firing
           - exp_labels:
@@ -4173,10 +4201,11 @@ tests:
               job: talos-controller
               instance: controller:8080
             exp_annotations:
-              summary: Crypto-orphan detector has not completed a sweep in 10+ minutes
+              summary: Crypto-orphan detector has not completed a sweep in 2+ hours
               description: |
-                No crypto-orphan sweep has measured all three tables for over ten
-                minutes, so `talos_actor_memory_orphaned_rows`,
+                No crypto-orphan sweep has measured all three tables for over two
+                hours (at least two consecutive hourly sweeps did not complete),
+                so `talos_actor_memory_orphaned_rows`,
                 `talos_module_execution_orphaned_rows` and
                 `talos_workflow_execution_orphaned_rows` are holding values
                 nothing measured — and their three `critical` data-loss alerts
@@ -4184,8 +4213,9 @@ tests:
                 firing, you will not be told.
 
                 A value of 0 for the stamp means the sweep has NEVER completed on
-                this controller: either it has just started (it clears within
-                ~60s) or the sweep task is not running at all.
+                this controller: the first tick runs at boot, so it clears within
+                seconds of start-up, and a persistent 0 means the sweep task is
+                not running at all.
               action: |
                 1. Controller log, target=talos_crypto,
                    event_kind=crypto_orphan_probe_failed — it names the failing
@@ -4196,64 +4226,69 @@ tests:
                    return, the fault is in the controller, not the data.
                 3. Until this clears, treat the three orphan gauges as unknown,
                    not as zero.
-      - eval_time: 55m
+      - eval_time: 2h55m
         alertname: TalosCryptoOrphanDetectorBlind
         exp_alerts: *talos_crypto_orphan_detector_blind_firing
       # THE PAIRING. Same timeline, same data: the data-loss alert is silent
       # throughout. That silence is what the blind alert qualifies.
-      - eval_time: 26m
+      - eval_time: 2h26m
         alertname: TalosActorMemoryDEKOrphaned
         exp_alerts: []
-      - eval_time: 55m
+      - eval_time: 2h55m
         alertname: TalosActorMemoryDEKOrphaned
         exp_alerts: []
 
   # ══════════════════════════════════════════════════════════════════════
   # A HEALTHY sweep is quiet for the whole timeline. Without this, a rule
-  # that fired unconditionally would pass the test above.
+  # that fired unconditionally would pass the test above. The stamp steps
+  # ONCE AN HOUR — the production cadence — so healthy staleness sweeps
+  # 0 → 3540 s inside every hour. Run against the pre-fix `> 600` this case
+  # fails at 59m, 1h59m and 2h59m: that is the live defect, offline.
   # ══════════════════════════════════════════════════════════════════════
   - interval: 1m
-    name: TalosCryptoOrphanDetectorBlind — a sweep that keeps up is silent
+    name: TalosCryptoOrphanDetectorBlind — a sweep that keeps up (hourly) is silent
     input_series:
       - series: 'talos_crypto_orphan_scan_last_success_timestamp_seconds{job="talos-controller",instance="controller:8080"}'
-        values: "0+60x90"
+        values: "0x59 3600x59 7200x59"
     alert_rule_test:
-      - eval_time: 30m
+      - eval_time: 59m
         alertname: TalosCryptoOrphanDetectorBlind
         exp_alerts: []
-      - eval_time: 60m
+      - eval_time: 1h59m
         alertname: TalosCryptoOrphanDetectorBlind
         exp_alerts: []
-      - eval_time: 89m
+      - eval_time: 2h59m
         alertname: TalosCryptoOrphanDetectorBlind
         exp_alerts: []
 
   # ══════════════════════════════════════════════════════════════════════
   # A TRANSIENT stall must not page, and the alert must CLEAR when the
-  # sweep recovers. The stamp stops advancing for 20 minutes — long enough
-  # to cross the 600s threshold for ten of them — and `for: 15m` absorbs
-  # it. A detector-health alert that pages on every DB blip is one
-  # operators learn to ignore, which is the same defect one level up.
+  # sweep recovers. One hourly sweep is MISSED and the next completes ten
+  # minutes late: the stamp sits at 0 until 2h20m — past the 7800 s
+  # threshold for ten of those minutes — and `for: 15m` absorbs it. A
+  # detector-health alert that pages on one late sweep is one operators
+  # learn to ignore, which is the same defect one level up.
   # ══════════════════════════════════════════════════════════════════════
   - interval: 1m
-    name: TalosCryptoOrphanDetectorBlind — a 20-minute stall that recovers never fires
+    name: TalosCryptoOrphanDetectorBlind — one missed sweep that recovers never fires
     input_series:
-      # t=0..30m tracking the clock; t=31..50m frozen at 1800; t=51m+ caught up.
+      # Sweep at t=0; the t=1h sweep never completes; the t=2h sweep lands
+      # at 2h21m. Staleness peaks at 8400 s at 2h20m, then drops to ~60 s.
       - series: 'talos_crypto_orphan_scan_last_success_timestamp_seconds{job="talos-controller",instance="controller:8080"}'
-        values: "0+60x30 1800x19 3060+60x30"
+        values: "0x140 8400x40"
     alert_rule_test:
-      # Threshold crossed at ~41m, so this is PENDING, not firing.
-      - eval_time: 45m
+      # Threshold crossed at 2h10m01s, so this is PENDING, not firing.
+      - eval_time: 2h15m
         alertname: TalosCryptoOrphanDetectorBlind
         exp_alerts: []
-      - eval_time: 50m
+      - eval_time: 2h20m
         alertname: TalosCryptoOrphanDetectorBlind
         exp_alerts: []
       # Recovered; the pending state is discarded.
-      - eval_time: 60m
+      - eval_time: 2h30m
         alertname: TalosCryptoOrphanDetectorBlind
         exp_alerts: []
-      - eval_time: 80m
+      - eval_time: 2h59m
         alertname: TalosCryptoOrphanDetectorBlind
         exp_alerts: []
 
