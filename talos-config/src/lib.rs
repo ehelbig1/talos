@@ -343,6 +343,18 @@ pub fn ranked_recall_enabled() -> bool {
 /// payload would exceed this bound, so the injected context can never
 /// balloon a node's parse-fuel regardless of how large individual
 /// memories are.
+///
+/// **Reachable range** (measured 2026-09-11, the #791 class): the packer can
+/// only fill what its CANDIDATES supply, and every production caller asks
+/// for `limit = 20` (scheduler, sub-workflow resolver), each capped at
+/// [`smart_memory_context_per_memory_cap`] bytes. So a budget above
+/// `20 × per_memory_cap` (= 60 000 at the default cap) cannot be filled by
+/// count, and on any actor holding fewer than 20 memories the ceiling is
+/// lower still — the reference fleet's busiest actor holds 9. Below that
+/// the budget is the binding bound (default 12 000 vs 9 × 3 000 = 27 000
+/// available), which is the intended shape; above it the knob is inert and
+/// nothing reports that. Raise the caller limit together with the budget if
+/// you need more than 60 KB of injected context.
 pub fn smart_memory_context_byte_budget() -> usize {
     // Floor well above the empty `{actor_id, memories:[]}` wrapper (~65 B)
     // so the packer's `<= byte_budget` bound is always meaningful — a

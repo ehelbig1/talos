@@ -415,11 +415,15 @@ bold "▶ check 5: helm chart renders cleanly"
 # blind to this class — it survives until `helm upgrade` sees the
 # template execute against the actual values tree.
 #
-# Two renders here:
+# Four renders here:
 #   (a) default values — every key the templates reference must exist.
 #   (b) every `enabled: false` flipped to `true` — renders the
 #       conditional blocks too. Catches misplaced keys whose `{{- if }}`
 #       guard masks them when the toggle is off.
+#   (c) values-phase1.yaml — the installer's in-cluster Postgres path, which
+#       (b) no longer reaches because `postgres.enabled` gates a `fail`.
+#   (d) a NEGATIVE render: in-cluster Postgres over-subscribed by the default
+#       HPA must REFUSE with the connection-arithmetic message (2026-09-11).
 #
 # Helm is required; if it's not installed we skip with a warning rather
 # than fail (CI installs it; some local dev environments don't).
@@ -509,6 +513,45 @@ else
         fi
     else
         green "✓ helm chart renders cleanly (defaults; no enabled-toggles to flip)"
+    fi
+
+    # (c) The phase-1 installer values — the ONLY shipped configuration that
+    #     enables in-cluster Postgres (values-phase1.yaml is what install.sh
+    #     passes). `postgres.enabled` carries `# no-render-toggle` because it
+    #     gates a deliberate `fail` (the connection-arithmetic guard), so (b)
+    #     no longer renders the postgres/* templates; this render does, with
+    #     the numbers that actually ship (1 controller, autoscaling off).
+    if [ -f "$CHART_DIR/values-phase1.yaml" ]; then
+        if helm template "$CHART_DIR" -f "$CHART_DIR/values-phase1.yaml" >/dev/null 2>"$HELM_LOG"; then
+            green "✓ helm chart renders cleanly (values-phase1.yaml — in-cluster Postgres path)"
+        else
+            red "✗ helm template (values-phase1.yaml) failed"
+            sed 's/^/  /' "$HELM_LOG"
+            EXIT_CODE=1
+        fi
+    else
+        red "✗ $CHART_DIR/values-phase1.yaml is missing — the installer passes it; check 5(c) cannot render the in-cluster Postgres path"
+        EXIT_CODE=1
+    fi
+
+    # (d) NEGATIVE probe: a `fail` guard that never fires is a green tick over
+    #     nothing (checks 64/65). In-cluster Postgres at its 60-connection
+    #     default with the default HPA (max 6 × pool 20 = 120) MUST refuse to
+    #     render, and the refusal must be the arithmetic message, not some
+    #     other template error.
+    if helm template "$CHART_DIR" --set postgres.enabled=true \
+            --set controller.autoscaling.enabled=true \
+            --set controller.autoscaling.maxReplicas=6 \
+            --set controller.database.maxConnections=20 \
+            --set postgres.config.maxConnections=60 >/dev/null 2>"$HELM_LOG"; then
+        red "✗ helm template RENDERED in-cluster Postgres with HPA max 6 × pool 20 against a 60-connection ceiling — the connection-arithmetic guard in templates/postgres/configmap.yaml did not fire"
+        EXIT_CODE=1
+    elif grep -q 'connection arithmetic does not hold' "$HELM_LOG"; then
+        green "✓ in-cluster Postgres refuses to render when replicas × pool + reserve > max_connections (guard fires with the arithmetic)"
+    else
+        red "✗ the in-cluster Postgres over-subscription render failed for a reason OTHER than the arithmetic guard:"
+        sed 's/^/  /' "$HELM_LOG"
+        EXIT_CODE=1
     fi
     rm -f "$HELM_LOG"
 fi

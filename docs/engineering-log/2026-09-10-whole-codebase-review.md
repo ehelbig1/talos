@@ -1544,3 +1544,54 @@ overwritten only by that worker's next registration (registration is
 idempotent and runs at every boot, so one rolling restart of the worker fleet
 refreshes it). The baseline schema still shows the two tables until the next
 baseline cut; the drop migration applies on top.
+
+## Package L — the chart refuses the Postgres arithmetic it used to state (2026-09-11, follow-up PR)
+
+**What G5(a) left.** Package G set `controller.database.maxConnections: 20` so
+two controller replicas hold 40 of the in-cluster server's 60 connections,
+and wrote the rest into a values comment: "6 × 20 = 120 at HPA max — STILL
+over 60 — stated". The chart's DEFAULT autoscaler is on with `maxReplicas: 6`.
+A bare-helm operator who enabled `postgres.enabled` — the shape the chart
+documents as the homelab path — got a clean `helm install`, and the first
+sustained CPU spike would have had the HPA add controller pods that each fail
+to open a pool against a server already at its ceiling: crash-looping pods,
+"too many clients already", and the migrations Job and pg_dump competing for
+the last three superuser-reserved slots. A comment is not a control.
+
+**The guard.** `templates/postgres/configmap.yaml` computes
+`(autoscaling.enabled ? maxReplicas : replicaCount) × pool + 6` and `fail`s
+above `postgres.config.maxConnections`. The reserve is itemised (3
+superuser_reserved_connections, 2 for the migrations Job, 1 for the backup
+pg_dump) and the message prints the computed remedies: the pool that would
+fit at this replica count, the replica count that would fit at this pool, and
+the ceiling that would fit both. Measured on the fixed tree: default HPA × 20
+refuses at 126 > 60; three replicas refuse at 66; two render at 46; the
+phase-1 installer values (one controller, autoscaling off) render at 26.
+
+**What it cost the lint, and what it gave back.** Check 5(b) flips every
+`enabled: false` on and renders; with `postgres.enabled` on and the default
+autoscaler on, that render now fails BY DESIGN. `postgres.enabled` therefore
+carries `# no-render-toggle` — the marker exists precisely for a toggle that
+gates a `fail` (ollama's precedent) — which removes the `postgres/*` templates
+from (b). Two legs were added so the coverage went UP rather than down: 5(c)
+renders `values-phase1.yaml`, the only shipped configuration that enables
+in-cluster Postgres and the file install.sh passes, so the postgres templates
+are exercised with the numbers that actually deploy; and 5(d) is a NEGATIVE
+render that must REFUSE with the arithmetic message — a `fail` guard nothing
+ever drives is a green tick over nothing, checks 64/65's class, and 5(d) also
+distinguishes "refused for the right reason" from "failed for another". No
+new check number; `--count` stays 88.
+
+**Also closed here, by disclosure: #791's item D.** Every production caller
+of the smart memory context asks for 20 candidates, each capped at
+`SMART_MEMORY_CONTEXT_PER_MEMORY_CAP` (3 000), so `SMART_MEMORY_CONTEXT_BYTE_BUDGET`
+is inert above 60 000 — five times its default — and on the reference fleet's
+busiest actor (9 memories, p50 1 074 B, p90 6 553 B, 5 of 19 over the cap)
+above 27 000. Below that the budget binds, which is the intended shape; unlike
+#791's A, this knob's default sits inside its live range. The interaction is
+now written at the knob's doc comment and its `configuration-reference.md`
+row, the two places #791 found the repo writes such disclosures separately.
+
+**Stated limit.** The guard sees only what the chart deploys. A managed
+Postgres (the recommended production topology) has a ceiling the chart cannot
+read, and values.yaml says to size against that instead.

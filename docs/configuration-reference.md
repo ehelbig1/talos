@@ -414,8 +414,8 @@ Several default **ON** as of the 2026-07 "Tier 3" learning-loops cutover.
 | `ENABLE_ADAPTIVE_RANK_TRAINING` | on | Background rank-weight training | |
 | `MEMORY_CONSOLIDATION_TIER1_LOCAL_OK` | `false` | Attestation: consolidation LLM is local (Tier-1 actors) | 🔒 (privacy) |
 | `MEMORY_REFLECTION_TIER1_LOCAL_OK` | `false` | Attestation: reflection LLM is local (Tier-1 actors) | 🔒 (privacy) |
-| `SMART_MEMORY_CONTEXT_BYTE_BUDGET` | `12000` | Context byte budget | |
-| `SMART_MEMORY_CONTEXT_PER_MEMORY_CAP` | `3000` | Per-memory byte cap | |
+| `SMART_MEMORY_CONTEXT_BYTE_BUDGET` | `12000` | Context byte budget for the injected `__actor_context__` payload. Reachable range: the packer fills from at most 20 candidates (every production caller's limit), each capped at `SMART_MEMORY_CONTEXT_PER_MEMORY_CAP`, so a budget above `20 × cap` (60 000 at defaults) is inert, and on an actor with fewer than 20 memories the ceiling is `memories × cap` | |
+| `SMART_MEMORY_CONTEXT_PER_MEMORY_CAP` | `3000` | Per-memory byte cap (values above it are truncated at a char boundary and marked). Clamped to ≤ the byte budget at pack time | |
 | `SMART_MEMORY_CONTEXT_MIN_SCORE` | `0.25` | Min fused score to include | |
 | `SMART_MEMORY_CONTEXT_W_RELEVANCE` | `1.0` | Fused-rank relevance weight | |
 | `SMART_MEMORY_CONTEXT_W_RECENCY` | `0.3` | Fused-rank recency weight | |
