@@ -934,6 +934,37 @@ event and no restart; and the signed-RPC data plane had a function named
   is left alone** — it is a real ordering fact about the engine's failure path,
   not a rendering question. Population: 2 of 10,729 completed executions.
 
+* **Neither Talos process exported a single `process_*` series (2026-09-11).**
+  Measured while looking for a 26-hour RSS trend after #809: the controller's
+  registry had 66 families and none about the process; every
+  `process_resident_memory_bytes` in the dev Prometheus came from Prometheus,
+  Grafana, Jaeger, Alertmanager and node-exporter. A controller leaking memory
+  or file descriptors had NO series anywhere — `docker stats` was the only
+  view (44 MiB / 9 MiB at the time, healthy). The prometheus crate's own
+  `ProcessCollector` (`process` feature, procfs, Linux-only by its cfg) is now
+  registered in `TalosMetrics::new` and in the worker's `init_telemetry` —
+  before the exporter's `?`, for the reason the breaker seed sits there — so
+  both `/metrics` carry RSS, virtual size, open/max fds, threads, CPU seconds
+  and start time. **ONE alert, `TalosProcessFdsNearLimit`** (`open/max > 0.8`
+  for 10 m, warning): the one process-level threshold that is not a guess,
+  because the limit is read from the process. **Deliberately NO RSS alert** —
+  `process_*` cannot see the cgroup limit, so a byte threshold pages at the
+  wrong number on the next resize; and **NO `absent()` arm** — an image built
+  before the collector exports nothing here, and a capacity alert firing on a
+  rolling deploy's version skew is check 69's trap. Not a `TalosMetrics` field
+  (check 58 audits fields for increment sites; a collector is sampled). Pinned
+  by `process_metrics_are_exported_on_linux` in both crates, `cfg(linux)` so it
+  is SKIPPED on macOS rather than green over a cfg'd-out body. **Measured and
+  NOT changed on the same pass — outbound HTTP deadlines**: 24 `Client::builder()`
+  statements in non-test code; a statement-aware scan finds 5 whose chain sets
+  no total `.timeout(`, and every one is covered elsewhere — three are prose
+  hits inside comments (`platform.rs`, `oauth`, `slack`; their real builders go
+  through `build_outbound_webhook_client_with_timeout` / `build_integration_client`,
+  both of which set one), the worker's per-execution client applies a
+  per-request `.timeout(timeout_ms.min(120_000))`, and the local-LLM client is
+  wrapped by `LOCAL_LLM_EXCHANGE_TIMEOUT_SECS`. Zero findings; recorded so the
+  sweep is not redone.
+
 **Measured and NOT changed.** `create_watch` accepted ANY `module_id` uuid with
 no error and no trace — the most likely origin of this fleet's dangling channel —
 and a correct create-time gate needed a THREE-valued module-visibility read that

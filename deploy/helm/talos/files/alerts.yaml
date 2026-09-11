@@ -2628,6 +2628,54 @@ groups:
             All N controller replicas have failed scrapes for 2m. Platform
             is down. Check: `kubectl -n talos get pods -l app.kubernetes.io/component=controller`.
 
+      # ── A Talos process is running out of file descriptors.
+      # `process_open_fds` / `process_max_fds` come from the prometheus crate's
+      # ProcessCollector, registered in BOTH processes since 2026-09-11 (before
+      # that, neither exported a single `process_*` series — every one in the
+      # dev Prometheus came from Prometheus, Grafana, Jaeger and node-exporter,
+      # so a leaking controller had no series to alert on). The ratio is the
+      # one process-level number with a threshold that is not a guess: the
+      # limit is read from the process itself, and 80% of it sustained for
+      # 10 m is a leak or a stuck pool, not a burst. Deliberately NO RSS alert:
+      # `process_*` cannot see the cgroup memory limit (compose: 2 GiB
+      # controller, 4 GiB worker; the chart's `resources.limits`), so any
+      # absolute byte threshold would be a guess that pages at the wrong
+      # number on the next resize — read `process_resident_memory_bytes` on
+      # a dashboard and alert on `container_memory_*` where cAdvisor exists.
+      # Structural lint check 65(c) verifies only `talos_*`/`wasm_*` series;
+      # these two are produced by the collector by construction and pinned by
+      # `process_metrics_are_exported_on_linux` in both crates instead.
+      # Deliberately NO `absent()` arm: a Talos process built before the
+      # collector existed exports nothing here, and a `for: 10m` capacity
+      # alert firing on an old image during a rolling deploy would page on a
+      # version skew, not a leak. `TalosControllerDown`/`TalosWorkerDown`
+      # already cover "the process is gone".
+      - alert: TalosProcessFdsNearLimit
+        expr: |
+          process_open_fds{job=~"talos-controller|talos-worker"}
+            / process_max_fds{job=~"talos-controller|talos-worker"}
+            > 0.8
+        for: 10m
+        labels:
+          severity: warning
+          category: capacity
+        annotations:
+          summary: "{{ $labels.job }} is using {{ $value | humanizePercentage }} of its file-descriptor limit"
+          description: |
+            `process_open_fds / process_max_fds` for `{{ $labels.job }}`
+            ({{ $labels.instance }}) has been above 80% for 10 minutes. At the
+            limit, every new socket, pipe and file open fails: Postgres
+            connections, NATS, outbound HTTP, the metrics listener itself.
+
+            Likely causes, in order: a connection pool that grows without
+            bound (compare `talos_db_pool_*` / NATS connection counts), SSE or
+            WebSocket streams that never close, leaked temp files in the
+            compilation sandbox (worker: `/tmp/cargo-target/per-user`), or a
+            `max_fds` that is simply too low for the replica count
+            (`ulimit -n` / the container's `nofile`). Restarting clears the
+            symptom and loses the evidence — take `ls -l /proc/<pid>/fd | sort
+            | uniq -c` first.
+
       # Interactive-login failure rate. Population is method="password"
       # (talos_auth::AuthService::login) + method="oauth" (the controller's
       # oauth_callback_handler) — every attempt counted once, on success and

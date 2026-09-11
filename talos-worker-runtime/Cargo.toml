@@ -104,7 +104,9 @@ redis = { version = "0.27", features = ["tokio-comp", "connection-manager", "tls
 opentelemetry = { version = "0.32", features = ["metrics", "trace"] }
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "metrics", "trace"] }
 opentelemetry-prometheus = "0.32"
-prometheus = "0.14" # opentelemetry-prometheus 0.32 supports prometheus 0.14.x, which drops the
+# `process`: see talos-metrics/Cargo.toml — the worker registers the same
+# ProcessCollector into the default registry in `metrics::init_telemetry`.
+prometheus = { version = "0.14", features = ["process"] } # opentelemetry-prometheus 0.32 supports prometheus 0.14.x, which drops the
                     # vulnerable protobuf 2.x dependency (prometheus 0.14 uses protobuf 3.x, optional).
                     # This clears RUSTSEC-2024-0437 (protobuf recursion crash) — the deny.toml exemption
                     # is removed. worker's metrics_server.rs still enforces 4KB max request size, auth

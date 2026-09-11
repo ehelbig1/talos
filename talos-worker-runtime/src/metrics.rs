@@ -1551,6 +1551,23 @@ pub fn init_telemetry() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create Prometheus exporter (version 0.17+ API)
     let registry = prometheus::default_registry();
+
+    // The worker process itself (RSS, fds, threads, CPU, start time) — see
+    // `talos_metrics::TalosMetrics::new` for why: until 2026-09-11 neither
+    // Talos process exported a `process_*` series. Registered BEFORE the
+    // exporter's `?` for the same reason the breaker seed above is: these
+    // series must not depend on OTEL initialising. `AlreadyReg` is the second
+    // `init_telemetry` call in a test binary and is not an error; anything
+    // else is logged and the worker keeps serving — the collector is
+    // observability, not a dependency. Linux-only by the crate's own cfg.
+    #[cfg(target_os = "linux")]
+    match registry.register(Box::new(
+        prometheus::process_collector::ProcessCollector::for_self(),
+    )) {
+        Ok(()) | Err(prometheus::Error::AlreadyReg) => {}
+        Err(e) => eprintln!("[METRICS] process collector not registered: {e}"),
+    }
+
     let exporter = opentelemetry_prometheus::exporter()
         .with_registry(registry.clone())
         .build()?;

@@ -962,3 +962,71 @@ panic) with an ordinary-row CONTROL that stays green, and a second mutation
 silencing `beyond_total` is red too. Neither can see the HANDLER BODY — a caller
 that computes the geometry correctly and discards `beyond_total` survives, which
 is checks 74b/79b's stated limit and is the honest position here.
+
+## The process nobody measured (2026-09-11)
+
+**How it was found.** Verifying the #809 deploy, the natural next question
+after a controller had run 26 hours without a restart was whether its memory
+had moved. `process_resident_memory_bytes{job="talos-controller"}` returned
+NO SERIES. So did `process_open_fds` and `process_threads`, for both jobs.
+The five processes that DID export them were Prometheus, Grafana, Jaeger,
+Alertmanager and node-exporter — every observability component, and neither
+Talos binary. The controller's registry carries 66 metric families about
+executions, RPC, crypto invariants, schedulers and webhooks, and not one about
+the process running them; the worker's OTEL exporter likewise. `docker stats`
+said 44 MiB and 9 MiB, healthy, and was the only thing that could say it.
+
+**Why it is this file's class.** "Failures nobody can see" catalogued a push
+channel failing silently, a background loop dying with no metric, an RPC
+instrument that recorded nothing. A leak is the same shape one layer down: the
+process gets slower, then OOM-killed, and the first series to say anything is
+`up` going to 0 — the symptom, minutes after the cause was observable.
+
+**The fix is the crate's own collector.** `prometheus` 0.14 ships
+`ProcessCollector::for_self()` behind the `process` feature (procfs, so
+Linux-only by its cfg — a macOS dev build is byte-identical to before). It is
+registered in `TalosMetrics::new` and in the worker's `init_telemetry`,
+BEFORE the exporter's `?` — the same argument the breaker seed makes two
+lines above it: a series about the process must not depend on OTEL
+initialising. `AlreadyReg` on the worker is the second `init_telemetry` call
+in a test binary and is not an error. Seven families each: RSS, virtual size,
+open fds, max fds, threads, CPU seconds, start time. Not a `TalosMetrics`
+FIELD, deliberately: check 58 audits every field for a live increment site
+and a collector is sampled by the registry, never incremented — it would be
+reported dead while being the most alive thing in the file.
+
+**One alert, and the two that were declined.** `TalosProcessFdsNearLimit`:
+`process_open_fds / process_max_fds > 0.8` for 10 minutes, warning. It is the
+one process-level threshold that is not a guess, because the denominator is
+read from the process. An RSS alert was declined: `process_*` cannot see the
+cgroup limit (compose says 2 GiB / 4 GiB, the chart says `resources.limits`),
+so any absolute byte threshold pages at the wrong number the day someone
+resizes the pod — the honest home for that is `container_memory_*` where
+cAdvisor exists, and a dashboard panel here. An `absent()` arm was declined
+too, against this file's own rule of thumb, and the reason is stated: an image
+built before the collector exports nothing, so a capacity alert with an absent
+arm fires on every rolling deploy's version skew (check 69's trap), and
+`TalosControllerDown` / `TalosWorkerDown` already say "the process is gone".
+
+**Guards.** `process_metrics_are_exported_on_linux` in both crates renders the
+registry and asserts the families are present. Both are `cfg(target_os =
+"linux")`, so on macOS they are SKIPPED — a `#[test]` whose body is cfg'd out
+would be a green tick over nothing (checks 64/65), and saying "skipped" is
+the honest state. CI runs Linux. Deleting either `register` call fails the
+test on every runner. Stated limit: check 65(c) verifies only `talos_*` /
+`wasm_*` names in alert expressions, so the alert's `process_*` selectors are
+pinned by those tests and by the collector's construction, not by the lint.
+
+**Measured on the same pass and NOT changed — outbound deadlines.** A grep
+for `Client::builder()` with no `.timeout(` in the file reported 5 of 24
+non-test builders; a statement-aware scan (gather the builder chain to its
+`;`) confirmed 5 chains without a total timeout. Every one is covered: three
+are PROSE — comments quoting the anti-pattern above builders that go through
+`build_outbound_webhook_client_with_timeout` (a2a, failure webhook) or
+`build_integration_client(15 s)` (oauth, slack), both of which set one; the
+worker's per-execution client sets `.timeout(timeout_ms.min(120_000))` per
+request; the local-LLM client is wrapped by `LOCAL_LLM_EXCHANGE_TIMEOUT_SECS`.
+Zero findings. The first grep's "5 files" was a line count over a file that
+contains the word, not a population — the same lesson this file records for
+`mcp_error` and `JsonRpcResponse {`.
+
