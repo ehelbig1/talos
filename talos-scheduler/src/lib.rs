@@ -398,6 +398,22 @@ fn parse_validated_cron(cron_expression: &str) -> Result<croner::Cron, String> {
         .map_err(|e| format!("Invalid cron expression: {}", e))
 }
 
+/// One poll's claimed batch: which `phase` it dispatches under, how late its
+/// most overdue row was, and the executions to spawn now that the claim has
+/// committed. `pub` because [`SchedulerService::select_due_and_advance`] is
+/// driven by a controller DB test; not an API.
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct DueBatch {
+    /// One of [`talos_metrics::SCHEDULER_DISPATCH_PHASES`].
+    pub phase: &'static str,
+    /// Seconds past `next_trigger_at` of the batch's most overdue row, by the
+    /// database clock. `None` for an empty batch.
+    pub max_overdue_secs: Option<f64>,
+    /// `(workflow_id, user_id, schedule_id)` per claimed row.
+    pub to_spawn: Vec<(Uuid, Uuid, Uuid)>,
+}
+
 /// Background service that polls for due schedules and triggers workflow
 /// executions.
 pub struct SchedulerService {
@@ -418,8 +434,11 @@ pub struct SchedulerService {
     /// rate. Sized from `SCHEDULER_MAX_CONCURRENT_EXECUTIONS` (default
     /// [`DEFAULT_SCHEDULER_MAX_CONCURRENT_EXECUTIONS`]).
     spawn_semaphore: Arc<tokio::sync::Semaphore>,
-    /// A SECOND, tighter ceiling applied only to the **startup backlog** —
-    /// the schedules found due by the first poll after this process booted.
+    /// A SECOND, tighter ceiling applied only to a **backlog batch** — the
+    /// schedules found due by the first poll after this process booted
+    /// (`phase = startup`), or by a later poll that finds a schedule overdue
+    /// by more than [`CATCHUP_OVERDUE_SECS`] (`phase = catchup`; see
+    /// [`classify_dispatch_phase`]).
     ///
     /// The M6 semaphore above did not prevent the 2026-08-10 outage because
     /// its default (16) never bound: exactly 15 schedules came due at boot, so
@@ -435,14 +454,31 @@ pub struct SchedulerService {
     /// budget backstop, which the burst had exhausted; two of those are DAILY
     /// crons, so "the next scheduled occurrence will retry" meant tomorrow.
     ///
-    /// Backlog executions acquire from BOTH semaphores, so startup
+    /// Backlog executions acquire from BOTH semaphores, so backlog
     /// concurrency is `min(startup, steady)`. This is admission control, not
     /// a delay: the first backlog run starts immediately, the rest queue
     /// behind permits and drain as those complete.
+    ///
+    /// Until 2026-09-11 this ceiling keyed on PROCESS AGE alone ("the first
+    /// poll since boot"), and the M6 comment above names the case that
+    /// misses: "controller downtime OR a clock catch-up". Measured live
+    /// 2026-09-10: the host was suspended 10:56–12:06 UTC (every Prometheus
+    /// job, Prometheus included, has no samples in that window; the dispatch
+    /// counter climbed 17 → 28 with no reset, so the process never
+    /// restarted). The controller resumed with `first_poll_done` already
+    /// spent and found TEN schedules due in one poll — daily crons 53 minutes
+    /// late, a `*/15` cron 65 minutes late — labelled every one `steady`,
+    /// drained them under this file's 16-wide steady ceiling (which did not
+    /// bind on 10, as it had not bound on 15), and the herd alert, selecting
+    /// `phase="startup"`, saw nothing. Six of the ten carried LLM nodes into
+    /// a single-slot Ollama; the worker's LLM gate queued them (p90 wait 96 s
+    /// in that window) and two hit their 120 s node timeout while queued. The
+    /// phase is now classified from the BATCH's own lateness as well as from
+    /// process age, so a resume, a long DB outage and a boot are one shape.
     startup_semaphore: Arc<tokio::sync::Semaphore>,
-    /// Flips to `true` once the first poll has run, so the startup ceiling
-    /// applies to exactly one batch — the accumulated backlog — and steady
-    /// state is untouched.
+    /// Flips to `true` once the first poll has run, so the `startup` phase
+    /// applies to exactly one batch — the boot backlog. A later backlog is
+    /// recognised by its lateness instead (`catchup`).
     first_poll_done: Arc<std::sync::atomic::AtomicBool>,
     /// Consecutive polls held by the fleet-readiness barrier, and the latch
     /// that stops it holding once that count passes
@@ -473,6 +509,68 @@ pub const DEFAULT_SCHEDULER_MAX_CONCURRENT_EXECUTIONS: usize = 16;
 /// the alert built on it are what tell us whether 4 was actually enough;
 /// tuning belongs there, driven by that signal rather than by this comment.
 pub const DEFAULT_SCHEDULER_STARTUP_MAX_CONCURRENT: usize = 4;
+
+/// How often the scheduler polls `workflow_schedules` for due rows. One home
+/// for the literal the loop, the readiness bound and the catch-up threshold
+/// all reason from.
+pub const SCHEDULER_POLL_INTERVAL_SECS: u64 = 15;
+
+/// A due schedule overdue by at least this many seconds marks its poll's
+/// batch as a CATCH-UP backlog (`phase = catchup`), which drains under the
+/// startup ceiling like a boot backlog does.
+///
+/// Six poll intervals. Ordinary lateness is bounded by ONE interval — a row
+/// due at 12:00:00 is claimed by 12:00:15 — and a single failed poll adds one
+/// more, so a row six intervals late means the scheduler did not complete a
+/// poll for a minute and a half: a host suspend/resume, a Postgres outage the
+/// pool has just recovered from, or a controller that was wedged. It is
+/// deliberately far above one interval, because the cost of a false `steady`
+/// is the 2026-09-10 herd and the cost of a false `catchup` is that a batch
+/// too small for the 4-wide ceiling to bind is labelled `catchup` in the
+/// metric (the ceiling itself is a no-op below its width). A `*/15` cron is
+/// the most frequent schedule the platform admits, so no LEGITIMATE row can
+/// sit this long past `next_trigger_at` while the scheduler is polling.
+///
+/// Measured on the one sample: the 2026-09-10 batch's least-late row was
+/// 3 195 s overdue and its most-late 3 915 s — forty times this threshold.
+pub const CATCHUP_OVERDUE_SECS: f64 = 6.0 * SCHEDULER_POLL_INTERVAL_SECS as f64;
+
+/// Which `talos_scheduler_dispatches_total{phase}` a poll's batch belongs to.
+///
+/// `first_poll_since_boot` wins outright: the boot backlog is `startup`
+/// whatever its lateness (a controller restarted 3 s after a `*/15` cron came
+/// due has a boot backlog of one row 3 s late, and that is still the boot
+/// batch). Otherwise the batch is `catchup` when its MOST overdue row is at
+/// least [`CATCHUP_OVERDUE_SECS`] late — the max, not the mean, because one
+/// hour-late daily cron in a batch of otherwise on-time rows is exactly the
+/// resume shape (the on-time rows came due DURING the gap too, they are just
+/// the frequent ones). `None` lateness (an empty batch) is `steady`.
+///
+/// Pure so the boundary is unit-tested without a database; the SQL that
+/// produces `max_overdue_secs` is driven by
+/// `controller/tests/scheduler_catchup_phase_tests` against a real clone.
+#[must_use]
+pub fn classify_dispatch_phase(
+    first_poll_since_boot: bool,
+    max_overdue_secs: Option<f64>,
+) -> &'static str {
+    if first_poll_since_boot {
+        return talos_metrics::SCHEDULER_PHASE_STARTUP;
+    }
+    match max_overdue_secs {
+        Some(late) if late >= CATCHUP_OVERDUE_SECS => talos_metrics::SCHEDULER_PHASE_CATCHUP,
+        _ => talos_metrics::SCHEDULER_PHASE_STEADY,
+    }
+}
+
+/// Does a dispatch in this phase take the tighter startup permit before the
+/// steady one? True for BOTH backlog shapes; only `steady` runs on the steady
+/// pool alone. One predicate so the semaphore site and the metric label can
+/// never disagree about what a backlog is.
+#[must_use]
+pub fn phase_takes_backlog_permit(phase: &str) -> bool {
+    phase != talos_metrics::SCHEDULER_PHASE_STEADY
+}
 
 /// Default bound on how long the first poll waits for the worker fleet to
 /// become visible before giving up on THAT poll. Override via
@@ -805,7 +903,8 @@ impl SchedulerService {
         // `talos_scheduler_readiness_holds_total` by one on every boot that
         // waits, and the alert on it is threshold-based.
 
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(SCHEDULER_POLL_INTERVAL_SECS));
 
         loop {
             tokio::select! {
@@ -965,16 +1064,36 @@ impl SchedulerService {
 
     /// Single poll iteration: find due schedules and trigger them.
     async fn poll_and_trigger(&self) -> Result<(), String> {
-        let (phase, to_spawn) =
-            Self::select_due_and_advance(&self.db_pool, &self.first_poll_done).await?;
+        let DueBatch {
+            phase,
+            max_overdue_secs,
+            to_spawn,
+        } = Self::select_due_and_advance(&self.db_pool, &self.first_poll_done).await?;
 
         if phase == talos_metrics::SCHEDULER_PHASE_STARTUP && !to_spawn.is_empty() {
             tracing::info!(
                 target: "talos_scheduler",
                 event_kind = "scheduler_startup_backlog",
                 backlog = to_spawn.len(),
+                max_overdue_secs = max_overdue_secs.unwrap_or(0.0),
                 "Scheduler: first poll after boot — draining the accumulated backlog \
                  under the startup concurrency ceiling rather than all at once"
+            );
+        } else if phase == talos_metrics::SCHEDULER_PHASE_CATCHUP {
+            // Not a boot: the process has been polling, and a row is more than
+            // CATCHUP_OVERDUE_SECS late, so it stopped polling for a while
+            // (host suspend/resume, DB outage). Same shape, same ceiling, its
+            // own event_kind so the two can be told apart in the log.
+            tracing::warn!(
+                target: "talos_scheduler",
+                event_kind = "scheduler_catchup_backlog",
+                backlog = to_spawn.len(),
+                max_overdue_secs = max_overdue_secs.unwrap_or(0.0),
+                catchup_threshold_secs = CATCHUP_OVERDUE_SECS,
+                "Scheduler: a schedule is overdue by more than the catch-up threshold \
+                 without a controller boot — the scheduler missed several polls (host \
+                 suspend/resume or a DB outage); draining the backlog under the startup \
+                 concurrency ceiling rather than all at once"
             );
         }
 
@@ -995,12 +1114,18 @@ impl SchedulerService {
     /// unit test. Building a whole `SchedulerService` would need a live NATS
     /// connection, which is precisely the kind of setup cost that leaves an
     /// error path with no test at all.
-    async fn select_due_and_advance(
+    ///
+    /// `pub` for `controller/tests/scheduler_catchup_phase_tests`, which
+    /// drives it against a real database clone; not an API.
+    #[doc(hidden)]
+    pub async fn select_due_and_advance(
         db_pool: &PgPool,
         first_poll_done: &std::sync::atomic::AtomicBool,
-    ) -> Result<(&'static str, Vec<(Uuid, Uuid, Uuid)>), String> {
-        // Classify the phase FIRST — before the query — but do NOT consume the
-        // startup phase until this poll has actually reached a COMMIT.
+    ) -> Result<DueBatch, String> {
+        // Read the boot flag FIRST — before the query — but do NOT consume the
+        // startup phase until this poll has actually reached a COMMIT. The
+        // batch's OWN lateness is folded in after the fetch
+        // (`classify_dispatch_phase`), since it needs the rows.
         //
         // Consuming it on entry (a `swap(true, ..)` here, which is what this
         // did until the review of 6dde58b) disarms the ceiling on exactly the
@@ -1026,12 +1151,7 @@ impl SchedulerService {
         // Plain load/store rather than a compare-exchange: `poll_and_trigger`
         // is driven from a single scheduler loop, one poll at a time, so there
         // is no concurrent second caller to race with.
-        let is_startup_backlog = !first_poll_done.load(std::sync::atomic::Ordering::SeqCst);
-        let phase = if is_startup_backlog {
-            talos_metrics::SCHEDULER_PHASE_STARTUP
-        } else {
-            talos_metrics::SCHEDULER_PHASE_STEADY
-        };
+        let is_first_poll = !first_poll_done.load(std::sync::atomic::Ordering::SeqCst);
 
         // Use a transaction with FOR UPDATE SKIP LOCKED to prevent
         // double-firing in multi-instance deployments.
@@ -1047,11 +1167,17 @@ impl SchedulerService {
             user_id: Uuid,
             cron_expression: String,
             timezone: String,
+            /// How far past `next_trigger_at` this row is, by the DATABASE
+            /// clock — the same clock the `<= NOW()` predicate used, so a
+            /// controller whose own clock drifted cannot manufacture or hide
+            /// a catch-up batch.
+            overdue_secs: f64,
         }
 
         let due_schedules: Vec<DueSchedule> = sqlx::query_as(
             r#"
-            SELECT id, workflow_id, user_id, cron_expression, timezone
+            SELECT id, workflow_id, user_id, cron_expression, timezone,
+                   EXTRACT(EPOCH FROM (NOW() - next_trigger_at))::float8 AS overdue_secs
             FROM workflow_schedules
             WHERE is_enabled = true
               AND next_trigger_at IS NOT NULL
@@ -1072,10 +1198,29 @@ impl SchedulerService {
             // A boot with nothing overdue HAS consumed its startup phase — see
             // the classification comment above.
             first_poll_done.store(true, std::sync::atomic::Ordering::SeqCst);
-            return Ok((phase, Vec::new()));
+            return Ok(DueBatch {
+                phase: classify_dispatch_phase(is_first_poll, None),
+                max_overdue_secs: None,
+                to_spawn: Vec::new(),
+            });
         }
 
-        tracing::info!("Scheduler found {} due schedule(s)", due_schedules.len());
+        // The batch's lateness is its MOST overdue row (see
+        // `classify_dispatch_phase` for why the max and not the mean).
+        let max_overdue_secs = due_schedules
+            .iter()
+            .map(|s| s.overdue_secs)
+            .fold(None, |acc: Option<f64>, x| {
+                Some(acc.map_or(x, |a| a.max(x)))
+            });
+        let phase = classify_dispatch_phase(is_first_poll, max_overdue_secs);
+
+        tracing::info!(
+            phase,
+            max_overdue_secs = max_overdue_secs.unwrap_or(0.0),
+            "Scheduler found {} due schedule(s)",
+            due_schedules.len()
+        );
 
         // MCP-539: defer execution-spawning until AFTER tx.commit() so a
         // commit failure can't leave us in the "tasks fired but
@@ -1173,7 +1318,11 @@ impl SchedulerService {
         // "scheduled forward" because the UPDATE committed.
         first_poll_done.store(true, std::sync::atomic::Ordering::SeqCst);
 
-        Ok((phase, to_spawn))
+        Ok(DueBatch {
+            phase,
+            max_overdue_secs,
+            to_spawn,
+        })
     }
 
     /// Trigger a workflow execution in the background, mirroring the pattern
@@ -1196,7 +1345,7 @@ impl SchedulerService {
         let nats_client = self.nats_client.clone();
         let spawn_semaphore = self.spawn_semaphore.clone();
         let startup_semaphore = self.startup_semaphore.clone();
-        let is_startup = phase == talos_metrics::SCHEDULER_PHASE_STARTUP;
+        let is_backlog = phase_takes_backlog_permit(phase);
 
         tokio::spawn(async move {
             // M6: bound concurrent scheduled executions. Acquire INSIDE the
@@ -1209,9 +1358,10 @@ impl SchedulerService {
             // closed, which never happens (the Arc lives as long as the
             // service); on the impossible error we skip rather than run
             // unbounded.
-            // Startup-backlog runs take the tighter startup permit FIRST, then
-            // the steady-state one, so the boot burst is `min(startup, steady)`
-            // wide instead of "however many happened to come due".
+            // Backlog runs (phase `startup` OR `catchup`) take the tighter
+            // startup permit FIRST, then the steady-state one, so the burst is
+            // `min(startup, steady)` wide instead of "however many happened to
+            // come due".
             //
             // The order is load-bearing and is the opposite of the obvious one.
             // Taking the steady permit first would let all 15 parked backlog
@@ -1233,7 +1383,7 @@ impl SchedulerService {
             // Both impossible-error arms still record: "impossible" is a claim
             // about the code, and the counter's value is that it partitions
             // every spawned task without needing that claim to hold.
-            let _startup_permit = if is_startup {
+            let _startup_permit = if is_backlog {
                 match startup_semaphore.acquire_owned().await {
                     Ok(p) => Some(p),
                     Err(_) => {
@@ -2503,6 +2653,28 @@ mod startup_herd_tests {
             .contains(&talos_metrics::SCHEDULER_PHASE_STARTUP));
         assert!(talos_metrics::SCHEDULER_DISPATCH_PHASES
             .contains(&talos_metrics::SCHEDULER_PHASE_STEADY));
+        assert!(talos_metrics::SCHEDULER_DISPATCH_PHASES
+            .contains(&talos_metrics::SCHEDULER_PHASE_CATCHUP));
+        assert_eq!(
+            talos_metrics::SCHEDULER_DISPATCH_PHASES.len(),
+            3,
+            "a new phase must be added to this test, to the pre-seed loop, to \
+             `phase_takes_backlog_permit` and to the herd alert's phase selector"
+        );
+        // Every phase the classifier can return is a seeded label, in every
+        // branch it has.
+        for phase in [
+            super::classify_dispatch_phase(true, None),
+            super::classify_dispatch_phase(true, Some(1e6)),
+            super::classify_dispatch_phase(false, None),
+            super::classify_dispatch_phase(false, Some(0.0)),
+            super::classify_dispatch_phase(false, Some(super::CATCHUP_OVERDUE_SECS)),
+        ] {
+            assert!(
+                talos_metrics::SCHEDULER_DISPATCH_PHASES.contains(&phase),
+                "{phase} is emitted but not seeded"
+            );
+        }
         for outcome in [
             talos_metrics::SCHEDULER_OUTCOME_COMPLETED,
             talos_metrics::SCHEDULER_OUTCOME_FAILED,
@@ -2547,6 +2719,110 @@ mod startup_herd_tests {
              drops below the herd size, the comment above the startup semaphore \
              is stale and needs rewriting"
         );
+        // The second sample, 2026-09-10: a host suspend/resume herd of TEN,
+        // classified `steady` at the time. The startup ceiling binds on it
+        // and the steady one does not — which is why the phase now has to be
+        // recognised from the batch's lateness and not from process age.
+        const OBSERVED_CATCHUP_HERD: usize = 10;
+        assert!(super::DEFAULT_SCHEDULER_STARTUP_MAX_CONCURRENT < OBSERVED_CATCHUP_HERD);
+        assert!(super::DEFAULT_SCHEDULER_MAX_CONCURRENT_EXECUTIONS >= OBSERVED_CATCHUP_HERD);
+    }
+
+    /// The boot flag wins whatever the lateness: a controller restarted 3 s
+    /// after a `*/15` cron came due has a one-row, 3 s-late boot backlog, and
+    /// it is still the boot batch. Without this precedence a boot with a
+    /// small backlog would be `steady` and the startup log line would lie.
+    #[test]
+    fn the_first_poll_is_startup_whatever_its_lateness() {
+        for late in [
+            None,
+            Some(0.0),
+            Some(3.0),
+            Some(super::CATCHUP_OVERDUE_SECS),
+            Some(1e6),
+        ] {
+            assert_eq!(
+                super::classify_dispatch_phase(true, late),
+                talos_metrics::SCHEDULER_PHASE_STARTUP,
+                "lateness {late:?}"
+            );
+        }
+    }
+
+    /// Ordinary lateness — up to one poll interval, plus one more for a poll
+    /// that failed — is `steady`. The threshold sits at SIX intervals, so a
+    /// row that is merely "claimed by the next tick" can never be a catch-up.
+    #[test]
+    fn ordinary_poll_lateness_is_steady() {
+        let one_interval = super::SCHEDULER_POLL_INTERVAL_SECS as f64;
+        for late in [
+            0.0,
+            0.5,
+            one_interval,
+            2.0 * one_interval,
+            super::CATCHUP_OVERDUE_SECS - 0.001,
+        ] {
+            assert_eq!(
+                super::classify_dispatch_phase(false, Some(late)),
+                talos_metrics::SCHEDULER_PHASE_STEADY,
+                "lateness {late}"
+            );
+        }
+        assert_eq!(
+            super::classify_dispatch_phase(false, None),
+            talos_metrics::SCHEDULER_PHASE_STEADY,
+            "an empty batch has no lateness and is steady"
+        );
+        assert!(
+            super::CATCHUP_OVERDUE_SECS >= 4.0 * one_interval,
+            "the catch-up threshold must clear several consecutive missed polls, \
+             or a single slow poll would relabel a steady batch as a herd"
+        );
+    }
+
+    /// At and above the threshold, without a boot, the batch is `catchup`.
+    /// The two live numbers from 2026-09-10 (least-late 3 195 s, most-late
+    /// 3 915 s) are pinned so the sample that motivated the phase stays in
+    /// range if the threshold is ever moved.
+    #[test]
+    fn a_row_overdue_past_the_threshold_makes_the_batch_catchup() {
+        for late in [
+            super::CATCHUP_OVERDUE_SECS,
+            super::CATCHUP_OVERDUE_SECS + 1.0,
+            3195.0,
+            3915.0,
+        ] {
+            assert_eq!(
+                super::classify_dispatch_phase(false, Some(late)),
+                talos_metrics::SCHEDULER_PHASE_CATCHUP,
+                "lateness {late}"
+            );
+        }
+    }
+
+    /// The permit decision and the metric label must agree about what a
+    /// backlog is: both backlog phases take the startup permit, steady does
+    /// not, and every seeded phase is classified one way or the other.
+    #[test]
+    fn both_backlog_phases_take_the_startup_permit_and_steady_does_not() {
+        assert!(super::phase_takes_backlog_permit(
+            talos_metrics::SCHEDULER_PHASE_STARTUP
+        ));
+        assert!(super::phase_takes_backlog_permit(
+            talos_metrics::SCHEDULER_PHASE_CATCHUP
+        ));
+        assert!(!super::phase_takes_backlog_permit(
+            talos_metrics::SCHEDULER_PHASE_STEADY
+        ));
+        let backlog = talos_metrics::SCHEDULER_DISPATCH_PHASES
+            .iter()
+            .filter(|p| super::phase_takes_backlog_permit(p))
+            .count();
+        assert_eq!(
+            backlog,
+            talos_metrics::SCHEDULER_DISPATCH_PHASES.len() - 1,
+            "exactly one phase (steady) runs on the steady pool alone"
+        );
     }
 
     /// The chart's alert file, read at COMPILE time so the threshold this test
@@ -2582,6 +2858,77 @@ mod startup_herd_tests {
             .next()
             .and_then(|t| t.trim().parse::<usize>().ok())
             .unwrap_or_else(|| panic!("could not parse a threshold after `{NEEDLE}`"))
+    }
+
+    /// The herd alert must select BOTH backlog phases. Read from the chart
+    /// file at compile time (#630's rule: a hardcoded copy of the selector
+    /// would pass while the shipped alert silently reverted to
+    /// `phase="startup"` — which is the exact selector that was blind to the
+    /// 2026-09-10 resume herd). Three selector occurrences: the threshold arm,
+    /// the ratio's numerator and its denominator. A `phase="startup"` alone
+    /// anywhere in that alert's block is the regression.
+    #[test]
+    fn the_herd_alert_selects_both_backlog_phases() {
+        let block = CHART_ALERTS_YAML
+            .split("- alert: TalosSchedulerStartupHerdNotAbsorbed")
+            .nth(1)
+            .expect("the herd alert must still exist under that name")
+            .split("- alert: ")
+            .next()
+            .expect("alert block");
+        // The EXPRESSION only: the description below it quotes a selector as
+        // operator guidance, and prose is not what fires.
+        let expr = block
+            .split("\n        for:")
+            .next()
+            .expect("the alert has a `for:` after its expr");
+        let both = expr.matches(r#"phase=~"startup|catchup""#).count();
+        assert_eq!(
+            both, 3,
+            "the threshold arm, the ratio numerator and the ratio denominator must \
+             each select phase=~\"startup|catchup\"; found {both}"
+        );
+        assert!(
+            !expr.contains(r#"phase="startup""#),
+            "a startup-only selector inside the herd alert is blind to a catch-up herd"
+        );
+        for phase in talos_metrics::SCHEDULER_DISPATCH_PHASES {
+            if super::phase_takes_backlog_permit(phase) {
+                assert!(
+                    expr.contains(phase),
+                    "backlog phase {phase} takes the startup permit but the herd alert \
+                     does not select it — the ceiling and its detector disagree"
+                );
+            }
+        }
+    }
+
+    /// The semaphore site must decide "backlog or not" through the ONE
+    /// predicate the metric label is built from. Asserted on the code path
+    /// (the same way `the_startup_phase_is_spent_by_a_commit_not_by_finding_work`
+    /// is): replacing the call with `phase == SCHEDULER_PHASE_STARTUP` at that
+    /// site is behaviourally identical to the pre-fix tree for every boot and
+    /// silently drops the catch-up batch back onto the steady pool — and no
+    /// unit test can drive the spawned task's permit acquisition without a
+    /// live NATS connection. Textual, and stated as such.
+    #[test]
+    fn the_permit_site_uses_the_shared_backlog_predicate() {
+        let src = include_str!("lib.rs");
+        let body = src
+            .split("    fn spawn_workflow_execution(")
+            .nth(1)
+            .expect("spawn_workflow_execution must exist")
+            .split("\n    /// ")
+            .next()
+            .expect("function body");
+        assert!(
+            body.contains("phase_takes_backlog_permit(phase)"),
+            "the startup-permit decision must come from phase_takes_backlog_permit"
+        );
+        assert!(
+            !body.contains("== talos_metrics::SCHEDULER_PHASE_STARTUP"),
+            "a direct startup comparison at the permit site excludes the catch-up phase"
+        );
     }
 
     /// The barrier must GIVE UP, and it must give up after the alert has had

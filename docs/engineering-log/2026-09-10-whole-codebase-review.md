@@ -1595,3 +1595,109 @@ row, the two places #791 found the repo writes such disclosures separately.
 **Stated limit.** The guard sees only what the chart deploys. A managed
 Postgres (the recommended production topology) has a ceiling the chart cannot
 read, and values.yaml says to size against that instead.
+
+## Package M — a backlog that arrives without a boot (2026-09-11)
+
+**How it was found.** Routine post-deploy verification of #808: `get_error_report`
+listed two `execution timed out after 120 seconds` failures at 12:05 UTC on
+2026-09-10 (`pa-meeting-prep`'s judge, `pa-inbox-triage`'s triage), both
+inside a burst in which TEN scheduled workflows share one `started_at` second.
+The other seven days in the window had zero timeouts and no burst larger than
+six. The first hypothesis — a deploy restart landing on the daily herd — was
+wrong in the way that matters: `sum(talos_scheduler_dispatches_total)` climbs
+17 → 21 → 23 → 25 → 28 across 12:06–12:09 with NO reset, and `up` for every
+Prometheus job (controller, worker, node-exporter, grafana, jaeger,
+alertmanager and Prometheus itself) has an identical sample gap 10:56 → 12:06.
+Prometheus cannot fail to scrape itself; the host was suspended. The
+controller RESUMED — its boot flag long spent — and its next poll found the
+schedules that had come due during the gap: `pa-daily-brief` (11:12) 53 min
+late, `pa-ask-email` (`*/15`, last fired 10:50) 65 min late.
+
+**Why the existing ceiling missed it.** `first_poll_done` was the ONLY input to
+the phase. The struct doc above the steady semaphore (M6, 2026-05-28) reads
+"After controller downtime or a clock catch-up a large batch of schedules
+comes due at once" — the second clause was the case nobody had wired, and the
+2026-08-10 fix (the startup semaphore, default 4) bound only the first. The
+resume batch ran under `DEFAULT_SCHEDULER_MAX_CONCURRENT_EXECUTIONS = 16`,
+labelled `phase="steady"` on every one of its ten dispatches (8 completed,
+2 failed), invisible to an alert selecting `phase="startup"`.
+
+**What actually failed downstream is #792's documented residual, with numbers.**
+The worker's LLM gate did its job: in that 30-minute window it recorded 16
+acquires, 673 s of total queue wait, a p90 wait of 96 s and ZERO
+wait-expiries — no concurrent inference reached the one-slot Ollama. But the
+120 s NODE timeout is charged from job start and the gate sits inside the
+job, so the sixth LLM-bearing workflow in line spent its budget queued
+(`pa-inbox-triage`'s triage node: 12:05:41 → 12:07:41, exactly 120 s). #792
+said "jitter is the complement, out of scope"; this is the first live sample
+of the shape it declined to fix, and this package does not fix it either — it
+fixes the ADMISSION classification, which is the platform's decision, and
+leaves the user's colliding crons alone.
+
+**The design choice: classify the batch, not the process.**
+`classify_dispatch_phase(first_poll_since_boot, max_overdue_secs)`: the boot
+flag still wins outright (a restart 3 s after a `*/15` came due has a one-row,
+3 s-late boot backlog, and it is the boot batch); otherwise the MOST overdue
+row decides — max and not mean, because one hour-late daily cron beside
+on-time `*/15` rows IS the resume shape (the frequent rows came due during
+the gap too). Lateness is computed in the claim statement itself,
+`EXTRACT(EPOCH FROM (NOW() - next_trigger_at))::float8`, by the database
+clock — the clock the `<= NOW()` predicate already used, so a controller with
+a drifted clock can neither manufacture nor hide a catch-up batch.
+
+**The threshold is 90 s and is a constant, argued rather than tuned.** Six
+poll intervals. Ordinary lateness is bounded by one interval (a row due at
+12:00:00 is claimed by 12:00:15); a failed poll adds one more; the platform
+admits nothing more frequent than a `*/15` cron — so a row six intervals late
+means the scheduler completed no poll for ninety seconds: suspend/resume, a
+Postgres outage the pool just recovered from, a wedged controller. The two
+error directions are not symmetric: a false `steady` is this herd; a false
+`catchup` relabels a batch that a 4-wide ceiling does not bind anyway (the
+ceiling is a no-op below its width). The one sample sits at 3 195–3 915 s,
+forty times the threshold, and both numbers are pinned in a test so the
+sample stays in range if anyone moves the constant. Making it a knob was
+declined: nothing in the measured population is near the boundary, and a knob
+here would be #791's class — a documented range most of which does nothing.
+
+**One predicate for the permit and the label.** `phase_takes_backlog_permit`
+is what the semaphore site consults and what the alert's phase set is checked
+against in a test, so "what counts as a backlog" cannot drift between the
+ceiling and its detector. The alert keeps its name
+(`TalosSchedulerStartupHerdNotAbsorbed` — runbooks reference it) and gains
+the second phase in all three arms; its description now tells the operator
+how to read which shape fired. Fifteen pre-seeded series, up from ten; the
+`catchup` five will read 0 forever on a fleet that never suspends, which is
+precisely the series an unseeded registry omits and an `increase()` alert
+then cannot see (#625).
+
+**Guards, and their limits.** Boundary unit tests on the pure classifier;
+`controller/tests/scheduler_catchup_phase_tests` drives the VERBATIM claim
+statement against a template clone — 70 min overdue on a spent flag is
+`catchup` and still advances the row; 5 s overdue is `steady` (the control
+without which "every non-boot batch is catchup" would pass); one late row
+beside an on-time one is `catchup` and both are claimed; the same late row on
+the first poll is `startup` and spends the flag. Each test disables the
+clone's inherited schedules first, because the harness clones whatever
+template it is pointed at. Two guards are SOURCE PINS and say so: the permit
+site must call `phase_takes_backlog_permit(phase)` and must not compare
+`== SCHEDULER_PHASE_STARTUP` — a revert there is behaviourally identical on
+every boot, drops only the catch-up batch onto the steady pool, and cannot be
+driven by a unit test because the spawned task needs a live NATS client; and
+the alert file is read at compile time and its `expr` must carry
+`phase=~"startup|catchup"` exactly three times with no bare `phase="startup"`
+(#630's rule against a hardcoded copy of the thing being pinned). The pin's
+first version counted the whole alert block and failed on the FIXED tree —
+the new description quotes the selector as operator guidance, a fourth
+occurrence — which is the prose-is-not-what-fires lesson check 65(c) already
+records, re-learned in a test.
+
+**Stated limits.** A `catchup` batch drains under a ceiling of 4, and four
+concurrent LLM-bearing workflows on a one-slot Ollama still queue; whether 4
+was enough is what the (now two-phase) alert measures. The 12:05 sample is a
+restart-day sample of the LLM residual — the first non-restart post-gate noon
+is 2026-09-11 12:00 UTC and had not happened when this was written. Nothing
+here changes catch-up SEMANTICS: a `*/15` cron missed four times still fires
+once (its `next_trigger_at` is recomputed from now), which is the existing
+and correct behaviour. And a host that suspends for less than 90 s produces
+no catch-up batch at all — by design, since nothing can be six intervals late.
+
