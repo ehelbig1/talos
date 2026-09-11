@@ -1,4 +1,28 @@
 {{- if .Values.postgres.enabled -}}
+{{- /*
+Connection arithmetic guard (2026-09-11). In-cluster Postgres has a HARD
+ceiling (`postgres.config.maxConnections`, default 60) and the controller's
+pool is a per-replica CAP (`controller.database.maxConnections`, default 20).
+Until this guard, values.yaml merely STATED that the default HPA
+(`controller.autoscaling.maxReplicas: 6`) could ask for 6 × 20 = 120 of a
+60-connection server — a chart that rendered cleanly and exhausted Postgres
+the first time the autoscaler scaled out, with every new controller pod
+crash-looping on "too many clients already". The chart now REFUSES to render
+that shape. Reserve = 3 superuser_reserved_connections (Postgres default) +
+2 for the migrations Job + 1 for the postgres-backup pg_dump. The replica
+count is the HPA ceiling when autoscaling is on, else the fixed replicaCount.
+The phase-1 installer values (1 controller, autoscaling off) pass at 20 + 6
+of 60; bare-helm operators enabling in-cluster Postgres pick one of the three
+remedies the message names.
+*/ -}}
+{{- $pool := int (.Values.controller.database.maxConnections | default 20) -}}
+{{- $replicas := ternary (int .Values.controller.autoscaling.maxReplicas) (int .Values.controller.replicaCount) .Values.controller.autoscaling.enabled -}}
+{{- $reserve := 6 -}}
+{{- $ceiling := int (.Values.postgres.config.maxConnections | default 60) -}}
+{{- $demand := add (mul $replicas $pool) $reserve -}}
+{{- if gt $demand $ceiling -}}
+{{- fail (printf "in-cluster Postgres connection arithmetic does not hold: %d controller replica(s) (%s) × controller.database.maxConnections %d + %d reserved (superuser 3, migrations Job 2, backup pg_dump 1) = %d > postgres.config.maxConnections %d. Pick one: lower controller.database.maxConnections to at most %d; lower controller.autoscaling.maxReplicas (or disable autoscaling) to at most %d; or raise postgres.config.maxConnections (and its RAM budget: work_mem × connections) to at least %d." $replicas (ternary "HPA maxReplicas" "replicaCount" .Values.controller.autoscaling.enabled) $pool $reserve $demand $ceiling (div (sub $ceiling $reserve) $replicas) (div (sub $ceiling $reserve) $pool) $demand) -}}
+{{- end -}}
 # postgresql.conf tuning, baked into the image's read-only filesystem
 # via a ConfigMap mount. The values here are calibrated for a single-
 # node k3s on a 4-8 GiB VM with a single-user Talos workload:
