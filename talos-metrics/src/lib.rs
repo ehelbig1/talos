@@ -13,10 +13,12 @@ use prometheus::{
 };
 use std::sync::{Arc, OnceLock};
 
+pub mod execution;
 pub mod mcp;
 pub mod outcome_class;
 pub mod rpc;
 pub mod security;
+pub use execution::ModuleExecutionOutcome;
 pub use mcp::McpToolOutcome;
 pub use outcome_class::OutcomeClass;
 pub use rpc::{seeded_pairs as rpc_seeded_pairs, RpcOutcome, RpcSubject};
@@ -325,11 +327,67 @@ pub fn record_dispatch_refusal(path: talos_workflow_liveness::dispatch::Dispatch
 /// remembering to. This is the metric the TalosWorkflowFailureRateHigh
 /// alert fires on — before this wiring the counter was registered but
 /// never incremented (dead), so any alert on it would never have fired.
-pub fn record_workflow_outcome(status: &str) {
+/// Count one terminal workflow outcome and, when the finalizer could
+/// compute it, observe the run's wall-clock duration.
+///
+/// `duration_secs` is `completed_at - started_at` as the DATABASE computed it
+/// in the same UPDATE that moved the status (`RETURNING EXTRACT(EPOCH FROM
+/// (completed_at - started_at))`), so the two series describe the same row
+/// and the same clock. `None` when the finalizer did not stamp
+/// `completed_at` (the `set_completed_at = false` arm of
+/// `fail_execution_unless_terminal`) — the count still moves, the histogram
+/// does not: an unknown duration is not a zero-second one. The histogram is
+/// deliberately NOT pre-seeded (a quantile needs no first observation; the
+/// seeded COUNTER carries the volume — the MCP-instrument decision).
+pub fn record_workflow_outcome(status: &str, duration_secs: Option<f64>) {
     if let Some(m) = global() {
-        m.workflow_executions_total
+        record_workflow_outcome_on(m, status, duration_secs);
+    }
+}
+
+/// The recording itself, against an EXPLICIT registry.
+pub fn record_workflow_outcome_on(
+    metrics: &TalosMetrics,
+    status: &str,
+    duration_secs: Option<f64>,
+) {
+    metrics
+        .workflow_executions_total
+        .with_label_values(&[status])
+        .inc();
+    if let Some(secs) = duration_secs {
+        metrics
+            .workflow_execution_duration_seconds
             .with_label_values(&[status])
-            .inc();
+            .observe(secs.max(0.0));
+    }
+}
+
+/// Count one terminal module-execution outcome and, when known, observe its
+/// duration. Same contract as [`record_workflow_outcome`]: the duration comes
+/// from the finalizing UPDATE's own `RETURNING`, `None` means unknown (the
+/// engine's born-`cancelled` row never ran), and only the counter is seeded.
+pub fn record_module_execution(outcome: ModuleExecutionOutcome, duration_secs: Option<f64>) {
+    if let Some(m) = global() {
+        record_module_execution_on(m, outcome, duration_secs);
+    }
+}
+
+/// The recording itself, against an EXPLICIT registry.
+pub fn record_module_execution_on(
+    metrics: &TalosMetrics,
+    outcome: ModuleExecutionOutcome,
+    duration_secs: Option<f64>,
+) {
+    metrics
+        .module_executions_total
+        .with_label_values(&[outcome.as_str()])
+        .inc();
+    if let Some(secs) = duration_secs {
+        metrics
+            .module_execution_duration_seconds
+            .with_label_values(&[outcome.as_str()])
+            .observe(secs.max(0.0));
     }
 }
 
@@ -1714,20 +1772,41 @@ impl TalosMetrics {
                 .inc_by(0.0);
         }
 
-        // Execution metrics
+        // Execution metrics. Both module families sat in check 58's dead-metric
+        // baseline from 2026-05 to 2026-09-11; they are now moved by every
+        // module_executions finalizer (talos-module-executions: complete /
+        // fail / timeout, the two worker-result paths, the stuck sweep; the
+        // engine's race-safe INSERT for born-cancelled rows). `trigger_type`
+        // was dropped from the counter while it was still dead — the column
+        // reads `webhook` on all 55 279 rows of the reference fleet.
         let module_executions_total = CounterVec::new(
             prometheus::Opts::new(
                 "talos_module_executions_total",
-                "Total number of module executions",
+                "Terminal module-execution outcomes, by status. \
+                 status=completed|failed|timeout|cancelled — the module_executions.status \
+                 terminal states spelled as the column spells them \
+                 (talos_metrics::ModuleExecutionOutcome, a closed set, all four pre-seeded \
+                 at 0). timeout covers BOTH the per-execution finalizer and the \
+                 stuck-execution sweep; cancelled is the engine's born-terminal row. \
+                 Registered 2026-05, first incremented 2026-09-11.",
             ),
-            &["status", "trigger_type"], // success, failure, timeout
+            &["status"],
         )?;
         registry.register(Box::new(module_executions_total.clone()))?;
+        for outcome in ModuleExecutionOutcome::ALL {
+            module_executions_total
+                .with_label_values(&[outcome.as_str()])
+                .inc_by(0.0);
+        }
 
         let module_execution_duration_seconds = HistogramVec::new(
             prometheus::HistogramOpts::new(
                 "talos_module_execution_duration_seconds",
-                "Module execution duration in seconds",
+                "Wall-clock duration of one module execution, completed_at - started_at as \
+                 the finalizing UPDATE's RETURNING computed it (database clock). Same \
+                 status label as talos_module_executions_total; NOT pre-seeded (a \
+                 quantile needs no first observation — read volume from the counter). \
+                 A born-cancelled row has no duration and is absent here.",
             )
             .buckets(exponential_buckets(0.01, 2.0, 15).expect("valid exponential buckets")),
             &["status"],
@@ -1759,7 +1838,12 @@ impl TalosMetrics {
         let workflow_execution_duration_seconds = HistogramVec::new(
             prometheus::HistogramOpts::new(
                 "talos_workflow_execution_duration_seconds",
-                "Workflow execution duration in seconds",
+                "Wall-clock duration of one workflow execution, completed_at - started_at \
+                 as the finalizing UPDATE's RETURNING computed it (database clock), \
+                 observed at the same five finalizers that move \
+                 talos_workflow_executions_total and with the same status label \
+                 (success|failure). NOT pre-seeded (read volume from the counter). \
+                 Registered 2026-05, first observed 2026-09-11.",
             )
             .buckets(exponential_buckets(0.1, 2.0, 15).expect("valid exponential buckets")),
             &["status"],
@@ -3357,7 +3441,6 @@ mod tests {
         assert_eq!(lines(&warm, "talos_rpc_calls_total"), 64);
     }
 
-    #[test]
     /// The three security counters that sat DEAD in check 58's baseline for
     /// four months are now seeded over their closed sets and moved by their
     /// recorders. Exhaustive over `ALL`, so a new variant is covered the
@@ -3412,6 +3495,35 @@ mod tests {
                 k.as_str()
             )));
         }
+        // The two execution families that closed the baseline: the counter is
+        // seeded over ALL and both recorders move counter + histogram, the
+        // histogram only when a duration is known.
+        for o in ModuleExecutionOutcome::ALL {
+            assert!(warm.contains(&format!(
+                "talos_module_executions_total{{status=\"{}\"}} 0",
+                o.as_str()
+            )));
+        }
+        record_module_execution_on(&m, ModuleExecutionOutcome::Completed, Some(2.5));
+        record_module_execution_on(&m, ModuleExecutionOutcome::Cancelled, None);
+        record_workflow_outcome_on(&m, "success", Some(4.0));
+        record_workflow_outcome_on(&m, "failure", None);
+        let after = m.render_prometheus().expect("render");
+        assert!(after.contains("talos_module_executions_total{status=\"completed\"} 1"));
+        assert!(after.contains("talos_module_executions_total{status=\"cancelled\"} 1"));
+        assert!(
+            after.contains("talos_module_execution_duration_seconds_count{status=\"completed\"} 1")
+        );
+        assert!(
+            !after.contains("talos_module_execution_duration_seconds_count{status=\"cancelled\"}"),
+            "an unknown duration must not be observed as zero seconds"
+        );
+        assert!(
+            after.contains("talos_workflow_execution_duration_seconds_count{status=\"success\"} 1")
+        );
+        assert!(
+            !after.contains("talos_workflow_execution_duration_seconds_count{status=\"failure\"}")
+        );
         // And the four deleted families are gone — a registry that still
         // exported them would be the dead-metric defect back under a comment.
         for gone in [
@@ -3427,6 +3539,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn alerted_counter_vecs_are_seeded_at_zero_on_a_cold_registry() {
         let m = TalosMetrics::new().unwrap();
         let rendered = m.render_prometheus().expect("render");
@@ -3695,8 +3808,8 @@ mod tests {
         // Does not panic even though set_global may not have run in this test
         // binary. (If a sibling test already set the global, this still just
         // increments harmlessly.)
-        super::record_workflow_outcome("failure");
-        super::record_workflow_outcome("success");
+        super::record_workflow_outcome("failure", None);
+        super::record_workflow_outcome("success", Some(1.5));
     }
 
     // set_global / global round-trip. One-shot semantics: subsequent

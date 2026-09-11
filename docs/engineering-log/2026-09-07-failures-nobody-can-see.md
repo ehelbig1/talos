@@ -1099,3 +1099,58 @@ should not survive the wiring. And the histogram-versus-counter seeding
 asymmetry from the MCP package applies here too: durations need no first
 call; counts do.
 
+## The baseline reaches zero (2026-09-11, later the same day)
+
+The three execution families were the awkward ones: a count is one line of
+code at a finalizer, a DURATION needs `started_at`, and every finalizer here
+wrote `completed_at = NOW()` with `.execute()` and threw the row away. The
+obvious fix — a second `SELECT started_at` after the UPDATE — costs a round
+trip per finished execution for a metric. The fix taken costs nothing: the
+finalizing UPDATE already touches the row, so it now RETURNS
+`EXTRACT(EPOCH FROM (completed_at - started_at))::float8` and the caller
+reads one float from the row it was already waiting for. Same row, same
+statement, the DATABASE's clock on both timestamps. `.execute()` became
+`.fetch_optional()`, and "did the guarded UPDATE match" is now `Some(row)`
+instead of `rows_affected() > 0` — the same fact from the same round trip.
+
+**Every finalizer, listed, because the one nobody listed was the finding.**
+Workflow: both repositories' `mark_execution_completed` and
+`mark_execution_failed` (two branches each — encrypted output or not), and
+`fail_execution_unless_terminal` in the execution repository. That last one
+had never counted on `talos_workflow_executions_total` at all: a failure
+that reached the row through it was invisible to `TalosWorkflowFailureRateHigh`.
+It counts now, and observes a duration only on the arm that stamps
+`completed_at`; the other arm returns `NULL::float8` on purpose — an unknown
+duration moves the counter and not the histogram, because a zero-second
+observation would be a claim. Module: `complete_execution`,
+`fail_execution`, `timeout_execution`, both worker-result paths
+(`complete_execution_from_worker` already RETURNED `actor_id`; the duration
+joined it), the stuck sweep (one `timeout` observation per swept row, with
+the age the row had reached — a bulk UPDATE RETURNING a column is one round
+trip for up to 100 rows), and the engine's race-safe INSERT, which is the
+only writer of a born-`cancelled` row and therefore the only place that
+outcome can be counted; it RETURNS `status` and counts when the CASE chose
+`cancelled`, with no duration because the row never ran.
+
+**Two `query!` macros became function-form `sqlx::query`.** Adding a
+RETURNING projection to a `query!` means regenerating the committed `.sqlx`
+offline cache, and this repository's memory records what a workspace-wide
+`cargo sqlx prepare` does to queries whose targets it did not compile. The
+function form is checked by check 88's PREPARE instead — the trade the
+repository already made for 1 227 other statements.
+
+**Labels.** `talos_module_executions_total{status}` uses the column's own
+terminal spellings (`completed|failed|timeout|cancelled`) so the series joins
+to the table without translation; `timeout` deliberately covers both the
+per-execution finalizer and the sweep, which are one outcome to an operator.
+`trigger_type` was dropped while the metric was still dead: on the reference
+fleet the column reads `webhook` on all 55 279 rows, so the label would have
+cost a series per value and carried nothing. Counters are seeded over `ALL`;
+the two histograms are not, on the MCP decision — a quantile needs no first
+observation and the seeded counter carries the volume.
+
+**`BASELINE_DEAD` is empty and the check's comment now says it must stay
+so**: a new registered-but-unincremented metric is a failure at PR time, not
+a baseline entry. Ten names, one day, three wired and seeded, four deleted,
+three wired with the duration the row already knew.
+

@@ -1088,7 +1088,7 @@ impl WorkflowRepository {
         // rows_affected across both branches so the outcome counter only fires
         // on a real terminal transition (the guarded UPDATE hits 0 rows when
         // the row was already terminal / claimed by another writer).
-        let rows_affected = if let Some((key_id, enc_bytes, format_version)) = self
+        let finalized = if let Some((key_id, enc_bytes, format_version)) = self
             .maybe_encrypt_execution_output(execution_id, output)
             .await?
         {
@@ -1097,15 +1097,15 @@ impl WorkflowRepository {
                  SET status = 'completed', output_data = NULL, \
                      output_data_enc = $1, output_enc_key_id = $2, \
                      output_data_format = $3, completed_at = NOW() \
-                 WHERE id = $4 AND status IN ('running', 'resuming')",
+                 WHERE id = $4 AND status IN ('running', 'resuming') \
+                 RETURNING EXTRACT(EPOCH FROM (completed_at - started_at))::float8",
             )
             .bind(&enc_bytes)
             .bind(key_id)
             .bind(format_version)
             .bind(execution_id)
-            .execute(&self.db_pool)
+            .fetch_optional(&self.db_pool)
             .await?
-            .rows_affected()
         } else {
             // MCP-971 (2026-05-15): DLP-redact the plaintext fallback
             // output before bind. The encrypt branch above is the
@@ -1122,18 +1122,20 @@ impl WorkflowRepository {
                  SET status = 'completed', output_data = $1, \
                      output_data_enc = NULL, output_enc_key_id = NULL, \
                      completed_at = NOW() \
-                 WHERE id = $2 AND status IN ('running', 'resuming')",
+                 WHERE id = $2 AND status IN ('running', 'resuming') \
+                 RETURNING EXTRACT(EPOCH FROM (completed_at - started_at))::float8",
             )
             .bind(&redacted)
             .bind(execution_id)
-            .execute(&self.db_pool)
+            .fetch_optional(&self.db_pool)
             .await?
-            .rows_affected()
         };
         // talos_workflow_executions_total{status="success"} — see
         // talos_metrics::record_workflow_outcome (feeds TalosWorkflowFailureRateHigh).
-        if rows_affected > 0 {
-            talos_metrics::record_workflow_outcome("success");
+        if let Some(row) = finalized {
+            use sqlx::Row as _;
+            let duration_secs = row.try_get::<Option<f64>, _>(0)?;
+            talos_metrics::record_workflow_outcome("success", duration_secs);
         }
         Ok(())
     }
@@ -1253,7 +1255,7 @@ impl WorkflowRepository {
         // rows_affected across both branches — the outcome counter only fires
         // on a real terminal transition (guarded UPDATE, 0 rows when already
         // terminal / claimed by another writer).
-        let rows_affected = if self.secrets_manager.is_some() {
+        let finalized = if self.secrets_manager.is_some() {
             // Encrypted-aware branch: writes ciphertext when present,
             // NULLs plaintext column unconditionally so a stale value
             // can't survive a fail-rewrite. MCP-S2: format_version is
@@ -1272,16 +1274,16 @@ impl WorkflowRepository {
                  SET status = 'failed', error_message = $1, output_data = NULL, \
                      output_data_enc = $2, output_enc_key_id = $3, \
                      output_data_format = $4, completed_at = NOW() \
-                 WHERE id = $5 AND status IN ('running', 'resuming')",
+                 WHERE id = $5 AND status IN ('running', 'resuming') \
+                 RETURNING EXTRACT(EPOCH FROM (completed_at - started_at))::float8",
             )
             .bind(&redacted_error)
             .bind(enc_bytes.as_deref())
             .bind(enc_key_id)
             .bind(enc_format)
             .bind(execution_id)
-            .execute(&self.db_pool)
+            .fetch_optional(&self.db_pool)
             .await?
-            .rows_affected()
         } else {
             // MCP-971: DLP-redact the plaintext fallback output. Same
             // defence-in-depth as mark_execution_completed above. The
@@ -1293,19 +1295,21 @@ impl WorkflowRepository {
                  SET status = 'failed', error_message = $1, output_data = $2, \
                      output_data_enc = NULL, output_enc_key_id = NULL, \
                      completed_at = NOW() \
-                 WHERE id = $3 AND status IN ('running', 'resuming')",
+                 WHERE id = $3 AND status IN ('running', 'resuming') \
+                 RETURNING EXTRACT(EPOCH FROM (completed_at - started_at))::float8",
             )
             .bind(&redacted_error)
             .bind(redacted_output.as_ref())
             .bind(execution_id)
-            .execute(&self.db_pool)
+            .fetch_optional(&self.db_pool)
             .await?
-            .rows_affected()
         };
         // talos_workflow_executions_total{status="failure"} — feeds the
         // TalosWorkflowFailureRateHigh alert; only on a real transition.
-        if rows_affected > 0 {
-            talos_metrics::record_workflow_outcome("failure");
+        if let Some(row) = finalized {
+            use sqlx::Row as _;
+            let duration_secs = row.try_get::<Option<f64>, _>(0)?;
+            talos_metrics::record_workflow_outcome("failure", duration_secs);
         }
         Ok(())
     }
