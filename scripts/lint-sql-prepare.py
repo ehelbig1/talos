@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check 87 — every STATIC sqlx statement must PREPARE against the real schema.
+"""Check 88 — every STATIC sqlx statement must PREPARE against the real schema.
 
 `sqlx::query("…")` (the FUNCTION form) takes a runtime `&str`. Nothing checks it
 against the schema: not rustc, not clippy, and not CI's "sqlx offline cache"

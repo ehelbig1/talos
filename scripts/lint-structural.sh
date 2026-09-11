@@ -8973,17 +8973,21 @@ elif [ ! -f "$ROOT/scripts/lint-sql-prepare.py" ]; then
     red "✗ scripts/lint-sql-prepare.py is missing — the check cannot run"
     EXIT_CODE=1
 else
-    # Roots: the crates whose statements are the platform's persistence layer —
-    # the repository crates plus the check-52 widened family (repositories by
-    # ROLE, not by name). The runner itself prunes `target`, `.claude` (check
-    # 75) and `tests/` (an integration binary legitimately CREATEs its own
-    # tables at runtime).
+    # Roots: EVERY crate's `src/` — the two binaries plus every `talos-*` crate —
+    # derived by glob, not listed. Until 2026-09-11 this was a hardcoded list of
+    # the repository crates plus the check-52 family, and it covered 949 of the
+    # 1227 static statements in the workspace (77%): `talos-ml` (85),
+    # `talos-oauth` (29), `controller` (24), `talos-engine` (20),
+    # `talos-webhooks` (19), `talos-scheduler` (18) and 22 more crates were
+    # never probed — check 74's glob and check 64's runner list are the same
+    # rot mode. A crate that gains its first sqlx statement is now covered the
+    # day it does. Widening cost 0.3 s (0.6 → 0.9 s) and found 0 findings — the
+    # 278 newly covered statements all PREPARE. The runner itself prunes
+    # `target`, `.claude` (check 75) and `tests/` (an integration binary
+    # legitimately CREATEs its own tables at runtime); a crate with no sqlx at
+    # all (most of them) contributes nothing and costs nothing.
     SQL_PREPARE_ROOTS=()
-    for d in "$ROOT"/talos-*-repository "$ROOT"/talos-memory "$ROOT"/talos-secrets-manager \
-             "$ROOT"/talos-registry "$ROOT"/talos-module-executions \
-             "$ROOT"/talos-integration-state "$ROOT"/talos-auth \
-             "$ROOT"/talos-organizations "$ROOT"/talos-gmail "$ROOT"/talos-google-calendar \
-             "$ROOT"/talos-slack "$ROOT"/talos-retry-intelligence; do
+    for d in "$ROOT"/controller "$ROOT"/worker "$ROOT"/talos-*; do
         [ -d "$d/src" ] && SQL_PREPARE_ROOTS+=("$d/src")
     done
     if [ "${#SQL_PREPARE_ROOTS[@]}" -eq 0 ]; then
