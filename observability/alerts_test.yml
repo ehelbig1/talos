@@ -16,13 +16,16 @@
 # without generating real traffic. These tests drive synthetic series through
 # the real rule file and assert the transitions directly.
 #
-# NOT WIRED INTO CI. `promtool` is not available on the CI runners and this
-# repo has no Prometheus toolchain step; naming that plainly is better than
-# implying a gate that does not exist (a sweep is not a gate — see structural
-# lint check 64). What IS gated at build time is the complementary half:
-# structural check 65(c) fails if a rule here names a series nothing
-# registers, and 65(a)/(b)/(d) cover the scrape jobs, rule-file resolution and
-# duplicate names.
+# WIRED INTO CI since 2026-09-11: `make test-alert-rules` runs promtool from
+# the digest-pinned v2.48.0 image (`.github/workflows/quality.yml`, job
+# `alert-rules`), the same command as the one above. Until then this header
+# said promtool was "not available on the CI runners" — the runners have
+# Docker, so it always was — and in those six weeks the sibling chart fixture
+# rotted twice without anyone noticing (a sweep is not a gate — structural
+# lint check 64). The complementary build-time half is unchanged: structural
+# check 65(c) fails if a rule here names a series nothing registers, and
+# 65(a)/(b)/(d) cover the scrape jobs, rule-file resolution and duplicate
+# names.
 
 rule_files:
   # The DEV stack's wasm_* rules.

@@ -24,7 +24,7 @@ export GIT_SHA_OVERRIDE   := $(shell git rev-parse --short=7 HEAD 2>/dev/null ||
 export GIT_DIRTY_OVERRIDE := $(shell test -n "$$(git status --porcelain 2>/dev/null)" && echo true || echo false)
 
 .PHONY: help setup up down rebuild restart logs ps shell doctor quickstart \
-        check build lint lint-frontend hooks test test-changed test-integration test-clean coverage-html audit check-catalog ci \
+        check build lint lint-frontend hooks test test-changed test-integration test-clean coverage-html audit check-catalog test-alert-rules ci \
         drill drill-schedule drill-unschedule drill-schedule-status \
         offhost-upload offhost-backfill offhost-plan offhost-probe \
         offhost-schedule offhost-unschedule offhost-status \
@@ -383,6 +383,18 @@ audit: ## Supply-chain gates — cargo-deny (advisories + licenses + bans + sour
 	    exit 1; \
 	fi; \
 	printf '  all migrations idempotent (or grandfathered/marked)\n'
+
+# promtool, digest-pinned like every other image CI runs (an unpinned tag lets
+# an upstream rebuild silently change what the gate tests). v2.48.0 and NOT
+# 3.x: promtool 3.13 fails herd-alert fixtures that 2.48 passes with identical
+# expected/got output (memory: promtool_3_fails_a_fixture_promtool_2_passes).
+PROMTOOL_IMAGE ?= prom/prometheus:v2.48.0@sha256:b440bc0e8aa5bab44a782952c09516b6a50f9d7b2325c1ffafac7bc833298e2e
+
+test-alert-rules: ## promtool `check rules` on both alert files + `test rules` on both fixtures (used by CI; Docker only)
+	@docker run --rm -v "$(CURDIR):/repo:ro" --entrypoint promtool $(PROMTOOL_IMAGE) \
+		check rules /repo/deploy/helm/talos/files/alerts.yaml /repo/observability/rules/alerts.yml
+	@docker run --rm -v "$(CURDIR):/repo:ro" --entrypoint promtool $(PROMTOOL_IMAGE) \
+		test rules /repo/observability/alerts_test.yml /repo/observability/alerts_chart_test.yml
 
 check-catalog: ## Compile every module-templates/* against current WIT (used by CI)
 	@bash scripts/check-catalog.sh
