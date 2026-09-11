@@ -37,11 +37,10 @@ listed here so nobody re-classifies them:
     test-only file the `#[cfg(test)]` strip cannot see (the module has no
     column-0 attribute).
   * `worker/src/bin/metrics_demo.rs` x2 -- a hand-run demo binary.
-  * `talos-jobs/src/lib.rs:422` -- `JobProcessor::start_processor`, which
-    has a correct shutdown arm and **zero callers workspace-wide**; its
-    own `process_next_job` is a stub returning `Ok(())`. Supervising dead
-    code would seed five series nothing can increment, which is check 58's
-    rule.
+  * (`talos-jobs/src/lib.rs:422` -- `JobProcessor::start_processor` -- was
+    on this list with **zero callers workspace-wide** and a stub
+    `process_next_job`; the crate was DELETED 2026-09-11, so the walk no
+    longer reports it.)
 
 The remaining **4 are real, all in the WORKER process**, all pure
 `loop { tick; f() }` with no exit path:

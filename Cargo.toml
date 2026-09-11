@@ -43,7 +43,6 @@ members = [
     "talos-node-cache",
     "talos-replay-guard",
     "talos-envelope-seal",
-    "talos-db-monitor",
     "talos-worker-fleet",
     "talos-schedule-repo",
     "talos-ops-alerts-repository",
@@ -68,7 +67,6 @@ members = [
     # engine that EVALUATES a stored/caller-authored expression is built here.
     "talos-rhai-sandbox",
     "talos-capability-world",
-    "talos-jobs",
     "talos-replay-diff",
     "talos-trace",
     "talos-mcp-tool-schema",

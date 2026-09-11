@@ -1109,9 +1109,13 @@ pub(crate) async fn build_platform_services(
     // - `db_monitor::QueryMonitor::new()` — bound to `_query_monitor`,
     //   never used; no callsite recorded queries.
     //
-    // Workspace crates + 3-LoC shim files kept in place so future wiring
-    // doesn't have to re-import; only the misleading boot allocations +
-    // log lines removed. Same "operator-facing log lies about what's
+    // MCP-704 kept the workspace crates + 3-LoC shim files "so future
+    // wiring doesn't have to re-import"; no wiring came, and on 2026-09-11
+    // `talos-jobs` and `talos-db-monitor` (plus their shims and the empty
+    // `jobs` / `dead_letter_jobs` tables only `talos-jobs` read) were
+    // DELETED — a crate with zero callers is a statement about the
+    // system that is not true. Only the misleading boot allocations +
+    // log lines were removed at the time. Same "operator-facing log lies about what's
     // running" class as the embedding-provider probe (r239 / r241) where
     // an env-var-only check was upgraded to a real round-trip probe.
 

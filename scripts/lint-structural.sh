@@ -1445,7 +1445,7 @@ done < <(grep -rEn \
             controller/src worker/src talos-worker-runtime/src talos-engine talos-workflow-engine \
             talos-workflow-engine-nats talos-execution-orchestration \
             talos-continuation-trigger talos-webhooks talos-google-calendar \
-            talos-gmail talos-replay-service talos-jobs talos-rpc-subscribers \
+            talos-gmail talos-replay-service talos-rpc-subscribers \
             talos-hot-update-service talos-inline-compile-service \
             2>/dev/null \
         || true)

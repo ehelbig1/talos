@@ -46,7 +46,6 @@ talos-tenancy = { path = "../talos-tenancy" }
 talos-secrets-rotation = { path = "../talos-secrets-rotation" }
 talos-node-cache = { path = "../talos-node-cache" }
 talos-replay-guard = { path = "../talos-replay-guard" }
-talos-db-monitor = { path = "../talos-db-monitor" }
 talos-worker-fleet = { path = "../talos-worker-fleet" }
 talos-schedule-repo = { path = "../talos-schedule-repo" }
 talos-config = { path = "../talos-config" }
@@ -59,7 +58,6 @@ talos-graph-rag = { path = "../talos-graph-rag" }
 talos-security-headers = { path = "../talos-security-headers" }
 talos-retry-intelligence = { path = "../talos-retry-intelligence" }
 talos-capability-world = { path = "../talos-capability-world" }
-talos-jobs = { path = "../talos-jobs" }
 talos-replay-diff = { path = "../talos-replay-diff" }
 talos-replay-service = { path = "../talos-replay-service" }
 talos-inline-compile-service = { path = "../talos-inline-compile-service" }
