@@ -149,7 +149,8 @@ impl PostgresModuleExecutionStore {
                          WHERE id = $8 AND status IN ('failed', 'cancelled') \
                      ) THEN 'cancelled' ELSE 'running' END, \
                      $4, $5, $6, $7, $8, $9, $10, NOW() \
-                 ON CONFLICT DO NOTHING",
+                 ON CONFLICT DO NOTHING \
+                 RETURNING status",
             )
             .bind(id)
             .bind(module_id)
@@ -161,8 +162,26 @@ impl PostgresModuleExecutionStore {
             .bind(workflow_execution_id)
             .bind(trigger_type)
             .bind(actor_id)
-            .execute(&self.pool)
+            .fetch_optional(&self.pool)
             .await
+            .and_then(|inserted| -> Result<(), sqlx::Error> {
+                // A row born `cancelled` is terminal at birth: it is the one
+                // module-execution outcome no finalizer will ever see, so it
+                // is counted here, with no duration (it never ran). The
+                // status read propagates (check 52): a projection that stops
+                // returning `status` must be an error, not an uncounted row.
+                use sqlx::Row as _;
+                if let Some(row) = inserted {
+                    let status: String = row.try_get("status")?;
+                    if status == "cancelled" {
+                        talos_metrics::record_module_execution(
+                            talos_metrics::ModuleExecutionOutcome::Cancelled,
+                            None,
+                        );
+                    }
+                }
+                Ok(())
+            })
         } else {
             // allow-trigger-type-column: same as the race-safe arm above —
             // module_executions.trigger_type is a real column.
@@ -186,8 +205,9 @@ impl PostgresModuleExecutionStore {
             .bind(actor_id)
             .execute(&self.pool)
             .await
+            .map(|_| ())
         };
-        result.map(|_| ()).map_err(|e| -> BoxError { e.into() })
+        result.map_err(|e| -> BoxError { e.into() })
     }
 }
 

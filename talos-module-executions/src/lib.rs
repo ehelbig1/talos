@@ -770,6 +770,7 @@ impl ModuleExecutionService {
                 fuel_consumed = $6,
                 memory_used_mb = $7
             WHERE id = $8 AND user_id = $9
+            RETURNING EXTRACT(EPOCH FROM (completed_at - started_at))::float8 AS duration_secs
             "#,
         )
         .bind(ExecutionStatus::Completed.to_string())
@@ -781,13 +782,21 @@ impl ModuleExecutionService {
         .bind(memory_used_mb)
         .bind(execution_id)
         .bind(user_id)
-        .execute(&self.db_pool)
+        .fetch_optional(&self.db_pool)
         .await
         .context("Failed to complete execution")?;
 
         // Verify the update happened (user owns the execution)
-        if result.rows_affected() == 0 {
+        let Some(row) = result else {
             anyhow::bail!("Execution not found or access denied");
+        };
+        {
+            use sqlx::Row as _;
+            let duration_secs = row.try_get::<Option<f64>, _>("duration_secs")?;
+            talos_metrics::record_module_execution(
+                talos_metrics::ModuleExecutionOutcome::Completed,
+                duration_secs,
+            );
         }
 
         tracing::debug!("Completed module execution {}", execution_id);
@@ -821,7 +830,10 @@ impl ModuleExecutionService {
         // DLP: redact PII from the sanitized + bounded error message.
         let sanitized_message = talos_dlp_provider::redact_str(&sanitized_message);
 
-        let result = sqlx::query!(
+        // `sqlx::query` (function form) rather than the `query!` macro so the
+        // RETURNING projection needs no offline-cache regeneration; check 88
+        // PREPAREs it against the real schema instead.
+        let result = sqlx::query(
             r#"
             UPDATE module_executions
             SET
@@ -830,20 +842,29 @@ impl ModuleExecutionService {
                 error_message = $2,
                 error_type = $3
             WHERE id = $4 AND user_id = $5
+            RETURNING EXTRACT(EPOCH FROM (completed_at - started_at))::float8 AS duration_secs
             "#,
-            ExecutionStatus::Failed.to_string(),
-            sanitized_message,
-            error_type,
-            execution_id,
-            user_id
         )
-        .execute(&self.db_pool)
+        .bind(ExecutionStatus::Failed.to_string())
+        .bind(&sanitized_message)
+        .bind(&error_type)
+        .bind(execution_id)
+        .bind(user_id)
+        .fetch_optional(&self.db_pool)
         .await
         .context("Failed to mark execution as failed")?;
 
         // Verify the update happened (user owns the execution)
-        if result.rows_affected() == 0 {
+        let Some(row) = result else {
             anyhow::bail!("Execution not found or access denied");
+        };
+        {
+            use sqlx::Row as _;
+            let duration_secs = row.try_get::<Option<f64>, _>("duration_secs")?;
+            talos_metrics::record_module_execution(
+                talos_metrics::ModuleExecutionOutcome::Failed,
+                duration_secs,
+            );
         }
 
         tracing::debug!(
@@ -858,7 +879,8 @@ impl ModuleExecutionService {
     /// Mark execution as timed out
     /// Verifies user_id ownership to prevent unauthorized modifications
     pub async fn timeout_execution(&self, execution_id: Uuid, user_id: Uuid) -> Result<()> {
-        let result = sqlx::query!(
+        // Function form for the same reason as `fail_execution` above.
+        let result = sqlx::query(
             r#"
             UPDATE module_executions
             SET
@@ -866,18 +888,27 @@ impl ModuleExecutionService {
                 completed_at = NOW(),
                 error_type = 'timeout'
             WHERE id = $2 AND user_id = $3
+            RETURNING EXTRACT(EPOCH FROM (completed_at - started_at))::float8 AS duration_secs
             "#,
-            ExecutionStatus::Timeout.to_string(),
-            execution_id,
-            user_id
         )
-        .execute(&self.db_pool)
+        .bind(ExecutionStatus::Timeout.to_string())
+        .bind(execution_id)
+        .bind(user_id)
+        .fetch_optional(&self.db_pool)
         .await
         .context("Failed to mark execution as timeout")?;
 
         // Verify the update happened (user owns the execution)
-        if result.rows_affected() == 0 {
+        let Some(row) = result else {
             anyhow::bail!("Execution not found or access denied");
+        };
+        {
+            use sqlx::Row as _;
+            let duration_secs = row.try_get::<Option<f64>, _>("duration_secs")?;
+            talos_metrics::record_module_execution(
+                talos_metrics::ModuleExecutionOutcome::Timeout,
+                duration_secs,
+            );
         }
 
         Ok(())
@@ -1507,7 +1538,8 @@ impl ModuleExecutionService {
                                        THEN NULL ELSE 'monotonic' END,
                 completed_at = NOW()
             WHERE id = $3 AND status IN ('pending', 'running')
-            RETURNING actor_id
+            RETURNING actor_id,
+                      EXTRACT(EPOCH FROM (completed_at - started_at))::float8 AS duration_secs
             "#,
         )
         .bind(&output_data)
@@ -1526,6 +1558,14 @@ impl ModuleExecutionService {
         // ingested exactly once. Gated on the transition (no replay
         // double-bumps) and on envelope presence (zero cost otherwise).
         if let Some(row) = transitioned {
+            {
+                use sqlx::Row as _;
+                let duration_secs = row.try_get::<Option<f64>, _>("duration_secs")?;
+                talos_metrics::record_module_execution(
+                    talos_metrics::ModuleExecutionOutcome::Completed,
+                    duration_secs,
+                );
+            }
             if let Some(ref output) = output_data {
                 if talos_ops_alerts_repository::envelope::output_has_envelope(output) {
                     use sqlx::Row as _;
@@ -1583,7 +1623,7 @@ impl ModuleExecutionService {
         //
         // `duration_source` bound from the SAME parameter as `duration_ms` —
         // see `complete_execution_from_worker` for the rule.
-        sqlx::query(
+        let transitioned = sqlx::query(
             r#"
             UPDATE module_executions
             SET
@@ -1595,15 +1635,24 @@ impl ModuleExecutionService {
                                        THEN NULL ELSE 'monotonic' END,
                 completed_at = NOW()
             WHERE id = $4 AND status IN ('pending', 'running')
+            RETURNING EXTRACT(EPOCH FROM (completed_at - started_at))::float8 AS duration_secs
             "#,
         )
         .bind(&error_message)
         .bind(error_type)
         .bind(duration_ms)
         .bind(execution_id)
-        .execute(&self.db_pool)
+        .fetch_optional(&self.db_pool)
         .await
         .context("Failed to fail execution from worker result")?;
+        if let Some(row) = transitioned {
+            use sqlx::Row as _;
+            let duration_secs = row.try_get::<Option<f64>, _>("duration_secs")?;
+            talos_metrics::record_module_execution(
+                talos_metrics::ModuleExecutionOutcome::Failed,
+                duration_secs,
+            );
+        }
 
         tracing::debug!(
             "Worker failed module execution {}: {}",
@@ -2076,10 +2125,11 @@ impl ModuleExecutionService {
                 LIMIT 100
                 FOR UPDATE SKIP LOCKED
             )
+            RETURNING EXTRACT(EPOCH FROM (completed_at - started_at))::float8 AS duration_secs
             "#,
         )
         .bind(max_age_mins)
-        .execute(&self.db_pool)
+        .fetch_all(&self.db_pool)
         .await
         .context("Failed to cleanup stuck executions")?;
 
@@ -2097,7 +2147,17 @@ impl ModuleExecutionService {
         // so a future second caller cannot silently bypass it. `global()` is
         // `None` when no registry is installed (tests, tools), which is why
         // this is best-effort and not a hard dependency.
-        let swept = result.rows_affected();
+        // Every swept row is a `timeout` outcome on the module-execution
+        // instrument too, with the age it had reached when the sweep found it.
+        for row in &result {
+            use sqlx::Row as _;
+            let duration_secs = row.try_get::<Option<f64>, _>("duration_secs")?;
+            talos_metrics::record_module_execution(
+                talos_metrics::ModuleExecutionOutcome::Timeout,
+                duration_secs,
+            );
+        }
+        let swept = result.len() as u64;
         if let Some(m) = talos_metrics::global() {
             m.module_executions_swept_stuck_total.inc_by(swept as f64);
         }

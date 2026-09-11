@@ -2194,13 +2194,14 @@ impl ExecutionRepository {
                  SET status = 'completed', output_data = NULL, \
                      output_data_enc = $1, output_enc_key_id = $2, \
                      output_data_format = $3, completed_at = NOW() \
-                 WHERE id = $4 AND status IN ('running', 'resuming')",
+                 WHERE id = $4 AND status IN ('running', 'resuming') \
+                 RETURNING EXTRACT(EPOCH FROM (completed_at - started_at))::float8",
             )
             .bind(&enc_bytes)
             .bind(key_id)
             .bind(format_version)
             .bind(exec_id)
-            .execute(&self.db_pool)
+            .fetch_optional(&self.db_pool)
             .await?
         } else {
             // MCP-971: DLP-redact plaintext-fallback output. Sibling
@@ -2209,17 +2210,20 @@ impl ExecutionRepository {
             sqlx::query(
                 "UPDATE workflow_executions \
                  SET status = 'completed', output_data = $1, completed_at = NOW() \
-                 WHERE id = $2 AND status IN ('running', 'resuming')",
+                 WHERE id = $2 AND status IN ('running', 'resuming') \
+                 RETURNING EXTRACT(EPOCH FROM (completed_at - started_at))::float8",
             )
             .bind(&redacted)
             .bind(exec_id)
-            .execute(&self.db_pool)
+            .fetch_optional(&self.db_pool)
             .await?
         };
-        if result.rows_affected() > 0 {
+        if let Some(row) = result {
+            use sqlx::Row as _;
+            let duration_secs = row.try_get::<Option<f64>, _>(0)?;
             // talos_workflow_executions_total{status="success"} — feeds the
             // TalosWorkflowFailureRateHigh alert (only on a real transition).
-            talos_metrics::record_workflow_outcome("success");
+            talos_metrics::record_workflow_outcome("success", duration_secs);
             if let Some(ref tx) = self.workflow_execution_tx {
                 // Fetch user_id and workflow_id to broadcast properly
                 let row = sqlx::query!("SELECT user_id, workflow_id, started_at FROM workflow_executions WHERE id = $1", exec_id)
@@ -2295,14 +2299,15 @@ impl ExecutionRepository {
                  SET status = 'failed', error_message = $1, output_data = NULL, \
                      output_data_enc = $2, output_enc_key_id = $3, \
                      output_data_format = $4, completed_at = NOW() \
-                 WHERE id = $5 AND status IN ('running', 'resuming')",
+                 WHERE id = $5 AND status IN ('running', 'resuming') \
+                 RETURNING EXTRACT(EPOCH FROM (completed_at - started_at))::float8",
             )
             .bind(&redacted_error)
             .bind(enc_bytes.as_deref())
             .bind(enc_key_id)
             .bind(enc_format)
             .bind(exec_id)
-            .execute(&self.db_pool)
+            .fetch_optional(&self.db_pool)
             .await?
         } else {
             // MCP-971: DLP-redact plaintext-fallback output. Sibling
@@ -2311,18 +2316,21 @@ impl ExecutionRepository {
             sqlx::query(
                 "UPDATE workflow_executions \
                  SET status = 'failed', error_message = $1, output_data = $2, completed_at = NOW() \
-                 WHERE id = $3 AND status IN ('running', 'resuming')",
+                 WHERE id = $3 AND status IN ('running', 'resuming') \
+                 RETURNING EXTRACT(EPOCH FROM (completed_at - started_at))::float8",
             )
             .bind(&redacted_error)
             .bind(redacted_output.as_ref())
             .bind(exec_id)
-            .execute(&self.db_pool)
+            .fetch_optional(&self.db_pool)
             .await?
         };
-        if result.rows_affected() > 0 {
+        if let Some(row) = result {
+            use sqlx::Row as _;
+            let duration_secs = row.try_get::<Option<f64>, _>(0)?;
             // talos_workflow_executions_total{status="failure"} — feeds the
             // TalosWorkflowFailureRateHigh alert (only on a real transition).
-            talos_metrics::record_workflow_outcome("failure");
+            talos_metrics::record_workflow_outcome("failure", duration_secs);
             if let Some(ref tx) = self.workflow_execution_tx {
                 let row = sqlx::query!("SELECT user_id, workflow_id, started_at FROM workflow_executions WHERE id = $1", exec_id)
                     .fetch_one(&self.db_pool).await;
@@ -3851,19 +3859,35 @@ impl ExecutionRepository {
         error_message: &str,
         set_completed_at: bool,
     ) -> Result<u64> {
+        // The THIRD failure finalizer, and until 2026-09-11 the only one that
+        // did not count on talos_workflow_executions_total — a failure that
+        // reached the row through this path was invisible to the failure-rate
+        // alert. It counts now; the duration is observed only on the arm that
+        // stamps completed_at (the other leaves it NULL, and NULL is unknown,
+        // not zero).
         let sql = if set_completed_at {
             "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $2 \
-             WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')"
+             WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming') \
+             RETURNING EXTRACT(EPOCH FROM (completed_at - started_at))::float8"
         } else {
             "UPDATE workflow_executions SET status = 'failed', error_message = $2 \
-             WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')"
+             WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming') \
+             RETURNING NULL::float8"
         };
-        let result = sqlx::query(sql)
+        let row = sqlx::query(sql)
             .bind(execution_id)
             .bind(error_message)
-            .execute(&self.db_pool)
+            .fetch_optional(&self.db_pool)
             .await?;
-        Ok(result.rows_affected())
+        match row {
+            Some(row) => {
+                use sqlx::Row as _;
+                let duration_secs = row.try_get::<Option<f64>, _>(0)?;
+                talos_metrics::record_workflow_outcome("failure", duration_secs);
+                Ok(1)
+            }
+            None => Ok(0),
+        }
     }
 
     /// Insert the GraphQL `testWorkflow` execution row: status 'running',

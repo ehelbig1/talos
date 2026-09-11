@@ -479,6 +479,11 @@ CTRL_TESTS=(
     # (64b).
     "claim_read_disclosure_tier3_tests"
     "api_key_tests"
+    # Every workflow and module finalizer moves the execution count/duration
+    # families that closed check 58's dead-metric baseline, with the duration
+    # the finalizing UPDATE itself RETURNS; back-dated rows prove the observed
+    # value is the row's own age. `common` harness, so CTRL_TESTS (64b).
+    "execution_metrics_tests"
     "api_auth_integration_test"
     "integration_mcp_tests"
     "auth_concurrency_tests"

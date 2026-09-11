@@ -4518,12 +4518,14 @@ if [ -f "$METRICS_LIB" ]; then
     # (talos_metrics::security); the two per-trigger webhook series and the
     # two cache series were DELETED (never incremented in four months,
     # referenced by nothing, and `trigger_id` is a per-row label). The three
-    # execution-duration/count families remain and are the next package.
-    BASELINE_DEAD="$(printf '%s\n' \
-        module_executions_total \
-        module_execution_duration_seconds \
-        workflow_execution_duration_seconds \
-        | sort)"
+    # execution-duration/count families followed the same day: wired at every
+    # finalizer (both workflow repositories' mark_execution_completed/failed +
+    # fail_execution_unless_terminal; module complete/fail/timeout, both
+    # worker-result paths, the stuck sweep, the engine's born-cancelled INSERT)
+    # with the duration RETURNED by the finalizing UPDATE itself. The list is
+    # EMPTY and must stay empty — a new dead metric is a failure, not a
+    # baseline entry.
+    BASELINE_DEAD=""
     DEAD_SORTED="$(printf '%s' "$DEAD_METRICS" | grep -vE '^$' | sort || true)"
     # NEW dead = flagged now but not in the baseline → hard fail.
     NEW_DEAD="$(comm -23 <(printf '%s\n' "$DEAD_SORTED" | grep -vE '^$') <(printf '%s\n' "$BASELINE_DEAD") || true)"
