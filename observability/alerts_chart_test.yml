@@ -21,9 +21,13 @@
 # So the transition is driven here, against the real expression, at
 # synthetic time.
 #
-# NOT WIRED INTO CI, for the same reason as alerts_test.yml: promtool is not
-# available on the runners. Saying so is better than implying a gate that
-# does not exist.
+# WIRED INTO CI since 2026-09-11 (`make test-alert-rules`, quality.yml job
+# `alert-rules`, digest-pinned promtool v2.48.0). Until then this header said
+# promtool was "not available on the runners"; the runners have Docker. In the
+# six weeks it was a hand-run file it went red twice on main without anyone
+# noticing — #809 reworded two alerts' annotations (four cases), and the
+# crypto-blind cases modelled a 60 s sweep for a day after the sweep went
+# hourly. A fixture nobody runs certifies nothing.
 #
 # NOTE ON THE STALE-ARM TEST. promtool's clock starts at 0, so `time()` inside
 # a test is small (seconds since the test's own t=0) and `time() - 14*86400`

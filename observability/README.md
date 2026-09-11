@@ -227,8 +227,8 @@ WASM/worker alert rules (10 total).
 > `/metrics` was empty regardless of workload.
 >
 > `observability/alerts_test.yml` drives these transitions through
-> `promtool test rules` (NOT CI-wired — there is no Prometheus toolchain on
-> the runners; see its header).
+> `promtool test rules` — CI-wired since 2026-09-11 (`make test-alert-rules`,
+> quality.yml job `alert-rules`, digest-pinned promtool v2.48.0 via Docker).
 
 
 **Performance Alerts** (5):

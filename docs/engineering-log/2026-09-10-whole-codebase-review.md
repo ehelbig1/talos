@@ -1770,9 +1770,8 @@ description for the catch-up phase; the breaker's runbook step 4) without
 re-running `promtool test rules`. The header's own warning — a fixture
 that is not a gate rots — came true within a day of the change, on a
 change I made. All four expectations are brought back to the rule file's
-text here, so the fixture is green again; it is still not a gate, and no
-CI runner has promtool, so the honest position is unchanged: run it by
-hand when an alert's text or numbers move.
+text here, so the fixture is green again. It was still not a gate when
+this section was written; package T below made it one the same day.
 
 Not changed, with the reason: the three data-loss alerts keep `for: 5m`
 and `keep_firing_for: 5m` — an hourly sweep cannot move a count that only
@@ -1783,4 +1782,48 @@ stays hourly; and no lint was written — the population is two blind
 detectors reading two stamps, and a per-alert compile-time pin against the
 constant the spawn actually uses is stronger than any grep over a YAML
 comment could be.
+
+## Package T — a fixture nobody runs certifies nothing (2026-09-11)
+
+Both promtool fixtures carried the same header sentence: "NOT WIRED INTO
+CI. `promtool` is not available on the CI runners and this repo has no
+Prometheus toolchain step; naming that plainly is better than implying a
+gate that does not exist." The second half is this repository's own rule
+(a sweep is not a gate — check 64). The first half was false the day it
+was written: every `services:` block in `quality.yml` is a Docker
+container, and `docker run --entrypoint promtool prom/prometheus:v2.48.0`
+is the exact command both headers tell a human to run. The toolchain was
+never the obstacle; nobody had asked whether the runners could run the
+command the file already contained.
+
+What the six weeks of hand-running cost, measured on main rather than
+argued: the chart fixture went red twice. #809 reworded the herd alert's
+summary and description and the circuit-breaker runbook's step 4 and never
+re-ran the file — four cases red from 2026-09-10. And its three
+crypto-blind cases fed a stamp advancing every 60 s for a day after #794
+made the sweep hourly, so they stayed green over the defect package S
+found live. Both were caught only because package S ran the file by hand.
+
+The wiring is one `make` target and one job. `make test-alert-rules` runs
+`promtool check rules` over both rule files and `promtool test rules` over
+both fixtures from a digest-pinned `prom/prometheus:v2.48.0` (3.x fails
+herd fixtures 2.x passes with identical expected/got — the memory note
+`promtool_3_fails_a_fixture_promtool_2_passes` — so the pin is load-bearing,
+and a digest rather than a tag because every other image CI runs is pinned
+that way). The `alert-rules` job in `quality.yml` calls the target, so the
+command is the same locally and in CI. Twenty-two seconds locally, most of
+it container start.
+
+Mutation-proved before it shipped: an expectation reverted to the pre-#809
+herd summary fails `test rules` with the case named; a rule file with a
+broken expression fails `check rules` ("unclosed left parenthesis", file,
+line, group and rule named); the fixed tree passes both. The first form
+of that second mutation returned exit 0 and proved nothing — the script
+edited the first `expr:` in the file, which is a commented-out line. The
+printed diff said "mutated"; only the second run, aimed at a live rule
+line, was a mutation. Confirm the mutation landed on CODE, not merely
+that the edit landed. The
+headers, `observability/README.md` and the two CLAUDE.md sentences that
+said "not CI-wired" are corrected — the base sentences by a new line beside
+them, since `check-engineering-log.py` keeps the originals byte-identical.
 
