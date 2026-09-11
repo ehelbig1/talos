@@ -470,6 +470,49 @@ Talos sends emails via a SendGrid-compatible HTTP API. Configure via environment
 
 When not configured, the `email` WIT interface returns an `unauthorized` error. Modules using the `email` interface should handle this gracefully.
 
+## Worker trust (RFC 0010): Ed25519 dispatch, per-worker results, sealed envelopes
+
+The legacy posture signs every job and seals every secret envelope under ONE
+fleet-shared HMAC key (`WORKER_SHARED_KEY`), so a compromised worker can forge
+dispatches to its peers and decrypt every job's secrets fleet-wide. The full
+posture replaces that with a controller Ed25519 dispatch signature, a
+per-fleet worker Ed25519 result signature, and per-execution envelope sealing
+(`TALOS_ENVELOPE_SEALING=required`). The dev compose stack has run it since
+2026-07-06; `deploy/k3s/install.sh` applies it by default since 2026-09-11.
+
+**Why it is staged.** A worker signs results with Ed25519 the moment it holds
+a signing key, and a controller can verify those only once it holds that
+worker's public key; a worker can verify an Ed25519 dispatch only once it
+holds the controller's public key; a worker under `required` refuses an
+unsealed dispatch that carries secrets. Helm rolls both Deployments together,
+so each "before" needs its own upgrade:
+
+| Phase | Controller | Workers | Safe because |
+|---|---|---|---|
+| A | `TALOS_WORKER_PUBLIC_KEYS=fleet=<hex>` | unchanged | nothing signs Ed25519 yet |
+| B | unchanged | `TALOS_WORKER_SIGNING_KEY`, `TALOS_WORKER_ID=fleet`, `TALOS_CONTROLLER_PUBLIC_KEY` | results now Ed25519; every controller already holds the key (A) |
+| C | `TALOS_DISPATCH_SCHEME=ed25519`, `TALOS_ENVELOPE_SEALING=required` | unchanged | workers verify (B) and claim (a claim follows the dispatch's flag + the worker's key) |
+| D | `TALOS_RESULT_REQUIRE_ED25519=1` | `TALOS_ENVELOPE_SEALING=required`, `TALOS_DISPATCH_REQUIRE_ED25519=1` | nothing on either side still emits the legacy shape |
+
+`install.sh` runs `auto` by default: a fresh install jumps to D (no old pods
+to disagree with); an existing cluster advances one phase per run and records
+the applied phase in `/etc/talos/worker-trust.phase` after the upgrade
+succeeds. `TALOS_WORKER_TRUST=hold` re-applies the current phase, `off`
+renders the legacy posture, and `A`..`D` pins one — roll back one step at a
+time, for the same reason the roll-forward is staged. Keys are minted with
+OpenSSL (`deploy/k3s/lib/worker-trust.sh`; the derivation is checked against
+RFC 8032 and against the controller's own keygen), stored in the bootstrap
+Secret as `TALOS_CONTROLLER_SIGNING_KEY` / `TALOS_CONTROLLER_PUBLIC_KEY` /
+`TALOS_WORKER_SIGNING_KEY_STAGED` / `TALOS_WORKER_PUBLIC_KEY`, with the worker
+seed promoted to the chart-mounted `TALOS_WORKER_SIGNING_KEY` at phase B.
+Bare-helm operators follow the same sequence by hand (values.yaml runbook).
+
+**Stated limit.** This is a single-key FLEET identity (`fleet`): every worker
+replica shares one Ed25519 key, so a compromised worker can still sign results
+as the fleet. Per-worker identities go through dynamic self-registration
+(`controller.workerRegistration`) or `worker.extraEnv`, which the installer
+does not automate.
+
 ## Scaling
 
 - **Controller**: Stateless (background sweeps coordinate through Postgres — e.g. the scheduler uses `FOR UPDATE SKIP LOCKED` so N replicas don't double-fire). Can run multiple instances behind a load balancer. Use sticky sessions for WebSocket connections. **Connection-pool note:** each controller replica holds its own `DB_MAX_CONNECTIONS`-sized pool; the *sum* across replicas must stay below the backend's server-side connection ceiling. The `talos_db_pool_*` gauges (see Prometheus Metrics) and the `TalosDBPoolSaturated` alert exist to catch this.

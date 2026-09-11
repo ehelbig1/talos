@@ -1440,3 +1440,61 @@ end to end — the guard on those two sites is the TYPE (there is no `None` to
 pass), plus the live read after deploy: set a workflow `high`, let its schedule
 fire, read the row. The frontend selector is unchanged (it writes the same key
 and makes no ordering claim in its labels).
+
+
+## Package J — the installer applies worker trust, one loss-free phase per run (2026-09-11, follow-up PR)
+
+**Where it stood.** The deploy/infra review's G4 hardened the NATS route port
+and said of item (c): "consider defaulting `TALOS_DISPATCH_SCHEME=ed25519` +
+sealing in the chart, since the canary is complete". The canary had been
+complete since 2026-07-06 — the dev compose stack runs Ed25519 dispatch, a
+per-fleet worker result key and `TALOS_ENVELOPE_SEALING=required` from its
+`.env` — while values.yaml carried the same settings as a commented-out
+four-step runbook and install.sh minted none of the keys. Every
+installer-built cluster therefore ran the posture the review had flagged as
+the fleet's largest remaining exposure.
+
+**Why "default it in the chart" is the wrong shape.** Read from the code, not
+the runbook: `worker_result_signing_key` signs every result with Ed25519 the
+moment `TALOS_WORKER_SIGNING_KEY` is present, and the controller's result
+verify accepts an Ed25519 result only from a worker whose public key it holds
+(`TALOS_WORKER_PUBLIC_KEYS` or the dynamic registry); `dispatch_verify_config`
+verifies an Ed25519 dispatch only with `TALOS_CONTROLLER_PUBLIC_KEY`; and a
+worker under `required` refuses a `sealing=0` dispatch that carries secrets.
+Helm rolls the controller and worker Deployments concurrently, so a single
+upgrade that turns everything on has a window in which an old controller pod
+receives results it cannot verify, or a new worker refuses the old
+controller's envelopes. The runbook's four manual steps were the right
+sequence; what was missing was making the installer walk them.
+
+**The state machine.** `deploy/k3s/lib/worker-trust.sh` is pure bash with no
+kubectl or helm in it, which is what makes it testable on a laptop: phase
+order A → B → C → D, `wt_next_phase(last, fresh, override)`, per-side env
+renderers, and the OpenSSL Ed25519 derivation. A fresh install has no old
+pods to disagree with and jumps to D; an existing cluster advances exactly
+one phase per `install.sh` run, and the applied phase is written to
+`/etc/talos/worker-trust.phase` only after `helm upgrade --wait` returned —
+a failed upgrade must not claim a phase it did not reach. The worker seed is
+minted at A but stored under `TALOS_WORKER_SIGNING_KEY_STAGED`, a key the
+chart does not mount, and promoted to the mounted name at B; without that
+split, phase A's own upgrade would have rolled the worker pods (the Secret
+checksum annotation) with a signing key the controller could not yet verify.
+
+**The derivation was proved, not assumed.** OpenSSL's PKCS#8 DER for an
+Ed25519 private key is a fixed 16-byte prefix plus the seed; its SPKI DER for
+the public key is a fixed 12-byte prefix plus the key. The test pins RFC 8032
+§7.1 vector 1 (a public vector, not a credential), and before that the
+derivation was run against a throwaway keypair from the real
+`controller generate-worker-trust-keypair` on OpenSSL 3.3: identical public
+key. macOS ships LibreSSL, which has no Ed25519 in `genpkey`, so the test
+skips that section loudly there and CI's Ubuntu runs it — which is why the
+step lives in quality.yml rather than only in `make lint`.
+
+**Stated limits.** One FLEET identity: every worker replica shares the `fleet`
+key, so a compromised replica can still sign results as the fleet; per-worker
+identities exist (dynamic self-registration, `worker.extraEnv`) and are not
+automated. The chart's bare-helm defaults are unchanged — a `helm install`
+without the installer still needs the runbook, now stated to be the same
+sequence. And this is verified by rendering and by the state-machine test,
+not by a live k3s upgrade: the honest guard for the ordering argument is the
+first existing cluster that walks A → D, watching for a single failed job.
