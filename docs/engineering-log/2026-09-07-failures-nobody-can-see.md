@@ -1030,3 +1030,72 @@ Zero findings. The first grep's "5 files" was a line count over a file that
 contains the word, not a population — the same lesson this file records for
 `mcp_error` and `JsonRpcResponse {`.
 
+## Ten dead metrics, three of them the ones security would reach for (2026-09-11)
+
+**How it was found.** The same scrape read that found the MCP counter born
+at one asked the wider question: which registered families export NO series
+at boot? Fifteen of 78. Two were the deliberately unseeded histograms; three
+were the two reason-labelled failure counters and the alerted
+`talos_auth_failures_total`, all born-at-one but wired. The other ten were
+check 58's `BASELINE_DEAD` — the burn-down list the check's own text says
+must shrink and never rot — unchanged since the check landed: registered in
+2026-05, incremented by nothing, referenced by no alert or dashboard (58(b)
+proves that on every run). Three of the ten are the counters a security
+operator reaches for first: 2FA attempts, API-key validations, rate-limit
+hits. A brute-force burst against 2FA, a key-guessing burst, a limiter
+refusing traffic — every one of them read as ABSENT.
+
+**Decisions.** Wire at the recorder each surface already had, so no branch
+can forget the metric without also forgetting the bookkeeping it already
+does: `TotpService::record_2fa_success` / `record_2fa_failure` are called at
+six sites covering TOTP match, replay, and the backup-code path;
+`ApiKeyService::validate_key` records a verdict at every return —
+`expired` ONLY when every candidate for the prefix was past its expiry, and
+a DB failure mid-validation is not a verdict and records nothing; both
+middlewares count in their `Err(not_until)` arm (the per-IP one whether it
+answers 429 or the GraphQL 200-with-`RATE_LIMITED` variant — both are one
+refused request), the webhook router at its per-trigger limiter, and the
+API-key limiter on both `talos_rate_limit_hits_total{type="api_key"}` and
+`talos_api_key_validations_total{status="rate_limited"}` — two series, two
+questions. Label sets are enums with `ALL`, so the seed loop in
+`TalosMetrics::new` and the emit sites cannot drift, and every value is
+pre-seeded: for a security counter the FIRST event is exactly the one that
+must be counted, and the born-at-one finding earlier the same day says an
+unseeded counter loses it.
+
+Four names were DELETED rather than wired. `talos_webhook_requests_total
+{trigger_id,status}` and `talos_webhook_request_duration_seconds{trigger_id}`
+carry a per-row label this file otherwise forbids, and the per-request
+record already exists in `webhook_request_log`; `talos_cache_hits_total` /
+`talos_cache_misses_total` named three caches in a comment and were wired to
+none of them in four months. A registered metric nobody increments is a
+statement about the system that is not true, and a comment is not a plan.
+
+**No alert, deliberately.** A threshold on 2FA failures or on key-guessing
+needs a baseline these series have never produced; the series come first and
+the alert follows a week of data, the way `TalosControllerHighErrorRate`
+followed `talos_auth_failures_total`.
+
+**Guards, stated at their real strength.** `talos-metrics` asserts the seed
+over every `ALL` and that every recorder moves its series, and that the four
+deleted families no longer render. `controller/tests/api_key_tests::
+validate_key_verdicts_move_the_seeded_counters` drives the PRODUCTION path
+for all four verdicts (valid, malformed and unknown → invalid, an expired
+key as the only candidate → expired, the 61st call → rate_limited) and the
+api-key limiter kind — check 58's wrapper limit closed for that surface. The
+2FA and middleware sites are SOURCE PINS and say so: `verify_2fa_login`
+needs a user row, an encrypted TOTP secret and Redis, and the middlewares
+need an axum `Next`, a `ConnectInfo` and the production env gate; a pin that
+each recorder line exists is weaker than a drive and is the honest
+instrument available.
+
+**Left for the next package, with a fact worth carrying.** `BASELINE_DEAD`
+is now three: `module_executions_total{status,trigger_type}`,
+`module_execution_duration_seconds{status}`,
+`workflow_execution_duration_seconds{status}`. Measured while scoping them:
+`module_executions.trigger_type` reads `webhook` on ALL 55 279 rows — every
+writer stamps the same value — so that label carries no information and
+should not survive the wiring. And the histogram-versus-counter seeding
+asymmetry from the MCP package applies here too: durations need no first
+call; counts do.
+

@@ -28,13 +28,19 @@
 //!
 //! # Cardinality
 //!
-//! `talos_mcp_tool_calls_total` is NOT pre-seeded and deliberately so: the
-//! product is `tools × outcomes` (~320 × 6) and almost none of those pairs is
-//! reachable — a tool that takes no arguments cannot answer `refused` —
-//! so seeding it would mint ~1900 series nothing can move, which is check
-//! 58's own defect. `class` adds NO series because it is a pure function of
-//! `outcome`; `the_class_label_adds_no_series` verifies that rather than
-//! assuming it.
+//! `talos_mcp_tool_duration_seconds` (the HISTOGRAM) is NOT pre-seeded and
+//! deliberately so: the product is `tools × outcomes` (~353 × 6) at 19 lines
+//! a pair, and almost none of those pairs is reachable — a tool that takes
+//! no arguments cannot answer `refused`. `talos_mcp_tool_calls_total` (the
+//! COUNTER, one line a pair) IS pre-seeded over that same product since
+//! 2026-09-11 (`talos_mcp_handlers::tool_labels::seed_tool_call_series`,
+//! 2 130 lines / ~196 KB measured): a counter born at 1 loses its first
+//! increment to `increase()`/`rate()`, and a tool called once per process
+//! lifetime read ZERO forever — `session_start`, 15 real calls in 7 days,
+//! rendered as 0. The unreachable seeded pairs are the stated price: they sit
+//! at 0, which is what they are. `class` adds NO series because it is a pure
+//! function of `outcome`; `the_class_label_adds_no_series` verifies that
+//! rather than assuming it.
 
 use crate::OutcomeClass;
 

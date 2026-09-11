@@ -330,6 +330,7 @@ impl ApiKeyService {
             && key_bytes[..KEY_PREFIX.len()].ct_eq(KEY_PREFIX).unwrap_u8() == 1;
         if !prefix_ok {
             tracing::warn!("API key validation failed: malformed prefix");
+            talos_metrics::record_api_key_validation(talos_metrics::ApiKeyValidation::Invalid);
             return Err(anyhow!("Invalid API key format"));
         }
 
@@ -338,6 +339,7 @@ impl ApiKeyService {
         let prefix: String = key_without_prefix.chars().take(8).collect();
         if prefix.chars().count() < 8 {
             tracing::warn!("API key validation failed: short prefix");
+            talos_metrics::record_api_key_validation(talos_metrics::ApiKeyValidation::Invalid);
             return Err(anyhow!("Invalid API key format"));
         }
 
@@ -347,6 +349,10 @@ impl ApiKeyService {
             match self.check_rate_limit_redis(prefix.clone(), redis).await {
                 Ok(true) => {
                     tracing::warn!("API key rate limit exceeded for prefix {}", prefix);
+                    talos_metrics::record_api_key_validation(
+                        talos_metrics::ApiKeyValidation::RateLimited,
+                    );
+                    talos_metrics::record_rate_limit_hit(talos_metrics::RateLimitKind::ApiKey);
                     return Err(anyhow!("Rate limit exceeded"));
                 }
                 Ok(false) => {} // Rate limit OK, continue
@@ -412,6 +418,10 @@ impl ApiKeyService {
             }
             if *count >= LIMIT {
                 tracing::warn!("API key rate limit exceeded for prefix {}", prefix);
+                talos_metrics::record_api_key_validation(
+                    talos_metrics::ApiKeyValidation::RateLimited,
+                );
+                talos_metrics::record_rate_limit_hit(talos_metrics::RateLimitKind::ApiKey);
                 return Err(anyhow!("Rate limit exceeded"));
             }
             *count += 1;
@@ -427,11 +437,15 @@ impl ApiKeyService {
         .fetch_all(&self.db_pool)
         .await?;
 
-        // Try to verify against each key with this prefix
+        // Try to verify against each key with this prefix. `expired` is
+        // reported only when every candidate was past its expiry — see
+        // `talos_metrics::ApiKeyValidation`.
+        let mut expired_seen = false;
         for key_record in keys {
             // Check expiration
             if let Some(expires_at) = key_record.expires_at {
                 if expires_at < Utc::now() {
+                    expired_seen = true;
                     continue;
                 }
             }
@@ -491,6 +505,9 @@ impl ApiKeyService {
                 match update_result {
                     Ok(res) if res.rows_affected() == 0 => {
                         tracing::warn!("API key was deactivated during validation");
+                        talos_metrics::record_api_key_validation(
+                            talos_metrics::ApiKeyValidation::Invalid,
+                        );
                         return Err(anyhow!("Invalid or expired API key"));
                     }
                     Err(e) => {
@@ -526,9 +543,13 @@ impl ApiKeyService {
                         key_id = %key_record.id,
                         "Rejecting API key with invalid scopes in production (fail-closed)"
                     );
+                    talos_metrics::record_api_key_validation(
+                        talos_metrics::ApiKeyValidation::Invalid,
+                    );
                     return Err(anyhow!("API key configuration error — contact support"));
                 }
 
+                talos_metrics::record_api_key_validation(talos_metrics::ApiKeyValidation::Valid);
                 return Ok((key_record.user_id, scopes));
             } else {
                 tracing::warn!("API key hash mismatch for prefix {}", prefix);
@@ -536,6 +557,11 @@ impl ApiKeyService {
         }
 
         tracing::warn!("API key validation failed: no matching active key");
+        talos_metrics::record_api_key_validation(if expired_seen {
+            talos_metrics::ApiKeyValidation::Expired
+        } else {
+            talos_metrics::ApiKeyValidation::Invalid
+        });
         Err(anyhow!("Invalid or expired API key"))
     }
 

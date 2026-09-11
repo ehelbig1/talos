@@ -318,11 +318,17 @@ impl TotpService {
     ///   concurrent gate-pass-then-verify can't amplify N attempts
     ///   per lockout cycle.
     async fn record_2fa_failure(&self, _user_id: Uuid) {
-        // No-op — counter is pre-charged in `check_rate_limit`.
+        // The rate-limit counter is pre-charged in `check_rate_limit`; what
+        // happens here is the METRIC. Every failing verification path (TOTP
+        // mismatch, replay, bad backup code) calls this, so it is the ONE
+        // place `talos_auth_2fa_attempts_total{status="failure"}` moves —
+        // registered 2026-05, first incremented 2026-09-11.
+        talos_metrics::record_2fa_attempt(talos_metrics::TwoFactorOutcome::Failure);
     }
 
     /// Reset the rate-limit counter for `user_id` after a successful 2FA verification.
     async fn record_2fa_success(&self, user_id: Uuid) {
+        talos_metrics::record_2fa_attempt(talos_metrics::TwoFactorOutcome::Success);
         // Try Redis first if available
         if let Some(redis) = &self.redis_client {
             match self.record_2fa_success_redis(user_id, redis).await {
@@ -1135,5 +1141,44 @@ mod tests {
             .get(&user_id)
             .is_none_or(|e| e.locked_until.is_none());
         assert!(check_result);
+    }
+
+    /// Both recorders — the ONE place every verification path lands — must
+    /// count on `talos_auth_2fa_attempts_total`. A SOURCE PIN, stated as
+    /// such: `verify_2fa_login` needs a user row, an encrypted TOTP secret
+    /// and (in production) Redis to drive, so the recorder's own behaviour is
+    /// proved in `talos-metrics` and this pins that a revert of either line
+    /// is visible.
+    #[test]
+    fn both_2fa_recorders_count_the_attempt() {
+        let src = include_str!("lib.rs");
+        let failure = src
+            .split("async fn record_2fa_failure(")
+            .nth(1)
+            .expect("failure recorder")
+            .split("\n    }\n")
+            .next()
+            .expect("failure body");
+        assert!(failure.contains("record_2fa_attempt(talos_metrics::TwoFactorOutcome::Failure)"));
+        let success = src
+            .split("async fn record_2fa_success(")
+            .nth(1)
+            .expect("success recorder")
+            .split("\n    }\n")
+            .next()
+            .expect("success body");
+        assert!(success.contains("record_2fa_attempt(talos_metrics::TwoFactorOutcome::Success)"));
+        // And every verification path calls one of the two: six call sites
+        // today (TOTP replay/failure/success, backup-code failure×2/success).
+        let calls = src
+            .matches("self.record_2fa_failure(user_id).await")
+            .count()
+            + src
+                .matches("self.record_2fa_success(user_id).await")
+                .count();
+        assert!(
+            calls >= 6,
+            "expected >= 6 recorder call sites, found {calls}"
+        );
     }
 }

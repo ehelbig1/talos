@@ -16,6 +16,7 @@ governor = "0.6"
 ipnetwork = "0.21"
 redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }
 talos-config = { path = "../talos-config" }
+talos-metrics = { path = "../talos-metrics" }
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
 # F4: the production governor layer keys on the trusted-proxy-resolved client
 # IP via `governor_key::TrustedProxyClientIpKeyExtractor`. `tracing` is forced

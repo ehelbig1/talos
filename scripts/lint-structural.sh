@@ -4512,17 +4512,17 @@ if [ -f "$METRICS_LIB" ]; then
     # cannot close that gap; only reading the runbook can. What the check does
     # close is the strictly easier direction: someone writing an alert or a
     # dashboard panel directly on a baselined metric.
+    # 2026-09-11: ten entries → three. auth_2fa_attempts_total,
+    # api_key_validations_total and rate_limit_hits_total are now WIRED at
+    # their single recorders and seeded over compiler-closed sets
+    # (talos_metrics::security); the two per-trigger webhook series and the
+    # two cache series were DELETED (never incremented in four months,
+    # referenced by nothing, and `trigger_id` is a per-row label). The three
+    # execution-duration/count families remain and are the next package.
     BASELINE_DEAD="$(printf '%s\n' \
-        webhook_requests_total \
-        webhook_request_duration_seconds \
-        auth_2fa_attempts_total \
-        api_key_validations_total \
         module_executions_total \
         module_execution_duration_seconds \
         workflow_execution_duration_seconds \
-        rate_limit_hits_total \
-        cache_hits_total \
-        cache_misses_total \
         | sort)"
     DEAD_SORTED="$(printf '%s' "$DEAD_METRICS" | grep -vE '^$' | sort || true)"
     # NEW dead = flagged now but not in the baseline → hard fail.

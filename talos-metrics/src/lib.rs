@@ -16,9 +16,11 @@ use std::sync::{Arc, OnceLock};
 pub mod mcp;
 pub mod outcome_class;
 pub mod rpc;
+pub mod security;
 pub use mcp::McpToolOutcome;
 pub use outcome_class::OutcomeClass;
 pub use rpc::{seeded_pairs as rpc_seeded_pairs, RpcOutcome, RpcSubject};
+pub use security::{ApiKeyValidation, RateLimitKind, TwoFactorOutcome};
 
 /// The complete, closed set of `subject` label values on
 /// `talos_rpc_write_ceiling_refusals_total` — the NATS subjects on which the
@@ -331,6 +333,52 @@ pub fn record_workflow_outcome(status: &str) {
     }
 }
 
+/// Count one interactive 2FA verification. Inert without [`set_global`].
+pub fn record_2fa_attempt(outcome: TwoFactorOutcome) {
+    if let Some(m) = global() {
+        record_2fa_attempt_on(m, outcome);
+    }
+}
+
+/// The recording itself, against an EXPLICIT registry (testable without
+/// racing `set_global`).
+pub fn record_2fa_attempt_on(metrics: &TalosMetrics, outcome: TwoFactorOutcome) {
+    metrics
+        .auth_2fa_attempts_total
+        .with_label_values(&[outcome.as_str()])
+        .inc();
+}
+
+/// Count one API-key validation verdict. Inert without [`set_global`].
+pub fn record_api_key_validation(verdict: ApiKeyValidation) {
+    if let Some(m) = global() {
+        record_api_key_validation_on(m, verdict);
+    }
+}
+
+/// The recording itself, against an EXPLICIT registry.
+pub fn record_api_key_validation_on(metrics: &TalosMetrics, verdict: ApiKeyValidation) {
+    metrics
+        .api_key_validations_total
+        .with_label_values(&[verdict.as_str()])
+        .inc();
+}
+
+/// Count one request a limiter refused. Inert without [`set_global`].
+pub fn record_rate_limit_hit(kind: RateLimitKind) {
+    if let Some(m) = global() {
+        record_rate_limit_hit_on(m, kind);
+    }
+}
+
+/// The recording itself, against an EXPLICIT registry.
+pub fn record_rate_limit_hit_on(metrics: &TalosMetrics, kind: RateLimitKind) {
+    metrics
+        .rate_limit_hits_total
+        .with_label_values(&[kind.as_str()])
+        .inc();
+}
+
 /// The closed set of `kind` label values on
 /// `talos_condition_eval_failures_total`, in the order they are pre-seeded.
 ///
@@ -373,9 +421,12 @@ pub const CONDITION_EVAL_KIND_VERIFY: &str = "verify";
 pub struct TalosMetrics {
     pub registry: Registry,
 
-    // Webhook metrics
-    pub webhook_requests_total: CounterVec,
-    pub webhook_request_duration_seconds: HistogramVec,
+    // Webhook metrics. `talos_webhook_requests_total{trigger_id,status}` and
+    // `talos_webhook_request_duration_seconds{trigger_id}` were DELETED
+    // 2026-09-11: registered since 2026-05, never incremented (check 58's
+    // burn-down baseline), referenced by no alert or dashboard, and keyed on
+    // `trigger_id` — a per-row label this file otherwise forbids. The
+    // per-request record is `webhook_request_log`.
     pub webhook_dlq_drops_total: Counter,
 
     // Authentication metrics.
@@ -388,8 +439,11 @@ pub struct TalosMetrics {
     // request, so folding it into the same `sum(rate(...))` would swamp the
     // interactive population and leave a credential-stuffing burst unable to
     // move the ratio — an alert that is technically live but still cannot
-    // fire. `api_key_validations_total` below is that surface's own series
-    // (currently unwired; no alert references it).
+    // fire. `api_key_validations_total` below is that surface's own series —
+    // wired 2026-09-11 at `ApiKeyService::validate_key`, seeded over
+    // `ApiKeyValidation::ALL`; no alert references it yet. Both it and
+    // `auth_2fa_attempts_total` sat in check 58's dead-metric baseline for
+    // four months before that.
     pub auth_attempts_total: CounterVec,
     pub auth_failures_total: CounterVec,
     pub auth_2fa_attempts_total: CounterVec,
@@ -1276,12 +1330,14 @@ pub struct TalosMetrics {
     /// documenting an alert as expected-to-fire-forever.
     pub scheduler_readiness_degraded: IntGauge,
 
-    // Rate limiting metrics
+    // Rate limiting metrics — wired 2026-09-11 at all four limiters
+    // (`RateLimitKind::ALL`), seeded at 0.
     pub rate_limit_hits_total: CounterVec,
 
-    // Cache metrics
-    pub cache_hits_total: CounterVec,
-    pub cache_misses_total: CounterVec,
+    // `talos_cache_hits_total{cache_type}` / `talos_cache_misses_total` were
+    // DELETED 2026-09-11: registered since 2026-05 with a comment naming three
+    // caches (wasm, secret, dek), incremented by none of them in four months,
+    // referenced by nothing. Re-add WITH a live site when a cache needs it.
 
     // NOTE — no circuit-breaker metrics here, deliberately.
     //
@@ -1554,26 +1610,8 @@ impl TalosMetrics {
             prometheus::process_collector::ProcessCollector::for_self(),
         ))?;
 
-        // Webhook metrics
-        let webhook_requests_total = CounterVec::new(
-            prometheus::Opts::new(
-                "talos_webhook_requests_total",
-                "Total number of webhook requests received",
-            ),
-            &["trigger_id", "status"],
-        )?;
-        registry.register(Box::new(webhook_requests_total.clone()))?;
-
-        let webhook_request_duration_seconds = HistogramVec::new(
-            prometheus::HistogramOpts::new(
-                "talos_webhook_request_duration_seconds",
-                "Webhook request duration in seconds",
-            )
-            .buckets(exponential_buckets(0.001, 2.0, 15).expect("valid exponential buckets")),
-            &["trigger_id"],
-        )?;
-        registry.register(Box::new(webhook_request_duration_seconds.clone()))?;
-
+        // Webhook metrics (the per-trigger request pair was deleted 2026-09-11;
+        // see the struct field comment).
         let webhook_dlq_drops_total = Counter::new(
             "talos_webhook_dlq_drops_total",
             "Total number of webhook requests dropped to DLQ",
@@ -1640,20 +1678,41 @@ impl TalosMetrics {
         let auth_2fa_attempts_total = CounterVec::new(
             prometheus::Opts::new(
                 "talos_auth_2fa_attempts_total",
-                "Total number of 2FA verification attempts",
+                "Interactive 2FA verifications (TOTP or backup code), by outcome. \
+                 status=success|failure (talos_metrics::TwoFactorOutcome, a closed \
+                 set); recorded at TotpService's success/failure recorders, so every \
+                 verification branch is counted. Both values pre-seeded at 0 — a \
+                 counter born at 1 loses its first increment to increase()/rate(). \
+                 Registered 2026-05, first incremented 2026-09-11.",
             ),
-            &["status"], // success, failure
+            &["status"],
         )?;
         registry.register(Box::new(auth_2fa_attempts_total.clone()))?;
+        for outcome in TwoFactorOutcome::ALL {
+            auth_2fa_attempts_total
+                .with_label_values(&[outcome.as_str()])
+                .inc_by(0.0);
+        }
 
         let api_key_validations_total = CounterVec::new(
             prometheus::Opts::new(
                 "talos_api_key_validations_total",
-                "Total number of API key validations",
+                "API-key validation verdicts (ApiKeyService::validate_key), by outcome. \
+                 status=valid|invalid|expired|rate_limited (talos_metrics::ApiKeyValidation, \
+                 a closed set); expired means EVERY candidate for the prefix was past its \
+                 expiry; a DB failure mid-validation is not a verdict and records nothing. \
+                 Deliberately NOT part of the interactive-login ratio alert (see the field \
+                 comment). All four values pre-seeded at 0. Registered 2026-05, first \
+                 incremented 2026-09-11.",
             ),
-            &["status"], // valid, invalid, expired, rate_limited
+            &["status"],
         )?;
         registry.register(Box::new(api_key_validations_total.clone()))?;
+        for verdict in ApiKeyValidation::ALL {
+            api_key_validations_total
+                .with_label_values(&[verdict.as_str()])
+                .inc_by(0.0);
+        }
 
         // Execution metrics
         let module_executions_total = CounterVec::new(
@@ -2410,24 +2469,26 @@ impl TalosMetrics {
         let rate_limit_hits_total = CounterVec::new(
             prometheus::Opts::new(
                 "talos_rate_limit_hits_total",
-                "Total number of rate limit hits",
+                "Requests a limiter refused, by limiter. type=ip (per-IP middleware: the \
+                 429, and the GraphQL 200-with-RATE_LIMITED variant) | global (the \
+                 controller-wide limiter's 503) | api_key (the per-prefix limiter inside \
+                 validate_key; also counted as api_key_validations_total{status=\
+                 rate_limited}) | webhook (the per-trigger limiter in the webhook \
+                 router). talos_metrics::RateLimitKind, a closed set, all four pre-seeded \
+                 at 0. The webhook IP circuit breaker is not a rate limit and is not \
+                 here. Registered 2026-05, first incremented 2026-09-11.",
             ),
-            &["type"], // ip, api_key, webhook
+            &["type"],
         )?;
         registry.register(Box::new(rate_limit_hits_total.clone()))?;
+        for kind in RateLimitKind::ALL {
+            rate_limit_hits_total
+                .with_label_values(&[kind.as_str()])
+                .inc_by(0.0);
+        }
 
-        // Cache metrics
-        let cache_hits_total = CounterVec::new(
-            prometheus::Opts::new("talos_cache_hits_total", "Total number of cache hits"),
-            &["cache_type"], // wasm, secret, dek
-        )?;
-        registry.register(Box::new(cache_hits_total.clone()))?;
-
-        let cache_misses_total = CounterVec::new(
-            prometheus::Opts::new("talos_cache_misses_total", "Total number of cache misses"),
-            &["cache_type"],
-        )?;
-        registry.register(Box::new(cache_misses_total.clone()))?;
+        // (cache_hits_total / cache_misses_total were deleted 2026-09-11 — see
+        // the struct field comment.)
 
         // (circuit-breaker metrics moved to talos-worker-runtime — see the
         // note on the struct definition above.)
@@ -2842,8 +2903,6 @@ impl TalosMetrics {
             mcp_tool_calls_total,
             rpc_calls_total,
             rpc_duration_seconds,
-            webhook_requests_total,
-            webhook_request_duration_seconds,
             webhook_dlq_drops_total,
             auth_attempts_total,
             auth_failures_total,
@@ -2893,8 +2952,6 @@ impl TalosMetrics {
             scheduler_readiness_holds_total,
             scheduler_readiness_degraded,
             rate_limit_hits_total,
-            cache_hits_total,
-            cache_misses_total,
             dlq_entries_total,
             dlq_drops_total,
             dlq_db_errors_total,
@@ -3301,6 +3358,75 @@ mod tests {
     }
 
     #[test]
+    /// The three security counters that sat DEAD in check 58's baseline for
+    /// four months are now seeded over their closed sets and moved by their
+    /// recorders. Exhaustive over `ALL`, so a new variant is covered the
+    /// moment it is declared.
+    #[test]
+    fn security_counters_are_seeded_and_their_recorders_move_them() {
+        let m = TalosMetrics::new().unwrap();
+        let cold = m.render_prometheus().expect("render");
+        for o in TwoFactorOutcome::ALL {
+            assert!(cold.contains(&format!(
+                "talos_auth_2fa_attempts_total{{status=\"{}\"}} 0",
+                o.as_str()
+            )));
+        }
+        for v in ApiKeyValidation::ALL {
+            assert!(cold.contains(&format!(
+                "talos_api_key_validations_total{{status=\"{}\"}} 0",
+                v.as_str()
+            )));
+        }
+        for k in RateLimitKind::ALL {
+            assert!(cold.contains(&format!(
+                "talos_rate_limit_hits_total{{type=\"{}\"}} 0",
+                k.as_str()
+            )));
+        }
+        for o in TwoFactorOutcome::ALL {
+            record_2fa_attempt_on(&m, *o);
+        }
+        for v in ApiKeyValidation::ALL {
+            record_api_key_validation_on(&m, *v);
+        }
+        for k in RateLimitKind::ALL {
+            record_rate_limit_hit_on(&m, *k);
+        }
+        let warm = m.render_prometheus().expect("render");
+        for o in TwoFactorOutcome::ALL {
+            assert!(warm.contains(&format!(
+                "talos_auth_2fa_attempts_total{{status=\"{}\"}} 1",
+                o.as_str()
+            )));
+        }
+        for v in ApiKeyValidation::ALL {
+            assert!(warm.contains(&format!(
+                "talos_api_key_validations_total{{status=\"{}\"}} 1",
+                v.as_str()
+            )));
+        }
+        for k in RateLimitKind::ALL {
+            assert!(warm.contains(&format!(
+                "talos_rate_limit_hits_total{{type=\"{}\"}} 1",
+                k.as_str()
+            )));
+        }
+        // And the four deleted families are gone — a registry that still
+        // exported them would be the dead-metric defect back under a comment.
+        for gone in [
+            "talos_webhook_requests_total",
+            "talos_webhook_request_duration_seconds",
+            "talos_cache_hits_total",
+            "talos_cache_misses_total",
+        ] {
+            assert!(
+                !warm.contains(gone),
+                "{gone} was deleted and must not render"
+            );
+        }
+    }
+
     fn alerted_counter_vecs_are_seeded_at_zero_on_a_cold_registry() {
         let m = TalosMetrics::new().unwrap();
         let rendered = m.render_prometheus().expect("render");
