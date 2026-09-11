@@ -149,16 +149,6 @@ fn non_empty_env(name: &str) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-fn bool_env(name: &str) -> bool {
-    std::env::var(name)
-        .ok()
-        .map(|v| {
-            let v = v.trim().to_ascii_lowercase();
-            matches!(v.as_str(), "1" | "true" | "yes" | "on")
-        })
-        .unwrap_or(false)
-}
-
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -194,7 +184,21 @@ pub async fn register_worker_identity_at_boot(signing_key: &'static DispatchSign
     };
 
     let worker_id = crate::worker_identity::worker_identity();
-    let supports_sealing = bool_env("TALOS_WORKER_SUPPORTS_SEALING");
+    // A registered worker supports RFC 0010 P3 sealing BY CONSTRUCTION: the
+    // registration proof below is signed with `signing_key`, and that same key
+    // is the only thing a secret claim needs (`secret_claim::claim_secrets`
+    // signs the claim with it; the worker's own TALOS_ENVELOPE_SEALING mode is
+    // never consulted). Until 2026-09-11 this bit came from an UNDOCUMENTED
+    // opt-in env var (`TALOS_WORKER_SUPPORTS_SEALING`) that no compose file,
+    // chart or installer ever set, so every self-registered worker — including
+    // the dev fleet that has claimed sealed envelopes under `required` since
+    // 2026-07-06 — told the controller it could NOT seal, and
+    // `get_platform_info.fleet` repeated it. The static-ring path deliberately
+    // renders `null` here because "the ring cannot make that claim"; the
+    // registered path was making the claim, and making it wrong. The bit stays
+    // on the wire (it is bound into the signed proof) for a future build that
+    // can register but not claim; today no such build exists.
+    let supports_sealing = true;
     let public_key = signing_key.verifying_key().to_bytes();
     let build_version = worker_build_version();
     // From the runtime's own gate readers, not a second env parse here.
@@ -537,15 +541,5 @@ mod tests {
         std::env::set_var("TALOS_VERSION", "1.2.3+deadbee");
         assert_eq!(worker_build_version(), "1.2.3+deadbee");
         std::env::remove_var("TALOS_VERSION");
-    }
-
-    #[test]
-    fn bool_env_parses_truthy_tokens() {
-        std::env::set_var("TALOS_TEST_SEALING_FLAG", "yes");
-        assert!(bool_env("TALOS_TEST_SEALING_FLAG"));
-        std::env::set_var("TALOS_TEST_SEALING_FLAG", "0");
-        assert!(!bool_env("TALOS_TEST_SEALING_FLAG"));
-        std::env::remove_var("TALOS_TEST_SEALING_FLAG");
-        assert!(!bool_env("TALOS_TEST_SEALING_FLAG"));
     }
 }

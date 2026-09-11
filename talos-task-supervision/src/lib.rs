@@ -26,8 +26,9 @@
 //! total to **18**. Of the 17 rows the walk still reports, **13 are
 //! false positives of its 60-line window** (startup one-shots,
 //! per-connection and per-execution tasks, a test-only file, a demo
-//! binary, and `talos-jobs`' `start_processor`, which has zero callers
-//! workspace-wide) and **4 are real, all in the WORKER**, all pure
+//! binary, and — until the crate was deleted 2026-09-11 — `talos-jobs`'
+//! `start_processor`, which had zero callers) and **4 are real, all in
+//! the WORKER**, all pure
 //! tickers. Those four are NOT supervised, and the reason is measured:
 //! `BackgroundTask::ALL` is what the CONTROLLER pre-seeds, so a
 //! worker-side variant costs a process partition of this table rather

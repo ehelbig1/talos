@@ -1498,3 +1498,49 @@ without the installer still needs the runbook, now stated to be the same
 sequence. And this is verified by rendering and by the state-machine test,
 not by a live k3s upgrade: the honest guard for the ordering argument is the
 first existing cluster that walks A → D, watching for a single failed job.
+
+## Package K — the sealing bit that was an unset flag, and two crates nobody called (2026-09-11, follow-up PR)
+
+**How it was found.** Verifying the #803 deploy, the worker's boot line read
+`worker self-registered its Ed25519 identity … supports_sealing=false` on a
+stack that has run `TALOS_ENVELOPE_SEALING=required` since 2026-07-06 and
+claims a sealed envelope on every secret-carrying job. The bit is bound into
+the signed registration proof, stored on `worker_identities`, rendered by
+`get_platform_info.fleet` and by the `register-worker-identity` CLI's listing.
+Its source was `bool_env("TALOS_WORKER_SUPPORTS_SEALING")` — an env var that
+appears in no compose file, no chart template, no installer and no
+documentation row. Every self-registered worker therefore reported that it
+could not seal, and the fleet report repeated it.
+
+**Why derive rather than document.** The static-ring branch of the same report
+already renders the bit as `null`, with a comment that says why: "`false`
+would read as 'this worker said it cannot seal', a claim the ring cannot
+make." The registered branch WAS making that claim. And a registered worker
+supports sealing by construction: `register_worker_identity_at_boot` signs its
+proof with the worker's `DispatchSigningKey`, and `secret_claim::claim_secrets`
+signs a claim with exactly that key and consults nothing else — the worker's
+own `TALOS_ENVELOPE_SEALING` mode is not part of claiming. So a build that can
+register can claim, and the honest value is `true`, derived, with the env var
+and its helper removed. The wire field is kept because it is inside the signed
+proof and because a future build could plausibly register without speaking
+the claim protocol; none exists today, and the comment says so.
+
+**The two crates.** MCP-704 had removed the misleading boot allocations of four
+dead-binding scaffolds and kept the crates and their 3-line shims "so future
+wiring doesn't have to re-import". No wiring came. `talos-jobs` (668 lines;
+`start_processor` with zero callers workspace-wide, `process_next_job` a stub
+returning `Ok(())`) and `talos-db-monitor` (115 lines; `QueryMonitor` with zero
+callers) are deleted with their shims, and migration `20260911120000` drops
+`jobs` and `dead_letter_jobs` — the only tables `talos-jobs` read, 0 rows each
+on the reference fleet, no other FK, taking their three indexes and the RLS
+policies the org-id migration had attached. The background-task inventory's
+classification table and `talos-task-supervision`'s doc comment named
+`start_processor` as a false positive of the 60-line window; both now say the
+site is gone.
+
+**Stated limits.** The bit's history is not repaired: every existing
+`worker_identities` row holds the `false` a previous boot wrote, and it is
+overwritten only by that worker's next registration (registration is
+idempotent and runs at every boot, so one rolling restart of the worker fleet
+refreshes it). The baseline schema still shows the two tables until the next
+baseline cut; the drop migration applies on top.
