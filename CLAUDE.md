@@ -577,6 +577,36 @@ report was measured" over a nulled field.
   six outcomes since #789 make it worse, not better. Nothing alerts on
   the series, so absent ≠ zero does not apply. If an alert is ever written, seed
   the pairs THAT alert selects, never the product.
+* **The COUNTER half of that instrument IS pre-seeded since 2026-09-11, and the
+  reason is a defect the no-pre-seed argument did not consider.** A counter
+  whose first sample is already `1` loses that increment to `increase()` /
+  `rate()` — there is no `0 → 1` edge to see — so an unseeded per-tool counter
+  under-counts by one per `(tool, outcome)` per PROCESS LIFETIME, and a tool
+  called once per lifetime reads **zero forever** under the idiom every
+  dashboard uses. Measured on the reference fleet over a 7-day window with
+  thirteen controller restarts: `increase(talos_mcp_tool_calls_total{tool=
+  "session_start"}[7d])` = **0**, the per-lifetime first samples sum to **15**,
+  and the current lifetime's log shows the one call its instant value reports.
+  The HELP text's "an absent pair means not called since process start" was
+  true of the INSTANT read and silent about the rate read. So
+  `talos_mcp_handlers::tool_labels::seed_tool_call_series` seeds
+  `talos_mcp_tool_calls_total` at 0 over the closed product — declared tools ∪
+  the two sentinels × six outcomes — from the controller bootstrap right after
+  `set_global`, ONE text line per pair. **The HISTOGRAM stays unseeded**, exactly
+  as #786 decided: 19 lines per pair is the 2.1 MB argument, and its `_count`
+  is not the series to read call volume from — that is what the counter is
+  for; latency quantiles do not need the first call. Cost is MEASURED by
+  `seeding_costs_what_the_decision_assumes`: **195 825 bytes over 2 130 lines
+  (91 B per line)**, i.e. the 76 KB controller scrape becomes ~272 KB — a 3.6×
+  scrape against the histogram product's 35×; it re-derives if a seventh
+  outcome or a large batch of tools lands. The talos-metrics cost pin's
+  FIRST-pair number moved 2941 → 3459 because both HELP texts grew; the
+  MARGINAL 1996 the histogram decision rests on is unchanged. The seed lives in the
+  handler crate because the closed tool set is that crate's build-time
+  registry; `talos-metrics` cannot name it without inverting the layering,
+  and its own cold-registry cost test stays true (a bare `TalosMetrics::new()`
+  still exports no per-tool series). Both HELP texts now say which series to
+  read for which question.
 * **Cardinality is closed by the COMPILER, not by convention**:
   `canonical_tool_label` returns a `&'static str` borrowed from
   `declared_tool_params()`'s own key, with `catalog_template` and `unknown`
