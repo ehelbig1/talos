@@ -125,10 +125,10 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 
 | Variable | Default | Component | Purpose | Sensitive |
 |---|---|---|---|---|
-| `TALOS_RLS_SET_ROLE` | none (optional) | both | Role name for the RLS `SET ROLE` enforcement path | 🔒 |
+| `TALOS_RLS_SET_ROLE` | unset (off) | controller | **Boolean** (`1`/`true`/`yes`/`on`), not a role name: when on, every tenant-scoped transaction runs `SET LOCAL ROLE talos_app` (a fixed `NOLOGIN` role from migration `20260529220000`) so the RFC 0004/0005 RLS policies enforce even on a superuser pool. Read by `talos-db` (controller). In production, `enforce_production_rls_posture` refuses to boot unless RLS is effective or `TALOS_ALLOW_RLS_DISABLED` is set. The chart and compose set it `true`. | 🔒 |
 | `TALOS_ALLOW_RLS_DISABLED` | unset (refuse) | both | Explicit opt-in to run with Postgres RLS disabled | 🔒 |
 | `TALOS_RPC_REQUIRE_ED25519` | unset | both | Require Ed25519-signed NATS-RPC auth | 🔒 |
-| `TALOS_RPC_GUEST_ROLE` | none (optional) | both | Guest role for unauthenticated RPC (`talos-rpc-subscribers`) | 🔒 |
+| `TALOS_RPC_GUEST_ROLE` | unset (guest SQL runs as the app user) | controller | Postgres role the `database`-world SQL sandbox runs guest statements under (`SET LOCAL ROLE`, `talos-rpc-subscribers`); `talos_guest` ships with **no** table grants, so an operator grants what modules may read. Not about RPC authentication — every NATS-RPC message is HMAC/Ed25519-signed regardless. In production `enforce_production_db_sandbox_posture` refuses to boot without it unless `TALOS_ALLOW_UNSCOPED_DB_SANDBOX` is set. | 🔒 |
 | `TALOS_ALLOW_UNSCOPED_DB_SANDBOX` | unset | both | Allow unscoped DB access in the SQL sandbox | 🔒 |
 
 ### Controller↔worker dispatch trust (signing keys)
