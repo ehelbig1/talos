@@ -46,6 +46,15 @@ pub(crate) async fn init_database() -> anyhow::Result<sqlx::Pool<sqlx::Postgres>
     // outside production.
     talos_rpc_subscribers::enforce_production_db_sandbox_posture(config::is_production())?;
 
+    // RFC 0010 P1/P3 production fail-closed posture (2026-09-12). If
+    // TALOS_DISPATCH_SCHEME=ed25519 (or claim-based TALOS_ENVELOPE_SEALING) is
+    // requested but TALOS_CONTROLLER_SIGNING_KEY is unset/unparsable, every sign
+    // site falls back to the fleet-shared HMAC key with one boot ERROR — a
+    // requested control switched off by a typo. In production, refuse to boot
+    // instead, unless acknowledged via TALOS_ALLOW_DISPATCH_SCHEME_FALLBACK=1.
+    // Mirrors the two gates above; no-op outside production.
+    talos_engine::nats_run::enforce_production_dispatch_scheme_posture(config::is_production())?;
+
     {
         let migrate_start = std::time::Instant::now();
         match sqlx::migrate!("../migrations").run(&db_pool).await {

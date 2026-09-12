@@ -3483,17 +3483,34 @@ bold "▶ check 45: env-KEK in production must be guarded (no plaintext master k
 # (a) its existence and (b) that it fails closed (return Err) within 25 lines —
 # catching a future softening to a warn-only / always-accept regression.
 
-KEK_GUARD_HITS=$(grep -rn "prod-kek-guard" --include='*.rs' controller/src 2>/dev/null | head -1 || true)
+# Anchor on the MARKER COMMENT LINE (`// prod-kek-guard` alone), never on a
+# prose mention. Until 2026-09-12 this took the FIRST grep hit, which was the
+# RLS posture comment 270 lines ABOVE the real guard ("Mirrors the env-KEK
+# production guard (`prod-kek-guard`)"), and the check passed because the
+# migrations block's unrelated `return Err` sat within 25 lines of it — a
+# green tick anchored on a sentence about the guard, with the guard itself
+# never inspected. Nine comment lines inserted below that sentence (package
+# AM) pushed the accidental `return Err` out of the window and the check went
+# red on a tree whose real guard was unchanged. Exact-line match, and every
+# marker must pass, not the first.
+KEK_GUARD_HITS=$(grep -rnE "^\s*//\s*prod-kek-guard\s*$" --include='*.rs' controller/src 2>/dev/null || true)
 if [ -z "$KEK_GUARD_HITS" ]; then
     red "✗ missing production env-KEK guard marker: prod-kek-guard"
     yellow "  → the KEK_PROVIDER=env arm must refuse boot in production (see controller/src/main.rs)"
     EXIT_CODE=1
 else
-    file=$(echo "$KEK_GUARD_HITS" | cut -d: -f1)
-    lineno=$(echo "$KEK_GUARD_HITS" | cut -d: -f2)
-    window=$(sed -n "${lineno},$((lineno + 25))p" "$file" 2>/dev/null || true)
-    if echo "$window" | grep -q 'return Err'; then
-        green "✓ env-KEK-in-production guard present and fails closed"
+    KEK_GUARD_BAD=0
+    while IFS= read -r hit; do
+        [ -n "$hit" ] || continue
+        file=$(echo "$hit" | cut -d: -f1)
+        lineno=$(echo "$hit" | cut -d: -f2)
+        window=$(sed -n "${lineno},$((lineno + 25))p" "$file" 2>/dev/null || true)
+        echo "$window" | grep -q 'return Err' || { KEK_GUARD_BAD=1; KEK_GUARD_FILE="$file"; KEK_GUARD_LINE="$lineno"; }
+    done <<< "$KEK_GUARD_HITS"
+    file="${KEK_GUARD_FILE:-$(echo "$KEK_GUARD_HITS" | head -1 | cut -d: -f1)}"
+    lineno="${KEK_GUARD_LINE:-$(echo "$KEK_GUARD_HITS" | head -1 | cut -d: -f2)}"
+    if [ "$KEK_GUARD_BAD" -eq 0 ]; then
+        green "✓ env-KEK-in-production guard present and fails closed ($(echo "$KEK_GUARD_HITS" | grep -c . ) marker(s) at ${file}:${lineno})"
     else
         red "✗ env-KEK guard at ${file}:${lineno} does not fail closed (no return Err within 25 lines)"
         yellow "  → a production env-KEK without TALOS_ALLOW_ENV_KEK must refuse boot, not warn."

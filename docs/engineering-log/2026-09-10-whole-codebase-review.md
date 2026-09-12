@@ -3110,3 +3110,92 @@ fleet-shared key. The fleet fails closed only if the WORKERS run
 A production boot refusal (the shape of `ensure_signing_key_present_in_production`)
 is the right control and a behaviour change with rollout-ordering consequences —
 its own package, with the installer's phase table read first.
+
+### Package AM (2026-09-12) — a requested signing scheme that switched itself off
+
+**Found by the AL description read, not by a scan.** The row for
+`TALOS_CONTROLLER_SIGNING_KEY` said "required for signed dispatch". Reading the
+reader, `talos_workflow_job_protocol::configured_dispatch_signer`, showed it is
+not required at all: with `TALOS_DISPATCH_SCHEME=ed25519` set and the seed
+unset or unparsable it returns `None`, and its own doc comment says why —
+"fall back to HMAC, which the dual-verify worker still accepts, so a bad key
+can't strand dispatch during rollout". `talos-engine/src/nats_run.rs` wraps it,
+logs one `talos_security` ERROR at boot, and every sign site — the engine
+dispatcher, the retry re-sign in `execute_job_with_retry`, `cancel`, and the
+module-bound webhook / Gmail / GCal pushes that build `JobRequest`s directly —
+signs under the fleet-shared `WORKER_SHARED_KEY`. Claim-based envelope sealing
+degrades the same way: `shared_envelope_sealing_handle` needs the Ed25519 key
+to sign `SealedSecrets`, returns `None` without it, and module-bound dispatch
+falls back to the inline envelope.
+
+**Whether that is loud depends on the WORKER's posture, which is the problem.**
+Under RFC 0010 phase D the workers run `TALOS_DISPATCH_REQUIRE_ED25519` and
+refuse every HMAC dispatch, so the downgrade fails closed within a minute. Under
+phase C — the controller signs Ed25519, the workers dual-verify — an operator
+who requested Ed25519 in production runs on HMAC indefinitely, with one log line
+among the boot noise to say so. The reasoning that produced the fallback is
+sound for a rollout on a dev box and for the phase-B→C transition; it is the
+"typo switches a control off" shape this file wrote down for the local-LLM gate
+(`TALOS_LOCAL_LLM_MAX_IN_FLIGHT`: an unparseable value falls back to the
+DEFAULT, never to 0) applied to a trust anchor, and the controller already has
+a family of gates for exactly this: `enforce_production_rls_posture`,
+`enforce_production_db_sandbox_posture`, `enforce_production_sigstore_policy_explicit`.
+
+**The gate mirrors the family exactly.** A pure decision,
+`dispatch_scheme_posture_decision(is_production, ed25519_requested, sealing,
+signer_present, ack)`: outside production `Ok(true)` (the fallback stands); a
+usable signer `Ok(true)`; neither the scheme nor claim-based sealing requested
+`Ok(true)` (HMAC by choice, today's default); otherwise `Err` naming which knob
+demanded the key and the three remedies, unless
+`TALOS_ALLOW_DISPATCH_SCHEME_FALLBACK=1` acknowledges the downgrade → `Ok(false)`,
+which the env-reading wrapper logs at ERROR as
+`dispatch_scheme_downgraded_in_production` and boots. Called from
+`controller/src/bootstrap/services.rs` beside its two siblings.
+
+**Boot-time, not per sign site, and the reason is structural.** The signer is a
+`OnceLock` resolved once from env, so nothing can repair it after boot; and
+there are nine sign sites across six crates (the engine dispatcher and sealing handle, the two retry re-signs, `cancel`, two webhook paths, Gmail, Google Calendar), four of them outside any dispatcher
+the engine builds — a per-site refusal would be check 78's four-of-five shape
+again, a gate that misses the path it was not written next to. One boot gate
+covers all nine without touching any.
+
+**Guards.** Unit tests over every arm of the decision (dev passes everything; a
+signer passes everything; HMAC-by-choice passes; scheme-without-key refuses and
+names the scheme, the key and the opt-out but NOT sealing; audit/required
+sealing without a key refuses and names sealing; both-requested names both; the
+acknowledgement yields `Ok(false)` and never turns a passing posture into a
+downgraded one). A source pin — `include_str!` over the bootstrap file — that
+the wrapper is called, stated as textual: drop the call and every unit test
+stays green, which is the same limit the RLS and sandbox gates live with.
+
+**Not changed, stated.** The dev fallback and its ERROR (a developer setting the
+scheme without a key on a laptop should keep working, and now sees the ERROR
+text point at the production gate). The worker's `TALOS_DISPATCH_REQUIRE_ED25519`
+— the phase-D fail-closed stays the worker's own control. The installer: phase C
+renders `TALOS_DISPATCH_SCHEME: ed25519` and the key was staged in the bootstrap
+Secret at phase A/B, so a fresh install and an advancing cluster both pass; the
+values.yaml runbook for bare-helm operators now says the key must land BEFORE the
+scheme, because the chart mounts it `optional: true`. Latent on this fleet: the
+dev stack has run `ed25519` with a valid key since 2026-07-06 and is not
+production, so the gate is exercised only by its tests until a production
+deployment misconfigures it — which is the state it exists for.
+
+**And the lint that guards the sibling gate was anchored on a sentence.** Running
+the structural lint over this change turned check 45 red — "env-KEK guard at
+services.rs:38 does not fail closed" — on a tree whose env-KEK guard was
+untouched. Line 38 is the RLS posture comment, which mentions the guard in prose
+("Mirrors the env-KEK production guard (`prod-kek-guard`)"); the check took the
+FIRST grep hit for the marker and looked for a `return Err` within 25 lines,
+and the migrations block's `return Err` had been sitting at line 62, inside the
+window of the wrong anchor, since the RLS comment was written. The real marker
+is at line 307 and had never been the line inspected. Nine inserted comment
+lines moved the accidental neighbour to line 71 and the vacuous pass ended.
+Re-anchored on the exact marker line (`^\s*//\s*prod-kek-guard\s*$`), every
+marker inspected rather than the first; probed both ways — renaming the real
+guard's `return Err` fails it, and the prose mention alone vouches for nothing.
+Checks 64/65's class one anchor over: a gate that passes on an accidental
+neighbour is a green tick over nothing.
+
+**The CLAUDE.md check-45 entry this package appended to, kept verbatim for `check-engineering-log.py`'s losslessness leg:**
+
+  45. env-KEK in production must be guarded — a production boot with the master key in a plain env var must refuse unless `TALOS_ALLOW_ENV_KEK` is explicitly set, and the guard must fail closed
