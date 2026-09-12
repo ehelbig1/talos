@@ -2093,7 +2093,20 @@ each. Four classes fell out:
   because nothing happened".
 * **Read but never written by Rust: four.** `_sqlx_migrations` and
   `agent_roles` are seeded by migrations — fine. `workflow_nodes` (zero rows)
-  has one "reader": the registry's own comment saying it has no INSERT writer.
+  has one reader — and this sentence first said that reader was "the
+  registry's own comment". It was not. The sweep stripped comments; its one
+  reader was `WorkflowRepository::list_workflows_for_actor_scoped`, the
+  GraphQL `actorWorkflows` resolver, whose `node_count` was a `COUNT(*)`
+  subselect over the table — `pg_stat_statements` shows it executed six times
+  in the two days before the drop. The #822 deploy broke that resolver for
+  every actor (42P01) until the same-day hotfix (#823) derived the count from
+  `graph_json` in Rust — a count that had been 0 for every workflow since the
+  table was created, because nothing ever wrote it. **A reader of an
+  always-empty table is not harmless; it is a statement that works until the
+  table is gone. Open every reader the sweep counts.** And the gate that would
+  have caught it — check 88's PREPARE probe, which reports this exact line on
+  the first run over the post-#822 tree — is invoked by NO runner: the claim
+  in this file that `make test-integration` runs it was false (package Z).
   `google_calendar_watch_channels` (zero rows) has THREE readers and no writer,
   because gcal channels moved into `integration_state` and the flat table was
   never retired.

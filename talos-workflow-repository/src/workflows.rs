@@ -798,6 +798,17 @@ impl WorkflowRepository {
     /// this on a per-user UnitOfWork so the workflows RLS policy
     /// backstops the `w.user_id` predicate (RFC 0005 S3). Do NOT route
     /// through `self.db_pool`; that would silently drop the RLS backstop.
+    ///
+    /// `node_count` is derived from `graph_json` in Rust. Until 2026-09-12 it
+    /// was `(SELECT COUNT(*) FROM workflow_nodes wn WHERE wn.workflow_id =
+    /// w.id)` — a table nothing in the workspace ever WROTE, so every actor
+    /// workflow reported `node_count: 0` whatever its graph held, and when
+    /// migration `20260912100000` dropped that table this statement (executed
+    /// live six times in the preceding two days, per `pg_stat_statements`)
+    /// stopped preparing at all: the resolver answered "Request could not be
+    /// completed" for every actor. Two lessons carried in
+    /// `controller/tests/dead_schema_tests`: a reader of an always-empty table
+    /// works until the table is gone, and this count is now the REAL one.
     pub async fn list_workflows_for_actor_scoped(
         &self,
         conn: &mut sqlx::PgConnection,
@@ -805,13 +816,10 @@ impl WorkflowRepository {
         user_id: Uuid,
         limit: i64,
     ) -> Result<Vec<ActorWorkflowRow>> {
-        let rows = sqlx::query_as::<_, ActorWorkflowRow>(
+        let mut rows = sqlx::query_as::<_, ActorWorkflowRow>(
             r#"SELECT
                 w.id, w.name, w.status, w.graph_json, w.created_at, w.updated_at,
-                COALESCE(
-                    (SELECT COUNT(*) FROM workflow_nodes wn WHERE wn.workflow_id = w.id),
-                    0
-                ) AS node_count
+                0::bigint AS node_count
                FROM workflows w
                WHERE w.actor_id = $1 AND w.user_id = $2
                ORDER BY w.updated_at DESC, w.id DESC
@@ -822,6 +830,9 @@ impl WorkflowRepository {
         .bind(limit)
         .fetch_all(conn)
         .await?;
+        for row in &mut rows {
+            row.node_count = node_count_from_graph_json(row.graph_json.as_deref());
+        }
         Ok(rows)
     }
 
@@ -2318,6 +2329,22 @@ pub struct WorkflowAccessRow {
     pub actor_id: Option<Uuid>,
 }
 
+/// The number of nodes a stored graph declares: the length of its top-level
+/// `nodes` array. Anything that is not a JSON object with a `nodes` array —
+/// NULL, malformed text, a graph with no `nodes` key — counts as 0, so a
+/// broken graph reads as "no nodes" rather than failing the whole list. Pure,
+/// and the one home for the count `list_workflows_for_actor_scoped` renders.
+pub fn node_count_from_graph_json(graph_json: Option<&str>) -> i64 {
+    graph_json
+        .and_then(|g| serde_json::from_str::<serde_json::Value>(g).ok())
+        .and_then(|v| {
+            v.get("nodes")
+                .and_then(|n| n.as_array())
+                .map(|a| a.len() as i64)
+        })
+        .unwrap_or(0)
+}
+
 /// Row returned by `list_workflows_for_actor_scoped`.
 #[derive(Debug, sqlx::FromRow)]
 pub struct ActorWorkflowRow {
@@ -2641,5 +2668,25 @@ mod dispatch_liveness_tests {
         // An unknown reason must still render as a refusal, not as an empty
         // string or a panic.
         assert!(not_dispatchable_message("weird").contains("not dispatchable"));
+    }
+}
+
+#[cfg(test)]
+mod node_count_from_graph_json_tests {
+    use super::node_count_from_graph_json;
+
+    #[test]
+    fn counts_the_nodes_array_and_nothing_else() {
+        assert_eq!(node_count_from_graph_json(None), 0);
+        assert_eq!(node_count_from_graph_json(Some("not json")), 0);
+        assert_eq!(node_count_from_graph_json(Some("{}")), 0);
+        assert_eq!(node_count_from_graph_json(Some(r#"{"nodes": "x"}"#)), 0);
+        assert_eq!(node_count_from_graph_json(Some(r#"{"nodes": []}"#)), 0);
+        assert_eq!(
+            node_count_from_graph_json(Some(
+                r#"{"nodes": [{"id":"a"},{"id":"b"},{"id":"c"}], "edges": []}"#
+            )),
+            3
+        );
     }
 }
