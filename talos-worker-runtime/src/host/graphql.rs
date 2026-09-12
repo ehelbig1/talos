@@ -889,20 +889,8 @@ impl TalosContext {
         // hot path — not justified for a defense-in-depth check.
         if looks_like_graphql_introspection(&query) {
             let actor_tier = self.max_llm_tier == talos_workflow_job_protocol::LlmTier::Tier1;
-            let env_block = std::env::var("TALOS_WIT_GRAPHQL_BLOCK_INTROSPECTION")
-                .ok()
-                .as_deref()
-                .map(str::trim)
-                .map(str::to_ascii_lowercase)
-                .as_deref()
-                == Some("1")
-                || std::env::var("TALOS_WIT_GRAPHQL_BLOCK_INTROSPECTION")
-                    .ok()
-                    .as_deref()
-                    .map(str::trim)
-                    .map(str::to_ascii_lowercase)
-                    .as_deref()
-                    == Some("true");
+            let env_block =
+                talos_config::bool_env_or_default("TALOS_WIT_GRAPHQL_BLOCK_INTROSPECTION", false);
             let blocked = actor_tier || env_block;
 
             // Always emit the structured event so dashboards see

@@ -477,10 +477,7 @@ pub(crate) fn classify_url_scheme(scheme: &str, insecure_opt_in: bool) -> UrlSch
 /// Empty / unset → off — same fail-closed default as
 /// `TALOS_ALLOW_UNATTESTED_WASM`.
 pub(crate) fn insecure_http_opt_in() -> bool {
-    std::env::var("WASM_ALLOW_INSECURE_HTTP")
-        .ok()
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+    talos_config::bool_env_or_default("WASM_ALLOW_INSECURE_HTTP", false)
 }
 
 #[cfg(test)]

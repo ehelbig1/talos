@@ -529,15 +529,7 @@ pub fn failure_dedup_key(workflow_id: Uuid, node: Option<&str>, error_message: &
 #[must_use]
 pub fn self_alerts_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        !matches!(
-            std::env::var("TALOS_SELF_ALERTS")
-                .ok()
-                .map(|v| v.trim().to_ascii_lowercase())
-                .as_deref(),
-            Some("0" | "false" | "off")
-        )
-    })
+    *ON.get_or_init(|| talos_config::bool_env_or_default("TALOS_SELF_ALERTS", true))
 }
 
 /// Outcome counters for one reconciler tick (log/metric fodder).

@@ -764,12 +764,7 @@ pub fn sign_rpc(
 /// `accept_legacy_hmac` argument at every RPC verify site.
 pub fn rpc_accept_legacy_hmac() -> bool {
     static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| {
-        !matches!(
-            std::env::var("TALOS_RPC_REQUIRE_ED25519").ok().as_deref(),
-            Some("1" | "true" | "yes" | "on")
-        )
-    })
+    *CACHE.get_or_init(|| !talos_config::bool_env_or_default("TALOS_RPC_REQUIRE_ED25519", false))
 }
 
 /// Why a signed-RPC request failed its protocol's `verify()`.

@@ -3199,3 +3199,64 @@ neighbour is a green tick over nothing.
 **The CLAUDE.md check-45 entry this package appended to, kept verbatim for `check-engineering-log.py`'s losslessness leg:**
 
   45. env-KEK in production must be guarded — a production boot with the master key in a plain env var must refuse unless `TALOS_ALLOW_ENV_KEK` is explicitly set, and the guard must fail closed
+
+### Package AN (2026-09-12) — one boolean, eight spellings, two readers that disagreed
+
+**Found as a pattern in the AL read, then measured.** Row after row of the 🔒
+description audit ended with the same note: "accepts only `1`", "only
+`true`/`1`", "`1`/`true`/`yes` but not `on`". The workspace already had one
+correct parser — `talos_config::bool_env_or_default`, `true|1|yes|on` /
+`false|0|no|off`, case-insensitive, WARN on an unrecognised token — with 33
+callers. A statement-aware scan (the single-line grep returned ZERO, because the
+house style breaks every one of these chains across lines) found **24** more
+sites parsing a boolean env var inline, in seven distinct vocabularies.
+
+**Two of them are bugs, not style.** `ENABLE_EDGE_ROUTING` had two readers: the
+Gmail push used `talos_config::edge_routing_enabled()` (the full set) and the
+engine dispatcher compared `std::env::var(..).as_deref() == Ok("true")` — so
+`ENABLE_EDGE_ROUTING=1` routed module-bound pushes to per-user topics and engine
+jobs to the shared topic, a split fleet from one env value.
+`WORKER_ALLOW_PRIVATE_HOST_TARGETS` had two enforcement layers with two parsers:
+`host/limits.rs` through the shared helper, `ssrf_resolver.rs` against the
+literal `"1"` — and the resolver's own comment said it "matches the host-limits
+gate so the two layers agree". They agreed on the production gate and disagreed
+on the spelling: `=true` opened one layer and not the other, which in the SSRF
+case happens to fail closed (the resolver still refused), and in the routing
+case does not fail at all. The third worth naming is
+`TALOS_ENCRYPT_EXECUTION_OUTPUT`, `.map(|v| v != "false").unwrap_or(true)`: an
+operator writing `=0` or `=off` kept encryption ON and could read the row #836
+had just corrected to say so — correct documentation of a trap is still a trap.
+
+**One vocabulary.** `talos_config::bool_env(var) -> Option<bool>` is the new
+primitive — `Some(true)` / `Some(false)` for the eight tokens, `None` for unset,
+empty or unrecognised (the WARN stays) — and `bool_env_or_default` is
+`unwrap_or(default)` over it. Every site routes through one or the other; the two
+three-valued sites (`TALOS_REPLAY_FAIL_CLOSED`, `TALOS_COMPILATION_CONTAINER`,
+unset ⇒ `is_production()`) use `bool_env(..).unwrap_or_else(is_production)`.
+Five crates gained the `talos-config` dependency; it is a leaf (`tracing` only),
+so no cycle was possible, checked by `cargo check --workspace --all-targets`.
+`talos-workflow-job-protocol` keeps its inline reader for
+`TALOS_RESULT_REQUIRE_ED25519` — it carries no `talos-config`/`tracing`
+dependency by design, being the wire protocol both binaries share — under the
+opt-out, with `result_require_flag_spellings` pinning its truthy set to the
+shared one.
+
+**The behaviour changes are stated, not hidden.** Seventeen sites accept more
+spellings than before; every one honours what the operator typed. The one that
+moves in the LESS restrictive direction is `TALOS_ENCRYPT_EXECUTION_OUTPUT`:
+`0`/`off`/`no` now disable output encryption where only the literal `false` did.
+That is the operator's explicit instruction being followed rather than silently
+ignored, and the doc row says the new rule.
+
+**Check 90.** `scripts/lint-inline-env-bool.py`: for each `env::var("X")` read
+outside `talos-config`, the SAME expression (stopping at `;`, and at a `{` unless
+the read is the scrutinee of a `match`, whose arms are then read to the matching
+brace) is searched for a boolean literal beside `==`, `!=`, `matches!`,
+`eq_ignore_ascii_case`, `Some("` or `Ok("`. **24 on pristine main, 0 on the fixed
+tree.** The `{` cut is load-bearing: without it `TALOS_VERSION`'s three
+`unwrap_or_else(|_| { … "true" … })` closures read as boolean parsers (3 false
+positives). The `Ok("1" | "true")` spelling was added after the first pass
+missed both `TALOS_SIGNATURE_DIAG` readers (22 → 24). Mutation: reinstating the
+dispatcher's `== Ok("true")` fires at that line. Stated limits: a literal held in
+a variable, a comparison inside a helper in another crate, and a runtime-assembled
+variable name are invisible.

@@ -22,12 +22,8 @@ pub const RLS_APP_ROLE: &str = "talos_app";
 /// grants are provisioned (migration applied) in that environment.
 /// Read once — process env is immutable for the lifetime of the process.
 fn rls_set_role_enabled() -> bool {
-    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        matches!(
-            std::env::var("TALOS_RLS_SET_ROLE").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
-        )
-    });
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| talos_config::bool_env_or_default("TALOS_RLS_SET_ROLE", false));
     *ENABLED
 }
 

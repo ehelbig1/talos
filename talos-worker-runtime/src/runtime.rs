@@ -2903,10 +2903,7 @@ impl TalosRuntime {
         // guard is the backstop if it re-triggers). Deliberately NOT in
         // ENGINE_CONFIG_FINGERPRINT (per-deploy; no serialized-component
         // compatibility impact), so this needs no AOT-cache invalidation.
-        let wasm_debug_info = matches!(
-            std::env::var("TALOS_WASM_DEBUG_INFO").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes")
-        );
+        let wasm_debug_info = talos_config::bool_env_or_default("TALOS_WASM_DEBUG_INFO", false);
         config.debug_info(wasm_debug_info);
 
         // Limit backtrace depth in production to avoid unbounded diagnostic overhead
@@ -3032,9 +3029,7 @@ impl TalosRuntime {
         const MEMORY_SLOT_BYTES: u64 = 128 * 1024 * 1024; // 128 MiB
         config.memory_reservation(MEMORY_SLOT_BYTES);
 
-        let disable_pooling = std::env::var("TALOS_DISABLE_POOLING")
-            .map(|v| v == "true" || v == "1")
-            .unwrap_or(false);
+        let disable_pooling = talos_config::bool_env_or_default("TALOS_DISABLE_POOLING", false);
 
         if !disable_pooling {
             let mut pooling_config = PoolingAllocationConfig::default();

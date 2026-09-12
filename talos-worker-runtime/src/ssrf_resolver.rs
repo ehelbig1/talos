@@ -167,10 +167,8 @@ impl Resolve for SsrfFilteringResolver {
             // scheme. We use port 80 here as a placeholder because
             // tokio's `lookup_host` needs a port to return SocketAddr
             // (the port is rewritten by reqwest before the connect).
-            let env_toggle = std::env::var("WORKER_ALLOW_PRIVATE_HOST_TARGETS")
-                .ok()
-                .as_deref()
-                == Some("1");
+            let env_toggle =
+                talos_config::bool_env_or_default("WORKER_ALLOW_PRIVATE_HOST_TARGETS", false);
             // wasm-security-review (2026-05-22): refuse the bypass in
             // production regardless of the env toggle. The flag is a
             // dev-only convenience (reaching `host.docker.internal`

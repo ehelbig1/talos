@@ -759,9 +759,7 @@ impl ExecutionRepository {
     /// Returns true if output encryption is enabled (SecretsManager present + not disabled).
     fn output_encryption_enabled(&self) -> bool {
         self.secrets_manager.is_some()
-            && std::env::var("TALOS_ENCRYPT_EXECUTION_OUTPUT")
-                .map(|v| v != "false")
-                .unwrap_or(true)
+            && talos_config::bool_env_or_default("TALOS_ENCRYPT_EXECUTION_OUTPUT", true)
     }
 
     /// Encrypt a JSON value for storage. Returns (key_id, encrypted_bytes,

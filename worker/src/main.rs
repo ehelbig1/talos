@@ -667,12 +667,8 @@ mod timeout_message_tests {
 /// env var as the controller's dispatch-side diagnostic so one setting
 /// lights up both halves during an investigation. Read once at first use;
 /// changing the env after boot has no effect.
-static WORKER_SIGNATURE_DIAG_ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    matches!(
-        std::env::var("TALOS_SIGNATURE_DIAG").as_deref(),
-        Ok("1" | "true")
-    )
-});
+static WORKER_SIGNATURE_DIAG_ENABLED: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| talos_config::bool_env_or_default("TALOS_SIGNATURE_DIAG", false));
 
 /// Coarse, non-sensitive classification of a verify failure.
 ///
@@ -1033,10 +1029,8 @@ fn dispatch_verify_config() -> &'static DispatchVerifyConfig {
                 }
             }
         }
-        let require_ed25519 = matches!(
-            std::env::var("TALOS_DISPATCH_REQUIRE_ED25519").ok().as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
-        );
+        let require_ed25519 =
+            talos_config::bool_env_or_default("TALOS_DISPATCH_REQUIRE_ED25519", false);
         if require_ed25519 && ed_keys.is_empty() {
             ::tracing::error!(
                 target: "talos_security",
@@ -1508,10 +1502,8 @@ async fn execute_job(
             // belt-and-braces — production never accepts unattested
             // bytes regardless of the override.
             let is_prod = talos_config::is_production();
-            let allow_unattested = std::env::var("TALOS_ALLOW_UNATTESTED_WASM")
-                .ok()
-                .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
-                .unwrap_or(false);
+            let allow_unattested =
+                talos_config::bool_env_or_default("TALOS_ALLOW_UNATTESTED_WASM", false);
             let block_unattested = is_prod || !allow_unattested;
             if block_unattested {
                 ::tracing::error!(

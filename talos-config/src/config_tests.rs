@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::{
-        bool_env_or_default, env_var_is_set_nonempty, execution_retention_days,
+        bool_env, bool_env_or_default, env_var_is_set_nonempty, execution_retention_days,
         get_allowed_origins, get_env, get_frontend_url, is_allowed_origin, positive_env_or_default,
         sanitize_oauth_error_code, validate_shared_secret_token,
     };
@@ -441,6 +441,29 @@ mod tests {
     }
 
     /// MCP-1060: canonical truthy tokens.
+    #[test]
+    fn bool_env_is_three_valued() {
+        // package AN: the ONE boolean vocabulary; Some/Some/None, never a default.
+        let _g = env_lock();
+        for v in ["true", "1", "yes", "on", " ON ", "Yes"] {
+            env::set_var("TALOS_TEST_BOOL_ENV", v);
+            assert_eq!(bool_env("TALOS_TEST_BOOL_ENV"), Some(true), "{v:?}");
+        }
+        for v in ["false", "0", "no", "off", "OFF"] {
+            env::set_var("TALOS_TEST_BOOL_ENV", v);
+            assert_eq!(bool_env("TALOS_TEST_BOOL_ENV"), Some(false), "{v:?}");
+        }
+        for v in ["", "   ", "enable", "2"] {
+            env::set_var("TALOS_TEST_BOOL_ENV", v);
+            assert_eq!(bool_env("TALOS_TEST_BOOL_ENV"), None, "{v:?}");
+        }
+        env::remove_var("TALOS_TEST_BOOL_ENV");
+        assert_eq!(bool_env("TALOS_TEST_BOOL_ENV"), None);
+        // and the defaulting wrapper is exactly `unwrap_or(default)` over it
+        assert!(bool_env_or_default("TALOS_TEST_BOOL_ENV", true));
+        assert!(!bool_env_or_default("TALOS_TEST_BOOL_ENV", false));
+    }
+
     #[test]
     fn test_bool_env_truthy_tokens() {
         let _g = env_lock();

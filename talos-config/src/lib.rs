@@ -1377,30 +1377,46 @@ pub fn module_execution_retention_batch() -> i64 {
 /// is visible without flipping behaviour silently.
 ///
 /// Sibling of `positive_env_or_default` (MCP-643).
-pub fn bool_env_or_default(var: &str, default: bool) -> bool {
-    let raw = match env::var(var) {
-        Ok(v) => v,
-        Err(_) => return default,
-    };
+/// Three-valued boolean env read (2026-09-12, package AN): `Some(true)` for
+/// `true | 1 | yes | on`, `Some(false)` for `false | 0 | no | off`
+/// (case-insensitive, whitespace-tolerant), `None` when unset, empty or
+/// unrecognised — the unrecognised case WARNs exactly as
+/// [`bool_env_or_default`] does. Use this where "unset" has its own meaning
+/// (`TALOS_REPLAY_FAIL_CLOSED` / `TALOS_COMPILATION_CONTAINER`: unset ⇒
+/// `is_production()`); use `bool_env_or_default` for a plain default.
+///
+/// This is the ONE boolean-token vocabulary for the workspace (check 90):
+/// before it, 23 sites parsed their variable inline against sets ranging
+/// from a lone `"1"` to eight spellings, and two variables were parsed by
+/// TWO readers that disagreed — `ENABLE_EDGE_ROUTING` (`== "true"` in the
+/// engine dispatcher, the full set in `edge_routing_enabled()` used by the
+/// Gmail push) and `WORKER_ALLOW_PRIVATE_HOST_TARGETS` (`== "1"` in the SSRF
+/// resolver, the full set in the host limits) — so one env value could turn a
+/// control on at one layer and leave it off at the other.
+pub fn bool_env(var: &str) -> Option<bool> {
+    let raw = env::var(var).ok()?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return default;
+        return None;
     }
     match trimmed.to_ascii_lowercase().as_str() {
-        "true" | "1" | "yes" | "on" => true,
-        "false" | "0" | "no" | "off" => false,
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
         _ => {
             tracing::warn!(
                 target: "talos_config",
                 event_kind = "env_bool_unrecognised_substituted",
                 var = var,
                 configured = %raw,
-                default = default,
-                "{var}={raw:?} is not a recognised boolean token; using default {default}"
+                "{var}={raw:?} is not a recognised boolean token; treating it as unset"
             );
-            default
+            None
         }
     }
+}
+
+pub fn bool_env_or_default(var: &str, default: bool) -> bool {
+    bool_env(var).unwrap_or(default)
 }
 
 /// MCP-643 (2026-05-13): read a positive-integer env var, treating
