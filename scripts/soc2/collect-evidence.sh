@@ -16,7 +16,6 @@
 #
 # Output:
 #   evidence/YYYYMMDD_HHMMSS/
-#     audit_events.csv
 #     auth_audit_log.csv
 #     secret_audit_log.csv
 #     admin_event_log.csv
@@ -127,7 +126,13 @@ export_table() {
     fi
 }
 
-export_table "audit_events"     "$EVIDENCE_DIR/audit_events.csv"
+# The EXECUTION audit ledger is not a table: the worker writes a per-job
+# HMAC-chained event log to the S3/MinIO WORM bucket (`MINIO_BUCKET`, default
+# `audit-logs`), and the controller's hourly sweep verifies it —
+# `security_audit.audit_chain_verification` and the `talos_audit_chain_*` /
+# `talos_audit_verification_failures_total` series are that control's
+# evidence. The `audit_events` TABLE this script used to export had held zero
+# rows since 2026-03 and was dropped on 2026-09-11 (migration 20260911160000).
 export_table "auth_audit_log"   "$EVIDENCE_DIR/auth_audit_log.csv"
 export_table "secret_audit_log" "$EVIDENCE_DIR/secret_audit_log.csv"
 export_table "admin_event_log"  "$EVIDENCE_DIR/admin_event_log.csv"
@@ -140,7 +145,6 @@ echo ""
 echo "--- Verifying immutability triggers ---"
 
 EXPECTED_TRIGGERS=(
-    "trg_audit_events_immutable"
     "trg_auth_audit_log_immutable"
     "trg_secret_audit_log_immutable"
     "trg_admin_event_log_immutable"

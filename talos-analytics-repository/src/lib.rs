@@ -635,6 +635,26 @@ pub fn webhook_endpoint_path(id: Uuid) -> String {
     format!("/webhooks/{id}")
 }
 
+/// One `admin_event_log` row scoped to a resource — an administrative action
+/// taken ON a workflow / module / actor (tier ceiling set, actor binding
+/// changed, deleted, bulk-archived…). Until 2026-09-11 that table had FOUR
+/// writers and NO operator-facing reader: it sat on the platform-admin query
+/// tool's deny list and no MCP tool selected from it, so the audit trail the
+/// security docs told an auditor to check could only be read with psql.
+#[derive(Debug, Clone)]
+pub struct AdminEventRow {
+    pub id: Uuid,
+    /// The user who PERFORMED the action — not necessarily the resource's
+    /// owner (a platform admin acting on a tenant's workflow lands here too),
+    /// which is why the caller checks ownership of the RESOURCE and this read
+    /// does not filter on the event's user.
+    pub user_id: Option<Uuid>,
+    pub event_type: String,
+    pub summary: Option<String>,
+    pub details: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug)]
 pub struct ExecutionAuditRow {
     pub id: Uuid,
@@ -2861,6 +2881,42 @@ impl AnalyticsRepository {
     // per-workflow audit surface is `list_executions_for_audit` below plus
     // `audit_events` / `admin_event_log`; there is no workflow-scoped audit
     // table to revive this against.
+
+    /// Administrative actions recorded against ONE resource, newest first.
+    /// `resource_type` is the writer's vocabulary (`workflow`, `module`,
+    /// `actor`, `ml_model`, `mcp_agent`); the caller has already established
+    /// the caller may see the resource, and the event's own `user_id` is the
+    /// actor of the change, rendered rather than filtered on.
+    pub async fn list_admin_events_for_resource(
+        &self,
+        resource_type: &str,
+        resource_id: Uuid,
+        limit: i64,
+    ) -> Result<Vec<AdminEventRow>> {
+        let rows = sqlx::query(
+            "SELECT id, user_id, event_type, summary, details, created_at \
+             FROM admin_event_log \
+             WHERE resource_type = $1 AND resource_id = $2 \
+             ORDER BY created_at DESC, id DESC LIMIT $3",
+        )
+        .bind(resource_type)
+        .bind(resource_id)
+        .bind(limit)
+        .fetch_all(&self.db_pool)
+        .await?;
+        rows.into_iter()
+            .map(|r| -> Result<AdminEventRow> {
+                Ok(AdminEventRow {
+                    id: r.try_get("id")?,
+                    user_id: r.try_get::<Option<_>, _>("user_id")?,
+                    event_type: r.try_get("event_type")?,
+                    summary: r.try_get::<Option<_>, _>("summary")?,
+                    details: r.try_get::<Option<_>, _>("details")?,
+                    created_at: r.try_get("created_at")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+    }
 
     pub async fn list_executions_for_audit(
         &self,

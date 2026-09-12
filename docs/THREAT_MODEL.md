@@ -295,7 +295,7 @@ This is the highest-risk attack surface. Users submit arbitrary Rust source code
 
 ### Tampering
 - **Threat:** Direct modification of audit records to cover tracks.
-- **Mitigation:** Immutability triggers on all 4 audit tables (`audit_events`, `auth_audit_log`, `secret_audit_log`, `admin_event_log`). BEFORE UPDATE OR DELETE raises SQLSTATE 42501. Append-only design.
+- **Mitigation:** Immutability triggers on all 3 audit tables (`auth_audit_log`, `secret_audit_log`, `admin_event_log`); the execution audit ledger is the S3 WORM hash chain verified by the controller sweep (`audit_events`, a table nothing ever wrote, was dropped 2026-09-11). BEFORE UPDATE OR DELETE raises SQLSTATE 42501. Append-only design.
 - **File:** `migrations/` (trigger migrations)
 
 ### Information Disclosure
