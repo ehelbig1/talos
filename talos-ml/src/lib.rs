@@ -41,7 +41,7 @@ pub use content_identity::{content_key, CONTENT_KEY_LEN, CONTENT_KEY_PREFIX};
 pub use correction::{resolve_disagreement, ResolveError, ResolveOutcome};
 pub use dataset::{
     AppendExample, ContentDedupeOutcome, DatasetService, DatasetStats, DatasetTenancy,
-    ExampleSource, GoldExample, HoldoutExample, PreparedExample, SampledExample,
+    ExampleSource, GoldExample, HoldoutExample, PreparedExample, SampledExample, SplitAssignment,
 };
 pub use delete::{delete_model, DeleteError, DeleteOutcome};
 pub use digest::{run_digest_tick, spawn_disagreement_digest};

@@ -1950,21 +1950,36 @@ population).
   unreadable; `ml_get_model_card` renders `admin_events` through its existing
   `Readings` ledger, so an unreadable log lands in `not_measured`.
 
-**Measured and NOT changed on the same pass.** The `pg_stat_statements` survey
-that opened the cycle (the instrument #791 added) ranked the fuel-headroom
-detector's statement third by total time: `get_node_fuel_headroom`, 178 calls
-in 48 h at 92.6 ms mean, 274 ms max. Its plan re-joins `workflows` once per
-rollup row for the workflow NAME — a nested-loop index scan with `loops=33880`
-accounting for 67 760 of the statement's 70 342 buffer hits — and materialises
-the `scoped` CTE twice. An aggregate-first rewrite (group the rollup rows,
-take the ceiling with `(array_agg(max_fuel ORDER BY recorded_at DESC, max_fuel
-DESC))[1]`, join `workflows` once on the 59 grouped rows) measured **59 → 35 ms
-over five runs each, with row-for-row parity (59 rows, symmetric difference
-0)**. Declined as a package: it is 25 ms on a 15-minute background tick and
-one interactive report, and the remaining 35 ms is the 30-day window being 61%
-of a 55 606-row table plus a hash of all 10 888 `workflow_executions` for the
-`is_test_execution` exclusion — neither of which a rewrite moves. Recorded so
-the rewrite is not re-derived. `LowCacheHitRate` was observed `pending` after
+**Measured and NOT changed on the same pass — and the first version of this
+paragraph was WRONG; the correction is kept beside the error.** As shipped
+in #820 it read: the `pg_stat_statements` survey ranked the fuel-headroom
+detector's statement third by total time (`WITH scoped AS …`, 178 calls in
+48 h at 92.6 ms mean), its plan re-joined `workflows` once per rollup row
+(`loops=33880`, 67 760 of 70 342 buffer hits), and an aggregate-first
+rewrite measured 59 → 35 ms with row parity — "declined as a package, 25 ms
+on a 15-minute tick, recorded so the rewrite is not re-derived." Every
+measurement in that sentence was real and every conclusion was wrong,
+because the statement measured was not the one running. #798 (2026-09-10
+19:05 UTC) had already replaced `get_node_fuel_headroom` with exactly that
+aggregate-first shape. The 178-call entry is the OLD shape's statistics,
+surviving since the postmaster started at 02:14 that morning; a one-tick
+probe on 2026-09-12 read `calls` frozen at 178 across a 300-second gauge
+interval in which `talos_fuel_utilisation_observed_nodes` was published.
+And the live statement was in the same view under another name:
+`pg_stat_statements` keys its entries by query id and keeps the FIRST text
+that minted the entry, and a scratch `PREPARE d2chk(int, uuid, bigint) AS
+SELECT agg.workflow_id …` from the #798 session had minted it — so the
+controller's every-300-s execution had been accumulating under a psql
+alias: 381 calls, 34 ms mean, which IS #798's "3× faster". Two signals were
+misread on the way: `grep -rn "WITH scoped AS" --include=*.rs` returned
+nothing and was written off as a zsh globbing problem rather than read as
+"no such statement exists in the tree"; and the survey never compared a
+row's `calls` across two reads. Both rules are already in this file (#685's
+"the run predated the fix"; "a line grep over Rust is not a population");
+a third joins them: **a `pg_stat_statements` row is live only if its
+`calls` move, and its text is whoever got there first.**
+
+`LowCacheHitRate` was observed `pending` after
 the deploy and its two-day history read: four `pending` stretches, zero
 `firing` — the worker's compiled-module cache is cold after every restart and
 the ratio recovers inside the rule's `for: 10m`. Benign, stated.
@@ -1996,4 +2011,60 @@ the baseline is green.
 The model-card block has no DB test — driving it needs an `ml_models` row
 resolved through the user-scoped registry — and shares the repository read the
 other two tests exercise; stated as a limit.
+
+## Package X — an UPDATE to the value a row already holds is still a write (2026-09-12)
+
+The `pg_stat_statements` survey that opened the #820 cycle was re-read
+through a write-churn lens — rows written per call — after the #820
+deploy verified. The top two statements by rows written were the two halves
+of `DatasetService::assign_splits`: 62 calls each, 51 373 and 10 798 rows,
+829 and 174 rows per call, 46 ms and 12 ms mean, 62 109 shared blocks read
+by the first. The method persists an eval's holdout as "everything becomes
+train, then these ids become holdout", over the whole dataset, on every
+eval.
+
+The holdout is deterministic BY DESIGN — `stratified_holdout`'s doc comment
+says why: "re-running eval on an unchanged dataset must produce the same
+split, or metric deltas between runs are noise." Which means that on a
+steady dataset every eval re-derives exactly the split the rows already
+carry, and the two UPDATEs rewrite every row to the value it already holds.
+Postgres does not short-circuit that: an UPDATE whose new value equals the
+old still writes a new heap tuple, a new entry in every index on the table
+(six here, one of them the ivfflat vector index) and leaves a dead tuple
+behind. Measured on a `pg_restore` of the live database in the scratch
+container, inside a rolled-back transaction, for the 2 145-row dataset:
+
+| statement | rows written | time | buffers |
+|---|---|---|---|
+| old: `SET split = 'train' WHERE dataset_id = $1` | 2 145 | 110 ms | 89 061 hit, 1 574 read, 2 373 dirtied |
+| new: same with `split IS DISTINCT FROM 'train' AND NOT (id = ANY(holdout))` | 0 | 0.7 ms | 384 hit |
+| new: `SET split = 'holdout' … AND split IS DISTINCT FROM 'holdout'` | 0 | 0.2 ms | 150 hit |
+
+Semantics are unchanged. A row outside the holdout ends `'train'`, a row
+inside ends `'holdout'`, and `IS DISTINCT FROM` treats a NULL `split` — a
+freshly appended row, which is what the column holds before its first eval —
+as different from both, so the first assignment writes exactly the rows the
+old shape wrote. The method now returns `SplitAssignment { moved_to_train,
+moved_to_holdout }`, the number the old shape could not report, and both
+eval call sites log it at debug under `talos_ml`.
+
+**Guards.** `controller/tests/ml_split_churn_tests` (CTRL_TESTS) drives the
+real service against a real database with rows appended through the real
+`prepare_examples` / `insert_prepared` path (a dead embedder URL, so the
+rows carry NULL embeddings — the split does not depend on them). It pins
+that the first assignment writes every row and lands the old shape's result
+byte-for-byte (an in-test oracle that applies the old rule to the id list);
+that a repeat assignment returns zero moves AND leaves every row's `xmin`
+unchanged — the version-level proof that "moved nothing" is about tuples,
+not counts — with a CONTROL where a real change mints a new version for
+exactly the one moved row; and that a changed holdout moves exactly the
+symmetric difference.
+
+**Recorded, not swept.** The shape generalises — an idempotent re-assertion
+written as an unconditional UPDATE — and it is the class check 83 already
+names for the catalog seeder's `updated_at = NOW()`. A workspace grep for
+`UPDATE … SET col = <literal> WHERE <scope>` without a guard is not a
+population a regex can judge: most such writes are real state transitions,
+where the old and new values differ by construction. So this is a measured
+instance with a test, not a lint.
 

@@ -521,9 +521,17 @@ pub async fn run_backend_selection_eval(
         !holdout_ids.is_empty(),
         "stratified split produced an empty holdout (all classes below the minimum size)"
     );
-    service
+    let moved = service
         .assign_splits(&mut *conn, dataset_id, &holdout_ids)
         .await?;
+    tracing::debug!(
+        target: "talos_ml",
+        %dataset_id,
+        holdout = holdout_ids.len(),
+        moved_to_train = moved.moved_to_train,
+        moved_to_holdout = moved.moved_to_holdout,
+        "split assignment persisted (only rows whose split changed were written)"
+    );
     let holdout = service.load_holdout(&mut *conn, dataset_id).await?;
     let counts = service.class_counts(&mut *conn, dataset_id).await?;
     let truths: Vec<String> = holdout.iter().map(|e| e.label.clone()).collect();
@@ -667,9 +675,17 @@ pub async fn run_knn_eval(
         !holdout_ids.is_empty(),
         "stratified split produced an empty holdout (all classes below the minimum size)"
     );
-    service
+    let moved = service
         .assign_splits(&mut *conn, dataset_id, &holdout_ids)
         .await?;
+    tracing::debug!(
+        target: "talos_ml",
+        %dataset_id,
+        holdout = holdout_ids.len(),
+        moved_to_train = moved.moved_to_train,
+        moved_to_holdout = moved.moved_to_holdout,
+        "split assignment persisted (only rows whose split changed were written)"
+    );
     let holdout = service.load_holdout(&mut *conn, dataset_id).await?;
     // Class priors for balanced voting (matches knn_predict_text so the
     // eval measures exactly what production serves).
