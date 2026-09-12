@@ -12,6 +12,7 @@ repository = "https://github.com/aegix-dev/talos-workflow-engine"
 homepage = "https://github.com/aegix-dev/talos-workflow-engine"
 
 [dependencies]
+talos-config = { path = "../talos-config", version = "0.1.0" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core", version = "0.3", default-features = false }
 talos-workflow-engine = { path = "../talos-workflow-engine", version = "0.3", default-features = false }
 async-nats = "0.47"

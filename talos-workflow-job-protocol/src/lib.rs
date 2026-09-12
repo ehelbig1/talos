@@ -1058,6 +1058,9 @@ fn summarize_worker_ring(map: &WorkerKeyMap) -> Vec<(String, usize)> {
 #[must_use]
 pub fn result_accept_legacy_hmac() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    // allow-inline-env-bool: this crate carries no talos-config/tracing dependency
+    // by design (it is the wire protocol both binaries share); the truthy set below
+    // is pinned equal to talos_config::bool_env\'s by `result_require_flag_spellings`.
     *CACHE.get_or_init(|| {
         !matches!(
             std::env::var("TALOS_RESULT_REQUIRE_ED25519")
@@ -10474,5 +10477,26 @@ mod protocol_review_2026_09_tests {
             );
         }
         clear_job_nonce_cache_for_test();
+    }
+}
+
+#[cfg(test)]
+mod result_require_flag_spellings {
+    //! `result_accept_legacy_hmac` is the ONE env-boolean reader in this crate
+    //! that does not route through `talos_config::bool_env` (no talos-config /
+    //! tracing dependency here, by design). Its truthy set must stay equal to
+    //! that helper's — `true | 1 | yes | on` — or `TALOS_RESULT_REQUIRE_ED25519`
+    //! becomes the divergent parser check 90 exists to prevent.
+    #[test]
+    fn truthy_set_matches_talos_config() {
+        let src = include_str!("lib.rs");
+        let site = src
+            .find("std::env::var(\"TALOS_RESULT_REQUIRE_ED25519\")")
+            .expect("reader present");
+        let window = &src[site..site + 200];
+        assert!(
+            window.contains(r#"Some("1" | "true" | "yes" | "on")"#),
+            "TALOS_RESULT_REQUIRE_ED25519's inline truthy set drifted from talos_config::bool_env's: {window}"
+        );
     }
 }

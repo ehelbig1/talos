@@ -579,13 +579,7 @@ pub fn enforce_production_dispatch_scheme_posture(is_production: bool) -> anyhow
         .unwrap_or(false);
     let sealing = talos_envelope_seal::EnvelopeSealingMode::from_env();
     let signer_present = talos_workflow_job_protocol::configured_dispatch_signer().is_some();
-    let ack = matches!(
-        std::env::var("TALOS_ALLOW_DISPATCH_SCHEME_FALLBACK")
-            .ok()
-            .map(|v| v.trim().to_ascii_lowercase())
-            .as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("on")
-    );
+    let ack = talos_config::bool_env_or_default("TALOS_ALLOW_DISPATCH_SCHEME_FALLBACK", false);
     match dispatch_scheme_posture_decision(
         is_production,
         ed25519_requested,

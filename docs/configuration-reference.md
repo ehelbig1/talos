@@ -28,6 +28,13 @@ Workspace-wide read conventions:
   `.ok().filter(|v| !v.is_empty())` — `VAR=""` behaves like the variable is
   absent (intentional hardening; see the MCP-590/591/597/598 fix family and
   the `zero_env_var_footgun` pattern).
+- **Booleans have ONE vocabulary.** Every boolean variable is read through
+  `talos_config::bool_env` / `bool_env_or_default`: `true | 1 | yes | on` and
+  `false | 0 | no | off`, case-insensitive, whitespace-tolerant; empty or
+  unrecognised counts as unset (with a `talos_config` WARN). Check 90 fails
+  an inline `env::var(..) == "1"`-style parser; the one exemption is the wire
+  protocol crate, which carries no `talos-config` dependency and pins its
+  truthy set to this one by test.
 - **`<VAR>_FILE` siblings.** Secrets that support the Docker-secrets pattern
   are read through `talos_config::read_env_or_file`, which prefers the
   `_FILE` path variant when set.
@@ -102,7 +109,7 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | `TALOS_MASTER_KEY` (+`_FILE`) | required when `KEK_PROVIDER=env`, AND under `KEK_PROVIDER=vault` unless `KEK_DISABLE_LEGACY=true` (the legacy dual-wrap provider still loads it and refuses boot without it) | controller | Master KEK for envelope encryption | 🔒 |
 | `KEK_PROVIDER` | `env` | controller | KEK provider kind (`env` / `vault`) | 🔒 |
 | `TALOS_ALLOW_ENV_KEK` | unset (refuse) | controller | Explicit opt-in required to boot production with an env-var KEK (lint check 45; fails closed) | 🔒 |
-| `KEK_DISABLE_LEGACY` | `false` | controller | Disable the legacy KEK path | 🔒 |
+| `KEK_DISABLE_LEGACY` | `false` | controller | Disable the legacy env-KEK dual-wrap path under `KEK_PROVIDER=vault` (`true`/`1`/`yes`/`on`; before 2026-09-12 only `true`/`1`) | 🔒 |
 | `DEK_CACHE_TTL_SECS` | `300` | controller | DEK cache TTL | |
 | `VAULT_ADDR` (+`_FILE`) | none | controller | HashiCorp Vault address | 🔒 |
 | `VAULT_TOKEN` (+`_FILE`) | none | controller | Vault auth token | 🔒 |
@@ -151,7 +158,7 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | `TALOS_DISPATCH_SCHEME` | `""` | controller | Dispatch signing scheme selector (`ed25519`) | 🔒 |
 | `TALOS_DISPATCH_REQUIRE_ED25519` | unset (fail-open to HMAC) | worker | Require Ed25519-signed dispatch (fail-closed flag) | 🔒 |
 | `TALOS_RESULT_REQUIRE_ED25519` | unset | controller | Require Ed25519-signed job results | 🔒 |
-| `TALOS_SIGNATURE_DIAG` | off | both | Signature diagnostic logging | |
+| `TALOS_SIGNATURE_DIAG` | `false` | both | Signature diagnostic logging | |
 | `WORKER_SHARED_KEY` (+`_FILE`, `_PREVIOUS`) | none in dev (controller WARNs and boots); in production every NATS dispatch is REFUSED until it is set | both | HMAC shared key for worker auth (rotation-capable); also the IKM for checkpoint/envelope AEAD derivations | 🔒 |
 | `TALOS_AOT_HMAC_KEY` / `_PREVIOUS` | none in dev (an ephemeral random key is minted per process); REQUIRED in production — ≥32 raw bytes or the worker panics at boot | worker | HMAC key signing AOT-compiled WASM cache entries | 🔒 |
 | `TALOS_AUDIT_SIGNING_KEY` / `_PREVIOUS` | none | both | Key signing hash-chained audit-ledger entries (`talos-audit-event`) | 🔒 |
@@ -193,11 +200,11 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | `WASM_CACHE_MAX_SIZE_MB` | `500` | controller | Cap on the summed `size_bytes` of modules holding compiled bytes. Same semantics and same exemptions as `WASM_CACHE_MAX_MODULES`; the shortfall is reported as `unevictable_size_overage_bytes`. At 13–18 MB per JS/Python component the default is ~30 such modules, which is why the caps evict bytes and exempt anything referenced or recently run. | |
 | `WORKER_MAX_JOB_RESULT_BYTES` | 4 MiB | worker | Max serialized job result size | |
 | `WORKER_MAX_OCI_LAYER_BYTES` | 32 MiB | worker | Max OCI layer size pulled when fetching modules | |
-| `WORKER_ALLOW_PRIVATE_HOST_TARGETS` | `false` | worker | DEV-ONLY: allow module egress to private/internal IPs (reaching `host.docker.internal` etc.). IGNORED in production at both enforcement layers (`ssrf_resolver`, `host/limits`), so it cannot widen the SSRF blast radius there; the resolver layer accepts only the literal `1` | 🔒 |
+| `WORKER_ALLOW_PRIVATE_HOST_TARGETS` | `false` | worker | DEV-ONLY: allow module egress to private/internal IPs (reaching `host.docker.internal` etc.). IGNORED in production at both enforcement layers (`ssrf_resolver`, `host/limits`), so it cannot widen the SSRF blast radius there; both layers now share one parser (until 2026-09-12 the resolver accepted only the literal `1`, so `true` enabled one layer and not the other) | 🔒 |
 | `METRICS_PORT` | `9090` | worker | Worker Prometheus port | |
 | `TALOS_WORKER_HEARTBEAT_INTERVAL_SECS` | `30` (clamped to 5..45) | worker | Seconds between signed NATS fleet heartbeats. `0` disables publishing entirely — a supported setting, but the controller cannot detect it, so pair it with `SCHEDULER_FLEET_READINESS_BARRIER=false` on the controller or the scheduler's readiness barrier will hold, give up, and report degraded forever. Unparseable values fall back to the default and are logged, never silently disabling the publisher | |
 | `TALOS_INLINE_WASM_MAX_BYTES` | built-in default | controller | Cap on inline-dispatched WASM bytes | |
-| `TALOS_ENCRYPT_EXECUTION_OUTPUT` | ON (only the literal `false` disables — `0`/`off`/`no`/empty leave it on); also needs a SecretsManager | controller | Encrypt stored execution output | 🔒 |
+| `TALOS_ENCRYPT_EXECUTION_OUTPUT` | ON (`false`/`0`/`no`/`off` disable — one boolean vocabulary since 2026-09-12; before, only the literal `false` did); also needs a SecretsManager | controller | Encrypt stored execution output | 🔒 |
 | `TALOS_SQL_PERMISSIVE_EMPTY_ALLOWLIST` | unset | worker | Changes what an EMPTY sandbox SQL allowlist MEANS: unset ⇒ read-only (`SELECT` only — the production default at every dispatch site); `1`/`true`/`yes` ⇒ every non-DDL statement including INSERT/UPDATE/DELETE is admitted. An empty allowlist is always permitted; this flag widens it | 🔒 |
 | `TALOS_WIT_GRAPHQL_BLOCK_INTROSPECTION` | unset | worker | Block GraphQL introspection from guest modules | 🔒 |
 | `TALOS_DEFAULT_WIT_WORLD` | `minimal-node` | controller | Default WIT capability world | |
@@ -218,7 +225,7 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | `TALOS_COMPILE_TARGET_CACHE` | enabled | talos-compilation | Enable the per-USER persistent compile target cache (per-user scoping is a security invariant — never fleet-share) |  |
 | `TALOS_COMPILE_TARGET_CACHE_DIR` | `/tmp/cargo-target/per-user` | talos-compilation | Target-cache directory root | |
 | `TALOS_COMPILE_TARGET_CACHE_TTL_HOURS` | built-in default | talos-compilation | Target-cache idle TTL | |
-| `TALOS_COMPILATION_CONTAINER` | built-in default | talos-compilation | Container image/runtime for sandboxed compiles | |
+| `TALOS_COMPILATION_CONTAINER` | unset ⇒ `is_production()` (containerised in production, host toolchain elsewhere); any boolean token overrides | talos-compilation | Container image/runtime for sandboxed compiles | |
 | `TALOS_COMPILATION_ALLOW_HOST_FALLBACK` | off (prod requires the literal ack token `acknowledge-single-tenant-rce-risk`) | talos-compilation | Allow host-side JS/Python compile (RCE risk) | 🔒 |
 | `TALOS_ADVISORY_DB_MAX_AGE_DAYS` | `90` | talos-compilation | Max RustSec advisory-DB age; fails closed in prod | 🔒 |
 | `MCP_ALLOWED_CRATE_DEPENDENCIES` | built-in allowlist | talos-compilation | Replace the allowed crate-dependency allowlist | 🔒 |
@@ -287,7 +294,7 @@ the env vars above are fallbacks only. See CLAUDE.md "LLM key resolution".
 | `TALOS_COSIGN_MIN_VERSION` | `2.0.0` | worker | Minimum cosign binary version | 🔒 |
 | `TALOS_COSIGN_SHA256` | none (optional) | worker | Pin the cosign binary SHA-256 | 🔒 |
 | `TALOS_ALLOW_UNATTESTED_WASM` | off | worker | DEV-ONLY: permit unattested WASM modules (`1`/`true`/`yes`). IGNORED in production — `block_unattested = is_production() || !allow` | 🔒 |
-| `TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS` | off | worker | DEV-ONLY: accept OCI manifests whose signature could not be verified (only the literal `1`). REFUSED whenever the process is in production OR `TALOS_SIGSTORE_REQUIRED` is `required` | 🔒 |
+| `TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS` | off | worker | DEV-ONLY: accept OCI manifests whose signature could not be verified. REFUSED whenever the process is in production OR `TALOS_SIGSTORE_REQUIRED` is `required` | 🔒 |
 
 Script-level publish knobs (`scripts/publish-images.sh`, not Rust reads):
 `TALOS_PUBLISH_SIGN`, `TALOS_PUBLISH_SKIP_CI_CHECK`, `GITHUB_TOKEN`/`GHCR_TOKEN` 🔒.
@@ -391,7 +398,7 @@ into both deployments.
 | `TALOS_ADAPTIVE_FUEL` | ON (`0`/`false`/`off` disables) | controller | Adaptive WASM fuel metering | |
 | ~~`TALOS_NODE_CACHE`~~ | — | — | **Removed 2026-09-12.** Read only by `talos-node-cache`, a crate nothing constructed ("not yet wired into the engine" since May); the knob controlled nothing. Crate, shim and the empty `node_result_cache` table deleted (migration `20260912110000`). | |
 | `TALOS_MAX_YAML_BYTES` | 1 MiB | controller | Max YAML workflow size | |
-| `ENABLE_EDGE_ROUTING` | `false` | controller | Per-user vs shared NATS dispatch topic | |
+| `ENABLE_EDGE_ROUTING` | `false` | controller | Per-user vs shared NATS dispatch topic. ONE parser since 2026-09-12: the engine dispatcher compared `== "true"` while the Gmail push used `edge_routing_enabled()`, so `ENABLE_EDGE_ROUTING=1` routed module-bound pushes per-user and engine jobs to the shared topic | |
 | `ENFORCE_RATE_LIMITS_IN_DEV` | `false` | controller | Apply rate limits in dev | |
 | `TALOS_WEBHOOK_USER_RPM` | `300` | talos-webhooks | Per-user webhook rate limit | |
 | `MCP_AGENT_RATE_LIMIT_PER_MIN` | `1000` | controller | MCP agent rate limit | |

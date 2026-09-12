@@ -49,10 +49,7 @@ fn cache() -> &'static Mutex<HashMap<Uuid, Entry>> {
 /// Whether adaptive fuel is active. ON by default (guard mode is strictly safe);
 /// set `TALOS_ADAPTIVE_FUEL` to `0` / `false` / `off` to disable.
 pub fn adaptive_fuel_enabled() -> bool {
-    !matches!(
-        std::env::var("TALOS_ADAPTIVE_FUEL").ok().as_deref(),
-        Some("0") | Some("false") | Some("off")
-    )
+    talos_config::bool_env_or_default("TALOS_ADAPTIVE_FUEL", true)
 }
 
 /// Learned per-node fuel ceilings for a workflow, keyed by node label (matching

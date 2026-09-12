@@ -6,6 +6,7 @@ publish = false
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+talos-config = { path = "../talos-config" }
 anyhow = "1"
 arc-swap = "1.7"
 dashmap = "6.1"

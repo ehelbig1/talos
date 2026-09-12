@@ -811,14 +811,10 @@ impl EmptyAllowlistPolicy {
     /// `DenyMutations`. Truthy values that flip to legacy permissive
     /// mode: `1` / `true` / `yes` (case-insensitive).
     pub fn from_env() -> Self {
-        match std::env::var("TALOS_SQL_PERMISSIVE_EMPTY_ALLOWLIST")
-            .ok()
-            .as_deref()
-            .map(str::to_ascii_lowercase)
-            .as_deref()
-        {
-            Some("1") | Some("true") | Some("yes") => Self::AllowAllNonDdl,
-            _ => Self::DenyMutations,
+        if talos_config::bool_env_or_default("TALOS_SQL_PERMISSIVE_EMPTY_ALLOWLIST", false) {
+            Self::AllowAllNonDdl
+        } else {
+            Self::DenyMutations
         }
     }
 }

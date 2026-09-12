@@ -9101,6 +9101,41 @@ else
 fi
 echo
 
+bold "▶ check 90: a boolean env var must be parsed by the ONE shared vocabulary"
+
+# Measured 2026-09-12: 24 sites outside talos-config parsed a boolean env var
+# inline, against sets ranging from a lone `"1"` (TALOS_OCI_ACCEPT_UNVERIFIED_
+# MANIFESTS, the SSRF resolver's WORKER_ALLOW_PRIVATE_HOST_TARGETS) through
+# `"true"` alone (ENABLE_EDGE_ROUTING in the engine dispatcher) to the full
+# eight. Two variables had TWO readers that disagreed: `ENABLE_EDGE_ROUTING=1`
+# routed the Gmail push per-user (talos_config accessor) and engine jobs to the
+# shared topic (`== "true"`); `WORKER_ALLOW_PRIVATE_HOST_TARGETS=true` enabled
+# the host-limits bypass and not the resolver's. And `TALOS_ENCRYPT_EXECUTION_
+# OUTPUT` disabled on the literal `false` only — `0`/`off`/`no` left it on.
+# One vocabulary now: `talos_config::bool_env` (three-valued) and
+# `bool_env_or_default`; every site routes through them (0 on the fixed tree).
+# The detector is statement-aware (chain form, `match … { Some("1") … }` form,
+# `Ok("1" | "true")` form); a read compared inside a helper in another crate
+# or against a literal held in a variable is invisible (stated). Opt-out
+# `// allow-inline-env-bool: <reason>` within 8 lines above — the one holder is
+# talos-workflow-job-protocol, which carries no talos-config dependency by
+# design and pins its truthy set to the shared one by unit test.
+if [ ! -f "$ROOT/scripts/lint-inline-env-bool.py" ]; then
+    red "✗ scripts/lint-inline-env-bool.py is missing — the check cannot run"
+    EXIT_CODE=1
+else
+    CK90_OUT="$(python3 "$ROOT/scripts/lint-inline-env-bool.py" "$ROOT" 2>&1)"
+    CK90_RC=$?
+    if [ "$CK90_RC" -eq 0 ]; then
+        green "✓ every boolean env read routes through talos_config::bool_env ($(echo "$CK90_OUT" | tail -1 | sed -E 's/^ +//'))"
+    else
+        echo "$CK90_OUT" | sed 's/^/  /'
+        red "✗ boolean env var(s) parsed inline against a literal — route through talos_config::bool_env_or_default"
+        EXIT_CODE=1
+    fi
+fi
+echo
+
 bold "▶ check 54: lint self-consistency (check numbering + documented count)"
 ACTUAL_NUMS="$(grep -oE '^bold "▶ check [0-9]+:' "${BASH_SOURCE[0]}" | grep -oE '[0-9]+' | sort -n)"
 EXPECTED_NUMS="$(seq 1 "$CHECK_COUNT")"

@@ -352,10 +352,7 @@ pub(crate) async fn build_core_services(
             // not-yet-rewrapped row, and writes dual-populate both
             // columns for rollback safety. Disable via
             // KEK_DISABLE_LEGACY=true once Phase 5 ships.
-            let disable_legacy = std::env::var("KEK_DISABLE_LEGACY")
-                .ok()
-                .map(|v| v.eq_ignore_ascii_case("true") || v == "1")
-                .unwrap_or(false);
+            let disable_legacy = talos_config::bool_env_or_default("KEK_DISABLE_LEGACY", false);
             let legacy = if disable_legacy {
                 tracing::info!("KEK_DISABLE_LEGACY=true — running vault-only (no env fallback)");
                 None
@@ -1439,10 +1436,7 @@ pub(crate) async fn init_graph_rag(
 pub(crate) async fn register_distributed_replay_guard(
     redis_client: Option<&std::sync::Arc<redis::Client>>,
 ) {
-    let enabled = matches!(
-        std::env::var("TALOS_DISTRIBUTED_REPLAY").ok().as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("on")
-    );
+    let enabled = talos_config::bool_env_or_default("TALOS_DISTRIBUTED_REPLAY", false);
     if !enabled {
         return;
     }

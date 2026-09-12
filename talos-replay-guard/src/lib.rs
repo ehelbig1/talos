@@ -238,12 +238,8 @@ pub fn shared_replay_guard() -> Option<Arc<dyn ReplayGuard>> {
 /// explicitly with `TALOS_REPLAY_FAIL_CLOSED=0`; the env var (any of
 /// 1/true/yes/on or 0/false/no/off) always wins over the environment default.
 pub fn fail_closed_from_env() -> bool {
-    match std::env::var("TALOS_REPLAY_FAIL_CLOSED").ok().as_deref() {
-        Some("1") | Some("true") | Some("yes") | Some("on") => true,
-        Some("0") | Some("false") | Some("no") | Some("off") => false,
-        // Unset (or an unrecognised value): fail-closed in prod, open in dev.
-        _ => talos_config::is_production(),
-    }
+    // Unset (or an unrecognised value): fail-closed in prod, open in dev.
+    talos_config::bool_env("TALOS_REPLAY_FAIL_CLOSED").unwrap_or_else(talos_config::is_production)
 }
 
 /// Resolve an [`ReplayOutcome`] into an admit/reject decision under a fail

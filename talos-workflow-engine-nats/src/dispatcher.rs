@@ -57,15 +57,14 @@ static SUBJECT_PREFIX: std::sync::LazyLock<String> = std::sync::LazyLock::new(||
 /// unauthenticated request get attacker-chosen fields signed by the worker
 /// key), so set it on BOTH sides while investigating.
 /// Read once at process start — changing the env var after boot has no effect.
-static SIGNATURE_DIAG_ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-    matches!(
-        std::env::var("TALOS_SIGNATURE_DIAG").as_deref(),
-        Ok("1" | "true")
-    )
-});
+static SIGNATURE_DIAG_ENABLED: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| talos_config::bool_env_or_default("TALOS_SIGNATURE_DIAG", false));
 
 fn edge_routing_enabled() -> bool {
-    std::env::var("ENABLE_EDGE_ROUTING").as_deref() == Ok("true")
+    // ONE parser: the Gmail push already routed through this accessor while this
+    // dispatcher compared `== "true"`, so `ENABLE_EDGE_ROUTING=1` split the fleet
+    // between per-user and shared topics (package AN, 2026-09-12).
+    talos_config::edge_routing_enabled()
 }
 
 pub(crate) fn get_single_job_topic(user_id: Option<Uuid>, priority: u8) -> String {

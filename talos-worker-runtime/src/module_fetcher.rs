@@ -1245,11 +1245,10 @@ pub async fn fetch(
                                     // mode to use it — making the trade-off
                                     // explicit rather than hiding it behind
                                     // one toggle.
-                                    let accept_env =
-                                        std::env::var("TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS")
-                                            .ok()
-                                            .as_deref()
-                                            == Some("1");
+                                    let accept_env = talos_config::bool_env_or_default(
+                                        "TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS",
+                                        false,
+                                    );
                                     let prod = talos_config::is_production();
                                     let sigstore_required = matches!(
                                         SigstorePolicy::from_env(),

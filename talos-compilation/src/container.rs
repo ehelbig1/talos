@@ -158,13 +158,8 @@ fn nonempty_env_or(name: &str, default: &str) -> String {
 /// comment cites the same class) and `talos_config::bool_env_or_default`,
 /// which likewise returns its default on empty.
 fn container_enabled() -> bool {
-    match std::env::var("TALOS_COMPILATION_CONTAINER")
-        .ok()
-        .filter(|v| !v.is_empty())
-    {
-        Some(val) => !matches!(val.to_lowercase().as_str(), "false" | "0" | "no"),
-        None => talos_config::is_production(),
-    }
+    talos_config::bool_env("TALOS_COMPILATION_CONTAINER")
+        .unwrap_or_else(talos_config::is_production)
 }
 
 /// Returns `true` when the operator has explicitly opted in to running

@@ -632,12 +632,7 @@ pub(crate) fn db_sandbox_posture_decision(
 pub fn enforce_production_db_sandbox_posture(is_production: bool) -> anyhow::Result<()> {
     let raw = std::env::var("TALOS_RPC_GUEST_ROLE").ok();
     let trimmed = raw.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    let ack = matches!(
-        std::env::var("TALOS_ALLOW_UNSCOPED_DB_SANDBOX")
-            .ok()
-            .as_deref(),
-        Some("1") | Some("true") | Some("yes") | Some("on")
-    );
+    let ack = talos_config::bool_env_or_default("TALOS_ALLOW_UNSCOPED_DB_SANDBOX", false);
     match db_sandbox_posture_decision(is_production, trimmed, ack) {
         Ok(true) => Ok(()),
         Ok(false) => {
