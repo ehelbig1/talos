@@ -34,7 +34,8 @@ use std::time::{Duration, Instant};
 // exactly one process produces these series and there is no ambiguity about
 // which `job` label is authoritative.
 //
-// A THIRD dead breaker-observability surface exists and is NOT addressed here:
+// A THIRD dead breaker-observability surface existed and was DROPPED on
+// 2026-09-12 (migration 20260912100000_drop_untouched_tables.sql):
 // the Postgres table `circuit_breaker_metrics` (migration
 // `20260329000000_new_modules_tables.sql`, plus an index on
 // `(service_name, recorded_at)`). It is real, empty, and has no writer or

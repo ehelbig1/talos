@@ -117,9 +117,11 @@ performance one, and it does not cap anything upstream of the module.
 When you raise a budget, state what still bounds it: the 50M engine ceiling,
 the per-step wall-clock timeout, and — if populated — the actor's
 `actor_budget_policies` (`max_fuel_per_execution`, `max_fuel_per_hour`,
-`fuel_budget_daily`) and `tenant_quotas.max_fuel_per_execution`. All of those
+`fuel_budget_daily`). All of those
 are NULL/empty for the PA actor today, which means **no budget is currently
-backstopping a mis-set node ceiling**.
+backstopping a mis-set node ceiling**. (`tenant_quotas.max_fuel_per_execution`
+used to be named here too; that table never had a writer or a reader and was
+dropped 2026-09-12 — it was never a backstop.)
 
 ## Where the real numbers live
 

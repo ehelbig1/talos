@@ -1844,20 +1844,25 @@ macro_rules! module_recency_key {
 ///    bytes gone. (Static text also keeps this statement inside lint check 88's
 ///    PREPARE coverage.)
 /// 3. A `webhook_triggers.module_id` names it (indexed).
-/// 4. An ACTIVE `google_calendar_watch_channels.module_id` names it (the
-///    index is partial on `is_active`, hence the predicate). Gmail and GCP
-///    push bindings are NOT covered here: they live inside
-///    `integration_state.value` (`GmailWatchRow.module_id`, the GCP push
-///    subscription row), which is JSON that may be ENCRYPTED (`value_enc`),
-///    so SQL cannot see the binding — stated as a limit rather than
-///    approximated. A module bound only to a gmail/gcp push channel is
-///    protected by leg 5 for as long as it keeps firing.
-/// 5. It was used within the window — [`module_recency_key!`] is newer than
+/// 4. It was used within the window — [`module_recency_key!`] is newer than
 ///    `NOW() - $window days`. This is the leg that makes `WASM_CACHE_RETENTION_DAYS`
 ///    mean what it says on BOTH paths.
 ///
-/// `workflow_nodes.module_id` is NOT consulted: that table has no INSERT
-/// writer anywhere in the workspace.
+/// Push-channel bindings — gmail, GCP AND google-calendar — are NOT covered
+/// here: they live inside `integration_state.value` (`GmailWatchRow.module_id`,
+/// the GCP push subscription row, the gcal channel row), which is JSON that
+/// may be ENCRYPTED (`value_enc`), so SQL cannot see the binding — stated as
+/// a limit rather than approximated. A module bound only to a push channel is
+/// protected by leg 4 for as long as it keeps firing. Until 2026-09-12 a
+/// fourth leg read `google_calendar_watch_channels.module_id` and this comment
+/// said it covered gcal; that table had held ZERO rows with no writer since
+/// gcal channels moved into `integration_state`, so the leg matched nothing
+/// and the claim was false — the class one level up from the leg it sat
+/// beside (a control that reads an always-empty table). The table was dropped
+/// (migration 20260912100000) and the leg with it.
+///
+/// `workflow_nodes.module_id` was never consulted: that table had no INSERT
+/// writer anywhere in the workspace, and was dropped by the same migration.
 macro_rules! module_eviction_exemptions {
     ($window:literal) => {
         concat!(
@@ -1865,8 +1870,6 @@ macro_rules! module_eviction_exemptions {
               AND NOT EXISTS (SELECT 1 FROM workflows w \
                               WHERE w.graph_json LIKE '%' || m.id::text || '%') \
               AND NOT EXISTS (SELECT 1 FROM webhook_triggers t WHERE t.module_id = m.id) \
-              AND NOT EXISTS (SELECT 1 FROM google_calendar_watch_channels c \
-                              WHERE c.module_id = m.id AND c.is_active = true) \
               AND ",
             module_recency_key!(),
             " < NOW() - INTERVAL '1 day' * ",
@@ -2632,8 +2635,6 @@ mod wasm_cache_sweep_sql_tests {
             "FROM workflows w",
             "w.graph_json LIKE '%' || m.id::text || '%'",
             "NOT EXISTS (SELECT 1 FROM webhook_triggers t WHERE t.module_id = m.id)",
-            "FROM google_calendar_watch_channels c",
-            "c.module_id = m.id AND c.is_active = true",
             "COALESCE(GREATEST(m.last_used_at, e.last_exec), m.created_at) < NOW() - INTERVAL '1 day' * $1",
         ] {
             assert!(
@@ -2650,6 +2651,18 @@ mod wasm_cache_sweep_sql_tests {
         assert!(
             !EVICTION_CANDIDATES_SQL.contains("status"),
             "graph-text exemption must protect archived workflows' modules too"
+        );
+        // Dropped 2026-09-12: a leg over `google_calendar_watch_channels` (zero
+        // rows, no writer) matched nothing while the doc comment said it covered
+        // gcal — an exemption that reads an always-empty table is a claim, not a
+        // control. The table is gone — and this assertion is the ONLY guard:
+        // check 88's PREPARE probe cannot see this statement (it is assembled
+        // by `concat!` in a macro, one of the probe's `dynamic — OUT OF RANGE`
+        // sites; measured by mutation 2026-09-12), so a leg over a dropped
+        // table would otherwise fail at request time.
+        assert!(
+            !EVICTION_CANDIDATES_SQL.contains("google_calendar_watch_channels"),
+            "the eviction exemption must not read a dropped table"
         );
     }
 

@@ -492,6 +492,10 @@ CTRL_TESTS=(
     # dirtied pages measured on a live copy). `common` harness, so CTRL_TESTS
     # (64b).
     "ml_split_churn_tests"
+    # Eleven tables no Rust reads or writes are gone (migration 20260912100000);
+    # schema_audit_log and its DDL event trigger stay; every SOC 2 collector
+    # export statement PREPAREs. `common` harness, so CTRL_TESTS (64b).
+    "dead_schema_tests"
     "api_auth_integration_test"
     "integration_mcp_tests"
     "auth_concurrency_tests"
