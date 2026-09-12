@@ -529,6 +529,10 @@ CTRL_TESTS=(
     # (workflow_versions / execution_approvals / actor_action_log); parent-derived
     # policies, migration 20260912130000. `common` harness (64b).
     "rls_scoped_reader_tables_tests"
+    # The eleven RLS policies whose `org_id IS NULL → permit` arm admitted every
+    # row of a never-written column; re-keyed on user_id + parent, migration
+    # 20260912140000. `common` harness (64b).
+    "rls_permit_arm_retired_tests"
     "api_auth_integration_test"
     "integration_mcp_tests"
     "auth_concurrency_tests"
