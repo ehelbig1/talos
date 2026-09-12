@@ -204,6 +204,31 @@ echo "▶ creating 'talos_ctl' for the controller DB-harness binaries…"
 docker exec "$PG_NAME" psql -U "$PG_USER" -d talos -c "CREATE DATABASE talos_ctl" >/dev/null
 migrate_db talos_ctl "$CTL_URL"
 
+# Check 88 — every static sqlx statement must PREPARE against the migrated
+# schema. This is the ONLY place it runs with a database: `make lint` leaves
+# the DB leg off (`TALOS_LINT_SQL_PREPARE=1` is opt-in) and, measured
+# 2026-09-12, NOTHING set that variable — no workflow, no runner, no hook — so
+# the gate CLAUDE.md described as "make test-integration runs it against the
+# DB it already builds" had never run anywhere but a developer's shell. The
+# day that was found, #822 had dropped a table one live statement still
+# named, and the probe reported that line on its first run over the tree. The
+# roots mirror `scripts/lint-structural.sh` check 88 (every crate's `src/`
+# except `talos-statement-stats`, whose statements name a relation absent by
+# design). A missing `psql` is a FAILURE, not a skip: asked-for-and-unable-to-
+# run is a green tick over zero statements (checks 64/65).
+echo "▶ check 88: PREPARE every static sqlx statement against 'talos_ctl'…"
+if ! command -v psql >/dev/null 2>&1; then
+    echo "✗ psql is not on PATH — check 88 cannot run (install postgresql-client)" >&2
+    exit 1
+fi
+SQL_PREPARE_ROOTS=()
+for d in controller worker talos-*; do
+    case "$d" in talos-statement-stats) continue ;; esac
+    [ -d "$d/src" ] && SQL_PREPARE_ROOTS+=("$d/src")
+done
+python3 scripts/lint-sql-prepare.py --self-test
+python3 scripts/lint-sql-prepare.py "$CTL_URL" "${SQL_PREPARE_ROOTS[@]}"
+
 export TALOS_TEST_REDIS_URL="redis://127.0.0.1:${REDIS_PORT}"
 export TALOS_TEST_NATS_URL="nats://127.0.0.1:${NATS_PORT}"
 export TALOS_TEST_NATS_PERM_URL="nats://127.0.0.1:${NATS_PERM_PORT}"
