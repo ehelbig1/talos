@@ -541,6 +541,10 @@ CTRL_TESTS=(
     # actor repository's completion delegates to the counted engine finalizer.
     # `common` harness (64b).
     "workflow_failure_finalizer_tests"
+    # The archive's status CHECK equals the live table's (three widenings of the
+    # live constraint never reached the archive; migration 20260912160000).
+    # `common` harness (64b).
+    "archive_status_check_parity_tests"
     "api_auth_integration_test"
     "integration_mcp_tests"
     "auth_concurrency_tests"
