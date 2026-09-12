@@ -358,8 +358,8 @@ async fn reading_a_secret_does_not_date_it_but_rotating_it_does() {
 
     let id = Uuid::new_v4();
     sqlx::query(
-        "INSERT INTO secrets (id, name, key_path, encrypted_value, encryption_key_id, user_id, owner_user_id) \
-         VALUES ($1, 'probe', $2, '\\x00'::bytea, $3, $4, $4)",
+        "INSERT INTO secrets (id, name, key_path, encrypted_value, encryption_key_id, owner_user_id) \
+         VALUES ($1, 'probe', $2, '\\x00'::bytea, $3, $4)",
     )
     .bind(id)
     .bind(format!("probe/{id}"))

@@ -533,6 +533,10 @@ CTRL_TESTS=(
     # row of a never-written column; re-keyed on user_id + parent, migration
     # 20260912140000. `common` harness (64b).
     "rls_permit_arm_retired_tests"
+    # secrets: the dead `user_id` column, its three indexes and the org-stamp
+    # trigger that RFC 0006 makes wrong are gone; owner_user_id / org_id indexed
+    # (migration 20260912150000). `common` harness (64b).
+    "secrets_owner_column_tests"
     "api_auth_integration_test"
     "integration_mcp_tests"
     "auth_concurrency_tests"
