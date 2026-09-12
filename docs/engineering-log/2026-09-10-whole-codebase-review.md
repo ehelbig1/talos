@@ -2901,3 +2901,102 @@ attempt at it produced a table that was wrong on nearly every row (zsh
 does not word-split an unquoted expansion; every reader list became one
 token). Population recorded: 106 rows carry the 🔒 mark; two are now known
 wrong and fixed; the rest are unverified.
+
+### Package AK (2026-09-12) — the Component column, derived instead of judged
+
+**The paragraph above ends "the rest are unverified"; this is the
+verification.** The shell attempt failed on a quoting bug, so the second
+attempt was written in Python and measured before it was trusted: for each of
+the 274 classifiable rows, the crates whose production `.rs` name the variable
+(plus the crates that call a `talos-config` accessor which does), intersected
+with the crate sets `cargo tree -p worker` and `-p controller` resolve. The
+worker links 22 `talos-*` crates, the controller 137, and the worker's set is a
+strict subset of the controller's — so "the worker cannot read it" is decidable
+(no worker-linked crate names it) while "the controller cannot read it" almost
+never is.
+
+**What the derivation said about the document: 117 findings.** 115 rows
+claimed `both` or `worker` for a variable no worker-linked crate reads — 69 in
+a Component cell, 48 under two 4-column sections whose HEADINGS said "both
+components" (`talos-config` memory knobs) and "both" (`talos-audit-ledger`) —
+plus `COMPILE_DIR`, whose cell named `talos-compilation` while the read is in
+`controller/src/bootstrap/services.rs`, and `TALOS_VERSION`, whose cell said
+`controller` while `worker/src/self_register.rs` reads it into the registration
+proof. The 108 `both`→`controller` rows include `TALOS_MASTER_KEY`, `JWT_SECRET`,
+`JWT_PRIVATE_KEY`, `VAULT_ADDR`, `VAULT_TRANSIT_KEY_NAME`, `NEO4J_PASSWORD`,
+`ADMIN_SECRET_KEY`, `BOOTSTRAP_FIRST_USER_EMAIL` — read literally, the column
+told an operator wiring a fresh environment to hand the credential-free worker
+the master KEK. **The deployments were checked before the document was
+blamed**: `docker-compose.yml`'s worker service sets 20 variables and the chart's
+worker Deployment 21, and NONE of the 108 is among them. The document was wrong
+and the shipped configs were right, which is the better way round — and also
+why nobody had noticed.
+
+**Three rules the detector needed, each added on a measurement.**
+(1) *Whole-literal, not token.* Under a bare-token rule three prose hits
+vouched for reads: `worker/src/self_register.rs` names `TALOS_WORKER_PUBLIC_KEYS`
+inside a WARN string (making a correct `controller` row look like a false
+`controller` claim), `talos-dlp-provider` names `VAULT_TOKEN` in a
+`[REDACTED:VAULT_TOKEN]` fixture, and `talos-worker-runtime` has gemini's
+`const BASE_URL`. Requiring the name to be a WHOLE quoted literal — the shape
+of every real `env::var("X")` — removed all three and changed the finding set
+by exactly those three rows. (2) *Comments stripped.* `TALOS_AUDIT_S3_OBJECT_LOCK`
+is named in a `///` in `talos-worker-runtime/src/context.rs`; with comments in
+the haystack it read as worker-readable. (3) *Fully-qualified accessor calls.*
+The first caller regex excluded `:` in its look-behind, so
+`talos_config::llm_boot_warmup_enabled()` did not count as a call and
+`TALOS_LLM_BOOT_WARMUP` reported NO reader; removing one character moved the
+count from 141 candidate mismatches to the 117 that are real.
+
+**Speed was also a measurement.** A regex per (row, crate) pair took 35 s;
+one pass per crate collecting its set of quoted SCREAMING_SNAKE literals and
+its set of called function names, then O(1) membership tests, takes 0.8 s of
+Python plus two 0.25 s `cargo tree` resolutions. A lint step at 35 s would have
+been the check nobody runs.
+
+**What the check cannot see, and what was done about it by hand.** A read in
+a SHARED crate proves nothing about which process executes it:
+`talos-worker-runtime` is linked into the controller for the WIT inspector and
+its host-side env reads run only in the worker; `talos-memory` is linked into
+the worker for the RPC protocol and its embedding reads run only in the
+controller. So `worker` rows read only in `talos-worker-runtime` stay `worker`
+(the check passes them — 41 such rows), and thirteen `both` rows have no reader
+in the worker bin or the worker runtime. Those thirteen were read one by one:
+`EMBEDDING_API_URL` / `_API_KEY` / `_MODEL` / `_DIMENSIONS` / `_TIMEOUT_SECS`
+are the controller's embedding provider (CLAUDE.md: the worker has "no
+embedding-provider keys"; neither compose nor the chart gives it one) and
+`TALOS_DISPATCH_SCHEME`'s only reader, `configured_dispatch_signer`, has no
+caller under `worker/` or `talos-worker-runtime/` — six flipped on architecture,
+stated as such in the check's header. `NATS_CA_FILE` (`talos-nats-tls`, both
+connections), `TALOS_RPC_REQUIRE_ED25519` (`rpc_auth`, both ends) and the five
+tracing endpoints (`talos-trace`, both `init_tracing` calls) are true `both` and
+stay. **Deliberately NOT changed**: the `worker` rows in `talos-worker-runtime`
+— the legend now defines Component as the process that reads at runtime, and
+for those rows `worker` is that answer even though the crate is shared.
+
+**Mutations, all caught at the exact row.** `JWT_SECRET` back to `both` → 1
+finding; `NATS_URL` (read by the worker bin) to `controller` → 1 finding on the
+other arm; the memory-knob heading back to "both components" → 38 findings,
+one per row under it. Baseline 0 after every revert. The zero-rows, empty
+cargo tree and wrong-root arms exit 2 rather than pass.
+
+**Found on the way.** The chart's worker Deployment set `AWS_ENDPOINT_URL` to
+the MinIO endpoint. `cargo tree -p worker` lists no `aws-*` crate and no worker
+source names an `AWS_*` variable — the worker seals audit events and publishes
+them over NATS; the S3 writer and the chain verifier are controller loops. It
+arrived in `8f13f1e9` (2026-05-18, an MCP reason-length fix) and was read by
+nothing for four months: W1's dead-env class. Removed with a comment saying why.
+
+**And the reconciliation lesson from the same afternoon**, recorded here
+because the deploy record is in memory, not in the repo: the recon script read
+`talos_*_total` through the Prometheus API, which returns the last SCRAPE. On
+the #833 deploy the scheduled runs completed seconds before the read, so the DB
+said 3 workflows / 10 modules and the API said 1 / 4 — the shape of a real
+missing-count defect, and the previous eleven reconciliations had matched only
+because their completions were older than a scrape interval. Re-read at the
+controller's own `/metrics/prometheus`: 4↔4↔12.820 s and 14↔14↔2.411 s, exact.
+The script now reads the endpoint directly.
+
+**The CLAUDE.md count sentence this package changed (88 → 89), kept verbatim for `check-engineering-log.py`'s losslessness leg — the first count bump since the split, so the first time that base line moved:**
+
+- **`make lint` enforces structural rules** via `scripts/lint-structural.sh`. 88 checks today (the authoritative, inline-documented list lives in the script; `bash scripts/lint-structural.sh --count` prints the live number, and check 54 fails the lint if this sentence's count goes stale), each tied to a specific past regression so it catches at PR-time the class of bug that survives `cargo check` cleanly but breaks at CI or request time:

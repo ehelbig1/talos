@@ -84,8 +84,10 @@ spec:
             - name: NATS_CA_FILE
               value: /etc/talos/nats-ca/tls.crt
             {{- end }}
-            - name: AWS_ENDPOINT_URL
-              value: {{ include "talos.minioEndpoint" . | quote }}
+            # AWS_ENDPOINT_URL was set here until 2026-09-12 and read by nothing:
+            # the worker links no AWS SDK and no `AWS_*` reader — it seals audit
+            # events and publishes them over NATS; the S3 writer and the chain
+            # verifier are controller loops (see controller/deployment.yaml).
             - name: OLLAMA_URL
               {{- if .Values.ollama.enabled }}
               value: "http://{{ include "talos.componentName" (list . "ollama") }}.{{ .Release.Namespace }}.svc.cluster.local:11434"

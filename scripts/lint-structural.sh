@@ -9035,6 +9035,55 @@ else
 fi
 echo
 
+bold "▶ check 89: a configuration-reference Component cell must not claim a process that cannot read the variable"
+
+# `docs/configuration-reference.md` is the AUTHORITATIVE env-var list (the
+# 2026-09-07 artefacts entry made it so) and its Component column tells an
+# operator which PROCESS needs a variable set. Measured 2026-09-12: it said
+# `both` for 108 variables the worker binary cannot read at all —
+# TALOS_MASTER_KEY, JWT_SECRET, VAULT_ADDR, NEO4J_PASSWORD, every scheduler
+# knob, every memory-loop knob — and the two 4-column sections' headings said
+# "both components" over 48 more. Read literally, that column told an operator
+# to hand the credential-free worker the master KEK and the JWT signing secret.
+#
+# The rule is an IMPOSSIBILITY test, so its precision is structural, not
+# measured: the linked crate sets come from `cargo tree -p worker` /
+# `-p controller` (lockfile resolution, no build, ~0.3 s each), a read is the
+# variable as a WHOLE quoted literal in a crate's production `.rs` (or a
+# `talos-config` accessor called from it), and a row may not claim a process
+# no linked crate reads it from. A read in a SHARED crate is left to the
+# author — `talos-worker-runtime` is linked into the controller for the WIT
+# inspector and its host-side env reads run only in the worker — so `worker`
+# rows read there stay `worker`, and `both` rows whose only worker-side
+# evidence is a shared crate PASS (a stated false-negative direction).
+# Measured on pristine main after #834: 117 findings (115 "worker cannot read
+# it", 1 crate-named row read by the controller bin, 1 `controller` row the
+# worker bin reads), 0 on the fixed tree; mutation-proved in both arms.
+# Fails LOUDLY (exit 2) when cargo tree, the doc table or the source set
+# resolves to nothing — a check over zero rows is a green tick over nothing
+# (checks 64/65). No opt-out: a process that cannot read a variable has no
+# legitimate reason to be listed as reading it; fix the cell.
+if [ ! -f "$ROOT/scripts/lint-config-reference-components.py" ]; then
+    red "✗ scripts/lint-config-reference-components.py is missing — the check cannot run"
+    EXIT_CODE=1
+elif ! command -v cargo >/dev/null 2>&1; then
+    red "✗ cargo is not on PATH — check 89 needs \`cargo tree\` to derive the linked crate sets"
+    EXIT_CODE=1
+else
+    CK89_OUT="$(python3 "$ROOT/scripts/lint-config-reference-components.py" "$ROOT" 2>&1)"
+    CK89_RC=$?
+    if [ "$CK89_RC" -eq 0 ]; then
+        green "✓ every Component cell names a process that can read its variable ($(echo "$CK89_OUT" | tail -1 | sed -E 's/^ +//'))"
+    else
+        echo "$CK89_OUT" | sed 's/^/  /'
+        red "✗ configuration-reference Component cell(s) claim a process that cannot read the variable"
+        yellow "  → \`both\`/\`worker\` needs a reader in a crate linked into the worker binary;"
+        yellow "    \`controller\` must not be read by the worker binary itself. Fix the cell."
+        EXIT_CODE=1
+    fi
+fi
+echo
+
 bold "▶ check 54: lint self-consistency (check numbering + documented count)"
 ACTUAL_NUMS="$(grep -oE '^bold "▶ check [0-9]+:' "${BASH_SOURCE[0]}" | grep -oE '[0-9]+' | sort -n)"
 EXPECTED_NUMS="$(seq 1 "$CHECK_COUNT")"
