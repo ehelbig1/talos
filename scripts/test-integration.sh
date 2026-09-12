@@ -537,6 +537,10 @@ CTRL_TESTS=(
     # trigger that RFC 0006 makes wrong are gone; owner_user_id / org_id indexed
     # (migration 20260912150000). `common` harness (64b).
     "secrets_owner_column_tests"
+    # ONE home for the dispatcher-side workflow-failure finalizer (counted); the
+    # actor repository's completion delegates to the counted engine finalizer.
+    # `common` harness (64b).
+    "workflow_failure_finalizer_tests"
     "api_auth_integration_test"
     "integration_mcp_tests"
     "auth_concurrency_tests"

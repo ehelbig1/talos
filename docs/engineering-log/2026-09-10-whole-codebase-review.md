@@ -2675,3 +2675,86 @@ the earlier mechanism was broken. Before repairing a control that has never
 run, read every decision that postdates it: a dead control can be dead
 because it was superseded, and reviving it re-opens a closed question in
 the wrong direction.
+
+## Package AG — "every finalizer" was seven of seventeen (2026-09-12)
+
+The #828 deploy's reconciliation (read the database first, then the
+metrics, nothing in flight) came out exact on the module side — 92 ↔ 92
+completed, 2 ↔ 2 failed, sums to the millisecond — and short on the
+workflow side: 28 ↔ 28 successes, but two `failed` rows since boot against
+`talos_workflow_executions_total{status="failure"} = 0`. Both rows were
+written by the scheduler at 16:15Z ("Scheduled workflow failed: … node
+'fetch' failed: Job failed after 3 attempts … networkerror") during a
+one-minute Docker-DNS blip that also produced 24 worker WARNs on
+`gmail.googleapis.com`. The failures were transient and correct; the
+counter was wrong.
+
+**Enumerated by statement, not by crate.** `grep -rn "UPDATE
+workflow_executions" … status = 'failed'` outside the two repositories the
+09-11 burn-down had wired: eight raw sites — `talos-scheduler` ×3 (the
+timeout, the engine-build failure, the run failure), `talos-webhooks` ×3
+(graph load, and two dispatch-failure arms), `talos-actor-repository` ×2
+(`fail_execution`, `fail_execution_nats_unavailable`, the continuation and
+handoff paths). Seven carry the check-39 guard `NOT IN ('completed',
+'failed', 'cancelled', 'resuming')`; the actor repository's carries
+`status = 'running'` alone. None records the outcome. And beside them the
+actor repository's `complete_execution` is a third copy of the COMPLETION
+statement — uncounted, no payload bound, `running`-only guard — that check
+46 never saw because its roots were the hardcoded pair
+`talos-workflow-repository talos-execution-repository`. Enumerated by
+statement: seventeen terminal-status writes across six crates (plus the
+stale sweep's marked one); seven counted, ten not.
+
+**The obvious placement was a cycle.** The counted failure statement lives
+in `talos-execution-repository`, the counted completion in
+`talos-workflow-repository`, and the actor repository depends on neither —
+adding `talos-workflow-repository` to it fails `cargo check` with
+`talos-actor-repository → talos-workflow-repository → talos-graph-rag →
+talos-actor-repository`. So the home is a leaf: `talos-execution-finalizer`
+(sqlx, uuid, serde_json, talos-metrics, nothing else) with three functions
+— `fail_workflow_execution_unless_terminal`, `complete_workflow_execution_
+encrypted`, `complete_workflow_execution_plain` — each RETURNING
+`EXTRACT(EPOCH FROM (completed_at - started_at))` and recording once per
+finalized row. The workflow repository re-exports the failure home (the
+scheduler and webhook router call it through the crate they already depend
+on) and its `mark_execution_completed` delegates both statements;
+`ExecutionRepository::fail_execution_unless_terminal` delegates its
+`set_completed_at = true` branch and that repository's own
+`mark_execution_completed` delegates both statements too; the actor
+repository's three methods call in, keeping their own redaction, truncation and encryption ahead of the
+call. The dispatcher-side guard and the engine-side guard stay DIFFERENT on
+purpose: a dispatcher that lost a run must not touch a `resuming` row that
+crash recovery owns; the engine may finalize the run it resumed.
+
+**Two behaviour changes, stated.** `ActorRepository::fail_execution` now
+finalizes a row still `queued` (its callers are trigger paths that fail
+before dispatch; the old guard left such a row queued forever — measured:
+0 rows stuck older than an hour on the reference database, so latent), and
+`complete_execution` now applies `bound_execution_payload` and completes a
+`resuming` row.
+
+**Guards.** The leaf carries two source pins over `include_str!` of the
+five former files: the single-line failure statement and the
+`SET status = 'completed', output_data` fragment may appear in none of
+them, every former file must call the home, and the leaf's own file holds
+each needle exactly once (its statements are written across lines).
+`controller/tests/workflow_failure_finalizer_tests` (CTRL_TESTS) drives the
+home against rows in six states — running and queued finalize and count,
+completed / failed / cancelled / resuming are refused and do not count —
+and the three actor-repository methods, reading
+`talos_workflow_executions_total` and the duration histogram the alerts
+read. Mutations: re-inlining one scheduler site fails the pin; removing the
+recorder from the leaf fails the counter assertion. **Check 46's roots** are
+now the whole workspace: measured before widening at four hits, three the
+actor repository's (removed here) and one the stale sweep's (marked and
+argued in place), so it ships at zero.
+
+**The measurement instrument was also wrong today, and that is recorded
+beside this.** Every "0 WARN/ERROR since boot" reported on 2026-09-12 came
+from `grep -cE ' (WARN|ERROR) '` over `docker logs`, whose coloured output
+puts an ANSI reset immediately after the level; the trailing space never
+matched. Re-counted with the escapes stripped, the #828 boot had 7 WARN and
+2 ERROR on the controller and 30 WARN on the worker — all the DNS blip,
+all benign — and the two ERRORs are the very rows this package is about. A
+zero from a filter that cannot match is the green-tick-over-nothing shape,
+turned on the reviewer.

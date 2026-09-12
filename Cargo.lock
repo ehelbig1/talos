@@ -7492,6 +7492,7 @@ dependencies = [
  "talos-config",
  "talos-db",
  "talos-dlp-provider",
+ "talos-execution-finalizer",
  "talos-memory",
  "talos-secrets-manager",
  "talos-tenancy",
@@ -8109,6 +8110,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "talos-execution-finalizer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "sqlx",
+ "talos-metrics",
+ "uuid",
+]
+
+[[package]]
 name = "talos-execution-orchestration"
 version = "0.1.0"
 dependencies = [
@@ -8158,6 +8170,7 @@ dependencies = [
  "talos-db",
  "talos-dlp-provider",
  "talos-engine-events",
+ "talos-execution-finalizer",
  "talos-metrics",
  "talos-module-payload-encryption",
  "talos-secrets-manager",
@@ -9959,6 +9972,7 @@ dependencies = [
  "talos-db",
  "talos-dlp-provider",
  "talos-engine-events",
+ "talos-execution-finalizer",
  "talos-graph-rag",
  "talos-memory",
  "talos-memory-ranking",
