@@ -74,7 +74,6 @@ mod memory_crypto;
 mod module_executions;
 mod module_payload_encryption;
 mod module_repository;
-mod node_cache;
 mod oauth;
 mod organizations;
 mod rate_limit;

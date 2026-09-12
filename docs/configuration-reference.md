@@ -379,7 +379,7 @@ into both deployments.
 | `TALOS_CHAIN_CONCURRENCY` | `8` | both | Chain fan-out concurrency | |
 | `TALOS_NATS_TIMEOUT_SECS` | `0` (disabled) | both | NATS request-reply timeout | |
 | `TALOS_ADAPTIVE_FUEL` | flag | both | Adaptive WASM fuel metering | |
-| `TALOS_NODE_CACHE` | bool default | both | Node-output cache | |
+| ~~`TALOS_NODE_CACHE`~~ | — | — | **Removed 2026-09-12.** Read only by `talos-node-cache`, a crate nothing constructed ("not yet wired into the engine" since May); the knob controlled nothing. Crate, shim and the empty `node_result_cache` table deleted (migration `20260912110000`). | |
 | `TALOS_MAX_YAML_BYTES` | 1 MiB | both | Max YAML workflow size | |
 | `ENABLE_EDGE_ROUTING` | `false` | both | Per-user vs shared NATS dispatch topic | |
 | `ENFORCE_RATE_LIMITS_IN_DEV` | bool default | both | Apply rate limits in dev | |

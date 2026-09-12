@@ -19,7 +19,9 @@ use common::{create_test_user, create_test_workflow, setup_test_context};
 use talos_workflow_repository::WorkflowRepository;
 use uuid::Uuid;
 
-const DROPPED: [&str; 11] = [
+const DROPPED: [&str; 12] = [
+    // package AA (2026-09-12): the table behind a cache nothing constructed
+    "node_result_cache",
     "circuit_breaker_metrics",
     "compilation_cache",
     "feature_flags",
@@ -34,7 +36,7 @@ const DROPPED: [&str; 11] = [
 ];
 
 #[tokio::test]
-async fn the_eleven_untouched_tables_are_gone_and_the_live_ones_remain() {
+async fn the_twelve_untouched_tables_are_gone_and_the_live_ones_remain() {
     let (pool, _db) = common::isolated_db_pool().await;
     for t in DROPPED {
         let gone: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NULL")
