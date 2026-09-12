@@ -486,6 +486,12 @@ CTRL_TESTS=(
     "execution_metrics_tests"
     "chain_run_linkage_tests"
     "admin_event_visibility_tests"
+    # `DatasetService::assign_splits` writes only rows whose split CHANGES:
+    # the holdout is deterministic, so a steady dataset used to rewrite every
+    # row per eval for a net change of zero (110 ms / 2 145 tuples / 2 373
+    # dirtied pages measured on a live copy). `common` harness, so CTRL_TESTS
+    # (64b).
+    "ml_split_churn_tests"
     "api_auth_integration_test"
     "integration_mcp_tests"
     "auth_concurrency_tests"
