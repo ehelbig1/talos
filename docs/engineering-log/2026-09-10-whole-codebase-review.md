@@ -2180,3 +2180,94 @@ scored three readers and was the most misleading table of the eleven. The
 `docs/rfcs/0004` tenant plan still lists several dropped tables among its
 org-scoping candidates; it is a design record and was left as written.
 
+## Package Z — the gate that read too little and ran nowhere (2026-09-12)
+
+Two findings from one mutation. Package Y's review re-added an eviction
+exemption leg over a table the same package had dropped, expecting two
+guards to fire — the registry's unit pin and check 88's PREPARE probe. The
+pin fired; the probe did not. The exemption SQL is assembled by `concat!`
+inside `module_eviction_exemptions!`, and the probe read only a string
+LITERAL at the call site: everything else was "dynamic — OUT OF RANGE", 73
+sites on the widened roots (the digest's "32" was measured on the old
+roots). A statement over a dropped table, invisible to the one gate whose
+name is "every static sqlx statement must PREPARE".
+
+Then the second finding, while checking where the probe would have run:
+**nowhere**. `grep -rn TALOS_LINT_SQL_PREPARE` over `scripts/`, `Makefile`,
+`.github/workflows/` and `.githooks/` returns only the lint script that
+reads the variable. The base paragraph of check 88 says "`make
+test-integration` runs it against the DB it already builds so the gate is
+not merely opt-in"; `scripts/test-integration.sh` never mentioned it. The
+check had run exactly where a developer typed it. And the same afternoon,
+#822 dropped `workflow_nodes` — a table this session's own sweep had called
+"read only by a comment" — while `list_workflows_for_actor_scoped` still
+counted rows in it; the probe named that line on its first run over the
+post-#822 tree, hours after the deploy had broken the `actorWorkflows`
+resolver. A gate that is not wired protects exactly the trees someone
+happens to run it on.
+
+**Decisions.**
+* **The probe resolves same-file indirection.** `scripts/lint-sql-prepare.py`
+  gains a `Resolver` built per file from its `const NAME: &str = …`
+  definitions (including `pub const` inside an `impl`, reached as
+  `Self::NAME`) and its `macro_rules!` definitions. At a call site whose
+  first argument is not a literal it resolves: a bare identifier → its
+  const's expression; `concat!(…)` → the join of its resolved parts;
+  `name!(…)` → the matching arm's body with `$param` substituted (zero- or
+  one-parameter macros, `literal`/`expr`/`tt`/`ident` fragments);
+  `format!("…")` with NO trailing arguments and only `{CONST}` placeholders
+  → the substituted string (`{{`/`}}` honoured). Everything else — a
+  cross-file name, a function call, a positional `{}` — stays dynamic and is
+  counted, exactly as before. Depth-limited at 12.
+* **Measured on the runner's roots (139, statement-stats excluded)**:
+  1 225 → 1 249 static (25 resolved), 73 → 45 dynamic. The 25 are the six
+  `execution_row_columns!`/`execution_base_columns!`/`lineage_node_columns!`
+  projections in the execution repository, the four registry sweep statements
+  (three constants built from `concat!` + macros, one touched through a
+  `const`), `VISIBLE_PREDICATE`, `CATALOG_MISSING_WASM_SQL`,
+  `CATALOG_ROWS_WITHOUT_WASM_SQL`, and the eleven `format!("… {COLS} …")` /
+  `{ENC_ROW_COLS}` / `{JUDGE_LABEL_LATERAL}` sites in the github, ml and
+  memory crates. The 45 that remain are 37 `&sql` locals (predicate builders
+  such as `live_sql(None)` and `archive_move_sql(…)`, paginated readers that
+  assemble ORDER BY, the RPC subscribers' wrapped guest queries) and 8
+  `format!` sites whose placeholder is a function result.
+* **The mutation is now caught.** Re-adding the dropped-table leg fails the
+  probe at the three statements that embed the exemption (`[42P01] relation
+  "google_calendar_watch_channels" does not exist`), beside the unit pin.
+* **`--self-test`, run unconditionally.** A fixture `.rs` with every resolved
+  shape (a const, a nested const via `concat!`, a one-parameter macro
+  wrapping a `concat!` of a literal-parameter macro, `Self::ASSOC`, a
+  zero-parameter macro inside `concat!`, a `format!` over a const) and three
+  that must stay dynamic (positional `format!`, a non-const `{live}`
+  placeholder, a `&sql` local); it asserts the exact resolved SQL and the
+  exact dynamic reasons. `make lint` runs it before the env gate, so a
+  resolver regression is red even where the DB leg is off.
+* **`make test-integration` runs the DB leg**, after `talos_ctl` is built,
+  under the script's `set -euo pipefail`, with the same root derivation as
+  the lint and `psql` REQUIRED — a missing client is a failure, because
+  asked-for-and-unable-to-run is a green tick over zero statements (checks
+  64/65). Ubuntu runners ship `psql`. This is the first time check 88's DB
+  leg runs anywhere but a shell.
+* **`talos-statement-stats` is excluded explicitly**, in both runners, with
+  the reason at the site: every statement in it names a relation absent by
+  design. The digest already said the crate was "deliberately OUTSIDE check
+  88's PREPARE roots"; the 2026-09-11 glob had re-included it and nothing
+  noticed, because the old probe could not read its `const` statements —
+  the same blindness that hid the eviction leg hid a false claim about the
+  roots. The resolver would have turned that into two red lines on every
+  server without the preload; the exclusion the digest described now exists
+  in code. Its guard is `controller/tests/statement_stats_tests`, which
+  drives the real statements against a database WITH the view and one
+  WITHOUT.
+
+**Stated limits.** The resolver is same-file only and textual: a fragment
+imported from another module, a `const` produced by a function, a macro
+with two parameters, or a `format!` with any non-const placeholder stays
+dynamic. Macro substitution is token-blind (`$name` replaced by the argument
+text) — correct for the SQL-fragment idiom this workspace uses, not a Rust
+macro expander. A resolved statement PREPAREs like a literal one, with the
+limit check 88 already states: PREPARE proves it plans, never that it
+succeeds. And the wiring fixes where the check runs, not what it can see —
+the 45 dynamic sites are exactly as unprotected as they were, and the count
+on every run is what keeps that visible.
+

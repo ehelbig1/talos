@@ -8966,9 +8966,21 @@ bold "▶ check 88: every static sqlx statement must PREPARE against the real sc
 # See CLAUDE.md check 88 for the measured numbers, the two false-positive
 # classes and the stated limits. Opt-out: // allow-unpreparable-sql: <reason>.
 
+# The probe's RESOLVER (2026-09-12) reads a statement reached through a same-file
+# `const`, `concat!`, `macro_rules!` fragment or const-only `format!` — 27 of the
+# 73 sites the literal-only probe had to call "dynamic", among them every WASM
+# cache sweep statement in `talos-registry`. Its fixture self-test needs no
+# database and runs UNCONDITIONALLY, so a regression in the resolver is a red
+# lint even where the DB leg below is switched off.
+if [ -f "$ROOT/scripts/lint-sql-prepare.py" ]; then
+    if ! python3 "$ROOT/scripts/lint-sql-prepare.py" --self-test; then
+        red "✗ scripts/lint-sql-prepare.py --self-test failed — the resolver no longer reads the shapes it claims to"
+        EXIT_CODE=1
+    fi
+fi
 SQL_PREPARE_URL="${TALOS_SQL_PREPARE_URL:-${DATABASE_URL:-}}"
 if [ "${TALOS_LINT_SQL_PREPARE:-0}" != "1" ]; then
-    yellow "⊘ skipped (set TALOS_LINT_SQL_PREPARE=1 + a migrated DATABASE_URL to run)"
+    yellow "⊘ DB leg skipped (set TALOS_LINT_SQL_PREPARE=1 + a migrated DATABASE_URL to run; make test-integration runs it)"
 elif [ -z "$SQL_PREPARE_URL" ]; then
     # Asked for and unable to run is a FAILURE, not a skip: a check that skips
     # when switched on is a green tick over zero statements (checks 64/65).
@@ -8991,8 +9003,19 @@ else
     # `target`, `.claude` (check 75) and `tests/` (an integration binary
     # legitimately CREATEs its own tables at runtime); a crate with no sqlx at
     # all (most of them) contributes nothing and costs nothing.
+    #
+    # `talos-statement-stats` is EXCLUDED, and the exclusion has to be explicit:
+    # every statement in it names `pg_stat_statements`, a relation ABSENT BY
+    # DESIGN on most servers (the digest's stated reason for keeping that crate
+    # outside this check). The glob above had quietly re-included it on
+    # 2026-09-11 and nothing noticed, because its statements are `const`s the
+    # literal-only probe could not read; the resolver reads them, so the
+    # exclusion the digest described now exists in code. Its guard is
+    # `controller/tests/statement_stats_tests`, which drives the real
+    # statements against a database WITH the view and one WITHOUT it.
     SQL_PREPARE_ROOTS=()
     for d in "$ROOT"/controller "$ROOT"/worker "$ROOT"/talos-*; do
+        case "$d" in */talos-statement-stats) continue ;; esac
         [ -d "$d/src" ] && SQL_PREPARE_ROOTS+=("$d/src")
     done
     if [ "${#SQL_PREPARE_ROOTS[@]}" -eq 0 ]; then
