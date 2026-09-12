@@ -2539,3 +2539,83 @@ is in this section so the next scoped reader over `execution_events`,
 `admin_event_log` or `execution_state` knows it is adding the first
 evaluated read of an unguarded table, and that the table's own `org_id`
 is not a key it can scope on.
+
+## Package AE — a transition arm that never ended (2026-09-12)
+
+Package AD asked, of the tables without RLS, whether their `org_id` was
+written. The follow-up question was the obvious one: what about the tables
+WITH RLS? `SELECT count(*), count(org_id)` over every RLS'd table:
+
+    module_executions        56 633 rows   0 with an org   user_id on 56 633
+    secret_audit_log         22 593        0
+    workflow_schedules           18        0               user_id on 18
+    integration_credentials       7        0               user_id on 7
+    gmail_integrations            2        0               user_id on 2
+    google_calendar_integrations  2        0               user_id on 2
+    integration_state             2        0               user_id on 2
+    atlassian / slack / workflow_suspensions / workflow_approval_gates   0 rows
+
+and every one of those eleven policies read, verbatim,
+`(NULLIF(current_setting('app.current_org_ids'), '') IS NULL) OR (org_id IS
+NULL) OR (org_id = ANY(...))`. The middle arm is RFC 0004's M4 transition
+clause: keep rows visible until the M3 write-side stamp reaches them. M3
+shipped as `set_org_id_from_personal_org` (20260529140000), a BEFORE INSERT
+trigger whose header scopes it deliberately to actors, secrets, modules and
+webhook_triggers — "high-write operational tables are NOT triggered — the
+per-insert subquery cost isn't worth it there, their existing rows are
+M2-backfilled, and an org_id-NULL row stays visible to its owner via the
+union read's user_id clause". That last sentence is about the APP-LAYER
+union read; the RLS policy beside it had no user_id clause at all. So on
+these eleven tables the transition never ended, and under `talos_app` the
+policy admitted every row to every tenant while the catalog reported
+`relrowsecurity = t` and a policy named `*_tenant_isolation`.
+
+**Exposure.** The same scoped-connection scan package AD used: of the
+eleven, only `workflow_schedules` is read on a scoped connection — five
+methods in `talos-scheduler` (`get_schedule_for_accessor_on_conn`,
+`get_schedule_for_update_on_conn`, `upsert_schedule_on_conn`,
+`update_schedule_on_conn`, `delete_schedule_on_conn`), each with its own
+`ws.user_id = $2 OR w.org_id = ANY($3)` predicate. The predicates held; the
+backstop behind them was a pass-through since May. The other ten are read
+on the bare superuser pool today. They are fixed anyway, for a different
+reason than AD's 34 were recorded: those had no policy and would have
+gained a control nothing exercised; these HAVE a policy, advertise
+isolation, and deliver none — repairing what a table already claims is not
+adding a dead control.
+
+**Shape.** Key the policy on the column that is written. `user_id` is
+populated on every row of every one of these tables that has it. The org
+arm is kept for a future explicit stamp. Where the table hangs off a parent
+the parent-derived arm is added and the parent's own policy filters the
+`EXISTS` under `talos_app`: `workflow_schedules` → `workflows`;
+`module_executions` and `workflow_suspensions` → `workflow_executions`;
+`secret_audit_log` → `secrets` (the only tenant key that table has — its
+`actor_id` is the acting principal, not the owner). The unset→permit clause
+stays and is keyed on `app.current_user_id`, as `workflows_tenant_isolation`
+keys it (`begin_org_scoped` sets only the singular `app.current_org_id`, so
+under that helper both the old and the new policy permit — equivalent, and
+stated). `WITH CHECK` is the owner arm without the org arm, mirroring
+20260602120000. FORCE stays.
+
+**Deliberately not done.** Stamping `org_id` on these writers, or widening
+the autostamp trigger to them. The M3 header's cost argument still holds
+for `module_executions`, and more to the point a policy keyed on a column
+that is written is worth more than one keyed on a column that might one day
+be — the eleven above are what the second choice looks like four months on.
+
+**Guards.** `controller/tests/rls_permit_arm_retired_tests` (CTRL_TESTS):
+a structural pin that all eleven policies exist, their tables are enabled
+and forced, and neither USING nor WITH CHECK contains `(org_id IS NULL)`;
+raw predicate-free reads under `talos_app` as user A against user B's
+org_id-NULL rows on `workflow_schedules`, `module_executions` and
+`integration_credentials` (1 each on pristine main, 0 here) plus the
+production `get_schedule_for_accessor_on_conn`; the owner control; the
+unset-GUC control; and a write control (the owner's schedule update lands,
+a credential row minted for another user is 42501). Mutations: reinstating
+the pre-fix `workflow_schedules` policy verbatim fails the isolation test;
+`USING (false)` on `module_executions` fails the owner control.
+
+**The one-line check worth keeping.** Whether a policy's key is written is
+a fact about the DATA, not the schema, so no structural lint can see it.
+`SELECT count(*), count(org_id) FROM <table>` per RLS'd table, once, is the
+whole audit — and it took four months for anyone to run it.
