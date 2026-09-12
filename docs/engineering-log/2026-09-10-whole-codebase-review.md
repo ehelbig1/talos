@@ -2619,3 +2619,59 @@ the pre-fix `workflow_schedules` policy verbatim fails the isolation test;
 a fact about the DATA, not the schema, so no structural lint can see it.
 `SELECT count(*), count(org_id) FROM <table>` per RLS'd table, once, is the
 whole audit — and it took four months for anyone to run it.
+
+## Package AF — a stamp that would have been wrong had it worked (2026-09-12)
+
+Package AE's table of trigger-bearing tables had one row that did not fit:
+`secrets` carries `trg_set_org_id` and has `org_id` on 0 of 14 rows. The
+trigger fires on `NEW.user_id IS NOT NULL`; `secrets.user_id` is NULL on
+every row, because both INSERT sites in `talos-secrets-manager` write
+`created_by` and `owner_user_id` and nothing has ever written `user_id`.
+Nothing reads it either — the only reference outside `migrations/` was one
+test seed. Three indexes sat on the dead column (`(user_id, key_path)`,
+`(user_id, name)`, `(org_id, user_id)`) while `owner_user_id`, which the
+manager's reads filter on (3 648 calls in the statistics window), had no
+index at all. The M2 backfill loop (20260529130000) keyed `secrets` on
+`x.user_id` as well, so it backfilled nothing — which turned out to be
+lucky.
+
+**The re-key is the wrong fix.** The natural repair — `COALESCE(NEW.user_id,
+NEW.owner_user_id)` or a secrets-specific trigger on `owner_user_id` — was
+written, run as a mutation, and rejected on a decision this repository
+already records. `20260608130000` (RFC 0006 decision (b)) scopes the
+secrets owner pin to PERSONAL secrets, defined as `org_id IS NULL`, and
+skips it for org-shared rows: "personal secret → org pin permits (NULL) +
+owner pin ENFORCES; org-shared secret → org pin ENFORCES + owner pin
+SKIPPED". A trigger that stamps the owner's personal org onto every
+personal secret reclassifies all of them as org-shared and switches the
+owner pin OFF for exactly the rows it exists to protect. On this fleet the
+personal org's only member is the owner, so no row would have leaked — but
+the control would have been inverted by its own repair, and on a
+deployment where a personal org ever gains a member it would have leaked.
+The June decision supersedes the May trigger for this table.
+
+**What shipped.** Migration `20260912150000`: `idx_secrets_owner_user_id`
+and `idx_secrets_org_id` created first (the table is never without an
+index on its filtered columns), then `DROP TRIGGER trg_set_org_id ON
+secrets`, the three dead indexes, and `ALTER TABLE secrets DROP COLUMN
+user_id`. No backfill. The trigger stays on `actors`, `modules` and
+`webhook_triggers`, where a NULL `org_id` carries no meaning and the stamp
+is right.
+
+**Guards.** `controller/tests/secrets_owner_column_tests` (CTRL_TESTS):
+the column and old indexes absent, the new indexes present; the trigger
+present on exactly `actors`, `modules`, `webhook_triggers`; and the
+RFC 0006 invariant driven behaviourally — a secret inserted with no org, by
+an owner who HAS a personal organization, still reads `org_id IS NULL`.
+Mutations: installing the re-key alternative as a probe trigger fails that
+invariant test (the stamp lands, the owner pin would be off); re-adding the
+column fails the structural pin. `updated_at_maintenance_tests`, whose
+seed named the column, is updated and re-run.
+
+**The generalisable point.** Two migrations six weeks apart assigned
+`org_id IS NULL` opposite meanings on one table — "not yet stamped" in May,
+"personal, owner-pinned" in June — and the later meaning held only because
+the earlier mechanism was broken. Before repairing a control that has never
+run, read every decision that postdates it: a dead control can be dead
+because it was superseded, and reviving it re-opens a closed question in
+the wrong direction.
