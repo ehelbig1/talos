@@ -525,6 +525,10 @@ CTRL_TESTS=(
     # of a same-predicate sibling); 45 dropped by migration 20260912120000 and the
     # two invariants pinned over the whole schema. `common` harness (64b).
     "index_hygiene_tests"
+    # RLS on the three tenant-content tables scoped transactions read
+    # (workflow_versions / execution_approvals / actor_action_log); parent-derived
+    # policies, migration 20260912130000. `common` harness (64b).
+    "rls_scoped_reader_tables_tests"
     "api_auth_integration_test"
     "integration_mcp_tests"
     "auth_concurrency_tests"
