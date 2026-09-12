@@ -2191,18 +2191,18 @@ async fn run_scheduled_execution(
         // is the main training-data source for the learned ranker. The execution
         // row already exists here (created at `create_execution_under_concurrency_
         // limit` above), so provenance rows join cleanly to `judge_scores`.
-        match workflow_repo
-            .get_relevant_actor_context(
-                actor_id,
-                20,
-                context_hint,
-                Some(execution_id),
-                // Auto-injection (scheduled actor-bound run) → curated (durable
-                // semantic+episodic) scope; never surfaces transient `working`
-                // memory into the execution trace by default.
-                talos_workflow_repository::MemoryScope::Curated,
-            )
-            .await
+        match talos_actor_memory_service::actor_context::get_relevant_actor_context(
+            &workflow_repo,
+            actor_id,
+            20,
+            context_hint,
+            Some(execution_id),
+            // Auto-injection (scheduled actor-bound run) → curated (durable
+            // semantic+episodic) scope; never surfaces transient `working`
+            // memory into the execution trace by default.
+            talos_actor_memory_service::MemoryScope::Curated,
+        )
+        .await
         {
             Ok(rows) if !rows.is_empty() => Some(talos_memory::actor_context::assemble_payload(
                 actor_id, &rows,

@@ -290,7 +290,7 @@ pub async fn trigger_continuation_workflow(
                     10,
                     None,
                     Some(execution_id),
-                    talos_workflow_repository::MemoryScope::Curated,
+                    talos_actor_memory_service::MemoryScope::Curated,
                 )
                 .await;
             }

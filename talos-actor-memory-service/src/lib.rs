@@ -36,6 +36,12 @@ pub use talos_memory::{
 /// keep working through this re-export.
 pub use talos_graph_rag::GRAPH_SERVICE;
 
+/// Actor-context assembly (memory recall + graph-RAG + ranking), moved here from
+/// `talos-workflow-repository` on 2026-09-12 so a persistence crate no longer
+/// depends on services.
+pub mod actor_context;
+pub use actor_context::MemoryScope;
+
 /// Adapter that hands graph extraction to `GRAPH_SERVICE` via the
 /// crate-level hook. Registered once at controller startup (in
 /// `main.rs`) immediately after `GRAPH_SERVICE.set(...)`.
@@ -277,7 +283,7 @@ pub async fn inject_actor_context_into_input(
     max_memories: usize,
     context_hint: Option<&str>,
     execution_id: Option<uuid::Uuid>,
-    scope: talos_workflow_repository::MemoryScope,
+    scope: MemoryScope,
 ) {
     // SECURITY (reserved-key spoof guard): `__actor_context__` is an
     // engine-AUTHORED reserved key — the assembled per-actor memory view. Once
@@ -308,9 +314,15 @@ pub async fn inject_actor_context_into_input(
     // error, schema skew). Log at warn so the failure is observable
     // while preserving the best-effort contract that caller code
     // relies on.
-    let memories = match workflow_repo
-        .get_relevant_actor_context(actor_id, max_memories, context_hint, execution_id, scope)
-        .await
+    let memories = match actor_context::get_relevant_actor_context(
+        workflow_repo,
+        actor_id,
+        max_memories,
+        context_hint,
+        execution_id,
+        scope,
+    )
+    .await
     {
         Ok(rows) => rows,
         Err(e) => {
@@ -386,5 +398,45 @@ mod backfill_guard_tests {
         assert!(try_claim(b), "a different actor's backfill is independent");
         BACKFILLS_IN_FLIGHT.lock().unwrap().remove(&a);
         BACKFILLS_IN_FLIGHT.lock().unwrap().remove(&b);
+    }
+}
+
+#[cfg(test)]
+mod layering_pins {
+    //! `talos-workflow-repository` is a PERSISTENCE crate. Until 2026-09-12 it
+    //! depended on `talos-graph-rag`, `talos-memory` and `talos-memory-ranking`
+    //! for one module — the actor-context assembly, now `crate::actor_context`
+    //! — and that edge made `talos-workflow-repository → talos-graph-rag →
+    //! talos-actor-repository` a path, which is why #831's finalizer home had to
+    //! be a leaf crate. These pins keep the edge cut: a dependency added back to
+    //! the repository's manifest, or the module re-appearing there, fails here.
+    const REPO_MANIFEST: &str = include_str!("../../talos-workflow-repository/Cargo.toml");
+    const REPO_LIB: &str = include_str!("../../talos-workflow-repository/src/lib.rs");
+
+    #[test]
+    fn the_workflow_repository_depends_on_no_memory_or_graph_service() {
+        for dep in [
+            "talos-graph-rag",
+            "talos-memory-ranking",
+            "talos-memory =",
+            "talos-actor-memory-service",
+        ] {
+            assert!(
+                !REPO_MANIFEST.contains(dep),
+                "talos-workflow-repository must not depend on `{dep}` — the actor-context assembly lives in talos-actor-memory-service"
+            );
+        }
+    }
+
+    #[test]
+    fn the_actor_context_module_has_one_home() {
+        assert!(
+            !REPO_LIB.contains("mod actor_context"),
+            "actor_context moved to talos-actor-memory-service"
+        );
+        assert!(
+            REPO_MANIFEST.contains("talos-execution-finalizer"),
+            "sanity: the manifest read is the real one"
+        );
     }
 }

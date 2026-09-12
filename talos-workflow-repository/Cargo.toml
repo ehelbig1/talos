@@ -23,9 +23,6 @@ talos-db = { path = "../talos-db" }
 talos-tenancy = { path = "../talos-tenancy" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-engine-events = { path = "../talos-engine-events" }
-talos-graph-rag = { path = "../talos-graph-rag" }
-talos-memory = { path = "../talos-memory" }
-talos-memory-ranking = { path = "../talos-memory-ranking" }
 talos-execution-finalizer = { path = "../talos-execution-finalizer" }
 talos-metrics = { path = "../talos-metrics" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
