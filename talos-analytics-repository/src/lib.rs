@@ -655,6 +655,38 @@ pub struct AdminEventRow {
     pub created_at: DateTime<Utc>,
 }
 
+/// Filter for [`AnalyticsRepository::list_admin_events`]; see its doc comment
+/// for what each field scopes.
+#[derive(Debug, Clone, Default)]
+pub struct AdminEventFilter {
+    /// `Some(u)`: only actions PERFORMED BY `u`. `None`: every row, including
+    /// system-authored ones with a NULL `user_id`.
+    pub acting_user: Option<Uuid>,
+    pub resource_type: Option<String>,
+    pub event_type: Option<String>,
+    pub limit: i64,
+    pub offset: i64,
+}
+
+/// One `admin_event_log` row as [`AnalyticsRepository::list_admin_events`]
+/// renders it — [`AdminEventRow`] plus the resource it is about and whether
+/// that resource still exists.
+#[derive(Debug, Clone)]
+pub struct AdminEventListRow {
+    pub id: Uuid,
+    pub user_id: Option<Uuid>,
+    pub event_type: String,
+    pub resource_type: String,
+    pub resource_id: Option<Uuid>,
+    pub summary: Option<String>,
+    pub details: Option<serde_json::Value>,
+    pub created_at: DateTime<Utc>,
+    /// `Some(true)` the resource row exists; `Some(false)` it is gone (the
+    /// event is the only trace); `None` unknown — a NULL `resource_id` (bulk
+    /// events) or a `resource_type` with no table this read knows.
+    pub resource_present: Option<bool>,
+}
+
 #[derive(Debug)]
 pub struct ExecutionAuditRow {
     pub id: Uuid,
@@ -2913,6 +2945,90 @@ impl AnalyticsRepository {
                     summary: r.try_get::<Option<_>, _>("summary")?,
                     details: r.try_get::<Option<_>, _>("details")?,
                     created_at: r.try_get("created_at")?,
+                })
+            })
+            .collect::<Result<Vec<_>>>()
+    }
+
+    /// One page of `admin_event_log`, newest first, optionally restricted to
+    /// the ACTING user and/or one `resource_type` / `event_type`.
+    ///
+    /// This is the reader for the 65% of the table no per-resource surface can
+    /// reach: an event about a resource that has since been DELETED (there is
+    /// no workflow to open `get_workflow_audit_trail` on), a BULK event whose
+    /// `resource_id` is NULL, and the resource types that have no per-resource
+    /// tool at all (`api_key`, `mcp_agent`, `user`, `system`,
+    /// `worker_provisioning_token`). Measured 2026-09-12 on the reference
+    /// fleet: 55 of 85 rows.
+    ///
+    /// `acting_user: Some(u)` is the TENANT view — the actions `u` performed,
+    /// which is tenant-safe by construction (the table has no RLS and no owner
+    /// column; the event's `user_id` is the one fact that binds a row to a
+    /// tenant). `None` is the platform-wide view, which the caller gates on
+    /// platform-admin; it is also the ONLY view that reaches system-authored
+    /// rows (`user_id IS NULL`, e.g. the CLI's provisioning-token audit).
+    ///
+    /// `resource_present` answers "does the thing this event is about still
+    /// exist" from the resource's own table; `None` when `resource_id` is NULL
+    /// or the type has no table this read knows — unknown, never false.
+    /// `execution` is checked against the live table AND the archive tier
+    /// (#748's rule).
+    pub async fn list_admin_events(
+        &self,
+        filter: &AdminEventFilter,
+    ) -> Result<Vec<AdminEventListRow>> {
+        let rows = sqlx::query(
+            "SELECT a.id, a.user_id, a.event_type, a.resource_type, a.resource_id, \
+                    a.summary, a.details, a.created_at, \
+                    CASE \
+                      WHEN a.resource_id IS NULL THEN NULL \
+                      WHEN a.resource_type = 'workflow' THEN \
+                        EXISTS (SELECT 1 FROM workflows x WHERE x.id = a.resource_id) \
+                      WHEN a.resource_type = 'module' THEN \
+                        EXISTS (SELECT 1 FROM modules x WHERE x.id = a.resource_id) \
+                      WHEN a.resource_type = 'actor' THEN \
+                        EXISTS (SELECT 1 FROM actors x WHERE x.id = a.resource_id) \
+                      WHEN a.resource_type = 'ml_model' THEN \
+                        EXISTS (SELECT 1 FROM ml_models x WHERE x.id = a.resource_id) \
+                      WHEN a.resource_type = 'api_key' THEN \
+                        EXISTS (SELECT 1 FROM api_keys x WHERE x.id = a.resource_id) \
+                      WHEN a.resource_type = 'mcp_agent' THEN \
+                        EXISTS (SELECT 1 FROM mcp_agents x WHERE x.id = a.resource_id) \
+                      WHEN a.resource_type = 'user' THEN \
+                        EXISTS (SELECT 1 FROM users x WHERE x.id = a.resource_id) \
+                      WHEN a.resource_type = 'worker_provisioning_token' THEN \
+                        EXISTS (SELECT 1 FROM worker_provisioning_tokens x WHERE x.id = a.resource_id) \
+                      WHEN a.resource_type = 'execution' THEN \
+                        EXISTS (SELECT 1 FROM workflow_executions x WHERE x.id = a.resource_id) \
+                        OR EXISTS (SELECT 1 FROM workflow_executions_archive x WHERE x.id = a.resource_id) \
+                      ELSE NULL \
+                    END AS resource_present \
+             FROM admin_event_log a \
+             WHERE ($1::uuid IS NULL OR a.user_id = $1) \
+               AND ($2::text IS NULL OR a.resource_type = $2) \
+               AND ($3::text IS NULL OR a.event_type = $3) \
+             ORDER BY a.created_at DESC, a.id DESC \
+             LIMIT $4 OFFSET $5",
+        )
+        .bind(filter.acting_user)
+        .bind(filter.resource_type.as_deref())
+        .bind(filter.event_type.as_deref())
+        .bind(filter.limit)
+        .bind(filter.offset)
+        .fetch_all(&self.db_pool)
+        .await?;
+        rows.into_iter()
+            .map(|r| -> Result<AdminEventListRow> {
+                Ok(AdminEventListRow {
+                    id: r.try_get("id")?,
+                    user_id: r.try_get::<Option<_>, _>("user_id")?,
+                    event_type: r.try_get("event_type")?,
+                    resource_type: r.try_get("resource_type")?,
+                    resource_id: r.try_get::<Option<_>, _>("resource_id")?,
+                    summary: r.try_get::<Option<_>, _>("summary")?,
+                    details: r.try_get::<Option<_>, _>("details")?,
+                    created_at: r.try_get("created_at")?,
+                    resource_present: r.try_get::<Option<_>, _>("resource_present")?,
                 })
             })
             .collect::<Result<Vec<_>>>()

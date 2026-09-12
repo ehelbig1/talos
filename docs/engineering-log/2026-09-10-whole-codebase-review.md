@@ -1892,3 +1892,108 @@ a psql script with `\echo` directives needs a different runner; the guard is
 the `ON_ERROR_STOP=1` run recorded in this package's PR, which is a snapshot
 and not a gate.
 
+## Package W — the 65% of the admin audit log no reader could reach (2026-09-12)
+
+Package V's question — is it written? is it read? — was answered per table.
+The morning after it deployed the same question was asked per ROW, and the
+answer was that the two surfaces it added reach the minority of the table.
+Of 85 `admin_event_log` rows on the reference fleet, 55 had no
+operator-facing surface: 21 `workflow_deleted` and 8 `module_deleted` events
+whose resource is gone (the per-resource tools take a live id, and a deleted
+workflow has none to give), 7 bulk events (`workflows_bulk_deleted`,
+`workflows_bulk_archived`, `modules_bulk_cleanup`) whose `resource_id` is
+NULL, and every `actor` (9), `ml_model` (13) and `mcp_agent` (2) row. The
+audit question an operator actually asks of this table — "who deleted these
+workflows, and when" — was exactly the one no surface could answer, because
+the deletion is the event that removes the id the surfaces key on.
+
+**The writer inventory was wrong too.** Package V said "four writers", counting
+files carrying `INSERT INTO admin_event_log`. Two more write through the actor
+repository's generic `insert_admin_event_log` from thirteen call-site files,
+and the resource vocabulary across all of them is TEN types: `workflow`,
+`module`, `actor`, `ml_model`, `api_key`, `mcp_agent`, `user`, `execution`,
+`system`, and `worker_provisioning_token` — the last written by the CLI with
+`user_id = NULL`, a system-authored row no per-user view can ever contain. A
+line grep over `INSERT INTO` is not a writer inventory when a repository
+wraps the INSERT (the `talos_rpc` lesson: a line grep over Rust is not a
+population).
+
+**Decisions.**
+* **`list_admin_events` is the reader.** One page newest first, `ORDER BY
+  created_at DESC, id DESC` (check 28's tiebreaker), `limit` ≤ 200, `offset`
+  ≤ 100 000, optional `resource_type` / `event_type` filters (a blank filter
+  is no filter — MCP-258's rule; a non-string is a caller error). `has_more`
+  is answered by fetching one extra row, not a second COUNT.
+* **Tenancy is the event's `user_id`, and the default scope is the caller's
+  own actions.** The table has no RLS and no owner column; the acting user is
+  the one fact binding a row to a tenant. Actions a platform admin took on a
+  tenant's resource stay on that resource's own surface (package V's
+  decision), so the two views compose rather than overlap.
+* **`all_users` is platform-admin only, REFUSED rather than narrowed.** The
+  gate is `users.is_platform_admin`, the `get_secret_access_log` /
+  `query_paginated` precedent; the agent identity's `*` capability is
+  deliberately not enough, and the test drives that distinction (the harness
+  agent carries `*` and is refused until the column flips). A narrowed answer
+  to a request for the platform-wide view would be the quiet-smaller-answer
+  shape this file names under check 74.
+* **`resource_present` is three-valued and never guesses.** It reads the
+  resource's OWN table (`workflows`, `modules`, `actors`, `ml_models`,
+  `api_keys`, `mcp_agents`, `users`, `worker_provisioning_tokens`;
+  `execution` against `workflow_executions` AND the archive tier, #748's
+  rule); a NULL `resource_id` or an unknown type is `null`, never `false`.
+* **An unreadable log is an error, not an empty page.** The read failing
+  returns `mcp_failed` with a sentence saying so — check 74's rule on a
+  surface whose whole output is an audit claim.
+* **The two remaining per-resource homes got the block.** `get_actor_summary`
+  renders `admin_events` beside the ceilings it reports (the current value
+  above, the WHEN and WHO of each change below), `null` + a flag when
+  unreadable; `ml_get_model_card` renders `admin_events` through its existing
+  `Readings` ledger, so an unreadable log lands in `not_measured`.
+
+**Measured and NOT changed on the same pass.** The `pg_stat_statements` survey
+that opened the cycle (the instrument #791 added) ranked the fuel-headroom
+detector's statement third by total time: `get_node_fuel_headroom`, 178 calls
+in 48 h at 92.6 ms mean, 274 ms max. Its plan re-joins `workflows` once per
+rollup row for the workflow NAME — a nested-loop index scan with `loops=33880`
+accounting for 67 760 of the statement's 70 342 buffer hits — and materialises
+the `scoped` CTE twice. An aggregate-first rewrite (group the rollup rows,
+take the ceiling with `(array_agg(max_fuel ORDER BY recorded_at DESC, max_fuel
+DESC))[1]`, join `workflows` once on the 59 grouped rows) measured **59 → 35 ms
+over five runs each, with row-for-row parity (59 rows, symmetric difference
+0)**. Declined as a package: it is 25 ms on a 15-minute background tick and
+one interactive report, and the remaining 35 ms is the 30-day window being 61%
+of a 55 606-row table plus a hash of all 10 888 `workflow_executions` for the
+`is_test_execution` exclusion — neither of which a rewrite moves. Recorded so
+the rewrite is not re-derived. `LowCacheHitRate` was observed `pending` after
+the deploy and its two-day history read: four `pending` stretches, zero
+`firing` — the worker's compiled-module cache is cold after every restart and
+the ratio recovers inside the rule's `for: 10m`. Benign, stated.
+
+**Guards.** `controller/tests/admin_event_visibility_tests` (CTRL_TESTS)
+gained three tests driving the real MCP dispatch: the own-actions view returns
+exactly the caller's rows with a second tenant's row as the CONTROL and
+`resource_present` true / false / null on a live, a deleted and a bulk event;
+`all_users` is refused for a `*`-capability agent whose user is not a platform
+admin and admitted once the column flips, reaching the NULL-user system row
+that the own view never shows; the actor summary renders the actor's own
+ceiling-change event and not another actor's. **Five mutations, worst blast
+radius first, five caught at the exact assertion**: the user predicate dropped
+(cross-tenant leak — 4 rows where 3 were the caller's, and the other tenant's
+control view); the platform-admin gate removed; `resource_present` pinned
+`true`; a deleted workflow reading as present; the actor summary reading
+another actor's events. **Two of the five had to be re-run**, and the reason
+is the #791 harness lesson in a new spelling: that entry says `shutil.copy`
+lost the mtime and a reverted file came back OLDER than the mutated build's
+fingerprint; this harness used `shutil.copy2`, which PRESERVES the original
+mtime — and that is the same file coming back older than the build. cargo
+kept the previous mutation's artefact, so the admin-gate run still carried the
+leak and the actor-summary run still carried the pinned `resource_present`,
+each "caught" partly by the wrong mutation, and the post-revert baseline ran
+RED. The rule is not "preserve the mtime" or "don't preserve it"; it is that
+a revert must leave the file NEWER than every build that saw the mutation —
+bump it. Re-run with the bump, both fail on exactly their own assertion and
+the baseline is green.
+The model-card block has no DB test — driving it needs an `ml_models` row
+resolved through the user-scoped registry — and shares the repository read the
+other two tests exercise; stated as a limit.
+

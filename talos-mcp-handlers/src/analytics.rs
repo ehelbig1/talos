@@ -456,6 +456,31 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
+            "name": "list_admin_events",
+            "description": "One page of the administrative audit log (admin_event_log), newest first: \
+                deletions, bulk archive/cleanup, ceiling changes, actor bindings, API-key lifecycle, \
+                ML policy/lifecycle changes, agent registrations — each with who performed it, when, \
+                the resource it was about, and whether that resource STILL EXISTS (resource_present: \
+                true / false / null=unknown). This is the ONLY surface for events about a resource that \
+                has since been deleted, for bulk events (resource_id null), and for resource types with \
+                no per-resource tool; events about a LIVE workflow / module / actor / ML model also \
+                appear on get_workflow_audit_trail / get_module_history / get_actor_summary / \
+                ml_get_model_card. Default scope is YOUR OWN actions (scope: own_actions). \
+                all_users=true is platform-admin only and is the only scope that reaches \
+                system-authored rows (user_id null). Paginate with limit/offset; has_more says \
+                whether another page exists.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "resource_type": { "type": "string", "description": "Only events about this resource type (writer vocabulary: workflow, module, actor, ml_model, api_key, mcp_agent, user, execution, system, worker_provisioning_token)." },
+                    "event_type": { "type": "string", "description": "Only this event type (e.g. workflow_deleted, actor_llm_tier_ceiling_set)." },
+                    "all_users": { "type": "boolean", "description": "Platform-admin only: every user's actions plus system-authored rows. Default false = your own actions." },
+                    "limit": { "type": "number", "description": "Page size (default 50, max 200)." },
+                    "offset": { "type": "number", "description": "Rows to skip (default 0, max 100000); ordering is created_at DESC, id DESC." }
+                }
+            }
+        }),
+        serde_json::json!({
             "name": "get_workflow_sla_report",
             "description": "SLA compliance report for a workflow. Compares actual success rate and \
                 latency percentiles (p50/p95/p99) against configurable targets. The success rate is \
@@ -748,6 +773,7 @@ pub async fn dispatch(
         "get_workflow_audit_trail" => {
             Some(handle_get_workflow_audit_trail(req_id, args, state, user_id).await)
         }
+        "list_admin_events" => Some(handle_list_admin_events(req_id, args, state, user_id).await),
         "get_workflow_sla_report" => {
             Some(handle_get_workflow_sla_report(req_id, args, state, user_id).await)
         }
@@ -1111,6 +1137,209 @@ async fn handle_get_health_dashboard(
 /// to 1 decimal. `None` (serialized as JSON null) when the window has no
 /// terminal executions at all — a rate over zero runs is meaningless and
 /// `0.0` would falsely read as "healthy".
+/// `list_admin_events` — the reader for the part of `admin_event_log` that no
+/// per-resource surface can reach (see the repository method's doc comment).
+///
+/// Tenancy: the default view is the CALLER's own actions, filtered on the
+/// event's `user_id` — the one column that binds a row to a tenant on a table
+/// with no RLS and no owner column. `all_users` is the platform-wide view,
+/// gated on `users.is_platform_admin` (the `query_paginated` /
+/// `get_secret_access_log` precedent), and refused rather than narrowed so an
+/// operator is never handed a quietly smaller answer than they asked for.
+///
+/// Every failure is an ERROR to the caller: an unreadable audit log must not
+/// render as an empty one (check 74's rule, check 88's class one table over).
+async fn handle_list_admin_events(
+    req_id: Option<serde_json::Value>,
+    args: &serde_json::Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    const DEFAULT_LIMIT: i64 = 50;
+    const MAX_LIMIT: i64 = 200;
+    const MAX_OFFSET: i64 = 100_000;
+
+    let limit = match args.get("limit") {
+        None | Some(serde_json::Value::Null) => DEFAULT_LIMIT,
+        Some(v) => match v.as_i64() {
+            Some(n) if (1..=MAX_LIMIT).contains(&n) => n,
+            Some(n) => {
+                return mcp_error(
+                    req_id,
+                    -32602,
+                    &format!("limit must be in [1, {MAX_LIMIT}], got {n}"),
+                )
+            }
+            None => {
+                let kind = crate::utils::json_type_name(v);
+                return mcp_error(
+                    req_id,
+                    -32602,
+                    &format!("limit must be an integer, got {kind}"),
+                );
+            }
+        },
+    };
+    let offset = match args.get("offset") {
+        None | Some(serde_json::Value::Null) => 0,
+        Some(v) => match v.as_i64() {
+            Some(n) if (0..=MAX_OFFSET).contains(&n) => n,
+            Some(n) => {
+                return mcp_error(
+                    req_id,
+                    -32602,
+                    &format!("offset must be in [0, {MAX_OFFSET}], got {n}"),
+                )
+            }
+            None => {
+                let kind = crate::utils::json_type_name(v);
+                return mcp_error(
+                    req_id,
+                    -32602,
+                    &format!("offset must be an integer, got {kind}"),
+                );
+            }
+        },
+    };
+    // A blank filter is NO filter (MCP-258's rule: never run `= '   '` and
+    // report zero rows); a non-string is a caller error, never silently ignored.
+    let optional_str = |key: &str| -> Result<Option<String>, JsonRpcResponse> {
+        match args.get(key) {
+            None | Some(serde_json::Value::Null) => Ok(None),
+            Some(serde_json::Value::String(raw)) => {
+                let t = raw.trim();
+                Ok(if t.is_empty() {
+                    None
+                } else {
+                    Some(t.to_string())
+                })
+            }
+            Some(v) => {
+                let kind = crate::utils::json_type_name(v);
+                Err(mcp_error(
+                    req_id.clone(),
+                    -32602,
+                    &format!("{key} must be a string, got {kind}"),
+                ))
+            }
+        }
+    };
+    let resource_type = match optional_str("resource_type") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let event_type = match optional_str("event_type") {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    let all_users = match args.get("all_users") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(v) => {
+            let kind = crate::utils::json_type_name(v);
+            return mcp_error(
+                req_id,
+                -32602,
+                &format!("all_users must be a boolean, got {kind}"),
+            );
+        }
+    };
+
+    if all_users {
+        // allow-benign-default: fail-CLOSED admin gate — a failed read denies
+        // the platform-wide view, costing the caller a refusal rather than
+        // granting anything (the second shape check 74's opt-out admits).
+        let is_platform_admin = state
+            .actor_repo
+            .is_platform_admin(user_id)
+            .await
+            .unwrap_or(false);
+        if !is_platform_admin {
+            return mcp_denied(
+                req_id,
+                -32601,
+                "list_admin_events with all_users=true requires platform-admin privileges: the \
+                 platform-wide view spans every tenant's administrative actions. Omit all_users \
+                 to list your own.",
+            );
+        }
+    }
+
+    let filter = talos_analytics_repository::AdminEventFilter {
+        acting_user: if all_users { None } else { Some(user_id) },
+        resource_type,
+        event_type,
+        // One extra row answers `has_more` without a second COUNT round trip.
+        limit: limit + 1,
+        offset,
+    };
+    let mut rows = match state.analytics_repo.list_admin_events(&filter).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!("list_admin_events: admin_event_log read failed: {:#}", e);
+            return crate::utils::mcp_failed(
+                req_id,
+                -32000,
+                "Could not read admin_event_log — this is a database failure, NOT an empty \
+                 audit trail. Retry, and check controller logs.",
+            );
+        }
+    };
+    let has_more = rows.len() as i64 > limit;
+    rows.truncate(limit as usize);
+
+    let events: Vec<serde_json::Value> = rows
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "admin_event_id": r.id.to_string(),
+                "event_type": r.event_type,
+                "resource_type": r.resource_type,
+                "resource_id": r.resource_id.map(|u| u.to_string()),
+                "resource_present": r.resource_present,
+                "summary": r.summary,
+                "details": r.details,
+                "by_user_id": r.user_id.map(|u| u.to_string()),
+                "timestamp": r.created_at.to_rfc3339(),
+            })
+        })
+        .collect();
+    let (scope, scope_note) = if all_users {
+        (
+            "all_users",
+            "Every user's administrative actions, plus system-authored rows (by_user_id null — \
+             e.g. the CLI's worker-provisioning-token audit). Platform-admin view.",
+        )
+    } else {
+        (
+            "own_actions",
+            "Actions YOU performed. Actions a platform admin took on your resources appear on \
+             that resource's own surface (get_workflow_audit_trail / get_module_history / \
+             get_actor_summary / ml_get_model_card), and system-authored rows are visible only \
+             with all_users=true.",
+        )
+    };
+    let envelope = serde_json::json!({
+        "scope": scope,
+        "scope_note": scope_note,
+        "count": events.len(),
+        "has_more": has_more,
+        "limit": limit,
+        "offset": offset,
+        "filters": { "resource_type": filter.resource_type, "event_type": filter.event_type },
+        "resource_present_legend": {
+            "true": "the resource this event is about still exists",
+            "false": "it has since been deleted — this event is its remaining trace",
+            "null": "unknown: a bulk event with no resource_id, or a resource type this reader does not check",
+        },
+        "events": events,
+    });
+    mcp_text(
+        req_id,
+        &serde_json::to_string_pretty(&envelope).unwrap_or_default(),
+    )
+}
+
 pub(crate) fn failure_rate_pct(failed: i64, completed: i64) -> Option<f64> {
     let total = failed + completed;
     if total <= 0 || failed < 0 || completed < 0 {

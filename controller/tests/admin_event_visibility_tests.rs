@@ -200,3 +200,263 @@ async fn the_never_written_audit_events_table_is_gone() {
     .unwrap();
     assert_eq!(n, 3);
 }
+
+/// The 65% of `admin_event_log` no per-resource surface can reach — events
+/// about DELETED resources, bulk events with no `resource_id`, resource types
+/// with no tool — has one reader, and its default view is the caller's OWN
+/// actions. A second user's events must not leak into it (the table has no RLS
+/// and no owner column; the event's `user_id` is the tenancy bind).
+#[tokio::test]
+async fn list_admin_events_lists_the_callers_own_actions_and_says_what_still_exists() {
+    let ctx = setup_test_context().await;
+    let pool = ctx.db_pool.clone();
+    let me = create_test_user(&ctx.auth_service, "admin_events_list_me@example.com").await;
+    let other = create_test_user(&ctx.auth_service, "admin_events_list_other@example.com").await;
+    let live_wf = create_test_workflow(&pool, me, "admin-events-live-wf").await;
+    let deleted_wf = Uuid::new_v4(); // never existed in this clone = "deleted"
+    seed_admin_event(
+        &pool,
+        me,
+        "workflow_deleted",
+        "workflow",
+        deleted_wf,
+        "deleted it",
+    )
+    .await;
+    seed_admin_event(
+        &pool,
+        me,
+        "workflow_actor_binding_changed",
+        "workflow",
+        live_wf,
+        "bound it",
+    )
+    .await;
+    // A bulk event: resource_id NULL — presence is UNKNOWN, never false.
+    sqlx::query(
+        "INSERT INTO admin_event_log (user_id, event_type, resource_type, resource_id, summary) \
+         VALUES ($1, 'workflows_bulk_deleted', 'workflow', NULL, 'bulk')",
+    )
+    .bind(me)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // CONTROL: the other tenant's action must not appear in my view.
+    seed_admin_event(
+        &pool,
+        other,
+        "module_deleted",
+        "module",
+        Uuid::new_v4(),
+        "theirs",
+    )
+    .await;
+
+    let state = mcp_state(pool.clone()).await;
+    let resp = controller::mcp::analytics::dispatch(
+        "list_admin_events",
+        Some(serde_json::json!(1)),
+        &serde_json::json!({}),
+        &state,
+        agent(me),
+    )
+    .await
+    .expect("list_admin_events is dispatched");
+    let body = text_json(&resp);
+    assert_eq!(body["scope"], Value::String("own_actions".into()), "{body}");
+    let evs = events(&body);
+    assert_eq!(
+        evs.len(),
+        3,
+        "exactly my three events, not the other tenant's: {body}"
+    );
+    assert!(
+        evs.iter()
+            .all(|e| e["by_user_id"] == Value::String(me.to_string())),
+        "every row is mine: {body}"
+    );
+    let by_type = |t: &str| {
+        evs.iter()
+            .find(|e| e["event_type"] == Value::String(t.into()))
+            .unwrap_or_else(|| panic!("event {t} missing: {body}"))
+    };
+    assert_eq!(
+        by_type("workflow_deleted")["resource_present"],
+        Value::Bool(false)
+    );
+    assert_eq!(
+        by_type("workflow_actor_binding_changed")["resource_present"],
+        Value::Bool(true)
+    );
+    assert_eq!(
+        by_type("workflows_bulk_deleted")["resource_present"],
+        Value::Null
+    );
+    assert_eq!(body["has_more"], Value::Bool(false));
+
+    // The other tenant sees exactly their own row.
+    let resp = controller::mcp::analytics::dispatch(
+        "list_admin_events",
+        Some(serde_json::json!(2)),
+        &serde_json::json!({ "resource_type": "module" }),
+        &state,
+        agent(other),
+    )
+    .await
+    .unwrap();
+    let body = text_json(&resp);
+    let evs = events(&body);
+    assert_eq!(evs.len(), 1, "{body}");
+    assert_eq!(evs[0]["by_user_id"], Value::String(other.to_string()));
+}
+
+/// `all_users` is the platform-wide view: refused for an ordinary tenant (the
+/// agent identity here carries `*`, and that is deliberately NOT enough — the
+/// gate is `users.is_platform_admin`, the `get_secret_access_log` precedent),
+/// and the only view that reaches system-authored rows with a NULL `user_id`.
+#[tokio::test]
+async fn list_admin_events_all_users_is_platform_admin_only_and_reaches_system_rows() {
+    let ctx = setup_test_context().await;
+    let pool = ctx.db_pool.clone();
+    let me = create_test_user(&ctx.auth_service, "admin_events_all_me@example.com").await;
+    let other = create_test_user(&ctx.auth_service, "admin_events_all_other@example.com").await;
+    seed_admin_event(
+        &pool,
+        other,
+        "module_deleted",
+        "module",
+        Uuid::new_v4(),
+        "theirs",
+    )
+    .await;
+    // System-authored (the CLI's worker-provisioning-token audit writes NULL).
+    sqlx::query(
+        "INSERT INTO admin_event_log (user_id, event_type, resource_type, resource_id, summary) \
+         VALUES (NULL, 'worker_provisioning_token_minted', 'worker_provisioning_token', $1, 'minted')",
+    )
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let state = mcp_state(pool.clone()).await;
+    let args = serde_json::json!({ "all_users": true });
+    let resp = controller::mcp::analytics::dispatch(
+        "list_admin_events",
+        Some(serde_json::json!(1)),
+        &args,
+        &state,
+        agent(me),
+    )
+    .await
+    .unwrap();
+    // A refusal is an MCP tool error (`isError: true`, code -32601 — the
+    // denied kind), not a JSON-RPC transport error.
+    let denied = resp
+        .result
+        .as_ref()
+        .map(|r| r["isError"] == Value::Bool(true) && r["errorCode"] == serde_json::json!(-32601))
+        .unwrap_or(false);
+    assert!(
+        denied,
+        "a non-platform-admin must be REFUSED, not narrowed: {:?}",
+        resp.result
+    );
+
+    // CONTROL: my own view never includes either row.
+    let resp = controller::mcp::analytics::dispatch(
+        "list_admin_events",
+        Some(serde_json::json!(2)),
+        &serde_json::json!({}),
+        &state,
+        agent(me),
+    )
+    .await
+    .unwrap();
+    assert_eq!(events(&text_json(&resp)).len(), 0);
+
+    sqlx::query("UPDATE users SET is_platform_admin = true WHERE id = $1")
+        .bind(me)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let resp = controller::mcp::analytics::dispatch(
+        "list_admin_events",
+        Some(serde_json::json!(3)),
+        &args,
+        &state,
+        agent(me),
+    )
+    .await
+    .unwrap();
+    let body = text_json(&resp);
+    assert_eq!(body["scope"], Value::String("all_users".into()), "{body}");
+    let evs = events(&body);
+    assert_eq!(
+        evs.len(),
+        2,
+        "the other tenant's row AND the system row: {body}"
+    );
+    assert!(
+        evs.iter().any(|e| e["by_user_id"].is_null()
+            && e["resource_type"] == Value::String("worker_provisioning_token".into())),
+        "the NULL-user system row is reachable only here: {body}"
+    );
+}
+
+/// The actor summary shows the ceilings' CURRENT values; the admin events say
+/// who moved them and when.
+#[tokio::test]
+async fn the_actor_summary_renders_admin_actions_on_that_actor() {
+    let ctx = setup_test_context().await;
+    let pool = ctx.db_pool.clone();
+    let user = create_test_user(&ctx.auth_service, "admin_events_actor@example.com").await;
+    let actor_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO actors (id, user_id, name) VALUES ($1, $2, 'admin-events-actor')")
+        .bind(actor_id)
+        .bind(user)
+        .execute(&pool)
+        .await
+        .expect("seed actor");
+    seed_admin_event(
+        &pool,
+        user,
+        "actor_llm_tier_ceiling_set",
+        "actor",
+        actor_id,
+        "tier2 -> tier1",
+    )
+    .await;
+    // CONTROL: another actor's event stays off this summary.
+    seed_admin_event(
+        &pool,
+        user,
+        "actor_write_ceiling_set",
+        "actor",
+        Uuid::new_v4(),
+        "other",
+    )
+    .await;
+
+    let state = mcp_state(pool.clone()).await;
+    let resp = controller::mcp::actor::dispatch(
+        "get_actor_summary",
+        Some(serde_json::json!(1)),
+        &serde_json::json!({ "actor_id": actor_id.to_string() }),
+        &state,
+        agent(user),
+    )
+    .await
+    .expect("get_actor_summary is dispatched");
+    let body = text_json(&resp);
+    let admin = body["admin_events"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{body}"));
+    assert_eq!(admin.len(), 1, "{body}");
+    assert_eq!(
+        admin[0]["admin_event_type"],
+        Value::String("actor_llm_tier_ceiling_set".into())
+    );
+    assert_eq!(admin[0]["by_user_id"], Value::String(user.to_string()));
+    assert_eq!(body["admin_events_unreadable"], Value::Bool(false));
+}
