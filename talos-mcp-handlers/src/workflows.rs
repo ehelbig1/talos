@@ -3347,7 +3347,7 @@ async fn handle_test_workflow_draft(
             // Draft/test path — no durable execution to key provenance to.
             None,
             // Explicit caller opt-in (a test invocation) → Full scope.
-            talos_workflow_repository::MemoryScope::Full,
+            talos_actor_memory_service::MemoryScope::Full,
         )
         .await;
     }
@@ -7115,17 +7115,16 @@ async fn handle_trigger_workflow_as_actors(
         // Build per-actor input: shared input + optionally injected actor memories
         // Uses workflow description as relevance hint for semantic matching.
         let per_actor_input = if inject_memory {
-            match state
-                .workflow_repo
-                .get_relevant_actor_context(
-                    actor_id,
-                    max_memories,
-                    wf_record.description.as_deref(),
-                    None,
-                    // Per-actor auto-injection → curated scope (secure default).
-                    talos_workflow_repository::MemoryScope::Curated,
-                )
-                .await
+            match talos_actor_memory_service::actor_context::get_relevant_actor_context(
+                &state.workflow_repo,
+                actor_id,
+                max_memories,
+                wf_record.description.as_deref(),
+                None,
+                // Per-actor auto-injection → curated scope (secure default).
+                talos_actor_memory_service::MemoryScope::Curated,
+            )
+            .await
             {
                 Ok(context) if !context.is_empty() => {
                     let mut merged = shared_input.as_object().cloned().unwrap_or_default();
@@ -7915,7 +7914,7 @@ async fn handle_test_workflow(
             // Test path — no durable execution to key provenance to.
             None,
             // Explicit caller opt-in (a test invocation) → Full scope.
-            talos_workflow_repository::MemoryScope::Full,
+            talos_actor_memory_service::MemoryScope::Full,
         )
         .await;
     }

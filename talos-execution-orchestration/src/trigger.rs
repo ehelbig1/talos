@@ -361,9 +361,9 @@ impl ExecutionOrchestrationService {
             wf_record.actor_id
         };
         let inject_scope = if explicit {
-            talos_workflow_repository::MemoryScope::Full
+            talos_actor_memory_service::MemoryScope::Full
         } else {
-            talos_workflow_repository::MemoryScope::Curated
+            talos_actor_memory_service::MemoryScope::Curated
         };
         talos_actor_memory_service::inject_actor_context_into_input(
             &self.workflow_repo,
@@ -714,8 +714,9 @@ impl ExecutionOrchestrationService {
                             "node_outputs": &output_json,
                             "captured_at": chrono::Utc::now().to_rfc3339(),
                         });
-                        if let Err(e) = workflow_repo_for_task
-                            .upsert_scratchpad_trace(
+                        if let Err(e) =
+                            talos_actor_memory_service::actor_context::upsert_scratchpad_trace(
+                                &workflow_repo_for_task,
                                 actor_id,
                                 &scratchpad_trace_key(execution_id),
                                 &trace_value,

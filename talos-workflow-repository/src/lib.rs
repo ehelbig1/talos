@@ -11,7 +11,6 @@ use std::collections::HashMap;
 use talos_dlp_provider::bound_execution_payload;
 use uuid::Uuid;
 
-mod actor_context;
 mod executions;
 mod graph_export;
 mod search;
@@ -19,7 +18,6 @@ mod stats;
 mod templates;
 mod workflows;
 
-pub use actor_context::MemoryScope;
 pub use executions::*;
 pub use graph_export::*;
 pub use search::*;
@@ -57,6 +55,14 @@ pub struct WorkflowRepository {
 }
 
 impl WorkflowRepository {
+    /// The pool this repository reads and writes through — for the actor-context
+    /// assembly that moved to `talos-actor-memory-service` (2026-09-12), whose
+    /// statements run on the same connection pool but whose memory / graph-RAG
+    /// dependencies do not belong in a persistence crate.
+    pub fn pool(&self) -> &PgPool {
+        &self.db_pool
+    }
+
     pub fn new(db_pool: PgPool) -> Self {
         Self {
             db_pool,

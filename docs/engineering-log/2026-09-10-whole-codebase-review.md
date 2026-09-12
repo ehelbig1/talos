@@ -2811,3 +2811,62 @@ functions) and `talos-memory-ranking` (one) — a repository reaching into
 services. Seven such repository→non-data edges exist across the workspace
 today; a layering lint's precision is unmeasured and the refactor is a
 package of its own.
+
+## Package AI — a persistence crate that reached into three services (2026-09-12)
+
+Package AG's first attempt placed the shared workflow-failure finalizer in
+`talos-workflow-repository` and had `talos-actor-repository` call it;
+`cargo check` refused: `talos-actor-repository → talos-workflow-repository →
+talos-graph-rag → talos-actor-repository`. A repository depended on a
+service that depended on another repository. AG took the leaf-crate exit;
+this package asks why the edge existed.
+
+**One module.** Grepping the workflow repository for `talos_graph_rag::`,
+`talos_memory::` and `talos_memory_ranking::` finds every use in a single
+file, `actor_context.rs` — the actor-context assembly: recent-memory recall
+and semantic recall (`talos-memory`, four functions), graph-RAG entity
+context (`GRAPH_SERVICE`, two sites), learned ranking weights
+(`talos-memory-ranking`, one), plus the `MemoryScope` enum that every
+caller imports. Four methods in an `impl WorkflowRepository` block, there
+because the assembly reads `workflow_executions` through the repository's
+pool and the file predates the service crates. Callers: `talos-engine`'s
+sub-actor context resolver, the scheduler, `talos-mcp-handlers` (two), the
+execution orchestration's scratchpad trace, and `talos-actor-memory-service`
+itself.
+
+**The move.** `talos-actor-memory-service` already depended on
+`talos-memory`, `talos-graph-rag` and `talos-workflow-repository`; it is the
+crate whose name describes the module. The file moved there verbatim with
+three mechanical changes: `impl WorkflowRepository { … &self … }` became
+free functions taking `repo: &WorkflowRepository`; nine `self.db_pool`
+reads became `repo.pool()` through a new one-line public accessor (a
+persistence crate exposing its pool to the service layer is the correct
+direction); and the four sibling method calls became free-function calls.
+`MemoryScope` is re-exported from the service; six importers and six call
+sites were rewired (`&Arc<WorkflowRepository>` deref-coerces to
+`&WorkflowRepository` at a function argument, so no receiver needed `&*`).
+The scheduler gained a dependency on the service — no cycle, the service
+depends on nothing that depends on the scheduler. The repository's
+manifest lost `talos-graph-rag`, `talos-memory` and `talos-memory-ranking`,
+and `chrono`, `talos-config` and `talos-memory-ranking` moved to the
+service's manifest with the code that used them.
+
+**Guards.** `layering_pins` in the service (`include_str!` over the
+repository's `Cargo.toml` and `lib.rs`): none of the three dependencies may
+return, the module may not reappear. Mutation: reinstating the graph-rag
+line fails the pin. Behaviour is unchanged by construction — same
+statements, same pool, same callers — and the module's own unit tests moved
+with it; the two controller DB binaries that exercise actor context
+(`claim_read_disclosure_tier4_tests`, `report_quality_signals_tests`) re-ran
+green against the migrated template.
+
+**Not done, stated.** Six other repository→non-data edges exist:
+`talos-advanced-repository` and `talos-analytics-repository` depend on
+`talos-child-workflow-refs`, `talos-child-run-ledger`,
+`talos-draft-heuristics` and `talos-retry-intelligence`;
+`talos-ops-alerts-repository` on `talos-actor-repository`;
+`talos-actor-repository` on `talos-memory`. Each is a judgement about what
+counts as a leaf (`child-workflow-refs` is a scan over `graph_json`, arguably
+data; `retry-intelligence` is not), none has produced a cycle, and a lint
+would ship at seven markers of unmeasured precision. Recorded so the next
+cycle starts from the list rather than the grep.
