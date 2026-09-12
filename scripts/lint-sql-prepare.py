@@ -339,14 +339,57 @@ class Resolver:
         return None, 'expr'
 
 
+def blank_comments(src):
+    """Replace `//` line comments (outside string literals) with spaces of the
+    same length, so offsets and line numbers are preserved. A call quoted in
+    prose is not a call: three of the 45 "dynamic" sites on 2026-09-12 were
+    comment lines that mentioned `sqlx::query(...)`."""
+    out, i, n = [], 0, len(src)
+    while i < n:
+        c = src[i]
+        if c == '"' or (c == 'r' and re.match(r'r#*"', src[i:])):
+            lit, end = read_literal(src, i)
+            if lit is None:
+                out.append(src[i:]); break
+            out.append(src[i:end]); i = end; continue
+        if src.startswith('//', i):
+            j = src.find('\n', i); j = n if j < 0 else j
+            out.append(' ' * (j - i)); i = j; continue
+        out.append(c); i += 1
+    return ''.join(out)
+
+
+LET_INIT = r'\blet\s+(?:mut\s+)?{name}\s*(?::\s*[^=]+?)?=\s*'
+
+
+def local_initializer(src, call_pos, name):
+    """The initializer expression of the nearest `let <name> = …;` ABOVE the
+    call, within the same function (the walk stops at a `fn` header). Same-
+    function, same-file, nearest-wins — a textual proxy for the binding, which
+    is right for the `let sql = "…"; sqlx::query(sql)` idiom and wrong only in
+    the loud direction (a shadowed name resolves to the nearer binding)."""
+    head = src[:call_pos]
+    fn_pos = max((m.end() for m in re.finditer(r'\bfn\s+[a-z_][a-z0-9_]*\s*[<(]', head)), default=0)
+    region = head[fn_pos:]
+    best = None
+    for m in re.finditer(LET_INIT.format(name=re.escape(name)), region):
+        best = m
+    if best is None:
+        return None
+    start = fn_pos + best.end()
+    end = Resolver._expr_end(src, start)
+    return src[start:end] if end is not None else None
+
+
 def scan(path):
-    src = open(path, encoding='utf-8', errors='replace').read()
+    raw = open(path, encoding='utf-8', errors='replace').read()
+    src = blank_comments(raw)
     lines = src.split('\n')
     resolver = Resolver(src)
     for m in CALL.finditer(src):
         line = src.count('\n', 0, m.start()) + 1
         lo = max(0, line - 1 - MARKER_WINDOW)
-        if any(MARKER in l for l in lines[lo:line]):
+        if any(MARKER in l for l in raw.split('\n')[lo:line]):
             yield {'file': path, 'line': line, 'marked': True}
             continue
         lit, why = read_literal(src, m.end())
@@ -356,6 +399,17 @@ def scan(path):
         else:
             arg = first_argument(src, m.end())
             val, kind = (resolver.resolve(arg) if arg is not None else (None, why))
+            if val is None and arg is not None:
+                # A lower-case local: follow its nearest same-function `let`.
+                lm = re.match(r'^&?\s*([a-z_][a-z0-9_]*)\s*$', arg.strip())
+                if lm:
+                    init = local_initializer(src, m.start(), lm.group(1))
+                    if init is not None:
+                        v2, k2 = resolver.resolve(init)
+                        if v2 is not None:
+                            val, kind = v2, 'let:' + k2
+                        else:
+                            kind = 'let:' + k2
             if val is not None:
                 rec['sql'] = val
                 rec['resolved'] = kind
@@ -397,6 +451,13 @@ fn f(live: &str) {
     sqlx::query(&format!("SELECT {} FROM t7", live));
     sqlx::query(&format!("SELECT x FROM t8 {live}"));
     sqlx::query(&sql);
+    // sqlx::query("SELECT prose FROM t9") — a call quoted in a comment is not a call
+    let local_lit = "SELECT l FROM t10 WHERE a = $1";
+    sqlx::query(local_lit);
+    let local_fmt = format!("SELECT {COLS} FROM t11");
+    sqlx::query(&local_fmt);
+    let local_dyn = format!("SELECT {} FROM t12", live);
+    sqlx::query(&local_dyn);
 }
 """
 
@@ -407,9 +468,13 @@ EXPECT = {
     'SELECT 1 FROM t4': 'const',
     'SELECT a, b FROM t5': 'concat!',
     'SELECT id, name FROM t6 WHERE a = $1': 'format!',
+    'SELECT l FROM t10 WHERE a = $1': 'let:literal',
+    'SELECT id, name FROM t11': 'let:format!',
 }
-# `&sql` is a lower-case local: not a const, not a macro — `expr`, as before.
-EXPECT_DYNAMIC = ['format!-args', 'format!-placeholder', 'expr']
+# `&sql` is a lower-case local with no same-function `let`: `expr`, as before;
+# `local_dyn`'s `let` is a positional `format!`, so it stays dynamic with the
+# reason prefixed `let:`. The commented-out call must not appear at all.
+EXPECT_DYNAMIC = ['format!-args', 'format!-placeholder', 'expr', 'let:format!-args']
 
 
 def self_test():
