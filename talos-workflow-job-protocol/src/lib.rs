@@ -868,7 +868,10 @@ impl DispatchSigner {
 /// `TALOS_CONTROLLER_SIGNING_KEY` is present. A requested-but-misconfigured
 /// setup logs an error and returns `None` (fall back to HMAC, which the
 /// dual-verify worker still accepts, so a bad key can't strand dispatch during
-/// rollout). Single source of truth for ALL controller sign sites (engine
+/// rollout — OUTSIDE production; since 2026-09-12 the controller's boot gate
+/// `talos_engine::nats_run::enforce_production_dispatch_scheme_posture` refuses
+/// that state in production unless acknowledged). Single source of truth for
+/// ALL controller sign sites (engine
 /// dispatcher, retry re-sign, module-push paths) so the scheme can't diverge
 /// between them.
 ///

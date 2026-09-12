@@ -384,6 +384,11 @@ controller:
     #      downgrade (no-secret nodes still run). Rollback at any step:
     #      revert the values and upgrade; "off" is byte-identical legacy.
     # TALOS_DISPATCH_SCHEME: "ed25519"
+    #   Production refuses to BOOT when this (or claim-based
+    #   TALOS_ENVELOPE_SEALING) is set and TALOS_CONTROLLER_SIGNING_KEY is
+    #   absent or invalid — the key must land in the bootstrap Secret BEFORE
+    #   the scheme is enabled (the installer's phase C does both). Escape:
+    #   TALOS_ALLOW_DISPATCH_SCHEME_FALLBACK=1 (logged at ERROR).
     # Static registry of worker Ed25519 public keys (worker_id=hex pairs,
     # comma-separated). Alternative: dynamic self-registration via
     # controller.workerRegistration + networkPolicy.workerRegistrationIngress.

@@ -138,12 +138,13 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | `TALOS_RPC_REQUIRE_ED25519` | unset | both | Require Ed25519-signed NATS-RPC auth | 🔒 |
 | `TALOS_RPC_GUEST_ROLE` | unset (guest SQL runs as the app user) | controller | Postgres role the `database`-world SQL sandbox runs guest statements under (`SET LOCAL ROLE`, `talos-rpc-subscribers`); `talos_guest` ships with **no** table grants, so an operator grants what modules may read. Not about RPC authentication — every NATS-RPC message is HMAC/Ed25519-signed regardless. In production `enforce_production_db_sandbox_posture` refuses to boot without it unless `TALOS_ALLOW_UNSCOPED_DB_SANDBOX` is set. | 🔒 |
 | `TALOS_ALLOW_UNSCOPED_DB_SANDBOX` | unset | controller | Allow unscoped DB access in the SQL sandbox | 🔒 |
+| `TALOS_ALLOW_DISPATCH_SCHEME_FALLBACK` | unset | controller | Production opt-out for the dispatch-scheme posture gate: acknowledge booting with `TALOS_DISPATCH_SCHEME=ed25519` / claim-based sealing requested but no usable `TALOS_CONTROLLER_SIGNING_KEY` (dispatch then runs on the fleet-shared HMAC key; logged at ERROR as `dispatch_scheme_downgraded_in_production`). `1`/`true`/`yes`/`on`. Never set it on a fleet whose workers run `TALOS_DISPATCH_REQUIRE_ED25519` — they refuse every dispatch | 🔒 (posture) |
 
 ### Controller↔worker dispatch trust (signing keys)
 
 | Variable | Default | Component | Purpose | Sensitive |
 |---|---|---|---|---|
-| `TALOS_CONTROLLER_SIGNING_KEY` | none — read only when `TALOS_DISPATCH_SCHEME=ed25519`; unset/invalid there ⇒ ONE boot ERROR and dispatch FALLS BACK to HMAC (not refused). Workers running `TALOS_DISPATCH_REQUIRE_ED25519` then refuse every dispatch | controller | Ed25519 seed (hex) signing job dispatch + SealedSecrets | 🔒 |
+| `TALOS_CONTROLLER_SIGNING_KEY` | none — read only when `TALOS_DISPATCH_SCHEME=ed25519` (or claim-based `TALOS_ENVELOPE_SEALING`). Unset/invalid there ⇒ outside production ONE boot ERROR and dispatch FALLS BACK to HMAC; in PRODUCTION the controller REFUSES TO BOOT (`enforce_production_dispatch_scheme_posture`, since 2026-09-12) unless `TALOS_ALLOW_DISPATCH_SCHEME_FALLBACK=1` | controller | Ed25519 seed (hex) signing job dispatch + SealedSecrets | 🔒 |
 | `TALOS_CONTROLLER_PUBLIC_KEY` / `_PREVIOUS` | none | worker | Controller Ed25519 verify key(s) | 🔒 |
 | `TALOS_WORKER_SIGNING_KEY` | none | worker | Worker Ed25519 signing key | 🔒 |
 | `TALOS_WORKER_PUBLIC_KEYS` | none | controller | Worker Ed25519 public keys (static fleet identity) for result verification | 🔒 |

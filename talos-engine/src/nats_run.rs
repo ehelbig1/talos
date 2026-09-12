@@ -382,7 +382,8 @@ fn resolve_dispatch_signer() -> Option<talos_workflow_job_protocol::DispatchSign
             (None, true) => tracing::error!(
                 target: "talos_security",
                 "TALOS_DISPATCH_SCHEME=ed25519 but TALOS_CONTROLLER_SIGNING_KEY is unset/invalid \
-                 — falling back to HMAC dispatch signing"
+                 — falling back to HMAC dispatch signing (a PRODUCTION boot refuses this state: \
+                 see enforce_production_dispatch_scheme_posture)"
             ),
             (None, false) => {}
         }
@@ -499,4 +500,190 @@ pub async fn run_with_trigger_input_via_nats(
             execution_id,
         )
         .await
+}
+
+/// Production fail-closed posture for the dispatch-signing SCHEME (2026-09-12,
+/// package AM). Pure decision so it can be tested without env.
+///
+/// [`configured_dispatch_signer`](talos_workflow_job_protocol::configured_dispatch_signer)
+/// deliberately returns `None` when `TALOS_DISPATCH_SCHEME=ed25519` is set but
+/// `TALOS_CONTROLLER_SIGNING_KEY` is unset or unparsable, so that "a bad key
+/// can't strand dispatch during rollout" — and every sign site then falls back
+/// to the fleet-shared HMAC path with ONE boot `ERROR` from
+/// `resolve_dispatch_signer`. That is the right shape for a dev box and the
+/// wrong one for production: an operator who REQUESTED Ed25519 dispatch (or
+/// turned claim-based envelope sealing on, which needs the same key to sign
+/// `SealedSecrets`) has a control that switched itself off on a typo, visible
+/// only as one log line among the boot noise, while every worker still on the
+/// dual-verify (phase-C) posture accepts the downgraded dispatch. The house
+/// rule the local-LLM gate wrote applies here: an unusable value must not
+/// silently switch a control off.
+///
+/// * Outside production → `Ok(true)`: the rollout-safety fallback stands.
+/// * A usable signer → `Ok(true)`.
+/// * Neither Ed25519 requested nor sealing on → `Ok(true)`: HMAC by choice.
+/// * Otherwise → `Err` (refuse to boot), unless the operator acknowledges the
+///   downgrade with `TALOS_ALLOW_DISPATCH_SCHEME_FALLBACK=1` → `Ok(false)`
+///   (boot, but log the acknowledged posture loudly — the RLS / sandbox gates'
+///   shape).
+///
+/// Boot-time is the right moment: the signer is resolved once per process from
+/// env (`OnceLock`), so nothing can repair it after boot, and a refusal here
+/// covers EVERY sign site — the engine dispatcher, the retry re-sign, the
+/// cancel path and the module-bound webhook/Gmail/GCal pushes — without a
+/// per-caller change.
+pub fn dispatch_scheme_posture_decision(
+    is_production: bool,
+    ed25519_requested: bool,
+    sealing: talos_envelope_seal::EnvelopeSealingMode,
+    signer_present: bool,
+    ack_fallback: bool,
+) -> Result<bool, String> {
+    if !is_production || signer_present {
+        return Ok(true);
+    }
+    let sealing_needs_signer = sealing.seals_claim_based();
+    if !ed25519_requested && !sealing_needs_signer {
+        return Ok(true);
+    }
+    if ack_fallback {
+        return Ok(false);
+    }
+    let demanded_by = match (ed25519_requested, sealing_needs_signer) {
+        (true, true) => "TALOS_DISPATCH_SCHEME=ed25519 and TALOS_ENVELOPE_SEALING (claim-based sealing signs SealedSecrets with the same key)",
+        (true, false) => "TALOS_DISPATCH_SCHEME=ed25519",
+        (false, true) => "TALOS_ENVELOPE_SEALING=audit|required (claim-based sealing signs SealedSecrets with the controller key)",
+        (false, false) => unreachable!("handled above"),
+    };
+    Err(format!(
+        "Ed25519 controller signing was requested by {demanded_by} but \
+         TALOS_CONTROLLER_SIGNING_KEY is unset or not a valid 64-hex Ed25519 seed — \
+         refusing to boot in production. Every dispatch would otherwise be signed under the \
+         fleet-shared HMAC key (and module-bound dispatch could not claim-seal), i.e. a \
+         requested control switched itself off on a misconfiguration. Fix by one of: (a) set \
+         TALOS_CONTROLLER_SIGNING_KEY to the seed printed by `controller \
+         generate-worker-trust-keypair --role controller`; (b) run HMAC deliberately by unsetting \
+         TALOS_DISPATCH_SCHEME and TALOS_ENVELOPE_SEALING; (c) set \
+         TALOS_ALLOW_DISPATCH_SCHEME_FALLBACK=1 to acknowledge the downgrade for this boot."
+    ))
+}
+
+/// Boot-time wrapper over [`dispatch_scheme_posture_decision`]: reads the env,
+/// resolves the signer once (the same `OnceLock` every sign site reads), and
+/// refuses to boot in production when a requested Ed25519 posture has no usable
+/// key. No-op outside production. Call from the controller bootstrap beside
+/// `enforce_production_rls_posture` / `enforce_production_db_sandbox_posture`.
+pub fn enforce_production_dispatch_scheme_posture(is_production: bool) -> anyhow::Result<()> {
+    let ed25519_requested = std::env::var("TALOS_DISPATCH_SCHEME")
+        .map(|s| s.trim().eq_ignore_ascii_case("ed25519"))
+        .unwrap_or(false);
+    let sealing = talos_envelope_seal::EnvelopeSealingMode::from_env();
+    let signer_present = talos_workflow_job_protocol::configured_dispatch_signer().is_some();
+    let ack = matches!(
+        std::env::var("TALOS_ALLOW_DISPATCH_SCHEME_FALLBACK")
+            .ok()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("1") | Some("true") | Some("yes") | Some("on")
+    );
+    match dispatch_scheme_posture_decision(
+        is_production,
+        ed25519_requested,
+        sealing,
+        signer_present,
+        ack,
+    ) {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            tracing::error!(
+                target: "talos_security",
+                event_kind = "dispatch_scheme_downgraded_in_production",
+                ed25519_requested,
+                sealing = ?sealing,
+                "Ed25519 controller signing was requested but no usable TALOS_CONTROLLER_SIGNING_KEY \
+                 is configured; dispatch runs on the fleet-shared HMAC key, accepted via \
+                 TALOS_ALLOW_DISPATCH_SCHEME_FALLBACK. Workers on TALOS_DISPATCH_REQUIRE_ED25519 \
+                 will refuse every dispatch until the key is fixed."
+            );
+            Ok(())
+        }
+        Err(e) => Err(anyhow::anyhow!(e)),
+    }
+}
+
+#[cfg(test)]
+mod dispatch_scheme_posture_tests {
+    use super::dispatch_scheme_posture_decision as decide;
+    use talos_envelope_seal::EnvelopeSealingMode as M;
+
+    #[test]
+    fn outside_production_the_rollout_fallback_stands() {
+        assert_eq!(decide(false, true, M::Required, false, false), Ok(true));
+        assert_eq!(decide(false, false, M::Off, false, false), Ok(true));
+    }
+
+    #[test]
+    fn a_usable_signer_always_passes() {
+        assert_eq!(decide(true, true, M::Required, true, false), Ok(true));
+        assert_eq!(decide(true, false, M::Off, true, false), Ok(true));
+    }
+
+    #[test]
+    fn hmac_by_choice_passes_in_production() {
+        // Neither the scheme nor sealing asked for the key: today's default posture.
+        assert_eq!(decide(true, false, M::Off, false, false), Ok(true));
+    }
+
+    #[test]
+    fn a_requested_scheme_without_a_key_refuses_in_production() {
+        let err = decide(true, true, M::Off, false, false).unwrap_err();
+        assert!(err.contains("TALOS_DISPATCH_SCHEME=ed25519"), "{err}");
+        assert!(err.contains("TALOS_CONTROLLER_SIGNING_KEY"), "{err}");
+        assert!(
+            err.contains("TALOS_ALLOW_DISPATCH_SCHEME_FALLBACK"),
+            "{err}"
+        );
+        assert!(
+            !err.contains("TALOS_ENVELOPE_SEALING=audit"),
+            "sealing was off: {err}"
+        );
+    }
+
+    #[test]
+    fn claim_based_sealing_without_a_key_refuses_too() {
+        for mode in [M::Audit, M::Required] {
+            let err = decide(true, false, mode, false, false).unwrap_err();
+            assert!(err.contains("TALOS_ENVELOPE_SEALING"), "{err}");
+        }
+        let both = decide(true, true, M::Required, false, false).unwrap_err();
+        assert!(
+            both.contains("TALOS_DISPATCH_SCHEME=ed25519 and TALOS_ENVELOPE_SEALING"),
+            "{both}"
+        );
+    }
+
+    #[test]
+    fn the_acknowledgement_boots_but_is_reported_as_downgraded() {
+        assert_eq!(decide(true, true, M::Off, false, true), Ok(false));
+        assert_eq!(decide(true, false, M::Audit, false, true), Ok(false));
+        // The acknowledgement never turns a passing posture into a "downgraded" one.
+        assert_eq!(decide(true, true, M::Required, true, true), Ok(true));
+    }
+
+    /// Source pin (stated as textual): the gate is only worth its one caller.
+    /// The controller bootstrap must call the wrapper beside its two sibling
+    /// posture gates; a refactor that drops the line leaves every unit test
+    /// above green while production boots into the downgrade again.
+    #[test]
+    fn the_controller_bootstrap_calls_the_gate() {
+        let bootstrap = include_str!("../../controller/src/bootstrap/services.rs");
+        assert!(
+            bootstrap
+                .contains("enforce_production_dispatch_scheme_posture(config::is_production())"),
+            "controller/src/bootstrap/services.rs no longer calls the dispatch-scheme posture gate"
+        );
+        assert!(
+            bootstrap.contains("enforce_production_db_sandbox_posture(config::is_production())")
+        );
+    }
 }
