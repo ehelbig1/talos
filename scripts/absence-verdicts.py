@@ -152,7 +152,7 @@ SITES = [
     ("talos-mcp-handlers/src/search.rs", 629, "b", "Module-name batch lookup -> name: null beside a module_id that is still emitted. Ornament on an answer that stands without it; no count or ranking uses it."),
     ("talos-scheduler/src/lib.rs", 2083, "b", "THE MODEL SHAPE. Fence-epoch read is .ok().flatten() and is IMMEDIATELY followed by `if fence_epoch.is_none() { warn!(\"running unfenced\") }` with a comment stating why unfenced is acceptable. The absence is observable and the degradation is named."),
     ("talos-registry/src/sync.rs", 122, "b", "`which cosign` -> None -> falls back to Command::new(\"cosign\") (PATH walk). Verification still runs; only the PATH-pinning defense-in-depth is lost, and the doc comment says a resolution failure deliberately does not cache a sentinel so the next call retries."),
-    ("talos-node-cache/src/lib.rs", 145, "b", "Textbook cache case: a read error and a genuine miss both mean 'recompute the node', and the recompute is the correct answer either way."),
+    # talos-node-cache/src/lib.rs:145 — crate DELETED 2026-09-12 (nothing constructed it); entry removed.
     ("talos-workflow-repository/src/search.rs", 25, "b", "Exact execution-cache lookup: same argument."),
     ("talos-workflow-repository/src/search.rs", 82, "b", "Semantic execution-cache lookup: same argument."),
     ("talos-api/src/schema/platform/queries.rs", 103, "b", "granted_by_email: null decorates a CapabilityCeilingDetail whose ceiling/source/granted_at come from an already-error-checked query; nothing branches on the email, and null is what a deleted granter yields anyway."),

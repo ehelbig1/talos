@@ -98,9 +98,7 @@ add("talos-worker-runtime/src/host/vault.rs", [611, 719, 768], "c", "SecretProvi
     "providers. Checked rather than assumed because a failed slot release would leave secret "
     "material resident.")
 add("talos-worker-runtime/src/host/secrets.rs", [228], "c", "SecretProvider::release", "Same as vault.rs — infallible in every impl.")
-add("talos-node-cache/src/lib.rs", [154, 184], "c", "redis SETEX", "Cache hydration; a miss is free.")
-add("talos-node-cache/src/lib.rs", [208], "c", "sqlx INSERT node_result_cache",
-    "Cache hydration; already carries `// allow-sqlx-swallow` (check 10's opt-out).")
+# talos-node-cache/src/lib.rs:154,184,208 — crate DELETED 2026-09-12 (nothing constructed it); entries removed.
 add("talos-oauth/src/credentials.rs", [503], "c", "sqlx UPDATE integration_credentials",
     "Already carries `// allow-sqlx-swallow`; the chained `.map_err` logs the cause at WARN.")
 add("talos-worker-runtime/src/runtime.rs", [2558], "c", "redis SET EX", "Result cache hydration.")

@@ -48,7 +48,6 @@ pub mod module_executions;
 pub mod module_payload_encryption;
 pub mod module_repository;
 pub mod module_templates;
-pub mod node_cache;
 pub mod oauth;
 pub mod organizations;
 pub mod rate_limit;

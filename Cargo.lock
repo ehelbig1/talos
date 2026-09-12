@@ -1841,7 +1841,6 @@ dependencies = [
  "talos-module-repository",
  "talos-module-templates",
  "talos-nats-tls",
- "talos-node-cache",
  "talos-oauth",
  "talos-ops-alerts-repository",
  "talos-organizations",
@@ -8960,20 +8959,6 @@ version = "0.1.0"
 dependencies = [
  "async-nats",
  "futures",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "talos-node-cache"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "redis",
- "serde_json",
- "sha2 0.10.9",
- "sqlx",
- "talos-config",
  "tokio",
  "tracing",
 ]

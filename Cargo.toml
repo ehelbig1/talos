@@ -40,7 +40,6 @@ members = [
     "talos-nats-tls",
     "talos-tenancy",
     "talos-secrets-rotation",
-    "talos-node-cache",
     "talos-replay-guard",
     "talos-envelope-seal",
     "talos-worker-fleet",

@@ -215,9 +215,9 @@ Cache hydration; a miss is free.
 
 ### `sqlx INSERT node_result_cache` — 1 site(s)
 
-* `talos-node-cache/src/lib.rs:208`
+* `talos-node-cache/src/lib.rs:208` — **site removed 2026-09-12**: the crate was dead (no constructor anywhere) and was deleted with its table.
 
-Cache hydration; already carries `// allow-sqlx-swallow` (check 10's opt-out).
+Cache hydration; carried `// allow-sqlx-swallow` (check 10's opt-out).
 
 ### `sqlx UPDATE integration_credentials` — 1 site(s)
 

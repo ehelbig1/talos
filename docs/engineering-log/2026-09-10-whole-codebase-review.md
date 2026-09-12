@@ -2271,3 +2271,48 @@ succeeds. And the wiring fixes where the check runs, not what it can see —
 the 45 dynamic sites are exactly as unprotected as they were, and the count
 on every run is what keeps that visible.
 
+## Package AA — a cache nothing constructed (2026-09-12)
+
+Package Y asked every table "is it written? is it read?" and package Z
+found the one reader Y had not opened. This re-ran Y's question the honest
+way — every zero-row table with every reader site listed by file and line
+— and all 24 came back with both readers and writers except four
+written-never-read audit logs already recorded. One of them looked odd:
+`node_result_cache`, zero rows, three statement sites in `talos-node-cache`
+(an `UPDATE … RETURNING` that IS the lookup, an INSERT, a DELETE), and not
+one row of `pg_stat_statements` over it since the postmaster started.
+
+The table is reached by code; the code is not reachable. `NodeResultCache::
+new` has zero call sites in the workspace. `controller/src/node_cache.rs` is
+a four-line shim whose comment has read "Re-export for future use; not yet
+wired into the engine" since the May-2026 extraction. Two tickets had fixed
+bugs in it while it was dead — MCP-695 (`TALOS_NODE_CACHE_TTL_SECS=0` would
+have set a zero-second TTL) and MCP-1117 (the bool-env footgun) — and
+`docs/configuration-reference.md` listed `TALOS_NODE_CACHE` as a bool
+default for "both" processes: a documented knob that controlled nothing,
+the `EXECUTION_MAX_ROWS` / `DB_EXECUTION_TIMEOUT_SECS` class.
+
+**Decision: delete, not wire.** The `talos-jobs` / `talos-db-monitor`
+precedent (package K): the crate, the shim, both Cargo entries, the table
+(migration `20260912110000`, zero rows, no inbound FK, no policy) and the
+doc row, struck through with the reason. A content-addressed node cache is
+a legitimate design — skip a module run whose `(module_hash, input)` already
+has an output — and it raises questions the crate never answered: a module
+whose output depends on the clock, a secret or an upstream call would be
+served stale forever; a cache shared across tenants keyed on content is a
+cross-tenant read of one tenant's output by another's identical input;
+nothing invalidates on `hot_update_module`. Resurrecting an unreviewed
+cache because it exists is not a feature decision, so it does not happen
+here.
+
+**Measured limit worth carrying.** A writer/reader sweep proves a table is
+reached by statements, not that the statements are reachable — that is a
+call-graph question one level up, and the sweep cannot see it. Package Y's
+sweep was RIGHT about this table and still described a dead feature as
+live. The zero-row filter is what surfaced it; the constructor grep is what
+settled it.
+
+**Guards.** `controller/tests/dead_schema_tests` pins the table absent on a
+migrated clone (twelve tables now). The crate's four in-crate unit tests go
+with it; no integration binary referenced it (check 64 was already silent).
+
