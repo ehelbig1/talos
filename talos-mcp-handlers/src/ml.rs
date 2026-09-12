@@ -110,7 +110,7 @@ pub fn tool_schemas() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "ml_get_model_card",
-            "description": "Full model card: config, dataset stats, and every version's backend/metrics/status — the provenance record for 'why did the model say X'.",
+            "description": "Full model card: config, dataset stats, every version's backend/metrics/status, and the admin_event_log record of policy / lifecycle / shadow-window changes (admin_events: who, what, when) — the provenance record for 'why did the model say X'.",
             "inputSchema": { "type": "object", "properties": {
                 "model_name": { "type": "string" }
             }, "required": ["model_name"] }
@@ -1244,8 +1244,32 @@ async fn handle_get_model_card(
             talos_ml::stored_teacher_audit(&mut tx, model.model_id, user_id).await,
         )
         .flatten();
+    // Administrative actions on this model (`ml_policy_set`, `ml_lifecycle_set`,
+    // `ml_shadow_window_reset`) — the provenance of the policy_json above, read
+    // from admin_event_log and disclosed through the same ledger as the other
+    // reads (an unreadable log is `not_measured`, not an empty history).
+    let admin_events: Vec<serde_json::Value> = readings
+        .record_rows(
+            "admin_events",
+            state
+                .analytics_repo
+                .list_admin_events_for_resource("ml_model", model.model_id, 50)
+                .await,
+        )
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "admin_event_type": r.event_type,
+                "timestamp": r.created_at.to_rfc3339(),
+                "summary": r.summary,
+                "details": r.details,
+                "by_user_id": r.user_id.map(|u| u.to_string()),
+            })
+        })
+        .collect();
     let mut card = serde_json::json!({
         "model_id": model.model_id.to_string(),
+        "admin_events": admin_events,
         "name": name,
         "lifecycle_state": model.lifecycle_state,
         "shadow": shadow,

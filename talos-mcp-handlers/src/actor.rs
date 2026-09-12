@@ -209,7 +209,8 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             "name": "get_actor_summary",
             "description": "Full picture of an actor: owned workflows, recent executions, budget usage, \
                 memory count, active approval policies, its three enforcement ceilings \
-                (max_llm_tier / max_write_ceiling / egress_scope), and whether the registered worker \
+                (max_llm_tier / max_write_ceiling / egress_scope) with the admin_event_log record of \
+                every change to them (admin_events: who set what, when), and whether the registered worker \
                 fleet actually enforces the write ceiling ('write_ceiling_enforcement.enforced_by').",
             "inputSchema": {
                 "type": "object",
@@ -1934,6 +1935,39 @@ async fn handle_get_actor_summary(
             crate::platform::read_write_ceiling_fleet(&state.db_pool).await,
         );
 
+    // The ceilings above are the CURRENT values; `admin_event_log` holds the
+    // WHEN and WHO of every change to them (`actor_llm_tier_ceiling_set`,
+    // `actor_write_ceiling_set`, `actor_egress_scope_set`) — nine rows on the
+    // reference fleet that until 2026-09-12 no operator surface rendered.
+    // Scoped to the resource; the ownership gate ran in `resolve_actor_via_repo`.
+    // Unreadable is `null` + a flag, never `[]` (check 74's rule).
+    let (admin_events, admin_events_unreadable) = match state
+        .analytics_repo
+        .list_admin_events_for_resource("actor", actor_id, 50)
+        .await
+    {
+        Ok(rows) => (
+            Value::Array(
+                rows.iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "admin_event_type": r.event_type,
+                            "timestamp": r.created_at.to_rfc3339(),
+                            "summary": r.summary,
+                            "details": r.details,
+                            "by_user_id": r.user_id.map(|u| u.to_string()),
+                        })
+                    })
+                    .collect(),
+            ),
+            false,
+        ),
+        Err(e) => {
+            tracing::error!(%actor_id, "get_actor_summary: admin_event_log read failed: {:#}", e);
+            (Value::Null, true)
+        }
+    };
+
     mcp_text(
         req_id,
         &serde_json::to_string_pretty(&serde_json::json!({
@@ -1957,6 +1991,8 @@ async fn handle_get_actor_summary(
             // ADDED fields; every pre-existing key above is unchanged.
             "ceilings":            ceilings,
             "write_ceiling_enforcement": write_ceiling_enforcement,
+            "admin_events":        admin_events,
+            "admin_events_unreadable": admin_events_unreadable,
         }))
         .unwrap_or_default(),
     )
