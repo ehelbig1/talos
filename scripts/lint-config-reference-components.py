@@ -39,6 +39,24 @@ named in prose beside unrelated code counts as read (false NEGATIVE for the
 `worker cannot read it` arm — the safe direction). `cargo tree` resolves the
 lockfile; it needs no build.
 
+Two further rows-level legs (2026-09-12, package AL), both cheap because the
+rows are already parsed:
+
+  * a Default cell may not be a PLACEHOLDER (`bool default`, `flag`,
+    `policy default`): it must say what happens when the variable is unset.
+    Ten cells were, two of them security-posture switches
+    (`TALOS_WRITE_CEILING_ENFORCED`, `TALOS_WRITE_CEILING_STRICT_EGRESS`) and
+    one whose real default is `is_production()` (`ENABLE_HSTS`).
+  * a `(+_FILE)` claim needs a reader — `read_env_or_file("VAR")` or the
+    literal `"VAR_FILE"` in production Rust. `NATS_PASSWORD` claimed the
+    Docker-secrets sibling while both its readers were a bare `env::var`.
+
+Neither leg reads a DESCRIPTION: the 24 wrong descriptions the same package
+fixed were found by a per-row human read against the reader code, and a
+Default-VALUE comparison was measured and rejected (93 rows carry a literal
+code default, 23 differ from the doc, 21 of those by vocabulary — `on` vs
+`true` — or by matching a test fixture; ~9 % precision).
+
 Usage: lint-config-reference-components.py [--report] [ROOT]
   exit 0 = every classifiable row is consistent; 1 = findings; 2 = cannot run.
 """
@@ -126,7 +144,9 @@ def parse_rows(root):
                 comp, src = cells[comp_idx], "cell"
             else:
                 comp, src = heading_comp, "heading"
-            rows.append((lineno, m.group(1), comp, src))
+            default_cell = cells[1] if len(cells) > 1 else ""
+            claims_file = bool(re.search(r"\(\+\s*`_FILE`", cells[0]))
+            rows.append((lineno, m.group(1), comp, src, default_cell, claims_file))
     return rows
 
 
@@ -174,18 +194,36 @@ def main():
     # read: `worker/src/self_register.rs` names `TALOS_WORKER_PUBLIC_KEYS` in a
     # WARN message and never reads it.
     tok_re = re.compile(r"[\"']([A-Z][A-Z0-9_]{2,})[\"']")
+    file_reads = collections.defaultdict(set)
+    file_read_re = re.compile(r"read_env_or_file\(\s*[\"']([A-Z][A-Z0-9_]{2,})[\"']")
     call_re = re.compile(r"(?<![a-z0-9_])([a-z_][a-z0-9_]*)\s*\(")
     for p, t in sources.items():
         cr = p.split("/")[0]
         if cr == "talos-config":
             continue
         tokens[cr].update(tok_re.findall(t))
+        file_reads[cr].update(file_read_re.findall(t))
         calls[cr].update(call_re.findall(t))
     crates = set(tokens) | set(calls)
 
     findings = []
     skipped = 0
-    for lineno, var, comp, src in rows:
+    PLACEHOLDER_DEFAULTS = {"bool default", "flag", "policy default", "default", "tbd", "?"}
+    for lineno, var, comp, src, default_cell, claims_file in rows:
+        where0 = f"{DOC}:{lineno}"
+        # (b) a Default cell must state the default, not name its type: `bool
+        # default` / `flag` / `policy default` tell an operator nothing about
+        # what happens when the variable is unset. 10 such cells on 2026-09-12,
+        # including two security-posture switches (`TALOS_WRITE_CEILING_*`).
+        if default_cell.replace("`", "").strip().lower() in PLACEHOLDER_DEFAULTS:
+            findings.append(f"{where0}: `{var}` Default cell is the placeholder {default_cell.strip()!r} — state the real default")
+        # (c) a `(+_FILE)` claim needs a reader: `read_env_or_file("VAR")` or the
+        # literal `"VAR_FILE"` somewhere in production Rust. `NATS_PASSWORD`
+        # claimed one on 2026-09-12 and both its readers were bare `env::var`.
+        if claims_file:
+            file_tok = var + "_FILE"
+            if not any(file_tok in tokens[cr] or var in file_reads[cr] for cr in crates):
+                findings.append(f"{where0}: `{var}` row claims a `_FILE` sibling but no production reader consults `{file_tok}` or `read_env_or_file(\"{var}\")`")
         c = comp.replace("`", "").strip()
         if c in SKIP_COMPONENTS or (not c.startswith("talos-") and c not in ("both", "controller", "worker")):
             skipped += 1

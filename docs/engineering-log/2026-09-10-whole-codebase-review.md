@@ -3000,3 +3000,113 @@ The script now reads the endpoint directly.
 **The CLAUDE.md count sentence this package changed (88 → 89), kept verbatim for `check-engineering-log.py`'s losslessness leg — the first count bump since the split, so the first time that base line moved:**
 
 - **`make lint` enforces structural rules** via `scripts/lint-structural.sh`. 88 checks today (the authoritative, inline-documented list lives in the script; `bash scripts/lint-structural.sh --count` prints the live number, and check 54 fails the lint if this sentence's count goes stale), each tied to a specific past regression so it catches at PR-time the class of bug that survives `cargo check` cleanly but breaks at CI or request time:
+
+### Package AL (2026-09-12) — the cells a cargo tree cannot read
+
+**Package AK derived the Component column; this reads the rest.** The
+detector's own header says why a lint stops there: whether a description is
+TRUE is a per-row read against the reader, and the two AJ rows had been found
+that way by hand. So the 107 🔒 rows were read that way in full — each row's
+reader located, its parse (which spellings of a boolean, which clamp, which
+default) compared with the Default and Purpose cells — and 24 were wrong in a
+way an operator acts on. Every finding below was re-verified at the cited line
+before a cell was changed.
+
+**The class that matters most is "optional in dev, required in production",
+and the document called all five `none (optional)`.** `PROMETHEUS_SCRAPE_TOKEN`
+unset in production refuses every `/metrics/prometheus` scrape 403
+(`controller/src/bootstrap/router.rs`); `REGISTRY_PUBLISH_TOKEN` unset refuses
+every publish POST 503 (`talos-registry/src/api.rs`); `TALOS_AOT_HMAC_KEY`
+unset or under 32 bytes PANICS the worker at boot in production
+(`talos-worker-runtime/src/runtime.rs`); `METRICS_AUTH_TOKENS` unset or empty
+refuses to start the metrics server and the worker `.expect()`s it — in EVERY
+environment; `WORKER_SHARED_KEY` unset boots the controller with a WARN and
+then refuses every NATS dispatch in production (`talos-engine/src/nats_run.rs`).
+An operator wiring production from the reference would have skipped five
+variables the reference called optional and met three refusals and two panics.
+
+**Three flags described as live controls are ignored in production, correctly
+and silently.** `WORKER_ALLOW_PRIVATE_HOST_TARGETS` is gated `raw && !is_prod`
+at both enforcement layers (`ssrf_resolver.rs`, `host/limits.rs` — the resolver
+layer also accepts only the literal `1`); `TALOS_ALLOW_UNATTESTED_WASM` is
+`block_unattested = is_prod || !allow`; `TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS`
+is refused in production OR under `TALOS_SIGSTORE_REQUIRED=required`. The
+behaviour is the right one; the document's silence about it is the defect —
+a reviewer reading "allow module egress to private IPs" beside 🔒 would
+reasonably believe production could be opened by one env var. Each row now
+says DEV-ONLY and names the gate.
+
+**Wrong defaults and wrong effects.** `VAULT_TRANSIT_MOUNT` defaults to
+`transit` and `VAULT_TRANSIT_KEY_NAME` to `talos-kek` (both rows said
+`none`); `GMAIL_PUBSUB_SERVICE_ACCOUNT` defaults to Google's push principal;
+`TALOS_COSIGN_MIN_VERSION` to `2.0.0`; `TALOS_ENCRYPT_EXECUTION_OUTPUT` is ON
+and only the literal `false` turns it off — `0`, `off`, `no` and empty all
+leave it on (`map(|v| v != "false").unwrap_or(true)`); `TALOS_MASTER_KEY` is
+required under `KEK_PROVIDER=vault` too unless `KEK_DISABLE_LEGACY=true`,
+because the legacy dual-wrap provider still loads it and refuses boot without
+it. `TALOS_SQL_PERMISSIVE_EMPTY_ALLOWLIST` was described as "permit an empty
+SQL allowlist" — an empty allowlist is always permitted; the flag changes what
+it MEANS, from read-only to every non-DDL statement including
+INSERT/UPDATE/DELETE (`sql_validator.rs`, `AllowAllNonDdl`). That is the same
+"empty allowlist" surface check 85 found the CTE bypass in, and the row now
+says so. `TRUSTED_IPS` is a rate-limit EXEMPTION (`IpWhitelist`, consulted only
+by the per-IP limiter), not an access allowlist. `TALOS_CONTROLLER_SIGNING_KEY`
+was "required for signed dispatch": it is read only when
+`TALOS_DISPATCH_SCHEME=ed25519`, and unset or invalid there produces one boot
+ERROR and a FALLBACK to HMAC — recorded rather than fixed (below).
+`OPENAI_API_KEY` said `controller` and "embeddings fallback"; it is also the
+worker's env fallback for the `openai/api_key` LLM vault path, exactly as the
+`ANTHROPIC_API_KEY` row beside it already said — `both`. `GEMINI_API_KEY`, the
+third such fallback, had no row at all.
+
+**Ten Default cells were placeholders** — `bool default` ×6, `flag` ×3,
+`policy default` ×1 — and two of the six are the write-ceiling posture
+switches (`false`), one is `ENABLE_HSTS` whose real default is
+`is_production()`, and the `policy default` is `TALOS_REPLAY_FAIL_CLOSED`, whose
+unset value is `is_production()` with an explicit spelling always winning.
+**And one row claimed a `_FILE` sibling nothing reads**: `NATS_PASSWORD (+_FILE)`
+is read by a bare `env::var` in both binaries; the `_FILE` convention paragraph
+at the top of the document listed it too. Every OTHER `(+_FILE)` row does have a
+`read_env_or_file("VAR")` reader — measured, 10 of 11.
+
+**Two sensitive marks did not fit the legend.** `TALOS_WORKER_MAX_JOB_FUEL` is
+a `u64` clamp and `TALOS_COMPILE_TARGET_CACHE` a performance opt-out that does
+not touch the per-user scoping its row cites as the invariant; 🔒 removed from
+both, since a mark that means "secret material, trust anchor, or a
+security-posture switch" is only worth what it excludes.
+
+**A dead knob.** `CACHE_ADMIN_USER_IDS`'s only reader was
+`invalidate_cache_handler` in `controller/src/secrets/handlers.rs`, marked
+`#[allow(dead_code)]` and mounted on no route since MCP-953 (May 2026), kept as
+"defensive scaffolding … so it can be hooked up to an operator-debug endpoint
+without re-deriving the security gate". Four months later nothing hooked it up,
+and the reference listed the variable as a live 🔒 control. Package K's rule:
+deleted, row struck with the reason (`EXECUTION_MAX_ROWS`'s precedent), the
+module header rewritten.
+
+**Check 89 gained two legs, and a third was measured and rejected.** The rows
+are already parsed, so a placeholder Default cell (10 on pristine main) and a
+`(+_FILE)` claim with no `read_env_or_file("VAR")` / `"VAR_FILE"` reader (1)
+cost two conditions each and ship at 0. The first `_FILE` draft tested the
+substring in the VARIABLE cell and flagged `NATS_CA_FILE` — a false positive
+from the name — and its reader test paired "this crate calls
+`read_env_or_file` somewhere" with "this crate names the variable somewhere",
+which let `controller` vouch for `NATS_PASSWORD` through two unrelated lines;
+both fixed before the leg was kept (claim pattern `(+`_FILE``; a per-crate set
+of the literal `read_env_or_file("X")` arguments). The rejected leg is the
+obvious one: compare the Default cell to the accessor's literal default. 93
+rows carry a literal code default; 23 differ from the doc; 21 of those are
+vocabulary (`on` vs `true`, `4 MiB` vs `4194304`) or a matched test fixture
+(`set_var("TALOS_ADVISORY_DB_MAX_AGE_DAYS", "100000")` read as the default) —
+~9 % precision, below every bar this file has set. Descriptions and defaults
+stay a human read; the 107 are now that read.
+
+**Recorded, NOT fixed: a requested signing scheme that downgrades itself.**
+`configured_dispatch_signer` returns `None` when `TALOS_DISPATCH_SCHEME=ed25519`
+and the seed is unset or unparsable, `talos-engine/src/nats_run.rs` logs one
+`talos_security` ERROR at boot, and every dispatch is then HMAC-signed under the
+fleet-shared key. The fleet fails closed only if the WORKERS run
+`TALOS_DISPATCH_REQUIRE_ED25519`, which the RFC 0010 phases install in phase D.
+A production boot refusal (the shape of `ensure_signing_key_present_in_production`)
+is the right control and a behaviour change with rollout-ordering consequences —
+its own package, with the installer's phase table read first.

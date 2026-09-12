@@ -4,9 +4,10 @@
 //! providers, DEK cache, master-key rotation) lives in
 //! `talos-secrets-manager`. The OAuth-aware `ControllerSecretsResolver`
 //! moved with `OAuthCredentialService` into `talos-oauth` and is
-//! re-exported under its historical path here. Only [`handlers`] (axum
-//! HTTP handlers) stays in the controller — it pulls in axum + the
-//! request/response plumbing the core crate intentionally avoids.
+//! re-exported under its historical path here. (The controller-side
+//! `handlers` module — one DEK-cache-flush handler mounted on no route since
+//! MCP-953, gated on `CACHE_ADMIN_USER_IDS` — was deleted 2026-09-12: a
+//! documented control that controlled nothing.)
 //!
 //! `vault_resolver` (`vault://` reference substitution helpers) has lived in
 //! `talos-workflow-engine` since the engine extraction; we re-export it here
@@ -29,8 +30,6 @@ pub mod provider {
 pub mod vault_kek_provider {
     pub use talos_secrets_manager::vault_kek_provider::*;
 }
-
-pub mod handlers;
 
 /// OAuth-aware secrets resolver re-exported from `talos-oauth`.
 pub mod resolver {
