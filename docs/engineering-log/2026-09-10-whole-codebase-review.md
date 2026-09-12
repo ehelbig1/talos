@@ -2068,3 +2068,102 @@ population a regex can judge: most such writes are real state transitions,
 where the old and new values differ by construction. So this is a measured
 instance with a test, not a lint.
 
+## Package Y — eleven tables nothing touches (2026-09-12)
+
+Package V asked one table "is it written? is it read?"; package W asked it per
+row; this one asks it of every table. The sweep: every `public` table (95)
+against every non-test Rust file in `controller/`, `worker/` and `talos-*/`,
+with `INSERT INTO` / `UPDATE` / `DELETE FROM` counted as a writer and `FROM` /
+`JOIN` as a reader, comments stripped first, and the live row count beside
+each. Four classes fell out:
+
+* **Untouched (no writer, no reader): ten tables**, nine of them with zero
+  rows — `circuit_breaker_metrics`, `compilation_cache`, `feature_flags`,
+  `idempotency_keys`, `key_rotation_events`, `mcp_crate_allowlist`,
+  `secrets_rotation_log`, `tenant_quotas`, `webhook_processed_events` — and
+  `schema_audit_log` with 2 020. Eight of the nine came from one migration
+  (`20260329000000_new_modules_tables`), scaffolding for features that were
+  built elsewhere or never: the worker's idempotency store is in-process
+  (`talos-idempotency`), webhook dedup keys on the verified signature in
+  Redis, budgets are `actor_budget_policies`, rotation audit goes to
+  `secret_audit_log`, the dependency allowlist is compiled into
+  `talos-compilation`. `docs/backlog.md` had already proposed dropping
+  `circuit_breaker_metrics` on 2026-08-11 as "a third dead
+  breaker-observability surface … empty by construction rather than empty
+  because nothing happened".
+* **Read but never written by Rust: four.** `_sqlx_migrations` and
+  `agent_roles` are seeded by migrations — fine. `workflow_nodes` (zero rows)
+  has one "reader": the registry's own comment saying it has no INSERT writer.
+  `google_calendar_watch_channels` (zero rows) has THREE readers and no writer,
+  because gcal channels moved into `integration_state` and the flat table was
+  never retired.
+* **Written but never read: four**, and every one is an audit log —
+  `oauth_audit_log` (1 row), `gmail_integration_audit_log` (0; the table
+  package #776 created so Gmail connect events would stop erroring),
+  `slack_integration_audit_log` (0), `module_marketplace_stars` (0). Recorded,
+  not swept: one row in total, and a reader for each is a product surface.
+* **Both, healthily: the remaining 77.**
+
+**Decisions.**
+* **All eleven dropped** in one migration (`20260912100000`): no inbound FK,
+  no dependent view, no RLS policy, no row on the reference fleet, each in the
+  schema baseline so this is the tail dropping baseline objects (the
+  `jobs` / `audit_events` precedent). `IF EXISTS` throughout.
+* **`schema_audit_log` KEPT and put to use.** It is written by the
+  `log_schema_changes` event trigger on `ddl_command_end` (migration 034) with
+  the statement text, role and client — 134 rows in the last three days, one
+  per DDL statement of every migration and every test-clone — and it is
+  exactly the change-management evidence SOC 2 CC8.1 asks for. The collector
+  now exports it. A table nobody reads is not the same as a table nobody
+  should read.
+* **The eviction exemption's fourth leg is removed, and the comment beside it
+  corrected.** `module_eviction_exemptions!` had `NOT EXISTS (SELECT 1 FROM
+  google_calendar_watch_channels c WHERE c.module_id = m.id AND c.is_active)`
+  under a doc comment that said gmail and GCP push bindings were NOT covered
+  ("stated as a limit rather than approximated") while gcal WAS. The table had
+  no writer; the leg could never match; gcal-bound modules were protected by
+  the recency leg alone, exactly like gmail and GCP. A control that reads an
+  always-empty table is the misleading-report class one level down — the
+  claim was in the comment and the SQL agreed with the claim, and both were
+  wrong about the world. The unit pin now asserts the fragment does NOT name
+  the table. **It is the only guard, and that was measured rather than
+  assumed**: the first draft of this paragraph said check 88's PREPARE probe
+  would refuse a statement over the dropped table; re-adding the leg as a
+  mutation was caught by the unit pin and NOT by the probe, because the
+  exemption SQL is built by `concat!` inside `module_eviction_exemptions!`
+  and is one of the six sites the probe reports as `dynamic — OUT OF RANGE`.
+  A statement the probe cannot reach fails at request time; the pin is what
+  stands between this module and that.
+* **The `query_paginated` deny-list entry for the dropped table stays**, as
+  forward-protection — the `workspace_oci_settings` precedent in the same
+  list.
+* **The SOC 2 collector had the verifier's defect.** `export_table` hardcoded
+  `WHERE created_at >= cutoff`; `secret_audit_log`'s column is `"timestamp"`;
+  psql's stderr went to `/dev/null`; the row count was computed from the
+  (empty) output file and reported as `Exported 0 rows`. So the secret-access
+  evidence — 22 413 rows over 90 days on the reference fleet — had been an
+  empty CSV on every run, indistinguishable from a quiet vault. The function
+  now takes each table's own timestamp column, a psql error is a
+  `record_fail` naming the table, and `schema_audit_log` joins the export
+  list. Every export statement was executed against the live database before
+  this shipped (1 921 / 22 413 / 85 / 90 287 lines).
+
+**Guards.** `controller/tests/dead_schema_tests` (CTRL_TESTS): the eleven
+tables absent on a migrated clone, `schema_audit_log` present with its event
+trigger, the three audit tables' immutability triggers intact, and every
+collector export statement PREPAREd against the migrated schema (the test
+that would have caught the `created_at` assumption). The registry's
+`wasm_cache_sweep_sql_tests` gained the negative pin. Mutation: re-adding the
+dropped-table leg to the exemption fails the unit pin; check 88's PREPARE
+probe SURVIVES it (the statement is macro-assembled and out of its range) —
+one guard, not two, stated as measured.
+
+**Stated limits.** The sweep is TEXTUAL: SQL assembled with `format!` or a
+table name reached through a variable is invisible to it, the same limit
+check 88 states; it was cross-checked against live row counts, which is what
+made the ten zero-row tables safe to drop and what kept `schema_audit_log`.
+It counts references, not correctness — `google_calendar_watch_channels`
+scored three readers and was the most misleading table of the eleven. The
+`docs/rfcs/0004` tenant plan still lists several dropped tables among its
+org-scoping candidates; it is a design record and was left as written.
+

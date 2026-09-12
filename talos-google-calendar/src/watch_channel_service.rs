@@ -326,8 +326,9 @@ fn truncate_error(s: &str, cap: usize) -> String {
 /// the same reasons.
 ///
 /// Note this integration is LATENT on the reference fleet: measured 2026-09-08,
-/// `google_calendar_watch_channels` holds 0 rows and `integration_state` holds
-/// no `gcal` row at all. It is implemented anyway because the alternative is a
+/// `integration_state` holds no `gcal` row at all (the legacy
+/// `google_calendar_watch_channels` table held 0 rows too, and was dropped on
+/// 2026-09-12 as a table with no writer). It is implemented anyway because the alternative is a
 /// survey that silently covers two integrations of three — which is the
 /// misleading-report class this whole package is about, one level up.
 pub struct GcalPushChannelInventory {

@@ -84,9 +84,12 @@ pub(crate) const BLOCKED_TABLES_LIST: &[&str] = &[
     //     webhook bearer) + `signing_secret_enc` BYTEA / `signing_key_id`
     //     (mig 20260312000200; plaintext `signing_secret` dropped in
     //     20260408000002).
-    //   * `google_calendar_watch_channels` — still-PLAINTEXT
+    //   * `google_calendar_watch_channels` — had a still-PLAINTEXT
     //     `verification_token TEXT NOT NULL` (the per-channel webhook secret,
-    //     mig 010_watch_channel_security).
+    //     mig 010_watch_channel_security). DROPPED 2026-09-12 (migration
+    //     20260912100000): channels moved to `integration_state` and the table
+    //     had held zero rows with no writer. The deny-list entry is RETAINED as
+    //     forward-protection, the `workspace_oci_settings` precedent below.
     //   * `workspace_oci_settings` — DROPPED as dead/never-wired schema
     //     (mig 20260627120000; it had `password_encrypted`/`password_nonce`
     //     columns but no crypto code ever populated them — OCI creds come from

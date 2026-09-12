@@ -563,7 +563,7 @@ families before and after.
 
 ## Drop the empty `circuit_breaker_metrics` table — a third dead breaker-observability surface
 
-**Added:** 2026-08-11. **Priority: LOW** (cleanup; no behaviour depends on it).
+**Added:** 2026-08-11. **Priority: LOW** (cleanup; no behaviour depends on it). **DONE 2026-09-12** — migration `20260912100000_drop_untouched_tables.sql`, together with ten other tables the same writer/reader sweep found untouched.
 
 **What.** `circuit_breaker_metrics` (created in
 `migrations/20260329000000_new_modules_tables.sql`, with

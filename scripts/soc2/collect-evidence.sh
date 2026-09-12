@@ -19,6 +19,7 @@
 #     auth_audit_log.csv
 #     secret_audit_log.csv
 #     admin_event_log.csv
+#     schema_audit_log.csv
 #     immutability_triggers.txt
 #     encryption_key_status.txt
 #     control_verification.txt
@@ -95,9 +96,15 @@ record_warn() {
 # ---------------------------------------------------------------------------
 echo "--- Exporting audit logs (last ${RETENTION_DAYS} days) ---"
 
+# $3 is the table's OWN timestamp column. Until 2026-09-12 this function
+# hardcoded `created_at`, which `secret_audit_log` does not have (its column is
+# `"timestamp"`), so that export had produced an EMPTY file on every run —
+# the same never-executed statement the control verifier carried until
+# 2026-09-11, one script over. psql's stderr was discarded, so nothing said so.
 export_table() {
     local table="$1"
     local output_file="$2"
+    local ts_col="$3"
     local count
 
     # Check if table exists
@@ -110,8 +117,14 @@ export_table() {
         --no-align \
         --field-separator=',' \
         --pset footer=off \
-        -c "\\COPY (SELECT * FROM ${table} WHERE created_at >= '${CUTOFF_DATE}'::timestamptz ORDER BY created_at DESC) TO STDOUT WITH (FORMAT CSV, HEADER TRUE)" \
-        > "$output_file" 2>/dev/null
+        -c "\\COPY (SELECT * FROM ${table} WHERE ${ts_col} >= '${CUTOFF_DATE}'::timestamptz ORDER BY ${ts_col} DESC) TO STDOUT WITH (FORMAT CSV, HEADER TRUE)" \
+        > "$output_file" 2>"$output_file.err"
+    if [ -s "$output_file.err" ]; then
+        record_fail "Export of ${table} FAILED: $(head -1 "$output_file.err")"
+        rm -f "$output_file.err"
+        return
+    fi
+    rm -f "$output_file.err"
 
     count=$(wc -l < "$output_file" | tr -d ' ')
     # Subtract header line
@@ -133,9 +146,14 @@ export_table() {
 # `talos_audit_verification_failures_total` series are that control's
 # evidence. The `audit_events` TABLE this script used to export had held zero
 # rows since 2026-03 and was dropped on 2026-09-11 (migration 20260911160000).
-export_table "auth_audit_log"   "$EVIDENCE_DIR/auth_audit_log.csv"
-export_table "secret_audit_log" "$EVIDENCE_DIR/secret_audit_log.csv"
-export_table "admin_event_log"  "$EVIDENCE_DIR/admin_event_log.csv"
+export_table "auth_audit_log"   "$EVIDENCE_DIR/auth_audit_log.csv"   "created_at"
+export_table "secret_audit_log" "$EVIDENCE_DIR/secret_audit_log.csv" "\"timestamp\""
+export_table "admin_event_log"  "$EVIDENCE_DIR/admin_event_log.csv"  "created_at"
+# CC8.1 change management: every DDL statement the database has executed,
+# written by the `log_schema_changes` event trigger (migration 034) with the
+# statement text, role and client — 2 020 rows on the reference fleet, and
+# until 2026-09-12 exported by nothing.
+export_table "schema_audit_log" "$EVIDENCE_DIR/schema_audit_log.csv" "event_time"
 
 echo ""
 
