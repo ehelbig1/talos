@@ -521,6 +521,10 @@ CTRL_TESTS=(
     # schema_audit_log and its DDL event trigger stay; every SOC 2 collector
     # export statement PREPAREs. `common` harness, so CTRL_TESTS (64b).
     "dead_schema_tests"
+    # No index is redundant by definition (exact duplicate or leading-prefix twin
+    # of a same-predicate sibling); 45 dropped by migration 20260912120000 and the
+    # two invariants pinned over the whole schema. `common` harness (64b).
+    "index_hygiene_tests"
     "api_auth_integration_test"
     "integration_mcp_tests"
     "auth_concurrency_tests"
