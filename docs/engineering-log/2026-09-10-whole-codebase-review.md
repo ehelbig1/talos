@@ -2369,3 +2369,69 @@ a literal `let`, a const-only `format!` `let` (both resolved) and a
 positional-`format!` `let` (stays dynamic, reason prefixed `let:`) — 8
 resolved, 4 dynamic, asserted exactly.
 
+## Package AC — forty-five indexes redundant by definition (2026-09-12)
+
+The twenty-seventh deploy's verification pass surveyed the reference
+schema's indexes for the first time: ~360 indexes, of which 234 had
+`idx_scan = 0` in `pg_stat_user_indexes`. That number was written down and
+then explicitly set aside as a drop basis — the statistics window began at
+the 2026-09-10 02:14 UTC postmaster restart, the fleet has one user, and an
+index that serves a monthly report or a path nobody has exercised this week
+reads exactly like one nothing will ever use. What CAN be decided from the
+catalog alone is redundancy by definition, and that is what this package
+drops.
+
+**Two shapes, both from `pg_index`.** An EXACT duplicate: two non-primary
+indexes on one table with identical `indkey`, `indclass`, `indoption`,
+predicate (`pg_get_expr(indpred)`) and access method. Eleven of these.
+A LEADING-PREFIX twin: a non-unique btree whose key columns, operator
+classes and sort options are a strict prefix of a sibling's with the same
+predicate. Thirty-four of these. Postgres uses a multicolumn btree for any
+query on its leading columns, so `(execution_id)` beside
+`(execution_id, created_at)` buys nothing but a second write per insert.
+UNIQUE prefixes are exempt (a constraint is not an access path), and where
+the duplicate pair was a plain index beside a unique constraint's index, the
+plain one goes and the constraint stays (`idx_oauth_accounts_provider_user`
+vs `oauth_accounts_provider_provider_user_id_key`).
+
+**The scan counts argue the OTHER way and were kept in the header for that
+reason.** Fourteen of the forty-five carried scans in the two-day window —
+`idx_events_execution_id` 24 308, `idx_executions_status` 1 117,
+`idx_executions_workflow_id` 576, `idx_module_executions_status` 309. The
+planner, offered two indexes that answer the same predicate, picks the
+narrower one; the count therefore measures which index the planner
+preferred, not whether the lookup needs it. After the drop the same
+predicates resolve on the wider sibling's leading columns. A reader who
+sees "24 308 scans, dropped" and objects has the right instinct and the
+wrong instrument.
+
+**Size and write cost.** 19.4 MB of index bytes; the first four by size are
+`idx_execution_events_execution_created` 8.3 MB (duplicate),
+`idx_module_execution_logs_execution_id` 4.5 MB, `idx_events_execution_id`
+2.1 MB and `idx_module_executions_workflow_exec` 1.5 MB — all on the tables
+every execution writes to.
+
+**Safety checks before the migration was written.** None of the 45 names
+appears anywhere outside `migrations/` (grep over the whole tree, so no
+`pg_hint_plan` hint, no doc, no script names one); all 45 originate in the
+schema baseline, so this is the post-cutpoint tail dropping baseline
+objects, package Y's precedent. `DROP INDEX IF EXISTS` for idempotency; no
+`CONCURRENTLY` (sqlx transaction).
+
+**Guards.** `controller/tests/index_hygiene_tests` (CTRL_TESTS) pins the 45
+absent and the 41 surviving siblings present, and pins the two invariants
+over the WHOLE schema — the same two catalog queries that computed the
+drop set, run against the migrated clone — so the next duplicate or prefix
+twin fails in CI rather than accruing until someone surveys again.
+Mutation: re-creating `idx_events_execution_id` and an exact duplicate of
+`idx_events_created_at` on the template failed all three tests, each naming
+the offending index; reverted, baseline green.
+
+**Not done, stated.** No index is dropped on usage grounds; that question
+needs a statistics window measured in months on a fleet with more than one
+user, and the 234-unscanned figure is recorded here so the next survey
+starts from a known number rather than re-deriving it. Two-column indexes
+that share a leading column with a THREE-column sibling but diverge on the
+second are not prefixes and are untouched. The perf rule in CLAUDE.md
+("ALWAYS add database indexes for frequently queried column combinations")
+gains no converse sentence: the invariant tests are the converse.
