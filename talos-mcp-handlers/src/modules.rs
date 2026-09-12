@@ -199,7 +199,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_module_history",
-            "description": "Get the hot-update history for a module, showing previous and new content hashes, sizes, and timestamps.",
+            "description": "Get the hot-update history for a module (previous and new content hashes, sizes, timestamps) plus the administrative actions recorded against it in admin_event_log (allowed_methods / allowed_secrets updates, deletion, bulk cleanup), each with who performed it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2439,10 +2439,40 @@ async fn handle_get_module_history(
             // history (the same one-letter shape that bit MCP-133 in
             // get_workflow_call_tree). Mirrors the _count_legend pattern
             // from list_module_catalog.
+            // Administrative actions ON this module (`admin_event_log`,
+            // resource_type = 'module'). Unreadable is disclosed as `null` +
+            // a flag, never as an empty list (check 74's rule).
+            let (admin_events, admin_events_unreadable) = match state
+                .analytics_repo
+                .list_admin_events_for_resource("module", module_id, 100)
+                .await
+            {
+                Ok(rows) => (
+                    serde_json::Value::Array(
+                        rows.iter()
+                            .map(|r| {
+                                serde_json::json!({
+                                    "admin_event_type": r.event_type,
+                                    "timestamp": r.created_at.to_rfc3339(),
+                                    "summary": r.summary,
+                                    "by_user_id": r.user_id.map(|u| u.to_string()),
+                                })
+                            })
+                            .collect(),
+                    ),
+                    false,
+                ),
+                Err(e) => {
+                    tracing::error!("get_module_history: admin_event_log read failed: {:#}", e);
+                    (serde_json::Value::Null, true)
+                }
+            };
             let envelope = serde_json::json!({
                 "module_id": module_id.to_string(),
                 "count": history.len(),
                 "change_count": change_count,
+                "admin_events": admin_events,
+                "admin_events_unreadable": admin_events_unreadable,
                 "_count_legend": {
                     "count": "Total audit rows (includes byte-identical no-op recompiles where previous_hash == new_hash, stamped with `unchanged: true`).",
                     "change_count": "Subset of audit rows where the WASM hash actually changed (`unchanged: false`). Use this to count real module updates.",

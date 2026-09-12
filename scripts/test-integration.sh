@@ -485,6 +485,7 @@ CTRL_TESTS=(
     # value is the row's own age. `common` harness, so CTRL_TESTS (64b).
     "execution_metrics_tests"
     "chain_run_linkage_tests"
+    "admin_event_visibility_tests"
     "api_auth_integration_test"
     "integration_mcp_tests"
     "auth_concurrency_tests"

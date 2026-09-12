@@ -901,7 +901,7 @@ pub struct SideTableReap {
 /// What tier five deleted.
 ///
 /// **What is deliberately NOT in this struct.** `admin_event_log`,
-/// `auth_audit_log`, `secret_audit_log` and `audit_events` carry the
+/// `auth_audit_log` and `secret_audit_log` carry the
 /// `prevent_audit_modification` BEFORE DELETE trigger (migration
 /// `20260408000001`): a DELETE against any of them raises `42501` by security
 /// policy. They are permanent, and this reaper does not fight the trigger.
@@ -1710,7 +1710,7 @@ impl AdvancedRepository {
     /// that bypasses the clamp still cannot wipe an audit trail.
     ///
     /// **Not reaped, by design**: `admin_event_log` (and `auth_audit_log`,
-    /// `secret_audit_log`, `audit_events`) carry `prevent_audit_modification`
+    /// `secret_audit_log`) carry `prevent_audit_modification`
     /// and refuse every DELETE with `42501`. This function never names them.
     pub async fn reap_audit_tables(&self, days: i32) -> Result<AuditTableReap> {
         if days < MIN_AUDIT_TABLE_RETENTION_DAYS {

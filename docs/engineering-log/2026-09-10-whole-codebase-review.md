@@ -1827,3 +1827,68 @@ headers, `observability/README.md` and the two CLAUDE.md sentences that
 said "not CI-wired" are corrected — the base sentences by a new line beside
 them, since `check-engineering-log.py` keeps the originals byte-identical.
 
+## Package V — two audit tables, one nobody reads and one nothing writes (2026-09-11)
+
+Found while looking for a durable home for the audit-chain verification
+failures package U had just chased through a recreated container's missing
+logs. The candidates were the two tables the security docs name as the
+platform's audit trail, and neither was what the docs said.
+
+`admin_event_log` is real: 85 rows, 16 event kinds — `workflow_deleted`,
+`workflow_actor_binding_changed`, `module_allowed_methods_updated`,
+`actor_llm_tier_ceiling_set`, `ml_policy_set` and the rest — written by four
+sites through one DLP-redacting insert. Nothing reads it. The platform-admin
+`query_paginated` tool carries it on its DENY list (it holds credential-class
+detail), no MCP tool selects from it, and the pentest scope's "flip a tier
+and confirm `admin_event_log` has 2 entries" is a psql instruction. An audit
+trail an operator cannot reach from the platform is the
+answer-written-to-an-unread-table shape. It is now rendered where the
+operator already looks — the workflow audit trail (as `admin_action` events
+carrying `admin_event_type` and `by_user_id`, under the `Readings` ledger) and
+the module history (`admin_events`, with `admin_events_unreadable` disclosed
+rather than an empty list) — through one repository read that filters on the
+RESOURCE and renders the event's own user as the actor, because a platform
+admin's action on a tenant's workflow is exactly the row the tenant needs to
+see. Actor, model and MCP-agent events are not yet rendered anywhere, and
+that is stated rather than implied.
+
+`audit_events` is the opposite defect. The docs call it "Primary security
+audit ledger"; the threat model counts it among "all 4 audit tables"; it
+carries an immutability trigger, three indexes (one added two days ago by
+the retention-index migration), a CSV export in the SOC 2 evidence collector
+and a summary query in the SOC 2 control verifier. It has held zero rows
+since it was created in March. Nothing in the workspace writes it — the
+execution audit ledger moved to the worker's per-job HMAC hash chain in the
+S3 WORM bucket, and this table was never retired. And the SOC 2 summary query
+selects `details->>'event_type'` and `created_at`, two columns the table never
+had: check 88's class, in a `.sql` file no PREPARE probe walks, so the
+evidence query for the "primary audit ledger" could never once have executed.
+Dropped, on package K's rule for `jobs` and `dead_letter_jobs`. Check 47's
+audit-table list, both SOC 2 scripts and both docs now name three tables and
+the S3 ledger, and the verifier's dead query became a real one over
+`admin_event_log`.
+
+**The dead `audit_events` query was one of SIX.** Running the original
+`scripts/soc2/verify-controls.sql` against the live dev database with
+`ON_ERROR_STOP=0` lists six statements that cannot execute: the
+`audit_events` summary (`details`), the `secret_audit_log` count
+(`created_at` — the table stamps `"timestamp"`), the webhook rate-limit block
+(`rate_limit`, a column that never existed — the real one is
+`max_requests_per_minute` — plus a jsonb comparison on a `text[]`
+`allowed_ips`), the module secret-access block (`FROM wasm_modules`, dropped
+by Phase 5 `20260423050000`, with jsonb operators on a `text[]`
+`allowed_secrets`), the capability-world distribution (`FROM node_templates`,
+dropped by the same migration) and the approval-gate summary
+(`execution_approvals.created_at`; the column is `requested_at`). Ten
+sections, six of them broken, under a header reading "Each section outputs a
+labeled result set for auditor review": the script had never once run
+end-to-end on any database this repository can produce, and nothing gates
+it — check 88's roots are Rust crates. Every block is repaired to the real
+column names and array semantics, each carrying a comment naming what it
+read until 2026-09-11, and the script now exits 0 under `ON_ERROR_STOP=1`
+against both a freshly migrated scratch database and the live one. Not
+added to check 88, stated: the probe walks `sqlx` call sites in `.rs`, and
+a psql script with `\echo` directives needs a different runner; the guard is
+the `ON_ERROR_STOP=1` run recorded in this package's PR, which is a snapshot
+and not a gate.
+

@@ -445,7 +445,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "get_workflow_audit_trail",
-            "description": "Unified audit timeline for a workflow: version publishes, execution triggers, and configuration changes.",
+            "description": "Unified audit timeline for a workflow: version publishes, execution triggers, configuration changes, and the administrative actions recorded against it in admin_event_log (actor binding changes, deletion, bulk archive) — each with who performed it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -2267,6 +2267,27 @@ async fn handle_get_workflow_audit_trail(
         events.push(event);
     }
 
+    // Administrative actions taken ON this workflow (`admin_event_log`,
+    // resource_type = 'workflow'). Four writers and, until 2026-09-11, no
+    // reader anywhere an operator looks. Ownership was checked above on the
+    // WORKFLOW; the event's user is the actor of the change and is rendered.
+    let admin_rows = readings.record_rows(
+        "events.admin_action",
+        state
+            .analytics_repo
+            .list_admin_events_for_resource("workflow", wf_id, limit)
+            .await,
+    );
+    for row in &admin_rows {
+        events.push(serde_json::json!({
+            "event_type": "admin_action",
+            "admin_event_type": row.event_type,
+            "timestamp": row.created_at.to_rfc3339(),
+            "details": row.summary.clone().unwrap_or_else(|| row.event_type.clone()),
+            "by_user_id": row.user_id.map(|u| u.to_string()),
+            "admin_event_id": row.id.to_string(),
+        }));
+    }
     if wf_updated_at != wf_created_at {
         // Before migration 20260905120000 the trigger stamped `updated_at` on
         // ANY column change, so the hourly readiness recompute overwrote it on

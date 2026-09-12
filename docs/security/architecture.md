@@ -395,7 +395,7 @@ HTTPS enforced for all outbound webhook URLs.
 
 | Table | Purpose | Immutability | DLP |
 |-------|---------|-------------|-----|
-| `audit_events` | Primary security audit ledger | Trigger: `trg_audit_events_immutable` | Yes |
+| S3/MinIO WORM bucket (not a table) | Execution audit ledger: per-job HMAC hash chain written by the worker, verified hourly by the controller sweep (`talos_audit_verification_failures_total`) | Object-store WORM + hash chain; `audit_events` table dropped 2026-09-11 (never written) | n/a |
 | `auth_audit_log` | Login/logout events | Trigger: `trg_auth_audit_log_immutable` | Yes |
 | `secret_audit_log` | Secret access events | Trigger: `trg_secret_audit_log_immutable` | Yes |
 | `admin_event_log` | Admin action events | Trigger: `trg_admin_event_log_immutable` | Yes |

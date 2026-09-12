@@ -3564,7 +3564,10 @@ bold "▶ check 47: append-only audit tables must not gain CASCADE/SET NULL FKs"
 # NEW append-only audit table? Append its name to AUDIT_TABLES below.
 
 AUDIT_FK_VIOLATIONS=0
-AUDIT_TABLES='admin_event_log audit_events auth_audit_log secret_audit_log'
+# `audit_events` left this list 2026-09-11: dropped (migration 20260911160000) —
+# it had held zero rows since creation and nothing wrote it; the execution
+# audit ledger is the S3 WORM chain, not a table.
+AUDIT_TABLES='admin_event_log auth_audit_log secret_audit_log'
 AUDIT_FK_CUTOFF=20260625150000
 for mig in "$ROOT"/migrations/*.sql; do
     [ -f "$mig" ] || continue

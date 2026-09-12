@@ -35,7 +35,6 @@ SELECT
     END AS status
 FROM (
     VALUES
-        ('trg_audit_events_immutable',      'audit_events'),
         ('trg_auth_audit_log_immutable',    'auth_audit_log'),
         ('trg_secret_audit_log_immutable',  'secret_audit_log'),
         ('trg_admin_event_log_immutable',   'admin_event_log')
@@ -62,21 +61,21 @@ WHERE routine_name = 'prevent_audit_modification';
 \echo '--- 2. Audit Log Entry Counts (Last 90 Days) ---'
 \echo ''
 
--- audit_events by category
-\echo 'audit_events by event type (top 20):'
-
+-- admin_event_log by event type. (Until 2026-09-11 this section summarised
+-- `audit_events` by `details->>'event_type'` and `created_at` — two columns
+-- that table never had, over a table nothing ever wrote; the query could not
+-- have executed. The EXECUTION audit ledger is the S3 WORM hash chain,
+-- verified by the controller sweep; see collect-evidence.sh.)
+\echo 'admin_event_log by event type (top 20):'
 SELECT
-    COALESCE(
-        (details->>'event_type')::text,
-        (details->>'action')::text,
-        'unknown'
-    ) AS event_category,
-    COUNT(*) AS entry_count,
-    MIN(created_at) AS earliest,
-    MAX(created_at) AS latest
-FROM audit_events
+    event_type       AS event_category,
+    resource_type,
+    COUNT(*)         AS entry_count,
+    MIN(created_at)  AS earliest,
+    MAX(created_at)  AS latest
+FROM admin_event_log
 WHERE created_at >= NOW() - INTERVAL '90 days'
-GROUP BY event_category
+GROUP BY event_type, resource_type
 ORDER BY entry_count DESC
 LIMIT 20;
 
@@ -92,12 +91,15 @@ FROM auth_audit_log;
 
 \echo ''
 \echo 'secret_audit_log summary:'
+-- `secret_audit_log` keys its rows on `timestamp`, not `created_at`; until
+-- 2026-09-11 this block named the wrong column and could not execute, so the
+-- script never ran end-to-end (found while removing the `audit_events` block).
 
 SELECT
     COUNT(*) AS total_entries,
-    COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '90 days') AS last_90_days,
-    COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days') AS last_30_days,
-    COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days')  AS last_7_days
+    COUNT(*) FILTER (WHERE "timestamp" >= NOW() - INTERVAL '90 days') AS last_90_days,
+    COUNT(*) FILTER (WHERE "timestamp" >= NOW() - INTERVAL '30 days') AS last_30_days,
+    COUNT(*) FILTER (WHERE "timestamp" >= NOW() - INTERVAL '7 days')  AS last_7_days
 FROM secret_audit_log;
 
 \echo ''
@@ -209,23 +211,30 @@ FROM encryption_keys;
 -- Check for webhook triggers with rate limiting configured
 \echo 'Webhook triggers with rate limiting:'
 
+-- `webhook_triggers` names the limit `max_requests_per_minute` and stores
+-- `allowed_ips` as text[]; until 2026-09-11 this block read a `rate_limit`
+-- column that never existed and compared the array to a jsonb literal, so it
+-- could not execute.
 SELECT
     COUNT(*) AS total_triggers,
-    COUNT(*) FILTER (WHERE rate_limit IS NOT NULL AND rate_limit > 0) AS rate_limited,
-    COUNT(*) FILTER (WHERE rate_limit IS NULL OR rate_limit = 0) AS unlimited,
-    COUNT(*) FILTER (WHERE allowed_ips IS NOT NULL AND allowed_ips != '[]'::jsonb) AS ip_restricted
+    COUNT(*) FILTER (WHERE max_requests_per_minute IS NOT NULL AND max_requests_per_minute > 0) AS rate_limited,
+    COUNT(*) FILTER (WHERE max_requests_per_minute IS NULL OR max_requests_per_minute = 0) AS unlimited,
+    COUNT(*) FILTER (WHERE allowed_ips IS NOT NULL AND cardinality(allowed_ips) > 0) AS ip_restricted
 FROM webhook_triggers;
 
 -- Check for modules with secret access
 \echo ''
 \echo 'Module secret access configuration:'
 
+-- The table is `modules` (`wasm_modules` was dropped by migration
+-- 20260423050000, Phase 5) and `allowed_secrets` is text[]; until 2026-09-11
+-- this block queried the old name with jsonb operators, so it could not execute.
 SELECT
     COUNT(*) AS total_modules,
-    COUNT(*) FILTER (WHERE allowed_secrets IS NOT NULL AND allowed_secrets != '[]'::jsonb) AS with_secret_access,
-    COUNT(*) FILTER (WHERE allowed_secrets IS NOT NULL AND allowed_secrets @> '"*"') AS wildcard_access,
-    COUNT(*) FILTER (WHERE allowed_secrets IS NULL OR allowed_secrets = '[]'::jsonb) AS no_secret_access
-FROM wasm_modules;
+    COUNT(*) FILTER (WHERE allowed_secrets IS NOT NULL AND cardinality(allowed_secrets) > 0) AS with_secret_access,
+    COUNT(*) FILTER (WHERE allowed_secrets IS NOT NULL AND '*' = ANY(allowed_secrets)) AS wildcard_access,
+    COUNT(*) FILTER (WHERE allowed_secrets IS NULL OR cardinality(allowed_secrets) = 0) AS no_secret_access
+FROM modules;
 
 -- ---------------------------------------------------------------------------
 -- 6. USER ACCOUNT STATUS (CC6.1, CC6.2)
@@ -272,7 +281,10 @@ SELECT
     COALESCE(capability_world, 'NULL/unset') AS capability_world,
     COUNT(*) AS module_count,
     ROUND(100.0 * COUNT(*) / NULLIF(SUM(COUNT(*)) OVER (), 0), 1) AS percentage
-FROM node_templates
+-- `node_templates` was dropped by migration 20260423050000 (Phase 5, folded
+-- into `modules`); this block queried the old name until 2026-09-11 and could
+-- not execute.
+FROM modules
 GROUP BY capability_world
 ORDER BY module_count DESC;
 
@@ -318,7 +330,9 @@ SELECT
     COUNT(*) FILTER (WHERE status = 'approved') AS approved,
     COUNT(*) FILTER (WHERE status = 'denied') AS denied,
     COUNT(*) FILTER (WHERE status = 'pending') AS pending,
-    COUNT(*) FILTER (WHERE status = 'pending' AND created_at < NOW() - INTERVAL '24 hours') AS stale_pending
+    -- `execution_approvals` stamps `requested_at`, not `created_at`; this block
+    -- read the wrong column until 2026-09-11 and could not execute.
+    COUNT(*) FILTER (WHERE status = 'pending' AND requested_at < NOW() - INTERVAL '24 hours') AS stale_pending
 FROM execution_approvals;
 
 -- ---------------------------------------------------------------------------
