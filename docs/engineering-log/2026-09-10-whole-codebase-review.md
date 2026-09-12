@@ -2870,3 +2870,34 @@ counts as a leaf (`child-workflow-refs` is a scan over `graph_json`, arguably
 data; `retry-intelligence` is not), none has produced a cycle, and a lint
 would ship at seven markers of unmeasured precision. Recorded so the next
 cycle starts from the list rather than the grep.
+
+## Package AJ — two security knobs documented as something they are not (2026-09-12)
+
+Asked after the day's four RLS packages: are they live where it matters?
+The compose file sets `TALOS_RLS_SET_ROLE=true`; so does the Helm chart
+(`values.yaml:349`); and `talos_db::enforce_production_rls_posture`, called
+from `controller/src/bootstrap/services.rs:39`, refuses a production boot
+when RLS would not enforce unless `TALOS_ALLOW_RLS_DISABLED` is set, loudly.
+So the fail-open worry closed on measurement. What did not close was the
+reference row read on the way: `TALOS_RLS_SET_ROLE | none (optional) | both
+| Role name for the RLS SET ROLE enforcement path`. The knob is a boolean
+(`1`/`true`/`yes`/`on`; the role is the constant `talos_app`), read by
+`talos-db` on the controller only — and an operator who followed the row
+and set it to `talos_app` would switch enforcement OFF, since that spelling
+is not in the truthy set. One row down, `TALOS_RPC_GUEST_ROLE | none |
+both | Guest role for unauthenticated RPC`: it is the Postgres role the
+`database`-world sandbox runs guest SQL under, and no NATS-RPC message is
+unauthenticated. Both rows rewritten from their readers' doc comments,
+naming the production gate and its opt-out beside each.
+
+**The audit that would find the rest was measured and not built.** The
+09-11 sweep proved every one of 331 documented tokens has a reader; it
+proved nothing about descriptions. A description check is a human read
+per row. The `Component` column is machine-checkable in principle — but
+not by grep: a shared crate (`talos-config`, `talos-trace`,
+`talos-workflow-job-protocol`) is compiled into both binaries, so "who
+reads it" is a per-binary `cargo tree` question, and a first shell
+attempt at it produced a table that was wrong on nearly every row (zsh
+does not word-split an unquoted expansion; every reader list became one
+token). Population recorded: 106 rows carry the 🔒 mark; two are now known
+wrong and fixed; the rest are unverified.
