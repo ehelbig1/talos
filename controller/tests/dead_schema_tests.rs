@@ -15,6 +15,10 @@
 
 mod common;
 
+use common::{create_test_user, create_test_workflow, setup_test_context};
+use talos_workflow_repository::WorkflowRepository;
+use uuid::Uuid;
+
 const DROPPED: [&str; 11] = [
     "circuit_breaker_metrics",
     "compilation_cache",
@@ -98,4 +102,64 @@ async fn every_collector_export_statement_prepares() {
             .unwrap_or_else(|e| panic!("collector export for {table} cannot run: {e}"));
         assert!(n >= 0);
     }
+}
+
+/// The one reader `workflow_nodes` had was not a comment: the GraphQL
+/// `actorWorkflows` resolver counted nodes with a subselect over it, executed
+/// live six times in the two days before the table was dropped, and answered
+/// "Request could not be completed" for every actor on the #822 deploy. The
+/// count now comes from `graph_json`, so this pins both facts: the read
+/// succeeds on a schema without the table, and the count is the REAL one
+/// (it was always 0 before — the table never had a writer).
+#[tokio::test]
+async fn the_actor_workflows_read_counts_graph_nodes_without_workflow_nodes() {
+    let ctx = setup_test_context().await;
+    let pool = ctx.db_pool.clone();
+    let user = create_test_user(&ctx.auth_service, "dead_schema_actor_wf@example.com").await;
+    let actor_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO actors (id, user_id, name) VALUES ($1, $2, 'dead-schema-actor')")
+        .bind(actor_id)
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let wf = create_test_workflow(&pool, user, "dead-schema-actor-wf").await;
+    sqlx::query(
+        "UPDATE workflows SET actor_id = $2, \
+         graph_json = '{\"nodes\":[{\"id\":\"a\"},{\"id\":\"b\"},{\"id\":\"c\"}],\"edges\":[]}' \
+         WHERE id = $1",
+    )
+    .bind(wf)
+    .bind(actor_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // CONTROL: another actor's workflow stays out.
+    let other_actor = Uuid::new_v4();
+    sqlx::query("INSERT INTO actors (id, user_id, name) VALUES ($1, $2, 'dead-schema-other')")
+        .bind(other_actor)
+        .bind(user)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let other_wf = create_test_workflow(&pool, user, "dead-schema-other-wf").await;
+    sqlx::query("UPDATE workflows SET actor_id = $2 WHERE id = $1")
+        .bind(other_wf)
+        .bind(other_actor)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let repo = WorkflowRepository::new(pool.clone());
+    let mut conn = pool.acquire().await.unwrap();
+    let rows = repo
+        .list_workflows_for_actor_scoped(&mut conn, actor_id, user, 10)
+        .await
+        .expect("the actor-workflows read must prepare on a schema without workflow_nodes");
+    assert_eq!(rows.len(), 1, "only this actor's workflow");
+    assert_eq!(rows[0].id, wf);
+    assert_eq!(
+        rows[0].node_count, 3,
+        "the count is derived from graph_json"
+    );
 }
