@@ -1468,12 +1468,11 @@ impl SchedulerService {
                 // that the timeout was DETECTED but not persisted.
                 // Same class as MCP-743 (talos-webhooks). WARN with
                 // `target: "talos_audit"` for dashboard alerting.
-                if let Err(ue) = sqlx::query(
-                    "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $2 WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')",
+                if let Err(ue) = talos_workflow_repository::fail_workflow_execution_unless_terminal(
+                    &db_pool_for_timeout,
+                    execution_id,
+                    &format!("Execution timed out after {} seconds", timeout_secs),
                 )
-                .bind(execution_id)
-                .bind(format!("Execution timed out after {} seconds", timeout_secs))
-                .execute(&db_pool_for_timeout)
                 .await
                 {
                     tracing::warn!(
@@ -2256,12 +2255,11 @@ async fn run_scheduled_execution(
             let error_msg = format!("Scheduler: failed to build engine: {}", redacted_e);
             tracing::error!(execution_id = %execution_id, "{}", error_msg);
             // MCP-776 (2026-05-13): see timeout-arm above.
-            if let Err(ue) = sqlx::query(
-                "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $2 WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')",
+            if let Err(ue) = talos_workflow_repository::fail_workflow_execution_unless_terminal(
+                &db_pool,
+                execution_id,
+                &error_msg,
             )
-            .bind(execution_id)
-            .bind(&error_msg)
-            .execute(&db_pool)
             .await
             {
                 tracing::warn!(
@@ -2509,12 +2507,11 @@ async fn run_scheduled_execution(
             let redacted_err = talos_dlp_provider::redact_str(&e.to_string());
             let error_msg = format!("Scheduled workflow failed: {}", redacted_err);
             // MCP-776 (2026-05-13): see timeout-arm earlier in this function.
-            if let Err(ue) = sqlx::query(
-                "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $2 WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')",
+            if let Err(ue) = talos_workflow_repository::fail_workflow_execution_unless_terminal(
+                &db_pool,
+                execution_id,
+                &error_msg,
             )
-            .bind(execution_id)
-            .bind(&error_msg)
-            .execute(&db_pool)
             .await
             {
                 tracing::warn!(

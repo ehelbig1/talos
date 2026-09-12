@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "talos-execution-finalizer",
     "talos-dlp",
     "talos-secrets",
     "talos-audit-event",

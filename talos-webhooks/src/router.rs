@@ -2318,13 +2318,13 @@ impl WebhookRouter {
                 // reason — operator dashboards saw an execution that
                 // never moved past queued and no log signal explaining
                 // why. Same operator-visibility class as MCP-733..742.
-                if let Err(db_err) = sqlx::query(
-                    "UPDATE workflow_executions SET status = 'failed', error_message = $2, completed_at = NOW() WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')",
-                )
-                .bind(execution_id)
-                .bind(format!("Failed to load graph: {}", redacted))
-                .execute(&self.db_pool)
-                .await
+                if let Err(db_err) =
+                    talos_workflow_repository::fail_workflow_execution_unless_terminal(
+                        &self.db_pool,
+                        execution_id,
+                        &format!("Failed to load graph: {}", redacted),
+                    )
+                    .await
                 {
                     tracing::warn!(
                         target: "talos_rpc",
@@ -2486,13 +2486,13 @@ impl WebhookRouter {
                     // visibility rationale. The execution row would
                     // otherwise be stuck in 'queued' even though the
                     // caller saw 500 + the redacted error in the body.
-                    if let Err(db_err) = sqlx::query(
-                        "UPDATE workflow_executions SET status = 'failed', error_message = $2, completed_at = NOW() WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')",
-                    )
-                    .bind(execution_id)
-                    .bind(&err_msg)
-                    .execute(&db_pool)
-                    .await
+                    if let Err(db_err) =
+                        talos_workflow_repository::fail_workflow_execution_unless_terminal(
+                            &db_pool,
+                            execution_id,
+                            &err_msg,
+                        )
+                        .await
                     {
                         tracing::warn!(
                             target: "talos_rpc",
@@ -2539,13 +2539,13 @@ impl WebhookRouter {
                     // sees an indefinitely-queued execution with no
                     // explanation, indistinguishable from a stuck
                     // dispatcher.
-                    if let Err(db_err) = sqlx::query(
-                        "UPDATE workflow_executions SET status = 'failed', error_message = $2, completed_at = NOW() WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')",
-                    )
-                    .bind(execution_id)
-                    .bind(&err_msg)
-                    .execute(&db_pool)
-                    .await
+                    if let Err(db_err) =
+                        talos_workflow_repository::fail_workflow_execution_unless_terminal(
+                            &db_pool,
+                            execution_id,
+                            &err_msg,
+                        )
+                        .await
                     {
                         tracing::warn!(
                             target: "talos_rpc",

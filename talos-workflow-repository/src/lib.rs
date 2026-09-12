@@ -89,3 +89,8 @@ impl WorkflowRepository {
         self
     }
 }
+
+/// ONE home for the dispatcher-side workflow-failure finalizer (2026-09-12);
+/// re-exported so the scheduler and webhook router call it through the crate they
+/// already depend on.
+pub use talos_execution_finalizer::fail_workflow_execution_unless_terminal;

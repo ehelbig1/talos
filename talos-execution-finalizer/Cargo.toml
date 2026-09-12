@@ -1,0 +1,18 @@
+[package]
+name = "talos-execution-finalizer"
+description = "The one home for the workflow_executions terminal writes every dispatcher and engine path shares — failed (dispatcher-side guard) and completed — each RETURNING the row's own duration and recording the outcome the alerts read"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde_json.workspace = true
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "uuid", "json", "chrono"] }
+talos-metrics = { path = "../talos-metrics" }
+uuid.workspace = true
+
+[lints]
+workspace = true

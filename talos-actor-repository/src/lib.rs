@@ -2240,23 +2240,25 @@ impl ActorRepository {
             error_message
         };
         let redacted = talos_dlp_provider::redact_str(truncated);
-        sqlx::query(
-            "UPDATE workflow_executions SET status = 'failed', error_message = $1, completed_at = NOW() WHERE id = $2 AND status = 'running'",
+        // ONE home (2026-09-12): counted, and the guard is `NOT IN (terminal,
+        // resuming)` rather than `= 'running'` — a trigger-path failure on a
+        // row still `queued` must not leave it queued forever.
+        talos_execution_finalizer::fail_workflow_execution_unless_terminal(
+            &self.db_pool,
+            exec_id,
+            &redacted,
         )
-        .bind(&redacted)
-        .bind(exec_id)
-        .execute(&self.db_pool)
         .await?;
         Ok(())
     }
 
     /// Mark a running execution as failed with a fixed 'NATS client not available' message.
     pub async fn fail_execution_nats_unavailable(&self, exec_id: Uuid) -> Result<()> {
-        sqlx::query(
-            "UPDATE workflow_executions SET status = 'failed', error_message = 'NATS client not available', completed_at = NOW() WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')",
+        talos_execution_finalizer::fail_workflow_execution_unless_terminal(
+            &self.db_pool,
+            exec_id,
+            "NATS client not available",
         )
-        .bind(exec_id)
-        .execute(&self.db_pool)
         .await?;
         Ok(())
     }
@@ -2269,63 +2271,34 @@ impl ActorRepository {
         exec_id: Uuid,
         output_data: &serde_json::Value,
     ) -> Result<()> {
+        // The statements live in `talos-execution-finalizer` (2026-09-12): the
+        // former inline twins wrote `status = 'completed'` with a
+        // `status = 'running'`-only guard, recorded nothing on
+        // `talos_workflow_executions_total{status="success"}`, and skipped
+        // the payload bound the engine-side finalizer applies.
+        let bounded = talos_dlp_provider::bound_execution_payload(output_data);
+        let output = &*bounded;
         if let Some(sm) = &self.secrets_manager {
-            let json_str = serde_json::to_string(output_data)?;
-            // MCP-S2: bind the output ciphertext to exec_id so an
-            // attacker with DB write capability can't swap user B's
-            // execution output onto user A's row to leak it through
-            // the GraphQL read path. AAD-bound + per-context-derived
-            // key; per-row format column dispatches so legacy rows still read.
-            //
-            // Per-org DEK arc (2026-09-10): encrypt under the WORKFLOW's
-            // org root DEK (v4) — the same resolution
-            // `ExecutionRepository::encrypt_output` uses for this column.
-            // This path previously wrote v3 under the GLOBAL DEK, so the
-            // DEK scope of `output_data_enc` depended on which repository
-            // finalised the execution. `None` org → v3 as before. The
-            // RETURNED format is bound below, never a hardcoded 3/4.
+            let json_str = serde_json::to_string(output)?;
             let org_id = sm.resolve_workflow_execution_org_id(exec_id).await?;
             let (key_id, enc_bytes, format_version) = sm
                 .encrypt_value_aad_v4_or_global(&json_str, org_id, exec_id.as_bytes())
                 .await?;
-            sqlx::query(
-                "UPDATE workflow_executions \
-                 SET status = 'completed', output_data = NULL, \
-                     output_data_enc = $1, output_enc_key_id = $2, \
-                     output_data_format = $3, completed_at = NOW() \
-                 WHERE id = $4 AND status = 'running'",
+            talos_execution_finalizer::complete_workflow_execution_encrypted(
+                &self.db_pool,
+                exec_id,
+                &enc_bytes,
+                key_id,
+                format_version,
             )
-            .bind(&enc_bytes)
-            .bind(key_id)
-            .bind(format_version)
-            .bind(exec_id)
-            .execute(&self.db_pool)
             .await?;
         } else {
-            // L T4-7: NULL the ciphertext columns symmetrically with the
-            // encrypted branch above. Without this, a row that was
-            // previously written via the encrypted path then re-written
-            // via the plaintext path (test env, post-rotate ad-hoc fix,
-            // SecretsManager unwiring during a migration) keeps stale
-            // ciphertext alongside the new plaintext. Reads prefer
-            // ciphertext when both columns are populated, so the row
-            // would decrypt to the OLD output, masking the rewrite.
-            //
-            // MCP-971 (2026-05-15): DLP-redact plaintext-fallback
-            // output. Sibling to the workflow-repository +
-            // execution-repository fixes — defence-in-depth even
-            // though SecretsManager is wired in production.
-            let redacted = talos_dlp_provider::redact_json(output_data);
-            sqlx::query(
-                "UPDATE workflow_executions \
-                 SET status = 'completed', output_data = $1, \
-                     output_data_enc = NULL, output_enc_key_id = NULL, \
-                     completed_at = NOW() \
-                 WHERE id = $2 AND status = 'running'",
+            let redacted = talos_dlp_provider::redact_json(output);
+            talos_execution_finalizer::complete_workflow_execution_plain(
+                &self.db_pool,
+                exec_id,
+                &redacted,
             )
-            .bind(&redacted)
-            .bind(exec_id)
-            .execute(&self.db_pool)
             .await?;
         }
         Ok(())

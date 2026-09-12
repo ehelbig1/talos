@@ -1092,19 +1092,13 @@ impl WorkflowRepository {
             .maybe_encrypt_execution_output(execution_id, output)
             .await?
         {
-            sqlx::query(
-                "UPDATE workflow_executions \
-                 SET status = 'completed', output_data = NULL, \
-                     output_data_enc = $1, output_enc_key_id = $2, \
-                     output_data_format = $3, completed_at = NOW() \
-                 WHERE id = $4 AND status IN ('running', 'resuming') \
-                 RETURNING EXTRACT(EPOCH FROM (completed_at - started_at))::float8",
+            talos_execution_finalizer::complete_workflow_execution_encrypted(
+                &self.db_pool,
+                execution_id,
+                &enc_bytes,
+                key_id,
+                format_version,
             )
-            .bind(&enc_bytes)
-            .bind(key_id)
-            .bind(format_version)
-            .bind(execution_id)
-            .fetch_optional(&self.db_pool)
             .await?
         } else {
             // MCP-971 (2026-05-15): DLP-redact the plaintext fallback
@@ -1117,26 +1111,16 @@ impl WorkflowRepository {
             // even though it's the defence-in-depth path. `redact_str`
             // is infallible, `redact_json` is too (walks the tree).
             let redacted = talos_dlp_provider::redact_json(output);
-            sqlx::query(
-                "UPDATE workflow_executions \
-                 SET status = 'completed', output_data = $1, \
-                     output_data_enc = NULL, output_enc_key_id = NULL, \
-                     completed_at = NOW() \
-                 WHERE id = $2 AND status IN ('running', 'resuming') \
-                 RETURNING EXTRACT(EPOCH FROM (completed_at - started_at))::float8",
+            talos_execution_finalizer::complete_workflow_execution_plain(
+                &self.db_pool,
+                execution_id,
+                &redacted,
             )
-            .bind(&redacted)
-            .bind(execution_id)
-            .fetch_optional(&self.db_pool)
             .await?
         };
-        // talos_workflow_executions_total{status="success"} — see
-        // talos_metrics::record_workflow_outcome (feeds TalosWorkflowFailureRateHigh).
-        if let Some(row) = finalized {
-            use sqlx::Row as _;
-            let duration_secs = row.try_get::<Option<f64>, _>(0)?;
-            talos_metrics::record_workflow_outcome("success", duration_secs);
-        }
+        // talos_workflow_executions_total{status="success"} is recorded by
+        // talos_execution_finalizer, once per finalized row (2026-09-12).
+        let _finalized_rows = finalized;
         Ok(())
     }
 
@@ -1314,12 +1298,6 @@ impl WorkflowRepository {
         Ok(())
     }
 
-    /// Cancel all still-running module_executions for a workflow execution.
-    /// Called after marking a workflow as failed so that parallel siblings
-    /// that were in-flight are cleaned up.  The DB trigger
-    /// `trg_cancel_siblings_on_workflow_fail` (migration 20260327000001) handles
-    /// this atomically, but this explicit call is defence-in-depth for environments
-    /// where the trigger has not yet been applied.
     pub async fn cancel_running_module_executions(&self, execution_id: Uuid) -> Result<()> {
         let cancelled = cancel_running_module_executions(
             &self.db_pool,

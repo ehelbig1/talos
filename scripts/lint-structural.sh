@@ -3521,7 +3521,7 @@ bold "▶ check 46: execution finalizers must accept 'resuming', not only 'runni
 RESUME_FINALIZE_VIOLATIONS=0
 rf_matches=$(grep -rnE --include='*.rs' \
     "WHERE id = [\$][0-9]+ AND status = 'running'" \
-    talos-workflow-repository talos-execution-repository 2>/dev/null || true)
+    controller/src worker/src talos-*/src 2>/dev/null || true)
 if [ -n "$rf_matches" ]; then
     while IFS= read -r line; do
         file=$(echo "$line" | cut -d: -f1)

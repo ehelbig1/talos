@@ -2196,41 +2196,28 @@ impl ExecutionRepository {
     ) -> Result<()> {
         let result = if self.output_encryption_enabled() {
             let (key_id, enc_bytes, format_version) = self.encrypt_output(exec_id, output).await?;
-            sqlx::query(
-                "UPDATE workflow_executions \
-                 SET status = 'completed', output_data = NULL, \
-                     output_data_enc = $1, output_enc_key_id = $2, \
-                     output_data_format = $3, completed_at = NOW() \
-                 WHERE id = $4 AND status IN ('running', 'resuming') \
-                 RETURNING EXTRACT(EPOCH FROM (completed_at - started_at))::float8",
+            talos_execution_finalizer::complete_workflow_execution_encrypted(
+                &self.db_pool,
+                exec_id,
+                &enc_bytes,
+                key_id,
+                format_version,
             )
-            .bind(&enc_bytes)
-            .bind(key_id)
-            .bind(format_version)
-            .bind(exec_id)
-            .fetch_optional(&self.db_pool)
             .await?
         } else {
             // MCP-971: DLP-redact plaintext-fallback output. Sibling
             // to the workflow-repository fix above.
             let redacted = talos_dlp_provider::redact_json(output);
-            sqlx::query(
-                "UPDATE workflow_executions \
-                 SET status = 'completed', output_data = $1, completed_at = NOW() \
-                 WHERE id = $2 AND status IN ('running', 'resuming') \
-                 RETURNING EXTRACT(EPOCH FROM (completed_at - started_at))::float8",
+            talos_execution_finalizer::complete_workflow_execution_plain(
+                &self.db_pool,
+                exec_id,
+                &redacted,
             )
-            .bind(&redacted)
-            .bind(exec_id)
-            .fetch_optional(&self.db_pool)
             .await?
         };
-        if let Some(row) = result {
-            use sqlx::Row as _;
-            let duration_secs = row.try_get::<Option<f64>, _>(0)?;
-            // talos_workflow_executions_total{status="success"} — feeds the
-            // TalosWorkflowFailureRateHigh alert (only on a real transition).
-            talos_metrics::record_workflow_outcome("success", duration_secs);
+        // talos_workflow_executions_total{status="success"} is recorded by
+        // talos_execution_finalizer, once per finalized row (2026-09-12).
+        if result > 0 {
             if let Some(ref tx) = self.workflow_execution_tx {
                 // Fetch user_id and workflow_id to broadcast properly
                 let row = sqlx::query!("SELECT user_id, workflow_id, started_at FROM workflow_executions WHERE id = $1", exec_id)
@@ -3875,15 +3862,21 @@ impl ExecutionRepository {
         // alert. It counts now; the duration is observed only on the arm that
         // stamps completed_at (the other leaves it NULL, and NULL is unknown,
         // not zero).
-        let sql = if set_completed_at {
-            "UPDATE workflow_executions SET status = 'failed', completed_at = NOW(), error_message = $2 \
+        if set_completed_at {
+            // ONE home for the dispatcher-side failure finalizer (2026-09-12).
+            return talos_execution_finalizer::fail_workflow_execution_unless_terminal(
+                &self.db_pool,
+                execution_id,
+                error_message,
+            )
+            .await;
+        }
+        // The no-`completed_at` variant stays here: it is not a terminal-time
+        // write (the row's duration is unknown), so it records `None`.
+        let sql = "UPDATE workflow_executions \
+             SET status = 'failed', error_message = $2 \
              WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming') \
-             RETURNING EXTRACT(EPOCH FROM (completed_at - started_at))::float8"
-        } else {
-            "UPDATE workflow_executions SET status = 'failed', error_message = $2 \
-             WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming') \
-             RETURNING NULL::float8"
-        };
+             RETURNING NULL::float8";
         let row = sqlx::query(sql)
             .bind(execution_id)
             .bind(error_message)
