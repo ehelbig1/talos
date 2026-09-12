@@ -2758,3 +2758,56 @@ matched. Re-counted with the escapes stripped, the #828 boot had 7 WARN and
 all benign — and the two ERRORs are the very rows this package is about. A
 zero from a filter that cannot match is the green-tick-over-nothing shape,
 turned on the reviewer.
+
+## Package AH — the archive's status CHECK was March's (2026-09-12)
+
+Found while seeding the AG test: `pending` violated `workflow_executions`'
+status CHECK, yet a second constraint with the same name admitted it. That
+second one is the archive's. `20260314000500` created
+`workflow_executions_archive` with the live table's status set of that day
+(`pending, running, completed, failed, cancelled`); `20260314001000` added
+`queued` to the live table the same day, `20260319000000` added `waiting`,
+`20260530000000` added `resuming`, and `pending` was dropped from the live
+set along the way — none of the three touched the archive. Measured on the
+dev database: live admits seven statuses, the archive five, disagreeing in
+both directions (`pending` only in the archive; `queued`, `waiting`,
+`resuming` only in the live table); the archive holds 2 226 rows, 2 212
+`completed` and 14 `failed`.
+
+**Inert today, and why that is stated rather than assumed.** The retention
+sweep's predicate is `status IN ('completed', 'failed', 'cancelled') AND
+completed_at IS NOT NULL AND is_pinned = false`, so every row it has ever
+moved is admitted by both constraints. The first writer that moves a
+non-terminal row — an operator's manual archive, a decommission path that
+archives everything — fails 23514 against a constraint naming a status the
+platform retired in March. The two tables' COLUMN parity is pinned
+(`ARCHIVED_EXECUTION_COLUMNS` and `execution_archive_read_tests`); nothing
+pinned their constraints.
+
+**What shipped.** Migration `20260912160000` drops the archive's CHECK and
+adds `workflow_executions_archive_status_check` with the live set verbatim
+(`running, completed, failed, cancelled, queued, waiting, resuming`) —
+renamed so `pg_constraint` tells the two apart. `pending` goes: no live row
+can carry it and none of the archived rows does.
+
+**Guards.** `controller/tests/archive_status_check_parity_tests`
+(CTRL_TESTS): reads both definitions from `pg_constraint`, parses the
+quoted set, asserts the archive's equals the live table's and contains no
+`pending`; inserts a `cancelled` archived row (admitted) and a `pending` one
+(refused, 23514). Mutation: widening only the live constraint on the
+template (adding `paused`) fails the parity test — which is exactly the
+shape of the next drift.
+
+**Found on the way, not changed.** `20260910120000`'s in-flight partial
+index predicate reads `status IN ('running', 'queued', 'pending',
+'resuming')`: `pending` is a never-true disjunct there. Harmless, and an
+index predicate decides which queries the index can serve, so it is
+recorded rather than edited.
+
+**Measured beside it, not changed.** The dependency edge that forced
+package AG's home into a leaf: `talos-workflow-repository` depends on
+`talos-graph-rag` (`GRAPH_SERVICE`, two sites), `talos-memory` (four
+functions) and `talos-memory-ranking` (one) — a repository reaching into
+services. Seven such repository→non-data edges exist across the workspace
+today; a layering lint's precision is unmeasured and the refactor is a
+package of its own.
