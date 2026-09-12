@@ -65,7 +65,12 @@ const DROPPED: [&str; 45] = [
     "idx_workflow_execution_logs_exec",
 ];
 
-const KEPT: [&str; 41] = [
+// `idx_secrets_user_keypath` was the kept sibling of the dropped
+// `idx_secrets_user_id` when this list was written; migration 20260912150000
+// then dropped `secrets.user_id` itself (never written) and the index with it,
+// so it is no longer a survivor to pin. Its replacement, `idx_secrets_owner_user_id`,
+// is pinned by `secrets_owner_column_tests`.
+const KEPT: [&str; 40] = [
     "agent_runtime_memory_agent_id_key_key",
     "atlassian_integrations_user_id_cloud_id_key",
     "gmail_integrations_user_id_email_address_key",
@@ -83,7 +88,6 @@ const KEPT: [&str; 41] = [
     "idx_module_executions_status_created",
     "idx_module_executions_user_module_started",
     "idx_module_executions_wf_exec_status",
-    "idx_secrets_user_keypath",
     "idx_user_sessions_user_expires",
     "idx_webhook_request_log_user_trigger",
     "idx_webhook_triggers_enabled_user",
