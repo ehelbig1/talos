@@ -2435,3 +2435,107 @@ that share a leading column with a THREE-column sibling but diverge on the
 second are not prefixes and are untouched. The perf rule in CLAUDE.md
 ("ALWAYS add database indexes for frequently queried column combinations")
 gains no converse sentence: the invariant tests are the converse.
+
+## Package AD — a tenant column nothing writes, a policy nothing evaluates (2026-09-12)
+
+Three catalog surveys ran while #827 was in CI, each decidable from the
+catalog rather than from a two-day statistics window.
+
+**Vector indexes.** Five ivfflat indexes, ~50 MB, `idx_scan = 0` on all of
+them — and that zero is NOT a window artefact, because 12 633 kNN
+statements over `ml_examples` ran in the same window. The suspected cause
+was check 60's `, id` tiebreaker on every vector `ORDER BY`. Tested rather
+than assumed, under `enable_seqscan = off`: the canonical shape plans an
+`Index Scan using idx_ml_examples_embedding`; WITH the tiebreaker the
+planner runs an `Incremental Sort` over that same index scan; with the live
+filters (`dataset_id`, `embedding_model`) it prefers the btree on
+`embedding_model` and sorts; and with the default planner at 2 457 rows
+even the canonical shape is a seq scan. So the tiebreaker is exonerated,
+the indexes are dead by size and filter shape, and that is a usage
+argument, the kind package AC declined to act on. Recorded: the 47 MB
+`idx_ml_examples_embedding` over ~10 MB of vectors is bloat from the
+pre-#821 split churn (62 evals × 2 145 rewritten rows, each a new ivfflat
+entry); a `REINDEX` reclaims it and is an operator's action, not a
+migration.
+
+**Foreign keys without an index.** 28 by the naive rule; 19 once a partial
+`WHERE col IS NOT NULL` index is allowed to count (it covers the FK lookup,
+which never asks for NULL). The cost of an unindexed FK is a scan of the
+child on every parent delete, or a filter on the column nothing indexes.
+Measured: no parent among the 19 was deleted in the window (`ops_alerts`
+0 deletes — the 378 first read there were updates —, `workflow_versions`,
+`actors`, `users`, `organizations`, `encryption_keys` all 0), the one
+cascading child (`ops_alert_correction_tokens`, 8 415 rows) had 4
+sequential scans total, and the only column with live filters is
+`secrets.owner_user_id` on a 14-row table. Inert; recorded.
+
+**Row-level security.** 83 public tables, 28 with RLS. Of the other 55,
+37 carry a `user_id` or `org_id` column and no policy. The compose file
+sets `TALOS_RLS_SET_ROLE=true`, so on this fleet a scoped transaction
+really does `SET LOCAL ROLE talos_app` and the policies are live — the
+first question was therefore not "is there a gap" but "what would a
+policy on each of these actually do".
+
+Two measurements decided the shape. First, the tenant column on the big
+tables is unwritten: `execution_events` 130 696 rows with `org_id` NULL on
+130 696; `execution_cost_rollup` 56 273 / 56 273; `workflow_versions` 165 /
+165; `llm_usage` 4 572 / 4 572 (and `user_id` NULL on 2 206, `actor_id` on
+2 209 — 2 206 rows attributed to nothing at all); `workflow_alerts` 110 /
+110; `actor_action_log` 102 / 102. The May org-id migration added the key
+and no writer stamps it. The sibling policy template (`NULLIF(org_ids) IS
+NULL OR org_id IS NULL OR org_id = ANY(...)`) would admit every row of
+every one of them through its second clause — a policy that looks like
+the others and protects nothing. Second, a policy is evaluated only under
+`talos_app`, i.e. only for a statement executed on a scoped connection.
+Scanning every `pub async fn` in the workspace that takes a
+`&mut PgConnection` or ends in `_scoped` and reading the tables each names:
+exactly **three** of the 37 appear — `workflow_versions` (five methods:
+`list_versions_on_conn`, `get_active_version_on_conn`,
+`get_active_graph_json_on_conn`, `get_version_for_accessor_on_conn`, the
+actor-policy detector), `execution_approvals` (`list_pending_approvals_scoped`,
+`decide_execution_approval_scoped`) and `actor_action_log`
+(`list_action_log_scoped`). Every analytics read of `execution_events` and
+`execution_cost_rollup` runs on `&self.db_pool` as the superuser, where a
+policy is bypassed.
+
+**The gate is the three.** Migration `20260912130000`: the tenant is the
+parent's tenant, and the parent's own policy does the work — under
+`talos_app` the `EXISTS (SELECT 1 FROM workflows w WHERE w.id =
+workflow_versions.workflow_id)` subquery is itself filtered by
+`workflows_tenant_isolation`, so a child row is visible exactly when its
+parent is, with no second copy of the org-membership arithmetic to drift.
+`actor_action_log` derives from `actors` the same way. The unset→permit
+clause is kept (a scoped role with no GUC is the engine/analytics
+posture), FORCE is applied, and `WITH CHECK` is the same expression so a
+scoped INSERT under another tenant's workflow is a 42501.
+
+**Proved before it was written**, on a full `pg_dump | pg_restore` copy of
+the dev database into the scratch container (`talos_perf`, 740 MB), with
+the three policies created inside a transaction that was rolled back: as
+the owning user under `talos_app` the counts were 165 / 6 / 102 — every
+row, since one user owns this fleet — and as a stranger 0 / 0 / 0; the
+three scoped statements planned as an index scan plus a hashed subplan
+over the parent, 0.017 / 0.030 / 0.016 ms.
+
+**Guards.** `controller/tests/rls_scoped_reader_tables_tests` (CTRL_TESTS)
+drives the PRODUCTION scoped readers whose statements carry no owner
+predicate — `WorkflowVersionService::list_versions_on_conn` and
+`ActorRepository::list_action_log_scoped` — under `talos_app` with user
+A's GUC against user B's ids, plus a raw count for the approval. On
+pristine main each returns 1; here 0. Beside it: the owner control (1 /
+1 / 1, so `USING (false)` cannot pass), the unset-GUC control (both
+tenants' rows visible, pinning the transition clause), the structural pin
+(enabled + forced + policy by name) and the write control (the owner's
+version lands, a version under B's workflow is 42501). Mutations: dropping
+the `workflow_versions` policy fails the isolation test; replacing the
+`actor_action_log` policy with `USING (false)` fails the owner control.
+
+**The 34 are recorded, not gated.** A policy on a table only the
+superuser ever reads is a control nothing exercises — check 58's dead
+metric in RLS form — and a wrong one would fail silently on the first
+scoped reader someone adds, in whichever direction it was wrong. The list
+is in this section so the next scoped reader over `execution_events`,
+`execution_cost_rollup`, `llm_usage`, `ops_alerts`, `workflow_alerts`,
+`admin_event_log` or `execution_state` knows it is adding the first
+evaluated read of an unguarded table, and that the table's own `org_id`
+is not a key it can scope on.
