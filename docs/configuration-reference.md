@@ -35,8 +35,16 @@ Workspace-wide read conventions:
   accept the previous value under a `_PREVIOUS` name during the overlap
   window.
 
-Column legend — **Component**: controller / worker / both (read in a shared
-crate used by both) / crate name for leaf-crate reads. **Sensitive**: 🔒 =
+Column legend — **Component**: the PROCESS that reads the variable at
+runtime — controller / worker / both — or a crate name for a leaf-crate read.
+`both` means BOTH binaries read it, not "a shared crate mentions it": a crate
+linked into only one binary can only be read by that binary, and check 89
+(`scripts/lint-config-reference-components.py`) derives the linked sets from
+`cargo tree` and fails on a row claiming a process that cannot read it. Before
+2026-09-12 that column said `both` for 108 controller-only variables
+(`TALOS_MASTER_KEY`, `JWT_SECRET`, `VAULT_ADDR`, every scheduler and memory-loop
+knob) — read literally, an instruction to hand the credential-free worker the
+master KEK. **Sensitive**: 🔒 =
 secret material, trust anchor, or a security-posture switch; never log its
 value, log presence only.
 
@@ -46,11 +54,11 @@ value, log presence only.
 
 | Variable | Default | Component | Purpose | Sensitive |
 |---|---|---|---|---|
-| `DATABASE_URL` | required | both | Primary Postgres DSN; pool creation | 🔒 (embeds credentials) |
+| `DATABASE_URL` | required | controller | Primary Postgres DSN; pool creation | 🔒 (embeds credentials) |
 | `DATABASE_READ_REPLICA_URL` | none (optional) | controller | Read-replica DSN; falls back to primary if unset (`talos-db`) | 🔒 |
 | `DB_MAX_CONNECTIONS` | `30` | controller | Postgres pool max connections | |
 | `DB_READ_REPLICA_MAX_CONNECTIONS` | `20` | controller | Replica pool max connections | |
-| `DB_STATEMENT_TIMEOUT_SECS` | `60` | both | Per-statement timeout applied to the pool | |
+| `DB_STATEMENT_TIMEOUT_SECS` | `60` | controller | Per-statement timeout applied to the pool | |
 | ~~`DB_EXECUTION_TIMEOUT_SECS`~~ | n/a | — | **Not a variable (removed 2026-09-11).** It was read and logged in the connect line as `execution_timeout=300s`, but reached no `SET` and no pool — there is no "execution-path pool"; every statement runs under `DB_STATEMENT_TIMEOUT_SECS`. Setting it changed nothing, and now nothing reads it | |
 | `REDIS_URL` | none (optional) | both | Redis connection; Redis-backed features disabled when unset | 🔒 |
 | `NATS_URL` | none (controller) / effectively required (worker) | both | NATS server URL | |
@@ -59,10 +67,10 @@ value, log presence only.
 | `NATS_CA_FILE` | none (optional) | both | PEM path added as trusted root for NATS TLS (`talos-nats-tls`) | 🔒 |
 | `NATS_JOB_TOPIC` | built-in topic | worker | Single-job subscription subject | |
 | `NATS_PIPELINE_TOPIC` | built-in topic | worker | Pipeline-job subscription subject | |
-| `WORKFLOW_NATS_PREFIX` | `workflow` | both | NATS subject prefix for engine dispatch | |
-| `NEO4J_URI` | none (optional) | both | Graph-RAG Neo4j URI; graph features disabled when unset | |
-| `NEO4J_USER` | `neo4j` | both | Neo4j username | |
-| `NEO4J_PASSWORD` | required if Neo4j used | both | Neo4j password | 🔒 |
+| `WORKFLOW_NATS_PREFIX` | `workflow` | controller | NATS subject prefix for engine dispatch | |
+| `NEO4J_URI` | none (optional) | controller | Graph-RAG Neo4j URI; graph features disabled when unset | |
+| `NEO4J_USER` | `neo4j` | controller | Neo4j username | |
+| `NEO4J_PASSWORD` | required if Neo4j used | controller | Neo4j password | 🔒 |
 | `TALOS_DEPLOYMENT_TOPOLOGY` | `single_pod` | controller | Deployment topology selector | |
 | `RUST_ENV` | `development` | both | Master environment switch; `production` gates fail-closed behavior workspace-wide (`talos_config::is_production`) | 🔒 (posture) |
 
@@ -75,31 +83,31 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 
 | Variable | Default | Component | Purpose | Sensitive |
 |---|---|---|---|---|
-| `JWT_SECRET` (+`_FILE`) | required (HS\*) | both | HMAC JWT signing secret | 🔒 |
-| `JWT_PRIVATE_KEY` (+`_FILE`) | required (RS/ES) | both | Asymmetric JWT signing key (PEM) | 🔒 |
-| `JWT_PUBLIC_KEY` (+`_FILE`) | required (RS/ES) | both | JWT verification key | 🔒 |
-| `JWT_PUBLIC_KEY_PREVIOUS` (+`_FILE`) | none (optional) | both | Previous JWT public key for rotation overlap | 🔒 |
-| `JWT_ALGORITHM` | `HS256` | both | JWT algorithm selection | |
-| `JWT_ALGORITHM_PREVIOUS` | none (optional) | both | Previous algorithm during rotation (`talos-auth`) | |
-| `JWT_REQUIRE_AUD` | `false` | both | Enforce the JWT `aud` claim per request | 🔒 (posture) |
-| `BCRYPT_COST` | `12` | both | Bcrypt cost factor for password hashing | 🔒 (tuning) |
+| `JWT_SECRET` (+`_FILE`) | required (HS\*) | controller | HMAC JWT signing secret | 🔒 |
+| `JWT_PRIVATE_KEY` (+`_FILE`) | required (RS/ES) | controller | Asymmetric JWT signing key (PEM) | 🔒 |
+| `JWT_PUBLIC_KEY` (+`_FILE`) | required (RS/ES) | controller | JWT verification key | 🔒 |
+| `JWT_PUBLIC_KEY_PREVIOUS` (+`_FILE`) | none (optional) | controller | Previous JWT public key for rotation overlap | 🔒 |
+| `JWT_ALGORITHM` | `HS256` | controller | JWT algorithm selection | |
+| `JWT_ALGORITHM_PREVIOUS` | none (optional) | controller | Previous algorithm during rotation (`talos-auth`) | |
+| `JWT_REQUIRE_AUD` | `false` | controller | Enforce the JWT `aud` claim per request | 🔒 (posture) |
+| `BCRYPT_COST` | `12` | controller | Bcrypt cost factor for password hashing | 🔒 (tuning) |
 | `API_KEY_BCRYPT_COST` | built-in default | talos-api-keys | Bcrypt cost for API-key hashing | 🔒 (tuning) |
-| `TOTP_ISSUER` | `Talos` | both | TOTP issuer label shown in authenticator apps | |
-| `BOOTSTRAP_FIRST_USER_EMAIL` | none (optional) | both | Pin the first bootstrap admin user email (`talos-auth`) | |
+| `TOTP_ISSUER` | `Talos` | controller | TOTP issuer label shown in authenticator apps | |
+| `BOOTSTRAP_FIRST_USER_EMAIL` | none (optional) | controller | Pin the first bootstrap admin user email (`talos-auth`) | |
 
 ### Encryption keys / Vault (KEK/DEK)
 
 | Variable | Default | Component | Purpose | Sensitive |
 |---|---|---|---|---|
-| `TALOS_MASTER_KEY` (+`_FILE`) | required when `KEK_PROVIDER=env` | both | Master KEK for envelope encryption | 🔒 |
+| `TALOS_MASTER_KEY` (+`_FILE`) | required when `KEK_PROVIDER=env` | controller | Master KEK for envelope encryption | 🔒 |
 | `KEK_PROVIDER` | `env` | controller | KEK provider kind (`env` / `vault`) | 🔒 |
 | `TALOS_ALLOW_ENV_KEK` | unset (refuse) | controller | Explicit opt-in required to boot production with an env-var KEK (lint check 45; fails closed) | 🔒 |
 | `KEK_DISABLE_LEGACY` | `false` | controller | Disable the legacy KEK path | 🔒 |
-| `DEK_CACHE_TTL_SECS` | `300` | both | DEK cache TTL | |
-| `VAULT_ADDR` (+`_FILE`) | none | both | HashiCorp Vault address | 🔒 |
-| `VAULT_TOKEN` (+`_FILE`) | none | both | Vault auth token | 🔒 |
-| `VAULT_TRANSIT_KEY_NAME` (+`_FILE`) | none | both | Vault transit key name | 🔒 |
-| `VAULT_TRANSIT_MOUNT` (+`_FILE`) | none | both | Vault transit mount path | 🔒 |
+| `DEK_CACHE_TTL_SECS` | `300` | controller | DEK cache TTL | |
+| `VAULT_ADDR` (+`_FILE`) | none | controller | HashiCorp Vault address | 🔒 |
+| `VAULT_TOKEN` (+`_FILE`) | none | controller | Vault auth token | 🔒 |
+| `VAULT_TRANSIT_KEY_NAME` (+`_FILE`) | none | controller | Vault transit key name | 🔒 |
+| `VAULT_TRANSIT_MOUNT` (+`_FILE`) | none | controller | Vault transit mount path | 🔒 |
 | `VAULT_CACERT` | none (optional) | controller | Vault CA certificate path | 🔒 |
 | `TALOS_ALLOW_PLAINTEXT_VAULT` | unset | controller | Escape hatch for the production `https://`-only gate on `VAULT_ADDR` (`tls-prod-gate-vault`, check 44). Every DEK wrap/unwrap carries the plaintext DEK and `X-Vault-Token`, so a plaintext `VAULT_ADDR` in production refuses to boot unless this is set; intended for an in-pod Vault agent sidecar on loopback only. Setting it writes an audit WARN at boot. | 🔒 |
 
@@ -107,18 +115,18 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 
 | Variable | Default | Component | Purpose | Sensitive |
 |---|---|---|---|---|
-| `ADMIN_SECRET_KEY` | `""` (disabled) | both | Constant-time `X-Admin-Secret` compare for admin endpoints | 🔒 |
-| `ENABLE_ADMIN_OPS` | `false` | both | "Big red button" gate enabling admin ops | 🔒 |
+| `ADMIN_SECRET_KEY` | `""` (disabled) | controller | Constant-time `X-Admin-Secret` compare for admin endpoints | 🔒 |
+| `ENABLE_ADMIN_OPS` | `false` | controller | "Big red button" gate enabling admin ops | 🔒 |
 | `PROMETHEUS_SCRAPE_TOKEN` | none (optional) | controller | Bearer token gating `/metrics` scrape | 🔒 |
 | `METRICS_AUTH_TOKENS` | none (optional) | worker | Comma-separated tokens gating the worker metrics endpoint | 🔒 |
-| `ALLOWED_ORIGIN` | dev: localhost list; prod: **required** (panics unset) | both | CORS allowed origins (credentialed requests) | 🔒 |
-| `ALLOW_DEV_UNSAFE_CSRF_BYPASS` | `false` | both | Dev-only `/graphql` CSRF disable; panics in production if truthy | 🔒 |
-| `CSP_REPORT_URI` | none (optional) | both | Content-Security-Policy report endpoint | |
-| `ENABLE_HSTS` | bool default | both | Emit HSTS header | |
+| `ALLOWED_ORIGIN` | dev: localhost list; prod: **required** (panics unset) | controller | CORS allowed origins (credentialed requests) | 🔒 |
+| `ALLOW_DEV_UNSAFE_CSRF_BYPASS` | `false` | controller | Dev-only `/graphql` CSRF disable; panics in production if truthy | 🔒 |
+| `CSP_REPORT_URI` | none (optional) | controller | Content-Security-Policy report endpoint | |
+| `ENABLE_HSTS` | bool default | controller | Emit HSTS header | |
 | `TRUSTED_IPS` | none (optional) | controller | IP allowlist | 🔒 |
-| `TRUSTED_PROXY_CIDRS` | `""` | both | Trusted reverse-proxy CIDRs for RFC 7239 client-IP extraction (rate limiting) | 🔒 |
-| `FRONTEND_URL` | `http://localhost:3000` | both | Frontend base for OAuth redirects (validated; open-redirect guard) | 🔒 |
-| `BASE_URL` | `http://localhost:8000` | both | Public API base for webhook/callback URLs (`talos_config::get_base_url`) | 🔒 |
+| `TRUSTED_PROXY_CIDRS` | `""` | controller | Trusted reverse-proxy CIDRs for RFC 7239 client-IP extraction (rate limiting) | 🔒 |
+| `FRONTEND_URL` | `http://localhost:3000` | controller | Frontend base for OAuth redirects (validated; open-redirect guard) | 🔒 |
+| `BASE_URL` | `http://localhost:8000` | controller | Public API base for webhook/callback URLs (`talos_config::get_base_url`) | 🔒 |
 | `CACHE_ADMIN_USER_IDS` | none | controller | User ids permitted cache-admin operations | 🔒 |
 
 ### RLS / tenancy / RPC posture
@@ -126,10 +134,10 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | Variable | Default | Component | Purpose | Sensitive |
 |---|---|---|---|---|
 | `TALOS_RLS_SET_ROLE` | unset (off) | controller | **Boolean** (`1`/`true`/`yes`/`on`), not a role name: when on, every tenant-scoped transaction runs `SET LOCAL ROLE talos_app` (a fixed `NOLOGIN` role from migration `20260529220000`) so the RFC 0004/0005 RLS policies enforce even on a superuser pool. Read by `talos-db` (controller). In production, `enforce_production_rls_posture` refuses to boot unless RLS is effective or `TALOS_ALLOW_RLS_DISABLED` is set. The chart and compose set it `true`. | 🔒 |
-| `TALOS_ALLOW_RLS_DISABLED` | unset (refuse) | both | Explicit opt-in to run with Postgres RLS disabled | 🔒 |
+| `TALOS_ALLOW_RLS_DISABLED` | unset (refuse) | controller | Explicit opt-in to run with Postgres RLS disabled | 🔒 |
 | `TALOS_RPC_REQUIRE_ED25519` | unset | both | Require Ed25519-signed NATS-RPC auth | 🔒 |
 | `TALOS_RPC_GUEST_ROLE` | unset (guest SQL runs as the app user) | controller | Postgres role the `database`-world SQL sandbox runs guest statements under (`SET LOCAL ROLE`, `talos-rpc-subscribers`); `talos_guest` ships with **no** table grants, so an operator grants what modules may read. Not about RPC authentication — every NATS-RPC message is HMAC/Ed25519-signed regardless. In production `enforce_production_db_sandbox_posture` refuses to boot without it unless `TALOS_ALLOW_UNSCOPED_DB_SANDBOX` is set. | 🔒 |
-| `TALOS_ALLOW_UNSCOPED_DB_SANDBOX` | unset | both | Allow unscoped DB access in the SQL sandbox | 🔒 |
+| `TALOS_ALLOW_UNSCOPED_DB_SANDBOX` | unset | controller | Allow unscoped DB access in the SQL sandbox | 🔒 |
 
 ### Controller↔worker dispatch trust (signing keys)
 
@@ -139,15 +147,15 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | `TALOS_CONTROLLER_PUBLIC_KEY` / `_PREVIOUS` | none | worker | Controller Ed25519 verify key(s) | 🔒 |
 | `TALOS_WORKER_SIGNING_KEY` | none | worker | Worker Ed25519 signing key | 🔒 |
 | `TALOS_WORKER_PUBLIC_KEYS` | none | controller | Worker Ed25519 public keys (static fleet identity) for result verification | 🔒 |
-| `TALOS_DISPATCH_SCHEME` | `""` | both | Dispatch signing scheme selector (`ed25519`) | 🔒 |
+| `TALOS_DISPATCH_SCHEME` | `""` | controller | Dispatch signing scheme selector (`ed25519`) | 🔒 |
 | `TALOS_DISPATCH_REQUIRE_ED25519` | unset (fail-open to HMAC) | worker | Require Ed25519-signed dispatch (fail-closed flag) | 🔒 |
 | `TALOS_RESULT_REQUIRE_ED25519` | unset | controller | Require Ed25519-signed job results | 🔒 |
 | `TALOS_SIGNATURE_DIAG` | off | both | Signature diagnostic logging | |
 | `WORKER_SHARED_KEY` (+`_FILE`, `_PREVIOUS`) | none | both | HMAC shared key for worker auth (rotation-capable); also the IKM for checkpoint/envelope AEAD derivations | 🔒 |
 | `TALOS_AOT_HMAC_KEY` / `_PREVIOUS` | none | worker | HMAC key signing AOT-compiled WASM cache entries | 🔒 |
 | `TALOS_AUDIT_SIGNING_KEY` / `_PREVIOUS` | none | both | Key signing hash-chained audit-ledger entries (`talos-audit-event`) | 🔒 |
-| `TALOS_WORKFLOW_SIGNING_KEY` | none | both | Key for workflow-definition signatures | 🔒 |
-| `TALOS_WORKFLOW_SIGNING_STRICT` | `false` | both | Reject unsigned workflows | 🔒 |
+| `TALOS_WORKFLOW_SIGNING_KEY` | none | controller | Key for workflow-definition signatures | 🔒 |
+| `TALOS_WORKFLOW_SIGNING_STRICT` | `false` | controller | Reject unsigned workflows | 🔒 |
 | `TALOS_WORKER_REGISTRATION_TOKEN` | none (optional) | both | Shared token for worker self-registration — the SAME value on controller (gate) and worker (bearer); unset on either side disables the handshake | 🔒 |
 | `TALOS_CONTROLLER_URL` | none (dev compose: `http://controller:8000`) | worker | Controller base URL the worker self-registers against — not a secret. Registration also requires the token above **and** `TALOS_WORKER_SIGNING_KEY`; with all three, the worker reports its build into `get_platform_info.fleet` | |
 | `TALOS_WORKER_REG_REQUIRE_BOUND_TOKEN` | unset | controller | Require a bound registration token | 🔒 |
@@ -158,9 +166,9 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 
 | Variable | Default | Component | Purpose | Sensitive |
 |---|---|---|---|---|
-| `OKTA_DOMAIN` | none (optional) | both | Okta SSO domain (rejects `@` in value) | 🔒 |
-| `OKTA_CLIENT_ID` / `OKTA_CLIENT_SECRET` / `OKTA_REDIRECT_URI` | none | both | Okta OAuth client credentials + redirect | 🔒 (id/secret) |
-| `SNYK_CLIENT_ID` / `SNYK_CLIENT_SECRET` / `SNYK_REDIRECT_URI` | none | both | Snyk OAuth integration credentials + redirect | 🔒 (id/secret) |
+| `OKTA_DOMAIN` | none (optional) | controller | Okta SSO domain (rejects `@` in value) | 🔒 |
+| `OKTA_CLIENT_ID` / `OKTA_CLIENT_SECRET` / `OKTA_REDIRECT_URI` | none | controller | Okta OAuth client credentials + redirect | 🔒 (id/secret) |
+| `SNYK_CLIENT_ID` / `SNYK_CLIENT_SECRET` / `SNYK_REDIRECT_URI` | none | controller | Snyk OAuth integration credentials + redirect | 🔒 (id/secret) |
 
 ## 3. Worker / WASM runtime
 
@@ -169,8 +177,8 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | `TALOS_WORKER_ID` | derived | worker | Explicit worker identity override | |
 | `HOSTNAME` | pod hostname | both | Fallback worker id / job host tag | |
 | `WASM_EXECUTION_TIMEOUT_SECS` | `120` | both | Per-node WASM execution timeout | |
-| `TALOS_MAX_CONCURRENT_NODES` | `8` (clamped ≥1) | both | Max concurrent node dispatch within an execution | |
-| `TALOS_MAX_CONCURRENT_EXECUTIONS` | built-in default | both | Execution-level concurrency semaphore | |
+| `TALOS_MAX_CONCURRENT_NODES` | `8` (clamped ≥1) | controller | Max concurrent node dispatch within an execution | |
+| `TALOS_MAX_CONCURRENT_EXECUTIONS` | built-in default | controller | Execution-level concurrency semaphore | |
 | `WASM_RESULT_CACHE_CAPACITY` | `256` | worker | Result-cache entry cap | |
 | `WASM_INSTANCE_CACHE_MAX_PER_TIER` | `256` | worker | Instance-cache cap per tier | |
 | `WASM_RESULT_CACHE_TTL_SECS` | none (disabled if unset) | worker | Result-cache TTL | |
@@ -187,11 +195,11 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | `WORKER_ALLOW_PRIVATE_HOST_TARGETS` | `false` | worker | Allow module egress to private/internal IPs (SSRF gate) | 🔒 |
 | `METRICS_PORT` | `9090` | worker | Worker Prometheus port | |
 | `TALOS_WORKER_HEARTBEAT_INTERVAL_SECS` | `30` (clamped to 5..45) | worker | Seconds between signed NATS fleet heartbeats. `0` disables publishing entirely — a supported setting, but the controller cannot detect it, so pair it with `SCHEDULER_FLEET_READINESS_BARRIER=false` on the controller or the scheduler's readiness barrier will hold, give up, and report degraded forever. Unparseable values fall back to the default and are logged, never silently disabling the publisher | |
-| `TALOS_INLINE_WASM_MAX_BYTES` | built-in default | both | Cap on inline-dispatched WASM bytes | |
-| `TALOS_ENCRYPT_EXECUTION_OUTPUT` | flag | both | Encrypt stored execution output | 🔒 |
+| `TALOS_INLINE_WASM_MAX_BYTES` | built-in default | controller | Cap on inline-dispatched WASM bytes | |
+| `TALOS_ENCRYPT_EXECUTION_OUTPUT` | flag | controller | Encrypt stored execution output | 🔒 |
 | `TALOS_SQL_PERMISSIVE_EMPTY_ALLOWLIST` | unset | worker | Permit an empty SQL allowlist in the sandbox | 🔒 |
 | `TALOS_WIT_GRAPHQL_BLOCK_INTROSPECTION` | unset | worker | Block GraphQL introspection from guest modules | 🔒 |
-| `TALOS_DEFAULT_WIT_WORLD` | `minimal-node` | both | Default WIT capability world | |
+| `TALOS_DEFAULT_WIT_WORLD` | `minimal-node` | controller | Default WIT capability world | |
 | `CIRCUIT_BREAKER_CLEANUP_SECS` | `300` | worker | Circuit-breaker cleanup interval | |
 | `CIRCUIT_BREAKER_MAX_AGE_SECS` | `1800` | worker | Max age before breaker state is pruned | |
 | `CIRCUIT_BREAKER_SUCCESS_RATE` | built-in default (f64) | worker | Success-rate threshold to close the breaker | |
@@ -214,7 +222,7 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | `TALOS_ADVISORY_DB_MAX_AGE_DAYS` | `90` | talos-compilation | Max RustSec advisory-DB age; fails closed in prod | 🔒 |
 | `MCP_ALLOWED_CRATE_DEPENDENCIES` | built-in allowlist | talos-compilation | Replace the allowed crate-dependency allowlist | 🔒 |
 | `MCP_ALLOWED_CRATE_DEPENDENCIES_EXTRA` | none | talos-compilation | Append extra allowed crate dependencies | 🔒 |
-| `COMPILE_DIR` | `/tmp/talos-compilations` | talos-compilation | Compilation workspace root | |
+| `COMPILE_DIR` | `/tmp/talos-compilations` | controller | Compilation workspace root | |
 
 ## 5. LLM providers / embeddings
 
@@ -225,12 +233,12 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | `OLLAMA_URL` | `http://ollama:11434` | both | Local Ollama endpoint (Tier-1 local LLM) | |
 | `TALOS_LOCAL_LLM_MAX_IN_FLIGHT` | `1` | worker | Simultaneous LOCAL (ollama) `llm::complete*` exchanges permitted PER WORKER PROCESS. The gate QUEUES and never refuses: a call that cannot get a permit within 120 s proceeds ungated, i.e. degrades to the pre-gate behaviour. `0` disables it entirely; an unparseable value falls back to `1`, never to `0`. **Raise it to match a backend that genuinely serves requests in parallel** — Talos cannot see the backend's `OLLAMA_NUM_PARALLEL`, and the default is set for the single-slot Ollama the bundled `docker-compose.yml` provides. The effective fleet ceiling against a shared backend is `WORKER_REPLICAS x this`. | |
 | `TALOS_LLM_BOOT_WARMUP` | `true` | controller | Warm the ≤3 most-referenced local (ollama) generation models at boot, after the reachability probe, so the first scheduled run doesn't pay the cold model load. Fail-soft, spawned, never delays boot. Local provider only. | |
-| `EMBEDDING_API_URL` | none (optional) | both | Embedding service URL | |
-| `EMBEDDING_API_KEY` | none (optional) | both | Embedding API key | 🔒 |
-| `EMBEDDING_MODEL` | built-in default | both | Embedding model name | |
-| `EMBEDDING_DIMENSIONS` | `768` | both | Embedding vector dimension | |
-| `EMBEDDING_TIMEOUT_SECS` | `8` (clamped 1–60) | both | Embedding request timeout | |
-| `TALOS_GRAPH_RAG_MODEL` | `qwen2.5:7b` | both | Graph-RAG entity-extraction model | |
+| `EMBEDDING_API_URL` | none (optional) | controller | Embedding service URL | |
+| `EMBEDDING_API_KEY` | none (optional) | controller | Embedding API key | 🔒 |
+| `EMBEDDING_MODEL` | built-in default | controller | Embedding model name | |
+| `EMBEDDING_DIMENSIONS` | `768` | controller | Embedding vector dimension | |
+| `EMBEDDING_TIMEOUT_SECS` | `8` (clamped 1–60) | controller | Embedding request timeout | |
+| `TALOS_GRAPH_RAG_MODEL` | `qwen2.5:7b` | controller | Graph-RAG entity-extraction model | |
 | `TALOS_GRAPH_RAG_TIER1_LOCAL_OK` | `false` | controller | Attestation that Ollama is on-host so Tier-1 graph extraction may run locally | 🔒 (privacy) |
 | `SEMANTIC_SEARCH_MIN_SCORE` | `0.40` (clamped 0–1) | controller | Default cosine floor for semantic search | |
 
@@ -241,7 +249,7 @@ the env vars above are fallbacks only. See CLAUDE.md "LLM key resolution".
 
 | Variable | Default | Component | Purpose | Sensitive |
 |---|---|---|---|---|
-| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REDIRECT_URI` | none (canonical) | both | Google OAuth client credentials + redirect | 🔒 (id/secret) |
+| `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` / `GOOGLE_REDIRECT_URI` | none (canonical) | controller | Google OAuth client credentials + redirect | 🔒 (id/secret) |
 | `GMAIL_CLIENT_ID` / `GMAIL_CLIENT_SECRET` / `GMAIL_REDIRECT_URI` | none | talos-gmail / talos-oauth | **Legacy fallback** spelling for the Google OAuth credentials (see duplicates) | 🔒 (id/secret) |
 | `GMAIL_PUBSUB_TOPIC` | none (optional) | controller | Gmail push Pub/Sub topic | |
 | `GMAIL_PUBSUB_AUDIENCE` | none (optional) | controller | JWT audience for Gmail push verification | 🔒 |
@@ -267,7 +275,7 @@ the env vars above are fallbacks only. See CLAUDE.md "LLM key resolution".
 
 | Variable | Default | Component | Purpose | Sensitive |
 |---|---|---|---|---|
-| `TALOS_REGISTRY_URL` | none (opt-in; empty = disk seeding) | both | OCI registry URL for template sync (mutually exclusive with disk seeding) | |
+| `TALOS_REGISTRY_URL` | none (opt-in; empty = disk seeding) | controller | OCI registry URL for template sync (mutually exclusive with disk seeding) | |
 | `TALOS_REGISTRY_NAMESPACE` | `talos-tools` | talos-registry | OCI namespace for templates | |
 | `OCI_REGISTRY_USERNAME` / `OCI_REGISTRY_PASSWORD` | none (anonymous) | both | OCI registry basic-auth (PAT works as password for GHCR) | 🔒 |
 | `REGISTRY_PUBLISH_TOKEN` | none (optional) | talos-registry | Bearer token gating the template publish API | 🔒 |
@@ -340,9 +348,9 @@ into both deployments.
 
 | Variable | Default | Component | Purpose | Sensitive |
 |---|---|---|---|---|
-| `TALOS_PUBLIC_BASE_URL` | none (optional; wins over discovery) | both | Explicit public origin for external URLs (validated) | 🔒 (open-redirect) |
-| `TALOS_NGROK_API_URL` | none (optional) | both | ngrok local API to auto-discover the tunnel URL | |
-| `TALOS_PUBLIC_URL_REFRESH_SECS` | `60` (min 10) | both | ngrok URL refresh interval | |
+| `TALOS_PUBLIC_BASE_URL` | none (optional; wins over discovery) | controller | Explicit public origin for external URLs (validated) | 🔒 (open-redirect) |
+| `TALOS_NGROK_API_URL` | none (optional) | controller | ngrok local API to auto-discover the tunnel URL | |
+| `TALOS_PUBLIC_URL_REFRESH_SECS` | `60` (min 10) | controller | ngrok URL refresh interval | |
 | `NGROK_AUTHTOKEN` | none | compose (shell) | Starts the ngrok sidecar (compose profile `public`) | 🔒 |
 | `NGROK_STATIC_DOMAIN` | none | compose (shell) | Reserved ngrok domain | |
 | `VITE_API_URL` | `http://localhost:4003` | frontend (build) | Frontend GraphQL endpoint | |
@@ -368,36 +376,36 @@ into both deployments.
 | `SCHEDULER_READINESS_TIMEOUT_SECS` | `135` | talos-scheduler | Bound on that one pre-loop wait. Derived from the protocol (3× the largest configurable heartbeat interval, `WORKER_HEARTBEAT_MAX_INTERVAL_SECS` = 45 s), not guessed — a worker that booted before the controller subscribed loses its unretained first heartbeat and is only learned about on the second. Overshooting is nearly free: the wait returns the instant a worker appears | |
 | `SCHEDULER_READINESS_MAX_HOLDS` | `20` | talos-scheduler | Consecutive polls the barrier may hold (≈5 min at the 15 s interval) before giving up and dispatching anyway, setting `talos_scheduler_readiness_degraded`. An empty fleet view is ambiguous, not proof of absence, so the barrier degrades rather than wedging. The gauge re-arms by itself once a heartbeat is seen | |
 | `TALOS_APPROVAL_TIMEOUT_SECS` | `86400` | both | Human-approval-gate timeout | |
-| `TALOS_SEAL_ORPHAN_TTL_SECS` | `600` | both | Envelope-seal orphan lease TTL | |
-| `TALOS_SEAL_SWEEP_INTERVAL_SECS` | `60` | both | Envelope-seal sweep cadence | |
+| `TALOS_SEAL_ORPHAN_TTL_SECS` | `600` | controller | Envelope-seal orphan lease TTL | |
+| `TALOS_SEAL_SWEEP_INTERVAL_SECS` | `60` | controller | Envelope-seal sweep cadence | |
 | `LLM_KEYS_SWEEP_INTERVAL_SECS` | `300` | controller | LLM-key cache sweep interval | |
 | `AUDIT_CHAIN_SWEEP_INTERVAL_SECS` | `3600` | controller | Audit-chain verify sweep | |
 | `MODULES_RECONCILE_INTERVAL_SECS` | `600` | controller | Module reconcile loop interval | |
-| `CHECKPOINT_EVERY_N_NODES` | `1` | both | Execution checkpoint frequency | |
-| `EXECUTION_CHECKPOINTING_ENABLED` | bool default | both | Enable execution checkpointing | |
-| `TALOS_CHAIN_MAX_WORKFLOWS` | `50` | both | Max workflows in a chain | |
-| `TALOS_CHAIN_CONCURRENCY` | `8` | both | Chain fan-out concurrency | |
-| `TALOS_NATS_TIMEOUT_SECS` | `0` (disabled) | both | NATS request-reply timeout | |
-| `TALOS_ADAPTIVE_FUEL` | flag | both | Adaptive WASM fuel metering | |
+| `CHECKPOINT_EVERY_N_NODES` | `1` | controller | Execution checkpoint frequency | |
+| `EXECUTION_CHECKPOINTING_ENABLED` | bool default | controller | Enable execution checkpointing | |
+| `TALOS_CHAIN_MAX_WORKFLOWS` | `50` | controller | Max workflows in a chain | |
+| `TALOS_CHAIN_CONCURRENCY` | `8` | controller | Chain fan-out concurrency | |
+| `TALOS_NATS_TIMEOUT_SECS` | `0` (disabled) | controller | NATS request-reply timeout | |
+| `TALOS_ADAPTIVE_FUEL` | flag | controller | Adaptive WASM fuel metering | |
 | ~~`TALOS_NODE_CACHE`~~ | — | — | **Removed 2026-09-12.** Read only by `talos-node-cache`, a crate nothing constructed ("not yet wired into the engine" since May); the knob controlled nothing. Crate, shim and the empty `node_result_cache` table deleted (migration `20260912110000`). | |
-| `TALOS_MAX_YAML_BYTES` | 1 MiB | both | Max YAML workflow size | |
-| `ENABLE_EDGE_ROUTING` | `false` | both | Per-user vs shared NATS dispatch topic | |
-| `ENFORCE_RATE_LIMITS_IN_DEV` | bool default | both | Apply rate limits in dev | |
+| `TALOS_MAX_YAML_BYTES` | 1 MiB | controller | Max YAML workflow size | |
+| `ENABLE_EDGE_ROUTING` | `false` | controller | Per-user vs shared NATS dispatch topic | |
+| `ENFORCE_RATE_LIMITS_IN_DEV` | bool default | controller | Apply rate limits in dev | |
 | `TALOS_WEBHOOK_USER_RPM` | `300` | talos-webhooks | Per-user webhook rate limit | |
-| `MCP_AGENT_RATE_LIMIT_PER_MIN` | `1000` | both | MCP agent rate limit | |
-| `MCP_USER_RATE_LIMIT_PER_MIN` | `5000` | both | MCP user rate limit | |
-| `MCP_AUTH_RATE_LIMIT` | `60` | both | MCP auth attempts per window | |
-| `MCP_AUTH_RATE_WINDOW` | `60` | both | MCP auth window (seconds) | |
-| `MCP_EXPENSIVE_OP_RATE_LIMIT` | `10` | both | Rate limit for expensive MCP operations | |
-| `MCP_TOKEN_REVALIDATION_INTERVAL_SECS` | `60` | both | MCP token revalidation cadence | |
+| `MCP_AGENT_RATE_LIMIT_PER_MIN` | `1000` | controller | MCP agent rate limit | |
+| `MCP_USER_RATE_LIMIT_PER_MIN` | `5000` | controller | MCP user rate limit | |
+| `MCP_AUTH_RATE_LIMIT` | `60` | controller | MCP auth attempts per window | |
+| `MCP_AUTH_RATE_WINDOW` | `60` | controller | MCP auth window (seconds) | |
+| `MCP_EXPENSIVE_OP_RATE_LIMIT` | `10` | controller | Rate limit for expensive MCP operations | |
+| `MCP_TOKEN_REVALIDATION_INTERVAL_SECS` | `60` | controller | MCP token revalidation cadence | |
 | `TALOS_WRITE_CEILING_ENFORCED` | bool default | both | Enforce actor write ceiling. **Set it on BOTH** — the worker gates mutating host calls, the controller gates the `__memory_write__` envelope it persists on node completion (#750); on the worker alone a `readonly` actor is refused one route and permitted the other. The worker reports its value to the controller at self-registration, diagnostic only, outside the registration proof (`get_platform_info.fleet.write_ceiling`). | 🔒 (posture) |
 | `TALOS_WRITE_CEILING_STRICT_EGRESS` | bool default | worker | Strict egress under the write ceiling; inert unless the flag above is on. Reported alongside it at self-registration. | 🔒 (posture) |
 | `TALOS_DISTRIBUTED_REPLAY` | off | controller | Enable distributed replay | |
-| `TALOS_REPLAY_FAIL_CLOSED` | policy default | both | Fail closed on replay-guard errors | 🔒 (posture) |
-| `TALOS_VERSION` | derived from build | controller | Build/version string override | |
+| `TALOS_REPLAY_FAIL_CLOSED` | policy default | controller | Fail closed on replay-guard errors | 🔒 (posture) |
+| `TALOS_VERSION` | derived from build | both | Build/version string override | |
 | `TALOS_BASE_URL` | none (optional) | controller | Platform base-URL override for status responses (see duplicates) | |
 
-### Memory / adaptive-ranking feature flags & weights (`talos-config`; both components)
+### Memory / adaptive-ranking feature flags & weights (`talos-config`; controller-side — read by the controller's memory loops, ranking and context assembly; the worker reads none of them)
 
 Several default **ON** as of the 2026-07 "Tier 3" learning-loops cutover.
 
@@ -482,7 +490,7 @@ Where to SEE the effective window rather than infer it:
 | `TALOS_TEACHER_AUDIT_INTERVAL_DAYS` | built-in (clamped) | Teacher-vs-gold audit cadence |
 | `TALOS_TEACHER_AUDIT_CHECK_INTERVAL_SECS` | built-in (min bound) | Audit-due check cadence |
 
-### Audit ledger / S3 WORM (`talos-audit-ledger`; both)
+### Audit ledger / S3 WORM (`talos-audit-ledger`; controller-side — the WORKER seals and publishes audit events over NATS but never touches S3; the ledger writer and the chain verifier are controller loops)
 
 | Variable | Default | Purpose | Sensitive |
 |---|---|---|---|
