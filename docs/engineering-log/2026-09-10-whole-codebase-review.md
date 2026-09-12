@@ -2316,3 +2316,56 @@ settled it.
 migrated clone (twelve tables now). The crate's four in-crate unit tests go
 with it; no integration binary referenced it (check 64 was already silent).
 
+## Package AB — the probe's remaining blind spot, inventoried (2026-09-12)
+
+After package Z the probe still called 45 statements dynamic. Rather than
+leave "45, counted" as the coverage claim, each was asked the question that
+matters for a statement nothing PREPAREs: does any test execute the function
+it lives in? By enclosing-function name (a textual proxy), 21 are called from
+a `tests/` binary and 4 from an in-crate `#[cfg(test)]` module; **20 have no
+test caller at all.**
+
+The twenty split three ways. **Three were not statements** — `//` comment
+lines that quoted `sqlx::query(...)` in prose (`talos-scheduler/src/lib.rs`,
+`talos-totp-2fa/src/lib.rs`, `talos-webhooks/src/router.rs`); the scanner
+matched the call regex inside a comment, check 73's self-report trap in the
+probe itself. It now blanks line comments outside string literals (offsets
+preserved) before matching. **Two were literals bound to a local** — `let
+sql = "SELECT … FROM actor_memory …"; sqlx::query(sql)` in the consolidation
+and reflection scanners — and fourteen more were a `format!` bound to a
+local; the probe now follows the nearest same-function `let` binding
+(nearest-wins, stopping at the `fn` header, so a shadowed name resolves to
+the nearer binding — the loud direction) and resolves its initializer by the
+same rules. Measured: 1 246 → 1 249 static (28 resolved), 45 → 39 dynamic.
+
+**The sixteen real builders were then verified by hand, and every one
+holds.** Four have fully determinable expansions, PREPAREd against the
+migrated clone: `update_actor_fields_scoped`'s three-column `UPDATE actors`,
+`search_marketplace`'s all-filters `SELECT … FROM module_marketplace`,
+`cleanup_audit_logs`' batched `DELETE FROM auth_audit_log … FOR UPDATE SKIP
+LOCKED`, and `execute_paginated_select`'s cursor wrapper. The rest name
+specific columns and tables, each confirmed present on the migrated schema:
+`workflows.tags / capabilities / intent / max_concurrent_executions /
+workflow_type` (the paginated list and `update_workflow_metadata`),
+`ml_models.last_policy_eval_at / last_policy_eval_attempt_at` (`stamp_pool`),
+and the five `*_integrations` tables with `id / user_id / is_active /
+created_at / updated_at` that `talos-integrations`' `PROVIDERS` table drives
+(`list_user_service_integrations`, `disconnect_user_integration`). The
+chain runner and `list_published_workflows_for_actor` interpolate the
+liveness crate's rendered predicates over columns already probed elsewhere.
+
+**What remains dynamic is dynamic in fact**, and stated: predicate builders
+(`live_sql(None)`, `dispatchable_sql(None)`, `archive_move_sql(…)`),
+conditional `SET` / `WHERE` assembly from optional arguments, the RPC
+subscribers' `SET LOCAL ROLE` and guest-query wrapping, and SQL passed INTO a
+batching helper (`run_batched`, `run_batched_delete`, `run_batched_sweep`)
+as a `&str` parameter — the helper's `sqlx::query(sql)` is the site the probe
+sees and the literal lives at each caller. Following a parameter to its
+callers is a call-graph step this textual probe does not take; the DB tests
+on those callers are the guard, and the inventory above is the record.
+
+**Guards.** The self-test gains the commented-out call (must not appear),
+a literal `let`, a const-only `format!` `let` (both resolved) and a
+positional-`format!` `let` (stays dynamic, reason prefixed `let:`) — 8
+resolved, 4 dynamic, asserted exactly.
+
