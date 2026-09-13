@@ -88,6 +88,15 @@ impl PubsubJwtVerifier {
         claims.require_service_account(&self.expected_email)?;
         Ok(claims)
     }
+
+    /// Count and log one refused push under the `gmail` integration label;
+    /// see [`GoogleOidcVerifier::report_refusal`] for the WARN/DEBUG rule.
+    pub fn report_refusal(&self, err: &VerifyError) {
+        self.inner.report_refusal(
+            talos_integration_helpers::google_jwt::PushIntegration::Gmail,
+            err,
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

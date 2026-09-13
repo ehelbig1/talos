@@ -14,11 +14,13 @@ use prometheus::{
 use std::sync::{Arc, OnceLock};
 
 pub mod execution;
+pub mod google_push;
 pub mod mcp;
 pub mod outcome_class;
 pub mod rpc;
 pub mod security;
 pub use execution::ModuleExecutionOutcome;
+pub use google_push::{JwkRefreshOutcome, PushIntegration, PushRefusalReason};
 pub use mcp::McpToolOutcome;
 pub use outcome_class::OutcomeClass;
 pub use rpc::{seeded_pairs as rpc_seeded_pairs, RpcOutcome, RpcSubject};
@@ -434,6 +436,41 @@ pub fn record_rate_limit_hit_on(metrics: &TalosMetrics, kind: RateLimitKind) {
     metrics
         .rate_limit_hits_total
         .with_label_values(&[kind.as_str()])
+        .inc();
+}
+
+/// Count one Google push delivery refused at the HTTP boundary. Inert
+/// without [`set_global`].
+pub fn record_google_push_refusal(integration: PushIntegration, reason: PushRefusalReason) {
+    if let Some(m) = global() {
+        record_google_push_refusal_on(m, integration, reason);
+    }
+}
+
+/// The recording itself, against an EXPLICIT registry.
+pub fn record_google_push_refusal_on(
+    metrics: &TalosMetrics,
+    integration: PushIntegration,
+    reason: PushRefusalReason,
+) {
+    metrics
+        .google_push_refusals_total
+        .with_label_values(&[integration.as_str(), reason.as_str()])
+        .inc();
+}
+
+/// Count one attempt to fetch Google's JWK set. Inert without [`set_global`].
+pub fn record_google_jwk_refresh(outcome: JwkRefreshOutcome) {
+    if let Some(m) = global() {
+        record_google_jwk_refresh_on(m, outcome);
+    }
+}
+
+/// The recording itself, against an EXPLICIT registry.
+pub fn record_google_jwk_refresh_on(metrics: &TalosMetrics, outcome: JwkRefreshOutcome) {
+    metrics
+        .google_jwk_refresh_total
+        .with_label_values(&[outcome.as_str()])
         .inc();
 }
 
@@ -1391,6 +1428,12 @@ pub struct TalosMetrics {
     // Rate limiting metrics — wired 2026-09-11 at all four limiters
     // (`RateLimitKind::ALL`), seeded at 0.
     pub rate_limit_hits_total: CounterVec,
+
+    // Google push authentication (Gmail + GCP Pub/Sub) — added 2026-09-12
+    // after one JWK fetch failure produced 94 WARN lines and no series. Both
+    // seeded over their closed sets (`google_push`).
+    pub google_push_refusals_total: CounterVec,
+    pub google_jwk_refresh_total: CounterVec,
 
     // `talos_cache_hits_total{cache_type}` / `talos_cache_misses_total` were
     // DELETED 2026-09-11: registered since 2026-05 with a comment naming three
@@ -2571,6 +2614,51 @@ impl TalosMetrics {
                 .inc_by(0.0);
         }
 
+        // Google push authentication
+        let google_push_refusals_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_google_push_refusals_total",
+                "Google Pub/Sub push deliveries refused at the HTTP boundary (401), by \
+                 integration (gmail | gcp) and reason. reason=missing_bearer (no \
+                 Authorization header) | malformed_header | wrong_algorithm | missing_kid | \
+                 unknown_key (the JWT's kid is not in the cached JWK set — during a JWK \
+                 backoff window EVERY push with a rotated key lands here; read beside \
+                 talos_google_jwk_refresh_total) | invalid (signature / iss / aud / exp) | \
+                 wrong_email | email_not_verified (service-account check) | \
+                 jwk_fetch_failed. Closed sets (talos_metrics::{PushIntegration, \
+                 PushRefusalReason}), all 18 pairs pre-seeded at 0. A refusal is the \
+                 fail-closed control working; Pub/Sub retries a 401. Not alerted.",
+            ),
+            &["integration", "reason"],
+        )?;
+        registry.register(Box::new(google_push_refusals_total.clone()))?;
+        for integration in PushIntegration::ALL {
+            for reason in PushRefusalReason::ALL {
+                google_push_refusals_total
+                    .with_label_values(&[integration.as_str(), reason.as_str()])
+                    .inc_by(0.0);
+            }
+        }
+        let google_jwk_refresh_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_google_jwk_refresh_total",
+                "Attempts by the shared GoogleOidcVerifier to fetch Google's JWK set, by \
+                 outcome (ok | failed). A fetch runs on an unknown kid or a stale (1 h) \
+                 cache; `failed` opens a 60 s backoff during which every unknown-kid push \
+                 is refused (talos_google_push_refusals_total{reason=unknown_key}), so a \
+                 sustained outage yields at most one `failed` per minute per controller \
+                 and only while pushes arrive. Alerted by TalosGoogleJwkRefreshFailing \
+                 (>= 5 failures in 15 m). Both values pre-seeded at 0.",
+            ),
+            &["outcome"],
+        )?;
+        registry.register(Box::new(google_jwk_refresh_total.clone()))?;
+        for outcome in JwkRefreshOutcome::ALL {
+            google_jwk_refresh_total
+                .with_label_values(&[outcome.as_str()])
+                .inc_by(0.0);
+        }
+
         // (cache_hits_total / cache_misses_total were deleted 2026-09-11 — see
         // the struct field comment.)
 
@@ -3036,6 +3124,8 @@ impl TalosMetrics {
             scheduler_readiness_holds_total,
             scheduler_readiness_degraded,
             rate_limit_hits_total,
+            google_push_refusals_total,
+            google_jwk_refresh_total,
             dlq_entries_total,
             dlq_drops_total,
             dlq_db_errors_total,
@@ -3186,7 +3276,7 @@ mod tests {
         let families = metrics.gather();
         let dlq_metric = families
             .iter()
-            .find(|f| f.get_name() == "talos_dlq_entries_total");
+            .find(|f| f.name() == "talos_dlq_entries_total");
         assert!(dlq_metric.is_some());
     }
 
@@ -3222,6 +3312,11 @@ mod tests {
         }
     }
 
+    /// `#[test]` restored 2026-09-12: f27db68d inserted the process-metrics
+    /// test above this fn and took this attribute with it, so the guard on the
+    /// crypto series (incl. the blind-detector stamp rendering 0) had not run
+    /// since 2026-09-11 while `cargo check --all-targets` called it dead code.
+    #[test]
     fn crypto_invariant_metrics_render() {
         let m = TalosMetrics::new().unwrap();
 
@@ -3439,6 +3534,46 @@ mod tests {
         // The counter is seeded, so its line count does not move.
         assert_eq!(lines(&cold, "talos_rpc_calls_total"), 64);
         assert_eq!(lines(&warm, "talos_rpc_calls_total"), 64);
+    }
+
+    /// The Google push counters (2026-09-12) are seeded over the FULL
+    /// integration × reason product — every pair is reachable from a live
+    /// handler — and both recorders move exactly the pair they were given.
+    #[test]
+    fn google_push_counters_are_seeded_over_the_product_and_moved_by_pair() {
+        let m = TalosMetrics::new().unwrap();
+        let cold = m.render_prometheus().expect("render");
+        let mut seeded = 0;
+        for i in PushIntegration::ALL {
+            for r in PushRefusalReason::ALL {
+                assert!(cold.contains(&format!(
+                    "talos_google_push_refusals_total{{integration=\"{}\",reason=\"{}\"}} 0",
+                    i.as_str(),
+                    r.as_str()
+                )));
+                seeded += 1;
+            }
+        }
+        assert_eq!(seeded, 18, "the HELP text claims 18 pre-seeded pairs");
+        for o in JwkRefreshOutcome::ALL {
+            assert!(cold.contains(&format!(
+                "talos_google_jwk_refresh_total{{outcome=\"{}\"}} 0",
+                o.as_str()
+            )));
+        }
+        record_google_push_refusal_on(&m, PushIntegration::Gmail, PushRefusalReason::UnknownKey);
+        record_google_jwk_refresh_on(&m, JwkRefreshOutcome::Failed);
+        let warm = m.render_prometheus().expect("render");
+        assert!(warm.contains(
+            "talos_google_push_refusals_total{integration=\"gmail\",reason=\"unknown_key\"} 1"
+        ));
+        // The sibling integration's same reason did NOT move — the label is
+        // not aggregated away by the recorder.
+        assert!(warm.contains(
+            "talos_google_push_refusals_total{integration=\"gcp\",reason=\"unknown_key\"} 0"
+        ));
+        assert!(warm.contains("talos_google_jwk_refresh_total{outcome=\"failed\"} 1"));
+        assert!(warm.contains("talos_google_jwk_refresh_total{outcome=\"ok\"} 0"));
     }
 
     /// The three security counters that sat DEAD in check 58's baseline for

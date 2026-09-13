@@ -641,6 +641,23 @@ turn every push into a 5 s HTTP timeout unless a dedicated
 after re-acquiring it. Staleness-TTL alone is not enough; the
 mutex path always falls through to refresh on unknown kid.
 
+**And the window must be REPORTED as a window, not per push (2026-09-12).**
+One failed fetch on the reference fleet opened the 60 s backoff and the
+92 pushes that arrived inside it were each refused `UnknownKey` with a
+WARN of their own — 94 lines for one blip, and no series anywhere.
+Now `GoogleOidcVerifier::report_refusal(integration, &err)` is the ONE
+place a push handler reports a `VerifyError`: every refusal moves
+`talos_google_push_refusals_total{integration,reason}`; an `UnknownKey`
+inside an open window logs at DEBUG and the window's close (the next
+fetch attempt, whatever its outcome) writes ONE WARN carrying
+`refused_in_previous_window`. `talos_google_jwk_refresh_total{outcome}`
+counts the fetches; `TalosGoogleJwkRefreshFailing` (>= 5 failures in
+15 m — derived from the backoff cadence, not guessed) is the alert. A
+new push integration adds a `PushIntegration` variant in `talos-metrics`,
+calls `report_refusal` on its verify failure and `record_missing_bearer`
+on a missing header — never its own per-push `warn!`; the helpers crate's
+source pin checks both handlers for exactly that.
+
 ### Double-submit on Create (`7018372`)
 
 Disable the Create button until the post-create list refetch

@@ -3337,3 +3337,131 @@ the author's.
 **The CLAUDE.md `make lint ≠ pre-commit` bullet this package extended, kept verbatim for `check-engineering-log.py`'s losslessness leg:**
 
 - **`make lint` ≠ pre-commit.** The pre-commit hook runs compile-only; clippy (`-D warnings`) and rustfmt run at pre-push / CI. Run `TALOS_LINT_CLIPPY=1 make lint` before pushing — recurring surprises this session: `trivially_copy_pass_by_ref` on serde `skip_serializing_if(&T)` helpers (allow it — serde mandates the ref), needless late-init (`let x; if … {x=…}` → `let x = if …`), and ref-to-ref on `Option<&T>` params.
+
+### Package AP (2026-09-12) — one JWK fetch failure was 94 WARN lines and no series
+
+**Found by the deploy verification, not by a review.** The #837 deploy's WARN
+count read 94 on the controller against the 0 every clean boot before it had
+produced. Reading them: ONE `JWK refresh failed; backing off` at 21:20:32 —
+`could not fetch Google JWKs`, a network blip on the way to
+`www.googleapis.com/oauth2/v3/certs` — then 92 `gmail pubsub: JWT verification
+failed` lines carrying `unknown signing key — Google may have rotated`, the
+last at 21:21:31, then twelve push-triggered module executions as Pub/Sub
+redelivered. Sixty seconds, one cause, ninety-four lines.
+
+**Every one of those refusals was correct.** `GoogleOidcVerifier` (the shared
+kernel in `talos-integration-helpers::google_jwt`, one instance per push
+integration) keeps Google's JWK set in an `ArcSwap`, refreshes on an unknown
+`kid` or a stale hour-old cache, and after a failed fetch sets `backoff_until`
+sixty seconds out so a sustained Google outage does not turn every push into a
+5 s HTTP timeout (regression `13ea09c`, recorded in `docs/integration-pattern.md`).
+Inside that window a push whose `kid` the cache does not hold cannot be
+verified and is refused 401 — fail-closed, and Pub/Sub retries a 401. The
+behaviour is the design. What was wrong is what the design SAID about itself.
+
+**Two defects in the reporting, and the second is the one that matters.** (1)
+The verifier logged the one cause once and the callers logged each consequence
+once more, at the same level, so an operator reading the log saw ninety-three
+WARNs about one event — check 69's trap in miniature, a signal that trains its
+reader to skim. (2) There was NO SERIES. `google_jwt.rs` had no metric, and
+`talos-gmail`, `talos-google-cloud` and `talos-integration-helpers` had no
+`talos-metrics` dependency between them (measured: 24 crates depend on it; none
+of these three). So a SUSTAINED JWK outage — every push carrying a rotated key
+refused, Pub/Sub retrying for its retention window and then dropping the
+message, the Gmail and GCP integrations off the air — would have been visible
+as log volume and as nothing else. `security_audit` does not look there; no
+alert could.
+
+**The move.** Two counter families in `talos-metrics`, label sets closed by
+the compiler in a new `google_push` module: `talos_google_push_refusals_total
+{integration,reason}` — `integration` ∈ {gmail, gcp}, `reason` = one value per
+`VerifyError` arm plus `missing_bearer`, **all 18 pairs pre-seeded** because
+every pair is reachable from a live handler (Gmail's `PubsubJwtVerifier::verify`
+chains the signature and service-account checks so it can yield all eight;
+GCP's `verify_signed` yields six and its own `require_service_account` step the
+other two; both handlers refuse a missing header) — and `talos_google_jwk_refresh_total
+{outcome}`. `VerifyError::refusal_reason()` is an exhaustive match, so a ninth
+verifier arm cannot ship uncounted. `talos-integration-helpers` takes the
+`talos-metrics` dependency (a leaf: `prometheus` and `talos-workflow-liveness`;
+the worker links neither the helpers nor the metrics crate, checked with
+`cargo tree`).
+
+**The window is reported as a window.** `GoogleOidcVerifier::report_refusal
+(integration, &err)` is now the ONE place a push handler reports a `VerifyError`:
+it records the pair and then decides the level with the pure
+`refusal_log_is_folded(err, in_backoff)` — an `UnknownKey` produced INSIDE an
+open backoff window is logged at DEBUG with the running `refused_in_window`
+count; everything else is WARN, including an `UnknownKey` with NO window open,
+which is a rotation the fetch could not resolve and deserves its line. The
+verifier counts the in-window refusals on an `AtomicU64` at the exact point it
+produces them (`verify_signed`'s unknown-key arm, gated on `in_backoff()`), and
+the window's CLOSE — which is by construction the next `fetch_jwks` attempt,
+since no attempt is reachable while the window is open — swaps the count to 0
+and writes ONE WARN carrying `refused_in_previous_window`, on the failure line
+if the fetch failed again and on a new `JWK refresh recovered` line if it
+succeeded. Both handlers replace their per-push `warn!` with the call; Gmail
+through a one-line passthrough on `PubsubJwtVerifier` that fixes the
+integration label; GCP's separate service-account refusal keeps its own WARN
+(it carries the channel id) and gains the count beside it.
+
+**One alert, and its threshold is derived rather than guessed.**
+`TalosGoogleJwkRefreshFailing`: `increase(talos_google_jwk_refresh_total
+{outcome="failed"}[15m]) >= 5`, warning, category integrations. The arithmetic:
+a fetch runs only on an unknown `kid` or a stale cache, and a failure opens a
+60 s backoff during which no fetch runs, so failures are capped at one per
+minute per controller and occur only while pushes arrive. Five in fifteen
+minutes is therefore at least five minutes of CONTINUOUS failure with live
+traffic. The shapes that must stay quiet do: the 2026-09-12 blip (one failure),
+the hourly TTL refresh failing once (one per hour), a quiet fleet (no pushes,
+no fetches, nothing to refuse). No `absent()` arm — the series is seeded at 0.
+The promtool case drives all three transitions: one blip at t=10 m (quiet), one
+failure per minute from t=40 m (fires at t=50 m with `10` in the description —
+nine raw increments that `increase()` extrapolates over the range boundary,
+recorded in the fixture so the next reader does not "fix" it), flat for
+fifteen minutes (clears). **The refusal counter itself is deliberately NOT
+alerted**: a refusal is the control working, and its per-window summary in the
+log says how many; the alert says whether the control can recover.
+
+**Guards, and what they do NOT cover.** `google_push_counters_are_seeded_over_the_product_and_moved_by_pair`
+pins the 18 seeded pairs and that a recorder moves exactly its own pair (the
+sibling integration's same reason stays 0). `every_verify_error_counts_under_its_own_reason`
+pins the mapping exhaustive and distinct against an explicit registry.
+`unknown_key_refusals_inside_backoff_are_counted_and_folded` drives
+`verify_signed` three times with a rotated `kid` inside a stamped window and
+reads 3 off the verifier, with a same-window `Invalid` refusal as the control
+(not folded, not counted) and the no-window `UnknownKey` as the second control
+(not folded). `both_push_handlers_report_refusals_through_the_verifier` is a
+SOURCE PIN, stated as textual: `include_str!` over both handlers, each must call
+`report_refusal` and `record_missing_bearer` under its own `PushIntegration`,
+and neither may contain the old per-push WARN text — a guard at the primitive
+cannot see a call site, and both call sites are where a revert would land.
+**Not covered, stated**: the summary line at the window's close lives in
+`fetch_jwks`, which needs the network — no unit test drives it, and the honest
+guard is the live read after deploy (the same position #767/#769/#771 took).
+Populations for the record: Gmail push here runs ~55–73 module executions per
+hour, so a steady-state 60 s window holds one or two pushes; the 92 were a
+burst, which is exactly when a per-push WARN is at its worst.
+
+**Not changed.** The 60 s backoff, the hourly TTL, the 401 (Pub/Sub retries a
+401 and must keep doing so), and `require_service_account`'s WARN on GCP. No
+lint: the population of "a caller that logs a `VerifyError` itself" is the two
+handlers the pin already reads.
+
+**Found on the way, by `cargo check --workspace --all-targets`.** Two test-target
+warnings, both pre-existing on main and both invisible to CI's `--no-deps`
+clippy. `talos-metrics/src/lib.rs`: `function crypto_invariant_metrics_render is
+never used` — the fn check 58's own entry names as the test that vouches for
+`talos_dek_cache_size` and `talos_module_payload_encryption_failures_total` had
+no `#[test]`. `git log -S` dates the loss to f27db68d (2026-09-11), the commit
+that inserted `process_metrics_are_exported_on_linux` directly above it: the new
+test was anchored on the old fn's attribute line and took the attribute — the
+stolen-attribute shape this session already recorded once. For one day the
+guard that asserts the crypto series render, and that the blind-detector stamp
+renders 0 on an unstamped registry, was dead code. Restored; it passes.
+`talos-measurement/src/lib.rs`: two `#[test]` attributes on one fn, the first
+stranded above a comment block. Removed. And a third, found only when clippy
+was pointed at the test targets: `MetricFamily::get_name()` is deprecated in
+prometheus 0.14, which under `-D warnings` is an ERROR — `cargo clippy
+--all-targets -p talos-metrics` did not compile on main. Moved to `.name()`.
+None of the three could have failed CI, which is the point of running
+`--all-targets` before every push.

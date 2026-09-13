@@ -697,7 +697,10 @@ use super::dispatch::{
 };
 use axum::body::Bytes;
 use axum::http::HeaderMap;
-use talos_integration_helpers::google_jwt::{GoogleOidcVerifier, PubsubPushEnvelope};
+use talos_integration_helpers::google_jwt::{
+    record_missing_bearer, record_push_refusal, GoogleOidcVerifier, PubsubPushEnvelope,
+    PushIntegration,
+};
 
 pub struct PubsubHandlerState {
     pub verifier: Arc<GoogleOidcVerifier>,
@@ -750,12 +753,15 @@ pub async fn pubsub_push_handler(
     {
         Some(t) => t,
         None => {
+            record_missing_bearer(PushIntegration::Gcp);
             tracing::warn!("gcp pubsub: missing Authorization bearer");
             return StatusCode::UNAUTHORIZED;
         }
     };
 
     // 2. Verify signature + audience + issuer + expiry. NO DB before this.
+    //    The verifier owns the refusal's count + log line (one WARN per JWK
+    //    backoff window, not one per refused push — 2026-09-12).
     let claims = match state
         .verifier
         .verify_signed(token, &state.expected_audience)
@@ -763,7 +769,7 @@ pub async fn pubsub_push_handler(
     {
         Ok(c) => c,
         Err(e) => {
-            tracing::warn!(error = %e, "gcp pubsub: JWT verification failed");
+            state.verifier.report_refusal(PushIntegration::Gcp, &e);
             return StatusCode::UNAUTHORIZED;
         }
     };
@@ -786,6 +792,7 @@ pub async fn pubsub_push_handler(
     // 4. Enforce the PER-WATCH service account. Log channel_uuid only —
     //    never the token or the email (PII / secret).
     if let Err(e) = claims.require_service_account(&row.expected_sa_email) {
+        record_push_refusal(PushIntegration::Gcp, e.refusal_reason());
         tracing::warn!(
             channel_uuid = %row.id,
             error = %e,

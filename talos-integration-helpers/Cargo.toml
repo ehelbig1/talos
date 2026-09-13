@@ -34,6 +34,9 @@ talos-http-body = { path = "../talos-http-body" }
 talos-http-utils = { path = "../talos-http-utils" }
 talos-integration-state = { path = "../talos-integration-state" }
 talos-memory = { path = "../talos-memory" }
+# `google_jwt` records push refusals + JWK refresh outcomes (2026-09-12).
+# `version` because the cargo-deny wildcard ban applies to publishable crates.
+talos-metrics = { path = "../talos-metrics", version = "0.1.0" }
 # The ONE three-valued module-visibility read, beside the dispatch-time load
 # whose predicate it is pinned equal to (see `watch_binding`).
 talos-registry = { path = "../talos-registry" }

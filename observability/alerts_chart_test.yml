@@ -4473,6 +4473,71 @@ tests:
         exp_alerts: []
 
   # ══════════════════════════════════════════════════════════════════════
+  # TalosGoogleJwkRefreshFailing — the threshold is derived from the
+  # verifier's 60 s backoff: a single blip (the 2026-09-12 shape) and the
+  # hourly TTL refresh failing once both stay quiet; five failures inside
+  # 15 m is at least five minutes of continuous failure with live pushes.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: one JWK blip stays quiet, a sustained outage fires, recovery clears
+    input_series:
+      # Seeded at 0. One failure at t=10m (a blip), then from t=40m one
+      # failure per minute for ten minutes (backoff cadence), then flat.
+      - series: 'talos_google_jwk_refresh_total{job="talos-controller",outcome="failed"}'
+        values: "0+0x10 1+0x29 2+1x9 11+0x30"
+      - series: 'talos_google_jwk_refresh_total{job="talos-controller",outcome="ok"}'
+        values: "0+0x80"
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: TalosGoogleJwkRefreshFailing
+        exp_alerts: []
+      # The blip: 1 in 15m, below the threshold.
+      - eval_time: 20m
+        alertname: TalosGoogleJwkRefreshFailing
+        exp_alerts: []
+      # Sustained: t=40..49 climbs 2→11 — nine raw increments, which
+      # increase() extrapolates to 10 over the 15 m range (Prometheus's
+      # range-boundary extrapolation, not a counting error).
+      - eval_time: 50m
+        alertname: TalosGoogleJwkRefreshFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: integrations
+              job: talos-controller
+              outcome: failed
+            exp_annotations:
+              summary: "Google JWK fetches keep failing — every rotated-key push is being refused"
+              description: |
+                The controller has failed to fetch Google's OIDC signing keys
+                10 times in the last 15 minutes. Each
+                failure opens a 60 s backoff during which every Gmail / GCP
+                Pub/Sub push whose key is not already cached is refused with 401
+                (talos_google_push_refusals_total{reason="unknown_key"}); Pub/Sub
+                retries those and drops them after its retention window.
+
+                Pushes signed with a key the cache already holds still verify,
+                so the effect is partial until Google rotates keys (roughly
+                daily) — after which it is total.
+              action: |
+                1. Controller log: `JWK refresh failed; backing off` carries the
+                   HTTP / transport error from https://www.googleapis.com/oauth2/v3/certs;
+                   `refused_in_previous_window` on that line and on the
+                   `JWK refresh recovered` line count the affected pushes.
+                2. Egress: the fetch goes through the hardened outbound client
+                   (5 s timeout, 2 s connect). A NetworkPolicy or proxy change
+                   that blocks googleapis.com from the controller looks exactly
+                   like this.
+                3. Nothing is lost inside Pub/Sub's retention; once the fetch
+                   succeeds the next retry of each push verifies. Watch
+                   `talos_google_push_refusals_total{reason="unknown_key"}` stop
+                   climbing.
+      # Flat again for 15 m: the window drains and the alert clears.
+      - eval_time: 70m
+        alertname: TalosGoogleJwkRefreshFailing
+        exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
   # TalosRPCWriteCeilingRefusals — the fleet-configuration signal.
   #
   # The case that mattered: before this change the ONLY trace of a signed-RPC
