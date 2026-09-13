@@ -3293,6 +3293,23 @@ crate, the wildcard rule — a leg `make lint` runs only under
 `TALOS_LINT_AUDIT=1`. The local gate was green because it had not been asked;
 CI was red because it always asks. That is the relationship a CI gate is for.
 
+**And the first CI run of the moved clippy job produced a second proof, this
+time about the job itself.** It died after 1 m 50 s — far short of a workspace
+build — on `collect2: fatal error: cannot find 'ld'` while linking the build
+scripts of `quote`, `proc-macro2`, `libc` and `serde`. `.cargo/config.toml`
+pins `-C link-arg=-fuse-ld=mold` for `x86_64-unknown-linux-gnu`; the test,
+integration and sqlx-cache jobs each carry an "Install mold linker" step with
+a per-attempt apt timeout (the 2026-08-19 stall lesson); the clippy job copied
+out of `ci.yml` never had one, because `ci.yml`'s clippy job never had one
+either — and that job had never run, so nothing had ever told anyone. Clippy
+with `--no-deps` still LINKS every build script and proc-macro, so the
+requirement is not optional. The step is now in the clippy job, same shape as
+the test job's. The structural lint job passed on the same run: 95 green
+lines, the four env-gated legs (clippy, audit, personal markers, DB PREPARE)
+reporting their documented `⊘` skips, `helm version` present, and one
+pre-existing info-only warning from check 2 (a `/internal` route with no
+`// no-nginx-route` marker on either nginx file — recorded, not fixed here).
+
 **The move.** The `lint` job (rustfmt, `scripts/lint-structural.sh`, WIT drift)
 and the `clippy` job move from `ci.yml` into `quality.yml` — one home, deleted
 from the dispatch-only file with a note saying why — with one addition: a

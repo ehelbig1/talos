@@ -830,6 +830,26 @@ jobs:
           sudo rm -rf /usr/local/share/boost || true
           sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
 
+      - name: Install mold linker
+        # .cargo/config.toml pins `-fuse-ld=mold` for x86_64-unknown-linux-gnu,
+        # and clippy still LINKS every build script and proc-macro, so without
+        # mold the job dies in the first minute on `collect2: cannot find 'ld'`.
+        # That is exactly how this job failed on its first CI run (#839) — and
+        # how ci.yml's copy would have failed on ITS first run, had it ever had
+        # one. Same retry-with-per-attempt-timeout shape as the test job.
+        timeout-minutes: 6
+        run: |
+          for attempt in 1 2 3; do
+            if sudo timeout 90 apt-get update -qq \
+               && sudo timeout 90 apt-get install -y -qq mold; then
+              exit 0
+            fi
+            echo "apt attempt ${attempt}/3 failed or timed out; retrying" >&2
+            sleep $((attempt * 10))
+          done
+          echo "::error::apt-get failed to install mold after 3 attempts" >&2
+          exit 1
+
       - name: Install Rust toolchain (clippy)
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
         with:
