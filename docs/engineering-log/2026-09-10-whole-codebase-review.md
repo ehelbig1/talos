@@ -3890,3 +3890,81 @@ clippy and were left for a test-target pass.
 **The CLAUDE.md count sentence this package moved (its package-AN form), kept verbatim for `check-engineering-log.py`'s losslessness leg:**
 
 - **`make lint` enforces structural rules** via `scripts/lint-structural.sh`. 90 checks today (the authoritative, inline-documented list lives in the script; `bash scripts/lint-structural.sh --count` prints the live number, and check 54 fails the lint if this sentence's count goes stale), each tied to a specific past regression so it catches at PR-time the class of bug that survives `cargo check` cleanly but breaks at CI or request time:
+
+### Package AV (2026-09-13) — one job's lost ledger batch read as a control failure for two hours
+
+**How it was found.** The forty-third deploy (#845) verified clean and the
+alert list carried a newcomer: `TalosAuditChainUnverifiable` FIRING,
+`reason=empty_chain`. The current process's counters were all 0 (boot 14:48),
+so the increment belonged to the previous lifetime; Prometheus placed it at the
+14:20:56 sweep — the first hourly sweep after the 13:20 boot — and the
+last-verified-ok stamp moved on that same sweep, so the control had verified
+the rest of its population while the alert said it could not verify. The
+rule: `increase(talos_audit_chain_unverifiable_total[2h]) > 0`, `for: 0m`, no
+`reason` split, and no promtool case in the chart fixture at all.
+
+**Which job.** `module_executions` between 09:30 and 14:21 held 167 rows, 166
+`completed` and ONE `failed`: `f7490bee`, started 10:00:08 — six minutes
+before the host suspend that ran 10:06–12:23 — and finished at 12:22:50 with
+"execution timed out after 120 seconds". The worker was frozen for the whole
+job; the dispatcher's timeout fired on resume; the #843 deploy recreated the
+worker container at 12:28. The worker flushes a job's ledger batch at job
+end, so this job wrote nothing to the WORM store, and the sweep's `empty_chain`
+is precisely right about it.
+
+**The code had the partition; the alert did not.** `ChainVerifyErrorKind::
+aborts_sweep` names `access_denied`, `no_such_bucket` and `no_credentials` as
+deployment-wide — "if the first says AccessDenied, so will all of them" — and
+`EmptyChain`'s doc comment ends: "an individual execution can legitimately
+produce no audit events, so this is a per-execution fact and the volume is
+what makes it a finding." The one rule selected all seven reasons at `> 0`.
+Measured over the seven days before the fix: **3.7 hours firing, five
+increments, all `empty_chain`, all single jobs, zero deployment-wide reasons**
+(and zero in the seven days before that). The alert's own description said
+"suspect the audit-ledger subscriber" — for one job.
+
+**The fix is the partition, plus the denominator the per-job half needed.**
+`talos_audit_chain_jobs_swept_total{outcome}` — one increment per classified
+job at `record_chain_verification_outcome`'s single exit, labels from the new
+`JobChainOutcome::metric_label` over `ALL`, pre-seeded in talos-metrics
+(pinned equal from the ledger side, which is the only side that can name the
+enum). `TalosAuditChainUnverifiable` keeps its name and threshold and selects
+`reason=~"access_denied|no_such_bucket|no_credentials"`; the new
+`TalosAuditChainJobsUnverifiable` divides the complement's increase by the
+swept increase, `> 0.25` AND `>= 5` over 2 h, `for: 5m`. On this fleet a 2 h
+window sweeps ~110 jobs, so one lost job is 0.9 %, a deploy that kills three
+in-flight jobs is under the floor, and a subscriber that lands nothing is
+100 % within one sweep. `alert_selectors_match_the_aborts_sweep_partition`
+reads the chart file at compile time and asserts each `reason=~` alternation
+equals the code's partition — a reason added to the enum lands in exactly one
+rule or fails the build — and that the per-job rule names the denominator.
+
+**Fixtures.** The dev fixture (`observability/alerts_test.yml`) already held a
+case asserting that `empty_chain` climbing at one per minute fires the alert;
+it now fires the JOBS alert, with a `jobs_swept_total{outcome="empty"}` series
+climbing beside it (ratio 1.0). The chart fixture gains five cases: one empty
+of 111 swept (both quiet), 40 of 40 (fires `100%` after `for`), 4 of 8 (ratio
+0.5, count under the floor, quiet), 6 of 110 (count over the floor, share
+0.055, quiet), and `access_denied` at one per minute (the control alert
+fires with 120 in the description; the jobs alert stays quiet). `make
+test-alert-rules` green on the first run — and the 6-of-110 case was not in
+that first run: mutation M3 (`> 0.25` → `> 0`) SURVIVED the first four,
+because every quiet case was also under the floor and so proved nothing
+about the share. A threshold with no case on the far side of it is not
+tested; the case was added and M3 then failed on it alone.
+
+**Mutations** are recorded in the package's PR body and memory: dropping the
+denominator increment fails the ledger's empty-prefix test; moving
+`empty_chain` into the control alert's selector fails the compile-time pin AND
+the one-of-111 fixture case; `> 0` in place of `> 0.25` fires the six-of-110
+case (and only that one — see above); removing the floor fires the four-of-eight case; un-seeding one outcome
+fails the seed pin.
+
+**Stated, not fixed.** The WORM writer anchors a job's chain at job END, so a
+worker that dies with a job in flight — a crash, a deploy, a host suspend that
+outlives the dispatcher's timeout — leaves an empty prefix, and every such
+event is one `empty_chain`. A per-event flush would close that at the cost of
+one PutObject per audit event on the hot path; not this package's call. The
+sweep reporting the lost job per job, with the module and workflow execution
+ids on the WARN line, is the correct behaviour and stays.
+

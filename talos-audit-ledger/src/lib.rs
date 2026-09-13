@@ -1246,6 +1246,11 @@ fn record_chain_verification_outcome(
             }
         }
     };
+    // ONE site, after the arms: every classified job moves the denominator
+    // `TalosAuditChainJobsUnverifiable` divides by, whatever it was classified
+    // as. Per job, not per sweep, so a sweep that aborts on its first job
+    // still counts the one it read.
+    inc_chain_job_swept(class);
     (control, class)
 }
 
@@ -1276,6 +1281,16 @@ fn inc_chain_unverifiable(kind: ChainVerifyErrorKind) {
     if let Some(m) = talos_metrics::global() {
         m.audit_chain_unverifiable_total
             .with_label_values(&[kind.metric_label()])
+            .inc();
+    }
+}
+
+/// One job classified by the sweep, whatever the verdict — the denominator
+/// the per-job unverifiable alert divides by (package AV, 2026-09-13).
+fn inc_chain_job_swept(class: JobChainOutcome) {
+    if let Some(m) = talos_metrics::global() {
+        m.audit_chain_jobs_swept_total
+            .with_label_values(&[class.metric_label()])
             .inc();
     }
 }
@@ -2789,6 +2804,103 @@ mod audit_verification_metric_tests {
             .get()
     }
 
+    fn jobs_swept_count(outcome: &str) -> f64 {
+        talos_metrics::global()
+            .expect("global installed")
+            .audit_chain_jobs_swept_total
+            .with_label_values(&[outcome])
+            .get()
+    }
+
+    /// The seed list in talos-metrics cannot import this enum; pin the two
+    /// equal here so a fifth outcome cannot ship unseeded (absent ≠ zero).
+    #[test]
+    fn job_chain_outcome_labels_are_the_seeded_set() {
+        let m = talos_metrics::TalosMetrics::new().expect("registry");
+        let rendered = m.render_prometheus().expect("render");
+        for outcome in JobChainOutcome::ALL {
+            let line = format!(
+                "talos_audit_chain_jobs_swept_total{{outcome=\"{}\"}} 0",
+                outcome.metric_label()
+            );
+            assert!(rendered.contains(&line), "unseeded outcome: {line}");
+        }
+        let seeded = rendered
+            .lines()
+            .filter(|l| l.starts_with("talos_audit_chain_jobs_swept_total{"))
+            .count();
+        assert_eq!(
+            seeded,
+            JobChainOutcome::ALL.len(),
+            "a seeded outcome no variant produces"
+        );
+    }
+
+    /// The two unverifiable alerts are split along `aborts_sweep`, and the
+    /// chart file is read at compile time so the selectors cannot drift from
+    /// the enum (#630's rule): a reason added to `ChainVerifyErrorKind` must
+    /// land in exactly one of the two `reason=~` alternations or this fails.
+    /// Textual, stated as such — it reads the `reason=~"…"` selectors out of
+    /// each alert's block and compares the sets.
+    #[test]
+    fn alert_selectors_match_the_aborts_sweep_partition() {
+        const ALERTS: &str = include_str!("../../deploy/helm/talos/files/alerts.yaml");
+        fn selectors(alert: &str) -> Vec<std::collections::BTreeSet<&'static str>> {
+            let start = ALERTS
+                .find(&format!("- alert: {alert}\n"))
+                .unwrap_or_else(|| panic!("{alert} is not defined in alerts.yaml"));
+            let block = &ALERTS[start + 8..];
+            let end = block.find("- alert: ").unwrap_or(block.len());
+            let block = &block[..end];
+            let mut out = Vec::new();
+            let mut rest = block;
+            while let Some(i) = rest.find("reason=~\"") {
+                let after = &rest[i + 9..];
+                let close = after.find('"').expect("closing quote");
+                out.push(after[..close].split('|').collect());
+                rest = &after[close..];
+            }
+            assert!(!out.is_empty(), "{alert} carries no reason=~ selector");
+            out
+        }
+        let deployment_wide: std::collections::BTreeSet<&str> = ChainVerifyErrorKind::ALL
+            .iter()
+            .filter(|k| k.aborts_sweep())
+            .map(|k| k.metric_label())
+            .collect();
+        let per_job: std::collections::BTreeSet<&str> = ChainVerifyErrorKind::ALL
+            .iter()
+            .filter(|k| !k.aborts_sweep())
+            .map(|k| k.metric_label())
+            .collect();
+        assert!(!deployment_wide.is_empty() && !per_job.is_empty());
+        for sel in selectors("TalosAuditChainUnverifiable") {
+            assert_eq!(
+                sel, deployment_wide,
+                "TalosAuditChainUnverifiable must select exactly the aborts_sweep reasons"
+            );
+        }
+        let jobs = selectors("TalosAuditChainJobsUnverifiable");
+        for sel in &jobs {
+            assert_eq!(
+                *sel, per_job,
+                "TalosAuditChainJobsUnverifiable must select exactly the per-job reasons"
+            );
+        }
+        let start = ALERTS
+            .find("- alert: TalosAuditChainJobsUnverifiable\n")
+            .unwrap();
+        let block = &ALERTS[start..];
+        let block = &block[..block[8..]
+            .find("- alert: ")
+            .map(|i| i + 8)
+            .unwrap_or(block.len())];
+        assert!(
+            block.contains("talos_audit_chain_jobs_swept_total"),
+            "the per-job alert must be a ratio over the swept denominator"
+        );
+    }
+
     /// The counter the `Err` arm never had.
     ///
     /// Before this, an execution whose chain could not be READ incremented
@@ -2873,6 +2985,7 @@ mod audit_verification_metric_tests {
         };
         let mut stats = ChainSweepStats::default();
         let before = unverifiable_count("empty_chain");
+        let swept_before = jobs_swept_count("empty");
         let gauge_before = gauge();
 
         let mut empty = report(true);
@@ -2886,6 +2999,11 @@ mod audit_verification_metric_tests {
         );
         assert_eq!(stats.empty, 1);
         assert_eq!(unverifiable_count("empty_chain") - before, 1.0);
+        assert_eq!(
+            jobs_swept_count("empty") - swept_before,
+            1.0,
+            "the job moves the denominator too — the per-job alert is a RATIO"
+        );
         assert_eq!(
             gauge(),
             gauge_before,

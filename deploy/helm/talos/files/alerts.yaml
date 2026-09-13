@@ -1275,7 +1275,7 @@ groups:
                handful of failures against a same-build fleet is the real shape.
             3. Check S3/MinIO Object Lock is still enforced on the audit bucket.
 
-      # ── The verifier could not READ the chain ────────────────────────
+      # ── The verifier could not READ the chain — two alerts, one partition ─
       #
       # A SEPARATE series from the one above, and the split is the design:
       # "the chain is broken" and "I could not look" are different findings.
@@ -1300,52 +1300,102 @@ groups:
       # `reason` is a CLOSED set from `talos_audit_ledger::ChainVerifyErrorKind`
       # and every value is PRE-SEEDED at 0 — an `increase(...) > 0` over an
       # absent series matches nothing, which is exactly how this stayed quiet.
+      #
+      # SPLIT 2026-09-13 (package AV), along the partition the code already
+      # draws — `ChainVerifyErrorKind::aborts_sweep`. access_denied /
+      # no_such_bucket / no_credentials are DEPLOYMENT-WIDE facts: if the
+      # first job says so, every job would, and the sweep aborts on them.
+      # empty_chain / not_found / transport / other are facts about ONE job —
+      # an empty prefix is a worker that died with its ledger batch
+      # unflushed (measured 2026-09-13: job f7490bee, frozen through a
+      # 137-minute host suspend, marked timed-out on resume, its worker
+      # recreated by a deploy five minutes later); not_found / transport are
+      # one failed read. Until this split ONE rule fired `> 0`, `for: 0m`,
+      # on any of the seven for the whole 2 h window: 3.7 h of "the audit
+      # chain could not be verified" in the seven days before, every hour of
+      # it one job, ZERO deployment-wide reasons in the same seven days —
+      # while the last-verified-ok stamp advanced on the very sweep that
+      # raised it. The verifier's own doc for EmptyChain says "an individual
+      # execution can legitimately produce no audit events … the volume is
+      # what makes it a finding"; the rule had no volume. It has one now: a
+      # RATIO against `talos_audit_chain_jobs_swept_total`, the denominator
+      # this split added, with a floor of five (the TalosRPCSubjectFailing
+      # shape — a ratio cannot fire on an idle fleet, 0/0 is NaN, and the
+      # floor keeps one deploy's handful of in-flight jobs out of it). The
+      # selectors are pinned to the code's partition by
+      # `alert_selectors_match_the_aborts_sweep_partition` in
+      # talos-audit-ledger, so a reason added to the enum lands in exactly
+      # one of the two rules or fails the build.
       - alert: TalosAuditChainUnverifiable
-        expr: increase(talos_audit_chain_unverifiable_total[2h]) > 0
+        expr: increase(talos_audit_chain_unverifiable_total{reason=~"access_denied|no_such_bucket|no_credentials"}[2h]) > 0
         for: 0m
         labels:
           severity: warning
           category: audit-integrity
         annotations:
-          summary: "Audit chain could not be verified (reason={{ $labels.reason }})"
+          summary: "Audit chain verifier cannot read the ledger (reason={{ $labels.reason }})"
           description: |
-            {{ $value }} job chain(s) in the last 2h could not be READ. The
-            WORM ledger is keyed per JOB — every object key is
-            <module_executions.id>/… — so this counts module executions, and
-            the sweep's summary line rolls them up to the workflow executions
-            they belong to. The ledger is still being written; nothing is
-            verifying it, so there is currently no tamper-evidence on those
-            runs.
+            {{ $value }} job chain(s) in the last 2h could not be READ for a
+            DEPLOYMENT-WIDE reason — the sweep aborts on this one, because
+            every remaining job would answer the same. The WORM ledger is
+            still being written; nothing is verifying it, so there is
+            currently no tamper-evidence on any run.
             reason=access_denied: the verifier identity may not read the audit
             bucket. On this platform that almost always means the verifier is
             running as the WRITE-ONLY writer — check
             AUDIT_VERIFIER_ACCESS_KEY_ID names the read-only verifier user and
             that the audit_read_only policy is attached to it.
             reason=no_credentials: no verifier identity is configured at all.
-            reason=empty_chain: the prefix READ CLEANLY and held no events, so
-            nothing was verified — an empty chain trivially satisfies every
-            check. The identity is fine; the prefix is empty. The sweep names
-            <module_executions.id>/ prefixes, the id space the writer keys,
-            where an empty prefix is NOT expected (200 of 200 recent module
-            executions had events, measured 2026-09-06) — so suspect the
-            audit-ledger subscriber (did the batch reach the store?) rather
-            than the verifier, whose identity demonstrably works or this would
-            have been access_denied.
             reason=no_such_bucket: a provisioning gap, not a permission one.
-            reason=transport / not_found: an object-store fault; check the
-            endpoint before treating this as a control failure.
+            The per-JOB reasons (empty_chain, not_found, transport, other)
+            belong to TalosAuditChainJobsUnverifiable, which needs volume.
           action: |
             1. security_audit → the `audit_chain_verification` check. It runs
                the REAL verifier against a recent execution and reports the
                same classified reason plus its remedy.
             2. Grep the controller log for
-               event_kind="audit_chain_verification_errored" (per job; the
-               line carries module_execution_id AND workflow_execution_id)
-               and event_kind="audit_chain_sweep_aborted" (the whole pass gave
-               up on a deployment-wide condition).
+               event_kind="audit_chain_sweep_aborted" (the whole pass gave up
+               on this condition) and event_kind="audit_chain_verification_errored"
+               (the job it gave up on; the line carries module_execution_id
+               AND workflow_execution_id).
             3. Do NOT widen the WRITER's policy to fix this. The writer is
                PutObject-only by design; the fix is the separate read-only
                verifier identity.
+
+      - alert: TalosAuditChainJobsUnverifiable
+        expr: |
+          (
+            sum(increase(talos_audit_chain_unverifiable_total{reason=~"empty_chain|not_found|transport|other"}[2h]))
+              / sum(increase(talos_audit_chain_jobs_swept_total[2h]))
+          ) > 0.25
+          and sum(increase(talos_audit_chain_unverifiable_total{reason=~"empty_chain|not_found|transport|other"}[2h])) >= 5
+        for: 5m
+        labels:
+          severity: warning
+          category: audit-integrity
+        annotations:
+          summary: "A large share of job audit chains could not be verified"
+          description: |
+            {{ $value | humanizePercentage }} of the job chains the sweep read
+            in the last 2h were unverifiable for a PER-JOB reason, at least
+            five of them. ONE such job is expected and stays out of this
+            alert — a worker that dies mid-flight leaves an empty prefix, an
+            object-store blip fails one read; a quarter of the population is
+            not one job. empty_chain across the population means the
+            audit-ledger SUBSCRIBER is not landing batches (the verifier's
+            identity works, or this would be TalosAuditChainUnverifiable with
+            reason=access_denied); transport / not_found across the
+            population is the object store.
+          action: |
+            1. Controller log, event_kind="audit_chain_verification_empty" and
+               event_kind="audit_chain_verification_errored" — each line names
+               the module_execution_id AND workflow_execution_id, so the
+               affected runs are listable.
+            2. empty_chain dominating: is the audit-ledger subscriber running
+               and reaching the store? Its boot line is "Audit ledger
+               subscriber ready"; the writer identity needs PutObject only.
+            3. transport / not_found dominating: the object-store endpoint,
+               then the bucket's Object Lock configuration.
 
       # ── The sweep is alive but has verified nothing ──────────────────
       #
