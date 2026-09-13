@@ -861,6 +861,16 @@ worker:
   # the SAN URI of the Fulcio cert; pin to the workflow URL pattern so
   # only artifacts signed by THIS repo's publish workflow are accepted.
   # Default `oidcIssuer` is the GitHub Actions OIDC endpoint.
+  # DESPITE THE `worker.` PREFIX THIS BLOCK GOVERNS BOTH PROCESSES (2026-09-13).
+  # The controller's OCI catalog sync (talos-registry::sync) verifies the
+  # `_index` artifact and every template under the SAME policy type
+  # (talos_sigstore_policy::SigstorePolicy) and reads the SAME three env vars,
+  # and its production gate refuses to SYNC on an unset/empty value exactly as
+  # the worker refuses to BOOT. Both Deployments render these three from here.
+  # Until 2026-09-13 only the worker did, so `controller.ociRegistry.url` was
+  # inert under the chart's production default (sync declined every boot).
+  # The key is not renamed: install.sh's overlay and the operational runbook
+  # address `worker.sigstore.*`, and a rename would be a second spelling.
   sigstore:
     required: ""              # "" (→ disabled) | "disabled" | "audit" | "required"
     identityRegexp: ""        # e.g. "^https://github\\.com/OWNER/talos/\\.github/workflows/template-publish\\.yml@"

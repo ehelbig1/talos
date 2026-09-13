@@ -669,9 +669,11 @@ worker:
     repository: "ghcr.io/${TALOS_GHCR_OWNER}/talos-worker"
     digest: "${TALOS_WORKER_DIGEST}"
 ${WT_WORKER_ENV_BLOCK}
-  # Sigstore enforcement for OCI template signatures. See
-  # talos-worker-runtime/src/module_fetcher.rs (SigstorePolicy) for the
-  # runtime check + worker.sigstore in values.yaml for the chart key.
+  # Sigstore enforcement for OCI template signatures — for BOTH processes:
+  # the chart renders these onto the worker AND the controller (whose OCI
+  # catalog sync verifies the index + templates under the same policy). See
+  # talos-sigstore-policy (SigstorePolicy) for the shared type and
+  # worker.sigstore in values.yaml for the chart key.
   # Defaults to the EXPLICIT "disabled": under RUST_ENV=production the worker
   # refuses to boot on an unset/empty value ("must be set explicitly"), so an
   # empty default here was a guaranteed CrashLoop. Operators move to "audit"

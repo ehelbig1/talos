@@ -71,6 +71,66 @@ BINS = ("controller", "worker")
 SKIP_COMPONENTS = {"", "—", "frontend (build)", "compose (shell)"}
 
 
+CHART_DEPLOYMENTS = {
+    "controller": "deploy/helm/talos/templates/controller/deployment.yaml",
+    "worker": "deploy/helm/talos/templates/worker/deployment.yaml",
+}
+
+
+def chart_env_names(root, rel):
+    """Env-var names a Deployment template hands its container: an explicit
+    `- name: VAR` entry, or `"VAR"` inside its `$secretKeys := list …` block
+    (the controller's `talos.envFromSecret` include). Operator-supplied maps
+    (`talos.envFromMap .Values.*.env`) are invisible by construction — the
+    chart cannot know their keys — and read as absent on BOTH sides."""
+    path = os.path.join(root, rel)
+    if not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as fh:
+        t = fh.read()
+    names = set(re.findall(r"^\s*-\s*name:\s*([A-Z][A-Z0-9_]+)\s*$", t, re.M))
+    # `# allow-chart-asymmetry: VAR VAR — <reason>` exempts the named
+    # variables from leg (d): a `both` variable ONE process must deliberately
+    # NOT receive. The one legitimate shape today is the credential-free
+    # worker — LLM provider keys travel in the sealed job envelope, never env.
+    exempt = set()
+    for m in re.finditer(r"allow-chart-asymmetry:\s*([A-Z0-9_ ]+)", t):
+        exempt.update(m.group(1).split())
+    chart_env_names.exempt = getattr(chart_env_names, "exempt", set()) | exempt
+    m = re.search(r"\$secretKeys\s*:=\s*list(.*?)\}\}", t, re.S)
+    if m:
+        names.update(re.findall(r"[\"']([A-Z][A-Z0-9_]+)[\"']", m.group(1)))
+    return names
+
+
+def chart_parity_findings(rows, ctl_env, wrk_env):
+    """(d) The chart must agree with the Component column. A `both` variable the
+    chart renders by name on ONE Deployment and not the other is a control one
+    process was never given: on 2026-09-13 the three `TALOS_SIGSTORE_*` vars
+    were rendered on the worker alone while the controller's OCI-sync gate read
+    the same three — so `controller.ociRegistry.url` was inert under the chart's
+    production default. A `controller`/`worker` variable rendered on the OTHER
+    process is W1's dead-env class (`AWS_ENDPOINT_URL` on the worker, removed
+    2026-09-12). Rows the chart renders on neither side are out of range — the
+    chart is not obliged to render every documented variable."""
+    out = []
+    exempt = getattr(chart_env_names, "exempt", set())
+    for lineno, var, comp, _src, _default, _claims in rows:
+        c = comp.replace("`", "").strip()
+        if var in exempt:
+            continue
+        in_ctl, in_wrk = var in ctl_env, var in wrk_env
+        where = f"{DOC}:{lineno}"
+        if c == "both" and in_ctl != in_wrk:
+            has, lacks = ("controller", "worker") if in_ctl else ("worker", "controller")
+            out.append(f"{where}: `{var}` Component=both but the chart renders it on the {has} Deployment only — the {lacks} reads it too and never receives it (see {CHART_DEPLOYMENTS[lacks]})")
+        elif c == "controller" and in_wrk and not in_ctl:
+            out.append(f"{where}: `{var}` Component=controller but the chart renders it on the worker Deployment (dead env — the worker cannot read it)")
+        elif c == "worker" and in_ctl and not in_wrk:
+            out.append(f"{where}: `{var}` Component=worker but the chart renders it on the controller Deployment (dead env — the controller cannot read it)")
+    return out
+
+
 def sh(args, cwd):
     return subprocess.run(args, cwd=cwd, capture_output=True, text=True)
 
@@ -248,6 +308,15 @@ def main():
             named = [n.strip() for n in c.split("/")]
             if not any(n in readers for n in named):
                 findings.append(f"{where}: `{var}` Component names {c} but that crate does not read it (readers: {rd})")
+    ctl_env = chart_env_names(root, CHART_DEPLOYMENTS["controller"])
+    wrk_env = chart_env_names(root, CHART_DEPLOYMENTS["worker"])
+    if ctl_env is None or wrk_env is None:
+        print("✗ a chart Deployment template is missing — the parity leg would pass over nothing", file=sys.stderr)
+        sys.exit(2)
+    if len(ctl_env) < 10 or len(wrk_env) < 10:
+        print(f"✗ chart env extraction found {len(ctl_env)}/{len(wrk_env)} names — the template shape moved", file=sys.stderr)
+        sys.exit(2)
+    findings.extend(chart_parity_findings(rows, ctl_env, wrk_env))
     for f in findings:
         print(f)
     print(f"  checked {len(rows) - skipped} row(s) ({skipped} out of range); worker tree {len(wrk)} crates, controller tree {len(ctl)}; {len(findings)} finding(s)")
