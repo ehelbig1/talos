@@ -3,7 +3,9 @@ name: CI
 # Auto-triggers DISABLED in May-2026 — the operator opted out of paid
 # GitHub Actions and runs the workspace's lint + test suite locally via
 # `cargo check --workspace`, `cargo test --workspace`, and
-# `bash scripts/lint-structural.sh`. Image publish is handled by
+# `bash scripts/lint-structural.sh`. (Since 2026-09-12 the lint, clippy and
+# rustfmt gates run on every PR in quality.yml — this file never did, having
+# zero runs in the repository's history.) Image publish is handled by
 # `scripts/publish-images.sh` (local builds + cosign).
 #
 # This workflow is kept (not deleted) so it can be re-enabled by
@@ -46,91 +48,10 @@ concurrency:
 # ─────────────────────────────────────────────────────────────────────────
 
 jobs:
-  # ── Fast lints: rustfmt + structural checks (no Rust compile) ─────────────
-  # Sub-30-second job that fails fast on the cheap things — formatting
-  # drift and structural-rule violations don't need to wait for the
-  # workspace to compile. Expensive `cargo clippy --workspace` moved
-  # into the `test` job below, where the workspace is already being
-  # compiled — running both in parallel paid for one full compile twice.
-  lint:
-    name: Fast lints
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
-        with:
-          persist-credentials: false
-
-
-      - name: Install rustfmt
-        # Toolchain pin matters because rustfmt rules differ between
-        # versions — pinning rust-toolchain.toml + this CI knob keeps
-        # local + CI in lockstep.
-        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # master @ 2026-04-...
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          components: rustfmt
-
-      - name: rustfmt --check
-        run: cargo fmt --all -- --check
-
-      - name: Structural lints
-        run: bash scripts/lint-structural.sh
-
-      - name: WIT drift check
-        # Catches fork between `wit/talos.wit` and the embedded copy in
-        # `module-templates/wit/talos.wit` — same check as `make lint`.
-        run: |
-          diff -q wit/talos.wit module-templates/wit/talos.wit \
-            || { echo "::error::wit/talos.wit and module-templates/wit/talos.wit have drifted"; exit 1; }
-
-  # ── Clippy: workspace lint with -D warnings ───────────────────────────────
-  # Separate from `test` so the two can run in parallel. We tried merging
-  # clippy into the test job to reuse nextest's compile, but cargo can't
-  # share metadata across `--cfg test` and non-test invocations — clippy
-  # had to re-type-check every dependency, costing 10+ minutes on top of
-  # nextest. Two parallel jobs finish in less wall-clock than the merged
-  # serial path.
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6.0.3
-        with:
-          persist-credentials: false
-
-      - name: Free runner disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet || true
-          sudo rm -rf /usr/local/lib/android || true
-          sudo rm -rf /opt/ghc || true
-          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
-          sudo rm -rf /usr/local/share/boost || true
-          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
-
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # master
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          components: clippy
-
-      - name: Cache Rust build artifacts
-        # Per-job shared-key — clippy and test each maintain their own
-        # cache slot. Co-occupying one slot would invalidate after every
-        # job since each writes back at end-of-run.
-        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4  # v2.9.1
-        with:
-          shared-key: clippy
-
-      - name: cargo clippy --workspace --no-deps
-        # Matches `make lint` scope (bin+lib only, not --all-targets).
-        # Tests and examples have a backlog of cosmetic lint drift; fixing
-        # that is tracked separately and would expand this to --all-targets.
-        run: cargo clippy --workspace --no-deps -- -D warnings
+  # The `lint` (rustfmt + structural checks + WIT drift) and `clippy` jobs that
+  # used to open this file MOVED to quality.yml on 2026-09-12: this workflow is
+  # workflow_dispatch-only and had run zero times, so those gates had never
+  # executed in CI. One home; do not re-add them here.
 
   # ── Test: nextest with Postgres service for integration tests ─────────────
   # cargo-nextest is 3-5x faster than `cargo test` (parallel scheduling,
