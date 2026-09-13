@@ -100,6 +100,7 @@ fn env(k: &str) -> Option<String> {
 }
 
 fn resolve_config() -> Config {
+    // allow-undocumented-env: HOME — the operator CLI's home directory, not Talos configuration
     let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
     let bucket = env("TALOS_OFFHOST_B2_BUCKET");
     let endpoint = env("TALOS_OFFHOST_B2_ENDPOINT");

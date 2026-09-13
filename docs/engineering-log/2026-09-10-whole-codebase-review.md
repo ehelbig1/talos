@@ -3665,3 +3665,98 @@ gone.
 **The CLAUDE.md check-89 line this package extended, kept verbatim for `check-engineering-log.py`'s losslessness leg:**
 
   89. a configuration-reference Component cell must not claim a process that cannot read the variable — `docs/configuration-reference.md` is the AUTHORITATIVE env-var list and its Component column tells an operator which PROCESS needs a variable set. Measured 2026-09-12 (after #834): it said `both` for **108** variables the worker binary cannot read at all — `TALOS_MASTER_KEY`, `JWT_SECRET`, `VAULT_ADDR`, `NEO4J_PASSWORD`, every scheduler knob, every memory-loop knob — 69 in a Component cell and 48 under two section headings that said "both components" / "both"; one crate-named row (`COMPILE_DIR` → `talos-compilation`) is read by the controller bin and not that crate; one `controller` row (`TALOS_VERSION`) is read by the worker's self-registration. Read literally, the column told an operator to hand the credential-free worker the master KEK and the JWT signing secret. **The rule is an IMPOSSIBILITY test, so its precision is structural**: `scripts/lint-config-reference-components.py` derives the crate set linked into each binary from `cargo tree -p worker` / `-p controller` (lockfile resolution, ~0.3 s each, no build), takes a read to be the variable as a WHOLE quoted literal in a crate's production `.rs` (whole-line comments stripped; `tests/`, `*_tests.rs`, `examples/`, `benches/` excluded) or a `talos-config` `pub fn` accessor called from it, and fails a `both`/`worker` row no worker-linked crate reads, a `controller` row the worker bin itself reads, a `both`/`controller` row nothing controller-linked reads, and a crate-named row the named crate does not read. **117 findings on pristine main, 0 on the fixed tree**; mutation-proved in both arms (one row back to `both` → 1; `NATS_URL` → `controller` → 1; the memory heading back to "both components" → 38). ~1.9 s. Fails LOUDLY (exit 2) on an empty cargo tree, a moved table format or a wrong root. **Stated limits, each the quiet direction:** a read in a SHARED crate is left to the author — `talos-worker-runtime` is linked into the controller for the WIT inspector and its host-side env reads run only in the worker, so `worker` rows read there stay `worker` and a `both` row whose only worker-side evidence is a shared crate PASSES. Measured: after the fix **13** `both` rows have no reader in the worker bin or `talos-worker-runtime`; six were hand-flipped on architecture (`EMBEDDING_*` ×5 — the worker is credential-free and the reader is the service half of `talos-memory`; `TALOS_DISPATCH_SCHEME` — `configured_dispatch_signer` has no worker caller) and seven are true `both` (`NATS_CA_FILE`, `TALOS_RPC_REQUIRE_ED25519`, `JAEGER_ENDPOINT` + the four `OTEL_*`). The WHOLE-LITERAL rule is load-bearing and was added on measurement: under a bare-token rule `worker/src/self_register.rs` vouched for `TALOS_WORKER_PUBLIC_KEYS` from inside a WARN message, `talos-dlp-provider` for `VAULT_TOKEN` from a `[REDACTED:VAULT_TOKEN]` fixture and `talos-worker-runtime` for `BASE_URL` from gemini's `const BASE_URL` — three prose hits, two false negatives and one false positive. A name assembled at runtime (`format!("{}_FILE", v)`) is invisible; trailing `// comments` on code lines are not stripped. **No opt-out**: a process that cannot read a variable has no legitimate reason to be listed as reading it. The same pass removed the chart worker's `AWS_ENDPOINT_URL` env — set since 2026-05-18 (`8f13f1e9`, an unrelated MCP commit) and read by nothing: the worker links no AWS SDK (W1's dead-env class). The legend now defines `both` as "both binaries read it", not "a shared crate mentions it". **Two legs added the same day (package AL, no new number):** a Default cell may not be a placeholder (`bool default`/`flag`/`policy default`; 10 on pristine main, two of them the write-ceiling switches) and a `(+_FILE)` claim needs a `read_env_or_file("VAR")` or `"VAR_FILE"` reader (1: `NATS_PASSWORD`, both readers bare `env::var`). The first `_FILE` draft matched the substring in the variable NAME and flagged `NATS_CA_FILE` — the claim pattern is `(+`_FILE``. Descriptions stay out of range: the 24 wrong ones were a per-row human read, and a Default-VALUE compare scored ~9 % precision.
+
+### Package AT (2026-09-13) — the authoritative list was 25 knobs short
+
+**Found by a retention survey.** With forty deploys verified and no carried
+candidate, the pass started from the database: which tables grow, which have a
+sweep, which have rows older than the 60-day execution lifetime.
+`module_executions` is the largest table (57 755 rows, 193 MB) and holds 911
+terminal `timeout`/`cancelled` rows whose `workflow_executions` parent is gone
+from both the live table and the archive, plus 1 831 `module_execution_logs`
+rows that CASCADE from them; `execution_cost_rollup` holds 891 rows older than
+60 days and no sweep names it. The row-retention sweep for exactly those
+module rows exists — `delete_expired_executions`, six-hourly, batch-bounded,
+corpus-preserving, orphan-only — and has never run here, because
+`MODULE_EXECUTION_RETENTION_ENABLED` defaults off.
+
+**The default is right and stays.** Its doc comment states the precondition —
+the off-host backup chain proven end-to-end, which as of 2026-08-13 it was not
+(the daily dumps live on the disk they insure) — and the argument that a
+strictly larger irreversible deletion cannot carry a weaker precondition than
+the payload sweep's. Nothing here relitigates that. What was wrong is
+downstream of it: neither retention flag, nor the five knobs beside them,
+appeared anywhere in `docs/configuration-reference.md`, which this file
+declared the AUTHORITATIVE list on 2026-09-07. An operator who had met the
+precondition and gone looking for the switch would not have found it.
+
+**So the reverse question was asked for the first time.** Check 89 and the
+09-11 audit proved every documented token has a reader. Nothing proved every
+reader has a row. Measured over whole-literal reads through the reader
+functions in production Rust (test paths and `#[cfg(test)]` modules out):
+**309 distinct variables read, 37 with no backticked mention in the
+reference; 30 once suffix twins documented inside their parent's row (`X
+(+`_FILE`, `_PREVIOUS`)`, `X / `_PREVIOUS``) are credited; 25 real knobs**
+once `HOME` (the off-host backup CLI's home directory), three
+`TALOS_TEST_*` probes and the `TALOS_NATS_PERMISSIONS_WRITE` regeneration
+switch are set aside. The twenty-five, by weight: the seven retention-sweep
+switches (`MODULE_PAYLOAD_RETENTION_{ENABLED,DAYS,CORPUS_KEEP,BATCH}`,
+`MODULE_EXECUTION_RETENTION_{ENABLED,DAYS,BATCH}`); the three worker-identity
+REAPER knobs (`TALOS_WORKER_IDENTITY_REAP_{ENABLED,HOURS,PRE_PROTOCOL_HOURS}`
+— whether a departed worker's key leaves the trusted verify ring, and when);
+`TALOS_WORKER_FLEET_HEARTBEAT_AUTHORITATIVE` and
+`TALOS_WORKER_LIVENESS_INTERVAL_SECS`, both of which the Helm chart RENDERS
+onto a Deployment with a values comment and no reference row; the two `=0`
+hot-path cliffs MCP-771 and MCP-695 fixed in May (`LLM_KEYS_CACHE_TTL_SECS`,
+`TALOS_POLICY_CACHE_TTL_SECS`) and never documented; `TALOS_SELF_ALERTS_INTERVAL_SECS`
+beside a documented `TALOS_SELF_ALERTS`; `MEMORY_RANK_PROVENANCE_SWEEP_INTERVAL_SECS`,
+which `docker-compose.yml` sets; and nine worker caps — the four
+`CIRCUIT_BREAKER_*` thresholds beside three documented siblings,
+`FETCH_ALL_CONCURRENCY`, `WASM_HTTP_MAX_RESPONSE_BYTES`,
+`TALOS_SSE_MAX_EVENT_BYTES`, `TALOS_WORKER_IDEMPOTENCY_{TTL_SECS,MAX_ENTRIES}`.
+
+**The rows.** Each written from the reader's own doc comment: the default, the
+clamp, the `=0` rule (the MCP-6xx footgun family's "non-positive ⇒ default +
+WARN, never disabled"), the Component, and for the two destructive flags the
+stated precondition in the Default cell's neighbour, so the reference says what
+the code comment says. Check 89's existing arms then verified every new
+Component cell against `cargo tree` — 300 rows, 0 findings — which is the
+right order: write the row, let the impossibility test read it.
+
+**Check 89 gained leg (e)**, and its first draft was wrong twice in the
+reassuring direction. (1) "Documented" was any backticked token in the file, so
+a row whose name a SIBLING row's Purpose cell quoted stayed documented after
+the row was deleted — the mutation "drop `TALOS_WORKER_IDENTITY_REAP_HOURS`"
+reported nothing, because the `_ENABLED` row's prose names it. Check 65(c)
+records the same weakness for test literals. Documentation is now the
+Variable cell of a table row (plus its declared suffix twins) or the two prose
+sections whose job is to list names; the mutation fires at the row. (2) The
+opt-out marker `// allow-undocumented-env:` was scanned in the text
+`load_sources` returns, which has whole-line comments stripped — so the marker
+was dead code, and the fixed tree was green only because the dev-only prose
+happened to name `HOME`. The scan reads the raw file now; removing the marker
+(and the prose mention) fires. Measured after both fixes: **25 against main's
+reference, 0 on the fixed tree**; 309 reads, with a "fewer than 100 reads"
+arm that fails rather than passing over a moved root.
+
+**Stated limits.** Textual: a name assembled at runtime, or read through a
+helper the regex does not list, is invisible; a read in an indented (nested)
+test module is not stripped — the loud direction. Documentation by row means a
+variable listed only in another row's prose is reported until it gets its own
+row, which is the intended pressure. `execution_cost_rollup`'s 891 rows older
+than 60 days have no sweep and are RECORDED, not fixed: no reader is harmed and
+a new destructive sweep is its own decision with the same backup precondition.
+
+**Also measured on the same pass, no finding.** Compose-vs-chart env asymmetry
+per process (41 compose-only controller variables, 27 chart-only) is tuning
+knobs with code defaults plus the RFC 0010 trust-posture variables the
+installer applies in phases by design. The host was suspended 10:06–12:23 UTC
+(a 137-minute Prometheus sample gap): two module executions that started at
+10:00 straddled it — one hit its 120 s job timeout the instant the clock
+resumed, the other "completed" with a 2.4-hour recorded duration — and the
+scheduler then classified seven overdue dispatches `catchup`, as package M
+intended. The dev laptop, not the platform.
+
+**The CLAUDE.md check-89 line this package extended (its package-AS form), kept verbatim for `check-engineering-log.py`'s losslessness leg:**
+
+  89. a configuration-reference Component cell must not claim a process that cannot read the variable — `docs/configuration-reference.md` is the AUTHORITATIVE env-var list and its Component column tells an operator which PROCESS needs a variable set. Measured 2026-09-12 (after #834): it said `both` for **108** variables the worker binary cannot read at all — `TALOS_MASTER_KEY`, `JWT_SECRET`, `VAULT_ADDR`, `NEO4J_PASSWORD`, every scheduler knob, every memory-loop knob — 69 in a Component cell and 48 under two section headings that said "both components" / "both"; one crate-named row (`COMPILE_DIR` → `talos-compilation`) is read by the controller bin and not that crate; one `controller` row (`TALOS_VERSION`) is read by the worker's self-registration. Read literally, the column told an operator to hand the credential-free worker the master KEK and the JWT signing secret. **The rule is an IMPOSSIBILITY test, so its precision is structural**: `scripts/lint-config-reference-components.py` derives the crate set linked into each binary from `cargo tree -p worker` / `-p controller` (lockfile resolution, ~0.3 s each, no build), takes a read to be the variable as a WHOLE quoted literal in a crate's production `.rs` (whole-line comments stripped; `tests/`, `*_tests.rs`, `examples/`, `benches/` excluded) or a `talos-config` `pub fn` accessor called from it, and fails a `both`/`worker` row no worker-linked crate reads, a `controller` row the worker bin itself reads, a `both`/`controller` row nothing controller-linked reads, and a crate-named row the named crate does not read. **117 findings on pristine main, 0 on the fixed tree**; mutation-proved in both arms (one row back to `both` → 1; `NATS_URL` → `controller` → 1; the memory heading back to "both components" → 38). ~1.9 s. Fails LOUDLY (exit 2) on an empty cargo tree, a moved table format or a wrong root. **Stated limits, each the quiet direction:** a read in a SHARED crate is left to the author — `talos-worker-runtime` is linked into the controller for the WIT inspector and its host-side env reads run only in the worker, so `worker` rows read there stay `worker` and a `both` row whose only worker-side evidence is a shared crate PASSES. Measured: after the fix **13** `both` rows have no reader in the worker bin or `talos-worker-runtime`; six were hand-flipped on architecture (`EMBEDDING_*` ×5 — the worker is credential-free and the reader is the service half of `talos-memory`; `TALOS_DISPATCH_SCHEME` — `configured_dispatch_signer` has no worker caller) and seven are true `both` (`NATS_CA_FILE`, `TALOS_RPC_REQUIRE_ED25519`, `JAEGER_ENDPOINT` + the four `OTEL_*`). The WHOLE-LITERAL rule is load-bearing and was added on measurement: under a bare-token rule `worker/src/self_register.rs` vouched for `TALOS_WORKER_PUBLIC_KEYS` from inside a WARN message, `talos-dlp-provider` for `VAULT_TOKEN` from a `[REDACTED:VAULT_TOKEN]` fixture and `talos-worker-runtime` for `BASE_URL` from gemini's `const BASE_URL` — three prose hits, two false negatives and one false positive. A name assembled at runtime (`format!("{}_FILE", v)`) is invisible; trailing `// comments` on code lines are not stripped. **No opt-out**: a process that cannot read a variable has no legitimate reason to be listed as reading it. The same pass removed the chart worker's `AWS_ENDPOINT_URL` env — set since 2026-05-18 (`8f13f1e9`, an unrelated MCP commit) and read by nothing: the worker links no AWS SDK (W1's dead-env class). The legend now defines `both` as "both binaries read it", not "a shared crate mentions it". **Two legs added the same day (package AL, no new number):** a Default cell may not be a placeholder (`bool default`/`flag`/`policy default`; 10 on pristine main, two of them the write-ceiling switches) and a `(+_FILE)` claim needs a `read_env_or_file("VAR")` or `"VAR_FILE"` reader (1: `NATS_PASSWORD`, both readers bare `env::var`). The first `_FILE` draft matched the substring in the variable NAME and flagged `NATS_CA_FILE` — the claim pattern is `(+`_FILE``. Descriptions stay out of range: the 24 wrong ones were a per-row human read, and a Default-VALUE compare scored ~9 % precision. **Leg (d), 2026-09-13 (package AS): the CHART must agree with the column.** A `both` variable the chart renders by name (or via the controller's `$secretKeys` list) on ONE Deployment and not the other is a control one process was never given; a `controller`/`worker` variable rendered on the other process is W1's dead-env class. Measured against main's controller template: 5 findings — the three `TALOS_SIGSTORE_*` vars rendered on the worker alone while the controller's OCI-sync gate reads them (real), plus `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` rendered on the controller alone, which is the credential-free worker BY DESIGN — so the leg takes `# allow-chart-asymmetry: VAR … — <reason>` in the template, and that marker now records the decision where the list lives. 3 real / 3 reported after the exemption, 0 on the fixed tree; mutation: dropping the controller's `TALOS_SIGSTORE_REQUIRED` fires. Operator-supplied `talos.envFromMap` keys are invisible by construction and read as absent on both sides (stated).

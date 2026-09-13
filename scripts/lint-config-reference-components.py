@@ -103,6 +103,90 @@ def chart_env_names(root, rel):
     return names
 
 
+ENV_READ_RE = re.compile(
+    r"\b(?:env::var(?:_os)?|std::env::var(?:_os)?|read_env_or_file|bool_env(?:_or_default)?"
+    r"|positive_env_or_default(?:::<[^>]+>)?|get_env(?:_or)?|env_var_is_set_nonempty)"
+    r"\(\s*[\"']([A-Z][A-Z0-9_]{2,})[\"']"
+)
+TEST_MOD_RE = re.compile(r"^#\[cfg\(test\)\][^\n]*\n(?:#\[[^\n]*\]\s*\n)*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{.*?\n\}\n?", re.M | re.S)
+
+
+def documented_names(root):
+    """Every variable the reference DOCUMENTS: the Variable cell of a table row
+    (its first backticked SCREAMING_SNAKE token, `~~struck~~` rows included)
+    plus the suffix siblings that cell declares — `X (+`_FILE`, `_PREVIOUS`)`
+    and `X / `_PREVIOUS`` document `X_FILE` / `X_PREVIOUS` — plus every token
+    named in the "Test-only / dev-only" and "Compile-time values" sections,
+    which are prose lists by design. A backticked mention inside another row's
+    Purpose cell is NOT documentation: the first version of this leg counted
+    it, and deleting a row whose name a sibling row quoted left the leg green
+    (check 65(c)'s test-literal weakness, one file over)."""
+    with open(os.path.join(root, DOC), encoding="utf-8") as fh:
+        t = fh.read()
+    names = set()
+    section = ""
+    for line in t.splitlines():
+        if line.startswith("#"):
+            section = line
+            continue
+        if section.startswith("## Test-only") or section.startswith("## Compile-time"):
+            names.update(re.findall(r"`([A-Z][A-Z0-9_]{2,})`", line))
+            continue
+        if not line.startswith("|"):
+            continue
+        cell = line.strip().strip("|").split("|")[0]
+        base = re.search(r"`([A-Z][A-Z0-9_]{2,})`", cell)
+        if not base:
+            continue
+        names.add(base.group(1))
+        # A cell may list several full names (`A` / `B` / `C`) and suffix twins.
+        names.update(re.findall(r"`([A-Z][A-Z0-9_]{2,})`", cell))
+        for suf in re.findall(r"`(_[A-Z0-9_]+)`", cell):
+            names.add(base.group(1) + suf)
+    return names
+
+
+def undocumented_env_findings(sources, documented, root):
+    """(e) The reverse of every other arm: a variable PRODUCTION code reads
+    through a reader function must have a row. The 09-11 audit proved every
+    documented token has a reader; nothing proved every reader has a row, and
+    on 2026-09-13 the reference — the AUTHORITATIVE list — was 25 real knobs
+    short: seven retention-sweep switches (default-off destructive controls
+    an operator could not have found), the three worker-identity reaper knobs
+    (a trust-ring control), two variables the chart itself renders, and a
+    dozen worker caps. Scope: whole-literal reads via the reader functions
+    (the same rule as the Component arms — a name inside a log line is prose);
+    column-0 `#[cfg(test)] mod` regions and whole-line comments are dropped;
+    `tests/`, `*_tests.rs`, `examples/`, `benches/` are already excluded from
+    `sources`. Opt-out `// allow-undocumented-env: VAR VAR — <reason>` anywhere
+    in a production file, for a read that is not Talos configuration (a CLI's
+    `HOME`, a test-only probe read from a production file)."""
+    reads = collections.defaultdict(set)
+    exempt = set()
+    for p, t in sources.items():
+        # The marker is a COMMENT, and `load_sources` strips whole-line comments,
+        # so it is read from the raw file — the first version scanned `t` and
+        # found no marker anywhere, while the fixed tree stayed green only
+        # because the dev-only prose happened to name the exempted variable.
+        try:
+            with open(os.path.join(root, p), encoding="utf-8") as fh:
+                raw = fh.read()
+        except OSError:
+            raw = ""
+        for m in re.finditer(r"allow-undocumented-env:\s*([A-Z0-9_ ]+)", raw):
+            exempt.update(m.group(1).split())
+        t = TEST_MOD_RE.sub("", t)
+        t = re.sub(r"^\s*//.*$", "", t, flags=re.M)
+        for v in ENV_READ_RE.findall(t):
+            reads[v].add(p.split("/")[0])
+    out = []
+    for v in sorted(reads):
+        if v in documented or v in exempt:
+            continue
+        out.append(f"{DOC}: `{v}` is read by production code ({', '.join(sorted(reads[v]))}) and has no row — document it, or mark the read `// allow-undocumented-env: {v} — <reason>` if it is not Talos configuration")
+    return out, len(reads)
+
+
 def chart_parity_findings(rows, ctl_env, wrk_env):
     """(d) The chart must agree with the Component column. A `both` variable the
     chart renders by name on ONE Deployment and not the other is a control one
@@ -317,9 +401,15 @@ def main():
         print(f"✗ chart env extraction found {len(ctl_env)}/{len(wrk_env)} names — the template shape moved", file=sys.stderr)
         sys.exit(2)
     findings.extend(chart_parity_findings(rows, ctl_env, wrk_env))
+    documented = documented_names(root)
+    undoc, n_reads = undocumented_env_findings(sources, documented, root)
+    if n_reads < 100:
+        print(f"✗ only {n_reads} env reads found in production code — the reader regex or the root moved", file=sys.stderr)
+        sys.exit(2)
+    findings.extend(undoc)
     for f in findings:
         print(f)
-    print(f"  checked {len(rows) - skipped} row(s) ({skipped} out of range); worker tree {len(wrk)} crates, controller tree {len(ctl)}; {len(findings)} finding(s)")
+    print(f"  checked {len(rows) - skipped} row(s) ({skipped} out of range); {n_reads} distinct env reads in production code; worker tree {len(wrk)} crates, controller tree {len(ctl)}; {len(findings)} finding(s)")
     sys.exit(1 if findings else 0)
 
 

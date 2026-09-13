@@ -111,6 +111,7 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | `TALOS_ALLOW_ENV_KEK` | unset (refuse) | controller | Explicit opt-in required to boot production with an env-var KEK (lint check 45; fails closed) | 🔒 |
 | `KEK_DISABLE_LEGACY` | `false` | controller | Disable the legacy env-KEK dual-wrap path under `KEK_PROVIDER=vault` (`true`/`1`/`yes`/`on`; before 2026-09-12 only `true`/`1`) | 🔒 |
 | `DEK_CACHE_TTL_SECS` | `300` | controller | DEK cache TTL | |
+| `LLM_KEYS_CACHE_TTL_SECS` | `60` | controller | Per-user TTL of the vault-first LLM provider-key cache (`get_llm_vault_keys`); short so a `rotate_secret` propagates within one window. `=0` ⇒ default + WARN (would turn every dispatch into a DB miss) | |
 | `VAULT_ADDR` (+`_FILE`) | none | controller | HashiCorp Vault address | 🔒 |
 | `VAULT_TOKEN` (+`_FILE`) | none | controller | Vault auth token | 🔒 |
 | `VAULT_TRANSIT_KEY_NAME` (+`_FILE`) | `talos-kek` | controller | Vault transit key name | 🔒 |
@@ -168,6 +169,10 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | `TALOS_CONTROLLER_URL` | none (dev compose: `http://controller:8000`) | worker | Controller base URL the worker self-registers against — not a secret. Registration also requires the token above **and** `TALOS_WORKER_SIGNING_KEY`; with all three, the worker reports its build into `get_platform_info.fleet` | |
 | `TALOS_WORKER_REG_REQUIRE_BOUND_TOKEN` | unset | controller | Require a bound registration token | 🔒 |
 | `TALOS_WORKER_KEY_REFRESH_SECS` | `60` | controller | Worker key refresh sweep interval | |
+| `TALOS_WORKER_IDENTITY_REAP_ENABLED` | `false` | controller | Enable the worker-identity reaper: a registered worker whose liveness pings have stopped for `TALOS_WORKER_IDENTITY_REAP_HOURS` is DEACTIVATED (its key leaves the trusted verify ring). Off ⇒ departed workers' keys stay trusted until `deactivate-worker-identity` (INFO at boot says so). Truthy: `1`/`true`/`yes`/`on` | 🔒 (posture) |
+| `TALOS_WORKER_IDENTITY_REAP_HOURS` | `24` (clamped 1..87600) | controller | Silence window before a liveness-participating identity is reaped. Non-positive/garbage ⇒ default; clamping UP is the safe direction (deactivates less) | 🔒 (posture) |
+| `TALOS_WORKER_IDENTITY_REAP_PRE_PROTOCOL_HOURS` | unset (OFF) | controller | Opt-in SECOND arm keyed on `last_seen_at` for identities that never pinged (registered before the liveness protocol). Setting it is the operator ASSERTING the whole fleet runs a pinging build — the controller cannot check that, and a healthy long-lived worker on an old build would be reaped | 🔒 (posture) |
+| `TALOS_WORKER_FLEET_HEARTBEAT_AUTHORITATIVE` | `false` | controller | Operator assertion that every worker runs a heartbeat-publishing build, so `talos_worker_build_skew_workers` may treat a silent identity row as departed rather than unknown. Affects ONLY that gauge; grants nothing; the heartbeat-derived `talos_worker_fleet_*` gauges ignore it. Truthy: `1`/`true`/`yes`/`on` | |
 | `TALOS_ENVELOPE_SEALING` | unset (OFF = legacy inline WSK envelope) | both | Per-execution secret-envelope sealing mode (`audit` / `required`; RFC 0010 P3) | 🔒 |
 
 ### SSO / OAuth login providers
@@ -212,6 +217,16 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | `CIRCUIT_BREAKER_MAX_AGE_SECS` | `1800` | worker | Max age before breaker state is pruned | |
 | `CIRCUIT_BREAKER_SUCCESS_RATE` | built-in default (f64) | worker | Success-rate threshold to close the breaker | |
 | `TALOS_WORKER_MAX_JOB_FUEL` | `50000000` (`MAX_JOB_FUEL`) | worker | Ceiling the worker clamps a dispatch's `max_fuel` (and every pipeline step's) to, whatever the signed request asks for. The controller caps at the same constant; this is the worker-side belt (2026-09-10 review — `max_fuel` was the one policy field not bound into the dispatch signature). |  |
+| `TALOS_WORKER_LIVENESS_INTERVAL_SECS` | `60` (clamped 10..3600) | worker | Seconds between this worker's Ed25519 proof-of-possession liveness pings to the controller (`/internal/worker-liveness`). `0` DISABLES pinging — safe only for an identity that has never pinged; garbage ⇒ default + WARN, never disabled | 🔒 (posture) |
+| `CIRCUIT_BREAKER_FAILURE_THRESHOLD` | `5` | worker | Consecutive-failure count that opens a per-host outbound-HTTP breaker (`=0`/non-positive ⇒ default + WARN) | |
+| `CIRCUIT_BREAKER_FAILURE_WINDOW_SECS` | `60` | worker | Window over which failures are counted toward the threshold | |
+| `CIRCUIT_BREAKER_OPEN_DURATION_SECS` | `30` | worker | How long an open breaker rejects a host before half-open probing | |
+| `CIRCUIT_BREAKER_TEST_REQUESTS` | `3` | worker | Half-open probe requests before a breaker closes again (`=0` would stick every tripped host in permanent rejection — refused) | |
+| `FETCH_ALL_CONCURRENCY` | `10` (max 100) | worker | Parallelism of a guest `http::fetch_all` batch; the batch is also capped against the execution's remaining call budget | |
+| `WASM_HTTP_MAX_RESPONSE_BYTES` | `10485760` (10 MiB) | worker | Cap on one guest HTTP response body (OOM guard); `=0` ⇒ default + WARN | |
+| `TALOS_SSE_MAX_EVENT_BYTES` | `1048576` (1 MiB) | worker | Cap on one SSE event / unterminated line in a guest `http_stream`; `=0` ⇒ default + WARN (would abort every stream on its first byte) | |
+| `TALOS_WORKER_IDEMPOTENCY_TTL_SECS` | `900` | worker | TTL of the worker-local idempotency store for `__idempotency_key__` sends (keyed `{user}:{actor}:{host}:{key}` + request hash) | |
+| `TALOS_WORKER_IDEMPOTENCY_MAX_ENTRIES` | `10000` | worker | Entry cap of that store (eviction bound) | |
 | `TALOS_SSE_IDLE_TIMEOUT_SECS` | `900` | worker | Idle timeout for a guest `http_stream` (SSE) reader task: a stream that delivers nothing for this long is closed with `IdleTimeout`. Reader tasks are also aborted when their job's Store drops, so this is a backstop for a stream nothing ever reads, not the primary bound. `0` disables. | |
 
 ## 4. Module compilation / build toolchain
@@ -309,6 +324,7 @@ Script-level publish knobs (`scripts/publish-images.sh`, not Rust reads):
 | `OTEL_TRACES_SAMPLER` | none (optional) | both | OTel trace sampler selection | |
 | `OTEL_TRACES_SAMPLER_ARG` | none (optional) | both | OTel sampler argument | |
 | `OTEL_METRICS_ENABLED` | `false` | both | Enable OTel metrics export | |
+| `TALOS_SELF_ALERTS_INTERVAL_SECS` | `60` (clamped 5..3600) | controller | Cadence of the platform self-monitor tick that files `source='talos'` ops alerts and auto-resolves them on a later green run | |
 | `TALOS_SELF_ALERTS` | ON (`0`/`false`/`off` disables) | talos-ops-alerts-repository | Enable self-monitoring ops alerts | |
 
 **Trace export is OFF unless one of the three endpoint variables above holds a
@@ -370,6 +386,14 @@ into both deployments.
 |---|---|---|---|---|
 | `EXECUTION_RETENTION_DAYS` | `30` | controller | Days an **archived** execution is kept before permanent deletion, clocked on `archived_at` (destructive-zero guarded). **Changed 2026-09-04:** this used to delete rows from the LIVE table; live rows are now MOVED to `workflow_executions_archive` after `ARCHIVE_AFTER_DAYS` and purged from there after this window. Default total lifetime is therefore 30 + 30 = 60 days, not 30.  **2026-09-10:** the TOTAL lifetime (`ARCHIVE_AFTER_DAYS` + this) is also the clock for `llm_usage` (`recorded_at`), `judge_scores` (`created_at`) and orphaned `execution_state` rows — three tables that had a writer and no reaper; they are reaped by the same 6-hourly pass, in 5 000-row batches capped at 20 batches per tier per tick (the log says `truncated=true` when the cap bound, and the backlog continues next tick). | |
 | ~~`EXECUTION_MAX_ROWS`~~ | n/a | — | **Not a variable (removed 2026-09-11).** No count-based eviction exists; the accessor had zero callers since it was written. Retention is by AGE only: `ARCHIVE_AFTER_DAYS` (live → archive) then `EXECUTION_RETENTION_DAYS` (archive → deleted) | |
+| `MODULE_PAYLOAD_RETENTION_ENABLED` | `false` | controller | Enable the six-hourly sweep that NULLs `input_data_enc`/`output_data_enc` on TERMINAL `module_executions` rows older than `MODULE_PAYLOAD_RETENTION_DAYS` (a `payload_pruned_at` tombstone stays). IRREVERSIBLE — AEAD ciphertext, no decrypt-and-restore. **Stated precondition**: the off-host backup chain proven end-to-end first (as of 2026-08-13 the daily dumps live on the disk they insure). Off by default for that reason, not by oversight | 🔒 (destructive) |
+| `MODULE_PAYLOAD_RETENTION_DAYS` | = `EXECUTION_RETENTION_DAYS` (`30`) | controller | Age floor for the payload sweep. Deliberately derived from `EXECUTION_RETENTION_DAYS`, not `ARCHIVE_AFTER_DAYS` (both 30; switching would SHORTEN the window for an operator archiving early). Non-positive ⇒ default + WARN and the sweep refuses (`=0` would prune every terminal row) | |
+| `MODULE_PAYLOAD_RETENTION_CORPUS_KEEP` | `50` (floor 20) | controller | Most-recent COMPLETED rows per `(module, user)` both sweeps keep intact — the replay/scaffold corpus (`replay_module_regression` reaches at most rank 20). Clamped UP to 20, never down: a smaller value would silently empty the replay corpus | |
+| `MODULE_PAYLOAD_RETENTION_BATCH` | `5000` (clamped 1..20000) | controller | Rows one payload-sweep batch may touch (same lock-hold profile as the execution retention DELETE) | |
+| `MODULE_EXECUTION_RETENTION_ENABLED` | `false` | controller | Enable the six-hourly ROW-retention sweep that DELETEs TERMINAL `module_executions` rows older than `MODULE_EXECUTION_RETENTION_DAYS` whose `workflow_executions` parent no longer exists (outside the corpus above); `module_execution_logs` CASCADE with them. A SECOND flag on purpose: payload pruning leaves a tombstone, row deletion leaves nothing. Same backup precondition as the payload sweep — a strictly larger irreversible loss cannot carry a weaker one. Reference fleet 2026-09-13: 911 such rows + 1 831 log rows waiting on it | 🔒 (destructive) |
+| `MODULE_EXECUTION_RETENTION_DAYS` | = `EXECUTION_RETENTION_DAYS` (`30`) | controller | Age floor for the row sweep (same derivation and same `=0` refusal as the payload sweep's) | |
+| `MODULE_EXECUTION_RETENTION_BATCH` | `5000` (clamped 1..20000) | controller | Rows one row-sweep batch may DELETE — ~2.3 log rows cascade per execution (measured), so a batch is ~3.3× its nominal size | |
+| `TALOS_POLICY_CACHE_TTL_SECS` | `60` | controller | TTL of the actor approval-policy evaluation cache; `=0` ⇒ default + WARN (would send every evaluation to the DB) | |
 | `ARCHIVE_AFTER_DAYS` | `30` | controller | Days an execution stays in `workflow_executions` before being MOVED to the archive. This is the window that bounds the LIVE table, and the one `execution_events` / `workflow_execution_logs` / `execution_approval_tokens` CASCADE at. Overridden per-cluster by `system_settings.archive_after_days` (`set_archive_policy`). **What an operator sees past this window:** the execution row itself stays fully readable by id — `get_execution_status` / `get_execution_output` / `get_execution_cost` and friends answer from `workflow_executions_archive` and stamp the response `archived: true` with `archived_at`. What is GONE is the per-node detail: `get_execution_logs`, `get_execution_trace`, `get_execution_timeline`, `get_execution_waterfall` and `analyze_execution_failure` all read `execution_events`, which the move CASCADEs away, so they say so rather than rendering an empty node list. Operations that ACT on a live row (`cancel_execution`, `retry_execution`, `replay_execution`, `acknowledge_execution_failure`, `watch_execution`) refuse with "archived" as the stated reason — never "not found or access denied", which was the pre-2026-09-04 behaviour and is false in both clauses. Set this longer if per-node traces matter to you more than live-table size. | |
 | `AUDIT_LOG_RETENTION_DAYS` | `90` | controller | Retention for the webhook request log and webhook DLQ (daily at 02:00 UTC). **It does NOT apply to `auth_audit_log` or `secret_audit_log`** — both carry the `prevent_audit_modification` BEFORE DELETE trigger (migration `20260408000001`) and are append-only by security policy; until 2026-09-10 the cleanup tried anyway and logged a `42501` ERROR every night while deleting nothing. It now reads the policy from the catalog and logs `append-only by policy` at INFO. Dropping that trigger is an operator decision; if it is dropped, the batched delete runs under this window. | |
 | `TALOS_AUDIT_TABLE_RETENTION_DAYS` | `180` | controller | **Added 2026-09-10.** Age-based reaper for the audit-shaped tables that are NOT immutable and grew forever: `actor_action_log` (`"timestamp"`), `module_update_history` (`created_at`) and **resolved** `ops_alerts` (`resolved_at`; `new`/`acked` alerts are never touched, however old). Runs inside the 6-hourly `ExecutionRetention` pass in 5 000-row batches, 20 batches per table per tick. **Floor 30 days**: any value below 30 is raised to 30 with a WARN, so a typo (`18` for `180`) cannot wipe an audit trail; non-positive or unparseable values fall to the default. `admin_event_log` is deliberately NOT covered — it is append-only by trigger and permanent. The per-user `cleanup_ops_alerts` MCP tool is unchanged and can be stricter. | |
@@ -453,6 +477,7 @@ Several default **ON** as of the 2026-07 "Tier 3" learning-loops cutover.
 | `MEMORY_REFLECTION_MAX_ACTORS_PER_TICK` | `25` | Actor fan-out cap per tick | |
 | `MEMORY_REFLECTION_MODEL` | `qwen2.5:7b` | Reflection LLM model | |
 | `MEMORY_RANK_PROVENANCE_RETENTION_DAYS` | `90` | Provenance row retention | |
+| `MEMORY_RANK_PROVENANCE_SWEEP_INTERVAL_SECS` | `3600` (clamped 300..86400) | Cadence of the `execution_memory_context` provenance sweep that enforces the retention above | |
 | `ADAPTIVE_RANK_MIN_EXAMPLES` | `50` | Min examples before training | |
 | `ADAPTIVE_RANK_TRAINING_INTERVAL_SECS` | `21600` | Training cadence | |
 | `ADAPTIVE_RANK_LOOKBACK_DAYS` | `30` | Training lookback window. **Effective DOWNWARD only** — see the note below | |
@@ -542,7 +567,13 @@ Where to SEE the effective window rather than infer it:
 `NATS_TEST_URL`, `NATS_TEST_USER`, `NATS_TEST_PASS`,
 `GRAPH_RAG_TEST_OLLAMA_URL`, `GRAPH_RAG_TEST_MODEL`,
 `GRAPH_RAG_TEST_TIER1_ACTOR`. Lint-gate opt-ins: `TALOS_LINT_CLIPPY`,
-`TALOS_LINT_AUDIT`.
+`TALOS_LINT_AUDIT`. Developer regeneration switch: `TALOS_NATS_PERMISSIONS_WRITE`
+(rewrites the two checked-in NATS worker-permission fragments from
+`talos_workflow_job_protocol::nats_permissions` instead of asserting parity).
+Test probes read inside `#[cfg(test)]` modules of production files
+(`TALOS_TEST_MCP_599_PROBE`, `TALOS_TEST_NATS_USER`, `TALOS_TEST_NATS_PASSWORD`)
+are outside check 89(e)'s haystack; the `HOME` read of the off-host backup
+CLI carries `// allow-undocumented-env` at the read.
 
 Excluded from the count: shell-internal locals in `scripts/*.sh` (loop vars,
 computed intermediates) — not application config. Shell/compose pass-throughs
