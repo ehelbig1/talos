@@ -69,7 +69,7 @@ pub async fn proactive_token_refresh_task(cred_service: Arc<OAuthCredentialServi
             // refreshes for the same credential without leaking the
             // raw identifier; the user_id stays visible because it's
             // already a UUID (not directly attributable PII).
-            let redacted_path = redact_oauth_path_for_log(path);
+            let redacted_path = talos_workflow_job_protocol::redact_vault_path_for_log(path);
             match cred_service.refresh_oauth_token_if_needed(path).await {
                 Ok(true) => tracing::info!(path = %redacted_path, "Token refresh task: refreshed"),
                 Ok(false) => {
@@ -83,90 +83,9 @@ pub async fn proactive_token_refresh_task(cred_service: Arc<OAuthCredentialServi
     }
 }
 
-/// Replace the `provider_key` segment (4th path component) of an OAuth
-/// vault path with a sha256 prefix so it's safe for INFO-level logs.
-///
-/// `oauth/gmail/<user_id>/alice@example.com/access_token`
-///   → `oauth/gmail/<user_id>/<a1b2c3d4>/access_token`
-///
-/// Non-conforming paths return unchanged — the OAuth refresh task
-/// only enqueues paths it queried by shape, so this defensive branch
-/// is unreachable in practice but doesn't lose information if the
-/// shape ever changes.
-pub(crate) fn redact_oauth_path_for_log(path: &str) -> String {
-    let parts: Vec<&str> = path.split('/').collect();
-    if parts.len() == 5 && parts[0] == "oauth" && parts[4] == "access_token" {
-        format!(
-            "{}/{}/{}/{}/{}",
-            parts[0],
-            parts[1],
-            parts[2],
-            redact_provider_key_for_log(parts[3]),
-            parts[4]
-        )
-    } else {
-        path.to_string()
-    }
-}
-
-/// Replace an OAuth `provider_key` (which for gmail/google_calendar IS the
-/// user's email address — PII) with a short sha256 prefix so it's safe to log.
-/// Same MCP-988 discipline as [`redact_oauth_path_for_log`], for the sites that
-/// log `provider_key` as a bare field rather than embedded in a path.
-pub(crate) fn redact_provider_key_for_log(provider_key: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let hash = Sha256::digest(provider_key.as_bytes());
-    let prefix: String = hex::encode(hash).chars().take(8).collect();
-    format!("<{prefix}>")
-}
-
-#[cfg(test)]
-mod redact_tests {
-    use super::redact_oauth_path_for_log;
-
-    #[test]
-    fn redacts_gmail_email() {
-        let in_path =
-            "oauth/gmail/11111111-2222-3333-4444-555555555555/alice@example.com/access_token";
-        let out = redact_oauth_path_for_log(in_path);
-        assert!(!out.contains("alice"));
-        assert!(!out.contains("example.com"));
-        assert!(out.contains("11111111-2222-3333-4444-555555555555"));
-        assert!(out.starts_with("oauth/gmail/"));
-        assert!(out.ends_with("/access_token"));
-    }
-
-    #[test]
-    fn passes_through_unexpected_shapes() {
-        // Refresh task only enqueues 5-part oauth paths, so any
-        // other shape is a future change — fall through unchanged
-        // rather than munge it.
-        let other = "weird/three/parts";
-        assert_eq!(redact_oauth_path_for_log(other), other);
-    }
-
-    #[test]
-    fn stable_hash_for_same_input() {
-        let a = redact_oauth_path_for_log(
-            "oauth/atlassian/00000000-0000-0000-0000-000000000000/site-abc/access_token",
-        );
-        let b = redact_oauth_path_for_log(
-            "oauth/atlassian/00000000-0000-0000-0000-000000000000/site-abc/access_token",
-        );
-        assert_eq!(a, b, "same provider_key must hash to same prefix");
-    }
-
-    #[test]
-    fn distinct_hashes_for_distinct_keys() {
-        let a = redact_oauth_path_for_log(
-            "oauth/gmail/00000000-0000-0000-0000-000000000000/alice@example.com/access_token",
-        );
-        let b = redact_oauth_path_for_log(
-            "oauth/gmail/00000000-0000-0000-0000-000000000000/bob@example.com/access_token",
-        );
-        assert_ne!(
-            a, b,
-            "different provider_keys must produce different log strings"
-        );
-    }
-}
+// The path/provider-key redactors that lived here as `pub(crate)` helpers
+// (MCP-988, 2026-05-15) moved to `talos_workflow_job_protocol::
+// {redact_vault_path_for_log, redact_oauth_provider_key_for_log}` on
+// 2026-09-13: the worker's `AuditingProvider` logs the same paths on every
+// secret resolve and could not reach a helper private to this crate. Their
+// tests moved with them (`vault_path_log_redaction_tests`).

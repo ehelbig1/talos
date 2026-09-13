@@ -16,10 +16,15 @@ tokio = { version = "1", features = ["sync", "rt", "macros"] }
 hmac = "0.12"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
+talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 # L-13 (2026-05-22): random slot-handle allocation. Defense-in-depth
 # against guest enumeration of adjacent slot IDs; see
 # `fresh_slot_handle` in `talos_vault.rs`.
 rand = { version = "0.8", default-features = false, features = ["std", "getrandom"] }
+
+[dev-dependencies]
+# capture test over the real AuditingProvider log lines (check 91's behavioural half)
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
 
 [lints]
 workspace = true

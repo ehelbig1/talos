@@ -4192,8 +4192,12 @@ async fn handle_wasm_log_message(
     exec_service_for_logs: &ModuleExecutionService,
     tx_for_wasm_logs: &tokio::sync::broadcast::Sender<ExecutionEvent>,
 ) {
-    // DEBUG: Log when message is received
-    tracing::info!("📩 Received WASM log from NATS topic: {}", msg.subject);
+    // One line per guest log message received — DEBUG, not INFO: measured
+    // 2026-09-13 it was 68 of 329 controller INFO lines in 25 minutes (21 %),
+    // an acknowledgement of a message the worker already relayed at the
+    // guest's own level and this function is about to persist. The comment
+    // above it said DEBUG since the day it was written; the macro said info.
+    tracing::debug!("📩 Received WASM log from NATS topic: {}", msg.subject);
 
     // Parse log message from NATS
     match serde_json::from_slice::<serde_json::Value>(&msg.payload) {

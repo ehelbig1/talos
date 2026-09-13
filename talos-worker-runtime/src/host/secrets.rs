@@ -108,7 +108,7 @@ impl wit_secrets::Host for TalosContext {
                 gate = "capability_world",
                 module_id = ?self.module_id,
                 capability_world = ?self.capability_world,
-                key_path,
+                key_path = %talos_workflow_job_protocol::redact_vault_path_for_log(&key_path),
                 "WASM module attempted secrets access but capability world does not import the secrets interface. \
                  Recompile with capability_world: secrets-node (or higher: agent-node, database-node, automation-node)."
             );
@@ -187,7 +187,7 @@ impl wit_secrets::Host for TalosContext {
             Ok(handle) => Ok(handle.0), // return the raw u64; slot stays alive for Tier-1/2 use
             Err(_) => {
                 tracing::warn!(
-                    key_path,
+                    key_path = %talos_workflow_job_protocol::redact_vault_path_for_log(&key_path),
                     module_id = ?self.module_id,
                     "WASM module requested a secret that is not available"
                 );

@@ -391,7 +391,7 @@ impl TalosContext {
         if is_reserved_host_secret_path(key_path) {
             tracing::warn!(
                 gate = "reserved_host_path",
-                key_path,
+                key_path = %talos_workflow_job_protocol::redact_vault_path_for_log(key_path),
                 module_id = ?self.module_id,
                 capability_world = ?self.capability_world,
                 "WASM module attempted to read a reserved host secret path — denied. \
@@ -436,7 +436,7 @@ impl TalosContext {
             };
             tracing::warn!(
                 gate = "allowlist",
-                key_path,
+                key_path = %talos_workflow_job_protocol::redact_vault_path_for_log(key_path),
                 module_id = ?self.module_id,
                 capability_world = ?self.capability_world,
                 allowed_secrets = %grant_summary,
@@ -531,7 +531,7 @@ impl TalosContext {
             self.record_capability_denied("vault-header", "secret-allowlist", &full_path_hash)
                 .await;
             tracing::warn!(
-                vault_path,
+                vault_path = %talos_workflow_job_protocol::redact_vault_path_for_log(vault_path),
                 vault_path_hash = %vault_path_hash,
                 header_name,
                 actor_id = ?self.actor_id,
@@ -567,7 +567,7 @@ impl TalosContext {
             self.record_capability_denied("vault-header", "tier1-llm-egress", &full_path_hash)
                 .await;
             tracing::warn!(
-                vault_path,
+                vault_path = %talos_workflow_job_protocol::redact_vault_path_for_log(vault_path),
                 vault_path_hash = %vault_path_hash,
                 header_name,
                 actor_id = ?self.actor_id,
@@ -628,7 +628,7 @@ impl TalosContext {
                     }
                     Err(e) => {
                         tracing::error!(
-                            vault_path,
+                            vault_path = %talos_workflow_job_protocol::redact_vault_path_for_log(vault_path),
                             vault_path_hash = %vault_path_hash,
                             header_name,
                             error = %e,
@@ -651,7 +651,7 @@ impl TalosContext {
             }
             Err(e) => {
                 tracing::error!(
-                    vault_path,
+                    vault_path = %talos_workflow_job_protocol::redact_vault_path_for_log(vault_path),
                     vault_path_hash = %vault_path_hash,
                     header_name,
                     error = %e,
@@ -744,7 +744,7 @@ impl TalosContext {
             Ok(h) => h,
             Err(e) => {
                 tracing::warn!(
-                    vault_path = %path,
+                    vault_path = %talos_workflow_job_protocol::redact_vault_path_for_log(path),
                     error = %e,
                     "resolve_raw_vault_secret: provider.resolve failed — returning None; \
                      caller will dispatch WITHOUT the secret"
@@ -758,7 +758,7 @@ impl TalosContext {
             Ok(v) => Some(v),
             Err(e) => {
                 tracing::warn!(
-                    vault_path = %path,
+                    vault_path = %talos_workflow_job_protocol::redact_vault_path_for_log(path),
                     error = %e,
                     "resolve_raw_vault_secret: into_auth_header failed — returning None"
                 );

@@ -263,9 +263,16 @@ pub async fn gmail_callback_handler(
     // Exchange code for tokens and create integration (state validated inside for CSRF protection)
     match service.handle_callback(code, state).await {
         Ok(integration) => {
+            // The account email is the provider key of this credential's
+            // vault path; log the same hashed token the path lines carry, not
+            // the address (PII in operator logs — see check 91).
             tracing::info!(
-                "Successfully connected Gmail account: {}",
-                integration.email_address
+                user_id = %integration.user_id,
+                integration_id = %integration.id,
+                account = %talos_workflow_job_protocol::redact_oauth_provider_key_for_log(
+                    &integration.email_address
+                ),
+                "Successfully connected Gmail account"
             );
             Redirect::to(&format!(
                 "{}/settings?gmail_connected={}#integrations",

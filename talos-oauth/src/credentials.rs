@@ -170,7 +170,7 @@ impl OAuthCredentialService {
         tracing::info!(
             user_id = %user_id,
             provider = %provider,
-            provider_key = %crate::refresh_task::redact_provider_key_for_log(provider_key),
+            provider_key = %talos_workflow_job_protocol::redact_oauth_provider_key_for_log(provider_key),
             "Stored OAuth credentials"
         );
 
@@ -263,7 +263,7 @@ impl OAuthCredentialService {
             tracing::debug!(
                 user_id = %user_id,
                 provider = %provider,
-                provider_key = %crate::refresh_task::redact_provider_key_for_log(provider_key),
+                provider_key = %talos_workflow_job_protocol::redact_oauth_provider_key_for_log(provider_key),
                 "update_access_token: no integration_credentials row (legacy integration predating migration 019)"
             );
         }
@@ -575,19 +575,19 @@ impl OAuthCredentialService {
                 match self.refresh_oauth_token_if_needed(vp).await {
                     Ok(true) => tracing::info!(
                         target: "talos_oauth_refresh",
-                        vault_path = %crate::refresh_task::redact_oauth_path_for_log(vp),
+                        vault_path = %talos_workflow_job_protocol::redact_vault_path_for_log(vp),
                         outcome = "refreshed",
                         "OAuth token refreshed before dispatch"
                     ),
                     Ok(false) => tracing::debug!(
                         target: "talos_oauth_refresh",
-                        vault_path = %crate::refresh_task::redact_oauth_path_for_log(vp),
+                        vault_path = %talos_workflow_job_protocol::redact_vault_path_for_log(vp),
                         outcome = "skipped",
                         "OAuth token still valid — no refresh needed"
                     ),
                     Err(e) => tracing::warn!(
                         target: "talos_oauth_refresh",
-                        vault_path = %crate::refresh_task::redact_oauth_path_for_log(vp),
+                        vault_path = %talos_workflow_job_protocol::redact_vault_path_for_log(vp),
                         outcome = "failed",
                         error = %e,
                         "OAuth token refresh failed — worker may see 401. \
@@ -638,13 +638,12 @@ impl OAuthCredentialService {
 
         let outcomes: Vec<bool> = stream::iter(targets)
         .map(|vp| async move {
-            let redacted = crate::refresh_task::redact_oauth_path_for_log(&vp);
             match self.refresh_oauth_token_forced(&vp).await {
                 Ok(true) => {
                     record_reactive_refresh("repaired");
                     tracing::info!(
                         target: "talos_oauth_refresh",
-                        vault_path = %redacted,
+                        vault_path = %talos_workflow_job_protocol::redact_vault_path_for_log(&vp),
                         outcome = "repaired",
                         "OAuth credential re-refreshed after an auth failure — retrying the node once"
                     );
@@ -654,7 +653,7 @@ impl OAuthCredentialService {
                     record_reactive_refresh("not_refreshed");
                     tracing::warn!(
                         target: "talos_oauth_refresh",
-                        vault_path = %redacted,
+                        vault_path = %talos_workflow_job_protocol::redact_vault_path_for_log(&vp),
                         outcome = "not_refreshed",
                         "Auth failure on an OAuth credential that has no refresh path — \
                          not retrying (the 401 is not a token-staleness problem)"
@@ -669,7 +668,7 @@ impl OAuthCredentialService {
                     // is length-logged only at its own call site above.
                     tracing::error!(
                         target: "talos_oauth_refresh",
-                        vault_path = %redacted,
+                        vault_path = %talos_workflow_job_protocol::redact_vault_path_for_log(&vp),
                         outcome = "refresh_failed",
                         error = %e,
                         "OAuth credential refresh REFUSED by the provider after an auth \
@@ -1048,7 +1047,7 @@ impl OAuthCredentialService {
 
         tracing::info!(
             provider,
-            provider_key = %crate::refresh_task::redact_provider_key_for_log(provider_key),
+            provider_key = %talos_workflow_job_protocol::redact_oauth_provider_key_for_log(provider_key),
             expires_in = ?token_data.expires_in,
             "Auto-refreshed OAuth token before workflow execution"
         );
