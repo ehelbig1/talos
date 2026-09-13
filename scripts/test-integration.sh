@@ -99,7 +99,9 @@ docker run -d --rm --name "$PG_NAME" \
     -c shared_preload_libraries=pg_stat_statements >/dev/null
 # NATS for the RFC 0010 P3 (D3b) claim-protocol integration tests (envelope-seal
 # responder↔worker handshake + the engine-nats full dispatch→claim→open loop).
-docker run -d --rm --name "$NATS_NAME" -p "${NATS_PORT}:4222" nats:2.10-alpine >/dev/null
+# `-js`: the audit-ledger stream-bound test (below) needs JetStream; the claim
+# protocol tests do not care either way.
+docker run -d --rm --name "$NATS_NAME" -p "${NATS_PORT}:4222" nats:2.10-alpine -js >/dev/null
 # The permissioned broker: the compose nats.conf, byte-for-byte, with the worker
 # fragment it includes. Credentials are throwaway literals; what is under test
 # is the PERMISSION SET, not the secrets. `-c` only — no JetStream needed here.
@@ -335,6 +337,19 @@ fi
 echo
 echo "▶ worker NATS credential permissions :: talos-workflow-engine-nats  [nats-perm]"
 if ! cargo test -p talos-workflow-engine-nats --test nats_worker_permissions; then
+    rc=1
+fi
+
+# ── Audit ledger stream is BOUNDED, and an existing unbounded one is updated  [nats]
+# The AUDIT_LEDGER JetStream stream was created with `..Default::default()` for
+# two months — no max_age, no max_msgs, no max_bytes — and kept every acked
+# message forever (58 978 / 31 MB on the reference deployment, 2026-09-13).
+# `get_or_create_stream` never touches an existing stream, so the bound has to
+# be applied in place; only a live JetStream can prove that path preserves the
+# messages already in the stream. Needs `-js` on the disposable broker above.
+echo
+echo "▶ audit ledger stream bound :: talos-audit-ledger  [nats]"
+if ! cargo test -p talos-audit-ledger --test audit_ledger_stream_bounds; then
     rc=1
 fi
 

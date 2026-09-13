@@ -3968,3 +3968,77 @@ one PutObject per audit event on the hot path; not this package's call. The
 sweep reporting the lost job per job, with the module and workflow execution
 ids on the WARN line, is the correct behaviour and stays.
 
+### Package AW (2026-09-13) — a durable buffer with no bound
+
+**How it was found.** The forty-fourth deploy (#846) verified clean, and the
+survey turned to two layers no package in this review had measured: Redis and
+NATS JetStream. Redis first, and there was nothing to find — 178 keys, all 178
+with a TTL (`db0:keys=178,expires=178`), 3.8 MB used, 6 MB peak, three key
+families (`gmail:processed` 142, `gcp:processed` 20, the per-module WASM cache
+16). `maxmemory` is unset with `noeviction`, and with every key expiring that
+is a tuning note, not a defect. Then `curl :8222/jsz?streams=true&config=true`:
+one stream, `AUDIT_LEDGER`, `retention=limits`, `max_msgs=-1`, `max_bytes=-1`,
+`max_age=0`, file storage, **58 978 messages, 31 083 154 bytes**, first
+timestamp 2026-07-08 19:31, last 17:33 today. The consumer
+`audit_ledger_processor`: `ack_floor 58978`, `delivered 58978`,
+`num_pending 0`. Every message ever published had been delivered, acked and —
+because `Limits` retention keeps acked messages — kept.
+
+**Why acked means redundant.** `process_batch` acks exactly the messages it
+has finished with: valid-and-persisted to S3, structurally invalid (nothing to
+persist), dropped duplicates, and verification-rejected ones (quarantined to
+S3 first). A failed S3 write leaves its message unacked for redelivery after
+`ack_wait`. So the stream is a durable buffer whose acked content is, by
+construction, already in the WORM bucket — and the WORM bucket is the record.
+The buffer was keeping a second copy of everything, forever, on the NATS
+volume: ~0.5 MB/day on this one-user fleet, scaling with execution volume, and
+the only ceiling the chart's `nats.persistence.size` PVC and the JetStream
+server's disk-derived `max_file_store` (41.8 GB here).
+
+**Why an age, and not the retention the role suggests.** A buffer whose
+consumer acks on shipment wants `WorkQueue` retention — delete on ack — but
+JetStream refuses to change a stream's retention policy in place, and the
+production stream exists. `get_or_create_stream` returns the existing stream
+untouched, so a bound written into the config alone would apply to fresh
+deployments and never to this one. `max_age` IS an allowed update.
+`ensure_bounded_stream` therefore does both: get-or-create with the bound, read
+the live config, and `update_stream` when `max_age` differs — logging the
+message and byte count it found, so the boot line after this deploys says what
+the stream held. Thirty days: long enough that the buffer is never the reason
+an event is lost on a fleet whose subscriber is alive (steady-state pending is
+0 to one batch), short enough to bound the copy to about a month of events.
+
+**What the bound costs, and why it is acceptable.** `max_age` does not know
+whether a message is acked; a subscriber that stays down for thirty days loses
+the events that age out unshipped. Two things make that acceptable rather than
+silent: package AV's `TalosAuditChainJobsUnverifiable` fires within one hourly
+sweep of the subscriber dying (every swept job reads `empty_chain`), and this
+package adds `talos_audit_ledger_consumer_pending` — the consumer's
+`num_pending`, sampled once per 5 s batch tick from a cloned consumer handle —
+so the fill level is a series rather than a `jsz` curl. A `max_bytes` with
+`discard = Old` was the other candidate and was rejected on shape: under
+backlog it drops the oldest UNSHIPPED events first, at a size that depends on
+the fleet's event rate rather than on how long the subscriber has been gone,
+and it does so with no log line. Not alerted yet: the gauge has no baseline.
+
+**Guards.** `talos-audit-ledger/tests/audit_ledger_stream_bounds` runs on a
+live JetStream — `scripts/test-integration.sh`'s disposable NATS now starts
+with `-js`, which the claim-protocol tests beside it do not mind — and skips
+loudly on stderr without `TALOS_TEST_NATS_URL`. Three cases with unique stream
+names: a fresh stream carries the bound; a stream created in the 2026-07-08
+shape (`..Default::default()`) with three published messages is bounded in
+place and still holds three messages at the same first sequence; ensuring an
+already-bounded stream changes nothing. Mutations: M1 (the update branch
+short-circuited) fails the in-place case at "the bound was applied in place";
+M2 (`max_age: Duration::ZERO`) fails all three; M3 (the backlog sample
+removed) is INVISIBLE to check 58 — the `.set()` sits in `sample_consumer_backlog`,
+the wrapper limit that check states — and is caught by `-D warnings`, because
+the cloned consumer binding and the helper both become unused. Stated as the
+instrument that catches it, rather than implying the lint does.
+
+**Live proof deferred to the deploy.** The dev stack's stream is the
+2026-07-08 one, so the first boot after this merges should log
+`audit_ledger_stream_bounded` with `messages_before` ≈ 59 000 and the stream's
+message count should fall toward the last thirty days' worth as the broker
+expires the rest.
+

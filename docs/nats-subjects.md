@@ -32,6 +32,8 @@ JetStream/durable, **Sub** = long-lived subscription.
 | `talos.results.<job_id>` | `subjects::results_for(job_id)` | `JobResult` | F&F (audit topic branch) | worker | controller |
 | `talos.pipeline.results.<job_id>` | `subjects::pipeline_results_for(job_id)` | `PipelineJobResult` | R/R + F&F cache-replay | worker | controller |
 | `talos.audit.ledger` | `subjects::AUDIT_LEDGER` | `AuditEvent` (hash-chained, signed) | Stream (F&F publish) | worker host fns (audit) | `talos-audit-ledger` WORM consumer |
+
+The `AUDIT_LEDGER` JetStream stream behind that subject is a durable buffer in front of the S3 WORM bucket, bounded by age (`talos_audit_ledger::AUDIT_LEDGER_STREAM_MAX_AGE`, 30 days; applied in place to an existing stream at subscriber start — package AW, 2026-09-13). The consumer `audit_ledger_processor` acks only shipped or terminal messages; its backlog is `talos_audit_ledger_consumer_pending`.
 | `talos.approvals.pending` | `subjects::APPROVALS_PENDING` | approval-request JSON | F&F | worker governance host | controller continuation trigger |
 | `talos.approvals.wait.<exec_id>` | `subjects::approvals_wait_for(exec_id)` | approval-response JSON | R/R (reply topic) | worker governance host (subscribes) | approve/reject webhook handler |
 | `talos.workers.heartbeat.>` | `subjects::WORKERS_HEARTBEAT_WILDCARD` | `WorkerHeartbeat` | Sub | worker | fleet manager |

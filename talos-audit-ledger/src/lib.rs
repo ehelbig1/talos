@@ -1407,6 +1407,135 @@ fn publish_sweep_snapshot(stats: &ChainSweepStats) {
     }
 }
 
+/// Publish how far the WORM writer is behind the stream — `num_pending` on
+/// the durable consumer, i.e. audit events the broker holds that have not
+/// been delivered to this process yet — as
+/// `talos_audit_ledger_consumer_pending`. Sampled on the 5 s batch tick (one
+/// consumer-info round trip), so the gauge is at most one tick stale. A
+/// failed probe is DEBUG and leaves the last value: the probe is a reading of
+/// the buffer, not a control, and the delivery loop beside it is the loud
+/// path if the broker is gone.
+async fn sample_consumer_backlog(consumer: &mut async_nats::jetstream::consumer::PullConsumer) {
+    match consumer.info().await {
+        Ok(info) => {
+            if let Some(m) = talos_metrics::global() {
+                m.audit_ledger_consumer_pending
+                    .set(i64::try_from(info.num_pending).unwrap_or(i64::MAX));
+            }
+        }
+        Err(e) => {
+            tracing::debug!(
+                target: "talos_audit_ledger",
+                error = %e,
+                "audit ledger consumer info probe failed; backlog gauge keeps its last value"
+            );
+        }
+    }
+}
+
+/// How long the `AUDIT_LEDGER` JetStream stream keeps a message, acked or not.
+///
+/// The stream is a DURABLE BUFFER in front of the S3 WORM bucket: the consumer
+/// acks a message only once its batch has been written (or it is terminal —
+/// unparseable, a dropped duplicate, quarantined), and an unacked message is
+/// redelivered after `ack_wait`. So an acked message is a redundant copy of
+/// something already in the object store, and until 2026-09-13 the stream
+/// kept every one of them forever — it was created with `..Default::default()`,
+/// i.e. `retention = Limits` with NO max_age, max_msgs or max_bytes. Measured on
+/// the reference deployment that day: **58 978 messages, 31 MB, every audit
+/// event since 2026-07-08, consumer ack floor == last sequence** — nothing
+/// pending, everything shipped, all of it still on the NATS volume, growing at
+/// ~0.5 MB/day here and proportionally to execution volume anywhere else, with
+/// no ceiling but the disk (the chart's `nats.persistence.size` PVC; the
+/// JetStream server default `max_file_store` is the disk).
+///
+/// Thirty days. The retention POLICY cannot be changed on an existing stream
+/// (JetStream refuses `Limits` ↔ `WorkQueue`), so the bound that both a fresh
+/// and an existing stream can take is an AGE; `max_age` is an allowed in-place
+/// update, applied by [`ensure_bounded_stream`] on every boot when the live
+/// value differs. **What the bound costs, stated**: `max_age` expires UNACKED
+/// messages too, so an audit-ledger subscriber that stays down longer than
+/// this loses the events that aged out — and that outage is loud well before
+/// day 30: `TalosAuditChainJobsUnverifiable` fires within one hourly sweep
+/// of the subscriber stopping (every swept job reads `empty_chain`), and the
+/// `talos_audit_ledger_consumer_pending` gauge this same change added shows
+/// the backlog climbing. A byte cap with `discard = Old` was considered and
+/// rejected: under backlog it would drop the OLDEST unshipped events first,
+/// silently, at a size that depends on the fleet's event rate rather than on
+/// how long the subscriber has been gone.
+pub const AUDIT_LEDGER_STREAM_MAX_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+
+/// The one stream configuration, so the fresh-create path and the in-place
+/// update path cannot disagree about anything but the bound they share.
+pub fn audit_ledger_stream_config(name: &str, subject: &str) -> StreamConfig {
+    StreamConfig {
+        name: name.to_string(),
+        subjects: vec![subject.to_string()],
+        max_age: AUDIT_LEDGER_STREAM_MAX_AGE,
+        ..Default::default()
+    }
+}
+
+/// Get-or-create the audit ledger stream AND bring an existing one to the
+/// bounded configuration. `get_or_create_stream` never updates an existing
+/// stream, so a deployment whose stream predates the bound would keep the
+/// unbounded one forever without the second half of this.
+///
+/// A failed update is logged at ERROR and does NOT stop the subscriber: an
+/// unbounded buffer that ships is better than no ledger consumer at all, and
+/// the ERROR carries the reason.
+pub async fn ensure_bounded_stream(
+    js: &jetstream::Context,
+    name: &str,
+    subject: &str,
+) -> Result<jetstream::stream::Stream> {
+    let cfg = audit_ledger_stream_config(name, subject);
+    let mut stream = js.get_or_create_stream(cfg.clone()).await?;
+    let info = stream.info().await?.clone();
+    let live_max_age = info.config.max_age;
+    tracing::info!(
+        target: "talos_audit_ledger",
+        event_kind = "audit_ledger_stream_state",
+        stream = name,
+        messages = info.state.messages,
+        bytes = info.state.bytes,
+        max_age_secs = live_max_age.as_secs(),
+        "audit ledger JetStream stream state at subscriber start"
+    );
+    if live_max_age == cfg.max_age {
+        return Ok(stream);
+    }
+    match js.update_stream(cfg.clone()).await {
+        Ok(updated) => {
+            tracing::info!(
+                target: "talos_audit_ledger",
+                event_kind = "audit_ledger_stream_bounded",
+                stream = name,
+                previous_max_age_secs = live_max_age.as_secs(),
+                max_age_secs = updated.config.max_age.as_secs(),
+                messages_before = info.state.messages,
+                bytes_before = info.state.bytes,
+                "audit ledger stream had no age bound (kept every acked message forever) — \
+                 applied the shared max_age in place; messages older than it expire from here"
+            );
+            Ok(js.get_stream(name).await?)
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "talos_audit_ledger",
+                event_kind = "audit_ledger_stream_bound_failed",
+                stream = name,
+                live_max_age_secs = live_max_age.as_secs(),
+                wanted_max_age_secs = cfg.max_age.as_secs(),
+                error = %e,
+                "could not apply the audit ledger stream's age bound — the stream keeps \
+                 growing without limit until this succeeds; the subscriber continues"
+            );
+            Ok(stream)
+        }
+    }
+}
+
 pub async fn start_audit_ledger_subscriber(
     nc: Client,
     db_pool: PgPool,
@@ -1417,16 +1546,12 @@ pub async fn start_audit_ledger_subscriber(
 
     let js = jetstream::new(nc);
 
-    // Ensure the stream exists for guaranteed delivery
+    // Ensure the stream exists for guaranteed delivery — and is BOUNDED (see
+    // `AUDIT_LEDGER_STREAM_MAX_AGE`); an existing unbounded stream is updated
+    // in place.
     let stream_name = "AUDIT_LEDGER";
     let subject = talos_workflow_job_protocol::subjects::AUDIT_LEDGER;
-    let _stream = js
-        .get_or_create_stream(StreamConfig {
-            name: stream_name.to_string(),
-            subjects: vec![subject.to_string()],
-            ..Default::default()
-        })
-        .await?;
+    let _stream = ensure_bounded_stream(&js, stream_name, subject).await?;
 
     // MCP-1119 (2026-05-16): consumer + messages-stream creation
     // moved INSIDE the supervisor loop below. Pre-fix they were
@@ -1561,6 +1686,10 @@ pub async fn start_audit_ledger_subscriber(
             backoff_secs = 1;
             let mut batch: Vec<Message> = Vec::new();
             let mut interval = tokio::time::interval(Duration::from_secs(5));
+            // A second handle on the same durable consumer, for the backlog
+            // probe: `messages()` owns the delivery stream and `info()` needs
+            // `&mut self`, so the probe cannot share the binding that feeds it.
+            let mut backlog_probe = consumer.clone();
 
             // Inner work loop. Exits via `break` on stream-end
             // (None arm); supervisor will re-bind.
@@ -1570,6 +1699,7 @@ pub async fn start_audit_ledger_subscriber(
                         if !batch.is_empty() {
                             process_batch(&mut batch, &s3_client, &bucket, &db_pool, &otlp_cache, secrets_manager.as_deref(), object_lock).await;
                         }
+                        sample_consumer_backlog(&mut backlog_probe).await;
                     }
                     msg_result = messages.next() => {
                         match msg_result {
