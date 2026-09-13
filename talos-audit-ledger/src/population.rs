@@ -177,6 +177,30 @@ pub enum JobChainOutcome {
     Failed,
 }
 
+impl JobChainOutcome {
+    /// The `outcome` label on `talos_audit_chain_jobs_swept_total` — the
+    /// denominator `TalosAuditChainJobsUnverifiable` divides by. Lower-snake
+    /// because it is a Prometheus label value an alert expression selects on.
+    #[must_use]
+    pub fn metric_label(self) -> &'static str {
+        match self {
+            JobChainOutcome::VerifiedOk => "verified_ok",
+            JobChainOutcome::Empty => "empty",
+            JobChainOutcome::Errored => "errored",
+            JobChainOutcome::Failed => "failed",
+        }
+    }
+
+    /// Every outcome, for the pre-seed pin: the talos-metrics seed list must
+    /// equal this set, and it cannot import this crate to say so.
+    pub const ALL: &'static [JobChainOutcome] = &[
+        JobChainOutcome::VerifiedOk,
+        JobChainOutcome::Empty,
+        JobChainOutcome::Errored,
+        JobChainOutcome::Failed,
+    ];
+}
+
 /// The sweep's per-job tally lifted to the grain operators ask at.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct WorkflowExecutionRollup {

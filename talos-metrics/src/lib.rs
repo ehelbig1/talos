@@ -710,6 +710,17 @@ pub struct TalosMetrics {
     /// series matches nothing, which is precisely how this control stayed
     /// quiet. No execution id, workflow id or object key is ever a label.
     pub audit_chain_unverifiable_total: CounterVec,
+    /// Job chains the audit-chain verification sweep CLASSIFIED, by outcome
+    /// (`verified_ok`, `empty`, `failed`, `errored` — the closed set
+    /// `talos_audit_ledger::JobChainOutcome`), one increment per job at the
+    /// sweep's single classification site. The DENOMINATOR
+    /// `TalosAuditChainJobsUnverifiable` divides by: a per-job unverifiable
+    /// reason (an empty prefix, one failed read) is a finding only as a SHARE
+    /// of the jobs swept — one job whose worker died mid-flight is expected,
+    /// a quarter of the population is not. Pre-seeded over the closed set so
+    /// the ratio is defined the moment the sweep runs; 0/0 on an idle fleet is
+    /// NaN and matches nothing, which is the intended silence.
+    pub audit_chain_jobs_swept_total: CounterVec,
     /// EXACT duplicate audit events dropped by the WORM LEDGER WRITER before
     /// persistence, by scope. `scope="batch"` is the only value with a live
     /// increment site (`talos_audit_ledger::batch_dedupe`), because the writer
@@ -2062,6 +2073,29 @@ impl TalosMetrics {
                 .inc_by(0.0);
         }
 
+        let audit_chain_jobs_swept_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_audit_chain_jobs_swept_total",
+                "Job chains the audit-chain verification sweep classified, by outcome \
+                 (verified_ok, empty, failed, errored). The DENOMINATOR \
+                 TalosAuditChainJobsUnverifiable divides talos_audit_chain_unverifiable_total's \
+                 per-job reasons by: one empty prefix is a worker that died mid-flight, \
+                 a quarter of the population is the audit-ledger subscriber. Pre-seeded \
+                 over the closed set; 0/0 on an idle fleet is NaN and matches nothing.",
+            ),
+            &["outcome"],
+        )?;
+        registry.register(Box::new(audit_chain_jobs_swept_total.clone()))?;
+        // The outcome set is `talos_audit_ledger::JobChainOutcome::ALL`, pinned
+        // equal to this list by `job_chain_outcome_labels_are_the_seeded_set`
+        // in that crate (it cannot be imported here without inverting the
+        // layering — #760's `RPC_WRITE_CEILING_SUBJECTS` precedent).
+        for outcome in ["verified_ok", "empty", "failed", "errored"] {
+            audit_chain_jobs_swept_total
+                .with_label_values(&[outcome])
+                .inc_by(0.0);
+        }
+
         let audit_ledger_duplicate_deliveries_total = CounterVec::new(
             prometheus::Opts::new(
                 "talos_audit_ledger_duplicate_deliveries_total",
@@ -3096,6 +3130,7 @@ impl TalosMetrics {
             audit_chain_duplicate_deliveries_total,
             audit_chain_multi_attempt_jobs_total,
             audit_chain_unverifiable_total,
+            audit_chain_jobs_swept_total,
             audit_chain_last_verified_ok_timestamp_seconds,
             audit_chain_sweep_timestamp_seconds,
             worker_key_tofu_conflicts_total,
@@ -3743,6 +3778,13 @@ mod tests {
             r#"talos_audit_chain_unverifiable_total{reason="other"} 0"#,
             r#"talos_audit_chain_unverifiable_total{reason="no_credentials"} 0"#,
             r#"talos_audit_chain_unverifiable_total{reason="empty_chain"} 0"#,
+            // Package AV's denominator: the per-job half of the unverifiable
+            // alert is a RATIO over this, so the ratio must be defined from
+            // the first sweep, not from the first job that happened to fail.
+            r#"talos_audit_chain_jobs_swept_total{outcome="verified_ok"} 0"#,
+            r#"talos_audit_chain_jobs_swept_total{outcome="empty"} 0"#,
+            r#"talos_audit_chain_jobs_swept_total{outcome="failed"} 0"#,
+            r#"talos_audit_chain_jobs_swept_total{outcome="errored"} 0"#,
             // The duplicate-delivery pair. Neither is alerted on — that is the
             // point of them — but both are read by an operator asking "is this
             // ledger carrying redundant copies?", and an ABSENT series answers

@@ -4615,3 +4615,156 @@ tests:
       - eval_time: 60m
         alertname: TalosRPCWriteCeilingRefusals
         exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
+  # TalosAuditChainUnverifiable / TalosAuditChainJobsUnverifiable — the
+  # partition (package AV, 2026-09-13). ONE job's empty prefix is a worker
+  # that died mid-flight (the 2026-09-13 shape: frozen through a host
+  # suspend, its worker recreated by a deploy) and must not read as "the
+  # control is not working"; a deployment-wide reason fires at once; a
+  # per-job reason fires only as a SHARE of the jobs swept, with a floor.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: one empty prefix among a swept population is a job, not a finding
+    input_series:
+      # One hourly sweep at t=60 classifies 111 jobs: 110 verified, 1 empty.
+      - series: 'talos_audit_chain_unverifiable_total{job="talos-controller",reason="empty_chain"}'
+        values: "0+0x59 1+0x120"
+      - series: 'talos_audit_chain_jobs_swept_total{job="talos-controller",outcome="verified_ok"}'
+        values: "0+0x59 110+0x120"
+      - series: 'talos_audit_chain_jobs_swept_total{job="talos-controller",outcome="empty"}'
+        values: "0+0x59 1+0x120"
+    alert_rule_test:
+      - eval_time: 90m
+        alertname: TalosAuditChainJobsUnverifiable
+        exp_alerts: []
+      # The deployment-wide rule does not select empty_chain at all.
+      - eval_time: 90m
+        alertname: TalosAuditChainUnverifiable
+        exp_alerts: []
+
+  - interval: 1m
+    name: the whole swept population is empty — the subscriber is not landing batches
+    input_series:
+      - series: 'talos_audit_chain_unverifiable_total{job="talos-controller",reason="empty_chain"}'
+        values: "0+0x59 40+0x120"
+      - series: 'talos_audit_chain_jobs_swept_total{job="talos-controller",outcome="empty"}'
+        values: "0+0x59 40+0x120"
+      - series: 'talos_audit_chain_jobs_swept_total{job="talos-controller",outcome="verified_ok"}'
+        values: "0+0x180"
+    alert_rule_test:
+      # 40 of 40: ratio 1.0, count 40 — pending at t=62, firing after `for: 5m`.
+      - eval_time: 70m
+        alertname: TalosAuditChainJobsUnverifiable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: audit-integrity
+            exp_annotations:
+              summary: A large share of job audit chains could not be verified
+              description: |
+                100% of the job chains the sweep read
+                in the last 2h were unverifiable for a PER-JOB reason, at least
+                five of them. ONE such job is expected and stays out of this
+                alert — a worker that dies mid-flight leaves an empty prefix, an
+                object-store blip fails one read; a quarter of the population is
+                not one job. empty_chain across the population means the
+                audit-ledger SUBSCRIBER is not landing batches (the verifier's
+                identity works, or this would be TalosAuditChainUnverifiable with
+                reason=access_denied); transport / not_found across the
+                population is the object store.
+              action: |
+                1. Controller log, event_kind="audit_chain_verification_empty" and
+                   event_kind="audit_chain_verification_errored" — each line names
+                   the module_execution_id AND workflow_execution_id, so the
+                   affected runs are listable.
+                2. empty_chain dominating: is the audit-ledger subscriber running
+                   and reaching the store? Its boot line is "Audit ledger
+                   subscriber ready"; the writer identity needs PutObject only.
+                3. transport / not_found dominating: the object-store endpoint,
+                   then the bucket's Object Lock configuration.
+      - eval_time: 70m
+        alertname: TalosAuditChainUnverifiable
+        exp_alerts: []
+
+  - interval: 1m
+    name: four empty of eight swept is half the population and still below the floor
+    input_series:
+      - series: 'talos_audit_chain_unverifiable_total{job="talos-controller",reason="empty_chain"}'
+        values: "0+0x59 4+0x120"
+      - series: 'talos_audit_chain_jobs_swept_total{job="talos-controller",outcome="empty"}'
+        values: "0+0x59 4+0x120"
+      - series: 'talos_audit_chain_jobs_swept_total{job="talos-controller",outcome="verified_ok"}'
+        values: "0+0x59 4+0x120"
+    alert_rule_test:
+      # ratio 0.5 > 0.25 but 4 < 5: a single deploy's handful of in-flight
+      # jobs, not a population.
+      - eval_time: 90m
+        alertname: TalosAuditChainJobsUnverifiable
+        exp_alerts: []
+
+  - interval: 1m
+    name: six empty of 110 swept clears the floor and not the share — several workers restarted, not a dead subscriber
+    input_series:
+      - series: 'talos_audit_chain_unverifiable_total{job="talos-controller",reason="empty_chain"}'
+        values: "0+0x59 6+0x120"
+      - series: 'talos_audit_chain_jobs_swept_total{job="talos-controller",outcome="empty"}'
+        values: "0+0x59 6+0x120"
+      - series: 'talos_audit_chain_jobs_swept_total{job="talos-controller",outcome="verified_ok"}'
+        values: "0+0x59 104+0x120"
+    alert_rule_test:
+      # count 6 >= 5 but ratio 0.055 < 0.25 — this is the case that isolates
+      # the SHARE threshold; the one-of-111 and four-of-eight cases are also
+      # under the floor, so a `> 0` share would pass them and fail here.
+      - eval_time: 90m
+        alertname: TalosAuditChainJobsUnverifiable
+        exp_alerts: []
+
+  - interval: 1m
+    name: a deployment-wide reason fires the control alert at once, and never the per-job one
+    input_series:
+      - series: 'talos_audit_chain_unverifiable_total{job="talos-controller",reason="access_denied"}'
+        values: "0+1x180"
+      - series: 'talos_audit_chain_jobs_swept_total{job="talos-controller",outcome="errored"}'
+        values: "0+1x180"
+    alert_rule_test:
+      - eval_time: 150m
+        alertname: TalosAuditChainUnverifiable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: audit-integrity
+              reason: access_denied
+              job: talos-controller
+            exp_annotations:
+              summary: Audit chain verifier cannot read the ledger (reason=access_denied)
+              description: |
+                120 job chain(s) in the last 2h could not be READ for a
+                DEPLOYMENT-WIDE reason — the sweep aborts on this one, because
+                every remaining job would answer the same. The WORM ledger is
+                still being written; nothing is verifying it, so there is
+                currently no tamper-evidence on any run.
+                reason=access_denied: the verifier identity may not read the audit
+                bucket. On this platform that almost always means the verifier is
+                running as the WRITE-ONLY writer — check
+                AUDIT_VERIFIER_ACCESS_KEY_ID names the read-only verifier user and
+                that the audit_read_only policy is attached to it.
+                reason=no_credentials: no verifier identity is configured at all.
+                reason=no_such_bucket: a provisioning gap, not a permission one.
+                The per-JOB reasons (empty_chain, not_found, transport, other)
+                belong to TalosAuditChainJobsUnverifiable, which needs volume.
+              action: |
+                1. security_audit → the `audit_chain_verification` check. It runs
+                   the REAL verifier against a recent execution and reports the
+                   same classified reason plus its remedy.
+                2. Grep the controller log for
+                   event_kind="audit_chain_sweep_aborted" (the whole pass gave up
+                   on this condition) and event_kind="audit_chain_verification_errored"
+                   (the job it gave up on; the line carries module_execution_id
+                   AND workflow_execution_id).
+                3. Do NOT widen the WRITER's policy to fix this. The writer is
+                   PutObject-only by design; the fix is the separate read-only
+                   verifier identity.
+      - eval_time: 150m
+        alertname: TalosAuditChainJobsUnverifiable
+        exp_alerts: []
