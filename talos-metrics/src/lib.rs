@@ -733,6 +733,16 @@ pub struct TalosMetrics {
     /// the transport working as designed, and the tamper counter's whole value
     /// is that its steady state is 0.
     pub audit_ledger_duplicate_deliveries_total: CounterVec,
+    /// Audit events the JetStream broker holds that the WORM-ledger consumer
+    /// has not yet been delivered (`num_pending` on the durable consumer),
+    /// sampled every 5 s by `talos-audit-ledger`'s batch loop. This is the
+    /// buffer's FILL LEVEL: the `AUDIT_LEDGER` stream is bounded by age (30 d,
+    /// `AUDIT_LEDGER_STREAM_MAX_AGE`), so a backlog that keeps climbing is a
+    /// subscriber that is not shipping to S3, and past the bound its oldest
+    /// events expire unshipped. Steady state on a healthy fleet is 0 to a few
+    /// (one batch). Not alerted yet — the series comes first; the loud signal
+    /// for a dead subscriber today is `TalosAuditChainJobsUnverifiable`.
+    pub audit_ledger_consumer_pending: IntGauge,
     /// Job chains the offline sweep found carrying a BYTE-IDENTICAL redelivery
     /// (`talos_audit_event::ChainBreak::DuplicateDelivery`) — the copies the
     /// writer could not see because they arrived in different batches.
@@ -2109,6 +2119,16 @@ impl TalosMetrics {
             &["scope"],
         )?;
         registry.register(Box::new(audit_ledger_duplicate_deliveries_total.clone()))?;
+
+        let audit_ledger_consumer_pending = IntGauge::new(
+            "talos_audit_ledger_consumer_pending",
+            "Audit events the JetStream AUDIT_LEDGER stream holds that the WORM-ledger \
+             consumer has not yet been delivered (consumer num_pending), sampled every \
+             5 s. The buffer's fill level: the stream is age-bounded (30 d), so a climbing \
+             backlog is a subscriber not shipping to S3, and events older than the bound \
+             expire unshipped. Healthy steady state is 0 to one batch.",
+        )?;
+        registry.register(Box::new(audit_ledger_consumer_pending.clone()))?;
         // `batch` is the ONLY scope with a live increment site — the writer is
         // write-only and cannot see a cross-batch copy. Seeding a second value
         // would imply a signal that is not wired (check 58's own rule read
@@ -3127,6 +3147,7 @@ impl TalosMetrics {
             job_results_dropped_unparseable_total,
             audit_verification_failures_total,
             audit_ledger_duplicate_deliveries_total,
+            audit_ledger_consumer_pending,
             audit_chain_duplicate_deliveries_total,
             audit_chain_multi_attempt_jobs_total,
             audit_chain_unverifiable_total,
