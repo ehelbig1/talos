@@ -24,7 +24,7 @@ pub use google_push::{JwkRefreshOutcome, PushIntegration, PushRefusalReason};
 pub use mcp::McpToolOutcome;
 pub use outcome_class::OutcomeClass;
 pub use rpc::{seeded_pairs as rpc_seeded_pairs, RpcOutcome, RpcSubject};
-pub use security::{ApiKeyValidation, RateLimitKind, TwoFactorOutcome};
+pub use security::{ApiKeyValidation, McpAuthOutcome, RateLimitKind, TwoFactorOutcome};
 
 /// The complete, closed set of `subject` label values on
 /// `talos_rpc_write_ceiling_refusals_total` — the NATS subjects on which the
@@ -439,6 +439,22 @@ pub fn record_rate_limit_hit_on(metrics: &TalosMetrics, kind: RateLimitKind) {
         .inc();
 }
 
+/// Count one MCP agent-token authentication outcome. Inert without
+/// [`set_global`].
+pub fn record_mcp_auth(outcome: McpAuthOutcome) {
+    if let Some(m) = global() {
+        record_mcp_auth_on(m, outcome);
+    }
+}
+
+/// The recording itself, against an EXPLICIT registry.
+pub fn record_mcp_auth_on(metrics: &TalosMetrics, outcome: McpAuthOutcome) {
+    metrics
+        .mcp_auth_total
+        .with_label_values(&[outcome.as_str()])
+        .inc();
+}
+
 /// Count one Google push delivery refused at the HTTP boundary. Inert
 /// without [`set_global`].
 pub fn record_google_push_refusal(integration: PushIntegration, reason: PushRefusalReason) {
@@ -543,6 +559,15 @@ pub struct TalosMetrics {
     pub auth_failures_total: CounterVec,
     pub auth_2fa_attempts_total: CounterVec,
     pub api_key_validations_total: CounterVec,
+    // The third bearer credential — the MCP agent token — was the one whose
+    // refusals reached no series and no log line until 2026-09-13: a guessed
+    // token got a bare 401 from `mcp_auth_middleware` and nothing else
+    // happened. One value per `/mcp` request, from the middleware's single
+    // exit; the per-IP limiter in front of it also counts on
+    // `rate_limit_hits_total{type="mcp_auth"}`. No alert yet, deliberately:
+    // like the two above, a threshold needs a baseline this series has never
+    // produced. Seeded over `McpAuthOutcome::ALL`.
+    pub mcp_auth_total: CounterVec,
 
     // Execution metrics
     pub module_executions_total: CounterVec,
@@ -1836,6 +1861,32 @@ impl TalosMetrics {
                 .inc_by(0.0);
         }
 
+        let mcp_auth_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_mcp_auth_total",
+                "MCP agent-token authentication outcomes (mcp_auth_middleware), one per \
+                 /mcp request. outcome=ok | missing_token (no bearer header and no ?token=) \
+                 | unknown_token (no active mcp_agents row carries the token's lookup hash \
+                 — a guessed, mistyped or REVOKED token; the guessing signal) | \
+                 invalid_token (a row's lookup hash matches and its bcrypt hash does not — \
+                 a corrupted or hand-edited row, not a guess) | unscoped_agent (authenticated, \
+                 mcp_agents.user_id IS NULL, 403) | rate_limited (the per-IP limiter, also \
+                 rate_limit_hits_total{type=mcp_auth}) | error (lookup failed / bcrypt worker \
+                 panicked / stored hash malformed — counted, so a surface failing every \
+                 request is not quiet). talos_metrics::McpAuthOutcome, a closed set, all \
+                 seven pre-seeded at 0. The caller sees one 401 for the three token \
+                 outcomes; the split is for the operator. Registered and first incremented \
+                 2026-09-13.",
+            ),
+            &["outcome"],
+        )?;
+        registry.register(Box::new(mcp_auth_total.clone()))?;
+        for outcome in McpAuthOutcome::ALL {
+            mcp_auth_total
+                .with_label_values(&[outcome.as_str()])
+                .inc_by(0.0);
+        }
+
         // Execution metrics. Both module families sat in check 58's dead-metric
         // baseline from 2026-05 to 2026-09-11; they are now moved by every
         // module_executions finalizer (talos-module-executions: complete /
@@ -2655,9 +2706,12 @@ impl TalosMetrics {
                  controller-wide limiter's 503) | api_key (the per-prefix limiter inside \
                  validate_key; also counted as api_key_validations_total{status=\
                  rate_limited}) | webhook (the per-trigger limiter in the webhook \
-                 router). talos_metrics::RateLimitKind, a closed set, all four pre-seeded \
-                 at 0. The webhook IP circuit breaker is not a rate limit and is not \
-                 here. Registered 2026-05, first incremented 2026-09-11.",
+                 router) | mcp_auth (the per-IP limiter in front of MCP agent-token \
+                 authentication; also counted as mcp_auth_total{outcome=rate_limited}). \
+                 talos_metrics::RateLimitKind, a closed set, all five pre-seeded at 0. \
+                 The webhook IP circuit breaker is not a rate limit and is not here. \
+                 Registered 2026-05, first incremented 2026-09-11; mcp_auth added \
+                 2026-09-13.",
             ),
             &["type"],
         )?;
@@ -3134,6 +3188,7 @@ impl TalosMetrics {
             auth_failures_total,
             auth_2fa_attempts_total,
             api_key_validations_total,
+            mcp_auth_total,
             module_executions_total,
             module_execution_duration_seconds,
             workflow_executions_total,
@@ -3658,6 +3713,12 @@ mod tests {
                 k.as_str()
             )));
         }
+        for o in McpAuthOutcome::ALL {
+            assert!(cold.contains(&format!(
+                "talos_mcp_auth_total{{outcome=\"{}\"}} 0",
+                o.as_str()
+            )));
+        }
         for o in TwoFactorOutcome::ALL {
             record_2fa_attempt_on(&m, *o);
         }
@@ -3666,6 +3727,9 @@ mod tests {
         }
         for k in RateLimitKind::ALL {
             record_rate_limit_hit_on(&m, *k);
+        }
+        for o in McpAuthOutcome::ALL {
+            record_mcp_auth_on(&m, *o);
         }
         let warm = m.render_prometheus().expect("render");
         for o in TwoFactorOutcome::ALL {
@@ -3686,6 +3750,16 @@ mod tests {
                 k.as_str()
             )));
         }
+        for o in McpAuthOutcome::ALL {
+            assert!(warm.contains(&format!(
+                "talos_mcp_auth_total{{outcome=\"{}\"}} 1",
+                o.as_str()
+            )));
+        }
+        // Seven distinct label values, seven distinct series — the recorder
+        // does not aggregate outcomes away.
+        assert_eq!(McpAuthOutcome::ALL.len(), 7);
+        assert_eq!(warm.matches("talos_mcp_auth_total{outcome=").count(), 7);
         // The two execution families that closed the baseline: the counter is
         // seeded over ALL and both recorders move counter + histogram, the
         // histogram only when a duration is known.
