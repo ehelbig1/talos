@@ -16,7 +16,7 @@
 //! captures `1` cleanly (set before the first helper call). Gated on
 //! `TALOS_TEST_DATABASE_URL` (must be a superuser); skips when unset.
 
-use sqlx::{postgres::PgPoolOptions, Executor, Pool, Postgres};
+use sqlx::{postgres::PgPoolOptions, Pool, Postgres};
 use talos_db::begin_tenant_read_scoped;
 use talos_tenancy::TenantReadScope;
 use uuid::Uuid;

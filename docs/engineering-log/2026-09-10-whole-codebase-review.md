@@ -3583,3 +3583,85 @@ three-valued parser. The two production gates stay two functions with two
 consequences (boot refusal vs sync refusal) — deliberately, since they are
 different decisions about the same predicate, and the predicate is what was
 duplicated.
+
+### Package AS (2026-09-13) — the chart handed the Sigstore policy to one of two readers
+
+**Found by asking the next question.** Package AR folded two copies of
+`SigstorePolicy` into one type because both the worker (WASM layers) and the
+controller (the OCI catalog `_index` and every template) resolve it. The
+next question was whether the CHART configures both. `helm template` with
+`controller.ociRegistry.url` set answered: the controller container's env
+carried `TALOS_REGISTRY_URL` and nothing Sigstore; the worker's carried all
+three of `TALOS_SIGSTORE_REQUIRED`, `_IDENTITY_REGEXP`, `_OIDC_ISSUER`. The
+controller Deployment template never rendered them — `worker.sigstore.*` fed
+the worker template alone, and nothing fed the controller.
+
+**What that meant, in both environments the chart can produce.** Under the
+chart's default `RUST_ENV=production`, `start_registry_sync_loop`'s gate
+(`talos_config::is_production() && !SigstorePolicy::raw_env_is_explicit(...)`)
+refuses to run OCI sync on an unset/empty policy — it logs CRITICAL and
+returns `Declined(PolicyNotExplicit)`. So `controller.ociRegistry.url` was
+INERT on every chart deploy: set it and templates stay disk-seeded forever,
+with one CRITICAL line per boot saying why — the inert-knob class at the
+chart layer, and a fail-SAFE one, which is why nobody was hurt and nobody
+noticed. On a non-production render (`RUST_ENV=staging`,
+`docker-compose.prod.yml`'s posture) the gate stands down and the sync RUNS
+with the silent `Disabled` policy: the `_index` and every template pulled
+unverified while the worker, one values block over, verifies signatures
+under `required`. That is the 2026-07-19 P4 finding — the controller
+trusting regexps the worker rejected, the reason `talos-sigstore-policy`
+exists — reproduced one layer up by the chart. Same enum, same env names,
+same gate shape; one process configured.
+
+**The move.** The controller Deployment now renders the same three variables
+from the same values block, ALWAYS emitted with the worker's 2026-09-10 rule
+(an empty `required` renders the literal `disabled`, never a missing
+variable — the default render was checked to carry `disabled` on both).
+Proved by the same `helm template` before and after. **`worker.sigstore` is
+deliberately not renamed**: install.sh's generated overlay and
+`docs/security/operational-runbook.md` address it, and a rename would be a
+second spelling of one control; values.yaml now says in capitals that the
+prefix understates the scope, and install.sh's comment says "for BOTH
+processes".
+
+**Check 89 gained leg (d)**, and its measurement decided its shape. The rule
+"a `both` row the chart renders on one Deployment must reach the other"
+reported FIVE against main's controller template: the three Sigstore
+variables (real) and `ANTHROPIC_API_KEY` / `OPENAI_API_KEY`, rendered on the
+controller through its `$secretKeys` list and withheld from the worker —
+which is correct, because the worker is credential-free BY DESIGN and LLM
+provider keys reach it inside the sealed per-job envelope (and a tier-1 job
+never carries them at all). 3 of 5 is 60 % and does not ship; so the leg
+takes `# allow-chart-asymmetry: VAR … — <reason>` in the template, and the
+marker now records the credential-free decision beside the list it protects
+— a better place for that sentence than this file. With the exemption: 3 on
+main, 0 on the fixed tree; a `controller`/`worker` row rendered on the wrong
+process (W1's `AWS_ENDPOINT_URL` class) is the same leg's other arm, 0 today.
+Mutation: dropping the controller's `TALOS_SIGSTORE_REQUIRED` entry fires it
+at the row; revert byte-identical. Stated: operator `talos.envFromMap` keys
+are invisible by construction and read as absent on both sides; the
+controller's `$secretKeys` list is parsed by a regex over a Helm expression,
+so a second such list would need the pattern widened.
+
+**Live posture, stated.** The dev stack is unaffected: `docker inspect` shows
+neither process carries `TALOS_SIGSTORE_REQUIRED` or `RUST_ENV`, so both run
+the silent default outside production and the gates stand down. The finding
+is about what the CHART deploys.
+
+**Measured and closed on the same pass.** Package AI recorded six other
+repository→non-data dependency edges as "each a judgement". Measured by use
+site: `talos-advanced-repository` / `talos-analytics-repository` →
+`child-workflow-refs`, `draft-heuristics`, `retry-intelligence` are pure
+classifiers (leaves — `retry-intelligence` depends only on
+`talos-reason-class`), `child-run-ledger` depends on `talos-db` (a data
+crate), `talos-ops-alerts-repository → talos-actor-repository` constructs a
+peer repository once, and `talos-actor-repository → talos-memory` is the path
+this file MANDATES for `actor_memory`. None is the AI shape (a repository
+reaching into a service); recorded so the population is not re-measured. And
+the unused `Executor` import in `talos-db/tests/rls_helper_enforcement.rs`
+that `cargo check --all-targets` had flagged on three consecutive packages is
+gone.
+
+**The CLAUDE.md check-89 line this package extended, kept verbatim for `check-engineering-log.py`'s losslessness leg:**
+
+  89. a configuration-reference Component cell must not claim a process that cannot read the variable — `docs/configuration-reference.md` is the AUTHORITATIVE env-var list and its Component column tells an operator which PROCESS needs a variable set. Measured 2026-09-12 (after #834): it said `both` for **108** variables the worker binary cannot read at all — `TALOS_MASTER_KEY`, `JWT_SECRET`, `VAULT_ADDR`, `NEO4J_PASSWORD`, every scheduler knob, every memory-loop knob — 69 in a Component cell and 48 under two section headings that said "both components" / "both"; one crate-named row (`COMPILE_DIR` → `talos-compilation`) is read by the controller bin and not that crate; one `controller` row (`TALOS_VERSION`) is read by the worker's self-registration. Read literally, the column told an operator to hand the credential-free worker the master KEK and the JWT signing secret. **The rule is an IMPOSSIBILITY test, so its precision is structural**: `scripts/lint-config-reference-components.py` derives the crate set linked into each binary from `cargo tree -p worker` / `-p controller` (lockfile resolution, ~0.3 s each, no build), takes a read to be the variable as a WHOLE quoted literal in a crate's production `.rs` (whole-line comments stripped; `tests/`, `*_tests.rs`, `examples/`, `benches/` excluded) or a `talos-config` `pub fn` accessor called from it, and fails a `both`/`worker` row no worker-linked crate reads, a `controller` row the worker bin itself reads, a `both`/`controller` row nothing controller-linked reads, and a crate-named row the named crate does not read. **117 findings on pristine main, 0 on the fixed tree**; mutation-proved in both arms (one row back to `both` → 1; `NATS_URL` → `controller` → 1; the memory heading back to "both components" → 38). ~1.9 s. Fails LOUDLY (exit 2) on an empty cargo tree, a moved table format or a wrong root. **Stated limits, each the quiet direction:** a read in a SHARED crate is left to the author — `talos-worker-runtime` is linked into the controller for the WIT inspector and its host-side env reads run only in the worker, so `worker` rows read there stay `worker` and a `both` row whose only worker-side evidence is a shared crate PASSES. Measured: after the fix **13** `both` rows have no reader in the worker bin or `talos-worker-runtime`; six were hand-flipped on architecture (`EMBEDDING_*` ×5 — the worker is credential-free and the reader is the service half of `talos-memory`; `TALOS_DISPATCH_SCHEME` — `configured_dispatch_signer` has no worker caller) and seven are true `both` (`NATS_CA_FILE`, `TALOS_RPC_REQUIRE_ED25519`, `JAEGER_ENDPOINT` + the four `OTEL_*`). The WHOLE-LITERAL rule is load-bearing and was added on measurement: under a bare-token rule `worker/src/self_register.rs` vouched for `TALOS_WORKER_PUBLIC_KEYS` from inside a WARN message, `talos-dlp-provider` for `VAULT_TOKEN` from a `[REDACTED:VAULT_TOKEN]` fixture and `talos-worker-runtime` for `BASE_URL` from gemini's `const BASE_URL` — three prose hits, two false negatives and one false positive. A name assembled at runtime (`format!("{}_FILE", v)`) is invisible; trailing `// comments` on code lines are not stripped. **No opt-out**: a process that cannot read a variable has no legitimate reason to be listed as reading it. The same pass removed the chart worker's `AWS_ENDPOINT_URL` env — set since 2026-05-18 (`8f13f1e9`, an unrelated MCP commit) and read by nothing: the worker links no AWS SDK (W1's dead-env class). The legend now defines `both` as "both binaries read it", not "a shared crate mentions it". **Two legs added the same day (package AL, no new number):** a Default cell may not be a placeholder (`bool default`/`flag`/`policy default`; 10 on pristine main, two of them the write-ceiling switches) and a `(+_FILE)` claim needs a `read_env_or_file("VAR")` or `"VAR_FILE"` reader (1: `NATS_PASSWORD`, both readers bare `env::var`). The first `_FILE` draft matched the substring in the variable NAME and flagged `NATS_CA_FILE` — the claim pattern is `(+`_FILE``. Descriptions stay out of range: the 24 wrong ones were a per-row human read, and a Default-VALUE compare scored ~9 % precision.

@@ -91,6 +91,33 @@ spec:
             - name: TALOS_REGISTRY_NAMESPACE
               value: {{ . | quote }}
             {{- end }}
+            # --- Sigstore policy for the OCI catalog sync — ALWAYS emitted ---
+            # The SAME three variables the worker Deployment renders, from the
+            # SAME values block (`worker.sigstore`, which despite its prefix is
+            # the one Sigstore policy for OCI artifacts — the policy is one type,
+            # talos_sigstore_policy::SigstorePolicy, resolved by both processes).
+            # Until 2026-09-13 the controller rendered TALOS_REGISTRY_URL and
+            # NONE of these: under RUST_ENV=production (the chart default) the
+            # controller's sync gate (talos-registry::sync::start_registry_sync_loop)
+            # refuses to run OCI sync on an unset/empty policy, so
+            # `controller.ociRegistry.url` was INERT on every chart deploy — a
+            # CRITICAL log line per boot and disk-seeded templates forever —
+            # and on a non-production render the sync would have run with the
+            # silent `Disabled` policy while the worker verified: the
+            # controller trusting what the worker rejects, the 2026-07-19
+            # P4 finding one layer up. An empty `required` renders the literal
+            # `disabled` (the worker Deployment's 2026-09-10 rule), never a
+            # missing variable.
+            - name: TALOS_SIGSTORE_REQUIRED
+              value: {{ .Values.worker.sigstore.required | default "disabled" | quote }}
+            {{- with .Values.worker.sigstore.identityRegexp }}
+            - name: TALOS_SIGSTORE_IDENTITY_REGEXP
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.worker.sigstore.oidcIssuer }}
+            - name: TALOS_SIGSTORE_OIDC_ISSUER
+              value: {{ . | quote }}
+            {{- end }}
             # MCP-860: Optional OCI Basic-auth for private packages.
             # `optional: true` keeps anonymous public-registry deploys
             # working when the bootstrap secret omits these keys.
@@ -208,6 +235,13 @@ spec:
                   optional: true
             {{- end }}
             # --- Secrets ---
+            # allow-chart-asymmetry: ANTHROPIC_API_KEY OPENAI_API_KEY — both
+            # binaries CAN read these (the worker's env fallback for its LLM
+            # host functions), but the worker is credential-free BY DESIGN: LLM
+            # provider keys reach it inside the sealed per-job secret envelope
+            # (`build_encrypted_secrets` → `EncryptedSecrets`), never as env,
+            # and a tier-1 job never carries them at all. Withholding them here
+            # is the control, so check 89(d)'s chart-parity leg is told so.
             {{- $secretKeys := list
                 "DATABASE_URL"
                 "REDIS_URL"
