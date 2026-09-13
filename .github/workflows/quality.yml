@@ -16,6 +16,14 @@ name: Quality (heavy gates)
 #     cargo-deny checks (bans/licenses/sources)
 #   * frontend lint + test as an unbypassable backstop for contributors who
 #     skip `make hooks`
+#   * rustfmt, the structural lints (`scripts/lint-structural.sh`, 90 checks)
+#     and `cargo clippy -D warnings` — since 2026-09-12. Until then they lived
+#     ONLY in ci.yml, which is workflow_dispatch-only and had run ZERO times in
+#     the repository's history (quality.yml: 1 362 runs), and in the pre-push
+#     hook, which `git push --no-verify` skips. Every "lint green" in the
+#     engineering log before that date was a local run. The frontend line
+#     above gives the reason it was wrong to leave them out: the same
+#     "contributors who skip `make hooks`" bypass the Rust gates too.
 on:
   pull_request:
     branches: [main]
@@ -756,3 +764,102 @@ jobs:
         # Compiles every query! against the live schema and fails if the checked-in
         # `.sqlx/` would change.
         run: make sqlx-check
+
+  # ── Fast lints: rustfmt + the 90 structural checks + WIT drift ─────────────
+  # Moved here from ci.yml on 2026-09-12 (one home; ci.yml is dispatch-only and
+  # never ran). No Rust compile: rustfmt needs the toolchain, check 89 needs
+  # `cargo tree` (lockfile resolution), check 5 needs `helm` — which is on the
+  # ubuntu-latest image, and the `helm version` step below makes its absence a
+  # FAILURE rather than the lint's own "⚠ helm not installed — skipping" (a
+  # check that skips is not a gate — checks 64/65). Env-gated legs stay off
+  # here by design: check 7 (clippy) has its own job below, check 36 (cargo
+  # audit) is the `audit` job, check 88's PREPARE leg runs in `integration`
+  # against the migrated DB, check 72 (PI markers) skips loudly without the
+  # operator-local list.
+  lint:
+    name: Lint (rustfmt + structural checks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain (rustfmt)
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt
+
+      - name: helm must be present (check 5 skips without it)
+        run: helm version
+
+      - name: rustfmt --check
+        run: cargo fmt --all -- --check
+
+      - name: Structural lints
+        run: bash scripts/lint-structural.sh
+
+      - name: WIT drift check
+        run: |
+          diff -q wit/talos.wit module-templates/wit/talos.wit \
+            || { echo "::error::wit/talos.wit and module-templates/wit/talos.wit have drifted"; exit 1; }
+
+  # ── Clippy: workspace lint with -D warnings ────────────────────────────────
+  # Separate from `test` so the two run in parallel; cargo cannot share
+  # metadata across `--cfg test` and non-test invocations, so merging them
+  # re-type-checks every dependency (ci.yml's own measurement). Scope matches
+  # `make lint` (check 7): bin+lib, `--no-deps`, not `--all-targets`.
+  clippy:
+    name: Clippy (-D warnings)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /opt/hostedtoolcache/CodeQL || true
+          sudo rm -rf /usr/local/share/boost || true
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
+
+      - name: Install mold linker
+        # .cargo/config.toml pins `-fuse-ld=mold` for x86_64-unknown-linux-gnu,
+        # and clippy still LINKS every build script and proc-macro, so without
+        # mold the job dies in the first minute on `collect2: cannot find 'ld'`.
+        # That is exactly how this job failed on its first CI run (#839) — and
+        # how ci.yml's copy would have failed on ITS first run, had it ever had
+        # one. Same retry-with-per-attempt-timeout shape as the test job.
+        timeout-minutes: 6
+        run: |
+          for attempt in 1 2 3; do
+            if sudo timeout 90 apt-get update -qq \
+               && sudo timeout 90 apt-get install -y -qq mold; then
+              exit 0
+            fi
+            echo "apt attempt ${attempt}/3 failed or timed out; retrying" >&2
+            sleep $((attempt * 10))
+          done
+          echo "::error::apt-get failed to install mold after 3 attempts" >&2
+          exit 1
+
+      - name: Install Rust toolchain (clippy)
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9 # master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: clippy
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: clippy
+
+      - name: cargo clippy --workspace --no-deps -- -D warnings
+        run: cargo clippy --workspace --no-deps -- -D warnings

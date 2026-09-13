@@ -9158,6 +9158,29 @@ if [ "$META_FAIL" -gt 0 ]; then
 else
     green "✓ ${CHECK_COUNT} checks, contiguous numbering, CLAUDE.md count in sync"
 fi
+
+# 54(c) — this script must be RUN by an auto-triggered workflow. Measured
+# 2026-09-12: the only workflow invoking it was ci.yml, `workflow_dispatch`
+# only, with ZERO runs in the repository's history, while the PR gate
+# (quality.yml, 1 362 runs) ran none of rustfmt / structural / clippy. Ninety
+# checks that no CI job executes are a pre-push hook that `--no-verify` skips
+# — check 64's "runner not WIRED" arm, one level up. A workflow counts only if
+# its `on:` block has an ACTIVE (uncommented) `pull_request:` or `push:` key.
+LINT_CI_WIRED=0
+for wf in "$ROOT"/.github/workflows/*.yml; do
+    grep -qE '^\s*(bash )?scripts/lint-structural\.sh|run: .*lint-structural\.sh|run: make lint\b' "$wf" || continue
+    if sed -n '/^on:/,/^[a-z]/p' "$wf" | grep -qE '^\s{2}(pull_request|push):'; then
+        LINT_CI_WIRED=1
+    fi
+done
+if [ "$LINT_CI_WIRED" -eq 1 ]; then
+    green "✓ scripts/lint-structural.sh is run by an auto-triggered workflow"
+else
+    red "✗ no auto-triggered workflow (pull_request:/push:) runs scripts/lint-structural.sh"
+    yellow "  → these checks then exist only in the pre-push hook, which --no-verify skips"
+    EXIT_CODE=1
+fi
+
 echo
 
 # ── Summary ──────────────────────────────────────────────────────────

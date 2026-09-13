@@ -3260,3 +3260,80 @@ missed both `TALOS_SIGNATURE_DIAG` readers (22 → 24). Mutation: reinstating th
 dispatcher's `== Ok("true")` fires at that line. Stated limits: a literal held in
 a variable, a comparison inside a helper in another crate, and a runtime-assembled
 variable name are invisible.
+
+### Package AO (2026-09-12) — ninety checks that no CI job had ever run
+
+**Found while grepping for something else.** Checking whether the pre-existing
+warnings in a controller test target would fail CI's clippy, the grep for
+`clippy` in `quality.yml` returned nothing. Neither did `lint-structural`,
+`make lint` or `rustfmt`. They are all in `ci.yml` — and `ci.yml` has been
+`workflow_dispatch`-only since May 2026, when the operator opted out of paid
+Actions minutes. `gh api …/actions/workflows/ci.yml/runs` reports
+**`total_count: 0`**. `quality.yml`, created a month later as the auto-triggered
+exception for "the correctness gates too slow or too network-dependent for the
+pre-push hook", reports 1 362 runs and runs tests, the advisory audit, the alert
+fixtures, the catalog compile, the frontend lint, the baseline verifier and the
+sqlx cache. Not rustfmt, not the structural lints, not clippy.
+
+**So the ninety checks lived in exactly one place that executes: the pre-push
+hook.** And `git push --no-verify` — the documented emergency bypass, and the
+way every package in this digest was pushed after a local `make lint` — skips
+it. Every "lint green", every "N findings on pristine main, 0 on the fixed tree",
+every "mutation-proved" sentence above was true of one developer machine and
+verified by no CI job. Check 64's own rule — "named by a runner is only worth as
+much as the runner being real and being run" — applied to the lint that
+contains check 64. The quality.yml header even states the reason the omission
+was wrong, one bullet up from where it was made: the FRONTEND lint was added
+there "as an unbypassable backstop for contributors who skip `make hooks`"; the
+Rust lints have the same contributors.
+
+**The same afternoon produced the proof that it matters.** #838's CI failed on
+`cargo-deny check bans` — a `version`-less path dependency in a publishable
+crate, the wildcard rule — a leg `make lint` runs only under
+`TALOS_LINT_AUDIT=1`. The local gate was green because it had not been asked;
+CI was red because it always asks. That is the relationship a CI gate is for.
+
+**And the first CI run of the moved clippy job produced a second proof, this
+time about the job itself.** It died after 1 m 50 s — far short of a workspace
+build — on `collect2: fatal error: cannot find 'ld'` while linking the build
+scripts of `quote`, `proc-macro2`, `libc` and `serde`. `.cargo/config.toml`
+pins `-C link-arg=-fuse-ld=mold` for `x86_64-unknown-linux-gnu`; the test,
+integration and sqlx-cache jobs each carry an "Install mold linker" step with
+a per-attempt apt timeout (the 2026-08-19 stall lesson); the clippy job copied
+out of `ci.yml` never had one, because `ci.yml`'s clippy job never had one
+either — and that job had never run, so nothing had ever told anyone. Clippy
+with `--no-deps` still LINKS every build script and proc-macro, so the
+requirement is not optional. The step is now in the clippy job, same shape as
+the test job's. The structural lint job passed on the same run: 95 green
+lines, the four env-gated legs (clippy, audit, personal markers, DB PREPARE)
+reporting their documented `⊘` skips, `helm version` present, and one
+pre-existing info-only warning from check 2 (a `/internal` route with no
+`// no-nginx-route` marker on either nginx file — recorded, not fixed here).
+
+**The move.** The `lint` job (rustfmt, `scripts/lint-structural.sh`, WIT drift)
+and the `clippy` job move from `ci.yml` into `quality.yml` — one home, deleted
+from the dispatch-only file with a note saying why — with one addition: a
+`helm version` step before the lint, because check 5 SKIPS with a yellow line
+when Helm is absent, and a check that skips is not a gate (checks 64/65). Scope
+and pins are unchanged (`--no-deps`, not `--all-targets`; the same commit-pinned
+actions). Cost, stated: ~3 min for the lint job and ~10–15 min cached for clippy,
+per PR, beside a test job that already runs 30.
+
+**Check 54 gained leg (c)**: some workflow whose `on:` block has an ACTIVE
+`pull_request:` or `push:` key must invoke `scripts/lint-structural.sh` (or
+`make lint`). Probed against the pre-fix tree: `ci.yml` invokes it and is not
+auto-triggered → NOT wired → fail; the fixed tree passes. The commented-out
+`# push:` / `# pull_request:` lines in `ci.yml` do not count, which is the whole
+point of the leg.
+
+**Not changed, stated.** `ci.yml` stays dispatch-only for the image builds — the
+May decision was about publish minutes, and it stands. Check 7's env gate
+(`TALOS_LINT_CLIPPY=1`) stays, since the separate CI job is now the parity run
+and a 60–90 s clippy on every local `make lint` was the cost that gated it. The
+pre-push hook is unchanged. What is changed is the epistemics: from this PR on,
+a check that says "0 on the fixed tree" has been run by a machine that is not
+the author's.
+
+**The CLAUDE.md `make lint ≠ pre-commit` bullet this package extended, kept verbatim for `check-engineering-log.py`'s losslessness leg:**
+
+- **`make lint` ≠ pre-commit.** The pre-commit hook runs compile-only; clippy (`-D warnings`) and rustfmt run at pre-push / CI. Run `TALOS_LINT_CLIPPY=1 make lint` before pushing — recurring surprises this session: `trivially_copy_pass_by_ref` on serde `skip_serializing_if(&T)` helpers (allow it — serde mandates the ref), needless late-init (`let x; if … {x=…}` → `let x = if …`), and ref-to-ref on `Option<&T>` params.
