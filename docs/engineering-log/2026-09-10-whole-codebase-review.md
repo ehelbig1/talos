@@ -3465,3 +3465,64 @@ prometheus 0.14, which under `-D warnings` is an ERROR — `cargo clippy
 --all-targets -p talos-metrics` did not compile on main. Moved to `.name()`.
 None of the three could have failed CI, which is the point of running
 `--all-targets` before every push.
+
+### Package AQ (2026-09-13) — a warning nobody read for five weeks
+
+**Found in the first CI lint log this repository ever produced.** #839's lint
+job passed, and in its output check 2 printed, twice, `⚠ controller routes
+missing a matching top-level nginx location: /internal`. The two `/internal`
+routes in `bootstrap/router.rs` both carry `// no-nginx-route` on the path
+line — so the finding was not about them. It came from two `#[cfg(test)] mod`
+blocks in the same file that build a TEST router mounting
+`/internal/worker-liveness` to drive `worker_liveness_handler` through
+`oneshot`, added by #631 on 2026-08-05. Check 2 read every `.route(` in the
+file, test modules included, so a test fixture read as an unmarked production
+route.
+
+**The defect is the level, not the false positive.** Check 2 was written
+"information-only": every leg set `ROUTE_NGINX_ALIGNED=0`, printed yellow, and
+never touched `EXIT_CODE`. So this false positive has been in the output of
+every `make lint`, every pre-push hook run and — since #839 — every CI lint
+job for five weeks, and nobody acted on it, including the author of the
+eleven packages that ran the lint dozens of times a day. That is not a
+reproach; it is the measurement: a check that only warns is a check nobody
+reads, which is check 64/65's "a check that skips is not a gate" one level
+softer. The same file's header calls the class it guards "a silent prod-only
+failure" (`/auth/csrf` and `/mcp`, 2026-04) — a silent prod-only failure
+guarded by a check whose own output is silent by convention.
+
+**The move.** Two changes, measured in that order. (1) The route haystack
+strips `#[cfg(test)] mod` regions first — a column-0 `#[cfg(test)]` through
+the first column-0 `}`, check 58's conservative rule, so a mis-detected end
+leaves test code IN the haystack (a loud false positive) and can never swallow
+production code. Measured: 11 top-level routes before the strip, 10 after,
+the difference exactly `/internal`; both nginx files then show MISSING = ∅
+and EXTRA = ∅, and the chart ConfigMap and `frontend/nginx.conf` carry the
+same location set. (2) With all three legs at zero, `ROUTE_NGINX_ALIGNED=0`
+now sets `EXIT_CODE=1` — the graduation-at-zero shape of checks 6, 50, 52 and
+55. The opt-outs are unchanged: `// no-nginx-route` on the `.route()` line, `#
+no-controller-route` on or within three lines above a `location`. The
+"likely safe (merged sub-router)" wording on the EXTRA leg stays as advice,
+but an EXTRA location now fails too: today's population is zero, and a
+location proxying to a route the controller does not register IS the
+`/approvals/` drift the review found on 2026-09-10, so it has no quiet form.
+
+**Probes.** Baseline green; an unmarked `/probe-aq` route added beside the
+liveness router fails; a `location /ghost-aq/` appended to `frontend/nginx.conf`
+fails twice (extra in the image file, chart ≠ image); the pre-strip haystack
+(the `cat` the check used until today) fails on the test router — i.e. the
+graduated check would have been RED on pristine main, which is exactly the
+state the strip exists to make truthful. `--count` stays 90: no new check, a
+level change and a haystack fix on an existing one.
+
+**Stated limits.** The strip is column-0 anchored, so a test module nested
+inside a `mod` (indented) is not stripped — the loud direction. The check
+still sees only `.route(`/`.nest(` in `main.rs` and `bootstrap/router.rs`; a
+route registered in a merged sub-router built elsewhere is invisible to the
+route side and reads as EXTRA on the nginx side, where `# no-controller-route`
+is the documented answer. And it proves the location SETS agree, never that a
+`proxy_pass` target is right.
+
+**The CLAUDE.md check-2 line this package extended, kept verbatim for `check-engineering-log.py`'s losslessness leg:**
+
+  2. bidirectional `controller/src/main.rs` route ↔ `deploy/helm/talos/templates/frontend/configmap.yaml` location alignment (opt-outs: `// no-nginx-route`, `# no-controller-route`)
