@@ -360,7 +360,13 @@ impl wit_llm_streaming::Host for TalosContext {
                          or export {} in the worker environment as a fallback.",
                         vault_path, env_name
                     );
-                    tracing::warn!(vault_path, env_name, module_id = ?self.module_id, "{}", msg);
+                    tracing::warn!(
+                        vault_path = %talos_workflow_job_protocol::redact_vault_path_for_log(vault_path),
+                        env_name,
+                        module_id = ?self.module_id,
+                        "{}",
+                        msg
+                    );
                     return Err(wit_llm_streaming::Error::NotConfigured(msg));
                 }
             }
@@ -443,7 +449,13 @@ impl wit_llm_streaming::Host for TalosContext {
                          or export {} in the worker environment as a fallback.",
                         vault_path, env_name
                     );
-                    tracing::warn!(vault_path, env_name, module_id = ?self.module_id, "{}", msg);
+                    tracing::warn!(
+                        vault_path = %talos_workflow_job_protocol::redact_vault_path_for_log(vault_path),
+                        env_name,
+                        module_id = ?self.module_id,
+                        "{}",
+                        msg
+                    );
                     return Err(wit_llm_streaming::Error::NotConfigured(msg));
                 }
             }

@@ -205,7 +205,7 @@ impl SecretsMutations {
             .await
             .map_err(|e| {
                 tracing::error!(
-                    key_path = %input.key_path,
+                    key_path = %talos_workflow_job_protocol::redact_vault_path_for_log(&input.key_path),
                     error = %e,
                     "update_secret existence_check failed"
                 );
@@ -263,7 +263,7 @@ impl SecretsMutations {
             .await
             .map_err(|e| {
                 tracing::error!(
-                    key_path = %key_path,
+                    key_path = %talos_workflow_job_protocol::redact_vault_path_for_log(&key_path),
                     error = %e,
                     "delete_secret failed"
                 );

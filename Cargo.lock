@@ -9008,6 +9008,7 @@ dependencies = [
  "talos-secrets-manager",
  "talos-text-util",
  "talos-workflow-engine-core",
+ "talos-workflow-job-protocol",
  "tokio",
  "tracing",
  "uuid",
@@ -9341,8 +9342,10 @@ dependencies = [
  "rand 0.8.6",
  "serde",
  "sha2 0.10.9",
+ "talos-workflow-job-protocol",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "zeroize",
 ]

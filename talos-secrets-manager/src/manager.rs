@@ -1486,7 +1486,7 @@ impl SecretsManager {
             // for newly-created secrets. Invalidate only their cache entry.
             self.invalidate_llm_keys_cache(Some(creator_user_id));
             tracing::info!(
-                key_path = %key_path,
+                key_path = %talos_workflow_job_protocol::redact_vault_path_for_log(key_path),
                 owner_user_id = %creator_user_id,
                 "Invalidated LLM-keys cache for creator after new-secret insert"
             );
@@ -1494,7 +1494,7 @@ impl SecretsManager {
 
         tracing::info!(
             secret_id = %secret_id,
-            key_path = %key_path,
+            key_path = %talos_workflow_job_protocol::redact_vault_path_for_log(key_path),
             "Created new secret"
         );
 
@@ -1774,7 +1774,7 @@ impl SecretsManager {
             Some(r) => r,
             None => {
                 tracing::warn!(
-                    key_path = %key_path,
+                    key_path = %talos_workflow_job_protocol::redact_vault_path_for_log(key_path),
                     updater = ?updater_user_id,
                     "update_secret: no row matched (not found or access denied)"
                 );
@@ -1837,7 +1837,7 @@ impl SecretsManager {
                 Some(owner) => {
                     self.invalidate_llm_keys_cache(Some(owner));
                     tracing::info!(
-                        key_path = %key_path,
+                        key_path = %talos_workflow_job_protocol::redact_vault_path_for_log(key_path),
                         owner_user_id = %owner,
                         "Invalidated LLM-keys cache for secret owner after rotation"
                     );
@@ -1845,13 +1845,13 @@ impl SecretsManager {
                 None => {
                     self.invalidate_all_llm_keys_cache();
                     tracing::info!(
-                        key_path = %key_path,
+                        key_path = %talos_workflow_job_protocol::redact_vault_path_for_log(key_path),
                         "Invalidated ALL LLM-keys cache entries after rotation (legacy secret with no owner)"
                     );
                 }
             }
         }
-        tracing::info!(key_path = %key_path, "Rotated secret");
+        tracing::info!(key_path = %talos_workflow_job_protocol::redact_vault_path_for_log(key_path), "Rotated secret");
         Ok(())
     }
 
@@ -2652,7 +2652,7 @@ impl SecretsManager {
                     target: "talos_secrets",
                     event_kind = "secret_decrypt_failure",
                     reason = "too_short",
-                    key_path = %key_path,
+                    key_path = %talos_workflow_job_protocol::redact_vault_path_for_log(&key_path),
                     "Invalid encrypted secret (too short)"
                 );
                 inc_secret_decrypt_failure("too_short");
@@ -2681,7 +2681,7 @@ impl SecretsManager {
                         target: "talos_secrets",
                         event_kind = "secret_decrypt_failure",
                         reason = "decrypt_helper",
-                        key_path = %key_path,
+                        key_path = %talos_workflow_job_protocol::redact_vault_path_for_log(&key_path),
                         error = %e,
                         "Decrypt via helper failed"
                     );
@@ -2812,7 +2812,11 @@ impl SecretsManager {
                     secrets_map.insert(key_path, plaintext.to_string());
                 }
                 Err(e) => {
-                    tracing::warn!("Failed to decrypt secret {}: {}", key_path, e);
+                    tracing::warn!(
+                        key_path = %talos_workflow_job_protocol::redact_vault_path_for_log(&key_path),
+                        error = %e,
+                        "Failed to decrypt secret"
+                    );
                 }
             }
         }
@@ -2891,7 +2895,7 @@ impl SecretsManager {
                 Some(owner) => {
                     self.invalidate_llm_keys_cache(Some(owner));
                     tracing::info!(
-                        key_path = %key_path,
+                        key_path = %talos_workflow_job_protocol::redact_vault_path_for_log(key_path),
                         owner_user_id = %owner,
                         "Invalidated LLM-keys cache for secret owner after deletion"
                     );
@@ -2899,14 +2903,14 @@ impl SecretsManager {
                 None => {
                     self.invalidate_all_llm_keys_cache();
                     tracing::info!(
-                        key_path = %key_path,
+                        key_path = %talos_workflow_job_protocol::redact_vault_path_for_log(key_path),
                         "Invalidated ALL LLM-keys cache entries after deletion (legacy secret with no owner)"
                     );
                 }
             }
         }
 
-        tracing::info!(key_path = %key_path, "Deleted secret");
+        tracing::info!(key_path = %talos_workflow_job_protocol::redact_vault_path_for_log(key_path), "Deleted secret");
 
         Ok(())
     }
@@ -3741,7 +3745,7 @@ impl SecretsManager {
         if is_llm_provider_key_path(key_path) {
             self.invalidate_llm_keys_cache(Some(creator_user_id));
             tracing::info!(
-                key_path = %key_path,
+                key_path = %talos_workflow_job_protocol::redact_vault_path_for_log(key_path),
                 owner_user_id = %creator_user_id,
                 action = %action,
                 "Invalidated LLM-keys cache after upsert"
@@ -3750,7 +3754,7 @@ impl SecretsManager {
 
         tracing::info!(
             secret_id = %secret_id,
-            key_path = %key_path,
+            key_path = %talos_workflow_job_protocol::redact_vault_path_for_log(key_path),
             namespace = %namespace,
             inserted = was_inserted,
             "upsert_secret: {} secret",

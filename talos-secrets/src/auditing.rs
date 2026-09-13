@@ -7,6 +7,10 @@ use crate::provider::{SecretProvider, SlotHandle};
 /// let provider = AuditingProvider::new(TalosVaultProvider::from_resolved(secrets));
 /// ```
 ///
+/// `resolve` logs the key path at INFO with the OAuth provider key hashed
+/// (`talos_workflow_job_protocol::redact_vault_path_for_log`) — never the raw
+/// `oauth/gmail/<user>/<email>/…` form.
+///
 /// All plaintext exit points (`into_auth_header`, `sign`, `decrypt`) are logged
 /// at `DEBUG` level with handle ID and context so that access can be audited with:
 /// ```text
@@ -25,10 +29,16 @@ impl<P: SecretProvider> AuditingProvider<P> {
 #[async_trait::async_trait]
 impl<P: SecretProvider> SecretProvider for AuditingProvider<P> {
     async fn resolve(&self, path: &str, execution_id: uuid::Uuid) -> anyhow::Result<SlotHandle> {
-        tracing::info!(path, %execution_id, "secret.resolve");
+        // The path is rendered through the shared redactor: an OAuth path
+        // carries the account's provider key (for gmail, the user's email)
+        // in its fourth segment, and this line fires on every secret a
+        // module resolves — structural check 91. The field is `key_path`
+        // (was `path`) so the check can see it by name; grep the message.
+        let key_path = talos_workflow_job_protocol::redact_vault_path_for_log(path);
+        tracing::info!(key_path = %key_path, %execution_id, "secret.resolve");
         let result = self.inner.resolve(path, execution_id).await;
         if let Err(ref e) = result {
-            tracing::warn!(path, %execution_id, error = %e, "secret.resolve.failed");
+            tracing::warn!(key_path = %key_path, %execution_id, error = %e, "secret.resolve.failed");
         }
         result
     }

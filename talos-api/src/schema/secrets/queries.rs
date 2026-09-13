@@ -109,7 +109,7 @@ impl SecretsQueries {
             .await
             .map_err(|e| {
                 tracing::error!(
-                    key_path = %key_path,
+                    key_path = %talos_workflow_job_protocol::redact_vault_path_for_log(&key_path),
                     error = %e,
                     "get_secret_metadata failed"
                 );

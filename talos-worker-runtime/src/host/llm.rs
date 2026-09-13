@@ -527,7 +527,13 @@ impl TalosContext {
                          or export {} in the worker environment as a fallback.",
                         vault_path, env_name
                     );
-                    tracing::warn!(vault_path, env_name, module_id = ?self.module_id, "{}", msg);
+                    tracing::warn!(
+                        vault_path = %talos_workflow_job_protocol::redact_vault_path_for_log(vault_path),
+                        env_name,
+                        module_id = ?self.module_id,
+                        "{}",
+                        msg
+                    );
                     // Also the Tier-1-refusal exit: `get_llm_api_key` returns
                     // `None` for a ceiling denial too, and cannot be told apart
                     // from a genuinely missing key here. See `LlmFailure::NotConfigured`.

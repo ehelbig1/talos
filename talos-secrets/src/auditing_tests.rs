@@ -71,6 +71,79 @@ mod tests {
         assert_eq!(handle.0, 1);
     }
 
+    /// The decorator's `secret.resolve` / `secret.resolve.failed` lines fire on
+    /// every secret a module resolves, and an OAuth path carries the account's
+    /// provider key — for gmail, the user's email — in its fourth segment.
+    /// Drive the REAL decorator under a capturing subscriber and read the
+    /// bytes it wrote: the message and the correlation token must be there,
+    /// the address must not. (Check 91 is the textual gate; this is the half
+    /// that proves the rendered field, not the named function.)
+    #[tokio::test]
+    async fn resolve_log_lines_carry_the_hashed_provider_key_not_the_email() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = Capture;
+            fn make_writer(&'a self) -> Capture {
+                self.clone()
+            }
+        }
+        let buf = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let uid = "11111111-2222-3333-4444-555555555555";
+        let ok_path = format!("oauth/gmail/{uid}/alice@example.com/access_token");
+        let mut map = HashMap::new();
+        map.insert(ok_path.clone(), "secret".to_string());
+        let provider = AuditingProvider::new(MockProvider { resolved: map });
+
+        provider
+            .resolve(&ok_path, uuid::Uuid::new_v4())
+            .await
+            .unwrap();
+        let missing = format!("oauth/gmail/{uid}/bob@example.com/refresh_token");
+        assert!(provider
+            .resolve(&missing, uuid::Uuid::new_v4())
+            .await
+            .is_err());
+
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        assert!(out.contains("secret.resolve"), "{out}");
+        assert!(out.contains("secret.resolve.failed"), "{out}");
+        assert!(out.contains("key_path="), "field is `key_path`: {out}");
+        assert!(!out.contains("alice"), "email leaked into the log: {out}");
+        assert!(
+            !out.contains("bob"),
+            "email leaked into the failure log: {out}"
+        );
+        assert!(!out.contains('@'), "an address survived redaction: {out}");
+        let token =
+            talos_workflow_job_protocol::redact_oauth_provider_key_for_log("alice@example.com");
+        assert!(
+            out.contains(&token),
+            "correlation token {token} absent: {out}"
+        );
+        assert!(
+            out.contains(&format!("oauth/gmail/{uid}/")),
+            "provider + user id stay visible: {out}"
+        );
+    }
+
     #[tokio::test]
     async fn auditing_provider_passes_through_resolve_error() {
         let inner = MockProvider {

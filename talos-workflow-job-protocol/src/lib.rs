@@ -2604,6 +2604,147 @@ pub fn vault_path_permitted(allowed: &[String], key_path: &str) -> bool {
     })
 }
 
+// ============================================================================
+// Vault path LOG rendering — shared between controller and worker
+// ============================================================================
+
+/// Render a vault key path for a LOG LINE, with the OAuth provider key hashed.
+///
+/// The OAuth credential paths are `oauth/<provider>/<user_id>/<provider_key>/…`
+/// (see `OAuthCredentialService::access_token_path` / `refresh_token_path` in
+/// `talos-oauth`), and for the `gmail` provider `<provider_key>` IS the
+/// account's email address — straight PII. MCP-988 (2026-05-15) redacted it in
+/// the controller's token-refresh task, in a `pub(crate)` helper that crate
+/// alone could reach; the worker's `AuditingProvider` — which logs every
+/// `secret.resolve` of every module execution — kept printing the path whole
+/// (measured 2026-09-13: 23 email-bearing INFO lines in 25 minutes on a
+/// one-user fleet). This is the ONE home now, beside [`vault_path_permitted`]
+/// for the same reason that function lives here: both binaries hold vault
+/// paths and both must agree on what a vault path means — and on what of it
+/// may be printed. Structural check 91 requires every `key_path`/`vault_path`
+/// log field to route through it.
+///
+/// Rules, deliberately narrow so the line stays greppable:
+///   - an `oauth/…` path with at least four segments has its FOURTH segment
+///     (the provider key) replaced by `<8-hex sha256 prefix>` — whatever the
+///     provider keys on (email for gmail, a derived account UUID for
+///     google_calendar, a team id for slack), so a new provider keyed on a
+///     human identifier is covered the day it ships; the leaf
+///     (`access_token`, `refresh_token`, none) does not matter, which is what
+///     the MCP-988 helper (exactly five parts, `access_token` only) got wrong;
+///   - `<provider>` and `<user_id>` stay visible — a UUID is not directly
+///     attributable, and operators correlate on it;
+///   - every other path (`anthropic/api_key`, `stripe/live/key`, a bare
+///     `oauth/gmail/<uid>` with no provider key) is returned UNCHANGED.
+///
+/// The hash is a correlation token, not a secret: two log lines for the same
+/// credential render the same prefix.
+pub fn redact_vault_path_for_log(key_path: &str) -> String {
+    let parts: Vec<&str> = key_path.split('/').collect();
+    if parts.len() >= 4 && parts[0] == "oauth" {
+        let hashed = redact_oauth_provider_key_for_log(parts[3]);
+        parts
+            .iter()
+            .enumerate()
+            .map(|(i, seg)| if i == 3 { hashed.as_str() } else { seg })
+            .collect::<Vec<&str>>()
+            .join("/")
+    } else {
+        key_path.to_string()
+    }
+}
+
+/// Replace an OAuth `provider_key` (for gmail the user's email address) with a
+/// short sha256 prefix in angle brackets, for the sites that log the key as a
+/// bare field rather than embedded in a path. Same token
+/// [`redact_vault_path_for_log`] substitutes into the path, so a path line and
+/// a bare-key line about one credential correlate.
+pub fn redact_oauth_provider_key_for_log(provider_key: &str) -> String {
+    use sha2::Digest as _;
+    let hash = Sha256::digest(provider_key.as_bytes());
+    let prefix: String = hex::encode(hash).chars().take(8).collect();
+    format!("<{prefix}>")
+}
+
+#[cfg(test)]
+mod vault_path_log_redaction_tests {
+    use super::{redact_oauth_provider_key_for_log, redact_vault_path_for_log};
+
+    const UID: &str = "11111111-2222-3333-4444-555555555555";
+
+    #[test]
+    fn gmail_access_token_path_loses_the_email_and_keeps_the_rest() {
+        let out =
+            redact_vault_path_for_log(&format!("oauth/gmail/{UID}/alice@example.com/access_token"));
+        assert!(!out.contains("alice"), "{out}");
+        assert!(!out.contains("example.com"), "{out}");
+        assert!(!out.contains('@'), "{out}");
+        assert_eq!(
+            out.matches('/').count(),
+            4,
+            "segment count preserved: {out}"
+        );
+        assert!(out.starts_with(&format!("oauth/gmail/{UID}/<")), "{out}");
+        assert!(out.ends_with(">/access_token"), "{out}");
+    }
+
+    #[test]
+    fn refresh_token_leaf_is_redacted_too() {
+        // The MCP-988 helper matched exactly five parts ending in
+        // `access_token`; the refresh-token twin of the same credential
+        // carries the same email and was invisible to it.
+        let out = redact_vault_path_for_log(&format!(
+            "oauth/gmail/{UID}/alice@example.com/refresh_token"
+        ));
+        assert!(!out.contains("alice"), "{out}");
+        assert!(out.ends_with(">/refresh_token"), "{out}");
+    }
+
+    #[test]
+    fn four_segment_prefix_is_redacted() {
+        // `oauth/<provider>/<user_id>/<provider_key>` without a leaf — the
+        // shape talos-google-calendar builds before appending `/access_token`.
+        let out =
+            redact_vault_path_for_log(&format!("oauth/google_calendar/{UID}/alice@example.com"));
+        assert!(!out.contains("alice"), "{out}");
+        assert_eq!(out.matches('/').count(), 3, "{out}");
+    }
+
+    #[test]
+    fn non_oauth_paths_pass_through_unchanged() {
+        for p in [
+            "anthropic/api_key",
+            "stripe/live/key",
+            "weird/three/parts",
+            "",
+            "oauth",
+            "oauth/gmail",
+            // three segments: there is no provider key to hash yet
+            &format!("oauth/gmail/{UID}"),
+        ] {
+            assert_eq!(redact_vault_path_for_log(p), p, "{p:?} must be unchanged");
+        }
+    }
+
+    #[test]
+    fn provider_key_token_is_stable_distinct_and_at_free() {
+        let a = redact_oauth_provider_key_for_log("alice@example.com");
+        let b = redact_oauth_provider_key_for_log("alice@example.com");
+        let c = redact_oauth_provider_key_for_log("bob@example.com");
+        assert_eq!(a, b, "same key must render the same token");
+        assert_ne!(a, c, "different keys must render different tokens");
+        assert!(
+            a.starts_with('<') && a.ends_with('>') && a.len() == 10,
+            "{a}"
+        );
+        assert!(!a.contains('@'));
+        // and the path form substitutes exactly this token
+        let path =
+            redact_vault_path_for_log(&format!("oauth/gmail/{UID}/alice@example.com/access_token"));
+        assert!(path.contains(&a), "{path} should carry {a}");
+    }
+}
+
 /// A detected `vault://` reference in a config object: `(config_key, vault_path)`.
 ///
 /// `vault_path` is the path with the `vault://` prefix already stripped,

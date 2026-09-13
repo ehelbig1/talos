@@ -941,7 +941,7 @@ async fn handle_refresh_oauth_token(
         Err(e) => {
             tracing::warn!(
                 target: "talos_oauth_refresh",
-                %vault_path,
+                vault_path = %talos_workflow_job_protocol::redact_vault_path_for_log(vault_path),
                 error = %e,
                 "manual refresh_oauth_token failed"
             );

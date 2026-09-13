@@ -9159,6 +9159,53 @@ else
 fi
 echo
 
+bold "▶ check 91: a vault key path in a log line must be rendered through the shared redactor"
+
+# Measured 2026-09-13 (package AU): the worker's `AuditingProvider` logged
+# `secret.resolve path="oauth/gmail/<user_id>/<EMAIL>/access_token"` at INFO on
+# every secret a module resolved — 23 email-bearing lines in 25 minutes on a
+# one-user fleet, ~1 300/day, one per active user per push on a real one. The
+# OAuth vault path is `oauth/<provider>/<user_id>/<provider_key>/<leaf>` and for
+# gmail the provider key IS the account's email. MCP-988 (2026-05-15) had fixed
+# exactly this in the controller's token-refresh task with a `pub(crate)` helper
+# in talos-oauth — a crate the worker does not link — and 34 other emitters kept
+# printing the path raw (the secrets manager's create/rotate/delete/upsert lines,
+# the worker's allowlist-denial and vault:// resolution WARNs, the GraphQL and
+# MCP secret error paths). ONE home now: `talos_workflow_job_protocol::
+# redact_vault_path_for_log` (beside `vault_path_permitted`, for the same
+# reason), which hashes the fourth segment of any `oauth/…` path with ≥4
+# segments (any leaf — the private helper matched five parts ending in
+# `access_token` only, so the refresh-token twin was invisible to it) and
+# returns every other path unchanged. The detector is statement-aware: a
+# `trace!`…`error!` macro whose argument list names a `key_path`/`vault_path`/
+# `secret_path`/`*_token_path` field (or a bare `path` inside talos-secrets/ and
+# talos-oauth/, where a path IS a vault path) must name the redactor in the
+# statement or within 8 lines above; string literals are blanked before the
+# field scan (the first draft matched prose after a `\`-newline continuation —
+# 31 false positives), whole-line comments and column-0 `#[cfg(test)] mod`
+# regions are blanked. 43 on pristine main (9 of them routed through the private
+# helper, 34 raw), 0 on the fixed tree. Exit 2 (loud) when the scan matches NO
+# tracing statement at all. Stated limits: a path bound to a differently-named
+# local (`let p = key_path; info!(p = %p)`), or rendered inside a helper in
+# another crate, is invisible; the check proves the redactor is NAMED, never
+# that its output is what the field carries. Opt-out
+# `// allow-raw-vault-path-log: <reason>` within 8 lines above.
+if [ ! -f "$ROOT/scripts/lint-vault-path-log-redaction.py" ]; then
+    red "✗ scripts/lint-vault-path-log-redaction.py is missing — the check cannot run"
+    EXIT_CODE=1
+else
+    CK91_OUT="$(python3 "$ROOT/scripts/lint-vault-path-log-redaction.py" "$ROOT" 2>&1)"
+    CK91_RC=$?
+    if [ "$CK91_RC" -eq 0 ]; then
+        green "✓ every vault key path in a log line routes through redact_vault_path_for_log ($(echo "$CK91_OUT" | tail -1 | sed -E 's/^ +//'))"
+    else
+        echo "$CK91_OUT" | sed 's/^/  /'
+        red "✗ vault key path(s) rendered raw in a log line — wrap in talos_workflow_job_protocol::redact_vault_path_for_log"
+        EXIT_CODE=1
+    fi
+fi
+echo
+
 bold "▶ check 54: lint self-consistency (check numbering + documented count)"
 ACTUAL_NUMS="$(grep -oE '^bold "▶ check [0-9]+:' "${BASH_SOURCE[0]}" | grep -oE '[0-9]+' | sort -n)"
 EXPECTED_NUMS="$(seq 1 "$CHECK_COUNT")"

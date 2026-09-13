@@ -3760,3 +3760,133 @@ intended. The dev laptop, not the platform.
 **The CLAUDE.md check-89 line this package extended (its package-AS form), kept verbatim for `check-engineering-log.py`'s losslessness leg:**
 
   89. a configuration-reference Component cell must not claim a process that cannot read the variable — `docs/configuration-reference.md` is the AUTHORITATIVE env-var list and its Component column tells an operator which PROCESS needs a variable set. Measured 2026-09-12 (after #834): it said `both` for **108** variables the worker binary cannot read at all — `TALOS_MASTER_KEY`, `JWT_SECRET`, `VAULT_ADDR`, `NEO4J_PASSWORD`, every scheduler knob, every memory-loop knob — 69 in a Component cell and 48 under two section headings that said "both components" / "both"; one crate-named row (`COMPILE_DIR` → `talos-compilation`) is read by the controller bin and not that crate; one `controller` row (`TALOS_VERSION`) is read by the worker's self-registration. Read literally, the column told an operator to hand the credential-free worker the master KEK and the JWT signing secret. **The rule is an IMPOSSIBILITY test, so its precision is structural**: `scripts/lint-config-reference-components.py` derives the crate set linked into each binary from `cargo tree -p worker` / `-p controller` (lockfile resolution, ~0.3 s each, no build), takes a read to be the variable as a WHOLE quoted literal in a crate's production `.rs` (whole-line comments stripped; `tests/`, `*_tests.rs`, `examples/`, `benches/` excluded) or a `talos-config` `pub fn` accessor called from it, and fails a `both`/`worker` row no worker-linked crate reads, a `controller` row the worker bin itself reads, a `both`/`controller` row nothing controller-linked reads, and a crate-named row the named crate does not read. **117 findings on pristine main, 0 on the fixed tree**; mutation-proved in both arms (one row back to `both` → 1; `NATS_URL` → `controller` → 1; the memory heading back to "both components" → 38). ~1.9 s. Fails LOUDLY (exit 2) on an empty cargo tree, a moved table format or a wrong root. **Stated limits, each the quiet direction:** a read in a SHARED crate is left to the author — `talos-worker-runtime` is linked into the controller for the WIT inspector and its host-side env reads run only in the worker, so `worker` rows read there stay `worker` and a `both` row whose only worker-side evidence is a shared crate PASSES. Measured: after the fix **13** `both` rows have no reader in the worker bin or `talos-worker-runtime`; six were hand-flipped on architecture (`EMBEDDING_*` ×5 — the worker is credential-free and the reader is the service half of `talos-memory`; `TALOS_DISPATCH_SCHEME` — `configured_dispatch_signer` has no worker caller) and seven are true `both` (`NATS_CA_FILE`, `TALOS_RPC_REQUIRE_ED25519`, `JAEGER_ENDPOINT` + the four `OTEL_*`). The WHOLE-LITERAL rule is load-bearing and was added on measurement: under a bare-token rule `worker/src/self_register.rs` vouched for `TALOS_WORKER_PUBLIC_KEYS` from inside a WARN message, `talos-dlp-provider` for `VAULT_TOKEN` from a `[REDACTED:VAULT_TOKEN]` fixture and `talos-worker-runtime` for `BASE_URL` from gemini's `const BASE_URL` — three prose hits, two false negatives and one false positive. A name assembled at runtime (`format!("{}_FILE", v)`) is invisible; trailing `// comments` on code lines are not stripped. **No opt-out**: a process that cannot read a variable has no legitimate reason to be listed as reading it. The same pass removed the chart worker's `AWS_ENDPOINT_URL` env — set since 2026-05-18 (`8f13f1e9`, an unrelated MCP commit) and read by nothing: the worker links no AWS SDK (W1's dead-env class). The legend now defines `both` as "both binaries read it", not "a shared crate mentions it". **Two legs added the same day (package AL, no new number):** a Default cell may not be a placeholder (`bool default`/`flag`/`policy default`; 10 on pristine main, two of them the write-ceiling switches) and a `(+_FILE)` claim needs a `read_env_or_file("VAR")` or `"VAR_FILE"` reader (1: `NATS_PASSWORD`, both readers bare `env::var`). The first `_FILE` draft matched the substring in the variable NAME and flagged `NATS_CA_FILE` — the claim pattern is `(+`_FILE``. Descriptions stay out of range: the 24 wrong ones were a per-row human read, and a Default-VALUE compare scored ~9 % precision. **Leg (d), 2026-09-13 (package AS): the CHART must agree with the column.** A `both` variable the chart renders by name (or via the controller's `$secretKeys` list) on ONE Deployment and not the other is a control one process was never given; a `controller`/`worker` variable rendered on the other process is W1's dead-env class. Measured against main's controller template: 5 findings — the three `TALOS_SIGSTORE_*` vars rendered on the worker alone while the controller's OCI-sync gate reads them (real), plus `ANTHROPIC_API_KEY`/`OPENAI_API_KEY` rendered on the controller alone, which is the credential-free worker BY DESIGN — so the leg takes `# allow-chart-asymmetry: VAR … — <reason>` in the template, and that marker now records the decision where the list lives. 3 real / 3 reported after the exemption, 0 on the fixed tree; mutation: dropping the controller's `TALOS_SIGSTORE_REQUIRED` fires. Operator-supplied `talos.envFromMap` keys are invisible by construction and read as absent on both sides (stated).
+
+### Package AU (2026-09-13) — a redactor written for one emitter, in a crate the other never links
+
+**How it was found.** The forty-second deploy (#844) verified clean — 0 WARN, 0
+ERROR, exact reconciliation — so the survey turned to what the two containers
+say at INFO in a steady state. The controller's biggest INFO emitter was a
+per-message acknowledgement (`📩 Received WASM log from NATS topic`, 68 of 329
+lines in 25 minutes, 21 %, under a comment reading `// DEBUG:`). The worker's
+list carried something different: 23 lines of
+`talos_secrets::auditing: secret.resolve path="oauth/gmail/<user_id>/<the
+operator's email address>/access_token"`. A grep for an email-shaped token over
+both containers since boot: controller 0, worker 23 — all 23 that one line.
+
+**What the repository already knew.** `talos-oauth/src/refresh_task.rs` carries
+a 2026-05-15 comment (MCP-988) that describes this exact defect at a different
+emitter: the token-refresh task "logged at INFO level on every successful
+refresh, surfacing every active user's email to operator log pipelines on every
+5-minute tick", fixed with `redact_oauth_path_for_log` — a `pub(crate)` function
+hashing the provider-key segment to an 8-hex sha256 prefix. `pub(crate)` in a
+controller-side crate. The worker links `talos-secrets` and the job-protocol
+crate and nothing else on that side of the graph, and `AuditingProvider` —
+the decorator whose one job is to log every `SecretProvider` call — printed the
+path whole. The HTTP audit line beside it in the same worker log already
+redacted its request path to a LENGTH (`path_len=`); the secret audit line did
+not redact at all.
+
+**The population, measured twice.** A single-line grep for tracing macros
+carrying a `path` / `key_path` / `vault_path` field found 23 sites. The
+statement-aware scan that became check 91 found **43** on pristine main —
+the house call style breaks the macro across lines, the same 46.6 %/63.3 %
+undercount the `mcp_error` inventory recorded on 2026-09-07. Of the 43, nine
+were already routed through the private helper (six in `credentials.rs`, three
+in `refresh_task.rs`); 34 were raw:
+
+| where | sites | can the path be an OAuth one? |
+|---|---|---|
+| `talos-secrets/src/auditing.rs` (worker, every resolve) | 2 | yes — LIVE, 23 lines / 25 min |
+| `talos-secrets-manager/src/manager.rs` (create / update-miss / rotate / delete / upsert / decrypt-failure) | 14 | yes — the OAuth dual-write lands on `create_secret` at connect |
+| `talos-worker-runtime/src/host/{secrets,vault}.rs` (allowlist denial, reserved-path denial, `vault://` resolution) | 10 | yes — Gmail modules resolve `oauth/gmail/…`; four sites already logged `vault_path_hash` BESIDE the raw path |
+| `talos-worker-runtime/src/host/llm*.rs` (LLM key lookups) | 4 | no — `anthropic/api_key`; routed for uniformity, pass through unchanged |
+| `talos-api` secret mutations/queries (error paths) | 3 | yes — caller-supplied |
+| `talos-mcp-handlers` manual `refresh_oauth_token` failure | 1 | yes — OAuth by construction |
+
+Plus one emitter outside the path vocabulary entirely: `talos-gmail`'s connect
+handler logged `Successfully connected Gmail account: <email>` at INFO. A
+statement-aware scan for tracing macros carrying an `email`-named field found
+15 hits, 1 real (the rest are `event_kind` names and `user_id` fields).
+
+**Which segment is PII depends on the provider.** The OAuth vault path is
+`oauth/<provider>/<user_id>/<provider_key>/<leaf>`. Gmail keys on the account
+email; Google Calendar moved to a derived account UUID (the Sha256→UUID of
+Google's immutable account id, one of check 71's two opt-outs); Slack keys on
+the team id. So the redactor hashes the fourth segment of every `oauth/…` path
+with at least four segments, whatever it holds and whatever the leaf, and a
+future provider keyed on a human identifier is covered without a code change.
+That generalisation is load-bearing, not cosmetic: the MCP-988 helper matched
+exactly five parts ending in `access_token`, so `refresh_token_path`'s twin of
+the same credential — same email — passed through it unchanged, as did the
+four-segment prefix `talos-google-calendar` builds before appending the leaf.
+
+**Where the one home is, and why.** `talos_workflow_job_protocol` already holds
+`vault_path_permitted` and `LLM_PROVIDER_VAULT_PATHS` — the vocabulary of what a
+vault path MEANS, shared because "both controller (validation) and worker
+(runtime enforcement) import from there". What of a vault path may be PRINTED
+is the same vocabulary's other half. No cycle: the protocol crate depends on
+`talos-workflow-engine-core` alone, `talos-secrets` on nothing in the
+workspace; both `talos-secrets` and `talos-oauth` gained the dependency (already
+in both binaries' trees — `cargo deny check bans` clean). `redact_vault_path_for_log`
+and `redact_oauth_provider_key_for_log` (the bare-field form) live there with
+five tests; `talos-oauth`'s helpers and their four tests are deleted, its eight
+call sites renamed to the canonical functions, and the three reactive-refresh
+sites that read a `redacted` binding fifteen lines above their macro now call
+the redactor inline so the check's 8-line window sees them.
+
+**The check, and the bug in its first draft.** `scripts/lint-vault-path-log-redaction.py`
+gathers each `trace!`…`error!` macro's paren-balanced argument list, blanks
+string literals, and looks for a `key_path` / `vault_path` / `secret_path` /
+`*_token_path` field (plus a bare `path` inside `talos-secrets/` and
+`talos-oauth/`, where a path is a vault path by construction — the manager
+names its `key_path`, and `vault_kek_provider.rs`'s `path` is a Vault HTTP API
+path, which is why the manager crate is NOT in that list). Its first run
+reported **32 sites on the fixed tree**, 31 of them prose: the string-literal
+matcher `"(?:\\.|[^"\\])*"` has `\\.` in it and `.` does not match a newline
+without `re.S`, so a `\`-newline continuation inside a message ended the
+literal early and the rest of the message leaked into the field scan — "the
+key_path" in an operator hint matched. One flag fixed it; the run over main
+went 63 → 43 and over the fixed tree 32 → 0, and the bare-`path` list lost the
+manager crate on the same pass. **43 on main, 0 after**; exit 2 if the scan
+matches no tracing statement at all.
+
+**Mutations — and the one that showed the check's limit rather than its reach.**
+* M1: the worker line back to the bare `path` field, the
+  `let key_path = redact…(path)` binding LEFT in place one line above. **Check
+  91 reported 0** — the window vouches for a redactor that is named and not
+  applied, exactly the stated limit — and the new capture test in
+  `talos-secrets` FAILED (it installs a capturing `tracing` subscriber, drives
+  the real decorator on an email-bearing path and its `refresh_token` twin, and
+  asserts the bytes carry `secret.resolve`, `key_path=`, the correlation token
+  and no `@`). M1b, the binding deleted too: check 91 fires at both lines.
+* M2: the redactor returns every path unchanged — protocol tests and the
+  capture test fail.
+* M3: the redactor back to the MCP-988 shape (five parts, `access_token` only)
+  — `refresh_token_leaf_is_redacted_too` and `four_segment_prefix_is_redacted`
+  fail, which is the measurement that the generalisation is not cosmetic.
+* M4: one worker-runtime allowlist WARN back to the raw `key_path` — check 91
+  fires at `vault.rs:437`.
+* M5, stated as UNCAUGHT: the Gmail connect line back to the address. Its field
+  is `account`, not a path field; check 91 keys on the field name. The
+  workspace's one such emitter was fixed by hand and nothing gates the next.
+* M6, uncaught: the WASM-log acknowledgement back to INFO. A log level has no
+  test; the deploy's INFO count is the read.
+
+**Also on the same pass, measured and not changed.** `pg_stat_statements` top
+entries since the 2026-09-10 postmaster start are the daily backup `COPY`s
+(pg_dump), the kNN few-shot statement (17 991 calls at 4.3 ms mean), the frozen
+pre-deploy shapes already recorded, and the hourly orphan sweep (786 calls, 8
+since the last survey). Dead-tuple ratios: `module_executions` 18.7 %,
+`execution_events` 14.7 % (19 044 dead against a default autovacuum threshold
+of ~26 000 — below it, never vacuumed since stats reset), `workflow_executions`
+12.9 %; default autovacuum tuning is adequate at this size. Security counters
+all at 0 since boot; alerts fired in 24 h: the two drill alerts and one
+`LowCacheHitRate` post-restart pending. Pre-existing test-target `rustc`
+warnings (`prov_days` unused in `talos-memory-ranking`, an unused `TaskExit` in
+`talos-integration-helpers`' renewal test, two never-read fields in
+`controller/tests/execution_retention_tests.rs`) are outside CI's `--no-deps`
+clippy and were left for a test-target pass.
+
+**The CLAUDE.md count sentence this package moved (its package-AN form), kept verbatim for `check-engineering-log.py`'s losslessness leg:**
+
+- **`make lint` enforces structural rules** via `scripts/lint-structural.sh`. 90 checks today (the authoritative, inline-documented list lives in the script; `bash scripts/lint-structural.sh --count` prints the live number, and check 54 fails the lint if this sentence's count goes stale), each tied to a specific past regression so it catches at PR-time the class of bug that survives `cargo check` cleanly but breaks at CI or request time:
