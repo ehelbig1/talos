@@ -10,6 +10,14 @@
 //! reject (security review 2026-07-19, P4). Both processes now call this
 //! one function, so the identity-pinning strength cannot drift.
 //!
+//! The POLICY enum had the same history one level up (2026-09-13, package
+//! AR): `SigstorePolicy` / `from_env_str` / `raw_env_is_explicit` existed as
+//! two byte-identical copies — `talos-worker-runtime::module_fetcher` and
+//! `talos-registry::sync` — each carrying a comment promising to "mirror"
+//! the other. Identical today; nothing but a reader kept them so. Both now
+//! import [`SigstorePolicy`] from here, and the source pins in this crate's
+//! tests fail if either grows a private copy again.
+//!
 //! Pure, dependency-light (regex only) so it drops into both the
 //! WASM-host worker and the controller without dragging in a web
 //! framework.
@@ -222,6 +230,77 @@ pub fn validate_sigstore_identity_regexp(regexp: &str) -> Result<(), SigstoreReg
     Ok(())
 }
 
+/// The operator's `TALOS_SIGSTORE_REQUIRED` env var name — ONE spelling for
+/// the worker's boot gate and the controller's OCI-sync gate.
+pub const SIGSTORE_POLICY_ENV: &str = "TALOS_SIGSTORE_REQUIRED";
+
+/// How strictly OCI artifacts (worker: WASM layers; controller: the catalog
+/// `_index` and each template) must be Sigstore-verified before use.
+///
+/// * `Disabled` — no verification (dev). The SILENT default for an
+///   unset/unrecognised value; both production gates refuse that state
+///   unless the operator spelled `disabled` (or an alias) explicitly.
+/// * `Audit` — verify, log, continue (migration window).
+/// * `Required` — verify, refuse on failure (production).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SigstorePolicy {
+    Disabled,
+    Audit,
+    Required,
+}
+
+impl SigstorePolicy {
+    /// Read and parse [`SIGSTORE_POLICY_ENV`]. Unset/empty/unrecognised →
+    /// `Disabled`; see [`SigstorePolicy::raw_env_is_explicit`] for the
+    /// production gates' explicitness test over the same raw string.
+    pub fn from_env() -> Self {
+        Self::from_env_str(&std::env::var(SIGSTORE_POLICY_ENV).unwrap_or_default())
+    }
+
+    /// Pure parse. Recognised values (case-insensitive, trimmed):
+    ///   * `required` / `true` / `1`                → `Required`
+    ///   * `audit` / `warn`                         → `Audit`
+    ///   * `disabled` / `off` / `0` / `false` / `no` → `Disabled` (explicit opt-out)
+    ///   * anything else, including empty           → `Disabled` (silent default)
+    ///
+    /// The silent-default arm is fail-SAFE in the parser (an unknown value
+    /// never upgrades to a stricter policy) and POLICED by the production
+    /// gates, which refuse to run unless [`raw_env_is_explicit`](Self::raw_env_is_explicit)
+    /// holds — the 2026-05-22 wasm-security review's MEDIUM-4: an operator
+    /// who forgot the variable got Sigstore silently disabled with no
+    /// startup warning.
+    #[must_use]
+    pub fn from_env_str(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "true" | "1" | "required" => Self::Required,
+            "audit" | "warn" => Self::Audit,
+            "disabled" | "off" | "0" | "false" | "no" => Self::Disabled,
+            _ => Self::Disabled,
+        }
+    }
+
+    /// Was the operator EXPLICIT? Distinguishes "set `=disabled`, accepting
+    /// the risk" from "forgot to set anything" — the production gates key on
+    /// this, not on the parsed value. Every spelling `from_env_str`
+    /// recognises counts as explicit; nothing else does.
+    #[must_use]
+    pub fn raw_env_is_explicit(raw: &str) -> bool {
+        matches!(
+            raw.trim().to_ascii_lowercase().as_str(),
+            "true"
+                | "1"
+                | "required"
+                | "audit"
+                | "warn"
+                | "disabled"
+                | "off"
+                | "0"
+                | "false"
+                | "no"
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,5 +410,136 @@ mod tests {
             "{:?}",
             validate_sigstore_identity_regexp(pattern)
         );
+    }
+
+    // ---- SigstorePolicy (moved here from both consumers, 2026-09-13) ----
+
+    #[test]
+    fn sigstore_policy_parses_every_recognised_spelling() {
+        for v in [
+            "required",
+            "true",
+            "1",
+            "REQUIRED",
+            "Required",
+            " REQUIRED ",
+        ] {
+            assert_eq!(
+                SigstorePolicy::from_env_str(v),
+                SigstorePolicy::Required,
+                "{v:?}"
+            );
+        }
+        for v in ["audit", "warn", "  audit  "] {
+            assert_eq!(
+                SigstorePolicy::from_env_str(v),
+                SigstorePolicy::Audit,
+                "{v:?}"
+            );
+        }
+        for v in ["disabled", "off", "0", "false", "no", "\tDISABLED\n"] {
+            assert_eq!(
+                SigstorePolicy::from_env_str(v),
+                SigstorePolicy::Disabled,
+                "{v:?}"
+            );
+        }
+        // Silent default: never upgrades.
+        for v in ["", "   ", "typo", "enabled", "maybe", "true-ish"] {
+            assert_eq!(
+                SigstorePolicy::from_env_str(v),
+                SigstorePolicy::Disabled,
+                "{v:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sigstore_raw_env_is_explicit_distinguishes_silent_from_chosen() {
+        for v in [
+            "required",
+            "true",
+            "1",
+            "audit",
+            "warn",
+            "disabled",
+            "off",
+            "0",
+            "false",
+            "no",
+            "  REQUIRED  ",
+        ] {
+            assert!(
+                SigstorePolicy::raw_env_is_explicit(v),
+                "`{v}` must be explicit"
+            );
+        }
+        for v in [
+            "",
+            "  ",
+            "\t\n",
+            "yes-please",
+            "true-ish",
+            "maybe",
+            "off-ish",
+            "enabled",
+        ] {
+            assert!(
+                !SigstorePolicy::raw_env_is_explicit(v),
+                "`{v}` must NOT be explicit"
+            );
+        }
+    }
+
+    /// Explicit ⇔ recognised: every string the parser classifies by a named
+    /// arm is explicit, and the silent-default arm is exactly the
+    /// not-explicit set — so the two functions cannot drift apart.
+    #[test]
+    fn explicit_is_exactly_the_recognised_set() {
+        for v in [
+            "required", "true", "1", "audit", "warn", "disabled", "off", "0", "false", "no",
+        ] {
+            assert!(SigstorePolicy::raw_env_is_explicit(v));
+        }
+        for v in ["", "typo", "enabled", "yes", "on"] {
+            // `yes` / `on` are deliberately NOT sigstore spellings: this is a
+            // three-valued policy, not `talos_config::bool_env`'s vocabulary.
+            assert!(!SigstorePolicy::raw_env_is_explicit(v));
+            assert_eq!(SigstorePolicy::from_env_str(v), SigstorePolicy::Disabled);
+        }
+    }
+
+    /// SOURCE PIN, stated as textual: neither consumer may grow its own
+    /// `SigstorePolicy` again. Both copies were byte-identical when they were
+    /// folded in here; a third would be the same class one step further.
+    #[test]
+    fn neither_consumer_carries_a_private_policy_enum() {
+        for (name, src) in [
+            (
+                "talos-worker-runtime",
+                include_str!("../../talos-worker-runtime/src/module_fetcher.rs"),
+            ),
+            (
+                "talos-registry",
+                include_str!("../../talos-registry/src/sync.rs"),
+            ),
+        ] {
+            assert!(
+                !src.contains("enum SigstorePolicy"),
+                "{name}: private SigstorePolicy enum"
+            );
+            assert!(
+                !src.contains("fn from_env_str"),
+                "{name}: private from_env_str"
+            );
+            assert!(
+                !src.contains("fn raw_env_is_explicit"),
+                "{name}: private raw_env_is_explicit"
+            );
+            assert!(
+                src.contains("talos_sigstore_policy::SigstorePolicy"),
+                "{name}: does not import the shared enum"
+            );
+        }
     }
 }

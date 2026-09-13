@@ -109,79 +109,13 @@ pub fn check_manifest_layer_sizes(layer_sizes: &[i64], cap: u64) -> ManifestSize
 }
 
 /// Sigstore enforcement modes for OCI artifact signature verification.
-/// Resolved once at process startup from `TALOS_SIGSTORE_REQUIRED`.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum SigstorePolicy {
-    /// Don't verify signatures. Right for dev/local where the worker can't
-    /// reach Fulcio/Rekor and templates aren't signed. The default.
-    Disabled,
-    /// Try to verify; on failure log a warning but continue. Right for the
-    /// migration window when some templates are signed and some aren't.
-    Audit,
-    /// Verify is mandatory; failure => refuse to execute. Production setting.
-    Required,
-}
-
-impl SigstorePolicy {
-    /// Parse the operator's `TALOS_SIGSTORE_REQUIRED` env var into a policy.
-    ///
-    /// Recognised values:
-    ///   * `required` / `true` / `1` → `Required`
-    ///   * `audit` / `warn`          → `Audit`
-    ///   * `disabled` / `off` / `0`  → `Disabled` (explicit opt-out)
-    ///   * unset / empty / anything else → `Disabled` (silent default)
-    ///
-    /// **The silent-default branch is policed by [`enforce_production_policy_explicit`]**.
-    /// In production we refuse to boot unless the operator has explicitly
-    /// chosen one of the recognised values — the silent fallthrough is a
-    /// deployment trap we caught in the 2026-05-22 wasm-security review
-    /// (MEDIUM-4): an operator who forgot to set the env var got Sigstore
-    /// silently disabled with no startup warning, defeating the entire
-    /// signature-verification chain. The pure parse here stays minimal and
-    /// fail-safe (unknown → Disabled, never up-grading to a stricter policy);
-    /// the production-gate lives at the boot path so dev/test environments
-    /// keep the lenient default.
-    pub fn from_env() -> Self {
-        Self::from_env_str(&std::env::var("TALOS_SIGSTORE_REQUIRED").unwrap_or_default())
-    }
-
-    /// Pure parse helper. Split out so unit tests don't touch process env.
-    fn from_env_str(raw: &str) -> Self {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "true" | "1" | "required" => Self::Required,
-            "audit" | "warn" => Self::Audit,
-            // Explicit opt-out aliases. Operators who *want* Disabled in
-            // production set one of these so the production gate below
-            // sees an explicit choice instead of silent emptiness.
-            "disabled" | "off" | "0" | "false" | "no" => Self::Disabled,
-            // Anything else (including empty) → Disabled, but the
-            // production gate refuses to boot in this state. Tests on
-            // dev hosts continue to see the silent default.
-            _ => Self::Disabled,
-        }
-    }
-
-    /// Was the operator explicit about the Sigstore policy?
-    ///
-    /// Distinguishes "operator set `TALOS_SIGSTORE_REQUIRED=disabled`,
-    /// accepting the risk" from "operator forgot to set anything". The
-    /// production gate refuses to boot in the second state.
-    fn raw_env_is_explicit(raw: &str) -> bool {
-        matches!(
-            raw.trim().to_ascii_lowercase().as_str(),
-            "true"
-                | "1"
-                | "required"
-                | "audit"
-                | "warn"
-                | "disabled"
-                | "off"
-                | "0"
-                | "false"
-                | "no"
-        )
-    }
-}
+/// The Sigstore verification policy, ONE home: `talos_sigstore_policy`
+/// (shared with the controller's OCI catalog sync — the two copies this file
+/// and `talos-registry::sync` carried were folded there 2026-09-13). Resolved
+/// once at process startup from `TALOS_SIGSTORE_REQUIRED` via
+/// [`SigstorePolicy::from_env`]; the production gate below refuses to boot
+/// on the silent default.
+pub use talos_sigstore_policy::SigstorePolicy;
 
 /// Production-only gate: refuse to boot when the operator hasn't made an
 /// explicit Sigstore choice.
@@ -1539,86 +1473,8 @@ mod oci_layer_tests {
     // parse contract and the explicit-vs-silent distinction; the
     // production-gate function itself is tested indirectly via the
     // `raw_env_is_explicit` predicate (the gate just composes parser
-    // + predicate + production flag).
-
-    #[test]
-    fn sigstore_policy_parses_explicit_disabled_aliases() {
-        // Operators wanting Disabled in production set one of these
-        // so the production-gate sees an explicit choice.
-        for v in ["disabled", "off", "0", "false", "no"] {
-            assert_eq!(
-                SigstorePolicy::from_env_str(v),
-                SigstorePolicy::Disabled,
-                "value `{v}` should map to Disabled"
-            );
-        }
-    }
-
-    #[test]
-    fn sigstore_policy_parser_handles_case_and_whitespace() {
-        // Operators copy values out of secret managers / CI logs which
-        // sometimes add whitespace or uppercase. The pure parser
-        // normalises both. Pre-fix, `Required` was case-sensitive and
-        // " REQUIRED" silently mapped to Disabled.
-        assert_eq!(
-            SigstorePolicy::from_env_str("REQUIRED"),
-            SigstorePolicy::Required
-        );
-        assert_eq!(
-            SigstorePolicy::from_env_str("Required"),
-            SigstorePolicy::Required
-        );
-        assert_eq!(
-            SigstorePolicy::from_env_str("  audit  "),
-            SigstorePolicy::Audit
-        );
-        assert_eq!(
-            SigstorePolicy::from_env_str("\tDISABLED\n"),
-            SigstorePolicy::Disabled
-        );
-    }
-
-    #[test]
-    fn sigstore_raw_env_is_explicit_distinguishes_silent_from_chosen() {
-        // The production gate fires ONLY when the operator's choice
-        // is ambiguous (empty / unrecognised). Every recognised value —
-        // including the Disabled aliases — counts as explicit.
-        for v in [
-            "required",
-            "true",
-            "1",
-            "audit",
-            "warn",
-            "disabled",
-            "off",
-            "0",
-            "false",
-            "no",
-            "  REQUIRED  ", // case + whitespace normalisation
-        ] {
-            assert!(
-                SigstorePolicy::raw_env_is_explicit(v),
-                "`{v}` must be considered explicit"
-            );
-        }
-
-        // The silent-default footgun cases the production-gate
-        // protects against.
-        for v in [
-            "",
-            "  ",
-            "\t\n",
-            "yes-please",
-            "true-ish",
-            "maybe",
-            "off-ish",
-        ] {
-            assert!(
-                !SigstorePolicy::raw_env_is_explicit(v),
-                "`{v}` must be considered NOT explicit (production-gate target)"
-            );
-        }
-    }
+    // + predicate + production flag). The parser + predicate tests moved
+    // to `talos-sigstore-policy` with the enum (2026-09-13).
 
     #[test]
     fn sigstore_production_gate_admits_when_not_in_production() {

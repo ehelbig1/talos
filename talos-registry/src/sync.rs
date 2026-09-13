@@ -45,59 +45,15 @@ use tokio::time::{sleep, Duration};
 // still be sigstore-verified at worker execution time, but the catalog
 // itself (and the discovery surface it controls) was unauthenticated.
 //
-// We mirror the worker's policy enum (`Disabled` / `Audit` / `Required`)
-// so the operator-facing env vars are identical:
+// The policy enum is `talos_sigstore_policy::SigstorePolicy`, the SAME type
+// the worker resolves at boot (this file carried a byte-identical private
+// copy until 2026-09-13), so the operator-facing env vars are identical:
 //   * TALOS_SIGSTORE_REQUIRED  (true | audit | <unset>)
 //   * TALOS_SIGSTORE_IDENTITY_REGEXP
 //   * TALOS_SIGSTORE_OIDC_ISSUER (default: GitHub Actions OIDC)
 // ───────────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum SigstorePolicy {
-    Disabled,
-    Audit,
-    Required,
-}
-
-impl SigstorePolicy {
-    fn from_env() -> Self {
-        Self::from_env_str(&env::var("TALOS_SIGSTORE_REQUIRED").unwrap_or_default())
-    }
-
-    /// Pure parse helper. Mirrors the worker's `SigstorePolicy::from_env_str`
-    /// (worker/src/main.rs) so the controller and worker classify the same
-    /// `TALOS_SIGSTORE_REQUIRED` string identically — including the explicit
-    /// `disabled` opt-out aliases the production gate below keys on.
-    fn from_env_str(raw: &str) -> Self {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "true" | "1" | "required" => Self::Required,
-            "audit" | "warn" => Self::Audit,
-            "disabled" | "off" | "0" | "false" | "no" => Self::Disabled,
-            // Anything else (including empty) → Disabled, but the production
-            // gate in `start_registry_sync_loop` refuses to sync in this state.
-            _ => Self::Disabled,
-        }
-    }
-
-    /// Was the operator EXPLICIT about the Sigstore policy? Distinguishes
-    /// "operator set `=disabled`, accepting the risk" from "operator forgot to
-    /// set anything". Mirrors the worker's `raw_env_is_explicit`.
-    fn raw_env_is_explicit(raw: &str) -> bool {
-        matches!(
-            raw.trim().to_ascii_lowercase().as_str(),
-            "true"
-                | "1"
-                | "required"
-                | "audit"
-                | "warn"
-                | "disabled"
-                | "off"
-                | "0"
-                | "false"
-                | "no"
-        )
-    }
-}
+use talos_sigstore_policy::SigstorePolicy;
 
 /// Process-wide pinned absolute path to the `cosign` binary on the
 /// controller side. Mirrors the worker's pin (worker/src/main.rs) so
@@ -990,46 +946,6 @@ mod tests {
         assert_eq!(strip_scheme("https://ghcr.io"), "ghcr.io");
         assert_eq!(strip_scheme("http://registry:5000/"), "registry:5000");
         assert_eq!(strip_scheme("ghcr.io"), "ghcr.io");
-    }
-
-    #[test]
-    fn sigstore_policy_parse_and_explicit_match_worker() {
-        // Parity with the worker's SigstorePolicy classification.
-        assert_eq!(
-            SigstorePolicy::from_env_str("required"),
-            SigstorePolicy::Required
-        );
-        assert_eq!(
-            SigstorePolicy::from_env_str(" REQUIRED "),
-            SigstorePolicy::Required
-        );
-        assert_eq!(SigstorePolicy::from_env_str("audit"), SigstorePolicy::Audit);
-        assert_eq!(
-            SigstorePolicy::from_env_str("disabled"),
-            SigstorePolicy::Disabled
-        );
-        assert_eq!(SigstorePolicy::from_env_str(""), SigstorePolicy::Disabled);
-        assert_eq!(
-            SigstorePolicy::from_env_str("typo"),
-            SigstorePolicy::Disabled
-        );
-
-        // The production gate keys on explicitness: an explicit `disabled` is
-        // accepted, but an empty / unrecognized value is NOT (gate refuses sync).
-        for explicit in [
-            "required", "audit", "disabled", "off", "0", "false", "no", " TRUE ",
-        ] {
-            assert!(
-                SigstorePolicy::raw_env_is_explicit(explicit),
-                "{explicit:?} must count as an explicit operator choice"
-            );
-        }
-        for ambiguous in ["", "   ", "typo", "enabled", "maybe"] {
-            assert!(
-                !SigstorePolicy::raw_env_is_explicit(ambiguous),
-                "{ambiguous:?} must NOT count as explicit (production gate refuses sync)"
-            );
-        }
     }
 
     #[test]
