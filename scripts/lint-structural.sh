@@ -26,11 +26,14 @@
 #   2. Top-level controller routes vs nginx ConfigMap proxies. Adding a
 #      new top-level path on the controller is a silent prod-only
 #      failure if the chart's nginx ConfigMap doesn't learn about it
-#      (`/auth/csrf` and `/mcp` both bit us in 2026-04). Information-only
-#      check (warns, doesn't fail the build) — nginx prefix-matches and
-#      a bunch of routes are intentionally not exposed (probes, scrape).
-#      Add `// no-nginx-route: <reason>` to the `.route()` line to silence
-#      a single intentional-internal route.
+#      (`/auth/csrf` and `/mcp` both bit us in 2026-04). FAILS the build
+#      since 2026-09-13 (package AQ) — it was information-only from the
+#      day it was written, and a false positive from a TEST router sat in
+#      its output on every run for five weeks unread. Test modules are
+#      stripped from the haystack. Routes intentionally not exposed
+#      (probes, scrape) take `// no-nginx-route: <reason>` on the
+#      `.route()` line; a location with no upstream takes
+#      `# no-controller-route` on or within 3 lines above it.
 
 set -euo pipefail
 
@@ -163,7 +166,15 @@ fi
 echo
 
 # ── 2. Top-level controller routes vs nginx locations (chart + image) ──
-bold "▶ check 2: top-level controller routes vs nginx locations (info-only)"
+bold "▶ check 2: top-level controller routes vs nginx locations"
+# GRADUATED from info-only to FAILING 2026-09-13 (package AQ). Every leg
+# below reported ⚠ + exit 0 since the check was written, and the measurement
+# that closed that: a `#[cfg(test)] mod` in bootstrap/router.rs mounted
+# `/internal/worker-liveness` on a TEST router (#631, 2026-08-05) with no
+# marker, so the check printed "/internal missing" on EVERY local and CI run
+# for five weeks and nobody acted — a warning is not a gate. With test
+# modules stripped from the haystack (below) all three legs sit at ZERO on
+# this tree, which is the bar checks 6/50/52/55 graduated at.
 
 ROUTES_FILE="$(mktemp)"
 NGINX_FILE="$(mktemp)"
@@ -181,7 +192,15 @@ trap 'rm -f "$ROUTES_FILE" "$NGINX_FILE"' EXIT
 # /approval-actions were reported as nginx EXTRAS on every run while being
 # real controller routes). Join `.route(`/`.nest(` with the following line
 # first so the path literal lands on the same line as the call.
-perl -0777 -pe 's/\.(route|nest)\(\s*\n\s*"/.$1("/g' controller/src/main.rs controller/src/bootstrap/router.rs \
+# Test modules are NOT controller routes: a `#[cfg(test)] mod` at column 0
+# is dropped (the region ends at the first column-0 `}` — check 58's
+# conservative rule; a mis-detected end leaves test code IN the haystack,
+# i.e. a loud false positive, never a silent miss). Before this strip the
+# test router in bootstrap/router.rs that mounts `/internal/worker-liveness`
+# read as an unmarked production route.
+perl -0777 -pe 's/^#\[cfg\(test\)\][^\n]*\n(?:#\[[^\n]*\]\s*\n)*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*\{.*?\n\}\n?//msg' \
+        controller/src/main.rs controller/src/bootstrap/router.rs \
+    | perl -0777 -pe 's/\.(route|nest)\(\s*\n\s*"/.$1("/g' \
     | grep -nhE '\.(route|nest)\("/' \
     | grep -v 'no-nginx-route' \
     | grep -oE '\.(route|nest)\("/[^"]*"' \
@@ -302,6 +321,10 @@ fi
 
 if [ "$ROUTE_NGINX_ALIGNED" -eq 1 ]; then
     green "✓ controller routes ↔ nginx locations are aligned (chart ConfigMap + frontend/nginx.conf)"
+else
+    red "✗ controller routes and nginx locations disagree (see ⚠ above)"
+    yellow "  → opt-outs: // no-nginx-route on the .route() line; # no-controller-route on the location"
+    EXIT_CODE=1
 fi
 echo
 
