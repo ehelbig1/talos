@@ -59,10 +59,12 @@ use arc_swap::ArcSwap;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
+
+pub use talos_metrics::{JwkRefreshOutcome, PushIntegration, PushRefusalReason};
 
 /// Google's OIDC issuer. MUST match `iss` on valid Google push JWTs.
 pub const GOOGLE_ISSUER: &str = "https://accounts.google.com";
@@ -106,6 +108,48 @@ pub enum VerifyError {
     EmailNotVerified,
     #[error("could not fetch Google JWKs: {0}")]
     JwkFetchFailed(String),
+}
+
+impl VerifyError {
+    /// The `reason` label this refusal is counted under on
+    /// `talos_google_push_refusals_total`. Exhaustive, so a new variant
+    /// cannot ship uncounted.
+    #[must_use]
+    pub fn refusal_reason(&self) -> PushRefusalReason {
+        match self {
+            Self::MalformedHeader => PushRefusalReason::MalformedHeader,
+            Self::WrongAlgorithm => PushRefusalReason::WrongAlgorithm,
+            Self::MissingKid => PushRefusalReason::MissingKid,
+            Self::UnknownKey => PushRefusalReason::UnknownKey,
+            Self::Invalid(_) => PushRefusalReason::Invalid,
+            Self::WrongEmail => PushRefusalReason::WrongEmail,
+            Self::EmailNotVerified => PushRefusalReason::EmailNotVerified,
+            Self::JwkFetchFailed(_) => PushRefusalReason::JwkFetchFailed,
+        }
+    }
+}
+
+/// Count a push refusal that never reached the verifier (or that a caller
+/// logs itself). Metric only — the caller owns the log line.
+pub fn record_push_refusal(integration: PushIntegration, reason: PushRefusalReason) {
+    talos_metrics::record_google_push_refusal(integration, reason);
+}
+
+/// Count a push that arrived with no `Authorization: Bearer` header.
+pub fn record_missing_bearer(integration: PushIntegration) {
+    record_push_refusal(integration, PushRefusalReason::MissingBearer);
+}
+
+/// Whether one refusal's per-push log line is folded into the backoff
+/// window's summary instead of being written at WARN. Only the
+/// `UnknownKey` refusals produced INSIDE an open backoff window qualify:
+/// they are the consequence of the one fetch failure already logged at
+/// WARN, and on 2026-09-12 one such failure produced 92 of them in 60 s.
+/// Every other refusal, and an unknown key with NO backoff open (a rotation
+/// the fetch could not resolve), stays at WARN.
+#[must_use]
+pub fn refusal_log_is_folded(err: &VerifyError, in_backoff: bool) -> bool {
+    in_backoff && matches!(err, VerifyError::UnknownKey)
 }
 
 /// Typed claims extracted from a valid Google push JWT. The caller
@@ -187,6 +231,12 @@ pub struct GoogleOidcVerifier {
     /// regardless of whether cached keys are stale. Without this a
     /// sustained JWKs outage turns every push into a 5s timeout.
     backoff_until: AtomicI64,
+    /// `UnknownKey` refusals produced while `backoff_until` was in the
+    /// future. Swapped to 0 by the next fetch attempt (the window's close)
+    /// and reported ONCE there, so a backoff window costs one summary line
+    /// rather than one WARN per refused push. Every refusal is still
+    /// counted individually on `talos_google_push_refusals_total`.
+    backoff_refusals: AtomicU64,
     /// Single-flight guard: only one task fetches Google's JWKs at a
     /// time, even under a flood of concurrent pushes with unknown kids.
     refresh_lock: Mutex<()>,
@@ -208,6 +258,7 @@ impl GoogleOidcVerifier {
             keys: ArcSwap::new(Arc::new(HashMap::new())),
             last_refreshed: AtomicI64::new(0),
             backoff_until: AtomicI64::new(0),
+            backoff_refusals: AtomicU64::new(0),
             refresh_lock: Mutex::new(()),
             // MCP-534: defence-in-depth even though this client only
             // fetches Google's public JWK set (no Bearer token to leak).
@@ -235,6 +286,7 @@ impl GoogleOidcVerifier {
             keys: ArcSwap::new(Arc::new(keys)),
             last_refreshed: AtomicI64::new(i64::MAX),
             backoff_until: AtomicI64::new(0),
+            backoff_refusals: AtomicU64::new(0),
             refresh_lock: Mutex::new(()),
             http: reqwest::Client::new(),
         }
@@ -266,7 +318,15 @@ impl GoogleOidcVerifier {
             Some(k) => k,
             None => {
                 self.refresh_if_stale_or_unknown(&kid).await?;
-                self.find_key(&kid).ok_or(VerifyError::UnknownKey)?
+                match self.find_key(&kid) {
+                    Some(k) => k,
+                    None => {
+                        if self.in_backoff() {
+                            self.backoff_refusals.fetch_add(1, Ordering::Relaxed);
+                        }
+                        return Err(VerifyError::UnknownKey);
+                    }
+                }
             }
         };
 
@@ -284,6 +344,43 @@ impl GoogleOidcVerifier {
 
     fn find_key(&self, kid: &str) -> Option<DecodingKey> {
         self.keys.load().get(kid).cloned()
+    }
+
+    /// Whether a JWK fetch failure has closed refreshes for now.
+    #[must_use]
+    pub fn in_backoff(&self) -> bool {
+        chrono::Utc::now().timestamp() < self.backoff_until.load(Ordering::Relaxed)
+    }
+
+    /// `UnknownKey` refusals produced inside the currently open backoff
+    /// window (0 when none is open or none were refused).
+    #[must_use]
+    pub fn refused_in_backoff_window(&self) -> u64 {
+        self.backoff_refusals.load(Ordering::Relaxed)
+    }
+
+    /// Count AND log one refused push. The ONE place a push handler reports
+    /// a `VerifyError`: every refusal moves
+    /// `talos_google_push_refusals_total{integration,reason}`; an
+    /// `UnknownKey` inside an open backoff window is logged at DEBUG with
+    /// the running count (the window's close writes the WARN summary), every
+    /// other refusal at WARN.
+    pub fn report_refusal(&self, integration: PushIntegration, err: &VerifyError) {
+        record_push_refusal(integration, err.refusal_reason());
+        if refusal_log_is_folded(err, self.in_backoff()) {
+            tracing::debug!(
+                integration = integration.as_str(),
+                error = %err,
+                refused_in_window = self.refused_in_backoff_window(),
+                "google push: JWT refused during JWK backoff (summarised when the window closes)"
+            );
+        } else {
+            tracing::warn!(
+                integration = integration.as_str(),
+                error = %err,
+                "google push: JWT verification failed"
+            );
+        }
     }
 
     /// Refresh JWKs if either (a) the given `kid` isn't cached, or
@@ -374,11 +471,24 @@ impl GoogleOidcVerifier {
         .await;
 
         let now = chrono::Utc::now().timestamp();
+        // A fetch attempt is only reachable once any earlier backoff has
+        // expired, so it is the CLOSE of that window: take the refusals it
+        // accumulated and report them once, whatever this attempt's outcome.
+        let refused_in_previous_window = self.backoff_refusals.swap(0, Ordering::Relaxed);
         match &result {
             Ok(_) => {
                 self.last_refreshed.store(now, Ordering::Relaxed);
                 // Any earlier backoff is implicitly cleared — a
                 // time in the past is !< now.
+                talos_metrics::record_google_jwk_refresh(JwkRefreshOutcome::Ok);
+                if refused_in_previous_window > 0 {
+                    tracing::warn!(
+                        refused_in_previous_window,
+                        backoff_secs = JWK_REFRESH_BACKOFF_SECS,
+                        "JWK refresh recovered; pushes carrying an unknown key were refused \
+                         (401, Pub/Sub retries) during the backoff window that just closed"
+                    );
+                }
             }
             Err(e) => {
                 // Stamp the explicit backoff deadline. The staleness
@@ -387,10 +497,13 @@ impl GoogleOidcVerifier {
                 // this marker every push would still hammer Google.
                 self.backoff_until
                     .store(now + JWK_REFRESH_BACKOFF_SECS, Ordering::Relaxed);
+                talos_metrics::record_google_jwk_refresh(JwkRefreshOutcome::Failed);
                 tracing::warn!(
                     error = %e,
                     backoff_secs = JWK_REFRESH_BACKOFF_SECS,
-                    "JWK refresh failed; backing off"
+                    refused_in_previous_window,
+                    "JWK refresh failed; backing off — unknown-key pushes are refused (401) \
+                     until the window closes and are summarised then"
                 );
             }
         }
@@ -611,6 +724,122 @@ mod tests {
             matches!(err, VerifyError::UnknownKey),
             "expected UnknownKey during backoff, got: {err:?}"
         );
+    }
+
+    /// Every `VerifyError` arm has its own `reason` label and the mapping
+    /// moves exactly that series on an explicit registry — the metric half
+    /// of `report_refusal`, without racing `set_global`.
+    #[test]
+    fn every_verify_error_counts_under_its_own_reason() {
+        let errs = [
+            VerifyError::MalformedHeader,
+            VerifyError::WrongAlgorithm,
+            VerifyError::MissingKid,
+            VerifyError::UnknownKey,
+            VerifyError::Invalid("x".into()),
+            VerifyError::WrongEmail,
+            VerifyError::EmailNotVerified,
+            VerifyError::JwkFetchFailed("x".into()),
+        ];
+        let mut seen = std::collections::HashSet::new();
+        let m = talos_metrics::TalosMetrics::new().unwrap();
+        for e in &errs {
+            let r = e.refusal_reason();
+            assert!(
+                seen.insert(r.as_str()),
+                "duplicate reason label {}",
+                r.as_str()
+            );
+            talos_metrics::record_google_push_refusal_on(&m, PushIntegration::Gcp, r);
+        }
+        // Eight verifier arms + missing_bearer = the closed set of nine.
+        assert_eq!(seen.len() + 1, PushRefusalReason::ALL.len());
+        let out = m.render_prometheus().unwrap();
+        for e in &errs {
+            assert!(out.contains(&format!(
+                "talos_google_push_refusals_total{{integration=\"gcp\",reason=\"{}\"}} 1",
+                e.refusal_reason().as_str()
+            )));
+        }
+    }
+
+    /// Inside an open backoff window an unknown kid is COUNTED on the
+    /// verifier (the per-window summary's number) and its log line is
+    /// folded; a refusal for any other reason in the same window — and an
+    /// unknown key with no window open — is not folded and does not count.
+    #[tokio::test]
+    async fn unknown_key_refusals_inside_backoff_are_counted_and_folded() {
+        let (enc, dec, kid) = keypair();
+        let v = make_verifier(dec, &kid);
+        v.backoff_until.store(now() + 60, Ordering::Relaxed);
+        assert!(v.in_backoff());
+
+        // Three pushes with a rotated kid during the window.
+        for _ in 0..3 {
+            let token = sign(&enc, "rotated-kid", json!({"aud": TEST_AUDIENCE}));
+            let err = v
+                .verify_signed(&token, TEST_AUDIENCE)
+                .await
+                .expect_err("unknown kid");
+            assert!(matches!(err, VerifyError::UnknownKey));
+            assert!(refusal_log_is_folded(&err, v.in_backoff()));
+        }
+        assert_eq!(v.refused_in_backoff_window(), 3);
+
+        // Control: a KNOWN kid with a bad audience in the same window is a
+        // real refusal — not folded, not counted toward the window.
+        let token = sign(
+            &enc,
+            &kid,
+            json!({
+                "iss": GOOGLE_ISSUER, "aud": "https://elsewhere", "exp": now() + 300, "iat": now(),
+                "email": TEST_SA, "email_verified": true,
+            }),
+        );
+        let err = v
+            .verify_signed(&token, TEST_AUDIENCE)
+            .await
+            .expect_err("wrong aud");
+        assert!(matches!(err, VerifyError::Invalid(_)));
+        assert!(!refusal_log_is_folded(&err, v.in_backoff()));
+        assert_eq!(v.refused_in_backoff_window(), 3);
+
+        // Control: the same UnknownKey with NO window open stays at WARN.
+        assert!(!refusal_log_is_folded(&VerifyError::UnknownKey, false));
+        // report_refusal must not panic without a global registry.
+        v.report_refusal(PushIntegration::Gmail, &VerifyError::UnknownKey);
+    }
+
+    /// SOURCE PIN, stated as textual: both push handlers must report a
+    /// refusal through the verifier (count + folded log) and count a missing
+    /// bearer, and neither may carry its own per-push WARN again. A guard at
+    /// the primitive cannot see a call site (checks 74b/79b's limit); this is
+    /// the cheap second copy.
+    #[test]
+    fn both_push_handlers_report_refusals_through_the_verifier() {
+        let gmail = include_str!("../../talos-gmail/src/handlers.rs");
+        let gcp = include_str!("../../talos-google-cloud/src/handlers.rs");
+        for (name, src, integration) in [
+            ("gmail", gmail, "PushIntegration::Gmail"),
+            ("gcp", gcp, "PushIntegration::Gcp"),
+        ] {
+            assert!(
+                src.contains(".report_refusal("),
+                "{name}: no report_refusal call"
+            );
+            assert!(
+                src.contains(&format!("record_missing_bearer(\n{}", ""))
+                    || src.contains("record_missing_bearer("),
+                "{name}: missing-bearer refusal not counted"
+            );
+            assert!(src.contains(integration), "{name}: wrong integration label");
+            assert!(
+                !src.contains("pubsub: JWT verification failed"),
+                "{name}: per-push WARN reinstated beside the verifier's reporting"
+            );
+        }
+        // GCP's service-account step is a refusal too, counted where it is logged.
+        assert!(gcp.contains("record_push_refusal(PushIntegration::Gcp, e.refusal_reason())"));
     }
 
     #[tokio::test]

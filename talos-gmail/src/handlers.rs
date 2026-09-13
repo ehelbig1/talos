@@ -715,15 +715,20 @@ pub async fn pubsub_push_handler(
     {
         Some(t) => t,
         None => {
+            talos_integration_helpers::google_jwt::record_missing_bearer(
+                talos_integration_helpers::google_jwt::PushIntegration::Gmail,
+            );
             tracing::warn!("gmail pubsub: missing Authorization bearer");
             return StatusCode::UNAUTHORIZED;
         }
     };
 
     // 2. Verify. This handles signature + claims + audience + issuer
-    //    in one shot; see pubsub_jwt.rs for the guarantees.
+    //    in one shot; see pubsub_jwt.rs for the guarantees. The verifier
+    //    owns the refusal's count + log line (one WARN per JWK backoff
+    //    window, not one per refused push — 2026-09-12).
     if let Err(e) = state.verifier.verify(token).await {
-        tracing::warn!(error = %e, "gmail pubsub: JWT verification failed");
+        state.verifier.report_refusal(&e);
         return StatusCode::UNAUTHORIZED;
     }
 

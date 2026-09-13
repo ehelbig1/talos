@@ -2567,6 +2567,60 @@ groups:
                occurrence costs a doubled dispatch — worth investigating even
                though nothing is failing.
 
+      # The shared GoogleOidcVerifier cannot fetch Google's JWK set. One
+      # failure opens a 60 s backoff during which every push carrying a key
+      # the cache does not hold is refused 401 (fail-closed — correct), so a
+      # SUSTAINED failure means every Gmail / GCP push with a rotated key is
+      # refused, Pub/Sub retries and eventually drops them, and the only
+      # trace used to be log volume: on 2026-09-12 one failure produced 94
+      # WARN lines and no series.
+      #
+      # THE THRESHOLD IS DERIVED, NOT GUESSED. A fetch runs only on an
+      # unknown kid or a stale (1 h) cache, and the backoff caps failures at
+      # one per minute per controller, so `>= 5 in 15m` is at least five
+      # minutes of continuous failure WITH live push traffic. A single blip
+      # (1 failure, the 2026-09-12 shape) does not fire; the hourly TTL
+      # refresh failing once does not fire; a quiet fleet — no pushes, no
+      # fetches — cannot fire, and there is nothing to refuse there. No
+      # absent() arm: the series is pre-seeded at 0 in talos-metrics.
+      #
+      # Deliberately NOT alerted: `talos_google_push_refusals_total` itself.
+      # A refusal is the control working; the per-window summary WARN in the
+      # controller log says how many, and this alert says whether the
+      # control can recover.
+      - alert: TalosGoogleJwkRefreshFailing
+        expr: increase(talos_google_jwk_refresh_total{outcome="failed"}[15m]) >= 5
+        for: 0m
+        labels:
+          severity: warning
+          category: integrations
+        annotations:
+          summary: "Google JWK fetches keep failing — every rotated-key push is being refused"
+          description: |
+            The controller has failed to fetch Google's OIDC signing keys
+            {{ $value | humanize }} times in the last 15 minutes. Each
+            failure opens a 60 s backoff during which every Gmail / GCP
+            Pub/Sub push whose key is not already cached is refused with 401
+            (talos_google_push_refusals_total{reason="unknown_key"}); Pub/Sub
+            retries those and drops them after its retention window.
+
+            Pushes signed with a key the cache already holds still verify,
+            so the effect is partial until Google rotates keys (roughly
+            daily) — after which it is total.
+          action: |
+            1. Controller log: `JWK refresh failed; backing off` carries the
+               HTTP / transport error from https://www.googleapis.com/oauth2/v3/certs;
+               `refused_in_previous_window` on that line and on the
+               `JWK refresh recovered` line count the affected pushes.
+            2. Egress: the fetch goes through the hardened outbound client
+               (5 s timeout, 2 s connect). A NetworkPolicy or proxy change
+               that blocks googleapis.com from the controller looks exactly
+               like this.
+            3. Nothing is lost inside Pub/Sub's retention; once the fetch
+               succeeds the next retry of each push verifies. Watch
+               `talos_google_push_refusals_total{reason="unknown_key"}` stop
+               climbing.
+
   # ────────────────────────────────────────────────────────────────────
   - name: talos.vault
     interval: 30s

@@ -1067,7 +1067,6 @@ mod tests {
 
     // ---- The consolidated population note --------------------------------
 
-    #[test]
     // ── Coverage ──────────────────────────────────────────────────────────
     //
     // The failure these guard is not "the arithmetic is wrong" — it is
