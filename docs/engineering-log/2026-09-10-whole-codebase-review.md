@@ -3526,3 +3526,60 @@ is the documented answer. And it proves the location SETS agree, never that a
 **The CLAUDE.md check-2 line this package extended, kept verbatim for `check-engineering-log.py`'s losslessness leg:**
 
   2. bidirectional `controller/src/main.rs` route ↔ `deploy/helm/talos/templates/frontend/configmap.yaml` location alignment (opt-outs: `// no-nginx-route`, `# no-controller-route`)
+
+### Package AR (2026-09-13) — two byte-identical copies of a security policy
+
+**Recorded after AN, opened now.** The one-boolean-vocabulary sweep (package
+AN) measured every inline env parser and left one finding outside its class:
+the Sigstore policy parser is three-valued, not boolean, and it existed twice.
+`talos-worker-runtime/src/module_fetcher.rs` and `talos-registry/src/sync.rs`
+each defined `enum SigstorePolicy { Disabled, Audit, Required }`, a
+`from_env_str` over `TALOS_SIGSTORE_REQUIRED` and a `raw_env_is_explicit`
+predicate. The registry copy's doc comment read "Mirrors the worker's
+`SigstorePolicy::from_env_str` (worker/src/main.rs) so the controller and
+worker classify the same string identically", and its unit test
+`sigstore_policy_parse_and_explicit_match_worker` re-asserted the worker's
+spellings by hand. The worker's copy pointed back at the registry for the
+production gate. Compared arm by arm on 2026-09-13 the two were identical —
+and identical because someone had copied carefully, not because anything
+held them together.
+
+**Why it matters more than a duplicated helper.** Both production gates —
+`enforce_production_sigstore_policy_explicit` (the worker refuses to BOOT)
+and the registry's `start_registry_sync_loop` guard (the controller refuses
+to SYNC) — key on `raw_env_is_explicit`, and the whole point of that
+predicate (the 2026-05-22 review's MEDIUM-4) is that an operator who forgot
+the variable must not get verification silently disabled. Had one copy
+gained a spelling the other lacked, one process would have called an
+operator's value "explicit" and run while the other refused to start —
+two processes disagreeing about the same security setting, the shape
+package AN closed for booleans. And the crate that should have owned it
+already existed: `talos-sigstore-policy`'s header says it "exists because
+the check was duplicated" — the identity-regexp validator, folded in after
+the 2026-07-19 review found the controller trusting regexps the worker
+rejected. The policy enum sat one level above it with the same defect, in
+two crates that both already depended on the leaf.
+
+**The move.** `SigstorePolicy`, `from_env`, `from_env_str`,
+`raw_env_is_explicit` and a `SIGSTORE_POLICY_ENV` constant now live in
+`talos-sigstore-policy`; the runtime `pub use`s the enum (so
+`module_fetcher::SigstorePolicy`, the path `worker/src/main.rs` imports, is
+unchanged) and the registry `use`s it. Both production gates are untouched in
+behaviour — the same predicate, now the same function. The two consumers'
+parser tests are folded into the leaf as one suite, and one test is new:
+`explicit_is_exactly_the_recognised_set` pins that every string the parser
+classifies by a NAMED arm is explicit and the silent-default arm is exactly
+the not-explicit set, which is the one relationship two independent copies
+could have broken. It also records that `yes` and `on` are deliberately NOT
+Sigstore spellings — a three-valued policy is not `talos_config::bool_env`'s
+vocabulary, and widening it would make `=on` mean Disabled-but-explicit.
+`neither_consumer_carries_a_private_policy_enum` is a source pin over both
+consumer files (stated as textual); regrowing a private `from_env_str` in
+the registry fails it at the exact assertion.
+
+**Not done, stated.** No lint: the population was two and both are folded;
+check 90 is this class's boolean twin and correctly does not fire on a
+three-valued parser. The two production gates stay two functions with two
+consequences (boot refusal vs sync refusal) — deliberately, since they are
+different decisions about the same predicate, and the predicate is what was
+duplicated.
