@@ -10,6 +10,7 @@ use sqlx::PgPool;
 use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::Instant;
+use talos_metrics::McpAuthOutcome;
 use uuid::Uuid;
 
 /// The canonical set of recognized MCP agent capability strings.
@@ -525,40 +526,159 @@ fn refuse_unscoped_agent(agent: &AgentIdentity) -> Result<(), Response> {
         .into_response())
 }
 
-pub async fn mcp_auth_middleware(
-    State(db_pool): State<PgPool>,
-    ConnectInfo(addr): ConnectInfo<SocketAddr>,
-    mut req: Request<axum::body::Body>,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    // MCP-1097 (2026-05-16): rate-limit bucket key must reflect the
-    // REAL client IP, not the direct peer (the reverse proxy in any
-    // production deployment with a load balancer / ingress). Pre-fix
-    // `addr.ip().to_string()` collapsed every MCP agent into the
-    // proxy's single IP bucket — the 60-req/min default became a
-    // GLOBAL cap shared across all MCP traffic. A chatty client
-    // exhausted the bucket and every other agent got 429. Sibling
-    // pattern to `talos_rate_limit::extract_client_ip` which the main
-    // app rate-limiter already uses correctly (RFC 7239 right-to-left
-    // XFF walk skipping trusted-proxy entries). `mcp_router` is
-    // merged AFTER the outer rate-limit layers so the existing
-    // `Extension<Arc<TrustedProxies>>` doesn't propagate; build a
-    // process-local handle from `TRUSTED_PROXY_CIDRS` once via
-    // LazyLock so each request pays only a hashmap lookup.
+/// Why one `/mcp` request was refused before it reached a handler.
+///
+/// Every exit of [`authenticate_mcp_request`] that is not an admission is one
+/// of these, so the counter and the log line live at ONE place — the
+/// middleware's single `match` — and a new refusal branch cannot forget
+/// either: [`McpAuthRefusal::outcome`] is an exhaustive match. The CALLER
+/// sees the same reply for `MissingToken`, `UnknownToken` and `InvalidToken`
+/// (a bare 401 — a reason-split reply would be a token-existence oracle),
+/// exactly as before 2026-09-13; the split exists for the OPERATOR, who reads
+/// `talos_mcp_auth_total{outcome}` and the `mcp_auth_refused` audit line.
+/// Until then a guessed token produced NEITHER — the API-key and interactive
+/// login surfaces both counted and logged their refusals, and this one, the
+/// bearer MCP-1201 calls "long-lived … with no 2FA equivalent", did not.
+#[derive(Debug)]
+enum McpAuthRefusal {
+    /// The per-IP limiter (`MCP_AUTH_RATE_LIMIT` per `MCP_AUTH_RATE_WINDOW`)
+    /// or its defense-in-depth entry cap refused the request before any
+    /// credential was read.
+    RateLimited,
+    /// No `Authorization: Bearer` header and no `?token=` query parameter.
+    MissingToken,
+    /// No active `mcp_agents` row carries this token's SHA-256 lookup hash —
+    /// a guessed, mistyped or REVOKED token (`is_active = false` rows are
+    /// filtered by the lookup, so a revoked token is unknown by construction).
+    UnknownToken,
+    /// A row carries this token's lookup hash and its bcrypt hash does NOT
+    /// verify. Reachable only when the two stored hashes disagree about the
+    /// token — a corrupted or hand-edited row, not a guess (a guess never
+    /// matches the lookup hash in the first place).
+    InvalidToken,
+    /// Authenticated, but `mcp_agents.user_id IS NULL` — see
+    /// [`refuse_unscoped_agent`], which builds the JSON-RPC body and logs the
+    /// agent id.
+    UnscopedAgent(Response),
+    /// The middleware could not decide: the agent lookup failed, the bcrypt
+    /// worker panicked, or the stored hash is malformed. The status is the
+    /// one each site returned before (500 / 500 / 401) and the cause was
+    /// logged at that site.
+    Error(StatusCode),
+}
+
+impl McpAuthRefusal {
+    /// The label the counter records for this refusal — exhaustive, so a
+    /// new variant must choose one.
+    fn outcome(&self) -> McpAuthOutcome {
+        match self {
+            Self::RateLimited => McpAuthOutcome::RateLimited,
+            Self::MissingToken => McpAuthOutcome::MissingToken,
+            Self::UnknownToken => McpAuthOutcome::UnknownToken,
+            Self::InvalidToken => McpAuthOutcome::InvalidToken,
+            Self::UnscopedAgent(_) => McpAuthOutcome::UnscopedAgent,
+            Self::Error(_) => McpAuthOutcome::Error,
+        }
+    }
+
+    /// The reply the caller receives — what each site returned before the
+    /// refusals were funnelled through one type.
+    fn into_reply(self) -> Result<Response, StatusCode> {
+        match self {
+            Self::RateLimited => Err(StatusCode::TOO_MANY_REQUESTS),
+            Self::MissingToken | Self::UnknownToken | Self::InvalidToken => {
+                Err(StatusCode::UNAUTHORIZED)
+            }
+            Self::UnscopedAgent(response) => Ok(response),
+            Self::Error(status) => Err(status),
+        }
+    }
+}
+
+/// Record one refusal where an operator can see it: the counter (always)
+/// and the log (at a level chosen per reason). The limiter also moves
+/// `talos_rate_limit_hits_total{type="mcp_auth"}`, so the MCP limiter joins
+/// the four the 2026-09-11 burn-down wired. A missing token is DEBUG — an
+/// unauthenticated probe of `/mcp` carries nothing to guess with and the
+/// counter has it; an unknown or invalid token is WARN under `talos_audit`,
+/// the level `ApiKeyService::validate_key` uses for the same event; the
+/// unscoped-agent refusal already logged itself with the agent id inside
+/// [`refuse_unscoped_agent`], and every `Error` was logged with its cause at
+/// the site that produced it — neither is logged twice.
+fn report_mcp_auth_refusal(refusal: &McpAuthRefusal, ip: &str) {
+    let outcome = refusal.outcome();
+    talos_metrics::record_mcp_auth(outcome);
+    match refusal {
+        McpAuthRefusal::RateLimited => {
+            talos_metrics::record_rate_limit_hit(talos_metrics::RateLimitKind::McpAuth);
+            tracing::warn!(ip = %ip, "MCP auth rate limit exceeded");
+        }
+        McpAuthRefusal::MissingToken => {
+            tracing::debug!(
+                ip = %ip,
+                reason = outcome.as_str(),
+                "MCP request carried no agent token"
+            );
+        }
+        McpAuthRefusal::UnknownToken | McpAuthRefusal::InvalidToken => {
+            tracing::warn!(
+                target: "talos_audit",
+                event_kind = "mcp_auth_refused",
+                reason = outcome.as_str(),
+                ip = %ip,
+                "MCP agent token refused"
+            );
+        }
+        McpAuthRefusal::UnscopedAgent(_) | McpAuthRefusal::Error(_) => {}
+    }
+}
+
+/// The client IP the limiter and the audit line key on.
+///
+/// MCP-1097 (2026-05-16): rate-limit bucket key must reflect the
+/// REAL client IP, not the direct peer (the reverse proxy in any
+/// production deployment with a load balancer / ingress). Pre-fix
+/// `addr.ip().to_string()` collapsed every MCP agent into the
+/// proxy's single IP bucket — the 60-req/min default became a
+/// GLOBAL cap shared across all MCP traffic. A chatty client
+/// exhausted the bucket and every other agent got 429. Sibling
+/// pattern to `talos_rate_limit::extract_client_ip` which the main
+/// app rate-limiter already uses correctly (RFC 7239 right-to-left
+/// XFF walk skipping trusted-proxy entries). `mcp_router` is
+/// merged AFTER the outer rate-limit layers so the existing
+/// `Extension<Arc<TrustedProxies>>` doesn't propagate; build a
+/// process-local handle from `TRUSTED_PROXY_CIDRS` once via
+/// LazyLock so each request pays only a hashmap lookup.
+fn mcp_client_ip(addr: SocketAddr, req: &Request<axum::body::Body>) -> String {
     static TRUSTED_PROXIES: std::sync::LazyLock<talos_rate_limit::TrustedProxies> =
         std::sync::LazyLock::new(talos_rate_limit::TrustedProxies::from_env);
-    let ip =
-        talos_rate_limit::extract_client_ip(addr.ip(), req.headers(), &TRUSTED_PROXIES).to_string();
-    if check_mcp_auth_rate_limit(&ip).is_err() {
-        tracing::warn!(ip = %ip, "MCP auth rate limit exceeded");
-        return Err(StatusCode::TOO_MANY_REQUESTS);
+    talos_rate_limit::extract_client_ip(addr.ip(), req.headers(), &TRUSTED_PROXIES).to_string()
+}
+
+/// Every step of MCP authentication — limiter, token extraction, cache,
+/// lookup, bcrypt, the user-scope gate, the admit-side bookkeeping — admitting
+/// an [`AgentIdentity`] or naming why not. It writes nothing to the request
+/// and sends nothing: [`mcp_auth_middleware`] does both from its one `match`,
+/// which is where every outcome is counted.
+///
+/// Takes the request's HEADERS and URI rather than the request: an
+/// `axum::body::Body` is not `Sync`, so holding `&Request<Body>` across the
+/// awaits below would make the middleware's future `!Send`, which
+/// `from_fn_with_state` refuses at compile time.
+async fn authenticate_mcp_request(
+    db_pool: &PgPool,
+    ip: &str,
+    headers: &axum::http::HeaderMap,
+    uri: &axum::http::Uri,
+) -> Result<AgentIdentity, McpAuthRefusal> {
+    if check_mcp_auth_rate_limit(ip).is_err() {
+        return Err(McpAuthRefusal::RateLimited);
     }
 
     // 1. Extract Bearer Token from multiple sources:
     //    a) Authorization: Bearer <token> header (standard)
     //    b) ?token=<token> query parameter (for clients that can't set headers)
-    let auth_header = req
-        .headers()
+    let auth_header = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
         .filter(|s| s.starts_with("Bearer "))
@@ -568,7 +688,7 @@ pub async fn mcp_auth_middleware(
     // (e.g. SSE clients, browser EventSource).  The token value is extracted
     // here and NEVER written to any log — the raw URI (which would contain the
     // plaintext token) must not appear in access logs or tracing spans.
-    let query_token = req.uri().query().and_then(|q| {
+    let query_token = uri.query().and_then(|q| {
         q.split('&').find_map(|pair| {
             let mut parts = pair.splitn(2, '=');
             match (parts.next(), parts.next()) {
@@ -580,7 +700,7 @@ pub async fn mcp_auth_middleware(
 
     let token = match auth_header.or(query_token) {
         Some(t) => t,
-        None => return Err(StatusCode::UNAUTHORIZED),
+        None => return Err(McpAuthRefusal::MissingToken),
     };
 
     // 2. Compute SHA-256 lookup hash for efficient DB query
@@ -596,26 +716,22 @@ pub async fn mcp_auth_middleware(
             tracing::trace!(agent_id = %agent.agent_id, "bcrypt verification cache hit");
 
             // MCP-716 (2026-05-13): skip `touch_agent_last_connected` on
-            // cache hit. The uncached path below (line ~366) fires the
-            // touch unconditionally when it inserts the cache entry, so
-            // a cache hit means `last_connected_at` was updated less
-            // than BCRYPT_CACHE_TTL_SECS (10 s) ago — re-updating on
-            // every cached request added zero information but cost one
-            // DB UPDATE per request. For a chatty MCP agent (e.g. 100
-            // req/s) that's 100 redundant UPDATEs/s against the
-            // `mcp_agents` row — at 1000 active agents the prior
-            // implementation generated ~100k pointless UPDATEs/s of DB
-            // pool pressure. `last_connected_at` UX granularity remains
-            // bounded by the cache TTL (10 s freshness for "currently
-            // online" displays), which is well within product
-            // expectations and matches the equivalent JWT
-            // `last_seen_at` patterns elsewhere in the codebase.
-
-            if let Err(refusal) = refuse_unscoped_agent(&agent) {
-                return Ok(refusal);
-            }
-            req.extensions_mut().insert(Arc::new(agent));
-            return Ok(next.run(req).await);
+            // cache hit. The uncached path below fires the touch
+            // unconditionally when it inserts the cache entry, so a cache
+            // hit means `last_connected_at` was updated less than
+            // BCRYPT_CACHE_TTL_SECS (10 s) ago — re-updating on every
+            // cached request added zero information but cost one DB
+            // UPDATE per request. For a chatty MCP agent (e.g. 100 req/s)
+            // that's 100 redundant UPDATEs/s against the `mcp_agents` row
+            // — at 1000 active agents the prior implementation generated
+            // ~100k pointless UPDATEs/s of DB pool pressure.
+            // `last_connected_at` UX granularity remains bounded by the
+            // cache TTL (10 s freshness for "currently online" displays),
+            // which is well within product expectations and matches the
+            // equivalent JWT `last_seen_at` patterns elsewhere in the
+            // codebase.
+            refuse_unscoped_agent(&agent).map_err(McpAuthRefusal::UnscopedAgent)?;
+            return Ok(agent);
         }
     }
 
@@ -636,115 +752,109 @@ pub async fn mcp_auth_middleware(
                 error = %e,
                 "mcp_auth: agent lookup by token_lookup_hash failed"
             );
-            StatusCode::INTERNAL_SERVER_ERROR
+            McpAuthRefusal::Error(StatusCode::INTERNAL_SERVER_ERROR)
         })?;
 
-    let agent = match record {
-        Some(r) => {
-            // 4. Verify bcrypt hash for security (lookup hash only narrows the search)
-            let token_clone = token.clone();
-            let bcrypt_hash = r.token_hash.clone();
-            // MCP-873 (2026-05-14): log both failure paths distinctly.
-            // JoinError → spawn_blocking thread panicked, real
-            // operator-actionable failure (likely OOM or runtime bug).
-            // bcrypt::verify Err → either invalid stored hash format
-            // (DB corruption) or a malformed bcrypt input — also
-            // operator-actionable. Pre-fix both collapsed to 500/401
-            // with no telemetry.
-            let is_valid =
-                tokio::task::spawn_blocking(move || bcrypt::verify(&token_clone, &bcrypt_hash))
-                    .await
-                    .map_err(|e| {
-                        tracing::error!(
-                            error = %e,
-                            "mcp_auth: bcrypt spawn_blocking JoinError"
-                        );
-                        StatusCode::INTERNAL_SERVER_ERROR
-                    })?
-                    .map_err(|e| {
-                        tracing::error!(
-                            error = %e,
-                            "mcp_auth: bcrypt::verify failed (possibly malformed stored hash)"
-                        );
-                        StatusCode::UNAUTHORIZED
-                    })?;
-
-            if !is_valid {
-                return Err(StatusCode::UNAUTHORIZED);
-            }
-
-            {
-                let identity = AgentIdentity {
-                    agent_id: r.id,
-                    name: r.name,
-                    role_name: r.role_name,
-                    allowed_capabilities: r.allowed_capabilities,
-                    user_id: r.user_id,
-                };
-                // Validate capabilities at auth time — unknown strings are logged as
-                // warnings so operators catch typos before they cause silent access denials.
-                identity.warn_unknown_capabilities();
-
-                // Cache the verified identity to avoid repeated bcrypt work.
-                //
-                // MCP-1177 (2026-05-17): fail-CLOSED at cap. Pre-fix sequence
-                // was `if len > MAX: retain non-expired; insert`. Under a
-                // burst where all entries are fresh (< BCRYPT_CACHE_TTL_SECS
-                // = 10 s), `retain` evicts zero entries and the unconditional
-                // insert grows the cache beyond cap by 1 per call. Under
-                // sustained burst, the cache can grow to N × (request rate ×
-                // TTL window) entries — N=1 per insert, 10s window, 1000
-                // req/s = 10_000 entries (10x the configured cap), each
-                // holding an `AgentIdentity` with allowed_capabilities and
-                // role_name strings. Sibling fail-CLOSED-at-cap pattern as
-                // MCP-1145 (TOKEN_GRACE_CACHE), MCP-1146 (MCP_AUTH_RATE_LIMITER),
-                // MCP-1147 (REFRESH_RATE_LIMITER). The cost of refusing to
-                // cache when at cap is one extra bcrypt verify per
-                // already-known-token request — bounded and operator-
-                // recognisable (caches are perf optimisations; auth is
-                // already correct without them).
-                let already_cached = BCRYPT_VERIFY_CACHE.contains_key(&token_lookup_hash);
-                let mut should_insert = true;
-                if BCRYPT_VERIFY_CACHE.len() >= BCRYPT_CACHE_MAX_ENTRIES {
-                    let evict_now = Instant::now();
-                    BCRYPT_VERIFY_CACHE.retain(|_, (cached_at, _)| {
-                        evict_now.duration_since(*cached_at).as_secs() < BCRYPT_CACHE_TTL_SECS
-                    });
-                    // After expired-eviction, if STILL at cap and this
-                    // token isn't already cached, refuse the new insert.
-                    // Auth succeeds; the next request from this token
-                    // re-verifies via bcrypt (~50-100 ms cost) rather than
-                    // the ~µs cache hit. Loud event so operators can
-                    // correlate auth-rate spikes with cache pressure.
-                    if !already_cached && BCRYPT_VERIFY_CACHE.len() >= BCRYPT_CACHE_MAX_ENTRIES {
-                        tracing::warn!(
-                            target: "talos_audit",
-                            event_kind = "bcrypt_cache_at_cap",
-                            cap = BCRYPT_CACHE_MAX_ENTRIES,
-                            "BCRYPT_VERIFY_CACHE at cap after expired-eviction; \
-                             skipping insert for this token (next request from this \
-                             token will re-verify via bcrypt)"
-                        );
-                        should_insert = false;
-                    }
-                }
-                if should_insert {
-                    BCRYPT_VERIFY_CACHE.insert(
-                        token_lookup_hash.clone(),
-                        (Instant::now(), identity.clone()),
-                    );
-                }
-
-                identity
-            }
-        }
-        None => return Err(StatusCode::UNAUTHORIZED),
+    let Some(r) = record else {
+        return Err(McpAuthRefusal::UnknownToken);
     };
 
-    // 4a. An agent with NO user scope is refused on the authenticated path.
-    if let Err(refusal) = refuse_unscoped_agent(&agent) {
-        return Ok(refusal);
+    // 4. Verify bcrypt hash for security (lookup hash only narrows the search)
+    let token_clone = token.clone();
+    let bcrypt_hash = r.token_hash.clone();
+    // MCP-873 (2026-05-14): log both failure paths distinctly.
+    // JoinError → spawn_blocking thread panicked, real
+    // operator-actionable failure (likely OOM or runtime bug).
+    // bcrypt::verify Err → either invalid stored hash format
+    // (DB corruption) or a malformed bcrypt input — also
+    // operator-actionable. Pre-fix both collapsed to 500/401
+    // with no telemetry.
+    let is_valid = tokio::task::spawn_blocking(move || bcrypt::verify(&token_clone, &bcrypt_hash))
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                error = %e,
+                "mcp_auth: bcrypt spawn_blocking JoinError"
+            );
+            McpAuthRefusal::Error(StatusCode::INTERNAL_SERVER_ERROR)
+        })?
+        .map_err(|e| {
+            tracing::error!(
+                error = %e,
+                "mcp_auth: bcrypt::verify failed (possibly malformed stored hash)"
+            );
+            McpAuthRefusal::Error(StatusCode::UNAUTHORIZED)
+        })?;
+
+    if !is_valid {
+        return Err(McpAuthRefusal::InvalidToken);
     }
+
+    let identity = AgentIdentity {
+        agent_id: r.id,
+        name: r.name,
+        role_name: r.role_name,
+        allowed_capabilities: r.allowed_capabilities,
+        user_id: r.user_id,
+    };
+    // Validate capabilities at auth time — unknown strings are logged as
+    // warnings so operators catch typos before they cause silent access denials.
+    identity.warn_unknown_capabilities();
+
+    // Cache the verified identity to avoid repeated bcrypt work.
+    //
+    // MCP-1177 (2026-05-17): fail-CLOSED at cap. Pre-fix sequence
+    // was `if len > MAX: retain non-expired; insert`. Under a
+    // burst where all entries are fresh (< BCRYPT_CACHE_TTL_SECS
+    // = 10 s), `retain` evicts zero entries and the unconditional
+    // insert grows the cache beyond cap by 1 per call. Under
+    // sustained burst, the cache can grow to N × (request rate ×
+    // TTL window) entries — N=1 per insert, 10s window, 1000
+    // req/s = 10_000 entries (10x the configured cap), each
+    // holding an `AgentIdentity` with allowed_capabilities and
+    // role_name strings. Sibling fail-CLOSED-at-cap pattern as
+    // MCP-1145 (TOKEN_GRACE_CACHE), MCP-1146 (MCP_AUTH_RATE_LIMITER),
+    // MCP-1147 (REFRESH_RATE_LIMITER). The cost of refusing to
+    // cache when at cap is one extra bcrypt verify per
+    // already-known-token request — bounded and operator-
+    // recognisable (caches are perf optimisations; auth is
+    // already correct without them).
+    let already_cached = BCRYPT_VERIFY_CACHE.contains_key(&token_lookup_hash);
+    let mut should_insert = true;
+    if BCRYPT_VERIFY_CACHE.len() >= BCRYPT_CACHE_MAX_ENTRIES {
+        let evict_now = Instant::now();
+        BCRYPT_VERIFY_CACHE.retain(|_, (cached_at, _)| {
+            evict_now.duration_since(*cached_at).as_secs() < BCRYPT_CACHE_TTL_SECS
+        });
+        // After expired-eviction, if STILL at cap and this
+        // token isn't already cached, refuse the new insert.
+        // Auth succeeds; the next request from this token
+        // re-verifies via bcrypt (~50-100 ms cost) rather than
+        // the ~µs cache hit. Loud event so operators can
+        // correlate auth-rate spikes with cache pressure.
+        if !already_cached && BCRYPT_VERIFY_CACHE.len() >= BCRYPT_CACHE_MAX_ENTRIES {
+            tracing::warn!(
+                target: "talos_audit",
+                event_kind = "bcrypt_cache_at_cap",
+                cap = BCRYPT_CACHE_MAX_ENTRIES,
+                "BCRYPT_VERIFY_CACHE at cap after expired-eviction; \
+                 skipping insert for this token (next request from this \
+                 token will re-verify via bcrypt)"
+            );
+            should_insert = false;
+        }
+    }
+    if should_insert {
+        BCRYPT_VERIFY_CACHE.insert(
+            token_lookup_hash.clone(),
+            (Instant::now(), identity.clone()),
+        );
+    }
+
+    let agent = identity;
+
+    // 4a. An agent with NO user scope is refused on the authenticated path.
+    refuse_unscoped_agent(&agent).map_err(McpAuthRefusal::UnscopedAgent)?;
 
     // 4b. Lazy user-row upsert — ensures FK-constrained writes succeed.
     //
@@ -785,26 +895,210 @@ pub async fn mcp_auth_middleware(
         }
     });
 
-    // 5. Inject AgentIdentity into Request extensions
-    req.extensions_mut().insert(Arc::new(agent));
+    Ok(agent)
+}
 
-    Ok(next.run(req).await)
+/// Authenticate one `/mcp` request and count the outcome — the ONE place
+/// every request through this surface passes, so the counter sits here and
+/// not at the six sites that refuse. An admitted agent's identity is
+/// injected into the request extensions for the handlers.
+pub async fn mcp_auth_middleware(
+    State(db_pool): State<PgPool>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    mut req: Request<axum::body::Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let ip = mcp_client_ip(addr, &req);
+    match authenticate_mcp_request(&db_pool, &ip, req.headers(), req.uri()).await {
+        Ok(agent) => {
+            talos_metrics::record_mcp_auth(McpAuthOutcome::Ok);
+            // 5. Inject AgentIdentity into Request extensions
+            req.extensions_mut().insert(Arc::new(agent));
+            Ok(next.run(req).await)
+        }
+        Err(refusal) => {
+            report_mcp_auth_refusal(&refusal, &ip);
+            refusal.into_reply()
+        }
+    }
+}
+
+/// Process-global limiter — serialise tests that touch it so parallel runs
+/// don't race each other's `clear()` and pre-fill assertions. Same pattern
+/// as the GRACE_TEST_LOCK in talos-csrf (MCP-1145) and NONCE_TEST_LOCK in
+/// talos-memory. Shared by the cap tests and the refusal tests below.
+#[cfg(test)]
+static LIMITER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
+fn limiter_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    LIMITER_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// The refusal type is what makes every exit of the middleware countable;
+/// these drive the pre-database half of [`authenticate_mcp_request`] with a
+/// pool that can never connect, so "refused before any DB read" is proven by
+/// the test finishing at all, and pin the outcome/reply pairing.
+#[cfg(test)]
+mod mcp_auth_refusal_tests {
+    use super::*;
+
+    fn never_connecting_pool() -> PgPool {
+        sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_secs(2))
+            .connect_lazy("postgres://talos:x@127.0.0.1:1/never")
+            .expect("lazy pool")
+    }
+
+    fn request(auth: Option<&str>) -> Request<axum::body::Body> {
+        let mut b = Request::builder().method("POST").uri("/mcp");
+        if let Some(a) = auth {
+            b = b.header(axum::http::header::AUTHORIZATION, a);
+        }
+        b.body(axum::body::Body::empty()).expect("request")
+    }
+
+    #[tokio::test]
+    async fn a_missing_token_is_refused_before_any_database_read() {
+        let _g = limiter_test_lock();
+        let pool = never_connecting_pool();
+        let no_token = request(None);
+        let refusal =
+            authenticate_mcp_request(&pool, "203.0.113.11", no_token.headers(), no_token.uri())
+                .await
+                .expect_err("no token must be refused");
+        assert!(
+            matches!(refusal, McpAuthRefusal::MissingToken),
+            "{refusal:?}"
+        );
+        assert_eq!(refusal.outcome(), McpAuthOutcome::MissingToken);
+        // The caller's reply is the bare 401 it always was.
+        assert_eq!(
+            refusal.into_reply().expect_err("a status, not a body"),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    /// An unreadable agent table is `Error`, never `UnknownToken`: "we could
+    /// not look" must not read as "no such token" on the series an operator
+    /// uses to spot guessing.
+    #[tokio::test]
+    async fn an_unreadable_agent_table_is_an_error_not_an_unknown_token() {
+        let _g = limiter_test_lock();
+        let pool = never_connecting_pool();
+        let guess = request(Some("Bearer not-a-real-token"));
+        let refusal = authenticate_mcp_request(&pool, "203.0.113.12", guess.headers(), guess.uri())
+            .await
+            .expect_err("the lookup cannot succeed");
+        assert!(
+            matches!(
+                refusal,
+                McpAuthRefusal::Error(StatusCode::INTERNAL_SERVER_ERROR)
+            ),
+            "{refusal:?}"
+        );
+        assert_eq!(refusal.outcome(), McpAuthOutcome::Error);
+    }
+
+    /// The limiter is the first gate: request `MCP_AUTH_RATE_LIMIT + 1` from
+    /// one IP inside one window is refused as `RateLimited` (429) whatever
+    /// credential it carries, and the ones before it are refused for the
+    /// credential (here: none).
+    #[tokio::test]
+    async fn the_limiter_refuses_the_request_past_the_window_cap() {
+        let _g = limiter_test_lock();
+        let limiter = MCP_AUTH_RATE_LIMITER.get_or_init(DashMap::new);
+        limiter.remove("203.0.113.13");
+        let pool = never_connecting_pool();
+        let no_token = request(None);
+        for i in 0..mcp_auth_max_requests() {
+            let refusal =
+                authenticate_mcp_request(&pool, "203.0.113.13", no_token.headers(), no_token.uri())
+                    .await
+                    .expect_err("no token");
+            assert!(
+                matches!(refusal, McpAuthRefusal::MissingToken),
+                "request {i}: {refusal:?}"
+            );
+        }
+        let refusal =
+            authenticate_mcp_request(&pool, "203.0.113.13", no_token.headers(), no_token.uri())
+                .await
+                .expect_err("over the cap");
+        assert!(
+            matches!(refusal, McpAuthRefusal::RateLimited),
+            "{refusal:?}"
+        );
+        assert_eq!(
+            refusal.into_reply().expect_err("a status"),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        limiter.remove("203.0.113.13");
+    }
+
+    /// Every refusal names exactly one outcome and keeps the reply its site
+    /// returned before the funnel existed; together the refusals cover every
+    /// outcome except `Ok`.
+    #[test]
+    fn every_refusal_names_one_outcome_and_keeps_its_reply() {
+        let unscoped = || McpAuthRefusal::UnscopedAgent(StatusCode::FORBIDDEN.into_response());
+        let table: Vec<(
+            McpAuthRefusal,
+            McpAuthOutcome,
+            Result<StatusCode, StatusCode>,
+        )> = vec![
+            (
+                McpAuthRefusal::RateLimited,
+                McpAuthOutcome::RateLimited,
+                Err(StatusCode::TOO_MANY_REQUESTS),
+            ),
+            (
+                McpAuthRefusal::MissingToken,
+                McpAuthOutcome::MissingToken,
+                Err(StatusCode::UNAUTHORIZED),
+            ),
+            (
+                McpAuthRefusal::UnknownToken,
+                McpAuthOutcome::UnknownToken,
+                Err(StatusCode::UNAUTHORIZED),
+            ),
+            (
+                McpAuthRefusal::InvalidToken,
+                McpAuthOutcome::InvalidToken,
+                Err(StatusCode::UNAUTHORIZED),
+            ),
+            (
+                unscoped(),
+                McpAuthOutcome::UnscopedAgent,
+                Ok(StatusCode::FORBIDDEN),
+            ),
+            (
+                McpAuthRefusal::Error(StatusCode::INTERNAL_SERVER_ERROR),
+                McpAuthOutcome::Error,
+                Err(StatusCode::INTERNAL_SERVER_ERROR),
+            ),
+        ];
+        let mut covered = std::collections::HashSet::new();
+        for (refusal, outcome, reply) in table {
+            assert_eq!(refusal.outcome(), outcome);
+            covered.insert(outcome);
+            match (refusal.into_reply(), reply) {
+                (Ok(resp), Ok(status)) => assert_eq!(resp.status(), status),
+                (Err(got), Err(want)) => assert_eq!(got, want),
+                (got, want) => panic!("{outcome:?}: reply shape {got:?} vs {want:?}"),
+            }
+        }
+        let mut expected: std::collections::HashSet<_> =
+            McpAuthOutcome::ALL.iter().copied().collect();
+        expected.remove(&McpAuthOutcome::Ok);
+        assert_eq!(covered, expected, "every non-Ok outcome has a refusal");
+    }
 }
 
 /// MCP-1146 (2026-05-16): tests for the rate-limiter max-entries cap.
 #[cfg(test)]
 mod mcp_auth_rate_limiter_cap_tests {
     use super::*;
-
-    /// Process-global limiter — serialise tests that touch it so
-    /// parallel runs don't race each other's `clear()` and pre-fill
-    /// assertions. Same pattern as the GRACE_TEST_LOCK in talos-csrf
-    /// (MCP-1145) and NONCE_TEST_LOCK in talos-memory.
-    static LIMITER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn limiter_test_lock() -> std::sync::MutexGuard<'static, ()> {
-        LIMITER_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())
-    }
 
     /// At cap, NEW IPs are rejected; existing tracked IPs still flow
     /// through their normal rate-limit accounting (the cap doesn't

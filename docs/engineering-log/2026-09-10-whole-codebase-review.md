@@ -4042,3 +4042,154 @@ instrument that catches it, rather than implying the lint does.
 message count should fall toward the last thirty days' worth as the broker
 expires the rest.
 
+
+### Package AX (2026-09-13) — the third bearer credential was the one nobody counted
+
+**Found by the steady-state survey after the #847 deploy**, sweeping the
+seven-day `increase()` of every refusal counter on the fleet. All quiet —
+and one of the quiet ones raised the question that became the package:
+`talos_api_key_validations_total` read 0 over seven days in which
+`talos_mcp_tool_calls_total` had climbed by 23. MCP calls happened;
+API-key validations did not. So what authenticates an MCP call? Not
+`ApiKeyService::validate_key`: `mcp_auth_middleware` in
+`talos-mcp-handlers/src/auth.rs` resolves an `mcp_agents` row by the token's
+SHA-256 lookup hash and verifies bcrypt. That is a THIRD bearer credential —
+the interactive session, the API key, and the MCP agent token — and MCP-1201
+had already said what kind: "MCP API keys are long-lived bearer tokens with
+no 2FA equivalent", the reason secret writes were removed from MCP.
+
+**Measured before writing anything**, against the live controller:
+
+```
+curl -X POST -H 'Authorization: Bearer definitely-not-a-token' localhost:8000/mcp  → 401
+curl -X POST                                                    localhost:8000/mcp  → 401
+docker logs talos-controller --since 30s | grep -ciE 'mcp_auth|MCP auth'         → 0
+/metrics/prometheus: no series moved
+```
+
+A bare 401 and nothing else. Reading the middleware: six refusal sites
+(`return Err(StatusCode::UNAUTHORIZED)` for a missing token, for no row, for
+a bcrypt mismatch; a 429 from the limiter; a 403 from
+`refuse_unscoped_agent`; two 500s from the lookup and the bcrypt worker) and
+not one of them counted; the only per-request log line on a refusal was the
+limiter's `MCP auth rate limit exceeded` — i.e. a brute-force against an MCP
+agent token was invisible below 60 requests per minute per IP and visible
+above it only as that line. Its siblings do better: `validate_key` WARNs and
+counts every invalid key (package "dead metric burn-down", 2026-09-11) and
+the interactive login has counted since 2026-07-31. The 09-11 burn-down's
+own sentence — "the three a security operator would reach for first (a 2FA
+brute-force burst, a key-guessing burst, a limiter refusing traffic)" — had
+enumerated the credentials by the counters that EXISTED, and the credential
+with no counter was not on the list to be found.
+
+**The fix is structural, not six increments.** Six refusal sites with six
+`record()` calls is the shape check 58 cannot audit (it proves an increment
+site exists, not that a path reaches it) and the shape package AG found
+"every finalizer" to be: seven of seventeen. Instead:
+
+- `McpAuthRefusal` — `RateLimited` / `MissingToken` / `UnknownToken` /
+  `InvalidToken` / `UnscopedAgent(Response)` / `Error(StatusCode)` — is the
+  type every non-admitting exit of `authenticate_mcp_request` returns.
+- `McpAuthRefusal::outcome()` is an EXHAUSTIVE match onto
+  `talos_metrics::McpAuthOutcome` (seven values with `Ok`), and
+  `into_reply()` is the exhaustive match back onto the HTTP reply each site
+  used to build — byte-for-byte the same 401 / 429 / 403 / 500 the caller saw
+  before.
+- `mcp_auth_middleware` is one `match`: `Ok(agent)` records `ok` and injects
+  the identity; `Err(refusal)` calls `report_mcp_auth_refusal`, which counts
+  on `talos_mcp_auth_total{outcome}`, moves
+  `talos_rate_limit_hits_total{type="mcp_auth"}` for the limiter (the fifth
+  `RateLimitKind`), and logs at a level chosen per reason.
+
+So a seventh refusal branch must choose an outcome or fail to compile, and
+the counter has exactly one call site per direction.
+
+**Decisions, each argued rather than defaulted.**
+
+- **The caller's reply is unchanged.** `MissingToken`, `UnknownToken` and
+  `InvalidToken` are all a bare 401. The split exists for the operator; a
+  reason-split reply would hand a holder of a guessed prefix a
+  token-existence oracle — the same argument `caller_facing_unauthorized`
+  and the write-ceiling `unreadable`/`policy` split already make.
+- **A revoked token is `unknown_token`, and there is no `revoked` value.**
+  `find_active_agent_by_token_lookup_hash` filters `is_active = true`, so a
+  revoked row is not found — the middleware genuinely cannot tell "never
+  existed" from "revoked" without a second, unfiltered read on every
+  refusal, and the runbook's remediation for a leaked token IS revocation,
+  after which the leaked token being tried reads as `unknown_token`. The
+  runbook §3.4 now says so.
+- **`invalid_token` stays distinct although it is not a guess.** A guess never
+  matches the SHA-256 lookup hash, so a row that is FOUND and whose bcrypt
+  then fails has two stored hashes disagreeing about one token — a corrupted
+  or hand-edited row. Folding that into `unknown_token` would hide a
+  data-integrity signal under the guessing one.
+- **`error` is a verdict.** `ApiKeyValidation` decided a DB failure
+  mid-validation "is not a verdict and records nothing". Here it records:
+  an auth surface that fails 100 % of requests because the agent table is
+  unreadable must not read as a quiet fleet — the same argument
+  `AUTH_REASON_ERROR` makes for the interactive login.
+- **Log levels.** Unknown/invalid token: WARN under `target: "talos_audit"`,
+  `event_kind = "mcp_auth_refused"`, `reason`, `ip` — the level
+  `validate_key` uses for the same event, bounded above by the limiter.
+  Missing token: DEBUG — an unauthenticated probe of `/mcp` (a scanner, a
+  misconfigured client) carries nothing to guess with, and the counter has
+  it. Unscoped agent: already WARNs with the agent id inside
+  `refuse_unscoped_agent`; error: already ERRORs with its cause at the site.
+  Neither is logged twice.
+- **No alert, deliberately.** The 09-11 argument stands: a threshold on
+  token guessing needs a baseline the series has never produced. The series
+  comes first.
+
+**Found on the way.** The first extraction passed `&Request<Body>` into the
+new async fn and the middleware stopped compiling: `axum::body::Body` is not
+`Sync`, so a future holding `&Request<Body>` across an await is `!Send`, and
+`from_fn_with_state` requires `Send`. The function takes `&HeaderMap` and
+`&Uri` instead — both `Sync` — which is also the honest signature: those are
+the two things it reads.
+
+**Guards.**
+
+- `talos-metrics`: `security_counters_are_seeded_and_their_recorders_move_them`
+  extended over `McpAuthOutcome::ALL` and the fifth `RateLimitKind`; seven
+  distinct series after recording.
+- `talos-mcp-handlers` unit tests: `every_refusal_names_one_outcome_and_keeps_its_reply`
+  (a table over all six refusals, asserting the outcome AND the reply, and
+  that the six outcomes are exactly `ALL` minus `Ok`); the pre-database half
+  driven with a `connect_lazy` pool at `127.0.0.1:1` that can never connect —
+  a missing token is refused before any read (the test finishing proves it),
+  an unreadable agent table is `Error(500)` and NOT `UnknownToken`, and the
+  `MCP_AUTH_RATE_LIMIT + 1`-th request from one IP is `RateLimited`.
+- `controller/tests/mcp_auth_metrics_tests` (CTRL_TESTS, per 64b): the
+  PRODUCTION middleware mounted with `from_fn_with_state` on a router, real
+  `agent_roles` + `mcp_agents` rows, `ConnectInfo` injected the way
+  `into_make_service_with_connect_info` would. Deltas on the global registry:
+  a guessed token → 401 + `unknown_token`; no credential → 401 +
+  `missing_token`; the real token twice → 200 + `ok` × 2 (the second from
+  the bcrypt cache); a row whose lookup hash is SHA-256 of the presented token
+  and whose bcrypt was minted from another → 401 + `invalid_token`; an agent
+  with `user_id NULL` → 403 + `unscoped_agent`; cap+1 credential-less requests
+  from one IP → the last is 429 and moves BOTH `rate_limited` and
+  `rate_limit_hits_total{type="mcp_auth"}`, while the first `cap` moved
+  `missing_token`. Control: the API-key series did not move — two bearer
+  surfaces, two series.
+
+**Mutations, five applied and five caught, each confirmed to have LANDED
+(the mutated text grepped absent/present before the run) and each revert
+byte-verified against the original's SHA-256.** M1 deletes the counter call
+in `report_mcp_auth_refusal` → the DB test fails at the first refusal
+assertion (`left: 0.0, right: 1.0`). M2 maps `UnknownToken` to
+`MissingToken` in `outcome()` → the unit table test AND the DB test fail.
+M3 drops the `record_rate_limit_hit` → the DB test fails at the limiter's
+hits assertion. M4 drops the `Ok` record in the middleware → the DB test
+fails at `ok` (`left: 0.0, right: 2.0`). M5 relabels the bcrypt mismatch
+as `UnknownToken` at its site → the DB test fails at `invalid_token`, which
+is what the crafted disagreeing row exists for. No survivors.
+
+**Stated limits.** The log lines are not tested (a capture subscriber over
+the middleware is more harness than the lines warrant). `error` is driven by
+the unit test only; under a live pool it needs an unreadable agent table.
+And this closes the THIRD credential's counter, not a class: the
+controller's other authenticated entry points (`/ws` handshake, the Gmail /
+GCP push JWT verifiers — counted since package AP, the approval-gate token
+lookups, webhook signatures) each have their own refusal reporting, surveyed
+one by one on the 09-11 and 09-12 passes; none was re-audited here.

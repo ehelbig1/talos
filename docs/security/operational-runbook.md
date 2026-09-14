@@ -799,6 +799,18 @@ docker exec talos-postgres psql -U talos -d talos -c \
 The token itself is unrecoverable from the DB (only `token_lookup_hash`
 + bcrypt of the token is stored), so revocation is the only remediation.
 
+Whether the token is being TRIED — before or after revocation — is on the
+controller's metrics endpoint (2026-09-13): `talos_mcp_auth_total{outcome}`
+counts every `/mcp` request's authentication outcome; `unknown_token` is a
+guessed, mistyped or REVOKED token (a revoked row is filtered by the lookup,
+so a revoked token reads as unknown), `invalid_token` a row whose lookup hash
+and bcrypt hash disagree (corruption or a hand-edited row, not a guess), and
+`rate_limited` the per-IP limiter refusing — also on
+`talos_rate_limit_hits_total{type="mcp_auth"}`. The same refusals are WARN
+lines under `target: "talos_audit"` with `event_kind = "mcp_auth_refused"`
+and the client IP. No alert references the series yet; a threshold needs a
+baseline it has not produced.
+
 ---
 
 ## 4. Pre-deployment security checklist

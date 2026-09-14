@@ -519,6 +519,11 @@ CTRL_TESTS=(
     # (64b).
     "claim_read_disclosure_tier3_tests"
     "api_key_tests"
+    # The MCP agent token is the third bearer credential and until 2026-09-13
+    # the only one whose refusals were counted nowhere: drives the production
+    # middleware on a router against real mcp_agents rows and reads
+    # talos_mcp_auth_total / rate_limit_hits_total{type=mcp_auth} as deltas.
+    "mcp_auth_metrics_tests"
     # Every workflow and module finalizer moves the execution count/duration
     # families that closed check 58's dead-metric baseline, with the duration
     # the finalizing UPDATE itself RETURNS; back-dated rows prove the observed
