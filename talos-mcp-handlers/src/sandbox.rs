@@ -4369,7 +4369,7 @@ pub fn run(input: String) -> Result<String, String> {
              // and only the resolved bytes go on the wire.\n\
              //\n\
              // To call an API with a token/key stored in the vault:\n\
-             //   1. Store the secret:  set_secret(key_path: \"jira/api-token\", ...)\n\
+             //   1. Store the secret \"jira/api-token\" (dashboard Settings -> Secrets, or GraphQL createSecret)\n\
              //   2. Set node config:   update_node_config → {\"AUTH\": \"vault://jira/api-token\"}\n\
              //   3. Compile with:      allowed_secrets: [\"jira/api-token\"]\n\
              //   4. In run():          let auth = data[\"config\"][\"AUTH\"].as_str().unwrap_or(\"\");\n\
@@ -4406,7 +4406,7 @@ pub fn run(input: String) -> Result<String, String> {
              //   Plaintext NEVER enters WASM. The host substitutes the secret into the\n\
              //   header value just before sending the request.\n\
              //\n\
-             //     1. Store secret:   set_secret(key_path: \"jira/api-token\", value: \"…\")\n\
+             //     1. Store secret:   \"jira/api-token\" via the dashboard (Settings -> Secrets) or GraphQL createSecret\n\
              //     2. Compile:        allowed_secrets: [\"jira/api-token\"]\n\
              //     3. Pass the literal string \"vault://jira/api-token\" as the header value:\n\
              //          let req = Request {\n\

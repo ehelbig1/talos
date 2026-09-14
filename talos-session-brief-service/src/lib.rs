@@ -791,7 +791,7 @@ impl SessionBriefService {
                 "auto_healing": auto_healing_caps,
                 "tip": if uncap_count > 0 {
                     "Capability tags are being auto-applied in the background. \
-                     Call run_workflow_hygiene to see which workflows still lack tags, \
+                     Call get_platform_hygiene_report to see which workflows still lack tags, \
                      or suggest_capabilities(workflow_id) to apply them manually."
                 } else {
                     "All workflows have capability tags."

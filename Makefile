@@ -16,6 +16,13 @@ MAKEFLAGS          += --warn-undefined-variables --no-print-directory
 .DEFAULT_GOAL      := help
 
 SERVICE            ?= controller
+# Pass-through arguments for test-changed / drill / deploy-prod, and the
+# changelog --write switch. Declared empty so --warn-undefined-variables above
+# stays a signal: before 2026-09-14 every `make drill` / `make deploy-prod` /
+# `make test-changed` / `make changelog` printed "undefined variable" for them,
+# i.e. the flag warned on correct invocations and taught readers to ignore it.
+ARGS               ?=
+CHANGELOG_WRITE    ?=
 
 # Git state exposed to the controller build so session_start.server_version
 # surfaces the deployed commit (operator never has to ask "what's running?").

@@ -3485,7 +3485,7 @@ pub fn validate_prepared_with_children(
                             "Node '{}' configures LLM input/output enforcement key(s) {:?}. \
                              If the underlying module was compiled before these keys were honoured, \
                              they will be silently ignored at runtime — reinstall via \
-                             reinstall_module_from_catalog (or recompile via hot_update_module) \
+                             install_module_from_catalog + swap_node_module (or recompile via hot_update_module) \
                              to pick up the current enforcement behaviour.",
                             node_label, keys_present
                         ),

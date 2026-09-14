@@ -2049,7 +2049,7 @@ fn handle_get_js_scaffold(
         "secrets-node" => {
             "// Secret access — modules MUST NOT see plaintext. Two correct paths:\n\
              // (Tier-3, recommended) vault:// in HTTP headers — host substitutes at fetch time:\n\
-             //   1. set_secret(key_path: 'jira/token', value: '...')\n\
+             //   1. create the secret 'jira/token' (dashboard Settings -> Secrets, or GraphQL createSecret; MCP has no secret-write tool)\n\
              //   2. update_node_config -> {\"AUTH\": \"vault://jira/token\"}; allowed_secrets: ['jira/token']\n\
              //   3. Read AUTH literal: const auth = parsed.config?.AUTH ?? '';   // 'vault://jira/token'\n\
              //   4. Pass as-is in headers: { Authorization: auth } — host resolves before sending.\n\
@@ -2186,7 +2186,7 @@ fn handle_get_python_scaffold(
         "secrets-node" => {
             "# Secret access — modules MUST NOT see plaintext. Two correct paths:\n\
              # (Tier-3, recommended) vault:// in HTTP headers — host substitutes at fetch time:\n\
-             #   1. set_secret(key_path='jira/token', value='...')\n\
+             #   1. create the secret 'jira/token' (dashboard Settings -> Secrets, or GraphQL createSecret; MCP has no secret-write tool)\n\
              #   2. update_node_config -> {\"AUTH\": \"vault://jira/token\"}; allowed_secrets=['jira/token']\n\
              #   3. Read AUTH literal: auth = parsed.get('config', {}).get('AUTH', '')   # 'vault://jira/token'\n\
              #   4. Pass as-is in headers: {'Authorization': auth} — host resolves before sending.\n\

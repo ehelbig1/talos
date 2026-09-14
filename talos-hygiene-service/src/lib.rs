@@ -1387,7 +1387,7 @@ pub fn build_report(
             "priority": "medium",
             "category": "input_schema",
             "action": format!(
-                "{} published workflow(s) have execution history but no input_schema (e.g. {}). Run infer_workflow_input_schema on each, then set_workflow_input_schema to lock the contract and enable input validation.",
+                "{} published workflow(s) have execution history but no input_schema (e.g. {}). Run get_workflow_input_schema on each (it infers a schema from recent executions), then lock it with confirm_inferred_schema=true or set_workflow_input_schema to enable input validation.",
                 workflows_needing_schema.len(),
                 names_preview.join(", ")
             ),
