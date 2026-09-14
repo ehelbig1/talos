@@ -2717,6 +2717,80 @@ groups:
             so controller-side DB reads will show elevated p99 too.
             Common causes: Vault PVC disk pressure, Vault CPU throttling.
 
+      # ──────────────────────────────────────────────────────────────
+      # THE KEK TOKEN ITSELF (2026-09-14). With KEK_PROVIDER=vault every DEK
+      # wrap and unwrap is authenticated by ONE token, and until this change
+      # nothing renewed it: Vault does not extend a token because it is used
+      # (measured — a 45 s periodic token used every 10 s expired on schedule
+      # and the next transit call was a 403), so the chart's `-period=768h`
+      # controller token took the KEK path down 32 days after install.
+      #
+      # The controller now renews it (spawn_vault_token_renewal): immediately
+      # at boot, then at a third of the remaining TTL, AT MOST HOURLY. That
+      # cadence is what the window below is derived from — a healthy renewable
+      # token has at least one `renewed`/`capped` in ANY two-hour window, so
+      # two hours of failures with no success is at least one missed renewal,
+      # not a blip (a single failed attempt is retried within a minute).
+      #
+      # NO absent() ARM: the series exists only where a Vault KEK provider
+      # runs (seeded by the loop, not at registration); an env-KEK cluster has
+      # nothing to renew, and absence there is "not applicable". A renewal
+      # loop that ENDS — the token was never, or is no longer, renewable — is
+      # `TalosBackgroundTaskExited{task="vault_token_renewal"}`; production
+      # refuses to boot on a non-renewable token in the first place.
+      - alert: TalosVaultTokenRenewalFailing
+        expr: |
+          increase(talos_vault_token_renewals_total{outcome="failed"}[2h]) > 0
+          and on(job, instance)
+          sum by (job, instance) (increase(talos_vault_token_renewals_total{outcome=~"renewed|capped"}[2h])) == 0
+        for: 15m
+        labels:
+          severity: critical
+          category: crypto-broken
+        annotations:
+          summary: "The Vault KEK token has not been renewed for two hours"
+          description: |
+            Every renewal attempt of the controller's Vault KEK token in the
+            last two hours failed ({{ $value | humanize }} failures) and none
+            succeeded. When the token's TTL runs out, every DEK wrap and
+            unwrap fails: secrets, actor memory and encrypted execution output
+            stop decrypting once the 5-minute DEK cache drains.
+            `talos_vault_token_ttl_seconds` is the TTL Vault last reported.
+          action: |
+            1. Controller log, target `talos_security`, event_kind
+               `vault_token_renewal_failed`: `stage` (lookup | renew) and the
+               HTTP status. A 403 means the token is already gone; anything
+               else is reachability (VaultSealed, NetworkPolicy, TLS).
+            2. If the token has expired, mint a new periodic one
+               (`vault token create -policy=talos-controller -period=768h
+               -orphan`), write it to the bootstrap Secret's VAULT_TOKEN and
+               restart the controller.
+
+      # A renewal Vault answered with LESS than the requested increment: the
+      # token is bounded by a maximum TTL and renewal can no longer extend it.
+      # `renewed` never becomes `capped` on a periodic token without an
+      # explicit max, so this cannot fire on the chart's own token shape; it
+      # fires on an AppRole-style bounded token as it reaches its ceiling —
+      # exactly when a replacement is needed.
+      - alert: TalosVaultTokenCapped
+        expr: increase(talos_vault_token_renewals_total{outcome="capped"}[2h]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          category: crypto-broken
+        annotations:
+          summary: "The Vault KEK token has reached its maximum TTL and will expire"
+          description: |
+            Vault granted less than the requested renewal: the controller's
+            KEK token is bounded by a maximum TTL and cannot be extended past
+            it. `talos_vault_token_ttl_seconds{lifetime="renewable_bounded"}`
+            is how long it has left; after that every DEK operation fails.
+          action: |
+            Replace the token before it expires: mint a periodic token with no
+            explicit max TTL (`vault token create -policy=talos-controller
+            -period=768h -orphan`), write it to the bootstrap Secret's
+            VAULT_TOKEN and restart the controller.
+
   # ────────────────────────────────────────────────────────────────────
   - name: talos.controller.health
     interval: 30s

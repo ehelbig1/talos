@@ -37,5 +37,10 @@ tracing.workspace = true
 uuid.workspace = true
 zeroize = "1.8"
 
+[dev-dependencies]
+# Mock Vault for the token-renewal tests (vault_token_renewal_tests.rs).
+axum = { version = "0.8", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+
 [lints]
 workspace = true

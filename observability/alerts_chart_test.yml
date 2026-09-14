@@ -4538,6 +4538,133 @@ tests:
         exp_alerts: []
 
   # ══════════════════════════════════════════════════════════════════════
+  # TalosVaultTokenRenewalFailing — the window is derived from the renewal
+  # cadence (immediately at boot, then at most hourly): a healthy token has a
+  # success in every two-hour window, so a failure burst that a later hourly
+  # renewal follows stays quiet, and only a run of failures with no success
+  # for two hours fires.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: vault token — healthy hourly renewal quiet, a short outage quiet, a dead token fires
+    input_series:
+      # Seeded 0 at boot. renewed: +1 at boot (t=1m) and hourly through t=121m,
+      # then nothing more (the token is gone). failed: a 5-minute outage at
+      # t=30..34 (retried every minute, then the hourly renewal succeeds), and
+      # from t=150m one failure a minute.
+      - series: 'talos_vault_token_renewals_total{job="talos-controller",instance="c:8000",outcome="renewed"}'
+        values: "0 1+0x59 2+0x59 3+0x299"
+      - series: 'talos_vault_token_renewals_total{job="talos-controller",instance="c:8000",outcome="capped"}'
+        values: "0+0x420"
+      - series: 'talos_vault_token_renewals_total{job="talos-controller",instance="c:8000",outcome="failed"}'
+        values: "0+0x29 1+1x4 5+0x114 6+1x269"
+    alert_rule_test:
+      # The 5-minute outage sits between two successful hourly renewals.
+      - eval_time: 40m
+        alertname: TalosVaultTokenRenewalFailing
+        exp_alerts: []
+      - eval_time: 100m
+        alertname: TalosVaultTokenRenewalFailing
+        exp_alerts: []
+      # Failures from t=150m; the last success was at t=121m, so the 2 h
+      # window still holds it until t=241m — quiet while one exists. (A 1 h
+      # success window would already be empty here and fire: this is the
+      # case that pins the window to the hourly cadence's double.)
+      - eval_time: 230m
+        alertname: TalosVaultTokenRenewalFailing
+        exp_alerts: []
+      # From t=242m the window holds only failures; `for: 15m` → firing by 258m.
+      - eval_time: 260m
+        alertname: TalosVaultTokenRenewalFailing
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              category: crypto-broken
+              job: talos-controller
+              instance: "c:8000"
+              outcome: failed
+            exp_annotations:
+              summary: "The Vault KEK token has not been renewed for two hours"
+              description: |
+                Every renewal attempt of the controller's Vault KEK token in the
+                last two hours failed (111 failures) and none
+                succeeded. When the token's TTL runs out, every DEK wrap and
+                unwrap fails: secrets, actor memory and encrypted execution output
+                stop decrypting once the 5-minute DEK cache drains.
+                `talos_vault_token_ttl_seconds` is the TTL Vault last reported.
+              action: |
+                1. Controller log, target `talos_security`, event_kind
+                   `vault_token_renewal_failed`: `stage` (lookup | renew) and the
+                   HTTP status. A 403 means the token is already gone; anything
+                   else is reachability (VaultSealed, NetworkPolicy, TLS).
+                2. If the token has expired, mint a new periodic one
+                   (`vault token create -policy=talos-controller -period=768h
+                   -orphan`), write it to the bootstrap Secret's VAULT_TOKEN and
+                   restart the controller.
+      - eval_time: 260m
+        alertname: TalosVaultTokenCapped
+        exp_alerts: []
+
+  # A bounded token reaching its ceiling: capped renewals fire at once; a run
+  # of plain `renewed` does not.
+  - interval: 1m
+    name: vault token — a capped renewal fires, full renewals do not
+    input_series:
+      - series: 'talos_vault_token_renewals_total{job="talos-controller",instance="c:8000",outcome="renewed"}'
+        values: "0 1+0x59 2+0x59 3+0x100"
+      - series: 'talos_vault_token_renewals_total{job="talos-controller",instance="c:8000",outcome="capped"}'
+        values: "0+0x149 1+0x9 2+0x100"
+      - series: 'talos_vault_token_renewals_total{job="talos-controller",instance="c:8000",outcome="failed"}'
+        values: "0+0x260"
+    alert_rule_test:
+      - eval_time: 140m
+        alertname: TalosVaultTokenCapped
+        exp_alerts: []
+      - eval_time: 165m
+        alertname: TalosVaultTokenCapped
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: crypto-broken
+              job: talos-controller
+              instance: "c:8000"
+              outcome: capped
+            exp_annotations:
+              summary: "The Vault KEK token has reached its maximum TTL and will expire"
+              description: |
+                Vault granted less than the requested renewal: the controller's
+                KEK token is bounded by a maximum TTL and cannot be extended past
+                it. `talos_vault_token_ttl_seconds{lifetime="renewable_bounded"}`
+                is how long it has left; after that every DEK operation fails.
+              action: |
+                Replace the token before it expires: mint a periodic token with no
+                explicit max TTL (`vault token create -policy=talos-controller
+                -period=768h -orphan`), write it to the bootstrap Secret's
+                VAULT_TOKEN and restart the controller.
+      # A capped renewal is never a renewal FAILURE.
+      - eval_time: 165m
+        alertname: TalosVaultTokenRenewalFailing
+        exp_alerts: []
+
+  # A capped renewal IS a success for the renewal-failing alert: a bounded
+  # token renewing (capped) through a burst of failures, with no full
+  # `renewed` in the window, must not read as "not renewed for two hours".
+  - interval: 1m
+    name: vault token — capped renewals between failures do not read as a renewal outage
+    input_series:
+      - series: 'talos_vault_token_renewals_total{job="talos-controller",instance="c:8000",outcome="renewed"}'
+        values: "0 1+0x300"
+      # One capped renewal every 20 minutes throughout.
+      - series: 'talos_vault_token_renewals_total{job="talos-controller",instance="c:8000",outcome="capped"}'
+        values: "0+0x19 1+0x19 2+0x19 3+0x19 4+0x19 5+0x19 6+0x19 7+0x19 8+0x19 9+0x19 10+0x19 11+0x19 12+0x19 13+0x19 14+0x19 15+0x19"
+      # A failure every minute from t=150m.
+      - series: 'talos_vault_token_renewals_total{job="talos-controller",instance="c:8000",outcome="failed"}'
+        values: "0+0x149 1+1x150"
+    alert_rule_test:
+      - eval_time: 280m
+        alertname: TalosVaultTokenRenewalFailing
+        exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
   # TalosRPCWriteCeilingRefusals — the fleet-configuration signal.
   #
   # The case that mattered: before this change the ONLY trace of a signed-RPC

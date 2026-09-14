@@ -286,6 +286,7 @@ pub(crate) async fn build_core_services(
     let kek_provider_kind = std::env::var("KEK_PROVIDER")
         .unwrap_or_else(|_| "env".to_string())
         .to_lowercase();
+    let mut vault_kek_provider = None;
     let (kek_provider, kek_legacy_provider): (
         std::sync::Arc<dyn crate::secrets::kek_provider::KekProvider>,
         Option<std::sync::Arc<dyn crate::secrets::kek_provider::KekProvider>>,
@@ -359,7 +360,9 @@ pub(crate) async fn build_core_services(
             } else {
                 Some(crate::secrets::kek_provider::env_kek_provider_from_environment()?)
             };
-            (std::sync::Arc::new(active), legacy)
+            let active = std::sync::Arc::new(active);
+            vault_kek_provider = Some(active.clone());
+            (active, legacy)
         }
         other => {
             return Err(anyhow::anyhow!(
@@ -381,6 +384,7 @@ pub(crate) async fn build_core_services(
         compiler,
         compilation_event_tx,
         secrets_manager,
+        vault_kek_provider,
     })
 }
 

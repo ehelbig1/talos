@@ -211,6 +211,11 @@ background_tasks! {
     ActorPolicyCacheSweep       => "actor_policy_cache_sweep",
     PublicUrlDiscovery          => "public_url_discovery",
     EngineRateLimitEviction     => "engine_rate_limit_eviction",
+
+    // ── 2026-09-14: the Vault KEK-token renewal loop. Declines on an
+    // env-KEK deployment (no Vault provider) and on a token with no TTL;
+    // ends — a real finding — only when the token cannot be renewed.
+    VaultTokenRenewal           => "vault_token_renewal",
 }
 
 /// Why a supervised body stopped running.
@@ -286,6 +291,9 @@ pub enum DeclineReason {
     /// A policy choice this task refuses to guess was not made
     /// explicitly, so it withholds itself rather than run unverified.
     PolicyNotExplicit,
+    /// The thing this task maintains needs no maintenance under this
+    /// configuration — e.g. a Vault token with no TTL has nothing to renew.
+    NotNeeded,
 }
 
 impl DeclineReason {
@@ -296,6 +304,7 @@ impl DeclineReason {
             DeclineReason::NotConfigured => "not_configured",
             DeclineReason::FeatureDisabled => "feature_disabled",
             DeclineReason::PolicyNotExplicit => "policy_not_explicit",
+            DeclineReason::NotNeeded => "not_needed",
         }
     }
 }

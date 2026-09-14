@@ -48,8 +48,10 @@
 #   - `secrets enable transit` + `write -f transit/keys/$KEK` swallow
 #     "already exists" errors.
 #   - `policy write` is upsert by design.
-#   - Token mint creates a NEW token each run (cheap; old tokens
-#     orphan-expire at -period=768h max).
+#   - Token mint creates a NEW token each run (cheap; an unused one
+#     expires at its -period=768h, since nothing renews it). Only the
+#     first run's token reaches the controller — see step 8 — and the
+#     controller keeps THAT one alive by renewing it.
 #   - Secret patch only fires when VAULT_TOKEN is a known placeholder.
 #   - Controller rollout only fires if the deployment exists.
 #
@@ -256,8 +258,14 @@ spec:
 
               # ── 7. Mint an orphan periodic token under the policy ───
               # -orphan: not revoked when its parent (root) is revoked.
-              # -period=768h: token auto-renews every 32d as long as the
-              #   controller is calling Vault; expires after 32d silence.
+              # -period=768h: each RENEWAL restores a full 32-day TTL.
+              #   Vault does NOT renew a token because it is used —
+              #   measured 2026-09-14, a periodic token used for transit
+              #   every 10 s expired on schedule — so the controller runs
+              #   its own renew-self loop (VaultTransitProvider::
+              #   run_token_renewal: at boot, then at most hourly) and
+              #   counts it on talos_vault_token_renewals_total. Without
+              #   that loop this token expired 32 days after install.
               TOKEN_JSON="$(kubectl -n "$NAMESPACE" exec "$VAULT_POD" -- \
                   env VAULT_TOKEN="$ROOT_TOKEN" \
                   vault token create \

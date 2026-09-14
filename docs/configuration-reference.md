@@ -113,7 +113,7 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | `DEK_CACHE_TTL_SECS` | `300` | controller | DEK cache TTL | |
 | `LLM_KEYS_CACHE_TTL_SECS` | `60` | controller | Per-user TTL of the vault-first LLM provider-key cache (`get_llm_vault_keys`); short so a `rotate_secret` propagates within one window. `=0` ⇒ default + WARN (would turn every dispatch into a DB miss) | |
 | `VAULT_ADDR` (+`_FILE`) | none | controller | HashiCorp Vault address | 🔒 |
-| `VAULT_TOKEN` (+`_FILE`) | none | controller | Vault auth token | 🔒 |
+| `VAULT_TOKEN` (+`_FILE`) | none | controller | Vault auth token for the transit KEK (`KEK_PROVIDER=vault`). Read ONCE at boot. The controller renews it itself (`auth/token/renew-self` at boot, then at a third of the remaining TTL, at most hourly — `talos_vault_token_renewals_total`), so mint it renewable: a periodic token with no explicit max TTL (`-period=768h -orphan`) lives indefinitely. A production boot REFUSES a token with a finite TTL that is not renewable; a renewable token bounded by a max TTL boots with an ERROR and expires at that ceiling (`TalosVaultTokenCapped`). | 🔒 |
 | `VAULT_TRANSIT_KEY_NAME` (+`_FILE`) | `talos-kek` | controller | Vault transit key name | 🔒 |
 | `VAULT_TRANSIT_MOUNT` (+`_FILE`) | `transit` | controller | Vault transit mount path | 🔒 |
 | `VAULT_CACERT` | none (optional) | controller | Vault CA certificate path | 🔒 |

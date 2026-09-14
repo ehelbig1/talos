@@ -4450,3 +4450,116 @@ evaluation records is a separate decision about audit value. The embedding
 backfill and grandfather writers (they never touched `updated_at`, before or
 after). No lint: the predicate has one home and the population of example
 upserts is one statement.
+
+### Package BA (2026-09-14) — the KEK token nothing renewed
+
+**Found by the survey that followed deploy 48**, in the Vault layer, which no
+earlier pass had read. With `KEK_PROVIDER=vault` (the chart default, and the
+posture every production boot is steered toward by the `prod-kek-guard`)
+every DEK wrap and unwrap is a transit call authenticated by one token.
+
+**Measured, in order:**
+- `grep renew-self` over the workspace: zero calls. `VaultTransitProvider`
+  called `lookup-self` once, inside `health_check`, at boot.
+- The chart's `templates/vault/init-job.yaml` mints the controller token
+  `-period=768h -orphan` under a comment claiming it "auto-renews every 32d as
+  long as the controller is calling Vault"; `docker-compose.yml` said of
+  `dev-root` that it "never expires as long as it's being used".
+- **The claim is false.** On the dev Vault a throwaway 45 s periodic token was
+  used for `transit/encrypt` on `talos-kek` every 10 s: TTL 45 → 35 → 25 → 15
+  → 5, then encrypt 403, lookup gone. Revoked afterwards.
+- The Job re-runs on every upgrade and mints a new token each time, but patches
+  the bootstrap Secret only while `VAULT_TOKEN` is still a placeholder. After
+  the first install the controller keeps the first token forever — so it
+  expired 32 days after install and took the KEK path with it.
+- Dev never showed it: the dev controller runs `KEK_PROVIDER=env`, and compose's
+  vault-init looks `dev-root` up on every `make up` and recreates it when the
+  lookup fails. The current `dev-root` was issued 2026-09-11 16:05 with
+  `last_renewal_time: None` and expires 2026-10-13.
+- Response shapes captured from Vault 1.18 with four throwaway tokens:
+  `lookup-self` carries `data.ttl`, `data.renewable`, `data.explicit_max_ttl`,
+  `data.creation_ttl`, and `data.period` ONLY on a periodic token; a top-level
+  `renewable: false` / `lease_duration: 0` describes the RESPONSE, not the
+  token. `renew-self` answers `auth.lease_duration` / `auth.renewable`; with
+  `explicit_max_ttl=320` an `increment=600s` request came back
+  `lease_duration: 320` with a "TTL value is capped" warning; a non-renewable
+  token answers 400 `lease is not renewable`; a periodic token ignores the
+  increment and returns its period.
+
+**Latent, stated plainly**: there is no production deployment, and the dev
+stack does not use the Vault KEK path. Every installer-built cluster would
+have hit it on day 32.
+
+**Decisions.**
+- **Production refuses a finite, non-renewable token at boot** — the operator's
+  call (2026-09-14). No escape hatch, deliberately: the token is read once at
+  construction, so no configuration exists in which booting on it ends
+  otherwise than in an outage at its TTL.
+- A renewable token bounded by a max TTL boots with an ERROR, not a refusal:
+  renewal keeps it alive until its ceiling, and `TalosVaultTokenCapped` fires
+  when that ceiling is reached, which is when a replacement is due.
+- Renew immediately at boot, then at a third of the remaining TTL, at most
+  hourly (at least 5 s); after a failure, a third of what is believed left, at
+  most a minute. A failing Vault never ends the loop.
+- The increment is the period (periodic) or the token's creation TTL
+  (bounded). Omitting it asks for the mount default, which can exceed the
+  token's TTL and would read as a false cap.
+- `talos_vault_token_renewals_total{outcome}` is seeded by the LOOP, not in
+  `TalosMetrics::new`: only a process running a Vault KEK provider can move it
+  (check 58's rule on seeding unreachable series). `talos_vault_token_ttl_seconds{lifetime}`
+  is not seeded — a reading, and a seeded 0 would say "expires now" — and
+  carries exactly one lifetime class at a time.
+- The loop is supervised (`BackgroundTask::VaultTokenRenewal`). A token with no
+  TTL is `Declined(NotNeeded)` (a new `DeclineReason`); a token that never was,
+  or no longer is, renewable is `LoopEnded` — a finding, because it will
+  expire.
+- Alerts derived from the cadence, not guessed: a healthy renewable token has a
+  success in every two-hour window, so `TalosVaultTokenRenewalFailing`
+  (critical) is failures with no `renewed`/`capped` in 2 h, `for: 15m`;
+  `TalosVaultTokenCapped` (warning) is any capped renewal in 2 h. No `absent()`
+  arm: absence is an env-KEK cluster with nothing to renew.
+
+**Guards.**
+- 15 unit tests in `talos-secrets-manager` (`vault_token_renewal_tests.rs`)
+  against an axum mock Vault serving the measured shapes: classification by
+  table, the posture decision, renewal outcome, schedule bounds; the production
+  refusal through the real `health_check_in`; the loop renewing at once and
+  repeatedly, counting capped, retrying failures, ending on a no-longer-renewable
+  answer, seeding, and returning without renewing for non-renewable and
+  non-expiring tokens.
+- `talos-metrics`: both series absent on a cold registry, seeded by the seed
+  call, one lifetime class at a time.
+- Controller: the stop → `TaskExit` mapping; a textual pin that `main` spawns the
+  loop with the provider `build_core_services` kept.
+- promtool: an hourly-renewal fixture with a short outage (quiet), failures
+  after the last success (quiet at 230 m, which a 1 h success window would
+  fire on), a dead token (fires); a capped renewal (fires); capped renewals
+  between failures (renewal-failing stays quiet).
+- `talos-secrets-manager/tests/vault_token_renewal_live.rs`, `ci-ungated` (CI
+  runs no Vault), against the REAL dev Vault: two identical 4 s periodic tokens
+  under a transit-only policy, both used every 500 ms for 10 s, one renewed by
+  the loop. The control was refused at iteration 8 (~4 s); the renewed token
+  wrapped all 20 times with 11 renewals.
+
+**Mutations, seventeen, each confirmed landed and byte-reverted.** M1 posture
+never refuses, M2 health check skips the posture, M3 classify ignores
+`renewable`, M4 first renewal waits a third of the TTL, M5 capped counted as
+renewed, M6 a failure ends the loop, M7 a no-longer-renewable answer keeps
+looping, M8 the loop does not seed, M9 explicit max ignored, M10 bounded
+increment drops the creation TTL, M11 the gauge keeps stale classes, M12 `main`
+does not spawn, M13 a non-renewable stop reported as a decline, M14 a 1 h success
+window, M16 the capped alert's threshold raised — caught. **Two first SURVIVED**:
+M15 (dropping `capped` from the renewal-failing alert's success set — no
+fixture held failures and capped renewals in one window) and M17 (defaulting
+`ttl` — the missing-fields test's lookup body also lacked `renewable`, so it
+failed for the wrong reason). Both fixtures were tightened; re-run, both caught.
+Before the run, three tests were also rewritten because reading them against
+their mutation showed they could not fail: "renewed at once" could not see a
+delayed first renewal under a schedule whose cap bounds every delay, `count()`
+creates the series it was meant to prove seeded, and the missing-fields mock
+served no transit routes, so a defaulted `ttl` still failed on the probe.
+
+**Not changed.** The Job still patches the Secret only while it holds a
+placeholder: re-minting and swapping the controller's token on every upgrade is
+token rotation, a different design. No AppRole re-login for a bounded token.
+No lint — one provider; the loop, the refusal and the pins are the guard.

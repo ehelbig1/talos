@@ -9,7 +9,7 @@
 //! - DLQ metrics
 
 use prometheus::{
-    exponential_buckets, Counter, CounterVec, Gauge, HistogramVec, IntGauge, Registry,
+    exponential_buckets, Counter, CounterVec, Gauge, HistogramVec, IntGauge, IntGaugeVec, Registry,
 };
 use std::sync::{Arc, OnceLock};
 
@@ -19,12 +19,14 @@ pub mod mcp;
 pub mod outcome_class;
 pub mod rpc;
 pub mod security;
+pub mod vault_token;
 pub use execution::ModuleExecutionOutcome;
 pub use google_push::{JwkRefreshOutcome, PushIntegration, PushRefusalReason};
 pub use mcp::McpToolOutcome;
 pub use outcome_class::OutcomeClass;
 pub use rpc::{seeded_pairs as rpc_seeded_pairs, RpcOutcome, RpcSubject};
 pub use security::{ApiKeyValidation, McpAuthOutcome, RateLimitKind, TwoFactorOutcome};
+pub use vault_token::{VaultTokenLifetimeLabel, VaultTokenRenewalOutcome};
 
 /// The complete, closed set of `subject` label values on
 /// `talos_rpc_write_ceiling_refusals_total` — the NATS subjects on which the
@@ -473,6 +475,70 @@ pub fn record_google_push_refusal_on(
         .google_push_refusals_total
         .with_label_values(&[integration.as_str(), reason.as_str()])
         .inc();
+}
+
+/// Seed every `talos_vault_token_renewals_total` outcome at 0. Called by the
+/// Vault token renewal loop when it starts — NOT by [`TalosMetrics::new`],
+/// because only a process running a Vault KEK provider can move the series.
+/// Inert without [`set_global`].
+pub fn seed_vault_token_renewals() {
+    if let Some(m) = global() {
+        seed_vault_token_renewals_on(m);
+    }
+}
+
+/// The seeding itself, against an EXPLICIT registry.
+pub fn seed_vault_token_renewals_on(metrics: &TalosMetrics) {
+    for outcome in VaultTokenRenewalOutcome::ALL {
+        metrics
+            .vault_token_renewals_total
+            .with_label_values(&[outcome.as_str()])
+            .inc_by(0.0);
+    }
+}
+
+/// Count one Vault token renewal attempt. Inert without [`set_global`].
+pub fn record_vault_token_renewal(outcome: VaultTokenRenewalOutcome) {
+    if let Some(m) = global() {
+        record_vault_token_renewal_on(m, outcome);
+    }
+}
+
+/// The recording itself, against an EXPLICIT registry.
+pub fn record_vault_token_renewal_on(metrics: &TalosMetrics, outcome: VaultTokenRenewalOutcome) {
+    metrics
+        .vault_token_renewals_total
+        .with_label_values(&[outcome.as_str()])
+        .inc();
+}
+
+/// Publish the Vault token's remaining TTL under its lifetime class, removing
+/// every other class so exactly one series is present. Inert without
+/// [`set_global`].
+pub fn publish_vault_token_ttl(lifetime: VaultTokenLifetimeLabel, ttl_secs: u64) {
+    if let Some(m) = global() {
+        publish_vault_token_ttl_on(m, lifetime, ttl_secs);
+    }
+}
+
+/// The publication itself, against an EXPLICIT registry.
+pub fn publish_vault_token_ttl_on(
+    metrics: &TalosMetrics,
+    lifetime: VaultTokenLifetimeLabel,
+    ttl_secs: u64,
+) {
+    for other in VaultTokenLifetimeLabel::ALL {
+        if *other != lifetime {
+            // Absent is the only honest reading for a class the token is not.
+            let _ = metrics
+                .vault_token_ttl_seconds
+                .remove_label_values(&[other.as_str()]);
+        }
+    }
+    metrics
+        .vault_token_ttl_seconds
+        .with_label_values(&[lifetime.as_str()])
+        .set(i64::try_from(ttl_secs).unwrap_or(i64::MAX));
 }
 
 /// Count one attempt to fetch Google's JWK set. Inert without [`set_global`].
@@ -1480,6 +1546,13 @@ pub struct TalosMetrics {
     // seeded over their closed sets (`google_push`).
     pub google_push_refusals_total: CounterVec,
     pub google_jwk_refresh_total: CounterVec,
+
+    // Vault KEK-token renewal — added 2026-09-14 after the controller's transit
+    // token was found to be minted periodic and renewed by nothing
+    // (`vault_token`). The counter is seeded by the renewal loop, not here:
+    // only a process running a Vault KEK provider can move it.
+    pub vault_token_renewals_total: CounterVec,
+    pub vault_token_ttl_seconds: IntGaugeVec,
 
     // `talos_cache_hits_total{cache_type}` / `talos_cache_misses_total` were
     // DELETED 2026-09-11: registered since 2026-05 with a comment naming three
@@ -2767,6 +2840,37 @@ impl TalosMetrics {
                 .inc_by(0.0);
         }
 
+        // Vault KEK-token renewal
+        let vault_token_renewals_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_vault_token_renewals_total",
+                "auth/token/renew-self attempts on the controller's Vault KEK token \
+                 (KEK_PROVIDER=vault), by outcome: renewed (full increment granted) | capped \
+                 (Vault granted less, or the token stopped being renewable: it has reached \
+                 its maximum TTL and WILL expire) | failed (no successful answer). A healthy \
+                 renewable token renews at least once an hour. ABSENT on a deployment with \
+                 no Vault KEK provider (seeded at 0 by the renewal loop, not at \
+                 registration). Alerted by TalosVaultTokenRenewalFailing and \
+                 TalosVaultTokenCapped.",
+            ),
+            &["outcome"],
+        )?;
+        registry.register(Box::new(vault_token_renewals_total.clone()))?;
+        let vault_token_ttl_seconds = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "talos_vault_token_ttl_seconds",
+                "Seconds until the controller's Vault KEK token expires, as Vault last \
+                 reported it (boot lookup-self, then every renewal), labelled by the \
+                 token's lifetime class: periodic | renewable_bounded | expiring | \
+                 non_expiring (value 0 = no TTL). Exactly one lifetime is present at a \
+                 time; ABSENT when no Vault KEK provider runs. Not seeded (a reading, not a \
+                 count) and not alerted directly — read it beside \
+                 talos_vault_token_renewals_total to see how long a capped token has left.",
+            ),
+            &["lifetime"],
+        )?;
+        registry.register(Box::new(vault_token_ttl_seconds.clone()))?;
+
         // (cache_hits_total / cache_misses_total were deleted 2026-09-11 — see
         // the struct field comment.)
 
@@ -3237,6 +3341,8 @@ impl TalosMetrics {
             rate_limit_hits_total,
             google_push_refusals_total,
             google_jwk_refresh_total,
+            vault_token_renewals_total,
+            vault_token_ttl_seconds,
             dlq_entries_total,
             dlq_drops_total,
             dlq_db_errors_total,
@@ -3685,6 +3791,43 @@ mod tests {
         ));
         assert!(warm.contains("talos_google_jwk_refresh_total{outcome=\"failed\"} 1"));
         assert!(warm.contains("talos_google_jwk_refresh_total{outcome=\"ok\"} 0"));
+    }
+
+    /// The Vault token instruments (2026-09-14) are ABSENT on a cold registry —
+    /// no Vault KEK provider has started — the seed brings all three outcomes
+    /// to 0, each recorder moves exactly its outcome, and the TTL gauge carries
+    /// exactly ONE lifetime class at a time.
+    #[test]
+    fn vault_token_instruments_are_absent_until_seeded_and_one_lifetime_at_a_time() {
+        let m = TalosMetrics::new().unwrap();
+        let cold = m.render_prometheus().expect("render");
+        assert!(
+            !cold.contains("talos_vault_token_renewals_total{"),
+            "an env-KEK process must not expose renewal series nothing can move"
+        );
+        assert!(!cold.contains("talos_vault_token_ttl_seconds{"));
+
+        seed_vault_token_renewals_on(&m);
+        let seeded = m.render_prometheus().expect("render");
+        for o in VaultTokenRenewalOutcome::ALL {
+            assert!(seeded.contains(&format!(
+                "talos_vault_token_renewals_total{{outcome=\"{}\"}} 0",
+                o.as_str()
+            )));
+        }
+
+        record_vault_token_renewal_on(&m, VaultTokenRenewalOutcome::Capped);
+        publish_vault_token_ttl_on(&m, VaultTokenLifetimeLabel::Periodic, 2_764_800);
+        publish_vault_token_ttl_on(&m, VaultTokenLifetimeLabel::RenewableBounded, 3600);
+        let warm = m.render_prometheus().expect("render");
+        assert!(warm.contains("talos_vault_token_renewals_total{outcome=\"capped\"} 1"));
+        assert!(warm.contains("talos_vault_token_renewals_total{outcome=\"renewed\"} 0"));
+        assert!(warm.contains("talos_vault_token_renewals_total{outcome=\"failed\"} 0"));
+        assert!(warm.contains("talos_vault_token_ttl_seconds{lifetime=\"renewable_bounded\"} 3600"));
+        assert!(
+            !warm.contains("talos_vault_token_ttl_seconds{lifetime=\"periodic\"}"),
+            "a class the token is no longer must be removed, not left stale"
+        );
     }
 
     /// The three security counters that sat DEAD in check 58's baseline for
