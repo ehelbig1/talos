@@ -168,6 +168,11 @@ struct CoreServices {
     compiler: std::sync::Arc<CompilationService>,
     compilation_event_tx: broadcast::Sender<crate::engine::events::CompilationEvent>,
     secrets_manager: std::sync::Arc<SecretsManager>,
+    /// The Vault KEK provider when `KEK_PROVIDER=vault` — held so its token
+    /// can be renewed for the life of the process
+    /// (`spawn_vault_token_renewal`). `None` on an env-KEK deployment.
+    vault_kek_provider:
+        Option<std::sync::Arc<crate::secrets::vault_kek_provider::VaultTransitProvider>>,
 }
 
 /// The integration / auth / OAuth / webhook service pile. Field order
@@ -428,6 +433,10 @@ async fn main() -> anyhow::Result<()> {
     // Embedding re-probe + crypto-invariant orphan gauges + worker build-skew
     // gauge + DB-pool gauges.
     spawn_metrics_gauge_tasks(db_pool.clone(), services.worker_manager.clone());
+
+    // Vault KEK-token renewal. After `build_platform_services`, which installs
+    // the metrics global the loop records against.
+    crate::bootstrap::background::spawn_vault_token_renewal(core.vault_kek_provider.clone());
 
     // Worker-fleet NATS heartbeat: the subscriber + the four
     // `talos_worker_fleet_*` gauges. `start_worker_management` had ZERO call

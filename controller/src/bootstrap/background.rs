@@ -1659,6 +1659,44 @@ pub(crate) fn spawn_metrics_gauge_tasks(
     }
 }
 
+/// Keep the Vault KEK token alive (2026-09-14).
+///
+/// Nothing renewed this token before: Vault does not extend a token because it
+/// is used, so the chart's `-period=768h` controller token took every DEK wrap
+/// and unwrap down 32 days after install. The loop renews immediately, then at
+/// a third of the remaining TTL (at most hourly), and counts every attempt on
+/// `talos_vault_token_renewals_total{outcome}`.
+pub(crate) fn spawn_vault_token_renewal(
+    provider: Option<std::sync::Arc<crate::secrets::vault_kek_provider::VaultTransitProvider>>,
+) {
+    spawn_supervised(BackgroundTask::VaultTokenRenewal, async move {
+        let Some(provider) = provider else {
+            return TaskExit::Declined(DeclineReason::NotConfigured);
+        };
+        let stop = provider
+            .run_token_renewal(
+                crate::secrets::vault_kek_provider::RenewalSchedule::DEFAULT,
+                talos_metrics::global().map(|m| m.as_ref()),
+            )
+            .await;
+        vault_token_renewal_exit(stop)
+    });
+}
+
+/// How a returned renewal loop is reported. A token with no TTL is a DECLINE
+/// (nothing to maintain); a token that cannot be renewed is a FINDING — it
+/// will expire and take the KEK path with it, so it must not render as a
+/// quiet decline.
+fn vault_token_renewal_exit(
+    stop: crate::secrets::vault_kek_provider::TokenRenewalStop,
+) -> TaskExit {
+    use crate::secrets::vault_kek_provider::TokenRenewalStop as S;
+    match stop {
+        S::NotNeeded => TaskExit::Declined(DeclineReason::NotNeeded),
+        S::NotRenewable | S::NoLongerRenewable => TaskExit::LoopEnded,
+    }
+}
+
 /// OCI registry background sync loop. Extracted verbatim from `main()` —
 /// must start AFTER `seed_templates` / `seed_marketplace`.
 pub(crate) fn spawn_registry_sync(registry: std::sync::Arc<ModuleRegistry>) {
@@ -6986,8 +7024,9 @@ mod task_supervision_wiring_tests {
     /// `grandfather_embedding_model` one-shot, the crash-recovery startup
     /// sweep, and the actor-memory embedding backfill — each a single
     /// awaited call that is meant to finish) minus, from 2026-09-08,
-    /// `start_worker_management`, which was never a loop at all.
-    const EXPECTED_SUPERVISED: usize = 41;
+    /// `start_worker_management`, which was never a loop at all — plus, from
+    /// 2026-09-14, the Vault KEK-token renewal loop (42).
+    const EXPECTED_SUPERVISED: usize = 42;
 
     /// The remaining bare `tokio::spawn` calls in THIS file, deliberately
     /// unwrapped because each is a one-shot whose death is bounded to one
@@ -7037,6 +7076,36 @@ mod task_supervision_wiring_tests {
              changed. If you added a long-lived loop, wrap it; if you added a \
              genuine one-shot, update EXPECTED_BARE and name it above."
         );
+    }
+
+    /// A renewal loop that returns because the token CANNOT be renewed is
+    /// reported as a finding (ERROR + `TalosBackgroundTaskExited`), not as a
+    /// quiet decline: the token will expire and every DEK operation with it.
+    /// Only a token with no TTL at all is a decline.
+    #[test]
+    fn a_vault_token_that_cannot_be_renewed_is_a_finding_not_a_decline() {
+        use crate::secrets::vault_kek_provider::TokenRenewalStop as S;
+        use talos_task_supervision::{DeclineReason, TaskExit};
+        assert_eq!(
+            super::vault_token_renewal_exit(S::NotNeeded),
+            TaskExit::Declined(DeclineReason::NotNeeded)
+        );
+        for stop in [S::NotRenewable, S::NoLongerRenewable] {
+            let exit = super::vault_token_renewal_exit(stop);
+            assert_eq!(exit, TaskExit::LoopEnded, "{stop:?}");
+            assert!(exit.is_finding(), "{stop:?}");
+        }
+    }
+
+    /// The renewal loop must be spawned from `main` with the provider the
+    /// bootstrap kept. Textual, stated as such: dropping the call leaves every
+    /// behavioural test green and the token silently un-renewed again.
+    #[test]
+    fn main_spawns_the_vault_token_renewal_with_the_kept_provider() {
+        let main = include_str!("../main.rs");
+        assert!(main.contains("spawn_vault_token_renewal(core.vault_kek_provider.clone())"));
+        let services = include_str!("services.rs");
+        assert!(services.contains("vault_kek_provider = Some(active.clone());"));
     }
 
     /// **The launcher must not come back.** Wrapping a function that

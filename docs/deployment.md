@@ -69,7 +69,7 @@ The production overlay:
 | `KEK_PROVIDER` | `env` (dev, uses `TALOS_MASTER_KEY`) or `vault` (prod, uses Vault transit) | `vault` |
 | `TALOS_MASTER_KEY` | (dev-only) Envelope-encryption KEK, 32-byte hex. Used when `KEK_PROVIDER=env`. Production deployments MUST use `vault` and leave this unset so the key never lives in process memory. | `<random-64-char-hex>` |
 | `VAULT_ADDR` | Vault API endpoint. Required when `KEK_PROVIDER=vault`. | `https://vault.internal:8200` |
-| `VAULT_TOKEN` | Vault token with `transit/encrypt` + `transit/decrypt` caps on `talos-kek` only. Issue via a transit-only policy; do not reuse a root token. | `hvs.xxx...` |
+| `VAULT_TOKEN` | Vault token with `transit/encrypt` + `transit/decrypt` caps on `talos-kek` only. Issue via a transit-only policy; do not reuse a root token. Make it a renewable PERIODIC token (`-period=768h -orphan`): the controller renews it hourly; production refuses a non-renewable token with a TTL. | `hvs.xxx...` |
 | `VAULT_TRANSIT_MOUNT` | Transit engine mount path. Default `transit`. | `transit` |
 | `VAULT_TRANSIT_KEY_NAME` | Key name under the transit mount. Default `talos-kek`. | `talos-kek` |
 | `OAUTH_STATE_SECRET` | Secret for signing OAuth state tokens | `<random-32-char>` |

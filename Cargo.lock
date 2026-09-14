@@ -9357,6 +9357,7 @@ dependencies = [
  "aes-gcm",
  "anyhow",
  "async-trait",
+ "axum",
  "base64 0.22.1",
  "chrono",
  "dashmap 6.2.1",

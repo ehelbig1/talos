@@ -426,8 +426,11 @@ services:
           echo "vault-init: dev-root token already present"
         else
           vault token revoke dev-root 2>/dev/null || true
-          # Periodic orphan token: auto-renews every 768h, never expires as
-          # long as it's being used. Safe choice for a dev-only credential.
+          # Periodic orphan token (768h). It is NOT renewed by use — Vault
+          # only extends a token on an explicit renew-self (measured
+          # 2026-09-14) — so it lapses 32 days after it is minted unless a
+          # KEK_PROVIDER=vault controller renews it. The lookup above then
+          # fails on the next `make up` and this recreates it.
           vault token create -id=dev-root -orphan -policy=root -period=768h -display-name=dev-root >/dev/null
         fi
         echo "vault-init: dev-root token ready"
