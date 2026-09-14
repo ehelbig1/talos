@@ -267,6 +267,18 @@ proxy timestamp 45 days old. Once `ledger_since` is older than the list's 30-day
 window the proxy adds nothing and can be removed; an operator loses nothing by
 that removal, and until then loses the only pre-ledger signal.
 
+**Update 2026-09-14: the proxy is removed.** Removed eight days into the ledger's
+life, before its floor predated the window, on measurement rather than on the
+calendar: of the five dormant workflows on the reference deployment, the two
+children the ledger records (6 and 18 runs) needed nothing from it, and the other
+three carried proxy timestamps from July — outside the 30-day window, so the
+proxy said nothing the list did not. The population it could still have helped —
+a child with fuel activity between the window's start and `ledger_since` and no
+recorded run — was zero. The rendering it leaves behind is honest by itself: a
+child the ledger has not seen reads "anything before that date is UNKNOWN", and a
+child whose ledger read FAILED — the one row the proxy had still been speaking
+for — now renders `CHILD_LEDGER_NOT_READ_NOTE` instead of nothing.
+
 **3. The four uncovered dispatch kinds.** `dispatch`, `capability_dispatch`,
 `agent_loop` and `react_loop` now record. `ChildRunSite` is threaded through
 `try_dispatch_dynamic_dispatch`, `try_dispatch_capability_dispatch` and

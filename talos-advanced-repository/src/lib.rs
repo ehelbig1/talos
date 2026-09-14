@@ -957,10 +957,8 @@ pub const ORPHAN_STATE_GRACE_DAYS: i32 = 1;
 /// deliberately not a knob: lowering it below the widest reader window is the
 /// defect above, and raising it buys nothing any reader can ask for.
 ///
-/// The demoted `last_child_activity_at` proxy in the hygiene report reads
-/// `MAX(recorded_at)` unbounded; a workflow whose last rollup row is older
-/// than this reads `null` there instead of a >90-day-old timestamp, which the
-/// report's dormancy threshold (30 days) treats identically.
+/// (The hygiene report's `last_child_activity_at` proxy, which read
+/// `MAX(recorded_at)` unbounded, was removed 2026-09-14.)
 pub const EXECUTION_COST_ROLLUP_RETENTION_DAYS: i32 = 90;
 
 /// Resolve tier five's window: `TALOS_AUDIT_TABLE_RETENTION_DAYS`, default

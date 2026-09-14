@@ -644,9 +644,6 @@ async fn the_hygiene_rows_carry_the_ledgers_answer() {
         "the note must refute the list's own premise: {}",
         ev.note()
     );
-    // The proxy is the thing being superseded and is legitimately NULL here —
-    // which is the whole point: it has 0% recall on this shape.
-    assert_eq!(dormant.last_child_activity_at, None);
 
     // The STALE-DRAFT list is the destructive one, and the ledger answers its
     // premise ("never executed") directly.

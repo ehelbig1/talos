@@ -990,15 +990,6 @@ pub struct DormantWorkflowRow {
     /// this one. Non-empty ⇒ this workflow is somebody's child and its silence
     /// in `workflow_executions` is expected, not evidence of neglect.
     pub runs_as_child_of: Vec<String>,
-    /// Most recent `execution_cost_rollup.recorded_at` attributed to this
-    /// workflow id. A LOWER BOUND on child activity, never a run record — see
-    /// [`DORMANT_CHILD_ACTIVITY_CAVEAT`].
-    ///
-    /// **Superseded by [`Self::last_child_run_at`] for any period after the
-    /// child-run ledger's floor, and KEPT rather than deleted.** See
-    /// [`DORMANT_CHILD_ACTIVITY_CAVEAT`] for the measurement and
-    /// [`ChildRunEvidence`] for why both are rendered.
-    pub last_child_activity_at: Option<DateTime<Utc>>,
     /// What the child-run ledger says about this workflow (RFC 0012 P2).
     /// `None` when the ledger was not read; the variant inside says whether
     /// the ledger could speak for the period at all.
@@ -1067,27 +1058,16 @@ pub const DORMANT_ARCHIVED_NOTE: &str =
      deleting them. Since 2026-09-07 they also will not RUN: every dispatch path refuses an \
      archived workflow, so a dormant archived row is retired in fact and not only in the listing.";
 
-/// What `last_child_activity_at` is worth, stated so a `null` there cannot be
-/// read as a second, independent "it never ran".
+/// What a child row says when the child-run ledger could not be read.
 ///
-/// `execution_cost_rollup` is written only when a node returns
-/// `__fuel_consumed__ > 0`, and `execute_subworkflow_graph` runs the child
-/// under a fresh `Uuid::new_v4()`, so most child rows land under a synthetic
-/// workflow id that matches no workflow. Measured on the reference deployment
-/// 2026-09-05: the `crm_recall` node produced 21 rollup rows, of which **2**
-/// carried the child's real workflow id and 19 were synthetic — and in the
-/// 30-day window the child had ONE attributed row while its parent ran ~21
-/// times. Roughly 5% recall.
-pub const DORMANT_CHILD_ACTIVITY_CAVEAT: &str =
-    "Lower bound only, and SUPERSEDED by last_child_run_at for any period after ledger_since. \
-     execution_cost_rollup records a row per node that burned fuel, and an in-process \
-     sub-workflow run usually lands under a synthetic workflow id, so a null here is NOT \
-     evidence the child never ran. Measured on the reference deployment 2026-09-07, the worst \
-     case is 0% and not 5%: one child whose parent ran 5085 times in 30 days (461 of them in \
-     48 h) has ZERO rollup rows in the whole window and a proxy timestamp 45 days old. This \
-     field is retained ONLY because it can speak for the period BEFORE the child-run ledger's \
-     first row; once ledger_since is older than this list's 30-day window it adds nothing and \
-     can be removed.";
+/// A failed ledger read leaves `child_runs: None` on every child row; the
+/// renderer must say so rather than render nothing, because silence beside
+/// `last_execution: null` reads as "never ran". Until 2026-09-14 the demoted
+/// `last_child_activity_at` fuel-rollup proxy and its caveat still appeared on
+/// such a row; with the proxy removed this note is what speaks for it.
+pub const CHILD_LEDGER_NOT_READ_NOTE: &str =
+    "The child-run ledger (sub_workflow_runs) could not be read for this report, so whether \
+     this workflow ran as a sub-workflow is UNKNOWN — not zero, and not evidence it never ran.";
 
 /// The child-reference scan — who dispatches into whom — re-exported from the
 /// crate that owns it.
@@ -5512,9 +5492,7 @@ impl AnalyticsRepository {
                  WHERE w.user_id = $1 AND {dormant_dispatchable} \
                    AND w.created_at < NOW() - INTERVAL '30 days' \
              ) \
-             SELECT w.id, w.name, w.created_at, lr.last_execution, \
-                    (SELECT MAX(r.recorded_at) FROM execution_cost_rollup r \
-                      WHERE r.workflow_id = w.id) AS last_child_activity_at \
+             SELECT w.id, w.name, w.created_at, lr.last_execution \
              FROM workflows w \
              JOIN last_run lr ON lr.id = w.id \
              WHERE lr.last_execution IS NULL \
@@ -5543,8 +5521,6 @@ impl AnalyticsRepository {
                         // row cannot answer "who dispatches into me?" from its
                         // own table.
                         runs_as_child_of: Vec::new(),
-                        last_child_activity_at: r
-                            .try_get::<Option<_>, _>("last_child_activity_at")?,
                         // Filled in at the join site from the child-run
                         // ledger — a `workflows` row cannot answer "did I
                         // run?" from its own table, which is the whole point.
@@ -5797,19 +5773,17 @@ impl AnalyticsRepository {
 
             // ── The child-run ledger (RFC 0012 P2) ────────────────────────
             //
-            // The proxy this replaces — `MAX(execution_cost_rollup.recorded_at)`
-            // — is a LOWER BOUND on fuel-burning node activity that usually
-            // lands under a synthetic workflow id. Measured 2026-09-07 on the
-            // reference deployment: one child whose parent ran 461 times in
-            // 48 h has ZERO rollup rows in the whole 30-day window and a proxy
-            // timestamp 45 days old. `sub_workflow_runs` records the RUN.
+            // The proxy this replaced — `MAX(execution_cost_rollup.recorded_at)`,
+            // a LOWER BOUND on fuel-burning node activity that usually landed
+            // under a synthetic workflow id (0% recall measured 2026-09-07) —
+            // was removed 2026-09-14. `sub_workflow_runs` records the RUN.
             //
             // ONE batched read over the DORMANT ∪ STALE-DRAFT children — the
             // same candidate set the scan just ran over, narrowed to the rows
             // the scan says are somebody's child, so a report with no children
             // costs no query. A read FAILURE leaves `child_runs: None` on
-            // every row, which renders as "the ledger was not read" and never
-            // as a count of zero.
+            // every child row, which the renderer turns into
+            // [`CHILD_LEDGER_NOT_READ_NOTE`] and never into a count of zero.
             let mut ledger_candidates: Vec<Uuid> = dormant_workflows
                 .iter()
                 .filter(|r| !r.runs_as_child_of.is_empty())
@@ -5853,8 +5827,7 @@ impl AnalyticsRepository {
                             error = %e,
                             event_kind = "hygiene_child_ledger_read_failed",
                             "hygiene: child-run ledger unreadable — the dormant and \
-                             stale-draft child rows fall back to the execution_cost_rollup \
-                             proxy alone, which is a lower bound and not a run record"
+                             stale-draft child rows render that whether they ran is UNKNOWN"
                         );
                     }
                 }
