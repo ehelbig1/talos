@@ -44,10 +44,12 @@ pub enum OrchestrationError {
     #[error("execution {0} was archived at {1}")]
     ExecutionArchived(Uuid, chrono::DateTime<chrono::Utc>),
 
-    /// Caller paused workflow execution globally (`pause_executions`
-    /// MCP tool). Re-fires once `resume_executions` is called.
-    #[error("workflow execution is currently paused at the platform level")]
-    ExecutionPaused,
+    /// The deployment-wide execution pause refused the start
+    /// (`pause_executions`; `talos_execution_pause`). Carries WHY: `Paused`,
+    /// or `Unreadable` — a stored flag that is not a JSON boolean, which is
+    /// refused rather than read as running.
+    #[error("workflow execution is refused by the platform-level execution pause ({})", .0.as_str())]
+    ExecutionPaused(talos_metrics::PauseRefusal),
 
     /// Workflow `is_enabled = false`. Different from `Paused` because
     /// this is a per-workflow toggle, not a platform-wide drain.
@@ -156,7 +158,7 @@ impl OrchestrationError {
             // is refused because of the row's CURRENT state. Not -32001 —
             // that code means "no such thing".
             Self::ExecutionArchived(..) => -32003,
-            Self::ExecutionPaused
+            Self::ExecutionPaused(_)
             | Self::WorkflowDisabled(_)
             | Self::WorkflowNotLive(..)
             | Self::WorkflowArchived(_)
@@ -191,7 +193,10 @@ mod tests {
             OrchestrationError::WorkflowNotFound(Uuid::nil()).jsonrpc_code(),
             -32001
         );
-        assert_eq!(OrchestrationError::ExecutionPaused.jsonrpc_code(), -32003);
+        assert_eq!(
+            OrchestrationError::ExecutionPaused(talos_metrics::PauseRefusal::Paused).jsonrpc_code(),
+            -32003
+        );
         assert_eq!(
             OrchestrationError::AuthorizationDenied("denied".into()).jsonrpc_code(),
             -32004

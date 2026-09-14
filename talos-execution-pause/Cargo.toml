@@ -1,0 +1,16 @@
+[package]
+name = "talos-execution-pause"
+description = "The one home for the deployment-wide execution pause (system_settings.execution_paused): a typed three-valued read, the writer, and the admission decision every start path shares"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "json"] }
+talos-metrics = { path = "../talos-metrics" }
+
+[lints]
+workspace = true

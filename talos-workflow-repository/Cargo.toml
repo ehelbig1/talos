@@ -24,6 +24,7 @@ talos-tenancy = { path = "../talos-tenancy" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-engine-events = { path = "../talos-engine-events" }
 talos-execution-finalizer = { path = "../talos-execution-finalizer" }
+talos-execution-pause = { path = "../talos-execution-pause" }
 talos-metrics = { path = "../talos-metrics" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 talos-text-util = { path = "../talos-text-util" }

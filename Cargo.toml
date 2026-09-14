@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "talos-execution-finalizer",
+    "talos-execution-pause",
     "talos-dlp",
     "talos-secrets",
     "talos-audit-event",

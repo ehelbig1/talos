@@ -183,14 +183,15 @@ impl ExecutionOrchestrationService {
             wait_ms,
         } = input;
 
-        // 1. Platform-level pause gate.
-        if self
-            .workflow_repo
-            .is_execution_paused()
-            .await
-            .map_err(OrchestrationError::Internal)?
+        // 1. Platform-level pause gate (`talos_execution_pause`, the one home).
+        if let Some(reason) = talos_execution_pause::gate_start(
+            self.workflow_repo.pool(),
+            talos_metrics::PauseGatePath::Trigger,
+        )
+        .await
+        .map_err(OrchestrationError::Database)?
         {
-            return Err(OrchestrationError::ExecutionPaused);
+            return Err(OrchestrationError::ExecutionPaused(reason));
         }
 
         // 2. Workflow load + ownership + is_enabled.
@@ -447,6 +448,11 @@ impl ExecutionOrchestrationService {
                     talos_workflow_liveness::dispatch::DispatchPath::Trigger,
                 );
                 return Err(OrchestrationError::WorkflowArchived(workflow_id));
+            }
+            // The pause was set between the entry gate above and the INSERT;
+            // the repository counted it as `row_creation`.
+            talos_workflow_repository::ConcurrencyAdmission::ExecutionsPaused(reason) => {
+                return Err(OrchestrationError::ExecutionPaused(reason));
             }
             talos_workflow_repository::ConcurrencyAdmission::LimitReached { limit, running } => {
                 return Err(OrchestrationError::ConcurrencyLimitExceeded(format!(

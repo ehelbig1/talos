@@ -127,6 +127,7 @@ talos-workflow-engine = { path = "../talos-workflow-engine" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 talos-metrics = { path = "../talos-metrics" }
+talos-execution-pause = { path = "../talos-execution-pause" }
 talos-workflow-liveness = { path = "../talos-workflow-liveness" }
 talos-workflow-repository = { path = "../talos-workflow-repository" }
 talos-workflow-types = { path = "../talos-workflow-types" }

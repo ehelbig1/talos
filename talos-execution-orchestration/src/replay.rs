@@ -91,13 +91,12 @@ impl ExecutionOrchestrationService {
     ) -> Result<ExecutionOutcome, OrchestrationError> {
         // 1. Platform-level pause gate. Drains background dispatch
         // without ripping out the queue.
-        let paused = self
-            .execution_repo
-            .is_execution_paused()
-            .await
-            .map_err(OrchestrationError::Internal)?;
-        if paused {
-            return Err(OrchestrationError::ExecutionPaused);
+        if let Some(reason) =
+            talos_execution_pause::gate_start(&self.db_pool, talos_metrics::PauseGatePath::Replay)
+                .await
+                .map_err(OrchestrationError::Database)?
+        {
+            return Err(OrchestrationError::ExecutionPaused(reason));
         }
 
         // 2. Load the original execution (single SQL with ownership

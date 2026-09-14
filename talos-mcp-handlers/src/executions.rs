@@ -220,7 +220,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "pause_executions",
-            "description": "(Admin only) Pause the execution queue. New workflow triggers will be rejected until resumed. Requires admin privileges — returns an error for non-admin agents.",
+            "description": "(Platform admin only) Pause every new workflow start, deployment-wide, until resume_executions. Due schedules are DEFERRED (each fires once on the first poll after resume), inbound webhooks and Gmail pushes are answered 503 so the sender redelivers, and trigger/call/bulk/enqueue/test/retry/replay are refused. Runs already in flight finish; crash-recovery resumes, sub-workflows of a running parent and chained workflows are not stopped. Returns an error for non-platform-admin callers.",
             "inputSchema": {
                 "type": "object",
                 "properties": {},
@@ -2734,7 +2734,7 @@ async fn handle_pause_executions(
              The execution-paused flag is deployment-wide state that affects every tenant.",
         );
     }
-    match state.execution_repo.set_execution_paused(true).await {
+    match talos_execution_pause::set_execution_paused(&state.db_pool, true).await {
         Ok(_) => {
             // MCP-398 (2026-05-11): persistent audit on a deployment-
             // wide DoS gate. The auth gate from MCP-323 prevents
@@ -2757,7 +2757,7 @@ async fn handle_pause_executions(
             );
             mcp_text(
                 req_id,
-                "Execution queue paused. New workflow triggers will be rejected until resumed.",
+                "Execution queue paused (deployment-wide). Due schedules are deferred and fire once after resume; inbound webhooks and Gmail pushes get 503 so the sender redelivers; manual starts are refused. Runs already in flight finish.",
             )
         }
         Err(e) => {
@@ -2792,7 +2792,7 @@ async fn handle_resume_executions(
              The execution-paused flag is deployment-wide state that affects every tenant.",
         );
     }
-    match state.execution_repo.set_execution_paused(false).await {
+    match talos_execution_pause::set_execution_paused(&state.db_pool, false).await {
         Ok(_) => {
             // MCP-398 (2026-05-11): paired audit to pause_executions
             // above. Without the resume event, an attacker who paused
@@ -3176,6 +3176,31 @@ async fn handle_enqueue_workflow(
                 "input_index": idx,
                 "execution_id": serde_json::Value::Null,
                 "status": "archived",
+                "error": msg,
+            }));
+        }
+        return mcp_text(
+            req_id,
+            &serde_json::to_string_pretty(&serde_json::json!({
+                "queued": 0,
+                "rate_per_second": rate_per_second,
+                "executions": results,
+                "monitor_with": null
+            }))
+            .unwrap_or_default(),
+        );
+    }
+
+    // The execution pause, set after this handler's entry gate (the repository
+    // counted the refusal as `row_creation`). Its own status for `archived`'s
+    // reason: nothing was written, and `throttled` would misstate why.
+    if let Some(reason) = admission.paused {
+        let msg = talos_execution_pause::refusal_message(reason);
+        for idx in 0..inputs.len() {
+            results.push(serde_json::json!({
+                "input_index": idx,
+                "execution_id": serde_json::Value::Null,
+                "status": "paused",
                 "error": msg,
             }));
         }

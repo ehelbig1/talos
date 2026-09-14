@@ -588,6 +588,11 @@ CTRL_TESTS=(
     # due-claim SQL, whose `overdue_secs` projection no unit test can see.
     # `common` harness, so CTRL_TESTS (64b).
     "scheduler_catchup_phase_tests"
+    # The deployment-wide execution pause (package BF, 2026-09-14): its writer
+    # bound TEXT into jsonb and had never succeeded, and the scheduler, webhook
+    # router and Gmail push never read it. Drives the one home, the row-creation
+    # chokepoint and the scheduler's defer-not-drop claim against a real clone.
+    "execution_pause_tests"
     "workflow_version_tests"
     # #609's closing provenance test (measurement PR 3, D7). Gated here on
     # arrival rather than later: it is the ONLY coverage of the promoted-vs-

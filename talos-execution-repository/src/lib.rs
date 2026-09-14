@@ -1101,28 +1101,9 @@ impl ExecutionRepository {
 
     // ── System settings ────────────────────────────────────────────────────
 
-    /// Returns true if global execution queue is paused.
-    pub async fn is_execution_paused(&self) -> Result<bool> {
-        let paused: Option<bool> = sqlx::query_scalar(
-            "SELECT (value)::text = 'true' FROM system_settings WHERE key = 'execution_paused'",
-        )
-        .fetch_optional(&self.db_pool)
-        .await?;
-        Ok(paused.unwrap_or(false))
-    }
-
-    /// Upserts the execution_paused system setting.
-    pub async fn set_execution_paused(&self, paused: bool) -> Result<()> {
-        let value = if paused { "true" } else { "false" };
-        sqlx::query(
-            "INSERT INTO system_settings (key, value) VALUES ('execution_paused', $1) \
-             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-        )
-        .bind(value)
-        .execute(&self.db_pool)
-        .await?;
-        Ok(())
-    }
+    // The execution-pause read and write moved to `talos_execution_pause`
+    // (package BF, 2026-09-14): this copy's writer bound TEXT into the jsonb
+    // `system_settings.value` column and had never once succeeded.
 
     // ── Execution reads ────────────────────────────────────────────────────
 
