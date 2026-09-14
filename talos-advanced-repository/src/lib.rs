@@ -894,7 +894,11 @@ pub struct SideTableReap {
     pub llm_usage: u64,
     /// `judge_scores` rows older than the total execution lifetime.
     pub judge_scores: u64,
-    /// Any of the three stopped at the per-tick cap with a full last batch.
+    /// `execution_cost_rollup` rows older than
+    /// [`EXECUTION_COST_ROLLUP_RETENTION_DAYS`] — its own clock, not the
+    /// lifetime.
+    pub execution_cost_rollup: u64,
+    /// Any of the four stopped at the per-tick cap with a full last batch.
     pub truncated: bool,
 }
 
@@ -934,6 +938,30 @@ pub const MIN_AUDIT_TABLE_RETENTION_DAYS: i32 = 30;
 /// execution row is being created; one day is three orders of magnitude of
 /// margin over that.
 pub const ORPHAN_STATE_GRACE_DAYS: i32 = 1;
+
+/// Days an `execution_cost_rollup` row is kept, on its OWN clock rather than
+/// the total execution lifetime tier four's other tables use.
+///
+/// Why it exists (2026-09-14): the table had a writer (`talos-cost-attribution`,
+/// one row per fuel-burning node) and no reaper — 59 023 rows / 24 MB from
+/// 2026-07-08 on the reference deployment, growing ~9 000 rows a week — while
+/// `llm_usage` and `judge_scores` beside it were reaped since 2026-09-10.
+///
+/// Why 90 and not the 60-day lifetime: the rollup is read by trailing-window
+/// REPORTS, and the widest is `get_workflow_node_timing_breakdown`, whose MCP
+/// tool accepts `days` up to 90. Reaping at 60 would make a 90-day request
+/// silently answer over 60 days — a report asserting a window it cannot read.
+/// Every other reader asks for ≤ 31 days (adaptive fuel 30, fuel headroom 30,
+/// per-module fuel stats ≤ 30, weekly fuel ≤ 31, the hourly/daily budget
+/// gates), and `node_fuel_history` is clamped to this value. A CONSTANT and
+/// deliberately not a knob: lowering it below the widest reader window is the
+/// defect above, and raising it buys nothing any reader can ask for.
+///
+/// The demoted `last_child_activity_at` proxy in the hygiene report reads
+/// `MAX(recorded_at)` unbounded; a workflow whose last rollup row is older
+/// than this reads `null` there instead of a >90-day-old timestamp, which the
+/// report's dormancy threshold (30 days) treats identically.
+pub const EXECUTION_COST_ROLLUP_RETENTION_DAYS: i32 = 90;
 
 /// Resolve tier five's window: `TALOS_AUDIT_TABLE_RETENTION_DAYS`, default
 /// [`DEFAULT_AUDIT_TABLE_RETENTION_DAYS`], never below
@@ -1061,17 +1089,21 @@ impl RetentionPassOutcome {
         // Tier four / five (2026-09-10). Same rule as above: a count and an
         // error are different answers and both are reported.
         if let Some(s) = &self.side_tables {
-            if s.execution_state_orphans + s.llm_usage + s.judge_scores > 0 {
+            if s.execution_state_orphans + s.llm_usage + s.judge_scores + s.execution_cost_rollup
+                > 0
+            {
                 tracing::info!(
                     target: "talos_engine",
                     event_kind = "execution_side_tables_reaped",
                     execution_state_orphans = s.execution_state_orphans,
                     llm_usage = s.llm_usage,
                     judge_scores = s.judge_scores,
+                    execution_cost_rollup = s.execution_cost_rollup,
+                    cost_rollup_retention_days = EXECUTION_COST_ROLLUP_RETENTION_DAYS,
                     lifetime_days = self
                         .windows
                         .map_or(-1, |w| w.archive_after_days.saturating_add(w.purge_after_days)),
-                    "reaped execution side-table rows past the total execution lifetime"
+                    "reaped execution side-table rows past their retention windows"
                 );
             }
         }
@@ -1635,6 +1667,13 @@ impl AdvancedRepository {
     ///   execution archived before the move started deleting state (see
     ///   [`archive_move_sql`]), plus any sandbox run that wrote state without
     ///   an execution row. `days` is not used for this statement.
+    /// * `execution_cost_rollup` rows older than
+    ///   [`EXECUTION_COST_ROLLUP_RETENTION_DAYS`] (clocked on `recorded_at`).
+    ///   `days` is not used for this statement either: the rollup's widest
+    ///   reader window is longer than the execution lifetime. Measured at
+    ///   ~13 ms per batch over 59 k rows with no dedicated `recorded_at`
+    ///   index, on a 6-hourly tick — so none is added (an index is a write on
+    ///   every node completion).
     ///
     /// Statements run in sequence; the first `Err` aborts the tier and is
     /// propagated, with the counts of the tables that DID sweep lost for that
@@ -1685,6 +1724,16 @@ impl AdvancedRepository {
              )",
             batch = RETENTION_BATCH
         );
+        let rollup_sql = format!(
+            "DELETE FROM execution_cost_rollup WHERE id IN ( \
+                 SELECT id FROM execution_cost_rollup \
+                 WHERE recorded_at < NOW() - make_interval(days => $1::int) \
+                 ORDER BY recorded_at, id \
+                 LIMIT {batch} \
+                 FOR UPDATE SKIP LOCKED \
+             )",
+            batch = RETENTION_BATCH
+        );
         let llm = run_batched(&self.db_pool, &llm_sql, days, "reap_llm_usage").await?;
         let judge = run_batched(&self.db_pool, &judge_sql, days, "reap_judge_scores").await?;
         let orphans = run_batched(
@@ -1694,11 +1743,19 @@ impl AdvancedRepository {
             "reap_execution_state_orphans",
         )
         .await?;
+        let rollup = run_batched(
+            &self.db_pool,
+            &rollup_sql,
+            EXECUTION_COST_ROLLUP_RETENTION_DAYS,
+            "reap_execution_cost_rollup",
+        )
+        .await?;
         Ok(SideTableReap {
             execution_state_orphans: orphans.rows,
             llm_usage: llm.rows,
             judge_scores: judge.rows,
-            truncated: llm.truncated || judge.truncated || orphans.truncated,
+            execution_cost_rollup: rollup.rows,
+            truncated: llm.truncated || judge.truncated || orphans.truncated || rollup.truncated,
         })
     }
 
@@ -4403,6 +4460,53 @@ mod audit_retention_clamp_tests {
     #[test]
     fn the_default_is_above_the_floor() {
         assert!(DEFAULT_AUDIT_TABLE_RETENTION_DAYS >= MIN_AUDIT_TABLE_RETENTION_DAYS);
+    }
+
+    /// Every reader of `execution_cost_rollup` whose window is caller-chosen
+    /// must be bounded by the reaper's window, or a report asserts history the
+    /// reaper deleted. Textual pins (stated as such) over the two sites whose
+    /// bound is not already ≤ 31 days: the MCP performance report's `days`
+    /// range must NAME the constant, and `node_fuel_history`'s clamp must not
+    /// exceed it. Adding a wider reader elsewhere is not caught here.
+    #[test]
+    fn cost_rollup_readers_never_ask_past_the_retention_window() {
+        let mcp = include_str!("../../talos-mcp-handlers/src/analytics.rs");
+        let start = mcp
+            .find("async fn handle_get_workflow_performance_report(")
+            .expect("performance report handler moved");
+        let body = &mcp[start..];
+        let call = body
+            .find(".get_workflow_node_timing_breakdown(")
+            .expect("the handler no longer reads the rollup timing breakdown");
+        let range = body
+            .find("validate_range_i64(")
+            .expect("the handler no longer validates `days`");
+        assert!(range < call, "`days` must be validated before the read");
+        let range_stmt = &body[range..range + body[range..].find(';').unwrap()];
+        assert!(
+            range_stmt.contains("EXECUTION_COST_ROLLUP_RETENTION_DAYS"),
+            "the performance report's `days` bound must be the rollup retention: {range_stmt}"
+        );
+
+        let exec = include_str!("../../talos-execution-repository/src/lib.rs");
+        let start = exec
+            .find("pub async fn node_fuel_history(")
+            .expect("node_fuel_history moved");
+        let body = &exec[start..start + exec[start..].find("sqlx::query_as").unwrap()];
+        let clamp = body
+            .find("days.clamp(1, ")
+            .expect("node_fuel_history clamp moved");
+        let upper: i32 = body[clamp + "days.clamp(1, ".len()..]
+            .split(')')
+            .next()
+            .unwrap()
+            .trim()
+            .parse()
+            .expect("clamp upper bound is not an integer literal");
+        assert!(
+            upper <= EXECUTION_COST_ROLLUP_RETENTION_DAYS,
+            "node_fuel_history may ask for {upper} days of a table kept {EXECUTION_COST_ROLLUP_RETENTION_DAYS}"
+        );
     }
 
     /// `truncated()` and `failed()` see every tier, including the two added

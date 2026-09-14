@@ -4700,3 +4700,60 @@ cannot run — recorded, not fixed. A tool reached through a shim that needs mor
 of the shell's environment than PATH is out of range. Nothing re-derives the PATH
 after install; `status` is what notices a tool that moved. No lint check was
 added — population two schedulers, both now sourcing the one helper.
+
+### Package BD (2026-09-14) — a fuel ledger with a writer and no reaper
+
+**How it was found.** Package AT's retention survey recorded that no sweep
+touches `execution_cost_rollup` (891 rows past the 60-day lifetime then, "no
+reader-side harm"). The operator's follow-up decision was to reap it at 90 days.
+
+**Measured, in order:**
+- 59 023 rows / 24 MB, oldest 2026-07-08, ~9 000 rows a week and rising;
+  969 rows past 60 days, 0 past 90.
+- Fourteen statements read or write the table. Reader windows: the hourly
+  fuel-per-hour admission gate (1 h), the daily budget (since midnight),
+  adaptive fuel (30 d), the fuel-headroom gauge and tool (30 d), per-module
+  fuel stats (≤ 30 d), weekly fuel totals (≤ 31 d), `node_fuel_history`
+  (clamped to 365, one caller passing 30), `get_execution_node_fuel` (by
+  execution id), the hygiene report's unbounded `MAX(recorded_at)` proxy, and
+  `get_workflow_performance_report`'s node timing, which accepts `days` up to
+  **90**.
+- Tier four of the retention pass (`reap_execution_side_tables`) already reaps
+  `llm_usage` and `judge_scores` on the total execution lifetime (60 days by
+  default), every 6 hours, unconditionally.
+- The batched delete over the live table: ~12–14 ms per batch, through
+  `idx_cost_rollup_workflow`'s trailing column when nothing qualifies and a
+  seq scan + sort when rows do. No index leads on `recorded_at`.
+
+**Decisions.**
+- The rollup joins tier four, on its own 90-day clock
+  (`EXECUTION_COST_ROLLUP_RETENTION_DAYS`). The lifetime clock was rejected:
+  at 60 days a 90-day performance report would answer over 60 days and not
+  say so.
+- A constant, not a knob. Below the widest reader window it recreates the
+  defect; above it no reader can ask for the extra history.
+- No `recorded_at` index. Thirteen milliseconds every six hours does not pay
+  for an index write on every node completion.
+- The two reader bounds that could exceed 90 were aligned: the performance
+  report's `days` range names the constant, `node_fuel_history` clamps to 90.
+- The demoted child-activity proxy reads `null` for a workflow whose newest
+  rollup row is older than 90 days. Under the report's 30-day dormancy
+  threshold that is the same answer, and its caveat already says a null is not
+  evidence of no run. Its removal stays scheduled for on or after 2026-10-06.
+
+**Guards.** The tier-four DB test seeds rollup rows at 91, 70 and 5 days and
+reaps with a 60-day lifetime: only the 91-day row goes, and a non-positive
+lifetime reaps nothing. `cost_rollup_readers_never_ask_past_the_retention_window`
+is a textual pin over the two aligned reader bounds.
+
+**Mutations, six, each confirmed landed and byte-reverted.** The rollup reaped
+on the lifetime clock, the rollup reap not run, the constant lowered to 60,
+`node_fuel_history`'s clamp back at 365 and the performance report's range back
+to a literal 90 — five caught. **M6 (the `truncated` flag ignoring the rollup)
+is a measured SURVIVOR**, as expected below.
+
+**Stated limits.** A new reader with a wider window elsewhere is not caught by
+the pin. The `truncated` flag's rollup arm and the log line's new field have no
+test; a backlog large enough to truncate needs more than 100 000 qualifying
+rows. `talos_cost_attribution::get_actor_cost_report` has no caller in the
+workspace — recorded, not removed.
