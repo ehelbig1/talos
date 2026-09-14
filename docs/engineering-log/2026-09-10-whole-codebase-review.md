@@ -4757,3 +4757,51 @@ the pin. The `truncated` flag's rollup arm and the log line's new field have no
 test; a backlog large enough to truncate needs more than 100 000 qualifying
 rows. `talos_cost_attribution::get_actor_cost_report` has no caller in the
 workspace — recorded, not removed.
+
+### Package BE (2026-09-14) — the demoted child-activity proxy is removed
+
+**How it was asked.** The operator asked to remove `last_child_activity_at` from
+the hygiene report now rather than on 2026-10-06, the date the ledger's floor
+would predate the report's 30-day window.
+
+**Measured, in order:**
+- `sub_workflow_runs` floor: 2026-09-06 14:37 — eight days, not thirty.
+- The dormant list on the reference deployment, all users: five workflows.
+  `cos-team-recall` (proxy 09-14, ledger 6 runs) and `pa-quality-judge` (ledger
+  18 runs) — the ledger answers both. `pa-ask`, `pa-ask-grounded`,
+  `pa-followup-approve-send` — proxy timestamps 07-21 to 07-24, outside the
+  window, ledger 0; the proxy adds nothing the dormancy test did not already say.
+- The only rows the proxy could still help: a child with fuel activity between
+  the window start and the ledger floor and no recorded run. Zero.
+- Every consumer of the field: the analytics repository (struct, subselect,
+  mapping, caveat constant), the hygiene renderer, one hygiene unit fixture, one
+  DB-test assertion, RFC 0012, and a retention constant's comment. No GraphQL,
+  frontend or tool description names it.
+
+**The finding the removal exposed.** The analytics repository's comment said a
+failed ledger read "renders as 'the ledger was not read'". The renderer returned
+early on `None` and rendered nothing. The proxy and its caveat were the only
+fields still on such a row, so removing them alone would have left a dormant
+child with `last_execution: null` and no evidence — the reading RFC 0012 exists
+to remove.
+
+**Decisions.**
+- Remove now. The measured population the proxy could serve is zero, and what
+  replaces it is not silence: "anything before that date is UNKNOWN" for a
+  child the ledger has not seen, and `CHILD_LEDGER_NOT_READ_NOTE` for a child
+  whose read failed.
+- The renderer takes `is_child`. `child_runs: None` means "the read failed" on a
+  child and nothing on a non-child stale draft (only children are read), so one
+  `None` arm cannot render one sentence for both.
+- The unread child renders the three ledger keys as null alongside the note, so
+  the row's shape does not depend on whether the read succeeded.
+
+**Guards.** A render test over a real `build_report` covering an unread child,
+a measured child (control), a non-child dormant row, an unread stale-draft child
+and a non-child stale draft, asserting the proxy text never appears. Five
+mutations, each landed and byte-reverted, all caught — after tightening the test
+first: indexing a missing key in `serde_json` yields `Null`, so the original
+`is_null()` check would have passed with the key removed.
+
+**Stated limits.** The ledger-read-failure path is driven by the render test
+only; no DB test fails the ledger read. The warn line's wording is untested.

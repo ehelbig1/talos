@@ -461,11 +461,23 @@ impl PartialCount {
 /// `last_child_run_at` is the field that supersedes the
 /// `execution_cost_rollup` proxy: the proxy timestamps a node that burned
 /// fuel, this timestamps the RUN.
+/// `is_child` is whether the graph scan named this row somebody's child. Only
+/// a child's ledger is read, so `evidence: None` means the read FAILED for a
+/// child — which must be said, since silence beside `last_execution: null`
+/// reads as "never ran" — and means nothing at all for a non-child.
 fn attach_child_run_evidence(
     entry: &mut serde_json::Value,
+    is_child: bool,
     evidence: Option<&talos_analytics_repository::ChildRunEvidence>,
 ) {
     let Some(ev) = evidence else {
+        if is_child {
+            entry["last_child_run_at"] = serde_json::Value::Null;
+            entry["child_runs_since_ledger"] = serde_json::Value::Null;
+            entry["ledger_since"] = serde_json::Value::Null;
+            entry["child_run_note"] =
+                serde_json::json!(talos_analytics_repository::CHILD_LEDGER_NOT_READ_NOTE);
+        }
         return;
     };
     entry["last_child_run_at"] = serde_json::json!(ev.last_run_at.map(|t| t.to_rfc3339()));
@@ -883,15 +895,9 @@ pub fn build_report(
                 entry["runs_as_child_of"] = serde_json::json!(r.runs_as_child_of);
                 entry["last_execution_note"] =
                     serde_json::json!(talos_analytics_repository::DORMANT_CHILD_NOTE);
-                // RFC 0012 P2: the LEDGER first — it records the run — with
-                // the fuel-rollup proxy kept beneath it and demoted, because
-                // it is the only thing that can speak for the period BEFORE
-                // the ledger's first row.
-                attach_child_run_evidence(&mut entry, r.child_runs.as_ref());
-                entry["last_child_activity_at"] =
-                    serde_json::json!(r.last_child_activity_at.map(|t| t.to_rfc3339()));
-                entry["last_child_activity_caveat"] =
-                    serde_json::json!(talos_analytics_repository::DORMANT_CHILD_ACTIVITY_CAVEAT);
+                // RFC 0012 P2: the LEDGER records the run. The fuel-rollup
+                // proxy that used to sit beneath it was removed 2026-09-14.
+                attach_child_run_evidence(&mut entry, true, r.child_runs.as_ref());
             }
             entry
         })
@@ -930,7 +936,11 @@ pub fn build_report(
             // RFC 0012 P2. On THIS list the ledger answers the query's own
             // premise: "never executed" is a claim about `workflow_executions`,
             // and a non-zero `child_runs_since_ledger` refutes it outright.
-            attach_child_run_evidence(&mut entry, r.child_runs.as_ref());
+            attach_child_run_evidence(
+                &mut entry,
+                !r.runs_as_child_of.is_empty(),
+                r.child_runs.as_ref(),
+            );
             entry
         })
         .collect();
@@ -2405,6 +2415,93 @@ mod partial_report_disclosure_tests {
         );
     }
 
+    /// The fuel-rollup proxy (`last_child_activity_at` + its caveat) was
+    /// removed 2026-09-14. What spoke for a child row whose ledger read FAILED
+    /// was that proxy; now it is `CHILD_LEDGER_NOT_READ_NOTE`, and it must be
+    /// rendered on a CHILD with no evidence and on nothing else — a non-child
+    /// has no ledger read to fail. CONTROL: a child with evidence renders the
+    /// evidence's own note.
+    #[test]
+    fn a_child_row_with_an_unread_ledger_says_so_and_the_proxy_is_gone() {
+        let not_read = talos_analytics_repository::CHILD_LEDGER_NOT_READ_NOTE;
+        let mut h = HygieneReport::empty(ledger(&[]));
+        let mut child = dormant("child");
+        child.runs_as_child_of = vec!["parent".to_string()];
+        let mut measured = dormant("measured-child");
+        measured.runs_as_child_of = vec!["parent".to_string()];
+        let since = chrono::Utc::now() - chrono::Duration::days(8);
+        measured.child_runs = Some(talos_analytics_repository::ChildRunEvidence {
+            runs: 3,
+            last_run_at: Some(chrono::Utc::now()),
+            ledger_since: Some(since),
+        });
+        h.dormant_workflows = vec![child, measured, dormant("not-a-child")];
+        h.stale_draft_workflows = vec![
+            talos_analytics_repository::StaleDraftRow {
+                id: uuid::Uuid::new_v4(),
+                name: "draft-child".to_string(),
+                created_at: chrono::Utc::now(),
+                graph_json: None,
+                runs_as_child_of: vec!["parent".to_string()],
+                child_protection_reason: Some("dispatched by parent".to_string()),
+                child_runs: None,
+            },
+            talos_analytics_repository::StaleDraftRow {
+                id: uuid::Uuid::new_v4(),
+                name: "draft-plain".to_string(),
+                created_at: chrono::Utc::now(),
+                graph_json: None,
+                runs_as_child_of: Vec::new(),
+                child_protection_reason: None,
+                child_runs: None,
+            },
+        ];
+        let r = build_report(
+            &h,
+            &talos_push_channel_inventory::PushChannelReadout::NotConsulted,
+        )
+        .report;
+        let text = serde_json::to_string(&r).expect("render");
+        assert!(
+            !text.contains("last_child_activity"),
+            "the removed proxy must not come back: {text}"
+        );
+        let by_name = |list: &str, name: &str| -> serde_json::Value {
+            r[list]
+                .as_array()
+                .expect("list rendered")
+                .iter()
+                .find(|e| e["name"] == name)
+                .cloned()
+                .unwrap_or_else(|| panic!("{name} not rendered in {list}"))
+        };
+        let child = by_name("dormant_workflows", "child");
+        assert_eq!(child["child_run_note"], not_read, "{child}");
+        assert!(
+            child
+                .get("child_runs_since_ledger")
+                .is_some_and(serde_json::Value::is_null),
+            "UNKNOWN is not zero, and the key must be present: {child}"
+        );
+        let measured = by_name("dormant_workflows", "measured-child");
+        assert!(
+            measured["child_run_note"]
+                .as_str()
+                .is_some_and(|n| n.contains("This workflow RUNS")),
+            "{measured}"
+        );
+        assert_eq!(measured["child_runs_since_ledger"], 3);
+        let plain = by_name("dormant_workflows", "not-a-child");
+        assert!(plain.get("child_run_note").is_none(), "{plain}");
+        let draft_child = by_name("stale_draft_workflows", "draft-child");
+        assert_eq!(draft_child["child_run_note"], not_read, "{draft_child}");
+        let draft_plain = by_name("stale_draft_workflows", "draft-plain");
+        assert!(
+            draft_plain.get("child_run_note").is_none(),
+            "a non-child has no ledger read that could fail: {draft_plain}"
+        );
+    }
+
     /// The `archived_excluded` sentence lost its `\`-continuations at some
     /// point and shipped runs of ~23 spaces into operator-facing JSON — seen
     /// live 2026-09-08. A rendered recommendation must carry no mid-sentence
@@ -2675,7 +2772,6 @@ mod partial_report_disclosure_tests {
             created_at: chrono::Utc::now(),
             last_execution: None,
             runs_as_child_of: Vec::new(),
-            last_child_activity_at: None,
             child_runs: None,
         }
     }
