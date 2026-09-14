@@ -1413,6 +1413,19 @@ async fn seed_llm_usage(f: &Fixture, age_days: i32) -> Uuid {
     .unwrap()
 }
 
+async fn seed_cost_rollup(f: &Fixture, age_days: i32) -> Uuid {
+    sqlx::query_scalar(
+        "INSERT INTO execution_cost_rollup (workflow_id, execution_id, node_id, fuel_consumed, recorded_at) \
+         VALUES ($1, $2, 'n', 1, NOW() - make_interval(days => $3::int)) RETURNING id",
+    )
+    .bind(f.workflow)
+    .bind(Uuid::new_v4())
+    .bind(age_days)
+    .fetch_one(&f.pool)
+    .await
+    .unwrap()
+}
+
 async fn seed_judge_score(f: &Fixture, age_days: i32) -> Uuid {
     sqlx::query_scalar(
         "INSERT INTO judge_scores (workflow_id, node_id, execution_id, score, passed, created_at) \
@@ -1513,7 +1526,8 @@ async fn archival_move_deletes_the_victims_execution_state() {
     );
 }
 
-/// Tier four: `llm_usage` / `judge_scores` past the total lifetime go,
+/// Tier four: `llm_usage` / `judge_scores` past the total lifetime go (the
+/// cost rollup past its own 90-day window, and NOT at the lifetime),
 /// recent rows stay; an orphaned state row older than the grace goes, a
 /// young orphan and a live execution's state stay; non-positive days refuse.
 #[tokio::test]
@@ -1529,6 +1543,11 @@ async fn side_table_reap_is_clocked_on_total_lifetime_and_spares_the_young() {
     seed_state(&f, orphan_old, "k", 3).await;
     let orphan_young = Uuid::new_v4();
     seed_state(&f, orphan_young, "k", 0).await;
+    // The rollup is on its OWN 90-day clock: a 70-day row is past the 60-day
+    // lifetime passed below and must survive it.
+    let rollup_old = seed_cost_rollup(&f, 91).await;
+    let rollup_past_lifetime = seed_cost_rollup(&f, 70).await;
+    let rollup_new = seed_cost_rollup(&f, 5).await;
 
     let refused = f.repo.reap_execution_side_tables(0).await.unwrap();
     assert_eq!(
@@ -1537,11 +1556,22 @@ async fn side_table_reap_is_clocked_on_total_lifetime_and_spares_the_young() {
         "non-positive days must delete nothing"
     );
     assert!(row_exists(&f, "llm_usage", old_llm).await);
+    assert!(
+        row_exists(&f, "execution_cost_rollup", rollup_old).await,
+        "non-positive days must not reap the rollup either"
+    );
 
     let reap = f.repo.reap_execution_side_tables(60).await.unwrap();
     assert!(reap.llm_usage >= 1, "{reap:?}");
     assert!(reap.judge_scores >= 1, "{reap:?}");
     assert!(reap.execution_state_orphans >= 1, "{reap:?}");
+    assert!(reap.execution_cost_rollup >= 1, "{reap:?}");
+    assert!(!row_exists(&f, "execution_cost_rollup", rollup_old).await);
+    assert!(
+        row_exists(&f, "execution_cost_rollup", rollup_past_lifetime).await,
+        "a rollup row past the execution lifetime but inside its own retention is kept"
+    );
+    assert!(row_exists(&f, "execution_cost_rollup", rollup_new).await);
     assert!(!row_exists(&f, "llm_usage", old_llm).await);
     assert!(row_exists(&f, "llm_usage", new_llm).await);
     assert!(!row_exists(&f, "judge_scores", old_judge).await);

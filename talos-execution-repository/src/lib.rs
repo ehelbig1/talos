@@ -1564,7 +1564,12 @@ impl ExecutionRepository {
         user_id: Uuid,
         days: i32,
     ) -> Result<Option<(i64, i64, i64)>> {
-        let days = days.clamp(1, 365);
+        // Never wider than `execution_cost_rollup`'s retention
+        // (`talos_advanced_repository::EXECUTION_COST_ROLLUP_RETENTION_DAYS`,
+        // 90): a longer window would report history the reaper has deleted
+        // as if it had been read. Pinned by that crate's
+        // `cost_rollup_readers_never_ask_past_the_retention_window`.
+        let days = days.clamp(1, 90);
         let row: (i64, i64, i64) = sqlx::query_as(
             "SELECT COUNT(*)::bigint, \
                     COALESCE(percentile_cont(0.5) WITHIN GROUP (ORDER BY r.fuel_consumed), 0)::bigint, \

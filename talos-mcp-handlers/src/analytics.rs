@@ -5617,7 +5617,16 @@ async fn handle_get_workflow_performance_report(
         Err(resp) => return resp,
     };
 
-    let days: i32 = match crate::utils::validate_range_i64(args, "days", 1, 90, 7, &req_id) {
+    // The node-timing half of this report reads `execution_cost_rollup`, so
+    // the window may not exceed that table's retention.
+    let days: i32 = match crate::utils::validate_range_i64(
+        args,
+        "days",
+        1,
+        i64::from(talos_advanced_repository::EXECUTION_COST_ROLLUP_RETENTION_DAYS),
+        7,
+        &req_id,
+    ) {
         Ok(v) => v as i32,
         Err(resp) => return resp,
     };
