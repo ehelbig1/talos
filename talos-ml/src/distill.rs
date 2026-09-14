@@ -495,6 +495,11 @@ async fn process_distill(
             example_key: i.example_key.clone(),
         })
         .collect();
+    // Items offered to the append, logged beside `appended` (rows INSERTED or
+    // CHANGED). A re-distill of examples the dataset already holds unchanged is
+    // `submitted > 0, appended = 0` — the no-op the upsert now recognises —
+    // and without both numbers that reads as a dropped batch.
+    let submitted = append.len();
     let prepared = ctx
         .dataset_service
         .prepare_examples(dataset_id, tenancy, append)
@@ -517,6 +522,7 @@ async fn process_distill(
         target: "talos_ml",
         model = model_name,
         state = state.as_str(),
+        submitted,
         appended = stored,
         shadow_recorded,
         "distill hook processed"

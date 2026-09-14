@@ -1,0 +1,21 @@
+-- ml_examples.content_fingerprint: a dataset-scoped keyed MAC of the example's
+-- features text (talos_ml::content_identity::row_content_fingerprint — HMAC
+-- under the server-side ML content purpose key, over a domain label, the
+-- dataset id and the text). Keyed, so no offline confirmation oracle (same key
+-- as the `ck1:` example_keys already persisted); dataset-scoped, so identical
+-- text in two datasets or two tenants yields unrelated values and the column
+-- reveals no cross-dataset overlap.
+--
+-- Why: the (dataset_id, example_key) upsert could not tell a re-append of the
+-- SAME text from a changed one — features_enc is fresh AEAD ciphertext on
+-- every append — so it rewrote every conflicting row and touched
+-- ml_datasets.updated_at, which the ML policy evaluator reads as "the dataset
+-- changed" and answers with a full evaluation and a new model version.
+-- Measured 2026-09-14: 129 of ops-severity's 162 evaluations in 7 days were
+-- identical to the previous one.
+--
+-- Nullable, no backfill: a NULL is DISTINCT from any fingerprint, so a
+-- pre-existing row is rewritten once on its next re-append (filling the
+-- column) and is a no-op after that. Backfilling here would mean decrypting
+-- every example to fingerprint it.
+ALTER TABLE ml_examples ADD COLUMN IF NOT EXISTS content_fingerprint text;

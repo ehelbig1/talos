@@ -41,7 +41,7 @@ pub fn tool_schemas() -> Vec<Value> {
         }),
         serde_json::json!({
             "name": "ml_append_examples",
-            "description": "Append (upsert) labeled examples to a dataset. Rows with the same example_key REPLACE earlier ones — corrections beat bootstrap labels. Max 200 per call; embedding happens before the write transaction opens.",
+            "description": "Append (upsert) labeled examples to a dataset. Rows with the same example_key REPLACE earlier ones — corrections beat bootstrap labels. The reply's `stored` counts rows INSERTED or CHANGED: re-appending an example whose text, label and source are unchanged stores nothing and does not mark the dataset as changed. Max 200 per call; embedding happens before the write transaction opens.",
             "inputSchema": { "type": "object", "properties": {
                 "dataset_id": { "type": "string" },
                 "examples": { "type": "array", "items": { "type": "object", "properties": {

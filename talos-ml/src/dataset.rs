@@ -115,6 +115,14 @@ pub struct PreparedExample {
     embedding: Option<pgvector::Vector>,
     source: &'static str,
     example_key: Option<String>,
+    /// Dataset-scoped keyed MAC of `features_text`
+    /// (`content_identity::row_content_fingerprint`), so the
+    /// upsert can tell a re-append of the SAME text from a changed one without
+    /// decrypting — `features_enc` is fresh AEAD ciphertext on every append and
+    /// can never compare equal. `None` when the purpose key could not be
+    /// resolved: the upsert then treats the row as changed (the loud
+    /// direction — a write, never a silently skipped update).
+    content_fingerprint: Option<String>,
 }
 
 /// Parent-dataset tenancy, read once per batch and stamped on every row.
@@ -199,6 +207,43 @@ pub struct ContentDedupeOutcome {
     /// parametric fit until they are backfilled.
     pub rows_without_embedding: i64,
 }
+
+/// The `DO UPDATE … WHERE` arm of the example upsert: a conflicting row is
+/// rewritten only when something a model can see would change.
+///
+/// * `content_fingerprint` — the text changed under the same key (a producer
+///   key such as an ops `dedup_key` legitimately maps new text onto an old
+///   key). A NULL on either side is DISTINCT, so a row written before the
+///   column existed is rewritten ONCE — backfilling its fingerprint — and a
+///   batch whose key could not be resolved always writes.
+/// * `label_json`, `source` — a relabel or a correction.
+/// * a different `embedding_model` — the vector space moved. Because every
+///   writer binds the model only beside a vector, this ALSO catches a NULL
+///   vector gaining one (NULL model → current model).
+/// * a NULL embedding gaining one — kept explicitly for a row that lost its
+///   vector but kept its model name, a state no writer produces today (0 rows
+///   on the reference fleet, 2026-09-14) and which the clause above would
+///   therefore miss if one ever did.
+///
+/// Deliberately NOT compared: `features_enc` / `features_key_id` /
+/// `features_format` (fresh ciphertext on every append; the stored one still
+/// decrypts under the same AAD, which binds `example_key`), and the embedding
+/// VALUES under an unchanged model and text — re-embedding identical text was
+/// measured bit-identical on the live embedder, serially and concurrently.
+/// A KEK rotation (or `rotate_dek` on the KMS-backed path) moves the purpose
+/// key and therefore every fingerprint: each row is rewritten ONCE on its next
+/// re-append, and the policy evaluator runs once — the same bounded,
+/// self-healing seam `content_identity` documents for the `ck1:` keys.
+///
+/// ONE home: the upsert interpolates this constant, and the DB tests drive the
+/// upsert rather than restating it.
+const EXAMPLE_UPSERT_CHANGES: &str =
+    "ml_examples.content_fingerprint IS DISTINCT FROM EXCLUDED.content_fingerprint \
+     OR ml_examples.label_json IS DISTINCT FROM EXCLUDED.label_json \
+     OR ml_examples.source IS DISTINCT FROM EXCLUDED.source \
+     OR (ml_examples.embedding IS NULL AND EXCLUDED.embedding IS NOT NULL) \
+     OR (EXCLUDED.embedding_model IS NOT NULL \
+         AND ml_examples.embedding_model IS DISTINCT FROM EXCLUDED.embedding_model)";
 
 pub struct DatasetService {
     secrets: Arc<SecretsManager>,
@@ -316,51 +361,83 @@ impl DatasetService {
         use futures::stream::{self, StreamExt, TryStreamExt};
         let secrets = self.secrets.clone();
         let org_id = tenancy.org_id;
-        let prepared: Vec<PreparedExample> = stream::iter(examples.into_iter().map(|ex| {
-            let secrets = secrets.clone();
-            async move {
-                let id = Uuid::new_v4();
-                let aad = example_aad(dataset_id, ex.example_key.as_deref(), id);
-                let (key_id, ciphertext, format) = secrets
-                    .encrypt_value_aad_v4_or_global(&ex.features_text, org_id, &aad)
-                    .await
-                    .context("encrypt ml_example features")?;
-                let embedding =
-                    talos_memory::embedding::generate_embedding(&ex.features_text, true)
-                        .await
-                        .and_then(|v| {
-                            if v.len() == expected_embedding_dims() {
-                                Some(pgvector::Vector::from(v))
-                            } else {
-                                // Configured local model has a different
-                                // dimensionality than the column — degrade
-                                // to NULL (backfillable) instead of failing
-                                // the whole batch at INSERT time.
-                                tracing::warn!(
-                                    target: "talos_ml",
-                                    %dataset_id,
-                                    got_dims = v.len(),
-                                    expected_dims = expected_embedding_dims(),
-                                    "embedding dimensionality mismatch — storing NULL"
-                                );
-                                None
-                            }
-                        });
-                anyhow::Ok(PreparedExample {
-                    id,
-                    features_enc: ciphertext,
-                    features_key_id: key_id,
-                    features_format: format,
-                    label_json: serde_json::json!({ "label": ex.label }),
-                    embedding,
-                    source: ex.source.as_str(),
-                    example_key: ex.example_key,
+        // Fingerprints are derived ONCE per batch, before the concurrent
+        // encrypt/embed stream, so the wipe-on-drop key is held for a loop of
+        // HMACs and never shared across tasks. A key-resolution failure is
+        // NOT fatal here (unlike DISTILL, where a keyless row could never be
+        // deduped): it only costs the no-op detection, and every row then
+        // upserts as if changed — exactly today's behaviour.
+        let fingerprints: Vec<Option<String>> = match self.secrets.ml_content_mac_key().await {
+            Ok(key) => examples
+                .iter()
+                .map(|ex| {
+                    Some(crate::content_identity::row_content_fingerprint(
+                        key.as_bytes(),
+                        dataset_id,
+                        &ex.features_text,
+                    ))
                 })
+                .collect(),
+            Err(e) => {
+                tracing::warn!(
+                    target: "talos_ml",
+                    %dataset_id,
+                    error = %e,
+                    "prepare_examples: ML content-fingerprint key unavailable — re-appends of \
+                     unchanged examples will be rewritten this batch"
+                );
+                vec![None; examples.len()]
             }
-        }))
-        .buffer_unordered(EMBED_CONCURRENCY)
-        .try_collect()
-        .await?;
+        };
+        let prepared: Vec<PreparedExample> =
+            stream::iter(examples.into_iter().zip(fingerprints).map(
+                |(ex, content_fingerprint)| {
+                    let secrets = secrets.clone();
+                    async move {
+                        let id = Uuid::new_v4();
+                        let aad = example_aad(dataset_id, ex.example_key.as_deref(), id);
+                        let (key_id, ciphertext, format) = secrets
+                            .encrypt_value_aad_v4_or_global(&ex.features_text, org_id, &aad)
+                            .await
+                            .context("encrypt ml_example features")?;
+                        let embedding =
+                            talos_memory::embedding::generate_embedding(&ex.features_text, true)
+                                .await
+                                .and_then(|v| {
+                                    if v.len() == expected_embedding_dims() {
+                                        Some(pgvector::Vector::from(v))
+                                    } else {
+                                        // Configured local model has a different
+                                        // dimensionality than the column — degrade
+                                        // to NULL (backfillable) instead of failing
+                                        // the whole batch at INSERT time.
+                                        tracing::warn!(
+                                            target: "talos_ml",
+                                            %dataset_id,
+                                            got_dims = v.len(),
+                                            expected_dims = expected_embedding_dims(),
+                                            "embedding dimensionality mismatch — storing NULL"
+                                        );
+                                        None
+                                    }
+                                });
+                        anyhow::Ok(PreparedExample {
+                            id,
+                            features_enc: ciphertext,
+                            features_key_id: key_id,
+                            features_format: format,
+                            label_json: serde_json::json!({ "label": ex.label }),
+                            embedding,
+                            source: ex.source.as_str(),
+                            example_key: ex.example_key,
+                            content_fingerprint,
+                        })
+                    }
+                },
+            ))
+            .buffer_unordered(EMBED_CONCURRENCY)
+            .try_collect()
+            .await?;
 
         let missing = prepared.iter().filter(|p| p.embedding.is_none()).count();
         if missing > 0 {
@@ -377,9 +454,22 @@ impl DatasetService {
         Ok(prepared)
     }
 
-    /// Short write phase: chunked multi-row upserts + one touch UPDATE.
-    /// Tenancy comes from `dataset_tenancy`, never from the caller's
-    /// request context.
+    /// Short write phase: chunked multi-row upserts, then ONE touch of the
+    /// dataset's `updated_at` — only when a row was actually inserted, changed
+    /// or evicted. Tenancy comes from `dataset_tenancy`, never from the
+    /// caller's request context.
+    ///
+    /// Returns the rows INSERTED or CHANGED. A re-append of an example whose
+    /// text, label and source are unchanged is a no-op and is not counted.
+    ///
+    /// Why the touch is conditional: `ml_datasets.updated_at` is the policy
+    /// evaluator's "the dataset changed" signal, and every evaluation records a
+    /// model version. The hourly alert-triage run re-distills alerts it has
+    /// already taught, so the old unconditional upsert + touch re-evaluated
+    /// `ops-severity` every hour — measured 2026-09-14: 129 of its 162
+    /// evaluations in 7 days were identical to the previous one (after
+    /// normalising the unordered `unmet` list), and one append rewrote 4
+    /// existing rows (one created 07-21) to add 1 new one.
     pub async fn insert_prepared(
         &self,
         conn: &mut PgConnection,
@@ -392,7 +482,8 @@ impl DatasetService {
             let mut qb: sqlx::QueryBuilder<sqlx::Postgres> = sqlx::QueryBuilder::new(
                 "INSERT INTO ml_examples \
                  (id, dataset_id, user_id, org_id, features_enc, features_key_id, \
-                  features_format, label_json, embedding, embedding_model, source, example_key) ",
+                  features_format, label_json, embedding, embedding_model, source, example_key, \
+                  content_fingerprint) ",
             );
             qb.push_values(chunk, |mut b, p| {
                 b.push_bind(p.id)
@@ -410,13 +501,14 @@ impl DatasetService {
                             .and_then(|_| talos_memory::embedding::active_embedding_model()),
                     )
                     .push_bind(p.source)
-                    .push_bind(&p.example_key);
+                    .push_bind(&p.example_key)
+                    .push_bind(&p.content_fingerprint);
             });
             // COALESCE keeps an existing good embedding when a correction
             // re-labels a row while the embedder is down (talos-memory's
             // upsert discipline) — the text is unchanged, so the old
             // vector is still correct for the new label.
-            qb.push(
+            qb.push(format!(
                 " ON CONFLICT (dataset_id, example_key) WHERE example_key IS NOT NULL \
                   DO UPDATE SET features_enc = EXCLUDED.features_enc, \
                                 features_key_id = EXCLUDED.features_key_id, \
@@ -424,10 +516,12 @@ impl DatasetService {
                                 label_json = EXCLUDED.label_json, \
                                 embedding = COALESCE(EXCLUDED.embedding, ml_examples.embedding), \
                                 embedding_model = COALESCE(EXCLUDED.embedding_model, ml_examples.embedding_model), \
-                                source = EXCLUDED.source \
-                  WHERE ml_examples.source <> 'correction' \
-                     OR EXCLUDED.source = 'correction'",
-            );
+                                source = EXCLUDED.source, \
+                                content_fingerprint = EXCLUDED.content_fingerprint \
+                  WHERE (ml_examples.source <> 'correction' \
+                         OR EXCLUDED.source = 'correction') \
+                    AND ({EXAMPLE_UPSERT_CHANGES})"
+            ));
             let res = qb
                 .build()
                 .execute(&mut *conn)
@@ -435,16 +529,27 @@ impl DatasetService {
                 .context("insert ml_examples chunk")?;
             stored += res.rows_affected() as usize;
         }
-        sqlx::query("UPDATE ml_datasets SET updated_at = NOW() WHERE id = $1")
-            .bind(dataset_id)
-            .execute(&mut *conn)
-            .await
-            .context("touch ml_dataset")?;
-        self.enforce_growth_cap(conn, dataset_id).await?;
+        let evicted = self.enforce_growth_cap(conn, dataset_id).await?;
+        if stored > 0 || evicted > 0 {
+            sqlx::query("UPDATE ml_datasets SET updated_at = NOW() WHERE id = $1")
+                .bind(dataset_id)
+                .execute(&mut *conn)
+                .await
+                .context("touch ml_dataset")?;
+        }
         // After the cap, so the two never fight over which rows go: the cap
         // evicts by age, this collapses by content, and running it second means
         // the cap's count reflects rows that actually earned their place.
-        self.auto_dedupe_after_append(conn, dataset_id).await;
+        //
+        // Skipped when nothing was inserted or changed: a content duplicate can
+        // only be CREATED by a row that was written (a new row, new text, or an
+        // embedding that just arrived), and eviction removes rows. The pass is a
+        // COUNT plus a ranked CTE over every embedded row in the dataset —
+        // 43–91 ms mean in `pg_stat_statements` on the reference fleet — so a
+        // no-op re-append must not pay it.
+        if stored > 0 {
+            self.auto_dedupe_after_append(conn, dataset_id).await;
+        }
         Ok(stored)
     }
 
@@ -458,11 +563,12 @@ impl DatasetService {
     /// Public so the lifecycle integration tests can exercise the
     /// eviction invariant (corrections pinned) directly; production
     /// callers reach it through `insert_prepared`.
+    /// Returns the rows evicted.
     pub async fn enforce_growth_cap(
         &self,
         conn: &mut PgConnection,
         dataset_id: Uuid,
-    ) -> Result<()> {
+    ) -> Result<u64> {
         let schema: Option<serde_json::Value> =
             sqlx::query_scalar("SELECT schema_json FROM ml_datasets WHERE id = $1")
                 .bind(dataset_id)
@@ -475,7 +581,7 @@ impl DatasetService {
             .and_then(|v| v.as_i64())
             .filter(|c| *c > 0)
         else {
-            return Ok(());
+            return Ok(0);
         };
         let total: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM ml_examples WHERE dataset_id = $1")
@@ -485,7 +591,7 @@ impl DatasetService {
                 .context("count dataset examples")?;
         let excess = total - cap;
         if excess <= 0 {
-            return Ok(());
+            return Ok(0);
         }
         let evicted = sqlx::query(
             "DELETE FROM ml_examples WHERE id IN ( \
@@ -504,7 +610,7 @@ impl DatasetService {
             evicted = evicted.rows_affected(),
             "ml dataset growth cap enforced (corrections pinned)"
         );
-        Ok(())
+        Ok(evicted.rows_affected())
     }
 
     /// Precedence-ranked duplicate groups within ONE dataset, keyed on
