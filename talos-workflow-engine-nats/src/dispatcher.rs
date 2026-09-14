@@ -466,7 +466,7 @@ pub(crate) async fn execute_job_with_retry(
     // every reply can be checked against it (the retry re-sign keeps the id).
     // An unparseable payload cannot have been signed by `dispatch_single`, so
     // failing here is the deterministic-serialization class, not a retry.
-    let expected_job_id = dispatched_job_id(&payload)?;
+    let (expected_job_id, attempt_base) = dispatched_identity(&payload)?;
     let mut current_payload = payload;
     loop {
         // Budget-aware clamp, recomputed on EVERY attempt.
@@ -873,9 +873,14 @@ pub(crate) async fn execute_job_with_retry(
                     // exactly what a non-retry dispatch would produce.
                     if let Some(key) = worker_shared_key {
                         // `attempts` was incremented above, so the first retry
-                        // is dispatch attempt 1 — the first dispatch is 0.
-                        current_payload = resign_payload_for_retry(&current_payload, key, attempts)
-                            .unwrap_or(current_payload);
+                        // is `attempt_base + 1` — the first send is the base
+                        // (0 for every dispatch but a re-dispatch).
+                        current_payload = resign_payload_for_retry(
+                            &current_payload,
+                            key,
+                            attempt_base.saturating_add(attempts),
+                        )
+                        .unwrap_or(current_payload);
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
                 }
@@ -905,9 +910,14 @@ pub(crate) async fn execute_job_with_retry(
                 // edge case where the worker did receive it and cached
                 // the nonce before the controller's request timed out.
                 if let Some(key) = worker_shared_key {
-                    // Same counter, same meaning: attempt 1 is the first retry.
-                    current_payload = resign_payload_for_retry(&current_payload, key, attempts)
-                        .unwrap_or(current_payload);
+                    // Same counter, same meaning: `attempt_base + 1` is the
+                    // first retry.
+                    current_payload = resign_payload_for_retry(
+                        &current_payload,
+                        key,
+                        attempt_base.saturating_add(attempts),
+                    )
+                    .unwrap_or(current_payload);
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             }
@@ -926,13 +936,17 @@ pub(crate) async fn execute_job_with_retry(
     }
 }
 
-/// The `job_id` a serialized `JobRequest` payload carries. Read at the head of
-/// `execute_job_with_retry` so the reply's `job_id` can be matched against the
-/// job that was actually dispatched. `from_slice` on the exact wire bytes, so
-/// the `SignedJson` payload is not re-derived (see `resign_payload_for_retry`).
-fn dispatched_job_id(payload: &[u8]) -> Result<Uuid, String> {
+/// The `job_id` and FIRST `dispatch_attempt` a serialized `JobRequest` payload
+/// carries. Read at the head of `execute_job_with_retry` so the reply's
+/// `job_id` can be matched against the job that was actually dispatched, and so
+/// every retry's attempt counts up from the attempt the SIGNED first send
+/// carried — read off the wire bytes rather than passed alongside them, so the
+/// counter and the payload cannot disagree. `from_slice` on the exact wire
+/// bytes, so the `SignedJson` payload is not re-derived (see
+/// `resign_payload_for_retry`).
+fn dispatched_identity(payload: &[u8]) -> Result<(Uuid, u32), String> {
     serde_json::from_slice::<JobRequest>(payload)
-        .map(|r| r.job_id)
+        .map(|r| (r.job_id, r.dispatch_attempt))
         .map_err(|e| format!("Failed to read job_id from the dispatch payload: {e}"))
 }
 
@@ -974,12 +988,17 @@ fn resign_payload_for_retry(payload: &[u8], key: &[u8], dispatch_attempt: u32) -
     // hold more than one object, and the 11- and 12-copy ones match
     // `node_retrying` rows one for one.
     //
-    // This is the ONLY place the attempt can be stamped, and that is a
-    // structural fact rather than a convenience: a retry that is NOT re-signed
-    // re-sends the previous nonce, which `JobRequest::verify_dispatch` rejects
-    // as a replay in the worker ABOVE the ledger — so it never mints a second
-    // chain to partition. Every path that can write a second chain passes
-    // through here.
+    // A retry that is NOT re-signed re-sends the previous nonce, which
+    // `JobRequest::verify_dispatch` rejects as a replay in the worker ABOVE the
+    // ledger — so it never mints a second chain to partition. That made this
+    // the only RETRY that can write a second chain, and this comment used to
+    // say it was the only PATH. It was not: a fresh `dispatch()` of the same
+    // `job_id` signs a fresh request too, and the OAuth credential repair does
+    // exactly that. Measured 2026-09-13 — both `repaired` outcomes ever
+    // recorded wrote two anchors into attempt partition 0 and were reported as
+    // `DuplicateSequence` tamper evidence. That path now starts from
+    // `DispatchJob::redispatch_attempt_base`, and the attempt passed here is
+    // `attempt_base + attempts`.
     req.dispatch_attempt = dispatch_attempt;
     // RFC 0010 P1: re-sign under the configured dispatch scheme so a retry
     // matches the primary path (Ed25519 when configured, else HMAC).
@@ -1394,12 +1413,15 @@ impl NodeDispatcher for NatsNodeDispatcher {
             // append) so it can't be stripped/swapped on the wire. `None` for
             // every other dispatch — ships nothing.
             idempotency_key,
-            // The FIRST dispatch is attempt 0 and appends nothing to the
+            // An ordinary dispatch is attempt 0 and appends nothing to the
             // signing payload, so this request is byte-identical to the
-            // pre-field wire format. Retries are stamped by
-            // `resign_payload_for_retry`, which is the only path that can
-            // produce a second audit chain under this job's prefix.
-            dispatch_attempt: 0,
+            // pre-field wire format. It is non-zero only when the engine
+            // dispatches a `job_id` an earlier dispatch already sent (the OAuth
+            // credential repair), which is the SECOND path that can produce a
+            // second audit chain under this job's prefix; this loop's own
+            // retries, stamped by `resign_payload_for_retry` counting up from
+            // here, are the first.
+            dispatch_attempt: job.dispatch_attempt_base,
         };
 
         // RFC 0010 P3 (D3b): when the engine resolved PLAINTEXT secrets for this
@@ -3018,6 +3040,141 @@ mod budget_clamp_loop_tests {
         assert!(
             !String::from_utf8_lossy(&sent[0]).contains("dispatch_attempt"),
             "attempt 0 must not appear on the wire"
+        );
+    }
+
+    /// A transport that records every payload and answers with an HMAC-SIGNED
+    /// result, so the production `NatsNodeDispatcher::dispatch` path — which
+    /// verifies results whenever it holds a key — can be driven end to end.
+    struct SigningRecordingTransport {
+        payloads: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+        fail_first: usize,
+        key: Vec<u8>,
+        /// Fail the first sends as a NATS DELIVERY error rather than a failed
+        /// result — the other of the two re-sign sites.
+        as_delivery_errors: bool,
+    }
+
+    #[async_trait]
+    impl JobTransport for SigningRecordingTransport {
+        async fn request(&self, _topic: &str, payload: Vec<u8>) -> Result<Vec<u8>, BoxError> {
+            let job_id = echo_job_id(&payload);
+            let n = {
+                let mut g = self.payloads.lock().expect("lock");
+                g.push(payload);
+                g.len()
+            };
+            let failing = n <= self.fail_first;
+            if failing && self.as_delivery_errors {
+                return Err("nats: connection closed".into());
+            }
+            let mut jr = JobResult {
+                llm_usage: vec![],
+                job_id,
+                status: if failing {
+                    JobStatus::Failed
+                } else {
+                    JobStatus::Success
+                },
+                output_payload: if failing {
+                    serde_json::json!({"error": "connection reset"})
+                } else {
+                    serde_json::json!({"ok": true})
+                }
+                .into(),
+                logs: vec![],
+                execution_time_ms: 1,
+                signature: vec![],
+                result_nonce: String::new(),
+                worker_id: String::new(),
+                crypto_scheme: 0,
+            };
+            jr.sign_with_worker_id(&self.key, "w-test")
+                .expect("sign result");
+            Ok(serde_json::to_vec(&jr).unwrap())
+        }
+    }
+
+    /// Drive the PRODUCTION `dispatch()` for one job and return the
+    /// `dispatch_attempt` of every send, in order.
+    async fn wire_attempts_for(
+        dispatch_attempt_base: u32,
+        as_delivery_errors: bool,
+    ) -> (Vec<u32>, Vec<Vec<u8>>) {
+        use talos_workflow_engine_core::{DispatchJob, NodeDispatcher, WorkerSharedKey};
+        use talos_workflow_job_protocol::JobRequest;
+        let key = vec![9u8; 32];
+        let payloads = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let dispatcher = super::NatsNodeDispatcher::new(
+            Arc::new(SigningRecordingTransport {
+                payloads: payloads.clone(),
+                fail_first: 2,
+                key: key.clone(),
+                as_delivery_errors,
+            }),
+            None,
+            Some(WorkerSharedKey::new(key)),
+            Arc::new(AlwaysTransient),
+            Arc::new(NoExpr),
+        );
+        let job = DispatchJob {
+            job_id: Some(uuid::Uuid::new_v4()),
+            user_id: Some(uuid::Uuid::new_v4()),
+            input_payload: serde_json::json!({"seed": 1}),
+            timeout: Duration::from_secs(5),
+            max_retries: 2,
+            backoff_ms: 1,
+            dispatch_attempt_base,
+            ..Default::default()
+        };
+        dispatcher
+            .dispatch(job)
+            .await
+            .expect("the third send succeeds");
+        let sent = payloads.lock().expect("lock").clone();
+        let attempts = sent
+            .iter()
+            .map(|p| {
+                serde_json::from_slice::<JobRequest>(p)
+                    .expect("payload is a JobRequest")
+                    .dispatch_attempt
+            })
+            .collect();
+        (attempts, sent)
+    }
+
+    /// The production dispatcher stamps a re-dispatch's base on its FIRST send
+    /// and counts its retries up from it — through `dispatch()`, the entry
+    /// point the OAuth repair calls, not through the retry loop directly. The
+    /// base-0 control proves an ordinary dispatch is unchanged, first send
+    /// carrying nothing on the wire.
+    #[tokio::test]
+    async fn dispatch_counts_every_send_up_from_the_jobs_attempt_base() {
+        let (ordinary, sent) = wire_attempts_for(0, false).await;
+        assert_eq!(ordinary, vec![0, 1, 2], "control: an ordinary dispatch");
+        assert!(
+            !String::from_utf8_lossy(&sent[0]).contains("dispatch_attempt"),
+            "control: attempt 0 must not appear on the wire"
+        );
+
+        let (redispatch, sent) = wire_attempts_for(4, false).await;
+        assert_eq!(
+            redispatch,
+            vec![4, 5, 6],
+            "a re-dispatch's first send carries the base and its retries count up from it"
+        );
+        assert!(
+            String::from_utf8_lossy(&sent[0]).contains("\"dispatch_attempt\":4"),
+            "the base is on the SIGNED wire bytes of the first send"
+        );
+
+        // The NATS-delivery-failure retry re-signs at a SEPARATE site; the
+        // failed-result sends above never reach it.
+        let (after_delivery_errors, _) = wire_attempts_for(4, true).await;
+        assert_eq!(
+            after_delivery_errors,
+            vec![4, 5, 6],
+            "delivery-failure retries count up from the base too"
         );
     }
 

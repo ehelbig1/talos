@@ -171,6 +171,7 @@ mod tests {
             retry_condition: None,
             retry_delay_expr: None,
             emit_retry_events: false,
+            dispatch_attempt_base: 0,
         }
     }
 

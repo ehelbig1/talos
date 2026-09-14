@@ -572,6 +572,10 @@ impl ParallelWorkflowEngine {
             retry_condition: retry.retry_condition.clone(),
             retry_delay_expr: retry.retry_delay_expression.clone(),
             emit_retry_events: true,
+            // The FIRST dispatch of this `job_id`. The OAuth repair below is the
+            // one site that dispatches it again, and it moves the base past
+            // every attempt this dispatch can send.
+            dispatch_attempt_base: 0,
         };
 
         // ── One-shot reactive OAuth credential repair ────────────────────
@@ -716,6 +720,15 @@ impl ParallelWorkflowEngine {
                     .await;
 
                     let mut retry_job = seed;
+                    // SAME `job_id`, so the same WORM audit prefix. Starting
+                    // this dispatch at attempt 0 again made the worker open a
+                    // second chain in the first dispatch's partition — two
+                    // different anchors at `sequence_num` 1, which the offline
+                    // verifier reports as `DuplicateSequence` and pages CRITICAL
+                    // as possible tampering (2026-09-13, both `repaired`
+                    // outcomes ever recorded). `redispatch_attempt_base` clears
+                    // the first dispatch's retries too, not just its attempt 0.
+                    retry_job.dispatch_attempt_base = retry_job.redispatch_attempt_base();
                     // Re-attach the bytes the snapshot deliberately left
                     // behind (identical decision to the first dispatch).
                     retry_job.wasm_bytes =
@@ -1180,6 +1193,8 @@ mod oauth_repair_tests {
     struct SequencedDispatcher {
         script: Mutex<std::collections::VecDeque<Result<serde_json::Value, String>>>,
         calls: Mutex<usize>,
+        /// `(job_id, dispatch_attempt_base, max_retries)` per dispatch, in order.
+        jobs: Mutex<Vec<(Option<Uuid>, u32, u32)>>,
     }
 
     impl SequencedDispatcher {
@@ -1187,17 +1202,26 @@ mod oauth_repair_tests {
             Arc::new(Self {
                 script: Mutex::new(script.into()),
                 calls: Mutex::new(0),
+                jobs: Mutex::new(Vec::new()),
             })
         }
         fn calls(&self) -> usize {
             *self.calls.lock().expect("calls mutex")
         }
+        fn jobs(&self) -> Vec<(Option<Uuid>, u32, u32)> {
+            self.jobs.lock().expect("jobs mutex").clone()
+        }
     }
 
     #[async_trait]
     impl NodeDispatcher for SequencedDispatcher {
-        async fn dispatch(&self, _job: DispatchJob) -> Result<DispatchResult, BoxError> {
+        async fn dispatch(&self, job: DispatchJob) -> Result<DispatchResult, BoxError> {
             *self.calls.lock().expect("calls mutex") += 1;
+            self.jobs.lock().expect("jobs mutex").push((
+                job.job_id,
+                job.dispatch_attempt_base,
+                job.max_retries,
+            ));
             match self
                 .script
                 .lock()
@@ -1303,6 +1327,20 @@ mod oauth_repair_tests {
         Arc<SequencedDispatcher>,
         Arc<RepairResolver>,
     ) {
+        run_with_retry_count(script, refresh_succeeds, auth_header, None).await
+    }
+
+    /// [`run`] with an explicit graph `retry_count` on the node.
+    async fn run_with_retry_count(
+        script: Vec<Result<serde_json::Value, String>>,
+        refresh_succeeds: bool,
+        auth_header: Option<&str>,
+        retry_count: Option<u32>,
+    ) -> (
+        Result<serde_json::Value, String>,
+        Arc<SequencedDispatcher>,
+        Arc<RepairResolver>,
+    ) {
         let node_id = Uuid::new_v4();
         let module_id = Uuid::new_v4();
         let dispatcher = SequencedDispatcher::new(script);
@@ -1315,7 +1353,11 @@ mod oauth_repair_tests {
             InMemoryModuleFetcher::new().with_module(module_id, artifact(module_id)),
         ));
         engine.set_secrets_resolver(resolver.clone());
-        engine.add_node(node_id, Some(module_id), None, None);
+        let retry_policy = retry_count.map(|n| talos_workflow_engine_core::RetryPolicy {
+            max_retries: Some(n),
+            ..Default::default()
+        });
+        engine.add_node(node_id, Some(module_id), retry_policy, None);
         if let Some(header) = auth_header {
             engine
                 .node_configs
@@ -1370,6 +1412,53 @@ mod oauth_repair_tests {
             resolver.log(),
             vec!["resolve", "force_refresh", "resolve"],
             "secrets must be RE-RESOLVED after the refresh, not reused"
+        );
+    }
+
+    /// The repair re-dispatches the SAME `job_id`, so it writes into the same
+    /// WORM audit prefix — and the worker opens one hash chain per
+    /// `(job_id, dispatch_attempt)`. The re-dispatch must therefore start past
+    /// EVERY attempt the first dispatch can have sent, its own retries
+    /// included, or the verifier sees two anchors at `sequence_num` 1 in one
+    /// partition and reports `DuplicateSequence` (2026-09-13: both `repaired`
+    /// outcomes ever recorded paged CRITICAL this way).
+    ///
+    /// `retry_count: 3` is what makes this a test of the arithmetic rather
+    /// than of "non-zero": with no retries, `base + 1` and the correct answer
+    /// coincide, and `base + 1` is exactly where the first dispatch's first
+    /// retry lands.
+    #[tokio::test]
+    async fn the_repair_redispatch_starts_past_every_attempt_the_first_dispatch_can_send() {
+        let (out, dispatcher, _resolver) = run_with_retry_count(
+            vec![Err(LIVE_401.to_string()), Ok(json!({ "messages": [] }))],
+            true,
+            Some(&bearer()),
+            Some(3),
+        )
+        .await;
+
+        assert!(out.is_ok(), "node should have recovered, got {out:?}");
+        let jobs = dispatcher.jobs();
+        assert_eq!(jobs.len(), 2, "one dispatch and one repair");
+        let (first_id, first_base, first_retries) = jobs[0];
+        let (repair_id, repair_base, _) = jobs[1];
+
+        assert!(first_id.is_some(), "the engine pre-assigns the job_id");
+        assert_eq!(
+            repair_id, first_id,
+            "the repair re-dispatches the SAME job_id (same module_executions row)"
+        );
+        assert_eq!(first_base, 0, "the first dispatch is attempt 0");
+        assert_eq!(first_retries, 3, "the node's retry_count reached the job");
+        let first_attempts = first_base..=first_base + first_retries;
+        assert!(
+            !first_attempts.contains(&repair_base),
+            "repair base {repair_base} collides with the first dispatch's attempts \
+             {first_attempts:?}"
+        );
+        assert_eq!(
+            repair_base, 4,
+            "exactly one past the first dispatch's last attempt"
         );
     }
 

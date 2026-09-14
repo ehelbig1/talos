@@ -473,6 +473,9 @@ impl ParallelWorkflowEngine {
                 // Chain-level retry events are not emitted per-step; the
                 // worker logs per-attempt retries into the step's module log.
                 emit_retry_events: false,
+                // Chain-level, ignored per step (`PipelineJobRequest` carries no
+                // attempt; the chain path writes no audit chain to partition).
+                dispatch_attempt_base: 0,
             });
         }
 

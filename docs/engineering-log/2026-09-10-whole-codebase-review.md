@@ -4193,3 +4193,124 @@ controller's other authenticated entry points (`/ws` handshake, the Gmail /
 GCP push JWT verifiers — counted since package AP, the approval-gate token
 lookups, webhook signatures) each have their own refusal reporting, surveyed
 one by one on the 09-11 and 09-12 passes; none was re-audited here.
+
+### Package AY (2026-09-14) — a repaired OAuth credential paged CRITICAL as tampering
+
+**Found by** the deploy-46 survey: `talos_audit_verification_failures_total
+{stage="chain"}` had moved by 2 on 2026-09-13 at 14:24, and Prometheus'
+`ALERTS` history showed `TalosAuditVerificationFailures` (CRITICAL,
+`category: audit-integrity`) FIRING 14:21–14:35. The deploy-43 record
+mentioned only the `empty_chain` unverifiable from the same sweep (package
+AV). The container logs of that lifetime were gone — two deploys had
+recreated both containers since.
+
+**Reproduction, with the production verifier.** A scratch example (not
+committed) enumerated `module_executions` completed 12:00–14:30 and ran
+`verify_execution_chain` — the sweep's own function, with the verifier
+identity from the controller's environment — over each: 153 rows, 150
+verified, 1 empty (`f7490bee`, AV's job), **2 failed, both
+`DuplicateSequence { seq: 1 }` over 2 events**. Reading the two prefixes:
+one object each, holding two `execution_complete` anchors with the same
+`sequence_num` (1), the same `previous_hash` (the genesis), the same payload
+(`{"total_events":1}`), no `dispatch_attempt` (so 0), and timestamps two
+seconds apart. The verifier was right: two different events at one sequence
+in one attempt partition is what a substitution looks like.
+
+**Where the second anchor came from — eliminated in order, each by
+evidence.**
+
+1. *Transport duplication after the host resume.* Both jobs were dispatched
+   at 12:22:15, seconds after the 10:06–12:23 suspend. But the worker
+   verifies every job with the replay-caching `verify_dispatch`
+   (`check_and_record_job_nonce`, read end to end), so a same-nonce copy is
+   refused before any ledger exists; and the two anchors were built two
+   seconds apart, so the SEAL ran twice, not the publish.
+2. *The in-worker retry loop.* `module_execution_logs` (which outlive
+   container restarts) showed attempt 1 failing on DNS for
+   `gmail.googleapis.com` and "Retrying WASM execution (attempt 2/4)" — but
+   #769 (2026-09-06) shares one ledger across attempts and seals once; the
+   final performance line carried `retry_attempts: 0`, i.e. the successful
+   run was a FRESH job-level execution.
+3. *The dispatcher's retry loop.* The `AUDIT_LEDGER` JetStream stream —
+   bounded to 30 days by package AW the day before — still held both anchors
+   of both jobs with their publish times (12:22:23.8 and 12:22:25.5). A
+   contrast day settled it: on 2026-09-12 16:15 the same two nodes had real
+   dispatcher retries, and their anchors carry attempts `null`, `1`, `2`
+   with `node_retrying` rows beside them, and all 24 jobs in that window
+   verify. On 09-13 there was no `node_retrying` row and both anchors were
+   attempt 0.
+4. *The engine.* `engine_dispatch_single` mints `job_id = Uuid::new_v4()`
+   per node dispatch, so an engine node retry would have had a different
+   prefix. But the SAME function holds the one-shot OAuth credential repair
+   (#664): on a credential rejection it force-refreshes the token and calls
+   `dispatcher.dispatch(retry_job)`, where `retry_job` is a clone of the
+   original `DispatchJob` — same `job_id`, freshly signed, attempt 0.
+   `talos_oauth_reactive_refresh_total{outcome="repaired"}` moved 0 → 2 at
+   12:24 on 09-13 and at no other time in the series' life (since
+   2026-08-29). After two hours asleep both Gmail tokens had expired; attempt
+   2 reached Gmail and got a 401.
+
+So every OAuth repair the platform has ever performed wrote a false tamper
+verdict into its audit sweep. The dispatcher's comment over
+`resign_payload_for_retry` said the re-sign was "the ONLY place the attempt
+can be stamped … Every path that can write a second chain passes through
+here" — a true statement about retries stated as a statement about paths.
+
+**The fix.** `DispatchJob.dispatch_attempt_base: u32` (default 0) is the
+attempt the first send carries. The NATS dispatcher stamps it into the
+`JobRequest`, and `execute_job_with_retry` reads it back off the SIGNED first
+payload (`dispatched_identity`, replacing `dispatched_job_id`) and re-signs
+both retry sites at `attempt_base + attempts` — reading it from the bytes
+rather than taking a parameter means the loop's counter and the wire cannot
+disagree. `DispatchJob::redispatch_attempt_base()` returns
+`base + max_retries + 1` (saturating), the first attempt no send of that
+dispatch can have used; the repair sets its clone's base from it. One home
+for the arithmetic, because the tempting `+ 1` is exactly where the first
+dispatch's first retry lands.
+
+**Population of the class.** Sites that dispatch a `job_id` an earlier send
+already used: ONE. Loop iterations mint `iter_exec_id` per iteration; chain
+steps carry no attempt on the wire (`PipelineJobRequest` is unchanged, and
+the chain path writes no audit chain). The three other `DispatchJob`
+literals the compiler enumerated set the base to 0 with a sentence saying
+why.
+
+**Wire and deploy.** No new signed field: `:attempt=` has been
+conditional-append since 2026-09-07 and workers already handle a non-zero
+value. A base-0 first send is byte-identical to before (pinned by the
+dispatcher test's control). Any rolling order is safe; a pre-AY controller
+simply produces the false verdict again on its next repair.
+
+**Guards.**
+- `talos-workflow-engine-core`: `redispatch_attempt_base` clears every
+  attempt of the earlier dispatch, composes, and saturates.
+- `talos-workflow-engine` `oauth_repair_tests`: the real
+  `run_single_node_dispatch`, a 401 then success, the node declaring
+  `retry_count: 3` — the repair carries the same `job_id` and base 4, outside
+  `0..=3`. With no retries `+1` and the right answer coincide, which is why
+  the test declares three.
+- `talos-workflow-engine-nats`: the PRODUCTION `NatsNodeDispatcher::dispatch`
+  over a transport that records payloads and signs its results (so result
+  verification runs): base 0 → wire attempts `[0, 1, 2]` with attempt 0
+  absent from the first send's bytes; base 4 → `[4, 5, 6]` through the
+  failed-result re-sign site AND through the delivery-error re-sign site.
+- `talos-audit-event`: partitions `{0, 4}` verify as two chains — the
+  property the fix relies on.
+
+**Mutations, six applied, six caught, each confirmed landed and each revert
+byte-verified.** M1 the repair keeps base 0 → engine test. M2 the repair uses
+`base + 1` → engine test. M3 the first send hard-codes attempt 0 → dispatcher
+test. M4 the failed-result re-sign ignores the base → dispatcher test (line
+of the base-4 assertion). M5 the delivery-error re-sign ignores the base →
+dispatcher test (the delivery-error assertion, a different line — the first
+draft of the test drove only failed results and M5 would have survived it,
+which is why the transport grew a delivery-error mode before the run). M6
+`redispatch_attempt_base` drops `max_retries` → core test and engine test.
+
+**Stated limits.** The two historical prefixes keep failing if re-swept;
+they have aged out of the sweep's window and nothing re-reads them
+(forward-only, like the partition and key-space fixes). No test drives the
+repair through a live worker; the live proof is the next `repaired`
+increment with a clean sweep beside it. The alert text is unchanged: a
+`DuplicateSequence` within one attempt remains substitution evidence, and
+the producer was what was wrong. No lint: the population is one site.
