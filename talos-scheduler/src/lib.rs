@@ -412,6 +412,39 @@ pub struct DueBatch {
     pub max_overdue_secs: Option<f64>,
     /// `(workflow_id, user_id, schedule_id)` per claimed row.
     pub to_spawn: Vec<(Uuid, Uuid, Uuid)>,
+    /// `Some` when the deployment-wide execution pause deferred this poll:
+    /// NOTHING was claimed, so every due schedule is still due and fires on
+    /// the first poll after the pause lifts (package BF). `None` otherwise.
+    pub deferred_by_pause: Option<talos_metrics::PauseRefusal>,
+}
+
+/// Re-arm a schedule whose fire was CLAIMED before the execution pause was set
+/// and then refused at row creation (`ConcurrencyAdmission::ExecutionsPaused`).
+///
+/// The claim had already advanced `next_trigger_at` to the next occurrence, so
+/// without this the fire would be DROPPED — the operator chose "defer, don't
+/// drop". Pulling `next_trigger_at` back to `NOW()` makes the schedule due
+/// again: every poll while paused defers it without claiming, and the first
+/// poll after resume fires it. Guarded so it only ever moves the time EARLIER
+/// and never re-enables a schedule someone disabled in the meantime. Returns
+/// the rows re-armed (0 or 1). `last_triggered_at` keeps the claim's stamp —
+/// it records an attempt, and the re-armed fire will overwrite it.
+///
+/// `pub` for `controller/tests/execution_pause_tests`; not an API.
+#[doc(hidden)]
+pub async fn rearm_schedule_deferred_by_pause(
+    db_pool: &PgPool,
+    schedule_id: Uuid,
+) -> Result<u64, sqlx::Error> {
+    let done = sqlx::query(
+        "UPDATE workflow_schedules SET next_trigger_at = NOW() \
+         WHERE id = $1 AND is_enabled = true \
+           AND (next_trigger_at IS NULL OR next_trigger_at > NOW())",
+    )
+    .bind(schedule_id)
+    .execute(db_pool)
+    .await?;
+    Ok(done.rows_affected())
 }
 
 /// Background service that polls for due schedules and triggers workflow
@@ -488,6 +521,10 @@ pub struct SchedulerService {
     /// have a give-up point.
     consecutive_holds: Arc<std::sync::atomic::AtomicUsize>,
     readiness_degraded: Arc<std::sync::atomic::AtomicBool>,
+    /// The execution-pause state the last poll saw (0 running, 1 paused, 2
+    /// unreadable), so the scheduler logs the TRANSITION once instead of a
+    /// line every 15 s poll for the length of a pause (check 69's trap).
+    pause_observed: Arc<std::sync::atomic::AtomicU8>,
 }
 
 /// Default ceiling on concurrently-running scheduled executions (see
@@ -669,6 +706,7 @@ impl SchedulerService {
             first_poll_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             consecutive_holds: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             readiness_degraded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            pause_observed: Arc::new(std::sync::atomic::AtomicU8::new(0)),
         }
     }
 
@@ -1068,7 +1106,9 @@ impl SchedulerService {
             phase,
             max_overdue_secs,
             to_spawn,
+            deferred_by_pause,
         } = Self::select_due_and_advance(&self.db_pool, &self.first_poll_done).await?;
+        self.log_pause_transition(deferred_by_pause);
 
         if phase == talos_metrics::SCHEDULER_PHASE_STARTUP && !to_spawn.is_empty() {
             tracing::info!(
@@ -1102,6 +1142,49 @@ impl SchedulerService {
         }
 
         Ok(())
+    }
+
+    /// Log the execution pause once per TRANSITION. The per-poll signal is the
+    /// `scheduler_poll` series on `talos_execution_pause_refusals_total`.
+    fn log_pause_transition(&self, deferred: Option<talos_metrics::PauseRefusal>) {
+        let now: u8 = match deferred {
+            None => 0,
+            Some(talos_metrics::PauseRefusal::Paused) => 1,
+            Some(talos_metrics::PauseRefusal::Unreadable) => 2,
+        };
+        let before = self
+            .pause_observed
+            .swap(now, std::sync::atomic::Ordering::SeqCst);
+        if before == now {
+            if now != 0 {
+                tracing::debug!(
+                    target: "talos_scheduler",
+                    "Scheduler: execution pause still in force — poll deferred"
+                );
+            }
+            return;
+        }
+        match deferred {
+            Some(talos_metrics::PauseRefusal::Paused) => tracing::info!(
+                target: "talos_scheduler",
+                event_kind = "scheduler_execution_pause_observed",
+                "Scheduler: the deployment-wide execution pause is set — due schedules \
+                 are DEFERRED (not claimed) until resume_executions; each fires once on \
+                 the first poll after resume, under the catch-up concurrency ceiling"
+            ),
+            Some(talos_metrics::PauseRefusal::Unreadable) => tracing::warn!(
+                target: "talos_scheduler",
+                event_kind = "scheduler_execution_pause_unreadable",
+                "Scheduler: system_settings.execution_paused is not a JSON boolean — \
+                 due schedules are DEFERRED until an operator rewrites it with \
+                 pause_executions or resume_executions"
+            ),
+            None => tracing::info!(
+                target: "talos_scheduler",
+                event_kind = "scheduler_execution_pause_lifted",
+                "Scheduler: the execution pause has lifted — due schedules fire again"
+            ),
+        }
     }
 
     /// The DB half of one poll: classify the phase, claim the due batch,
@@ -1153,6 +1236,29 @@ impl SchedulerService {
         // is no concurrent second caller to race with.
         let is_first_poll = !first_poll_done.load(std::sync::atomic::Ordering::SeqCst);
 
+        // The deployment-wide execution pause (package BF). Read BEFORE the
+        // claim, and a deferred poll claims NOTHING: every due schedule keeps
+        // its `next_trigger_at`, so it is still due when the pause lifts and
+        // fires then — deferred, not dropped (the operator's decision,
+        // 2026-09-14). The boot flag is deliberately NOT consumed: a controller
+        // that boots into a pause has not drained its backlog, and the first
+        // poll after resume must still take the startup ceiling. A schedule
+        // overdue by several occurrences fires ONCE on resume, not once per
+        // missed occurrence — the claim advances to the next future tick, the
+        // same catch-up shape as a host suspend.
+        if let Some(reason) =
+            talos_execution_pause::gate_start(db_pool, talos_metrics::PauseGatePath::SchedulerPoll)
+                .await
+                .map_err(|e| format!("Failed to read the execution pause flag: {}", e))?
+        {
+            return Ok(DueBatch {
+                phase: classify_dispatch_phase(is_first_poll, None),
+                max_overdue_secs: None,
+                to_spawn: Vec::new(),
+                deferred_by_pause: Some(reason),
+            });
+        }
+
         // Use a transaction with FOR UPDATE SKIP LOCKED to prevent
         // double-firing in multi-instance deployments.
         let mut tx = db_pool
@@ -1202,6 +1308,7 @@ impl SchedulerService {
                 phase: classify_dispatch_phase(is_first_poll, None),
                 max_overdue_secs: None,
                 to_spawn: Vec::new(),
+                deferred_by_pause: None,
             });
         }
 
@@ -1322,6 +1429,7 @@ impl SchedulerService {
             phase,
             max_overdue_secs,
             to_spawn,
+            deferred_by_pause: None,
         })
     }
 
@@ -2088,6 +2196,39 @@ async fn run_scheduled_execution(
                 "Scheduler: refusing a due fire — the workflow is archived. The \
                  schedule stays enabled; un-archive the workflow to resume it."
             );
+            return;
+        }
+        talos_workflow_repository::ConcurrencyAdmission::ExecutionsPaused(reason) => {
+            // Claimed before the pause, refused at row creation (the
+            // repository counted it as `row_creation`). DENIED, like the
+            // archived arm: a policy refusal, not a herd symptom. The claim
+            // already advanced `next_trigger_at`, so re-arm the schedule or
+            // this fire is dropped rather than deferred.
+            match rearm_schedule_deferred_by_pause(&db_pool, schedule_id).await {
+                Ok(rearmed) => tracing::info!(
+                    target: "talos_scheduler",
+                    event_kind = "scheduler_fire_deferred_by_pause",
+                    execution_id = %execution_id,
+                    workflow_id = %workflow_id,
+                    schedule_id = %schedule_id,
+                    reason = reason.as_str(),
+                    rearmed,
+                    "Scheduler: a claimed fire was refused by the execution pause; the \
+                     schedule is re-armed and fires after resume"
+                ),
+                Err(e) => tracing::error!(
+                    target: "talos_scheduler",
+                    event_kind = "scheduler_fire_rearm_failed",
+                    execution_id = %execution_id,
+                    workflow_id = %workflow_id,
+                    schedule_id = %schedule_id,
+                    error = %e,
+                    "Scheduler: a claimed fire was refused by the execution pause and the \
+                     schedule could NOT be re-armed — this occurrence is dropped; the next \
+                     one fires normally after resume"
+                ),
+            }
+            record_dispatch(phase, talos_metrics::SCHEDULER_OUTCOME_DENIED);
             return;
         }
         talos_workflow_repository::ConcurrencyAdmission::LimitReached { limit, running } => {
@@ -3018,8 +3159,12 @@ mod startup_herd_tests {
             let err = super::SchedulerService::select_due_and_advance(&pool, &first_poll_done)
                 .await
                 .expect_err("a poll against a closed port must fail");
+            // The first database touch is now the execution-pause read (package
+            // BF, 2026-09-14), which runs before `begin()`; the invariant this
+            // test guards — an uncommitted poll does not spend the startup
+            // phase — is the same whichever read fails first.
             assert!(
-                err.contains("Failed to begin transaction"),
+                err.contains("Failed to read the execution pause flag"),
                 "attempt {attempt} failed for an unexpected reason: {err}"
             );
             assert!(
@@ -3337,7 +3482,11 @@ mod startup_herd_tests {
         // third DENIED terminal path (a due fire refused because the workflow is
         // archived) beside the two pre-existing refusals. Found by this pin on
         // the rebase that brought the two changes together.
-        ("SCHEDULER_OUTCOME_DENIED", 3),
+        // 4 since 2026-09-14 (package BF): a fire claimed just before the
+        // deployment-wide execution pause and refused at row creation is DENIED
+        // too — a policy refusal, not a herd symptom — and its schedule is
+        // re-armed so the fire is deferred rather than dropped.
+        ("SCHEDULER_OUTCOME_DENIED", 4),
         ("SCHEDULER_OUTCOME_FENCED", 1),
     ];
 

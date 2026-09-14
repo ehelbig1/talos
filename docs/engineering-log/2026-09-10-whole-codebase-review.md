@@ -4805,3 +4805,84 @@ first: indexing a missing key in `serde_json` yields `Null`, so the original
 
 **Stated limits.** The ledger-read-failure path is driven by the render test
 only; no DB test fails the ledger read. The warn line's wording is untested.
+
+### Package BF (2026-09-14) — the execution pause had never once taken effect
+
+**How it was found.** A read-only survey sent two agents at open leads. The
+GraphQL-vs-MCP authorization comparison reported that GraphQL `testWorkflow`
+skips the platform-wide pause its MCP twin enforces. Following that one gap to
+its population turned up a much larger one, then a second defect under it.
+
+**Measured, in order:**
+- Every call site that STARTS a workflow run (`run_with_trigger_input_via_nats`,
+  `run_with_seed_via_nats`, `run_with_seed_fenced`, `execute_subworkflow_graph`)
+  outside the engine crates: 20. Nine read the pause (the orchestration
+  `trigger` and `replay`, six MCP handlers; crash recovery excluded by design).
+  Ungated: the scheduler, both webhook-router dispatch sites, the continuation
+  trigger (approval, suspension and the Gmail push branch), workflow chains,
+  actor handoff, orchestration `retry`, GraphQL `testWorkflow`, the
+  sub-workflow contract test.
+- Traffic, 7 days: 2 951 workflow executions — 1 982 `provenance.trigger_type =
+  'scheduled'` (67%), 952 with no provenance, all `pa-ask-email`, i.e. the Gmail
+  push branch of the continuation trigger (32%), 17 other. So the gated paths
+  covered under 1% of real dispatch.
+- The writer: `set_execution_paused`, two byte-identical copies, bound a Rust
+  `&str` into `system_settings.value`, which is `jsonb NOT NULL`. A text-typed
+  `PREPARE` of the same statement in a rolled-back transaction: `column "value"
+  is of type jsonb but expression is of type text`. `admin_event_log` holds zero
+  `executions_paused` events; `system_settings` holds no `execution_paused` row;
+  no test calls either copy; `talos_mcp_tool_calls_total` shows no
+  pause/resume call in 30 days. So the tool was never used, and the first
+  incident that reached for it would have received "Failed to pause executions".
+- Why check 88 is green over it: the probe PREPAREs with no type list, the
+  server infers `jsonb` for `$1`, and the statement plans. This is the probe's
+  own stated limit, and the first live instance of it.
+- The reader, `(value)::text = 'true'`, reads any value it does not recognise —
+  a JSON string `"true"`, a number, `null` — as running.
+
+**Decisions.**
+- ONE home, the leaf crate `talos-execution-pause`: a three-valued read
+  (`Running` / `Paused` / `Unreadable`), a writer that states its parameter's
+  type (`to_jsonb($2::boolean)`), `gate_start` (`#[must_use]`, records the
+  counter), one refusal sentence. Both repository copies are deleted, and a pin
+  keeps them deleted.
+- `Unreadable` REFUSES. A kill-switch that reads garbage as "carry on" fails in
+  the one direction a kill-switch must not.
+- Defer, don't drop (operator decision). The scheduler gates before its claim
+  and claims nothing while paused, so due rows stay due; it does not spend the
+  boot flag. A fire claimed a moment before the pause is re-armed
+  (`next_trigger_at = NOW()`, only ever earlier, never re-enabling a disabled
+  row). A schedule several occurrences overdue fires ONCE on resume — the same
+  catch-up shape as a host suspend, and under the same ceiling.
+- The row-creation chokepoint reads the flag FIRST in its transaction and
+  returns a new `ConcurrencyAdmission::ExecutionsPaused` variant, so the
+  compiler made all six callers render it; its batch twin carries a `paused`
+  field for the reason `archived` is a field.
+- HTTP senders are told to come back: the webhook router answers 503 with
+  `Retry-After: 60`, releases its dedup claim and writes nothing to the DLQ; the
+  Gmail push handler answers 503 before the detached task that always answers
+  200 and advances the history cursor — a gate inside that task would ack the
+  push and move the cursor past the mail.
+- The counter `talos_execution_pause_refusals_total{path,reason}` records each
+  refusal once on exactly one path, so the family sums; all 16 pairs are
+  pre-seeded. No alert: a refusal is the pause working.
+
+**Scoped out, stated as the next package:** GraphQL `testWorkflow`, actor
+`handoff`, approval-gate and suspension continuation resumes,
+`test_subworkflow_contract`, and the GCal / GCP push paths. Excluded by design,
+following the archived gate's precedent (work already admitted): crash-recovery
+resumes, sub-workflows of a running parent, chained workflows.
+
+**Guards.** Home-crate unit tests and source pins; `execution_pause_tests`
+(8 DB tests, each with an admitted control and a row count read back); the
+metrics seed/recorder test; the webhook 503 test; the Gmail `push_starts_work`
+test. Twenty mutations, each landed and byte-reverted, 19 caught. The survivor,
+`if false &&` before the Gmail gate, passed a presence pin; the decision was then
+extracted into `execution_pause_defers_push` with its own DB test, and the
+rewritten call site's mutation is caught.
+
+**Stated limits.** Removing the `trigger` or `replay` entry gate leaves every
+test green: the chokepoint refuses the same start. `gate_start`'s increment is
+covered by the recorder unit test only. The scheduler's transition log lines and
+the webhook router's row-creation arm body are untested. A Pub/Sub pause longer
+than the subscription's message retention loses what ages out.

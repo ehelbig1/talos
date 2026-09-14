@@ -77,7 +77,7 @@ impl ExecutionsMutations {
                     // the caller already owns, so it surfaces verbatim like
                     // the other actionable variants.
                     | OrchestrationError::ExecutionArchived(..)
-                    | OrchestrationError::ExecutionPaused
+                    | OrchestrationError::ExecutionPaused(_)
                     | OrchestrationError::WorkflowDisabled(_)
                     | OrchestrationError::WorkflowNotLive(..)
                     // ARCHIVED is not DISABLED and not ABSENT: the workflow

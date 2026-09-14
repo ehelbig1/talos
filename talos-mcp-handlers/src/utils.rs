@@ -357,9 +357,7 @@ pub fn orchestration_error_to_response(
     use talos_execution_orchestration::OrchestrationError as E;
     let code = err.jsonrpc_code();
     let msg: String = match &err {
-        E::ExecutionPaused => {
-            "Execution queue is paused. Use resume_executions to re-enable.".to_string()
-        }
+        E::ExecutionPaused(reason) => talos_execution_pause::refusal_message(*reason).to_string(),
         E::WorkflowDisabled(_) => {
             "Workflow is disabled. Use enable_workflow to re-enable.".to_string()
         }
@@ -1172,12 +1170,17 @@ pub async fn enforce_executions_not_paused(
     workflow_repo: &talos_workflow_repository::WorkflowRepository,
     req_id: Option<serde_json::Value>,
 ) -> Result<(), JsonRpcResponse> {
-    match workflow_repo.is_execution_paused().await {
-        Ok(false) => Ok(()),
-        Ok(true) => Err(mcp_denied(
+    match talos_execution_pause::gate_start(
+        workflow_repo.pool(),
+        talos_metrics::PauseGatePath::McpEntry,
+    )
+    .await
+    {
+        Ok(None) => Ok(()),
+        Ok(Some(reason)) => Err(mcp_denied(
             req_id,
             -32000,
-            "Execution queue is paused. Use resume_executions to re-enable.",
+            talos_execution_pause::refusal_message(reason),
         )),
         Err(e) => {
             tracing::error!("is_execution_paused error: {}", e);

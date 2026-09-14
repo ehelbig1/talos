@@ -43,6 +43,19 @@ impl ExecutionOrchestrationService {
             user_id,
         } = input;
 
+        // 0. Platform-level pause gate. A retry STARTS a new run (a new row,
+        // a fresh dispatch), so it is refused while the deployment is paused,
+        // exactly like `trigger` and `replay` beside it. Until package BF
+        // (2026-09-14) this was the one orchestration entry point that did not
+        // read the flag at all.
+        if let Some(reason) =
+            talos_execution_pause::gate_start(&self.db_pool, talos_metrics::PauseGatePath::Retry)
+                .await
+                .map_err(OrchestrationError::Database)?
+        {
+            return Err(OrchestrationError::ExecutionPaused(reason));
+        }
+
         // 1. Load + ownership check (single SQL round-trip).
         //
         // Three-way: an ARCHIVED execution is refused with its own reason.

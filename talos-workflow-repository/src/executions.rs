@@ -142,6 +142,22 @@ pub enum ConcurrencyAdmission {
     /// all, so each carries its own. This is the backstop for the seven that
     /// pass through here.
     WorkflowArchived,
+    /// The deployment-wide execution pause refused the start. No row was
+    /// written.
+    ///
+    /// Read FIRST inside this transaction, before the actor advisory lock and
+    /// the workflow row lock: a paused platform should not queue behind locks
+    /// it is not going to use. The entry gates in front of this function
+    /// (`talos_execution_pause::gate_start` in the scheduler poll, the
+    /// orchestration service, the MCP handlers) refuse almost every start
+    /// before it gets here; this variant is the atomic backstop for the start
+    /// that passed an entry gate a moment before an operator paused, and the
+    /// ONLY gate for a caller that has none. It is a variant, not a flag, for
+    /// `WorkflowArchived`'s reason: a forgotten arm would dispatch.
+    ///
+    /// `PauseRefusal::Unreadable` is a stored flag that is not a JSON boolean —
+    /// refused, never read as running (`talos_execution_pause`'s crate docs).
+    ExecutionsPaused(talos_metrics::PauseRefusal),
 }
 
 /// Render the human-facing message for a
@@ -207,6 +223,11 @@ pub struct BatchAdmission {
     /// which IS a new variant, because there `Created` and `LimitReached` are
     /// different outcomes and a forgotten arm would have dispatched.)
     pub archived: bool,
+    /// The deployment-wide execution pause refused the whole batch, so NOTHING
+    /// was admitted. A field for `archived`'s reason (`inserted == 0` already
+    /// refuses); what it buys is the caller saying the queue is paused rather
+    /// than reporting a full concurrency cap.
+    pub paused: Option<talos_metrics::PauseRefusal>,
 }
 
 /// Pure helper extracted for unit-testing the cap math without a
@@ -468,30 +489,9 @@ impl WorkflowRepository {
 
     // ── Execution control ──────────────────────────────────────────────────
 
-    /// Returns true if the global execution queue has been paused by an operator.
-    /// Appears 5+ times in the original handlers — centralised here.
-    pub async fn is_execution_paused(&self) -> Result<bool> {
-        let paused: Option<bool> = sqlx::query_scalar(
-            "SELECT (value)::text = 'true' FROM system_settings \
-             WHERE key = 'execution_paused'",
-        )
-        .fetch_optional(&self.db_pool)
-        .await?;
-        Ok(paused.unwrap_or(false))
-    }
-
-    /// Set the execution_paused system setting.
-    pub async fn set_execution_paused(&self, paused: bool) -> Result<()> {
-        let value = if paused { "true" } else { "false" };
-        sqlx::query(
-            "INSERT INTO system_settings (key, value) VALUES ('execution_paused', $1) \
-             ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-        )
-        .bind(value)
-        .execute(&self.db_pool)
-        .await?;
-        Ok(())
-    }
+    // The execution-pause read and write moved to `talos_execution_pause`
+    // (package BF, 2026-09-14): this copy's writer bound TEXT into the jsonb
+    // `system_settings.value` column and had never once succeeded.
 
     /// Count active (running/queued/pending) executions for a workflow.
     pub async fn count_running_executions(&self, workflow_id: Uuid) -> Result<i64> {
@@ -581,6 +581,24 @@ impl WorkflowRepository {
         initial_status: InitialExecutionStatus,
     ) -> Result<ConcurrencyAdmission> {
         let mut tx = self.db_pool.begin().await?;
+
+        // The deployment-wide execution pause (package BF). First, so a paused
+        // platform takes no advisory lock and no row lock for a start it is
+        // going to refuse. Counted here as `row_creation`: the entry gates in
+        // front of this function count their own refusals, so a refusal HERE
+        // means the flag was set between an entry gate and the INSERT — or the
+        // caller has no entry gate at all.
+        if let Some(reason) = talos_execution_pause::read_execution_pause(&mut *tx)
+            .await?
+            .refusal()
+        {
+            tx.rollback().await?;
+            talos_execution_pause::record_refusal(
+                talos_metrics::PauseGatePath::RowCreation,
+                reason,
+            );
+            return Ok(ConcurrencyAdmission::ExecutionsPaused(reason));
+        }
 
         // Actor-budget atomic backstop (battle-hardening). The fast-fail
         // pre-check in `authorize_workflow_trigger` is lock-free
@@ -870,9 +888,30 @@ impl WorkflowRepository {
                 limit: None,
                 running: 0,
                 archived: false,
+                paused: None,
             });
         }
         let mut tx = self.db_pool.begin().await?;
+
+        // The execution pause, read inside the batch's own transaction — see
+        // `create_execution_under_concurrency_limit`.
+        if let Some(reason) = talos_execution_pause::read_execution_pause(&mut *tx)
+            .await?
+            .refusal()
+        {
+            tx.rollback().await?;
+            talos_execution_pause::record_refusal(
+                talos_metrics::PauseGatePath::RowCreation,
+                reason,
+            );
+            return Ok(BatchAdmission {
+                inserted: 0,
+                limit: None,
+                running: 0,
+                archived: false,
+                paused: Some(reason),
+            });
+        }
 
         // Lock the workflow row so concurrent enqueues against the same
         // workflow can't both pass the cap check and then both insert.
@@ -893,6 +932,7 @@ impl WorkflowRepository {
                 limit: max_concurrent,
                 running: 0,
                 archived: true,
+                paused: None,
             });
         }
 
@@ -917,6 +957,7 @@ impl WorkflowRepository {
                 limit: max_concurrent,
                 running,
                 archived: false,
+                paused: None,
             });
         }
 
@@ -960,6 +1001,7 @@ impl WorkflowRepository {
             limit: max_concurrent,
             running,
             archived: false,
+            paused: None,
         })
     }
 

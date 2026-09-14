@@ -41,6 +41,7 @@ talos-idempotency = { path = "../talos-idempotency" }
 # and the DLQ replay dispatch (line ~2427).
 talos-integration-helpers = { path = "../talos-integration-helpers" }
 talos-metrics = { path = "../talos-metrics" }
+talos-execution-pause = { path = "../talos-execution-pause" }
 talos-workflow-liveness = { path = "../talos-workflow-liveness" }
 talos-module-executions = { path = "../talos-module-executions" }
 talos-ml = { path = "../talos-ml" }

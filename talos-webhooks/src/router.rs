@@ -18,6 +18,22 @@ use talos_module_executions::ModuleExecutionService;
 use talos_registry::ModuleRegistry;
 
 use crate::dispatch_failure::{self, ModuleDispatchFailure};
+
+/// The response an inbound webhook gets while the deployment-wide execution
+/// pause refuses its start: 503 with `Retry-After`, so the sender redelivers
+/// after the pause lifts (deferred, not dropped). The body is the caller-safe
+/// sentence from the pause's one home.
+pub(crate) fn execution_pause_response(reason: talos_metrics::PauseRefusal) -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(
+            axum::http::header::RETRY_AFTER,
+            talos_execution_pause::PAUSE_RETRY_AFTER_SECS.to_string(),
+        )],
+        talos_execution_pause::refusal_message(reason),
+    )
+        .into_response()
+}
 use talos_secrets_manager::SecretsManager;
 use talos_worker_fleet::WorkerManager;
 use talos_workflow_engine_core::WorkerSharedKey;
@@ -1989,6 +2005,55 @@ impl WebhookRouter {
     ) -> Result<Response> {
         let execution_id = Uuid::new_v4();
 
+        // 0. The deployment-wide execution pause (package BF). First, before
+        //    any other read: a paused platform answers 503 so the sender
+        //    redelivers after the pause lifts — deferred, not dropped (the
+        //    operator's decision, 2026-09-14). The dedup claim is RELEASED so
+        //    that redelivery is not suppressed as a duplicate, and nothing
+        //    goes to the DLQ: the sender still owns the event. A flag set
+        //    after this read is caught by the row-creation arm below.
+        match talos_execution_pause::gate_start(
+            &self.db_pool,
+            talos_metrics::PauseGatePath::Webhook,
+        )
+        .await
+        {
+            Ok(None) => {}
+            Ok(Some(reason)) => {
+                self.release_dedup_claim(trigger_id, dedup_claim).await;
+                tracing::info!(
+                    target: "talos_webhooks",
+                    event_kind = "webhook_deferred_by_execution_pause",
+                    workflow_id = %workflow_id,
+                    trigger_id = %trigger_id,
+                    reason = reason.as_str(),
+                    "Webhook refused with 503: the deployment-wide execution pause is in force"
+                );
+                return Ok(execution_pause_response(reason));
+            }
+            Err(e) => {
+                // Not a verdict — but a start whose kill-switch could not be
+                // read is not admitted either. 503 is retryable, which is the
+                // right answer for a transient read failure too.
+                self.release_dedup_claim(trigger_id, dedup_claim).await;
+                tracing::error!(
+                    workflow_id = %workflow_id,
+                    trigger_id = %trigger_id,
+                    error = %e,
+                    "Webhook refused with 503: could not read the execution pause flag"
+                );
+                return Ok((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(
+                        axum::http::header::RETRY_AFTER,
+                        talos_execution_pause::PAUSE_RETRY_AFTER_SECS.to_string(),
+                    )],
+                    "Service temporarily unavailable",
+                )
+                    .into_response());
+            }
+        }
+
         // 1. Fetch the workflow's graph + actor binding BEFORE creating
         //    the execution row so the row carries the workflow's bound
         //    actor_id and provenance.trigger_type='webhook' from the
@@ -2229,6 +2294,13 @@ impl WebhookRouter {
                      is told only 'Workflow not found'."
                 );
                 return Ok((StatusCode::NOT_FOUND, "Workflow not found").into_response());
+            }
+            talos_workflow_repository::ConcurrencyAdmission::ExecutionsPaused(reason) => {
+                // Paused between the entry gate at the top of this function and
+                // the INSERT (counted by the repository as `row_creation`).
+                // Same answer as that gate: 503, dedup claim released.
+                self.release_dedup_claim(trigger_id, dedup_claim).await;
+                return Ok(execution_pause_response(reason));
             }
             talos_workflow_repository::ConcurrencyAdmission::LimitReached { limit, .. } => {
                 // FU-3: transient pre-dispatch failure — a concurrency slot may free
@@ -3358,6 +3430,28 @@ pub async fn webhook_handler(
                 );
                 (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod execution_pause_response_tests {
+    use super::execution_pause_response;
+    use axum::http::StatusCode;
+
+    #[test]
+    fn a_paused_webhook_is_told_to_come_back() {
+        for reason in talos_metrics::PauseRefusal::ALL {
+            let resp = execution_pause_response(*reason);
+            // 503, not 4xx: a 4xx tells a sender like Pub/Sub or a CI hook the
+            // event is bad and must not be retried — that is a DROP.
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                resp.headers()
+                    .get(axum::http::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok()),
+                Some("60")
+            );
         }
     }
 }

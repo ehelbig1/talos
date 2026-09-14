@@ -586,7 +586,7 @@ fn safe_orch(e: &OrchestrationError) -> String {
         E::WorkflowNotFound(id) => format!("workflow {id} not found"),
         E::ExecutionNotFound(id) => format!("execution {id} not found"),
         E::ExecutionArchived(id, at) => format!("execution {id} was archived at {at}"),
-        E::ExecutionPaused => "execution paused".into(),
+        E::ExecutionPaused(_) => "execution paused".into(),
         E::WorkflowDisabled(id) => format!("workflow {id} disabled"),
         // Explicit, NOT left to the `_` arm below: that arm renders
         // "execution dispatch failed", which would send an operator looking at

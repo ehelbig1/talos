@@ -114,6 +114,7 @@ talos-actor-scaffold = { path = "../talos-actor-scaffold" }
 talos-engine = { path = "../talos-engine" }
 talos-subworkflow-contract = { path = "../talos-subworkflow-contract" }
 talos-scheduler = { path = "../talos-scheduler" }
+talos-execution-pause = { path = "../talos-execution-pause" }
 talos-actor-policies = { path = "../talos-actor-policies" }
 talos-templates = { path = "../talos-templates" }
 talos-llm = { path = "../talos-llm" }

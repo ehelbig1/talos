@@ -1809,6 +1809,7 @@ dependencies = [
  "talos-engine-events",
  "talos-errors",
  "talos-execution-orchestration",
+ "talos-execution-pause",
  "talos-execution-repository",
  "talos-failure-analysis-service",
  "talos-github",
@@ -8140,6 +8141,7 @@ dependencies = [
  "talos-config",
  "talos-dlp-provider",
  "talos-engine",
+ "talos-execution-pause",
  "talos-execution-repository",
  "talos-execution-result-collector",
  "talos-http-utils",
@@ -8157,6 +8159,15 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "talos-execution-pause"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sqlx",
+ "talos-metrics",
 ]
 
 [[package]]
@@ -8300,6 +8311,7 @@ dependencies = [
  "talos-config",
  "talos-continuation-trigger",
  "talos-dlp-provider",
+ "talos-execution-pause",
  "talos-http-body",
  "talos-http-utils",
  "talos-integration-helpers",
@@ -8709,6 +8721,7 @@ dependencies = [
  "talos-engine",
  "talos-evaluation",
  "talos-execution-orchestration",
+ "talos-execution-pause",
  "talos-execution-repository",
  "talos-execution-result-collector",
  "talos-failure-analysis-service",
@@ -9293,6 +9306,7 @@ dependencies = [
  "talos-config",
  "talos-dlp-provider",
  "talos-engine",
+ "talos-execution-pause",
  "talos-execution-repository",
  "talos-memory",
  "talos-metrics",
@@ -9679,6 +9693,7 @@ dependencies = [
  "talos-dlp-provider",
  "talos-engine",
  "talos-execution-orchestration",
+ "talos-execution-pause",
  "talos-execution-repository",
  "talos-idempotency",
  "talos-integration-helpers",
@@ -9988,6 +10003,7 @@ dependencies = [
  "talos-dlp-provider",
  "talos-engine-events",
  "talos-execution-finalizer",
+ "talos-execution-pause",
  "talos-metrics",
  "talos-secrets-manager",
  "talos-tenancy",

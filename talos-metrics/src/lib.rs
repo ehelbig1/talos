@@ -14,6 +14,7 @@ use prometheus::{
 use std::sync::{Arc, OnceLock};
 
 pub mod execution;
+pub mod execution_pause;
 pub mod google_push;
 pub mod mcp;
 pub mod outcome_class;
@@ -21,6 +22,7 @@ pub mod rpc;
 pub mod security;
 pub mod vault_token;
 pub use execution::ModuleExecutionOutcome;
+pub use execution_pause::{PauseGatePath, PauseRefusal};
 pub use google_push::{JwkRefreshOutcome, PushIntegration, PushRefusalReason};
 pub use mcp::McpToolOutcome;
 pub use outcome_class::OutcomeClass;
@@ -454,6 +456,26 @@ pub fn record_mcp_auth_on(metrics: &TalosMetrics, outcome: McpAuthOutcome) {
     metrics
         .mcp_auth_total
         .with_label_values(&[outcome.as_str()])
+        .inc();
+}
+
+/// Count one start the deployment-wide execution pause refused. Inert without
+/// [`set_global`].
+pub fn record_execution_pause_refusal(path: PauseGatePath, reason: PauseRefusal) {
+    if let Some(m) = global() {
+        record_execution_pause_refusal_on(m, path, reason);
+    }
+}
+
+/// The recording itself, against an EXPLICIT registry.
+pub fn record_execution_pause_refusal_on(
+    metrics: &TalosMetrics,
+    path: PauseGatePath,
+    reason: PauseRefusal,
+) {
+    metrics
+        .execution_pause_refusals_total
+        .with_label_values(&[path.as_str(), reason.as_str()])
         .inc();
 }
 
@@ -1545,6 +1567,12 @@ pub struct TalosMetrics {
     // after one JWK fetch failure produced 94 WARN lines and no series. Both
     // seeded over their closed sets (`google_push`).
     pub google_push_refusals_total: CounterVec,
+
+    // Deployment-wide execution pause — added 2026-09-14 (package BF) when the
+    // pause turned out never to have taken effect. `PauseGatePath::ALL` ×
+    // `PauseRefusal::ALL`, seeded at 0; no alert (a refusal is the operator's
+    // pause working).
+    pub execution_pause_refusals_total: CounterVec,
     pub google_jwk_refresh_total: CounterVec,
 
     // Vault KEK-token renewal — added 2026-09-14 after the controller's transit
@@ -2795,6 +2823,35 @@ impl TalosMetrics {
                 .inc_by(0.0);
         }
 
+        // Deployment-wide execution pause
+        let execution_pause_refusals_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_execution_pause_refusals_total",
+                "Workflow starts refused because the deployment-wide execution pause \
+                 (pause_executions) is set, by the surface that refused and why. \
+                 path=scheduler_poll counts deferred POLLS, not schedules (the due rows \
+                 are never claimed, so they fire on resume); webhook and gmail_push \
+                 requests answered 503 so the sender redelivers; trigger / retry / replay \
+                 / mcp_entry the operator-invoked entry gates; row_creation the \
+                 in-transaction backstop behind them (including a scheduled fire claimed \
+                 just before the pause, whose schedule is re-armed). One refusal is one \
+                 increment on exactly one path, so the family sums. reason=paused | \
+                 unreadable (a stored value that is not a JSON boolean — refused, never \
+                 read as running). talos_metrics::{PauseGatePath, PauseRefusal}, closed \
+                 sets, every pair pre-seeded at 0. A refusal is the pause working: do \
+                 NOT alert on it.",
+            ),
+            &["path", "reason"],
+        )?;
+        registry.register(Box::new(execution_pause_refusals_total.clone()))?;
+        for path in PauseGatePath::ALL {
+            for reason in PauseRefusal::ALL {
+                execution_pause_refusals_total
+                    .with_label_values(&[path.as_str(), reason.as_str()])
+                    .inc_by(0.0);
+            }
+        }
+
         // Google push authentication
         let google_push_refusals_total = CounterVec::new(
             prometheus::Opts::new(
@@ -3340,6 +3397,7 @@ impl TalosMetrics {
             scheduler_readiness_degraded,
             rate_limit_hits_total,
             google_push_refusals_total,
+            execution_pause_refusals_total,
             google_jwk_refresh_total,
             vault_token_renewals_total,
             vault_token_ttl_seconds,
@@ -3828,6 +3886,41 @@ mod tests {
             !warm.contains("talos_vault_token_ttl_seconds{lifetime=\"periodic\"}"),
             "a class the token is no longer must be removed, not left stale"
         );
+    }
+
+    /// Every `(path, reason)` pair of the execution-pause counter is seeded at
+    /// 0 and moved by the recorder. Exhaustive over both `ALL`s.
+    #[test]
+    fn execution_pause_refusals_are_seeded_and_the_recorder_moves_them() {
+        let m = TalosMetrics::new().unwrap();
+        let cold = m.render_prometheus().expect("render");
+        for path in PauseGatePath::ALL {
+            for reason in PauseRefusal::ALL {
+                assert!(
+                    cold.contains(&format!(
+                        "talos_execution_pause_refusals_total{{path=\"{}\",reason=\"{}\"}} 0",
+                        path.as_str(),
+                        reason.as_str()
+                    )),
+                    "unseeded pair {path:?}/{reason:?}"
+                );
+            }
+        }
+        for path in PauseGatePath::ALL {
+            for reason in PauseRefusal::ALL {
+                record_execution_pause_refusal_on(&m, *path, *reason);
+            }
+        }
+        let warm = m.render_prometheus().expect("render");
+        for path in PauseGatePath::ALL {
+            for reason in PauseRefusal::ALL {
+                assert!(warm.contains(&format!(
+                    "talos_execution_pause_refusals_total{{path=\"{}\",reason=\"{}\"}} 1",
+                    path.as_str(),
+                    reason.as_str()
+                )));
+            }
+        }
     }
 
     /// The three security counters that sat DEAD in check 58's baseline for

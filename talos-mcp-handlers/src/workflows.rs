@@ -5378,6 +5378,15 @@ async fn handle_call_workflow(
                 &talos_workflow_liveness::dispatch::archived_refusal_message(&wf_id.to_string()),
             ));
         }
+        // The execution pause, set after this handler's entry gate (the
+        // repository counted the refusal as `row_creation`).
+        Ok(talos_workflow_repository::ConcurrencyAdmission::ExecutionsPaused(reason)) => {
+            return Some(mcp_denied(
+                req_id.clone(),
+                -32000,
+                talos_execution_pause::refusal_message(reason),
+            ));
+        }
         Ok(talos_workflow_repository::ConcurrencyAdmission::LimitReached { limit, running }) => {
             return Some(mcp_denied(
                 req_id.clone(),
@@ -6601,6 +6610,18 @@ async fn handle_bulk_trigger_workflow(
                 }));
                 continue;
             }
+            // The execution pause, set mid-batch after the entry gate. Every
+            // remaining input meets the same refusal, so stop rather than
+            // report it N times.
+            Ok(talos_workflow_repository::ConcurrencyAdmission::ExecutionsPaused(reason)) => {
+                results.push(serde_json::json!({
+                    "input_index": idx,
+                    "execution_id": serde_json::Value::Null,
+                    "status": "paused",
+                    "error": talos_execution_pause::refusal_message(reason),
+                }));
+                break;
+            }
             Ok(talos_workflow_repository::ConcurrencyAdmission::LimitReached {
                 limit,
                 running,
@@ -7061,6 +7082,17 @@ async fn handle_trigger_workflow_as_actors(
                     ),
                 }));
                 continue;
+            }
+            // The execution pause, set mid-list after the entry gate: every
+            // remaining actor meets the same refusal, so stop.
+            Ok(talos_workflow_repository::ConcurrencyAdmission::ExecutionsPaused(reason)) => {
+                results.push(serde_json::json!({
+                    "actor_id": actor_id.to_string(),
+                    "execution_id": serde_json::Value::Null,
+                    "status": "paused",
+                    "error": talos_execution_pause::refusal_message(reason),
+                }));
+                break;
             }
             Ok(talos_workflow_repository::ConcurrencyAdmission::LimitReached {
                 limit,

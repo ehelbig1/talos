@@ -780,6 +780,24 @@ pub async fn pubsub_push_handler(
         }
     };
 
+    // 4b. The deployment-wide execution pause (package BF). Checked HERE —
+    //     after the watch row is known and BEFORE the detached task below
+    //     advances the history cursor — because that task always answers 200:
+    //     a refusal inside it would move the cursor past the mail and ack the
+    //     push, i.e. DROP it. A 503 makes Pub/Sub redeliver on its
+    //     subscription's backoff instead — deferred, not dropped (the
+    //     operator's decision, 2026-09-14). This is the one exception to the
+    //     "always 200" rule above, and it is safe for that rule's reason: a
+    //     pause is lifted by an operator, so the redelivery loop ends. A pause
+    //     longer than the subscription's message retention (7 days by
+    //     default) loses what ages out — stated, not handled. Only a watch
+    //     bound to a workflow or module consults the flag.
+    if let Some(ctx) = state.dispatch.as_ref() {
+        if super::dispatch::execution_pause_defers_push(&ctx.db_pool, &row).await {
+            return StatusCode::SERVICE_UNAVAILABLE;
+        }
+    }
+
     // 5. Advance the cursor and dispatch. (Stale-comment fix 2026-07-01:
     //    an earlier revision deferred dispatch to a "follow-up commit" —
     //    it landed; `dispatch_history_entries` below is that layer.)
