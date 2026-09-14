@@ -4635,3 +4635,68 @@ prose the schemas do not carry, is invisible to every guard here. The
 undefined-Makefile-variable detector was 100 % precise over a population of two
 variables and was not spent as a lint. The controller's HTTP surface has no
 per-route request series; recorded, not built, for want of a baseline.
+
+### Package BC (2026-09-14) — the scheduled drill could not find `cargo`
+
+**How it was found.** Verifying the operator's escrow change end to end: the
+backup drill LaunchAgent resolved `TALOS_MASTER_KEY` through a Keychain-held
+1Password service-account token (64 characters read under launchd, so that half
+worked), and the drill log then ended at step 2/8 with
+`env: cargo: No such file or directory`. The drill textfile flipped to
+`last_status 0`, which is what `TalosBackupRestoreDrillLastRunFailed` reads —
+the alert was the first surface to say the schedule had never worked.
+
+**Measured, in order:**
+- The installed plist's `EnvironmentVariables.PATH` was the scheduler's
+  hardcoded `/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin`.
+- `cargo` on this host is `~/.cargo/bin/cargo` — rustup's default, not an
+  unusual layout. launchd reads no shell profile.
+- `scripts/offhost-backup/schedule.sh` wrote the identical PATH and its job
+  also starts with `cargo build`, so the nightly upload schedule was broken the
+  same way; it had simply never been installed here.
+- `status` for both schedulers checked plist presence and `launchctl list`
+  only, so a job whose first command cannot be found read `✓ scheduled`.
+
+**Decisions.**
+- The PATH is derived from where the installing shell resolves the tools the
+  job runs (`type -P`, argument order, then the old base list, de-duplicated).
+  Adding `~/.cargo/bin` to the constant was rejected: right for one install
+  layout, silently wrong for the next (asdf, Nix, a custom `CARGO_HOME`).
+- Copying the whole shell PATH was rejected: it bakes every transient
+  directory of one terminal session into a job that runs for months.
+- A tool that does not resolve REFUSES the install and is named. A WARN was
+  rejected — the failure it prevents surfaces at 03:00 in a log file.
+- `status` checks the INSTALLED plist, not a fresh render, so a schedule written
+  before this fix, or after a tool moved, reports broken.
+- `render` prints the plist `install` would write, so the test and an operator
+  can see the job PATH without touching `~/Library/LaunchAgents`.
+
+**Guards.** `scripts/tests/launchd-path-test.sh`, wired into `quality.yml`'s
+audit job. Fake `cargo`/`docker`/`aws` in temp directories; a probe tool name no
+system directory can hold; `/nonexistent` standing in for the old PATH — so no
+check depends on where the running host keeps its real cargo. The scheduler half
+renders both real plists through `plutil -lint`, drives `render` with a tool
+missing, and drives `status` against an unresolving and a resolving plist; it
+needs macOS `plutil` and skips loudly on Linux.
+
+**Mutations, twelve, each confirmed landed and byte-reverted, all caught.** Both
+schedulers' PATH hardcoded again; the helper dropping resolved directories,
+accepting a missing tool, counting a shell function (`command -v`), skipping the
+de-duplication, and its missing-tool probe returning empty; both `status` arms
+skipping the PATH report; both `render` arms not refusing; and the empty-array
+guard reverted. **M4 first SURVIVED**: the helper accepting a missing tool
+printed three FAILs and the test exited 0. macOS's `/bin/bash` is 3.2, where
+expanding an empty array under `set -u` aborts the shell, and an abort inside an
+`if` condition exits with status 0 — the EXIT trap ran, every later check was
+skipped. The helper now expands `${dirs[@]+"${dirs[@]}"}` (both schedulers run
+`set -u`, so a zero-tool call would have aborted a scheduler the same way), a
+zero-tool check pins it, and the test's EXIT trap fails any run that did not
+reach its last line.
+
+**Stated limits.** The helper proves each tool RESOLVES on the job PATH, never
+that the job's other environment is complete: the drill scheduler still passes
+no off-host or age-passphrase variables, so a scheduled `--source b2` drill
+cannot run — recorded, not fixed. A tool reached through a shim that needs more
+of the shell's environment than PATH is out of range. Nothing re-derives the PATH
+after install; `status` is what notices a tool that moved. No lint check was
+added — population two schedulers, both now sourcing the one helper.
