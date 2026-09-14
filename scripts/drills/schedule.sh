@@ -28,6 +28,7 @@
 #
 # Usage:
 #   scripts/drills/schedule.sh install     # render + install + load
+#   scripts/drills/schedule.sh render      # print the plist install would write
 #   scripts/drills/schedule.sh uninstall
 #   scripts/drills/schedule.sh status
 #
@@ -38,6 +39,16 @@ PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 LOG_DIR="$HOME/.talos/logs"
 LOG="$LOG_DIR/backup-drill.log"
+
+# The commands the scheduled drill runs before it can do anything else: it
+# `cargo build`s its verifiers and drives the scratch stack with `docker`. Their
+# directories go on the job's PATH as THIS shell resolves them (see
+# scripts/lib/launchd-path.sh for the 2026-09-14 failure that motivated it).
+# The escrow command's own tools (`op`, `security`) are the operator's to
+# resolve; if one is missing the run fails loudly at step 0b, not silently.
+# shellcheck source=../lib/launchd-path.sh
+source "$REPO_ROOT/scripts/lib/launchd-path.sh"
+SCHEDULED_TOOLS=(cargo docker)
 # Sunday 03:00 local. Sunday because a failure then leaves a full working week
 # to fix it before the 14-day threshold.
 WEEKDAY=0
@@ -154,7 +165,7 @@ render_plist() {
   <key>StandardErrorPath</key><string>$LOG</string>
   <key>EnvironmentVariables</key>
   <dict>
-    <key>PATH</key><string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>PATH</key><string>$(xml_escape "$SCHEDULED_PATH")</string>
 $(render_escrow_env)  </dict>
   <key>RunAtLoad</key><false/>
 </dict>
@@ -162,8 +173,44 @@ $(render_escrow_env)  </dict>
 EOF
 }
 
+# Check the INSTALLED plist's PATH against the tools the job runs. Before
+# 2026-09-14 `status` printed "✓ scheduled" for a plist whose job could not
+# find `cargo`; existence of the file is not a working schedule.
+report_scheduled_path() {
+    local plist_path missing
+    plist_path="$(/usr/bin/plutil -extract EnvironmentVariables.PATH raw -o - "$PLIST" 2>/dev/null || true)"
+    if [[ -z "$plist_path" ]]; then
+        red "  ✗ the installed plist sets no readable PATH — re-run '$1'"
+        return
+    fi
+    missing="$(launchd_path_missing "$plist_path" "${SCHEDULED_TOOLS[@]}" | tr '\n' ' ')"
+    if [[ -n "$missing" ]]; then
+        red "  ✗ the scheduled job cannot find: ${missing% } — every run fails before it starts."
+        red "    Re-run '$1' from a shell where they resolve."
+    else
+        green "  scheduled job's PATH resolves ${SCHEDULED_TOOLS[*]}"
+    fi
+}
+
+# Resolve the job's PATH or refuse. Shared by `install` and `render`.
+resolve_scheduled_path() {
+    if ! SCHEDULED_PATH="$(launchd_path_for "${SCHEDULED_TOOLS[@]}")"; then
+        red "✗ refusing to schedule: the drill runs ${SCHEDULED_TOOLS[*]}, and at least one"
+        red "  is not on this shell's PATH (named above). A LaunchAgent that cannot find"
+        red "  its first command fails every week and says so only in the log."
+        exit 1
+    fi
+}
+
 case "${1:-status}" in
+render)
+    # The plist `install` would write, on stdout — nothing is installed or
+    # loaded. Used by scripts/tests/launchd-path-test.sh and for inspection.
+    resolve_scheduled_path
+    render_plist
+    ;;
 install)
+    resolve_scheduled_path
     mkdir -p "$HOME/Library/LaunchAgents" "$LOG_DIR"
     render_plist > "$PLIST"
     chmod 600 "$PLIST"
@@ -171,8 +218,7 @@ install)
     launchctl load "$PLIST"
     green "✓ installed $PLIST"
     green "  weekly: Sunday $(printf '%02d:%02d' "$HOUR" "$MINUTE") local, logging to $LOG"
-    yellow "  NOTE: launchd runs this without your interactive shell. If 'docker'"
-    yellow "  or 'cargo' live somewhere unusual, add them to the plist's PATH."
+    green "  job PATH (from where this shell finds ${SCHEDULED_TOOLS[*]}): $SCHEDULED_PATH"
     if [[ -n "${TALOS_DRILL_ESCROW_KEY_CMD:-}${TALOS_DRILL_ESCROW_KEY_FILE:-}" ]]; then
         green "  escrow source propagated into the plist (command/path only, never the key)."
         yellow "  Verify it runs NON-INTERACTIVELY. A Touch ID prompt at 03:00 has nobody to"
@@ -204,6 +250,7 @@ status)
     if [[ -f "$PLIST" ]]; then
         green "✓ scheduled: $PLIST"
         launchctl list | grep -F "$LABEL" || yellow "  (plist present but not loaded — run 'make drill-schedule')"
+        report_scheduled_path "make drill-schedule"
     else
         yellow "not scheduled. Install with: make drill-schedule"
     fi

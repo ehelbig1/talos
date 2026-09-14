@@ -274,6 +274,12 @@ make offhost-schedule
 make offhost-status
 ```
 
+Run step 4 from the shell where `cargo` and `aws` resolve: the job's PATH is
+taken from where that shell finds them, `make offhost-schedule` refuses if
+either is missing, and `make offhost-status` reports a job whose installed
+PATH cannot find them (launchd does not read your shell profile, so a
+`~/.cargo/bin` cargo is invisible to a job that is not told where it is).
+
 Step 3 is the one that matters. Steps 0-2 prove the pipe works; step 3 proves
 the thing on the other end is a backup.
 

@@ -87,6 +87,14 @@ jobs:
         # part that a LibreSSL laptop skips.
         run: bash deploy/k3s/tests/worker-trust-test.sh
 
+      - name: LaunchAgent PATH helper (drill + off-host schedulers)
+        # scripts/lib/launchd-path.sh derives a scheduled job's PATH from where
+        # the installing shell finds cargo/docker/aws. Both schedulers used to
+        # hardcode a PATH without ~/.cargo/bin, so the first scheduled drill
+        # died at `cargo: No such file or directory`. The helper half runs
+        # here; the plist render/status half needs macOS plutil and skips loudly.
+        run: bash scripts/tests/launchd-path-test.sh
+
   # ── Rust unit tests: library unit tests + the DB-free integration binaries ──
   # The bulk is `--lib` (~1.3k DB-free unit tests). On top of that we explicitly
   # run the two `tests/`-dir integration binaries that are DB-free once their
