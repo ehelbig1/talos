@@ -2679,6 +2679,9 @@ impl ParallelWorkflowEngine {
                 // Retries inside a loop iteration are internal and
                 // should not inflate workflow-level retry metrics.
                 emit_retry_events: false,
+                // Each iteration mints its own `iter_exec_id`, so no iteration
+                // re-dispatches an id an earlier send used.
+                dispatch_attempt_base: 0,
             };
 
             let dispatch_outcome = dispatcher.dispatch(body_job).await;

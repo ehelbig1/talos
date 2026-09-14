@@ -818,6 +818,30 @@ fn two_dispatch_attempts_verify_as_two_chains() {
     assert_eq!(anchored.attempt_anchors.len(), 2);
 }
 
+/// Attempt numbers need not be CONTIGUOUS. A re-dispatch of the same `job_id`
+/// (the engine's one-shot OAuth credential repair) starts past every attempt
+/// the first dispatch could have sent — `DispatchJob::redispatch_attempt_base`
+/// — so a first dispatch with no retries leaves partitions `{0, 4}` when its
+/// node declares `retry_count: 3`. The producer fix for the 2026-09-13 false
+/// tamper verdicts rests on this: a gap must verify exactly like adjacency.
+#[test]
+fn non_contiguous_dispatch_attempts_verify_as_separate_chains() {
+    let mut first = ExecutionLedger::new_for_attempt("wf", "ex", 0);
+    let mut repair = ExecutionLedger::new_for_attempt("wf", "ex", 4);
+    let events = vec![
+        first.append_terminal_anchor("worker"),
+        repair.append_terminal_anchor("worker"),
+    ];
+
+    let report = verify_chain("wf", "ex", &events, &[]);
+    assert!(report.ok, "breaks: {:?}", report.breaks);
+    let attempts: Vec<u32> = report.attempts.iter().map(|a| a.dispatch_attempt).collect();
+    assert_eq!(attempts, vec![0, 4]);
+
+    let anchored = verify_chain_anchored("wf", "ex", &events, &[]);
+    assert!(anchored.ok, "anchor: {:?}", anchored.anchor);
+}
+
 /// The CONTROL. Partitioning must not become a way to launder a substitution:
 /// two conflicting records at the SAME attempt and the SAME sequence are still
 /// tamper evidence, and `ok` must still be false.

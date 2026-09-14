@@ -305,6 +305,28 @@ pub struct DispatchJob {
     /// workflow level and should not inflate retry-rate metrics.
     /// Default `true`.
     pub emit_retry_events: bool,
+    /// The `dispatch_attempt` this dispatch's FIRST send carries; the
+    /// dispatcher's own retries count up from it (`base + 1`, `base + 2`, …).
+    ///
+    /// `0` for every ordinary dispatch, which keeps the first send
+    /// byte-identical to the pre-field wire format. It is non-zero only when
+    /// the engine dispatches a `job_id` that an earlier dispatch already sent
+    /// — today exactly one site, the one-shot OAuth credential repair — and
+    /// then it MUST come from [`DispatchJob::redispatch_attempt_base`] on the
+    /// earlier job.
+    ///
+    /// Why it exists: the worker opens one audit hash chain per
+    /// `(job_id, dispatch_attempt)`, and the offline verifier partitions a
+    /// job's WORM prefix by that pair. A second dispatch of the same `job_id`
+    /// that restarted at attempt 0 put two chains in ONE partition, which the
+    /// verifier correctly reads as two different events at `sequence_num` 1 —
+    /// `DuplicateSequence`, positive tamper evidence — and paged CRITICAL for
+    /// a node that had merely had its expired OAuth token refreshed (measured
+    /// 2026-09-13: both `repaired` outcomes the counter has ever recorded
+    /// produced exactly that verdict).
+    ///
+    /// **Chain steps ignore it**, like the other retry-policy fields.
+    pub dispatch_attempt_base: u32,
 }
 
 /// Default per-node execution budget used by [`DispatchJob::default`].
@@ -407,11 +429,30 @@ impl Default for DispatchJob {
             retry_condition: None,
             retry_delay_expr: None,
             emit_retry_events: true,
+            dispatch_attempt_base: 0,
         }
     }
 }
 
 impl DispatchJob {
+    /// The first `dispatch_attempt` no send of THIS dispatch can have used —
+    /// the base a later dispatch of the same `job_id` must start from.
+    ///
+    /// A dispatch sends at most `max_retries + 1` times, stamped `base` through
+    /// `base + max_retries`, so the next free attempt is one past that.
+    /// Saturating: at `u32::MAX` two dispatches would share a partition again,
+    /// which needs four billion retries and is stated rather than handled.
+    ///
+    /// ONE home for the arithmetic. A caller that re-derives it (`+ 1`,
+    /// forgetting `max_retries`) collides with the earlier dispatch's own
+    /// retries — attempt 1 is exactly where the first retry lands.
+    #[must_use]
+    pub fn redispatch_attempt_base(&self) -> u32 {
+        self.dispatch_attempt_base
+            .saturating_add(self.max_retries)
+            .saturating_add(1)
+    }
+
     /// Construct a [`DispatchJob`] with the four fields every dispatch
     /// needs — the identity triple plus the input payload — leaving
     /// every other field at its documented [`Default`].
@@ -774,6 +815,7 @@ impl fmt::Debug for DispatchJob {
             .field("retry_condition", &self.retry_condition)
             .field("retry_delay_expr", &self.retry_delay_expr)
             .field("emit_retry_events", &self.emit_retry_events)
+            .field("dispatch_attempt_base", &self.dispatch_attempt_base)
             .finish()
     }
 }
@@ -1006,6 +1048,34 @@ mod tests {
         (Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4())
     }
 
+    /// The re-dispatch base must clear EVERY attempt the earlier dispatch can
+    /// have sent, retries included. `base + 1` is the tempting re-derivation
+    /// and it is exactly where the earlier dispatch's first retry lands.
+    #[test]
+    fn redispatch_attempt_base_clears_every_attempt_the_earlier_dispatch_can_send() {
+        let (exec, node, module) = ids();
+        let mut job = DispatchJob::new(exec, node, module, json!({}));
+        assert_eq!(
+            job.redispatch_attempt_base(),
+            1,
+            "no retries: attempt 0 only"
+        );
+
+        job.max_retries = 3; // sends attempts 0, 1, 2, 3
+        assert_eq!(job.redispatch_attempt_base(), 4);
+        let earlier: Vec<u32> =
+            (job.dispatch_attempt_base..=job.dispatch_attempt_base + job.max_retries).collect();
+        assert!(!earlier.contains(&job.redispatch_attempt_base()));
+
+        // Composes: a re-dispatch of a re-dispatch clears both.
+        job.dispatch_attempt_base = 4;
+        assert_eq!(job.redispatch_attempt_base(), 8);
+
+        // Saturates rather than wrapping back into attempt 0's partition.
+        job.dispatch_attempt_base = u32::MAX - 1;
+        assert_eq!(job.redispatch_attempt_base(), u32::MAX);
+    }
+
     #[test]
     fn builder_starts_from_required_fields_and_keeps_defaults() {
         // Required fields go in via `builder(...)`. Everything else
@@ -1024,6 +1094,10 @@ mod tests {
         );
         assert_eq!(job.priority, 100);
         assert!(job.emit_retry_events);
+        assert_eq!(
+            job.dispatch_attempt_base, 0,
+            "a first dispatch is attempt 0"
+        );
         assert_eq!(job.user_id, None);
         assert!(job.encrypted_secrets_ciphertext.is_empty());
         assert!(job.encrypted_secrets_nonce.is_empty());
