@@ -177,7 +177,7 @@ impl LlmClient {
                     Some(k) if !k.is_empty() => Ok(Zeroizing::new(k.clone())),
                     _ => Err(anyhow!(
                         "LLM client: no `anthropic/api_key` in vault and no env fallback. \
-                         Set the vault path via `set_secret anthropic/api_key` or export \
+                         Create the vault secret `anthropic/api_key` (dashboard Settings → Secrets, or the GraphQL `createSecret` mutation) or export \
                          ANTHROPIC_API_KEY in the controller environment."
                     )),
                 }

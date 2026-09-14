@@ -116,13 +116,13 @@ impl OrganizationsMutations {
         let parsed_role = talos_organizations::OrgRole::from_str(&role).ok_or_else(|| {
             async_graphql::Error::new(
                 "Invalid role: must be one of 'viewer', 'member', or 'admin' \
-                 (use transfer_ownership for 'owner')",
+                 (use the transferOwnership mutation for 'owner')",
             )
             .extend_safe()
         })?;
         if parsed_role == talos_organizations::OrgRole::Owner {
             return Err(async_graphql::Error::new(
-                "Cannot add a member as 'owner' — use transfer_ownership instead",
+                "Cannot add a member as 'owner' — use the transferOwnership mutation instead",
             )
             .extend_safe());
         }
@@ -237,14 +237,14 @@ impl OrganizationsMutations {
         let parsed_role = talos_organizations::OrgRole::from_str(&role).ok_or_else(|| {
             async_graphql::Error::new(
                 "Invalid role: must be one of 'viewer', 'member', or 'admin' \
-                 (use transfer_ownership for 'owner')",
+                 (use the transferOwnership mutation for 'owner')",
             )
             .extend_safe()
         })?;
         if parsed_role == talos_organizations::OrgRole::Owner {
             return Err(async_graphql::Error::new(
-                "Cannot promote a member to 'owner' via update_member_role — \
-                 use transfer_ownership instead (Owner-only operation)",
+                "Cannot promote a member to 'owner' via updateMemberRole — \
+                 use the transferOwnership mutation instead (Owner-only operation)",
             )
             .extend_safe());
         }

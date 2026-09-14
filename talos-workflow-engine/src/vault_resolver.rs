@@ -70,7 +70,8 @@ impl fmt::Display for VaultResolverError {
             } => write!(
                 f,
                 "Config key '{config_key}' references vault://{vault_path} but the secret \
-                 could not be resolved. Ensure the secret exists (set_secret) and the path \
+                 could not be resolved. Ensure the secret exists (dashboard Settings → Secrets, or the GraphQL \
+                 createSecret mutation) and the path \
                  is correct."
             ),
             Self::ReservedHostPath {

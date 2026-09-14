@@ -76,6 +76,74 @@ mod schema_snapshot_tests {
 }
 
 #[cfg(test)]
+mod operation_name_prose_tests {
+    /// Caller-facing text names GraphQL operations by the name a GraphQL
+    /// caller actually sends (2026-09-14). The organization and audit-settings
+    /// errors said `transfer_ownership` / `update_member_role` /
+    /// `update_audit_settings` — the Rust RESOLVER names — while the schema
+    /// field is `transferOwnership` / `updateMemberRole` /
+    /// `updateAuditSettings`. Two halves, both needed: the SDL must still carry
+    /// the named fields (a rename there makes the corrected text wrong again),
+    /// and the caller-facing string literals must not regress to the resolver
+    /// spelling. Textual on the second half, and stated: a Rust fn NAME in code
+    /// is not a literal and is correctly ignored, and the log line naming the
+    /// `update_member_role` resolver is an operator line, not caller text, so
+    /// only `transfer_ownership` is pinned in that file.
+    #[test]
+    fn org_and_audit_errors_name_the_graphql_fields() {
+        let sdl = crate::schema_sdl();
+        for field in [
+            "transferOwnership(",
+            "updateMemberRole(",
+            "updateAuditSettings(",
+        ] {
+            assert!(sdl.contains(field), "SDL no longer has `{field}`");
+        }
+        let sites: &[(&str, &str, &[&str])] = &[
+            (
+                "talos-api organizations/mutations.rs",
+                include_str!("schema/organizations/mutations.rs"),
+                &["transfer_ownership"],
+            ),
+            (
+                "talos-organizations lib.rs",
+                include_str!("../../talos-organizations/src/lib.rs"),
+                &["transfer_ownership", "update_member_role"],
+            ),
+            (
+                "talos-audit-ledger lib.rs",
+                include_str!("../../talos-audit-ledger/src/lib.rs"),
+                &["update_audit_settings"],
+            ),
+        ];
+        let mut offenders = Vec::new();
+        for (label, src, names) in sites {
+            // Quoted segments only; whole-line `//` comments are dropped first
+            // (none of these files carries scaffold text in a literal).
+            // Join `\`-newline continuations first, so a message wrapped
+            // across lines is one quoted segment rather than a tail the split
+            // below would read as code.
+            let joined = src.replace("\\\n", "");
+            for (lineno, line) in joined.lines().enumerate() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                for (i, seg) in line.split('"').enumerate() {
+                    if i % 2 == 1 {
+                        for name in *names {
+                            if seg.contains(name) {
+                                offenders.push(format!("{label}:{}: `{name}`", lineno + 1));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(offenders.is_empty(), "{}", offenders.join("\n"));
+    }
+}
+
+#[cfg(test)]
 mod list_complexity_schema_tests {
     use async_graphql::Schema;
 

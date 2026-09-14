@@ -3015,7 +3015,7 @@ async fn handle_trigger_workflow(
                 crate::utils::mcp_text_with_json(
                     req_id,
                     &format!(
-                        "Workflow triggered.\nExecution ID: {}\nStatus: running\n\nUse get_execution_status(execution_id: \"{}\") to check results.\nAfter several runs, use get_execution_delta(workflow_id: \"{}\") to see how outputs are changing across executions.",
+                        "Workflow triggered.\nExecution ID: {}\nStatus: running\n\nUse get_execution_status(execution_id: \"{}\") to check results.\nAfter several runs, use compare_executions(view: \"delta\", workflow_id: \"{}\") to see how outputs are changing across executions.",
                         exec.execution_id, exec.execution_id, workflow_id
                     ),
                     serde_json::json!({
@@ -9929,7 +9929,7 @@ async fn handle_get_workflow_quickstart(
                                             "config_field": field_key,
                                             "vault_path": path,
                                             "allowed_secrets": secrets,
-                                            "fix": "reinstall_module_from_catalog with vault path added to allowed_secrets",
+                                            "fix": "update_module_secrets to add this vault path to the module's allowed_secrets",
                                         }));
                                     }
                                 }
@@ -11834,7 +11834,7 @@ async fn handle_create_workflow_from_spec(
                     "next_steps": [
                         format!("call_workflow(workflow_id: \"{}\")", wf_id),
                         format!("get_workflow_quickstart(workflow_id: \"{}\")", wf_id),
-                        format!("After several runs: get_execution_delta(workflow_id: \"{}\")", wf_id),
+                        format!("After several runs: compare_executions(view: \"delta\", workflow_id: \"{}\")", wf_id),
                     ]
                 }))
                 .unwrap_or_default(),

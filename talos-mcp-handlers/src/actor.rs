@@ -435,7 +435,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "approvers": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Email addresses or Talos user IDs to notify. Required for 'block' and 'notify' modes — the server rejects these modes with no approvers. Notification is delivered via the platform notification webhook if configured, otherwise stored in the approval queue for retrieval via get_approval_queue. Not needed for 'log' mode."
+                        "description": "Email addresses or Talos user IDs to notify. Required for 'block' and 'notify' modes — the server rejects these modes with no approvers. Notification is delivered via the platform notification webhook if configured, otherwise recorded as a `policy_notification_pending` row in the actor action log (read it with get_actor_action_log). A 'block' gate is listed by list_approval_gates. Not needed for 'log' mode."
                     }
                 },
                 "required": ["actor_id", "trigger_condition"]

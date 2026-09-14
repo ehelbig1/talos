@@ -334,7 +334,7 @@ impl OrganizationService {
         // Cannot add someone as Owner through this method — use transfer_ownership.
         if role == OrgRole::Owner {
             return Err(anyhow!(
-                "Cannot directly add a member as owner; use transfer_ownership instead"
+                "Cannot directly add a member as owner; use the transferOwnership mutation instead"
             ));
         }
 
@@ -520,8 +520,8 @@ impl OrganizationService {
         // shape; keep the two methods symmetric.
         if new_role == OrgRole::Owner {
             return Err(anyhow!(
-                "Cannot promote a member to owner via update_member_role; \
-                 use transfer_ownership (Owner-only) instead"
+                "Cannot promote a member to owner via updateMemberRole; \
+                 use the transferOwnership mutation (Owner-only) instead"
             ));
         }
 

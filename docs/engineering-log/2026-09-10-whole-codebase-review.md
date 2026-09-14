@@ -4563,3 +4563,75 @@ served no transit routes, so a defaulted `ttl` still failed on the probe.
 placeholder: re-minting and swapping the controller's token on every upgrade is
 token rotation, a different design. No AppRole re-login for a bounded token.
 No lint — one provider; the loop, the refusal and the pins are the guard.
+
+### Package BB (2026-09-14) — the discovery tool recommended tools that do not exist
+
+**How it was found.** The survey after deploy 49 read `get_platform_hygiene_report`
+the way an operator would. Its input-schema recommendation said "Run
+infer_workflow_input_schema on each"; no tool of that name exists among the 359
+declared (`get_workflow_input_schema` is the one that infers a schema from
+recent executions). One wrong name is a typo; the question was the population.
+
+**Measured, in order:**
+- A literal-aware scan (a small Rust string-literal lexer, comments skipped)
+  over every `.rs` under `controller/src` and `talos-*/src`, first with a
+  call-verb cue, then for an exact list of confirmed-undeclared names.
+- The cue-based detector is noisy in every scope: over source literals
+  workspace-wide 18 hits with ~7 real; over the 3 819 strings of the BUILT tool
+  schemas 21 hits with 2 real (~10 %); a declared-verb-prefix filter drops the
+  motivating `infer_workflow_input_schema` altogether. Prose names response
+  fields exactly as it names tools.
+- A sweep for string arrays whose items are mostly declared tools found ONE
+  table: `search::TOOL_GROUPS`, 10 of 58 entries undeclared, one duplicate.
+- Live: `tool_search("webhook")` returned `related_tools` with
+  `pause_webhook`, `resume_webhook`, `test_webhook`.
+- The exact-name population: 19 prose sites in 13 files across 8 crates (listed in
+  the digest), plus the GraphQL case variant in three files. Four `set_secret`
+  sites were scaffold text inside multi-line literals whose continuation lines
+  start with `//`, invisible to a line grep that skips comment lines.
+
+**Decisions.**
+- Fix every site with the declared equivalent, reading each context rather than
+  mapping names mechanically (notify-mode approvals are an action-log row, not a
+  queue; a vault-denial fix is `update_module_secrets`, not a reinstall).
+- No general prose lint and no general prose test: precision measured at ~10 %
+  on the runtime schema strings. A gate that fires mostly on correct text trains
+  people to add exemptions.
+- `TOOL_GROUPS` is pinned exhaustively — the table is structured, so the check
+  is exact. The prose is pinned against the measured list: in the built schemas
+  (runtime values) and per fixed file (textual), plus the one pure builder.
+- The list is itself pinned as still-unadvertised, so a future tool of one of
+  those names removes the name from the list instead of being banned.
+- Deprecation notes ("replaces the deprecated get_execution_delta") are allowed:
+  they map an old name for a caller who has it.
+- GraphQL-facing errors name the schema field (`transferOwnership`), not the
+  Rust resolver; operator log lines naming the resolver function are left.
+- Folded in, same class: Makefile `ARGS` / `CHANGELOG_WRITE` declared `?=`
+  (four undefined-variable warnings on correct invocations → 0); the Grafana
+  memory panel repointed from a demo-only series to worker process RSS.
+
+**Guards.**
+- `tool_hints`: `tool_groups_name_only_advertised_tools`,
+  `names_once_in_prose_are_still_unadvertised`,
+  `built_tool_schemas_do_not_point_at_unadvertised_names`,
+  `fixed_prose_sites_do_not_point_at_unadvertised_names`,
+  `missing_description_warning_names_only_advertised_tools`, and
+  `string_literal_lexer_reads_scaffold_text_and_skips_comments` for the lexer's
+  two failure directions.
+- `talos-api`: `org_and_audit_errors_name_the_graphql_fields` — the SDL still
+  carries the three fields, and caller-facing literals (continuations joined)
+  do not regress to the resolver spelling.
+
+**Mutations, twelve, each confirmed landed and byte-reverted.** The table
+regrowing a wrong name and a duplicate; the hygiene, approvers-description, tail-logs-description, scaffold (inside a `//`
+continuation), creation-helper, trigger-text, vault-resolver, organization
+continuation-line and audit-ledger reverts — all caught. **M11 first SURVIVED**:
+removing the lexer's continuation-stripping branch changed nothing, because the
+names are found whether the `\`-newline stays in the literal or not. The branch
+was deleted; the replacement M11 (a string lexed as a comment) is caught.
+
+**Stated limits.** A wrong tool name in a file not on the per-file list, in
+prose the schemas do not carry, is invisible to every guard here. The
+undefined-Makefile-variable detector was 100 % precise over a population of two
+variables and was not spent as a lint. The controller's HTTP surface has no
+per-route request series; recorded, not built, for want of a baseline.

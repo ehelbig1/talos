@@ -614,7 +614,7 @@ pub fn validate_workflow_description(input: Option<&str>) -> Result<ValidatedDes
         return Ok(ValidatedDescription {
             description: None,
             semantic_search_warning: Some(
-                "No description provided. Semantic search (search_workflows, tool_search) will return poor results for this workflow. Set a description with update_workflow or recreate with a 'description' field.",
+                "No description provided. Semantic search (search_workflows, tool_search) will return poor results for this workflow. Set a description with set_workflow_description or recreate with a 'description' field.",
             ),
         });
     };
@@ -646,7 +646,7 @@ pub fn validate_workflow_description(input: Option<&str>) -> Result<ValidatedDes
         Ok(ValidatedDescription {
             description: None,
             semantic_search_warning: Some(
-                "No description provided. Semantic search (search_workflows, tool_search) will return poor results for this workflow. Set a description with update_workflow or recreate with a 'description' field.",
+                "No description provided. Semantic search (search_workflows, tool_search) will return poor results for this workflow. Set a description with set_workflow_description or recreate with a 'description' field.",
             ),
         })
     } else {

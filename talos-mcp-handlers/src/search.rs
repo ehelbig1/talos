@@ -1265,6 +1265,126 @@ async fn handle_generate_workflow_embeddings(
 // Ranking: exact name match (score 3) > name contains (score 2) >
 //          description contains (score 1). Ties broken by name order.
 
+/// Static co-loading groups for `tool_search`: tools commonly used together.
+/// When any returned result is in a group, the rest of that group is surfaced
+/// as `related_tools`.
+///
+/// Every entry is a tool name an agent will CALL, and `tool_search` is the tool
+/// the server's own instructions tell agents to use when a call fails — so a
+/// name here that `tools/list` does not advertise sends the agent straight to
+/// `-32601` from the recovery path. Until 2026-09-14 TEN of the 58 entries were
+/// such names (`pause_webhook`, `resume_webhook`, `test_webhook`,
+/// `rollback_version`, `compare_versions`, `remove_node`, `create_sandbox`,
+/// `compile_sandbox`, `compile_and_add_module`, `update_workflow` — renamed or
+/// never built), invisible to `tool_hints`' source scan because it reads
+/// `"tool": "<literal>"` keys and this table has none. Pinned by
+/// `tool_groups_name_only_advertised_tools`.
+pub(crate) const TOOL_GROUPS: &[(&str, &[&str])] = &[
+    (
+        "schedule",
+        &[
+            "list_schedules",
+            "create_schedule",
+            "pause_schedule",
+            "resume_schedule",
+            "delete_schedule",
+            "get_schedule_next_runs",
+        ],
+    ),
+    (
+        "execution",
+        &[
+            "trigger_workflow",
+            "get_execution_status",
+            "list_recent_executions",
+            "cancel_execution",
+            "cancel_queued_executions",
+            "get_execution_lineage",
+            "get_workflow_quickstart",
+        ],
+    ),
+    (
+        "module",
+        &[
+            "list_modules",
+            "install_module_from_catalog",
+            "restore_pinned_modules",
+            "list_module_catalog",
+            "compile_custom_sandbox",
+        ],
+    ),
+    (
+        "secret",
+        &[
+            "list_secrets",
+            "list_secret_namespaces",
+            "list_secret_usage",
+            "list_expiring_secrets",
+            "get_unused_secrets",
+            "check_secret_health",
+            "refresh_oauth_token",
+            "get_secret_access_log",
+        ],
+    ),
+    (
+        "workflow",
+        &[
+            "create_workflow",
+            "list_workflows",
+            "get_workflow",
+            "set_workflow_description",
+            "get_workflow_quickstart",
+            "add_workflow_tags",
+        ],
+    ),
+    (
+        "version",
+        &[
+            "publish_version",
+            "list_versions",
+            "rollback_workflow",
+            "diff_versions",
+            "get_workflow_quickstart",
+        ],
+    ),
+    (
+        "graph",
+        &[
+            "add_node_to_workflow",
+            "add_edge",
+            "add_collect_node",
+            "add_loop_node",
+            "remove_edge",
+            "update_node_config",
+            "get_workflow_quickstart",
+        ],
+    ),
+    (
+        "sandbox",
+        &[
+            "run_sandbox",
+            "lint_sandbox",
+            "compile_custom_sandbox",
+            "get_rust_scaffold",
+            "get_js_scaffold",
+            "get_python_scaffold",
+            "add_node_to_workflow",
+            "get_workflow_quickstart",
+        ],
+    ),
+    (
+        "webhook",
+        &[
+            "create_webhook",
+            "list_webhooks",
+            "disable_webhook",
+            "enable_webhook",
+            "delete_webhook",
+            "get_webhook_security_stats",
+        ],
+    ),
+];
+
 async fn handle_tool_search(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
@@ -1410,114 +1530,6 @@ async fn handle_tool_search(
             na.cmp(nb)
         })
     });
-
-    // Static co-loading groups: tools commonly used together.
-    // When any returned result is in a group, surface the rest of that group.
-    const TOOL_GROUPS: &[(&str, &[&str])] = &[
-        (
-            "schedule",
-            &[
-                "list_schedules",
-                "create_schedule",
-                "pause_schedule",
-                "resume_schedule",
-                "delete_schedule",
-                "get_schedule_next_runs",
-            ],
-        ),
-        (
-            "execution",
-            &[
-                "trigger_workflow",
-                "get_execution_status",
-                "get_execution_status",
-                "list_recent_executions",
-                "cancel_execution",
-                "cancel_queued_executions",
-                "get_execution_lineage",
-                "get_workflow_quickstart",
-            ],
-        ),
-        (
-            "module",
-            &[
-                "list_modules",
-                "install_module_from_catalog",
-                "restore_pinned_modules",
-                "list_module_catalog",
-                "compile_and_add_module",
-            ],
-        ),
-        (
-            "secret",
-            &[
-                "list_secrets",
-                "list_secret_namespaces",
-                "list_secret_usage",
-                "list_expiring_secrets",
-                "get_unused_secrets",
-                "check_secret_health",
-                "refresh_oauth_token",
-                "get_secret_access_log",
-            ],
-        ),
-        (
-            "workflow",
-            &[
-                "create_workflow",
-                "list_workflows",
-                "get_workflow",
-                "update_workflow",
-                "get_workflow_quickstart",
-                "add_workflow_tags",
-            ],
-        ),
-        (
-            "version",
-            &[
-                "publish_version",
-                "list_versions",
-                "rollback_version",
-                "compare_versions",
-                "get_workflow_quickstart",
-            ],
-        ),
-        (
-            "graph",
-            &[
-                "add_node_to_workflow",
-                "add_edge",
-                "add_collect_node",
-                "add_loop_node",
-                "remove_node",
-                "update_node_config",
-                "get_workflow_quickstart",
-            ],
-        ),
-        (
-            "sandbox",
-            &[
-                "create_sandbox",
-                "lint_sandbox",
-                "compile_sandbox",
-                "get_rust_scaffold",
-                "get_js_scaffold",
-                "get_python_scaffold",
-                "add_node_to_workflow",
-                "get_workflow_quickstart",
-            ],
-        ),
-        (
-            "webhook",
-            &[
-                "create_webhook",
-                "list_webhooks",
-                "pause_webhook",
-                "resume_webhook",
-                "test_webhook",
-            ],
-        ),
-    ];
 
     // Include the full inputSchema so agents have parameter names and types
     // in context — enabling correct tool calls without a separate schema lookup.

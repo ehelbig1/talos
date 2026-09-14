@@ -439,13 +439,13 @@ async fn handle_list_secret_usage(
                     "consumer": "talos_llm::LlmClient",
                     "purpose": "Controller-side Tier-2 LLM dispatch (workflow scaffolding, hot-update, sub-workflow contract).",
                     "rotation_safe": true,
-                    "rotation_note": "Per-request resolution via 60s vault cache — `rotate_secret` propagates within one TTL window without restart.",
+                    "rotation_note": "Per-request resolution via 60s vault cache — a value changed via the dashboard or the GraphQL `updateSecret` mutation propagates within one TTL window without restart.",
                 }),
                 serde_json::json!({
                     "consumer": "talos_graph_rag::GraphRagService",
                     "purpose": "LLM-fallback entity extraction on actor_memory writes (rule-based runs first; LLM only when rule-based returns empty).",
                     "rotation_safe": true,
-                    "rotation_note": "Vault-first resolution per call (post r306) — `rotate_secret` propagates without restart. Tier-1 actors skip this path entirely.",
+                    "rotation_note": "Vault-first resolution per call (post r306) — a value changed via the dashboard or the GraphQL `updateSecret` mutation propagates without restart. Tier-1 actors skip this path entirely.",
                 }),
                 serde_json::json!({
                     "consumer": "Engine job dispatch (ParallelWorkflowEngine::build_encrypted_secrets)",

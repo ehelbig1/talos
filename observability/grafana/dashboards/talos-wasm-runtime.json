@@ -802,14 +802,14 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "wasm_memory_used_bytes",
-          "legendFormat": "Memory Used",
+          "expr": "process_resident_memory_bytes{job=\"talos-worker\"}",
+          "legendFormat": "{{instance}} RSS",
           "refId": "A"
         }
       ],
-      "title": "Memory Usage \u2014 NO PRODUCER (always empty)",
+      "title": "Worker Process Memory (RSS)",
       "type": "timeseries",
-      "description": "wasm_memory_used_bytes has no producer. It is registered only in worker/src/bin/metrics_demo.rs, which serves its own private registry on port 9091 that nothing scrapes; the real worker exports no memory instrument of any name. This panel is therefore permanently empty, and is kept (renamed) rather than deleted so the gap stays visible instead of reading as 'memory is fine'. The matching alert HighWASMMemoryUsage was deleted from observability/rules/alerts.yml for the same reason. To fix: add a gauge in talos-worker-runtime/src/metrics.rs, extend the exported-name pinning test, then point this panel at the name that test asserts."
+      "description": "Resident memory of each worker PROCESS (process_resident_memory_bytes, exported by the prometheus crate's ProcessCollector since 2026-09-11). It includes every live wasmtime store plus the host runtime, so it answers 'is the worker's memory growing?' but NOT 'how much memory is one WASM instance using' - no per-instance instrument exists. Until 2026-09-14 this panel queried wasm_memory_used_bytes, which only the unscraped demo binary worker/src/bin/metrics_demo.rs produces, so it was permanently empty. No RSS alert on purpose: process_* cannot see the cgroup limit (see TalosProcessFdsNearLimit's comment)."
     }
   ],
   "refresh": "10s",

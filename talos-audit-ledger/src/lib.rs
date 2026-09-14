@@ -455,7 +455,7 @@ impl OTLPCache {
                 reason = %reason,
                 "OTLP endpoint failed fire-time SSRF re-check — refusing to build exporter. \
                  This is defense-in-depth against write-side bypasses; check the user_audit_settings \
-                 row and the audit trail of update_audit_settings calls for this user."
+                 row and the audit trail of updateAuditSettings mutations for this user."
             );
             return None;
         }
@@ -526,7 +526,7 @@ impl OTLPCache {
                         reason = %reason,
                         "Failed to decrypt OTLP auth headers — exporter will stream WITHOUT auth \
                          headers. Check the KEK provider (env/Vault) the SecretsManager is wired \
-                         to, then re-save via update_audit_settings."
+                         to, then re-save via the updateAuditSettings mutation."
                     );
                 }
             }

@@ -158,7 +158,7 @@ pub async fn promote_first_user_if_needed(
         %user_id,
         "Bootstrap: first user promoted to automation-node ceiling — \
          actor creation with LLM/memory/HTTP/secrets worlds is now unblocked. \
-         For admin-gated MCP tools (set_secret, query_paginated), grant \
+         For admin-gated MCP tools (e.g. query_paginated), grant \
          agent capabilities via the agents/roles tables or use the local-dev \
          stdio endpoint which auto-assigns '*'."
     );

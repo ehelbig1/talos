@@ -723,4 +723,380 @@ mod tests {
             hint_defects(&fixes)
         );
     }
+
+    // ── Prose and tables that name tools (2026-09-14) ───────────────────────
+    //
+    // The two legs above see a tool name only in a `"tool": "<literal>"` key.
+    // Operator-facing text also names tools in PROSE ("Run X on each", "Pairs
+    // with X", a scaffold's "1. Store the secret: X(...)") and in one TABLE
+    // (`search::TOOL_GROUPS`, which feeds `tool_search`'s `related_tools`).
+    // Measured that day: the table held 10 names `tools/list` does not
+    // advertise, and prose held 14 more across 10 files in 7 crates.
+    //
+    // A general prose detector was built and MEASURED and is deliberately not
+    // shipped: over the 3 819 strings in the built tool schemas a call-verb cue
+    // ("run|call|use|via|with|see|pairs with" + a snake_case name not declared
+    // as a tool, parameter or enum value) flags 21 names of which 2 are real
+    // (~10 %), because prose names response FIELDS the same way it names tools;
+    // over source literals workspace-wide it is 18 hits / ~7 real, and it MISSES
+    // the motivating `infer_workflow_input_schema` under any declared-verb-prefix
+    // filter. So what ships is: the table pinned exhaustively, the schema
+    // strings and the fixed source sites pinned against the measured list, and
+    // one pure builder driven end to end.
+
+    /// Names operator-facing text pointed at until 2026-09-14 that `tools/list`
+    /// does not advertise: removed by MCP-1201 (secret writes), renamed in the
+    /// 2026-07 consolidation (`get_execution_delta` is a dispatch-only alias of
+    /// `compare_executions` view `delta`), or never built.
+    const UNADVERTISED_NAMES_ONCE_IN_PROSE: &[&str] = &[
+        "analyze_failure",
+        "compare_versions",
+        "compile_and_add_module",
+        "compile_sandbox",
+        "create_sandbox",
+        "get_approval_queue",
+        "get_execution_delta",
+        "infer_workflow_input_schema",
+        "pause_webhook",
+        "reinstall_module_from_catalog",
+        "resume_webhook",
+        "rollback_version",
+        "rotate_secret",
+        "run_workflow_hygiene",
+        "set_secret",
+        "test_webhook",
+        "update_workflow",
+    ];
+
+    /// Whole-word occurrence (`[A-Za-z0-9_]` boundaries), so `set_secret` does
+    /// not match inside `set_secret_expiry` and vice versa.
+    fn word_positions(hay: &str, needle: &str) -> Vec<usize> {
+        let is_word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+        hay.match_indices(needle)
+            .filter(|(i, _)| {
+                let before = hay[..*i].chars().next_back();
+                let after = hay[i + needle.len()..].chars().next();
+                !before.is_some_and(is_word) && !after.is_some_and(is_word)
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// The text of every string literal in `src`, comments skipped.
+    ///
+    /// Needed because scaffold text lives in multi-line string literals whose
+    /// continuation lines BEGIN with `//` — a line-based "skip comment lines"
+    /// filter reads exactly those as comments, which is how four `set_secret(`
+    /// instructions hid from a grep on the day this was written. Handles `"…"`
+    /// with escapes (continuations kept verbatim), `r"…"` / `r#"…"#`, char
+    /// literals and lifetimes. Not a full Rust lexer: a raw string whose hash
+    /// count differs from its closer's would mis-split (none exists in the
+    /// pinned files — the tripwire below asserts each yields literals).
+    fn string_literals(src: &str) -> Vec<String> {
+        let b: Vec<char> = src.chars().collect();
+        let n = b.len();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < n {
+            let c = b[i];
+            if c == '/' && i + 1 < n && b[i + 1] == '/' {
+                while i < n && b[i] != '\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if c == '/' && i + 1 < n && b[i + 1] == '*' {
+                i += 2;
+                while i + 1 < n && !(b[i] == '*' && b[i + 1] == '/') {
+                    i += 1;
+                }
+                i += 2;
+                continue;
+            }
+            if c == 'r' && (i == 0 || !(b[i - 1].is_alphanumeric() || b[i - 1] == '_')) {
+                let mut j = i + 1;
+                let mut hashes = 0;
+                while j < n && b[j] == '#' {
+                    hashes += 1;
+                    j += 1;
+                }
+                if j < n && b[j] == '"' {
+                    let start = j + 1;
+                    let mut k = start;
+                    while k < n
+                        && !(b[k] == '"' && (0..hashes).all(|h| b.get(k + 1 + h) == Some(&'#')))
+                    {
+                        k += 1;
+                    }
+                    out.push(b[start..k.min(n)].iter().collect());
+                    i = k + 1 + hashes;
+                    continue;
+                }
+            }
+            if c == '\'' {
+                if i + 2 < n && b[i + 1] == '\\' {
+                    let mut k = i + 2;
+                    while k < n && b[k] != '\'' {
+                        k += 1;
+                    }
+                    i = k + 1;
+                } else if i + 2 < n && b[i + 2] == '\'' {
+                    i += 3;
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            if c == '"' {
+                let mut k = i + 1;
+                let mut lit = String::new();
+                while k < n && b[k] != '"' {
+                    if b[k] == '\\' && k + 1 < n {
+                        // An escape (a `\`-newline continuation included) is
+                        // kept verbatim: only the closing quote matters here,
+                        // and the text either side is still searched.
+                        lit.push(b[k]);
+                        lit.push(b[k + 1]);
+                        k += 2;
+                        continue;
+                    }
+                    lit.push(b[k]);
+                    k += 1;
+                }
+                out.push(lit);
+                i = k + 1;
+                continue;
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// The lexer's own two failure directions: a scaffold line inside a string
+    /// that starts with `//` IS literal text, and a real comment is NOT.
+    #[test]
+    fn string_literal_lexer_reads_scaffold_text_and_skips_comments() {
+        let src = "// set_secret in a comment\nlet s = \"a\\n\\\n   //   1. set_secret(key)\\n\";\nlet r = r#\"raw \"q\" x\"#;\nlet c = '\"';\n";
+        let lits = string_literals(src);
+        assert!(
+            lits.iter().any(|l| l.contains("//   1. set_secret(key)")),
+            "{lits:?}"
+        );
+        assert!(!lits.iter().any(|l| l.contains("in a comment")), "{lits:?}");
+        assert!(lits.iter().any(|l| l == "raw \"q\" x"), "{lits:?}");
+        assert_eq!(
+            word_positions("set_secret_expiry and set_secret(", "set_secret").len(),
+            1
+        );
+    }
+
+    /// The list cannot drift into banning a real tool: every name in it must
+    /// still be absent from `tools/list`. If a tool of that name is ever built,
+    /// this fails and the name leaves the list.
+    #[test]
+    fn names_once_in_prose_are_still_unadvertised() {
+        for name in UNADVERTISED_NAMES_ONCE_IN_PROSE {
+            assert!(
+                !is_declared_tool(name),
+                "`{name}` is now an advertised tool — remove it from the list"
+            );
+        }
+    }
+
+    /// `tool_search`'s `related_tools` table names only advertised tools, each
+    /// once per group. Exhaustive over the table, not over a list of past
+    /// mistakes: a new wrong name fails here the day it is typed.
+    #[test]
+    fn tool_groups_name_only_advertised_tools() {
+        assert!(
+            crate::search::TOOL_GROUPS.len() >= 9,
+            "TOOL_GROUPS shrank to {} groups — extraction or table broken",
+            crate::search::TOOL_GROUPS.len()
+        );
+        let mut offenders = Vec::new();
+        for (group, tools) in crate::search::TOOL_GROUPS {
+            assert!(tools.len() >= 2, "group `{group}` has fewer than two tools");
+            let mut seen = std::collections::BTreeSet::new();
+            for tool in *tools {
+                if !seen.insert(*tool) {
+                    offenders.push(format!("{group}: `{tool}` listed twice"));
+                }
+                if !is_declared_tool(tool) {
+                    offenders.push(format!("{group}: `{tool}` is not advertised"));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "tool_search would suggest tools a caller cannot call:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    fn collect_strings<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
+        match v {
+            Value::String(s) => out.push(s),
+            Value::Array(a) => a.iter().for_each(|x| collect_strings(x, out)),
+            Value::Object(m) => m.values().for_each(|x| collect_strings(x, out)),
+            _ => {}
+        }
+    }
+
+    /// No string in any BUILT tool schema — tool and parameter descriptions,
+    /// read at runtime — points at a name on the list. The one allowed shape is
+    /// a deprecation note ("replaces the deprecated get_execution_delta"),
+    /// which names the alias so a caller holding the old name can map it.
+    #[test]
+    fn built_tool_schemas_do_not_point_at_unadvertised_names() {
+        let mut strings_seen = 0usize;
+        let mut offenders = Vec::new();
+        for (module, schemas) in all_static_schema_modules() {
+            for schema in &schemas {
+                let mut strings = Vec::new();
+                collect_strings(schema, &mut strings);
+                for text in strings {
+                    strings_seen += 1;
+                    for name in UNADVERTISED_NAMES_ONCE_IN_PROSE {
+                        for at in word_positions(text, name) {
+                            let before = &text[text[..at]
+                                .char_indices()
+                                .rev()
+                                .nth(40)
+                                .map_or(0, |(i, _)| i)
+                                ..at];
+                            if !before.contains("deprecated") {
+                                offenders.push(format!(
+                                    "{module}::{}: `{name}`",
+                                    schema["name"].as_str().unwrap_or("?")
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            strings_seen >= 3000,
+            "only {strings_seen} schema strings walked"
+        );
+        assert!(
+            offenders.is_empty(),
+            "tool schemas point callers at tools that do not exist:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
+    /// The fixed SOURCE sites, pinned by file: each file's string literals
+    /// (comments excluded) must not name what it once did. Textual, and stated
+    /// as such — these literals are built inside async, DB-reading handlers and
+    /// services no unit test constructs. A new wrong name in a DIFFERENT file
+    /// is invisible here; the measurement above is why a general detector was
+    /// not shipped instead.
+    #[test]
+    fn fixed_prose_sites_do_not_point_at_unadvertised_names() {
+        let sites: &[(&str, &str, &[&str])] = &[
+            (
+                "talos-hygiene-service/src/lib.rs",
+                include_str!("../../talos-hygiene-service/src/lib.rs"),
+                &["infer_workflow_input_schema"],
+            ),
+            (
+                "talos-session-brief-service/src/lib.rs",
+                include_str!("../../talos-session-brief-service/src/lib.rs"),
+                &["run_workflow_hygiene"],
+            ),
+            (
+                "talos-workflow-creation-helpers/src/lib.rs",
+                include_str!("../../talos-workflow-creation-helpers/src/lib.rs"),
+                &["update_workflow"],
+            ),
+            (
+                "talos-workflow-validation/src/lib.rs",
+                include_str!("../../talos-workflow-validation/src/lib.rs"),
+                &["reinstall_module_from_catalog"],
+            ),
+            (
+                "talos-llm/src/lib.rs",
+                include_str!("../../talos-llm/src/lib.rs"),
+                &["set_secret"],
+            ),
+            (
+                "talos-workflow-engine/src/vault_resolver.rs",
+                include_str!("../../talos-workflow-engine/src/vault_resolver.rs"),
+                &["set_secret"],
+            ),
+            (
+                "talos-auth/src/bootstrap.rs",
+                include_str!("../../talos-auth/src/bootstrap.rs"),
+                &["set_secret"],
+            ),
+            (
+                "secrets.rs",
+                include_str!("secrets.rs"),
+                &["rotate_secret", "set_secret"],
+            ),
+            (
+                "workflows.rs",
+                include_str!("workflows.rs"),
+                &["get_execution_delta", "reinstall_module_from_catalog"],
+            ),
+            ("platform.rs", include_str!("platform.rs"), &["set_secret"]),
+            ("sandbox.rs", include_str!("sandbox.rs"), &["set_secret"]),
+            (
+                "actor.rs",
+                include_str!("actor.rs"),
+                &["get_approval_queue"],
+            ),
+            (
+                "executions.rs",
+                include_str!("executions.rs"),
+                &["analyze_failure"],
+            ),
+        ];
+        let mut offenders = Vec::new();
+        for (label, src, names) in sites {
+            let literals = string_literals(src);
+            assert!(
+                !literals.is_empty(),
+                "{label}: lexer found no string literals"
+            );
+            for lit in &literals {
+                for name in *names {
+                    if !word_positions(lit, name).is_empty() {
+                        offenders.push(format!(
+                            "{label}: `{name}` in {:?}",
+                            &lit[..lit.len().min(90)]
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(offenders.is_empty(), "{}", offenders.join("\n"));
+    }
+
+    /// The one fixed site built by a PURE function, driven end to end: every
+    /// tool-shaped token in the no-description warning is an advertised tool.
+    #[test]
+    fn missing_description_warning_names_only_advertised_tools() {
+        let v = talos_workflow_creation_helpers::validate_workflow_description(None)
+            .expect("no description is accepted with a warning");
+        let warning = v
+            .semantic_search_warning
+            .expect("a missing description carries a warning");
+        let tokens: Vec<&str> = warning
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|t| {
+                t.contains('_')
+                    && t.chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            })
+            .collect();
+        assert!(tokens.contains(&"set_workflow_description"), "{warning}");
+        for t in tokens {
+            assert!(
+                is_declared_tool(t),
+                "warning names `{t}`, not an advertised tool: {warning}"
+            );
+        }
+    }
 }
