@@ -537,6 +537,16 @@ CTRL_TESTS=(
     # dirtied pages measured on a live copy). `common` harness, so CTRL_TESTS
     # (64b).
     "ml_split_churn_tests"
+    # A re-append of an unchanged example writes no row version and does not
+    # touch ml_datasets.updated_at, so the ML policy evaluator does not record a
+    # new model version for it (129 of ops-severity's 162 evaluations in 7 days
+    # were identical, 2026-09-14); the dataset-scoped content fingerprint is
+    # pinned through the real prepare path. `common` harness, so CTRL_TESTS (64b).
+    "ml_append_noop_tests"
+    # The upsert's two embedding clauses (a NULL vector arriving, a model
+    # change) against a local mock embedder the test toggles — its own binary
+    # because the embedding config is a process-wide OnceLock. CTRL_TESTS (64b).
+    "ml_append_embedding_arrival_tests"
     # Eleven tables no Rust reads or writes are gone (migration 20260912100000);
     # schema_audit_log and its DDL event trigger stay; every SOC 2 collector
     # export statement PREPAREs. `common` harness, so CTRL_TESTS (64b).

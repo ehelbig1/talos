@@ -338,7 +338,15 @@ pub fn evaluate_policy(policy: &PolicyJson, inputs: &PolicyInputs<'_>) -> Policy
         if inputs.dataset_classes.is_empty() {
             unmet.push("min_corrections_per_class: dataset has no classes yet".into());
         }
-        for class in inputs.dataset_classes {
+        // SORTED, not caller order: both callers build `dataset_classes` from
+        // `DatasetService::class_counts`, a HashMap, so the unmet list came out
+        // in a different order on every evaluation — and it is stored in
+        // `metrics_json.policy_decision`, where two identical verdicts then
+        // read as different records (measured 2026-09-14: the order was the
+        // only difference in most consecutive `ops-severity` versions).
+        let mut classes: Vec<&String> = inputs.dataset_classes.iter().collect();
+        classes.sort();
+        for class in classes {
             let have = inputs
                 .corrections_per_class
                 .get(class)
@@ -1122,6 +1130,45 @@ impl LifecycleService {
 
 #[cfg(test)]
 mod tests {
+    /// The unmet list is stored in `metrics_json.policy_decision`, so its ORDER
+    /// is part of the record. Callers hand classes over from a HashMap; the
+    /// same inputs in two different orders must yield byte-identical verdicts.
+    #[test]
+    fn unmet_order_does_not_depend_on_caller_class_order() {
+        let report = report(&[], &[]);
+        let corrections = BTreeMap::new();
+        let policy = PolicyJson {
+            min_corrections_per_class: Some(2),
+            ..Default::default()
+        };
+        let forward: Vec<String> = ["alpha", "beta", "gamma"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut backward = forward.clone();
+        backward.reverse();
+        let a = evaluate_policy(
+            &policy,
+            &PolicyInputs {
+                report: &report,
+                total_examples: 10,
+                corrections_per_class: &corrections,
+                dataset_classes: &forward,
+            },
+        );
+        let b = evaluate_policy(
+            &policy,
+            &PolicyInputs {
+                report: &report,
+                total_examples: 10,
+                corrections_per_class: &corrections,
+                dataset_classes: &backward,
+            },
+        );
+        assert_eq!(a.unmet, b.unmet);
+        assert!(a.unmet[0].contains("'alpha'"), "sorted: {:?}", a.unmet);
+    }
+
     use super::*;
     use crate::eval::{ClassMetrics, CoveragePoint};
 

@@ -4314,3 +4314,139 @@ repair through a live worker; the live proof is the next `repaired`
 increment with a clean sweep beside it. The alert text is unchanged: a
 `DuplicateSequence` within one attempt remains substitution evidence, and
 the producer was what was wrong. No lint: the population is one site.
+
+### Package AZ (2026-09-14) — a re-taught example was a dataset change
+
+**Asked for** by the operator after the deploy-47 survey listed
+`ml_model_versions` growth as a candidate: no DELETE anywhere, ~30 rows a
+day, 1 232 rows across two models, `ops-severity` with 840 versions and none
+promoted.
+
+**What the first reads got wrong, measured and corrected before any code.**
+- *"~1 050 byte-identical duplicate models."* `count(distinct
+  artifact_sha256)` ignores NULL, and the 1 043 `knn-pgvector` versions carry
+  NO artifact — they are evaluation records. Real byte duplicates: 5 of 174
+  logistic-regression artifacts.
+- *"Consecutive evaluations differ."* Diffing flattened `metrics_json` pairs
+  showed the dominant difference was `policy_decision.unmet` — the SAME
+  reasons in a different order. `evaluate_policy` iterated
+  `dataset_classes`, which both callers build from `class_counts`, a
+  `HashMap`.
+- Normalising that order: **129 of `ops-severity`'s 162 kNN evaluations in
+  the last 7 days were identical to the previous one**; `inbox-classifier`,
+  whose dataset genuinely grows, 2 of 62.
+
+**Why the evaluator kept running.** It re-evaluates when
+`ml_datasets.updated_at` passes the model's last attempt (at most hourly),
+and each evaluation records a version. `DatasetService::insert_prepared`
+touched `updated_at` unconditionally after an `ON CONFLICT (dataset_id,
+example_key) DO UPDATE` that rewrote every conflicting row. The hourly
+alert-triage workflow re-distills alerts it has already taught, so each run
+"changed" the dataset. Proved by `xmin` on the live table: the 10:00 append
+on `ops-severity` wrote five row versions in one transaction — one new
+example and four rewrites of rows created as early as 07-21.
+`pg_stat_user_tables` over the 4.4-day stats window: 176 dataset touches.
+
+**Why the upsert could not already tell.** `features_enc` is fresh AEAD
+ciphertext on every append; the plaintext is not in the row. Comparing
+embeddings was considered: re-embedding identical text on the live embedder
+was bit-identical (4 of 4 serially, 8 of 8 in parallel), but an embedder
+outage yields NULL vectors, and the DB test harness itself runs a dead
+embedder, so an embedding-keyed rule would write every time it mattered to
+observe. A stored keyed fingerprint is exact and embedder-independent.
+
+**The fix.**
+1. `ml_examples.content_fingerprint text` (migration `20260914120000`,
+   nullable, no backfill — backfilling would mean decrypting every example).
+2. `content_identity::row_content_fingerprint(mac_key, dataset_id, text)` =
+   `"cf1:" + HMAC-SHA256(key, "talos:ml_example_content:v1\0" || dataset_id
+   bytes || text)`, derived once per batch in `prepare_examples`.
+3. The `DO UPDATE … WHERE` arm adds `EXAMPLE_UPSERT_CHANGES`: fingerprint,
+   `label_json`, `source`, `embedding_model` (non-NULL new), or a NULL stored
+   vector gaining one. One constant, interpolated into the statement.
+4. The dataset touch fires only when `stored > 0 || evicted > 0`
+   (`enforce_growth_cap` now returns the eviction count).
+5. The content-dedupe pass runs only when `stored > 0`.
+6. `evaluate_policy` iterates classes sorted.
+
+**Security decisions.**
+- *Dataset-scoped, not `content_key`.* `content_key` is an identity key,
+  equal for equal text wherever it appears, because it deduplicates. This
+  column needs equality only within one `(dataset_id, example_key)` row, so
+  binding the dataset id makes identical text in two tenants' (or two
+  datasets') rows produce unrelated values — a reader of the table learns
+  nothing about cross-dataset overlap, at no cost. Domain-separated from
+  `content_key` by the label, so the two persisted MACs cannot be joined.
+- *Keyed* under the existing ML content purpose key (KEK-derived HKDF, or an
+  HKDF over the global DEK on the KMS path), so there is no offline
+  confirmation oracle — the property `content_identity` already documents.
+- *Failure direction.* A key-resolution failure yields `None` fingerprints;
+  NULL is DISTINCT, so every row writes — today's behaviour — never a
+  silently skipped update. Logged at WARN.
+
+**Performance decisions.**
+- The key derivation is microseconds (or a TTL-cached DEK read) and runs once
+  per batch.
+- The predicate is per-conflicting-row scalar comparisons; the column adds
+  ~70 bytes per row.
+- Skipping dedupe after a no-op saves a COUNT plus a ranked CTE over every
+  embedded row in the dataset (43 ms mean over 128 calls and 91 ms over 33 in
+  `pg_stat_statements`). Only a written row can create a content duplicate;
+  eviction removes rows.
+
+**Semantics changes, stated.** `insert_prepared` returns rows inserted or
+changed (was: rows the statement touched, including no-op rewrites). The MCP
+`ml_append_examples` reply's `stored` inherits that, and the tool description
+says so. The distill log adds `submitted` beside `appended`, so
+`submitted > 0, appended = 0` reads as a recognised no-op rather than a
+dropped batch.
+
+**Seams.** Existing rows have a NULL fingerprint: each is rewritten once on
+its next re-append (filling the column), so each model is evaluated once
+after deploy. A KEK rotation, or `rotate_dek` on the KMS path, moves every
+fingerprint the same way — the bounded seam `content_identity` documents for
+`ck1:` keys.
+
+**Guards.**
+- `content_identity`: pinned vectors for two datasets computed independently
+  with Python `hmac`; scoping, keying and domain separation from
+  `content_key`.
+- `lifecycle`: the same classes in two orders yield identical `unmet`.
+- `controller/tests/ml_append_noop_tests` (7, CTRL_TESTS), through the real
+  `prepare_examples` + `insert_prepared`, a dead embedder, `xmin` and the
+  dataset timestamp: unchanged re-append writes no row version, does not move
+  `updated_at`, and `should_evaluate` then DECLINES; relabel rewrites exactly
+  that row and the evaluator RUNS; new text under an existing producer key
+  writes; a NULL-fingerprint row rewrites once then settles; a correction
+  wins and a teacher re-append over it writes nothing; a correction
+  confirming the same label is written (source-only); an eviction with no
+  write still touches; identical text in two datasets gets unrelated `cf1:`
+  values.
+- `controller/tests/ml_append_embedding_arrival_tests` (CTRL_TESTS): a local
+  axum mock embedder the test toggles. Embedder down → rows stored without
+  vectors; up → the same re-append writes both (vectors arrive); then no-op;
+  a row stamped with an older model is rewritten alone; a row that lost its
+  vector but kept its model name has it restored. Its own binary because the
+  embedding client caches config in a process-wide `OnceLock` and vectors in
+  an LRU, and one sequential scenario so no parallel test races that state.
+
+**Mutations, twelve applied, each confirmed landed, each revert
+byte-verified.** M1 drop the change predicate, M2 touch unconditionally, M3
+drop the fingerprint clause, M4 drop the label clause, M5 drop the source
+clause, M7 drop the model clause, M8 omit the fingerprint from `SET`, M9 drop
+the dataset id from the MAC, M10 stop sorting classes, M12 ignore eviction
+in the touch — all caught. **M6 (drop the NULL-vector-arrival clause) first
+SURVIVED**: every writer binds `embedding_model` only beside a vector (0 rows
+violate it live), so an arriving vector is also a model change and the model
+clause caught it. The clause is kept for a future writer that breaks the
+invariant, and the arrival test gained a constructed vector-lost-model-kept
+step; re-run, M6 is caught. **M11 (run dedupe on every append) is a measured
+SURVIVOR** and is stated as such: it changes cost, not behaviour, and no test
+can observe it. Its live guard is the dedupe CTE's `pg_stat_statements` call
+count after deploy.
+
+**Not changed.** The 1 232 existing versions — retention of unpromoted
+evaluation records is a separate decision about audit value. The embedding
+backfill and grandfather writers (they never touched `updated_at`, before or
+after). No lint: the predicate has one home and the population of example
+upserts is one statement.

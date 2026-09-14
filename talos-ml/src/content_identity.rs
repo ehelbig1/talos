@@ -126,9 +126,95 @@ pub fn content_key(mac_key: &[u8], features_text: &str) -> String {
     format!("{CONTENT_KEY_PREFIX}{}", hex::encode(tag))
 }
 
+/// Prefix of a per-row content fingerprint ([`row_content_fingerprint`]).
+/// Distinct from [`CONTENT_KEY_PREFIX`]: the two answer different questions
+/// under different inputs and must never be compared with each other.
+pub const ROW_CONTENT_FINGERPRINT_PREFIX: &str = "cf1:";
+
+/// Domain-separation label for [`row_content_fingerprint`]. Fixed bytes, then a
+/// NUL, so no text can be mistaken for the label and a different purpose of the
+/// same key can never produce a colliding tag.
+const ROW_CONTENT_DOMAIN: &[u8] = b"talos:ml_example_content:v1\0";
+
+/// Keyed fingerprint of one example row's `features_text`, scoped to its
+/// dataset — stored in `ml_examples.content_fingerprint` so the append upsert
+/// can recognise a re-append of UNCHANGED text without decrypting anything.
+///
+/// Why not [`content_key`]: that is an IDENTITY key, deliberately equal for
+/// equal text wherever it appears, because it is what deduplicates. This
+/// column only ever needs equality WITHIN one `(dataset_id, example_key)` row,
+/// so it binds the dataset id and gains unlinkability for free: two tenants —
+/// or two datasets of one tenant — holding identical text get UNRELATED
+/// fingerprints, so a reader of the table (a backup, a SQL read primitive)
+/// learns nothing about cross-dataset overlap. It is keyed under the same
+/// server-side purpose key, so the offline confirmation oracle stays closed
+/// for the same reason (see the module docs).
+///
+/// Input encoding: `DOMAIN || dataset_id (16 raw bytes) || features_text`. The
+/// id is fixed-width, so the concatenation is unambiguous without a length
+/// prefix.
+#[must_use]
+pub fn row_content_fingerprint(
+    mac_key: &[u8],
+    dataset_id: uuid::Uuid,
+    features_text: &str,
+) -> String {
+    let mut mac =
+        <Hmac<Sha256>>::new_from_slice(mac_key).expect("HMAC-SHA256 accepts keys of any length");
+    mac.update(ROW_CONTENT_DOMAIN);
+    mac.update(dataset_id.as_bytes());
+    mac.update(features_text.as_bytes());
+    let tag = mac.finalize().into_bytes();
+    format!("{ROW_CONTENT_FINGERPRINT_PREFIX}{}", hex::encode(tag))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DS_A: uuid::Uuid = uuid::uuid!("11111111-2222-3333-4444-555555555555");
+    const DS_B: uuid::Uuid = uuid::uuid!("11111111-2222-3333-4444-555555555556");
+
+    /// Wire-format pin, computed INDEPENDENTLY (Python `hmac` over
+    /// `b"talos:ml_example_content:v1\x00" + uuid.bytes + text`), not copied
+    /// from this implementation's own output.
+    #[test]
+    fn row_content_fingerprint_matches_the_independent_vector() {
+        assert_eq!(
+            row_content_fingerprint(&TEST_KEY, DS_A, "Subject: same email"),
+            "cf1:2408e5d89f5b7f2eb8c1a01b2bc028bbb8506f2386a3aebdf45303b0e0e31793"
+        );
+        assert_eq!(
+            row_content_fingerprint(&TEST_KEY, DS_B, "Subject: same email"),
+            "cf1:e9b3976b3c390b0b86429b680381ed233dda5d7572f661d66e99c8d354e75b7a"
+        );
+    }
+
+    /// The unlinkability property: identical text in two datasets must not
+    /// share a fingerprint, and the row fingerprint must not equal the identity
+    /// key that is ALSO persisted for keyless rows (or a reader could join the
+    /// two columns across datasets through it).
+    #[test]
+    fn row_content_fingerprint_is_scoped_to_the_dataset_and_not_the_identity_key() {
+        let text = "Subject: same email";
+        let a = row_content_fingerprint(&TEST_KEY, DS_A, text);
+        assert_eq!(a, row_content_fingerprint(&TEST_KEY, DS_A, text), "stable");
+        assert_ne!(a, row_content_fingerprint(&TEST_KEY, DS_B, text));
+        assert_ne!(
+            a,
+            row_content_fingerprint(&TEST_KEY, DS_A, "Subject: other")
+        );
+        assert_ne!(
+            a.trim_start_matches(ROW_CONTENT_FINGERPRINT_PREFIX),
+            content_key(&TEST_KEY, text).trim_start_matches(CONTENT_KEY_PREFIX),
+            "domain separation from the identity key"
+        );
+        assert_ne!(
+            a,
+            row_content_fingerprint(&[0x2bu8; 32], DS_A, text),
+            "keyed"
+        );
+    }
 
     /// FIXED test key. Never the real derivation chain — a KEK-derived value
     /// must never appear in a test expectation.
