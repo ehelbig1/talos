@@ -430,6 +430,45 @@ pub async fn approval_gate_handler(
         return (StatusCode::CONFLICT, axum::response::Html(msg)).into_response();
     }
 
+    // The deployment-wide execution pause (package BG). BEFORE the single-use
+    // resolve below: an approval that names a continuation, refused after the
+    // UPDATE, would leave the gate approved and its continuation never
+    // dispatched. 503 + Retry-After, and the page says the link still works.
+    if talos_continuation_trigger::resolution_starts_work(is_approve, continuation_wf_id) {
+        let refused = match talos_execution_pause::gate_start(
+            &db_pool,
+            talos_execution_pause::PauseGatePath::Continuation,
+        )
+        .await
+        {
+            Ok(None) => false,
+            Ok(Some(_)) => true,
+            Err(e) => {
+                tracing::error!(
+                    gate_id = %gate_id,
+                    error = %e,
+                    "approval gate action: execution pause read failed; refusing (503)"
+                );
+                true
+            }
+        };
+        if refused {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                [(
+                    axum::http::header::RETRY_AFTER,
+                    talos_execution_pause::PAUSE_RETRY_AFTER_SECS.to_string(),
+                )],
+                axum::response::Html(
+                    "<h1>Not approved yet</h1><p>Workflow execution is paused on this \
+                     Talos deployment, so the approval was NOT recorded. The gate is still \
+                     pending — open this link again after execution resumes.</p>",
+                ),
+            )
+                .into_response();
+        }
+    }
+
     let new_status = if is_approve { "approved" } else { "rejected" };
 
     let updated = sqlx::query(

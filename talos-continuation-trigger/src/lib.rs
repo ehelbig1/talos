@@ -20,6 +20,30 @@ use talos_secrets_manager::SecretsManager;
 use talos_workflow_repository::WorkflowRepository;
 use uuid::Uuid;
 
+/// Whether resolving an approval gate or resuming a suspension would START
+/// work — an approval (or resume) of a record that names a continuation
+/// workflow. Only such a resolution consults the deployment-wide execution
+/// pause, and it must do so BEFORE the gate is resolved or the suspension is
+/// claimed: both are single-use, so a refusal after them would leave the
+/// record consumed and the continuation never dispatched — a DROP, not a
+/// deferral (package BG). Pure, so the rule is unit-tested.
+#[must_use]
+pub fn resolution_starts_work(approve: bool, continuation_workflow_id: Option<Uuid>) -> bool {
+    approve && continuation_workflow_id.is_some()
+}
+
+/// The sentence a caller sees when the pause refuses a resolution: the
+/// refusal itself plus the fact that matters to the approver — nothing was
+/// consumed, so the same action can be taken again after resume.
+#[must_use]
+pub fn resolution_deferred_message(reason: talos_metrics::PauseRefusal) -> String {
+    format!(
+        "{} Nothing was resolved: the approval gate or suspension is still pending, \
+         so the same action can be repeated after the pause lifts.",
+        talos_execution_pause::refusal_message(reason)
+    )
+}
+
 /// Discriminates which platform primitive is dispatching a
 /// continuation workflow. Emitted into the continuation workflow's
 /// trigger input as `triggered_by` and used to pick the right ID
@@ -586,4 +610,25 @@ pub async fn trigger_continuation_workflow(
     });
 
     Some(execution_id.to_string())
+}
+
+#[cfg(test)]
+mod resolution_pause_tests {
+    use super::resolution_starts_work;
+    use uuid::Uuid;
+
+    #[test]
+    fn only_an_approval_with_a_continuation_starts_work() {
+        let cwf = Some(Uuid::new_v4());
+        assert!(resolution_starts_work(true, cwf));
+        assert!(
+            !resolution_starts_work(false, cwf),
+            "a rejection dispatches nothing"
+        );
+        assert!(
+            !resolution_starts_work(true, None),
+            "no continuation configured"
+        );
+        assert!(!resolution_starts_work(false, None));
+    }
 }

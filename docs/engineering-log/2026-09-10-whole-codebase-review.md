@@ -4886,3 +4886,59 @@ test green: the chokepoint refuses the same start. `gate_start`'s increment is
 covered by the recorder unit test only. The scheduler's transition log lines and
 the webhook router's row-creation arm body are untested. A Pub/Sub pause longer
 than the subscription's message retention loses what ages out.
+
+### Package BG (2026-09-14) — the pause's remaining start paths
+
+**How it was asked.** The operator asked for the package BF named as next: the
+seven start paths it did not gate.
+
+**Measured, in order:**
+- 30 days of `workflow_executions`: 7 779 `scheduled`, 3 432 with no
+  provenance (3 414 `pa-ask-email`, the Gmail push branch BF gated), 11 test
+  executions. No row carries a chain trigger or a parent.
+- `workflow_approval_gates`: 0 rows, ever. `workflow_suspensions`: 0 rows,
+  ever. Actor handoff: 0 logged uses. Module-bound push runs: 0 in 7 days.
+- So every path here is latent. The package closes the population; it stops
+  no live traffic.
+
+**The constraint that shaped it.** An approval gate is resolved, and a
+suspension claimed, BEFORE the continuation workflow is triggered, and both are
+single-use. A refusal inside `trigger_continuation_workflow` would leave the
+record consumed and the continuation never dispatched — a drop. So the check
+sits before the consuming statement at every surface.
+
+**Decisions.**
+- Approvals (MCP and the link) consult the pause only for an approval that
+  names a continuation; a rejection starts nothing and is always accepted.
+  One rule: `talos_continuation_trigger::resolution_starts_work`.
+- The MCP suspension resume consults it before the claim, unconditionally,
+  because which suspensions carry a continuation is only known from the claim
+  that consumes them. The caller is authenticated. A continuation-less resume
+  is therefore refused while paused too; stated.
+- The suspension callback is unauthenticated — the correlation id is the
+  capability. Refusing every POST would tell anyone probing that the platform
+  is paused. A peek consults the pause only when the id names a waiting
+  suspension with a continuation; an unknown id still gets 404. The peek and
+  the claim can race, and the race admits; stated.
+- Refusals say the record is still pending and the action can be repeated.
+- Push paths share one rule, `talos_execution_pause::push_admission`. Gmail
+  delegates to it. Google Calendar checks before its message-number dedup and
+  before the task that advances the sync token, because a 503 after either
+  would be retried by Google and skipped as a duplicate. GCP checks before its
+  task and its Redis SETNX.
+- Handoff, GraphQL `testWorkflow` and `test_subworkflow_contract` get entry
+  checks.
+- Still excluded by design: crash-recovery resumes, sub-workflows of a running
+  parent, chained workflows.
+
+**Guards.** Five DB tests: the shared push rule (including an unreachable
+database), MCP approval (paused keeps pending, rejection resolves, control
+approves), MCP resume, the approve link (503, pending, control approves), and
+the callback (live continuation deferred, unknown id 404, continuation-less
+suspension resumed, control resumes). Unit tests for the three predicates;
+source pins for nine call sites. Thirteen mutations, each landed and
+byte-reverted, all caught.
+
+**Stated limits.** The handoff, GraphQL and contract gates are pinned, not
+driven. The Calendar and GCP handlers' 503 is pinned, not driven. Pins prove a
+spelling, not a behaviour.

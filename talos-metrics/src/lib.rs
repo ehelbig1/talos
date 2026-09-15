@@ -2831,8 +2831,11 @@ impl TalosMetrics {
                  (pause_executions) is set, by the surface that refused and why. \
                  path=scheduler_poll counts deferred POLLS, not schedules (the due rows \
                  are never claimed, so they fire on resume); webhook and gmail_push \
-                 requests answered 503 so the sender redelivers; trigger / retry / replay \
-                 / mcp_entry the operator-invoked entry gates; row_creation the \
+                 requests answered 503 so the sender redelivers (gcal_push and gcp_push \
+                 likewise, since package BG); trigger / retry / replay / mcp_entry / \
+                 graphql_test / handoff the operator-invoked entry gates; continuation an \
+                 approval or suspension resume refused BEFORE the gate is resolved or the \
+                 suspension claimed, so it can be repeated; row_creation the \
                  in-transaction backstop behind them (including a scheduled fire claimed \
                  just before the pause, whose schedule is re-armed). One refusal is one \
                  increment on exactly one path, so the family sums. reason=paused | \

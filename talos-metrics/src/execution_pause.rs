@@ -39,8 +39,25 @@ pub enum PauseGatePath {
     Retry,
     /// `ExecutionOrchestrationService::replay*`.
     Replay,
-    /// The MCP handlers' shared entry gate (`enforce_executions_not_paused`).
+    /// The MCP handlers' shared entry gate (`enforce_executions_not_paused`),
+    /// including `test_subworkflow_contract` since package BG.
     McpEntry,
+    /// GraphQL `testWorkflow` (package BG).
+    GraphqlTest,
+    /// Actor handoff (`HandoffService::handoff`, MCP `handoff_to_actor`).
+    Handoff,
+    /// An approval-gate approval or a workflow-suspension resume that would
+    /// dispatch a continuation workflow — MCP `resolve_approval_gate` /
+    /// `resume_workflow_by_correlation_id` and their webhook twins. Refused
+    /// BEFORE the gate is resolved or the suspension claimed, so the gate
+    /// stays pending and the resume can be retried (package BG).
+    Continuation,
+    /// A Google Calendar push whose watch is bound to a module, answered 503
+    /// before its message-number dedup and sync cursor move.
+    GcalPush,
+    /// A GCP Pub/Sub push whose watch is bound to a module, answered 503
+    /// before the dispatch task starts.
+    GcpPush,
     /// The row-creation chokepoint (`create_execution_under_concurrency_limit`
     /// and its batch twin) refusing a start that an entry gate admitted a
     /// moment earlier — the flag was set in between — or one whose caller has
@@ -60,6 +77,11 @@ impl PauseGatePath {
         Self::Retry,
         Self::Replay,
         Self::McpEntry,
+        Self::GraphqlTest,
+        Self::Handoff,
+        Self::Continuation,
+        Self::GcalPush,
+        Self::GcpPush,
         Self::RowCreation,
     ];
     #[must_use]
@@ -72,6 +94,11 @@ impl PauseGatePath {
             Self::Retry => "retry",
             Self::Replay => "replay",
             Self::McpEntry => "mcp_entry",
+            Self::GraphqlTest => "graphql_test",
+            Self::Handoff => "handoff",
+            Self::Continuation => "continuation",
+            Self::GcalPush => "gcal_push",
+            Self::GcpPush => "gcp_push",
             Self::RowCreation => "row_creation",
         }
     }

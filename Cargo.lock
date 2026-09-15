@@ -7409,6 +7409,7 @@ dependencies = [
  "talos-actor-scaffold",
  "talos-dlp-provider",
  "talos-engine",
+ "talos-execution-pause",
  "talos-execution-result-collector",
  "talos-memory",
  "talos-metrics",
@@ -7623,6 +7624,7 @@ dependencies = [
  "talos-dlp-provider",
  "talos-engine",
  "talos-execution-orchestration",
+ "talos-execution-pause",
  "talos-execution-repository",
  "talos-google-calendar",
  "talos-http-utils",
@@ -7899,6 +7901,7 @@ dependencies = [
  "talos-advanced-repository",
  "talos-dlp-provider",
  "talos-engine",
+ "talos-execution-pause",
  "talos-execution-result-collector",
  "talos-metrics",
  "talos-registry",
@@ -8168,6 +8171,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "talos-metrics",
+ "tracing",
 ]
 
 [[package]]
@@ -8358,6 +8362,7 @@ dependencies = [
  "talos-config",
  "talos-dlp-provider",
  "talos-engine",
+ "talos-execution-pause",
  "talos-http-body",
  "talos-http-utils",
  "talos-integration-helpers",
@@ -8405,6 +8410,7 @@ dependencies = [
  "talos-actor-repository",
  "talos-config",
  "talos-dlp-provider",
+ "talos-execution-pause",
  "talos-http-body",
  "talos-http-utils",
  "talos-integration-helpers",

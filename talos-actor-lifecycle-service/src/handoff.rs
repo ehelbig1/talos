@@ -119,6 +119,17 @@ pub enum HandoffError {
     #[error("Failed to create execution record")]
     ExecutionInsertFailed,
 
+    /// The deployment-wide execution pause refused the handoff's run (package
+    /// BG). Refused before the execution row is written; the handoff can be
+    /// repeated after `resume_executions`.
+    #[error("{}", talos_execution_pause::refusal_message(*.0))]
+    ExecutionPaused(talos_metrics::PauseRefusal),
+
+    /// The execution pause flag could not be read; the handoff is refused
+    /// rather than started without its kill-switch.
+    #[error("Failed to read the execution pause flag")]
+    ExecutionPauseUnreadable,
+
     #[error("NATS client not available")]
     NatsUnavailable,
 
@@ -608,6 +619,23 @@ impl ActorLifecycleService {
             "trigger_type": "actor_handoff",
             "budget_units_debited": budget_debit
         });
+        // The deployment-wide execution pause (package BG) — before the run's
+        // row is written. A handoff STARTS a run like any trigger; until this
+        // package it was one of the start paths that never read the flag.
+        match talos_execution_pause::gate_start(
+            &self.db_pool,
+            talos_execution_pause::PauseGatePath::Handoff,
+        )
+        .await
+        {
+            Ok(None) => {}
+            Ok(Some(reason)) => return Err(HandoffError::ExecutionPaused(reason)),
+            Err(e) => {
+                tracing::error!("handoff_to_actor: execution pause read failed: {e}");
+                return Err(HandoffError::ExecutionPauseUnreadable);
+            }
+        }
+
         if let Err(e) = self
             .actor_repo
             .insert_handoff_execution(

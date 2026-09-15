@@ -600,6 +600,29 @@ pub async fn webhook_notification_handler(
     let module_id = watch.module_id;
     let integration_uuid = watch.integration_id;
 
+    // The deployment-wide execution pause (package BG). HERE — before the
+    // message-number dedup below and before the spawned task that advances the
+    // channel's sync token — because both would otherwise mark this
+    // notification as handled: a 503 after them would be retried by Google
+    // and then skipped as a duplicate, i.e. DROPPED. Google retries a 503 with
+    // exponential backoff, so the notification is deferred, not dropped (the
+    // operator's decision, 2026-09-14). Only a watch bound to a module starts
+    // work; the `sync` handshake starts none.
+    let pause = talos_execution_pause::push_admission(
+        &service.db_pool,
+        gcal_webhook_starts_work(module_id, resource_state.as_deref()),
+        talos_execution_pause::PauseGatePath::GcalPush,
+    )
+    .await;
+    if pause.defers() {
+        tracing::info!(
+            channel_id = %ch_id,
+            admission = ?pause,
+            "Google Calendar webhook deferred by the execution pause (503)"
+        );
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
+
     // Deduplicate by X-Goog-Message-Number. integration_state has no
     // per-row conditional update; the service method reads + compares +
     // writes. Concurrent duplicates in the same millisecond are rare
@@ -1146,6 +1169,17 @@ pub async fn client_config_handler(
 }
 
 /// Process webhook events: sync, filter, deduplicate, and publish jobs to worker
+/// Whether a Google Calendar notification would START work: a watch bound to
+/// a module, on anything but the initial `sync` handshake (which only
+/// establishes the sync token). Only such a notification consults the
+/// execution pause. Pure, so the rule is unit-tested.
+pub(crate) fn gcal_webhook_starts_work(
+    module_id: Option<Uuid>,
+    resource_state: Option<&str>,
+) -> bool {
+    module_id.is_some() && resource_state != Some("sync")
+}
+
 pub async fn process_webhook_events(
     service: Arc<GoogleCalendarService>,
     channel_uuid: Uuid,
@@ -2140,4 +2174,22 @@ fn filter_events(events: &[Value], config: &Value) -> Vec<Value> {
         })
         .cloned()
         .collect()
+}
+
+#[cfg(test)]
+mod execution_pause_predicate_tests {
+    use super::gcal_webhook_starts_work;
+    use uuid::Uuid;
+
+    #[test]
+    fn only_a_module_bound_non_sync_notification_starts_work() {
+        let m = Some(Uuid::new_v4());
+        assert!(gcal_webhook_starts_work(m, Some("exists")));
+        assert!(gcal_webhook_starts_work(m, None));
+        assert!(
+            !gcal_webhook_starts_work(m, Some("sync")),
+            "the handshake runs nothing"
+        );
+        assert!(!gcal_webhook_starts_work(None, Some("exists")), "unbound");
+    }
 }

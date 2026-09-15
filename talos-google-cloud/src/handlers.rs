@@ -702,6 +702,13 @@ use talos_integration_helpers::google_jwt::{
     PushIntegration,
 };
 
+/// Whether a verified GCP push would START work: a dispatch context is wired
+/// and the watch is bound to a module. Only such a push consults the
+/// execution pause. Pure, so the rule is unit-tested.
+pub(crate) fn gcp_push_starts_work(has_dispatch: bool, module_id: Option<uuid::Uuid>) -> bool {
+    has_dispatch && module_id.is_some()
+}
+
 pub struct PubsubHandlerState {
     pub verifier: Arc<GoogleOidcVerifier>,
     /// Operator-configured audience (`GCP_PUBSUB_AUDIENCE`, i.e. the
@@ -821,6 +828,27 @@ pub async fn pubsub_push_handler(
     let parsed = parse_monitoring_incident(&payload);
     let pubsub_message_id = env.message.message_id.clone();
 
+    // 5b. The deployment-wide execution pause (package BG). Before the spawned
+    //     task: that task acks with 200 and its Redis SETNX marks the incident
+    //     dispatched, so a refusal inside it would DROP the push. A 503 makes
+    //     Pub/Sub redeliver — deferred, not dropped. Only a module-bound watch
+    //     with a dispatch context starts work. A pause longer than the
+    //     subscription's retention (7 days by default) loses what ages out.
+    let pause = talos_execution_pause::push_admission(
+        &state.watch_service.pool,
+        gcp_push_starts_work(state.dispatch.is_some(), row.module_id),
+        talos_execution_pause::PauseGatePath::GcpPush,
+    )
+    .await;
+    if pause.defers() {
+        tracing::info!(
+            channel_uuid = %row.id,
+            admission = ?pause,
+            "gcp pubsub: deferred by the execution pause; 503 so Pub/Sub redelivers"
+        );
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
+
     // 6. Record liveness + dispatch off the hot path; ack immediately.
     let svc = Arc::clone(&state.watch_service);
     let dispatch_ctx = state.dispatch.clone();
@@ -904,6 +932,17 @@ async fn audit_push_rejected(
 
 #[cfg(test)]
 mod pubsub_tests {
+    #[test]
+    fn only_a_dispatchable_module_bound_push_starts_work() {
+        let m = Some(uuid::Uuid::new_v4());
+        assert!(super::gcp_push_starts_work(true, m));
+        assert!(
+            !super::gcp_push_starts_work(false, m),
+            "no dispatch context"
+        );
+        assert!(!super::gcp_push_starts_work(true, None), "unbound");
+    }
+
     use super::*;
     use jsonwebtoken::{encode, Algorithm, DecodingKey, EncodingKey, Header};
     use rsa::pkcs1::EncodeRsaPrivateKey;

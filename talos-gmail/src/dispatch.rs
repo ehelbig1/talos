@@ -76,30 +76,20 @@ pub(crate) fn push_starts_work(row: &GmailWatchRow) -> bool {
 /// DB test (`controller/tests/execution_pause_tests`); the one-line call site
 /// in `pubsub_push_handler` is pinned textually.
 pub async fn execution_pause_defers_push(pool: &sqlx::PgPool, row: &GmailWatchRow) -> bool {
-    if !push_starts_work(row) {
-        return false;
+    let admission = talos_execution_pause::push_admission(
+        pool,
+        push_starts_work(row),
+        talos_execution_pause::PauseGatePath::GmailPush,
+    )
+    .await;
+    if admission.defers() {
+        tracing::info!(
+            channel_uuid = %row.id,
+            admission = ?admission,
+            "gmail pubsub: deferred by the execution pause; 503 so Pub/Sub redelivers"
+        );
     }
-    match talos_execution_pause::gate_start(pool, talos_execution_pause::PauseGatePath::GmailPush)
-        .await
-    {
-        Ok(None) => false,
-        Ok(Some(reason)) => {
-            tracing::info!(
-                channel_uuid = %row.id,
-                reason = reason.as_str(),
-                "gmail pubsub: execution pause in force; 503 so Pub/Sub redelivers"
-            );
-            true
-        }
-        Err(e) => {
-            tracing::error!(
-                channel_uuid = %row.id,
-                error = %e,
-                "gmail pubsub: could not read the execution pause flag; 503 so Pub/Sub redelivers"
-            );
-            true
-        }
-    }
+    admission.defers()
 }
 
 /// Every service the dispatch path needs. Constructed once at

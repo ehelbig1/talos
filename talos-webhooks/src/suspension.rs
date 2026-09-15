@@ -88,6 +88,67 @@ pub async fn suspension_callback_handler(
     // Persist a DLP-redacted copy; dispatch the original (below).
     let stored_payload = talos_dlp_provider::redact_json(&payload);
 
+    // The deployment-wide execution pause (package BG). BEFORE the single-use
+    // claim: a resume refused after it would leave the suspension resumed and
+    // its continuation never dispatched. This endpoint is unauthenticated —
+    // the correlation id IS the capability — so the pause is consulted only
+    // when the id names a WAITING suspension with a continuation: an unknown
+    // id still gets the 404 below, and a caller cannot learn that the platform
+    // is paused without holding a live capability. The peek and the claim can
+    // race; the loser of that race is the pause set in between, whose
+    // continuation runs — the admitting direction, stated.
+    let continuation_waiting: Option<Option<Uuid>> = match sqlx::query_scalar(
+        "SELECT continuation_workflow_id FROM workflow_suspensions \
+         WHERE correlation_id = $1 AND status = 'waiting'",
+    )
+    .bind(&correlation_id)
+    .fetch_optional(&db_pool)
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("suspension_callback_handler: suspension peek failed: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(serde_json::json!({"error": "Internal error"})),
+            )
+                .into_response();
+        }
+    };
+    if let Some(continuation) = continuation_waiting {
+        if talos_continuation_trigger::resolution_starts_work(true, continuation) {
+            let refused = match talos_execution_pause::gate_start(
+                &db_pool,
+                talos_execution_pause::PauseGatePath::Continuation,
+            )
+            .await
+            {
+                Ok(None) => false,
+                Ok(Some(_)) => true,
+                Err(e) => {
+                    tracing::error!(
+                        "suspension_callback_handler: execution pause read failed: {}",
+                        e
+                    );
+                    true
+                }
+            };
+            if refused {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(
+                        axum::http::header::RETRY_AFTER,
+                        talos_execution_pause::PAUSE_RETRY_AFTER_SECS.to_string(),
+                    )],
+                    axum::Json(serde_json::json!({
+                        "error": "Workflow execution is paused; the suspension was not resumed and can be resumed again later"
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+
     // Atomic check-and-claim: a single UPDATE...WHERE status='waiting'...RETURNING
     // closes the TOCTOU window between SELECT (status='waiting') and UPDATE
     // (mark resumed). Without this, two concurrent POSTs to the same
