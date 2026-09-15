@@ -202,16 +202,31 @@ impl wit_email::Host for TalosContext {
                     .ok()
                     .filter(|v| !v.is_empty())
             });
-        let api_key: Option<String> = self
-            .get_host_secret("EMAIL_API_KEY")
-            .await
-            .or_else(|| {
-                std::env::var("EMAIL_API_KEY")
+        let api_key: Option<(String, crate::context::SecretSource)> =
+            match self.get_host_secret("EMAIL_API_KEY").await {
+                Some(k) => Some((k, crate::context::SecretSource::Vault)),
+                None => std::env::var("EMAIL_API_KEY")
                     .ok()
                     .filter(|v| !v.is_empty())
-            });
+                    .map(|k| (k, crate::context::SecretSource::Env)),
+            };
 
-        if let (Some(url), Some(key)) = (api_url, api_key) {
+        if let (Some(url), Some((key, key_source))) = (api_url, api_key) {
+            // The key leaves the host in the request below: ledger the use
+            // against the API's HOST (package BL). The URL is itself a
+            // configured secret, so only its host is recorded.
+            let destination = reqwest::Url::parse(&url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_string))
+                .unwrap_or_else(|| "unparseable-email-api-url".to_string());
+            self.record_secret_use(
+                crate::context::SecretUseSurface::EmailApiKey,
+                &destination,
+                "EMAIL_API_KEY",
+                key_source,
+                None,
+            )
+            .await;
             // SendGrid v3 API format
             // MCP-631: empty-env hardening — `EMAIL_FROM=""` (Helm
             // placeholder) would otherwise produce an empty sender
