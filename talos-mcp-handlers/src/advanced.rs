@@ -3899,6 +3899,32 @@ async fn handle_resolve_approval_gate(
     let cwf_id = gate.continuation_workflow_id;
     let payload = gate.payload;
 
+    // The deployment-wide execution pause (package BG). BEFORE the single-use
+    // resolve below: refusing after it would leave the gate approved and its
+    // continuation never dispatched. Only an approval that names a
+    // continuation starts work; a rejection is always accepted.
+    if talos_continuation_trigger::resolution_starts_work(resolution == "approved", cwf_id) {
+        match talos_execution_pause::gate_start(
+            &state.db_pool,
+            talos_execution_pause::PauseGatePath::Continuation,
+        )
+        .await
+        {
+            Ok(None) => {}
+            Ok(Some(reason)) => {
+                return mcp_denied(
+                    req_id,
+                    -32000,
+                    &talos_continuation_trigger::resolution_deferred_message(reason),
+                )
+            }
+            Err(e) => {
+                tracing::error!("resolve_approval_gate: execution pause read failed: {}", e);
+                return mcp_error(req_id, -32000, "Failed to read the execution pause flag");
+            }
+        }
+    }
+
     // Update the gate status. The UPDATE is guarded `AND status = 'pending'`, so
     // `rows_affected == 0` means a concurrent caller resolved/cancelled/expired
     // this gate between our read above and this write (TOCTOU). Bail WITHOUT
@@ -5529,6 +5555,37 @@ async fn handle_resume_workflow_by_correlation_id(
         }
         p
     };
+
+    // The deployment-wide execution pause (package BG). BEFORE the single-use
+    // claim below, and unconditionally: which suspensions carry a continuation
+    // is only known from the claim that consumes them, and refusing after it
+    // would leave the suspension resumed with its continuation never
+    // dispatched. The caller is authenticated, so saying "paused" to a caller
+    // whose correlation id matches nothing discloses nothing it could not read
+    // from any other start. Resuming a suspension with no continuation is
+    // therefore refused too while paused — stated, not incidental.
+    match talos_execution_pause::gate_start(
+        &state.db_pool,
+        talos_execution_pause::PauseGatePath::Continuation,
+    )
+    .await
+    {
+        Ok(None) => {}
+        Ok(Some(reason)) => {
+            return mcp_denied(
+                req_id,
+                -32000,
+                &talos_continuation_trigger::resolution_deferred_message(reason),
+            )
+        }
+        Err(e) => {
+            tracing::error!(
+                "resume_workflow_by_correlation_id: execution pause read failed: {}",
+                e
+            );
+            return mcp_error(req_id, -32000, "Failed to read the execution pause flag");
+        }
+    }
 
     // Atomic claim: matches the public /api/callbacks/{correlation_id} path's
     // pattern — UPDATE...WHERE status='waiting' RETURNING — so two concurrent

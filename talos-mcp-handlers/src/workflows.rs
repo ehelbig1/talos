@@ -7622,6 +7622,13 @@ async fn handle_test_subworkflow_contract(
     if let Err(resp) = crate::utils::enforce_payload_size_limit(&input, req_id.clone()) {
         return resp;
     }
+    // The deployment-wide execution pause (package BG): a contract test runs
+    // the sub-workflow's real modules on real workers, like `test_workflow`.
+    if let Err(resp) =
+        crate::utils::enforce_executions_not_paused(&state.workflow_repo, req_id.clone()).await
+    {
+        return resp;
+    }
     // Default 90s + max 300s, raised in r234 (pain point #3 from
     // aegix_dev_pain_points.md). The pre-r234 30s default routinely fired
     // before LLM-backed sub-workflows completed (a single LLM call is

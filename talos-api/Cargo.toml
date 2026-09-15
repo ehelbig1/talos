@@ -7,6 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+talos-execution-pause = { path = "../talos-execution-pause" }
 anyhow.workspace = true
 async-graphql = { version = "7.2", features = ["uuid", "chrono", "dataloader"] }
 async-graphql-axum = "7.2"

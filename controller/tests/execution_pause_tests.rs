@@ -17,6 +17,9 @@
 //! migrated DB), so they belong in CTRL_TESTS, not TC_TESTS (sub-leg 64b).
 
 mod common;
+// The real `McpState` + response helpers, one home (2026-09-08).
+#[path = "common/mcp.rs"]
+mod mcp_common;
 
 use sqlx::{Pool, Postgres};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -452,4 +455,287 @@ async fn a_bound_gmail_push_is_deferred_while_paused_and_an_unbound_one_is_not()
         .connect_lazy("postgres://nobody:nothing@127.0.0.1:1/none")
         .expect("lazy pool");
     assert!(talos_gmail::dispatch::execution_pause_defers_push(&unreachable, &bound).await);
+}
+
+// ───────────── package BG: the remaining start paths ─────────────
+
+/// The ONE push rule every push integration calls (Gmail, Google Calendar,
+/// GCP): a push that starts nothing is admitted even while paused; a bound one
+/// is deferred while paused; a flag the database cannot return defers too.
+#[tokio::test]
+async fn the_shared_push_rule_defers_only_pushes_that_start_work() {
+    use talos_execution_pause::{push_admission, PauseGatePath, PushAdmission};
+    let (pool, _db) = common::isolated_db_pool().await;
+
+    assert_eq!(
+        push_admission(&pool, true, PauseGatePath::GcalPush).await,
+        PushAdmission::Admit,
+        "CONTROL: running admits a bound push"
+    );
+    talos_execution_pause::set_execution_paused(&pool, true)
+        .await
+        .unwrap();
+    assert_eq!(
+        push_admission(&pool, true, PauseGatePath::GcalPush).await,
+        PushAdmission::Defer(PauseRefusal::Paused)
+    );
+    assert_eq!(
+        push_admission(&pool, false, PauseGatePath::GcpPush).await,
+        PushAdmission::Admit,
+        "a push that starts nothing keeps acking and advancing its cursor"
+    );
+    let unreachable = sqlx::postgres::PgPoolOptions::new()
+        .acquire_timeout(std::time::Duration::from_millis(200))
+        .connect_lazy("postgres://nobody:nothing@127.0.0.1:1/none")
+        .expect("lazy pool");
+    assert_eq!(
+        push_admission(&unreachable, true, PauseGatePath::GcpPush).await,
+        PushAdmission::DeferReadFailed
+    );
+}
+
+async fn seed_gate(
+    pool: &Pool<Postgres>,
+    user: Uuid,
+    continuation: Option<Uuid>,
+) -> (Uuid, String) {
+    let id = Uuid::new_v4();
+    let token = format!(
+        "{:032x}{:032x}",
+        Uuid::new_v4().as_u128(),
+        Uuid::new_v4().as_u128()
+    );
+    sqlx::query(
+        "INSERT INTO workflow_approval_gates (id, user_id, title, token, continuation_workflow_id) \
+         VALUES ($1, $2, 'pause gate', $3, $4)",
+    )
+    .bind(id)
+    .bind(user)
+    .bind(&token)
+    .bind(continuation)
+    .execute(pool)
+    .await
+    .expect("seed gate");
+    (id, token)
+}
+
+async fn gate_status(pool: &Pool<Postgres>, id: Uuid) -> String {
+    sqlx::query_scalar("SELECT status FROM workflow_approval_gates WHERE id = $1")
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("gate status")
+}
+
+async fn seed_suspension(pool: &Pool<Postgres>, user: Uuid, continuation: Option<Uuid>) -> String {
+    let correlation = format!(
+        "{:032x}{:032x}",
+        Uuid::new_v4().as_u128(),
+        Uuid::new_v4().as_u128()
+    );
+    sqlx::query(
+        "INSERT INTO workflow_suspensions (user_id, correlation_id, continuation_workflow_id, callback_url) \
+         VALUES ($1, $2, $3, 'http://localhost/cb')",
+    )
+    .bind(user)
+    .bind(&correlation)
+    .bind(continuation)
+    .execute(pool)
+    .await
+    .expect("seed suspension");
+    correlation
+}
+
+async fn suspension_status(pool: &Pool<Postgres>, correlation: &str) -> String {
+    sqlx::query_scalar("SELECT status FROM workflow_suspensions WHERE correlation_id = $1")
+        .bind(correlation)
+        .fetch_one(pool)
+        .await
+        .expect("suspension status")
+}
+
+async fn mcp_resolve(
+    state: &controller::mcp::McpState,
+    user: Uuid,
+    gate: Uuid,
+    resolution: &str,
+) -> controller::mcp::types::JsonRpcResponse {
+    controller::mcp::advanced::dispatch(
+        "resolve_approval_gate",
+        Some(serde_json::json!(1)),
+        &serde_json::json!({"gate_id": gate, "resolution": resolution}),
+        state,
+        mcp_common::agent(user),
+    )
+    .await
+    .expect("resolve_approval_gate is dispatched")
+}
+
+/// MCP `resolve_approval_gate`: an approval that would dispatch a continuation
+/// is refused BEFORE the single-use resolve, so the gate stays pending and can
+/// be approved after resume. A rejection starts nothing and is accepted.
+#[tokio::test]
+async fn a_paused_mcp_approval_leaves_the_gate_pending() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let user = seed_user(&pool).await;
+    let continuation = common::create_test_workflow(&pool, user, "pause-continuation").await;
+    let state = mcp_common::mcp_state(pool.clone()).await;
+
+    let (gate, _) = seed_gate(&pool, user, Some(continuation)).await;
+    talos_execution_pause::set_execution_paused(&pool, true)
+        .await
+        .unwrap();
+    let refused = mcp_resolve(&state, user, gate, "approve").await;
+    let msg = mcp_common::error_message(&refused);
+    assert!(msg.contains("still pending"), "{msg}");
+    assert_eq!(
+        gate_status(&pool, gate).await,
+        "pending",
+        "nothing consumed"
+    );
+
+    // A rejection dispatches nothing: accepted while paused.
+    let (rejected, _) = seed_gate(&pool, user, Some(continuation)).await;
+    let _ = mcp_resolve(&state, user, rejected, "reject").await;
+    assert_eq!(gate_status(&pool, rejected).await, "rejected");
+
+    // CONTROL: resumed, the same approval resolves the gate.
+    talos_execution_pause::set_execution_paused(&pool, false)
+        .await
+        .unwrap();
+    let _ = mcp_resolve(&state, user, gate, "approve").await;
+    assert_eq!(gate_status(&pool, gate).await, "approved");
+}
+
+/// MCP `resume_workflow_by_correlation_id`: refused BEFORE the claim.
+#[tokio::test]
+async fn a_paused_mcp_suspension_resume_consumes_nothing() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let user = seed_user(&pool).await;
+    let continuation = common::create_test_workflow(&pool, user, "pause-suspension").await;
+    let state = mcp_common::mcp_state(pool.clone()).await;
+    let correlation = seed_suspension(&pool, user, Some(continuation)).await;
+    let args = serde_json::json!({"correlation_id": correlation});
+    let resume = || {
+        controller::mcp::advanced::dispatch(
+            "resume_workflow_by_correlation_id",
+            Some(serde_json::json!(1)),
+            &args,
+            &state,
+            mcp_common::agent(user),
+        )
+    };
+
+    talos_execution_pause::set_execution_paused(&pool, true)
+        .await
+        .unwrap();
+    let refused = resume().await.expect("dispatched");
+    assert!(mcp_common::error_message(&refused).contains("still pending"));
+    assert_eq!(suspension_status(&pool, &correlation).await, "waiting");
+
+    talos_execution_pause::set_execution_paused(&pool, false)
+        .await
+        .unwrap();
+    let _ = resume().await.expect("dispatched");
+    assert_eq!(suspension_status(&pool, &correlation).await, "resumed");
+}
+
+fn registry(pool: &Pool<Postgres>) -> std::sync::Arc<talos_registry::ModuleRegistry> {
+    std::sync::Arc::new(talos_registry::ModuleRegistry::new(pool.clone(), None))
+}
+
+/// The approve LINK (a capability URL, no session): 503 + the gate stays
+/// pending while paused; resumed, the same link approves.
+#[tokio::test]
+async fn a_paused_approve_link_answers_503_and_consumes_nothing() {
+    use axum::extract::{Extension, Path};
+    use axum::response::IntoResponse;
+    let (pool, _db) = common::isolated_db_pool().await;
+    let user = seed_user(&pool).await;
+    let continuation = common::create_test_workflow(&pool, user, "pause-link").await;
+    let (gate, token) = seed_gate(&pool, user, Some(continuation)).await;
+    let click = |token: String| {
+        talos_webhooks::approval_gate_handler(
+            Path((token, "approve".to_string())),
+            Extension(pool.clone()),
+            Extension(None::<std::sync::Arc<async_nats::Client>>),
+            Extension(registry(&pool)),
+            Extension(None),
+        )
+    };
+
+    talos_execution_pause::set_execution_paused(&pool, true)
+        .await
+        .unwrap();
+    let resp = click(token.clone()).await.into_response();
+    assert_eq!(resp.status(), axum::http::StatusCode::SERVICE_UNAVAILABLE);
+    assert!(resp.headers().contains_key(axum::http::header::RETRY_AFTER));
+    assert_eq!(gate_status(&pool, gate).await, "pending");
+
+    talos_execution_pause::set_execution_paused(&pool, false)
+        .await
+        .unwrap();
+    let _ = click(token).await.into_response();
+    assert_eq!(gate_status(&pool, gate).await, "approved", "CONTROL");
+}
+
+/// The unauthenticated suspension callback: a live suspension with a
+/// continuation is deferred (503, still waiting); an UNKNOWN id still gets 404
+/// while paused (no "is the platform paused?" oracle without a capability); a
+/// suspension with no continuation starts nothing and is resumed.
+#[tokio::test]
+async fn a_paused_suspension_callback_defers_only_a_live_continuation() {
+    use axum::extract::{Extension, Path};
+    let (pool, _db) = common::isolated_db_pool().await;
+    let user = seed_user(&pool).await;
+    let continuation = common::create_test_workflow(&pool, user, "pause-callback").await;
+    let with_continuation = seed_suspension(&pool, user, Some(continuation)).await;
+    let bare = seed_suspension(&pool, user, None).await;
+    let call = |correlation: String| {
+        talos_webhooks::suspension_callback_handler(
+            Path(correlation),
+            Extension(pool.clone()),
+            Extension(registry(&pool)),
+            Extension(None::<std::sync::Arc<async_nats::Client>>),
+            Extension(None),
+            axum::body::Bytes::new(),
+        )
+    };
+
+    talos_execution_pause::set_execution_paused(&pool, true)
+        .await
+        .unwrap();
+    let deferred = call(with_continuation.clone()).await;
+    assert_eq!(
+        deferred.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(
+        suspension_status(&pool, &with_continuation).await,
+        "waiting"
+    );
+
+    let unknown = call(format!("{:064x}", 7u8)).await;
+    assert_eq!(
+        unknown.status(),
+        axum::http::StatusCode::NOT_FOUND,
+        "without a live capability the caller learns nothing about the pause"
+    );
+
+    let _ = call(bare.clone()).await;
+    assert_eq!(
+        suspension_status(&pool, &bare).await,
+        "resumed",
+        "no continuation → starts nothing → not deferred"
+    );
+
+    talos_execution_pause::set_execution_paused(&pool, false)
+        .await
+        .unwrap();
+    let _ = call(with_continuation.clone()).await;
+    assert_eq!(
+        suspension_status(&pool, &with_continuation).await,
+        "resumed",
+        "CONTROL"
+    );
 }

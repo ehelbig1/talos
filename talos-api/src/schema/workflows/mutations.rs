@@ -1312,6 +1312,31 @@ impl WorkflowsMutations {
             .await
             .ok();
 
+        // The deployment-wide execution pause (package BG). A GraphQL test run
+        // dispatches real modules to real workers, exactly like MCP
+        // `test_workflow`, which has refused while paused since before the
+        // pause's home existed; this twin never read the flag.
+        match talos_execution_pause::gate_start(
+            &db_pool,
+            talos_execution_pause::PauseGatePath::GraphqlTest,
+        )
+        .await
+        {
+            Ok(None) => {}
+            Ok(Some(reason)) => {
+                return Err(
+                    async_graphql::Error::new(talos_execution_pause::refusal_message(reason))
+                        .extend_safe(),
+                )
+            }
+            Err(e) => {
+                tracing::error!("testWorkflow: execution pause read failed: {}", e);
+                return Err(
+                    async_graphql::Error::new("Request could not be completed").extend_safe()
+                );
+            }
+        }
+
         // Create a test execution record (marked as test)
         talos_execution_repository::ExecutionRepository::new(db_pool.clone())
             .insert_test_execution_row(

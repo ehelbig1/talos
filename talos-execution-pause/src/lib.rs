@@ -137,6 +137,53 @@ pub fn record_refusal(path: PauseGatePath, reason: PauseRefusal) {
 /// own backoff) is unaffected.
 pub const PAUSE_RETRY_AFTER_SECS: u32 = 60;
 
+/// What an inbound push that would start work must do while the pause may be
+/// in force. The RULE lives here, once, for every push integration (Gmail,
+/// Google Calendar, GCP): a push that starts nothing is admitted; a paused or
+/// unreadable flag DEFERS it; a flag the database could not return DEFERS it
+/// too, because a start whose kill-switch could not be read is not admitted
+/// and a push sender retries a non-2xx. The handler answers 503 on any
+/// `Defer*` BEFORE it moves a cursor, a dedup marker or spawns work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PushAdmission {
+    Admit,
+    Defer(PauseRefusal),
+    DeferReadFailed,
+}
+
+impl PushAdmission {
+    #[must_use]
+    pub const fn defers(self) -> bool {
+        !matches!(self, Self::Admit)
+    }
+}
+
+/// Decide a push. `starts_work` is the integration's own "is this watch bound
+/// to something that runs" predicate. A read failure is logged here with the
+/// path label; a refusal is counted by [`gate_start`].
+#[must_use = "a push admission whose answer is dropped admits every push"]
+pub async fn push_admission<'e, E: PgExecutor<'e>>(
+    executor: E,
+    starts_work: bool,
+    path: PauseGatePath,
+) -> PushAdmission {
+    if !starts_work {
+        return PushAdmission::Admit;
+    }
+    match gate_start(executor, path).await {
+        Ok(None) => PushAdmission::Admit,
+        Ok(Some(reason)) => PushAdmission::Defer(reason),
+        Err(e) => {
+            tracing::error!(
+                path = path.as_str(),
+                error = %e,
+                "could not read the execution pause flag; deferring the push (503)"
+            );
+            PushAdmission::DeferReadFailed
+        }
+    }
+}
+
 /// The one sentence a caller shows for a refusal. `Unreadable` names the
 /// repair, because a stored value nothing can classify refuses every start
 /// until an operator rewrites it.
@@ -254,6 +301,92 @@ mod tests {
             ".lookup_execution(",
         );
         assert!(retry.contains("PauseGatePath::Retry"));
+    }
+
+    /// Package BG's call sites, textual and stated as such: each gate sits
+    /// BEFORE the statement that would consume the event or start the run.
+    #[test]
+    fn each_remaining_start_path_reads_the_pause_before_it_consumes_or_starts() {
+        let gcal = region(
+            include_str!("../../talos-google-calendar/src/handlers.rs"),
+            "let integration_uuid = watch.integration_id;",
+            ".advance_message_number(",
+        );
+        assert!(
+            gcal.contains("PauseGatePath::GcalPush")
+                && gcal.contains("if pause.defers() {")
+                && gcal.contains("return StatusCode::SERVICE_UNAVAILABLE;")
+        );
+
+        let gcp = region(
+            include_str!("../../talos-google-cloud/src/handlers.rs"),
+            "let parsed = parse_monitoring_incident(&payload);",
+            "tokio::spawn(async move",
+        );
+        assert!(
+            gcp.contains("PauseGatePath::GcpPush")
+                && gcp.contains("if pause.defers() {")
+                && gcp.contains("return StatusCode::SERVICE_UNAVAILABLE;")
+        );
+
+        let mcp_approval = region(
+            include_str!("../../talos-mcp-handlers/src/advanced.rs"),
+            "let cwf_id = gate.continuation_workflow_id;",
+            ".resolve_approval_gate(gate_id, user_id, resolution, note)",
+        );
+        assert!(mcp_approval.contains("PauseGatePath::Continuation"));
+
+        let mcp_resume = region(
+            include_str!("../../talos-mcp-handlers/src/advanced.rs"),
+            "async fn handle_resume_workflow_by_correlation_id(",
+            ".claim_suspension_for_mcp_resume(",
+        );
+        assert!(mcp_resume.contains("PauseGatePath::Continuation"));
+
+        let link = region(
+            include_str!("../../talos-webhooks/src/approval.rs"),
+            "pub async fn approval_gate_handler(",
+            "UPDATE workflow_approval_gates",
+        );
+        assert!(link.contains("PauseGatePath::Continuation"));
+
+        let callback = region(
+            include_str!("../../talos-webhooks/src/suspension.rs"),
+            "pub async fn suspension_callback_handler(",
+            "UPDATE workflow_suspensions",
+        );
+        assert!(callback.contains("PauseGatePath::Continuation"));
+
+        let handoff = region(
+            include_str!("../../talos-actor-lifecycle-service/src/handoff.rs"),
+            "pub async fn handoff(",
+            ".insert_handoff_execution(",
+        );
+        assert!(
+            handoff.contains("PauseGatePath::Handoff")
+                && handoff.contains(
+                    "Ok(Some(reason)) => return Err(HandoffError::ExecutionPaused(reason))"
+                )
+        );
+
+        let graphql = region(
+            include_str!("../../talos-api/src/schema/workflows/mutations.rs"),
+            "async fn test_workflow(",
+            ".insert_test_execution_row(",
+        );
+        assert!(
+            graphql.contains("PauseGatePath::GraphqlTest")
+                && graphql.contains(
+                    "async_graphql::Error::new(talos_execution_pause::refusal_message(reason))"
+                )
+        );
+
+        let contract = region(
+            include_str!("../../talos-mcp-handlers/src/workflows.rs"),
+            "use talos_subworkflow_contract::{run_contract_test, ContractKind, ContractTestError};",
+            "match run_contract_test(&deps",
+        );
+        assert!(contract.contains("enforce_executions_not_paused(&state.workflow_repo, req_id.clone()).await\n    {\n        return resp;"));
     }
 
     /// ONE home: the two deleted repository copies (whose writer bound TEXT
