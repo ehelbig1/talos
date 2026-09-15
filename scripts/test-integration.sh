@@ -230,6 +230,21 @@ for d in controller worker talos-*; do
 done
 python3 scripts/lint-sql-prepare.py --self-test
 python3 scripts/lint-sql-prepare.py "$CTL_URL" "${SQL_PREPARE_ROOTS[@]}"
+# A probe that cannot reach a server must REFUSE, never pass (package BK,
+# 2026-09-15): until then a wrong password, a missing database, a closed port
+# and an unresolvable host all exited 0 with the same "scanned N statements"
+# line as the run above. The run above uses a correct URL, so it cannot see
+# that regression; this one points at a port nothing listens on and requires
+# the harness-failure exit, 2 — not 0 (a pass) and not 1 (a finding).
+set +e
+python3 scripts/lint-sql-prepare.py "postgresql://talos@127.0.0.1:1/talos_ctl" "${SQL_PREPARE_ROOTS[@]}" >/dev/null 2>&1
+unreachable_rc=$?
+set -e
+if [ "$unreachable_rc" -ne 2 ]; then
+    echo "✗ check 88's probe exited $unreachable_rc against an unreachable server (want 2)" >&2
+    exit 1
+fi
+echo "  check 88 refuses an unreachable server (exit 2) ✓"
 
 export TALOS_TEST_REDIS_URL="redis://127.0.0.1:${REDIS_PORT}"
 export TALOS_TEST_NATS_URL="nats://127.0.0.1:${NATS_PORT}"

@@ -9064,6 +9064,16 @@ else
         EXIT_CODE=1
     elif python3 "$ROOT/scripts/lint-sql-prepare.py" "$SQL_PREPARE_URL" "${SQL_PREPARE_ROOTS[@]}"; then
         green "✓ every static sqlx statement prepares against the migrated schema"
+    elif [ "$?" -eq 2 ]; then
+        # Exit 2 is a HARNESS failure: psql did not run the probe script to the
+        # end (wrong credentials, missing database, unreachable server). Until
+        # 2026-09-15 (package BK) all four of those exited 0 with the same
+        # "scanned N statements" line as a real run — a ✓ over statements
+        # that never reached a server. Asked for and unable to run is a
+        # failure, not a skip.
+        red "✗ the PREPARE probe could not run against TALOS_SQL_PREPARE_URL / DATABASE_URL"
+        yellow "  → the URL must reach a MIGRATED database (make test-integration builds one)."
+        EXIT_CODE=1
     else
         red "✗ static sqlx statement(s) do not PREPARE — they cannot run at all"
         yellow "  → a caller's .unwrap_or_default() renders this as an empty list, so the"

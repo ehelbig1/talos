@@ -477,6 +477,98 @@ EXPECT = {
 EXPECT_DYNAMIC = ['format!-args', 'format!-placeholder', 'expr', 'let:format!-args']
 
 
+# The last line the probe script echoes. Its presence is how a run proves psql
+# reached the end of the script rather than stopping part-way.
+END_MARKER = 'end'
+
+
+def read_probe_output(stdout, returncode, probe_names):
+    """Classify one psql run of the probe script.
+
+    Package BK (2026-09-15): psql's stderr is merged into stdout (see the call
+    site), so a psql that never connected — wrong password, missing database,
+    closed port, unresolvable host — still produces NON-EMPTY output: its own
+    `psql: error: …` line. The old guard (`returncode != 0 and not stdout`)
+    therefore never fired, no `@@@` marker was seen, no ERROR was attributed,
+    and the check printed ✓ over statements that had never reached a server.
+    Measured on main for all four failure modes: exit 0, output identical to a
+    good run.
+
+    A run now counts only when psql exited 0 AND echoed EVERY probe's marker
+    AND the end marker. Anything else is a harness failure, never a pass.
+    Returns {'harness': str|None, 'context': [str], 'findings': [(name, code,
+    msg)], 'indeterminate': [(name, code, msg)]}.
+    """
+    names = set(probe_names)
+    seen, ended = set(), False
+    cur, findings, indeterminate = None, [], []
+    pending = set(names)
+    for line in stdout.split('\n'):
+        m = re.match(r'^@@@(\S+)$', line.strip())
+        if m:
+            if m.group(1) == END_MARKER:
+                ended = True
+                cur = None
+            elif m.group(1) in names:
+                cur = m.group(1)
+                seen.add(cur)
+            continue
+        m = re.search(r'ERROR:\s+([0-9A-Z]{5}):\s*(.*)$', line)
+        if not (m and cur and cur in pending):
+            continue
+        code, msg = m.group(1), m.group(2).strip()
+        if code == CASCADE:
+            continue
+        pending.discard(cur)
+        (indeterminate if code in INDETERMINATE else findings).append((cur, code, msg))
+    context = [l.strip() for l in stdout.split('\n') if l.strip() and not l.startswith('@@@')][:3]
+    harness = None
+    if returncode != 0:
+        harness = f'psql exited {returncode} — it did not run the probe script to completion'
+    elif not seen and names:
+        harness = 'psql echoed no probe marker — it never ran a statement against a server'
+    elif seen != names:
+        harness = f'psql echoed {len(seen)} of {len(names)} probe markers — the run stopped part-way'
+    elif not ended:
+        harness = 'psql never echoed the end marker — the run stopped part-way'
+    return {'harness': harness, 'context': context if harness else [],
+            'findings': [] if harness else findings,
+            'indeterminate': [] if harness else indeterminate}
+
+
+# (stdout, returncode, probe names, expected harness token or None, expected
+# findings). Each failure case is built so that exactly ONE branch of
+# read_probe_output can refuse it — a case two branches both catch cannot
+# tell a deleted branch from a present one.
+OUTPUT_CASES = [
+    # A good run: every marker, the end marker, one finding.
+    ('@@@s1\n@@@s2\nERROR:  42703: column "x" does not exist\n@@@end\n', 0, ['s1', 's2'], None, 1),
+    # The measured defect: psql never connected, its own error on stdout.
+    ('psql: error: connection to server at "127.0.0.1", port 5433 failed: '
+     'FATAL:  password authentication failed for user "talos"\n', 0, ['s1', 's2'],
+     'no probe marker', 0),
+    # Connection lost after the script ran: every marker echoed, exit 2.
+    ('@@@s1\n@@@s2\n@@@end\n', 2, ['s1', 's2'], 'exited 2', 0),
+    # A probe marker missing although the run reached the end.
+    ('@@@s1\n@@@end\n', 0, ['s1', 's2'], 'of 2 probe markers', 0),
+    # Every probe marker but no end marker.
+    ('@@@s1\n@@@s2\n', 0, ['s1', 's2'], 'end marker', 0),
+    # An ERROR before the first marker (the refused track_utility SET) is not a finding.
+    ('ERROR:  42501: permission denied to set parameter\n@@@s1\n@@@end\n', 0, ['s1'], None, 0),
+]
+
+
+def output_self_test():
+    bad = []
+    for stdout, rc, names, want_harness, want_findings in OUTPUT_CASES:
+        got = read_probe_output(stdout, rc, names)
+        harness_ok = (got['harness'] is None) if want_harness is None \
+            else (got['harness'] is not None and want_harness in got['harness'])
+        if not harness_ok or len(got['findings']) != want_findings:
+            bad.append((stdout[:60], rc, got['harness'], len(got['findings'])))
+    return bad
+
+
 def self_test():
     with tempfile.NamedTemporaryFile('w', suffix='.rs', delete=False) as fh:
         fh.write(FIXTURE); path = fh.name
@@ -486,14 +578,18 @@ def self_test():
         os.unlink(path)
     got = {r['sql']: r.get('resolved') for r in recs if 'sql' in r}
     dyn = [r['dynamic'] for r in recs if 'dynamic' in r]
-    ok = got == EXPECT and dyn == EXPECT_DYNAMIC
+    bad_outputs = output_self_test()
+    ok = got == EXPECT and dyn == EXPECT_DYNAMIC and not bad_outputs
     if not ok:
+        for case in bad_outputs:
+            print(f'   output case misclassified: {case}', file=sys.stderr)
         print('  self-test FAILED', file=sys.stderr)
         print(f'   resolved: {json.dumps(got, indent=1)}', file=sys.stderr)
         print(f'   dynamic:  {dyn}', file=sys.stderr)
         return 1
     print(f'  self-test ok: {len(EXPECT)} statements resolved as expected, '
-          f'{len(EXPECT_DYNAMIC)} correctly left dynamic')
+          f'{len(EXPECT_DYNAMIC)} correctly left dynamic, '
+          f'{len(OUTPUT_CASES)} psql outputs classified as expected')
     return 0
 
 
@@ -546,6 +642,7 @@ def main():
         name = f's{n}'
         probes[name] = (r, sql)
         script += [f'\\echo @@@{name}', f'PREPARE {name} AS {sql};', f'DEALLOCATE {name};']
+    script.append(f'\\echo @@@{END_MARKER}')
 
     with tempfile.NamedTemporaryFile('w', suffix='.sql', delete=False) as fh:
         fh.write('\n'.join(script) + '\n')
@@ -565,24 +662,14 @@ def main():
         return 2
     finally:
         os.unlink(path)
-    if proc.returncode != 0 and not proc.stdout:
-        print(f'  harness failure: psql exited {proc.returncode}: '
-              f'{proc.stdout.strip()[:400]}', file=sys.stderr)
+    outcome = read_probe_output(proc.stdout, proc.returncode, list(probes))
+    if outcome['harness']:
+        print(f"  harness failure: {outcome['harness']}", file=sys.stderr)
+        for line in outcome['context']:
+            print(f'    {line}', file=sys.stderr)
         return 2
-
-    cur, findings, indeterminate = None, [], []
-    for line in proc.stdout.split('\n'):
-        m = re.match(r'^@@@(s\d+)$', line.strip())
-        if m:
-            cur = m.group(1); continue
-        m = re.search(r'ERROR:\s+([0-9A-Z]{5}):\s*(.*)$', line)
-        if not (m and cur and cur in probes):
-            continue
-        code, msg = m.group(1), m.group(2).strip()
-        if code == CASCADE:
-            continue
-        r, _sql = probes.pop(cur)
-        (indeterminate if code in INDETERMINATE else findings).append((r, code, msg))
+    findings = [(probes[name][0], code, msg) for name, code, msg in outcome['findings']]
+    indeterminate = [(probes[name][0], code, msg) for name, code, msg in outcome['indeterminate']]
 
     resolved = [r for r in static if r.get('resolved')]
     print(f'  scanned {len(static)} static statement(s) in {len(roots)} root(s) '
