@@ -6,9 +6,9 @@
 // manually. The in-memory `KeyVersion` tracker never persists
 // anywhere. Removing the attribute would surface dead-field /
 // dead-method warnings without operator-actionable cleanup until a
-// real automatic-rotation implementation lands. Sibling of the
-// talos-tenancy placeholder retention (talos-feature-flags and
-// talos-circuit-breaker were deleted 2026-07-24 — this crate survives
+// real automatic-rotation implementation lands. (Its former siblings —
+// talos-feature-flags and talos-circuit-breaker, deleted 2026-07-24, and
+// the talos-tenancy placeholder types, deleted 2026-09-15 — are gone; this crate survives
 // because its rotation semantics are real and tested, even though the
 // boot wiring hasn't landed).
 #![allow(dead_code)]

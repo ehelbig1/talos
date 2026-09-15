@@ -1105,7 +1105,9 @@ pub(crate) async fn build_platform_services(
     //
     // - `tenancy::TenantIsolation::new()` — bound to `_tenant_isolation`,
     //   never used; tenant isolation is actually enforced at the
-    //   repository layer (per-user / per-org SQL gates).
+    //   repository layer (per-user / per-org SQL gates) with the RLS
+    //   backstop `talos_tenancy::{OrgScope, TenantReadScope}`. The type itself
+    //   (and its `TenantLimits` quota defaults) was DELETED 2026-09-15.
     // - `secrets_rotation::SecretsRotation::new()` — bound to
     //   `_secrets_rotation`, never used; the in-memory `KeyVersion`
     //   tracker never persisted anywhere. The log line "Secrets rotation
