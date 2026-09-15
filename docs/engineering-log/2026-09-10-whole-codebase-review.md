@@ -5217,3 +5217,28 @@ caught. Restoring the deleted code fails check 88 against the migrated schema.
 **Recorded, not done.** `talos_tenancy::TenantIsolation` / `TenantLimits` and the
 `talos-secrets-rotation` crate are the same shape — placeholders that document a
 control nothing constructs.
+
+## Package BO — a tenancy crate that promised quotas nothing enforced (2026-09-15)
+
+**How it was found.** A recorded side finding from the package BF survey
+("dead `TenantIsolation`"), picked by the operator after deploy 62.
+
+**Measured.** `talos-tenancy` is half live: `OrgScope` (7 uses) and
+`TenantReadScope` (45 uses) carry tenancy into the RLS backstop. The other half —
+`TenantLimits` with quota defaults, `TenantContext`, `TenantIsolation` — had zero
+uses outside the crate, under a module header claiming "resource quotas per
+tenant" and a crate-wide `#![allow(dead_code)]`. MCP-704 had removed the only
+constructor call in May and kept the types. Nothing enforces a per-tenant quota,
+and no doc outside the crate claims one.
+
+**What changed.** Deleted the three types, the blanket `allow` and the
+dependencies only they used; rewrote the header; corrected two sibling comments
+that cited this crate's placeholder as their precedent.
+
+**Guards.** Deletion is the guard for the types. The `allow` removal was proved by
+mutation: an unused private function fails `clippy -D warnings` without it and
+passes with it restored. A `pub` placeholder would not be reported — stated.
+
+**Recorded, not done.** `talos-secrets-rotation` and the stub
+`VaultSecretProvider` / `AwsSecretProvider` in `talos-secrets-manager` are the
+same shape.
