@@ -116,7 +116,6 @@ SITES = [
     ("talos-engine/src/sub_actor_context_resolver.rs", 53, "a", "Workflow read error -> resolve() returns None -> the sub-workflow executes with NO actor memory injected, producing different agent output with no signal."),
     ("talos-engine/src/sub_actor_context_resolver.rs", 72, "a", "Same, get_relevant_actor_context leg."),
     ("talos-failure-analysis-service/src/lib.rs", 721, "a", "apply_fix path: a graph read error skips the `if let Some(..)` block with no else — the requested auto-fix silently does NOT write, and the response still carries apply_fix_available: true."),
-    ("talos-cost-attribution/src/lib.rs", 149, "a", "check_fuel_budget error -> budget_usage: None in ActorCostReport, reported as 'no daily fuel budget configured'."),
     ("talos-integrations/src/handlers.rs", 74, "a", "Workflow-id query error -> HTTP 404 'create a workflow named daily-morning-briefing first', which if followed creates a duplicate."),
     ("talos-integrations/src/handlers.rs", 127, "a", "Execution query error -> HTTP 404 'run the daily-morning-briefing workflow first'."),
     ("talos-ml/src/lifecycle.rs", 196, "a", "policy_json read error -> CorrectionsCfg::default() -> eval runs with default correction weight / gold fraction, which the comment says mis-calibrates the confidence thresholds recorded in metrics_json — and those metrics are PERSISTED."),
