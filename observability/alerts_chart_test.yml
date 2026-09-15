@@ -1777,12 +1777,13 @@ tests:
                 30 scheduled workflow run(s) from a BACKLOG batch — the
                 schedules that came due while the controller was restarting
                 (phase=startup) or while it was not polling without a restart
-                (phase=catchup: host suspend/resume, DB outage) — ended
+                (phase=catchup: host suspend/resume, DB outage, or an execution
+                pause lifting) — ended
                 `failed`, and the failed+skipped runs are a MAJORITY
                 of that backlog. Which shape:
                 `sum by (phase) (increase(talos_scheduler_dispatches_total{phase=~"startup|catchup"}[30m]))`,
                 or the controller log's `event_kind="scheduler_startup_backlog"` /
-                `"scheduler_catchup_backlog"` line, which carries the batch size
+                `"scheduler_catchup_backlog"` / `"scheduler_pause_backlog"` line, which carries the batch size
                 and how late its most overdue row was.
 
                 What this number knows: the outcome of each startup-phase dispatch.
@@ -1872,12 +1873,13 @@ tests:
                 30 scheduled workflow run(s) from a BACKLOG batch — the
                 schedules that came due while the controller was restarting
                 (phase=startup) or while it was not polling without a restart
-                (phase=catchup: host suspend/resume, DB outage) — ended
+                (phase=catchup: host suspend/resume, DB outage, or an execution
+                pause lifting) — ended
                 `skipped`, and the failed+skipped runs are a MAJORITY
                 of that backlog. Which shape:
                 `sum by (phase) (increase(talos_scheduler_dispatches_total{phase=~"startup|catchup"}[30m]))`,
                 or the controller log's `event_kind="scheduler_startup_backlog"` /
-                `"scheduler_catchup_backlog"` line, which carries the batch size
+                `"scheduler_catchup_backlog"` / `"scheduler_pause_backlog"` line, which carries the batch size
                 and how late its most overdue row was.
 
                 What this number knows: the outcome of each startup-phase dispatch.

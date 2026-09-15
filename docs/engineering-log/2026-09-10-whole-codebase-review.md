@@ -5023,3 +5023,45 @@ lines.
 **Stated limits.** The unexplained 0 B. The figures come from `docker system
 df` and `docker buildx du`, whose own accounting (shared vs private) is what the
 experiment showed to be subtle.
+
+## Package BJ — a lifted pause was logged as missed polls (2026-09-15)
+
+**How it was found.** The first live pause→resume round trip, run on the dev
+deployment with the operator's go-ahead after deploy 57. The pause itself did
+what package BF designed: twelve polls deferred the three schedules due at
+17:30Z without claiming them, `trigger_workflow` was refused, and on resume
+each schedule fired once at 17:32:28 and completed. The resume poll's backlog
+was 149 s overdue, above `CATCHUP_OVERDUE_SECS` (90 s), so it was correctly
+classified `phase=catchup` and drained under the backlog ceiling — and logged
+`WARN scheduler_catchup_backlog … the scheduler missed several polls (host
+suspend/resume or a DB outage)`. It had missed none.
+
+**The defect.** The catch-up line was written for package M's shape (a host
+suspend) before package BF gave the scheduler a second way to hold due rows.
+Every deliberate pause longer than six poll intervals would end in a WARN that
+blames the host for the operator's own act.
+
+**Decisions.**
+- The phase and the permit are unchanged: a pause-held batch is a backlog and
+  the backlog ceiling is right for it. No new `phase` label (it would add five
+  seeded series and a selector change for a distinction the log already makes).
+- Attribution comes from the poll BEFORE the batch: `observe_execution_pause`
+  now returns whether that poll was deferred (paused or unreadable flag), and
+  `classify_backlog_report` turns phase + batch size + that bit into one of
+  `Startup` / `CatchupAfterPause` / `CatchupMissedPolls` / `None`.
+- `CatchupAfterPause` logs at INFO as `scheduler_pause_backlog` and names the
+  pause. Only `CatchupMissedPolls` stays a WARN, still `scheduler_catchup_backlog`.
+- The herd alert's description and the `SCHEDULER_STARTUP_MAX_CONCURRENT` row
+  name the pause as a third catch-up cause and the new event kind.
+
+**Guards.** Unit tests over the classifier (with controls for the old reading,
+boot and steady batches, empty batches), over the observation sequence of the
+live round trip, and over the emitted lines under a capturing subscriber
+(level, event kind, no "missed"/"suspend" in the pause line). `poll_and_trigger`
+needs live NATS, so its wiring is a textual pin. Seven mutations, all caught.
+
+**Stated limits.** A host suspend that happens DURING a pause is reported as
+the pause lifting (the pause held the rows either way). A controller that boots
+while paused drains the held rows as its `startup` backlog and says so. The
+Gmail push deferral was not exercised by the round trip — no push arrived in
+the three-minute window.
