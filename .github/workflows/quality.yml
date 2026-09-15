@@ -95,6 +95,15 @@ jobs:
         # here; the plist render/status half needs macOS plutil and skips loudly.
         run: bash scripts/tests/launchd-path-test.sh
 
+      - name: make up disk preflight + make clean prune flags
+        # scripts/preflight-disk.sh refuses `make up` at >=95% Docker disk and
+        # prints reclaim commands. On 2026-09-15 its first command reclaimed 0 B
+        # at 95% with nothing on screen to say so. A fake `docker` on PATH
+        # drives every branch: figures shown (or omitted when unreadable),
+        # image prune first, the builder-prune flag this client knows, the
+        # 95% refusal and the opt-out; plus make clean's prune line.
+        run: bash scripts/tests/preflight-disk-test.sh
+
   # ── Rust unit tests: library unit tests + the DB-free integration binaries ──
   # The bulk is `--lib` (~1.3k DB-free unit tests). On top of that we explicitly
   # run the two `tests/`-dir integration binaries that are DB-free once their
