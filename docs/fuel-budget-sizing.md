@@ -116,8 +116,11 @@ performance one, and it does not cap anything upstream of the module.
 
 When you raise a budget, state what still bounds it: the 50M engine ceiling,
 the per-step wall-clock timeout, and — if populated — the actor's
-`actor_budget_policies` (`max_fuel_per_execution`, `max_fuel_per_hour`,
-`fuel_budget_daily`). All of those
+`actor_budget_policies.max_fuel_per_hour`, which the row-creation gate
+enforces before a run starts. `max_fuel_per_execution` is stored by
+`set_actor_budget` but NOT enforced (the tool's own description says so), so it
+bounds nothing. (`fuel_budget_daily` used to be named here too; nothing wrote or
+enforced it and it was dropped 2026-09-15 — it was never a backstop.) All of those
 are NULL/empty for the PA actor today, which means **no budget is currently
 backstopping a mis-set node ceiling**. (`tenant_quotas.max_fuel_per_execution`
 used to be named here too; that table never had a writer or a reader and was

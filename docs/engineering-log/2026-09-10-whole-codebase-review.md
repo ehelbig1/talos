@@ -5181,3 +5181,39 @@ the tables, a textual pin on both call sites. Nine mutations, all caught.
 **Stated limits.** GraphQL `createActor`/`updateActor` still inline their own
 ceiling read. The GraphQL source read is no longer inside an org-scoped
 transaction (the `user_id` predicate remains; the INSERT is still org-scoped).
+
+## Package BN — a daily fuel budget that enforced nothing (2026-09-15)
+
+**How it was found.** A recorded side finding from the package BF survey
+("dead fuel_budget_daily / check_fuel_budget / get_actor_cost_report"), picked
+by the operator.
+
+**Measured before deleting.**
+- `get_actor_cost_report` had zero callers; `check_fuel_budget` was called only
+  by it.
+- `actor_budget_policies.fuel_budget_daily` and `fuel_alert_threshold_pct` had
+  no writer: `set_actor_budget`, the scaffold and the clone write or copy every
+  other budget column and not these. Reference fleet: 0 of 5 rows set the
+  budget; the threshold is the default 80 on all 5. No view, function or policy
+  references either column.
+- The hourly cap `max_fuel_per_hour` is enforced at row creation and is a
+  different column.
+- `docs/fuel-budget-sizing.md` named `fuel_budget_daily` (and
+  `max_fuel_per_execution`, which `set_actor_budget` documents as not enforced)
+  as bounds on a raised node ceiling. Neither bounds anything.
+- The package BD digest bullet described "hourly and daily fuel budget gates";
+  the daily gate never existed.
+
+**What changed.** Deleted both functions, their structs and a unit test that
+asserted a struct it had built; dropped both columns
+(`20260915120000`); corrected the sizing doc; removed the stale
+`absence-verdicts.py` entry.
+
+**Guards.** A DB test pins the two columns absent with five live budget columns
+as the control. Four migration mutations (absent, either column kept, hourly cap
+over-dropped), each built into a fresh clone of the pre-migration template, all
+caught. Restoring the deleted code fails check 88 against the migrated schema.
+
+**Recorded, not done.** `talos_tenancy::TenantIsolation` / `TenantLimits` and the
+`talos-secrets-rotation` crate are the same shape — placeholders that document a
+control nothing constructs.

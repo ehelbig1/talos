@@ -165,3 +165,37 @@ async fn the_actor_workflows_read_counts_graph_nodes_without_workflow_nodes() {
         "the count is derived from graph_json"
     );
 }
+
+/// Package BN (2026-09-15): the daily fuel budget columns had no writer and
+/// their only reader had no caller. They are gone; the HOURLY cap the
+/// row-creation gate enforces, and the budget columns MCP writes, remain.
+#[tokio::test]
+async fn the_unenforced_daily_fuel_budget_columns_are_gone() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let cols: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name::text FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'actor_budget_policies'",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    for gone in ["fuel_budget_daily", "fuel_alert_threshold_pct"] {
+        assert!(
+            !cols.iter().any(|c| c == gone),
+            "{gone} must not exist: {cols:?}"
+        );
+    }
+    // CONTROL: the enforced hourly cap and the columns `set_actor_budget` writes.
+    for live in [
+        "max_fuel_per_hour",
+        "max_executions_per_hour",
+        "max_executions_total",
+        "max_fuel_per_execution",
+        "on_budget_exceeded",
+    ] {
+        assert!(
+            cols.iter().any(|c| c == live),
+            "{live} must remain: {cols:?}"
+        );
+    }
+}
