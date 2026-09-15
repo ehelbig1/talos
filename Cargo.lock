@@ -9328,6 +9328,7 @@ dependencies = [
  "talos-workflow-repository",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

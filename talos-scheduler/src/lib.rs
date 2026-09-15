@@ -572,6 +572,151 @@ pub const SCHEDULER_POLL_INTERVAL_SECS: u64 = 15;
 /// 3 195 s overdue and its most-late 3 915 s — forty times this threshold.
 pub const CATCHUP_OVERDUE_SECS: f64 = 6.0 * SCHEDULER_POLL_INTERVAL_SECS as f64;
 
+/// Why a poll's batch is logged as a backlog. The LOG attribution only: the
+/// `phase` label and the permit a dispatch takes come from
+/// [`classify_dispatch_phase`] and do not read this.
+///
+/// Package BJ (2026-09-15): the first live pause→resume round trip ended with
+/// `WARN scheduler_catchup_backlog … the scheduler missed several polls (host
+/// suspend/resume or a DB outage)`. It had missed none — twelve consecutive
+/// polls had DEFERRED the three due schedules because the operator paused
+/// executions, which is exactly what package BF designed. The drain was right
+/// (catch-up phase, backlog ceiling, each schedule once); the sentence blamed
+/// the host for an operator's deliberate act, at a level that asks for a look.
+/// A backlog whose previous poll was deferred by the pause is now reported as
+/// the pause lifting.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BacklogReport {
+    /// Not a backlog, or an empty batch: nothing to say.
+    None,
+    /// The first poll after a controller boot (`phase=startup`).
+    Startup,
+    /// A catch-up batch on the first poll after an execution pause lifted:
+    /// the rows were held by the pause, not missed.
+    CatchupAfterPause,
+    /// A catch-up batch with no pause behind it: the process stopped polling
+    /// for a while (host suspend/resume, DB outage).
+    CatchupMissedPolls,
+}
+
+/// Classify a batch for the log. `previous_poll_deferred_by_pause` is what
+/// [`observe_execution_pause`] returns for THIS poll: whether the poll before
+/// it was deferred (paused or an unreadable flag).
+#[doc(hidden)]
+#[must_use]
+pub fn classify_backlog_report(
+    phase: &str,
+    batch_len: usize,
+    previous_poll_deferred_by_pause: bool,
+) -> BacklogReport {
+    if batch_len == 0 {
+        return BacklogReport::None;
+    }
+    if phase == talos_metrics::SCHEDULER_PHASE_STARTUP {
+        BacklogReport::Startup
+    } else if phase == talos_metrics::SCHEDULER_PHASE_CATCHUP {
+        if previous_poll_deferred_by_pause {
+            BacklogReport::CatchupAfterPause
+        } else {
+            BacklogReport::CatchupMissedPolls
+        }
+    } else {
+        BacklogReport::None
+    }
+}
+
+/// Emit the one backlog line a poll warrants. Only `CatchupMissedPolls` is a
+/// WARN: the process stopped polling and nobody chose that. A boot backlog and
+/// a pause lifting are both expected shapes and log at INFO.
+fn log_backlog(report: BacklogReport, backlog: usize, max_overdue_secs: Option<f64>) {
+    let max_overdue_secs = max_overdue_secs.unwrap_or(0.0);
+    match report {
+        BacklogReport::None => {}
+        BacklogReport::Startup => tracing::info!(
+            target: "talos_scheduler",
+            event_kind = "scheduler_startup_backlog",
+            backlog,
+            max_overdue_secs,
+            "Scheduler: first poll after boot — draining the accumulated backlog \
+             under the startup concurrency ceiling rather than all at once"
+        ),
+        BacklogReport::CatchupAfterPause => tracing::info!(
+            target: "talos_scheduler",
+            event_kind = "scheduler_pause_backlog",
+            backlog,
+            max_overdue_secs,
+            catchup_threshold_secs = CATCHUP_OVERDUE_SECS,
+            "Scheduler: the execution pause has lifted — the schedules it held are \
+             firing once each, under the startup concurrency ceiling rather than all \
+             at once"
+        ),
+        // Not a boot and no pause behind it: the process has been polling, and
+        // a row is more than CATCHUP_OVERDUE_SECS late, so it stopped polling
+        // for a while (host suspend/resume, DB outage). Same shape, same
+        // ceiling, its own event_kind so the shapes can be told apart.
+        BacklogReport::CatchupMissedPolls => tracing::warn!(
+            target: "talos_scheduler",
+            event_kind = "scheduler_catchup_backlog",
+            backlog,
+            max_overdue_secs,
+            catchup_threshold_secs = CATCHUP_OVERDUE_SECS,
+            "Scheduler: a schedule is overdue by more than the catch-up threshold \
+             without a controller boot or an execution pause — the scheduler missed \
+             several polls (host suspend/resume or a DB outage); draining the backlog \
+             under the startup concurrency ceiling rather than all at once"
+        ),
+    }
+}
+
+/// Record the execution-pause state this poll saw and log a TRANSITION once
+/// (not a line every 15 s for the length of a pause — check 69's trap).
+/// Returns whether the PREVIOUS poll was deferred by the pause, which is what
+/// lets the resume poll's backlog be attributed to it.
+#[doc(hidden)]
+pub fn observe_execution_pause(
+    observed: &std::sync::atomic::AtomicU8,
+    deferred: Option<talos_metrics::PauseRefusal>,
+) -> bool {
+    let now: u8 = match deferred {
+        None => 0,
+        Some(talos_metrics::PauseRefusal::Paused) => 1,
+        Some(talos_metrics::PauseRefusal::Unreadable) => 2,
+    };
+    let before = observed.swap(now, std::sync::atomic::Ordering::SeqCst);
+    if before == now {
+        if now != 0 {
+            tracing::debug!(
+                target: "talos_scheduler",
+                "Scheduler: execution pause still in force — poll deferred"
+            );
+        }
+        return before != 0;
+    }
+    match deferred {
+        Some(talos_metrics::PauseRefusal::Paused) => tracing::info!(
+            target: "talos_scheduler",
+            event_kind = "scheduler_execution_pause_observed",
+            "Scheduler: the deployment-wide execution pause is set — due schedules \
+             are DEFERRED (not claimed) until resume_executions; each fires once on \
+             the first poll after resume, under the catch-up concurrency ceiling"
+        ),
+        Some(talos_metrics::PauseRefusal::Unreadable) => tracing::warn!(
+            target: "talos_scheduler",
+            event_kind = "scheduler_execution_pause_unreadable",
+            "Scheduler: system_settings.execution_paused is not a JSON boolean — \
+             due schedules are DEFERRED until an operator rewrites it with \
+             pause_executions or resume_executions"
+        ),
+        None => tracing::info!(
+            target: "talos_scheduler",
+            event_kind = "scheduler_execution_pause_lifted",
+            "Scheduler: the execution pause has lifted — due schedules fire again"
+        ),
+    }
+    before != 0
+}
+
 /// Which `talos_scheduler_dispatches_total{phase}` a poll's batch belongs to.
 ///
 /// `first_poll_since_boot` wins outright: the boot backlog is `startup`
@@ -1108,83 +1253,19 @@ impl SchedulerService {
             to_spawn,
             deferred_by_pause,
         } = Self::select_due_and_advance(&self.db_pool, &self.first_poll_done).await?;
-        self.log_pause_transition(deferred_by_pause);
-
-        if phase == talos_metrics::SCHEDULER_PHASE_STARTUP && !to_spawn.is_empty() {
-            tracing::info!(
-                target: "talos_scheduler",
-                event_kind = "scheduler_startup_backlog",
-                backlog = to_spawn.len(),
-                max_overdue_secs = max_overdue_secs.unwrap_or(0.0),
-                "Scheduler: first poll after boot — draining the accumulated backlog \
-                 under the startup concurrency ceiling rather than all at once"
-            );
-        } else if phase == talos_metrics::SCHEDULER_PHASE_CATCHUP {
-            // Not a boot: the process has been polling, and a row is more than
-            // CATCHUP_OVERDUE_SECS late, so it stopped polling for a while
-            // (host suspend/resume, DB outage). Same shape, same ceiling, its
-            // own event_kind so the two can be told apart in the log.
-            tracing::warn!(
-                target: "talos_scheduler",
-                event_kind = "scheduler_catchup_backlog",
-                backlog = to_spawn.len(),
-                max_overdue_secs = max_overdue_secs.unwrap_or(0.0),
-                catchup_threshold_secs = CATCHUP_OVERDUE_SECS,
-                "Scheduler: a schedule is overdue by more than the catch-up threshold \
-                 without a controller boot — the scheduler missed several polls (host \
-                 suspend/resume or a DB outage); draining the backlog under the startup \
-                 concurrency ceiling rather than all at once"
-            );
-        }
+        let previous_poll_deferred =
+            observe_execution_pause(&self.pause_observed, deferred_by_pause);
+        log_backlog(
+            classify_backlog_report(phase, to_spawn.len(), previous_poll_deferred),
+            to_spawn.len(),
+            max_overdue_secs,
+        );
 
         for (workflow_id, user_id, schedule_id) in to_spawn {
             self.spawn_workflow_execution(workflow_id, user_id, schedule_id, phase);
         }
 
         Ok(())
-    }
-
-    /// Log the execution pause once per TRANSITION. The per-poll signal is the
-    /// `scheduler_poll` series on `talos_execution_pause_refusals_total`.
-    fn log_pause_transition(&self, deferred: Option<talos_metrics::PauseRefusal>) {
-        let now: u8 = match deferred {
-            None => 0,
-            Some(talos_metrics::PauseRefusal::Paused) => 1,
-            Some(talos_metrics::PauseRefusal::Unreadable) => 2,
-        };
-        let before = self
-            .pause_observed
-            .swap(now, std::sync::atomic::Ordering::SeqCst);
-        if before == now {
-            if now != 0 {
-                tracing::debug!(
-                    target: "talos_scheduler",
-                    "Scheduler: execution pause still in force — poll deferred"
-                );
-            }
-            return;
-        }
-        match deferred {
-            Some(talos_metrics::PauseRefusal::Paused) => tracing::info!(
-                target: "talos_scheduler",
-                event_kind = "scheduler_execution_pause_observed",
-                "Scheduler: the deployment-wide execution pause is set — due schedules \
-                 are DEFERRED (not claimed) until resume_executions; each fires once on \
-                 the first poll after resume, under the catch-up concurrency ceiling"
-            ),
-            Some(talos_metrics::PauseRefusal::Unreadable) => tracing::warn!(
-                target: "talos_scheduler",
-                event_kind = "scheduler_execution_pause_unreadable",
-                "Scheduler: system_settings.execution_paused is not a JSON boolean — \
-                 due schedules are DEFERRED until an operator rewrites it with \
-                 pause_executions or resume_executions"
-            ),
-            None => tracing::info!(
-                target: "talos_scheduler",
-                event_kind = "scheduler_execution_pause_lifted",
-                "Scheduler: the execution pause has lifted — due schedules fire again"
-            ),
-        }
     }
 
     /// The DB half of one poll: classify the phase, claim the due batch,
@@ -3702,5 +3783,159 @@ mod scheduler_dispatch_tests {
             "fresh-execution trigger envelope must NEVER be JSON null \
              (would re-introduce the r245 daily-brief regression)"
         );
+    }
+}
+
+/// Package BJ: a backlog that follows a deferred poll is the pause lifting,
+/// not polls the scheduler missed.
+#[cfg(test)]
+mod backlog_attribution_tests {
+    use super::{
+        classify_backlog_report, log_backlog, observe_execution_pause, BacklogReport,
+        CATCHUP_OVERDUE_SECS,
+    };
+    use std::sync::atomic::AtomicU8;
+    use std::sync::{Arc, Mutex};
+    use talos_metrics::{
+        PauseRefusal, SCHEDULER_PHASE_CATCHUP, SCHEDULER_PHASE_STARTUP, SCHEDULER_PHASE_STEADY,
+    };
+
+    #[test]
+    fn a_catch_up_batch_is_attributed_by_the_poll_before_it() {
+        assert_eq!(
+            classify_backlog_report(SCHEDULER_PHASE_CATCHUP, 3, true),
+            BacklogReport::CatchupAfterPause
+        );
+        // CONTROL: the same batch with no pause behind it keeps the old reading.
+        assert_eq!(
+            classify_backlog_report(SCHEDULER_PHASE_CATCHUP, 3, false),
+            BacklogReport::CatchupMissedPolls
+        );
+        // A boot backlog is a boot backlog whatever the pause did.
+        assert_eq!(
+            classify_backlog_report(SCHEDULER_PHASE_STARTUP, 2, true),
+            BacklogReport::Startup
+        );
+        assert_eq!(
+            classify_backlog_report(SCHEDULER_PHASE_STARTUP, 2, false),
+            BacklogReport::Startup
+        );
+        // A short pause leaves an on-time batch: steady, nothing to say.
+        assert_eq!(
+            classify_backlog_report(SCHEDULER_PHASE_STEADY, 3, true),
+            BacklogReport::None
+        );
+        for phase in [SCHEDULER_PHASE_STARTUP, SCHEDULER_PHASE_CATCHUP] {
+            for deferred in [false, true] {
+                assert_eq!(
+                    classify_backlog_report(phase, 0, deferred),
+                    BacklogReport::None
+                );
+            }
+        }
+    }
+
+    /// The sequence of the 2026-09-15 round trip: running, paused ×2, the
+    /// resume poll, the poll after. Only the resume poll reports that the poll
+    /// before it was deferred — an unreadable flag defers too.
+    #[test]
+    fn the_resume_poll_is_the_one_that_sees_a_deferred_predecessor() {
+        let observed = AtomicU8::new(0);
+        let seen: Vec<bool> = [
+            None,
+            Some(PauseRefusal::Paused),
+            Some(PauseRefusal::Paused),
+            None,
+            None,
+            Some(PauseRefusal::Unreadable),
+            None,
+        ]
+        .into_iter()
+        .map(|d| observe_execution_pause(&observed, d))
+        .collect();
+        assert_eq!(seen, [false, false, true, true, false, false, true]);
+    }
+
+    fn captured(f: impl FnOnce()) -> String {
+        #[derive(Clone, Default)]
+        struct Capture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Capture {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+            type Writer = Capture;
+            fn make_writer(&'a self) -> Capture {
+                self.clone()
+            }
+        }
+        let buf = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(buf.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        f();
+        let out = String::from_utf8(buf.0.lock().unwrap().clone()).unwrap();
+        out
+    }
+
+    /// The level and the sentence, read off the emitted line: a lifted pause
+    /// is INFO and names the pause; only missed polls are a WARN.
+    #[test]
+    fn a_lifted_pause_is_info_and_never_blames_the_host() {
+        let late = Some(CATCHUP_OVERDUE_SECS + 58.8);
+        let after_pause = captured(|| log_backlog(BacklogReport::CatchupAfterPause, 3, late));
+        assert!(after_pause.contains(" INFO "), "{after_pause}");
+        assert!(!after_pause.contains(" WARN "), "{after_pause}");
+        assert!(
+            after_pause.contains("event_kind=\"scheduler_pause_backlog\""),
+            "{after_pause}"
+        );
+        assert!(after_pause.contains("pause has lifted"), "{after_pause}");
+        assert!(!after_pause.contains("missed"), "{after_pause}");
+        assert!(!after_pause.contains("suspend"), "{after_pause}");
+
+        // CONTROL: missed polls still WARN, under the event_kind the herd
+        // alert's description names.
+        let missed = captured(|| log_backlog(BacklogReport::CatchupMissedPolls, 3, late));
+        assert!(missed.contains(" WARN "), "{missed}");
+        assert!(
+            missed.contains("event_kind=\"scheduler_catchup_backlog\""),
+            "{missed}"
+        );
+
+        let boot = captured(|| log_backlog(BacklogReport::Startup, 2, Some(3.0)));
+        assert!(boot.contains(" INFO "), "{boot}");
+        assert!(boot.contains("scheduler_startup_backlog"), "{boot}");
+
+        assert_eq!(captured(|| log_backlog(BacklogReport::None, 0, None)), "");
+    }
+
+    /// `poll_and_trigger` needs a live NATS connection, so no test drives it.
+    /// TEXTUAL pin (stated): the poll feeds the pause observation into the
+    /// attribution, and no inline backlog log survives in it.
+    #[test]
+    fn the_poll_attributes_its_backlog_through_the_observation() {
+        let src = include_str!("lib.rs");
+        let start = src.find("async fn poll_and_trigger").expect("poll fn");
+        let body = &src[start..start + src[start..].find("\n    }\n").expect("end")];
+        assert!(
+            body.contains("observe_execution_pause(&self.pause_observed, deferred_by_pause)"),
+            "{body}"
+        );
+        assert!(
+            body.contains("classify_backlog_report(phase, to_spawn.len(), previous_poll_deferred)"),
+            "{body}"
+        );
+        assert!(body.contains("log_backlog("), "{body}");
+        assert!(!body.contains("tracing::warn!"), "{body}");
+        assert!(!body.contains("scheduler_catchup_backlog"), "{body}");
     }
 }
