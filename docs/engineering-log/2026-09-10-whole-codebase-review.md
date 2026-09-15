@@ -5065,3 +5065,42 @@ the pause lifting (the pause held the rows either way). A controller that boots
 while paused drains the held rows as its `startup` backlog and says so. The
 Gmail push deferral was not exercised by the round trip — no push arrived in
 the three-minute window.
+
+## Package BK — check 88 passed without reaching a database (2026-09-15)
+
+**How it was found.** Gating package BJ with a guessed password in
+`TALOS_SQL_PREPARE_URL`: the lint printed `scanned 1240 static statement(s) …
+0 indeterminate parameter type` and ✓, while the DB test binaries using the same
+URL failed at login (`28P01`). Re-run with the real credentials, the same probe
+reported 2 indeterminate-parameter statements — the first run had never reached
+the server.
+
+**The mechanism.** The probe merges psql's stderr into stdout on purpose (so
+each `ERROR:` attributes to the marker before it). A psql that cannot connect
+exits 2 and writes `psql: error: …` — non-empty output — so the harness guard
+`returncode != 0 and not stdout` never fired. No `@@@` marker was seen, no ERROR
+attributed, and `main` returned 0.
+
+**Measured on main** (two roots, 183 statements): wrong password, missing
+database, closed port and unresolvable host all exited 0 with output identical
+to the good run. A connected server with the wrong schema exited 1 (correct).
+CI's integration job always uses a correct URL, so CI was not affected; every
+local run with a stale or mistyped URL was.
+
+**Decisions.**
+- One classifier, `read_probe_output`: a run counts only when psql exited 0 AND
+  echoed every probe marker AND a final `@@@end`. Anything else is exit 2 with
+  psql's own first lines (the URL is never echoed).
+- The lint wrapper names exit 2 as a probe that could not run, not as findings.
+- Guard the regression CI cannot see: `scripts/test-integration.sh` runs the
+  probe against a closed port and requires exit 2.
+
+**Guards.** Six classified psql outputs in the unconditional `--self-test`, each
+refused by exactly one branch. The four-mode matrix against the dev database.
+Eight mutations, all caught; "end marker never appended" and "harness result
+ignored" only by live runs, which is why the negative CI run exists.
+
+**Stated limits.** The wrapper's exit-2 message branch is message-only (removing
+it still fails through the generic branch). A server that accepts the connection
+and then drops it before the first marker is covered by the exit status, not by
+a test.
