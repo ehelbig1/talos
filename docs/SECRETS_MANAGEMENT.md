@@ -692,16 +692,28 @@ WHERE updated_at < NOW() - INTERVAL '90 days'
 
 ## Monitoring & Alerts
 
+Measured 2026-09-15 (package BP): this section used to list three metrics
+(`secrets_accessed_total`, `secrets_access_denied_total`,
+`secrets_rotation_age_days`) and four alerts that exist in no Rust file and no
+rule file — none was ever built, and the first would have carried `key_path` as
+a label, which this repo forbids (unbounded, caller-influenced cardinality).
+What exists today:
+
 ### Metrics
-- `secrets_accessed_total` - Counter by key_path
-- `secrets_access_denied_total` - Failed access attempts
-- `secrets_rotation_age_days` - How old secrets are
+- `talos_secret_decrypt_failures_total` — decryption failures by reason.
+- `talos_dek_cache_size` — DEK cache occupancy, with the
+  `TalosDEKCacheOverflow` alert.
+- Access itself is recorded in the `secret_audit_log` TABLE (key hash, never the
+  value), not as a series; there is no per-access counter.
 
 ### Alerts
-- Secret accessed by unauthorized module
-- Secret not rotated in 90+ days
-- High volume of failed access attempts (potential breach)
-- Master key environment variable missing on startup
+- `TalosActorMemoryDEKOrphaned`, `TalosMemoryWriteFailuresCrypto`,
+  `TalosCryptoOrphanDetectorBlind` (the detector-blind guard),
+  `TalosDEKCacheOverflow`.
+
+There is deliberately no rotation-age alert: nothing computes a secret's
+rotation age, and rotation is operator-invoked (see CC6.2-07 in
+`docs/compliance/soc2-control-mapping.md` for the real entry points).
 
 ## Migration Path
 

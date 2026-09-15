@@ -2,7 +2,7 @@
 """Candidate check (package AN): an `env::var("X")` read compared inline against a
 boolean literal must go through `talos_config::bool_env_or_default` (or carry
 `// allow-inline-env-bool: <reason>` within 8 lines above)."""
-import re, subprocess, sys
+import os, re, subprocess, sys
 root = sys.argv[1] if len(sys.argv) > 1 else '.'
 files=[p for p in subprocess.run(['git','ls-files','*.rs'],cwd=root,capture_output=True,text=True).stdout.split()
        if '/tests/' not in '/'+p and not p.endswith('_tests.rs') and '/examples/' not in p and not p.startswith('module-templates/') and not p.startswith('talos-config/')]
@@ -10,6 +10,12 @@ rd=re.compile(r'env::var\(\s*"([A-Z][A-Z0-9_]+)"\s*\)')
 lit=re.compile(r'"(1|0|true|false|yes|no|on|off)"', re.I)
 finds=[]
 for p in files:
+    # `git ls-files` lists TRACKED paths, so a file deleted but not yet
+    # committed is listed and is not on disk. Skip it: there is nothing to
+    # scan (package BP, 2026-09-15 — deleting a crate made this check crash
+    # mid-run, which reads as a lint failure with no finding).
+    if not os.path.exists(f'{root}/{p}'):
+        continue
     raw=open(f'{root}/{p}',encoding='utf-8',errors='ignore').read()
     t=re.sub(r'(?m)^(\s*)//.*$', lambda m: m.group(1), raw)   # blank comment lines, keep line count
     lines=t.split('\n')

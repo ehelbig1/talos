@@ -1860,7 +1860,6 @@ dependencies = [
  "talos-search-service",
  "talos-secrets",
  "talos-secrets-manager",
- "talos-secrets-rotation",
  "talos-security-headers",
  "talos-session-brief-service",
  "talos-shutdown",
@@ -9409,16 +9408,6 @@ dependencies = [
  "tracing",
  "uuid",
  "zeroize",
-]
-
-[[package]]
-name = "talos-secrets-rotation"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "tracing",
- "uuid",
 ]
 
 [[package]]
