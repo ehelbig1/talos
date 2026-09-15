@@ -49,6 +49,15 @@ PROBE_IMAGE="${TALOS_UP_DISK_PROBE_IMAGE:-alpine}"
 # Hard deadline for EACH docker call, in tenths of a second. There are two
 # (inspect, then run), so the pathological worst case is twice this.
 DEADLINE_TENTHS="${TALOS_UP_DISK_DEADLINE_TENTHS:-10}"
+# Deadline for the REPORTING calls that only run once the disk is already over
+# the warn threshold (what is reclaimable, which prune flag this client knows).
+# Longer, because `docker system df` measured 0.95 s on a 126 GB VM — at the
+# edge of the probe deadline — and a figure that times out is just omitted.
+# The healthy path never pays it.
+INFO_DEADLINE_TENTHS="${TALOS_UP_DISK_INFO_DEADLINE_TENTHS:-30}"
+
+# shellcheck source=lib/docker-reclaim.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/docker-reclaim.sh"
 
 YEL=$'\033[1;33m'; RED=$'\033[1;31m'; DIM=$'\033[2m'; RST=$'\033[0m'
 
@@ -73,10 +82,16 @@ trap "rm -f '$probe_out'" EXIT
 # `make up` forever, which is a far worse outcome than the corrupted checkpoint
 # this script exists to prevent.
 run_with_deadline() { # $@ = docker args
+  run_with_deadline_tenths "$DEADLINE_TENTHS" "$@"
+}
+
+run_with_deadline_tenths() { # $1 = deadline in tenths, rest = docker args
+  local deadline="$1"
+  shift
   : >"$probe_out"
   docker "$@" >"$probe_out" 2>/dev/null &
   local pid=$! waited=0
-  while [ "$waited" -lt "$DEADLINE_TENTHS" ]; do
+  while [ "$waited" -lt "$deadline" ]; do
     kill -0 "$pid" 2>/dev/null || break
     sleep 0.1
     waited=$((waited + 1))
@@ -122,11 +137,32 @@ case "$used_pct" in
 esac
 [ "$used_pct" -le 100 ] 2>/dev/null || exit 0
 
+# What is reclaimable right now, one line per kind, or nothing if a figure
+# cannot be read in time. Shown next to the commands so an operator can tell
+# whether a command they ran did anything (2026-09-15: the first printed
+# command reclaimed 0 B at 95% disk and nothing on screen said why).
+reclaimable_lines() {
+  local images="" cache=""
+  if run_with_deadline_tenths "$INFO_DEADLINE_TENTHS" system df --format '{{.Type}}\t{{.Reclaimable}}'; then
+    images="$(awk -F'\t' '$1 == "Images" { print $2; exit }' "$probe_out" 2>/dev/null)"
+  fi
+  if run_with_deadline_tenths "$INFO_DEADLINE_TENTHS" buildx du; then
+    cache="$(awk '$1 == "Reclaimable:" { print $2; exit }' "$probe_out" 2>/dev/null)"
+  fi
+  [ -n "$images" ] && printf '%s  reclaimable now: images %s%s\n' "$DIM" "$images" "$RST"
+  [ -n "$cache" ] && printf '%s  reclaimable now: build cache %s%s\n' "$DIM" "$cache" "$RST"
+  return 0
+}
+
 remedies() {
+  local reserve
+  reserve="$(docker_prune_reserve_flag)"
+  reclaimable_lines
   printf '%s  reclaim, in this order (none of these touch your data volumes):%s\n' "$DIM" "$RST"
-  printf '%s    docker builder prune -f --keep-storage 20GB%s\n' "$DIM" "$RST"
-  printf '%s    docker image prune -f%s\n' "$DIM" "$RST"
+  printf '%s    docker image prune -f   # first: a layer an image still holds is not reclaimable build cache%s\n' "$DIM" "$RST"
+  printf '%s    docker builder prune -af %s 20GB%s\n' "$DIM" "$reserve" "$RST"
   printf '%s    docker builder prune -f --filter type=exec.cachemount   # last resort: full rebuild next time%s\n' "$DIM" "$RST"
+  printf '%s  re-check after each step: docker buildx du | tail -3%s\n' "$DIM" "$RST"
   printf '%s  do NOT run `docker volume prune` / `system prune --volumes` — that deletes the Postgres data volume.%s\n' "$DIM" "$RST"
 }
 

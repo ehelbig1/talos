@@ -4981,3 +4981,45 @@ unscoped transaction now pins the predicate alone.
 
 **Stated limits.** The GraphQL resolvers' rendering is not driven by a test;
 dropping the refusal would leave the outcome unused, which clippy refuses.
+
+### Package BI (2026-09-15) — the disk preflight's remedies, measured
+
+**How it was found.** Deploying #858, `make up` refused at 95% Docker disk. The
+operator ran the two printed commands: `docker builder prune -f --keep-storage
+20GB` reclaimed 0 B with a deprecation warning, and `docker image prune -f`
+deleted about 170 image records and reclaimed 0 B. `docker builder prune -af
+--reserved-space 20GB` then pruned private cache from 52.7 GB to 21.04 GB, and
+the deploy went ahead.
+
+**Measured, in order — and the first two readings were wrong:**
+- First reading: "without `-a`, `builder prune` only removes dangling cache."
+  Refuted: a plain `docker builder prune -f` then reclaimed 21.04 GB on the same
+  real cache. (It also removed the two cargo exec cache mounts, 3.8 GB.)
+- Second reading: "`--keep-storage`/`--reserved-space` alone is a no-op."
+  Refuted by a controlled experiment on throwaway 100 MB layers:
+  - threshold above the private size: 0 B, with or without `-a` (E1, E2, E3, E5);
+  - threshold below it: pruned down to the threshold, with or without `-a`, the
+    two spellings identical (E6, E8);
+  - an image present: its layers counted as 152 B private (E10).
+- The operator's 0 B was not reproduced at small scale. Reproducing it at scale
+  would mean rebuilding tens of GB of cache; not done.
+
+**Decisions.**
+- Do not claim the old commands never work. Print, and run in `make clean`, the
+  form proven at scale on this machine (`-af` with a reserve), with the flag
+  chosen from the client's own `builder prune --help`.
+- `docker image prune -f` first, because an image holds its layers out of the
+  reclaimable build cache.
+- Show `reclaimable now:` figures and a re-check command, so the next operator
+  whose command reclaims nothing can see it. Reporting calls only past the warn
+  threshold, behind their own deadline; an unreadable figure is omitted.
+- `doctor.sh`, `QUICKSTART.md` and the cache-mount recipe use plain
+  `docker builder prune -f`, which the measurement shows does reclaim; unchanged.
+
+**Guards.** A shell test with a fake `docker`, wired into CI. Nine mutations,
+all caught, after one survived on a fake that printed the same value on two
+lines.
+
+**Stated limits.** The unexplained 0 B. The figures come from `docker system
+df` and `docker buildx du`, whose own accounting (shared vs private) is what the
+experiment showed to be subtle.

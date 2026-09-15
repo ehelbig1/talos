@@ -483,8 +483,8 @@ migration-recovery: ## Re-run failed migrations job + tail logs in real time (NA
 
 clean: ## Stop containers, prune build caches (PRESERVES data volumes)
 	@docker compose down --rmi local
-	@docker builder prune --keep-storage 8gb -f
 	@docker image prune -f
+	@docker builder prune -af $$(bash scripts/lib/docker-reclaim.sh reserve-flag) 8gb
 
 nuke: ## DESTRUCTIVE — wipe containers, volumes, images, host target/. Requires TALOS_NUKE=yes
 	@if [ "$${TALOS_NUKE:-}" != "yes" ]; then \
