@@ -41,7 +41,6 @@ members = [
     "talos-shutdown",
     "talos-nats-tls",
     "talos-tenancy",
-    "talos-secrets-rotation",
     "talos-replay-guard",
     "talos-envelope-seal",
     "talos-worker-fleet",

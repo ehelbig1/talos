@@ -5242,3 +5242,33 @@ passes with it restored. A `pub` placeholder would not be reported — stated.
 **Recorded, not done.** `talos-secrets-rotation` and the stub
 `VaultSecretProvider` / `AwsSecretProvider` in `talos-secrets-manager` are the
 same shape.
+
+## Package BP — a rotation crate a SOC 2 control cited (2026-09-15)
+
+**How it was found.** Recorded as a sibling in package BO, picked by the
+operator.
+
+**Measured.** `talos-secrets-rotation` (415 lines, 13 tests) models a 90-day
+rotation with a 7-day grace period and `auto_rotate: true`, in memory, and is
+constructed nowhere — MCP-704 removed its only boot binding in May 2026 and kept
+the crate for a wiring that never came. Real rotation is operator-invoked in
+`talos-secrets-manager` behind the GraphQL security mutations.
+
+**The finding.** `docs/compliance/soc2-control-mapping.md` cited
+`controller/src/secrets_rotation.rs` — the shim over this placeholder — as
+evidence for CC6.2-07 "Secret rotation support". An auditor following the
+citation would have read a never-constructed tracker with `auto_rotate: true`.
+
+**What changed.** Deleted the crate, its shim, the workspace member, the
+controller dependency and its `mod` line. Re-pointed CC6.2-07 at the real entry
+points. Rewrote `docs/SECRETS_MANAGEMENT.md`'s monitoring section, which listed
+three metrics and four alerts that exist in no Rust or rule file — one of them a
+counter labelled by `key_path`, which this repo forbids.
+
+**Not deleted.** The `VaultSecretProvider` / `AwsSecretProvider` stubs in
+`talos-secrets-manager`: a named product direction, not a claimed control. Their
+comment now says so.
+
+**Found by the deletion.** Checks 90 and 91 enumerate files with `git ls-files`
+and open them from disk, so the staged deletion made the lint crash mid-run —
+exit 1 with no finding. Both now skip a tracked path that is not on disk.

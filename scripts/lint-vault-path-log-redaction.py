@@ -15,7 +15,7 @@ string literals are blanked before the field scan (so `event_kind =
 `// allow-raw-vault-path-log: <reason>` within 8 lines above.
 Exit 1 on findings; exit 2 (loud) if the scan matched NO tracing statement
 at all — a check over zero statements is a green tick over nothing."""
-import re, subprocess, sys
+import os, re, subprocess, sys
 root = sys.argv[1] if len(sys.argv) > 1 else '.'
 files=[p for p in subprocess.run(['git','ls-files','*.rs'],cwd=root,capture_output=True,text=True).stdout.split()
        if '/tests/' not in '/'+p and not p.endswith('_tests.rs') and '/examples/' not in p
@@ -61,6 +61,12 @@ def statement(t, start):
 
 finds=[]; scanned=0
 for p in files:
+    # `git ls-files` lists TRACKED paths, so a file deleted but not yet
+    # committed is listed and is not on disk. Skip it: there is nothing to
+    # scan (package BP, 2026-09-15 — deleting a crate made this check crash
+    # mid-run, which reads as a lint failure with no finding).
+    if not os.path.exists(f'{root}/{p}'):
+        continue
     raw=open(f'{root}/{p}',encoding='utf-8',errors='ignore').read()
     lines=raw.split('\n')
     lines=[re.sub(r'^(\s*)//.*$', r'\1', l) for l in lines]

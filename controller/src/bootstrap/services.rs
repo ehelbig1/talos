@@ -1114,7 +1114,9 @@ pub(crate) async fn build_platform_services(
     //   manager initialized" was the highest-priority lie: an operator
     //   relying on it would believe automatic JWT/DEK rotation is active
     //   when actual rotation lives in `SecretsManager::rotate_master_key`
-    //   / `rotate_dek` and runs ONLY when invoked manually.
+    //   / `rotate_dek` and runs ONLY when invoked manually. The crate itself
+    //   was DELETED 2026-09-15 (package BP) — nothing constructed it in the
+    //   four months after the boot binding went.
     // - `jobs::JobQueue::new(db_pool.clone(), 10)` — bound to
     //   `__job_queue`, never used; the crate's persistence layer was
     //   never exercised because no caller pushed jobs.
