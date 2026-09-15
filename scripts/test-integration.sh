@@ -776,6 +776,10 @@ CTRL_TESTS=(
     # ["abandoned-scaffold", "half-built-brief"], right: ["abandoned-scaffold"]`).
     # `common` DATABASE_URL harness ⇒ CTRL_TESTS, not TC_TESTS (sub-leg 64b).
     "stale_draft_advice_agreement_tests"
+    # Package BM (2026-09-15): MCP clone_actor and GraphQL cloneActor share one
+    # implementation — ceiling gate, actor limit, grant/budget/policy copy.
+    # `common` DATABASE_URL harness ⇒ CTRL_TESTS, not TC_TESTS (sub-leg 64b).
+    "actor_clone_parity_tests"
 )
 # 'talos_ctl' is now the migrated TEMPLATE: setup_test_context clones it into a
 # private per-test database (controller/tests/common::isolated_db_pool), so the

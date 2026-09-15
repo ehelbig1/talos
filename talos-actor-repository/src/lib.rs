@@ -230,29 +230,6 @@ pub struct ActorWorkflowCountsRow {
     pub active: i64,
 }
 
-/// Clone-source row returned by `get_actor_clone_source_scoped`.
-#[derive(Debug, sqlx::FromRow)]
-pub struct ActorCloneSourceRow {
-    pub name: String,
-    pub description: Option<String>,
-    pub max_capability_world: Option<String>,
-    /// See [`ActorCeilingColumns`] — copied verbatim onto the clone.
-    pub max_llm_tier: String,
-    pub egress_scope: Option<String>,
-    pub max_write_ceiling: String,
-}
-
-impl ActorCloneSourceRow {
-    /// The three ceilings as one value for `insert_actor_clone_scoped`.
-    pub fn ceilings(&self) -> ActorCeilingColumns {
-        ActorCeilingColumns {
-            max_llm_tier: self.max_llm_tier.clone(),
-            egress_scope: self.egress_scope.clone(),
-            max_write_ceiling: self.max_write_ceiling.clone(),
-        }
-    }
-}
-
 /// Action-log listing row (no `details` payload) returned by
 /// `list_action_log_scoped`.
 #[derive(Debug, sqlx::FromRow)]
@@ -319,6 +296,8 @@ pub struct UserCapabilityGrant {
 /// Source actor row returned by `get_source_actor_for_clone`.
 #[derive(Debug)]
 pub struct SourceActorCloneRow {
+    /// The source's name — the default clone name and the action-log text.
+    pub name: String,
     pub max_capability_world: String,
     pub description: Option<String>,
     pub secret_grants: Vec<String>,
@@ -332,9 +311,9 @@ pub struct SourceActorCloneRow {
 
 /// The three per-actor ceiling columns as their DB strings — `max_llm_tier`,
 /// `egress_scope` (nullable) and `max_write_ceiling` — read from one row and
-/// written to another without re-interpretation. Used by both clone paths
-/// (`get_source_actor_for_clone` → `insert_actor_with_grants_and_limit_check`,
-/// `get_actor_clone_source_scoped` → `insert_actor_clone_scoped`).
+/// written to another without re-interpretation. Used by the one clone path
+/// (`get_source_actor_for_clone` → `insert_actor_with_grants_and_limit_check`),
+/// which both MCP and GraphQL reach through `talos_actor_lifecycle_service::clone_actor`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorCeilingColumns {
     pub max_llm_tier: String,
@@ -1899,37 +1878,6 @@ impl ActorRepository {
         Ok(())
     }
 
-    /// `insert_actor_scoped` for a CLONE: the same org-scoped INSERT carrying
-    /// the source actor's three ceilings verbatim (2026-09-10). Kept separate
-    /// from the create path, which correctly takes the column defaults.
-    pub async fn insert_actor_clone_scoped(
-        &self,
-        conn: &mut sqlx::PgConnection,
-        actor_id: Uuid,
-        user_id: Uuid,
-        name: &str,
-        description: Option<&str>,
-        max_capability_world: &str,
-        ceilings: &ActorCeilingColumns,
-    ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO actors (id, user_id, name, description, max_capability_world, status, \
-                                 max_llm_tier, egress_scope, max_write_ceiling) \
-             VALUES ($1, $2, $3, $4, $5, 'active', $6, $7, $8)",
-        )
-        .bind(actor_id)
-        .bind(user_id)
-        .bind(name)
-        .bind(description)
-        .bind(max_capability_world)
-        .bind(&ceilings.max_llm_tier)
-        .bind(&ceilings.egress_scope)
-        .bind(&ceilings.max_write_ceiling)
-        .execute(conn)
-        .await?;
-        Ok(())
-    }
-
     /// Set an actor's status (ownership-gated), refusing terminal-state
     /// rows — the `status NOT IN ('archived','terminated')` guard makes
     /// the IRREVERSIBLE contract on terminate/archive unconditional
@@ -2047,28 +1995,6 @@ impl ActorRepository {
         .fetch_one(conn)
         .await?;
         Ok(exists)
-    }
-
-    /// Clone-source fields for a non-terminated actor the user owns.
-    /// Takes the caller's connection — the GraphQL clone mutation runs
-    /// this ownership read and the clone INSERT in ONE org-scoped tx.
-    pub async fn get_actor_clone_source_scoped(
-        &self,
-        conn: &mut sqlx::PgConnection,
-        actor_id: Uuid,
-        user_id: Uuid,
-    ) -> Result<Option<ActorCloneSourceRow>> {
-        let row = sqlx::query_as::<_, ActorCloneSourceRow>(
-            "SELECT name, description, max_capability_world, \
-                    max_llm_tier, egress_scope, max_write_ceiling \
-             FROM actors \
-             WHERE id = $1 AND user_id = $2 AND status != 'terminated'",
-        )
-        .bind(actor_id)
-        .bind(user_id)
-        .fetch_optional(conn)
-        .await?;
-        Ok(row)
     }
 
     /// Fetch actor action log entries with optional timestamp and action-type filters.
@@ -3109,7 +3035,10 @@ impl ActorRepository {
 
     // ── clone_actor helpers ────────────────────────────────────────────────
 
-    /// Fetch the fields needed to clone an actor (ownership-checked).
+    /// Fetch the fields needed to clone an actor (ownership-checked). A
+    /// TERMINATED actor is not a clone source: terminate is irreversible ("cannot
+    /// be reactivated"), and a clone carries its grants, ceilings and memories
+    /// into a new active actor (package BM; GraphQL already refused it, MCP did not).
     pub async fn get_source_actor_for_clone(
         &self,
         source_actor_id: Uuid,
@@ -3118,7 +3047,7 @@ impl ActorRepository {
         let row = sqlx::query(
             "SELECT name, description, max_capability_world, secret_grants, \
                     max_llm_tier, egress_scope, max_write_ceiling \
-             FROM actors WHERE id = $1 AND user_id = $2",
+             FROM actors WHERE id = $1 AND user_id = $2 AND status != 'terminated'",
         )
         .bind(source_actor_id)
         .bind(user_id)
@@ -3127,6 +3056,7 @@ impl ActorRepository {
 
         row.map(|r| -> Result<SourceActorCloneRow> {
             Ok(SourceActorCloneRow {
+                name: r.try_get("name")?,
                 max_capability_world: r.try_get("max_capability_world")?,
                 description: r.try_get::<Option<_>, _>("description")?,
                 secret_grants: r

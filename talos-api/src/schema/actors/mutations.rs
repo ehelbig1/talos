@@ -965,7 +965,15 @@ impl ActorsMutations {
         Ok(deleted > 0)
     }
 
-    /// Clone an actor, copying its semantic and episodic memories into the new actor.
+    /// Clone an actor with its capability world, ceilings, secret grants, budget policy, approval policies and semantic/episodic memories.
+    //
+    // Package BM (2026-09-15): this mutation — the one the web UI calls — had
+    // drifted from the MCP `clone_actor` tool into a different operation: no
+    // user capability-ceiling gate (revoking a grant does not lower existing
+    // actors, so a clone minted a new actor above it), no per-user actor limit,
+    // and the secret grants, budget policy (spend ceiling) and approval
+    // policies were silently DROPPED. Both surfaces now call
+    // `talos_actor_lifecycle_service::clone_actor`, one implementation.
     async fn clone_actor(
         &self,
         ctx: &Context<'_>,
@@ -979,200 +987,48 @@ impl ActorsMutations {
             .data_opt::<Uuid>()
             .copied()
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
-
         let db_pool = ctx.data::<sqlx::PgPool>()?;
 
-        // RFC 0006 / RFC 0005 S3: the source-actor ownership read + the
-        // clone INSERT share one tx scoped to the owner's personal org.
-        // actors are ORG-pinned, so the INSERT's WITH CHECK keys on
-        // `org_id = app.current_org_id` (the trg_set_org_id trigger stamps
-        // that same org on the new row). `begin_org_scoped` also sets the
-        // user GUC, so the ownership read below still matches via the
-        // policy's `user_id = current_user_id` clause. Commit before the
-        // memory copy below (it needs the new actor row).
-        let org_id =
-            talos_organizations::OrganizationService::create_personal_org(db_pool, user_id, None)
-                .await
-                .map_err(|e| {
-                    tracing::error!(error = %e, "graphql: resolve personal org error");
-                    async_graphql::Error::new("Request scope error").extend_safe()
-                })?
-                .id;
-        let mut tx =
-            talos_db::begin_org_scoped(db_pool, &talos_tenancy::OrgScope::new(org_id, user_id))
-                .await
-                .map_err(|e| {
-                    tracing::error!(error = %e, "graphql: tenant scope error");
-                    async_graphql::Error::new("Request scope error").extend_safe()
-                })?;
-
-        // Fetch source actor (ownership check) — repo method executes on
-        // the org-scoped tx we pass.
+        // A blank name keeps its historical meaning here: "use the default".
+        let new_name = name.filter(|n| !n.trim().is_empty());
         let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
-        let src = actor_repo
-            .get_actor_clone_source_scoped(&mut tx, id, user_id)
-            .await
-            .map_err(|e| {
-                tracing::error!(error = %e, "graphql: clone source read failed");
-                async_graphql::Error::new("Request could not be completed").extend_safe()
-            })?
-            .ok_or_else(|| {
-                async_graphql::Error::new("Actor not found or access denied").extend_safe()
-            })?;
-
-        // 2026-09-10: the source's `max_llm_tier` / `egress_scope` /
-        // `max_write_ceiling` travel with the clone (see the MCP twin
-        // `handle_clone_actor`). Pre-fix the INSERT took the column defaults —
-        // the widest posture — while the memories were copied beside it.
-        let src_ceilings = src.ceilings();
-        let src_name: String = src.name;
-        let src_description: Option<String> = src.description;
-        let src_world: Option<String> = src.max_capability_world;
-
-        let clone_name = name
-            .filter(|n| !n.trim().is_empty())
-            .unwrap_or_else(|| format!("Copy of {}", src_name));
-        if clone_name.len() > 100 {
-            return Err(async_graphql::Error::new("name must be ≤100 characters").extend_safe());
-        }
-
-        let new_id = uuid::Uuid::new_v4();
-        let world = src_world.as_deref().unwrap_or("minimal-node");
-
-        actor_repo
-            .insert_actor_clone_scoped(
-                &mut tx,
-                new_id,
+        let outcome = talos_actor_lifecycle_service::clone_actor(
+            db_pool,
+            &actor_repo,
+            talos_actor_lifecycle_service::CloneActorRequest {
                 user_id,
-                &clone_name,
-                src_description.as_deref(),
-                world,
-                &src_ceilings,
-            )
-            .await
-            .map_err(|e| {
-                tracing::error!("clone_actor insert failed: {}", e);
-                async_graphql::Error::new("Failed to clone actor").extend_safe()
-            })?;
-        tx.commit().await.map_err(|e| {
-            tracing::error!(error = %e, "graphql: commit transaction error");
-            async_graphql::Error::new("Request could not be completed").extend_safe()
+                source_actor_id: id,
+                new_name,
+                description_override: None,
+                origin: talos_actor_lifecycle_service::CloneOrigin::Dashboard,
+            },
+        )
+        .await
+        .map_err(|e| {
+            use talos_actor_lifecycle_service::CloneActorError as E;
+            match &e {
+                E::SourceUnreadable(inner)
+                | E::CeilingUnreadable(inner)
+                | E::InsertFailed(inner) => {
+                    tracing::error!(error = %inner, "graphql: clone_actor failed: {e}");
+                }
+                _ => {}
+            }
+            async_graphql::Error::new(e.user_facing_message()).extend_safe()
         })?;
 
-        // Copy semantic (permanent) and episodic (fresh 7-day TTL) memories
-        // through the canonical talos_memory entry point. The same-user gate it
-        // enforces is a tenancy boundary, not a crypto one (the DEK is global,
-        // not per-user); v1/v3 rows are decrypt+re-encrypted on copy to re-base
-        // their actor_id-bound AAD, v0 rows pass ciphertext through. Failures
-        // are logged but not fatal:
-        // the actor itself was already inserted above and the response
-        // includes `memories_copied=0` so the caller can detect partial
-        // success. (Pre-Phase-B regression class: silent SQL errors here
-        // were invisible without controller logs — the explicit warn closes
-        // that gap.)
-        // MCP-654: route through the SQL-gated wrapper instead of
-        // calling `talos_memory::clone_memories` directly. The wrapper
-        // re-verifies that BOTH actors belong to `user_id` in a single
-        // SELECT, defense-in-depth on top of the source-actor ownership
-        // check at the top of this handler. Mirrors the MCP-side
-        // `handle_clone_actor` path (`state.actor_repo.clone_actor_memories(...)`)
-        // — same cross-protocol parity class as MCP-647/648/649/650/651/652.
-        // Without this, a future refactor that decouples the
-        // source-actor-ownership probe from the actual call could let a
-        // ciphertext-passthrough cross-user clone slip through; the DEK
-        // lineage is per-user and the wrapper fails closed on mismatch.
-        //
-        // 2026-09-08: `memories_copied` is an `Option`, matching the MCP twin
-        // `handle_clone_actor`, which took the same fix on 2026-09-02. `None`
-        // means the copy could not be MEASURED; `Some(0)` means the source had
-        // nothing to copy. Two things turned on the difference and both were
-        // wrong here:
-        //
-        //  * the action-log line an operator later reads in
-        //    `get_actor_action_log` said "(0 memories copied)" for a copy that
-        //    FAILED, which is indistinguishable from a source actor with an
-        //    empty memory — and this mutation returns an `ActorSummary`, which
-        //    carries no field the caller could have checked instead;
-        //  * the backfill below was SKIPPED on failure, so any rows that DID
-        //    land before the error stayed permanently invisible to semantic
-        //    recall. An UNKNOWN count now runs it, bounded at the cap — the
-        //    MCP twin's rule, verbatim.
-        /// Same cap the MCP twin uses for an UNKNOWN copy count — a bounded
-        /// backfill is right when the number of rows that landed is unknown.
-        const MAX_CLONE_BACKFILL_ROWS_GQL: i64 = 10_000;
-
-        let actor_repo_for_clone = talos_actor_repository::ActorRepository::new(db_pool.clone());
-        let memories_copied: Option<i64> = match actor_repo_for_clone
-            .clone_actor_memories(user_id, new_id, id)
-            .await
-        {
-            Ok(n) => Some(n),
-            Err(e) => {
-                tracing::warn!(
-                    source_actor_id = %id,
-                    target_actor_id = %new_id,
-                    error = %e,
-                    "clone_actor (gql): bulk memory copy failed"
-                );
-                None
-            }
-        };
-
-        // The bulk copy skips embedding — trigger a targeted backfill
-        // so cloned memories are immediately searchable.
-        if memories_copied != Some(0) {
-            let backfill_cap = memories_copied.unwrap_or(MAX_CLONE_BACKFILL_ROWS_GQL);
-            let pool = db_pool.clone();
-            tokio::spawn(async move {
-                if let Err(e) = talos_actor_memory_service::backfill_embeddings_for_actor(
-                    &pool,
-                    new_id,
-                    backfill_cap.min(MAX_CLONE_BACKFILL_ROWS_GQL),
-                )
-                .await
-                {
-                    tracing::warn!(
-                        actor_id = %new_id,
-                        error = %e,
-                        "clone_actor (gql): post-clone backfill failed"
-                    );
-                }
-            });
+        if !outcome.readings.complete() {
+            // The actor exists but a post-commit copy could not be measured.
+            // `ActorSummary` carries no field for it; the action log on the new
+            // actor records which copies are unknown.
+            tracing::warn!(
+                actor_id = %outcome.new_actor_id,
+                not_measured = ?outcome.readings.not_measured(),
+                "graphql: clone_actor completed with unmeasured copies"
+            );
         }
 
-        talos_actor_repository::spawn_log_action(
-            db_pool.clone(),
-            new_id,
-            "created",
-            None,
-            None,
-            match memories_copied {
-                Some(n) => format!(
-                    "Actor cloned from '{}' ({} memories copied) via dashboard",
-                    src_name, n
-                ),
-                None => format!(
-                    "Actor cloned from '{}' (memory copy FAILED — count unknown, not zero) via dashboard",
-                    src_name
-                ),
-            },
-            Some(serde_json::json!({
-                "cloned_from": id,
-                "memories_copied": memories_copied,
-                "memory_copy_failed": memories_copied.is_none(),
-            })),
-        );
-        talos_actor_repository::spawn_log_action(
-            db_pool.clone(),
-            id,
-            "cloned",
-            None,
-            None,
-            format!("Actor cloned as '{}' via dashboard", clone_name),
-            Some(serde_json::json!({ "clone_id": new_id })),
-        );
-
-        super::helpers::fetch_actor_summary_post_mutation(db_pool, new_id, user_id)
+        super::helpers::fetch_actor_summary_post_mutation(db_pool, outcome.new_actor_id, user_id)
             .await
             .map_err(|e: sqlx::Error| e.extend_safe())
     }

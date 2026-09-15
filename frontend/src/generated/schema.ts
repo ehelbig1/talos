@@ -915,7 +915,7 @@ export type MutationRoot = {
    */
   ackOpsAlert: Scalars["Boolean"]["output"];
   approveExecution: Scalars["Boolean"]["output"];
-  /** Clone an actor, copying its semantic and episodic memories into the new actor. */
+  /** Clone an actor with its capability world, ceilings, secret grants, budget policy, approval policies and semantic/episodic memories. */
   cloneActor: ActorSummary;
   /**
    * Record a HUMAN severity correction — the distillation gold signal.

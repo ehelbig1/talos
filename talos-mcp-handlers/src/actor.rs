@@ -1205,22 +1205,10 @@ pub use talos_actor_repository::{spawn_log_action, spawn_log_admin_event};
 /// one rank of escalation on the left-hand side of every `ceiling_permits` gate
 /// this feeds. Callers refuse rather than guess.
 async fn user_max_world(pool: &sqlx::PgPool, user_id: Uuid) -> anyhow::Result<String> {
+    // One home, shared with the clone service (package BM). Unreadable is an
+    // error; an unrecognised stored value is the conservative `http-node`.
     let repo = talos_actor_repository::ActorRepository::new(pool.clone());
-    let row = repo.get_user_max_capability_world(user_id).await?;
-
-    Ok(match row.as_deref() {
-        Some(world) if talos_capability_world::is_actor_ceiling_world(world) => world.to_string(),
-        // Unrecognised grant value (legacy migration drift, direct
-        // SQL write) collapses to the conservative default. Fail-
-        // CLOSED on the over-permissive direction: `world_rank` would
-        // assign rank 7 (most-privileged) to an unknown string, but
-        // the actor ceiling check downstream uses this string back
-        // through `world_rank` so we'd silently grant tier-7.
-        // Returning "http-node" caps at rank 1 and forces the
-        // operator to investigate. Sibling pattern to MCP-461
-        // (`actor_world_rank_strict`).
-        _ => "http-node".to_string(),
-    })
+    talos_actor_lifecycle_service::user_capability_ceiling(&repo, user_id).await
 }
 
 /// Resolve `user_max_world` or produce the MCP error response. Keeps the three
@@ -1257,26 +1245,8 @@ macro_rules! user_ceiling_or_error {
 /// match that. Returns `Ok(())` on accept, `Err(message)` on reject.
 /// Caller wraps the error in `mcp_error(req_id, -32602, …)`.
 fn validate_actor_name(name: &str) -> Result<(), &'static str> {
-    if name.trim().is_empty() {
-        return Err("Actor name must be a non-empty, non-whitespace string");
-    }
-    if name.len() > 100 {
-        return Err("Actor name must be 1–100 characters");
-    }
-    // Predicate sourced from the canonical `talos-validation` crate
-    // (single source of truth shared with the GraphQL surface). The
-    // message stays a `&'static str` literal so this helper's error type
-    // is unchanged for its three callers.
-    if talos_validation::reject_control_chars(
-        "Actor name",
-        name,
-        talos_validation::LineMode::SingleLine,
-    )
-    .is_err()
-    {
-        return Err("Actor name cannot contain control characters or null bytes");
-    }
-    Ok(())
+    // One home, shared with the clone service and so with GraphQL (package BM).
+    talos_actor_lifecycle_service::validate_actor_name(name)
 }
 
 /// MCP-197 (2026-05-08): RFC-5321-light email validator.
@@ -5296,34 +5266,11 @@ async fn handle_clone_actor(
 
     let new_name = match args.get("new_name").and_then(|v| v.as_str()) {
         Some(n) => match validate_actor_name(n) {
-            Ok(()) => n,
+            Ok(()) => n.to_string(),
             Err(msg) => return mcp_error(req_id, -32602, msg),
         },
         None => return mcp_error(req_id, -32602, "Missing required field: new_name"),
     };
-
-    // Fetch source actor (ownership-checked)
-    let source = match state
-        .actor_repo
-        .get_source_actor_for_clone(source_actor_id, user_id)
-        .await
-    {
-        Ok(Some(r)) => r,
-        Ok(None) => return mcp_denied(req_id, -32000, "Source actor not found or access denied"),
-        Err(e) => {
-            tracing::error!("clone_actor fetch source: {:#}", e);
-            return crate::utils::database_error(req_id);
-        }
-    };
-
-    let source_max_world = source.max_capability_world;
-    let source_description = source.description;
-    let source_secret_grants = source.secret_grants;
-    // 2026-09-10: the source's privacy / mutation ceilings travel with the
-    // clone. Pre-fix the INSERT omitted them, so a clone of a `tier1` +
-    // `egress=local` + `readonly` actor came up `tier2` / public / `write` —
-    // while its memories were copied beside it.
-    let source_ceilings = source.ceilings;
 
     // Override description if caller provided one.
     //
@@ -5365,188 +5312,50 @@ async fn handle_clone_actor(
             }
         },
     };
-    let new_description = override_description.or(source_description);
-
-    // Human RBAC: enforce the requesting user's capability ceiling.
-    // Wasm-security review 2026-05-28 (HIGH): partial-order lattice gate — a
-    // user could previously clone an actor whose ceiling is a lattice-incomparable
-    // sibling of (not a subset of) their own.
-    let user_ceiling = user_ceiling_or_error!(req_id, &state.db_pool, user_id);
-    if !talos_capability_world::ceiling_permits(&user_ceiling, &source_max_world) {
-        return mcp_denied(
-            req_id,
-            -32603,
-            &format!(
-                "Your capability ceiling is '{}'. Cloning an actor with '{}' requires a higher grant.",
-                user_ceiling, source_max_world
-            ),
-        );
-    }
-
-    // MCP-401/434 (2026-05-11): atomic INSERT/COUNT with limit
-    // check. MCP-401 fixed the fail-OPEN on the count query but
-    // left the TOCTOU window between SELECT-COUNT and INSERT —
-    // N concurrent clones could each see `count = 999` and all
-    // successfully insert, collectively pushing the user from
-    // 999 to 999+N. MCP-434 added
-    // `insert_actor_with_grants_and_limit_check` which packs the
-    // COUNT into a `INSERT … SELECT … WHERE count < cap` so the
-    // race closes at the DB transaction layer. rows_affected == 0
-    // means either (a) the limit fired, or (b) we hit a unique
-    // constraint on name — disambiguate by checking the name
-    // collision before inserting. Same atomic pattern as
-    // create_actor's insert_actor_with_limit_check.
-    const MAX_ACTORS_PER_USER: i64 = 1000;
-    /// Upper bound on the post-clone embedding backfill. Also the cap used when
-    /// the copied-row count is UNKNOWN, so an unmeasurable clone still gets a
-    /// bounded backfill rather than none at all.
-    const MAX_CLONE_BACKFILL_ROWS: i64 = 10_000;
-
-    let new_actor_id = Uuid::new_v4();
-    let rows = match state
-        .actor_repo
-        .insert_actor_with_grants_and_limit_check(
-            new_actor_id,
+    // Package BM (2026-09-15): the clone itself — source read, the user
+    // capability-ceiling gate, the atomic limit-checked INSERT with grants and
+    // ceilings, and the budget / approval-policy / memory copies — has ONE home,
+    // shared with the GraphQL `cloneActor` mutation, which had drifted into a
+    // different operation (no ceiling gate, no limit, no grant/budget/policy
+    // copy). See `talos_actor_lifecycle_service::clone_actor`.
+    let outcome = match talos_actor_lifecycle_service::clone_actor(
+        &state.db_pool,
+        &state.actor_repo,
+        talos_actor_lifecycle_service::CloneActorRequest {
             user_id,
-            new_name,
-            new_description.as_deref(),
-            &source_max_world,
-            &source_secret_grants,
-            &source_ceilings,
-            MAX_ACTORS_PER_USER,
-        )
-        .await
+            source_actor_id,
+            new_name: Some(new_name),
+            description_override: override_description,
+            origin: talos_actor_lifecycle_service::CloneOrigin::Mcp,
+        },
+    )
+    .await
     {
-        Ok(n) => n,
-        Err(e) => {
-            let err_str = e.to_string();
-            if err_str.contains("unique") || err_str.contains("duplicate") {
-                return mcp_error(
-                    req_id,
-                    -32602,
-                    &format!("An actor named '{}' already exists", new_name),
-                );
-            }
-            tracing::error!("clone_actor insert: {:#}", e);
-            return mcp_error(req_id, -32000, "Failed to create cloned actor");
-        }
+        Ok(o) => o,
+        Err(e) => return clone_error_response(req_id, &e),
     };
-    if rows == 0 {
-        // INSERT silently filtered by the count gate. The unique
-        // constraint would have surfaced as an Err above, so the
-        // 0-row case here is the limit-hit case.
-        return mcp_error(
-            req_id,
-            -32602,
-            "Actor limit reached (1000). Delete unused actors before cloning.",
-        );
+
+    // The destination actor may have gained policies (or an UNKNOWN number of
+    // them) — invalidate its policy cache so the next evaluation reads them.
+    if outcome.approval_policies_copied != Some(0) {
+        state.policy_evaluator.invalidate(outcome.new_actor_id);
     }
-
-    // Copy budget + approval policies + memories from source actor.
-    //
-    // The actor row is already committed by this point, so a failure here
-    // cannot be rolled back — it produces a PARTIALLY cloned actor. The
-    // pre-2026-09-02 defaults reported that partial actor as a complete one:
-    // `budget_copied: false` / `approval_policies_copied: 0` are exactly what a
-    // source actor with no budget and no policies produces, and the response's
-    // own `next_steps` then told the operator to "Review the cloned budget" —
-    // which would show nothing and confirm the wrong story. A clone that
-    // silently drops the source's SPEND CEILING and its APPROVAL GATES is a
-    // governance regression, not a cosmetic one.
-    let mut readings = talos_measurement::Readings::new();
-
-    let budget_copied = readings.record(
-        "budget_copied",
-        state
-            .actor_repo
-            .copy_budget_policy(new_actor_id, source_actor_id)
-            .await,
-    );
-    let policies_copied = readings.record(
-        "approval_policies_copied",
-        state
-            .actor_repo
-            .copy_approval_policies(new_actor_id, source_actor_id)
-            .await,
-    );
-    // Invalidate on UNKNOWN as well as on a positive count. A failed bulk
-    // INSERT may still have committed rows before erroring, and a cache
-    // invalidation costs one miss — treating "we could not tell" as "definitely
-    // zero" is the assumption this whole change exists to remove.
-    if policies_copied != Some(0) {
-        // The destination actor just gained new policies via the bulk
-        // INSERT — invalidate its policy cache so the next evaluation
-        // picks them up instead of waiting out the TTL.
-        state.policy_evaluator.invalidate(new_actor_id);
-    }
-
-    // Semantic + episodic memories only (working/scratchpad excluded — ephemeral).
-    // Embedding is intentionally not copied; the post-clone backfill task
-    // regenerates them downstream.
-    let memories_copied = readings.record(
-        "memories_copied",
-        state
-            .actor_repo
-            .clone_actor_memories(user_id, new_actor_id, source_actor_id)
-            .await,
-    );
-
-    // The bulk COPY above preserves content but skips embedding
-    // computation, so cloned memories would be invisible to semantic
-    // recall until the nightly backfill runs. Fire a targeted backfill
-    // now on a detached task — it's best-effort and must not block the
-    // clone response.
-    //
-    // Same rule as the policy-cache invalidation above: an UNKNOWN count runs
-    // the backfill (bounded at the cap), because a swallowed error previously
-    // skipped it outright and left any rows that DID land permanently invisible
-    // to semantic recall.
-    if memories_copied != Some(0) {
-        let backfill_cap = memories_copied.unwrap_or(MAX_CLONE_BACKFILL_ROWS);
-        let pool = state.db_pool.clone();
-        tokio::spawn(async move {
-            if let Err(e) = talos_actor_memory_service::backfill_embeddings_for_actor(
-                &pool,
-                new_actor_id,
-                backfill_cap.min(MAX_CLONE_BACKFILL_ROWS),
-            )
-            .await
-            {
-                tracing::warn!(
-                    actor_id = %new_actor_id,
-                    error = %e,
-                    "clone_actor: post-clone backfill failed"
-                );
-            }
-        });
-    }
-
-    spawn_log_action(
-        state.db_pool.clone(),
-        new_actor_id,
-        "created",
-        None,
-        None,
-        format!("Actor '{}' cloned from '{}'", new_name, source_actor_id),
-        Some(
-            serde_json::json!({ "source_actor_id": source_actor_id, "max_capability_world": source_max_world }),
-        ),
-    );
 
     // `budget_copied` / `approval_policies_copied` / `memories_copied` are
     // `Option` here: `null` means the copy could not be measured, and the
     // `measurement` block `attach` adds names exactly which. `false` and `0`
-    // now mean only what they say — the source had nothing to copy.
+    // mean only what they say — the source had nothing to copy.
+    let new_actor_id = outcome.new_actor_id;
     let mut result = serde_json::json!({
             "actor_id": new_actor_id,
-            "name": new_name,
+            "name": outcome.name,
             "status": "active",
-            "max_capability_world": source_max_world,
+            "max_capability_world": outcome.max_capability_world,
             "cloned_from": source_actor_id.to_string(),
-            "budget_copied": budget_copied,
-            "approval_policies_copied": policies_copied,
-            "secret_grants_copied": source_secret_grants.len(),
-            "memories_copied": memories_copied,
+            "budget_copied": outcome.budget_copied,
+            "approval_policies_copied": outcome.approval_policies_copied,
+            "secret_grants_copied": outcome.secret_grants_copied,
+            "memories_copied": outcome.memories_copied,
             "memory_note": "Semantic and episodic memories were copied. Working and scratchpad memories were excluded (ephemeral, run-specific).",
             "next_steps": [
                 format!("Define this actor's persona with actor_remember if it should differ from the source"),
@@ -5555,11 +5364,41 @@ async fn handle_clone_actor(
                 format!("Review the cloned approval policies with list_actor_approval_policies(actor_id: '{}')", new_actor_id),
             ]
     });
-    readings.attach(&mut result);
+    outcome.readings.attach(&mut result);
     mcp_text(
         req_id,
         &serde_json::to_string_pretty(&result).unwrap_or_default(),
     )
+}
+
+/// Render a [`talos_actor_lifecycle_service::CloneActorError`]: refusals as
+/// denials, internal failures logged here and returned as the fixed text.
+fn clone_error_response(
+    req_id: Option<serde_json::Value>,
+    e: &talos_actor_lifecycle_service::CloneActorError,
+) -> JsonRpcResponse {
+    use talos_actor_lifecycle_service::CloneActorError as E;
+    match e {
+        E::SourceUnreadable(inner) => {
+            tracing::error!("clone_actor fetch source: {:#}", inner);
+            crate::utils::database_error(req_id)
+        }
+        E::CeilingUnreadable(inner) => {
+            tracing::error!(
+                target: "talos_mcp",
+                error = %inner,
+                "could not read capability grant — refusing rather than assuming the \
+                 default ceiling"
+            );
+            mcp_error(req_id, e.jsonrpc_code(), &e.user_facing_message())
+        }
+        E::InsertFailed(inner) => {
+            tracing::error!("clone_actor insert: {:#}", inner);
+            mcp_error(req_id, e.jsonrpc_code(), &e.user_facing_message())
+        }
+        _ if e.is_refusal() => mcp_denied(req_id, e.jsonrpc_code(), &e.user_facing_message()),
+        _ => mcp_error(req_id, e.jsonrpc_code(), &e.user_facing_message()),
+    }
 }
 
 // ────────────────────────────────────────────────────────────────────────────

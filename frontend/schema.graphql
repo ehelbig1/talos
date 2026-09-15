@@ -973,7 +973,7 @@ type MutationRoot {
 	"""
 	deleteActorMemory(actorId: UUID!, key: String!): Boolean!
 	"""
-	Clone an actor, copying its semantic and episodic memories into the new actor.
+	Clone an actor with its capability world, ceilings, secret grants, budget policy, approval policies and semantic/episodic memories.
 	"""
 	cloneActor(		id: UUID!,
 		"""
