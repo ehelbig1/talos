@@ -26,9 +26,15 @@
 
 #![forbid(unsafe_code)]
 
+mod clone;
 mod handoff;
 mod scaffold_args;
 
+pub use clone::{
+    check_clone_gates, clone_actor, user_capability_ceiling, validate_actor_name, CloneActorError,
+    CloneActorOutcome, CloneActorRequest, CloneOrigin, MAX_ACTORS_PER_USER,
+    MAX_CLONE_BACKFILL_ROWS,
+};
 pub use handoff::{HandoffError, HandoffOutcome};
 pub use scaffold_args::parse_scaffold_request;
 

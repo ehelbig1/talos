@@ -5151,3 +5151,33 @@ record.
 **Stated limits.** Uses are recorded at resolution, not at a confirmed send. The
 chain path still writes no ledger. First use only, no counts. The env-fallback
 source is not driven by a test.
+
+## Package BM — two operations named "clone actor" (2026-09-15)
+
+**How it was found.** A recorded side finding from the package BF survey
+("GraphQL `cloneActor` skips the user ceiling"), picked by the operator.
+
+**Measured.** Reading the two implementations side by side, the GraphQL mutation
+(called by the web UI's Actors page and actor summary panel) differed from MCP
+`clone_actor` in seven ways, not one: no user capability-ceiling gate; no
+per-user actor limit; secret grants, budget policy and approval policies not
+copied; name validation limited to length; and, in the other direction, a
+`terminated` source refused where MCP cloned it. Revoking a user's grant does
+not lower their existing actors, which is what makes the missing ceiling gate
+reachable. Reference fleet: 0 clones ever, one user with the top grant, 10
+actors — 5 with a budget policy, 1 terminated.
+
+**Decision (operator): one shared service.** Alternatives put: patch the
+GraphQL resolver (two copies remain), or the ceiling gate alone.
+
+**What changed.** `talos_actor_lifecycle_service::clone_actor` holds the whole
+sequence with the MCP handler's error codes and strings; both surfaces are thin
+callers; the GraphQL-only repository methods are deleted; the source read
+excludes terminated actors for both.
+
+**Guards.** Four gate unit tests, seven DB tests reading every outcome back from
+the tables, a textual pin on both call sites. Nine mutations, all caught.
+
+**Stated limits.** GraphQL `createActor`/`updateActor` still inline their own
+ceiling read. The GraphQL source read is no longer inside an org-scoped
+transaction (the `user_id` predicate remains; the INSERT is still org-scoped).

@@ -7,6 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+anyhow.workspace = true
 talos-execution-pause = { path = "../talos-execution-pause" }
 async-nats = "0.47"
 serde_json.workspace = true
@@ -21,6 +22,9 @@ talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-memory = { path = "../talos-memory" }
 talos-text-util = { path = "../talos-text-util" }
 talos-validation = { path = "../talos-validation" }
+talos-capability-world = { path = "../talos-capability-world" }
+talos-measurement = { path = "../talos-measurement" }
+talos-actor-memory-service = { path = "../talos-actor-memory-service" }
 
 # Talos crates — repositories
 talos-actor-repository = { path = "../talos-actor-repository" }
@@ -40,7 +44,6 @@ talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 
 [dev-dependencies]
-anyhow.workspace = true
 
 [lints]
 workspace = true
