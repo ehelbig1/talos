@@ -449,6 +449,52 @@ impl JudgeScoreStat {
     }
 }
 
+/// A human's decision on an `execution_approvals` row. A closed set: the
+/// status CHECK admits exactly these two decided values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalDecision {
+    Approved,
+    Denied,
+}
+
+impl ApprovalDecision {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Approved => "approved",
+            Self::Denied => "denied",
+        }
+    }
+}
+
+/// Outcome of [`ExecutionRepository::decide_execution_approval_scoped`].
+#[must_use = "an approval decision write whose outcome is dropped reports success for a refusal"]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApprovalDecisionWrite {
+    /// The pending row now carries the decision.
+    Decided,
+    /// The caller owns the row and it was already decided; nothing changed.
+    AlreadyDecided { status: String },
+    /// No such approval, or not the caller's.
+    NotFound,
+}
+
+impl ApprovalDecisionWrite {
+    /// The caller-facing refusal for a write that decided nothing, or `None`
+    /// for [`Self::Decided`]. `NotFound` keeps its pre-existing sentence (it
+    /// must not distinguish "absent" from "not yours").
+    #[must_use]
+    pub fn refusal_message(&self) -> Option<String> {
+        match self {
+            Self::Decided => None,
+            Self::AlreadyDecided { status } => Some(format!(
+                "Approval request was already {status}; an approval decision is final"
+            )),
+            Self::NotFound => Some("Approval request not found or access denied".to_string()),
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Repository
 // ─────────────────────────────────────────────────────────────────────────────
@@ -3657,29 +3703,59 @@ impl ExecutionRepository {
     /// policy backstops the `w.user_id = $1` gate (RFC 0005 S3 —
     /// execution_approvals has no policy itself). Do NOT route this through
     /// `self.db_pool`; that would silently drop the RLS backstop.
-    /// Returns rows affected (0 = not found or not owned).
+    ///
+    /// **A decision is final** (package BH, 2026-09-15). Until then this
+    /// statement had no `status = 'pending'` guard — its MCP sibling always
+    /// had one — so a denied approval could be re-decided as approved and the
+    /// denier's `decided_by` / `decided_at` / `reason` overwritten; with the
+    /// UI's decide-then-resume flow that was a path from a denial to a run.
+    /// The guard is here, and the rule's one home is the
+    /// `trg_execution_approvals_decision_final` trigger (migration
+    /// `20260915100000`), which refuses the change for any writer.
+    ///
+    /// Three-valued, because "already decided" and "not yours / not there"
+    /// are different answers: the second read runs only after the guarded
+    /// UPDATE matched nothing, inside the same transaction and behind the
+    /// same ownership JOIN, so it tells the OWNER the row's status and tells
+    /// anyone else nothing.
     pub async fn decide_execution_approval_scoped(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         approval_id: Uuid,
         user_id: Uuid,
-        decision_status: &str,
+        decision: ApprovalDecision,
         reason: Option<&str>,
-    ) -> Result<u64> {
+    ) -> Result<ApprovalDecisionWrite> {
         let result = sqlx::query(
             "UPDATE execution_approvals \
              SET status = $1, decided_at = NOW(), decided_by = $2, reason = $3 \
              FROM workflows w \
              WHERE execution_approvals.id = $4 \
+               AND execution_approvals.status = 'pending' \
                AND w.id = execution_approvals.workflow_id AND w.user_id = $2",
         )
-        .bind(decision_status)
+        .bind(decision.as_str())
         .bind(user_id)
         .bind(reason)
         .bind(approval_id)
         .execute(&mut **tx)
         .await?;
-        Ok(result.rows_affected())
+        if result.rows_affected() > 0 {
+            return Ok(ApprovalDecisionWrite::Decided);
+        }
+        let status: Option<String> = sqlx::query_scalar(
+            "SELECT a.status FROM execution_approvals a \
+             JOIN workflows w ON w.id = a.workflow_id \
+             WHERE a.id = $1 AND w.user_id = $2",
+        )
+        .bind(approval_id)
+        .bind(user_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        Ok(match status {
+            Some(status) => ApprovalDecisionWrite::AlreadyDecided { status },
+            None => ApprovalDecisionWrite::NotFound,
+        })
     }
 
     /// Workflow dead-letter-queue entries for a user, newest first. Takes

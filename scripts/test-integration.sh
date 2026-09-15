@@ -593,6 +593,11 @@ CTRL_TESTS=(
     # router and Gmail push never read it. Drives the one home, the row-creation
     # chokepoint and the scheduler's defer-not-drop claim against a real clone.
     "execution_pause_tests"
+    # An approval decision is FINAL (package BH, 2026-09-15): GraphQL
+    # approve/deny could overwrite a decided approval. Drives the guarded
+    # production write, the owner-only "already decided" answer and the
+    # trigger that refuses any writer changing a decision.
+    "approval_decision_finality_tests"
     "workflow_version_tests"
     # #609's closing provenance test (measurement PR 3, D7). Gated here on
     # arrival rather than later: it is the ONLY coverage of the promoted-vs-

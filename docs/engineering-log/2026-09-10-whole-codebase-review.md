@@ -4942,3 +4942,42 @@ byte-reverted, all caught.
 **Stated limits.** The handoff, GraphQL and contract gates are pinned, not
 driven. The Calendar and GCP handlers' 503 is pinned, not driven. Pins prove a
 spelling, not a behaviour.
+
+### Package BH (2026-09-15) — an approval decision is final
+
+**How it was found.** The 2026-09-14 GraphQL-vs-MCP authorization survey:
+`decide_execution_approval_scoped` (GraphQL approve/deny) had no
+`status = 'pending'` guard, while its MCP sibling did.
+
+**Measured, in order:**
+- Writers of `execution_approvals.status`: exactly two statements, both in
+  `talos-execution-repository`, plus the engine's `INSERT` of a pending row.
+  Nothing legitimately moves a decided row anywhere.
+- Rows: 6, all decided on 2026-07-21 (3 approved, 3 denied), all with a
+  reason; their executions have since been purged by retention. None pending.
+- Consequence: the web UI's approval queue calls only the decision mutation;
+  resuming is a separate `resumeWorkflow` from execution history, which
+  re-evaluates the gate against the row. So deny, then approve the same id,
+  then resume, runs the gated module — and the denier's `decided_by`,
+  `decided_at` and `reason` are gone. Owner-only: finality and audit
+  integrity, not tenancy.
+
+**Decisions.**
+- The rule's home is a `BEFORE UPDATE` trigger: a decided row's four decision
+  columns may not change, for any writer. SQLSTATE 23514. Other columns stay
+  writable; DELETE is not blocked.
+- Not named `trg_%_immutable`, because `security_audit` counts that name as
+  audit-table immutability.
+- The GraphQL statement is guarded, and its outcome is three-valued so the
+  owner is told "already denied" and anyone else keeps the not-found sentence.
+- Not changed: the two-step decide-then-resume UI flow; the MCP/link writer.
+
+**Guards.** Five DB tests. Nine mutations, including three against the
+migration (each rebuilt into a fresh pre-migration clone) and main's shape
+(no guard, no trigger): all caught — after one first survived. Deleting the
+ownership predicate from the "already decided" read stayed green because the
+scoped transaction's RLS policy also hides a stranger's workflow; a test on an
+unscoped transaction now pins the predicate alone.
+
+**Stated limits.** The GraphQL resolvers' rendering is not driven by a test;
+dropping the refusal would leave the outcome unused, which clippy refuses.

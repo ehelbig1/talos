@@ -141,8 +141,14 @@ impl ExecutionsMutations {
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
         let exec_repo = talos_execution_repository::ExecutionRepository::new(db_pool.clone());
-        let rows_affected = exec_repo
-            .decide_execution_approval_scoped(&mut tx, id, user_id, "approved", reason.as_deref())
+        let outcome = exec_repo
+            .decide_execution_approval_scoped(
+                &mut tx,
+                id,
+                user_id,
+                talos_execution_repository::ApprovalDecision::Approved,
+                reason.as_deref(),
+            )
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "graphql: approve_execution decision write failed");
@@ -153,11 +159,10 @@ impl ExecutionsMutations {
             async_graphql::Error::new("Request could not be completed").extend_safe()
         })?;
 
-        if rows_affected == 0 {
-            return Err(
-                async_graphql::Error::new("Approval request not found or access denied")
-                    .extend_safe(),
-            );
+        // A decision is final (package BH): an already-decided row is refused
+        // with its own sentence, not reported as absent.
+        if let Some(message) = outcome.refusal_message() {
+            return Err(async_graphql::Error::new(message).extend_safe());
         }
 
         Ok(true)
@@ -195,8 +200,14 @@ impl ExecutionsMutations {
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
         let exec_repo = talos_execution_repository::ExecutionRepository::new(db_pool.clone());
-        let rows_affected = exec_repo
-            .decide_execution_approval_scoped(&mut tx, id, user_id, "denied", reason.as_deref())
+        let outcome = exec_repo
+            .decide_execution_approval_scoped(
+                &mut tx,
+                id,
+                user_id,
+                talos_execution_repository::ApprovalDecision::Denied,
+                reason.as_deref(),
+            )
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "graphql: deny_execution decision write failed");
@@ -207,11 +218,10 @@ impl ExecutionsMutations {
             async_graphql::Error::new("Request could not be completed").extend_safe()
         })?;
 
-        if rows_affected == 0 {
-            return Err(
-                async_graphql::Error::new("Approval request not found or access denied")
-                    .extend_safe(),
-            );
+        // A decision is final (package BH): an already-decided row is refused
+        // with its own sentence, not reported as absent.
+        if let Some(message) = outcome.refusal_message() {
+            return Err(async_graphql::Error::new(message).extend_safe());
         }
 
         Ok(true)
