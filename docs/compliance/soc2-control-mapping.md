@@ -47,7 +47,7 @@ This document maps Talos platform security controls to SOC 2 Trust Services Crit
 | CC6.2-04 | TOTP 2FA enrollment | Encrypted TOTP seed storage via SecretsManager; QR code provisioning | `controller/src/totp_2fa.rs` (TotpService) |
 | CC6.2-05 | API key generation | Cryptographic random generation; `talos_sk_` prefix; SHA256 lookup hash + bcrypt verification | `controller/src/api_keys.rs` |
 | CC6.2-06 | Account lockout | 5 failed login attempts triggers lockout; `locked_until` timestamp | `controller/src/auth/mod.rs` (User struct), `controller/src/totp_2fa.rs` |
-| CC6.2-07 | Secret rotation support | DEK rotation (create new, re-encrypt); secret value rotation via API | `controller/src/secrets/mod.rs`, `controller/src/secrets_rotation.rs` |
+| CC6.2-07 | Secret rotation support | DEK rotation (create new, re-encrypt) + master-key rotation, both operator-invoked; secret value rotation via the GraphQL secrets mutations | `talos-secrets-manager` (`rotate_dek`, `rotate_dek_for_org`, `rotate_master_key`, `rotate_secret_value_by_id`), `talos-api/src/schema/security/mutations.rs` (`rotateDek`, `rotateMasterKey`, `rotateEncryptionKey`, the `reEncrypt*` sweeps) |
 | CC6.2-08 | Session revocation | Refresh token invalidation; JWT short-lived (15 min) | `controller/src/auth/mod.rs` |
 
 **Testing procedure:**

@@ -1047,5 +1047,4 @@ mod rpc_subscribers;
 
 // build test 1773350690
 
-mod secrets_rotation;
 mod tenancy;
