@@ -419,7 +419,12 @@ impl wit_webhook::Host for TalosContext {
                 .timeout(std::time::Duration::from_secs(30));
             for (k, v) in &headers {
                 let resolved = self
-                    .resolve_vault_header(k.as_str(), v.as_str())
+                    .resolve_vault_header(
+                        crate::context::SecretUseSurface::WebhookHeader,
+                        &host,
+                        k.as_str(),
+                        v.as_str(),
+                    )
                     .await
                     .map_err(|_| webhook_deny(self, reason_class::SECRET_LOOKUP))?;
                 req_builder = req_builder.header(k.as_str(), resolved.as_ref());

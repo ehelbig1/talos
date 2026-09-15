@@ -1106,7 +1106,12 @@ impl TalosContext {
                 // variant would be a WIT-level breaking change. Operators see the real
                 // reason in the WARN log emitted by check_secret_allowlist.
                 let resolved = self
-                    .resolve_vault_header(k.as_str(), v.as_str())
+                    .resolve_vault_header(
+                        crate::context::SecretUseSurface::GraphqlHeader,
+                        &target_host,
+                        k.as_str(),
+                        v.as_str(),
+                    )
                     .await
                     .map_err(|_| gql_deny(self, reason_class::SECRET_LOOKUP))?;
                 req_builder = req_builder.header(k.as_str(), resolved.as_ref());

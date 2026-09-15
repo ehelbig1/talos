@@ -5104,3 +5104,50 @@ ignored" only by live runs, which is why the negative CI run exists.
 it still fails through the generic branch). A server that accepts the connection
 and then drops it before the first marker is covered by the exit status, not by
 a test.
+
+## Package BL — credential uses the WORM ledger never recorded (2026-09-15)
+
+**How it was found.** A recorded side finding from the package BF survey
+("vault:// header resolution not in the WORM ledger"), picked by the operator
+after deploy 59.
+
+**Measured before designing.**
+- Since the 18:30Z controller boot the worker logged 27 `secret.resolve` lines,
+  every one a Gmail access token resolved into an `Authorization` header, across
+  7 executions. Each of those executions' prefixes in the `audit-logs` bucket
+  held exactly one event, `execution_complete`.
+- The whole bucket (60 618 prefixes, 717 MB): 61 111 `execution_complete`,
+  6 `wasi:capability_denied`, 1 `wasi:human_approval_request`. No event records
+  a credential being used.
+- The worker's ledger vocabulary: `capability_denied` (+ `_suppressed`),
+  `database_execute_query`, `human_approval_request`/`response`,
+  `secrets_expose`, `secrets_get`. Guest-initiated access and refusals were
+  ledgered; host-initiated credential egress (six header sites, LLM keys, email
+  key) was not.
+
+**Decision (operator): all egress, deduped.** Options put: all egress deduped
+(recommended), header sites only, or every resolution with no dedupe (a looping
+module mints a row and a NATS publish per request — the MCP-588 audit-pipeline
+DoS shape).
+
+**What changed.**
+- `wasi:secret_use` `{surface, key_hash, destination, source, header, actor_id,
+  module_id}`, once per distinct `(surface, key hash, destination)` per
+  execution; at 64 distinct uses one `wasi:secret_use_suppressed`, then silence.
+- `resolve_vault_header(surface, destination, header, value)`: the two new
+  parameters are required, so the compiler enumerated all six call sites.
+  Recorded on the success arm only.
+- `llm_key_with_use_recorded` serves both `get_llm_api_key` variants; the email
+  send records the `EMAIL_API_KEY` use against the API host.
+- `append_and_replicate` is the one append + NATS replication path for both
+  recorders.
+
+**Guards.** Eight unit tests, including the live Gmail shape, denied/failed
+controls, payload redaction, the cap, and a textual pin on host-internal lookup
+call sites. Ten mutations, all caught — after the LLM test was split per variant
+because one shared context let a reverted variant hide behind the other's
+record.
+
+**Stated limits.** Uses are recorded at resolution, not at a confirmed send. The
+chain path still writes no ledger. First use only, no counts. The env-fallback
+source is not driven by a test.

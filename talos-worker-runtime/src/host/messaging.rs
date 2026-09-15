@@ -236,7 +236,12 @@ impl wit_messaging::Host for TalosContext {
             }
             for (k, v) in &hdr_list {
                 let resolved = self
-                    .resolve_vault_header(k.as_str(), v.as_str())
+                    .resolve_vault_header(
+                        crate::context::SecretUseSurface::MessagingHeader,
+                        &msg.topic,
+                        k.as_str(),
+                        v.as_str(),
+                    )
                     .await
                     .map_err(|_| wit_messaging::Error::Publishfailed)?;
                 headers.insert(k.as_str(), resolved.as_ref());

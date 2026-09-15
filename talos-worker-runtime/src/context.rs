@@ -395,6 +395,12 @@ pub struct TalosContext {
     /// this execution. See [`Self::DENIAL_LEDGER_CAP`].
     pub(crate) denial_ledger_count: AtomicU64,
 
+    /// Distinct `(surface, key hash, destination)` credential uses already
+    /// written to the audit ledger this execution, so a module that sends the
+    /// same token to the same host in a loop records ONE `wasi:secret_use`, not
+    /// one per request. See [`Self::record_secret_use`].
+    pub(crate) secret_use_recorded: std::collections::HashSet<String>,
+
     /// The [`crate::reason_class`] token of the most recent host-side HTTP
     /// OUTCOME in this execution, or `None` if the most recent outcome was a
     /// success (or there has been none).
@@ -1123,6 +1129,88 @@ pub(crate) fn capability_world_has_fs_preopen(
     }
 }
 
+/// Which host path a credential leaves through — the `surface` of a
+/// `wasi:secret_use` audit event. A closed set so the ledger's vocabulary is
+/// fixed at compile time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SecretUseSurface {
+    HttpHeader,
+    GraphqlHeader,
+    HttpStreamHeader,
+    WebhookHeader,
+    MessagingHeader,
+    LlmProviderKey,
+    EmailApiKey,
+}
+
+impl SecretUseSurface {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::HttpHeader => "http-header",
+            Self::GraphqlHeader => "graphql-header",
+            Self::HttpStreamHeader => "http-stream-header",
+            Self::WebhookHeader => "webhook-header",
+            Self::MessagingHeader => "messaging-header",
+            Self::LlmProviderKey => "llm-provider-key",
+            Self::EmailApiKey => "email-api-key",
+        }
+    }
+}
+
+/// Where a credential's plaintext came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SecretSource {
+    /// The job's secret provider (a vault path).
+    Vault,
+    /// A worker environment variable fallback (the key is the variable NAME).
+    Env,
+}
+
+impl SecretSource {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Vault => "vault",
+            Self::Env => "env",
+        }
+    }
+}
+
+/// What [`TalosContext::record_secret_use`] does with one credential use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SecretUseAdmission {
+    /// A new `(surface, key, destination)`: write `wasi:secret_use`.
+    Record,
+    /// Already written this execution: nothing.
+    AlreadyRecorded,
+    /// The first new use past the cap: write ONE `wasi:secret_use_suppressed`.
+    RecordSuppression,
+    /// A new use after the suppression marker: nothing.
+    Suppressed,
+}
+
+/// Dedupe-and-cap decision over the set of uses already recorded. The set
+/// holds at most `cap` real entries plus one suppression sentinel, so its size
+/// is bounded whatever a module does.
+pub(crate) fn secret_use_admission(
+    seen: &mut std::collections::HashSet<String>,
+    key: String,
+    cap: usize,
+) -> SecretUseAdmission {
+    const SUPPRESSED: &str = "\u{0}suppressed";
+    if seen.contains(&key) {
+        return SecretUseAdmission::AlreadyRecorded;
+    }
+    let recorded = seen.len() - usize::from(seen.contains(SUPPRESSED));
+    if recorded < cap {
+        seen.insert(key);
+        SecretUseAdmission::Record
+    } else if seen.insert(SUPPRESSED.to_string()) {
+        SecretUseAdmission::RecordSuppression
+    } else {
+        SecretUseAdmission::Suppressed
+    }
+}
+
 impl TalosContext {
     /// Create a new execution context with an ephemeral file-system sandbox.
     ///
@@ -1419,6 +1507,7 @@ impl TalosContext {
             log_message_count: AtomicU64::new(0),
             host_diag_count: AtomicU64::new(0),
             denial_ledger_count: AtomicU64::new(0),
+            secret_use_recorded: std::collections::HashSet::new(),
             last_network_reason: Arc::new(std::sync::Mutex::new(None)),
             event_emit_count: AtomicU64::new(0),
             streams: StreamRegistry::new(),
@@ -1718,6 +1807,15 @@ impl TalosContext {
     /// legitimate run's denial count, and a bounded worst case for the ledger.
     pub(crate) const DENIAL_LEDGER_CAP: u64 = 200;
 
+    /// Cap on DISTINCT credential-use audit events per execution (package BL).
+    /// Measured on the reference fleet 2026-09-15: 27 host-side resolutions
+    /// across 7 executions, all one Gmail token to one host, so ONE distinct
+    /// use per execution is the steady state. 64 is the per-request outbound
+    /// header cap: a single request cannot carry more distinct `vault://`
+    /// references than that. At the cap one `wasi:secret_use_suppressed` is
+    /// appended and later new uses are resolved but not recorded.
+    pub(crate) const SECRET_USE_LEDGER_CAP: usize = 64;
+
     /// Publish a sanitized host-side diagnostic into the per-execution
     /// log stream — the same `wasm.log.{execution_id}` channel guest
     /// `logging::log` uses, marked `source: "host"` — so it lands in
@@ -1924,9 +2022,9 @@ impl TalosContext {
             &format!("{capability} denied by policy '{policy}' (target: {target})"),
         )
         .await;
-        let Some(ledger_mutex) = &self.audit_ledger else {
+        if self.audit_ledger.is_none() {
             return;
-        };
+        }
 
         // Bound the ledger + publish fan-out (see `DENIAL_LEDGER_CAP`). The
         // DENY itself is unconditional and already happened at the call site;
@@ -1972,9 +2070,25 @@ impl TalosContext {
             return;
         };
 
+        self.append_and_replicate(action, &payload, capability)
+            .await;
+    }
+
+    /// Append one `worker` event to this execution's audit ledger and
+    /// replicate it to the WORM stream (`talos.audit.ledger`). Returns the
+    /// appended event, or `None` when no ledger is wired. `label` names the
+    /// event in the replication-failure WARN. One home for both recorders
+    /// (`record_capability_denied`, `record_secret_use`).
+    async fn append_and_replicate(
+        &mut self,
+        action: &str,
+        payload: &str,
+        label: &str,
+    ) -> Option<crate::audit::AuditEvent> {
+        let ledger_mutex = self.audit_ledger.as_ref()?;
         let event = {
             let mut ledger = ledger_mutex.lock().await;
-            ledger.append("worker", action, &payload)
+            ledger.append("worker", action, payload)
         };
 
         if let Some(n) = &self.nats_client {
@@ -1991,7 +2105,8 @@ impl TalosContext {
             // through publish) — fire-and-forget for the guest, but
             // operators need WARN-level visibility on systemic
             // failures.
-            let capability_label = capability.to_string();
+            let label = label.to_string();
+            let event = event.clone();
             tokio::spawn(async move {
                 let hash = event.calculate_hash();
                 let msg = serde_json::json!({
@@ -2009,19 +2124,95 @@ impl TalosContext {
                         {
                             tracing::warn!(
                                 target: "talos_rpc",
-                                capability = %capability_label,
+                                event = %label,
                                 error = %e,
-                                "audit-ledger NATS replication failed (capability_denied) — local ledger unaffected, SIEM stream will miss this event"
+                                "audit-ledger NATS replication failed — local ledger unaffected, SIEM stream will miss this event"
                             );
                         }
                     }
                     Err(e) => tracing::error!(
+                        event = %label,
                         error = %e,
-                        "Failed to serialize capability_denied audit event"
+                        "Failed to serialize audit event"
                     ),
                 }
             });
         }
+        Some(event)
+    }
+
+    /// Record that a resolved CREDENTIAL is about to leave the host (package
+    /// BL, 2026-09-15).
+    ///
+    /// Before this, the WORM ledger recorded guest `get_secret` calls and every
+    /// DENIED resolution, but not one host-initiated credential USE: a
+    /// `vault://` token spliced into an outbound header, an LLM provider key,
+    /// the email API key. Measured over the whole reference audit bucket
+    /// (60 618 execution prefixes): 61 111 `execution_complete`, 6
+    /// `capability_denied`, 1 approval request — and zero events saying a
+    /// credential went anywhere, while the worker resolved a Gmail token into
+    /// an `Authorization` header roughly 1 300 times a day. The ledger could say
+    /// what a module was refused and never what it was given.
+    ///
+    /// ONE event per distinct `(surface, key hash, destination)` per execution
+    /// (a loop sending one token to one host records once — the per-request
+    /// cost stays a set lookup), up to [`Self::SECRET_USE_LEDGER_CAP`], then a
+    /// single `wasi:secret_use_suppressed`. The payload carries the key-path
+    /// SHA-256 (never the path: operators reading the ledger must not learn
+    /// vault layout) and the destination HOST (never the URL, whose query
+    /// string can carry data). Call only AFTER the plaintext is in hand — a
+    /// failed or denied resolution is not a use.
+    pub(crate) async fn record_secret_use(
+        &mut self,
+        surface: SecretUseSurface,
+        destination: &str,
+        key_name: &str,
+        source: SecretSource,
+        header_name: Option<&str>,
+    ) -> Option<crate::audit::AuditEvent> {
+        self.audit_ledger.as_ref()?;
+        let key_hash = format!(
+            "{:x}",
+            <sha2::Sha256 as sha2::Digest>::digest(key_name.as_bytes())
+        );
+        let dedupe = format!("{}|{}|{}", surface.as_str(), key_hash, destination);
+        let action = match secret_use_admission(
+            &mut self.secret_use_recorded,
+            dedupe,
+            Self::SECRET_USE_LEDGER_CAP,
+        ) {
+            SecretUseAdmission::AlreadyRecorded | SecretUseAdmission::Suppressed => return None,
+            SecretUseAdmission::Record => "wasi:secret_use",
+            SecretUseAdmission::RecordSuppression => {
+                tracing::warn!(
+                    module_id = ?self.module_id,
+                    cap = Self::SECRET_USE_LEDGER_CAP,
+                    "credential-use audit cap reached — further distinct credential uses in \
+                     this execution are allowed but not individually recorded"
+                );
+                "wasi:secret_use_suppressed"
+            }
+        };
+        let payload = if action == "wasi:secret_use" {
+            serde_json::json!({
+                "surface": surface.as_str(),
+                "key_hash": key_hash,
+                "destination": destination,
+                "source": source.as_str(),
+                "header": header_name,
+                "actor_id": self.actor_id.map(|u| u.to_string()),
+                "module_id": self.module_id.as_deref(),
+            })
+        } else {
+            serde_json::json!({
+                "suppressed_after": Self::SECRET_USE_LEDGER_CAP,
+                "last_surface": surface.as_str(),
+                "actor_id": self.actor_id.map(|u| u.to_string()),
+                "module_id": self.module_id.as_deref(),
+            })
+        }
+        .to_string();
+        self.append_and_replicate(action, &payload, action).await
     }
 
     /// Write-ceiling gate for data-mutating host ops.
@@ -3153,5 +3344,377 @@ impl TalosContext {
                 .await?;
             Ok(mgr.clone())
         }
+    }
+}
+
+/// Package BL: a credential the host resolves and sends out is recorded in the
+/// WORM ledger — once per (surface, key, destination) per execution, capped —
+/// and a denied or failed resolution is not.
+#[cfg(test)]
+mod secret_use_ledger_tests {
+    use super::*;
+    use crate::wit_inspector::CapabilityWorld;
+    use std::collections::HashSet;
+    use talos_workflow_job_protocol::LlmTier;
+
+    const PATH: &str = "oauth/gmail/00000000-0000-0000-0000-000000000000/acct/access_token";
+
+    fn ctx_with_secret() -> (
+        TalosContext,
+        Arc<tokio::sync::Mutex<crate::audit::ExecutionLedger>>,
+    ) {
+        let mut secrets = HashMap::new();
+        secrets.insert(PATH.to_string(), "tok-plaintext".to_string());
+        let mut c = TalosContext::new(
+            CapabilityWorld::Http,
+            vec!["gmail.googleapis.com".to_string()],
+            vec![],
+            128,
+            secrets,
+            None,
+            None,
+            false,
+            None,
+            Arc::new(crate::expose_fallback::ExposeFallback::new()),
+            LlmTier::Tier2,
+            None,
+        )
+        .expect("context builds");
+        c.set_allowed_secrets(vec!["oauth/gmail".to_string()]);
+        let ledger = Arc::new(tokio::sync::Mutex::new(crate::audit::ExecutionLedger::new(
+            "wf", "ex",
+        )));
+        c.set_audit_ledger(ledger.clone());
+        (c, ledger)
+    }
+
+    async fn seq(l: &Arc<tokio::sync::Mutex<crate::audit::ExecutionLedger>>) -> u64 {
+        l.lock().await.current_sequence
+    }
+
+    #[test]
+    fn admission_dedupes_caps_and_suppresses_once() {
+        let mut seen = HashSet::new();
+        assert_eq!(
+            secret_use_admission(&mut seen, "a".into(), 2),
+            SecretUseAdmission::Record
+        );
+        assert_eq!(
+            secret_use_admission(&mut seen, "a".into(), 2),
+            SecretUseAdmission::AlreadyRecorded
+        );
+        assert_eq!(
+            secret_use_admission(&mut seen, "b".into(), 2),
+            SecretUseAdmission::Record
+        );
+        assert_eq!(
+            secret_use_admission(&mut seen, "c".into(), 2),
+            SecretUseAdmission::RecordSuppression
+        );
+        for k in ["d", "e", "f"] {
+            assert_eq!(
+                secret_use_admission(&mut seen, k.into(), 2),
+                SecretUseAdmission::Suppressed
+            );
+        }
+        // An already-recorded use stays silent past the cap too.
+        assert_eq!(
+            secret_use_admission(&mut seen, "a".into(), 2),
+            SecretUseAdmission::AlreadyRecorded
+        );
+        assert_eq!(
+            seen.len(),
+            3,
+            "cap entries plus one sentinel, whatever a module does"
+        );
+    }
+
+    /// The live shape: a Gmail token spliced into an Authorization header.
+    #[tokio::test]
+    async fn a_resolved_header_credential_is_ledgered_once_per_destination() {
+        let (mut c, ledger) = ctx_with_secret();
+        let header = format!("Bearer vault://{PATH}");
+
+        let out = c
+            .resolve_vault_header(
+                SecretUseSurface::HttpHeader,
+                "gmail.googleapis.com",
+                "Authorization",
+                &header,
+            )
+            .await
+            .expect("resolves");
+        assert_eq!(out, "Bearer tok-plaintext");
+        assert_eq!(seq(&ledger).await, 1, "the use is recorded");
+
+        // Same credential, same host, again: the loop case — no new row.
+        for _ in 0..5 {
+            c.resolve_vault_header(
+                SecretUseSurface::HttpHeader,
+                "gmail.googleapis.com",
+                "Authorization",
+                &header,
+            )
+            .await
+            .expect("resolves");
+        }
+        assert_eq!(seq(&ledger).await, 1);
+
+        // A different destination and a different surface are distinct uses.
+        c.resolve_vault_header(
+            SecretUseSurface::HttpHeader,
+            "other.example.com",
+            "Authorization",
+            &header,
+        )
+        .await
+        .expect("resolves");
+        c.resolve_vault_header(
+            SecretUseSurface::WebhookHeader,
+            "gmail.googleapis.com",
+            "Authorization",
+            &header,
+        )
+        .await
+        .expect("resolves");
+        assert_eq!(seq(&ledger).await, 3);
+    }
+
+    /// CONTROLS: a header with no reference, a denied path and a path the
+    /// provider cannot resolve are not uses.
+    #[tokio::test]
+    async fn denied_failed_and_plain_headers_record_no_use() {
+        let (mut c, ledger) = ctx_with_secret();
+        c.resolve_vault_header(
+            SecretUseSurface::HttpHeader,
+            "h",
+            "Accept",
+            "application/json",
+        )
+        .await
+        .expect("plain header passes through");
+        assert_eq!(seq(&ledger).await, 0);
+
+        // Not in allowed_secrets: a DENIAL row, not a use.
+        let denied = c
+            .resolve_vault_header(
+                SecretUseSurface::HttpHeader,
+                "h",
+                "Authorization",
+                "Bearer vault://stripe/api_key",
+            )
+            .await;
+        assert!(denied.is_err());
+        assert_eq!(
+            c.denial_ledger_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert!(c.secret_use_recorded.is_empty(), "a denial is not a use");
+
+        // Allowed prefix, but nothing to resolve.
+        let before = seq(&ledger).await;
+        let missing = c
+            .resolve_vault_header(
+                SecretUseSurface::HttpHeader,
+                "h",
+                "Authorization",
+                "Bearer vault://oauth/gmail/nobody/access_token",
+            )
+            .await;
+        assert!(missing.is_err());
+        assert_eq!(
+            seq(&ledger).await,
+            before,
+            "a failed resolution is not a use"
+        );
+        assert!(c.secret_use_recorded.is_empty());
+    }
+
+    /// The payload names the key by hash and the destination by host, never
+    /// the vault path or the plaintext.
+    #[tokio::test]
+    async fn the_event_carries_a_key_hash_and_never_the_path_or_value() {
+        let (mut c, _ledger) = ctx_with_secret();
+        let event = c
+            .record_secret_use(
+                SecretUseSurface::HttpHeader,
+                "gmail.googleapis.com",
+                PATH,
+                SecretSource::Vault,
+                Some("Authorization"),
+            )
+            .await
+            .expect("recorded");
+        assert_eq!(event.action, "wasi:secret_use");
+        assert_eq!(event.actor, "worker");
+        let p: serde_json::Value = serde_json::from_str(&event.payload).unwrap();
+        let expected_hash = format!(
+            "{:x}",
+            <sha2::Sha256 as sha2::Digest>::digest(PATH.as_bytes())
+        );
+        assert_eq!(p["key_hash"], expected_hash);
+        assert_eq!(p["surface"], "http-header");
+        assert_eq!(p["destination"], "gmail.googleapis.com");
+        assert_eq!(p["source"], "vault");
+        assert_eq!(p["header"], "Authorization");
+        assert!(!event.payload.contains("oauth/gmail"), "{}", event.payload);
+        assert!(
+            !event.payload.contains("tok-plaintext"),
+            "{}",
+            event.payload
+        );
+    }
+
+    /// Past the cap: exactly one suppression row, then silence.
+    #[tokio::test]
+    async fn distinct_uses_past_the_cap_collapse_into_one_suppression_event() {
+        let (mut c, ledger) = ctx_with_secret();
+        let n = TalosContext::SECRET_USE_LEDGER_CAP + 10;
+        let mut last = None;
+        for i in 0..n {
+            if let Some(e) = c
+                .record_secret_use(
+                    SecretUseSurface::HttpHeader,
+                    &format!("h{i}"),
+                    PATH,
+                    SecretSource::Vault,
+                    None,
+                )
+                .await
+            {
+                last = Some(e);
+            }
+        }
+        assert_eq!(
+            seq(&ledger).await,
+            TalosContext::SECRET_USE_LEDGER_CAP as u64 + 1
+        );
+        assert_eq!(last.expect("events").action, "wasi:secret_use_suppressed");
+    }
+
+    /// An external LLM provider key resolved from the job's secrets is a use;
+    /// the tier-1 refusal of the same provider is not.
+    #[tokio::test]
+    async fn an_llm_provider_key_is_ledgered_and_a_tier1_refusal_is_not() {
+        let mut secrets = HashMap::new();
+        secrets.insert("anthropic/api_key".to_string(), "sk-ant-test".to_string());
+        let mk = |tier| {
+            TalosContext::new(
+                CapabilityWorld::Agent,
+                vec![],
+                vec![],
+                128,
+                secrets.clone(),
+                None,
+                None,
+                false,
+                None,
+                Arc::new(crate::expose_fallback::ExposeFallback::new()),
+                tier,
+                None,
+            )
+            .expect("context builds")
+        };
+        let mut c = mk(LlmTier::Tier2);
+        let ledger = Arc::new(tokio::sync::Mutex::new(crate::audit::ExecutionLedger::new(
+            "wf", "ex",
+        )));
+        c.set_audit_ledger(ledger.clone());
+        assert_eq!(
+            c.get_llm_api_key_by_name("Anthropic").await.as_deref(),
+            Some("sk-ant-test")
+        );
+        assert_eq!(seq(&ledger).await, 1);
+        assert!(c
+            .secret_use_recorded
+            .iter()
+            .any(|k| k.starts_with("llm-provider-key|") && k.ends_with("|anthropic")));
+        // The enum-keyed variant, on its own context, records independently.
+        let mut e = mk(LlmTier::Tier2);
+        let le = Arc::new(tokio::sync::Mutex::new(crate::audit::ExecutionLedger::new(
+            "wf", "ex",
+        )));
+        e.set_audit_ledger(le.clone());
+        e.get_llm_api_key(crate::host::wit_llm::Provider::Anthropic)
+            .await
+            .expect("resolves");
+        assert_eq!(seq(&le).await, 1, "get_llm_api_key records too");
+        // And a repeat on the first context adds nothing.
+        c.get_llm_api_key_by_name("anthropic")
+            .await
+            .expect("resolves");
+        assert_eq!(seq(&ledger).await, 1);
+
+        // CONTROL: the tier-1 ceiling refuses before any key is resolved.
+        let mut t1 = mk(LlmTier::Tier1);
+        let l1 = Arc::new(tokio::sync::Mutex::new(crate::audit::ExecutionLedger::new(
+            "wf", "ex",
+        )));
+        t1.set_audit_ledger(l1.clone());
+        assert!(t1.get_llm_api_key_by_name("anthropic").await.is_none());
+        assert!(t1.secret_use_recorded.is_empty(), "a refusal is not a use");
+    }
+
+    /// TEXTUAL pin (stated): the two host-internal plaintext lookups have
+    /// exactly the call sites that record a use. A new caller of either must
+    /// record one — or change this count and say why.
+    #[test]
+    fn host_internal_secret_lookups_are_all_recorded() {
+        let vault = include_str!("host/vault.rs");
+        let email = include_str!("host/email.rs");
+        let raw_calls = vault.matches("self.resolve_raw_vault_secret(").count();
+        assert_eq!(raw_calls, 1, "resolve_raw_vault_secret callers in vault.rs");
+        assert!(vault.contains("async fn llm_key_with_use_recorded("));
+        let host_calls: usize = [
+            include_str!("host/email.rs"),
+            include_str!("host/llm.rs"),
+            include_str!("host/llm_tools.rs"),
+            include_str!("host/llm_streaming.rs"),
+            include_str!("host/http.rs"),
+            include_str!("host/webhook.rs"),
+            include_str!("host/graphql.rs"),
+            include_str!("host/messaging.rs"),
+        ]
+        .iter()
+        .map(|f| f.matches(".get_host_secret(").count())
+        .sum();
+        assert_eq!(
+            host_calls, 2,
+            "get_host_secret callers (EMAIL_API_URL, EMAIL_API_KEY)"
+        );
+        assert!(email.contains("SecretUseSurface::EmailApiKey"));
+    }
+
+    /// No ledger wired (a test or a stripped runtime): nothing recorded and no
+    /// dedupe state accumulates.
+    #[tokio::test]
+    async fn without_a_ledger_nothing_is_recorded() {
+        let mut c = TalosContext::new(
+            CapabilityWorld::Http,
+            vec![],
+            vec![],
+            128,
+            HashMap::new(),
+            None,
+            None,
+            false,
+            None,
+            Arc::new(crate::expose_fallback::ExposeFallback::new()),
+            LlmTier::Tier2,
+            None,
+        )
+        .expect("context builds");
+        assert!(c
+            .record_secret_use(
+                SecretUseSurface::HttpHeader,
+                "h",
+                PATH,
+                SecretSource::Vault,
+                None
+            )
+            .await
+            .is_none());
+        assert!(c.secret_use_recorded.is_empty());
     }
 }

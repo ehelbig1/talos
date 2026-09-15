@@ -471,7 +471,12 @@ impl wit_http_stream::Host for TalosContext {
             let mut hdrs = Vec::with_capacity(headers.len());
             for (k, v) in &headers {
                 let resolved = self
-                    .resolve_vault_header(k.as_str(), v.as_str())
+                    .resolve_vault_header(
+                        crate::context::SecretUseSurface::HttpStreamHeader,
+                        &host,
+                        k.as_str(),
+                        v.as_str(),
+                    )
                     .await
                     .map_err(|_| stream_deny_forbidden(self, reason_class::SECRET_LOOKUP))?;
                 hdrs.push((k.clone(), resolved.into_owned()));

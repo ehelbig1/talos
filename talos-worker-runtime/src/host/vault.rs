@@ -5,6 +5,7 @@
 //! GraphQL, Webhook and NATS host functions.
 
 use super::*;
+use crate::context::{SecretSource, SecretUseSurface};
 
 // ============================================================================
 // Vault path allowlist matcher
@@ -470,6 +471,8 @@ impl TalosContext {
     /// emit signed audit events from the deny paths. Both fixed here.
     pub(crate) async fn resolve_vault_header<'a>(
         &mut self,
+        surface: SecretUseSurface,
+        destination: &str,
         header_name: &str,
         value: &'a str,
     ) -> Result<std::borrow::Cow<'a, str>, String> {
@@ -624,6 +627,17 @@ impl TalosContext {
                         } else {
                             (*plaintext).clone()
                         };
+                        // The credential is in hand and about to go out: ledger
+                        // the use (package BL). Denied and failed resolutions
+                        // above never reach this line.
+                        self.record_secret_use(
+                            surface,
+                            destination,
+                            vault_path,
+                            SecretSource::Vault,
+                            Some(header_name),
+                        )
+                        .await;
                         Ok(std::borrow::Cow::Owned(out))
                     }
                     Err(e) => {
@@ -813,10 +827,8 @@ impl TalosContext {
             LlmTierDecision::Allowed => {}
         }
         let (vault_path, env_name) = llm_key_lookup_paths(provider_name)?;
-        if let Some(v) = self.resolve_raw_vault_secret(vault_path).await {
-            return Some(v);
-        }
-        std::env::var(env_name).ok().filter(|v| !v.is_empty())
+        self.llm_key_with_use_recorded(provider_name, vault_path, env_name)
+            .await
     }
 
     /// String-keyed variant used by llm-tools / llm-streaming, whose WIT Provider
@@ -839,9 +851,40 @@ impl TalosContext {
             LlmTierDecision::Allowed => {}
         }
         let (vault_path, env_name) = llm_key_lookup_paths(provider_name)?;
+        self.llm_key_with_use_recorded(provider_name, vault_path, env_name)
+            .await
+    }
+
+    /// Resolve an LLM provider key (vault first, then the worker env) and
+    /// ledger the use — ONE home for both `get_llm_api_key` variants, so a
+    /// third variant cannot resolve a key without recording it.
+    async fn llm_key_with_use_recorded(
+        &mut self,
+        provider_name: &str,
+        vault_path: &str,
+        env_name: &str,
+    ) -> Option<String> {
+        let provider = provider_name.to_ascii_lowercase();
         if let Some(v) = self.resolve_raw_vault_secret(vault_path).await {
+            self.record_secret_use(
+                SecretUseSurface::LlmProviderKey,
+                &provider,
+                vault_path,
+                SecretSource::Vault,
+                None,
+            )
+            .await;
             return Some(v);
         }
-        std::env::var(env_name).ok().filter(|v| !v.is_empty())
+        let v = std::env::var(env_name).ok().filter(|v| !v.is_empty())?;
+        self.record_secret_use(
+            SecretUseSurface::LlmProviderKey,
+            &provider,
+            env_name,
+            SecretSource::Env,
+            None,
+        )
+        .await;
+        Some(v)
     }
 }

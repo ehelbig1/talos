@@ -714,7 +714,12 @@ impl wit_http::Host for TalosContext {
             .timeout(std::time::Duration::from_millis(timeout_ms));
         for (name, value) in &headers {
             let resolved = match self
-                .resolve_vault_header(name.as_str(), value.as_str())
+                .resolve_vault_header(
+                    crate::context::SecretUseSurface::HttpHeader,
+                    &host_str,
+                    name.as_str(),
+                    value.as_str(),
+                )
                 .await
             {
                 Ok(v) => v,
@@ -1459,7 +1464,15 @@ impl wit_http::Host for TalosContext {
             let mut hdrs: Vec<(String, String)> = Vec::with_capacity(req.headers.len());
             let mut header_failed = false;
             for (k, v) in &req.headers {
-                match self.resolve_vault_header(k.as_str(), v.as_str()).await {
+                match self
+                    .resolve_vault_header(
+                        crate::context::SecretUseSurface::HttpHeader,
+                        &host,
+                        k.as_str(),
+                        v.as_str(),
+                    )
+                    .await
+                {
                     Ok(resolved) => hdrs.push((k.clone(), resolved.into_owned())),
                     Err(_) => {
                         header_failed = true;
