@@ -68,7 +68,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # rust:1.91 is based on Debian trixie (glibc 2.39, OpenSSL 3.3).
 # Using bookworm-slim (glibc 2.36, OpenSSL 3.0) causes "GLIBC_2.38 not found"
 # and "OPENSSL_3.3.0 not found" crashes at startup.
-FROM debian:trixie-slim
+FROM debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
 
 # `cosign` (~80 MB) is bundled so the worker can verify Sigstore-signed OCI
 # template artifacts before executing their WASM. See `verify_oci_signature`

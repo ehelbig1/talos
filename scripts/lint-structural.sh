@@ -8127,8 +8127,9 @@ else
             continue
         fi
         # (b) Reproducibility surfaces must additionally be DIGEST-pinned. The
-        #     deploy chart and installer are deliberately exempt: an
-        #     operator-overridable tag is the normal chart convention, and
+        #     deploy chart and installer are exempt HERE (check 93 has pinned the
+        #     chart's default digest since 2026-09-16, package BX; an operator
+        #     may still override it): an operator-overridable tag is the normal chart convention, and
         #     pinning a digest there would dictate the image an operator runs.
         case "$loc" in
             ./docker-compose*|./.github/workflows/*|./controller/tests/*|./scripts/drills/*)
@@ -9240,6 +9241,45 @@ else
     else
         echo "$CK92_OUT" | sed 's/^/  /'
         red "✗ auditor-facing doc cites code that does not exist or a re-export shim"
+        EXIT_CODE=1
+    fi
+fi
+echo
+
+bold "▶ check 93: every container image this repository runs or builds from is digest-pinned"
+# A tag is a mutable pointer: an upstream re-push changes what runs with no
+# change in this tree. The SOC 2 mapping claimed every image was digest-pinned;
+# measured 2026-09-16 (package BX) it was not — 19 references over 59: the
+# worker's runtime stage (`FROM debian:trixie-slim`, the image that executes
+# production WASM), the CI integration runner's `docker run` of redis, pgvector
+# and nats, the production and observability compose files, the chart's
+# in-cluster Postgres (`digest: ""`) and the kubectl image the Vault init Job
+# runs WITH THE ROOT TOKEN; 16 real, 3 legitimately unpinned (an image this repo
+# builds locally, twice, and a probe that runs only when the image is already
+# present). Check 80 covers Postgres only and only in assignment form, which is
+# how the integration runner's `docker run … pgvector/pgvector:pg17` escaped it.
+# scripts/lint-image-pins.py scans git-tracked Dockerfiles (`FROM`, `COPY
+# --from`), YAML `image:` values (compose, workflows, deploy/, and heredoc pod
+# specs in shell), Helm values `repository:` blocks (a non-empty `digest:`), and
+# shell/Makefile `docker|podman run|pull|create` arguments and `*IMAGE*=`
+# defaults; it also fails when one `repository:tag` is pinned to two digests.
+# 19 on pristine main, 0 after. Exit 2 (loud) when it matches nothing. Stated
+# limits: images named in Rust source (the compilation sandbox's
+# `TALOS_BUILDER_IMAGE` default) and any reference assembled at runtime (`$`,
+# `{{`) are out of range; a `docker run` inside a quoted string is treated as
+# prose. Opt-out `allow-unpinned-image: <reason>` on the line or the line above,
+# for an image built locally and never pulled.
+if [ ! -f "$ROOT/scripts/lint-image-pins.py" ]; then
+    red "✗ scripts/lint-image-pins.py is missing — the check cannot run"
+    EXIT_CODE=1
+else
+    CK93_OUT="$(cd "$ROOT" && python3 scripts/lint-image-pins.py "$ROOT" 2>&1)"
+    CK93_RC=$?
+    if [ "$CK93_RC" -eq 0 ]; then
+        green "✓ every container image reference is digest-pinned ($(echo "$CK93_OUT" | tail -1 | sed -E 's/^ +//'))"
+    else
+        echo "$CK93_OUT" | sed 's/^/  /'
+        red "✗ unpinned container image reference(s) — pin by @sha256 digest (docker buildx imagetools inspect <ref>)"
         EXIT_CODE=1
     fi
 fi

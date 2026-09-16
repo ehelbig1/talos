@@ -41,7 +41,7 @@ spec:
       type: RuntimeDefault
   containers:
   - name: debug
-    image: alpine/k8s:1.31.4
+    image: alpine/k8s:1.31.4@sha256:9c4976d47656d78cf53a92b0203fc54ac45eae18a2b45001ac221c27da4c8036
     imagePullPolicy: IfNotPresent
     securityContext:
       allowPrivilegeEscalation: false

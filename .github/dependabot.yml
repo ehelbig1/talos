@@ -133,6 +133,33 @@ updates:
       prefix: "chore(docker)"
     open-pull-requests-limit: 5
 
+  # worker/ and frontend/ (package BX, 2026-09-16): their base images are
+  # digest-pinned (check 93), and a pin nothing updates freezes security
+  # fixes — the worker's runtime stage executes production WASM.
+  - package-ecosystem: "docker"
+    directory: "/worker"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    labels:
+      - "dependencies"
+      - "docker"
+    commit-message:
+      prefix: "chore(docker)"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: "docker"
+    directory: "/frontend"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    labels:
+      - "dependencies"
+      - "docker"
+    commit-message:
+      prefix: "chore(docker)"
+    open-pull-requests-limit: 5
+
   # ── docker-compose services (separate ecosystem in Dependabot) ───────────
   # Scans the `image:` fields in docker-compose.yml. Only bumps the digest
   # when the tag itself has moved (e.g. new minio/minio:latest push). For

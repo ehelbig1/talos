@@ -13,7 +13,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-IMAGE_NAME="talos-builder:latest"
+IMAGE_NAME="talos-builder:latest"  # allow-unpinned-image: this script BUILDS it; never pulled
 DOCKERFILE="$REPO_ROOT/Dockerfile.builder"
 
 # Detect container runtime (prefer podman for rootless)

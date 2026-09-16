@@ -39,7 +39,7 @@ services:
   # PROMETHEUS - Metrics Collection
   # ========================================================================
   prometheus:
-    image: prom/prometheus:v2.48.0
+    image: prom/prometheus:v2.48.0@sha256:b440bc0e8aa5bab44a782952c09516b6a50f9d7b2325c1ffafac7bc833298e2e
     container_name: talos-prometheus
     restart: unless-stopped
     ports:
@@ -102,7 +102,7 @@ services:
   # GRAFANA - Metrics Visualization
   # ========================================================================
   grafana:
-    image: grafana/grafana:10.2.2
+    image: grafana/grafana:10.2.2@sha256:e3e9c2b5776fe3657f4954dfa91579224f98a0316f51d431989b15425e95530f
     container_name: talos-grafana
     restart: unless-stopped
     ports:
@@ -131,7 +131,7 @@ services:
   # JAEGER - Distributed Tracing
   # ========================================================================
   jaeger:
-    image: jaegertracing/all-in-one:1.52
+    image: jaegertracing/all-in-one:1.52@sha256:7885400a153ac908d8bfbf72c27e3389dbab1942a35dd0ce3228611dc48cbf9f
     container_name: talos-jaeger
     restart: unless-stopped
     ports:

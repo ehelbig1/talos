@@ -87,7 +87,7 @@ command -v sqlx >/dev/null 2>&1 \
     || { echo "✗ sqlx-cli missing — install: cargo install sqlx-cli --locked"; exit 1; }
 
 echo "▶ starting disposable Redis + pgvector + NATS…"
-docker run -d --rm --name "$REDIS_NAME" -p "${REDIS_PORT}:6379" redis:7-alpine >/dev/null
+docker run -d --rm --name "$REDIS_NAME" -p "${REDIS_PORT}:6379" redis:7-alpine@sha256:7aec734b2bb298a1d769fd8729f13b8514a41bf90fcdd1f38ec52267fbaa8ee6 >/dev/null
 # `pg_stat_statements` must be PRELOADED at postmaster start, exactly as
 # docker-compose.yml does: without it migration 20260908120000 no-ops, the
 # talos_ctl template has no extension, and `statement_stats_tests` sees only
@@ -95,13 +95,13 @@ docker run -d --rm --name "$REDIS_NAME" -p "${REDIS_PORT}:6379" redis:7-alpine >
 # this comment ABOVE the command: a `#` line inside a `\` continuation ends it.)
 docker run -d --rm --name "$PG_NAME" \
     -e "POSTGRES_USER=${PG_USER}" -e "POSTGRES_PASSWORD=${PG_PASS}" -e POSTGRES_DB=talos \
-    -p "${PG_PORT}:5432" pgvector/pgvector:pg17 \
+    -p "${PG_PORT}:5432" pgvector/pgvector:pg17@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f \
     -c shared_preload_libraries=pg_stat_statements >/dev/null
 # NATS for the RFC 0010 P3 (D3b) claim-protocol integration tests (envelope-seal
 # responder↔worker handshake + the engine-nats full dispatch→claim→open loop).
 # `-js`: the audit-ledger stream-bound test (below) needs JetStream; the claim
 # protocol tests do not care either way.
-docker run -d --rm --name "$NATS_NAME" -p "${NATS_PORT}:4222" nats:2.10-alpine -js >/dev/null
+docker run -d --rm --name "$NATS_NAME" -p "${NATS_PORT}:4222" nats:2.10-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927 -js >/dev/null
 # The permissioned broker: the compose nats.conf, byte-for-byte, with the worker
 # fragment it includes. Credentials are throwaway literals; what is under test
 # is the PERMISSION SET, not the secrets. `-c` only — no JetStream needed here.
@@ -109,7 +109,7 @@ docker run -d --rm --name "$NATS_PERM_NAME" -p "${NATS_PERM_PORT}:4222" \
     -v "${REPO_ROOT}/deploy/nats:/etc/nats:ro" \
     -e NATS_USER=it-controller -e NATS_PASSWORD=it-controller-pw \
     -e NATS_WORKER_USER=it-worker -e NATS_WORKER_PASSWORD=it-worker-pw \
-    nats:2.10-alpine -c /etc/nats/nats.conf >/dev/null
+    nats:2.10-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927 -c /etc/nats/nats.conf >/dev/null
 
 # ── Readiness gates ─────────────────────────────────────────────────────────
 #

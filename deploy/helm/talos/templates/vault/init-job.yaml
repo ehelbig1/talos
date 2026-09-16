@@ -8,7 +8,7 @@
        kubectl + helm + sh + bash + jq + awk + curl. Free. Aligns with
        k3s minor version. Canonical post-bitnami "kubectl in a Job".
 */}}
-{{- $kubectlImage := .Values.vault.init.kubectlImage | default (dict "repository" "alpine/k8s" "tag" "1.31.4" "pullPolicy" "IfNotPresent") -}}
+{{- $kubectlImage := .Values.vault.init.kubectlImage | default (dict "repository" "alpine/k8s" "tag" "1.31.4" "digest" "sha256:9c4976d47656d78cf53a92b0203fc54ac45eae18a2b45001ac221c27da4c8036" "pullPolicy" "IfNotPresent") -}}
 {{- $bootstrapSecret := include "talos.bootstrapSecretName" . -}}
 {{- $controllerDeploy := include "talos.componentName" (list . "controller") -}}
 {{- $vaultPod := printf "%s-0" (include "talos.componentName" (list . "vault")) -}}
@@ -105,7 +105,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: vault-init
-          image: {{ printf "%s:%s" $kubectlImage.repository $kubectlImage.tag | quote }}
+          image: {{ include "talos.image" $kubectlImage | quote }}
           imagePullPolicy: {{ $kubectlImage.pullPolicy }}
           securityContext:
             allowPrivilegeEscalation: false
