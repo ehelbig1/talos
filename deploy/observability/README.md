@@ -33,7 +33,7 @@ working correctly":
 ### 1. Prometheus scrape target
 
 The controller exposes Prometheus text format at `/metrics/prometheus`
-(separate from the existing per-user `/metrics` endpoint). Gated by a
+(the controller serves no other metrics route). Gated by a
 shared-secret `PROMETHEUS_SCRAPE_TOKEN` bearer.
 
 ```yaml

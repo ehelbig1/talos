@@ -131,7 +131,7 @@ This document maps Talos platform security controls to SOC 2 Trust Services Crit
 **Testing procedure:**
 1. Attempt `UPDATE auth_audit_log SET success = true` -- verify trigger rejection (SQLSTATE 42501)
 2. Run `scripts/soc2/collect-evidence.sh` -- verify audit exports contain expected entries
-3. Verify Prometheus `/metrics` endpoint returns expected metric families
+3. Verify the controller's Prometheus `/metrics/prometheus` endpoint returns expected metric families
 4. Read a secret through `get_secret` and check `secret_audit_log` -- verify a `read` entry exists
 5. Feed a tampered (bad-HMAC) audit event into the JetStream consumer -- verify it lands in the `rejected/` prefix and is NOT persisted to the main WORM path
 6. Run `verify_execution_chain` over an exported chain with an injected sequence gap / broken `previous_hash` -- verify the break is reported

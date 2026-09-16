@@ -1518,162 +1518,6 @@ pub(crate) async fn prometheus_metrics_handler(
     Ok(resp)
 }
 
-// ---------- Metrics endpoint ----------
-pub(crate) async fn metrics_handler(
-    Extension(db_pool): Extension<sqlx::PgPool>,
-    Extension(schema): Extension<TalosSchema>,
-    cookies: tower_cookies::Cookies,
-    headers: axum::http::HeaderMap,
-) -> Result<impl axum::response::IntoResponse, (axum::http::StatusCode, String)> {
-    use serde_json::json;
-
-    // Extract token from cookie or Authorization header
-    let token = cookies
-        .get("talos_access_token")
-        .map(|c| c.value().to_string())
-        .or_else(|| {
-            headers
-                .get(axum::http::header::AUTHORIZATION)
-                .and_then(|h| h.to_str().ok())
-                .and_then(|s| s.strip_prefix("Bearer ").map(|t| t.to_string()))
-        })
-        .ok_or_else(|| {
-            (
-                axum::http::StatusCode::UNAUTHORIZED,
-                "Authentication required (cookie or Bearer token)".to_string(),
-            )
-        })?;
-
-    // Verify token and extract user_id
-    let auth_service = schema
-        .data::<std::sync::Arc<AuthService>>()
-        .ok_or_else(|| {
-            (
-                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                "Auth service not available".to_string(),
-            )
-        })?;
-
-    let claims = auth_service.verify_token(&token).map_err(|_| {
-        (
-            axum::http::StatusCode::UNAUTHORIZED,
-            "Invalid or expired token".to_string(),
-        )
-    })?;
-
-    let user_id = uuid::Uuid::parse_str(&claims.sub).map_err(|_| {
-        (
-            axum::http::StatusCode::UNAUTHORIZED,
-            "Invalid user ID in token".to_string(),
-        )
-    })?;
-
-    // Gather user-specific metrics
-    let webhook_stats = sqlx::query_as::<_, (i64, i64, i64, i64, f64)>(
-        r#"
-        SELECT
-            COUNT(*)::bigint,
-            COALESCE(SUM(trigger_count), 0)::bigint,
-            COALESCE(SUM(success_count), 0)::bigint,
-            COALESCE(SUM(error_count), 0)::bigint,
-            COALESCE(AVG(avg_response_ms), 0.0)::float
-        FROM webhook_triggers
-        WHERE user_id = $1
-        "#,
-    )
-    .bind(user_id)
-    .fetch_one(&db_pool)
-    .await
-    .map_err(|e| {
-        tracing::error!(user_id = %user_id, error = %e, "Failed to fetch webhook stats");
-        (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to fetch metrics".to_string(),
-        )
-    })?;
-
-    // MCP-676 (2026-05-13): the `secrets` table has THREE legacy
-    // ownership columns from drift across the early schema: `user_id`
-    // (001_initial_schema, never written by any code path),
-    // `created_by` (001_initial_schema, written by `INSERT INTO
-    // secrets` in talos-secrets-manager), and `owner_user_id`
-    // (007_missing_columns, backfilled from created_by in
-    // 20260410100005). The CANONICAL column is `owner_user_id` —
-    // every write site sets both `created_by` and `owner_user_id`
-    // to the creating user; nothing populates `user_id`. Pre-fix the
-    // user-stats endpoint queried `WHERE user_id = $1` and silently
-    // returned (count=0, sum=0) for every user regardless of how
-    // many secrets they actually owned. UX bug, not a security bug
-    // — but the broken column reference is a copy-paste hazard for
-    // future code and worth fixing alongside the equivalent
-    // talos-workflow-repository::get_provisioned_secrets gap.
-    let secret_stats = sqlx::query_as::<_, (i64, i64)>(
-        r#"
-        SELECT
-            COUNT(*)::bigint,
-            COALESCE(SUM(access_count), 0)::bigint
-        FROM secrets
-        WHERE owner_user_id = $1
-        "#,
-    )
-    .bind(user_id)
-    .fetch_one(&db_pool)
-    .await
-    .map_err(|e| {
-        tracing::error!(user_id = %user_id, error = %e, "Failed to fetch secret stats");
-        (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to fetch metrics".to_string(),
-        )
-    })?;
-
-    // Phase 5: reads from the unified `modules` table (filter to user-authored
-    // sandbox/extracted rows so catalog counts don't double-count per user).
-    let module_stats = sqlx::query_as::<_, (i64, i64, i64)>(
-        r#"
-        SELECT
-            COUNT(*)::bigint,
-            COALESCE(SUM(usage_count), 0)::bigint,
-            COALESCE(SUM(size_bytes), 0)::bigint
-        FROM modules
-        WHERE user_id = $1 AND kind IN ('sandbox', 'extracted')
-        "#,
-    )
-    .bind(user_id)
-    .fetch_one(&db_pool)
-    .await
-    .map_err(|e| {
-        tracing::error!(user_id = %user_id, error = %e, "Failed to fetch module stats");
-        (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to fetch metrics".to_string(),
-        )
-    })?;
-
-    let metrics = json!({
-        "status": "healthy",
-        "webhooks": {
-            "total_listeners": webhook_stats.0,
-            "total_triggers": webhook_stats.1,
-            "total_successes": webhook_stats.2,
-            "total_errors": webhook_stats.3,
-            "avg_response_time_ms": webhook_stats.4,
-        },
-        "secrets": {
-            "total_secrets": secret_stats.0,
-            "total_accesses": secret_stats.1,
-        },
-        "modules": {
-            "total_modules": module_stats.0,
-            "total_executions": module_stats.1,
-            "total_size_mb": (module_stats.2 as f64 / 1_048_576.0),
-        },
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-    });
-
-    Ok(axum::Json(metrics))
-}
-
 // ---------- REST API Authentication Middleware ----------
 pub(crate) async fn rest_auth_middleware(
     cookies: tower_cookies::Cookies,
@@ -3893,10 +3737,6 @@ pub(crate) fn build_router(
         .layer(Extension(db_pool.clone()));
 
     let app = Router::new()
-        // Authenticated user-facing metrics dashboard. Stays inside the
-        // rate-limited router; the unauthenticated Prometheus scrape lives
-        // in `probe_routes` above.
-        .route("/metrics", get(metrics_handler)) // no-nginx-route: authenticated metrics dashboard, accessed via /graphql proxy
         .merge(api_docs::create_docs_router())
         .merge(graphql_routes)
         .merge(webhook_routes)
@@ -4051,6 +3891,13 @@ pub(crate) fn build_router(
         // token is unset, so this merge is a no-op in that mode).
         .merge(internal_routes)
         .merge(worker_liveness_routes)
+        // Package BZ: a route that extracts an `Extension` no layer above
+        // provides is rejected by axum before its handler runs. Log it with
+        // the route template, count it, and replace the body (which names
+        // internal Rust types). Outside every merge so every route is covered.
+        .layer(from_fn(
+            talos_http_utils::missing_extension::missing_extension_guard,
+        ))
         // Request ID for tracing and audit logging (generates/propagates X-Request-ID)
         .layer(from_fn(request_id::request_id_middleware))
         // Security headers (apply to all responses)
@@ -4640,6 +4487,35 @@ mod worker_liveness_metric_tests {
                 ]
                 .contains(&l),
                 "status {code} produced an unseeded label {l}"
+            );
+        }
+    }
+}
+
+/// Package BZ. TEXTUAL, stated as such: `build_router` needs the full service
+/// set, so no test can drive it. `missing_extension_guard` covers a route only
+/// if it is layered AFTER that route is added (axum applies `Router::layer` to
+/// the routes present at that point), so it must come after the last
+/// `.route(`, `.merge(` and `.nest(` in the function. The layer's behaviour is
+/// tested in `talos_http_utils::missing_extension`.
+#[cfg(test)]
+mod missing_extension_guard_wiring_tests {
+    #[test]
+    fn build_router_layers_the_guard_outside_every_route() {
+        let src = include_str!("router.rs");
+        let start = src
+            .find("pub(crate) fn build_router(")
+            .expect("build_router");
+        let body = &src[start..];
+        let body = &body[..body.find("\n}\n").expect("end of build_router")];
+        let guard = body
+            .rfind("missing_extension::missing_extension_guard")
+            .expect("build_router must layer the missing-extension guard");
+        for registration in [".route(", ".merge(", ".nest("] {
+            let last = body.rfind(registration).expect(registration);
+            assert!(
+                guard > last,
+                "a `{registration}` follows the guard layer, so that route is not covered"
             );
         }
     }

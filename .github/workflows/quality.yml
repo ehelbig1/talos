@@ -115,6 +115,10 @@ jobs:
         env:
           TALOS_REQUIRE_DOCKER: "1"
         run: bash scripts/tests/vault-chart-init-test.sh
+      - name: Route crawl parser self-test
+        # Package BZ. The crawl itself needs a running controller (smoke.sh
+        # leg 7, the installer); CI proves the route derivation it relies on.
+        run: python3 scripts/check-route-extensions.py --self-test
 
   # ── Rust unit tests: library unit tests + the DB-free integration binaries ──
   # The bulk is `--lib` (~1.3k DB-free unit tests). On top of that we explicitly

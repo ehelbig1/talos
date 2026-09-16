@@ -789,8 +789,30 @@ done
 # unless SMOKE_AGENT_TOKEN + SMOKE_ACTOR_ID are exported.
 SMOKE_SCRIPT="$SCRIPT_DIR/../../scripts/smoke.sh"
 if [[ -x "$SMOKE_SCRIPT" ]]; then
+    # Leg 7 (route crawl) needs the controller port directly: forward it for
+    # the duration of the smoke run. The scrape token goes to the crawl's
+    # environment only and is never printed. Requests are paced under the
+    # production per-IP limit.
+    SMOKE_PF_PORT=18000
+    SMOKE_CONTROLLER_URL=""
+    SMOKE_SCRAPE_TOKEN=""
+    if k3s kubectl -n "$TALOS_NAMESPACE" get svc "${TALOS_FULLNAME}-controller" >/dev/null 2>&1; then
+        k3s kubectl -n "$TALOS_NAMESPACE" port-forward "svc/${TALOS_FULLNAME}-controller" \
+            "${SMOKE_PF_PORT}:8000" >/dev/null 2>&1 &
+        SMOKE_PF_PID=$!
+        for _ in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -s -o /dev/null --max-time 2 "http://127.0.0.1:${SMOKE_PF_PORT}/live"; then
+                SMOKE_CONTROLLER_URL="http://127.0.0.1:${SMOKE_PF_PORT}"
+                break
+            fi
+            sleep 1
+        done
+        SMOKE_SCRAPE_TOKEN="$(k3s kubectl -n "$TALOS_NAMESPACE" get secret "$SECRET_NAME" \
+            -o jsonpath='{.data.PROMETHEUS_SCRAPE_TOKEN}' 2>/dev/null | base64 -d 2>/dev/null || true)"
+    fi
     log "Running end-to-end smoke test against https://$TALOS_FRONTEND_HOST"
-    if BASE_URL="https://$TALOS_FRONTEND_HOST" "$SMOKE_SCRIPT"; then
+    if BASE_URL="https://$TALOS_FRONTEND_HOST" SMOKE_CONTROLLER_URL="$SMOKE_CONTROLLER_URL" \
+        SMOKE_CRAWL_DELAY=0.7 PROMETHEUS_SCRAPE_TOKEN="$SMOKE_SCRAPE_TOKEN" "$SMOKE_SCRIPT"; then
         ok "smoke test passed"
     else
         warn "smoke test failed — install completed but at least one public path is broken."
@@ -798,7 +820,12 @@ if [[ -x "$SMOKE_SCRIPT" ]]; then
         warn "    - missing nginx location for a new controller route (see scripts/lint-structural.sh)"
         warn "    - frontend pod still on old ConfigMap (kubectl rollout restart deploy/${TALOS_FULLNAME}-frontend)"
         warn "    - DNS / LE cert not yet propagated"
+        warn "    - leg 7: a route extracting an axum Extension its router lacks (check-route-extensions.py)"
     fi
+    if [[ -n "${SMOKE_PF_PID:-}" ]]; then
+        kill "$SMOKE_PF_PID" >/dev/null 2>&1 || true
+    fi
+    SMOKE_SCRAPE_TOKEN=""
 else
     warn "smoke script not found at $SMOKE_SCRIPT — skipping end-to-end probe."
 fi

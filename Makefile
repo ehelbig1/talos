@@ -23,6 +23,7 @@ SERVICE            ?= controller
 # i.e. the flag warned on correct invocations and taught readers to ignore it.
 ARGS               ?=
 CHANGELOG_WRITE    ?=
+CONTROLLER_URL     ?= http://localhost:8000
 
 # Git state exposed to the controller build so session_start.server_version
 # surfaces the deployed commit (operator never has to ask "what's running?").
@@ -35,7 +36,7 @@ export GIT_DIRTY_OVERRIDE := $(shell test -n "$$(git status --porcelain 2>/dev/n
         drill drill-schedule drill-unschedule drill-schedule-status \
         offhost-upload offhost-backfill offhost-plan offhost-probe \
         offhost-schedule offhost-unschedule offhost-status \
-        clean nuke smoke rls-preflight sqlx-prepare sqlx-check _wait-healthy \
+        clean nuke smoke check-route-extensions rls-preflight sqlx-prepare sqlx-check _wait-healthy \
         observability-reload observability-verify
 
 ## ──── Dev ──────────────────────────────────────────────────────────
@@ -455,6 +456,9 @@ deploy-prod: ## One-command production deploy: publish (gated+signed) -> pin dig
 
 smoke: ## End-to-end probe of a deployed cluster (BASE_URL=https://… SMOKE_AGENT_TOKEN=… SMOKE_ACTOR_ID=…)
 	@bash scripts/smoke.sh
+
+check-route-extensions: ## Crawl a running controller for routes missing an axum Extension (CONTROLLER_URL=http://localhost:8000)
+	@python3 scripts/check-route-extensions.py --controller-url "$(CONTROLLER_URL)"
 
 changelog: ## Print CHANGELOG entries missing for merged PRs (add --write via CHANGELOG_WRITE=1)
 	@bash scripts/changelog-update.sh $(if $(CHANGELOG_WRITE),--write,)

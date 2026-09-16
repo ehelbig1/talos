@@ -1,6 +1,8 @@
 //! Small axum-layer utilities used by every Talos HTTP service.
 //!
 //! Three modules:
+//! * [`missing_extension`] — logs, counts and scrubs axum's rejection for
+//!   a route that extracts an `Extension` its router never layered.
 //! * [`request_id`] — middleware that generates / propagates an
 //!   `X-Request-ID` header for distributed tracing and audit log
 //!   correlation. Reads upstream value if present, otherwise mints
@@ -17,6 +19,7 @@
 //!   [`ssrf`] check; every controller outbound-webhook fire site builds
 //!   its client here so the resolver is reachable from every crate.
 
+pub mod missing_extension;
 pub mod outbound;
 pub mod request_id;
 pub mod sanitization;
