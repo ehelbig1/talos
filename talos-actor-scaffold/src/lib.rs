@@ -293,9 +293,9 @@ pub async fn scaffold_actor(
     // the canonical `ceiling_permits` helper — the `world_rank` comparison
     // wrongly admitted lattice-incomparable siblings.
     let user_ceiling = user_max_world_str(&deps.db_pool, user_id).await?;
-    if !talos_capability_world::ceiling_permits(user_ceiling, &req.max_capability_world) {
+    if !talos_capability_world::ceiling_permits(&user_ceiling, &req.max_capability_world) {
         return Err(ScaffoldError::CapabilityCeilingExceeded {
-            user_ceiling: user_ceiling.to_string(),
+            user_ceiling: user_ceiling.clone(),
             requested: req.max_capability_world.clone(),
         });
     }
@@ -800,46 +800,17 @@ async fn build_and_create_starter_workflow(
 
 // ── Local helpers ────────────────────────────────────────────────────────────
 
-/// Same default-ceiling helper `handle_create_actor` uses, lifted out
-/// so the service doesn't reach into mcp/actor.rs internals beyond the
-/// already-public `world_rank` + `is_actor_ceiling_world`.
+/// The user's ceiling through the ONE home,
+/// `ActorRepository::user_capability_ceiling` (package BR). An unreadable
+/// grant refuses the scaffold rather than assuming a default (#661).
 ///
-/// #661 (error-as-absence): returns `Err` when the grant could not be READ.
-/// `.ok().flatten()` put a DB error into the same bucket as "no grant" and
-/// "unrecognised label", all three yielding `http-node` (rank 1) — an
-/// escalation for a user whose actual grant is `minimal-node` (rank 0), on the
-/// left-hand side of the `ceiling_permits` gate at the call site, and persisted
-/// into the actor row this function's caller then creates.
-async fn user_max_world_str(
-    pool: &sqlx::PgPool,
-    user_id: Uuid,
-) -> Result<&'static str, ScaffoldError> {
-    // MCP-816 (2026-05-14): delegate canonicalization to the
-    // `talos_capability_world` crate instead of hand-rolling a match
-    // arm per world. Pre-fix this match was missing `"agent-node"` and
-    // `"trusted-node"` — users with those ceilings stored in the DB
-    // fell through to `_ => "http-node"`, silently downgrading their
-    // effective ceiling at the `create_actor` RBAC check. A user with
-    // a granted `agent-node` ceiling who tried to spawn an agent-tier
-    // actor would be rejected with "ceiling exceeded" — the user's
-    // ACTUAL ceiling, returned via this helper, was http-node (rank 1),
-    // while the requested actor ceiling (rank 6) sailed past it.
-    //
-    // Also accepted the dead `"standard-node"` and `"full-node"` labels
-    // (closed at the grant-handler layer in the same MCP). Switching
-    // to the canonical FromStr + `as_node_str()` round-trip:
-    //   - Recognizes EVERY canonical ceiling (incl. agent-node,
-    //     trusted-node, automation-node, llm-node).
-    //   - Normalizes `trusted-node`/`automation-node` to the public-
-    //     facing `automation-node` form.
-    //   - Returns `Unknown` for legacy/dead labels — falls through to
-    //     the safer `"http-node"` default rather than silently passing
-    //     a label downstream that the dispatcher would reject.
-    use std::str::FromStr;
-    use talos_capability_world::CapabilityWorld;
-    let repo = ActorRepository::new(pool.clone());
-    let row = repo
-        .get_user_max_capability_world(user_id)
+/// Until 2026-09-16 this was a private `FromStr` round trip that also accepted
+/// `trusted-node` as `automation-node`; the grant column's CHECK has never
+/// admitted `trusted-node`, so that arm was unreachable and the two readings
+/// agreed on every storable value.
+async fn user_max_world_str(pool: &sqlx::PgPool, user_id: Uuid) -> Result<String, ScaffoldError> {
+    ActorRepository::new(pool.clone())
+        .user_capability_ceiling(user_id)
         .await
         .map_err(|e| {
             tracing::error!(
@@ -852,13 +823,7 @@ async fn user_max_world_str(
             ScaffoldError::DatabaseError(
                 "Could not verify your capability ceiling — try again.".to_string(),
             )
-        })?;
-    Ok(row
-        .as_deref()
-        .and_then(|s| CapabilityWorld::from_str(s).ok())
-        .filter(|w| !matches!(w, CapabilityWorld::Unknown))
-        .map(|w| w.as_node_str())
-        .unwrap_or("http-node"))
+        })
 }
 
 #[cfg(test)]

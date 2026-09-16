@@ -780,6 +780,8 @@ CTRL_TESTS=(
     # implementation — ceiling gate, actor limit, grant/budget/policy copy.
     # `common` DATABASE_URL harness ⇒ CTRL_TESTS, not TC_TESTS (sub-leg 64b).
     "actor_clone_parity_tests"
+    # BR: the grant CHECK equals ACTOR_CEILING_WORLDS; one ceiling read.
+    "capability_grant_world_check_tests"
 )
 # 'talos_ctl' is now the migrated TEMPLATE: setup_test_context clones it into a
 # private per-test database (controller/tests/common::isolated_db_pool), so the

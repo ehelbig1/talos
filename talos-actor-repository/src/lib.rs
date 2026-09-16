@@ -2919,9 +2919,37 @@ impl ActorRepository {
         classify_module_bound_ceilings(self.get_actor_ceilings(actor_id).await)
     }
 
-    /// Fetch only the max_capability_world string for a user (used by user_max_world helper).
-    /// Returns None if no explicit grant exists.
-    pub async fn get_user_max_capability_world(&self, user_id: Uuid) -> Result<Option<String>> {
+    /// The capability ceiling a user holds — the ONE read every gate and every
+    /// report consults (package BR, 2026-09-16).
+    ///
+    /// Fails CLOSED: an unreadable grant is an `Err` and callers refuse, never
+    /// a default (#661 — a defaulted `http-node` is an escalation for a user
+    /// granted `minimal-node`). No grant row is `http-node`, the column's own
+    /// DEFAULT. A stored value that is not one of
+    /// `talos_capability_world::ACTOR_CEILING_WORLDS` is also `http-node`, the
+    /// conservative reading rather than the permissive rank an unknown string
+    /// would get — unreachable since migration `20260916100000` pinned the
+    /// column's CHECK to exactly that list, and kept as defence in depth.
+    ///
+    /// Until 2026-09-16 this rule existed SEVEN times: here as a raw read, in
+    /// the clone service, inline in GraphQL `createActor` and `updateActor`, in
+    /// the actor scaffold (a `FromStr` round trip that also accepted
+    /// `trusted-node`), in the GraphQL grant mutation (no canonicalisation), and
+    /// raw in the two self-reports (`whoami`, `myCapabilityCeiling`). The raw
+    /// read is now private, so a new caller cannot re-derive the rule — the
+    /// compiler sends it here.
+    pub async fn user_capability_ceiling(&self, user_id: Uuid) -> Result<String> {
+        let row = self.read_user_grant_world(user_id).await?;
+        Ok(match row.as_deref() {
+            Some(world) if talos_capability_world::is_actor_ceiling_world(world) => {
+                world.to_string()
+            }
+            _ => "http-node".to_string(),
+        })
+    }
+
+    /// The raw grant row. Private: callers take [`Self::user_capability_ceiling`].
+    async fn read_user_grant_world(&self, user_id: Uuid) -> Result<Option<String>> {
         let world: Option<String> = sqlx::query_scalar(
             "SELECT max_capability_world FROM user_capability_grants WHERE user_id = $1",
         )
