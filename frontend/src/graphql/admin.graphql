@@ -130,6 +130,7 @@ query GetCapabilityWorldHierarchy {
     name
     rank
     description
+    permits
   }
 }
 

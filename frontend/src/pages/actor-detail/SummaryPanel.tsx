@@ -1,6 +1,6 @@
 import React, { useState, useMemo } from "react";
 import { useNavigate } from "react-router";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
   Sparkles,
@@ -19,6 +19,7 @@ import { ConfirmDialog } from "@/components/ui";
 import {
   updateActor,
   cloneActor,
+  getMyCapabilityCeiling,
   type ActorDetails,
   type ActorActionLogEntry,
   type ActorWorkflowItem,
@@ -26,8 +27,9 @@ import {
 import {
   getCapabilityConfig,
   isAiWorkflow,
-  CAPABILITY_WORLDS,
+  ceilingOptions,
 } from "@/lib/capabilityConfig";
+import { useGetCapabilityWorldHierarchyQuery } from "@/generated/graphql";
 import { ageDays } from "@/lib/formatTime";
 import {
   CapabilityBadge,
@@ -65,6 +67,23 @@ export function SummaryPanel({
   const [editName, setEditName] = useState(actor.name);
   const [editDesc, setEditDesc] = useState(actor.description ?? "");
   const [editWorld, setEditWorld] = useState(actor.maxCapabilityWorld);
+  const { data: ceilingWorld } = useQuery({
+    queryKey: ["myCapabilityCeiling"],
+    queryFn: getMyCapabilityCeiling,
+    staleTime: 60_000,
+  });
+  const { data: hierarchyData } = useGetCapabilityWorldHierarchyQuery();
+  const worldOptions = ceilingOptions(
+    hierarchyData?.capabilityWorldHierarchy ?? [],
+    ceilingWorld,
+  );
+  // An actor already holding a world the backend no longer serves keeps it
+  // visible as its current value, but it cannot be re-selected.
+  const editOptions = worldOptions.some(
+    (o) => o.world === actor.maxCapabilityWorld,
+  )
+    ? worldOptions
+    : [{ world: actor.maxCapabilityWorld, permitted: false }, ...worldOptions];
 
   const { mutate: doUpdate, isPending: updatePending } = useMutation({
     mutationFn: () =>
@@ -160,13 +179,16 @@ export function SummaryPanel({
                         onChange={(e) => setEditWorld(e.target.value)}
                         className="w-full bg-surface-4/60 border border-white/10 rounded-2xl px-5 py-3 text-sm text-white focus:outline-none focus:ring-2 focus:ring-primary/20 focus:border-primary/50 transition-premium appearance-none cursor-pointer"
                       >
-                        {Object.entries(CAPABILITY_WORLDS).map(([key, cfg]) => (
+                        {editOptions.map(({ world, permitted }) => (
                           <option
-                            key={key}
-                            value={key}
+                            key={world}
+                            value={world}
+                            disabled={
+                              !permitted && world !== actor.maxCapabilityWorld
+                            }
                             className="bg-surface-4 text-white"
                           >
-                            {cfg.label} Level
+                            {getCapabilityConfig(world).label} Level
                           </option>
                         ))}
                       </select>

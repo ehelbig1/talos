@@ -1620,6 +1620,10 @@ pub struct CapabilityWorldInfo {
     pub name: String,
     pub rank: i32,
     pub description: String,
+    /// The worlds an actor may be given when this world is the caller's
+    /// ceiling, from the backend lattice. The ceilings are a partial order:
+    /// compare against this list, never against `rank`.
+    pub permits: Vec<String>,
 }
 
 /// A capability grant record (admin view).
