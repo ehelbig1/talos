@@ -11,6 +11,29 @@ use sqlx::PgPool;
 use std::sync::OnceLock;
 use uuid::Uuid;
 
+/// The columns of a new `mcp_agents` row (see
+/// [`SystemRepository::register_agent_on_conn`]). No `Debug`: the token hashes
+/// are credential material, and a derived `Debug` would print them.
+#[derive(Clone, Copy)]
+pub struct NewAgent<'a> {
+    pub id: Uuid,
+    pub name: &'a str,
+    pub role_id: Uuid,
+    pub token_hash: &'a str,
+    pub token_lookup_hash: &'a str,
+    pub user_id: Uuid,
+}
+
+/// An MCP agent removed by [`SystemRepository::revoke_agent_on_conn`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevokedAgent {
+    pub id: Uuid,
+    pub name: String,
+    pub role: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub last_connected_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// MCP-709 (2026-05-13): the synthetic `password_hash` written by
 /// [`SystemRepository::ensure_user_row_for_agent`] must be a STRUCTURALLY
 /// VALID bcrypt string so `bcrypt::verify` (in `talos-auth::login`) pays
@@ -124,44 +147,70 @@ impl SystemRepository {
         Ok(role_id)
     }
 
-    /// Persist a freshly registered MCP agent. Token hashes arrive
-    /// pre-computed (bcrypt storage hash + SHA-256 lookup hash) — this
-    /// method only inserts. Returns the raw `sqlx::Error` so callers can
-    /// distinguish the `mcp_agents_name_key` unique violation (duplicate
-    /// agent name) from other failures via the error message.
-    pub async fn register_agent(
-        &self,
-        agent_id: Uuid,
-        name: &str,
-        role_id: Uuid,
-        token_hash: &str,
-        token_lookup_hash: &str,
-        user_id: Uuid,
+    /// Persist a freshly registered MCP agent on the caller's connection, so
+    /// the insert and its `admin_event_log` record commit in ONE transaction
+    /// (`talos_api::schema::actors::mutations::register_mcp_agent_recorded`).
+    /// Token hashes arrive pre-computed (bcrypt storage hash + SHA-256 lookup
+    /// hash) — this function only inserts. Returns the raw `sqlx::Error` so the
+    /// caller can distinguish the `mcp_agents_name_key` unique violation
+    /// (duplicate agent name) from other failures.
+    pub async fn register_agent_on_conn(
+        conn: &mut sqlx::PgConnection,
+        agent: NewAgent<'_>,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO mcp_agents (id, name, role_id, token_hash, token_lookup_hash, user_id) \
              VALUES ($1, $2, $3, $4, $5, $6)",
         )
-        .bind(agent_id)
-        .bind(name)
-        .bind(role_id)
-        .bind(token_hash)
-        .bind(token_lookup_hash)
-        .bind(user_id)
-        .execute(&self.db_pool)
+        .bind(agent.id)
+        .bind(agent.name)
+        .bind(agent.role_id)
+        .bind(agent.token_hash)
+        .bind(agent.token_lookup_hash)
+        .bind(agent.user_id)
+        .execute(conn)
         .await?;
         Ok(())
     }
 
-    /// Delete an MCP agent scoped to its owner. Returns rows affected
-    /// (0 = not found / not owned).
-    pub async fn delete_agent_for_user(&self, agent_id: Uuid, user_id: Uuid) -> Result<u64> {
-        let result = sqlx::query("DELETE FROM mcp_agents WHERE id = $1 AND user_id = $2")
-            .bind(agent_id)
-            .bind(user_id)
-            .execute(&self.db_pool)
-            .await?;
-        Ok(result.rows_affected())
+    /// Delete an MCP agent scoped to its owner on the caller's connection and
+    /// return what was removed, so the caller can record the revocation in
+    /// the same transaction. `None` = no such agent for this user (not found
+    /// and not owned are one answer, deliberately — a split is an agent-
+    /// existence oracle).
+    ///
+    /// The DELETE is the whole revocation: the MCP auth lookup reads
+    /// `mcp_agents`, so a deleted row authenticates nothing. Because the row
+    /// is gone, the returned name / role / timestamps are the ONLY record of
+    /// what the credential was — until 2026-09-16 nothing kept them.
+    pub async fn revoke_agent_on_conn(
+        conn: &mut sqlx::PgConnection,
+        agent_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<RevokedAgent>> {
+        let row: Option<(
+            String,
+            String,
+            chrono::DateTime<chrono::Utc>,
+            Option<chrono::DateTime<chrono::Utc>>,
+        )> = sqlx::query_as(
+            "DELETE FROM mcp_agents a USING agent_roles r \
+             WHERE a.id = $1 AND a.user_id = $2 AND r.id = a.role_id \
+             RETURNING a.name, r.name, a.created_at, a.last_connected_at",
+        )
+        .bind(agent_id)
+        .bind(user_id)
+        .fetch_optional(conn)
+        .await?;
+        Ok(
+            row.map(|(name, role, created_at, last_connected_at)| RevokedAgent {
+                id: agent_id,
+                name,
+                role,
+                created_at,
+                last_connected_at,
+            }),
+        )
     }
 
     /// A user's MCP agents, newest first, capped at `limit`. Backs the

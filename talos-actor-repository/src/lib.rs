@@ -3910,33 +3910,60 @@ impl ActorRepository {
         summary: &str,
         details: Option<&serde_json::Value>,
     ) -> Result<()> {
-        // MCP-1104: see insert_action_log_entry doc-comment for the
-        // truncate-then-redact rationale. Sibling helper, same fix.
-        let truncated_summary = truncate_summary_at_boundary(summary);
-        let redacted_summary = talos_dlp_provider::redact_str(&truncated_summary);
-        // MCP-1195 (2026-05-17): cap details JSONB at 1 MiB, sibling
-        // of the actor_action_log.details fix. admin_event_log writes
-        // operator-facing audit context (config snapshots, change
-        // diffs) — typical size is small but no upper bound on
-        // caller-supplied JSON. Measure-then-cap-then-redact prevents
-        // pathological inputs from blowing both regex cost and
-        // persisted column size. 1 MiB matches the canonical cap.
-        let redacted_details = bound_log_details(details);
-        sqlx::query(
-            "INSERT INTO admin_event_log \
-             (user_id, event_type, resource_type, resource_id, summary, details) \
-             VALUES ($1, $2, $3, $4, $5, $6)",
+        let mut conn = self.db_pool.acquire().await?;
+        insert_admin_event_log_on_conn(
+            &mut conn,
+            user_id,
+            event_type,
+            resource_type,
+            resource_id,
+            summary,
+            details,
         )
-        .bind(user_id)
-        .bind(event_type)
-        .bind(resource_type)
-        .bind(resource_id)
-        .bind(&redacted_summary)
-        .bind(redacted_details.as_ref())
-        .execute(&self.db_pool)
-        .await?;
-        Ok(())
+        .await
     }
+}
+
+/// The ONE `admin_event_log` insert: truncate the summary at a char boundary,
+/// DLP-redact summary and details, write the row on the caller's connection.
+/// [`ActorRepository::insert_admin_event_log`] delegates here; a caller that
+/// must commit the event atomically with the change it records (MCP agent
+/// registration and revocation, package BW) passes its transaction.
+pub async fn insert_admin_event_log_on_conn(
+    conn: &mut sqlx::PgConnection,
+    user_id: Uuid,
+    event_type: &str,
+    resource_type: &str,
+    resource_id: Option<Uuid>,
+    summary: &str,
+    details: Option<&serde_json::Value>,
+) -> Result<()> {
+    // MCP-1104: see insert_action_log_entry doc-comment for the
+    // truncate-then-redact rationale. Sibling helper, same fix.
+    let truncated_summary = truncate_summary_at_boundary(summary);
+    let redacted_summary = talos_dlp_provider::redact_str(&truncated_summary);
+    // MCP-1195 (2026-05-17): cap details JSONB at 1 MiB, sibling
+    // of the actor_action_log.details fix. admin_event_log writes
+    // operator-facing audit context (config snapshots, change
+    // diffs) — typical size is small but no upper bound on
+    // caller-supplied JSON. Measure-then-cap-then-redact prevents
+    // pathological inputs from blowing both regex cost and
+    // persisted column size. 1 MiB matches the canonical cap.
+    let redacted_details = bound_log_details(details);
+    sqlx::query(
+        "INSERT INTO admin_event_log \
+         (user_id, event_type, resource_type, resource_id, summary, details) \
+         VALUES ($1, $2, $3, $4, $5, $6)",
+    )
+    .bind(user_id)
+    .bind(event_type)
+    .bind(resource_type)
+    .bind(resource_id)
+    .bind(&redacted_summary)
+    .bind(redacted_details.as_ref())
+    .execute(conn)
+    .await?;
+    Ok(())
 }
 
 /// MCP-1104: Truncate summaries to 1000 chars at a UTF-8 char boundary.
