@@ -197,7 +197,7 @@ The differentiators are the credential-isolation primitive and the signed data p
 - `deploy/k3s/README.md` — Single-VM production runbook
 - `docs/deployment.md` — Service inventory, env-var reference, Vault/KEK rotation
 - `docs/security/architecture.md` — Security architecture with diagrams
-- `docs/security/threat-model.md` — STRIDE threat model (7 trust boundaries)
+- `docs/THREAT_MODEL.md` — STRIDE threat model (trust boundaries, attack surfaces, residual risks)
 - `docs/security/operational-runbook.md` — Encryption posture, KEK/DEK rotation, supply-chain hygiene
 - `docs/compliance/soc2-control-mapping.md` — SOC 2 control mapping
 - `docs/architecture/managed-cloud.md` — Managed-cloud design document

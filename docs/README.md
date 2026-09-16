@@ -70,8 +70,7 @@ Last indexed: 2026-07-24.
 
 | Doc | What it is |
 |---|---|
-| [THREAT_MODEL.md](THREAT_MODEL.md) | STRIDE threat model **v2.0** — the current one |
-| [security/threat-model.md](security/threat-model.md) | Threat model **v1.0** — ⚠ likely superseded by the top-level v2.0 `THREAT_MODEL.md`; verify before citing |
+| [THREAT_MODEL.md](THREAT_MODEL.md) | STRIDE threat model **v2.1** — the one threat model (v1.0 merged in 2026-09-16) |
 | [security/architecture.md](security/architecture.md) | Security architecture document (v1.0) |
 | [security/pentest-scope.md](security/pentest-scope.md) | Penetration-test scope document |
 | [compliance/soc2-control-mapping.md](compliance/soc2-control-mapping.md) | SOC 2 Type II control mapping |

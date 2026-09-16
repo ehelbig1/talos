@@ -2,14 +2,14 @@
 
 ## Overview
 
-Talos is a workflow automation platform that executes user-provided WebAssembly modules. This document is a **summary**; the authoritative, maintained security documentation lives in [`docs/security/`](docs/security/):
+Talos is a workflow automation platform that executes user-provided WebAssembly modules. This document is a **summary**; the authoritative, maintained security documentation lives in [`docs/security/`](docs/security/) and [`docs/THREAT_MODEL.md`](docs/THREAT_MODEL.md):
 
-- [`threat-model.md`](docs/security/threat-model.md) — the full threat model (assets, adversaries, trust boundaries)
+- [`THREAT_MODEL.md`](docs/THREAT_MODEL.md) — the full STRIDE threat model (trust boundaries, attack surfaces, residual risks)
 - [`architecture.md`](docs/security/architecture.md) — security architecture detail (per-org DEKs, HKDF per-context AEAD subkeys, format versioning, signed NATS-RPC, capability worlds, tier ceilings)
 - [`operational-runbook.md`](docs/security/operational-runbook.md) — incident response and key-rotation procedures
 - [`pentest-scope.md`](docs/security/pentest-scope.md) — authorized testing scope
 
-If a statement here and one in `docs/security/` disagree, `docs/security/` wins — this file is refreshed less often.
+If a statement here and one in `docs/security/` or `docs/THREAT_MODEL.md` disagree, those documents win — this file is refreshed less often.
 
 ## Threat Model
 
