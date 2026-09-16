@@ -61,6 +61,18 @@ pub fn env_rate_limit(var: &str, default: u32) -> u32 {
     talos_config::positive_env_or_default(var, default)
 }
 
+/// Code default for `API_RATE_LIMIT` — the per-IP limit on API routes built in
+/// the controller bootstrap. ONE home: the bootstrap reads it, and the
+/// auditor-facing documents are pinned to it by
+/// `auditor_docs_state_the_code_defaults` below. (A test-only
+/// `RateLimitConfig::api()` with a default of 300 used to sit beside it; the
+/// documents quoted that number for months and it was deleted in package BV.)
+pub const API_RATE_LIMIT_DEFAULT_PER_MIN: u32 = 100;
+/// Code default for `WEBHOOK_RATE_LIMIT` (per-IP limit on webhook routes).
+pub const WEBHOOK_RATE_LIMIT_DEFAULT_PER_MIN: u32 = 60;
+/// Code default for `GLOBAL_RATE_LIMIT` (one process-wide bucket).
+pub const GLOBAL_RATE_LIMIT_DEFAULT_PER_MIN: u32 = 1000;
+
 /// Rate limiter configuration
 #[derive(Clone)]
 pub struct RateLimitConfig {
@@ -82,7 +94,6 @@ impl Default for RateLimitConfig {
     }
 }
 
-#[allow(dead_code)]
 impl RateLimitConfig {
     /// Create rate limit for authentication endpoints (stricter)
     pub fn auth() -> Self {
@@ -90,24 +101,6 @@ impl RateLimitConfig {
             requests: 5,
             per: Duration::from_secs(60), // 5 requests per minute
             burst_size: 2,
-        }
-    }
-
-    /// Create rate limit for general API endpoints
-    pub fn api() -> Self {
-        Self {
-            requests: env_rate_limit("RATE_LIMIT_API_REQUESTS", 300),
-            per: Duration::from_secs(env_rate_limit("RATE_LIMIT_API_WINDOW", 60) as u64),
-            burst_size: env_rate_limit("RATE_LIMIT_API_BURST", 100),
-        }
-    }
-
-    /// Create rate limit for webhooks
-    pub fn webhook() -> Self {
-        Self {
-            requests: 60,
-            per: Duration::from_secs(60), // 60 requests per minute (1/sec)
-            burst_size: 10,
         }
     }
 }
@@ -1081,16 +1074,15 @@ mod tests {
         let auth = RateLimitConfig::auth();
         assert_eq!(auth.requests, 5);
         assert_eq!(auth.per, Duration::from_secs(60));
-
-        // Since we allow configuring from env, these defaults are 300, 60, 100
-        // in a clean environment. Let's just assume we check the general logic.
-        // assert_eq!(api.requests, 300);
-        // assert_eq!(api.per, Duration::from_secs(60));
     }
 
     #[tokio::test]
     async fn test_rate_limiter_creation() {
-        let config = RateLimitConfig::api();
+        let config = RateLimitConfig {
+            requests: API_RATE_LIMIT_DEFAULT_PER_MIN,
+            per: Duration::from_secs(60),
+            burst_size: 20,
+        };
         let limiter = create_rate_limiter(config);
         assert!(limiter.check_key(&"127.0.0.1".to_string()).is_ok());
     }
@@ -1211,5 +1203,105 @@ mod tests {
             .next()
             .expect("global body");
         assert!(global.contains("record_rate_limit_hit(talos_metrics::RateLimitKind::Global)"));
+    }
+
+    /// The integer after the word `default` within `window` characters of an
+    /// occurrence of `var`, for every occurrence that has one.
+    fn documented_defaults(doc: &str, var: &str, window: usize) -> Vec<u32> {
+        let mut out = Vec::new();
+        for (idx, _) in doc.match_indices(var) {
+            let rest = &doc[idx + var.len()..];
+            let near: String = rest.chars().take(window).collect();
+            if let Some(after) = near.split("default").nth(1) {
+                let digits: String = after
+                    .trim_start()
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
+                if let Ok(n) = digits.parse() {
+                    out.push(n);
+                }
+            }
+        }
+        out
+    }
+
+    /// Package BV (2026-09-16): the SOC 2 mapping, the threat model and the
+    /// security architecture quoted a per-IP API limit of 300/min — the
+    /// default of a test-only config the production limiter never used —
+    /// while the bootstrap applied 100. Every documented default for the three
+    /// env-tunable limiters, the auth limiter's 5/min, the chart's API value
+    /// the threat model cites, and the API reference's rate-limit table are
+    /// held to the constants the bootstrap reads. A mention of the variable
+    /// with no `default` beside it is not a claim and is skipped; each
+    /// variable must still be found with a default at least `min` times, so a
+    /// reworded document cannot pass by saying nothing.
+    #[test]
+    fn auditor_docs_state_the_code_defaults() {
+        let docs = [
+            include_str!("../../docs/THREAT_MODEL.md"),
+            include_str!("../../docs/compliance/soc2-control-mapping.md"),
+            include_str!("../../docs/security/architecture.md"),
+            include_str!("../../docs/security/pentest-scope.md"),
+        ];
+        for (var, default, min) in [
+            ("API_RATE_LIMIT", API_RATE_LIMIT_DEFAULT_PER_MIN, 3),
+            ("WEBHOOK_RATE_LIMIT", WEBHOOK_RATE_LIMIT_DEFAULT_PER_MIN, 2),
+            ("GLOBAL_RATE_LIMIT", GLOBAL_RATE_LIMIT_DEFAULT_PER_MIN, 3),
+        ] {
+            let found: Vec<u32> = docs
+                .iter()
+                .flat_map(|d| documented_defaults(d, var, 40))
+                .collect();
+            assert!(
+                found.len() >= min,
+                "{var}: expected at least {min} documented defaults, found {found:?}"
+            );
+            assert!(
+                found.iter().all(|n| *n == default),
+                "{var}: documents state {found:?}, code default is {default}"
+            );
+        }
+
+        // The auth limiter the architecture describes.
+        let auth = RateLimitConfig::auth();
+        assert_eq!(auth.per, Duration::from_secs(60));
+        let arch = include_str!("../../docs/security/architecture.md");
+        let auth_block = arch
+            .split("Auth mutations (login / verifyTwoFactor / refreshToken / signup)")
+            .nth(1)
+            .expect("architecture rate-limit diagram names the auth limiter");
+        assert!(
+            auth_block
+                .lines()
+                .nth(1)
+                .is_some_and(|l| l.contains(&format!("{}/min per IP", auth.requests))),
+            "architecture must state the auth limiter's {}/min",
+            auth.requests
+        );
+
+        // The chart value the threat model cites is the chart's value.
+        let values = include_str!("../../deploy/helm/talos/values.yaml");
+        let chart: u32 = values
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("API_RATE_LIMIT: \""))
+            .and_then(|v| v.trim_end_matches('"').parse().ok())
+            .expect("values.yaml sets API_RATE_LIMIT");
+        assert!(
+            docs[0].contains(&format!("the Helm chart sets {chart}")),
+            "THREAT_MODEL must cite the chart's API_RATE_LIMIT ({chart})"
+        );
+
+        // The API reference (talos-api-docs) serves the same table.
+        let api_docs = include_str!("../../talos-api-docs/src/lib.rs");
+        for field in [
+            format!("graphql_per_minute: {API_RATE_LIMIT_DEFAULT_PER_MIN},"),
+            format!("webhook_per_minute: {WEBHOOK_RATE_LIMIT_DEFAULT_PER_MIN},"),
+        ] {
+            assert!(
+                api_docs.contains(&field),
+                "talos-api-docs must serve `{field}`"
+            );
+        }
     }
 }

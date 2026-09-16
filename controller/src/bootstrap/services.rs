@@ -1228,9 +1228,16 @@ pub(crate) fn build_rate_limiters() -> RateLimiters {
     // ---------- Initialize rate limiters ----------
     // Read rate limit configuration from environment variables
     // Load rate‑limit settings using the shared helper.
-    let api_rate_limit = rate_limit::env_rate_limit("API_RATE_LIMIT", 100);
-    let webhook_rate_limit = rate_limit::env_rate_limit("WEBHOOK_RATE_LIMIT", 60);
-    let global_rate_limit = rate_limit::env_rate_limit("GLOBAL_RATE_LIMIT", 1000);
+    let api_rate_limit =
+        rate_limit::env_rate_limit("API_RATE_LIMIT", rate_limit::API_RATE_LIMIT_DEFAULT_PER_MIN);
+    let webhook_rate_limit = rate_limit::env_rate_limit(
+        "WEBHOOK_RATE_LIMIT",
+        rate_limit::WEBHOOK_RATE_LIMIT_DEFAULT_PER_MIN,
+    );
+    let global_rate_limit = rate_limit::env_rate_limit(
+        "GLOBAL_RATE_LIMIT",
+        rate_limit::GLOBAL_RATE_LIMIT_DEFAULT_PER_MIN,
+    );
 
     // API rate limiter: configurable requests/min per IP (general GraphQL queries)
     let api_limiter = rate_limit::create_rate_limiter(rate_limit::RateLimitConfig {

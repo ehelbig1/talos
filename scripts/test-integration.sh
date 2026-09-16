@@ -566,6 +566,11 @@ CTRL_TESTS=(
     # schema_audit_log and its DDL event trigger stay; every SOC 2 collector
     # export statement PREPAREs. `common` harness, so CTRL_TESTS (64b).
     "dead_schema_tests"
+    # The auditor-facing documents (SOC 2 mapping, threat model, security
+    # architecture) name exactly the immutable audit tables and the
+    # actor_budget_policies columns + defaults the migrated schema has
+    # (package BV). `common` harness, so CTRL_TESTS (64b).
+    "auditor_doc_claims_tests"
     # No index is redundant by definition (exact duplicate or leading-prefix twin
     # of a same-predicate sibling); 45 dropped by migration 20260912120000 and the
     # two invariants pinned over the whole schema. `common` harness (64b).
