@@ -266,6 +266,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.builder
+    # allow-unpinned-image: built locally by scripts/build-compiler-image.sh (make builder), never pulled
     image: talos-builder:latest
     container_name: talos-builder
     entrypoint: ["echo", "Builder image ready"]
@@ -1589,7 +1590,7 @@ services:
   # mints a new origin and provider-side registrations must be updated
   # (the get_public_url_status MCP tool prints the commands).
   ngrok:
-    image: ngrok/ngrok:3
+    image: ngrok/ngrok:3@sha256:14d80d083e5b53145f416bbbd36238336c9de4016c43fd950eb2eb845670583b
     container_name: talos-ngrok
     profiles: ["public"]
     restart: unless-stopped

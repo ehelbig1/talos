@@ -45,6 +45,7 @@ WARN_PCT="${TALOS_UP_DISK_WARN_PCT:-80}"
 FAIL_PCT="${TALOS_UP_DISK_FAIL_PCT:-95}"
 # The probe image. Any image with a `df` will do; alpine is already present on
 # every machine that has built this stack.
+# allow-unpinned-image: used only if already present locally (`image inspect` gate + `--pull=never`), never pulled
 PROBE_IMAGE="${TALOS_UP_DISK_PROBE_IMAGE:-alpine}"
 # Hard deadline for EACH docker call, in tenths of a second. There are two
 # (inspect, then run), so the pathological worst case is twice this.

@@ -1035,9 +1035,12 @@ postgres:
     # securityContext is set accordingly.
     repository: pgvector/pgvector
     tag: "pg17"
-    # Pin to a digest in production. Compose with `docker manifest
-    # inspect pgvector/pgvector:pg17 | jq -r '.config.digest'`.
-    digest: ""
+    # Pinned (2026-09-16, package BX) to the SAME manifest-list digest
+    # docker-compose.yml, CI and the restore drill use — check 80 + check 93.
+    # A tag alone let an upstream re-push change the database image an
+    # upgrade rolls out. Resolve a new pin with
+    # `docker buildx imagetools inspect pgvector/pgvector:pg17`.
+    digest: "sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f"
     pullPolicy: IfNotPresent
 
   auth:
@@ -1300,6 +1303,9 @@ vault:
     kubectlImage:
       repository: alpine/k8s
       tag: "1.31.4"
+      # Pinned (package BX): this Job runs with the Vault ROOT token, so the
+      # image it pulls must not be a mutable tag.
+      digest: "sha256:9c4976d47656d78cf53a92b0203fc54ac45eae18a2b45001ac221c27da4c8036"
       pullPolicy: IfNotPresent
     # MCP-898 (2026-05-14): explicit resources for the init Job's two
     # containers. Pre-fix neither carried `resources:`, putting the

@@ -48,7 +48,7 @@ services:
   # (talos_workflow_job_protocol::nats_permissions). Same config file as
   # docker-compose.yml; the directory is bind-mounted (check 66).
   nats:
-    image: nats:2.10-alpine
+    image: nats:2.10-alpine@sha256:b83efabe3e7def1e0a4a31ec6e078999bb17c80363f881df35edc70fcb6bb927
     container_name: talos-nats-prod
     environment:
       NATS_USER: ${NATS_USER:?NATS_USER required in .env.production}
@@ -79,7 +79,7 @@ services:
 
   # Redis Cache
   redis:
-    image: redis:7-alpine
+    image: redis:7-alpine@sha256:7aec734b2bb298a1d769fd8729f13b8514a41bf90fcdd1f38ec52267fbaa8ee6
     container_name: talos-redis-prod
     command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD required in .env.production}
     # ✅ SECURITY: NO port exposure — internal Docker network only
