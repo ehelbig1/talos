@@ -104,7 +104,7 @@ Talos is a workflow automation platform built on:
 
 | Threat | Category | Mitigations | Residual Risk |
 |--------|----------|-------------|---------------|
-| WASM sandbox escape | EoP | wasmtime with 9-tier capability world system; each world restricts available WIT imports (filesystem, network, secrets, HTTP, governance); `minimal-node` default grants no host access | wasmtime CVE (mitigate with prompt updates; wasmtime is memory-safe Rust) |
+| WASM sandbox escape | EoP | wasmtime with a 12-world capability lattice; each world restricts available WIT imports (filesystem, network, secrets, HTTP, governance); `minimal-node` default grants no host access | wasmtime CVE (mitigate with prompt updates; wasmtime is memory-safe Rust) |
 | Resource exhaustion by guest | DoS | Fuel-based instruction metering; tokio::time::timeout wall-clock limits; per-module rate limiting | Fuel calibration may allow expensive operations within budget |
 | Filesystem escape | Info Disclosure | WASI filesystem access only granted to specific capability worlds; preopened directories scoped; most modules run without filesystem access | Symlink traversal if filesystem world is granted (restrict preopened paths) |
 | Secret exfiltration from guest | Info Disclosure | Per-module `allowed_secrets` allowlist (deny-all default); vault slot handles (not raw values) cross WASM boundary; `into_auth_header` is the single plaintext exit; slots have 300s TTL with auto-release; `__secret_tier2_exposed__` flag in execution output | Module with legitimate secret access could exfiltrate via HTTP (mitigate with SSRF blocking + network isolation) |
@@ -128,7 +128,7 @@ Talos is a workflow automation platform built on:
 **Attack vector:** Malicious user-authored module exploits wasmtime bug to break out of WASM sandbox.
 
 **Mitigations:**
-- 9-tier capability world system limits WIT imports per module tier
+- 12-world capability lattice (a partial order, not a ladder) limits WIT imports per module world
 - Default `minimal-node` world grants zero host access (no filesystem, no network, no secrets)
 - Capability escalation requires admin approval (governance-node ceiling per actor)
 - Compilation pipeline validates crate allowlist before building

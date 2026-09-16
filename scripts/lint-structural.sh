@@ -9216,6 +9216,35 @@ else
 fi
 echo
 
+bold "▶ check 92: an evidence path cited in an auditor-facing doc must exist and hold the code"
+# The SOC 2 control mapping, the security architecture, both threat models and
+# the pentest scope cite code as EVIDENCE. The May-2026 decomposition moved that
+# code into talos-* crates and left thin `pub use` shims (or nothing) at the old
+# controller/ and worker/ paths, so 120 citations pointed an auditor at a file
+# that did not exist (57) or at a three-line re-export (63). Scope is DERIVED:
+# every docs/**/*.md with a `**Classification:**` header. Findings: a cited path
+# that does not exist, or a `.rs` file made only of attributes / use / mod lines.
+# 120 on the tree before the repair, 0 after over 155 citations. Exit 2 (loud) when nothing is in
+# scope or no citation matches. Stated limits: existence and shape only — a file
+# that exists but no longer holds the named function, a stale `:<line>`, and a
+# wrong claim beside a right path all pass. No opt-out: a missing evidence path
+# has no legitimate form.
+if [ ! -f "$ROOT/scripts/lint-doc-evidence-paths.py" ]; then
+    red "✗ scripts/lint-doc-evidence-paths.py is missing — the check cannot run"
+    EXIT_CODE=1
+else
+    CK92_OUT="$(python3 "$ROOT/scripts/lint-doc-evidence-paths.py" "$ROOT" 2>&1)"
+    CK92_RC=$?
+    if [ "$CK92_RC" -eq 0 ]; then
+        green "✓ every evidence path in the classified docs names real code ($(echo "$CK92_OUT" | tail -1 | sed -E 's/^ +//'))"
+    else
+        echo "$CK92_OUT" | sed 's/^/  /'
+        red "✗ auditor-facing doc cites code that does not exist or a re-export shim"
+        EXIT_CODE=1
+    fi
+fi
+echo
+
 bold "▶ check 54: lint self-consistency (check numbering + documented count)"
 ACTUAL_NUMS="$(grep -oE '^bold "▶ check [0-9]+:' "${BASH_SOURCE[0]}" | grep -oE '[0-9]+' | sort -n)"
 EXPECTED_NUMS="$(seq 1 "$CHECK_COUNT")"

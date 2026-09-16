@@ -139,8 +139,7 @@ DEK, and are not per-org.)
 The `KekProvider` abstraction means every encrypted column above
 behaves identically regardless of whether the KEK is a local AES key
 or a Vault transit operation — call sites never branch on backend.
-See `docs/deployment.md` for the env→Vault migration procedure
-(historical reference: `docs/security/kek-to-kms-plan.md`).
+See `docs/deployment.md` for the env→Vault migration procedure.
 
 ### 2.2 Secret Lifecycle Steps
 
@@ -227,7 +226,7 @@ See `docs/deployment.md` for the env→Vault migration procedure
 
 | Check | Implementation | File |
 |-------|---------------|------|
-| Algorithm | HS256 only; reject others | `controller/src/auth/mod.rs` |
+| Algorithm | HS256 only; reject others | `talos-auth/src/lib.rs` |
 | Issuer claim | Must match `"talos"` | `Claims.iss` field, validated in `verify_token` |
 | Expiration | 15-minute TTL | `Claims.exp` checked by jsonwebtoken crate |
 | 2FA status | `is_2fa_verified` claim | Enforced at handler level for sensitive operations |
@@ -271,26 +270,44 @@ See `docs/deployment.md` for the env→Vault migration procedure
 
 ## 4. Authorization Model
 
-### 4.1 Capability World System (9 Tiers)
+### 4.1 Capability World System (12 worlds, a lattice)
 
-The capability world system controls what WIT (WebAssembly Interface Types) imports are available to each WASM module. Higher tiers unlock more host functions.
+The capability world system controls which WIT (WebAssembly Interface Types)
+imports a WASM module can link, and which worlds an actor may be given. There
+are **12** actor-ceiling worlds (`talos_capability_world::ACTOR_CEILING_WORLDS`);
+11 are compilable module worlds, and `llm-node` exists only as an actor
+ceiling. The worlds form a **partial order, not a ladder**: a ceiling permits
+a world only when that world's interfaces are a subset of the ceiling's
+(`talos_capability_world::ceiling_permits`). The permitted sets below are what
+the GraphQL `capabilityWorldHierarchy` query serves from that function:
 
-| Tier | World Name | Capabilities | Use Case |
-|------|-----------|-------------|----------|
-| 1 | `minimal` | Pure computation, no host access | Data transforms, validation |
-| 2 | `minimal-node` | Minimal + node I/O | Default for new modules |
-| 3 | `http-node` | HTTP client (outbound, SSRF-protected) | API integrations |
-| 4 | `secrets-node` | Vault access (per-module allowlist) | Authenticated API calls |
-| 5 | `automation-node` | Secrets + filesystem (scoped) | File processing |
-| 6 | `database-node` | Read-only database queries | Analytics, reporting |
-| 7 | `governance-node` | Approval gates, actor management | Human-in-the-loop workflows |
-| 8 | `full-node` | All standard capabilities | Trusted internal modules |
-| 9 | `admin-node` | Platform administration | System management |
+| Ceiling | Adds | Permits |
+|---------|------|---------|
+| `minimal-node` | Pure computation, no host access | `minimal-node` |
+| `http-node` | Outbound HTTP (SSRF-protected), events, SSE | `minimal-node`, `http-node`, `llm-node` |
+| `llm-node` | Native LLM host bindings, no vault | `minimal-node`, `http-node`, `llm-node` |
+| `network-node` | Raw socket access | `minimal-node`, `http-node`, `llm-node`, `network-node` |
+| `secrets-node` | Vault access (per-module allowlist) + LLM | `minimal-node`, `http-node`, `llm-node`, `network-node`, `secrets-node` |
+| `governance-node` | Human-approval gates | `minimal-node`, `governance-node` |
+| `messaging-node` | NATS pub/sub | `minimal-node`, `http-node`, `llm-node`, `network-node`, `messaging-node` |
+| `filesystem-node` | Scoped file I/O | `minimal-node`, `http-node`, `llm-node`, `network-node`, `filesystem-node` |
+| `cache-node` | Redis cache | `minimal-node`, `http-node`, `llm-node`, `network-node`, `cache-node` |
+| `database-node` | Sandboxed SQL | `minimal-node`, `http-node`, `llm-node`, `network-node`, `secrets-node`, `database-node` |
+| `agent-node` | LLM + secrets + memory + governance + orchestration | `minimal-node`, `http-node`, `llm-node`, `network-node`, `secrets-node`, `governance-node`, `agent-node` |
+| `automation-node` | All interfaces | all 12 |
 
-**Enforcement points:**
-- Compilation time: module's declared world checked against actor's max ceiling
-- Runtime: wasmtime only links WIT imports for the declared world
-- MCP tools: `add_node_to_workflow` checks capability ceiling BEFORE compilation
+There is no `full-node`, `admin-node` or `standard-node`; those
+names were retired and every gate reads them as unrecognised.
+
+**Enforcement points** (`talos-capability-world/src/lib.rs`):
+- Authoring: `add_node_to_workflow` / inline compile check the actor's ceiling
+  before compilation.
+- Dispatch: the engine refuses a module whose world the bound actor's ceiling
+  does not permit (`capability_ceiling::refuse_module_over_ceiling`, both
+  single and pipeline paths), which also covers sub-workflow children.
+- Runtime: wasmtime links only the WIT imports of the module's declared world.
+- Grants: a user's own ceiling lives in `user_capability_grants`, whose CHECK
+  constraint admits exactly the 12 worlds; an actor's world cannot exceed it.
 
 ### 4.2 Actor Budget System
 
@@ -337,7 +354,7 @@ Approval flow: Redis pub/sub for real-time notification; `execution_approvals` t
 
 ### 5.1 SSRF Protection
 
-The `check_outbound_url_no_ssrf()` function (in `controller/src/mcp/utils.rs`) blocks:
+The `check_outbound_url_no_ssrf()` function (in `talos-mcp-handlers/src/utils.rs`) blocks:
 
 | Blocked Range | Reason |
 |--------------|--------|

@@ -4,6 +4,7 @@
 **Date:** 2026-04-09
 **Methodology:** STRIDE (Spoofing, Tampering, Repudiation, Information Disclosure, Denial of Service, Elevation of Privilege)
 **Scope:** All externally reachable and internally critical attack surfaces
+**Classification:** CONFIDENTIAL -- share only with authorized auditors and pentest firms.
 
 ---
 
@@ -55,12 +56,12 @@ The MCP endpoint exposes 348+ tools via JSON-RPC over SSE and Streamable HTTP tr
 ### Spoofing
 - **Threat:** Unauthenticated tool invocation; forged agent identity.
 - **Mitigation:** JWT-based authentication on all MCP endpoints; `AgentIdentity` extracted from token with capability grants. API keys scoped to specific operations (`workflows:read`, `secrets:write`, etc.) with bcrypt-hashed storage and SHA256 lookup hash.
-- **File:** `controller/src/auth/mod.rs`, `controller/src/api_keys.rs`
+- **File:** `talos-auth/src/lib.rs`, `talos-api-keys/src/lib.rs`
 
 ### Tampering
 - **Threat:** Manipulated tool parameters bypass validation (e.g., negative `max_depth`, float `timeout_secs`).
 - **Mitigation:** Per-parameter validation with explicit rejection (not silent clamping). `fract() != 0.0` float guard, positivity checks, bounds validation on all numeric fields. Input size caps (1MB for payloads, 10KB for Rhai scripts).
-- **File:** `controller/src/mcp/workflows.rs`, `controller/src/mcp/actor.rs`
+- **File:** `talos-mcp-handlers/src/workflows.rs`, `talos-mcp-handlers/src/actor.rs`
 
 ### Repudiation
 - **Threat:** Admin invokes destructive operations (delete workflow, modify secrets) without audit trail.
@@ -167,22 +168,22 @@ The MCP endpoint exposes 348+ tools via JSON-RPC over SSE and Streamable HTTP tr
   width of the rollout).
   **Historical prefixes carry no attempt on either copy, so they partition into
   one attempt and stay CONFLICTING**; they age out of the sweep's 2 h window.
-- **File:** `talos-audit-event` (shared chain/HMAC + `verify_chain` + the duplicate classification + the per-attempt partition), `talos-audit-ledger` (consumer + inline verify + `batch_dedupe` + `verifier` module: the read-only identity and the failure classification), `talos-workflow-engine-nats/src/dispatcher.rs` (`resign_payload_for_retry` — the one site that stamps the attempt), `worker/src/audit.rs`, `talos-worker-runtime/src/runtime.rs` (`seal_job_audit_chain`)
+- **File:** `talos-audit-event` (shared chain/HMAC + `verify_chain` + the duplicate classification + the per-attempt partition), `talos-audit-ledger` (consumer + inline verify + `batch_dedupe` + `verifier` module: the read-only identity and the failure classification), `talos-workflow-engine-nats/src/dispatcher.rs` (`resign_payload_for_retry` — the one site that stamps the attempt), `talos-audit-event/src/lib.rs`, `talos-worker-runtime/src/runtime.rs` (`seal_job_audit_chain`)
 
 ### Information Disclosure
 - **Threat:** Tool responses leak internal errors, stack traces, or secret values.
 - **Mitigation:** Generic error messages returned to clients; full errors logged server-side only. DLP redaction applied to audit log payloads. Secret values never returned in API responses.
-- **File:** `controller/src/dlp.rs`, `controller/src/mcp/utils.rs`
+- **File:** `talos-dlp-provider/src/lib.rs`, `talos-mcp-handlers/src/utils.rs`
 
 ### Denial of Service
 - **Threat:** Rapid tool invocation exhausts server resources; unbounded pagination.
 - **Mitigation:** Per-IP rate limiting (300 req/min API, 5/min auth). Fail-closed in production (rate limiter failure = request rejected). Pagination with cursor-based limits.
-- **File:** `controller/src/rate_limit.rs`
+- **File:** `talos-rate-limit/src/middleware.rs`
 
 ### Elevation of Privilege
 - **Threat:** Non-admin user invokes admin-only tools (e.g., `set_wasm_config`, `publish_built_in_templates`).
 - **Mitigation:** `is_admin()` check at dispatch entry for admin tools. Capability-filtered tool lists (agents only see tools within their capability grants). `governance-node` ceiling per actor.
-- **File:** `controller/src/mcp/platform.rs`, `controller/src/mcp/actor.rs`
+- **File:** `talos-mcp-handlers/src/platform.rs`, `talos-mcp-handlers/src/actor.rs`
 
 ---
 
@@ -191,12 +192,12 @@ The MCP endpoint exposes 348+ tools via JSON-RPC over SSE and Streamable HTTP tr
 ### Spoofing
 - **Threat:** Stolen JWT replayed to impersonate user.
 - **Mitigation:** JWT with 15-min TTL, issuer claim validation, refresh token rotation. HttpOnly + Secure + SameSite=Strict cookies.
-- **File:** `controller/src/auth/mod.rs`
+- **File:** `talos-auth/src/lib.rs`
 
 ### Tampering
 - **Threat:** CSRF on mutation endpoints.
 - **Mitigation:** Double-submit cookie pattern with constant-time comparison (`constant_time_eq`). SameSite=Strict. CSRF token rotation after each mutation.
-- **File:** `controller/src/csrf.rs`
+- **File:** `talos-csrf/src/lib.rs`
 
 ### Information Disclosure
 - **Threat:** Schema introspection reveals internal types and fields.
@@ -210,7 +211,7 @@ The MCP endpoint exposes 348+ tools via JSON-RPC over SSE and Streamable HTTP tr
 ### Elevation of Privilege
 - **Threat:** User accesses another user's workflows via GraphQL.
 - **Mitigation:** All queries filter by `user_id` from JWT. Row-level ownership enforcement on workflows, secrets, executions.
-- **File:** `controller/src/api/schema/workflows/queries.rs`
+- **File:** `talos-api/src/schema/workflows/queries.rs`
 
 ---
 
@@ -219,7 +220,7 @@ The MCP endpoint exposes 348+ tools via JSON-RPC over SSE and Streamable HTTP tr
 ### Spoofing
 - **Threat:** Forged webhook payloads trigger unauthorized workflow executions.
 - **Mitigation:** HMAC-SHA256 signature verification with constant-time comparison (`subtle::ConstantTimeEq`). Per-trigger signing secrets. Slack-specific signature format support.
-- **File:** `controller/src/api/schema/webhooks/mutations.rs`
+- **File:** `talos-api/src/schema/webhooks/mutations.rs`
 
 ### Tampering
 - **Threat:** Replay of previously valid webhook payloads.
@@ -232,7 +233,7 @@ The MCP endpoint exposes 348+ tools via JSON-RPC over SSE and Streamable HTTP tr
 ### Elevation of Privilege
 - **Threat:** SSRF via user-configured webhook URLs (controller makes outbound requests to attacker-controlled URLs).
 - **Mitigation:** `check_outbound_url_no_ssrf()` blocks RFC1918, link-local, localhost, IPv6 ULA, cloud metadata endpoints (169.254.169.254, metadata.google.internal). HTTPS enforced for outbound.
-- **File:** `controller/src/mcp/utils.rs`
+- **File:** `talos-mcp-handlers/src/utils.rs`
 
 ---
 
@@ -247,22 +248,22 @@ This is the highest-risk attack surface. Users submit arbitrary Rust source code
 ### Tampering
 - **Threat:** Supply-chain attack via malicious dependency in user code.
 - **Mitigation:** Crate allowlist enforcement (only pre-approved dependencies compile). `cargo-audit` gate rejects known-vulnerable crates. `reqwest` explicitly blocked. Containerized compilation (Podman with `--network=none`).
-- **File:** `controller/src/compilation/mod.rs`
+- **File:** `talos-compilation/src/lib.rs`
 
 ### Information Disclosure
 - **Threat:** Module reads secrets beyond its allowlist; exfiltrates via HTTP.
 - **Mitigation:** Per-module `allowed_secrets` with deny-all default. Vault slot handles (opaque `SlotHandle(u64)`) cross WASM boundary, not raw values. `into_auth_header()` is the single plaintext exit. Slot TTL 300s with auto-release. Secret audit log records every access.
-- **File:** `worker/src/runtime.rs`, `worker/src/context.rs`
+- **File:** `talos-worker-runtime/src/runtime.rs`, `talos-worker-runtime/src/context.rs`
 
 ### Denial of Service
 - **Threat:** Module runs infinite loop or allocates unbounded memory.
 - **Mitigation:** Fuel-based instruction metering (default 10M fuel units). `tokio::time::timeout` wall-clock limits (default 30s, configurable 5-300s). Memory limit (default 128MB, max 512MB).
-- **File:** `worker/src/runtime.rs`
+- **File:** `talos-worker-runtime/src/runtime.rs`
 
 ### Elevation of Privilege
 - **Threat:** Module accesses host functions beyond its capability world (e.g., filesystem, network, governance).
-- **Mitigation:** 12-tier capability world system verified as partial order. Default `minimal-node` grants zero host access. Capability escalation requires admin approval. `get_actor_max_world()` checked before compilation.
-- **File:** `worker/src/wit_inspector.rs`
+- **Mitigation:** 12-world capability lattice verified as a partial order. Default `minimal-node` grants zero host access. Capability escalation requires admin approval. `get_actor_max_world()` checked before compilation.
+- **File:** `talos-wit-inspector/src/lib.rs`
 
 ---
 
@@ -301,7 +302,7 @@ This is the highest-risk attack surface. Users submit arbitrary Rust source code
 ### Information Disclosure
 - **Threat:** Secret values exfiltrated from database dump.
 - **Mitigation:** AES-256-GCM envelope encryption. DEKs are **per-organization** (`encryption_keys.org_id`; one global DEK + one active per org), each wrapped by the master KEK (`TALOS_MASTER_KEY` dev / Vault transit prod), never stored in DB plaintext. A row seals under its org's DEK (format v4) when an org is resolvable, else the global DEK (v3) — so a compromised root DEK is bounded to one tenant. DEKs cached (per-org + global) with Zeroizing memory. Within an org, each AEAD operation encrypts under a **per-context HKDF subkey** of the DEK (per secret / actor-key / execution / per-slot), not the shared DEK directly — the per-key message count is ~1, so the random-96-bit-nonce birthday bound is unreachable. (Checkpoint / worker-envelope / OTLP encryption use a separate `WORKER_SHARED_KEY`/`user_id` root, not the DEK.)
-- **File:** `controller/src/db.rs`, `talos-secrets-manager`
+- **File:** `talos-db/src/lib.rs`, `talos-secrets-manager`
 
 ### Denial of Service
 - **Threat:** Expensive queries lock tables or exhaust connections.
@@ -319,10 +320,10 @@ Rhai is used for approval condition evaluation and expression-based dispatch rou
 
 | Threat | Mitigation | File |
 |--------|-----------|------|
-| Arbitrary code execution via `eval()` | `engine.disable_symbol("eval")`; case-insensitive string-layer block | `controller/src/engine/rhai_helpers.rs` |
-| Module import escape | `import` blocked at string layer; `DummyModuleResolver` | `controller/src/engine/rhai_helpers.rs` |
-| Resource exhaustion | `max_operations(1000)`, `max_call_levels(16)`, `max_string_size(65536)`, `max_array_size(500)`, `max_map_size(500)` | `controller/src/engine/rhai_helpers.rs` |
-| Syntax injection at save time | `Engine::new_raw().compile()` validates syntax before persistence | `controller/src/mcp/actor.rs` |
+| Arbitrary code execution via `eval()` | `engine.disable_symbol("eval")`; case-insensitive string-layer block | `talos-engine/src/rhai_helpers.rs` |
+| Module import escape | `import` blocked at string layer; `DummyModuleResolver` | `talos-engine/src/rhai_helpers.rs` |
+| Resource exhaustion | `max_operations(1000)`, `max_call_levels(16)`, `max_string_size(65536)`, `max_array_size(500)`, `max_map_size(500)` | `talos-engine/src/rhai_helpers.rs` |
+| Syntax injection at save time | `Engine::new_raw().compile()` validates syntax before persistence | `talos-mcp-handlers/src/actor.rs` |
 
 ---
 
@@ -330,9 +331,9 @@ Rhai is used for approval condition evaluation and expression-based dispatch rou
 
 | Threat | Mitigation | File |
 |--------|-----------|------|
-| PII leakage in audit logs | `DlpProvider` with regex-based patterns: SSN, credit card (Luhn), email, phone, JWT detection | `controller/src/dlp.rs` |
-| PII in execution outputs | DLP redaction applied before audit persistence | `controller/src/audit_ledger.rs` |
-| External DLP integration | `ExternalDlpProvider` sends payloads to enterprise DLP webhook | `controller/src/dlp.rs` |
+| PII leakage in audit logs | `DlpProvider` with regex-based patterns: SSN, credit card (Luhn), email, phone, JWT detection | `talos-dlp-provider/src/lib.rs` |
+| PII in execution outputs | DLP redaction applied before audit persistence | `talos-audit-ledger/src/lib.rs` |
+| External DLP integration | `ExternalDlpProvider` sends payloads to enterprise DLP webhook | `talos-dlp-provider/src/lib.rs` |
 
 ---
 
@@ -340,10 +341,10 @@ Rhai is used for approval condition evaluation and expression-based dispatch rou
 
 | Header | Value | File |
 |--------|-------|------|
-| Content-Security-Policy | Strict CSP blocking inline scripts | `controller/src/security_headers.rs` |
-| X-Frame-Options | DENY | `controller/src/security_headers.rs` |
-| Strict-Transport-Security | max-age=31536000; includeSubDomains | `controller/src/security_headers.rs` |
-| X-Content-Type-Options | nosniff | `controller/src/security_headers.rs` |
+| Content-Security-Policy | Strict CSP blocking inline scripts | `talos-security-headers/src/lib.rs` |
+| X-Frame-Options | DENY | `talos-security-headers/src/lib.rs` |
+| Strict-Transport-Security | max-age=31536000; includeSubDomains | `talos-security-headers/src/lib.rs` |
+| X-Content-Type-Options | nosniff | `talos-security-headers/src/lib.rs` |
 
 ---
 
@@ -351,17 +352,17 @@ Rhai is used for approval condition evaluation and expression-based dispatch rou
 
 | Control | Implementation | File Path |
 |---------|---------------|-----------|
-| WASM sandboxing | Fuel limits, memory caps, capability worlds, wall-clock timeout | `worker/src/runtime.rs` |
+| WASM sandboxing | Fuel limits, memory caps, capability worlds, wall-clock timeout | `talos-worker-runtime/src/runtime.rs` |
 | Job signing | HMAC-SHA256 + AES-256-GCM under a per-job HKDF subkey + nonce per job | `talos-workflow-job-protocol/src/lib.rs` |
-| Audit ledger | HMAC-signed events, hash chains, DB immutability triggers, **consumer-side inline HMAC+hash verify before WORM persist (poison → Object-Locked `rejected/`), offline `verify_chain` for sequence/linkage/genesis** | `talos-audit-event`, `talos-audit-ledger`, `worker/src/audit.rs` |
-| SQL validation | AST-parsed via sqlparser, parameterized queries only | `worker/src/sql_validator.rs` |
-| DLP | PII redaction (SSN, CC, email, phone, JWT), Luhn validation | `controller/src/dlp.rs` |
-| Rate limiting | Per-IP, per-route, fail-closed in production | `controller/src/rate_limit.rs` |
-| JWT auth | HS256/RS256/ES256, issuer validation, 15-min TTL | `controller/src/auth/mod.rs` |
-| Capability lattice | 12 worlds, verified partial order, admin escalation gate | `worker/src/wit_inspector.rs` |
-| CSRF | Double-submit cookies, constant-time comparison | `controller/src/csrf.rs` |
-| Security headers | CSP, X-Frame-Options, HSTS, X-Content-Type-Options | `controller/src/security_headers.rs` |
-| SSRF protection | RFC1918/link-local/metadata endpoint blocking | `controller/src/mcp/utils.rs` |
+| Audit ledger | HMAC-signed events, hash chains, DB immutability triggers, **consumer-side inline HMAC+hash verify before WORM persist (poison → Object-Locked `rejected/`), offline `verify_chain` for sequence/linkage/genesis** | `talos-audit-event`, `talos-audit-ledger`, `talos-audit-event/src/lib.rs` |
+| SQL validation | AST-parsed via sqlparser, parameterized queries only | `talos-worker-runtime/src/sql_validator.rs` |
+| DLP | PII redaction (SSN, CC, email, phone, JWT), Luhn validation | `talos-dlp-provider/src/lib.rs` |
+| Rate limiting | Per-IP, per-route, fail-closed in production | `talos-rate-limit/src/middleware.rs` |
+| JWT auth | HS256/RS256/ES256, issuer validation, 15-min TTL | `talos-auth/src/lib.rs` |
+| Capability lattice | 12 worlds, verified partial order, admin escalation gate | `talos-capability-world/src/lib.rs` |
+| CSRF | Double-submit cookies, constant-time comparison | `talos-csrf/src/lib.rs` |
+| Security headers | CSP, X-Frame-Options, HSTS, X-Content-Type-Options | `talos-security-headers/src/lib.rs` |
+| SSRF protection | RFC1918/link-local/metadata endpoint blocking | `talos-mcp-handlers/src/utils.rs` |
 | Secret encryption | AES-256-GCM envelope encryption, master KEK, **per-organization DEKs** (one global + one per org; format v4/v3), per-context HKDF subkey derivation (per secret/actor/execution/per-slot; ~1 message per key), Zeroizing DEK cache | `talos-secrets-manager` |
 
 ---
@@ -374,7 +375,7 @@ Rhai is used for approval condition evaluation and expression-based dispatch rou
 | Single-region deployment | High | Low | Multi-region scaffolded but not proven. Mitigated by database replication; worker-crash is covered by controller-side dispatch retry, and interrupted runs are resumable via opt-in per-node checkpointing (RFC 0003). |
 | DLP patterns are regex-based (no ML-based PII detection) | Medium | Medium | Known PII formats covered. Novel PII patterns may pass through. Mitigated by ExternalDlpProvider hook for enterprise ML systems. |
 | Master key in environment variable | Critical | Low | Standard practice but not HSM-backed. Recommend migration to AWS KMS / GCP Cloud KMS for production. |
-| DNS rebinding bypasses SSRF check | High | Low | URL validated at config time, not at request time. **Closed (M4, 2026-05-22)**: `SsrfFilteringResolver` reapplies the private-IP filter at the reqwest resolve point, closing the TOCTOU window. See `worker/src/ssrf_resolver.rs`. |
+| DNS rebinding bypasses SSRF check | High | Low | URL validated at config time, not at request time. **Closed (M4, 2026-05-22)**: `SsrfFilteringResolver` reapplies the private-IP filter at the reqwest resolve point, closing the TOCTOU window. See `talos-worker-runtime/src/ssrf_resolver.rs`. |
 | Long-lived API keys | Medium | Medium | Scoped but no mandatory expiry. Recommend adding rotation reminders and maximum lifetime. |
 | Distributed brute-force from many IPs | Medium | Medium | Per-IP rate limiting only. Recommend CDN/WAF layer with global rate limiting. |
 | Redis unavailability causes fail-closed auth | Low | Low | By design, but may cause availability impact. |
