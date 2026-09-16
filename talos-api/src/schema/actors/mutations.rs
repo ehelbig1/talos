@@ -130,53 +130,40 @@ impl ActorsMutations {
         );
 
         let agent_id = Uuid::new_v4();
-        system_repo
-            .register_agent(
-                agent_id,
-                &name,
+        let registration = register_mcp_agent_recorded(
+            &db_pool,
+            talos_system_repo::NewAgent {
+                id: agent_id,
+                name: &name,
                 role_id,
-                &bcrypt_hash,
-                &lookup_hash,
-                *user_id,
-            )
-            .await
-            .map_err(|e| {
-                if e.to_string().contains("mcp_agents_name_key") {
-                    // MCP-1200 (2026-05-17): .extend_safe() added so the
-                    // duplicate-name message survives the production
-                    // scrubber. Pre-fix the Error::new on this line lacked
-                    // .extend_safe() AND the sibling else-branch on the
-                    // next call DID have it — the existing lint check 14
-                    // saw the sibling's .extend_safe() in its 8-line
-                    // lookahead and treated both as covered (blind spot).
-                    // The message had no whitelist-substring match either
-                    // ("already exists" not in the canonical list) so the
-                    // scrubber replaced it with "Internal server error",
-                    // leaving operators with no actionable signal.
-                    async_graphql::Error::new(format!("Agent name '{}' already exists", name))
-                        .extend_safe()
-                } else {
-                    tracing::error!("Failed to register MCP agent: {}", e);
-                    async_graphql::Error::new("Failed to register agent").extend_safe()
-                }
-            })?;
+                token_hash: &bcrypt_hash,
+                token_lookup_hash: &lookup_hash,
+                user_id: *user_id,
+            },
+            &role_name,
+        )
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "register_mcp_agent: insert or audit record failed");
+            async_graphql::Error::new("Failed to register agent").extend_safe()
+        })?;
+        if registration == AgentRegistration::DuplicateName {
+            // MCP-1200 (2026-05-17): .extend_safe() so the duplicate-name
+            // message survives the production scrubber ("already exists"
+            // is not on its whitelist).
+            return Err(
+                async_graphql::Error::new(format!("Agent name '{}' already exists", name))
+                    .extend_safe(),
+            );
+        }
 
         tracing::info!(
+            target: "talos_audit",
+            event_kind = "mcp_agent_registered",
             agent_id = %agent_id,
             agent_name = %name,
             role = %role_name,
             "MCP agent registered"
-        );
-
-        // Write to append-only admin_event_log for WORM-style audit trail.
-        talos_actor_repository::spawn_log_admin_event(
-            db_pool.clone(),
-            *user_id,
-            "registered",
-            "mcp_agent",
-            Some(agent_id),
-            format!("MCP agent '{}' registered with role '{}'", name, role_name),
-            Some(serde_json::json!({ "agent_id": agent_id, "role": role_name })),
         );
 
         Ok(McpAgentCreated {
@@ -1037,20 +1024,25 @@ impl ActorsMutations {
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
         let db_pool = ctx.data_unchecked::<sqlx::PgPool>();
 
-        let system_repo = talos_system_repo::SystemRepository::new(db_pool.clone());
-        let rows_affected = system_repo
-            .delete_agent_for_user(id, *user_id)
+        let Some(revoked) = revoke_mcp_agent_recorded(db_pool, id, *user_id)
             .await
             .map_err(|e| {
-                tracing::error!(error = %e, "graphql: mcp agent delete failed");
+                tracing::error!(error = %e, "graphql: mcp agent revocation failed");
                 async_graphql::Error::new("Request could not be completed").extend_safe()
-            })?;
-
-        if rows_affected == 0 {
+            })?
+        else {
             return Err(
                 async_graphql::Error::new("Agent not found or access denied").extend_safe(),
             );
-        }
+        };
+        tracing::info!(
+            target: "talos_audit",
+            event_kind = "mcp_agent_revoked",
+            agent_id = %id,
+            agent_name = %revoked.name,
+            role = %revoked.role,
+            "MCP agent revoked"
+        );
 
         // 2026-07-24: proactively evict the revoked agent's bearer token(s)
         // from the MCP auth bcrypt-verify cache so revocation is observable
@@ -1088,4 +1080,148 @@ struct McpAgentCreated {
     name: String,
     token: String,
     role: String,
+}
+
+/// Outcome of [`register_mcp_agent_recorded`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub enum AgentRegistration {
+    /// The agent row and its `registered` admin event committed together.
+    Registered,
+    /// `mcp_agents_name_key`: the name is taken; nothing was written.
+    DuplicateName,
+}
+
+/// Register an MCP agent and record it in `admin_event_log` in ONE
+/// transaction.
+///
+/// Until package BW (2026-09-16) the record was written by a detached
+/// `spawn_log_admin_event` after the insert returned, so a failed or dropped
+/// task left a live bearer credential with no registration record. Now the
+/// row and its record commit or roll back together: a failed audit write
+/// fails the registration, and the token — never returned — authenticates
+/// nothing.
+pub async fn register_mcp_agent_recorded(
+    pool: &sqlx::PgPool,
+    agent: talos_system_repo::NewAgent<'_>,
+    role_name: &str,
+) -> anyhow::Result<AgentRegistration> {
+    let mut tx = pool.begin().await?;
+    if let Err(e) =
+        talos_system_repo::SystemRepository::register_agent_on_conn(&mut tx, agent).await
+    {
+        let duplicate = e
+            .as_database_error()
+            .and_then(|d| d.constraint())
+            .is_some_and(|c| c == "mcp_agents_name_key");
+        if duplicate {
+            return Ok(AgentRegistration::DuplicateName);
+        }
+        return Err(e.into());
+    }
+    talos_actor_repository::insert_admin_event_log_on_conn(
+        &mut tx,
+        agent.user_id,
+        "registered",
+        "mcp_agent",
+        Some(agent.id),
+        &format!(
+            "MCP agent '{}' registered with role '{}'",
+            agent.name, role_name
+        ),
+        Some(&serde_json::json!({ "agent_id": agent.id, "role": role_name })),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(AgentRegistration::Registered)
+}
+
+/// Revoke (delete) an MCP agent and record the revocation in
+/// `admin_event_log` in ONE transaction. `Ok(None)` = no such agent for this
+/// user, and nothing is written.
+///
+/// Until package BW (2026-09-16) `revokeMcpAgent` deleted the row and wrote
+/// nothing, and because the row is the only place the agent's name, role and
+/// connection history lived, a revoked credential left no trace at all —
+/// measured on the reference deployment: two `registered` events, one
+/// remaining row, no record of the other's revocation. The event now carries
+/// what the deleted row held.
+///
+/// Atomic by decision: if the record cannot be written the DELETE rolls back
+/// and the caller is told the revocation failed, so the credential is never
+/// gone without its record. The cost is that a database able to delete a row
+/// but not append to the audit table refuses the revocation until it can;
+/// the caller sees an error, not a silent success, and can retry.
+pub async fn revoke_mcp_agent_recorded(
+    pool: &sqlx::PgPool,
+    agent_id: Uuid,
+    user_id: Uuid,
+) -> anyhow::Result<Option<talos_system_repo::RevokedAgent>> {
+    let mut tx = pool.begin().await?;
+    let Some(revoked) =
+        talos_system_repo::SystemRepository::revoke_agent_on_conn(&mut tx, agent_id, user_id)
+            .await?
+    else {
+        return Ok(None);
+    };
+    talos_actor_repository::insert_admin_event_log_on_conn(
+        &mut tx,
+        user_id,
+        "revoked",
+        "mcp_agent",
+        Some(agent_id),
+        &format!(
+            "MCP agent '{}' revoked (role '{}')",
+            revoked.name, revoked.role
+        ),
+        Some(&serde_json::json!({
+            "agent_id": agent_id,
+            "role": revoked.role,
+            "created_at": revoked.created_at,
+            "last_connected_at": revoked.last_connected_at,
+        })),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Some(revoked))
+}
+
+/// TEXTUAL pins, stated as such: no test harness in this workspace drives a
+/// GraphQL resolver, so the behavioural guard is
+/// `controller/tests/mcp_agent_lifecycle_audit_tests` over the two recorded
+/// functions, and this pins that the resolvers reach them. Calling the bare
+/// repository functions from a resolver would register or revoke a credential
+/// with no record while every DB test stayed green.
+#[cfg(test)]
+mod mcp_agent_resolver_record_pins {
+    #[test]
+    fn the_resolvers_register_and_revoke_through_the_recorded_functions() {
+        let src = include_str!("mutations.rs");
+        let resolvers = src
+            .split("/// Outcome of [`register_mcp_agent_recorded`].")
+            .next()
+            .expect("resolver half of the file");
+        let register = resolvers
+            .split("async fn register_mcp_agent(")
+            .nth(1)
+            .and_then(|s| s.split("async fn ").next())
+            .expect("register_mcp_agent resolver");
+        assert!(register.contains("register_mcp_agent_recorded("));
+        let revoke = resolvers
+            .split("async fn revoke_mcp_agent(")
+            .nth(1)
+            .and_then(|s| s.split("async fn ").next())
+            .expect("revoke_mcp_agent resolver");
+        assert!(revoke.contains("revoke_mcp_agent_recorded("));
+        for bare in [
+            "register_agent_on_conn(",
+            "revoke_agent_on_conn(",
+            "spawn_log_admin_event(",
+        ] {
+            assert!(
+                !register.contains(bare) && !revoke.contains(bare),
+                "an MCP agent resolver calls `{bare}` directly"
+            );
+        }
+    }
 }

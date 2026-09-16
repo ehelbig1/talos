@@ -788,7 +788,13 @@ malicious module escaped:
 docker exec talos-postgres psql -U talos -d talos -c \
   "SELECT id, name, last_connected_at FROM mcp_agents WHERE name = '...';"
 
-# 2. Revoke (set is_active = false)
+# 2. Revoke through the API (Settings → MCP Server in the UI, or the
+#    `revokeMcpAgent(id:)` GraphQL mutation). It deletes the row, records the
+#    revocation in admin_event_log in the same transaction (agent name, role,
+#    created_at, last_connected_at), and evicts the token from the MCP auth
+#    cache immediately. Only if the API is unreachable, deactivate by hand —
+#    this writes NO audit record and a cached token keeps authenticating for
+#    up to ~10 s:
 docker exec talos-postgres psql -U talos -d talos -c \
   "UPDATE mcp_agents SET is_active = false WHERE id = '...';"
 

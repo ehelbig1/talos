@@ -571,6 +571,10 @@ CTRL_TESTS=(
     # actor_budget_policies columns + defaults the migrated schema has
     # (package BV). `common` harness, so CTRL_TESTS (64b).
     "auditor_doc_claims_tests"
+    # MCP agent registration and revocation commit with exactly one
+    # admin_event_log record each, a refused change writes nothing, and a failed
+    # audit write leaves the credential untouched (package BW). `common` (64b).
+    "mcp_agent_lifecycle_audit_tests"
     # No index is redundant by definition (exact duplicate or leading-prefix twin
     # of a same-predicate sibling); 45 dropped by migration 20260912120000 and the
     # two invariants pinned over the whole schema. `common` harness (64b).
