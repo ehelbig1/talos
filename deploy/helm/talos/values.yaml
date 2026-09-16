@@ -1281,6 +1281,25 @@ vault:
   #     placeholder — `__pending_vault_init__`, `dev-root`, or empty),
   #     then trigger a controller rollout so envFromSecret picks up the
   #     new value at the next pod start.
+  # Sidecar that unseals the in-chart Vault after any pod restart (package BY,
+  # 2026-09-16). Vault's seal state is process memory: without it a restarted
+  # Vault stays sealed until the next install/upgrade runs the init Job, and
+  # every KEK wrap/unwrap fails once the controller's 5-minute DEK cache
+  # drains. It reads the unseal key from bootstrap.json on the Vault volume —
+  # the key is ALREADY co-located with the data (see init-job.yaml); this
+  # restores availability, it does not add exposure. Disable only if you unseal
+  # by other means (e.g. auto-unseal against an external KMS).
+  unsealer:
+    enabled: true
+    intervalSeconds: 10
+    resources:
+      requests:
+        cpu: 5m
+        memory: 16Mi
+      limits:
+        cpu: 50m
+        memory: 64Mi
+
   init:
     enabled: true
     # kubectl image used by the secret-patcher container. Pin to the

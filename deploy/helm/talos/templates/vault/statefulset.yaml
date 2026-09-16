@@ -147,6 +147,52 @@ spec:
               mountPath: /vault/tls
               readOnly: true
             {{- end }}
+        {{- if .Values.vault.unsealer.enabled }}
+        # Package BY (2026-09-16): Vault's seal state is process memory, so a
+        # restarted Vault pod comes back SEALED — measured on this image, with
+        # the chart's own init/unseal commands. Only the vault-init Job ever
+        # unsealed, and it runs at install/upgrade, so a pod restart between
+        # upgrades broke every KEK wrap/unwrap once the controller's DEK cache
+        # drained. This sidecar polls the co-located Vault over loopback and
+        # unseals it from bootstrap.json. Body: files/vault-unseal-loop.sh
+        # (tested against a real Vault by scripts/tests/vault-chart-init-test.sh).
+        - name: unsealer
+          image: {{ include "talos.image" .Values.vault.image }}
+          imagePullPolicy: {{ .Values.vault.image.pullPolicy }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: VAULT_ADDR
+              value: {{ if .Values.tls.inCluster.enabled }}"https://127.0.0.1:8200"{{ else }}"http://127.0.0.1:8200"{{ end }}
+            {{- if .Values.tls.inCluster.enabled }}
+            - name: VAULT_SKIP_VERIFY
+              value: "true"
+            {{- end }}
+            - name: VAULT_UNSEAL_INTERVAL_SECS
+              value: {{ .Values.vault.unsealer.intervalSeconds | quote }}
+            # The vault CLI writes a token helper file under HOME; the root
+            # filesystem is read-only.
+            - name: HOME
+              value: /tmp
+          command:
+            - /bin/sh
+            - -c
+            - |
+{{ .Files.Get "files/vault-unseal-loop.sh" | indent 14 }}
+          resources:
+            {{- toYaml .Values.vault.unsealer.resources | nindent 12 }}
+          volumeMounts:
+            - name: data
+              mountPath: /vault/file
+              readOnly: true
+            - name: unsealer-tmp
+              mountPath: /tmp
+        {{- end }}
       volumes:
         - name: config
           configMap:
@@ -154,6 +200,11 @@ spec:
         - name: logs
           emptyDir:
             sizeLimit: "256Mi"
+        {{- if .Values.vault.unsealer.enabled }}
+        - name: unsealer-tmp
+          emptyDir:
+            sizeLimit: "8Mi"
+        {{- end }}
         {{- if .Values.tls.inCluster.enabled }}
         - name: tls
           secret:

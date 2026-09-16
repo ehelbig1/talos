@@ -48,15 +48,18 @@
 #   - `secrets enable transit` + `write -f transit/keys/$KEK` swallow
 #     "already exists" errors.
 #   - `policy write` is upsert by design.
-#   - Token mint creates a NEW token each run (cheap; an unused one
-#     expires at its -period=768h, since nothing renews it). Only the
-#     first run's token reaches the controller — see step 8 — and the
-#     controller keeps THAT one alive by renewing it.
-#   - Secret patch only fires when VAULT_TOKEN is a known placeholder.
+#   - A controller token is minted ONLY when VAULT_TOKEN is a known
+#     placeholder (until 2026-09-16 every run minted a fresh orphan 768h
+#     token and discarded it — a valid, unused credential per upgrade), and
+#     a minted token whose Secret patch fails is revoked before exiting.
+#   - Each run generates its own root token from the unseal key and revokes
+#     it on exit, success or failure; bootstrap.json keeps no root token
+#     (one written by an earlier chart is revoked and removed).
 #   - Controller rollout only fires if the deployment exists.
 #
-# bootstrap.json (unseal key + initial root token) lives on the Vault
-# data PVC, NOT in a K8s Secret. That intentionally ties key material
+# bootstrap.json (the unseal key; no root token since package BY) lives on
+# the Vault data PVC, NOT in a K8s Secret. The StatefulSet's `unsealer`
+# sidecar reads it to unseal Vault after any pod restart. That intentionally ties key material
 # to the Vault PVC lifecycle — `helm uninstall` doesn't revoke unseal.
 # Operators running HA Vault must replace this Job with Shamir-split
 # keys held by distinct humans.
@@ -142,196 +145,14 @@ spec:
             # the container otherwise blocks any write.
             - name: tmp
               mountPath: /tmp
+          # The script lives in files/vault-init.sh so it can be tested against
+          # a real Vault (scripts/tests/vault-chart-init-test.sh). No `set -x`
+          # anywhere: it handles the unseal key and a root token.
           command:
             - /bin/sh
             - -c
             - |
-              set -eu
-
-              # Verbose tracing — every shell command echoed. Cheap;
-              # the script is ~50 lines and finishes in seconds. Helps
-              # the next operator who hits a Vault-side regression
-              # narrow it to the exact kubectl call in <30 s.
-              set -x
-
-              # ── 1. Wait for the Vault pod to be Ready ────────────────
-              # On fresh installs the Vault StatefulSet is being created
-              # in parallel with this Job. Poll until the pod exists +
-              # its first container reports ready=true. 5 min budget.
-              echo "vault-init: waiting for $VAULT_POD to be Ready (max 5 min)..."
-              for i in $(seq 1 60); do
-                  phase="$(kubectl -n "$NAMESPACE" get pod "$VAULT_POD" \
-                              -o jsonpath='{.status.phase}' 2>/dev/null || true)"
-                  ready="$(kubectl -n "$NAMESPACE" get pod "$VAULT_POD" \
-                              -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || true)"
-                  if [ "$phase" = "Running" ] && [ "$ready" = "true" ]; then
-                      echo "vault-init: $VAULT_POD ready"
-                      break
-                  fi
-                  sleep 5
-              done
-
-              # ── 2. Initialize Vault on first install ─────────────────
-              INIT_STATE="$(kubectl -n "$NAMESPACE" exec "$VAULT_POD" -- \
-                  sh -c 'vault status -format=json 2>&1 | grep -o "\"initialized\":[[:space:]]*true" || true')"
-              if [ -z "$INIT_STATE" ]; then
-                  echo "vault-init: initializing fresh Vault storage"
-                  kubectl -n "$NAMESPACE" exec "$VAULT_POD" -- sh -c '
-                      vault operator init -key-shares=1 -key-threshold=1 -format=json \
-                          > /vault/file/bootstrap.json &&
-                      chmod 600 /vault/file/bootstrap.json
-                  '
-              else
-                  echo "vault-init: existing Vault storage detected"
-                  # Defensive check — if Vault is initialized but
-                  # bootstrap.json is missing, we have no path forward
-                  # without operator intervention (PVC was wiped without
-                  # this Job knowing, or someone deleted the file).
-                  if ! kubectl -n "$NAMESPACE" exec "$VAULT_POD" -- \
-                      test -f /vault/file/bootstrap.json; then
-                      echo "vault-init: ERROR — Vault initialized but bootstrap.json missing." >&2
-                      echo "vault-init: restore the file from backup OR delete the Vault PVC" >&2
-                      echo "vault-init: and re-run (data loss)." >&2
-                      exit 1
-                  fi
-              fi
-
-              # ── 3. Extract root token + unseal key from bootstrap.json ──
-              # awk/sed inside the exec — avoids piping multi-line JSON
-              # across kubectl exec's stdin/stdout boundary.
-              ROOT_TOKEN="$(kubectl -n "$NAMESPACE" exec "$VAULT_POD" -- sh -c '
-                  sed -n "s/.*\"root_token\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" \
-                      /vault/file/bootstrap.json | head -1
-              ')"
-              if [ -z "$ROOT_TOKEN" ]; then
-                  echo "vault-init: ERROR — could not parse root token from bootstrap.json" >&2
-                  exit 1
-              fi
-
-              # SECURITY: disable command tracing now that secrets are in
-              # scope. From here on the script EXPANDS $ROOT_TOKEN, $UNSEAL_KEY,
-              # and the minted $CONTROLLER_TOKEN directly into commands (e.g.
-              # `env VAULT_TOKEN="$ROOT_TOKEN" ...`, `vault operator unseal
-              # '$UNSEAL_KEY'`). Under `set -x` those values would be printed to
-              # this Job pod's stdout — and the pod is retained
-              # `ttlSecondsAfterFinished`, so anyone with `kubectl logs` could
-              # recover the Vault root token + unseal key. The `$(...)` captures
-              # above are safe (set -x traces the command, not its output); only
-              # the use-sites below leak, so we fence them off. The earlier
-              # pod-wait / init phases keep tracing for debuggability.
-              set +x
-
-              # ── 4. Unseal if needed ─────────────────────────────────
-              SEALED="$(kubectl -n "$NAMESPACE" exec "$VAULT_POD" -- \
-                  sh -c 'vault status -format=json 2>&1 | grep -o "\"sealed\":[[:space:]]*true" || true')"
-              if [ -n "$SEALED" ]; then
-                  echo "vault-init: unsealing"
-                  UNSEAL_KEY="$(kubectl -n "$NAMESPACE" exec "$VAULT_POD" -- sh -c '
-                      awk "/unseal_keys_b64/{f=1;next} /\]/{f=0} f" /vault/file/bootstrap.json |
-                          sed -n "s/.*\"\([^\"]*\)\".*/\1/p" | head -1
-                  ')"
-                  kubectl -n "$NAMESPACE" exec "$VAULT_POD" -- \
-                      sh -c "vault operator unseal '$UNSEAL_KEY' >/dev/null"
-              fi
-
-              # ── 5. Ensure transit engine + KEK key ──────────────────
-              # Both are upserts; `|| true` swallows "already enabled".
-              kubectl -n "$NAMESPACE" exec "$VAULT_POD" -- \
-                  env VAULT_TOKEN="$ROOT_TOKEN" \
-                  sh -c "vault secrets enable -path=transit transit 2>/dev/null || true"
-              kubectl -n "$NAMESPACE" exec "$VAULT_POD" -- \
-                  env VAULT_TOKEN="$ROOT_TOKEN" \
-                  sh -c "vault write -f transit/keys/$KEK_KEY 2>/dev/null || true"
-
-              # ── 6. Write the least-privilege controller policy ──────
-              # Heredoc piped over `kubectl exec -i`. The policy grants
-              # ONLY the transit ops the controller needs against the
-              # KEK key — no token mint, no key rotation, no other
-              # engines.
-              cat <<POLICY | kubectl -n "$NAMESPACE" exec -i "$VAULT_POD" -- \
-                  env VAULT_TOKEN="$ROOT_TOKEN" \
-                  sh -c "vault policy write talos-controller -"
-              path "transit/encrypt/$KEK_KEY" { capabilities = ["update"] }
-              path "transit/decrypt/$KEK_KEY" { capabilities = ["update"] }
-              path "transit/keys/$KEK_KEY"    { capabilities = ["read"] }
-              POLICY
-
-              # ── 7. Mint an orphan periodic token under the policy ───
-              # -orphan: not revoked when its parent (root) is revoked.
-              # -period=768h: each RENEWAL restores a full 32-day TTL.
-              #   Vault does NOT renew a token because it is used —
-              #   measured 2026-09-14, a periodic token used for transit
-              #   every 10 s expired on schedule — so the controller runs
-              #   its own renew-self loop (VaultTransitProvider::
-              #   run_token_renewal: at boot, then at most hourly) and
-              #   counts it on talos_vault_token_renewals_total. Without
-              #   that loop this token expired 32 days after install.
-              TOKEN_JSON="$(kubectl -n "$NAMESPACE" exec "$VAULT_POD" -- \
-                  env VAULT_TOKEN="$ROOT_TOKEN" \
-                  vault token create \
-                      -policy=talos-controller \
-                      -period=768h \
-                      -orphan \
-                      -display-name=talos-controller \
-                      -format=json)"
-              CONTROLLER_TOKEN="$(printf '%s' "$TOKEN_JSON" |
-                  sed -n 's/.*"client_token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)"
-              if [ -z "$CONTROLLER_TOKEN" ]; then
-                  echo "vault-init: ERROR — failed to mint talos-controller token" >&2
-                  echo "$TOKEN_JSON" | head -20 >&2
-                  exit 1
-              fi
-
-              # ── 8. Patch bootstrap secret IFF current is a placeholder ──
-              # Only replace placeholders. An operator who manually
-              # rotated to a custom token (e.g. AppRole-derived) gets
-              # to keep it. Idempotency property: a re-run after a
-              # successful patch sees the real token, leaves it alone.
-              CURRENT_B64="$(kubectl -n "$NAMESPACE" get secret "$BOOTSTRAP_SECRET" \
-                  -o jsonpath='{.data.VAULT_TOKEN}' 2>/dev/null || true)"
-              if [ -n "$CURRENT_B64" ]; then
-                  CURRENT="$(printf '%s' "$CURRENT_B64" | base64 -d 2>/dev/null || true)"
-              else
-                  CURRENT=""
-              fi
-
-              case "$CURRENT" in
-                __pending_vault_init__|dev-root|"")
-                  echo "vault-init: VAULT_TOKEN is a placeholder ('${CURRENT:-<empty>}'); patching"
-                  NEW_B64="$(printf '%s' "$CONTROLLER_TOKEN" | base64 | tr -d '\n')"
-                  PAYLOAD="$(printf '{"data":{"VAULT_TOKEN":"%s"}}' "$NEW_B64")"
-                  kubectl -n "$NAMESPACE" patch secret "$BOOTSTRAP_SECRET" \
-                      --type=merge -p "$PAYLOAD" >/dev/null
-                  echo "vault-init: bootstrap secret patched"
-
-                  # ── 9. Trigger controller rollout ───────────────────
-                  # envFromSecret reads at pod start; rotating the
-                  # secret without a rollout leaves running pods on
-                  # the OLD (placeholder) value. The new MCP-1231
-                  # `checksum/bootstrap-secret-data` annotation will
-                  # ALSO trigger a roll on the next helm upgrade, but
-                  # we want the live pod to pick up the patch
-                  # immediately, not on the next reconcile.
-                  #
-                  # Tolerate deployment-not-yet-exists (first install
-                  # race) — the controller will pick up the patched
-                  # secret on its first pod creation regardless.
-                  if kubectl -n "$NAMESPACE" get deployment "$CONTROLLER_DEPLOY" >/dev/null 2>&1; then
-                      NOW="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-                      ROLL_PATCH="$(printf '{"spec":{"template":{"metadata":{"annotations":{"kubectl.kubernetes.io/restartedAt":"%s"}}}}}' "$NOW")"
-                      kubectl -n "$NAMESPACE" patch deployment "$CONTROLLER_DEPLOY" \
-                          --type=strategic -p "$ROLL_PATCH" >/dev/null
-                      echo "vault-init: controller rollout triggered"
-                  else
-                      echo "vault-init: controller deployment not yet present; skipping rollout"
-                  fi
-                  ;;
-                *)
-                  echo "vault-init: VAULT_TOKEN is operator-set (not a placeholder); leaving alone"
-                  ;;
-              esac
-
-              echo "vault-init: complete"
+{{ .Files.Get "files/vault-init.sh" | indent 14 }}
       volumes:
         - name: tmp
           emptyDir:
