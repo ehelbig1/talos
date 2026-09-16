@@ -1751,21 +1751,40 @@ pub struct AuditChainJobVerification {
     /// "4 events" from "two dispatches of two", and `breaks` can name the same
     /// `sequence` twice meaning two different records.
     pub dispatch_attempts: i32,
+    /// Dispatch attempts that sealed NO terminal anchor, so their tail is
+    /// unprovable. Does not clear `ok` — a chain written before the anchor
+    /// existed is legitimately here — but a non-zero value means this run
+    /// could not check whether records were removed from the END.
+    pub unanchored_attempts: i32,
+    /// The terminal-anchor verdict, rendered. The ONLY field that can name a
+    /// truncation: deleting a chain's last records leaves every remaining link
+    /// intact, so such a job reports `ok: false` with an EMPTY `breaks` list.
+    pub anchor: String,
 }
 
-impl From<talos_audit_ledger::ChainVerificationReport> for AuditChainJobVerification {
-    fn from(r: talos_audit_ledger::ChainVerificationReport) -> Self {
-        let duplicate_deliveries = i32::try_from(r.duplicate_delivery_count()).unwrap_or(i32::MAX);
-        let dispatch_attempts = i32::try_from(r.dispatch_attempt_count()).unwrap_or(i32::MAX);
+impl From<talos_audit_ledger::AnchoredChainVerificationReport> for AuditChainJobVerification {
+    fn from(r: talos_audit_ledger::AnchoredChainVerificationReport) -> Self {
+        let unanchored_attempts = i32::try_from(r.unanchored_attempts()).unwrap_or(i32::MAX);
+        let anchor = r.anchor.describe();
+        let c = r.chain;
+        let duplicate_deliveries = i32::try_from(c.duplicate_delivery_count()).unwrap_or(i32::MAX);
+        let dispatch_attempts = i32::try_from(c.dispatch_attempt_count()).unwrap_or(i32::MAX);
         Self {
-            module_execution_id: r.execution_id,
-            workflow_execution_id: r.workflow_id,
-            total_events: i32::try_from(r.total_events).unwrap_or(i32::MAX),
+            module_execution_id: c.execution_id,
+            workflow_execution_id: c.workflow_id,
+            total_events: i32::try_from(c.total_events).unwrap_or(i32::MAX),
+            // `r.ok`, NOT `c.ok`: the anchored bit is the chain's own verdict
+            // AND the terminal anchor's. A chain truncated before its anchor
+            // has `c.ok == true` — every event that remains is contiguous,
+            // linked and signed — so reading the inner bit here is exactly the
+            // "verified" answer this surface used to give for a deleted tail.
             ok: r.ok,
-            signatures_checked: r.signatures_checked,
-            breaks: r.breaks.iter().map(AuditChainBreak::from).collect(),
+            signatures_checked: c.signatures_checked,
+            breaks: c.breaks.iter().map(AuditChainBreak::from).collect(),
             duplicate_deliveries,
             dispatch_attempts,
+            unanchored_attempts,
+            anchor,
         }
     }
 }
@@ -1806,6 +1825,10 @@ pub struct AuditChainVerification {
     /// How many of `jobs` hold more than one controller dispatch attempt — a
     /// re-dispatched `job_id`. A retry, not a finding; `ok` is unaffected.
     pub jobs_with_multiple_attempts: i32,
+    /// How many of `jobs` sealed no terminal anchor on at least one dispatch.
+    /// `ok` is unaffected — the verdict is soft so pre-anchor chains keep
+    /// verifying — but for those jobs this run did not check the TAIL.
+    pub jobs_unanchored: i32,
     /// The per-job chains this aggregate is built from. EMPTY means nothing
     /// was verified, which is why `ok` is false in that case.
     pub jobs: Vec<AuditChainJobVerification>,
@@ -1820,7 +1843,7 @@ impl AuditChainVerification {
     pub fn aggregate(
         execution_id: String,
         workflow_id: String,
-        reports: Vec<talos_audit_ledger::ChainVerificationReport>,
+        reports: Vec<talos_audit_ledger::AnchoredChainVerificationReport>,
     ) -> Self {
         let jobs: Vec<AuditChainJobVerification> = reports
             .into_iter()
@@ -1839,6 +1862,9 @@ impl AuditChainVerification {
         let jobs_with_multiple_attempts: i32 =
             i32::try_from(jobs.iter().filter(|j| j.dispatch_attempts > 1).count())
                 .unwrap_or(i32::MAX);
+        let jobs_unanchored: i32 =
+            i32::try_from(jobs.iter().filter(|j| j.unanchored_attempts > 0).count())
+                .unwrap_or(i32::MAX);
         Self {
             execution_id,
             workflow_id,
@@ -1852,6 +1878,7 @@ impl AuditChainVerification {
             breaks,
             duplicate_deliveries,
             jobs_with_multiple_attempts,
+            jobs_unanchored,
             jobs,
         }
     }
@@ -1899,7 +1926,7 @@ mod audit_chain_mapping_tests {
         assert_eq!(unsigned.sequence, Some(6));
     }
 
-    fn report(id: &str, ok: bool, total_events: usize) -> ChainVerificationReport {
+    fn chain_report(id: &str, ok: bool, total_events: usize) -> ChainVerificationReport {
         ChainVerificationReport {
             execution_id: id.to_string(),
             workflow_id: "wfx".to_string(),
@@ -1925,7 +1952,7 @@ mod audit_chain_mapping_tests {
 
     /// A report for a job the controller RE-DISPATCHED: two attempts, each its
     /// own chain, both verified.
-    fn re_dispatched_report(id: &str) -> ChainVerificationReport {
+    fn re_dispatched_chain(id: &str) -> ChainVerificationReport {
         ChainVerificationReport {
             execution_id: id.to_string(),
             workflow_id: "wfx".to_string(),
@@ -1948,6 +1975,145 @@ mod audit_chain_mapping_tests {
                 },
             ],
         }
+    }
+
+    /// The anchored wrapper the production caller now hands these types.
+    ///
+    /// The anchor verdict is stated EXPLICITLY, not derived: `Unanchored` is
+    /// what an anchor-less event set produces, so a helper that defaulted it
+    /// would route every assertion below through the soft arm and quietly stop
+    /// testing the anchored one.
+    fn anchored_ok(
+        chain: ChainVerificationReport,
+        anchor: talos_audit_ledger::AnchorVerdict,
+    ) -> talos_audit_ledger::AnchoredChainVerificationReport {
+        let ok = chain.ok && !anchor.is_hard_failure();
+        let attempt_anchors = chain
+            .attempts
+            .iter()
+            .map(|a| talos_audit_ledger::AttemptAnchorVerdict {
+                dispatch_attempt: a.dispatch_attempt,
+                anchor: anchor.clone(),
+            })
+            .collect();
+        talos_audit_ledger::AnchoredChainVerificationReport {
+            chain,
+            anchor,
+            attempt_anchors,
+            ok,
+        }
+    }
+
+    fn report(
+        id: &str,
+        ok: bool,
+        total_events: usize,
+    ) -> talos_audit_ledger::AnchoredChainVerificationReport {
+        let chain = chain_report(id, ok, total_events);
+        anchored_ok(
+            chain,
+            talos_audit_ledger::AnchorVerdict::Anchored {
+                total_events: total_events as u64,
+            },
+        )
+    }
+
+    fn re_dispatched_report(id: &str) -> talos_audit_ledger::AnchoredChainVerificationReport {
+        anchored_ok(
+            re_dispatched_chain(id),
+            talos_audit_ledger::AnchorVerdict::Anchored { total_events: 2 },
+        )
+    }
+
+    /// The operator's on-demand surface must not answer "verified" for a chain
+    /// whose terminal anchor disagrees with it.
+    ///
+    /// `AuditChainJobVerification.ok` reads the ANCHORED bit, not the inner
+    /// `chain.ok`. The distinction is invisible for an intact chain and is the
+    /// whole finding for a truncated one: remove a chain's trailing records
+    /// and everything that remains is contiguous, linked and signed, so
+    /// `chain.ok` is TRUE — which is the answer this query gave until
+    /// 2026-09-15.
+    #[test]
+    fn a_chain_the_anchor_rejects_renders_not_ok() {
+        // `chain.ok` deliberately TRUE: the structural verifier is happy.
+        let chain = chain_report("m1", true, 4);
+        let v = AuditChainJobVerification::from(anchored_ok(
+            chain,
+            talos_audit_ledger::AnchorVerdict::CountMismatch {
+                committed: 6,
+                found: 4,
+            },
+        ));
+        assert!(
+            !v.ok,
+            "reading the inner chain.ok here is exactly the defect: a truncated chain is a \
+             valid chain"
+        );
+        assert!(
+            v.breaks.is_empty(),
+            "and it fails with NO breaks, which is why `anchor` must carry the finding"
+        );
+        assert!(
+            v.anchor.contains("count_mismatch") && v.anchor.contains("committed=6"),
+            "the anchor field must name the finding and its numbers, got {}",
+            v.anchor
+        );
+    }
+
+    /// The control: an intact, anchored chain still renders `ok` and says so.
+    #[test]
+    fn an_anchored_chain_renders_ok_and_names_its_anchor() {
+        let v = AuditChainJobVerification::from(report("m1", true, 3));
+        assert!(v.ok);
+        assert_eq!(v.unanchored_attempts, 0);
+        assert!(v.anchor.starts_with("anchored("), "got {}", v.anchor);
+    }
+
+    /// A chain with no anchor stays `ok` — soft by design — but SAYS it could
+    /// not check its tail, so the caller is never told "verified" without the
+    /// qualification.
+    #[test]
+    fn an_unanchored_chain_stays_ok_but_discloses_the_unproven_tail() {
+        let v = AuditChainJobVerification::from(anchored_ok(
+            chain_report("m1", true, 3),
+            talos_audit_ledger::AnchorVerdict::Unanchored,
+        ));
+        assert!(v.ok, "a pre-anchor chain must keep verifying");
+        assert_eq!(v.unanchored_attempts, 1);
+        assert_eq!(v.anchor, "unanchored");
+
+        let agg = AuditChainVerification::aggregate(
+            "ex".into(),
+            "wf".into(),
+            vec![anchored_ok(
+                chain_report("m1", true, 3),
+                talos_audit_ledger::AnchorVerdict::Unanchored,
+            )],
+        );
+        assert!(agg.ok);
+        assert_eq!(
+            agg.jobs_unanchored, 1,
+            "the aggregate must carry the count, or the disclosure dies at the top level"
+        );
+    }
+
+    /// One unanchored job among several must not be averaged away.
+    #[test]
+    fn the_aggregate_counts_every_unanchored_job() {
+        let agg = AuditChainVerification::aggregate(
+            "ex".into(),
+            "wf".into(),
+            vec![
+                report("m1", true, 3),
+                anchored_ok(
+                    chain_report("m2", true, 3),
+                    talos_audit_ledger::AnchorVerdict::Unanchored,
+                ),
+            ],
+        );
+        assert!(agg.ok);
+        assert_eq!(agg.jobs_unanchored, 1);
     }
 
     /// A re-dispatched job renders `dispatchAttempts: 2` and stays `ok` — and

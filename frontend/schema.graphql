@@ -217,6 +217,19 @@ type AuditChainJobVerification {
 	`sequence` twice meaning two different records.
 	"""
 	dispatchAttempts: Int!
+	"""
+	Dispatch attempts that sealed NO terminal anchor, so their tail is
+	unprovable. Does not clear `ok` — a chain written before the anchor
+	existed is legitimately here — but a non-zero value means this run
+	could not check whether records were removed from the END.
+	"""
+	unanchoredAttempts: Int!
+	"""
+	The terminal-anchor verdict, rendered. The ONLY field that can name a
+	truncation: deleting a chain's last records leaves every remaining link
+	intact, so such a job reports `ok: false` with an EMPTY `breaks` list.
+	"""
+	anchor: String!
 }
 
 """
@@ -274,6 +287,12 @@ type AuditChainVerification {
 	re-dispatched `job_id`. A retry, not a finding; `ok` is unaffected.
 	"""
 	jobsWithMultipleAttempts: Int!
+	"""
+	How many of `jobs` sealed no terminal anchor on at least one dispatch.
+	`ok` is unaffected — the verdict is soft so pre-anchor chains keep
+	verifying — but for those jobs this run did not check the TAIL.
+	"""
+	jobsUnanchored: Int!
 	"""
 	The per-job chains this aggregate is built from. EMPTY means nothing
 	was verified, which is why `ok` is false in that case.

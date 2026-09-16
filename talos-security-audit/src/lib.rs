@@ -1310,13 +1310,26 @@ pub enum AuditChainProbe {
         /// DISCLOSED for the same reason as the line above: a reader told only
         /// "4 events, verified" cannot tell that they are two dispatches of two.
         dispatch_attempts: usize,
+        /// Dispatch attempts that sealed NO terminal anchor. Still a PASS —
+        /// the verdict is soft by design so legacy pre-anchor chains keep
+        /// verifying — but it is the state in which a deleted TAIL would also
+        /// have passed, so it is disclosed rather than rendered as a clean
+        /// verification.
+        unanchored_attempts: usize,
+        /// The terminal-anchor verdict, rendered.
+        anchor: String,
     },
     /// The chain read back and DID NOT verify — a gap, a broken link, a bad
-    /// HMAC. Tamper evidence.
+    /// HMAC, or a terminal anchor that disagrees with the chain it seals
+    /// (truncation). Tamper evidence.
     Broken {
         execution_id: String,
         workflow_execution_id: String,
         breaks: usize,
+        /// The terminal-anchor verdict, rendered. A chain truncated before its
+        /// anchor fails with `breaks == 0`, so this is the only field that can
+        /// name that finding.
+        anchor: String,
     },
     /// The prefix read cleanly and held ZERO events. `verify_chain` returns
     /// `ok == true` over an empty set, so this must NOT render as a pass —
@@ -1380,17 +1393,24 @@ pub async fn probe_audit_chain(candidate: &AuditChainCandidate) -> AuditChainPro
     )
     .await
     {
-        Ok(report) if report.ok && report.total_events == 0 => AuditChainProbe::EmptyChain {
+        Ok(report) if report.ok && report.chain.total_events == 0 => AuditChainProbe::EmptyChain {
             execution_id,
             workflow_execution_id: target.genesis_workflow_id(),
         },
         Ok(report) if report.ok => AuditChainProbe::Verified {
             execution_id,
             workflow_execution_id: target.genesis_workflow_id(),
-            total_events: report.total_events,
-            signatures_checked: report.signatures_checked,
-            duplicate_deliveries: report.duplicate_delivery_count(),
-            dispatch_attempts: report.dispatch_attempt_count(),
+            total_events: report.chain.total_events,
+            signatures_checked: report.chain.signatures_checked,
+            duplicate_deliveries: report.chain.duplicate_delivery_count(),
+            dispatch_attempts: report.chain.dispatch_attempt_count(),
+            // Disclosed on the PASS, for the same reason the two counts above
+            // it are: a reader told only "5 events, verified" cannot tell
+            // whether the chain committed its own length. `Unanchored` here is
+            // still a pass — the links and HMACs verified — but it is the one
+            // pass under which a deleted tail would also have passed.
+            unanchored_attempts: report.unanchored_attempts(),
+            anchor: report.anchor.describe(),
         },
         Ok(report) => AuditChainProbe::Broken {
             execution_id,
@@ -1401,10 +1421,18 @@ pub async fn probe_audit_chain(candidate: &AuditChainCandidate) -> AuditChainPro
             // real breaks and one redelivery, which is the same
             // report-overstates-its-finding defect one level down.
             breaks: report
+                .chain
                 .breaks
                 .iter()
                 .filter(|b| b.is_tamper_evidence())
                 .count(),
+            // Carried because a chain can now FAIL with ZERO breaks: truncate
+            // a valid chain before its terminal anchor and every event that
+            // remains is correctly linked and signed — the anchor's committed
+            // length is the only thing that disagrees. A `Broken` rendering
+            // that could only say "0 break(s)" would be a finding that cannot
+            // state itself.
+            anchor: report.anchor.describe(),
         },
         Err(e) => {
             // "No endpoint configured" arrives here as `Other`, and it is the
@@ -1461,6 +1489,8 @@ pub fn check_audit_chain_verification(
             signatures_checked,
             duplicate_deliveries,
             dispatch_attempts,
+            unanchored_attempts,
+            anchor,
         } => {
             let sig = if *signatures_checked {
                 "with HMAC signatures checked"
@@ -1499,6 +1529,29 @@ pub fn check_audit_chain_verification(
             } else {
                 String::new()
             };
+            // The TAIL disclosure. A chain with a terminal anchor has
+            // committed its own length, so this run also proved that nothing
+            // was removed from the END; without one it did not, and cannot —
+            // truncating a valid chain leaves a valid chain. Both sentences
+            // are stated affirmatively rather than one of them being silence,
+            // because "verified" with no qualifier is precisely the reading
+            // that made truncation invisible on this surface until 2026-09-15.
+            let tail = if *unanchored_attempts > 0 {
+                format!(
+                    " TAIL NOT PROVEN: {unanchored_attempts} dispatch(es) sealed no terminal \
+                     `execution_complete` anchor ({anchor}), so no committed event count \
+                     exists to compare this chain's length against and a deletion of its \
+                     LAST record(s) would have verified exactly as this did. That is \
+                     expected only for a chain written before the anchor existed; on a \
+                     current producer it means the worker is not sealing anchors, and the \
+                     truncation check is off for every job it writes."
+                )
+            } else {
+                format!(
+                    " The chain's own terminal anchor was checked ({anchor}), so its LENGTH \
+                     is committed too: no record was removed from the end."
+                )
+            };
             Check {
                 name: "audit_chain_verification",
                 status: Status::Pass,
@@ -1509,8 +1562,8 @@ pub fn check_audit_chain_verification(
                      event(s), no gaps, no broken links, {sig}. The ledger is keyed PER JOB \
                      — every object key is `<{key_space}>/…` and the genesis hash binds \
                      ({genesis_col}, {key_space}) — so this is the id space that was \
-                     verified, not `workflow_executions.id`.{dupes}{attempts} {sweep_note} \
-                     Reported, not scored.",
+                     verified, not `workflow_executions.id`.{tail}{dupes}{attempts} \
+                     {sweep_note} Reported, not scored.",
                     key_space = talos_audit_ledger::LEDGER_KEY_SPACE,
                     genesis_col = talos_audit_ledger::LEDGER_GENESIS_WORKFLOW_COLUMN,
                 ),
@@ -1523,20 +1576,24 @@ pub fn check_audit_chain_verification(
             execution_id,
             workflow_execution_id,
             breaks,
+            anchor,
         } => Check {
             name: "audit_chain_verification",
             status: Status::Fail,
             detail: format!(
                 "CRITICAL: the WORM audit chain for MODULE EXECUTION {execution_id} (of \
                  workflow execution {workflow_execution_id}) FAILED verification with \
-                 {breaks} break(s) — a sequence gap (deleted or \
+                 {breaks} break(s), terminal anchor {anchor} — a sequence gap (deleted or \
                  never-persisted events), broken previous_hash linkage (reorder or \
-                 substitution), or a per-event HMAC failure. Treat that execution's audit \
-                 record as UNTRUSTED and delete nothing. Grep the controller log for \
+                 substitution), a per-event HMAC failure, or an anchor that disagrees with \
+                 the chain it seals (records removed from the END, which leaves every \
+                 remaining link intact — that case reports ZERO breaks and the anchor \
+                 verdict is the whole finding). Treat that execution's audit record as \
+                 UNTRUSTED and delete nothing. Grep the controller log for \
                  event_kind=\"audit_chain_verification_failed\" for the structured `breaks` \
-                 list, and rule out a controller/worker build skew and an unmatched \
-                 audit-signing key rotation before declaring tampering. {sweep_note} \
-                 Reported, not scored."
+                 list and the `anchor` field, and rule out a controller/worker build skew \
+                 and an unmatched audit-signing key rotation before declaring tampering. \
+                 {sweep_note} Reported, not scored."
             ),
             verification: Verification::RoundTrip,
             points: 0,
@@ -1653,6 +1710,24 @@ fn describe_last_sweep(sweep: Option<talos_audit_ledger::ChainSweepSnapshot>) ->
     // wire this exact shape was reported as CRITICAL tamper evidence, so an
     // operator reading a clean sweep deserves to know how much of it is
     // re-dispatch and that the partitioning was applied.
+    // The TAIL half of the sweep's verdict. `unanchored` chains are counted
+    // as verified in every structural sense and are NOT failures, so without
+    // this sentence they vanish into a clean-looking pass — which is the exact
+    // reading that made truncation invisible before the sweep verified
+    // anchors at all.
+    let base = if s.unanchored > 0 {
+        format!(
+            "{base} {} of those job chain(s) sealed NO terminal anchor on at least one \
+             dispatch, so their LENGTH is not committed and a deletion of their last \
+             record(s) would have verified as cleanly as this did. Not a failure — a chain \
+             written before the anchor existed is legitimately in this state — but on a \
+             current producer it means execution_complete is not being emitted and the \
+             truncation check is off for every job it writes.",
+            s.unanchored
+        )
+    } else {
+        base
+    };
     let base = if s.multi_attempt > 0 {
         format!(
             "{base} {} of those job chain(s) hold MORE THAN ONE controller dispatch \
