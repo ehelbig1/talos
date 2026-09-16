@@ -487,6 +487,24 @@ pub fn compilable_worlds_csv() -> String {
     compilable_worlds().join(", ")
 }
 
+/// The actor-ceiling worlds a `ceiling` permits, in [`ACTOR_CEILING_WORLDS`]
+/// order — the lattice rendered as a list, so a UI never re-derives it.
+///
+/// The ceilings are a partial order, not a ladder: a `database-node` ceiling
+/// does not cover `governance-node`, and an `llm-node` ceiling covers only
+/// `minimal-node` / `http-node` / `llm-node`. A client that orders the list
+/// and compares positions offers worlds this function (and every backend
+/// gate, which is [`ceiling_permits`]) refuses. An unrecognised ceiling
+/// permits nothing.
+#[must_use]
+pub fn permitted_ceiling_worlds(ceiling: &str) -> Vec<&'static str> {
+    ACTOR_CEILING_WORLDS
+        .iter()
+        .copied()
+        .filter(|world| ceiling_permits(ceiling, world))
+        .collect()
+}
+
 /// CSV rendering of [`ACTOR_CEILING_WORLDS`].
 pub fn actor_ceiling_worlds_csv() -> String {
     ACTOR_CEILING_WORLDS.join(", ")
@@ -1026,5 +1044,21 @@ mod ceiling_tests {
                 "{w} must keep the default-true memory posture"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod permitted_ceiling_worlds_tests {
+    use super::*;
+
+    #[test]
+    fn an_unrecognised_ceiling_permits_nothing() {
+        assert!(permitted_ceiling_worlds("full-node").is_empty());
+        assert!(permitted_ceiling_worlds("").is_empty());
+        // Control: a recognised ceiling permits at least itself.
+        assert_eq!(
+            permitted_ceiling_worlds("minimal-node"),
+            vec!["minimal-node"]
+        );
     }
 }

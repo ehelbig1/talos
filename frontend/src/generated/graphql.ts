@@ -871,6 +871,7 @@ export type GetCapabilityWorldHierarchyQuery = {
     name: string;
     rank: number;
     description: string;
+    permits: Array<string>;
   }>;
 };
 
@@ -3726,6 +3727,7 @@ export const GetCapabilityWorldHierarchyDocument = new TypedDocumentString(`
     name
     rank
     description
+    permits
   }
 }
     `);

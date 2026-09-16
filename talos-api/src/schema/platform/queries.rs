@@ -39,6 +39,23 @@ fn description_for(world: &str) -> &'static str {
 
 /// Rank a world name. Delegates to `talos_capability_world::world_rank`
 /// (single source of truth). Returns 7 for unknown worlds (safest default).
+/// The hierarchy the `capabilityWorldHierarchy` query serves, with each
+/// world's permitted set taken from the lattice itself.
+fn capability_world_infos() -> Vec<CapabilityWorldInfo> {
+    talos_capability_world::ACTOR_CEILING_WORLDS
+        .iter()
+        .map(|name| CapabilityWorldInfo {
+            name: name.to_string(),
+            rank: world_rank(name),
+            description: description_for(name).to_string(),
+            permits: talos_capability_world::permitted_ceiling_worlds(name)
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
+        })
+        .collect()
+}
+
 fn world_rank(world: &str) -> i32 {
     talos_capability_world::world_rank(world) as i32
 }
@@ -124,14 +141,7 @@ impl PlatformQueries {
 
     /// Return the full capability world hierarchy with ranks and descriptions.
     async fn capability_world_hierarchy(&self) -> Vec<CapabilityWorldInfo> {
-        talos_capability_world::ACTOR_CEILING_WORLDS
-            .iter()
-            .map(|name| CapabilityWorldInfo {
-                name: name.to_string(),
-                rank: world_rank(name),
-                description: description_for(name).to_string(),
-            })
-            .collect()
+        capability_world_infos()
     }
 
     /// List all capability grants. Requires platform admin role.
@@ -431,6 +441,105 @@ impl PlatformQueries {
             .collect();
 
         Ok(integrations)
+    }
+}
+
+#[cfg(test)]
+mod capability_world_permits_tests {
+    use super::capability_world_infos;
+    use talos_capability_world::{ceiling_permits, ACTOR_CEILING_WORLDS};
+
+    /// The served `permits` list is exactly the lattice, for every pair.
+    #[test]
+    fn permits_is_the_lattice_for_every_pair() {
+        let infos = capability_world_infos();
+        assert_eq!(infos.len(), ACTOR_CEILING_WORLDS.len());
+        for info in &infos {
+            for world in ACTOR_CEILING_WORLDS {
+                assert_eq!(
+                    info.permits.iter().any(|p| p == world),
+                    ceiling_permits(&info.name, world),
+                    "{} -> {}",
+                    info.name,
+                    world
+                );
+            }
+        }
+    }
+
+    /// The shapes a linear ladder gets wrong, pinned by name.
+    #[test]
+    fn the_ceilings_are_not_a_ladder() {
+        let permits = |c: &str| {
+            capability_world_infos()
+                .into_iter()
+                .find(|i| i.name == c)
+                .expect("world served")
+                .permits
+        };
+        assert_eq!(
+            permits("llm-node"),
+            vec!["minimal-node", "http-node", "llm-node"]
+        );
+        assert!(!permits("database-node").contains(&"governance-node".to_string()));
+        assert!(!permits("agent-node").contains(&"messaging-node".to_string()));
+        // Control: the top of the lattice permits every world.
+        assert_eq!(permits("automation-node").len(), ACTOR_CEILING_WORLDS.len());
+    }
+
+    /// TEXTUAL pin on the web UI's world table (stated as such): its keys are
+    /// exactly the served worlds — no retired alias a form could offer, no
+    /// served world it cannot label — and no linear ladder survives beside it.
+    #[test]
+    fn the_web_ui_labels_exactly_the_served_worlds() {
+        let src = include_str!("../../../../frontend/src/lib/capabilityConfig.ts");
+        let start = src
+            .find("export const CAPABILITY_WORLDS")
+            .expect("world table present");
+        let end = start + src[start..].find("\n};").expect("world table end");
+        let mut keys: Vec<&str> = src[start..end]
+            .lines()
+            .filter_map(|l| l.strip_prefix("  \"")?.split_once("\": {"))
+            .map(|(k, _)| k)
+            .collect();
+        keys.sort_unstable();
+        let mut served: Vec<&str> = ACTOR_CEILING_WORLDS.to_vec();
+        served.sort_unstable();
+        assert_eq!(keys, served);
+        assert!(!src.contains("CAPABILITY_LADDER"), "linear ladder returned");
+    }
+
+    /// TEXTUAL pin on the two web UI forms that pick an actor's ceiling
+    /// (stated as such — a component test would need the query client and
+    /// router): both derive their options from `ceilingOptions`, neither
+    /// ranks worlds by list position, and neither assumes a ceiling before
+    /// the backend has answered.
+    #[test]
+    fn the_web_ui_forms_ask_the_lattice() {
+        for (name, src) in [
+            (
+                "CreateActorPanel",
+                include_str!("../../../../frontend/src/pages/actors/CreateActorPanel.tsx"),
+            ),
+            (
+                "SummaryPanel",
+                include_str!("../../../../frontend/src/pages/actor-detail/SummaryPanel.tsx"),
+            ),
+        ] {
+            assert!(
+                src.contains("ceilingOptions("),
+                "{name}: options not from the lattice"
+            );
+            assert!(
+                src.contains("!permitted"),
+                "{name}: never refuses an unpermitted world"
+            );
+            assert!(!src.contains(".indexOf("), "{name}: position-ranked worlds");
+            assert!(
+                !src.contains(r#"data: ceilingWorld = ""#),
+                "{name}: ceiling assumed before the backend answered"
+            );
+        }
     }
 }
 

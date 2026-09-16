@@ -331,6 +331,12 @@ export type CapabilityWorldInfo = {
   __typename?: "CapabilityWorldInfo";
   description: Scalars["String"]["output"];
   name: Scalars["String"]["output"];
+  /**
+   * The worlds an actor may be given when this world is the caller's
+   * ceiling, from the backend lattice. The ceilings are a partial order:
+   * compare against this list, never against `rank`.
+   */
+  permits: Array<Scalars["String"]["output"]>;
   rank: Scalars["Int"]["output"];
 };
 

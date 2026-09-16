@@ -334,6 +334,12 @@ type CapabilityWorldInfo {
 	name: String!
 	rank: Int!
 	description: String!
+	"""
+	The worlds an actor may be given when this world is the caller's
+	ceiling, from the backend lattice. The ceilings are a partial order:
+	compare against this list, never against `rank`.
+	"""
+	permits: [String!]!
 }
 
 """

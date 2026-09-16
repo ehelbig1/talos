@@ -4,7 +4,8 @@ import { X, ChevronRight, Info, Zap, Shield, Gauge } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { StepIndicator } from "@/components/ui";
 import { getMyCapabilityCeiling } from "@/lib/graphqlApi";
-import { getCapabilityConfig, CAPABILITY_LADDER } from "@/lib/capabilityConfig";
+import { getCapabilityConfig, ceilingOptions } from "@/lib/capabilityConfig";
+import { useGetCapabilityWorldHierarchyQuery } from "@/generated/graphql";
 import { CapabilityBadge } from "./ActorCard";
 
 // ── Actor persona templates ───────────────────────────────────────────────────
@@ -212,14 +213,18 @@ export function CreateActorPanel({
   const [budgetId, setBudgetId] = useState<BudgetPresetId>("standard");
   const [showAdvanced, setShowAdvanced] = useState(false);
 
-  const { data: ceilingWorld = "automation-node" } = useQuery({
+  // No default ceiling: until the backend has said what the caller holds,
+  // every world renders as unavailable rather than as permitted.
+  const { data: ceilingWorld } = useQuery({
     queryKey: ["myCapabilityCeiling"],
     queryFn: getMyCapabilityCeiling,
     staleTime: 60_000,
   });
-  const ceilingIdx = CAPABILITY_LADDER.indexOf(ceilingWorld);
-  const effectiveCeilingIdx =
-    ceilingIdx === -1 ? CAPABILITY_LADDER.length - 1 : ceilingIdx;
+  const { data: hierarchyData } = useGetCapabilityWorldHierarchyQuery();
+  const worldOptions = ceilingOptions(
+    hierarchyData?.capabilityWorldHierarchy ?? [],
+    ceilingWorld,
+  );
 
   function reset() {
     setStep(0);
@@ -469,10 +474,10 @@ export function CreateActorPanel({
                       </p>
                     </div>
                     <div className="flex flex-col gap-3">
-                      {CAPABILITY_LADDER.map((world, idx) => {
+                      {worldOptions.map(({ world, permitted }) => {
                         const cfg = getCapabilityConfig(world);
                         const isSelected = capWorld === world;
-                        const isAboveCeiling = idx > effectiveCeilingIdx;
+                        const isAboveCeiling = !permitted;
                         return (
                           <button
                             key={world}

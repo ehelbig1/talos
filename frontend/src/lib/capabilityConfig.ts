@@ -43,17 +43,15 @@ export const CAPABILITY_WORLDS: Record<string, CapabilityConfig> = {
     borderColor: "border-blue-400/20",
     level: 1,
   },
-  // Legacy alias — kept for backward compatibility with stored actor configs.
-  // The canonical name is "http-node"; this alias renders identically.
-  "standard-node": {
-    label: "HTTP requests",
-    description: "Can make outbound HTTP calls",
+  "llm-node": {
+    label: "LLM inference",
+    description: "Native LLM calls, no vault",
     tooltipDetail:
-      "standard-node (alias for http-node): Can make outbound HTTP requests to external APIs.",
-    unlocks: "Outbound HTTP, REST APIs, webhooks",
-    textColor: "text-blue-400",
-    bgColor: "bg-blue-400/10",
-    borderColor: "border-blue-400/20",
+      "llm-node: Can call the platform's native LLM host bindings and make outbound HTTP requests. Cannot read vault secrets, write to databases, or send autonomous messages.",
+    unlocks: "Native LLM completions on top of HTTP",
+    textColor: "text-sky-400",
+    bgColor: "bg-sky-400/10",
+    borderColor: "border-sky-400/20",
     level: 1,
   },
   "network-node": {
@@ -155,38 +153,44 @@ export const CAPABILITY_WORLDS: Record<string, CapabilityConfig> = {
     borderColor: "border-red-400/20",
     level: 5,
   },
-  // Legacy alias — kept for backward compatibility with stored actor configs.
-  // The canonical name is "automation-node"; this alias renders identically.
-  "full-node": {
-    label: "Full access",
-    description: "No capability restrictions",
-    tooltipDetail:
-      "full-node (alias for automation-node): Full platform access — all host interfaces available.",
-    unlocks: "Everything — no restrictions",
-    textColor: "text-red-400",
-    bgColor: "bg-red-400/10",
-    borderColor: "border-red-400/20",
-    level: 5,
-  },
 };
 
+/** One world as served by the `capabilityWorldHierarchy` query. */
+export interface CapabilityWorldNode {
+  name: string;
+  /** Worlds an actor may be given when this world is the caller's ceiling. */
+  permits: readonly string[];
+}
+
+export interface CeilingOption {
+  world: string;
+  permitted: boolean;
+}
+
 /**
- * The ordered capability ladder shown in the Create Actor flow.
- * Each step is a superset of the previous.
+ * The actor worlds to show a user whose ceiling is `ceiling`, in the order
+ * the backend serves them, each marked with whether the backend will accept
+ * it.
+ *
+ * The ceilings form a lattice, not a ladder: a `database-node` ceiling does
+ * not cover `governance-node`, and an `llm-node` ceiling covers only
+ * `minimal-node`, `http-node` and `llm-node`. So "permitted" is read from the
+ * ceiling's own `permits` list, never from a position in the list. An
+ * unknown or not-yet-loaded ceiling permits nothing — the form must not offer
+ * a world the backend will refuse.
  */
-export const CAPABILITY_LADDER: readonly string[] = [
-  "minimal-node",
-  "http-node",
-  "network-node",
-  "secrets-node",
-  "governance-node",
-  "messaging-node",
-  "filesystem-node",
-  "cache-node",
-  "database-node",
-  "agent-node",
-  "automation-node",
-];
+export function ceilingOptions(
+  hierarchy: readonly CapabilityWorldNode[],
+  ceiling: string | undefined,
+): CeilingOption[] {
+  const permits = new Set(
+    hierarchy.find((node) => node.name === ceiling)?.permits ?? [],
+  );
+  return hierarchy.map((node) => ({
+    world: node.name,
+    permitted: permits.has(node.name),
+  }));
+}
 
 export function getCapabilityConfig(world: string): CapabilityConfig {
   return (
