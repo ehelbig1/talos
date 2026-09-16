@@ -1590,6 +1590,7 @@ fn sweep(
     talos_audit_ledger::ChainSweepSnapshot {
         scanned: verified_ok + errored,
         verified_ok,
+        unanchored: 0,
         empty: 0,
         failed: 0,
         duplicate_delivery: 0,
@@ -1625,6 +1626,8 @@ fn a_multi_attempt_chain_passes_and_names_the_re_dispatch() {
             signatures_checked: true,
             duplicate_deliveries: 0,
             dispatch_attempts: 2,
+            unanchored_attempts: 0,
+            anchor: "anchored(total_events=1)".to_string(),
         },
         Some(sweep(37, 0, None, false)),
     );
@@ -1653,6 +1656,8 @@ fn a_single_attempt_chain_makes_no_attempt_claim() {
             signatures_checked: true,
             duplicate_deliveries: 0,
             dispatch_attempts: 1,
+            unanchored_attempts: 0,
+            anchor: "anchored(total_events=1)".to_string(),
         },
         Some(sweep(37, 0, None, false)),
     );
@@ -1674,6 +1679,8 @@ fn the_sweep_note_discloses_multi_attempt_jobs() {
             signatures_checked: true,
             duplicate_deliveries: 0,
             dispatch_attempts: 1,
+            unanchored_attempts: 0,
+            anchor: "anchored(total_events=1)".to_string(),
         },
         Some(snap),
     );
@@ -1695,6 +1702,8 @@ fn a_verified_chain_passes_as_a_round_trip() {
             signatures_checked: true,
             duplicate_deliveries: 0,
             dispatch_attempts: 1,
+            unanchored_attempts: 0,
+            anchor: "anchored(total_events=1)".to_string(),
         },
         Some(sweep(37, 0, None, false)),
     );
@@ -1718,6 +1727,8 @@ fn a_verified_chain_without_keys_states_what_it_did_not_check() {
             signatures_checked: false,
             duplicate_deliveries: 0,
             dispatch_attempts: 1,
+            unanchored_attempts: 0,
+            anchor: "anchored(total_events=1)".to_string(),
         },
         None,
     );
@@ -1739,6 +1750,8 @@ fn a_redelivered_chain_passes_with_the_count_disclosed() {
             signatures_checked: true,
             duplicate_deliveries: 1,
             dispatch_attempts: 1,
+            unanchored_attempts: 0,
+            anchor: "anchored(total_events=1)".to_string(),
         },
         Some(sweep(37, 0, None, false)),
     );
@@ -1765,10 +1778,149 @@ fn a_clean_chain_says_nothing_about_redelivery() {
             signatures_checked: true,
             duplicate_deliveries: 0,
             dispatch_attempts: 1,
+            unanchored_attempts: 0,
+            anchor: "anchored(total_events=1)".to_string(),
         },
         None,
     );
     assert!(!c.detail.contains("BYTE-IDENTICAL"), "{}", c.detail);
+}
+
+/// A chain the terminal anchor rejects is CRITICAL, and the rendering must be
+/// able to say what is wrong when `breaks` is EMPTY.
+///
+/// Truncating a chain before its anchor leaves every surviving link intact, so
+/// that finding arrives here as "0 break(s)". Without the anchor verdict in
+/// the sentence the operator is told a chain FAILED verification and given no
+/// reason at all — a report that cannot state its own finding.
+#[test]
+fn a_truncated_chain_names_the_anchor_because_it_has_no_breaks() {
+    let c = check_audit_chain_verification(
+        &AuditChainProbe::Broken {
+            execution_id: "ex-9".to_string(),
+            workflow_execution_id: "wfx-9".to_string(),
+            breaks: 0,
+            anchor: "count_mismatch(committed=6, found=4)".to_string(),
+        },
+        Some(sweep(0, 0, None, false)),
+    );
+    assert_eq!(c.status, Status::Fail);
+    assert!(
+        c.detail.contains("count_mismatch(committed=6, found=4)"),
+        "the anchor verdict is the only thing that can name this finding: {}",
+        c.detail
+    );
+    assert!(
+        c.detail.contains("removed from the END"),
+        "and the sentence must explain why a truncation shows zero breaks: {}",
+        c.detail
+    );
+}
+
+/// A PASS over an ANCHORED chain says the tail was proven.
+#[test]
+fn an_anchored_pass_states_that_the_length_is_committed() {
+    let c = check_audit_chain_verification(
+        &AuditChainProbe::Verified {
+            execution_id: "ex-1".to_string(),
+            workflow_execution_id: "wfx-1".to_string(),
+            total_events: 3,
+            signatures_checked: true,
+            duplicate_deliveries: 0,
+            dispatch_attempts: 1,
+            unanchored_attempts: 0,
+            anchor: "anchored(total_events=3)".to_string(),
+        },
+        Some(sweep(9, 0, None, false)),
+    );
+    assert_eq!(c.status, Status::Pass);
+    assert!(
+        c.detail.contains("no record was removed from the end"),
+        "{}",
+        c.detail
+    );
+    assert!(!c.detail.contains("TAIL NOT PROVEN"), "{}", c.detail);
+}
+
+/// A PASS over an UNANCHORED chain is still a PASS — and must say, in the same
+/// breath, that a deleted tail would have passed identically.
+///
+/// This is the disclosure the whole package turns on. `Unanchored` is soft by
+/// design, so without this sentence the surface renders a chain whose length
+/// was never committed exactly like one whose length was.
+#[test]
+fn an_unanchored_pass_discloses_that_the_tail_was_not_proven() {
+    let c = check_audit_chain_verification(
+        &AuditChainProbe::Verified {
+            execution_id: "ex-2".to_string(),
+            workflow_execution_id: "wfx-2".to_string(),
+            total_events: 3,
+            signatures_checked: true,
+            duplicate_deliveries: 0,
+            dispatch_attempts: 1,
+            unanchored_attempts: 1,
+            anchor: "unanchored".to_string(),
+        },
+        Some(sweep(9, 0, None, false)),
+    );
+    assert_eq!(c.status, Status::Pass, "soft by design — still a pass");
+    assert!(c.detail.contains("TAIL NOT PROVEN"), "{}", c.detail);
+    assert!(
+        c.detail.contains("would have verified"),
+        "it must state the consequence, not just the fact: {}",
+        c.detail
+    );
+    assert!(
+        !c.detail.contains("no record was removed from the end"),
+        "and it must NOT also make the anchored claim: {}",
+        c.detail
+    );
+}
+
+/// The sweep summary carries the same disclosure for the STANDING control, not
+/// just for the one probed chain.
+#[test]
+fn the_sweep_summary_reports_unanchored_chains() {
+    let mut s = sweep(9, 0, None, false);
+    s.unanchored = 2;
+    let c = check_audit_chain_verification(
+        &AuditChainProbe::Verified {
+            execution_id: "ex-3".to_string(),
+            workflow_execution_id: "wfx-3".to_string(),
+            total_events: 1,
+            signatures_checked: true,
+            duplicate_deliveries: 0,
+            dispatch_attempts: 1,
+            unanchored_attempts: 0,
+            anchor: "anchored(total_events=1)".to_string(),
+        },
+        Some(s),
+    );
+    assert!(
+        c.detail
+            .contains("2 of those job chain(s) sealed NO terminal anchor"),
+        "{}",
+        c.detail
+    );
+    // The control: a sweep with none says nothing, so a reading means what it says.
+    let clean = check_audit_chain_verification(
+        &AuditChainProbe::Verified {
+            execution_id: "ex-4".to_string(),
+            workflow_execution_id: "wfx-4".to_string(),
+            total_events: 1,
+            signatures_checked: true,
+            duplicate_deliveries: 0,
+            dispatch_attempts: 1,
+            unanchored_attempts: 0,
+            anchor: "anchored(total_events=1)".to_string(),
+        },
+        Some(sweep(9, 0, None, false)),
+    );
+    assert!(
+        !clean.detail.contains("sealed NO terminal anchor"),
+        "{}",
+        clean.detail
+    );
 }
 
 #[test]
@@ -1778,6 +1930,7 @@ fn a_broken_chain_fails_and_says_critical() {
             execution_id: "ex-2".to_string(),
             workflow_execution_id: "wfx-1".to_string(),
             breaks: 2,
+            anchor: "anchored(total_events=1)".to_string(),
         },
         Some(sweep(0, 0, None, false)),
     );
@@ -1917,6 +2070,8 @@ fn an_aborted_sweep_is_not_a_clean_bill_of_health() {
             signatures_checked: true,
             duplicate_deliveries: 0,
             dispatch_attempts: 1,
+            unanchored_attempts: 0,
+            anchor: "anchored(total_events=1)".to_string(),
         },
         Some(sweep(500, 0, None, true)),
     );
@@ -1935,6 +2090,8 @@ fn an_absent_sweep_snapshot_reads_as_not_yet_run() {
             signatures_checked: true,
             duplicate_deliveries: 0,
             dispatch_attempts: 1,
+            unanchored_attempts: 0,
+            anchor: "anchored(total_events=1)".to_string(),
         },
         None,
     );
@@ -1964,11 +2121,14 @@ fn the_chain_check_costs_nothing_in_every_arm() {
             signatures_checked: true,
             duplicate_deliveries: 0,
             dispatch_attempts: 1,
+            unanchored_attempts: 0,
+            anchor: "anchored(total_events=1)".to_string(),
         },
         AuditChainProbe::Broken {
             execution_id: "e".to_string(),
             workflow_execution_id: "wfx-1".to_string(),
             breaks: 1,
+            anchor: "anchored(total_events=1)".to_string(),
         },
         AuditChainProbe::Unverifiable {
             reason: talos_audit_ledger::ChainVerifyErrorKind::AccessDenied,
@@ -2006,6 +2166,7 @@ fn a_failing_chain_check_reaches_the_operator_despite_the_zero_weight() {
             execution_id: "ex".to_string(),
             workflow_execution_id: "wfx-1".to_string(),
             breaks: 1,
+            anchor: "anchored(total_events=1)".to_string(),
         },
         None,
     );
@@ -2052,6 +2213,8 @@ fn the_pass_names_the_id_space_it_verified() {
             signatures_checked: true,
             duplicate_deliveries: 0,
             dispatch_attempts: 1,
+            unanchored_attempts: 0,
+            anchor: "anchored(total_events=1)".to_string(),
         },
         Some(sweep(4, 0, None, false)),
     );
@@ -2085,6 +2248,7 @@ fn every_chain_arm_names_both_ids() {
             execution_id: "me-b".to_string(),
             workflow_execution_id: "wfx-b".to_string(),
             breaks: 2,
+            anchor: "anchored(total_events=1)".to_string(),
         },
         AuditChainProbe::EmptyChain {
             execution_id: "me-b".to_string(),
@@ -2114,6 +2278,7 @@ fn the_sweep_note_reports_both_grains() {
     let snapshot = talos_audit_ledger::ChainSweepSnapshot {
         scanned: 12,
         verified_ok: 9,
+        unanchored: 0,
         empty: 1,
         failed: 1,
         duplicate_delivery: 0,
@@ -2125,6 +2290,7 @@ fn the_sweep_note_reports_both_grains() {
         rollup: talos_audit_ledger::WorkflowExecutionRollup {
             covered: 4,
             verified_ok: 1,
+            unanchored: 0,
             empty: 1,
             errored: 1,
             failed: 1,
@@ -2139,6 +2305,8 @@ fn the_sweep_note_reports_both_grains() {
             signatures_checked: true,
             duplicate_deliveries: 0,
             dispatch_attempts: 1,
+            unanchored_attempts: 0,
+            anchor: "anchored(total_events=1)".to_string(),
         },
         Some(snapshot),
     );
@@ -2159,6 +2327,7 @@ fn standalone_jobs_are_disclosed_not_absorbed() {
     let snapshot = talos_audit_ledger::ChainSweepSnapshot {
         scanned: 5,
         verified_ok: 3,
+        unanchored: 0,
         empty: 0,
         failed: 0,
         duplicate_delivery: 0,
@@ -2182,6 +2351,8 @@ fn standalone_jobs_are_disclosed_not_absorbed() {
             signatures_checked: true,
             duplicate_deliveries: 0,
             dispatch_attempts: 1,
+            unanchored_attempts: 0,
+            anchor: "anchored(total_events=1)".to_string(),
         },
         Some(snapshot),
     );

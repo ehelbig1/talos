@@ -477,6 +477,10 @@ pub struct ChainSweepSnapshot {
     pub scanned: usize,
     /// Job chains that verified AND held at least one event.
     pub verified_ok: usize,
+    /// Job chains that verified but sealed NO terminal anchor on at least one
+    /// dispatch — the tail could not be checked. NOT part of `verified_ok`
+    /// and NOT a failure; see [`crate::population::JobChainOutcome::Unanchored`].
+    pub unanchored: usize,
     /// Prefixes that read cleanly and held ZERO events — see
     /// [`ChainVerifyErrorKind::EmptyChain`]. NOT verified.
     pub empty: usize,
@@ -736,6 +740,7 @@ mod verifier_tests {
         let snap = ChainSweepSnapshot {
             scanned: 37,
             verified_ok: 0,
+            unanchored: 0,
             empty: 0,
             failed: 0,
             duplicate_delivery: 0,

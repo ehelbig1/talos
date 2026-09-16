@@ -935,6 +935,45 @@ impl AnchorVerdict {
             AnchorVerdict::Anchored { .. } | AnchorVerdict::Unanchored
         )
     }
+
+    /// `true` when this attempt sealed no terminal anchor.
+    ///
+    /// SOFT — it never clears `ok` — but it is the one verdict an operator
+    /// must be able to COUNT rather than merely read, because it is the state
+    /// in which tail truncation is undetectable: with no anchor there is no
+    /// committed length to compare the observed one against, so a chain whose
+    /// last N events were deleted verifies green. A legacy pre-anchor chain is
+    /// legitimately in that state; a chain written by a CURRENT producer is
+    /// not, and only the caller knows which population it is looking at.
+    pub fn is_unanchored(&self) -> bool {
+        matches!(self, AnchorVerdict::Unanchored)
+    }
+
+    /// A short, stable rendering for an operator-facing field.
+    ///
+    /// Owned `String` rather than `&'static str` because four of the six
+    /// variants carry the numbers that make them actionable — "the anchor
+    /// committed 7 events and 5 are present" is the finding; "count_mismatch"
+    /// alone sends the reader back to the raw objects. Deliberately NOT a
+    /// Prometheus label (unbounded cardinality); the metric dimension is the
+    /// sweep's `JobChainOutcome`.
+    pub fn describe(&self) -> String {
+        match self {
+            AnchorVerdict::Anchored { total_events } => {
+                format!("anchored(total_events={total_events})")
+            }
+            AnchorVerdict::Unanchored => "unanchored".to_string(),
+            AnchorVerdict::CountMismatch { committed, found } => {
+                format!("count_mismatch(committed={committed}, found={found})")
+            }
+            AnchorVerdict::NotTerminal {
+                anchor_seq,
+                last_seq,
+            } => format!("not_terminal(anchor_seq={anchor_seq}, last_seq={last_seq})"),
+            AnchorVerdict::MalformedAnchor { seq } => format!("malformed_anchor(seq={seq})"),
+            AnchorVerdict::MultipleAnchors { count } => format!("multiple_anchors(count={count})"),
+        }
+    }
 }
 
 /// [`ChainVerificationReport`] plus the terminal-anchor verdict.
@@ -966,6 +1005,24 @@ pub struct AnchoredChainVerificationReport {
     /// `chain.ok` AND no hard anchor failure. `Unanchored` does NOT clear
     /// this bit — legacy pre-anchor chains must keep verifying green.
     pub ok: bool,
+}
+
+impl AnchoredChainVerificationReport {
+    /// How many dispatch attempts sealed NO terminal anchor.
+    ///
+    /// Deliberately read from `attempt_anchors` and not from the collapsed
+    /// [`AnchoredChainVerificationReport::anchor`]: that field is worst-wins
+    /// only among HARD failures and otherwise takes the FIRST attempt's
+    /// verdict, so a retried job whose first dispatch anchored and whose
+    /// second did not reports `Anchored` there. The unanchored attempt is the
+    /// one whose tail cannot be checked, and collapsing it away is how the
+    /// blind spot would survive the switch to anchored verification.
+    pub fn unanchored_attempts(&self) -> usize {
+        self.attempt_anchors
+            .iter()
+            .filter(|a| a.anchor.is_unanchored())
+            .count()
+    }
 }
 
 /// One dispatch attempt's terminal-anchor verdict.

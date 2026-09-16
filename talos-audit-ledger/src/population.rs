@@ -166,8 +166,23 @@ pub fn partition_sweep_rows(rows: &[(Uuid, Option<Uuid>)]) -> (Vec<LedgerTarget>
 /// these variants silently changes what a mixed group reports.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum JobChainOutcome {
-    /// Read back, at least one event, no breaks.
+    /// Read back, at least one event, no breaks, and every dispatch attempt
+    /// sealed a terminal anchor whose committed length matched.
     VerifiedOk,
+    /// Read back and structurally verified, but at least one dispatch attempt
+    /// sealed NO terminal anchor, so its tail cannot be checked.
+    ///
+    /// Ordered above [`JobChainOutcome::VerifiedOk`] and below
+    /// [`JobChainOutcome::Empty`]: it is NOT a failure — the links, the
+    /// genesis and the HMACs all verified, and a legacy pre-anchor chain is
+    /// legitimately here — but it is not the full verification either, and
+    /// folding it into `verified_ok` is exactly how the gap this outcome
+    /// exists to expose would stay invisible. Measured on the reference fleet
+    /// 2026-09-15: 60 626 of 60 790 bucket prefixes carry an anchor, every
+    /// prefix written since 2026-08-01 does, and the sweep's window holds only
+    /// recent jobs — so a non-zero count here means the PRODUCER stopped
+    /// sealing anchors, not that the ledger is old.
+    Unanchored,
     /// Read cleanly, ZERO events — not verified, see
     /// [`ChainVerifyErrorKind::EmptyChain`](crate::ChainVerifyErrorKind::EmptyChain).
     Empty,
@@ -185,6 +200,7 @@ impl JobChainOutcome {
     pub fn metric_label(self) -> &'static str {
         match self {
             JobChainOutcome::VerifiedOk => "verified_ok",
+            JobChainOutcome::Unanchored => "unanchored",
             JobChainOutcome::Empty => "empty",
             JobChainOutcome::Errored => "errored",
             JobChainOutcome::Failed => "failed",
@@ -195,6 +211,7 @@ impl JobChainOutcome {
     /// equal this set, and it cannot import this crate to say so.
     pub const ALL: &'static [JobChainOutcome] = &[
         JobChainOutcome::VerifiedOk,
+        JobChainOutcome::Unanchored,
         JobChainOutcome::Empty,
         JobChainOutcome::Errored,
         JobChainOutcome::Failed,
@@ -206,8 +223,12 @@ impl JobChainOutcome {
 pub struct WorkflowExecutionRollup {
     /// Distinct workflow executions represented by the jobs that were checked.
     pub covered: usize,
-    /// Every job of this workflow execution verified with at least one event.
+    /// Every job of this workflow execution verified with at least one event
+    /// AND sealed a terminal anchor on every dispatch attempt.
     pub verified_ok: usize,
+    /// No job failed, errored or read empty, and at least one verified without
+    /// a terminal anchor — its tail is unprovable.
+    pub unanchored: usize,
     /// No job failed or errored, and at least one read cleanly and empty.
     pub empty: usize,
     /// No job failed, and at least one could not be read.
@@ -241,6 +262,7 @@ pub fn roll_up_by_workflow_execution(jobs: &[(Uuid, JobChainOutcome)]) -> Workfl
     for outcome in worst.values() {
         match outcome {
             JobChainOutcome::VerifiedOk => rollup.verified_ok += 1,
+            JobChainOutcome::Unanchored => rollup.unanchored += 1,
             JobChainOutcome::Empty => rollup.empty += 1,
             JobChainOutcome::Errored => rollup.errored += 1,
             JobChainOutcome::Failed => rollup.failed += 1,
@@ -383,6 +405,57 @@ mod rollup_tests {
             u(2).to_string(),
             "standalone genesis is (job_id, job_id) — the wire contract"
         );
+    }
+
+    /// `Unanchored` sits between `VerifiedOk` and `Empty` in the worst-wins
+    /// order, and that placement is the whole of its meaning.
+    ///
+    /// ABOVE `VerifiedOk`: a workflow execution one of whose jobs could not
+    /// prove its tail must not roll up as fully verified — that is the reading
+    /// this outcome exists to remove. BELOW `Empty`/`Errored`/`Failed`: it is
+    /// not a failure and must never mask one, because a legacy pre-anchor
+    /// chain is legitimately unanchored and the verdict is soft by design.
+    #[test]
+    fn unanchored_outranks_verified_but_never_masks_a_real_finding() {
+        let wf = u(1);
+        let r = roll_up_by_workflow_execution(&[
+            (wf, JobChainOutcome::VerifiedOk),
+            (wf, JobChainOutcome::Unanchored),
+        ]);
+        assert_eq!(r.covered, 1);
+        assert_eq!(r.unanchored, 1, "one unproven tail demotes the whole run");
+        assert_eq!(r.verified_ok, 0);
+
+        for louder in [
+            JobChainOutcome::Empty,
+            JobChainOutcome::Errored,
+            JobChainOutcome::Failed,
+        ] {
+            let r =
+                roll_up_by_workflow_execution(&[(wf, JobChainOutcome::Unanchored), (wf, louder)]);
+            assert_eq!(
+                r.unanchored, 0,
+                "{louder:?} must win — a soft verdict cannot hide a real finding"
+            );
+        }
+    }
+
+    /// The label is part of the alert contract (it is a Prometheus label value
+    /// an expression can select on), so it is pinned as a literal.
+    #[test]
+    fn every_outcome_has_a_distinct_stable_label() {
+        let labels: Vec<&str> = JobChainOutcome::ALL
+            .iter()
+            .map(|o| o.metric_label())
+            .collect();
+        assert_eq!(
+            labels,
+            vec!["verified_ok", "unanchored", "empty", "errored", "failed"]
+        );
+        let mut sorted = labels.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), labels.len(), "two outcomes share a label");
     }
 
     /// Order is preserved, because the sweep's `completed_at DESC` ordering is

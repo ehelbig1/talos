@@ -16,8 +16,9 @@ use talos_task_supervision::{spawn_supervised, BackgroundTask};
 // `pub use` so consumers (e.g. the talos-api GraphQL admin query) can name the
 // report types without a direct dep on talos-audit-event.
 pub use talos_audit_event::{
-    audit_verify_keys, verify_chain, AttemptChainReport, AuditEvent, ChainBreak,
-    ChainVerificationReport,
+    audit_verify_keys, verify_chain, verify_chain_anchored, AnchorVerdict,
+    AnchoredChainVerificationReport, AttemptAnchorVerdict, AttemptChainReport, AuditEvent,
+    ChainBreak, ChainVerificationReport,
 };
 
 pub mod batch_dedupe;
@@ -701,7 +702,7 @@ pub fn audit_bucket_name() -> String {
 pub async fn verify_execution_chain_from_env(
     workflow_id: &str,
     execution_id: &str,
-) -> std::result::Result<ChainVerificationReport, ChainVerifyError> {
+) -> std::result::Result<AnchoredChainVerificationReport, ChainVerifyError> {
     let client = match build_audit_verifier_client_from_env() {
         VerifierClient::Ready(c) => c,
         VerifierClient::NoEndpoint => {
@@ -857,7 +858,21 @@ pub struct ChainSweepStats {
     /// is now a real per-execution finding rather than the expected reading,
     /// and it is still not folded into `verified_ok`.
     pub empty: usize,
-    /// Chains WITH breaks — tamper / corruption / gap / linkage / bad HMAC.
+    /// Chains that verified but sealed NO terminal anchor on at least one
+    /// dispatch attempt — their TAIL is unprovable.
+    ///
+    /// Not folded into `verified_ok` and not counted as a failure. The
+    /// verdict is deliberately soft (a legacy pre-anchor chain is legitimately
+    /// here and must keep verifying green), which is exactly why it needs its
+    /// own number: with no committed length, deleting a chain's last N events
+    /// leaves something that still verifies, so this counts the population in
+    /// which the truncation check cannot run. Measured 2026-09-15 over the
+    /// whole bucket: 1 of 60 790 prefixes, written 2026-07-21; every prefix
+    /// since 2026-08-01 is anchored. The sweep reads only RECENT jobs, so a
+    /// non-zero count here is a producer regression, not history.
+    pub unanchored: usize,
+    /// Chains WITH breaks — tamper / corruption / gap / linkage / bad HMAC /
+    /// a terminal anchor that disagrees with the chain it seals.
     ///
     /// A byte-identical REDELIVERY is not one of these. It is counted in
     /// [`ChainSweepStats::duplicate_delivery`] and, when it is the only
@@ -1103,7 +1118,7 @@ enum SweepControl {
 /// re-checking one known-broken chain cannot re-page.
 fn record_chain_verification_outcome(
     stats: &mut ChainSweepStats,
-    outcome: std::result::Result<ChainVerificationReport, ChainVerifyError>,
+    outcome: std::result::Result<AnchoredChainVerificationReport, ChainVerifyError>,
     target: &LedgerTarget,
 ) -> (SweepControl, JobChainOutcome) {
     // Named for what they ARE, not for the ledger field they feed: the log
@@ -1123,7 +1138,7 @@ fn record_chain_verification_outcome(
         // Counted BEFORE the arms and independently of them, for the same
         // reason as the redelivery count below it: how many dispatches a job
         // took is a property of the chain, not of the verdict.
-        let attempts = report.dispatch_attempt_count();
+        let attempts = report.chain.dispatch_attempt_count();
         if attempts > 1 {
             stats.multi_attempt += 1;
             inc_chain_multi_attempt();
@@ -1142,6 +1157,7 @@ fn record_chain_verification_outcome(
             );
         }
         let duplicates = report
+            .chain
             .breaks
             .iter()
             .filter(|b| matches!(b, ChainBreak::DuplicateDelivery { .. }))
@@ -1167,7 +1183,7 @@ fn record_chain_verification_outcome(
         // An EMPTY prefix is not a verified chain. It does not stamp the
         // last-verified-ok gauge either — "the control works" must not be
         // claimed from a read that returned nothing.
-        Ok(report) if report.ok && report.total_events == 0 => {
+        Ok(report) if report.ok && report.chain.total_events == 0 => {
             stats.empty += 1;
             class = JobChainOutcome::Empty;
             inc_chain_unverifiable(ChainVerifyErrorKind::EmptyChain);
@@ -1188,6 +1204,43 @@ fn record_chain_verification_outcome(
             );
             SweepControl::Continue
         }
+        // Verified, but at least one dispatch sealed no terminal anchor, so
+        // its tail is unprovable. SOFT — `ok` is untouched, the gauge is
+        // stamped, and nothing is counted as a verification failure: a legacy
+        // pre-anchor chain is legitimately here and hard-failing it would
+        // re-page the whole history. It gets its OWN outcome rather than
+        // folding into `verified_ok`, because the state in which truncation
+        // is undetectable must be countable: every prefix this fleet has
+        // written since 2026-08-01 carries an anchor, and the sweep reads only
+        // recent jobs, so a climbing `unanchored` here means the PRODUCER
+        // stopped sealing them — the one regression that would silently
+        // restore the blind spot this change closes.
+        Ok(report) if report.ok && report.unanchored_attempts() > 0 => {
+            stats.unanchored += 1;
+            class = JobChainOutcome::Unanchored;
+            // Stamped, like `verified_ok`: this chain WAS read and its links,
+            // genesis and HMACs all verified, so the "has the verifier ever
+            // worked" gauge (`TalosAuditChainNeverVerified`) must not read as
+            // never-verified on a deployment whose ledger predates anchors.
+            set_last_verified_ok_timestamp();
+            tracing::warn!(
+                target: "talos_audit",
+                event_kind = "audit_chain_verification_unanchored",
+                module_execution_id = %exec_id,
+                workflow_execution_id = %wf_id,
+                ledger_key_space = LEDGER_KEY_SPACE,
+                total_events = report.chain.total_events,
+                signatures_checked = report.chain.signatures_checked,
+                unanchored_attempts = report.unanchored_attempts(),
+                dispatch_attempts = report.chain.dispatch_attempt_count(),
+                "a job's audit chain verified but sealed NO terminal anchor on at least one \
+                 dispatch — its links and signatures are good, and nothing here is tamper \
+                 evidence, but with no committed length a deleted TAIL would still verify. \
+                 Expected only for a chain written before the anchor existed; on a current \
+                 producer it means execution_complete is not being emitted."
+            );
+            SweepControl::Continue
+        }
         Ok(report) if report.ok => {
             stats.verified_ok += 1;
             set_last_verified_ok_timestamp();
@@ -1199,17 +1252,25 @@ fn record_chain_verification_outcome(
             inc_audit_verification_failure(AUDIT_STAGE_CHAIN);
             // The security signal — one ERROR per broken chain so SIEM
             // can alert per job. `breaks` is a structured list.
+            //
+            // `anchor` is rendered BESIDE `breaks` and not folded into it: a
+            // chain truncated before its anchor has an EMPTY break list — the
+            // events that remain are a perfectly good chain — so a reader
+            // given only `breaks` on such a job would see "FAILED" with
+            // nothing named. The anchor verdict is the finding in that case.
             tracing::error!(
                 target: "talos_audit",
                 event_kind = "audit_chain_verification_failed",
                 module_execution_id = %exec_id,
                 workflow_execution_id = %wf_id,
                 ledger_key_space = LEDGER_KEY_SPACE,
-                total_events = report.total_events,
-                signatures_checked = report.signatures_checked,
-                breaks = ?report.breaks,
+                total_events = report.chain.total_events,
+                signatures_checked = report.chain.signatures_checked,
+                breaks = ?report.chain.breaks,
+                anchor = %report.anchor.describe(),
+                attempt_anchors = ?report.attempt_anchors,
                 "audit chain verification FAILED for a completed job — \
-                 possible tampering, deletion, reorder, or corruption"
+                 possible tampering, deletion, reorder, truncation, or corruption"
             );
             SweepControl::Continue
         }
@@ -1390,6 +1451,7 @@ fn publish_sweep_snapshot(stats: &ChainSweepStats) {
     verifier::publish_chain_sweep_snapshot(ChainSweepSnapshot {
         scanned: stats.scanned,
         verified_ok: stats.verified_ok,
+        unanchored: stats.unanchored,
         empty: stats.empty,
         failed: stats.failed,
         duplicate_delivery: stats.duplicate_delivery,
@@ -2405,12 +2467,38 @@ fn extract_events_from_jsonl(objects: &[Vec<u8>]) -> Vec<AuditEvent> {
 /// that need the whole record set and so cannot live in the streaming
 /// persister. Intended to back an operator/admin audit endpoint or a periodic
 /// sweep; safe to call on demand.
+///
+/// # Why the ANCHORED verifier
+///
+/// Every check above is a statement about the events that are PRESENT. None
+/// of them can see a chain whose TAIL was removed: delete the last N events
+/// of a valid chain and what remains is a valid chain — contiguous from
+/// genesis, correctly linked, every HMAC good. Until 2026-09-15 this function
+/// called [`talos_audit_event::verify_chain`], which answers exactly that, so
+/// truncation was undetectable on the only path that runs in production —
+/// the hourly sweep, the `security_audit` round trip and the operator's
+/// on-demand GraphQL query all read through here.
+///
+/// [`talos_audit_event::verify_chain_anchored`] adds the one check that can
+/// see it: the worker seals each dispatch with a terminal
+/// `execution_complete` anchor committing the chain's own length, so a
+/// truncated tail is a `CountMismatch` (or, if the anchor itself went, an
+/// `Unanchored` chain — soft, and counted rather than failed; see
+/// [`JobChainOutcome::Unanchored`]).
+///
+/// Switching cost NOTHING in new failures, and that was measured rather than
+/// assumed: replicating the anchored logic over a copy of the whole bucket
+/// (60 790 prefixes, 2026-09-15) gives 60 626 anchored, 163 `MultipleAnchors`
+/// and 1 `Unanchored` — and all 163 of those already carry a duplicate
+/// `sequence_num` inside one dispatch attempt, so `verify_chain` ALREADY
+/// fails every one of them. The anchored verdict adds detection, not alert
+/// volume.
 pub async fn verify_execution_chain(
     s3_client: &S3Client,
     bucket: &str,
     workflow_id: &str,
     execution_id: &str,
-) -> std::result::Result<ChainVerificationReport, ChainVerifyError> {
+) -> std::result::Result<AnchoredChainVerificationReport, ChainVerifyError> {
     let prefix = format!("{execution_id}/");
     let mut bodies: Vec<Vec<u8>> = Vec::new();
     let mut continuation: Option<String> = None;
@@ -2474,15 +2562,98 @@ pub async fn verify_execution_chain(
         }
     }
 
-    let events = extract_events_from_jsonl(&bodies);
-    let keys = audit_verify_keys();
-    Ok(verify_chain(workflow_id, execution_id, &events, &keys))
+    Ok(verify_reassembled_chain(
+        workflow_id,
+        execution_id,
+        &bodies,
+        &audit_verify_keys(),
+    ))
+}
+
+/// Reassemble a prefix's `.jsonl` object bodies and run the verifier over them.
+///
+/// Extracted from [`verify_execution_chain`] for one reason: WHICH VERIFIER
+/// this calls is the entire substance of the 2026-09-15 change, and the
+/// function it was inlined in needs an S3 client, so no test in this workspace
+/// could see it. A mutation swapping `verify_chain_anchored` back for
+/// `verify_chain` there compiled, passed every unit test and every DB test,
+/// and silently restored the blind spot — checks 74b/79b's recorded limit, and
+/// extraction is the only thing that closes it.
+fn verify_reassembled_chain(
+    workflow_id: &str,
+    execution_id: &str,
+    bodies: &[Vec<u8>],
+    keys: &[Vec<u8>],
+) -> AnchoredChainVerificationReport {
+    let events = extract_events_from_jsonl(bodies);
+    verify_chain_anchored(workflow_id, execution_id, &events, keys)
 }
 
 #[cfg(test)]
 mod chain_reader_tests {
     use super::*;
     use talos_audit_event::{ChainBreak, ExecutionLedger};
+
+    /// The READ PATH must use the ANCHORED verifier.
+    ///
+    /// This is the pin on the substance of the 2026-09-15 change. The events
+    /// below form a chain that `verify_chain` calls perfect — contiguous from
+    /// genesis, correctly linked — with one record appended AFTER the terminal
+    /// anchor, which is the shape only the anchor can reject. Both directions
+    /// are asserted, so the test cannot pass because the chain was broken
+    /// anyway: the unanchored verifier must say `ok`, and the read path must
+    /// not.
+    #[test]
+    fn the_read_path_verifies_the_terminal_anchor() {
+        let mut ledger = ExecutionLedger::new("wf", "ex");
+        let mut events = vec![ledger.append("worker", "act", "one")];
+        events.push(ledger.append_terminal_anchor("worker"));
+        events.push(ledger.append("worker", "act", "appended-after-completion"));
+
+        assert!(
+            verify_chain("wf", "ex", &events, &[]).ok,
+            "control: the pre-2026-09-15 verifier sees nothing wrong with this chain"
+        );
+
+        let bodies = jsonl_objects(&events, 2);
+        let report = verify_reassembled_chain("wf", "ex", &bodies, &[]);
+        assert!(
+            !report.ok,
+            "the production read path must reject an event appended after the anchor"
+        );
+        assert_eq!(
+            report.anchor,
+            talos_audit_event::AnchorVerdict::NotTerminal {
+                anchor_seq: 2,
+                last_seq: 3
+            }
+        );
+        assert!(
+            report.chain.breaks.is_empty(),
+            "and with no structural breaks: {:?}",
+            report.chain.breaks
+        );
+    }
+
+    /// The read path still reads the whole prefix and still verifies an
+    /// ordinary anchored chain — the control for the test above.
+    #[test]
+    fn the_read_path_verifies_an_intact_anchored_chain() {
+        let mut ledger = ExecutionLedger::new("wf", "ex");
+        let mut events: Vec<AuditEvent> = (1..=3)
+            .map(|i| ledger.append("worker", "act", &format!("p{i}")))
+            .collect();
+        events.push(ledger.append_terminal_anchor("worker"));
+
+        let report = verify_reassembled_chain("wf", "ex", &jsonl_objects(&events, 2), &[]);
+        assert!(report.ok, "breaks: {:?}", report.chain.breaks);
+        assert_eq!(report.chain.total_events, 4);
+        assert_eq!(report.unanchored_attempts(), 0);
+        assert_eq!(
+            report.anchor,
+            talos_audit_event::AnchorVerdict::Anchored { total_events: 4 }
+        );
+    }
 
     /// Serialize a chain into `.jsonl` object bodies the way `process_batch`
     /// persists them (`{ "event": ..., "hash": ... }` per line), optionally
@@ -2685,7 +2856,7 @@ mod audit_verification_metric_tests {
         }
     }
 
-    fn report(ok: bool) -> ChainVerificationReport {
+    fn chain_report(ok: bool) -> ChainVerificationReport {
         ChainVerificationReport {
             execution_id: "ex".into(),
             workflow_id: "wf".into(),
@@ -2699,6 +2870,39 @@ mod audit_verification_metric_tests {
                 ok,
                 breaks: Vec::new(),
             }],
+        }
+    }
+
+    /// A synthetic report the sweep would classify, ANCHORED — i.e. the shape
+    /// a current producer writes.
+    ///
+    /// The anchor is stated explicitly rather than derived, and that is the
+    /// point: `AnchorVerdict::Unanchored` is the DEFAULT for an event set that
+    /// carries no anchor, so a helper that left it unset would quietly route
+    /// every pre-existing assertion in this module through the unanchored arm
+    /// and prove nothing about the one it names.
+    fn report(ok: bool) -> AnchoredChainVerificationReport {
+        anchored(
+            chain_report(ok),
+            AnchorVerdict::Anchored { total_events: 3 },
+        )
+    }
+
+    /// Wrap a chain report in a given anchor verdict, computing `ok` the way
+    /// [`verify_chain_anchored`] does (chain ok AND no hard anchor failure).
+    fn anchored(
+        chain: ChainVerificationReport,
+        anchor: AnchorVerdict,
+    ) -> AnchoredChainVerificationReport {
+        let ok = chain.ok && !anchor.is_hard_failure();
+        AnchoredChainVerificationReport {
+            chain,
+            attempt_anchors: vec![AttemptAnchorVerdict {
+                dispatch_attempt: 0,
+                anchor: anchor.clone(),
+            }],
+            anchor,
+            ok,
         }
     }
 
@@ -2796,8 +3000,13 @@ mod audit_verification_metric_tests {
             a1.append("worker", "act", "two"),
             a1.append_terminal_anchor("worker"),
         ];
-        let report = verify_chain("wf", "ex", &events, &[]);
-        assert!(report.ok, "breaks: {:?}", report.breaks);
+        let report = verify_chain_anchored("wf", "ex", &events, &[]);
+        assert!(report.ok, "breaks: {:?}", report.chain.breaks);
+        assert_eq!(
+            report.unanchored_attempts(),
+            0,
+            "both attempts sealed their own anchor"
+        );
 
         let multi_before = talos_metrics::global()
             .expect("global installed")
@@ -2822,6 +3031,231 @@ mod audit_verification_metric_tests {
             stage_count(AUDIT_STAGE_CHAIN) - fail_before,
             0.0,
             "a retry must never touch the tamper counter"
+        );
+    }
+
+    /// A chain that `verify_chain` calls PERFECT and the terminal anchor calls
+    /// broken — the whole reason the production path moved to the anchored
+    /// verifier on 2026-09-15.
+    ///
+    /// The shape is an event appended AFTER the terminal anchor. Structurally
+    /// it is flawless: contiguous from genesis, correctly linked, correctly
+    /// signed — so the unanchored verifier this sweep used to call answers
+    /// `ok`, and the sweep counted it in `verified_ok`. The anchor is the only
+    /// thing that disagrees, because it certifies "nothing comes after me".
+    ///
+    /// Asserted BOTH ways deliberately: `verify_chain` on the same events must
+    /// say `ok`, so this test cannot pass for the wrong reason (a chain that
+    /// was broken anyway would prove nothing about the switch).
+    #[test]
+    fn an_event_after_the_anchor_fails_only_under_the_anchored_verifier() {
+        let _guard = metric_guard();
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
+        let mut stats = ChainSweepStats::default();
+
+        let mut ledger = talos_audit_event::ExecutionLedger::new("wf", "ex");
+        let mut events = vec![ledger.append("worker", "act", "one")];
+        events.push(ledger.append_terminal_anchor("worker"));
+        // Appended through the REAL producer, so its linkage and hash are
+        // genuine — this is not a hand-built event the verifier would reject
+        // for an unrelated reason.
+        events.push(ledger.append("worker", "act", "after-the-anchor"));
+
+        // The control, and the point: the verifier the sweep used to call is
+        // perfectly happy with this chain.
+        let unanchored_view = verify_chain("wf", "ex", &events, &[]);
+        assert!(
+            unanchored_view.ok,
+            "the pre-2026-09-15 verifier must see nothing wrong here, or this test proves \
+             nothing about the switch: {:?}",
+            unanchored_view.breaks
+        );
+
+        let report = verify_chain_anchored("wf", "ex", &events, &[]);
+        assert!(
+            !report.ok,
+            "the anchor must reject an event appended after it"
+        );
+        assert!(
+            report.chain.breaks.is_empty(),
+            "and it must do so with NO structural breaks — which is why the failed log line \
+             renders `anchor` beside `breaks`: {:?}",
+            report.chain.breaks
+        );
+
+        let before = stage_count(AUDIT_STAGE_CHAIN);
+        record_chain_verification_outcome(&mut stats, Ok(report), &nil_target());
+        assert_eq!(stats.failed, 1, "the sweep must classify it as a failure");
+        assert_eq!(stats.verified_ok, 0);
+        assert_eq!(
+            stats.unanchored, 0,
+            "it HAS an anchor — it is a hard failure, not a gap"
+        );
+        assert_eq!(
+            stage_count(AUDIT_STAGE_CHAIN) - before,
+            1.0,
+            "and it must reach the CRITICAL tamper counter"
+        );
+    }
+
+    /// A chain with NO terminal anchor is counted as its own outcome, never
+    /// folded into `verified_ok`.
+    ///
+    /// `AnchorVerdict::Unanchored` is SOFT at the verifier and must stay soft:
+    /// from chain content alone a truncated chain and a legacy pre-anchor
+    /// chain are the same bytes, so hard-failing it would re-page the entire
+    /// history. The SWEEP, however, knows something the verifier cannot — it
+    /// reads only RECENT terminal jobs, and every prefix this fleet has
+    /// written since 2026-08-01 carries an anchor (measured 2026-09-15 over
+    /// all 60 790 bucket prefixes: 1 unanchored, dated 2026-07-21). So here it
+    /// is a finding, and the assertions below are that it is counted, kept out
+    /// of `verified_ok`, and kept out of the tamper counter.
+    #[test]
+    fn an_unanchored_chain_is_counted_separately_and_is_not_a_tamper_failure() {
+        let _guard = metric_guard();
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
+        let mut stats = ChainSweepStats::default();
+
+        // A real chain whose tail — anchor included — is gone. What remains is
+        // a structurally valid chain, which is exactly the problem.
+        let mut ledger = talos_audit_event::ExecutionLedger::new("wf", "ex");
+        let mut events: Vec<talos_audit_event::AuditEvent> = (1..=3)
+            .map(|i| ledger.append("worker", "act", &format!("p{i}")))
+            .collect();
+        events.push(ledger.append_terminal_anchor("worker"));
+        events.truncate(2);
+
+        let report = verify_chain_anchored("wf", "ex", &events, &[]);
+        assert!(
+            report.ok,
+            "soft by design — the chain itself still verifies"
+        );
+        assert_eq!(report.unanchored_attempts(), 1);
+
+        let before = stage_count(AUDIT_STAGE_CHAIN);
+        let (control, class) =
+            record_chain_verification_outcome(&mut stats, Ok(report), &nil_target());
+        assert_eq!(class, JobChainOutcome::Unanchored);
+        assert_eq!(control, SweepControl::Continue);
+        assert_eq!(stats.unanchored, 1);
+        assert_eq!(
+            stats.verified_ok, 0,
+            "folding it into verified_ok is the whole defect — a chain whose length is not \
+             committed has not been fully verified"
+        );
+        assert_eq!(stats.failed, 0, "and it is NOT tamper evidence");
+        assert_eq!(
+            stage_count(AUDIT_STAGE_CHAIN) - before,
+            0.0,
+            "so it must never reach the CRITICAL counter"
+        );
+    }
+
+    /// One unanchored attempt among several is counted, even when the chain's
+    /// COLLAPSED anchor verdict reads `Anchored`.
+    ///
+    /// `AnchoredChainVerificationReport::anchor` is worst-wins only among HARD
+    /// failures; with none it takes the FIRST attempt's verdict. So a job
+    /// re-dispatched after its first attempt completed — first chain anchored,
+    /// second truncated to nothing — collapses to `Anchored`, and a classifier
+    /// reading that field would call the job fully verified. The count must
+    /// come from `attempt_anchors`, and this is the case that says so: a
+    /// mutation reading the collapsed field passes every single-attempt test
+    /// in this module.
+    #[test]
+    fn an_unanchored_attempt_is_counted_even_when_a_sibling_attempt_anchored() {
+        let _guard = metric_guard();
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
+        let mut stats = ChainSweepStats::default();
+
+        let mut a0 = talos_audit_event::ExecutionLedger::new_for_attempt("wf", "ex", 0);
+        let mut a1 = talos_audit_event::ExecutionLedger::new_for_attempt("wf", "ex", 1);
+        let events = vec![
+            a0.append("worker", "act", "one"),
+            a0.append_terminal_anchor("worker"),
+            // The second dispatch's chain, with no anchor sealed.
+            a1.append("worker", "act", "two"),
+        ];
+
+        let report = verify_chain_anchored("wf", "ex", &events, &[]);
+        assert_eq!(
+            report.anchor,
+            talos_audit_event::AnchorVerdict::Anchored { total_events: 2 },
+            "the COLLAPSED verdict reads anchored — that is the trap"
+        );
+        assert_eq!(
+            report.unanchored_attempts(),
+            1,
+            "but one attempt sealed nothing"
+        );
+
+        let (_, class) = record_chain_verification_outcome(&mut stats, Ok(report), &nil_target());
+        assert_eq!(class, JobChainOutcome::Unanchored);
+        assert_eq!(stats.unanchored, 1);
+        assert_eq!(stats.verified_ok, 0);
+    }
+
+    /// The control for the test above: an ANCHORED chain lands in
+    /// `verified_ok` and moves nothing else, so a non-zero `unanchored` means
+    /// what it says.
+    #[test]
+    fn an_anchored_chain_is_verified_ok_and_not_counted_as_unanchored() {
+        let _guard = metric_guard();
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
+        let mut stats = ChainSweepStats::default();
+
+        let mut ledger = talos_audit_event::ExecutionLedger::new("wf", "ex");
+        let mut events: Vec<talos_audit_event::AuditEvent> = (1..=3)
+            .map(|i| ledger.append("worker", "act", &format!("p{i}")))
+            .collect();
+        events.push(ledger.append_terminal_anchor("worker"));
+
+        let report = verify_chain_anchored("wf", "ex", &events, &[]);
+        let (_, class) = record_chain_verification_outcome(&mut stats, Ok(report), &nil_target());
+        assert_eq!(class, JobChainOutcome::VerifiedOk);
+        assert_eq!(stats.verified_ok, 1);
+        assert_eq!(stats.unanchored, 0);
+        assert_eq!(stats.failed, 0);
+    }
+
+    /// An unanchored chain still stamps the "has the verifier ever worked"
+    /// gauge.
+    ///
+    /// `TalosAuditChainNeverVerified` fires on that stamp being absent or
+    /// stale. A deployment whose ledger predates the anchor would classify
+    /// every job `unanchored`, and if that arm skipped the stamp it would page
+    /// as a BROKEN VERIFIER — which is false: the chain was read, its links
+    /// and signatures checked. The stamp answers "did verification run", not
+    /// "was the tail proven".
+    #[test]
+    fn an_unanchored_chain_still_proves_the_verifier_ran() {
+        let _guard = metric_guard();
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
+        let mut stats = ChainSweepStats::default();
+
+        // Zeroed explicitly rather than assumed: `metric_guard` serialises
+        // these tests but they SHARE the process-global registry, so a sibling
+        // that stamped the gauge would otherwise make this assertion pass
+        // without this call having done anything — the sibling test above
+        // records the same race.
+        talos_metrics::global()
+            .expect("global installed")
+            .audit_chain_last_verified_ok_timestamp_seconds
+            .set(0.0);
+
+        let mut ledger = talos_audit_event::ExecutionLedger::new("wf", "ex");
+        let events = vec![ledger.append("worker", "act", "only")];
+        let report = verify_chain_anchored("wf", "ex", &events, &[]);
+        record_chain_verification_outcome(&mut stats, Ok(report), &nil_target());
+
+        assert_eq!(stats.unanchored, 1);
+        assert!(
+            talos_metrics::global()
+                .expect("global installed")
+                .audit_chain_last_verified_ok_timestamp_seconds
+                .get()
+                > 0.0,
+            "an unanchored chain WAS verified — the never-verified alert must not fire on it"
         );
     }
 
@@ -2860,7 +3294,9 @@ mod audit_verification_metric_tests {
         talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
         let mut stats = ChainSweepStats::default();
         let mut r = report(true);
-        r.breaks.push(ChainBreak::DuplicateDelivery { seq: 1 });
+        r.chain
+            .breaks
+            .push(ChainBreak::DuplicateDelivery { seq: 1 });
 
         let before = stage_count(AUDIT_STAGE_CHAIN);
         let before_dupes = chain_duplicate_count();
@@ -2886,8 +3322,10 @@ mod audit_verification_metric_tests {
         talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
         let mut stats = ChainSweepStats::default();
         let mut r = report(false);
-        r.breaks.push(ChainBreak::DuplicateDelivery { seq: 1 });
-        r.breaks.push(ChainBreak::SequenceGap {
+        r.chain
+            .breaks
+            .push(ChainBreak::DuplicateDelivery { seq: 1 });
+        r.chain.breaks.push(ChainBreak::SequenceGap {
             expected: 2,
             found: 3,
         });
@@ -3119,7 +3557,7 @@ mod audit_verification_metric_tests {
         let gauge_before = gauge();
 
         let mut empty = report(true);
-        empty.total_events = 0;
+        empty.chain.total_events = 0;
         let (control, class) =
             record_chain_verification_outcome(&mut stats, Ok(empty), &nil_target());
         assert_eq!(class, JobChainOutcome::Empty);
@@ -3226,6 +3664,7 @@ mod sweep_coverage_pins {
             empty: 0,
             scanned: 500,
             verified_ok: 500,
+            unanchored: 0,
             failed: 0,
             duplicate_delivery: 0,
             multi_attempt: 0,

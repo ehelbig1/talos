@@ -195,6 +195,12 @@ export type AuditChainBreak = {
  */
 export type AuditChainJobVerification = {
   __typename?: "AuditChainJobVerification";
+  /**
+   * The terminal-anchor verdict, rendered. The ONLY field that can name a
+   * truncation: deleting a chain's last records leaves every remaining link
+   * intact, so such a job reports `ok: false` with an EMPTY `breaks` list.
+   */
+  anchor: Scalars["String"]["output"];
   breaks: Array<AuditChainBreak>;
   /**
    * How many CONTROLLER DISPATCH ATTEMPTS this prefix holds chains for.
@@ -224,6 +230,13 @@ export type AuditChainJobVerification = {
    * `duplicateDeliveries` for the number of distinct events.
    */
   totalEvents: Scalars["Int"]["output"];
+  /**
+   * Dispatch attempts that sealed NO terminal anchor, so their tail is
+   * unprovable. Does not clear `ok` — a chain written before the anchor
+   * existed is legitimately here — but a non-zero value means this run
+   * could not check whether records were removed from the END.
+   */
+  unanchoredAttempts: Scalars["Int"]["output"];
   /** `module_executions.workflow_execution_id` — the genesis `workflow_id`. */
   workflowExecutionId: Scalars["String"]["output"];
 };
@@ -256,6 +269,12 @@ export type AuditChainVerification = {
    * was verified, which is why `ok` is false in that case.
    */
   jobs: Array<AuditChainJobVerification>;
+  /**
+   * How many of `jobs` sealed no terminal anchor on at least one dispatch.
+   * `ok` is unaffected — the verdict is soft so pre-anchor chains keep
+   * verifying — but for those jobs this run did not check the TAIL.
+   */
+  jobsUnanchored: Scalars["Int"]["output"];
   /**
    * How many of `jobs` hold more than one controller dispatch attempt — a
    * re-dispatched `job_id`. A retry, not a finding; `ok` is unaffected.

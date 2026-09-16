@@ -2239,7 +2239,11 @@ impl TalosMetrics {
             prometheus::Opts::new(
                 "talos_audit_chain_jobs_swept_total",
                 "Job chains the audit-chain verification sweep classified, by outcome \
-                 (verified_ok, empty, failed, errored). The DENOMINATOR \
+                 (verified_ok, unanchored, empty, failed, errored). `unanchored` is NOT a \
+                 failure — the chain verified, but a dispatch sealed no terminal anchor, so \
+                 its tail is unprovable; every prefix this fleet wrote since 2026-08-01 is \
+                 anchored, so a climbing unanchored means the producer stopped sealing them. \
+                 The DENOMINATOR \
                  TalosAuditChainJobsUnverifiable divides talos_audit_chain_unverifiable_total's \
                  per-job reasons by: one empty prefix is a worker that died mid-flight, \
                  a quarter of the population is the audit-ledger subscriber. Pre-seeded \
@@ -2252,7 +2256,7 @@ impl TalosMetrics {
         // equal to this list by `job_chain_outcome_labels_are_the_seeded_set`
         // in that crate (it cannot be imported here without inverting the
         // layering — #760's `RPC_WRITE_CEILING_SUBJECTS` precedent).
-        for outcome in ["verified_ok", "empty", "failed", "errored"] {
+        for outcome in ["verified_ok", "unanchored", "empty", "failed", "errored"] {
             audit_chain_jobs_swept_total
                 .with_label_values(&[outcome])
                 .inc_by(0.0);
@@ -4116,6 +4120,7 @@ mod tests {
             // alert is a RATIO over this, so the ratio must be defined from
             // the first sweep, not from the first job that happened to fail.
             r#"talos_audit_chain_jobs_swept_total{outcome="verified_ok"} 0"#,
+            r#"talos_audit_chain_jobs_swept_total{outcome="unanchored"} 0"#,
             r#"talos_audit_chain_jobs_swept_total{outcome="empty"} 0"#,
             r#"talos_audit_chain_jobs_swept_total{outcome="failed"} 0"#,
             r#"talos_audit_chain_jobs_swept_total{outcome="errored"} 0"#,
