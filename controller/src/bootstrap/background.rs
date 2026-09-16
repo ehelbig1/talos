@@ -2120,7 +2120,12 @@ pub(crate) fn spawn_maintenance_sweeps(
                         )
                         .await
                         {
-                            if let Some(kind) = stats.aborted {
+                            // The branch is chosen by ONE classifier in the
+                            // ledger crate (`ChainSweepStats::summary`); this
+                            // loop only renders it. See that fn for why
+                            // `unanchored` is a finding.
+                            match stats.summary() {
+                            talos_audit_ledger::SweepSummary::Aborted(kind) => {
                                 // A deployment-wide condition: one identity,
                                 // one bucket, so every remaining execution in
                                 // the window would answer identically. ONE
@@ -2143,10 +2148,8 @@ pub(crate) fn spawn_maintenance_sweeps(
                                      audit_chain_verification_errored line for the classified \
                                      reason and its remedy."
                                 );
-                            } else if stats.failed > 0
-                                || stats.errored > 0
-                                || stats.empty > 0
-                            {
+                            }
+                            talos_audit_ledger::SweepSummary::WithFindings => {
                                 // `empty` counts here: a prefix that read
                                 // cleanly and held NOTHING is not a verified
                                 // chain, and folding it into verified_ok is
@@ -2170,6 +2173,7 @@ pub(crate) fn spawn_maintenance_sweeps(
                                     jobs_scanned = stats.scanned,
                                     jobs_verified_ok = stats.verified_ok,
                                     jobs_empty = stats.empty,
+                                    jobs_unanchored = stats.unanchored,
                                     jobs_failed = stats.failed,
                                     // Reported beside the verdict, never inside
                                     // it: a byte-identical redelivery is
@@ -2187,12 +2191,14 @@ pub(crate) fn spawn_maintenance_sweeps(
                                     jobs_standalone = stats.standalone,
                                     workflow_executions_covered = stats.rollup.covered,
                                     workflow_executions_verified_ok = stats.rollup.verified_ok,
+                                    workflow_executions_unanchored = stats.rollup.unanchored,
                                     workflow_executions_empty = stats.rollup.empty,
                                     workflow_executions_failed = stats.rollup.failed,
                                     workflow_executions_errored = stats.rollup.errored,
                                     "audit chain verification sweep completed WITH findings"
                                 );
-                            } else if stats.cap_hit {
+                            }
+                            talos_audit_ledger::SweepSummary::Incomplete => {
                                 // 2026-08-19: this branch used to say "completed
                                 // clean". It cannot: the sweep takes the NEWEST
                                 // `MAX_EXECUTIONS_PER_SWEEP` of a sliding window
@@ -2218,7 +2224,8 @@ pub(crate) fn spawn_maintenance_sweeps(
                                      AUDIT_CHAIN_SWEEP_INTERVAL_SECS so fewer module executions \
                                      land in each window, or raise the sweep cap."
                                 );
-                            } else if stats.scanned > 0 {
+                            }
+                            talos_audit_ledger::SweepSummary::Clean => {
                                 tracing::info!(
                                     target: "talos_audit",
                                     event_kind = "audit_chain_sweep_summary",
@@ -2231,6 +2238,8 @@ pub(crate) fn spawn_maintenance_sweeps(
                                     workflow_executions_verified_ok = stats.rollup.verified_ok,
                                     "audit chain verification sweep completed clean"
                                 );
+                            }
+                            talos_audit_ledger::SweepSummary::Idle => {}
                             }
                         }
                     }
@@ -7179,5 +7188,61 @@ mod task_supervision_wiring_tests {
              that nothing in that process can increment — the mirror of the \
              absent-is-not-zero defect, and check 58's own rule."
         );
+    }
+}
+
+/// The audit-chain sweep loop lives in this bin and no test can drive it, so
+/// these pins are TEXTUAL, stated as such: they prove the loop renders the
+/// ledger's verdict and that the findings line names the unanchored counts —
+/// the two things #867 left out — never that the rendered values are right
+/// (`talos_audit_ledger::sweep_summary_tests` covers the verdict itself).
+#[cfg(test)]
+mod audit_sweep_summary_wiring_tests {
+    fn loop_text() -> &'static str {
+        let src = include_str!("background.rs");
+        let prod = src
+            .split("mod audit_sweep_summary_wiring_tests")
+            .next()
+            .expect("own module excluded");
+        let start = prod
+            .find("BackgroundTask::AuditChainVerificationSweep")
+            .expect("sweep loop present");
+        let end = start
+            + prod[start..]
+                .find("Audit-chain verification sweep loop received shutdown signal")
+                .expect("sweep loop end marker");
+        &prod[start..end]
+    }
+
+    #[test]
+    fn the_loop_renders_the_ledger_verdict_instead_of_rederiving_it() {
+        let body = loop_text();
+        assert!(
+            body.contains("match stats.summary()"),
+            "loop must match on the one classifier"
+        );
+        for re_derived in [
+            "stats.failed > 0",
+            "stats.empty > 0",
+            "if stats.cap_hit",
+            "stats.scanned > 0",
+        ] {
+            assert!(
+                !body.contains(re_derived),
+                "inline branch condition returned: {re_derived}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_findings_line_names_the_unanchored_counts() {
+        let body = loop_text();
+        let findings = body
+            .split("SweepSummary::WithFindings")
+            .nth(1)
+            .and_then(|rest| rest.split("SweepSummary::Incomplete").next())
+            .expect("findings arm present");
+        assert!(findings.contains("jobs_unanchored = stats.unanchored"));
+        assert!(findings.contains("workflow_executions_unanchored = stats.rollup.unanchored"));
     }
 }

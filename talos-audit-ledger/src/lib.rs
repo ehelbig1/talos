@@ -969,6 +969,56 @@ pub struct ChainSweepStats {
     pub rollup: WorkflowExecutionRollup,
 }
 
+/// Which summary line one sweep pass earns. ONE home for the choice, so the
+/// controller's loop matches on a verdict instead of re-deriving it inline —
+/// the inline form is how #867 added `unanchored` to the stats and left the
+/// loop's findings test keyed on `failed`/`errored`/`empty` alone, so a pass
+/// whose only finding was an unprovable tail logged "completed clean".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepSummary {
+    /// Stopped early on a deployment-wide condition; the rest of the window was
+    /// not examined.
+    Aborted(ChainVerifyErrorKind),
+    /// At least one job failed, errored, read empty, or verified without a
+    /// terminal anchor.
+    WithFindings,
+    /// No findings among the rows checked, but the row cap bound, so the
+    /// oldest rows in the window were never read.
+    Incomplete,
+    /// Every job in the window was read and verified with its tail proven.
+    Clean,
+    /// Nothing terminal in the window.
+    Idle,
+}
+
+impl ChainSweepStats {
+    /// Classify this pass for its summary line. Precedence: an abort outranks
+    /// everything (coverage is unknown), a finding outranks the row cap (the
+    /// finding is real whatever was not read), and only a complete window with
+    /// no finding is `Clean`.
+    ///
+    /// `unanchored` is a FINDING here even though it is not a failure: the
+    /// verdict is soft so a legacy pre-anchor chain keeps verifying, and on the
+    /// RECENT population this sweep reads it can only mean a chain whose tail
+    /// cannot be proven — calling that pass "clean" is the reading the anchor
+    /// exists to remove. `duplicate_delivery`, `multi_attempt` and `standalone`
+    /// stay disclosures, never findings.
+    #[must_use]
+    pub fn summary(&self) -> SweepSummary {
+        if let Some(kind) = self.aborted {
+            SweepSummary::Aborted(kind)
+        } else if self.failed > 0 || self.errored > 0 || self.empty > 0 || self.unanchored > 0 {
+            SweepSummary::WithFindings
+        } else if self.cap_hit {
+            SweepSummary::Incomplete
+        } else if self.scanned > 0 {
+            SweepSummary::Clean
+        } else {
+            SweepSummary::Idle
+        }
+    }
+}
+
 /// Periodic sweep that runs the offline chain verifier over recently-completed
 /// executions and emits a loud structured event for any break (finding #2).
 /// This is what makes the WORM ledger **continuously** verified rather than
@@ -2714,6 +2764,69 @@ mod chain_reader_tests {
 }
 
 #[cfg(test)]
+mod sweep_summary_tests {
+    use super::*;
+
+    fn clean(scanned: usize) -> ChainSweepStats {
+        ChainSweepStats {
+            scanned,
+            verified_ok: scanned,
+            ..ChainSweepStats::default()
+        }
+    }
+
+    #[test]
+    fn an_unanchored_chain_is_a_finding_not_a_clean_pass() {
+        let mut s = clean(10);
+        s.verified_ok = 9;
+        s.unanchored = 1;
+        assert_eq!(s.summary(), SweepSummary::WithFindings);
+        // Control: the same window with the tail proven is clean.
+        assert_eq!(clean(10).summary(), SweepSummary::Clean);
+    }
+
+    #[test]
+    fn each_finding_kind_alone_earns_the_findings_line() {
+        for set in [
+            |s: &mut ChainSweepStats| s.failed = 1,
+            |s: &mut ChainSweepStats| s.errored = 1,
+            |s: &mut ChainSweepStats| s.empty = 1,
+            |s: &mut ChainSweepStats| s.unanchored = 1,
+        ] {
+            let mut s = clean(4);
+            set(&mut s);
+            assert_eq!(s.summary(), SweepSummary::WithFindings, "{s:?}");
+        }
+    }
+
+    #[test]
+    fn disclosures_alone_stay_clean() {
+        let mut s = clean(4);
+        s.duplicate_delivery = 1;
+        s.multi_attempt = 1;
+        s.standalone = 2;
+        assert_eq!(s.summary(), SweepSummary::Clean);
+    }
+
+    #[test]
+    fn precedence_is_abort_then_findings_then_cap() {
+        let mut s = clean(4);
+        s.unanchored = 1;
+        s.cap_hit = true;
+        assert_eq!(s.summary(), SweepSummary::WithFindings);
+        s.aborted = Some(ChainVerifyErrorKind::AccessDenied);
+        assert_eq!(
+            s.summary(),
+            SweepSummary::Aborted(ChainVerifyErrorKind::AccessDenied)
+        );
+        let mut capped = clean(4);
+        capped.cap_hit = true;
+        assert_eq!(capped.summary(), SweepSummary::Incomplete);
+        assert_eq!(ChainSweepStats::default().summary(), SweepSummary::Idle);
+    }
+}
+
+#[cfg(test)]
 mod inline_verify_tests {
     //! Finding #2, Layer 1: per-message verify-at-persist verdicts. The
     //! canonical hash/HMAC logic itself is tested in `talos-audit-event`;
@@ -3683,22 +3796,30 @@ mod sweep_coverage_pins {
         );
     }
 
-    /// The consumer half: the controller must branch on `cap_hit` BEFORE the
-    /// clean-bill branch, and must not describe a capped sweep as clean.
+    /// The consumer half. Since package BS the branch is chosen by
+    /// [`ChainSweepStats::summary`] (a capped pass is `Incomplete`, pinned by
+    /// `sweep_summary_tests::precedence_is_abort_then_findings_then_cap`), so
+    /// what the controller must do is render that verdict and emit the
+    /// clean-bill line ONLY under its `Clean` arm.
     #[test]
     fn the_controller_cannot_certify_a_truncated_sweep() {
         let src = include_str!("../../controller/src/bootstrap/background.rs");
         let clean = concat!("audit chain verification sweep ", "completed clean");
-        let guard = concat!("} else if stats.", "cap_hit {");
-        let (guard_at, clean_at) = (
-            src.find(guard)
-                .expect("the cap_hit branch is gone; a truncated sweep can be certified clean"),
-            src.find(clean).expect("the clean-bill log line moved"),
-        );
         assert!(
-            guard_at < clean_at,
-            "the cap_hit branch must precede the clean-bill branch, or a truncated sweep still \
-             reports clean"
+            src.contains(concat!("match stats.", "summary()")),
+            "the loop no longer renders the ledger verdict; a truncated sweep can be certified clean"
         );
+        let clean_at = src.find(clean).expect("the clean-bill log line moved");
+        let arm_before = |arm: &str| src[..clean_at].rfind(arm);
+        let clean_arm = arm_before(concat!("SweepSummary::", "Clean =>"))
+            .expect("the clean-bill line is not under the Clean arm");
+        for other in ["Incomplete =>", "WithFindings =>", "Aborted("] {
+            let at = arm_before(&format!("SweepSummary::{other}"))
+                .unwrap_or_else(|| panic!("arm {other} missing"));
+            assert!(
+                at < clean_arm,
+                "the clean-bill line sits under the {other} arm, not the Clean arm"
+            );
+        }
     }
 }
