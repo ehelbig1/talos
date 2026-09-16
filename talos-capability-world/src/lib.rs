@@ -1062,3 +1062,55 @@ mod permitted_ceiling_worlds_tests {
         );
     }
 }
+
+/// The security architecture's capability table is auditor-facing prose about
+/// this crate's lattice. Read it and hold it to [`permitted_ceiling_worlds`],
+/// so the table cannot describe a ladder, a retired world or a stale permit
+/// set again (it described a nine-tier ladder with `full-node` / `admin-node`
+/// until 2026-09-16).
+#[cfg(test)]
+mod architecture_doc_lattice_tests {
+    use super::*;
+
+    const DOC: &str = include_str!("../../docs/security/architecture.md");
+
+    fn table() -> Vec<(String, Vec<String>)> {
+        let start = DOC.find("### 4.1 ").expect("section 4.1 present");
+        let end = start + DOC[start..].find("### 4.2 ").expect("section 4.2 present");
+        DOC[start..end]
+            .lines()
+            .filter(|l| l.starts_with("| `"))
+            .map(|l| {
+                let cells: Vec<&str> = l.trim_matches('|').split('|').map(str::trim).collect();
+                let ceiling = cells[0].trim_matches('`').to_string();
+                let permits = if cells[2] == format!("all {}", ACTOR_CEILING_WORLDS.len()) {
+                    ACTOR_CEILING_WORLDS.iter().map(|w| w.to_string()).collect()
+                } else {
+                    cells[2]
+                        .split(',')
+                        .map(|w| w.trim().trim_matches('`').to_string())
+                        .collect()
+                };
+                (ceiling, permits)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_table_lists_exactly_the_ceiling_worlds() {
+        let listed: Vec<String> = table().into_iter().map(|(c, _)| c).collect();
+        let served: Vec<String> = ACTOR_CEILING_WORLDS.iter().map(|w| w.to_string()).collect();
+        assert_eq!(listed, served);
+    }
+
+    #[test]
+    fn each_row_states_the_lattice_permit_set() {
+        for (ceiling, permits) in table() {
+            let expected: Vec<String> = permitted_ceiling_worlds(&ceiling)
+                .into_iter()
+                .map(str::to_string)
+                .collect();
+            assert_eq!(permits, expected, "architecture.md §4.1 row `{ceiling}`");
+        }
+    }
+}

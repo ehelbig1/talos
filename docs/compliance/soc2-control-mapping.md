@@ -21,12 +21,12 @@ This document maps Talos platform security controls to SOC 2 Trust Services Crit
 
 | Control ID | Control Description | Implementation | Evidence Location |
 |-----------|-------------------|----------------|-------------------|
-| CC6.1-01 | JWT-based session authentication | HS256 JWT with issuer claim, 15-min TTL; HttpOnly + Secure + SameSite=Strict cookies | `controller/src/auth/mod.rs` (Claims struct, verify_token fn) |
-| CC6.1-02 | Role-based access control | Admin/User/Org Member roles; `is_admin()` method; per-endpoint authorization checks | `controller/src/auth/mod.rs`, `controller/src/mcp/actor.rs` |
-| CC6.1-03 | API key scoped access | 6 scope levels (workflows:read/write, secrets:read/write, webhooks:access, admin); bcrypt-hashed storage | `controller/src/api_keys.rs` (ApiKeyScope enum) |
-| CC6.1-04 | WASM capability world enforcement | 9-tier capability system restricts host function access per module; checked at compile time and runtime | `controller/src/compilation/mod.rs`, `worker/src/runtime.rs` |
-| CC6.1-05 | Per-module secret allowlists | Deny-all default; modules can only access secrets in their allowlist; wildcard flagged in hygiene report | `controller/src/secrets/mod.rs`, `worker/src/host_impl.rs` |
-| CC6.1-06 | Actor budget enforcement | 8-field resource budgets per actor; validated positive integers; enforced at trigger time | `controller/src/mcp/actor.rs` |
+| CC6.1-01 | JWT-based session authentication | HS256 JWT with issuer claim, 15-min TTL; HttpOnly + Secure + SameSite=Strict cookies | `talos-auth/src/lib.rs` (Claims struct, verify_token fn) |
+| CC6.1-02 | Role-based access control | Admin/User/Org Member roles; `is_admin()` method; per-endpoint authorization checks | `talos-auth/src/lib.rs`, `talos-mcp-handlers/src/actor.rs` |
+| CC6.1-03 | API key scoped access | 6 scope levels (workflows:read/write, secrets:read/write, webhooks:access, admin); bcrypt-hashed storage | `talos-api-keys/src/lib.rs` (ApiKeyScope enum) |
+| CC6.1-04 | WASM capability world enforcement | 12-world capability lattice restricts host function access per module; checked at compile time and runtime | `talos-capability-world/src/lib.rs` (ceiling_permits), `talos-compilation/src/lib.rs`, `talos-worker-runtime/src/runtime.rs` |
+| CC6.1-05 | Per-module secret allowlists | Deny-all default; modules can only access secrets in their allowlist; wildcard flagged in hygiene report | `talos-secrets-manager/src/lib.rs`, `talos-worker-runtime/src/host/vault.rs` |
+| CC6.1-06 | Actor budget enforcement | 8-field resource budgets per actor; validated positive integers; enforced at trigger time | `talos-mcp-handlers/src/actor.rs` |
 | CC6.1-07 | GraphQL query limits | Depth limit 15; complexity limit 5000; introspection disabled in production | `controller/src/main.rs` line ~1435 |
 
 **Testing procedure:**
@@ -41,14 +41,14 @@ This document maps Talos platform security controls to SOC 2 Trust Services Crit
 
 | Control ID | Control Description | Implementation | Evidence Location |
 |-----------|-------------------|----------------|-------------------|
-| CC6.2-01 | Password complexity enforcement | 12-72 characters; 2-of-4 character classes (upper, lower, digit, symbol) | `controller/src/auth/mod.rs` (validate_password fn) |
-| CC6.2-02 | Email format validation | Regex validation; 254-char max | `controller/src/auth/mod.rs` (validate_email fn) |
-| CC6.2-03 | Password hashing | bcrypt with DEFAULT_COST factor | `controller/src/auth/mod.rs` |
-| CC6.2-04 | TOTP 2FA enrollment | Encrypted TOTP seed storage via SecretsManager; QR code provisioning | `controller/src/totp_2fa.rs` (TotpService) |
-| CC6.2-05 | API key generation | Cryptographic random generation; `talos_sk_` prefix; SHA256 lookup hash + bcrypt verification | `controller/src/api_keys.rs` |
-| CC6.2-06 | Account lockout | 5 failed login attempts triggers lockout; `locked_until` timestamp | `controller/src/auth/mod.rs` (User struct), `controller/src/totp_2fa.rs` |
+| CC6.2-01 | Password complexity enforcement | 12-72 characters; 2-of-4 character classes (upper, lower, digit, symbol) | `talos-auth/src/lib.rs` (validate_password fn) |
+| CC6.2-02 | Email format validation | Regex validation; 254-char max | `talos-auth/src/lib.rs` (validate_email fn) |
+| CC6.2-03 | Password hashing | bcrypt with DEFAULT_COST factor | `talos-auth/src/lib.rs` |
+| CC6.2-04 | TOTP 2FA enrollment | Encrypted TOTP seed storage via SecretsManager; QR code provisioning | `talos-totp-2fa/src/lib.rs` (TotpService) |
+| CC6.2-05 | API key generation | Cryptographic random generation; `talos_sk_` prefix; SHA256 lookup hash + bcrypt verification | `talos-api-keys/src/lib.rs` |
+| CC6.2-06 | Account lockout | 5 failed login attempts triggers lockout; `locked_until` timestamp | `talos-auth/src/lib.rs` (User struct), `talos-totp-2fa/src/lib.rs` |
 | CC6.2-07 | Secret rotation support | DEK rotation (create new, re-encrypt) + master-key rotation, both operator-invoked; secret value rotation via the GraphQL secrets mutations | `talos-secrets-manager` (`rotate_dek`, `rotate_dek_for_org`, `rotate_master_key`, `rotate_secret_value_by_id`), `talos-api/src/schema/security/mutations.rs` (`rotateDek`, `rotateMasterKey`, `rotateEncryptionKey`, the `reEncrypt*` sweeps) |
-| CC6.2-08 | Session revocation | Refresh token invalidation; JWT short-lived (15 min) | `controller/src/auth/mod.rs` |
+| CC6.2-08 | Session revocation | Refresh token invalidation; JWT short-lived (15 min) | `talos-auth/src/lib.rs` |
 
 **Testing procedure:**
 1. Attempt registration with weak password (< 12 chars, single char class)
@@ -62,21 +62,21 @@ This document maps Talos platform security controls to SOC 2 Trust Services Crit
 
 | Control ID | Control Description | Implementation | Evidence Location |
 |-----------|-------------------|----------------|-------------------|
-| CC6.3-01 | Envelope encryption for secrets | AES-256-GCM; DEK wrapped by KEK provider; **per-context HKDF subkey derived per row** (`HKDF(DEK, info=secret_id)`, format v3) so each key encrypts ~1 message and the random-nonce birthday bound is never approached; AAD-bound; random 12-byte nonce per operation | `controller/src/secrets/mod.rs` (SecretsManager) |
+| CC6.3-01 | Envelope encryption for secrets | AES-256-GCM; DEK wrapped by KEK provider; **per-context HKDF subkey derived per row** (`HKDF(DEK, info=secret_id)`, format v3) so each key encrypts ~1 message and the random-nonce birthday bound is never approached; AAD-bound; random 12-byte nonce per operation | `talos-secrets-manager/src/manager.rs` (SecretsManager) |
 | CC6.3-02 | Transit encryption (client) | HTTPS enforced; HSTS headers in production | Load balancer configuration |
 | CC6.3-03 | Transit encryption (Redis) | `rediss://` TLS enforced in production; startup panic on `redis://` | `controller/src/main.rs` line ~178 |
 | CC6.3-04 | Transit encryption (NATS jobs) | Secrets encrypted with AES-256-GCM before NATS transmission under a **per-job HKDF subkey derived from `WORKER_SHARED_KEY`** (per-context key separation; ~1 message per key) | `talos-workflow-job-protocol/src/lib.rs` (EncryptedSecrets; sibling repo `../talos-workflow-engine/talos-workflow-job-protocol/`) |
-| CC6.3-05 | KEK management (production) | HashiCorp Vault transit engine; KEK never enters controller process memory; transit token scoped to encrypt+decrypt on `talos-kek` only; rotation via `vault transit/keys/talos-kek/rotate` | `controller/src/secrets/vault_kek_provider.rs`, runbook §2.1.1 |
-| CC6.3-05a | KEK management (dev only) | Env var or Docker secret file mount (`TALOS_MASTER_KEY` / `TALOS_MASTER_KEY_FILE`); 256-bit; Zeroizing memory; NOT for production | `controller/src/config.rs`, `controller/src/secrets/kek_provider.rs::EnvKekProvider` |
-| CC6.3-05b | Pluggable KEK abstraction | `KekProvider` trait isolates KEK backend from call sites; switching env↔Vault is a config flip + dual-wrap migration, not a code change | `controller/src/secrets/kek_provider.rs` |
-| CC6.3-06 | TOTP seed encryption | TOTP secrets encrypted via SecretsManager before DB storage | `controller/src/totp_2fa.rs` |
-| CC6.3-07 | OAuth token encryption | OAuth tokens encrypted before storage; plaintext columns dropped (migration 036) | `controller/src/oauth/credentials.rs`, `migrations/036_drop_plaintext_tokens.sql` |
+| CC6.3-05 | KEK management (production) | HashiCorp Vault transit engine; KEK never enters controller process memory; transit token scoped to encrypt+decrypt on `talos-kek` only; rotation via `vault transit/keys/talos-kek/rotate` | `talos-secrets-manager/src/vault_kek_provider.rs`, runbook §2.1.1 |
+| CC6.3-05a | KEK management (dev only) | Env var or Docker secret file mount (`TALOS_MASTER_KEY` / `TALOS_MASTER_KEY_FILE`); 256-bit; Zeroizing memory; NOT for production | `talos-config/src/lib.rs`, `talos-secrets-manager/src/kek_provider.rs::EnvKekProvider` |
+| CC6.3-05b | Pluggable KEK abstraction | `KekProvider` trait isolates KEK backend from call sites; switching env↔Vault is a config flip + dual-wrap migration, not a code change | `talos-secrets-manager/src/kek_provider.rs` |
+| CC6.3-06 | TOTP seed encryption | TOTP secrets encrypted via SecretsManager before DB storage | `talos-totp-2fa/src/lib.rs` |
+| CC6.3-07 | OAuth token encryption | OAuth tokens encrypted before storage; plaintext columns dropped (migration 036) | `talos-oauth/src/credentials.rs`, `migrations/036_drop_plaintext_tokens.sql` |
 | CC6.3-08 | Webhook signing secret encryption | Stored encrypted via envelope encryption | `migrations/20260312000200_encrypt_webhook_signing_secrets.sql` |
-| CC6.3-09 | DEK caching with TTL | In-memory DashMap cache; configurable TTL (default 300s via DEK_CACHE_TTL_SECS) | `controller/src/secrets/mod.rs` (CachedDek) |
+| CC6.3-09 | DEK caching with TTL | In-memory DashMap cache; configurable TTL (default 300s via DEK_CACHE_TTL_SECS) | `talos-secrets-manager/src/manager.rs` (CachedDek) |
 | CC6.3-10 | Actor memory at-rest encryption | AES-256-GCM on `actor_memory.value_enc` + `value_key_id` (NOT NULL) under a **per-context HKDF subkey** (`info = actor_id‖key`, format v3); plaintext `value` column dropped Phase B 2026-04-24 | `talos-memory/src/lib.rs` (MemoryCryptoHook), migrations `20260423235406` + `20260424010000` + `20260617120000` |
-| CC6.3-11 | Module-execution payload encryption | AES-256-GCM on `module_executions.{input_data, output_data, trigger_metadata}_enc` + shared `payload_enc_key_id` under a **per-context HKDF subkey** (`info = execution_id‖slot`, format v3); all writers route through `module_payload_encryption::encrypt_payload_bundle` | `controller/src/module_payload_encryption.rs`, migrations `20260424030501` + `20260617120000` |
-| CC6.3-12 | Workflow-execution output encryption | AES-256-GCM on `workflow_executions.output_data_enc` + `output_enc_key_id` under a **per-context HKDF subkey** (`info = execution_id`, format v3); all writer paths route through encryption-aware methods | `controller/src/execution_repository.rs::mark_execution_completed`, `mark_execution_waiting`, `mark_execution_failed` |
-| CC6.3-13 | Per-actor LLM data-egress ceiling | `actors.max_llm_tier` (tier1/tier2) HMAC-bound in JobRequest + PipelineJobRequest signing; enforced at 5 worker surfaces (`llm::*`, `wit_http`, `wit_graphql`, `wit_webhook`, HTTP-stream) + vault-header gate; tier changes audit-logged | `worker/src/host_impl.rs::decide_llm_tier_access`, migration `20260424100000`, runbook §1.3 |
+| CC6.3-11 | Module-execution payload encryption | AES-256-GCM on `module_executions.{input_data, output_data, trigger_metadata}_enc` + shared `payload_enc_key_id` under a **per-context HKDF subkey** (`info = execution_id‖slot`, format v3); all writers route through `module_payload_encryption::encrypt_payload_bundle` | `talos-module-payload-encryption/src/lib.rs`, migrations `20260424030501` + `20260617120000` |
+| CC6.3-12 | Workflow-execution output encryption | AES-256-GCM on `workflow_executions.output_data_enc` + `output_enc_key_id` under a **per-context HKDF subkey** (`info = execution_id`, format v3); all writer paths route through encryption-aware methods | `talos-execution-repository/src/lib.rs::mark_execution_completed`, `mark_execution_waiting`, `mark_execution_failed` |
+| CC6.3-13 | Per-actor LLM data-egress ceiling | `actors.max_llm_tier` (tier1/tier2) HMAC-bound in JobRequest + PipelineJobRequest signing; enforced at 5 worker surfaces (`llm::*`, `wit_http`, `wit_graphql`, `wit_webhook`, HTTP-stream) + vault-header gate; tier changes audit-logged | `talos-worker-runtime/src/host/llm.rs::decide_llm_tier_access`, migration `20260424100000`, runbook §1.3 |
 | CC6.3-14 | Supply-chain integrity | `cargo deny check` (RUSTSEC + license + ban + source policy) + `cargo audit` gated in CI; every Docker image pinned by SHA-256 digest; weekly Dependabot bumps grouped by domain; SLSA L2 cosign-signed release images with SBOM + provenance attestations | `deny.toml`, `.github/workflows/ci.yml`, `.github/workflows/release.yml`, `scripts/verify-image.sh`, `.github/dependabot.yml` |
 
 **Testing procedure:**
@@ -91,16 +91,16 @@ This document maps Talos platform security controls to SOC 2 Trust Services Crit
 
 | Control ID | Control Description | Implementation | Evidence Location |
 |-----------|-------------------|----------------|-------------------|
-| CC6.6-01 | WASM sandbox isolation | wasmtime sandbox with 9-tier capability worlds; no ambient host access | `worker/src/runtime.rs`, `controller/src/compilation/mod.rs` |
-| CC6.6-02 | SSRF protection | `check_outbound_url_no_ssrf()` blocks RFC1918, link-local, cloud metadata, IPv6 ULA | `controller/src/mcp/utils.rs` |
-| CC6.6-03 | Per-IP rate limiting | governor crate; 300/min API, 5/min auth; configurable via env vars | `controller/src/rate_limit.rs` |
-| CC6.6-04 | Distributed rate limiting | Redis sliding window; per-user MCP 5000/min, per-agent MCP 1000/min | `controller/src/distributed_ratelimit.rs` |
-| CC6.6-05 | Compilation sandbox | Containerized build (Podman, --network=none); crate allowlist; cargo-audit gate | `controller/src/compilation/mod.rs` |
-| CC6.6-06 | CSRF protection | Double-submit cookie pattern; constant-time comparison; SameSite=Strict | `controller/src/csrf.rs` |
-| CC6.6-07 | Webhook authentication | HMAC-SHA256 signatures; timestamp replay window; IP allowlists; circuit breaker | `controller/src/webhook_security.rs`, `controller/src/webhooks/mod.rs` |
-| CC6.6-08 | Rhai sandbox | eval disabled; import blocked; max_operations 1000; max_call_levels 16; max_string_size 64KB | `controller/src/engine/rhai_helpers.rs` |
-| CC6.6-09 | Input size limits | GraphQL: mock_inputs 1MB, scripts 100KB; Rhai: context 1MB | `controller/src/api/schema/workflows/mutations.rs`, `controller/src/api/schema/workflows/queries.rs` |
-| CC6.6-10 | CORS restrictions | Explicit origin allowlist; wildcard and "null" blocked in production | `controller/src/config.rs` (get_allowed_origins) |
+| CC6.6-01 | WASM sandbox isolation | wasmtime sandbox with a 12-world capability lattice; no ambient host access | `talos-worker-runtime/src/runtime.rs`, `talos-compilation/src/lib.rs` |
+| CC6.6-02 | SSRF protection | `check_outbound_url_no_ssrf()` blocks RFC1918, link-local, cloud metadata, IPv6 ULA | `talos-mcp-handlers/src/utils.rs` |
+| CC6.6-03 | Per-IP rate limiting | governor crate; 300/min API, 5/min auth; configurable via env vars | `talos-rate-limit/src/middleware.rs` |
+| CC6.6-04 | Distributed rate limiting | Redis sliding window; per-user MCP 5000/min, per-agent MCP 1000/min | `talos-rate-limit/src/distributed.rs` |
+| CC6.6-05 | Compilation sandbox | Containerized build (Podman, --network=none); crate allowlist; cargo-audit gate | `talos-compilation/src/lib.rs` |
+| CC6.6-06 | CSRF protection | Double-submit cookie pattern; constant-time comparison; SameSite=Strict | `talos-csrf/src/lib.rs` |
+| CC6.6-07 | Webhook authentication | HMAC-SHA256 signatures; timestamp replay window; IP allowlists; circuit breaker | `talos-webhooks/src/signature.rs`, `talos-webhooks/src/lib.rs` |
+| CC6.6-08 | Rhai sandbox | eval disabled; import blocked; max_operations 1000; max_call_levels 16; max_string_size 64KB | `talos-engine/src/rhai_helpers.rs` |
+| CC6.6-09 | Input size limits | GraphQL: mock_inputs 1MB, scripts 100KB; Rhai: context 1MB | `talos-api/src/schema/workflows/mutations.rs`, `talos-api/src/schema/workflows/queries.rs` |
+| CC6.6-10 | CORS restrictions | Explicit origin allowlist; wildcard and "null" blocked in production | `talos-config/src/lib.rs` (get_allowed_origins) |
 
 **Testing procedure:**
 1. Deploy WASM module requesting `governance-node` world as non-admin actor -- verify rejection
@@ -120,12 +120,12 @@ This document maps Talos platform security controls to SOC 2 Trust Services Crit
 |-----------|-------------------|----------------|-------------------|
 | CC7.1-01 | Immutable audit logs | 4 audit tables with BEFORE UPDATE/DELETE triggers; SQLSTATE 42501 on modification | `migrations/20260408000001_audit_log_immutability.sql` |
 | CC7.1-01a | Audit-ledger cryptographic verification | Worker emits a per-execution HMAC-SHA256-signed SHA-256 hash chain; the WORM consumer **verifies each event's HMAC + recomputes its hash inline before S3 (Object Lock) persist**, quarantining failures to an Object-Locked `rejected/` prefix instead of ACK-dropping them; a **continuous controller-side sweep** (`AUDIT_CHAIN_SWEEP_INTERVAL_SECS`, default 1h) runs `verify_execution_chain` over recently-completed executions and emits an `audit_chain_verification_failed` event per broken chain (sequence contiguity, `previous_hash` linkage, genesis, per-event HMAC); a platform-admin GraphQL `verifyAuditChain(executionId)` query exposes the same verifier on demand for forensic review | `talos-audit-event` (chain + `verify_chain`), `talos-audit-ledger` (inline verify + S3 verifier + sweep), `controller/src/main.rs` (sweep wiring), `talos-api` (`verifyAuditChain`) |
-| CC7.1-02 | Prometheus metrics | Webhook requests, auth attempts, execution counts, rate limit hits, cache stats, DLQ drops | `controller/src/metrics.rs` (TalosMetrics) |
-| CC7.1-03 | OpenTelemetry tracing | Per-tenant OTLP export; LRU tracer cache (100 providers); configurable endpoint | `controller/src/audit_ledger.rs` |
+| CC7.1-02 | Prometheus metrics | Webhook requests, auth attempts, execution counts, rate limit hits, cache stats, DLQ drops | `talos-metrics/src/lib.rs` (TalosMetrics) |
+| CC7.1-03 | OpenTelemetry tracing | Per-tenant OTLP export; LRU tracer cache (100 providers); configurable endpoint | `talos-audit-ledger/src/lib.rs` |
 | CC7.1-04 | Structured logging | `tracing` crate with JSON output; span context; structured fields | Throughout controller and worker |
-| CC7.1-05 | Secret access audit | Every secret access logged to `secret_audit_log` (key_path, requestor, timestamp) | `controller/src/secrets/mod.rs` |
+| CC7.1-05 | Secret access audit | Every secret access logged to `secret_audit_log` (key_path, requestor, timestamp) | `talos-secrets-manager/src/lib.rs` |
 | CC7.1-06 | Admin event log | Privileged operations recorded (MCP agent registration/revocation, actor changes) | `migrations/20260407000001_admin_event_log.sql` |
-| CC7.1-07 | Auth audit log | Login/logout events with IP, user-agent, success/failure | `controller/src/auth/mod.rs` |
+| CC7.1-07 | Auth audit log | Login/logout events with IP, user-agent, success/failure | `talos-auth/src/lib.rs` |
 | CC7.1-08 | NATS audit streaming | Real-time audit event stream to external SIEM via JetStream; the WORM consumer verifies each event's HMAC + recomputes its hash before persisting (Object Lock), quarantining verification failures to a `rejected/` prefix rather than ACK-dropping them | `talos-audit-ledger` |
 
 **Testing procedure:**
@@ -142,13 +142,13 @@ This document maps Talos platform security controls to SOC 2 Trust Services Crit
 
 | Control ID | Control Description | Implementation | Evidence Location |
 |-----------|-------------------|----------------|-------------------|
-| CC7.2-01 | DLP/PII redaction | `BuiltinDlpProvider` regex patterns (SSN, credit card with Luhn, email, phone); applied to audit payloads | `controller/src/dlp.rs` |
-| CC7.2-02 | External DLP integration | `ExternalDlpProvider` webhook for enterprise DLP systems | `controller/src/dlp.rs` (ExternalDlpProvider) |
-| CC7.2-03 | Circuit breaker on webhooks | Failure type tracking (auth failure, IP not allowed); automatic circuit open on repeated failures | `controller/src/webhooks/mod.rs` |
-| CC7.2-04 | Authentication failure tracking | `failed_login_attempts` counter per user; locked_until timestamp; Prometheus auth_failures_total | `controller/src/auth/mod.rs`, `controller/src/metrics.rs` |
-| CC7.2-05 | Webhook DLQ | Failed webhook deliveries queued in Dead Letter Queue; replay capability with admin authentication | `controller/src/webhooks/mod.rs` |
-| CC7.2-06 | Secret tier-2 exposure flag | `__secret_tier2_exposed__` injected into execution output when raw secret value exits vault | `worker/src/runtime.rs` |
-| CC7.2-07 | Wildcard secret grant detection | Platform hygiene report flags modules with wildcard (`*`) secret access | `controller/src/mcp/platform.rs` |
+| CC7.2-01 | DLP/PII redaction | `BuiltinDlpProvider` regex patterns (SSN, credit card with Luhn, email, phone); applied to audit payloads | `talos-dlp-provider/src/lib.rs` |
+| CC7.2-02 | External DLP integration | `ExternalDlpProvider` webhook for enterprise DLP systems | `talos-dlp-provider/src/lib.rs` (ExternalDlpProvider) |
+| CC7.2-03 | Circuit breaker on webhooks | Failure type tracking (auth failure, IP not allowed); automatic circuit open on repeated failures | `talos-webhooks/src/lib.rs` |
+| CC7.2-04 | Authentication failure tracking | `failed_login_attempts` counter per user; locked_until timestamp; Prometheus auth_failures_total | `talos-auth/src/lib.rs`, `talos-metrics/src/lib.rs` |
+| CC7.2-05 | Webhook DLQ | Failed webhook deliveries queued in Dead Letter Queue; replay capability with admin authentication | `talos-webhooks/src/lib.rs` |
+| CC7.2-06 | Secret tier-2 exposure flag | `__secret_tier2_exposed__` injected into execution output when raw secret value exits vault | `talos-worker-runtime/src/runtime.rs` |
+| CC7.2-07 | Wildcard secret grant detection | Platform hygiene report flags modules with wildcard (`*`) secret access | `talos-mcp-handlers/src/platform.rs` |
 | CC7.2-08 | Execution anomaly alerts | Alert table for execution failures; alert counts tracked | `migrations/20260314000100_add_alerts_table.sql` |
 
 **Testing procedure:**
@@ -169,9 +169,9 @@ This document maps Talos platform security controls to SOC 2 Trust Services Crit
 |-----------|-------------------|----------------|-------------------|
 | CC8.1-01 | Database migration system | Timestamped migration files; `IF NOT EXISTS` / `IF EXISTS` for idempotency; never modify applied migrations | `migrations/` directory |
 | CC8.1-02 | Compile-time SQL validation | sqlx offline mode; compile-time query checking | `controller/Cargo.toml` (sqlx feature flags) |
-| CC8.1-03 | Dependency vulnerability scanning | `cargo-audit` gate during module compilation; known CVEs block build | `controller/src/compilation/mod.rs` |
-| CC8.1-04 | Crate allowlist | Only pre-approved Rust crates compile; reqwest explicitly blocked | `controller/src/mcp/utils.rs`, `controller/src/mcp/tests.rs` |
-| CC8.1-05 | Environment-aware configuration | `config::is_production()` gates debug features, introspection, TLS enforcement | `controller/src/config.rs` |
+| CC8.1-03 | Dependency vulnerability scanning | `cargo-audit` gate during module compilation; known CVEs block build | `talos-compilation/src/lib.rs` |
+| CC8.1-04 | Crate allowlist | Only pre-approved Rust crates compile; reqwest explicitly blocked | `talos-mcp-handlers/src/utils.rs`, `talos-mcp-handlers/src/tests.rs` |
+| CC8.1-05 | Environment-aware configuration | `config::is_production()` gates debug features, introspection, TLS enforcement | `talos-config/src/lib.rs` |
 | CC8.1-06 | Migration service | Docker Compose migrate service (one-shot, runs `sqlx migrate run`); controller depends on completion | `docker-compose.yml` |
 | CC8.1-07 | Version tracking | `CARGO_PKG_VERSION` from `controller/Cargo.toml`; `TALOS_VERSION` env override | `controller/Cargo.toml`, MCP `get_platform_info` tool |
 
@@ -189,10 +189,10 @@ This document maps Talos platform security controls to SOC 2 Trust Services Crit
 
 | Control ID | Control Description | Implementation | Evidence Location |
 |-----------|-------------------|----------------|-------------------|
-| CC9.1-01 | Workflow risk assessment | `get_workflow_risk_assessment` evaluates secret access patterns, capability levels, dependency risks | `controller/src/mcp/advanced.rs` |
-| CC9.1-02 | Platform hygiene report | `get_platform_hygiene_report` checks wildcard secrets, unused modules, configuration drift | `controller/src/mcp/platform.rs` |
-| CC9.1-03 | Workflow validation | `validate_workflow` checks secret allowlists, vault path permissions, module compatibility | `controller/src/mcp/workflows.rs` |
-| CC9.1-04 | Quickstart readiness check | `get_workflow_quickstart` surfaces blockers (missing secrets, wrong capability world, vault access denied) | `controller/src/mcp/workflows.rs` |
+| CC9.1-01 | Workflow risk assessment | `get_workflow_risk_assessment` evaluates secret access patterns, capability levels, dependency risks | `talos-mcp-handlers/src/advanced.rs` |
+| CC9.1-02 | Platform hygiene report | `get_platform_hygiene_report` checks wildcard secrets, unused modules, configuration drift | `talos-mcp-handlers/src/platform.rs` |
+| CC9.1-03 | Workflow validation | `validate_workflow` checks secret allowlists, vault path permissions, module compatibility | `talos-mcp-handlers/src/workflows.rs` |
+| CC9.1-04 | Quickstart readiness check | `get_workflow_quickstart` surfaces blockers (missing secrets, wrong capability world, vault access denied) | `talos-mcp-handlers/src/workflows.rs` |
 
 ---
 
