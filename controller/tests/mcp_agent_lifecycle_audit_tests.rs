@@ -38,11 +38,21 @@ async fn user(pool: &PgPool, tag: &str) -> Uuid {
     id
 }
 
+/// The test's own agent role. A migrated schema is not guaranteed to carry the
+/// seed roles: the CI harness builds its template from the schema baseline,
+/// which holds no data (this binary's first CI run failed on exactly that).
 async fn role(pool: &PgPool) -> (Uuid, String) {
-    sqlx::query_as("SELECT id, name FROM agent_roles ORDER BY name LIMIT 1")
-        .fetch_one(pool)
-        .await
-        .expect("a migrated schema seeds agent_roles")
+    let name = "bw-test-role".to_string();
+    let id: Uuid = sqlx::query_scalar(
+        "INSERT INTO agent_roles (name, description, allowed_capabilities) \
+         VALUES ($1, 'package BW test role', ARRAY['minimal']) \
+         ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name RETURNING id",
+    )
+    .bind(&name)
+    .fetch_one(pool)
+    .await
+    .expect("insert the test agent role");
+    (id, name)
 }
 
 async fn register(pool: &PgPool, user_id: Uuid, name: &str) -> (Uuid, AgentRegistration) {
