@@ -715,8 +715,9 @@ ok "overlay written"
 # templates/vault/init-job.yaml for why), so when its pod template
 # changes between releases (image bump, env-var rename, etc.), helm
 # upgrade fails with `Job.batch is invalid: spec.template ... field
-# is immutable`. The Job is idempotent — its initContainer detects
-# the existing bootstrap.json on the Vault PVC and just re-unseals —
+# is immutable`. The Job is idempotent — it detects the existing
+# bootstrap.json on the Vault PVC, re-unseals if needed and mints no new
+# token once the bootstrap Secret holds one —
 # so deleting and recreating each run is safe AND avoids the
 # manual-intervention workflow operators kept hitting on
 # image/spec changes (most recently May-2026 bitnami/kubectl →

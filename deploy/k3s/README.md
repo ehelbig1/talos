@@ -171,8 +171,10 @@ sudo k3s kubectl -n talos get pods
 sudo k3s kubectl -n talos get certificate
 # Should show READY=True within 2-3 minutes of DNS + ACME completion
 
-# Vault is unsealed (key lives on the PVC, unseal survives pod restart)
-sudo k3s kubectl -n talos exec statefulset/talos-vault-0 -- \
+# Vault is unsealed. Seal state does NOT survive a pod restart; the `unsealer`
+# sidecar in the Vault pod re-unseals it within ~10 s from the key on the PVC
+# (`kubectl logs talos-vault-0 -c unsealer`).
+sudo k3s kubectl -n talos exec talos-vault-0 -c vault -- \
     vault status -format=json | jq '.sealed'
 
 # End-to-end: load the UI
