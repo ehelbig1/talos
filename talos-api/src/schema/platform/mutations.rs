@@ -232,13 +232,12 @@ impl PlatformMutations {
         // Check granter's own ceiling
         let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
         let granter_ceiling: String = actor_repo
-            .get_user_max_capability_world(granter_id)
+            .user_capability_ceiling(granter_id)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "graphql: granter ceiling read failed");
                 async_graphql::Error::new("Request could not be completed").extend_safe()
-            })?
-            .unwrap_or_else(|| "http-node".to_string());
+            })?;
 
         // Lattice gate — NOT a linear rank comparison. You may only grant a
         // ceiling that is a SUBSET of your own. The previous local `rank`

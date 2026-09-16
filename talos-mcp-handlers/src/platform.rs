@@ -322,12 +322,10 @@ async fn handle_whoami(
             let org = readings
                 .record("organization", repo.get_user_org_summary(uid).await)
                 .flatten();
-            let ceiling = readings
-                .record(
-                    "capability_ceiling",
-                    repo.get_user_max_capability_world(uid).await,
-                )
-                .map(|opt| opt.unwrap_or_else(|| "http-node".to_string()));
+            let ceiling = readings.record(
+                "capability_ceiling",
+                repo.user_capability_ceiling(uid).await,
+            );
             let is_admin = readings.record("is_platform_admin", repo.is_platform_admin(uid).await);
             (email, org, ceiling, is_admin)
         }

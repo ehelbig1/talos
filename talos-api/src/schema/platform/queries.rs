@@ -62,14 +62,14 @@ impl PlatformQueries {
 
         let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
         let ceiling = actor_repo
-            .get_user_max_capability_world(user_id)
+            .user_capability_ceiling(user_id)
             .await
             .map_err(|e| {
                 tracing::error!(error = %e, "graphql: capability ceiling read failed");
                 async_graphql::Error::new("Request could not be completed").extend_safe()
             })?;
 
-        Ok(ceiling.unwrap_or_else(|| "http-node".to_string()))
+        Ok(ceiling)
     }
 
     /// Get detailed capability ceiling info for the current user.

@@ -1205,10 +1205,11 @@ pub use talos_actor_repository::{spawn_log_action, spawn_log_admin_event};
 /// one rank of escalation on the left-hand side of every `ceiling_permits` gate
 /// this feeds. Callers refuse rather than guess.
 async fn user_max_world(pool: &sqlx::PgPool, user_id: Uuid) -> anyhow::Result<String> {
-    // One home, shared with the clone service (package BM). Unreadable is an
-    // error; an unrecognised stored value is the conservative `http-node`.
-    let repo = talos_actor_repository::ActorRepository::new(pool.clone());
-    talos_actor_lifecycle_service::user_capability_ceiling(&repo, user_id).await
+    // One home (package BR): `ActorRepository::user_capability_ceiling`.
+    // Unreadable is an error; an unrecognised stored value is `http-node`.
+    talos_actor_repository::ActorRepository::new(pool.clone())
+        .user_capability_ceiling(user_id)
+        .await
 }
 
 /// Resolve `user_max_world` or produce the MCP error response. Keeps the three

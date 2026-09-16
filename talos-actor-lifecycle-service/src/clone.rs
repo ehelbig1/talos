@@ -158,21 +158,6 @@ pub fn validate_actor_name(name: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
-/// The user's capability ceiling, failing CLOSED. An unreadable grant is an
-/// error (callers refuse); an unrecognised stored value is `http-node` (the
-/// conservative default, never the permissive rank an unknown string would
-/// get). No grant row is also `http-node`.
-pub async fn user_capability_ceiling(
-    actor_repo: &ActorRepository,
-    user_id: Uuid,
-) -> anyhow::Result<String> {
-    let row = actor_repo.get_user_max_capability_world(user_id).await?;
-    Ok(match row.as_deref() {
-        Some(world) if talos_capability_world::is_actor_ceiling_world(world) => world.to_string(),
-        _ => "http-node".to_string(),
-    })
-}
-
 /// The ordered gates before any write: name, source (ownership), ceiling.
 /// Pure over its inputs so the decision is unit-tested without a database.
 pub fn check_clone_gates(
@@ -216,7 +201,8 @@ pub async fn clone_actor(
         .await
         .map_err(CloneActorError::SourceUnreadable)?
         .ok_or(CloneActorError::SourceNotFound)?;
-    let user_ceiling = user_capability_ceiling(actor_repo, req.user_id)
+    let user_ceiling = actor_repo
+        .user_capability_ceiling(req.user_id)
         .await
         .map_err(CloneActorError::CeilingUnreadable)?;
     let name = check_clone_gates(

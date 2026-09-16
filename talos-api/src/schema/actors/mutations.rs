@@ -282,9 +282,8 @@ impl ActorsMutations {
         // only a `minimal-node` grant escalates.
         let user_ceiling: String = {
             let repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
-            match repo.get_user_max_capability_world(user_id).await {
-                Ok(Some(world)) if talos_capability_world::is_actor_ceiling_world(&world) => world,
-                Ok(_) => "http-node".to_string(),
+            match repo.user_capability_ceiling(user_id).await {
+                Ok(world) => world,
                 Err(e) => {
                     tracing::error!(
                         target: "talos_api",
@@ -664,11 +663,8 @@ impl ActorsMutations {
             // create.
             let user_ceiling: String = {
                 let repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
-                match repo.get_user_max_capability_world(user_id).await {
-                    Ok(Some(world)) if talos_capability_world::is_actor_ceiling_world(&world) => {
-                        world
-                    }
-                    Ok(_) => "http-node".to_string(),
+                match repo.user_capability_ceiling(user_id).await {
+                    Ok(world) => world,
                     Err(e) => {
                         tracing::error!(
                             target: "talos_api",
