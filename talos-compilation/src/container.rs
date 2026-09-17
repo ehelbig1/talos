@@ -241,6 +241,114 @@ pub fn will_sandbox() -> bool {
     container_enabled() && detect_runtime().is_some()
 }
 
+/// Why a Rust compile or audit would run on the host instead of the sandbox.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostReason {
+    /// `TALOS_COMPILATION_CONTAINER` turned container mode off.
+    ContainerDisabled,
+    /// Container mode is on but neither podman nor docker was found.
+    NoRuntime,
+}
+
+impl HostReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            HostReason::ContainerDisabled => "container_disabled",
+            HostReason::NoRuntime => "no_runtime",
+        }
+    }
+}
+
+/// Where a Rust compile or `cargo audit` runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+pub(crate) enum SandboxDecision {
+    /// Inside the container, with this runtime.
+    Container(&'static str),
+    /// On the host: outside production, or in production with the ack token.
+    Host(HostReason),
+    /// Refused: production without the ack token.
+    Refuse(HostReason),
+}
+
+/// The one rule for running cargo unsandboxed (package CA, 2026-09-17).
+///
+/// Until then only the no-runtime case consulted the production ack token:
+/// `TALOS_COMPILATION_CONTAINER=false` returned a host `cargo` with a debug
+/// log, in production, so the acknowledgement that names the RCE risk was
+/// bypassed by the other env var. A host compile in production now needs the
+/// ack whichever of the two put it there. `runtime` is only consulted when
+/// container mode is on (detecting it spawns processes).
+pub(crate) fn sandbox_decision(
+    container_enabled: bool,
+    runtime: Option<&'static str>,
+    production: bool,
+    fallback_acknowledged: bool,
+) -> SandboxDecision {
+    let reason = match (container_enabled, runtime) {
+        (true, Some(rt)) => return SandboxDecision::Container(rt),
+        (true, None) => HostReason::NoRuntime,
+        (false, _) => HostReason::ContainerDisabled,
+    };
+    if production && !fallback_acknowledged {
+        SandboxDecision::Refuse(reason)
+    } else {
+        SandboxDecision::Host(reason)
+    }
+}
+
+/// Resolves [`sandbox_decision`] from the environment for `step` (`build` /
+/// `audit`), logs it, and returns the container runtime or `None` for a host
+/// run. A refusal is an `Err`.
+fn resolve_sandbox_runtime(step: &str) -> Result<Option<&'static str>> {
+    let enabled = container_enabled();
+    let runtime = if enabled { detect_runtime() } else { None };
+    let production = talos_config::is_production();
+    let ack = production && host_fallback_allowed();
+    match sandbox_decision(enabled, runtime, production, ack) {
+        SandboxDecision::Container(rt) => Ok(Some(rt)),
+        SandboxDecision::Refuse(reason) => bail!(
+            "Container compilation is required in production ({}): {}. \
+             Install podman or docker in the controller pod and leave \
+             TALOS_COMPILATION_CONTAINER unset or true. Single-tenant operators who \
+             accept the trust model (operator authors all modules — user-supplied \
+             proc-macros run on the controller host) can set \
+             TALOS_COMPILATION_ALLOW_HOST_FALLBACK=acknowledge-single-tenant-rce-risk. \
+             The short-form values (`true`/`1`/`yes`) accepted in dev are REFUSED in \
+             production — see `host_fallback_allowed` in talos-compilation/src/container.rs.",
+            step,
+            match reason {
+                HostReason::ContainerDisabled => "TALOS_COMPILATION_CONTAINER disables it",
+                HostReason::NoRuntime => "neither podman nor docker was found in PATH",
+            }
+        ),
+        SandboxDecision::Host(reason) if production => {
+            tracing::warn!(
+                target: "talos_compilation",
+                event_kind = "compilation_unsandboxed_fallback",
+                fallback_reason = reason.as_str(),
+                step,
+                "cargo is running WITHOUT container isolation in production because \
+                 TALOS_COMPILATION_ALLOW_HOST_FALLBACK carries the acknowledgement token. \
+                 Operator-acknowledged for single-tenant deploys; UNSAFE for multi-tenant."
+            );
+            Ok(None)
+        }
+        SandboxDecision::Host(HostReason::ContainerDisabled) => {
+            tracing::debug!(step, "Container compilation disabled — using direct cargo");
+            Ok(None)
+        }
+        SandboxDecision::Host(HostReason::NoRuntime) => {
+            tracing::warn!(
+                step,
+                "Container compilation enabled but no runtime found — \
+                 falling back to direct cargo in non-production mode"
+            );
+            Ok(None)
+        }
+    }
+}
+
 /// Detect which container runtime is available on the host.
 ///
 /// Prefers `podman` (rootless by default); falls back to `docker`.
@@ -284,8 +392,8 @@ fn detect_runtime() -> Option<&'static str> {
 ///
 /// # Fallback
 ///
-/// When `TALOS_COMPILATION_CONTAINER=false` (or neither podman nor docker is
-/// found in a non-production environment), returns a plain `Command::new("cargo")`
+/// Decided by [`sandbox_decision`]: a host run (container mode off, or no
+/// runtime) outside production, or in production with the ack token, returns a plain `Command::new("cargo")`
 /// that runs directly on the host (with `CARGO_TARGET_DIR` set to the same
 /// per-user cache when provided, so the host path gets identical reuse).
 pub fn build_command(
@@ -294,72 +402,14 @@ pub fn build_command(
     wit_dir: &Path,
     target_cache: Option<&Path>,
 ) -> Result<Command> {
-    if !container_enabled() {
-        tracing::debug!("Container compilation disabled — using direct cargo");
+    let Some(runtime) = resolve_sandbox_runtime("build")? else {
         let mut cmd = host_command("cargo");
         if let Some(cache) = target_cache {
             cmd.env("CARGO_TARGET_DIR", cache);
         }
         return Ok(cmd);
-    }
-
-    let runtime = match detect_runtime() {
-        Some(rt) => {
-            tracing::info!(runtime = rt, "Container compilation enabled");
-            rt
-        }
-        None => {
-            // In production we fail-closed by default — running user-supplied
-            // `build.rs` / proc-macros on the host pod is arbitrary code
-            // execution outside the WASM sandbox, trivially escalatable to
-            // RCE. Single-tenant operators who accept the trust model can
-            // opt back into the degraded-sandbox path by setting
-            // `TALOS_COMPILATION_ALLOW_HOST_FALLBACK=true`. This matches
-            // `audit_command`'s production policy.
-            if talos_config::is_production() && !host_fallback_allowed() {
-                bail!(
-                    "Container compilation is required in production but neither \
-                     podman nor docker was found in PATH. Install a container \
-                     runtime in the controller pod to restore sandboxing. \
-                     Single-tenant operators who accept the trust model (operator \
-                     authors all modules — user-supplied proc-macros run on the \
-                     controller host) can set \
-                     TALOS_COMPILATION_ALLOW_HOST_FALLBACK=acknowledge-single-tenant-rce-risk \
-                     to permit the legacy unsandboxed fallback. The short-form values \
-                     (`true`/`1`/`yes`) accepted in dev are intentionally REFUSED in \
-                     production to prevent accidental dev-config inheritance — see \
-                     `host_fallback_allowed` in talos-compilation/src/container.rs."
-                );
-            }
-            if talos_config::is_production() {
-                // Opt-in fallback. Loud WARN so operators can correlate any
-                // proc-macro escape with the missing sandbox; emit a
-                // structured event under target = "talos_compilation" so
-                // dashboards can alert on the rate.
-                tracing::warn!(
-                    target: "talos_compilation",
-                    event_kind = "compilation_unsandboxed_fallback",
-                    fallback_reason = "no_runtime",
-                    "Container compilation enabled but no runtime (podman/docker) \
-                     found in PATH — FALLING BACK to direct cargo in production \
-                     because TALOS_COMPILATION_ALLOW_HOST_FALLBACK=true. \
-                     Modules are compiling WITHOUT container isolation. \
-                     This is operator-acknowledged for single-tenant deploys; \
-                     UNSAFE for multi-tenant."
-                );
-            } else {
-                tracing::warn!(
-                    "Container compilation enabled but no runtime found — \
-                     falling back to direct cargo in non-production mode"
-                );
-            }
-            let mut cmd = host_command("cargo");
-            if let Some(cache) = target_cache {
-                cmd.env("CARGO_TARGET_DIR", cache);
-            }
-            return Ok(cmd);
-        }
     };
+    tracing::info!(runtime, "Container compilation enabled");
 
     let image = nonempty_env_or("TALOS_BUILDER_IMAGE", DEFAULT_IMAGE);
 
@@ -479,42 +529,8 @@ pub fn build_command(
 /// stable bake-in. If you set `TALOS_BUILDER_IMAGE` to a custom image,
 /// bake the DB at the same path or every audit fails closed.
 pub fn audit_command(workspace: &Path, cargo_registry_cache: &Path) -> Result<Command> {
-    if !container_enabled() {
-        tracing::debug!("Container compilation disabled — using direct cargo for audit");
+    let Some(runtime) = resolve_sandbox_runtime("audit")? else {
         return Ok(host_command("cargo"));
-    }
-
-    let runtime = match detect_runtime() {
-        Some(rt) => rt,
-        None => {
-            // Same fail-closed-by-default policy as `build_command`: missing
-            // sandbox in production = bail. Opt-in via
-            // `TALOS_COMPILATION_ALLOW_HOST_FALLBACK=true` mirrors `build_command`.
-            if talos_config::is_production() && !host_fallback_allowed() {
-                bail!(
-                    "Container compilation is required in production but neither \
-                     podman nor docker was found in PATH. Install a container \
-                     runtime in the controller pod, or set \
-                     TALOS_COMPILATION_ALLOW_HOST_FALLBACK=acknowledge-single-tenant-rce-risk \
-                     if you accept the unsandboxed fallback (single-tenant only). \
-                     The short-form values (`true`/`1`/`yes`) accepted in dev are \
-                     intentionally REFUSED in production to prevent accidental \
-                     dev-config inheritance."
-                );
-            }
-            if talos_config::is_production() {
-                tracing::warn!(
-                    target: "talos_compilation",
-                    event_kind = "compilation_unsandboxed_fallback",
-                    fallback_reason = "no_runtime",
-                    "cargo-audit running outside container in production \
-                     because TALOS_COMPILATION_ALLOW_HOST_FALLBACK=true."
-                );
-            } else {
-                tracing::warn!("No container runtime found — falling back to direct cargo audit");
-            }
-            return Ok(host_command("cargo"));
-        }
     };
 
     let image = nonempty_env_or("TALOS_BUILDER_IMAGE", DEFAULT_IMAGE);
@@ -1080,5 +1096,100 @@ mod tests {
             "container disabled must mean no sandbox — the M-13 host gate applies"
         );
         std::env::remove_var("TALOS_COMPILATION_CONTAINER");
+    }
+
+    /// Package CA: every combination of the four inputs. The production
+    /// arms are the point — a disabled container and a missing runtime need
+    /// the same acknowledgement.
+    #[test]
+    fn sandbox_decision_covers_every_input() {
+        use HostReason::*;
+        use SandboxDecision::*;
+        for prod in [false, true] {
+            for ack in [false, true] {
+                assert_eq!(
+                    sandbox_decision(true, Some("podman"), prod, ack),
+                    Container("podman"),
+                    "a present runtime is always used (prod={prod}, ack={ack})"
+                );
+                let host_or_refuse = |reason| {
+                    if prod && !ack {
+                        Refuse(reason)
+                    } else {
+                        Host(reason)
+                    }
+                };
+                assert_eq!(
+                    sandbox_decision(true, None, prod, ack),
+                    host_or_refuse(NoRuntime)
+                );
+                assert_eq!(
+                    sandbox_decision(false, None, prod, ack),
+                    host_or_refuse(ContainerDisabled)
+                );
+                // A detected runtime does not rescue disabled container mode.
+                assert_eq!(
+                    sandbox_decision(false, Some("docker"), prod, ack),
+                    host_or_refuse(ContainerDisabled)
+                );
+            }
+        }
+    }
+
+    /// Package CA: `TALOS_COMPILATION_CONTAINER=false` in production used to
+    /// return a host `cargo` with a debug log. Both production entry points
+    /// now refuse without the ack token and name the variable that caused it;
+    /// with the token they run on the host. Development is unchanged.
+    #[test]
+    fn container_disabled_in_production_requires_the_ack_token() {
+        let _g = env_lock();
+        let ws = PathBuf::from("/tmp/test-workspace");
+        let reg = PathBuf::from("/tmp/test-registry");
+        let wit = PathBuf::from("/tmp/test-wit");
+        std::env::set_var("TALOS_COMPILATION_CONTAINER", "false");
+        std::env::set_var("RUST_ENV", "production");
+        std::env::remove_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK");
+
+        for (step, result) in [
+            ("build", build_command(&ws, &reg, &wit, None).map(|_| ())),
+            ("audit", audit_command(&ws, &reg).map(|_| ())),
+        ] {
+            let err = result.expect_err("production + container disabled + no ack must refuse");
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("TALOS_COMPILATION_CONTAINER disables it"),
+                "{step}: {msg}"
+            );
+            assert!(
+                msg.contains("acknowledge-single-tenant-rce-risk"),
+                "{step}: {msg}"
+            );
+        }
+
+        // The short form stays refused in production.
+        std::env::set_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK", "true");
+        assert!(build_command(&ws, &reg, &wit, None).is_err());
+
+        std::env::set_var(
+            "TALOS_COMPILATION_ALLOW_HOST_FALLBACK",
+            "acknowledge-single-tenant-rce-risk",
+        );
+        for cmd in [
+            build_command(&ws, &reg, &wit, None).expect("ack admits the host build"),
+            audit_command(&ws, &reg).expect("ack admits the host audit"),
+        ] {
+            assert!(format!("{:?}", cmd.as_std().get_program()).contains("cargo"));
+        }
+
+        std::env::remove_var("TALOS_COMPILATION_ALLOW_HOST_FALLBACK");
+        std::env::set_var("RUST_ENV", "development");
+        assert!(
+            build_command(&ws, &reg, &wit, None).is_ok(),
+            "development is unchanged"
+        );
+        assert!(audit_command(&ws, &reg).is_ok(), "development is unchanged");
+
+        std::env::remove_var("TALOS_COMPILATION_CONTAINER");
+        std::env::remove_var("RUST_ENV");
     }
 }

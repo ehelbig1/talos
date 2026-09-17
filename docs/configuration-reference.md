@@ -240,7 +240,7 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | `TALOS_COMPILE_TARGET_CACHE` | enabled | talos-compilation | Enable the per-USER persistent compile target cache (per-user scoping is a security invariant — never fleet-share) |  |
 | `TALOS_COMPILE_TARGET_CACHE_DIR` | `/tmp/cargo-target/per-user` | talos-compilation | Target-cache directory root | |
 | `TALOS_COMPILE_TARGET_CACHE_TTL_HOURS` | built-in default | talos-compilation | Target-cache idle TTL | |
-| `TALOS_COMPILATION_CONTAINER` | unset ⇒ `is_production()` (containerised in production, host toolchain elsewhere); any boolean token overrides | talos-compilation | Container image/runtime for sandboxed compiles | |
+| `TALOS_COMPILATION_CONTAINER` | unset ⇒ `is_production()` (containerised in production, host toolchain elsewhere); any boolean token overrides | talos-compilation | Whether compiles run in the sandbox container. A false value in production refuses Rust compiles and audits unless `TALOS_COMPILATION_ALLOW_HOST_FALLBACK=acknowledge-single-tenant-rce-risk` (the same gate as a missing runtime) | |
 | `TALOS_COMPILATION_ALLOW_HOST_FALLBACK` | off (prod requires the literal ack token `acknowledge-single-tenant-rce-risk`) | talos-compilation | Allow host-side JS/Python compile (RCE risk) | 🔒 |
 | `TALOS_ADVISORY_DB_MAX_AGE_DAYS` | `90` | talos-compilation | Max RustSec advisory-DB age; fails closed in prod | 🔒 |
 | `MCP_ALLOWED_CRATE_DEPENDENCIES` | built-in allowlist | talos-compilation | Replace the allowed crate-dependency allowlist | 🔒 |

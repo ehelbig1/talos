@@ -614,7 +614,8 @@ Implementation: `User` struct's `Debug` impl redacts `password_hash` and `totp_s
        |
        v
   Containerized compilation (Podman, else Docker)
-  - on by default in production (TALOS_COMPILATION_CONTAINER)
+  - on by default in production (TALOS_COMPILATION_CONTAINER); a host
+    compile in production needs the host-fallback ack token
   - --network=none, --read-only, --cap-drop=ALL, no-new-privileges
   - --memory / --cpus / --pids-limit, non-root user
        |
