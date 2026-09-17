@@ -789,6 +789,8 @@ CTRL_TESTS=(
     # implementation — ceiling gate, actor limit, grant/budget/policy copy.
     # `common` DATABASE_URL harness ⇒ CTRL_TESTS, not TC_TESTS (sub-leg 64b).
     "actor_clone_parity_tests"
+    # Package CC: approval policies on unevaluated triggers are refused.
+    "approval_policy_trigger_refusal_tests"
     # BR: the grant CHECK equals ACTOR_CEILING_WORLDS; one ceiling read.
     "capability_grant_world_check_tests"
 )

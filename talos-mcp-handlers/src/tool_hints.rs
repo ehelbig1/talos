@@ -933,6 +933,58 @@ mod tests {
         );
     }
 
+    /// Package CC: the web UI tells an operator which MCP tools manage a panel
+    /// (`<ManagedViaMcp tools={[...]} />`). The Policies panel named
+    /// `create_actor_approval_policy` and `delete_actor_approval_policy`, which
+    /// do not exist. Every `tools={[...]}` array in `frontend/src` names only
+    /// advertised tools.
+    #[test]
+    fn web_ui_tool_references_name_only_advertised_tools() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("read frontend dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|e| e == "tsx" || e == "ts") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../frontend/src");
+        let mut files = Vec::new();
+        walk(&root, &mut files);
+        let mut arrays = 0;
+        let mut offenders = Vec::new();
+        for file in files {
+            let text = std::fs::read_to_string(&file).expect("read source");
+            let mut rest = text.as_str();
+            while let Some(start) = rest.find("tools={[") {
+                let after = &rest[start + "tools={[".len()..];
+                let end = after.find("]}").expect("unterminated tools={[ array");
+                arrays += 1;
+                for name in after[..end]
+                    .split(',')
+                    .map(|n| n.trim().trim_matches('"'))
+                    .filter(|n| !n.is_empty())
+                {
+                    if !is_declared_tool(name) {
+                        offenders.push(format!("{}: `{name}`", file.display()));
+                    }
+                }
+                rest = &after[end..];
+            }
+        }
+        assert!(
+            arrays >= 1,
+            "no `tools={{[` array found — the scan matches nothing"
+        );
+        assert!(
+            offenders.is_empty(),
+            "the web UI names MCP tools that are not advertised:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
+
     fn collect_strings<'a>(v: &'a Value, out: &mut Vec<&'a str>) {
         match v {
             Value::String(s) => out.push(s),

@@ -10,22 +10,22 @@ export function PoliciesPanel() {
           <Shield className="w-5 h-5 text-violet-400 shrink-0 mt-0.5" />
           <p className="text-muted-foreground text-sm leading-relaxed">
             Approval policies define when this Actor must pause and request
-            human approval before proceeding.
+            human approval before proceeding. Enforced triggers today are
+            first_workflow_deploy and custom Rhai expressions, both evaluated
+            when a workflow version is published.
           </p>
         </div>
         <ManagedViaMcp
           tools={[
             "list_actor_approval_policies",
-            "create_actor_approval_policy",
-            "delete_actor_approval_policy",
+            "add_actor_approval_policy",
+            "remove_actor_approval_policy",
           ]}
         />
-        <div className="flex flex-col items-center justify-center py-10 gap-3 mt-4">
-          <Shield className="w-12 h-12 text-violet-500/20" />
-          <p className="text-muted-foreground/40 text-sm">
-            No approval policies configured.
-          </p>
-        </div>
+        <p className="text-muted-foreground/60 text-sm mt-4">
+          This panel does not load policies; list them with
+          list_actor_approval_policies.
+        </p>
       </div>
     </div>
   );

@@ -408,10 +408,10 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                   a JSON context: { event, actor_id, workflow_id, user_id }. Must be \
                   pure (no 'eval' / no 'import'); syntax is checked at save. \
                 \
-                NOT YET ENFORCED (Phase 2 — persisted but no call site emits events): \
+                REFUSED (no call site evaluates them yet, so a policy would have no effect): \
                 - 'new_external_host', 'database_write', 'email_send', 'new_secret_access'. \
-                The response's `enforcement` field tells you which bucket your policy falls \
-                into ('enabled' / 'enabled_for_publish_version_only' / 'disabled'). \
+                The response's `enforcement` field says which bucket an accepted policy falls \
+                into ('enabled' / 'enabled_for_publish_version_only'). \
                 \
                 Modes: \
                 - block — halts the action, creates an approval gate (token-bearer URL, \
@@ -3230,6 +3230,12 @@ async fn handle_add_approval_policy(
     // operator-facing string starts with "trigger_condition may not"
     // / "trigger_condition is not valid Rhai syntax", which preserves
     // the current operator-visible error shape.
+    // Package CC: a trigger nothing evaluates is refused before anything is
+    // stored (one rule, `TriggerCondition::creation_refusal`).
+    if let Some(refusal) = talos_actor_policies::TriggerCondition::parse(trigger).creation_refusal()
+    {
+        return mcp_error(req_id, -32602, &refusal);
+    }
     if let Err(e) = talos_actor_policies::rhai_eval::validate_expression(trigger) {
         return mcp_error(req_id, -32602, &e.to_string());
     }
@@ -3414,13 +3420,12 @@ async fn handle_add_approval_policy(
                             .to_string(),
                     )
                 }
+                // Unreachable for a new policy (refused above); kept so the
+                // match stays exhaustive over the status.
                 talos_actor_policies::EnforcementStatus::Disabled => {
                     serde_json::Value::String(format!(
-                        "Trigger condition '{trigger}' is persisted but NOT yet \
-                         evaluated at runtime — Phase 2 will add the emitting call \
-                         site. Today this policy has no effect. Use \
-                         `first_workflow_deploy`, a custom Rhai expression, or \
-                         `create_approval_gate` for currently-enforced gating."
+                        "Trigger condition '{trigger}' is NOT evaluated at runtime; \
+                         this policy has no effect."
                     ))
                 }
             };
