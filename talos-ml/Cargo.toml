@@ -21,6 +21,7 @@ sqlx = { version = "0.8", default-features = false, features = ["postgres", "run
 talos-llm = { path = "../talos-llm" }
 talos-measurement = { path = "../talos-measurement" }
 talos-memory = { path = "../talos-memory" }
+talos-admin-event-log = { path = "../talos-admin-event-log" }
 talos-db = { path = "../talos-db" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 talos-tenancy = { path = "../talos-tenancy" }

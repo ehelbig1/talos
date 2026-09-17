@@ -66,10 +66,18 @@ pub const DEFAULT_MIN_EVAL_INTERVAL_SECS: i64 = 3600;
 const DEFAULT_MIN_SHADOW_TOTAL: i64 = 50;
 const EVAL_HOLDOUT_FRACTION: f64 = 0.2;
 
-/// Audit-log helper. `admin_event_log` is append-only; summaries here
-/// are BUILT from fixed strings + model names/states (no user content),
-/// so no DLP pass is needed — do not interpolate example text into
-/// them. WARN-level tracing doubles as the ops notification.
+/// Audit-log helper. `admin_event_log` is append-only, so a row written here
+/// is what an auditor reads forever.
+///
+/// Package CH (2026-09-17) corrected the claim this comment used to make —
+/// that the summaries are "BUILT from fixed strings + model names/states (no
+/// user content), so no DLP pass is needed". The model NAME is user-supplied
+/// (`ml_create_model` takes it, and nothing caps its length on that path), and
+/// the policy `details` written beside it are keyed by user-chosen CLASS
+/// LABELS. Both columns now go through the one shared writer, which truncates
+/// the summary, bounds `details` and DLP-redacts both. Still do not
+/// interpolate example text into a summary. WARN-level tracing doubles as the
+/// ops notification.
 async fn audit_transition(
     pool: &PgPool,
     user_id: Uuid,
@@ -79,16 +87,15 @@ async fn audit_transition(
     details: serde_json::Value,
 ) {
     tracing::warn!(target: "talos_ml", %model_id, event = event_type, "{summary}");
-    if let Err(e) = sqlx::query(
-        "INSERT INTO admin_event_log (user_id, event_type, resource_type, resource_id, \
-         summary, details) VALUES ($1, $2, 'ml_model', $3, $4, $5)",
+    if let Err(e) = talos_admin_event_log::insert(
+        pool,
+        Some(user_id),
+        event_type,
+        "ml_model",
+        Some(model_id),
+        &summary,
+        Some(&details),
     )
-    .bind(user_id)
-    .bind(event_type)
-    .bind(model_id)
-    .bind(&summary)
-    .bind(&details)
-    .execute(pool)
     .await
     {
         tracing::warn!(error = %e, "failed to audit-log lifecycle event (non-fatal)");

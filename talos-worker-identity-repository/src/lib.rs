@@ -929,19 +929,21 @@ impl WorkerIdentityRepository {
         summary: &str,
         details: Option<&serde_json::Value>,
     ) -> Result<()> {
-        sqlx::query!(
-            "INSERT INTO admin_event_log
-             (user_id, event_type, resource_type, resource_id, summary, details)
-             VALUES (NULL, $1, 'worker_provisioning_token', $2, $3, $4)",
+        // Package CH (2026-09-17): through the one shared writer, which
+        // truncates the summary, bounds `details` and DLP-redacts both. This
+        // site did none of that, and an operator's `note` reaches it — the
+        // mint-site discipline below is the FIRST line, not the only one.
+        talos_admin_event_log::insert(
+            &self.db_pool,
+            None,
             event_type,
-            token_id,
+            "worker_provisioning_token",
+            Some(token_id),
             summary,
-            details as Option<&serde_json::Value>,
+            details,
         )
-        .execute(&self.db_pool)
         .await
-        .context("insert provisioning-token audit event")?;
-        Ok(())
+        .context("insert provisioning-token audit event")
     }
 
     /// All provisioning-token rows for the operator listing surface, newest

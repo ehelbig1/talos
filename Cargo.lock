@@ -1782,6 +1782,7 @@ dependencies = [
  "talos-actor-repository",
  "talos-actor-scaffold",
  "talos-actor-types",
+ "talos-admin-event-log",
  "talos-advanced-repository",
  "talos-analytics-repository",
  "talos-api",
@@ -7510,6 +7511,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "talos-actor-budget-refusal",
+ "talos-admin-event-log",
  "talos-capability-world",
  "talos-config",
  "talos-db",
@@ -7553,6 +7555,18 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "talos-text-util",
+ "uuid",
+]
+
+[[package]]
+name = "talos-admin-event-log"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde_json",
+ "sqlx",
+ "talos-dlp-provider",
  "talos-text-util",
  "uuid",
 ]
@@ -7713,6 +7727,7 @@ dependencies = [
  "sha2 0.10.9",
  "sqlx",
  "subtle",
+ "talos-admin-event-log",
  "talos-auth-types",
  "talos-config",
  "talos-dlp-provider",
@@ -8939,6 +8954,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sqlx",
+ "talos-admin-event-log",
  "talos-db",
  "talos-llm",
  "talos-measurement",
@@ -9781,6 +9797,7 @@ dependencies = [
  "chrono",
  "serde_json",
  "sqlx",
+ "talos-admin-event-log",
  "tokio",
  "uuid",
 ]

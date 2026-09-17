@@ -9312,6 +9312,51 @@ else
 fi
 echo
 
+bold "▶ check 94: admin_event_log has ONE writer"
+
+# `admin_event_log` is an append-only operator audit trail (its immutability
+# triggers refuse UPDATE, DELETE and TRUNCATE since package CG), so a row a
+# writer puts there is what an auditor reads forever — and every summary on
+# this platform interpolates something a user chose: an API key's name, a
+# model's name, an operator's note. Two protections belong at the write:
+# TRUNCATE the summary / bound `details`, and DLP-REDACT both. Measured
+# 2026-09-17 (package CH): of FOUR production writers exactly ONE did both.
+# `talos-api-keys` redacted and never truncated; `talos-ml`'s lifecycle job and
+# `talos-worker-identity-repository` did neither — the first under a comment
+# asserting its summaries needed no DLP pass because they are built from "fixed
+# strings + model names", while the model name is user-supplied and the policy
+# `details` beside it are keyed by user-chosen class labels. All four now go
+# through `talos_admin_event_log::insert[_on_conn]`, and this check keeps it
+# that way: the statement may appear in that crate and nowhere else in
+# production code. 3 on pristine main, 0 after. Tests write their own fixtures
+# and are out of scope (the `tests/` directories), the same scoping checks 6 and
+# 50 use. Stated limit: TEXTUAL — SQL assembled with `format!`, or an INSERT
+# reached through a helper in another crate, is invisible; it proves the
+# statement has one home, never that a caller passes good arguments.
+ADMIN_EVENT_WRITERS=0
+while IFS= read -r hit; do
+    file="${hit%%:*}"
+    case "$file" in
+        talos-admin-event-log/src/*|*/talos-admin-event-log/src/*) continue ;;
+    esac
+    grep -q 'allow-raw-admin-event-insert' "$ROOT/$file" && continue
+    printf '  %s\n' "$hit"
+    ADMIN_EVENT_WRITERS=$((ADMIN_EVENT_WRITERS + 1))
+done < <(cd "$ROOT" && grep -rn "INSERT INTO admin_event_log" \
+    --include='*.rs' "${TREE_PRUNE_GREP[@]}" . 2>/dev/null \
+    | grep -vE '/target/|/tests/|_tests\.rs:' | sed 's|^\./||' || true)
+
+if [ "$ADMIN_EVENT_WRITERS" -gt 0 ]; then
+    red "✗ $ADMIN_EVENT_WRITERS raw admin_event_log INSERT(s) outside talos-admin-event-log"
+    yellow "  → use talos_admin_event_log::insert[_on_conn]: it truncates the summary,"
+    yellow "    bounds details at 1 MiB and DLP-redacts both. An audit row is permanent."
+    EXIT_CODE=1
+else
+    green "✓ admin_event_log is written through its one home"
+fi
+
+echo
+
 bold "▶ check 54: lint self-consistency (check numbering + documented count)"
 ACTUAL_NUMS="$(grep -oE '^bold "▶ check [0-9]+:' "${BASH_SOURCE[0]}" | grep -oE '[0-9]+' | sort -n)"
 EXPECTED_NUMS="$(seq 1 "$CHECK_COUNT")"
