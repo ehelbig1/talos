@@ -489,7 +489,9 @@ every environment.
     per-user aggregate TALOS_WEBHOOK_USER_RPM, default 300/min (in-memory)
   - API key validation: 60/min per key prefix
   - GraphQL depth: 15, complexity: 5000 (hardcoded)
-  - TOTP: 5 attempts, 15-min lockout
+  - TOTP: 5 attempts, 15-min lockout (Redis, so the count is shared across
+    controller instances; production refuses verification when Redis is unset
+    or unreachable, the in-memory counter is a development fallback)
   - Refresh token: 10/min per user
 ```
 

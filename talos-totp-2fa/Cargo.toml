@@ -28,5 +28,8 @@ urlencoding = "2.1"
 uuid.workspace = true
 zeroize = "1.8"
 
+[dev-dependencies]
+tokio.workspace = true
+
 [lints]
 workspace = true

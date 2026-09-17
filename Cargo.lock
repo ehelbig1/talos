@@ -9643,6 +9643,7 @@ dependencies = [
  "talos-config",
  "talos-metrics",
  "talos-secrets-manager",
+ "tokio",
  "totp-rs",
  "tracing",
  "urlencoding",

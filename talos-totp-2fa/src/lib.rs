@@ -993,6 +993,25 @@ impl TotpService {
 mod tests {
     use super::*;
 
+    /// A real `TotpService` over a never-connected lazy pool: every test here
+    /// exercises the limiter, which runs before any DB work, so a touched pool
+    /// would fail the test loudly rather than pass on a stub.
+    pub(super) fn stub_service(redis_client: Option<Arc<redis::Client>>) -> TotpService {
+        std::env::set_var(
+            "TALOS_MASTER_KEY",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        );
+        let db_pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_millis(250))
+            .connect_lazy("postgres://127.0.0.1:1/talos_never_connects")
+            .expect("lazy pool");
+        // allow-secrets-manager-new: test stub — no McpState in unit tests
+        let secrets_manager =
+            Arc::new(talos_secrets_manager::SecretsManager::new(db_pool.clone()).unwrap());
+        TotpService::new(db_pool, redis_client, secrets_manager)
+    }
+
     #[test]
     #[ignore]
     fn test_generate_secret() {
@@ -1072,75 +1091,120 @@ mod tests {
         assert!(!service.verify_code(&secret, email, "000000").unwrap());
     }
 
-    #[test]
-    fn test_rate_limiter_locks_after_max_attempts() {
-        // Rate limiter is purely in-memory; we can test it without a real DB connection.
-        let rate_limits: Arc<DashMap<Uuid, TotpRateState>> = Arc::new(DashMap::new());
+    /// The DEV fallback limiter, driven through the production function
+    /// rather than a re-implementation of it. The two tests this replaces
+    /// rebuilt the counter arithmetic over their own `DashMap` and asserted
+    /// against that copy, so the production `check_rate_limit_memory` could
+    /// have been gutted with both of them green (CLAUDE.md's own
+    /// "unit tests exercise real production code" rule).
+    #[tokio::test]
+    async fn the_memory_limiter_locks_after_max_attempts_and_a_success_clears_it() {
+        let service = stub_service(None);
         let user_id = Uuid::new_v4();
 
-        let check = |rl: &Arc<DashMap<Uuid, TotpRateState>>| {
-            let mut entry = rl.entry(user_id).or_insert_with(|| TotpRateState {
-                failed_attempts: 0,
-                locked_until: None,
-            });
-            if let Some(locked_until) = entry.locked_until {
-                if Instant::now() < locked_until {
-                    return Err(());
-                }
-                entry.failed_attempts = 0;
-                entry.locked_until = None;
-            }
-            Ok(())
-        };
-
-        let record_failure = |rl: &Arc<DashMap<Uuid, TotpRateState>>| {
-            let mut entry = rl.entry(user_id).or_insert_with(|| TotpRateState {
-                failed_attempts: 0,
-                locked_until: None,
-            });
-            entry.failed_attempts += 1;
-            if entry.failed_attempts >= MAX_2FA_ATTEMPTS {
-                entry.locked_until =
-                    Some(Instant::now() + std::time::Duration::from_secs(LOCKOUT_SECS));
-            }
-        };
-
-        // First MAX_2FA_ATTEMPTS - 1 failures should pass the rate-limit check
-        for _ in 0..MAX_2FA_ATTEMPTS - 1 {
-            assert!(check(&rate_limits).is_ok());
-            record_failure(&rate_limits);
+        // The pre-charge admits exactly MAX_2FA_ATTEMPTS.
+        for attempt in 1..=MAX_2FA_ATTEMPTS {
+            service
+                .check_rate_limit_memory(user_id)
+                .unwrap_or_else(|e| panic!("attempt {attempt} must be admitted: {e}"));
         }
+        let locked = service
+            .check_rate_limit_memory(user_id)
+            .expect_err("the attempt past the cap is refused");
+        assert!(
+            locked.to_string().contains("Too many failed 2FA attempts"),
+            "{locked}"
+        );
 
-        // The Nth failure should trigger lockout
-        assert!(check(&rate_limits).is_ok());
-        record_failure(&rate_limits);
+        // A second user is unaffected — the counter is per user.
+        service
+            .check_rate_limit_memory(Uuid::new_v4())
+            .expect("another user is not locked out");
 
-        // Now the account should be locked
-        assert!(check(&rate_limits).is_err());
+        // Success clears the counter, so the full budget is available again.
+        service.rate_limits.remove(&user_id);
+        for attempt in 1..=MAX_2FA_ATTEMPTS {
+            service
+                .check_rate_limit_memory(user_id)
+                .unwrap_or_else(|e| panic!("post-success attempt {attempt}: {e}"));
+        }
+        service
+            .check_rate_limit_memory(user_id)
+            .expect_err("the cap applies again after the reset");
     }
 
-    #[test]
-    fn test_rate_limiter_resets_on_success() {
-        let rate_limits: Arc<DashMap<Uuid, TotpRateState>> = Arc::new(DashMap::new());
+    /// `RUST_ENV` is process-global and these tests move it, so every test
+    /// whose behaviour depends on `is_production()` takes this lock.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct ProdEnv(Option<String>);
+    impl ProdEnv {
+        fn set() -> Self {
+            let prev = std::env::var("RUST_ENV").ok();
+            std::env::set_var("RUST_ENV", "production");
+            Self(prev)
+        }
+    }
+    impl Drop for ProdEnv {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(v) => std::env::set_var("RUST_ENV", v),
+                None => std::env::remove_var("RUST_ENV"),
+            }
+        }
+    }
+
+    /// Production with no Redis configured at all refuses the verification
+    /// before any DB work — the pool here can never connect, so a regression
+    /// that let this through would surface as a pool timeout, not a refusal.
+    #[tokio::test]
+    async fn production_without_redis_refuses_before_the_database() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let service = stub_service(None);
+        let _prod = ProdEnv::set();
+        let err = service
+            .verify_2fa_login(Uuid::new_v4(), "000000", "user@example.com")
+            .await
+            .expect_err("production without Redis must refuse");
+        assert!(
+            err.to_string().contains("temporarily unavailable"),
+            "refusal must be the fail-closed one, got: {err}"
+        );
+    }
+
+    /// Redis CONFIGURED but unreachable: production refuses, development falls
+    /// back to the in-memory counter (and really charges it). The two arms are
+    /// one test so the control cannot drift away from the case it controls.
+    #[tokio::test]
+    async fn an_unreachable_redis_refuses_in_production_and_falls_back_in_development() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let unreachable =
+            Arc::new(redis::Client::open("redis://127.0.0.1:1").expect("client for a dead port"));
+        let service = stub_service(Some(unreachable));
         let user_id = Uuid::new_v4();
 
-        // Record some failures
-        for _ in 0..3 {
-            let mut entry = rate_limits.entry(user_id).or_insert_with(|| TotpRateState {
-                failed_attempts: 0,
-                locked_until: None,
-            });
-            entry.failed_attempts += 1;
+        {
+            let _prod = ProdEnv::set();
+            let err = service
+                .check_rate_limit(user_id)
+                .await
+                .expect_err("production must not degrade to per-process state");
+            assert!(err.to_string().contains("temporarily unavailable"), "{err}");
         }
+        assert!(
+            service.rate_limits.is_empty(),
+            "a production refusal must not seed the in-memory counter"
+        );
 
-        // Successful auth clears the counter
-        rate_limits.remove(&user_id);
-
-        // Should now pass (no entry = no lock)
-        let check_result = rate_limits
-            .get(&user_id)
-            .is_none_or(|e| e.locked_until.is_none());
-        assert!(check_result);
+        service
+            .check_rate_limit(user_id)
+            .await
+            .expect("development falls back to the in-memory limiter");
+        assert_eq!(
+            service.rate_limits.get(&user_id).map(|e| e.failed_attempts),
+            Some(1),
+            "the dev fallback must charge the attempt it admitted"
+        );
     }
 
     /// Both recorders — the ONE place every verification path lands — must
@@ -1179,6 +1243,175 @@ mod tests {
         assert!(
             calls >= 6,
             "expected >= 6 recorder call sites, found {calls}"
+        );
+    }
+}
+
+/// Redis-backed lockout: the property the in-process tests above cannot reach.
+///
+/// The recorded finding "the 2FA lockout counter is per-process memory" is
+/// REFUTED for production — `check_rate_limit` tries Redis first, production
+/// fails CLOSED when Redis is unset or unreachable, and the `DashMap` is a
+/// development fallback. What was true is that NOTHING drove the Redis path:
+/// the cross-instance lockout, the shared counter and its clearing existed
+/// only as code. These tests drive the real gate on two SEPARATE `TotpService`
+/// instances — separate DashMaps, separate clients — against one Redis.
+///
+/// Skipped (green) unless `TALOS_TEST_REDIS_URL` is set, and named explicitly
+/// by `scripts/test-integration.sh` so it is real coverage there rather than a
+/// green skip. Run locally against a disposable Redis:
+///
+/// ```bash
+/// docker run -d --rm -p 16399:6379 redis:7-alpine
+/// TALOS_TEST_REDIS_URL=redis://127.0.0.1:16399 \
+///   cargo test -p talos-totp-2fa --lib redis_lockout_tests
+/// ```
+#[cfg(test)]
+mod redis_lockout_tests {
+    use super::tests::stub_service;
+    use super::*;
+
+    /// A fresh service per call: its own `DashMap` and its own client, so a
+    /// lockout one instance sees can only have come from Redis.
+    fn instance_or_skip() -> Option<TotpService> {
+        let url = std::env::var("TALOS_TEST_REDIS_URL").ok()?;
+        let client = redis::Client::open(url).expect("valid TALOS_TEST_REDIS_URL");
+        Some(stub_service(Some(Arc::new(client))))
+    }
+
+    /// The shared counter as Redis holds it.
+    async fn read_attempts(service: &TotpService, user_id: Uuid) -> i64 {
+        use redis::AsyncCommands as _;
+        let mut conn = service
+            .redis_client
+            .as_ref()
+            .expect("redis client")
+            .get_multiplexed_async_connection()
+            .await
+            .expect("redis connection");
+        conn.hget::<_, _, Option<i64>>(format!("totp_rate_limit:{user_id}"), "failed_attempts")
+            .await
+            .expect("read the counter")
+            .unwrap_or(0)
+    }
+
+    macro_rules! two_instances_or_skip {
+        () => {
+            match (instance_or_skip(), instance_or_skip()) {
+                (Some(a), Some(b)) => (a, b),
+                _ => {
+                    eprintln!("skipping: TALOS_TEST_REDIS_URL is not set");
+                    return;
+                }
+            }
+        };
+    }
+
+    /// The attempt past the cap is refused on an instance that never saw one of
+    /// the attempts — which is the whole claim the per-process reading denied.
+    #[tokio::test]
+    async fn a_lockout_on_one_instance_is_enforced_by_the_other() {
+        let (a, b) = two_instances_or_skip!();
+        let user_id = Uuid::new_v4();
+
+        for attempt in 1..=MAX_2FA_ATTEMPTS {
+            a.check_rate_limit(user_id)
+                .await
+                .unwrap_or_else(|e| panic!("attempt {attempt} on instance A: {e}"));
+        }
+        let refused = b
+            .check_rate_limit(user_id)
+            .await
+            .expect_err("instance B must refuse the attempt past the shared cap");
+        assert!(
+            refused.to_string().contains("Too many failed 2FA attempts"),
+            "{refused}"
+        );
+        // And the lockout B wrote is read back by A, which never wrote one.
+        let still_locked = a
+            .check_rate_limit(user_id)
+            .await
+            .expect_err("instance A must honour the lockout B recorded");
+        assert!(
+            still_locked.to_string().contains("Account locked"),
+            "{still_locked}"
+        );
+
+        // The lockout MARKER, not merely the counter, is what refused that
+        // attempt: a locked-out user is turned away BEFORE the pre-charge, so
+        // sustained attempts cannot grow the counter without bound. Dropping
+        // the `locked_until` HSET leaves every refusal above intact (the
+        // pre-charge refuses too, in the same words) and is visible only here.
+        let attempts_before = read_attempts(&a, user_id).await;
+        a.check_rate_limit(user_id)
+            .await
+            .expect_err("still locked out");
+        assert_eq!(
+            read_attempts(&a, user_id).await,
+            attempts_before,
+            "a refusal under an active lockout must not charge the counter again"
+        );
+
+        // Control: another user is unaffected, so the key is per user.
+        b.check_rate_limit(Uuid::new_v4())
+            .await
+            .expect("a different user is not locked out");
+
+        // Neither instance used its in-memory fallback.
+        assert!(
+            a.rate_limits.is_empty() && b.rate_limits.is_empty(),
+            "the Redis path must not touch the per-process counter"
+        );
+    }
+
+    /// A success on one instance clears the shared counter, so the other
+    /// instance grants the full budget again.
+    #[tokio::test]
+    async fn a_success_on_one_instance_clears_the_counter_for_the_other() {
+        let (a, b) = two_instances_or_skip!();
+        let user_id = Uuid::new_v4();
+
+        for _ in 0..MAX_2FA_ATTEMPTS - 1 {
+            a.check_rate_limit(user_id).await.expect("under the cap");
+        }
+        b.record_2fa_success(user_id).await;
+
+        for attempt in 1..=MAX_2FA_ATTEMPTS {
+            a.check_rate_limit(user_id)
+                .await
+                .unwrap_or_else(|e| panic!("post-success attempt {attempt}: {e}"));
+        }
+        a.check_rate_limit(user_id)
+            .await
+            .expect_err("the cap applies again once the budget is spent");
+    }
+
+    /// The production ENTRY POINT is gated by the shared counter before it
+    /// touches the database: five attempts through `verify_2fa_login` on one
+    /// instance fail at the DB (this pool can never connect), and the sixth on
+    /// the OTHER instance is refused by the lockout instead.
+    #[tokio::test]
+    async fn verify_2fa_login_spends_the_shared_budget_before_any_db_work() {
+        let (a, b) = two_instances_or_skip!();
+        let user_id = Uuid::new_v4();
+
+        for attempt in 1..=MAX_2FA_ATTEMPTS {
+            let err = a
+                .verify_2fa_login(user_id, "000000", "user@example.com")
+                .await
+                .expect_err("the unreachable database fails the attempt");
+            assert!(
+                !err.to_string().contains("Too many failed 2FA attempts"),
+                "attempt {attempt} must reach the DB, not the lockout: {err}"
+            );
+        }
+        let refused = b
+            .verify_2fa_login(user_id, "000000", "user@example.com")
+            .await
+            .expect_err("the attempt past the cap is refused on the other instance");
+        assert!(
+            refused.to_string().contains("Too many failed 2FA attempts"),
+            "the refusal must be the lockout, not a DB error: {refused}"
         );
     }
 }
