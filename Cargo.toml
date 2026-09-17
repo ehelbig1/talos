@@ -120,6 +120,7 @@ members = [
     "talos-child-run-ledger",
     "talos-draft-heuristics",
     "talos-actor-repository",
+    "talos-admin-event-log",
     "talos-engine-events",
     "talos-execution-repository",
     "talos-workflow-authorization",

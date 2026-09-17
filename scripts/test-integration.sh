@@ -418,6 +418,12 @@ CTRL_TESTS=(
     # makes the PARENT undeletable. `common` (DATABASE_URL) harness, so
     # CTRL_TESTS and not TC_TESTS (64b).
     "audit_immutability_tests"
+    # admin_event_log is append-only, so what a writer stores is what an
+    # auditor reads forever — and of four production writers exactly one both
+    # truncated and redacted. Drives the shared writer and the operator-CLI
+    # caller that wrote raw until package CH. `common` (DATABASE_URL) harness,
+    # so CTRL_TESTS and not TC_TESTS (64b).
+    "admin_event_writer_tests"
     # Nothing on this platform could say which operator surface is slow: no
     # per-tool series, no per-call line, and no pg_stat_statements (that last
     # one is live from 2026-09-10; the counting here stays client-side because

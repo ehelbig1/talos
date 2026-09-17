@@ -8,6 +8,7 @@ publish.workspace = true
 
 [dependencies]
 # The actor-tenancy read has one home there (package CD).
+talos-admin-event-log = { path = "../talos-admin-event-log" }
 talos-ops-alert-store = { path = "../talos-ops-alert-store" }
 # Budget-refusal counter + the alert on_budget_exceeded = 'alert' raises (package CD).
 talos-actor-budget-refusal = { path = "../talos-actor-budget-refusal" }

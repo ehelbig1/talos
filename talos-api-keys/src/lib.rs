@@ -852,20 +852,20 @@ impl ApiKeyService {
         details: serde_json::Value,
     ) {
         tokio::spawn(async move {
-            let redacted_summary = talos_dlp_provider::redact_str(&summary);
-            let redacted_details = talos_dlp_provider::redact_json(&details);
-            if let Err(e) = sqlx::query(
-                "INSERT INTO admin_event_log \
-                 (user_id, event_type, resource_type, resource_id, summary, details) \
-                 VALUES ($1, $2, $3, $4, $5, $6)",
+            // Package CH (2026-09-17): through the one shared writer. This site
+            // redacted both columns and never TRUNCATED either, while the
+            // summary interpolates the user-supplied key name; the shared
+            // writer caps the summary at 1000 bytes and bounds `details` at
+            // 1 MiB as well as redacting.
+            if let Err(e) = talos_admin_event_log::insert(
+                &pool,
+                Some(user_id),
+                event_type,
+                "api_key",
+                Some(key_id),
+                &summary,
+                Some(&details),
             )
-            .bind(user_id)
-            .bind(event_type)
-            .bind("api_key")
-            .bind(key_id)
-            .bind(&redacted_summary)
-            .bind(&redacted_details)
-            .execute(&pool)
             .await
             {
                 // MCP-573: upgrade to ERROR with a structured
