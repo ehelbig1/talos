@@ -32,6 +32,13 @@
 #                         If set together with SMOKE_AGENT_TOKEN, runs the
 #                         full write→read round-trip (Phase B encryption).
 #   SMOKE_TIMEOUT         Per-request timeout in seconds. Default: 10.
+#   SMOKE_CONTROLLER_URL  The controller port reached directly (e.g. through
+#                         `kubectl port-forward`). Enables leg 7, the route
+#                         crawl (scripts/check-route-extensions.py), which
+#                         cannot run through BASE_URL: nginx fronts only some
+#                         paths and does not route /metrics/prometheus.
+#                         PROMETHEUS_SCRAPE_TOKEN is passed through to it.
+#   SMOKE_CRAWL_DELAY     Seconds between crawl requests. Default: 0.
 
 set -euo pipefail
 
@@ -245,6 +252,28 @@ EOF
         bad "actorMemories failed: $status (body: $(head -c 200 "$body"))"
     fi
     rm -f "$body"
+fi
+
+# ── 7. Route Extension wiring (package BZ) ───────────────────────────
+echo
+bold "7. Every mounted route has the axum Extensions it extracts"
+if [ -z "${SMOKE_CONTROLLER_URL:-}" ]; then
+    skip "SMOKE_CONTROLLER_URL unset — the route crawl needs the controller port, not the public URL"
+elif ! command -v python3 >/dev/null 2>&1; then
+    skip "python3 not found — route crawl not run"
+else
+    SMOKE_REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+    if ( cd "$SMOKE_REPO_ROOT" && python3 scripts/check-route-extensions.py \
+            --controller-url "$SMOKE_CONTROLLER_URL" --delay "${SMOKE_CRAWL_DELAY:-0}" ); then
+        ok "no route answered a missing-extension rejection"
+    else
+        crawl_rc=$?
+        if [ "$crawl_rc" -eq 1 ]; then
+            bad "a mounted route extracts an Extension its router does not provide (see above)"
+        else
+            bad "route crawl could not verify (exit $crawl_rc, see above)"
+        fi
+    fi
 fi
 
 # ── Summary ──────────────────────────────────────────────────────────

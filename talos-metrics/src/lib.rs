@@ -902,6 +902,12 @@ pub struct TalosMetrics {
     /// key are both caller-supplied at a network endpoint, so neither may
     /// become a label (unbounded cardinality, attacker-driven).
     pub worker_key_tofu_conflicts_total: Counter,
+    /// Responses in which a mounted route asked for an axum `Extension` its
+    /// router never layered (`talos_http_utils::missing_extension`). A wiring
+    /// defect, never a caller error: `GET /metrics` and `GET /graphql/schema`
+    /// answered this way from the day they were mounted until package BZ
+    /// deleted them. UNLABELLED — the route template is in the ERROR log line.
+    pub http_missing_extension_total: Counter,
     /// Number of distinct `worker_id`s with an ACTIVE `worker_identities` row
     /// whose reported build provably differs from this controller's. A GAUGE,
     /// recomputed from a query each sweep (always `set`, never `inc`/`dec`) so a
@@ -2346,6 +2352,15 @@ impl TalosMetrics {
         )?;
         registry.register(Box::new(worker_key_tofu_conflicts_total.clone()))?;
 
+        let http_missing_extension_total = Counter::new(
+            "talos_http_missing_extension_total",
+            "Responses where a mounted route extracted an axum Extension its \
+             router does not provide (a wiring defect, answered 500 with the \
+             body replaced). Zero on a correctly wired controller; the route \
+             is named in the route_missing_extension ERROR log line.",
+        )?;
+        registry.register(Box::new(http_missing_extension_total.clone()))?;
+
         let worker_build_skew_workers = IntGauge::new(
             "talos_worker_build_skew_workers",
             "Distinct worker_ids with an ACTIVE worker_identities row whose \
@@ -3378,6 +3393,7 @@ impl TalosMetrics {
             audit_chain_last_verified_ok_timestamp_seconds,
             audit_chain_sweep_timestamp_seconds,
             worker_key_tofu_conflicts_total,
+            http_missing_extension_total,
             worker_build_skew_workers,
             catalog_templates_missing_wasm,
             catalog_missing_wasm_scan_last_success_timestamp_seconds,

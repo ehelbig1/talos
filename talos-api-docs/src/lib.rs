@@ -1,7 +1,7 @@
 //! API Documentation Module
 //!
 //! Provides comprehensive API documentation including:
-//! - GraphQL Schema Definition Language (SDL) export
+//! - Where the GraphQL SDL lives (`frontend/schema.graphql`, checked in)
 //! - Interactive GraphQL Playground (security-controlled)
 //! - REST endpoint documentation
 //! - Example queries and mutations
@@ -9,11 +9,18 @@
 //!
 //! Security:
 //! - GraphQL introspection and playground disabled in production
-//! - Schema export requires authentication
 //! - Rate limits apply to documentation endpoints
+//!
+//! Package BZ (2026-09-16): there is no live SDL endpoint. `GET /graphql/schema`
+//! extracted `Extension<TalosSchema>`, which only the `/graphql` + `/ws`
+//! sub-router carries, so from the day it was mounted it answered 500 with
+//! axum's "Missing request extension" text naming internal Rust types. It was
+//! deleted rather than wired: the SDL is already checked in at
+//! `frontend/schema.graphql` (pinned equal to the compiled schema by
+//! `talos_api::schema_snapshot_tests`), and a live export would publish the schema in
+//! production, where introspection is deliberately off.
 
 use axum::{
-    extract::Extension,
     http::{header, StatusCode},
     response::{Html, Json, Response},
     routing::get,
@@ -22,23 +29,11 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use talos_api::TalosSchema;
 use talos_errors::AppError;
 
-/// GraphQL Schema SDL export handler
-/// Returns the complete GraphQL schema in SDL format
-pub async fn graphql_schema_handler(
-    Extension(schema): Extension<TalosSchema>,
-) -> Result<Response, AppError> {
-    let sdl = schema.sdl();
-
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/graphql")
-        .header(header::CACHE_CONTROL, "public, max-age=3600")
-        .body(sdl.into())
-        .map_err(|e| AppError::internal(format!("Failed to build response: {}", e)))
-}
+/// Repository path of the checked-in GraphQL SDL. `talos_api`'s
+/// `schema_snapshot_tests` pin that file equal to the compiled schema.
+pub const GRAPHQL_SDL_PATH: &str = "frontend/schema.graphql";
 
 /// GraphQL Playground HTML source handler
 /// Serves the GraphQL Playground IDE for interactive API exploration
@@ -129,7 +124,9 @@ pub struct ApiDocumentation {
 pub struct GraphQlDoc {
     pub endpoint: String,
     pub playground_url: Option<String>,
-    pub schema_url: String,
+    /// Repository path of the SDL ([`GRAPHQL_SDL_PATH`]). Not a URL: no
+    /// route serves the schema.
+    pub schema_sdl_path: String,
     pub subscriptions: bool,
     pub introspection: bool,
     pub description: String,
@@ -195,7 +192,7 @@ pub fn generate_api_documentation() -> ApiDocumentation {
         graphql: GraphQlDoc {
             endpoint: format!("{}/graphql", base_url),
             playground_url: if is_production { None } else { Some(format!("{}/graphql/playground", base_url)) },
-            schema_url: format!("{}/graphql/schema", base_url),
+            schema_sdl_path: GRAPHQL_SDL_PATH.to_string(),
             subscriptions: true,
             introspection: !is_production,
             description: "Primary API for all Talos operations. Supports queries, mutations, and real-time subscriptions.".to_string(),
@@ -235,36 +232,6 @@ pub fn generate_api_documentation() -> ApiDocumentation {
                 example_request: None,
                 example_response: Some(json!({"status": "healthy", "service": "nats"})),
             },
-            // MCP-849 (2026-05-14): correct doc-reality drift on metrics
-            // routes. Pre-fix `/metrics` was documented as "Prometheus
-            // metrics endpoint" with `# HELP talos_requests_total Total
-            // requests` example — that's wrong on two dimensions:
-            //   * the controller serves Prometheus-format at
-            //     `/metrics/prometheus`, not `/metrics`. Operators
-            //     setting up scrape configs against `/metrics` would get
-            //     JSON dashboard data that Prometheus can't parse and
-            //     fail their scrape silently (no metrics surfaced for
-            //     this controller in dashboards) or noisily (parse
-            //     errors in scrape logs).
-            //   * `/metrics` accepts session/JWT only (no API key path);
-            //     pre-fix the `scopes: ["admin"]` claim was misleading
-            //     because no API key with `admin` scope would actually
-            //     work — operators would create such a key and still
-            //     get 401.
-            EndpointDoc {
-                path: "/metrics".to_string(),
-                method: "GET".to_string(),
-                description: "Authenticated metrics dashboard (JSON). Served to the operator UI via the /graphql proxy; NOT a Prometheus scrape target.".to_string(),
-                authentication: "Session cookie or Bearer JWT. NOT API key.".to_string(),
-                scopes: vec![],
-                rate_limit: "60/minute".to_string(),
-                example_request: None,
-                example_response: Some(json!({
-                    "uptime_seconds": 12345,
-                    "total_requests": 100000,
-                    "active_executions": 42
-                })),
-            },
             EndpointDoc {
                 path: "/metrics/prometheus".to_string(),
                 method: "GET".to_string(),
@@ -273,7 +240,7 @@ pub fn generate_api_documentation() -> ApiDocumentation {
                 scopes: vec![],
                 rate_limit: "60/minute".to_string(),
                 example_request: None,
-                example_response: Some(json!("# HELP talos_requests_total Total requests\n# TYPE talos_requests_total counter\ntalos_requests_total 12345")),
+                example_response: Some(json!("# HELP talos_workflow_executions_total Total workflow executions\n# TYPE talos_workflow_executions_total counter\ntalos_workflow_executions_total{status=\"success\"} 12345")),
             },
             // MCP-848 (2026-05-14): four endpoints below previously
             // documented non-existent API key scopes (`webhooks:execute`,
@@ -418,10 +385,15 @@ pub async fn api_docs_json_handler() -> Result<Json<ApiDocumentation>, AppError>
 
 /// HTML API documentation handler (simple documentation page)
 pub async fn api_docs_html_handler() -> Html<String> {
-    let is_production = talos_config::is_production();
+    Html(render_docs_html(talos_config::is_production()))
+}
 
+/// The documentation page, as a pure function of the environment so every
+/// link it renders can be tested in both variants.
+#[must_use]
+pub fn render_docs_html(is_production: bool) -> String {
     let playground_section = if is_production {
-        r##"<div class="notice warning">GraphQL Playground is disabled in production. Use the <a href="/graphql/schema">Schema Endpoint</a> to introspect the API.</div>"##.to_string()
+        r##"<div class="notice warning">GraphQL Playground and introspection are disabled in production. The schema (SDL) is checked in at <code>frontend/schema.graphql</code> in the source repository.</div>"##.to_string()
     } else {
         r##"<div class="notice info">Interactive API Explorer available at <a href="/graphql/playground">/graphql/playground</a></div>"##.to_string()
     };
@@ -434,7 +406,7 @@ pub async fn api_docs_html_handler() -> Html<String> {
 
     let version = env!("CARGO_PKG_VERSION");
 
-    let html = format!(
+    format!(
         r##"<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -487,9 +459,9 @@ pub async fn api_docs_html_handler() -> Html<String> {
                 <div class="endpoint"><span class="method get">WS</span>/graphql (WebSocket for subscriptions)</div>
                 <h3>Resources</h3>
                 <ul>
-                    <li><a href="/graphql/schema">Schema (SDL)</a></li>
+                    <li>Schema (SDL): <code>frontend/schema.graphql</code> in the source repository</li>
                     {}
-                    <li><a href="/api/docs.json">JSON Documentation</a></li>
+                    <li><a href="/docs.json">JSON Documentation</a></li>
                 </ul>
             </div>
             <div class="card">
@@ -581,9 +553,7 @@ pub async fn api_docs_html_handler() -> Html<String> {
 </body>
 </html>"##,
         version, playground_section, playground_link
-    );
-
-    Html(html)
+    )
 }
 
 /// Create router for API documentation endpoints
@@ -591,7 +561,6 @@ pub fn create_docs_router() -> Router {
     Router::new()
         .route("/docs", get(api_docs_html_handler))
         .route("/docs.json", get(api_docs_json_handler))
-        .route("/graphql/schema", get(graphql_schema_handler))
         .route("/graphql/playground", get(graphql_playground_handler))
 }
 
@@ -607,6 +576,82 @@ pub async fn docs_headers_middleware(
         header::HeaderValue::from_static("</docs>; rel=\"help\""),
     );
     response
+}
+
+/// Package BZ (2026-09-16): the documentation page linked `/graphql/schema`
+/// (a 500 since it was mounted) and `/api/docs.json` (a 404 — the route is
+/// `/docs.json`). Every link the page renders must either be served by this
+/// crate's own router or be a path the page's own JSON documentation lists.
+#[cfg(test)]
+mod docs_page_link_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    fn hrefs(html: &str) -> Vec<String> {
+        html.split("href=\"")
+            .skip(1)
+            .filter_map(|rest| rest.split('"').next())
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn every_link_on_the_docs_page_resolves() {
+        let documented: Vec<String> = generate_api_documentation()
+            .rest_endpoints
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        for is_production in [false, true] {
+            let links = hrefs(&render_docs_html(is_production));
+            assert!(!links.is_empty(), "the page renders no links at all");
+            for link in links {
+                if documented.contains(&link) {
+                    continue;
+                }
+                let status = create_docs_router()
+                    .oneshot(Request::get(&link).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .status();
+                assert!(
+                    status.is_success(),
+                    "docs page (production={is_production}) links {link}, which the docs \
+                     router answers {status} and the JSON documentation does not list"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_sdl_is_pointed_at_the_checked_in_file_not_a_route() {
+        let docs = generate_api_documentation();
+        assert_eq!(docs.graphql.schema_sdl_path, GRAPHQL_SDL_PATH);
+        assert!(
+            std::path::Path::new(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../frontend/schema.graphql"
+            ))
+            .is_file(),
+            "{GRAPHQL_SDL_PATH} is not in the repository"
+        );
+        for is_production in [false, true] {
+            assert!(!render_docs_html(is_production).contains("/graphql/schema"));
+        }
+        assert!(!documented_paths()
+            .iter()
+            .any(|p| p == "/graphql/schema" || p == "/metrics"));
+    }
+
+    fn documented_paths() -> Vec<String> {
+        generate_api_documentation()
+            .rest_endpoints
+            .into_iter()
+            .map(|e| e.path)
+            .collect()
+    }
 }
 
 #[cfg(test)]

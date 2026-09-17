@@ -549,7 +549,8 @@ password for GHCR's Basic auth path.
 
 k3s ships Traefik; point Grafana Cloud's free hosted metrics at the
 Traefik `/metrics` endpoint. Also wire the controller's
-`/metrics` (Prometheus format) and Vault's audit log output into
+`/metrics/prometheus` (Prometheus format, `Authorization: Bearer
+$PROMETHEUS_SCRAPE_TOKEN`) and Vault's audit log output into
 Grafana Loki for query.
 
 Alerts to set up day 1:

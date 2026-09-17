@@ -7674,14 +7674,14 @@ dependencies = [
 name = "talos-api-docs"
 version = "0.1.0"
 dependencies = [
- "async-graphql",
  "axum",
  "serde",
  "serde_json",
- "talos-api",
  "talos-auth-types",
  "talos-config",
  "talos-errors",
+ "tokio",
+ "tower",
 ]
 
 [[package]]
@@ -8501,12 +8501,15 @@ name = "talos-http-utils"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures-util",
  "regex",
  "reqwest",
+ "talos-metrics",
  "talos-ssrf-classify",
  "tokio",
  "tower",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

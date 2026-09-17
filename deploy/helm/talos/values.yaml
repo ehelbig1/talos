@@ -1839,7 +1839,7 @@ bootstrapSecret:
     # empty (see MCP-591 sweep); leaving these "" on a non-production
     # cluster is fine and disables the corresponding endpoint instead.
     #
-    # PROMETHEUS_SCRAPE_TOKEN — shared-secret bearer for GET /metrics.
+    # PROMETHEUS_SCRAPE_TOKEN — shared-secret bearer for GET /metrics/prometheus.
     # Production: REQUIRED. When unset/empty AND RUST_ENV=production,
     # the handler returns 403 for every scrape (controller/main.rs
     # ::prometheus_metrics_handler). Configure your ServiceMonitor /
