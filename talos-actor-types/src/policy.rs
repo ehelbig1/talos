@@ -105,6 +105,32 @@ impl TriggerCondition {
     }
 }
 
+impl TriggerCondition {
+    /// Why a policy with this trigger may not be created, or `None` when it
+    /// may. Package CC (2026-09-17): a trigger nothing evaluates is REFUSED at
+    /// creation. Until then `new_external_host`, `database_write`,
+    /// `email_send` and `new_secret_access` were accepted and stored — the
+    /// response carried `enforcement: "disabled"` and a warning — and the
+    /// policy then had no effect: an operator configuring oversight on email
+    /// sends got none. One home for the rule: a condition whose status is
+    /// [`EnforcementStatus::Disabled`] is refused, so wiring a detector (and
+    /// moving its status) re-admits the name with no second edit.
+    #[must_use]
+    pub fn creation_refusal(&self) -> Option<String> {
+        match self.phase1_enforcement_status() {
+            EnforcementStatus::Disabled => Some(format!(
+                "trigger_condition '{}' is not evaluated anywhere yet (no call site emits \
+                 its event), so a policy on it would have no effect and is refused. \
+                 Enforced today: 'first_workflow_deploy' and custom Rhai expressions \
+                 (evaluated at publish_version). For gating inside a workflow, use \
+                 create_approval_gate.",
+                self.label()
+            )),
+            EnforcementStatus::Enabled | EnforcementStatus::PublishVersionOnly => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EnforcementStatus {
@@ -212,4 +238,54 @@ pub enum PolicyVerdict {
         /// policies) before the block short-circuit.
         fired: Vec<PolicyFiredRecord>,
     },
+}
+
+#[cfg(test)]
+mod creation_refusal_tests {
+    use super::{EnforcementStatus, TriggerCondition};
+
+    /// Every built-in name, the refused four, and the two admitted shapes.
+    #[test]
+    fn exactly_the_unevaluated_triggers_are_refused() {
+        for name in [
+            "new_external_host",
+            "database_write",
+            "email_send",
+            "new_secret_access",
+        ] {
+            let t = TriggerCondition::parse(name);
+            let msg = t
+                .creation_refusal()
+                .unwrap_or_else(|| panic!("{name} must be refused"));
+            assert!(msg.contains(name), "{msg}");
+            assert!(msg.contains("first_workflow_deploy"), "{msg}");
+        }
+        assert!(TriggerCondition::parse("first_workflow_deploy")
+            .creation_refusal()
+            .is_none());
+        assert!(TriggerCondition::parse("actor_id != \"\"")
+            .creation_refusal()
+            .is_none());
+    }
+
+    /// The refusal is the enforcement status, not a second list: every
+    /// condition is refused exactly when its status is `Disabled`.
+    #[test]
+    fn refusal_follows_the_enforcement_status() {
+        for name in [
+            "first_workflow_deploy",
+            "new_external_host",
+            "database_write",
+            "email_send",
+            "new_secret_access",
+            "true",
+        ] {
+            let t = TriggerCondition::parse(name);
+            assert_eq!(
+                t.creation_refusal().is_some(),
+                t.phase1_enforcement_status() == EnforcementStatus::Disabled,
+                "{name}"
+            );
+        }
+    }
 }

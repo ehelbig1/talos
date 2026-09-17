@@ -409,9 +409,11 @@ all nine numeric columns (`talos-mcp-handlers/src/actor.rs`).
 
 Actor approval policies (`actor_approval_policies`) are evaluated only on a
 `publish_version` event today: the `first_workflow_deploy` trigger and custom
-Rhai triggers fire there; `new_external_host`, `database_write`, `email_send`
-and `new_secret_access` are stored but no code path evaluates them
-(`talos-actor-types/src/policy.rs`, `talos-actor-policies/src/evaluator.rs`).
+Rhai triggers fire there. `new_external_host`, `database_write`, `email_send`
+and `new_secret_access` have no evaluator, so a policy on them is refused at
+creation (`TriggerCondition::creation_refusal` in
+`talos-actor-types/src/policy.rs`; evaluation in
+`talos-actor-policies/src/evaluator.rs`).
 
 | Policy Mode | Behavior |
 |------------|----------|
