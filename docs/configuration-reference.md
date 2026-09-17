@@ -32,9 +32,12 @@ Workspace-wide read conventions:
   `talos_config::bool_env` / `bool_env_or_default`: `true | 1 | yes | on` and
   `false | 0 | no | off`, case-insensitive, whitespace-tolerant; empty or
   unrecognised counts as unset (with a `talos_config` WARN). Check 90 fails
-  an inline `env::var(..) == "1"`-style parser; the one exemption is the wire
+  an inline `env::var(..) == "1"`-style parser and a private boolean helper
+  (a token set or `!= Some("true")`); the one boolean exemption is the wire
   protocol crate, which carries no `talos-config` dependency and pins its
-  truthy set to this one by test.
+  truthy set to this one by test. Until 2026-09-17 (package CB)
+  `TALOS_AUDIT_S3_OBJECT_LOCK` accepted only `true` and
+  `TALOS_GRAPH_RAG_TIER1_LOCAL_OK` rejected `on`/`off`.
 - **`<VAR>_FILE` siblings.** Secrets that support the Docker-secrets pattern
   are read through `talos_config::read_env_or_file`, which prefers the
   `_FILE` path variant when set.
@@ -528,8 +531,8 @@ Where to SEE the effective window rather than infer it:
 
 | Variable | Default | Purpose | Sensitive |
 |---|---|---|---|
-| `TALOS_AUDIT_S3_OBJECT_LOCK` | none (optional) | Enable S3 Object Lock on audit objects | 🔒 (posture) |
-| `TALOS_AUDIT_S3_RETENTION_DAYS` | none (optional) | S3 retention period | |
+| `TALOS_AUDIT_S3_OBJECT_LOCK` | unset (off) | Boolean. Enable S3 Object Lock (Compliance mode) on audit objects; the bucket must have Object Lock enabled at creation. Any true spelling enables it — before 2026-09-17 only the literal `true` did, and `1`/`yes`/`on` left it silently off. The boot line states enabled or disabled. | 🔒 (posture) |
+| `TALOS_AUDIT_S3_RETENTION_DAYS` | `2555` (7 years) | Object Lock retention in days, [1, 36500]; an unparseable or out-of-range value uses the default and logs `audit_object_lock_retention_substituted` | |
 | `AWS_ENDPOINT_URL` | none (optional) | Custom S3 endpoint | |
 | `MINIO_ENDPOINT` | none (optional) | MinIO endpoint | |
 | `MINIO_BUCKET` | `audit-logs` | Audit bucket name | |

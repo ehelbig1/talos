@@ -307,16 +307,7 @@ pub(crate) async fn build_core_services(
             // audited opt-in, not a silent default.
             // prod-kek-guard
             if crate::config::is_production() {
-                let allow_env_kek = std::env::var("TALOS_ALLOW_ENV_KEK")
-                    .ok()
-                    .map(|v| {
-                        let v = v.trim();
-                        v.eq_ignore_ascii_case("true")
-                            || v == "1"
-                            || v.eq_ignore_ascii_case("yes")
-                            || v.eq_ignore_ascii_case("on")
-                    })
-                    .unwrap_or(false);
+                let allow_env_kek = talos_config::bool_env_or_default("TALOS_ALLOW_ENV_KEK", false);
                 if !allow_env_kek {
                     return Err(anyhow::anyhow!(
                         "KEK_PROVIDER=env keeps the master key (TALOS_MASTER_KEY) in a Secret + \
@@ -1380,30 +1371,12 @@ pub(crate) async fn init_graph_rag(
                 // LOCAL backend only (never Anthropic; see
                 // `with_tier1_local_extraction` for the full security
                 // semantics). Empty-env hardening: unset/"" → off;
-                // explicit truthy ("1"/"true"/"yes") → on; anything else
-                // → off with a WARN (a typo like "on" must not silently
-                // disable a knob the operator believes is enabled —
-                // sibling of the MCP-590 empty-env class).
-                let tier1_local_raw = std::env::var("TALOS_GRAPH_RAG_TIER1_LOCAL_OK")
-                    .ok()
-                    .filter(|v| !v.is_empty());
-                let tier1_local_ok = match tier1_local_raw.as_deref() {
-                    Some(v) if matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes") => {
-                        true
-                    }
-                    Some(v) if matches!(v.to_ascii_lowercase().as_str(), "0" | "false" | "no") => {
-                        false
-                    }
-                    Some(v) => {
-                        tracing::warn!(
-                            value = %v,
-                            "TALOS_GRAPH_RAG_TIER1_LOCAL_OK set to an unrecognized value — \
-                             treating as OFF. Use 1/true/yes to enable."
-                        );
-                        false
-                    }
-                    None => false,
-                };
+                // explicit truthy → on; anything unrecognised → off with a
+                // WARN. Parsed by the shared vocabulary (package CB): until
+                // then `on`/`off` were themselves a WARN plus OFF here while
+                // every other boolean accepted them.
+                let tier1_local_ok =
+                    talos_config::bool_env_or_default("TALOS_GRAPH_RAG_TIER1_LOCAL_OK", false);
                 if tier1_local_ok {
                     if ollama_wired {
                         service = service.with_tier1_local_extraction(true);

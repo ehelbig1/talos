@@ -271,6 +271,8 @@ impl SigstorePolicy {
     /// startup warning.
     #[must_use]
     pub fn from_env_str(raw: &str) -> Self {
+        // allow-inline-env-bool: a three-valued policy (package AR), not a boolean;
+        // `yes`/`on` are deliberately not Sigstore spellings.
         match raw.trim().to_ascii_lowercase().as_str() {
             "true" | "1" | "required" => Self::Required,
             "audit" | "warn" => Self::Audit,

@@ -225,7 +225,7 @@ pub async fn encrypt_otlp_auth_headers(
 /// tamper-evident audit storage. Use `Governance` only if regulatory
 /// allowance for an early-removal escape hatch is acceptable — Talos
 /// does not currently expose that knob.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ObjectLockConfig {
     /// Days of retention from the moment of upload. Bounded to
     /// [1, 36500] (100 years) at parse time to prevent operator typos
@@ -233,98 +233,153 @@ struct ObjectLockConfig {
     retention_days: i64,
 }
 
-/// Pure parser exposed for unit testing. The env-driven entry point
-/// `load_object_lock_config` reads `TALOS_AUDIT_S3_OBJECT_LOCK` and
-/// `TALOS_AUDIT_S3_RETENTION_DAYS` and delegates here so the validation
-/// logic (kill-switch flag, days bounded to [1, 36500], default 7 years)
-/// can be tested without env mutation.
+/// Why a configured retention value was not used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetentionSubstitution {
+    Unparseable,
+    OutOfRange,
+}
+
+const DEFAULT_OBJECT_LOCK_RETENTION_DAYS: i64 = 2555; // 7 years — SOX / HIPAA / SOC2 norms.
+
+/// Pure parser exposed for unit testing. `enabled` is the flag as the shared
+/// boolean vocabulary read it (`talos_config::bool_env`); the retention value
+/// is bounded to [1, 36500] and falls back to the 7-year default, reporting
+/// why so the loader can say so.
+///
+/// Package CB (2026-09-17): the flag used to be compared against the literal
+/// `"true"` here, so `TALOS_AUDIT_S3_OBJECT_LOCK=1` / `yes` / `on` / `TRUE`
+/// left Object Lock OFF with no log line — a WORM control failing open in
+/// silence, the one boolean in the workspace with its own vocabulary. The old
+/// test called `1` "a common operator typo"; an operator who writes `1` means
+/// on, as every other flag since package AN reads it, and the chart only ever
+/// renders `true`.
 fn parse_object_lock_config(
-    enabled_var: Option<&str>,
+    enabled: Option<bool>,
     retention_var: Option<&str>,
-) -> Option<ObjectLockConfig> {
-    if enabled_var != Some("true") {
-        return None;
+) -> (Option<ObjectLockConfig>, Option<RetentionSubstitution>) {
+    if enabled != Some(true) {
+        return (None, None);
     }
-    let retention_days = retention_var
-        .and_then(|v| v.parse::<i64>().ok())
-        .filter(|&d| (1..=36500).contains(&d))
-        .unwrap_or(2555); // 7 years default — tracks SOX / HIPAA / SOC2 norms.
-    Some(ObjectLockConfig { retention_days })
+    let (retention_days, substitution) = match retention_var.map(str::trim) {
+        None | Some("") => (DEFAULT_OBJECT_LOCK_RETENTION_DAYS, None),
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(d) if (1..=36500).contains(&d) => (d, None),
+            Ok(_) => (
+                DEFAULT_OBJECT_LOCK_RETENTION_DAYS,
+                Some(RetentionSubstitution::OutOfRange),
+            ),
+            Err(_) => (
+                DEFAULT_OBJECT_LOCK_RETENTION_DAYS,
+                Some(RetentionSubstitution::Unparseable),
+            ),
+        },
+    };
+    (Some(ObjectLockConfig { retention_days }), substitution)
 }
 
 fn load_object_lock_config() -> Option<ObjectLockConfig> {
-    let enabled = std::env::var("TALOS_AUDIT_S3_OBJECT_LOCK").ok();
+    let enabled = talos_config::bool_env("TALOS_AUDIT_S3_OBJECT_LOCK");
     let retention = std::env::var("TALOS_AUDIT_S3_RETENTION_DAYS").ok();
-    let cfg = parse_object_lock_config(enabled.as_deref(), retention.as_deref());
-    if let Some(c) = &cfg {
-        tracing::info!(
+    let (cfg, substitution) = parse_object_lock_config(enabled, retention.as_deref());
+    if let Some(reason) = substitution {
+        tracing::warn!(
+            target: "talos_audit",
+            event_kind = "audit_object_lock_retention_substituted",
+            configured = retention.as_deref().unwrap_or_default(),
+            reason = ?reason,
+            retention_days = DEFAULT_OBJECT_LOCK_RETENTION_DAYS,
+            "TALOS_AUDIT_S3_RETENTION_DAYS is not a whole number of days in [1, 36500]; \
+             Object Lock uses the 7-year default"
+        );
+    }
+    match &cfg {
+        Some(c) => tracing::info!(
             retention_days = c.retention_days,
             mode = "Compliance",
             "Audit S3 Object Lock ENABLED — bucket must have Object Lock enabled at creation"
-        );
+        ),
+        None => tracing::info!(
+            "Audit S3 Object Lock disabled (TALOS_AUDIT_S3_OBJECT_LOCK not set to a true value)"
+        ),
     }
     cfg
 }
 
 #[cfg(test)]
 mod object_lock_parse_tests {
-    use super::parse_object_lock_config;
+    use super::{parse_object_lock_config, RetentionSubstitution};
 
-    #[test]
-    fn disabled_when_env_missing() {
-        assert!(parse_object_lock_config(None, None).is_none());
+    fn days(enabled: Option<bool>, retention: Option<&str>) -> Option<i64> {
+        parse_object_lock_config(enabled, retention)
+            .0
+            .map(|c| c.retention_days)
     }
 
     #[test]
-    fn disabled_when_env_not_true() {
-        assert!(parse_object_lock_config(Some("false"), None).is_none());
-        assert!(parse_object_lock_config(Some(""), None).is_none());
-        assert!(
-            parse_object_lock_config(Some("1"), None).is_none(),
-            "must require literal 'true' — '1' is a common operator typo"
+    fn disabled_unless_the_flag_reads_true() {
+        assert_eq!(parse_object_lock_config(None, None), (None, None));
+        assert_eq!(
+            parse_object_lock_config(Some(false), Some("365")),
+            (None, None)
         );
     }
 
     #[test]
     fn defaults_to_seven_years_when_enabled_no_retention() {
-        let cfg = parse_object_lock_config(Some("true"), None).expect("enabled");
-        assert_eq!(cfg.retention_days, 2555);
+        assert_eq!(days(Some(true), None), Some(2555));
+        assert_eq!(parse_object_lock_config(Some(true), Some("  ")).1, None);
     }
 
     #[test]
     fn honors_explicit_retention_within_bounds() {
-        let cfg = parse_object_lock_config(Some("true"), Some("365")).expect("enabled");
-        assert_eq!(cfg.retention_days, 365);
+        assert_eq!(parse_object_lock_config(Some(true), Some("365")).1, None);
+        assert_eq!(days(Some(true), Some("365")), Some(365));
+        assert_eq!(days(Some(true), Some("1")), Some(1));
+        assert_eq!(days(Some(true), Some("36500")), Some(36500));
     }
 
     #[test]
-    fn rejects_zero_retention() {
-        let cfg = parse_object_lock_config(Some("true"), Some("0")).expect("enabled");
+    fn out_of_range_retention_is_substituted_and_reported() {
+        for bad in ["0", "-1", "36501"] {
+            assert_eq!(
+                parse_object_lock_config(Some(true), Some(bad)).1,
+                Some(RetentionSubstitution::OutOfRange),
+                "{bad}"
+            );
+            assert_eq!(days(Some(true), Some(bad)), Some(2555), "{bad}");
+        }
+    }
+
+    #[test]
+    fn unparseable_retention_is_substituted_and_reported() {
         assert_eq!(
-            cfg.retention_days, 2555,
-            "0 is invalid — must fall back to default rather than create a no-retention lock"
+            parse_object_lock_config(Some(true), Some("seven_years")).1,
+            Some(RetentionSubstitution::Unparseable)
         );
+        assert_eq!(days(Some(true), Some("seven_years")), Some(2555));
     }
 
+    /// Package CB: the loader reads the flag through the shared vocabulary,
+    /// so every spelling it accepts enables Object Lock. Serialised by the
+    /// variable name being private to this test.
     #[test]
-    fn rejects_negative_retention() {
-        let cfg = parse_object_lock_config(Some("true"), Some("-1")).expect("enabled");
-        assert_eq!(cfg.retention_days, 2555);
-    }
-
-    #[test]
-    fn rejects_excessive_retention_above_100_years() {
-        let cfg = parse_object_lock_config(Some("true"), Some("36501")).expect("enabled");
-        assert_eq!(
-            cfg.retention_days, 2555,
-            "operator typos like 36500*10 should not produce effectively-permanent locks"
-        );
-    }
-
-    #[test]
-    fn rejects_unparseable_retention() {
-        let cfg = parse_object_lock_config(Some("true"), Some("seven_years")).expect("enabled");
-        assert_eq!(cfg.retention_days, 2555);
+    fn every_shared_true_spelling_enables_object_lock() {
+        for on in ["true", "TRUE", "1", "yes", "on"] {
+            std::env::set_var("TALOS_AUDIT_S3_OBJECT_LOCK", on);
+            assert!(
+                super::load_object_lock_config().is_some(),
+                "{on} must enable it"
+            );
+        }
+        for off in ["false", "0", "no", "off", "", "ture"] {
+            std::env::set_var("TALOS_AUDIT_S3_OBJECT_LOCK", off);
+            assert!(
+                super::load_object_lock_config().is_none(),
+                "{off:?} must leave it off"
+            );
+        }
+        std::env::remove_var("TALOS_AUDIT_S3_OBJECT_LOCK");
     }
 }
 

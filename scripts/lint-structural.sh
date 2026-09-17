@@ -9154,10 +9154,29 @@ bold "▶ check 90: a boolean env var must be parsed by the ONE shared vocabular
 # `// allow-inline-env-bool: <reason>` within 8 lines above — the one holder is
 # talos-workflow-job-protocol, which carries no talos-config dependency by
 # design and pins its truthy set to the shared one by unit test.
+# Package CB (2026-09-17): two legs added. (a) now reads through a closure body
+# over the value (`.map(|v| { let v = …; matches!(…) })`) — stopping at its `{`
+# hid three controller parsers — while a fallback closure (`|_| {`) still ends
+# the chain. (b) catches the HELPER shape the env read cannot reveal: an
+# alternation of two boolean tokens, a chain of comparisons naming two within
+# six lines, or `== / != Some("true"|"1")` — `TALOS_AUDIT_S3_OBJECT_LOCK`
+# accepted only the literal `true` that way. On main: 24 lines at 11 sites, 8
+# real env parsers and 3 legitimate non-booleans (the host-fallback ack token,
+# the three-valued Sigstore policy, a workflow condition expression), which now
+# carry the opt-out. `--self-test` fixtures run first.
 if [ ! -f "$ROOT/scripts/lint-inline-env-bool.py" ]; then
     red "✗ scripts/lint-inline-env-bool.py is missing — the check cannot run"
     EXIT_CODE=1
 else
+    # The fixtures run unconditionally (package CB): a detector edit that stops
+    # seeing a closure-body parser or starts firing on a fallback closure fails
+    # here even on a tree with no parser left to find.
+    CK90_SELF="$(python3 "$ROOT/scripts/lint-inline-env-bool.py" --self-test 2>&1)"
+    if [ $? -ne 0 ]; then
+        echo "$CK90_SELF" | sed 's/^/  /'
+        red "✗ check 90's own fixtures fail — the detector is not measuring what it claims"
+        EXIT_CODE=1
+    fi
     CK90_OUT="$(python3 "$ROOT/scripts/lint-inline-env-bool.py" "$ROOT" 2>&1)"
     CK90_RC=$?
     if [ "$CK90_RC" -eq 0 ]; then

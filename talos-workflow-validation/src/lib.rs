@@ -2342,6 +2342,7 @@ pub(crate) fn is_trivially_true_condition(raw: &str) -> bool {
         s = s[1..s.len() - 1].trim();
     }
     let lower = s.to_ascii_lowercase();
+    // allow-inline-env-bool: a workflow condition expression, not an env var.
     matches!(lower.as_str(), "true" | "1" | "!false")
 }
 

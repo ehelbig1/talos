@@ -49,20 +49,11 @@ const LAST_USED_MARKER: &str = ".last_used";
 /// every compile.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
 
-/// Pure parse of the enable flag: `None` (unset) and anything not in the
-/// explicit off-list is ON. Mirrors the repo's opt-OUT flag convention.
-fn parse_enabled(value: Option<&str>) -> bool {
-    match value {
-        Some(v) => {
-            let v = v.trim().to_ascii_lowercase();
-            !matches!(v.as_str(), "0" | "false" | "no" | "off")
-        }
-        None => true,
-    }
-}
-
+/// On unless explicitly off, through the shared vocabulary
+/// (`talos_config::bool_env`; an unrecognised value WARNs and keeps the
+/// default). Package CB: this was a private off-list.
 fn cache_enabled() -> bool {
-    parse_enabled(std::env::var("TALOS_COMPILE_TARGET_CACHE").ok().as_deref())
+    talos_config::bool_env_or_default("TALOS_COMPILE_TARGET_CACHE", true)
 }
 
 fn cache_root() -> PathBuf {
@@ -175,17 +166,6 @@ fn sweep_stale(root: &Path, ttl: Duration, now: SystemTime) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn enabled_by_default_and_off_list_disables() {
-        assert!(parse_enabled(None));
-        assert!(parse_enabled(Some("1")));
-        assert!(parse_enabled(Some("true")));
-        assert!(parse_enabled(Some("anything-else")));
-        for off in ["0", "false", "no", "off", " OFF ", "False"] {
-            assert!(!parse_enabled(Some(off)), "{off:?} should disable");
-        }
-    }
 
     #[test]
     fn user_dir_is_uuid_keyed_under_root() {
