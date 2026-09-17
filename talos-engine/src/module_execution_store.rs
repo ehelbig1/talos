@@ -263,16 +263,16 @@ impl ModuleExecutionStore for PostgresModuleExecutionStore {
         //
         // MCP-S2: AAD = the same module_execution_id used in
         // record_started, so the v1 ciphertext stays decryptable.
-        let bundle = talos_module_payload_encryption::encrypt_payload_bundle(
+        //
+        // Package CJ (2026-09-17): the output is sealed under the key and
+        // format the row ALREADY names, never a freshly chosen one. The
+        // UPDATE below keeps the row's key, so a fresh choice that differed
+        // (org lookup answered differently, or rotateOrgDek ran mid-module)
+        // left a row naming one key over an output sealed under another.
+        let bundle = talos_module_payload_encryption::encrypt_output_for_row(
             self.secrets_manager.as_ref(),
             id,
-            // record_completed: workflow_execution_id isn't in scope; pass None so
-            // encrypt_payload_bundle resolves the SAME org from the existing row
-            // (keeps the shared payload_enc_key_id consistent with record_started).
-            None,
-            None,
             Some(output),
-            None,
         )
         .await
         .map_err(|e| -> BoxError { e.into() })?;

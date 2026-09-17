@@ -522,7 +522,8 @@ impl SecurityMutations {
     /// Per-org DEK arc: move existing module-execution payloads onto their
     /// workflow's org's ACTIVE root DEK (format v4), including payloads under a
     /// retired org DEK. Last of the per-org sweeps; org-less / standalone
-    /// payloads stay on the global DEK.
+    /// payloads stay on the global DEK. Rows of modules still running are
+    /// skipped and counted as pending until they finish.
     async fn re_encrypt_module_payloads_to_org(
         &self,
         ctx: &Context<'_>,
