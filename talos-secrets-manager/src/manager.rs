@@ -2209,18 +2209,7 @@ impl SecretsManager {
             ));
         }
         let dek = self.get_active_dek().await?;
-        let subkey = Self::derive_per_context_subkey(&dek.key, aad)?;
-        let cipher = Aes256Gcm::new_from_slice(subkey.as_slice())?;
-        let nonce_bytes = Self::generate_nonce();
-        let payload = aes_gcm::aead::Payload {
-            msg: value.as_bytes(),
-            aad,
-        };
-        let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce_bytes), payload)
-            .map_err(|e| anyhow!("Encryption failed: {}", e))?;
-        let mut stored = nonce_bytes.to_vec();
-        stored.extend_from_slice(&ciphertext);
+        let stored = Self::seal_derived(&dek.key, value, aad)?;
         Ok((dek.id, stored, Self::AAD_FORMAT_V3_DERIVED))
     }
 
@@ -2245,18 +2234,7 @@ impl SecretsManager {
             ));
         }
         let dek = self.get_or_create_dek_for_org(org_id).await?;
-        let subkey = Self::derive_per_context_subkey(&dek.key, aad)?;
-        let cipher = Aes256Gcm::new_from_slice(subkey.as_slice())?;
-        let nonce_bytes = Self::generate_nonce();
-        let payload = aes_gcm::aead::Payload {
-            msg: value.as_bytes(),
-            aad,
-        };
-        let ciphertext = cipher
-            .encrypt(Nonce::from_slice(&nonce_bytes), payload)
-            .map_err(|e| anyhow!("Encryption failed: {}", e))?;
-        let mut stored = nonce_bytes.to_vec();
-        stored.extend_from_slice(&ciphertext);
+        let stored = Self::seal_derived(&dek.key, value, aad)?;
         Ok((dek.id, stored, Self::AAD_FORMAT_V4_ORG_DERIVED))
     }
 
@@ -2315,6 +2293,64 @@ impl SecretsManager {
             Some(org_id) => self.encrypt_value_aad_v4_org(value, org_id, aad).await,
             None => self.encrypt_value_aad_v3(value, aad).await,
         }
+    }
+
+    /// Encrypt under the DEK a row ALREADY names, in the derived format the
+    /// row already records (v3 or v4), instead of choosing a key for this
+    /// write. For a row whose payload is sealed in more than one write — a
+    /// `module_executions` row seals its input when the module starts and its
+    /// output when it completes, and both slots share ONE
+    /// `payload_enc_key_id` / `payload_format` — the second write must use the
+    /// first write's key: choosing afresh can pick a different DEK (the org
+    /// lookup answered differently, or the org DEK was rotated in between),
+    /// and the row would then name a key the new slot was not sealed under.
+    ///
+    /// The key may be a retired DEK after a rotation; sealing under it keeps
+    /// the row self-consistent, and the per-org sweep re-keys the whole row
+    /// afterwards. Refuses an empty AAD and any non-derived format (v0–v2 seal
+    /// under the DEK itself with a different AAD rule; no steady-state writer
+    /// produces them).
+    pub async fn encrypt_value_aad_under_row_key(
+        &self,
+        value: &str,
+        key_id: Uuid,
+        format_version: i16,
+        aad: &[u8],
+    ) -> Result<Vec<u8>> {
+        if aad.is_empty() {
+            return Err(anyhow!(
+                "derived encryption requires a non-empty AAD context"
+            ));
+        }
+        if !matches!(
+            crate::SecretFormat::from_version(format_version)?.decrypt_route(),
+            crate::DecryptRoute::DerivedAad
+        ) {
+            return Err(anyhow!(
+                "cannot seal under a row's key in non-derived format v{format_version}"
+            ));
+        }
+        let dek = self.get_dek(key_id).await?;
+        Self::seal_derived(&dek.key, value, aad)
+    }
+
+    /// AES-256-GCM under the per-context HKDF subkey of `dek_key`: the one
+    /// sealing routine the v3, v4 and row-key encrypts share, so the three
+    /// cannot drift from `decrypt_value_derived_with_aad`.
+    fn seal_derived(dek_key: &[u8], value: &str, aad: &[u8]) -> Result<Vec<u8>> {
+        let subkey = Self::derive_per_context_subkey(dek_key, aad)?;
+        let cipher = Aes256Gcm::new_from_slice(subkey.as_slice())?;
+        let nonce_bytes = Self::generate_nonce();
+        let payload = aes_gcm::aead::Payload {
+            msg: value.as_bytes(),
+            aad,
+        };
+        let ciphertext = cipher
+            .encrypt(Nonce::from_slice(&nonce_bytes), payload)
+            .map_err(|e| anyhow!("Encryption failed: {}", e))?;
+        let mut stored = nonce_bytes.to_vec();
+        stored.extend_from_slice(&ciphertext);
+        Ok(stored)
     }
 
     /// Resolve the org that owns a `workflow_executions` row — the WORKFLOW's

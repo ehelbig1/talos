@@ -156,39 +156,24 @@ pub async fn decrypt_payload_slot(
         .with_context(|| format!("payload_encryption: decrypt {slot:?}"))
 }
 
-/// Encrypt a payload bundle through the configured SecretsManager.
-/// Returns an empty bundle (no-op) when `secrets_manager` is `None` so
-/// callers can write plaintext columns unchanged. Returns an empty bundle
-/// when all three plaintexts are `None` (nothing to encrypt).
-///
-/// MCP-S2: `module_execution_id` is bound as AAD so an attacker with DB write
-/// capability cannot swap (input|output|trigger)_enc between two
-/// `module_executions` rows that share an `encryption_key_id`.
-///
-/// 2026-05-28 review (low): v2 additionally folds a per-slot tag into the AAD
-/// (see [`payload_slot_aad`]). Pre-fix all three slots authenticated under the
-/// identical row-id AAD + the same DEK, so a DB-write attacker could swap
-/// input_enc ↔ output_enc *within one row* and both still verified — execution
-/// input would surface as its output in dashboards/audit/replay. v2 binds each
-/// ciphertext to its column so a within-row swap now fails tag verification.
-/// Existing v1 rows stay readable (readers dispatch on the per-row
-/// `payload_format`).
 /// Resolve the org a module-execution's payloads encrypt under — the execution's
 /// TENANT org = the workflow's org (matching workflow-output crypto, #326). Prefer
 /// the caller-supplied `workflow_execution_id` (available at record_started);
-/// otherwise fall back to the existing `module_executions` row (record_completed,
-/// where the row exists but the parent id isn't in scope). `None` (standalone /
-/// webhook / org-less) → the global DEK. Because both the started and completed
-/// writes of one row resolve the SAME org, the shared `payload_enc_key_id` stays
-/// consistent across slots. Best-effort: a DB error degrades to None (global)
-/// rather than failing the encrypt.
+/// otherwise read it through the existing `module_executions` row. `Ok(None)`
+/// (standalone / webhook / org-less, or no such row yet) → the global DEK.
+///
+/// A read that FAILS is an error, not `None`: until package CJ (2026-09-17) this
+/// ended `row.ok().flatten().flatten()`, so a pool timeout sealed a tenant's
+/// payload under the GLOBAL DEK with nothing said — the org-scoped-data-on-the-
+/// global-key class package C closed for the other writers. The encrypt now
+/// fails and the caller's existing encrypt-error handling applies.
 async fn resolve_workflow_org(
     sm: &talos_secrets_manager::SecretsManager,
     workflow_execution_id: Option<Uuid>,
     module_execution_id: Uuid,
-) -> Option<Uuid> {
+) -> Result<Option<Uuid>> {
     let pool = sm.db_pool();
-    let row: std::result::Result<Option<Option<Uuid>>, sqlx::Error> = match workflow_execution_id {
+    let row: Option<Option<Uuid>> = match workflow_execution_id {
         Some(wei) => {
             sqlx::query_scalar(
                 "SELECT w.org_id FROM workflow_executions we \
@@ -208,10 +193,28 @@ async fn resolve_workflow_org(
             .fetch_optional(pool)
             .await
         }
-    };
-    row.ok().flatten().flatten()
+    }
+    .context("payload_encryption: resolve the execution's org")?;
+    Ok(row.flatten())
 }
 
+/// Encrypt a payload bundle through the configured SecretsManager.
+/// Returns an empty bundle (no-op) when `secrets_manager` is `None` so
+/// callers can write plaintext columns unchanged. Returns an empty bundle
+/// when all three plaintexts are `None` (nothing to encrypt).
+///
+/// MCP-S2: `module_execution_id` is bound as AAD so an attacker with DB write
+/// capability cannot swap (input|output|trigger)_enc between two
+/// `module_executions` rows that share an `encryption_key_id`.
+///
+/// 2026-05-28 review (low): v2 additionally folds a per-slot tag into the AAD
+/// (see [`payload_slot_aad`]). Pre-fix all three slots authenticated under the
+/// identical row-id AAD + the same DEK, so a DB-write attacker could swap
+/// input_enc ↔ output_enc *within one row* and both still verified — execution
+/// input would surface as its output in dashboards/audit/replay. v2 binds each
+/// ciphertext to its column so a within-row swap now fails tag verification.
+/// Existing v1 rows stay readable (readers dispatch on the per-row
+/// `payload_format`).
 pub async fn encrypt_payload_bundle(
     secrets_manager: Option<&Arc<talos_secrets_manager::SecretsManager>>,
     module_execution_id: Uuid,
@@ -234,7 +237,21 @@ pub async fn encrypt_payload_bundle(
     // for any format >= V2) and the per-context-derived key — v4 only differs in
     // using the org's root DEK as IKM. Readers dispatch on the per-row
     // `payload_format`, so existing v0/v1/v2/v3 rows stay readable.
-    let org_id = resolve_workflow_org(sm, workflow_execution_id, module_execution_id).await;
+    let org_id = match resolve_workflow_org(sm, workflow_execution_id, module_execution_id).await {
+        Ok(org) => org,
+        Err(e) => {
+            for (slot, value) in [
+                (PayloadSlot::Input, input),
+                (PayloadSlot::Output, output),
+                (PayloadSlot::Trigger, trigger),
+            ] {
+                if value.is_some() {
+                    inc_payload_crypto_failure("encrypt", slot.metric_stage());
+                }
+            }
+            return Err(e);
+        }
+    };
     let format_version = if org_id.is_some() {
         talos_secrets_manager::SecretsManager::AAD_FORMAT_V4_ORG_DERIVED
     } else {
@@ -285,6 +302,60 @@ pub async fn encrypt_payload_bundle(
         }
     }
     Ok(bundle)
+}
+
+/// Encrypt a module's OUTPUT for a row that may already hold sealed input or
+/// trigger slots — the completion-time write.
+///
+/// All three slots of a `module_executions` row share ONE `payload_enc_key_id`
+/// and ONE `payload_format`, and the completion UPDATE keeps the row's key
+/// (`COALESCE(payload_enc_key_id, $key)`). So the output must be sealed under the
+/// key and format the row ALREADY names. Choosing afresh — what the completion
+/// writers did until package CJ (2026-09-17) — splits the row whenever the second
+/// choice differs from the first: the org lookup answered differently at start
+/// and completion, or `rotateOrgDek` ran while the module was running. The row
+/// then names one key while the output was sealed under another, and the output
+/// cannot be decrypted. Measured on the reference deployment: 2 of 61 584 rows
+/// (`payload_format = 4` beside a global `payload_enc_key_id`).
+///
+/// Row with a key → sealed under that key in the row's format. Row with no key
+/// (input was stored unencrypted) or no row → a fresh bundle, exactly as before.
+/// No SecretsManager or no output → an empty bundle, touching nothing.
+pub async fn encrypt_output_for_row(
+    secrets_manager: Option<&Arc<talos_secrets_manager::SecretsManager>>,
+    module_execution_id: Uuid,
+    output: Option<&JsonValue>,
+) -> Result<EncryptedPayloadBundle> {
+    let (Some(sm), Some(out)) = (secrets_manager, output) else {
+        return Ok(EncryptedPayloadBundle::default());
+    };
+    let row: Option<(Option<Uuid>, i16)> = sqlx::query_as(
+        "SELECT payload_enc_key_id, payload_format FROM module_executions WHERE id = $1",
+    )
+    .bind(module_execution_id)
+    .fetch_optional(sm.db_pool())
+    .await
+    .inspect_err(|_| inc_payload_crypto_failure("encrypt", PayloadSlot::Output.metric_stage()))
+    .context("payload_encryption: read the row's payload key")?;
+    let Some((Some(key_id), format_version)) = row else {
+        return encrypt_payload_bundle(Some(sm), module_execution_id, None, None, Some(out), None)
+            .await;
+    };
+    let plain = serde_json::to_string(out)
+        .inspect_err(|_| inc_payload_crypto_failure("encrypt", PayloadSlot::Output.metric_stage()))
+        .context("payload_encryption: serialize Output")?;
+    let aad = payload_slot_aad(module_execution_id, PayloadSlot::Output, format_version);
+    let output_enc = sm
+        .encrypt_value_aad_under_row_key(&plain, key_id, format_version, &aad)
+        .await
+        .inspect_err(|_| inc_payload_crypto_failure("encrypt", PayloadSlot::Output.metric_stage()))
+        .context("payload_encryption: encrypt Output under the row's key")?;
+    Ok(EncryptedPayloadBundle {
+        key_id: Some(key_id),
+        output_enc: Some(output_enc),
+        format_version,
+        ..Default::default()
+    })
 }
 
 #[cfg(test)]
@@ -489,6 +560,44 @@ mod stub_sm_tests {
             .expect("nothing-to-encrypt path must not hit the DB");
         assert!(!bundle.encrypting());
         assert_eq!(bundle.format_version, 0);
+    }
+
+    /// Package CJ: the completion-time encrypt is a no-op — no row read — when
+    /// there is nothing to seal or nothing to seal it with.
+    #[tokio::test]
+    async fn output_for_row_without_output_or_manager_touches_nothing() {
+        let sm = stub_sm();
+        let empty = encrypt_output_for_row(Some(&sm), Uuid::new_v4(), None)
+            .await
+            .expect("no output must not read the row");
+        assert!(!empty.encrypting());
+        let unwired = encrypt_output_for_row(None, Uuid::new_v4(), Some(&json!({"o": 1})))
+            .await
+            .expect("no SecretsManager must not read the row");
+        assert!(!unwired.encrypting());
+    }
+
+    /// Package CJ: sealing under a row's key refuses what it cannot seal
+    /// consistently — an empty AAD, and a non-derived format — before any key
+    /// lookup, each with its own reason.
+    #[tokio::test]
+    async fn sealing_under_a_row_key_refuses_empty_aad_and_non_derived_formats() {
+        let sm = stub_sm();
+        let v4 = talos_secrets_manager::SecretsManager::AAD_FORMAT_V4_ORG_DERIVED;
+        let v2 = talos_secrets_manager::SecretsManager::AAD_FORMAT_V2;
+        let empty = sm
+            .encrypt_value_aad_under_row_key("x", Uuid::new_v4(), v4, &[])
+            .await
+            .expect_err("empty AAD");
+        assert!(empty.to_string().contains("non-empty AAD"), "{empty}");
+        let legacy = sm
+            .encrypt_value_aad_under_row_key("x", Uuid::new_v4(), v2, b"ctx")
+            .await
+            .expect_err("non-derived format");
+        assert!(
+            legacy.to_string().contains("non-derived format"),
+            "{legacy}"
+        );
     }
 
     /// Unknown format versions fail CLOSED at the decrypt dispatcher —

@@ -397,6 +397,13 @@ impl ModuleExecutionService {
     /// re-encrypt rewrites them together. Standalone / org-less rows are not
     /// selected (no org). Lost-write guard: the UPDATE only fires while the row
     /// is still on the (key, format) we read. No-op without a SecretsManager.
+    ///
+    /// In-flight rows (`pending` / `running`) are NOT selected (package CJ): the
+    /// completion write seals the output under the key it reads from the row,
+    /// and a re-key landing between that read and its UPDATE would leave the
+    /// output under the old key beside a row naming the new one. Such a row is
+    /// still counted as pending by `dek_migration_status` and is re-keyed by the
+    /// next sweep once it finishes.
     pub async fn re_encrypt_module_payloads_to_org(&self) -> Result<ModulePayloadReEncryptStats> {
         use sqlx::Row;
         use talos_module_payload_encryption::PayloadSlot;
@@ -410,6 +417,7 @@ impl ModuleExecutionService {
              JOIN workflow_executions we ON we.id = me.workflow_execution_id \
              JOIN workflows w ON w.id = we.workflow_id \
              WHERE w.org_id IS NOT NULL \
+               AND me.status NOT IN ('pending', 'running') \
                AND talos_org_dek_pending(me.payload_enc_key_id, w.org_id) \
                AND (me.input_data_enc IS NOT NULL OR me.output_data_enc IS NOT NULL \
                     OR me.trigger_metadata_enc IS NOT NULL)",
@@ -726,13 +734,20 @@ impl ModuleExecutionService {
         // ciphertext under the same key.
         //
         // MCP-S2: AAD = execution_id, matching the row that
-        // create_execution populated. Per-org DEK arc: pass
-        // workflow_execution_id = None so encrypt_payload_bundle resolves the
-        // SAME org from the existing row (create_execution already created it),
-        // keeping the shared payload_enc_key_id consistent.
-        let (key_id, _input_enc, output_enc, _trigger_enc, payload_format) = self
-            .encrypt_payload_bundle(execution_id, None, None, output_data.as_ref(), None)
-            .await?;
+        // create_execution populated. Package CJ (2026-09-17): sealed under
+        // the key and format the row ALREADY names (see
+        // `encrypt_output_for_row`) — resolving the org afresh here could pick
+        // a different DEK than create_execution did, and the COALESCE below
+        // would keep the old key over an output sealed under the new one.
+        let bundle = talos_module_payload_encryption::encrypt_output_for_row(
+            self.secrets_manager.as_ref(),
+            execution_id,
+            output_data.as_ref(),
+        )
+        .await?;
+        let key_id = bundle.key_id;
+        let output_enc = bundle.output_enc;
+        let payload_format = bundle.format_version;
         let encrypting = key_id.is_some();
 
         // MCP-S2: use dynamic `sqlx::query` (not `query!` macro) since
