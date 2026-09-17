@@ -376,6 +376,22 @@ fi
 # returns Err AND leaves the key untouched. Named here, not merely gated on
 # TALOS_TEST_REDIS_URL, so it is real coverage rather than a green skip (the
 # workspace `--lib` run in quality.yml has no Redis and skips it).
+# ── 2FA lockout is SHARED across controller instances  [redis] ─────────────
+# The recorded finding "the 2FA lockout counter is per-process memory" is
+# refuted for production — the limiter is Redis-backed and production fails
+# closed without it — but nothing drove that path: the cross-instance lockout,
+# the shared counter and its clearing existed only as code. These drive the real
+# gate on two separate TotpService instances (separate DashMaps, separate
+# clients) against one Redis, including through `verify_2fa_login` itself.
+# Named here, not merely gated on TALOS_TEST_REDIS_URL, so it is real coverage
+# rather than a green skip (the workspace `--lib` run in quality.yml has no
+# Redis and skips it).
+echo
+echo "▶ 2FA cross-instance lockout :: talos-totp-2fa  [redis]"
+if ! cargo test -p talos-totp-2fa --lib redis_lockout_tests; then
+    rc=1
+fi
+
 echo
 echo "▶ #661 expose-limit error-as-absence :: talos-worker-runtime  [redis]"
 if ! cargo test -p talos-worker-runtime --lib expose_limit_absence_tests; then
