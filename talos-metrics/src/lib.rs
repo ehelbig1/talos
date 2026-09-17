@@ -13,6 +13,7 @@ use prometheus::{
 };
 use std::sync::{Arc, OnceLock};
 
+pub mod actor_budget;
 pub mod execution;
 pub mod execution_pause;
 pub mod google_push;
@@ -21,6 +22,7 @@ pub mod outcome_class;
 pub mod rpc;
 pub mod security;
 pub mod vault_token;
+pub use actor_budget::{BudgetCap, BudgetMode};
 pub use execution::ModuleExecutionOutcome;
 pub use execution_pause::{PauseGatePath, PauseRefusal};
 pub use google_push::{JwkRefreshOutcome, PushIntegration, PushRefusalReason};
@@ -461,6 +463,22 @@ pub fn record_mcp_auth_on(metrics: &TalosMetrics, outcome: McpAuthOutcome) {
 
 /// Count one start the deployment-wide execution pause refused. Inert without
 /// [`set_global`].
+pub fn record_actor_budget_refusal(cap: BudgetCap, mode: BudgetMode) {
+    if let Some(m) = global() {
+        record_actor_budget_refusal_on(m, cap, mode);
+    }
+}
+
+/// The recording itself, against an EXPLICIT registry.
+pub fn record_actor_budget_refusal_on(metrics: &TalosMetrics, cap: BudgetCap, mode: BudgetMode) {
+    metrics
+        .actor_budget_refusals_total
+        .with_label_values(&[cap.as_str(), mode.as_str()])
+        .inc();
+}
+
+/// Count one start refused by the deployment-wide execution pause. Inert
+/// without [`set_global`].
 pub fn record_execution_pause_refusal(path: PauseGatePath, reason: PauseRefusal) {
     if let Some(m) = global() {
         record_execution_pause_refusal_on(m, path, reason);
@@ -1579,6 +1597,10 @@ pub struct TalosMetrics {
     // `PauseRefusal::ALL`, seeded at 0; no alert (a refusal is the operator's
     // pause working).
     pub execution_pause_refusals_total: CounterVec,
+    // Actor budget refusals — added 2026-09-17 (package CD). `BudgetCap::ALL`
+    // × `BudgetMode::ALL`, seeded at 0; no alert (a refusal is the budget
+    // working; `on_budget_exceeded = 'alert'` raises an ops alert instead).
+    pub actor_budget_refusals_total: CounterVec,
     pub google_jwk_refresh_total: CounterVec,
 
     // Vault KEK-token renewal — added 2026-09-14 after the controller's transit
@@ -2874,6 +2896,30 @@ impl TalosMetrics {
             }
         }
 
+        // Actor budget refusals
+        let actor_budget_refusals_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_actor_budget_refusals_total",
+                "Workflow starts refused by an actor budget cap, by the cap and the \
+                 policy's on_budget_exceeded mode. cap=per_minute | per_hour | total | \
+                 fuel_per_hour | llm_tokens_per_day; mode=suspend | alert | block. Recorded \
+                 where the refusal is decided (the pre-checks and the atomic backstop at \
+                 row creation), once per refused start. mode=alert also raises an ops \
+                 alert keyed per actor and cap. talos_metrics::{BudgetCap, BudgetMode}, \
+                 closed sets, every pair pre-seeded at 0. A refusal is the budget \
+                 working: do NOT alert on this series.",
+            ),
+            &["cap", "mode"],
+        )?;
+        registry.register(Box::new(actor_budget_refusals_total.clone()))?;
+        for cap in BudgetCap::ALL {
+            for mode in BudgetMode::ALL {
+                actor_budget_refusals_total
+                    .with_label_values(&[cap.as_str(), mode.as_str()])
+                    .inc_by(0.0);
+            }
+        }
+
         // Google push authentication
         let google_push_refusals_total = CounterVec::new(
             prometheus::Opts::new(
@@ -3421,6 +3467,7 @@ impl TalosMetrics {
             rate_limit_hits_total,
             google_push_refusals_total,
             execution_pause_refusals_total,
+            actor_budget_refusals_total,
             google_jwk_refresh_total,
             vault_token_renewals_total,
             vault_token_ttl_seconds,
@@ -3909,6 +3956,42 @@ mod tests {
             !warm.contains("talos_vault_token_ttl_seconds{lifetime=\"periodic\"}"),
             "a class the token is no longer must be removed, not left stale"
         );
+    }
+
+    /// Every `(cap, mode)` pair of the actor-budget counter is seeded at 0 and
+    /// moved by the recorder; the cap strings are the backstop's `kind`s and the
+    /// mode parse is exactly the column's CHECK set.
+    #[test]
+    fn actor_budget_refusals_are_seeded_and_the_recorder_moves_them() {
+        let m = TalosMetrics::new().unwrap();
+        let cold = m.render_prometheus().expect("render");
+        for cap in BudgetCap::ALL {
+            for mode in BudgetMode::ALL {
+                assert!(
+                    cold.contains(&format!(
+                        "talos_actor_budget_refusals_total{{cap=\"{}\",mode=\"{}\"}} 0",
+                        cap.as_str(),
+                        mode.as_str()
+                    )),
+                    "unseeded pair {cap:?}/{mode:?}"
+                );
+                record_actor_budget_refusal_on(&m, *cap, *mode);
+            }
+        }
+        let warm = m.render_prometheus().expect("render");
+        for cap in BudgetCap::ALL {
+            for mode in BudgetMode::ALL {
+                assert!(warm.contains(&format!(
+                    "talos_actor_budget_refusals_total{{cap=\"{}\",mode=\"{}\"}} 1",
+                    cap.as_str(),
+                    mode.as_str()
+                )));
+            }
+        }
+        for mode in BudgetMode::ALL {
+            assert_eq!(BudgetMode::parse(mode.as_str()), Some(*mode));
+        }
+        assert_eq!(BudgetMode::parse("notify"), None);
     }
 
     /// Every `(path, reason)` pair of the execution-pause counter is seeded at

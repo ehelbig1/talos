@@ -7,6 +7,7 @@
 //! `list_recent_completed_outputs`). Kept verbatim in this split.
 
 use crate::*;
+use talos_actor_budget_refusal::BudgetCap;
 
 /// The value `workflow_executions.priority` may hold, and the ONE home for the
 /// vocabulary that three surfaces used to spell independently: the graph key
@@ -176,6 +177,11 @@ pub fn actor_budget_exceeded_message(kind: &str, limit: i64, count: i64) -> Stri
         "per_hour" => {
             format!("Actor budget exceeded: {count} executions in the last hour (limit: {limit})")
         }
+        // Package CD: this cap fell into the `_` arm and was worded
+        // "executions total" — a token count reported as an execution count.
+        "llm_tokens_per_day" => format!(
+            "Actor LLM token budget exceeded: {count} tokens in the last 24 hours (limit: {limit})"
+        ),
         _ => format!("Actor budget exceeded: {count} executions total (limit: {limit})"),
     }
 }
@@ -451,6 +457,33 @@ pub struct ActorRow {
 }
 
 impl WorkflowRepository {
+    /// Record an actor-budget refusal decided by the atomic backstop, then
+    /// hand back the refusal. Called AFTER the transaction rolled back, so the
+    /// alert write never runs under the advisory lock (package CD).
+    async fn refuse_for_budget(
+        &self,
+        actor_id: Uuid,
+        cap: BudgetCap,
+        limit: i64,
+        count: i64,
+        mode: &str,
+    ) -> ConcurrencyAdmission {
+        talos_actor_budget_refusal::record_actor_budget_refusal(
+            &self.db_pool,
+            actor_id,
+            cap,
+            limit,
+            count,
+            mode,
+        )
+        .await;
+        ConcurrencyAdmission::ActorBudgetExceeded {
+            kind: cap.as_str(),
+            limit,
+            count,
+        }
+    }
+
     /// Helper used by the encrypted branch of `mark_execution_*`.
     /// Returns `Ok(None)` when no SecretsManager is wired (the caller
     /// then falls back to the plaintext branch). Centralised so the
@@ -620,22 +653,29 @@ impl WorkflowRepository {
                 .execute(&mut *tx)
                 .await?;
 
+            // `max_executions_total` is BIGINT: decoding it as i32 made every
+            // start of an actor with a lifetime cap fail with a decode error
+            // (package CD, found by the first test that set the cap here).
             let policy: Option<(
                 Option<i32>,
-                Option<i32>,
+                Option<i64>,
                 Option<i32>,
                 Option<i64>,
                 Option<i64>,
+                String,
             )> = sqlx::query_as(
                 "SELECT max_executions_per_hour, max_executions_total, \
-                     max_workflows_per_minute, max_fuel_per_hour, max_llm_tokens_per_day \
+                     max_workflows_per_minute, max_fuel_per_hour, max_llm_tokens_per_day, \
+                     on_budget_exceeded \
                      FROM actor_budget_policies WHERE actor_id = $1",
             )
             .bind(aid)
             .fetch_optional(&mut *tx)
             .await?;
 
-            if let Some((per_hour, total, per_minute, fuel_per_hour, llm_tokens_per_day)) = policy {
+            if let Some((per_hour, total, per_minute, fuel_per_hour, llm_tokens_per_day, mode)) =
+                policy
+            {
                 // Per-minute trigger-rate cap. Counts only rows that carry
                 // this actor_id — top-level triggers (bulk_trigger /
                 // trigger_as_actors included). Sub-workflow chain rows are
@@ -653,11 +693,15 @@ impl WorkflowRepository {
                     .await?;
                     if count >= i64::from(limit) {
                         tx.rollback().await?;
-                        return Ok(ConcurrencyAdmission::ActorBudgetExceeded {
-                            kind: "per_minute",
-                            limit: i64::from(limit),
-                            count,
-                        });
+                        return Ok(self
+                            .refuse_for_budget(
+                                aid,
+                                BudgetCap::PerMinute,
+                                i64::from(limit),
+                                count,
+                                &mode,
+                            )
+                            .await);
                     }
                 }
                 if let Some(limit) = per_hour {
@@ -670,11 +714,15 @@ impl WorkflowRepository {
                     .await?;
                     if count >= i64::from(limit) {
                         tx.rollback().await?;
-                        return Ok(ConcurrencyAdmission::ActorBudgetExceeded {
-                            kind: "per_hour",
-                            limit: i64::from(limit),
-                            count,
-                        });
+                        return Ok(self
+                            .refuse_for_budget(
+                                aid,
+                                BudgetCap::PerHour,
+                                i64::from(limit),
+                                count,
+                                &mode,
+                            )
+                            .await);
                     }
                 }
                 if let Some(limit) = total {
@@ -696,13 +744,11 @@ impl WorkflowRepository {
                     .bind(aid)
                     .fetch_one(&mut *tx)
                     .await?;
-                    if count >= i64::from(limit) {
+                    if count >= limit {
                         tx.rollback().await?;
-                        return Ok(ConcurrencyAdmission::ActorBudgetExceeded {
-                            kind: "total",
-                            limit: i64::from(limit),
-                            count,
-                        });
+                        return Ok(self
+                            .refuse_for_budget(aid, BudgetCap::Total, limit, count, &mode)
+                            .await);
                     }
                 }
                 // Rolling per-hour FUEL cap. Sums fuel already consumed by the
@@ -726,11 +772,9 @@ impl WorkflowRepository {
                     .await?;
                     if used >= limit {
                         tx.rollback().await?;
-                        return Ok(ConcurrencyAdmission::ActorBudgetExceeded {
-                            kind: "fuel_per_hour",
-                            limit,
-                            count: used,
-                        });
+                        return Ok(self
+                            .refuse_for_budget(aid, BudgetCap::FuelPerHour, limit, used, &mode)
+                            .await);
                     }
                 }
                 // R2 token ledger: rolling daily LLM token ceiling. Sums the
@@ -753,11 +797,9 @@ impl WorkflowRepository {
                     .await?;
                     if used >= limit {
                         tx.rollback().await?;
-                        return Ok(ConcurrencyAdmission::ActorBudgetExceeded {
-                            kind: "llm_tokens_per_day",
-                            limit,
-                            count: used,
-                        });
+                        return Ok(self
+                            .refuse_for_budget(aid, BudgetCap::LlmTokensPerDay, limit, used, &mode)
+                            .await);
                     }
                 }
             }

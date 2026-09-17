@@ -197,6 +197,15 @@ pub async fn check_actor_hour_budget_for_batch(
                 }
             }
         }
+        talos_actor_budget_refusal::record_actor_budget_refusal(
+            pool,
+            actor_id,
+            talos_actor_budget_refusal::BudgetCap::PerHour,
+            i64::from(max_per_hour),
+            count,
+            &budget.on_budget_exceeded,
+        )
+        .await;
         return Err(format!(
             "Actor budget exceeded: {} executions in the last hour + {} requested would exceed cap {}. \
              on_budget_exceeded={}",
@@ -245,6 +254,15 @@ pub async fn check_actor_total_budget_for_batch(
     // MCP-566: batch-aware. `count + batch_size > max_total` refuses any
     // batch that would push the lifetime count past the cap.
     if count + batch_size > max_total {
+        talos_actor_budget_refusal::record_actor_budget_refusal(
+            pool,
+            actor_id,
+            talos_actor_budget_refusal::BudgetCap::Total,
+            max_total,
+            count,
+            &budget.on_budget_exceeded,
+        )
+        .await;
         return Err(format!(
             "Actor budget exceeded: {} total executions + {} requested would exceed lifetime cap {}. \
              Increase the budget with set_actor_budget.",
@@ -285,6 +303,15 @@ pub async fn check_actor_llm_token_budget(
         }
     };
     if used >= cap {
+        talos_actor_budget_refusal::record_actor_budget_refusal(
+            pool,
+            actor_id,
+            talos_actor_budget_refusal::BudgetCap::LlmTokensPerDay,
+            cap,
+            used,
+            &budget.on_budget_exceeded,
+        )
+        .await;
         return Err(format!(
             "Actor budget exceeded: {used} LLM tokens consumed in the last 24 hours reaches cap {cap}. \
              on_budget_exceeded={}. Raise max_llm_tokens_per_day with set_actor_budget or wait for the window to roll.",

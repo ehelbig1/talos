@@ -791,6 +791,8 @@ CTRL_TESTS=(
     "actor_clone_parity_tests"
     # Package CC: approval policies on unevaluated triggers are refused.
     "approval_policy_trigger_refusal_tests"
+    # Package CD: on_budget_exceeded=alert raises an ops alert; every refusal is counted.
+    "actor_budget_alert_tests"
     # BR: the grant CHECK equals ACTOR_CEILING_WORLDS; one ceiling read.
     "capability_grant_world_check_tests"
 )
