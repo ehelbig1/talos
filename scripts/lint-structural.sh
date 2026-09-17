@@ -3600,15 +3600,23 @@ bold "▶ check 47: append-only audit tables must not gain CASCADE/SET NULL FKs"
 # historical reference. This freezes it: a CREATE/ALTER of an append-only audit
 # table that adds `ON DELETE CASCADE|SET NULL` fails. Pre-fix history is
 # grandfathered by timestamp — those bad FKs are dropped by 20260625140000 /
-# 20260625150000; only migrations newer than the last fix are scanned. Adding a
+# 20260625150000, and the four tables package CG made immutable had theirs
+# dropped by 20260917130000 (they were written as ordinary tables before that
+# migration, so their CREATE statements still carry the text); only migrations
+# newer than the last fix are scanned. Adding a
 # NEW append-only audit table? Append its name to AUDIT_TABLES below.
 
 AUDIT_FK_VIOLATIONS=0
 # `audit_events` left this list 2026-09-11: dropped (migration 20260911160000) —
 # it had held zero rows since creation and nothing wrote it; the execution
 # audit ledger is the S3 WORM chain, not a table.
-AUDIT_TABLES='admin_event_log auth_audit_log secret_audit_log'
-AUDIT_FK_CUTOFF=20260625150000
+# Package CG (2026-09-17) widened immutability to four more audit-shaped
+# tables and DROPPED their CASCADE/SET NULL FKs in the same migration — an
+# enforced delete action into a table that refuses DELETE makes the PARENT
+# undeletable, which is what this check exists to stop. They join the list so a
+# future migration cannot re-add one.
+AUDIT_TABLES='admin_event_log auth_audit_log secret_audit_log schema_audit_log oauth_audit_log gmail_integration_audit_log slack_integration_audit_log'
+AUDIT_FK_CUTOFF=20260917130000
 for mig in "$ROOT"/migrations/*.sql; do
     [ -f "$mig" ] || continue
     ts=$(basename "$mig" | grep -oE '^[0-9]{14}' || true)

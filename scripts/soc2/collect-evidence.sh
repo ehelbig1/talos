@@ -162,10 +162,30 @@ echo ""
 # ---------------------------------------------------------------------------
 echo "--- Verifying immutability triggers ---"
 
+# The row triggers (BEFORE UPDATE OR DELETE). Package CG (2026-09-17) widened
+# immutability from three tables to seven.
 EXPECTED_TRIGGERS=(
     "trg_auth_audit_log_immutable"
     "trg_secret_audit_log_immutable"
     "trg_admin_event_log_immutable"
+    "trg_schema_audit_log_immutable"
+    "trg_oauth_audit_log_immutable"
+    "trg_gmail_integration_audit_log_immutable"
+    "trg_slack_integration_audit_log_immutable"
+)
+
+# The TRUNCATE guards, verified from pg_catalog rather than information_schema:
+# the SQL-standard view reports INSERT/UPDATE/DELETE only, so a BEFORE TRUNCATE
+# trigger is INVISIBLE there and the loop above would report every one of these
+# as MISSING (checked against the live catalog, not assumed).
+EXPECTED_TRUNCATE_TRIGGERS=(
+    "trg_auth_audit_log_immutable_truncate"
+    "trg_secret_audit_log_immutable_truncate"
+    "trg_admin_event_log_immutable_truncate"
+    "trg_schema_audit_log_immutable_truncate"
+    "trg_oauth_audit_log_immutable_truncate"
+    "trg_gmail_integration_audit_log_immutable_truncate"
+    "trg_slack_integration_audit_log_immutable_truncate"
 )
 
 {
@@ -180,6 +200,25 @@ EXPECTED_TRIGGERS=(
              FROM information_schema.triggers
              WHERE trigger_name = '${trigger_name}'
              ORDER BY event_manipulation" 2>/dev/null)
+
+        if [ -n "$result" ]; then
+            record_pass "Trigger '${trigger_name}' exists"
+            echo "  Trigger: ${trigger_name}" >> "$EVIDENCE_DIR/immutability_triggers.txt.tmp"
+            echo "  Details: ${result}" >> "$EVIDENCE_DIR/immutability_triggers.txt.tmp"
+            echo "" >> "$EVIDENCE_DIR/immutability_triggers.txt.tmp"
+        else
+            record_fail "Trigger '${trigger_name}' is MISSING"
+            echo "  MISSING: ${trigger_name}" >> "$EVIDENCE_DIR/immutability_triggers.txt.tmp"
+            echo "" >> "$EVIDENCE_DIR/immutability_triggers.txt.tmp"
+        fi
+    done
+
+    for trigger_name in "${EXPECTED_TRUNCATE_TRIGGERS[@]}"; do
+        result=$(psql "$DATABASE_URL" -tAc \
+            "SELECT t.tgname || ' TRUNCATE on ' || c.relname
+             FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid
+             WHERE t.tgname = '${trigger_name}' AND NOT t.tgisinternal
+               AND (t.tgtype & 32) <> 0" 2>/dev/null)
 
         if [ -n "$result" ]; then
             record_pass "Trigger '${trigger_name}' exists"

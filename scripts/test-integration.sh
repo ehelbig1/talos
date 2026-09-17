@@ -409,6 +409,15 @@ fi
 # needed here. 64 hex = 32 bytes, non-zero.
 CTRL_MASTER_KEY="00000000000000000000000000000000000000000000000000000000deadbeef"
 CTRL_TESTS=(
+    # The immutability triggers were BEFORE DELETE OR UPDATE ... FOR EACH ROW,
+    # and TRUNCATE fires no row trigger: it emptied an audit table with nothing
+    # raised. Drives TRUNCATE/DELETE/UPDATE against every immutable table on a
+    # migrated clone, pins that a table guarded on rows is guarded on TRUNCATE
+    # too (the invariant that outlives the list), and pins #264/#266 from the
+    # live catalog — an enforced delete action into a table that refuses DELETE
+    # makes the PARENT undeletable. `common` (DATABASE_URL) harness, so
+    # CTRL_TESTS and not TC_TESTS (64b).
+    "audit_immutability_tests"
     # Nothing on this platform could say which operator surface is slow: no
     # per-tool series, no per-call line, and no pg_stat_statements (that last
     # one is live from 2026-09-10; the counting here stays client-side because
