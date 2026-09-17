@@ -1010,30 +1010,35 @@ export type MutationRoot = {
   provisionMlClassifier: MlProvisionResult;
   publishWorkflowVersion: WorkflowVersion;
   /**
-   * Per-org DEK arc: migrate existing `actor_memory` rows to their actor's
-   * org root DEK (format v4). Memory sibling of `reEncryptSecretsToOrg`;
-   * rows whose actor has no org stay on the global DEK.
+   * Per-org DEK arc: move existing `actor_memory` rows onto their actor's
+   * org's ACTIVE root DEK (format v4), including rows under a retired org
+   * DEK. Memory sibling of `reEncryptSecretsToOrg`; rows whose actor has no
+   * org stay on the global DEK.
    */
   reEncryptMemoriesToOrg: ReEncryptionResult;
   /**
-   * Per-org DEK arc: migrate existing module-execution payloads to their
-   * workflow's org root DEK (format v4). Last of the per-org sweeps; org-less
-   * / standalone payloads stay on the global DEK.
+   * Per-org DEK arc: move existing module-execution payloads onto their
+   * workflow's org's ACTIVE root DEK (format v4), including payloads under a
+   * retired org DEK. Last of the per-org sweeps; org-less / standalone
+   * payloads stay on the global DEK.
    */
   reEncryptModulePayloadsToOrg: ReEncryptionResult;
   /**
-   * Per-org DEK arc: migrate existing encrypted execution outputs to their
-   * workflow's org root DEK (format v4). Execution-output sibling of
-   * `reEncryptSecretsToOrg` / `reEncryptMemoriesToOrg`; outputs whose workflow
-   * has no org stay on the global DEK.
+   * Per-org DEK arc: move existing encrypted execution outputs onto their
+   * workflow's org's ACTIVE root DEK (format v4), including outputs under a
+   * retired org DEK. Execution-output sibling of `reEncryptSecretsToOrg` /
+   * `reEncryptMemoriesToOrg`; outputs whose workflow has no org stay on the
+   * global DEK.
    */
   reEncryptOutputsToOrg: ReEncryptionResult;
   reEncryptSecrets: ReEncryptionResult;
   /**
-   * Per-org DEK arc: migrate existing org-scoped secrets to their org's root
-   * DEK (format v4). The complement of `reEncryptSecrets` (which keeps the
-   * global-DEK rows current); together they let the global DEK retire for the
-   * secrets table. Personal/org-less secrets are intentionally left global.
+   * Per-org DEK arc: move existing org-scoped secrets onto their org's ACTIVE
+   * root DEK (format v4) — rows still on the global DEK, and rows under an
+   * org DEK retired by `rotateOrgDek`. The complement of `reEncryptSecrets`
+   * (which keeps the global-DEK rows current); together they let the global
+   * DEK retire for the secrets table. Personal/org-less secrets are
+   * intentionally left global.
    */
   reEncryptSecretsToOrg: ReEncryptionResult;
   refreshToken: AuthPayload;
@@ -1068,6 +1073,14 @@ export type MutationRoot = {
   rotateDek: DekRotationResult;
   rotateEncryptionKey: Scalars["Int"]["output"];
   rotateMasterKey: MasterKeyRotationResult;
+  /**
+   * Rotate ONE organization's root DEK (platform admin). The org's current
+   * active DEK is retired and a new one becomes active for new writes; the
+   * global DEK and every other org are untouched. Rows already encrypted
+   * under the retired key keep decrypting until the `reEncrypt…ToOrg` sweeps
+   * re-key them; `dekMigrationStatus` counts them as pending until then.
+   */
+  rotateOrgDek: DekRotationResult;
   setConcurrencyLimit: Scalars["Boolean"]["output"];
   /**
    * Bind (or unbind, with a null `actorId`) a workflow's default actor —
@@ -1290,6 +1303,10 @@ export type MutationRootRotateApiKeyArgs = {
 
 export type MutationRootRotateMasterKeyArgs = {
   newMasterKey: Scalars["String"]["input"];
+};
+
+export type MutationRootRotateOrgDekArgs = {
+  orgId: Scalars["UUID"]["input"];
 };
 
 export type MutationRootSetConcurrencyLimitArgs = {
@@ -1604,10 +1621,11 @@ export type QueryRoot = {
   capabilityWorldHierarchy: Array<CapabilityWorldInfo>;
   deadLetterQueue: Array<DeadLetterEntry>;
   /**
-   * Per-org DEK migration status — per encrypted table, how many rows still
-   * reference the global DEK but could be migrated to a per-org DEK (the
-   * remaining work for the `reEncrypt…ToOrg` sweeps). When every `pending` is
-   * 0, the global DEK is no longer load-bearing for migratable data.
+   * Per-org DEK migration status — per encrypted table, how many org-scoped
+   * rows are not under their org's active DEK: still on the global DEK, or
+   * under an org DEK retired by `rotateOrgDek` (the remaining work for the
+   * `reEncrypt…ToOrg` sweeps). When every `pending` is 0, neither the global
+   * DEK nor a retired org DEK is load-bearing for migratable data.
    * Platform-admin only (reveals system-wide counts across all orgs).
    */
   dekMigrationStatus: Array<DekMigrationStatusEntry>;

@@ -3531,7 +3531,9 @@ pub struct MemoryReEncryptStats {
 /// invoked — sibling of `SecretsManager::re_encrypt_secrets_to_org`.
 ///
 /// Selects rows whose actor HAS an org (`actors.org_id IS NOT NULL`) and that are
-/// not already v4, decrypts via the registered hook (version-aware), and
+/// not under that org's ACTIVE DEK — not yet v4, or v4 under an org DEK that has
+/// since been rotated (`talos_org_dek_pending`, package CE) — decrypts via the
+/// registered hook (version-aware), and
 /// re-encrypts under the actor's org DEK, stamping `actor_memory.org_id`. Rows
 /// whose actor has no org keep their current (global) DEK. Same lost-write guard
 /// as the secrets sweep: the UPDATE only fires while the row is still on the
@@ -3541,16 +3543,12 @@ pub async fn re_encrypt_memories_to_org(pool: &Pool<Postgres>) -> Result<MemoryR
     let Some(hook) = MEMORY_CRYPTO_HOOK.get().cloned() else {
         return Ok(MemoryReEncryptStats::default());
     };
-    // 4 = talos_secrets_manager::SecretsManager::AAD_FORMAT_V4_ORG_DERIVED
-    // (literal to avoid a talos-memory → talos-secrets-manager dependency).
-    const V4: i16 = 4;
-
     let rows = sqlx::query(
         "SELECT am.actor_id, am.key, am.value_enc, am.value_key_id, am.value_format, a.org_id \
          FROM actor_memory am JOIN actors a ON a.id = am.actor_id \
-         WHERE am.value_format <> $1 AND a.org_id IS NOT NULL",
+         WHERE a.org_id IS NOT NULL \
+           AND talos_org_dek_pending(am.value_key_id, a.org_id)",
     )
-    .bind(V4)
     .fetch_all(pool)
     .await
     .context("re_encrypt_memories_to_org: select stale rows")?;

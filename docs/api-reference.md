@@ -167,9 +167,10 @@ Returns usage metrics such as `llm_tokens`, `http_calls`, `db_queries`, and `was
 | `createSecret(input: CreateSecretInput)` | Store an encrypted secret |
 | `updateSecret(input: UpdateSecretInput)` | Update a secret's value |
 | `deleteSecret(keyPath: String)` | Delete a secret |
-| `rotateDek` | Rotate the Data Encryption Key |
+| `rotateDek` | Rotate the global Data Encryption Key (platform admin) |
+| `rotateOrgDek(orgId: UUID)` | Rotate one organization's root DEK (platform admin); run the `reEncrypt…ToOrg` sweeps to re-key existing rows |
 | `reEncryptSecrets` | Re-encrypt all secrets with current DEK |
-| `rotateEncryptionKey` | Rotate the master encryption key and re-wrap all DEKs (admin only) |
+| `rotateEncryptionKey` | Legacy alias of `rotateDek`: rotates the global DEK and returns the DEK generation count (platform admin) |
 
 ### Dead Letter Queue
 

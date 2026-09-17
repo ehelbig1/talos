@@ -349,7 +349,11 @@ async fn per_org_dek_rotation_preserves_old_ciphertext_and_global() {
     assert_eq!(kid1, dek1.id);
 
     // Rotate the org's DEK: active flips to a new key.
-    let new_id = manager.rotate_dek_for_org(org, None).await.unwrap();
+    let new_id = manager
+        .rotate_dek_for_org(org, None)
+        .await
+        .unwrap()
+        .expect("the org exists");
     assert_ne!(new_id, dek1.id, "rotation must mint a new active DEK");
     let active_after = manager.get_active_dek_for_org(org).await.unwrap().unwrap();
     assert_eq!(
@@ -714,6 +718,237 @@ async fn dek_migration_status_reports_and_tracks_pending() {
         secrets_done, secrets_before,
         "after the sweep, our row is no longer pending"
     );
+}
+
+// ── Per-org DEK rotation retires the key (package CE, 2026-09-17) ──────────
+//
+// Until CE the sweeps selected `format <> 4`, so a v4 row under a ROTATED org
+// DEK was never re-keyed and `dek_migration_status` counted it as done: a
+// rotation changed which key new writes used and left the retired key
+// load-bearing for everything it had already encrypted.
+
+async fn secret_key_id(pool: &sqlx::Pool<sqlx::Postgres>, sid: Uuid) -> (i16, Uuid) {
+    sqlx::query_as("SELECT encryption_format_version, encryption_key_id FROM secrets WHERE id=$1")
+        .bind(sid)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+fn pending_for(status: &[talos_secrets_manager::DekTableMigrationStatus], table: &str) -> i64 {
+    status
+        .iter()
+        .find(|e| e.table == table)
+        .map(|e| e.pending)
+        .expect("table reported")
+}
+
+#[tokio::test]
+async fn a_rotated_org_dek_is_pending_until_the_sweep_rekeys_its_rows() {
+    set_master_key_for_dek_tests();
+    let pool = test_helpers::get_test_db_pool().await;
+    let manager = SecretsManager::new(pool.clone()).unwrap();
+    manager.initialize().await.unwrap();
+
+    // An org-scoped secret brought onto the org's (first) DEK.
+    let org = create_test_org(&pool).await;
+    let kp = format!("dek/rotate/{}", Uuid::new_v4());
+    let sid = manager
+        .create_secret(
+            "RotSecret",
+            &kp,
+            "rot-val",
+            None,
+            SYSTEM_USER_ID,
+            vec![],
+            None,
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE secrets SET org_id = $1 WHERE id = $2")
+        .bind(org)
+        .bind(sid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    manager.re_encrypt_secrets_to_org().await.unwrap();
+    let (fmt1, old_key) = secret_key_id(&pool, sid).await;
+    assert_eq!(fmt1, 4);
+    let settled = pending_for(&manager.dek_migration_status().await.unwrap(), "secrets");
+
+    // Control: with no rotation, a second sweep leaves the row where it is.
+    manager.re_encrypt_secrets_to_org().await.unwrap();
+    assert_eq!(secret_key_id(&pool, sid).await, (4, old_key));
+
+    let new_key = manager
+        .rotate_dek_for_org(org, Some(SYSTEM_USER_ID))
+        .await
+        .unwrap()
+        .expect("the org exists");
+    assert_ne!(new_key, old_key);
+
+    // The row is still under the retired key, and the status now says so.
+    assert_eq!(secret_key_id(&pool, sid).await, (4, old_key));
+    let rotated = pending_for(&manager.dek_migration_status().await.unwrap(), "secrets");
+    assert_eq!(
+        rotated,
+        settled + 1,
+        "a v4 row under a retired org DEK is pending"
+    );
+
+    // The sweep re-keys it onto the new active DEK and the value survives.
+    let stats = manager.re_encrypt_secrets_to_org().await.unwrap();
+    assert_eq!(stats.failed, 0);
+    assert_eq!(
+        secret_key_id(&pool, sid).await,
+        (4, new_key),
+        "the sweep must move the row onto the org's active DEK"
+    );
+    let got = manager
+        .get_secret(&kp, SecretRequestor::System, &[])
+        .await
+        .unwrap();
+    assert_eq!(got, "rot-val");
+    assert_eq!(
+        pending_for(&manager.dek_migration_status().await.unwrap(), "secrets"),
+        settled,
+        "after the sweep nothing under the retired key is pending"
+    );
+    let still_on_old: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM secrets WHERE encryption_key_id = $1")
+            .bind(old_key)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(still_on_old, 0, "the retired DEK is no longer load-bearing");
+}
+
+#[tokio::test]
+async fn a_row_under_another_orgs_active_dek_is_pending_and_moves_to_its_own() {
+    set_master_key_for_dek_tests();
+    let pool = test_helpers::get_test_db_pool().await;
+    let manager = SecretsManager::new(pool.clone()).unwrap();
+    manager.initialize().await.unwrap();
+
+    // Sealed under org A's ACTIVE DEK, then reassigned to org B: the key is
+    // active, but not B's — the org-match half of the predicate.
+    let org_a = create_test_org(&pool).await;
+    let org_b = create_test_org(&pool).await;
+    let kp = format!("dek/foreign/{}", Uuid::new_v4());
+    let sid = manager
+        .create_secret(
+            "Foreign",
+            &kp,
+            "foreign-val",
+            None,
+            SYSTEM_USER_ID,
+            vec![],
+            None,
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE secrets SET org_id = $1 WHERE id = $2")
+        .bind(org_a)
+        .bind(sid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    manager.re_encrypt_secrets_to_org().await.unwrap();
+    let a_key = manager
+        .get_active_dek_for_org(org_a)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    assert_eq!(secret_key_id(&pool, sid).await, (4, a_key));
+    let settled = pending_for(&manager.dek_migration_status().await.unwrap(), "secrets");
+
+    sqlx::query("UPDATE secrets SET org_id = $1 WHERE id = $2")
+        .bind(org_b)
+        .bind(sid)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        pending_for(&manager.dek_migration_status().await.unwrap(), "secrets"),
+        settled + 1,
+        "a row under another org's active DEK is pending"
+    );
+    manager.re_encrypt_secrets_to_org().await.unwrap();
+    let b_key = manager
+        .get_active_dek_for_org(org_b)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+    assert_eq!(secret_key_id(&pool, sid).await, (4, b_key));
+    let got = manager
+        .get_secret(&kp, SecretRequestor::System, &[])
+        .await
+        .unwrap();
+    assert_eq!(got, "foreign-val");
+}
+
+#[tokio::test]
+async fn an_org_dek_rotation_is_audited_with_its_org_and_an_unknown_org_writes_nothing() {
+    set_master_key_for_dek_tests();
+    let pool = test_helpers::get_test_db_pool().await;
+    let manager = SecretsManager::new(pool.clone()).unwrap();
+    manager.initialize().await.unwrap();
+
+    let org = create_test_org(&pool).await;
+    manager.get_or_create_dek_for_org(org).await.unwrap();
+    manager
+        .rotate_dek_for_org(org, Some(SYSTEM_USER_ID))
+        .await
+        .unwrap()
+        .expect("the org exists");
+    let rows: Vec<(String, Option<Uuid>, Option<Uuid>, bool)> = sqlx::query_as(
+        "SELECT action, actor_id, org_id, success FROM secret_audit_log \
+         WHERE action = 'DEK_ROTATED_ORG' AND org_id = $1",
+    )
+    .bind(org)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![(
+            "DEK_ROTATED_ORG".to_string(),
+            Some(SYSTEM_USER_ID),
+            Some(org),
+            true
+        )],
+        "one audit row naming the org and the operator"
+    );
+
+    // An organization that does not exist: None, and nothing written.
+    let keys_before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM encryption_keys")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let audit_before: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM secret_audit_log WHERE action = 'DEK_ROTATED_ORG'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let missing = manager
+        .rotate_dek_for_org(Uuid::new_v4(), Some(SYSTEM_USER_ID))
+        .await
+        .unwrap();
+    assert_eq!(missing, None);
+    let keys_after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM encryption_keys")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let audit_after: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM secret_audit_log WHERE action = 'DEK_ROTATED_ORG'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((keys_after, audit_after), (keys_before, audit_before));
 }
 
 // ── Domain-tagged AAD for user-keyed columns (2026-09-10) ────────────────────

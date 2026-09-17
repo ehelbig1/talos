@@ -389,9 +389,10 @@ impl ModuleExecutionService {
     /// cutover only converts NEW writes; this brings stored rows over so the
     /// global DEK can retire for module payloads.
     ///
-    /// Selects rows not already v4 with an encrypted payload whose workflow has
-    /// an org, decrypts each present slot, then re-encrypts the whole bundle via
-    /// `encrypt_payload_bundle` (passing `workflow_execution_id`, which resolves
+    /// Selects rows with an encrypted payload whose workflow has an org and that
+    /// are not under that org's ACTIVE DEK (not yet v4, or v4 under a rotated org
+    /// DEK — `talos_org_dek_pending`, package CE), decrypts each present slot,
+    /// then re-encrypts the whole bundle via `encrypt_payload_bundle` (passing `workflow_execution_id`, which resolves
     /// the workflow's org → v4). All three slots share one key + format, so the
     /// re-encrypt rewrites them together. Standalone / org-less rows are not
     /// selected (no org). Lost-write guard: the UPDATE only fires while the row
@@ -402,19 +403,17 @@ impl ModuleExecutionService {
         let Some(sm) = self.secrets_manager.clone() else {
             return Ok(ModulePayloadReEncryptStats::default());
         };
-        const V4: i16 = talos_secrets_manager::SecretsManager::AAD_FORMAT_V4_ORG_DERIVED;
-
         let rows = sqlx::query(
             "SELECT me.id, me.workflow_execution_id, me.payload_enc_key_id, me.payload_format, \
                     me.input_data_enc, me.output_data_enc, me.trigger_metadata_enc \
              FROM module_executions me \
              JOIN workflow_executions we ON we.id = me.workflow_execution_id \
              JOIN workflows w ON w.id = we.workflow_id \
-             WHERE me.payload_format <> $1 AND w.org_id IS NOT NULL \
+             WHERE w.org_id IS NOT NULL \
+               AND talos_org_dek_pending(me.payload_enc_key_id, w.org_id) \
                AND (me.input_data_enc IS NOT NULL OR me.output_data_enc IS NOT NULL \
                     OR me.trigger_metadata_enc IS NOT NULL)",
         )
-        .bind(V4)
         .fetch_all(&self.db_pool)
         .await
         .context("re_encrypt_module_payloads_to_org: select stale rows")?;

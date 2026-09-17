@@ -186,8 +186,45 @@ async fn re_encrypt_outputs_to_org_migrates_v3_global_rows_to_v4() {
     };
     assert_eq!(
         row.output_data,
-        Some(output),
+        Some(output.clone()),
         "value must survive the sweep"
+    );
+
+    // Package CE: after an org DEK rotation the output is pending again and
+    // the sweep re-keys it onto the new active DEK.
+    let new_key = sm
+        .rotate_dek_for_org(org, None)
+        .await
+        .unwrap()
+        .expect("the org exists");
+    let pending = sm
+        .dek_migration_status()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|e| e.table == "workflow_executions.output")
+        .map(|e| e.pending)
+        .unwrap();
+    assert!(pending >= 1, "an output under a retired org DEK is pending");
+    let stats = repo.re_encrypt_outputs_to_org().await.unwrap();
+    assert_eq!(stats.failed, 0);
+    let (fmt2, kid2): (i16, Uuid) = sqlx::query_as(
+        "SELECT output_data_format, output_enc_key_id FROM workflow_executions WHERE id=$1",
+    )
+    .bind(exec)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((fmt2, kid2), (4, new_key), "re-keyed onto the active DEK");
+    assert_ne!(kid2, rkid);
+    let row = match repo.lookup_execution(exec, user).await.unwrap() {
+        talos_execution_repository::ExecutionLookup::Live(r) => r,
+        other => panic!("execution row must be Live, got {other:?}"),
+    };
+    assert_eq!(
+        row.output_data,
+        Some(output),
+        "value must survive the re-key"
     );
 }
 

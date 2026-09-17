@@ -147,8 +147,9 @@ legitimately org-less rows — so **a compromised root DEK is bounded to one ten
 not the whole deployment.** Decrypt is identical for v3/v4 (the row's `*_key_id`
 names the DEK); a per-row `*_format` column selects the scheme and
 `SecretsManager::decrypt_versioned` handles v0/v1/v2/v3/v4 under lazy migration.
-Existing rows move to per-org via `re_encrypt_*_to_org` sweeps; the
-`dekMigrationStatus` query reports remaining work. OTLP auth headers use this
+Existing rows move to per-org via `re_encrypt_*_to_org` sweeps, which also re-key
+rows under an org DEK retired by `rotateOrgDek`; the `dekMigrationStatus` query
+reports remaining work. OTLP auth headers use this
 same DEK envelope (with a domain-tagged `user_id` AAD,
 `talos-audit-ledger/src/lib.rs::encrypt_otlp_auth_headers`). Checkpoint
 encryption and the default worker secret envelope do not use the DEK: they
@@ -175,7 +176,7 @@ See `docs/deployment.md` for the env→Vault migration procedure.
 | 7. Slot handle | Opaque `SlotHandle(u64)` returned to WASM | Worker | Raw value does not cross the WASM boundary on this path |
 | 8. Usage | Host uses the slot via `into_auth_header()`, `sign()` or `decrypt()` | Worker host | Three auditable plaintext exits on `SecretProvider` (`talos-secrets/src/provider.rs`); a fourth, Tier-2 `expose_secret`, returns plaintext to the guest only when the module opts in with `allow_tier2_exposure` (every dispatch path sets `false`), rate-limited and logged at WARN |
 | 9. Release | Slot released after use or TTL (300s) | Worker | `Zeroizing<String>` ensures memory is zeroed |
-| 10. Rotation | GraphQL `rotateDek` creates a new global DEK | Controller | Old global DEK deactivated; new one set active; `DEK_ROTATED` written to `secret_audit_log`; active-DEK cache cleared. Existing rows are NOT re-encrypted by rotation — they keep decrypting under the old DEK until the separate `reEncryptSecrets` mutation is run. Per-org DEKs are not touched by `rotateDek`; `SecretsManager::rotate_dek_for_org` exists but no API calls it |
+| 10. Rotation | GraphQL `rotateDek` creates a new global DEK | Controller | Old global DEK deactivated; new one set active; `DEK_ROTATED` written to `secret_audit_log`; active-DEK cache cleared. Existing rows are NOT re-encrypted by rotation — they keep decrypting under the old DEK until the separate `reEncryptSecrets` mutation is run. Per-org DEKs are not touched by `rotateDek`: GraphQL `rotateOrgDek(orgId)` (2FA, Admin scope, platform admin) retires one organization's active DEK, writes `DEK_ROTATED_ORG` with that `org_id`, and clears that org's active-DEK cache entry in the controller that ran it. Rows under the retired org DEK keep decrypting and are counted as pending by `dekMigrationStatus` until the `reEncrypt…ToOrg` sweeps re-key them onto the active DEK; other controller processes keep the old key cached as active for up to the 5-minute cache TTL, and rows they write meanwhile are re-keyed by the next sweep. Archived execution outputs (`workflow_executions_archive`) are not swept |
 
 ### 2.3 DEK Caching
 

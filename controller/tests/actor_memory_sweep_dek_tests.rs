@@ -108,4 +108,50 @@ async fn re_encrypt_memories_to_org_migrates_v3_global_rows_to_v4() {
         .unwrap()
         .expect("row present");
     assert_eq!(got.value, value, "value must survive the sweep");
+
+    // Package CE: rotating the org DEK makes the row pending again, and the
+    // sweep moves it onto the new active DEK (it used to skip v4 rows).
+    let old_key = rkid;
+    let new_key = sm
+        .rotate_dek_for_org(org, None)
+        .await
+        .unwrap()
+        .expect("the org exists");
+    let pending = |status: Vec<talos_secrets_manager::DekTableMigrationStatus>| {
+        status
+            .into_iter()
+            .find(|e| e.table == "actor_memory")
+            .map(|e| e.pending)
+            .unwrap()
+    };
+    assert!(
+        pending(sm.dek_migration_status().await.unwrap()) >= 1,
+        "a memory row under a retired org DEK is pending"
+    );
+    let stats = talos_memory::re_encrypt_memories_to_org(&pool)
+        .await
+        .unwrap();
+    assert_eq!(stats.failed, 0);
+    let (fmt2, kid2): (i16, Uuid) = sqlx::query_as(
+        "SELECT value_format, value_key_id FROM actor_memory WHERE actor_id=$1 AND key=$2",
+    )
+    .bind(actor)
+    .bind(&key)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((fmt2, kid2), (4, new_key), "re-keyed onto the active DEK");
+    assert_ne!(kid2, old_key);
+    let got = talos_memory::recall_exact(&pool, actor, &key)
+        .await
+        .unwrap()
+        .expect("row present");
+    assert_eq!(got.value, value, "value must survive the re-key");
+    let on_old: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM actor_memory WHERE value_key_id = $1")
+            .bind(old_key)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(on_old, 0, "the retired DEK is no longer load-bearing");
 }

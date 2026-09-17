@@ -247,4 +247,46 @@ async fn re_encrypt_module_payloads_to_org_migrates_v3_global_rows_to_v4() {
         serde_json::from_str::<serde_json::Value>(&dec).unwrap(),
         input
     );
+
+    // Package CE: after an org DEK rotation the payload is pending again and
+    // the sweep re-keys it onto the new active DEK.
+    let new_key = sm
+        .rotate_dek_for_org(org, None)
+        .await
+        .unwrap()
+        .expect("the org exists");
+    let pending = sm
+        .dek_migration_status()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|e| e.table == "module_executions.payloads")
+        .map(|e| e.pending)
+        .unwrap();
+    assert!(pending >= 1, "a payload under a retired org DEK is pending");
+    let stats = service.re_encrypt_module_payloads_to_org().await.unwrap();
+    assert_eq!(stats.failed, 0);
+    let (fmt2, kid2): (i16, Uuid) = sqlx::query_as(
+        "SELECT payload_format, payload_enc_key_id FROM module_executions WHERE id=$1",
+    )
+    .bind(meid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!((fmt2, kid2), (4, new_key), "re-keyed onto the active DEK");
+    assert_ne!(kid2, kid);
+    let enc2: Vec<u8> =
+        sqlx::query_scalar("SELECT input_data_enc FROM module_executions WHERE id=$1")
+            .bind(meid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let dec2 = decrypt_payload_slot(&sm, kid2, &enc2, meid, PayloadSlot::Input, fmt2)
+        .await
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&dec2).unwrap(),
+        input,
+        "value must survive the re-key"
+    );
 }
