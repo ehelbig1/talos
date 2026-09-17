@@ -868,10 +868,11 @@ impl ExecutionRepository {
     /// sweeps; the cutover only converts NEW writes, this brings stored rows over
     /// so the global DEK can retire for execution output.
     ///
-    /// Selects rows with an encrypted output not already on v4 whose workflow has
-    /// an org, then decrypts + re-encrypts via the SAME helpers the live write
-    /// path uses — `encrypt_output` resolves the workflow's org (the execution
-    /// tenant). Outputs whose workflow has no org stay on the global DEK.
+    /// Selects rows with an encrypted output whose workflow has an org and that
+    /// are not under that org's ACTIVE DEK (not yet v4, or v4 under a rotated org
+    /// DEK — `talos_org_dek_pending`, package CE), then decrypts + re-encrypts
+    /// via the SAME helpers the live write path uses — `encrypt_output`
+    /// resolves the workflow's org (the execution tenant). Outputs whose workflow has no org stay on the global DEK.
     /// `workflow_executions.org_id` is left as-is (the high-write perf exclusion);
     /// the org is authoritative via the workflow join. Lost-write guard: the
     /// UPDATE only fires while the row is still on the (key, format) we read.
@@ -885,10 +886,9 @@ impl ExecutionRepository {
             "SELECT we.id, we.output_data_enc, we.output_enc_key_id, we.output_data_format \
              FROM workflow_executions we JOIN workflows w ON w.id = we.workflow_id \
              WHERE we.output_data_enc IS NOT NULL \
-               AND we.output_data_format <> $1 \
-               AND w.org_id IS NOT NULL",
+               AND w.org_id IS NOT NULL \
+               AND talos_org_dek_pending(we.output_enc_key_id, w.org_id)",
         )
-        .bind(talos_secrets_manager::SecretsManager::AAD_FORMAT_V4_ORG_DERIVED)
         .fetch_all(&self.db_pool)
         .await
         .map_err(|e| anyhow::anyhow!("re_encrypt_outputs_to_org: select stale rows: {e}"))?;

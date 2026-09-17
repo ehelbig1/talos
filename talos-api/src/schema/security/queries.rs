@@ -60,10 +60,11 @@ impl SecurityQueries {
         }))
     }
 
-    /// Per-org DEK migration status — per encrypted table, how many rows still
-    /// reference the global DEK but could be migrated to a per-org DEK (the
-    /// remaining work for the `reEncrypt…ToOrg` sweeps). When every `pending` is
-    /// 0, the global DEK is no longer load-bearing for migratable data.
+    /// Per-org DEK migration status — per encrypted table, how many org-scoped
+    /// rows are not under their org's active DEK: still on the global DEK, or
+    /// under an org DEK retired by `rotateOrgDek` (the remaining work for the
+    /// `reEncrypt…ToOrg` sweeps). When every `pending` is 0, neither the global
+    /// DEK nor a retired org DEK is load-bearing for migratable data.
     /// Platform-admin only (reveals system-wide counts across all orgs).
     async fn dek_migration_status(
         &self,

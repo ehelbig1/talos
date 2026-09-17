@@ -326,6 +326,43 @@ impl SecurityMutations {
         })
     }
 
+    /// Rotate ONE organization's root DEK (platform admin). The org's current
+    /// active DEK is retired and a new one becomes active for new writes; the
+    /// global DEK and every other org are untouched. Rows already encrypted
+    /// under the retired key keep decrypting until the `reEncrypt…ToOrg` sweeps
+    /// re-key them; `dekMigrationStatus` counts them as pending until then.
+    async fn rotate_org_dek(&self, ctx: &Context<'_>, org_id: Uuid) -> Result<DekRotationResult> {
+        require_2fa(ctx)?;
+        require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
+        // One tenant's key material, but the same authority as every other key
+        // operation (package CE decision): a platform admin, never an org role.
+        require_platform_admin(ctx).await?;
+
+        let secrets_manager = ctx.data::<Arc<talos_secrets_manager::SecretsManager>>()?;
+
+        let user_id = ctx
+            .data_opt::<Uuid>()
+            .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
+
+        match secrets_manager
+            .rotate_dek_for_org(org_id, Some(*user_id))
+            .await
+        {
+            Ok(Some(new_dek_id)) => Ok(DekRotationResult {
+                new_dek_id,
+                message: "Organization DEK rotated. Existing rows stay under the retired key \
+                          until the reEncrypt…ToOrg sweeps re-key them; dekMigrationStatus \
+                          counts them as pending."
+                    .to_string(),
+            }),
+            Ok(None) => Err(async_graphql::Error::new("Organization not found").extend_safe()),
+            Err(e) => {
+                tracing::error!(%org_id, "Failed to rotate organization DEK: {}", e);
+                Err(async_graphql::Error::new("Failed to rotate organization DEK").extend_safe())
+            }
+        }
+    }
+
     async fn re_encrypt_secrets(&self, ctx: &Context<'_>) -> Result<ReEncryptionResult> {
         require_2fa(ctx)?;
         require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
@@ -362,10 +399,12 @@ impl SecurityMutations {
         })
     }
 
-    /// Per-org DEK arc: migrate existing org-scoped secrets to their org's root
-    /// DEK (format v4). The complement of `reEncryptSecrets` (which keeps the
-    /// global-DEK rows current); together they let the global DEK retire for the
-    /// secrets table. Personal/org-less secrets are intentionally left global.
+    /// Per-org DEK arc: move existing org-scoped secrets onto their org's ACTIVE
+    /// root DEK (format v4) — rows still on the global DEK, and rows under an
+    /// org DEK retired by `rotateOrgDek`. The complement of `reEncryptSecrets`
+    /// (which keeps the global-DEK rows current); together they let the global
+    /// DEK retire for the secrets table. Personal/org-less secrets are
+    /// intentionally left global.
     async fn re_encrypt_secrets_to_org(&self, ctx: &Context<'_>) -> Result<ReEncryptionResult> {
         require_2fa(ctx)?;
         require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
@@ -401,9 +440,10 @@ impl SecurityMutations {
         })
     }
 
-    /// Per-org DEK arc: migrate existing `actor_memory` rows to their actor's
-    /// org root DEK (format v4). Memory sibling of `reEncryptSecretsToOrg`;
-    /// rows whose actor has no org stay on the global DEK.
+    /// Per-org DEK arc: move existing `actor_memory` rows onto their actor's
+    /// org's ACTIVE root DEK (format v4), including rows under a retired org
+    /// DEK. Memory sibling of `reEncryptSecretsToOrg`; rows whose actor has no
+    /// org stay on the global DEK.
     async fn re_encrypt_memories_to_org(&self, ctx: &Context<'_>) -> Result<ReEncryptionResult> {
         require_2fa(ctx)?;
         require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
@@ -437,10 +477,11 @@ impl SecurityMutations {
         })
     }
 
-    /// Per-org DEK arc: migrate existing encrypted execution outputs to their
-    /// workflow's org root DEK (format v4). Execution-output sibling of
-    /// `reEncryptSecretsToOrg` / `reEncryptMemoriesToOrg`; outputs whose workflow
-    /// has no org stay on the global DEK.
+    /// Per-org DEK arc: move existing encrypted execution outputs onto their
+    /// workflow's org's ACTIVE root DEK (format v4), including outputs under a
+    /// retired org DEK. Execution-output sibling of `reEncryptSecretsToOrg` /
+    /// `reEncryptMemoriesToOrg`; outputs whose workflow has no org stay on the
+    /// global DEK.
     async fn re_encrypt_outputs_to_org(&self, ctx: &Context<'_>) -> Result<ReEncryptionResult> {
         require_2fa(ctx)?;
         require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
@@ -478,9 +519,10 @@ impl SecurityMutations {
         })
     }
 
-    /// Per-org DEK arc: migrate existing module-execution payloads to their
-    /// workflow's org root DEK (format v4). Last of the per-org sweeps; org-less
-    /// / standalone payloads stay on the global DEK.
+    /// Per-org DEK arc: move existing module-execution payloads onto their
+    /// workflow's org's ACTIVE root DEK (format v4), including payloads under a
+    /// retired org DEK. Last of the per-org sweeps; org-less / standalone
+    /// payloads stay on the global DEK.
     async fn re_encrypt_module_payloads_to_org(
         &self,
         ctx: &Context<'_>,
@@ -838,5 +880,49 @@ impl SecurityMutations {
             created_at: row.created_at.to_rfc3339(),
             updated_at: row.updated_at.to_rfc3339(),
         })
+    }
+}
+
+/// TEXTUAL pin (package CE), stated as such: no harness in this crate drives a
+/// GraphQL resolver with a session, so the gate on `rotateOrgDek` is pinned by
+/// reading the resolver's own source. It proves the three gates are CALLED
+/// before the rotation and that a missing org is answered as not found; it
+/// cannot prove a differently spelled bypass is absent.
+#[cfg(test)]
+mod rotate_org_dek_gate_pins {
+    fn resolver_body() -> &'static str {
+        let src = include_str!("mutations.rs");
+        let start = src
+            .find("async fn rotate_org_dek(")
+            .expect("rotateOrgDek resolver present");
+        let rest = &src[start..];
+        let end = rest
+            .find("\n    }\n")
+            .expect("resolver body ends at a four-space closing brace");
+        &rest[..end]
+    }
+
+    #[test]
+    fn the_org_dek_rotation_is_gated_before_it_rotates() {
+        let body = resolver_body();
+        let rotate = body
+            .find(".rotate_dek_for_org(")
+            .expect("the resolver rotates through the manager");
+        for gate in [
+            "require_2fa(ctx)?",
+            "require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?",
+            "require_platform_admin(ctx).await?",
+        ] {
+            let at = body
+                .find(gate)
+                .unwrap_or_else(|| panic!("rotateOrgDek must call `{gate}`"));
+            assert!(at < rotate, "`{gate}` must run before the rotation");
+        }
+        assert!(
+            body.contains(
+                "Ok(None) => Err(async_graphql::Error::new(\"Organization not found\").extend_safe())"
+            ),
+            "a missing organization must be answered as not found"
+        );
     }
 }

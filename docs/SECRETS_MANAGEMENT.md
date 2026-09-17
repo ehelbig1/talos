@@ -121,7 +121,8 @@ CREATE INDEX idx_audit_log_timestamp ON secret_audit_log(timestamp);
 >    Decrypt is identical for v3/v4 (the row's `*_key_id` names the DEK); a per-row
 >    `*_format` column selects the scheme and `SecretsManager::decrypt_versioned`
 >    handles v0/v1/v2/v3/v4 (lazy migration, zero backfill). Existing rows migrate
->    via per-table `re_encrypt_*_to_org` sweeps (platform-admin mutations); the
+>    via per-table `re_encrypt_*_to_org` sweeps (platform-admin mutations), which
+>    also re-key rows under an org DEK retired by `rotateOrgDek`; the
 >    `dekMigrationStatus` query reports remaining work. NOTE: checkpoint + worker
 >    secret-envelope + OTLP-header encryption use a *separate* root
 >    (`WORKER_SHARED_KEY` / `user_id`), not the DEK, and are NOT per-org.

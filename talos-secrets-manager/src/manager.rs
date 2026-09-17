@@ -4736,13 +4736,32 @@ impl SecretsManager {
     /// [`Self::rotate_dek`]: deactivates that org's current active DEK and
     /// inserts a fresh one, leaving every other org and the global DEK
     /// untouched. Existing v4 rows keep decrypting — they pin the old DEK by
-    /// `key_id` (re-encryption to the new key is the later-phase sweep's job).
+    /// `key_id` — until the `re_encrypt_*_to_org` sweeps re-key them onto the
+    /// new one; `dek_migration_status` counts them as pending meanwhile.
+    ///
+    /// Returns `Ok(None)` when no such organization exists (nothing written).
+    /// The audit row (`DEK_ROTATED_ORG`) names the org, so a rotation can be
+    /// attributed to the tenant it retired a key for.
     ///
     /// Serialized by the per-org advisory lock (distinct lock space from the
     /// global `ROTATE_DEK_LOCK_KEY`); `idx_one_active_dek_per_org` is the
     /// schema-level backstop. Wraps the new key BEFORE the lock (KMS round-trip
     /// off the lock) exactly like `rotate_dek`.
-    pub async fn rotate_dek_for_org(&self, org_id: Uuid, auditor: Option<Uuid>) -> Result<Uuid> {
+    pub async fn rotate_dek_for_org(
+        &self,
+        org_id: Uuid,
+        auditor: Option<Uuid>,
+    ) -> Result<Option<Uuid>> {
+        let org_exists: bool =
+            sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM organizations WHERE id = $1)")
+                .bind(org_id)
+                .fetch_one(&self.db_pool)
+                .await
+                .context("Failed to read organization for per-org DEK rotation")?;
+        if !org_exists {
+            return Ok(None);
+        }
+
         let mut new_key = [0u8; 32];
         rand::rngs::OsRng.fill_bytes(&mut new_key);
         let active_wrap = self.current_kek()?.wrap_dek(&new_key).await?;
@@ -4780,18 +4799,17 @@ impl SecretsManager {
         .await
         .context("Failed to insert new per-org DEK")?;
 
-        // Audit inside the same tx (mirrors rotate_dek's L-5). secret_id NULL.
-        Self::log_audit_in_tx(
-            &mut tx,
-            None,
-            "DEK_ROTATED_ORG",
-            "system",
-            auditor,
-            None,
-            true,
-            None,
-            None,
+        // Audit inside the same tx (mirrors rotate_dek's L-5). secret_id NULL;
+        // unlike the global row this one carries the org it rotated
+        // (`log_audit_in_tx` has no org column, and an org rotation recorded
+        // without its org cannot be attributed).
+        sqlx::query(
+            "INSERT INTO secret_audit_log (action, actor_type, actor_id, success, org_id) \
+             VALUES ('DEK_ROTATED_ORG', 'system', $1, true, $2)",
         )
+        .bind(auditor)
+        .bind(org_id)
+        .execute(&mut *tx)
         .await
         .context("Failed to insert audit row for rotate_dek_for_org")?;
 
@@ -4804,7 +4822,7 @@ impl SecretsManager {
         self.active_org_dek_cache.remove(&org_id);
 
         tracing::info!(%org_id, new_dek_id = %new_dek_id, auditor = ?auditor, "Per-org DEK rotated");
-        Ok(new_dek_id)
+        Ok(Some(new_dek_id))
     }
 
     // MCP-944 (2026-05-15): deleted the unused `encrypt_dek_with_master`
@@ -5050,16 +5068,17 @@ impl SecretsManager {
             }
         };
 
-        // Org-scoped rows not yet on v4. (A v4 row whose key_id is a STALE org
-        // DEK — after a per-org rotation — is intentionally NOT swept here; v4
-        // rows decrypt by key_id regardless. Re-keying rotated org rows can be a
-        // later refinement.)
+        // Org-scoped rows not under their org's ACTIVE DEK: not yet v4, or v4
+        // under a DEK that `rotate_dek_for_org` has since retired (package CE —
+        // until then a rotated key stayed load-bearing for every row it had
+        // encrypted). `talos_org_dek_pending` is the one home for the predicate;
+        // `dek_migration_status` counts with it too.
         let stale_rows = sqlx::query(
             "SELECT id, org_id, encrypted_value, encryption_key_id, encryption_format_version \
              FROM secrets \
-             WHERE org_id IS NOT NULL AND encryption_format_version <> $1",
+             WHERE org_id IS NOT NULL \
+               AND talos_org_dek_pending(encryption_key_id, org_id)",
         )
-        .bind(Self::AAD_FORMAT_V4_ORG_DERIVED)
         .fetch_all(&self.db_pool)
         .await?;
 
@@ -5149,12 +5168,13 @@ impl SecretsManager {
         })
     }
 
-    /// Per-org DEK migration status: per encrypted table, how many rows STILL
-    /// reference the global DEK but COULD be moved to a per-org DEK (i.e. the
-    /// remaining work for the `re_encrypt_*_to_org` sweeps). When every count
-    /// reaches 0, the only global-DEK rows left are legitimately org-less
-    /// (e.g. personal secrets, standalone module executions) and the global DEK
-    /// is no longer load-bearing for migratable data.
+    /// Per-org DEK migration status: per encrypted table, how many org-scoped
+    /// rows are NOT under their org's active DEK — still on the global DEK, or
+    /// under an org DEK that has since been rotated (the remaining work for the
+    /// `re_encrypt_*_to_org` sweeps). When every count reaches 0, the only
+    /// global-DEK rows left are legitimately org-less (e.g. personal secrets,
+    /// standalone module executions) and no retired org DEK is load-bearing for
+    /// migratable data.
     ///
     /// Each `pending` count uses the SAME predicate as that table's sweep, so
     /// "run the sweep until pending = 0" is exact. The personal tables
@@ -5172,22 +5192,25 @@ impl SecretsManager {
             r#"
             SELECT 'secrets' AS tbl, true AS has_sweep, COUNT(*) AS pending
               FROM secrets
-             WHERE org_id IS NOT NULL AND encryption_format_version <> 4
+             WHERE org_id IS NOT NULL
+               AND talos_org_dek_pending(encryption_key_id, org_id)
             UNION ALL
             SELECT 'actor_memory', true, COUNT(*)
               FROM actor_memory am JOIN actors a ON a.id = am.actor_id
-             WHERE am.value_format <> 4 AND a.org_id IS NOT NULL
+             WHERE a.org_id IS NOT NULL
+               AND talos_org_dek_pending(am.value_key_id, a.org_id)
             UNION ALL
             SELECT 'workflow_executions.output', true, COUNT(*)
               FROM workflow_executions we JOIN workflows w ON w.id = we.workflow_id
-             WHERE we.output_data_enc IS NOT NULL AND we.output_data_format <> 4
-               AND w.org_id IS NOT NULL
+             WHERE we.output_data_enc IS NOT NULL AND w.org_id IS NOT NULL
+               AND talos_org_dek_pending(we.output_enc_key_id, w.org_id)
             UNION ALL
             SELECT 'module_executions.payloads', true, COUNT(*)
               FROM module_executions me
               JOIN workflow_executions we ON we.id = me.workflow_execution_id
               JOIN workflows w ON w.id = we.workflow_id
-             WHERE me.payload_format <> 4 AND w.org_id IS NOT NULL
+             WHERE w.org_id IS NOT NULL
+               AND talos_org_dek_pending(me.payload_enc_key_id, w.org_id)
                AND (me.input_data_enc IS NOT NULL OR me.output_data_enc IS NOT NULL
                     OR me.trigger_metadata_enc IS NOT NULL)
             UNION ALL
