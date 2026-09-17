@@ -45,6 +45,8 @@ members = [
     "talos-envelope-seal",
     "talos-worker-fleet",
     "talos-schedule-repo",
+    "talos-ops-alert-store",
+    "talos-actor-budget-refusal",
     "talos-ops-alerts-repository",
     "talos-public-url",
     "talos-push-channel-inventory",

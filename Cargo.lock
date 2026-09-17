@@ -7397,6 +7397,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "talos-actor-budget-refusal"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sqlx",
+ "talos-metrics",
+ "talos-ops-alert-store",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "talos-actor-lifecycle-service"
 version = "0.1.0"
 dependencies = [
@@ -7497,12 +7509,14 @@ dependencies = [
  "chrono",
  "serde_json",
  "sqlx",
+ "talos-actor-budget-refusal",
  "talos-capability-world",
  "talos-config",
  "talos-db",
  "talos-dlp-provider",
  "talos-execution-finalizer",
  "talos-memory",
+ "talos-ops-alert-store",
  "talos-secrets-manager",
  "talos-tenancy",
  "talos-text-util",
@@ -9075,6 +9089,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "talos-ops-alert-store"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.18",
+ "uuid",
+]
+
+[[package]]
 name = "talos-ops-alerts-repository"
 version = "0.1.0"
 dependencies = [
@@ -9089,6 +9113,7 @@ dependencies = [
  "talos-config",
  "talos-dlp-provider",
  "talos-metrics",
+ "talos-ops-alert-store",
  "talos-reason-class",
  "talos-text-util",
  "talos-workflow-authorization",
@@ -9999,6 +10024,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sqlx",
+ "talos-actor-budget-refusal",
  "talos-child-workflow-refs",
  "talos-config",
  "talos-db",

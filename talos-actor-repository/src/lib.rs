@@ -1442,14 +1442,9 @@ impl ActorRepository {
     /// [`Self::get_actor_owner_user_id`] plus the (nullable) org, in one
     /// round-trip instead of two.
     pub async fn get_actor_tenancy(&self, actor_id: Uuid) -> Result<Option<(Uuid, Option<Uuid>)>> {
-        let row = sqlx::query("SELECT user_id, org_id FROM actors WHERE id = $1")
-            .bind(actor_id)
-            .fetch_optional(&self.db_pool)
-            .await?;
-        row.map(|r| -> Result<(Uuid, Option<Uuid>)> {
-            Ok((r.try_get("user_id")?, r.try_get::<Option<_>, _>("org_id")?))
-        })
-        .transpose()
+        // One home for the read (package CD): the budget-refusal alert needs
+        // it below this crate.
+        Ok(talos_ops_alert_store::actor_tenancy(&self.db_pool, actor_id).await?)
     }
 
     /// Fetch execution trend for the last 7 days (date + count pairs).
@@ -3324,6 +3319,15 @@ impl ActorRepository {
                         );
                     }
                 }
+                talos_actor_budget_refusal::record_actor_budget_refusal(
+                    &self.db_pool,
+                    actor_id,
+                    talos_actor_budget_refusal::BudgetCap::PerHour,
+                    i64::from(max_per_hour),
+                    count,
+                    &on_exceeded,
+                )
+                .await;
                 return Err(format!(
                     "Actor budget exceeded: {} executions in the last hour (limit: {}). \
                      on_budget_exceeded={}",
@@ -3340,6 +3344,15 @@ impl ActorRepository {
                 .map_err(|e| format!("budget enforcement: total count lookup failed: {e}"))?;
 
             if count >= max_total {
+                talos_actor_budget_refusal::record_actor_budget_refusal(
+                    &self.db_pool,
+                    actor_id,
+                    talos_actor_budget_refusal::BudgetCap::Total,
+                    max_total,
+                    count,
+                    &on_exceeded,
+                )
+                .await;
                 return Err(format!(
                     "Actor budget exceeded: {} total executions (limit: {}). Increase the budget with set_actor_budget.",
                     count, max_total

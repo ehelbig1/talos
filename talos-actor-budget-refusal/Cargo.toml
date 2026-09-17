@@ -1,0 +1,19 @@
+[package]
+name = "talos-actor-budget-refusal"
+description = "The one recorder for an actor-budget refusal: the refusal counter for every mode, and the ops alert on_budget_exceeded = 'alert' promises"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "uuid", "json", "chrono"] }
+talos-metrics = { path = "../talos-metrics" }
+talos-ops-alert-store = { path = "../talos-ops-alert-store" }
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

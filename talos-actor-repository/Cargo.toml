@@ -7,6 +7,10 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# The actor-tenancy read has one home there (package CD).
+talos-ops-alert-store = { path = "../talos-ops-alert-store" }
+# Budget-refusal counter + the alert on_budget_exceeded = 'alert' raises (package CD).
+talos-actor-budget-refusal = { path = "../talos-actor-budget-refusal" }
 talos-execution-finalizer = { path = "../talos-execution-finalizer" }
 talos-workflow-liveness = { path = "../talos-workflow-liveness" }
 anyhow.workspace = true

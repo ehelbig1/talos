@@ -391,7 +391,7 @@ in-process, create no execution row, and are not counted.
 | `max_fuel_per_execution` | Per-execution fuel ceiling | NOT ENFORCED: stored and returned only; per-execution fuel comes from module/node configuration |
 | `max_outbound_requests_per_hour` | Outbound HTTP cap | NOT ENFORCED: stored and returned only |
 | `max_compilations_per_hour` (default 20) | Compilation rate | NOT ENFORCED: stored and returned only |
-| `on_budget_exceeded` | `suspend` (default) / `alert` / `block` | `suspend` auto-suspends the actor when the hourly pre-check trips; `alert` and `block` behave identically — the request is refused and nothing else happens |
+| `on_budget_exceeded` | `suspend` (default) / `alert` / `block` | Every mode refuses the start and counts it on `talos_actor_budget_refusals_total{cap,mode}`. `suspend` also suspends the actor when the hourly pre-check trips. `alert` also raises one ops alert per actor and cap (dedup key `talos/actor/<id>/budget/<cap>`, owned by the actor's user; a repeat within 60 s per controller process is counted but not re-written). `block` refuses and records nothing else |
 
 The MCP `set_actor_budget` tool rejects zero, negative and non-integer values for
 all nine numeric columns (`talos-mcp-handlers/src/actor.rs`).
