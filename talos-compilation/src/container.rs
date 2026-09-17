@@ -207,6 +207,8 @@ pub fn host_fallback_allowed() -> bool {
         if normalized == HOST_FALLBACK_PROD_ACK {
             return true;
         }
+        // allow-inline-env-bool: not a boolean — a production ack token whose
+        // short forms are deliberately REJECTED here (see the doc comment above).
         if matches!(normalized.as_str(), "true" | "1" | "yes") {
             tracing::warn!(
                 target: "talos_compilation",
@@ -225,6 +227,7 @@ pub fn host_fallback_allowed() -> bool {
     // Dev/CI: short-form values keep working so existing test fixtures
     // and local `.env` files don't break. The ack token also works so
     // operators can mirror prod config locally.
+    // allow-inline-env-bool: the dev arm of the same ack-token parse, not a boolean.
     matches!(
         normalized.as_str(),
         "true" | "1" | "yes" | HOST_FALLBACK_PROD_ACK
@@ -772,6 +775,13 @@ mod tests {
         let _g = env_lock();
         std::env::set_var("TALOS_COMPILATION_CONTAINER", "false");
         std::env::set_var("RUST_ENV", "development");
+        // The host command forwards CARGO_TARGET_DIR from the allowlist, so a
+        // test process that inherited one (`CARGO_TARGET_DIR=… cargo test`)
+        // would see it on the no-cache command. Hermetic by removing it for
+        // the test and restoring it after (package CB; found when a deploy
+        // verification ran this binary with the variable exported).
+        let inherited_target_dir = std::env::var_os("CARGO_TARGET_DIR");
+        std::env::remove_var("CARGO_TARGET_DIR");
 
         let ws = PathBuf::from("/tmp/test-workspace");
         let reg = PathBuf::from("/tmp/test-registry");
@@ -796,6 +806,9 @@ mod tests {
             "no-cache path must not override CARGO_TARGET_DIR"
         );
 
+        if let Some(v) = inherited_target_dir {
+            std::env::set_var("CARGO_TARGET_DIR", v);
+        }
         std::env::remove_var("TALOS_COMPILATION_CONTAINER");
     }
 

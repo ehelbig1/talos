@@ -171,12 +171,7 @@ pub(crate) fn publish_worker_build_skew(
 /// unaffected by this flag — they report only positive observations, so they
 /// need no such assertion.
 pub(crate) fn heartbeat_silence_is_authoritative() -> bool {
-    std::env::var("TALOS_WORKER_FLEET_HEARTBEAT_AUTHORITATIVE")
-        .map(|v| {
-            let v = v.trim().to_ascii_lowercase();
-            matches!(v.as_str(), "1" | "true" | "yes" | "on")
-        })
-        .unwrap_or(false)
+    talos_config::bool_env_or_default("TALOS_WORKER_FLEET_HEARTBEAT_AUTHORITATIVE", false)
 }
 
 /// Whether a row is PROVABLY departed: it participated in the liveness protocol
@@ -1432,12 +1427,8 @@ pub(crate) fn spawn_metrics_gauge_tasks(
                     // error. See `departed_liveness_cutoff_hours`.
                     .map(|h| h.clamp(1, MAX_REAP_SILENCE_HOURS));
 
-            let enabled = std::env::var("TALOS_WORKER_IDENTITY_REAP_ENABLED")
-                .map(|v| {
-                    let v = v.trim().to_ascii_lowercase();
-                    matches!(v.as_str(), "1" | "true" | "yes" | "on")
-                })
-                .unwrap_or(false);
+            let enabled =
+                talos_config::bool_env_or_default("TALOS_WORKER_IDENTITY_REAP_ENABLED", false);
             if !enabled {
                 tracing::info!(
                     target: "worker_registry",

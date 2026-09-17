@@ -367,7 +367,7 @@ touches the object store; it carries no S3 identity for it.
 | `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | SDK chain | The **writer**, read implicitly by `aws_config::load_defaults`. On this platform they are the `audit_write_only` identity (`s3:PutObject` and nothing else) |
 | `AUDIT_VERIFIER_ACCESS_KEY_ID` / `AUDIT_VERIFIER_SECRET_ACCESS_KEY` | (none) | The **verifier**, resolved EXPLICITLY with no `load_defaults` on the path. Both halves required |
 | `AWS_REGION` / `AWS_DEFAULT_REGION` | `us-east-1` (verifier) | Region. Note the asymmetry: the verifier resolves these itself and falls back to `us-east-1`; the writer takes whatever the SDK's own chain resolves, so a deployment that sets neither can have a writer that errors on region and a verifier that quietly assumes one |
-| `TALOS_AUDIT_S3_OBJECT_LOCK` / `TALOS_AUDIT_S3_RETENTION_DAYS` | (none) | Object-Lock posture on written objects |
+| `TALOS_AUDIT_S3_OBJECT_LOCK` / `TALOS_AUDIT_S3_RETENTION_DAYS` | off / `2555` | Object-Lock posture on written objects (boolean; retention in days, [1, 36500]) |
 | `AUDIT_CHAIN_SWEEP_INTERVAL_SECS` | `3600` | Chain-verification sweep cadence; `0` disables it |
 
 The two identities are the subject of the next subsection and must not be

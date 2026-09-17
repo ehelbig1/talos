@@ -353,26 +353,11 @@ pub async fn rls_enforcement_effective(pool: &Pool<Postgres>) -> anyhow::Result<
     Ok(check_rls_role(pool).await?.rls_enforced())
 }
 
-/// Pure parse of a boolean opt-in flag value (`1` / `true` / `yes` / `on`,
-/// case-insensitive, surrounding whitespace ignored). `None` (unset) → `false`.
-/// Split out so the accept/reject logic is unit-tested without touching process
-/// env (which is global mutable state and racy across parallel tests).
-fn parse_opt_in(value: Option<&str>) -> bool {
-    match value {
-        Some(v) => {
-            let v = v.trim();
-            v.eq_ignore_ascii_case("true")
-                || v == "1"
-                || v.eq_ignore_ascii_case("yes")
-                || v.eq_ignore_ascii_case("on")
-        }
-        None => false,
-    }
-}
-
-/// Parse a boolean opt-in env var (`1` / `true` / `yes` / `on`, case-insensitive).
+/// Parse a boolean opt-in env var through the shared vocabulary
+/// (`talos_config::bool_env`: `true|1|yes|on`, an unrecognised value WARNs and
+/// counts as off). Package CB: this crate carried its own copy of that set.
 fn env_opt_in(var: &str) -> bool {
-    parse_opt_in(std::env::var(var).ok().as_deref())
+    talos_config::bool_env_or_default(var, false)
 }
 
 /// Production fail-closed RLS posture guard (RFC 0004 / RFC 0005 S3).
@@ -762,23 +747,8 @@ mod rls_role_prefix_tests {
 
 #[cfg(test)]
 mod rls_prod_guard_tests {
-    use super::{enforce_production_rls_posture, parse_opt_in};
+    use super::enforce_production_rls_posture;
     use sqlx::postgres::PgPoolOptions;
-
-    #[test]
-    fn opt_in_accepts_truthy_forms() {
-        for v in ["1", "true", "TRUE", "yes", "On", " true ", "\ton\n"] {
-            assert!(parse_opt_in(Some(v)), "should accept {v:?}");
-        }
-    }
-
-    #[test]
-    fn opt_in_rejects_falsy_and_unset() {
-        assert!(!parse_opt_in(None));
-        for v in ["", "0", "false", "no", "off", "enabled", "2", "y"] {
-            assert!(!parse_opt_in(Some(v)), "should reject {v:?}");
-        }
-    }
 
     #[tokio::test]
     async fn guard_is_noop_outside_production() {

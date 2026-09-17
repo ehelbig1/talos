@@ -3689,12 +3689,8 @@ pub(crate) fn build_router(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .map(std::sync::Arc::new);
-    let worker_reg_require_bound = std::env::var("TALOS_WORKER_REG_REQUIRE_BOUND_TOKEN")
-        .map(|v| {
-            let v = v.trim().to_ascii_lowercase();
-            matches!(v.as_str(), "1" | "true" | "yes" | "on")
-        })
-        .unwrap_or(false);
+    let worker_reg_require_bound =
+        talos_config::bool_env_or_default("TALOS_WORKER_REG_REQUIRE_BOUND_TOKEN", false);
     let internal_routes = if worker_reg_shared_token.is_some() || worker_reg_require_bound {
         tracing::info!(
             require_bound_token = worker_reg_require_bound,
