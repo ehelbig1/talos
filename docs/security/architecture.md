@@ -516,15 +516,20 @@ every environment.
 | Table | Purpose | Immutability | DLP |
 |-------|---------|-------------|-----|
 | S3/MinIO WORM bucket (not a table) | Execution audit ledger: per-job HMAC hash chain written by the worker, verified hourly by the controller sweep (`talos_audit_verification_failures_total`) | Object-store WORM + hash chain; `audit_events` table dropped 2026-09-11 (never written) | n/a |
-| `auth_audit_log` | Authentication events: `signup`, `login_success`, `login_failed`, `account_locked`, `token_refresh`, `refresh_token_reuse_detected`, `password_change` (no logout event is written) | Trigger: `trg_auth_audit_log_immutable` | Partial: `user_agent` redacted; `email` and `failure_reason` stored as-is |
-| `secret_audit_log` | Secret access events | Trigger: `trg_secret_audit_log_immutable` | Partial: error message redacted; stores `key_hash`, not values |
-| `admin_event_log` | Admin action events | Trigger: `trg_admin_event_log_immutable` | Partial: the actor-repository and API-key writers redact summary/details; the ML lifecycle and worker-provisioning-token writers insert without redaction |
+| `auth_audit_log` | Authentication events: `signup`, `login_success`, `login_failed`, `account_locked`, `token_refresh`, `refresh_token_reuse_detected`, `password_change` (no logout event is written) | Triggers: `trg_auth_audit_log_immutable` (UPDATE/DELETE), `trg_auth_audit_log_immutable_truncate` (TRUNCATE) | Partial: `user_agent` redacted; `email` and `failure_reason` stored as-is |
+| `secret_audit_log` | Secret access events | Triggers: `trg_secret_audit_log_immutable` (UPDATE/DELETE), `trg_secret_audit_log_immutable_truncate` (TRUNCATE) | Partial: error message redacted; stores `key_hash`, not values |
+| `admin_event_log` | Admin action events | Triggers: `trg_admin_event_log_immutable` (UPDATE/DELETE), `trg_admin_event_log_immutable_truncate` (TRUNCATE) | Partial: the actor-repository and API-key writers redact summary/details; the ML lifecycle and worker-provisioning-token writers insert without redaction |
+| `schema_audit_log` | DDL change record: every migration's `CREATE`/`ALTER`/`DROP`, written by the `log_schema_changes` event trigger; exported as SOC 2 CC8.1 evidence | Triggers: `trg_schema_audit_log_immutable` (UPDATE/DELETE), `trg_schema_audit_log_immutable_truncate` (TRUNCATE) | n/a: DDL text, no user data |
+| `oauth_audit_log` | OAuth connect / disconnect / refresh events | Triggers: `trg_oauth_audit_log_immutable` (UPDATE/DELETE), `trg_oauth_audit_log_immutable_truncate` (TRUNCATE) | Partial: provider and event only, no tokens |
+| `gmail_integration_audit_log` | Gmail integration connect / disconnect / watch events | Triggers: `trg_gmail_integration_audit_log_immutable` (UPDATE/DELETE), `trg_gmail_integration_audit_log_immutable_truncate` (TRUNCATE) | Partial: error message stored as returned |
+| `slack_integration_audit_log` | Slack integration connect / disconnect events | Triggers: `trg_slack_integration_audit_log_immutable` (UPDATE/DELETE), `trg_slack_integration_audit_log_immutable_truncate` (TRUNCATE) | Partial: error message stored as returned |
 
-All triggers use `prevent_audit_modification()` function: BEFORE UPDATE OR DELETE, raises SQLSTATE 42501 (insufficient_privilege).
+All triggers use the `prevent_audit_modification()` function and raise SQLSTATE 42501 (insufficient_privilege). Each table carries TWO: a row trigger BEFORE UPDATE OR DELETE, and a statement trigger BEFORE TRUNCATE (package CG, 2026-09-17 — TRUNCATE fires no row trigger, so until then it emptied an audit table with nothing raised). TRUNCATE needs the table owner: `talos_app`, the role the RLS path runs as, holds no TRUNCATE grant, and sandbox SQL cannot issue one (it is DDL, refused by the worker validator and by the controller's statement classifier). These tables hold their parent ids as plain historical references with no enforced delete action — an `ON DELETE CASCADE`/`SET NULL` into a table that refuses DELETE makes the PARENT undeletable (#264/#266, lint check 47).
 The retention cleanup for `auth_audit_log` and `secret_audit_log` checks the
 catalog for that trigger first and, when present, issues no DELETE and reports
-`ImmutableByPolicy`. The trigger blocks row-level UPDATE/DELETE; it does not
-stop a database role that can disable or drop the trigger.
+`ImmutableByPolicy`. The triggers block UPDATE, DELETE and TRUNCATE; they do not
+stop a database role that can disable or drop a trigger, and a SUPERUSER
+bypasses every trigger with `SET session_replication_role = replica`.
 
 #### 6.1.1 WORM ledger cryptographic verification (finding #2)
 

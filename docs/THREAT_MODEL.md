@@ -349,7 +349,7 @@ This is the highest-risk attack surface. Users submit arbitrary Rust source code
 
 ### Tampering
 - **Threat:** Direct modification of audit records to cover tracks.
-- **Mitigation:** Immutability triggers on all 3 audit tables (`auth_audit_log`, `secret_audit_log`, `admin_event_log`); the execution audit ledger is the S3 WORM hash chain verified by the controller sweep (`audit_events`, a table nothing ever wrote, was dropped 2026-09-11). BEFORE UPDATE OR DELETE raises SQLSTATE 42501. Append-only design.
+- **Mitigation:** Immutability triggers on all 7 audit tables (`auth_audit_log`, `secret_audit_log`, `admin_event_log`, `schema_audit_log`, `oauth_audit_log`, `gmail_integration_audit_log`, `slack_integration_audit_log`), refusing UPDATE, DELETE and TRUNCATE; the execution audit ledger is the S3 WORM hash chain verified by the controller sweep (`audit_events`, a table nothing ever wrote, was dropped 2026-09-11). BEFORE UPDATE OR DELETE raises SQLSTATE 42501. Append-only design.
 - **File:** `migrations/20260911160000_drop_dead_audit_events_table.sql` (and the trigger definitions in the schema baseline)
 
 ### Information Disclosure
@@ -426,7 +426,7 @@ Rhai is used for approval condition evaluation, node skip conditions, edge condi
 |---------|---------------|-----------|
 | WASM sandboxing | Fuel limits, memory caps, capability worlds, wall-clock timeout | `talos-worker-runtime/src/runtime.rs` |
 | Job signing | HMAC-SHA256 (default) or Ed25519 signature, nonce + 300 s freshness per job; secrets in AES-256-GCM under a per-job HKDF subkey, or claim-based X25519 sealing | `talos-workflow-job-protocol/src/lib.rs` |
-| Audit ledger | HMAC-signed events, hash chains, DB immutability triggers on 3 tables, **consumer-side inline HMAC+hash verify before WORM persist (poison → `rejected/`; Object Lock only with `TALOS_AUDIT_S3_OBJECT_LOCK=true`), anchored verification of sequence/linkage/genesis/terminal anchor** | `talos-audit-event/src/lib.rs`, `talos-audit-ledger/src/lib.rs` |
+| Audit ledger | HMAC-signed events, hash chains, DB immutability triggers on 7 tables (UPDATE/DELETE and TRUNCATE), **consumer-side inline HMAC+hash verify before WORM persist (poison → `rejected/`; Object Lock only with `TALOS_AUDIT_S3_OBJECT_LOCK=true`), anchored verification of sequence/linkage/genesis/terminal anchor** | `talos-audit-event/src/lib.rs`, `talos-audit-ledger/src/lib.rs` |
 | SQL validation (guest SQL) | AST-parsed via sqlparser: single statement, fail-closed parse, DDL and a statement deny-list blocked, CTE mutations classified, disallowed-function list. It validates statement shape; it does not require bind parameters (SQL with literal values is accepted). | `talos-worker-runtime/src/sql_validator.rs` |
 | DLP | PII redaction (SSN, CC, email, phone, JWT), Luhn validation, at persistence boundaries; not on WORM ledger events | `talos-dlp-provider/src/lib.rs` |
 | Rate limiting | Per-IP and global in-memory limiters per replica (per-IP off outside production unless `ENFORCE_RATE_LIMITS_IN_DEV`); Redis-backed auth limiter fail-closed in production; MCP token-auth limiter | `talos-rate-limit/src/middleware.rs` |
