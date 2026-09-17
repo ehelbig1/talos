@@ -729,19 +729,26 @@ impl BeginPayload {
     }
 }
 
-/// Webhook deduplication service
+/// Webhook deduplication service.
+///
+/// The retention window is NOT stored here and is passed per call (package CI,
+/// 2026-09-17): it is a property of the scheme that authenticated the request,
+/// not of the store. The GitHub HMAC signs the body alone, so it has no
+/// freshness window and this store is its ONLY replay defence, while every
+/// other format binds a timestamp into the signed bytes and needs the store
+/// only against concurrent redelivery — one number could not serve both, and a
+/// window configured here that the caller then overrode would be a value
+/// nothing applies. `talos_webhooks::signature::dedup_window` is the one home.
 pub struct WebhookDeduplication {
     redis: Arc<redis::Client>,
-    window: Duration,
     /// M4 (2026-05-28 review): cached, auto-reconnecting multiplexed connection.
     conn_mgr: tokio::sync::OnceCell<redis::aio::ConnectionManager>,
 }
 
 impl WebhookDeduplication {
-    pub fn new(redis: Arc<redis::Client>, window: Duration) -> Self {
+    pub fn new(redis: Arc<redis::Client>) -> Self {
         Self {
             redis,
-            window,
             conn_mgr: tokio::sync::OnceCell::new(),
         }
     }
@@ -757,8 +764,27 @@ impl WebhookDeduplication {
         Ok(mgr.clone())
     }
 
-    /// Check if webhook was already processed
-    pub async fn is_duplicate(&self, trigger_id: Uuid, event_id: &str) -> Result<bool> {
+    /// Check if webhook was already processed, recording the claim for
+    /// `window` when it was not.
+    ///
+    /// `window` is how long a replay of this exact event stays suppressed —
+    /// and, for a format whose fingerprint is deterministic in the body, how
+    /// long a legitimate redelivery of the same payload stays suppressed too.
+    /// The caller derives it from the verified format
+    /// (`talos_webhooks::signature::dedup_window`); a zero window is refused
+    /// rather than passed to Redis, where `EX 0` is an error and would fail the
+    /// dedup check open for a format whose only replay defence this is.
+    pub async fn is_duplicate(
+        &self,
+        trigger_id: Uuid,
+        event_id: &str,
+        window: Duration,
+    ) -> Result<bool> {
+        let secs = window.as_secs();
+        if secs == 0 {
+            anyhow::bail!("webhook dedup window must be at least one second");
+        }
+
         let mut conn = self.conn().await?;
 
         let key = format!("webhook:processed:{}:{}", trigger_id, event_id);
@@ -769,7 +795,7 @@ impl WebhookDeduplication {
             .arg("1")
             .arg("NX")
             .arg("EX")
-            .arg(self.window.as_secs() as usize)
+            .arg(secs as usize)
             .query_async(&mut conn)
             .await?;
 

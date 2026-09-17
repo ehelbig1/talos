@@ -779,12 +779,13 @@ pub(crate) async fn build_platform_services(
     }
 
     // ---------- Initialize Webhook Deduplication ----------
-    let webhook_deduplication = redis_client.clone().map(|redis| {
-        std::sync::Arc::new(idempotency::WebhookDeduplication::new(
-            redis,
-            std::time::Duration::from_secs(3600), // 1 hour dedup window
-        ))
-    });
+    // The retention window is NOT set here (package CI): it is per format, and
+    // `talos_webhooks::signature::dedup_window` is its one home — the GitHub
+    // format's claim is held 24 h because this store is its only replay
+    // defence, everything else 1 h.
+    let webhook_deduplication = redis_client
+        .clone()
+        .map(|redis| std::sync::Arc::new(idempotency::WebhookDeduplication::new(redis)));
     tracing::info!(
         "Webhook deduplication initialized: {}",
         webhook_deduplication.is_some()
