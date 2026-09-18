@@ -698,8 +698,8 @@ use super::dispatch::{
 use axum::body::Bytes;
 use axum::http::HeaderMap;
 use talos_integration_helpers::google_jwt::{
-    record_missing_bearer, record_push_refusal, GoogleOidcVerifier, PubsubPushEnvelope,
-    PushIntegration,
+    record_missing_bearer, record_push_accepted, record_push_refusal, GoogleOidcVerifier,
+    PubsubPushEnvelope, PushIntegration,
 };
 
 /// Whether a verified GCP push would START work: a dispatch context is wired
@@ -809,6 +809,10 @@ pub async fn pubsub_push_handler(
         audit_push_rejected(&state.watch_service.pool, user_id, &row, &e.to_string()).await;
         return StatusCode::UNAUTHORIZED;
     }
+    // Authentication is complete (signature, claims, per-watch service
+    // account): count the accepted push, so a stream that goes quiet is
+    // visible (`TalosGooglePushSilent`).
+    record_push_accepted(PushIntegration::Gcp);
 
     // 5. Decode envelope → base64 inner payload → Cloud Monitoring JSON.
     let env: PubsubPushEnvelope = match serde_json::from_slice(&body) {
@@ -1087,6 +1091,48 @@ mod pubsub_tests {
             claims.require_service_account(SA).expect_err("must reject"),
             VerifyError::WrongEmail
         ));
+    }
+
+    /// A push whose JWT verifies but whose token names no watch is NOT an
+    /// accepted push: GCP authentication completes only at the per-watch
+    /// service-account check, which such a push never reaches. Counting it
+    /// earlier would let a stream of stale-token deliveries keep
+    /// `TalosGooglePushSilent` quiet. (The positive path needs a persisted
+    /// watch row; it is pinned textually in talos-integration-helpers.)
+    #[tokio::test]
+    async fn a_verified_push_for_no_watch_is_not_counted_as_accepted() {
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
+        let accepted = || {
+            talos_metrics::global()
+                .expect("registry installed")
+                .google_push_accepted_total
+                .with_label_values(&["gcp"])
+                .get()
+        };
+        let (enc, dec, kid) = keypair();
+        let state = state_with(dec, &kid, AUD, None);
+        let token = sign(
+            &enc,
+            &kid,
+            json!({
+                "iss": "https://accounts.google.com",
+                "email": SA,
+                "email_verified": true,
+                "aud": AUD,
+                "iat": now(),
+                "exp": now() + 300,
+            }),
+        );
+        let before = accepted();
+        let status = pubsub_push_handler(
+            Path("no-such-watch-token".into()),
+            State(state),
+            bearer(&token),
+            valid_envelope_body(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(accepted() - before, 0.0, "no watch, no accepted push");
     }
 
     #[tokio::test]

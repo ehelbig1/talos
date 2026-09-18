@@ -86,6 +86,12 @@ impl PubsubJwtVerifier {
             .verify_signed(token, &self.expected_audience)
             .await?;
         claims.require_service_account(&self.expected_email)?;
+        // Authentication is complete: count the accepted push HERE, the one
+        // place every Gmail push passes through on success, so a stream that
+        // goes quiet is visible (`TalosGooglePushSilent`).
+        talos_integration_helpers::google_jwt::record_push_accepted(
+            talos_integration_helpers::google_jwt::PushIntegration::Gmail,
+        );
         Ok(claims)
     }
 
@@ -190,6 +196,62 @@ mod tests {
         let mut header = Header::new(Algorithm::RS256);
         header.kid = Some(kid.to_string());
         encode(&header, &claims, enc).unwrap()
+    }
+
+    fn accepted_gmail_pushes() -> f64 {
+        talos_metrics::global()
+            .expect("registry installed")
+            .google_push_accepted_total
+            .with_label_values(&["gmail"])
+            .get()
+    }
+
+    /// A push that passes authentication is COUNTED as accepted, exactly
+    /// once; one refused for its service account is not. The counter is the
+    /// only series that can say a push stream went quiet
+    /// (`TalosGooglePushSilent`), so a verify that forgets it reads as a
+    /// silent mailbox. No other test in this crate verifies a push
+    /// successfully, so the global delta is this test's alone.
+    #[tokio::test]
+    async fn an_authenticated_push_is_counted_and_a_refused_one_is_not() {
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
+        let (enc, dec, kid) = keypair();
+        let v = make_verifier(dec, &kid);
+        let claims = |email: &str| {
+            json!({
+                "iss": GOOGLE_ISSUER,
+                "email": email,
+                "email_verified": true,
+                "aud": "https://example/webhook",
+                "iat": now(),
+                "exp": now() + 300,
+            })
+        };
+
+        let before = accepted_gmail_pushes();
+        let ok = sign(
+            &enc,
+            &kid,
+            claims("gmail-api-push@system.gserviceaccount.com"),
+        );
+        v.verify(&ok).await.expect("a valid Gmail push verifies");
+        assert_eq!(
+            accepted_gmail_pushes() - before,
+            1.0,
+            "counted exactly once"
+        );
+
+        let refused = sign(
+            &enc,
+            &kid,
+            claims("another-service@system.gserviceaccount.com"),
+        );
+        v.verify(&refused).await.expect_err("wrong service account");
+        assert_eq!(
+            accepted_gmail_pushes() - before,
+            1.0,
+            "a refused push is not counted as accepted"
+        );
     }
 
     #[tokio::test]

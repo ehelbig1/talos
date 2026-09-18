@@ -61,6 +61,9 @@ urlencoding = "2.1"
 uuid.workspace = true
 
 [dev-dependencies]
+# pubsub_jwt::tests reads talos_google_push_accepted_total back from the
+# global registry.
+talos-metrics = { path = "../talos-metrics" }
 # Used by pubsub_jwt::tests to mint RSA keypairs that back locally-signed
 # test JWTs. Production verifier fetches JWKs from Google and never calls
 # rsa::* directly. jsonwebtoken is test-only now that the verifier kernel

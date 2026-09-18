@@ -535,6 +535,22 @@ pub fn record_google_push_refusal_on(
         .inc();
 }
 
+/// Count one Google push delivery that passed authentication. Inert without
+/// [`set_global`].
+pub fn record_google_push_accepted(integration: PushIntegration) {
+    if let Some(m) = global() {
+        record_google_push_accepted_on(m, integration);
+    }
+}
+
+/// The recording itself, against an EXPLICIT registry.
+pub fn record_google_push_accepted_on(metrics: &TalosMetrics, integration: PushIntegration) {
+    metrics
+        .google_push_accepted_total
+        .with_label_values(&[integration.as_str()])
+        .inc();
+}
+
 /// Seed every `talos_vault_token_renewals_total` outcome at 0. Called by the
 /// Vault token renewal loop when it starts — NOT by [`TalosMetrics::new`],
 /// because only a process running a Vault KEK provider can move the series.
@@ -1609,6 +1625,7 @@ pub struct TalosMetrics {
     // after one JWK fetch failure produced 94 WARN lines and no series. Both
     // seeded over their closed sets (`google_push`).
     pub google_push_refusals_total: CounterVec,
+    pub google_push_accepted_total: CounterVec,
 
     // Deployment-wide execution pause — added 2026-09-14 (package BF) when the
     // pause turned out never to have taken effect. `PauseGatePath::ALL` ×
@@ -2991,6 +3008,26 @@ impl TalosMetrics {
                     .inc_by(0.0);
             }
         }
+        let google_push_accepted_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_google_push_accepted_total",
+                "Google Pub/Sub push deliveries that PASSED authentication, by integration \
+                 (gmail | gcp) — counted the moment the push's JWT verifies, before any \
+                 payload decode or dispatch. The positive twin of \
+                 talos_google_push_refusals_total: a push stream that stops (a deleted \
+                 subscription, a moved push endpoint, a revoked publisher grant) refuses \
+                 nothing, so only this series can say it went quiet. Closed set \
+                 (talos_metrics::PushIntegration), both values pre-seeded at 0. Alerted by \
+                 TalosGooglePushSilent (pushes in the last 7 d, none in the last 12 h).",
+            ),
+            &["integration"],
+        )?;
+        registry.register(Box::new(google_push_accepted_total.clone()))?;
+        for integration in PushIntegration::ALL {
+            google_push_accepted_total
+                .with_label_values(&[integration.as_str()])
+                .inc_by(0.0);
+        }
         let google_jwk_refresh_total = CounterVec::new(
             prometheus::Opts::new(
                 "talos_google_jwk_refresh_total",
@@ -3512,6 +3549,7 @@ impl TalosMetrics {
             scheduler_readiness_degraded,
             rate_limit_hits_total,
             google_push_refusals_total,
+            google_push_accepted_total,
             execution_pause_refusals_total,
             webhook_duplicate_suppressed_total,
             actor_budget_refusals_total,
@@ -3926,6 +3964,24 @@ mod tests {
         // The counter is seeded, so its line count does not move.
         assert_eq!(lines(&cold, "talos_rpc_calls_total"), 64);
         assert_eq!(lines(&warm, "talos_rpc_calls_total"), 64);
+    }
+
+    /// The accepted-push counter (2026-09-18) is seeded for every
+    /// integration and moved by exactly the integration it was given.
+    #[test]
+    fn google_push_accepted_is_seeded_and_moved_by_integration() {
+        let m = TalosMetrics::new().unwrap();
+        let cold = m.render_prometheus().expect("render");
+        for i in PushIntegration::ALL {
+            assert!(cold.contains(&format!(
+                "talos_google_push_accepted_total{{integration=\"{}\"}} 0",
+                i.as_str()
+            )));
+        }
+        record_google_push_accepted_on(&m, PushIntegration::Gmail);
+        let warm = m.render_prometheus().expect("render");
+        assert!(warm.contains("talos_google_push_accepted_total{integration=\"gmail\"} 1"));
+        assert!(warm.contains("talos_google_push_accepted_total{integration=\"gcp\"} 0"));
     }
 
     /// The Google push counters (2026-09-12) are seeded over the FULL

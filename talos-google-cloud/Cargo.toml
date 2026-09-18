@@ -52,6 +52,9 @@ urlencoding = "2.1"
 uuid.workspace = true
 
 [dev-dependencies]
+# handlers::tests reads talos_google_push_accepted_total from the global
+# registry.
+talos-metrics = { path = "../talos-metrics" }
 # handlers::tests mint RSA-signed push JWTs to exercise the push-handler
 # auth ordering. Production verifies Google's JWKs; rsa is test-only.
 rsa = { version = "0.9", features = ["pem"] }

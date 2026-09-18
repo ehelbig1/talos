@@ -1,6 +1,8 @@
 //! Closed label sets for the Google push-authentication counters —
-//! `talos_google_push_refusals_total{integration,reason}` and
-//! `talos_google_jwk_refresh_total{outcome}`.
+//! `talos_google_push_refusals_total{integration,reason}`,
+//! `talos_google_push_accepted_total{integration}` (2026-09-18: a stream that
+//! stops refuses nothing, so only an accepted count can say it went quiet)
+//! and `talos_google_jwk_refresh_total{outcome}`.
 //!
 //! Why they exist (2026-09-12, deploy of #837): ONE failed fetch of Google's
 //! JWK set opened `GoogleOidcVerifier`'s 60 s backoff window and the 92 Gmail
