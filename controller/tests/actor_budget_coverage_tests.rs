@@ -511,3 +511,136 @@ fn the_undriven_start_paths_name_the_shared_check() {
         "MCP test_workflow_draft must record the actor its engine runs as"
     );
 }
+
+// ── One pre-check, one set of counts (2026-09-18) ───────────────────────────
+//
+// `authorize_workflow_trigger` called `ActorRepository::check_execution_allowed`,
+// an inline SECOND copy of the pre-check that skipped the token cap, and every
+// pre-check counted the lifetime cap from the live table only while the
+// in-transaction admission counted live + archive. The trigger gate now IS
+// `budget_precheck::check_execution_allowed`, and the counts have one home.
+
+#[tokio::test]
+async fn the_trigger_gate_precheck_reads_the_token_cap() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let f = fixture(&pool).await;
+    hold_at_cap(&pool, &f, "max_llm_tokens_per_day").await;
+
+    let got = talos_actor_repository::ActorRepository::new(pool.clone())
+        .check_execution_allowed(f.actor)
+        .await;
+    let msg = got.expect_err("an actor over its token cap is refused at the trigger gate");
+    assert!(
+        msg.contains("token"),
+        "refused for the token cap, got: {msg}"
+    );
+
+    // Control: the same gate admits an actor with no policy.
+    let g = fixture(&pool).await;
+    talos_actor_repository::ActorRepository::new(pool.clone())
+        .check_execution_allowed(g.actor)
+        .await
+        .expect("no policy, no refusal");
+}
+
+#[tokio::test]
+async fn the_precheck_counts_archived_executions_toward_the_lifetime_cap() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let f = fixture(&pool).await;
+    for _ in 0..2 {
+        sqlx::query(
+            "INSERT INTO workflow_executions \
+             (id, workflow_id, user_id, status, started_at, completed_at, actor_id) \
+             VALUES ($1, $2, $3, 'completed', NOW() - INTERVAL '2 days', \
+                     NOW() - INTERVAL '2 days', $4)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(f.wf)
+        .bind(f.user)
+        .bind(f.actor)
+        .execute(&pool)
+        .await
+        .expect("seed old execution");
+    }
+    let moved = talos_advanced_repository::AdvancedRepository::new(pool.clone())
+        .archive_executions(1, f.user)
+        .await
+        .expect("archive");
+    assert_eq!(moved, 2, "both executions move to the archive");
+    sqlx::query(
+        "INSERT INTO actor_budget_policies (actor_id, max_executions_total, on_budget_exceeded) \
+         VALUES ($1, 2, 'block')",
+    )
+    .bind(f.actor)
+    .execute(&pool)
+    .await
+    .expect("lifetime cap");
+
+    let repo = talos_actor_repository::ActorRepository::new(pool.clone());
+    assert_eq!(
+        repo.count_total_executions(f.actor).await.unwrap(),
+        2,
+        "the lifetime count includes the archive"
+    );
+    let gate = repo
+        .check_execution_allowed(f.actor)
+        .await
+        .expect_err("the trigger gate refuses at the lifetime cap");
+    assert!(gate.contains("total"), "lifetime cap message, got: {gate}");
+    talos_actor_repository::budget_precheck::check_execution_allowed(&pool, f.actor)
+        .await
+        .expect_err("the module pre-check agrees");
+
+    // And the authoritative admission says the same thing.
+    let mut tx = pool.begin().await.unwrap();
+    let admission = talos_execution_repository::admit_actor_budget(&mut tx, f.actor)
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+    assert!(
+        matches!(admission, BudgetAdmission::Refused(_)),
+        "admission and pre-check agree"
+    );
+}
+
+/// The shared hourly count is a ROLLING hour: an execution that started two
+/// hours ago does not count toward an hourly cap of 1, at the pre-check or at
+/// the admission. (Every other test seeds its executions at `NOW()`, so a
+/// widened window passed all of them.)
+#[tokio::test]
+async fn an_execution_older_than_an_hour_does_not_count_toward_the_hourly_cap() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let f = fixture(&pool).await;
+    sqlx::query(
+        "INSERT INTO workflow_executions \
+         (id, workflow_id, user_id, status, started_at, completed_at, actor_id) \
+         VALUES ($1, $2, $3, 'completed', NOW() - INTERVAL '2 hours', \
+                 NOW() - INTERVAL '2 hours', $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(f.wf)
+    .bind(f.user)
+    .bind(f.actor)
+    .execute(&pool)
+    .await
+    .expect("seed older execution");
+    sqlx::query(
+        "INSERT INTO actor_budget_policies (actor_id, max_executions_per_hour, on_budget_exceeded) \
+         VALUES ($1, 1, 'block')",
+    )
+    .bind(f.actor)
+    .execute(&pool)
+    .await
+    .expect("hourly cap");
+
+    talos_actor_repository::ActorRepository::new(pool.clone())
+        .check_execution_allowed(f.actor)
+        .await
+        .expect("an execution two hours old is outside the rolling hour");
+    let mut tx = pool.begin().await.unwrap();
+    let admission = talos_execution_repository::admit_actor_budget(&mut tx, f.actor)
+        .await
+        .unwrap();
+    tx.rollback().await.unwrap();
+    assert!(matches!(admission, BudgetAdmission::Admitted));
+}

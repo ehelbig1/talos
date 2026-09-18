@@ -362,3 +362,28 @@ pub async fn check_execution_allowed_for_batch(
     check_actor_llm_token_budget(pool, actor_id, &budget).await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod trigger_gate_error_tests {
+    /// The trigger gate's refusal string reaches MCP and GraphQL callers
+    /// verbatim (`TriggerAuthError::ExecutionDenied`). Its old inline copy
+    /// formatted the raw sqlx error into it (`status lookup failed: {e}`);
+    /// on a database that cannot be reached the caller must get the
+    /// sanitised sentence and nothing from the driver.
+    #[tokio::test]
+    async fn an_unreachable_database_yields_the_sanitised_refusal() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_millis(200))
+            .connect_lazy("postgres://127.0.0.1:1/nodb")
+            .expect("lazy pool");
+        let msg = crate::ActorRepository::new(pool)
+            .check_execution_allowed(uuid::Uuid::new_v4())
+            .await
+            .expect_err("an unreadable status refuses");
+        assert_eq!(
+            msg,
+            "Failed to verify actor status (database error). Retry the request; if the issue \
+             persists, check controller logs."
+        );
+    }
+}

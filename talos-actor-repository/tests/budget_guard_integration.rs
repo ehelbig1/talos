@@ -35,21 +35,31 @@ macro_rules! pool_or_skip {
 }
 
 /// Minimal schema covering exactly the columns `check_execution_allowed`
-/// touches: actors.status, actor_budget_policies.{max_executions_per_hour,
-/// max_executions_total, on_budget_exceeded}, and workflow_executions for the
-/// count helpers.
+/// touches: actors.{status, user_id} (the auto-suspend is owner-scoped),
+/// every actor_budget_policies column the shared policy read selects, and
+/// workflow_executions for the count helpers. Since 2026-09-18 the method IS
+/// `budget_precheck::check_execution_allowed`; with the old three-column
+/// policy table every call failed at the policy read, so the archived half
+/// passed because NOTHING ran and the active half could not suspend.
 async fn setup(pool: &PgPool) {
     pool.execute(
         "DROP TABLE IF EXISTS workflow_executions CASCADE; \
          DROP TABLE IF EXISTS actor_budget_policies CASCADE; \
          DROP TABLE IF EXISTS actors CASCADE; \
          CREATE TABLE actors ( \
-            id uuid PRIMARY KEY, status text NOT NULL, \
+            id uuid PRIMARY KEY, user_id uuid NOT NULL, status text NOT NULL, \
             updated_at timestamptz NOT NULL DEFAULT now()); \
          CREATE TABLE actor_budget_policies ( \
             actor_id uuid PRIMARY KEY, \
             max_executions_per_hour int, \
             max_executions_total bigint, \
+            max_fuel_per_execution bigint, \
+            max_fuel_per_hour bigint, \
+            max_outbound_requests_per_hour int, \
+            max_workflow_count int, \
+            max_workflows_per_minute int NOT NULL DEFAULT 10, \
+            max_compilations_per_hour int NOT NULL DEFAULT 20, \
+            max_llm_tokens_per_day bigint, \
             on_budget_exceeded text NOT NULL); \
          CREATE TABLE workflow_executions ( \
             id uuid PRIMARY KEY DEFAULT gen_random_uuid(), \
@@ -61,8 +71,9 @@ async fn setup(pool: &PgPool) {
 }
 
 async fn seed_actor(pool: &PgPool, id: uuid::Uuid, status: &str) {
-    sqlx::query("INSERT INTO actors (id, status) VALUES ($1, $2)")
+    sqlx::query("INSERT INTO actors (id, user_id, status) VALUES ($1, $2, $3)")
         .bind(id)
+        .bind(uuid::Uuid::new_v4())
         .bind(status)
         .execute(pool)
         .await
