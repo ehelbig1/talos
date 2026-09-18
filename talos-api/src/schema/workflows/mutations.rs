@@ -1337,8 +1337,11 @@ impl WorkflowsMutations {
             }
         }
 
-        // Create a test execution record (marked as test)
-        talos_execution_repository::ExecutionRepository::new(db_pool.clone())
+        // Create a test execution record (marked as test). Package CK: the row
+        // write runs the actor's five-cap budget check in its own transaction
+        // — a test run spends real fuel and tokens, so it is counted like any
+        // other start (operator decision 2026-09-18).
+        match talos_execution_repository::ExecutionRepository::new(db_pool.clone())
             .insert_test_execution_row(
                 execution_id,
                 workflow_id,
@@ -1350,7 +1353,12 @@ impl WorkflowsMutations {
             .map_err(|e| {
                 tracing::error!("Failed to create test execution: {}", e);
                 async_graphql::Error::new("Failed to create test execution").extend_safe()
-            })?;
+            })? {
+            talos_execution_repository::BudgetAdmission::Admitted => {}
+            talos_execution_repository::BudgetAdmission::Refused(refusal) => {
+                return Err(async_graphql::Error::new(refusal.message()).extend_safe());
+            }
+        }
 
         // Parse mock_inputs → trigger_input BEFORE spawning so a malformed
         // payload returns a proper synchronous GraphQL error rather than a

@@ -636,7 +636,7 @@ impl ActorLifecycleService {
             }
         }
 
-        if let Err(e) = self
+        match self
             .actor_repo
             .insert_handoff_execution(
                 exec_id,
@@ -650,8 +650,23 @@ impl ActorLifecycleService {
             )
             .await
         {
-            tracing::error!(execution_id = %exec_id, "handoff_to_actor: failed to create execution record: {:#}", e);
-            return Err(HandoffError::ExecutionInsertFailed);
+            Ok(talos_actor_budget_refusal::BudgetAdmission::Admitted) => {}
+            // Package CK: the in-transaction five-cap check refused to_actor.
+            // Rendered through the same to_actor budget wording the pre-check
+            // uses, so the two refusals read as one control.
+            Ok(talos_actor_budget_refusal::BudgetAdmission::Refused(refusal)) => {
+                return Err(HandoffError::AuthorizationRejected(
+                    render_trigger_auth_error(
+                        &TriggerAuthError::ExecutionDenied(refusal.message()),
+                        existing_chain.len(),
+                        max_depth,
+                    ),
+                ));
+            }
+            Err(e) => {
+                tracing::error!(execution_id = %exec_id, "handoff_to_actor: failed to create execution record: {:#}", e);
+                return Err(HandoffError::ExecutionInsertFailed);
+            }
         }
 
         // Audit log for from_actor (initiated the handoff)

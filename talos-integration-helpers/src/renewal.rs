@@ -204,7 +204,15 @@ mod tests {
         tokio::task::yield_now().await;
 
         shutdown_tx.send(true).unwrap();
-        handle.await.unwrap();
+        // The test is named for TERMINATING on shutdown, so it must say HOW it
+        // terminated: `LoopEnded` is the exit the supervisor records as a
+        // finding (ERROR + `TalosBackgroundTaskExited`), and a regression
+        // that ended the loop that way would pass a bare `handle.await`.
+        assert_eq!(
+            handle.await.unwrap(),
+            TaskExit::ShuttingDown,
+            "a shutdown signal must end the scheduler as ShuttingDown, not LoopEnded"
+        );
 
         assert!(
             fake.cycles.load(Ordering::SeqCst) >= 1,

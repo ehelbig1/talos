@@ -10,6 +10,23 @@ use sqlx::{PgPool, Row};
 use std::sync::Arc;
 use uuid::Uuid;
 
+pub use talos_actor_budget_refusal::{admit_actor_budget, BudgetAdmission, BudgetRefusal};
+
+/// What [`ExecutionRepository::mark_execution_running`] did to a retried row.
+///
+/// `#[must_use]` and three-valued for `ConcurrencyAdmission`'s reason: a
+/// forgotten budget refusal would dispatch.
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetryReset {
+    /// This caller won the `failed|cancelled → running` transition.
+    Reset,
+    /// Another concurrent retry already won it (MCP-693); abort.
+    AlreadyRunning,
+    /// The row's actor is over budget; nothing was changed.
+    BudgetRefused(BudgetRefusal),
+}
+
 /// One-click email approve/reject capability links for suspended
 /// confidence-gate executions (`/approval-actions/{token}/{action}`).
 pub mod approval_links;
@@ -1969,106 +1986,6 @@ impl ExecutionRepository {
 
     // ── Create executions ──────────────────────────────────────────────────
 
-    /// Standard execution insert. status is 'running' or 'queued'.
-    /// priority is omitted — the column DEFAULT 'normal' applies. Explicitly binding None for a
-    /// TEXT NOT NULL DEFAULT column would override the DEFAULT with NULL and violate the constraint.
-    pub async fn create_execution(
-        &self,
-        exec_id: Uuid,
-        wf_id: Uuid,
-        user_id: Uuid,
-        version_id: Option<Uuid>,
-        actor_id: Option<Uuid>,
-        status: &str,
-    ) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO workflow_executions \
-             (id, workflow_id, user_id, status, started_at, workflow_version_id, actor_id) \
-             VALUES ($1, $2, $3, $4, NOW(), $5, $6)",
-        )
-        .bind(exec_id)
-        .bind(wf_id)
-        .bind(user_id)
-        .bind(status)
-        .bind(version_id)
-        .bind(actor_id)
-        .execute(&self.db_pool)
-        .await?;
-
-        if let Some(ref tx) = self.workflow_execution_tx {
-            let _ = tx.send(talos_engine_events::WorkflowExecutionEvent {
-                workflow_id: wf_id,
-                execution_id: exec_id,
-                user_id,
-                status: status.to_string(),
-                started_at: chrono::Utc::now().to_rfc3339(),
-                error_message: None,
-            });
-        }
-        Ok(())
-    }
-
-    /// Batch sibling to [`create_execution`] for callers that enqueue N
-    /// executions sharing the same workflow_id / user_id / version_id /
-    /// actor_id / status (e.g. `enqueue_workflow`'s bulk path). Single
-    /// `INSERT ... SELECT ... UNNEST` round-trip replaces the prior
-    /// per-input loop, and converts the prior best-effort-prefix
-    /// failure mode into a clean all-or-nothing transaction — either
-    /// every row queues or none do, so no caller can observe a partial
-    /// state where some inputs got executions and some didn't.
-    ///
-    /// Empty input short-circuits without touching the DB. The
-    /// per-execution event emission on the `workflow_execution_tx`
-    /// channel mirrors `create_execution`'s post-INSERT behaviour.
-    ///
-    /// Security: same row shape and same scoping as `create_execution` —
-    /// `user_id` is bound on every row and the FK on `workflow_id`
-    /// enforces existence. Callers must verify ownership of `wf_id`
-    /// against `user_id` upstream (handler-side responsibility, identical
-    /// to `create_execution`).
-    pub async fn create_executions_batch_for_workflow(
-        &self,
-        exec_ids: &[Uuid],
-        wf_id: Uuid,
-        user_id: Uuid,
-        version_id: Option<Uuid>,
-        actor_id: Option<Uuid>,
-        status: &str,
-    ) -> Result<()> {
-        if exec_ids.is_empty() {
-            return Ok(());
-        }
-        sqlx::query(
-            "INSERT INTO workflow_executions \
-             (id, workflow_id, user_id, status, started_at, workflow_version_id, actor_id) \
-             SELECT eid, $2, $3, $4, NOW(), $5, $6 \
-             FROM UNNEST($1::uuid[]) AS eid",
-        )
-        .bind(exec_ids)
-        .bind(wf_id)
-        .bind(user_id)
-        .bind(status)
-        .bind(version_id)
-        .bind(actor_id)
-        .execute(&self.db_pool)
-        .await?;
-
-        if let Some(ref tx) = self.workflow_execution_tx {
-            let started_at = chrono::Utc::now().to_rfc3339();
-            for &exec_id in exec_ids {
-                let _ = tx.send(talos_engine_events::WorkflowExecutionEvent {
-                    workflow_id: wf_id,
-                    execution_id: exec_id,
-                    user_id,
-                    status: status.to_string(),
-                    started_at: started_at.clone(),
-                    error_message: None,
-                });
-            }
-        }
-        Ok(())
-    }
-
     /// Replay execution — includes replayed_from_id and provenance chain.
     pub async fn create_replay_execution(
         &self,
@@ -2078,7 +1995,19 @@ impl ExecutionRepository {
         replayed_from_id: Uuid,
         actor_id: Option<Uuid>,
         provenance: Option<&serde_json::Value>,
-    ) -> Result<()> {
+    ) -> Result<BudgetAdmission> {
+        // Package CK: a replay is a new start, so it runs the SAME five-cap
+        // check as every other start, inside this INSERT's transaction and
+        // under the same per-actor advisory lock. Until then replay passed
+        // only the lock-free pre-check (status, per-hour, total).
+        let mut tx = self.db_pool.begin().await?;
+        if let Some(aid) = actor_id {
+            if let BudgetAdmission::Refused(refusal) = admit_actor_budget(&mut tx, aid).await? {
+                tx.rollback().await?;
+                refusal.record(&self.db_pool).await;
+                return Ok(BudgetAdmission::Refused(refusal));
+            }
+        }
         sqlx::query(
             "INSERT INTO workflow_executions \
              (id, workflow_id, user_id, status, started_at, replayed_from_id, actor_id, provenance) \
@@ -2090,8 +2019,9 @@ impl ExecutionRepository {
         .bind(replayed_from_id)
         .bind(actor_id)
         .bind(provenance)
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
 
         if let Some(ref tx) = self.workflow_execution_tx {
             let _ = tx.send(talos_engine_events::WorkflowExecutionEvent {
@@ -2103,7 +2033,7 @@ impl ExecutionRepository {
                 error_message: None,
             });
         }
-        Ok(())
+        Ok(BudgetAdmission::Admitted)
     }
 
     // ── Status updates ─────────────────────────────────────────────────────
@@ -2122,7 +2052,28 @@ impl ExecutionRepository {
     /// precondition all along. Returns `true` if this caller won the
     /// transition; `false` if another concurrent caller already
     /// re-marked the row running (caller must abort the retry).
-    pub async fn mark_execution_running(&self, exec_id: Uuid) -> Result<bool> {
+    ///
+    /// Package CK: a retry resets `started_at = NOW()`, so the row re-enters
+    /// every rolling window — it is a new start for budget purposes, and it
+    /// runs the SAME five-cap check as every other start, against the actor
+    /// the row carries, inside this reset's transaction and under the same
+    /// per-actor advisory lock. Until then retry passed only the lock-free
+    /// pre-check (status, per-hour, total).
+    pub async fn mark_execution_running(&self, exec_id: Uuid) -> Result<RetryReset> {
+        let mut tx = self.db_pool.begin().await?;
+        let actor_id: Option<Uuid> =
+            sqlx::query_scalar("SELECT actor_id FROM workflow_executions WHERE id = $1")
+                .bind(exec_id)
+                .fetch_optional(&mut *tx)
+                .await?
+                .flatten();
+        if let Some(aid) = actor_id {
+            if let BudgetAdmission::Refused(refusal) = admit_actor_budget(&mut tx, aid).await? {
+                tx.rollback().await?;
+                refusal.record(&self.db_pool).await;
+                return Ok(RetryReset::BudgetRefused(refusal));
+            }
+        }
         let result = sqlx::query(
             "UPDATE workflow_executions \
              SET status = 'running', error_message = NULL, completed_at = NULL, \
@@ -2131,9 +2082,14 @@ impl ExecutionRepository {
              WHERE id = $1 AND status IN ('failed', 'cancelled')",
         )
         .bind(exec_id)
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(result.rows_affected() > 0)
+        tx.commit().await?;
+        Ok(if result.rows_affected() > 0 {
+            RetryReset::Reset
+        } else {
+            RetryReset::AlreadyRunning
+        })
     }
 
     /// Transition queued → running for enqueue dispatch. Returns true if updated.
@@ -3971,7 +3927,18 @@ impl ExecutionRepository {
         user_id: Uuid,
         actor_id: Option<Uuid>,
         priority: talos_workflow_repository::ExecutionPriority,
-    ) -> Result<()> {
+    ) -> Result<BudgetAdmission> {
+        // Package CK (operator decision 2026-09-18): a test run spends real
+        // fuel and LLM tokens, so it counts against the actor's budget like
+        // any other start — a spend ceiling tests bypass is not a ceiling.
+        let mut tx = self.db_pool.begin().await?;
+        if let Some(aid) = actor_id {
+            if let BudgetAdmission::Refused(refusal) = admit_actor_budget(&mut tx, aid).await? {
+                tx.rollback().await?;
+                refusal.record(&self.db_pool).await;
+                return Ok(BudgetAdmission::Refused(refusal));
+            }
+        }
         sqlx::query(
             "INSERT INTO workflow_executions (id, workflow_id, user_id, status, is_test_execution, actor_id, priority) VALUES ($1, $2, $3, 'running', true, $4, $5)",
         )
@@ -3980,9 +3947,10 @@ impl ExecutionRepository {
         .bind(user_id)
         .bind(actor_id)
         .bind(priority.as_str())
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(())
+        tx.commit().await?;
+        Ok(BudgetAdmission::Admitted)
     }
 
     /// Latest execution per workflow (DISTINCT ON) for a batch of

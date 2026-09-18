@@ -3495,28 +3495,63 @@ impl AdvancedRepository {
     /// applied at the output side in MCP-1204; the DLP scrub matches
     /// the canonical persistence-boundary discipline (MCP-466/481/
     /// 967/971/972 family).
+    ///
+    /// Package CK (2026-09-18): the row now CARRIES the actor the engine runs
+    /// as, and the insert runs the actor's five-cap budget check in its own
+    /// transaction. Both were missing. This INSERT bound no `actor_id`, so the
+    /// `trg_set_default_actor` trigger stamped the user's DEFAULT actor: on the
+    /// reference fleet `pa-ask-email` (bound to `personal-assistant`) ran 3 104
+    /// continuations in 30 days whose rows said `Default` while the engine ran
+    /// as `personal-assistant` — #756's row/engine split — and every one was
+    /// counted against the wrong actor's per-hour and total caps. And the only
+    /// budget gate on this path was the lock-free pre-check (status, per-hour,
+    /// total), so per-minute, fuel per hour and LLM tokens per day were never
+    /// consulted for 28% of all runs. `actor_id` is the gate-resolved effective
+    /// actor; `None` keeps the trigger's default-actor stamp and runs no check,
+    /// exactly as a trigger-path row with no actor does.
     pub async fn insert_queued_execution(
         &self,
         exec_id: Uuid,
         wf_id: Uuid,
         user_id: Uuid,
+        actor_id: Option<Uuid>,
         payload: &serde_json::Value,
-    ) -> Result<()> {
+    ) -> Result<talos_actor_budget_refusal::BudgetAdmission> {
+        use talos_actor_budget_refusal::{admit_actor_budget, BudgetAdmission};
         let bounded = talos_dlp_provider::bound_execution_payload(payload);
         let scrubbed = talos_dlp_provider::redact_json(&bounded);
+        let mut tx = self
+            .db_pool
+            .begin()
+            .await
+            .context("insert_queued_execution: begin")?;
+        if let Some(aid) = actor_id {
+            if let BudgetAdmission::Refused(refusal) = admit_actor_budget(&mut tx, aid)
+                .await
+                .context("insert_queued_execution: budget check")?
+            {
+                tx.rollback().await?;
+                refusal.record(&self.db_pool).await;
+                return Ok(BudgetAdmission::Refused(refusal));
+            }
+        }
         sqlx::query(
             "INSERT INTO workflow_executions \
-                (id, workflow_id, user_id, status, input_data, started_at) \
-             VALUES ($1, $2, $3, 'queued', $4::jsonb, NOW())",
+                (id, workflow_id, user_id, status, input_data, started_at, actor_id) \
+             VALUES ($1, $2, $3, 'queued', $4::jsonb, NOW(), $5)",
         )
         .bind(exec_id)
         .bind(wf_id)
         .bind(user_id)
         .bind(&scrubbed)
-        .execute(&self.db_pool)
+        .bind(actor_id)
+        .execute(&mut *tx)
         .await
-        .map(|_| ())
-        .context("insert_queued_execution")
+        .context("insert_queued_execution")?;
+        tx.commit()
+            .await
+            .context("insert_queued_execution: commit")?;
+        Ok(BudgetAdmission::Admitted)
     }
 
     /// Write back the continuation execution ID to an approval gate.

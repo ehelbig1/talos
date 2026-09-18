@@ -244,7 +244,8 @@ impl ExecutionOrchestrationService {
                 "trigger_type": trigger_type.as_str(),
             })
         });
-        self.execution_repo
+        match self
+            .execution_repo
             .create_replay_execution(
                 new_execution_id,
                 workflow_id,
@@ -254,7 +255,15 @@ impl ExecutionOrchestrationService {
                 provenance.as_ref(),
             )
             .await
-            .map_err(OrchestrationError::Internal)?;
+            .map_err(OrchestrationError::Internal)?
+        {
+            talos_execution_repository::BudgetAdmission::Admitted => {}
+            // Package CK: the in-transaction five-cap check — the same one the
+            // trigger backstop runs — refused; no row was written.
+            talos_execution_repository::BudgetAdmission::Refused(refusal) => {
+                return Err(OrchestrationError::AuthorizationDenied(refusal.message()));
+            }
+        }
 
         // 8. Engine build — synchronous so graph-load errors surface
         // to the caller rather than being silently buried in the

@@ -3290,13 +3290,32 @@ async fn handle_test_workflow_draft(
     let exec_id = uuid::Uuid::new_v4();
     let priority =
         talos_workflow_repository::ExecutionPriority::declared_in_graph_json(&graph_json);
-    if let Err(e) = state
+    // Package CK: the row carries the actor the draft ENGINE runs as (the
+    // `with_effective_actor` rule below: explicit arg, else the workflow's
+    // bound actor), and its insert runs that actor's five-cap budget check —
+    // test runs spend real fuel and tokens (operator decision 2026-09-18).
+    let draft_row_actor = draft_actor_arg.or(wf_agent_id);
+    match state
         .workflow_repo
-        .create_execution(exec_id, wf_id, user_id, None, priority, None, None)
+        .create_execution(
+            exec_id,
+            wf_id,
+            user_id,
+            None,
+            priority,
+            draft_row_actor,
+            None,
+        )
         .await
     {
-        tracing::error!(execution_id = %exec_id, "Failed to create execution record: {}", e);
-        return mcp_error(req_id, -32000, "Failed to create execution record");
+        Ok(talos_actor_budget_refusal::BudgetAdmission::Admitted) => {}
+        Ok(talos_actor_budget_refusal::BudgetAdmission::Refused(refusal)) => {
+            return mcp_denied(req_id, -32000, &refusal.message());
+        }
+        Err(e) => {
+            tracing::error!(execution_id = %exec_id, "Failed to create execution record: {}", e);
+            return mcp_error(req_id, -32000, "Failed to create execution record");
+        }
     }
 
     let registry = state.registry.clone();
@@ -7885,17 +7904,34 @@ async fn handle_test_workflow(
     let exec_id = uuid::Uuid::new_v4();
     let priority =
         talos_workflow_repository::ExecutionPriority::declared_in_graph_json(&graph_json);
-    if let Err(e) = state
+    // Package CK: the row carries the actor the test ENGINE runs as — the
+    // same `test_actor_arg.or(workflow's bound actor)` the builder below uses
+    // (`effective_test_actor`) — and its insert runs that actor's five-cap
+    // budget check (operator decision 2026-09-18: test runs are counted).
+    match state
         .workflow_repo
-        .create_test_execution(exec_id, wf_id, user_id, version_id, priority)
+        .create_test_execution(
+            exec_id,
+            wf_id,
+            user_id,
+            version_id,
+            priority,
+            test_actor_arg.or(test_wf_record.actor_id),
+        )
         .await
     {
-        tracing::error!(execution_id = %exec_id, "test_workflow: failed to create execution record: {}", e);
-        return Some(mcp_error(
-            req_id.clone(),
-            -32000,
-            "Failed to create execution record",
-        ));
+        Ok(talos_actor_budget_refusal::BudgetAdmission::Admitted) => {}
+        Ok(talos_actor_budget_refusal::BudgetAdmission::Refused(refusal)) => {
+            return Some(mcp_denied(req_id.clone(), -32000, &refusal.message()));
+        }
+        Err(e) => {
+            tracing::error!(execution_id = %exec_id, "test_workflow: failed to create execution record: {}", e);
+            return Some(mcp_error(
+                req_id.clone(),
+                -32000,
+                "Failed to create execution record",
+            ));
+        }
     }
 
     let registry = state.registry.clone();

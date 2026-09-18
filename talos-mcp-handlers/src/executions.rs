@@ -3191,6 +3191,33 @@ async fn handle_enqueue_workflow(
         );
     }
 
+    // Package CK: the actor's budget refused the whole batch inside the
+    // admission transaction (the in-transaction twin of the batch pre-check
+    // above, which covers per-hour and total only and is not atomic). Its own
+    // status for `archived`'s reason: nothing was written, and `throttled`
+    // would invite a retry that the cap will refuse again.
+    if let Some(refusal) = admission.budget_refused.as_ref() {
+        let msg = refusal.message();
+        for idx in 0..inputs.len() {
+            results.push(serde_json::json!({
+                "input_index": idx,
+                "execution_id": serde_json::Value::Null,
+                "status": "budget_exceeded",
+                "error": msg,
+            }));
+        }
+        return mcp_text(
+            req_id,
+            &serde_json::to_string_pretty(&serde_json::json!({
+                "queued": 0,
+                "rate_per_second": rate_per_second,
+                "executions": results,
+                "monitor_with": null
+            }))
+            .unwrap_or_default(),
+        );
+    }
+
     // The execution pause, set after this handler's entry gate (the repository
     // counted the refusal as `row_creation`). Its own status for `archived`'s
     // reason: nothing was written, and `throttled` would misstate why.
