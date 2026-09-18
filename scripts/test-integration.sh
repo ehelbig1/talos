@@ -417,6 +417,10 @@ CTRL_TESTS=(
     # A user changing their own password: session gate, shared lockout, atomic
     # revocation + audit row, conflict on a concurrent change (2026-09-18).
     "password_change_tests"
+    # Credential and privilege changes are recorded in the same transaction as
+    # the change: API keys (once, not twice), capability grants on every
+    # surface incl. the bootstrap, 2FA enable/disable (2026-09-18).
+    "credential_audit_record_tests"
     # The immutability triggers were BEFORE DELETE OR UPDATE ... FOR EACH ROW,
     # and TRUNCATE fires no row trigger: it emptied an audit table with nothing
     # raised. Drives TRUNCATE/DELETE/UPDATE against every immutable table on a

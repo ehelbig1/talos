@@ -488,17 +488,6 @@ impl AuthMutations {
                 async_graphql::Error::new("Failed to enable 2FA").extend_safe()
             })?;
 
-        let db_pool = ctx.data::<sqlx::PgPool>()?.clone();
-        talos_actor_repository::spawn_log_admin_event(
-            db_pool,
-            *user_id,
-            "2fa_enabled",
-            "user",
-            Some(*user_id),
-            "Two-factor authentication enabled".to_string(),
-            None,
-        );
-
         // Enrolment changes how this account authenticates, so every session
         // minted before it is signed out. Without this a refresh token taken
         // before enrolment (7-day lifetime) kept renewing sessions after it.
@@ -609,17 +598,6 @@ impl AuthMutations {
             tracing::error!("Failed to disable 2FA: {}", e);
             async_graphql::Error::new("Failed to disable 2FA").extend_safe()
         })?;
-
-        let db_pool = ctx.data::<sqlx::PgPool>()?.clone();
-        talos_actor_repository::spawn_log_admin_event(
-            db_pool,
-            *user_id,
-            "2fa_disabled",
-            "user",
-            Some(*user_id),
-            "Two-factor authentication disabled".to_string(),
-            None,
-        );
 
         Ok(true)
     }

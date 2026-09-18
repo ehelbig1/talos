@@ -136,25 +136,6 @@ impl SecurityMutations {
                 async_graphql::Error::new("Failed to create API key").extend_safe()
             })?;
 
-        let db_pool = ctx.data::<sqlx::PgPool>()?.clone();
-        talos_actor_repository::spawn_log_admin_event(
-            db_pool,
-            *user_id,
-            "api_key_created",
-            "api_key",
-            Some(id),
-            format!(
-                "API key '{}' created with scopes: {}",
-                name_owned,
-                scopes
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            None,
-        );
-
         Ok(ApiKeyCreated {
             id,
             name: name_owned,
@@ -183,17 +164,6 @@ impl SecurityMutations {
                 async_graphql::Error::new("Failed to revoke API key").extend_safe()
             })?;
 
-        let db_pool = ctx.data::<sqlx::PgPool>()?.clone();
-        talos_actor_repository::spawn_log_admin_event(
-            db_pool,
-            *user_id,
-            "api_key_revoked",
-            "api_key",
-            Some(key_id),
-            format!("API key {} revoked (deactivated)", key_id),
-            None,
-        );
-
         Ok(true)
     }
 
@@ -215,17 +185,6 @@ impl SecurityMutations {
                 tracing::error!("Failed to delete API key: {}", e);
                 async_graphql::Error::new("Failed to delete API key").extend_safe()
             })?;
-
-        let db_pool = ctx.data::<sqlx::PgPool>()?.clone();
-        talos_actor_repository::spawn_log_admin_event(
-            db_pool,
-            *user_id,
-            "api_key_deleted",
-            "api_key",
-            Some(key_id),
-            format!("API key {} permanently deleted", key_id),
-            None,
-        );
 
         Ok(true)
     }
@@ -273,20 +232,6 @@ impl SecurityMutations {
                 tracing::error!("Failed to rotate API key: {}", e);
                 async_graphql::Error::new("Failed to rotate API key").extend_safe()
             })?;
-
-        let db_pool = ctx.data::<sqlx::PgPool>()?.clone();
-        talos_actor_repository::spawn_log_admin_event(
-            db_pool,
-            *user_id,
-            "api_key_rotated",
-            "api_key",
-            Some(key_id),
-            format!(
-                "API key '{}' rotated (old key deactivated, new key issued)",
-                old_key.name
-            ),
-            None,
-        );
 
         Ok(ApiKeyCreated {
             id: key_id,

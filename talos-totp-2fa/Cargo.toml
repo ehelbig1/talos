@@ -7,6 +7,8 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
+# One writer for admin_event_log (check 94): enrolment and disable record in-transaction.
+talos-admin-event-log = { path = "../talos-admin-event-log" }
 anyhow.workspace = true
 base64 = "0.22"
 bcrypt = "0.18"

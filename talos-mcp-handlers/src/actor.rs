@@ -4870,38 +4870,11 @@ async fn handle_grant_capability_ceiling(
         .await
     {
         Ok(_) => {
-            // MCP-391 (2026-05-11): sibling to MCP-390 — admin-event
-            // audit on the grant side. Pre-fix the only record of a
-            // grant was the `capability_grants` row itself (including
-            // the `notes` column). On UPSERT-overwrite the previous
-            // grant's notes/world/granter were silently replaced; on
-            // eventual revoke the row was DELETEd. Either way the
-            // moment-in-time "user X was elevated to world Y by Z
-            // because <notes>" event was lost. Recording it on
-            // `admin_event_log` makes the event durable and
-            // independent of the row's fate. `resource_id` is the
-            // target user_id; `details` carries the granted world
-            // and the `notes` justification. Best-effort write —
-            // failure logs at WARN inside `spawn_log_admin_event`
-            // but doesn't fail the grant (already committed).
-            let details = serde_json::json!({
-                "target_user_id": target_user_str,
-                "max_capability_world": grant_world,
-                "notes": notes,
-                "self_grant": granter_id == target_user_id,
-            });
-            crate::actor::spawn_log_admin_event(
-                state.db_pool.clone(),
-                granter_id,
-                "capability_grant_issued",
-                "user",
-                Some(target_user_id),
-                format!(
-                    "Capability ceiling {} granted to user {}",
-                    grant_world, target_user_str
-                ),
-                Some(details),
-            );
+            // MCP-391's grant record (target, world granted, the world it
+            // replaced, the `notes` justification) is written by
+            // `upsert_capability_grant` in the same transaction as the grant
+            // (2026-09-18) — it used to be a detached task after the grant
+            // had already committed.
             mcp_text(
                 req_id,
                 &serde_json::to_string_pretty(&serde_json::json!({
@@ -4981,35 +4954,15 @@ async fn handle_revoke_capability_ceiling(
 
     match state
         .actor_repo
-        .delete_capability_grant(target_user_id)
+        .delete_capability_grant(target_user_id, revoker_id, notes.as_deref())
         .await
     {
         Ok(rows) if rows > 0 => {
-            // MCP-390 (2026-05-11): close the revoke audit-trail gap.
-            // Pre-fix a successful revoke vanished without trace
-            // because the row is hard-DELETEd, not tombstoned. Same
-            // gap class as MCP-389 (delete_workflow / delete_module).
-            // Record the actor (revoker), the target user, and the
-            // operator's `notes` justification — together these let
-            // forensics reconstruct who downgraded whom and why,
-            // even after the grant row is gone.
-            let details = serde_json::json!({
-                "target_user_id": target_user_str,
-                "notes": notes,
-                "self_revoke": revoker_id == target_user_id,
-            });
-            crate::actor::spawn_log_admin_event(
-                state.db_pool.clone(),
-                revoker_id,
-                "capability_grant_revoked",
-                "user",
-                Some(target_user_id),
-                format!(
-                    "Capability ceiling grant revoked for user {}",
-                    target_user_str
-                ),
-                Some(details),
-            );
+            // MCP-390's revoke record (who downgraded whom, the ceiling
+            // withdrawn, and the operator's `notes`) is written by
+            // `delete_capability_grant` in the same transaction as the
+            // DELETE (2026-09-18) — it used to be a detached task after
+            // the row was already gone.
             mcp_text(
                 req_id,
                 &serde_json::to_string_pretty(&serde_json::json!({

@@ -392,10 +392,20 @@ async fn list_admin_events_all_users_is_platform_admin_only_and_reaches_system_r
     let body = text_json(&resp);
     assert_eq!(body["scope"], Value::String("all_users".into()), "{body}");
     let evs = events(&body);
+    // Three: the other tenant's row, the seeded system row, and the
+    // first-user bootstrap grant, which `create_test_user` made for `me` and
+    // which is recorded with no user because the platform granted it (package
+    // CS, 2026-09-18).
     assert_eq!(
         evs.len(),
-        2,
-        "the other tenant's row AND the system row: {body}"
+        3,
+        "the other tenant's row, the system row AND the bootstrap grant: {body}"
+    );
+    assert!(
+        evs.iter().any(|e| e["by_user_id"].is_null()
+            && e["event_type"] == Value::String("capability_grant_issued".into())
+            && e["resource_id"] == Value::String(me.to_string())),
+        "the bootstrap grant is a system row: {body}"
     );
     assert!(
         evs.iter().any(|e| e["by_user_id"].is_null()

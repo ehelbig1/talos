@@ -649,6 +649,11 @@ impl TotpService {
         // macro) so this UPDATE doesn't need to be added to the sqlx
         // offline cache — matches the pattern already used for the
         // similar atomic UPDATE in `login`.
+        //
+        // The enrolment and its `2fa_enabled` record in `admin_event_log`
+        // commit in ONE transaction (2026-09-18 — the record used to be a
+        // detached task in the resolver after the enrolment had committed).
+        let mut tx = self.db_pool.begin().await?;
         let result = sqlx::query(
             "UPDATE users
              SET totp_secret = $1, totp_secret_format = $2, totp_enabled = true, backup_codes = $3
@@ -658,7 +663,7 @@ impl TotpService {
         .bind(format_version)
         .bind(&hashed_codes[..])
         .bind(user_id)
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await?;
 
         if result.rows_affected() == 0 {
@@ -670,20 +675,38 @@ impl TotpService {
                 "Two-factor authentication is already enabled. Disable it first if you need to re-enrol."
             ));
         }
+        talos_admin_event_log::insert_on_conn(
+            &mut tx,
+            Some(user_id),
+            "2fa_enabled",
+            "user",
+            Some(user_id),
+            "Two-factor authentication enabled",
+            None,
+        )
+        .await?;
+        tx.commit().await?;
 
         // Return plain backup codes to user (only shown once!)
         Ok(backup_codes)
     }
 
-    /// Disable 2FA for a user
+    /// Disable 2FA for a user.
+    ///
+    /// The disable, the revocation of every session and the `2fa_disabled`
+    /// record in `admin_event_log` commit in ONE transaction (2026-09-18).
+    /// Before, they were three separate writes: a failed session DELETE left
+    /// 2FA off with the old sessions alive, and the record was a detached
+    /// task in the resolver.
     pub async fn disable_2fa(&self, user_id: Uuid) -> Result<()> {
+        let mut tx = self.db_pool.begin().await?;
         sqlx::query!(
             "UPDATE users
              SET totp_secret = NULL, totp_enabled = false, backup_codes = NULL
              WHERE id = $1",
             user_id
         )
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await?;
 
         // Revoke ALL active sessions when 2FA is disabled.
@@ -695,10 +718,21 @@ impl TotpService {
         // re-authenticate against the current security posture.
         sqlx::query("DELETE FROM user_sessions WHERE user_id = $1")
             .bind(user_id)
-            .execute(&self.db_pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to revoke sessions after 2FA disable: {}", e))?;
 
+        talos_admin_event_log::insert_on_conn(
+            &mut tx,
+            Some(user_id),
+            "2fa_disabled",
+            "user",
+            Some(user_id),
+            "Two-factor authentication disabled",
+            None,
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
