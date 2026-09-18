@@ -375,6 +375,14 @@ fn validate_password(password: &str) -> Result<()> {
         return Err(anyhow!("Password must be no more than 72 characters long"));
     }
 
+    // A reserved password is refused at every login, so an account that chose
+    // one could never sign in (see `talos_unusable_password`).
+    if talos_unusable_password::is_reserved_password(password) {
+        return Err(anyhow!(
+            "This password cannot be used. Please choose another."
+        ));
+    }
+
     // Require at least 2 distinct character classes out of 4:
     //   uppercase, lowercase, digit, symbol.
     // This rejects trivially weak passwords like "aaaaaaaaaaaa" while still
@@ -914,6 +922,23 @@ impl AuthService {
         }
     }
 
+    /// Does `password` open an account whose stored hash is `stored_hash`?
+    ///
+    /// The ONE password check: login and password change both call it. It
+    /// always runs the bcrypt verify, so a refusal costs the same time as a
+    /// wrong password, and then refuses a reserved password whatever bcrypt
+    /// said — accounts created by OAuth sign-up before 2026-09-18 store the
+    /// hash of a public literal (`talos_unusable_password`), and without this
+    /// that literal opens every one of them.
+    async fn password_matches(&self, password: &str, stored_hash: &str) -> Result<bool> {
+        let password_owned = password.to_string();
+        let hash_owned = stored_hash.to_string();
+        let verified = tokio::task::spawn_blocking(move || verify(&password_owned, &hash_owned))
+            .await
+            .context("Password verification task panicked")??;
+        Ok(verified && !talos_unusable_password::is_reserved_password(password))
+    }
+
     /// Create a new user (signup)
     pub async fn create_user(
         &self,
@@ -1171,11 +1196,7 @@ impl AuthService {
         }
 
         // Verify password (use spawn_blocking to avoid blocking the async executor)
-        let password_owned = password.to_string();
-        let password_hash = user.password_hash.clone();
-        let is_valid = tokio::task::spawn_blocking(move || verify(&password_owned, &password_hash))
-            .await
-            .context("Password verification task panicked")??;
+        let is_valid = self.password_matches(password, &user.password_hash).await?;
 
         if !is_valid {
             const MAX_ATTEMPTS: i32 = 5; // Production security: lock after 5 failed attempts
@@ -1997,11 +2018,9 @@ impl AuthService {
         let user = self.get_user(user_id).await?;
 
         // Verify old password (use spawn_blocking to avoid blocking)
-        let old_pwd = old_password.to_string();
-        let old_hash = user.password_hash.clone();
-        let is_valid = tokio::task::spawn_blocking(move || verify(&old_pwd, &old_hash))
-            .await
-            .context("Password verification task panicked")??;
+        let is_valid = self
+            .password_matches(old_password, &user.password_hash)
+            .await?;
 
         if !is_valid {
             return Err(anyhow!("Invalid current password"));

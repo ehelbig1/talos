@@ -79,6 +79,7 @@ members = [
     "talos-config-validator",
     "talos-db",
     "talos-text-util",
+    "talos-unusable-password",
     "talos-measurement",
     "talos-trace-nats",
     "talos-workflow-signing",

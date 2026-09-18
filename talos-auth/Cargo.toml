@@ -23,6 +23,7 @@ tracing.workspace = true
 uuid.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 bcrypt = "0.18"
+talos-unusable-password = { path = "../talos-unusable-password" }
 jsonwebtoken = { version = "10.3", default-features = false, features = ["rust_crypto", "use_pem"] }
 regex = "1.12"
 sha2 = "0.10"

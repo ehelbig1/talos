@@ -737,3 +737,49 @@ fn jwt_selftest_is_idempotent() {
         }
     );
 }
+
+/// Accounts created by OAuth sign-up before 2026-09-18 store bcrypt of a
+/// public literal. bcrypt matches that literal; the one password check must
+/// refuse it anyway, and a real password must still match (the control).
+#[tokio::test]
+async fn password_matches_refuses_the_legacy_oauth_sentinel() {
+    use talos_unusable_password::LEGACY_OAUTH_NO_PASSWORD_SENTINEL as SENTINEL;
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .connect_lazy("postgres://localhost/talos_test")
+        .unwrap();
+    let service = AuthService::new(
+        pool,
+        "this-is-a-test-secret-that-is-32bytes".into(),
+        10,
+        None,
+    )
+    .unwrap();
+
+    let legacy_row = bcrypt::hash(SENTINEL, 4).unwrap();
+    assert!(
+        bcrypt::verify(SENTINEL, &legacy_row).unwrap(),
+        "precondition: bcrypt itself matches the sentinel"
+    );
+    assert!(!service
+        .password_matches(SENTINEL, &legacy_row)
+        .await
+        .unwrap());
+
+    let real = bcrypt::hash("Correct-Horse-9", 4).unwrap();
+    assert!(service
+        .password_matches("Correct-Horse-9", &real)
+        .await
+        .unwrap());
+    assert!(!service
+        .password_matches("Wrong-Horse-9", &real)
+        .await
+        .unwrap());
+}
+
+#[test]
+fn a_reserved_password_cannot_be_chosen() {
+    use talos_unusable_password::LEGACY_OAUTH_NO_PASSWORD_SENTINEL as SENTINEL;
+    assert!(validate_password(SENTINEL).is_err());
+    // Control: the same shape one character shorter is an ordinary password.
+    assert!(validate_password(&SENTINEL[1..]).is_ok());
+}

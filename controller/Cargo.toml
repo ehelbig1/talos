@@ -251,6 +251,8 @@ prometheus = "0.14" # opentelemetry-prometheus 0.32 supports prometheus 0.14.x, 
                     # clearing RUSTSEC-2024-0437 (protobuf recursion crash) — deny.toml exemption removed.
 
 [dev-dependencies]
+# oauth_tests pins the legacy OAuth sentinel by name.
+talos-unusable-password = { path = "../talos-unusable-password" }
 testcontainers = "0.23"
 testcontainers-modules = { version = "0.11", features = ["postgres"] }
 # `libc::atexit` in controller/tests/test_helpers: the shared testcontainer is

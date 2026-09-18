@@ -1422,10 +1422,13 @@ impl OAuthService {
             );
         } else {
             // Create new user.
-            // SECURITY: OAuth accounts have no password. Store a bcrypt hash of a
-            // fixed sentinel string so that password verification always fails for
-            // these accounts (bcrypt::verify returns false, never true).
-            // Using "" would work in practice but is ambiguous and error-prone.
+            // SECURITY: OAuth accounts have no password. Until 2026-09-18 this
+            // stored bcrypt of a fixed, PUBLIC sentinel string under a comment
+            // claiming verification "always fails" — it succeeds for that
+            // literal, so the literal logged in to every OAuth-created
+            // account. The hash is now of a per-account CSPRNG seed nobody
+            // holds (`talos_unusable_password`), and every password check
+            // refuses the legacy literal for the rows written before.
             //
             // MCP-659: persist the normalized (trim+lowercase) email, matching
             // the signup-side normalization in talos_auth::create_user. This
@@ -1458,8 +1461,8 @@ impl OAuthService {
                 .and_then(|v| v.parse::<u32>().ok())
                 .filter(|c| (4..=31).contains(c))
                 .unwrap_or(bcrypt::DEFAULT_COST);
-            let sentinel_hash = bcrypt::hash("__talos_oauth_account_no_password__", sentinel_cost)
-                .map_err(|e| anyhow::anyhow!("Failed to create sentinel hash: {}", e))?;
+            let sentinel_hash = talos_unusable_password::unusable_password_hash(sentinel_cost)
+                .map_err(|e| anyhow::anyhow!("Failed to create unusable password hash: {}", e))?;
             // MCP-1004 (2026-05-15): sanitize provider-supplied display
             // name before persistence. Pre-fix `user_info.name` was bound
             // verbatim — providers occasionally return names with embedded

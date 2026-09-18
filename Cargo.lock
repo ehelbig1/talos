@@ -1875,6 +1875,7 @@ dependencies = [
  "talos-totp-2fa",
  "talos-trace",
  "talos-trace-nats",
+ "talos-unusable-password",
  "talos-webhook-repository",
  "talos-webhooks",
  "talos-worker-fleet",
@@ -7830,6 +7831,7 @@ dependencies = [
  "talos-config",
  "talos-dlp-provider",
  "talos-metrics",
+ "talos-unusable-password",
  "tokio",
  "tracing",
  "uuid",
@@ -9072,6 +9074,7 @@ dependencies = [
  "talos-metrics",
  "talos-secrets-manager",
  "talos-text-util",
+ "talos-unusable-password",
  "talos-workflow-engine-core",
  "talos-workflow-job-protocol",
  "tokio",
@@ -9606,6 +9609,7 @@ dependencies = [
  "chrono",
  "serde_json",
  "sqlx",
+ "talos-unusable-password",
  "tokio",
  "tracing",
  "uuid",
@@ -9697,6 +9701,15 @@ dependencies = [
  "opentelemetry_sdk",
  "tracing",
  "tracing-opentelemetry",
+]
+
+[[package]]
+name = "talos-unusable-password"
+version = "0.1.0"
+dependencies = [
+ "bcrypt",
+ "rand 0.8.6",
+ "zeroize",
 ]
 
 [[package]]

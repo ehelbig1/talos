@@ -46,12 +46,13 @@ pub struct RevokedAgent {
 /// user_id a known synthetic MCP user," reachable via the public
 /// `/auth/login` endpoint with `email=mcp-{uuid}@system.internal`.
 ///
-/// The fix: lazily generate ONE process-wide bcrypt hash of a random
-/// UUID at first use and reuse it for every synthetic-user INSERT.
+/// The fix: lazily generate ONE process-wide unusable hash at first use
+/// (`talos_unusable_password`, the one home shared with OAuth sign-up) and
+/// reuse it for every synthetic-user INSERT and the local dev user.
 /// Properties:
 /// * Structurally valid → `bcrypt::verify` pays full cost → timing
 ///   matches the dummy-bcrypt user-not-found path.
-/// * Seed UUID is `Uuid::new_v4()` (cryptographic random), generated
+/// * The seed is 32 CSPRNG bytes, generated
 ///   in-process, never returned, never logged, never persisted. Even
 ///   though every synthetic user shares the same hash, no client can
 ///   recover the seed to brute-force a login.
@@ -68,8 +69,8 @@ static SYNTHETIC_PASSWORD_HASH: OnceLock<String> = OnceLock::new();
 
 fn synthetic_password_hash() -> &'static str {
     SYNTHETIC_PASSWORD_HASH.get_or_init(|| {
-        let seed = Uuid::new_v4().to_string();
-        bcrypt::hash(&seed, bcrypt::DEFAULT_COST).expect("bcrypt::hash of random UUID cannot fail")
+        talos_unusable_password::unusable_password_hash(bcrypt::DEFAULT_COST)
+            .expect("bcrypt::hash at DEFAULT_COST cannot fail")
     })
 }
 
@@ -255,10 +256,13 @@ impl SystemRepository {
         let id: Option<Uuid> = sqlx::query_scalar(
             "INSERT INTO users \
                  (email, password_hash, is_active, failed_login_attempts, totp_enabled) \
-             VALUES ('dev@talos.local', '', true, 0, false) \
+             VALUES ('dev@talos.local', $1, true, 0, false) \
              ON CONFLICT (email) DO UPDATE SET email = EXCLUDED.email \
              RETURNING id",
         )
+        // An empty hash made `bcrypt::verify` return Err instantly — a
+        // timing tell, and an internal error instead of a refusal.
+        .bind(synthetic_password_hash())
         .fetch_optional(&self.db_pool)
         .await?;
         Ok(id)
