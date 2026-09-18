@@ -161,49 +161,17 @@ pub enum ConcurrencyAdmission {
     ExecutionsPaused(talos_metrics::PauseRefusal),
 }
 
-/// Render the human-facing message for a
-/// [`ConcurrencyAdmission::ActorBudgetExceeded`] outcome. Centralised so the
-/// four trigger paths (orchestration, GraphQL, MCP trigger/bulk/as-actors)
-/// share one wording — and so the fuel cap (count = fuel units, not
-/// executions) doesn't get the execution-count phrasing.
-pub fn actor_budget_exceeded_message(kind: &str, limit: i64, count: i64) -> String {
-    match kind {
-        "fuel_per_hour" => format!(
-            "Actor fuel budget exceeded: {count} fuel consumed in the last hour (limit: {limit})"
-        ),
-        "per_minute" => {
-            format!("Actor budget exceeded: {count} executions in the last minute (limit: {limit})")
-        }
-        "per_hour" => {
-            format!("Actor budget exceeded: {count} executions in the last hour (limit: {limit})")
-        }
-        // Package CD: this cap fell into the `_` arm and was worded
-        // "executions total" — a token count reported as an execution count.
-        "llm_tokens_per_day" => format!(
-            "Actor LLM token budget exceeded: {count} tokens in the last 24 hours (limit: {limit})"
-        ),
-        _ => format!("Actor budget exceeded: {count} executions total (limit: {limit})"),
-    }
-}
-
-/// Derive a stable per-actor key for `pg_advisory_xact_lock(bigint)` from
-/// the actor UUID. Transaction-scoped advisory locks serialise execution
-/// creation for the same actor so the in-transaction budget re-check in
-/// [`WorkflowRepository::create_execution_under_concurrency_limit`] is
-/// atomic with the INSERT (closes the actor-budget TOCTOU). A 64-bit
-/// collision would merely serialise two unrelated actors together
-/// occasionally — correctness-safe, perf-only.
-pub(crate) fn actor_advisory_lock_key(actor_id: Uuid) -> i64 {
-    let b = actor_id.as_bytes();
-    i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
-}
+/// The human-facing sentence for a refused start. ONE home since package CK:
+/// the backstop and every other start path render the same wording through
+/// [`talos_actor_budget_refusal::BudgetRefusal::message`].
+pub use talos_actor_budget_refusal::actor_budget_exceeded_message;
 
 /// Outcome of [`WorkflowRepository::create_executions_batch_under_concurrency_limit`].
 ///
 /// Reports the prefix of input rows actually admitted plus the
 /// observed cap parameters so the caller can render an actionable
 /// "X of N admitted, Y throttled" response without re-querying.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchAdmission {
     /// Number of rows inserted. The first `inserted` ids in the
     /// caller's `exec_ids` slice are now `'queued'`. Suffix was
@@ -234,6 +202,13 @@ pub struct BatchAdmission {
     /// refuses); what it buys is the caller saying the queue is paused rather
     /// than reporting a full concurrency cap.
     pub paused: Option<talos_metrics::PauseRefusal>,
+    /// The actor's budget refused the whole batch, so NOTHING was admitted
+    /// (package CK). A field for `archived`'s reason (`inserted == 0` already
+    /// refuses): what it buys is the caller naming the cap instead of
+    /// reporting a full concurrency cap. Refused WHOLE, never as a prefix —
+    /// the batch-aware pre-check (MCP-566) already refuses any batch that
+    /// would carry the actor past a count cap, and this is its atomic twin.
+    pub budget_refused: Option<talos_actor_budget_refusal::BudgetRefusal>,
 }
 
 /// Pure helper extracted for unit-testing the cap math without a
@@ -255,25 +230,7 @@ pub(crate) fn compute_batch_admit_count(
 }
 
 #[cfg(test)]
-mod actor_lock_key_tests {
-    use super::actor_advisory_lock_key;
-    use uuid::Uuid;
-
-    #[test]
-    fn key_is_deterministic_and_distinct() {
-        let a = Uuid::parse_str("d8aaa59a-bab7-4a7e-9c21-8ba041543403").unwrap();
-        let b = Uuid::parse_str("cd4ac0f1-9a4b-425b-9434-c0dda50e0049").unwrap();
-        // Same UUID → same key (serialises the same actor across calls).
-        assert_eq!(actor_advisory_lock_key(a), actor_advisory_lock_key(a));
-        // Different UUIDs → different keys (no spurious cross-actor serialisation).
-        assert_ne!(actor_advisory_lock_key(a), actor_advisory_lock_key(b));
-    }
-
-    #[test]
-    fn nil_uuid_maps_to_zero() {
-        assert_eq!(actor_advisory_lock_key(Uuid::nil()), 0);
-    }
-
+mod actor_budget_message_tests {
     #[test]
     fn budget_message_distinguishes_fuel_from_counts() {
         use super::actor_budget_exceeded_message;
@@ -538,13 +495,16 @@ impl WorkflowRepository {
         Ok(count)
     }
 
-    /// Insert a new workflow execution record.
+    /// Insert a new workflow execution record — the MCP `test_workflow_draft`
+    /// path's row.
     ///
-    /// Thin wrapper around [`Self::create_execution_with_lineage`]. The
-    /// underlying SQL gates on `(workflow_id, user_id)` ownership match
-    /// (T5-N3 / T7-N1); the wrapper bails with `anyhow::Error` when
-    /// `rows_affected == 0` so existing callers that don't track row
-    /// counts still observe the failure instead of silently no-op'ing.
+    /// Package CK: the insert runs the row actor's five-cap budget check in its
+    /// own transaction under the shared per-actor advisory lock (operator
+    /// decision 2026-09-18: test runs spend real fuel and tokens and are
+    /// counted). The SQL still gates on `(workflow_id, user_id)` ownership
+    /// (T5-N3 / T7-N1) and bails when it matches nothing. This absorbed
+    /// `create_execution_with_lineage`, whose only caller was this wrapper and
+    /// whose lineage arguments were always `None`.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_execution(
         &self,
@@ -555,27 +515,41 @@ impl WorkflowRepository {
         priority: ExecutionPriority,
         actor_id: Option<Uuid>,
         provenance: Option<&serde_json::Value>,
-    ) -> Result<()> {
-        let rows = self
-            .create_execution_with_lineage(
-                id,
-                workflow_id,
-                user_id,
-                version_id,
-                priority,
-                actor_id,
-                provenance,
-                None,
-                None,
-            )
-            .await?;
-        if rows == 0 {
+    ) -> Result<talos_actor_budget_refusal::BudgetAdmission> {
+        use talos_actor_budget_refusal::{admit_actor_budget, BudgetAdmission};
+        let mut tx = self.db_pool.begin().await?;
+        if let Some(aid) = actor_id {
+            if let BudgetAdmission::Refused(refusal) = admit_actor_budget(&mut tx, aid).await? {
+                tx.rollback().await?;
+                refusal.record(&self.db_pool).await;
+                return Ok(BudgetAdmission::Refused(refusal));
+            }
+        }
+        let result = sqlx::query(
+            "INSERT INTO workflow_executions \
+             (id, workflow_id, user_id, workflow_version_id, status, started_at, \
+              priority, actor_id, provenance) \
+             SELECT $1, $2, $3, $4, 'running', NOW(), $5, $6, $7 \
+             WHERE EXISTS (SELECT 1 FROM workflows WHERE id = $2 AND user_id = $3)",
+        )
+        .bind(id)
+        .bind(workflow_id)
+        .bind(user_id)
+        .bind(version_id)
+        .bind(priority.as_str())
+        .bind(actor_id)
+        .bind(provenance)
+        .execute(&mut *tx)
+        .await?;
+        if result.rows_affected() == 0 {
+            tx.rollback().await?;
             anyhow::bail!(
                 "create_execution: ownership mismatch — workflow_id {workflow_id} \
                  does not belong to user_id {user_id} (or workflow not found)"
             );
         }
-        Ok(())
+        tx.commit().await?;
+        Ok(BudgetAdmission::Admitted)
     }
 
     /// Atomically check the per-workflow concurrency limit and create a
@@ -648,159 +622,24 @@ impl WorkflowRepository {
         // stays as a fast-fail + owner of the `on_budget_exceeded=suspend`
         // side-effect; this is the pure hard-cap race-closer.
         if let Some(aid) = actor_id {
-            sqlx::query("SELECT pg_advisory_xact_lock($1)")
-                .bind(actor_advisory_lock_key(aid))
-                .execute(&mut *tx)
-                .await?;
-
-            // `max_executions_total` is BIGINT: decoding it as i32 made every
-            // start of an actor with a lifetime cap fail with a decode error
-            // (package CD, found by the first test that set the cap here).
-            let policy: Option<(
-                Option<i32>,
-                Option<i64>,
-                Option<i32>,
-                Option<i64>,
-                Option<i64>,
-                String,
-            )> = sqlx::query_as(
-                "SELECT max_executions_per_hour, max_executions_total, \
-                     max_workflows_per_minute, max_fuel_per_hour, max_llm_tokens_per_day, \
-                     on_budget_exceeded \
-                     FROM actor_budget_policies WHERE actor_id = $1",
-            )
-            .bind(aid)
-            .fetch_optional(&mut *tx)
-            .await?;
-
-            if let Some((per_hour, total, per_minute, fuel_per_hour, llm_tokens_per_day, mode)) =
-                policy
-            {
-                // Per-minute trigger-rate cap. Counts only rows that carry
-                // this actor_id — top-level triggers (bulk_trigger /
-                // trigger_as_actors included). Sub-workflow chain rows are
-                // inserted with actor_id = NULL and in-process sub-workflow
-                // dispatch creates no execution rows, so neither inflates
-                // this count. Same advisory-lock serialisation as the
-                // per-hour / total caps above → atomic with the INSERT.
-                if let Some(limit) = per_minute {
-                    let count: i64 = sqlx::query_scalar(
-                        "SELECT COUNT(*) FROM workflow_executions \
-                         WHERE actor_id = $1 AND started_at > now() - INTERVAL '1 minute'",
-                    )
-                    .bind(aid)
-                    .fetch_one(&mut *tx)
-                    .await?;
-                    if count >= i64::from(limit) {
-                        tx.rollback().await?;
-                        return Ok(self
-                            .refuse_for_budget(
-                                aid,
-                                BudgetCap::PerMinute,
-                                i64::from(limit),
-                                count,
-                                &mode,
-                            )
-                            .await);
-                    }
-                }
-                if let Some(limit) = per_hour {
-                    let count: i64 = sqlx::query_scalar(
-                        "SELECT COUNT(*) FROM workflow_executions \
-                         WHERE actor_id = $1 AND started_at > now() - INTERVAL '1 hour'",
-                    )
-                    .bind(aid)
-                    .fetch_one(&mut *tx)
-                    .await?;
-                    if count >= i64::from(limit) {
-                        tx.rollback().await?;
-                        return Ok(self
-                            .refuse_for_budget(
-                                aid,
-                                BudgetCap::PerHour,
-                                i64::from(limit),
-                                count,
-                                &mode,
-                            )
-                            .await);
-                    }
-                }
-                if let Some(limit) = total {
-                    // LIFETIME cap, so it must count the archive tier too.
-                    // The retention sweep (#746) moves terminal rows out of
-                    // `workflow_executions` after `ARCHIVE_AFTER_DAYS`; a
-                    // live-table-only count therefore RESET this budget every
-                    // archive window, and an actor capped at N total runs
-                    // could run N per window forever. The per-minute /
-                    // per-hour counts above stay on the live table: nothing
-                    // that recent has been archived (the sweep's floor is
-                    // days, not hours). Two COUNTs summed rather than a UNION
-                    // — both tables carry `actor_id`, and a summed pair is
-                    // one index probe each with no row materialisation.
-                    let count: i64 = sqlx::query_scalar(
-                        "SELECT (SELECT COUNT(*) FROM workflow_executions WHERE actor_id = $1) \
-                              + (SELECT COUNT(*) FROM workflow_executions_archive WHERE actor_id = $1)",
-                    )
-                    .bind(aid)
-                    .fetch_one(&mut *tx)
-                    .await?;
-                    if count >= limit {
-                        tx.rollback().await?;
-                        return Ok(self
-                            .refuse_for_budget(aid, BudgetCap::Total, limit, count, &mode)
-                            .await);
-                    }
-                }
-                // Rolling per-hour FUEL cap. Sums fuel already consumed by the
-                // actor's executions in the last hour (execution_cost_rollup is
-                // written per-node during execution by talos-engine's node_hook;
-                // it carries actor_id + recorded_at and is covered by the partial
-                // index idx_cost_rollup_actor). Pre-execution gate: refuse to
-                // START another run once the actor has burned its hourly fuel
-                // budget. fuel_consumed/cap are i64 (bigint); the cap can exceed
-                // i32, which is why ActorBudgetExceeded.limit is i64.
-                if let Some(limit) = fuel_per_hour {
-                    // `::bigint` cast is required: Postgres SUM(bigint) returns
-                    // NUMERIC, which sqlx can't decode into i64 — without the
-                    // cast the whole create transaction errors out.
-                    let used: i64 = sqlx::query_scalar(
-                        "SELECT COALESCE(SUM(fuel_consumed), 0)::bigint FROM execution_cost_rollup \
-                         WHERE actor_id = $1 AND recorded_at > now() - INTERVAL '1 hour'",
-                    )
-                    .bind(aid)
-                    .fetch_one(&mut *tx)
-                    .await?;
-                    if used >= limit {
-                        tx.rollback().await?;
-                        return Ok(self
-                            .refuse_for_budget(aid, BudgetCap::FuelPerHour, limit, used, &mode)
-                            .await);
-                    }
-                }
-                // R2 token ledger: rolling daily LLM token ceiling. Sums the
-                // actor's provider-reported tokens (prompt + completion) from
-                // the `llm_usage` ledger over the trailing 24 hours —
-                // populated at result-ingest from the SIGNED
-                // JobResult/PipelineJobResult, attributed from controller
-                // records. Pre-execution gate mirroring `fuel_per_hour`:
-                // refuse to START another run once the ceiling is reached.
-                // Same `::bigint` cast rationale as the fuel sum above
-                // (SUM(bigint) → NUMERIC otherwise).
-                if let Some(limit) = llm_tokens_per_day {
-                    let used: i64 = sqlx::query_scalar(
-                        "SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0)::bigint \
-                         FROM llm_usage \
-                         WHERE actor_id = $1 AND recorded_at > now() - INTERVAL '24 hours'",
-                    )
-                    .bind(aid)
-                    .fetch_one(&mut *tx)
-                    .await?;
-                    if used >= limit {
-                        tx.rollback().await?;
-                        return Ok(self
-                            .refuse_for_budget(aid, BudgetCap::LlmTokensPerDay, limit, used, &mode)
-                            .await);
-                    }
+            // Package CK: the actor half of this backstop — the per-actor
+            // advisory lock and all five caps — is `admit_actor_budget`, the
+            // ONE in-transaction check every start path now runs inside its
+            // own row-creation transaction. Behaviour here is unchanged: same
+            // lock key, same caps in the same order, recorded after rollback.
+            match talos_actor_budget_refusal::admit_actor_budget(&mut tx, aid).await? {
+                talos_actor_budget_refusal::BudgetAdmission::Admitted => {}
+                talos_actor_budget_refusal::BudgetAdmission::Refused(refusal) => {
+                    tx.rollback().await?;
+                    return Ok(self
+                        .refuse_for_budget(
+                            aid,
+                            refusal.cap,
+                            refusal.limit,
+                            refusal.used,
+                            &refusal.mode,
+                        )
+                        .await);
                 }
             }
         }
@@ -931,6 +770,7 @@ impl WorkflowRepository {
                 running: 0,
                 archived: false,
                 paused: None,
+                budget_refused: None,
             });
         }
         let mut tx = self.db_pool.begin().await?;
@@ -952,7 +792,32 @@ impl WorkflowRepository {
                 running: 0,
                 archived: false,
                 paused: Some(reason),
+                budget_refused: None,
             });
+        }
+
+        // Package CK: the actor's five-cap budget, for the WHOLE batch, inside
+        // this transaction and under the shared per-actor advisory lock —
+        // taken BEFORE the workflow row lock, the order the single-start
+        // backstop uses, so the two cannot deadlock. Until then this batch
+        // twin had no in-transaction budget check at all: `enqueue_workflow`
+        // relied on the lock-free batch pre-check (per-hour, total).
+        if let Some(aid) = actor_id {
+            let starts = i64::try_from(exec_ids.len()).unwrap_or(i64::MAX);
+            if let talos_actor_budget_refusal::BudgetAdmission::Refused(refusal) =
+                talos_actor_budget_refusal::admit_actor_budget_for(&mut tx, aid, starts).await?
+            {
+                tx.rollback().await?;
+                refusal.record(&self.db_pool).await;
+                return Ok(BatchAdmission {
+                    inserted: 0,
+                    limit: None,
+                    running: 0,
+                    archived: false,
+                    paused: None,
+                    budget_refused: Some(refusal),
+                });
+            }
         }
 
         // Lock the workflow row so concurrent enqueues against the same
@@ -975,6 +840,7 @@ impl WorkflowRepository {
                 running: 0,
                 archived: true,
                 paused: None,
+                budget_refused: None,
             });
         }
 
@@ -1000,6 +866,7 @@ impl WorkflowRepository {
                 running,
                 archived: false,
                 paused: None,
+                budget_refused: None,
             });
         }
 
@@ -1044,63 +911,19 @@ impl WorkflowRepository {
             running,
             archived: false,
             paused: None,
+            budget_refused: None,
         })
     }
 
-    /// Insert a new workflow execution record with optional provenance lineage links.
+    /// Insert a test execution record (flagged with is_test_execution = true)
+    /// — the MCP `test_workflow` path's row.
     ///
-    /// T5-N3 / T7-N1: defense-in-depth ownership gates at the SQL layer.
-    /// (1) The INSERT is rewritten as `INSERT ... SELECT ... WHERE EXISTS`
-    ///     so the row only lands when `(workflow_id, user_id)` matches an
-    ///     actual workflow. Caller-side ownership checks remain canonical;
-    ///     this catches a missed check by silently producing zero rows
-    ///     instead of writing an execution row whose `user_id` and the
-    ///     workflow's owner disagree.
-    /// (2) When `parent_execution_id` is supplied, the same EXISTS gate
-    ///     verifies the parent execution belongs to `user_id`, preventing
-    ///     a foreign parent from being threaded into the audit lineage.
-    ///
-    /// Returns `Ok(rows_affected)` so callers can detect the
-    /// "ownership mismatch" case (== 0).
-    #[allow(clippy::too_many_arguments)]
-    pub async fn create_execution_with_lineage(
-        &self,
-        id: Uuid,
-        workflow_id: Uuid,
-        user_id: Uuid,
-        version_id: Option<Uuid>,
-        priority: ExecutionPriority,
-        actor_id: Option<Uuid>,
-        provenance: Option<&serde_json::Value>,
-        parent_execution_id: Option<Uuid>,
-        root_execution_id: Option<Uuid>,
-    ) -> Result<u64> {
-        let result = sqlx::query(
-            "INSERT INTO workflow_executions \
-             (id, workflow_id, user_id, workflow_version_id, status, started_at, \
-              priority, actor_id, provenance, parent_execution_id, root_execution_id) \
-             SELECT $1, $2, $3, $4, 'running', NOW(), $5, $6, $7, $8, $9 \
-             WHERE EXISTS (SELECT 1 FROM workflows WHERE id = $2 AND user_id = $3) \
-               AND ($8::uuid IS NULL OR EXISTS ( \
-                   SELECT 1 FROM workflow_executions \
-                   WHERE id = $8 AND user_id = $3 \
-               ))",
-        )
-        .bind(id)
-        .bind(workflow_id)
-        .bind(user_id)
-        .bind(version_id)
-        .bind(priority.as_str())
-        .bind(actor_id)
-        .bind(provenance)
-        .bind(parent_execution_id)
-        .bind(root_execution_id)
-        .execute(&self.db_pool)
-        .await?;
-        Ok(result.rows_affected())
-    }
-
-    /// Insert a test execution record (flagged with is_test_execution = true).
+    /// Package CK: `actor_id` is the actor the test ENGINE runs as, and the row
+    /// now carries it; until then this INSERT bound none, so the default-actor
+    /// trigger stamped the user's Default actor on a run executing as the
+    /// workflow's bound actor. The insert runs that actor's five-cap budget
+    /// check in its own transaction (operator decision 2026-09-18: test runs
+    /// spend real fuel and tokens and are counted).
     pub async fn create_test_execution(
         &self,
         id: Uuid,
@@ -1108,20 +931,32 @@ impl WorkflowRepository {
         user_id: Uuid,
         version_id: Option<Uuid>,
         priority: ExecutionPriority,
-    ) -> Result<()> {
+        actor_id: Option<Uuid>,
+    ) -> Result<talos_actor_budget_refusal::BudgetAdmission> {
+        use talos_actor_budget_refusal::{admit_actor_budget, BudgetAdmission};
+        let mut tx = self.db_pool.begin().await?;
+        if let Some(aid) = actor_id {
+            if let BudgetAdmission::Refused(refusal) = admit_actor_budget(&mut tx, aid).await? {
+                tx.rollback().await?;
+                refusal.record(&self.db_pool).await;
+                return Ok(BudgetAdmission::Refused(refusal));
+            }
+        }
         sqlx::query(
             "INSERT INTO workflow_executions \
-             (id, workflow_id, user_id, workflow_version_id, status, started_at, priority, is_test_execution) \
-             VALUES ($1, $2, $3, $4, 'running', NOW(), $5, true)",
+             (id, workflow_id, user_id, workflow_version_id, status, started_at, priority, is_test_execution, actor_id) \
+             VALUES ($1, $2, $3, $4, 'running', NOW(), $5, true, $6)",
         )
         .bind(id)
         .bind(workflow_id)
         .bind(user_id)
         .bind(version_id)
         .bind(priority.as_str())
-        .execute(&self.db_pool)
+        .bind(actor_id)
+        .execute(&mut *tx)
         .await?;
-        Ok(())
+        tx.commit().await?;
+        Ok(BudgetAdmission::Admitted)
     }
 
     /// Transition a `queued` execution to `running`. Returns `true` if a row

@@ -10,6 +10,30 @@ mod test_helpers;
 use std::sync::Arc;
 use uuid::Uuid;
 
+/// A running execution row for these fixtures. Package CK deleted
+/// `ExecutionRepository::create_execution` — it had no production caller, and
+/// an ungated `pub` INSERT into `workflow_executions` is the shape the package
+/// removes — so the fixture writes its own row.
+async fn insert_running_execution(
+    pool: &sqlx::PgPool,
+    exec: Uuid,
+    wf: Uuid,
+    user: Uuid,
+    actor: Uuid,
+) {
+    sqlx::query(
+        "INSERT INTO workflow_executions (id, workflow_id, user_id, status, started_at, actor_id) \
+         VALUES ($1, $2, $3, 'running', NOW(), $4)",
+    )
+    .bind(exec)
+    .bind(wf)
+    .bind(user)
+    .bind(actor)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 #[tokio::test]
 async fn workflow_output_writes_v4_under_workflow_org_dek_and_reads_back() {
     std::env::set_var(
@@ -65,9 +89,7 @@ async fn workflow_output_writes_v4_under_workflow_org_dek_and_reads_back() {
     let repo =
         talos_execution_repository::ExecutionRepository::with_encryption(pool.clone(), sm.clone());
     let exec = Uuid::new_v4();
-    repo.create_execution(exec, wf, user, None, Some(actor), "running")
-        .await
-        .unwrap();
+    insert_running_execution(&pool, exec, wf, user, actor).await;
 
     let output = serde_json::json!({ "result": "top-secret-output" });
     repo.mark_execution_waiting(exec, &output).await.unwrap();
@@ -138,9 +160,7 @@ async fn re_encrypt_outputs_to_org_migrates_v3_global_rows_to_v4() {
     let repo =
         talos_execution_repository::ExecutionRepository::with_encryption(pool.clone(), sm.clone());
     let exec = Uuid::new_v4();
-    repo.create_execution(exec, wf, user, None, Some(actor), "running")
-        .await
-        .unwrap();
+    insert_running_execution(&pool, exec, wf, user, actor).await;
 
     // Craft a PRE-cutover output: v3 global ciphertext.
     let output = serde_json::json!({ "result": "legacy-output" });
@@ -298,13 +318,8 @@ async fn seed_running_execution(
         .await
         .unwrap();
 
-    let exec_repo =
-        talos_execution_repository::ExecutionRepository::with_encryption(pool.clone(), sm.clone());
     let exec = Uuid::new_v4();
-    exec_repo
-        .create_execution(exec, wf, user, None, Some(actor), "running")
-        .await
-        .unwrap();
+    insert_running_execution(&pool, exec, wf, user, actor).await;
     (user, org, exec, sm, pool)
 }
 
@@ -437,13 +452,8 @@ async fn orgless_workflow_output_stays_v3_global_from_every_writer() {
         .execute(&pool)
         .await
         .unwrap();
-    let exec_repo =
-        talos_execution_repository::ExecutionRepository::with_encryption(pool.clone(), sm.clone());
     let exec = Uuid::new_v4();
-    exec_repo
-        .create_execution(exec, wf, user, None, Some(actor), "running")
-        .await
-        .unwrap();
+    insert_running_execution(&pool, exec, wf, user, actor).await;
 
     let repo = talos_workflow_repository::WorkflowRepository::new(pool.clone())
         .with_encryption(sm.clone());

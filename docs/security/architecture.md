@@ -375,11 +375,21 @@ names were retired and every gate reads them as unrecognised.
 
 Each actor may have one `actor_budget_policies` row. Every limit is optional
 (NULL = no cap) except the two with column defaults. Enforcement is at
-execution-row creation, inside one transaction under a per-actor advisory lock
+execution-row creation, inside the row's own transaction under a per-actor
+advisory lock, by ONE function every start path calls
+(`talos-actor-budget-refusal/src/admission.rs::admit_actor_budget`): the
+scheduler, webhooks, the operator trigger surfaces
 (`talos-workflow-repository/src/executions.rs::create_execution_under_concurrency_limit`),
-plus a lock-free pre-check on the trigger paths
-(`talos-actor-repository/src/budget_precheck.rs`). Sub-workflow children run
-in-process, create no execution row, and are not counted.
+the `enqueue_workflow` batch (whole batch refused when it would carry a count
+cap over), the approval/suspension/push continuation path, replay, retry,
+handoff, and the three test-run writers (test runs are counted: they spend real
+fuel and tokens). Chain starts run the same check before dispatch in their own
+transaction, NOT atomically with their row, which is written off the push
+handler's critical path. Until 2026-09-18 (package CK) only the first group ran
+it; the rest relied on a lock-free pre-check
+(`talos-actor-repository/src/budget_precheck.rs`) that never read the
+per-minute, fuel or token caps. Sub-workflow children run in-process, create no
+execution row, and are not counted.
 
 | Column | Purpose | Enforcement |
 |-------------|---------|-------------|

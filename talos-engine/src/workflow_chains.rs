@@ -305,6 +305,10 @@ pub async fn insert_chain_execution_row(
     // Phase D2: stamp the gate-resolved actor so row attribution matches the
     // engine binding (pre-fix the DB trigger filled the user's DEFAULT actor
     // and per-actor budget COUNTs never saw chain runs).
+    // allow-unbudgeted-execution-insert: the budget check runs in the CALLER,
+    // `run_single_workflow_chain`, BEFORE dispatch — this INSERT is spawned off
+    // the push handler's critical path (L-29), so gating it here could not stop
+    // the run (package CK).
     sqlx::query(
         "INSERT INTO workflow_executions \
              (id, workflow_id, user_id, actor_id, status, started_at, triggered_by_module_execution_id) \
@@ -1009,6 +1013,54 @@ async fn run_single_workflow_chain(
         trigger_module_id,
         trigger_context_id
     );
+
+    // Package CK: the actor's five-cap budget, checked BEFORE dispatch. The
+    // pre-check above (`resolve_effective_actor`) covers status, per-hour and
+    // total only. The row INSERT below stays off the critical path (L-29), so
+    // gating THAT would not stop the run — it would only leave a spending run
+    // unrecorded — which is why this check runs in its own short transaction
+    // here instead. Stated limit: unlike every other start path it is not
+    // atomic with the row write, so two concurrent chain starts for one actor
+    // can both pass at the cap's edge (0 chain runs in 30 days on the
+    // reference fleet).
+    if let Some(aid) = effective_actor_id {
+        let admission = async {
+            let mut tx = db_pool.begin().await?;
+            let got = talos_actor_budget_refusal::admit_actor_budget(&mut tx, aid).await?;
+            tx.commit().await?;
+            Ok::<_, sqlx::Error>(got)
+        }
+        .await;
+        match admission {
+            Ok(talos_actor_budget_refusal::BudgetAdmission::Admitted) => {}
+            Ok(talos_actor_budget_refusal::BudgetAdmission::Refused(refusal)) => {
+                refusal.record(db_pool).await;
+                tracing::warn!(
+                    target: "talos_engine",
+                    event_kind = "chain_dispatch_denied_by_budget",
+                    %workflow_id,
+                    actor_id = %aid,
+                    cap = refusal.cap.as_str(),
+                    reason = %refusal.message(),
+                    "chain dispatch denied by the actor's budget"
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                // Fail CLOSED, like the pre-check's own database arm: a budget
+                // that cannot be read must not grant a start.
+                tracing::warn!(
+                    target: "talos_engine",
+                    event_kind = "chain_dispatch_denied_db_error",
+                    %workflow_id,
+                    actor_id = %aid,
+                    error = %e,
+                    "chain dispatch denied — budget check could not run (fail-closed)"
+                );
+                return Ok(());
+            }
+        }
+    }
 
     // Create a workflow execution record for this chain run.
     // L-29: spawn the initial INSERT + linkage UPDATE so push-notification

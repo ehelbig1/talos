@@ -824,6 +824,7 @@ CTRL_TESTS=(
     "approval_policy_trigger_refusal_tests"
     # Package CD: on_budget_exceeded=alert raises an ops alert; every refusal is counted.
     "actor_budget_alert_tests"
+    "actor_budget_coverage_tests"
     # BR: the grant CHECK equals ACTOR_CEILING_WORLDS; one ceiling read.
     "capability_grant_world_check_tests"
 )

@@ -321,18 +321,46 @@ pub async fn trigger_continuation_workflow(
         }
     }
 
-    // 1. Create execution record (queued; transitions to running in the spawn below)
-    if let Err(e) = repo
-        .insert_queued_execution(execution_id, workflow_id, user_id, &trigger_payload)
+    // 1. Create execution record (queued; transitions to running in the spawn
+    //    below). Package CK: the row carries the gate-resolved actor the engine
+    //    will run as, and the insert runs the actor's five-cap budget check in
+    //    its own transaction — the pre-check above covers only status,
+    //    per-hour and total, and is not atomic.
+    match repo
+        .insert_queued_execution(
+            execution_id,
+            workflow_id,
+            user_id,
+            effective_actor_id,
+            &trigger_payload,
+        )
         .await
     {
-        tracing::error!(
-            source_id = %source_id,
-            source_kind = ?source_kind,
-            "trigger_continuation_workflow: INSERT failed: {}",
-            e
-        );
-        return None;
+        Ok(talos_actor_budget_refusal::BudgetAdmission::Admitted) => {}
+        Ok(talos_actor_budget_refusal::BudgetAdmission::Refused(refusal)) => {
+            tracing::warn!(
+                target: "talos_continuation_trigger",
+                event_kind = "continuation_dispatch_denied_by_budget",
+                source_id = %source_id,
+                source_kind = ?source_kind,
+                workflow_id = %workflow_id,
+                actor_id = %refusal.actor_id,
+                %user_id,
+                cap = refusal.cap.as_str(),
+                reason = %refusal.message(),
+                "continuation dispatch denied by the actor's budget (in-transaction check)"
+            );
+            return None;
+        }
+        Err(e) => {
+            tracing::error!(
+                source_id = %source_id,
+                source_kind = ?source_kind,
+                "trigger_continuation_workflow: INSERT failed: {}",
+                e
+            );
+            return None;
+        }
     }
 
     // 2. Write back continuation_execution_id to the source record so

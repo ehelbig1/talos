@@ -2106,6 +2106,11 @@ impl ActorRepository {
     }
 
     /// Insert a new workflow execution record for a handoff.
+    ///
+    /// Package CK: the row is counted against `to_actor`, so the insert runs
+    /// that actor's five-cap budget check in its own transaction under the
+    /// shared per-actor advisory lock. Until then the only gates were the
+    /// lock-free pre-checks, which never consulted per-minute or fuel per hour.
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_handoff_execution(
         &self,
@@ -2117,7 +2122,14 @@ impl ActorRepository {
         provenance: &serde_json::Value,
         parent_execution_id: Option<Uuid>,
         root_execution_id: Option<Uuid>,
-    ) -> Result<()> {
+    ) -> Result<talos_actor_budget_refusal::BudgetAdmission> {
+        use talos_actor_budget_refusal::{admit_actor_budget, BudgetAdmission};
+        let mut tx = self.db_pool.begin().await?;
+        if let BudgetAdmission::Refused(refusal) = admit_actor_budget(&mut tx, to_actor_id).await? {
+            tx.rollback().await?;
+            refusal.record(&self.db_pool).await;
+            return Ok(BudgetAdmission::Refused(refusal));
+        }
         sqlx::query(
             "INSERT INTO workflow_executions \
              (id, workflow_id, user_id, status, started_at, workflow_version_id, priority, actor_id, provenance, parent_execution_id, root_execution_id) \
@@ -2131,9 +2143,10 @@ impl ActorRepository {
         .bind(provenance)
         .bind(parent_execution_id)
         .bind(root_execution_id)
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(())
+        tx.commit().await?;
+        Ok(BudgetAdmission::Admitted)
     }
 
     /// Mark a running execution as failed (used in handoff error paths).

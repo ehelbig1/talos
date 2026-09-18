@@ -9357,6 +9357,42 @@ fi
 
 echo
 
+bold "▶ check 95: every execution-row insert runs the actor budget check"
+
+# The five per-actor caps (executions per minute / hour / total, fuel per hour,
+# LLM tokens per day) were enforced atomically in ONE of the thirteen places
+# that create a `workflow_executions` row — `create_execution_under_concurrency_limit`.
+# Measured 2026-09-18 (package CK), the other start paths passed a lock-free
+# pre-check covering some caps or none: the approval/suspension/push
+# CONTINUATION path (3 104 runs in 30 days, 28% of the reference fleet's runs)
+# never read per-minute, fuel or tokens; replay, retry, handoff, chain starts,
+# the enqueue batch and the three test-run writers likewise. Every start now
+# runs `talos_actor_budget_refusal::admit_actor_budget[_for]` in its own
+# transaction; this check keeps a new creation site from being added without
+# it. 13 on pristine main (9 real uncovered starts, 2 dead creators, the
+# backstop itself — which held the lock under a different name — and 2 chain
+# failure-record upserts), 0 after. Stated limits: TEXTUAL and function-scoped,
+# so a check reached through a helper in another function, SQL assembled with
+# `format!`, or a check that runs and is then ignored all pass; the behaviour is
+# pinned by `controller/tests/actor_budget_coverage_tests`. Opt-out
+# `// allow-unbudgeted-execution-insert: <reason>` within 8 lines above.
+if [ ! -f "$ROOT/scripts/lint-execution-start-budget.py" ]; then
+    red "✗ scripts/lint-execution-start-budget.py is missing — the check cannot run"
+    EXIT_CODE=1
+else
+    CK95_OUT="$(cd "$ROOT" && python3 scripts/lint-execution-start-budget.py "$ROOT" 2>&1)"
+    CK95_RC=$?
+    if [ "$CK95_RC" -eq 0 ]; then
+        green "✓ every execution-row insert runs the actor budget check ($(echo "$CK95_OUT" | tail -1 | sed -E 's/^ +//'))"
+    else
+        echo "$CK95_OUT" | sed 's/^/  /'
+        red "✗ an execution-row insert skips the actor budget check"
+        yellow "  → run talos_actor_budget_refusal::admit_actor_budget in the insert's transaction"
+        EXIT_CODE=1
+    fi
+fi
+echo
+
 bold "▶ check 54: lint self-consistency (check numbering + documented count)"
 ACTUAL_NUMS="$(grep -oE '^bold "▶ check [0-9]+:' "${BASH_SOURCE[0]}" | grep -oE '[0-9]+' | sort -n)"
 EXPECTED_NUMS="$(seq 1 "$CHECK_COUNT")"

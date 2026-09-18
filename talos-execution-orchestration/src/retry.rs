@@ -205,17 +205,25 @@ impl ExecutionOrchestrationService {
         // wins (rows_affected = 1) and the second sees `false` —
         // abort with StatusConflict so the second retry doesn't spawn
         // a duplicate engine racing against the first.
-        let admitted = self
+        match self
             .execution_repo
             .mark_execution_running(execution_id)
             .await
-            .map_err(OrchestrationError::Internal)?;
-        if !admitted {
-            return Err(OrchestrationError::StatusConflict(format!(
-                "execution {} was already retried (concurrent caller won the transition); \
-                 poll get_execution_status to observe the in-flight retry",
-                execution_id
-            )));
+            .map_err(OrchestrationError::Internal)?
+        {
+            talos_execution_repository::RetryReset::Reset => {}
+            talos_execution_repository::RetryReset::AlreadyRunning => {
+                return Err(OrchestrationError::StatusConflict(format!(
+                    "execution {} was already retried (concurrent caller won the transition); \
+                     poll get_execution_status to observe the in-flight retry",
+                    execution_id
+                )));
+            }
+            // Package CK: the in-transaction five-cap check — the same one the
+            // trigger backstop runs — refused; nothing was reset.
+            talos_execution_repository::RetryReset::BudgetRefused(refusal) => {
+                return Err(OrchestrationError::AuthorizationDenied(refusal.message()));
+            }
         }
 
         // 5. Engine build. Build before spawning so we surface graph-
