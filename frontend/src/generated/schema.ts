@@ -1027,7 +1027,8 @@ export type MutationRoot = {
   /**
    * Per-org DEK arc: move existing encrypted execution outputs onto their
    * workflow's org's ACTIVE root DEK (format v4), including outputs under a
-   * retired org DEK. Execution-output sibling of `reEncryptSecretsToOrg` /
+   * retired org DEK, in both the live table and the retention archive.
+   * Execution-output sibling of `reEncryptSecretsToOrg` /
    * `reEncryptMemoriesToOrg`; outputs whose workflow has no org stay on the
    * global DEK.
    */

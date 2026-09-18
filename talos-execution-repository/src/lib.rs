@@ -566,12 +566,67 @@ pub struct LoopCappedWorkflowRow {
     pub last_seen: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// Outcome of [`ExecutionRepository::re_encrypt_outputs_to_org`].
+/// Outcome of [`ExecutionRepository::re_encrypt_outputs_to_org`], summed over
+/// both tiers. `archive_re_encrypted` is the subset of `re_encrypted` that came
+/// from `workflow_executions_archive`, so a caller can say how much of the work
+/// the retention move had already taken out of the live table.
 #[derive(Debug, Clone, Default)]
 pub struct OutputReEncryptStats {
     pub re_encrypted: u64,
     pub failed: u64,
+    pub archive_re_encrypted: u64,
 }
+
+/// The two tables an execution output can live in. The retention sweep MOVES a
+/// terminal row into `workflow_executions_archive` with its ciphertext, key id,
+/// format and id unchanged, so an output sealed under the global DEK (or an org
+/// DEK since retired by `rotateOrgDek`) stays under it after archival — and a
+/// sweep that reads only the live table stops seeing it the moment it moves.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputTier {
+    Live,
+    Archive,
+}
+
+impl OutputTier {
+    /// Every tier the output sweep covers. Live first: a row the retention
+    /// move archives between the two passes is then picked up by the second.
+    pub const ALL: [OutputTier; 2] = [OutputTier::Live, OutputTier::Archive];
+}
+
+/// Rows re-keyed per page of the output sweep. The SELECT carries the
+/// ciphertext, so an unpaged sweep holds every pending output in memory at once
+/// (23 MB on the reference deployment at the time of writing, unbounded in
+/// general).
+pub const OUTPUT_SWEEP_PAGE: i64 = 200;
+
+// One pending page of each tier: an encrypted output whose workflow has an org
+// and which is not under that org's ACTIVE DEK (`talos_org_dek_pending`, the
+// one home for that predicate, shared with `dek_migration_status`). Keyset on
+// `id` so a row that fails to re-key cannot be re-read forever.
+const LIVE_OUTPUT_SWEEP_PAGE_SQL: &str =
+    "SELECT we.id, we.output_data_enc, we.output_enc_key_id, we.output_data_format, w.org_id \
+     FROM workflow_executions we JOIN workflows w ON w.id = we.workflow_id \
+     WHERE we.output_data_enc IS NOT NULL \
+       AND w.org_id IS NOT NULL \
+       AND talos_org_dek_pending(we.output_enc_key_id, w.org_id) \
+       AND we.id > $1 \
+     ORDER BY we.id LIMIT $2";
+const ARCHIVE_OUTPUT_SWEEP_PAGE_SQL: &str =
+    "SELECT we.id, we.output_data_enc, we.output_enc_key_id, we.output_data_format, w.org_id \
+     FROM workflow_executions_archive we JOIN workflows w ON w.id = we.workflow_id \
+     WHERE we.output_data_enc IS NOT NULL \
+       AND w.org_id IS NOT NULL \
+       AND talos_org_dek_pending(we.output_enc_key_id, w.org_id) \
+       AND we.id > $1 \
+     ORDER BY we.id LIMIT $2";
+// Lost-write guard: fires only while the row is still on the (key, format) read.
+const LIVE_OUTPUT_SWEEP_UPDATE_SQL: &str = "UPDATE workflow_executions \
+     SET output_data_enc = $1, output_enc_key_id = $2, output_data_format = $3 \
+     WHERE id = $4 AND output_enc_key_id = $5 AND output_data_format = $6";
+const ARCHIVE_OUTPUT_SWEEP_UPDATE_SQL: &str = "UPDATE workflow_executions_archive \
+     SET output_data_enc = $1, output_enc_key_id = $2, output_data_format = $3 \
+     WHERE id = $4 AND output_enc_key_id = $5 AND output_data_format = $6";
 
 impl ExecutionRepository {
     pub fn new(db_pool: PgPool) -> Self {
@@ -856,7 +911,22 @@ impl ExecutionRepository {
         .fetch_optional(&self.db_pool)
         .await?;
         let org_id = org_row.flatten();
-        sm.encrypt_value_aad_v4_or_global(&json_str, org_id, exec_id.as_bytes())
+        Self::seal_output(sm, exec_id, &json_str, org_id).await
+    }
+
+    /// The one sealing rule for an execution output: v4 under `org_id`'s active
+    /// DEK when the workflow has an org, v3 under the global DEK otherwise, AAD
+    /// = the execution id. [`Self::encrypt_output`] resolves `org_id` from the
+    /// LIVE row; the per-org sweep passes the org it already selected, because
+    /// an ARCHIVED row has no live row and that lookup would answer "no org"
+    /// and re-seal it under the global DEK it is being moved off.
+    async fn seal_output(
+        sm: &talos_secrets_manager::SecretsManager,
+        exec_id: Uuid,
+        json_str: &str,
+        org_id: Option<Uuid>,
+    ) -> Result<(Uuid, Vec<u8>, i16)> {
+        sm.encrypt_value_aad_v4_or_global(json_str, org_id, exec_id.as_bytes())
             .await
     }
 
@@ -885,93 +955,126 @@ impl ExecutionRepository {
     /// sweeps; the cutover only converts NEW writes, this brings stored rows over
     /// so the global DEK can retire for execution output.
     ///
+    /// Covers BOTH tiers ([`OutputTier::ALL`]): the retention sweep moves a
+    /// terminal row into `workflow_executions_archive` with its ciphertext and
+    /// key id unchanged, so a live-only sweep left every archived output on the
+    /// DEK it was sealed under — the global DEK, or an org DEK `rotateOrgDek`
+    /// had retired — while `dek_migration_status` reported the work done.
+    ///
     /// Selects rows with an encrypted output whose workflow has an org and that
-    /// are not under that org's ACTIVE DEK (not yet v4, or v4 under a rotated org
-    /// DEK — `talos_org_dek_pending`, package CE), then decrypts + re-encrypts
-    /// via the SAME helpers the live write path uses — `encrypt_output`
-    /// resolves the workflow's org (the execution tenant). Outputs whose workflow has no org stay on the global DEK.
-    /// `workflow_executions.org_id` is left as-is (the high-write perf exclusion);
-    /// the org is authoritative via the workflow join. Lost-write guard: the
-    /// UPDATE only fires while the row is still on the (key, format) we read.
-    /// No-op when no SecretsManager is wired.
+    /// are not under that org's ACTIVE DEK (`talos_org_dek_pending`, package
+    /// CE), a page of [`OUTPUT_SWEEP_PAGE`] at a time, decrypts, and re-seals
+    /// under the org the page SELECTED ([`Self::seal_output`]). Outputs whose
+    /// workflow has no org stay on the global DEK. Lost-write guard: the UPDATE
+    /// only fires while the row is still on the (key, format) we read. A row the
+    /// retention move archives between the two passes is re-keyed by the
+    /// archive pass. No-op when no SecretsManager is wired.
     pub async fn re_encrypt_outputs_to_org(&self) -> Result<OutputReEncryptStats> {
-        if self.secrets_manager.is_none() {
+        let Some(sm) = self.secrets_manager.as_ref() else {
             return Ok(OutputReEncryptStats::default());
-        }
-
-        let rows = sqlx::query(
-            "SELECT we.id, we.output_data_enc, we.output_enc_key_id, we.output_data_format \
-             FROM workflow_executions we JOIN workflows w ON w.id = we.workflow_id \
-             WHERE we.output_data_enc IS NOT NULL \
-               AND w.org_id IS NOT NULL \
-               AND talos_org_dek_pending(we.output_enc_key_id, w.org_id)",
-        )
-        .fetch_all(&self.db_pool)
-        .await
-        .map_err(|e| anyhow::anyhow!("re_encrypt_outputs_to_org: select stale rows: {e}"))?;
-
-        let mut re_encrypted = 0u64;
-        let mut failed = 0u64;
-        for r in &rows {
-            let exec_id: Uuid = r.try_get("id")?;
-            let enc: Vec<u8> = r.try_get("output_data_enc")?;
-            let key_id: Uuid = r.try_get("output_enc_key_id")?;
-            let fmt: i16 = r.try_get("output_data_format")?;
-
-            let value = match self.decrypt_output(exec_id, key_id, &enc, fmt).await {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::error!(%exec_id, "output per-org sweep: decrypt failed: {e}");
-                    failed += 1;
-                    continue;
-                }
-            };
-            let (new_key_id, new_enc, new_fmt) = match self.encrypt_output(exec_id, &value).await {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::error!(%exec_id, "output per-org sweep: re-encrypt failed: {e}");
-                    failed += 1;
-                    continue;
-                }
-            };
-
-            match sqlx::query(
-                "UPDATE workflow_executions \
-                 SET output_data_enc = $1, output_enc_key_id = $2, output_data_format = $3 \
-                 WHERE id = $4 AND output_enc_key_id = $5 AND output_data_format = $6",
-            )
-            .bind(&new_enc)
-            .bind(new_key_id)
-            .bind(new_fmt)
-            .bind(exec_id)
-            .bind(key_id)
-            .bind(fmt)
-            .execute(&self.db_pool)
-            .await
-            {
-                Ok(res) => {
-                    if res.rows_affected() > 0 {
-                        re_encrypted += 1;
-                    } else {
-                        tracing::debug!(%exec_id, "output per-org sweep: row concurrently re-keyed; skipped");
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(%exec_id, "output per-org sweep: update failed: {e}");
-                    failed += 1;
-                }
+        };
+        let mut stats = OutputReEncryptStats::default();
+        for tier in OutputTier::ALL {
+            let (re_encrypted, failed) = self.re_encrypt_output_tier(sm, tier).await?;
+            stats.re_encrypted += re_encrypted;
+            stats.failed += failed;
+            if tier == OutputTier::Archive {
+                stats.archive_re_encrypted += re_encrypted;
             }
         }
-
         tracing::info!(
-            re_encrypted,
-            failed,
+            re_encrypted = stats.re_encrypted,
+            archive_re_encrypted = stats.archive_re_encrypted,
+            failed = stats.failed,
             "Per-org execution-output re-encryption sweep complete"
         );
-        Ok(OutputReEncryptStats {
-            re_encrypted,
-            failed,
-        })
+        Ok(stats)
+    }
+
+    /// One tier of [`Self::re_encrypt_outputs_to_org`]: `(re_encrypted, failed)`.
+    async fn re_encrypt_output_tier(
+        &self,
+        sm: &talos_secrets_manager::SecretsManager,
+        tier: OutputTier,
+    ) -> Result<(u64, u64)> {
+        let mut re_encrypted = 0u64;
+        let mut failed = 0u64;
+        let mut after = Uuid::nil();
+        loop {
+            let page = match tier {
+                OutputTier::Live => sqlx::query(LIVE_OUTPUT_SWEEP_PAGE_SQL),
+                OutputTier::Archive => sqlx::query(ARCHIVE_OUTPUT_SWEEP_PAGE_SQL),
+            }
+            .bind(after)
+            .bind(OUTPUT_SWEEP_PAGE)
+            .fetch_all(&self.db_pool)
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("re_encrypt_outputs_to_org: select stale rows ({tier:?}): {e}")
+            })?;
+            let Some(last) = page.last() else { break };
+            after = last.try_get("id")?;
+            let full_page = page.len() as i64 == OUTPUT_SWEEP_PAGE;
+
+            for r in &page {
+                let exec_id: Uuid = r.try_get("id")?;
+                let enc: Vec<u8> = r.try_get("output_data_enc")?;
+                let key_id: Uuid = r.try_get("output_enc_key_id")?;
+                let fmt: i16 = r.try_get("output_data_format")?;
+                let org_id: Uuid = r.try_get("org_id")?;
+
+                let value = match self.decrypt_output(exec_id, key_id, &enc, fmt).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::error!(%exec_id, ?tier, "output per-org sweep: decrypt failed: {e}");
+                        failed += 1;
+                        continue;
+                    }
+                };
+                let sealed = match serde_json::to_string(&value) {
+                    Ok(json) => Self::seal_output(sm, exec_id, &json, Some(org_id)).await,
+                    Err(e) => Err(e.into()),
+                };
+                let (new_key_id, new_enc, new_fmt) = match sealed {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::error!(%exec_id, ?tier, "output per-org sweep: re-encrypt failed: {e}");
+                        failed += 1;
+                        continue;
+                    }
+                };
+
+                let update = match tier {
+                    OutputTier::Live => sqlx::query(LIVE_OUTPUT_SWEEP_UPDATE_SQL),
+                    OutputTier::Archive => sqlx::query(ARCHIVE_OUTPUT_SWEEP_UPDATE_SQL),
+                };
+                match update
+                    .bind(&new_enc)
+                    .bind(new_key_id)
+                    .bind(new_fmt)
+                    .bind(exec_id)
+                    .bind(key_id)
+                    .bind(fmt)
+                    .execute(&self.db_pool)
+                    .await
+                {
+                    Ok(res) if res.rows_affected() > 0 => re_encrypted += 1,
+                    Ok(_) => tracing::debug!(
+                        %exec_id,
+                        ?tier,
+                        "output per-org sweep: row concurrently re-keyed or moved; skipped"
+                    ),
+                    Err(e) => {
+                        tracing::error!(%exec_id, ?tier, "output per-org sweep: update failed: {e}");
+                        failed += 1;
+                    }
+                }
+            }
+            if !full_page {
+                break;
+            }
+        }
+        Ok((re_encrypted, failed))
     }
 
     /// Read output_data from a row, transparently decrypting if stored encrypted.

@@ -5213,7 +5213,11 @@ impl SecretsManager {
     /// migratable data.
     ///
     /// Each `pending` count uses the SAME predicate as that table's sweep, so
-    /// "run the sweep until pending = 0" is exact. The personal tables
+    /// "run the sweep until pending = 0" is exact. Execution outputs are counted
+    /// per TIER: the retention move carries an output's ciphertext into
+    /// `workflow_executions_archive` unchanged, and `reEncryptOutputsToOrg`
+    /// re-keys both tiers, so the archive row is what says whether a retired
+    /// key is still load-bearing for archived executions. The personal tables
     /// (totp / webhook signing secret / audit headers) have no sweep — they
     /// migrate lazily on next write — so their `pending` is informational
     /// (`has_sweep = false`): it shrinks as users naturally re-write, and only
@@ -5238,6 +5242,11 @@ impl SecretsManager {
             UNION ALL
             SELECT 'workflow_executions.output', true, COUNT(*)
               FROM workflow_executions we JOIN workflows w ON w.id = we.workflow_id
+             WHERE we.output_data_enc IS NOT NULL AND w.org_id IS NOT NULL
+               AND talos_org_dek_pending(we.output_enc_key_id, w.org_id)
+            UNION ALL
+            SELECT 'workflow_executions_archive.output', true, COUNT(*)
+              FROM workflow_executions_archive we JOIN workflows w ON w.id = we.workflow_id
              WHERE we.output_data_enc IS NOT NULL AND w.org_id IS NOT NULL
                AND talos_org_dek_pending(we.output_enc_key_id, w.org_id)
             UNION ALL
