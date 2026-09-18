@@ -817,6 +817,51 @@ lines under `target: "talos_audit"` with `event_kind = "mcp_auth_refused"`
 and the client IP. No alert references the series yet; a threshold needs a
 baseline it has not produced.
 
+### 3.5 Suspected user password leak
+
+The user signs in and changes the password under **Settings → Password**
+(the `changePassword` GraphQL mutation). It requires the current password
+and, on an account with 2FA enrolled, a session that verified the second
+factor; API keys cannot change a password. One transaction replaces the
+hash, resets the lockout counter, signs out EVERY session of the account and
+writes the `password_change` row in `auth_audit_log`; if any part fails,
+nothing changes. The browser that made the change is issued a fresh session.
+
+Access tokens already issued stay valid until they expire (at most 15
+minutes); the refresh tokens that would renew them are gone.
+
+```bash
+# The change and its failures, newest first
+docker exec talos-postgres psql -U talos -d talos -c \
+  "SELECT created_at, event_type, success, failure_reason, ip_address
+     FROM auth_audit_log
+    WHERE user_id = '...' AND event_type LIKE 'password_change%'
+    ORDER BY created_at DESC LIMIT 20;"
+```
+
+Someone holding a stolen session but not the password shows up as
+`talos_password_changes_total{outcome="wrong_current_password"}` and as
+`password_change_failed` rows. Those guesses share the login lockout counter
+(5 wrong passwords lock the account for 15 minutes), so a session gets no
+more guesses than an anonymous caller. No alert references the series yet.
+
+If the user cannot sign in (the password is already changed by someone
+else), there is no self-service reset: an operator must set a new hash by
+hand and revoke the sessions. Generate the hash off the shell history (for
+example `python3 -c 'import bcrypt,getpass; print(bcrypt.hashpw(getpass.getpass().encode(), bcrypt.gensalt(12)).decode())'`), and have the user
+change it again once signed in:
+
+```bash
+docker exec talos-postgres psql -U talos -d talos -c \
+  "BEGIN;
+   UPDATE users SET password_hash = '<bcrypt hash>', failed_login_attempts = 0,
+          locked_until = NULL WHERE id = '...';
+   DELETE FROM user_sessions WHERE user_id = '...';
+   COMMIT;"
+```
+
+This path writes no audit row; record it in the incident notes.
+
 ---
 
 ## 4. Pre-deployment security checklist

@@ -18,6 +18,7 @@ import {
   Inbox,
   BarChart,
   Fingerprint,
+  KeyRound,
   Globe,
   Search,
   Layers,
@@ -37,6 +38,7 @@ const quotasImport = () => import("@/components/settings/ResourceQuotas");
 const organizationsImport = () =>
   import("@/components/settings/OrganizationsManager");
 const twoFactorImport = () => import("@/components/settings/TwoFactorSettings");
+const passwordImport = () => import("@/components/settings/PasswordSettings");
 const oauthImport = () => import("@/components/settings/OAuthManager");
 const schedulesImport = () => import("@/components/settings/SchedulesManager");
 const securityImport = () => import("@/components/settings/SecurityManager");
@@ -70,6 +72,7 @@ const ResourceQuotas = lazy(() =>
 );
 const OrganizationsManager = lazy(() => organizationsImport());
 const TwoFactorSettings = lazy(() => twoFactorImport());
+const PasswordSettings = lazy(() => passwordImport());
 const OAuthManager = lazy(() => oauthImport());
 const SchedulesManager = lazy(() =>
   schedulesImport().then((m) => ({ default: m.default })),
@@ -99,6 +102,7 @@ const prefetchMap: Record<string, () => Promise<unknown>> = {
   quotas: quotasImport,
   organizations: organizationsImport,
   "two-factor": twoFactorImport,
+  password: passwordImport,
   oauth: oauthImport,
   schedules: schedulesImport,
   security: securityImport,
@@ -125,6 +129,7 @@ const SIDEBAR_CATEGORIES: SidebarCategory[] = [
     label: "Account",
     items: [
       { value: "account", label: "Profile", icon: UserIcon },
+      { value: "password", label: "Password", icon: KeyRound },
       { value: "two-factor", label: "Two-Factor Auth", icon: Fingerprint },
       { value: "oauth", label: "OAuth Apps", icon: Globe },
     ],
@@ -462,6 +467,13 @@ export default function Settings() {
               <ErrorBoundary>
                 <Suspense fallback={<PanelLoading />}>
                   <SecurityManager />
+                </Suspense>
+              </ErrorBoundary>
+            )}
+            {active === "password" && (
+              <ErrorBoundary>
+                <Suspense fallback={<PanelLoading />}>
+                  <PasswordSettings />
                 </Suspense>
               </ErrorBoundary>
             )}

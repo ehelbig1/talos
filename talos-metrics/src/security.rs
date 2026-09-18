@@ -157,3 +157,47 @@ impl McpAuthOutcome {
         }
     }
 }
+
+/// Outcome of one `AuthService::change_password` call, recorded once per call
+/// at its single wrapper — the only way a user changes their own password.
+/// `WrongCurrentPassword` is the guessing signal: a caller holding a session
+/// but not the password (a stolen cookie). It shares the account-lockout
+/// counter with login, so `Locked` follows five of them. `PolicyRejected`
+/// and `Unchanged` are refused BEFORE any guess is counted. `Conflict` is
+/// another request changing the password between this call's check and its
+/// write. `Error` is "could not decide" and is a verdict, so a surface
+/// failing every request for an infrastructure reason is not quiet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PasswordChangeOutcome {
+    Changed,
+    WrongCurrentPassword,
+    Locked,
+    PolicyRejected,
+    Unchanged,
+    Conflict,
+    Error,
+}
+
+impl PasswordChangeOutcome {
+    pub const ALL: &'static [Self] = &[
+        Self::Changed,
+        Self::WrongCurrentPassword,
+        Self::Locked,
+        Self::PolicyRejected,
+        Self::Unchanged,
+        Self::Conflict,
+        Self::Error,
+    ];
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Changed => "changed",
+            Self::WrongCurrentPassword => "wrong_current_password",
+            Self::Locked => "locked",
+            Self::PolicyRejected => "policy_rejected",
+            Self::Unchanged => "unchanged",
+            Self::Conflict => "conflict",
+            Self::Error => "error",
+        }
+    }
+}

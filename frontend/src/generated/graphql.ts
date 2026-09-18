@@ -19,6 +19,12 @@ export type AnalyzeRhaiInput = {
   script: string;
 };
 
+/** The current password and the new one. */
+export type ChangePasswordInput = {
+  currentPassword: string;
+  newPassword: string;
+};
+
 /** Input type for createActor mutation. */
 export type CreateActorInput = {
   description?: string | null | undefined;
@@ -294,6 +300,12 @@ export type UnlinkOAuthMutationVariables = Exact<{
 }>;
 
 export type UnlinkOAuthMutation = { unlinkOauthAccount: boolean };
+
+export type ChangePasswordMutationVariables = Exact<{
+  input: ChangePasswordInput;
+}>;
+
+export type ChangePasswordMutation = { changePassword: boolean };
 
 export type Setup2FaMutationVariables = Exact<{ [key: string]: never }>;
 
@@ -2084,6 +2096,36 @@ export const useUnlinkOAuthMutation = <TError = unknown, TContext = unknown>(
     mutationFn: (variables?: UnlinkOAuthMutationVariables) =>
       graphqlFetcher<UnlinkOAuthMutation, UnlinkOAuthMutationVariables>(
         UnlinkOAuthDocument,
+        variables,
+      )(),
+    ...options,
+  });
+};
+
+export const ChangePasswordDocument = new TypedDocumentString(`
+    mutation ChangePassword($input: ChangePasswordInput!) {
+  changePassword(input: $input)
+}
+    `);
+
+export const useChangePasswordMutation = <TError = unknown, TContext = unknown>(
+  options?: UseMutationOptions<
+    ChangePasswordMutation,
+    TError,
+    ChangePasswordMutationVariables,
+    TContext
+  >,
+) => {
+  return useMutation<
+    ChangePasswordMutation,
+    TError,
+    ChangePasswordMutationVariables,
+    TContext
+  >({
+    mutationKey: ["ChangePassword"],
+    mutationFn: (variables?: ChangePasswordMutationVariables) =>
+      graphqlFetcher<ChangePasswordMutation, ChangePasswordMutationVariables>(
+        ChangePasswordDocument,
         variables,
       )(),
     ...options,
