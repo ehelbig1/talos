@@ -402,8 +402,11 @@ pub struct UserInfo {
 #[derive(SimpleObject, Clone)]
 pub struct TwoFactorSetup {
     pub secret: String,
+    /// The `otpauth://` provisioning URI the QR code encodes.
     #[graphql(name = "qrCodeUrl")]
     pub qr_code_url: String,
+    /// The QR code as BARE base64 of a PNG image (no `data:` prefix): prepend
+    /// `data:image/png;base64,` to use it as an image source.
     #[graphql(name = "qrCodePng")]
     pub qr_code_png: String,
 }

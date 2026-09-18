@@ -20,6 +20,7 @@ import { toast } from "sonner";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { gql } from "@/lib/graphqlClient";
+import { qrCodeImageSrc } from "@/lib/qrCode";
 import {
   useSetup2FaMutation,
   useEnable2FaMutation,
@@ -248,7 +249,7 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
             <div className="flex flex-col lg:flex-row items-stretch gap-10">
               <div className="bg-white p-6 rounded-[2rem] shadow-2xl flex items-center justify-center ring-4 ring-primary/10 mx-auto lg:mx-0 shrink-0">
                 <img
-                  src={setupData.qrCodePng}
+                  src={qrCodeImageSrc(setupData.qrCodePng)}
                   alt="2FA QR Code"
                   className="w-48 h-48"
                 />

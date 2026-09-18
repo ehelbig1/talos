@@ -2124,7 +2124,12 @@ export type TwoFactorEnrollment = {
 
 export type TwoFactorSetup = {
   __typename?: "TwoFactorSetup";
+  /**
+   * The QR code as BARE base64 of a PNG image (no `data:` prefix): prepend
+   * `data:image/png;base64,` to use it as an image source.
+   */
   qrCodePng: Scalars["String"]["output"];
+  /** The `otpauth://` provisioning URI the QR code encodes. */
   qrCodeUrl: Scalars["String"]["output"];
   secret: Scalars["String"]["output"];
 };
