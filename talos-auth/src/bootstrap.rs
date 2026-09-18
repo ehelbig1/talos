@@ -140,8 +140,13 @@ pub async fn promote_first_user_if_needed(
 
     // Upsert the grant. The WHERE guard prevents downgrading a higher grant
     // (defense-in-depth — we already short-circuit above, but a concurrent
-    // path could race between the SELECT and INSERT).
-    sqlx::query(
+    // path could race between the SELECT and INSERT). The grant and its
+    // `capability_grant_issued` record commit together; the record's user is
+    // NULL because the platform, not a person, granted it (2026-09-18 —
+    // before, the first user's elevation to the top of the lattice left no
+    // record at all).
+    let mut tx = pool.begin().await?;
+    let granted = sqlx::query(
         "INSERT INTO user_capability_grants (user_id, max_capability_world, notes) \
          VALUES ($1, 'automation-node', 'Bootstrap: first-user elevation (runtime)') \
          ON CONFLICT (user_id) DO UPDATE \
@@ -151,8 +156,32 @@ pub async fn promote_first_user_if_needed(
          WHERE user_capability_grants.max_capability_world != 'automation-node'",
     )
     .bind(user_id)
-    .execute(pool)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if granted == 0 {
+        // Someone else already holds the top ceiling for this user; nothing
+        // changed, so nothing is recorded.
+        tx.rollback().await?;
+        return Ok(false);
+    }
+    talos_admin_event_log::insert_on_conn(
+        &mut tx,
+        None,
+        "capability_grant_issued",
+        "user",
+        Some(user_id),
+        &format!(
+            "Capability ceiling automation-node granted to user {user_id} (first-user bootstrap)"
+        ),
+        Some(&serde_json::json!({
+            "target_user_id": user_id,
+            "max_capability_world": "automation-node",
+            "bootstrap": true,
+        })),
+    )
     .await?;
+    tx.commit().await?;
 
     tracing::info!(
         %user_id,

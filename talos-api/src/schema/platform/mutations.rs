@@ -267,7 +267,8 @@ impl PlatformMutations {
             return Err(async_graphql::Error::new("Target user not found").extend_safe());
         }
 
-        // UPSERT the grant
+        // UPSERT the grant; `capability_grant_issued` is recorded in the same
+        // transaction (until 2026-09-18 this mutation recorded nothing).
         actor_repo
             .upsert_capability_grant(
                 input.user_id,
@@ -331,7 +332,8 @@ impl PlatformMutations {
 
         let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
         let rows_deleted = actor_repo
-            .delete_capability_grant(user_id)
+            // Records `capability_grant_revoked` in the same transaction.
+            .delete_capability_grant(user_id, revoker_id, None)
             .await
             .map_err(|e| {
                 tracing::error!("revoke_capability_ceiling failed: {}", e);

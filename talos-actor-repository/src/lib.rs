@@ -2991,7 +2991,17 @@ impl ActorRepository {
         Ok(exists)
     }
 
-    /// Upsert a capability ceiling grant for a target user.
+    /// Grant a capability ceiling to `target_user_id`, and record it.
+    ///
+    /// The grant and its `capability_grant_issued` row in `admin_event_log`
+    /// commit in ONE transaction: a ceiling is never raised without its
+    /// record, and a record is never written for a grant that did not land.
+    /// Until 2026-09-18 the GraphQL `grantCapabilityCeiling` wrote NO record
+    /// and the MCP tool wrote one from a detached task after the grant had
+    /// committed. The record carries the ceiling the user held before, so an
+    /// overwrite is not lost (`previous_world`, `null` when there was none).
+    /// The row is locked first so two concurrent grants record the ceiling
+    /// each actually replaced.
     pub async fn upsert_capability_grant(
         &self,
         target_user_id: Uuid,
@@ -2999,6 +3009,14 @@ impl ActorRepository {
         granter_id: Uuid,
         notes: Option<&str>,
     ) -> Result<()> {
+        let mut tx = self.db_pool.begin().await?;
+        let previous: Option<String> = sqlx::query_scalar(
+            "SELECT max_capability_world FROM user_capability_grants \
+             WHERE user_id = $1 FOR UPDATE",
+        )
+        .bind(target_user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
         sqlx::query(
             "INSERT INTO user_capability_grants (user_id, max_capability_world, granted_by, notes) \
              VALUES ($1, $2, $3, $4) \
@@ -3012,18 +3030,69 @@ impl ActorRepository {
         .bind(max_capability_world)
         .bind(granter_id)
         .bind(notes)
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await?;
+        let details = serde_json::json!({
+            "target_user_id": target_user_id,
+            "max_capability_world": max_capability_world,
+            "previous_world": previous,
+            "notes": notes,
+            "self_grant": granter_id == target_user_id,
+        });
+        talos_admin_event_log::insert_on_conn(
+            &mut tx,
+            Some(granter_id),
+            "capability_grant_issued",
+            "user",
+            Some(target_user_id),
+            &format!("Capability ceiling {max_capability_world} granted to user {target_user_id}"),
+            Some(&details),
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
-    /// Delete a capability grant for a user. Returns the number of rows deleted.
-    pub async fn delete_capability_grant(&self, target_user_id: Uuid) -> Result<u64> {
-        let result = sqlx::query("DELETE FROM user_capability_grants WHERE user_id = $1")
-            .bind(target_user_id)
-            .execute(&self.db_pool)
-            .await?;
-        Ok(result.rows_affected())
+    /// Revoke `target_user_id`'s capability grant, and record it. Returns the
+    /// number of rows deleted (0 when there was no grant, in which case
+    /// nothing is recorded). The deletion and its `capability_grant_revoked`
+    /// row commit in ONE transaction, and the record names the ceiling that
+    /// was withdrawn.
+    pub async fn delete_capability_grant(
+        &self,
+        target_user_id: Uuid,
+        revoked_by: Uuid,
+        notes: Option<&str>,
+    ) -> Result<u64> {
+        let mut tx = self.db_pool.begin().await?;
+        let withdrawn: Option<String> = sqlx::query_scalar(
+            "DELETE FROM user_capability_grants WHERE user_id = $1 \
+             RETURNING max_capability_world",
+        )
+        .bind(target_user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(withdrawn) = withdrawn else {
+            tx.rollback().await?;
+            return Ok(0);
+        };
+        talos_admin_event_log::insert_on_conn(
+            &mut tx,
+            Some(revoked_by),
+            "capability_grant_revoked",
+            "user",
+            Some(target_user_id),
+            &format!("Capability ceiling {withdrawn} revoked from user {target_user_id}"),
+            Some(&serde_json::json!({
+                "target_user_id": target_user_id,
+                "withdrawn_world": withdrawn,
+                "notes": notes,
+                "self_revoke": revoked_by == target_user_id,
+            })),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(1)
     }
 
     /// List all capability grants (admin-only). Returns up to 200 rows.

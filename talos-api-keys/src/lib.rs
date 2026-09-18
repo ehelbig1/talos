@@ -296,19 +296,21 @@ impl ApiKeyService {
         .await
         .context("Failed to create API key")?;
 
+        Self::record_key_event(
+            &mut tx,
+            user_id,
+            "api_key_created",
+            record.id,
+            &format!("API key '{}' created", name),
+            serde_json::json!({ "name": name, "scopes": scope_strings }),
+        )
+        .await?;
+
         tx.commit()
             .await
             .context("Failed to commit api-key create transaction")?;
 
         tracing::info!("Created API key '{}' for user {}", name, user_id);
-        Self::log_key_event(
-            self.db_pool.clone(),
-            user_id,
-            "api_key_created",
-            record.id,
-            format!("API key '{}' created", name),
-            serde_json::json!({ "name": name, "scopes": scope_strings }),
-        );
 
         // Return the full key (only time it's returned!) along with metadata
         Ok((full_key, record.id, record.expires_at))
@@ -677,6 +679,7 @@ impl ApiKeyService {
 
     /// Revoke an API key
     pub async fn revoke_key(&self, key_id: Uuid, user_id: Uuid) -> Result<()> {
+        let mut tx = self.db_pool.begin().await?;
         let result = sqlx::query!(
             "UPDATE api_keys
              SET is_active = false
@@ -684,49 +687,54 @@ impl ApiKeyService {
             key_id,
             user_id
         )
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await?;
 
         if result.rows_affected() == 0 {
             return Err(anyhow!("API key not found or not owned by user"));
         }
 
-        tracing::info!("Revoked API key {} for user {}", key_id, user_id);
-        Self::log_key_event(
-            self.db_pool.clone(),
+        Self::record_key_event(
+            &mut tx,
             user_id,
             "api_key_revoked",
             key_id,
-            format!("API key {} revoked (deactivated)", key_id),
+            &format!("API key {} revoked (deactivated)", key_id),
             serde_json::json!({ "key_id": key_id }),
-        );
+        )
+        .await?;
+        tx.commit().await?;
+        tracing::info!("Revoked API key {} for user {}", key_id, user_id);
         Ok(())
     }
 
     /// Delete an API key permanently
     pub async fn delete_key(&self, key_id: Uuid, user_id: Uuid) -> Result<()> {
+        let mut tx = self.db_pool.begin().await?;
         let result = sqlx::query!(
             "DELETE FROM api_keys
              WHERE id = $1 AND user_id = $2",
             key_id,
             user_id
         )
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await?;
 
         if result.rows_affected() == 0 {
             return Err(anyhow!("API key not found or not owned by user"));
         }
 
-        tracing::info!("Deleted API key {} for user {}", key_id, user_id);
-        Self::log_key_event(
-            self.db_pool.clone(),
+        Self::record_key_event(
+            &mut tx,
             user_id,
             "api_key_deleted",
             key_id,
-            format!("API key {} permanently deleted", key_id),
+            &format!("API key {} permanently deleted", key_id),
             serde_json::json!({ "key_id": key_id }),
-        );
+        )
+        .await?;
+        tx.commit().await?;
+        tracing::info!("Deleted API key {} for user {}", key_id, user_id);
         Ok(())
     }
 
@@ -801,6 +809,19 @@ impl ApiKeyService {
         .await
         .context("Failed to insert new key")?;
 
+        Self::record_key_event(
+            &mut tx,
+            user_id,
+            "api_key_rotated",
+            key_id,
+            &format!(
+                "API key '{}' rotated (old key {} deactivated)",
+                old_key.name, key_id
+            ),
+            serde_json::json!({ "old_key_id": key_id, "new_key_id": new_id, "key_name": old_key.name }),
+        )
+        .await?;
+
         tx.commit()
             .await
             .context("Failed to commit rotation transaction")?;
@@ -811,88 +832,36 @@ impl ApiKeyService {
             user_id = %user_id,
             "Rotated API key"
         );
-        Self::log_key_event(
-            self.db_pool.clone(),
-            user_id,
-            "api_key_rotated",
-            key_id,
-            format!(
-                "API key '{}' rotated (old key {} deactivated)",
-                old_key.name, key_id
-            ),
-            serde_json::json!({ "old_key_id": key_id, "new_key_id": new_id, "key_name": old_key.name }),
-        );
 
         Ok(full_key)
     }
 
-    /// Fire-and-forget audit log entry for API key lifecycle events.
-    ///
-    /// Writes to `admin_event_log` (append-only, immutability-trigger protected).
-    /// Runs in a background task so it never blocks the caller.
-    /// Sensitive values (key hash, full key) must NOT appear in `summary` or `details`.
-    ///
-    /// MCP-984 (2026-05-15): defence-in-depth DLP-redact `summary` and
-    /// `details` at the persistence boundary. Callers embed
-    /// user-supplied `name` (line ~252, ~707, ~849 — `format!("API key
-    /// '{}' ...", name)`) which is arbitrary user input from
-    /// `create_api_key(... name: &str ...)`. Users occasionally paste
-    /// secrets into name fields by mistake; the canonical
-    /// `ActorRepository::insert_admin_event_log` path already redacts
-    /// both columns (MCP-978/979), but this crate writes raw SQL
-    /// directly to the same table — bypassing that protection.
-    /// Redaction is idempotent so re-scrubbing pre-cleaned text is a
-    /// no-op.
-    fn log_key_event(
-        pool: Pool<Postgres>,
+    /// The audit record of an API-key lifecycle change, written on the
+    /// change's own transaction: a key is never created, rotated, revoked,
+    /// deleted or expired without its row in `admin_event_log`, and a record
+    /// is never written for a change that rolled back. Until 2026-09-18 this
+    /// was a detached `tokio::spawn` after the commit — a failed or dropped
+    /// task left a permanent gap — AND the GraphQL resolvers wrote a second
+    /// copy of the same event, so every change was recorded twice.
+    async fn record_key_event(
+        conn: &mut sqlx::PgConnection,
         user_id: Uuid,
         event_type: &'static str,
         key_id: Uuid,
-        summary: String,
+        summary: &str,
         details: serde_json::Value,
-    ) {
-        tokio::spawn(async move {
-            // Package CH (2026-09-17): through the one shared writer. This site
-            // redacted both columns and never TRUNCATED either, while the
-            // summary interpolates the user-supplied key name; the shared
-            // writer caps the summary at 1000 bytes and bounds `details` at
-            // 1 MiB as well as redacting.
-            if let Err(e) = talos_admin_event_log::insert(
-                &pool,
-                Some(user_id),
-                event_type,
-                "api_key",
-                Some(key_id),
-                &summary,
-                Some(&details),
-            )
-            .await
-            {
-                // MCP-573: upgrade to ERROR with a structured
-                // event_kind so log-aggregation alerts surface
-                // audit-log gaps. Pre-fix this was warn-only, which
-                // for a tamper-evident audit surface (admin_event_log
-                // has an immutability trigger — see migration) is
-                // exactly the wrong default. A failed INSERT here
-                // means a permanent audit gap for an api-key
-                // create/revoke/rotate/use event: no WORM ledger
-                // mirror exists for these (talos-audit-ledger covers
-                // workflow audit events via the talos.audit.ledger
-                // NATS topic, not api-key lifecycle). Operators
-                // alerting on `event_kind=api_key_audit_write_failed`
-                // get a signal of an incomplete trail at the time
-                // it happens, not during a later forensic review.
-                tracing::error!(
-                    target: "talos_api_keys",
-                    event_kind = "api_key_audit_write_failed",
-                    error = %e,
-                    event_type,
-                    %key_id,
-                    %user_id,
-                    "Failed to write API key audit log entry — audit trail has a permanent gap for this event"
-                );
-            }
-        });
+    ) -> Result<()> {
+        talos_admin_event_log::insert_on_conn(
+            conn,
+            Some(user_id),
+            event_type,
+            "api_key",
+            Some(key_id),
+            summary,
+            Some(&details),
+        )
+        .await
+        .context("Failed to record the API key lifecycle event")
     }
 
     /// Check rate limit using Redis (distributed across instances).
@@ -951,37 +920,41 @@ impl ApiKeyService {
     /// path that mutated `is_active` without an `admin_event_log`
     /// entry — create/revoke/delete/rotate all logged, expiration did
     /// not. The bulk UPDATE returns the affected rows via RETURNING so
-    /// per-key logging stays a single SQL round-trip; individual log
-    /// writes are still fire-and-forget so a busy expiration batch
-    /// doesn't block the operator-callable.
+    /// per-key logging needs no second read; each key's record is written in
+    /// the same transaction as the bulk UPDATE (2026-09-18 — it was a
+    /// detached task per key), so an expiry is never committed without its
+    /// record.
     pub async fn cleanup_expired_keys(&self) -> Result<u64> {
         // Uses runtime-typed `sqlx::query_as` instead of the `sqlx::query!`
         // macro so the RETURNING-clause addition doesn't require a fresh
         // `cargo sqlx prepare` round-trip against a live DB. The tuple
         // shape is pinned by the query text and exercised at runtime.
+        let mut tx = self.db_pool.begin().await?;
         let expired: Vec<(Uuid, Uuid, String, Option<DateTime<Utc>>)> = sqlx::query_as(
             "UPDATE api_keys
                  SET is_active = false
                  WHERE expires_at < NOW() AND is_active = true
                  RETURNING id, user_id, name, expires_at",
         )
-        .fetch_all(&self.db_pool)
+        .fetch_all(&mut *tx)
         .await?;
 
         let count = expired.len() as u64;
         for (id, user_id, name, expires_at) in expired {
-            Self::log_key_event(
-                self.db_pool.clone(),
+            Self::record_key_event(
+                &mut tx,
                 user_id,
                 "api_key_expired",
                 id,
-                format!("API key '{}' expired and was deactivated", name),
+                &format!("API key '{}' expired and was deactivated", name),
                 serde_json::json!({
                     "name": name,
                     "expires_at": expires_at,
                 }),
-            );
+            )
+            .await?;
         }
+        tx.commit().await?;
         Ok(count)
     }
 }
