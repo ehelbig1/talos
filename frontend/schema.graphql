@@ -1790,7 +1790,14 @@ type TwoFactorEnrollment {
 
 type TwoFactorSetup {
 	secret: String!
+	"""
+	The `otpauth://` provisioning URI the QR code encodes.
+	"""
 	qrCodeUrl: String!
+	"""
+	The QR code as BARE base64 of a PNG image (no `data:` prefix): prepend
+	`data:image/png;base64,` to use it as an image source.
+	"""
 	qrCodePng: String!
 }
 

@@ -1012,6 +1012,23 @@ mod tests {
         TotpService::new(db_pool, redis_client, secrets_manager)
     }
 
+    /// The `qrCodePng` contract, from the producer's side: BARE base64 of a
+    /// PNG — no `data:` prefix. The web UI builds the image URL from it; its
+    /// test fixture once assumed a data URL, so the QR image never rendered
+    /// while the test stayed green (2026-09-18).
+    #[tokio::test]
+    async fn qr_code_png_is_bare_base64_of_a_png() {
+        use base64::{engine::general_purpose::STANDARD, Engine as _};
+        let service = stub_service(None);
+        let secret = service.generate_secret();
+        let png = service
+            .generate_qr_code_png(&secret, "user@example.com")
+            .expect("qr code");
+        assert!(!png.starts_with("data:"), "no data-URL prefix on the wire");
+        let bytes = STANDARD.decode(&png).expect("valid base64");
+        assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "PNG signature");
+    }
+
     #[test]
     #[ignore]
     fn test_generate_secret() {

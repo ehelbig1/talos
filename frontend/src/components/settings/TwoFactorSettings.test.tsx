@@ -57,7 +57,8 @@ describe("TwoFactorSettings", () => {
           setupTwoFactor: {
             secret: "JBSWY3DPEHPK3PXP",
             qrCodeUrl: "otpauth://totp/Talos:test",
-            qrCodePng: "data:image/png;base64,AAAA",
+            // The shape the server sends: BARE base64 (no data: prefix).
+            qrCodePng: "iVBORw0KGgo=",
           },
         },
       }),
@@ -71,6 +72,11 @@ describe("TwoFactorSettings", () => {
     });
     // Manual key section header renders in the setup step.
     expect(screen.getByText(/Manual_Cipher_Key/i)).toBeInTheDocument();
+    // The QR image is a PNG data URL built from the bare base64.
+    expect(screen.getByAltText("2FA QR Code")).toHaveAttribute(
+      "src",
+      "data:image/png;base64,iVBORw0KGgo=",
+    );
   });
 
   it("opens the deactivate confirmation gate before disabling", async () => {
