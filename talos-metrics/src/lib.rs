@@ -22,6 +22,7 @@ pub mod outcome_class;
 pub mod rpc;
 pub mod security;
 pub mod vault_token;
+pub mod webhook;
 pub use actor_budget::{BudgetCap, BudgetMode};
 pub use execution::ModuleExecutionOutcome;
 pub use execution_pause::{PauseGatePath, PauseRefusal};
@@ -31,6 +32,7 @@ pub use outcome_class::OutcomeClass;
 pub use rpc::{seeded_pairs as rpc_seeded_pairs, RpcOutcome, RpcSubject};
 pub use security::{ApiKeyValidation, McpAuthOutcome, RateLimitKind, TwoFactorOutcome};
 pub use vault_token::{VaultTokenLifetimeLabel, VaultTokenRenewalOutcome};
+pub use webhook::WebhookAuthFormat;
 
 /// The complete, closed set of `subject` label values on
 /// `talos_rpc_write_ceiling_refusals_total` — the NATS subjects on which the
@@ -494,6 +496,22 @@ pub fn record_execution_pause_refusal_on(
     metrics
         .execution_pause_refusals_total
         .with_label_values(&[path.as_str(), reason.as_str()])
+        .inc();
+}
+
+/// Count one inbound webhook delivery suppressed as a duplicate. Inert without
+/// [`set_global`].
+pub fn record_webhook_duplicate_suppressed(format: WebhookAuthFormat) {
+    if let Some(m) = global() {
+        record_webhook_duplicate_suppressed_on(m, format);
+    }
+}
+
+/// The recording itself, against an EXPLICIT registry.
+pub fn record_webhook_duplicate_suppressed_on(metrics: &TalosMetrics, format: WebhookAuthFormat) {
+    metrics
+        .webhook_duplicate_suppressed_total
+        .with_label_values(&[format.as_str()])
         .inc();
 }
 
@@ -1597,6 +1615,10 @@ pub struct TalosMetrics {
     // `PauseRefusal::ALL`, seeded at 0; no alert (a refusal is the operator's
     // pause working).
     pub execution_pause_refusals_total: CounterVec,
+    /// `talos_webhook_duplicate_suppressed_total{format}` — inbound webhook
+    /// deliveries answered 200 and dispatched nothing because the dedup store
+    /// had already seen this event. Package CI.
+    pub webhook_duplicate_suppressed_total: CounterVec,
     // Actor budget refusals — added 2026-09-17 (package CD). `BudgetCap::ALL`
     // × `BudgetMode::ALL`, seeded at 0; no alert (a refusal is the budget
     // working; `on_budget_exceeded = 'alert'` raises an ops alert instead).
@@ -2896,6 +2918,30 @@ impl TalosMetrics {
             }
         }
 
+        // Webhook duplicate suppression (package CI)
+        let webhook_duplicate_suppressed_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_webhook_duplicate_suppressed_total",
+                "Inbound webhook deliveries answered 200 and dispatched NOTHING because \
+                 the deduplication store had already seen this event, by the scheme that \
+                 authenticated the request. format=github is the one to read: the GitHub \
+                 HMAC signs the body alone, so its dedup fingerprint is deterministic in \
+                 the body and a legitimate GitHub 'Redeliver' of an unchanged payload is \
+                 indistinguishable from a replay — this series is how often that horizon \
+                 (24 h since package CI, 1 h for every other format) suppressed a \
+                 delivery someone meant to send. talos_metrics::WebhookAuthFormat, a \
+                 closed set, every value pre-seeded at 0. A suppression is deduplication \
+                 working: do NOT alert on it.",
+            ),
+            &["format"],
+        )?;
+        registry.register(Box::new(webhook_duplicate_suppressed_total.clone()))?;
+        for format in WebhookAuthFormat::ALL {
+            webhook_duplicate_suppressed_total
+                .with_label_values(&[format.as_str()])
+                .inc_by(0.0);
+        }
+
         // Actor budget refusals
         let actor_budget_refusals_total = CounterVec::new(
             prometheus::Opts::new(
@@ -3467,6 +3513,7 @@ impl TalosMetrics {
             rate_limit_hits_total,
             google_push_refusals_total,
             execution_pause_refusals_total,
+            webhook_duplicate_suppressed_total,
             actor_budget_refusals_total,
             google_jwk_refresh_total,
             vault_token_renewals_total,
@@ -3992,6 +4039,38 @@ mod tests {
             assert_eq!(BudgetMode::parse(mode.as_str()), Some(*mode));
         }
         assert_eq!(BudgetMode::parse("notify"), None);
+    }
+
+    /// Every format of the webhook duplicate-suppression counter is seeded at
+    /// 0 and moved by the recorder. Exhaustive over `ALL`, so a sixth
+    /// authentication scheme cannot ship without a seeded series.
+    #[test]
+    fn webhook_duplicate_suppressions_are_seeded_and_the_recorder_moves_them() {
+        let m = TalosMetrics::new().unwrap();
+        let cold = m.render_prometheus().expect("render");
+        for format in WebhookAuthFormat::ALL {
+            assert!(
+                cold.contains(&format!(
+                    "talos_webhook_duplicate_suppressed_total{{format=\"{}\"}} 0",
+                    format.as_str()
+                )),
+                "unseeded format {format:?}"
+            );
+            record_webhook_duplicate_suppressed_on(&m, *format);
+        }
+        let warm = m.render_prometheus().expect("render");
+        for format in WebhookAuthFormat::ALL {
+            assert!(warm.contains(&format!(
+                "talos_webhook_duplicate_suppressed_total{{format=\"{}\"}} 1",
+                format.as_str()
+            )));
+        }
+        // The label values are distinct — a collision would merge two schemes
+        // into one series and make the github reading unreadable.
+        let mut seen = std::collections::HashSet::new();
+        for format in WebhookAuthFormat::ALL {
+            assert!(seen.insert(format.as_str()), "duplicate label {format:?}");
+        }
     }
 
     /// Every `(path, reason)` pair of the execution-pause counter is seeded at

@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 use std::time::Duration;
-use talos_idempotency::{BeginOutcome, IdempotencyService};
+use talos_idempotency::{BeginOutcome, IdempotencyService, WebhookDeduplication};
 
 fn service() -> Option<IdempotencyService> {
     let url = std::env::var("TALOS_TEST_REDIS_URL").ok()?;
@@ -182,5 +182,113 @@ async fn concurrent_begin_yields_exactly_one_proceed() {
         inflight,
         n - 1,
         "all other concurrent callers must be InFlight"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Webhook deduplication (package CI, 2026-09-17)
+//
+// The retention window is passed per call because it is a property of the
+// scheme that authenticated the delivery, not of the store: the GitHub HMAC
+// signs the body alone, so it carries no freshness window and this claim is
+// its ONLY replay defence. That the claim is really written with the window
+// the caller asked for can only be checked against a live Redis — the TTL is
+// server state, and a window silently truncated back to the old hour would
+// restore the replay window package CI closed while every unit test stayed
+// green.
+// ---------------------------------------------------------------------------
+
+fn dedup_or_skip() -> Option<(WebhookDeduplication, redis::Client)> {
+    let url = std::env::var("TALOS_TEST_REDIS_URL").ok()?;
+    let client = redis::Client::open(url).expect("valid TALOS_TEST_REDIS_URL");
+    Some((WebhookDeduplication::new(Arc::new(client.clone())), client))
+}
+
+#[tokio::test]
+async fn a_dedup_claim_is_held_for_the_window_the_caller_passed() {
+    let Some((dedup, client)) = dedup_or_skip() else {
+        eprintln!("skipping: TALOS_TEST_REDIS_URL is not set");
+        return;
+    };
+    let trigger = uuid::Uuid::new_v4();
+    let event = format!("sha256={}", uuid::Uuid::new_v4().simple());
+    let window = Duration::from_secs(86_400);
+
+    assert!(
+        !dedup
+            .is_duplicate(trigger, &event, window)
+            .await
+            .expect("first sighting"),
+        "the first sighting of an event is not a duplicate"
+    );
+    assert!(
+        dedup
+            .is_duplicate(trigger, &event, window)
+            .await
+            .expect("second sighting"),
+        "the same event again is a duplicate"
+    );
+
+    // The claim's TTL is the window the caller asked for, not the store's own
+    // idea of one — read back from the server.
+    let mut conn = client.get_multiplexed_async_connection().await.unwrap();
+    let ttl: i64 = redis::cmd("TTL")
+        .arg(format!("webhook:processed:{trigger}:{event}"))
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert!(
+        ttl > 86_000 && ttl <= 86_400,
+        "claim TTL {ttl} is not the 24 h window that was passed"
+    );
+
+    // A shorter window on a DIFFERENT event is held for that shorter time —
+    // the two horizons coexist in one store, which is the whole point of
+    // passing it per call.
+    let short_event = format!("v0={}", uuid::Uuid::new_v4().simple());
+    assert!(!dedup
+        .is_duplicate(trigger, &short_event, Duration::from_secs(3600))
+        .await
+        .unwrap());
+    let short_ttl: i64 = redis::cmd("TTL")
+        .arg(format!("webhook:processed:{trigger}:{short_event}"))
+        .query_async(&mut conn)
+        .await
+        .unwrap();
+    assert!(
+        short_ttl > 3400 && short_ttl <= 3600,
+        "sibling claim TTL {short_ttl} is not the 1 h window that was passed"
+    );
+
+    // Releasing an abandoned claim lets the sender's redelivery through.
+    dedup.release(trigger, &event).await.expect("release");
+    assert!(
+        !dedup
+            .is_duplicate(trigger, &event, window)
+            .await
+            .expect("after release"),
+        "a released claim must not suppress the redelivery"
+    );
+}
+
+#[tokio::test]
+async fn a_zero_dedup_window_is_refused_rather_than_failing_open() {
+    let Some((dedup, _client)) = dedup_or_skip() else {
+        eprintln!("skipping: TALOS_TEST_REDIS_URL is not set");
+        return;
+    };
+    // `SET ... EX 0` is a Redis error, and the caller treats a dedup error as
+    // "could not check". For the GitHub format that error is fail-closed (401),
+    // so a zero window would take the integration off the air rather than
+    // weaken it — but for every other format the router continues, which is a
+    // replay check that silently never recorded anything. Refuse it here, at
+    // the one place that can tell.
+    let err = dedup
+        .is_duplicate(uuid::Uuid::new_v4(), "e", Duration::from_secs(0))
+        .await
+        .expect_err("a zero window must be refused");
+    assert!(
+        err.to_string().contains("at least one second"),
+        "unexpected error: {err}"
     );
 }

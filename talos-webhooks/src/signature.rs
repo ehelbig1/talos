@@ -90,6 +90,77 @@ pub fn dedup_fingerprint(outcome: WebhookAuthOutcome, headers: &HeaderMap, body:
     }
 }
 
+/// How long a deduplication claim is retained for every format whose signature
+/// binds a timestamp — Slack and generic (±5 min) — and for the token / open
+/// modes, whose fingerprint is the body hash. For these the store is not the
+/// replay defence: the signed timestamp is, and a delivery repeated past its
+/// own freshness window fails verification before it ever reaches dedup. One
+/// hour is the concurrent-redelivery guard the store has always been here.
+pub const DEDUP_WINDOW_SECS: u64 = 3600;
+
+/// How long a deduplication claim is retained for the GitHub format.
+///
+/// The GitHub HMAC signs the body ALONE, so no timestamp is bound and no
+/// freshness window is possible from the sender's side; this store is the
+/// ONLY replay defence the format has, and outside the window a captured,
+/// still-valid delivery replays. Package CI (operator decision 2026-09-17)
+/// widened it from one hour to twenty-four.
+///
+/// **This number is two things at once, and the second is the cost.** The
+/// GitHub dedup fingerprint is the signature value, `HMAC(secret, body)`,
+/// deterministic in the body, and GitHub's manual *Redeliver* re-sends that
+/// same body — so a legitimate redelivery is identical to a replay in every
+/// authenticated field, and nothing can tell them apart. The replay window and
+/// the window in which an operator clicking "Redeliver" gets a 200 with no
+/// execution are the SAME number. That is why the suppression is counted on
+/// `talos_webhook_duplicate_suppressed_total{format="github"}` rather than
+/// only logged: widening the horizon without making its cost visible would be
+/// a control whose price nobody can read.
+///
+/// A longer horizon was considered and left to the operator: cost is not the
+/// constraint (measured on the pinned `redis:7-alpine`, 239 bytes per claim,
+/// so 1 000 deliveries/day is ~5.7 MB at 24 h and ~7.2 MB at 30 days), the
+/// redelivery blackout is.
+pub const GITHUB_DEDUP_WINDOW_SECS: u64 = 86_400;
+
+/// The deduplication retention for a request, from the scheme that
+/// AUTHENTICATED it. One home: the router reads the window here and passes it
+/// to the store, which keeps none of its own.
+#[must_use]
+pub fn dedup_window(outcome: WebhookAuthOutcome) -> std::time::Duration {
+    match outcome {
+        WebhookAuthOutcome::Hmac(VerifiedSignatureFormat::GitHub) => {
+            std::time::Duration::from_secs(GITHUB_DEDUP_WINDOW_SECS)
+        }
+        WebhookAuthOutcome::Hmac(VerifiedSignatureFormat::Slack)
+        | WebhookAuthOutcome::Hmac(VerifiedSignatureFormat::Generic)
+        | WebhookAuthOutcome::StaticToken
+        | WebhookAuthOutcome::Open => std::time::Duration::from_secs(DEDUP_WINDOW_SECS),
+    }
+}
+
+/// The metric label for the scheme that authenticated a request. An exhaustive
+/// match, so a sixth outcome cannot reach the counter unlabelled;
+/// `talos_metrics` cannot import this enum without inverting the layering, and
+/// this mapping plus its test is what keeps the two vocabularies paired
+/// (#787's precedent for the RPC subject strings).
+#[must_use]
+pub fn metrics_format(outcome: WebhookAuthOutcome) -> talos_metrics::WebhookAuthFormat {
+    match outcome {
+        WebhookAuthOutcome::Hmac(VerifiedSignatureFormat::Slack) => {
+            talos_metrics::WebhookAuthFormat::Slack
+        }
+        WebhookAuthOutcome::Hmac(VerifiedSignatureFormat::GitHub) => {
+            talos_metrics::WebhookAuthFormat::GitHub
+        }
+        WebhookAuthOutcome::Hmac(VerifiedSignatureFormat::Generic) => {
+            talos_metrics::WebhookAuthFormat::Generic
+        }
+        WebhookAuthOutcome::StaticToken => talos_metrics::WebhookAuthFormat::StaticToken,
+        WebhookAuthOutcome::Open => talos_metrics::WebhookAuthFormat::Open,
+    }
+}
+
 /// Is this request header one whose VALUE must never be persisted?
 ///
 /// ONE classifier for every place a webhook's headers are written to a
@@ -289,6 +360,153 @@ mod tests {
     use std::collections::HashSet;
 
     const SECRET: &str = "a-signing-secret-of-adequate-length";
+
+    /// Every outcome the auth gate can produce, so the two tests below are
+    /// exhaustive by construction rather than by a list someone maintains.
+    const ALL_OUTCOMES: &[WebhookAuthOutcome] = &[
+        WebhookAuthOutcome::Hmac(VerifiedSignatureFormat::Slack),
+        WebhookAuthOutcome::Hmac(VerifiedSignatureFormat::GitHub),
+        WebhookAuthOutcome::Hmac(VerifiedSignatureFormat::Generic),
+        WebhookAuthOutcome::StaticToken,
+        WebhookAuthOutcome::Open,
+    ];
+
+    /// The GitHub format — and ONLY the GitHub format — holds its dedup claim
+    /// for the long horizon, because it is the only one whose signature binds
+    /// no timestamp and whose replay defence is therefore this claim alone.
+    #[test]
+    fn only_the_timestampless_format_gets_the_long_dedup_horizon() {
+        assert_eq!(
+            dedup_window(WebhookAuthOutcome::Hmac(VerifiedSignatureFormat::GitHub)),
+            std::time::Duration::from_secs(GITHUB_DEDUP_WINDOW_SECS)
+        );
+        for outcome in ALL_OUTCOMES {
+            if matches!(
+                outcome,
+                WebhookAuthOutcome::Hmac(VerifiedSignatureFormat::GitHub)
+            ) {
+                continue;
+            }
+            assert_eq!(
+                dedup_window(*outcome),
+                std::time::Duration::from_secs(DEDUP_WINDOW_SECS),
+                "{outcome:?} binds a timestamp (or has no signature at all) — the store \
+                 is not its replay defence and must not hold its claim longer"
+            );
+        }
+        // The long horizon must actually BE longer, and it must be the 24 h
+        // the operator picked: a constant edited down to the base window would
+        // silently restore the one-hour replay window package CI closed.
+        assert!(GITHUB_DEDUP_WINDOW_SECS > DEDUP_WINDOW_SECS);
+        assert_eq!(GITHUB_DEDUP_WINDOW_SECS, 24 * 3600);
+        assert_eq!(DEDUP_WINDOW_SECS, 3600);
+    }
+
+    /// The router must take the retention from this one home, and the store
+    /// must keep none of its own. TEXTUAL, and stated as such: it proves the
+    /// call is spelled that way, never that the value is honoured — a caller
+    /// computing `dedup_window` and then passing a literal would pass it. The
+    /// behaviour is pinned by the live-Redis TTL test in `talos-idempotency`.
+    #[test]
+    fn the_router_takes_the_dedup_window_from_this_home() {
+        let router = include_str!("router.rs");
+        assert!(
+            router.contains("let window = signature::dedup_window(auth_outcome);"),
+            "the router no longer derives the dedup retention from dedup_window"
+        );
+        assert!(
+            router.contains(".is_duplicate(trigger_id, &event_id, window)"),
+            "the dedup call no longer passes the derived window"
+        );
+        // A second window would be a second policy. The only `Duration`
+        // literals near the dedup call would be a re-derived horizon.
+        assert!(
+            !router.contains("Duration::from_secs(3600)")
+                && !router.contains("Duration::from_secs(86_400)")
+                && !router.contains("Duration::from_secs(86400)"),
+            "a webhook retention literal reappeared in the router"
+        );
+        let store = include_str!("../../talos-idempotency/src/lib.rs");
+        assert!(
+            !store.contains("self.window"),
+            "WebhookDeduplication grew a stored window again — one configured \
+             value the caller overrides is a value nothing applies"
+        );
+    }
+
+    /// The auditor-facing documents state the GitHub replay horizon in HOURS,
+    /// and it is the one number a pentester plans around. Package S's class —
+    /// a cadence changed in code with the rule that reads it left behind — is
+    /// what this pins: the three documents must name the horizon the constants
+    /// actually hold, in both directions.
+    #[test]
+    fn the_auditor_docs_state_the_horizon_the_code_holds() {
+        let docs = [
+            ("THREAT_MODEL", include_str!("../../docs/THREAT_MODEL.md")),
+            (
+                "pentest-scope",
+                include_str!("../../docs/security/pentest-scope.md"),
+            ),
+            (
+                "soc2-control-mapping",
+                include_str!("../../docs/compliance/soc2-control-mapping.md"),
+            ),
+        ];
+        let github_hours = GITHUB_DEDUP_WINDOW_SECS / 3600;
+        let base_hours = DEDUP_WINDOW_SECS / 3600;
+        for (name, doc) in docs {
+            let lines: Vec<&str> = doc
+                .lines()
+                .filter(|l| {
+                    // In scope: a line that states a HORIZON for the GitHub
+                    // format's deduplication. A line that merely mentions the
+                    // fail-closed refusal states no number and pins nothing.
+                    let l = l.to_ascii_lowercase();
+                    l.contains("dedup")
+                        && (l.contains("github") || l.contains("hub-signature"))
+                        && (l.contains("hour") || l.contains(" h "))
+                })
+                .collect();
+            assert!(
+                !lines.is_empty(),
+                "{name} no longer states the GitHub deduplication horizon at all"
+            );
+            for line in &lines {
+                assert!(
+                    line.contains(&format!("{github_hours}-hour"))
+                        || line.contains(&format!("{github_hours} h"))
+                        || line.contains(&format!("{github_hours}-h")),
+                    "{name} states a GitHub horizon that is not {github_hours} h: {line}"
+                );
+                // The number the code no longer holds must not survive beside
+                // it — the pre-CI text read "1-hour window" and would still
+                // parse as a sentence about deduplication.
+                assert!(
+                    !line.contains(&format!("{base_hours}-hour window")),
+                    "{name} still calls the GitHub horizon a {base_hours}-hour window: {line}"
+                );
+            }
+        }
+    }
+
+    /// Each outcome maps to its own metric label. A collision would merge two
+    /// schemes into one series, and `format="github"` is the only value whose
+    /// suppressions can mean a lost redelivery.
+    #[test]
+    fn every_outcome_has_a_distinct_metric_label() {
+        let mut seen = HashSet::new();
+        for outcome in ALL_OUTCOMES {
+            assert!(
+                seen.insert(metrics_format(*outcome).as_str()),
+                "two outcomes share a label at {outcome:?}"
+            );
+        }
+        assert_eq!(seen.len(), talos_metrics::WebhookAuthFormat::ALL.len());
+        assert_eq!(
+            metrics_format(WebhookAuthOutcome::Hmac(VerifiedSignatureFormat::GitHub)).as_str(),
+            "github"
+        );
+    }
 
     fn github_headers(body: &[u8]) -> HeaderMap {
         let sig = hmac_sha256_hex(SECRET, &[body]).unwrap();

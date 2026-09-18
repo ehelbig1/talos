@@ -23,6 +23,33 @@ use crate::dispatch_failure::{self, ModuleDispatchFailure};
 /// pause refuses its start: 503 with `Retry-After`, so the sender redelivers
 /// after the pause lifts (deferred, not dropped). The body is the caller-safe
 /// sentence from the pause's one home.
+/// The answer to a delivery the dedup store has already seen: 200 with a
+/// machine-readable body, one increment on
+/// `talos_webhook_duplicate_suppressed_total{format}`, and nothing dispatched.
+///
+/// Extracted from the router's duplicate arm (package CI) so the recording and
+/// the reply can be driven by a test — the arm itself needs a live Redis, a
+/// trigger row and a verified signature to reach, and a counter nothing can
+/// exercise is the shape check 58 warns about one level up. 200 rather than a
+/// 4xx so the sender does not retry; the body SAYS it was suppressed, because
+/// a bare "OK" made an identical re-POST look like a dropped delivery during
+/// live validation (2026-07-17) with nothing to explain it but container logs.
+pub(crate) fn duplicate_suppressed_response(
+    outcome: signature::WebhookAuthOutcome,
+    window: std::time::Duration,
+) -> Response {
+    talos_metrics::record_webhook_duplicate_suppressed(signature::metrics_format(outcome));
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({
+            "status": "duplicate_suppressed",
+            "detail": "identical payload already processed within the dedup window; no execution dispatched",
+            "dedup_window_secs": window.as_secs(),
+        })),
+    )
+        .into_response()
+}
+
 pub(crate) fn execution_pause_response(reason: talos_metrics::PauseRefusal) -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -966,27 +993,21 @@ impl WebhookRouter {
                 raw_event_id
             };
 
-            match dedup.is_duplicate(trigger_id, &event_id).await {
+            // Package CI: the retention is a property of the scheme that
+            // authenticated the request, not of the store — the GitHub format
+            // has no freshness window of its own and this claim is its only
+            // replay defence, so it is held 24× longer than the rest.
+            let window = signature::dedup_window(auth_outcome);
+            match dedup.is_duplicate(trigger_id, &event_id, window).await {
                 Ok(true) => {
                     tracing::info!(
                         trigger_id = %trigger_id,
                         event_id = %event_id,
+                        format = signature::metrics_format(auth_outcome).as_str(),
+                        window_secs = window.as_secs(),
                         "Suppressed duplicate webhook delivery"
                     );
-                    // Return 200 so the sender does not retry; log at INFO not
-                    // WARN. The body SAYS it was suppressed — a bare "OK" made
-                    // manual testing look like a dropped delivery (2026-07-17:
-                    // an identical re-POST during live validation produced no
-                    // execution and nothing to explain why without docker
-                    // logs). Machine-readable so scripted callers can branch.
-                    return Ok((
-                        StatusCode::OK,
-                        axum::Json(serde_json::json!({
-                            "status": "duplicate_suppressed",
-                            "detail": "identical payload already processed within the dedup window; no execution dispatched",
-                        })),
-                    )
-                        .into_response());
+                    return Ok(duplicate_suppressed_response(auth_outcome, window));
                 }
                 Ok(false) => {
                     // Claim recorded — track it so a pre-execution failure can
@@ -3453,5 +3474,89 @@ mod execution_pause_response_tests {
                 Some("60")
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod duplicate_suppressed_tests {
+    use super::duplicate_suppressed_response;
+    use crate::signature::{dedup_window, VerifiedSignatureFormat, WebhookAuthOutcome};
+    use axum::http::StatusCode;
+    use std::sync::Mutex;
+
+    /// The process-global metrics registry is a `OnceLock`, so the tests that
+    /// read a counter DELTA must not run concurrently with each other.
+    static SERIES: Mutex<()> = Mutex::new(());
+
+    fn counter_value(rendered: &str, format: &str) -> f64 {
+        let needle = format!("talos_webhook_duplicate_suppressed_total{{format=\"{format}\"}} ");
+        rendered
+            .lines()
+            .find_map(|l| l.strip_prefix(needle.as_str()))
+            .expect("seeded series must be present")
+            .trim()
+            .parse()
+            .expect("counter value")
+    }
+
+    /// A suppressed delivery answers 200 (so the sender does not retry), says
+    /// so in a machine-readable body, discloses the horizon that suppressed it,
+    /// and moves the counter for the format that authenticated it — EXACTLY
+    /// once, which is what proves one recording site.
+    #[test]
+    fn a_suppressed_github_delivery_is_reported_and_counted_once() {
+        let _guard = SERIES.lock().unwrap();
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().unwrap());
+        // Another test may have won the OnceLock; read the registry the
+        // recorder will actually write to.
+        let live = talos_metrics::global().expect("global registry").clone();
+
+        let outcome = WebhookAuthOutcome::Hmac(VerifiedSignatureFormat::GitHub);
+        let window = dedup_window(outcome);
+        let before = counter_value(&live.render_prometheus().unwrap(), "github");
+
+        let resp = duplicate_suppressed_response(outcome, window);
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let after = counter_value(&live.render_prometheus().unwrap(), "github");
+        assert_eq!(after - before, 1.0, "one suppression is one increment");
+
+        // The reply names the horizon, so an operator whose redelivery was
+        // suppressed can tell how long it stays suppressed without reading
+        // container logs.
+        let body = futures::executor::block_on(async {
+            axum::body::to_bytes(resp.into_body(), 64 * 1024)
+                .await
+                .expect("body")
+        });
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(json["status"], "duplicate_suppressed");
+        assert_eq!(json["dedup_window_secs"], 86_400);
+    }
+
+    /// The counter is labelled by the scheme that authenticated the request —
+    /// a static-token delivery must not be counted as a GitHub one, because
+    /// `format="github"` is the only value whose suppression can mean a lost
+    /// redelivery rather than an ordinary duplicate.
+    #[test]
+    fn the_label_is_the_format_that_authenticated_the_request() {
+        let _guard = SERIES.lock().unwrap();
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().unwrap());
+        let live = talos_metrics::global().expect("global registry").clone();
+
+        let outcome = WebhookAuthOutcome::StaticToken;
+        let before_token = counter_value(&live.render_prometheus().unwrap(), "static_token");
+        let before_github = counter_value(&live.render_prometheus().unwrap(), "github");
+
+        let resp = duplicate_suppressed_response(outcome, dedup_window(outcome));
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let rendered = live.render_prometheus().unwrap();
+        assert_eq!(counter_value(&rendered, "static_token") - before_token, 1.0);
+        assert_eq!(
+            counter_value(&rendered, "github") - before_github,
+            0.0,
+            "control: the github series must not move"
+        );
     }
 }
