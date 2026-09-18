@@ -134,3 +134,104 @@ async fn test_oauth_provider_enum_conversion() {
     );
     assert!(OAuthProvider::from_str("invalid").is_err());
 }
+
+/// Until 2026-09-18 an OAuth sign-up stored `bcrypt("__talos_oauth_account_no_password__")`
+/// as the account's password hash, and bcrypt MATCHES that literal — so the
+/// literal, public in this repository, signed in to every OAuth-created
+/// account. Two independent guards are pinned here:
+/// 1. a NEW OAuth account's hash matches nothing, the sentinel included
+///    (driven through the production `link_or_create_user`);
+/// 2. an account created BEFORE the fix still holds the legacy hash, and
+///    `AuthService::login` refuses the sentinel against it.
+/// A real password on an ordinary account still signs in (the control).
+#[tokio::test]
+async fn the_oauth_no_password_sentinel_opens_no_account() {
+    use controller::auth::AuthService;
+    use controller::oauth::OAuthUserInfo;
+    use talos_unusable_password::LEGACY_OAUTH_NO_PASSWORD_SENTINEL as SENTINEL;
+
+    let db_pool = test_helpers::get_test_db_pool().await;
+    std::env::set_var(
+        "OAUTH_STATE_SECRET",
+        "test-state-secret-at-least-32-chars-long",
+    );
+    let auth = AuthService::new(
+        db_pool.clone(),
+        "test-secret-key-for-testing-only-min-32-chars".to_string(),
+        10,
+        None,
+    )
+    .unwrap();
+    let oauth = OAuthService::new(db_pool.clone(), None).unwrap();
+
+    // 1. A new OAuth sign-up, through the production path.
+    let email = format!("oauth-new-{}@example.com", uuid::Uuid::new_v4());
+    let (new_id, created) = oauth
+        .link_or_create_user(
+            OAuthProvider::Google,
+            OAuthUserInfo {
+                provider_user_id: uuid::Uuid::new_v4().to_string(),
+                email: email.clone(),
+                email_verified: true,
+                name: None,
+                picture: None,
+                access_token: None,
+                refresh_token: None,
+                expires_in: None,
+                scope: None,
+            },
+            None,
+        )
+        .await
+        .expect("OAuth sign-up");
+    assert!(created, "a new account must have been created");
+    let stored: String = sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+        .bind(new_id)
+        .fetch_one(&db_pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        stored.len(),
+        60,
+        "a well-formed bcrypt hash (timing parity)"
+    );
+    assert!(
+        !bcrypt::verify(SENTINEL, &stored).unwrap(),
+        "a new OAuth account's hash must not match the public sentinel"
+    );
+    assert!(auth.login(&email, SENTINEL, None, None).await.is_err());
+
+    // 2. A row written before the fix: the legacy hash is still stored.
+    let legacy_email = format!("oauth-legacy-{}@example.com", uuid::Uuid::new_v4());
+    let legacy_hash = bcrypt::hash(SENTINEL, 10).unwrap();
+    sqlx::query("INSERT INTO users (email, password_hash, is_active) VALUES ($1, $2, true)")
+        .bind(&legacy_email)
+        .bind(&legacy_hash)
+        .execute(&db_pool)
+        .await
+        .unwrap();
+    assert!(
+        auth.login(&legacy_email, SENTINEL, None, None)
+            .await
+            .is_err(),
+        "the sentinel must not sign in to a pre-fix OAuth account"
+    );
+
+    // Control: an ordinary account with a real password signs in.
+    let real_email = format!("real-{}@example.com", uuid::Uuid::new_v4());
+    auth.create_user(&real_email, "Correct-Horse-Battery-9", None, None, None)
+        .await
+        .unwrap();
+    assert!(auth
+        .login(&real_email, "Correct-Horse-Battery-9", None, None)
+        .await
+        .is_ok());
+
+    for e in [&email, &legacy_email, &real_email] {
+        sqlx::query("DELETE FROM users WHERE email = $1")
+            .bind(e)
+            .execute(&db_pool)
+            .await
+            .ok();
+    }
+}

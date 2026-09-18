@@ -422,3 +422,23 @@ async fn test_account_lockout_after_failed_attempts() {
     // Cleanup
     cleanup_test_user(&auth_service.db_pool, &test_email).await;
 }
+
+/// The local-dev synthetic user used to be inserted with `password_hash = ''`,
+/// on which `bcrypt::verify` returns an instant `Err`: a login against it
+/// failed as an internal error at a different speed from a wrong password.
+/// It now stores the shared unusable hash, which matches nothing.
+#[tokio::test]
+async fn the_dev_user_is_created_with_an_unusable_password_hash() {
+    let db_pool = test_helpers::get_test_db_pool().await;
+    cleanup_test_user(&db_pool, "dev@talos.local").await;
+    let repo = talos_system_repo::SystemRepository::new(db_pool.clone());
+    let id = repo.ensure_dev_user().await.unwrap().expect("dev user id");
+    let stored: String = sqlx::query_scalar("SELECT password_hash FROM users WHERE id = $1")
+        .bind(id)
+        .fetch_one(&db_pool)
+        .await
+        .unwrap();
+    assert_eq!(stored.len(), 60, "a well-formed bcrypt hash");
+    assert!(matches!(bcrypt::verify("", &stored), Ok(false)));
+    cleanup_test_user(&db_pool, "dev@talos.local").await;
+}

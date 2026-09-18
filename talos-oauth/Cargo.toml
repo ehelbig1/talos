@@ -31,6 +31,8 @@ talos-metrics = { path = "../talos-metrics" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 # MCP-1028: truncate-then-redact discipline on audit log error_message.
 talos-text-util = { path = "../talos-text-util" }
+# One home for the hash of an account with no password (OAuth sign-up).
+talos-unusable-password = { path = "../talos-unusable-password" }
 talos-workflow-engine-core = { path = "../talos-workflow-engine-core" }
 talos-workflow-job-protocol = { path = "../talos-workflow-job-protocol" }
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
