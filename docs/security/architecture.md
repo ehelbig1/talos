@@ -278,7 +278,8 @@ when no Redis client is configured (`talos-totp-2fa/src/lib.rs`).
 | Issuer claim | Must match `"talos"` | `Claims.iss` field, validated in `verify_token` |
 | Audience claim | If present, must be `"talos"`; tokens with no `aud` are accepted unless `JWT_REQUIRE_AUD=true` | `talos-auth/src/lib.rs::verify_token` |
 | Expiration | 15-minute TTL | `Claims.exp` checked by jsonwebtoken crate |
-| 2FA status | `is_2fa_verified` claim | Enforced at handler level for sensitive operations (`require_2fa`) |
+| 2FA status | `is_2fa_verified` claim: the session is not waiting for its 2FA code. It is `true` for an account with no second factor enrolled, so `require_2fa` refuses only a half-finished 2FA login | `require_2fa` on ordinary mutations (`talos-api/src/schema/mod.rs`) |
+| Verified second factor | `second_factor_verified` claim, also stored on the session row and carried across refresh. Set only when a TOTP or backup code was verified (a 2FA login, or the session that enrolled); absent on older tokens, which read as `false` | `require_second_factor` on the privileged operations: master-key and DEK rotation, the re-encryption sweeps, API-key creation and rotation, MCP agent registration, capability grants, audit settings and ownership transfer. It refuses API keys, requires the verified flag, and re-reads that 2FA is still enrolled (`talos-api/src/schema/mod.rs`) |
 
 ### 3.3 API Key Authentication
 
@@ -309,7 +310,10 @@ when no Redis client is configured (`talos-totp-2fa/src/lib.rs`).
 
 Scopes constrain API-key callers only: `require_scope` passes a cookie-session
 caller without checking a scope, and an API-key caller is treated as
-2FA-verified (`talos-api/src/schema/mod.rs`).
+2FA-verified (`talos-api/src/schema/mod.rs`). An API key never satisfies
+`require_second_factor`: the privileged operations need an interactive session
+with a verified second factor. Enabling 2FA signs out the account's existing
+sessions and re-issues the enrolling one as verified.
 
 ### 3.4 Refresh Token Flow
 

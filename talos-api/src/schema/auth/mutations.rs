@@ -90,7 +90,7 @@ impl AuthMutations {
         // Generate access token (short-lived: 15 minutes)
         // New users don't have 2FA enabled yet, so they are verified
         let access_token = auth_service
-            .generate_access_token(&user, true)
+            .generate_access_token(&user, talos_auth::SessionAuth::PasswordOnly)
             .map_err(|e| {
                 tracing::error!("Failed to generate access token: {}", e);
                 async_graphql::Error::new("Failed to generate access token").extend_safe()
@@ -98,7 +98,7 @@ impl AuthMutations {
 
         // Generate refresh token (long-lived: 7 days)
         let refresh_token = auth_service
-            .generate_refresh_token(user_id, true)
+            .generate_refresh_token(user_id, talos_auth::SessionAuth::PasswordOnly)
             .await
             .map_err(|e| {
                 tracing::error!("Failed to generate refresh token: {}", e);
@@ -390,6 +390,51 @@ impl AuthMutations {
             None,
         );
 
+        // Enrolment changes how this account authenticates, so every session
+        // minted before it is signed out. Without this a refresh token taken
+        // before enrolment (7-day lifetime) kept renewing sessions after it.
+        // NOT fatal: the backup codes below are shown exactly once, and a
+        // surviving pre-enrolment session still cannot pass the privileged
+        // gate (its `second_factor_verified` is false).
+        match auth_service.revoke_all_sessions(*user_id).await {
+            Ok(revoked) => tracing::info!(
+                target: "talos_audit",
+                event_kind = "2fa_enrolment_sessions_revoked",
+                user_id = %user_id,
+                revoked,
+                "2FA enabled: signed out the account's existing sessions"
+            ),
+            Err(e) => tracing::error!(
+                target: "talos_audit",
+                event_kind = "2fa_enrolment_sessions_not_revoked",
+                user_id = %user_id,
+                "2FA enabled but existing sessions could not be signed out: {e}"
+            ),
+        }
+
+        // The enrolling browser session proved a code, so it continues as a
+        // second-factor-verified session. An API-key caller gets no cookies.
+        if ctx.data_opt::<crate::schema::ApiKeyScopes>().is_none() {
+            if let Ok(cookies) = ctx.data::<Cookies>() {
+                let auth = talos_auth::SessionAuth::SecondFactorVerified;
+                match (
+                    auth_service.generate_access_token(&user, auth),
+                    auth_service.generate_refresh_token(*user_id, auth).await,
+                ) {
+                    (Ok(access), Ok(refresh)) => {
+                        super::set_session_cookies(cookies, &access, &refresh);
+                    }
+                    (a, r) => tracing::error!(
+                        user_id = %user_id,
+                        access_ok = a.is_ok(),
+                        refresh_ok = r.is_ok(),
+                        "2FA enabled but the enrolling session could not be re-issued; \
+                         the user must sign in again"
+                    ),
+                }
+            }
+        }
+
         Ok(TwoFactorEnrollment { backup_codes })
     }
 
@@ -520,14 +565,14 @@ impl AuthMutations {
 
         // Generate new tokens
         let access_token = auth_service
-            .generate_access_token(&user, true)
+            .generate_access_token(&user, talos_auth::SessionAuth::SecondFactorVerified)
             .map_err(|e| {
                 tracing::error!("Failed to generate token: {}", e);
                 async_graphql::Error::new("Failed to generate token").extend_safe()
             })?;
 
         let refresh_token = auth_service
-            .generate_refresh_token(*user_id, true)
+            .generate_refresh_token(*user_id, talos_auth::SessionAuth::SecondFactorVerified)
             .await
             .map_err(|e| {
                 tracing::error!("Failed to generate refresh token: {}", e);

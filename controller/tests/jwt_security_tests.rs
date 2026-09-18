@@ -51,6 +51,7 @@ async fn expired_token_is_rejected() {
         exp: (now - Duration::hours(1)).timestamp() as usize,
         iat: (now - Duration::hours(2)).timestamp() as usize,
         is_2fa_verified: false,
+        second_factor_verified: false,
         iss: "talos".to_string(),
         aud: Some("talos".to_string()),
         org: String::new(),
@@ -82,7 +83,7 @@ async fn tampered_payload_is_rejected() {
     let service = make_auth_service("correct-secret-for-tamper-test!!");
     let user = test_user();
     let token = service
-        .generate_access_token(&user, false)
+        .generate_access_token(&user, talos_auth::SessionAuth::PendingSecondFactor)
         .expect("token generation should succeed");
 
     // Tamper: decode the payload, modify it, re-encode without the correct key.
@@ -170,7 +171,7 @@ async fn token_from_different_secret_is_rejected() {
 
     let user = test_user();
     let token = service_a
-        .generate_access_token(&user, false)
+        .generate_access_token(&user, talos_auth::SessionAuth::PendingSecondFactor)
         .expect("token generation with secret A");
 
     let result = service_b.verify_token(&token);
@@ -196,6 +197,7 @@ async fn alg_none_token_is_rejected() {
         exp: (Utc::now() + Duration::hours(1)).timestamp() as usize,
         iat: Utc::now().timestamp() as usize,
         is_2fa_verified: false,
+        second_factor_verified: false,
         iss: "talos".to_string(),
         aud: Some("talos".to_string()),
         org: String::new(),
@@ -227,11 +229,15 @@ async fn valid_token_verifies_successfully() {
     let service = make_auth_service("secret-for-happy-path!!!!!!!!!!!!");
     let user = test_user();
     let token = service
-        .generate_access_token(&user, true)
+        .generate_access_token(&user, talos_auth::SessionAuth::SecondFactorVerified)
         .expect("token generation should succeed");
     let claims = service
         .verify_token(&token)
         .expect("valid token should verify");
+    assert!(
+        claims.second_factor_verified,
+        "the verified second factor survives signing"
+    );
     assert_eq!(claims.email, user.email);
     assert_eq!(claims.sub, user.id.to_string());
 }

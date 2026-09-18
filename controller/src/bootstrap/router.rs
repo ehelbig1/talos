@@ -1789,6 +1789,12 @@ pub(crate) async fn graphql_handler(
                         req = req.data(crate::api::schema::IsTwoFactorVerified(
                             claims.is_2fa_verified,
                         ));
+                        // Whether a second factor was VERIFIED (not merely not
+                        // pending). Only a session carries it; the privileged
+                        // gate reads its absence as `false`.
+                        req = req.data(crate::api::schema::SecondFactorVerified(
+                            claims.second_factor_verified,
+                        ));
                         pre_2fa_session = !claims.is_2fa_verified;
                         tracing::debug!(
                             "Authenticated via JWT for user {} (2FA verified: {})",
@@ -2272,13 +2278,15 @@ pub(crate) async fn oauth_callback_handler(
     // bypass 2FA for anyone who can complete an OAuth handshake with the
     // upstream provider — i.e. Google-account compromise = Talos session,
     // even when the user thinks TOTP is protecting them.
-    let is_2fa_verified = !user.totp_enabled.unwrap_or(false);
+    // An OAuth login proves no second factor (the same rule as a password
+    // login): pending when TOTP is enrolled, password-only otherwise.
+    let session_auth = talos_auth::SessionAuth::at_login(user.totp_enabled.unwrap_or(false));
     let access_token = auth_service
-        .generate_access_token(&user, is_2fa_verified)
+        .generate_access_token(&user, session_auth)
         .map_err(oauth_login_internal_error)?;
 
     let refresh_token = auth_service
-        .generate_refresh_token(user_id, is_2fa_verified)
+        .generate_refresh_token(user_id, session_auth)
         .await
         .map_err(oauth_login_internal_error)?;
 
@@ -4514,5 +4522,36 @@ mod missing_extension_guard_wiring_tests {
                 "a `{registration}` follows the guard layer, so that route is not covered"
             );
         }
+    }
+}
+
+/// SOURCE PIN, stated as textual: the GraphQL handler injects the session's
+/// VERIFIED-second-factor flag from the JWT claim, and the API-key branch does
+/// not (an API key must read as unverified). The privileged-gate DB tests
+/// inject context by hand, so without this pin a dropped injection would only
+/// show as every privileged operation failing closed in production.
+#[cfg(test)]
+mod second_factor_injection_pin {
+    #[test]
+    fn the_jwt_branch_injects_the_verified_second_factor_and_the_api_key_branch_does_not() {
+        let src = include_str!("router.rs");
+        let jwt = src
+            .find("claims.is_2fa_verified,\n                        ));")
+            .expect("the JWT branch's IsTwoFactorVerified injection");
+        let window = &src[jwt..jwt + 700];
+        assert!(
+            window.contains(
+                "SecondFactorVerified(\n                            claims.second_factor_verified,"
+            ),
+            "the JWT branch must inject SecondFactorVerified from the claim"
+        );
+        let api_key = src
+            .find("req = req.data(crate::api::schema::IsTwoFactorVerified(true));")
+            .expect("the API-key branch");
+        let branch = &src[api_key..api_key + 400];
+        assert!(
+            !branch.contains("SecondFactorVerified"),
+            "an API-key request must not be marked second-factor verified"
+        );
     }
 }

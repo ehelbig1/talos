@@ -43,6 +43,10 @@ use talos_workflow_engine::ParallelWorkflowEngine;
 
 pub struct ApiKeyScopes(pub Vec<talos_api_keys::ApiKeyScope>);
 pub struct IsTwoFactorVerified(pub bool);
+/// The session's JWT records a VERIFIED second factor
+/// (`Claims::second_factor_verified`). Injected for session requests only; an
+/// API-key request carries none, and absence reads as `false`.
+pub struct SecondFactorVerified(pub bool);
 
 /// When present in the GraphQL context, indicates the API key is scoped
 /// to a specific organization. Resolvers should restrict resource access
@@ -376,6 +380,130 @@ fn selection_set_root_fields_allowed(
         }
     }
     true
+}
+
+/// Why a privileged operation was refused. The caller-facing text says what
+/// to do; none of it reveals anything about another account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecondFactorRefusal {
+    /// An API key: keys skip 2FA by design, so they cannot stand in for it.
+    ApiKey,
+    /// The session is still waiting for its 2FA code.
+    Pending,
+    /// No second factor was verified for this session (a password-only or
+    /// OAuth login, or a session from before enrolment).
+    NotVerified,
+    /// The account has no second factor enrolled (or it was removed).
+    NotEnrolled,
+}
+
+impl SecondFactorRefusal {
+    #[must_use]
+    pub const fn message(self) -> &'static str {
+        match self {
+            Self::ApiKey => {
+                "This operation requires an interactive session with two-factor \
+                 authentication; API keys cannot perform it."
+            }
+            Self::Pending => "Two-Factor Authentication required. Please verify your identity.",
+            Self::NotVerified => {
+                "This operation requires a session verified with two-factor \
+                 authentication. Sign in again and enter your authentication code."
+            }
+            Self::NotEnrolled => {
+                "This operation requires two-factor authentication. Enable it under \
+                 Settings → Security, then sign in again."
+            }
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ApiKey => "api_key",
+            Self::Pending => "pending",
+            Self::NotVerified => "not_verified",
+            Self::NotEnrolled => "not_enrolled",
+        }
+    }
+}
+
+/// The privileged-operation decision, from facts the caller has gathered.
+/// `enrolled` is `None` until it is read, and it is read only when every
+/// cheaper condition has already passed.
+pub fn second_factor_decision(
+    api_key: bool,
+    pending: bool,
+    verified: bool,
+    enrolled: Option<bool>,
+) -> std::result::Result<(), SecondFactorRefusal> {
+    if api_key {
+        return Err(SecondFactorRefusal::ApiKey);
+    }
+    if pending {
+        return Err(SecondFactorRefusal::Pending);
+    }
+    if !verified {
+        return Err(SecondFactorRefusal::NotVerified);
+    }
+    match enrolled {
+        Some(true) => Ok(()),
+        _ => Err(SecondFactorRefusal::NotEnrolled),
+    }
+}
+
+/// Gate for the PRIVILEGED operations — key material and security controls
+/// (master-key and DEK rotation, the re-encryption sweeps, API-key lifecycle,
+/// capability grants, audit settings, ownership transfer).
+///
+/// `require_2fa` only refuses a session that is half-way through a 2FA login:
+/// an account with no second factor enrolled passes it on a password alone,
+/// and every API-key request passes it. This gate requires, in order: not an
+/// API key; not pending; a second factor VERIFIED for this session
+/// (`SecondFactorVerified`, minted only by a 2FA login or by the enrolling
+/// session); and 2FA still enrolled on the account now — one primary-key read,
+/// so disabling 2FA withdraws the privilege at once rather than when the
+/// session expires. A read failure refuses.
+pub async fn require_second_factor(ctx: &Context<'_>) -> Result<()> {
+    let api_key = ctx.data_opt::<ApiKeyScopes>().is_some();
+    // A request with neither marker is unauthenticated: `require_2fa`'s own
+    // missing-data arm names that condition, so defer to it.
+    if !api_key && ctx.data_opt::<IsTwoFactorVerified>().is_none() {
+        return require_2fa(ctx);
+    }
+    let pending = !ctx.data_opt::<IsTwoFactorVerified>().is_some_and(|v| v.0);
+    let verified = ctx.data_opt::<SecondFactorVerified>().is_some_and(|v| v.0);
+    let early = second_factor_decision(api_key, pending, verified, Some(true));
+    let decision = if early.is_err() {
+        early
+    } else {
+        let user_id = ctx
+            .data_opt::<Uuid>()
+            .copied()
+            .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
+        let auth_service = ctx.data::<std::sync::Arc<talos_auth::AuthService>>()?;
+        let enrolled = match auth_service.get_user(user_id).await {
+            Ok(user) => user.totp_enabled.unwrap_or(false),
+            Err(e) => {
+                tracing::error!(
+                    %user_id,
+                    "require_second_factor: enrolment read failed; refusing: {e}"
+                );
+                return Err(async_graphql::Error::new("Database error").extend_safe());
+            }
+        };
+        second_factor_decision(api_key, pending, verified, Some(enrolled))
+    };
+    decision.map_err(|refusal| {
+        tracing::info!(
+            target: "talos_audit",
+            event_kind = "privileged_op_refused",
+            reason = refusal.as_str(),
+            user_id = ?ctx.data_opt::<Uuid>(),
+            "privileged operation refused: second factor not satisfied"
+        );
+        async_graphql::Error::new(refusal.message()).extend_safe()
+    })
 }
 
 /// Gate for system-wide / cross-tenant operations.
@@ -1096,5 +1224,129 @@ mod ws_lane_guard_tests {
         let mut resp = response_with(vec![leaky]);
         scrub_response_errors_with(&mut resp, true);
         assert_eq!(resp.errors[0].message, "relation does not exist");
+    }
+}
+
+#[cfg(test)]
+mod second_factor_tests {
+    use super::{second_factor_decision, SecondFactorRefusal};
+
+    /// Every combination of the four facts: only "not an API key, not
+    /// pending, verified, enrolled" passes, and each refusal names the FIRST
+    /// failing condition in the documented order.
+    #[test]
+    fn only_a_verified_enrolled_session_passes() {
+        for api_key in [false, true] {
+            for pending in [false, true] {
+                for verified in [false, true] {
+                    for enrolled in [None, Some(false), Some(true)] {
+                        let got = second_factor_decision(api_key, pending, verified, enrolled);
+                        let want = if api_key {
+                            Err(SecondFactorRefusal::ApiKey)
+                        } else if pending {
+                            Err(SecondFactorRefusal::Pending)
+                        } else if !verified {
+                            Err(SecondFactorRefusal::NotVerified)
+                        } else if enrolled != Some(true) {
+                            Err(SecondFactorRefusal::NotEnrolled)
+                        } else {
+                            Ok(())
+                        };
+                        assert_eq!(got, want, "{api_key} {pending} {verified} {enrolled:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn refusals_have_distinct_labels_and_messages() {
+        let all = [
+            SecondFactorRefusal::ApiKey,
+            SecondFactorRefusal::Pending,
+            SecondFactorRefusal::NotVerified,
+            SecondFactorRefusal::NotEnrolled,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for b in &all[i + 1..] {
+                assert_ne!(a.as_str(), b.as_str());
+                assert_ne!(a.message(), b.message());
+            }
+        }
+    }
+
+    /// SOURCE PIN, stated as textual: the privileged tier — operations that
+    /// touch key material or create or expand privilege — calls
+    /// `require_second_factor`, and the revocations (which REDUCE privilege and
+    /// must stay quick in an incident) keep `require_2fa`. The DB test drives
+    /// the gate through `rotateOrgDek` only; this pins every member.
+    #[test]
+    fn the_privileged_tier_calls_the_second_factor_gate() {
+        let files = [
+            (include_str!("security/mutations.rs"), "security"),
+            (include_str!("platform/mutations.rs"), "platform"),
+            (include_str!("organizations/mutations.rs"), "organizations"),
+            (include_str!("actors/mutations.rs"), "actors"),
+        ];
+        let body = |name: &str| -> &'static str {
+            let needle = format!("\n    async fn {name}(");
+            let hits: Vec<(&'static str, usize)> = files
+                .iter()
+                .filter_map(|(src, _)| src.find(&needle).map(|i| (*src, i)))
+                .collect();
+            assert_eq!(hits.len(), 1, "{name}: exactly one resolver");
+            let (src, i) = hits[0];
+            // A resolver ends at the next resolver or at the impl's closing
+            // brace — never at end of file, where a test module quoting the
+            // gate would vouch for it.
+            let rest = &src[i + 1..];
+            let end = [rest.find("\n    async fn "), rest.find("\n}\n")]
+                .into_iter()
+                .flatten()
+                .min()
+                .map_or(src.len(), |e| i + 1 + e);
+            &src[i..end]
+        };
+        const PRIVILEGED: [&str; 15] = [
+            "create_api_key",
+            "rotate_api_key",
+            "register_mcp_agent",
+            "rotate_dek",
+            "rotate_org_dek",
+            "rotate_master_key",
+            "rotate_encryption_key",
+            "re_encrypt_secrets",
+            "re_encrypt_secrets_to_org",
+            "re_encrypt_memories_to_org",
+            "re_encrypt_outputs_to_org",
+            "re_encrypt_module_payloads_to_org",
+            "update_audit_settings",
+            "grant_capability_ceiling",
+            "transfer_ownership",
+        ];
+        for name in PRIVILEGED {
+            let b = body(name);
+            assert!(
+                b.contains("require_second_factor(ctx).await?"),
+                "{name}: privileged, must call require_second_factor"
+            );
+            assert!(
+                !b.contains("require_2fa(ctx)?"),
+                "{name}: must not keep the weaker gate"
+            );
+        }
+        const REDUCING: [&str; 4] = [
+            "revoke_api_key",
+            "delete_api_key",
+            "revoke_mcp_agent",
+            "revoke_capability_ceiling",
+        ];
+        for name in REDUCING {
+            let b = body(name);
+            assert!(
+                b.contains("require_2fa(ctx)?") && !b.contains("require_second_factor"),
+                "{name}: reduces privilege, keeps require_2fa"
+            );
+        }
     }
 }

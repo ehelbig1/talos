@@ -700,7 +700,11 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             "name": "grant_capability_ceiling",
             "description": "Grant a user an elevated capability ceiling. You can only grant up to \
                 your own ceiling — you cannot grant more than you have. UPSERT semantics: \
-                re-calling with a different world replaces the existing grant.",
+                re-calling with a different world replaces the existing grant. Granting to \
+                ANOTHER user is refused over MCP: it expands a user's privilege, and an MCP \
+                agent token cannot prove a second factor. A platform admin grants through the \
+                GraphQL grantCapabilityCeiling mutation from a session verified with \
+                two-factor authentication.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4727,19 +4731,21 @@ async fn handle_grant_capability_ceiling(
     // Self-grant is a no-op (you can't exceed your own ceiling) so it can
     // pass without the platform-admin requirement. revoke_capability_ceiling
     // already enforces the same gate (actor.rs:handle_revoke_capability_ceiling).
+    //
+    // 2026-09-18: a cross-user grant EXPANDS another user's privilege, the
+    // class that now requires a session with a verified second factor
+    // (`require_second_factor` on the GraphQL `grantCapabilityCeiling`). An MCP
+    // agent token is a long-lived bearer credential that cannot prove one, so
+    // the grant is refused here for every caller, admin or not — the same
+    // reasoning that took secret writes off MCP (MCP-1201).
     if target_user_id != granter_id {
-        let is_admin = state
-            .actor_repo
-            .is_platform_admin(granter_id)
-            .await
-            .unwrap_or(false);
-        if !is_admin {
-            return mcp_error(
-                req_id,
-                -32003,
-                "Only platform admins (org owner/admin) can grant capability ceilings to other users.",
-            );
-        }
+        return mcp_denied(
+            req_id,
+            -32003,
+            "Granting a capability ceiling to another user is not available over MCP: it \
+             requires a session verified with two-factor authentication. A platform admin \
+             grants it through the GraphQL grantCapabilityCeiling mutation.",
+        );
     }
 
     // MCP-279 (2026-05-10): pre-fix the handler accepted any string
