@@ -7,7 +7,8 @@ use uuid::Uuid;
 
 use crate::schema::types::*;
 use crate::schema::{
-    require_2fa, require_scope, ApiKeyScopes, RequestMetadata, SafeErrorExtensions,
+    password_change_decision, require_2fa, require_scope, ApiKeyScopes, IsTwoFactorVerified,
+    RequestMetadata, SafeErrorExtensions, SecondFactorVerified,
 };
 
 #[derive(Default)]
@@ -285,6 +286,114 @@ impl AuthMutations {
         // logged-in client-side after a successful logout_all_sessions
         // call until the access-token JWT expires on its own.
         super::clear_session_cookies(cookies);
+
+        Ok(true)
+    }
+
+    /// Change the signed-in user's password. Requires the current password.
+    /// Every session of the account is signed out; a browser caller is issued
+    /// a fresh session. API keys cannot change a password.
+    async fn change_password(&self, ctx: &Context<'_>, input: ChangePasswordInput) -> Result<bool> {
+        let metadata = ctx.data_opt::<RequestMetadata>();
+        // The auth-endpoint limiter login uses (Redis-backed, per IP). The
+        // account lockout already bounds guesses per account; this bounds a
+        // caller cycling through several stolen sessions.
+        if let Ok(limiter) = ctx.data::<Arc<talos_rate_limit::DistributedRateLimiter>>() {
+            let ip = metadata
+                .and_then(|m| m.ip_address.as_deref())
+                .unwrap_or("unknown");
+            if !limiter.check(ip).await {
+                return Err(async_graphql::Error::new(
+                    "Too many attempts. Please try again later.",
+                )
+                .extend_safe());
+            }
+        }
+
+        let api_key = ctx.data_opt::<ApiKeyScopes>().is_some();
+        // Neither marker ⇒ unauthenticated: `require_2fa` names that condition.
+        if !api_key && ctx.data_opt::<IsTwoFactorVerified>().is_none() {
+            require_2fa(ctx)?;
+        }
+        let user_id = *ctx
+            .data_opt::<Uuid>()
+            .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
+        let pending = !ctx.data_opt::<IsTwoFactorVerified>().is_some_and(|v| v.0);
+        let verified = ctx.data_opt::<SecondFactorVerified>().is_some_and(|v| v.0);
+        let auth_service = ctx.data::<Arc<talos_auth::AuthService>>()?;
+
+        // Cheap refusals first; the enrolment read only for a session that
+        // could still pass.
+        let mut decision = password_change_decision(api_key, pending, verified, false);
+        let mut user = None;
+        if decision.is_ok() {
+            let u = auth_service.get_user(user_id).await.map_err(|e| {
+                tracing::error!(%user_id, "changePassword: user read failed: {e}");
+                async_graphql::Error::new("Failed to change password").extend_safe()
+            })?;
+            decision = password_change_decision(
+                api_key,
+                pending,
+                verified,
+                u.totp_enabled.unwrap_or(false),
+            );
+            user = Some(u);
+        }
+        if let Err(refusal) = decision {
+            tracing::info!(
+                target: "talos_audit",
+                event_kind = "password_change_refused",
+                reason = refusal.as_str(),
+                %user_id,
+                "password change refused: session not permitted"
+            );
+            return Err(async_graphql::Error::new(refusal.message()).extend_safe());
+        }
+
+        auth_service
+            .change_password(
+                user_id,
+                &input.current_password,
+                &input.new_password,
+                metadata.and_then(|m| m.ip_address.as_deref()),
+                metadata.and_then(|m| m.user_agent.as_deref()),
+            )
+            .await
+            .map_err(|e| {
+                if let talos_auth::PasswordChangeError::Internal(inner) = &e {
+                    tracing::error!(%user_id, "changePassword failed: {inner:#}");
+                }
+                async_graphql::Error::new(e.message()).extend_safe()
+            })?;
+
+        // Every session is gone, this browser's included. It proved the
+        // current password, and whatever second factor it had verified still
+        // holds, so it continues with the same standing.
+        if let (Ok(cookies), Some(user)) = (ctx.data::<Cookies>(), user.as_ref()) {
+            let auth = if verified {
+                talos_auth::SessionAuth::SecondFactorVerified
+            } else {
+                talos_auth::SessionAuth::PasswordOnly
+            };
+            match (
+                auth_service.generate_access_token(user, auth),
+                auth_service.generate_refresh_token(user_id, auth).await,
+            ) {
+                (Ok(access), Ok(refresh)) => {
+                    super::set_session_cookies(cookies, &access, &refresh);
+                }
+                (a, r) => {
+                    tracing::error!(
+                        %user_id,
+                        access_ok = a.is_ok(),
+                        refresh_ok = r.is_ok(),
+                        "password changed but this session could not be re-issued; \
+                         the user must sign in again"
+                    );
+                    super::clear_session_cookies(cookies);
+                }
+            }
+        }
 
         Ok(true)
     }

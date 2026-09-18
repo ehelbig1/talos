@@ -423,6 +423,16 @@ pub struct Enable2FAInput {
     pub code: String,
 }
 
+/// The current password and the new one.
+// No `Debug` derive: both fields are passwords.
+#[derive(InputObject)]
+pub struct ChangePasswordInput {
+    #[graphql(name = "currentPassword")]
+    pub current_password: String,
+    #[graphql(name = "newPassword")]
+    pub new_password: String,
+}
+
 #[derive(InputObject)]
 pub struct Verify2FAInput {
     pub code: String,

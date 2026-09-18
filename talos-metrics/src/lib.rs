@@ -30,7 +30,9 @@ pub use google_push::{JwkRefreshOutcome, PushIntegration, PushRefusalReason};
 pub use mcp::McpToolOutcome;
 pub use outcome_class::OutcomeClass;
 pub use rpc::{seeded_pairs as rpc_seeded_pairs, RpcOutcome, RpcSubject};
-pub use security::{ApiKeyValidation, McpAuthOutcome, RateLimitKind, TwoFactorOutcome};
+pub use security::{
+    ApiKeyValidation, McpAuthOutcome, PasswordChangeOutcome, RateLimitKind, TwoFactorOutcome,
+};
 pub use vault_token::{VaultTokenLifetimeLabel, VaultTokenRenewalOutcome};
 pub use webhook::WebhookAuthFormat;
 
@@ -463,6 +465,21 @@ pub fn record_mcp_auth_on(metrics: &TalosMetrics, outcome: McpAuthOutcome) {
         .inc();
 }
 
+/// Count one password-change outcome. Inert without [`set_global`].
+pub fn record_password_change(outcome: PasswordChangeOutcome) {
+    if let Some(m) = global() {
+        record_password_change_on(m, outcome);
+    }
+}
+
+/// The recording itself, against an EXPLICIT registry.
+pub fn record_password_change_on(metrics: &TalosMetrics, outcome: PasswordChangeOutcome) {
+    metrics
+        .password_changes_total
+        .with_label_values(&[outcome.as_str()])
+        .inc();
+}
+
 /// Count one start the deployment-wide execution pause refused. Inert without
 /// [`set_global`].
 pub fn record_actor_budget_refusal(cap: BudgetCap, mode: BudgetMode) {
@@ -708,6 +725,12 @@ pub struct TalosMetrics {
     // like the two above, a threshold needs a baseline this series has never
     // produced. Seeded over `McpAuthOutcome::ALL`.
     pub mcp_auth_total: CounterVec,
+    // A user changing their own password (2026-09-18): the one recovery a
+    // user has after a password leak, and — through `wrong_current_password`
+    // — the signal that someone holding a session is guessing the password.
+    // No alert yet, for the reason given above. Seeded over
+    // `PasswordChangeOutcome::ALL`.
+    pub password_changes_total: CounterVec,
 
     // Execution metrics
     pub module_executions_total: CounterVec,
@@ -2051,6 +2074,29 @@ impl TalosMetrics {
         registry.register(Box::new(mcp_auth_total.clone()))?;
         for outcome in McpAuthOutcome::ALL {
             mcp_auth_total
+                .with_label_values(&[outcome.as_str()])
+                .inc_by(0.0);
+        }
+
+        let password_changes_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_password_changes_total",
+                "Password changes a signed-in user requested (AuthService::change_password), \
+                 one per request. outcome=changed | wrong_current_password (the current \
+                 password did not match — the guessing signal; shares the login lockout \
+                 counter) | locked (the account is locked after repeated wrong passwords) | \
+                 policy_rejected (the new password fails the policy; not counted toward the \
+                 lockout) | unchanged (the new password is the current one) | conflict \
+                 (another request changed the password first) | error (could not decide — \
+                 counted, so a surface failing every request is not quiet). \
+                 talos_metrics::PasswordChangeOutcome, a closed set, all seven pre-seeded \
+                 at 0. Registered 2026-09-18.",
+            ),
+            &["outcome"],
+        )?;
+        registry.register(Box::new(password_changes_total.clone()))?;
+        for outcome in PasswordChangeOutcome::ALL {
+            password_changes_total
                 .with_label_values(&[outcome.as_str()])
                 .inc_by(0.0);
         }
@@ -3501,6 +3547,7 @@ impl TalosMetrics {
             auth_2fa_attempts_total,
             api_key_validations_total,
             mcp_auth_total,
+            password_changes_total,
             module_executions_total,
             module_execution_duration_seconds,
             workflow_executions_total,
@@ -4208,6 +4255,13 @@ mod tests {
         for o in McpAuthOutcome::ALL {
             record_mcp_auth_on(&m, *o);
         }
+        for o in PasswordChangeOutcome::ALL {
+            assert!(cold.contains(&format!(
+                "talos_password_changes_total{{outcome=\"{}\"}} 0",
+                o.as_str()
+            )));
+            record_password_change_on(&m, *o);
+        }
         let warm = m.render_prometheus().expect("render");
         for o in TwoFactorOutcome::ALL {
             assert!(warm.contains(&format!(
@@ -4237,6 +4291,17 @@ mod tests {
         // does not aggregate outcomes away.
         assert_eq!(McpAuthOutcome::ALL.len(), 7);
         assert_eq!(warm.matches("talos_mcp_auth_total{outcome=").count(), 7);
+        for o in PasswordChangeOutcome::ALL {
+            assert!(warm.contains(&format!(
+                "talos_password_changes_total{{outcome=\"{}\"}} 1",
+                o.as_str()
+            )));
+        }
+        assert_eq!(
+            warm.matches("talos_password_changes_total{outcome=")
+                .count(),
+            PasswordChangeOutcome::ALL.len()
+        );
         // The two execution families that closed the baseline: the counter is
         // seeded over ALL and both recorders move counter + histogram, the
         // histogram only when a duration is known.

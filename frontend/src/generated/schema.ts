@@ -340,6 +340,12 @@ export type CapabilityWorldInfo = {
   rank: Scalars["Int"]["output"];
 };
 
+/** The current password and the new one. */
+export type ChangePasswordInput = {
+  currentPassword: Scalars["String"]["input"];
+  newPassword: Scalars["String"]["input"];
+};
+
 /** Human-readable changelog entry for a workflow version. */
 export type ChangelogEntry = {
   __typename?: "ChangelogEntry";
@@ -940,6 +946,12 @@ export type MutationRoot = {
    */
   ackOpsAlert: Scalars["Boolean"]["output"];
   approveExecution: Scalars["Boolean"]["output"];
+  /**
+   * Change the signed-in user's password. Requires the current password.
+   * Every session of the account is signed out; a browser caller is issued
+   * a fresh session. API keys cannot change a password.
+   */
+  changePassword: Scalars["Boolean"]["output"];
   /** Clone an actor with its capability world, ceilings, secret grants, budget policy, approval policies and semantic/episodic memories. */
   cloneActor: ActorSummary;
   /**
@@ -1122,6 +1134,10 @@ export type MutationRootAckOpsAlertArgs = {
 export type MutationRootApproveExecutionArgs = {
   id: Scalars["UUID"]["input"];
   reason?: InputMaybe<Scalars["String"]["input"]>;
+};
+
+export type MutationRootChangePasswordArgs = {
+  input: ChangePasswordInput;
 };
 
 export type MutationRootCloneActorArgs = {

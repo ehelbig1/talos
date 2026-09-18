@@ -322,7 +322,7 @@ async fn test_password_change() {
 
     // Change password
     let result = auth_service
-        .change_password(user_id, old_password, new_password)
+        .change_password(user_id, old_password, new_password, None, None)
         .await;
 
     assert!(result.is_ok(), "Password change should succeed");
@@ -362,12 +362,15 @@ async fn test_password_change_with_wrong_old_password() {
 
     // Change password with wrong old password should fail
     let result = auth_service
-        .change_password(user_id, wrong_old, new_password)
+        .change_password(user_id, wrong_old, new_password, None, None)
         .await;
 
     assert!(
-        result.is_err(),
-        "Password change with wrong old password should fail"
+        matches!(
+            result,
+            Err(controller::auth::PasswordChangeError::WrongCurrentPassword)
+        ),
+        "Password change with wrong old password should fail: {result:?}"
     );
 
     // Cleanup

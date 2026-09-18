@@ -452,6 +452,33 @@ pub fn second_factor_decision(
     }
 }
 
+/// The session a password change needs, from facts the caller has gathered.
+///
+/// Not the privileged tier: an account with no second factor enrolled must
+/// still be able to change a leaked password (the current password is the
+/// proof), so a password-only session passes. What it refuses: an API key (a
+/// long-lived bearer token must not be able to take over the account's
+/// sign-in credential), a session still waiting for its 2FA code, and — on an
+/// account WITH 2FA enrolled — a session that did not verify it, so a stolen
+/// password-only token cannot rotate the password out from under the owner.
+pub fn password_change_decision(
+    api_key: bool,
+    pending: bool,
+    verified: bool,
+    enrolled: bool,
+) -> std::result::Result<(), SecondFactorRefusal> {
+    if api_key {
+        return Err(SecondFactorRefusal::ApiKey);
+    }
+    if pending {
+        return Err(SecondFactorRefusal::Pending);
+    }
+    if enrolled && !verified {
+        return Err(SecondFactorRefusal::NotVerified);
+    }
+    Ok(())
+}
+
 /// Gate for the PRIVILEGED operations — key material and security controls
 /// (master-key and DEK rotation, the re-encryption sweeps, API-key lifecycle,
 /// capability grants, audit settings, ownership transfer).
@@ -1229,7 +1256,35 @@ mod ws_lane_guard_tests {
 
 #[cfg(test)]
 mod second_factor_tests {
-    use super::{second_factor_decision, SecondFactorRefusal};
+    use super::{password_change_decision, second_factor_decision, SecondFactorRefusal};
+
+    /// A password change needs a session that is not an API key, not pending,
+    /// and — only when 2FA is enrolled — verified. A password-only session on
+    /// an account with nothing enrolled passes: the current password is its
+    /// proof, and refusing it would leave that account no way to rotate a
+    /// leaked password.
+    #[test]
+    fn a_password_change_needs_verification_only_when_enrolled() {
+        for api_key in [false, true] {
+            for pending in [false, true] {
+                for verified in [false, true] {
+                    for enrolled in [false, true] {
+                        let got = password_change_decision(api_key, pending, verified, enrolled);
+                        let want = if api_key {
+                            Err(SecondFactorRefusal::ApiKey)
+                        } else if pending {
+                            Err(SecondFactorRefusal::Pending)
+                        } else if enrolled && !verified {
+                            Err(SecondFactorRefusal::NotVerified)
+                        } else {
+                            Ok(())
+                        };
+                        assert_eq!(got, want, "{api_key} {pending} {verified} {enrolled}");
+                    }
+                }
+            }
+        }
+    }
 
     /// Every combination of the four facts: only "not an API key, not
     /// pending, verified, enrolled" passes, and each refusal names the FIRST

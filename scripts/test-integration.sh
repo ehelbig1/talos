@@ -414,6 +414,9 @@ CTRL_TESTS=(
     # factor: the gate matrix through the real schema, login/refresh flags, and
     # enrolment signing out every earlier session (2026-09-18).
     "privileged_second_factor_tests"
+    # A user changing their own password: session gate, shared lockout, atomic
+    # revocation + audit row, conflict on a concurrent change (2026-09-18).
+    "password_change_tests"
     # The immutability triggers were BEFORE DELETE OR UPDATE ... FOR EACH ROW,
     # and TRUNCATE fires no row trigger: it emptied an audit table with nothing
     # raised. Drives TRUNCATE/DELETE/UPDATE against every immutable table on a

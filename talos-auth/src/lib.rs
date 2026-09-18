@@ -15,6 +15,13 @@ use sqlx::{Pool, Postgres};
 /// `talos-advanced-repository`'s `RETENTION_BATCH`.
 const SWEEP_BATCH: i64 = 5000;
 
+/// Wrong passwords before an account is locked. ONE counter
+/// (`users.failed_login_attempts`) is shared by login and password change, so
+/// a caller holding a stolen session gets no more guesses than one without.
+const MAX_PASSWORD_ATTEMPTS: i32 = 5;
+/// How long a locked account stays locked.
+const PASSWORD_LOCKOUT_MINUTES: i64 = 15;
+
 /// Batches one cleanup call will issue before reporting `truncated`. Matches
 /// `talos-advanced-repository`'s `MAX_BATCHES_PER_SWEEP`.
 const MAX_SWEEP_BATCHES: u32 = 20;
@@ -254,6 +261,78 @@ impl std::fmt::Debug for User {
 /// Pure-data struct lives in `talos-auth-types`; re-exported here so
 /// the existing `crate::auth::Claims` import path continues to work.
 pub use talos_auth_types::{Claims, SessionAuth};
+
+/// A completed password change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PasswordChanged {
+    /// Sessions signed out — every session the account had, the caller's own
+    /// included (a browser caller re-issues its own afterwards).
+    pub sessions_revoked: u64,
+}
+
+/// Why [`AuthService::change_password`] refused. [`Self::message`] is safe to
+/// return to the caller; `Internal` carries the real error for the log only.
+#[derive(Debug)]
+pub enum PasswordChangeError {
+    /// The account is locked after repeated wrong passwords.
+    Locked,
+    /// The current password did not match (counted toward the lockout).
+    WrongCurrentPassword,
+    /// The new password fails the policy; the policy's own sentence.
+    PolicyRejected(String),
+    /// The new password is the current one.
+    Unchanged,
+    /// Another request changed the password between the check and the write.
+    Conflict,
+    /// Could not decide (database or hashing failure).
+    Internal(anyhow::Error),
+}
+
+impl From<anyhow::Error> for PasswordChangeError {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Internal(e)
+    }
+}
+
+impl From<sqlx::Error> for PasswordChangeError {
+    fn from(e: sqlx::Error) -> Self {
+        Self::Internal(e.into())
+    }
+}
+
+impl PasswordChangeError {
+    #[must_use]
+    pub const fn outcome(&self) -> talos_metrics::PasswordChangeOutcome {
+        use talos_metrics::PasswordChangeOutcome as O;
+        match self {
+            Self::Locked => O::Locked,
+            Self::WrongCurrentPassword => O::WrongCurrentPassword,
+            Self::PolicyRejected(_) => O::PolicyRejected,
+            Self::Unchanged => O::Unchanged,
+            Self::Conflict => O::Conflict,
+            Self::Internal(_) => O::Error,
+        }
+    }
+
+    /// The caller-facing sentence. Never includes an internal error.
+    #[must_use]
+    pub fn message(&self) -> String {
+        match self {
+            Self::Locked => "Too many incorrect password attempts. The account is locked; \
+                             try again in 15 minutes."
+                .to_string(),
+            Self::WrongCurrentPassword => "Current password is incorrect.".to_string(),
+            Self::PolicyRejected(policy) => policy.clone(),
+            Self::Unchanged => {
+                "The new password must be different from the current one.".to_string()
+            }
+            Self::Conflict => "Your password was changed by another request. \
+                               Sign in again and retry."
+                .to_string(),
+            Self::Internal(_) => "Failed to change password".to_string(),
+        }
+    }
+}
 
 /// Canonical email-format validator. Public so siblings (talos-api,
 /// callers of `talos-mcp-handlers`) can share one source of truth
@@ -812,10 +891,14 @@ impl AuthService {
         })
     }
 
-    /// Log authentication event for security monitoring
+    /// Log authentication event for security monitoring.
+    ///
+    /// Takes the executor so an event that belongs to a state change (a
+    /// password change) commits in the SAME transaction as the change; the
+    /// best-effort wrapper below passes the pool.
     #[allow(clippy::too_many_arguments)]
-    async fn log_auth_event(
-        &self,
+    async fn log_auth_event<'e>(
+        executor: impl sqlx::PgExecutor<'e>,
         user_id: Option<Uuid>,
         event_type: &str,
         email: Option<&str>,
@@ -882,7 +965,7 @@ impl AuthService {
             success,
             failure_reason
         )
-        .execute(&self.db_pool)
+        .execute(executor)
         .await
         .context("Failed to log auth event")?;
 
@@ -902,17 +985,17 @@ impl AuthService {
         success: bool,
         failure_reason: Option<&str>,
     ) {
-        if let Err(e) = self
-            .log_auth_event(
-                user_id,
-                event_type,
-                email,
-                ip_address,
-                user_agent,
-                success,
-                failure_reason,
-            )
-            .await
+        if let Err(e) = Self::log_auth_event(
+            &self.db_pool,
+            user_id,
+            event_type,
+            email,
+            ip_address,
+            user_agent,
+            success,
+            failure_reason,
+        )
+        .await
         {
             tracing::warn!(
                 event_type = event_type,
@@ -920,6 +1003,39 @@ impl AuthService {
                 "Failed to write auth audit log entry"
             );
         }
+    }
+
+    /// Count one wrong password against `user_id` and lock the account when the
+    /// count reaches [`MAX_PASSWORD_ATTEMPTS`]; returns the new count. The ONE
+    /// place the lockout counter moves — login and password change share it.
+    ///
+    /// A single `UPDATE … RETURNING` so two concurrent wrong guesses cannot
+    /// both read the same count and each add one.
+    async fn record_wrong_password(&self, user_id: Uuid) -> Result<i32> {
+        let locked_until = Utc::now() + Duration::minutes(PASSWORD_LOCKOUT_MINUTES);
+        let row = sqlx::query(
+            r#"
+            UPDATE users
+            SET
+                failed_login_attempts = failed_login_attempts + 1,
+                locked_until = CASE
+                    WHEN failed_login_attempts + 1 >= $1 THEN $2
+                    ELSE locked_until
+                END
+            WHERE id = $3
+            RETURNING failed_login_attempts
+            "#,
+        )
+        .bind(MAX_PASSWORD_ATTEMPTS)
+        .bind(locked_until)
+        .bind(user_id)
+        .fetch_one(&self.db_pool)
+        .await?;
+
+        use sqlx::Row as _;
+        Ok(row
+            .try_get::<Option<i32>, _>("failed_login_attempts")?
+            .unwrap_or(1))
     }
 
     /// Does `password` open an account whose stored hash is `stored_hash`?
@@ -931,11 +1047,13 @@ impl AuthService {
     /// hash of a public literal (`talos_unusable_password`), and without this
     /// that literal opens every one of them.
     async fn password_matches(&self, password: &str, stored_hash: &str) -> Result<bool> {
-        let password_owned = password.to_string();
+        // The copy handed to the blocking thread is wiped when it is dropped.
+        let password_owned = zeroize::Zeroizing::new(password.to_string());
         let hash_owned = stored_hash.to_string();
-        let verified = tokio::task::spawn_blocking(move || verify(&password_owned, &hash_owned))
-            .await
-            .context("Password verification task panicked")??;
+        let verified =
+            tokio::task::spawn_blocking(move || verify(password_owned.as_str(), &hash_owned))
+                .await
+                .context("Password verification task panicked")??;
         Ok(verified && !talos_unusable_password::is_reserved_password(password))
     }
 
@@ -1199,39 +1317,8 @@ impl AuthService {
         let is_valid = self.password_matches(password, &user.password_hash).await?;
 
         if !is_valid {
-            const MAX_ATTEMPTS: i32 = 5; // Production security: lock after 5 failed attempts
-            const LOCKOUT_DURATION_MINUTES: i64 = 15;
-
-            // Atomically increment failed_login_attempts and lock if threshold reached.
-            // Using a single UPDATE + RETURNING prevents the read-modify-write race condition
-            // where two concurrent failed logins could both read the same counter value and
-            // each only increment it once, effectively skipping a count.
-            let locked_until = Utc::now() + Duration::minutes(LOCKOUT_DURATION_MINUTES);
-            // Use dynamic query (not query!) to avoid sqlx offline cache issues with
-            // RETURNING. The UPDATE is atomic — no read-modify-write race condition.
-            let row = sqlx::query(
-                r#"
-                UPDATE users
-                SET
-                    failed_login_attempts = failed_login_attempts + 1,
-                    locked_until = CASE
-                        WHEN failed_login_attempts + 1 >= $1 THEN $2
-                        ELSE locked_until
-                    END
-                WHERE id = $3
-                RETURNING failed_login_attempts
-                "#,
-            )
-            .bind(MAX_ATTEMPTS)
-            .bind(locked_until)
-            .bind(user.id)
-            .fetch_one(&self.db_pool)
-            .await?;
-
-            use sqlx::Row as _;
-            let new_attempts: i32 = row
-                .try_get::<Option<i32>, _>("failed_login_attempts")?
-                .unwrap_or(1);
+            const MAX_ATTEMPTS: i32 = MAX_PASSWORD_ATTEMPTS;
+            let new_attempts = self.record_wrong_password(user.id).await?;
 
             if new_attempts >= MAX_ATTEMPTS {
                 // Log account lockout server-side; return the same generic
@@ -2007,80 +2094,176 @@ impl AuthService {
         Ok(user)
     }
 
-    /// Change user password
+    /// Change a signed-in user's password.
+    ///
+    /// The ONE path by which a user replaces their own password. Order, and
+    /// why:
+    /// 1. the account must not be locked (login and password change share one
+    ///    lockout counter, so a stolen session gets no extra guesses);
+    /// 2. the NEW password must meet the policy — checked before the current
+    ///    one so a typo in the new password costs no guess;
+    /// 3. the CURRENT password must match (a wrong one is counted and can lock
+    ///    the account);
+    /// 4. the new password must differ from the current one;
+    /// 5. the write, in ONE transaction: the new hash (only if the stored hash
+    ///    is still the one just verified — otherwise another request changed
+    ///    it first), the lockout counter reset, EVERY session of the account
+    ///    signed out, and the `password_change` audit row. A leaked password
+    ///    is rotated precisely to cut off whoever holds it, so a change that
+    ///    left the old sessions alive would be worse than none; if any part
+    ///    fails, none of it happens.
+    ///
+    /// Counts exactly one `talos_password_changes_total` per call.
     pub async fn change_password(
         &self,
         user_id: Uuid,
-        old_password: &str,
+        current_password: &str,
         new_password: &str,
-    ) -> Result<()> {
-        // Fetch user
+        ip_address: Option<&str>,
+        user_agent: Option<&str>,
+    ) -> std::result::Result<PasswordChanged, PasswordChangeError> {
+        let outcome = self
+            .change_password_inner(
+                user_id,
+                current_password,
+                new_password,
+                ip_address,
+                user_agent,
+            )
+            .await;
+        talos_metrics::record_password_change(match &outcome {
+            Ok(_) => talos_metrics::PasswordChangeOutcome::Changed,
+            Err(e) => e.outcome(),
+        });
+        if let Err(e) = &outcome {
+            if !matches!(e, PasswordChangeError::Internal(_)) {
+                self.log_auth_event_best_effort(
+                    Some(user_id),
+                    "password_change_failed",
+                    None,
+                    ip_address,
+                    user_agent,
+                    false,
+                    Some(e.outcome().as_str()),
+                )
+                .await;
+            }
+        }
+        outcome
+    }
+
+    async fn change_password_inner(
+        &self,
+        user_id: Uuid,
+        current_password: &str,
+        new_password: &str,
+        ip_address: Option<&str>,
+        user_agent: Option<&str>,
+    ) -> std::result::Result<PasswordChanged, PasswordChangeError> {
         let user = self.get_user(user_id).await?;
 
-        // Verify old password (use spawn_blocking to avoid blocking)
-        let is_valid = self
-            .password_matches(old_password, &user.password_hash)
-            .await?;
-
-        if !is_valid {
-            return Err(anyhow!("Invalid current password"));
+        if user.locked_until.is_some_and(|until| until > Utc::now()) {
+            return Err(PasswordChangeError::Locked);
         }
 
-        // Validate new password complexity
-        validate_password(new_password)?;
+        validate_password(new_password)
+            .map_err(|e| PasswordChangeError::PolicyRejected(e.to_string()))?;
 
-        // Hash new password (use spawn_blocking to avoid blocking)
-        let cost = self.bcrypt_cost;
-        let new_pwd = new_password.to_string();
-        let new_password_hash = tokio::task::spawn_blocking(move || hash(&new_pwd, cost))
-            .await
-            .context("Password hashing task panicked")??;
-
-        // Update password
-        sqlx::query!(
-            "UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2",
-            new_password_hash,
-            user_id
-        )
-        .execute(&self.db_pool)
-        .await?;
-
-        // Revoke ALL active sessions after a password change.
-        //
-        // An attacker who obtained the old password (or any active refresh token from
-        // before the change) must not be able to continue using those tokens. Revoking
-        // here forces every session to re-authenticate with the new password.
-        //
-        // Non-fatal: if the DELETE fails (e.g. transient DB issue) we log and proceed.
-        // The password was already updated successfully; the worst outcome is stale
-        // sessions that will expire on their own within 7 days.
-        if let Err(e) = sqlx::query("DELETE FROM user_sessions WHERE user_id = $1")
-            .bind(user_id)
-            .execute(&self.db_pool)
-            .await
+        if !self
+            .password_matches(current_password, &user.password_hash)
+            .await?
         {
-            tracing::warn!(
-                user_id = %user_id,
-                "Failed to revoke sessions after password change (non-fatal): {}",
-                e
-            );
-        } else {
-            tracing::info!(user_id = %user_id, "All sessions revoked after password change");
+            let attempts = self.record_wrong_password(user_id).await?;
+            return Err(if attempts >= MAX_PASSWORD_ATTEMPTS {
+                PasswordChangeError::Locked
+            } else {
+                PasswordChangeError::WrongCurrentPassword
+            });
         }
 
-        // Log password change
-        self.log_auth_event_best_effort(
+        if self
+            .password_matches(new_password, &user.password_hash)
+            .await?
+        {
+            return Err(PasswordChangeError::Unchanged);
+        }
+
+        let cost = self.bcrypt_cost;
+        let new_pwd = zeroize::Zeroizing::new(new_password.to_string());
+        let new_hash = tokio::task::spawn_blocking(move || hash(new_pwd.as_str(), cost))
+            .await
+            .context("Password hashing task panicked")?
+            .context("Password hashing failed")?;
+
+        let sessions_revoked = self
+            .commit_password_change(
+                user_id,
+                &user.password_hash,
+                &new_hash,
+                &user.email,
+                ip_address,
+                user_agent,
+            )
+            .await?
+            .ok_or(PasswordChangeError::Conflict)?;
+
+        tracing::info!(
+            target: "talos_audit",
+            event_kind = "password_changed",
+            user_id = %user_id,
+            sessions_revoked,
+            "password changed; every session of the account was signed out"
+        );
+        Ok(PasswordChanged { sessions_revoked })
+    }
+
+    /// The write half of a password change, in one transaction. `None` when
+    /// the stored hash is no longer `verified_hash` — another request changed
+    /// the password after this one verified it — in which case nothing is
+    /// written.
+    async fn commit_password_change(
+        &self,
+        user_id: Uuid,
+        verified_hash: &str,
+        new_hash: &str,
+        email: &str,
+        ip_address: Option<&str>,
+        user_agent: Option<&str>,
+    ) -> Result<Option<u64>> {
+        let mut tx = self.db_pool.begin().await?;
+        let updated = sqlx::query(
+            "UPDATE users \
+             SET password_hash = $1, updated_at = NOW(), \
+                 failed_login_attempts = 0, locked_until = NULL \
+             WHERE id = $2 AND password_hash = $3",
+        )
+        .bind(new_hash)
+        .bind(user_id)
+        .bind(verified_hash)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if updated == 0 {
+            return Ok(None);
+        }
+        let revoked = sqlx::query("DELETE FROM user_sessions WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        Self::log_auth_event(
+            &mut *tx,
             Some(user_id),
             "password_change",
-            Some(&user.email),
-            None,
-            None,
+            Some(email),
+            ip_address,
+            user_agent,
             true,
             None,
         )
-        .await;
-
-        Ok(())
+        .await?;
+        tx.commit().await?;
+        Ok(Some(revoked))
     }
 
     /// Check refresh token rate limit using Redis (distributed across instances).
