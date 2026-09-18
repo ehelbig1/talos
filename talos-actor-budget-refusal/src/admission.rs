@@ -203,27 +203,13 @@ pub async fn admit_actor_budget_for(
         }
     }
     if let Some(limit) = per_hour {
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM workflow_executions \
-             WHERE actor_id = $1 AND started_at > now() - INTERVAL '1 hour'",
-        )
-        .bind(actor_id)
-        .fetch_one(&mut *conn)
-        .await?;
+        let count = executions_last_hour(&mut *conn, actor_id).await?;
         if count + starts > i64::from(limit) {
             return Ok(refuse(BudgetCap::PerHour, i64::from(limit), count));
         }
     }
     if let Some(limit) = total {
-        // LIFETIME cap, so it counts the archive tier too (#746): a live-only
-        // count reset this budget every archive window.
-        let count: i64 = sqlx::query_scalar(
-            "SELECT (SELECT COUNT(*) FROM workflow_executions WHERE actor_id = $1) \
-                  + (SELECT COUNT(*) FROM workflow_executions_archive WHERE actor_id = $1)",
-        )
-        .bind(actor_id)
-        .fetch_one(&mut *conn)
-        .await?;
+        let count = lifetime_executions(&mut *conn, actor_id).await?;
         if count + starts > limit {
             return Ok(refuse(BudgetCap::Total, limit, count));
         }
@@ -244,19 +230,68 @@ pub async fn admit_actor_budget_for(
     }
     // Rolling daily LLM token ceiling over the `llm_usage` ledger.
     if let Some(limit) = llm_tokens_per_day {
-        let used: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0)::bigint \
-             FROM llm_usage \
-             WHERE actor_id = $1 AND recorded_at > now() - INTERVAL '24 hours'",
-        )
-        .bind(actor_id)
-        .fetch_one(&mut *conn)
-        .await?;
+        let used = llm_tokens_last_24h(&mut *conn, actor_id).await?;
         if used >= limit {
             return Ok(refuse(BudgetCap::LlmTokensPerDay, limit, used));
         }
     }
     Ok(BudgetAdmission::Admitted)
+}
+
+// ── The counts, one home ─────────────────────────────────────────────────
+//
+// The budget is read in two places: this in-transaction admission (the
+// authoritative check, under the per-actor lock) and the lock-free
+// pre-checks in `talos_actor_repository::budget_precheck` (fast-fail, and the
+// owner of the `suspend` side effect). They had their own copies of these
+// statements, and the copies disagreed: the pre-check's lifetime count read
+// the live table only while this one added the archive (#746), so the same
+// actor passed one and failed the other. Both now call these.
+
+/// Executions attributed to `actor_id` that started in the rolling last hour.
+pub async fn executions_last_hour<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    actor_id: Uuid,
+) -> sqlx::Result<i64> {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM workflow_executions \
+         WHERE actor_id = $1 AND started_at > now() - INTERVAL '1 hour'",
+    )
+    .bind(actor_id)
+    .fetch_one(executor)
+    .await
+}
+
+/// Every execution ever attributed to `actor_id`. A LIFETIME count, so it
+/// counts the retention archive too (#746): a live-only count reset the
+/// budget every archive window.
+pub async fn lifetime_executions<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    actor_id: Uuid,
+) -> sqlx::Result<i64> {
+    sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM workflow_executions WHERE actor_id = $1) \
+              + (SELECT COUNT(*) FROM workflow_executions_archive WHERE actor_id = $1)",
+    )
+    .bind(actor_id)
+    .fetch_one(executor)
+    .await
+}
+
+/// LLM tokens (prompt + completion) attributed to `actor_id` over the
+/// trailing 24 hours, from the `llm_usage` ledger.
+pub async fn llm_tokens_last_24h<'e, E: sqlx::PgExecutor<'e>>(
+    executor: E,
+    actor_id: Uuid,
+) -> sqlx::Result<i64> {
+    sqlx::query_scalar(
+        "SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0)::bigint \
+         FROM llm_usage \
+         WHERE actor_id = $1 AND recorded_at > now() - INTERVAL '24 hours'",
+    )
+    .bind(actor_id)
+    .fetch_one(executor)
+    .await
 }
 
 #[cfg(test)]

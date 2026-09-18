@@ -1284,15 +1284,7 @@ impl ActorRepository {
     /// the trailing 24 hours — the read side of the
     /// `max_llm_tokens_per_day` budget ceiling.
     pub async fn sum_llm_tokens_last_24h(&self, actor_id: Uuid) -> Result<i64> {
-        let total: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0)::bigint \
-             FROM llm_usage \
-             WHERE actor_id = $1 AND recorded_at > now() - INTERVAL '24 hours'",
-        )
-        .bind(actor_id)
-        .fetch_one(&self.db_pool)
-        .await?;
-        Ok(total)
+        Ok(talos_actor_budget_refusal::llm_tokens_last_24h(&self.db_pool, actor_id).await?)
     }
 
     /// Per-(provider, model) LLM usage rollup for a user over the trailing
@@ -1401,26 +1393,18 @@ impl ActorRepository {
         .transpose()
     }
 
-    /// Count executions for an actor in the rolling last hour.
+    /// Count executions for an actor in the rolling last hour. The statement
+    /// has one home, shared with the in-transaction budget admission.
     pub async fn count_executions_last_hour(&self, actor_id: Uuid) -> Result<i64> {
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM workflow_executions \
-             WHERE actor_id = $1 AND started_at > now() - INTERVAL '1 hour'",
-        )
-        .bind(actor_id)
-        .fetch_one(&self.db_pool)
-        .await?;
-        Ok(count)
+        Ok(talos_actor_budget_refusal::executions_last_hour(&self.db_pool, actor_id).await?)
     }
 
-    /// Count total lifetime executions for an actor.
+    /// Count total lifetime executions for an actor — live AND archived, the
+    /// same count the in-transaction budget admission refuses on. This read
+    /// the live table only until 2026-09-18, so after an archive pass the
+    /// pre-check admitted an actor the admission then refused.
     pub async fn count_total_executions(&self, actor_id: Uuid) -> Result<i64> {
-        let count: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM workflow_executions WHERE actor_id = $1")
-                .bind(actor_id)
-                .fetch_one(&self.db_pool)
-                .await?;
-        Ok(count)
+        Ok(talos_actor_budget_refusal::lifetime_executions(&self.db_pool, actor_id).await?)
     }
 
     /// Look up the owning `user_id` for an actor by id. Returns
@@ -3256,124 +3240,15 @@ impl ActorRepository {
     /// the dispatch on Err. Mirrors `apply_actor_to_engine`'s
     /// fail-closed contract for the same threat class.
     ///
-    /// Counts delegated to the public siblings `count_executions_last_hour`
-    /// and `count_total_executions` (L T4-6) so the inline path can't
-    /// drift from a future window-policy change.
+    /// **One pre-check (2026-09-18).** This method carried its own copy of
+    /// the pre-check — status SQL, a raw auto-suspend UPDATE, the hourly and
+    /// lifetime caps but not the token cap — and put the raw sqlx error text
+    /// into its `Err`, which `authorize_workflow_trigger` hands to MCP and
+    /// GraphQL callers verbatim. It now IS
+    /// [`crate::budget_precheck::check_execution_allowed`]: sanitised error
+    /// messages, the token cap, and the one suspend routine.
     pub async fn check_execution_allowed(&self, actor_id: Uuid) -> Result<(), String> {
-        // Check actor is active. Fail-closed on DB error: refuse to
-        // dispatch rather than risk a permissive default.
-        let status: Option<String> = sqlx::query_scalar("SELECT status FROM actors WHERE id = $1")
-            .bind(actor_id)
-            .fetch_optional(&self.db_pool)
-            .await
-            .map_err(|e| format!("budget enforcement: status lookup failed: {e}"))?;
-
-        match status.as_deref() {
-            None => return Err("Actor not found".to_string()),
-            Some("suspended") => {
-                return Err(
-                    "Actor is suspended. Resume it with update_actor_status before executing."
-                        .to_string(),
-                )
-            }
-            Some("terminated") => {
-                return Err("Actor is terminated and cannot execute workflows.".to_string())
-            }
-            _ => {}
-        }
-
-        // Check budget policy. Same fail-closed treatment.
-        let budget = sqlx::query(
-            "SELECT max_executions_per_hour, max_executions_total, on_budget_exceeded \
-             FROM actor_budget_policies WHERE actor_id = $1",
-        )
-        .bind(actor_id)
-        .fetch_optional(&self.db_pool)
-        .await
-        .map_err(|e| format!("budget enforcement: policy lookup failed: {e}"))?;
-
-        let Some(budget) = budget else {
-            return Ok(());
-        };
-
-        let on_exceeded = budget.get::<String, _>("on_budget_exceeded");
-
-        // Rolling 1-hour check via the public sibling.
-        if let Some(max_per_hour) = budget.get::<Option<i32>, _>("max_executions_per_hour") {
-            let count = self
-                .count_executions_last_hour(actor_id)
-                .await
-                .map_err(|e| format!("budget enforcement: 1h count lookup failed: {e}"))?;
-
-            if count >= max_per_hour as i64 {
-                if on_exceeded == "suspend" {
-                    // MCP-646: terminal-state guard for the auto-suspend
-                    // path too. An archived actor with a budget policy
-                    // would otherwise have its status clobbered from
-                    // 'archived' → 'suspended', breaking the IRREVERSIBLE
-                    // contract documented on archive_actor. Sibling fix
-                    // to the suspend_actor SQL above.
-                    if let Err(e) = sqlx::query(
-                        "UPDATE actors SET status = 'suspended', updated_at = now() \
-                         WHERE id = $1 AND status NOT IN ('archived', 'terminated')",
-                    )
-                    .bind(actor_id)
-                    .execute(&self.db_pool)
-                    .await
-                    {
-                        // Don't mask the budget-exceeded error if the
-                        // suspend itself fails — log + continue, since
-                        // the caller should still see the cap message
-                        // and refuse the dispatch.
-                        tracing::warn!(
-                            %actor_id,
-                            error = %e,
-                            "check_execution_allowed: auto-suspend failed (budget still enforced)"
-                        );
-                    }
-                }
-                talos_actor_budget_refusal::record_actor_budget_refusal(
-                    &self.db_pool,
-                    actor_id,
-                    talos_actor_budget_refusal::BudgetCap::PerHour,
-                    i64::from(max_per_hour),
-                    count,
-                    &on_exceeded,
-                )
-                .await;
-                return Err(format!(
-                    "Actor budget exceeded: {} executions in the last hour (limit: {}). \
-                     on_budget_exceeded={}",
-                    count, max_per_hour, on_exceeded
-                ));
-            }
-        }
-
-        // Total lifetime check via the public sibling.
-        if let Some(max_total) = budget.get::<Option<i64>, _>("max_executions_total") {
-            let count = self
-                .count_total_executions(actor_id)
-                .await
-                .map_err(|e| format!("budget enforcement: total count lookup failed: {e}"))?;
-
-            if count >= max_total {
-                talos_actor_budget_refusal::record_actor_budget_refusal(
-                    &self.db_pool,
-                    actor_id,
-                    talos_actor_budget_refusal::BudgetCap::Total,
-                    max_total,
-                    count,
-                    &on_exceeded,
-                )
-                .await;
-                return Err(format!(
-                    "Actor budget exceeded: {} total executions (limit: {}). Increase the budget with set_actor_budget.",
-                    count, max_total
-                ));
-            }
-        }
-
-        Ok(())
+        crate::budget_precheck::check_execution_allowed(&self.db_pool, actor_id).await
     }
 
     /// Return the max_capability_world for an actor, or None if actor not found.

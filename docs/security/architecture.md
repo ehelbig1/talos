@@ -391,7 +391,13 @@ handler's critical path. Until 2026-09-18 (package CK) only the first group ran
 it; the rest relied on a lock-free pre-check
 (`talos-actor-repository/src/budget_precheck.rs`) that never read the
 per-minute, fuel or token caps. Sub-workflow children run in-process, create no
-execution row, and are not counted.
+execution row, and are not counted. The lock-free pre-check still runs ahead of
+the admission as a fast fail and as the owner of the `suspend` side effect;
+there is exactly one (the trigger gate's former inline copy was removed on
+2026-09-18), and it reads the hourly, lifetime (live + archive) and 24-hour
+token counts through the same functions as the admission
+(`talos-actor-budget-refusal/src/admission.rs::lifetime_executions`), so the
+two cannot disagree about an actor.
 
 | Column | Purpose | Enforcement |
 |-------------|---------|-------------|
