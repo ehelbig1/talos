@@ -9,8 +9,8 @@ use uuid::Uuid;
 #[allow(unused_imports)]
 use crate::schema::types::*;
 use crate::schema::{
-    require_2fa, require_platform_admin, require_scope, validate_api_key_expires_in_days,
-    SafeErrorExtensions,
+    require_2fa, require_platform_admin, require_scope, require_second_factor,
+    validate_api_key_expires_in_days, SafeErrorExtensions,
 };
 // Removed unused imports: CompilationService, ParallelWorkflowEngine, encrypt_checkpoint
 
@@ -24,7 +24,7 @@ impl SecurityMutations {
         ctx: &Context<'_>,
         input: CreateApiKeyInput,
     ) -> Result<ApiKeyCreated> {
-        require_2fa(ctx)?;
+        require_second_factor(ctx).await?;
         require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
 
         let api_key_service = ctx.data::<Arc<talos_api_keys::ApiKeyService>>()?;
@@ -231,7 +231,7 @@ impl SecurityMutations {
     }
 
     async fn rotate_api_key(&self, ctx: &Context<'_>, key_id: Uuid) -> Result<ApiKeyCreated> {
-        require_2fa(ctx)?;
+        require_second_factor(ctx).await?;
         require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
 
         let api_key_service = ctx.data::<Arc<talos_api_keys::ApiKeyService>>()?;
@@ -298,7 +298,7 @@ impl SecurityMutations {
     }
 
     async fn rotate_dek(&self, ctx: &Context<'_>) -> Result<DekRotationResult> {
-        require_2fa(ctx)?;
+        require_second_factor(ctx).await?;
         require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
         // System-wide: rotates the DEK that protects every tenant's
         // secrets. require_scope(Admin) session-bypasses, so add the
@@ -332,7 +332,7 @@ impl SecurityMutations {
     /// under the retired key keep decrypting until the `reEncrypt…ToOrg` sweeps
     /// re-key them; `dekMigrationStatus` counts them as pending until then.
     async fn rotate_org_dek(&self, ctx: &Context<'_>, org_id: Uuid) -> Result<DekRotationResult> {
-        require_2fa(ctx)?;
+        require_second_factor(ctx).await?;
         require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
         // One tenant's key material, but the same authority as every other key
         // operation (package CE decision): a platform admin, never an org role.
@@ -364,7 +364,7 @@ impl SecurityMutations {
     }
 
     async fn re_encrypt_secrets(&self, ctx: &Context<'_>) -> Result<ReEncryptionResult> {
-        require_2fa(ctx)?;
+        require_second_factor(ctx).await?;
         require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
         // System-wide: re-encrypts every secret in the deployment.
         require_platform_admin(ctx).await?;
@@ -406,7 +406,7 @@ impl SecurityMutations {
     /// DEK retire for the secrets table. Personal/org-less secrets are
     /// intentionally left global.
     async fn re_encrypt_secrets_to_org(&self, ctx: &Context<'_>) -> Result<ReEncryptionResult> {
-        require_2fa(ctx)?;
+        require_second_factor(ctx).await?;
         require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
         // System-wide: migrates every org-scoped secret in the deployment.
         require_platform_admin(ctx).await?;
@@ -445,7 +445,7 @@ impl SecurityMutations {
     /// DEK. Memory sibling of `reEncryptSecretsToOrg`; rows whose actor has no
     /// org stay on the global DEK.
     async fn re_encrypt_memories_to_org(&self, ctx: &Context<'_>) -> Result<ReEncryptionResult> {
-        require_2fa(ctx)?;
+        require_second_factor(ctx).await?;
         require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
         // System-wide: migrates every org-scoped actor's memory in the deployment.
         require_platform_admin(ctx).await?;
@@ -484,7 +484,7 @@ impl SecurityMutations {
     /// `reEncryptMemoriesToOrg`; outputs whose workflow has no org stay on the
     /// global DEK.
     async fn re_encrypt_outputs_to_org(&self, ctx: &Context<'_>) -> Result<ReEncryptionResult> {
-        require_2fa(ctx)?;
+        require_second_factor(ctx).await?;
         require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
         // System-wide: migrates every org-scoped execution's output.
         require_platform_admin(ctx).await?;
@@ -519,7 +519,7 @@ impl SecurityMutations {
         &self,
         ctx: &Context<'_>,
     ) -> Result<ReEncryptionResult> {
-        require_2fa(ctx)?;
+        require_second_factor(ctx).await?;
         require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
         // System-wide: migrates every org-scoped module execution's payloads.
         require_platform_admin(ctx).await?;
@@ -558,7 +558,7 @@ impl SecurityMutations {
         ctx: &Context<'_>,
         new_master_key: String,
     ) -> Result<MasterKeyRotationResult> {
-        require_2fa(ctx)?;
+        require_second_factor(ctx).await?;
         require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
         // CRITICAL: re-encrypts every DEK in the system with the
         // caller-supplied master key. Without this gate any 2FA-verified
@@ -618,7 +618,7 @@ impl SecurityMutations {
     }
 
     async fn rotate_encryption_key(&self, ctx: &Context<'_>) -> Result<i32> {
-        require_2fa(ctx)?;
+        require_second_factor(ctx).await?;
         require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
         // System-wide: same blast radius as rotate_dek (legacy alias).
         require_platform_admin(ctx).await?;
@@ -709,7 +709,7 @@ impl SecurityMutations {
         otlp_protocol: Option<String>,
         auth_headers: Option<String>,
     ) -> Result<UserAuditSettings> {
-        require_2fa(ctx)?;
+        require_second_factor(ctx).await?;
         require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
         let user_id = ctx
             .data_opt::<Uuid>()
@@ -919,7 +919,9 @@ mod rotate_org_dek_gate_pins {
             .find(".rotate_dek_for_org(")
             .expect("the resolver rotates through the manager");
         for gate in [
-            "require_2fa(ctx)?",
+            // 2026-09-18: the privileged gate (a VERIFIED second factor), which
+            // subsumes `require_2fa`.
+            "require_second_factor(ctx).await?",
             "require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?",
             "require_platform_admin(ctx).await?",
         ] {

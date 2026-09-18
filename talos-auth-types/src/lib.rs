@@ -17,12 +17,12 @@ mod claims;
 mod org_role;
 mod scope;
 
-pub use claims::Claims;
+pub use claims::{Claims, SessionAuth};
 pub use org_role::OrgRole;
 pub use scope::ApiKeyScope;
 
 /// Glob-friendly re-export so `use talos_auth_types::prelude::*;`
 /// pulls in every type at once without bringing in the module names.
 pub mod prelude {
-    pub use super::{ApiKeyScope, Claims, OrgRole};
+    pub use super::{ApiKeyScope, Claims, OrgRole, SessionAuth};
 }

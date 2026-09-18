@@ -409,6 +409,11 @@ fi
 # needed here. 64 hex = 32 bytes, non-zero.
 CTRL_MASTER_KEY="00000000000000000000000000000000000000000000000000000000deadbeef"
 CTRL_TESTS=(
+    # Privileged operations (key material, credential minting, capability
+    # grants, audit settings, ownership transfer) require a VERIFIED second
+    # factor: the gate matrix through the real schema, login/refresh flags, and
+    # enrolment signing out every earlier session (2026-09-18).
+    "privileged_second_factor_tests"
     # The immutability triggers were BEFORE DELETE OR UPDATE ... FOR EACH ROW,
     # and TRUNCATE fires no row trigger: it emptied an audit table with nothing
     # raised. Drives TRUNCATE/DELETE/UPDATE against every immutable table on a

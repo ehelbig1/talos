@@ -6,7 +6,7 @@ use async_graphql::{Context, Result};
 // use tracing::info; // unused
 use uuid::Uuid;
 
-use super::super::{require_2fa, require_scope, SafeErrorExtensions};
+use super::super::{require_2fa, require_scope, require_second_factor, SafeErrorExtensions};
 #[allow(unused_imports)]
 use crate::schema::types::*;
 #[derive(Default)]
@@ -167,7 +167,7 @@ impl PlatformMutations {
         ctx: &Context<'_>,
         input: GrantCapabilityCeilingInput,
     ) -> Result<bool> {
-        require_2fa(ctx)?;
+        require_second_factor(ctx).await?;
         require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
         let granter_id = ctx
             .data_opt::<Uuid>()

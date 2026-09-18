@@ -4,7 +4,7 @@ use async_graphql::{Context, Object, Result};
 use uuid::Uuid;
 
 use crate::schema::types::*;
-use crate::schema::{require_2fa, require_scope, SafeErrorExtensions};
+use crate::schema::{require_2fa, require_scope, require_second_factor, SafeErrorExtensions};
 
 #[derive(Default)]
 pub struct OrganizationsMutations;
@@ -271,7 +271,7 @@ impl OrganizationsMutations {
         org_id: Uuid,
         new_owner_id: Uuid,
     ) -> Result<OrganizationObj> {
-        require_2fa(ctx)?;
+        require_second_factor(ctx).await?;
         // 2026-09-10: organization membership and ownership are ADMIN-scope
         // operations for an API key. `require_2fa` alone passed every scoped key,
         // because API-key requests inject `IsTwoFactorVerified(true)` by

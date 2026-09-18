@@ -253,7 +253,7 @@ impl std::fmt::Debug for User {
 ///
 /// Pure-data struct lives in `talos-auth-types`; re-exported here so
 /// the existing `crate::auth::Claims` import path continues to work.
-pub use talos_auth_types::Claims;
+pub use talos_auth_types::{Claims, SessionAuth};
 
 /// Canonical email-format validator. Public so siblings (talos-api,
 /// callers of `talos-mcp-handlers`) can share one source of truth
@@ -621,6 +621,7 @@ pub fn jwt_selftest() -> JwtSelfTest {
         exp: (now + Duration::seconds(60)).timestamp() as usize,
         iat: now.timestamp() as usize,
         is_2fa_verified: false,
+        second_factor_verified: false,
         iss: "talos".to_string(),
         aud: Some("talos".to_string()),
         org: String::new(),
@@ -1262,17 +1263,16 @@ impl AuthService {
         .execute(&self.db_pool)
         .await?;
 
-        // Determine initial 2FA verification status
-        // If TOTP is enabled, the user is NOT yet 2FA verified upon initial login
-        let is_2fa_verified = !user.totp_enabled.unwrap_or(false);
+        // A password login proves no second factor: with TOTP enrolled the
+        // session is pending until the code is verified; without it the
+        // session is password-only (never `SecondFactorVerified`).
+        let auth = SessionAuth::at_login(user.totp_enabled.unwrap_or(false));
 
         // Generate access token (short-lived: 15 minutes)
-        let access_token = self.generate_access_token(&user, is_2fa_verified)?;
+        let access_token = self.generate_access_token(&user, auth)?;
 
         // Generate refresh token (long-lived: 7 days)
-        let refresh_token = self
-            .generate_refresh_token(user.id, is_2fa_verified)
-            .await?;
+        let refresh_token = self.generate_refresh_token(user.id, auth).await?;
 
         // Log successful login
         self.log_auth_event_best_effort(
@@ -1291,7 +1291,7 @@ impl AuthService {
 
     /// Generate access token for a user (short-lived: 15 minutes)
     #[must_use]
-    pub fn generate_access_token(&self, user: &User, is_2fa_verified: bool) -> Result<String> {
+    pub fn generate_access_token(&self, user: &User, auth: SessionAuth) -> Result<String> {
         let now = Utc::now();
         let expiration = now + Duration::minutes(15); // Short-lived access token
 
@@ -1300,7 +1300,8 @@ impl AuthService {
             email: user.email.clone(),
             exp: expiration.timestamp() as usize,
             iat: now.timestamp() as usize,
-            is_2fa_verified,
+            is_2fa_verified: auth.is_2fa_verified(),
+            second_factor_verified: auth.second_factor_verified(),
             iss: "talos".to_string(),
             aud: Some("talos".to_string()),
             // RFC 0004: left empty here (this minting path is sync / has
@@ -1324,11 +1325,7 @@ impl AuthService {
 
     /// Generate refresh token and store in database (long-lived: 7 days)
     #[must_use]
-    pub async fn generate_refresh_token(
-        &self,
-        user_id: Uuid,
-        is_2fa_verified: bool,
-    ) -> Result<String> {
+    pub async fn generate_refresh_token(&self, user_id: Uuid, auth: SessionAuth) -> Result<String> {
         // Generate token and lookup hash before any async operations
         let (refresh_token, lookup_hash, expires_at) = {
             // Generate cryptographically secure random token (32 bytes = 256 bits).
@@ -1358,14 +1355,15 @@ impl AuthService {
 
         // Store in database with lookup hash for efficient queries
         sqlx::query(
-            "INSERT INTO user_sessions (user_id, refresh_token_hash, refresh_token_lookup_hash, expires_at, is_2fa_verified)
-             VALUES ($1, $2, $3, $4, $5)"
+            "INSERT INTO user_sessions (user_id, refresh_token_hash, refresh_token_lookup_hash, expires_at, is_2fa_verified, second_factor_verified)
+             VALUES ($1, $2, $3, $4, $5, $6)"
         )
         .bind(user_id)
         .bind(&token_hash)
         .bind(&lookup_hash)
         .bind(expires_at)
-        .bind(is_2fa_verified)
+        .bind(auth.is_2fa_verified())
+        .bind(auth.second_factor_verified())
         .execute(&self.db_pool)
         .await
         .context("Failed to store refresh token")?;
@@ -1392,9 +1390,10 @@ impl AuthService {
 
         // Find session by lookup hash (much faster than fetching all sessions)
         // Note: lookup_hash column may be NULL for old sessions created before this optimization
-        let session = sqlx::query_as::<_, (Uuid, Uuid, String, DateTime<Utc>, bool)>(
+        let session = sqlx::query_as::<_, (Uuid, Uuid, String, DateTime<Utc>, bool, bool)>(
             r#"
-            SELECT id, user_id, refresh_token_hash, expires_at, is_2fa_verified
+            SELECT id, user_id, refresh_token_hash, expires_at, is_2fa_verified,
+                   second_factor_verified
             FROM user_sessions
             WHERE refresh_token_lookup_hash = $1
               AND expires_at > NOW()
@@ -1569,7 +1568,10 @@ impl AuthService {
         }
 
         // Destructure session tuple for clarity
-        let (session_id, user_id, _token_hash, _expires_at, is_2fa_verified) = session;
+        let (session_id, user_id, _token_hash, _expires_at, is_2fa_verified, second_factor) =
+            session;
+        // The rotated session carries forward exactly what the old one proved.
+        let auth = SessionAuth::from_flags(is_2fa_verified, second_factor);
 
         // Get user
         let user = self.get_user(user_id).await?;
@@ -1590,7 +1592,7 @@ impl AuthService {
         }
 
         // Generate new access token
-        let access_token = self.generate_access_token(&user, is_2fa_verified)?;
+        let access_token = self.generate_access_token(&user, auth)?;
 
         // Rotate the refresh token: issue a new one, then delete the old session.
         //
@@ -1599,9 +1601,7 @@ impl AuthService {
         // If the delete fails after a successful insert, the user will have two valid
         // sessions briefly — acceptable since the old token expires within 7 days and
         // the lookup-hash fast path prevents O(N·bcrypt) scanning of stale rows.
-        let new_refresh_token = self
-            .generate_refresh_token(user.id, is_2fa_verified)
-            .await?;
+        let new_refresh_token = self.generate_refresh_token(user.id, auth).await?;
 
         // Record this lookup_hash in the rotated_session_audit table so a
         // future refresh attempt with the (now-stale) original token can be

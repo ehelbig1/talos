@@ -161,7 +161,9 @@ async fn test_lockout_constants() {
 
     // Service should generate valid tokens for a test user
     let user = test_user();
-    let token = service.generate_access_token(&user, false).unwrap();
+    let token = service
+        .generate_access_token(&user, SessionAuth::PendingSecondFactor)
+        .unwrap();
     let claims = service.verify_token(&token).unwrap();
 
     // Token should expire in the future (15 min from now)
@@ -260,7 +262,9 @@ async fn test_generate_access_token_claims() {
         totp_enabled: None,
     };
 
-    let token = service.generate_access_token(&user, false).unwrap();
+    let token = service
+        .generate_access_token(&user, SessionAuth::PendingSecondFactor)
+        .unwrap();
     assert!(!token.is_empty());
 }
 
@@ -294,7 +298,9 @@ async fn test_verify_token_invalid_secret() {
         totp_enabled: None,
     };
 
-    let token = service1.generate_access_token(&user, false).unwrap();
+    let token = service1
+        .generate_access_token(&user, SessionAuth::PendingSecondFactor)
+        .unwrap();
     let result = service2.verify_token(&token);
     assert!(
         result.is_err(),
@@ -410,7 +416,9 @@ fn test_service() -> AuthService {
 async fn test_jwt_audience_present_in_new_tokens() {
     let service = test_service();
     let user = test_user();
-    let token = service.generate_access_token(&user, false).unwrap();
+    let token = service
+        .generate_access_token(&user, SessionAuth::PendingSecondFactor)
+        .unwrap();
     let claims = service.verify_token(&token).unwrap();
     assert_eq!(
         claims.aud.as_deref(),
@@ -432,6 +440,7 @@ async fn test_jwt_wrong_audience_rejected() {
         exp: (now + Duration::minutes(15)).timestamp() as usize,
         iat: now.timestamp() as usize,
         is_2fa_verified: false,
+        second_factor_verified: false,
         iss: "talos".to_string(),
         aud: Some("evil-service".to_string()),
         org: String::new(),
@@ -460,6 +469,7 @@ async fn test_jwt_missing_audience_accepted_for_migration() {
         exp: (now + Duration::minutes(15)).timestamp() as usize,
         iat: now.timestamp() as usize,
         is_2fa_verified: false,
+        second_factor_verified: false,
         iss: "talos".to_string(),
         aud: None,
         org: String::new(),
