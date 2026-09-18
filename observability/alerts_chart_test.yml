@@ -4540,6 +4540,114 @@ tests:
         exp_alerts: []
 
   # ══════════════════════════════════════════════════════════════════════
+  # TalosGooglePushSilent — pushes in the last 7 d, none in the last 12 h.
+  # gmail: pushes every 10 m, a controller restart (counter reset) at 12 h,
+  # pushes again until 24h10m, then silence. gcp: never used.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 10m
+    name: push silence — active stream quiet, reset quiet, stop fires, never-used quiet
+    input_series:
+      - series: 'talos_google_push_accepted_total{job="talos-controller",instance="c:8000",integration="gmail"}'
+        values: "0+1x72 0+1x72 72+0x1300"
+      - series: 'talos_google_push_accepted_total{job="talos-controller",instance="c:8000",integration="gcp"}'
+        values: "0+0x1446"
+    alert_rule_test:
+      # Active stream, and just after the reset: quiet.
+      - eval_time: 13h
+        alertname: TalosGooglePushSilent
+        exp_alerts: []
+      - eval_time: 20h
+        alertname: TalosGooglePushSilent
+        exp_alerts: []
+      # Last push at 24h10m: under 12 h of silence is still quiet.
+      - eval_time: 36h
+        alertname: TalosGooglePushSilent
+        exp_alerts: []
+      # 12 h of silence from 36h20m: fires for gmail only, never for gcp.
+      - eval_time: 36h40m
+        alertname: TalosGooglePushSilent
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: integrations
+              integration: gmail
+            exp_annotations:
+              summary: "gmail push deliveries have stopped arriving"
+              description: |
+                No authenticated gmail Pub/Sub push has reached
+                the controller in 12 hours, although pushes arrived within the last
+                7 days. Workflows triggered by these pushes are not running.
+
+                A push that is never sent is never refused, so
+                talos_google_push_refusals_total stays at 0: the likely causes sit
+                outside the controller — the push subscription was deleted or
+                detached, its push endpoint no longer reaches this deployment, or
+                the publisher lost its grant on the topic.
+              action: |
+                1. `gcloud pubsub topics list-subscriptions <topic>` for the
+                   integration's topic: a push subscription must exist, and
+                   `gcloud pubsub subscriptions describe` must show the push
+                   endpoint and state ACTIVE. The CreateSubscription entry in the
+                   project's Cloud Audit Logs holds the original configuration.
+                2. `get_public_url_status`: the endpoint's public origin must be
+                   the one the subscription pushes to.
+                3. Gmail: `list_push_channels` — the watch must not be expired
+                   (the hourly renewal task renews it).
+                4. A mailbox or project that is genuinely idle for 12 hours also
+                   fires this; silence it for that integration if so.
+      # Four days in, still firing (the 2026-09-14 outage's length).
+      - eval_time: 120h
+        alertname: TalosGooglePushSilent
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: integrations
+              integration: gmail
+            exp_annotations:
+              summary: "gmail push deliveries have stopped arriving"
+              description: |
+                No authenticated gmail Pub/Sub push has reached
+                the controller in 12 hours, although pushes arrived within the last
+                7 days. Workflows triggered by these pushes are not running.
+
+                A push that is never sent is never refused, so
+                talos_google_push_refusals_total stays at 0: the likely causes sit
+                outside the controller — the push subscription was deleted or
+                detached, its push endpoint no longer reaches this deployment, or
+                the publisher lost its grant on the topic.
+              action: |
+                1. `gcloud pubsub topics list-subscriptions <topic>` for the
+                   integration's topic: a push subscription must exist, and
+                   `gcloud pubsub subscriptions describe` must show the push
+                   endpoint and state ACTIVE. The CreateSubscription entry in the
+                   project's Cloud Audit Logs holds the original configuration.
+                2. `get_public_url_status`: the endpoint's public origin must be
+                   the one the subscription pushes to.
+                3. Gmail: `list_push_channels` — the watch must not be expired
+                   (the hourly renewal task renews it).
+                4. A mailbox or project that is genuinely idle for 12 hours also
+                   fires this; silence it for that integration if so.
+      # Stated limit: after 7 days of total silence the look-back empties.
+      - eval_time: 194h
+        alertname: TalosGooglePushSilent
+        exp_alerts: []
+
+  # Two controller replicas share one push stream; replica c2 stops
+  # receiving pushes while c1 keeps going. The integration is NOT silent, so
+  # the per-integration sum must stay quiet — a per-instance rule would fire.
+  - interval: 10m
+    name: push silence — one replica quiet while another receives stays quiet
+    input_series:
+      - series: 'talos_google_push_accepted_total{job="talos-controller",instance="c1:8000",integration="gmail"}'
+        values: "0+1x300"
+      - series: 'talos_google_push_accepted_total{job="talos-controller",instance="c2:8000",integration="gmail"}'
+        values: "0+1x50 50+0x250"
+    alert_rule_test:
+      - eval_time: 48h
+        alertname: TalosGooglePushSilent
+        exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
   # TalosVaultTokenRenewalFailing — the window is derived from the renewal
   # cadence (immediately at boot, then at most hourly): a healthy token has a
   # success in every two-hour window, so a failure burst that a later hourly

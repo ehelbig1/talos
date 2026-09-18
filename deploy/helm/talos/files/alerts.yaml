@@ -2672,6 +2672,57 @@ groups:
                `talos_google_push_refusals_total{reason="unknown_key"}` stop
                climbing.
 
+      # A push stream that STOPS refuses nothing, so the refusal counter above
+      # cannot see it. On 2026-09-14 both Pub/Sub subscriptions on the Gmail
+      # push topic were deleted; pushes simply stopped, the push-driven
+      # workflow stopped running, and nothing said so for four days.
+      #
+      # The rule selects its own population: an integration that received an
+      # authenticated push in the last 7 days and none in the last 12 hours.
+      # A deployment that never uses Gmail or GCP push has no activity in the
+      # look-back and stays quiet — no watch gauge needed. 12 h is derived:
+      # on the reference deployment the gap between pushes had p50 11 min and
+      # p99 57 min (4 103 pushes, 2026-08-05..09-14); the longest gaps that
+      # were not host suspends were 4.2 h and 3.0 h. A suspended host stops
+      # Prometheus too, and Pub/Sub redelivers the backlog on resume.
+      # Summed per integration so one replica that happened to receive none
+      # does not fire. STATED LIMIT: after 7 days of total silence the
+      # look-back empties and the alert clears.
+      - alert: TalosGooglePushSilent
+        expr: |
+          sum by (integration) (increase(talos_google_push_accepted_total[7d])) > 0
+          and
+          sum by (integration) (increase(talos_google_push_accepted_total[12h])) == 0
+        # No hold: the 12 h window is the smoothing; a `for` would only delay.
+        for: 0m
+        labels:
+          severity: warning
+          category: integrations
+        annotations:
+          summary: "{{ $labels.integration }} push deliveries have stopped arriving"
+          description: |
+            No authenticated {{ $labels.integration }} Pub/Sub push has reached
+            the controller in 12 hours, although pushes arrived within the last
+            7 days. Workflows triggered by these pushes are not running.
+
+            A push that is never sent is never refused, so
+            talos_google_push_refusals_total stays at 0: the likely causes sit
+            outside the controller — the push subscription was deleted or
+            detached, its push endpoint no longer reaches this deployment, or
+            the publisher lost its grant on the topic.
+          action: |
+            1. `gcloud pubsub topics list-subscriptions <topic>` for the
+               integration's topic: a push subscription must exist, and
+               `gcloud pubsub subscriptions describe` must show the push
+               endpoint and state ACTIVE. The CreateSubscription entry in the
+               project's Cloud Audit Logs holds the original configuration.
+            2. `get_public_url_status`: the endpoint's public origin must be
+               the one the subscription pushes to.
+            3. Gmail: `list_push_channels` — the watch must not be expired
+               (the hourly renewal task renews it).
+            4. A mailbox or project that is genuinely idle for 12 hours also
+               fires this; silence it for that integration if so.
+
   # ────────────────────────────────────────────────────────────────────
   - name: talos.vault
     interval: 30s

@@ -135,6 +135,16 @@ pub fn record_push_refusal(integration: PushIntegration, reason: PushRefusalReas
     talos_metrics::record_google_push_refusal(integration, reason);
 }
 
+/// Count one push that PASSED authentication. The positive twin of
+/// [`record_push_refusal`]: a push stream that stops refuses nothing, so only
+/// this count can say it went quiet (`TalosGooglePushSilent`). Each
+/// integration records it at the one point its authentication completes —
+/// Gmail inside `PubsubJwtVerifier::verify`, GCP after its per-watch
+/// service-account check.
+pub fn record_push_accepted(integration: PushIntegration) {
+    talos_metrics::record_google_push_accepted(integration);
+}
+
 /// Count a push that arrived with no `Authorization: Bearer` header.
 pub fn record_missing_bearer(integration: PushIntegration) {
     record_push_refusal(integration, PushRefusalReason::MissingBearer);
@@ -840,6 +850,56 @@ mod tests {
         }
         // GCP's service-account step is a refusal too, counted where it is logged.
         assert!(gcp.contains("record_push_refusal(PushIntegration::Gcp, e.refusal_reason())"));
+    }
+
+    /// SOURCE PIN, stated as textual: each integration counts an ACCEPTED
+    /// push exactly once, at the point its authentication completes — Gmail
+    /// after `require_service_account` inside `PubsubJwtVerifier::verify`,
+    /// GCP after its per-watch `require_service_account` and before the
+    /// envelope is decoded. Gmail's placement is also driven behaviourally
+    /// (`talos-gmail` pubsub_jwt tests); GCP's positive path needs a persisted
+    /// watch row, so this pin is its only guard there.
+    #[test]
+    fn both_integrations_count_an_accepted_push_where_authentication_completes() {
+        let gmail = include_str!("../../talos-gmail/src/pubsub_jwt.rs");
+        let gcp = include_str!("../../talos-google-cloud/src/handlers.rs");
+        let body = |src: &'static str, start: &str, end: &str| -> &'static str {
+            let a = src.find(start).expect("start anchor");
+            let b = a + src[a..].find(end).expect("end anchor");
+            &src[a..b]
+        };
+        let gmail_verify = body(gmail, "pub async fn verify(", "pub fn report_refusal(");
+        let gcp_handler = body(gcp, "pub async fn pubsub_push_handler(", "#[cfg(test)]");
+        for (name, region, accept, after) in [
+            (
+                "gmail",
+                gmail_verify,
+                "PushIntegration::Gmail,\n        );",
+                "claims.require_service_account(&self.expected_email)?;",
+            ),
+            (
+                "gcp",
+                gcp_handler,
+                "record_push_accepted(PushIntegration::Gcp);",
+                "claims.require_service_account(&row.expected_sa_email)",
+            ),
+        ] {
+            let at = region
+                .find(accept)
+                .unwrap_or_else(|| panic!("{name}: no accepted-push count"));
+            assert_eq!(
+                region.matches("record_push_accepted(").count(),
+                1,
+                "{name}: counted exactly once"
+            );
+            let auth = region.find(after).expect("authentication step");
+            assert!(at > auth, "{name}: counted before authentication completes");
+        }
+        let decode = gcp_handler
+            .find("let env: PubsubPushEnvelope")
+            .expect("decode");
+        let at = gcp_handler.find("record_push_accepted(").unwrap();
+        assert!(at < decode, "gcp: counted before the envelope is decoded (a malformed body is still an authenticated delivery)");
     }
 
     #[tokio::test]

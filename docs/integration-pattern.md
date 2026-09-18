@@ -658,6 +658,16 @@ calls `report_refusal` on its verify failure and `record_missing_bearer`
 on a missing header — never its own per-push `warn!`; the helpers crate's
 source pin checks both handlers for exactly that.
 
+The refusal counter cannot see a stream that STOPS: a push that is never
+sent is never refused. On 2026-09-14 both Pub/Sub subscriptions on the Gmail
+push topic were deleted and the push-driven workflow stopped for four days
+with nothing saying so. So an integration also calls `record_push_accepted`
+exactly once, at the point its authentication completes (Gmail inside
+`PubsubJwtVerifier::verify`, GCP after its per-watch service-account check),
+moving `talos_google_push_accepted_total{integration}`; `TalosGooglePushSilent`
+fires when an integration that received pushes in the last 7 days has
+received none in 12 hours.
+
 ### Double-submit on Create (`7018372`)
 
 Disable the Create button until the post-create list refetch
