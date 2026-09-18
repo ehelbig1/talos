@@ -148,8 +148,10 @@ not the whole deployment.** Decrypt is identical for v3/v4 (the row's `*_key_id`
 names the DEK); a per-row `*_format` column selects the scheme and
 `SecretsManager::decrypt_versioned` handles v0/v1/v2/v3/v4 under lazy migration.
 Existing rows move to per-org via `re_encrypt_*_to_org` sweeps, which also re-key
-rows under an org DEK retired by `rotateOrgDek`; the `dekMigrationStatus` query
-reports remaining work. OTLP auth headers use this
+rows under an org DEK retired by `rotateOrgDek`; the execution-output sweep covers
+both `workflow_executions` and `workflow_executions_archive` (the retention move
+carries an output's ciphertext and key id into the archive unchanged). The
+`dekMigrationStatus` query reports remaining work, with the archive as its own row. OTLP auth headers use this
 same DEK envelope (with a domain-tagged `user_id` AAD,
 `talos-audit-ledger/src/lib.rs::encrypt_otlp_auth_headers`). Checkpoint
 encryption and the default worker secret envelope do not use the DEK: they

@@ -474,3 +474,242 @@ async fn orgless_workflow_output_stays_v3_global_from_every_writer() {
         "…under the GLOBAL DEK"
     );
 }
+
+// ── The archive tier (2026-09-18) ───────────────────────────────────────────
+//
+// The retention sweep MOVES a terminal execution into
+// `workflow_executions_archive` with its ciphertext, key id and format
+// unchanged. The per-org output sweep and `dek_migration_status` read the LIVE
+// table only, so an archived output stayed on the global DEK (or an org DEK
+// `rotateOrgDek` had retired) and the status called the work done. Both now
+// cover the archive; these tests archive through the production move.
+
+/// Seal `value` as a pre-cutover v3 GLOBAL output on `exec`, terminal and
+/// completed two days ago so a one-day archival moves it.
+async fn make_terminal_v3_global_output(
+    pool: &sqlx::PgPool,
+    sm: &controller::secrets::SecretsManager,
+    exec: Uuid,
+    value: &serde_json::Value,
+) -> Uuid {
+    let (kid, ct, ver) = sm
+        .encrypt_value_aad_v3(&serde_json::to_string(value).unwrap(), exec.as_bytes())
+        .await
+        .unwrap();
+    assert_eq!(ver, 3);
+    sqlx::query(
+        "UPDATE workflow_executions SET output_data = NULL, output_data_enc = $1, \
+         output_enc_key_id = $2, output_data_format = 3, status = 'completed', \
+         completed_at = NOW() - INTERVAL '2 days' WHERE id = $3",
+    )
+    .bind(ct.as_slice())
+    .bind(kid)
+    .bind(exec)
+    .execute(pool)
+    .await
+    .unwrap();
+    kid
+}
+
+async fn archived_output_key(pool: &sqlx::PgPool, exec: Uuid) -> (i16, Uuid) {
+    sqlx::query_as(
+        "SELECT output_data_format, output_enc_key_id FROM workflow_executions_archive WHERE id=$1",
+    )
+    .bind(exec)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn archive_output_pending(sm: &controller::secrets::SecretsManager) -> i64 {
+    sm.dek_migration_status()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|e| e.table == "workflow_executions_archive.output")
+        .map(|e| e.pending)
+        .expect("dek_migration_status must report the archive tier")
+}
+
+#[tokio::test]
+async fn archived_outputs_are_counted_and_re_keyed_onto_the_org_dek() {
+    let (user, org, exec, sm, pool) = seed_running_execution("archsweep").await;
+    let output = serde_json::json!({ "result": "archived-legacy-output" });
+    let global_kid = make_terminal_v3_global_output(&pool, &sm, exec, &output).await;
+
+    // Archive it through the production retention move.
+    let moved = talos_advanced_repository::AdvancedRepository::new(pool.clone())
+        .archive_executions(1, user)
+        .await
+        .unwrap();
+    assert_eq!(moved, 1, "the terminal row must move into the archive");
+    assert_eq!(
+        archived_output_key(&pool, exec).await,
+        (3, global_kid),
+        "the move carries the ciphertext and its global key unchanged"
+    );
+
+    // Counted as pending on the archive tier.
+    let before = archive_output_pending(&sm).await;
+    assert!(before >= 1, "an archived global-DEK output is pending");
+
+    let repo =
+        talos_execution_repository::ExecutionRepository::with_encryption(pool.clone(), sm.clone());
+    let stats = repo.re_encrypt_outputs_to_org().await.unwrap();
+    assert_eq!(stats.failed, 0);
+    assert!(
+        stats.archive_re_encrypted >= 1,
+        "the archived row is reported as re-keyed from the archive"
+    );
+
+    // v4 under the WORKFLOW's org DEK — the org the page selected, not a
+    // live-row lookup (an archived row has none and would re-seal globally).
+    let org_dek = sm.get_active_dek_for_org(org).await.unwrap().unwrap();
+    assert_eq!(archived_output_key(&pool, exec).await, (4, org_dek.id));
+    assert_eq!(
+        archive_output_pending(&sm).await,
+        before - 1,
+        "the status count drops by exactly the re-keyed row"
+    );
+
+    // Reads back through the archive read path.
+    match repo.lookup_execution(exec, user).await.unwrap() {
+        talos_execution_repository::ExecutionLookup::Archived { row, .. } => {
+            assert_eq!(row.output_data, Some(output.clone()), "value survives");
+        }
+        other => panic!("execution must be Archived, got {other:?}"),
+    }
+
+    // A rotated org DEK leaves the archived row pending again; the sweep moves
+    // it onto the new active key.
+    let new_key = sm
+        .rotate_dek_for_org(org, None)
+        .await
+        .unwrap()
+        .expect("the org exists");
+    assert!(archive_output_pending(&sm).await >= 1);
+    let stats = repo.re_encrypt_outputs_to_org().await.unwrap();
+    assert_eq!(stats.failed, 0);
+    assert_eq!(archived_output_key(&pool, exec).await, (4, new_key));
+    match repo.lookup_execution(exec, user).await.unwrap() {
+        talos_execution_repository::ExecutionLookup::Archived { row, .. } => {
+            assert_eq!(row.output_data, Some(output), "value survives the re-key");
+        }
+        other => panic!("execution must be Archived, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn output_sweep_pages_past_one_page_and_steps_over_an_unreadable_row() {
+    let (user, org, first, sm, pool) = seed_running_execution("pagesweep").await;
+    let (wf, actor): (Uuid, Uuid) =
+        sqlx::query_as("SELECT workflow_id, actor_id FROM workflow_executions WHERE id = $1")
+            .bind(first)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    // One more pending row than a page holds.
+    let n = talos_execution_repository::OUTPUT_SWEEP_PAGE as usize + 1;
+    let mut execs = vec![first];
+    for _ in 1..n {
+        let e = Uuid::new_v4();
+        insert_running_execution(&pool, e, wf, user, actor).await;
+        execs.push(e);
+    }
+    for e in &execs {
+        make_terminal_v3_global_output(&pool, &sm, *e, &serde_json::json!({ "n": e.to_string() }))
+            .await;
+    }
+    // And a FULL PAGE of rows whose ciphertext cannot be opened. Each must be
+    // counted as failed and stepped over: with fewer than a page of them the
+    // keyset cursor is not load-bearing (the loop ends on a short page anyway),
+    // so only a full page proves the sweep cannot re-read the same rows forever.
+    let mut bad = Vec::new();
+    let mut global_kid = Uuid::nil();
+    for _ in 0..talos_execution_repository::OUTPUT_SWEEP_PAGE {
+        let b = Uuid::new_v4();
+        insert_running_execution(&pool, b, wf, user, actor).await;
+        global_kid = make_terminal_v3_global_output(&pool, &sm, b, &serde_json::json!({})).await;
+        bad.push(b);
+    }
+    sqlx::query(
+        "UPDATE workflow_executions SET output_data_enc = '\\x00ff'::bytea WHERE id = ANY($1)",
+    )
+    .bind(&bad)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // The sweep runs on its OWN thread, runtime, pool and SecretsManager. A
+    // sweep that re-reads the same unreadable page forever must FAIL this test
+    // rather than hang the binary: a timeout inside the test's runtime cannot
+    // guarantee that, because dropping the runtime waits for the stuck task.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let opts = (*pool.connect_options()).clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt.block_on(async move {
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(2)
+                .connect_with(opts)
+                .await?;
+            let sm = Arc::new(controller::secrets::SecretsManager::new(pool.clone())?);
+            sm.initialize().await?;
+            talos_execution_repository::ExecutionRepository::with_encryption(pool, sm)
+                .re_encrypt_outputs_to_org()
+                .await
+        });
+        let _ = tx.send(result);
+    });
+    let outcome =
+        tokio::task::spawn_blocking(move || rx.recv_timeout(std::time::Duration::from_secs(60)))
+            .await
+            .unwrap();
+    // Record the unreadable rows' state NOW, then delete them BEFORE asserting:
+    // the binary's tests share one database and every other test runs a
+    // whole-table sweep, so a page of unreadable rows left behind by a failure
+    // here would make those sweeps fail (or, under a cursor regression, spin)
+    // instead of this test reporting the one defect.
+    let untouched: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM workflow_executions \
+         WHERE id = ANY($1) AND output_data_format = 3 AND output_enc_key_id = $2",
+    )
+    .bind(&bad)
+    .bind(global_kid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM workflow_executions WHERE id = ANY($1)")
+        .bind(&bad)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let stats = outcome.expect("the sweep must terminate").unwrap();
+    assert!(stats.re_encrypted >= n as u64, "every page is swept");
+    assert!(
+        stats.failed >= bad.len() as u64,
+        "every unreadable row is reported as failed"
+    );
+    assert_eq!(
+        untouched,
+        bad.len() as i64,
+        "rows that cannot be opened are left as they were"
+    );
+
+    let org_dek = sm.get_active_dek_for_org(org).await.unwrap().unwrap();
+    let left: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM workflow_executions \
+         WHERE id = ANY($1) AND (output_data_format <> 4 OR output_enc_key_id <> $2)",
+    )
+    .bind(&execs)
+    .bind(org_dek.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(left, 0, "no row past the first page is left behind");
+}

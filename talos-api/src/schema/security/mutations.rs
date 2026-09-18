@@ -479,7 +479,8 @@ impl SecurityMutations {
 
     /// Per-org DEK arc: move existing encrypted execution outputs onto their
     /// workflow's org's ACTIVE root DEK (format v4), including outputs under a
-    /// retired org DEK. Execution-output sibling of `reEncryptSecretsToOrg` /
+    /// retired org DEK, in both the live table and the retention archive.
+    /// Execution-output sibling of `reEncryptSecretsToOrg` /
     /// `reEncryptMemoriesToOrg`; outputs whose workflow has no org stay on the
     /// global DEK.
     async fn re_encrypt_outputs_to_org(&self, ctx: &Context<'_>) -> Result<ReEncryptionResult> {
@@ -500,17 +501,7 @@ impl SecurityMutations {
                 .extend_safe()
         })?;
 
-        let message = if stats.failed == 0 {
-            format!(
-                "{} execution outputs migrated to per-org DEKs",
-                stats.re_encrypted
-            )
-        } else {
-            format!(
-                "{} migrated, {} failed (still on the prior DEK). Inspect server logs and re-run.",
-                stats.re_encrypted, stats.failed
-            )
-        };
+        let message = output_sweep_message(&stats);
         Ok(ReEncryptionResult {
             re_encrypted_count: stats.re_encrypted,
             failed_count: stats.failed,
@@ -889,6 +880,24 @@ impl SecurityMutations {
 /// reading the resolver's own source. It proves the three gates are CALLED
 /// before the rotation and that a missing org is answered as not found; it
 /// cannot prove a differently spelled bypass is absent.
+/// The operator reply for `reEncryptOutputsToOrg`. Names how many of the
+/// re-keyed outputs were ARCHIVED ones, because those are the rows no sweep
+/// reached before the archive tier was covered.
+fn output_sweep_message(stats: &talos_execution_repository::OutputReEncryptStats) -> String {
+    let migrated = format!(
+        "{} execution outputs migrated to per-org DEKs ({} of them archived)",
+        stats.re_encrypted, stats.archive_re_encrypted
+    );
+    if stats.failed == 0 {
+        migrated
+    } else {
+        format!(
+            "{migrated}; {} failed (still on the prior DEK). Inspect server logs and re-run.",
+            stats.failed
+        )
+    }
+}
+
 #[cfg(test)]
 mod rotate_org_dek_gate_pins {
     fn resolver_body() -> &'static str {
@@ -924,6 +933,30 @@ mod rotate_org_dek_gate_pins {
                 "Ok(None) => Err(async_graphql::Error::new(\"Organization not found\").extend_safe())"
             ),
             "a missing organization must be answered as not found"
+        );
+    }
+}
+
+#[cfg(test)]
+mod output_sweep_message_tests {
+    use super::output_sweep_message;
+
+    #[test]
+    fn output_sweep_message_names_the_archived_share_and_failures() {
+        let clean = talos_execution_repository::OutputReEncryptStats {
+            re_encrypted: 7,
+            failed: 0,
+            archive_re_encrypted: 3,
+        };
+        assert_eq!(
+            output_sweep_message(&clean),
+            "7 execution outputs migrated to per-org DEKs (3 of them archived)"
+        );
+        let partial = talos_execution_repository::OutputReEncryptStats { failed: 2, ..clean };
+        assert_eq!(
+            output_sweep_message(&partial),
+            "7 execution outputs migrated to per-org DEKs (3 of them archived); 2 failed \
+             (still on the prior DEK). Inspect server logs and re-run."
         );
     }
 }
