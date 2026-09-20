@@ -819,6 +819,13 @@ CTRL_TESTS=(
     # gets wrong), a lapsed lease is taken over in place, sixteen concurrent
     # claims yield one holder, and an unreadable lease is not a claim.
     "background_lease_tests"
+    # Google Calendar watch create / renew with two controller replicas
+    # (2026-09-20). `events.watch` mints a new Google-side channel per call, so
+    # the count a fake Google sees IS the defect: two services on two pools of
+    # one database must register once on create and once on renew, the loser is
+    # handed the winner's channel, and a renewal that waited must not act on
+    # the row it read before waiting. Also drives `acquire_fleet` directly.
+    "gcal_watch_fleet_lock_tests"
     # The `__memory_write__` write-ceiling gate (#750). Needs a real Postgres
     # because the property under test is "no actor_memory ROW" — the thing a
     # silent drop and a correct refusal both produce, distinguished only by the

@@ -272,6 +272,20 @@ for gmail: `(user, integ)`). Serialize across create AND renew.
 Sweep idle locks hourly — call `.cleanup()` from an hourly spawn in
 `main.rs` (see `cleanup_create_locks`).
 
+**Which acquire.** Every controller replica serves the create endpoint and
+runs the renewal loop, so ask what a SECOND upstream call does:
+
+- it **adds** something upstream (gcal `events.watch` mints a new channel per
+  call, so a duplicate is an orphan that pushes until it expires) → use
+  `acquire_fleet(pool, key, "<integration>:<grain>")`: the local mutex plus a
+  blocking Postgres advisory lock held for the length of the call. Then
+  RE-CHECK state under the lock — on create, "does a channel already exist?";
+  on renew, **re-read the row you read before waiting**, and if it is gone hand
+  back what the other renewer created. A lock without the re-check serializes
+  two duplicate calls instead of preventing the second.
+- it **replaces** (gmail `users.watch` is one watch per mailbox) → `acquire`
+  is enough; a duplicate call is wasted, not wrong.
+
 **Row CRUD**: route set/delete/get/list through
 `talos_integration_helpers::state_store::ChannelStore` — it owns the
 `execute_op` plumbing and error wrapping. Row structs, decode

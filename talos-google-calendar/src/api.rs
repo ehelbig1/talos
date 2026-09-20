@@ -106,6 +106,17 @@ impl GoogleCalendarApiClient {
         }
     }
 
+    /// The same hardened client, pointed at another origin. For tests that
+    /// stand in for Google; production never calls it (the base URL is not
+    /// configurable from the environment or from any request).
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_base_url(base_url: &str) -> Self {
+        let mut api = Self::new();
+        api.base_url = base_url.trim_end_matches('/').to_string();
+        api
+    }
+
     /// List user's calendars
     pub async fn list_calendars(&self, access_token: &str) -> Result<Vec<CalendarListEntry>> {
         let url = format!("{}/users/me/calendarList", self.base_url);

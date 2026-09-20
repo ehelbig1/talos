@@ -5336,3 +5336,19 @@ position after the spawn marker. The pin's first draft compared the services
 registration with literal newlines, which rustfmt would have been free to
 move; both halves now compare whitespace-squashed text.
 
+## Package CX (2026-09-20): Calendar watch create and renew across replicas
+
+No test had ever driven `create_watch_channel` or `renew_watch_channel`, so
+the harness came first: a seeded `google_calendar_integrations` row, the
+access token stored through the real `SecretsManager`, a worker shared key,
+and an axum stand-in for `events.watch` / `channels.stop` reached through a
+new `#[doc(hidden)]` base-URL setter. The tests passed on the first run, which
+proves nothing, so the pre-fix numbers come from mutations: without the
+database lock Google is asked for 2 channels on a concurrent create; without
+the re-read a concurrent renew makes 3 `events.watch` calls, with one replica
+or two.
+
+GCP create was read and left alone (it calls nothing upstream and allows
+several watches per integration); Gmail was read and left alone (`users.watch`
+replaces).
+
