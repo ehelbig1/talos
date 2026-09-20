@@ -152,6 +152,9 @@ background_tasks! {
     GcalChannelRenewal          => "gcal_channel_renewal",
     GcalRateLimitCleanup        => "gcal_rate_limit_cleanup",
     WasmLogSubscriber           => "wasm_log_subscriber",
+    // The PLAIN-subscribe half of the `wasm.log.*` relay (2026-09-20): the
+    // variant above is the queue-group half that persists.
+    WasmLogBroadcaster          => "wasm_log_broadcaster",
     JobResultSubscriber         => "job_result_subscriber",
     StaleExecutionSweep         => "stale_execution_sweep",
     Scheduler                   => "scheduler",

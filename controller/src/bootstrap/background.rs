@@ -13,46 +13,6 @@ use crate::*;
 // Nothing is restarted: see the crate docs for why.
 use talos_task_supervision::{spawn_supervised, BackgroundTask, DeclineReason, TaskExit};
 
-/// Maximum characters of WASM-emitted log content broadcast on the
-/// `execution_updates` GraphQL subscription. Mirrors the persistence
-/// path's per-row cap (`MAX_MSG_LEN` in
-/// `talos_execution_repository::add_workflow_log`); kept in lockstep
-/// so the live channel can't carry more than the persisted row.
-const MAX_BROADCAST_LOG_CHARS: usize = 8 * 1024;
-
-/// Sanitise a WASM-emitted log message for live broadcast on
-/// `execution_updates`. Mirrors the pipeline `add_workflow_log` runs
-/// before persisting to `workflow_execution_logs.message`:
-///   1. char-count truncate to `MAX_BROADCAST_LOG_CHARS`
-///   2. strip control chars except newline/tab/carriage return
-///   3. DLP redact (`talos_dlp_provider::redact_str`)
-///
-/// Extracted as a free function so the discipline is unit-testable
-/// (the inline call site is otherwise too deep in the NATS subscriber
-/// loop to cover without bringing up a NATS test harness).
-/// Same MCP-481 / MCP-1011 class — every operator-visible WASM-log
-/// surface needs identical scrubbing.
-fn scrub_wasm_log_for_broadcast(message: &str) -> String {
-    let truncated: String = if message.chars().count() > MAX_BROADCAST_LOG_CHARS {
-        let mut s: String = message.chars().take(MAX_BROADCAST_LOG_CHARS).collect();
-        s.push_str("... (truncated)");
-        s
-    } else {
-        message.to_string()
-    };
-    let sanitized: String = truncated
-        .chars()
-        .filter(|c| !c.is_control() || matches!(*c, '\n' | '\t' | '\r'))
-        .collect();
-    // 2026-05-28 audit F3 perf follow-up: per-log-line broadcast is a
-    // hot path that runs the DLP scrubber per message × per subscriber.
-    // The trait-method `redact_str` allocates a fresh String for every
-    // pattern even when nothing matches (~14 patterns × `String::from_owned`
-    // per call). Switching to the Cow variant keeps the legitimate-log
-    // common case allocation-free.
-    talos_dlp_provider::redact_str_cow(&sanitized).into_owned()
-}
-
 /// Recompute and publish `talos_worker_build_skew_workers` from one snapshot of
 /// the ACTIVE `worker_identities` rows.
 ///
@@ -4201,289 +4161,17 @@ pub(crate) fn classify_job_result_parse_error(err: &serde_json::Error) -> &'stat
     }
 }
 
-/// `kind` label values for `talos_wasm_log_orphaned_total`. A closed set of
-/// `&'static str`, and it must stay closed: `/metrics/prometheus` is
-/// scrapeable, and the thing being counted is a log line whose body is
-/// guest-authored module output. Neither the message, nor the execution id, nor
-/// the NATS subject may ever become a label.
-pub(crate) const WASM_LOG_ORPHAN_NO_EXECUTION_ROW: &str = "no_execution_row";
-pub(crate) const WASM_LOG_ORPHAN_UNPARSEABLE_ID: &str = "unparseable_id";
-
-/// Handle ONE `wasm.log.*` message: broadcast it live, persist it to whichever
-/// log table owns its execution id, and — when neither owns it — say so loudly
-/// on both the operator log and `talos_wasm_log_orphaned_total`.
-///
-/// Extracted VERBATIM out of the subscriber loop in `spawn_nats_log_subscribers`
-/// (2026-08) so the discard branches are reachable from a test at all: the loop
-/// needs a live NATS server, this function needs only a payload. The
-/// `unparseable_id` branch runs before any DB call and is therefore driven
-/// end-to-end offline; the `no_execution_row` branch sits behind two Postgres
-/// round-trips and is NOT covered by an offline test — the test module at the
-/// bottom of this file says so rather than implying otherwise.
-///
-/// Neither increment goes through a shared warn-and-count helper; see the
-/// detector-metrics block in `talos_metrics::TalosMetrics` for why a macro
-/// would re-blind structural check 58.
-async fn handle_wasm_log_message(
-    msg: &async_nats::Message,
-    exec_repo_for_wasm_logs: &crate::execution_repository::ExecutionRepository,
-    exec_service_for_logs: &ModuleExecutionService,
-    tx_for_wasm_logs: &tokio::sync::broadcast::Sender<ExecutionEvent>,
-) {
-    // One line per guest log message received — DEBUG, not INFO: measured
-    // 2026-09-13 it was 68 of 329 controller INFO lines in 25 minutes (21 %),
-    // an acknowledgement of a message the worker already relayed at the
-    // guest's own level and this function is about to persist. The comment
-    // above it said DEBUG since the day it was written; the macro said info.
-    tracing::debug!("📩 Received WASM log from NATS topic: {}", msg.subject);
-
-    // Parse log message from NATS
-    match serde_json::from_slice::<serde_json::Value>(&msg.payload) {
-        Ok(log_msg) => {
-            // Extract fields with defaults
-            let execution_id = log_msg
-                .get("execution_id")
-                .and_then(|v| v.as_str())
-                .and_then(|s| uuid::Uuid::parse_str(s).ok());
-
-            let level_str = log_msg
-                .get("level")
-                .and_then(|v| v.as_str())
-                .unwrap_or("info");
-
-            // Convert string to LogLevel enum. Case-insensitive
-            // because the worker emits UPPERCASE ("INFO", "WARN",
-            // ...) while older test paths used lowercase. Without
-            // the fold, every uppercase line collapsed to Info.
-            let level = match level_str.to_ascii_lowercase().as_str() {
-                "debug" => LogLevel::Debug,
-                "warn" => LogLevel::Warn,
-                "error" => LogLevel::Error,
-                _ => LogLevel::Info,
-            };
-
-            let message = log_msg
-                .get("message")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-
-            let metadata = log_msg.get("metadata").cloned();
-            let trace_id = log_msg
-                .get("trace_id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let span_id = log_msg
-                .get("span_id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-
-            // Save to database (best-effort - don't crash on error)
-            if let Some(exec_id) = execution_id {
-                let node_id = metadata
-                    .as_ref()
-                    .and_then(|m| m.get("node_id"))
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| uuid::Uuid::parse_str(s).ok());
-
-                // MCP-1011 sibling: scrub the broadcast `message`
-                // the same way `add_workflow_log` scrubs before
-                // persisting. Pre-fix the persistence path
-                // (`workflow_execution_logs.message`) applied
-                // MCP-481 truncation + control-char strip +
-                // `redact_str`, but the parallel `tx_for_wasm_logs`
-                // broadcast used the raw `message` — a WASM module
-                // emitting a Bearer / sk- / ghp_ token leaked it
-                // to live `execution_updates` GraphQL subscribers
-                // even though the persisted row was clean. See
-                // `scrub_wasm_log_for_broadcast` (above) for the
-                // canonical pipeline — kept in lockstep with the
-                // persistence path so the live channel can't
-                // carry more than the persisted row.
-                let scrubbed_for_broadcast = scrub_wasm_log_for_broadcast(&message);
-
-                // Broadcast the live log to all connected GraphQL clients!
-                let _ = tx_for_wasm_logs.send(ExecutionEvent {
-                    execution_id: exec_id,
-                    node_id,
-                    status: ExecutionStatus::Running,
-                    trace_id,
-                    span_id,
-                    log_message: Some(format!(
-                        "[{}] {}",
-                        level_str.to_uppercase(),
-                        scrubbed_for_broadcast
-                    )),
-                    iteration_index: None,
-                    iteration_total: None,
-                    duration_ms: None,
-                    output: None,
-                });
-
-                // Route to the right log table:
-                //   - workflow_execution_logs when exec_id is a workflow_executions.id
-                //     (the common case — every run via trigger_workflow / call_workflow / scheduled)
-                //   - module_execution_logs when exec_id is a module_executions.id
-                //     (standalone module runs via webhook / test_module)
-                // `add_workflow_log` does a `WHERE EXISTS`-guarded insert and
-                // returns `Ok(false)` (rather than tripping the FK constraint)
-                // when exec_id isn't a workflow execution — so the standalone-
-                // module case no longer emits a Postgres FK-violation ERROR per
-                // log line. Single round trip for the common (workflow) case.
-                let level_upper = match level {
-                    LogLevel::Debug => "DEBUG",
-                    LogLevel::Info => "INFO",
-                    LogLevel::Warn => "WARN",
-                    LogLevel::Error => "ERROR",
-                };
-                match exec_repo_for_wasm_logs
-                    .add_workflow_log(exec_id, node_id, level_upper, &message, metadata.as_ref())
-                    .await
-                {
-                    Ok(true) => {} // landed in workflow_execution_logs
-                    Ok(false) => {
-                        // Not a workflow execution → standalone module run.
-                        let outcome = exec_service_for_logs
-                            .add_log_best_effort(exec_id, level, message, metadata)
-                            .await;
-                        // BOTH routes missed: `exec_id` names
-                        // neither a `workflow_executions` row nor a
-                        // `module_executions` row, so this line has
-                        // been DISCARDED. This is the terminal hop —
-                        // if we don't say it here, nobody does, and
-                        // `get_execution_logs` will return `[]`,
-                        // byte-identical to an execution that
-                        // genuinely logged nothing. That silence is
-                        // how every Loop-node iteration lost all of
-                        // its logs (host diagnostics AND guest
-                        // `logging::log`) unnoticed until 2026-07-30.
-                        //
-                        // Only `NoExecutionRow` warns: a `RateLimited`
-                        // drop is deliberate back-pressure and a
-                        // `WriteFailed` already warned inside
-                        // `add_log_best_effort` — calling either
-                        // "orphaned" would be the misleading-signal
-                        // bug in the fix for a misleading signal.
-                        //
-                        // CONTENT: execution id + level ONLY. The
-                        // message body is guest-authored and may carry
-                        // anything the module printed; it must not be
-                        // copied into the controller's operator log by
-                        // a diagnostic about routing.
-                        //
-                        // VOLUME: one warn per orphaned line is
-                        // bounded, not unbounded — a producer's
-                        // per-execution log budget is capped in the
-                        // worker (MAX_LOG_MESSAGES_PER_EXECUTION for
-                        // guest lines, HOST_DIAG_CAP for host
-                        // diagnostics), so a single pathological module
-                        // cannot emit more warns than it can emit logs.
-                        //
-                        // EXPECTED RATE: zero on ordinary
-                        // trigger / schedule / webhook / push traffic
-                        // — every routine dispatch path pre-INSERTs its
-                        // row before publishing (single-node
-                        // `engine_dispatch_single.rs`, pipeline steps via
-                        // the parent `workflow_executions.id`, loop bodies
-                        // as of 2026-07-30, and the live webhook path at
-                        // `talos-webhooks/src/router.rs`). It is NOT
-                        // zero everywhere, and the earlier draft of this
-                        // comment claiming otherwise was the same
-                        // unearned-certainty class the warn exists to
-                        // close.
-                        //
-                        // The 2026-07-30 audit listed three residual
-                        // producers here. Two of them — webhook DLQ
-                        // replay (no row at all) and Google Calendar
-                        // push (random `job_id` when `create_execution`
-                        // errored) — were closed on 2026-07-31, along
-                        // with a fourth the audit itself had missed: the
-                        // LIVE webhook INSERT, which on error logged and
-                        // dispatched anyway. All three webhook/GCal paths
-                        // now fail closed. Do not re-derive that list
-                        // from this comment: it is a snapshot, and this
-                        // is the second time it has gone stale. The warn
-                        // below is the live detector — trust it over the
-                        // prose.
-                        //
-                        // ONE deliberate producer remains, and it is not
-                        // a bug: either engine `record_started` failing
-                        // is non-fatal by design (always paired with a
-                        // nearby `tracing::error!`), so a DB blip during
-                        // a node dispatch still orphans that node's
-                        // lines.
-                        //
-                        // A burst of these named by `exec_id` therefore
-                        // means either that, or a NEW dispatch path that
-                        // mints an id without recording a row — which is
-                        // what this warn is FOR. Fix the producer; do
-                        // not silence the warn.
-                        if outcome.is_orphaned() {
-                            // The metric twin of the WARN below. The label is a
-                            // closed-set &'static str — never the guest-authored
-                            // message body, never `exec_id` (per-execution labels
-                            // are unbounded cardinality on a scrapeable endpoint,
-                            // and an orphaned line is exactly the content that
-                            // must not leak there).
-                            if let Some(m) = metrics::global() {
-                                m.wasm_log_orphaned_total
-                                    .with_label_values(&[WASM_LOG_ORPHAN_NO_EXECUTION_ROW])
-                                    .inc();
-                            }
-                            tracing::warn!(
-                                target: "talos_controller",
-                                event_kind = "wasm_log_orphaned",
-                                %exec_id,
-                                level = level_upper,
-                                "WASM log line discarded: execution id matches \
-                                 neither workflow_executions nor module_executions. \
-                                 The dispatching path minted an id without \
-                                 recording an execution row — its logs are being \
-                                 lost and will not appear in get_execution_logs."
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        // exec_id IS a workflow execution but the insert failed
-                        // (5000-entry rate-limit trigger, DB outage). Don't
-                        // misroute a real workflow log to the module table.
-                        tracing::debug!(
-                            %exec_id,
-                            error = %e,
-                            "workflow_execution_logs insert failed (capped or DB error)"
-                        );
-                    }
-                }
-            } else {
-                // Same class as `wasm_log_orphaned` one branch up:
-                // the line is discarded here and nothing downstream
-                // will ever mention it. A `debug!` (off in every
-                // real deployment) meant an entire producer could
-                // publish malformed ids forever and read as silence.
-                // No message body — see the content rule above.
-                if let Some(m) = metrics::global() {
-                    m.wasm_log_orphaned_total
-                        .with_label_values(&[WASM_LOG_ORPHAN_UNPARSEABLE_ID])
-                        .inc();
-                }
-                tracing::warn!(
-                    target: "talos_controller",
-                    event_kind = "wasm_log_unparseable_execution_id",
-                    subject = %msg.subject,
-                    "WASM log line discarded: missing or unparseable execution_id"
-                );
-            }
-        }
-        Err(e) => {
-            tracing::debug!("Failed to parse WASM log message: {}", e);
-        }
-    }
-}
+// The `wasm.log.*` relay (parser, persist half, broadcast half, orphan
+// counter) lives in `talos-wasm-log-relay` since 2026-09-20; the label
+// constants are re-exported for the detector-metric pins below.
+#[cfg(test)]
+pub(crate) use talos_wasm_log_relay::{
+    WASM_LOG_ORPHAN_NO_EXECUTION_ROW, WASM_LOG_ORPHAN_UNPARSEABLE_ID,
+};
 
 /// WASM-log subscriber + job-result subscriber (both supervisor-wrapped,
 /// MCP-1121/1122). Extracted verbatim from `main()`; spawn order preserved.
-/// The per-message body of the WASM-log loop now lives in
-/// [`handle_wasm_log_message`] above.
+/// The WASM-log relay itself lives in `talos-wasm-log-relay`.
 pub(crate) fn spawn_nats_log_subscribers(
     db_pool: sqlx::Pool<sqlx::Postgres>,
     nats_client: Option<std::sync::Arc<async_nats::Client>>,
@@ -4508,68 +4196,15 @@ pub(crate) fn spawn_nats_log_subscribers(
             crate::execution_repository::ExecutionRepository::new(db_pool.clone())
                 .with_workflow_execution_sender(workflow_execution_tx.clone()),
         );
-        spawn_supervised(BackgroundTask::WasmLogSubscriber, async move {
-            tracing::info!("Starting WASM log subscriber on topic: wasm.log.*");
-
-            // MCP-1121 (2026-05-16): supervisor loop wraps the inner
-            // subscriber. Sibling sweep of MCP-1119/1120 (audit-ledger
-            // JetStream + worker-fleet heartbeats). Pre-fix when
-            // `subscriber.next()` returned None (NATS disconnect,
-            // server-side unsubscribe, client reconnect window), the
-            // spawned task exited and workflow execution logs stopped
-            // persisting until controller restart — `workflow_execution_logs`
-            // table received nothing, the UI's live log stream went
-            // silent, and operators couldn't see workflow progress
-            // mid-execution. Workers continue publishing to NATS but
-            // without a JetStream durable here the messages drop on
-            // the floor.
-            //
-            // Same audit rule (MCP-1119/1120): every background-spawned
-            // message-consumer that processes external infrastructure
-            // events MUST be supervisor-wrapped. Exponential backoff
-            // caps at 60s, resets on successful bind.
-            let mut backoff_secs: u64 = 1;
-            'supervisor: loop {
-                // Subscribe to all WASM log topics (wasm.log.{execution_id})
-                let mut subscriber = match nats.subscribe("wasm.log.*").await {
-                    Ok(sub) => sub,
-                    Err(e) => {
-                        tracing::error!(
-                            target: "talos_controller",
-                            event_kind = "wasm_log_subscribe_failed",
-                            error = %e,
-                            backoff_secs,
-                            "Failed to subscribe to WASM logs; retrying after backoff"
-                        );
-                        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
-                        backoff_secs = (backoff_secs * 2).min(60);
-                        continue 'supervisor;
-                    }
-                };
-                backoff_secs = 1;
-
-                tracing::info!("WASM log subscriber active - waiting for messages");
-
-                // Process messages as they arrive
-                while let Some(msg) = subscriber.next().await {
-                    handle_wasm_log_message(
-                        &msg,
-                        &exec_repo_for_wasm_logs,
-                        &exec_service_for_logs,
-                        &tx_for_wasm_logs,
-                    )
-                    .await;
-                }
-
-                // MCP-1121: stream ended — supervisor re-binds.
-                tracing::warn!(
-                    target: "talos_controller",
-                    event_kind = "wasm_log_subscriber_rebinding",
-                    "WASM log subscriber stream ended; supervisor re-binding (no controller restart required)"
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            } // end 'supervisor
-        });
+        // Two supervised tasks: a queue-group persister (one replica stores
+        // each line) and a plain-subscribe broadcaster (every replica feeds
+        // its own GraphQL subscribers). See `talos-wasm-log-relay`.
+        talos_wasm_log_relay::spawn_wasm_log_relay(
+            nats,
+            exec_repo_for_wasm_logs,
+            exec_service_for_logs,
+            tx_for_wasm_logs,
+        );
         tracing::info!("WASM log subscriber task started");
 
         // ---------- Start job result subscriber ----------
@@ -5342,78 +4977,6 @@ pub(crate) fn spawn_late_background_tasks(
     tracing::info!("SLA threshold breach check task started (runs every 5 minutes)");
 }
 
-#[cfg(test)]
-mod scrub_wasm_log_for_broadcast_tests {
-    use super::{scrub_wasm_log_for_broadcast, MAX_BROADCAST_LOG_CHARS};
-
-    #[test]
-    fn redacts_anthropic_secret() {
-        // MCP-1011 sibling: a WASM module emitting `sk-ant-...` must
-        // have it redacted BEFORE the broadcast lands on the live
-        // `execution_updates` channel. The persistence path
-        // (`add_workflow_log`) applied this; the broadcast didn't.
-        let raw = "thinking response sk-ant-abcdefghijklmnopqrstuvwxyz0123456789 returned";
-        let out = scrub_wasm_log_for_broadcast(raw);
-        assert!(
-            !out.contains("sk-ant-abcdefghijklmnopqrstuvwxyz0123456789"),
-            "DLP scrubber must remove the secret. Got: {out}"
-        );
-    }
-
-    #[test]
-    fn redacts_bearer_token() {
-        let raw = "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.sig";
-        let out = scrub_wasm_log_for_broadcast(raw);
-        assert!(
-            !out.contains("eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.sig"),
-            "Bearer JWT must be redacted. Got: {out}"
-        );
-    }
-
-    #[test]
-    fn redacts_github_token() {
-        let raw = "git push uses ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; // secret-scan-allow: DLP redaction test fixture
-        let out = scrub_wasm_log_for_broadcast(raw);
-        assert!(
-            !out.contains("ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), // secret-scan-allow: DLP redaction test fixture
-            "GitHub PAT must be redacted. Got: {out}"
-        );
-    }
-
-    #[test]
-    fn strips_control_chars_except_whitespace() {
-        // ANSI escape sequences and other control chars must not
-        // reach operator dashboards (terminal-render attacks). \n,
-        // \t, \r preserved so multi-line logs format correctly.
-        let raw = "before\x1b[31mafter\nnext\ttabbed\rret\x07bell";
-        let out = scrub_wasm_log_for_broadcast(raw);
-        assert!(!out.contains('\x1b'));
-        assert!(!out.contains('\x07'));
-        assert!(out.contains('\n'));
-        assert!(out.contains('\t'));
-        assert!(out.contains('\r'));
-    }
-
-    #[test]
-    fn truncates_oversize_input() {
-        // Char-based truncation must respect the 8 KiB cap so the
-        // broadcast can't carry more than `add_workflow_log` persists.
-        let raw: String = "a".repeat(MAX_BROADCAST_LOG_CHARS + 1000);
-        let out = scrub_wasm_log_for_broadcast(&raw);
-        assert!(out.contains("... (truncated)"));
-        // After truncation the prefix is exactly MAX chars, then the
-        // marker; total chars <= cap + marker length.
-        assert!(out.chars().count() <= MAX_BROADCAST_LOG_CHARS + "... (truncated)".chars().count());
-    }
-
-    #[test]
-    fn small_input_passes_through_clean() {
-        let raw = "user logged in successfully";
-        let out = scrub_wasm_log_for_broadcast(raw);
-        assert_eq!(out, raw);
-    }
-}
-
 /// D1 + D5 pins for `talos_wasm_log_orphaned_total` and
 /// `talos_worker_build_skew_workers`.
 ///
@@ -5537,7 +5100,8 @@ mod detector_metric_tests {
         }
     }
 
-    /// Drives the production `handle_wasm_log_message` — the function the NATS
+    /// Drives the production `persist_log_message` — the function the relay's
+    /// persist half calls once per message (`talos-wasm-log-relay`) — the function the NATS
     /// subscriber loop calls once per message — down its `unparseable_id`
     /// discard branch, end to end, with no NATS and no Postgres.
     ///
@@ -5547,8 +5111,9 @@ mod detector_metric_tests {
     /// which a dead pool turns into `Err` instead — so that arm is NOT covered
     /// offline. What IS covered for it: it is the same function, the same
     /// `metrics::global()` idiom and the same counter, and structural check 58
-    /// sees both increments. The honest guard for that arm is the post-merge
-    /// live check.
+    /// sees both increments. Since 2026-09-20 that arm IS driven, with a real
+    /// Postgres and a live broker, by `controller/tests/wasm_log_relay_tests`
+    /// (which also pins it to once per line across two replicas).
     #[tokio::test]
     async fn unparseable_execution_id_is_counted_on_the_production_path() {
         install_metrics();
@@ -5557,15 +5122,12 @@ mod detector_metric_tests {
             dead_pool(),
             std::sync::Arc::new(talos_dlp_provider::DlpService::from_env()),
         );
-        let (tx, _rx) = tokio::sync::broadcast::channel(8);
-
         // No `execution_id` key at all.
         let before = orphan_count(WASM_LOG_ORPHAN_UNPARSEABLE_ID);
-        handle_wasm_log_message(
+        talos_wasm_log_relay::persist_log_message(
             &nats_msg("wasm.log.nope", r#"{"level":"INFO","message":"hi"}"#),
             &repo,
             &service,
-            &tx,
         )
         .await;
         assert_eq!(
@@ -5577,14 +5139,13 @@ mod detector_metric_tests {
         // Present but not a UUID — same branch, and the branch that a
         // malformed publisher actually produces.
         let before = orphan_count(WASM_LOG_ORPHAN_UNPARSEABLE_ID);
-        handle_wasm_log_message(
+        talos_wasm_log_relay::persist_log_message(
             &nats_msg(
                 "wasm.log.garbage",
                 r#"{"execution_id":"not-a-uuid","level":"WARN","message":"x"}"#,
             ),
             &repo,
             &service,
-            &tx,
         )
         .await;
         assert_eq!(orphan_count(WASM_LOG_ORPHAN_UNPARSEABLE_ID) - before, 1.0);
@@ -5593,11 +5154,10 @@ mod detector_metric_tests {
         // unparseable id) and must NOT be counted here — conflating them would
         // make the alert's `kind` label lie about what to go grep.
         let before = orphan_count(WASM_LOG_ORPHAN_UNPARSEABLE_ID);
-        handle_wasm_log_message(
+        talos_wasm_log_relay::persist_log_message(
             &nats_msg("wasm.log.x", "not json at all"),
             &repo,
             &service,
-            &tx,
         )
         .await;
         assert_eq!(orphan_count(WASM_LOG_ORPHAN_UNPARSEABLE_ID) - before, 0.0);
@@ -7026,7 +6586,9 @@ mod task_supervision_wiring_tests {
     /// awaited call that is meant to finish) minus, from 2026-09-08,
     /// `start_worker_management`, which was never a loop at all — plus, from
     /// 2026-09-14, the Vault KEK-token renewal loop (42).
-    const EXPECTED_SUPERVISED: usize = 42;
+    /// 2026-09-20: the `wasm.log.*` relay moved to `talos-wasm-log-relay`,
+    /// which supervises its own two halves (41 here).
+    const EXPECTED_SUPERVISED: usize = 41;
 
     /// The remaining bare `tokio::spawn` calls in THIS file, deliberately
     /// unwrapped because each is a one-shot whose death is bounded to one
