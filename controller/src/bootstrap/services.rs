@@ -1147,6 +1147,12 @@ pub(crate) async fn build_platform_services(
     ) {
         tracing::warn!(error = %e, "task-supervision metrics already registered");
     }
+    if let Err(e) = talos_background_lease::register_metrics(
+        &metrics.registry,
+        &crate::bootstrap::background::LEASED_TASKS,
+    ) {
+        tracing::warn!(error = %e, "background-lease metrics already registered");
+    }
     tracing::info!("Metrics service initialized");
 
     // ---------- Embedding-provider boot probe (added r239) ----------

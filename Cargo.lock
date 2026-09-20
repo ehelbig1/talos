@@ -1792,6 +1792,7 @@ dependencies = [
  "talos-audit-ledger",
  "talos-auth",
  "talos-auth-types",
+ "talos-background-lease",
  "talos-capability-downgrade",
  "talos-capability-world",
  "talos-child-run-ledger",
@@ -7847,6 +7848,16 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "talos-background-lease"
+version = "0.1.0"
+dependencies = [
+ "prometheus",
+ "sqlx",
+ "talos-task-supervision",
+ "tracing",
 ]
 
 [[package]]
