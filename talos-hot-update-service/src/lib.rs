@@ -230,8 +230,7 @@ impl HotUpdateService {
         //     `is_compilable_world(effective_world)` check below at
         //     step 4 we already validated `effective_world` is one
         //     of the canonical strings, so the rank is well-defined.
-        {
-            let new_rank = talos_capability_world::world_rank(&effective_world);
+        let dependent_workflow_ids: Vec<Uuid> = {
             // Find every workflow currently binding this module,
             // along with its actor_id.
             let bindings = match self
@@ -292,46 +291,11 @@ impl HotUpdateService {
                 }
             }
 
-            // M3: log every world change (upgrade OR downgrade) to
-            // `admin_event_log` for forensics. The fire-and-forget
-            // helper handles DLP redaction + truncation; we never
-            // block the hot-update on the audit write.
-            if effective_world != ctx.capability_world {
-                let kind = if new_rank > talos_capability_world::world_rank(&ctx.capability_world) {
-                    "upgrade"
-                } else {
-                    "change"
-                };
-                let summary = format!(
-                    "hot_update_module capability {}: module='{}' module_id={} \
-                     old_world='{}' new_world='{}' bindings={}",
-                    kind,
-                    ctx.name,
-                    module_id,
-                    ctx.capability_world,
-                    effective_world,
-                    bindings.len(),
-                );
-                let details = serde_json::json!({
-                    "module_id": module_id,
-                    "module_name": ctx.name,
-                    "old_capability_world": ctx.capability_world,
-                    "new_capability_world": effective_world,
-                    "kind": kind,
-                    "dependent_workflow_count": bindings.len(),
-                    "dependent_workflow_ids": bindings.iter().map(|(id, _, _)| id).collect::<Vec<_>>(),
-                });
-                talos_actor_repository::spawn_log_admin_event(
-                    self.db_pool.clone(),
-                    user_id,
-                    "hot_update_capability_change",
-                    "module",
-                    Some(module_id),
-                    summary,
-                    Some(details),
-                );
-            }
-        }
+            // M3: the world change itself is recorded by the modules write
+            // below, in the same transaction (package CT) — see
+            // `world_change_audit`.
+            bindings.iter().map(|(id, _, _)| *id).collect()
+        };
 
         // 5. Validate explicit dependencies if provided; otherwise cascade
         //    explicit → node_templates → wasm_modules.
@@ -379,7 +343,43 @@ impl HotUpdateService {
             .clone()
             .ok_or(HotUpdateError::NoWasmBytes)?;
 
-        // 8. Mirror to modules table — sandbox vs compiled paths.
+        // 8. Mirror to modules table — sandbox vs compiled paths. A
+        //    capability-world change (upgrade OR downgrade) is recorded to
+        //    `admin_event_log` by the SAME transaction as the write, so a
+        //    failed compile records nothing and a landed change is never
+        //    unrecorded (package CT). The repository compares the world it
+        //    locks against the one it writes; this closure only words it.
+        let module_name = ctx.name.clone();
+        let describe = move |old_world: &str, new_world: &str| {
+            let kind = if talos_capability_world::world_rank(new_world)
+                > talos_capability_world::world_rank(old_world)
+            {
+                "upgrade"
+            } else {
+                "change"
+            };
+            let summary = format!(
+                "hot_update_module capability {kind}: module='{module_name}' \
+                 module_id={module_id} old_world='{old_world}' new_world='{new_world}' \
+                 bindings={}",
+                dependent_workflow_ids.len(),
+            );
+            let details = serde_json::json!({
+                "module_id": module_id,
+                "module_name": module_name,
+                "old_capability_world": old_world,
+                "new_capability_world": new_world,
+                "kind": kind,
+                "dependent_workflow_count": dependent_workflow_ids.len(),
+                "dependent_workflow_ids": dependent_workflow_ids,
+            });
+            (summary, details)
+        };
+        let world_change_audit = talos_module_repository::CapabilityChangeAudit {
+            recorded_by: user_id,
+            event_type: "hot_update_capability_change",
+            describe: &describe,
+        };
         if ctx.is_sandbox_only {
             self.write_sandbox_path(
                 module_id,
@@ -391,6 +391,7 @@ impl HotUpdateService {
                 fuel_budget,
                 ctx.existing_max_fuel,
                 stored_dependencies.as_ref(),
+                world_change_audit,
             )
             .await?;
         } else {
@@ -406,6 +407,7 @@ impl HotUpdateService {
                 fuel_budget,
                 ctx.existing_max_fuel,
                 stored_dependencies.as_ref(),
+                world_change_audit,
             )
             .await?;
         }
@@ -547,6 +549,7 @@ impl HotUpdateService {
         fuel_budget: Option<u64>,
         existing_max_fuel: Option<i64>,
         stored_dependencies: Option<&JsonValue>,
+        world_change_audit: talos_module_repository::CapabilityChangeAudit<'_>,
     ) -> Result<(), HotUpdateError> {
         let computed_max_fuel = resolve_sandbox_max_fuel(fuel_budget, existing_max_fuel);
         let world_short = sandbox_world_short(effective_world);
@@ -634,6 +637,7 @@ impl HotUpdateService {
                 // previous language. JS/Python source fails the rust
                 // compile long before this write is reached.
                 "rust",
+                Some(world_change_audit),
             )
             .await
             .map_err(|e| {
@@ -656,6 +660,7 @@ impl HotUpdateService {
         fuel_budget: Option<u64>,
         existing_max_fuel: Option<i64>,
         stored_dependencies: Option<&JsonValue>,
+        world_change_audit: talos_module_repository::CapabilityChangeAudit<'_>,
     ) -> Result<(), HotUpdateError> {
         let mirror_max_fuel = resolve_compiled_max_fuel(fuel_budget, existing_max_fuel);
         let mirror_tid = template_id.unwrap_or(effective_wm_id);
@@ -678,6 +683,7 @@ impl HotUpdateService {
                 stored_dependencies,
                 // Rust toolchain — see the sandbox-path comment above.
                 "rust",
+                Some(world_change_audit),
             )
             .await
             .map_err(|e| {

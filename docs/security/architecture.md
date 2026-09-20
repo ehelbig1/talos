@@ -684,6 +684,6 @@ These are skipped during user dependency resolution.
 |---------------|----------|---------|--------|
 | Critical | KEK (master key) | Vault transit (`KEK_PROVIDER=vault`, chart default) — never enters controller memory. `TALOS_MASTER_KEY` env var (`KEK_PROVIDER=env`, code default; refused in production unless `TALOS_ALLOW_ENV_KEK` is set). | Vault transit token / controller process |
 | Secret | User secrets, OAuth tokens, signing keys, **actor memory**, **module-execution payloads**, **workflow-execution outputs** | AES-256-GCM in PostgreSQL under per-context HKDF subkeys of a per-org (or global) DEK, which is wrapped by the KEK | Per-module allowlist; per-actor LLM tier ceiling for LLM payloads |
-| Sensitive | Admin events (`admin_event_log`), audit logs | PostgreSQL append-only (DLP-redacted on most writers, intentionally NOT envelope-encrypted to preserve query-ability for incident triage — see runbook §1.2) | Authenticated + authorized |
+| Sensitive | Admin events (`admin_event_log`), audit logs | PostgreSQL append-only (DLP-redacted by its one writer, intentionally NOT envelope-encrypted to preserve query-ability for incident triage — see runbook §1.2) | Authenticated + authorized |
 | Internal | Workflow definitions, module source code, WASM bytes | PostgreSQL | Owner + org members |
 | Public | Health check, API schema (dev only) | N/A | Unauthenticated |

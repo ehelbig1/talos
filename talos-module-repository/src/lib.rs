@@ -18,6 +18,88 @@ use uuid::Uuid;
 /// than defaulting it.
 pub const UNREFERENCED_MODULES_LIMIT: i64 = 50;
 
+/// How a module write records a capability-world change: who made it, the
+/// event type, and how to describe a `(previous, new)` transition. The
+/// description is the caller's (it knows the dependents, the rank change);
+/// the lock, the comparison and the insert are the repository's.
+pub struct CapabilityChangeAudit<'a> {
+    pub recorded_by: Uuid,
+    pub event_type: &'static str,
+    pub describe: &'a (dyn Fn(&str, &str) -> (String, serde_json::Value) + Send + Sync),
+}
+
+/// `modules.capability_world` is stored in long form (`secrets-node`), which
+/// the worker's `CapabilityWorld` parser reads; compile paths carry the short
+/// form (`secrets`). `trusted` is the legacy name of `automation-node`.
+fn capability_world_long(short: &str) -> String {
+    if short == "trusted" {
+        "automation-node".to_string()
+    } else if short.ends_with("-node") {
+        short.to_string()
+    } else {
+        format!("{short}-node")
+    }
+}
+
+/// What a recorded module-permission change replaced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModulePermissionChange {
+    pub previous: Vec<String>,
+}
+
+/// A module's three permission lists, which share one recorded writer. A
+/// closed set, so every statement below is a static string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModulePermission {
+    Secrets,
+    Hosts,
+    Methods,
+}
+
+impl ModulePermission {
+    fn column(self) -> &'static str {
+        match self {
+            Self::Secrets => "allowed_secrets",
+            Self::Hosts => "allowed_hosts",
+            Self::Methods => "allowed_methods",
+        }
+    }
+
+    fn lock_sql(self) -> &'static str {
+        match self {
+            Self::Secrets => {
+                "SELECT allowed_secrets FROM modules WHERE id = $1 AND user_id = $2 FOR UPDATE"
+            }
+            Self::Hosts => {
+                "SELECT allowed_hosts FROM modules WHERE id = $1 AND user_id = $2 FOR UPDATE"
+            }
+            Self::Methods => {
+                "SELECT allowed_methods FROM modules WHERE id = $1 AND user_id = $2 FOR UPDATE"
+            }
+        }
+    }
+
+    fn update_sql(self) -> &'static str {
+        match self {
+            Self::Secrets => {
+                "UPDATE modules SET allowed_secrets = $1 WHERE id = $2 AND user_id = $3"
+            }
+            Self::Hosts => "UPDATE modules SET allowed_hosts = $1 WHERE id = $2 AND user_id = $3",
+            Self::Methods => {
+                "UPDATE modules SET allowed_methods = $1 WHERE id = $2 AND user_id = $3"
+            }
+        }
+    }
+
+    fn event_type(self) -> &'static str {
+        match self {
+            Self::Secrets => "module_allowed_secrets_updated",
+            Self::Hosts => "module_allowed_hosts_updated",
+            Self::Methods => "module_allowed_methods_updated",
+        }
+    }
+}
+
 pub struct ModuleRepository {
     db_pool: PgPool,
     /// Optional SecretsManager for transparent decryption of
@@ -2498,13 +2580,7 @@ impl ModuleRepository {
         code_template: &str,
         capability_world_short: &str,
     ) -> Result<Option<(Uuid, Vec<u8>)>> {
-        let cw_long = if capability_world_short == "trusted" {
-            "automation-node".to_string()
-        } else if capability_world_short.ends_with("-node") {
-            capability_world_short.to_string()
-        } else {
-            format!("{}-node", capability_world_short)
-        };
+        let cw_long = capability_world_long(capability_world_short);
         let row: Option<(Uuid, Vec<u8>)> = sqlx::query_as(
             "SELECT id, wasm_bytes FROM modules \
              WHERE user_id = $1 AND source_code = $2 \
@@ -2630,6 +2706,7 @@ impl ModuleRepository {
         integration_name: Option<&str>,
         dependencies: Option<&serde_json::Value>,
         language: &str,
+        world_change_audit: Option<CapabilityChangeAudit<'_>>,
     ) -> Result<()> {
         // Convenience overload: callers with no extra metadata
         // (max_memory_mb, imported_interfaces, config) get sensible
@@ -2637,7 +2714,7 @@ impl ModuleRepository {
         //
         // L-5/L-33: `dependencies` is now passed through (was hardcoded
         // None pre-fix, dropping the inline-compile sandbox dep set).
-        self.mirror_module_write(ModuleMirrorWrite {
+        let spec = ModuleMirrorWrite {
             wasm_module_id,
             template_id,
             user_id,
@@ -2657,8 +2734,56 @@ impl ModuleRepository {
             config: None,
             integration_name,
             language,
-        })
-        .await
+        };
+        match world_change_audit {
+            None => self.mirror_module_write(spec).await,
+            Some(audit) => self.mirror_module_write_recorded(spec, audit).await,
+        }
+    }
+
+    /// [`Self::mirror_module_write`] plus a record of any capability-world
+    /// change, in ONE transaction (package CT, 2026-09-19).
+    ///
+    /// The module row is locked first (ownership-scoped) so the world it
+    /// replaces is read under the same lock the write takes; when the stored
+    /// world differs from the one being written, the caller's `describe`
+    /// renders the record and it is inserted before commit. Until then
+    /// `hot_update_module` wrote its `hot_update_capability_change` record from
+    /// a detached task BEFORE compiling — a compile that then failed left a
+    /// record of an upgrade that never happened, and a successful one could
+    /// land with no record at all.
+    pub async fn mirror_module_write_recorded(
+        &self,
+        spec: ModuleMirrorWrite<'_>,
+        audit: CapabilityChangeAudit<'_>,
+    ) -> Result<()> {
+        let mut tx = self.db_pool.begin().await?;
+        let previous: Option<String> = sqlx::query_scalar(
+            "SELECT capability_world FROM modules \
+             WHERE id = $1 AND user_id IS NOT DISTINCT FROM $2 FOR UPDATE",
+        )
+        .bind(spec.wasm_module_id)
+        .bind(spec.user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let module_id = spec.wasm_module_id;
+        let new_world = capability_world_long(spec.capability_world_short);
+        Self::mirror_module_write_on(&mut tx, spec).await?;
+        if let Some(previous) = previous.filter(|p| *p != new_world) {
+            let (summary, details) = (audit.describe)(&previous, &new_world);
+            talos_admin_event_log::insert_on_conn(
+                &mut tx,
+                Some(audit.recorded_by),
+                audit.event_type,
+                "module",
+                Some(module_id),
+                &summary,
+                Some(&details),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     /// Full-control mirror used by the rare callers that have the new
@@ -2668,6 +2793,16 @@ impl ModuleRepository {
     /// the reconciliation sweep + Phase 1.4 backfill have already
     /// populated existing rows from the legacy tables.
     pub async fn mirror_module_write<'a>(&self, spec: ModuleMirrorWrite<'a>) -> Result<()> {
+        let mut conn = self.db_pool.acquire().await?;
+        Self::mirror_module_write_on(&mut conn, spec).await
+    }
+
+    /// The mirror write on a caller's connection (a pooled connection, or the
+    /// transaction [`Self::mirror_module_write_recorded`] holds).
+    async fn mirror_module_write_on(
+        conn: &mut sqlx::PgConnection,
+        spec: ModuleMirrorWrite<'_>,
+    ) -> Result<()> {
         // Defensive: refuse unknown kind values rather than letting the DB
         // CHECK fail with a generic error. Callers know exactly which kind
         // they meant.
@@ -2702,13 +2837,7 @@ impl ModuleRepository {
         // capability_world is stored in long form (`secrets-node`) on the
         // new modules table to match the worker's CapabilityWorld parser.
         // wasm_modules stores the short form (`secrets`); convert here.
-        let cw_long = if capability_world_short == "trusted" {
-            "automation-node".to_string()
-        } else if capability_world_short.ends_with("-node") {
-            capability_world_short.to_string()
-        } else {
-            format!("{}-node", capability_world_short)
-        };
+        let cw_long = capability_world_long(capability_world_short);
 
         // ON CONFLICT preserves the existing `kind` (via COALESCE check
         // on the conflict row) so a hot_update of an `extracted` module
@@ -2798,7 +2927,7 @@ impl ModuleRepository {
         .bind(dependencies)
         .bind(config)
         .bind(language)
-        .execute(&self.db_pool)
+        .execute(&mut *conn)
         .await?;
         // rows_affected == 0 means the INSERT conflicted on `id` AND the
         // UPDATE's WHERE filtered it out — the conflicting row is owned
@@ -2844,13 +2973,7 @@ impl ModuleRepository {
         catalog_slug: Option<&str>,
         fuel_explicit: bool,
     ) -> Result<CatalogInstallResult> {
-        let cw_long = if capability_world_short == "trusted" {
-            "automation-node".to_string()
-        } else if capability_world_short.ends_with("-node") {
-            capability_world_short.to_string()
-        } else {
-            format!("{}-node", capability_world_short)
-        };
+        let cw_long = capability_world_long(capability_world_short);
 
         // CTE pattern: capture prior content_hash in the SAME statement as the
         // upsert. `prev` and `upsert` see the same snapshot so the
@@ -3309,75 +3432,110 @@ impl ModuleRepository {
         Ok(rows)
     }
 
-    /// Phase 5: update `allowed_secrets` on the unified `modules` table.
-    /// Returns `(rows, 0)` for signature stability with callers that
-    /// expected the pre-Phase-5 `(node_templates_rows, wasm_modules_rows)`
-    /// tuple shape — the second value is always 0 now. Callers detect
-    /// "module not found" via `rows == 0`.
+    /// Replace a user-owned module's `allowed_secrets`, and record it.
+    /// `Ok(None)` = no such module for this user (nothing written);
+    /// `Ok(Some(change))` carries the grant list it replaced. See
+    /// [`Self::set_module_permission_recorded`].
     pub async fn update_module_allowed_secrets(
         &self,
         module_id: Uuid,
         user_id: Uuid,
         allowed_secrets: &[String],
-    ) -> Result<(u64, u64)> {
-        let result = sqlx::query(
-            "UPDATE modules SET allowed_secrets = $1 \
-             WHERE id = $2 \
-               AND user_id = $3",
+    ) -> Result<Option<ModulePermissionChange>> {
+        self.set_module_permission_recorded(
+            module_id,
+            user_id,
+            ModulePermission::Secrets,
+            allowed_secrets,
         )
-        .bind(allowed_secrets)
-        .bind(module_id)
-        .bind(user_id)
-        .execute(&self.db_pool)
-        .await?;
-
-        Ok((result.rows_affected(), 0))
+        .await
     }
 
-    /// Companion to `update_module_allowed_secrets`: replace the
-    /// `allowed_hosts` column on a user-owned module. Returns rows
-    /// affected (0 = not found / not owned, caller surfaces as a
-    /// permission-denied-shaped error).
+    /// Replace a user-owned module's `allowed_hosts` (its HTTP egress
+    /// allowlist), and record it. Same contract as
+    /// [`Self::update_module_allowed_secrets`].
     pub async fn update_module_allowed_hosts(
         &self,
         module_id: Uuid,
         user_id: Uuid,
         allowed_hosts: &[String],
-    ) -> Result<u64> {
-        let result = sqlx::query(
-            "UPDATE modules SET allowed_hosts = $1 \
-             WHERE id = $2 \
-               AND user_id = $3",
+    ) -> Result<Option<ModulePermissionChange>> {
+        self.set_module_permission_recorded(
+            module_id,
+            user_id,
+            ModulePermission::Hosts,
+            allowed_hosts,
         )
-        .bind(allowed_hosts)
-        .bind(module_id)
-        .bind(user_id)
-        .execute(&self.db_pool)
-        .await?;
-
-        Ok(result.rows_affected())
+        .await
     }
 
-    /// Companion to `update_module_allowed_secrets`: replace the
-    /// `allowed_methods` column on a user-owned module.
+    /// Replace a user-owned module's `allowed_methods`, and record it. Same
+    /// contract as [`Self::update_module_allowed_secrets`].
     pub async fn update_module_allowed_methods(
         &self,
         module_id: Uuid,
         user_id: Uuid,
         allowed_methods: &[String],
-    ) -> Result<u64> {
-        let result = sqlx::query(
-            "UPDATE modules SET allowed_methods = $1 \
-             WHERE id = $2 \
-               AND user_id = $3",
+    ) -> Result<Option<ModulePermissionChange>> {
+        self.set_module_permission_recorded(
+            module_id,
+            user_id,
+            ModulePermission::Methods,
+            allowed_methods,
         )
-        .bind(allowed_methods)
-        .bind(module_id)
-        .bind(user_id)
-        .execute(&self.db_pool)
-        .await?;
+        .await
+    }
 
-        Ok(result.rows_affected())
+    /// The one writer of a module's three permission lists. Locks the module
+    /// row (ownership-scoped), reads the list it replaces, writes the new one
+    /// and the `admin_event_log` record in ONE transaction (package CT,
+    /// 2026-09-19). Until then the MCP handlers wrote the record from a
+    /// detached task after the update had committed and could not say what
+    /// was replaced — these are REPLACE-style writes, so a flip-use-revert of
+    /// a grant left no durable trace whenever that task failed.
+    async fn set_module_permission_recorded(
+        &self,
+        module_id: Uuid,
+        user_id: Uuid,
+        which: ModulePermission,
+        new: &[String],
+    ) -> Result<Option<ModulePermissionChange>> {
+        let mut tx = self.db_pool.begin().await?;
+        let previous: Option<Vec<String>> = sqlx::query_scalar(which.lock_sql())
+            .bind(module_id)
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(previous) = previous else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        sqlx::query(which.update_sql())
+            .bind(new)
+            .bind(module_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        let column = which.column();
+        talos_admin_event_log::insert_on_conn(
+            &mut tx,
+            Some(user_id),
+            which.event_type(),
+            "module",
+            Some(module_id),
+            &format!(
+                "Module {module_id} {column} replaced ({} entries, was {})",
+                new.len(),
+                previous.len()
+            ),
+            Some(&serde_json::json!({
+                column: new,
+                format!("previous_{column}"): &previous,
+            })),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Some(ModulePermissionChange { previous }))
     }
 
     /// `workflow_executions JOIN workflows` graph_json fetch by execution id.

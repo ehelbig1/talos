@@ -1674,41 +1674,27 @@ impl WorkflowsMutations {
             }
         }
 
+        // The binding decides which actor's tier ceiling, budget and approval
+        // policies govern every later run; the repository writes it and its
+        // `admin_event_log` record in ONE transaction (package CT).
         let workflow_repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
-        let updated = workflow_repo
-            .set_workflow_actor_id(workflow_id, user_id, actor_id)
+        let changed = workflow_repo
+            .set_workflow_actor_id(
+                workflow_id,
+                user_id,
+                actor_id,
+                talos_workflow_repository::ChangeSurface::Graphql,
+            )
             .await
             .map_err(|e| {
                 tracing::error!(target: "talos_api", error = %e, "set_workflow_actor_id failed");
                 async_graphql::Error::new("Could not bind the actor").extend_safe()
             })?;
-        if !updated {
+        if changed.is_none() {
             return Err(
                 async_graphql::Error::new("Workflow not found or not owned by you").extend_safe(),
             );
         }
-
-        // MCP-396 parity: the binding decides which actor's tier ceiling,
-        // budget, and approval policies govern every subsequent run — a flip
-        // to a permissive actor (or to unbound/shared mode) must leave a
-        // persistent trace on THIS surface too, exactly as the MCP handler
-        // records it. Same event shape so forensics join on one event_type.
-        talos_actor_repository::spawn_log_admin_event(
-            db_pool.clone(),
-            user_id,
-            "workflow_actor_binding_changed",
-            "workflow",
-            Some(workflow_id),
-            match actor_id {
-                Some(aid) => format!("Workflow {workflow_id} bound to actor {aid}"),
-                None => format!("Workflow {workflow_id} actor binding cleared (shared mode)"),
-            },
-            Some(serde_json::json!({
-                "new_actor_id": actor_id.map(|a| a.to_string()),
-                "shared_mode": actor_id.is_none(),
-                "surface": "graphql",
-            })),
-        );
         Ok(true)
     }
 

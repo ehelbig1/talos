@@ -20,6 +20,7 @@ sqlx = { version = "0.8", default-features = false, features = ["postgres", "run
 # defence in front of an irreversible write — every other guard in this class
 # lives in a report that recommends calling it (#758/#759).
 talos-child-workflow-refs = { path = "../talos-child-workflow-refs" }
+talos-admin-event-log = { path = "../talos-admin-event-log" }
 talos-config = { path = "../talos-config" }
 talos-db = { path = "../talos-db" }
 talos-tenancy = { path = "../talos-tenancy" }

@@ -7427,48 +7427,19 @@ async fn handle_set_workflow_actor_id(
         }
     }
 
+    // The binding and its `admin_event_log` record (naming the actor it
+    // replaced) commit in ONE transaction inside the repository (package CT).
     match state
         .workflow_repo
-        .set_workflow_actor_id(wf_id, user_id, actor_id)
+        .set_workflow_actor_id(
+            wf_id,
+            user_id,
+            actor_id,
+            talos_workflow_repository::ChangeSurface::Mcp,
+        )
         .await
     {
-        Ok(true) => {
-            // MCP-396 (2026-05-11): audit log on workflow-to-actor
-            // binding mutations. The binding determines which actor's
-            // tier ceiling, budget, and approval policies govern
-            // execution. Threat: an attacker with a stolen MCP key
-            // flips a workflow bound to a strict actor (tier1 LLM,
-            // tight fuel budget, approval-required) to a permissive
-            // actor (tier2 LLM, no budget, no approvals) — every
-            // subsequent run inherits the looser policy. Or flips to
-            // unbound ("shared mode") so trigger_workflow callers can
-            // pass any actor_id; if they pass none, __memory_write__
-            // envelopes silently drop with only a WARN log. Either
-            // direction has no persistent trace pre-fix.
-            //
-            // Same audit-gap class as MCP-389 through MCP-395. Uses
-            // spawn_log_admin_event because the binding is a
-            // workflow-resource mutation; resource_id = workflow_id
-            // for join-on-workflow forensics. details carries the
-            // new actor_id (or null for unbind). The previous binding
-            // is unrecoverable from the row alone, but
-            // admin_event_log is append-only so prior rows for the
-            // same workflow show the history.
-            crate::actor::spawn_log_admin_event(
-                state.db_pool.clone(),
-                user_id,
-                "workflow_actor_binding_changed",
-                "workflow",
-                Some(wf_id),
-                match actor_id {
-                    Some(aid) => format!("Workflow {} bound to actor {}", wf_id, aid),
-                    None => format!("Workflow {} actor binding cleared (shared mode)", wf_id),
-                },
-                Some(serde_json::json!({
-                    "new_actor_id": actor_id.map(|a| a.to_string()),
-                    "shared_mode": actor_id.is_none(),
-                })),
-            );
+        Ok(Some(_)) => {
             let msg = match actor_id {
                 Some(aid) => format!(
                     "Workflow {} bound to actor {}. Triggers without explicit actor_id \
@@ -7485,7 +7456,7 @@ async fn handle_set_workflow_actor_id(
             };
             Some(mcp_text(req_id.clone(), &msg))
         }
-        Ok(false) => Some(mcp_denied(
+        Ok(None) => Some(mcp_denied(
             req_id.clone(),
             -32000,
             "Workflow not found or access denied",

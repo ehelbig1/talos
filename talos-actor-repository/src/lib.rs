@@ -525,6 +525,87 @@ pub struct RankFitSummary {
     pub fitted_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// What a recorded per-actor ceiling change replaced: the column's value
+/// before the change, as stored (`None` only for a cleared `egress_scope`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CeilingChange {
+    pub previous: Option<String>,
+}
+
+/// The three per-actor ceilings that share one recorded writer. A closed set,
+/// so every statement below is a static string (check 88 PREPAREs each one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActorCeiling {
+    LlmTier,
+    EgressScope,
+    WriteCeiling,
+}
+
+impl ActorCeiling {
+    fn lock_sql(self) -> &'static str {
+        match self {
+            Self::LlmTier => {
+                "SELECT max_llm_tier FROM actors WHERE id = $1 AND user_id = $2 FOR UPDATE"
+            }
+            Self::EgressScope => {
+                "SELECT egress_scope FROM actors WHERE id = $1 AND user_id = $2 FOR UPDATE"
+            }
+            Self::WriteCeiling => {
+                "SELECT max_write_ceiling FROM actors WHERE id = $1 AND user_id = $2 FOR UPDATE"
+            }
+        }
+    }
+
+    fn update_sql(self) -> &'static str {
+        match self {
+            Self::LlmTier => "UPDATE actors SET max_llm_tier = $1 WHERE id = $2 AND user_id = $3",
+            Self::EgressScope => {
+                "UPDATE actors SET egress_scope = $1 WHERE id = $2 AND user_id = $3"
+            }
+            Self::WriteCeiling => {
+                "UPDATE actors SET max_write_ceiling = $1 WHERE id = $2 AND user_id = $3"
+            }
+        }
+    }
+
+    fn needs_grant_guc(self) -> bool {
+        matches!(self, Self::WriteCeiling)
+    }
+
+    fn event_type(self) -> &'static str {
+        match self {
+            Self::LlmTier => "actor_llm_tier_ceiling_set",
+            Self::EgressScope => "actor_egress_scope_set",
+            Self::WriteCeiling => "actor_write_ceiling_set",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::LlmTier => "tier ceiling",
+            Self::EgressScope => "egress scope",
+            Self::WriteCeiling => "write ceiling",
+        }
+    }
+
+    fn detail_keys(self) -> (&'static str, &'static str) {
+        match self {
+            Self::LlmTier => ("previous_tier", "new_tier"),
+            Self::EgressScope => ("previous_egress_scope", "new_egress_scope"),
+            Self::WriteCeiling => ("previous_ceiling", "new_ceiling"),
+        }
+    }
+
+    /// How an absent value renders: a cleared egress override is the
+    /// tier-derived default. The other two columns are NOT NULL.
+    fn unset_label(self) -> &'static str {
+        match self {
+            Self::EgressScope => "default",
+            Self::LlmTier | Self::WriteCeiling => "unknown",
+        }
+    }
+}
+
 impl ActorRepository {
     pub fn new(db_pool: PgPool) -> Self {
         Self {
@@ -1907,7 +1988,14 @@ impl ActorRepository {
     /// Partial-update an actor's name / description / capability world
     /// (ownership-gated). At least one field must be Some — callers
     /// validate that upstream. Takes the caller's connection (per-user
-    /// scoped tx). Returns rows affected.
+    /// scoped tx, which the caller commits). Returns rows affected.
+    ///
+    /// A capability-world change is a privilege change, so it is RECORDED on
+    /// the same connection: the row is locked first to read the world it
+    /// replaces, and an `actor_capability_world_set` row is written after the
+    /// UPDATE. The change and its record commit together or not at all
+    /// (package CT, 2026-09-19 — until then the dashboard, the only surface
+    /// that changes this column, wrote no `admin_event_log` row at all).
     ///
     /// Errors are returned WITHOUT added context so callers can inspect
     /// the raw Postgres message (unique/duplicate-name detection).
@@ -1920,6 +2008,23 @@ impl ActorRepository {
         description: Option<&str>,
         max_capability_world: Option<&str>,
     ) -> Result<u64> {
+        let previous_world: Option<String> = match max_capability_world {
+            Some(_) => {
+                let row: Option<String> = sqlx::query_scalar(
+                    "SELECT max_capability_world FROM actors \
+                     WHERE id = $1 AND user_id = $2 FOR UPDATE",
+                )
+                .bind(actor_id)
+                .bind(user_id)
+                .fetch_optional(&mut *conn)
+                .await?;
+                match row {
+                    Some(world) => Some(world),
+                    None => return Ok(0),
+                }
+            }
+            None => None,
+        };
         // Dynamic SET clause; param_count tracks bound parameters
         // separately from set_parts because "updated_at = NOW()" has no
         // bind (same shape as WorkflowRepository::update_workflow_metadata).
@@ -1953,7 +2058,24 @@ impl ActorRepository {
         if let Some(w) = max_capability_world {
             q = q.bind(w);
         }
-        let result = q.bind(actor_id).bind(user_id).execute(conn).await?;
+        let result = q.bind(actor_id).bind(user_id).execute(&mut *conn).await?;
+        if let (Some(new_world), Some(previous_world)) = (max_capability_world, previous_world) {
+            if result.rows_affected() > 0 {
+                talos_admin_event_log::insert_on_conn(
+                    conn,
+                    Some(user_id),
+                    "actor_capability_world_set",
+                    "actor",
+                    Some(actor_id),
+                    &format!("Actor capability ceiling: {previous_world} → {new_world}"),
+                    Some(&serde_json::json!({
+                        "previous_world": previous_world,
+                        "new_world": new_world,
+                    })),
+                )
+                .await?;
+            }
+        }
         Ok(result.rows_affected())
     }
 
@@ -2727,23 +2849,24 @@ impl ActorRepository {
         Ok(result.rows_affected())
     }
 
-    /// Set an actor's LLM data-egress ceiling. Validates user ownership
-    /// before mutating. Returns true if the row was updated, false if
-    /// the actor doesn't exist or doesn't belong to the user.
+    /// Set an actor's LLM data-egress ceiling, and record it. `Ok(None)` =
+    /// no such actor for this user (nothing written); `Ok(Some(change))`
+    /// carries the value the column held before. The change and its
+    /// `actor_llm_tier_ceiling_set` row commit in ONE transaction — see
+    /// [`ActorCeiling`].
     pub async fn set_actor_max_llm_tier(
         &self,
         actor_id: Uuid,
         user_id: Uuid,
         tier: talos_workflow_job_protocol::LlmTier,
-    ) -> Result<bool> {
-        let result =
-            sqlx::query("UPDATE actors SET max_llm_tier = $1 WHERE id = $2 AND user_id = $3")
-                .bind(tier.as_signing_str())
-                .bind(actor_id)
-                .bind(user_id)
-                .execute(&self.db_pool)
-                .await?;
-        Ok(result.rows_affected() > 0)
+    ) -> Result<Option<CeilingChange>> {
+        self.set_actor_ceiling_recorded(
+            actor_id,
+            user_id,
+            ActorCeiling::LlmTier,
+            Some(tier.as_signing_str()),
+        )
+        .await
     }
 
     /// Fetch the data-mutation ceiling for an actor.
@@ -2758,38 +2881,22 @@ impl ActorRepository {
         read_actor_write_ceiling(&self.db_pool, actor_id).await
     }
 
-    /// Set an actor's data-mutation ceiling. Validates user ownership
-    /// before mutating. Returns true if the row was updated, false if
-    /// the actor doesn't exist or doesn't belong to the user.
+    /// Set an actor's data-mutation ceiling, and record it. Same contract as
+    /// [`Self::set_actor_max_llm_tier`]; the transaction also sets the
+    /// `talos.allow_ceiling_grant` GUC the grant-guard trigger requires.
     pub async fn set_actor_max_write_ceiling(
         &self,
         actor_id: Uuid,
         user_id: Uuid,
         ceiling: talos_workflow_job_protocol::WriteCeiling,
-    ) -> Result<bool> {
-        // The `actors_write_ceiling_grant_guard` trigger (migration
-        // 20260709180000) blocks any `readonly -> write` escalation unless
-        // the session opts in via this transaction-local GUC. This is the
-        // ONLY sanctioned grant path, so it is the only place the GUC is set
-        // — a bulk / migration-re-run `UPDATE actors SET
-        // max_write_ceiling='write'` carries no GUC and is refused, which is
-        // exactly the clobber we're guarding against. `set_config(..., true)`
-        // scopes the setting to this transaction. Locking DOWN
-        // (write -> readonly) doesn't strictly need the GUC, but setting it
-        // unconditionally keeps this path simple and is harmless.
-        let mut tx = self.db_pool.begin().await?;
-        sqlx::query("SELECT set_config('talos.allow_ceiling_grant', 'on', true)")
-            .execute(&mut *tx)
-            .await?;
-        let result =
-            sqlx::query("UPDATE actors SET max_write_ceiling = $1 WHERE id = $2 AND user_id = $3")
-                .bind(ceiling.as_signing_str())
-                .bind(actor_id)
-                .bind(user_id)
-                .execute(&mut *tx)
-                .await?;
-        tx.commit().await?;
-        Ok(result.rows_affected() > 0)
+    ) -> Result<Option<CeilingChange>> {
+        self.set_actor_ceiling_recorded(
+            actor_id,
+            user_id,
+            ActorCeiling::WriteCeiling,
+            Some(ceiling.as_signing_str()),
+        )
+        .await
     }
 
     /// Resolve an actor's blanket network-egress scope OVERRIDE (independent of
@@ -2809,28 +2916,86 @@ impl ActorRepository {
         Ok(row.map(|col| talos_workflow_job_protocol::EgressScope::from_db_opt(col.as_deref())))
     }
 
-    /// Set (or clear) an actor's network-egress scope override. Validates user
-    /// ownership before mutating. Passing `None` clears the override back to SQL
-    /// NULL (tier-derived default). Returns true if a row was updated. Unlike
-    /// the write-ceiling setter, no grant-guard GUC is needed: `egress_scope`
-    /// only governs the blanket public-egress SSRF gate, and both tightening
-    /// (`public`→`local`) and loosening (`local`→`public`) are legitimate
-    /// operator actions — the LLM-provider gate stays keyed to `max_llm_tier`
-    /// regardless, so this can never open external-LLM egress.
+    /// Set (or clear) an actor's network-egress scope override, and record it.
+    /// `None` clears the override back to SQL NULL (tier-derived default). Same
+    /// contract as [`Self::set_actor_max_llm_tier`]. Unlike the write ceiling,
+    /// no grant-guard GUC is needed: `egress_scope` only governs the blanket
+    /// public-egress SSRF gate, and both tightening (`public`→`local`) and
+    /// loosening (`local`→`public`) are legitimate operator actions — the
+    /// LLM-provider gate stays keyed to `max_llm_tier` regardless, so this can
+    /// never open external-LLM egress.
     pub async fn set_actor_egress_scope(
         &self,
         actor_id: Uuid,
         user_id: Uuid,
         scope: Option<talos_workflow_job_protocol::EgressScope>,
-    ) -> Result<bool> {
-        let result =
-            sqlx::query("UPDATE actors SET egress_scope = $1 WHERE id = $2 AND user_id = $3")
-                .bind(scope.map(|s| s.as_signing_str()))
-                .bind(actor_id)
-                .bind(user_id)
-                .execute(&self.db_pool)
+    ) -> Result<Option<CeilingChange>> {
+        self.set_actor_ceiling_recorded(
+            actor_id,
+            user_id,
+            ActorCeiling::EgressScope,
+            scope.map(|s| s.as_signing_str()),
+        )
+        .await
+    }
+
+    /// The one writer of the three per-actor ceilings. Locks the actor row
+    /// (ownership-scoped), reads the value it replaces, updates it and writes
+    /// the `admin_event_log` record — all in ONE transaction, so a ceiling is
+    /// never changed without its record and never recorded without the change
+    /// (package CT, 2026-09-19). Until then each MCP handler read the previous
+    /// value outside any lock and wrote the record after the change had
+    /// committed, best-effort: a failed record left the change applied and
+    /// untraced.
+    async fn set_actor_ceiling_recorded(
+        &self,
+        actor_id: Uuid,
+        user_id: Uuid,
+        which: ActorCeiling,
+        new: Option<&str>,
+    ) -> Result<Option<CeilingChange>> {
+        let mut tx = self.db_pool.begin().await?;
+        if which.needs_grant_guc() {
+            // The `actors_write_ceiling_grant_guard` trigger (migration
+            // 20260709180000) blocks any `readonly -> write` escalation unless
+            // the session opts in via this transaction-local GUC. This is the
+            // ONLY sanctioned grant path, so it is the only place the GUC is
+            // set — a bulk / migration-re-run `UPDATE actors SET
+            // max_write_ceiling='write'` carries no GUC and is refused.
+            sqlx::query("SELECT set_config('talos.allow_ceiling_grant', 'on', true)")
+                .execute(&mut *tx)
                 .await?;
-        Ok(result.rows_affected() > 0)
+        }
+        let previous: Option<Option<String>> = sqlx::query_scalar(which.lock_sql())
+            .bind(actor_id)
+            .bind(user_id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(previous) = previous else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        sqlx::query(which.update_sql())
+            .bind(new)
+            .bind(actor_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+        let prev_str = previous.as_deref().unwrap_or(which.unset_label());
+        let new_str = new.unwrap_or(which.unset_label());
+        let (prev_key, new_key) = which.detail_keys();
+        talos_admin_event_log::insert_on_conn(
+            &mut tx,
+            Some(user_id),
+            which.event_type(),
+            "actor",
+            Some(actor_id),
+            &format!("Actor {}: {prev_str} → {new_str}", which.label()),
+            Some(&serde_json::json!({ prev_key: prev_str, new_key: new_str })),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Some(CeilingChange { previous }))
     }
 
     /// Resolve all three per-actor engine ceilings — `max_llm_tier`,

@@ -372,11 +372,11 @@ pub async fn scaffold_actor(
             .set_actor_max_llm_tier(actor_id, user_id, llm_tier_to_protocol(tier))
             .await
         {
-            Ok(true) => {
+            Ok(Some(_)) => {
                 outcome.llm_tier_set =
                     Some(llm_tier_to_protocol(tier).as_signing_str().to_string());
             }
-            Ok(false) => {
+            Ok(None) => {
                 outcome.llm_tier_warning = Some(
                     "set_actor_max_llm_tier returned 0 rows — actor may have been deleted concurrently"
                         .to_string(),
@@ -384,7 +384,9 @@ pub async fn scaffold_actor(
             }
             Err(e) => {
                 tracing::warn!(%actor_id, error = %e, "scaffold_actor: set_actor_max_llm_tier failed");
-                outcome.llm_tier_warning = Some(format!("Failed to set llm_tier: {}", e));
+                // The error stays in the server log; the caller gets a
+                // fixed sentence (it can carry SQL / schema detail).
+                outcome.llm_tier_warning = Some("Failed to set llm_tier".to_string());
             }
         }
     }
