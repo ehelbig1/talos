@@ -100,6 +100,7 @@ talos-advanced-repository = { path = "../talos-advanced-repository" }
 talos-analytics-repository = { path = "../talos-analytics-repository" }
 talos-actor-repository = { path = "../talos-actor-repository" }
 talos-engine-events = { path = "../talos-engine-events" }
+talos-wasm-log-relay = { path = "../talos-wasm-log-relay" }
 talos-execution-repository = { path = "../talos-execution-repository" }
 talos-ops-alerts-repository = { path = "../talos-ops-alerts-repository" }
 talos-workflow-authorization = { path = "../talos-workflow-authorization" }

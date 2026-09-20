@@ -805,6 +805,14 @@ CTRL_TESTS=(
     # silently discarded every Loop-body iteration's logs while `add_log`
     # returned Ok. A mock cannot fail the way the real statement failed.
     "wasm_log_routing_tests"
+    # Two controller replicas relaying `wasm.log.*` (2026-09-20). Drives the
+    # production `talos_wasm_log_relay::spawn_wasm_log_relay` twice on the live
+    # broker with TWO databases holding the same execution ids: each line is
+    # stored by exactly one replica, both replicas broadcast every line, a
+    # line that lands nowhere is counted once, and a control shows two plain
+    # subscribers double the rows. Needs `TALOS_TEST_NATS_URL` + the `common`
+    # harness, so CTRL_TESTS (sub-leg 64b).
+    "wasm_log_relay_tests"
     # The `__memory_write__` write-ceiling gate (#750). Needs a real Postgres
     # because the property under test is "no actor_memory ROW" — the thing a
     # silent drop and a correct refusal both produce, distinguished only by the

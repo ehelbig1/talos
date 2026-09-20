@@ -156,6 +156,18 @@ pub const WORKERS_CMD_CANCEL: &str = "talos.workers.cmd.cancel";
 /// design and a queue group would be the defect.
 pub const CONTROLLER_RPC_QUEUE_GROUP: &str = "talos-controller-rpc";
 
+/// Wildcard the controller's log relay binds: `wasm.log.<execution_id>`, the
+/// subject the worker publishes every guest and host log line on.
+pub const WASM_LOG_WILDCARD: &str = "wasm.log.*";
+
+/// The queue group the PERSIST half of the controller's `wasm.log.*` relay
+/// joins, so one replica stores each line (neither log table has a
+/// de-duplication key: measured 2026-09-20, two plain relays stored 100 rows
+/// for 50 lines). The BROADCAST half of the same relay is a plain subscribe
+/// by design — every replica feeds its own GraphQL subscribers. See
+/// `talos-wasm-log-relay`.
+pub const CONTROLLER_WASM_LOG_QUEUE_GROUP: &str = "talos-controller-wasm-log";
+
 // ── Agent orchestration ────────────────────────────────────────────────────
 
 /// Per-target agent invoke subject: `talos.agent.<target>.invoke`. The worker's

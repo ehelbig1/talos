@@ -29,6 +29,7 @@ JetStream/durable, **Sub** = long-lived subscription.
 | `talos.jobs.<user_id>` | `subjects::jobs_for(user_id)` | `JobRequest` | R/R | Gmail / GCal / GCloud dispatchers, webhook router (edge routing on) | per-user worker pool |
 | `talos.pipeline.jobs` | `subjects::PIPELINE_JOBS` | `PipelineJobRequest` | R/R | engine dispatcher | worker pool |
 | `talos.results.*` | `subjects::RESULTS_WILDCARD` | `JobResult` | Sub | worker | controller results collector |
+| `wasm.log.*` | `subjects::WASM_LOG_WILDCARD` | log-line JSON (`execution_id`, `level`, `message`, `metadata`) | Sub ×2: persist (queue group) + broadcast (plain) | worker (`wasm.log.<execution_id>`) | controller `talos-wasm-log-relay` |
 | `talos.results.<job_id>` | `subjects::results_for(job_id)` | `JobResult` | F&F (audit topic branch) | worker | controller |
 | `talos.pipeline.results.<job_id>` | `subjects::pipeline_results_for(job_id)` | `PipelineJobResult` | R/R + F&F cache-replay | worker | controller |
 | `talos.audit.ledger` | `subjects::AUDIT_LEDGER` | `AuditEvent` (hash-chained, signed) | Stream (F&F publish) | worker host fns (audit) | `talos-audit-ledger` WORM consumer |
@@ -72,14 +73,20 @@ Plain subscribes that are correct as they are: `talos.workers.cmd.cancel`
 its own fleet view), per-request reply inboxes, and the envelope-sealing claim
 inbox (per replica).
 
-Two controller subscribers are still plain and are **not** correct at more than
-one replica (recorded 2026-09-19, not yet changed):
+`wasm.log.*` has two controller subscriptions, because its two consumers need
+opposite delivery (`talos-wasm-log-relay`, 2026-09-20):
 
-- `wasm.log.*` (`controller/src/bootstrap/background.rs`): each replica both
-  INSERTs the line (`workflow_execution_logs` has no de-duplication key, so N
-  replicas store N copies) and broadcasts it to its own GraphQL subscribers
-  (which needs fan-out). The two halves need separate subscriptions: a queue
-  group for the insert, a plain subscribe for the broadcast.
+- **persist** — a queue subscribe in `subjects::CONTROLLER_WASM_LOG_QUEUE_GROUP`
+  (`talos-controller-wasm-log`). One replica stores each line; neither log
+  table has a de-duplication key, and two plain relays stored 100 rows for 50
+  lines. The orphan counter is recorded on this half, so a lost line is counted
+  once for the fleet.
+- **broadcast** — a plain subscribe. Every replica feeds its own GraphQL
+  `execution_updates` subscribers, so every replica must see every line.
+
+One controller subscriber is still plain and does redundant work at more than
+one replica (recorded, not yet changed):
+
 - `talos.results.*` observer: a status-guarded, idempotent UPDATE counted per
   row transition, so N replicas do N−1 redundant verifies and UPDATEs and no
   wrong write. A queue group is safe there.

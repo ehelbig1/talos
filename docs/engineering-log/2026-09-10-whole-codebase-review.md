@@ -5298,3 +5298,23 @@ The two other plain controller subscribers were read the same afternoon: the
 `wasm.log.*` relay inserts and broadcasts per message, and the `talos.results.*`
 observer runs a status-guarded UPDATE. Their handling is in the CLAUDE.md
 bullet for this package.
+
+## Package CV (2026-09-20): every controller replica stored every guest log line
+
+Reproduction (before any fix): a clone of the migrated test template, a
+disposable `nats:2.10-alpine`, two connections each with a plain `wasm.log.*`
+subscribe persisting through `ExecutionRepository::add_workflow_log`, 50
+published lines: `rows=100 distinct_messages=50`.
+
+The relay loop lived in the controller binary, so the reproduction had to
+rebuild its shape; the fix moved it into `talos-wasm-log-relay` so the final
+test drives the production `spawn_wasm_log_relay` itself. Giving each test
+replica its OWN database (same ids seeded in both) is what makes queue-group
+membership observable: with one shared database "50 rows" cannot tell two
+members from one.
+
+First-draft notes: the live test's orphan assertion originally relied on the
+two 400 ms channel drains for settling; it now polls for the fifth increment
+and then waits 300 ms for a second copy. The mutation run rebuilt the
+controller test and bin targets per mutation (about four minutes each).
+
