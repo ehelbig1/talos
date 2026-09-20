@@ -50,8 +50,8 @@ async fn main() -> Result<()> {
         .set_actor_max_llm_tier(actor_id, user_id, LlmTier::Tier1)
         .await?;
     assert!(
-        updated,
-        "set returned false — actor not found or wrong user"
+        updated.is_some(),
+        "set returned None — actor not found or wrong user"
     );
     let t1 = repo.get_actor_max_llm_tier(actor_id).await?;
     assert!(
@@ -73,7 +73,10 @@ async fn main() -> Result<()> {
     let denied = repo
         .set_actor_max_llm_tier(actor_id, wrong_user, LlmTier::Tier1)
         .await?;
-    assert!(!denied, "set should have returned false for wrong user");
+    assert!(
+        denied.is_none(),
+        "set should have returned None for wrong user"
+    );
     println!("✓ set with wrong user_id denied");
 
     // 5. HMAC binding — tampering with tier on the wire breaks signature.

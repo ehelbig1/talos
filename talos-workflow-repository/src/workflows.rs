@@ -1542,35 +1542,75 @@ impl WorkflowRepository {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Bind or unbind the default actor on a workflow. Returns true if a
-    /// row was updated. `actor_id = None` clears the binding (the workflow
-    /// becomes "shared mode" — every caller must pass actor_id explicitly,
-    /// otherwise __memory_write__ envelopes silently drop).
+    /// Bind or unbind the default actor on a workflow, and record it.
+    /// `actor_id = None` clears the binding (the workflow becomes "shared
+    /// mode" — every caller must pass actor_id explicitly, otherwise
+    /// __memory_write__ envelopes silently drop). `Ok(None)` = no such
+    /// workflow for this user (nothing written); `Ok(Some(change))` carries
+    /// the binding it replaced.
     ///
-    /// Caller MUST pre-validate that:
-    ///   1. The workflow is owned by `user_id` (this query enforces that).
-    ///   2. When `actor_id` is `Some(_)`, the actor exists, is non-archived,
-    ///      and is owned by the same `user_id` (cross-user actor binding
-    ///      would let user A's workflow stamp user B's actor on every
-    ///      execution — defense in depth lives in the caller per the
-    ///      service-layer pattern; this repo method does NOT re-check the
-    ///      actor side).
+    /// The binding decides which actor's tier ceiling, budget and approval
+    /// policies govern every later run, so it is a privilege change: the row
+    /// is locked, the binding and its `workflow_actor_binding_changed` row in
+    /// `admin_event_log` commit in ONE transaction, and the record names the
+    /// actor it replaced (package CT, 2026-09-19 — until then both surfaces
+    /// wrote the record from a detached task and could not say what was
+    /// replaced).
+    ///
+    /// Caller MUST pre-validate that, when `actor_id` is `Some(_)`, the actor
+    /// exists, is non-archived, and is owned by the same `user_id`
+    /// (cross-user actor binding would let user A's workflow stamp user B's
+    /// actor on every execution — defense in depth lives in the caller per
+    /// the service-layer pattern; this method enforces workflow ownership
+    /// only).
     pub async fn set_workflow_actor_id(
         &self,
         workflow_id: Uuid,
         user_id: Uuid,
         actor_id: Option<Uuid>,
-    ) -> Result<bool> {
-        let result = sqlx::query(
+        surface: ChangeSurface,
+    ) -> Result<Option<ActorBindingChange>> {
+        let mut tx = self.db_pool.begin().await?;
+        let previous: Option<Option<Uuid>> = sqlx::query_scalar(
+            "SELECT actor_id FROM workflows WHERE id = $1 AND user_id = $2 FOR UPDATE",
+        )
+        .bind(workflow_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(previous) = previous else {
+            tx.rollback().await?;
+            return Ok(None);
+        };
+        sqlx::query(
             "UPDATE workflows SET actor_id = $1, updated_at = NOW() \
              WHERE id = $2 AND user_id = $3",
         )
         .bind(actor_id)
         .bind(workflow_id)
         .bind(user_id)
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(result.rows_affected() > 0)
+        talos_admin_event_log::insert_on_conn(
+            &mut tx,
+            Some(user_id),
+            "workflow_actor_binding_changed",
+            "workflow",
+            Some(workflow_id),
+            &match actor_id {
+                Some(aid) => format!("Workflow {workflow_id} bound to actor {aid}"),
+                None => format!("Workflow {workflow_id} actor binding cleared (shared mode)"),
+            },
+            Some(&serde_json::json!({
+                "new_actor_id": actor_id.map(|a| a.to_string()),
+                "previous_actor_id": previous.map(|a| a.to_string()),
+                "shared_mode": actor_id.is_none(),
+                "surface": surface.as_str(),
+            })),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(Some(ActorBindingChange { previous }))
     }
 
     /// Batch fetch of `(workflow_id, name)` pairs scoped to `user_id`.
@@ -2415,6 +2455,30 @@ pub struct ReferencedWorkflow {
     /// Operator-facing explanation, from
     /// [`talos_child_workflow_refs::ChildProtection::reason`].
     pub reason: String,
+}
+
+/// What a recorded workflow actor-binding change replaced (`None` = the
+/// workflow was in shared mode).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActorBindingChange {
+    pub previous: Option<Uuid>,
+}
+
+/// The API surface a recorded change came through — a closed set, stamped on
+/// the record so forensics can tell the dashboard from an MCP agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeSurface {
+    Mcp,
+    Graphql,
+}
+
+impl ChangeSurface {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mcp => "mcp",
+            Self::Graphql => "graphql",
+        }
+    }
 }
 
 /// What a batch delete actually did, with each refusal separated by CAUSE.

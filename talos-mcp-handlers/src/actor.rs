@@ -2700,60 +2700,22 @@ async fn handle_set_actor_llm_tier_ceiling(
         },
     };
 
-    // Capture the previous tier so the audit record shows the full
-    // transition (old → new). Swallow lookup errors for audit purposes —
-    // the update proceeds regardless; worst case the audit entry reads
-    // "unknown → tier1" which is still better than no record at all.
-    let previous = state
-        .actor_repo
-        .get_actor_max_llm_tier(actor_id)
-        .await
-        .ok()
-        .flatten();
-
-    let updated = match state
+    // The change and its `admin_event_log` record commit in ONE transaction
+    // inside the repository (package CT): a tier change is never applied
+    // without its record, and a failed record fails the call.
+    let change = match state
         .actor_repo
         .set_actor_max_llm_tier(actor_id, user_id, tier)
         .await
     {
-        Ok(n) => n,
+        Ok(Some(change)) => change,
+        Ok(None) => return mcp_error(req_id, -32602, "Actor not found or access denied"),
         Err(e) => {
             tracing::error!(%actor_id, error = %e, "set_actor_llm_tier_ceiling failed");
             return mcp_error(req_id, -32603, "Failed to update actor tier ceiling");
         }
     };
-    if !updated {
-        return mcp_error(req_id, -32602, "Actor not found or access denied");
-    }
-
-    // Audit log — tier changes are security-sensitive policy changes.
-    // The admin_event_log has an append-only trigger so an attacker who
-    // compromised the MCP layer can't flip-tier-exfiltrate-flip-back
-    // and leave no trace. Best-effort: failure to record doesn't fail
-    // the API call, but we log the error at WARN for operator visibility.
-    let prev_str = previous.map(|t| t.as_signing_str()).unwrap_or("unknown");
-    let details = serde_json::json!({
-        "previous_tier": prev_str,
-        "new_tier": tier.as_signing_str(),
-    });
-    if let Err(e) = state
-        .actor_repo
-        .insert_admin_event_log(
-            user_id,
-            "actor_llm_tier_ceiling_set",
-            "actor",
-            Some(actor_id),
-            &format!("Actor tier ceiling: {prev_str} → {}", tier.as_signing_str()),
-            Some(&details),
-        )
-        .await
-    {
-        tracing::warn!(
-            %actor_id,
-            error = %e,
-            "set_actor_llm_tier_ceiling: audit log write failed (policy change applied)"
-        );
-    }
+    let prev_str = change.previous.as_deref().unwrap_or("unknown");
 
     mcp_text(
         req_id,
@@ -2811,54 +2773,21 @@ async fn handle_set_actor_egress_scope(
         },
     };
 
-    // Capture the previous scope for the audit transition (best-effort).
-    let previous = state
-        .actor_repo
-        .get_actor_egress_scope(actor_id)
-        .await
-        .ok()
-        .flatten()
-        .flatten();
-
-    let updated = match state
+    // Change + record in ONE transaction (package CT).
+    let change = match state
         .actor_repo
         .set_actor_egress_scope(actor_id, user_id, scope)
         .await
     {
-        Ok(n) => n,
+        Ok(Some(change)) => change,
+        Ok(None) => return mcp_error(req_id, -32602, "Actor not found or access denied"),
         Err(e) => {
             tracing::error!(%actor_id, error = %e, "set_actor_egress_scope failed");
             return mcp_error(req_id, -32603, "Failed to update actor egress scope");
         }
     };
-    if !updated {
-        return mcp_error(req_id, -32602, "Actor not found or access denied");
-    }
-
-    let prev_str = previous.map(|s| s.as_signing_str()).unwrap_or("default");
+    let prev_str = change.previous.as_deref().unwrap_or("default");
     let new_str = scope.map(|s| s.as_signing_str()).unwrap_or("default");
-    let details = serde_json::json!({
-        "previous_egress_scope": prev_str,
-        "new_egress_scope": new_str,
-    });
-    if let Err(e) = state
-        .actor_repo
-        .insert_admin_event_log(
-            user_id,
-            "actor_egress_scope_set",
-            "actor",
-            Some(actor_id),
-            &format!("Actor egress scope: {prev_str} → {new_str}"),
-            Some(&details),
-        )
-        .await
-    {
-        tracing::warn!(
-            %actor_id,
-            error = %e,
-            "set_actor_egress_scope: audit log write failed (policy change applied)"
-        );
-    }
 
     mcp_text(
         req_id,
@@ -2917,56 +2846,20 @@ async fn handle_set_actor_write_ceiling(
         },
     };
 
-    let previous = state
-        .actor_repo
-        .get_actor_max_write_ceiling(actor_id)
-        .await
-        .ok()
-        .flatten();
-
-    let updated = match state
+    // Change + record in ONE transaction (package CT).
+    let change = match state
         .actor_repo
         .set_actor_max_write_ceiling(actor_id, user_id, ceiling)
         .await
     {
-        Ok(n) => n,
+        Ok(Some(change)) => change,
+        Ok(None) => return mcp_error(req_id, -32602, "Actor not found or access denied"),
         Err(e) => {
             tracing::error!(%actor_id, error = %e, "set_actor_write_ceiling failed");
             return mcp_error(req_id, -32603, "Failed to update actor write ceiling");
         }
     };
-    if !updated {
-        return mcp_error(req_id, -32602, "Actor not found or access denied");
-    }
-
-    // Audit log — write-ceiling changes are security-sensitive policy changes
-    // (append-only trigger on admin_event_log). Best-effort.
-    let prev_str = previous.map(|c| c.as_signing_str()).unwrap_or("unknown");
-    let details = serde_json::json!({
-        "previous_ceiling": prev_str,
-        "new_ceiling": ceiling.as_signing_str(),
-    });
-    if let Err(e) = state
-        .actor_repo
-        .insert_admin_event_log(
-            user_id,
-            "actor_write_ceiling_set",
-            "actor",
-            Some(actor_id),
-            &format!(
-                "Actor write ceiling: {prev_str} → {}",
-                ceiling.as_signing_str()
-            ),
-            Some(&details),
-        )
-        .await
-    {
-        tracing::warn!(
-            %actor_id,
-            error = %e,
-            "set_actor_write_ceiling: audit log write failed (policy change applied)"
-        );
-    }
+    let prev_str = change.previous.as_deref().unwrap_or("unknown");
 
     // DISCLOSE, do not refuse. Setting a ceiling before enabling enforcement
     // is a legitimate order of operations, so this never blocks the write — but

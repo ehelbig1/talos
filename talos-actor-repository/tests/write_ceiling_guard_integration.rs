@@ -47,7 +47,17 @@ async fn setup(pool: &PgPool) {
             user_id uuid NOT NULL, \
             name text NOT NULL DEFAULT 'a', \
             max_write_ceiling text NOT NULL DEFAULT 'readonly' \
-                CHECK (max_write_ceiling IN ('readonly', 'write')));",
+                CHECK (max_write_ceiling IN ('readonly', 'write'))); \
+         DROP TABLE IF EXISTS admin_event_log CASCADE; \
+         CREATE TABLE admin_event_log ( \
+            id bigserial PRIMARY KEY, \
+            user_id uuid, \
+            event_type text NOT NULL, \
+            resource_type text NOT NULL, \
+            resource_id uuid, \
+            summary text NOT NULL, \
+            details jsonb, \
+            created_at timestamptz NOT NULL DEFAULT now());",
     )
     .await
     .unwrap();
@@ -120,7 +130,7 @@ async fn guard_blocks_bulk_clobber_but_allows_sanctioned_grant() {
         .set_actor_max_write_ceiling(actor, user, WriteCeiling::Write)
         .await
         .expect("sanctioned grant should not error");
-    assert!(granted, "grant should report a row updated");
+    assert!(granted.is_some(), "grant should report a row updated");
     assert_eq!(ceiling_of(&pool, actor).await, "write");
 
     // (C) Locking back down (write->readonly) is always allowed.
@@ -128,6 +138,25 @@ async fn guard_blocks_bulk_clobber_but_allows_sanctioned_grant() {
         .set_actor_max_write_ceiling(actor, user, WriteCeiling::ReadOnly)
         .await
         .expect("lock-down should not error");
-    assert!(locked);
+    assert!(locked.is_some());
     assert_eq!(ceiling_of(&pool, actor).await, "readonly");
+
+    // Package CT: each sanctioned change is recorded with what it replaced;
+    // the refused bulk statement recorded nothing.
+    let recorded: Vec<(String, String)> = sqlx::query_as(
+        "SELECT details->>'previous_ceiling', details->>'new_ceiling' \
+         FROM admin_event_log WHERE event_type = 'actor_write_ceiling_set' \
+           AND resource_id = $1 ORDER BY id",
+    )
+    .bind(actor)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        recorded,
+        vec![
+            ("readonly".to_string(), "write".to_string()),
+            ("write".to_string(), "readonly".to_string()),
+        ]
+    );
 }

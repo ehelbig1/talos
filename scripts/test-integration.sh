@@ -421,6 +421,10 @@ CTRL_TESTS=(
     # the change: API keys (once, not twice), capability grants on every
     # surface incl. the bootstrap, 2FA enable/disable (2026-09-18).
     "credential_audit_record_tests"
+    # Privilege changes (actor ceilings on both surfaces, module permissions,
+    # workflow actor binding, module capability world) record in the same
+    # transaction, with what they replaced (2026-09-19).
+    "privilege_audit_record_tests"
     # The immutability triggers were BEFORE DELETE OR UPDATE ... FOR EACH ROW,
     # and TRUNCATE fires no row trigger: it emptied an audit table with nothing
     # raised. Drives TRUNCATE/DELETE/UPDATE against every immutable table on a

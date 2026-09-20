@@ -589,6 +589,28 @@ impl InlineCompileService {
 
         let template_id = existing_id.unwrap_or_else(Uuid::new_v4);
 
+        // Recompiling an EXISTING module under a different world is a
+        // capability change; the modules write records it in its own
+        // transaction (package CT). A fresh id has no previous world, so a
+        // first compile records nothing.
+        let module_name = input.node_id.to_string();
+        let workflow_id = input.workflow_id;
+        let describe = move |old_world: &str, new_world: &str| {
+            (
+                format!(
+                    "inline compile capability change: module='{module_name}' \
+                     module_id={template_id} old_world='{old_world}' new_world='{new_world}'"
+                ),
+                serde_json::json!({
+                    "module_id": template_id,
+                    "module_name": module_name,
+                    "old_capability_world": old_world,
+                    "new_capability_world": new_world,
+                    "workflow_id": workflow_id,
+                }),
+            )
+        };
+
         self.module_repo
             .mirror_sandbox_compile_to_modules(
                 template_id,
@@ -608,6 +630,11 @@ impl InlineCompileService {
                 input.dependencies,
                 // Inline add_node compiles are rust_code-only by definition.
                 "rust",
+                Some(talos_module_repository::CapabilityChangeAudit {
+                    recorded_by: input.user_id,
+                    event_type: "inline_compile_capability_change",
+                    describe: &describe,
+                }),
             )
             .await
             .map_err(|e| {

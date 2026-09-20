@@ -1509,6 +1509,8 @@ async fn handle_compile_custom_sandbox(
                     integration_name.as_deref(),
                     dependencies,
                     &language_str,
+                    // A fresh id: there is no previous world to record.
+                    None,
                 )
                 .await
             {
@@ -2899,25 +2901,26 @@ async fn handle_update_module_secrets(
         }
     }
 
-    let (nt_rows, wm_rows) = match state
+    // The replace and its `admin_event_log` record commit in ONE transaction
+    // inside the repository (package CT); a failed record fails the call.
+    let change = match state
         .module_repo
         .update_module_allowed_secrets(module_id, user_id, &allowed_secrets)
         .await
     {
-        Ok(r) => r,
+        Ok(Some(change)) => change,
+        Ok(None) => {
+            return Some(mcp_denied(
+                req_id,
+                -32000,
+                "Module not found or access denied",
+            ));
+        }
         Err(e) => {
             tracing::error!("update_module_secrets failed: {:#}", e);
             return Some(mcp_error(req_id, -32000, "Failed to update module secrets"));
         }
     };
-
-    if nt_rows == 0 && wm_rows == 0 {
-        return Some(mcp_denied(
-            req_id,
-            -32000,
-            "Module not found or access denied",
-        ));
-    }
 
     // Invalidate Redis cache (best-effort)
     if let Ok(redis_url) = std::env::var("REDIS_URL") {
@@ -2935,50 +2938,15 @@ async fn handle_update_module_secrets(
     tracing::info!(
         module_id = %module_id,
         allowed_secrets = ?allowed_secrets,
-        nt_rows,
-        wm_rows,
         "Updated module allowed_secrets"
     );
 
-    // MCP-395 (2026-05-11): persistent audit log for module
-    // capability mutations. The tracing::info! line above goes to
-    // stdout — ephemeral console state, not a queryable DB row. An
-    // attacker with a stolen MCP key could flip a benign module's
-    // allowed_secrets to include sensitive vault paths, use the
-    // elevated grant during a normal-looking workflow run, then
-    // revert — no persistent trace in admin_event_log. Same audit-
-    // gap class as MCP-389 through MCP-394. update_module_secrets,
-    // update_module_hosts, and update_module_methods are all
-    // REPLACE-style capability mutations — the previous state is
-    // unrecoverable from the row alone, so the audit log carries
-    // the new state and forensics reconstructs the diff by walking
-    // prior rows for the same module.
-    crate::actor::spawn_log_admin_event(
-        state.db_pool.clone(),
-        user_id,
-        "module_allowed_secrets_updated",
-        "module",
-        Some(module_id),
-        format!(
-            "Module {} allowed_secrets replaced ({} entries)",
-            module_id,
-            allowed_secrets.len()
-        ),
-        Some(serde_json::json!({
-            "allowed_secrets": &allowed_secrets,
-        })),
-    );
-
-    // `wm_rows` is always 0 post-Phase-5.1 (the wasm_modules table was dropped
-    // in Phase 5; the repo method now returns (rows, 0) for back-compat). The
-    // affected row count lives in `rows_affected` to match the response shape
-    // of update_module_hosts / update_module_methods.
-    let _ = wm_rows;
     let response = serde_json::json!({
         "status": "updated",
         "module_id": module_id,
         "allowed_secrets": allowed_secrets,
-        "rows_affected": nt_rows,
+        "previous_allowed_secrets": change.previous,
+        "rows_affected": 1,
     });
     Some(mcp_text(
         req_id,
@@ -3062,25 +3030,25 @@ async fn handle_update_module_hosts(
         }
     }
 
-    let rows = match state
+    // Replace + record in ONE transaction (package CT).
+    let change = match state
         .module_repo
         .update_module_allowed_hosts(module_id, user_id, &allowed_hosts)
         .await
     {
-        Ok(r) => r,
+        Ok(Some(change)) => change,
+        Ok(None) => {
+            return Some(mcp_denied(
+                req_id,
+                -32000,
+                "Module not found or access denied",
+            ));
+        }
         Err(e) => {
             tracing::error!("update_module_hosts failed: {:#}", e);
             return Some(mcp_error(req_id, -32000, "Failed to update module hosts"));
         }
     };
-
-    if rows == 0 {
-        return Some(mcp_denied(
-            req_id,
-            -32000,
-            "Module not found or access denied",
-        ));
-    }
 
     if let Ok(redis_url) = std::env::var("REDIS_URL") {
         if let Ok(client) = redis::Client::open(redis_url.as_str()) {
@@ -3097,38 +3065,15 @@ async fn handle_update_module_hosts(
     tracing::info!(
         module_id = %module_id,
         allowed_hosts = ?allowed_hosts,
-        rows,
         "Updated module allowed_hosts"
-    );
-
-    // MCP-395 (2026-05-11): persistent audit log for module
-    // capability mutations — siblng to update_module_secrets and
-    // update_module_methods. allowed_hosts is the module's HTTP
-    // SSRF allowlist; flipping a benign module's allowed_hosts to
-    // include an attacker-controlled domain is the simplest
-    // exfiltration path. Console-only tracing isn't a durable
-    // forensic record.
-    crate::actor::spawn_log_admin_event(
-        state.db_pool.clone(),
-        user_id,
-        "module_allowed_hosts_updated",
-        "module",
-        Some(module_id),
-        format!(
-            "Module {} allowed_hosts replaced ({} entries)",
-            module_id,
-            allowed_hosts.len()
-        ),
-        Some(serde_json::json!({
-            "allowed_hosts": &allowed_hosts,
-        })),
     );
 
     let response = serde_json::json!({
         "status": "updated",
         "module_id": module_id,
         "allowed_hosts": allowed_hosts,
-        "rows_affected": rows,
+        "previous_allowed_hosts": change.previous,
+        "rows_affected": 1,
     });
     Some(mcp_text(
         req_id,
@@ -3202,25 +3147,25 @@ async fn handle_update_module_methods(
         }
     }
 
-    let rows = match state
+    // Replace + record in ONE transaction (package CT).
+    let change = match state
         .module_repo
         .update_module_allowed_methods(module_id, user_id, &allowed_methods)
         .await
     {
-        Ok(r) => r,
+        Ok(Some(change)) => change,
+        Ok(None) => {
+            return Some(mcp_denied(
+                req_id,
+                -32000,
+                "Module not found or access denied",
+            ));
+        }
         Err(e) => {
             tracing::error!("update_module_methods failed: {:#}", e);
             return Some(mcp_error(req_id, -32000, "Failed to update module methods"));
         }
     };
-
-    if rows == 0 {
-        return Some(mcp_denied(
-            req_id,
-            -32000,
-            "Module not found or access denied",
-        ));
-    }
 
     if let Ok(redis_url) = std::env::var("REDIS_URL") {
         if let Ok(client) = redis::Client::open(redis_url.as_str()) {
@@ -3237,36 +3182,15 @@ async fn handle_update_module_methods(
     tracing::info!(
         module_id = %module_id,
         allowed_methods = ?allowed_methods,
-        rows,
         "Updated module allowed_methods"
-    );
-
-    // MCP-395 (2026-05-11): persistent audit log for module
-    // capability mutations — sibling to update_module_secrets and
-    // update_module_hosts. allowed_methods controls which HTTP verbs
-    // the module can use (a benign GET-only module flipped to
-    // accept DELETE is a different threat surface).
-    crate::actor::spawn_log_admin_event(
-        state.db_pool.clone(),
-        user_id,
-        "module_allowed_methods_updated",
-        "module",
-        Some(module_id),
-        format!(
-            "Module {} allowed_methods replaced ({} entries)",
-            module_id,
-            allowed_methods.len()
-        ),
-        Some(serde_json::json!({
-            "allowed_methods": &allowed_methods,
-        })),
     );
 
     let response = serde_json::json!({
         "status": "updated",
         "module_id": module_id,
         "allowed_methods": allowed_methods,
-        "rows_affected": rows,
+        "previous_allowed_methods": change.previous,
+        "rows_affected": 1,
     });
     Some(mcp_text(
         req_id,
