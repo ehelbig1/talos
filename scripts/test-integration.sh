@@ -355,6 +355,20 @@ if ! cargo test -p talos-workflow-engine-nats --test nats_worker_permissions; th
     rc=1
 fi
 
+# ── Signed-RPC subscribers :: one replica serves each request  [nats + nats-perm]
+# Every controller replica binds the signed-RPC subjects. With a plain subscribe
+# the broker hands each worker request to ALL of them: measured 2026-09-19 with
+# two kernels on one subject, the replay guard's loser answered `Unauthorized`
+# ahead of the winner's reply for 199 of 199 requests while the write still
+# landed, and with the guard off both replicas executed (398 runs for 199
+# requests). Only a live broker can show delivery counts; the fifth test drives
+# the worker credential on the permissioned broker.
+echo
+echo "▶ signed-RPC queue group :: talos-rpc-subscribers  [nats + nats-perm]"
+if ! cargo test -p talos-rpc-subscribers --lib kernel_two_replica; then
+    rc=1
+fi
+
 # ── Audit ledger stream is BOUNDED, and an existing unbounded one is updated  [nats]
 # The AUDIT_LEDGER JetStream stream was created with `..Default::default()` for
 # two months — no max_age, no max_msgs, no max_bytes — and kept every acked

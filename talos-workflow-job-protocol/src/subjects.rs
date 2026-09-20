@@ -135,6 +135,27 @@ pub const WORKERS_CMD_SHUTDOWN: &str = "talos.workers.cmd.shutdown";
 /// `/subsz`.
 pub const WORKERS_CMD_CANCEL: &str = "talos.workers.cmd.cancel";
 
+// ── Controller signed-RPC subscribers ──────────────────────────────────────
+
+/// The NATS queue group every controller replica joins for the signed-RPC
+/// subjects it serves on a worker's behalf (`talos.memory.op`,
+/// `talos.graph.search`, `talos.database.query`, `talos.integration_state.op`,
+/// `talos.ml.predict`, `talos.ml.fewshot`, `talos.state.write`).
+///
+/// **A queue subscribe, never a plain one.** A plain subscribe delivers each
+/// worker request to EVERY controller replica. Measured on a live broker with
+/// two replicas (2026-09-19): with the cross-replica replay guard on, one
+/// replica executes and the other answers `Unauthorized`, and the requester
+/// takes whichever reply arrives first — the refusal, for 199 of 199 requests
+/// once the winner does 1 ms of work; with the guard off, both replicas
+/// execute (398 handler runs for 199 requests). One group name for every
+/// subject is correct: NATS scopes a queue group per subject, so members
+/// share work subject by subject.
+///
+/// Contrast [`WORKERS_CMD_CANCEL`], where fan-out to every subscriber is the
+/// design and a queue group would be the defect.
+pub const CONTROLLER_RPC_QUEUE_GROUP: &str = "talos-controller-rpc";
+
 // ── Agent orchestration ────────────────────────────────────────────────────
 
 /// Per-target agent invoke subject: `talos.agent.<target>.invoke`. The worker's

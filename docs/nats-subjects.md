@@ -45,13 +45,44 @@ The `AUDIT_LEDGER` JetStream stream behind that subject is a durable buffer in f
 | `talos.events.<exec_id>.<event_type>` | `subjects::workflow_event_for(exec_id, ty)` | guest event JSON | F&F | worker `events` host | event subscribers |
 | `talos.llm.stream.<execution_id>` | `subjects::llm_stream_for(execution_id)` | token-chunk JSON | Sub | **none today** (measured 2026-09-10: no publisher in `worker/` or `talos-worker-runtime/`) | GraphQL subscription relay (`talos-api` subscriptions) |
 | `talos.alerts.execution_failed` | `EXECUTION_FAILED_ALERT_SUBJECT` (in `talos-execution-result-collector`) | failure-alert JSON | F&F | execution-result collector | alert consumers |
-| `talos.memory.op` | `talos_memory::memory_rpc::SUBJECT_MEMORY_OP` | `MemoryOp` | R/R (cap 16) | worker | controller memory subscriber |
-| `talos.graph.search` | `talos_memory::graph_rpc::SUBJECT_GRAPH_SEARCH` | `GraphSearchRequest` | R/R (cap 8) | worker | controller graph subscriber |
-| `talos.database.query` | `talos_memory::database_rpc::SUBJECT_DATABASE_QUERY` | `DatabaseRpcRequest` | R/R (cap 8) | worker | controller DB subscriber |
-| `talos.state.write` | `talos_memory::state_rpc::SUBJECT_STATE_WRITE` | `StateWriteRequest` | F&F (cap 32) | worker | controller state subscriber |
-| `talos.ml.predict` | `talos_memory::ml_rpc::SUBJECT_ML_PREDICT` | `MlPredictRequest` | R/R (cap 8) | worker | controller ML subscriber |
-| `talos.ml.fewshot` | `talos_memory::ml_rpc::SUBJECT_ML_FEWSHOT` | `MlFewShotRequest` | R/R (cap 8) | worker | controller ML subscriber |
-| `talos.integration_state.op` | `talos_memory::integration_state_rpc::SUBJECT_INTEGRATION_STATE_OP` | `IntegrationStateRequest` | R/R | worker | controller integration-state subscriber |
+| `talos.memory.op` | `talos_memory::memory_rpc::SUBJECT_MEMORY_OP` | `MemoryOp` | R/R (cap 16), queue group | worker | controller memory subscriber |
+| `talos.graph.search` | `talos_memory::graph_rpc::SUBJECT_GRAPH_SEARCH` | `GraphSearchRequest` | R/R (cap 8), queue group | worker | controller graph subscriber |
+| `talos.database.query` | `talos_memory::database_rpc::SUBJECT_DATABASE_QUERY` | `DatabaseRpcRequest` | R/R (cap 8), queue group | worker | controller DB subscriber |
+| `talos.state.write` | `talos_memory::state_rpc::SUBJECT_STATE_WRITE` | `StateWriteRequest` | F&F (cap 32), queue group | worker | controller state subscriber |
+| `talos.ml.predict` | `talos_memory::ml_rpc::SUBJECT_ML_PREDICT` | `MlPredictRequest` | R/R (cap 8), queue group | worker | controller ML subscriber |
+| `talos.ml.fewshot` | `talos_memory::ml_rpc::SUBJECT_ML_FEWSHOT` | `MlFewShotRequest` | R/R (cap 8), queue group | worker | controller ML subscriber |
+| `talos.integration_state.op` | `talos_memory::integration_state_rpc::SUBJECT_INTEGRATION_STATE_OP` | `IntegrationStateRequest` | R/R, queue group | worker | controller integration-state subscriber |
+
+### Controller replicas: which subscriptions share work and which fan out
+
+The seven signed-RPC subjects above are bound with a **queue subscribe** in the
+one group `subjects::CONTROLLER_RPC_QUEUE_GROUP` (`talos-controller-rpc`), at
+the single bind site `talos-rpc-subscribers/src/kernel.rs::bind_subscription`,
+so each worker request reaches exactly one controller replica. With a plain
+subscribe every replica received every request (measured 2026-09-19, two
+replicas on a live broker): with the cross-replica replay guard on, the losing
+replica's `Unauthorized` reached the worker ahead of the executing replica's
+reply for 199 of 199 requests; with the guard off, both replicas executed. A
+queue group changes no subject, so the worker credential's permissions are
+unchanged (driven on the permissioned broker by
+`the_worker_credential_is_served_through_the_queue_group`).
+
+Plain subscribes that are correct as they are: `talos.workers.cmd.cancel`
+(every worker must see it), `talos.workers.heartbeat.>` (every replica keeps
+its own fleet view), per-request reply inboxes, and the envelope-sealing claim
+inbox (per replica).
+
+Two controller subscribers are still plain and are **not** correct at more than
+one replica (recorded 2026-09-19, not yet changed):
+
+- `wasm.log.*` (`controller/src/bootstrap/background.rs`): each replica both
+  INSERTs the line (`workflow_execution_logs` has no de-duplication key, so N
+  replicas store N copies) and broadcasts it to its own GraphQL subscribers
+  (which needs fan-out). The two halves need separate subscriptions: a queue
+  group for the insert, a plain subscribe for the broadcast.
+- `talos.results.*` observer: a status-guarded, idempotent UPDATE counted per
+  row transition, so N replicas do N−1 redundant verifies and UPDATEs and no
+  wrong write. A queue group is safe there.
 
 `talos.` (namespace prefix) is `subjects::NAMESPACE_PREFIX` — used by the worker's
 guest-publish deny-list (`RESERVED_PUBLISH_PREFIXES`), not a subject itself.
