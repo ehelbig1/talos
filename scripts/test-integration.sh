@@ -813,6 +813,12 @@ CTRL_TESTS=(
     # subscribers double the rows. Needs `TALOS_TEST_NATS_URL` + the `common`
     # harness, so CTRL_TESTS (sub-leg 64b).
     "wasm_log_relay_tests"
+    # The fleet lease for periodic background loops (2026-09-20). Two pools on
+    # one database stand in for two controller replicas: one holds a period,
+    # the other is refused even with no lock held (the case an advisory lock
+    # gets wrong), a lapsed lease is taken over in place, sixteen concurrent
+    # claims yield one holder, and an unreadable lease is not a claim.
+    "background_lease_tests"
     # The `__memory_write__` write-ceiling gate (#750). Needs a real Postgres
     # because the property under test is "no actor_memory ROW" — the thing a
     # silent drop and a correct refusal both produce, distinguished only by the

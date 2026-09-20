@@ -1,0 +1,19 @@
+[package]
+name = "talos-background-lease"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+# Kept in lockstep with talos-metrics / talos-task-supervision (prometheus 0.14).
+prometheus = "0.14"
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls"] }
+tracing.workspace = true
+# The lease key is a `BackgroundTask`: a closed compile-time set, so neither the
+# table key nor the metric label can be a caller-authored string.
+talos-task-supervision = { path = "../talos-task-supervision" }
+
+[lints]
+workspace = true

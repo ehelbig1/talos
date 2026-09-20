@@ -3698,27 +3698,27 @@ pub(crate) fn spawn_analytics_tasks(
         let mut shutdown = sla_degradation_shutdown;
         // Wait 2 minutes after startup before first check to let executions settle
         tokio::time::sleep(std::time::Duration::from_secs(120)).await;
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(900)); // 15 min
-                                                                                       // MCP-469: disable redirect following for SLA notification
-                                                                                       // webhooks. The SSRF check at fire time validates the literal
-                                                                                       // URL, but reqwest's default `Policy::limited(10)` would follow
-                                                                                       // a 302/303 to an internal host beneath the SSRF gate. Matches
-                                                                                       // the canonical pattern in approval_gate / failure_webhook.
-                                                                                       //
-                                                                                       // Fallback to `Client::new()` removed: that path re-enabled the
-                                                                                       // default redirect policy and would silently reopen the SSRF
-                                                                                       // gap. `.build()` rarely fails (TLS init issues only), and
-                                                                                       // `Client::new()` would also panic on the same failure mode —
-                                                                                       // so a loud `.expect()` is functionally equivalent and removes
-                                                                                       // the false sense of recovery.
-                                                                                       // MCP-1034: explicit connect_timeout (2s on 5s budget) so a
-                                                                                       // black-holed SLA-webhook endpoint fails on connect rather than
-                                                                                       // burning the whole loop tick.
-                                                                                       // Built via the shared SSRF-safe builder: redirect(none) + the
-                                                                                       // connect-time ControllerSsrfResolver. The SLA-alert webhook URL is
-                                                                                       // user/workflow-supplied (SLA threshold config) and SSRF-checked at fire
-                                                                                       // time, but that call-time check can't stop DNS rebinding — the same gap
-                                                                                       // PR #162 closed for the sibling fire sites.
+        let mut interval = tokio::time::interval(SLA_DEGRADATION_PERIOD);
+        // MCP-469: disable redirect following for SLA notification
+        // webhooks. The SSRF check at fire time validates the literal
+        // URL, but reqwest's default `Policy::limited(10)` would follow
+        // a 302/303 to an internal host beneath the SSRF gate. Matches
+        // the canonical pattern in approval_gate / failure_webhook.
+        //
+        // Fallback to `Client::new()` removed: that path re-enabled the
+        // default redirect policy and would silently reopen the SSRF
+        // gap. `.build()` rarely fails (TLS init issues only), and
+        // `Client::new()` would also panic on the same failure mode —
+        // so a loud `.expect()` is functionally equivalent and removes
+        // the false sense of recovery.
+        // MCP-1034: explicit connect_timeout (2s on 5s budget) so a
+        // black-holed SLA-webhook endpoint fails on connect rather than
+        // burning the whole loop tick.
+        // Built via the shared SSRF-safe builder: redirect(none) + the
+        // connect-time ControllerSsrfResolver. The SLA-alert webhook URL is
+        // user/workflow-supplied (SLA threshold config) and SSRF-checked at fire
+        // time, but that call-time check can't stop DNS rebinding — the same gap
+        // PR #162 closed for the sibling fire sites.
         let http_client = talos_http_utils::outbound::build_outbound_webhook_client_with_timeout(
             "talos-sla-webhook/1.0",
             std::time::Duration::from_secs(5),
@@ -3734,6 +3734,17 @@ pub(crate) fn spawn_analytics_tasks(
             if !should_proceed {
                 tracing::info!("SLA degradation alerting loop received shutdown signal");
                 break TaskExit::ShuttingDown;
+            }
+            // Same lease as the breach monitor: this tick POSTs a webhook and
+            // bumps `workflow_alerts.occurrence_count`, once per fleet.
+            if !talos_background_lease::claim_tick(
+                &sla_pool,
+                BackgroundTask::SlaDegradationMonitor,
+                SLA_DEGRADATION_PERIOD,
+            )
+            .await
+            {
+                continue;
             }
 
             // 1. Check workflows with explicit SLA thresholds
@@ -4168,6 +4179,17 @@ pub(crate) fn classify_job_result_parse_error(err: &serde_json::Error) -> &'stat
 pub(crate) use talos_wasm_log_relay::{
     WASM_LOG_ORPHAN_NO_EXECUTION_ROW, WASM_LOG_ORPHAN_UNPARSEABLE_ID,
 };
+
+/// Tick periods of the two SLA monitors. Each is BOTH the ticker's interval and
+/// the fleet lease's period (`talos-background-lease`), so the two cannot drift.
+const SLA_BREACH_PERIOD: std::time::Duration = std::time::Duration::from_secs(300);
+const SLA_DEGRADATION_PERIOD: std::time::Duration = std::time::Duration::from_secs(900);
+
+/// The periodic loops in this process that hold a fleet lease per tick.
+pub(crate) const LEASED_TASKS: [BackgroundTask; 2] = [
+    BackgroundTask::SlaBreachMonitor,
+    BackgroundTask::SlaDegradationMonitor,
+];
 
 /// WASM-log subscriber + job-result subscriber (both supervisor-wrapped,
 /// MCP-1121/1122). Extracted verbatim from `main()`; spawn order preserved.
@@ -4712,21 +4734,21 @@ pub(crate) fn spawn_late_background_tasks(
     let sla_breach_shutdown = bg_shutdown_rx.clone();
     spawn_supervised(BackgroundTask::SlaBreachMonitor, async move {
         let mut shutdown = sla_breach_shutdown;
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(300)); // Every 5 min
-                                                                                       // MCP-497: same SSRF-via-redirect fix as MCP-469/470 — the
-                                                                                       // `check_outbound_url_no_ssrf` gate below catches the literal
-                                                                                       // URL but a 302 from the validated host to an internal host
-                                                                                       // bypasses it if reqwest's default redirect policy is in
-                                                                                       // effect. `Client::default()` (the prior fallback) re-enables
-                                                                                       // following up to 10 hops, so a build-time TLS failure here
-                                                                                       // silently reopened the SSRF gap. `.expect()` makes the
-                                                                                       // failure loud at startup; `.redirect(Policy::none())` makes
-                                                                                       // the SSRF re-check load-bearing.
-                                                                                       // MCP-1034: explicit connect_timeout — fast-fail on black-holed
-                                                                                       // SLA-alert endpoint.
-                                                                                       // Built via the shared SSRF-safe builder (redirect(none) + connect-time
-                                                                                       // ControllerSsrfResolver) — same user-supplied SLA-webhook + DNS-rebinding
-                                                                                       // rationale as the sibling SLA-monitor client above (PR #162).
+        let mut interval = tokio::time::interval(SLA_BREACH_PERIOD);
+        // MCP-497: same SSRF-via-redirect fix as MCP-469/470 — the
+        // `check_outbound_url_no_ssrf` gate below catches the literal
+        // URL but a 302 from the validated host to an internal host
+        // bypasses it if reqwest's default redirect policy is in
+        // effect. `Client::default()` (the prior fallback) re-enables
+        // following up to 10 hops, so a build-time TLS failure here
+        // silently reopened the SSRF gap. `.expect()` makes the
+        // failure loud at startup; `.redirect(Policy::none())` makes
+        // the SSRF re-check load-bearing.
+        // MCP-1034: explicit connect_timeout — fast-fail on black-holed
+        // SLA-alert endpoint.
+        // Built via the shared SSRF-safe builder (redirect(none) + connect-time
+        // ControllerSsrfResolver) — same user-supplied SLA-webhook + DNS-rebinding
+        // rationale as the sibling SLA-monitor client above (PR #162).
         let client =
             talos_http_utils::outbound::build_outbound_webhook_client("talos-sla-webhook/1.0")
                 .expect("SLA monitor: failed to build hardened reqwest client");
@@ -4738,6 +4760,17 @@ pub(crate) fn spawn_late_background_tasks(
             if !should_proceed {
                 tracing::info!("SLA threshold breach loop received shutdown signal");
                 break TaskExit::ShuttingDown;
+            }
+            // Every replica runs this loop and its tick POSTs a customer's
+            // webhook: one replica per period holds the fleet lease.
+            if !talos_background_lease::claim_tick(
+                &sla_pool,
+                BackgroundTask::SlaBreachMonitor,
+                SLA_BREACH_PERIOD,
+            )
+            .await
+            {
+                continue;
             }
 
             // Load all thresholds with their workflow's user_id for scoped queries
@@ -6608,6 +6641,62 @@ mod task_supervision_wiring_tests {
     ///      and `the_fleet_launcher_is_not_supervised_here` below is what
     ///      stops the wrapper migrating back up.
     const EXPECTED_BARE: usize = 7;
+
+    /// TEXTUAL, and stated as such: this loop is bin-private, so no test can
+    /// run it. What is pinned is that each SLA monitor asks for the fleet
+    /// lease — naming ITS task and ITS period — before its first read, and
+    /// skips the tick when refused. The lease's behaviour itself is driven
+    /// against Postgres by `controller/tests/background_lease_tests`.
+    #[test]
+    fn both_sla_monitors_take_the_fleet_lease_before_they_read() {
+        let src = include_str!("background.rs");
+        let prod = src
+            .split("mod task_supervision_wiring_tests")
+            .next()
+            .expect("production text");
+        for (task, period) in [
+            ("SlaBreachMonitor", "SLA_BREACH_PERIOD"),
+            ("SlaDegradationMonitor", "SLA_DEGRADATION_PERIOD"),
+        ] {
+            let start = prod
+                .find(&format!("spawn_supervised(BackgroundTask::{task}"))
+                .unwrap_or_else(|| panic!("{task} spawn not found"));
+            let body = &prod[start..];
+            let end = body[1..]
+                .find("spawn_supervised(BackgroundTask::")
+                .map_or(body.len(), |e| e + 1);
+            let body = &body[..end];
+            let squashed: String = body.split_whitespace().collect();
+            let claim = format!(
+                "if!talos_background_lease::claim_tick(&sla_pool,BackgroundTask::{task},{period},).await{{continue;}}"
+            );
+            let claim_at = squashed
+                .find(&claim)
+                .unwrap_or_else(|| panic!("{task} does not skip its tick on a refused lease"));
+            let first_read = squashed
+                .find(".fetch_all(&sla_pool)")
+                .expect("the loop reads");
+            assert!(claim_at < first_read, "{task} reads before it claims");
+            assert!(
+                squashed.contains(&format!("tokio::time::interval({period})")),
+                "{task}'s ticker and its lease must share one period"
+            );
+        }
+        assert_eq!(
+            super::LEASED_TASKS,
+            [
+                talos_task_supervision::BackgroundTask::SlaBreachMonitor,
+                talos_task_supervision::BackgroundTask::SlaDegradationMonitor
+            ]
+        );
+        let services: String = include_str!("services.rs").split_whitespace().collect();
+        assert!(
+            services.contains(
+                "talos_background_lease::register_metrics(&metrics.registry,&crate::bootstrap::background::LEASED_TASKS,"
+            ),
+            "the lease counter must be registered and seeded for exactly the leased loops"
+        );
+    }
 
     #[test]
     fn every_long_lived_loop_is_supervised() {

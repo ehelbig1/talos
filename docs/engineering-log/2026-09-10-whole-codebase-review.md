@@ -5318,3 +5318,21 @@ two 400 ms channel drains for settling; it now polls for the fifth increment
 and then waits 300 ms for a second copy. The mutation run rebuilt the
 controller test and bin targets per mutation (about four minutes each).
 
+## Package CW (2026-09-20): a fleet lease for periodic loops
+
+The 2026-09-20 inventory mapped all 67 `BackgroundTask` variants to their
+spawn sites and read the ones with outward effects. The first design for the
+SLA monitors was a `pg_try_advisory_xact_lock`, the form the ML policy
+evaluator uses; writing out the two replicas' timelines showed it fixes
+nothing for a periodic loop, because the two tickers are out of phase and the
+lock is free again by the second tick. The evaluator is correct with a lock
+because ITS work is selected by state (`should_evaluate`), so the second
+replica finds nothing to do; the SLA monitors select "every threshold, every
+tick".
+
+Two edit scripts failed on the way: the 5-minute interval line exists twice
+in `background.rs` (another loop), so the replacement was re-targeted by
+position after the spawn marker. The pin's first draft compared the services
+registration with literal newlines, which rustfmt would have been free to
+move; both halves now compare whitespace-squashed text.
+
