@@ -5272,3 +5272,29 @@ comment now says so.
 **Found by the deletion.** Checks 90 and 91 enumerate files with `git ls-files`
 and open them from disk, so the staged deletion made the lint crash mid-run —
 exit 1 with no finding. Both now skip a tracked path that is not on disk.
+
+## Package CU (2026-09-19): every controller replica answered every signed-RPC request
+
+Found in the 2026-09-19 review by reading `kernel.rs`; reproduced before any
+fix was written. The reproduction put two production `spawn_rpc_subscriber`
+kernels, one per NATS connection, on one subject of a disposable
+`nats:2.10-alpine`, with a handler modelling admission: an atomic flag per
+request stands in for the Redis SETNX, the winner optionally sleeps, the loser
+replies `unauthorized` at once.
+
+| guard | winner work | requests | handler executions | first reply ok | first reply refused |
+|---|---|---|---|---|---|
+| on | 0 ms | 199 | 199 | 138 | 61 |
+| on | 1 ms | 199 | 199 | 0 | 199 |
+| on | 5 ms | 199 | 199 | 0 | 199 |
+| off | 0 ms | 199 | 398 | 199 | 0 |
+
+The first draft of the readiness wait accepted "something executed and
+something was refused", which one replica can satisfy alone once the warm-up
+index is claimed; it now requires each replica to have run a handler, so a
+plain-subscribe mutation cannot pass because only one kernel had bound.
+
+The two other plain controller subscribers were read the same afternoon: the
+`wasm.log.*` relay inserts and broadcasts per message, and the `talos.results.*`
+observer runs a status-guarded UPDATE. Their handling is in the CLAUDE.md
+bullet for this package.

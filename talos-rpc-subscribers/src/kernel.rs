@@ -148,6 +148,22 @@ pub(crate) fn next_backoff_secs(current: u64) -> u64 {
     current.saturating_mul(2).min(60)
 }
 
+/// THE bind site for every signed-RPC subject: a QUEUE subscribe in
+/// [`CONTROLLER_RPC_QUEUE_GROUP`], so each worker request reaches exactly one
+/// controller replica. See that constant for the measurement behind it.
+///
+/// [`CONTROLLER_RPC_QUEUE_GROUP`]: talos_workflow_job_protocol::subjects::CONTROLLER_RPC_QUEUE_GROUP
+pub(crate) async fn bind_subscription(
+    nats: &async_nats::Client,
+    subject: &'static str,
+) -> Result<async_nats::Subscriber, async_nats::SubscribeError> {
+    nats.queue_subscribe(
+        subject,
+        talos_workflow_job_protocol::subjects::CONTROLLER_RPC_QUEUE_GROUP.to_string(),
+    )
+    .await
+}
+
 /// The shared subscriber loop. Owns subscription, supervisor re-bind,
 /// semaphore creation, tracked spawn, shutdown, and drain — see the
 /// module docs for the exact split of responsibilities.
@@ -181,7 +197,7 @@ pub(crate) fn spawn_rpc_subscriber<H, Fut>(
         let mut in_flight: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
         let mut backoff_secs: u64 = 1;
         'supervisor: loop {
-            let mut sub = match nats.subscribe(spec.subject).await {
+            let mut sub = match bind_subscription(&nats, spec.subject).await {
                 Ok(s) => s,
                 Err(e) => {
                     tracing::warn!(
@@ -364,6 +380,341 @@ pub(crate) fn record_rpc_metric(
             subject, actor_id = %actor_id, outcome, queue_ms, exec_ms, duration_ms,
             "rpc completed (non-ok outcome)"
         ),
+    }
+}
+
+/// Live-broker behaviour of TWO subscriber kernels on one subject — the
+/// shape of two controller replicas (chart default `replicaCount: 2`).
+/// Gated on `TALOS_TEST_NATS_URL` / `TALOS_TEST_NATS_PERM_URL`; named
+/// explicitly in `scripts/test-integration.sh`, because a gated test nobody
+/// names is a green skip.
+#[cfg(test)]
+mod kernel_two_replica_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    const REQUESTS: usize = 120;
+
+    fn spec(subject: &'static str) -> RpcSubscriberSpec {
+        RpcSubscriberSpec {
+            task: BackgroundTask::MemoryRpcSubscriber,
+            subject,
+            max_in_flight: 8,
+            active_msg: "test subscriber active",
+            subscribe_failed_msg: "test subscribe failed",
+            rebind_event_kind: "test_rebinding",
+            rebind_msg: "test rebinding",
+        }
+    }
+
+    fn unique_subject(tag: &str) -> &'static str {
+        Box::leak(
+            format!("talos.test.kernel.{tag}.{}", uuid::Uuid::new_v4().simple()).into_boxed_str(),
+        )
+    }
+
+    /// What two replicas observed.
+    struct Replicas {
+        /// Handler runs that EXECUTED (won the modelled replay guard, or ran
+        /// with it off), per replica.
+        executed: [Arc<AtomicUsize>; 2],
+        /// Handler runs that REFUSED (lost the modelled guard).
+        refused: Arc<AtomicUsize>,
+        /// Every handler run, per replica — proof that replica's SUB is live.
+        seen: [Arc<AtomicUsize>; 2],
+        _shutdown: tokio::sync::watch::Sender<bool>,
+    }
+
+    impl Replicas {
+        fn executed_total(&self) -> usize {
+            self.executed.iter().map(|c| c.load(Ordering::SeqCst)).sum()
+        }
+    }
+
+    /// Two production kernels on `subject`, one per connection. The handler
+    /// models admission: with `guard_on`, the first replica to see request
+    /// `i` executes (1 ms of "work", then replies `ok`) and any other replica
+    /// replies `unauthorized` at once — `crossreplica_replay_ok`'s shape.
+    async fn spawn_two_replicas(
+        conns: [Arc<async_nats::Client>; 2],
+        subject: &'static str,
+        guard_on: bool,
+    ) -> Replicas {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let claimed: Arc<Vec<AtomicBool>> =
+            Arc::new((0..REQUESTS).map(|_| AtomicBool::new(false)).collect());
+        let executed = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+        let refused = Arc::new(AtomicUsize::new(0));
+        let seen = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+        for (replica, conn) in conns.iter().enumerate() {
+            let (claimed, executed, refused, seen, reply_conn) = (
+                claimed.clone(),
+                executed[replica].clone(),
+                refused.clone(),
+                seen[replica].clone(),
+                conn.clone(),
+            );
+            spawn_rpc_subscriber(conn.clone(), rx.clone(), spec(subject), move |msg, _sem| {
+                let (claimed, executed, refused, seen, reply_conn) = (
+                    claimed.clone(),
+                    executed.clone(),
+                    refused.clone(),
+                    seen.clone(),
+                    reply_conn.clone(),
+                );
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    let i: usize = std::str::from_utf8(&msg.payload)
+                        .expect("utf8")
+                        .parse()
+                        .expect("index");
+                    let won = !guard_on || !claimed[i].swap(true, Ordering::SeqCst);
+                    let body = if won {
+                        executed.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        "ok"
+                    } else {
+                        refused.fetch_add(1, Ordering::SeqCst);
+                        "unauthorized"
+                    };
+                    if let Some(reply) = msg.reply {
+                        reply_conn
+                            .publish(reply, body.into())
+                            .await
+                            .expect("reply publish");
+                    }
+                }
+            });
+        }
+        Replicas {
+            executed,
+            refused,
+            seen,
+            _shutdown: tx,
+        }
+    }
+
+    /// Both kernels' subscriptions are live once BOTH replicas have answered
+    /// a warm-up request. `flush()` is not a server round trip, and the
+    /// kernel subscribes inside a spawned task, so the only proof a SUB
+    /// landed is a message it answered.
+    async fn wait_until_both_serve(
+        requester: &async_nats::Client,
+        subject: &'static str,
+        replicas: &Replicas,
+    ) {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        // Index 0 is reserved for warm-up.
+        loop {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                requester.request(subject, "0".into()),
+            )
+            .await;
+            if replicas.seen.iter().all(|c| c.load(Ordering::SeqCst) > 0) {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "both replicas never served the subject"
+            );
+        }
+    }
+
+    async fn drive(requester: &async_nats::Client, subject: &'static str) -> (usize, usize) {
+        let (mut ok, mut refused) = (0, 0);
+        for i in 1..REQUESTS {
+            let reply = requester
+                .request(subject, i.to_string().into())
+                .await
+                .expect("a reply");
+            if &reply.payload[..] == b"ok" {
+                ok += 1;
+            } else {
+                refused += 1;
+            }
+        }
+        // Let any second delivery finish its handler before counting.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        (ok, refused)
+    }
+
+    async fn plain_conns(url: &str) -> [Arc<async_nats::Client>; 2] {
+        [
+            Arc::new(async_nats::connect(url).await.expect("connect a")),
+            Arc::new(async_nats::connect(url).await.expect("connect b")),
+        ]
+    }
+
+    /// The defect, guard ON: with a plain subscribe the losing replica's
+    /// `unauthorized` beat the winner's `ok` for every request while the
+    /// mutation still landed. A queue group delivers each request once, so
+    /// nothing is refused and the requester always gets the executor's reply.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_request_is_never_refused_by_a_sibling_replica() {
+        let Ok(url) = std::env::var("TALOS_TEST_NATS_URL") else {
+            eprintln!("SKIP: TALOS_TEST_NATS_URL unset");
+            return;
+        };
+        let subject = unique_subject("guard_on");
+        let replicas = spawn_two_replicas(plain_conns(&url).await, subject, true).await;
+        let requester = async_nats::connect(&url).await.expect("requester");
+        wait_until_both_serve(&requester, subject, &replicas).await;
+        let refused_before = replicas.refused.load(Ordering::SeqCst);
+
+        let (ok, refused) = drive(&requester, subject).await;
+        assert_eq!(
+            refused, 0,
+            "a requester received a sibling replica's refusal"
+        );
+        assert_eq!(ok, REQUESTS - 1);
+        assert_eq!(
+            replicas.refused.load(Ordering::SeqCst),
+            refused_before,
+            "a second replica was delivered a request it then refused"
+        );
+    }
+
+    /// The defect, guard OFF (or Redis down — fail-open is the default):
+    /// every replica executed every request. Exactly one must.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_request_executes_on_exactly_one_replica() {
+        let Ok(url) = std::env::var("TALOS_TEST_NATS_URL") else {
+            eprintln!("SKIP: TALOS_TEST_NATS_URL unset");
+            return;
+        };
+        let subject = unique_subject("guard_off");
+        let replicas = spawn_two_replicas(plain_conns(&url).await, subject, false).await;
+        let requester = async_nats::connect(&url).await.expect("requester");
+        wait_until_both_serve(&requester, subject, &replicas).await;
+        let before = replicas.executed_total();
+
+        let (ok, _) = drive(&requester, subject).await;
+        assert_eq!(ok, REQUESTS - 1);
+        assert_eq!(
+            replicas.executed_total() - before,
+            REQUESTS - 1,
+            "requests executed on more than one replica"
+        );
+        // Both replicas are MEMBERS: the group shares work rather than
+        // starving one of them (which a second group name would not show).
+        for (i, c) in replicas.executed.iter().enumerate() {
+            assert!(c.load(Ordering::SeqCst) > 0, "replica {i} served nothing");
+        }
+    }
+
+    /// `talos.state.write` is fire-and-forget: no reply to race, so the only
+    /// symptom of fan-out is the write running once per replica.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_fire_and_forget_message_executes_once() {
+        let Ok(url) = std::env::var("TALOS_TEST_NATS_URL") else {
+            eprintln!("SKIP: TALOS_TEST_NATS_URL unset");
+            return;
+        };
+        let subject = unique_subject("ff");
+        let replicas = spawn_two_replicas(plain_conns(&url).await, subject, false).await;
+        let requester = async_nats::connect(&url).await.expect("requester");
+        wait_until_both_serve(&requester, subject, &replicas).await;
+        let before = replicas.executed_total();
+
+        for i in 1..REQUESTS {
+            requester
+                .publish(subject, i.to_string().into())
+                .await
+                .expect("publish");
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while replicas.executed_total() - before < REQUESTS - 1 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "writes never arrived"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(replicas.executed_total() - before, REQUESTS - 1);
+    }
+
+    /// CONTROL: this broker DOES fan a plain subscribe out to both
+    /// connections, so "exactly once" above is the queue group's doing and
+    /// not a property of the test rig.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn control_a_plain_subscribe_delivers_to_every_connection() {
+        let Ok(url) = std::env::var("TALOS_TEST_NATS_URL") else {
+            eprintln!("SKIP: TALOS_TEST_NATS_URL unset");
+            return;
+        };
+        let subject = unique_subject("control");
+        let [a, b] = plain_conns(&url).await;
+        let mut sub_a = a.subscribe(subject).await.expect("sub a");
+        let mut sub_b = b.subscribe(subject).await.expect("sub b");
+        // Same-connection round trips order each SUB before the publish.
+        for c in [&a, &b] {
+            let inbox = c.new_inbox();
+            let mut s = c.subscribe(inbox.clone()).await.expect("barrier sub");
+            c.publish(inbox, "x".into()).await.expect("barrier pub");
+            s.next().await.expect("barrier echo");
+        }
+        let publisher = async_nats::connect(&url).await.expect("publisher");
+        for i in 0..10 {
+            publisher
+                .publish(subject, i.to_string().into())
+                .await
+                .expect("publish");
+        }
+        let wait = std::time::Duration::from_secs(5);
+        for _ in 0..10 {
+            tokio::time::timeout(wait, sub_a.next())
+                .await
+                .expect("a")
+                .expect("a msg");
+            tokio::time::timeout(wait, sub_b.next())
+                .await
+                .expect("b")
+                .expect("b msg");
+        }
+    }
+
+    /// The permissioned broker (the compose `nats.conf`, the worker's real
+    /// credential and `_WINBOX` inbox prefix): a worker's request on a REAL
+    /// signed-RPC subject is answered once by a controller-credential queue
+    /// member. A queue group changes no subject, and this proves the broker
+    /// agrees.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_worker_credential_is_served_through_the_queue_group() {
+        let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
+        let (Some(url), Some(cu), Some(cp), Some(wu), Some(wp)) = (
+            env("TALOS_TEST_NATS_PERM_URL"),
+            env("TALOS_TEST_NATS_PERM_CONTROLLER_USER"),
+            env("TALOS_TEST_NATS_PERM_CONTROLLER_PASSWORD"),
+            env("TALOS_TEST_NATS_PERM_WORKER_USER"),
+            env("TALOS_TEST_NATS_PERM_WORKER_PASSWORD"),
+        ) else {
+            eprintln!("SKIP: TALOS_TEST_NATS_PERM_* unset");
+            return;
+        };
+        let controller = || async {
+            Arc::new(
+                async_nats::ConnectOptions::with_user_and_password(cu.clone(), cp.clone())
+                    .connect(&url)
+                    .await
+                    .expect("controller connect"),
+            )
+        };
+        let subject = talos_memory::memory_rpc::SUBJECT_MEMORY_OP;
+        let replicas =
+            spawn_two_replicas([controller().await, controller().await], subject, true).await;
+        let worker = async_nats::ConnectOptions::with_user_and_password(wu, wp)
+            .custom_inbox_prefix(talos_workflow_job_protocol::nats_permissions::WORKER_INBOX_PREFIX)
+            .connect(&url)
+            .await
+            .expect("worker connect");
+        wait_until_both_serve(&worker, subject, &replicas).await;
+        let refused_before = replicas.refused.load(Ordering::SeqCst);
+
+        let (ok, refused) = drive(&worker, subject).await;
+        assert_eq!((ok, refused), (REQUESTS - 1, 0));
+        assert_eq!(replicas.refused.load(Ordering::SeqCst), refused_before);
     }
 }
 

@@ -73,7 +73,7 @@ Talos is a workflow automation platform with user-submitted WASM module executio
 | B5 | NATS-to-Worker | NATS | Worker | TLS (production) + signed `JobRequest` (HMAC-SHA256, or Ed25519 with `TALOS_DISPATCH_SCHEME=ed25519`). The worker's own NATS credential has a subscribe allow-list (`deploy/nats/worker-permissions.conf`, rendered from `talos-workflow-job-protocol/src/nats_permissions.rs`). |
 | B6 | Worker-to-WASM | Worker host | WASM guest | wasmtime sandbox (capability worlds) |
 | B7 | Webhook ingress | External service | Controller `/webhooks/{id}` | HTTPS + per-trigger HMAC signature or static verification token |
-| B8 | Worker-to-controller data plane | Worker | Controller | Signed NATS-RPC: HMAC-SHA256 over `(subject, actor_id, nonce, body)`, nonce replay cache, 60 s past / 5 s future freshness window (`talos-memory/src/rpc_auth.rs`) |
+| B8 | Worker-to-controller data plane | Worker | Controller | Signed NATS-RPC: HMAC-SHA256 over `(subject, actor_id, nonce, body)`, nonce replay cache, 60 s past / 5 s future freshness window (`talos-memory/src/rpc_auth.rs`). Controller replicas bind these subjects in one NATS queue group (`talos-rpc-subscribers/src/kernel.rs`), so a request is delivered to one replica; the Redis cross-replica replay guard then only ever sees a genuine replay |
 
 ---
 
