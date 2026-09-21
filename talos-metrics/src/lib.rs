@@ -31,7 +31,8 @@ pub use mcp::McpToolOutcome;
 pub use outcome_class::OutcomeClass;
 pub use rpc::{seeded_pairs as rpc_seeded_pairs, RpcOutcome, RpcSubject};
 pub use security::{
-    ApiKeyValidation, McpAuthOutcome, PasswordChangeOutcome, RateLimitKind, TwoFactorOutcome,
+    ApiKeyValidation, McpAuthOutcome, PasswordChangeOutcome, RateLimitKind,
+    RotationAuditArmOutcome, TokenReuseOutcome, TwoFactorOutcome,
 };
 pub use vault_token::{VaultTokenLifetimeLabel, VaultTokenRenewalOutcome};
 pub use webhook::WebhookAuthFormat;
@@ -480,6 +481,43 @@ pub fn record_password_change_on(metrics: &TalosMetrics, outcome: PasswordChange
         .inc();
 }
 
+/// Count one refresh-token reuse-detector verdict. Inert without
+/// [`set_global`].
+///
+/// Called exactly once per failed refresh that reaches the detector, from
+/// the single `match` over `talos_auth::classify_token_reuse`'s finding, so
+/// a new verdict cannot be added without landing here.
+pub fn record_token_reuse(outcome: TokenReuseOutcome) {
+    if let Some(m) = global() {
+        record_token_reuse_on(m, outcome);
+    }
+}
+
+/// The recording itself, against an EXPLICIT registry.
+pub fn record_token_reuse_on(metrics: &TalosMetrics, outcome: TokenReuseOutcome) {
+    metrics
+        .token_reuse_total
+        .with_label_values(&[outcome.as_str()])
+        .inc();
+}
+
+/// Count one rotation by whether it armed the reuse detector. Inert without
+/// [`set_global`]. One per rotation, on BOTH outcomes — the failure series
+/// is only readable against this denominator.
+pub fn record_rotation_audit_arm(outcome: RotationAuditArmOutcome) {
+    if let Some(m) = global() {
+        record_rotation_audit_arm_on(m, outcome);
+    }
+}
+
+/// The recording itself, against an EXPLICIT registry.
+pub fn record_rotation_audit_arm_on(metrics: &TalosMetrics, outcome: RotationAuditArmOutcome) {
+    metrics
+        .rotation_audit_arm_total
+        .with_label_values(&[outcome.as_str()])
+        .inc();
+}
+
 /// Count one start the deployment-wide execution pause refused. Inert without
 /// [`set_global`].
 pub fn record_actor_budget_refusal(cap: BudgetCap, mode: BudgetMode) {
@@ -731,6 +769,13 @@ pub struct TalosMetrics {
     // No alert yet, for the reason given above. Seeded over
     // `PasswordChangeOutcome::ALL`.
     pub password_changes_total: CounterVec,
+    // What the refresh-token REUSE DETECTOR concluded, one per failed
+    // refresh that reaches it. Label set closed by
+    // `TokenReuseOutcome::ALL`; every value pre-seeded.
+    pub token_reuse_total: CounterVec,
+    // Did a successful rotation ARM that detector? The denominator the
+    // failure series needs, closed by `RotationAuditArmOutcome::ALL`.
+    pub rotation_audit_arm_total: CounterVec,
 
     // Execution metrics
     pub module_executions_total: CounterVec,
@@ -2097,6 +2142,70 @@ impl TalosMetrics {
         registry.register(Box::new(password_changes_total.clone()))?;
         for outcome in PasswordChangeOutcome::ALL {
             password_changes_total
+                .with_label_values(&[outcome.as_str()])
+                .inc_by(0.0);
+        }
+
+        // The refresh-token REUSE DETECTOR. Refresh rotation makes a stolen
+        // token self-announcing, `rotated_session_audit` turns the resulting
+        // miss into evidence, and `revoke_all_sessions` is the response — the
+        // platform's ONLY automated stolen-credential response. Until
+        // 2026-09-21 it produced NO machine-readable output: one
+        // `target: "talos_security_alert"` line, the sole emitter of that
+        // target in the workspace, with no layer, rule, scrape or script
+        // subscribing to it, so a detection and a non-detection rendered
+        // identically everywhere an operator looks.
+        let token_reuse_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_auth_token_reuse_total",
+                "Refresh-token reuse-detector verdicts, one per failed refresh that \
+                 reaches the detector. outcome=not_reused (no audit row — a stale \
+                 bookmark or a logged-out session; the common case) | within_grace (an \
+                 audit row younger than the grace window: two tabs raced one rotation, \
+                 deliberately not revoked) | detected (a stolen token was replayed AND \
+                 every session for that user was revoked) | revoke_failed (replay \
+                 detected and the revoke FAILED — the detection is real, the response \
+                 did not happen) | detector_unreadable (the audit read itself failed: \
+                 the control did not run, and this says NOTHING about whether the token \
+                 was reused). Alert on reuse must select detected AND revoke_failed. \
+                 The caller cannot tell any of these apart — every path answers the same \
+                 generic refusal, so a thief learns nothing. \
+                 talos_metrics::TokenReuseOutcome, a closed set, all five pre-seeded at \
+                 0. Registered 2026-09-21.",
+            ),
+            &["outcome"],
+        )?;
+        registry.register(Box::new(token_reuse_total.clone()))?;
+        for outcome in TokenReuseOutcome::ALL {
+            token_reuse_total
+                .with_label_values(&[outcome.as_str()])
+                .inc_by(0.0);
+        }
+
+        // The ARM side of the same control: the detector can only recognise a
+        // replayed token if the rotation that retired it wrote the audit row.
+        // That INSERT is best-effort by design (it must never fail a
+        // legitimate refresh), so a PERSISTENT failure disarms the detector
+        // fleet-wide while every verdict reads `not_reused` — a green
+        // detector over a dead control, check 58's class. Counted on BOTH
+        // outcomes so the failure series has a denominator.
+        let rotation_audit_arm_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_auth_rotation_audit_arm_total",
+                "Refresh-token rotations by whether they ARMED the reuse detector, one \
+                 per rotation. outcome=armed (the rotated_session_audit row was written, \
+                 so a later replay of the retired token is detectable) | failed (the \
+                 INSERT failed; the rotation still succeeded and the user got their new \
+                 token, but a replay of the retired token will read as not_reused). \
+                 This is also the controller's only volume series for the refresh path. \
+                 talos_metrics::RotationAuditArmOutcome, a closed set, both pre-seeded \
+                 at 0. Registered 2026-09-21.",
+            ),
+            &["outcome"],
+        )?;
+        registry.register(Box::new(rotation_audit_arm_total.clone()))?;
+        for outcome in RotationAuditArmOutcome::ALL {
+            rotation_audit_arm_total
                 .with_label_values(&[outcome.as_str()])
                 .inc_by(0.0);
         }
@@ -3548,6 +3657,8 @@ impl TalosMetrics {
             api_key_validations_total,
             mcp_auth_total,
             password_changes_total,
+            token_reuse_total,
+            rotation_audit_arm_total,
             module_executions_total,
             module_execution_duration_seconds,
             workflow_executions_total,
@@ -4262,6 +4373,24 @@ mod tests {
             )));
             record_password_change_on(&m, *o);
         }
+        // The refresh-token reuse detector and its arm side. Both are
+        // security counters whose FIRST event is the one that matters, so
+        // absent-vs-zero is not acceptable for either: a cold registry must
+        // already export every value at 0.
+        for o in TokenReuseOutcome::ALL {
+            assert!(cold.contains(&format!(
+                "talos_auth_token_reuse_total{{outcome=\"{}\"}} 0",
+                o.as_str()
+            )));
+            record_token_reuse_on(&m, *o);
+        }
+        for o in RotationAuditArmOutcome::ALL {
+            assert!(cold.contains(&format!(
+                "talos_auth_rotation_audit_arm_total{{outcome=\"{}\"}} 0",
+                o.as_str()
+            )));
+            record_rotation_audit_arm_on(&m, *o);
+        }
         let warm = m.render_prometheus().expect("render");
         for o in TwoFactorOutcome::ALL {
             assert!(warm.contains(&format!(
@@ -4301,6 +4430,32 @@ mod tests {
             warm.matches("talos_password_changes_total{outcome=")
                 .count(),
             PasswordChangeOutcome::ALL.len()
+        );
+        for o in TokenReuseOutcome::ALL {
+            assert!(warm.contains(&format!(
+                "talos_auth_token_reuse_total{{outcome=\"{}\"}} 1",
+                o.as_str()
+            )));
+        }
+        // Five distinct verdicts, five distinct series — the recorder does
+        // not aggregate `detector_unreadable` into `not_reused`, which is
+        // the whole point of the split.
+        assert_eq!(TokenReuseOutcome::ALL.len(), 5);
+        assert_eq!(
+            warm.matches("talos_auth_token_reuse_total{outcome=")
+                .count(),
+            TokenReuseOutcome::ALL.len()
+        );
+        for o in RotationAuditArmOutcome::ALL {
+            assert!(warm.contains(&format!(
+                "talos_auth_rotation_audit_arm_total{{outcome=\"{}\"}} 1",
+                o.as_str()
+            )));
+        }
+        assert_eq!(
+            warm.matches("talos_auth_rotation_audit_arm_total{outcome=")
+                .count(),
+            RotationAuditArmOutcome::ALL.len()
         );
         // The two execution families that closed the baseline: the counter is
         // seeded over ALL and both recorders move counter + histogram, the
@@ -4399,6 +4554,19 @@ mod tests {
             r#"talos_dispatch_refused_total{path="retry",reason="archived"} 0"#,
             r#"talos_dispatch_refused_total{path="replay",reason="archived"} 0"#,
             r#"talos_dispatch_refused_total{path="handoff",reason="archived"} 0"#,
+            // The refresh-token reuse detector (2026-09-21). Its healthy
+            // steady state is zero FOREVER on `detected` / `revoke_failed`,
+            // which is exactly where ABSENT and ZERO diverge: the alert on
+            // them is an `increase(...) > 0`, and an absent counter matches
+            // nothing. The arm pair carries the denominator of the ratio
+            // alert, so both of ITS values are seeded too — a ratio over an
+            // absent denominator is NaN, not 0. The other three verdicts are
+            // asserted, in both directions, by the exhaustive security-counter
+            // test above.
+            r#"talos_auth_token_reuse_total{outcome="detected"} 0"#,
+            r#"talos_auth_token_reuse_total{outcome="revoke_failed"} 0"#,
+            r#"talos_auth_rotation_audit_arm_total{outcome="armed"} 0"#,
+            r#"talos_auth_rotation_audit_arm_total{outcome="failed"} 0"#,
             r#"talos_rpc_write_ceiling_refusals_total{reason="unreadable",subject="talos.database.query"} 0"#,
             // #767's audit-chain read-side detector. ABSENT and ZERO diverge
             // here in the sharpest possible way: the control this counts had

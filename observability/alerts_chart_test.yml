@@ -5005,3 +5005,230 @@ tests:
       - eval_time: 150m
         alertname: TalosAuditChainJobsUnverifiable
         exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
+  # TalosAuthRefreshTokenReuseDetected — the stolen-credential response.
+  # The load-bearing case is the QUIET one: `detector_unreadable`,
+  # `not_reused` and `within_grace` all climbing must NOT page, because the
+  # unreadable arm is the control saying it could not look, not a finding
+  # about a token. `detected` and `revoke_failed` each fire ON THEIR OWN —
+  # they are the same finding about the token and differ only in whether
+  # the response ran, so a selector covering one and not the other is a
+  # silent half-alert.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 1m
+    name: refresh-token reuse — benign verdicts quiet, each reuse verdict fires alone
+    input_series:
+      # The common case, always climbing.
+      - series: 'talos_auth_token_reuse_total{job="talos-controller",instance="c:8000",outcome="not_reused"}'
+        values: "0+2x60"
+      # Tab races, always climbing.
+      - series: 'talos_auth_token_reuse_total{job="talos-controller",instance="c:8000",outcome="within_grace"}'
+        values: "0+1x60"
+      # The detector could not run — climbing throughout, and it must never
+      # page: it is not evidence that a token WAS reused.
+      - series: 'talos_auth_token_reuse_total{job="talos-controller",instance="c:8000",outcome="detector_unreadable"}'
+        values: "0+1x60"
+      # One real detection at t=30m.
+      - series: 'talos_auth_token_reuse_total{job="talos-controller",instance="c:8000",outcome="detected"}'
+        values: "0+0x29 1+0x30"
+      # One detection whose revoke FAILED at t=45m.
+      - series: 'talos_auth_token_reuse_total{job="talos-controller",instance="c:8000",outcome="revoke_failed"}'
+        values: "0+0x44 1+0x15"
+    alert_rule_test:
+      # Only the benign verdicts have moved. Quiet.
+      - eval_time: 20m
+        alertname: TalosAuthRefreshTokenReuseDetected
+        exp_alerts: []
+      # A replay past the grace window fires at once — no `for`, because a
+      # detection is an incident by definition.
+      - eval_time: 35m
+        alertname: TalosAuthRefreshTokenReuseDetected
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              category: auth
+            exp_annotations:
+              summary: "Refresh-token REUSE detected — a rotated token was replayed"
+              description: |
+                1 refresh(es) in the last 15 minutes presented a token
+                that had ALREADY been rotated away, past the 5-second tab-race
+                grace window. That token was VALID until the rotation, so
+                somebody else used it first: either a stolen refresh token was
+                replayed, or a client serialised a stale token to disk.
+
+                This threshold is > 0 and that is NOT a guessed number. A
+                detection is an incident BY DEFINITION — the same footing as
+                TalosAuditVerificationFailures — not a rate that needs a
+                baseline. The selector deliberately covers BOTH `detected` and
+                `revoke_failed`: they are the same finding about the token and
+                differ only in whether the response ran.
+              action: |
+                1. `sum by (outcome) (increase(talos_auth_token_reuse_total[15m]))`.
+                   outcome=detected means every session for the affected user was
+                   revoked and they must sign in again — the control worked.
+                   outcome=revoke_failed means the detection is real and the
+                   response did NOT happen: the replayed token's own
+                   freshly-minted session is STILL ALIVE. Revoke that user's
+                   sessions by hand before anything else.
+                2. The affected user id is NOT a metric label (it would be
+                   unbounded cardinality and PII on a public endpoint). Get it
+                   from the controller log — `event_kind=refresh_token_reuse_detected`
+                   on target `talos_security_alert` — or from
+                   `SELECT user_id, created_at FROM auth_audit_log
+                    WHERE event_type = 'refresh_token_reuse_detected'
+                    ORDER BY created_at DESC`.
+                3. Treat the affected account as compromised until shown
+                   otherwise: the thief held a live refresh token, so they held
+                   whatever that token could mint for up to its 7-day TTL.
+                4. A single event right after a client upgrade or a restored
+                   browser profile CAN be a stale token replayed from disk. The
+                   5-second grace window already excludes tab races; anything
+                   reaching this alert is past it.
+      # At t=50m the `detected` step has aged out of the 15 m window, so
+      # this firing is `revoke_failed` ALONE — the half a one-sided
+      # selector would miss.
+      - eval_time: 50m
+        alertname: TalosAuthRefreshTokenReuseDetected
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              category: auth
+            exp_annotations:
+              summary: "Refresh-token REUSE detected — a rotated token was replayed"
+              description: |
+                1 refresh(es) in the last 15 minutes presented a token
+                that had ALREADY been rotated away, past the 5-second tab-race
+                grace window. That token was VALID until the rotation, so
+                somebody else used it first: either a stolen refresh token was
+                replayed, or a client serialised a stale token to disk.
+
+                This threshold is > 0 and that is NOT a guessed number. A
+                detection is an incident BY DEFINITION — the same footing as
+                TalosAuditVerificationFailures — not a rate that needs a
+                baseline. The selector deliberately covers BOTH `detected` and
+                `revoke_failed`: they are the same finding about the token and
+                differ only in whether the response ran.
+              action: |
+                1. `sum by (outcome) (increase(talos_auth_token_reuse_total[15m]))`.
+                   outcome=detected means every session for the affected user was
+                   revoked and they must sign in again — the control worked.
+                   outcome=revoke_failed means the detection is real and the
+                   response did NOT happen: the replayed token's own
+                   freshly-minted session is STILL ALIVE. Revoke that user's
+                   sessions by hand before anything else.
+                2. The affected user id is NOT a metric label (it would be
+                   unbounded cardinality and PII on a public endpoint). Get it
+                   from the controller log — `event_kind=refresh_token_reuse_detected`
+                   on target `talos_security_alert` — or from
+                   `SELECT user_id, created_at FROM auth_audit_log
+                    WHERE event_type = 'refresh_token_reuse_detected'
+                    ORDER BY created_at DESC`.
+                3. Treat the affected account as compromised until shown
+                   otherwise: the thief held a live refresh token, so they held
+                   whatever that token could mint for up to its 7-day TTL.
+                4. A single event right after a client upgrade or a restored
+                   browser profile CAN be a stale token replayed from disk. The
+                   5-second grace window already excludes tab races; anything
+                   reaching this alert is past it.
+      # Both steps have drained; the benign verdicts are still climbing.
+      - eval_time: 62m
+        alertname: TalosAuthRefreshTokenReuseDetected
+        exp_alerts: []
+
+  # ══════════════════════════════════════════════════════════════════════
+  # TalosAuthRotationAuditArmFailing — the ARM side of the same control.
+  # Four blocks, one per clause, and each quiet case satisfies every OTHER
+  # clause so it can only be refused by the one it is testing (the lesson
+  # from the audit-chain ratio, where `> 0.25` survived four fixture cases
+  # that were all under the floor). Window is 24 h because the reference
+  # fleet rotates 8–50 times a DAY with a busiest hour of 6 — a 1 h window
+  # cannot hold a reachable floor.
+  # ══════════════════════════════════════════════════════════════════════
+  - interval: 10m
+    name: rotation arm — total failure fires, then clears when it stops
+    input_series:
+      - series: 'talos_auth_rotation_audit_arm_total{job="talos-controller",instance="c:8000",outcome="failed"}'
+        values: "0+1x60 60+0x180"
+      - series: 'talos_auth_rotation_audit_arm_total{job="talos-controller",instance="c:8000",outcome="armed"}'
+        values: "0+0x241"
+    alert_rule_test:
+      - eval_time: 24h
+        alertname: TalosAuthRotationAuditArmFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: auth
+            exp_annotations:
+              summary: "Refresh-token reuse detection is being DISARMED (100% of rotations)"
+              description: |
+                More than half of the refresh-token rotations in the last 24
+                hours could not write their `rotated_session_audit` row. Those
+                rotations SUCCEEDED — every user got their new token and nothing
+                was refused — but the tokens they retired are no longer
+                detectable if replayed: a later reuse of one will be counted
+                `not_reused` and no session will be revoked.
+
+                So this is not an availability problem. It is the stolen-token
+                response quietly going out of service while
+                TalosAuthRefreshTokenReuseDetected stays silent for the wrong
+                reason.
+              action: |
+                1. `sum by (outcome) (increase(talos_auth_rotation_audit_arm_total[24h]))`
+                   for the split, and the controller log line
+                   `event_kind=token_reuse_arm_failed` for the database error
+                   behind it.
+                2. Almost always the table: check that `rotated_session_audit`
+                   exists, that the controller's role can INSERT into it, and
+                   that the users FK is intact (the row references users(id)).
+                   A migration that renamed or dropped it will produce exactly
+                   this.
+                3. Detection stays off for every token retired while this was
+                   firing — those rows were never written and cannot be
+                   backfilled. Once fixed, coverage resumes from the next
+                   rotation, and fully within the 7-day refresh TTL.
+      # Failures stopped at 10 h; once they leave the 24 h window the ratio
+      # has no denominator at all (0/0 is NaN) and the alert clears.
+      - eval_time: 38h
+        alertname: TalosAuthRotationAuditArmFailing
+        exp_alerts: []
+
+  - interval: 10m
+    name: rotation arm — under the floor stays quiet at a 100% failure ratio
+    input_series:
+      # Exactly FOUR failures, so the RATIO clause is satisfied (100%) and
+      # only the floor can refuse it.
+      - series: 'talos_auth_rotation_audit_arm_total{job="talos-controller",instance="c:8000",outcome="failed"}'
+        values: "0+0x60 1+1x3 4+0x120"
+      - series: 'talos_auth_rotation_audit_arm_total{job="talos-controller",instance="c:8000",outcome="armed"}'
+        values: "0+0x185"
+    alert_rule_test:
+      - eval_time: 24h
+        alertname: TalosAuthRotationAuditArmFailing
+        exp_alerts: []
+
+  - interval: 10m
+    name: rotation arm — over the floor but a low ratio stays quiet
+    input_series:
+      # TEN failures, so the FLOOR is satisfied and only the ratio can
+      # refuse it. This is the case that kills a `> 0` ratio.
+      - series: 'talos_auth_rotation_audit_arm_total{job="talos-controller",instance="c:8000",outcome="failed"}'
+        values: "0+0x60 1+1x9 10+0x120"
+      - series: 'talos_auth_rotation_audit_arm_total{job="talos-controller",instance="c:8000",outcome="armed"}'
+        values: "0+0x60 9+9x9 90+0x120"
+    alert_rule_test:
+      - eval_time: 24h
+        alertname: TalosAuthRotationAuditArmFailing
+        exp_alerts: []
+
+  - interval: 10m
+    name: rotation arm — a healthy fleet arming every rotation stays quiet
+    input_series:
+      - series: 'talos_auth_rotation_audit_arm_total{job="talos-controller",instance="c:8000",outcome="armed"}'
+        values: "0+1x241"
+      - series: 'talos_auth_rotation_audit_arm_total{job="talos-controller",instance="c:8000",outcome="failed"}'
+        values: "0+0x241"
+    alert_rule_test:
+      - eval_time: 24h
+        alertname: TalosAuthRotationAuditArmFailing
+        exp_alerts: []

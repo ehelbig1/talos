@@ -783,3 +783,124 @@ fn a_reserved_password_cannot_be_chosen() {
     // Control: the same shape one character shorter is an ordinary password.
     assert!(validate_password(&SENTINEL[1..]).is_ok());
 }
+
+// ── refresh-token reuse detector: the classifier ─────────────────────────
+//
+// `classify_token_reuse` is the one home for "was this failed refresh a
+// replayed token?", and it is a free function taking the read's RESULT so
+// the `Err` arm — the whole reason it exists — is drivable without a
+// database. Before 2026-09-21 the decision was an `if let Ok(Some(..))` at
+// the call site, so a DB failure and "no audit row" were one branch and
+// nothing could tell them apart, here or in any dashboard.
+
+/// A read error must NEVER read as "not reused". This is the defect.
+#[test]
+fn an_unreadable_reuse_detector_is_not_a_clean_bill() {
+    let now = Utc::now();
+    let unreadable: std::result::Result<Option<(Uuid, DateTime<Utc>)>, &str> = Err("pool timeout");
+    assert_eq!(
+        classify_token_reuse(unreadable, now),
+        TokenReuseFinding::DetectorUnreadable
+    );
+    // Control: an answered read with no row IS a clean bill, and the two
+    // must not be the same value.
+    let empty: std::result::Result<Option<(Uuid, DateTime<Utc>)>, &str> = Ok(None);
+    assert_eq!(
+        classify_token_reuse(empty, now),
+        TokenReuseFinding::NotReused
+    );
+    assert_ne!(
+        TokenReuseFinding::DetectorUnreadable,
+        TokenReuseFinding::NotReused
+    );
+}
+
+/// The grace boundary is INCLUSIVE of the constant: at exactly
+/// `TOKEN_REUSE_GRACE_SECS` the tab-race explanation is spent and the reuse
+/// is real. One second under it, it is not.
+#[test]
+fn the_reuse_grace_boundary_is_the_constant() {
+    let now = Utc::now();
+    let user = Uuid::new_v4();
+    let at = |age: i64| -> TokenReuseFinding {
+        let row: std::result::Result<Option<(Uuid, DateTime<Utc>)>, &str> =
+            Ok(Some((user, now - Duration::seconds(age))));
+        classify_token_reuse(row, now)
+    };
+    assert_eq!(TOKEN_REUSE_GRACE_SECS, 5);
+    assert_eq!(
+        at(0),
+        TokenReuseFinding::WithinGrace {
+            user_id: user,
+            age_secs: 0
+        }
+    );
+    assert_eq!(
+        at(TOKEN_REUSE_GRACE_SECS - 1),
+        TokenReuseFinding::WithinGrace {
+            user_id: user,
+            age_secs: TOKEN_REUSE_GRACE_SECS - 1
+        }
+    );
+    assert_eq!(
+        at(TOKEN_REUSE_GRACE_SECS),
+        TokenReuseFinding::Reused {
+            user_id: user,
+            age_secs: TOKEN_REUSE_GRACE_SECS
+        }
+    );
+    assert_eq!(
+        at(3600),
+        TokenReuseFinding::Reused {
+            user_id: user,
+            age_secs: 3600
+        }
+    );
+}
+
+/// The classifier carries the AFFECTED user out of the read — the row's
+/// `user_id`, never the caller's — because that is who gets revoked.
+#[test]
+fn the_finding_names_the_user_from_the_audit_row() {
+    let now = Utc::now();
+    let victim = Uuid::new_v4();
+    let row: std::result::Result<Option<(Uuid, DateTime<Utc>)>, &str> =
+        Ok(Some((victim, now - Duration::seconds(60))));
+    match classify_token_reuse(row, now) {
+        TokenReuseFinding::Reused { user_id, .. } => assert_eq!(user_id, victim),
+        other => panic!("expected Reused, got {other:?}"),
+    }
+}
+
+/// "We saw it" and "we acted on it" are different claims: a detection whose
+/// revoke failed leaves the thief's own freshly-minted session alive, so it
+/// gets its own verdict rather than being folded into `detected`.
+#[test]
+fn a_failed_revoke_is_not_a_completed_response() {
+    assert_eq!(reuse_response_outcome(true), TokenReuseOutcome::Detected);
+    assert_eq!(
+        reuse_response_outcome(false),
+        TokenReuseOutcome::RevokeFailed
+    );
+    assert_ne!(TokenReuseOutcome::Detected, TokenReuseOutcome::RevokeFailed);
+}
+
+/// Every verdict the control can reach is a distinct label value, and the
+/// set is closed by the compiler — a sixth verdict cannot be spelled at a
+/// call site without landing in `TokenReuseOutcome::ALL`, where the seed
+/// loop in `TalosMetrics::new` picks it up.
+#[test]
+fn the_reuse_verdicts_are_a_closed_distinct_set() {
+    let labels: Vec<&str> = TokenReuseOutcome::ALL.iter().map(|o| o.as_str()).collect();
+    let mut sorted = labels.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(sorted.len(), labels.len(), "duplicate label value");
+    assert_eq!(labels.len(), 5);
+    assert!(labels.contains(&"detector_unreadable"));
+    let arm: Vec<&str> = RotationAuditArmOutcome::ALL
+        .iter()
+        .map(|o| o.as_str())
+        .collect();
+    assert_eq!(arm, vec!["armed", "failed"]);
+}

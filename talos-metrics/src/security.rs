@@ -7,6 +7,12 @@
 //! the MCP agent token is the third bearer credential the controller accepts
 //! and, until then, the only one whose refusals were counted nowhere and
 //! logged nowhere — a guessed token got a bare 401 and left no trace.
+//! `talos_password_changes_total` (2026-09-18) and, for the refresh-token
+//! REUSE DETECTOR, `talos_auth_token_reuse_total` +
+//! `talos_auth_rotation_audit_arm_total` (2026-09-21) followed: that last
+//! pair covers the platform's only automated stolen-credential response,
+//! whose single `talos_security_alert` log line was — measured — the sole
+//! emitter of that target in the workspace, with nothing subscribing to it.
 //!
 //! Each set is an ENUM so the label value is closed by the COMPILER: a call
 //! site cannot spell a fifth API-key verdict without adding it here, where
@@ -198,6 +204,112 @@ impl PasswordChangeOutcome {
             Self::Unchanged => "unchanged",
             Self::Conflict => "conflict",
             Self::Error => "error",
+        }
+    }
+}
+
+/// What the refresh-token REUSE DETECTOR concluded about one failed refresh.
+///
+/// Refresh-token rotation makes a stolen token self-announcing: the thief's
+/// first use succeeds and deletes the session, so the legitimate client's
+/// next refresh misses. `rotated_session_audit` is what turns that miss into
+/// evidence, and the response is `revoke_all_sessions` — the platform's ONLY
+/// automated stolen-credential response.
+///
+/// Until 2026-09-21 that control produced no machine-readable output at all:
+/// its one `target: "talos_security_alert"` line was the sole emitter of that
+/// target in the workspace and nothing subscribed to it, so a detection and a
+/// non-detection were indistinguishable to every dashboard and every rule.
+/// Worse, the detector's own read was written `if let Ok(Some(..))`, which put
+/// a DATABASE FAILURE in the same branch as "no reuse record" — the control
+/// could silently not run at all.
+///
+/// One value per failed refresh that reaches the detector. The CALLER cannot
+/// tell any of them apart (every path answers the same generic
+/// `Invalid or expired refresh token`, deliberately — a different response on
+/// detection is an oracle that tells a thief their token was recognised); the
+/// split is for the OPERATOR.
+///
+/// `Detected` and `RevokeFailed` are both "a stolen token was replayed" and
+/// an alert on reuse must select BOTH; they differ in whether the RESPONSE
+/// happened. `DetectorUnreadable` is NOT a finding about the token — it is
+/// the control reporting that it could not look, which is why it is a value
+/// of its own rather than folded into `NotReused`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum TokenReuseOutcome {
+    /// No audit row for this lookup hash: the token was never a rotated
+    /// token of a live session (a stale bookmark, a logged-out session, or
+    /// garbage). The overwhelmingly common case.
+    NotReused,
+    /// An audit row inside the grace window — two tabs raced one rotation
+    /// and the loser arrived here. Not revoked, by design.
+    WithinGrace,
+    /// Reuse past the grace window AND every session for the affected user
+    /// was revoked: the control worked end to end.
+    Detected,
+    /// Reuse past the grace window and `revoke_all_sessions` FAILED. The
+    /// detection is real and the response did not happen — the thief's own
+    /// freshly minted session is still alive. Distinct from `Detected`
+    /// because "we saw it" and "we acted on it" are different claims.
+    RevokeFailed,
+    /// The `rotated_session_audit` read itself failed. The control did not
+    /// run; nothing here says the token was or was not reused. The refresh
+    /// is still refused, so this is not a fail-open on the request — it is a
+    /// fail-open on the RESPONSE.
+    DetectorUnreadable,
+}
+
+impl TokenReuseOutcome {
+    pub const ALL: &'static [Self] = &[
+        Self::NotReused,
+        Self::WithinGrace,
+        Self::Detected,
+        Self::RevokeFailed,
+        Self::DetectorUnreadable,
+    ];
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotReused => "not_reused",
+            Self::WithinGrace => "within_grace",
+            Self::Detected => "detected",
+            Self::RevokeFailed => "revoke_failed",
+            Self::DetectorUnreadable => "detector_unreadable",
+        }
+    }
+}
+
+/// Did one successful rotation ARM the reuse detector?
+///
+/// The detector can only recognise a replayed token if the rotation that
+/// retired it wrote a `rotated_session_audit` row. That INSERT is
+/// deliberately best-effort — it must never fail a legitimate refresh — so a
+/// failure disarms the detector for that one token and used to leave nothing
+/// but a `warn!`. A PERSISTENT arm failure disarms it for the whole fleet
+/// while every subsequent detection reads `NotReused`: a green detector over
+/// a dead control, which is exactly check 58's class.
+///
+/// Recorded once per rotation, so `Failed / (Armed + Failed)` is a real
+/// ratio and the failure series has a denominator. It is also this platform's
+/// first volume series for the refresh path at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RotationAuditArmOutcome {
+    /// The audit row was written (or already existed): a later replay of
+    /// this token is detectable.
+    Armed,
+    /// The INSERT failed. The rotation itself still succeeded — the user got
+    /// their new token — but a replay of the retired token will read as
+    /// `NotReused`.
+    Failed,
+}
+
+impl RotationAuditArmOutcome {
+    pub const ALL: &'static [Self] = &[Self::Armed, Self::Failed];
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Armed => "armed",
+            Self::Failed => "failed",
         }
     }
 }

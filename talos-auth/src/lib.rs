@@ -113,6 +113,7 @@ pub use bootstrap::promote_first_user_if_needed;
 // Env helpers come from talos-config (formerly inlined here during the
 // initial extraction so the crate could land standalone).
 use talos_config::{get_env, read_env_or_file};
+use talos_metrics::{RotationAuditArmOutcome, TokenReuseOutcome};
 
 // ── `talos_auth_attempts_total` / `talos_auth_failures_total` label sets ──
 //
@@ -192,6 +193,87 @@ pub fn inc_auth_failure(method: &'static str, reason: &'static str) {
         m.auth_failures_total
             .with_label_values(&[method, reason])
             .inc();
+    }
+}
+
+/// Grace window for refresh-token reuse detection.
+///
+/// Two browser tabs can race one rotation: both pass bcrypt, and the loser
+/// arrives at the reuse path against a `rotated_session_audit` row that is
+/// milliseconds old. Revoking every session a user has because their second
+/// tab was pre-empted by 50 ms is the wrong trade. Past this window the
+/// race explanation is no longer plausible: the reuse is a replayed stolen
+/// token or a serious client bug, and revoke-all-and-re-login is the safe
+/// response to both.
+///
+/// ONE home. It was an inline `5` with the reasoning in a comment beside it,
+/// so the boundary could not be tested without a database.
+pub const TOKEN_REUSE_GRACE_SECS: i64 = 5;
+
+/// What the refresh-token reuse detector concluded about ONE failed refresh.
+///
+/// Four outcomes, not three: a read that FAILED is not a token that was not
+/// reused. The pre-2026-09-21 detector was written `if let Ok(Some(..))`,
+/// which put a pool timeout, a projection drift or a renamed table in the
+/// same branch as "no audit row" — so on a database blip the control did not
+/// run, said nothing, and a replayed stolen token left every other session of
+/// that user alive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TokenReuseFinding {
+    /// No audit row for this lookup hash. The token was never the rotated
+    /// token of a live session: a stale bookmark, a logged-out session, or
+    /// garbage.
+    NotReused,
+    /// An audit row younger than [`TOKEN_REUSE_GRACE_SECS`] — a tab race.
+    WithinGrace { user_id: Uuid, age_secs: i64 },
+    /// An audit row at or past the grace window: this token WAS valid until
+    /// it was rotated away, and someone is presenting it now.
+    Reused { user_id: Uuid, age_secs: i64 },
+    /// The audit read itself failed. This is the control reporting that it
+    /// could not look — it is NOT evidence either way, and must never be
+    /// rendered, logged or counted as `NotReused`.
+    DetectorUnreadable,
+}
+
+/// Classify one `rotated_session_audit` read.
+///
+/// Generic over the read's error type ON PURPOSE: the `Err` arm is the whole
+/// reason this function exists, so it lives INSIDE the one home where a unit
+/// test drives it, rather than at the call site where the defect was.
+///
+/// `now` is passed in rather than read here so the grace boundary is exactly
+/// testable and the caller takes a single clock reading.
+#[must_use]
+pub fn classify_token_reuse<E>(
+    read: std::result::Result<Option<(Uuid, DateTime<Utc>)>, E>,
+    now: DateTime<Utc>,
+) -> TokenReuseFinding {
+    match read {
+        Err(_) => TokenReuseFinding::DetectorUnreadable,
+        Ok(None) => TokenReuseFinding::NotReused,
+        Ok(Some((user_id, rotated_at))) => {
+            let age_secs = (now - rotated_at).num_seconds();
+            if age_secs >= TOKEN_REUSE_GRACE_SECS {
+                TokenReuseFinding::Reused { user_id, age_secs }
+            } else {
+                TokenReuseFinding::WithinGrace { user_id, age_secs }
+            }
+        }
+    }
+}
+
+/// The verdict a CONFIRMED reuse ends on, given whether the response — every
+/// session for the affected user revoked — actually happened.
+///
+/// A separate value rather than a log line: "we saw it" and "we acted on it"
+/// are different claims, and a failed revoke leaves the thief's own
+/// freshly-minted session alive. An alert on reuse must select both.
+#[must_use]
+pub fn reuse_response_outcome(revoked: bool) -> TokenReuseOutcome {
+    if revoked {
+        TokenReuseOutcome::Detected
+    } else {
+        TokenReuseOutcome::RevokeFailed
     }
 }
 
@@ -1536,19 +1618,56 @@ impl AuthService {
                 // any "reuse" is either a stolen-token replay or a
                 // serious client-side bug, and revoke-all-and-re-login
                 // is the safe response.
-                if let Ok(Some((reused_user_id, rotated_at))) =
-                    sqlx::query_as::<_, (Uuid, DateTime<Utc>)>(
-                        "SELECT user_id, rotated_at FROM rotated_session_audit \
-                         WHERE lookup_hash = $1 AND expires_at > NOW()",
-                    )
-                    .bind(&lookup_hash)
-                    .fetch_optional(&self.db_pool)
-                    .await
-                {
-                    let age_secs = (Utc::now() - rotated_at).num_seconds();
-                    if age_secs >= 5 {
+                let read = sqlx::query_as::<_, (Uuid, DateTime<Utc>)>(
+                    "SELECT user_id, rotated_at FROM rotated_session_audit \
+                     WHERE lookup_hash = $1 AND expires_at > NOW()",
+                )
+                .bind(&lookup_hash)
+                .fetch_optional(&self.db_pool)
+                .await;
+                // Keep the failure's text before the read is moved into the
+                // classifier; the classifier is deliberately blind to it.
+                let read_error = read.as_ref().err().map(ToString::to_string);
+
+                // One `match`, four arms, and EVERY arm records — so a
+                // detection and a non-detection are no longer identical to
+                // every dashboard and rule. `record_token_reuse` is reached
+                // from here and nowhere else.
+                match classify_token_reuse(read, Utc::now()) {
+                    TokenReuseFinding::DetectorUnreadable => {
+                        talos_metrics::record_token_reuse(TokenReuseOutcome::DetectorUnreadable);
                         tracing::error!(
                             target: "talos_security_alert",
+                            event_kind = "token_reuse_detector_unreadable",
+                            error = read_error.as_deref().unwrap_or("unknown"),
+                            "Refresh-token REUSE DETECTION could not run — the \
+                             rotated_session_audit read failed. This is NOT a statement \
+                             that the token was not reused: a replayed stolen token is \
+                             indistinguishable from a stale bookmark from here, and NO \
+                             session was revoked. The refresh itself is refused either \
+                             way, so the request fails closed; the RESPONSE is what did \
+                             not happen."
+                        );
+                    }
+                    TokenReuseFinding::NotReused => {
+                        talos_metrics::record_token_reuse(TokenReuseOutcome::NotReused);
+                    }
+                    TokenReuseFinding::WithinGrace { user_id, age_secs } => {
+                        talos_metrics::record_token_reuse(TokenReuseOutcome::WithinGrace);
+                        tracing::debug!(
+                            user_id = %user_id,
+                            age_secs,
+                            grace_secs = TOKEN_REUSE_GRACE_SECS,
+                            "Token reuse within the grace window — likely tab race, not revoking"
+                        );
+                    }
+                    TokenReuseFinding::Reused {
+                        user_id: reused_user_id,
+                        age_secs,
+                    } => {
+                        tracing::error!(
+                            target: "talos_security_alert",
+                            event_kind = "refresh_token_reuse_detected",
                             user_id = %reused_user_id,
                             age_secs,
                             "Refresh-token reuse detected — revoking ALL sessions for the affected user. \
@@ -1566,19 +1685,23 @@ impl AuthService {
                             Some("rotated session refresh attempted"),
                         )
                         .await;
-                        if let Err(e) = self.revoke_all_sessions(reused_user_id).await {
-                            tracing::warn!(
-                                user_id = %reused_user_id,
-                                "Failed to revoke all sessions after reuse detection: {}",
-                                e
-                            );
-                        }
-                    } else {
-                        tracing::debug!(
-                            user_id = %reused_user_id,
-                            age_secs,
-                            "Token reuse within 5s grace window — likely tab race, not revoking"
-                        );
+                        let revoked = match self.revoke_all_sessions(reused_user_id).await {
+                            Ok(_) => true,
+                            Err(e) => {
+                                tracing::error!(
+                                    target: "talos_security_alert",
+                                    event_kind = "refresh_token_reuse_revoke_failed",
+                                    user_id = %reused_user_id,
+                                    error = %e,
+                                    "Refresh-token reuse was DETECTED and the response did NOT \
+                                     happen — revoking the affected user's sessions failed, so \
+                                     the replayed token's own freshly-minted session is still \
+                                     alive. Revoke this user's sessions by hand."
+                                );
+                                false
+                            }
+                        };
+                        talos_metrics::record_token_reuse(reuse_response_outcome(revoked));
                     }
                 }
                 // Same generic error in either case — don't tip the attacker off
@@ -1718,7 +1841,7 @@ impl AuthService {
         // token's expiry window — set expires_at to now + 7d to match
         // generate_refresh_token's TTL.
         let audit_expires = Utc::now() + Duration::days(7);
-        if let Err(e) = sqlx::query(
+        match sqlx::query(
             "INSERT INTO rotated_session_audit (lookup_hash, user_id, expires_at) \
              VALUES ($1, $2, $3) \
              ON CONFLICT (lookup_hash) DO NOTHING",
@@ -1729,13 +1852,30 @@ impl AuthService {
         .execute(&self.db_pool)
         .await
         {
+            // The detector is ARMED for this token: a later replay of it is
+            // now recognisable. Counted on the success path too, because the
+            // failure series below is unreadable without a denominator.
+            Ok(_) => {
+                talos_metrics::record_rotation_audit_arm(RotationAuditArmOutcome::Armed);
+            }
             // Non-fatal — reuse detection is defence-in-depth, not a hard
-            // requirement. Log and proceed with the rotation.
-            tracing::warn!(
-                user_id = %user.id,
-                "Failed to record rotated_session_audit entry: {}",
-                e
-            );
+            // requirement, and failing a legitimate refresh over it would be
+            // the worse trade. But a PERSISTENT failure here disarms the
+            // detector fleet-wide while every later verdict reads
+            // `not_reused`: a green detector over a dead control. Until
+            // 2026-09-21 this arm left nothing but the `warn!`.
+            Err(e) => {
+                talos_metrics::record_rotation_audit_arm(RotationAuditArmOutcome::Failed);
+                tracing::warn!(
+                    event_kind = "token_reuse_arm_failed",
+                    user_id = %user.id,
+                    error = %e,
+                    "Failed to record rotated_session_audit entry — the rotation \
+                     SUCCEEDED and the user has their new token, but a replay of the \
+                     token just retired will read as `not_reused`. Reuse detection is \
+                     off for this one token."
+                );
+            }
         }
 
         // Best-effort deletion of the old session. Failure is logged but does not prevent
