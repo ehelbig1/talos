@@ -114,6 +114,126 @@ pub async fn fail_runs_interrupted_by_shutdown(
     Ok(finalized)
 }
 
+/// CRASH RECOVERY could not dispatch the run it claimed (decrypt failure,
+/// engine build failure, NATS down, deleted workflow). Guard: `resuming` ONLY —
+/// the claim's own state — so it never clobbers a row the engine moved on.
+/// Until 2026-09-21 this statement lived in `talos-execution-repository` and
+/// recorded nothing. Returns the rows finalized (0 or 1).
+pub async fn fail_resuming_workflow_execution(
+    pool: &PgPool,
+    execution_id: Uuid,
+    error_message: &str,
+) -> Result<u64> {
+    let row = sqlx::query(
+        "UPDATE workflow_executions \
+         SET status = 'failed', error_message = $2, completed_at = NOW() \
+         WHERE id = $1 AND status = 'resuming' \
+         RETURNING EXTRACT(EPOCH FROM (completed_at - started_at))::float8",
+    )
+    .bind(execution_id)
+    .bind(error_message)
+    .fetch_optional(pool)
+    .await?;
+    record("failure", row)
+}
+
+/// Runs wedged in `resuming` — a replica crashed DURING recovery, before the
+/// engine took over — older than `grace_minutes`. `epoch = epoch + 1` fences a
+/// resumer that merely went slow: its heartbeat sees the mismatch and aborts
+/// rather than drive a now-`failed` row. The caller refuses a non-positive
+/// grace. One statement; recorded once per row. Returns the rows finalized.
+pub async fn reclaim_orphaned_resuming_workflow_executions(
+    pool: &PgPool,
+    grace_minutes: i64,
+) -> Result<u64> {
+    let rows = sqlx::query(
+        "UPDATE workflow_executions \
+         SET status = 'failed', \
+             error_message = 'resume interrupted (controller restarted during recovery)', \
+             completed_at = NOW(), epoch = epoch + 1 \
+         WHERE status = 'resuming' \
+           AND updated_at < NOW() - make_interval(mins => $1::int) \
+         RETURNING EXTRACT(EPOCH FROM (completed_at - started_at))::float8",
+    )
+    .bind(grace_minutes)
+    .fetch_all(pool)
+    .await?;
+    let mut finalized = 0;
+    for row in rows {
+        finalized += record("failure", Some(row))?;
+    }
+    Ok(finalized)
+}
+
+/// Runs an OPERATOR's cleanup failed inside the caller's transaction, not yet
+/// counted. The caller commits and THEN calls [`Self::record_after_commit`]:
+/// counting inside a transaction that then rolls back would count failures
+/// that never happened. `#[must_use]`, so dropping it (never counting) is a
+/// `-D warnings` error rather than a silent gap.
+#[must_use = "call record_after_commit() once the transaction has committed"]
+#[derive(Debug)]
+pub struct PendingFailures(Vec<(Uuid, Option<f64>)>);
+
+impl PendingFailures {
+    pub fn ids(&self) -> Vec<Uuid> {
+        self.0.iter().map(|(id, _)| *id).collect()
+    }
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+    /// Count every run on the failure counter and duration histogram.
+    pub fn record_after_commit(self) -> u64 {
+        for (_, duration_secs) in &self.0 {
+            talos_metrics::record_workflow_outcome("failure", *duration_secs);
+        }
+        self.0.len() as u64
+    }
+}
+
+/// An operator's stale-execution cleanup (`cleanup_stale_executions`, hygiene
+/// `fix_all`): ONE user's runs `running` for longer than `timeout_minutes`,
+/// optionally bounded to an explicit id list (the hygiene preview). Guard:
+/// `running` ONLY, like the janitor — a `resuming` row is crash recovery's.
+/// Runs on the caller's connection so the cleanup and its `admin_event_log`
+/// record are one transaction. The caller refuses a non-positive timeout.
+/// Until 2026-09-21 both statements lived in `talos-execution-repository` and
+/// recorded nothing.
+pub async fn fail_stale_running_for_user_on_conn(
+    conn: &mut sqlx::PgConnection,
+    user_id: Uuid,
+    timeout_minutes: i64,
+    only_ids: Option<&[Uuid]>,
+) -> Result<PendingFailures> {
+    use sqlx::Row as _;
+    // allow-running-only-finalize: a `resuming` row is crash recovery's.
+    let rows = sqlx::query(
+        "UPDATE workflow_executions \
+         SET status = 'failed', \
+             error_message = CONCAT('Cleaned up: execution was stale (running for over ', $1::text, ' minutes)'), \
+             completed_at = NOW() \
+         WHERE status = 'running' AND user_id = $2 \
+           AND ($3::uuid[] IS NULL OR id = ANY($3)) \
+           AND started_at < NOW() - make_interval(mins => $1::int) \
+         RETURNING id, EXTRACT(EPOCH FROM (completed_at - started_at))::float8",
+    )
+    .bind(timeout_minutes)
+    .bind(user_id)
+    .bind(only_ids)
+    .fetch_all(conn)
+    .await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        out.push((
+            row.try_get::<Uuid, _>(0)?,
+            row.try_get::<Option<f64>, _>(1)?,
+        ));
+    }
+    Ok(PendingFailures(out))
+}
+
 /// Completion with the output already encrypted at rest by the caller
 /// (`output_data` cleared, ciphertext + DEK id + format bound). Guard
 /// `IN ('running', 'resuming')`: the engine may complete the run it resumed.

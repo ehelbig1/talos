@@ -3628,14 +3628,14 @@ impl AdvancedRepository {
             error
         };
         let redacted_error = talos_dlp_provider::redact_str(truncated);
-        sqlx::query(
-            "UPDATE workflow_executions \
-             SET status = 'failed', error_message = $1, completed_at = NOW() \
-             WHERE id = $2 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming')",
+        // The shared home: same guard, RETURNING the duration and recording the
+        // failure. Until 2026-09-21 this was a private copy that counted
+        // nothing — on the continuation path, the platform's busiest start.
+        talos_execution_finalizer::fail_workflow_execution_unless_terminal(
+            &self.db_pool,
+            exec_id,
+            &redacted_error,
         )
-        .bind(&redacted_error)
-        .bind(exec_id)
-        .execute(&self.db_pool)
         .await
         .map(|_| ())
         .context("fail_execution")

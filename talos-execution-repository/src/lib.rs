@@ -2619,19 +2619,60 @@ impl ExecutionRepository {
             );
             return Ok(0);
         }
-        let result = sqlx::query(
-            "UPDATE workflow_executions \
-             SET status = 'failed', \
-                 error_message = CONCAT('Cleaned up: execution was stale (running for over ', $1::text, ' minutes)'), \
-                 completed_at = NOW() \
-             WHERE status = 'running' AND user_id = $2 \
-               AND started_at < NOW() - make_interval(mins => $1::int)",
+        self.fail_stale_recorded(timeout_minutes, user_id, None, StaleCleanupSurface::McpTool)
+            .await
+    }
+
+    /// The one body behind both operator cleanups: fail the runs through the
+    /// shared finalizer on a transaction, write the `admin_event_log` record
+    /// on the SAME transaction, commit, and only then count the failures. A
+    /// cleanup that cannot be recorded does not happen.
+    async fn fail_stale_recorded(
+        &self,
+        timeout_minutes: i64,
+        user_id: Uuid,
+        only_ids: Option<&[Uuid]>,
+        surface: StaleCleanupSurface,
+    ) -> Result<u64> {
+        let mut tx = self.db_pool.begin().await?;
+        let pending = talos_execution_finalizer::fail_stale_running_for_user_on_conn(
+            &mut tx,
+            user_id,
+            timeout_minutes,
+            only_ids,
         )
-        .bind(timeout_minutes)
-        .bind(user_id)
-        .execute(&self.db_pool)
         .await?;
-        Ok(result.rows_affected())
+        if !pending.is_empty() {
+            let ids = pending.ids();
+            let details = serde_json::json!({
+                "surface": "mcp",
+                "failed_count": ids.len(),
+                "older_than_minutes": timeout_minutes,
+                "execution_ids": ids
+                    .iter()
+                    .take(STALE_CLEANUP_RECORD_LISTED)
+                    .map(Uuid::to_string)
+                    .collect::<Vec<_>>(),
+                "listed_truncated": ids.len() > STALE_CLEANUP_RECORD_LISTED,
+            });
+            talos_admin_event_log::insert_on_conn(
+                &mut tx,
+                Some(user_id),
+                surface.event_type(),
+                "execution",
+                None,
+                &format!(
+                    "{} stale execution(s) marked failed (running for over {} minutes) via {}",
+                    ids.len(),
+                    timeout_minutes,
+                    surface.via()
+                ),
+                Some(&details),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(pending.record_after_commit())
     }
 
     /// Stale-execution cleanup BOUNDED TO AN EXPLICIT ID LIST.
@@ -2684,20 +2725,13 @@ impl ExecutionRepository {
         if ids.is_empty() {
             return Ok(0);
         }
-        let result = sqlx::query(
-            "UPDATE workflow_executions \
-             SET status = 'failed', \
-                 error_message = CONCAT('Cleaned up: execution was stale (running for over ', $1::text, ' minutes)'), \
-                 completed_at = NOW() \
-             WHERE id = ANY($3) AND status = 'running' AND user_id = $2 \
-               AND started_at < NOW() - make_interval(mins => $1::int)",
+        self.fail_stale_recorded(
+            timeout_minutes,
+            user_id,
+            Some(ids),
+            StaleCleanupSurface::HygieneFixAll,
         )
-        .bind(timeout_minutes)
-        .bind(user_id)
-        .bind(ids)
-        .execute(&self.db_pool)
-        .await?;
-        Ok(result.rows_affected())
+        .await
     }
 
     /// Atomically CLAIM one orphaned `running` execution for crash recovery
@@ -2842,16 +2876,13 @@ impl ExecutionRepository {
     /// workflow). Status-guarded on `resuming` so it never clobbers a row the
     /// engine already moved on. Returns true if it transitioned a row.
     pub async fn fail_resuming_execution(&self, id: Uuid, error_message: &str) -> Result<bool> {
-        let result = sqlx::query(
-            "UPDATE workflow_executions \
-             SET status = 'failed', error_message = $2, completed_at = NOW() \
-             WHERE id = $1 AND status = 'resuming'",
+        let finalized = talos_execution_finalizer::fail_resuming_workflow_execution(
+            &self.db_pool,
+            id,
+            error_message,
         )
-        .bind(id)
-        .bind(error_message)
-        .execute(&self.db_pool)
         .await?;
-        Ok(result.rows_affected() > 0)
+        Ok(finalized > 0)
     }
 
     /// Read the current ownership `epoch` for an execution, or `None` if the
@@ -2881,22 +2912,13 @@ impl ExecutionRepository {
             );
             return Ok(0);
         }
-        // `epoch = epoch + 1` fences a resumer that itself went slow: when this
-        // reclaim fails its `resuming` row, the bump invalidates the epoch that
-        // resumer holds, so its fence heartbeat sees the mismatch and aborts
-        // rather than continuing to drive a now-`failed` row.
-        let result = sqlx::query(
-            "UPDATE workflow_executions \
-             SET status = 'failed', \
-                 error_message = 'resume interrupted (controller restarted during recovery)', \
-                 completed_at = NOW(), epoch = epoch + 1 \
-             WHERE status = 'resuming' \
-               AND updated_at < NOW() - make_interval(mins => $1::int)",
+        // The statement (with its `epoch = epoch + 1` fence) lives in the shared
+        // finalizer, which also counts each reclaimed run as a failure.
+        talos_execution_finalizer::reclaim_orphaned_resuming_workflow_executions(
+            &self.db_pool,
+            grace_minutes,
         )
-        .bind(grace_minutes)
-        .execute(&self.db_pool)
-        .await?;
-        Ok(result.rows_affected())
+        .await
     }
 
     /// Upsert failure alert with occurrence counter.
@@ -4350,4 +4372,33 @@ pub struct StuckExecutionForResume {
     /// The workflow definition. NULL only if the workflow row was deleted
     /// between trigger and resume — caller treats NULL as a hard skip.
     pub graph_json: Option<String>,
+}
+
+/// How many execution ids a stale-cleanup record lists; the count beside the
+/// list is always the true total (`details` over 1 MiB are dropped whole).
+const STALE_CLEANUP_RECORD_LISTED: usize = 1000;
+
+/// Which operator surface ran a stale-execution cleanup — a closed set that
+/// decides the `admin_event_log` event type and wording.
+#[derive(Debug, Clone, Copy)]
+enum StaleCleanupSurface {
+    /// MCP `cleanup_stale_executions`: user-wide, by age.
+    McpTool,
+    /// Hygiene `fix_all confirm=true`: bounded to the previewed id list.
+    HygieneFixAll,
+}
+
+impl StaleCleanupSurface {
+    fn event_type(self) -> &'static str {
+        match self {
+            Self::McpTool => "executions_stale_cleanup",
+            Self::HygieneFixAll => "executions_hygiene_stale_cleanup",
+        }
+    }
+    fn via(self) -> &'static str {
+        match self {
+            Self::McpTool => "MCP cleanup_stale_executions",
+            Self::HygieneFixAll => "hygiene fix_all",
+        }
+    }
 }
