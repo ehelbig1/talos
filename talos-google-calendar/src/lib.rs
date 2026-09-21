@@ -149,12 +149,13 @@ pub struct GoogleCalendarService {
     /// issue a Google API create — leaving one orphaned Google-side
     /// channel and a last-writer-wins row in integration_state.
     ///
-    /// The lock is process-local; cross-controller coordination would
-    /// require a Redis lock or DB advisory lock. Single-controller is
-    /// the current deployment, so the DashMap-backed
-    /// `talos_integration_helpers::state_store::CreateLockMap` suffices.
+    /// Taken through `CreateLockMap::acquire_fleet`: the process-local
+    /// mutex plus a Postgres advisory lock, because every controller
+    /// replica serves the create endpoint and runs the renewal loop.
     pub(crate) create_channel_locks:
         talos_integration_helpers::state_store::CreateLockMap<(Uuid, Uuid, String)>,
+    /// Test-only override of the Calendar API origin; unset in production.
+    pub(crate) api_base_url: OnceLock<String>,
 }
 
 impl GoogleCalendarService {
@@ -185,6 +186,23 @@ impl GoogleCalendarService {
             credentials_service: OnceLock::new(),
             shared_key: OnceLock::new(),
             create_channel_locks: talos_integration_helpers::state_store::CreateLockMap::new(),
+            api_base_url: OnceLock::new(),
+        }
+    }
+
+    /// Point the watch create/renew paths at a stand-in for Google. Tests
+    /// only: nothing in the controller calls this, and the value cannot come
+    /// from the environment or a request.
+    #[doc(hidden)]
+    pub fn with_api_base_url_for_tests(&self, base_url: &str) {
+        let _ = self.api_base_url.set(base_url.to_string());
+    }
+
+    /// The Calendar API client the watch create/renew paths use.
+    pub(crate) fn watch_api_client(&self) -> api::GoogleCalendarApiClient {
+        match self.api_base_url.get() {
+            Some(base) => api::GoogleCalendarApiClient::with_base_url(base),
+            None => api::GoogleCalendarApiClient::new(),
         }
     }
 

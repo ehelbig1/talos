@@ -188,9 +188,9 @@ impl GoogleCalendarService {
         // Serialize creation per (user, integration, calendar) so two
         // concurrent callers can't both pass the "no existing channel"
         // check and both create orphan Google channels.
-        let _guard = self
+        let guard = self
             .acquire_create_channel_lock(user_id, integration_id, calendar_id)
-            .await;
+            .await?;
 
         // Fast path: if this (integration_id, calendar_id) already has a
         // live channel, update its module_id without touching Google's
@@ -212,6 +212,7 @@ impl GoogleCalendarService {
 
         // Slow path: call Google to create a fresh channel and persist.
         self.create_fresh_watch_channel_locked(
+            &guard,
             user_id,
             integration_id,
             calendar_id,
@@ -232,6 +233,10 @@ impl GoogleCalendarService {
     /// to be deleted. See the renewal path comment for details.
     async fn create_fresh_watch_channel_locked(
         &self,
+        // Proof the caller holds the fleet create lock. Taking it by
+        // reference makes "the lock could not be taken, carry on anyway"
+        // a compile error instead of a quiet second Google channel.
+        _lock: &talos_integration_helpers::state_store::FleetCreateGuard,
         user_id: Uuid,
         integration_id: Uuid,
         calendar_id: &str,
@@ -266,7 +271,7 @@ impl GoogleCalendarService {
             webhook_token::sign_channel_token(user_id, &google_channel_id, shared_key);
 
         // Create the watch on Google's side.
-        let api_client = GoogleCalendarApiClient::new();
+        let api_client = self.watch_api_client();
         let watch_response = api_client
             .create_watch(
                 &access_token,
@@ -426,13 +431,53 @@ impl GoogleCalendarService {
         // Hold the create lock across the whole rotation so no other
         // caller can slip in with a concurrent create on the same
         // calendar.
-        let _guard = self
+        let guard = self
             .acquire_create_channel_lock(user_id, old_row.integration_id, &old_row.calendar_id)
-            .await;
+            .await?;
+
+        // `old_row` was read BEFORE the lock. If another renewer (the loop on
+        // another replica, or a manual renew) held it meanwhile, that row is
+        // already stopped and deleted and a fresh channel exists: acting on
+        // the stale row would register a SECOND channel with Google. Re-read
+        // under the lock and hand back what the other renewer created.
+        let old_row = match self.find_channel_by_id_raw(user_id, channel_id).await {
+            Ok(Some(current)) => current,
+            Ok(None) => {
+                return match self
+                    .find_channel_by_integration_and_calendar(
+                        user_id,
+                        old_row.integration_id,
+                        &old_row.calendar_id,
+                    )
+                    .await?
+                {
+                    Some(renewed) => {
+                        tracing::info!(
+                            channel_uuid = %renewed.id,
+                            "gcal renew: another renewer already replaced this channel"
+                        );
+                        Ok(renewed.to_watch_channel(user_id))
+                    }
+                    None => Err(anyhow!(
+                        "Watch channel {} not found in integration_state for user {}",
+                        channel_id,
+                        user_id
+                    )),
+                };
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "gcal renew: watch channel {} re-read failed for user {}",
+                        channel_id, user_id
+                    )
+                })
+            }
+        };
 
         // Best-effort stop of the old Google channel. 404/410 means
         // already expired — ignore.
-        let api_client = GoogleCalendarApiClient::new();
+        let api_client = self.watch_api_client();
         let _ = api_client
             .stop_watch(&access_token, &old_row.channel_id, &old_row.resource_id)
             .await;
@@ -452,6 +497,7 @@ impl GoogleCalendarService {
         // but its index entries may linger for a moment.
         let new = self
             .create_fresh_watch_channel_locked(
+                &guard,
                 user_id,
                 integration_id,
                 &calendar_id,
@@ -487,10 +533,15 @@ impl GoogleCalendarService {
         user_id: Uuid,
         integration_id: Uuid,
         calendar_id: &str,
-    ) -> tokio::sync::OwnedMutexGuard<()> {
+    ) -> Result<talos_integration_helpers::state_store::FleetCreateGuard> {
         self.create_channel_locks
-            .acquire((user_id, integration_id, calendar_id.to_string()))
+            .acquire_fleet(
+                &self.db_pool,
+                (user_id, integration_id, calendar_id.to_string()),
+                &format!("gcal:{user_id}:{integration_id}:{calendar_id}"),
+            )
             .await
+            .context("could not take the watch-channel create lock")
     }
 
     /// List channels that expire within the next 24 hours. Uses the

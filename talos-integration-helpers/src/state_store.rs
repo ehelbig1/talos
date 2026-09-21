@@ -189,8 +189,10 @@ impl ChannelStore {
 /// `(user_id, integration_id)` (one watch per mailbox); gcal:
 /// `(user_id, integration_id, calendar_id)` (one per calendar).
 ///
-/// Process-local; cross-controller coordination would require a Redis
-/// or DB advisory lock. Single-controller is the current deployment.
+/// [`Self::acquire`] is process-local. [`Self::acquire_fleet`] adds the
+/// cross-controller half — every controller replica runs the renewal loop
+/// and serves the create endpoints — and is what create/renew paths that
+/// call an upstream API must use.
 pub struct CreateLockMap<K: Eq + Hash> {
     map: DashMap<K, Arc<AsyncMutex<()>>>,
 }
@@ -220,6 +222,47 @@ impl<K: Eq + Hash> CreateLockMap<K> {
         lock.lock_owned().await
     }
 
+    /// Take the lock for `key` across the whole controller FLEET.
+    ///
+    /// Two layers, in this order:
+    /// 1. the process-local mutex, so N in-process waiters for one key queue
+    ///    in memory and hold at most ONE database connection between them;
+    /// 2. a Postgres transaction-scoped advisory lock on `fleet_key`, which
+    ///    BLOCKS until the other replica is done. Blocking (not try-lock) is
+    ///    the point: the second caller then runs its own "does a channel
+    ///    already exist?" check and reuses what the first created, instead of
+    ///    registering with the upstream a second time.
+    ///
+    /// The guard owns the transaction; dropping it rolls the transaction back
+    /// and the lock goes with it, including when the holder's process dies.
+    /// A wait longer than [`FLEET_LOCK_TIMEOUT`] is an ERROR, never a reason
+    /// to proceed unlocked.
+    ///
+    /// `fleet_key` must name the integration and the same grain as `key`
+    /// (e.g. `gcal:<user>:<integration>:<calendar>`). It is only ever a bind
+    /// parameter to `hashtextextended`, so its content cannot reach SQL text;
+    /// a 64-bit hash collision merely serializes two unrelated creates.
+    pub async fn acquire_fleet(
+        &self,
+        pool: &sqlx::Pool<sqlx::Postgres>,
+        key: K,
+        fleet_key: &str,
+    ) -> Result<FleetCreateGuard, sqlx::Error> {
+        let local = self.acquire(key).await;
+        let mut tx = pool.begin().await?;
+        sqlx::query(FLEET_LOCK_TIMEOUT_SQL)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(FLEET_LOCK_SQL)
+            .bind(fleet_key)
+            .execute(&mut *tx)
+            .await?;
+        Ok(FleetCreateGuard {
+            _tx: tx,
+            _local: local,
+        })
+    }
+
     /// Evict idle locks so churn doesn't accumulate one mutex per key
     /// forever. `Arc::strong_count == 1` (only the map's copy) is the
     /// idle signal; a later `acquire` re-creates on demand. Call from
@@ -227,6 +270,26 @@ impl<K: Eq + Hash> CreateLockMap<K> {
     pub fn cleanup(&self) {
         self.map.retain(|_k, lock| Arc::strong_count(lock) > 1);
     }
+}
+
+/// How long [`CreateLockMap::acquire_fleet`] waits for another replica. The
+/// holder is inside one upstream API call (30 s client timeout) plus a row
+/// write, so a longer wait means a stuck holder, not a slow one.
+pub const FLEET_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+
+/// `SET LOCAL` cannot bind parameters; the value is this crate's constant,
+/// pinned equal to [`FLEET_LOCK_TIMEOUT`] by a unit test.
+const FLEET_LOCK_TIMEOUT_SQL: &str = "SET LOCAL lock_timeout = '45s'";
+
+const FLEET_LOCK_SQL: &str = "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))";
+
+/// Held for the length of one create/renew. Field order is drop order: the
+/// database lock is released BEFORE the local mutex, so the next in-process
+/// waiter never finds the fleet lock still held by its own predecessor.
+#[must_use = "dropping the guard releases the fleet lock"]
+pub struct FleetCreateGuard {
+    _tx: sqlx::Transaction<'static, sqlx::Postgres>,
+    _local: tokio::sync::OwnedMutexGuard<()>,
 }
 
 #[cfg(test)]
@@ -249,6 +312,17 @@ mod tests {
         // Expiration far enough past that even the grace is consumed.
         let long_gone = Utc::now().timestamp_millis() - (TTL_GRACE_SECONDS + 10) * 1000;
         assert_eq!(ttl_with_grace(long_gone), Some(3600));
+    }
+
+    #[test]
+    fn the_lock_timeout_statement_matches_the_constant() {
+        assert_eq!(
+            FLEET_LOCK_TIMEOUT_SQL,
+            format!(
+                "SET LOCAL lock_timeout = '{}s'",
+                FLEET_LOCK_TIMEOUT.as_secs()
+            )
+        );
     }
 
     #[tokio::test]
