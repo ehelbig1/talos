@@ -1920,9 +1920,10 @@ impl HygieneService {
             // children removed upstream: the preview an operator confirmed may
             // be minutes old, and a `sub_workflow` node added in between is
             // exactly the window a graph-derived exclusion cannot see.
+            let surface = talos_workflow_repository::WorkflowDeleteSurface::HygieneFixAll;
             let outcome = self
                 .workflow_repo
-                .delete_workflows_checked(&candidates.draft_ids, user_id)
+                .delete_workflows_checked(&candidates.draft_ids, user_id, surface)
                 .await;
             match outcome {
                 Ok(outcome) => {

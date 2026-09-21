@@ -454,7 +454,11 @@ async fn deleting_a_workflow_an_enabled_parent_dispatches_into_is_refused() {
 
     let repo = talos_workflow_repository::WorkflowRepository::new(pool.clone());
     let outcome = repo
-        .delete_workflows_checked(&[child, orphan], user)
+        .delete_workflows_checked(
+            &[child, orphan],
+            user,
+            talos_workflow_repository::WorkflowDeleteSurface::McpBatch,
+        )
         .await
         .expect("delete");
 
@@ -496,7 +500,11 @@ async fn a_parent_deleted_in_the_same_call_does_not_block_its_child() {
 
     let repo = talos_workflow_repository::WorkflowRepository::new(pool.clone());
     let outcome = repo
-        .delete_workflows_checked(&[child, parent], user)
+        .delete_workflows_checked(
+            &[child, parent],
+            user,
+            talos_workflow_repository::WorkflowDeleteSurface::McpBatch,
+        )
         .await
         .expect("delete");
 
@@ -526,7 +534,11 @@ async fn a_published_child_is_protected_from_deletion_too() {
 
     let repo = talos_workflow_repository::WorkflowRepository::new(pool.clone());
     let outcome = repo
-        .delete_workflows_checked(&[judge], user)
+        .delete_workflows_checked(
+            &[judge],
+            user,
+            talos_workflow_repository::WorkflowDeleteSurface::McpBatch,
+        )
         .await
         .expect("delete");
     assert!(outcome.deleted.is_empty());
@@ -593,7 +605,11 @@ async fn a_draft_mentioned_by_an_unreadable_parent_is_listed_but_never_acted_on(
     // Decision 3: the delete-time guard.
     let wf_repo = talos_workflow_repository::WorkflowRepository::new(pool.clone());
     let del = wf_repo
-        .delete_workflows_checked(&[child], user)
+        .delete_workflows_checked(
+            &[child],
+            user,
+            talos_workflow_repository::WorkflowDeleteSurface::McpBatch,
+        )
         .await
         .expect("delete");
     assert!(del.deleted.is_empty());
@@ -630,7 +646,11 @@ async fn a_readable_parent_that_names_nobody_protects_nobody() {
 
     let wf_repo = talos_workflow_repository::WorkflowRepository::new(pool.clone());
     let del = wf_repo
-        .delete_workflows_checked(&[draft], user)
+        .delete_workflows_checked(
+            &[draft],
+            user,
+            talos_workflow_repository::WorkflowDeleteSurface::McpBatch,
+        )
         .await
         .expect("delete");
     assert_eq!(del.deleted, vec![draft]);

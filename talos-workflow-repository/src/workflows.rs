@@ -963,7 +963,7 @@ impl WorkflowRepository {
             }));
         }
 
-        let result = sqlx::query(
+        let removed: Option<String> = sqlx::query_scalar(
             "DELETE FROM workflows \
              WHERE id = $1 \
                AND (user_id = $2 OR org_id = ANY($3)) \
@@ -971,18 +971,33 @@ impl WorkflowRepository {
                    SELECT 1 FROM workflow_executions \
                    WHERE workflow_id = workflows.id \
                      AND status IN ('running', 'queued', 'pending', 'resuming') \
-               )",
+               ) \
+             RETURNING name",
         )
         .bind(workflow_id)
         .bind(user_id)
         .bind(writable_org_ids)
-        .execute(conn)
+        .fetch_optional(&mut *conn)
         .await?;
-        Ok(if result.rows_affected() > 0 {
-            ScopedWorkflowDelete::Deleted
-        } else {
-            ScopedWorkflowDelete::NotDeleted
-        })
+        let Some(name) = removed else {
+            return Ok(ScopedWorkflowDelete::NotDeleted);
+        };
+        // Recorded on the CALLER's transaction, so the delete and its record
+        // commit or roll back together. The acting user is the caller; the
+        // owner is named when it is somebody else (an org colleague's delete).
+        record_workflow_deletes(
+            conn,
+            user_id,
+            WorkflowDeleteSurface::GraphqlDelete {
+                owner_user_id: owner,
+            },
+            &[(workflow_id, name)],
+            0,
+            0,
+        )
+        .await
+        .context("delete_workflow admin event")?;
+        Ok(ScopedWorkflowDelete::Deleted)
     }
 
     /// Refusal-path diagnostic for `delete_workflow_guarded_scoped`: true
@@ -1275,6 +1290,7 @@ impl WorkflowRepository {
         &self,
         ids: &[Uuid],
         user_id: Uuid,
+        surface: WorkflowDeleteSurface<'_>,
     ) -> Result<WorkflowDeleteOutcome> {
         if ids.is_empty() {
             return Ok(WorkflowDeleteOutcome::default());
@@ -1326,35 +1342,62 @@ impl WorkflowRepository {
             });
         }
 
-        let deleted: Vec<Uuid> = sqlx::query_scalar(
-            "DELETE FROM workflows WHERE id = ANY($1) AND user_id = $2 \
-             AND NOT EXISTS ( \
-                 SELECT 1 FROM workflow_executions \
-                 WHERE workflow_id = workflows.id AND status IN ('running', 'queued', 'pending', 'resuming') \
+        // The delete, the read that says what it refused, and the record of
+        // what it removed are ONE transaction: a workflow's name exists only
+        // on the row being deleted, so a record written afterwards (the old
+        // detached task) could not name what was deleted, and one that failed
+        // left an irreversible delete with no record at all.
+        let mut tx = self.db_pool.begin().await?;
+        // ONE statement answers both "what was removed" and "what was refused
+        // for an execution in flight", from one snapshot: a workflow is in
+        // exactly one of the two sets, and there is no second read whose
+        // failure could report a blocked workflow as "not found". Ids that
+        // don't exist (or belong to another user) appear in NEITHER — the
+        // handler uses that to tell "blocked" from "not found".
+        let rows: Vec<(Uuid, String, bool)> = sqlx::query_as(
+            "WITH removed AS ( \
+                 DELETE FROM workflows WHERE id = ANY($1) AND user_id = $2 \
+                 AND NOT EXISTS ( \
+                     SELECT 1 FROM workflow_executions \
+                     WHERE workflow_id = workflows.id AND status IN ('running', 'queued', 'pending', 'resuming') \
+                 ) \
+                 RETURNING id, name \
              ) \
-             RETURNING id",
+             SELECT id, name, false AS blocked FROM removed \
+             UNION ALL \
+             SELECT w.id, w.name, true AS blocked FROM workflows w \
+             WHERE w.id = ANY($1) AND w.user_id = $2 \
+               AND EXISTS ( \
+                   SELECT 1 FROM workflow_executions \
+                   WHERE workflow_id = w.id AND status IN ('running', 'queued', 'pending', 'resuming') \
+               )",
         )
         .bind(&deletable)
         .bind(user_id)
-        .fetch_all(&self.db_pool)
+        .fetch_all(&mut *tx)
         .await?;
+        let mut removed: Vec<(Uuid, String)> = Vec::with_capacity(rows.len());
+        let mut blocked_running: Vec<Uuid> = Vec::new();
+        for (id, name, blocked) in rows {
+            if blocked {
+                blocked_running.push(id);
+            } else {
+                removed.push((id, name));
+            }
+        }
 
-        // Only include ids in `blocked_running` when the workflow EXISTS and is
-        // owned by this user but has active executions preventing deletion. Ids
-        // that don't exist (or belong to another user) must NOT appear — the
-        // handler uses the list to distinguish "blocked" from "not found".
-        let blocked_running: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM workflows WHERE id = ANY($1) AND user_id = $2 \
-             AND EXISTS ( \
-                 SELECT 1 FROM workflow_executions \
-                 WHERE workflow_id = workflows.id AND status IN ('running', 'queued', 'pending', 'resuming') \
-             )",
+        record_workflow_deletes(
+            &mut tx,
+            user_id,
+            surface,
+            &removed,
+            blocked_running.len(),
+            blocked_referenced.len(),
         )
-        .bind(&deletable)
-        .bind(user_id)
-        .fetch_all(&self.db_pool)
         .await
-        .unwrap_or_default();
+        .context("delete_workflows admin event")?;
+        tx.commit().await?;
+        let deleted: Vec<Uuid> = removed.iter().map(|(id, _)| *id).collect();
 
         if !blocked_referenced.is_empty() {
             tracing::warn!(
@@ -1486,7 +1529,9 @@ impl WorkflowRepository {
 
         let truncated = ids.len() as i64 > CLEANUP_WORKFLOWS_MAX;
         ids.truncate(CLEANUP_WORKFLOWS_MAX as usize);
-        let outcome = self.delete_workflows_checked(&ids, user_id).await?;
+        let outcome = self
+            .delete_workflows_checked(&ids, user_id, WorkflowDeleteSurface::McpCleanup { prefix })
+            .await?;
         Ok(WorkflowCleanupOutcome { outcome, truncated })
     }
 
@@ -2570,6 +2615,99 @@ impl ChangeSurface {
             Self::Graphql => "graphql",
         }
     }
+}
+
+/// Which surface deleted workflows — a closed set, because it decides the
+/// event type and wording of the `admin_event_log` record the delete writes in
+/// its own transaction.
+#[derive(Debug, Clone, Copy)]
+pub enum WorkflowDeleteSurface<'a> {
+    /// MCP `delete_workflow`: one `workflow_deleted` row per workflow.
+    McpDelete,
+    /// MCP `batch_delete_workflows`: one `workflows_bulk_deleted` row per call.
+    McpBatch,
+    /// MCP `cleanup_workflows`: one `workflows_bulk_cleanup` row per call.
+    McpCleanup { prefix: Option<&'a str> },
+    /// Hygiene `fix_all confirm=true`: one `workflows_hygiene_deleted` row.
+    HygieneFixAll,
+    /// GraphQL `deleteWorkflow` (the dashboard): one `workflow_deleted` row.
+    GraphqlDelete { owner_user_id: Uuid },
+}
+
+/// The one recorder of workflow deletes. Runs on the delete's own connection.
+/// Nothing deleted ⇒ nothing recorded. A single-workflow surface writes one
+/// row per workflow with `resource_id`; a bulk surface writes ONE row per call
+/// (MCP-399: bounded log volume) whose details name every workflow removed —
+/// id AND name, since the name exists nowhere else once the row is gone.
+async fn record_workflow_deletes(
+    conn: &mut sqlx::PgConnection,
+    user_id: Uuid,
+    surface: WorkflowDeleteSurface<'_>,
+    removed: &[(Uuid, String)],
+    refused_running: usize,
+    refused_referenced: usize,
+) -> Result<()> {
+    if removed.is_empty() {
+        return Ok(());
+    }
+    let (via, surface_label) = match surface {
+        WorkflowDeleteSurface::McpDelete => ("MCP delete_workflow", "mcp"),
+        WorkflowDeleteSurface::GraphqlDelete { .. } => ("GraphQL deleteWorkflow", "graphql"),
+        WorkflowDeleteSurface::McpBatch => ("MCP batch_delete_workflows", "mcp"),
+        WorkflowDeleteSurface::McpCleanup { .. } => ("cleanup_workflows", "mcp"),
+        WorkflowDeleteSurface::HygieneFixAll => ("hygiene fix_all", "mcp"),
+    };
+    let bulk_event = match surface {
+        WorkflowDeleteSurface::McpDelete | WorkflowDeleteSurface::GraphqlDelete { .. } => None,
+        WorkflowDeleteSurface::McpBatch => Some("workflows_bulk_deleted"),
+        WorkflowDeleteSurface::McpCleanup { .. } => Some("workflows_bulk_cleanup"),
+        WorkflowDeleteSurface::HygieneFixAll => Some("workflows_hygiene_deleted"),
+    };
+    let Some(event_type) = bulk_event else {
+        for (id, name) in removed {
+            let mut details = serde_json::json!({ "name": name, "surface": surface_label });
+            if let WorkflowDeleteSurface::GraphqlDelete { owner_user_id } = surface {
+                if owner_user_id != user_id {
+                    details["owner_user_id"] = serde_json::json!(owner_user_id);
+                }
+            }
+            talos_admin_event_log::insert_on_conn(
+                &mut *conn,
+                Some(user_id),
+                "workflow_deleted",
+                "workflow",
+                Some(*id),
+                &format!("Workflow '{name}' ({id}) deleted via {via}"),
+                Some(&details),
+            )
+            .await?;
+        }
+        return Ok(());
+    };
+    let mut details = serde_json::json!({
+        "surface": surface_label,
+        "deleted_count": removed.len(),
+        "deleted_workflow_ids": removed.iter().map(|(id, _)| id.to_string()).collect::<Vec<_>>(),
+        "deleted_workflows": removed
+            .iter()
+            .map(|(id, name)| serde_json::json!({ "id": id, "name": name }))
+            .collect::<Vec<_>>(),
+        "refused_running": refused_running,
+        "refused_referenced": refused_referenced,
+    });
+    if let WorkflowDeleteSurface::McpCleanup { prefix } = surface {
+        details["prefix"] = serde_json::json!(prefix);
+    }
+    talos_admin_event_log::insert_on_conn(
+        conn,
+        Some(user_id),
+        event_type,
+        "workflow",
+        None,
+        &format!("{} workflow(s) deleted via {via}", removed.len()),
+        Some(&details),
+    )
+    .await
 }
 
 /// What [`WorkflowRepository::delete_workflow_guarded_scoped`] did.

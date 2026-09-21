@@ -3563,7 +3563,9 @@ async fn handle_cleanup_workflows(
         }
     }
     match state.workflow_repo.cleanup_workflows(user_id, prefix).await {
-        Ok(cleanup) => render_cleanup_outcome(req_id, &state, user_id, prefix, &cleanup),
+        // The `workflows_bulk_cleanup` record is written by the repository inside
+        // the delete's transaction.
+        Ok(cleanup) => mcp_text(req_id, &cleanup_reply(&cleanup).to_string()),
         Err(e) => {
             tracing::error!("cleanup_workflows failed: {}", e);
             mcp_error(req_id, -32000, "Cleanup failed")
@@ -3574,39 +3576,6 @@ async fn handle_cleanup_workflows(
 /// How many refused workflows `cleanup_workflows` names in its reply; the
 /// counts beside the lists are always the true totals.
 const CLEANUP_REFUSALS_LISTED: usize = 50;
-
-/// Record and render one cleanup. Split from the handler so the reply — above
-/// all "N were refused, and why" — is driven by a test.
-fn render_cleanup_outcome(
-    req_id: Option<serde_json::Value>,
-    state: &McpState,
-    user_id: uuid::Uuid,
-    prefix: Option<&str>,
-    cleanup: &talos_workflow_repository::WorkflowCleanupOutcome,
-) -> JsonRpcResponse {
-    let outcome = &cleanup.outcome;
-    let n = outcome.deleted.len();
-    // MCP-399 (2026-05-11): bulk-destructive op audit. One row per call (not
-    // per workflow) bounds log volume — `deleted_count` and the optional
-    // prefix carry the scope.
-    if n > 0 {
-        crate::actor::spawn_log_admin_event(
-            state.db_pool.clone(),
-            user_id,
-            "workflows_bulk_cleanup",
-            "workflow",
-            None,
-            format!("{} workflow(s) bulk-deleted via cleanup_workflows", n),
-            Some(serde_json::json!({
-                "deleted_count": n,
-                "prefix": prefix,
-                "refused_running": outcome.blocked_running.len(),
-                "refused_referenced": outcome.blocked_referenced.len(),
-            })),
-        );
-    }
-    mcp_text(req_id, &cleanup_reply(cleanup).to_string())
-}
 
 /// The reply body. A refusal is never folded into a bare `deleted_count`: a
 /// caller who asked to delete ten and got seven must be told about the three.
@@ -3676,39 +3645,16 @@ async fn handle_delete_workflow(
 
     match state
         .workflow_repo
-        .delete_workflows_checked(&[wf_id], user_id)
+        .delete_workflows_checked(
+            &[wf_id],
+            user_id,
+            talos_workflow_repository::WorkflowDeleteSurface::McpDelete,
+        )
         .await
     {
         Ok(outcome) if !outcome.deleted.is_empty() => {
-            // MCP-389 (2026-05-11): close the audit-trail gap on
-            // irreversible destructive operations. Pre-fix a
-            // successful `delete_workflow` left NO trace anywhere —
-            // not on `admin_event_log`, not on `actor_action_log`,
-            // not on the workflow row itself (the DELETE is hard,
-            // not a tombstone). An operator who accidentally
-            // deleted the wrong workflow had no audit row to
-            // reconstruct the event, and a hostile MCP caller who
-            // compromised the user's API key could quietly wipe
-            // every workflow they owned with no forensic trail.
-            // `delete_secret_by_id` already writes to
-            // `secrets_audit_log` inside the secrets manager;
-            // mirror that posture for workflow deletes. Resource
-            // is named user-side, so the entry includes the
-            // workflow_id in `resource_id` for join-on-delete
-            // forensics. Best-effort: a failed admin-event write
-            // is logged at WARN but doesn't fail the DELETE
-            // (already committed). Sibling fix to the
-            // `delete_module` and `batch_delete_workflows` audits
-            // landed in the same cycle.
-            crate::actor::spawn_log_admin_event(
-                state.db_pool.clone(),
-                user_id,
-                "workflow_deleted",
-                "workflow",
-                Some(wf_id),
-                format!("Workflow {} deleted via MCP delete_workflow", wf_id),
-                None,
-            );
+            // The `workflow_deleted` record (with the workflow's name) is
+            // written by the repository inside the delete's transaction.
             mcp_text(
                 req_id,
                 &serde_json::to_string_pretty(&serde_json::json!({
@@ -6375,7 +6321,11 @@ async fn handle_batch_delete_workflows(
 
     let outcome = match state
         .workflow_repo
-        .delete_workflows_checked(&workflow_ids, user_id)
+        .delete_workflows_checked(
+            &workflow_ids,
+            user_id,
+            talos_workflow_repository::WorkflowDeleteSurface::McpBatch,
+        )
         .await
     {
         Ok(outcome) => outcome,
@@ -6428,35 +6378,8 @@ async fn handle_batch_delete_workflows(
         .map(|id| id.to_string())
         .collect();
 
-    // MCP-389 (2026-05-11): audit-trail parity with `delete_workflow`.
-    // Bulk-delete is the same audit-gap class — pre-fix a caller could
-    // wipe N workflows with no admin_event_log trace. One entry per
-    // call (not per workflow) keeps log volume bounded for large
-    // batches while still recording the resource ids in `details`.
-    // `resource_id` is left None because no single workflow is the
-    // primary target; the detail array carries the deleted ids.
-    if !deleted_ids.is_empty() {
-        let deleted_id_strs: Vec<String> = deleted_ids.iter().map(|id| id.to_string()).collect();
-        let details = serde_json::json!({
-            "deleted_workflow_ids": deleted_id_strs,
-            "deleted_count": deleted_ids.len(),
-            "blocked_count": blocked_ids.len(),
-            "referenced_count": blocked_referenced.len(),
-        });
-        crate::actor::spawn_log_admin_event(
-            state.db_pool.clone(),
-            user_id,
-            "workflows_bulk_deleted",
-            "workflow",
-            None,
-            format!(
-                "{} workflow(s) deleted via MCP batch_delete_workflows",
-                deleted_ids.len()
-            ),
-            Some(details),
-        );
-    }
-
+    // The `workflows_bulk_deleted` record (ids AND names) is written by the
+    // repository inside the delete's transaction.
     let response = serde_json::json!({
         "deleted_count": deleted_ids.len(),
         "skipped": skipped,
