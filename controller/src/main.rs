@@ -19,7 +19,6 @@ use axum::{
     routing::{get, post},
     Extension, Router,
 };
-use futures::StreamExt; // For NATS subscriber
 use tower_cookies::CookieManagerLayer;
 // tracing imports used in other modules
 // (removed redundant import; using fully qualified calls)

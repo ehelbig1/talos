@@ -1829,6 +1829,7 @@ dependencies = [
  "talos-integration-helpers",
  "talos-integration-state",
  "talos-integrations",
+ "talos-job-result-observer",
  "talos-judge-probe",
  "talos-llm",
  "talos-mcp",
@@ -8692,6 +8693,24 @@ dependencies = [
  "talos-secrets-manager",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "talos-job-result-observer"
+version = "0.1.0"
+dependencies = [
+ "async-nats",
+ "futures",
+ "serde_json",
+ "talos-dlp-provider",
+ "talos-engine",
+ "talos-metrics",
+ "talos-module-executions",
+ "talos-task-supervision",
+ "talos-workflow-engine-core",
+ "talos-workflow-job-protocol",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

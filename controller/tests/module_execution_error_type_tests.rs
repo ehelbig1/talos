@@ -346,9 +346,7 @@ async fn the_worker_finalizer_stores_null_for_an_unclassifiable_message() {
 
 /// The WIRING, which no round trip can see.
 ///
-/// Both remaining call sites are unreachable from an integration test:
-/// `background.rs` is `mod bootstrap` inside `main.rs` (bin-private), and the
-/// webhook one needs a full module-bound webhook dispatch that this fleet has
+/// The webhook call site is unreachable from an integration test: it needs a full module-bound webhook dispatch that this fleet has
 /// no row for. So reverting either to `None` is behaviourally identical to
 /// every test in the workspace — the shape checks 74b and 79b state as their
 /// own limit, and the shape `task_supervision_wiring_tests` /
@@ -372,8 +370,11 @@ fn both_remaining_worker_finalizers_derive_their_cause() {
          state and nothing else in this workspace can observe it"
     );
 
-    let background = std::fs::read_to_string(root.join("controller/src/bootstrap/background.rs"))
-        .expect("read controller/src/bootstrap/background.rs");
+    // The observer moved out of the bin into `talos-job-result-observer` on
+    // 2026-09-21; its cause derivation is now also DRIVEN, by
+    // `job_result_observer_tests`. This pin stays as the cheap second copy.
+    let background = std::fs::read_to_string(root.join("talos-job-result-observer/src/lib.rs"))
+        .expect("read talos-job-result-observer/src/lib.rs");
     assert!(
         background.contains("module_error_type::TIMEOUT_BUCKET"),
         "the job-result observer's TimedOut arm must name the shared constant, \

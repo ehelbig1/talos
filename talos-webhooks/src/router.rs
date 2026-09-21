@@ -3118,7 +3118,7 @@ impl WebhookRouter {
             // `reply_topic: None` and publishes with no wire reply, so the
             // worker sends its `JobResult` to `talos.results.{job_id}`, where
             // the controller's audit subscriber
-            // (`bootstrap/background.rs`, `RESULTS_WILDCARD`) calls
+            // (`talos-job-result-observer`, `RESULTS_WILDCARD`) calls
             // `complete_execution_from_worker` / `fail_execution_from_worker`
             // on that same id. What it does NOT cover is the four bail-outs
             // below — those happen before the worker ever sees the job, so no
