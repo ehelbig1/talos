@@ -1531,7 +1531,36 @@ impl ModuleExecutionService {
         // workflow-level output.  Regex patterns still catch standard credential formats.
         let output_data = output_data.map(|v| talos_dlp_provider::redact_json(&v));
 
-        // $1 = output_data, $2 = duration_ms, $3 = execution_id
+        // Sealed at rest, exactly as `complete_execution` and the engine's
+        // `record_completed` seal theirs — under the key and format the row
+        // ALREADY names (package CJ), because `create_execution` sealed this
+        // row's input under it. Until 2026-09-21 this writer stored the
+        // redacted output as PLAINTEXT beside a sealed input: measured, 3 of
+        // 34 153 outputs in 30 days, every one from this function (it is the
+        // completion path of module-bound webhooks and pushes, not only of
+        // the `talos.results.*` observer). DLP redaction is pattern matching,
+        // not confidentiality.
+        let bundle = talos_module_payload_encryption::encrypt_output_for_row(
+            self.secrets_manager.as_ref(),
+            execution_id,
+            output_data.as_ref(),
+        )
+        .await?;
+        let encrypting = bundle.key_id.is_some();
+        // No SecretsManager (tests, the documented dev fallback) = the
+        // plaintext column, as every sibling writer behaves.
+        let pt_output = if encrypting {
+            None
+        } else {
+            output_data.as_ref()
+        };
+        // Only restamp `payload_format` when this UPDATE wrote ciphertext: the
+        // no-output bundle reports format 0, which would orphan the row's
+        // sealed input (MCP-S2 follow-up, same rule as `complete_execution`).
+        let format_arg: Option<i16> = encrypting.then_some(bundle.format_version);
+
+        // $1 = output_data (plaintext fallback), $2 = duration_ms,
+        // $3 = execution_id, $4 = output_data_enc, $5 = key id, $6 = format
         //
         // RETURNING actor_id serves the `__ops_alert__` chokepoint below: a
         // row comes back ONLY when this call actually transitioned the
@@ -1547,6 +1576,9 @@ impl ModuleExecutionService {
             SET
                 status = 'completed',
                 output_data = $1,
+                output_data_enc = $4,
+                payload_enc_key_id = COALESCE(payload_enc_key_id, $5),
+                payload_format = COALESCE($6, payload_format),
                 duration_ms = $2,
                 duration_source = CASE WHEN $2::int4 IS NULL
                                        THEN NULL ELSE 'monotonic' END,
@@ -1556,9 +1588,12 @@ impl ModuleExecutionService {
                       EXTRACT(EPOCH FROM (completed_at - started_at))::float8 AS duration_secs
             "#,
         )
-        .bind(&output_data)
+        .bind(pt_output)
         .bind(duration_ms)
         .bind(execution_id)
+        .bind(bundle.output_enc.as_deref())
+        .bind(bundle.key_id)
+        .bind(format_arg)
         .fetch_optional(&self.db_pool)
         .await
         .context("Failed to complete execution from worker result")?;

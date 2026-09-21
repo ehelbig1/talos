@@ -5367,3 +5367,17 @@ The first design reused CW's shape unchanged (tick = period). Writing out a
 day with five deploys showed the starvation case for a 24-hour loop, which is
 where `tick_every` came from.
 
+## Package CZ (2026-09-21): the third module-output writer stored plaintext
+
+Noticed on 2026-09-20 while confirming the `talos.results.*` observer was
+idempotent, and first filed as a dormant side finding of that observer. A
+`git grep` for callers the next day showed the webhook router calls the same
+function, which moved it ahead of the observer package.
+
+The SOC 2 row was corrected three times in one sitting: first to stop claiming
+"all writers" seal; then to withdraw a sentence saying an existing backfill
+would re-seal the old rows (its selector is `payload_enc_key_id IS NULL`, and
+these rows have a key); then to withdraw a sentence saying the retention sweep
+would remove them (that sweep defaults off). Each claim was checked against
+the code only after it had been written down.
+
