@@ -8,7 +8,8 @@ publish.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-tokio = { version = "1", features = ["sync", "signal", "macros", "rt"] }
+tokio = { version = "1", features = ["sync", "signal", "macros", "rt", "time"] }
+uuid.workspace = true
 tracing.workspace = true
 
 [lints]

@@ -60,6 +60,10 @@ tls:
 controller:
   enabled: true
   replicaCount: 2
+  # Pod stop timeout. On SIGTERM the controller waits up to 120 s for the
+  # workflow runs it is driving and then fails the rest; this must stay above
+  # that, or SIGKILL lands mid-drain and those rows sit 'running' for an hour.
+  terminationGracePeriodSeconds: 150
 
   # MCP-1209: deployment topology hints security_audit JWT grading.
   # Talos default = single_pod: only the controller signs/validates JWTs;
@@ -707,6 +711,9 @@ controller:
 worker:
   enabled: true
   replicaCount: 2
+  # Pod stop timeout. The worker drains in-flight jobs for up to 30 s on
+  # SIGTERM; this must stay above that.
+  terminationGracePeriodSeconds: 40
 
   image:
     repository: ghcr.io/OWNER/talos-worker

@@ -1247,6 +1247,13 @@ impl SchedulerService {
 
     /// Single poll iteration: find due schedules and trigger them.
     async fn poll_and_trigger(&self) -> Result<(), String> {
+        // Shutting down: claim nothing. A schedule claimed now would start a
+        // run this process is about to abandon; left unclaimed it stays due
+        // and the next controller fires it once (the pause's defer-don't-drop
+        // rule, package BF).
+        if talos_shutdown::inflight::global().is_draining() {
+            return Ok(());
+        }
         let DueBatch {
             phase,
             max_overdue_secs,

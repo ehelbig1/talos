@@ -96,6 +96,7 @@ impl WorkflowRepository {
     }
 }
 
+pub use talos_execution_finalizer::fail_runs_interrupted_by_shutdown;
 /// ONE home for the dispatcher-side workflow-failure finalizer (2026-09-12);
 /// re-exported so the scheduler and webhook router call it through the crate they
 /// already depend on.

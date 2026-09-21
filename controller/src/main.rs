@@ -827,6 +827,7 @@ async fn main() -> anyhow::Result<()> {
         services.webhook_router.clone(),
         rpc_shutdown_tx,
         bg_shutdown_tx,
+        db_pool.clone(),
     )
     .await?;
 
@@ -955,15 +956,21 @@ fn build_event_buses() -> EventBuses {
     }
 }
 
-/// Bind the listener and serve with graceful shutdown (SIGTERM/SIGINT →
-/// DLQ flush → RPC-subscriber + background-sweep shutdown broadcasts).
-/// Extracted verbatim from `main()`.
+/// Bind the listener and serve with graceful shutdown: SIGTERM/SIGINT → stop
+/// starting work → wait up to `RUN_DRAIN_GRACE` for the workflow runs this
+/// process is driving, failing at once the ones that outlast it → DLQ flush →
+/// RPC-subscriber + background-sweep shutdown broadcasts.
+///
+/// The ORDER is load-bearing: a draining run still needs the signed-RPC
+/// subscribers (a module's memory or database call) and the claim responder,
+/// so those are told to stop only AFTER the drain.
 async fn serve(
     app: Router,
     limiters: &RateLimiters,
     webhook_router: std::sync::Arc<WebhookRouter>,
     rpc_shutdown_tx: std::sync::Arc<tokio::sync::watch::Sender<bool>>,
     bg_shutdown_tx: std::sync::Arc<tokio::sync::watch::Sender<bool>>,
+    db_pool: sqlx::PgPool,
 ) -> anyhow::Result<()> {
     let api_rate_limit = limiters.api_rate_limit;
     let webhook_rate_limit = limiters.webhook_rate_limit;
@@ -991,49 +998,74 @@ async fn serve(
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
+    // Fired once the shutdown signal arrives, so the drain below starts then
+    // and not when the HTTP server happens to finish.
+    let (signalled_tx, signalled_rx) = tokio::sync::oneshot::channel::<()>();
+
     // Use into_make_service_with_connect_info to provide IP addresses to rate limiter
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
-    )
-    .with_graceful_shutdown({
-        let rpc_shutdown_tx = rpc_shutdown_tx.clone();
-        let bg_shutdown_tx = bg_shutdown_tx.clone();
-        let webhook_router_shutdown = webhook_router.clone();
-        async move {
+    let http = std::future::IntoFuture::into_future(
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
             // MCP-667 (2026-05-13): route through `talos_shutdown::wait_for_shutdown`
             // so we listen for BOTH SIGTERM and SIGINT. Pre-fix the axum
             // hook only awaited `tokio::signal::ctrl_c()`, which on Unix
             // catches SIGINT only. In K8s, kubelet sends SIGTERM during
             // pod termination — the controller never observed it and ran
-            // to the full `terminationGracePeriodSeconds` (30s default)
-            // before getting SIGKILLed mid-request. HTTP connections
-            // dropped, RPC subscribers killed mid-handler, DLQ messages
-            // in-flight. The shared helper has its own MCP-501 history
-            // around install-failure handling — reuse it instead of
+            // to the full `terminationGracePeriodSeconds` before getting
+            // SIGKILLed mid-request. The shared helper has its own MCP-501
+            // history around install-failure handling — reuse it instead of
             // re-implementing both branches here.
             talos_shutdown::wait_for_shutdown().await;
-            // MCP-1131 (2026-05-16): signal the DLQ batch processor
-            // to flush before tokio aborts it. Closes the explicit
-            // "DLQ messages in-flight" concern in the MCP-667
-            // comment above. Fired BEFORE the bg/rpc broadcasts so
-            // the flush has a chance to complete while DB and NATS
-            // are still up. The processor breaks out of its loop
-            // immediately on `notified()` so we don't sleep here.
-            webhook_router_shutdown.shutdown_dlq();
-            // Broadcast to the RPC subscribers so they stop taking new
-            // work; in-flight spawned handlers finish naturally. Ignore
-            // the result — if the channel's closed the subscribers are
-            // already gone.
-            let _ = rpc_shutdown_tx.send(true);
-            // Same broadcast for background-sweep tasks (LLM-keys cache,
-            // actor-memory TTL). They poll on intervals and would
-            // otherwise be aborted mid-tick when the runtime stops.
-            let _ = bg_shutdown_tx.send(true);
+            // From here the scheduler claims nothing; axum stops accepting
+            // connections when this future returns.
+            talos_shutdown::inflight::global().begin_drain();
+            let _ = signalled_tx.send(());
+        }),
+    );
+    tokio::pin!(http);
+
+    let drain = async {
+        // An `Err` means the sender was dropped without a signal, i.e. the
+        // server ended on its own; there is still nothing to lose by draining.
+        let _ = signalled_rx.await;
+        talos_execution_orchestration::shutdown_drain::drain_in_flight_runs(
+            &db_pool,
+            talos_shutdown::inflight::global(),
+            talos_shutdown::inflight::RUN_DRAIN_GRACE,
+        )
+        .await
+    };
+    tokio::pin!(drain);
+
+    // Whichever ends first, the drain is always completed. The HTTP server is
+    // NOT waited for past the drain: a GraphQL WebSocket subscription keeps its
+    // connection open indefinitely, and a synchronous `call_workflow` request
+    // is itself a tracked run, so an empty registry means no request is doing
+    // workflow work.
+    let served = tokio::select! {
+        served = &mut http => {
+            (&mut drain).await;
+            served
         }
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("Failed to start Axum server: {}", e))?;
+        _report = &mut drain => Ok(()),
+    };
+
+    // MCP-1131 (2026-05-16): signal the DLQ batch processor to flush before
+    // tokio aborts it. After the drain, so a webhook run that was still
+    // finishing could still enqueue.
+    webhook_router.shutdown_dlq();
+    // Broadcast to the RPC subscribers so they stop taking new work. Ignore
+    // the result — if the channel's closed the subscribers are already gone.
+    let _ = rpc_shutdown_tx.send(true);
+    // Same broadcast for background-sweep tasks (LLM-keys cache, actor-memory
+    // TTL). They poll on intervals and would otherwise be aborted mid-tick
+    // when the runtime stops.
+    let _ = bg_shutdown_tx.send(true);
+
+    served.map_err(|e| anyhow::anyhow!("Failed to start Axum server: {}", e))?;
 
     Ok(())
 }
