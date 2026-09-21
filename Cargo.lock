@@ -7586,6 +7586,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "talos-actor-budget-refusal",
+ "talos-admin-event-log",
  "talos-child-run-ledger",
  "talos-child-workflow-refs",
  "talos-config",
@@ -8226,10 +8227,13 @@ dependencies = [
 name = "talos-execution-pause"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "serde_json",
  "sqlx",
+ "talos-admin-event-log",
  "talos-metrics",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

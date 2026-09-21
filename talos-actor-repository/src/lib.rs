@@ -4018,52 +4018,13 @@ impl ActorRepository {
             })
             .collect::<Result<Vec<_>>>()
     }
-
-    /// Insert an admin event log entry. Used by `spawn_log_admin_event` for
-    /// privileged-resource audit trail (MCP agents etc.). Best-effort: callers
-    /// typically discard errors and just log them.
-    ///
-    /// MCP-978 (2026-05-15): defence-in-depth DLP redact inside the
-    /// method. The canonical caller `spawn_log_admin_event` (line
-    /// ~2244-2253) already runs `redact_str(&summary)` and
-    /// `redact_json(&d)` upstream. But this method is `pub` — direct
-    /// callers (e.g. `talos-mcp-handlers/src/actor.rs:2990` for the
-    /// `actor_llm_tier_ceiling_set` audit event) bind their arguments
-    /// straight in. Today every direct caller passes internal trusted
-    /// values (enum strings, structured config snapshots) so the gap
-    /// isn't exploited, but the architectural rule is "redact at the
-    /// persistence boundary" — the method's contract should not depend
-    /// on caller discipline. Redact_str and redact_json are infallible
-    /// idempotent; re-redacting already-scrubbed text is a no-op.
-    /// Same defence-in-depth pattern as MCP-966 (engine event sink).
-    pub async fn insert_admin_event_log(
-        &self,
-        user_id: Uuid,
-        event_type: &str,
-        resource_type: &str,
-        resource_id: Option<Uuid>,
-        summary: &str,
-        details: Option<&serde_json::Value>,
-    ) -> Result<()> {
-        let mut conn = self.db_pool.acquire().await?;
-        insert_admin_event_log_on_conn(
-            &mut conn,
-            user_id,
-            event_type,
-            resource_type,
-            resource_id,
-            summary,
-            details,
-        )
-        .await
-    }
 }
 
 /// The ONE `admin_event_log` insert: truncate the summary at a char boundary,
 /// DLP-redact summary and details, write the row on the caller's connection.
-/// [`ActorRepository::insert_admin_event_log`] delegates here; a caller that
-/// must commit the event atomically with the change it records (MCP agent
-/// registration and revocation, package BW) passes its transaction.
+/// There is deliberately NO pool-taking sibling (it was deleted 2026-09-21 with
+/// its last caller): a caller records on the connection that carries the
+/// change, so the two commit together.
 pub async fn insert_admin_event_log_on_conn(
     conn: &mut sqlx::PgConnection,
     user_id: Uuid,
@@ -4210,56 +4171,6 @@ pub fn spawn_log_action(
                 error = %e,
                 "Failed to write actor_action_log entry (non-fatal)"
             );
-        }
-    });
-}
-
-/// Fire-and-forget audit entry for privileged admin-level resources
-/// (MCP agents, security toggles, etc.). Writes to `admin_event_log`
-/// — distinct from `actor_action_log` which requires an actors FK.
-/// DLP redaction is applied to summary and details; summary truncated
-/// to 1000 chars at a UTF-8 char boundary. Failures are logged but
-/// not propagated to callers.
-///
-/// Pre-extraction lived at `controller::mcp::actor::spawn_log_admin_event`;
-/// the canonical home is now this crate. Re-exported under the old
-/// path for backwards compatibility.
-pub fn spawn_log_admin_event(
-    pool: sqlx::PgPool,
-    user_id: Uuid,
-    event_type: &'static str,
-    resource_type: &'static str,
-    resource_id: Option<Uuid>,
-    summary: String,
-    details: Option<serde_json::Value>,
-) {
-    // MCP-1027 (2026-05-15): truncate ONLY; the inner
-    // `insert_admin_event_log` (lib.rs:2245) handles redaction. See
-    // sibling `spawn_log_action` for full rationale (double-redact
-    // + wrong order). Truncate at the boundary; persistence helper
-    // does the single canonical DLP pass.
-    let summary = if summary.len() > 1000 {
-        format!(
-            "{}…",
-            talos_text_util::truncate_at_char_boundary(&summary, 997)
-        )
-    } else {
-        summary
-    };
-    tokio::spawn(async move {
-        let repo = ActorRepository::new(pool);
-        if let Err(e) = repo
-            .insert_admin_event_log(
-                user_id,
-                event_type,
-                resource_type,
-                resource_id,
-                &summary,
-                details.as_ref(),
-            )
-            .await
-        {
-            tracing::warn!(error = %e, "Failed to write admin_event_log entry (non-fatal)");
         }
     });
 }

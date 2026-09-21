@@ -107,6 +107,62 @@ pub async fn set_execution_paused<'e, E: PgExecutor<'e>>(
     Ok(())
 }
 
+/// An operator pausing or resuming the deployment, RECORDED: the row is
+/// locked, the flag written and the `admin_event_log` row inserted in ONE
+/// transaction, so a pause → act → resume cycle cannot leave the log without
+/// either half (until 2026-09-21 both records were written by a detached task
+/// after the flag had already changed). The record names the state it
+/// replaced; a pause of an already-paused deployment is still recorded — it
+/// is an operator's act on deployment-wide state — with `changed: false`.
+/// Returns the state that was replaced.
+pub async fn set_execution_paused_recorded(
+    pool: &sqlx::PgPool,
+    paused: bool,
+    user_id: uuid::Uuid,
+) -> anyhow::Result<ExecutionPause> {
+    let mut tx = pool.begin().await?;
+    // Serialise concurrent pause / resume calls so each records the state it
+    // actually replaced (a missing row is locked by the upsert below).
+    let stored: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT value FROM system_settings WHERE key = $1 FOR UPDATE")
+            .bind(EXECUTION_PAUSED_SETTING_KEY)
+            .fetch_optional(&mut *tx)
+            .await?;
+    let previous = classify_stored_value(stored.as_ref());
+    set_execution_paused(&mut *tx, paused).await?;
+    let previous_label = match previous {
+        ExecutionPause::Running => "running",
+        ExecutionPause::Paused => "paused",
+        ExecutionPause::Unreadable => "unreadable",
+    };
+    let changed = previous
+        != if paused {
+            ExecutionPause::Paused
+        } else {
+            ExecutionPause::Running
+        };
+    talos_admin_event_log::insert_on_conn(
+        &mut tx,
+        Some(user_id),
+        if paused {
+            "executions_paused"
+        } else {
+            "executions_resumed"
+        },
+        "system",
+        None,
+        if paused {
+            "Execution queue paused (deployment-wide)"
+        } else {
+            "Execution queue resumed (deployment-wide)"
+        },
+        Some(&serde_json::json!({ "previous_state": previous_label, "changed": changed })),
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(previous)
+}
+
 /// Read the flag for a start about to happen on `path` and decide. On a
 /// refusal the counter is moved here — one recording site for every gate —
 /// and the caller renders the refusal in its own protocol. `Ok(None)` admits.

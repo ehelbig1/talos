@@ -1414,49 +1414,33 @@ async fn handle_set_policy(
         return mcp_error(req_id, -32000, &m);
     }
     match ModelRegistry::set_policy(&mut tx, model_id, user_id, policy_raw).await {
-        Ok(true) => match tx.commit().await {
-            Ok(()) => {
-                // The policy change is already committed; the audit row is
-                // best-effort. But it is an AUDIT row for a privileged
-                // change, so its failure must be visible — matching every
-                // other admin_event_log caller (actor.rs:2628/2733/2838 and
-                // spawn_log_admin_event, which all WARN). Pre-fix this was
-                // `let _ = ... .await`, the only silent admin_event_log
-                // write in the workspace: a gap in the trail for an
-                // operator-initiated ML policy change left no signal at all.
-                if let Err(e) = state
-                    .actor_repo
-                    .insert_admin_event_log(
-                        user_id,
-                        "ml_policy_set",
-                        "ml_model",
-                        Some(model_id),
-                        &format!(
-                            "Model '{}' lifecycle policy set (auto_advance={})",
-                            model.name, policy.auto_advance
-                        ),
-                        Some(policy_raw),
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        target: "talos_audit",
-                        %model_id,
-                        error = %e,
-                        "ml_set_policy: audit log write failed (policy change applied)"
-                    );
-                }
-                mcp_text(
-                    req_id,
-                    &serde_json::json!({
-                        "model_id": model_id.to_string(),
-                        "policy": policy_raw,
-                        "auto_advance": policy.auto_advance,
-                    })
-                    .to_string(),
-                )
-            }
-            Err(e) => internal(req_id, "set_policy commit", &e.into()),
+        // The `ml_policy_set` record is written on THIS transaction, before the
+        // commit: a promotion policy is a privileged change and must not be
+        // able to commit without its record (until 2026-09-21 the record was
+        // written after the commit, best-effort).
+        Ok(true) => match record_then_commit(
+            tx,
+            user_id,
+            "ml_policy_set",
+            model_id,
+            &format!(
+                "Model '{}' lifecycle policy set (auto_advance={})",
+                model.name, policy.auto_advance
+            ),
+            Some(policy_raw),
+        )
+        .await
+        {
+            Ok(()) => mcp_text(
+                req_id,
+                &serde_json::json!({
+                    "model_id": model_id.to_string(),
+                    "policy": policy_raw,
+                    "auto_advance": policy.auto_advance,
+                })
+                .to_string(),
+            ),
+            Err(e) => internal(req_id, "set_policy commit", &e),
         },
         Ok(false) => mcp_error(req_id, -32000, "Model not found"),
         Err(e) => internal(req_id, "set_policy", &e),
@@ -1520,35 +1504,24 @@ async fn handle_set_lifecycle(
         );
     }
     match svc.transition(&mut tx, model_id, user_id, from, to).await {
-        Ok(true) => match tx.commit().await {
+        // `ml_lifecycle_set` is recorded on this transaction, before the commit.
+        Ok(true) => match record_then_commit(
+            tx,
+            user_id,
+            "ml_lifecycle_set",
+            model_id,
+            &format!(
+                "Model '{}' lifecycle manually moved {} -> {}",
+                model.name,
+                from.as_str(),
+                to.as_str()
+            ),
+            None,
+        )
+        .await
+        {
             Ok(()) => {
                 talos_ml::invalidate_serving_cache(user_id, &model.name);
-                // Audit row for a privileged lifecycle move — see the
-                // rationale on the `ml_policy_set` write above.
-                if let Err(e) = state
-                    .actor_repo
-                    .insert_admin_event_log(
-                        user_id,
-                        "ml_lifecycle_set",
-                        "ml_model",
-                        Some(model_id),
-                        &format!(
-                            "Model '{}' lifecycle manually moved {} -> {}",
-                            model.name,
-                            from.as_str(),
-                            to.as_str()
-                        ),
-                        None,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        target: "talos_audit",
-                        %model_id,
-                        error = %e,
-                        "ml_set_lifecycle: audit log write failed (transition applied)"
-                    );
-                }
                 mcp_text(
                     req_id,
                     &serde_json::json!({
@@ -1560,7 +1533,7 @@ async fn handle_set_lifecycle(
                     .to_string(),
                 )
             }
-            Err(e) => internal(req_id, "set_lifecycle commit", &e.into()),
+            Err(e) => internal(req_id, "set_lifecycle commit", &e),
         },
         // CAS miss: someone (the evaluator) moved it first.
         Ok(false) => mcp_error(
@@ -1661,6 +1634,31 @@ async fn handle_teacher_audit(
     }
 }
 
+/// Write a model's `admin_event_log` record on the change's OWN transaction,
+/// then commit. One home for the three operator ML changes (policy, lifecycle,
+/// shadow-window reset): a change that cannot be recorded rolls back.
+async fn record_then_commit(
+    mut tx: sqlx::Transaction<'_, sqlx::Postgres>,
+    user_id: Uuid,
+    event_type: &str,
+    model_id: Uuid,
+    summary: &str,
+    details: Option<&Value>,
+) -> anyhow::Result<()> {
+    talos_actor_repository::insert_admin_event_log_on_conn(
+        &mut tx,
+        user_id,
+        event_type,
+        "ml_model",
+        Some(model_id),
+        summary,
+        details,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(())
+}
+
 /// Manual shadow-window rotation — for teacher-only changes (new
 /// fallback model/prompt, correction-loop improvements) that don't run
 /// through the automatic rotation on transition/promotion. Owner-only,
@@ -1688,32 +1686,21 @@ async fn handle_reset_shadow_window(
         Ok(e) => e,
         Err(e) => return internal(req_id, "reset_shadow_window", &e),
     };
-    match tx.commit().await {
+    // `ml_shadow_window_reset` is recorded on this transaction, before the commit.
+    match record_then_commit(
+        tx,
+        user_id,
+        "ml_shadow_window_reset",
+        model.model_id,
+        &format!(
+            "Model '{}' shadow-agreement window manually rotated to epoch {new_epoch}",
+            model.name
+        ),
+        None,
+    )
+    .await
+    {
         Ok(()) => {
-            // Audit row for a privileged shadow-window rotation — see the
-            // rationale on the `ml_policy_set` write above.
-            if let Err(e) = state
-                .actor_repo
-                .insert_admin_event_log(
-                    user_id,
-                    "ml_shadow_window_reset",
-                    "ml_model",
-                    Some(model.model_id),
-                    &format!(
-                        "Model '{}' shadow-agreement window manually rotated to epoch {new_epoch}",
-                        model.name
-                    ),
-                    None,
-                )
-                .await
-            {
-                tracing::warn!(
-                    target: "talos_audit",
-                    model_id = %model.model_id,
-                    error = %e,
-                    "ml_reset_shadow_window: audit log write failed (epoch bumped)"
-                );
-            }
             mcp_text(
                 req_id,
                 &serde_json::json!({
@@ -1724,7 +1711,7 @@ async fn handle_reset_shadow_window(
                 .to_string(),
             )
         }
-        Err(e) => internal(req_id, "reset_shadow_window commit", &e.into()),
+        Err(e) => internal(req_id, "reset_shadow_window commit", &e),
     }
 }
 

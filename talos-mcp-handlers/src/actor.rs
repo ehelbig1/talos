@@ -1188,7 +1188,7 @@ async fn resolve_actor_via_repo(
 // `crate::actor::{spawn_log_action, spawn_log_admin_event}`
 // call-sites in this crate AND in the GraphQL `api::schema::*` tree
 // keep resolving.
-pub use talos_actor_repository::{spawn_log_action, spawn_log_admin_event};
+pub use talos_actor_repository::spawn_log_action;
 
 /// Query the user's capability ceiling grant.
 /// Returns the ceiling world string ('http-node' default if no grant exists

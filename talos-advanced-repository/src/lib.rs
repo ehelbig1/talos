@@ -3798,11 +3798,16 @@ impl AdvancedRepository {
 
     // ── Built-in templates ────────────────────────────────────────────────────
 
-    /// Remove stale system-published marketplace entries (sandbox/QA templates).
-    /// Returns the number of entries removed.
-    pub async fn remove_stale_system_marketplace(&self) -> Result<u64> {
+    /// Republish the built-in templates: remove stale system listings, publish
+    /// the first-party templates not yet listed, and record it — ONE
+    /// transaction. It changes what EVERY tenant sees in the marketplace, so
+    /// the record must not be able to go missing, and (until 2026-09-21) a
+    /// failure between the two statements left listings removed and nothing
+    /// published. Returns `(published, removed_stale)`.
+    pub async fn republish_system_templates_recorded(&self, user_id: Uuid) -> Result<(u64, u64)> {
+        let mut tx = self.db_pool.begin().await?;
         // Phase 5.1: unified `modules` table; canonical id match only.
-        sqlx::query(
+        let removed = sqlx::query(
             "DELETE FROM module_marketplace mm
              WHERE mm.publisher_id = '00000000-0000-0000-0000-000000000000'::uuid
                AND EXISTS (
@@ -3816,17 +3821,11 @@ impl AdvancedRepository {
                      )
                )",
         )
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await
-        .map(|r| r.rows_affected())
-        .context("remove_stale_system_marketplace")
-    }
-
-    /// Publish all system-seeded (first-party) templates not yet listed.
-    /// Returns the number of entries published.
-    pub async fn publish_system_templates(&self) -> Result<u64> {
-        // Phase 5.1: unified `modules` table; canonical id dedup only.
-        sqlx::query(
+        .context("remove_stale_system_marketplace")?
+        .rows_affected();
+        let published = sqlx::query(
             "INSERT INTO module_marketplace
                  (id, module_id, publisher_id, name, description, capability_world,
                   version, is_public, tags, verified)
@@ -3846,10 +3845,22 @@ impl AdvancedRepository {
                    WHERE mm.module_id = m.id
                )",
         )
-        .execute(&self.db_pool)
+        .execute(&mut *tx)
         .await
-        .map(|r| r.rows_affected())
-        .context("publish_system_templates")
+        .context("publish_system_templates")?
+        .rows_affected();
+        talos_admin_event_log::insert_on_conn(
+            &mut tx,
+            Some(user_id),
+            "marketplace_built_in_templates_published",
+            "system",
+            None,
+            &format!("Built-in templates republished: {published} added, {removed} stale removed"),
+            Some(&serde_json::json!({ "published": published, "removed_stale": removed })),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok((published, removed))
     }
 
     // ── Workflow suspensions ──────────────────────────────────────────────────

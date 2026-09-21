@@ -1594,33 +1594,57 @@ impl WorkflowRepository {
         ids: &[Uuid],
         user_id: Uuid,
         wf_type: Option<&str>,
+        prefix: &str,
     ) -> Result<u64> {
         if ids.is_empty() {
             return Ok(0);
         }
-        let result = if let Some(t) = wf_type {
-            sqlx::query(
-                "UPDATE workflows SET status = 'archived', workflow_type = $3, updated_at = NOW() \
-                 WHERE id = ANY($1) AND user_id = $2 \
-                   AND (status IS NULL OR status != 'archived')",
+        // The archive and its `workflows_bulk_archived` record are ONE
+        // transaction, and the record names what was ACTUALLY archived (the
+        // statement's own RETURNING), not what a preview matched — an archive
+        // hides workflows from the default list and stops their dispatch.
+        let mut tx = self.db_pool.begin().await?;
+        let archived: Vec<(Uuid, String)> = sqlx::query_as(
+            "UPDATE workflows \
+             SET status = 'archived', workflow_type = COALESCE($3, workflow_type), updated_at = NOW() \
+             WHERE id = ANY($1) AND user_id = $2 \
+               AND (status IS NULL OR status != 'archived') \
+             RETURNING id, name",
+        )
+        .bind(ids)
+        .bind(user_id)
+        .bind(wf_type)
+        .fetch_all(&mut *tx)
+        .await?;
+        if !archived.is_empty() {
+            let details = serde_json::json!({
+                "surface": "mcp",
+                "prefix": prefix,
+                "set_type": wf_type,
+                "archived_count": archived.len(),
+                "archived_workflows": archived
+                    .iter()
+                    .take(BULK_RECORD_LISTED)
+                    .map(|(id, name)| serde_json::json!({ "id": id, "name": name }))
+                    .collect::<Vec<_>>(),
+                "listed_truncated": archived.len() > BULK_RECORD_LISTED,
+            });
+            talos_admin_event_log::insert_on_conn(
+                &mut tx,
+                Some(user_id),
+                "workflows_bulk_archived",
+                "workflow",
+                None,
+                &format!(
+                    "{} workflow(s) bulk-archived via archive_workflows_by_prefix",
+                    archived.len()
+                ),
+                Some(&details),
             )
-            .bind(ids)
-            .bind(user_id)
-            .bind(t)
-            .execute(&self.db_pool)
-            .await?
-        } else {
-            sqlx::query(
-                "UPDATE workflows SET status = 'archived', updated_at = NOW() \
-                 WHERE id = ANY($1) AND user_id = $2 \
-                   AND (status IS NULL OR status != 'archived')",
-            )
-            .bind(ids)
-            .bind(user_id)
-            .execute(&self.db_pool)
-            .await?
-        };
-        Ok(result.rows_affected())
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(archived.len() as u64)
     }
 
     // ── Simple single-field workflow updates ──────────────────────────────
@@ -2254,21 +2278,56 @@ impl WorkflowRepository {
     /// here as a shortcut past a `workflow_webhooks` table; there is no such
     /// table and never was (2026-09-07), so this column is not a shortcut past
     /// anything — it is the whole mechanism.
+    /// Set or clear a workflow's failure-notification webhook, RECORDED in the
+    /// same transaction with the URL it replaced. That URL is where a failed
+    /// run's error text is sent, so a set → wait-for-a-failure → revert cycle
+    /// must not be able to lose either record (until 2026-09-21 the record
+    /// was written by a detached task after the change). Returns rows changed
+    /// (0 = not found or not the caller's).
     pub async fn set_failure_webhook_url_column(
         &self,
         workflow_id: Uuid,
         user_id: Uuid,
         url: Option<&str>,
     ) -> Result<u64> {
-        let result = sqlx::query(
-            "UPDATE workflows SET failure_webhook_url = $1 WHERE id = $2 AND user_id = $3",
+        let mut tx = self.db_pool.begin().await?;
+        let previous: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT failure_webhook_url FROM workflows WHERE id = $1 AND user_id = $2 FOR UPDATE",
         )
-        .bind(url)
         .bind(workflow_id)
         .bind(user_id)
-        .execute(&self.db_pool)
+        .fetch_optional(&mut *tx)
         .await?;
-        Ok(result.rows_affected())
+        let Some(previous) = previous else {
+            return Ok(0);
+        };
+        // The row is the one the owner-scoped `FOR UPDATE` above just locked, so
+        // the write needs no second ownership predicate.
+        sqlx::query("UPDATE workflows SET failure_webhook_url = $1 WHERE id = $2")
+            .bind(url)
+            .bind(workflow_id)
+            .execute(&mut *tx)
+            .await?;
+        talos_admin_event_log::insert_on_conn(
+            &mut tx,
+            Some(user_id),
+            "workflow_failure_webhook_changed",
+            "workflow",
+            Some(workflow_id),
+            &if url.is_some() {
+                format!("Workflow {workflow_id} failure webhook set")
+            } else {
+                format!("Workflow {workflow_id} failure webhook cleared")
+            },
+            Some(&serde_json::json!({
+                "is_configured": url.is_some(),
+                "webhook_url": url,
+                "previous_webhook_url": previous,
+            })),
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(1)
     }
 
     /// Fetch the `workflows.failure_webhook_url` column. Outer Option
@@ -2616,6 +2675,10 @@ impl ChangeSurface {
         }
     }
 }
+
+/// How many workflows a bulk `admin_event_log` record lists; the count beside
+/// the list is the true total (`details` over 1 MiB are dropped whole).
+const BULK_RECORD_LISTED: usize = 1000;
 
 /// Which surface deleted workflows — a closed set, because it decides the
 /// event type and wording of the `admin_event_log` record the delete writes in
