@@ -101,7 +101,7 @@ fn strip_diag_appendix(msg: &str) -> &str {
 ///
 /// Named here rather than spelled inline at the one caller that knows the
 /// cause from the STATUS rather than from the prose
-/// (`controller/src/bootstrap/background.rs`'s job-result observer, whose
+/// (`talos-job-result-observer`'s `handle_result_message`, whose
 /// `JobStatus::TimedOut` arm needs no guess). Two spellings of one bucket is
 /// the drift this module exists to prevent, and
 /// `the_timeout_bucket_spelling_is_the_classifiers` pins the agreement

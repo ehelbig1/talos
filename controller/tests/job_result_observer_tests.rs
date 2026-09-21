@@ -19,6 +19,9 @@ use talos_workflow_job_protocol::{JobResult, JobStatus};
 use uuid::Uuid;
 
 const KEY: &[u8] = b"job-result-observer-test-key-0123456789abcdef";
+/// A failure text the shared classifier has a bucket for, so "derived" below
+/// is distinguishable from "stored nothing".
+const FAILURE_TEXT: &str = "Out of fuel: the module exhausted its fuel budget";
 const WARMUPS: usize = 60;
 const RESULTS: usize = 50;
 
@@ -30,7 +33,7 @@ fn signed(job_id: Uuid, status: JobStatus, key: &[u8]) -> Vec<u8> {
     let mut r = JobResult {
         job_id,
         status,
-        output_payload: serde_json::json!({"ok": true, "error": "upstream refused"}).into(),
+        output_payload: serde_json::json!({"ok": true, "error": FAILURE_TEXT}).into(),
         logs: vec![],
         execution_time_ms: 7,
         signature: vec![],
@@ -345,6 +348,37 @@ async fn one_replica_handles_each_worker_result() {
         )
         .await,
         ObservedResult::Failed
+    );
+    // The CAUSE the observer stores: a TimedOut status is the timeout bucket
+    // (the classifier's own spelling), and a plain Failed derives its cause
+    // from the same text it stores.
+    let error_type = |pool: sqlx::Pool<sqlx::Postgres>, id: Uuid| async move {
+        sqlx::query_scalar::<_, Option<String>>(
+            "SELECT error_type FROM module_executions WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .expect("error_type")
+    };
+    assert_eq!(
+        error_type(a.clone(), fresh).await.as_deref(),
+        Some(talos_engine::module_error_type::TIMEOUT_BUCKET)
+    );
+    let derived = talos_engine::module_error_type::derive_error_type("failed", Some(FAILURE_TEXT));
+    assert!(
+        derived.is_some() && derived != Some(talos_engine::module_error_type::TIMEOUT_BUCKET),
+        "the fixture text must classify, and not as a timeout: {derived:?}"
+    );
+    let failed_pool = if with_status(&a, &failed[..1], "failed").await == 1 {
+        a.clone()
+    } else {
+        b.clone()
+    };
+    assert_eq!(
+        error_type(failed_pool, failed[0]).await.as_deref(),
+        derived,
+        "a plain Failed result must store the cause the classifier derives from its text"
     );
     assert_eq!(
         handle_result_message(
