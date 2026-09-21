@@ -5431,3 +5431,11 @@ This is the package DD and DE interrupted. The plan had been "make the detached 
 So the record moved to the only place that can still see the name, the `DELETE … RETURNING` itself, and the transaction came with it. The dashboard delete takes the caller's connection, which made the rollback case a one-line test: delete, roll back, and both the workflow and the log are as they were.
 
 The swallowed `blocked_running` read was the instructive part. Replacing `.unwrap_or_default()` with `?` is obviously right and no test could fail without it — the read touches the same two tables as the delete, so nothing makes one fail and not the other. The standing rule is that such a clause goes or gets reached. Folding the read into the delete's own statement removed the clause, a round trip, and the window between two snapshots in which a workflow could be in both sets or neither. The owner predicate on the new blocked arm then survived its own mutation until a test put another user's busy workflow in the id list.
+
+## Package DG — three of five module deletes left no record (2026-09-21)
+
+The same enumeration as DF, one table over, and the picture was worse. Workflows at least recorded on every MCP path; modules recorded on two of five, and the comment above the cleanup record argues that an attacker who detaches a module and then wipes it must not be able to erase the fact that it existed — above a record that stores a count.
+
+The capped list came from reading what happens to an oversized `details`: it is dropped whole, with a warning, and the summary survives. For a delete with no upper bound that is the wrong failure: the larger the wipe, the less the record says. A thousand entries with the true count and a flag beside them keeps the record useful and keeps it under the bound.
+
+The batch loop was a small find on the way: one DELETE per id, justified by a cleanup step that a schema migration removed in April. Returning the rows forced the question of how to return them from a loop, and the answer was not to loop.

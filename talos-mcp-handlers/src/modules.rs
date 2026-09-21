@@ -715,28 +715,14 @@ async fn handle_delete_module(
         }
     }
 
-    match state.module_repo.delete_module(mod_id, user_id).await {
+    match state
+        .module_repo
+        .delete_module(mod_id, user_id, force)
+        .await
+    {
         Ok(n) if n > 0 => {
-            // MCP-389 (2026-05-11): close the audit-trail gap on
-            // module deletion. Pre-fix a successful delete left no
-            // `admin_event_log` row, and `delete_module` is more
-            // destructive than `delete_workflow` because a deleted
-            // module silently breaks every workflow that referenced
-            // it (the ref-count gate is bypassed when `force: true`).
-            // Forensics needs to be able to reconstruct "what module
-            // was deleted at T, with how many references at the
-            // time" — record both the module id and the `force`
-            // flag in `details`. Sibling fix to the
-            // `delete_workflow` audit in the same cycle.
-            crate::actor::spawn_log_admin_event(
-                state.db_pool.clone(),
-                user_id,
-                "module_deleted",
-                "module",
-                Some(mod_id),
-                format!("Module {} deleted via MCP delete_module", mod_id),
-                Some(serde_json::json!({ "force": force })),
-            );
+            // The `module_deleted` record (name, capability world, `force`) is
+            // written by the repository inside the delete's transaction.
             crate::notify_tools_list_changed();
             mcp_text(req_id, &format!("Module {} deleted.", mod_id))
         }
@@ -860,32 +846,8 @@ async fn handle_cleanup_modules(
         .await
     {
         Ok(deleted) => {
-            // MCP-399 (2026-05-11): bulk-destructive op audit, sibling
-            // to cleanup_workflows / archive_workflows_by_prefix.
-            // Although cleanup_modules is scoped to "unreferenced
-            // modules", an attacker who first quietly detaches a
-            // module from every workflow that uses it can then call
-            // cleanup_modules to wipe it — leaving no trace of the
-            // existence of the original module. The audit row carries
-            // the deleted count and optional prefix.
-            if deleted > 0 {
-                crate::actor::spawn_log_admin_event(
-                    state.db_pool.clone(),
-                    user_id,
-                    "modules_bulk_cleanup",
-                    "module",
-                    None,
-                    format!(
-                        "{} unreferenced module(s) bulk-deleted via cleanup_modules",
-                        deleted
-                    ),
-                    Some(serde_json::json!({
-                        "deleted_count": deleted,
-                        "prefix": prefix,
-                        "older_than_days": days,
-                    })),
-                );
-            }
+            // The `modules_bulk_cleanup` record — naming every module removed —
+            // is written by the repository inside the delete's transaction.
             mcp_text(
                 req_id,
                 &format!(
@@ -1701,7 +1663,13 @@ async fn handle_cleanup_module_versions(
     let mut deleted_summary: Vec<serde_json::Value> = Vec::new();
     if !dry_run && !deletable.is_empty() {
         let ids: Vec<uuid::Uuid> = deletable.iter().map(|(id, _, _)| *id).collect();
-        match state.module_repo.batch_delete_modules(&ids, user_id).await {
+        let surface =
+            talos_module_repository::ModuleDeleteSurface::McpCleanupVersions { prefix: &prefix };
+        match state
+            .module_repo
+            .batch_delete_modules(&ids, user_id, surface)
+            .await
+        {
             Ok(n) => {
                 tracing::info!(
                     user_id = %user_id,
@@ -2253,7 +2221,11 @@ async fn handle_batch_delete_modules(
     let deleted_count = if !final_delete.is_empty() {
         match state
             .module_repo
-            .batch_delete_modules(&final_delete, user_id)
+            .batch_delete_modules(
+                &final_delete,
+                user_id,
+                talos_module_repository::ModuleDeleteSurface::McpBatch,
+            )
             .await
         {
             Ok(n) => n as i64,

@@ -644,17 +644,44 @@ impl ModuleRepository {
     /// new authoritative store stays in sync with legacy. ON DELETE CASCADE
     /// is set for user_id; for module_id we have to hit it explicitly.
     /// Delete a user-owned module. Phase 5.1: modules-only, canonical id only.
-    pub async fn delete_module(&self, module_id: Uuid, user_id: Uuid) -> Result<u64> {
-        let rows = sqlx::query(
-            "DELETE FROM modules \
-             WHERE id = $1 \
-               AND user_id = $2",
+    ///
+    /// The `module_deleted` record is written in the delete's transaction
+    /// (see [`record_module_deletes`]).
+    pub async fn delete_module(&self, module_id: Uuid, user_id: Uuid, force: bool) -> Result<u64> {
+        self.delete_modules_recorded(
+            &[module_id],
+            user_id,
+            ModuleDeleteSurface::McpDelete { force },
         )
-        .bind(module_id)
+        .await
+    }
+
+    /// The ONE delete-by-id statement: every id in one `DELETE … RETURNING`,
+    /// recorded in the same transaction. A module that cannot be recorded is
+    /// not deleted.
+    async fn delete_modules_recorded(
+        &self,
+        ids: &[Uuid],
+        user_id: Uuid,
+        surface: ModuleDeleteSurface<'_>,
+    ) -> Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.db_pool.begin().await?;
+        let removed: Vec<RemovedModule> = sqlx::query_as(
+            "DELETE FROM modules \
+             WHERE id = ANY($1) \
+               AND user_id = $2 \
+             RETURNING id, name, capability_world",
+        )
+        .bind(ids)
         .bind(user_id)
-        .execute(&self.db_pool)
+        .fetch_all(&mut *tx)
         .await?;
-        Ok(rows.rows_affected())
+        record_module_deletes(&mut tx, user_id, surface, &removed).await?;
+        tx.commit().await?;
+        Ok(removed.len() as u64)
     }
 
     /// Fetch a module's effective `max_fuel` (NOT NULL on the table,
@@ -675,17 +702,17 @@ impl ModuleRepository {
         Ok(row)
     }
 
-    /// Batch delete modules by IDs (user-scoped). Returns rows affected.
-    pub async fn batch_delete_modules(&self, module_ids: &[Uuid], user_id: Uuid) -> Result<u64> {
-        // Reuse the per-id helper so orphan-template cleanup + template-id
-        // alias resolution apply consistently. The cost is O(N) round trips
-        // instead of a single DELETE, but `batch_delete_modules` is not on
-        // a hot path and N is tiny in practice (cleanup scripts, < 100).
-        let mut total: u64 = 0;
-        for id in module_ids {
-            total = total.saturating_add(self.delete_module(*id, user_id).await?);
-        }
-        Ok(total)
+    /// Batch delete modules by IDs (user-scoped). Returns rows affected. One
+    /// statement and one `admin_event_log` row per call (until 2026-09-21 this
+    /// was one DELETE per id, and neither caller recorded anything).
+    pub async fn batch_delete_modules(
+        &self,
+        module_ids: &[Uuid],
+        user_id: Uuid,
+        surface: ModuleDeleteSurface<'_>,
+    ) -> Result<u64> {
+        self.delete_modules_recorded(module_ids, user_id, surface)
+            .await
     }
 
     /// True if the module exists AND is owned by `user_id`. Used as the
@@ -1128,7 +1155,8 @@ impl ModuleRepository {
         // there's no dynamic SQL — the `$2::bool` arm short-circuits when no
         // prefix was given.
         let pattern = prefix_filter.map(|p| format!("{}%", p));
-        let result = sqlx::query(
+        let mut tx = self.db_pool.begin().await?;
+        let removed: Vec<RemovedModule> = sqlx::query_as(
             "DELETE FROM modules \
              WHERE user_id = $1 \
                AND ($2::bool IS FALSE OR name LIKE $3) \
@@ -1139,15 +1167,27 @@ impl ModuleRepository {
                    graph_json, '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', 'g' \
                  ))::uuid \
                  FROM workflows WHERE user_id = $1 \
-               )",
+               ) \
+             RETURNING id, name, capability_world",
         )
         .bind(user_id)
         .bind(prefix_filter.is_some())
         .bind(pattern.as_deref())
         .bind(older_than_days)
-        .execute(&self.db_pool)
+        .fetch_all(&mut *tx)
         .await?;
-        Ok(result.rows_affected())
+        record_module_deletes(
+            &mut tx,
+            user_id,
+            ModuleDeleteSurface::McpCleanup {
+                prefix: prefix_filter,
+                older_than_days,
+            },
+            &removed,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(removed.len() as u64)
     }
 
     /// Fetch a module row for the get_module_info handler. Phase 5.1:
@@ -2216,19 +2256,8 @@ impl ModuleRepository {
     /// Used by the hygiene-fix path in `mcp/analytics.rs`. Returns rows
     /// affected.
     pub async fn delete_orphaned_modules(&self, ids: &[Uuid], user_id: Uuid) -> Result<u64> {
-        if ids.is_empty() {
-            return Ok(0);
-        }
-        let result = sqlx::query(
-            "DELETE FROM modules \
-             WHERE id = ANY($1) \
-               AND user_id = $2",
-        )
-        .bind(ids)
-        .bind(user_id)
-        .execute(&self.db_pool)
-        .await?;
-        Ok(result.rows_affected())
+        self.delete_modules_recorded(ids, user_id, ModuleDeleteSurface::HygieneFixAll)
+            .await
     }
 
     /// True if a module exists with the given canonical id. Used by
@@ -3721,6 +3750,126 @@ impl ModuleRepository {
             .map(|row| -> Result<(String, Uuid)> { Ok((row.try_get("name")?, row.try_get("id")?)) })
             .collect::<Result<std::collections::HashMap<String, Uuid>>>()
     }
+}
+
+/// A module a delete removed — everything the record can still say about it
+/// once the row is gone.
+#[derive(Debug, sqlx::FromRow)]
+struct RemovedModule {
+    id: Uuid,
+    name: String,
+    capability_world: String,
+}
+
+/// Which surface deleted modules — a closed set: it decides the event type and
+/// wording of the `admin_event_log` record the delete writes in its own
+/// transaction.
+#[derive(Debug, Clone, Copy)]
+pub enum ModuleDeleteSurface<'a> {
+    /// MCP `delete_module`: one `module_deleted` row per module.
+    McpDelete { force: bool },
+    /// MCP `batch_delete_modules`: one `modules_bulk_deleted` row per call.
+    McpBatch,
+    /// MCP `cleanup_modules`: one `modules_bulk_cleanup` row per call.
+    McpCleanup {
+        prefix: Option<&'a str>,
+        older_than_days: i32,
+    },
+    /// MCP `cleanup_module_versions`: one `module_versions_cleanup` row.
+    McpCleanupVersions { prefix: &'a str },
+    /// Hygiene `fix_all confirm=true`: one `modules_hygiene_deleted` row.
+    HygieneFixAll,
+}
+
+/// How many removed modules a bulk record lists. `cleanup_modules` is an
+/// unbounded DELETE by design, and `admin_event_log.details` over 1 MiB is
+/// dropped whole — so the list is capped and says so, beside the true count.
+const MODULE_DELETE_RECORD_LISTED: usize = 1000;
+
+/// The one recorder of module deletes; runs on the delete's own connection.
+/// Nothing deleted ⇒ nothing recorded. The record names each module and its
+/// capability world: a deleted module silently breaks every workflow that
+/// referenced it, and its name and privilege exist nowhere else afterwards.
+async fn record_module_deletes(
+    conn: &mut sqlx::PgConnection,
+    user_id: Uuid,
+    surface: ModuleDeleteSurface<'_>,
+    removed: &[RemovedModule],
+) -> Result<()> {
+    if removed.is_empty() {
+        return Ok(());
+    }
+    let bulk = match surface {
+        ModuleDeleteSurface::McpDelete { .. } => None,
+        ModuleDeleteSurface::McpBatch => Some(("modules_bulk_deleted", "MCP batch_delete_modules")),
+        ModuleDeleteSurface::McpCleanup { .. } => Some(("modules_bulk_cleanup", "cleanup_modules")),
+        ModuleDeleteSurface::McpCleanupVersions { .. } => {
+            Some(("module_versions_cleanup", "cleanup_module_versions"))
+        }
+        ModuleDeleteSurface::HygieneFixAll => Some(("modules_hygiene_deleted", "hygiene fix_all")),
+    };
+    let Some((event_type, via)) = bulk else {
+        let force = matches!(surface, ModuleDeleteSurface::McpDelete { force: true });
+        for m in removed {
+            let details = serde_json::json!({
+                "name": m.name,
+                "capability_world": m.capability_world,
+                "force": force,
+                "surface": "mcp",
+            });
+            talos_admin_event_log::insert_on_conn(
+                &mut *conn,
+                Some(user_id),
+                "module_deleted",
+                "module",
+                Some(m.id),
+                &format!(
+                    "Module '{}' ({}) deleted via MCP delete_module",
+                    m.name, m.id
+                ),
+                Some(&details),
+            )
+            .await?;
+        }
+        return Ok(());
+    };
+    let mut details = serde_json::json!({
+        "surface": "mcp",
+        "deleted_count": removed.len(),
+        "deleted_modules": removed
+            .iter()
+            .take(MODULE_DELETE_RECORD_LISTED)
+            .map(|m| serde_json::json!({
+                "id": m.id,
+                "name": m.name,
+                "capability_world": m.capability_world,
+            }))
+            .collect::<Vec<_>>(),
+        "listed_truncated": removed.len() > MODULE_DELETE_RECORD_LISTED,
+    });
+    match surface {
+        ModuleDeleteSurface::McpCleanup {
+            prefix,
+            older_than_days,
+        } => {
+            details["prefix"] = serde_json::json!(prefix);
+            details["older_than_days"] = serde_json::json!(older_than_days);
+        }
+        ModuleDeleteSurface::McpCleanupVersions { prefix } => {
+            details["prefix"] = serde_json::json!(prefix);
+        }
+        _ => {}
+    }
+    talos_admin_event_log::insert_on_conn(
+        conn,
+        Some(user_id),
+        event_type,
+        "module",
+        None,
+        &format!("{} module(s) deleted via {via}", removed.len()),
+        Some(&details),
+    )
+    .await
 }
 
 #[cfg(test)]

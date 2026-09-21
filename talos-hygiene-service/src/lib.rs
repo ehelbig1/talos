@@ -1992,17 +1992,16 @@ impl HygieneService {
 
         // 3. Delete orphaned compiled modules (not referenced by any workflow)
         if !candidates.orphaned_module_ids.is_empty() {
-            let deleted_modules = self
-                .module_repo
-                .delete_orphaned_modules(&candidates.orphaned_module_ids, user_id)
-                .await
-                .unwrap_or(0);
-            tracing::warn!(
-                user_id = %user_id,
-                deleted = deleted_modules,
-                "hygiene fix: deleted orphaned modules"
+            let (count, error) = orphaned_module_delete_result(
+                self.module_repo
+                    .delete_orphaned_modules(&candidates.orphaned_module_ids, user_id)
+                    .await,
+                user_id,
             );
-            fix_results["orphaned_modules_deleted"] = serde_json::json!(deleted_modules);
+            fix_results["orphaned_modules_deleted"] = count;
+            if let Some(error) = error {
+                fix_results["orphaned_modules_delete_error"] = error;
+            }
         }
 
         serde_json::json!({
@@ -2012,6 +2011,35 @@ impl HygieneService {
             "results": fix_results,
             "note": "Fixes applied. Re-run get_platform_hygiene_report to verify the updated state.",
         })
+    }
+}
+
+/// Render the orphaned-module delete. Null, not 0, on failure — "0 deleted"
+/// beside a swallowed error reads as "there was nothing to delete" (the
+/// stale-draft step's rule; this step defaulted its error to 0 until the
+/// delete began refusing when it cannot be recorded).
+fn orphaned_module_delete_result(
+    outcome: anyhow::Result<u64>,
+    user_id: uuid::Uuid,
+) -> (serde_json::Value, Option<serde_json::Value>) {
+    match outcome {
+        Ok(deleted) => {
+            tracing::warn!(user_id = %user_id, deleted, "hygiene fix: deleted orphaned modules");
+            (serde_json::json!(deleted), None)
+        }
+        Err(e) => {
+            tracing::error!(
+                user_id = %user_id,
+                error = %e,
+                "hygiene fix: orphaned-module delete failed; nothing was deleted"
+            );
+            (
+                serde_json::Value::Null,
+                Some(serde_json::json!(
+                    "the orphaned-module delete could not run; NO module was deleted"
+                )),
+            )
+        }
     }
 }
 
@@ -3160,5 +3188,31 @@ mod partition_stale_drafts_tests {
     fn an_empty_population_partitions_into_nothing() {
         let p = partition_stale_drafts(&[]);
         assert_total(&p, 0);
+    }
+}
+
+#[cfg(test)]
+mod orphaned_module_delete_render_tests {
+    use super::orphaned_module_delete_result;
+
+    #[test]
+    fn a_failed_delete_is_null_with_a_reason_never_zero() {
+        let user = uuid::Uuid::nil();
+        let (count, error) =
+            orphaned_module_delete_result(Err(anyhow::anyhow!("pool closed")), user);
+        assert!(
+            count.is_null(),
+            "a failed delete must not read as 0 deleted"
+        );
+        let error = error.expect("a reason").to_string();
+        assert!(error.contains("NO module was deleted"));
+        assert!(
+            !error.contains("pool closed"),
+            "no internal error text to the caller"
+        );
+        // CONTROL
+        let (count, error) = orphaned_module_delete_result(Ok(3), user);
+        assert_eq!(count, serde_json::json!(3));
+        assert!(error.is_none());
     }
 }
