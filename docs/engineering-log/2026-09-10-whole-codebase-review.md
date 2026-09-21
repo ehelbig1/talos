@@ -5459,3 +5459,143 @@ The pause record earned its previous-state field from its own history: the first
 The archive handler had been recording the names its preview matched. A preview is a read; the archive is a write with a guard the preview does not have, and the difference — a workflow already archived — was sitting in the fixture. The statement's own RETURNING is the only honest source.
 
 With the last callers gone, both helpers were deleted rather than left for the next author to reach for. What remains takes a connection.
+
+## Package DJ — the stolen-credential response nobody could see (2026-09-21)
+
+The audit-record arc closed, and the next survey started from a question
+rather than a grep: which controls does this platform have that respond
+automatically to a compromised credential, and what does each of them say
+when it acts?
+
+There is one. Refresh-token rotation makes a stolen token self-announcing —
+the thief's first use succeeds and deletes the session row, so the
+legitimate client's next refresh misses — and `rotated_session_audit` is
+what turns that miss into evidence instead of an ordinary expired token. The
+response is `revoke_all_sessions`. Everything else on the credential surface
+refuses a request; this is the only thing that reaches back and takes
+sessions away.
+
+Its entire output was one line:
+
+```rust
+tracing::error!(target: "talos_security_alert", ...)
+```
+
+`grep -rn 'target: "talos_security_alert"'` over the workspace returns
+exactly that line and nothing else. A second grep, over `deploy/`,
+`observability/` and `scripts/`, returns nothing at all: no tracing layer
+routes it, no alert rule selects it, no scrape reads it, no script greps it.
+CLAUDE.md already records this shape for `talos_audit` — "a target string on
+an ordinary log line", shared by ~60 emitters as a grep convention — and
+this is the same shape with a population of one, on the one control whose
+whole job is to act without a human.
+
+Then the read itself:
+
+```rust
+if let Ok(Some((reused_user_id, rotated_at))) = sqlx::query_as(...)
+```
+
+A pool timeout, a projection drift, a renamed table — every one of them
+lands in the same branch as "there is no audit row for this token". The
+detector does not run, says nothing, and a replayed stolen token leaves
+every other session of that user alive. The request is still refused, so it
+is not a fail-open on the request; it is a fail-open on the response, which
+is the half that matters here.
+
+Two more silences sat in the same block. A failed `revoke_all_sessions` was
+a `warn!` — detection real, response absent, nothing machine-readable either
+way. And on the ARM side, the `INSERT INTO rotated_session_audit` that a
+rotation performs is best-effort by design, correctly so, but its failure
+disarms the detector for that token and also left nothing but a `warn!`.
+
+The live numbers made it a latent finding, not a live one: 107 rows in
+`rotated_session_audit` (so the path runs on this fleet), zero
+`refresh_token_reuse_detected` rows ever, 2101 `token_refresh` events. That
+is the cheapest possible moment to make a control legible.
+
+### What the fix is, and what it deliberately is not
+
+`classify_token_reuse` is the one home, and it is generic over the read's
+error type on purpose. The `Err` arm is the entire reason the function
+exists, so it belongs inside the function a unit test can drive, not at the
+call site where the defect was. `now` is a parameter, so the grace boundary
+is exactly testable and the caller takes a single clock reading. The inline
+`5` became `TOKEN_REUSE_GRACE_SECS`.
+
+Four findings, five metric verdicts: `Reused` splits into `detected` and
+`revoke_failed` depending on whether the response ran, because "we saw it"
+and "we acted on it" are different claims and only one of them means the
+thief's freshly-minted session is gone.
+
+What did NOT change is the caller's answer. Every path — detected, within
+grace, not reused, unreadable — returns the same generic
+`Invalid or expired refresh token`. A different response on detection is an
+oracle that tells a thief their token was recognised, and the pre-existing
+code said so in a comment. The split is for the operator.
+
+### Thresholds, and one window that had to be measured
+
+`TalosAuthRefreshTokenReuseDetected` fires at `> 0`. That is not a guessed
+threshold: a detection is an incident by definition, the same footing
+`TalosAuditVerificationFailures` stands on. It selects `detected` and
+`revoke_failed` together.
+
+The arm alert needed a real measurement, and the first instinct was wrong.
+A one-hour ratio window with a floor of five is the house shape
+(`TalosRPCSubjectFailing`), so that is what the first draft had. Then:
+
+```sql
+SELECT date_trunc('hour', rotated_at), count(*)
+FROM rotated_session_audit GROUP BY 1 ORDER BY 2 DESC LIMIT 5;
+```
+
+The busiest hour on this fleet has **six** rotations. Per day it is 8 to 50,
+and several days in the retained window carry none at all. A floor of five
+in one hour is therefore reachable only in the single busiest hour of the
+busiest day — which is to say, decorative. The window is 24 hours, and the
+justification is written into the rule: a disarmed defence-in-depth detector
+is an hours-matter problem, not a minutes-matter one.
+
+`detector_unreadable` gets no alert, and that is a decision rather than an
+omission. The detector runs only on a refresh whose session lookup missed,
+which this fleet produces far too rarely for any floor to be reachable; a
+threshold would be a guess on a series that has never produced a sample. The
+series ships and the alert waits for a baseline — the same call the
+2026-09-11 security-counter burn-down made for 2FA failures and key
+guessing.
+
+### Guards
+
+The classifier gets five unit tests, and the first one is the defect stated
+as an assertion: an unreadable read is `DetectorUnreadable`, an answered
+empty read is `NotReused`, and `assert_ne!` between the two.
+
+`controller/tests/token_reuse_detector_tests` drives the production
+`AuthService::refresh_access_token` through all six arms in one test
+function — one, because the metrics registry is process-global. The two
+unreadable arms are reached by renaming `rotated_session_audit` out from
+under a live pool, which is what lets the session lookup, the bcrypt verify
+and the rotation all keep working while only the detector's own read fails.
+That test asserts the thing the old code could not distinguish: on the
+unreadable arm, `not_reused` moves by **zero**.
+
+The arm-failure case earns its place twice over. It proves the failure is
+counted, and it proves the rotation still SUCCEEDS — the best-effort
+contract the `warn!` was protecting is still intact, now with a series
+behind it.
+
+Four promtool cases per alert, one per clause, each quiet case satisfying
+every other clause. The low-ratio case carries ten failures precisely so
+that only the ratio can refuse it; the audit-chain ratio survived four
+fixture cases once because every one of them was under the floor instead.
+All four clause mutations were run before the docs were written: selector
+narrowed to `detected` alone, selector widened to include
+`detector_unreadable`, ratio relaxed to `> 0`, floor relaxed to `>= 1` —
+caught, caught, caught, caught.
+
+### Cost
+
+Zero added database work. No new query, no new await, on any path. The
+classifier is a `match`; each counter is one atomic, and the arm counter
+sits on a path that was already writing a row.

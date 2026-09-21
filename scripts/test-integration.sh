@@ -600,6 +600,15 @@ CTRL_TESTS=(
     # middleware on a router against real mcp_agents rows and reads
     # talos_mcp_auth_total / rate_limit_hits_total{type=mcp_auth} as deltas.
     "mcp_auth_metrics_tests"
+    # The refresh-token REUSE DETECTOR is the platform's only automated
+    # stolen-credential response, and until 2026-09-21 its whole output was
+    # one log line on a tracing target nothing subscribed to, with a read
+    # whose failure was indistinguishable from "no reuse". Drives the
+    # production AuthService::refresh_access_token through every arm —
+    # including both unreadable ones, via a renamed table — and reads
+    # talos_auth_token_reuse_total / _rotation_audit_arm_total as deltas.
+    # `common` harness, so CTRL_TESTS (64b).
+    "token_reuse_detector_tests"
     # Every workflow and module finalizer moves the execution count/duration
     # families that closed check 58's dead-metric baseline, with the duration
     # the finalizing UPDATE itself RETURNS; back-dated rows prove the observed

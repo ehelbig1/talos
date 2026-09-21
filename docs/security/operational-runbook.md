@@ -864,6 +864,67 @@ This path writes no audit row; record it in the incident notes.
 
 ---
 
+### 3.6 Suspected refresh-token (session cookie) theft
+
+Refresh-token rotation makes a stolen token self-announcing. The thief's
+first use succeeds and deletes the session row, so the legitimate client's
+next refresh MISSES — and `rotated_session_audit` is what turns that miss
+into evidence rather than an ordinary "expired token". Past a 5-second
+tab-race grace window (`talos_auth::TOKEN_REUSE_GRACE_SECS`) the controller
+revokes EVERY session for the affected user, writes a
+`refresh_token_reuse_detected` row to `auth_audit_log` and logs at ERROR on
+target `talos_security_alert`. This is the platform's only automated
+stolen-credential response.
+
+Since 2026-09-21 it is also the only part of that control an operator can
+SEE without reading container logs:
+
+```bash
+curl -s -H "Authorization: Bearer $PROMETHEUS_SCRAPE_TOKEN" \
+  http://localhost:8000/metrics/prometheus | grep talos_auth_token_reuse_total
+```
+
+- `detected` — a replay was found AND every session was revoked. The
+  control worked; the user must sign in again.
+- `revoke_failed` — the replay was found and the revoke FAILED. The
+  detection is real and the response did not happen, so the thief's own
+  freshly-minted session is still alive. Revoke it by hand (§3.5's
+  `DELETE FROM user_sessions`) before anything else.
+- `detector_unreadable` — the `rotated_session_audit` read itself failed.
+  This says NOTHING about whether a token was reused: the control could not
+  look. The refresh was still refused, so the request failed closed; what
+  did not happen is the RESPONSE. Before 2026-09-21 this case was
+  indistinguishable from `not_reused`.
+- `not_reused` / `within_grace` — benign, and the overwhelming majority.
+
+`TalosAuthRefreshTokenReuseDetected` (critical) fires on `detected` or
+`revoke_failed`. The affected user id is deliberately NOT a metric label —
+it would be unbounded cardinality and PII on the metrics endpoint — so take
+it from the log line or from:
+
+```bash
+docker exec talos-postgres psql -U talos -d talos -c \
+  "SELECT user_id, created_at FROM auth_audit_log
+   WHERE event_type = 'refresh_token_reuse_detected'
+   ORDER BY created_at DESC LIMIT 20;"
+```
+
+Treat the account as compromised until shown otherwise: the thief held a
+live refresh token, so they held whatever it could mint for up to its
+7-day TTL. Revoking sessions does NOT invalidate an access JWT already
+issued — those stay valid for up to 15 minutes.
+
+`talos_auth_rotation_audit_arm_total{outcome}` is the other half: it counts
+whether each rotation ARMED the detector. That INSERT is best-effort by
+design (failing a legitimate refresh over defence-in-depth would be the
+worse trade), so a persistent `failed` means reuse detection is quietly out
+of service for every token retired since — and a later replay of one would
+be counted `not_reused`. `TalosAuthRotationAuditArmFailing` (warning) is the
+alert; its 24-hour window is set by the measured rotation rate (8–50 per day
+on the reference fleet, busiest hour 6), not by urgency.
+
+---
+
 ## 4. Pre-deployment security checklist
 
 Before pointing this at anything sensitive — especially before exposing
