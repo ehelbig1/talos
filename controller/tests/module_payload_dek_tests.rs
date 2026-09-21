@@ -509,6 +509,264 @@ async fn service_completion_seals_the_output_under_the_rows_key() {
     assert_eq!(got_out2, output);
 }
 
+/// The THIRD completion writer: `complete_execution_from_worker`, the path of
+/// module-bound webhooks and pushes and of the `talos.results.*` observer.
+/// Until 2026-09-21 it stored the redacted output as PLAINTEXT beside a sealed
+/// input (3 of 34 153 outputs on the reference deployment, all from here).
+#[tokio::test]
+async fn worker_result_completion_seals_the_output_under_the_rows_key() {
+    master_key();
+    let pool = test_helpers::get_isolated_db_pool().await;
+    let sm = Arc::new(controller::secrets::SecretsManager::new(pool.clone()).unwrap());
+    sm.initialize().await.unwrap();
+    let s = seed(&pool).await;
+    let service = talos_module_executions::ModuleExecutionService::new(
+        pool.clone(),
+        Arc::new(talos_dlp_provider::DlpService::from_env()),
+    )
+    .with_encryption(sm.clone());
+    let input = serde_json::json!({ "in": "worker-input" });
+    let output = serde_json::json!({ "out": "worker-output" });
+
+    // (a) The live shape: a standalone (webhook-style) row, global key, v3.
+    let meid = Uuid::new_v4();
+    service
+        .create_execution(
+            s.module,
+            s.user,
+            meid,
+            talos_module_executions::TriggerType::Webhook,
+            None,
+            Some(input.clone()),
+            None,
+            Some(s.actor),
+        )
+        .await
+        .unwrap();
+    service
+        .complete_execution_from_worker(meid, Some(output.clone()), Some(12))
+        .await
+        .unwrap();
+    let (plain, status, duration): (Option<serde_json::Value>, String, Option<i32>) =
+        sqlx::query_as(
+            "SELECT output_data, status, duration_ms FROM module_executions WHERE id = $1",
+        )
+        .bind(meid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        plain, None,
+        "the output must not be stored in the plaintext column"
+    );
+    assert_eq!((status.as_str(), duration), ("completed", Some(12)));
+    let global = sm.get_active_dek().await.unwrap();
+    let (kid, fmt, got_in, got_out) = row_slots(&pool, &sm, meid).await;
+    assert_eq!(
+        (kid, fmt),
+        (global.id, 3),
+        "the row keeps its start-time key and format"
+    );
+    assert_eq!(got_in, input);
+    assert_eq!(got_out, output);
+
+    // A late duplicate result must not re-seal a finished row.
+    let sealed_before: Vec<u8> =
+        sqlx::query_scalar("SELECT output_data_enc FROM module_executions WHERE id = $1")
+            .bind(meid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    service
+        .complete_execution_from_worker(meid, Some(serde_json::json!({ "out": "late" })), None)
+        .await
+        .unwrap();
+    let sealed_after: Vec<u8> =
+        sqlx::query_scalar("SELECT output_data_enc FROM module_executions WHERE id = $1")
+            .bind(meid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(sealed_before, sealed_after);
+
+    // (b) Org DEK rotated while the module runs: sealed under the retired key
+    // the row names, in the row's format (package CJ's rule).
+    let wei = Uuid::new_v4();
+    insert_workflow_execution(&pool, &s, wei).await;
+    let meid2 = Uuid::new_v4();
+    service
+        .create_execution(
+            s.module,
+            s.user,
+            meid2,
+            talos_module_executions::TriggerType::Webhook,
+            None,
+            Some(input.clone()),
+            Some(wei),
+            Some(s.actor),
+        )
+        .await
+        .unwrap();
+    let before = sm.get_active_dek_for_org(s.org).await.unwrap().unwrap().id;
+    let after = sm.rotate_dek_for_org(s.org, None).await.unwrap().unwrap();
+    assert_ne!(before, after);
+    service
+        .complete_execution_from_worker(meid2, Some(output.clone()), None)
+        .await
+        .unwrap();
+    let (kid2, fmt2, got_in2, got_out2) = row_slots(&pool, &sm, meid2).await;
+    assert_eq!(
+        (kid2, fmt2),
+        (before, 4),
+        "sealed under the retired key the row names"
+    );
+    assert_eq!(got_in2, input);
+    assert_eq!(got_out2, output);
+
+    // (c) A completion with NO output leaves the sealed input readable: the
+    // format stamp must not be reset by an empty bundle.
+    let meid3 = Uuid::new_v4();
+    service
+        .create_execution(
+            s.module,
+            s.user,
+            meid3,
+            talos_module_executions::TriggerType::Webhook,
+            None,
+            Some(input.clone()),
+            None,
+            Some(s.actor),
+        )
+        .await
+        .unwrap();
+    service
+        .complete_execution_from_worker(meid3, None, None)
+        .await
+        .unwrap();
+    let (kid3, fmt3, input_enc): (Uuid, i16, Vec<u8>) = sqlx::query_as(
+        "SELECT payload_enc_key_id, payload_format, input_data_enc FROM module_executions WHERE id = $1",
+    )
+    .bind(meid3)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let still = decrypt_payload_slot(&sm, kid3, &input_enc, meid3, PayloadSlot::Input, fmt3)
+        .await
+        .expect("the input still decrypts after an output-less completion");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&still).unwrap(),
+        input
+    );
+}
+
+/// A row that names NO key yet — the webhook router writes one when its input
+/// seal failed and it fell back to the redacted plaintext column. The
+/// completion then brings its own key and format, and BOTH must be stamped or
+/// the sealed output is unreadable.
+#[tokio::test]
+async fn worker_result_completion_stamps_key_and_format_on_a_keyless_row() {
+    master_key();
+    let pool = test_helpers::get_isolated_db_pool().await;
+    let sm = Arc::new(controller::secrets::SecretsManager::new(pool.clone()).unwrap());
+    sm.initialize().await.unwrap();
+    let s = seed(&pool).await;
+    let service = talos_module_executions::ModuleExecutionService::new(
+        pool.clone(),
+        Arc::new(talos_dlp_provider::DlpService::from_env()),
+    )
+    .with_encryption(sm.clone());
+    let meid = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO module_executions (id, module_id, user_id, status, actor_id, trigger_type, started_at) \
+         VALUES ($1, $2, $3, 'running', $4, 'webhook', NOW())",
+    )
+    .bind(meid)
+    .bind(s.module)
+    .bind(s.user)
+    .bind(s.actor)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let output = serde_json::json!({ "out": "keyless" });
+    service
+        .complete_execution_from_worker(meid, Some(output.clone()), None)
+        .await
+        .unwrap();
+    let (plain, kid, fmt, enc): (
+        Option<serde_json::Value>,
+        Option<Uuid>,
+        i16,
+        Option<Vec<u8>>,
+    ) = sqlx::query_as(
+        "SELECT output_data, payload_enc_key_id, payload_format, output_data_enc \
+             FROM module_executions WHERE id = $1",
+    )
+    .bind(meid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(plain, None);
+    let kid = kid.expect("the completion stamps the key it sealed under");
+    assert!(
+        fmt >= 3,
+        "the completion stamps the format it sealed in (got {fmt})"
+    );
+    let got = decrypt_payload_slot(
+        &sm,
+        kid,
+        &enc.expect("sealed"),
+        meid,
+        PayloadSlot::Output,
+        fmt,
+    )
+    .await
+    .expect("the output decrypts under the stamped key and format");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&got).unwrap(),
+        output
+    );
+}
+
+/// CONTROL: with no SecretsManager wired (the documented dev fallback, and
+/// every unit test), the output lands in the plaintext column as before — so
+/// the sealed assertion above is the encryption path's doing.
+#[tokio::test]
+async fn worker_result_completion_without_a_secrets_manager_stays_plaintext() {
+    master_key();
+    let pool = test_helpers::get_isolated_db_pool().await;
+    let s = seed(&pool).await;
+    let service = talos_module_executions::ModuleExecutionService::new(
+        pool.clone(),
+        Arc::new(talos_dlp_provider::DlpService::from_env()),
+    );
+    let meid = Uuid::new_v4();
+    service
+        .create_execution(
+            s.module,
+            s.user,
+            meid,
+            talos_module_executions::TriggerType::Webhook,
+            None,
+            None,
+            None,
+            Some(s.actor),
+        )
+        .await
+        .unwrap();
+    let output = serde_json::json!({ "out": "plain" });
+    service
+        .complete_execution_from_worker(meid, Some(output.clone()), None)
+        .await
+        .unwrap();
+    let (plain, enc): (Option<serde_json::Value>, Option<Vec<u8>>) =
+        sqlx::query_as("SELECT output_data, output_data_enc FROM module_executions WHERE id = $1")
+            .bind(meid)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((plain, enc), (Some(output), None));
+}
+
 /// The engine's store (`record_started` → `record_completed`) — the production
 /// writer for every workflow-dispatched module — across a mid-run rotation.
 #[tokio::test]
