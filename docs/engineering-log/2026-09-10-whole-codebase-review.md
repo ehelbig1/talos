@@ -5381,3 +5381,11 @@ these rows have a key); then to withdraw a sentence saying the retention sweep
 would remove them (that sweep defaults off). Each claim was checked against
 the code only after it had been written down.
 
+
+## Package DA — the janitor's failures were never counted (2026-09-21)
+
+The ninety-ninth deploy verification reconciled the database against the controller's counters seven hours after boot: 113 completed workflow runs against 113 counted, 340 module completions against 340 — and one `failed` run against a failure counter at 0. The row was `pa-inbox-organizer`, started 01:20:09Z, fifty seconds before the previous controller was replaced, closed an hour later by the stale sweep with its "Orphaned, not overrunning" message.
+
+Package AG (2026-09-12) had moved every workflow terminal write into `talos-execution-finalizer` and noted the stale sweep's write in passing as "the stale sweep's marked one" — marked for check 46, because its guard is deliberately `running`-only. The marker answered the lint and nobody asked the other question: does it count? It did not. Ten live rows and two archived ones in thirty days carry the sweep's message; none moved the counter.
+
+The fix moves the statement into the leaf with its guard unchanged and the usual `RETURNING` duration, and the sweep calls it. The DB test drives the repository method against six row states. Mutations are recorded in the PR.
