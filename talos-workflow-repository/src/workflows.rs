@@ -911,12 +911,23 @@ impl WorkflowRepository {
         Ok(result.rows_affected())
     }
 
-    /// Delete a workflow gated on ownership OR writable-org access,
-    /// REFUSING when in-flight executions exist (the NOT EXISTS guard —
-    /// a plain DELETE would CASCADE running executions away mid-flight,
-    /// MCP-650). Takes the caller's connection (tenant-scoped tx from the
-    /// WRITABLE org set). Returns rows affected; 0 = not found / not
-    /// permitted / blocked — disambiguate with
+    /// Delete a workflow gated on ownership OR writable-org access, with the
+    /// SAME two refusals every other workflow delete makes:
+    ///
+    /// * in-flight executions (the NOT EXISTS guard — a plain DELETE would
+    ///   CASCADE running executions away mid-flight, MCP-650);
+    /// * an ENABLED parent dispatches into it as a sub-workflow. Until
+    ///   2026-09-21 this statement — the one behind the dashboard's delete
+    ///   button — had only the first, so the UI could delete a child out from
+    ///   under a live parent while `delete_workflow`, `batch_delete_workflows`
+    ///   and `cleanup_workflows` all refused the same request.
+    ///
+    /// The child scan is keyed on the workflow's OWNER, not the caller: a
+    /// sub-workflow is resolved among its owner's workflows, and an org member
+    /// with write access deleting a colleague's child must meet the same
+    /// refusal the owner would. Takes the caller's connection (tenant-scoped
+    /// tx from the WRITABLE org set). `NotDeleted` = not found / not permitted
+    /// / blocked by an execution — disambiguate with
     /// `workflow_delete_blocked_scoped`.
     pub async fn delete_workflow_guarded_scoped(
         &self,
@@ -924,7 +935,34 @@ impl WorkflowRepository {
         workflow_id: Uuid,
         user_id: Uuid,
         writable_org_ids: &[Uuid],
-    ) -> Result<u64> {
+    ) -> Result<ScopedWorkflowDelete> {
+        let owner: Option<Uuid> = sqlx::query_scalar(
+            "SELECT user_id FROM workflows \
+             WHERE id = $1 AND (user_id = $2 OR org_id = ANY($3))",
+        )
+        .bind(workflow_id)
+        .bind(user_id)
+        .bind(writable_org_ids)
+        .fetch_optional(&mut *conn)
+        .await?;
+        let Some(owner) = owner else {
+            return Ok(ScopedWorkflowDelete::NotDeleted);
+        };
+
+        // A failed scan is an error, never "nobody's child" (the scan's own
+        // contract): refusing on doubt is the only safe direction for a delete.
+        let scan =
+            talos_child_workflow_refs::scan_child_parents(&self.db_pool, owner, &[workflow_id])
+                .await
+                .context("delete_workflow child-reference scan")?;
+        if let Some(protection) = scan.protection_for(workflow_id) {
+            return Ok(ScopedWorkflowDelete::Referenced(ReferencedWorkflow {
+                id: workflow_id,
+                parents: protection.parent_names().to_vec(),
+                reason: protection.reason(),
+            }));
+        }
+
         let result = sqlx::query(
             "DELETE FROM workflows \
              WHERE id = $1 \
@@ -940,7 +978,11 @@ impl WorkflowRepository {
         .bind(writable_org_ids)
         .execute(conn)
         .await?;
-        Ok(result.rows_affected())
+        Ok(if result.rows_affected() > 0 {
+            ScopedWorkflowDelete::Deleted
+        } else {
+            ScopedWorkflowDelete::NotDeleted
+        })
     }
 
     /// Refusal-path diagnostic for `delete_workflow_guarded_scoped`: true
@@ -2528,6 +2570,17 @@ impl ChangeSurface {
             Self::Graphql => "graphql",
         }
     }
+}
+
+/// What [`WorkflowRepository::delete_workflow_guarded_scoped`] did.
+#[derive(Debug)]
+#[must_use]
+pub enum ScopedWorkflowDelete {
+    Deleted,
+    /// Not found, not permitted, or blocked by an in-flight execution.
+    NotDeleted,
+    /// An enabled parent dispatches into it; nothing was deleted.
+    Referenced(ReferencedWorkflow),
 }
 
 /// What a batch delete actually did, with each refusal separated by CAUSE.
