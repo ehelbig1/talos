@@ -1976,12 +1976,18 @@ impl HygieneService {
         // Steps 1 and 3 below always passed their id lists; this one did not.
         // The action is now a subset of the preview by construction.
         if !candidates.stale_exec_ids.is_empty() {
-            let cancelled = self
-                .execution_repo
-                .cleanup_stale_executions_by_ids(&candidates.stale_exec_ids, 120, user_id)
-                .await
-                .unwrap_or(0);
-            fix_results["stale_executions_cancelled"] = serde_json::json!(cancelled);
+            let (cancelled, error) = destructive_step_result(
+                self.execution_repo
+                    .cleanup_stale_executions_by_ids(&candidates.stale_exec_ids, 120, user_id)
+                    .await,
+                user_id,
+                "stale-execution cleanup",
+                "NO execution was marked failed",
+            );
+            fix_results["stale_executions_cancelled"] = cancelled;
+            if let Some(error) = error {
+                fix_results["stale_executions_cleanup_error"] = error;
+            }
             // `cancelled` can legitimately be LOWER than the previewed count:
             // the preview selects running/queued/resuming, the write touches
             // only `running`, and a row may have finished in between. Saying so
@@ -1992,11 +1998,13 @@ impl HygieneService {
 
         // 3. Delete orphaned compiled modules (not referenced by any workflow)
         if !candidates.orphaned_module_ids.is_empty() {
-            let (count, error) = orphaned_module_delete_result(
+            let (count, error) = destructive_step_result(
                 self.module_repo
                     .delete_orphaned_modules(&candidates.orphaned_module_ids, user_id)
                     .await,
                 user_id,
+                "orphaned-module delete",
+                "NO module was deleted",
             );
             fix_results["orphaned_modules_deleted"] = count;
             if let Some(error) = error {
@@ -2014,30 +2022,29 @@ impl HygieneService {
     }
 }
 
-/// Render the orphaned-module delete. Null, not 0, on failure — "0 deleted"
-/// beside a swallowed error reads as "there was nothing to delete" (the
-/// stale-draft step's rule; this step defaulted its error to 0 until the
-/// delete began refusing when it cannot be recorded).
-fn orphaned_module_delete_result(
+/// Render one destructive `fix_all` step. Null, not 0, on failure — "0" beside
+/// a swallowed error reads as "there was nothing to do" (the stale-draft
+/// step's rule). Both callers defaulted their error to 0 until their writes
+/// began refusing when they cannot be recorded. No internal error text
+/// reaches the caller.
+fn destructive_step_result(
     outcome: anyhow::Result<u64>,
     user_id: uuid::Uuid,
+    step: &str,
+    nothing_happened: &str,
 ) -> (serde_json::Value, Option<serde_json::Value>) {
     match outcome {
-        Ok(deleted) => {
-            tracing::warn!(user_id = %user_id, deleted, "hygiene fix: deleted orphaned modules");
-            (serde_json::json!(deleted), None)
+        Ok(count) => {
+            tracing::warn!(user_id = %user_id, step, count, "hygiene fix: step applied");
+            (serde_json::json!(count), None)
         }
         Err(e) => {
-            tracing::error!(
-                user_id = %user_id,
-                error = %e,
-                "hygiene fix: orphaned-module delete failed; nothing was deleted"
-            );
+            tracing::error!(user_id = %user_id, step, error = %e, "hygiene fix: step failed");
             (
                 serde_json::Value::Null,
-                Some(serde_json::json!(
-                    "the orphaned-module delete could not run; NO module was deleted"
-                )),
+                Some(serde_json::json!(format!(
+                    "the {step} could not run; {nothing_happened}"
+                ))),
             )
         }
     }
@@ -3193,13 +3200,17 @@ mod partition_stale_drafts_tests {
 
 #[cfg(test)]
 mod orphaned_module_delete_render_tests {
-    use super::orphaned_module_delete_result;
+    use super::destructive_step_result;
 
     #[test]
     fn a_failed_delete_is_null_with_a_reason_never_zero() {
         let user = uuid::Uuid::nil();
-        let (count, error) =
-            orphaned_module_delete_result(Err(anyhow::anyhow!("pool closed")), user);
+        let (count, error) = destructive_step_result(
+            Err(anyhow::anyhow!("pool closed")),
+            user,
+            "orphaned-module delete",
+            "NO module was deleted",
+        );
         assert!(
             count.is_null(),
             "a failed delete must not read as 0 deleted"
@@ -3211,7 +3222,12 @@ mod orphaned_module_delete_render_tests {
             "no internal error text to the caller"
         );
         // CONTROL
-        let (count, error) = orphaned_module_delete_result(Ok(3), user);
+        let (count, error) = destructive_step_result(
+            Ok(3),
+            user,
+            "orphaned-module delete",
+            "NO module was deleted",
+        );
         assert_eq!(count, serde_json::json!(3));
         assert!(error.is_none());
     }

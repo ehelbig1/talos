@@ -250,4 +250,278 @@ async fn the_home_counts_what_it_finalizes_and_refuses_what_it_must() {
         assert_eq!(status_of(&pool, id).await.0, owned);
         assert_eq!(count("failure"), c, "a refused {owned} row must not count");
     }
+
+    // ── 2026-09-21 (package DH): five more failure writers that counted
+    // nothing. Enumerated by STATEMENT, multi-line aware — check 46 and the
+    // AG pin both read single lines, and these are written across several.
+
+    // (1) The continuation / handoff path's `AdvancedRepository::fail_execution`
+    // — the platform's busiest start path.
+    let advanced = talos_advanced_repository::AdvancedRepository::new(pool.clone());
+    let lost = new_execution(&pool, &t, "running").await;
+    let (c, h) = (count("failure"), hist("failure"));
+    advanced
+        .fail_execution(lost, "Workflow not found")
+        .await
+        .unwrap();
+    assert_eq!(status_of(&pool, lost).await.0, "failed");
+    assert_eq!(
+        count("failure") - c,
+        1.0,
+        "the continuation failure must count"
+    );
+    assert_eq!(hist("failure") - h, 1);
+    // …and its guard is kept: a `resuming` row is crash recovery's.
+    let owned = new_execution(&pool, &t, "resuming").await;
+    let c = count("failure");
+    advanced.fail_execution(owned, "no").await.unwrap();
+    assert_eq!(status_of(&pool, owned).await.0, "resuming");
+    assert_eq!(count("failure"), c);
+
+    // (2) Crash recovery's two exits.
+    let exec_repo = talos_execution_repository::ExecutionRepository::new(pool.clone());
+    let resuming = new_execution(&pool, &t, "resuming").await;
+    let running_now = new_execution(&pool, &t, "running").await;
+    let (c, h) = (count("failure"), hist("failure"));
+    assert!(exec_repo
+        .fail_resuming_execution(resuming, "dispatch failed")
+        .await
+        .unwrap());
+    assert!(
+        !exec_repo
+            .fail_resuming_execution(running_now, "no")
+            .await
+            .unwrap(),
+        "guard: `resuming` only"
+    );
+    assert_eq!(status_of(&pool, running_now).await.0, "running");
+    assert_eq!(count("failure") - c, 1.0);
+    assert_eq!(hist("failure") - h, 1);
+
+    let wedged_a = new_execution(&pool, &t, "resuming").await;
+    let wedged_b = new_execution(&pool, &t, "resuming").await;
+    let fresh = new_execution(&pool, &t, "resuming").await;
+    sqlx::query("ALTER TABLE workflow_executions DISABLE TRIGGER USER")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE workflow_executions SET updated_at = NOW() - interval '30 minutes' WHERE id = ANY($1)",
+    )
+    .bind(vec![wedged_a, wedged_b])
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("ALTER TABLE workflow_executions ENABLE TRIGGER USER")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let epoch_before: i64 =
+        sqlx::query_scalar("SELECT epoch FROM workflow_executions WHERE id = $1")
+            .bind(wedged_a)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let c = count("failure");
+    assert_eq!(exec_repo.reclaim_orphaned_resuming(10).await.unwrap(), 2);
+    assert_eq!(
+        count("failure") - c,
+        2.0,
+        "once per reclaimed run, not per call"
+    );
+    assert_eq!(
+        status_of(&pool, fresh).await.0,
+        "resuming",
+        "inside the grace"
+    );
+    let epoch_after: i64 =
+        sqlx::query_scalar("SELECT epoch FROM workflow_executions WHERE id = $1")
+            .bind(wedged_a)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(epoch_after, epoch_before + 1, "the fence bump is kept");
+    assert_eq!(exec_repo.reclaim_orphaned_resuming(0).await.unwrap(), 0);
+
+    // (3) The operator's stale-execution cleanups: counted, and recorded in the
+    // cleanup's own transaction with what they actually did.
+    sqlx::query("UPDATE workflow_executions SET status = 'failed' WHERE status IN ('running', 'resuming') AND user_id = $1")
+        .bind(t.user)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let old_a = new_execution(&pool, &t, "running").await;
+    let old_b = new_execution(&pool, &t, "running").await;
+    let old_c = new_execution(&pool, &t, "running").await;
+    let young = new_execution(&pool, &t, "running").await;
+    let old_resuming = new_execution(&pool, &t, "resuming").await;
+    sqlx::query(
+        "UPDATE workflow_executions SET started_at = NOW() - interval '3 hours' WHERE id = ANY($1)",
+    )
+    .bind(vec![old_a, old_b, old_c, old_resuming])
+    .execute(&pool)
+    .await
+    .unwrap();
+    let other = seed_tenant(&pool).await;
+    let theirs = new_execution(&pool, &other, "running").await;
+    sqlx::query(
+        "UPDATE workflow_executions SET started_at = NOW() - interval '3 hours' WHERE id = $1",
+    )
+    .bind(theirs)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Hygiene: bounded to the previewed ids — and another user's id in the
+    // list is not touched.
+    let (c, h) = (count("failure"), hist("failure"));
+    assert_eq!(
+        exec_repo
+            .cleanup_stale_executions_by_ids(&[old_a, young, theirs], 120, t.user)
+            .await
+            .unwrap(),
+        1
+    );
+    assert_eq!(count("failure") - c, 1.0);
+    assert_eq!(hist("failure") - h, 1);
+    assert_eq!(status_of(&pool, young).await.0, "running", "not old enough");
+    assert_eq!(
+        status_of(&pool, theirs).await.0,
+        "running",
+        "not this user's"
+    );
+    assert_eq!(
+        status_of(&pool, old_b).await.0,
+        "running",
+        "not in the list"
+    );
+
+    // The MCP tool: user-wide by age.
+    let c = count("failure");
+    assert_eq!(
+        exec_repo
+            .cleanup_stale_executions(120, t.user)
+            .await
+            .unwrap(),
+        2
+    );
+    assert_eq!(count("failure") - c, 2.0);
+    assert_eq!(
+        status_of(&pool, old_resuming).await.0,
+        "resuming",
+        "crash recovery's"
+    );
+    assert_eq!(status_of(&pool, theirs).await.0, "running");
+    // Nothing left to clean: nothing counted, nothing recorded.
+    let c = count("failure");
+    assert_eq!(
+        exec_repo
+            .cleanup_stale_executions(120, t.user)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(count("failure"), c);
+
+    let events: Vec<(String, String, serde_json::Value, Option<Uuid>)> = sqlx::query_as(
+        "SELECT event_type, summary, details, user_id FROM admin_event_log \
+         WHERE resource_type = 'execution' ORDER BY created_at, id",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        events.len(),
+        2,
+        "one record per cleanup that failed something"
+    );
+    assert_eq!(events[0].0, "executions_hygiene_stale_cleanup");
+    assert_eq!(events[0].2["failed_count"], 1);
+    assert_eq!(
+        events[0].2["execution_ids"],
+        serde_json::json!([old_a.to_string()])
+    );
+    assert_eq!(events[1].0, "executions_stale_cleanup");
+    assert_eq!(events[1].3, Some(t.user));
+    assert_eq!(events[1].2["failed_count"], 2);
+    assert_eq!(events[1].2["older_than_minutes"], 120);
+    assert_eq!(events[1].2["listed_truncated"], false);
+    let mut listed: Vec<String> = events[1].2["execution_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    listed.sort();
+    let mut want = vec![old_b.to_string(), old_c.to_string()];
+    want.sort();
+    assert_eq!(listed, want);
+    for (_, summary, _, _) in &events {
+        assert!(
+            summary.contains("marked failed") && !summary.contains("deleted"),
+            "the record must say what happened — these runs are failed, not deleted: {summary}"
+        );
+    }
+
+    // The record lists at most 1000 ids and says so, beside the TRUE count
+    // (`details` over 1 MiB are dropped whole, and the tool is unbounded).
+    sqlx::query(
+        "INSERT INTO workflow_executions (id, workflow_id, user_id, actor_id, status, started_at) \
+         SELECT gen_random_uuid(), $1, $2, $3, 'running', NOW() - interval '3 hours' \
+         FROM generate_series(1, 1001)",
+    )
+    .bind(t.workflow)
+    .bind(t.user)
+    .bind(t.actor)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let c = count("failure");
+    assert_eq!(
+        exec_repo
+            .cleanup_stale_executions(120, t.user)
+            .await
+            .unwrap(),
+        1001
+    );
+    assert_eq!(count("failure") - c, 1001.0);
+    let big: serde_json::Value = sqlx::query_scalar(
+        "SELECT details FROM admin_event_log WHERE resource_type = 'execution' \
+         ORDER BY created_at DESC, id DESC LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(big["failed_count"], 1001, "the TRUE count");
+    assert_eq!(big["execution_ids"].as_array().unwrap().len(), 1000);
+    assert_eq!(big["listed_truncated"], true);
+
+    // A cleanup that cannot be recorded does not happen — and counts nothing.
+    let unrecorded = new_execution(&pool, &t, "running").await;
+    sqlx::query(
+        "UPDATE workflow_executions SET started_at = NOW() - interval '3 hours' WHERE id = $1",
+    )
+    .bind(unrecorded)
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("ALTER TABLE admin_event_log RENAME TO admin_event_log_away")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let c = count("failure");
+    assert!(exec_repo
+        .cleanup_stale_executions(120, t.user)
+        .await
+        .is_err());
+    assert!(exec_repo
+        .cleanup_stale_executions_by_ids(&[unrecorded], 120, t.user)
+        .await
+        .is_err());
+    assert_eq!(status_of(&pool, unrecorded).await.0, "running");
+    assert_eq!(
+        count("failure"),
+        c,
+        "a rolled-back cleanup must count nothing"
+    );
 }

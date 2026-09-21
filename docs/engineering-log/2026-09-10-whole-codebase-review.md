@@ -5439,3 +5439,13 @@ The same enumeration as DF, one table over, and the picture was worse. Workflows
 The capped list came from reading what happens to an oversized `details`: it is dropped whole, with a warning, and the summary survives. For a delete with no upper bound that is the wrong failure: the larger the wipe, the less the record says. A thousand entries with the true count and a flag beside them keeps the record useful and keeps it under the bound.
 
 The batch loop was a small find on the way: one DELETE per id, justified by a cleanup step that a schema migration removed in April. Returning the rows forced the question of how to return them from a loop, and the answer was not to loop.
+
+## Package DH — five failure writers the counter never saw (2026-09-21)
+
+The plan for the day was the last six detached audit records. The first one read was the stale-execution cleanup, and its comment stopped the plan: it argues, at length, that the tool hard-deletes executions and that the record exists so the platform's own tools cannot launder its audit trail. The repository method under it is an UPDATE to `failed`. So the append-only log has been told, by design, that rows were deleted which are still there.
+
+Opening that UPDATE raised the older question — does it count? It did not, and neither did its hygiene twin. Two packages had already claimed the finalizers were all home, so the enumeration was redone properly: every `UPDATE workflow_executions`, continuations joined, the SET clause inspected. Ten terminal writers outside the leaf; five counted nothing. One of the five is the failure exit of the continuation path, which carries more than a quarter of all runs.
+
+Both earlier guards had the same blind spot, and it is the one this log keeps recording: they match a line, and the house style breaks SQL across lines. The new leg joins continuations before it looks.
+
+The cleanup needed its record and its count on opposite sides of a commit. Counting first would count a rollback; recording after would lose the atomicity the package exists for. A value that must be consumed after the commit — and is a compile error to drop — says that in the type.

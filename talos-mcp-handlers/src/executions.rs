@@ -1370,41 +1370,15 @@ async fn handle_cleanup_stale_executions(
         .await
     {
         Ok(count) => {
-            // MCP-400 (2026-05-11): audit-erasure protection. This
-            // path HARD-DELETEs rows from workflow_executions —
-            // unlike archive_executions which preserves them in an
-            // archive table. Pre-fix an attacker who wanted to erase
-            // a specific suspicious execution could call
-            // cleanup_stale_executions with a tight time window
-            // covering the target row's timestamp, and the row would
-            // be permanently gone with no trace anywhere.
-            // admin_event_log is append-only — once the cleanup is
-            // recorded here, the deletion itself becomes
-            // un-deniable even if the underlying rows are gone. This
-            // is the strictest audit-gap-closure of the session
-            // because it specifically prevents the use of the
-            // platform's own tools to launder its audit trail.
-            if count > 0 {
-                crate::actor::spawn_log_admin_event(
-                    state.db_pool.clone(),
-                    user_id,
-                    "executions_stale_cleanup",
-                    "execution",
-                    None,
-                    format!(
-                        "{} stale execution(s) hard-deleted (older than {} minutes)",
-                        count, older_than_minutes
-                    ),
-                    Some(serde_json::json!({
-                        "deleted_count": count,
-                        "older_than_minutes": older_than_minutes,
-                    })),
-                );
-            }
+            // The `executions_stale_cleanup` record — which runs were marked
+            // failed, by whom — is written by the repository inside the
+            // cleanup's own transaction. (This path marks runs `failed`; it
+            // never deleted them, although its record said "hard-deleted"
+            // until 2026-09-21.)
             mcp_text(
                 req_id,
                 &format!(
-                    "Cleaned up {} stale execution(s) older than {} minutes.",
+                    "Marked {} stale execution(s) as failed (running for over {} minutes).",
                     count, older_than_minutes
                 ),
             )

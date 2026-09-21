@@ -3589,6 +3589,24 @@ else
 fi
 echo
 
+# Sub-leg 46b (2026-09-21, no new number): a terminal `failed` / `completed`
+# write on workflow_executions outside the shared finalizer must COUNT the
+# outcome. Statement-aware (multi-line) — the leg above and the 2026-09-12
+# source pins read single lines, which is how five writers stayed uncounted.
+if ! python3 scripts/lint-terminal-write-recorded.py --self-test; then
+    red "✗ check 46b self-test failed"
+    EXIT_CODE=1
+fi
+if tw_out=$(python3 scripts/lint-terminal-write-recorded.py 2>&1); then
+    green "✓ every terminal workflow-execution write counts its outcome (${tw_out##*$'\n'})"
+else
+    printf '%s\n' "$tw_out"
+    red "✗ a terminal workflow_executions write records no outcome (check 46b)"
+    yellow "  → call talos_execution_finalizer, or record_workflow_outcome with the row's RETURNed duration."
+    EXIT_CODE=1
+fi
+echo
+
 bold "▶ check 47: append-only audit tables must not gain CASCADE/SET NULL FKs"
 
 # A table carrying the prevent_audit_modification trigger (BEFORE DELETE OR
