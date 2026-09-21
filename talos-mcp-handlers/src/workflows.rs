@@ -330,7 +330,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "cleanup_workflows",
-            "description": "Delete all workflows matching an optional name prefix. Returns count of deleted workflows. WARNING: Omitting prefix deletes ALL of your workflows and requires confirm: true.",
+            "description": "Delete all workflows matching an optional name prefix. A workflow with an execution in flight, or one an enabled workflow dispatches into as a sub-workflow, is REFUSED and named in the reply (refused_running / refused_referenced) — the same two guards delete_workflow and batch_delete_workflows apply. At most 1000 workflows per call; `truncated: true` means more matched. WARNING: Omitting prefix deletes ALL of your workflows and requires confirm: true.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -3563,48 +3563,103 @@ async fn handle_cleanup_workflows(
         }
     }
     match state.workflow_repo.cleanup_workflows(user_id, prefix).await {
-        // MCP-141 (2026-05-08): JSON envelope on success.
-        Ok(n) => {
-            // MCP-399 (2026-05-11): bulk-destructive op audit. Same
-            // gap class as MCP-389 (delete_workflow) but
-            // proportionally more dangerous — cleanup_workflows can
-            // delete unbounded numbers in one call, scoped only by
-            // an optional prefix (or the global confirm:true guard).
-            // An attacker calling `cleanup_workflows(prefix="prod-")`
-            // could wipe an entire workflow tree with no audit row
-            // pre-fix; forensics had nothing but the absence of rows
-            // to work with. One audit row per call (not per
-            // workflow) bounds log volume — `deleted_count` and
-            // optional prefix carry the scope.
-            if n > 0 {
-                crate::actor::spawn_log_admin_event(
-                    state.db_pool.clone(),
-                    user_id,
-                    "workflows_bulk_cleanup",
-                    "workflow",
-                    None,
-                    format!("{} workflow(s) bulk-deleted via cleanup_workflows", n),
-                    Some(serde_json::json!({
-                        "deleted_count": n,
-                        "prefix": prefix,
-                    })),
-                );
-            }
-            mcp_text(
-                req_id,
-                &serde_json::to_string_pretty(&serde_json::json!({
-                    "success": true,
-                    "deleted_count": n,
-                    "message": format!("Deleted {} workflow(s).", n),
-                }))
-                .unwrap_or_default(),
-            )
-        }
+        Ok(cleanup) => render_cleanup_outcome(req_id, &state, user_id, prefix, &cleanup),
         Err(e) => {
             tracing::error!("cleanup_workflows failed: {}", e);
             mcp_error(req_id, -32000, "Cleanup failed")
         }
     }
+}
+
+/// How many refused workflows `cleanup_workflows` names in its reply; the
+/// counts beside the lists are always the true totals.
+const CLEANUP_REFUSALS_LISTED: usize = 50;
+
+/// Record and render one cleanup. Split from the handler so the reply — above
+/// all "N were refused, and why" — is driven by a test.
+fn render_cleanup_outcome(
+    req_id: Option<serde_json::Value>,
+    state: &McpState,
+    user_id: uuid::Uuid,
+    prefix: Option<&str>,
+    cleanup: &talos_workflow_repository::WorkflowCleanupOutcome,
+) -> JsonRpcResponse {
+    let outcome = &cleanup.outcome;
+    let n = outcome.deleted.len();
+    // MCP-399 (2026-05-11): bulk-destructive op audit. One row per call (not
+    // per workflow) bounds log volume — `deleted_count` and the optional
+    // prefix carry the scope.
+    if n > 0 {
+        crate::actor::spawn_log_admin_event(
+            state.db_pool.clone(),
+            user_id,
+            "workflows_bulk_cleanup",
+            "workflow",
+            None,
+            format!("{} workflow(s) bulk-deleted via cleanup_workflows", n),
+            Some(serde_json::json!({
+                "deleted_count": n,
+                "prefix": prefix,
+                "refused_running": outcome.blocked_running.len(),
+                "refused_referenced": outcome.blocked_referenced.len(),
+            })),
+        );
+    }
+    mcp_text(req_id, &cleanup_reply(cleanup).to_string())
+}
+
+/// The reply body. A refusal is never folded into a bare `deleted_count`: a
+/// caller who asked to delete ten and got seven must be told about the three.
+fn cleanup_reply(cleanup: &talos_workflow_repository::WorkflowCleanupOutcome) -> serde_json::Value {
+    let outcome = &cleanup.outcome;
+    let n = outcome.deleted.len();
+    let (running, referenced) = (
+        outcome.blocked_running.len(),
+        outcome.blocked_referenced.len(),
+    );
+    let mut message = format!("Deleted {n} workflow(s).");
+    if running > 0 {
+        message.push_str(&format!(
+            " {running} were NOT deleted because they have an execution in flight — wait for it \
+             or cancel it, then run this again."
+        ));
+    }
+    if referenced > 0 {
+        message.push_str(&format!(
+            " {referenced} were NOT deleted because an enabled workflow dispatches into them as \
+             a sub-workflow — edit or retire the parent first."
+        ));
+    }
+    if cleanup.truncated {
+        message.push_str(&format!(
+            " More than {} workflows matched; the rest are untouched — run this again.",
+            talos_workflow_repository::CLEANUP_WORKFLOWS_MAX
+        ));
+    }
+    serde_json::json!({
+        "success": true,
+        "deleted_count": n,
+        "refused_running_count": running,
+        "refused_running": outcome
+            .blocked_running
+            .iter()
+            .take(CLEANUP_REFUSALS_LISTED)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        "refused_referenced_count": referenced,
+        "refused_referenced": outcome
+            .blocked_referenced
+            .iter()
+            .take(CLEANUP_REFUSALS_LISTED)
+            .map(|r| serde_json::json!({
+                "workflow_id": r.id.to_string(),
+                "dispatched_by": r.parents,
+                "reason": r.reason,
+            }))
+            .collect::<Vec<_>>(),
+        "truncated": cleanup.truncated,
+        "message": message,
+    })
 }
 
 async fn handle_delete_workflow(
@@ -13650,5 +13705,107 @@ mod input_schema_enforcement_tests {
                 "{label} must be a refusal on the enforcement path"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod cleanup_reply_tests {
+    use super::{cleanup_reply, CLEANUP_REFUSALS_LISTED};
+    use talos_workflow_repository::{
+        ReferencedWorkflow, WorkflowCleanupOutcome, WorkflowDeleteOutcome,
+    };
+    use uuid::Uuid;
+
+    fn outcome(
+        deleted: usize,
+        running: usize,
+        referenced: usize,
+        truncated: bool,
+    ) -> serde_json::Value {
+        let ids = |n: usize| (0..n).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
+        cleanup_reply(&WorkflowCleanupOutcome {
+            outcome: WorkflowDeleteOutcome {
+                deleted: ids(deleted),
+                blocked_running: ids(running),
+                blocked_referenced: ids(referenced)
+                    .into_iter()
+                    .map(|id| ReferencedWorkflow {
+                        id,
+                        parents: vec!["prod-parent".to_string()],
+                        reason: "dispatched by prod-parent".to_string(),
+                    })
+                    .collect(),
+            },
+            truncated,
+        })
+    }
+
+    /// CONTROL: a clean cleanup says only what it deleted.
+    #[test]
+    fn a_clean_cleanup_reports_no_refusal() {
+        let r = outcome(3, 0, 0, false);
+        assert_eq!(r["deleted_count"], 3);
+        assert_eq!(r["refused_running_count"], 0);
+        assert_eq!(r["refused_referenced_count"], 0);
+        assert_eq!(r["truncated"], false);
+        assert_eq!(r["message"], "Deleted 3 workflow(s).");
+    }
+
+    /// A refusal is never folded into a bare count: both kinds are counted,
+    /// named with their reason, and the message says what to do about each.
+    #[test]
+    fn refusals_are_counted_named_and_explained() {
+        let r = outcome(7, 2, 1, false);
+        assert_eq!(r["deleted_count"], 7);
+        assert_eq!(r["refused_running_count"], 2);
+        assert_eq!(r["refused_running"].as_array().unwrap().len(), 2);
+        assert_eq!(r["refused_referenced_count"], 1);
+        assert_eq!(
+            r["refused_referenced"][0]["dispatched_by"][0],
+            "prod-parent"
+        );
+        assert_eq!(
+            r["refused_referenced"][0]["reason"],
+            "dispatched by prod-parent"
+        );
+        let msg = r["message"].as_str().unwrap();
+        assert!(
+            msg.contains("2 were NOT deleted because they have an execution in flight"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("1 were NOT deleted because an enabled workflow dispatches into them"),
+            "{msg}"
+        );
+    }
+
+    /// The lists are capped; the counts beside them are the true totals.
+    #[test]
+    fn the_lists_are_capped_and_the_counts_are_not() {
+        let r = outcome(
+            0,
+            CLEANUP_REFUSALS_LISTED + 5,
+            CLEANUP_REFUSALS_LISTED + 9,
+            true,
+        );
+        assert_eq!(
+            r["refused_running"].as_array().unwrap().len(),
+            CLEANUP_REFUSALS_LISTED
+        );
+        assert_eq!(r["refused_running_count"], CLEANUP_REFUSALS_LISTED + 5);
+        assert_eq!(
+            r["refused_referenced"].as_array().unwrap().len(),
+            CLEANUP_REFUSALS_LISTED
+        );
+        assert_eq!(r["refused_referenced_count"], CLEANUP_REFUSALS_LISTED + 9);
+        assert_eq!(r["truncated"], true);
+        let msg = r["message"].as_str().unwrap();
+        assert!(msg.contains("More than 1000 workflows matched"), "{msg}");
+        // CONTROL: the sentence is about truncation, not about refusals.
+        let untruncated = outcome(0, 1, 0, false);
+        assert!(!untruncated["message"]
+            .as_str()
+            .unwrap()
+            .contains("workflows matched"));
     }
 }

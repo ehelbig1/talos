@@ -5405,3 +5405,11 @@ The first design was a boot-time reap, and it died on a schema fact: nothing rec
 Two things were found by building it. The stop signals for the RPC subscribers fired at the signal, which would have starved a draining run of the memory and database RPCs its modules call; they moved after the drain. And an explicit module-row cancel I wrote failed its own assertion, because a March trigger already cancels a failed run's module rows with its own message; the clause came out rather than stay as something no test could fail.
 
 Durable execution (RFC 0003) already exists and would resume these runs instead of failing them. It is opt-in and has never run on the reference deployment; turning it on is the operator's decision and is not part of this package.
+
+## Package DD — the bulk delete skipped both guards (2026-09-21)
+
+This was found on the way to something else. The plan was to make the eleven remaining detached admin-event records transactional, starting with the irreversible ones, and the first step was to list every `DELETE FROM workflows` by statement rather than by handler. There are four. Three of them refuse a workflow with an execution in flight, and the shared one also refuses a sub-workflow an enabled parent dispatches into. The fourth, behind `cleanup_workflows`, was a bare delete by user and name prefix.
+
+The reproduction took one test: seed a workflow with a running execution under the prefix, call the cleanup, and the workflow is gone — its execution with it, through the foreign-key cascade. The standing rule is that a more severe finding ships first as its own PR, so the audit package waits.
+
+The fix did not add a second guarded statement. The cleanup now resolves ids and hands them to the delete the other paths already use, which also gives it a bound it never had. The same enumeration showed that the dashboard's GraphQL delete and the hygiene fix write no admin event at all; that belongs to the next package and is recorded there.
