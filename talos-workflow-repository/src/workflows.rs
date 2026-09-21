@@ -1391,8 +1391,8 @@ impl WorkflowRepository {
 
     // ── Workflow cleanup & archiving ──────────────────────────────────────
 
-    /// Delete all workflows for a user, optionally filtered by name prefix.
-    /// Returns the number of rows deleted.
+    /// Delete a user's workflows, optionally filtered by name prefix. Returns
+    /// what was deleted AND what was refused, and why.
     ///
     /// MCP-719 (2026-05-13): added `ESCAPE '\\'` and inline LIKE-escape
     /// on the prefix so a caller-supplied `%` / `_` is matched literally
@@ -1408,24 +1408,73 @@ impl WorkflowRepository {
     /// search-service depends on this crate, so taking the reverse
     /// edge would cycle); replacement order matters (backslash MUST be
     /// doubled first so the `%` / `_` escapes don't get re-doubled).
-    pub async fn cleanup_workflows(&self, user_id: Uuid, prefix: Option<&str>) -> Result<u64> {
-        let result = if let Some(pfx) = prefix {
+    ///
+    /// **Guarded since 2026-09-21.** This used to be a bare `DELETE … WHERE
+    /// user_id = $1 [AND name LIKE $2]`: no running-execution guard (the
+    /// CASCADE removed executions mid-flight — MCP-650's class) and no
+    /// child-reference guard (it deleted a sub-workflow an enabled parent
+    /// dispatches into), while the single and batch deletes carried both. It
+    /// now RESOLVES the ids and deletes through
+    /// [`Self::delete_workflows_checked`], the one guarded statement.
+    ///
+    /// Bounded: at most [`CLEANUP_WORKFLOWS_MAX`] workflows per call, with
+    /// `truncated` saying more matched — call again.
+    pub async fn cleanup_workflows(
+        &self,
+        user_id: Uuid,
+        prefix: Option<&str>,
+    ) -> Result<WorkflowCleanupOutcome> {
+        let pattern = prefix.map(|pfx| {
             let escaped: String = pfx
                 .replace('\\', "\\\\")
                 .replace('%', "\\%")
                 .replace('_', "\\_");
-            sqlx::query("DELETE FROM workflows WHERE user_id = $1 AND name LIKE $2 ESCAPE '\\'")
-                .bind(user_id)
-                .bind(format!("{}%", escaped))
-                .execute(&self.db_pool)
-                .await?
-        } else {
-            sqlx::query("DELETE FROM workflows WHERE user_id = $1")
-                .bind(user_id)
-                .execute(&self.db_pool)
-                .await?
-        };
-        Ok(result.rows_affected())
+            format!("{escaped}%")
+        });
+        // RFC 0005 S3: self-scope, as every other read of this table does.
+        let mut tx = talos_db::begin_user_scoped(&self.db_pool, user_id).await?;
+        let mut ids = Self::resolve_cleanup_ids(
+            &mut tx,
+            user_id,
+            pattern.as_deref(),
+            CLEANUP_WORKFLOWS_MAX + 1,
+        )
+        .await?;
+        tx.commit().await?;
+
+        let truncated = ids.len() as i64 > CLEANUP_WORKFLOWS_MAX;
+        ids.truncate(CLEANUP_WORKFLOWS_MAX as usize);
+        let outcome = self.delete_workflows_checked(&ids, user_id).await?;
+        Ok(WorkflowCleanupOutcome { outcome, truncated })
+    }
+
+    /// The ids one cleanup call will consider: the CALLER's workflows matching
+    /// `pattern` (already LIKE-escaped), at most `limit`.
+    ///
+    /// Takes a connection so the tenant predicate can be tested on its own:
+    /// under a user-scoped transaction the `workflows` RLS policy hides another
+    /// tenant's rows too, and a test that only ever ran there could not tell a
+    /// dropped `user_id = $1` from a present one (package BH's lesson). RLS is
+    /// a backstop that a deployment may not have switched on; this predicate
+    /// is the rule.
+    #[doc(hidden)]
+    pub async fn resolve_cleanup_ids(
+        conn: &mut sqlx::PgConnection,
+        user_id: Uuid,
+        pattern: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<Uuid>> {
+        sqlx::query_scalar(
+            "SELECT id FROM workflows \
+             WHERE user_id = $1 AND ($2::text IS NULL OR name LIKE $2 ESCAPE '\\') \
+             LIMIT $3",
+        )
+        .bind(user_id)
+        .bind(pattern)
+        .bind(limit)
+        .fetch_all(conn)
+        .await
+        .context("cleanup_workflows id resolution")
     }
 
     /// Find non-archived workflows whose names match a LIKE pattern.
@@ -2486,6 +2535,20 @@ impl ChangeSurface {
 /// A `(deleted, blocked)` pair could not say "one of these is still running
 /// and the other is the flagship's daily sub-workflow", and the two need
 /// different remedies — wait, versus edit or retire the parent first.
+/// The most workflows one [`WorkflowRepository::cleanup_workflows`] call will
+/// resolve and delete. A bound on the id list, the child-reference scan and
+/// the DELETE; the caller is told when more matched.
+pub const CLEANUP_WORKFLOWS_MAX: i64 = 1000;
+
+/// What a prefix / delete-all cleanup did.
+#[derive(Debug, Default)]
+pub struct WorkflowCleanupOutcome {
+    pub outcome: WorkflowDeleteOutcome,
+    /// More than [`CLEANUP_WORKFLOWS_MAX`] workflows matched; the rest are
+    /// untouched and another call will reach them.
+    pub truncated: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct WorkflowDeleteOutcome {
     /// Rows actually removed.

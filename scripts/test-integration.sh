@@ -817,6 +817,8 @@ CTRL_TESTS=(
     # Shutdown drain (2026-09-21): a controller waits for the runs it is
     # driving, fails only its OWN leftovers, and never a sibling's run.
     "shutdown_drain_tests"
+    # cleanup_workflows carries the delete guards (2026-09-21).
+    "cleanup_workflows_guard_tests"
     # The fleet lease for periodic background loops (2026-09-20). Two pools on
     # one database stand in for two controller replicas: one holds a period,
     # the other is refused even with no lock held (the case an advisory lock
