@@ -137,6 +137,10 @@ services:
 
   # Controller Service (GraphQL API)
   controller:
+    # On SIGTERM the controller waits up to 120 s (`RUN_DRAIN_GRACE`) for the
+    # workflow runs it is driving, then fails the rest. Docker's default 10 s
+    # would SIGKILL it mid-drain and leave those rows 'running' for an hour.
+    stop_grace_period: 150s
     # No `additional_contexts`: the workflow-engine crates live IN this
     # workspace since May 2026 (talos-workflow-engine*/), and the Dockerfile
     # builds from the repo root alone — the sibling-repo context this file
@@ -247,6 +251,9 @@ services:
 
   # Worker Service (WASM Execution Engine)
   worker:
+    # The worker drains in-flight jobs for up to 30 s on SIGTERM; Docker's
+    # default 10 s cut that short.
+    stop_grace_period: 40s
     build:
       context: .
       dockerfile: worker/Dockerfile

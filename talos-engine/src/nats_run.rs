@@ -410,6 +410,9 @@ pub async fn run_with_nats(
         "run_with_nats",
         Some(execution_id),
     )?;
+    // Tracked for the shutdown drain (`talos_shutdown::inflight`): this
+    // process is driving the run until this future ends.
+    let _in_flight = talos_shutdown::inflight::global().track(execution_id);
     talos_workflow_engine_nats::run_with_nats(engine, dispatcher, worker_shared_key, execution_id)
         .await
 }
@@ -456,13 +459,18 @@ pub fn run_with_seed_via_nats(
         Ok(d) => d,
         Err(e) => return Box::pin(async move { Err(e) }),
     };
-    talos_workflow_engine_nats::run_with_seed_via_nats(
+    let run = talos_workflow_engine_nats::run_with_seed_via_nats(
         engine,
         dispatcher,
         worker_shared_key,
         initial_results,
         execution_id,
-    )
+    );
+    // Tracked for the shutdown drain, for as long as the returned future runs.
+    Box::pin(async move {
+        let _in_flight = talos_shutdown::inflight::global().track(execution_id);
+        run.await
+    })
 }
 
 /// Controller-convenience: dispatch a graph feeding `trigger_input` to
@@ -492,6 +500,8 @@ pub async fn run_with_trigger_input_via_nats(
         "run_with_trigger_input_via_nats",
         Some(execution_id),
     )?;
+    // Tracked for the shutdown drain (`talos_shutdown::inflight`).
+    let _in_flight = talos_shutdown::inflight::global().track(execution_id);
     engine
         .run_with_trigger_input_transport(
             dispatcher,

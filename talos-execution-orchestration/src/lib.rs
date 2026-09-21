@@ -37,6 +37,7 @@ mod input;
 mod outcome;
 mod replay;
 mod retry;
+pub mod shutdown_drain;
 mod terminal_event;
 mod trigger;
 

@@ -438,6 +438,10 @@ services:
 
   # Controller Service (GraphQL API)
   controller:
+    # On SIGTERM the controller waits up to 120 s (`RUN_DRAIN_GRACE`) for the
+    # workflow runs it is driving, then fails the rest. Docker's default 10 s
+    # would SIGKILL it mid-drain and leave those rows 'running' for an hour.
+    stop_grace_period: 150s
     deploy:
       resources:
         limits:
@@ -883,6 +887,9 @@ services:
 
   # Worker Service (WASM Runtime)
   worker:
+    # The worker drains in-flight jobs for up to 30 s on SIGTERM; Docker's
+    # default 10 s cut that short.
+    stop_grace_period: 40s
     deploy:
       resources:
         limits:

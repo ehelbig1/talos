@@ -78,6 +78,42 @@ pub async fn fail_stale_running_workflow_execution(
     record("failure", row)
 }
 
+/// A controller is SHUTTING DOWN and these are the runs IT was driving that
+/// did not finish inside the drain's grace period (`talos_shutdown::inflight`).
+/// They are failed at once with the real reason, instead of sitting `running`
+/// until the stale sweep closes them an hour later.
+///
+/// `ids` must be the caller's OWN in-flight set — never a query over the
+/// table: `workflow_executions` records no owning controller, so at two
+/// replicas any table-wide predicate would fail a sibling's live runs.
+/// Guard: `running` or `resuming` (a run this process resumed is its own);
+/// a run that finalized itself in the last instant keeps its real outcome.
+/// One statement for the whole set. Returns the rows finalized.
+pub async fn fail_runs_interrupted_by_shutdown(
+    pool: &PgPool,
+    ids: &[Uuid],
+    error_message: &str,
+) -> Result<u64> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let rows = sqlx::query(
+        "UPDATE workflow_executions \
+         SET status = 'failed', completed_at = NOW(), error_message = $2 \
+         WHERE id = ANY($1) AND status IN ('running', 'resuming') \
+         RETURNING EXTRACT(EPOCH FROM (completed_at - started_at))::float8",
+    )
+    .bind(ids)
+    .bind(error_message)
+    .fetch_all(pool)
+    .await?;
+    let mut finalized = 0;
+    for row in rows {
+        finalized += record("failure", Some(row))?;
+    }
+    Ok(finalized)
+}
+
 /// Completion with the output already encrypted at rest by the caller
 /// (`output_data` cleared, ciphertext + DEK id + format bound). Guard
 /// `IN ('running', 'resuming')`: the engine may complete the run it resumed.

@@ -5395,3 +5395,13 @@ The fix moves the statement into the leaf with its guard unchanged and the usual
 The replica inventory of 09-20 left one plain controller subscribe: the `talos.results.*` observer. Reading it for the move corrected an earlier label of mine. I had carried it as "zero traffic, mostly dormant" — the block's own comment says so — but the doc comment forty lines above it names what it is: the only finalizer for every dispatch that publishes without a reply inbox (Gmail, Calendar and GCP module-bound pushes, and the webhook DLQ replay). It is quiet on the reference fleet because the Gmail watch there starts a workflow, not because nothing can use it.
 
 At N replicas the guarded UPDATE keeps the rows right, so the cost is work and noise: N−1 extra verifies, row reads and output seals per result, a "completed" log line from replicas that completed nothing, and the unparseable-result counter moving N times per bad message. The block moved verbatim into `talos-job-result-observer` with a queue group, following the wasm-log relay's shape from the day before, and the test reuses that package's trick of two databases holding the same ids so the handling replica is observable.
+
+## Package DC — a restart killed the runs in flight (2026-09-21)
+
+Package DA made the stale sweep's failures count, and the very next deploys showed where those failures come from. The #904 deploy restarted the controller at 12:01:27Z; two runs had started at 12:00:06Z on the top-of-the-hour schedules. Both sat `running` until the sweep. Reading the shutdown path explained it: `SIGTERM` ended the process, a run is a task inside the process, and compose gave it Docker's ten seconds.
+
+The first design was a boot-time reap, and it died on a schema fact: nothing records which controller owns a run, so with two replicas the reap would kill a sibling's live work. The registry followed from that — a process can only vouch for what it is driving — and the three run functions in `talos-engine/src/nats_run.rs` turned out to be a complete chokepoint for roughly twenty start paths.
+
+Two things were found by building it. The stop signals for the RPC subscribers fired at the signal, which would have starved a draining run of the memory and database RPCs its modules call; they moved after the drain. And an explicit module-row cancel I wrote failed its own assertion, because a March trigger already cancels a failed run's module rows with its own message; the clause came out rather than stay as something no test could fail.
+
+Durable execution (RFC 0003) already exists and would resume these runs instead of failing them. It is opt-in and has never run on the reference deployment; turning it on is the operator's decision and is not part of this package.

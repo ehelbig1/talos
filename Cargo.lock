@@ -8090,6 +8090,7 @@ dependencies = [
  "talos-retry-intelligence",
  "talos-rhai-sandbox",
  "talos-secrets-manager",
+ "talos-shutdown",
  "talos-task-supervision",
  "talos-text-util",
  "talos-worker-fleet",
@@ -8206,6 +8207,7 @@ dependencies = [
  "talos-metrics",
  "talos-registry",
  "talos-secrets-manager",
+ "talos-shutdown",
  "talos-text-util",
  "talos-workflow-authorization",
  "talos-workflow-engine-core",
@@ -9416,6 +9418,7 @@ dependencies = [
  "talos-module-executions",
  "talos-registry",
  "talos-secrets-manager",
+ "talos-shutdown",
  "talos-task-supervision",
  "talos-worker-fleet",
  "talos-workflow-authorization",
@@ -9560,6 +9563,7 @@ dependencies = [
  "anyhow",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

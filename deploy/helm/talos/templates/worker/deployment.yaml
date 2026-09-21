@@ -33,6 +33,9 @@ spec:
         {{- end }}
     spec:
       serviceAccountName: {{ include "talos.componentName" (list . "worker") }}
+      # The worker drains in-flight jobs for up to 30 s on SIGTERM; the
+      # Kubernetes default of 30 s left it no margin.
+      terminationGracePeriodSeconds: {{ .Values.worker.terminationGracePeriodSeconds | default 40 }}
       {{- include "talos.imagePullSecrets" . | nindent 6 }}
       securityContext:
         {{- include "talos.podSecurityContext" . | nindent 8 }}

@@ -51,6 +51,10 @@ spec:
         {{- end }}
     spec:
       serviceAccountName: {{ include "talos.componentName" (list . "controller") }}
+      # On SIGTERM the controller waits up to 120 s (RUN_DRAIN_GRACE) for the
+      # workflow runs it is driving, then fails the rest. Must exceed that, or
+      # SIGKILL lands mid-drain and the rows stay 'running' for an hour.
+      terminationGracePeriodSeconds: {{ .Values.controller.terminationGracePeriodSeconds | default 150 }}
       {{- include "talos.imagePullSecrets" . | nindent 6 }}
       securityContext:
         {{- include "talos.podSecurityContext" . | nindent 8 }}

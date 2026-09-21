@@ -6,6 +6,8 @@
 //! - In-flight request completion
 //! - Resource cleanup
 
+pub mod inflight;
+
 use std::sync::Arc;
 use tokio::signal;
 use tokio::sync::{mpsc, RwLock};
