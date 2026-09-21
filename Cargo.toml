@@ -101,6 +101,7 @@ members = [
     "talos-secrets-manager",
     "talos-module-payload-encryption",
     "talos-webhook-repository",
+    "talos-job-result-observer",
     "talos-wasm-log-relay",
     "talos-background-lease",
     "talos-worker-identity-repository",

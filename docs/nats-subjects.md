@@ -28,7 +28,7 @@ JetStream/durable, **Sub** = long-lived subscription.
 | `talos.jobs` | `subjects::JOBS` | `JobRequest` | R/R (signed reply inbox) | engine dispatcher / integration dispatchers (fallback) | worker pool |
 | `talos.jobs.<user_id>` | `subjects::jobs_for(user_id)` | `JobRequest` | R/R | Gmail / GCal / GCloud dispatchers, webhook router (edge routing on) | per-user worker pool |
 | `talos.pipeline.jobs` | `subjects::PIPELINE_JOBS` | `PipelineJobRequest` | R/R | engine dispatcher | worker pool |
-| `talos.results.*` | `subjects::RESULTS_WILDCARD` | `JobResult` | Sub | worker | controller results collector |
+| `talos.results.*` | `subjects::RESULTS_WILDCARD` | `JobResult` | Sub (queue group) | worker | controller `talos-job-result-observer` |
 | `wasm.log.*` | `subjects::WASM_LOG_WILDCARD` | log-line JSON (`execution_id`, `level`, `message`, `metadata`) | Sub ×2: persist (queue group) + broadcast (plain) | worker (`wasm.log.<execution_id>`) | controller `talos-wasm-log-relay` |
 | `talos.results.<job_id>` | `subjects::results_for(job_id)` | `JobResult` | F&F (audit topic branch) | worker | controller |
 | `talos.pipeline.results.<job_id>` | `subjects::pipeline_results_for(job_id)` | `PipelineJobResult` | R/R + F&F cache-replay | worker | controller |
@@ -84,12 +84,13 @@ opposite delivery (`talos-wasm-log-relay`, 2026-09-20):
 - **broadcast** — a plain subscribe. Every replica feeds its own GraphQL
   `execution_updates` subscribers, so every replica must see every line.
 
-One controller subscriber is still plain and does redundant work at more than
-one replica (recorded, not yet changed):
-
-- `talos.results.*` observer: a status-guarded, idempotent UPDATE counted per
-  row transition, so N replicas do N−1 redundant verifies and UPDATEs and no
-  wrong write. A queue group is safe there.
+`talos.results.*` is queue-subscribed too (`talos-job-result-observer`,
+2026-09-21; group `subjects::CONTROLLER_RESULTS_QUEUE_GROUP` =
+`talos-controller-results`). Its write is status-guarded and idempotent, so a
+plain subscribe never wrote a wrong row; at N replicas it did N signature
+checks, N row reads and output seals per result, and counted and WARNed an
+unparseable or unverifiable result once per replica. One replica now handles
+each result.
 
 `talos.` (namespace prefix) is `subjects::NAMESPACE_PREFIX` — used by the worker's
 guest-publish deny-list (`RESERVED_PUBLISH_PREFIXES`), not a subject itself.

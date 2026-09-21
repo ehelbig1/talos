@@ -168,6 +168,14 @@ pub const WASM_LOG_WILDCARD: &str = "wasm.log.*";
 /// `talos-wasm-log-relay`.
 pub const CONTROLLER_WASM_LOG_QUEUE_GROUP: &str = "talos-controller-wasm-log";
 
+/// The queue group the controller's `talos.results.*` observer joins, so one
+/// replica handles each fire-and-forget worker result. The write behind it is
+/// status-guarded and idempotent, so a plain subscribe never wrote a wrong
+/// row; what it did at N replicas was N signature checks, N row reads and
+/// output seals, and N copies of every "unparseable" / "unverified" count and
+/// WARN per result. See `talos-job-result-observer`.
+pub const CONTROLLER_RESULTS_QUEUE_GROUP: &str = "talos-controller-results";
+
 // ── Agent orchestration ────────────────────────────────────────────────────
 
 /// Per-target agent invoke subject: `talos.agent.<target>.invoke`. The worker's

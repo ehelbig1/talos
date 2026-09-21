@@ -4096,81 +4096,12 @@ pub(crate) fn spawn_integration_renewal_tasks(
     }
 }
 
-/// Record a `talos.results.*` message that would not deserialize into a
-/// `JobResult`: bump `talos_job_results_dropped_unparseable_total` and say so
-/// at WARN.
-///
-/// This was a bare `tracing::debug!` until 2026-08. Debug is not enabled by
-/// default, so the drop left NO operator-visible trace — while the engine
-/// dispatcher, handling the SAME condition on the SAME signed message type,
-/// fails the node outright (`talos-workflow-engine-nats::dispatcher`,
-/// `map_err(…)?`). Two handlers of one message, opposite treatment.
-///
-/// Debug WOULD have been defensible if the subscription were broad enough to
-/// carry other traffic. It is not: `talos.results.*` is a single-token
-/// wildcard, its only publisher is the worker's no-reply-topic branch,
-/// pipeline results use `talos.pipeline.results.*`, and guest WASM is denied
-/// the entire `talos.` prefix (`RESERVED_PUBLISH_PREFIXES`). An unparseable
-/// message there is an anomaly by construction.
-///
-/// And the drop is expensive. This subscriber is the ONLY finalizer for the
-/// FOUR fire-and-forget dispatch paths that publish with no reply inbox
-/// (`reply_topic: None` and no wire `msg.reply`, so the worker's
-/// `pick_trusted_reply_topic` takes its `(None, None)` arm and
-/// `publish_result_with_retry` falls through to `talos.results.<job_id>`):
-/// Gmail push, Google-Calendar push, GCP Monitoring Pub/Sub, and the webhook
-/// **DLQ replay** (`talos_webhooks::router::dispatch_replay`, a bare
-/// `nats.publish`, whose own comment names this subscriber by
-/// `RESULTS_WILDCARD`). The LIVE webhook path is NOT one of them — it uses
-/// `nats.request()`, so a wire reply exists and the result goes to that inbox.
-/// Count the set from the publish call, not from the `reply_topic: None`
-/// literal: two other comments in this repo enumerate "three" and name two
-/// different threes. Losing one message loses that execution's
-/// terminal status write, its `output_data`, and the `__ops_alert__` ingest
-/// that hangs off `complete_execution_from_worker`; the stale sweep then
-/// rewrites the row to `'timeout'`. That is the #638 shape.
-///
-/// **The serde error text is NOT logged.** It is derived from the message
-/// payload, which on this path is worker output — the same secret-bearing
-/// class the sibling failure log DLP-redacts. `serde_json` error text quotes
-/// input around the failure point for several error kinds. Presence and count
-/// only; `classify` is a closed set of `&'static str` and never a label.
-///
-/// Not routed through a shared warn-and-count helper — see the detector block
-/// in `talos_metrics::TalosMetrics` for why a macro would re-blind check 58.
-pub(crate) fn record_unparseable_job_result(err: &serde_json::Error) {
-    if let Some(m) = metrics::global() {
-        m.job_results_dropped_unparseable_total.inc();
-    }
-    tracing::warn!(
-        target: "talos_controller",
-        event_kind = "job_result_unparseable",
-        classify = classify_job_result_parse_error(err),
-        "Job result on talos.results.* discarded: payload did not deserialize \
-         into a JobResult. This subscriber is the only finalizer for \
-         fire-and-forget module-bound dispatches, so the execution's terminal \
-         status, output and ops-alert ingest are lost and the stale sweep will \
-         mark it 'timeout'. Error text withheld (it can quote worker output)."
-    );
-}
-
-/// Closed-set shape hint for a `JobResult` parse failure, safe to log because
-/// it is derived only from `serde_json::Error::classify()` — a four-valued
-/// enum — and never from the payload bytes.
-///
-/// `Eof` is the one worth naming: an EMPTY payload classifies `Eof`, and an
-/// empty payload is what a NATS `503 no-responders` control message carries.
-/// Nothing should ever send one to `talos.results.*` (it is a reply-inbox
-/// mechanism), so seeing `Eof` here means something is publishing an empty
-/// body to a subject only the worker should touch.
-pub(crate) fn classify_job_result_parse_error(err: &serde_json::Error) -> &'static str {
-    match err.classify() {
-        serde_json::error::Category::Eof => "eof_empty_or_truncated",
-        serde_json::error::Category::Syntax => "syntax",
-        serde_json::error::Category::Data => "schema_mismatch",
-        serde_json::error::Category::Io => "io",
-    }
-}
+// The `talos.results.*` observer (handler, unparseable-result recorder) lives in
+// `talos-job-result-observer` since 2026-09-21.
+#[cfg(test)]
+pub(crate) use talos_job_result_observer::{
+    classify_job_result_parse_error, record_unparseable_job_result,
+};
 
 // The `wasm.log.*` relay (parser, persist half, broadcast half, orphan
 // counter) lives in `talos-wasm-log-relay` since 2026-09-20; the label
@@ -4236,306 +4167,24 @@ pub(crate) fn spawn_nats_log_subscribers(
         );
         tracing::info!("WASM log subscriber task started");
 
-        // ---------- Start job result subscriber ----------
-        // The worker publishes JobResult messages to talos.results.{job_id} after each
-        // WASM execution completes.  This subscriber receives those results and updates
-        // the module_executions record status to 'completed' or 'failed' so the UI can
-        // display the outcome.
-        let exec_service_for_results = module_execution_service.clone();
-        let nats_for_results = nats_client
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("NATS client missing"))?;
-        // Clone the shared key into a verify-ring (current + any staged
-        // WORKER_SHARED_KEY_PREVIOUS) so this audit observer accepts results
-        // signed under a previous key during a rolling rotation, consistent
-        // with the primary verifier in the engine dispatcher. Moved into the
-        // spawn; the original `worker_shared_key` is still used later for the
-        // Extension layer.
+        // ---------- Start job result observer ----------
+        // The only finalizer for the fire-and-forget module-bound dispatches
+        // (Gmail / Calendar / GCP push, webhook DLQ replay). It lives in
+        // `talos-job-result-observer` since 2026-09-21 and queue-subscribes,
+        // so ONE controller replica handles each result.
         let worker_key_ring_for_results = worker_shared_key.clone().map(|signing| {
             talos_workflow_engine_core::WorkerKeyRing::new(
                 signing,
                 talos_workflow_job_protocol::load_worker_shared_key_previous().unwrap_or_default(),
             )
         });
-        spawn_supervised(BackgroundTask::JobResultSubscriber, async move {
-            tracing::info!("Starting job result subscriber on topic: talos.results.*");
-
-            // MCP-1122 (2026-05-16): supervisor loop wraps the inner
-            // subscriber. Fourth site in the MCP-1119/1120/1121 sweep.
-            // The comment further down at line ~2960 notes this
-            // subscriber is "mostly dormant" today (every NATS-dispatched
-            // path uses request-reply), but it's the canonical landing
-            // point for future async-dispatch / work-queue patterns —
-            // when those land, the subscriber silently exiting on
-            // stream-end (NATS reconnect, server-side unsubscribe,
-            // client reconnect window) would be a latent reliability
-            // gap. Bring it into supervisor parity with siblings now
-            // so a future regression doesn't surface as "results
-            // mysteriously stopped updating after a NATS hiccup."
-            let mut backoff_secs: u64 = 1;
-            'supervisor: loop {
-                let mut sub = match nats_for_results
-                    .subscribe(talos_workflow_job_protocol::subjects::RESULTS_WILDCARD)
-                    .await
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::error!(
-                            target: "talos_controller",
-                            event_kind = "job_result_subscribe_failed",
-                            error = %e,
-                            backoff_secs,
-                            "Failed to subscribe to job results; retrying after backoff"
-                        );
-                        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
-                        backoff_secs = (backoff_secs * 2).min(60);
-                        continue 'supervisor;
-                    }
-                };
-                backoff_secs = 1;
-
-                tracing::info!("Job result subscriber active");
-
-                while let Some(msg) = sub.next().await {
-                    match serde_json::from_slice::<talos_workflow_job_protocol::JobResult>(
-                        &msg.payload,
-                    ) {
-                        Ok(result) => {
-                            let job_id = result.job_id;
-
-                            // SECURITY: Verify HMAC-SHA256 signature + freshness
-                            // window. Rejects results injected by any process that
-                            // can publish to NATS but does not know the pre-shared
-                            // key.
-                            //
-                            // Post-r301 the worker single-publishes: it sends a
-                            // result to EITHER the request-reply inbox OR
-                            // `talos.results.{job_id}` based on whether the
-                            // requester awaited the reply, never both. So this
-                            // subscriber only sees results that no other in-process
-                            // verifier has handled — there's no second verify to
-                            // race.
-                            //
-                            // We still call `verify_no_replay` here (not `verify`)
-                            // as defense-in-depth: it keeps this subscriber
-                            // safe-by-default if a future code path re-introduces a
-                            // dual-publish or a sibling subscriber, and the side
-                            // effect (`UPDATE module_executions WHERE status IN
-                            // ('pending','running')`) is idempotent under replay
-                            // anyway. HMAC + freshness still catch forgery and
-                            // stale-replay; the worker is the primary
-                            // replay-cache writer for fire-and-forget results.
-                            //
-                            // Today every NATS-dispatched code path uses
-                            // request-reply, so this subscriber is mostly dormant
-                            // — kept as the canonical landing point for future
-                            // truly-async dispatches (work-queue style).
-                            // L-4: typed Observer verifier — this audit
-                            // subscriber on `talos.results.*` only writes
-                            // an idempotent UPDATE; primary verification
-                            // happens at the request-reply inbox in the
-                            // engine dispatcher / webhook handler. Using
-                            // `Verifier::Observer` documents the role at
-                            // the type level so a future refactor can't
-                            // accidentally convert this site to a primary
-                            // verifier and reintroduce the r300 regression.
-                            if let Some(ref ring) = worker_key_ring_for_results {
-                                // RFC 0010 P2: scheme-routing Observer verify —
-                                // Ed25519 against the keys registered for this
-                                // worker_id, or legacy HMAC against the ring
-                                // while `result_accept_legacy_hmac()`. NEVER
-                                // records the replay cache (Observer role): the
-                                // request-reply dispatcher is the sole Primary
-                                // verifier, per the verify-once rule.
-                                let worker_ed_keys =
-                                    talos_workflow_job_protocol::worker_public_keys(
-                                        &result.worker_id,
-                                    );
-                                if let Err(e) = result.verify_no_replay_dispatch(
-                                    ring,
-                                    &worker_ed_keys,
-                                    300,
-                                    talos_workflow_job_protocol::result_accept_legacy_hmac(),
-                                ) {
-                                    tracing::warn!(
-                                        target: "talos_security",
-                                        job_id = %job_id,
-                                        failure_kind = e.kind().label(),
-                                        liveness = e.is_liveness(),
-                                        age_secs = e.age_secs(),
-                                        "{}",
-                                        talos_workflow_job_protocol::describe_verify_failure(
-                                            "Job result",
-                                            &e,
-                                        )
-                                    );
-                                    continue;
-                                }
-                            }
-                            tracing::debug!(
-                                "📥 Received job result: {} ({:?}, {}ms)",
-                                job_id,
-                                result.status,
-                                result.execution_time_ms
-                            );
-
-                            match result.status {
-                                talos_workflow_job_protocol::JobStatus::Success => {
-                                    if let Err(e) = exec_service_for_results
-                                        .complete_execution_from_worker(
-                                            job_id,
-                                            // Storage takes the PARSED payload; the
-                                            // signature that covered the raw wire text
-                                            // was already verified above.
-                                            Some(result.output_payload.into_value()),
-                                            // `None`, NOT `result.execution_time_ms`.
-                                            //
-                                            // The worker's value IS a real monotonic
-                                            // measurement, but of a DIFFERENT SPAN:
-                                            // its own `execute_job`, which excludes the
-                                            // NATS round trip and any queue wait. Every
-                                            // other `duration_source = 'monotonic'` row
-                                            // in this table is a CONTROLLER-side
-                                            // dispatch span (the engine's
-                                            // `dispatch_started`, the webhook router's
-                                            // `wasm_start`). Storing a worker span under
-                                            // the same label would put two
-                                            // non-comparable quantities in one column —
-                                            // the mixed-meaning hazard `duration_source`
-                                            // exists to prevent.
-                                            //
-                                            // This subscriber has no controller-side
-                                            // timer to offer instead: it is a
-                                            // fire-and-forget observer of the global
-                                            // audit topic and never held the dispatch.
-                                            // So the trigger's `completed_at -
-                                            // started_at` derivation stays, correctly
-                                            // labelled `'wallclock'`, and a reader knows
-                                            // to distrust it.
-                                            None,
-                                        )
-                                        .await
-                                    {
-                                        tracing::warn!(
-                                            "Failed to mark execution {} as completed: {}",
-                                            job_id,
-                                            e
-                                        );
-                                    } else {
-                                        tracing::info!(
-                                            "✅ Execution {} completed ({}ms)",
-                                            job_id,
-                                            result.execution_time_ms
-                                        );
-                                    }
-                                }
-                                talos_workflow_job_protocol::JobStatus::Failed
-                                | talos_workflow_job_protocol::JobStatus::TimedOut => {
-                                    let error_msg = result
-                                        .output_payload
-                                        .value()
-                                        .get("error")
-                                        .and_then(|v| v.as_str())
-                                        .unwrap_or("Worker reported failure")
-                                        .to_string();
-                                    // `error_type` — the CAUSE. #744 derived it
-                                    // at the ENGINE's finalizer and left this
-                                    // observer's non-timeout arm passing
-                                    // `None`, so a plain `Failed` result whose
-                                    // text names its own cause stored nothing.
-                                    //
-                                    // TimedOut takes the STATUS, which is a
-                                    // harder fact than the prose and needs no
-                                    // guess — through the named constant, not a
-                                    // second inline literal, because
-                                    // `classify_error` answers with that exact
-                                    // spelling and two spellings of one bucket
-                                    // is the drift the shared home exists to
-                                    // prevent (pinned by
-                                    // `the_timeout_bucket_spelling_is_the_classifiers`).
-                                    // Everything else derives from the same
-                                    // text this call is about to store.
-                                    let error_type = if matches!(
-                                        result.status,
-                                        talos_workflow_job_protocol::JobStatus::TimedOut
-                                    ) {
-                                        Some(
-                                            talos_engine::module_error_type::TIMEOUT_BUCKET
-                                                .to_string(),
-                                        )
-                                    } else {
-                                        talos_engine::module_error_type::derive_error_type(
-                                            "failed",
-                                            Some(&error_msg),
-                                        )
-                                        .map(str::to_string)
-                                    };
-
-                                    if let Err(e) = exec_service_for_results
-                                        .fail_execution_from_worker(
-                                            job_id,
-                                            error_msg.clone(),
-                                            error_type,
-                                            // `None` for the same reason as the
-                                            // success arm above: this observer holds
-                                            // no controller-side timer, and the
-                                            // worker's span is not the one every other
-                                            // 'monotonic' row in this column measures.
-                                            None,
-                                        )
-                                        .await
-                                    {
-                                        tracing::warn!(
-                                            "Failed to mark execution {} as failed: {}",
-                                            job_id,
-                                            e
-                                        );
-                                    } else {
-                                        // MCP-989 (2026-05-15): DLP-redact the
-                                        // failure preview at the operator-log
-                                        // boundary. `fail_execution_from_worker`
-                                        // redacts before persisting to
-                                        // `module_executions.error_message`
-                                        // (MCP-968), but this INFO log was
-                                        // taking the first 100 chars of the
-                                        // ORIGINAL worker-supplied error_msg.
-                                        // Worker failures regularly carry
-                                        // upstream auth errors that echo the
-                                        // rejected token in the body; secret-
-                                        // shaped prefixes must not land in
-                                        // operator log pipelines. Same
-                                        // wrapper class as the two
-                                        // talos-module-executions sites
-                                        // closed in this MCP.
-                                        let preview: String =
-                                            talos_dlp_provider::redact_str(&error_msg)
-                                                .chars()
-                                                .take(100)
-                                                .collect();
-                                        tracing::info!(
-                                            "❌ Execution {} failed: {}",
-                                            job_id,
-                                            preview
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            record_unparseable_job_result(&e);
-                        }
-                    }
-                }
-
-                // MCP-1122: stream ended — supervisor re-binds.
-                tracing::warn!(
-                    target: "talos_controller",
-                    event_kind = "job_result_subscriber_rebinding",
-                    "Job result subscriber stream ended; supervisor re-binding"
-                );
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            } // end 'supervisor
-        });
+        talos_job_result_observer::spawn_job_result_observer(
+            nats_client
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("NATS client missing"))?,
+            module_execution_service.clone(),
+            worker_key_ring_for_results,
+        );
         tracing::info!("Job result subscriber task started");
     } else {
         tracing::warn!("NATS not configured - WASM automatic logging disabled");
@@ -6628,7 +6277,9 @@ mod task_supervision_wiring_tests {
     /// 2026-09-14, the Vault KEK-token renewal loop (42).
     /// 2026-09-20: the `wasm.log.*` relay moved to `talos-wasm-log-relay`,
     /// which supervises its own two halves (41 here).
-    const EXPECTED_SUPERVISED: usize = 41;
+    /// 2026-09-21: the `talos.results.*` observer moved to
+    /// `talos-job-result-observer`, which supervises itself (40 here).
+    const EXPECTED_SUPERVISED: usize = 40;
 
     /// The remaining bare `tokio::spawn` calls in THIS file, deliberately
     /// unwrapped because each is a one-shot whose death is bounded to one

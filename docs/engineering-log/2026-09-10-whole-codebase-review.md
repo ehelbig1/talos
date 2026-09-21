@@ -5389,3 +5389,9 @@ The ninety-ninth deploy verification reconciled the database against the control
 Package AG (2026-09-12) had moved every workflow terminal write into `talos-execution-finalizer` and noted the stale sweep's write in passing as "the stale sweep's marked one" — marked for check 46, because its guard is deliberately `running`-only. The marker answered the lint and nobody asked the other question: does it count? It did not. Ten live rows and two archived ones in thirty days carry the sweep's message; none moved the counter.
 
 The fix moves the statement into the leaf with its guard unchanged and the usual `RETURNING` duration, and the sweep calls it. The DB test drives the repository method against six row states. Mutations are recorded in the PR.
+
+## Package DB — one replica handles each fire-and-forget result (2026-09-21)
+
+The replica inventory of 09-20 left one plain controller subscribe: the `talos.results.*` observer. Reading it for the move corrected an earlier label of mine. I had carried it as "zero traffic, mostly dormant" — the block's own comment says so — but the doc comment forty lines above it names what it is: the only finalizer for every dispatch that publishes without a reply inbox (Gmail, Calendar and GCP module-bound pushes, and the webhook DLQ replay). It is quiet on the reference fleet because the Gmail watch there starts a workflow, not because nothing can use it.
+
+At N replicas the guarded UPDATE keeps the rows right, so the cost is work and noise: N−1 extra verifies, row reads and output seals per result, a "completed" log line from replicas that completed nothing, and the unparseable-result counter moving N times per bad message. The block moved verbatim into `talos-job-result-observer` with a queue group, following the wasm-log relay's shape from the day before, and the test reuses that package's trick of two databases holding the same ids so the handling replica is observable.
