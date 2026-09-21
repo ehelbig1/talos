@@ -586,7 +586,7 @@ impl WorkflowsMutations {
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
         let workflow_repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
-        let rows_affected = workflow_repo
+        let deleted = workflow_repo
             .delete_workflow_guarded_scoped(&mut tx, id, *user_id, &scope.accessible_org_ids)
             .await
             .map_err(|e| {
@@ -597,7 +597,16 @@ impl WorkflowsMutations {
             .await
             .map_err(|e: sqlx::Error| e.extend_safe())?;
 
-        if rows_affected == 0 {
+        let deleted = match deleted {
+            talos_workflow_repository::ScopedWorkflowDelete::Deleted => true,
+            talos_workflow_repository::ScopedWorkflowDelete::NotDeleted => false,
+            // The same refusal, in the same words, the MCP deletes give: an
+            // enabled workflow dispatches into this one as a sub-workflow.
+            talos_workflow_repository::ScopedWorkflowDelete::Referenced(r) => {
+                return Err(async_graphql::Error::new(r.reason).extend_safe());
+            }
+        };
+        if !deleted {
             // Distinguish "not found / access denied" from "blocked by
             // in-flight executions" so the operator gets actionable
             // feedback. Run a second SELECT to determine which case
@@ -644,7 +653,7 @@ impl WorkflowsMutations {
                     // not "Internal server error".
                     return Err(async_graphql::Error::new(
                         "Workflow has running / queued / pending executions. \
-                         Cancel them before deleting, or use force-delete via MCP.",
+                         Cancel them, or wait for them to finish, then delete.",
                     )
                     .extend_safe());
                 }

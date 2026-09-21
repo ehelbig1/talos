@@ -5413,3 +5413,13 @@ This was found on the way to something else. The plan was to make the eleven rem
 The reproduction took one test: seed a workflow with a running execution under the prefix, call the cleanup, and the workflow is gone — its execution with it, through the foreign-key cascade. The standing rule is that a more severe finding ships first as its own PR, so the audit package waits.
 
 The fix did not add a second guarded statement. The cleanup now resolves ids and hands them to the delete the other paths already use, which also gives it a bound it never had. The same enumeration showed that the dashboard's GraphQL delete and the hygiene fix write no admin event at all; that belongs to the next package and is recorded there.
+
+## Package DE — the dashboard delete skipped the child-reference guard (2026-09-21)
+
+Package DD listed four statements that delete workflows and fixed the one with no guards. Reading the GraphQL resolver to plan the audit-record package showed the list was one entry short of done: the scoped delete behind the dashboard refused a workflow with an execution in flight and said nothing about children. It is the delete operators actually use.
+
+The scan had to be keyed on the workflow's owner rather than the caller, because the GraphQL surface lets an org colleague delete a workflow they do not own, and a sub-workflow is resolved among its owner's workflows. That in turn made the refusal text a disclosure question — it names parents — so the owner read keeps the caller's access predicate and a test pins that a stranger still gets "not found".
+
+The colleague test failed for a reason that had nothing to do with the change: the shared test client puts the org id into the request data as a bare `Uuid`, replacing the user id. It took three probes to see it; the repository call was right all along.
+
+Five mutations, and the fourth lesson of the week about the same thing. Dropping the access predicate from the owner read passed every test, the stranger test included: the resolver runs its delete inside a tenant-scoped transaction, and the `workflows` RLS policy hides another tenant's row before the application predicate is ever asked. The predicate is still what stands between a stranger and a refusal naming somebody else's parents on any connection that is not scoped, so a fifth test drives the repository method on a plain pool connection — control first, that the connection can see the row — and the mutation now fails there.
