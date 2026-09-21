@@ -468,13 +468,13 @@ Several default **ON** as of the 2026-07 "Tier 3" learning-loops cutover.
 | `SMART_MEMORY_CONTEXT_GRAPH_BASELINE` | `0.6` | Graph-signal baseline | |
 | `SMART_MEMORY_CONTEXT_RECENCY_BASELINE` | `0.4` | Recency baseline | |
 | `SMART_MEMORY_CONTEXT_ACCESS_WEIGHT` | `0.15` | Access-frequency weight | |
-| `MEMORY_CONSOLIDATION_INTERVAL_SECS` | `86400` | Consolidation cadence | |
+| `MEMORY_CONSOLIDATION_INTERVAL_SECS` | `86400` | Consolidation cadence: due once per interval for the whole fleet and across restarts (a fleet lease; the loop re-asks at most hourly) | |
 | `MEMORY_CONSOLIDATION_MIN_AGE_DAYS` | `30.0` | Min memory age to consolidate | |
 | `MEMORY_CONSOLIDATION_MAX_IMPORTANCE` | `0.4` | Max importance to consolidate | |
 | `MEMORY_CONSOLIDATION_BATCH_SIZE` | `20` | Rows per consolidation batch | |
 | `MEMORY_CONSOLIDATION_MAX_ACTORS_PER_TICK` | `25` | Actor fan-out cap per tick | |
 | `MEMORY_CONSOLIDATION_MODEL` | `qwen2.5:7b` | Consolidation LLM model | |
-| `MEMORY_REFLECTION_INTERVAL_SECS` | `86400` | Reflection cadence | |
+| `MEMORY_REFLECTION_INTERVAL_SECS` | `86400` | Reflection cadence: once per interval fleet-wide, across restarts (fleet lease) | |
 | `MEMORY_REFLECTION_INPUT_CAP` | `40` | Max memories fed to reflection | |
 | `MEMORY_REFLECTION_MIN_MEMORIES` | `8` | Min memories before reflecting | |
 | `MEMORY_REFLECTION_MAX_ACTORS_PER_TICK` | `25` | Actor fan-out cap per tick | |
@@ -482,7 +482,7 @@ Several default **ON** as of the 2026-07 "Tier 3" learning-loops cutover.
 | `MEMORY_RANK_PROVENANCE_RETENTION_DAYS` | `90` | Provenance row retention | |
 | `MEMORY_RANK_PROVENANCE_SWEEP_INTERVAL_SECS` | `3600` (clamped 300..86400) | Cadence of the `execution_memory_context` provenance sweep that enforces the retention above | |
 | `ADAPTIVE_RANK_MIN_EXAMPLES` | `50` | Min examples before training | |
-| `ADAPTIVE_RANK_TRAINING_INTERVAL_SECS` | `21600` | Training cadence | |
+| `ADAPTIVE_RANK_TRAINING_INTERVAL_SECS` | `21600` | Training cadence: once per interval fleet-wide, across restarts (fleet lease) | |
 | `ADAPTIVE_RANK_LOOKBACK_DAYS` | `30` | Training lookback window. **Effective DOWNWARD only** — see the note below | |
 | `ADAPTIVE_RANK_MAX_ACTORS_PER_TICK` | `50` | Actor fan-out cap per tick | |
 | `MEMORY_LOOP_MAX_ACTORS_PER_ORG_PER_TICK` | `0` (disabled) | Shared per-org fan-out cap across memory loops | |
@@ -521,7 +521,7 @@ Where to SEE the effective window rather than infer it:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ML_DIGEST_INTERVAL_SECS` | built-in (min 60) | ML digest job cadence |
+| `ML_DIGEST_INTERVAL_SECS` | built-in (min 60) | ML digest job cadence: once per interval fleet-wide, across restarts (fleet lease) |
 | `ML_POLICY_EVAL_INTERVAL_SECS` | built-in (min 30) | Lifecycle-policy evaluation cadence |
 | `ML_POLICY_EVAL_MIN_INTERVAL_SECS` | `3600` | Min interval between policy evaluations per model |
 | `TALOS_TEACHER_AUDIT_INTERVAL_DAYS` | built-in (clamped) | Teacher-vs-gold audit cadence |

@@ -4186,9 +4186,16 @@ const SLA_BREACH_PERIOD: std::time::Duration = std::time::Duration::from_secs(30
 const SLA_DEGRADATION_PERIOD: std::time::Duration = std::time::Duration::from_secs(900);
 
 /// The periodic loops in this process that hold a fleet lease per tick.
-pub(crate) const LEASED_TASKS: [BackgroundTask; 2] = [
+pub(crate) const LEASED_TASKS: [BackgroundTask; 7] = [
     BackgroundTask::SlaBreachMonitor,
     BackgroundTask::SlaDegradationMonitor,
+    // Leased inside their own library crates (2026-09-21): due once per
+    // configured interval, not once per replica and not once per boot.
+    BackgroundTask::MemoryConsolidationScheduler,
+    BackgroundTask::MemoryReflectionScheduler,
+    BackgroundTask::RankTrainingScheduler,
+    BackgroundTask::MlDisagreementDigest,
+    BackgroundTask::MlTeacherAudit,
 ];
 
 /// WASM-log subscriber + job-result subscriber (both supervisor-wrapped,
@@ -6686,7 +6693,12 @@ mod task_supervision_wiring_tests {
             super::LEASED_TASKS,
             [
                 talos_task_supervision::BackgroundTask::SlaBreachMonitor,
-                talos_task_supervision::BackgroundTask::SlaDegradationMonitor
+                talos_task_supervision::BackgroundTask::SlaDegradationMonitor,
+                talos_task_supervision::BackgroundTask::MemoryConsolidationScheduler,
+                talos_task_supervision::BackgroundTask::MemoryReflectionScheduler,
+                talos_task_supervision::BackgroundTask::RankTrainingScheduler,
+                talos_task_supervision::BackgroundTask::MlDisagreementDigest,
+                talos_task_supervision::BackgroundTask::MlTeacherAudit,
             ]
         );
         let services: String = include_str!("services.rs").split_whitespace().collect();

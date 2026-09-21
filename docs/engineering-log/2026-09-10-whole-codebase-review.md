@@ -5352,3 +5352,18 @@ GCP create was read and left alone (it calls nothing upstream and allows
 several watches per integration); Gmail was read and left alone (`users.watch`
 replaces).
 
+## Package CY (2026-09-21): the LLM / ML loops and the fleet lease
+
+The inventory had these five loops down as "N times the LLM spend at N
+replicas, grep only". Reading them, the replica question turned out to be the
+smaller half: a query for the newest `last_consolidated_at` returned the
+controller's boot second, and so did `last_reflected_at` and
+`last_digest_at`. The first attempt to price a boot-time run queried
+`llm_usage.created_at`, a column that does not exist (it is `recorded_at`);
+the corrected read showed no loop-attributed LLM rows at the boot minute, so
+the PR states the cost as re-delivery and refits rather than LLM spend.
+
+The first design reused CW's shape unchanged (tick = period). Writing out a
+day with five deploys showed the starvation case for a 24-hour loop, which is
+where `tick_every` came from.
+

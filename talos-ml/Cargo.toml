@@ -8,6 +8,8 @@ publish.workspace = true
 
 [dependencies]
 talos-task-supervision = { path = "../talos-task-supervision" }
+# Fleet lease: this crate's periodic loops run once per interval, not once per replica or per boot.
+talos-background-lease = { path = "../talos-background-lease" }
 anyhow.workspace = true
 chrono.workspace = true
 serde.workspace = true

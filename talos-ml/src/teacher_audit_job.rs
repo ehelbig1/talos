@@ -309,7 +309,12 @@ pub fn spawn_teacher_audit_scheduler(
     talos_task_supervision::spawn_supervised(
         talos_task_supervision::BackgroundTask::MlTeacherAudit,
         async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(check_secs));
+            // The "is an audit due?" check is leased per check interval: the
+            // in-flight slot is process-local and the `running` stamp lands a
+            // moment after the check, so two replicas checking together could
+            // both start the same LLM-heavy audit.
+            let period = std::time::Duration::from_secs(check_secs);
+            let mut interval = tokio::time::interval(talos_background_lease::tick_every(period));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             tracing::info!(
                 check_interval_secs = check_secs,
@@ -325,6 +330,15 @@ pub fn spawn_teacher_audit_scheduler(
                         break talos_task_supervision::TaskExit::ShuttingDown;
                     }
                     _ = interval.tick() => {
+                        if !talos_background_lease::claim_tick(
+                            &pool,
+                            talos_task_supervision::BackgroundTask::MlTeacherAudit,
+                            period,
+                        )
+                        .await
+                        {
+                            continue;
+                        }
                         match run_teacher_audit_tick(&pool, &dataset, ollama.as_ref(), days).await {
                             Ok(Some(_)) => {}
                             Ok(None) => {}
@@ -507,5 +521,33 @@ mod task_supervision_pin {
             bare, 0,
             "the set of deliberately-unsupervised one-shot spawns in this file changed"
         );
+    }
+
+    /// TEXTUAL, stated as such: an audit needs a dataset with corrections and
+    /// an LLM to be observable, so the scheduler's lease is pinned here while
+    /// the four sibling loops are driven against Postgres in
+    /// `controller/tests/leased_llm_loops_tests`. The check must claim ITS
+    /// task for ITS period and skip when refused, before the due-scan runs.
+    #[test]
+    fn the_due_check_is_leased_before_it_scans() {
+        let src: String = include_str!("teacher_audit_job.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("production text")
+            .split_whitespace()
+            .collect();
+        let claim = "if!talos_background_lease::claim_tick(&pool,talos_task_supervision::BackgroundTask::MlTeacherAudit,period,).await{continue;}";
+        let claim_at = src
+            .find(claim)
+            .expect("the due check does not take the fleet lease");
+        let scan_at = src
+            .find("matchrun_teacher_audit_tick(&pool,")
+            .expect("the scheduler calls the tick");
+        assert!(
+            claim_at < scan_at,
+            "the scan runs before the lease is claimed"
+        );
+        assert!(src.contains("letperiod=std::time::Duration::from_secs(check_secs);"));
+        assert!(src.contains("tokio::time::interval(talos_background_lease::tick_every(period))"));
     }
 }

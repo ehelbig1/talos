@@ -271,7 +271,11 @@ pub fn spawn_rank_training_scheduler(
     talos_task_supervision::spawn_supervised(
         talos_task_supervision::BackgroundTask::RankTrainingScheduler,
         async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            // Due once per `interval_secs` for the whole FLEET and across
+            // restarts (`talos-background-lease`); the ticker only decides
+            // how soon after the lease lapses this process asks again.
+            let period = std::time::Duration::from_secs(interval_secs);
+            let mut interval = tokio::time::interval(talos_background_lease::tick_every(period));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             tracing::info!(
                 target: "talos_memory_ranking",
@@ -286,6 +290,15 @@ pub fn spawn_rank_training_scheduler(
                         break talos_task_supervision::TaskExit::ShuttingDown;
                     }
                     _ = interval.tick() => {
+                        if !talos_background_lease::claim_tick(
+                            &pool,
+                            talos_task_supervision::BackgroundTask::RankTrainingScheduler,
+                            period,
+                        )
+                        .await
+                        {
+                            continue;
+                        }
                         if let Err(e) = run_rank_training_tick(&pool, &actor_repo).await {
                             tracing::warn!(target: "talos_memory_ranking", error = %e, "rank training tick failed; retrying next interval");
                         }

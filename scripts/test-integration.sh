@@ -826,6 +826,13 @@ CTRL_TESTS=(
     # handed the winner's channel, and a renewal that waited must not act on
     # the row it read before waiting. Also drives `acquire_fleet` directly.
     "gcal_watch_fleet_lock_tests"
+    # The LLM / ML background loops run once per configured interval for the
+    # fleet (2026-09-21). Before the lease every one of them swept everything
+    # on EVERY controller boot: their tickers fire at start and they select
+    # "least recently processed first" with no due-test. Spawns each PRODUCTION
+    # scheduler twice on one database and reads the stamp its sweep leaves;
+    # the control lapses the lease and requires the next boot tick to sweep.
+    "leased_llm_loops_tests"
     # The `__memory_write__` write-ceiling gate (#750). Needs a real Postgres
     # because the property under test is "no actor_memory ROW" — the thing a
     # silent drop and a correct refusal both produce, distinguished only by the
