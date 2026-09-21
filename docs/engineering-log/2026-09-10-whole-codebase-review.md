@@ -5449,3 +5449,13 @@ Opening that UPDATE raised the older question — does it count? It did not, and
 Both earlier guards had the same blind spot, and it is the one this log keeps recording: they match a line, and the house style breaks SQL across lines. The new leg joins continuations before it looks.
 
 The cleanup needed its record and its count on opposite sides of a commit. Counting first would count a rollback; recording after would lose the atomicity the package exists for. A value that must be consumed after the commit — and is a compile error to drop — says that in the type.
+
+## Package DI — no admin event is written after its change any more (2026-09-21)
+
+Four sites were left on the list, and reading around them found three more that were not on it because they were not detached: the ML policy, lifecycle and shadow-window handlers awaited their audit insert — after `tx.commit()`, with a comment calling it best-effort, a few lines below the transaction they could have used. Moving the insert above the commit was the whole fix.
+
+The pause record earned its previous-state field from its own history: the first live pause on this deployment was written with the home writer's statement and left no admin event at all, because the tool refused a caller who was not a platform admin. Recording what the flag WAS also turns a confused double-pause into something the log can show.
+
+The archive handler had been recording the names its preview matched. A preview is a read; the archive is a write with a guard the preview does not have, and the difference — a workflow already archived — was sitting in the fixture. The statement's own RETURNING is the only honest source.
+
+With the last callers gone, both helpers were deleted rather than left for the next author to reach for. What remains takes a connection.

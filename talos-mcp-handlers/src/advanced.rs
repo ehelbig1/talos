@@ -4862,59 +4862,18 @@ async fn handle_publish_built_in_templates(
              that every tenant browses via search_marketplace / install_from_marketplace.",
         );
     }
-    // Step 1: Remove stale system-published entries linked to sandbox/QA templates.
-    let removed = match state.advanced_repo.remove_stale_system_marketplace().await {
-        Ok(n) => {
-            if n > 0 {
-                tracing::info!(
-                    "publish_built_in_templates: removed {} stale sandbox/QA entries",
-                    n
-                );
-            }
-            n
-        }
-        Err(e) => {
-            tracing::error!("publish_built_in_templates cleanup: {}", e);
-            return mcp_error(
-                req_id,
-                -32000,
-                "Failed to clean up stale marketplace entries",
-            );
-        }
-    };
-
-    // Step 2: Publish system-seeded (first-party) templates not yet listed.
-    match state.advanced_repo.publish_system_templates().await {
-        Ok(published) => {
+    // Remove stale system listings, publish the first-party templates and
+    // record it — one transaction in the repository.
+    match state
+        .advanced_repo
+        .republish_system_templates_recorded(user_id)
+        .await
+    {
+        Ok((published, removed)) => {
             tracing::info!(
                 "publish_built_in_templates: published {} templates (removed {} stale)",
                 published,
                 removed
-            );
-            // MCP-421 (2026-05-11): persistent audit on deployment-wide
-            // marketplace mutation. Same audit-gap class as MCP-398
-            // (pause/resume_executions) — platform-admin gated
-            // operations that touch every tenant's view must leave a
-            // permanent admin_event_log row. tracing::info! is
-            // ephemeral console state. A compromised platform-admin
-            // token could republish bad templates, alter what every
-            // tenant sees in search_marketplace, then exit — and the
-            // only forensic trail would be the rotation of marketplace
-            // listings themselves (no operator-action attribution).
-            crate::actor::spawn_log_admin_event(
-                state.db_pool.clone(),
-                user_id,
-                "marketplace_built_in_templates_published",
-                "system",
-                None,
-                format!(
-                    "Built-in templates republished: {} added, {} stale removed",
-                    published, removed
-                ),
-                Some(serde_json::json!({
-                    "published": published,
-                    "removed_stale": removed,
-                })),
             );
             mcp_text(
                 req_id,

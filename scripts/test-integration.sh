@@ -823,6 +823,7 @@ CTRL_TESTS=(
     "graphql_delete_child_guard_tests"
     "workflow_delete_audit_tests"
     "module_delete_audit_tests"
+    "last_detached_records_tests"
     # The fleet lease for periodic background loops (2026-09-20). Two pools on
     # one database stand in for two controller replicas: one holds a period,
     # the other is refused even with no lock held (the case an advisory lock

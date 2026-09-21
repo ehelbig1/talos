@@ -748,41 +748,8 @@ async fn handle_set_failure_notification(
         .await
     {
         Ok(rows) if rows > 0 => {
-            // MCP-436 (2026-05-11): audit log on a failure-notification
-            // webhook change. Architectural follow-up flagged across
-            // recent cycles. The webhook URL is the exfiltration
-            // channel for workflow failure data (error messages,
-            // stack traces, sometimes secrets that surfaced in
-            // exceptions). Threat: attacker with stolen MCP key
-            // flips the webhook to an attacker-controlled URL,
-            // waits for a failure event to fire (or causes one),
-            // then reverts. The SSRF check at storage prevents
-            // private-IP exfil but doesn't prevent a public
-            // attacker-controlled domain. Auditing the change
-            // makes the flip-exfil-flip-back pattern visible in
-            // admin_event_log.
-            //
-            // The `is_configured` boolean distinguishes set vs
-            // clear in details (the resource_id stays the workflow
-            // either way). url_val is recorded too — operators
-            // investigating an exfil can see which destination got
-            // configured at the time of the change.
-            crate::actor::spawn_log_admin_event(
-                state.db_pool.clone(),
-                user_id,
-                "workflow_failure_webhook_changed",
-                "workflow",
-                Some(wf_id),
-                if url_val.is_some() {
-                    format!("Workflow {} failure webhook set", wf_id)
-                } else {
-                    format!("Workflow {} failure webhook cleared", wf_id)
-                },
-                Some(serde_json::json!({
-                    "is_configured": url_val.is_some(),
-                    "webhook_url": url_val,
-                })),
-            );
+            // The `workflow_failure_webhook_changed` record (new and previous
+            // URL) is written by the repository inside the change's transaction.
             let msg = if url_val.is_some() {
                 format!("Failure notification webhook set for workflow {}.", wf_id)
             } else {

@@ -2708,27 +2708,11 @@ async fn handle_pause_executions(
              The execution-paused flag is deployment-wide state that affects every tenant.",
         );
     }
-    match talos_execution_pause::set_execution_paused(&state.db_pool, true).await {
+    // Flag and `executions_paused` record are one transaction in the pause crate.
+    match talos_execution_pause::set_execution_paused_recorded(&state.db_pool, true, user_id)
+        .await
+    {
         Ok(_) => {
-            // MCP-398 (2026-05-11): persistent audit on a deployment-
-            // wide DoS gate. The auth gate from MCP-323 prevents
-            // per-tenant admins from flipping the flag, but a
-            // compromised platform-admin token could pause → exploit
-            // (e.g. modify infrastructure under cover of the
-            // queue-quiet window) → resume, with nothing in
-            // admin_event_log to mark the cycle. The append-only
-            // trigger on admin_event_log makes the pause/resume
-            // round-trip permanent. resource_id is None — the
-            // execution_paused flag is global, not per-resource.
-            crate::actor::spawn_log_admin_event(
-                state.db_pool.clone(),
-                user_id,
-                "executions_paused",
-                "system",
-                None,
-                "Execution queue paused (deployment-wide)".to_string(),
-                None,
-            );
             mcp_text(
                 req_id,
                 "Execution queue paused (deployment-wide). Due schedules are deferred and fire once after resume; inbound webhooks and Gmail pushes get 503 so the sender redelivers; manual starts are refused. Runs already in flight finish.",
@@ -2766,29 +2750,13 @@ async fn handle_resume_executions(
              The execution-paused flag is deployment-wide state that affects every tenant.",
         );
     }
-    match talos_execution_pause::set_execution_paused(&state.db_pool, false).await {
-        Ok(_) => {
-            // MCP-398 (2026-05-11): paired audit to pause_executions
-            // above. Without the resume event, an attacker who paused
-            // the queue could exit cleanly with only the pause row
-            // visible — operators investigating would see "paused
-            // 10:00, resumed (no row)" and not know who restored
-            // service. Pairing both events makes the round-trip
-            // intent-reconstructable from admin_event_log alone.
-            crate::actor::spawn_log_admin_event(
-                state.db_pool.clone(),
-                user_id,
-                "executions_resumed",
-                "system",
-                None,
-                "Execution queue resumed (deployment-wide)".to_string(),
-                None,
-            );
-            mcp_text(
-                req_id,
-                "Execution queue resumed. Workflow triggers are now accepted.",
-            )
-        }
+    // Flag and `executions_resumed` record are one transaction in the pause crate.
+    match talos_execution_pause::set_execution_paused_recorded(&state.db_pool, false, user_id).await
+    {
+        Ok(_) => mcp_text(
+            req_id,
+            "Execution queue resumed. Workflow triggers are now accepted.",
+        ),
         Err(e) => {
             tracing::error!("resume_executions failed: {}", e);
             mcp_error(req_id, -32000, "Failed to resume executions")

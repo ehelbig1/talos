@@ -11530,7 +11530,7 @@ async fn handle_archive_workflows_by_prefix(
 
     let archived_count = match state
         .workflow_repo
-        .archive_workflows_by_ids(&ids, user_id, set_type)
+        .archive_workflows_by_ids(&ids, user_id, set_type, prefix)
         .await
     {
         Ok(n) => n,
@@ -11548,31 +11548,8 @@ async fn handle_archive_workflows_by_prefix(
         "archive_workflows_by_prefix completed"
     );
 
-    // MCP-399 (2026-05-11): bulk-archive op audit. Sibling to
-    // cleanup_workflows above. tracing::info! is ephemeral console
-    // log; admin_event_log is the durable record. Prefix-style bulk
-    // archive can hide many workflows with one call; an attacker
-    // could archive an entire `prod-` namespace and the workflows
-    // wouldn't appear in the default unfiltered list_workflows view.
-    if archived_count > 0 {
-        crate::actor::spawn_log_admin_event(
-            state.db_pool.clone(),
-            user_id,
-            "workflows_bulk_archived",
-            "workflow",
-            None,
-            format!(
-                "{} workflow(s) bulk-archived via archive_workflows_by_prefix",
-                archived_count
-            ),
-            Some(serde_json::json!({
-                "prefix": prefix,
-                "set_type": set_type,
-                "archived_count": archived_count,
-                "matched": &matched,
-            })),
-        );
-    }
+    // The `workflows_bulk_archived` record — naming what was actually archived —
+    // is written by the repository inside the archive's transaction.
 
     mcp_text(
         req_id,
