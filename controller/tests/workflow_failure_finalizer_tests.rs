@@ -209,4 +209,45 @@ async fn the_home_counts_what_it_finalizes_and_refuses_what_it_must() {
         .await
         .unwrap();
     assert_eq!(status_of(&pool, d).await.0, "completed");
+
+    // The stale sweep's janitor write. Until 2026-09-21 it carried its own
+    // UPDATE and recorded nothing, so a run a controller restart orphaned was
+    // a `failed` row the failure counter never saw.
+    let sweep = talos_execution_repository::ExecutionRepository::new(pool.clone());
+    let stale = new_execution(&pool, &t, "running").await;
+    let (c4, h4) = (count("failure"), hist("failure"));
+    assert!(sweep
+        .fail_stale_execution(stale, "Auto-cleaned: execution stale")
+        .await
+        .unwrap());
+    assert_eq!(
+        status_of(&pool, stale).await,
+        (
+            "failed".to_string(),
+            Some("Auto-cleaned: execution stale".to_string())
+        )
+    );
+    assert_eq!(
+        count("failure") - c4,
+        1.0,
+        "a run the stale sweep fails must be counted as a failure"
+    );
+    assert_eq!(hist("failure") - h4, 1);
+
+    // The janitor's guard is `running` ONLY: it must not take a `resuming`
+    // row from crash recovery, start a `queued` one's failure, or re-fail a
+    // finished row — and what it does not finalize it does not count.
+    for owned in ["resuming", "queued", "completed", "failed", "cancelled"] {
+        let id = new_execution(&pool, &t, owned).await;
+        let c = count("failure");
+        assert!(
+            !sweep
+                .fail_stale_execution(id, "should not land")
+                .await
+                .unwrap(),
+            "the stale sweep must leave a {owned} row alone"
+        );
+        assert_eq!(status_of(&pool, id).await.0, owned);
+        assert_eq!(count("failure"), c, "a refused {owned} row must not count");
+    }
 }

@@ -333,23 +333,16 @@ impl ExecutionRepository {
     /// the new direction is the correct one: a genuine terminal status always
     /// beats the janitor's.
     pub async fn fail_stale_execution(&self, id: Uuid, error_message: &str) -> Result<bool> {
-        // Excluding 'resuming' is deliberate, and widening it would be a
-        // behaviour change rather than a fix: a `resuming` row is OWNED by crash
-        // recovery, and `reclaim_orphaned_resuming` is the writer that fails one
-        // out. The pre-2026-09 bulk sweep this replaces guarded
-        // `status IN ('running')` for exactly that reason; this preserves it.
-        //
-        // allow-running-only-finalize: see the paragraph directly above.
-        let r = sqlx::query(
-            "UPDATE workflow_executions \
-             SET status = 'failed', completed_at = NOW(), error_message = $2 \
-             WHERE id = $1 AND status = 'running'",
+        // The statement and its `running`-only guard live in the shared
+        // finalizer, which also records the outcome: a run the janitor fails
+        // is a failed run, and the failure counter must see it.
+        let finalized = talos_execution_finalizer::fail_stale_running_workflow_execution(
+            &self.db_pool,
+            id,
+            error_message,
         )
-        .bind(id)
-        .bind(error_message)
-        .execute(&self.db_pool)
         .await?;
-        Ok(r.rows_affected() > 0)
+        Ok(finalized > 0)
     }
 }
 

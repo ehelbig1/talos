@@ -49,6 +49,35 @@ pub async fn fail_workflow_execution_unless_terminal(
     record("failure", row)
 }
 
+/// The STALE SWEEP closes a run nothing is driving any more (typically one a
+/// controller restart orphaned). Guard: `running` ONLY. A `resuming` row is
+/// owned by crash recovery and a `queued` one has not started, so the janitor
+/// leaves both; a row that finalized itself between the sweep's read and this
+/// write keeps its real outcome. Until 2026-09-21 this statement lived in
+/// `talos-execution-repository::stale_sweep` and recorded nothing, so every
+/// run a restart killed was a `failed` row the failure counter never saw.
+/// Returns the rows finalized (0 or 1).
+pub async fn fail_stale_running_workflow_execution(
+    pool: &PgPool,
+    execution_id: Uuid,
+    error_message: &str,
+) -> Result<u64> {
+    // The janitor must not take a `resuming` row from crash recovery — see
+    // the doc comment above.
+    // allow-running-only-finalize: a `resuming` row is crash recovery's.
+    let row = sqlx::query(
+        "UPDATE workflow_executions \
+         SET status = 'failed', completed_at = NOW(), error_message = $2 \
+         WHERE id = $1 AND status = 'running' \
+         RETURNING EXTRACT(EPOCH FROM (completed_at - started_at))::float8",
+    )
+    .bind(execution_id)
+    .bind(error_message)
+    .fetch_optional(pool)
+    .await?;
+    record("failure", row)
+}
+
 /// Completion with the output already encrypted at rest by the caller
 /// (`output_data` cleared, ciphertext + DEK id + format bound). Guard
 /// `IN ('running', 'resuming')`: the engine may complete the run it resumed.
@@ -155,6 +184,27 @@ mod pins {
             );
         }
         assert_eq!(include_str!("lib.rs").matches(needle).count(), 1);
+    }
+
+    /// The stale sweep was the eighteenth terminal writer: its own UPDATE,
+    /// no outcome recorded. TEXTUAL, stated as such — the behaviour is driven
+    /// by `controller/tests/workflow_failure_finalizer_tests`.
+    #[test]
+    fn the_stale_sweep_fails_runs_through_the_home() {
+        let src = include_str!("../../talos-execution-repository/src/stale_sweep.rs");
+        let code: String = src
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            code.contains("fail_stale_running_workflow_execution("),
+            "the stale sweep no longer calls the failure home"
+        );
+        assert!(
+            !code.contains("SET status = 'failed'"),
+            "the stale sweep re-inlines its failure UPDATE"
+        );
     }
 
     #[test]
