@@ -68,7 +68,23 @@ pub fn lease_secs(period: Duration) -> f64 {
     (p - slack).max(1.0)
 }
 
-/// One claim attempt for `task`, whose loop ticks every `period`.
+/// The longest a leased loop should sleep between claim attempts.
+pub const MAX_TICK: Duration = Duration::from_secs(3600);
+
+/// How often a loop whose work is due once per `period` should TICK.
+///
+/// For a short period the two are the same. For a long one (a daily loop)
+/// they must not be: a ticker restarts with the process, so a loop refused at
+/// boot because the previous process's lease is still live would not ask
+/// again for a whole period, and under frequent deploys its runs drift up to
+/// two periods apart. Ticking at most [`MAX_TICK`] apart bounds that to the
+/// lease plus an hour; a refused tick costs one primary-key probe.
+#[must_use]
+pub fn tick_every(period: Duration) -> Duration {
+    period.min(MAX_TICK).max(Duration::from_secs(1))
+}
+
+/// One claim attempt for `task`, whose work is due once per `period`.
 pub async fn try_claim(
     pool: &sqlx::Pool<sqlx::Postgres>,
     task: BackgroundTask,
@@ -186,6 +202,18 @@ mod tests {
             assert!(lease_secs(p) >= 1.0);
             assert!(secs < 2 || lease_secs(p) < p.as_secs_f64(), "period {secs}");
         }
+    }
+
+    #[test]
+    fn a_long_period_ticks_hourly_and_a_short_one_at_its_own_pace() {
+        assert_eq!(tick_every(Duration::from_secs(86_400)), MAX_TICK);
+        assert_eq!(tick_every(Duration::from_secs(21_600)), MAX_TICK);
+        assert_eq!(tick_every(MAX_TICK), MAX_TICK);
+        assert_eq!(
+            tick_every(Duration::from_secs(300)),
+            Duration::from_secs(300)
+        );
+        assert_eq!(tick_every(Duration::ZERO), Duration::from_secs(1));
     }
 
     #[test]

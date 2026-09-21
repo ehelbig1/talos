@@ -558,7 +558,8 @@ services:
       # Phase 3a: weight on the durable access-frequency boost folded into importance.
       SMART_MEMORY_CONTEXT_ACCESS_WEIGHT: ${SMART_MEMORY_CONTEXT_ACCESS_WEIGHT:-}
       ENABLE_SMART_MEMORY_HYDE: ${ENABLE_SMART_MEMORY_HYDE:-}
-      # Phase 3b: autonomous actor-memory consolidation loop (default-OFF).
+      # Phase 3b: autonomous actor-memory consolidation loop. Default ON in code
+      # (`talos_config::memory_consolidation_enabled`); set to false to turn off.
       # Tier-1 actors summarize on local Ollama ONLY (or Skip) — tier1_local_ok
       # is the operator attestation that OLLAMA_URL is on-host.
       ENABLE_MEMORY_CONSOLIDATION: ${ENABLE_MEMORY_CONSOLIDATION:-}
@@ -587,11 +588,13 @@ services:
       MEMORY_RANK_PROVENANCE_RETENTION_DAYS: ${MEMORY_RANK_PROVENANCE_RETENTION_DAYS:-}
       MEMORY_RANK_PROVENANCE_SWEEP_INTERVAL_SECS: ${MEMORY_RANK_PROVENANCE_SWEEP_INTERVAL_SECS:-}
       # Adaptive per-actor memory ranking — Phase 2 (learned ranker). Two
-      # independent default-OFF flags: ENABLE_ADAPTIVE_RANK_TRAINING gates the
+      # independent flags, both default ON in code (unset here = on; set to
+      # false to turn off): ENABLE_ADAPTIVE_RANK_TRAINING gates the
       # scheduled per-actor logistic-regression fit (writes learned weights to
       # actors.metadata.rank_weights); ENABLE_ADAPTIVE_RANK gates SERVING (the
-      # ranker uses learned weights when present). Both off ⇒ byte-identical
-      # ranking + no training task. Pure numeric fit — no LLM, no tier gate.
+      # ranker uses learned weights when present). Both set to false ⇒
+      # byte-identical ranking + no training task. Pure numeric fit — no LLM,
+      # no tier gate.
       ENABLE_ADAPTIVE_RANK: ${ENABLE_ADAPTIVE_RANK:-}
       ENABLE_ADAPTIVE_RANK_TRAINING: ${ENABLE_ADAPTIVE_RANK_TRAINING:-}
       ADAPTIVE_RANK_MIN_EXAMPLES: ${ADAPTIVE_RANK_MIN_EXAMPLES:-}

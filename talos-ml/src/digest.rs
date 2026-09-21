@@ -85,7 +85,11 @@ pub fn spawn_disagreement_digest(
     talos_task_supervision::spawn_supervised(
         talos_task_supervision::BackgroundTask::MlDisagreementDigest,
         async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+            // Due once per `interval_secs` for the whole FLEET and across
+            // restarts (`talos-background-lease`); the ticker only decides
+            // how soon after the lease lapses this process asks again.
+            let period = std::time::Duration::from_secs(interval_secs);
+            let mut interval = tokio::time::interval(talos_background_lease::tick_every(period));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             tracing::info!(interval_secs, "ml disagreement-digest task active");
             loop {
@@ -96,6 +100,15 @@ pub fn spawn_disagreement_digest(
                         break talos_task_supervision::TaskExit::ShuttingDown;
                     }
                     _ = interval.tick() => {
+                        if !talos_background_lease::claim_tick(
+                            &pool,
+                            talos_task_supervision::BackgroundTask::MlDisagreementDigest,
+                            period,
+                        )
+                        .await
+                        {
+                            continue;
+                        }
                         match run_digest_tick(&pool, &lifecycle_service).await {
                             Ok(n) if n > 0 => tracing::info!(delivered = n, "ml digest tick complete"),
                             Ok(_) => {}
