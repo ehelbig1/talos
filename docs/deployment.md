@@ -310,7 +310,8 @@ check 65(c) fails the build if an alert names a series no instrument exports.
 | `wasm_errors_total{type}` | Counter | Errors by normalized type |
 | `wasm_retries_total{reason}` | Counter | Retry attempts by reason |
 | `wasm_cache_hits_total` / `wasm_cache_misses_total` | Counter | Module compilation cache; both seeded at 0 |
-| `wasm_cache_hit_ratio` | Gauge | Cache hit ratio, 0.0–1.0 |
+| `wasm_cache_hit_ratio` | Gauge | Lifetime cache hit ratio, 0.0–1.0. ABSENT until the first compile — a reading, not a count, so no sample means "no compile yet", never 0 % |
+| `wasm_instance_cache_evictions_total{tier}` | Counter | InstancePre entries removed by the per-tier capacity bound (`WASM_INSTANCE_CACHE_MAX_PER_TIER`); seeded at 0 for all ten tiers |
 | `wasm_instances_active` | Gauge (UpDownCounter) | Currently active instances, process-local |
 
 The **controller** exposes metrics on its main port at `/metrics/prometheus`
