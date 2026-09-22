@@ -609,6 +609,13 @@ CTRL_TESTS=(
     # talos_auth_token_reuse_total / _rotation_audit_arm_total as deltas.
     # `common` harness, so CTRL_TESTS (64b).
     "token_reuse_detector_tests"
+    # A read that FAILED is not a row that is ABSENT. Six ML handlers
+    # resolved a model with `let Ok(Some(m)) = … else { "Model not found" }`,
+    # and two service-layer belts swallowed the same Err into NotFound.
+    # Drives the production MCP dispatch and both services with the underlying
+    # table renamed away, with a foreign-row control for the enumeration
+    # property. `common` harness, so CTRL_TESTS (64b).
+    "ml_not_found_split_tests"
     # Every workflow and module finalizer moves the execution count/duration
     # families that closed check 58's dead-metric baseline, with the duration
     # the finalizing UPDATE itself RETURNS; back-dated rows prove the observed

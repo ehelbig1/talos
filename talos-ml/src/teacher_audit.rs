@@ -572,10 +572,15 @@ async fn load_audit_inputs(
         .map_err(TeacherAuditError::Internal)?
         .ok_or(TeacherAuditError::NotFound)?;
     let dataset_id = model.dataset_id.ok_or(TeacherAuditError::NoDataset)?;
-    // Dataset-ownership belt, same coarse posture as serving.
-    match dataset.dataset_tenancy(&mut tx, dataset_id).await {
-        Ok(t) if t.user_id == user_id => {}
-        _ => return Err(TeacherAuditError::NotFound),
+    // Dataset-ownership belt, same coarse posture as serving: absent and
+    // foreign are ONE answer so the surface can't enumerate dataset ids. A
+    // read that did not ANSWER is a third thing — the three-valued
+    // `lookup_dataset_tenancy` is what makes it visible, where the wildcard
+    // below used to report a pool timeout as "Model not found" (2026-09-22).
+    match dataset.lookup_dataset_tenancy(&mut tx, dataset_id).await {
+        Ok(Some(t)) if t.user_id == user_id => {}
+        Ok(_) => return Err(TeacherAuditError::NotFound),
+        Err(e) => return Err(TeacherAuditError::Internal(e)),
     }
     // Server-side dataset-derived LLM leg: locality-gate BEFORE any
     // invocation (the lifecycle guard's stated contract), and pin to
