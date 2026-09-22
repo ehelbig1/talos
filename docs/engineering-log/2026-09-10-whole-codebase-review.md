@@ -6686,3 +6686,96 @@ are never anonymous. The class is "a request whose failure is known before
 it is sent", and the instrument that would have shown it (a counter on the
 cookieless refusal) was deliberately not added: the refusal is now
 avoided rather than counted.
+
+## Package DV (2026-09-22) — one socket per page; the server lane multiplexes by id
+
+**Measured first.** After DU shipped its series the question was how many
+sockets a page opens. `frontend/src/lib/graphqlClient.ts::createSubscription`
+built a `new WebSocket(...)` per call; eight files call the five helpers, and
+the dashboard alone holds `workflowExecutionUpdates` (the page) plus a second
+lifecycle subscription and, per active execution, `executionUpdates` and
+`llmStream` (`useActiveExecutionSync`). DU's own live-read prediction — three
+`authenticated` handshakes per dashboard load — is that count. Each socket
+carried its own cookie handshake, its own MCP-865 backoff and its own
+15-minute `token_expired` close, so a token expiry produced N reconnects for
+one page.
+
+The server side was the sharper finding. `talos-ws-auth`'s session loop
+awaited `schema.execute_stream(req)` INLINE inside the `start` arm: the next
+inbound frame was not read until that stream ended, so a second `start` on
+the same socket queued behind the first forever, and `stop` merely echoed
+`complete` — the stream kept running until the socket closed. Multiplexing
+existed in the protocol and nowhere in the code. Fixing the client alone
+would therefore have made every page's second subscription silently dead,
+which is why the server half shipped first in this package.
+
+**Server.** `handle_graphql_ws` is now generic over `T: Stream<Item =
+Result<Message, axum::Error>> + Sink<Message>` and a schema
+`Schema<Q, M, S>`, so the production loop is driven in tests over a
+channel-backed `Duplex` and a two-field test schema (`ticks(n)`, `forever`
+with a live counter) without a socket. One writer task drains a bounded
+`mpsc` of 256 frames into the sink; each accepted `start` spawns a task that
+streams `data` frames and then `complete`; `stop` aborts the task by id;
+`SessionTasks` aborts every task on `Drop`, which matters because the
+handshake wraps the session in the token-expiry deadline and a timed-out
+future is dropped, not returned from. `reap()` drops finished handles so a
+long session cannot fill the map and a naturally completed id may be reused.
+Two new refusals close the obvious abuse: a per-socket cap of 16 live
+subscriptions and a `start` reusing a live id, each an `error` frame plus a
+`talos_audit`/`talos_ws_auth` line plus its own value on
+`talos_ws_operations_total` (five values, all seeded).
+
+**Client.** `frontend/src/lib/wsHub.ts` is the one socket owner: a lazily
+opened connection, ids from a counter, a registry of live subscriptions,
+replay of every `start` after each `connection_ack`, `stop` on unsubscribe,
+an idle close when the last unsubscribes, MCP-865's bounded backoff (5
+attempts before a first ack, 30 after), the 24 h lifetime, and one
+auth-recovery site through `recoverSession(this.epochAtConnect)` — DS's epoch
+rule applied at the connection rather than at a request. `createSubscription`
+delegates; its signature, the five helpers and all eight callers are
+unchanged. The hub imports only `config` and `session`, so it cannot cycle
+with the request wrappers.
+
+**Guards.** Rust: six `multiplex_tests` over the production loop (second
+subscription served while the first streams; the cap refuses the 17th and
+leaves the others alone; a live id refused, a stopped AND a naturally
+completed id reusable; dropping the session future aborts every task; a
+query is refused and the session survives; a refused start moves its own
+series and NOT `started`, read from the real registry under a `SERIES_LOCK`
+every multiplex test takes). TS: eight cases through the production helpers
+against a scripted `FakeWebSocket` (one socket for three subscriptions, ids
+distinct, data routed by id — including two `executionUpdates` for different
+executions, the same document; late start; idle close and reopen; replay on
+abnormal close; auth recovery once through the connect-time epoch; failed
+recovery dormant, not looping; non-auth refusal leaves the socket alone; the
+24 h lifetime). The DS textual pin moved to the hub: one `new WebSocket(`,
+one `recoverSession(this.epochAtConnect)`, two `recoverAuth` call sites.
+
+**Mutations: 18 applied, each confirmed landed by hash and byte-restored, 15
+caught on the first pass, 3 SURVIVED and were closed.** R4 (delete `reap`)
+survived because the reuse test freed its id with `stop`, which removes the
+entry itself — natural completion is now driven too, with a bounded re-try
+because the task sends `complete` and THEN returns. R7 (record `started`
+before the gates) survived because nothing read the registry — the new
+series-delta test does, and the lock it needs is now taken by every sibling.
+T5 (fan data to every handler) survived because every test used distinct
+documents, so `payloadData[sub.dataKey]` filtered by accident — two
+`executionUpdates` subscriptions for different executions now pin routing
+by id. Re-run: 18 of 18.
+
+**Behaviour changes, stated.** `stop` ends the server-side stream (before
+DV it ran until the socket closed). A page holding more than 16 live
+subscriptions on one socket has its 17th `start` refused; the hub logs the
+`error` frame once and does not retry — the actor-compare page holds one
+subscription per compared actor, 10 actors on this fleet, the page nearest
+the cap. `talos_ws_active_sessions` now counts roughly open pages, not open
+subscriptions; `docs/deployment.md` says so.
+
+**Stated limits.** No test drives a browser against the real server; the two
+halves are each driven against a fake of the other, and the live read after
+deploy is the wiring's proof (one dashboard load: `authenticated` +1 where
+DU predicted +3, `started` at least +3, gauge +1 per open page). The hub is
+per tab — many tabs still mean many sockets. The cap is a constant, not a
+knob. The client emits no series. `OUTBOUND_FRAME_BUFFER` bounds memory per
+socket; a slow client stalls its own subscription tasks at the channel, not
+the controller.

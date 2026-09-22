@@ -6,6 +6,7 @@ import {
   recoverSession,
   seedCsrfCookie,
 } from "@/lib/session";
+import { subscribeOverSharedSocket } from "@/lib/wsHub";
 import { config } from "@/config";
 /**
  * Minimal GraphQL client used by the Talos frontend — TRANSPORT ONLY.
@@ -227,172 +228,19 @@ export interface CompilationUpdate {
   progress?: number;
 }
 
+/**
+ * Since package DV every subscription rides the page's ONE shared socket
+ * (`wsHub.ts`). This kept its signature so the five helpers below and their
+ * callers are unchanged; the connection, replay, `stop`, idle close, backoff
+ * and auth recovery all live in the hub.
+ */
 function createSubscription<T>(
   query: string,
   variables: Record<string, unknown>,
   onEvent: (event: T) => void,
   dataKey: string,
 ): () => void {
-  // MCP-900 (2026-05-14): respect explicit VITE_WS_URL when set. Pre-fix
-  // `config.wsUrl` was defined in config.ts but never imported, so
-  // operators setting VITE_WS_URL at build time got a value silently
-  // dropped (Vite baked it into the bundle, nothing read it). Real-
-  // world use case: a deploy with split API + WS endpoints (e.g.
-  // `wss://ws.example.com` on a separate gateway from
-  // `https://api.example.com`) cannot be expressed via the protocol-
-  // replace derivation below. Order: explicit VITE_WS_URL > derive
-  // from VITE_API_URL > window.location fallback.
-  const wsUrl = config.wsUrl
-    ? config.wsUrl
-    : API_URL
-      ? API_URL.replace("http://", "ws://").replace("https://", "wss://")
-      : `${window.location.protocol === "https:" ? "wss" : "ws"}://${
-          window.location.host
-        }`;
-
-  let ws: WebSocket | null = null;
-  let subscriptionStarted = false;
-  let isClosed = false;
-  let reconnectAttempts = 0;
-  let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
-  let connectionStartTime = 0;
-
-  const connect = () => {
-    if (isClosed) return;
-    if (reconnectTimeout) {
-      clearTimeout(reconnectTimeout);
-      reconnectTimeout = null;
-    }
-
-    ws = new WebSocket(`${wsUrl}/ws`, "graphql-ws");
-    subscriptionStarted = false;
-    connectionStartTime = Date.now();
-    // Same rule as the HTTP wrappers: a refresh that succeeded since this
-    // socket was opened is what the reconnect needs, not another one.
-    const epochAtConnect = currentRefreshEpoch();
-
-    ws.onopen = () => {
-      reconnectAttempts = 0;
-      ws?.send(JSON.stringify({ type: "connection_init", payload: {} }));
-    };
-
-    ws.onmessage = (msg) => {
-      if (Date.now() - connectionStartTime > 24 * 60 * 60 * 1000) {
-        ws?.close(1000, "Max connection lifetime exceeded");
-        return;
-      }
-
-      try {
-        const data = JSON.parse(msg.data);
-
-        if (data.type === "connection_ack" && !subscriptionStarted) {
-          subscriptionStarted = true;
-          ws?.send(
-            JSON.stringify({
-              id: "1",
-              type: "start",
-              payload: { query, variables },
-            }),
-          );
-        }
-
-        if (data.type === "data" && data.id === "1") {
-          // Surface GraphQL errors instead of swallowing them. A query that
-          // references a non-existent field returns `{data: null, errors}`,
-          // and blindly indexing `data.payload.data[dataKey]` would throw into
-          // the catch below — silently dropping every event with no signal.
-          const payloadData = data.payload?.data;
-          if (payloadData && payloadData[dataKey] != null) {
-            onEvent(payloadData[dataKey]);
-          } else if (data.payload?.errors?.length) {
-            console.error(
-              `[subscription:${dataKey}] server returned errors:`,
-              data.payload.errors,
-            );
-          }
-        }
-
-        if (data.type === "connection_error") {
-          // MCP-864 (2026-05-14): try refreshing the access token on
-          // handshake auth failure before giving up. Without this, a
-          // WS subscription open for longer than the 15-minute access
-          // token TTL would silently stop receiving updates with no
-          // reconnect (the 4403 close bypasses the backoff path), so
-          // users staring at an execution timeline lose live events
-          // mid-session. authedFetch already handles the equivalent
-          // 401 path; this brings WS parity.
-          ws?.close(4403, "Forbidden");
-          recoverSession(epochAtConnect).then((refreshed) => {
-            if (refreshed && !isClosed) {
-              reconnectAttempts = 0;
-              connect();
-            } else {
-              isClosed = true;
-            }
-          });
-          return;
-        }
-
-        if (data.type === "error" && Array.isArray(data.payload)) {
-          const isAuthError = data.payload.some((e: Record<string, unknown>) =>
-            isAuthErrorMessage(e.message),
-          );
-
-          if (isAuthError) {
-            ws?.close(4403, "Forbidden");
-            recoverSession(epochAtConnect).then((refreshed) => {
-              if (refreshed && !isClosed) {
-                reconnectAttempts = 0;
-                connect();
-              } else {
-                isClosed = true;
-              }
-            });
-            return;
-          }
-        }
-      } catch {
-        // ignore
-      }
-    };
-
-    ws.onclose = (event) => {
-      if (isClosed) return;
-
-      // Auth-fail close codes: never reconnect (the connection_error /
-      // auth-error message handlers in onmessage already kicked off a
-      // refresh-then-connect attempt). 4403 from policy violation,
-      // 4401 from missing creds, 1008 from policy violation as well.
-      if (event.code === 4403 || event.code === 4401 || event.code === 1008) {
-        return;
-      }
-
-      // MCP-865 (2026-05-14): cap reconnect attempts so a permanently
-      // broken WS server (wrong URL, removed Service, tab left open
-      // for days against a decommissioned environment) doesn't loop
-      // every 30s forever. Pre-subscribe failures (1006 before the
-      // handshake completed) suggest auth or proxy misconfiguration
-      // — give up faster. Post-subscribe (live → disconnected) is
-      // typically a transient network blip, so retry more generously.
-      const maxAttempts = subscriptionStarted ? 30 : 5;
-      if (reconnectAttempts >= maxAttempts) {
-        isClosed = true;
-        return;
-      }
-
-      const timeout = Math.min(1000 * 2 ** reconnectAttempts, 30000);
-      reconnectAttempts++;
-      reconnectTimeout = setTimeout(() => connect(), timeout);
-    };
-  };
-
-  connect();
-
-  return () => {
-    isClosed = true;
-    if (reconnectTimeout) clearTimeout(reconnectTimeout);
-    if (ws) ws.close();
-  };
+  return subscribeOverSharedSocket(query, variables, onEvent, dataKey);
 }
 
 export function subscribeExecution(
