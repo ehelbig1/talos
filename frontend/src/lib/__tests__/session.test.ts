@@ -6,11 +6,18 @@
  * by construction: three concurrent surfaces produced two or three
  * `RefreshToken` mutations, not one.
  */
+import { readFileSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { graphqlRequest } from "../graphqlClient";
 import { authedFetch } from "../authedFetch";
 import { refreshAccessToken } from "../auth";
-import { isAuthErrorMessage, refreshSession, seedCsrfCookie } from "../session";
+import {
+  currentRefreshEpoch,
+  isAuthErrorMessage,
+  refreshSession,
+  refreshSucceededSince,
+  seedCsrfCookie,
+} from "../session";
 
 type Init = RequestInit | undefined;
 
@@ -33,7 +40,9 @@ const refreshOk = JSON.stringify({
 
 /** A fetch stub: the first call on each surface is an auth failure, the
  *  refresh is SLOW (so concurrent callers overlap), the retry succeeds. */
-function installFetch(opts: { refreshFails?: boolean } = {}) {
+function installFetch(
+  opts: { refreshFails?: boolean; slowFirstGraphqlMs?: number } = {},
+) {
   let refreshCalls = 0;
   let csrfGets = 0;
   const seenRetry = new Set<string>();
@@ -64,6 +73,11 @@ function installFetch(opts: { refreshFails?: boolean } = {}) {
       // GraphQL: first call per query text fails with an auth error.
       if (!seenRetry.has(q)) {
         seenRetry.add(q);
+        // Optionally a SLOW auth failure: the request is on the wire with
+        // the stale cookie while another surface's refresh settles.
+        if (opts.slowFirstGraphqlMs) {
+          await new Promise((r) => setTimeout(r, opts.slowFirstGraphqlMs));
+        }
         return {
           ok: true,
           status: 200,
@@ -159,5 +173,86 @@ describe("session: one refresh home for every surface", () => {
     expect(isAuthErrorMessage("Workflow not found")).toBe(false);
     expect(isAuthErrorMessage(undefined)).toBe(false);
     expect(isAuthErrorMessage({ message: "Not authenticated" })).toBe(false);
+  });
+});
+
+describe("session: a refresh that settled while a request was on the wire is reused (package DS)", () => {
+  beforeEach(() => {
+    vi.stubGlobal("fetch", vi.fn());
+    vi.stubGlobal("document", { cookie: "talos_csrf_token=t" });
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  it("an auth failure that arrives AFTER another surface's refresh settled retries without a second mutation", async () => {
+    // The REST 401 is immediate and its refresh settles in 40 ms; the GraphQL
+    // request's auth failure lands 120 ms later, past `activeRefresh`'s
+    // lifetime. Before the epoch this minted a second RefreshToken (the
+    // 0.4 s rotation pair measured live on 2026-09-22); now it retries.
+    const m = installFetch({ slowFirstGraphqlMs: 120 });
+    const [gql, rest] = await Promise.all([
+      graphqlRequest<{ ping: boolean }>("{ ping }"),
+      authedFetch("/api/rest-thing"),
+    ]);
+    expect(gql).toEqual({ ping: true });
+    expect(rest.ok).toBe(true);
+    expect(m.refreshCalls()).toBe(1);
+  });
+
+  it("CONTROL: an auth failure with no successful refresh since the request was sent refreshes", async () => {
+    const m = installFetch();
+    const before = currentRefreshEpoch();
+    await graphqlRequest("{ ping }");
+    expect(m.refreshCalls()).toBe(1);
+    expect(currentRefreshEpoch()).toBe(before + 1);
+  });
+
+  it("a FAILED refresh does not advance the epoch, so a later auth failure refreshes rather than trusting a cookie that is not fresh", async () => {
+    const m = installFetch({ refreshFails: true, slowFirstGraphqlMs: 120 });
+    const before = currentRefreshEpoch();
+    const results = await Promise.allSettled([
+      graphqlRequest("{ ping }"),
+      authedFetch("/api/rest-thing"),
+    ]);
+    expect(results.every((r) => r.status === "rejected")).toBe(true);
+    expect(currentRefreshEpoch()).toBe(before);
+    // Two surfaces, two attempts: the second must NOT assume freshness from
+    // a refresh that failed.
+    expect(m.refreshCalls()).toBe(2);
+  });
+
+  it("a REST 401 whose refresh FAILS makes exactly one attempt, not one per arm", async () => {
+    // Pre-fix: the 401 arm refreshed (failed), then the body-text arm saw
+    // "Not authenticated" and refreshed again against a session already
+    // known to be dead.
+    const m = installFetch({ refreshFails: true });
+    await expect(authedFetch("/api/rest-thing")).rejects.toThrow();
+    expect(m.refreshCalls()).toBe(1);
+  });
+
+  it("the epoch decision is strictly 'a success happened since send'", () => {
+    expect(refreshSucceededSince(3, 4)).toBe(true);
+    expect(refreshSucceededSince(3, 3)).toBe(false);
+    // A stale capture from before a page-lifetime reset can never read as
+    // fresh either: the epoch only grows.
+    expect(refreshSucceededSince(4, 3)).toBe(false);
+  });
+});
+
+describe("session: every auth-recovery site goes through the epoch (textual pin)", () => {
+  // The two WebSocket sites cannot be driven here (no WebSocket harness), so
+  // they are pinned by TEXT, stated as such: a `recoverSession(epochAtConnect)`
+  // at each, and no surface left calling the bare refresh.
+  it("no request wrapper calls attemptTokenRefresh directly; the WebSocket sites recover from the connect-time epoch", () => {
+    // vitest runs with the frontend package as its cwd (vite root).
+    const gql = readFileSync("src/lib/graphqlClient.ts", "utf8");
+    const rest = readFileSync("src/lib/authedFetch.ts", "utf8");
+    expect(gql).not.toMatch(/attemptTokenRefresh/);
+    expect(rest).not.toMatch(/attemptTokenRefresh/);
+    expect(gql.match(/recoverSession\(epochAtConnect\)/g)?.length).toBe(2);
+    expect(gql.match(/recoverSession\(epochAtSend\)/g)?.length).toBe(1);
+    expect(rest.match(/recoverSession\(epochAtSend\)/g)?.length).toBe(2);
   });
 });

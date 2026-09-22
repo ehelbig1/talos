@@ -1,8 +1,9 @@
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { getCsrfToken } from "@/lib/csrf";
 import {
-  attemptTokenRefresh,
+  currentRefreshEpoch,
   isAuthErrorMessage,
+  recoverSession,
   seedCsrfCookie,
 } from "@/lib/session";
 import { config } from "@/config";
@@ -74,6 +75,11 @@ export async function graphqlRequest<T>(
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 15_000); // 15s timeout
 
+  // Captured BEFORE the request leaves: if a refresh succeeds while this
+  // request is on the wire with the stale cookie, its auth failure is
+  // recovered by retrying, not by a second refresh (package DS).
+  const epochAtSend = currentRefreshEpoch();
+
   let resp: Response;
   try {
     resp = await fetch(`${API_URL}/graphql`, {
@@ -123,8 +129,8 @@ export async function graphqlRequest<T>(
     const hasAuthError = errors.some((e) => isAuthErrorMessage(e.message));
 
     if (hasAuthError && !isRetry) {
-      const refreshed = await attemptTokenRefresh();
-      if (refreshed) {
+      const recovered = await recoverSession(epochAtSend);
+      if (recovered) {
         return graphqlRequest<T>(query, variables, true);
       }
     }
@@ -261,6 +267,9 @@ function createSubscription<T>(
     ws = new WebSocket(`${wsUrl}/ws`, "graphql-ws");
     subscriptionStarted = false;
     connectionStartTime = Date.now();
+    // Same rule as the HTTP wrappers: a refresh that succeeded since this
+    // socket was opened is what the reconnect needs, not another one.
+    const epochAtConnect = currentRefreshEpoch();
 
     ws.onopen = () => {
       reconnectAttempts = 0;
@@ -313,7 +322,7 @@ function createSubscription<T>(
           // mid-session. authedFetch already handles the equivalent
           // 401 path; this brings WS parity.
           ws?.close(4403, "Forbidden");
-          attemptTokenRefresh().then((refreshed) => {
+          recoverSession(epochAtConnect).then((refreshed) => {
             if (refreshed && !isClosed) {
               reconnectAttempts = 0;
               connect();
@@ -331,7 +340,7 @@ function createSubscription<T>(
 
           if (isAuthError) {
             ws?.close(4403, "Forbidden");
-            attemptTokenRefresh().then((refreshed) => {
+            recoverSession(epochAtConnect).then((refreshed) => {
               if (refreshed && !isClosed) {
                 reconnectAttempts = 0;
                 connect();

@@ -22,6 +22,20 @@
  * seed GET /graphql (a 405 in production) after the GraphQL one had moved to
  * /auth/csrf.
  *
+ * 2026-09-22, package DS — the SECOND gap, measured on the first dashboard
+ * load after DP deployed: two rotations 0.4 s apart, both successful,
+ * `within_grace` 0. The in-flight promise covers callers whose failures
+ * OVERLAP; it cannot cover a request that was already on the wire with the
+ * stale cookie when the refresh settled — its 401 arrives AFTER
+ * `activeRefresh` cleared, so it started a second, redundant refresh (one
+ * wasted mutation and one extra rotation per load after idle). The refresh
+ * EPOCH closes that gap: every caller captures `currentRefreshEpoch()` before
+ * it sends, and on an auth failure asks `recoverSession(epochAtSend)`, which
+ * answers "already fresh" without a network call when a refresh SUCCEEDED
+ * after the request was sent, and otherwise joins or starts one. The epoch
+ * advances on success only: a failed refresh must never make a later 401
+ * assume the cookie is fresh.
+ *
  * This module imports only `config` and `csrf` — never a request wrapper —
  * so it can never form a cycle with the callers it serves.
  */
@@ -69,6 +83,8 @@ export const REFRESH_TOKEN_MUTATION = `
 
 let activeRefresh: Promise<RefreshOutcome> | null = null;
 let activeSeed: Promise<void> | null = null;
+/** Advances by one each time a refresh SUCCEEDS; never on failure. */
+let refreshEpoch = 0;
 
 async function doRefresh(): Promise<RefreshOutcome> {
   try {
@@ -120,10 +136,51 @@ async function doRefresh(): Promise<RefreshOutcome> {
  */
 export function refreshSession(): Promise<RefreshOutcome> {
   if (activeRefresh) return activeRefresh;
-  activeRefresh = doRefresh().finally(() => {
-    activeRefresh = null;
-  });
+  activeRefresh = doRefresh()
+    .then((outcome) => {
+      if (outcome.refreshed) refreshEpoch += 1;
+      return outcome;
+    })
+    .finally(() => {
+      activeRefresh = null;
+    });
   return activeRefresh;
+}
+
+/**
+ * The number of refreshes that have SUCCEEDED in this page's lifetime.
+ * Capture it immediately before sending a request; hand it to
+ * `recoverSession` if that request fails authentication.
+ */
+export function currentRefreshEpoch(): number {
+  return refreshEpoch;
+}
+
+/**
+ * The decision, kept pure so it can be pinned: a request sent at
+ * `epochAtSend` already has a fresher cookie waiting if a refresh has
+ * succeeded since — retrying is enough, refreshing again is a wasted
+ * mutation and an extra rotation. Equality means nothing succeeded since
+ * (a failed refresh does not advance the epoch), so a refresh is needed.
+ */
+export function refreshSucceededSince(
+  epochAtSend: number,
+  epochNow: number,
+): boolean {
+  return epochNow > epochAtSend;
+}
+
+/**
+ * Recover a request that failed authentication: `true` means "retry now,
+ * the cookie is fresh". No network call when a refresh already succeeded
+ * after the request was sent; otherwise the shared in-flight refresh (or a
+ * new one). The caller's `isRetry` guard still bounds this to ONE recovery
+ * per request, so a cookie that is fresh and still refused surfaces the
+ * original failure rather than looping.
+ */
+export async function recoverSession(epochAtSend: number): Promise<boolean> {
+  if (refreshSucceededSince(epochAtSend, refreshEpoch)) return true;
+  return attemptTokenRefresh();
 }
 
 /** `refreshSession()` collapsed to the boolean the retry paths branch on. */
