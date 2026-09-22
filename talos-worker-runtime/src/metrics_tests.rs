@@ -383,6 +383,31 @@ mod tests {
                 );
             }
         }
+        // The hit-RATIO gauge is a reading, not a count: on a cold registry it
+        // must be ABSENT, never a 0.0 that reads as "0 % hit rate" before a
+        // single compile has happened (package DR, 2026-09-22 — measured on
+        // the live worker: absent from boot until the first compile, whose
+        // first sample was a true 0 hits over 4 misses).
+        assert!(
+            !cold.contains("wasm_cache_hit_ratio"),
+            "the hit-ratio gauge must not exist before the first compile:\n{cold}"
+        );
+
+        // Every InstancePre tier's eviction counter is seeded at 0 — an
+        // eviction is asked about with `increase(...)`, which matches nothing
+        // over an absent series. Presence per tier label, not value (the
+        // record test in this binary moves one of them).
+        for tier in crate::metrics::InstanceCacheTier::ALL {
+            let needle = format!(r#"tier="{}""#, tier.label());
+            assert!(
+                cold.lines().any(|l| {
+                    l.starts_with("wasm_instance_cache_evictions_total{") && l.contains(&needle)
+                }),
+                "idle worker must export wasm_instance_cache_evictions_total for tier {}:\n{cold}",
+                tier.label()
+            );
+        }
+
         // Nothing has run, so the started-side counter must NOT have been
         // seeded into existence: it would claim a dispatch that never happened.
         assert!(
@@ -497,13 +522,14 @@ mod tests {
         // `wasm_x_bucket`/`_sum`/`_count`; an up/down counter and a gauge
         // export their name unchanged.
         for expected in [
-            "wasm_executions_total{",             // u64_counter  wasm.executions
-            "wasm_executions_started_total{",     // u64_counter  wasm.executions.started
-            "wasm_errors_total{",                 // u64_counter  wasm.errors
-            "wasm_retries_total{",                // u64_counter  wasm.retries
-            "wasm_cache_hits_total{",             // u64_counter  wasm.cache.hits
-            "wasm_cache_misses_total{",           // u64_counter  wasm.cache.misses
-            "wasm_execution_duration_ms_bucket{", // f64_histogram wasm.execution.duration_ms
+            "wasm_executions_total{",               // u64_counter  wasm.executions
+            "wasm_executions_started_total{",       // u64_counter  wasm.executions.started
+            "wasm_errors_total{",                   // u64_counter  wasm.errors
+            "wasm_retries_total{",                  // u64_counter  wasm.retries
+            "wasm_cache_hits_total{",               // u64_counter  wasm.cache.hits
+            "wasm_cache_misses_total{",             // u64_counter  wasm.cache.misses
+            "wasm_instance_cache_evictions_total{", // u64_counter wasm.instance_cache.evictions
+            "wasm_execution_duration_ms_bucket{",   // f64_histogram wasm.execution.duration_ms
             "wasm_execution_duration_ms_sum{",
             "wasm_execution_duration_ms_count{",
             "wasm_instances_active{", // i64_up_down_counter wasm.instances.active
@@ -895,4 +921,38 @@ mod tests {
             );
         }
     }
+}
+
+/// The eviction recorder moves exactly the tier it was given by exactly the
+/// number removed, and a zero records nothing (an insert that evicted nothing
+/// must not touch the series).
+#[test]
+fn instance_cache_evictions_are_counted_per_tier_and_only_when_something_was_removed() {
+    use crate::metrics::{InstanceCacheTier, RuntimeMetrics};
+    // The exporter is process-global and installed once; same rule as the
+    // idle test above.
+    crate::metrics::init_telemetry_for_tests();
+    let m = RuntimeMetrics::new();
+    let value = |out: &str, tier: &str| -> f64 {
+        out.lines()
+            .find(|l| {
+                l.starts_with("wasm_instance_cache_evictions_total{")
+                    && l.contains(&format!(r#"tier="{tier}""#))
+            })
+            .and_then(|l| l.rsplit(' ').next())
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or_else(|| panic!("no seeded series for tier {tier}"))
+    };
+    let before = crate::metrics::get_prometheus_metrics();
+    let db0 = value(&before, "database");
+    let agent0 = value(&before, "agent");
+    m.record_instance_cache_evictions(InstanceCacheTier::Database, 0);
+    m.record_instance_cache_evictions(InstanceCacheTier::Database, 64);
+    let after = crate::metrics::get_prometheus_metrics();
+    assert_eq!(value(&after, "database") - db0, 64.0);
+    assert_eq!(
+        value(&after, "agent") - agent0,
+        0.0,
+        "a sibling tier must not move"
+    );
 }

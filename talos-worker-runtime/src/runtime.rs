@@ -1,5 +1,7 @@
 use anyhow::Result;
 use dashmap::DashMap;
+
+use crate::metrics::InstanceCacheTier;
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -1667,6 +1669,129 @@ impl RetryPolicy {
     }
 }
 
+/// Bounded eviction for one InstancePre tier cache.
+///
+/// When `cache.len() > max`, remove about a quarter of `max` entries in
+/// DashMap iteration order (random, deliberately NOT LRU — the bound has never
+/// been reached on the reference fleet, whose largest tier holds 35 modules
+/// against the default 256, so an ordering policy would be design without a
+/// measurement) and return how many were ACTUALLY removed, counted per key,
+/// so a concurrent remove is never reported as an eviction. At or below the
+/// bound nothing is touched and 0 is returned.
+///
+/// `max / 4` is floored at ONE: with `max < 4` the old arithmetic evicted zero
+/// entries, so a cap of 1–3 was a bound that bounded nothing (stated
+/// behaviour change; no shipped configuration sets the cap that low).
+pub(crate) fn evict_over_capacity<V>(cache: &DashMap<[u8; 32], V>, max: usize) -> usize {
+    if cache.len() <= max {
+        return 0;
+    }
+    let evict_count = (max / 4).max(1);
+    let keys_to_evict: Vec<[u8; 32]> = cache
+        .iter()
+        .take(evict_count)
+        .map(|entry| *entry.key())
+        .collect();
+    keys_to_evict
+        .into_iter()
+        .filter(|k| cache.remove(k).is_some())
+        .count()
+}
+
+#[cfg(test)]
+mod instance_cache_eviction_tests {
+    use super::evict_over_capacity;
+    use dashmap::DashMap;
+
+    fn key(i: u32) -> [u8; 32] {
+        let mut k = [0u8; 32];
+        k[..4].copy_from_slice(&i.to_le_bytes());
+        k
+    }
+
+    fn filled(n: u32) -> DashMap<[u8; 32], u32> {
+        let m = DashMap::new();
+        for i in 0..n {
+            m.insert(key(i), i);
+        }
+        m
+    }
+
+    #[test]
+    fn at_or_below_the_bound_nothing_is_removed() {
+        let m = filled(8);
+        assert_eq!(evict_over_capacity(&m, 8), 0);
+        assert_eq!(m.len(), 8);
+        assert_eq!(evict_over_capacity(&m, 9), 0);
+        assert_eq!(m.len(), 8);
+    }
+
+    #[test]
+    fn one_over_the_bound_removes_a_quarter_of_the_bound_and_reports_that_count() {
+        let m = filled(257);
+        let removed = evict_over_capacity(&m, 256);
+        assert_eq!(removed, 64);
+        // The count is what was REMOVED, not what was requested: the map
+        // agrees with the report.
+        assert_eq!(m.len(), 257 - 64);
+    }
+
+    #[test]
+    fn a_bound_under_four_still_evicts_one_entry() {
+        // Pre-DR: `max / 4` == 0 here, so the bound never removed anything.
+        let m = filled(3);
+        assert_eq!(evict_over_capacity(&m, 2), 1);
+        assert_eq!(m.len(), 2);
+    }
+
+    /// TEXTUAL pin, stated as such: the runtime's insert path counts every
+    /// eviction on the per-tier series and passes the tier `select_tier`
+    /// chose. No unit test can drive `cache_insert_instance_pre` — its value
+    /// type is a compiled `InstancePre` — so the wiring is read out of this
+    /// file's production half: everything AFTER this test module (the
+    /// `TalosRuntime` impl), so the needles quoted here do not vouch for
+    /// themselves.
+    #[test]
+    fn the_insert_path_counts_evictions_per_tier() {
+        let src = include_str!("runtime.rs");
+        // `rfind` over the doc line WITH its newlines: this test quotes the
+        // sentence as a literal, so a plain `find` would land inside the
+        // test module and let the needles below vouch for themselves.
+        let production = &src[src
+            .rfind("\n/// Performance metrics for WASM execution\n")
+            .expect("the production half starts at PerformanceMetrics")..];
+        assert_eq!(
+            production
+                .matches("metrics.record_instance_cache_evictions(tier, removed as u64);")
+                .count(),
+            1,
+            "the eviction count must reach the per-tier counter exactly once"
+        );
+        assert_eq!(
+            production
+                .matches("evict_over_capacity(cache, self.instance_cache_max_per_tier)")
+                .count(),
+            1
+        );
+        // Every tier arm of select_tier names its label, so the counter can
+        // never see a tier the seed did not: Http and Network share one.
+        for variant in [
+            "T::Minimal",
+            "T::Secrets",
+            "T::Filesystem",
+            "T::Messaging",
+            "T::CacheNode",
+            "T::Database",
+            "T::Governance",
+            "T::Agent",
+            "T::Trusted",
+        ] {
+            assert_eq!(production.matches(variant).count(), 1, "{variant}");
+        }
+        assert_eq!(production.matches("T::Network").count(), 2);
+    }
+}
+
 /// Performance metrics for WASM execution
 #[derive(Debug, Clone, Default)]
 pub struct PerformanceMetrics {
@@ -2731,27 +2856,28 @@ impl TalosRuntime {
     /// When the cache exceeds `instance_cache_max_per_tier`, ~25% of entries
     /// are removed (random eviction via DashMap iteration order).  This amortizes
     /// eviction cost: one O(n) scan per 25% growth instead of one per insert.
+    /// The removal itself is `evict_over_capacity`, pure over the map so a
+    /// test can drive it without a compiled component; this method owns the
+    /// two things that need the runtime — the per-tier counter and the log
+    /// line (package DR, 2026-09-22: an eviction used to be a log line only).
     fn cache_insert_instance_pre(
         &self,
+        tier: InstanceCacheTier,
         cache: &DashMap<[u8; 32], wasmtime::component::InstancePre<TalosContext>>,
         key: [u8; 32],
         value: wasmtime::component::InstancePre<TalosContext>,
     ) {
         cache.insert(key, value);
 
-        if cache.len() > self.instance_cache_max_per_tier {
-            let evict_count = self.instance_cache_max_per_tier / 4;
-            let keys_to_evict: Vec<[u8; 32]> = cache
-                .iter()
-                .take(evict_count)
-                .map(|entry| *entry.key())
-                .collect();
-            for k in keys_to_evict {
-                cache.remove(&k);
+        let removed = evict_over_capacity(cache, self.instance_cache_max_per_tier);
+        if removed > 0 {
+            if let Some(metrics) = &self.metrics {
+                metrics.record_instance_cache_evictions(tier, removed as u64);
             }
             tracing::info!(
+                tier = tier.label(),
                 cache_size = cache.len(),
-                evicted = evict_count,
+                evicted = removed,
                 max = self.instance_cache_max_per_tier,
                 "InstancePre cache eviction"
             );
@@ -2766,9 +2892,11 @@ impl TalosRuntime {
     ) -> Result<(
         &Linker<TalosContext>,
         &Arc<DashMap<[u8; 32], wasmtime::component::InstancePre<TalosContext>>>,
+        InstanceCacheTier,
     )> {
+        use crate::metrics::InstanceCacheTier as T;
         match *cap {
-            CapabilityWorld::Minimal => Ok((&self.minimal_linker, &self.minimal_cache)),
+            CapabilityWorld::Minimal => Ok((&self.minimal_linker, &self.minimal_cache, T::Minimal)),
             // Http and Network share the same linker because wasmtime_wasi::p2 doesn't
             // support granular per-interface linking. WASI socket access is instead gated
             // at the context level: allow_wasi_network=false for Http, true for Network.
@@ -2798,16 +2926,32 @@ impl TalosRuntime {
             // remain in place. Granular per-interface linking is the long-term fix and
             // tracked in `wasmtime_wasi::p2` upstream; until it lands, do not collapse
             // the three layers into "the inspector covers it."
-            CapabilityWorld::Http => Ok((&self.network_linker, &self.network_cache)),
-            CapabilityWorld::Network => Ok((&self.network_linker, &self.network_cache)),
-            CapabilityWorld::Secrets => Ok((&self.secrets_linker, &self.secrets_cache)),
-            CapabilityWorld::Filesystem => Ok((&self.filesystem_linker, &self.filesystem_cache)),
-            CapabilityWorld::Messaging => Ok((&self.messaging_linker, &self.messaging_cache)),
-            CapabilityWorld::Cache => Ok((&self.cache_node_linker, &self.cache_node_cache)),
-            CapabilityWorld::Database => Ok((&self.database_linker, &self.database_cache)),
-            CapabilityWorld::Governance => Ok((&self.governance_linker, &self.governance_cache)),
-            CapabilityWorld::Agent => Ok((&self.agent_linker, &self.agent_cache)),
-            CapabilityWorld::Trusted => Ok((&self.trusted_linker, &self.trusted_cache)),
+            CapabilityWorld::Http => Ok((&self.network_linker, &self.network_cache, T::Network)),
+            CapabilityWorld::Network => Ok((&self.network_linker, &self.network_cache, T::Network)),
+            CapabilityWorld::Secrets => Ok((&self.secrets_linker, &self.secrets_cache, T::Secrets)),
+            CapabilityWorld::Filesystem => Ok((
+                &self.filesystem_linker,
+                &self.filesystem_cache,
+                T::Filesystem,
+            )),
+            CapabilityWorld::Messaging => {
+                Ok((&self.messaging_linker, &self.messaging_cache, T::Messaging))
+            }
+            CapabilityWorld::Cache => Ok((
+                &self.cache_node_linker,
+                &self.cache_node_cache,
+                T::CacheNode,
+            )),
+            CapabilityWorld::Database => {
+                Ok((&self.database_linker, &self.database_cache, T::Database))
+            }
+            CapabilityWorld::Governance => Ok((
+                &self.governance_linker,
+                &self.governance_cache,
+                T::Governance,
+            )),
+            CapabilityWorld::Agent => Ok((&self.agent_linker, &self.agent_cache, T::Agent)),
+            CapabilityWorld::Trusted => Ok((&self.trusted_linker, &self.trusted_cache, T::Trusted)),
             CapabilityWorld::Unknown => {
                 anyhow::bail!("Cannot execute component with unknown capabilities")
             }
@@ -3970,7 +4114,7 @@ impl TalosRuntime {
         let allow_wasi_network = socket_grant(&cap, max_llm_tier, egress_scope);
 
         // Select the correct linker + cache for this tier.
-        let (linker, cache) = self.select_tier(&cap)?;
+        let (linker, cache, tier) = self.select_tier(&cap)?;
 
         // Build a secured store with execution context and pre-fetched secrets.
         let mut context = TalosContext::new(
@@ -4146,7 +4290,7 @@ impl TalosRuntime {
                 metrics.compilation_ms = compilation_start.elapsed().as_millis() as u64;
                 span.add_event("compilation_completed");
                 span.set_attribute_int("compilation_ms", metrics.compilation_ms as i64);
-                self.cache_insert_instance_pre(cache, module_hash_bytes, pre.clone());
+                self.cache_insert_instance_pre(tier, cache, module_hash_bytes, pre.clone());
                 pre
             }
         };
@@ -4548,7 +4692,7 @@ impl TalosRuntime {
         // execution path; raw sockets are still SSRF-gated by socket_addr_check.
         let allow_wasi_network =
             socket_grant(&cap, talos_workflow_job_protocol::LlmTier::Tier2, None);
-        let (linker, cache) = self.select_tier(&cap)?;
+        let (linker, cache, tier) = self.select_tier(&cap)?;
 
         let mut context = TalosContext::new(
             cap.clone(),
@@ -4609,7 +4753,7 @@ impl TalosRuntime {
             } else {
                 let component = self.compile_component_guarded(wasm_bytes, cap.clone())?;
                 let pre = linker.instantiate_pre(&component)?;
-                self.cache_insert_instance_pre(cache, cache_key, pre.clone());
+                self.cache_insert_instance_pre(tier, cache, cache_key, pre.clone());
                 pre
             }
         };
@@ -4841,7 +4985,7 @@ impl TalosRuntime {
             // letting a Tier-2 module bypass its `allowed_hosts` confinement by
             // running as a pipeline step. Do not re-inline the predicate here.
             let allow_wasi_network = socket_grant(&cap, max_llm_tier, egress_scope);
-            let (linker, cache) = self.select_tier(&cap)?;
+            let (linker, cache, tier) = self.select_tier(&cap)?;
 
             // Get or compile InstancePre.
             let instance_pre = {
@@ -4851,7 +4995,7 @@ impl TalosRuntime {
                     let component =
                         self.compile_component_guarded(&step.wasm_bytes, cap.clone())?;
                     let pre = linker.instantiate_pre(&component)?;
-                    self.cache_insert_instance_pre(cache, module_hash_bytes, pre.clone());
+                    self.cache_insert_instance_pre(tier, cache, module_hash_bytes, pre.clone());
                     pre
                 }
             };
@@ -5339,7 +5483,7 @@ impl TalosRuntime {
 
         for (module_id, wasm_bytes) in frequent_modules {
             let cap = crate::wit_inspector::inspect_component(&wasm_bytes).capability_world;
-            let (linker, cache) = match self.select_tier(&cap) {
+            let (linker, cache, tier) = match self.select_tier(&cap) {
                 Ok(pair) => pair,
                 Err(e) => {
                     tracing::warn!(
@@ -5361,7 +5505,7 @@ impl TalosRuntime {
                         hasher.update(&wasm_bytes);
                         let cache_key: [u8; 32] = hasher.finalize().into();
 
-                        self.cache_insert_instance_pre(cache, cache_key, pre);
+                        self.cache_insert_instance_pre(tier, cache, cache_key, pre);
                         cached_count += 1;
                         tracing::info!(
                             module_id,
@@ -5754,7 +5898,7 @@ impl TalosRuntime {
         // A component whose imports exceed `cap`'s linker tier will fail to
         // instantiate here, which is the desired fail-closed behaviour and
         // matches the JIT path. `Unknown` cap fails closed via `select_tier`.
-        let (linker, _instance_cache) = self.select_tier(&cap)?;
+        let (linker, _instance_cache, _tier) = self.select_tier(&cap)?;
         let pre = linker.instantiate_pre(&component)?;
         let instance = pre.instantiate_async(&mut store).await?;
         let run_func = instance.get_func(&mut store, "run").ok_or_else(|| {

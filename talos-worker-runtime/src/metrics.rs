@@ -701,6 +701,55 @@ pub(crate) const LLM_QUEUE_WAIT_BOUNDARIES_MS: &[f64] = &[
 
 pub(crate) const LLM_PROVIDER_LABELS: [&str; 4] = ["anthropic", "openai", "gemini", "ollama"];
 
+/// The ten InstancePre tier caches, one label value per cache — CLOSED at
+/// compile time. `TalosRuntime::select_tier` returns one of these beside the
+/// cache it picks, so the `tier` label on `wasm.instance_cache.evictions` can
+/// never carry a runtime string (package DR, 2026-09-22).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstanceCacheTier {
+    Minimal,
+    /// Http and Network share one linker and one cache (see `select_tier`).
+    Network,
+    Secrets,
+    Filesystem,
+    Messaging,
+    CacheNode,
+    Database,
+    Governance,
+    Agent,
+    Trusted,
+}
+
+impl InstanceCacheTier {
+    pub const ALL: [InstanceCacheTier; 10] = [
+        InstanceCacheTier::Minimal,
+        InstanceCacheTier::Network,
+        InstanceCacheTier::Secrets,
+        InstanceCacheTier::Filesystem,
+        InstanceCacheTier::Messaging,
+        InstanceCacheTier::CacheNode,
+        InstanceCacheTier::Database,
+        InstanceCacheTier::Governance,
+        InstanceCacheTier::Agent,
+        InstanceCacheTier::Trusted,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            InstanceCacheTier::Minimal => "minimal",
+            InstanceCacheTier::Network => "network",
+            InstanceCacheTier::Secrets => "secrets",
+            InstanceCacheTier::Filesystem => "filesystem",
+            InstanceCacheTier::Messaging => "messaging",
+            InstanceCacheTier::CacheNode => "cache_node",
+            InstanceCacheTier::Database => "database",
+            InstanceCacheTier::Governance => "governance",
+            InstanceCacheTier::Agent => "agent",
+            InstanceCacheTier::Trusted => "trusted",
+        }
+    }
+}
+
 /// The `(provider, outcome)` pairs a live code path can actually write, and
 /// therefore the exact set `seed_zero_series` pre-seeds at 0.
 ///
@@ -800,6 +849,10 @@ pub struct RuntimeMetrics {
     cache_hits: Counter<u64>,
     /// Component cache misses
     cache_misses: Counter<u64>,
+    /// InstancePre entries removed by the per-tier capacity bound, per tier.
+    /// Until 2026-09-22 an eviction was a log line only; a falling hit rate
+    /// had no series saying WHY.
+    instance_cache_evictions: Counter<u64>,
     /// Number of active instances
     active_instances: UpDownCounter<i64>,
     /// Total executions counter (cumulative)
@@ -995,6 +1048,14 @@ impl RuntimeMetrics {
             cache_misses: meter
                 .u64_counter("wasm.cache.misses")
                 .with_description("Component cache misses")
+                .build(),
+
+            instance_cache_evictions: meter
+                .u64_counter("wasm.instance_cache.evictions")
+                .with_description(
+                    "InstancePre entries evicted by the per-tier capacity bound \
+                     (WASM_INSTANCE_CACHE_MAX_PER_TIER), by tier",
+                )
                 .build(),
 
             active_instances: meter
@@ -1265,6 +1326,13 @@ impl RuntimeMetrics {
         }
         self.cache_hits.add(0, &[]);
         self.cache_misses.add(0, &[]);
+        // Every tier: an eviction is a capacity event an operator asks
+        // `increase(...)` about, and a tier that has never evicted must read
+        // 0, not absent. Ten closed labels, one line each.
+        for tier in InstanceCacheTier::ALL {
+            self.instance_cache_evictions
+                .add(0, &[KeyValue::new("tier", tier.label())]);
+        }
         // Both legs of `failures / (failures + requests)` — see the doc above.
         for provider in LLM_PROVIDER_LABELS {
             self.llm_requests
@@ -1311,12 +1379,28 @@ impl RuntimeMetrics {
         let hits = self.cache_hits_count.load(Ordering::Relaxed);
         let misses = self.cache_misses_count.load(Ordering::Relaxed);
         let total = hits + misses;
-        let ratio = if total == 0 {
-            0.0
-        } else {
-            hits as f64 / total as f64
-        };
-        self.cache_hit_ratio.record(ratio, &[]);
+        // `total` is at least 1 here — this call incremented one leg above —
+        // so the guard is for the shape a future refactor could produce, and
+        // it RETURNS rather than recording 0.0: a ratio over zero compiles is
+        // unknown, and unknown must render as an ABSENT sample, never as a
+        // 0 % hit rate (the misleading-report class; pinned by the idle test
+        // in `metrics_tests`, which requires the gauge absent on a cold
+        // registry).
+        if total == 0 {
+            return;
+        }
+        self.cache_hit_ratio.record(hits as f64 / total as f64, &[]);
+    }
+
+    /// Count InstancePre entries the per-tier capacity bound removed. Called
+    /// with the number ACTUALLY removed (per key, so a concurrent remove is
+    /// never reported as an eviction); zero records nothing.
+    pub fn record_instance_cache_evictions(&self, tier: InstanceCacheTier, removed: u64) {
+        if removed == 0 {
+            return;
+        }
+        self.instance_cache_evictions
+            .add(removed, &[KeyValue::new("tier", tier.label())]);
     }
 
     /// Increment active instances
@@ -1498,24 +1582,6 @@ impl RuntimeMetrics {
             .record(duration_ms, &[KeyValue::new("function", normalized)]);
         self.host_function_calls
             .add(1, &[KeyValue::new("function", normalized)]);
-    }
-
-    /// Calculate cache hit rate
-    /// Returns value between 0.0 and 1.0
-    ///
-    /// # Example
-    /// - 90 hits, 10 misses = 0.90 (90% hit rate)
-    /// - 0 hits, 0 misses = 0.0 (no data yet)
-    pub fn cache_hit_rate(&self) -> f64 {
-        let hits = self.cache_hits_count.load(Ordering::Relaxed);
-        let misses = self.cache_misses_count.load(Ordering::Relaxed);
-        let total = hits + misses;
-
-        if total == 0 {
-            return 0.0; // No cache operations yet
-        }
-
-        hits as f64 / total as f64
     }
 }
 
