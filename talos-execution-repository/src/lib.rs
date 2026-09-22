@@ -4012,26 +4012,16 @@ impl ExecutionRepository {
             )
             .await;
         }
-        // The no-`completed_at` variant stays here: it is not a terminal-time
-        // write (the row's duration is unknown), so it records `None`.
-        let sql = "UPDATE workflow_executions \
-             SET status = 'failed', error_message = $2 \
-             WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming') \
-             RETURNING NULL::float8";
-        let row = sqlx::query(sql)
-            .bind(execution_id)
-            .bind(error_message)
-            .fetch_optional(&self.db_pool)
-            .await?;
-        match row {
-            Some(row) => {
-                use sqlx::Row as _;
-                let duration_secs = row.try_get::<Option<f64>, _>(0)?;
-                talos_metrics::record_workflow_outcome("failure", duration_secs);
-                Ok(1)
-            }
-            None => Ok(0),
-        }
+        // The no-`completed_at` variant moved to the leaf too (2026-09-22):
+        // it carries the SAME dispatcher guard, and the guard is the rule, so
+        // keeping a second copy here meant the predicate lived in two places
+        // while the pin that claimed otherwise could see neither.
+        talos_execution_finalizer::fail_workflow_execution_unless_terminal_without_completed_at(
+            &self.db_pool,
+            execution_id,
+            error_message,
+        )
+        .await
     }
 
     /// Insert the GraphQL `testWorkflow` execution row: status 'running',

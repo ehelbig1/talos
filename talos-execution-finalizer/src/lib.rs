@@ -49,6 +49,36 @@ pub async fn fail_workflow_execution_unless_terminal(
     record("failure", row)
 }
 
+/// The same dispatcher-side guard, for a failure that is NOT a terminal-time
+/// write: the GraphQL resume / test setup paths fail a run BEFORE it ever
+/// started, so the row has no meaningful duration and `completed_at` stays
+/// NULL. Records the outcome with `None` — unknown is not zero seconds.
+///
+/// It lives here, beside its twin, because the GUARD is the rule and the
+/// rule has one home. Until 2026-09-22 this statement was inlined in
+/// `talos-execution-repository::fail_execution_unless_terminal`, so the
+/// `NOT IN ('completed', 'failed', 'cancelled', 'resuming')` predicate
+/// existed in two places — and the source pin that claimed otherwise could
+/// not see either of them, because its needle was one contiguous string and
+/// both are written across lines.
+pub async fn fail_workflow_execution_unless_terminal_without_completed_at(
+    pool: &PgPool,
+    execution_id: Uuid,
+    error_message: &str,
+) -> Result<u64> {
+    let row = sqlx::query(
+        "UPDATE workflow_executions \
+         SET status = 'failed', error_message = $2 \
+         WHERE id = $1 AND status NOT IN ('completed', 'failed', 'cancelled', 'resuming') \
+         RETURNING NULL::float8",
+    )
+    .bind(execution_id)
+    .bind(error_message)
+    .fetch_optional(pool)
+    .await?;
+    record("failure", row)
+}
+
 /// The STALE SWEEP closes a run nothing is driving any more (typically one a
 /// controller restart orphaned). Guard: `running` ONLY. A `resuming` row is
 /// owned by crash recovery and a `queued` one has not started, so the janitor
@@ -324,22 +354,33 @@ mod pins {
         ),
     ];
 
+    /// The POSITIVE half: every former copy still calls the home.
+    ///
+    /// The NEGATIVE half — "no former copy re-inlines the statement" — was
+    /// deleted on 2026-09-22 because it was PROVABLY UNFIREABLE, and the
+    /// measurement is worth keeping. It read
+    /// `!src.contains("UPDATE workflow_executions SET status = 'failed'")`;
+    /// that needle is one contiguous string and every such statement in this
+    /// workspace is written across lines with `\` continuations, so it
+    /// matched **zero** of the five statements that existed in two of the
+    /// five pinned files. Its companion
+    /// `assert_eq!(include_str!("lib.rs").matches(needle).count(), 1)` was
+    /// worse: the single match it counted was the `let needle = …` line
+    /// declaring it. A pin whose only evidence is itself.
+    ///
+    /// That half now lives in `scripts/lint-terminal-write-recorded.py`
+    /// leg (b), which reads the statements STATEMENT-AWARE through the
+    /// shared `scripts/lint_lib/ruststmt.py`, and keys on the dispatcher
+    /// GUARD rather than the columns — because the guard is what makes it
+    /// this finalizer rather than the engine's.
     #[test]
     fn the_workflow_failure_finalizer_has_one_home() {
-        let needle = "UPDATE workflow_executions SET status = 'failed'";
-        for (name, src) in FORMER_COPIES {
-            assert!(
-                !src.contains(needle),
-                "{name} re-inlines the dispatcher-side failure UPDATE"
-            );
-        }
         for (name, src) in &FORMER_COPIES[..4] {
             assert!(
                 src.contains("fail_workflow_execution_unless_terminal("),
                 "{name} no longer calls the failure home"
             );
         }
-        assert_eq!(include_str!("lib.rs").matches(needle).count(), 1);
     }
 
     /// The stale sweep was the eighteenth terminal writer: its own UPDATE,
@@ -363,15 +404,13 @@ mod pins {
         );
     }
 
+    /// The POSITIVE half, as above. The negative half moved to the lint on
+    /// 2026-09-22 as well — not because it was unfireable (this needle sits
+    /// on ONE line in the house style, so it did match real statements) but
+    /// because it was fireable by the LUCK of where the author wrapped the
+    /// SQL, and a rule that depends on that is one reflow from silent.
     #[test]
     fn the_completion_finalizer_has_one_home() {
-        let needle = "SET status = 'completed', output_data";
-        for (name, src) in FORMER_COPIES {
-            assert!(
-                !src.contains(needle),
-                "{name} re-inlines a completion UPDATE"
-            );
-        }
         for name in [
             "talos-actor-repository/src/lib.rs",
             "talos-workflow-repository/src/executions.rs",
@@ -383,10 +422,5 @@ mod pins {
                 "{name} no longer calls both completion homes"
             );
         }
-        assert_eq!(
-            include_str!("lib.rs").matches(needle).count(),
-            3,
-            "two statements plus this needle"
-        );
     }
 }
