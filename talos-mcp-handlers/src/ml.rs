@@ -14,7 +14,7 @@
 //! embedder never holds a connection.
 
 use super::types::JsonRpcResponse;
-use super::utils::{mcp_denied, mcp_error, mcp_failed, mcp_not_found, mcp_text};
+use super::utils::{mcp_denied, mcp_error, mcp_not_found, mcp_text};
 use super::McpState;
 use serde_json::Value;
 use std::sync::Arc;
@@ -314,6 +314,90 @@ impl DatasetOwnerRefusal {
     /// every call site used to build.
     fn response(&self, req_id: Option<Value>) -> JsonRpcResponse {
         talos_mcp::mcp_error_kind(req_id, -32000, self.kind, self.msg)
+    }
+}
+
+/// The caller-facing sentence for a model the registry did not return.
+///
+/// `resolve_by_id` / `resolve_by_name` carry the app-layer tenancy belt in
+/// SQL, so absent and foreign are ONE answer by construction — the surface
+/// must not become an id oracle. Kept byte-identical to what every call site
+/// used to build.
+const MODEL_NOT_FOUND: &str = "Model not found";
+
+/// The caller-facing sentence for a model lookup that did not ANSWER.
+///
+/// The second half of it is the point: a reply that merely said "not found"
+/// during a database incident sent an operator to look for a deletion that
+/// never happened. Wording taken verbatim from `get_model_card`, which made
+/// this split first (2026-09-08).
+const MODEL_LOOKUP_UNAVAILABLE: &str =
+    "Could not look up this model — the model registry is unavailable. This \
+     is NOT a statement that the model is absent; retry, and check \
+     controller logs.";
+
+/// A refusal from a model lookup, carrying BOTH the caller-facing message
+/// and what the lookup MEANT.
+///
+/// Same two halves, and for the same reason, as `DatasetOwnerRefusal` above:
+/// `Ok(None)` is an absent-or-foreign answer and `Err` is a read that did not
+/// answer. They get DIFFERENT sentences — unlike the dataset gate's two
+/// tenancy cases, these two are not an enumeration pair, and the whole defect
+/// was that the second was being reported as the first — and different
+/// [`talos_mcp::McpErrorKind`]s, so the instrument can tell a model nobody
+/// created from a registry that is down.
+///
+/// `Debug` is safe here and useful in tests: both fields are constants — a
+/// closed enum and one of two `&'static str`s — so nothing caller-supplied
+/// and nothing secret can reach a debug rendering.
+#[derive(Debug)]
+struct ModelLookupRefusal {
+    kind: talos_mcp::McpErrorKind,
+    msg: &'static str,
+}
+
+impl ModelLookupRefusal {
+    fn response(&self, req_id: Option<Value>) -> JsonRpcResponse {
+        talos_mcp::mcp_error_kind(req_id, -32000, self.kind, self.msg)
+    }
+}
+
+/// Classify ONE `ModelRegistry::resolve_by_*` read — the one home for
+/// "did the registry give me this model, and if not, why not".
+///
+/// Until 2026-09-22 six handlers wrote this as
+/// `let Ok(Some(model)) = … else { return mcp_error(…, "Model not found") }`,
+/// which puts a pool timeout, a projection drift and a renamed table in the
+/// SAME branch as "no such model" — and four of the six are MUTATING tools
+/// (`promote_model`, `set_policy`, `set_lifecycle`, `reset_shadow_window`),
+/// where that sentence sends an operator hunting a deletion mid-incident.
+///
+/// Generic over the read's error type ON PURPOSE: the `Err` arm is the reason
+/// this function exists, so it lives where a unit test drives it rather than
+/// at six call sites where nothing could.
+fn classify_model_lookup<T, E: std::fmt::Display>(
+    read: std::result::Result<Option<T>, E>,
+    tool: &str,
+) -> std::result::Result<T, ModelLookupRefusal> {
+    match read {
+        Ok(Some(model)) => Ok(model),
+        Ok(None) => Err(ModelLookupRefusal {
+            // `NotFound`, not `Denied`: the outcome table already took this
+            // decision for `ml_get_model_card` by name, and these are its
+            // siblings asking the identical question of the identical
+            // resolver. Both are `Declined` class, so nothing an alert reads
+            // moves; what moves is that the absent answer stops being
+            // reported as the `error` FALLBACK, which is a Finding.
+            kind: talos_mcp::McpErrorKind::NotFound,
+            msg: MODEL_NOT_FOUND,
+        }),
+        Err(e) => {
+            tracing::error!(error = %e, tool, "model lookup failed");
+            Err(ModelLookupRefusal {
+                kind: talos_mcp::McpErrorKind::Failed,
+                msg: MODEL_LOOKUP_UNAVAILABLE,
+            })
+        }
     }
 }
 
@@ -798,8 +882,12 @@ async fn handle_eval_model(
         Err(e) => return internal(req_id, "eval_model", &e),
     };
     // Resolve model + its dataset; ownership gate rides on the dataset.
-    let Ok(Some(models)) = ModelRegistry::resolve_by_id(&mut tx, model_id, user_id).await else {
-        return mcp_error(req_id, -32000, "Model not found");
+    let models = match classify_model_lookup(
+        ModelRegistry::resolve_by_id(&mut tx, model_id, user_id).await,
+        "eval_model",
+    ) {
+        Ok(m) => m,
+        Err(refusal) => return refusal.response(req_id),
     };
     // Effective k: explicit arg > the MODEL's configured k > default. Using
     // the model's own k (like the scheduled evaluator does) keeps the eval
@@ -975,8 +1063,12 @@ async fn handle_promote_model(
         Ok(tx) => tx,
         Err(e) => return internal(req_id, "promote_model", &e),
     };
-    let Ok(Some(model)) = ModelRegistry::resolve_by_id(&mut tx, model_id, user_id).await else {
-        return mcp_error(req_id, -32000, "Model not found");
+    let model = match classify_model_lookup(
+        ModelRegistry::resolve_by_id(&mut tx, model_id, user_id).await,
+        "promote_model",
+    ) {
+        Ok(m) => m,
+        Err(refusal) => return refusal.response(req_id),
     };
     if let Some(dataset_id) = model.dataset_id {
         if let Err(m) = require_dataset_owner(&svc, &mut tx, dataset_id, user_id).await {
@@ -1155,19 +1247,14 @@ async fn handle_get_model_card(
     // "Model not found", which during a database incident sends an operator to
     // look for a deletion that never happened (check 79's shape, and the same
     // split `require_dataset_owner` already makes above).
-    let model = match ModelRegistry::resolve_by_name(&mut tx, name, user_id).await {
-        Ok(Some(m)) => m,
-        Ok(None) => return mcp_not_found(req_id, -32000, "Model not found"),
-        Err(e) => {
-            tracing::error!(error = %e, model_name = %name, "get_model_card: model lookup failed");
-            return mcp_failed(
-                req_id,
-                -32000,
-                "Could not look up this model — the model registry is unavailable. This \
-                 is NOT a statement that the model is absent; retry, and check \
-                 controller logs.",
-            );
-        }
+    // The split this helper generalises was made HERE first (2026-09-08);
+    // routing it through the one home is what stops the seven from drifting.
+    let model = match classify_model_lookup(
+        ModelRegistry::resolve_by_name(&mut tx, name, user_id).await,
+        "get_model_card",
+    ) {
+        Ok(m) => m,
+        Err(refusal) => return refusal.response(req_id),
     };
     let versions = match ModelRegistry::list_versions(&mut tx, model.model_id).await {
         Ok(v) => v,
@@ -1352,7 +1439,7 @@ async fn handle_predict(
                 .to_string(),
             ),
         },
-        Err(talos_ml::ServeError::NotFound) => mcp_error(req_id, -32000, "Model not found"),
+        Err(talos_ml::ServeError::NotFound) => mcp_not_found(req_id, -32000, MODEL_NOT_FOUND),
         Err(talos_ml::ServeError::NotPromoted) => mcp_error(
             req_id,
             -32000,
@@ -1404,8 +1491,12 @@ async fn handle_set_policy(
         Ok(tx) => tx,
         Err(e) => return internal(req_id, "set_policy", &e),
     };
-    let Ok(Some(model)) = ModelRegistry::resolve_by_id(&mut tx, model_id, user_id).await else {
-        return mcp_error(req_id, -32000, "Model not found");
+    let model = match classify_model_lookup(
+        ModelRegistry::resolve_by_id(&mut tx, model_id, user_id).await,
+        "set_policy",
+    ) {
+        Ok(m) => m,
+        Err(refusal) => return refusal.response(req_id),
     };
     // Locality pin (RFC guard): auto_advance may route production
     // traffic; refuse a policy on a config whose fallback/baseline LLM
@@ -1442,7 +1533,7 @@ async fn handle_set_policy(
             ),
             Err(e) => internal(req_id, "set_policy commit", &e),
         },
-        Ok(false) => mcp_error(req_id, -32000, "Model not found"),
+        Ok(false) => mcp_not_found(req_id, -32000, MODEL_NOT_FOUND),
         Err(e) => internal(req_id, "set_policy", &e),
     }
 }
@@ -1475,8 +1566,12 @@ async fn handle_set_lifecycle(
         Ok(tx) => tx,
         Err(e) => return internal(req_id, "set_lifecycle", &e),
     };
-    let Ok(Some(model)) = ModelRegistry::resolve_by_id(&mut tx, model_id, user_id).await else {
-        return mcp_error(req_id, -32000, "Model not found");
+    let model = match classify_model_lookup(
+        ModelRegistry::resolve_by_id(&mut tx, model_id, user_id).await,
+        "set_lifecycle",
+    ) {
+        Ok(m) => m,
+        Err(refusal) => return refusal.response(req_id),
     };
     let Some(from) = talos_ml::LifecycleState::parse(&model.lifecycle_state) else {
         return internal(
@@ -1620,7 +1715,7 @@ async fn handle_teacher_audit(
             }))
             .unwrap_or_default(),
         ),
-        Err(talos_ml::TeacherAuditError::NotFound) => mcp_error(req_id, -32000, "Model not found"),
+        Err(talos_ml::TeacherAuditError::NotFound) => mcp_not_found(req_id, -32000, MODEL_NOT_FOUND),
         Err(talos_ml::TeacherAuditError::NoDataset) => {
             mcp_error(req_id, -32000, "Model has no dataset to audit against")
         }
@@ -1679,8 +1774,12 @@ async fn handle_reset_shadow_window(
     };
     // resolve_by_name is user-scoped — the tenancy gate; a foreign model
     // is indistinguishable from an absent one.
-    let Ok(Some(model)) = ModelRegistry::resolve_by_name(&mut tx, name, user_id).await else {
-        return mcp_error(req_id, -32000, "Model not found");
+    let model = match classify_model_lookup(
+        ModelRegistry::resolve_by_name(&mut tx, name, user_id).await,
+        "reset_shadow_window",
+    ) {
+        Ok(m) => m,
+        Err(refusal) => return refusal.response(req_id),
     };
     let new_epoch = match talos_ml::bump_shadow_epoch(&mut tx, model.model_id).await {
         Ok(e) => e,
@@ -1732,8 +1831,12 @@ async fn handle_disagreements(
         Ok(tx) => tx,
         Err(e) => return internal(req_id, "disagreements", &e),
     };
-    let Ok(Some(model)) = ModelRegistry::resolve_by_name(&mut tx, name, user_id).await else {
-        return mcp_error(req_id, -32000, "Model not found");
+    let model = match classify_model_lookup(
+        ModelRegistry::resolve_by_name(&mut tx, name, user_id).await,
+        "disagreements",
+    ) {
+        Ok(m) => m,
+        Err(refusal) => return refusal.response(req_id),
     };
     // Which classes are actually blocking promotion, so the queue can lead
     // with rows that can move a gate. Best-effort: no policy, no eval yet, or
@@ -2315,5 +2418,91 @@ mod eval_next_step_tests {
         })
         .decision()
         .is_some());
+    }
+}
+
+#[cfg(test)]
+mod model_lookup_tests {
+    use super::{classify_model_lookup, MODEL_LOOKUP_UNAVAILABLE, MODEL_NOT_FOUND};
+    use talos_mcp::McpErrorKind;
+
+    /// A model registry that did not ANSWER is not a model that is ABSENT.
+    /// This is the defect: six handlers wrote
+    /// `let Ok(Some(m)) = … else { return mcp_error(…, "Model not found") }`,
+    /// so a pool timeout and "no such model" were one branch.
+    #[test]
+    fn an_unreadable_registry_is_not_an_absent_model() {
+        let unreadable: std::result::Result<Option<u8>, &str> = Err("pool timeout");
+        let r = classify_model_lookup(unreadable, "set_policy")
+            .expect_err("an unreadable registry must refuse");
+        assert_eq!(r.kind, McpErrorKind::Failed);
+        assert_eq!(r.msg, MODEL_LOOKUP_UNAVAILABLE);
+
+        // Control: an ANSWERED read with no row IS an absent model, and the
+        // two must differ in BOTH halves — the sentence the caller reads and
+        // the kind the instrument records.
+        let absent: std::result::Result<Option<u8>, &str> = Ok(None);
+        let a =
+            classify_model_lookup(absent, "set_policy").expect_err("an absent model must refuse");
+        assert_eq!(a.kind, McpErrorKind::NotFound);
+        assert_eq!(a.msg, MODEL_NOT_FOUND);
+        assert_ne!(r.kind, a.kind);
+        assert_ne!(r.msg, a.msg);
+    }
+
+    /// The unavailable sentence must DISCLAIM absence in so many words. A
+    /// message that merely omits "not found" still reads as one to an
+    /// operator scanning a reply mid-incident.
+    #[test]
+    fn the_unavailable_sentence_says_it_is_not_a_claim_about_absence() {
+        assert!(MODEL_LOOKUP_UNAVAILABLE.contains("NOT a statement that the model is absent"));
+        assert!(!MODEL_LOOKUP_UNAVAILABLE.contains("Model not found"));
+        assert_eq!(MODEL_NOT_FOUND, "Model not found");
+    }
+
+    /// A model that IS there passes straight through — the classifier is a
+    /// gate, not a filter.
+    #[test]
+    fn a_resolved_model_passes_through() {
+        let found: std::result::Result<Option<&str>, &str> = Ok(Some("the-model"));
+        assert_eq!(
+            classify_model_lookup(found, "get_model_card").expect("a resolved model"),
+            "the-model"
+        );
+    }
+
+    /// Both refusals carry the same error CODE and the kind travels OUT OF
+    /// BAND (`error_kind` is `#[serde(skip)]`), so the split is an
+    /// operator-side distinction: a caller cannot use the code to tell an
+    /// unreadable registry from an absent model.
+    ///
+    /// The two TEXTS do differ, and deliberately — an operator holding the
+    /// reply needs to know the platform could not look. That is not an
+    /// existence oracle: the unavailable sentence says nothing about whether
+    /// the model exists, which is exactly what its wording is pinned on
+    /// above.
+    #[test]
+    fn the_kind_travels_out_of_band_and_the_code_does_not_split() {
+        let unreadable: std::result::Result<Option<u8>, &str> = Err("down");
+        let absent: std::result::Result<Option<u8>, &str> = Ok(None);
+        let a = classify_model_lookup(unreadable, "t")
+            .unwrap_err()
+            .response(None);
+        let b = classify_model_lookup(absent, "t")
+            .unwrap_err()
+            .response(None);
+        let code = |r: &talos_mcp::JsonRpcResponse| {
+            r.result.as_ref().expect("result")["errorCode"]
+                .as_i64()
+                .expect("errorCode")
+        };
+        assert_eq!(code(&a), -32000);
+        assert_eq!(code(&a), code(&b));
+        // Out of band: the kinds differ on the struct...
+        assert_ne!(a.error_kind, b.error_kind);
+        // ...and neither reaches the serialized reply.
+        let wire = |r: &talos_mcp::JsonRpcResponse| serde_json::to_string(r).expect("serialize");
+        assert!(!wire(&a).contains("error_kind"));
+        assert!(!wire(&b).contains("errorKind"));
     }
 }

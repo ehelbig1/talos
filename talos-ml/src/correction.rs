@@ -122,10 +122,18 @@ pub async fn resolve_disagreement(
                     .ok_or(ResolveError::NotFound)?;
                 let dataset_id = model.dataset_id.ok_or(ResolveError::NoDataset)?;
                 // Dataset-ownership belt: single NotFound for absent AND
-                // foreign so the surface can't enumerate dataset ids.
-                let tenancy = match dataset.dataset_tenancy(&mut tx, dataset_id).await {
-                    Ok(t) if t.user_id == user_id => t,
-                    _ => return Err(ResolveError::NotFound),
+                // foreign so the surface can't enumerate dataset ids. That
+                // argument covers `Ok(None)` vs `Ok(foreign)` and says
+                // NOTHING about `Err` — which is why this reads the
+                // three-valued `lookup_dataset_tenancy` rather than
+                // `dataset_tenancy`, whose own `ok_or_else` folds an absent
+                // dataset into `Err` and left the wildcard below reporting a
+                // pool timeout as "Disagreement not found or already
+                // handled" (2026-09-22).
+                let tenancy = match dataset.lookup_dataset_tenancy(&mut tx, dataset_id).await {
+                    Ok(Some(t)) if t.user_id == user_id => t,
+                    Ok(_) => return Err(ResolveError::NotFound),
+                    Err(e) => return Err(ResolveError::Internal(e)),
                 };
                 // Reject a label outside the dataset's vocabulary. An EMPTY
                 // vocabulary accepts anything — a dataset with no labelled rows

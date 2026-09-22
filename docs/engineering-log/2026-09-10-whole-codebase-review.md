@@ -5599,3 +5599,165 @@ caught, caught, caught, caught.
 Zero added database work. No new query, no new await, on any path. The
 classifier is a `match`; each counter is one atomic, and the arm counter
 sits on a path that was already writing a row.
+
+## Package DK — a registry that could not answer said the model was gone (2026-09-22)
+
+#789 wrote the finding down and left it:
+
+> The nine `"Model not found"` sites in `ml.rs` were NOT marked `NotFound`
+> and this is the sharpest limit of that package: they are written
+> `let Ok(Some(m)) = … else`, which routes a READ FAILURE into the
+> not-found branch, so marking them would assert a determinate negative in
+> the instrument. The instrument cannot be more precise than the handler's
+> own read.
+
+That is exactly right, and it is also the reason the fix is not "mark them":
+the read has to be split first.
+
+### The population, re-measured
+
+Nine is the count of `"Model not found"` REPLIES. Statement-aware, the
+collapse is **six**:
+
+| handler | resolver | mutating? |
+|---|---|---|
+| `eval_model` | `resolve_by_id` | no |
+| `promote_model` | `resolve_by_id` | **yes** |
+| `set_policy` | `resolve_by_id` | **yes** |
+| `set_lifecycle` | `resolve_by_id` | **yes** |
+| `reset_shadow_window` | `resolve_by_name` | **yes** |
+| `disagreements` | `resolve_by_name` | no |
+
+The other three replies are correctly-typed service errors, and
+`get_model_card` had already made the split alone on 2026-09-08 — which is
+why the wording this package standardises on is its wording, verbatim.
+
+Four of the six are mutating. That is what decides the severity: "Model not
+found" during a promotion, mid-incident, sends an operator to look for a
+deletion nobody performed.
+
+### One layer down, and one false alarm
+
+Sweeping `talos-ml` for the same shape — a `_ =>` arm returning a
+NotFound-ish error over a scrutinee that is a `Result` — returns three
+sites. Two are the same defect:
+
+- `correction.rs:128`, reaching the caller as *"Disagreement not found or
+  already handled"*.
+- `teacher_audit.rs:578`, reaching the caller as *"Model not found"*.
+
+The third, `provision.rs:202`, looks identical and is **correct**: its
+scrutinee is `actor_row`, an already-resolved `Option`, because the `Err`
+was propagated by a `?` on the line above. It must not be "fixed", which is
+why it is written down here rather than left for the next sweep to
+rediscover.
+
+### The fix that would have been wrong
+
+The obvious repair at the two service sites is to split the wildcard in
+place:
+
+```rust
+Ok(t) if t.user_id == user_id => t,
+Ok(_) => return Err(ResolveError::NotFound),
+Err(e) => return Err(ResolveError::Internal(e)),
+```
+
+That is a regression. `dataset_tenancy` is itself two-valued — its body is
+`lookup_dataset_tenancy(...).await?.ok_or_else(|| anyhow!("dataset not
+found"))` — so an ABSENT dataset arrives as `Err`, and the split above would
+turn it into an internal error. Both belts now read the three-valued
+`lookup_dataset_tenancy` instead, which is the shape `require_dataset_owner`
+has used in the handler crate since 2026-09-07.
+
+This is the second package running where the first reading of a fix was
+refuted by reading one function deeper. The habit that catches it is cheap:
+before splitting an `Err`, open the callee and ask which of its own answers
+are already folded into it.
+
+### What is deliberately not changed
+
+**The tenancy ambiguity.** `resolve_by_id` / `resolve_by_name` carry the
+app-layer tenancy belt in SQL, so absent and foreign are one `None` by
+construction, and the reply must keep them that way or the surface becomes
+an id oracle. Every test here carries a foreign-row control for exactly
+that.
+
+**`NotFound` versus `Denied` for that one answer.** There is a real argument
+that a tenancy-collapsed answer is `Denied` — the enum's own doc says so,
+and `DatasetOwnerRefusal` uses `Denied` for the identical collapse. But the
+outcome table reasoned `NotFound` for `ml_get_model_card` **by name**, both
+are `Declined` class, and reopening it would be a second behaviour change
+riding along inside a package about something else. These six are its
+siblings asking the identical question of the identical resolver; they get
+its answer.
+
+**`serve.rs`'s two belts.** They already write `Ok(_)` and `Err(_)` as
+separate arms and send both to `NotAvailable` — a documented coarse signal
+that degrades the caller to the LLM and asserts nothing about absence. That
+is a visible, argued choice, not an accidental collapse.
+
+### The instrument moves, the wire does not
+
+Every site keeps `-32000` and its sentence; `error_kind` is
+`#[serde(skip)]`. What changes is which series an operator reads:
+
+- the six absent answers move from the `error` FALLBACK — a **Finding** —
+  to `not_found`, which is Declined. A model nobody created is not a
+  platform failure.
+- the three typed arms are classified the same way, for the same reason.
+- the unreadable answer becomes `failed`, and its sentence says in so many
+  words that it is not a statement about absence.
+
+### Guards
+
+The classifier is generic over the read's error type on purpose: the `Err`
+arm is the entire reason it exists, so it belongs where a unit test can
+drive it rather than at six call sites where nothing could.
+
+A unit test cannot see whether a CALL SITE still uses it, which is checks
+74b/79b's stated limit, so the DB binary drives the production
+`controller::mcp::ml::dispatch` for `ml_set_policy` — one of the four
+mutating tools — with `ml_models` renamed out from under a live pool, and
+both production services with `ml_datasets` renamed. Renaming is what makes
+one read fail while the session, the transaction and every other query keep
+working.
+
+Each has two controls: a foreign row still yields the single NotFound, and
+the same call served once the table is back — so the refusal under test was
+the read, not the request.
+
+The textual pin strips column-0 `#[cfg(test)]` modules before counting. It
+had to: this package's own tests call the classifier five times and its doc
+comments quote the shape it replaced, so the first version of the pin
+counted twelve where seven was the claim and failed for entirely the wrong
+reason.
+
+### The mutation that did not move, and what it measured
+
+Twelve mutations, eleven caught. The twelfth removed the correction belt's
+`t.user_id == user_id` guard — a tenancy clause — and every test stayed
+green. That is the point at which it is tempting to write "survivor" and
+move on, or to invent a mechanism.
+
+What was measured instead, under the mutation: the call still returns
+`NotFound`, `ml_examples` for the foreign dataset holds **zero** rows, and
+the disagreement is still `pending`. So no cross-tenant write happened and
+no state moved; something downstream refuses as well. The mutation is inert
+on this path rather than dangerous on it — the same shape as the survivor in
+the approval-finality package, where a scoped transaction's RLS policy was a
+genuine second guard the tests could not tell apart from the first.
+
+It is also a clause this package did not introduce: the pre-fix wildcard
+carried the same owner guard, and the change here is only what happens to
+`Err`. The honest disposition is therefore to record it, and to put the two
+assertions it *would* have to move — no row in the foreign dataset, status
+unchanged — into the control anyway, where they guard the day the
+downstream refusal stops holding.
+
+Three probes were needed to get there: one to see the error under the
+mutation, one to confirm the fixture really did point the model at a foreign
+dataset owned by someone else (it did), and one to read the write and the
+status. The first two were me guessing at mechanisms; only the third
+answered the question that mattered, which was never "why is it NotFound"
+but "did anything cross a tenant boundary".
