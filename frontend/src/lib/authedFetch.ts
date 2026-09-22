@@ -4,108 +4,21 @@
  * so that CSRF tokens and credentials are always included.
  */
 
-import { config } from "@/config";
 import { getCsrfToken } from "@/lib/csrf";
+import {
+  attemptTokenRefresh,
+  ensureCsrfCookie,
+  isAuthErrorMessage,
+} from "@/lib/session";
+// Re-exported so thin fetch helpers keep their import path (`@/lib/authedFetch`).
+export { ensureCsrfCookie };
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 
-const API_URL = config.apiUrl || "";
-
-let activeSeedPromise: Promise<void> | null = null;
-let activeRefreshPromise: Promise<boolean> | null = null;
-
-async function doTokenRefresh(): Promise<boolean> {
-  try {
-    const mutation = `
-      mutation RefreshToken {
-        refreshToken {
-          user {
-            id
-          }
-        }
-      }
-    `;
-
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-    };
-    const csrfToken = getCsrfToken();
-    if (csrfToken) {
-      headers["X-CSRF-Token"] = csrfToken;
-    }
-
-    const resp = await fetch(`${API_URL}/graphql`, {
-      method: "POST",
-      headers,
-      credentials: "include",
-      cache: "no-store",
-      body: JSON.stringify({
-        query: mutation,
-      }),
-    });
-
-    const text = await resp.text();
-    let json: Record<string, unknown>;
-    try {
-      json = JSON.parse(text);
-    } catch {
-      return false;
-    }
-    const data = json.data;
-    return (
-      !json.errors &&
-      typeof data === "object" &&
-      data !== null &&
-      "refreshToken" in data
-    );
-  } catch {
-    return false;
-  }
-}
-
-async function attemptTokenRefresh(): Promise<boolean> {
-  if (activeRefreshPromise) return activeRefreshPromise;
-  activeRefreshPromise = doTokenRefresh().finally(() => {
-    activeRefreshPromise = null;
-  });
-  return activeRefreshPromise;
-}
-
-// Seed the CSRF cookie by GET-ing /auth/csrf — the dedicated endpoint that
-// builds its Set-Cookie header by hand (see graphqlClient.seedCsrfCookie for
-// the full history). This helper used to GET /graphql, which is 405 in
-// production and sets no cookie, so the first REST call from a fresh session
-// went out with no X-CSRF-Token and failed CSRF — the GraphQL client had
-// already moved to /auth/csrf; this one had not.
-async function seedCsrfCookie(): Promise<void> {
-  if (activeSeedPromise) return activeSeedPromise;
-  activeSeedPromise = (async () => {
-    try {
-      await fetch(`${API_URL}/auth/csrf`, {
-        method: "GET",
-        credentials: "include",
-      });
-    } catch {
-      // Best-effort — if this fails the subsequent request surfaces a clear error.
-    }
-  })().finally(() => {
-    activeSeedPromise = null;
-  });
-  return activeSeedPromise;
-}
-
-/**
- * Make sure the CSRF cookie exists before a state-changing REST call.
- * Exported so thin fetch helpers that keep their own response-handling
- * semantics (e.g. the watch-channel panels, which read `body.success` off
- * non-2xx ApiJson envelopes and so cannot use `authedFetch`'s throw-on-!ok
- * contract) still seed through the ONE correct endpoint instead of
- * re-deriving it.
- */
-export async function ensureCsrfCookie(): Promise<void> {
-  if (!getCsrfToken()) {
-    await seedCsrfCookie();
-  }
-}
+// The CSRF seed, the token refresh and the auth-error match live in ONE home
+// (`session.ts`, 2026-09-22). This file's own copies had already drifted from
+// `graphqlClient.ts`'s once (they seeded from `/graphql`, a 405 in production,
+// after the GraphQL client had moved to `/auth/csrf`), and their separate
+// in-flight promise let the two wrappers refresh concurrently.
 
 /**
  * A fetch wrapper that handles CSRF, Auth cookies, 401 retries, and error sanitization.
@@ -163,12 +76,7 @@ export async function authedFetch(
   if (!resp.ok) {
     const text = await resp.text();
     // Check if the response is actually an auth error message from the backend
-    if (
-      !isRetry &&
-      (text.includes("Authentication required") ||
-        text.includes("Not authenticated") ||
-        text.includes("expired"))
-    ) {
+    if (!isRetry && isAuthErrorMessage(text)) {
       const refreshed = await attemptTokenRefresh();
       if (refreshed) {
         return authedFetch(url, options, true);
