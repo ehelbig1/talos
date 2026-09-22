@@ -6550,65 +6550,52 @@ arm ignoring the first attempt, D7 a WebSocket site back on the bare refresh
 Recorded, not changed: an anonymous page load still issues one doomed
 `refreshToken` with no cookie (the server writes no audit row for it), and
 `me` fires twice on load in dev under StrictMode.
-## Package DR — the worker cache, measured, and what was left of it (2026-09-22)
 
-The brief carried two claims about `talos-worker-runtime/src/metrics.rs`:
-the hit-ratio gauge reads 0.0 before the first compile, and the InstancePre
-eviction is a log line only. The first was measured before anything was
-designed and it does not hold.
+## Package DT — 2FA login had never worked (2026-09-22)
 
-| Prometheus, worker boot 18:06:24Z | |
+Reported by the operator as "2FA does not appear to be working", then as
+the browser's error text: `Unknown type "VerifyTwoFactorInput"`.
+
+| Measured, live | |
 |---|---|
-| `wasm_cache_hit_ratio` 18:06:30 → 18:07:30 | ABSENT (no sample) |
-| first sample, 18:07:45 | 0 — `wasm_cache_hits_total` 0, `wasm_cache_misses_total` 4 |
-| `record_compilation`'s `total == 0` arm | unreachable: the increment precedes the read |
+| `login_success` rows 19:26–19:32Z | 8 |
+| `user_sessions` created, `second_factor_verified` | 8, all `false` (pending) |
+| `talos_auth_2fa_attempts_total{status=success|failure}` | 0 / 0 |
+| `admin_event_log` `2fa_enabled` | 2026-09-18 16:29 (the CP/CO day) |
+| live schema `__type(name: "VerifyTwoFactorInput")` | null; `verifyTwoFactor(input: Verify2FAInput!)` |
+| bare inline documents under `frontend/src` | 53, 1 invalid |
 
-So the gauge is a reading that appears with the first compile, and its
-first value was correct. The arm that would have recorded a false 0.0 could
-never run. It now `return`s instead of recording, so a future refactor that
-makes it reachable produces an ABSENT sample and not a 0 % hit rate, and the
-cold-registry test pins the gauge absent. The one thing that did assert a
-determinate 0.0 for "no data yet" — `cache_hit_rate()` — had zero callers
-and is deleted.
+The prompt is shown, the code is submitted, and the mutation dies at schema
+validation: the frontend names an input type that does not exist. `git log
+-S` puts both spellings at `8f13f1e9` (2026-05-18), the commit where the
+file's history begins, and #519 (2026-07-19) rewrote the mutation string
+and kept the wrong name. So the 2FA login path has been broken for at least
+four months and was reachable by nobody: CO measured one user and zero TOTP
+enrolments on 2026-09-18, and the first password login by an enrolled user
+was today.
 
-The eviction claim held. `cache_insert_instance_pre` removed a quarter of a
-tier in DashMap iteration order and logged it; nothing counted it, so a
-falling `LowCacheHitRate` had no series saying whether capacity was the
-cause. Now:
+Why the repository could not see it: codegen (`documents: "src/**/*.{ts,
+tsx,graphql}"`) plucks `gql`-tagged literals and `.graphql` files and
+validates them against `schema.graphql`; CI gates the regenerated output.
+The auth documents are BARE template literals — no tag — so they are
+neither plucked nor validated, and the component test mocks the function.
 
-- `evict_over_capacity<V>(cache, max) -> usize` is pure over the map and
-  returns the number ACTUALLY removed (per key), so a test drives it with
-  `DashMap<[u8; 32], u32>` and no compiled component;
-- `wasm_instance_cache_evictions_total{tier}` is recorded at the one insert
-  path; `tier` is `InstanceCacheTier`, a closed enum `select_tier` returns
-  beside the cache it picks (ten caches — Http and Network share one), all
-  ten seeded at 0;
-- `max / 4` is floored at one: with a cap under four the old arithmetic
-  evicted nothing, a bound that bounded nothing (stated; no shipped
-  configuration sets the cap that low).
+The fix is one token. The guard is `inline_documents.test.ts`: a scanner
+over every `.ts`/`.tsx` under `src/` (generated and tests excluded) that
+strips comments — a backticked phrase in prose ("the `mutation
+RefreshToken`") reads as a document otherwise, the one false positive the
+first scan produced — extracts bare literals opening with an operation
+keyword and a selection, skips interpolated ones (none exist), and
+validates each with graphql-js against the snapshot. A floor of 40 on the
+measured 53 keeps it from passing over a scan that matched nothing. Two
+self-tests drive the extraction and validation on a fixture that carries
+the defect, a valid sibling, an interpolated literal and a comment mention.
 
-Latent on this fleet by a wide margin: the largest tier holds 35 modules
-(`http-node`) against the default cap of 256. The first "0 evictions in the
-worker's life" measurement was itself wrong — `docker logs talos-worker`
-returns nothing because the container is `talos-worker-1` — and the
-conclusion stands on the arithmetic, not the log.
+On the pre-fix tree the population test fails naming
+`src/lib/auth.ts: VerifyTwoFactor: Unknown type "VerifyTwoFactorInput"`.
 
-Deliberately not done: an ordering policy (LRU) — design without a
-measurement; an alert — no baseline; recording compile hit/miss on the
-failure arms — `PerformanceMetrics.cache_hit` is a `bool`, so a failure that
-happens BEFORE the cache lookup would record a false miss, and the bias is
-the failure share, 110 of 34 371 module runs in 30 days (< 0.4 %); deleting
-`wasm_cache_hit_ratio`, exported and read by one sentence in
-`docs/deployment.md` — one series, harmless, now documented as
-absent-until-first-compile.
-
-Guards: three tests on `evict_over_capacity` (at or below the bound,
-quarter-of-the-bound with the map agreeing with the count, the floor); the
-recorder moving exactly the tier by exactly the count with a sibling
-unmoved; the cold registry exporting all ten seeds and NOT the gauge; the
-exported-name pin; a textual pin (stated as such) that the insert path
-records per tier and every `select_tier` arm names its tier. That pin's
-first draft matched its own needle: `find` on the doc sentence landed on the
-test's string literal, above the production code, and counted the needle
-twice; `rfind` over the doc line with its surrounding newlines, which a
-literal cannot contain, fixed it.
+Deliberately not done: tagging the six documents with `gql` so codegen
+covers them — that regenerates `graphql.ts` for six operations the app
+calls imperatively, and the test covers the CLASS where tags would cover
+the six. Recorded: the eight pending sessions expire on their own; no
+account or session row was changed.

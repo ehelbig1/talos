@@ -82,9 +82,17 @@ export async function login(
   return result.login;
 }
 
+// The documents in this file are bare template literals — no `gql` tag — so
+// graphql-codegen never plucks or validates them. Until 2026-09-22 this one
+// named its input `VerifyTwoFactorInput`; the schema has called it
+// `Verify2FAInput` since at least 2026-05-18, so every 2FA login died at
+// schema validation before the code reached the verifier (0 server-side
+// attempts against 8 pending sessions on the first enrolled login). Every
+// bare document in `src/` is now validated against `schema.graphql` by
+// `__tests__/inline_documents.test.ts`.
 export async function verifyTwoFactor(code: string): Promise<User> {
   const mutation = `
-    mutation VerifyTwoFactor($input: VerifyTwoFactorInput!) {
+    mutation VerifyTwoFactor($input: Verify2FAInput!) {
       verifyTwoFactor(input: $input) {
         user {
           id
