@@ -6599,3 +6599,42 @@ covers them — that regenerates `graphql.ts` for six operations the app
 calls imperatively, and the test covers the CLASS where tags would cover
 the six. Recorded: the eight pending sessions expire on their own; no
 account or session row was changed.
+
+## Package DU — the WebSocket lane has series (2026-09-22)
+
+Measured on the 2026-09-22 survey: `talos-ws-auth` — the cookie-bearer
+surface behind `/ws` — had nine refusal or close arms and no metric of any
+kind, while the three sibling bearer surfaces (login, API key, MCP token) had
+each been instrumented in September. One dashboard load authenticated three
+sockets in 400 ms, visible only as three INFO lines.
+
+| Arm (pre-DU) | Then | Now |
+|---|---|---|
+| Origin missing (production) / malformed / not allowed | WARN, no counter | `origin_missing` / `origin_malformed` / `origin_not_allowed`, WARN under `talos_audit` |
+| no cookie / invalid token / `sub` not a UUID | WARN at verify time, refusal at init | held until `connection_init`; `no_token` DEBUG, the other two WARN under `talos_audit` |
+| first frame not `connection_init` | WARN `ws_protocol_violation` | same `event_kind`, counted |
+| no init within 30 s / client left before init | WARN `ws_init_not_received` | same `event_kind`, counted, with the pending refusal as a field |
+| ack sent | INFO | `authenticated`, counted; `talos_ws_active_sessions` +1 while the guard lives |
+| session end | INFO on expiry only | `token_expired` / `client_terminated` / `stream_ended` |
+| non-subscription over `/ws`; pre-2FA subscribe | `talos_audit` WARN | counted on `talos_ws_operations_total`; `started` beside them as the denominator |
+
+Design decisions. The two classifiers are pure functions so every arm is a
+unit test without a socket or an `AuthService` (the verifier is a closure
+reduced to `(sub, is_2fa_verified, exp)`). One report site owns the count and
+the log level, AX's shape; a cookieless socket is DEBUG because there is
+nothing to guess with and the counter carries it. The auth verdict is HELD
+rather than reported at verify time: the outcome is what the socket ENDS as,
+and a cookieless client that never sends `connection_init` is
+`init_not_received`, not `no_token` — the pending refusal rides along as a
+log field so the operator loses nothing. The active-sessions gauge is a Drop
+guard, so a session that ends by deadline, transport error, client close or
+a panic all release it. No alert: the series have no baseline yet.
+
+Guards: five classifier tests, the metrics seed/recorder test extended (15
+seeds, each recorder moves exactly its own value, the gauge follows the guard
+both ways), and a textual pin — stated as such — over the production half of
+`talos-ws-auth/src/lib.rs`: one report site with all nine outcomes reachable,
+two session-end arms, three operation records, one guard. No test drives a
+real socket end to end; the workspace has no WebSocket client harness, and
+the live read after deploy (one dashboard load → three `authenticated`, three
+`started`, gauge 3) is the wiring's proof.

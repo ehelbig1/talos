@@ -15,6 +15,7 @@ serde_json.workspace = true
 talos-api = { path = "../talos-api" }
 talos-auth = { path = "../talos-auth" }
 talos-config = { path = "../talos-config" }
+talos-metrics = { path = "../talos-metrics" }
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
 tracing.workspace = true
 uuid.workspace = true

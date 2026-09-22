@@ -325,6 +325,16 @@ samples its Postgres connection pool every 15s:
 | `talos_db_pool_in_use_connections` | Gauge | Connections currently checked out |
 | `talos_db_pool_max_connections` | Gauge | Configured pool ceiling (`DB_MAX_CONNECTIONS`) |
 
+The WebSocket lane (`/ws`, cookie-authenticated GraphQL subscriptions) is
+instrumented since 2026-09-22 (package DU):
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `talos_ws_handshakes_total{outcome}` | Counter | One per socket at the handshake's exit: `authenticated`, the three Origin refusals (`origin_missing` / `origin_malformed` / `origin_not_allowed` — the CSWH signal), `no_token` / `invalid_token` / `invalid_user_id` (connection_init without a usable cookie), `protocol_violation`, `init_not_received`. All nine seeded at 0 |
+| `talos_ws_session_ends_total{reason}` | Counter | `token_expired` (the stolen-cookie exposure bound firing), `client_terminated`, `stream_ended`; seeded |
+| `talos_ws_operations_total{outcome}` | Counter | `started`, `refused_non_subscription`, `refused_pre_second_factor`; seeded |
+| `talos_ws_active_sessions` | Gauge | Authenticated sessions open on this controller (one socket per frontend subscription; a dashboard load is several) |
+
 Alert on saturation with `in_use / max > 0.9` (shipped as `TalosDBPoolSaturated`
 in `deploy/observability/alerts.yaml`).
 

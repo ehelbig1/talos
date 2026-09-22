@@ -10226,6 +10226,7 @@ dependencies = [
  "talos-api",
  "talos-auth",
  "talos-config",
+ "talos-metrics",
  "tokio",
  "tracing",
  "uuid",

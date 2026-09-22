@@ -32,7 +32,8 @@ pub use outcome_class::OutcomeClass;
 pub use rpc::{seeded_pairs as rpc_seeded_pairs, RpcOutcome, RpcSubject};
 pub use security::{
     ApiKeyValidation, McpAuthOutcome, PasswordChangeOutcome, RateLimitKind,
-    RotationAuditArmOutcome, TokenReuseOutcome, TwoFactorOutcome,
+    RotationAuditArmOutcome, TokenReuseOutcome, TwoFactorOutcome, WsHandshakeOutcome,
+    WsOperationOutcome, WsSessionEnd,
 };
 pub use vault_token::{VaultTokenLifetimeLabel, VaultTokenRenewalOutcome};
 pub mod advisory_db;
@@ -468,6 +469,83 @@ pub fn record_mcp_auth_on(metrics: &TalosMetrics, outcome: McpAuthOutcome) {
         .inc();
 }
 
+/// Count one WebSocket handshake outcome. Inert without [`set_global`].
+pub fn record_ws_handshake(outcome: WsHandshakeOutcome) {
+    if let Some(m) = global() {
+        record_ws_handshake_on(m, outcome);
+    }
+}
+
+/// The recording itself, against an EXPLICIT registry.
+pub fn record_ws_handshake_on(metrics: &TalosMetrics, outcome: WsHandshakeOutcome) {
+    metrics
+        .ws_handshakes_total
+        .with_label_values(&[outcome.as_str()])
+        .inc();
+}
+
+/// Count how an authenticated WebSocket session ended. Inert without
+/// [`set_global`].
+pub fn record_ws_session_end(reason: WsSessionEnd) {
+    if let Some(m) = global() {
+        record_ws_session_end_on(m, reason);
+    }
+}
+
+pub fn record_ws_session_end_on(metrics: &TalosMetrics, reason: WsSessionEnd) {
+    metrics
+        .ws_session_ends_total
+        .with_label_values(&[reason.as_str()])
+        .inc();
+}
+
+/// Count one start/subscribe frame's outcome. Inert without [`set_global`].
+pub fn record_ws_operation(outcome: WsOperationOutcome) {
+    if let Some(m) = global() {
+        record_ws_operation_on(m, outcome);
+    }
+}
+
+pub fn record_ws_operation_on(metrics: &TalosMetrics, outcome: WsOperationOutcome) {
+    metrics
+        .ws_operations_total
+        .with_label_values(&[outcome.as_str()])
+        .inc();
+}
+
+/// One open, authenticated WebSocket session on this controller: the gauge
+/// is incremented when the guard is created and decremented when it is
+/// dropped, so a session that ends by deadline, transport error, client
+/// close or a panic unwinding through the handler all release it. Holding
+/// the guard IS the session's presence in `talos_ws_active_sessions`.
+#[must_use = "dropping the guard immediately ends the session's presence in the gauge"]
+pub struct WsActiveSession {
+    gauge: IntGauge,
+}
+
+impl WsActiveSession {
+    /// Register an open session against the GLOBAL registry; `None` when no
+    /// registry is installed (tests, the worker), in which case there is
+    /// nothing to hold.
+    pub fn open() -> Option<Self> {
+        global().map(|m| Self::open_on(m))
+    }
+
+    /// Register an open session against an EXPLICIT registry.
+    pub fn open_on(metrics: &TalosMetrics) -> Self {
+        metrics.ws_active_sessions.inc();
+        Self {
+            gauge: metrics.ws_active_sessions.clone(),
+        }
+    }
+}
+
+impl Drop for WsActiveSession {
+    fn drop(&mut self) {
+        self.gauge.dec();
+    }
+}
+
 /// Count one password-change outcome. Inert without [`set_global`].
 pub fn record_password_change(outcome: PasswordChangeOutcome) {
     if let Some(m) = global() {
@@ -803,6 +881,24 @@ pub struct TalosMetrics {
     // like the two above, a threshold needs a baseline this series has never
     // produced. Seeded over `McpAuthOutcome::ALL`.
     pub mcp_auth_total: CounterVec,
+    // The fourth bearer surface — the access-token cookie on the /ws upgrade
+    // (2026-09-22, package DU): nine refusal / close arms in talos-ws-auth and
+    // not one series, so a Cross-Site-WebSocket-Hijacking probe, a cookie
+    // guessing burst or a client that never completes connection_init were
+    // all invisible below the WARN log. One value per socket at the
+    // handshake's single exit. Seeded over `WsHandshakeOutcome::ALL`.
+    pub ws_handshakes_total: CounterVec,
+    // How an authenticated session ended; `token_expired` is the
+    // stolen-cookie exposure bound firing. Seeded over `WsSessionEnd::ALL`.
+    pub ws_session_ends_total: CounterVec,
+    // Subscription starts and the lane's two per-operation refusals (the
+    // subscriptions-only gate and the pre-2FA gate), both previously
+    // `talos_audit` log lines only. Seeded over `WsOperationOutcome::ALL`.
+    pub ws_operations_total: CounterVec,
+    // Authenticated sessions currently open on THIS controller (a Drop guard
+    // decrements, so a session that ends by timeout, error or client close
+    // all release it). Not seeded: a gauge reads 0 at registration.
+    pub ws_active_sessions: IntGauge,
     // A user changing their own password (2026-09-18): the one recovery a
     // user has after a password leak, and — through `wrong_current_password`
     // — the signal that someone holding a session is guessing the password.
@@ -2174,6 +2270,80 @@ impl TalosMetrics {
                 .with_label_values(&[outcome.as_str()])
                 .inc_by(0.0);
         }
+
+        let ws_handshakes_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_ws_handshakes_total",
+                "WebSocket (/ws) handshake outcomes, one per socket, recorded at the \
+                 handshake's single exit in talos-ws-auth. outcome=authenticated | \
+                 origin_missing / origin_malformed / origin_not_allowed (the Cross-Site \
+                 WebSocket Hijacking signal; missing is refused in production only) | \
+                 no_token / invalid_token / invalid_user_id (connection_init completed \
+                 without a usable access-token cookie; the caller sees one \
+                 connection_error for all three) | protocol_violation (first frame was \
+                 not connection_init) | init_not_received (no connection_init within \
+                 30 s or the client left first). talos_metrics::WsHandshakeOutcome, a \
+                 closed set, all nine pre-seeded at 0. No alert yet: no baseline. \
+                 Registered and first incremented 2026-09-22.",
+            ),
+            &["outcome"],
+        )?;
+        registry.register(Box::new(ws_handshakes_total.clone()))?;
+        for outcome in WsHandshakeOutcome::ALL {
+            ws_handshakes_total
+                .with_label_values(&[outcome.as_str()])
+                .inc_by(0.0);
+        }
+
+        let ws_session_ends_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_ws_session_ends_total",
+                "How an AUTHENTICATED WebSocket session ended. reason=token_expired (the \
+                 session's hard deadline — the access token's remaining life — fired: \
+                 the stolen-cookie exposure bound working) | client_terminated \
+                 (connection_terminate or a Close frame) | stream_ended (the transport \
+                 went away). talos_metrics::WsSessionEnd, closed, all three pre-seeded \
+                 at 0. Registered 2026-09-22.",
+            ),
+            &["reason"],
+        )?;
+        registry.register(Box::new(ws_session_ends_total.clone()))?;
+        for reason in WsSessionEnd::ALL {
+            ws_session_ends_total
+                .with_label_values(&[reason.as_str()])
+                .inc_by(0.0);
+        }
+
+        let ws_operations_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_ws_operations_total",
+                "start/subscribe frames on authenticated WebSocket sessions. \
+                 outcome=started (a subscription stream was opened) | \
+                 refused_non_subscription (the lane executes subscriptions only — a query \
+                 or mutation sent over /ws is refused, 2026-09-10) | \
+                 refused_pre_second_factor (a password-only session may not subscribe, \
+                 2026-07-19 P3). Both refusals were talos_audit log lines only until \
+                 2026-09-22. talos_metrics::WsOperationOutcome, closed, all three \
+                 pre-seeded at 0.",
+            ),
+            &["outcome"],
+        )?;
+        registry.register(Box::new(ws_operations_total.clone()))?;
+        for outcome in WsOperationOutcome::ALL {
+            ws_operations_total
+                .with_label_values(&[outcome.as_str()])
+                .inc_by(0.0);
+        }
+
+        let ws_active_sessions = IntGauge::new(
+            "talos_ws_active_sessions",
+            "Authenticated WebSocket sessions currently open on this controller \
+             (per process — sum across replicas for the fleet). Incremented when the \
+             connection_ack is sent, decremented by a Drop guard however the session \
+             ends. The frontend opens one socket per subscription, so one dashboard \
+             load is several sessions (3 measured on 2026-09-22).",
+        )?;
+        registry.register(Box::new(ws_active_sessions.clone()))?;
 
         let password_changes_total = CounterVec::new(
             prometheus::Opts::new(
@@ -3767,6 +3937,10 @@ impl TalosMetrics {
             auth_2fa_attempts_total,
             api_key_validations_total,
             mcp_auth_total,
+            ws_handshakes_total,
+            ws_session_ends_total,
+            ws_operations_total,
+            ws_active_sessions,
             password_changes_total,
             token_reuse_total,
             rotation_audit_arm_total,
@@ -4561,7 +4735,69 @@ mod tests {
             )));
             record_rotation_audit_arm_on(&m, *o);
         }
+        // The WebSocket lane (package DU): three closed sets, every value
+        // exported at 0 on a cold registry; the gauge reads 0 and follows the
+        // guard both ways.
+        for o in WsHandshakeOutcome::ALL {
+            assert!(cold.contains(&format!(
+                "talos_ws_handshakes_total{{outcome=\"{}\"}} 0",
+                o.as_str()
+            )));
+            record_ws_handshake_on(&m, *o);
+        }
+        for r in WsSessionEnd::ALL {
+            assert!(cold.contains(&format!(
+                "talos_ws_session_ends_total{{reason=\"{}\"}} 0",
+                r.as_str()
+            )));
+            record_ws_session_end_on(&m, *r);
+        }
+        for o in WsOperationOutcome::ALL {
+            assert!(cold.contains(&format!(
+                "talos_ws_operations_total{{outcome=\"{}\"}} 0",
+                o.as_str()
+            )));
+            record_ws_operation_on(&m, *o);
+        }
+        assert!(cold.contains("talos_ws_active_sessions 0"));
+        {
+            let _a = WsActiveSession::open_on(&m);
+            let _b = WsActiveSession::open_on(&m);
+            assert!(m
+                .render_prometheus()
+                .expect("render")
+                .contains("talos_ws_active_sessions 2"));
+            drop(_a);
+            assert!(m
+                .render_prometheus()
+                .expect("render")
+                .contains("talos_ws_active_sessions 1"));
+        }
         let warm = m.render_prometheus().expect("render");
+        assert!(warm.contains("talos_ws_active_sessions 0"));
+        for o in WsHandshakeOutcome::ALL {
+            assert!(warm.contains(&format!(
+                "talos_ws_handshakes_total{{outcome=\"{}\"}} 1",
+                o.as_str()
+            )));
+        }
+        assert_eq!(WsHandshakeOutcome::ALL.len(), 9);
+        assert_eq!(
+            warm.matches("talos_ws_handshakes_total{outcome=").count(),
+            9
+        );
+        for r in WsSessionEnd::ALL {
+            assert!(warm.contains(&format!(
+                "talos_ws_session_ends_total{{reason=\"{}\"}} 1",
+                r.as_str()
+            )));
+        }
+        for o in WsOperationOutcome::ALL {
+            assert!(warm.contains(&format!(
+                "talos_ws_operations_total{{outcome=\"{}\"}} 1",
+                o.as_str()
+            )));
+        }
         for o in TwoFactorOutcome::ALL {
             assert!(warm.contains(&format!(
                 "talos_auth_2fa_attempts_total{{status=\"{}\"}} 1",
