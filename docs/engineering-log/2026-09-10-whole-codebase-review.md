@@ -6497,3 +6497,56 @@ Stated limit: the executor is found by forward scan from the literal's line,
 so a literal bound to a local and executed in a later statement attributes
 the next executor it meets — the loud direction, since a scoped one in
 between hides nothing and a pool one reports.
+
+## Package DS — the second refresh after the first one settled (2026-09-22)
+
+Measured on the first dashboard load after DP (deploy 116), read from the
+live database, not the test clone:
+
+| | |
+|---|---|
+| `token_refresh` rows at 18:25:49 | 2, both `success = t` |
+| `rotated_session_audit` rows | 2, **0.4 s apart** |
+| `talos_auth_token_reuse_total{outcome="within_grace"}` | 0 (stayed) |
+| `talos_auth_rotation_audit_arm_total{outcome="armed"}` | 0 → 2 |
+| live `user_sessions` rows after | 1, `second_factor_verified` true |
+| rotation pairs < 2 s apart, 7 days | 3 (2 pre-DP races, this one chained) |
+
+So DP held — the second refresh used the first's new cookie, which is why
+the detector answered nothing — and the second refresh was still a wasted
+mutation and an extra rotation. The mechanism: `refreshSession()` clears
+`activeRefresh` when it settles; a request that left with the stale access
+token BEFORE that settlement gets its 401 AFTER it and finds no in-flight
+promise to join. The in-flight dedupe is the right answer for overlapping
+callers and cannot see this one.
+
+The fix is an epoch, not a timer. `refreshEpoch` advances by one when a
+refresh SUCCEEDS. A wrapper captures it before `fetch`; on an auth failure
+`recoverSession(epochAtSend)` returns `true` without a network call when
+`refreshSucceededSince(epochAtSend, refreshEpoch)`, otherwise
+`attemptTokenRefresh()`. Success-only is load-bearing: after a FAILED refresh
+(a dead session) a later 401 must refresh again rather than retry against a
+cookie nothing renewed. The `isRetry` guard the wrappers already carry keeps
+recovery to one attempt per request, so a fresh cookie that is still refused
+surfaces the original failure.
+
+The tests found a second instance of the class while being written:
+`authedFetch` checked `status === 401` and then, separately, whether the body
+text was an auth sentence — two independent arms, so a 401 with a
+"Not authenticated" body refreshed twice when the first refresh failed. One
+attempt per request now (`recoveryTried`).
+
+Guards: five new cases in `session.test.ts`, every one through the
+production wrappers; the pre-fix tree produced the second mutation by
+construction (observed: the first harness run, with `graphqlClient.ts` not
+yet edited, reported `expected 2 to be 1`). The two WebSocket sites are a
+textual pin, stated as such. Mutations: D1 recover ignores the epoch, D2
+epoch advances on failure, D3 decision inverted (never refresh — caught by
+the control and six siblings), D4 epoch captured after the fetch (two edits
+applied together), D5 the 401 arm reading the epoch late, D6 the body-text
+arm ignoring the first attempt, D7 a WebSocket site back on the bare refresh
+— 7 caught, 0 survivors.
+
+Recorded, not changed: an anonymous page load still issues one doomed
+`refreshToken` with no cookie (the server writes no audit row for it), and
+`me` fires twice on load in dev under StrictMode.

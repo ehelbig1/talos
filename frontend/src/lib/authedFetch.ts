@@ -6,9 +6,10 @@
 
 import { getCsrfToken } from "@/lib/csrf";
 import {
-  attemptTokenRefresh,
+  currentRefreshEpoch,
   ensureCsrfCookie,
   isAuthErrorMessage,
+  recoverSession,
 } from "@/lib/session";
 // Re-exported so thin fetch helpers keep their import path (`@/lib/authedFetch`).
 export { ensureCsrfCookie };
@@ -48,6 +49,9 @@ export async function authedFetch(
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 15_000);
 
+  // Captured BEFORE the request leaves — see `session.recoverSession`.
+  const epochAtSend = currentRefreshEpoch();
+
   let resp: Response;
   try {
     resp = await fetch(url, {
@@ -66,19 +70,27 @@ export async function authedFetch(
     clearTimeout(timeout);
   }
 
+  // ONE recovery attempt per request. The 401 arm and the auth-message-body
+  // arm below used to be independent, so a 401 whose body also read
+  // "Not authenticated" refreshed TWICE when the first refresh failed —
+  // a second mutation against a session already known to be dead
+  // (found by the DS tests, 2026-09-22).
+  let recoveryTried = false;
   if (resp.status === 401 && !isRetry) {
-    const refreshed = await attemptTokenRefresh();
-    if (refreshed) {
+    recoveryTried = true;
+    const recovered = await recoverSession(epochAtSend);
+    if (recovered) {
       return authedFetch(url, options, true);
     }
   }
 
   if (!resp.ok) {
     const text = await resp.text();
-    // Check if the response is actually an auth error message from the backend
-    if (!isRetry && isAuthErrorMessage(text)) {
-      const refreshed = await attemptTokenRefresh();
-      if (refreshed) {
+    // A non-401 status whose body is the backend's auth-failure sentence
+    // (the 403-shaped variants) gets the same single recovery attempt.
+    if (!isRetry && !recoveryTried && isAuthErrorMessage(text)) {
+      const recovered = await recoverSession(epochAtSend);
+      if (recovered) {
         return authedFetch(url, options, true);
       }
     }
