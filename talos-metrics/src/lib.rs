@@ -3983,12 +3983,6 @@ mod tests {
         assert!(dlq_metric.is_some());
     }
 
-    // Sanity-check that every crypto-invariant metric is actually
-    // registered AND surfaces in the rendered Prometheus text format.
-    // Catches typos in registry.register / series-name drift — a regression
-    // here means the alerts in deploy/observability/alerts.yaml would
-    // silently never fire.
-    #[test]
     /// The process collector is registered on Linux and its seven families
     /// render. Deleting the `register` call in `new()` fails this on every CI
     /// runner; on macOS the collector does not exist and the test is skipped
@@ -4071,6 +4065,15 @@ mod tests {
         assert!(later.contains(r#"talos_advisory_db_age_days{copy="controller"} 75"#));
     }
 
+    // Sanity-check that every crypto-invariant metric is actually
+    // registered AND surfaces in the rendered Prometheus text format.
+    // Catches typos in registry.register / series-name drift — a regression
+    // here means the alerts in deploy/observability/alerts.yaml would
+    // silently never fire. (Its `#[test]` sat orphaned above the Linux-only
+    // process test from f27db68d until 2026-09-22: on Linux that made a
+    // DUPLICATED `#[test]` there, which macOS — where the cfg removes the
+    // item — could never compile; the first `--all-targets` CI clippy run
+    // found it.)
     #[test]
     fn crypto_invariant_metrics_render() {
         let m = TalosMetrics::new().unwrap();
