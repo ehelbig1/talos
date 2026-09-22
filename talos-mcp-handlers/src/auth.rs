@@ -928,11 +928,14 @@ pub async fn mcp_auth_middleware(
 /// as the GRACE_TEST_LOCK in talos-csrf (MCP-1145) and NONCE_TEST_LOCK in
 /// talos-memory. Shared by the cap tests and the refusal tests below.
 #[cfg(test)]
-static LIMITER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static LIMITER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Synchronous `#[test]` takers; the `#[tokio::test]` takers below hold the
+/// same lock with `LIMITER_TEST_LOCK.lock().await`, so a guard is never held
+/// across an await point through a `std` mutex.
 #[cfg(test)]
-fn limiter_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    LIMITER_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+fn limiter_test_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    LIMITER_TEST_LOCK.blocking_lock()
 }
 
 /// The refusal type is what makes every exit of the middleware countable;
@@ -960,7 +963,7 @@ mod mcp_auth_refusal_tests {
 
     #[tokio::test]
     async fn a_missing_token_is_refused_before_any_database_read() {
-        let _g = limiter_test_lock();
+        let _g = LIMITER_TEST_LOCK.lock().await;
         let pool = never_connecting_pool();
         let no_token = request(None);
         let refusal =
@@ -984,7 +987,7 @@ mod mcp_auth_refusal_tests {
     /// uses to spot guessing.
     #[tokio::test]
     async fn an_unreadable_agent_table_is_an_error_not_an_unknown_token() {
-        let _g = limiter_test_lock();
+        let _g = LIMITER_TEST_LOCK.lock().await;
         let pool = never_connecting_pool();
         let guess = request(Some("Bearer not-a-real-token"));
         let refusal = authenticate_mcp_request(&pool, "203.0.113.12", guess.headers(), guess.uri())
@@ -1006,7 +1009,7 @@ mod mcp_auth_refusal_tests {
     /// credential (here: none).
     #[tokio::test]
     async fn the_limiter_refuses_the_request_past_the_window_cap() {
-        let _g = limiter_test_lock();
+        let _g = LIMITER_TEST_LOCK.lock().await;
         let limiter = MCP_AUTH_RATE_LIMITER.get_or_init(DashMap::new);
         limiter.remove("203.0.113.13");
         let pool = never_connecting_pool();

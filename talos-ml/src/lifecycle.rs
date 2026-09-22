@@ -1187,9 +1187,10 @@ mod tests {
     }
 
     fn policy_with_floors(floors: &[(&str, f64)]) -> PolicyJson {
-        let mut p = PolicyJson::default();
-        p.recall_floors = Some(floors.iter().map(|(c, f)| ((*c).to_string(), *f)).collect());
-        p
+        PolicyJson {
+            recall_floors: Some(floors.iter().map(|(c, f)| ((*c).to_string(), *f)).collect()),
+            ..Default::default()
+        }
     }
 
     /// The live case: `to_read` recall 0.679 against a 0.85 floor was the only

@@ -1002,7 +1002,7 @@ mod ceiling_tests {
                 let rank_allows = world_rank(r) <= world_rank(c);
                 let lattice_allows = ceiling_permits(c, r);
                 assert!(
-                    !(lattice_allows && !rank_allows),
+                    !lattice_allows || rank_allows,
                     "lattice allows ({c} ⊇ {r}) but rank rejected it — rank/lattice inconsistency"
                 );
             }

@@ -43,7 +43,7 @@ async fn seed_admin_event(
     .expect("seed admin event");
 }
 
-fn events<'a>(body: &'a Value) -> &'a [Value] {
+fn events(body: &Value) -> &[Value] {
     body.get("events")
         .and_then(|e| e.as_array())
         .map(|v| v.as_slice())

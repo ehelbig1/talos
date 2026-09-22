@@ -500,12 +500,13 @@ mod stub_sm_tests {
     /// drives a crypto FAILURE (i.e. bumps the counter) must hold this while
     /// it does, or the delta-assert below sees sibling traffic. Held by every
     /// counter-moving test in this module — add new ones to the list.
-    /// `into_inner` on poison: a sibling panic must not cascade into an
+    /// Async-aware because every holder awaits while holding it; a tokio
+    /// mutex does not poison, so a sibling panic cannot cascade into an
     /// unrelated failure here.
-    static METRIC_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static METRIC_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    fn metric_guard() -> std::sync::MutexGuard<'static, ()> {
-        METRIC_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    async fn metric_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        METRIC_LOCK.lock().await
     }
 
     /// Real SecretsManager over a never-connected lazy pool + a real (non-zero)
@@ -606,7 +607,7 @@ mod stub_sm_tests {
     /// version columns.
     #[tokio::test]
     async fn decrypt_unknown_format_fails_closed_without_db_access() {
-        let _g = metric_guard();
+        let _g = metric_guard().await;
         let sm = stub_sm();
         let row = Uuid::new_v4();
         // Plausible ciphertext length (nonce + tag + payload) so the failure
@@ -637,7 +638,7 @@ mod stub_sm_tests {
     /// malformed rows, no DB dependency).
     #[tokio::test]
     async fn decrypt_derived_format_rejects_truncated_ciphertext() {
-        let _g = metric_guard();
+        let _g = metric_guard().await;
         let sm = stub_sm();
         let row = Uuid::new_v4();
         for version in [
@@ -679,7 +680,7 @@ mod stub_sm_tests {
     /// the `set_global` race.
     #[tokio::test]
     async fn payload_crypto_failures_are_counted_on_the_production_path() {
-        let _g = metric_guard();
+        let _g = metric_guard().await;
         talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("metrics"));
         let m = talos_metrics::global().expect("global installed");
         let read = |op: &str, stage: &str| {
@@ -693,7 +694,7 @@ mod stub_sm_tests {
         decrypt_payload_slot(
             &stub_sm(),
             Uuid::new_v4(),
-            &vec![0u8; 12 + 16 + 32],
+            &[0u8; 12 + 16 + 32],
             Uuid::new_v4(),
             PayloadSlot::Output,
             99,
@@ -714,7 +715,7 @@ mod stub_sm_tests {
         decrypt_payload_slot(
             &stub_sm(),
             Uuid::new_v4(),
-            &vec![0u8; 60],
+            &[0u8; 60],
             Uuid::new_v4(),
             PayloadSlot::Trigger,
             99,

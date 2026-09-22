@@ -200,7 +200,7 @@ async fn main_the_risk_read_is_blind_to_a_totally_failing_child() {
     println!("MEASURED: ledger stats -> {stats:?}");
 
     assert!(
-        counts.get(&child).is_none(),
+        !counts.contains_key(&child),
         "the cascading check's only input sees the child"
     );
     let s = stats.get(&child).expect("ledger has the child");

@@ -1003,7 +1003,7 @@ name: \"networkerror\", message: \"\" }";
                 let before = is_transient_error_type(&classify_error(&bare));
                 let after = is_transient_error_type(&classify_error(&marked));
                 assert!(
-                    !(after && !before),
+                    !after || before,
                     "[reason_class={token}] moved a {wit} message from NON-TRANSIENT \\
                      to TRANSIENT — that retries a deterministic failure"
                 );

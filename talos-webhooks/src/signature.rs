@@ -359,6 +359,14 @@ mod tests {
     use axum::http::HeaderValue;
     use std::collections::HashSet;
 
+    /// The long horizon must actually BE longer than the base window — a
+    /// compile-time pin, so a constant edited down to the base window fails
+    /// the build rather than a test run.
+    const _: () = assert!(
+        GITHUB_DEDUP_WINDOW_SECS > DEDUP_WINDOW_SECS,
+        "GITHUB_DEDUP_WINDOW_SECS must exceed DEDUP_WINDOW_SECS"
+    );
+
     const SECRET: &str = "a-signing-secret-of-adequate-length";
 
     /// Every outcome the auth gate can produce, so the two tests below are
@@ -394,10 +402,11 @@ mod tests {
                  is not its replay defence and must not hold its claim longer"
             );
         }
-        // The long horizon must actually BE longer, and it must be the 24 h
-        // the operator picked: a constant edited down to the base window would
-        // silently restore the one-hour replay window package CI closed.
-        assert!(GITHUB_DEDUP_WINDOW_SECS > DEDUP_WINDOW_SECS);
+        // The long horizon must actually BE longer (pinned at compile time
+        // by the `const _` assertion at the top of this module), and it must
+        // be the 24 h the operator picked: a constant edited down to the base
+        // window would silently restore the one-hour replay window package CI
+        // closed.
         assert_eq!(GITHUB_DEDUP_WINDOW_SECS, 24 * 3600);
         assert_eq!(DEDUP_WINDOW_SECS, 3600);
     }

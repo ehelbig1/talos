@@ -1049,8 +1049,7 @@ async fn cross_column_swap_fails_under_tagged_readers_in_both_directions() {
     let err = manager
         .decrypt_versioned_tagged(kid_t, &ct_totp, OTLP_AUTH_HEADERS_TAG, uid, ver)
         .await
-        .err()
-        .expect("TOTP blob must NOT open as OTLP headers");
+        .expect_err("TOTP blob must NOT open as OTLP headers");
     assert!(
         matches!(err, controller::secrets::SecretsError::Aead),
         "must be the AEAD tag mismatch, not a DEK/format error: {err}"
@@ -1059,8 +1058,7 @@ async fn cross_column_swap_fails_under_tagged_readers_in_both_directions() {
     let err = manager
         .decrypt_versioned_tagged(kid_o, &ct_otlp, TOTP_SECRET_TAG, uid, ver)
         .await
-        .err()
-        .expect("OTLP blob must NOT open as a TOTP secret");
+        .expect_err("OTLP blob must NOT open as a TOTP secret");
     assert!(matches!(err, controller::secrets::SecretsError::Aead));
 
     // Control: each opens under its own reader.

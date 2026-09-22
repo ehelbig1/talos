@@ -4501,10 +4501,8 @@ mod audit_retention_clamp_tests {
     }
 
     /// The default sits above the floor, so an unset env is never clamped.
-    #[test]
-    fn the_default_is_above_the_floor() {
-        assert!(DEFAULT_AUDIT_TABLE_RETENTION_DAYS >= MIN_AUDIT_TABLE_RETENTION_DAYS);
-    }
+    /// Pinned at compile time: both operands are constants.
+    const _: () = assert!(DEFAULT_AUDIT_TABLE_RETENTION_DAYS >= MIN_AUDIT_TABLE_RETENTION_DAYS);
 
     /// Every reader of `execution_cost_rollup` whose window is caller-chosen
     /// must be bounded by the reaper's window, or a report asserts history the
@@ -4562,20 +4560,26 @@ mod audit_retention_clamp_tests {
         assert!(!o.failed() && !o.truncated());
         o.side_table_error = Some("x".into());
         assert!(o.failed());
-        let mut o = RetentionPassOutcome::default();
-        o.audit_table_error = Some("x".into());
+        let o = RetentionPassOutcome {
+            audit_table_error: Some("x".into()),
+            ..Default::default()
+        };
         assert!(o.failed());
-        let mut o = RetentionPassOutcome::default();
-        o.side_tables = Some(SideTableReap {
-            truncated: true,
-            ..SideTableReap::default()
-        });
+        let o = RetentionPassOutcome {
+            side_tables: Some(SideTableReap {
+                truncated: true,
+                ..SideTableReap::default()
+            }),
+            ..Default::default()
+        };
         assert!(o.truncated() && !o.failed());
-        let mut o = RetentionPassOutcome::default();
-        o.audit_tables = Some(AuditTableReap {
-            truncated: true,
-            ..AuditTableReap::default()
-        });
+        let o = RetentionPassOutcome {
+            audit_tables: Some(AuditTableReap {
+                truncated: true,
+                ..AuditTableReap::default()
+            }),
+            ..Default::default()
+        };
         assert!(o.truncated() && !o.failed());
     }
 }

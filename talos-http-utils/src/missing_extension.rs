@@ -110,7 +110,7 @@ mod tests {
     use tracing_subscriber::layer::{Context, SubscriberExt};
 
     /// The counter is process-global; tests that read it run one at a time.
-    static COUNTER_LOCK: Mutex<()> = Mutex::new(());
+    static COUNTER_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[derive(Clone)]
     struct NeverLayered;
@@ -189,7 +189,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_extension_is_counted_logged_and_its_body_replaced() {
-        let _serial = COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = COUNTER_LOCK.lock().await;
         let m = metrics();
         let before = m.http_missing_extension_total.get();
 
@@ -221,7 +221,7 @@ mod tests {
 
     #[tokio::test]
     async fn other_responses_pass_through_and_count_nothing() {
-        let _serial = COUNTER_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _serial = COUNTER_LOCK.lock().await;
         let m = metrics();
         let before = m.http_missing_extension_total.get();
 

@@ -316,6 +316,18 @@ pub(crate) fn label_in_vocabulary(label: &str, known: &[String]) -> bool {
     known.is_empty() || known.iter().any(|k| k == label)
 }
 
+async fn open_tx(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, ResolveError> {
+    talos_db::begin_tenant_read_scoped(
+        pool,
+        &talos_tenancy::TenantReadScope::new(user_id, Vec::new()),
+    )
+    .await
+    .map_err(|e| ResolveError::Internal(anyhow::anyhow!("open user-scoped tx: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -403,16 +415,4 @@ mod tests {
         let groups = vec![group(a, &[b]), group(c, &[d])];
         assert_eq!(siblings_from_groups(groups, c), vec![d]);
     }
-}
-
-async fn open_tx(
-    pool: &PgPool,
-    user_id: Uuid,
-) -> Result<sqlx::Transaction<'_, sqlx::Postgres>, ResolveError> {
-    talos_db::begin_tenant_read_scoped(
-        pool,
-        &talos_tenancy::TenantReadScope::new(user_id, Vec::new()),
-    )
-    .await
-    .map_err(|e| ResolveError::Internal(anyhow::anyhow!("open user-scoped tx: {e}")))
 }

@@ -1045,7 +1045,7 @@ mod resign_payload_tests {
             job_id: uuid::Uuid::new_v4(),
             workflow_execution_id: uuid::Uuid::new_v4(),
             module_uri: "test:noop".to_string(),
-            input_payload: serde_json::json!({ "ratio": 5.455171886890906e-115 }).into(),
+            input_payload: serde_json::json!({ "ratio": 5.455_171_886_890_906e-115 }).into(),
             encrypted_secrets: EncryptedSecrets::empty(),
             timeout_ms: 1000,
             priority: 100,
@@ -1964,6 +1964,9 @@ mod p3_full_loop_tests {
         JobRequest, JobResult, JobStatus, SecretClaim, WorkerEphemeral, SEALING_CLAIM_ECIES,
     };
 
+    /// The per-step secret maps a worker observed on ONE pipeline claim.
+    type PerStepSecrets = Option<Vec<HashMap<String, String>>>;
+
     struct NoRetry;
     impl RetryClassifier for NoRetry {
         fn classify(&self, _error: &str) -> String {
@@ -2260,7 +2263,7 @@ mod p3_full_loop_tests {
         let mut sub = nc.subscribe(topic).await.expect("worker subscribe");
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
-        let observed: Arc<tokio::sync::Mutex<Option<Vec<HashMap<String, String>>>>> =
+        let observed: Arc<tokio::sync::Mutex<PerStepSecrets>> =
             Arc::new(tokio::sync::Mutex::new(None));
         let worker_task = {
             let (nc, ring, observed, controller_vk) =

@@ -1,3 +1,7 @@
+// `module_inception`: mounted from lib.rs via `#[path = "config_tests.rs"] mod tests;`,
+// so the inner module shares its parent's name — the `*_tests.rs` companion
+// convention (see types_tests.rs); renaming would churn every test path.
+#[allow(clippy::module_inception)]
 #[cfg(test)]
 mod tests {
     use crate::{

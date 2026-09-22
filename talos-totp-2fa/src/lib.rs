@@ -1186,7 +1186,7 @@ mod tests {
 
     /// `RUST_ENV` is process-global and these tests move it, so every test
     /// whose behaviour depends on `is_production()` takes this lock.
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     struct ProdEnv(Option<String>);
     impl ProdEnv {
@@ -1210,7 +1210,7 @@ mod tests {
     /// that let this through would surface as a pool timeout, not a refusal.
     #[tokio::test]
     async fn production_without_redis_refuses_before_the_database() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         let service = stub_service(None);
         let _prod = ProdEnv::set();
         let err = service
@@ -1228,7 +1228,7 @@ mod tests {
     /// one test so the control cannot drift away from the case it controls.
     #[tokio::test]
     async fn an_unreachable_redis_refuses_in_production_and_falls_back_in_development() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK.lock().await;
         let unreachable =
             Arc::new(redis::Client::open("redis://127.0.0.1:1").expect("client for a dead port"));
         let service = stub_service(Some(unreachable));

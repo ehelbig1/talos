@@ -203,12 +203,14 @@ fn sign_request_with_fixed_nonce(req: &mut JobRequest, key: &[u8]) {
     // its default, which is what keeps an all-default request byte-identical.
     // `dispatch_attempt` is last and mirrors the `:attempt=` segment.
     if req.dispatch_attempt != 0 {
-        payload.push_str(&format!(":attempt={}", req.dispatch_attempt));
+        use std::fmt::Write as _;
+        let _ = write!(payload, ":attempt={}", req.dispatch_attempt);
     }
     // `max_fuel` is the LAST conditional segment (2026-09-10): appended only
     // when non-zero, after `:attempt=`.
     if req.max_fuel != 0 {
-        payload.push_str(&format!(":fuel={}", req.max_fuel));
+        use std::fmt::Write as _;
+        let _ = write!(payload, ":fuel={}", req.max_fuel);
     }
     let mut mac = <HmacSha256 as Mac>::new_from_slice(key).unwrap();
     mac.update(payload.as_bytes());

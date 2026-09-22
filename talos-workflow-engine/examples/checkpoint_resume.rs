@@ -87,8 +87,13 @@ async fn main() -> Result<(), WorkflowEngineError> {
     let dispatcher_1 = Arc::new(FlakyDispatcher {
         fail_module: branch_b_module,
     });
-    let (result_1, hook_1) =
-        run_once(graph.clone(), store.clone(), dispatcher_1, execution_id).await;
+    let (result_1, hook_1) = Box::pin(run_once(
+        graph.clone(),
+        store.clone(),
+        dispatcher_1,
+        execution_id,
+    ))
+    .await;
     match &result_1 {
         Ok(_) => panic!("Run 1 was supposed to fail (branch-b is flaky)"),
         Err(e) => println!("  expected failure: {e}"),

@@ -173,13 +173,14 @@ fn label_triples(
 /// away the property that matters: "exactly once" is what proves ONE record
 /// site writes both the counter and the histogram, which is the invariant
 /// `the_chokepoint_records_a_series_for_a_real_tool_call` was written for.
-/// So the window is serialised instead. Poison is recovered from, because a
-/// panicking sibling must fail on its OWN assertion rather than turn every
-/// other test in this binary red.
-static SHARED_SERIES: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// So the window is serialised instead. An async-aware mutex, because the
+/// guard is held across the `.await` on the tool call; tokio's mutex does not
+/// poison, so a panicking sibling releases it on unwind and fails on its OWN
+/// assertion rather than turning every other test in this binary red.
+static SHARED_SERIES: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-fn shared_series_guard() -> std::sync::MutexGuard<'static, ()> {
-    SHARED_SERIES.lock().unwrap_or_else(|e| e.into_inner())
+async fn shared_series_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    SHARED_SERIES.lock().await
 }
 
 fn call(tool: &str, args: serde_json::Value) -> controller::mcp::types::JsonRpcRequest {
@@ -215,7 +216,7 @@ async fn the_chokepoint_records_a_series_for_a_real_tool_call() {
     let m = installed_metrics();
     // `(whoami, ok)` is also moved by `the_exported_series_carry_one_class_
     // _per_outcome`; see `SHARED_SERIES`.
-    let _serial = shared_series_guard();
+    let _serial = shared_series_guard().await;
 
     let before = label_pairs(&m, "talos_mcp_tool_calls_total")
         .get(&("whoami".to_string(), "ok".to_string()))
@@ -360,7 +361,7 @@ async fn a_caller_fault_records_refused() {
     let user_id = seed_user(&pool).await;
     let state = mcp_state(pool.clone()).await;
     let m = installed_metrics();
-    let _serial = shared_series_guard();
+    let _serial = shared_series_guard().await;
 
     // A missing required argument is -32602 — the CALLER can fix it. Folding
     // it into `error` would make a client looping on a typo indistinguishable
@@ -834,7 +835,7 @@ async fn a_tenancy_refusal_records_denied_and_classes_declined() {
     let user_id = seed_user(&pool).await;
     let state = mcp_state(pool.clone()).await;
     let m = installed_metrics();
-    let _serial = shared_series_guard();
+    let _serial = shared_series_guard().await;
 
     let key = (
         "get_workflow".to_string(),
@@ -1007,7 +1008,7 @@ async fn a_read_failure_records_error_and_classes_finding() {
     let user_id = seed_user(&pool).await;
     let state = mcp_state(pool.clone()).await;
     let m = installed_metrics();
-    let _serial = shared_series_guard();
+    let _serial = shared_series_guard().await;
 
     // CONTROL FIRST, on the intact schema: a refusal here is `denied`, so the
     // assertion below cannot pass merely because everything is refused.
@@ -1079,7 +1080,7 @@ async fn the_exported_series_carry_one_class_per_outcome() {
     let user_id = seed_user(&pool).await;
     let state = mcp_state(pool.clone()).await;
     let m = installed_metrics();
-    let _serial = shared_series_guard();
+    let _serial = shared_series_guard().await;
 
     for (tool, args) in [
         ("whoami", serde_json::json!({})),

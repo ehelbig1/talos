@@ -2131,17 +2131,19 @@ mod policy_schema_tests {
     /// `None`s, so every field is set to Some(..) to enumerate them.
     #[test]
     fn set_policy_description_documents_every_policy_field() {
-        let mut all = talos_ml::PolicyJson::default();
-        all.min_examples = Some(1);
-        all.min_corrections_per_class = Some(1);
-        all.recall_floors = Some(Default::default());
-        all.demote_below_agreement = Some(0.5);
-        all.min_shadow_total = Some(1);
-        all.correction_weight = Some(3.0);
-        all.gold_fraction = Some(0.3);
-        all.min_gold = Some(8);
-        all.gray_band = Some(0.1);
-        all.gray_band_daily_cap = Some(20);
+        let all = talos_ml::PolicyJson {
+            min_examples: Some(1),
+            min_corrections_per_class: Some(1),
+            recall_floors: Some(Default::default()),
+            demote_below_agreement: Some(0.5),
+            min_shadow_total: Some(1),
+            correction_weight: Some(3.0),
+            gold_fraction: Some(0.3),
+            min_gold: Some(8),
+            gray_band: Some(0.1),
+            gray_band_daily_cap: Some(20),
+            ..Default::default()
+        };
         // accuracy_at_coverage is a struct; serialize via its own Default.
         let mut json = serde_json::to_value(&all).expect("PolicyJson serializes");
         json.as_object_mut()

@@ -252,7 +252,7 @@ async fn a_dispatch_node_records_one_child_run() {
         .expect("parent graph builds");
     let store = KeyedGraphStore::default().with_graph(child_wf, one_module_graph(module_id));
     let mut r = rig(&parent_graph, store, module_id, json!({"ok": true}));
-    let execution_id = run(&mut r, json!({"ok": true})).await;
+    let execution_id = Box::pin(run(&mut r, json!({"ok": true}))).await;
 
     let rows = r.recorder.of_kind(ChildDispatchKind::Dispatch);
     assert_eq!(
@@ -309,7 +309,7 @@ async fn a_dispatch_child_that_cannot_run_is_recorded_as_failed() {
         .expect("parent graph builds");
     let store = KeyedGraphStore::default().with_graph(child_wf, one_module_graph(absent_module));
     let mut r = rig(&parent_graph, store, module_id, json!({}));
-    run(&mut r, json!({"ok": true})).await;
+    Box::pin(run(&mut r, json!({"ok": true}))).await;
 
     let rows = r.recorder.of_kind(ChildDispatchKind::Dispatch);
     assert_eq!(rows.len(), 1, "the child STARTED, so it gets a row");
@@ -348,7 +348,7 @@ async fn a_capability_dispatch_node_records_its_own_kind() {
         .with_graph(cap_wf, one_module_graph(module_id))
         .with_capabilities(vec!["p3-cap".to_string()], cap_wf);
     let mut r = rig(&parent_graph, store, module_id, json!({"ok": true}));
-    run(&mut r, json!({"ok": true})).await;
+    Box::pin(run(&mut r, json!({"ok": true}))).await;
 
     let rows = r.recorder.of_kind(ChildDispatchKind::CapabilityDispatch);
     assert_eq!(
@@ -391,7 +391,7 @@ async fn an_agent_loop_records_one_row_per_iteration() {
         .expect("parent graph builds");
     let store = KeyedGraphStore::default().with_graph(body_wf, one_module_graph(module_id));
     let mut r = rig(&parent_graph, store, module_id, json!({"finished": false}));
-    let execution_id = run(&mut r, json!({"finished": false})).await;
+    let execution_id = Box::pin(run(&mut r, json!({"finished": false}))).await;
 
     let rows = r.recorder.of_kind(ChildDispatchKind::AgentLoop);
     assert_eq!(
@@ -431,7 +431,7 @@ async fn a_react_loop_records_the_kind_the_author_wrote() {
         .expect("parent graph builds");
     let store = KeyedGraphStore::default().with_graph(body_wf, one_module_graph(module_id));
     let mut r = rig(&parent_graph, store, module_id, json!({"finished": false}));
-    run(&mut r, json!({"finished": false})).await;
+    Box::pin(run(&mut r, json!({"finished": false}))).await;
 
     assert_eq!(
         r.recorder.of_kind(ChildDispatchKind::ReactLoop).len(),
@@ -467,7 +467,7 @@ async fn an_agent_loop_that_finishes_early_records_only_what_ran() {
         .expect("parent graph builds");
     let store = KeyedGraphStore::default().with_graph(body_wf, one_module_graph(module_id));
     let mut r = rig(&parent_graph, store, module_id, json!({"finished": true}));
-    run(&mut r, json!({"finished": true})).await;
+    Box::pin(run(&mut r, json!({"finished": true}))).await;
 
     assert_eq!(
         r.recorder.of_kind(ChildDispatchKind::AgentLoop).len(),

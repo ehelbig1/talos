@@ -857,7 +857,7 @@ mod tests {
                 "{name} estimate {estimate_ms} sits exactly ON a boundary, so \
                  histogram_quantile reports the edge instead of interpolating"
             );
-            let lo = b.iter().filter(|v| **v < estimate_ms).next_back().copied();
+            let lo = b.iter().rfind(|v| **v < estimate_ms).copied();
             let hi = b.iter().find(|v| **v > estimate_ms).copied();
             let (lo, hi) = (
                 lo.unwrap_or_else(|| panic!("{name} below every boundary: {b:?}")),
