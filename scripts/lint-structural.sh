@@ -9129,8 +9129,21 @@ elif ! command -v cargo >/dev/null 2>&1; then
     red "✗ cargo is not on PATH — check 89 needs \`cargo tree\` to derive the linked crate sets"
     EXIT_CODE=1
 else
-    CK89_OUT="$(python3 "$ROOT/scripts/lint-config-reference-components.py" "$ROOT" 2>&1)"
-    CK89_RC=$?
+# The `|| CK89_RC=$?` on the assignment is LOAD-BEARING (2026-09-22, package
+# DM), and the same form is on every python-script check below (90-93, 95).
+# The script is `set -euo pipefail`, and an assignment whose command
+# substitution exits non-zero is a failing simple command: with the former
+# `CK89_OUT="$(...)"` / `CK89_RC=$?` pair, a script that found something
+# exited 1, the assignment aborted the run HERE, `CK89_RC=$?` never executed,
+# the finding text was never printed and checks 90-95 never ran — `make: ***
+# [lint] Error 1` and nothing else. Measured on the first lint run of package
+# DM, whose one real check-89 finding surfaced only by running the script by
+# hand. Every one of these checks had shipped at zero findings, so the failure
+# arm had never once executed in CI. #768 recorded the same class for a
+# `grep | grep` pipeline one check earlier; this is its assignment-form twin.
+# `RC=0; OUT="$(...)" || RC=$?` is the `||`-list exemption from `set -e`.
+    CK89_RC=0
+    CK89_OUT="$(python3 "$ROOT/scripts/lint-config-reference-components.py" "$ROOT" 2>&1)" || CK89_RC=$?
     if [ "$CK89_RC" -eq 0 ]; then
         green "✓ every Component cell names a process that can read its variable ($(echo "$CK89_OUT" | tail -1 | sed -E 's/^ +//'))"
     else
@@ -9185,8 +9198,8 @@ else
         red "✗ check 90's own fixtures fail — the detector is not measuring what it claims"
         EXIT_CODE=1
     fi
-    CK90_OUT="$(python3 "$ROOT/scripts/lint-inline-env-bool.py" "$ROOT" 2>&1)"
-    CK90_RC=$?
+    CK90_RC=0
+    CK90_OUT="$(python3 "$ROOT/scripts/lint-inline-env-bool.py" "$ROOT" 2>&1)" || CK90_RC=$?
     if [ "$CK90_RC" -eq 0 ]; then
         green "✓ every boolean env read routes through talos_config::bool_env ($(echo "$CK90_OUT" | tail -1 | sed -E 's/^ +//'))"
     else
@@ -9232,8 +9245,8 @@ if [ ! -f "$ROOT/scripts/lint-vault-path-log-redaction.py" ]; then
     red "✗ scripts/lint-vault-path-log-redaction.py is missing — the check cannot run"
     EXIT_CODE=1
 else
-    CK91_OUT="$(python3 "$ROOT/scripts/lint-vault-path-log-redaction.py" "$ROOT" 2>&1)"
-    CK91_RC=$?
+    CK91_RC=0
+    CK91_OUT="$(python3 "$ROOT/scripts/lint-vault-path-log-redaction.py" "$ROOT" 2>&1)" || CK91_RC=$?
     if [ "$CK91_RC" -eq 0 ]; then
         green "✓ every vault key path in a log line routes through redact_vault_path_for_log ($(echo "$CK91_OUT" | tail -1 | sed -E 's/^ +//'))"
     else
@@ -9261,8 +9274,8 @@ if [ ! -f "$ROOT/scripts/lint-doc-evidence-paths.py" ]; then
     red "✗ scripts/lint-doc-evidence-paths.py is missing — the check cannot run"
     EXIT_CODE=1
 else
-    CK92_OUT="$(python3 "$ROOT/scripts/lint-doc-evidence-paths.py" "$ROOT" 2>&1)"
-    CK92_RC=$?
+    CK92_RC=0
+    CK92_OUT="$(python3 "$ROOT/scripts/lint-doc-evidence-paths.py" "$ROOT" 2>&1)" || CK92_RC=$?
     if [ "$CK92_RC" -eq 0 ]; then
         green "✓ every evidence path in the classified docs names real code ($(echo "$CK92_OUT" | tail -1 | sed -E 's/^ +//'))"
     else
@@ -9300,8 +9313,8 @@ if [ ! -f "$ROOT/scripts/lint-image-pins.py" ]; then
     red "✗ scripts/lint-image-pins.py is missing — the check cannot run"
     EXIT_CODE=1
 else
-    CK93_OUT="$(cd "$ROOT" && python3 scripts/lint-image-pins.py "$ROOT" 2>&1)"
-    CK93_RC=$?
+    CK93_RC=0
+    CK93_OUT="$(cd "$ROOT" && python3 scripts/lint-image-pins.py "$ROOT" 2>&1)" || CK93_RC=$?
     if [ "$CK93_RC" -eq 0 ]; then
         green "✓ every container image reference is digest-pinned ($(echo "$CK93_OUT" | tail -1 | sed -E 's/^ +//'))"
     else
@@ -9380,8 +9393,8 @@ if [ ! -f "$ROOT/scripts/lint-execution-start-budget.py" ]; then
     red "✗ scripts/lint-execution-start-budget.py is missing — the check cannot run"
     EXIT_CODE=1
 else
-    CK95_OUT="$(cd "$ROOT" && python3 scripts/lint-execution-start-budget.py "$ROOT" 2>&1)"
-    CK95_RC=$?
+    CK95_RC=0
+    CK95_OUT="$(cd "$ROOT" && python3 scripts/lint-execution-start-budget.py "$ROOT" 2>&1)" || CK95_RC=$?
     if [ "$CK95_RC" -eq 0 ]; then
         green "✓ every execution-row insert runs the actor budget check ($(echo "$CK95_OUT" | tail -1 | sed -E 's/^ +//'))"
     else

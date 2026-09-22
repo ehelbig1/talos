@@ -35,6 +35,8 @@ pub use security::{
     RotationAuditArmOutcome, TokenReuseOutcome, TwoFactorOutcome,
 };
 pub use vault_token::{VaultTokenLifetimeLabel, VaultTokenRenewalOutcome};
+pub mod advisory_db;
+pub use advisory_db::{AdvisoryDbCopy, AdvisoryDbSampleOutcome};
 pub use webhook::WebhookAuthFormat;
 
 /// The complete, closed set of `subject` label values on
@@ -668,6 +670,44 @@ pub fn publish_vault_token_ttl_on(
         .vault_token_ttl_seconds
         .with_label_values(&[lifetime.as_str()])
         .set(i64::try_from(ttl_secs).unwrap_or(i64::MAX));
+}
+
+/// Publish one MEASURED advisory-database age for `copy`.
+pub fn publish_advisory_db_age_on(metrics: &TalosMetrics, copy: AdvisoryDbCopy, age_days: u64) {
+    metrics
+        .advisory_db_age_days
+        .with_label_values(&[copy.as_str()])
+        .set(i64::try_from(age_days).unwrap_or(i64::MAX));
+}
+
+/// Publish the limit the compile gate applies to `copy` and whether it
+/// refuses (1) or only warns (0) on this controller.
+pub fn publish_advisory_db_limits_on(
+    metrics: &TalosMetrics,
+    copy: AdvisoryDbCopy,
+    max_age_days: u64,
+    enforced: bool,
+) {
+    metrics
+        .advisory_db_max_age_days
+        .with_label_values(&[copy.as_str()])
+        .set(i64::try_from(max_age_days).unwrap_or(i64::MAX));
+    metrics
+        .advisory_db_age_enforced
+        .with_label_values(&[copy.as_str()])
+        .set(i64::from(enforced));
+}
+
+/// Count one advisory-database age sample.
+pub fn record_advisory_db_sample_on(
+    metrics: &TalosMetrics,
+    copy: AdvisoryDbCopy,
+    outcome: AdvisoryDbSampleOutcome,
+) {
+    metrics
+        .advisory_db_age_samples_total
+        .with_label_values(&[copy.as_str(), outcome.as_str()])
+        .inc();
 }
 
 /// Count one attempt to fetch Google's JWK set. Inert without [`set_global`].
@@ -1716,6 +1756,18 @@ pub struct TalosMetrics {
     // only a process running a Vault KEK provider can move it.
     pub vault_token_renewals_total: CounterVec,
     pub vault_token_ttl_seconds: IntGaugeVec,
+
+    // RustSec advisory-database age (2026-09-22). The compile gate refuses
+    // every Rust compile in production once the baked DB passes
+    // TALOS_ADVISORY_DB_MAX_AGE_DAYS, and until these existed the age was
+    // computed only when somebody compiled. Three READINGS keyed on `copy`
+    // (absent until the hourly sampler's first tick — a seeded 0 would say
+    // "built today") and one pre-seeded sample counter, whose `unreadable`
+    // value is what says the age reading is stale.
+    pub advisory_db_age_days: IntGaugeVec,
+    pub advisory_db_max_age_days: IntGaugeVec,
+    pub advisory_db_age_enforced: IntGaugeVec,
+    pub advisory_db_age_samples_total: CounterVec,
 
     // `talos_cache_hits_total{cache_type}` / `talos_cache_misses_total` were
     // DELETED 2026-09-11: registered since 2026-05 with a comment naming three
@@ -3234,6 +3286,65 @@ impl TalosMetrics {
         )?;
         registry.register(Box::new(vault_token_ttl_seconds.clone()))?;
 
+        // RustSec advisory-database age
+        let advisory_db_age_days = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "talos_advisory_db_age_days",
+                "Age in whole days of the baked RustSec advisory database that the compile \
+                 gate (check_advisory_db_age) consults, sampled hourly from the freshest of \
+                 three filesystem signals (directory mtime, .git/refs/heads/main|master mtime, \
+                 newest crates/ entry). `copy` names which baked copy was sampled; only the \
+                 controller's is today, and in container mode `cargo audit` reads the BUILDER \
+                 image's copy, which this series does not see. A reading, not a count: ABSENT \
+                 until the first sample, and left at its last value when a sample is \
+                 unreadable — read talos_advisory_db_age_samples_total{outcome=\"unreadable\"} \
+                 beside it. Alerted by TalosAdvisoryDbAging and TalosAdvisoryDbExpired.",
+            ),
+            &["copy"],
+        )?;
+        registry.register(Box::new(advisory_db_age_days.clone()))?;
+        let advisory_db_max_age_days = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "talos_advisory_db_max_age_days",
+                "The age at which check_advisory_db_age refuses (TALOS_ADVISORY_DB_MAX_AGE_DAYS, \
+                 default 90), as this controller resolved it. Exported so the expiry alert's \
+                 threshold is the process's own limit rather than a copy of the default. \
+                 Absent until the first sample.",
+            ),
+            &["copy"],
+        )?;
+        registry.register(Box::new(advisory_db_max_age_days.clone()))?;
+        let advisory_db_age_enforced = IntGaugeVec::new(
+            prometheus::Opts::new(
+                "talos_advisory_db_age_enforced",
+                "1 when a stale advisory database REFUSES compilation on this controller \
+                 (RUST_ENV=production), 0 when it only warns. TalosAdvisoryDbExpired is \
+                 critical only where this is 1; outside production an expired copy is \
+                 TalosAdvisoryDbAging's warning. Absent until the first sample.",
+            ),
+            &["copy"],
+        )?;
+        registry.register(Box::new(advisory_db_age_enforced.clone()))?;
+        let advisory_db_age_samples_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_advisory_db_age_samples_total",
+                "Hourly samples of the baked advisory database's age, by outcome: measured \
+                 (the age gauge was set) | unreadable (the database is missing, unreadable or \
+                 dated in the future — the gauge was NOT touched, and cargo audit --no-fetch \
+                 fails in every environment while this persists). Pre-seeded at 0 for every \
+                 (copy, outcome). Alerted by TalosAdvisoryDbUnreadable.",
+            ),
+            &["copy", "outcome"],
+        )?;
+        registry.register(Box::new(advisory_db_age_samples_total.clone()))?;
+        for copy in AdvisoryDbCopy::ALL {
+            for outcome in AdvisoryDbSampleOutcome::ALL {
+                advisory_db_age_samples_total
+                    .with_label_values(&[copy.as_str(), outcome.as_str()])
+                    .inc_by(0.0);
+            }
+        }
+
         // (cache_hits_total / cache_misses_total were deleted 2026-09-11 — see
         // the struct field comment.)
 
@@ -3714,6 +3825,10 @@ impl TalosMetrics {
             google_jwk_refresh_total,
             vault_token_renewals_total,
             vault_token_ttl_seconds,
+            advisory_db_age_days,
+            advisory_db_max_age_days,
+            advisory_db_age_enforced,
+            advisory_db_age_samples_total,
             dlq_entries_total,
             dlq_drops_total,
             dlq_db_errors_total,
@@ -3904,6 +4019,58 @@ mod tests {
     /// test above this fn and took this attribute with it, so the guard on the
     /// crypto series (incl. the blind-detector stamp rendering 0) had not run
     /// since 2026-09-11 while `cargo check --all-targets` called it dead code.
+    /// The advisory-database age series (2026-09-22): the three readings are
+    /// ABSENT on a cold registry — a seeded 0 would say "built today" — while
+    /// both sample outcomes are seeded, and each recorder moves exactly the
+    /// series it names.
+    #[test]
+    fn advisory_db_readings_are_absent_until_sampled_and_the_counter_is_seeded() {
+        let m = TalosMetrics::new().unwrap();
+        let cold = m.render_prometheus().expect("render");
+        for reading in [
+            "talos_advisory_db_age_days{",
+            "talos_advisory_db_max_age_days{",
+            "talos_advisory_db_age_enforced{",
+        ] {
+            assert!(
+                !cold.contains(reading),
+                "{reading} must be absent before the first sample"
+            );
+        }
+        assert!(cold.contains(
+            r#"talos_advisory_db_age_samples_total{copy="controller",outcome="measured"} 0"#
+        ));
+        assert!(cold.contains(
+            r#"talos_advisory_db_age_samples_total{copy="controller",outcome="unreadable"} 0"#
+        ));
+
+        super::publish_advisory_db_age_on(&m, AdvisoryDbCopy::Controller, 75);
+        super::publish_advisory_db_limits_on(&m, AdvisoryDbCopy::Controller, 90, true);
+        super::record_advisory_db_sample_on(
+            &m,
+            AdvisoryDbCopy::Controller,
+            AdvisoryDbSampleOutcome::Measured,
+        );
+        let warm = m.render_prometheus().expect("render");
+        assert!(warm.contains(r#"talos_advisory_db_age_days{copy="controller"} 75"#));
+        assert!(warm.contains(r#"talos_advisory_db_max_age_days{copy="controller"} 90"#));
+        assert!(warm.contains(r#"talos_advisory_db_age_enforced{copy="controller"} 1"#));
+        assert!(warm.contains(
+            r#"talos_advisory_db_age_samples_total{copy="controller",outcome="measured"} 1"#
+        ));
+        assert!(warm.contains(
+            r#"talos_advisory_db_age_samples_total{copy="controller",outcome="unreadable"} 0"#
+        ));
+
+        // A later sample that only warns flips the enforced reading; the age
+        // it did not remeasure stands.
+        super::publish_advisory_db_limits_on(&m, AdvisoryDbCopy::Controller, 120, false);
+        let later = m.render_prometheus().expect("render");
+        assert!(later.contains(r#"talos_advisory_db_max_age_days{copy="controller"} 120"#));
+        assert!(later.contains(r#"talos_advisory_db_age_enforced{copy="controller"} 0"#));
+        assert!(later.contains(r#"talos_advisory_db_age_days{copy="controller"} 75"#));
+    }
+
     #[test]
     fn crypto_invariant_metrics_render() {
         let m = TalosMetrics::new().unwrap();
@@ -4591,6 +4758,13 @@ mod tests {
             r#"talos_audit_chain_jobs_swept_total{outcome="empty"} 0"#,
             r#"talos_audit_chain_jobs_swept_total{outcome="failed"} 0"#,
             r#"talos_audit_chain_jobs_swept_total{outcome="errored"} 0"#,
+            // The advisory-database age sampler (2026-09-22). Its `unreadable`
+            // value is alerted with an `increase(...) > 0`, and on a correctly
+            // built image it is zero FOREVER — exactly where ABSENT and ZERO
+            // diverge. Both outcomes are seeded because one sampler reaches
+            // both.
+            r#"talos_advisory_db_age_samples_total{copy="controller",outcome="measured"} 0"#,
+            r#"talos_advisory_db_age_samples_total{copy="controller",outcome="unreadable"} 0"#,
             // The duplicate-delivery pair. Neither is alerted on — that is the
             // point of them — but both are read by an operator asking "is this
             // ledger carrying redundant copies?", and an ABSENT series answers

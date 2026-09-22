@@ -118,6 +118,10 @@ background_tasks! {
     WorkerFleetGauge            => "worker_fleet_gauge",
     EmbeddingProviderProbe      => "embedding_provider_probe",
     CryptoInvariantGauge        => "crypto_invariant_gauge",
+    // Hourly age of the baked RustSec advisory database (2026-09-22): the
+    // compile gate refuses at TALOS_ADVISORY_DB_MAX_AGE_DAYS and until this
+    // loop existed the age was computed only when somebody compiled.
+    AdvisoryDbAgeGauge          => "advisory_db_age_gauge",
     CatalogMissingWasmGauge     => "catalog_missing_wasm_gauge",
     NodeFuelHeadroomGauge       => "node_fuel_headroom_gauge",
     FleetBuildSkewGauge         => "fleet_build_skew_gauge",

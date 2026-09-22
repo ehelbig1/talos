@@ -9,6 +9,7 @@ use anyhow::{bail, Context, Result};
 use handlebars::Handlebars;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+pub mod advisory_db;
 mod analyze;
 pub mod catalog;
 pub mod container;
@@ -58,180 +59,93 @@ pub(crate) fn nonzero_env_or_default(var: &str, default: usize) -> usize {
 /// a freshness check, a long-running cluster pinned to an old image
 /// can silently miss new advisories for weeks or months.
 ///
-/// This check uses the directory mtime as a proxy for the snapshot
-/// date — the publish-images pipeline writes the DB then doesn't
-/// touch it, so mtime corresponds to the bake-in moment. A more
-/// precise signal would be the git HEAD commit date inside the
-/// advisory-db repo, but mtime is portable (works for non-git
-/// snapshots too) and good-enough for a coarse "is it stale" gate.
-///
 /// Thresholds:
-/// - **Warn**: 30 days. Operators rebuild the builder image roughly
-///   monthly per CLAUDE.md guidance; a warning log here surfaces the
-///   condition in dashboards before it becomes a fail-closed.
-/// - **Fail-closed in production**: 90 days. Three months without an
-///   advisory refresh is too long; in production the compilation
+/// - **Warn**: [`advisory_db::ADVISORY_DB_WARN_AGE_DAYS`] (30). Operators
+///   rebuild the builder image roughly monthly per CLAUDE.md guidance; a
+///   warning here surfaces the condition before it becomes a fail-closed.
+/// - **Fail-closed in production**: [`advisory_db::advisory_db_max_age_days`]
+///   (default 90, `TALOS_ADVISORY_DB_MAX_AGE_DAYS`). Three months without
+///   an advisory refresh is too long; in production the compilation
 ///   refuses rather than rubber-stamping the build with stale data.
 ///   Outside production (dev/CI) the warning is enough.
 ///
-/// `TALOS_ADVISORY_DB_MAX_AGE_DAYS` overrides the fail-closed
-/// threshold (must be a positive integer). Use this for operators
-/// who genuinely cannot rebuild monthly (air-gapped environments)
-/// and have a compensating control elsewhere.
+/// The age, the limit and the decision have ONE home, [`advisory_db`]
+/// (2026-09-22) — the same computation the controller samples hourly onto
+/// `talos_advisory_db_age_days`, so what the gate consults and what the
+/// alerts read cannot drift. This function only renders the outcome.
 pub(crate) fn check_advisory_db_age(db_path: &str) -> Result<()> {
-    use std::time::SystemTime;
-    let meta = match std::fs::metadata(db_path) {
-        Ok(m) => m,
+    check_advisory_db_age_as(db_path, talos_config::is_production())
+}
+
+/// [`check_advisory_db_age`] with the posture passed in, so the refusal arm
+/// is driven by a test without touching the process-global `RUST_ENV`.
+pub(crate) fn check_advisory_db_age_as(db_path: &str, production: bool) -> Result<()> {
+    use advisory_db::{
+        advisory_db_age_days, advisory_db_gate_outcome, advisory_db_max_age_days,
+        AdvisoryDbGateOutcome, ADVISORY_DB_WARN_AGE_DAYS,
+    };
+    let age_days = match advisory_db_age_days(db_path) {
+        Ok(age) => age,
         Err(e) => {
-            // Missing DB is a separate failure mode the audit tool itself
-            // surfaces with its own actionable error message. Don't
-            // double-report here; just log and let the cargo audit
+            // A DB that cannot be dated is a separate failure mode the audit
+            // tool itself surfaces with its own actionable error message.
+            // Don't double-report here; log and let the cargo audit
             // invocation produce the operator-recognised error.
             tracing::warn!(
                 target: "talos_compilation",
                 event_kind = "advisory_db_metadata_unreadable",
                 path = %db_path,
                 error = %e,
-                "Could not stat the advisory DB to check freshness — \
+                "Could not date the advisory DB to check freshness — \
                  cargo audit will surface the missing-DB error if applicable."
             );
             return Ok(());
         }
     };
-    let dir_mtime = match meta.modified() {
-        Ok(t) => t,
-        Err(_) => return Ok(()),
-    };
-
-    // wasm-security-review (2026-05-22): the directory mtime alone is
-    // a fragile proxy — a `touch` or filesystem-repair tool can
-    // refresh it without any content change. Take the MAX of three
-    // signals so each one can independently bound staleness:
-    //   1. Directory mtime (legacy signal).
-    //   2. `.git/refs/heads/main` (or master) mtime — the git ref
-    //      file is written on every `git pull`/`git fetch`, so it
-    //      captures the actual upstream-sync moment for a cloned
-    //      advisory-db.
-    //   3. Newest file mtime under `<db_path>/crates/` — captures the
-    //      newest advisory added in any form (snapshot tarball,
-    //      manual copy, etc.) even when no `.git` directory exists.
-    // The freshest signal wins; if any signal returns "recent", the
-    // gate doesn't trip even if another signal is stale.
-    let mut freshest = dir_mtime;
-    for ref_name in ["main", "master"] {
-        let ref_path = format!("{db_path}/.git/refs/heads/{ref_name}");
-        if let Ok(meta) = std::fs::metadata(&ref_path) {
-            if let Ok(t) = meta.modified() {
-                if t > freshest {
-                    freshest = t;
-                }
-            }
-        }
-    }
-    if let Ok(rd) = std::fs::read_dir(format!("{db_path}/crates")) {
-        // Bound the walk: visit the per-crate dirs at depth-1 (taking
-        // each dir's mtime). Going deeper would touch tens of
-        // thousands of advisory files for marginal benefit — a
-        // per-crate dir's mtime updates whenever any of its
-        // advisories is added/modified.
-        for entry in rd.flatten().take(20_000) {
-            if let Ok(meta) = entry.metadata() {
-                if let Ok(t) = meta.modified() {
-                    if t > freshest {
-                        freshest = t;
-                    }
-                }
-            }
-        }
-    }
-
-    let age = match SystemTime::now().duration_since(freshest) {
-        Ok(d) => d,
-        Err(_) => return Ok(()),
-    };
-    let age_days = age.as_secs() / 86_400;
-
-    let fail_threshold_days: u64 = std::env::var("TALOS_ADVISORY_DB_MAX_AGE_DAYS")
-        .ok()
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(90);
-
-    let warn_threshold_days: u64 = 30;
-
-    if age_days >= fail_threshold_days {
-        if talos_config::is_production() {
+    let fail_threshold_days = advisory_db_max_age_days();
+    let warn_threshold_days = ADVISORY_DB_WARN_AGE_DAYS;
+    match advisory_db_gate_outcome(age_days, fail_threshold_days, production) {
+        AdvisoryDbGateOutcome::Refuse => {
             // Fail closed — production must not compile against a stale
             // advisory set. Operator action: rebuild the builder image.
-            return Err(anyhow::anyhow!(
+            Err(anyhow::anyhow!(
                 "RustSec advisory database at {db_path} is {age_days} days old \
                  (max {fail_threshold_days} days in production). Rebuild the \
                  talos-builder image (`scripts/build-compiler-image.sh`) to \
                  refresh the baked-in advisory snapshot, or set \
                  TALOS_ADVISORY_DB_MAX_AGE_DAYS=<bigger_number> if you have a \
                  compensating control for stale advisories."
-            ));
+            ))
         }
-        // Outside production: loud warning, don't block.
-        tracing::warn!(
-            target: "talos_compilation",
-            event_kind = "advisory_db_stale_dev",
-            path = %db_path,
-            age_days,
-            fail_threshold_days,
-            "Advisory DB is past the production fail threshold but \
-             this is dev/test — compilation continues. Rebuild the \
-             builder image to refresh."
-        );
-    } else if age_days >= warn_threshold_days {
-        tracing::warn!(
-            target: "talos_compilation",
-            event_kind = "advisory_db_aging",
-            path = %db_path,
-            age_days,
-            warn_threshold_days,
-            fail_threshold_days,
-            "Advisory DB is aging — rebuild the talos-builder image \
-             monthly to absorb new RustSec advisories."
-        );
-    }
-    Ok(())
-}
-
-/// L-16: numeric helper used by the compile-provenance log line. Same
-/// inputs as `check_advisory_db_age` but returns the age directly
-/// rather than emit a verdict.
-///
-/// wasm-security-review (2026-05-22): mirrors the multi-signal logic
-/// in `check_advisory_db_age` so the provenance log reports the same
-/// freshness number the gate consults.
-pub(crate) fn advisory_db_age_days(db_path: &str) -> Option<u64> {
-    use std::time::SystemTime;
-    let meta = std::fs::metadata(db_path).ok()?;
-    let mut freshest = meta.modified().ok()?;
-    for ref_name in ["main", "master"] {
-        let ref_path = format!("{db_path}/.git/refs/heads/{ref_name}");
-        if let Ok(meta) = std::fs::metadata(&ref_path) {
-            if let Ok(t) = meta.modified() {
-                if t > freshest {
-                    freshest = t;
-                }
-            }
+        AdvisoryDbGateOutcome::WarnExpiredUnenforced => {
+            // Outside production: loud warning, don't block.
+            tracing::warn!(
+                target: "talos_compilation",
+                event_kind = "advisory_db_stale_dev",
+                path = %db_path,
+                age_days,
+                fail_threshold_days,
+                "Advisory DB is past the production fail threshold but \
+                 this is dev/test — compilation continues. Rebuild the \
+                 builder image to refresh."
+            );
+            Ok(())
         }
-    }
-    if let Ok(rd) = std::fs::read_dir(format!("{db_path}/crates")) {
-        for entry in rd.flatten().take(20_000) {
-            if let Ok(meta) = entry.metadata() {
-                if let Ok(t) = meta.modified() {
-                    if t > freshest {
-                        freshest = t;
-                    }
-                }
-            }
+        AdvisoryDbGateOutcome::WarnAging => {
+            tracing::warn!(
+                target: "talos_compilation",
+                event_kind = "advisory_db_aging",
+                path = %db_path,
+                age_days,
+                warn_threshold_days,
+                fail_threshold_days,
+                "Advisory DB is aging — rebuild the talos-builder image \
+                 monthly to absorb new RustSec advisories."
+            );
+            Ok(())
         }
+        AdvisoryDbGateOutcome::Pass => Ok(()),
     }
-    let age = SystemTime::now().duration_since(freshest).ok()?;
-    Some(age.as_secs() / 86_400)
 }
 
 /// L-16: stable fingerprint of the effective dependency allowlist
@@ -306,45 +220,89 @@ mod provenance_fingerprint_tests {
 
 #[cfg(test)]
 mod advisory_db_age_tests {
+    //! The gate's DECISION is tested purely in `advisory_db::tests`
+    //! (`the_gate_refuses_only_an_expired_copy_in_production`), because
+    //! `RUST_ENV` is process-global. What is tested here is the rendering
+    //! this function still owns: outside production a copy of any age
+    //! passes, and a copy that cannot be dated passes rather than
+    //! double-faulting.
     use super::check_advisory_db_age;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
 
     /// A non-existent DB path is treated as "not our problem here" —
     /// cargo audit surfaces the missing-DB error. The freshness check
     /// must not double-fault.
     #[test]
     fn nonexistent_db_returns_ok() {
-        let path = "/does/not/exist/advisory-db";
-        let result = check_advisory_db_age(path);
+        let result = check_advisory_db_age("/does/not/exist/advisory-db");
         assert!(result.is_ok(), "missing DB should not error here");
     }
 
     #[test]
     fn fresh_db_passes() {
-        // A tempdir created now has mtime = now → age = 0 days.
         let tmp = tempfile::tempdir().expect("create tempdir");
-        let p = tmp.path().to_str().unwrap();
-        check_advisory_db_age(p).expect("fresh dir should pass");
+        check_advisory_db_age(tmp.path().to_str().unwrap()).expect("fresh dir should pass");
     }
 
-    /// 100-day-old DB in dev environment: warns but doesn't fail.
-    /// We can't easily backdate mtime in a portable way for the
-    /// production-fail-closed branch test without touching the
-    /// filesystem; the env-var-tunable threshold is exercised
-    /// indirectly via the override path.
+    /// The same 400-day-old copy under a PRODUCTION posture is refused, and
+    /// the refusal names the age, the limit and the rebuild script; under a
+    /// non-production posture it passes (the operator-facing WARN is the
+    /// gate's, its decision is `advisory_db_gate_outcome`'s).
     #[test]
-    fn old_db_with_huge_threshold_passes() {
-        // Even a hypothetically 1000-day-old DB passes if the
-        // operator opts out via the env-var override.
+    fn expired_db_is_refused_in_production_and_passes_elsewhere() {
         let tmp = tempfile::tempdir().expect("create tempdir");
+        let t = SystemTime::now() - Duration::from_secs(400 * 86_400);
+        std::fs::File::open(tmp.path())
+            .and_then(|f| f.set_modified(t))
+            .expect("backdate");
         let p = tmp.path().to_str().unwrap();
-        std::env::set_var("TALOS_ADVISORY_DB_MAX_AGE_DAYS", "100000");
-        let result = check_advisory_db_age(p);
-        std::env::remove_var("TALOS_ADVISORY_DB_MAX_AGE_DAYS");
-        assert!(
-            result.is_ok(),
-            "operator-tunable threshold should override default — got {result:?}"
+        let refused = super::check_advisory_db_age_as(p, true).expect_err("production refuses");
+        let msg = refused.to_string();
+        assert!(msg.contains("is 400 days old"), "{msg}");
+        assert!(msg.contains("max 90 days in production"), "{msg}");
+        assert!(msg.contains("scripts/build-compiler-image.sh"), "{msg}");
+        super::check_advisory_db_age_as(p, false).expect("outside production it passes");
+        // A copy under the warn threshold passes in production too.
+        let fresh = tempfile::tempdir().expect("create tempdir");
+        super::check_advisory_db_age_as(fresh.path().to_str().unwrap(), true)
+            .expect("a fresh copy passes in production");
+    }
+
+    /// TEXTUAL, and stated as such: the production wrapper hands the real
+    /// posture to the seam the tests drive. A wrapper passing `false` would
+    /// leave every test above green and never refuse anything.
+    #[test]
+    fn the_gate_wrapper_passes_the_real_posture() {
+        // Production text only: this test quotes the needle, so a whole-file
+        // search would match its own assertion and vouch for nothing (the
+        // pin-that-matches-its-own-needle shape, package DL).
+        let prod = include_str!("lib.rs")
+            .split("mod advisory_db_age_tests")
+            .next()
+            .expect("production text");
+        assert_eq!(
+            prod.matches("check_advisory_db_age_as(db_path, talos_config::is_production())")
+                .count(),
+            1,
+            "check_advisory_db_age must pass talos_config::is_production() to the seam"
         );
+    }
+
+    /// 400 days old — past every limit an operator could reasonably set —
+    /// and this binary is not production, so the gate warns and passes.
+    #[test]
+    fn expired_db_outside_production_passes() {
+        assert!(
+            !talos_config::is_production(),
+            "this test binary must not run as production"
+        );
+        let tmp = tempfile::tempdir().expect("create tempdir");
+        let t = SystemTime::now() - Duration::from_secs(400 * 86_400);
+        std::fs::File::open(tmp.path())
+            .and_then(|f| f.set_modified(t))
+            .expect("backdate");
+        check_advisory_db_age(tmp.path().to_str().unwrap())
+            .expect("an expired copy outside production warns and passes");
     }
 }
 
@@ -1531,8 +1489,10 @@ impl CompilationService {
         //     old binaries (their imports are a subset) but tracking
         //     it makes "this binary expects pre-X WIT" auditable.
         let allowlist_fp = dependency_allowlist_fingerprint();
+        // `u64::MAX` is this field's documented "unknown" sentinel; the
+        // reason it could not be dated is the sampler's and the gate's to log.
         let advisory_db_age_days =
-            advisory_db_age_days(container::ADVISORY_DB_PATH).unwrap_or(u64::MAX);
+            advisory_db::advisory_db_age_days(container::ADVISORY_DB_PATH).unwrap_or(u64::MAX);
         let wit_schema_fp = wit_schema_fingerprint();
         tracing::info!(
             target: "talos_compilation_provenance",

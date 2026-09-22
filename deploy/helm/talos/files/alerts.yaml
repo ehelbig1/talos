@@ -2844,6 +2844,112 @@ groups:
             VAULT_TOKEN and restart the controller.
 
   # ────────────────────────────────────────────────────────────────────
+  # THE BAKED RUSTSEC ADVISORY DATABASE (2026-09-22). `cargo audit --no-fetch`
+  # runs against a copy baked into the image at build time, and
+  # `check_advisory_db_age` (talos-compilation) warns at 30 days and, in
+  # production, REFUSES every Rust compile and audit once that copy is older
+  # than TALOS_ADVISORY_DB_MAX_AGE_DAYS (default 90). Until this group the age
+  # was computed only when somebody compiled: the reference controller's copy
+  # was 75 days old with nothing counting down to the day the gate would start
+  # refusing — the Vault KEK token's shape before TalosVaultTokenRenewalFailing.
+  #
+  # The controller now samples the age HOURLY (BackgroundTask
+  # `advisory_db_age_gauge`) onto three readings keyed by `copy` — the age,
+  # the limit the gate resolved, and whether that limit REFUSES (1) or only
+  # warns (0) on this controller — plus a pre-seeded sample counter. Every
+  # threshold below is the gate's own: the warn number is the gate's constant
+  # (pinned at compile time by talos-compilation's
+  # `alerts_read_the_gates_own_thresholds`), the expiry compares the age to
+  # the EXPORTED limit rather than to a copied default, and the unreadable
+  # window is two samples.
+  #
+  # NO absent() ARM: the readings are absent on a controller that has not yet
+  # sampled (boot pays one sample at once), and the worker never exports them.
+  # The three readings are a REPORT of one image; `copy="controller"` is the
+  # copy the gate consults. In container mode `cargo audit` reads the BUILDER
+  # image's own copy, which nothing samples yet.
+  - name: talos.advisory_db
+    interval: 30s
+    rules:
+      # The gate's warn threshold, as an alert. Fires until the image is
+      # rebuilt — that is the action, and the condition is a stated policy
+      # violation (rebuild monthly), not a control working as designed.
+      - alert: TalosAdvisoryDbAging
+        expr: talos_advisory_db_age_days >= 30
+        for: 1h
+        labels:
+          severity: warning
+          category: supply-chain
+        annotations:
+          summary: "The baked RustSec advisory database is {{ $value }} days old"
+          description: |
+            `cargo audit` inside module compilation checks dependencies against
+            a copy of the RustSec advisory database baked into the image, and
+            this controller's copy is past the 30-day warn threshold. Every
+            "passed audit" since then is a statement about advisories at least
+            that old. In production the compile gate REFUSES at
+            `talos_advisory_db_max_age_days`; outside production it keeps
+            warning.
+          action: |
+            Rebuild and redeploy the controller and builder images
+            (`scripts/build-compiler-image.sh`; the image builds fetch a fresh
+            advisory snapshot). `talos_advisory_db_age_days` falls to 0 on the
+            next hourly sample after the new image boots.
+
+      # The gate is REFUSING. Reads the limit the process itself resolved and
+      # the posture reading, so it fires exactly where compiles are refused
+      # and nowhere else.
+      - alert: TalosAdvisoryDbExpired
+        expr: |
+          talos_advisory_db_age_days >= talos_advisory_db_max_age_days
+          and talos_advisory_db_age_enforced == 1
+        for: 5m
+        labels:
+          severity: critical
+          category: supply-chain
+        annotations:
+          summary: "Module compilation is REFUSED: the RustSec advisory database has expired"
+          description: |
+            The baked advisory database is at or past
+            `talos_advisory_db_max_age_days` and this controller runs with
+            RUST_ENV=production, so `check_advisory_db_age` refuses every Rust
+            compile and `cargo audit` (compile_custom_sandbox,
+            install_module_from_catalog, inline rust_code, hot_update_module)
+            with "RustSec advisory database ... is N days old". Nothing else is
+            affected; already-compiled modules keep running.
+          action: |
+            Rebuild and redeploy the controller and builder images. Bridging
+            only: raise TALOS_ADVISORY_DB_MAX_AGE_DAYS on the controller with a
+            compensating advisory control in place — the reading
+            `talos_advisory_db_max_age_days` follows it on the next sample.
+
+      # The database could not be DATED at all — missing, unreadable, or dated
+      # in the future. `cargo audit --no-fetch` fails in EVERY environment
+      # while this persists (there is nothing to audit against), and the age
+      # gauge keeps its last reading, so this counter is the only thing that
+      # says the reading is stale. Two samples, because the sampler is hourly.
+      - alert: TalosAdvisoryDbUnreadable
+        expr: increase(talos_advisory_db_age_samples_total{outcome="unreadable"}[2h]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          category: supply-chain
+        annotations:
+          summary: "The baked RustSec advisory database cannot be read"
+          description: |
+            The hourly age sampler could not date `/opt/talos-advisory-db` on
+            this controller. `cargo audit --no-fetch` fails against a missing
+            or unreadable database, so every Rust module compile fails its
+            audit step until the image carries one. `talos_advisory_db_age_days`
+            is stale from the first unreadable sample onward.
+          action: |
+            Controller log, target `talos_compilation`, event_kind
+            `advisory_db_metadata_unreadable`: the `error` field is the
+            filesystem's own reason. Rebuild the controller image
+            (`controller/Dockerfile` bakes the database at
+            /opt/talos-advisory-db) and redeploy.
+
+  # ────────────────────────────────────────────────────────────────────
   - name: talos.controller.health
     interval: 30s
     rules:
