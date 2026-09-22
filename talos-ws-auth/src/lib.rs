@@ -11,6 +11,112 @@ use uuid::Uuid;
 
 use talos_auth::AuthService;
 use talos_config as config;
+use talos_metrics::{WsActiveSession, WsHandshakeOutcome, WsOperationOutcome, WsSessionEnd};
+
+/// Why a handshake did not (or did) produce a session, decided from the
+/// Origin header alone — pure, so every arm is a unit test. `production`
+/// decides whether an ABSENT Origin is refused (browsers always send one on a
+/// WS upgrade; non-browser dev clients may not). `allowed` is the deployment's
+/// allow-list (`talos_config::is_allowed_origin` in production code).
+pub fn classify_origin(
+    origin: Option<&HeaderValue>,
+    production: bool,
+    allowed: impl Fn(&str) -> bool,
+) -> Result<(), WsHandshakeOutcome> {
+    match origin {
+        Some(value) => match value.to_str() {
+            Ok(text) if allowed(text) => Ok(()),
+            Ok(_) => Err(WsHandshakeOutcome::OriginNotAllowed),
+            Err(_) => Err(WsHandshakeOutcome::OriginMalformed),
+        },
+        None if production => Err(WsHandshakeOutcome::OriginMissing),
+        None => Ok(()),
+    }
+}
+
+/// An authenticated socket's identity, plus how long the access token has
+/// left — the session's hard deadline (a stolen-and-later-revoked cookie is
+/// bounded by it).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WsAuth {
+    pub user_id: Uuid,
+    pub is_2fa_verified: bool,
+    pub secs_until_expiry: u64,
+}
+
+/// Classify the cookie: absent, unverifiable, or carrying a `sub` that is not
+/// a UUID — each its own outcome for the operator, ONE `connection_error` for
+/// the caller. `verify` is `AuthService::verify_token` reduced to
+/// `(sub, is_2fa_verified, exp)` so this stays pure and testable; `now_secs`
+/// is the caller's clock (a token whose `exp` is already past yields a
+/// zero-second session, which the deadline then closes at once).
+pub fn classify_auth(
+    access_token: Option<&str>,
+    verify: impl FnOnce(&str) -> Result<(String, bool, i64), String>,
+    now_secs: u64,
+) -> Result<WsAuth, (WsHandshakeOutcome, Option<String>)> {
+    let Some(token) = access_token else {
+        return Err((WsHandshakeOutcome::NoToken, None));
+    };
+    let (sub, is_2fa_verified, exp) =
+        verify(token).map_err(|e| (WsHandshakeOutcome::InvalidToken, Some(e)))?;
+    let user_id = Uuid::parse_str(&sub).map_err(|_| (WsHandshakeOutcome::InvalidUserId, None))?;
+    let secs_until_expiry = u64::try_from(exp).unwrap_or(0).saturating_sub(now_secs);
+    Ok(WsAuth {
+        user_id,
+        is_2fa_verified,
+        secs_until_expiry,
+    })
+}
+
+/// The ONE place a handshake's outcome is counted and logged (package DU,
+/// 2026-09-22 — before it, nine refusal arms each carried their own WARN and
+/// none reached a series). Security refusals go to `talos_audit` at WARN;
+/// a cookieless socket is DEBUG (nothing to guess with; the counter has it);
+/// the two protocol outcomes keep the `event_kind`s operators already filter
+/// on. `Authenticated` is counted here and described at the auth site, which
+/// holds the user id. `detail` is bounded to 256 bytes before it is logged —
+/// it is caller-influenced (an Origin string, a verifier error) and never a
+/// token.
+fn report_handshake(outcome: WsHandshakeOutcome, detail: Option<&str>) {
+    talos_metrics::record_ws_handshake(outcome);
+    let detail = detail.map(|d| {
+        let mut end = d.len().min(256);
+        while !d.is_char_boundary(end) {
+            end -= 1;
+        }
+        &d[..end]
+    });
+    match outcome {
+        WsHandshakeOutcome::Authenticated => {}
+        WsHandshakeOutcome::NoToken => tracing::debug!(
+            target: "talos_ws_auth",
+            event_kind = "ws_handshake_refused",
+            outcome = outcome.as_str(),
+            "WebSocket connection_init without an access-token cookie"
+        ),
+        WsHandshakeOutcome::ProtocolViolation => tracing::warn!(
+            target: "talos_ws_auth",
+            event_kind = "ws_protocol_violation",
+            outcome = outcome.as_str(),
+            "WebSocket first message was not connection_init — closing"
+        ),
+        WsHandshakeOutcome::InitNotReceived => tracing::warn!(
+            target: "talos_ws_auth",
+            event_kind = "ws_init_not_received",
+            outcome = outcome.as_str(),
+            pending_refusal = detail,
+            "WebSocket closed without observing connection_init within deadline"
+        ),
+        refusal => tracing::warn!(
+            target: "talos_audit",
+            event_kind = "ws_handshake_refused",
+            outcome = refusal.as_str(),
+            detail,
+            "WebSocket handshake refused"
+        ),
+    }
+}
 
 /// Custom WebSocket handler that validates JWT tokens on connection
 /// Token is extracted from httpOnly cookie in the upgrade request (secure!)
@@ -21,25 +127,16 @@ pub async fn handle_websocket_auth(
     access_token: Option<String>,
     origin: Option<HeaderValue>,
 ) {
-    // Validate Origin header to prevent Cross-Site WebSocket Hijacking (CSWH)
-    if let Some(origin_val) = origin {
-        if let Ok(origin_str) = origin_val.to_str() {
-            if !config::is_allowed_origin(origin_str) {
-                tracing::warn!(
-                    "WebSocket connection rejected: unauthorized origin {:?}",
-                    origin_val
-                );
-                let _ = socket.close().await;
-                return;
-            }
-        } else {
-            tracing::warn!("WebSocket connection rejected: invalid Origin header format");
-            let _ = socket.close().await;
-            return;
-        }
-    } else if config::is_production() {
-        // In production, require an Origin header for security
-        tracing::warn!("WebSocket connection rejected: missing Origin header in production");
+    // Validate Origin header to prevent Cross-Site WebSocket Hijacking (CSWH).
+    if let Err(outcome) = classify_origin(
+        origin.as_ref(),
+        config::is_production(),
+        config::is_allowed_origin,
+    ) {
+        // The Origin string is what an operator triaging CSWH needs; it is
+        // caller-supplied and bounded by the report site.
+        let shown = origin.as_ref().and_then(|v| v.to_str().ok());
+        report_handshake(outcome, shown);
         let _ = socket.close().await;
         return;
     }
@@ -48,41 +145,37 @@ pub async fn handle_websocket_auth(
     // We also capture the token's expiry so we can hard-terminate the connection
     // when the token expires — this covers the session-revocation case where an
     // attacker holds a stolen token that is later revoked server-side.
-    let auth_result: Option<(Uuid, bool, tokio::time::Instant)> = if let Some(token) = access_token
-    {
-        match auth_service.verify_token(&token) {
-            Ok(claims) => match Uuid::parse_str(&claims.sub) {
-                Ok(user_id) => {
-                    // Convert JWT exp (Unix seconds) → Instant for use with tokio timeout.
-                    let now_secs = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    let secs_until_expiry = (claims.exp as u64).saturating_sub(now_secs);
-                    let deadline = tokio::time::Instant::now()
-                        + tokio::time::Duration::from_secs(secs_until_expiry);
-                    tracing::info!(
-                        user_id = %user_id,
-                        is_2fa_verified = claims.is_2fa_verified,
-                        expires_in_secs = secs_until_expiry,
-                        "WebSocket authenticated (via cookie)"
-                    );
-                    Some((user_id, claims.is_2fa_verified, deadline))
-                }
-                Err(_) => {
-                    tracing::warn!("WebSocket authentication failed: invalid user ID");
-                    None
-                }
-            },
-            Err(e) => {
-                tracing::warn!("WebSocket authentication failed: {:?}", e);
-                None
-            }
-        }
-    } else {
-        tracing::warn!("WebSocket authentication failed: no access token in cookie");
-        None
-    };
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // The verdict is held, not reported: the handshake's outcome is what the
+    // socket ENDS as, and a cookieless client that never sends
+    // connection_init ends as `init_not_received`, not `no_token`.
+    let auth_result: Result<
+        (Uuid, bool, tokio::time::Instant),
+        (WsHandshakeOutcome, Option<String>),
+    > = classify_auth(
+        access_token.as_deref(),
+        |token| {
+            auth_service
+                .verify_token(token)
+                .map(|claims| (claims.sub, claims.is_2fa_verified, claims.exp as i64))
+                .map_err(|e| format!("{e:?}"))
+        },
+        now_secs,
+    )
+    .map(|auth| {
+        let deadline =
+            tokio::time::Instant::now() + tokio::time::Duration::from_secs(auth.secs_until_expiry);
+        tracing::info!(
+            user_id = %auth.user_id,
+            is_2fa_verified = auth.is_2fa_verified,
+            expires_in_secs = auth.secs_until_expiry,
+            "WebSocket authenticated (via cookie)"
+        );
+        (auth.user_id, auth.is_2fa_verified, deadline)
+    });
 
     // Wait for connection_init message with a 30-second timeout.
     // This prevents malicious clients from holding WebSocket connections open
@@ -119,11 +212,7 @@ pub async fn handle_websocket_auth(
                         == Some("connection_init");
 
                     if !is_init {
-                        tracing::warn!(
-                            target: "talos_ws_auth",
-                            event_kind = "ws_protocol_violation",
-                            "WebSocket first message was not connection_init — closing"
-                        );
+                        report_handshake(WsHandshakeOutcome::ProtocolViolation, None);
                         let error = serde_json::json!({
                             "type": "connection_error",
                             "payload": {
@@ -138,35 +227,42 @@ pub async fn handle_websocket_auth(
                     }
 
                     // Check if authenticated
-                    if auth_result.is_some() {
-                        // Send connection_ack
-                        let ack = serde_json::json!({
-                            "type": "connection_ack"
-                        });
-                        if let Ok(ack_text) = serde_json::to_string(&ack) {
-                            let _ = socket.send(Message::Text(ack_text.into())).await;
-                        }
-                        // MCP-633: mark init complete before exiting the loop.
-                        init_received = true;
-                        break;
-                    } else {
-                        // Authentication failed
-                        tracing::warn!("WebSocket connection_init received but not authenticated");
-                        let error = serde_json::json!({
-                            "type": "connection_error",
-                            "payload": {
-                                "message": "Authentication required"
+                    match &auth_result {
+                        Ok(_) => {
+                            // Send connection_ack
+                            let ack = serde_json::json!({
+                                "type": "connection_ack"
+                            });
+                            if let Ok(ack_text) = serde_json::to_string(&ack) {
+                                let _ = socket.send(Message::Text(ack_text.into())).await;
                             }
-                        });
-                        if let Ok(error_text) = serde_json::to_string(&error) {
-                            let _ = socket.send(Message::Text(error_text.into())).await;
+                            report_handshake(WsHandshakeOutcome::Authenticated, None);
+                            // MCP-633: mark init complete before exiting the loop.
+                            init_received = true;
+                            break;
                         }
-                        let _ = socket.close().await;
-                        return;
+                        Err((refusal, detail)) => {
+                            // Authentication failed: ONE caller-facing sentence for
+                            // all three token outcomes; the split is the operator's.
+                            report_handshake(*refusal, detail.as_deref());
+                            let error = serde_json::json!({
+                                "type": "connection_error",
+                                "payload": {
+                                    "message": "Authentication required"
+                                }
+                            });
+                            if let Ok(error_text) = serde_json::to_string(&error) {
+                                let _ = socket.send(Message::Text(error_text.into())).await;
+                            }
+                            let _ = socket.close().await;
+                            return;
+                        }
                     }
                 }
                 Message::Close(_) => {
-                    return;
+                    // Left before connection_init: the same ending as the
+                    // deadline, reported below.
+                    break;
                 }
                 _ => {}
             }
@@ -183,11 +279,11 @@ pub async fn handle_websocket_auth(
     // protocol state. async-graphql's downstream handler would soft-fail,
     // but the right behavior is to refuse explicitly.
     if !init_received {
-        tracing::warn!(
-            target: "talos_ws_auth",
-            event_kind = "ws_init_not_received",
-            "WebSocket closed without observing connection_init within deadline"
-        );
+        let pending = auth_result
+            .as_ref()
+            .err()
+            .map(|(refusal, _)| refusal.as_str());
+        report_handshake(WsHandshakeOutcome::InitNotReceived, pending);
         let _ = socket.close().await;
         return;
     }
@@ -195,26 +291,34 @@ pub async fn handle_websocket_auth(
     // If authenticated, inject user_id into schema data and continue with GraphQL protocol.
     // Wrap the session in a hard deadline matching the token expiry: the connection is closed
     // when the access token expires, bounding exposure from stolen or later-revoked tokens.
-    if let Some((user_id, is_2fa_verified, deadline)) = auth_result {
-        if tokio::time::timeout_at(
+    if let Ok((user_id, is_2fa_verified, deadline)) = auth_result {
+        // Holding the guard IS the session's presence in
+        // `talos_ws_active_sessions`; it is released however the session ends.
+        let _active = WsActiveSession::open();
+        let ended = match tokio::time::timeout_at(
             deadline,
             handle_graphql_ws(socket, schema, user_id, is_2fa_verified),
         )
         .await
-        .is_err()
         {
-            tracing::info!(user_id = %user_id, "WebSocket connection closed: access token expired");
-        }
+            Ok(end) => end,
+            Err(_) => {
+                tracing::info!(user_id = %user_id, "WebSocket connection closed: access token expired");
+                WsSessionEnd::TokenExpired
+            }
+        };
+        talos_metrics::record_ws_session_end(ended);
     }
 }
 
-/// Handle GraphQL WebSocket protocol after authentication
+/// Handle GraphQL WebSocket protocol after authentication. Returns how the
+/// session ended; the caller records it.
 async fn handle_graphql_ws(
     socket: WebSocket,
     schema: talos_api::TalosSchema,
     user_id: Uuid,
     is_2fa_verified: bool,
-) {
+) -> WsSessionEnd {
     let (mut sink, mut stream) = socket.split();
 
     // Process incoming messages
@@ -273,6 +377,9 @@ async fn handle_graphql_ws(
                                             ) {
                                                 Ok(true) => {}
                                                 Ok(false) | Err(_) => {
+                                                    talos_metrics::record_ws_operation(
+                                                        WsOperationOutcome::RefusedNonSubscription,
+                                                    );
                                                     tracing::warn!(
                                                         target: "talos_audit",
                                                         event_kind = "ws_non_subscription_refused",
@@ -314,6 +421,9 @@ async fn handle_graphql_ws(
                                                     request.operation_name.as_deref(),
                                                 )
                                             {
+                                                talos_metrics::record_ws_operation(
+                                                    WsOperationOutcome::RefusedPreSecondFactor,
+                                                );
                                                 let err_msg = serde_json::json!({
                                                     "type": "error",
                                                     "id": id,
@@ -341,6 +451,9 @@ async fn handle_graphql_ws(
                                             );
 
                                             // Execute subscription
+                                            talos_metrics::record_ws_operation(
+                                                WsOperationOutcome::Started,
+                                            );
                                             let mut response_stream = schema.execute_stream(req);
 
                                             // Send data messages
@@ -403,17 +516,159 @@ async fn handle_graphql_ws(
                                 }
                             }
                             Some("connection_terminate") => {
-                                break;
+                                return WsSessionEnd::ClientTerminated;
                             }
                             _ => {}
                         }
                     }
                 }
                 Message::Close(_) => {
-                    break;
+                    return WsSessionEnd::ClientTerminated;
                 }
                 _ => {}
             }
         }
+    }
+    WsSessionEnd::StreamEnded
+}
+
+#[cfg(test)]
+mod handshake_classification_tests {
+    use super::{classify_auth, classify_origin, WsAuth};
+    use axum::http::HeaderValue;
+    use talos_metrics::WsHandshakeOutcome as O;
+    use uuid::Uuid;
+
+    fn allowed(o: &str) -> bool {
+        o == "https://app.example"
+    }
+
+    #[test]
+    fn origin_absent_is_refused_in_production_only() {
+        assert_eq!(classify_origin(None, true, allowed), Err(O::OriginMissing));
+        assert_eq!(classify_origin(None, false, allowed), Ok(()));
+    }
+
+    #[test]
+    fn origin_not_on_the_allow_list_is_refused_whatever_the_environment() {
+        let h = HeaderValue::from_static("https://evil.example");
+        assert_eq!(
+            classify_origin(Some(&h), true, allowed),
+            Err(O::OriginNotAllowed)
+        );
+        assert_eq!(
+            classify_origin(Some(&h), false, allowed),
+            Err(O::OriginNotAllowed)
+        );
+        let ok = HeaderValue::from_static("https://app.example");
+        assert_eq!(classify_origin(Some(&ok), true, allowed), Ok(()));
+    }
+
+    #[test]
+    fn a_non_utf8_origin_is_malformed_not_merely_disallowed() {
+        let h = HeaderValue::from_bytes(b"https://\xff.example").unwrap();
+        assert_eq!(
+            classify_origin(Some(&h), true, allowed),
+            Err(O::OriginMalformed)
+        );
+    }
+
+    #[test]
+    fn the_three_token_refusals_are_told_apart_for_the_operator() {
+        let uid = Uuid::new_v4();
+        let good = |_: &str| Ok((uid.to_string(), true, 1_000_100_i64));
+        assert_eq!(
+            classify_auth(None, good, 1_000_000),
+            Err((O::NoToken, None))
+        );
+        assert_eq!(
+            classify_auth(
+                Some("t"),
+                |_| Err("ExpiredSignature".to_string()),
+                1_000_000
+            ),
+            Err((O::InvalidToken, Some("ExpiredSignature".to_string())))
+        );
+        assert_eq!(
+            classify_auth(
+                Some("t"),
+                |_| Ok(("not-a-uuid".to_string(), true, 1_000_100)),
+                1_000_000
+            ),
+            Err((O::InvalidUserId, None))
+        );
+        assert_eq!(
+            classify_auth(Some("t"), good, 1_000_000),
+            Ok(WsAuth {
+                user_id: uid,
+                is_2fa_verified: true,
+                secs_until_expiry: 100,
+            })
+        );
+    }
+
+    #[test]
+    fn an_already_expired_token_yields_a_zero_second_session_not_a_wraparound() {
+        let uid = Uuid::new_v4();
+        let past = |_: &str| Ok((uid.to_string(), false, 5_i64));
+        let auth = classify_auth(Some("t"), past, 1_000_000).unwrap();
+        assert_eq!(auth.secs_until_expiry, 0);
+        let negative = |_: &str| Ok((uid.to_string(), false, -1_i64));
+        assert_eq!(
+            classify_auth(Some("t"), negative, 10)
+                .unwrap()
+                .secs_until_expiry,
+            0
+        );
+    }
+
+    /// TEXTUAL pin, stated as such: the handshake reports through ONE site
+    /// and every outcome is reachable from production code; the session end
+    /// and the operation outcomes are recorded at their arms. The production
+    /// half is everything ABOVE this module.
+    #[test]
+    fn every_outcome_is_recorded_from_production_code() {
+        let src = include_str!("lib.rs");
+        let production = &src[..src.find("mod handshake_classification_tests").unwrap()];
+        assert_eq!(
+            production.matches("report_handshake(").count(),
+            6,
+            "5 call sites + the fn"
+        );
+        for variant in [
+            "OriginMissing",
+            "OriginMalformed",
+            "OriginNotAllowed",
+            "NoToken",
+            "InvalidToken",
+            "InvalidUserId",
+            "ProtocolViolation",
+            "InitNotReceived",
+            "Authenticated",
+        ] {
+            assert!(
+                production.contains(&format!("WsHandshakeOutcome::{variant}")),
+                "{variant} is never produced by production code"
+            );
+        }
+        assert_eq!(
+            production
+                .matches("talos_metrics::record_ws_session_end(")
+                .count(),
+            1
+        );
+        assert_eq!(production.matches("WsSessionEnd::TokenExpired").count(), 1);
+        assert_eq!(
+            production.matches("WsSessionEnd::ClientTerminated").count(),
+            2
+        );
+        assert_eq!(production.matches("WsSessionEnd::StreamEnded").count(), 1);
+        assert_eq!(
+            production
+                .matches("talos_metrics::record_ws_operation(")
+                .count(),
+            3
+        );
+        assert_eq!(production.matches("WsActiveSession::open()").count(), 1);
     }
 }

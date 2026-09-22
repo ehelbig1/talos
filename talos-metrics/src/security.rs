@@ -164,6 +164,135 @@ impl McpAuthOutcome {
     }
 }
 
+/// Outcome of one WebSocket HANDSHAKE on `/ws` — the fourth bearer surface
+/// (the access-token COOKIE, read on the upgrade request), and until
+/// 2026-09-22 the one with no series at all: `talos-ws-auth` had nine
+/// refusal / close arms and every one was a log line only. One value per
+/// socket, recorded once at the handshake's single exit through
+/// `report_handshake`, from an enum whose match is exhaustive, so a new
+/// refusal arm cannot forget the series (package AX's shape, one surface
+/// over).
+///
+/// The three origin values are the Cross-Site WebSocket Hijacking signal.
+/// `NoToken` / `InvalidToken` / `InvalidUserId` are recorded when the client
+/// completes `connection_init` WITHOUT a usable cookie — the moment the
+/// server tells it "Authentication required"; a cookieless socket that never
+/// sends `connection_init` ends as `InitNotReceived` instead. The CALLER sees
+/// one `connection_error` for the three token outcomes (a token-existence
+/// oracle otherwise); the split is for the operator. `Authenticated` means
+/// the ack was sent and a session began.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WsHandshakeOutcome {
+    Authenticated,
+    OriginMissing,
+    OriginMalformed,
+    OriginNotAllowed,
+    NoToken,
+    InvalidToken,
+    InvalidUserId,
+    ProtocolViolation,
+    InitNotReceived,
+}
+
+impl WsHandshakeOutcome {
+    pub const ALL: &'static [Self] = &[
+        Self::Authenticated,
+        Self::OriginMissing,
+        Self::OriginMalformed,
+        Self::OriginNotAllowed,
+        Self::NoToken,
+        Self::InvalidToken,
+        Self::InvalidUserId,
+        Self::ProtocolViolation,
+        Self::InitNotReceived,
+    ];
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Authenticated => "authenticated",
+            Self::OriginMissing => "origin_missing",
+            Self::OriginMalformed => "origin_malformed",
+            Self::OriginNotAllowed => "origin_not_allowed",
+            Self::NoToken => "no_token",
+            Self::InvalidToken => "invalid_token",
+            Self::InvalidUserId => "invalid_user_id",
+            Self::ProtocolViolation => "protocol_violation",
+            Self::InitNotReceived => "init_not_received",
+        }
+    }
+    /// A refusal the operator reads as a security signal (as opposed to a
+    /// client that simply went away). Drives the log level at the one
+    /// report site; the metric carries every value regardless.
+    #[must_use]
+    pub const fn is_security_refusal(self) -> bool {
+        matches!(
+            self,
+            Self::OriginMissing
+                | Self::OriginMalformed
+                | Self::OriginNotAllowed
+                | Self::InvalidToken
+                | Self::InvalidUserId
+        )
+    }
+}
+
+/// How an AUTHENTICATED WebSocket session ended. `TokenExpired` is the
+/// one that matters for security: the session is wrapped in a hard deadline equal to
+/// the access token's remaining life, so a stolen-and-later-revoked cookie
+/// is bounded — this is that bound firing. `ClientTerminated` is a
+/// `connection_terminate` frame or a Close frame; `StreamEnded` is the
+/// transport going away without either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WsSessionEnd {
+    TokenExpired,
+    ClientTerminated,
+    StreamEnded,
+}
+
+impl WsSessionEnd {
+    pub const ALL: &'static [Self] = &[
+        Self::TokenExpired,
+        Self::ClientTerminated,
+        Self::StreamEnded,
+    ];
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TokenExpired => "token_expired",
+            Self::ClientTerminated => "client_terminated",
+            Self::StreamEnded => "stream_ended",
+        }
+    }
+}
+
+/// One `start` / `subscribe` frame on an authenticated session: `Started`
+/// when a subscription stream was opened; the two refusals are the lane's
+/// own gates (2026-09-10: the WebSocket transport executes SUBSCRIPTIONS
+/// only; 2026-07-19 P3: a password-only session may not subscribe) — both
+/// were `talos_audit` log lines with no counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WsOperationOutcome {
+    Started,
+    RefusedNonSubscription,
+    RefusedPreSecondFactor,
+}
+
+impl WsOperationOutcome {
+    pub const ALL: &'static [Self] = &[
+        Self::Started,
+        Self::RefusedNonSubscription,
+        Self::RefusedPreSecondFactor,
+    ];
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::RefusedNonSubscription => "refused_non_subscription",
+            Self::RefusedPreSecondFactor => "refused_pre_second_factor",
+        }
+    }
+}
+
 /// Outcome of one `AuthService::change_password` call, recorded once per call
 /// at its single wrapper — the only way a user changes their own password.
 /// `WrongCurrentPassword` is the guessing signal: a caller holding a session
