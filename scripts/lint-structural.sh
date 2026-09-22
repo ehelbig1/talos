@@ -9406,6 +9406,33 @@ else
 fi
 echo
 
+bold "▶ check 96: the CLAUDE.md engineering-log split lost nothing"
+
+# CLAUDE.md is a DIGEST: two splits (2026-09-09, 2026-09-22) moved narrative
+# out to docs/engineering-log/ and kept the decisions. `scripts/check-
+# engineering-log.py` proves, per split, that every removed line is in the
+# archive verbatim (leg 1), that removed runs are contiguous there (leg 3) and
+# that every decision-marker line is either still in CLAUDE.md or archived AND
+# represented in the digest subsection that points at its file (leg 2). Until
+# 2026-09-22 that script was WIRED INTO NOTHING — no lint check, no CI job, no
+# hook — so the first split's proof had only ever run by hand (check 64's
+# rule: a gate nobody runs certifies nothing). It runs its own `--self-test`
+# first (seven fixtures through the SAME `check()` body, each flipping exactly
+# one leg) and FAILS rather than skips when a base commit cannot be read (a
+# shallow CI checkout fetches it on demand). No opt-out.
+CK96_RC=0
+CK96_OUT="$(cd "$ROOT" && python3 scripts/check-engineering-log.py --self-test 2>&1 && python3 scripts/check-engineering-log.py 2>&1)" || CK96_RC=$?
+if [ "$CK96_RC" -eq 0 ]; then
+    green "✓ engineering-log split lossless ($(echo "$CK96_OUT" | grep -o 'self-test ok: [0-9]* cases'); $(echo "$CK96_OUT" | grep -c '^base ') base(s) checked)"
+else
+    echo "$CK96_OUT" | sed 's/^/  /'
+    red "✗ the CLAUDE.md engineering-log split lost a line, an order, or a decision (or the checker could not run)"
+    yellow "  → every line removed from CLAUDE.md must appear VERBATIM and CONTIGUOUSLY under docs/engineering-log/,"
+    yellow "    and every decision-marker line must be kept or represented in the digest that points at its archive file."
+    EXIT_CODE=1
+fi
+echo
+
 bold "▶ check 54: lint self-consistency (check numbering + documented count)"
 ACTUAL_NUMS="$(grep -oE '^bold "▶ check [0-9]+:' "${BASH_SOURCE[0]}" | grep -oE '[0-9]+' | sort -n)"
 EXPECTED_NUMS="$(seq 1 "$CHECK_COUNT")"
