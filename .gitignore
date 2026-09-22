@@ -40,7 +40,11 @@ frontend/coverage/
 evidence/
 
 # SDK build artifacts
-sdks/python/__pycache__/
+# Python bytecode. Was path-specific to sdks/python/ until 2026-09-22, when
+# scripts/lint_lib/ became the first importable package under scripts/ and
+# every `make lint` started leaving an untracked directory behind.
+__pycache__/
+*.pyc
 sdks/python/*.egg-info/
 sdks/python/dist/
 sdks/typescript/dist/
