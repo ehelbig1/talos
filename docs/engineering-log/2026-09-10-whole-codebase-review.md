@@ -5761,3 +5761,127 @@ dataset owned by someone else (it did), and one to read the write and the
 status. The first two were me guessing at mechanisms; only the third
 answered the question that mattered, which was never "why is it NotFound"
 but "did anything cross a tenant boundary".
+
+## Package DL — the scanner was the thing that was blind (2026-09-22)
+
+This file already records the lesson twice — "a line grep over Rust is not a
+population" — both times as the *cause* of a missed defect. It had never been
+turned on the detectors themselves.
+
+### What the survey found
+
+Check 39's own comment said it:
+
+> (Parameterised `SET status=$N` and multi-line SQL are out of scope — the
+> common regression shape is single-line literal.)
+
+Measured on 2026-09-22: **zero** of the 19 `UPDATE workflow_executions SET
+status = '…' … WHERE id = $N` statements on this tree are single-line. Every
+one is wrapped. The check gated 0 % of its population for its entire life,
+and the parenthesis explaining why was the reason nobody looked.
+
+The `talos-execution-finalizer` source pins were worse, because they were
+*negative* assertions:
+
+```rust
+let needle = "UPDATE workflow_executions SET status = 'failed'";
+for (name, src) in FORMER_COPIES {
+    assert!(!src.contains(needle), "{name} re-inlines …");
+}
+assert_eq!(include_str!("lib.rs").matches(needle).count(), 1);
+```
+
+The needle is one contiguous string; every statement it hunts is wrapped. It
+matched none of the five that existed in two of the five pinned files. And
+the count assertion — which looks like a belt — matched exactly one thing:
+the `let needle = …` line declaring it. A pin whose sole evidence was itself.
+
+Its completion twin *did* fire, on the accident that `SET status =
+'completed', output_data` sits on one line in the house style. Fireable by
+luck of line-wrapping is one reflow away from silent, so it is not really a
+different case.
+
+### The home
+
+`scripts/lint_lib/ruststmt.py` yields every Rust string literal with `\`
+continuations joined, and the line it starts on. It is a lexer, not a parser,
+and says so: it knows strings, raw strings, byte strings, char literals and
+comments, and nothing else about Rust.
+
+Two of its cases exist only because a naive version gets them wrong and then
+silently mis-reads everything downstream of them: a char literal holding a
+double quote (`'"'`) opens a phantom string, and a lifetime (`'a`) is not a
+char literal at all.
+
+`strip_test_modules` blanks a column-0 `#[cfg(test)]` only when the next line
+opens a `mod`. That is deliberately the *conservative* rule: leaving test
+code in over-reports, which is loud, while blanking too much hides a real
+finding. `#[cfg(test)]` on a lone `fn` is left alone.
+
+Its self-test runs unconditionally in the lint. Every check built on it would
+otherwise report a comfortable zero if the lexer regressed.
+
+### What was re-pointed, and what deliberately was not
+
+Checks 39 and 46 now read through it. Check 39 examines **19** statements
+where it examined 0; all are guarded, so it ships at zero. Check 46 examines
+1 and finds nothing new — re-pointed anyway, and stated as a gate
+improvement rather than a bug fix, because the rule was invisible for any
+site written the way every sibling is written.
+
+Sub-leg 46b gains a second leg replacing both Rust pins. It keys on the
+**guard**, not the columns: `NOT IN ('completed', 'failed', 'cancelled',
+'resuming')` is what makes a statement the dispatcher's finalizer rather
+than the engine's `IN ('running', 'resuming')`. The old needle forbade the
+engine's four variants too, which is why it could not have been made to fire
+without also being made wrong.
+
+Two checks were measured and **not** re-pointed. Check 86 goes from 4 hits to
+11, and the 7 it gains are all legitimate — non-destructive reads, or keyed
+on an execution id, or already gated — so it would ship at 7 markers on
+correct code. Check 12 goes from 2 to 18 with 15 correct. This repository's
+own bar rejects both. 46b's own whole-file joiner also stays: it needs
+function attribution over character offsets, not literal boundaries, and
+forcing it onto the shared lexer would have risked a check that currently
+catches real defects, for tidiness.
+
+### The one real defect
+
+The dispatcher guard genuinely lived in two places. The second,
+`fail_execution_unless_terminal`'s no-`completed_at` arm, is not an
+accidental copy — it is documented and argued, and it records `None` because
+the row has no duration. But a variant that shares the *rule* is still a
+second home, so it moved into the leaf beside its twin.
+
+Worth separating from the agent survey that found it, which called it "a
+genuine second copy of the pinned statement". Reading the code, it is a
+deliberate variant whose existence the pin's text forbade by accident. The
+defect is real; the description needed correcting.
+
+### Four mutations survived, and all four were my fault
+
+The first run caught 8 of 12. Every survivor was a weakness in the tests, not
+in the rule:
+
+- the `--self-test` drove a **copy** of the scan logic, so removing the
+  opt-out check and removing the keyed-on-id check both passed;
+- the bulk-write fixture used `WHERE status = 'running'`, which carries a
+  status predicate and therefore passed the guard test anyway — it could
+  never have failed when the clause it was meant to test was removed;
+- the empty-scan refusal had no fixture at all;
+- the conservative strip rule had no case, because no file on the tree
+  currently has the shape it protects.
+
+One body for the rule, four new fixtures, and 12 of 12 are caught. A
+self-test that exercises a duplicate is the same defect as a pin whose only
+match is its own needle, one layer up.
+
+### And one near-miss worth writing down
+
+The first edit to check 46's bash block replaced everything between
+`check 46` and `check 47` — which silently **deleted sub-leg 46b**, a working
+check that catches real defects. It was caught by grepping for its
+invocation immediately afterwards and finding nothing.
+
+That is now the habit: after replacing a span of `lint-structural.sh`, grep
+for what used to be inside it.

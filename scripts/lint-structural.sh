@@ -3185,62 +3185,41 @@ bold "▶ check 39: workflow_executions status writes must carry a status guard"
 # (claim_stuck_execution_for_resume); a superseded dispatcher's bare failure
 # write then clobbers `resuming -> failed`, defeating recovery (PR #159), and a
 # late/duplicate write can re-clobber an already-terminal row or RESURRECT a
-# finished one (the resume_workflow `pending` TOCTOU, PR #158). The canonical
-# repo methods (mark_execution_completed/failed/waiting, …) all guard
-# `AND status …`; secondary dispatchers must too — the safe uniform guard is
-# `AND status NOT IN ('completed','failed','cancelled','resuming')` (admits every
-# legit non-terminal owned state, fences resuming + terminal). This freezes it:
-# any single-line `UPDATE workflow_executions … SET status='<lit>' … WHERE id=$N`
-# lacking `AND status` fails. (Parameterised `SET status=$N` and multi-line SQL
-# are out of scope — the common regression shape is single-line literal.)
-# Opt-out: `// allow-bare-status-write: <reason>` within 4 lines above.
+# finished one (the resume_workflow `pending` TOCTOU, PR #158).
+#
+# STATEMENT-AWARE since 2026-09-22, and the reason is measured: as a
+# single-line grep this check matched **0** lines while **19** such statements
+# exist. Its own comment used to say "multi-line SQL are out of scope — the
+# common regression shape is single-line literal"; that was false of every
+# statement on the tree, because the house style wraps all of them with `\`
+# continuations. It gated 0 % of its population for as long as it existed.
+# The scan now reads Rust string literals through the shared home
+# `scripts/lint_lib/ruststmt.py` and ships at ZERO: all 19 are guarded.
+#
+# A bulk write keyed on `WHERE status = …` rather than `WHERE id = $N` is
+# guarded by construction and is not in range.
+# Opt-out: `// allow-bare-status-write: <reason>` within 8 lines above.
 
-STATUS_CLOBBER_VIOLATIONS=0
-if [ -n "$RG_BIN" ]; then
-    sc_matches=$("$RG_BIN" -n --no-heading -g '*.rs' -g '!**/tests/**' -g '!**/*_tests.rs' \
-        -e "UPDATE workflow_executions.*SET status = '[a-z]+'.*WHERE id = [\$][0-9]" \
-        . 2>/dev/null || true)
-else
-    sc_matches=$(grep -rnE --include='*.rs' \
-        "UPDATE workflow_executions.*SET status = '[a-z]+'.*WHERE id = [\$][0-9]" \
-        talos-* controller worker 2>/dev/null | grep -vE '/tests/|_tests\.rs' || true)
-fi
-
-if [ -n "$sc_matches" ]; then
-    while IFS= read -r line; do
-        file=$(echo "$line" | cut -d: -f1)
-        lineno=$(echo "$line" | cut -d: -f2)
-        body=$(echo "$line" | cut -d: -f3-)
-        [ -f "$file" ] || continue
-        # Guarded (carries a status precondition) → OK.
-        if echo "$body" | grep -q 'AND status'; then
-            continue
-        fi
-        # Opt-out marker within 4 lines above.
-        if [ -n "$lineno" ] && [ "$lineno" -gt 1 ]; then
-            start=$((lineno > 4 ? lineno - 4 : 1))
-            ctx=$(sed -n "${start},${lineno}p" "$file" 2>/dev/null || true)
-            if echo "$ctx" | grep -q 'allow-bare-status-write'; then
-                continue
-            fi
-        fi
-        printf '  %s\n' "$line"
-        STATUS_CLOBBER_VIOLATIONS=$((STATUS_CLOBBER_VIOLATIONS + 1))
-    done <<< "$sc_matches"
-fi
-
-if [ "$STATUS_CLOBBER_VIOLATIONS" -gt 0 ]; then
-    red "✗ $STATUS_CLOBBER_VIOLATIONS bare workflow_executions status write(s) with no status guard"
-    yellow "  → add a status precondition, e.g. AND status NOT IN ('completed','failed','cancelled','resuming')"
-    yellow "    (PR #158/#159), or route through the guarded WorkflowRepository::mark_execution_* methods."
-    yellow "  → or // allow-bare-status-write: <reason> for an intentional unconditional write."
+if ! python3 "$ROOT/scripts/lint-execution-status-guards.py" --self-test; then
+    red "✗ scripts/lint-execution-status-guards.py --self-test failed"
     EXIT_CODE=1
-else
-    green "✓ workflow_executions status writes all carry a status guard"
 fi
-echo
+if ck39_out="$(cd "$ROOT" && python3 scripts/lint-execution-status-guards.py "$ROOT" --leg status-guard 2>&1)"; then
+    green "✓ workflow_executions status writes all carry a status guard (${ck39_out##*$'\n'})"
+else
+    ck39_rc=$?
+    printf '%s\n' "$ck39_out"
+    if [ "$ck39_rc" -ge 2 ]; then
+        red "✗ check 39 could not run"
+    else
+        red "✗ bare workflow_executions status write(s) with no status guard"
+        yellow "  → add a status precondition, e.g. AND status NOT IN ('completed','failed','cancelled','resuming')"
+        yellow "    (PR #158/#159), or route through the guarded finalizer/repository methods."
+        yellow "  → or // allow-bare-status-write: <reason> for an intentional unconditional write."
+    fi
+    EXIT_CODE=1
+fi
 
-# ── 40. SSRF-checked outbound URLs must use the shared safe HTTP client ──
 bold "▶ check 40: SSRF-checked outbound URLs must use the shared safe HTTP client"
 
 # A file that calls `check_outbound_url_no_ssrf` is BY DEFINITION firing a
@@ -3550,49 +3529,51 @@ bold "▶ check 46: execution finalizers must accept 'resuming', not only 'runni
 # `running` row to `resuming` (claim_stuck_execution_for_resume) BEFORE re-running
 # it, so a `running`-only completer / failer / waiter no-ops and the resumed
 # execution sticks in `resuming` forever (force-failed only by the 30-min stale
-# sweep) — PR #271. fence.rs documents these writes as
-# `WHERE status = 'running' (or 'resuming')`; the safe guard is
-# `status IN ('running', 'resuming')`. This freezes it: any single-line
-# `WHERE id = $N AND status = 'running'` in the execution-status repos fails.
-# (The `queued -> running` promotion guards on `status = 'queued'`, and the
-# child-row cleanup keys on `workflow_execution_id` — both out of scope by shape.)
-# Opt-out: `// allow-running-only-finalize: <reason>` within 4 lines above.
+# sweep) — PR #271. The safe guard is `status IN ('running', 'resuming')`.
+#
+# STATEMENT-AWARE since 2026-09-22, through the same shared home as check 39.
+# Stated plainly: this leg finds NOTHING NEW today — single-line and
+# statement-aware both see exactly 1 statement, and it carries the opt-out.
+# It is re-pointed because the RULE was invisible for any site written across
+# lines, which is how every sibling on this tree is written; that is a gate
+# improvement, not a bug fix (check 88's root-widening framing).
+# Opt-out: `// allow-running-only-finalize: <reason>` within 8 lines above.
 
-RESUME_FINALIZE_VIOLATIONS=0
-rf_matches=$(grep -rnE --include='*.rs' \
-    "WHERE id = [\$][0-9]+ AND status = 'running'" \
-    controller/src worker/src talos-*/src 2>/dev/null || true)
-if [ -n "$rf_matches" ]; then
-    while IFS= read -r line; do
-        file=$(echo "$line" | cut -d: -f1)
-        lineno=$(echo "$line" | cut -d: -f2)
-        [ -f "$file" ] || continue
-        if [ -n "$lineno" ] && [ "$lineno" -gt 1 ]; then
-            start=$((lineno > 4 ? lineno - 4 : 1))
-            ctx=$(sed -n "${start},${lineno}p" "$file" 2>/dev/null || true)
-            if echo "$ctx" | grep -q 'allow-running-only-finalize'; then
-                continue
-            fi
-        fi
-        printf '  %s\n' "$line"
-        RESUME_FINALIZE_VIOLATIONS=$((RESUME_FINALIZE_VIOLATIONS + 1))
-    done <<< "$rf_matches"
-fi
-
-if [ "$RESUME_FINALIZE_VIOLATIONS" -gt 0 ]; then
-    red "✗ $RESUME_FINALIZE_VIOLATIONS execution finalizer guard(s) accept only 'running', not 'resuming'"
-    yellow "  → widen to status IN ('running', 'resuming') so crash-recovery resumes finalize (PR #271)."
-    yellow "  → or // allow-running-only-finalize: <reason> if the write must target 'running' exclusively."
-    EXIT_CODE=1
+if ck46_out="$(cd "$ROOT" && python3 scripts/lint-execution-status-guards.py "$ROOT" --leg running-only 2>&1)"; then
+    green "✓ execution finalizers accept 'resuming' — crash-recovery resumes can finalize (${ck46_out##*$'\n'})"
 else
-    green "✓ execution finalizers accept 'resuming' (crash-recovery resumes can finalize)"
+    ck46_rc=$?
+    printf '%s\n' "$ck46_out"
+    if [ "$ck46_rc" -ge 2 ]; then
+        red "✗ check 46 could not run"
+    else
+        red "✗ execution finalizer guard(s) accept only 'running', not 'resuming'"
+        yellow "  → widen to status IN ('running', 'resuming') so crash-recovery resumes finalize (PR #271)."
+        yellow "  → or // allow-running-only-finalize: <reason> if the write must target 'running' exclusively."
+    fi
+    EXIT_CODE=1
 fi
-echo
 
-# Sub-leg 46b (2026-09-21, no new number): a terminal `failed` / `completed`
-# write on workflow_executions outside the shared finalizer must COUNT the
-# outcome. Statement-aware (multi-line) — the leg above and the 2026-09-12
-# source pins read single lines, which is how five writers stayed uncounted.
+# The shared statement-aware home's own self-test. Run UNCONDITIONALLY: every
+# check below that reads Rust the way Rust is written depends on this lexer,
+# and a regression in it would make those checks quietly report zero.
+if ! python3 scripts/lint_lib/ruststmt.py; then
+    red "✗ scripts/lint_lib/ruststmt.py self-test failed — the shared statement-aware reader is wrong"
+    EXIT_CODE=1
+fi
+
+# Sub-leg 46b (2026-09-21, no new number), TWO legs since 2026-09-22:
+#   (a) a terminal `failed` / `completed` write on workflow_executions outside
+#       the shared finalizer must COUNT the outcome. Statement-aware — the
+#       2026-09-12 source pins read single lines, which is how five writers
+#       stayed uncounted.
+#   (b) the dispatcher-side failure statement and the completion statements
+#       have ONE home. This replaces two `include_str!` assertions in
+#       talos-execution-finalizer: the failure one was provably UNFIREABLE
+#       (a contiguous needle against wrapped SQL — it matched 0 of the 5
+#       statements that existed, and its companion count matched only the
+#       `let needle = …` line declaring it), and the completion one fired
+#       only by the luck of where the author wrapped the SQL.
 if ! python3 scripts/lint-terminal-write-recorded.py --self-test; then
     red "✗ check 46b self-test failed"
     EXIT_CODE=1
@@ -3606,6 +3587,7 @@ else
     EXIT_CODE=1
 fi
 echo
+
 
 bold "▶ check 47: append-only audit tables must not gain CASCADE/SET NULL FKs"
 

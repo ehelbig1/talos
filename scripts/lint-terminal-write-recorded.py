@@ -25,6 +25,24 @@ inside the function.
 import re
 import subprocess
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from lint_lib.ruststmt import (  # noqa: E402
+    normalized,
+    string_literals,
+    strip_test_modules,
+)
+
+# The dispatcher-side failure finalizer is identified by its GUARD, not by the
+# columns it sets: `mark_execution_failed` writes the same status with
+# `IN ('running', 'resuming')` and is deliberately a different finalizer.
+DISPATCHER_GUARD = "NOT IN ('completed', 'failed', 'cancelled', 'resuming')"
+# Completion is identified by the status it writes: measured 2026-09-22, both
+# completion statements live in the leaf and none exists anywhere else, so the
+# rule ships at zero without needing a guard to tell it apart.
+COMPLETION_SET = "SET status = 'completed'"
+FINALIZER_CRATE = "talos-execution-finalizer/"
 
 STMT = re.compile(
     r"UPDATE\s+workflow_executions\b(?P<set>(?:(?!WHERE).){0,600}?)WHERE", re.S
@@ -85,7 +103,83 @@ def self_test() -> int:
         if got != want:
             print(f"self-test case {i}: want {want}, got {got}")
             return 1
+
+    # Leg (b). The FIRST case is the one the old source pin could not see.
+    import tempfile
+    wrapped = (
+        'fn f() {\n    sqlx::query(\n        "UPDATE workflow_executions \\\n'
+        "         SET status = 'failed', error_message = $2 \\\n"
+        "         WHERE id = $1 AND status NOT IN ('completed', 'failed', "
+        "'cancelled', 'resuming')\",\n    );\n}\n"
+    )
+    engine_variant = wrapped.replace(
+        "NOT IN ('completed', 'failed', 'cancelled', 'resuming')",
+        "IN ('running', 'resuming')",
+    )
+    with tempfile.TemporaryDirectory() as d:
+        for name, src, want in [
+            ("wrapped.rs", wrapped, 1),
+            ("engine.rs", engine_variant, 0),
+            (
+                "completion.rs",
+                wrapped.replace(
+                    "SET status = 'failed', error_message = $2",
+                    "SET status = 'completed', output_data = $2",
+                ).replace(DISPATCHER_GUARD, "IN ('running', 'resuming')"),
+                1,
+            ),
+            ("in_test.rs", "#[cfg(test)]\nmod t {\n" + wrapped + "}\n", 0),
+        ]:
+            path = f"{d}/{name}"
+            open(path, "w", encoding="utf-8").write(src)
+            got = len(dispatcher_guard_sites([path]))
+            if got != want:
+                print(f"self-test leg-b [{name}]: want {want}, got {got}")
+                return 1
     return 0
+
+
+def dispatcher_guard_sites(files: list[str]) -> list[str]:
+    """Leg (b): the dispatcher-side failure statement has ONE home.
+
+    Replaces two `include_str!` assertions in `talos-execution-finalizer`
+    that were provably UNFIREABLE: they tested
+    `!src.contains("UPDATE workflow_executions SET status = 'failed'")`, one
+    contiguous needle, against files where every such statement is written
+    across lines. Measured 2026-09-22 — five statements existed in two of the
+    five pinned files and the assertion saw none of them; one of the five,
+    `fail_execution_unless_terminal`'s no-`completed_at` arm, carried the
+    same dispatcher GUARD and is now in the leaf with its twin.
+
+    The rule is keyed on the guard because the guard IS the rule. The four
+    other statements set the same status under `IN ('running', 'resuming')`
+    — the engine's own finalizer, a different contract — and the old needle
+    forbade them too, which is why it could not have been made to fire
+    without also being made wrong.
+    """
+    findings = []
+    for f in files:
+        if f.startswith(FINALIZER_CRATE):
+            continue
+        try:
+            src = open(f, encoding="utf-8").read()
+        except OSError:
+            continue
+        for lit in string_literals(strip_test_modules(src)):
+            sql = normalized(lit.text)
+            if not sql.upper().startswith("UPDATE WORKFLOW_EXECUTIONS"):
+                continue
+            if DISPATCHER_GUARD in sql:
+                findings.append(
+                    f"  {f}:{lit.line}: re-inlines the dispatcher-side failure "
+                    f"UPDATE — it belongs in {FINALIZER_CRATE}"
+                )
+            elif COMPLETION_SET in sql:
+                findings.append(
+                    f"  {f}:{lit.line}: re-inlines the completion UPDATE — it "
+                    f"belongs in {FINALIZER_CRATE}"
+                )
+    return findings
 
 
 def main() -> int:
@@ -110,10 +204,19 @@ def main() -> int:
     if scan.seen == 0:
         print("✗ check 46b matched no terminal write at all — the scan is blind")
         return 2
+    one_home = dispatcher_guard_sites(
+        [f for f in sorted(set(files)) if f.endswith(".rs")]
+    )
     for x in findings:
         print(x)
-    print(f"scanned {scan.seen} terminal write(s) outside the finalizer, {len(findings)} uncounted")
-    return 1 if findings else 0
+    for x in one_home:
+        print(x)
+    print(
+        f"scanned {scan.seen} terminal write(s) outside the finalizer, "
+        f"{len(findings)} uncounted; {len(one_home)} dispatcher-guard copy(ies) outside "
+        f"{FINALIZER_CRATE}"
+    )
+    return 1 if (findings or one_home) else 0
 
 
 if __name__ == "__main__":
