@@ -5,7 +5,7 @@
 
 use axum::extract::ws::{Message, WebSocket};
 use axum::http::HeaderValue;
-use futures::{stream::StreamExt, SinkExt};
+use futures::{stream::StreamExt, Sink, SinkExt, Stream};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -311,222 +311,291 @@ pub async fn handle_websocket_auth(
     }
 }
 
-/// Handle GraphQL WebSocket protocol after authentication. Returns how the
+/// Per-socket cap on concurrently open subscriptions (package DV). The
+/// dashboard's busiest page holds four; a client asking for more is a bug or
+/// a probe, and every open subscription is a spawned task and a live
+/// `execute_stream`, so the cap bounds what one authenticated socket can
+/// cost the controller. A `start` past the cap is refused with an `error`
+/// frame and counted; existing subscriptions are untouched.
+pub const MAX_SUBSCRIPTIONS_PER_SOCKET: usize = 16;
+
+/// Frames waiting for the socket writer. Subscription tasks `await` on a
+/// full buffer (backpressure to the stream, not memory growth); the buffer
+/// only has to absorb a burst across the `MAX_SUBSCRIPTIONS_PER_SOCKET`
+/// tasks that share it.
+const OUTBOUND_FRAME_BUFFER: usize = 256;
+
+/// Everything the session spawned, aborted on drop. The session future is
+/// what the handshake wraps in the token-expiry deadline, and a timed-out
+/// future is DROPPED — so this guard, not a code path, is what guarantees
+/// that no subscription task or writer outlives its socket.
+struct SessionTasks {
+    writer: tokio::task::JoinHandle<()>,
+    subscriptions: std::collections::HashMap<String, tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for SessionTasks {
+    fn drop(&mut self) {
+        for (_, handle) in self.subscriptions.drain() {
+            handle.abort();
+        }
+        self.writer.abort();
+    }
+}
+
+impl SessionTasks {
+    /// Drop handles whose task already finished (the stream completed), so a
+    /// long session cannot fill the map with dead entries and a completed
+    /// id may be reused.
+    fn reap(&mut self) {
+        self.subscriptions.retain(|_, h| !h.is_finished());
+    }
+}
+
+fn text_frame(value: &serde_json::Value) -> Option<Message> {
+    serde_json::to_string(value)
+        .ok()
+        .map(|t| Message::Text(t.into()))
+}
+
+fn error_frame(id: &str, message: &str) -> Option<Message> {
+    text_frame(&serde_json::json!({
+        "type": "error",
+        "id": id,
+        "payload": [{ "message": message }]
+    }))
+}
+
+/// Handle the graphql-ws protocol after authentication and return how the
 /// session ended; the caller records it.
-async fn handle_graphql_ws(
-    socket: WebSocket,
-    schema: talos_api::TalosSchema,
+///
+/// Since package DV (2026-09-22) one socket carries MANY subscriptions: each
+/// `start` spawns its own task streaming `data` frames through ONE bounded
+/// channel to ONE writer task, `stop` aborts the named task, and every task
+/// is aborted when the session ends however it ends (`SessionTasks`' Drop).
+/// Before this the `start` arm awaited the whole response stream INSIDE the
+/// read loop, so a second `start` on the same socket was not read until the
+/// first subscription completed, and `stop` echoed `complete` without
+/// ending anything — the lane worked only because the frontend opened one
+/// socket per subscription (three per dashboard load).
+///
+/// Generic over the transport and the schema so a test can drive it with a
+/// channel-backed duplex and a two-field schema; production passes the axum
+/// socket and `TalosSchema`.
+async fn handle_graphql_ws<T, Q, M, S>(
+    socket: T,
+    schema: async_graphql::Schema<Q, M, S>,
     user_id: Uuid,
     is_2fa_verified: bool,
-) -> WsSessionEnd {
+) -> WsSessionEnd
+where
+    T: Stream<Item = Result<Message, axum::Error>> + Sink<Message> + Unpin + Send + 'static,
+    <T as Sink<Message>>::Error: std::fmt::Debug,
+    Q: async_graphql::ObjectType + 'static,
+    M: async_graphql::ObjectType + 'static,
+    S: async_graphql::SubscriptionType + 'static,
+{
     let (mut sink, mut stream) = socket.split();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Message>(OUTBOUND_FRAME_BUFFER);
+    let writer = tokio::spawn(async move {
+        while let Some(frame) = rx.recv().await {
+            if sink.send(frame).await.is_err() {
+                break;
+            }
+        }
+    });
+    let mut tasks = SessionTasks {
+        writer,
+        subscriptions: std::collections::HashMap::new(),
+    };
 
-    // Process incoming messages
     while let Some(msg) = stream.next().await {
-        if let Ok(msg) = msg {
-            match msg {
-                Message::Text(text) => {
-                    // MCP-1118 (2026-05-16): log byte-length only.
-                    // Pre-fix `WebSocket received message: {}` printed
-                    // the full message body at debug level. The body
-                    // is operator-supplied GraphQL — including
-                    // subscription `payload.query`, `payload.variables`,
-                    // and any operationName. Variables routinely carry
-                    // sensitive content: auth-related mutation inputs
-                    // (currentPassword for changePassword), secret-
-                    // setter payloads (`createSecret(input: {value:
-                    // "sk-..."})`), session tokens passed as variables
-                    // on the WS path. An operator running with
-                    // `RUST_LOG=debug` (common during incident triage)
-                    // would have written every authenticated user's
-                    // sensitive variables into the log aggregator
-                    // verbatim. Per CLAUDE.md "NEVER log sensitive
-                    // values (tokens, cookies, API keys, secrets)";
-                    // log presence + size only. Same shape as MCP-531
-                    // (REST auth Cookie header presence-only).
-                    tracing::debug!(byte_len = text.len(), "WebSocket received message");
-                    // Parse as GraphQL WS message
-                    if let Ok(ws_msg) = serde_json::from_str::<serde_json::Value>(&text) {
-                        let msg_type = ws_msg.get("type").and_then(|t| t.as_str());
-                        tracing::debug!("WebSocket message type: {:?}", msg_type);
+        let Ok(msg) = msg else { continue };
+        match msg {
+            Message::Text(text) => {
+                // MCP-1118 (2026-05-16): log byte-length only. The body is
+                // operator-supplied GraphQL — subscription `payload.query`,
+                // `payload.variables`, operationName — and variables can
+                // carry sensitive content; per CLAUDE.md "NEVER log
+                // sensitive values", log presence + size only (same shape as
+                // MCP-531, REST auth Cookie header presence-only).
+                tracing::debug!(byte_len = text.len(), "WebSocket received message");
+                let Ok(ws_msg) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
+                let msg_type = ws_msg.get("type").and_then(|t| t.as_str());
+                tracing::debug!("WebSocket message type: {:?}", msg_type);
 
-                        match msg_type {
-                            Some("start") | Some("subscribe") => {
-                                tracing::info!("WebSocket subscription start received");
-                                // Handle subscription
-                                if let Some(id) = ws_msg.get("id").and_then(|i| i.as_str()) {
-                                    if let Some(payload) = ws_msg.get("payload") {
-                                        if let Ok(request) =
-                                            serde_json::from_value::<async_graphql::Request>(
-                                                payload.clone(),
-                                            )
-                                        {
-                                            // 2026-09-10: the WebSocket lane
-                                            // executes SUBSCRIPTIONS only.
-                                            // `execute_stream` will happily run
-                                            // a query or a mutation as a
-                                            // one-item stream, which made `/ws`
-                                            // a second mutation transport
-                                            // without the HTTP lane's CSRF
-                                            // discipline. An operation that
-                                            // does not parse or cannot be
-                                            // classified is refused too.
-                                            match talos_api::schema::operation_is_subscription(
-                                                &request.query,
-                                                request.operation_name.as_deref(),
-                                            ) {
-                                                Ok(true) => {}
-                                                Ok(false) | Err(_) => {
-                                                    talos_metrics::record_ws_operation(
-                                                        WsOperationOutcome::RefusedNonSubscription,
-                                                    );
-                                                    tracing::warn!(
-                                                        target: "talos_audit",
-                                                        event_kind = "ws_non_subscription_refused",
-                                                        %user_id,
-                                                        "WebSocket lane refused a non-subscription operation"
-                                                    );
-                                                    let err_msg = serde_json::json!({
-                                                        "type": "error",
-                                                        "id": id,
-                                                        "payload": [{
-                                                            "message": "Only subscription \
-                                                                operations may be executed \
-                                                                over the WebSocket transport. \
-                                                                Send queries and mutations to \
-                                                                POST /graphql."
-                                                        }]
-                                                    });
-                                                    if let Ok(err_text) =
-                                                        serde_json::to_string(&err_msg)
-                                                    {
-                                                        let _ = sink
-                                                            .send(Message::Text(err_text.into()))
-                                                            .await;
-                                                    }
-                                                    continue;
-                                                }
-                                            }
+                match msg_type {
+                    Some("start") | Some("subscribe") => {
+                        tracing::info!("WebSocket subscription start received");
+                        let Some(id) = ws_msg.get("id").and_then(|i| i.as_str()) else {
+                            continue;
+                        };
+                        let Some(payload) = ws_msg.get("payload") else {
+                            continue;
+                        };
+                        let Ok(request) =
+                            serde_json::from_value::<async_graphql::Request>(payload.clone())
+                        else {
+                            continue;
+                        };
 
-                                            // Security review 2026-07-19 (P3):
-                                            // a pre-2FA (password-only) session
-                                            // may not open subscriptions — none
-                                            // are auth-bootstrap operations, so
-                                            // the allowlist rejects them all.
-                                            // Mirrors the HTTP graphql_handler
-                                            // gate and the REST pre-2FA 403.
-                                            if !is_2fa_verified
-                                                && !talos_api::schema::pre_2fa_operation_allowed(
-                                                    &request.query,
-                                                    request.operation_name.as_deref(),
-                                                )
-                                            {
-                                                talos_metrics::record_ws_operation(
-                                                    WsOperationOutcome::RefusedPreSecondFactor,
-                                                );
-                                                let err_msg = serde_json::json!({
-                                                    "type": "error",
-                                                    "id": id,
-                                                    "payload": [{
-                                                        "message": "Two-Factor Authentication \
-                                                            required. Complete 2FA verification \
-                                                            to subscribe."
-                                                    }]
-                                                });
-                                                if let Ok(err_text) =
-                                                    serde_json::to_string(&err_msg)
-                                                {
-                                                    let _ = sink
-                                                        .send(Message::Text(err_text.into()))
-                                                        .await;
-                                                }
-                                                continue;
-                                            }
+                        // 2026-09-10: the WebSocket lane executes SUBSCRIPTIONS
+                        // only. `execute_stream` will happily run a query or a
+                        // mutation as a one-item stream, which made `/ws` a
+                        // second mutation transport without the HTTP lane's
+                        // CSRF discipline. An operation that does not parse or
+                        // cannot be classified is refused too.
+                        match talos_api::schema::operation_is_subscription(
+                            &request.query,
+                            request.operation_name.as_deref(),
+                        ) {
+                            Ok(true) => {}
+                            Ok(false) | Err(_) => {
+                                talos_metrics::record_ws_operation(
+                                    WsOperationOutcome::RefusedNonSubscription,
+                                );
+                                tracing::warn!(
+                                    target: "talos_audit",
+                                    event_kind = "ws_non_subscription_refused",
+                                    %user_id,
+                                    "WebSocket lane refused a non-subscription operation"
+                                );
+                                if let Some(frame) = error_frame(
+                                    id,
+                                    "Only subscription operations may be executed over the \
+                                     WebSocket transport. Send queries and mutations to \
+                                     POST /graphql.",
+                                ) {
+                                    let _ = tx.send(frame).await;
+                                }
+                                continue;
+                            }
+                        }
 
-                                            // Add user_id and 2FA status to request data
-                                            let req = request.data(user_id).data(
-                                                talos_api::schema::IsTwoFactorVerified(
-                                                    is_2fa_verified,
-                                                ),
-                                            );
+                        // Security review 2026-07-19 (P3): a pre-2FA
+                        // (password-only) session may not open subscriptions —
+                        // none are auth-bootstrap operations, so the allowlist
+                        // rejects them all. Mirrors the HTTP graphql_handler
+                        // gate and the REST pre-2FA 403.
+                        if !is_2fa_verified
+                            && !talos_api::schema::pre_2fa_operation_allowed(
+                                &request.query,
+                                request.operation_name.as_deref(),
+                            )
+                        {
+                            talos_metrics::record_ws_operation(
+                                WsOperationOutcome::RefusedPreSecondFactor,
+                            );
+                            if let Some(frame) = error_frame(
+                                id,
+                                "Two-Factor Authentication required. Complete 2FA \
+                                 verification to subscribe.",
+                            ) {
+                                let _ = tx.send(frame).await;
+                            }
+                            continue;
+                        }
 
-                                            // Execute subscription
-                                            talos_metrics::record_ws_operation(
-                                                WsOperationOutcome::Started,
-                                            );
-                                            let mut response_stream = schema.execute_stream(req);
+                        tasks.reap();
+                        if tasks.subscriptions.contains_key(id) {
+                            talos_metrics::record_ws_operation(
+                                WsOperationOutcome::RefusedDuplicateId,
+                            );
+                            tracing::warn!(
+                                target: "talos_ws_auth",
+                                event_kind = "ws_duplicate_subscription_id",
+                                %user_id,
+                                "WebSocket start reused a live subscription id"
+                            );
+                            if let Some(frame) =
+                                error_frame(id, "A subscription with this id is already open.")
+                            {
+                                let _ = tx.send(frame).await;
+                            }
+                            continue;
+                        }
+                        if tasks.subscriptions.len() >= MAX_SUBSCRIPTIONS_PER_SOCKET {
+                            talos_metrics::record_ws_operation(
+                                WsOperationOutcome::RefusedTooManySubscriptions,
+                            );
+                            tracing::warn!(
+                                target: "talos_audit",
+                                event_kind = "ws_subscription_cap_refused",
+                                %user_id,
+                                open = tasks.subscriptions.len(),
+                                cap = MAX_SUBSCRIPTIONS_PER_SOCKET,
+                                "WebSocket start refused: per-socket subscription cap"
+                            );
+                            if let Some(frame) =
+                                error_frame(id, "Too many open subscriptions on this connection.")
+                            {
+                                let _ = tx.send(frame).await;
+                            }
+                            continue;
+                        }
 
-                                            // Send data messages
-                                            while let Some(mut response) =
-                                                response_stream.next().await
-                                            {
-                                                // 2026-09-10: same production
-                                                // error scrubber as the HTTP
-                                                // `graphql_handler` — one home.
-                                                talos_api::schema::scrub_response_errors(
-                                                    &mut response,
-                                                );
-                                                let data_msg = serde_json::json!({
-                                                    "type": "data",
-                                                    "id": id,
-                                                    "payload": response
-                                                });
+                        // Add user_id and 2FA status to request data
+                        let req = request
+                            .data(user_id)
+                            .data(talos_api::schema::IsTwoFactorVerified(is_2fa_verified));
 
-                                                if let Ok(data_text) =
-                                                    serde_json::to_string(&data_msg)
-                                                {
-                                                    if sink
-                                                        .send(Message::Text(data_text.into()))
-                                                        .await
-                                                        .is_err()
-                                                    {
-                                                        break;
-                                                    }
-                                                }
-                                            }
-
-                                            // Send complete message
-                                            let complete_msg = serde_json::json!({
-                                                "type": "complete",
-                                                "id": id
-                                            });
-                                            if let Ok(complete_text) =
-                                                serde_json::to_string(&complete_msg)
-                                            {
-                                                let _ = sink
-                                                    .send(Message::Text(complete_text.into()))
-                                                    .await;
-                                            }
-                                        }
-                                    }
+                        talos_metrics::record_ws_operation(WsOperationOutcome::Started);
+                        let mut response_stream = schema.execute_stream(req);
+                        let sub_tx = tx.clone();
+                        let sub_id = id.to_string();
+                        let handle = tokio::spawn(async move {
+                            while let Some(mut response) = response_stream.next().await {
+                                // 2026-09-10: same production error scrubber as
+                                // the HTTP `graphql_handler` — one home.
+                                talos_api::schema::scrub_response_errors(&mut response);
+                                let Some(frame) = text_frame(&serde_json::json!({
+                                    "type": "data",
+                                    "id": sub_id,
+                                    "payload": response
+                                })) else {
+                                    continue;
+                                };
+                                if sub_tx.send(frame).await.is_err() {
+                                    return;
                                 }
                             }
-                            Some("stop") => {
-                                // Handle stop message
-                                if let Some(id) = ws_msg.get("id").and_then(|i| i.as_str()) {
-                                    let complete_msg = serde_json::json!({
-                                        "type": "complete",
-                                        "id": id
-                                    });
-                                    if let Ok(complete_text) = serde_json::to_string(&complete_msg)
-                                    {
-                                        let _ =
-                                            sink.send(Message::Text(complete_text.into())).await;
-                                    }
-                                }
+                            if let Some(frame) = text_frame(&serde_json::json!({
+                                "type": "complete",
+                                "id": sub_id
+                            })) {
+                                let _ = sub_tx.send(frame).await;
                             }
-                            Some("connection_terminate") => {
-                                return WsSessionEnd::ClientTerminated;
+                        });
+                        tasks.subscriptions.insert(id.to_string(), handle);
+                    }
+                    Some("stop") => {
+                        if let Some(id) = ws_msg.get("id").and_then(|i| i.as_str()) {
+                            // Abort the stream — before DV this only echoed
+                            // `complete` and the server-side stream ran on
+                            // until the socket closed.
+                            if let Some(handle) = tasks.subscriptions.remove(id) {
+                                handle.abort();
                             }
-                            _ => {}
+                            if let Some(frame) = text_frame(&serde_json::json!({
+                                "type": "complete",
+                                "id": id
+                            })) {
+                                let _ = tx.send(frame).await;
+                            }
                         }
                     }
+                    Some("connection_terminate") => {
+                        return WsSessionEnd::ClientTerminated;
+                    }
+                    _ => {}
                 }
-                Message::Close(_) => {
-                    return WsSessionEnd::ClientTerminated;
-                }
-                _ => {}
             }
+            Message::Close(_) => {
+                return WsSessionEnd::ClientTerminated;
+            }
+            _ => {}
         }
     }
     WsSessionEnd::StreamEnded
@@ -667,8 +736,421 @@ mod handshake_classification_tests {
             production
                 .matches("talos_metrics::record_ws_operation(")
                 .count(),
-            3
+            5
         );
         assert_eq!(production.matches("WsActiveSession::open()").count(), 1);
+    }
+}
+
+/// Package DV: the session loop driven end to end over a channel-backed
+/// transport and a two-field schema. Every case here is impossible on the
+/// pre-DV loop by construction — it awaited one subscription's whole stream
+/// inside the read loop, so a second `start` was never read.
+#[cfg(test)]
+mod multiplex_tests {
+    use super::{handle_graphql_ws, MAX_SUBSCRIPTIONS_PER_SOCKET};
+    use axum::extract::ws::Message;
+    use futures::channel::mpsc;
+    use futures::{Sink, Stream, StreamExt};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::task::{Context as TaskContext, Poll};
+    use std::time::Duration;
+    use talos_metrics::WsSessionEnd;
+    use uuid::Uuid;
+
+    /// A socket stand-in: the test writes inbound frames, reads outbound ones.
+    struct Duplex {
+        inbound: mpsc::UnboundedReceiver<Result<Message, axum::Error>>,
+        outbound: mpsc::UnboundedSender<Message>,
+    }
+
+    impl Stream for Duplex {
+        type Item = Result<Message, axum::Error>;
+        fn poll_next(
+            mut self: Pin<&mut Self>,
+            cx: &mut TaskContext<'_>,
+        ) -> Poll<Option<Self::Item>> {
+            Pin::new(&mut self.inbound).poll_next(cx)
+        }
+    }
+
+    impl Sink<Message> for Duplex {
+        type Error = ();
+        fn poll_ready(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<Result<(), ()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), ()> {
+            self.outbound.unbounded_send(item).map_err(|_| ())
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<Result<(), ()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_close(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<Result<(), ()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A subscription stream that never yields and never ends; its guard
+    /// counts how many are alive, which is how "the task was aborted" is
+    /// observed from outside.
+    struct Forever(Arc<AtomicUsize>);
+    impl Forever {
+        fn new(live: Arc<AtomicUsize>) -> Self {
+            live.fetch_add(1, Ordering::SeqCst);
+            Self(live)
+        }
+    }
+    impl Drop for Forever {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+    impl Stream for Forever {
+        type Item = i32;
+        fn poll_next(self: Pin<&mut Self>, _: &mut TaskContext<'_>) -> Poll<Option<i32>> {
+            Poll::Pending
+        }
+    }
+
+    struct TestQuery;
+    #[async_graphql::Object]
+    impl TestQuery {
+        async fn ok(&self) -> bool {
+            true
+        }
+    }
+
+    struct TestSubscription;
+    #[async_graphql::Subscription]
+    impl TestSubscription {
+        async fn ticks(&self, n: i32) -> impl Stream<Item = i32> {
+            futures::stream::iter(0..n)
+        }
+        async fn forever(&self, ctx: &async_graphql::Context<'_>) -> impl Stream<Item = i32> {
+            Forever::new(ctx.data_unchecked::<Arc<AtomicUsize>>().clone())
+        }
+    }
+
+    type TestSchema =
+        async_graphql::Schema<TestQuery, async_graphql::EmptyMutation, TestSubscription>;
+
+    struct Harness {
+        to_server: mpsc::UnboundedSender<Result<Message, axum::Error>>,
+        from_server: mpsc::UnboundedReceiver<Message>,
+        live: Arc<AtomicUsize>,
+        session: tokio::task::JoinHandle<WsSessionEnd>,
+    }
+
+    /// The process-global registry is shared by every test in this binary, so
+    /// the tests that record or read `talos_ws_operations_total` serialise.
+    static SERIES_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn registry() -> &'static Arc<talos_metrics::TalosMetrics> {
+        if talos_metrics::global().is_none() {
+            talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("registry"));
+        }
+        talos_metrics::global().expect("installed above")
+    }
+
+    fn spawn_session() -> Harness {
+        let live = Arc::new(AtomicUsize::new(0));
+        let schema: TestSchema =
+            async_graphql::Schema::build(TestQuery, async_graphql::EmptyMutation, TestSubscription)
+                .data(live.clone())
+                .finish();
+        let (to_server, inbound) = mpsc::unbounded();
+        let (outbound, from_server) = mpsc::unbounded();
+        let duplex = Duplex { inbound, outbound };
+        let session = tokio::spawn(handle_graphql_ws(duplex, schema, Uuid::new_v4(), true));
+        Harness {
+            to_server,
+            from_server,
+            live,
+            session,
+        }
+    }
+
+    fn frame(v: serde_json::Value) -> Result<Message, axum::Error> {
+        Ok(Message::Text(v.to_string().into()))
+    }
+
+    fn start(id: &str, query: &str) -> Result<Message, axum::Error> {
+        frame(serde_json::json!({
+            "id": id,
+            "type": "start",
+            "payload": { "query": query }
+        }))
+    }
+
+    fn stop(id: &str) -> Result<Message, axum::Error> {
+        frame(serde_json::json!({ "id": id, "type": "stop" }))
+    }
+
+    async fn next_frame(h: &mut Harness) -> serde_json::Value {
+        let m = tokio::time::timeout(Duration::from_secs(2), h.from_server.next())
+            .await
+            .expect("a frame within 2 s")
+            .expect("the server did not close");
+        match m {
+            Message::Text(t) => serde_json::from_str(&t).expect("json frame"),
+            other => panic!("unexpected frame {other:?}"),
+        }
+    }
+
+    async fn wait_live(h: &Harness, want: usize) {
+        wait_live_on(&h.live, want).await;
+    }
+
+    async fn wait_live_on(live: &Arc<AtomicUsize>, want: usize) {
+        for _ in 0..200 {
+            if live.load(Ordering::SeqCst) == want {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!(
+            "live subscriptions stuck at {} (wanted {want})",
+            live.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_subscription_is_served_while_the_first_is_still_streaming() {
+        let _g = SERIES_LOCK.lock().await;
+        let mut h = spawn_session();
+        h.to_server
+            .unbounded_send(start("a", "subscription { forever }"))
+            .unwrap();
+        wait_live(&h, 1).await;
+        h.to_server
+            .unbounded_send(start("b", "subscription { ticks(n: 2) }"))
+            .unwrap();
+        // Pre-DV the read loop was inside `a`'s stream and `b` was never read.
+        let mut b_data = 0;
+        loop {
+            let f = next_frame(&mut h).await;
+            assert_eq!(f["id"], "b", "only b produces frames: {f}");
+            match f["type"].as_str() {
+                Some("data") => {
+                    b_data += 1;
+                    assert_eq!(f["payload"]["data"]["ticks"], b_data - 1);
+                }
+                Some("complete") => break,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(b_data, 2);
+        assert_eq!(h.live.load(Ordering::SeqCst), 1, "a is still open");
+        h.to_server.unbounded_send(stop("a")).unwrap();
+        let f = next_frame(&mut h).await;
+        assert_eq!(
+            (f["type"].as_str(), f["id"].as_str()),
+            (Some("complete"), Some("a"))
+        );
+        // `stop` ABORTS the stream server-side — pre-DV it ran on.
+        wait_live(&h, 0).await;
+        h.to_server
+            .unbounded_send(frame(serde_json::json!({ "type": "connection_terminate" })))
+            .unwrap();
+        assert_eq!(h.session.await.unwrap(), WsSessionEnd::ClientTerminated);
+    }
+
+    #[tokio::test]
+    async fn the_per_socket_cap_refuses_the_next_start_and_leaves_the_others_alone() {
+        let _g = SERIES_LOCK.lock().await;
+        let mut h = spawn_session();
+        for i in 0..MAX_SUBSCRIPTIONS_PER_SOCKET {
+            h.to_server
+                .unbounded_send(start(&format!("s{i}"), "subscription { forever }"))
+                .unwrap();
+        }
+        wait_live(&h, MAX_SUBSCRIPTIONS_PER_SOCKET).await;
+        h.to_server
+            .unbounded_send(start("overflow", "subscription { forever }"))
+            .unwrap();
+        let f = next_frame(&mut h).await;
+        assert_eq!(
+            (f["type"].as_str(), f["id"].as_str()),
+            (Some("error"), Some("overflow"))
+        );
+        assert!(f["payload"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Too many open subscriptions"));
+        assert_eq!(h.live.load(Ordering::SeqCst), MAX_SUBSCRIPTIONS_PER_SOCKET);
+        h.to_server
+            .unbounded_send(frame(serde_json::json!({ "type": "connection_terminate" })))
+            .unwrap();
+        let live = h.live.clone();
+        assert_eq!(h.session.await.unwrap(), WsSessionEnd::ClientTerminated);
+        // Session end aborts every task.
+        wait_live_on(&live, 0).await;
+    }
+
+    #[tokio::test]
+    async fn a_live_id_cannot_be_reused_but_a_completed_one_can() {
+        let _g = SERIES_LOCK.lock().await;
+        let mut h = spawn_session();
+        h.to_server
+            .unbounded_send(start("x", "subscription { forever }"))
+            .unwrap();
+        wait_live(&h, 1).await;
+        h.to_server
+            .unbounded_send(start("x", "subscription { ticks(n: 1) }"))
+            .unwrap();
+        let f = next_frame(&mut h).await;
+        assert_eq!(
+            (f["type"].as_str(), f["id"].as_str()),
+            (Some("error"), Some("x"))
+        );
+        assert!(f["payload"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("already open"));
+        assert_eq!(
+            h.live.load(Ordering::SeqCst),
+            1,
+            "the live one is untouched"
+        );
+        h.to_server.unbounded_send(stop("x")).unwrap();
+        assert_eq!(next_frame(&mut h).await["type"], "complete");
+        wait_live(&h, 0).await;
+        // The id is free again once its task is gone.
+        h.to_server
+            .unbounded_send(start("x", "subscription { ticks(n: 1) }"))
+            .unwrap();
+        let d = next_frame(&mut h).await;
+        assert_eq!(
+            (d["type"].as_str(), d["id"].as_str()),
+            (Some("data"), Some("x"))
+        );
+        assert_eq!(next_frame(&mut h).await["type"], "complete");
+        // And an id freed by NATURAL completion (no `stop`) is reusable too —
+        // that is `reap`'s job, and without it this third start is refused as
+        // "already open" (mutation-proved). The task sends `complete` and
+        // THEN returns, so `is_finished()` can lag the frame by microseconds;
+        // a refusal is re-tried a bounded number of times rather than read as
+        // the verdict. A deleted reap never frees the id and exhausts the
+        // bound.
+        let mut served = false;
+        for _ in 0..50 {
+            h.to_server
+                .unbounded_send(start("x", "subscription { ticks(n: 1) }"))
+                .unwrap();
+            let f = next_frame(&mut h).await;
+            if f["type"] == "error" {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                continue;
+            }
+            assert_eq!(
+                (f["type"].as_str(), f["id"].as_str()),
+                (Some("data"), Some("x"))
+            );
+            assert_eq!(next_frame(&mut h).await["type"], "complete");
+            served = true;
+            break;
+        }
+        assert!(served, "a naturally completed id was never freed");
+        h.to_server
+            .unbounded_send(frame(serde_json::json!({ "type": "connection_terminate" })))
+            .unwrap();
+        assert_eq!(h.session.await.unwrap(), WsSessionEnd::ClientTerminated);
+    }
+
+    /// The `started` series counts ACCEPTED starts only: a refused start
+    /// moves its own refusal series and nothing else. Reads the real
+    /// registry, so this test and its siblings serialise on `SERIES_LOCK`.
+    #[tokio::test]
+    async fn a_refused_start_moves_its_refusal_series_and_not_started() {
+        let _g = SERIES_LOCK.lock().await;
+        let m = registry();
+        let read = |label: &str| m.ws_operations_total.with_label_values(&[label]).get();
+        let (started0, dup0, cap0) = (
+            read("started"),
+            read("refused_duplicate_id"),
+            read("refused_too_many"),
+        );
+        let mut h = spawn_session();
+        h.to_server
+            .unbounded_send(start("a", "subscription { forever }"))
+            .unwrap();
+        wait_live(&h, 1).await;
+        assert_eq!(read("started") - started0, 1.0, "one accepted start");
+        h.to_server
+            .unbounded_send(start("a", "subscription { forever }"))
+            .unwrap();
+        assert_eq!(next_frame(&mut h).await["type"], "error");
+        assert_eq!(read("refused_duplicate_id") - dup0, 1.0);
+        assert_eq!(
+            read("started") - started0,
+            1.0,
+            "the refused start did not count as started"
+        );
+        for i in 1..MAX_SUBSCRIPTIONS_PER_SOCKET {
+            h.to_server
+                .unbounded_send(start(&format!("s{i}"), "subscription { forever }"))
+                .unwrap();
+        }
+        wait_live(&h, MAX_SUBSCRIPTIONS_PER_SOCKET).await;
+        h.to_server
+            .unbounded_send(start("over", "subscription { forever }"))
+            .unwrap();
+        assert_eq!(next_frame(&mut h).await["type"], "error");
+        assert_eq!(read("refused_too_many") - cap0, 1.0);
+        assert_eq!(
+            read("started") - started0,
+            MAX_SUBSCRIPTIONS_PER_SOCKET as f64,
+            "exactly the accepted starts"
+        );
+        h.to_server
+            .unbounded_send(frame(serde_json::json!({ "type": "connection_terminate" })))
+            .unwrap();
+        assert_eq!(h.session.await.unwrap(), WsSessionEnd::ClientTerminated);
+    }
+
+    /// The handshake wraps the session in the token-expiry deadline, and a
+    /// timed-out future is DROPPED — this is that drop, and the guard is what
+    /// makes it abort the spawned streams instead of orphaning them.
+    #[tokio::test]
+    async fn dropping_the_session_future_aborts_every_subscription_task() {
+        let _g = SERIES_LOCK.lock().await;
+        let h = spawn_session();
+        h.to_server
+            .unbounded_send(start("a", "subscription { forever }"))
+            .unwrap();
+        h.to_server
+            .unbounded_send(start("b", "subscription { forever }"))
+            .unwrap();
+        wait_live(&h, 2).await;
+        h.session.abort();
+        wait_live(&h, 0).await;
+    }
+
+    #[tokio::test]
+    async fn a_query_over_the_socket_is_refused_and_the_session_survives() {
+        let _g = SERIES_LOCK.lock().await;
+        let mut h = spawn_session();
+        h.to_server
+            .unbounded_send(start("q", "query { ok }"))
+            .unwrap();
+        let f = next_frame(&mut h).await;
+        assert_eq!(
+            (f["type"].as_str(), f["id"].as_str()),
+            (Some("error"), Some("q"))
+        );
+        assert!(f["payload"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Only subscription operations"));
+        h.to_server
+            .unbounded_send(start("s", "subscription { ticks(n: 1) }"))
+            .unwrap();
+        assert_eq!(next_frame(&mut h).await["type"], "data");
+        assert_eq!(next_frame(&mut h).await["type"], "complete");
+        // The transport ending without a terminate frame is `stream_ended`.
+        drop(h.to_server);
+        assert_eq!(h.session.await.unwrap(), WsSessionEnd::StreamEnded);
     }
 }

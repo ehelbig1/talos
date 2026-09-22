@@ -2322,9 +2322,11 @@ impl TalosMetrics {
                  refused_non_subscription (the lane executes subscriptions only — a query \
                  or mutation sent over /ws is refused, 2026-09-10) | \
                  refused_pre_second_factor (a password-only session may not subscribe, \
-                 2026-07-19 P3). Both refusals were talos_audit log lines only until \
-                 2026-09-22. talos_metrics::WsOperationOutcome, closed, all three \
-                 pre-seeded at 0.",
+                 2026-07-19 P3) | refused_too_many (the per-socket subscription cap, \
+                 MAX_SUBSCRIPTIONS_PER_SOCKET) | refused_duplicate_id (a start reusing a \
+                 live id). The first two refusals were talos_audit log lines only until \
+                 2026-09-22; the last two exist since the lane multiplexes (package DV). \
+                 talos_metrics::WsOperationOutcome, closed, all five pre-seeded at 0.",
             ),
             &["outcome"],
         )?;

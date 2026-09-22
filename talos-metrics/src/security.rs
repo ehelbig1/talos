@@ -270,11 +270,20 @@ impl WsSessionEnd {
 /// own gates (2026-09-10: the WebSocket transport executes SUBSCRIPTIONS
 /// only; 2026-07-19 P3: a password-only session may not subscribe) — both
 /// were `talos_audit` log lines with no counter.
+///
+/// Two more since the lane multiplexes subscriptions over one socket
+/// (package DV, 2026-09-22): `RefusedTooManySubscriptions` — the per-socket
+/// cap (`talos_ws_auth::MAX_SUBSCRIPTIONS_PER_SOCKET`) refused a `start`,
+/// a client bug or a probe, never a legitimate dashboard; and
+/// `RefusedDuplicateId` — a `start` reusing an id that is still live, a
+/// protocol violation the graphql-ws spec names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum WsOperationOutcome {
     Started,
     RefusedNonSubscription,
     RefusedPreSecondFactor,
+    RefusedTooManySubscriptions,
+    RefusedDuplicateId,
 }
 
 impl WsOperationOutcome {
@@ -282,6 +291,8 @@ impl WsOperationOutcome {
         Self::Started,
         Self::RefusedNonSubscription,
         Self::RefusedPreSecondFactor,
+        Self::RefusedTooManySubscriptions,
+        Self::RefusedDuplicateId,
     ];
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -289,6 +300,8 @@ impl WsOperationOutcome {
             Self::Started => "started",
             Self::RefusedNonSubscription => "refused_non_subscription",
             Self::RefusedPreSecondFactor => "refused_pre_second_factor",
+            Self::RefusedTooManySubscriptions => "refused_too_many",
+            Self::RefusedDuplicateId => "refused_duplicate_id",
         }
     }
 }

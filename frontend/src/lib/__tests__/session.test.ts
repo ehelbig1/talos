@@ -249,9 +249,18 @@ describe("session: every auth-recovery site goes through the epoch (textual pin)
     // vitest runs with the frontend package as its cwd (vite root).
     const gql = readFileSync("src/lib/graphqlClient.ts", "utf8");
     const rest = readFileSync("src/lib/authedFetch.ts", "utf8");
+    const hub = readFileSync("src/lib/wsHub.ts", "utf8");
     expect(gql).not.toMatch(/attemptTokenRefresh/);
     expect(rest).not.toMatch(/attemptTokenRefresh/);
-    expect(gql.match(/recoverSession\(epochAtConnect\)/g)?.length).toBe(2);
+    expect(hub).not.toMatch(/attemptTokenRefresh/);
+    // Package DV: the WebSocket lives in the hub, with ONE recovery site
+    // reached from both the connection_error and the auth-error frames.
+    expect(gql).not.toMatch(/new WebSocket\(/);
+    expect(hub.match(/new WebSocket\(/g)?.length).toBe(1);
+    expect(hub.match(/recoverSession\(this\.epochAtConnect\)/g)?.length).toBe(
+      1,
+    );
+    expect(hub.match(/this\.recoverAuth\(ws\)/g)?.length).toBe(2);
     expect(gql.match(/recoverSession\(epochAtSend\)/g)?.length).toBe(1);
     expect(rest.match(/recoverSession\(epochAtSend\)/g)?.length).toBe(2);
   });

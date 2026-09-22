@@ -332,8 +332,8 @@ instrumented since 2026-09-22 (package DU):
 |--------|------|-------------|
 | `talos_ws_handshakes_total{outcome}` | Counter | One per socket at the handshake's exit: `authenticated`, the three Origin refusals (`origin_missing` / `origin_malformed` / `origin_not_allowed` — the CSWH signal), `no_token` / `invalid_token` / `invalid_user_id` (connection_init without a usable cookie), `protocol_violation`, `init_not_received`. All nine seeded at 0 |
 | `talos_ws_session_ends_total{reason}` | Counter | `token_expired` (the stolen-cookie exposure bound firing), `client_terminated`, `stream_ended`; seeded |
-| `talos_ws_operations_total{outcome}` | Counter | `started`, `refused_non_subscription`, `refused_pre_second_factor`; seeded |
-| `talos_ws_active_sessions` | Gauge | Authenticated sessions open on this controller (one socket per frontend subscription; a dashboard load is several) |
+| `talos_ws_operations_total{outcome}` | Counter | `started`, `refused_non_subscription`, `refused_pre_second_factor`, `refused_too_many` (the per-socket cap of 16 live subscriptions), `refused_duplicate_id` (a `start` reusing a live id); all five seeded |
+| `talos_ws_active_sessions` | Gauge | Authenticated sessions open on this controller (since package DV one socket per frontend PAGE, every subscription multiplexed over it by id; before, one socket per subscription) |
 
 Alert on saturation with `in_use / max > 0.9` (shipped as `TalosDBPoolSaturated`
 in `deploy/observability/alerts.yaml`).
