@@ -3336,41 +3336,41 @@ bold "▶ check 42: org-pinned-table creates must run on a tenant-scoped tx"
 # they stay permit-via-unset and are protected by the read-scope USING clause
 # + the app-layer `user_id` filter.) Comment lines are skipped (a `//` that
 # merely mentions an INSERT is not a write). Opt-out
-# `// allow-unscoped-org-write: <reason>` within 4 lines above (engine /
+# `// allow-unscoped-org-write: <reason>` within 8 lines above (engine /
 # system / seeding paths that intentionally stay permissive).
 
-ORG_WRITE_VIOLATIONS=0
-org_write_files=$(grep -rlE "INSERT INTO (workflows|actors|secrets)\b" --include='*.rs' talos-* controller 2>/dev/null \
-    | grep -vE '/tests/' || true)
-for f in $org_write_files; do
-    [ -f "$f" ] || continue
-    while IFS= read -r m; do
-        [ -z "$m" ] && continue
-        lineno=$(echo "$m" | cut -d: -f1)
-        body=$(echo "$m" | cut -d: -f2-)
-        # Skip comment-line matches (a `//` referencing an INSERT, not a write).
-        echo "$body" | grep -qE '^[[:space:]]*//' && continue
-        # Inspect the statement's executor in the following lines.
-        ctx=$(sed -n "${lineno},$((lineno + 16))p" "$f" 2>/dev/null || true)
-        # Scoped writes use `&mut *tx` / a threaded conn — never the bare pool.
-        echo "$ctx" | grep -qE '\.(execute|fetch_one|fetch_optional|fetch_all)\([[:space:]]*(&self\.db_pool|&self\.pool|db_pool|&pool|pool)[[:space:]]*\)' || continue
-        # Opt-out within 4 lines above.
-        start=$((lineno > 4 ? lineno - 4 : 1))
-        above=$(sed -n "${start},${lineno}p" "$f" 2>/dev/null || true)
-        echo "$above" | grep -q 'allow-unscoped-org-write' && continue
-        printf '  %s:%s\n' "$f" "$lineno"
-        ORG_WRITE_VIOLATIONS=$((ORG_WRITE_VIOLATIONS + 1))
-    done <<< "$(grep -nE 'INSERT INTO (workflows|actors|secrets)\b' "$f" 2>/dev/null)"
-done
-
-if [ "$ORG_WRITE_VIOLATIONS" -gt 0 ]; then
-    red "✗ $ORG_WRITE_VIOLATIONS org-pinned-table create(s) on the bare pool (unscoped)"
-    yellow "  → open the write via talos_db::begin_org_scoped (or the repo"
-    yellow "    begin_personal_org_write helper) so the org-pin WITH CHECK enforces (RFC 0006)."
-    yellow "  → or // allow-unscoped-org-write: <reason> for an engine/system/seeding path."
+# STATEMENT-AWARE since 2026-09-22 (package DQ). The bash body this replaced
+# looked 16 lines below each INSERT line for one of five executor spellings.
+# Measured: 15 org-table INSERT statements, all on a tx/conn — 0 findings,
+# correctly — but THREE had their executor 18–22 lines below the literal
+# (`talos-secrets-manager/src/manager.rs` ×2, `talos-workflow-repository/src/
+# workflows.rs:739`), past the window, so a change to the bare pool there
+# would never have been seen; mutation-proved: `&mut *tx` → `&self.db_pool`
+# at manager.rs's far site is reported by the script and invisible to the
+# window. `scripts/lint-org-write-executor.py` follows each literal to its
+# executor and classifies the ARGUMENT by shape (names a pool, no `mut`), runs
+# its own self-test first, and fails loudly (exit 2) when the rule matches
+# nothing. Opt-out `// allow-unscoped-org-write: <reason>` within 8 lines
+# above the literal (was 4).
+if ! python3 "$ROOT/scripts/lint-org-write-executor.py" --self-test; then
+    red "✗ scripts/lint-org-write-executor.py --self-test failed"
     EXIT_CODE=1
+fi
+CK42_RC=0
+CK42_OUT="$(cd "$ROOT" && python3 scripts/lint-org-write-executor.py "$ROOT" 2>&1)" || CK42_RC=$?
+if [ "$CK42_RC" -eq 0 ]; then
+    green "✓ org-pinned-table creates all run on a tenant-scoped executor (${CK42_OUT##*$'\n'})"
 else
-    green "✓ org-pinned-table creates all run on a tenant-scoped tx"
+    printf '%s\n' "$CK42_OUT"
+    if [ "$CK42_RC" -ge 2 ]; then
+        red "✗ check 42 could not run"
+    else
+        red "✗ org-pinned-table create(s) on the bare pool, or with no executor in the statement"
+        yellow "  → open the write via talos_db::begin_org_scoped (or the repo"
+        yellow "    begin_personal_org_write helper) so the org-pin WITH CHECK enforces (RFC 0006)."
+        yellow "  → or // allow-unscoped-org-write: <reason> within 8 lines above, for an engine/system/seeding path."
+    fi
+    EXIT_CODE=1
 fi
 echo
 

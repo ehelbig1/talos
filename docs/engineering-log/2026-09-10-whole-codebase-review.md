@@ -6450,3 +6450,50 @@ one wasted round trip and not noise. `me` fires twice on load in
 development — React StrictMode's double effect, absent from the production
 build. The authenticated dashboard's request waterfall was not measured:
 signing in is the operator's, and this survey does not touch credentials.
+
+### The check-42 entry as it stood at ecf5fe4c (superseded by package DQ's statement-aware re-point)
+
+  42. org-pinned-table creates must run on a tenant-scoped tx — an `INSERT INTO {workflows,actors,secrets}` (the org-setting write) must execute on a `begin_org_scoped` / `begin_personal_org_write` tx, NOT the bare `&self.db_pool`/`db_pool`, so the org-pin RLS WITH CHECK (`org_id = app.current_org_id`) enforces once `TALOS_RLS_SET_ROLE` flips on (RFC 0006 / RFC 0005 S3, PRs #219–#222). A bare-pool create only passes via `unset → permit` (silently un-enforced). Comment lines are skipped; UPDATE/DELETE that don't move `org_id` are out of scope; opt-out `// allow-unscoped-org-write` for engine/system/seeding paths
+
+## Package DQ — check 42 reads the statement (2026-09-22)
+
+The org-pinned-table create rule (RFC 0006 / RFC 0005 S3): an `INSERT INTO
+workflows | actors | secrets` sets `org_id`, and the RLS `WITH CHECK` on those
+tables enforces only on a connection whose org GUC was set; on the bare pool
+it passes through `unset → permit`. Check 42 guarded that with a grep that
+read 16 lines below each `INSERT` line for one of five executor spellings.
+
+Measured first, statement-aware on the DL lexer:
+
+| | |
+|---|---|
+| org-table `INSERT` literals | 15 (the line grep counted 16) |
+| executor a tx / conn | 15 of 15 — the check's 0 was correct |
+| executor beyond the 16-line window | 3 (18, 21 and 22 lines below the literal) |
+| executor spellings the regex knew | 5; `&*self.pool`, `self.pool()`, `&state.db_pool` were not among them |
+
+So the check was green over the whole population and blind to a fifth of it:
+a change to `&self.db_pool` at any of the three far sites would have passed.
+Proved rather than argued: `.fetch_one(&mut *tx)` → `.fetch_one(&self.db_pool)`
+at `talos-secrets-manager/src/manager.rs:1437` (the executor of the literal
+at 1415) is one finding for the new script and nothing for the old window
+logic run over the same text; the file was restored byte-for-byte.
+
+`scripts/lint-org-write-executor.py` follows each literal to the first
+executor call within 60 lines and classifies the ARGUMENT by shape: it names
+`pool` / `db_pool` / `db` and carries no `mut` — the bare pool; otherwise
+scoped (`&mut *tx`, `&mut **tx`, `conn`, `&mut *conn`, `executor`). A
+statement with no executor in range is its own finding kind; a statement
+this rule cannot see is a gap it must say. One `scan_source` body serves the
+real run and the nine-case self-test (the far-window shape both ways, the
+new spellings, the scoped spellings, the marker in and out of range, the
+no-executor kind, a comment quoting the statement, a stripped test module,
+a non-org table). The check exits 2 when the rule matches nothing.
+
+Behaviour change, stated: the opt-out is read within 8 lines above the
+literal (was 4), DL's rule for wrapped statements. `--count` stays 96.
+
+Stated limit: the executor is found by forward scan from the literal's line,
+so a literal bound to a local and executed in a later statement attributes
+the next executor it meets — the loud direction, since a scoped one in
+between hides nothing and a pool one reports.
