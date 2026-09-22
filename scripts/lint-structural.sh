@@ -9423,7 +9423,7 @@ bold "▶ check 96: the CLAUDE.md engineering-log split lost nothing"
 CK96_RC=0
 CK96_OUT="$(cd "$ROOT" && python3 scripts/check-engineering-log.py --self-test 2>&1 && python3 scripts/check-engineering-log.py 2>&1)" || CK96_RC=$?
 if [ "$CK96_RC" -eq 0 ]; then
-    green "✓ engineering-log split lossless ($(echo "$CK96_OUT" | grep -o 'self-test ok: [0-9]* cases'); $(echo "$CK96_OUT" | grep -c '^base ') base(s) checked)"
+    green "✓ engineering-log split lossless ($(echo "$CK96_OUT" | grep -o 'self-test ok: [0-9]* cases'); $(echo "$CK96_OUT" | grep -c '^base .*: [0-9]* lines$') base(s) checked)"
 else
     echo "$CK96_OUT" | sed 's/^/  /'
     red "✗ the CLAUDE.md engineering-log split lost a line, an order, or a decision (or the checker could not run)"
