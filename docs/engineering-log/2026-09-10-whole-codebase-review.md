@@ -6550,3 +6550,52 @@ arm ignoring the first attempt, D7 a WebSocket site back on the bare refresh
 Recorded, not changed: an anonymous page load still issues one doomed
 `refreshToken` with no cookie (the server writes no audit row for it), and
 `me` fires twice on load in dev under StrictMode.
+
+## Package DT — 2FA login had never worked (2026-09-22)
+
+Reported by the operator as "2FA does not appear to be working", then as
+the browser's error text: `Unknown type "VerifyTwoFactorInput"`.
+
+| Measured, live | |
+|---|---|
+| `login_success` rows 19:26–19:32Z | 8 |
+| `user_sessions` created, `second_factor_verified` | 8, all `false` (pending) |
+| `talos_auth_2fa_attempts_total{status=success|failure}` | 0 / 0 |
+| `admin_event_log` `2fa_enabled` | 2026-09-18 16:29 (the CP/CO day) |
+| live schema `__type(name: "VerifyTwoFactorInput")` | null; `verifyTwoFactor(input: Verify2FAInput!)` |
+| bare inline documents under `frontend/src` | 53, 1 invalid |
+
+The prompt is shown, the code is submitted, and the mutation dies at schema
+validation: the frontend names an input type that does not exist. `git log
+-S` puts both spellings at `8f13f1e9` (2026-05-18), the commit where the
+file's history begins, and #519 (2026-07-19) rewrote the mutation string
+and kept the wrong name. So the 2FA login path has been broken for at least
+four months and was reachable by nobody: CO measured one user and zero TOTP
+enrolments on 2026-09-18, and the first password login by an enrolled user
+was today.
+
+Why the repository could not see it: codegen (`documents: "src/**/*.{ts,
+tsx,graphql}"`) plucks `gql`-tagged literals and `.graphql` files and
+validates them against `schema.graphql`; CI gates the regenerated output.
+The auth documents are BARE template literals — no tag — so they are
+neither plucked nor validated, and the component test mocks the function.
+
+The fix is one token. The guard is `inline_documents.test.ts`: a scanner
+over every `.ts`/`.tsx` under `src/` (generated and tests excluded) that
+strips comments — a backticked phrase in prose ("the `mutation
+RefreshToken`") reads as a document otherwise, the one false positive the
+first scan produced — extracts bare literals opening with an operation
+keyword and a selection, skips interpolated ones (none exist), and
+validates each with graphql-js against the snapshot. A floor of 40 on the
+measured 53 keeps it from passing over a scan that matched nothing. Two
+self-tests drive the extraction and validation on a fixture that carries
+the defect, a valid sibling, an interpolated literal and a comment mention.
+
+On the pre-fix tree the population test fails naming
+`src/lib/auth.ts: VerifyTwoFactor: Unknown type "VerifyTwoFactorInput"`.
+
+Deliberately not done: tagging the six documents with `gql` so codegen
+covers them — that regenerates `graphql.ts` for six operations the app
+calls imperatively, and the test covers the CLASS where tags would cover
+the six. Recorded: the eight pending sessions expire on their own; no
+account or session row was changed.
