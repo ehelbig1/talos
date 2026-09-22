@@ -7917,6 +7917,7 @@ dependencies = [
  "talos-capability-world",
  "talos-config",
  "talos-engine-events",
+ "talos-metrics",
  "talos-text-util",
  "talos-wit-inspector",
  "tempfile",

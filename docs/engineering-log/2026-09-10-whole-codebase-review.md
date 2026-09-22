@@ -5885,3 +5885,151 @@ invocation immediately afterwards and finding nothing.
 
 That is now the habit: after replacing a span of `lint-structural.sh`, grep
 for what used to be inside it.
+
+## Package DM — a fail-closed cliff with no series in front of it (2026-09-22)
+
+### The measurement
+
+`check_advisory_db_age` is the freshness gate on the RustSec advisory
+database that `cargo audit --no-fetch` reads during module compilation. It
+warns at 30 days and, when `RUST_ENV=production`, refuses every Rust compile
+and audit once the baked copy is older than `TALOS_ADVISORY_DB_MAX_AGE_DAYS`
+(default 90). The age was computed at exactly one moment: when somebody
+compiled. The lead in the session brief asked two questions — does a gauge
+need a periodic sampler, and does a derived threshold exist — and both were
+answered by reading the code: yes (the computation is inside the compile
+path), and yes (the process resolves its own limit).
+
+Then the live copies were dated:
+
+| copy | path | dated | age on 2026-09-22 |
+|---|---|---|---|
+| controller image | `/opt/talos-advisory-db` | 2026-07-09 | 75 days |
+| builder image (`talos-builder:latest`) | `/opt/talos-advisory-db` | 2026-07-07 | 77 days |
+
+Two copies. The gate stats the controller's, because `ADVISORY_DB_PATH` is
+evaluated on the controller's filesystem before the audit command is built;
+in container mode the same `--db /opt/talos-advisory-db` argument resolves
+INSIDE the builder container, so `cargo audit` reads the builder's copy. Both
+are produced by the same pipeline and were two days apart here, but the gate
+cannot see the copy the audit actually consults. This is recorded as a stated
+limit of the new series, not fixed: sampling the builder's copy needs a
+`docker run` per tick, and the `copy` label is the seam for a future sampler.
+
+The scan itself is cheap — 812 entries under `crates/`, 0.04 s including the
+`docker exec` — so the sampler is hourly with an immediate first tick.
+
+### Two homes for one number
+
+The gate inlined the three-signal freshness logic (directory mtime, git ref
+mtime, newest `crates/` entry — the freshest wins) and `advisory_db_age_days`
+"mirrors the multi-signal logic in `check_advisory_db_age` so the provenance
+log reports the same freshness number the gate consults". Two copies kept
+equal by a comment. They now live once in `talos_compilation::advisory_db`,
+together with the limit, the verdict and the decision:
+
+* `advisory_db_age_days(path) -> Result<u64, AdvisoryDbAgeError>` — a missing
+  or unreadable copy is `Unreadable`, a copy dated in the future is
+  `FutureDated`. Neither is `0`. The old helper returned `Option<u64>` and the
+  old gate returned `Ok(())` silently on a future date; the gate now WARNs on
+  both, the one behaviour change.
+* `advisory_db_max_age_days()` — the env parse (trimmed, positive, else 90),
+  previously inline in the gate.
+* `advisory_db_verdict(age, max)` and `advisory_db_gate_outcome(age, max,
+  production)` — pure. The gate itself is `check_advisory_db_age_as(path,
+  production)` behind a one-line wrapper that passes `is_production()`, so the
+  refusal arm is driven by a test on a backdated directory without touching
+  the process-global `RUST_ENV`.
+
+### The series and the alerts
+
+Three readings keyed by a closed `copy` label, published by
+`publish_advisory_db_sample`: the age, the limit the process resolved, and
+whether that limit refuses (1) or warns (0) on this controller. All three are
+`IntGaugeVec`s and ABSENT until the first sample — a registered plain
+`IntGauge` renders 0 at once, and 0 here reads as "built today". An unreadable
+sample publishes the limit and posture, leaves the age at its last reading,
+and increments the pre-seeded `talos_advisory_db_age_samples_total{copy,
+outcome="unreadable"}`; that counter is what says the reading is stale.
+
+`TalosAdvisoryDbAging` fires at `>= 30`, the gate's own constant, and a
+compile-time test reads the chart and asserts the two numbers are equal.
+`TalosAdvisoryDbExpired` is `age >= talos_advisory_db_max_age_days and
+enforced == 1` — the EXPORTED limit, so an operator who raised the env var has
+an alert that follows it; the fixture with age 95 under a limit of 120 is the
+case a copied `>= 90` fails. `TalosAdvisoryDbUnreadable` is an `increase(...)
+> 0` over two hours: the sampler is hourly, so one interval is a blip and two
+is a missed sample; the same test pins the window between two and eight
+intervals (the blind-detector shape).
+
+Aging fires until the image is rebuilt. That is deliberate: the stated policy
+is a monthly rebuild, the dev fleet has been past the warn threshold for 45
+days, and the alert clears on exactly the action it asks for.
+
+### Guards and mutations
+
+Nine unit tests over the home. The three-signal test is built so that
+removing any one signal changes the answer (100 → 40 → 10 days) and adding a
+STALER signal does not; missing and future-dated are `assert_ne!` against
+`Ok(0)`; the env parse runs under a lock because the variable is
+process-global. The publish test drives an explicit registry through a
+measured sample and then an unreadable one, and asserts the age still reads
+75. The gate test refuses a 400-day copy under `production = true`, names the
+age, the limit and the rebuild script, and passes the same copy under
+`false`. talos-metrics gains a readings test (absent cold, both outcomes
+seeded, each recorder moving the series it names). The bin loop and the
+wrapper are pinned textually and stated as such.
+
+Mutations: 23 applied across four surfaces (the home, the gate, the metrics
+crate, the chart, the bin loop), each confirmed landed and byte-reverted,
+**23 caught** — after one SURVIVED a first run. `L3` replaced the wrapper's
+`talos_config::is_production()` with `false`, and the textual pin written to
+catch exactly that stayed green: its needle is quoted inside its own
+assertion, so the mutated file still contained the string once. That is
+package DL's "a pin whose only match is its own needle", eight days later, in
+a pin written the day after the lesson was recorded. It now searches the
+production half of the file and requires exactly one match. The other
+twenty-two: the verdict off by one at the limit, production never refusing,
+an unreadable sample counted as measured, an unreadable sample publishing a
+fresh-looking zero, each of the two secondary freshness signals dropped, a
+future date reading as zero, a zero or untrimmed limit accepted, the gate
+ignoring its posture, an unreadable copy refusing the compile, the counter
+unseeded, the age written to the wrong gauge, the aging threshold drifting
+from the gate, the expiry ignoring posture or copying the default limit, the
+unreadable window under two samples or reading the wrong outcome, and the bin
+loop ticking at its own interval, sampling without publishing, running
+unsupervised, or the count reverted.
+
+### Stated limits
+
+The builder image's copy is not sampled. `copy="controller"` is the copy the
+gate consults; a builder-side sampler would join under a second label value
+without renaming any series. The rebuild is the operator's action, and the
+dev fleet's Aging alert will fire until it happens — correctly.
+
+
+### Folded: the gate that died of its own finding
+
+The first `make lint` of this package stopped at `▶ check 89` with
+`make: *** [lint] Error 1` and nothing else. Running the check's script by
+hand printed the finding: the reference row says `talos-compilation` reads
+`TALOS_ADVISORY_DB_MAX_AGE_DAYS`, and the detector — `env::var("LITERAL")` as
+a whole quoted argument, over `git ls-files` — could no longer see the read,
+because the new module routed it through a `const` (and, on the first run,
+because the new file was untracked). Inlining the literal fixes the reader;
+`git add -N` before the gate fixes the enumeration.
+
+Why the lint said nothing is the finding worth keeping. Checks 89–95 capture
+their scripts as `CKnn_OUT="$(python3 …)"` followed by `CKnn_RC=$?`. The
+script is `set -euo pipefail`; an assignment whose substitution exits
+non-zero is a failing simple command, so the run aborted at the assignment,
+the `RC=$?` line never executed, the failure arm that prints the finding
+never ran, and checks 90–95 never ran either. #768 recorded the identical
+class for a `grep | grep` pipeline (check 56) and warned that "another check
+that assigns from a pipeline with no `|| true` has this bug latent". Six
+checks had it live in the assignment form, latent only because every one
+had shipped at zero findings — the failure arm had never executed anywhere.
+Now `CKnn_RC=0; CKnn_OUT="$(…)" || CKnn_RC=$?`, the `||`-list exemption.
+Proof: the lint run against the untracked-file state prints the check-89
+finding, marks it `✗`, runs checks 90–95 and exits 1; the same tree with the
+file intent-added is green.

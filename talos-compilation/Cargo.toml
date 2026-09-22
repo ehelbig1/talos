@@ -18,6 +18,9 @@ sha2 = "0.10"
 talos-capability-world = { path = "../talos-capability-world" }
 talos-config = { path = "../talos-config" }
 talos-engine-events = { path = "../talos-engine-events" }
+# The advisory-database age sampler publishes through the controller's registry
+# (a leaf: prometheus + talos-workflow-liveness, no cycle back to here).
+talos-metrics = { path = "../talos-metrics" }
 talos-text-util = { path = "../talos-text-util" }
 talos-wit-inspector = { path = "../talos-wit-inspector" }
 tokio = { version = "1", features = ["sync", "rt", "macros", "process", "time", "io-util", "fs"] }

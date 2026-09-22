@@ -5232,3 +5232,165 @@ tests:
       - eval_time: 24h
         alertname: TalosAuthRotationAuditArmFailing
         exp_alerts: []
+
+  # ── The baked RustSec advisory database (2026-09-22) ──────────────────
+  # One case per clause, every other clause satisfied, so exactly one clause
+  # can refuse each quiet case.
+
+  # Aging: fires at the gate's warn threshold (30) after an hour, and not at
+  # 29. The limit and posture are set so only the threshold decides; Expired
+  # must stay quiet because 30 < 90.
+  - interval: 1m
+    name: advisory db — aging fires at 30 days, not 29
+    input_series:
+      - series: 'talos_advisory_db_age_days{job="talos-controller",instance="c:8000",copy="controller"}'
+        values: "29+0x70 30+0x140"
+      - series: 'talos_advisory_db_max_age_days{job="talos-controller",instance="c:8000",copy="controller"}'
+        values: "90+0x210"
+      - series: 'talos_advisory_db_age_enforced{job="talos-controller",instance="c:8000",copy="controller"}'
+        values: "1+0x210"
+    alert_rule_test:
+      - eval_time: 70m
+        alertname: TalosAdvisoryDbAging
+        exp_alerts: []
+      - eval_time: 100m
+        alertname: TalosAdvisoryDbAging
+        exp_alerts: []
+      - eval_time: 135m
+        alertname: TalosAdvisoryDbAging
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: supply-chain
+              job: talos-controller
+              instance: "c:8000"
+              copy: controller
+            exp_annotations:
+              summary: "The baked RustSec advisory database is 30 days old"
+              description: |
+                `cargo audit` inside module compilation checks dependencies against
+                a copy of the RustSec advisory database baked into the image, and
+                this controller's copy is past the 30-day warn threshold. Every
+                "passed audit" since then is a statement about advisories at least
+                that old. In production the compile gate REFUSES at
+                `talos_advisory_db_max_age_days`; outside production it keeps
+                warning.
+              action: |
+                Rebuild and redeploy the controller and builder images
+                (`scripts/build-compiler-image.sh`; the image builds fetch a fresh
+                advisory snapshot). `talos_advisory_db_age_days` falls to 0 on the
+                next hourly sample after the new image boots.
+      - eval_time: 135m
+        alertname: TalosAdvisoryDbExpired
+        exp_alerts: []
+
+  # Expired: age at the EXPORTED limit under an enforcing controller fires;
+  # the same age where the gate only warns does not.
+  - interval: 1m
+    name: advisory db — expired fires only where the gate refuses
+    input_series:
+      - series: 'talos_advisory_db_age_days{job="talos-controller",instance="c:8000",copy="controller"}'
+        values: "90+0x60"
+      - series: 'talos_advisory_db_max_age_days{job="talos-controller",instance="c:8000",copy="controller"}'
+        values: "90+0x60"
+      - series: 'talos_advisory_db_age_enforced{job="talos-controller",instance="c:8000",copy="controller"}'
+        values: "0+0x30 1+0x30"
+    alert_rule_test:
+      # Enforced = 0 for the first half-hour: expired but only warning.
+      - eval_time: 25m
+        alertname: TalosAdvisoryDbExpired
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: TalosAdvisoryDbExpired
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              category: supply-chain
+              job: talos-controller
+              instance: "c:8000"
+              copy: controller
+            exp_annotations:
+              summary: "Module compilation is REFUSED: the RustSec advisory database has expired"
+              description: |
+                The baked advisory database is at or past
+                `talos_advisory_db_max_age_days` and this controller runs with
+                RUST_ENV=production, so `check_advisory_db_age` refuses every Rust
+                compile and `cargo audit` (compile_custom_sandbox,
+                install_module_from_catalog, inline rust_code, hot_update_module)
+                with "RustSec advisory database ... is N days old". Nothing else is
+                affected; already-compiled modules keep running.
+              action: |
+                Rebuild and redeploy the controller and builder images. Bridging
+                only: raise TALOS_ADVISORY_DB_MAX_AGE_DAYS on the controller with a
+                compensating advisory control in place — the reading
+                `talos_advisory_db_max_age_days` follows it on the next sample.
+
+  # Expired reads the exported limit, not a copied default: 95 days under a
+  # raised limit of 120 stays quiet where a hard-coded `>= 90` would fire;
+  # 89 under the default limit stays quiet too.
+  - interval: 1m
+    name: advisory db — expired compares against the exported limit
+    input_series:
+      - series: 'talos_advisory_db_age_days{job="talos-controller",instance="c:8000",copy="controller"}'
+        values: "95+0x30 89+0x30"
+      - series: 'talos_advisory_db_max_age_days{job="talos-controller",instance="c:8000",copy="controller"}'
+        values: "120+0x30 90+0x30"
+      - series: 'talos_advisory_db_age_enforced{job="talos-controller",instance="c:8000",copy="controller"}'
+        values: "1+0x60"
+    alert_rule_test:
+      - eval_time: 25m
+        alertname: TalosAdvisoryDbExpired
+        exp_alerts: []
+      - eval_time: 55m
+        alertname: TalosAdvisoryDbExpired
+        exp_alerts: []
+
+  # Unreadable: one unreadable sample fires within the two-sample window;
+  # a controller measuring every hour stays quiet.
+  - interval: 1m
+    name: advisory db — an unreadable sample fires, measured samples do not
+    input_series:
+      - series: 'talos_advisory_db_age_samples_total{job="talos-controller",instance="c:8000",copy="controller",outcome="unreadable"}'
+        values: "0+0x60 1+0x120"
+      - series: 'talos_advisory_db_age_samples_total{job="talos-controller",instance="c:8000",copy="controller",outcome="measured"}'
+        values: "1+0x59 2+0x59 3+0x61"
+    alert_rule_test:
+      - eval_time: 55m
+        alertname: TalosAdvisoryDbUnreadable
+        exp_alerts: []
+      - eval_time: 70m
+        alertname: TalosAdvisoryDbUnreadable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              category: supply-chain
+              job: talos-controller
+              instance: "c:8000"
+              copy: controller
+              outcome: unreadable
+            exp_annotations:
+              summary: "The baked RustSec advisory database cannot be read"
+              description: |
+                The hourly age sampler could not date `/opt/talos-advisory-db` on
+                this controller. `cargo audit --no-fetch` fails against a missing
+                or unreadable database, so every Rust module compile fails its
+                audit step until the image carries one. `talos_advisory_db_age_days`
+                is stale from the first unreadable sample onward.
+              action: |
+                Controller log, target `talos_compilation`, event_kind
+                `advisory_db_metadata_unreadable`: the `error` field is the
+                filesystem's own reason. Rebuild the controller image
+                (`controller/Dockerfile` bakes the database at
+                /opt/talos-advisory-db) and redeploy.
+
+  - interval: 1m
+    name: advisory db — a controller that measures every hour stays quiet
+    input_series:
+      - series: 'talos_advisory_db_age_samples_total{job="talos-controller",instance="c:8000",copy="controller",outcome="unreadable"}'
+        values: "0+0x180"
+      - series: 'talos_advisory_db_age_samples_total{job="talos-controller",instance="c:8000",copy="controller",outcome="measured"}'
+        values: "1+0x59 2+0x59 3+0x61"
+    alert_rule_test:
+      - eval_time: 180m
+        alertname: TalosAdvisoryDbUnreadable
+        exp_alerts: []

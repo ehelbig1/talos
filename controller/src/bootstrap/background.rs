@@ -1077,6 +1077,30 @@ pub(crate) fn spawn_metrics_gauge_tasks(
         });
     }
 
+    // Background task: age of the baked RustSec advisory database (2026-09-22).
+    //
+    // `check_advisory_db_age` refuses every Rust compile and `cargo audit` in
+    // production once `/opt/talos-advisory-db` passes
+    // TALOS_ADVISORY_DB_MAX_AGE_DAYS (default 90), and until this loop existed
+    // the age was computed only when somebody compiled — the reference
+    // controller's copy was 75 days old with nothing counting down to the day
+    // the gate would start refusing. Hourly: the age moves once a day and a
+    // sample is a few hundred `stat` calls (0.04 s measured). First tick is
+    // immediate, so the readings mean what they say from the first scrape.
+    // The sampling, the publishing and the log line are the library's
+    // (`talos_compilation::advisory_db`), driven by its own tests; this loop
+    // only ticks, and `the_advisory_db_sampler_ticks_the_library` pins it.
+    spawn_supervised(BackgroundTask::AdvisoryDbAgeGauge, async move {
+        let mut ticker =
+            tokio::time::interval(talos_compilation::advisory_db::advisory_db_sample_interval());
+        loop {
+            ticker.tick().await;
+            talos_compilation::advisory_db::sample_and_publish_advisory_db_age(
+                talos_metrics::global().map(|m| m.as_ref()),
+            );
+        }
+    });
+
     // Background task: catalog missing-WASM detector. Runs every 5 min and
     // re-measures `talos_catalog_templates_missing_wasm`.
     //
@@ -6279,7 +6303,8 @@ mod task_supervision_wiring_tests {
     /// which supervises its own two halves (41 here).
     /// 2026-09-21: the `talos.results.*` observer moved to
     /// `talos-job-result-observer`, which supervises itself (40 here).
-    const EXPECTED_SUPERVISED: usize = 40;
+    /// 2026-09-22: the advisory-database age sampler (41).
+    const EXPECTED_SUPERVISED: usize = 41;
 
     /// The remaining bare `tokio::spawn` calls in THIS file, deliberately
     /// unwrapped because each is a one-shot whose death is bounded to one
@@ -6299,6 +6324,40 @@ mod task_supervision_wiring_tests {
     ///      and `the_fleet_launcher_is_not_supervised_here` below is what
     ///      stops the wrapper migrating back up.
     const EXPECTED_BARE: usize = 7;
+
+    /// TEXTUAL, and stated as such (the loop is bin-private): the advisory-DB
+    /// age sampler is supervised under ITS task, ticks at the library's
+    /// interval, and hands the global registry to the library's one
+    /// sample-and-publish routine. The sampling, publishing and thresholds
+    /// are driven by `talos_compilation::advisory_db::tests`.
+    #[test]
+    fn the_advisory_db_sampler_ticks_the_library() {
+        let src = include_str!("background.rs");
+        let prod = src
+            .split("mod task_supervision_wiring_tests")
+            .next()
+            .expect("production text");
+        let start = prod
+            .find("spawn_supervised(BackgroundTask::AdvisoryDbAgeGauge")
+            .expect("the advisory-DB sampler is supervised under its own task");
+        let body = &prod[start..];
+        let end = body[1..]
+            .find("spawn_supervised(BackgroundTask::")
+            .map_or(body.len(), |e| e + 1);
+        let squashed: String = body[..end].split_whitespace().collect();
+        assert!(
+            squashed.contains(
+                "tokio::time::interval(talos_compilation::advisory_db::advisory_db_sample_interval())"
+            ),
+            "the ticker must use the library's interval, which the alert window is pinned to"
+        );
+        assert!(
+            squashed.contains(
+                "talos_compilation::advisory_db::sample_and_publish_advisory_db_age(talos_metrics::global().map(|m|m.as_ref()),)"
+            ),
+            "each tick must call the library's one sample-and-publish routine with the global registry"
+        );
+    }
 
     /// TEXTUAL, and stated as such: this loop is bin-private, so no test can
     /// run it. What is pinned is that each SLA monitor asks for the fleet
