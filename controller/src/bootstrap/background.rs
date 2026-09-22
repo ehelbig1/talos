@@ -5718,12 +5718,13 @@ mod worker_liveness_reaper_metric_tests {
     /// a 2h horizon gives two whole intervals of slack at the worst case and
     /// sixty at the 60s default. If this constant is ever lowered below 1h the
     /// gauge starts flapping on a legally-configured fleet.
+    const _: () = assert!(
+        LIVENESS_PARTICIPATION_HORIZON_HOURS >= 2,
+        "the worker's max ping interval is 3600s; a horizon under 2h flaps"
+    );
+
     #[test]
     fn the_horizon_clears_the_slowest_legal_ping_interval() {
-        assert!(
-            LIVENESS_PARTICIPATION_HORIZON_HOURS >= 2,
-            "the worker's max ping interval is 3600s; a horizon under 2h flaps"
-        );
         let now = chrono::Utc::now();
         let h = liveness_participation_horizon_hours(24);
         // A worker on the maximum 1h interval that just missed ONE ping is

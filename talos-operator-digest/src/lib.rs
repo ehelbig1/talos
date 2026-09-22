@@ -2479,7 +2479,7 @@ mod measurement_pr3_tests {
         assert!(clean.ci95.unwrap()[1] > 0.0);
         let broken = failure_rate_measurement(50, 0).expect("50/50 is measurable");
         assert_eq!(broken.value, 1.0);
-        assert_eq!(broken.ci95.unwrap()[0] < 1.0, true);
+        assert!(broken.ci95.unwrap()[0] < 1.0);
     }
 
     /// The envelope is ADDITIVE: every pre-D5 key keeps its value and type.

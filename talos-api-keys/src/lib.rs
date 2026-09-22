@@ -1001,19 +1001,16 @@ mod tests {
     /// floor — they MUST NOT silently drop below 10 / 12 respectively
     /// in a future refactor. OWASP password-storage cheat sheet (2024)
     /// puts the minimum at 10.
-    #[test]
-    fn bcrypt_cost_floor_meets_owasp_minimum() {
-        assert!(
-            ApiKeyService::MIN_BCRYPT_COST >= 10,
-            "MIN_BCRYPT_COST must be ≥ 10 per OWASP 2024 guidance"
-        );
-        assert!(
-            DEFAULT_COST >= ApiKeyService::MIN_BCRYPT_COST,
-            "bcrypt::DEFAULT_COST ({}) must be ≥ our floor ({})",
-            DEFAULT_COST,
-            ApiKeyService::MIN_BCRYPT_COST
-        );
-    }
+    /// Both are compile-time pins: a floor that regresses fails the build
+    /// of the test target, not a test run.
+    const _: () = assert!(
+        ApiKeyService::MIN_BCRYPT_COST >= 10,
+        "MIN_BCRYPT_COST must be ≥ 10 per OWASP 2024 guidance"
+    );
+    const _: () = assert!(
+        DEFAULT_COST >= ApiKeyService::MIN_BCRYPT_COST,
+        "bcrypt::DEFAULT_COST must be ≥ our MIN_BCRYPT_COST floor"
+    );
 
     /// MCP-494: the env var is the operator-controlled knob and the
     /// floor is the safety net. This test simulates a fresh-process

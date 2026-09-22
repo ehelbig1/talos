@@ -119,9 +119,8 @@ async fn an_expired_wait_proceeds_ungated_and_never_refuses() {
         .expect("the only permit");
 
     let (slot, waited) = acquire_from(Some(&permits), Duration::from_millis(50)).await;
-    assert_eq!(
+    assert!(
         matches!(slot, LocalLlmSlot::Ungated(Ungated::WaitExpired)),
-        true,
         "a blocked acquire must degrade to ungated, not error"
     );
     assert!(

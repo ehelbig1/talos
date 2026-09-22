@@ -570,16 +570,13 @@ mod read_disclosure_tests {
     use super::*;
     use axum::http::HeaderValue;
     use sqlx::postgres::PgPoolOptions;
-    use std::sync::{Mutex, MutexGuard, OnceLock};
 
     /// `ADMIN_SECRET_KEY` / `ENABLE_ADMIN_OPS` are process-global, so
     /// the env-touching tests in this module serialize against each
     /// other.
-    fn env_guard() -> MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
+    async fn env_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        LOCK.lock().await
     }
 
     /// A `GoogleCalendarService` over a pool pointed at a closed port:
@@ -629,7 +626,7 @@ mod read_disclosure_tests {
     /// refusal has to be for the reason that is true.
     #[tokio::test]
     async fn stop_orphan_says_it_could_not_read_the_audit_log_not_that_the_channel_is_unknown() {
-        let _g = env_guard();
+        let _g = env_guard().await;
         std::env::set_var("ENABLE_ADMIN_OPS", "1");
         std::env::set_var("ADMIN_SECRET_KEY", "read-disclosure-test-secret");
 
@@ -674,7 +671,7 @@ mod read_disclosure_tests {
     /// unconditionally.
     #[tokio::test]
     async fn stop_orphan_still_refuses_a_bad_admin_secret_before_reading_anything() {
-        let _g = env_guard();
+        let _g = env_guard().await;
         std::env::set_var("ENABLE_ADMIN_OPS", "1");
         std::env::set_var("ADMIN_SECRET_KEY", "read-disclosure-test-secret");
 

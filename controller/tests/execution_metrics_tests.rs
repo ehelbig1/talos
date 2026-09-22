@@ -18,7 +18,7 @@ mod common;
 use common::{create_test_user, create_test_workflow, setup_test_context};
 use serde_json::json;
 use sqlx::{Pool, Postgres};
-use talos_execution_repository::ExecutionRepository;
+use talos_execution_repository::{BudgetAdmission, ExecutionRepository};
 use talos_metrics::ModuleExecutionOutcome;
 use talos_module_executions::TriggerType;
 use talos_workflow_repository::{ExecutionPriority, WorkflowRepository};
@@ -91,10 +91,16 @@ async fn every_finalizer_counts_and_measures_the_row_it_finalized() {
     let wf_repo = WorkflowRepository::new(pool.clone());
     let new_running = |pool: Pool<Postgres>| async move {
         let id = Uuid::new_v4();
-        ExecutionRepository::new(pool.clone())
+        let adm = ExecutionRepository::new(pool.clone())
             .insert_test_execution_row(id, wf, user, Some(actor), ExecutionPriority::Normal)
             .await
             .expect("insert running execution");
+        // A refused admission writes NO row, so every finalizer below would
+        // then be measured against a row that does not exist.
+        assert!(
+            matches!(adm, BudgetAdmission::Admitted),
+            "the fixture actor has no budget policy, so the test row must be admitted: {adm:?}"
+        );
         backdate_workflow_execution(&pool, id, 5).await;
         id
     };

@@ -482,23 +482,6 @@ mod tests {
         FetchProvenance::new(n_fetched, fetch_cap, n_available, None, None)
     }
 
-    /// A fetch that also declares the window it ran over, in days.
-    fn prov_days(
-        n_fetched: i64,
-        fetch_cap: i64,
-        n_available: Option<i64>,
-        configured_days: i64,
-        oldest_age_days: Option<f64>,
-    ) -> FetchProvenance {
-        FetchProvenance::new(
-            n_fetched,
-            fetch_cap,
-            n_available,
-            Some(configured_days),
-            oldest_age_days,
-        )
-    }
-
     fn ex(
         relevance: f64,
         recency: f64,

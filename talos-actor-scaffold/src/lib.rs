@@ -904,8 +904,10 @@ mod tests {
 
     #[test]
     fn validate_budget_rejects_zero() {
-        let mut b = BudgetSpec::default();
-        b.max_fuel_per_execution = Some(0);
+        let b = BudgetSpec {
+            max_fuel_per_execution: Some(0),
+            ..Default::default()
+        };
         assert!(matches!(
             validate_budget(&b),
             Err(ScaffoldError::InvalidBudgetField(_))
@@ -914,8 +916,10 @@ mod tests {
 
     #[test]
     fn validate_budget_rejects_negative() {
-        let mut b = BudgetSpec::default();
-        b.max_executions_per_hour = Some(-1);
+        let b = BudgetSpec {
+            max_executions_per_hour: Some(-1),
+            ..Default::default()
+        };
         assert!(matches!(
             validate_budget(&b),
             Err(ScaffoldError::InvalidBudgetField(_))
@@ -924,8 +928,10 @@ mod tests {
 
     #[test]
     fn validate_budget_rejects_unknown_on_exceeded() {
-        let mut b = BudgetSpec::default();
-        b.on_budget_exceeded = Some("explode".to_string());
+        let b = BudgetSpec {
+            on_budget_exceeded: Some("explode".to_string()),
+            ..Default::default()
+        };
         assert!(matches!(
             validate_budget(&b),
             Err(ScaffoldError::InvalidBudgetField(_))

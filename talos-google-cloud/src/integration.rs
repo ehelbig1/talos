@@ -859,9 +859,7 @@ mod tests {
         // calls with this token no matter what a module tries.
         let scopes = GcpTier::Write.scopes();
         assert!(
-            !scopes
-                .iter()
-                .any(|s| *s == "https://www.googleapis.com/auth/cloud-platform"),
+            !scopes.contains(&"https://www.googleapis.com/auth/cloud-platform"),
             "write tier must not request cloud-platform"
         );
         assert!(scopes.contains(&"https://www.googleapis.com/auth/pubsub"));

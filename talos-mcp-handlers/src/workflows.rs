@@ -13529,7 +13529,7 @@ mod input_schema_enforcement_tests {
         // Refusals do not depend on the payloads at all.
         let resp = enforce_declared_input_schema_batch(
             classify_input_schema_read(Err("boom".to_string()) as Read),
-            &[good.clone()],
+            std::slice::from_ref(&good),
             Some(json!(1)),
             "unit_test",
         )
@@ -13538,7 +13538,7 @@ mod input_schema_enforcement_tests {
         assert_eq!(message_of(&resp), "Database error");
         let resp = enforce_declared_input_schema_batch(
             classify_input_schema_read(Ok(None) as Read),
-            &[good.clone()],
+            std::slice::from_ref(&good),
             Some(json!(1)),
             "unit_test",
         )

@@ -6,7 +6,7 @@
 # scripts/lint-structural.sh --count` for the live number — this comment
 # deliberately doesn't state one; a hardcoded count drifted 40→49 undetected
 # by 2026-07-01) including rustfmt (check 35) and
-# `cargo clippy --workspace --no-deps -- -D warnings` (check 7,
+# `cargo clippy --workspace --all-targets --no-deps -- -D warnings` (check 7,
 # TALOS_LINT_CLIPPY=1), and offline cargo-deny (bans/licenses/sources).
 # `make lint-frontend` covers: frontend eslint + prettier + vitest.
 # Both are the single source of truth for "the gate" — this hook deliberately

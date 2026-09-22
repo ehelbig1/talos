@@ -49,6 +49,7 @@
 /// This is the value that makes "normalise to the fixed point" (the #595
 /// first attempt) provably insufficient and forces raw-bytes signing. Any
 /// signed-wire suite should carry at least one payload containing it.
+#[allow(clippy::unreadable_literal)] // the exact digits ARE the counterexample; the doc block above quotes them verbatim
 pub const POISON_2CYCLE: f64 = 5.455171886890906e-115;
 
 /// The exact bit pattern the #597 search surfaced as round-trip unstable;
@@ -82,13 +83,15 @@ pub fn arbitrary_json(seed: &mut u64, depth: u32) -> serde_json::Value {
                 .map_or(serde_json::Value::Null, serde_json::Value::Number)
         }
         // Integers at the boundaries where JSON number typing is subtle.
-        3 => serde_json::json!(next() as i64),
+        3 => serde_json::json!(next().cast_signed()),
         4 => serde_json::json!(next()),
         // Computed ratios — the digest's actual content, and what agent/LLM
         // nodes persist; ~10% of them are round-trip unstable.
         5 => {
             let (a, b) = (next() % 1000 + 1, next() % 1000 + 1);
-            serde_json::json!(a as f64 / b as f64)
+            // Both operands are in 1..=1000, so the conversion is exact.
+            let exact = |n: u64| f64::from(u32::try_from(n).expect("bounded to 1..=1000"));
+            serde_json::json!(exact(a) / exact(b))
         }
         6 => {
             let n = (next() % 4) as usize;
@@ -121,7 +124,10 @@ pub fn round_trip_unstable_count(seed: &mut u64, iters: usize, depth: u32) -> us
         let v = arbitrary_json(seed, depth);
         let once = v.to_string();
         if let Ok(p) = serde_json::from_str::<serde_json::Value>(&once) {
-            if p.to_string() != once {
+            // Compare the re-serialised TEXT, not the parsed `Value` (which
+            // would compare equal one ULP apart and hide the instability).
+            let again = p.to_string();
+            if again != once {
                 unstable += 1;
             }
         }

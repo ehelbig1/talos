@@ -3880,7 +3880,7 @@ mod loop_iteration_execution_row_tests {
 
     /// An engine with no store still dispatches under a stable minted id
     /// (test/embedded configurations must not regress into a panic or an
-    /// unset job_id).
+    /// unset `job_id`).
     #[tokio::test]
     async fn storeless_engine_still_stamps_a_job_id() {
         let mut engine = ParallelWorkflowEngine::new();

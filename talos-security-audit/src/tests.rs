@@ -1130,7 +1130,7 @@ fn unweighted_checks_cost_nothing() {
     let mut arms = Vec::new();
     for f in &fleets {
         for probe in [gate_probe(true), gate_probe(false), broken] {
-            arms.push(check_write_ceiling_enforcement(f.clone(), probe));
+            arms.push(check_write_ceiling_enforcement(*f, probe));
         }
     }
     for c in &arms {
@@ -2170,7 +2170,7 @@ fn a_failing_chain_check_reaches_the_operator_despite_the_zero_weight() {
         },
         None,
     );
-    let rec = recommendation_for(&[broken.clone()]);
+    let rec = recommendation_for(std::slice::from_ref(&broken));
     assert!(
         rec.contains("audit_chain_verification"),
         "a zero-weighted FAIL must still be named to the operator: {rec}"

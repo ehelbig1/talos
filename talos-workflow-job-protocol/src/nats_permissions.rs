@@ -411,10 +411,7 @@ mod tests {
     fn rendered_conf_files_match_the_code() {
         let rendered = render_worker_permissions_conf();
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
-        let write = std::env::var("TALOS_NATS_PERMISSIONS_WRITE")
-            .ok()
-            .filter(|v| !v.is_empty())
-            .is_some();
+        let write = std::env::var("TALOS_NATS_PERMISSIONS_WRITE").is_ok_and(|v| !v.is_empty());
         for rel in [
             "deploy/nats/worker-permissions.conf",
             "deploy/helm/talos/files/nats-worker-permissions.conf",

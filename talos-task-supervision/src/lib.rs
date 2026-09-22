@@ -810,8 +810,9 @@ mod hook_tests {
 
     /// Serializes every test that installs the hook or panics on a
     /// worker thread. `#[should_panic]` siblings elsewhere in this crate
-    /// would otherwise move the same counter.
-    static HOOK_LOCK: Mutex<()> = Mutex::new(());
+    /// would otherwise move the same counter. Async-aware because every
+    /// holder awaits while holding it (a tokio mutex does not poison).
+    static HOOK_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
     #[derive(Clone, Default)]
     struct Captured(Arc<Mutex<Vec<String>>>);
@@ -857,7 +858,7 @@ mod hook_tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_panicking_supervised_task_is_counted_and_logged() {
-        let _guard = HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = HOOK_LOCK.lock().await;
         let cap = capture();
         install_panic_hook("controller");
         let before_panics = panic_count_for_tests();
@@ -909,7 +910,7 @@ mod hook_tests {
     /// trace of any kind.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_clean_exit_is_counted_too() {
-        let _guard = HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = HOOK_LOCK.lock().await;
         let before_panics = panic_count_for_tests();
         let before = exit_count_for_tests(BackgroundTask::RegistrySync, "completed");
         spawn_supervised(BackgroundTask::RegistrySync, async { TaskExit::LoopEnded })
@@ -943,7 +944,7 @@ mod hook_tests {
     /// log line is an INFO carrying the reason.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_by_config_return_is_declined_not_completed() {
-        let _guard = HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = HOOK_LOCK.lock().await;
         let cap = capture();
         let before_completed = exit_count_for_tests(BackgroundTask::RegistrySync, "completed");
         let before_declined = exit_count_for_tests(BackgroundTask::RegistrySync, "declined");
@@ -992,7 +993,7 @@ mod hook_tests {
     /// Calling that "declined" would assert they never ran.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_shutdown_return_is_neither_completed_nor_declined() {
-        let _guard = HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = HOOK_LOCK.lock().await;
         let cap = capture();
         let before_completed = exit_count_for_tests(BackgroundTask::Scheduler, "completed");
         let before_declined = exit_count_for_tests(BackgroundTask::Scheduler, "declined");
@@ -1033,7 +1034,7 @@ mod hook_tests {
     /// stays a finding.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_loop_that_fell_out_still_errors() {
-        let _guard = HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = HOOK_LOCK.lock().await;
         let cap = capture();
         let before = exit_count_for_tests(BackgroundTask::JobResultSubscriber, "completed");
         if let Ok(mut g) = cap.0.lock() {

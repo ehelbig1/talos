@@ -66,7 +66,7 @@ async fn seed_workflow(
     .bind(EMPTY_GRAPH)
     .bind(status)
     .bind(
-        &capabilities
+        capabilities
             .iter()
             .map(|c| (*c).to_string())
             .collect::<Vec<_>>(),

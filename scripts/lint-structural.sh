@@ -631,7 +631,7 @@ fi
 echo
 
 # ── 7. CI's clippy invocation must pass cleanly ─────────────────────
-bold "▶ check 7: cargo clippy --workspace --no-deps -- -D warnings"
+bold "▶ check 7: cargo clippy --workspace --all-targets --no-deps -- -D warnings"
 
 # 2026-05-04: a clippy::large_enum_variant CI break landed in 58a3c1e
 # and went undetected for two days because the local dev loop used
@@ -639,10 +639,17 @@ bold "▶ check 7: cargo clippy --workspace --no-deps -- -D warnings"
 # matches it bit-for-bit so PRs see the failure at make-lint time
 # rather than after push.
 #
-# Why `--no-deps` and not `--all-targets`: matches CI's existing
-# scope (lib + bin only). Test/example clippy drift is tracked
-# separately and would expand this gate. See `.github/workflows/ci.yml`
-# step "cargo clippy --workspace --no-deps".
+# `--all-targets` since 2026-09-22 (package DO). The comment here used to
+# say "matches CI's existing scope (lib + bin only). Test/example clippy
+# drift is tracked separately and would expand this gate" — it was tracked
+# by nobody: measured on 1751b76b, the test targets carried 107 warnings
+# (await_holding_lock 23, assertions_on_constants 16, field_reassign 8,
+# large_futures 7, float_cmp 5, …) plus a test ignoring a `#[must_use]`
+# budget-admission verdict and a dead helper, and packages AO, AP and DL
+# had each found test-target defects BY HAND because `cargo check
+# --all-targets` was a pre-push habit and not a gate. Scope now matches
+# `quality.yml`'s clippy job bit-for-bit, all targets included. `--no-deps`
+# stays: dependencies' lints are not ours to fix.
 #
 # This check is gated behind TALOS_LINT_CLIPPY=1 by default because
 # clippy is a 60-90s build for a fresh tree. CI sets the env. Local
@@ -655,11 +662,11 @@ bold "▶ check 7: cargo clippy --workspace --no-deps -- -D warnings"
 # it) preserves the one-line-per-check output shape on the passing path.
 if [ "${TALOS_LINT_CLIPPY:-0}" = "1" ]; then
     CLIPPY_LOG="$(mktemp "${TMPDIR:-/tmp}/talos-clippy.XXXXXX")"
-    if cargo clippy --workspace --no-deps -- -D warnings >"$CLIPPY_LOG" 2>&1; then
-        green "✓ clippy --workspace --no-deps clean (-D warnings)"
+    if cargo clippy --workspace --all-targets --no-deps -- -D warnings >"$CLIPPY_LOG" 2>&1; then
+        green "✓ clippy --workspace --all-targets --no-deps clean (-D warnings)"
         rm -f "$CLIPPY_LOG"
     else
-        red "✗ clippy --workspace --no-deps failed (-D warnings)"
+        red "✗ clippy --workspace --all-targets --no-deps failed (-D warnings)"
         # Only the diagnostics, not the "Compiling …" progress noise.
         grep -E '^(error|warning)' -A 12 "$CLIPPY_LOG" | head -200 || cat "$CLIPPY_LOG"
         yellow "  → full log: $CLIPPY_LOG"

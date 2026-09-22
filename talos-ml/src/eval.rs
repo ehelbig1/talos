@@ -1001,7 +1001,7 @@ mod tests {
             .iter()
             .filter(|id| (10..13).contains(&id.as_u128()))
             .count();
-        assert!(trio_in_holdout >= 1 && trio_in_holdout < 3);
+        assert!((1..3).contains(&trio_in_holdout));
     }
 
     #[test]

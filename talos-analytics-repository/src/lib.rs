@@ -7400,7 +7400,10 @@ mod capability_query_pins {
         let src = include_str!("lib.rs");
         let needle = format!(
             "{} {}",
-            concat!("ORDER BY COALESCE(readiness_score, 0) ASC \\\n             LIMIT"),
+            concat!(
+                "ORDER BY COALESCE(readiness_score, 0) ASC \\\n",
+                "             LIMIT"
+            ),
             READINESS_PAGE_LIMIT
         );
         assert!(

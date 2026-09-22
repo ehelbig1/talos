@@ -396,6 +396,13 @@ fn strip_waiting_placeholder_seeds(
     seed
 }
 
+// `record_outcome` and `fail` deliberately sit AFTER this test module:
+// scripts/lint-structural.sh check 58 pins `fn record_outcome` as the
+// over-strip landmark — production code that a truncate-to-EOF strip of
+// `#[cfg(test)] mod` regions would swallow. Moving them above the module
+// would leave that tripwire vacuous, which is the exact regression it was
+// written to catch (see the check's own header comment).
+#[allow(clippy::items_after_test_module)] // reason: the ordering is load-bearing for lint check 58's over-strip tripwire
 #[cfg(test)]
 mod strip_waiting_placeholder_tests {
     use super::strip_waiting_placeholder_seeds;

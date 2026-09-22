@@ -6376,15 +6376,13 @@ mod worker_heartbeat_domain_separation_tests {
     /// constant. What this test contributes is the other half: that shrinking
     /// this constant below a minute — which would silently tighten that
     /// derived ceiling and could push it under the default publish interval —
-    /// is a deliberate act rather than a passing edit.
-    #[test]
-    fn the_freshness_window_has_a_floor_the_worker_can_derive_its_clamp_from() {
-        assert!(
-            WORKER_HEARTBEAT_MAX_AGE_SECS >= 60,
-            "worker::heartbeat clamps its publish interval to 3/4 of this \
-             value; below 60s that ceiling drops under the 30s default"
-        );
-    }
+    /// is a deliberate act rather than a passing edit. Pinned at COMPILE
+    /// time (a `const` assertion), so the edit fails the build, not a test.
+    const _: () = assert!(
+        WORKER_HEARTBEAT_MAX_AGE_SECS >= 60,
+        "worker::heartbeat clamps its publish interval to 3/4 of this \
+         value; below 60s that ceiling drops under the 30s default"
+    );
 }
 
 // ============================================================================
@@ -7696,6 +7694,11 @@ mod tests {
     /// harder to read, not easier.
     #[test]
     fn raw_signed_exposes_both_accessor_spellings_and_raw_len() {
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct Op {
+            key: String,
+            n: u32,
+        }
         let payload: SignedJson = serde_json::json!({"a": 1}).into();
 
         // Generic spelling.
@@ -7714,11 +7717,6 @@ mod tests {
 
         // The generic instantiates over a typed payload too, and `From`
         // mints the same compact text `Value::to_string` would.
-        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
-        struct Op {
-            key: String,
-            n: u32,
-        }
         let typed: RawSigned<Op> = Op {
             key: "k".to_string(),
             n: 1,
@@ -8040,14 +8038,14 @@ mod tests {
 
     #[test]
     fn result_ed25519_sign_verify_roundtrip() {
-        let worker_sk = ed_keypair();
-        let worker_pk = worker_sk.verifying_key();
+        let worker_signing = ed_keypair();
+        let worker_verifying = worker_signing.verifying_key();
         let mut r = make_test_result();
-        r.sign_ed25519_with_worker_id(&worker_sk, "talos-worker-7")
+        r.sign_ed25519_with_worker_id(&worker_signing, "talos-worker-7")
             .unwrap();
         assert_eq!(r.crypto_scheme, CRYPTO_SCHEME_ED25519);
         assert_eq!(r.worker_id, "talos-worker-7");
-        r.verify_no_replay_ed25519(&[worker_pk], 300)
+        r.verify_no_replay_ed25519(&[worker_verifying], 300)
             .expect("controller verifies against the worker's public key");
     }
 
@@ -8235,7 +8233,7 @@ mod tests {
         // worker-a carries BOTH keys (rotation overlap); worker-b carries one.
         assert_eq!(reg.get("worker-a").map(Vec::len), Some(2));
         assert_eq!(reg.get("worker-b").map(Vec::len), Some(1));
-        assert!(reg.get("worker-c").is_none());
+        assert!(!reg.contains_key("worker-c"));
 
         // A result signed under either of worker-a's keys verifies against the
         // registered set (first match wins).
@@ -9978,15 +9976,13 @@ mod cancel_command_tests {
     }
 
     /// The window is deliberately shorter than a job dispatch's 300 s: a
-    /// stale dispatch wastes work, a stale cancel destroys it.
-    #[test]
-    fn the_cancel_window_is_tighter_than_a_job_dispatch() {
-        assert!(EXECUTION_CANCEL_MAX_AGE_SECS < 300);
-        assert!(
-            EXECUTION_CANCEL_MAX_AGE_SECS > MAX_FUTURE_SKEW_SECS,
-            "the past window must exceed the future-skew tolerance"
-        );
-    }
+    /// stale dispatch wastes work, a stale cancel destroys it. Pinned at
+    /// COMPILE time (`const` assertions), so widening it fails the build.
+    const _: () = assert!(EXECUTION_CANCEL_MAX_AGE_SECS < 300);
+    const _: () = assert!(
+        EXECUTION_CANCEL_MAX_AGE_SECS > MAX_FUTURE_SKEW_SECS,
+        "the past window must exceed the future-skew tolerance"
+    );
 
     /// Ed25519 is the scheme a fleet running `TALOS_DISPATCH_REQUIRE_ED25519`
     /// accepts, and the only one it accepts. Both directions.

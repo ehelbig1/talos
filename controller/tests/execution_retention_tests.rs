@@ -98,8 +98,8 @@ use uuid::Uuid;
 static SCHEMA_LOCK: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
 enum SchemaGuard {
-    Shared(tokio::sync::RwLockReadGuard<'static, ()>),
-    Exclusive(tokio::sync::RwLockWriteGuard<'static, ()>),
+    Shared(#[allow(dead_code)] tokio::sync::RwLockReadGuard<'static, ()>), // held for Drop
+    Exclusive(#[allow(dead_code)] tokio::sync::RwLockWriteGuard<'static, ()>), // held for Drop
     /// A second fixture in the SAME test, covered by a sibling's guard. A test
     /// must never take `SCHEMA_LOCK` twice: tokio's RwLock is write-preferring,
     /// so read #1 held + a queued writer + read #2 requested is a deadlock

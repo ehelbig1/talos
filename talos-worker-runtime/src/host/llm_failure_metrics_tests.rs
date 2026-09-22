@@ -174,10 +174,11 @@ async fn serve_one(mut stream: tokio::net::TcpStream) {
 
     // Write failures are ignored throughout: several cases make the client
     // hang up mid-response on purpose.
-    let _ = match model.as_str() {
+    match model.as_str() {
         // Connection closed with no bytes written at all → reqwest `send()`
-        // fails → `LlmFailure::Network`.
-        "mock-abort" => return,
+        // fails → `LlmFailure::Network`. Nothing follows this match, so an
+        // empty arm drops the stream exactly as a `return` did.
+        "mock-abort" => {}
         // Accepted, request fully read, nothing ever written → the exchange
         // timeout wrapper is the only thing that can end this.
         "mock-stall" => {
@@ -216,7 +217,7 @@ async fn serve_one(mut stream: tokio::net::TcpStream) {
             )
             .await
         }
-    };
+    }
 }
 
 async fn write_simple(stream: &mut tokio::net::TcpStream, code: u16, reason: &str, body: &str) {

@@ -645,7 +645,10 @@ fn inline_judge_on_failure_error_propagates_not_applicable() {
         not_applicable,
         "an abstaining verdict must never be recorded as a scored datapoint"
     );
-    assert_eq!(score, 0.2);
+    assert!(
+        (score - 0.2).abs() < 1e-9,
+        "abstaining verdict keeps its authored score, got {score}"
+    );
     assert!(!passed);
 }
 
@@ -1368,7 +1371,11 @@ fn judge_verdict_not_applicable_absent_is_false_and_not_malformed() {
     assert!(!v.not_applicable);
     assert_eq!(v.malformed_field_count, 0);
     // The four required fields are untouched by the new parse.
-    assert_eq!(v.score, 0.8);
+    assert!(
+        (v.score - 0.8).abs() < 1e-9,
+        "score untouched, got {}",
+        v.score
+    );
     assert!(v.passed);
     assert_eq!(v.reasoning, "r");
     assert_eq!(v.feedback, "f");
@@ -1476,7 +1483,10 @@ fn ensemble_abstaining_candidate_never_wins() {
         Some("b"),
         "an abstaining judge's 1.0 must not beat a real 0.3"
     );
-    assert_eq!(best_score, 0.3);
+    assert!(
+        (best_score - 0.3).abs() < 1e-9,
+        "best score is the real 0.3, got {best_score}"
+    );
 }
 
 /// All-N/A behaves exactly like all-failed: no winner, sentinel score, so
@@ -1499,7 +1509,10 @@ fn ensemble_all_abstaining_behaves_like_all_failed() {
     );
     let (best, score) = pick_best_candidate(&candidates, &all_na);
     assert!(best.is_none());
-    assert_eq!(score, f64::NEG_INFINITY);
+    assert!(
+        score.is_infinite() && score.is_sign_negative(),
+        "no scored candidate yields NEG_INFINITY, got {score}"
+    );
 }
 
 /// Selection is otherwise unchanged: first candidate wins a tie (strict `>`).
@@ -1853,7 +1866,7 @@ fn extract_judge_score_ignores_reasoning_text() {
         "__judge_feedback__": "email said SECRET stuff",
     });
     let (score, passed, not_applicable) = extract_judge_score(&out).expect("has score");
-    assert_eq!(score, 0.5);
+    assert!((score - 0.5).abs() < 1e-9, "score is 0.5, got {score}");
     assert!(!passed);
     assert!(!not_applicable);
 }

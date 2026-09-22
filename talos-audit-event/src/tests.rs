@@ -287,7 +287,7 @@ fn verify_chain_treats_a_resigned_copy_as_conflicting() {
     let mut dup = events[1].clone();
     dup.hmac_signature = Some("00".repeat(32));
     events.push(dup);
-    let report = verify_chain("wf", "ex", &events, &[key.clone()]);
+    let report = verify_chain("wf", "ex", &events, std::slice::from_ref(&key));
     assert!(
         report
             .breaks

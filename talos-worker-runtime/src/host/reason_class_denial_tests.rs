@@ -334,7 +334,7 @@ fn no_http_policy_class_can_make_a_message_transient() {
             let before = crate::runtime::is_transient_error_text(&bare);
             let after = crate::runtime::is_transient_error_text(&marked);
             assert!(
-                !(after && !before),
+                !after || before,
                 "[reason_class={class}] moved a {wit} message from NON-TRANSIENT \
                  to TRANSIENT"
             );

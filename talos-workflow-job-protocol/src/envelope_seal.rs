@@ -612,6 +612,7 @@ mod tests {
 
     #[test]
     fn secret_claim_stale_fails() {
+        use ed25519_dalek::Signer;
         let (sk, vk) = kp();
         let mut claim = SecretClaim::new_signed(Uuid::new_v4(), "w".into(), [7u8; 32], &sk);
         claim.issued_at_ms = 1; // ancient
@@ -624,7 +625,6 @@ mod tests {
             claim.issued_at_ms,
             claim.crypto_scheme,
         );
-        use ed25519_dalek::Signer;
         claim.signature = sk.sign(&bytes).to_bytes().to_vec();
         assert!(
             claim.verify(&vk, 60).is_err(),

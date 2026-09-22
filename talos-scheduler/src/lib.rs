@@ -2925,28 +2925,29 @@ mod startup_herd_tests {
     /// exactly 15 schedules came due, so every one of them ran at once and
     /// the mitigation was a no-op on the only sample we have. A default that
     /// does not bind is the same defect one level up.
-    #[test]
-    fn startup_ceiling_binds_on_the_observed_herd() {
-        const OBSERVED_HERD: usize = 15;
-        assert!(
-            super::DEFAULT_SCHEDULER_STARTUP_MAX_CONCURRENT < OBSERVED_HERD,
-            "the startup ceiling must be below the observed boot herd ({OBSERVED_HERD}); \
-             at or above it the fix cannot have changed anything"
-        );
-        assert!(
-            super::DEFAULT_SCHEDULER_MAX_CONCURRENT_EXECUTIONS >= OBSERVED_HERD,
-            "documents WHY the pre-existing ceiling did not bind — if this ever \
-             drops below the herd size, the comment above the startup semaphore \
-             is stale and needs rewriting"
-        );
-        // The second sample, 2026-09-10: a host suspend/resume herd of TEN,
-        // classified `steady` at the time. The startup ceiling binds on it
-        // and the steady one does not — which is why the phase now has to be
-        // recognised from the batch's lateness and not from process age.
-        const OBSERVED_CATCHUP_HERD: usize = 10;
-        assert!(super::DEFAULT_SCHEDULER_STARTUP_MAX_CONCURRENT < OBSERVED_CATCHUP_HERD);
+    ///
+    /// Compile-time pins: every operand is a `const`, so a ceiling that stops
+    /// binding fails the BUILD rather than a test run.
+    const OBSERVED_HERD: usize = 15;
+    const _: () = assert!(
+        super::DEFAULT_SCHEDULER_STARTUP_MAX_CONCURRENT < OBSERVED_HERD,
+        "the startup ceiling must be below the observed boot herd (15); \
+         at or above it the fix cannot have changed anything"
+    );
+    const _: () = assert!(
+        super::DEFAULT_SCHEDULER_MAX_CONCURRENT_EXECUTIONS >= OBSERVED_HERD,
+        "documents WHY the pre-existing ceiling did not bind — if this ever \
+         drops below the herd size, the comment above the startup semaphore \
+         is stale and needs rewriting"
+    );
+    // The second sample, 2026-09-10: a host suspend/resume herd of TEN,
+    // classified `steady` at the time. The startup ceiling binds on it
+    // and the steady one does not — which is why the phase now has to be
+    // recognised from the batch's lateness and not from process age.
+    const OBSERVED_CATCHUP_HERD: usize = 10;
+    const _: () = assert!(super::DEFAULT_SCHEDULER_STARTUP_MAX_CONCURRENT < OBSERVED_CATCHUP_HERD);
+    const _: () =
         assert!(super::DEFAULT_SCHEDULER_MAX_CONCURRENT_EXECUTIONS >= OBSERVED_CATCHUP_HERD);
-    }
 
     /// The boot flag wins whatever the lateness: a controller restarted 3 s
     /// after a `*/15` cron came due has a one-row, 3 s-late boot backlog, and
@@ -3174,13 +3175,15 @@ mod startup_herd_tests {
              it has been silently dropped",
             super::DEFAULT_SCHEDULER_READINESS_MAX_HOLDS
         );
-        // And it must be finite. A `usize::MAX` "bound" is not a bound.
-        assert!(
-            super::DEFAULT_SCHEDULER_READINESS_MAX_HOLDS < 1_000,
-            "the give-up bound must be a real bound: at the 15s poll interval \
-             this is the number of polls scheduled work can be withheld for"
-        );
     }
+
+    // And it must be finite. A `usize::MAX` "bound" is not a bound. Pinned at
+    // compile time: both operands are constants.
+    const _: () = assert!(
+        super::DEFAULT_SCHEDULER_READINESS_MAX_HOLDS < 1_000,
+        "the give-up bound must be a real bound: at the 15s poll interval \
+         this is the number of polls scheduled work can be withheld for"
+    );
 
     /// The readiness bound must clear two heartbeat intervals **at the worst
     /// interval an operator can configure**, not at the default.

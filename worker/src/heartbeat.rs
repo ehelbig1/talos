@@ -245,13 +245,11 @@ mod tests {
     /// The clamp ceiling must stay strictly below the controller's staleness
     /// window, or a worker configured at the maximum would flap in and out of
     /// the fleet view while perfectly healthy. Pinned because the two numbers
-    /// live in different crates.
-    #[test]
-    fn the_slowest_configurable_interval_still_keeps_a_worker_visible() {
-        assert!(MAX_HEARTBEAT_INTERVAL_SECS < WORKER_HEARTBEAT_MAX_AGE_SECS);
-        assert!(MIN_HEARTBEAT_INTERVAL_SECS < DEFAULT_HEARTBEAT_INTERVAL_SECS);
-        assert!(DEFAULT_HEARTBEAT_INTERVAL_SECS <= MAX_HEARTBEAT_INTERVAL_SECS);
-    }
+    /// live in different crates — at compile time, since every operand is a
+    /// `const`.
+    const _: () = assert!(MAX_HEARTBEAT_INTERVAL_SECS < WORKER_HEARTBEAT_MAX_AGE_SECS);
+    const _: () = assert!(MIN_HEARTBEAT_INTERVAL_SECS < DEFAULT_HEARTBEAT_INTERVAL_SECS);
+    const _: () = assert!(DEFAULT_HEARTBEAT_INTERVAL_SECS <= MAX_HEARTBEAT_INTERVAL_SECS);
 
     #[test]
     fn a_built_heartbeat_verifies_and_carries_the_build() {

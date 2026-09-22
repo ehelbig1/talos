@@ -894,5 +894,13 @@ jobs:
         with:
           shared-key: clippy
 
-      - name: cargo clippy --workspace --no-deps -- -D warnings
-        run: cargo clippy --workspace --no-deps -- -D warnings
+      # `--all-targets` since 2026-09-22 (package DO). Until then this job
+      # linted lib + bin targets only, and the test targets accumulated 107
+      # warnings nothing in CI could see — including a test that ignored a
+      # `#[must_use]` budget-admission verdict and a dead helper — found by
+      # hand three times (packages AO, AP, DL) because `cargo check
+      # --all-targets` was the pre-push discipline and no gate. The cost is
+      # compiling the test targets, which the cache below already holds for
+      # the test job.
+      - name: cargo clippy --workspace --all-targets --no-deps -- -D warnings
+        run: cargo clippy --workspace --all-targets --no-deps -- -D warnings

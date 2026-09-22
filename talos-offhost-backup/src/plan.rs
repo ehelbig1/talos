@@ -255,7 +255,7 @@ mod tests {
         // so it is the property most worth pinning.
         let a = pg("talos-20260817-101757.dump");
         let remote = vec![a.object_key().unwrap()];
-        assert!(plan_uploads(&[a.clone()], &remote, UploadMode::NewestOnly).is_empty());
+        assert!(plan_uploads(std::slice::from_ref(&a), &remote, UploadMode::NewestOnly).is_empty());
         assert!(plan_uploads(&[a], &remote, UploadMode::Backfill).is_empty());
     }
 

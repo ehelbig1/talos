@@ -6270,3 +6270,100 @@ Each bullet below is the CLAUDE.md digest entry a package shipped with, moved he
 ### The `make lint` count sentence as it stood at 722c58e2 (superseded by check 96)
 
 - **`make lint` enforces structural rules** via `scripts/lint-structural.sh`. 95 checks today (the authoritative, inline-documented list lives in the script; `bash scripts/lint-structural.sh --count` prints the live number, and check 54 fails the lint if this sentence's count goes stale), each tied to a specific past regression so it catches at PR-time the class of bug that survives `cargo check` cleanly but breaks at CI or request time:
+
+### Two CLAUDE.md lines as they stood at 1751b76b (superseded by package DO's `--all-targets` widening)
+
+  7. `cargo clippy --workspace --no-deps -- -D warnings` matching CI (gated behind `TALOS_LINT_CLIPPY=1` because clippy is a 60-90s build; opt in locally for parity at PR time)
+
+- **CI gates** (lint, test, structural lint) run locally via `make lint` and `cargo test --workspace`. Run `make hooks` once per clone to install the git hooks (`core.hooksPath=.githooks`): the **pre-push** hook runs `make lint` (fmt + structural + `clippy --workspace --no-deps -D warnings` + offline cargo-deny) **and `make lint-frontend`** (frontend eslint + prettier + vitest) so the CI-parity gates can't silently regress between manual runs, and the **pre-commit** hook keeps the fast secret/migration/compile checks on every commit. Emergency bypass: `git push --no-verify`. Still run `cargo test --workspace` + `make lint` before `bash scripts/publish-images.sh`.
+
+## Package DO — the clippy gate covers every target (2026-09-22)
+
+### The measurement
+
+`cargo clippy --workspace --all-targets --no-deps -- -D warnings` on `1751b76b`
+(the 152 lines a naive `grep -c '^warning'` counts include the per-target
+"generated N warnings" summaries; located sites are what matters):
+
+| | |
+|---|---|
+| warning sites | 107 |
+| files | 55 |
+| `await_holding_lock` | 23 (test-only `std::sync::Mutex` guards held across `.await`) |
+| `assertions_on_constants` | 16 (pins between constants, written as runtime tests) |
+| `field_reassign_with_default` | 8 |
+| `large_futures` | 7 (engine tests, pedantic) |
+| `float_cmp` | 5 |
+| `cloned_ref_to_slice_refs` | 5 |
+| 28 other kinds | 43 |
+| semantic (rustc) | an ignored `#[must_use] BudgetAdmission`; a never-used `prov_days`; two never-read guard fields |
+
+CI's clippy job and check 7 both ran `--no-deps` over lib and bin targets
+only; check 7's own comment said test/example drift "is tracked separately
+and would expand this gate", and nothing tracked it. Packages AO (a stolen
+`#[test]` attribute that silenced a test for a merge), AP (a dead test since
+an inserted test took its attribute) and DL each found test-target defects
+by hand, and the recorded remedy was a pre-push habit: `cargo check
+--workspace --all-targets`. A habit is not a gate.
+
+### How the 107 were fixed
+
+Six agents worked file-disjoint chunks against one rule set (fix the code;
+`#[allow]` only where the lint is wrong for the site, with a written reason;
+report every allow and every semantic finding), then each report was read
+against its diff. The classes and their remedies:
+
+* Lock guards across awaits → `tokio::sync::Mutex<()>` statics
+  (`const_new`), taken with `.lock().await` at the same position and scope;
+  `blocking_lock()` where a synchronous `#[test]` shares the static. tokio's
+  mutex does not poison; a panicking sibling releases it on unwind, which is
+  the property the old `unwrap_or_else(|e| e.into_inner())` recovered by hand.
+* Constant assertions → `const _: () = assert!(EXPR, "message")` pins at
+  module level. A compile-time pin is STRONGER than the test it replaces:
+  the build fails, not a test. Messages with `{}` captures became literals
+  (a format is not const-evaluable). Where one operand was a function call
+  the runtime assert stayed.
+* `Box::pin` on the seven large test futures; struct literals with
+  `..Default::default()`; `std::slice::from_ref`; epsilon comparisons for
+  floats — except the protocol crate's bit-exact round-trip tests, which
+  compare `to_bits()`, and one `NEG_INFINITY` sentinel asserted by
+  `is_infinite() && is_sign_negative()`, because an epsilon subtraction
+  against infinity is NaN and would always fail.
+* The two semantic ones: `execution_metrics_tests`' fixture now asserts the
+  admission it used to discard (a refused admission writes no row, so every
+  later finalizer assertion would have failed with a misleading message);
+  `prov_days` was introduced by #791 with zero callers and is deleted — the
+  window-accounting methods it was written for are tested elsewhere.
+
+### The seven allows, and one refused suggestion
+
+| where | lint | reason |
+|---|---|---|
+| `controller/tests/execution_retention_tests.rs` ×2 | `dead_code` | guard fields held for `Drop`; clippy's `Shared(())` would drop the guard at construction and dissolve the serialisation |
+| `talos-workflow-job-protocol/src/test_support.rs` | `unreadable_literal` | the exact digits of the poison float ARE the counterexample |
+| `talos-config`, `talos-oauth`, `talos-module-templates` `*_tests.rs` | `module_inception` | `#[path = "<x>_tests.rs"] mod tests` companions — the convention `talos-mcp-handlers` and `talos-secrets` already use with the same allow; placed ABOVE `#[cfg(test)]` so `ruststmt.strip_test_modules` and check 58 still see `#[cfg(test)]` immediately followed by `mod` |
+| `talos-execution-orchestration/src/crash_recovery.rs` | `items_after_test_module` | check 58's over-strip tripwire pins `record_outcome` as production code sitting AFTER a `#[cfg(test)] mod` in this file; moving it (clippy's fix) would leave that tripwire vacuous |
+
+Refused: `cmp_owned`'s `p != once` in `test_support.rs` — `serde_json::Value:
+PartialEq<String>` compares against a `Value::String`, while the test
+compares re-serialised TEXT to detect a one-ULP instability. The owned
+comparison stays, bound to a local with a comment.
+
+### The gate, proved both ways
+
+`quality.yml`'s clippy job, check 7 and the pre-push comment now read
+`--all-targets`; `--no-deps` stays. A planted `let unused_planted_var = 1;`
+in `controller/tests/execution_metrics_tests.rs` turns the exact CI command
+red and leaves the old lib-only command green — the gap, demonstrated.
+Lowering `GITHUB_DEDUP_WINDOW_SECS` below `DEDUP_WINDOW_SECS` fails the build
+at the new compile-time pin. Both files restored byte-for-byte.
+
+### Stated
+
+`talos-workflow-job-protocol/src/test_support.rs` is compiled into the LIB
+only under `--features test-support`; `--all-targets` alone does not enable
+it, but `talos-memory`'s dev-dependency does in a workspace build, so its
+pedantic lints count in CI. The job's cost is compiling the test targets,
+which the shared cache already holds for the test job. The engine and
+protocol crates keep `#![warn(clippy::pedantic)]`; their test targets now
+meet it.

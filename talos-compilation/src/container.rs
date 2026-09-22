@@ -727,22 +727,23 @@ pub fn tool_command(tool: &str, workspace: &Path) -> Result<Command> {
 ///
 /// Every test in this crate that calls `std::env::set_var` /
 /// `remove_var` MUST acquire `TEST_ENV_LOCK` first. The lock is held
-/// across the env mutations + assertions; on test failure the
-/// `MutexGuard` is poisoned but the runtime recovers via
-/// `lock().unwrap_or_else(PoisonError::into_inner)`-style handling
-/// (see `env_lock()` helper below).
+/// across the env mutations + assertions. It is a `tokio::sync::Mutex`
+/// rather than `std::sync::Mutex` because one test holds it across an
+/// `.await` (`host_command_does_not_inherit_the_controller_env`), and a
+/// std guard held across an await point can deadlock the runtime's
+/// worker thread (clippy `await_holding_lock`). Tokio's mutex does not
+/// poison, so a prior test panicking mid-assertion leaves it usable —
+/// `set_var`/`remove_var` clean up regardless.
 #[cfg(test)]
-pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-/// Acquire `TEST_ENV_LOCK`, recovering from a previous test's panic.
-/// Poisoned-mutex recovery is fine here — the lock guards process
-/// env state, and `set_var`/`remove_var` clean up regardless of
-/// whether a prior test panicked mid-assertion.
+/// Acquire `TEST_ENV_LOCK` from a synchronous `#[test]`.
+///
+/// Async tests (`#[tokio::test]`) must `TEST_ENV_LOCK.lock().await`
+/// instead — `blocking_lock` panics when called from inside a runtime.
 #[cfg(test)]
-pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    TEST_ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+pub(crate) fn env_lock() -> tokio::sync::MutexGuard<'static, ()> {
+    TEST_ENV_LOCK.blocking_lock()
 }
 
 #[cfg(test)]
@@ -1008,7 +1009,7 @@ mod tests {
 
     #[tokio::test]
     async fn host_command_does_not_inherit_the_controller_env() {
-        let _g = env_lock();
+        let _g = TEST_ENV_LOCK.lock().await;
         // A stand-in for WORKER_SHARED_KEY / TALOS_MASTER_KEY / DATABASE_URL:
         // present in the controller process, must be ABSENT in the child.
         std::env::set_var("TALOS_TEST_SECRET_SHOULD_NOT_LEAK", "leak-canary-9f3a");
