@@ -41,7 +41,7 @@
  */
 
 import { config } from "@/config";
-import { getCsrfToken } from "@/lib/csrf";
+import { getCsrfToken, readCookie } from "@/lib/csrf";
 
 const API_URL = config.apiUrl || "";
 
@@ -80,6 +80,25 @@ export const REFRESH_TOKEN_MUTATION = `
     }
   }
 `;
+
+/**
+ * The readable, secretless session marker the backend sets beside the two
+ * HttpOnly auth cookies and clears with them (package DW, 2026-09-22;
+ * `talos_api::schema::auth::SESSION_PRESENT_COOKIE`). Its only content is
+ * its existence: the auth cookies are HttpOnly, correctly, so without it an
+ * anonymous page load could not tell "no session" from "session with an
+ * expired access token" and spent two round trips finding out (`me`, then
+ * a `refreshToken` refused with no audit row and no log line). A wrong
+ * marker costs nothing new — present-but-dead falls back to the old path,
+ * absent-but-alive means one login — which is why it gates only the
+ * SPECULATIVE bootstrap probe, never an explicit auth failure's recovery.
+ */
+export const SESSION_PRESENT_COOKIE = "talos_session_present";
+
+/** True when the backend has told this browser a session may exist. */
+export function sessionMarkerPresent(): boolean {
+  return readCookie(SESSION_PRESENT_COOKIE) === "1";
+}
 
 let activeRefresh: Promise<RefreshOutcome> | null = null;
 let activeSeed: Promise<void> | null = null;
