@@ -22,6 +22,20 @@ use tower_cookies::{Cookie, Cookies};
 /// - Path: "/" (visible to all routes)
 /// - Access TTL: 15 min (short — refreshable via the refresh-cookie path)
 /// - Refresh TTL: 7 days (long — but rotates on every refresh)
+///
+/// A THIRD cookie since 2026-09-22 (package DW): [`SESSION_PRESENT_COOKIE`],
+/// value `1`, the one cookie in this set that is deliberately NOT HttpOnly.
+/// It carries no secret — its only content is its existence — and exists so
+/// the browser client can know WHETHER a session may exist before it asks:
+/// the two auth cookies are HttpOnly (correctly), so a fresh anonymous page
+/// load could not tell "no session" from "session with an expired access
+/// token" and spent two round trips finding out (`me` → not authenticated →
+/// `refreshToken` → "No refresh token found"), a refusal that writes no
+/// audit row and no log line. Same attributes as the refresh cookie
+/// otherwise (Secure in production, SameSite=Strict, Path=/, 7 days) so it
+/// lives exactly as long as a refresh could succeed. A marker that is WRONG
+/// costs nothing new: present-but-dead falls back to today's path, and
+/// absent-but-alive means one login.
 pub fn set_session_cookies(cookies: &Cookies, access_token: &str, refresh_token: &str) {
     let is_production = talos_config::is_production();
 
@@ -38,9 +52,30 @@ pub fn set_session_cookies(cookies: &Cookies, access_token: &str, refresh_token:
     refresh_cookie.set_secure(is_production);
     refresh_cookie.set_same_site(tower_cookies::cookie::SameSite::Strict);
     refresh_cookie.set_path("/");
-    refresh_cookie.set_max_age(tower_cookies::cookie::time::Duration::days(7));
+    refresh_cookie.set_max_age(REFRESH_COOKIE_TTL);
     cookies.add(refresh_cookie);
+
+    // The readable marker. `set_http_only(false)` is the POINT and is pinned
+    // by `the_session_marker_is_readable_secretless_and_lives_as_long_as_the_refresh`.
+    let mut marker = Cookie::new(SESSION_PRESENT_COOKIE, SESSION_PRESENT_VALUE);
+    marker.set_http_only(false);
+    marker.set_secure(is_production);
+    marker.set_same_site(tower_cookies::cookie::SameSite::Strict);
+    marker.set_path("/");
+    marker.set_max_age(REFRESH_COOKIE_TTL);
+    cookies.add(marker);
 }
+
+/// The refresh cookie's lifetime — and the marker's, which must not outlive
+/// what it stands for.
+const REFRESH_COOKIE_TTL: tower_cookies::cookie::time::Duration =
+    tower_cookies::cookie::time::Duration::days(7);
+
+/// Name of the readable, secretless session marker (package DW). The frontend
+/// reads it by this exact name (`frontend/src/lib/session.ts`).
+pub const SESSION_PRESENT_COOKIE: &str = "talos_session_present";
+/// Its only value. Anything else the client reads as absent.
+pub const SESSION_PRESENT_VALUE: &str = "1";
 
 /// MCP-1041 (2026-05-15): canonical session-cookie remover. The
 /// inverse of [`set_session_cookies`] — must clear EVERY cookie that
@@ -60,6 +95,11 @@ pub fn set_session_cookies(cookies: &Cookies, access_token: &str, refresh_token:
 pub fn clear_session_cookies(cookies: &Cookies) {
     cookies.remove(Cookie::build(("talos_access_token", "")).path("/").build());
     cookies.remove(Cookie::build(("talos_refresh_token", "")).path("/").build());
+    cookies.remove(
+        Cookie::build((SESSION_PRESENT_COOKIE, ""))
+            .path("/")
+            .build(),
+    );
 }
 
 /// S1 (login-CSRF defense, 2026-06-23): cookie name carrying the
@@ -109,7 +149,10 @@ pub fn clear_oauth_session_binding_cookie(cookies: &Cookies) {
 
 #[cfg(test)]
 mod cookie_security_tests {
-    use super::{clear_session_cookies, set_session_cookies, Cookies};
+    use super::{
+        clear_session_cookies, set_session_cookies, Cookies, SESSION_PRESENT_COOKIE,
+        SESSION_PRESENT_VALUE,
+    };
     use tower_cookies::cookie::SameSite;
 
     /// CLAUDE.md security rule: auth cookies MUST be HttpOnly + Secure +
@@ -152,6 +195,46 @@ mod cookie_security_tests {
                 "{label} cookie Secure flag must follow is_production()"
             );
         }
+        // Every cookie carrying a TOKEN is HttpOnly; the marker is the one
+        // exception and is tested on its own below, so a fourth cookie
+        // added here without a decision fails this loop.
+        for c in list.iter().filter(|c| c.name() != SESSION_PRESENT_COOKIE) {
+            assert_eq!(c.http_only(), Some(true), "{} must be HttpOnly", c.name());
+        }
+    }
+
+    /// Package DW: the marker is READABLE by design (the client's whole use
+    /// of it), carries no secret (its value is the constant `1`), shares the
+    /// refresh cookie's Secure / SameSite / Path, and lives exactly as long
+    /// as the refresh cookie — never longer, so it cannot claim a session
+    /// that could not be refreshed.
+    #[test]
+    fn the_session_marker_is_readable_secretless_and_lives_as_long_as_the_refresh() {
+        let cookies = Cookies::default();
+        set_session_cookies(&cookies, "access-tok-value", "refresh-tok-value");
+        let list = cookies.list();
+        let marker = list
+            .iter()
+            .find(|c| c.name() == SESSION_PRESENT_COOKIE)
+            .expect("marker must be set");
+        let refresh = list
+            .iter()
+            .find(|c| c.name() == "talos_refresh_token")
+            .expect("refresh cookie must be set");
+        assert_eq!(
+            marker.http_only(),
+            Some(false),
+            "the marker MUST be readable"
+        );
+        assert_eq!(marker.value(), SESSION_PRESENT_VALUE);
+        assert!(
+            !marker.value().contains("tok"),
+            "the marker must never carry token material"
+        );
+        assert_eq!(marker.same_site(), Some(SameSite::Strict));
+        assert_eq!(marker.path(), Some("/"));
+        assert_eq!(marker.secure(), refresh.secure());
+        assert_eq!(marker.max_age(), refresh.max_age());
     }
 
     /// MCP-1041 logout-completeness: [`clear_session_cookies`] must remove

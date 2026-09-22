@@ -1,6 +1,7 @@
 import React, { createContext, useContext, useState, useEffect } from "react";
 import type { ReactNode } from "react";
 import { logout as authLogout, fetchCurrentUser } from "@/lib/auth";
+import { sessionMarkerPresent } from "@/lib/session";
 import type { User } from "@/lib/auth";
 
 interface AuthContextType {
@@ -38,6 +39,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     let mounted = true;
     async function initAuth() {
+      // No marker → the backend never installed a session in this browser
+      // (or cleared it): asking `me` would only be answered "not
+      // authenticated" and then cost a doomed `refreshToken`. Render
+      // anonymous with zero requests (package DW).
+      if (!sessionMarkerPresent()) {
+        if (mounted) setIsLoading(false);
+        return;
+      }
       try {
         const currentUser = await fetchCurrentUser();
         if (mounted) {

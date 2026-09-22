@@ -6638,3 +6638,51 @@ two session-end arms, three operation records, one guard. No test drives a
 real socket end to end; the workspace has no WebSocket client harness, and
 the live read after deploy (one dashboard load → three `authenticated`, three
 `started`, gauge 3) is the wiring's proof.
+## Package DW — the anonymous load's doomed refresh (2026-09-22)
+
+Recorded by DP as "recorded, not changed" and picked up at the operator's
+request. The measurement first:
+
+| | |
+|---|---|
+| `token_refresh` audit rows, 7 days | 113, all `success = t` |
+| refusals recorded (audit row or log line) for a cookieless `refreshToken` | **0** — the resolver returns `No refresh token found in cookies` and writes nothing |
+| requests an anonymous SPA load makes to learn it is anonymous | 2 (`me`, then `refreshToken`) |
+
+So the waste is real and invisible server-side, and the client cannot see
+the cause: both auth cookies are HttpOnly, which is right, and the browser
+therefore has no way to distinguish "no session" from "expired access
+token, live refresh token" — the second of which MUST try the refresh.
+
+The fix is a third cookie from the ONE installer (MCP-1040's
+`set_session_cookies`): `talos_session_present=1`, not HttpOnly because
+being readable is its whole purpose, carrying no secret because its only
+content is its existence, and living exactly as long as the refresh cookie
+(`REFRESH_COOKIE_TTL`, one constant, so the two cannot drift). The remover
+clears it with its siblings. The bootstrap in `AuthContext` skips `me` and
+renders anonymous with zero requests when it is absent.
+
+The decision that bounds the blast radius: the marker gates ONLY the
+speculative bootstrap probe. `recoverSession` — what runs when a real
+request is told it is not authenticated — does not consult it. A marker
+that is wrong therefore costs nothing new: present-but-dead takes the
+pre-DW path (`me` → refresh → anonymous), absent-but-alive means the user
+logs in once, which is also the deploy seam for every session minted before
+this change.
+
+Guards: a Rust test pins that the marker is readable (HttpOnly FALSE), that
+its value is the constant, that it shares Secure/SameSite/Path with the
+refresh cookie and its exact `max_age`; the pre-existing set→clear drift
+test catches a marker without a remover by construction (it sweeps every
+`talos_*` cookie with a live value); the HttpOnly loop now excludes the
+marker by NAME so a fourth token-bearing cookie still fails it. Three
+React tests render the real `AuthProvider`: no marker → `fetch` never
+called; marker → `me` asked; a marker with any value but `1` reads as
+absent. Five mutations, five caught. `readCookie` in `csrf.ts` is the one
+cookie reader.
+
+Value on this fleet, stated plainly: near zero — the operator's own loads
+are never anonymous. The class is "a request whose failure is known before
+it is sent", and the instrument that would have shown it (a counter on the
+cookieless refusal) was deliberately not added: the refusal is now
+avoided rather than counted.
