@@ -6367,3 +6367,86 @@ pedantic lints count in CI. The job's cost is compiling the test targets,
 which the shared cache already holds for the test job. The engine and
 protocol crates keep `#![warn(clippy::pedantic)]`; their test targets now
 meet it.
+
+## Package DP — the frontend runtime survey, and one home for the session refresh (2026-09-22)
+
+### What was measured and found sound
+
+| surface | measured |
+|---|---|
+| production build | `dist` 1.9 MB, 67 hashed assets, per-page lazy chunks, no source maps, 0 chunk-size warnings |
+| first load | vendor 474 KB (143 KB gz) + entry 81 KB (21 KB gz) + CSS 240 KB (27 KB gz) + UI 35 KB (12 KB gz) ≈ 200 KB gzipped |
+| production nginx headers | script CSP without `unsafe-inline`, HSTS, COOP `same-origin-allow-popups`, CORP, `X-Frame-Options: DENY`, Permissions-Policy, immutable caching on hashed assets |
+| storage and DOM | only execution history in `sessionStorage`; no `dangerouslySetInnerHTML`, no `eval` |
+| polling | approvals 60 s, watch channels 30 s (background off), approval queue 10 s, token refresh 14 min |
+| anonymous load (dev server) | 99 requests (module-by-module, dev only), one `/auth/csrf` seed, `me` twice (StrictMode), one doomed `refreshToken`; console clean |
+
+Nothing here needed a change, and that is stated rather than dressed up.
+
+### The finding
+
+The `refreshToken` mutation was written three times. `graphqlClient.ts` and
+`authedFetch.ts` each carried a copy with its OWN in-flight deduper (a
+`let activeRefreshPromise` per module), and `auth.ts`'s `refreshAccessToken`
+— what the 14-minute `useTokenRefresh` timer calls — issued a third copy
+through `graphqlRequest`, outside both dedupers. So a GraphQL auth error, a
+REST 401 and a timer tick could refresh at the same moment.
+
+Refresh tokens rotate. The first refresh rotates the cookie; the loser sends
+the already-rotated token; the server's reuse detector (package DJ) finds the
+rotation audit row younger than `TOKEN_REUSE_GRACE_SECS` and answers
+`within_grace` — the arm documented as "a tab race" — and the losing request
+fails with an auth error the user sees. The client racing itself lives
+inside the grace that exists to tolerate real multi-tab races.
+
+Measured in `rotated_session_audit` before designing: 95 rotation pairs, 2
+of them 0.4 s apart (2026-09-17 12:24 and 2026-09-18 14:19 — both the shape
+of a dashboard load after idle, where the REST and GraphQL wrappers see
+expiry at once). The two copies had also drifted once before, and the code
+said so: `authedFetch`'s seed used to GET `/graphql` (a 405 in production,
+no cookie) after `graphqlClient`'s had moved to `/auth/csrf`.
+
+### The home
+
+`frontend/src/lib/session.ts`:
+
+* `refreshSession() -> Promise<RefreshOutcome>` — ONE in-flight promise,
+  released when it settles; one `REFRESH_TOKEN_MUTATION` selecting every
+  field any caller reads (the timer needs the user, the wrappers a boolean).
+  `refreshed: false` is the only failure shape, on purpose: network error,
+  non-JSON, GraphQL error and missing payload all mean "do not retry", and
+  the refresh token is an HttpOnly cookie, so the client has nothing finer
+  to act on.
+* `attemptTokenRefresh()` — the boolean the retry paths branch on.
+* `seedCsrfCookie()` / `ensureCsrfCookie()` — one deduped GET.
+* `isAuthErrorMessage()` — the three backend phrasings, listed once; a
+  fourth is added here, not at a call site.
+* Imports only `config` and `csrf`, so it can never cycle with the wrappers.
+
+Both wrappers, the WebSocket reconnect (two sites) and `refreshAccessToken`
+call in. `refreshAccessToken` stays exported — `useTokenRefresh.test.ts`
+spies on it — and now throws only when the shared refresh reported failure.
+
+### Guards and mutations
+
+`src/lib/__tests__/session.test.ts` drives the PRODUCTION surfaces, not the
+home alone: `graphqlRequest` (auth error → retry), `authedFetch` (401 →
+retry) and `refreshAccessToken` fired concurrently against one slow mocked
+refresh must produce exactly one `RefreshToken` mutation — on the pre-fix
+tree this is two or three by construction. Also: a settled refresh does not
+shadow the next; a failed refresh is reported once to every concurrent
+caller and then forgotten (and the timer's wrapper throws); the timer gets
+the user; the CSRF seed is shared across both wrappers; the vocabulary table
+(including the non-string input). The existing `graphqlClient` tests and
+`useTokenRefresh.test.ts` stay green unchanged.
+
+Mutations: **6 applied, each confirmed landed and byte-reverted, 6 caught** (the refresh dedupe dropped, the settled promise never released, the seed dedupe dropped, one vocabulary phrase dropped, the timer bypassing the home through `graphqlRequest`, the REST 401 path issuing its own mutation — every one through the production surfaces, not the home alone). The vitest harness follows the Rust one's discipline: backup, exact-once anchor, byte-for-byte restore with the mtime bumped, baseline re-run at the end.
+
+### Recorded, not changed
+
+An anonymous page load issues one doomed `refreshToken` ("No refresh token
+found in cookies"); the resolver writes no audit row on that path, so it is
+one wasted round trip and not noise. `me` fires twice on load in
+development — React StrictMode's double effect, absent from the production
+build. The authenticated dashboard's request waterfall was not measured:
+signing in is the operator's, and this survey does not touch credentials.

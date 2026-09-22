@@ -1,5 +1,10 @@
 import { sanitizeErrorMessage } from "@/lib/sanitize";
 import { getCsrfToken } from "@/lib/csrf";
+import {
+  attemptTokenRefresh,
+  isAuthErrorMessage,
+  seedCsrfCookie,
+} from "@/lib/session";
 import { config } from "@/config";
 /**
  * Minimal GraphQL client used by the Talos frontend — TRANSPORT ONLY.
@@ -26,105 +31,10 @@ export const gql = (strings: TemplateStringsArray, ...values: unknown[]) => {
   return strings.reduce((acc, str, i) => acc + str + (values[i] || ""), "");
 };
 
-// Singleton in-flight refresh promise.
-// Concurrent callers (e.g. multiple queries returning 401 simultaneously) share
-// the same promise instead of firing N parallel refresh requests ("thundering herd").
-let activeRefreshPromise: Promise<boolean> | null = null;
-
-// Singleton in-flight CSRF seed promise.
-// Prevents the same thundering-herd problem on fresh sessions where many
-// simultaneous queries all find the CSRF cookie absent and all fire a
-// redundant preflight GET.
-let activeSeedPromise: Promise<void> | null = null;
-
-async function doTokenRefresh(): Promise<boolean> {
-  try {
-    // Note: We don't pass the refresh token explicitly anymore.
-    // The backend reads it from the httpOnly cookie automatically.
-    const mutation = `
-      mutation RefreshToken {
-        refreshToken {
-          user {
-            id
-          }
-        }
-      }
-    `;
-
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-    };
-    const csrfToken = getCsrfToken();
-    if (csrfToken) {
-      headers["X-CSRF-Token"] = csrfToken;
-    }
-
-    const resp = await fetch(`${API_URL}/graphql`, {
-      method: "POST",
-      headers,
-      credentials: "include",
-      cache: "no-store", // Send cookies
-      body: JSON.stringify({
-        query: mutation,
-      }),
-    });
-
-    const text = await resp.text();
-    let json: Record<string, unknown>;
-    try {
-      json = JSON.parse(text) as Record<string, unknown>;
-    } catch {
-      if (import.meta.env.DEV) console.error("Failed to parse response:", text);
-      return false;
-    }
-    if (
-      (json.errors as unknown[])?.length ||
-      !(json.data as Record<string, unknown>)?.refreshToken
-    ) {
-      return false;
-    }
-
-    // Token is now stored in httpOnly cookie by the backend
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-async function attemptTokenRefresh(): Promise<boolean> {
-  // Deduplicate concurrent refresh attempts: reuse any in-flight promise.
-  if (activeRefreshPromise) {
-    return activeRefreshPromise;
-  }
-  activeRefreshPromise = doTokenRefresh().finally(() => {
-    activeRefreshPromise = null;
-  });
-  return activeRefreshPromise;
-}
-
-// Seed the CSRF cookie by GET-ing /auth/csrf — a dedicated endpoint that
-// builds the Set-Cookie header by hand. We previously hit /graphql (405 in
-// prod, no Set-Cookie) and then /health (no CSRF middleware in its router
-// branch, no Set-Cookie). /auth/csrf is mounted under the chart's existing
-// /auth/* nginx proxy and bypasses tower_cookies / CookieManagerLayer
-// indirection entirely, so it reliably carries Set-Cookie.
-async function seedCsrfCookie(): Promise<void> {
-  if (activeSeedPromise) return activeSeedPromise;
-  activeSeedPromise = (async () => {
-    try {
-      await fetch(`${API_URL}/auth/csrf`, {
-        method: "GET",
-        credentials: "include",
-      });
-    } catch {
-      // Best-effort — if this fails the subsequent POST will surface a clear error.
-    }
-  })().finally(() => {
-    activeSeedPromise = null;
-  });
-  return activeSeedPromise;
-}
-
+// The CSRF seed, the token refresh and the auth-error match live in ONE home
+// (`session.ts`, 2026-09-22): this file used to carry its own copies with its
+// own in-flight promise, so it and `authedFetch.ts` could refresh concurrently
+// and race the rotating refresh token against each other.
 /**
  * Accepted operation document forms: a plain string, or a generated
  * `TypedDocumentString` constant from `@/generated/graphql` (a `String`
@@ -210,12 +120,7 @@ export async function graphqlRequest<T>(
   // Check for authentication errors
   if (json.errors) {
     const errors = json.errors as GraphQLError[];
-    const hasAuthError = errors.some(
-      (e) =>
-        e.message.includes("Authentication required") ||
-        e.message.includes("Not authenticated") ||
-        e.message.includes("expired"),
-    );
+    const hasAuthError = errors.some((e) => isAuthErrorMessage(e.message));
 
     if (hasAuthError && !isRetry) {
       const refreshed = await attemptTokenRefresh();
@@ -420,11 +325,8 @@ function createSubscription<T>(
         }
 
         if (data.type === "error" && Array.isArray(data.payload)) {
-          const isAuthError = data.payload.some(
-            (e: Record<string, unknown>) =>
-              String(e.message)?.includes("Authentication required") ||
-              String(e.message)?.includes("Not authenticated") ||
-              String(e.message)?.includes("expired"),
+          const isAuthError = data.payload.some((e: Record<string, unknown>) =>
+            isAuthErrorMessage(e.message),
           );
 
           if (isAuthError) {

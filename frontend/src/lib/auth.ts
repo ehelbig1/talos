@@ -1,4 +1,5 @@
 import { graphqlRequest } from "@/lib/graphqlClient";
+import { refreshSession } from "@/lib/session";
 import { useWorkflowStore } from "@/store/workflowStore";
 import { useUIStore } from "@/store/uiStore";
 
@@ -123,23 +124,18 @@ export async function fetchCurrentUser(): Promise<User> {
   return result.me;
 }
 
+/**
+ * The 14-minute timer's refresh. Goes through `session.refreshSession`, the
+ * ONE in-flight mutation every other refresh path shares — it used to issue
+ * its own `refreshToken` through `graphqlRequest`, outside both wrappers'
+ * dedupers, so a timer tick could race a 401-triggered refresh.
+ */
 export async function refreshAccessToken(): Promise<AuthResponse> {
-  const mutation = `
-    mutation RefreshToken {
-      refreshToken {
-        user {
-          id
-          email
-          name
-          twoFactorEnabled
-          isTwoFactorVerified
-        }
-      }
-    }
-  `;
-
-  const result = await graphqlRequest<{ refreshToken: AuthResponse }>(mutation);
-  return result.refreshToken;
+  const outcome = await refreshSession();
+  if (!outcome.refreshed) {
+    throw new Error("Session refresh failed");
+  }
+  return { user: outcome.user };
 }
 
 export async function logout(): Promise<void> {
