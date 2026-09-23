@@ -492,11 +492,45 @@ pub fn password_change_decision(
 /// so disabling 2FA withdraws the privilege at once rather than when the
 /// session expires. A read failure refuses.
 pub async fn require_second_factor(ctx: &Context<'_>) -> Result<()> {
+    let (outcome, result) = evaluate_second_factor(ctx).await;
+    // ONE recording site, for PERMITTED as well as every refusal. Counting
+    // only refusals would leave the series unable to tell a deployment nobody
+    // has been refused on from one whose gate is not wired — which is the
+    // reading this package exists to remove, so it must not be reintroduced by
+    // counting half the outcomes.
+    talos_metrics::record_privileged_op(outcome);
+    if !outcome.permitted() {
+        // Kept at INFO and under `talos_audit` with the same `event_kind` and
+        // `reason` vocabulary the four policy refusals have carried since
+        // package CO, now covering the unauthenticated and unreadable arms too
+        // — those used to reach this line not at all.
+        tracing::info!(
+            target: "talos_audit",
+            event_kind = "privileged_op_refused",
+            reason = outcome.as_str(),
+            user_id = ?ctx.data_opt::<Uuid>(),
+            "privileged operation refused: second factor not satisfied"
+        );
+    }
+    result
+}
+
+/// The verdict and the caller-facing result, together.
+///
+/// Split out so `require_second_factor` has exactly one place that records and
+/// one place that logs, while every error MESSAGE stays byte-identical to what
+/// package CO shipped — those sentences are what a caller sees, and three of
+/// them (the expired-session guidance, "Authentication required", "Database
+/// error") are deliberately different from each other.
+async fn evaluate_second_factor(
+    ctx: &Context<'_>,
+) -> (talos_metrics::PrivilegedOpOutcome, Result<()>) {
+    use talos_metrics::PrivilegedOpOutcome as Outcome;
     let api_key = ctx.data_opt::<ApiKeyScopes>().is_some();
     // A request with neither marker is unauthenticated: `require_2fa`'s own
     // missing-data arm names that condition, so defer to it.
     if !api_key && ctx.data_opt::<IsTwoFactorVerified>().is_none() {
-        return require_2fa(ctx);
+        return (Outcome::Unauthenticated, require_2fa(ctx));
     }
     let pending = !ctx.data_opt::<IsTwoFactorVerified>().is_some_and(|v| v.0);
     let verified = ctx.data_opt::<SecondFactorVerified>().is_some_and(|v| v.0);
@@ -504,11 +538,18 @@ pub async fn require_second_factor(ctx: &Context<'_>) -> Result<()> {
     let decision = if early.is_err() {
         early
     } else {
-        let user_id = ctx
-            .data_opt::<Uuid>()
-            .copied()
-            .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
-        let auth_service = ctx.data::<std::sync::Arc<talos_auth::AuthService>>()?;
+        let Some(user_id) = ctx.data_opt::<Uuid>().copied() else {
+            return (
+                Outcome::Unauthenticated,
+                Err(async_graphql::Error::new("Authentication required").extend_safe()),
+            );
+        };
+        let auth_service = match ctx.data::<std::sync::Arc<talos_auth::AuthService>>() {
+            Ok(svc) => svc,
+            // The gate cannot be evaluated without the service. Refused, and
+            // counted as unreadable rather than as a policy decision.
+            Err(e) => return (Outcome::Unreadable, Err(e)),
+        };
         let enrolled = match auth_service.get_user(user_id).await {
             Ok(user) => user.totp_enabled.unwrap_or(false),
             Err(e) => {
@@ -516,21 +557,41 @@ pub async fn require_second_factor(ctx: &Context<'_>) -> Result<()> {
                     %user_id,
                     "require_second_factor: enrolment read failed; refusing: {e}"
                 );
-                return Err(async_graphql::Error::new("Database error").extend_safe());
+                return (
+                    Outcome::Unreadable,
+                    Err(async_graphql::Error::new("Database error").extend_safe()),
+                );
             }
         };
         second_factor_decision(api_key, pending, verified, Some(enrolled))
     };
-    decision.map_err(|refusal| {
-        tracing::info!(
-            target: "talos_audit",
-            event_kind = "privileged_op_refused",
-            reason = refusal.as_str(),
-            user_id = ?ctx.data_opt::<Uuid>(),
-            "privileged operation refused: second factor not satisfied"
-        );
-        async_graphql::Error::new(refusal.message()).extend_safe()
-    })
+    match decision {
+        Ok(()) => (Outcome::Permitted, Ok(())),
+        Err(refusal) => (
+            privileged_outcome_for(refusal),
+            Err(async_graphql::Error::new(refusal.message()).extend_safe()),
+        ),
+    }
+}
+
+/// The ONE mapping from a policy refusal to its metric label.
+///
+/// A `match` rather than a string, so a new `SecondFactorRefusal` variant fails
+/// to compile until it is given a label — the same reason
+/// `talos_workflow_job_protocol::verify_failure_class` dropped its catch-all.
+/// The tokens are pinned equal to `SecondFactorRefusal::as_str` by
+/// `refusal_labels_match_the_caller_facing_reason`, because the log line and
+/// the series must not drift apart.
+const fn privileged_outcome_for(
+    refusal: SecondFactorRefusal,
+) -> talos_metrics::PrivilegedOpOutcome {
+    use talos_metrics::PrivilegedOpOutcome as Outcome;
+    match refusal {
+        SecondFactorRefusal::ApiKey => Outcome::ApiKey,
+        SecondFactorRefusal::Pending => Outcome::Pending,
+        SecondFactorRefusal::NotVerified => Outcome::NotVerified,
+        SecondFactorRefusal::NotEnrolled => Outcome::NotEnrolled,
+    }
 }
 
 /// Gate for system-wide / cross-tenant operations.
@@ -552,12 +613,33 @@ pub async fn require_second_factor(ctx: &Context<'_>) -> Result<()> {
 /// Use in addition to `require_2fa` and (where appropriate) the
 /// per-user `require_scope` check.
 pub async fn require_platform_admin(ctx: &Context<'_>) -> Result<()> {
-    let user_id = ctx
-        .data_opt::<Uuid>()
-        .copied()
-        .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
+    let (outcome, result) = evaluate_platform_admin(ctx).await;
+    // ONE recording site, permitted included — see `require_second_factor` for
+    // why the denominator is part of the signal.
+    talos_metrics::record_platform_admin_check(outcome);
+    result
+}
 
-    let db_pool = ctx.data::<sqlx::Pool<sqlx::Postgres>>()?;
+/// The verdict and the caller-facing result, together. Every message is
+/// byte-identical to the pre-instrumentation gate.
+async fn evaluate_platform_admin(
+    ctx: &Context<'_>,
+) -> (talos_metrics::PlatformAdminOutcome, Result<()>) {
+    use talos_metrics::PlatformAdminOutcome as Outcome;
+    let Some(user_id) = ctx.data_opt::<Uuid>().copied() else {
+        return (
+            Outcome::Unauthenticated,
+            Err(async_graphql::Error::new("Authentication required").extend_safe()),
+        );
+    };
+
+    let db_pool = match ctx.data::<sqlx::Pool<sqlx::Postgres>>() {
+        Ok(p) => p,
+        // No pool, so the rule cannot be read. Refused, and counted as
+        // unreadable rather than as "not an admin" — a caller told they lack a
+        // privilege they may well hold sends an operator to the wrong place.
+        Err(e) => return (Outcome::Unreadable, Err(e)),
+    };
 
     // M T6-1: delegate to the canonical helper so the column source
     // (post-migration `users.is_platform_admin`) is in one place.
@@ -565,19 +647,28 @@ pub async fn require_platform_admin(ctx: &Context<'_>) -> Result<()> {
     // organization_members ...)` SQL the actor-repository helper
     // had — drift risk + the conflation bug fixed in the migration.
     let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
-    let is_admin = actor_repo.is_platform_admin(user_id).await.map_err(|e| {
-        tracing::error!("require_platform_admin db check failed: {}", e);
-        async_graphql::Error::new("Database error").extend_safe()
-    })?;
+    let is_admin = match actor_repo.is_platform_admin(user_id).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::error!("require_platform_admin db check failed: {}", e);
+            return (
+                Outcome::Unreadable,
+                Err(async_graphql::Error::new("Database error").extend_safe()),
+            );
+        }
+    };
 
     if !is_admin {
-        return Err(
-            async_graphql::Error::new("Only platform admins can perform this operation")
-                .extend_safe(),
+        return (
+            Outcome::NotAdmin,
+            Err(
+                async_graphql::Error::new("Only platform admins can perform this operation")
+                    .extend_safe(),
+            ),
         );
     }
 
-    Ok(())
+    (Outcome::Permitted, Ok(()))
 }
 
 /// Fetch all organization IDs the user belongs to (any role).
@@ -1256,7 +1347,72 @@ mod ws_lane_guard_tests {
 
 #[cfg(test)]
 mod second_factor_tests {
-    use super::{password_change_decision, second_factor_decision, SecondFactorRefusal};
+    use super::{
+        password_change_decision, privileged_outcome_for, second_factor_decision,
+        SecondFactorRefusal,
+    };
+
+    /// The metric label and the caller-facing `reason` must be the SAME token
+    /// for every refusal.
+    ///
+    /// They are produced by two different functions in two different crates —
+    /// `SecondFactorRefusal::as_str` writes the `talos_audit` log field, and
+    /// `PrivilegedOpOutcome::as_str` writes the series label — so nothing but
+    /// this test stops them drifting. If they drift, an operator who greps the
+    /// log for a reason and then queries the counter for the same token gets an
+    /// empty series and concludes the gate never refused, which is the exact
+    /// misreading package DY exists to remove.
+    #[test]
+    fn refusal_labels_match_the_caller_facing_reason() {
+        for refusal in [
+            SecondFactorRefusal::ApiKey,
+            SecondFactorRefusal::Pending,
+            SecondFactorRefusal::NotVerified,
+            SecondFactorRefusal::NotEnrolled,
+        ] {
+            assert_eq!(
+                refusal.as_str(),
+                privileged_outcome_for(refusal).as_str(),
+                "{refusal:?}: log reason and metric label disagree"
+            );
+            // And a refusal never maps to the admitting value — a mapping that
+            // returned `Permitted` would make every refusal invisible while
+            // the per-value seed test above still passed.
+            assert!(
+                !privileged_outcome_for(refusal).permitted(),
+                "{refusal:?} mapped to the admitting outcome"
+            );
+        }
+    }
+
+    /// The three NON-policy outcomes are values the refusal enum cannot
+    /// produce, and that is the point: a caller who could not be identified, a
+    /// rule that could not be READ, and a rule that said no are three
+    /// different operator actions. Pinned so a future "simplification" that
+    /// folds `unreadable` into a policy reason has to delete this.
+    #[test]
+    fn the_non_policy_outcomes_are_distinct_from_every_policy_refusal() {
+        use talos_metrics::PrivilegedOpOutcome as O;
+        let policy: Vec<&str> = [
+            SecondFactorRefusal::ApiKey,
+            SecondFactorRefusal::Pending,
+            SecondFactorRefusal::NotVerified,
+            SecondFactorRefusal::NotEnrolled,
+        ]
+        .iter()
+        .map(|r| privileged_outcome_for(*r).as_str())
+        .collect();
+        for o in [O::Permitted, O::Unauthenticated, O::Unreadable] {
+            assert!(
+                !policy.contains(&o.as_str()),
+                "{} collides with a policy refusal label",
+                o.as_str()
+            );
+        }
+        // Every value the enum declares is reachable from somewhere: four from
+        // the policy mapping, three from the gate's own arms.
+        assert_eq!(O::ALL.len(), policy.len() + 3);
+    }
 
     /// A password change needs a session that is not an API key, not pending,
     /// and — only when 2FA is enrolled — verified. A password-only session on
@@ -1403,5 +1559,241 @@ mod second_factor_tests {
                 "{name}: reduces privilege, keeps require_2fa"
             );
         }
+    }
+}
+
+/// The ONE lock every test that reads the process-global metrics registry
+/// takes.
+///
+/// One home rather than one per module, and the reason is a failure this
+/// package had: the throttle recorder test passed alone and failed beside its
+/// siblings, because another test in the same binary refuses calls through the
+/// same limiter and moves the same series. A per-module lock serialises a
+/// module against itself and not against the binary, which is the shape that
+/// looks correct and is not.
+#[cfg(test)]
+pub(crate) static METRICS_SERIES_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Production-path guards for the privileged-operation gate (package DY).
+///
+/// These drive the REAL `require_second_factor` through a real `async_graphql`
+/// schema and read the counter out of a real registry — not the pure decision
+/// function, and not the recorder in isolation. That matters because the two
+/// things most likely to go wrong are invisible to either of those alone: a
+/// gate that classifies correctly and never records, and a gate that records
+/// only refusals (which leaves a refusal rate with no denominator, and makes a
+/// deployment nobody has been refused on look exactly like one whose gate is
+/// not wired — the reading this package exists to remove).
+///
+/// **Five of the seven outcomes are reachable with no database**, because each
+/// short-circuits before the enrolment read: no markers at all is
+/// `Unauthenticated`; an API key, a pending session and an unverified session
+/// are all settled by `second_factor_decision`'s early pass; and a session that
+/// passes every cheap check with no `AuthService` in the context is
+/// `Unreadable` — the fail-closed arm, exercised here rather than asserted.
+/// `Permitted` and `NotEnrolled` need a real `AuthService` and a user row, so
+/// they are covered by `second_factor_tests` at the decision level and stated
+/// as not driven end to end here.
+#[cfg(test)]
+mod privileged_gate_production_path_tests {
+    use super::*;
+    use async_graphql::{EmptyMutation, EmptySubscription, Object, Schema};
+    use std::sync::Arc;
+    use talos_metrics::PrivilegedOpOutcome as O;
+
+    struct PrivilegedQuery;
+
+    #[Object]
+    impl PrivilegedQuery {
+        /// Stands in for any of the fifteen privileged mutations — it calls
+        /// the same gate they do, by the same name.
+        async fn rotate_something(&self, ctx: &Context<'_>) -> Result<bool> {
+            require_second_factor(ctx).await?;
+            Ok(true)
+        }
+    }
+
+    fn schema() -> Schema<PrivilegedQuery, EmptyMutation, EmptySubscription> {
+        Schema::build(PrivilegedQuery, EmptyMutation, EmptySubscription).finish()
+    }
+
+    /// Install (idempotently) and return the process-global registry.
+    fn registry() -> &'static Arc<talos_metrics::TalosMetrics> {
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("registry"));
+        talos_metrics::global().expect("installed")
+    }
+
+    fn counts(m: &talos_metrics::TalosMetrics) -> Vec<(&'static str, u64)> {
+        O::ALL
+            .iter()
+            .map(|o| {
+                (
+                    o.as_str(),
+                    m.privileged_op_total
+                        .with_label_values(&[o.as_str()])
+                        .get()
+                        .round() as u64,
+                )
+            })
+            .collect()
+    }
+
+    /// Execute one request and assert EXACTLY the expected outcome moved, by
+    /// exactly one. The "every other value moved by zero" half is what catches
+    /// a recorder that ignores its argument, and the "by one" half catches a
+    /// gate that records twice.
+    async fn assert_records(req: async_graphql::Request, expected: O, expect_error: bool) {
+        let _guard = super::METRICS_SERIES_LOCK.lock().await;
+        let m = registry();
+        let before = counts(m);
+        let res = schema().execute(req).await;
+        assert_eq!(
+            res.errors.is_empty(),
+            !expect_error,
+            "caller-facing outcome changed: {:?}",
+            res.errors
+        );
+        let after = counts(m);
+        for ((name, b), (_, a)) in before.iter().zip(after.iter()) {
+            let want = u64::from(*name == expected.as_str());
+            assert_eq!(
+                a - b,
+                want,
+                "outcome {name}: delta {} , expected {want} (gate under test: {})",
+                a - b,
+                expected.as_str()
+            );
+        }
+    }
+
+    /// No session marker and no API key: the request is unauthenticated, and
+    /// that is its OWN outcome rather than a policy refusal — an operator
+    /// reading `not_verified` would go looking for a 2FA problem on an account
+    /// that never presented a session.
+    #[tokio::test]
+    async fn an_unauthenticated_request_is_counted_as_unauthenticated() {
+        assert_records(
+            async_graphql::Request::new("{ rotateSomething }"),
+            O::Unauthenticated,
+            true,
+        )
+        .await;
+    }
+
+    /// An API key is refused BY DESIGN — keys carry no second factor, so they
+    /// cannot stand in for one — and the counter says so in its own value
+    /// rather than folding into the generic refusal.
+    #[tokio::test]
+    async fn an_api_key_is_counted_as_api_key() {
+        assert_records(
+            async_graphql::Request::new("{ rotateSomething }")
+                .data(ApiKeyScopes(vec![]))
+                .data(Uuid::new_v4()),
+            O::ApiKey,
+            true,
+        )
+        .await;
+    }
+
+    /// A session half-way through its 2FA login.
+    #[tokio::test]
+    async fn a_pending_session_is_counted_as_pending() {
+        assert_records(
+            async_graphql::Request::new("{ rotateSomething }")
+                .data(IsTwoFactorVerified(false))
+                .data(Uuid::new_v4()),
+            O::Pending,
+            true,
+        )
+        .await;
+    }
+
+    /// A password-only or OAuth session: it authenticated, and it did not
+    /// prove a second factor.
+    #[tokio::test]
+    async fn a_session_that_proved_no_second_factor_is_counted_as_not_verified() {
+        assert_records(
+            async_graphql::Request::new("{ rotateSomething }")
+                .data(IsTwoFactorVerified(true))
+                .data(Uuid::new_v4()),
+            O::NotVerified,
+            true,
+        )
+        .await;
+    }
+
+    /// The platform-admin gate is the SECOND surface this package
+    /// instruments, and it needs its own production-path cases: a guard on one
+    /// gate cannot see the other, and these two are separate functions with
+    /// separate counters. Two of its four outcomes are drivable with no
+    /// database (no caller id; no pool to read the rule from); `permitted` and
+    /// `not_admin` need a real `users` row and are stated as not driven here.
+    #[tokio::test]
+    async fn the_platform_admin_gate_counts_its_own_outcomes() {
+        use talos_metrics::PlatformAdminOutcome as A;
+
+        struct AdminQuery;
+        #[Object]
+        impl AdminQuery {
+            async fn admin_only(&self, ctx: &Context<'_>) -> Result<bool> {
+                require_platform_admin(ctx).await?;
+                Ok(true)
+            }
+        }
+
+        let _guard = super::METRICS_SERIES_LOCK.lock().await;
+        let m = registry();
+        let read = |o: A| {
+            m.platform_admin_checks_total
+                .with_label_values(&[o.as_str()])
+                .get()
+                .round() as u64
+        };
+        let schema = Schema::build(AdminQuery, EmptyMutation, EmptySubscription).finish();
+
+        // No caller id at all.
+        let before = read(A::Unauthenticated);
+        let res = schema
+            .execute(async_graphql::Request::new("{ adminOnly }"))
+            .await;
+        assert_eq!(
+            res.errors.len(),
+            1,
+            "an unidentified caller must be refused"
+        );
+        assert_eq!(read(A::Unauthenticated), before + 1);
+
+        // A caller id, but the rule cannot be read — REFUSED, and counted as
+        // unreadable rather than as "not an admin": telling a caller they lack
+        // a privilege they may well hold sends an operator to the wrong place.
+        let before = read(A::Unreadable);
+        let res = schema
+            .execute(async_graphql::Request::new("{ adminOnly }").data(Uuid::new_v4()))
+            .await;
+        assert_eq!(res.errors.len(), 1, "an unreadable rule must be refused");
+        assert_eq!(read(A::Unreadable), before + 1);
+        assert_eq!(
+            read(A::NotAdmin),
+            0,
+            "an unreadable rule must not be reported as a policy refusal"
+        );
+    }
+
+    /// THE FAIL-CLOSED ARM, exercised rather than asserted. Every cheap check
+    /// passes and the enrolment rule cannot be read — here because no
+    /// `AuthService` is in the context, in production because the read failed.
+    /// The call must be REFUSED and counted as `unreadable`: a fault to fix,
+    /// never a policy decision to respect, and never a grant.
+    #[tokio::test]
+    async fn an_unreadable_rule_refuses_and_is_counted_as_unreadable() {
+        assert_records(
+            async_graphql::Request::new("{ rotateSomething }")
+                .data(IsTwoFactorVerified(true))
+                .data(SecondFactorVerified(true))
+                .data(Uuid::new_v4()),
+            O::Unreadable,
+            true,
+        )
+        .await;
     }
 }

@@ -7002,3 +7002,137 @@ timeout as a second guard.
   uninteresting, and it is stated rather than implied.
 * `execution_events` is the only durable record of a liveness re-dispatch. There
   is no series and therefore no alert.
+
+## Package DY (2026-09-23) — the last bearer surface with no series
+
+### What was measured first, and what the measurement refuted
+
+The survey that chose this package started somewhere else and was wrong twice,
+which is worth recording because both errors were in the alarming direction.
+
+**`pg_stat_statements` named one statement at 40 % of all database time** — an
+ML kNN search over `ml_examples`, 25 121 calls, 216 s. Alarming until the
+denominator: total database time over the 143.4-hour collection window is
+**538 s, i.e. 0.104 % of one core**. That statement costs **36 s/day** on a
+database that is 99.9 % idle. Optimising it would save nothing measurable, and
+the 48 MB ivfflat index with 0 scans over a 2 853-row table is package AD's
+decision, not a new finding. **A share is not a cost; read the denominator.**
+
+**The failure population is exhausted as a source of platform work.** 105
+failures over 30 days: 30 suspend-shaped (wall-clock spans of 721–8 567 s
+against 180–300 s budgets — the host sleeps, the monotonic deadline does not
+advance and the wall-clock freshness check does), 38 dns (**declined on
+measurement 2026-09-21**, 37 of 45 inside host outages), 15 liveness (**fixed
+the same day by package DX**), and 22 in a long tail that includes three
+deliberate exfil tests and two draft cycles. **79 % is one external root cause.**
+The eight WARNs that appeared after DX's deploy say the same thing from another
+angle: nine unrelated statements show max/mean ratios of 200–1287× (a 1.6 ms
+`INSERT INTO execution_events` peaking at 2064 ms), which is a host stalling,
+not query cost — and `track_io_timing` is off, so attributing it needs an
+operator GUC change.
+
+So the remaining work is instrumentation, and there is exactly one gap.
+
+### The gap
+
+`require_second_factor` guards **17 call sites across five files** — the
+fifteen privileged mutations package CO defined: `rotateMasterKey`,
+`rotateDek`, `rotateOrgDek`, `rotateEncryptionKey`, the four `reEncrypt*`
+sweeps, `updateAuditSettings`, `createApiKey`, `rotateApiKey`,
+`registerMcpAgent`, `grantCapabilityCeiling`, `transferOwnership` — with four
+distinct refusal reasons. `require_platform_admin` guards 12 more. **Zero
+metric references in the gate's file, and no such series anywhere in the
+workspace.**
+
+Every other bearer surface on this platform has one: `talos_auth_attempts_total`,
+`talos_api_key_validations_total`, `talos_mcp_auth_total` (package AX),
+`talos_ws_*` (package DU), `talos_rate_limit_hits_total`. This was the last one
+that was log-only — the AX → DU progression, one surface further on. Beside it,
+the per-USER GraphQL throttle (`schema/throttle.rs`, 203 lines, 0 metric
+references) was the only limiter on the platform whose refusals reached no
+series at all.
+
+### Decisions
+
+* **The `talos-metrics` dependency edge is taken here, and the argument that
+  declined it elsewhere does NOT transfer.** Package DX declined the same edge
+  in `talos-workflow-engine-nats` — but that crate is a deliberately
+  standalone, publishable engine adapter and the edge would have been new.
+  `talos-metrics` is already in `talos-api`'s dependency graph (26 transitive
+  paths) and carries one leaf talos dependency, so the edge adds no compilation
+  unit and cannot cycle; and `talos-api` is the controller's own GraphQL
+  surface. Checked rather than assumed, and recorded in the manifest beside the
+  dependency so the next reader does not re-derive it.
+* **`permitted` is counted, not only the refusals.** A refusal count with no
+  denominator cannot distinguish a deployment nobody has been refused on from
+  one whose gate is not wired — which is the exact reading the series exists to
+  remove, so counting half the outcomes would reintroduce it at one remove.
+  This decision is the package's central claim and it is the one a test had to
+  be built for; see the survivor below.
+* **Three NON-policy outcomes are distinct values, deliberately.**
+  `unauthenticated` (no session and no API key — usually an expired session),
+  `unreadable` (the enrolment rule could not be READ) and the four policy
+  refusals are three different operator actions. The `unreadable` split is
+  #757's `write_ceiling_unreadable` precedent: a fault to fix is not a policy
+  decision to respect, and a caller told they lack a privilege they may well
+  hold sends an operator to the wrong place. It REFUSES, never grants.
+* **The metric label and the caller-facing `reason` are pinned EQUAL.** They
+  are produced by two functions in two crates, so nothing but a test stops them
+  drifting; if they drift, an operator who greps the log for a reason and then
+  queries the counter for the same token gets an empty series and concludes the
+  gate never refused.
+* **Two throttle kinds, not one `graphql_user`.** They are two buckets with two
+  limits (heavy mutations 10/min, Rhai 60/min), and an operator who has to
+  raise one needs to know which.
+* **NO alert on any of it**, and the reason is the usual one: no baseline.
+  These series have never produced a value on this fleet.
+
+### The survivor, and what closed it
+
+Nine mutations ran first and **M2 SURVIVED**: narrowing the recorder to
+`if !outcome.permitted()` passed the entire `talos-api` suite. The reason is
+structural rather than an oversight in the tests — all five outcomes reachable
+without a database are refusals, so "record refusals only" is invisible to
+every one of them. That is the package's own central claim failing its own
+guard.
+
+Closing it needed a real `users` row, so `controller/tests/privileged_gate_permitted_tests`
+drives `require_second_factor` through a real `async_graphql` schema against a
+real `AuthService` on the isolated-DB harness: an enrolled user's call must be
+ADMITTED and must move `permitted` and nothing else, and a user whose enrolment
+has been withdrawn must be refused as `not_enrolled` while `permitted` does not
+move. Re-run, M2 is caught by exactly that test. The same binary reaches the
+two outcomes the unit tests could not, so the stated gap closed with it.
+
+**A second interleaving defect surfaced twice, the same shape both times.** The
+throttle recorder test passed alone and failed beside its siblings, because
+another test in the binary refuses calls through the same limiter and moves the
+same series; then the two DB tests did it to each other. A per-module lock
+serialises a module against itself and not against the binary — which is the
+shape that looks correct and is not — so the talos-api lock has one home
+(`METRICS_SERIES_LOCK`) that the sibling throttle test takes too.
+
+### Guards
+
+Five production-path tests drive the REAL gate through a real schema and read
+counter DELTAS out of a real registry, asserting that exactly the expected
+outcome moved and by exactly one — the "everything else moved by zero" half
+catches a recorder that ignores its argument, the "by one" half catches a gate
+that records twice. `unreadable` is EXERCISED rather than asserted (no
+`AuthService` in the context stands in for a read that failed). The
+platform-admin gate gets its own two, because a guard on one gate cannot see
+the other. The metrics seed/recorder test was EXTENDED in place rather than
+copied, and pins series counts equal to enum arity so a recorder that collapsed
+two reasons into one label fails even though the per-value loop passes.
+
+### Stated limits
+
+* No test drives a browser or a real operator session; the live read after
+  deploy is the honest guard for the wiring.
+* `permitted` and `not_enrolled` are covered only by the DB binary, so they do
+  not run in the `talos-api` unit suite.
+* The series are recorded but nothing alerts on them, so a burst of refusals
+  is visible only to someone looking.
+* This package instruments two gates. The OTHER fail-open-shaped gates in the
+  workspace (capability ceilings, module rate limits, Rhai policy evaluation)
+  are unmeasured here and are not claimed to be covered.

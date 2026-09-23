@@ -89,6 +89,14 @@ pub enum RateLimitKind {
     ApiKey,
     Webhook,
     McpAuth,
+    /// The per-USER GraphQL throttle on heavy mutations (an LLM call or a
+    /// synchronous WASM compile/run). A separate bucket from `Rhai` because
+    /// they are two limiters with two limits, and collapsing them would hide
+    /// which one an operator has to raise.
+    GraphqlHeavyMutation,
+    /// The per-USER GraphQL throttle on inline Rhai evaluation of a
+    /// caller-supplied script.
+    GraphqlRhai,
 }
 
 impl RateLimitKind {
@@ -98,6 +106,8 @@ impl RateLimitKind {
         Self::ApiKey,
         Self::Webhook,
         Self::McpAuth,
+        Self::GraphqlHeavyMutation,
+        Self::GraphqlRhai,
     ];
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -107,7 +117,112 @@ impl RateLimitKind {
             Self::ApiKey => "api_key",
             Self::Webhook => "webhook",
             Self::McpAuth => "mcp_auth",
+            Self::GraphqlHeavyMutation => "graphql_heavy_mutation",
+            Self::GraphqlRhai => "graphql_rhai",
         }
+    }
+}
+
+/// Outcome of one `require_second_factor` check — the gate on the PRIVILEGED
+/// tier (master-key and DEK rotation, the re-encryption sweeps, API-key
+/// lifecycle, MCP-agent registration, capability grants, audit settings,
+/// ownership transfer: 15 mutations across 17 call sites as of 2026-09-23).
+///
+/// Every other bearer surface on this platform counts its outcomes —
+/// `talos_auth_attempts_total`, `talos_api_key_validations_total`,
+/// `talos_mcp_auth_total`, `talos_ws_handshakes_total`. This one was log-only
+/// from the day it shipped, so "nobody has been refused a key rotation" and
+/// "the gate is not wired" rendered identically.
+///
+/// The three non-policy arms are deliberately NOT folded into the policy ones:
+/// a caller who could not be identified, a rule that could not be READ, and a
+/// rule that said no are three different operator actions — the same split
+/// `write_ceiling_unreadable` makes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrivilegedOpOutcome {
+    /// The second factor was verified for this session and still enrolled.
+    Permitted,
+    /// No session and no API key on the request (an expired session, usually).
+    Unauthenticated,
+    /// An API key. Keys skip 2FA by design, so they cannot stand in for it.
+    ApiKey,
+    /// The session is still half-way through its 2FA login.
+    Pending,
+    /// A password-only or OAuth session, or one minted before enrolment.
+    NotVerified,
+    /// The account has no second factor enrolled (or it was removed).
+    NotEnrolled,
+    /// The enrolment rule could NOT BE READ. A refusal, never a grant — and a
+    /// value of its own, because it is a fault to fix rather than a policy
+    /// decision to respect.
+    Unreadable,
+}
+
+impl PrivilegedOpOutcome {
+    pub const ALL: &'static [Self] = &[
+        Self::Permitted,
+        Self::Unauthenticated,
+        Self::ApiKey,
+        Self::Pending,
+        Self::NotVerified,
+        Self::NotEnrolled,
+        Self::Unreadable,
+    ];
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Permitted => "permitted",
+            Self::Unauthenticated => "unauthenticated",
+            Self::ApiKey => "api_key",
+            Self::Pending => "pending",
+            Self::NotVerified => "not_verified",
+            Self::NotEnrolled => "not_enrolled",
+            Self::Unreadable => "unreadable",
+        }
+    }
+    /// Did this outcome admit the call? One predicate, so a reader never has
+    /// to enumerate the refusals and miss one when a variant is added.
+    #[must_use]
+    pub const fn permitted(self) -> bool {
+        matches!(self, Self::Permitted)
+    }
+}
+
+/// Outcome of one `require_platform_admin` check — the gate on cross-tenant
+/// and system-wide operations.
+///
+/// Same three-way split as [`PrivilegedOpOutcome`]: an unidentified caller, an
+/// unreadable rule and a rule that said no are not one event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlatformAdminOutcome {
+    Permitted,
+    /// No user id on the request.
+    Unauthenticated,
+    /// The caller is not a platform admin.
+    NotAdmin,
+    /// The `is_platform_admin` read failed. Refused, never granted.
+    Unreadable,
+}
+
+impl PlatformAdminOutcome {
+    pub const ALL: &'static [Self] = &[
+        Self::Permitted,
+        Self::Unauthenticated,
+        Self::NotAdmin,
+        Self::Unreadable,
+    ];
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Permitted => "permitted",
+            Self::Unauthenticated => "unauthenticated",
+            Self::NotAdmin => "not_admin",
+            Self::Unreadable => "unreadable",
+        }
+    }
+    #[must_use]
+    pub const fn permitted(self) -> bool {
+        matches!(self, Self::Permitted)
     }
 }
 

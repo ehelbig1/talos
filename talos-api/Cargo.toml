@@ -31,6 +31,14 @@ sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 talos-actor-memory-service = { path = "../talos-actor-memory-service" }
 talos-actor-lifecycle-service = { path = "../talos-actor-lifecycle-service" }
+# Package DY: the privileged and platform-admin gates record their outcomes.
+# `talos-metrics` was ALREADY in this crate's dependency graph (26 transitive
+# paths) and carries one leaf talos dep, so this edge adds no compilation unit
+# and cannot cycle. Unlike `talos-workflow-engine-nats` — a deliberately
+# standalone, publishable engine adapter, which is why the 2026-09-06
+# attempt-window package declined the same edge there — this crate is the
+# controller's own GraphQL surface.
+talos-metrics = { path = "../talos-metrics", version = "0.1.0" }
 talos-actor-repository = { path = "../talos-actor-repository" }
 talos-api-keys = { path = "../talos-api-keys" }
 talos-audit-ledger = { path = "../talos-audit-ledger" }
