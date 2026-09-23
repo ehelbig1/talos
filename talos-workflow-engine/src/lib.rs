@@ -63,7 +63,7 @@ mod graph_parser;
 mod oauth_reauth;
 mod sandbox;
 mod scheduler_handlers;
-mod secrets_pipeline;
+pub mod secrets_pipeline;
 mod validation;
 pub mod vault_resolver;
 pub mod write_ceiling_gate;
@@ -87,8 +87,9 @@ pub use error::WorkflowEngineError;
 pub use event_spawn::emit_event_spawn;
 pub use graph_builder::{BuildError, WorkflowGraphBuilder, WorkflowGraphBuilderError};
 pub use graph_json::{validate as validate_graph_json, GraphJsonError, GraphSummary, SCHEMA_DOC};
+pub use secrets_pipeline::retain_wire_safe_secrets;
 pub use validation::validate_config_patterns;
 pub use vault_resolver::{
-    extract_vault_refs, merge_vault_refs_into_allowlist, replace_vault_values, VaultRef,
+    check_vault_refs_resolvable, extract_vault_refs, merge_vault_refs_into_allowlist, VaultRef,
     VaultResolverError,
 };
