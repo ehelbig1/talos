@@ -553,3 +553,173 @@ pub(crate) async fn run_publish_templates_cli(args: &[String]) -> anyhow::Result
     );
     Ok(())
 }
+
+/// `controller plaid-link` — link a Plaid item and put its credential in the
+/// vault, without the credential ever reaching a caller, a log or a terminal.
+///
+/// WHY THIS IS A CONTROLLER SUBCOMMAND rather than an MCP tool or a GraphQL
+/// mutation. `/item/public_token/exchange` RETURNS a long-lived credential.
+/// MCP is read-only for secrets by decision (MCP-1201: an MCP API key is a
+/// long-lived bearer token with no 2FA equivalent, so secret writes would
+/// bypass the `require_2fa + SecretsWrite` discipline), which rules that
+/// surface out. A GraphQL mutation would be the house answer for an operator
+/// secret write, and remains the right home for a future Hosted Link callback
+/// — but the exchange also needs to run before any browser flow exists, which
+/// is exactly the sandbox case. `publish-templates` is the precedent: a
+/// subcommand is how this repo does an operator action that needs the
+/// controller's own credentials and no HTTP surface.
+///
+/// The token's ONLY destination is the vault. It is not printed, not returned,
+/// and not logged — `AccessToken`'s redacting `Debug` covers the accidental
+/// `{:?}`, and this function never reaches for `.as_str()` except to hand the
+/// value to the encrypting writer.
+pub(crate) async fn run_plaid_link_cli(args: &[String]) -> anyhow::Result<()> {
+    use talos_plaid::link::{
+        access_token_path, check_source, LinkRefusal, LinkReport, LinkSource, PLAID_CLIENT_ID_PATH,
+        PLAID_SECRET_PATH,
+    };
+    use talos_plaid::{PlaidClient, PlaidConfig, PublicToken};
+
+    let mut sandbox = false;
+    let mut public_token: Option<String> = None;
+    let mut institution = "ins_109508".to_string(); // Plaid's sandbox test bank
+    let mut products = vec!["transactions".to_string()];
+    let mut user: Option<uuid::Uuid> = None;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--sandbox" => sandbox = true,
+            "--public-token" => {
+                public_token = Some(
+                    iter.next()
+                        .ok_or_else(|| anyhow::anyhow!(LinkRefusal::MissingPublicToken.message()))?
+                        .clone(),
+                );
+            }
+            "--institution" => {
+                institution = iter
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--institution requires a value"))?
+                    .clone();
+            }
+            "--products" => {
+                products = iter
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("--products requires a comma-separated value"))?
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+            }
+            "--user" => {
+                user = Some(
+                    iter.next()
+                        .ok_or_else(|| anyhow::anyhow!("--user requires a uuid"))?
+                        .parse()?,
+                );
+            }
+            other => anyhow::bail!("unknown plaid-link flag: {other}"),
+        }
+    }
+
+    let source = if sandbox {
+        LinkSource::Sandbox {
+            institution_id: institution.clone(),
+            products: products.clone(),
+        }
+    } else {
+        LinkSource::Browser
+    };
+    if !sandbox && public_token.is_none() {
+        anyhow::bail!(LinkRefusal::MissingPublicToken.message());
+    }
+
+    let config = PlaidConfig::from_env()?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Plaid is not configured — set PLAID_CLIENT_ID, PLAID_SECRET and PLAID_ENV \
+             (all three or none)"
+        )
+    })?;
+    // The environment gate runs BEFORE any network call, so a sandbox request
+    // against a production configuration never puts the production app
+    // credentials on the wire.
+    check_source(config.env, &source).map_err(|r| anyhow::anyhow!(r.message()))?;
+
+    let env_label = config.env.as_str();
+    let client_id = config.client_id.clone();
+    let app_secret = config.secret().to_string();
+    let client = PlaidClient::new(config);
+
+    let public = match public_token {
+        Some(raw) => PublicToken::new(raw),
+        None => client.sandbox_public_token(&institution, &products).await?,
+    };
+    // Exchange FIRST: a failure here must leave the vault untouched rather than
+    // half-seeded with app credentials for an item that does not exist.
+    let (access, item_id) = client.exchange_public_token(&public).await?;
+    let token_path = access_token_path(&item_id).map_err(|e| anyhow::anyhow!(e))?;
+    let accounts = client.accounts(&access).await?;
+
+    let pool = crate::db::init_pool().await?;
+    let user_id = match user {
+        Some(u) => u,
+        None => {
+            let ids: Vec<uuid::Uuid> = sqlx::query_scalar("SELECT id FROM users ORDER BY id")
+                .fetch_all(&pool)
+                .await?;
+            match ids.len() {
+                1 => ids[0],
+                0 => anyhow::bail!("no users exist; create one before linking a Plaid item"),
+                n => anyhow::bail!(
+                    "{n} users exist — pass --user <uuid> to say which one owns this item"
+                ),
+            }
+        }
+    };
+    let org_id =
+        talos_organizations::OrganizationService::create_personal_org(&pool, user_id, None)
+            .await?
+            .id;
+
+    // The SAME KEK resolution the server uses — `SecretsManager::new` would
+    // hardcode the env provider and silently wrap this DEK with the wrong key
+    // on a `KEK_PROVIDER=vault` deployment.
+    let kek = crate::bootstrap::services::resolve_kek_providers().await?;
+    let secrets = talos_secrets_manager::SecretsManager::with_kek_providers(
+        pool.clone(),
+        kek.active,
+        kek.legacy,
+    )?;
+    secrets.initialize().await?;
+    // All three, because a module needs all three IN ITS REQUEST BODY: Plaid
+    // takes client_id and secret as body fields on every endpoint, and
+    // `vault://` substitution is the only way a guest gets a secret into one.
+    for (name, path, value) in [
+        ("Plaid client id", PLAID_CLIENT_ID_PATH, client_id.as_str()),
+        ("Plaid app secret", PLAID_SECRET_PATH, app_secret.as_str()),
+        ("Plaid access token", token_path.as_str(), access.as_str()),
+    ] {
+        secrets
+            .upsert_secret(
+                name,
+                path,
+                value,
+                "default",
+                Some("written by `controller plaid-link`; read by a module through vault://"),
+                user_id,
+                Vec::new(),
+                Some(org_id),
+            )
+            .await?;
+    }
+
+    let report = LinkReport {
+        env: env_label,
+        item_id,
+        access_token_path: token_path,
+        accounts: accounts.len(),
+        account_names: accounts.into_iter().map(|a| a.name).collect(),
+    };
+    println!("{}", report.render());
+    Ok(())
+}

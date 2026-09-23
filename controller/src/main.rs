@@ -276,6 +276,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(sub) = args.get(1) {
         match sub.as_str() {
             "publish-templates" => return run_publish_templates_cli(&args[2..]).await,
+            "plaid-link" => return run_plaid_link_cli(&args[2..]).await,
             "generate-worker-trust-keypair" => {
                 return run_generate_worker_trust_keypair_cli(&args[2..]);
             }
@@ -300,6 +301,28 @@ async fn main() -> anyhow::Result<()> {
                 );
                 println!("                                        for `oras push`. See");
                 println!("                                        .github/workflows/template-publish.yml");
+                println!("  controller plaid-link --sandbox | --public-token <tok>");
+                println!(
+                    "                                        [--institution <id>] [--products a,b]"
+                );
+                println!(
+                    "                                        [--user <uuid>]  Link a Plaid item"
+                );
+                println!(
+                    "                                        and write its credential to the vault."
+                );
+                println!(
+                    "                                        --sandbox needs PLAID_ENV=sandbox; a"
+                );
+                println!(
+                    "                                        production item needs a public_token"
+                );
+                println!(
+                    "                                        from Plaid Link in a browser. The"
+                );
+                println!(
+                    "                                        token is never printed or returned."
+                );
                 println!("  controller generate-worker-trust-keypair --role <controller|worker>");
                 println!(
                     "                                        [--worker-id <id>]  Mint an Ed25519"
