@@ -7424,3 +7424,94 @@ Verified locally against a throwaway unauthenticated NATS container and a
 migrated template: 6 of 6 green. The operator's own broker refuses this
 publisher (its credentials are permissioned) and its live `talos` database is
 never connection-free, so neither could be used.
+
+## Package EB (2026-09-23) — the "flaky test class" was measured and is not a class
+
+Two flaky tests were fixed in consecutive PRs (#929, #930) and the
+recommendation coming out of that was to sweep the class properly. The
+measurement refuted the recommendation, which is the reason this is written
+down.
+
+### CI ground truth
+
+`quality.yml`, last **40 runs**: 32 success, 5 cancelled, **2 failure**. Both
+failures are the SAME test —
+`wasm_log_relay_tests::two_replicas_store_each_line_once_and_both_broadcast_it`
+— on 2026-09-22 (a=3, b=3 of 50 rows) and 2026-09-23 (a=8, b=8 of 50). One
+test, twice, now fixed.
+
+The other flake, `expired_db_is_refused_in_production_and_passes_elsewhere`,
+**never failed in CI at all**. It is a directory-mtime backdate that does not
+reliably take on macOS, and it only reproduces locally. The two flakes do not
+share a cause, a shape, or even an environment.
+
+### The obvious detector, built and rejected
+
+Shape: `sleep(...)` within 12 lines of an `assert`, outside a deadline-bounded
+loop. Over **187** test files: 50 sleep sites, 23 sleep-then-assert, **20
+reported**. All 20 read and classified:
+
+| classification | n |
+|---|---|
+| False positive — sleep inside a `for`-bounded poll | 6 |
+| Negative control (asserts an absence) | 5 |
+| Legitimate — simulated work in a spawned task | 5 |
+| Genuine latent risk | 3 |
+
+**15% precision, and 0-for-2 against the flakes that actually happened.** The
+relay test's failing wait is a `timeout`-based drain; the advisory-DB one is a
+filesystem mtime. Neither contains the shape the detector looks for. A
+detector green over both defects it was written for is the
+gate-that-doesn't-gate shape, so it is not shipped and `--count` stays 96.
+
+The 5 negative controls are worth separating rather than counting as risk:
+they assert something did NOT happen, so a slow machine makes the absence MORE
+likely. They can pass wrongly; they cannot flake red. Conflating them with
+races would have tripled the apparent population.
+
+### The finding that is actionable
+
+`eventually(what, probe)` existed in **exactly 1 of 187 test files**, as a
+private fn in `controller/tests/job_result_observer_tests.rs`. That file is
+the sibling of the one that flaked — same package, same two-replica NATS
+pattern, written days apart. One author reached for a bounded wait and has
+never flaked; the other re-invented it as `drain` plus fixed sleeps and flaked
+twice.
+
+Privacy was the cause: there was nothing to find. `common::eventually` and
+`eventually_default` now live in the shared harness and the private copy is
+gone.
+
+### None of the three latent sites is adopted, and the reasons are measured
+
+- `mcp_tool_instrument_tests:577` counts statements on a THREAD-LOCAL counter.
+  A polling probe issues statements on that same thread, so polling would
+  inflate `background` and corrupt the `background <= 8` measurement the test
+  exists to make.
+- `rpc_instrument_tests:220` asserts a COLD registry — `(0.0, 0.0, 0.0, 0.0)`
+  — immediately after the wait, and `installed_test_metrics()` calls
+  `set_global`, so the registry it reads is the one the subscriber records
+  into. A probe RPC would move `base_ok` off zero and break a deliberate
+  assertion.
+- `nats_worker_permissions:332` is in `talos-workflow-engine-nats`, whose
+  dev-dependencies are `rand` and `tokio` only. There is no shared test
+  harness to import, and one site does not justify a test-utils crate.
+
+Adopting `eventually` at any of them would break what they measure. Recorded
+rather than forced.
+
+### Mutations: 3 applied, 3 caught after closing one survivor
+
+**P2 survived, and then hung.** Deleting the helper's deadline arm makes
+`eventually` loop forever. The first guard was `#[should_panic(expected =
+"timed out")]`, which simply never returns — and a hung binary burns the CI
+job's entire timeout while reporting nothing, which is worse than a failure.
+The guard now spawns the wait and bounds the JOIN from outside, so a missing
+deadline fails within 5 seconds and says the helper hung.
+
+**And the harness lesson was re-learned the hard way.** The mutation run hit
+its own subprocess timeout, the exception propagated past the revert lines,
+and the mutation was left in the tree — found by grep and restored. The
+harness now reverts inside a `finally`. This is the second time a hung
+mutation has stranded an edit; the rule is that the revert belongs in a block
+that runs however the attempt ends.
