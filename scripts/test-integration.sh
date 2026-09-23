@@ -428,6 +428,10 @@ CTRL_TESTS=(
     # factor: the gate matrix through the real schema, login/refresh flags, and
     # enrolment signing out every earlier session (2026-09-18).
     "privileged_second_factor_tests"
+    # The same gate's ADMITTING outcome on the production path: `permitted`
+    # and `not_enrolled` need a real users row, and without the first of them
+    # a recorder narrowed to refusals is invisible (measured survivor, DY).
+    "privileged_gate_permitted_tests"
     # A user changing their own password: session gate, shared lockout, atomic
     # revocation + audit row, conflict on a concurrent change (2026-09-18).
     "password_change_tests"

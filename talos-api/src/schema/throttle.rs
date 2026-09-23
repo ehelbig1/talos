@@ -78,6 +78,19 @@ impl ThrottleClass {
             ThrottleClass::RhaiEval => "Rhai evaluations",
         }
     }
+
+    /// Which limiter this class draws from, as the metric names it.
+    ///
+    /// A `match`, so a third class cannot be added without choosing a label —
+    /// and two values rather than one `graphql_user`, because these are two
+    /// buckets with two limits and an operator who has to raise one needs to
+    /// know which.
+    const fn rate_limit_kind(self) -> talos_metrics::RateLimitKind {
+        match self {
+            ThrottleClass::HeavyMutation => talos_metrics::RateLimitKind::GraphqlHeavyMutation,
+            ThrottleClass::RhaiEval => talos_metrics::RateLimitKind::GraphqlRhai,
+        }
+    }
 }
 
 /// Extension code carried on every throttle refusal.
@@ -88,11 +101,16 @@ pub const RATE_LIMITED_CODE: &str = "RATE_LIMITED";
 /// unauthenticated request has no bucket to draw from and is refused here
 /// too (fail closed), but the auth helpers give it the right message.
 pub fn enforce_user_throttle(ctx: &Context<'_>, class: ThrottleClass) -> Result<()> {
-    enforce_with(ctx, class.throttle(), class.what())
+    enforce_with(ctx, class.throttle(), class.what(), class.rate_limit_kind())
 }
 
 /// The testable core: same decision, caller-supplied bucket.
-pub fn enforce_with(ctx: &Context<'_>, throttle: &PerUserThrottle, what: &str) -> Result<()> {
+pub fn enforce_with(
+    ctx: &Context<'_>,
+    throttle: &PerUserThrottle,
+    what: &str,
+    kind: talos_metrics::RateLimitKind,
+) -> Result<()> {
     let user_id = ctx
         .data_opt::<Uuid>()
         .copied()
@@ -100,6 +118,12 @@ pub fn enforce_with(ctx: &Context<'_>, throttle: &PerUserThrottle, what: &str) -
     match throttle.check(user_id) {
         Ok(()) => Ok(()),
         Err(exceeded) => {
+            // The fifth and sixth kinds in the family. Until package DY the
+            // per-USER GraphQL throttles were the only limiters on the
+            // platform whose refusals reached no series at all, so a user
+            // being throttled and the throttle being unconfigured looked the
+            // same from outside.
+            talos_metrics::record_rate_limit_hit(kind);
             tracing::warn!(
                 target: "talos_rate_limit",
                 event_kind = "graphql_user_throttle_refused",
@@ -138,7 +162,12 @@ mod tests {
     impl ThrottledQuery {
         async fn expensive(&self, ctx: &Context<'_>) -> Result<bool> {
             let t = ctx.data::<Arc<PerUserThrottle>>()?;
-            enforce_with(ctx, t, "test operations")?;
+            enforce_with(
+                ctx,
+                t,
+                "test operations",
+                talos_metrics::RateLimitKind::GraphqlHeavyMutation,
+            )?;
             Ok(true)
         }
     }
@@ -149,8 +178,67 @@ mod tests {
             .finish()
     }
 
+    /// The two classes draw from two BUCKETS, so they must report two
+    /// KINDS — collapsing them into one `graphql_user` label would leave an
+    /// operator who has to raise a limit unable to tell which one is refusing.
+    #[test]
+    fn each_throttle_class_reports_its_own_limiter_kind() {
+        use talos_metrics::RateLimitKind as K;
+        assert_eq!(
+            ThrottleClass::HeavyMutation.rate_limit_kind(),
+            K::GraphqlHeavyMutation
+        );
+        assert_eq!(ThrottleClass::RhaiEval.rate_limit_kind(), K::GraphqlRhai);
+        assert_ne!(
+            ThrottleClass::HeavyMutation.rate_limit_kind().as_str(),
+            ThrottleClass::RhaiEval.rate_limit_kind().as_str()
+        );
+    }
+
+    /// A refused call must MOVE the limiter series, on the production path.
+    ///
+    /// Until package DY these were the only limiters on the platform whose
+    /// refusals reached no series at all, so a user being throttled and the
+    /// throttle being misconfigured looked identical from outside. Driving the
+    /// resolver (not `record_rate_limit_hit` directly) is what proves the
+    /// refusal branch reaches the recorder.
+    #[tokio::test]
+    async fn a_refused_call_moves_the_limiter_series() {
+        let _guard = crate::schema::METRICS_SERIES_LOCK.lock().await;
+        talos_metrics::set_global(talos_metrics::TalosMetrics::new().expect("registry"));
+        let m = talos_metrics::global().expect("installed");
+        let label = talos_metrics::RateLimitKind::GraphqlHeavyMutation.as_str();
+        let read = || {
+            m.rate_limit_hits_total
+                .with_label_values(&[label])
+                .get()
+                .round() as u64
+        };
+
+        let schema = schema(1);
+        let user = Uuid::new_v4();
+        // The admitted call must NOT move it — a recorder on the wrong side of
+        // the branch would count every call and read as a permanent outage.
+        let before = read();
+        let ok = schema
+            .execute(async_graphql::Request::new("{ expensive }").data(user))
+            .await;
+        assert!(ok.errors.is_empty(), "{:?}", ok.errors);
+        assert_eq!(read(), before, "an admitted call moved the refusal series");
+
+        let refused = schema
+            .execute(async_graphql::Request::new("{ expensive }").data(user))
+            .await;
+        assert_eq!(refused.errors.len(), 1);
+        assert_eq!(read(), before + 1, "the refusal did not reach the recorder");
+    }
+
     #[tokio::test]
     async fn third_call_in_a_minute_is_rate_limited_with_code_and_safe_marker() {
+        // This test REFUSES calls, so it moves the same limiter series
+        // `a_refused_call_moves_the_limiter_series` reads. Taking the shared
+        // lock is what keeps the two from interleaving.
+        let _guard = crate::schema::METRICS_SERIES_LOCK.lock().await;
         let schema = schema(2);
         let user = Uuid::new_v4();
         for _ in 0..2 {

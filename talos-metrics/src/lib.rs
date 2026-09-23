@@ -31,9 +31,9 @@ pub use mcp::McpToolOutcome;
 pub use outcome_class::OutcomeClass;
 pub use rpc::{seeded_pairs as rpc_seeded_pairs, RpcOutcome, RpcSubject};
 pub use security::{
-    ApiKeyValidation, McpAuthOutcome, PasswordChangeOutcome, RateLimitKind,
-    RotationAuditArmOutcome, TokenReuseOutcome, TwoFactorOutcome, WsHandshakeOutcome,
-    WsOperationOutcome, WsSessionEnd,
+    ApiKeyValidation, McpAuthOutcome, PasswordChangeOutcome, PlatformAdminOutcome,
+    PrivilegedOpOutcome, RateLimitKind, RotationAuditArmOutcome, TokenReuseOutcome,
+    TwoFactorOutcome, WsHandshakeOutcome, WsOperationOutcome, WsSessionEnd,
 };
 pub use vault_token::{VaultTokenLifetimeLabel, VaultTokenRenewalOutcome};
 pub mod advisory_db;
@@ -450,6 +450,41 @@ pub fn record_rate_limit_hit_on(metrics: &TalosMetrics, kind: RateLimitKind) {
     metrics
         .rate_limit_hits_total
         .with_label_values(&[kind.as_str()])
+        .inc();
+}
+
+/// Count one privileged-operation gate outcome. Inert without [`set_global`].
+///
+/// Called from the ONE site in `talos_api::schema::require_second_factor` that
+/// knows the verdict — permitted and refused alike, because a refusal rate
+/// needs its denominator and "the gate ran and admitted" is what separates a
+/// quiet deployment from an unwired one.
+pub fn record_privileged_op(outcome: PrivilegedOpOutcome) {
+    if let Some(m) = global() {
+        record_privileged_op_on(m, outcome);
+    }
+}
+
+/// The recording itself, against an EXPLICIT registry.
+pub fn record_privileged_op_on(metrics: &TalosMetrics, outcome: PrivilegedOpOutcome) {
+    metrics
+        .privileged_op_total
+        .with_label_values(&[outcome.as_str()])
+        .inc();
+}
+
+/// Count one platform-admin gate outcome. Inert without [`set_global`].
+pub fn record_platform_admin_check(outcome: PlatformAdminOutcome) {
+    if let Some(m) = global() {
+        record_platform_admin_check_on(m, outcome);
+    }
+}
+
+/// The recording itself, against an EXPLICIT registry.
+pub fn record_platform_admin_check_on(metrics: &TalosMetrics, outcome: PlatformAdminOutcome) {
+    metrics
+        .platform_admin_checks_total
+        .with_label_values(&[outcome.as_str()])
         .inc();
 }
 
@@ -1822,8 +1857,20 @@ pub struct TalosMetrics {
     pub scheduler_readiness_degraded: IntGauge,
 
     // Rate limiting metrics — wired 2026-09-11 at all four limiters
-    // (`RateLimitKind::ALL`), seeded at 0.
+    // (`RateLimitKind::ALL`), seeded at 0. The two per-USER GraphQL throttles
+    // joined the family 2026-09-23 (package DY).
     pub rate_limit_hits_total: CounterVec,
+
+    /// `talos_privileged_op_total{outcome}` — every `require_second_factor`
+    /// check on the privileged tier. `PrivilegedOpOutcome::ALL`, seeded at 0.
+    /// Package DY: this was the LAST bearer/auth surface with no series, so a
+    /// deployment that had never refused a key rotation and one whose gate was
+    /// not wired rendered identically. No alert — no baseline yet, and a
+    /// refusal is the gate working.
+    pub privileged_op_total: CounterVec,
+    /// `talos_platform_admin_checks_total{outcome}` — every
+    /// `require_platform_admin` check. `PlatformAdminOutcome::ALL`, seeded at 0.
+    pub platform_admin_checks_total: CounterVec,
 
     // Google push authentication (Gmail + GCP Pub/Sub) — added 2026-09-12
     // after one JWK fetch failure produced 94 WARN lines and no series. Both
@@ -3282,6 +3329,47 @@ impl TalosMetrics {
                 .inc_by(0.0);
         }
 
+        // Privileged-operation gate (package DY). Seeded over the CLOSED set:
+        // an absent series and a zero are different claims, and `increase()`
+        // over an absent one matches nothing.
+        let privileged_op_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_privileged_op_total",
+                "Outcomes of the GraphQL privileged-operation gate \
+                 (require_second_factor): key-material rotation, the \
+                 re-encryption sweeps, API-key lifecycle, MCP-agent \
+                 registration, capability grants, audit settings, ownership \
+                 transfer. `outcome=permitted` admitted the call; every other \
+                 value refused it. `unreadable` means the enrolment rule could \
+                 not be READ and the call was refused anyway (fail closed) — \
+                 a fault to fix, not a policy decision.",
+            ),
+            &["outcome"],
+        )?;
+        registry.register(Box::new(privileged_op_total.clone()))?;
+        for outcome in PrivilegedOpOutcome::ALL {
+            privileged_op_total
+                .with_label_values(&[outcome.as_str()])
+                .inc_by(0.0);
+        }
+
+        let platform_admin_checks_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_platform_admin_checks_total",
+                "Outcomes of the GraphQL platform-admin gate \
+                 (require_platform_admin) on cross-tenant and system-wide \
+                 operations. `unreadable` means the is_platform_admin read \
+                 failed and the call was refused anyway.",
+            ),
+            &["outcome"],
+        )?;
+        registry.register(Box::new(platform_admin_checks_total.clone()))?;
+        for outcome in PlatformAdminOutcome::ALL {
+            platform_admin_checks_total
+                .with_label_values(&[outcome.as_str()])
+                .inc_by(0.0);
+        }
+
         // Deployment-wide execution pause
         let execution_pause_refusals_total = CounterVec::new(
             prometheus::Opts::new(
@@ -3993,6 +4081,8 @@ impl TalosMetrics {
             scheduler_readiness_holds_total,
             scheduler_readiness_degraded,
             rate_limit_hits_total,
+            privileged_op_total,
+            platform_admin_checks_total,
             google_push_refusals_total,
             google_push_accepted_total,
             execution_pause_refusals_total,
@@ -4775,6 +4865,26 @@ mod tests {
                 .expect("render")
                 .contains("talos_ws_active_sessions 1"));
         }
+        // The GraphQL privileged and platform-admin gates (package DY). The
+        // LAST bearer/auth surfaces on this platform with no series, and the
+        // first refusal is the one an operator wants, so a cold registry must
+        // already export every value at 0 — including `permitted`, without
+        // which a refusal rate has no denominator and a quiet deployment is
+        // indistinguishable from an unwired gate.
+        for o in PrivilegedOpOutcome::ALL {
+            assert!(cold.contains(&format!(
+                "talos_privileged_op_total{{outcome=\"{}\"}} 0",
+                o.as_str()
+            )));
+            record_privileged_op_on(&m, *o);
+        }
+        for o in PlatformAdminOutcome::ALL {
+            assert!(cold.contains(&format!(
+                "talos_platform_admin_checks_total{{outcome=\"{}\"}} 0",
+                o.as_str()
+            )));
+            record_platform_admin_check_on(&m, *o);
+        }
         let warm = m.render_prometheus().expect("render");
         assert!(warm.contains("talos_ws_active_sessions 0"));
         for o in WsHandshakeOutcome::ALL {
@@ -4828,6 +4938,46 @@ mod tests {
         // does not aggregate outcomes away.
         assert_eq!(McpAuthOutcome::ALL.len(), 7);
         assert_eq!(warm.matches("talos_mcp_auth_total{outcome=").count(), 7);
+        // Package DY's two gates: every value moved exactly once, and the
+        // series count equals the enum arity — a recorder that collapsed two
+        // refusal reasons into one label would pass the per-value loop above
+        // and fail here.
+        for o in PrivilegedOpOutcome::ALL {
+            assert!(warm.contains(&format!(
+                "talos_privileged_op_total{{outcome=\"{}\"}} 1",
+                o.as_str()
+            )));
+        }
+        assert_eq!(PrivilegedOpOutcome::ALL.len(), 7);
+        assert_eq!(
+            warm.matches("talos_privileged_op_total{outcome=").count(),
+            PrivilegedOpOutcome::ALL.len()
+        );
+        for o in PlatformAdminOutcome::ALL {
+            assert!(warm.contains(&format!(
+                "talos_platform_admin_checks_total{{outcome=\"{}\"}} 1",
+                o.as_str()
+            )));
+        }
+        assert_eq!(PlatformAdminOutcome::ALL.len(), 4);
+        assert_eq!(
+            warm.matches("talos_platform_admin_checks_total{outcome=")
+                .count(),
+            PlatformAdminOutcome::ALL.len()
+        );
+        // The two per-USER GraphQL throttles joined the limiter family; the
+        // loop above already moved every kind, so this pins that the family
+        // GREW rather than that a name was swapped.
+        assert_eq!(RateLimitKind::ALL.len(), 7);
+        for k in [
+            RateLimitKind::GraphqlHeavyMutation,
+            RateLimitKind::GraphqlRhai,
+        ] {
+            assert!(warm.contains(&format!(
+                "talos_rate_limit_hits_total{{type=\"{}\"}} 1",
+                k.as_str()
+            )));
+        }
         for o in PasswordChangeOutcome::ALL {
             assert!(warm.contains(&format!(
                 "talos_password_changes_total{{outcome=\"{}\"}} 1",

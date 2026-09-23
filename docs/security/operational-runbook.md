@@ -817,6 +817,43 @@ lines under `target: "talos_audit"` with `event_kind = "mcp_auth_refused"`
 and the client IP. No alert references the series yet; a threshold needs a
 baseline it has not produced.
 
+### 3.4a Was a privileged operation attempted without a second factor?
+
+The fifteen privileged mutations (master-key and DEK rotation, the
+re-encryption sweeps, API-key creation and rotation, MCP-agent registration,
+capability grants, audit settings, ownership transfer) are gated on a session
+whose second factor was verified and is still enrolled. Since 2026-09-23 every
+check is on the controller's metrics endpoint:
+
+- `talos_privileged_op_total{outcome}` — `permitted` when the call was
+  admitted, and one value per refusal: `unauthenticated` (no session and no API
+  key on the request — usually an expired session), `api_key` (keys carry no
+  second factor and cannot stand in for one), `pending` (a session half-way
+  through its 2FA login), `not_verified` (a password-only or OAuth session, or
+  one minted before enrolment), `not_enrolled` (the account no longer has a
+  second factor — the privilege is withdrawn at once rather than when the
+  session expires), and `unreadable` (the enrolment rule could not be READ; the
+  call was refused anyway — a fault to fix, not a policy decision).
+- `talos_platform_admin_checks_total{outcome}` — the same shape for the
+  cross-tenant gate: `permitted`, `unauthenticated`, `not_admin`, `unreadable`.
+
+**Read `permitted` alongside the refusals.** Every value is pre-seeded at 0, so
+an all-zero series means the gate has run and admitted nothing — but a refusal
+count with no `permitted` beside it cannot distinguish a quiet deployment from
+one whose gate is not wired, which is why the admitting outcome is counted too.
+
+The refusals are also INFO lines under `target: "talos_audit"` with
+`event_kind = "privileged_op_refused"` and the same `reason` token the metric
+label uses (the two are pinned equal by
+`refusal_labels_match_the_caller_facing_reason` — a drift would make a grep of
+the log and a query of the counter disagree). No alert references either series
+yet; a threshold needs a baseline neither has produced.
+
+The two per-USER GraphQL throttles join the limiter family in the same release:
+`talos_rate_limit_hits_total{type="graphql_heavy_mutation"}` and
+`{type="graphql_rhai"}` — two kinds rather than one, because they are two
+buckets with two limits and an operator raising one needs to know which.
+
 ### 3.5 Suspected user password leak
 
 The user signs in and changes the password under **Settings → Password**
