@@ -659,6 +659,23 @@ services:
       # ENABLE_HSTS: "true"          # Enable HSTS (only with HTTPS)
       # Anthropic API Key
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Optional features whose documented default is "none": absent or EMPTY
+      # means the feature stays off (talos_config treats "" as unset), so these
+      # are inert on a deployment that does not set them. They are listed HERE
+      # rather than left to `.env` because this service has no `env_file` — a
+      # variable not named in this map never reaches the process, so a
+      # documented "set this to turn it on" would silently do nothing.
+      PLAID_CLIENT_ID: ${PLAID_CLIENT_ID:-}
+      PLAID_SECRET: ${PLAID_SECRET:-}
+      PLAID_ENV: ${PLAID_ENV:-}
+      TALOS_WORKFLOW_SIGNING_KEY: ${TALOS_WORKFLOW_SIGNING_KEY:-}
+      MCP_ALLOWED_CRATE_DEPENDENCIES_EXTRA: ${MCP_ALLOWED_CRATE_DEPENDENCIES_EXTRA:-}
+      # allow-untransported-env: OTEL_EXPORTER_OTLP_TRACES_ENDPOINT
+      # allow-untransported-env: OTEL_EXPORTER_OTLP_ENDPOINT — deliberately NOT
+      # transported, for the `JAEGER_ENDPOINT` prohibition above: it is the same
+      # decision, and these two are the fallbacks `talos_trace::endpoint_from_env`
+      # consults when JAEGER_ENDPOINT is unset. Transporting them would reopen
+      # trace export through the back door that prohibition closes.
       # Embeddings — Ollama (OpenAI-compatible API, local, no API key required).
       # Override EMBEDDING_API_URL / EMBEDDING_API_KEY to switch providers (Azure, OpenAI, Jina…).
       EMBEDDING_API_URL: "http://ollama:11434/v1/embeddings"
@@ -1013,6 +1030,9 @@ services:
       # modules. Those are unset here on purpose — the host functions answer
       # `NotConfigured` — and they are documented in
       # docs/configuration-reference.md, NOT under the audit ledger.
+      # allow-untransported-env: S3_ACCESS_KEY_ID — "unset here on purpose",
+      # stated one paragraph up. The host functions answering `NotConfigured`
+      # IS the intended state for a stack with no object-storage backend.
       # Ollama (Tier 1 — local LLM inference from WASM modules)
       OLLAMA_URL: "http://ollama:11434"
       # Operator opt-in: allow modules to reach hostnames that resolve to

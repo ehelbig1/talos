@@ -9440,6 +9440,44 @@ else
 fi
 echo
 
+bold "▶ check 97: a documented env var with NO default must be TRANSPORTED"
+
+# The docs tell an operator to set a variable. On the compose stack the
+# controller service has NO `env_file` — its `environment:` map is an explicit
+# `KEY: ${VAR}` list — so a variable not named there never reaches the process:
+# the operator edits `.env`, restarts, and the feature stays off with no error,
+# no warning and no log line. Found 2026-09-23 when the three `PLAID_*`
+# variables were added to `.env` and reached nothing.
+#
+# SCOPE IS NARROW ON PURPOSE. Measured over 302 documented-and-read variables,
+# 143 (47%) are transported by nothing and nearly every one is a TUNABLE with a
+# working default (`WASM_CACHE_MAX_MODULES`, every `CIRCUIT_BREAKER_*`) — for
+# those, no transport is CORRECT, and gating them would be 143 findings on
+# correct code. What marks a defect is the ABSENCE of a default: the docs' own
+# Default cell reads `none`, so the variable is the only way to turn the
+# feature on. 8 on pristine main, 0 after (5 transported, 3 opt-outs whose
+# reasons were already written in the compose file). Transport is inert when
+# unset (`${VAR:-}` → empty → check 73's empty-is-unset), so adding one cannot
+# change a deployment that does not set it.
+#
+# A COMMENT IS NOT TRANSPORT — this check's own first run shipped green over
+# its own documented exemption because a NOTE naming the variable counted as
+# presence (checks 73/87's self-report trap); comments are stripped before the
+# transport scan and read only for the opt-out marker.
+CK97_RC=0
+CK97_OUT="$(cd "$ROOT" && python3 scripts/lint-env-transport.py 2>&1)" || CK97_RC=$?
+if [ "$CK97_RC" -eq 0 ]; then
+    green "✓ every no-default documented env var is transported or opted out ($(echo "$CK97_OUT" | grep -o 'scanned [0-9]* no-default documented variable(s) against [0-9]* deployment surface(s); [0-9]* opt-out(s)'))"
+else
+    echo "$CK97_OUT" | sed 's/^/  /'
+    red "✗ a documented env var with no default reaches no deployment surface"
+    yellow "  → add it to the controller/worker \`environment:\` map in docker-compose.yml and to the chart,"
+    yellow "    or mark it \`# allow-untransported-env: VAR — <reason>\` where the decision lives."
+    EXIT_CODE=1
+fi
+
+echo
+
 bold "▶ check 54: lint self-consistency (check numbering + documented count)"
 ACTUAL_NUMS="$(grep -oE '^bold "▶ check [0-9]+:' "${BASH_SOURCE[0]}" | grep -oE '[0-9]+' | sort -n)"
 EXPECTED_NUMS="$(seq 1 "$CHECK_COUNT")"

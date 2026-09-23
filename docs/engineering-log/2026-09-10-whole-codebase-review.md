@@ -7870,3 +7870,142 @@ twenty-five spaces inside it — a `\` line continuation eaten by the Python
 heredoc that wrote the file, which is the failure mode this log already records
 under the whitespace-run measurement. Found by scanning the file for
 `\S {5,}\S` inside a string literal rather than by reading it.
+
+
+### Superseded count sentence (check 97 took the list to 97)
+
+- **`make lint` enforces structural rules** via `scripts/lint-structural.sh`. 96 checks today (the authoritative, inline-documented list lives in the script; `bash scripts/lint-structural.sh --count` prints the live number, and check 54 fails the lint if this sentence's count goes stale), each tied to a specific past regression so it catches at PR-time the class of bug that survives `cargo check` cleanly but breaks at CI or request time:
+
+## Package EF (2026-09-23) — the documented variable that reaches nothing
+
+### How it was found
+
+Not by auditing. The operator added `PLAID_CLIENT_ID`, `PLAID_SECRET` and
+`PLAID_ENV` to `.env` and said so; the running controller could not see any of
+them. The cause is one line of compose semantics: the controller service has no
+`env_file`, so its `environment:` map is an explicit `KEY: ${VAR}` list and a
+variable not named there never reaches the process.
+
+The failure mode is the quiet one. The operator edits `.env`, restarts, and the
+feature stays off — no error, no warning, no log line, and a boot check that
+correctly reports "not configured" because from the process's point of view it
+genuinely is not.
+
+Package ED documented the three variables and wired a boot posture check.
+Nothing carried them from `.env` to the reader.
+
+### The first framing was wrong, and the measurement is what said so
+
+The obvious rule — *a documented variable that production code reads must be
+transported* — was measured before it was written:
+
+* documented variables: **305**
+* documented AND read in production `.rs`: **302**
+* of those, transported by no deployment surface: **143 (47%)**
+
+And nearly every one of the 143 is a TUNABLE with a working default:
+`WASM_CACHE_MAX_MODULES`, every `CIRCUIT_BREAKER_*`, the `SCHEDULER_*` family,
+the retention knobs. For those, no transport is the CORRECT state — you set them
+only to override a default that already works. A lint on that rule would be 143
+findings on correct code, which is the enforcement-shaped noise this repo
+rejects.
+
+What separates a defect is the **absence of a default**. The docs' own Default
+cell reads `none`, so the feature is off until the operator sets it, so the
+variable is the only way to turn it on. Re-measured on that predicate:
+
+* no-default AND read by production code: **22**
+* of those, untransported: **8** — five defects, three with decisions already
+  written down.
+
+### What changed
+
+Transported, in compose and — for the cluster — chart values plus the
+controller's `$secretKeys`:
+
+| variable | why it had to reach the process |
+|---|---|
+| `PLAID_CLIENT_ID` / `PLAID_SECRET` / `PLAID_ENV` | all three or none; the integration is off without them |
+| `TALOS_WORKFLOW_SIGNING_KEY` | blank leaves workflow-definition signing off |
+| `MCP_ALLOWED_CRATE_DEPENDENCIES_EXTRA` | the documented escape hatch for the compile allowlist |
+
+Plaid is controller-only, deliberately: the worker is credential-free, and a
+module reaches Plaid through `vault://` BODY substitution (package EE), never an
+env key.
+
+Transport is **inert when unset** — `${VAR:-}` renders empty and `talos_config`
+treats empty as unset (check 73) — so adding a variable to the map cannot change
+the behaviour of a deployment that does not set it. That is what makes this a
+safe change rather than a config change.
+
+Opted out, each with the reason it already had in the compose file:
+
+* `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` and `OTEL_EXPORTER_OTLP_ENDPOINT` — check
+  69's `JAEGER_ENDPOINT` prohibition. These two are exactly the fallbacks
+  `talos_trace::endpoint_from_env` consults when `JAEGER_ENDPOINT` is unset, so
+  transporting them reopens trace export through the back door that prohibition
+  closes.
+* `S3_ACCESS_KEY_ID` — *"Those are unset here on purpose — the host functions
+  answer `NotConfigured`"*, stated in the worker block one paragraph above the
+  marker.
+
+### Two findings against the check itself
+
+Both came from running it, not from reasoning about it, and both are worth more
+than the fix.
+
+**(a) A comment is not transport.** The check's first run was green. It was green
+because the NOTE written two steps earlier — saying `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`
+is *deliberately NOT here* — made the variable read as PRESENT. The check
+shipped green over its own documented exemption, which is checks 73 and 87's
+self-report trap reproduced inside the guard for a different class. Comments are
+now stripped before the transport scan and read only for the opt-out marker; the
+strip is line-level and blunt, so a `#` inside a quoted value loses the tail,
+which can only ADD findings.
+
+Stripping them immediately surfaced `S3_ACCESS_KEY_ID`, which the first
+measurement had counted as transported for the same reason.
+
+**(b) The any-surface rule let one deployment vouch for another.** A mutation
+removing `PLAID_SECRET` from `docker-compose.yml` SURVIVED, because the chart
+still named it — while the original defect, an operator's `.env` reaching
+nothing on the compose stack, was fully restored. `.env` is the COMPOSE
+mechanism, so the rule is now two legs checked separately.
+
+Measured before splitting, so the second leg's shape is evidence rather than
+guesswork: 19 of the 22 are in both families, 3 are opted out, and **2 are
+compose + installer** — `TALOS_CONTROLLER_PUBLIC_KEY` and
+`TALOS_WORKER_PUBLIC_KEYS`, because RFC 0010 worker trust is staged into the
+bootstrap Secret by `deploy/k3s/lib/worker-trust.sh` and is deliberately not in
+the chart YAML. Requiring "compose AND chart" would have reported both; the leg
+accepts chart OR installer for that reason.
+
+### Guards
+
+**8 on pristine `origin/main`, 0 after, 3 opt-outs.** Seven mutations applied,
+each confirmed landed by hash and byte-reverted, **seven caught**: a var removed
+from compose, opt-outs read from the stripped text, comment stripping removed, a
+row with a real default counted as no-default, the doc table format moved, a
+surface family missing, and the reader scan matching nothing.
+
+Plus a **control**: removing the var AND dropping the compose leg is green,
+which proves the T1 finding belongs to the leg rather than to the tree.
+
+**One mutation is recorded as INVALID rather than counted.** Dropping the compose
+leg on its own changes nothing, because a clean tree has no defect for that leg
+to catch — it proves nothing and had to be paired with the defect to mean
+anything. A mutation that cannot fail is not evidence, in the same way a
+mutation that does not compile is not.
+
+### Stated limits
+
+* TEXTUAL: a variable whose name is assembled at runtime, or carried by a surface
+  outside the two families, is invisible.
+* The cluster leg proves the name appears in the chart/installer family, **not**
+  that a particular file carries it. Removing `PLAID_SECRET` from `values.yaml`
+  while `$secretKeys` still names it SURVIVES this check — chart parity is check
+  89(d)'s job and the render is check 5's.
+* The Default cell is prose, so a row that expresses "no default" some other way
+  than `none` is out of range.
+* It proves a name is present in a deployment surface, never that it reaches the
+  right process or carries a sane value.
