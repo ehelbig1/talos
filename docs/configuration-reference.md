@@ -286,6 +286,9 @@ the env vars above are fallbacks only. See CLAUDE.md "LLM key resolution".
 | `GOOGLE_CLOUD_CLIENT_ID` / `GOOGLE_CLOUD_CLIENT_SECRET` / `GOOGLE_CLOUD_REDIRECT_URI` | none (fall back to `GOOGLE_*`) | talos-google-cloud | GCP OAuth client credentials + redirect | 🔒 (id/secret) |
 | `GCP_PUBSUB_AUDIENCE` | none (optional) | controller | JWT audience for GCP Pub/Sub push verification | 🔒 |
 | `SLACK_CLIENT_ID` / `SLACK_CLIENT_SECRET` / `SLACK_REDIRECT_URI` | none | talos-slack | Slack OAuth credentials + redirect | 🔒 (id/secret) |
+| `PLAID_CLIENT_ID` | none | talos-plaid | Plaid app client id. Not secret (it appears in Link tokens), but set alongside the other two or the integration refuses to start. | |
+| `PLAID_SECRET` | none | talos-plaid | Plaid API secret for the environment named by `PLAID_ENV`. Plaid issues a DIFFERENT secret per environment. | 🔒 |
+| `PLAID_ENV` | none | talos-plaid | Exactly `sandbox` or `production` — it selects the API host. There is NO default: sandbox would make a production deployment silently read nothing, and production would point a real credential at real banks because a variable was misspelt. `development` is not accepted (Plaid retired it). All three unset = integration off; a partial or unrecognised setting is a hard error naming which variable is wrong. | |
 | `ATLASSIAN_CLIENT_ID` / `ATLASSIAN_CLIENT_SECRET` / `ATLASSIAN_REDIRECT_URI` | none | talos-atlassian | Atlassian OAuth credentials + redirect | 🔒 (id/secret) |
 | `EMAIL_API_URL` | none (optional) | worker | Outbound email API URL (host function) | |
 | `EMAIL_API_KEY` | none (optional) | worker | Email API key | 🔒 |

@@ -122,6 +122,7 @@ talos-actor-policies = { path = "../talos-actor-policies" }
 talos-templates = { path = "../talos-templates" }
 talos-llm = { path = "../talos-llm" }
 talos-atlassian = { path = "../talos-atlassian" }
+talos-plaid = { path = "../talos-plaid" }
 talos-slack = { path = "../talos-slack" }
 talos-compilation = { path = "../talos-compilation" }
 talos-integration-helpers = { path = "../talos-integration-helpers" }

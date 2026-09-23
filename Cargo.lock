@@ -1849,6 +1849,7 @@ dependencies = [
  "talos-oauth",
  "talos-ops-alerts-repository",
  "talos-organizations",
+ "talos-plaid",
  "talos-public-url",
  "talos-push-channel-inventory",
  "talos-rate-limit",
@@ -9213,6 +9214,21 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "talos-plaid"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "talos-http-body",
+ "talos-http-utils",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
