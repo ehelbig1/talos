@@ -109,6 +109,40 @@ async fn start_replica(url: &str, ids: &Ids) -> Replica {
     Replica { pool, rx, _db: db }
 }
 
+/// Both replicas' row counts, once the fleet total reaches `expected` or the
+/// deadline passes.
+///
+/// The broadcast channel and the persist subscription are DIFFERENT NATS
+/// subscriptions on different tasks, so `drain` going quiet says nothing about
+/// whether the INSERTs have landed — waiting on one and asserting on the other
+/// is a race, and it is the race that failed this test on a loaded CI runner
+/// (16 of 50 rows, 8 per replica, with every broadcast already delivered).
+/// The orphan-counter assertion below this already polls for exactly this
+/// reason; the row assertions did not.
+///
+/// This changes no assertion: a relay that genuinely drops or duplicates a
+/// line still fails, with the same message, after the deadline.
+async fn rows_until(
+    a: &sqlx::Pool<sqlx::Postgres>,
+    b: &sqlx::Pool<sqlx::Postgres>,
+    table: &str,
+    exec: Uuid,
+    like: &str,
+    expected: i64,
+) -> (i64, i64) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let (ra, rb) = (
+            rows(a, table, exec, like).await,
+            rows(b, table, exec, like).await,
+        );
+        if ra + rb >= expected || tokio::time::Instant::now() >= deadline {
+            return (ra, rb);
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 async fn rows(pool: &sqlx::Pool<sqlx::Postgres>, table: &str, exec: Uuid, like: &str) -> i64 {
     // `table` is one of two literals below, never input.
     sqlx::query_scalar(&format!(
@@ -262,20 +296,37 @@ async fn two_replicas_store_each_line_once_and_both_broadcast_it() {
     let b_lines = drain(&mut b.rx, "] line ").await;
     // `drain` already waited out 400 ms of quiet on each channel.
 
-    let wf_a = rows(&a.pool, "workflow_execution_logs", ids.wf_exec, "line %").await;
-    let wf_b = rows(&b.pool, "workflow_execution_logs", ids.wf_exec, "line %").await;
+    let (wf_a, wf_b) = rows_until(
+        &a.pool,
+        &b.pool,
+        "workflow_execution_logs",
+        ids.wf_exec,
+        "line %",
+        LINES as i64,
+    )
+    .await;
     assert_eq!(
         wf_a + wf_b,
         LINES as i64,
-        "each workflow log line is stored by exactly one replica (a={wf_a}, b={wf_b})"
+        "each workflow log line is stored by exactly one replica (a={wf_a}, b={wf_b}); \
+         broadcasts delivered a={a_lines} b={b_lines} of {LINES} — if the broadcasts are \
+         COMPLETE the persist INSERTs merely lagged past the wait, and if they are SHORT \
+         the broker dropped messages to a slow consumer, which is a different defect"
     );
     assert!(
         wf_a > 0 && wf_b > 0,
         "both replicas are members (a={wf_a}, b={wf_b})"
     );
 
-    let mod_a = rows(&a.pool, "module_execution_logs", ids.mod_exec, "modline %").await;
-    let mod_b = rows(&b.pool, "module_execution_logs", ids.mod_exec, "modline %").await;
+    let (mod_a, mod_b) = rows_until(
+        &a.pool,
+        &b.pool,
+        "module_execution_logs",
+        ids.mod_exec,
+        "modline %",
+        LINES as i64,
+    )
+    .await;
     assert_eq!(
         mod_a + mod_b,
         LINES as i64,

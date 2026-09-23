@@ -307,6 +307,7 @@ pub enum WsHandshakeOutcome {
     InvalidUserId,
     ProtocolViolation,
     InitNotReceived,
+    ClosedBeforeInit,
 }
 
 impl WsHandshakeOutcome {
@@ -320,6 +321,7 @@ impl WsHandshakeOutcome {
         Self::InvalidUserId,
         Self::ProtocolViolation,
         Self::InitNotReceived,
+        Self::ClosedBeforeInit,
     ];
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -332,7 +334,15 @@ impl WsHandshakeOutcome {
             Self::InvalidToken => "invalid_token",
             Self::InvalidUserId => "invalid_user_id",
             Self::ProtocolViolation => "protocol_violation",
+            // The deadline elapsed with the socket still open. NARROWED by
+            // this package: it previously also counted a client that closed
+            // before connection_init, which is now `closed_before_init`. No
+            // series was removed and nothing alerts on either.
             Self::InitNotReceived => "init_not_received",
+            // The client went away before connection_init — an ordinary
+            // browser reconnect or navigation, not a deadline and not a
+            // refusal.
+            Self::ClosedBeforeInit => "closed_before_init",
         }
     }
     /// A refusal the operator reads as a security signal (as opposed to a

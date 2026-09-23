@@ -78,6 +78,23 @@ pub fn classify_auth(
 /// holds the user id. `detail` is bounded to 256 bytes before it is logged —
 /// it is caller-influenced (an Origin string, a verifier error) and never a
 /// token.
+/// How the pre-`connection_init` phase ended, as a pure decision.
+///
+/// `client_left` is true when the socket closed or its stream ended before a
+/// `connection_init` arrived; false when the deadline elapsed with the socket
+/// still open. The two are different events for an operator and are the whole
+/// reason this is not one outcome: a client that goes away is ordinary browser
+/// behaviour, while a client that connects and holds a slot in silence is
+/// worth looking at. Swapping the arms would put a WARN back on every
+/// abandoned reconnect, which is what this package removed.
+const fn pre_init_ending(client_left: bool) -> WsHandshakeOutcome {
+    if client_left {
+        WsHandshakeOutcome::ClosedBeforeInit
+    } else {
+        WsHandshakeOutcome::InitNotReceived
+    }
+}
+
 fn report_handshake(outcome: WsHandshakeOutcome, detail: Option<&str>) {
     talos_metrics::record_ws_handshake(outcome);
     let detail = detail.map(|d| {
@@ -101,12 +118,26 @@ fn report_handshake(outcome: WsHandshakeOutcome, detail: Option<&str>) {
             outcome = outcome.as_str(),
             "WebSocket first message was not connection_init — closing"
         ),
+        // The deadline elapsed with the socket still OPEN: the client
+        // connected and then said nothing for the full window, holding a
+        // connection slot. That is worth an operator's attention.
         WsHandshakeOutcome::InitNotReceived => tracing::warn!(
             target: "talos_ws_auth",
             event_kind = "ws_init_not_received",
             outcome = outcome.as_str(),
             pending_refusal = detail,
-            "WebSocket closed without observing connection_init within deadline"
+            "WebSocket sent no connection_init before the handshake deadline elapsed"
+        ),
+        // The client went away before connection_init. An ordinary browser
+        // reconnect that is superseded, or a navigation — the control working,
+        // not a finding. DEBUG for the same reason `no_token` is: the counter
+        // carries it, and a WARN here fires on healthy client behaviour.
+        WsHandshakeOutcome::ClosedBeforeInit => tracing::debug!(
+            target: "talos_ws_auth",
+            event_kind = "ws_closed_before_init",
+            outcome = outcome.as_str(),
+            pending_refusal = detail,
+            "WebSocket closed by the client before connection_init"
         ),
         refusal => tracing::warn!(
             target: "talos_audit",
@@ -194,8 +225,33 @@ pub async fn handle_websocket_auth(
     // at all" case). Track explicitly and refuse to continue if init
     // was never observed.
     let mut init_received = false;
-    while let Ok(Some(msg)) = tokio::time::timeout_at(init_deadline, socket.recv()).await {
-        if let Ok(msg) = msg {
+    // Track HOW the pre-init phase ended. A client that CLOSES before sending
+    // connection_init (an ordinary browser reconnect that is superseded, or a
+    // navigation) and a client that holds the socket open and says nothing for
+    // the full deadline are different events with different operator value.
+    // Collapsing them made every abandoned reconnect emit a WARN whose message
+    // claimed the deadline had elapsed — measured on deploy 124 as the
+    // controller's ONLY WARN, logged 535 microseconds after that same socket
+    // authenticated. A level that fires on ordinary client behaviour trains
+    // operators to ignore the level (check 69).
+    let mut client_left = false;
+    loop {
+        let received = tokio::time::timeout_at(init_deadline, socket.recv()).await;
+        let msg = match received {
+            // Deadline elapsed with the socket still open: the client
+            // connected and then went silent. This is the case worth a WARN.
+            Err(_) => break,
+            // The stream ended — the client went away.
+            Ok(None) => {
+                client_left = true;
+                break;
+            }
+            // Transport error mid-handshake. Unchanged from before this
+            // package: keep waiting, bounded by the same deadline.
+            Ok(Some(Err(_))) => continue,
+            Ok(Some(Ok(m))) => m,
+        };
+        {
             match msg {
                 Message::Text(text) => {
                     // L-21: graphql-ws protocol REQUIRES `connection_init`
@@ -260,8 +316,9 @@ pub async fn handle_websocket_auth(
                     }
                 }
                 Message::Close(_) => {
-                    // Left before connection_init: the same ending as the
-                    // deadline, reported below.
+                    // The client closed before connection_init. Ordinary
+                    // browser behaviour, and explicitly NOT the deadline.
+                    client_left = true;
                     break;
                 }
                 _ => {}
@@ -283,7 +340,7 @@ pub async fn handle_websocket_auth(
             .as_ref()
             .err()
             .map(|(refusal, _)| refusal.as_str());
-        report_handshake(WsHandshakeOutcome::InitNotReceived, pending);
+        report_handshake(pre_init_ending(client_left), pending);
         let _ = socket.close().await;
         return;
     }
@@ -691,6 +748,21 @@ mod handshake_classification_tests {
         );
     }
 
+    /// A client that goes away and a client that goes silent must not render
+    /// as the same event. The direction matters: swapping the arms restores
+    /// the WARN on every abandoned reconnect that this package removed.
+    #[test]
+    fn a_client_that_left_is_not_the_deadline_elapsing() {
+        use super::pre_init_ending;
+        assert_eq!(pre_init_ending(true), O::ClosedBeforeInit);
+        assert_eq!(pre_init_ending(false), O::InitNotReceived);
+        assert_ne!(pre_init_ending(true), pre_init_ending(false));
+        // Neither is a security refusal — a socket that never identified
+        // itself has told the operator nothing about an attacker.
+        assert!(!O::ClosedBeforeInit.is_security_refusal());
+        assert!(!O::InitNotReceived.is_security_refusal());
+    }
+
     /// TEXTUAL pin, stated as such: the handshake reports through ONE site
     /// and every outcome is reachable from production code; the session end
     /// and the operation outcomes are recorded at their arms. The production
@@ -713,6 +785,7 @@ mod handshake_classification_tests {
             "InvalidUserId",
             "ProtocolViolation",
             "InitNotReceived",
+            "ClosedBeforeInit",
             "Authenticated",
         ] {
             assert!(
@@ -739,6 +812,64 @@ mod handshake_classification_tests {
             5
         );
         assert_eq!(production.matches("WsActiveSession::open()").count(), 1);
+    }
+
+    /// TEXTUAL pin, stated as such, and the ONLY guard on the call site.
+    ///
+    /// `pre_init_ending` is a pure function and its own test cannot see
+    /// whether the loop ever passes it `true` — reverting the `Message::Close`
+    /// arm so it breaks WITHOUT setting `client_left` restores the defect in
+    /// full (an explicit client close reported as the deadline, at WARN) and
+    /// survived every behavioural test in this crate. Driving the loop would
+    /// mean making `handle_websocket_auth` generic over its socket the way
+    /// package DV did for the session, plus a real schema and `AuthService`;
+    /// that is a refactor of an auth path and is NOT done here, so this pin
+    /// and the stated limit are what stand in its place.
+    #[test]
+    fn both_client_endings_mark_the_pre_init_phase_as_left() {
+        let src = include_str!("lib.rs");
+        let production = &src[..src.find("mod handshake_classification_tests").unwrap()];
+        assert_eq!(
+            production.matches("client_left = true;").count(),
+            2,
+            "expected exactly two endings to mark the client as gone — the \
+             explicit Close arm and the stream-ended arm. A missing one reports \
+             that ending as the deadline elapsing, at WARN, which is the defect \
+             this package removed."
+        );
+        // The deadline arm must NOT mark it: that is the whole distinction.
+        let deadline_arm = production
+            .find("Err(_) => break,")
+            .expect("the deadline arm must break without marking the client as gone");
+        assert!(
+            !production[deadline_arm..deadline_arm + 40].contains("client_left"),
+            "the deadline arm must not mark the client as having left"
+        );
+    }
+
+    /// TEXTUAL pin, stated as such: the LEVEL each pre-init ending reports
+    /// at. A client that went away must stay at debug and the elapsed
+    /// deadline must stay at warn — reverting either is the defect this
+    /// package removed (a WARN on every abandoned browser reconnect), and no
+    /// behavioural test in this workspace can observe a tracing level.
+    #[test]
+    fn the_pre_init_endings_keep_their_levels() {
+        let src = include_str!("lib.rs");
+        let production = &src[..src.find("mod handshake_classification_tests").unwrap()];
+        let arm = |variant: &str| {
+            let at = production
+                .find(&format!("WsHandshakeOutcome::{variant} => tracing::"))
+                .unwrap_or_else(|| panic!("{variant} has no report arm"));
+            production[at..at + 80].to_string()
+        };
+        assert!(
+            arm("ClosedBeforeInit").contains("tracing::debug!"),
+            "a client leaving before connection_init is ordinary; a WARN here fires on healthy clients"
+        );
+        assert!(
+            arm("InitNotReceived").contains("tracing::warn!"),
+            "the deadline elapsing with the socket open is the case worth an operator's attention"
+        );
     }
 }
 
