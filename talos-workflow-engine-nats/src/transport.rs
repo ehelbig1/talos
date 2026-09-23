@@ -174,16 +174,52 @@ pub(crate) fn no_responders_error_for(
     topic: &str,
 ) -> Option<BoxError> {
     if status == Some(async_nats::StatusCode::NO_RESPONDERS) {
-        return Some(
-            format!(
-                "no responders on '{topic}': no worker was subscribed when the \
-                 job was published (NATS 503). The job was delivered to nobody, \
-                 so it is safe to retry."
-            )
-            .into(),
-        );
+        return Some(Box::new(NoRespondersError {
+            topic: topic.to_string(),
+        }));
     }
     None
+}
+
+/// The NATS server answered a request with **503 No Responders**: zero
+/// subscribers on the subject at publish time.
+///
+/// A distinct TYPE rather than a formatted string because the dispatcher's
+/// liveness allowance has to recognise this condition, and recognising it by
+/// matching the operator-facing prose would make a reworded message silently
+/// reclassify a delivery failure — the exact hazard
+/// `talos_workflow_job_protocol::verify_failure_class` was rewritten to escape
+/// on the other side of the wire. [`Display`](std::fmt::Display) still renders
+/// the same sentence, so the operator-visible text is unchanged and every
+/// existing consumer that only prints the error is unaffected.
+#[derive(Debug)]
+pub(crate) struct NoRespondersError {
+    /// The subject that had no subscribers. Named in the message because the
+    /// attribution is the whole point: the fleet, not the module's output.
+    pub(crate) topic: String,
+}
+
+impl std::fmt::Display for NoRespondersError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "no responders on '{}': no worker was subscribed when the job was \
+             published (NATS 503). The job was delivered to nobody, so it is \
+             safe to retry.",
+            self.topic
+        )
+    }
+}
+
+impl std::error::Error for NoRespondersError {}
+
+/// Was this delivery failure a 503 No Responders?
+///
+/// Downcast, never a substring test. Returns false for every other transport
+/// error, including a connection drop — a message that MAY have reached a
+/// worker is not one this can call safe.
+pub(crate) fn is_no_responders(e: &BoxError) -> bool {
+    e.downcast_ref::<NoRespondersError>().is_some()
 }
 
 #[cfg(test)]

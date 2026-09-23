@@ -104,6 +104,219 @@ pub(crate) fn get_pipeline_job_topic(user_id: Option<Uuid>, priority: u8) -> Str
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// Liveness re-dispatch — a job that was never executed is not a module error
+// ─────────────────────────────────────────────────────────────────────
+
+/// Why a dispatch came back without the module having run.
+///
+/// Both arms mean the SAME thing about safety — nothing executed, so re-sending
+/// cannot duplicate a side effect — and different things about timing, which is
+/// the only reason they are distinguished at all (see
+/// [`LivenessCause::base_backoff_ms`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LivenessCause {
+    /// The worker answered, and its answer was "this dispatch is older than my
+    /// freshness window; I refused it before evaluating its signature".
+    /// `talos_workflow_job_protocol::JobResult::is_pre_execution_rejection`.
+    StaleDispatch,
+    /// The NATS server answered 503: nobody was subscribed to the job subject
+    /// when the message was published, so it reached no worker at all.
+    NoResponders,
+}
+
+impl LivenessCause {
+    /// Stable token for logs and `execution_events.error_class`.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::StaleDispatch => "stale_dispatch",
+            Self::NoResponders => "no_responders",
+        }
+    }
+
+    /// Base backoff for this cause, in milliseconds — DERIVED from what the
+    /// cause says about the fleet, not picked for symmetry.
+    ///
+    /// `StaleDispatch`: the worker replied, so it is running and subscribed
+    /// right now. The dispatch was stale because this host's wall clock jumped
+    /// (measured 2026-09-18..20: eleven such failures, workflow wall-clock
+    /// spans of 13–82 minutes, the signature of a suspended VM whose monotonic
+    /// deadline never advanced while the worker's wall-clock freshness check
+    /// did). Nothing needs waiting for; a short pause only absorbs a clock
+    /// still settling after resume.
+    ///
+    /// `NoResponders`: nobody is subscribed, and the thing to wait for is a
+    /// worker roll. Sized from the failure that motivated this: on 2026-09-22 a
+    /// node exhausted its three ordinary retries across 35 s inside a deploy's
+    /// worker restart and failed anyway, so a sequence that tops out below that
+    /// would be theatre. At [`LIVENESS_REDISPATCH_MAX`] this gives
+    /// 10 s + 20 s + 40 s ≈ 70 s of coverage before jitter — comfortably past
+    /// the measured roll, and still bounded by the workflow budget, which
+    /// `clamp_attempt_timeout` re-checks at the top of every attempt.
+    pub(crate) fn base_backoff_ms(self) -> u64 {
+        match self {
+            Self::StaleDispatch => 1_000,
+            Self::NoResponders => 10_000,
+        }
+    }
+}
+
+/// How many times one node may be re-dispatched for a LIVENESS failure, over
+/// and above whatever module-error retries its graph declares.
+///
+/// A CONSTANT, deliberately not a knob: this is not a policy an author should
+/// tune per node, it is the platform absorbing its own transport and its own
+/// deploys. Three is the smallest number that spans a worker roll at
+/// [`LivenessCause::base_backoff_ms`]'s `NoResponders` backoff; more would keep
+/// re-sending into an outage that a failed node reports better than a hung one.
+///
+/// Deliberately INDEPENDENT of the node's `max_retries`. `max_retries` is the
+/// author's budget for errors the MODULE produced, and 10 of the 11 stale
+/// rejections measured on the reference fleet were refused by a
+/// `retry_condition` written to judge Gmail responses — a predicate that had
+/// never been shown a transport event and answered "no" for a job that had not
+/// run. One of the remaining two had `max_retries: 0`, i.e. an author's
+/// decision that the module must run at most once, which a re-dispatch of a job
+/// that never ran does not violate.
+pub(crate) const LIVENESS_REDISPATCH_MAX: u32 = 3;
+
+/// The `dispatch_attempt` index to stamp on the NEXT send of this job.
+///
+/// ONE formula, and it has to be, because two independent counters drive a
+/// re-send: `attempts` (module errors, measured against the node's
+/// `max_retries`) and `liveness_redispatches` (jobs that never ran, measured
+/// against [`LIVENESS_REDISPATCH_MAX`]). They are separate by design — see
+/// that constant — and a run that hits one of each must still stamp a strictly
+/// increasing index.
+///
+/// Getting this wrong is not a cosmetic off-by-one. The worker is
+/// credential-free, so it opens a fresh audit chain per dispatch and the
+/// offline verifier PARTITIONS a WORM prefix by this index; two sends sharing
+/// one index put two chains in one partition, which the verifier reports as
+/// `DuplicateSequence` — positive tamper evidence for a job that was merely
+/// re-sent. That is the 2026-09-14 OAuth-repair defect, and the first draft of
+/// the liveness path reproduced it: the module-error branch stamped
+/// `base + attempts` while the liveness branch stamped
+/// `base + attempts + liveness`, so a stale rejection followed by a module
+/// failure stamped index 1 twice. Pinned by
+/// `interleaved_failures_never_reuse_a_dispatch_attempt`.
+fn next_dispatch_attempt(base: u32, module_error_retries: u32, liveness_redispatches: u32) -> u32 {
+    base.saturating_add(module_error_retries)
+        .saturating_add(liveness_redispatches)
+}
+
+/// Spend one [`LIVENESS_REDISPATCH_MAX`] allowance on a job that never ran.
+///
+/// Returns `true` when the caller should loop and send again (the payload has
+/// been re-signed in place and the backoff slept), `false` when the allowance
+/// is spent and the caller should fall through to its ordinary failure
+/// handling. ONE body for both call sites — the application-failure branch (a
+/// worker that refused the dispatch on age) and the delivery branch (a 503 with
+/// no subscriber) — because they are one rule: *the module did not run, so
+/// module-error policy does not apply*. Two copies would be the way the second
+/// site silently stops honouring it.
+///
+/// # What it deliberately does not touch
+///
+/// * The `attempts` counter, and therefore `max_retries`. See
+///   [`LIVENESS_REDISPATCH_MAX`].
+/// * The attempt window. `clamp_attempt_timeout` runs at the top of every
+///   iteration and is the one home for that arithmetic
+///   (`talos_workflow_engine_core::attempt_window`); a re-dispatch that no
+///   longer fits the workflow budget is refused there, with the existing
+///   `budget_exhausted_message`, exactly as an ordinary retry is. This function
+///   must not re-derive it.
+///
+/// The re-sign is not incidental: it mints a fresh nonce, the nonce carries the
+/// timestamp the receiver's freshness window is measured from, and
+/// `dispatch_attempt` is stamped BEFORE signing so the worker opens its audit
+/// chain in a new partition rather than writing a second chain under the first
+/// attempt's prefix (2026-09-14, the OAuth-repair defect). The attempt index
+/// passed here therefore counts BOTH kinds of re-send, so it stays monotonic
+/// across a node that hits a liveness failure and a module error in one run.
+#[allow(clippy::too_many_arguments)]
+async fn try_liveness_redispatch(
+    cause: LivenessCause,
+    liveness_redispatches: &mut u32,
+    current_payload: &mut Vec<u8>,
+    attempt_base: u32,
+    module_error_attempts: u32,
+    worker_shared_key: Option<&[u8]>,
+    event_sink: &Option<Arc<dyn EventSink>>,
+    event_execution_id: Uuid,
+    event_node_id: Uuid,
+    detail: &str,
+) -> bool {
+    if *liveness_redispatches >= LIVENESS_REDISPATCH_MAX {
+        tracing::warn!(
+            event_kind = "liveness_redispatch_exhausted",
+            cause = cause.as_str(),
+            liveness_redispatches = *liveness_redispatches,
+            "job was never executed, but the liveness re-dispatch allowance is spent: {}",
+            detail
+        );
+        return false;
+    }
+    *liveness_redispatches += 1;
+    let delay = backoff_delay_ms(cause.base_backoff_ms(), *liveness_redispatches);
+    // INFO, not WARN, and the split is the house rule rather than taste: a
+    // re-dispatch that then succeeds is this control WORKING — the platform
+    // absorbing its own transport and its own deploys — and a line that fires
+    // when a control does its job trains operators to ignore the level (check
+    // 69; #787 demoted the rank-training truncation for exactly this and kept
+    // its failure at WARN). The EXHAUSTION above stays WARN, because there the
+    // recovery did not work and the node is about to fail. Both keep every
+    // field, and `execution_events` carries the durable record at either level.
+    tracing::info!(
+        event_kind = "liveness_redispatch",
+        cause = cause.as_str(),
+        liveness_redispatch = *liveness_redispatches,
+        max = LIVENESS_REDISPATCH_MAX,
+        backoff_ms = delay,
+        "job was never executed — re-dispatching (this is a transport/liveness \
+         failure, not a module error): {}",
+        detail
+    );
+    // `node_retrying` so `retries_attempted` in `get_execution_trace` keeps
+    // counting attempt boundaries, with `error_class` naming the cause so an
+    // operator can tell a re-dispatch of a job that never ran from a retry of a
+    // module that failed. This is the durable record: `talos-workflow-engine-nats`
+    // has no `talos-metrics` dependency (it reaches that crate only transitively,
+    // through `talos-workflow-engine`, which Rust does not permit a `use` for),
+    // and the 2026-09-06 attempt-window package already declined to add that
+    // dependency edge for a series. Same crate, same argument — so this cause is
+    // queryable from `execution_events`, and stated plainly as not alertable.
+    emit_event_spawn(
+        event_sink,
+        NodeEventWrite {
+            execution_id: event_execution_id,
+            event_type: "node_retrying".to_string(),
+            node_id: Some(event_node_id),
+            status: "Running".to_string(),
+            log_message: Some(format!(
+                "Liveness re-dispatch {} of {} ({}) — the job was never executed",
+                *liveness_redispatches,
+                LIVENESS_REDISPATCH_MAX,
+                cause.as_str()
+            )),
+            iteration_index: Some(i32::try_from(*liveness_redispatches).unwrap_or(i32::MAX)),
+            error_class: Some(format!("liveness:{}", cause.as_str())),
+            // An attempt boundary, not a node completion — like every other
+            // `node_retrying`, ignored by the trigger.
+            duration_ms: None,
+        },
+    );
+    if let Some(key) = worker_shared_key {
+        let attempt =
+            next_dispatch_attempt(attempt_base, module_error_attempts, *liveness_redispatches);
+        if let Some(bytes) = resign_payload_for_retry(current_payload, key, attempt) {
+            *current_payload = bytes;
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+    true
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Retry backoff — one implementation, four call sites
 // ─────────────────────────────────────────────────────────────────────
 
@@ -462,6 +675,12 @@ pub(crate) async fn execute_job_with_retry(
     budget_secs: Option<u64>,
 ) -> Result<serde_json::Value, String> {
     let mut attempts: u32 = 0;
+    // Re-dispatches spent on LIVENESS failures — a job the receiver refused
+    // before running it, or one that reached no worker at all. Separate from
+    // `attempts` because that one is measured against the node's `max_retries`,
+    // which is the author's budget for MODULE errors. See
+    // `LIVENESS_REDISPATCH_MAX`.
+    let mut liveness_redispatches: u32 = 0;
     // The `job_id` this loop dispatched, read ONCE off the signed payload so
     // every reply can be checked against it (the retry re-sign keeps the id).
     // An unparseable payload cannot have been signed by `dispatch_single`, so
@@ -686,6 +905,58 @@ pub(crate) async fn execute_job_with_retry(
                 if is_success {
                     return Ok(job_result.output_payload.into_value());
                 } else {
+                    // LIVENESS first — before `retry_condition`, before the
+                    // heuristic classifier, before `max_retries`.
+                    //
+                    // A result carrying a pre-execution rejection class is the
+                    // worker saying it refused this DISPATCH on age, above the
+                    // signature check and ~280 lines before it loads the
+                    // module: nothing ran. Every gate below it judges a MODULE
+                    // error, and each of them answered wrongly for this on the
+                    // reference fleet over the 30 days to 2026-09-22 — ten of
+                    // eleven such failures were refused by a `retry_condition`
+                    // authored to read Gmail responses, and the eleventh by a
+                    // `max_retries: 0`. `talos_retry_intelligence::classify_error`
+                    // would have been no better: it has no liveness class at
+                    // all, so its answer is `unknown`, i.e. non-transient.
+                    //
+                    // Note what is NOT reached from here. A result the
+                    // CONTROLLER could not verify — including one that aged out
+                    // in flight, the case where the module DID run — returns
+                    // above, at the `verify_dispatch` arm, and never enters this
+                    // branch. The two are separate code paths, not two readings
+                    // of one string: `is_pre_execution_rejection` matches a
+                    // closed token set the receiver stamped, never prose.
+                    if job_result.is_pre_execution_rejection() {
+                        let detail = job_result
+                            .output_payload
+                            .value()
+                            .get("error")
+                            .and_then(|e| e.as_str())
+                            .unwrap_or("dispatch rejected before execution")
+                            .to_string();
+                        if try_liveness_redispatch(
+                            LivenessCause::StaleDispatch,
+                            &mut liveness_redispatches,
+                            &mut current_payload,
+                            attempt_base,
+                            attempts,
+                            worker_shared_key,
+                            &event_sink,
+                            event_execution_id,
+                            event_node_id,
+                            &detail,
+                        )
+                        .await
+                        {
+                            continue;
+                        }
+                        return Err(format!(
+                            "Job failed after {} liveness re-dispatch(es): {}",
+                            liveness_redispatches, detail
+                        ));
+                    }
+
                     // Application-level failure — check retry_condition before retrying.
                     // Default to retry (true) on evaluation error: retry_condition is meant to
                     // BLOCK retrying in known-permanent-error scenarios. If the condition can't
@@ -875,10 +1146,14 @@ pub(crate) async fn execute_job_with_retry(
                         // `attempts` was incremented above, so the first retry
                         // is `attempt_base + 1` — the first send is the base
                         // (0 for every dispatch but a re-dispatch).
+                        // `next_dispatch_attempt`, NOT `attempt_base + attempts`:
+                        // a liveness re-dispatch earlier in this same run has
+                        // already consumed indices, and re-using one puts two
+                        // chains in one audit partition. See that function.
                         current_payload = resign_payload_for_retry(
                             &current_payload,
                             key,
-                            attempt_base.saturating_add(attempts),
+                            next_dispatch_attempt(attempt_base, attempts, liveness_redispatches),
                         )
                         .unwrap_or(current_payload);
                     }
@@ -886,6 +1161,45 @@ pub(crate) async fn execute_job_with_retry(
                 }
             }
             Ok(Err(e)) => {
+                // LIVENESS first, for the one delivery failure that PROVES the
+                // job reached nobody: a 503 with zero subscribers on the
+                // subject. `is_no_responders` downcasts a typed error rather
+                // than matching the sentence, so rewording the operator text
+                // cannot silently reclassify it.
+                //
+                // Every OTHER delivery error stays on the ordinary path below.
+                // A connection drop may have delivered the message before it
+                // broke, so it is not one this can call safe — and widening
+                // this to "transport errors" would be exactly that mistake.
+                //
+                // Both of the measured cases were self-inflicted: a worker
+                // restart during a deploy. One had `max_retries: 0` and gave up
+                // after a single attempt in 5 s, the other exhausted three
+                // retries across 35 s while the roll was still in progress.
+                if crate::transport::is_no_responders(&e) {
+                    let detail = e.to_string();
+                    if try_liveness_redispatch(
+                        LivenessCause::NoResponders,
+                        &mut liveness_redispatches,
+                        &mut current_payload,
+                        attempt_base,
+                        attempts,
+                        worker_shared_key,
+                        &event_sink,
+                        event_execution_id,
+                        event_node_id,
+                        &detail,
+                    )
+                    .await
+                    {
+                        continue;
+                    }
+                    return Err(format!(
+                        "Job dispatch failed after {} liveness re-dispatch(es): {}",
+                        liveness_redispatches, detail
+                    ));
+                }
+
                 // NATS delivery failure — retry
                 attempts += 1;
                 if attempts > max_retries {
@@ -3357,5 +3671,487 @@ mod fuel_ceiling_pin_tests {
             talos_workflow_engine::DEFAULT_MAX_FUEL_PER_NODE,
             "MAX_JOB_FUEL (protocol) and DEFAULT_MAX_FUEL_PER_NODE (engine) must agree"
         );
+    }
+}
+
+#[cfg(test)]
+mod liveness_redispatch_tests {
+    //! Tests that drive the REAL `execute_job_with_retry` loop for a job that
+    //! was never executed.
+    //!
+    //! **On running these red against the original tree.** Every one of them
+    //! compiles there — the loop's signature is unchanged by this package — and
+    //! the two that carry the defect fail with the message the reference fleet
+    //! actually recorded: `a_stale_dispatch_is_not_judged_by_the_module_retry_condition`
+    //! with `Job failed (retry_condition not met)` (ten of the eleven measured
+    //! failures) and `no_responders_is_re_dispatched_past_max_retries` with
+    //! `Job dispatch failed after 1 attempts` (one of the two). They are a
+    //! pre/post comparison, not a synthetic mutation.
+    //!
+    //! `start_paused` runs the production backoffs — a `NoResponders` sequence
+    //! is 10 s + 20 s + 40 s — against tokio's virtual clock, so the real sleep
+    //! is exercised and the test is instant. Nothing is stubbed to make it fast.
+
+    use super::{execute_job_with_retry, LivenessCause, LIVENESS_REDISPATCH_MAX};
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use talos_workflow_engine_core::{
+        BoxError, ExpressionEvaluator, JobTransport, RetryClassifier,
+    };
+    use talos_workflow_job_protocol::{JobResult, JobStatus, VERIFY_CLASS_STALE_TIMESTAMP};
+
+    /// Stands in for `talos_retry_intelligence`: it has no liveness class, so
+    /// on the original tree a stale rejection classified as non-transient.
+    /// Here it answers TRANSIENT for everything, which is the *permissive*
+    /// direction — so a test that still shows exactly one send is showing the
+    /// liveness branch working, not this stub's charity.
+    struct AlwaysTransient;
+    impl RetryClassifier for AlwaysTransient {
+        fn classify(&self, _e: &str) -> String {
+            "transient".to_string()
+        }
+        fn is_transient(&self, _c: &str) -> bool {
+            true
+        }
+    }
+
+    /// Answers every `retry_condition` with the configured verdict.
+    struct FixedVerdict(bool);
+    impl ExpressionEvaluator for FixedVerdict {
+        fn eval_bool(&self, _e: &str, _c: &serde_json::Value) -> bool {
+            self.0
+        }
+        fn try_eval_bool(&self, _e: &str, _c: &serde_json::Value) -> Result<bool, BoxError> {
+            Ok(self.0)
+        }
+        fn eval_i64(&self, _e: &str, _c: &serde_json::Value) -> Option<i64> {
+            None
+        }
+        fn eval_json(
+            &self,
+            _e: &str,
+            _c: &serde_json::Value,
+        ) -> Result<serde_json::Value, BoxError> {
+            Ok(serde_json::Value::Null)
+        }
+    }
+
+    fn echo_job_id(payload: &[u8]) -> uuid::Uuid {
+        serde_json::from_slice::<talos_workflow_job_protocol::JobRequest>(payload)
+            .expect("test payload is a JobRequest")
+            .job_id
+    }
+
+    /// Byte-for-byte the shape `worker::signature_failure_payload` publishes
+    /// with `TALOS_SIGNATURE_DIAG` unset — which is the production default on
+    /// the reference fleet (measured 2026-09-22: `TALOS_SIGNATURE_DIAG=`).
+    fn stale_dispatch_result(job_id: uuid::Uuid) -> JobResult {
+        JobResult {
+            llm_usage: vec![],
+            crypto_scheme: 0,
+            job_id,
+            status: JobStatus::Failed,
+            output_payload: serde_json::json!({
+                "error": talos_workflow_job_protocol::verify_failure_headline(
+                    "Job dispatch",
+                    talos_workflow_job_protocol::VerifyFailureKind::Stale,
+                ),
+                "reason_class": VERIFY_CLASS_STALE_TIMESTAMP,
+            })
+            .into(),
+            logs: vec![],
+            execution_time_ms: 0,
+            signature: vec![],
+            result_nonce: String::new(),
+            worker_id: String::new(),
+        }
+    }
+
+    fn module_failure_result(job_id: uuid::Uuid) -> JobResult {
+        JobResult {
+            llm_usage: vec![],
+            crypto_scheme: 0,
+            job_id,
+            status: JobStatus::Failed,
+            output_payload: serde_json::json!({"error": "execution failure: upstream 502"}).into(),
+            logs: vec![],
+            execution_time_ms: 7,
+            signature: vec![],
+            result_nonce: String::new(),
+            worker_id: String::new(),
+        }
+    }
+
+    fn success_result(job_id: uuid::Uuid) -> JobResult {
+        JobResult {
+            llm_usage: vec![],
+            crypto_scheme: 0,
+            job_id,
+            status: JobStatus::Success,
+            output_payload: serde_json::json!({"ok": true}).into(),
+            logs: vec![],
+            execution_time_ms: 3,
+            signature: vec![],
+            result_nonce: String::new(),
+            worker_id: String::new(),
+        }
+    }
+
+    /// What a transport does on a given attempt.
+    #[derive(Clone, Copy)]
+    enum Reply {
+        StaleRejection,
+        ModuleFailure,
+        NoResponders,
+        OtherDeliveryError,
+        Success,
+    }
+
+    /// Replays a script of [`Reply`]s, recording every payload it was handed.
+    /// The last entry repeats once the script is exhausted, so an unbounded
+    /// loop shows up as a send count rather than a hang.
+    struct ScriptedTransport {
+        script: Vec<Reply>,
+        payloads: Arc<Mutex<Vec<Vec<u8>>>>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ScriptedTransport {
+        fn new(script: Vec<Reply>) -> Self {
+            Self {
+                script,
+                payloads: Arc::new(Mutex::new(Vec::new())),
+                calls: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+        fn sends(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl JobTransport for ScriptedTransport {
+        async fn request(&self, topic: &str, payload: Vec<u8>) -> Result<Vec<u8>, BoxError> {
+            let job_id = echo_job_id(&payload);
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            // A hard stop, so a loop that lost its bound FAILS instead of
+            // hanging. Under `start_paused` tokio advances the virtual clock
+            // whenever the runtime is idle, so an unbounded re-dispatch loop
+            // spins forever at full speed and the test never returns a verdict
+            // — and a mutation that hangs the harness is not a mutation the
+            // harness caught. Comfortably above any bounded run here.
+            assert!(
+                n < 32,
+                "transport asked for send {} — the dispatch loop is unbounded",
+                n + 1
+            );
+            self.payloads.lock().expect("lock").push(payload);
+            let reply = *self
+                .script
+                .get(n)
+                .or_else(|| self.script.last())
+                .expect("script is non-empty");
+            let jr = match reply {
+                Reply::StaleRejection => stale_dispatch_result(job_id),
+                Reply::ModuleFailure => module_failure_result(job_id),
+                Reply::Success => success_result(job_id),
+                // The PRODUCTION constructor, so a test cannot pass against a
+                // hand-rolled stand-in that `is_no_responders` would not
+                // recognise. `no_responders_error_for` is the only producer.
+                Reply::NoResponders => {
+                    return Err(crate::transport::no_responders_error_for(
+                        Some(async_nats::StatusCode::NO_RESPONDERS),
+                        topic,
+                    )
+                    .expect("503 must map to an error"))
+                }
+                Reply::OtherDeliveryError => return Err("broken pipe while awaiting reply".into()),
+            };
+            Ok(serde_json::to_vec(&jr).unwrap())
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run(
+        transport: &ScriptedTransport,
+        max_retries: u32,
+        retry_condition: Option<&str>,
+        condition_verdict: bool,
+    ) -> Result<serde_json::Value, String> {
+        let classifier = AlwaysTransient;
+        let evaluator = FixedVerdict(condition_verdict);
+        // A REAL signed request under a REAL key, so the re-sign path actually
+        // runs — passing `None` for the key would skip it silently.
+        let key = [9u8; 32];
+        let payload = super::resign_payload_tests::signed_request(&key);
+        execute_job_with_retry(
+            transport,
+            "talos.jobs".to_string(),
+            payload,
+            5,
+            max_retries,
+            1, // module-error base backoff — unrelated to the liveness one
+            Some(&key),
+            None,
+            retry_condition,
+            None,
+            None,
+            uuid::Uuid::nil(),
+            uuid::Uuid::nil(),
+            &classifier,
+            &evaluator,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// THE defect, in the shape ten of the eleven measured failures took.
+    ///
+    /// A node whose `retry_condition` says "do not retry" — written to judge
+    /// Gmail responses — is handed a worker's statement that it refused the
+    /// DISPATCH before running anything. On the original tree the predicate is
+    /// consulted and the run dies with `retry_condition not met`. The job never
+    /// ran, so there is nothing for a module-error predicate to have an opinion
+    /// about.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_dispatch_is_not_judged_by_the_module_retry_condition() {
+        let t = ScriptedTransport::new(vec![Reply::StaleRejection, Reply::Success]);
+        let out = run(&t, 0, Some("error.contains('rate limit')"), false).await;
+        assert_eq!(
+            out.expect("a job that never ran must be re-dispatched"),
+            serde_json::json!({"ok": true})
+        );
+        assert_eq!(t.sends(), 2, "exactly one re-dispatch");
+    }
+
+    /// The same shape the eleventh failure took: `max_retries: 0`.
+    ///
+    /// That zero is the author saying the MODULE must run at most once, and a
+    /// re-dispatch of a job that never ran does not violate it — which is the
+    /// whole argument for `LIVENESS_REDISPATCH_MAX` being independent.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_dispatch_is_re_dispatched_even_at_max_retries_zero() {
+        let t = ScriptedTransport::new(vec![Reply::StaleRejection, Reply::Success]);
+        assert!(run(&t, 0, None, true).await.is_ok());
+        assert_eq!(t.sends(), 2);
+    }
+
+    /// NEGATIVE CONTROL for both tests above: an ORDINARY module failure with
+    /// the same `max_retries: 0` and the same refusing predicate must still be
+    /// refused after one send. Without this, "the liveness branch works" is
+    /// indistinguishable from "the liveness branch swallowed the module path".
+    #[tokio::test(start_paused = true)]
+    async fn a_module_failure_still_obeys_the_retry_condition() {
+        let t = ScriptedTransport::new(vec![Reply::ModuleFailure, Reply::Success]);
+        let err = run(&t, 3, Some("error.contains('rate limit')"), false)
+            .await
+            .expect_err("a module error the predicate refuses must not retry");
+        assert!(err.contains("retry_condition not met"), "got: {err}");
+        assert_eq!(t.sends(), 1);
+    }
+
+    /// The allowance is BOUNDED. A worker stuck refusing on age — a clock that
+    /// never re-syncs — must fail the node, not re-send forever.
+    #[tokio::test(start_paused = true)]
+    async fn the_liveness_allowance_is_bounded_and_says_so() {
+        let t = ScriptedTransport::new(vec![Reply::StaleRejection]);
+        let err = run(&t, 0, None, true)
+            .await
+            .expect_err("an endlessly stale worker must fail the node");
+        assert_eq!(
+            t.sends() as u32,
+            1 + LIVENESS_REDISPATCH_MAX,
+            "first send plus exactly the allowance"
+        );
+        assert!(
+            err.contains("liveness re-dispatch"),
+            "the failure must name what was spent, got: {err}"
+        );
+    }
+
+    /// The 503 half of the same rule, in the shape of the 2026-09-22 failure: a
+    /// worker roll during a deploy, a node that gave up while it was still in
+    /// progress. `max_retries: 0` here, so on the original tree this is
+    /// `Job dispatch failed after 1 attempts`.
+    #[tokio::test(start_paused = true)]
+    async fn no_responders_is_re_dispatched_past_max_retries() {
+        let t = ScriptedTransport::new(vec![
+            Reply::NoResponders,
+            Reply::NoResponders,
+            Reply::Success,
+        ]);
+        assert!(
+            run(&t, 0, None, true).await.is_ok(),
+            "a job delivered to nobody must be re-sent"
+        );
+        assert_eq!(t.sends(), 3);
+    }
+
+    /// NEGATIVE CONTROL for the 503: every OTHER delivery error stays on the
+    /// ordinary path. A connection that broke MAY have delivered the message
+    /// first, so it is not one this can call safe — widening the branch to
+    /// "transport errors" would be exactly that mistake, and this is what says
+    /// so.
+    #[tokio::test(start_paused = true)]
+    async fn an_ordinary_delivery_error_is_not_a_liveness_redispatch() {
+        let t = ScriptedTransport::new(vec![Reply::OtherDeliveryError, Reply::Success]);
+        let err = run(&t, 0, None, true)
+            .await
+            .expect_err("a broken pipe is not proof the job reached nobody");
+        assert!(
+            err.contains("Job dispatch failed after 1 attempts"),
+            "got: {err}"
+        );
+        assert!(!err.contains("liveness"), "got: {err}");
+        assert_eq!(t.sends(), 1);
+    }
+
+    /// Every re-dispatch must be a NEW signed message: a fresh nonce (which
+    /// carries the timestamp the receiver's freshness window is measured from —
+    /// without it the re-send is stale for the same reason and the allowance is
+    /// spent on nothing) and a strictly increasing `dispatch_attempt` (so the
+    /// worker opens its audit chain in a new partition instead of writing a
+    /// second chain under the first attempt's prefix).
+    #[tokio::test(start_paused = true)]
+    async fn every_redispatch_is_freshly_signed_in_a_new_attempt_partition() {
+        let t = ScriptedTransport::new(vec![
+            Reply::StaleRejection,
+            Reply::StaleRejection,
+            Reply::Success,
+        ]);
+        assert!(run(&t, 0, None, true).await.is_ok());
+        let sent = t.payloads.lock().expect("lock").clone();
+        assert_eq!(sent.len(), 3);
+        let reqs: Vec<talos_workflow_job_protocol::JobRequest> = sent
+            .iter()
+            .map(|p| serde_json::from_slice(p).expect("JobRequest"))
+            .collect();
+        let nonces: std::collections::BTreeSet<_> =
+            reqs.iter().map(|r| r.job_nonce.clone()).collect();
+        assert_eq!(nonces.len(), 3, "each re-dispatch needs its own nonce");
+        let attempts: Vec<u32> = reqs.iter().map(|r| r.dispatch_attempt).collect();
+        assert_eq!(attempts, vec![0, 1, 2], "attempt index must be monotonic");
+        // Same job, throughout — a re-dispatch, not a new job.
+        let ids: std::collections::BTreeSet<_> = reqs.iter().map(|r| r.job_id).collect();
+        assert_eq!(ids.len(), 1);
+    }
+
+    /// A liveness re-dispatch does NOT get its own opinion about the workflow
+    /// budget. `clamp_attempt_timeout` owns that arithmetic and runs at the top
+    /// of every iteration, so a node whose run is out of budget is refused
+    /// there with the existing message — the liveness branch must not have
+    /// re-derived a way past it.
+    #[tokio::test(start_paused = true)]
+    async fn a_liveness_redispatch_still_honours_the_workflow_budget() {
+        let t = ScriptedTransport::new(vec![Reply::StaleRejection]);
+        let classifier = AlwaysTransient;
+        let evaluator = FixedVerdict(true);
+        let key = [9u8; 32];
+        let payload = super::resign_payload_tests::signed_request(&key);
+        let err = execute_job_with_retry(
+            &t,
+            "talos.jobs".to_string(),
+            payload,
+            5,
+            0,
+            1,
+            Some(&key),
+            None,
+            None,
+            None,
+            None,
+            uuid::Uuid::nil(),
+            uuid::Uuid::nil(),
+            &classifier,
+            &evaluator,
+            None,
+            None,
+            None,
+            // One second of budget: enough for the first attempt, never enough
+            // to come back for a second after the liveness backoff.
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(1)),
+            Some(300),
+        )
+        .await
+        .expect_err("an exhausted budget must stop the loop");
+        assert!(
+            err.contains("budget") || err.contains("not dispatched"),
+            "the budget gate must be what stopped it, got: {err}"
+        );
+        assert!(
+            (t.sends() as u32) <= 1 + LIVENESS_REDISPATCH_MAX,
+            "the allowance cannot outlive the budget"
+        );
+    }
+
+    /// A run that hits BOTH kinds of failure must still stamp a strictly
+    /// increasing `dispatch_attempt`.
+    ///
+    /// This is the test that caught a real defect in this package's own first
+    /// draft: the module-error branch stamped `attempt_base + attempts` and the
+    /// liveness branch `attempt_base + attempts + liveness_redispatches`, so a
+    /// stale rejection followed by a module failure stamped index 1 twice. Two
+    /// sends in one audit partition is the `DuplicateSequence` false tamper
+    /// verdict — positive evidence of tampering, for a job that was merely
+    /// re-sent. Neither counter is wrong on its own, which is why only an
+    /// interleaved run shows it, and why `next_dispatch_attempt` is one
+    /// function rather than two expressions that agree today.
+    #[tokio::test(start_paused = true)]
+    async fn interleaved_failures_never_reuse_a_dispatch_attempt() {
+        let t = ScriptedTransport::new(vec![
+            Reply::StaleRejection, // liveness re-dispatch  -> attempt 1
+            Reply::ModuleFailure,  // module-error retry    -> attempt 2
+            Reply::StaleRejection, // liveness re-dispatch  -> attempt 3
+            Reply::Success,
+        ]);
+        assert!(run(&t, 2, None, true).await.is_ok());
+        let sent = t.payloads.lock().expect("lock").clone();
+        let attempts: Vec<u32> = sent
+            .iter()
+            .map(|p| {
+                serde_json::from_slice::<talos_workflow_job_protocol::JobRequest>(p)
+                    .expect("JobRequest")
+                    .dispatch_attempt
+            })
+            .collect();
+        assert_eq!(
+            attempts,
+            vec![0, 1, 2, 3],
+            "every send needs its own audit partition"
+        );
+        let unique: std::collections::BTreeSet<_> = attempts.iter().collect();
+        assert_eq!(unique.len(), attempts.len(), "a reused index merges chains");
+    }
+
+    /// The backoffs are DERIVED from what each cause says about the fleet, and
+    /// the ordering is the claim: a worker that answered is available now, a
+    /// worker that is not subscribed has to be waited for. If these were ever
+    /// made equal, one of the two arguments in `base_backoff_ms` would be
+    /// silently wrong.
+    #[test]
+    fn each_cause_waits_for_what_it_is_actually_waiting_on() {
+        assert!(
+            LivenessCause::StaleDispatch.base_backoff_ms()
+                < LivenessCause::NoResponders.base_backoff_ms(),
+            "a worker that replied does not need the wait a missing one does"
+        );
+        // Sized against the measured failure: three ordinary retries across
+        // 35 s were not enough for a worker roll on 2026-09-22.
+        let total: u64 = (1..=LIVENESS_REDISPATCH_MAX)
+            .map(|n| {
+                super::exponential_backoff_ms(LivenessCause::NoResponders.base_backoff_ms(), n)
+            })
+            .sum();
+        assert!(
+            total > 35_000,
+            "the no-responders sequence must outlast the roll that motivated it, got {total}ms"
+        );
+        assert_eq!(LivenessCause::StaleDispatch.as_str(), "stale_dispatch");
+        assert_eq!(LivenessCause::NoResponders.as_str(), "no_responders");
     }
 }

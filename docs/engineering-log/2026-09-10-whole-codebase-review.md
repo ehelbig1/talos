@@ -6779,3 +6779,226 @@ per tab — many tabs still mean many sockets. The cap is a constant, not a
 knob. The client emits no series. `OUTBOUND_FRAME_BUFFER` bounds memory per
 socket; a slow client stalls its own subscription tasks at the channel, not
 the controller.
+
+## Package DX (2026-09-23) — a job that was never executed, judged as a module error
+
+### What was measured first
+
+104 workflow failures over 30 days on the reference fleet, live table and
+archive together. Fourteen of them are jobs where the module never ran, and the
+first classification of them was WRONG in the direction that made the package
+look bigger: an `ILIKE '%outside its freshness window and was rejected on AGE%'`
+arm matches both `Job dispatch arrived …` and `Job result arrived …`, and the
+second of those is the one case that must NOT be re-sent. Read verbatim rather
+than bucketed, the population is:
+
+| class | n | module ran? | how it was judged |
+|---|---|---|---|
+| A — `Job dispatch` refused on AGE | **11** | no | 10 × `retry_condition not met`, 1 × `after 1 attempts` |
+| B — `Job result` refused on AGE | **1** | **yes** | returns above the retry loop, correctly |
+| C — `no responders` (NATS 503) | **2** | no | the node's `max_retries` (1 and 3 attempts, 5 s and 35 s) |
+
+So 13 of 104 failures — 12.5 % — are jobs the platform could have re-sent and
+did not.
+
+**The A cases are a suspended host.** Their workflow wall-clock spans are 13.0,
+13.3, 13.5, 14.2, 17.7, 22.8, 28.5, 29.1, 42.1, 42.8 and 82.3 minutes, under
+node budgets of a few minutes. tokio's deadline is monotonic and did not advance
+while the VM was paused; the worker's freshness check reads the wall clock and
+did. Five scheduled workflows across three days — `pa-ask-email`,
+`pa-followup-approval-notifier`, `pa-inbox-organizer`, `pa-inbox-organizer-work`
+and one alert-triage workflow whose name is operator-specific and so is left
+unnamed here (check 72 is why; the resolution for a PI marker is a placeholder,
+never an exemption).
+
+**The C cases are our own deploys.** 2026-09-21 15:30:00 and 2026-09-22
+19:25:12, both inside a worker restart (deploys 104 and 118). One node had
+`max_retries: 0` and gave up after a single attempt in 5 s; the other spent
+three retries across 35 s while the roll was still in progress.
+
+**"The module did not run" is structural, not inferred from the message.**
+`execute_job` verifies the request at `worker/src/main.rs:1278` and returns the
+rejection payload at `:1321`; it loads and runs the module at `:1602`, ~280
+lines later. The database agrees: of the twelve `module_executions` rows under
+those eleven executions, the eleven `failed` ones consumed **zero** fuel, and
+the one row with fuel (76 877) is a sibling node in the 05:14 workflow that ran
+fine.
+
+### The defect
+
+The worker already computes a typed token for this. `signature_failure_payload`
+publishes `{"error": <headline>, "reason_class": <class>}` in BOTH diag modes,
+and on this fleet `TALOS_SIGNATURE_DIAG` is unset, so the gated-off arm — which
+still carries the class — is what production sends. The controller reads
+`output_payload["error"]` for the message and **discards the rest**, then hands
+that prose to the node's `retry_condition`: a Rhai expression authored to judge
+Gmail responses, asked about a transport event it had never been shown, which
+answered "do not retry" ten times out of eleven. The fallback
+`HeuristicRetryClassifier` would not have helped — `talos-retry-intelligence`
+contains zero occurrences of `liveness`, `freshness` or `stale_timestamp`, so
+its answer is `unknown`, i.e. non-transient.
+
+Two `reason_class` namespaces exist and must not be read for one another:
+`talos_worker_runtime::reason_class` stamps `[reason_class=dns]` INSIDE an error
+string for host-call failures and is read by `classify_error`; this one is a
+top-level JSON key describing a message the receiver refused. Measured: 54 rows
+carry the first, none carries the second, because nothing ever read it.
+
+### The rule, and where it lives
+
+*A dispatch the receiver refused before the module ran is not a module error, so
+module-error policy — `retry_condition`, the heuristic classifier, the node's
+`max_retries` — does not apply to it.*
+
+`talos_workflow_job_protocol` is the one home, because the receiver stamps the
+class and the sender acts on it:
+
+* `verify_failure_class(VerifyFailureKind) -> &'static str` MOVED from the
+  worker's private `classify_verify_failure`. The move bought a behavioural
+  gain, not just tidiness: `VerifyFailureKind` is `#[non_exhaustive]`, so the
+  worker's copy NEEDED a `_` arm and a new variant silently became `"mismatch"`
+  — read as tampering, the exact collapse the token set exists to prevent.
+  `#[non_exhaustive]` does not apply inside the defining crate, so the match is
+  now EXHAUSTIVE and the compiler enumerates the population.
+* `PRE_EXECUTION_REJECTION_CLASSES` is a CLOSED set, and it is exactly
+  `{stale_timestamp}`. Membership needs two things, and the second is why it is
+  this small: **safe** (nothing ran) and **useful** (a re-send fixes it — the
+  re-sign mints a fresh nonce and the nonce carries the timestamp the freshness
+  window is measured from). `replay` is excluded because the receiver has
+  already SEEN that nonce, which is evidence a previous attempt was accepted;
+  `mismatch` because re-sending re-admits a forgery; `key_config` and
+  `scheme_mismatch` because identical bytes earn an identical refusal and would
+  burn the allowance for nothing.
+* `JobResult::is_pre_execution_rejection()` — `status == Failed` AND a
+  `reason_class` in that set. **The status test is load-bearing, not
+  belt-and-braces.** A module's own JSON reaches the wire only under `Success`
+  (the `success: false` shape), while every `Failed` payload is built by the
+  worker from its own `json!({…})`. Without it, a module could return
+  `{"success": false, "reason_class": "stale_timestamp"}` and talk the
+  controller into re-dispatching it — duplicating a side effect it had already
+  performed. With it the shape is unforgeable by a module; only a holder of the
+  worker signing key can mint it, and such a holder can already fabricate any
+  result, which is why the allowance is a small constant.
+
+The 503 half is classified by TYPE: `transport::NoRespondersError` is a real
+error type with `is_no_responders` downcasting to it, rather than a substring
+test on the operator sentence — the same "classification derived from prose"
+hazard, on the other side of the wire. Every OTHER delivery error stays on the
+ordinary path: a connection that broke MAY have delivered the message first, so
+widening this to "transport errors" would be exactly the mistake this is about.
+
+### Decisions
+
+* **`LIVENESS_REDISPATCH_MAX = 3`, a CONSTANT and deliberately not a knob**, and
+  deliberately INDEPENDENT of `max_retries`. `max_retries` is the author's
+  budget for errors the MODULE produced; `max_retries: 0` means the module must
+  run at most once, which re-sending a job that never ran does not violate.
+* **Backoff is DERIVED per cause, not picked for symmetry.** `StaleDispatch`
+  gets 1 s base: the worker replied, so it is subscribed right now, and the
+  only thing to absorb is a clock still settling after resume. `NoResponders`
+  gets 10 s base → 10 + 20 + 40 ≈ 70 s, sized against the measured failure where
+  three ordinary retries across 35 s were not enough for a roll.
+* **The attempt window is NOT re-derived.** `clamp_attempt_timeout`
+  (`talos_workflow_engine_core::attempt_window`) runs at the top of every
+  iteration and refuses a re-dispatch that no longer fits the workflow budget,
+  with the existing `budget_exhausted_message`. The liveness branch must not
+  have its own opinion about the budget, and a test pins that it does not.
+* **NO metric, and this is the same measurement as 2026-09-06, not an
+  omission.** `talos-workflow-engine-nats` reaches `talos-metrics` only
+  transitively (through `talos-workflow-engine`), which Rust does not permit a
+  `use` for, so a series costs a new direct dependency edge — the attempt-window
+  package declined that edge for a series and this is the same crate and the
+  same argument. The durable record is `execution_events`: a `node_retrying` row
+  with `error_class = "liveness:<cause>"`, which is queryable but, stated
+  plainly, not alertable.
+* **The re-dispatch logs at INFO; only the EXHAUSTION is a WARN.** A re-dispatch
+  that then succeeds is this control working — the platform absorbing its own
+  transport and its own deploys — and a line that fires when a control does its
+  job trains operators to ignore the level. That is check 69's rule, and #787
+  demoted the rank-training truncation for exactly it while keeping its failure
+  at WARN. Both lines carry every field.
+* **The result-stale case (B) stays refused**, and not by a second reading of
+  one string: a result the CONTROLLER could not verify returns at the
+  `verify_dispatch` arm and never reaches the branch that judges an application
+  failure. The module DID run, the worker's idempotency cache would re-publish
+  the same already-signed result anyway, and the existing doc comment already
+  argues it.
+
+### The defect this package's own first draft had
+
+`next_dispatch_attempt` exists because of it. The module-error branch stamped
+`attempt_base + attempts` and the liveness branch `attempt_base + attempts +
+liveness_redispatches`, so a run that hit a stale rejection and then a module
+failure stamped index **1 twice**. The worker is credential-free and opens a
+fresh audit chain per dispatch; the offline verifier partitions a WORM prefix by
+this index, so two sends under one index put two chains in one partition, which
+it reports as `DuplicateSequence` — positive tamper evidence for a job that was
+merely re-sent. That is the 2026-09-14 OAuth-repair defect reproduced by the fix
+for a different one. Neither counter is wrong on its own, which is why only an
+interleaved run shows it, and why the index now comes from one function rather
+than two expressions that happen to agree. Found by reading
+`docs/THREAT_MODEL.md`'s own claim about what sets the attempt, not by a test —
+the test (`interleaved_failures_never_reuse_a_dispatch_attempt`) was written
+afterwards and fails on the reverted formula.
+
+### Guards, and the pre/post proof
+
+The two defect tests were run **RED against a real `git worktree` of pristine
+`origin/main`**, written so they compile there (no reference to anything this
+package adds). `a_stale_dispatch_is_not_judged_by_the_module_retry_condition`
+fails with the verbatim production message the live database holds eleven
+copies of — `Job failed (retry_condition not met): Job dispatch arrived outside
+its freshness window and was rejected on AGE…` — and
+`no_responders_is_re_dispatched_past_max_retries` with `Job dispatch failed
+after 1 attempts`. That is a pre/post comparison against the real defect, not a
+mutation.
+
+Both negative controls exist and are the point: an ordinary module failure with
+the same refusing predicate must still be refused after one send, and an
+ordinary delivery error must still fail after one attempt. Without them,
+"the liveness branch works" cannot be told from "the liveness branch swallowed
+the module path".
+
+`start_paused` runs the PRODUCTION backoffs against tokio's virtual clock, so
+the real sleeps execute and the tests are instant — nothing is stubbed to make
+them fast. The scripted transport builds its 503 with the production
+`no_responders_error_for`, so a test cannot pass against a stand-in that
+`is_no_responders` would not recognise, and its `AlwaysTransient` classifier
+answers transient for everything — the *permissive* direction, so a test showing
+exactly one send is showing the branch, not the stub's charity.
+
+Thirteen mutations were applied worst-first, each confirmed landed by hash and
+byte-reverted, and **all thirteen caught**: the forgeable status guard, a
+widened class set, each of the two call sites removed independently (the
+delivery one is seen ONLY by the no-responders test — a guard at one site
+cannot see the other), an unbounded allowance, a dropped re-sign, a liveness
+re-dispatch that spends `max_retries`, the liveness check moved BELOW the
+`retry_condition` gate, `is_no_responders` answering true for everything, equal
+backoffs, `Stale` reclassified as tampering, the attempt index frozen, and the
+collision revert. Two earlier attempts are recorded as INVALID rather than
+counted: one added a comment line (a no-op proves nothing) and one missed its
+anchor after `cargo fmt` and was reported as SKIP. Both were rewritten as real
+behaviour changes and re-run.
+
+**Harness lesson worth carrying.** The first mutation run HUNG on M5 (drop the
+allowance bound): under `start_paused` an unbounded re-dispatch loop spins
+forever at full virtual speed, and a mutation that hangs the harness is not a
+mutation the harness caught. Killing it left the mutation in the tree — the
+2026-09-22 lesson, checked for and found. The scripted transport now asserts a
+hard send cap, so a lost bound FAILS, and the harness carries a per-mutation
+timeout as a second guard.
+
+### Stated limits
+
+* No test drives a real worker over real NATS; the honest guard for the wired
+  path is the live read after deploy.
+* The liveness re-dispatch covers the single-job path
+  (`execute_job_with_retry`). The pipeline path (`dispatch_with_retry`, used by
+  `engine_dispatch_pipeline`) is unchanged — it is dormant by config on every
+  production entry point (`ChainDispatch::Disabled`), and extending it is its
+  own package, recorded rather than done.
+* The predicate proves the RECEIVER said it refused before executing. A worker
+  holding the fleet key could say so falsely; the bound is what makes that
+  uninteresting, and it is stated rather than implied.
+* `execution_events` is the only durable record of a liveness re-dispatch. There
+  is no series and therefore no alert.

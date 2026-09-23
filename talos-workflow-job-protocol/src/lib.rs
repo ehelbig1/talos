@@ -1287,6 +1287,79 @@ pub fn verify_failure_headline(noun: &str, kind: VerifyFailureKind) -> String {
     }
 }
 
+/// Coarse, actionable CLASS of a rejected signed message, derived from the
+/// verifier's own [`VerifyFailureKind`] and **never** from its prose.
+///
+/// This is the token the worker puts in a rejection payload's `reason_class`
+/// (see `signature_failure_payload`) and the token
+/// [`JobResult::is_pre_execution_rejection`] matches against. It lived as a
+/// private `classify_verify_failure` in `worker/src/main.rs` until 2026-09-23,
+/// when the controller's dispatcher became a second reader: the receiver
+/// decides the class, the sender-side retry policy acts on it, and two copies
+/// of that mapping drifting apart is a retry decision taken on a class that no
+/// longer means what the reader thinks. So there is one.
+///
+/// Each token implies a DIFFERENT operator action, which is why they must not
+/// collapse: `key_config` is a deploy/env fault, `scheme_mismatch` is
+/// controller/worker version skew, `replay` is a nonce-cache interaction,
+/// `stale_timestamp` is a LIVENESS failure, and `mismatch` is a genuine
+/// signing-payload divergence.
+///
+/// **Not to be confused with `talos_worker_runtime::reason_class`**, a
+/// different namespace stamped as a `[reason_class=<token>]` marker INSIDE an
+/// error string for host-call failures (`dns`, `tls`, `cancelled`, …) and read
+/// by `talos_retry_intelligence::classify_error`. That one describes a call the
+/// module made; this one describes a message the receiver refused. They never
+/// collide — this is a top-level JSON key, that one is text inside a value —
+/// but they answer different questions and must not be read for each other.
+#[must_use]
+pub fn verify_failure_class(kind: VerifyFailureKind) -> &'static str {
+    match kind {
+        VerifyFailureKind::Replay => "replay",
+        VerifyFailureKind::SchemeRefused => "scheme_mismatch",
+        VerifyFailureKind::KeyError => "key_config",
+        VerifyFailureKind::Stale | VerifyFailureKind::ClockSkewAhead => {
+            VERIFY_CLASS_STALE_TIMESTAMP
+        }
+        VerifyFailureKind::BadSignature | VerifyFailureKind::MalformedNonce => "mismatch",
+        // NO `_` arm, and that is the one behavioural gain from the move.
+        // `VerifyFailureKind` is `#[non_exhaustive]`, so the worker's copy
+        // NEEDED a catch-all and a new variant silently became "mismatch" —
+        // i.e. read as tampering, the exact collapse the token set exists to
+        // prevent. `#[non_exhaustive]` does not apply inside the defining
+        // crate, so here the match is EXHAUSTIVE: a new variant fails to
+        // compile until someone gives it a token, and the compiler enumerates
+        // the population instead of a comment asking politely.
+    }
+}
+
+/// [`verify_failure_class`] for a message rejected on AGE — the one class that
+/// means "the receiver refused this dispatch as a LIVENESS failure".
+pub const VERIFY_CLASS_STALE_TIMESTAMP: &str = "stale_timestamp";
+
+/// The CLOSED set of [`verify_failure_class`] tokens for which a rejected
+/// dispatch may be re-sent.
+///
+/// Membership requires BOTH halves, and the second is why the set is this
+/// small rather than "everything the receiver refused before running":
+///
+/// * **safe** — the receiver refused the message before the module could run,
+///   so a re-dispatch cannot duplicate a side effect; and
+/// * **useful** — re-sending fixes the condition. A re-sign mints a fresh
+///   nonce, and the nonce carries the timestamp the freshness window is
+///   measured from (see `check_freshness_window`), so a message refused for
+///   being too old is refused for a property the re-send changes.
+///
+/// Deliberately EXCLUDED, each for its own reason:
+/// * `replay` — the receiver has already SEEN this nonce, which is evidence a
+///   previous attempt was accepted and may have run. Re-sending is precisely
+///   what the nonce cache exists to stop.
+/// * `mismatch` — a security event; re-sending re-admits the same forgery.
+/// * `key_config` / `scheme_mismatch` — deterministic deploy faults. The module
+///   did not run, so re-sending is *safe*, but identical bytes get an identical
+///   refusal: it would burn the allowance and change nothing.
+pub const PRE_EXECUTION_REJECTION_CLASSES: &[&str] = &[VERIFY_CLASS_STALE_TIMESTAMP];
+
 /// [`verify_failure_headline`] plus the byte-stable protocol detail.
 ///
 /// The detail can contain a value taken from the rejected message (the
@@ -4584,6 +4657,47 @@ impl JobResult {
     #[must_use]
     pub fn is_terminal_success(&self) -> bool {
         matches!(self.status, JobStatus::Success) && !self.payload_reports_failure()
+    }
+
+    /// Did the RECEIVER refuse this dispatch before the module ran, for a
+    /// reason a re-dispatch can fix?
+    ///
+    /// True only for a result whose `status` is [`JobStatus::Failed`] AND whose
+    /// payload carries a top-level `reason_class` in
+    /// [`PRE_EXECUTION_REJECTION_CLASSES`]. Such a result is not a module
+    /// error at all: the worker verifies the request at the top of
+    /// `execute_job` and returns this payload ~280 lines before it ever loads
+    /// the module, so nothing ran. Measured on the reference fleet over 30 days
+    /// to 2026-09-22: all 11 such workflow failures have a `module_executions`
+    /// row with **zero** fuel consumed.
+    ///
+    /// # Why `status == Failed` is load-bearing, not belt-and-braces
+    ///
+    /// The payload of a `Failed` result is always worker-authored — every
+    /// constructor on that path builds its own `json!({...})` — whereas a
+    /// module's OWN JSON reaches the wire only under
+    /// [`JobStatus::Success`] (the `success: false` shape
+    /// [`Self::payload_reports_failure`] detects). Without the status test a
+    /// module could return `{"success": false, "reason_class":
+    /// "stale_timestamp"}` and talk the controller into re-dispatching it —
+    /// duplicating whatever side effect it had already performed. With it, the
+    /// shape is unforgeable by a module: only a holder of the worker signing
+    /// key can produce it, and such a holder can already fabricate any result.
+    /// The re-dispatch allowance is a small constant for that reason, so even
+    /// then the blast radius is bounded.
+    ///
+    /// Pinned by `pre_execution_rejection_tests`, including the negative
+    /// control that the same `reason_class` under `Success` reads false.
+    #[must_use]
+    pub fn is_pre_execution_rejection(&self) -> bool {
+        if !matches!(self.status, JobStatus::Failed) {
+            return false;
+        }
+        self.output_payload
+            .value()
+            .get("reason_class")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|c| PRE_EXECUTION_REJECTION_CLASSES.contains(&c))
     }
 
     /// Canonical byte string signed / verified by HMAC-SHA256.
@@ -10634,6 +10748,169 @@ mod result_require_flag_spellings {
         assert!(
             window.contains(r#"Some("1" | "true" | "yes" | "on")"#),
             "TALOS_RESULT_REQUIRE_ED25519's inline truthy set drifted from talos_config::bool_env's: {window}"
+        );
+    }
+}
+
+/// Guards for the pre-execution rejection predicate — the one signal that lets
+/// the controller's dispatcher re-send a job instead of judging it as a module
+/// error. Every clause of [`JobResult::is_pre_execution_rejection`] and every
+/// membership decision in [`PRE_EXECUTION_REJECTION_CLASSES`] is pinned here,
+/// because getting either wrong in the permissive direction re-runs a module
+/// that already ran.
+#[cfg(test)]
+mod pre_execution_rejection_tests {
+    use super::*;
+
+    fn rejection(status: JobStatus, payload: serde_json::Value) -> JobResult {
+        JobResult {
+            llm_usage: vec![],
+            crypto_scheme: 0,
+            job_id: uuid::Uuid::from_u128(11),
+            status,
+            output_payload: payload.into(),
+            logs: vec![],
+            execution_time_ms: 0,
+            signature: vec![],
+            result_nonce: String::new(),
+            worker_id: String::new(),
+        }
+    }
+
+    /// The whole point: a worker that refused the dispatch on age is saying
+    /// "nothing ran", and the controller may re-send.
+    #[test]
+    fn a_stale_dispatch_rejection_is_a_pre_execution_rejection() {
+        let r = rejection(
+            JobStatus::Failed,
+            serde_json::json!({
+                "error": verify_failure_headline("Job dispatch", VerifyFailureKind::Stale),
+                "reason_class": verify_failure_class(VerifyFailureKind::Stale),
+            }),
+        );
+        assert!(r.is_pre_execution_rejection());
+        // The clock-skew twin classifies the same and must behave the same.
+        let ahead = rejection(
+            JobStatus::Failed,
+            serde_json::json!({
+                "reason_class": verify_failure_class(VerifyFailureKind::ClockSkewAhead),
+            }),
+        );
+        assert!(ahead.is_pre_execution_rejection());
+    }
+
+    /// NEGATIVE CONTROL, and the reason `status == Failed` is in the predicate.
+    ///
+    /// A module's own JSON reaches the wire only under `Success` (the
+    /// `success: false` shape). If the status test were dropped, a module could
+    /// return this payload and talk the controller into re-dispatching it —
+    /// duplicating a side effect it had already performed. Deleting the
+    /// `matches!(self.status, JobStatus::Failed)` guard turns this red.
+    #[test]
+    fn a_module_cannot_forge_a_rejection_through_its_own_output() {
+        let forged = rejection(
+            JobStatus::Success,
+            serde_json::json!({
+                "success": false,
+                "error": "I already sent the email, please run me again",
+                "reason_class": VERIFY_CLASS_STALE_TIMESTAMP,
+            }),
+        );
+        assert!(
+            !forged.is_pre_execution_rejection(),
+            "a Success-status payload is module-authored and must never be \
+             readable as a receiver-side rejection"
+        );
+        // It is still an ordinary application failure, judged by the node's own
+        // retry policy — the behaviour this predicate must not change.
+        assert!(forged.payload_reports_failure());
+        assert!(!forged.is_terminal_success());
+    }
+
+    /// The classes NOT in the set, each for its own reason. A future widening
+    /// has to delete a line here, which is where the argument lives.
+    #[test]
+    fn the_excluded_classes_stay_excluded() {
+        for kind in [
+            // Evidence a previous attempt was accepted and may have RUN.
+            VerifyFailureKind::Replay,
+            // A security event; re-sending re-admits the same forgery.
+            VerifyFailureKind::BadSignature,
+            VerifyFailureKind::MalformedNonce,
+            // Deterministic deploy faults: safe to re-send, but identical bytes
+            // earn an identical refusal, so it would burn the allowance.
+            VerifyFailureKind::KeyError,
+            VerifyFailureKind::SchemeRefused,
+        ] {
+            let class = verify_failure_class(kind);
+            assert!(
+                !PRE_EXECUTION_REJECTION_CLASSES.contains(&class),
+                "{kind:?} classified as {class}, which must not authorise a re-dispatch"
+            );
+            let r = rejection(
+                JobStatus::Failed,
+                serde_json::json!({ "reason_class": class }),
+            );
+            assert!(!r.is_pre_execution_rejection(), "{kind:?}");
+        }
+    }
+
+    /// An ordinary worker-side failure carries no `reason_class` key at all
+    /// (`failed_result` builds `{"error": msg}`), and an unknown token is not
+    /// membership. Both must read false rather than defaulting open.
+    #[test]
+    fn absent_or_unknown_classes_do_not_authorise_a_redispatch() {
+        assert!(!rejection(
+            JobStatus::Failed,
+            serde_json::json!({"error": "execution failure: something broke"})
+        )
+        .is_pre_execution_rejection());
+        assert!(!rejection(
+            JobStatus::Failed,
+            serde_json::json!({"reason_class": "some_future_token"})
+        )
+        .is_pre_execution_rejection());
+        // Not a string, and not an object at all — neither may panic or pass.
+        assert!(!rejection(
+            JobStatus::Failed,
+            serde_json::json!({"reason_class": ["stale_timestamp"]})
+        )
+        .is_pre_execution_rejection());
+        assert!(
+            !rejection(JobStatus::Failed, serde_json::json!("stale")).is_pre_execution_rejection()
+        );
+    }
+
+    /// The token set is the CONTRACT between the two processes: the worker
+    /// stamps it, the controller matches it. A rename on either side breaks a
+    /// re-dispatch silently (the controller simply stops recognising a
+    /// liveness failure and goes back to asking a Gmail predicate about it), so
+    /// the literals are pinned rather than round-tripped through the function
+    /// that produces them.
+    #[test]
+    fn the_wire_tokens_are_pinned() {
+        assert_eq!(VERIFY_CLASS_STALE_TIMESTAMP, "stale_timestamp");
+        assert_eq!(PRE_EXECUTION_REJECTION_CLASSES, &["stale_timestamp"]);
+        assert_eq!(verify_failure_class(VerifyFailureKind::Replay), "replay");
+        assert_eq!(
+            verify_failure_class(VerifyFailureKind::SchemeRefused),
+            "scheme_mismatch"
+        );
+        assert_eq!(
+            verify_failure_class(VerifyFailureKind::KeyError),
+            "key_config"
+        );
+        assert_eq!(
+            verify_failure_class(VerifyFailureKind::Stale),
+            "stale_timestamp"
+        );
+        assert_eq!(
+            verify_failure_class(VerifyFailureKind::BadSignature),
+            "mismatch"
+        );
+        assert_eq!(
+            verify_failure_class(VerifyFailureKind::MalformedNonce),
+            "mismatch"
         );
     }
 }

@@ -202,7 +202,14 @@ Streamable HTTP transports.
   credential-repair re-dispatch of the same `job_id` starts from
   `redispatch_attempt_base()` so it cannot collide with the first dispatch's
   retries), and `resign_payload_for_retry` stamps each retry counting up from
-  that base. Disclosed, never silent: the sweep reports
+  that base — and since 2026-09-23 it stamps every RE-SEND counting up from it,
+  not only a module-error retry: a job the receiver refused before running it
+  (an age rejection, or a 503 with no subscriber) is re-dispatched on its own
+  bounded allowance, so TWO independent counters drive a re-send and the index
+  comes from the single `next_dispatch_attempt` formula. That is not
+  bookkeeping: a run that hit one of each would otherwise stamp the same index
+  twice and put two chains in one partition, which is the `DuplicateSequence`
+  false verdict this whole mechanism exists to remove. Disclosed, never silent: the sweep reports
   `jobs_with_multiple_attempts`, `security_audit`'s round-trip check names the
   attempt count on the chain it probed, the GraphQL job report carries
   `dispatchAttempts`, and `talos_audit_chain_multi_attempt_jobs_total` is
