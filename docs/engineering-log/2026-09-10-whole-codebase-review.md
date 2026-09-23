@@ -7388,3 +7388,39 @@ deleted disclosure leaves an operator reading a permanent 0 as evidence, which
 is the whole defect.
 
 No lint check was added and `--count` stays 96.
+
+### A second unrelated pre-existing flake, fixed in the same PR
+
+`wasm_log_relay_tests::two_replicas_store_each_line_once_and_both_broadcast_it`
+(package CV) failed CI on this branch: 16 of 50 workflow log rows, 8 per
+replica. It is unrelated to this package — the diff touches `talos-ws-auth`,
+`talos-metrics` and `talos-api` and no relay, NATS or wasm code — and it is
+the first failure in the last eight `quality.yml` runs, so it is intermittent
+rather than newly broken. It is fixed here for the same reason the advisory-DB
+flake was in the previous PR: a test that reds a PR at random makes "all gates
+green before shipping" unverifiable.
+
+The race is structural. `drain` waits out 400 ms of quiet on the BROADCAST
+channel, and the assertion then counts DATABASE rows written by the PERSIST
+subscription — a different NATS subscription on a different task. One going
+quiet says nothing about the other having finished its INSERTs. On a loaded
+runner the persist half simply had not caught up. The orphan-counter assertion
+immediately below already polls with a 10-second deadline for exactly this
+reason; the row assertions did not.
+
+`rows_until` now polls both pools until the fleet total reaches the expected
+count or a 10-second deadline passes. **No assertion changed**: a relay that
+genuinely drops or duplicates a line still fails, with the same message, after
+the deadline.
+
+**And the failure message is now diagnostic**, because the alternative
+hypothesis could not be ruled out from the CI log. A short row count has two
+possible causes — the persist INSERTs lagged, or the broker dropped messages
+to a slow consumer — and only the first is fixed by waiting. The assertion now
+reports the delivered broadcast counts alongside the row counts, so a
+recurrence says which of the two it was instead of leaving it to be guessed.
+
+Verified locally against a throwaway unauthenticated NATS container and a
+migrated template: 6 of 6 green. The operator's own broker refuses this
+publisher (its credentials are permissioned) and its live `talos` database is
+never connection-free, so neither could be used.
