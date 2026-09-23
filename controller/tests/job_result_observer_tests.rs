@@ -105,20 +105,12 @@ fn service(pool: &sqlx::Pool<sqlx::Postgres>) -> Arc<ModuleExecutionService> {
     ))
 }
 
-/// Poll until `probe` holds or 10 s pass.
-async fn eventually<F, Fut>(what: &str, mut probe: F)
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = bool>,
-{
-    for _ in 0..200 {
-        if probe().await {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("timed out waiting for: {what}");
-}
+// `eventually` was born here as a private helper and has kept this file off
+// the flaky list; it now lives in the shared harness (`common::eventually`) so
+// the next test does not re-invent the wait. `wasm_log_relay_tests` — this
+// file's sibling, same package, same two-replica NATS pattern — did re-invent
+// it and failed twice in forty CI runs.
+use common::eventually_default as eventually;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn one_replica_handles_each_worker_result() {
@@ -412,4 +404,99 @@ async fn one_replica_handles_each_worker_result() {
         ObservedResult::WriteFailed
     );
     drop(dbs);
+}
+
+/// The shared wait must be BOUNDED. A probe that never holds has to fail the
+/// test, not hang it — a hung binary in CI is worse than a failing one,
+/// because it burns the job's whole timeout and reports nothing useful.
+///
+/// Mutation-proved: deleting the deadline arm in `common::eventually` leaves
+/// every other test in this binary green, because nothing else ever makes it
+/// time out.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_shared_wait_gives_up_instead_of_hanging() {
+    // Deliberately NOT `#[should_panic]`: a missing deadline makes the helper
+    // loop forever, and a `should_panic` test simply never returns. That is
+    // the failure mode this test exists to prevent, so it must be observed
+    // from OUTSIDE — spawn the wait, bound the join, and require that it
+    // ended by panicking rather than by running out of patience.
+    let waiting = tokio::spawn(async {
+        common::eventually(
+            "a condition that never holds",
+            std::time::Duration::from_millis(100),
+            || async { false },
+        )
+        .await;
+    });
+    let joined = tokio::time::timeout(std::time::Duration::from_secs(5), waiting)
+        .await
+        .expect("common::eventually HUNG instead of giving up — its deadline arm is gone");
+    let err = joined.expect_err("common::eventually must panic when the probe never holds");
+    let panic = err.into_panic();
+    let msg = panic
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| panic.downcast_ref::<&str>().copied())
+        .unwrap_or("");
+    assert!(
+        msg.contains("timed out after") && msg.contains("a condition that never holds"),
+        "the timeout message must name the deadline AND what was awaited, got: {msg}"
+    );
+}
+
+/// One home for the bounded wait.
+///
+/// This helper was private to this file and this file has never flaked, while
+/// its sibling `wasm_log_relay_tests` — same package, same two-replica NATS
+/// pattern, written days apart — re-invented the wait as a fixed sleep and
+/// failed twice in forty CI runs. Privacy was the cause: there was nothing to
+/// find. It now lives in `common`, and this pin is what stops the next author
+/// writing a third copy.
+///
+/// TEXTUAL, and stated as such: it sees a locally-DEFINED `eventually`, not a
+/// hand-rolled poll under another name. The shared helper being easy to find
+/// is what does most of the work; this only catches the literal recurrence.
+#[cfg(test)]
+mod bounded_wait_has_one_home {
+    /// Built from parts so the pin cannot match its own needle line.
+    fn needle() -> String {
+        format!("{} fn {}", "async", "eventually")
+    }
+
+    #[test]
+    fn no_test_file_defines_its_own_bounded_wait() {
+        let n = needle();
+        let dir = std::path::Path::new("tests");
+        let mut offenders = Vec::new();
+        let mut scanned = 0usize;
+        for entry in std::fs::read_dir(dir).expect("read tests/") {
+            let p = entry.expect("dir entry").path();
+            if p.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            scanned += 1;
+            let body = std::fs::read_to_string(&p).unwrap_or_default();
+            for line in body.lines() {
+                let t = line.trim_start();
+                if t.starts_with("//") || t.starts_with("use ") {
+                    continue;
+                }
+                if line.contains(&n) {
+                    offenders.push(p.display().to_string());
+                    break;
+                }
+            }
+        }
+        assert!(
+            scanned > 50,
+            "expected to scan the controller test binaries, scanned {scanned} — \
+             the scan stopped matching and would vouch for nothing"
+        );
+        assert!(
+            offenders.is_empty(),
+            "these test files define their own bounded wait instead of using \
+             common::eventually — a private copy is what let wasm_log_relay_tests \
+             re-invent the wait and flake twice: {offenders:?}"
+        );
+    }
 }

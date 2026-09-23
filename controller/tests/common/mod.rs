@@ -412,3 +412,62 @@ pub async fn create_test_workflow(
     .expect("Failed to create test workflow");
     workflow_id
 }
+
+/// Poll `probe` until it holds, or fail after `timeout`.
+///
+/// # Why this is shared rather than written per test
+///
+/// An integration test that publishes, spawns or dispatches and then asserts
+/// on the effect has to wait for work it does not own. A FIXED sleep is a bet
+/// on how fast the machine is, and it is the bet that loses on a loaded CI
+/// runner: `wasm_log_relay_tests` waited out 400 ms of quiet on a BROADCAST
+/// channel and then counted DATABASE rows written by a different subscription,
+/// and failed twice in forty `quality.yml` runs — at 6 of 50 rows, then 16 of
+/// 50. Both times the work was merely late.
+///
+/// The correct shape already existed: `job_result_observer_tests` — the
+/// SIBLING of that test, same package, same two-replica NATS pattern, written
+/// days apart — had a private `eventually` and has never flaked. It was
+/// private, so the next test re-invented the wait and got it wrong. That is
+/// the whole reason this lives in the harness now.
+///
+/// # What it does and does not buy
+///
+/// It removes a timing bet. It does NOT weaken an assertion: the caller still
+/// asserts exactly what it asserted before, and a probe that never holds fails
+/// after `timeout` with `what` in the message. Work that is genuinely wrong —
+/// dropped, duplicated, never done — still fails, just later and with a
+/// clearer reason.
+///
+/// Do NOT use it for a NEGATIVE control. "Assert that X did not happen" cannot
+/// be polled: the probe would hold immediately and prove nothing. Those keep a
+/// fixed sleep, and they fail in the safe direction — a slow machine makes the
+/// absence more likely, never less.
+#[allow(dead_code)]
+pub async fn eventually<F, Fut>(what: &str, timeout: std::time::Duration, mut probe: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    const STEP: std::time::Duration = std::time::Duration::from_millis(50);
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if probe().await {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!("timed out after {:?} waiting for: {what}", timeout);
+        }
+        tokio::time::sleep(STEP).await;
+    }
+}
+
+/// `eventually` with the harness default of 10 seconds.
+#[allow(dead_code)]
+pub async fn eventually_default<F, Fut>(what: &str, probe: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    eventually(what, std::time::Duration::from_secs(10), probe).await;
+}
