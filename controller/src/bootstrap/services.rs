@@ -242,41 +242,29 @@ pub(crate) async fn init_nats() -> anyhow::Result<Option<std::sync::Arc<async_na
     Ok(nats_client)
 }
 
-/// Module registry + compilation service + secrets manager (KEK provider
-/// selection). Extracted verbatim from `main()`.
-pub(crate) async fn build_core_services(
-    db_pool: sqlx::Pool<sqlx::Postgres>,
-    redis_client: Option<std::sync::Arc<redis::Client>>,
-) -> anyhow::Result<CoreServices> {
-    // ---------- Initialize node creation services ----------
-    let registry = std::sync::Arc::new(ModuleRegistry::new(db_pool.clone(), redis_client.clone()));
-    // MCP-922 (2026-05-14): `talos_templates::TemplateGenerator` was
-    // historically instantiated here and `.data(generator)`-injected
-    // into GraphQL ctx, but no resolver ever extracted it via
-    // `ctx.data::<Arc<TemplateGenerator>>()`. Production template
-    // rendering goes through `talos_compilation::render_template`
-    // (which has stricter `validate_config_values` + the
-    // `// handlebars: true` opt-in gate). Removing the dead Arc
-    // allocation + GraphQL ctx slot. The crate stays for the
-    // `controller/tests/module_template_tests.rs` integration tests
-    // that pin built-in template render correctness.
-    // Allow the compilation directory to be overridden via COMPILE_DIR env var.
-    // Defaults to "/tmp/talos-compilations" for backward compatibility.
-    // MCP-631: empty-env hardening — empty value would produce an empty
-    // path and every compile attempt would fail at FS-write time.
-    let compile_dir = talos_config::get_env("COMPILE_DIR", "/tmp/talos-compilations");
-    // CompilationService::new signature evolved to take a CompilationEventSender
-    // for streaming progress events. main.rs creates a no-op broadcast channel
-    // here — production paths that need the event stream wire it up via the
-    // GraphQL subscription layer; this dummy is fine for the binary's startup
-    // boilerplate (compilation events get dropped if no receiver is listening).
-    let (compilation_event_tx, _) =
-        tokio::sync::broadcast::channel::<crate::engine::events::CompilationEvent>(64);
-    let compiler = std::sync::Arc::new(CompilationService::new(
-        std::path::PathBuf::from(compile_dir),
-        compilation_event_tx.clone(),
-    ));
+/// Which KEK wraps this deployment's DEKs — resolved in ONE place.
+///
+/// This was inline in `build_core_services` until 2026-09-23, which was fine
+/// while the server was the only thing that built a `SecretsManager`. It stops
+/// being fine the moment anything else does: `SecretsManager::new` hardcodes
+/// the ENV provider, so a second caller on a `KEK_PROVIDER=vault` deployment
+/// would wrap new DEKs with the wrong key while the server unwraps with the
+/// right one — and `with_kek_providers`' own doc says reversing the two "would
+/// silently corrupt every new DEK". A second implementation of this decision is
+/// therefore not a style question.
+///
+/// The production env-KEK refusal (`// prod-kek-guard`, check 45) moves with
+/// the code rather than being duplicated, so every caller inherits it.
+pub(crate) struct ResolvedKek {
+    pub(crate) active: std::sync::Arc<dyn crate::secrets::kek_provider::KekProvider>,
+    pub(crate) legacy: Option<std::sync::Arc<dyn crate::secrets::kek_provider::KekProvider>>,
+    /// The Vault handle, when that is the active backend — rotation needs the
+    /// concrete type, not the trait object.
+    pub(crate) vault:
+        Option<std::sync::Arc<crate::secrets::vault_kek_provider::VaultTransitProvider>>,
+}
 
+pub(crate) async fn resolve_kek_providers() -> anyhow::Result<ResolvedKek> {
     // ---------- Initialize secrets manager ----------
     // KEK provider selection: `KEK_PROVIDER` env var picks the backend
     // that wraps/unwraps DEKs. `env` (default) loads `TALOS_MASTER_KEY`
@@ -311,10 +299,10 @@ pub(crate) async fn build_core_services(
                 if !allow_env_kek {
                     return Err(anyhow::anyhow!(
                         "KEK_PROVIDER=env keeps the master key (TALOS_MASTER_KEY) in a Secret + \
-                         process memory — refused in production. Use KEK_PROVIDER=vault \
-                         (KMS-backed; the chart default) so the root key never leaves Vault. To \
-                         run env-KEK in production anyway (e.g. a single-host homelab with no \
-                         Vault), set TALOS_ALLOW_ENV_KEK=true to acknowledge the weaker posture."
+                     process memory — refused in production. Use KEK_PROVIDER=vault \
+                     (KMS-backed; the chart default) so the root key never leaves Vault. To \
+                     run env-KEK in production anyway (e.g. a single-host homelab with no \
+                     Vault), set TALOS_ALLOW_ENV_KEK=true to acknowledge the weaker posture."
                     ));
                 }
                 // Override in use — loud + SIEM-greppable so the weaker posture
@@ -362,6 +350,57 @@ pub(crate) async fn build_core_services(
             ));
         }
     };
+    Ok(ResolvedKek {
+        active: kek_provider,
+        legacy: kek_legacy_provider,
+        vault: vault_kek_provider,
+    })
+}
+
+/// Module registry + compilation service + secrets manager (KEK provider
+/// selection). Extracted verbatim from `main()`.
+pub(crate) async fn build_core_services(
+    db_pool: sqlx::Pool<sqlx::Postgres>,
+    redis_client: Option<std::sync::Arc<redis::Client>>,
+) -> anyhow::Result<CoreServices> {
+    // ---------- Initialize node creation services ----------
+    let registry = std::sync::Arc::new(ModuleRegistry::new(db_pool.clone(), redis_client.clone()));
+    // MCP-922 (2026-05-14): `talos_templates::TemplateGenerator` was
+    // historically instantiated here and `.data(generator)`-injected
+    // into GraphQL ctx, but no resolver ever extracted it via
+    // `ctx.data::<Arc<TemplateGenerator>>()`. Production template
+    // rendering goes through `talos_compilation::render_template`
+    // (which has stricter `validate_config_values` + the
+    // `// handlebars: true` opt-in gate). Removing the dead Arc
+    // allocation + GraphQL ctx slot. The crate stays for the
+    // `controller/tests/module_template_tests.rs` integration tests
+    // that pin built-in template render correctness.
+    // Allow the compilation directory to be overridden via COMPILE_DIR env var.
+    // Defaults to "/tmp/talos-compilations" for backward compatibility.
+    // MCP-631: empty-env hardening — empty value would produce an empty
+    // path and every compile attempt would fail at FS-write time.
+    let compile_dir = talos_config::get_env("COMPILE_DIR", "/tmp/talos-compilations");
+    // CompilationService::new signature evolved to take a CompilationEventSender
+    // for streaming progress events. main.rs creates a no-op broadcast channel
+    // here — production paths that need the event stream wire it up via the
+    // GraphQL subscription layer; this dummy is fine for the binary's startup
+    // boilerplate (compilation events get dropped if no receiver is listening).
+    let (compilation_event_tx, _) =
+        tokio::sync::broadcast::channel::<crate::engine::events::CompilationEvent>(64);
+    let compiler = std::sync::Arc::new(CompilationService::new(
+        std::path::PathBuf::from(compile_dir),
+        compilation_event_tx.clone(),
+    ));
+
+    // ---------- Initialize secrets manager ----------
+    // KEK selection has ONE home so a second `SecretsManager` builder cannot
+    // resolve it differently — see `resolve_kek_providers`.
+    let ResolvedKek {
+        active: kek_provider,
+        legacy: kek_legacy_provider,
+        vault: vault_kek_provider,
+    } = resolve_kek_providers().await?;
+
     let secrets_manager = std::sync::Arc::new(SecretsManager::with_kek_providers(
         db_pool.clone(),
         kek_provider,

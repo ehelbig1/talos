@@ -34,6 +34,7 @@
 
 pub mod client;
 pub mod config;
+pub mod link;
 
 pub use client::{
     AccessToken, Account, Balances, PfCategory, PlaidApiError, PlaidClient, PublicToken, SyncPage,

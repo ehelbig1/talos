@@ -11,7 +11,7 @@
 //! integration lives in the controller, like `talos-gmail`,
 //! `talos-google-calendar` and `talos-google-cloud`.
 
-use crate::config::PlaidConfig;
+use crate::config::{PlaidConfig, PlaidEnv};
 use std::fmt;
 use std::time::Duration;
 
@@ -233,6 +233,15 @@ struct RemovedTransaction {
 /// Hand-written `Debug` (lint 37): `access_token` is a live credential, and a
 /// derived `Debug` would put it into the first `anyhow` chain or panic message
 /// that touched this struct. Caught by the structural lint, not by review.
+/// Sandbox-only: what `/sandbox/public_token/create` returns.
+///
+/// Deliberately NO `Debug` derive — a `public_token` is short-lived but it is
+/// still a credential that exchanges into a long-lived one.
+#[derive(serde::Deserialize)]
+struct SandboxPublicTokenResponse {
+    public_token: String,
+}
+
 #[derive(serde::Deserialize)]
 struct ExchangeResponse {
     access_token: String,
@@ -300,6 +309,27 @@ impl fmt::Debug for PlaidClient {
     }
 }
 
+/// May `/sandbox/*` be called against this environment?
+///
+/// PURE so it is reachable from a test: the method that enforces it needs a
+/// network, and a mutation removing the gate SURVIVED every test until this
+/// was extracted — a guard at the primitive that nothing can drive is a guard
+/// nobody will notice losing.
+///
+/// # Errors
+/// When the environment is anything but sandbox.
+pub fn sandbox_endpoint_permitted(env: PlaidEnv) -> Result<(), String> {
+    if env != PlaidEnv::Sandbox {
+        return Err(format!(
+            "refusing to call a /sandbox/* endpoint against the {} host: those endpoints \
+             exist only in sandbox. A production item is linked by a human completing \
+             Plaid Link in a browser; pass that public_token instead.",
+            env.as_str()
+        ));
+    }
+    Ok(())
+}
+
 impl PlaidClient {
     /// Build against a fixed, known host, so the hardened integration client
     /// is the right tool (lint 49). No SSRF resolver is needed because no part
@@ -363,6 +393,42 @@ impl PlaidClient {
             return Err(anyhow::anyhow!(err));
         }
         talos_http_body::read_json_capped(resp).await
+    }
+
+    /// Mint a `public_token` WITHOUT a browser. SANDBOX ONLY, by construction.
+    ///
+    /// `/sandbox/public_token/create` does not exist on the production host, so
+    /// calling it there is not merely pointless but a request carrying the
+    /// production app credentials to an endpoint that will reject them. The
+    /// gate is here rather than at the call site so there is ONE place the rule
+    /// lives and a second caller cannot reintroduce the mistake.
+    ///
+    /// This is the whole reason a sandbox item can be linked from a terminal:
+    /// production needs Hosted Link or an embedded Link component, because only
+    /// a human completing a bank login can produce a real `public_token`.
+    pub async fn sandbox_public_token(
+        &self,
+        institution_id: &str,
+        products: &[String],
+    ) -> anyhow::Result<PublicToken> {
+        sandbox_endpoint_permitted(self.config.env).map_err(|e| anyhow::anyhow!(e))?;
+        let r: SandboxPublicTokenResponse = self
+            .post(
+                "/sandbox/public_token/create",
+                serde_json::json!({
+                    "institution_id": institution_id,
+                    "initial_products": products,
+                }),
+            )
+            .await?;
+        tracing::info!(
+            target: "talos_plaid",
+            event_kind = "plaid_sandbox_public_token_created",
+            institution_id = institution_id,
+            products = ?products,
+            "minted a SANDBOX public token"
+        );
+        Ok(PublicToken::new(r.public_token))
     }
 
     /// Exchange the browser's short-lived `public_token` for the long-lived
@@ -457,6 +523,18 @@ impl PlaidClient {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_sandbox_endpoint_is_refused_outside_sandbox() {
+        let e = super::sandbox_endpoint_permitted(crate::config::PlaidEnv::Production)
+            .expect_err("production must refuse");
+        assert!(e.contains("only in sandbox"), "{e}");
+        assert!(e.contains("public_token"), "{e}");
+        assert_eq!(
+            super::sandbox_endpoint_permitted(crate::config::PlaidEnv::Sandbox),
+            Ok(())
+        );
+    }
+
     use super::*;
     use crate::config::PlaidEnv;
 

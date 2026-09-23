@@ -417,6 +417,13 @@ done < <(grep -rEn 'SecretsManager::new\b' \
             --exclude-dir=secrets \
             controller/src 2>/dev/null \
         | grep -v 'controller/src/main.rs' \
+        `# A COMMENT IS NOT A CONSTRUCTION. Added 2026-09-23 after the` \
+        `# extraction that fixes this check's OWN reason #1 (KEK drift) was` \
+        `# reported twice — both hits were doc comments naming the` \
+        `# constructor to explain why the shared resolution exists. A check` \
+        `# that fires on the sentence describing its rule pressures the next` \
+        `# author into not writing it: checks 73/87/97's self-report trap.` \
+        | grep -vE ':[0-9]+:[[:space:]]*(//|/\*|\*)' \
         || true)
 
 if [ "$SM_VIOLATIONS" -gt 0 ]; then

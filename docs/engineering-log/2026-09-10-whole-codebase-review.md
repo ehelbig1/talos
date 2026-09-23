@@ -8009,3 +8009,138 @@ mutation that does not compile is not.
   than `none` is out of range.
 * It proves a name is present in a deployment surface, never that it reaches the
   right process or carries a sane value.
+
+## Package EG (2026-09-23) — linking an item, and the KEK nobody could ask for
+
+### The state before
+
+`talos-plaid` (#933) shipped `exchange_public_token`, `accounts` and
+`sync_transactions`, and the only caller outside the crate was the boot posture
+check. The client existed; nothing could drive it. That is the
+reached-is-not-reachable class, and it meant there was no way to obtain a Plaid
+`access_token` at all.
+
+### Why a controller subcommand, argued rather than assumed
+
+Four surfaces were possible and three are ruled out by decisions already made:
+
+* **Not a module.** `/item/public_token/exchange` RETURNS a long-lived
+  credential in its response body, and a module's response becomes
+  `module_executions.output_data`. A module may cause a credential to be used
+  and must never be the thing that receives one (EE's rule).
+* **Not MCP.** MCP is read-only for secrets by decision — MCP-1201 removed
+  `set_secret` and friends because an MCP API key is a long-lived bearer token
+  with no 2FA equivalent, so a secret write there bypasses the
+  `require_2fa + SecretsWrite` discipline.
+* **Not (yet) GraphQL.** A mutation is the right home for a future Hosted Link
+  CALLBACK, and it is where a production link will land. It cannot serve the
+  case that exists today, which is linking an item before any browser flow has
+  been built.
+* **A subcommand**, then: `publish-templates` is the precedent for an operator
+  action that needs the controller's own credentials and no HTTP surface.
+
+### The decisions are pure because the IO is not testable
+
+`talos_plaid::link` holds what must be decided; `controller/src/cli.rs` holds the
+network and the database.
+
+**`check_source`** refuses a sandbox source against a production configuration
+BEFORE any request is made, so production app credentials are never sent to an
+endpoint that does not exist on that host. The reverse — a browser token against
+a sandbox configuration — is deliberately PERMITTED and has its own test as a
+control: it is exactly the flow that proves the production shape before anyone
+depends on it, and refusing it would block the only rehearsal available.
+
+**`access_token_path`** treats the item id as untrusted input to a path, because
+that is what it is: Plaid chooses it, and it is interpolated into a vault path.
+A `/` would silently re-root the credential outside the module's grant, or over
+another secret. Refused rather than sanitised — a silently rewritten path is a
+credential nobody can find later.
+
+**`LinkReport` has no token field.** The renderer cannot print one by accident,
+and a future field cannot leak one without someone deciding to add it. Its test
+asserts on Plaid's token prefixes (`access-sandbox-`, `access-production-`,
+`public-sandbox-`) rather than on words.
+
+That last test was wrong on its first run, and instructively so: it asserted the
+report must not contain the word "secret", and failed on `plaid/secret` — the
+PATH it exists to print. A guard has to name the thing it forbids, not a word
+that appears in the thing it requires.
+
+### One home for the paths
+
+`PLAID_CLIENT_ID_PATH`, `PLAID_SECRET_PATH` and `access_token_path` all sit under
+`PLAID_VAULT_PREFIX`, and a test asserts every written path falls inside the
+`plaid/*` grant a module will be given. Three readers have to agree — the writer,
+the module's `vault://` references, and its `allowed_secrets` — and a credential
+written where the reader may not look is indistinguishable from one that was
+never written.
+
+All three are written, not only the token, and that is a consequence of EE:
+Plaid takes `client_id` and `secret` as BODY fields on every endpoint, and
+`vault://` body substitution is the only way a guest gets a secret into a body.
+
+### The KEK finding, which is the load-bearing part
+
+`SecretsManager::new` hardcodes the ENV KEK provider. The deployment's real
+resolution — `KEK_PROVIDER=env|vault`, the production env-KEK refusal, the Vault
+health check, the legacy dual-wrap provider — was INLINE in
+`build_core_services`, so anything outside the server that built a manager would
+resolve it differently. On a `KEK_PROVIDER=vault` deployment that means wrapping
+new DEKs with the env key while the server unwraps with the Vault key, which
+`with_kek_providers`' own doc calls silently corrupting every new DEK.
+
+**This is check 4's own stated reason #1** — it documents "KEK drift (production
+correctness)" at length — and the structural answer had never been written, only
+the lint. `resolve_kek_providers` is now the one home; the `// prod-kek-guard`
+refusal (check 45) moved with the code so every caller inherits it rather than
+duplicating it; and the CLI calls the same function the server does.
+
+**Check 4 was comment-blind.** It fired twice — on the doc comments explaining
+why the shared resolution exists. A check that fires on the sentence describing
+its own rule pressures the next author into not writing it, which is checks
+73/87/97's self-report trap and the third instance in one day. Comment lines are
+stripped now; it is still ZERO on pristine main, and a planted real construction
+is still caught.
+
+### Proven live
+
+One `controller plaid-link --sandbox` against Plaid Sandbox:
+
+* linked item `yey3…` with **14 accounts** (Plaid's test institution set)
+* wrote all three secrets at `encryption_format_version = 4` — the per-ORG DEK —
+  with `org_id` set and `encrypted_value` populated
+* printed **no token**: ids, account names, counts and paths only
+
+### Recorded because it would read as a bug later
+
+The three secrets carry `allowed_modules = {}`, and that is correct. The
+`vault://` prefetch resolves through `get_secrets_by_paths(paths, user_id)` — as
+the USER — so `owner_user_id` / `org_id` govern the read. `allowed_modules` gates
+a DIFFERENT route: a module calling `secrets::get-secret(path)` directly, where
+the code says in as many words that it does "NOT fall back to permissive
+access". A future reader finding an empty allowlist on a working secret should
+not spend an afternoon on it.
+
+### Mutations
+
+Six applied, each landed by hash and byte-reverted, **six caught after closing
+one survivor**: the sandbox-in-production refusal removed, the item id allowed to
+re-root the path, the report carrying a token, a written path escaping the grant
+prefix, the CLI building its own env-KEK manager (caught by check 4), and the
+client's own sandbox gate.
+
+**G6 SURVIVED first.** The client's `/sandbox/*` gate lived inside a method that
+needs a network, so nothing drove it — the same shape as EE's M8: a guard at the
+primitive that no test can reach is a guard nobody will notice losing. Extracted
+to the pure `sandbox_endpoint_permitted` and now caught.
+
+### Stated limits
+
+* The CLI body is not driven by a test — it needs a database, a network and the
+  vault. The exchange-before-write ordering, which exists so a failed exchange
+  leaves the vault untouched rather than half-seeded with credentials for an
+  item that does not exist, is argued and observed, not asserted.
+* Production still has no way to obtain a `public_token`. Hosted Link or an
+  embedded Link component is unbuilt — recorded, not done — so `--public-token`
+  is today a parameter with no producer.
