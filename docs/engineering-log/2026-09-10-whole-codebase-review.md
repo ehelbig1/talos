@@ -7515,3 +7515,74 @@ and the mutation was left in the tree — found by grep and restored. The
 harness now reverts inside a `finally`. This is the second time a hung
 mutation has stranded an edit; the rule is that the revert belongs in a block
 that runs however the attempt ends.
+
+## Package EC (2026-09-23) — two tools rejected the name they had just handed the caller back
+
+Found by using the tool surface to build a workflow rather than by auditing
+it. Both instances cost a failed call inside one afternoon, and both have the
+same mechanism: read a value out of a response, reuse the key it came under,
+get rejected.
+
+### The measurement
+
+Over the **338** distinct declared input properties:
+
+* `timeout_secs` is declared by **17** tools and rendered as a response key
+  **33** times. `set_workflow_execution_timeout` is the single tool that
+  declares `timeout_seconds` — and the field it sets renders back as
+  `execution_timeout_secs`. One tool, one concept, three spellings, and the
+  natural move is the one it refuses.
+* `create_schedule` requires `cron_expression`; `list_schedules` and the
+  analytics readers render the same value under `cron`.
+
+**The population is exactly two.** The duration-family sweep found no third:
+every other `*_secs` / `*_hours` / `*_days` input is rendered back under its
+own name.
+
+### Aliasing rather than renaming
+
+A rename breaks callers that work today, and this is a friction fix rather
+than a correctness one. The canonical names are unchanged, both spellings are
+accepted, and **the canonical wins when both are supplied** — a caller who
+sends both gets the documented one rather than a coin-flip.
+
+That was already the house answer at fifteen ad-hoc
+`or_else(|| args.get(…))` sites (`capability_world`/`world`,
+`rust_code`/`code`). This gives the convention one home,
+`utils::arg_or_alias`, so the next alias is a call rather than another
+hand-rolled chain.
+
+**An explicit `null` falls through to the alias.** Without that,
+`{"timeout_seconds": null, "timeout_secs": 900}` reads `null` from the
+canonical key and never reaches the alias — the alias would be unreachable
+exactly when a caller had reason to send both.
+
+### Mutations: 6 applied, 6 caught after closing one survivor
+
+**Q5 survived.** Reverting a call site to a bare `args.get(canonical)` leaves
+the helper's own tests green while the advertised alias silently stops
+working. A guard at the primitive cannot see a call site — the same shape as
+DZ's and EB's survivors, three packages running.
+
+It is closed by widening the pin to assert BOTH halves of what makes an alias
+real: the schema DECLARES it (an accepted-but-undeclared alias is
+undiscoverable, so the friction it was meant to remove is still there) and the
+handler READS it through `arg_or_alias` (a declared-but-unread alias is a lie
+that fails at call time). Either half alone is worthless.
+
+No lint check was added and `--count` stays 96: the population is two, and the
+structural answer is stronger than a grep.
+
+### One behaviour change, stated rather than discovered later
+
+`unknown_argument_warning` used to answer a `cron` argument with "did you mean
+'cron_expression'". It no longer does, because `cron` is now a declared name
+that `create_schedule` accepts — and warning about an argument the tool
+accepts sends the caller to fix a non-problem.
+
+Its test failed during the gate run, which is the pin working: it encoded the
+old contract. It was rewritten to assert the new one rather than deleted, and
+a CONTROL was added beside it — `a_misspelled_cron_argument_still_gets_a_suggestion`
+— so the updated test cannot pass because the suggester broke entirely instead
+of because `cron` became legitimate. A near-miss must still warn, and must
+still not echo the argument's value.

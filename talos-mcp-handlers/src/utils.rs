@@ -437,6 +437,39 @@ pub fn orchestration_error_to_response(
 ///     Err(resp) => return resp,
 /// };
 /// ```
+/// Read an argument under its canonical name, falling back to an accepted
+/// alias.
+///
+/// # Why aliases exist at all
+///
+/// This tool surface grew a few places where the name a caller READS a value
+/// under is not the name it must WRITE it under. Measured 2026-09-23:
+/// `set_workflow_execution_timeout` took `timeout_seconds` while seventeen
+/// sibling tools take `timeout_secs` and its own response renders
+/// `execution_timeout_secs` — three names for one concept in one tool — and
+/// `create_schedule` took `cron_expression` while every schedule reader
+/// renders the value under `cron`. In both cases the natural move (read the
+/// field back, reuse its name) was rejected.
+///
+/// Aliasing rather than renaming is deliberate: the canonical name keeps
+/// working, so nothing that calls these tools today breaks. It was already
+/// the house answer at fifteen ad-hoc sites (`capability_world`/`world`,
+/// `rust_code`/`code`); this gives that convention one home so the next alias
+/// is a call rather than another hand-rolled `or_else`.
+///
+/// The canonical name WINS when both are supplied — a caller who sends both
+/// gets the documented one, never a coin-flip.
+#[must_use]
+pub fn arg_or_alias<'a>(
+    args: &'a serde_json::Value,
+    canonical: &str,
+    alias: &str,
+) -> Option<&'a serde_json::Value> {
+    args.get(canonical)
+        .filter(|v| !v.is_null())
+        .or_else(|| args.get(alias).filter(|v| !v.is_null()))
+}
+
 pub fn require_uuid(
     args: &serde_json::Value,
     field: &str,
@@ -2244,13 +2277,36 @@ mod unknown_arg_tests {
     }
 
     #[test]
-    fn cron_suggests_cron_expression() {
+    /// BEHAVIOUR CHANGE, package EC: `cron` used to warn "did you mean
+    /// 'cron_expression'". It is now a DECLARED alias that `create_schedule`
+    /// accepts, so warning about it would be telling a caller to fix
+    /// something that works. The warning stopped because the friction it
+    /// described was removed, not because the suggester broke — which is what
+    /// the sibling test below holds.
+    fn cron_is_an_accepted_alias_and_no_longer_warns() {
+        assert!(
+            unknown_argument_warning(
+                "create_schedule",
+                &serde_json::json!({"workflow_id": "x", "cron": "* * * * *"}),
+            )
+            .is_none(),
+            "`cron` is a declared alias for `cron_expression`; warning about an \
+             argument the tool accepts sends the caller to fix a non-problem"
+        );
+    }
+
+    /// The suggester itself must still work — otherwise the test above could
+    /// pass because suggestions broke entirely rather than because `cron`
+    /// became legitimate. A genuine near-miss must still be caught, and must
+    /// still not echo the argument's VALUE.
+    #[test]
+    fn a_misspelled_cron_argument_still_gets_a_suggestion() {
         let w = unknown_argument_warning(
             "create_schedule",
-            &serde_json::json!({"workflow_id": "x", "cron": "* * * * *"}),
+            &serde_json::json!({"workflow_id": "x", "cron_expresion": "* * * * *"}),
         )
-        .expect("must warn");
-        assert!(w.contains("did you mean 'cron_expression'"), "warning: {w}");
+        .expect("a misspelling must still warn");
+        assert!(w.contains("cron_expression"), "warning: {w}");
         assert!(!w.contains("* * * * *"), "arg value leaked: {w}");
     }
 
@@ -3959,5 +4015,92 @@ mod blocked_vault_report_tests {
             "{}",
             r.summary
         );
+    }
+}
+
+#[cfg(test)]
+mod arg_alias_tests {
+    use super::arg_or_alias;
+    use serde_json::json;
+
+    #[test]
+    fn either_spelling_is_accepted_and_the_canonical_wins() {
+        let canonical = json!({"timeout_seconds": 900});
+        let alias = json!({"timeout_secs": 900});
+        let both = json!({"timeout_seconds": 900, "timeout_secs": 60});
+        let neither = json!({"unrelated": 1});
+
+        assert_eq!(
+            arg_or_alias(&canonical, "timeout_seconds", "timeout_secs"),
+            Some(&json!(900))
+        );
+        assert_eq!(
+            arg_or_alias(&alias, "timeout_seconds", "timeout_secs"),
+            Some(&json!(900)),
+            "the alias must be accepted — that is the whole point"
+        );
+        assert_eq!(
+            arg_or_alias(&both, "timeout_seconds", "timeout_secs"),
+            Some(&json!(900)),
+            "with both supplied the CANONICAL wins; a coin-flip would be worse \
+             than either rule"
+        );
+        assert_eq!(
+            arg_or_alias(&neither, "timeout_seconds", "timeout_secs"),
+            None
+        );
+    }
+
+    /// An explicit `null` is ABSENT, under either spelling. Without this a
+    /// caller sending `{"timeout_seconds": null, "timeout_secs": 900}` would
+    /// get `null` from the canonical key and never reach the alias — the
+    /// alias would be silently unreachable exactly when it was needed.
+    #[test]
+    fn an_explicit_null_falls_through_to_the_alias() {
+        let nulled = json!({"timeout_seconds": null, "timeout_secs": 900});
+        assert_eq!(
+            arg_or_alias(&nulled, "timeout_seconds", "timeout_secs"),
+            Some(&json!(900))
+        );
+        let both_null = json!({"timeout_seconds": null, "timeout_secs": null});
+        assert_eq!(
+            arg_or_alias(&both_null, "timeout_seconds", "timeout_secs"),
+            None,
+            "two nulls is absent, not a null value the caller must handle"
+        );
+    }
+
+    /// An alias is only real if the handler READS it and the schema DECLARES
+    /// it. Either half alone is useless: a handler that accepts a name the
+    /// schema hides is undiscoverable, and a schema that advertises a name the
+    /// handler ignores is a lie that fails at call time.
+    ///
+    /// TEXTUAL, and stated as such. It exists because the helper's own tests
+    /// structurally cannot see a call site: reverting `schedules.rs` to a bare
+    /// `args.get("cron_expression")` leaves every other test in this module
+    /// green (mutation-proved) while the alias silently stops working.
+    #[test]
+    fn every_accepted_alias_is_both_read_and_declared() {
+        for (file, canonical, alias) in [
+            ("src/workflows.rs", "timeout_seconds", "timeout_secs"),
+            ("src/schedules.rs", "cron_expression", "cron"),
+        ] {
+            let body =
+                std::fs::read_to_string(file).unwrap_or_else(|e| panic!("cannot read {file}: {e}"));
+            for name in [canonical, alias] {
+                assert!(
+                    body.contains(&format!("\"{name}\": {{ \"type\""))
+                        || body.contains(&format!("\"{name}\": {{\n")),
+                    "{file}: {name} is accepted by the handler but not declared in \
+                     the tool schema, so a caller cannot discover it"
+                );
+            }
+            assert!(
+                body.contains(&format!("arg_or_alias(args, \"{canonical}\", \"{alias}\")")),
+                "{file}: the schema advertises {alias} as an alias for {canonical}, \
+                 but the handler does not read it through arg_or_alias — the \
+                 advertised name would be rejected at call time"
+            );
+        }
     }
 }
