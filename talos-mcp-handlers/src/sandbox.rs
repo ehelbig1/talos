@@ -3,6 +3,7 @@ use super::utils::{mcp_denied, mcp_error, mcp_text, validate_dependencies};
 use super::{auth, McpState};
 use serde_json::Value;
 use std::sync::Arc;
+use talos_compilation::source_entities::decode_entities_outside_literals;
 
 // SECURITY: Per-user rate limiter for expensive LLM-backed operations
 // (generate_typed_scaffold, replay_module_regression) to prevent quota
@@ -1225,20 +1226,17 @@ async fn handle_compile_custom_sandbox(
         );
     }
 
-    // Defensively decode HTML entities (&lt; → <, &gt; → >) that LLM clients may
-    // inject when they misinterpret serde_json's \u003c escape sequences in prior
-    // MCP responses. Angle brackets in generics (HashMap<K, V>) are the common case.
-    let inner_rust_code_decoded = args
+    // Repair HTML entities some MCP clients inject when they misinterpret
+    // serde_json's \u003c escapes in a prior response (generics are the common
+    // case). ONE home, and literal-aware: a `&amp;` inside a string literal is
+    // the author's and is left alone — rewriting it silently turns an HTML
+    // escaper into a no-op that still compiles.
+    let inner_rust_raw = args
         .get("rust_code")
         .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
-        .replace("&apos;", "'")
-        .replace("&#39;", "'")
-        .replace("&quot;", "\"");
-    let inner_rust_code = inner_rust_code_decoded.as_str();
+        .unwrap_or_default();
+    let inner_rust_decode = decode_entities_outside_literals(inner_rust_raw);
+    let inner_rust_code = inner_rust_decode.source.as_ref();
 
     if inner_rust_code.is_empty() {
         return mcp_error(req_id, -32602, "Missing 'rust_code' argument");
@@ -1665,20 +1663,15 @@ async fn handle_run_sandbox(
     agent: Arc<auth::AgentIdentity>,
 ) -> JsonRpcResponse {
     // Accept `rust_code` (primary) and `code` (legacy alias) for the Rust source.
-    let inner_code_decoded = args
+    // Same repair, same home, same literal-awareness as every other
+    // source-taking entry point (see `decode_entities_outside_literals`).
+    let inner_code_raw = args
         .get("rust_code")
         .or_else(|| args.get("code"))
         .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        // Defensively decode HTML entities that LLM clients may inject when
-        // misinterpreting serde_json's \u003c escape sequences in prior MCP responses.
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
-        .replace("&apos;", "'")
-        .replace("&#39;", "'")
-        .replace("&quot;", "\"");
-    let inner_code = inner_code_decoded.as_str();
+        .unwrap_or_default();
+    let inner_code_decode = decode_entities_outside_literals(inner_code_raw);
+    let inner_code = inner_code_decode.source.as_ref();
     if inner_code.is_empty() {
         return mcp_error(req_id, -32602, "Missing required 'rust_code' argument");
     }
@@ -2537,11 +2530,16 @@ async fn handle_lint_sandbox(
     // whitespace at the boundary, and enforce the canonical
     // MAX_RUST_CODE_BYTES cap mirrored from compile_custom_sandbox so
     // both handlers refuse the same too-large payloads consistently.
-    let code = match args
+    // Repair HTML entities before linting, with the SAME literal-aware rule as
+    // compile_custom_sandbox. These two are a documented pair (lint, then
+    // compile); before this they disagreed, so a source carrying encoded
+    // generics linted as broken and compiled fine.
+    let lint_decode = args
         .get("rust_code")
         .or_else(|| args.get("code"))
         .and_then(|v| v.as_str())
-    {
+        .map(decode_entities_outside_literals);
+    let code = match lint_decode.as_ref().map(|d| d.source.as_ref()) {
         Some(c) if c.trim().is_empty() => {
             return Some(mcp_error(
                 req_id.clone(),
@@ -2679,6 +2677,28 @@ async fn handle_lint_sandbox(
     }
 }
 
+/// What `hot_update_module` did with the source, as a pure decision.
+///
+/// `rust_code` is OPTIONAL: omitting it recompiles the STORED source, which
+/// mints a fresh `content_hash` and a changed `size_bytes` — byte-for-byte the
+/// shape of a real replacement. A caller who misspells the argument (it is
+/// `rust_code`, not `source_code`) therefore reads `status: "updated"` over a
+/// no-op, with nothing in the body to tell the two apart. Naming the
+/// disposition is what makes them distinguishable.
+pub(crate) fn hot_update_source_disposition(supplied: bool) -> (&'static str, &'static str) {
+    if supplied {
+        (
+            "replaced",
+            "the supplied rust_code replaced the stored source",
+        )
+    } else {
+        (
+            "recompiled_stored",
+            "no rust_code was supplied, so the STORED source was recompiled — the new content_hash does NOT mean your source was applied",
+        )
+    }
+}
+
 async fn handle_hot_update_module(
     req_id: Option<serde_json::Value>,
     args: &Value,
@@ -2703,13 +2723,26 @@ async fn handle_hot_update_module(
         }
     };
 
+    // `rust_code` is OPTIONAL here: omitting it recompiles the STORED source.
+    // Keep that distinction explicit so the reply can state which happened —
+    // a caller who misspells the argument would otherwise get a success whose
+    // fresh content_hash is indistinguishable from a real update.
+    let hot_update_source_supplied = args.get("rust_code").and_then(|v| v.as_str()).is_some();
+    let hot_update_decode = args
+        .get("rust_code")
+        .and_then(|v| v.as_str())
+        .map(decode_entities_outside_literals);
+
     let input = HotUpdateInput {
         module_id,
         user_id,
-        rust_code: args
-            .get("rust_code")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
+        // Same literal-aware repair as every other source-taking entry point.
+        // Before this, `hot_update_module` was one of four that did NOT repair
+        // while `compile_custom_sandbox` did, so identical source produced
+        // different modules depending on which tool compiled it.
+        rust_code: hot_update_decode
+            .as_ref()
+            .map(|d| d.source.as_ref().to_string()),
         config: args.get("config").cloned(),
         capability_world: args
             .get("capability_world")
@@ -2779,8 +2812,19 @@ async fn handle_hot_update_module(
                     })
                 })
                 .collect();
-            let response = serde_json::json!({
+            // `status: "updated"` alone cannot be acted on: omitting
+            // `rust_code` RECOMPILES the stored source, which mints a fresh
+            // content_hash and a changed size_bytes — byte-for-byte the shape
+            // of a real source replacement. A caller who misspells the
+            // argument (it is `rust_code`, not `source_code`) therefore reads
+            // success over a no-op. Say which of the two happened, and say
+            // what was done to the source that was supplied.
+            let (source_disposition, source_note) =
+                hot_update_source_disposition(hot_update_source_supplied);
+            let mut response = serde_json::json!({
                 "status": "updated",
+                "source": source_disposition,
+                "source_note": source_note,
                 "module_id": out.module_id,
                 "name": out.name,
                 "size_bytes": out.size_bytes,
@@ -2789,6 +2833,9 @@ async fn handle_hot_update_module(
                 "affected_workflows": affected_workflows,
                 "affected_count": out.affected_workflows.len(),
             });
+            if let Some(note) = hot_update_decode.as_ref().and_then(|d| d.note()) {
+                response["source_entity_repair"] = serde_json::Value::String(note);
+            }
             // The module's config schema / capability description may have
             // changed — connected MCP streams should re-fetch tools/list.
             crate::notify_tools_list_changed();
@@ -4866,5 +4913,110 @@ mod agent_role_permits_world_tests {
     fn wildcard_and_admin_permit_everything() {
         assert!(agent_role_permits_world(&agent(&["*"]), "automation-node"));
         assert!(agent_role_permits_world(&agent(&["admin"]), "secrets-node"));
+    }
+}
+
+/// Source pin: every handler that accepts caller-supplied module source must
+/// route it through the ONE literal-aware entity repair.
+///
+/// Stated as a TEXTUAL pin, which is what it is. It proves the shared
+/// function is NAMED in each file that reads a source argument, never that
+/// its answer is the one compiled — that is what
+/// `talos_compilation::source_entities`' own tests cover. It exists because
+/// the defect this package fixed was an ASYMMETRY: two of six entry points
+/// repaired and four did not, so identical source produced different modules
+/// depending on which tool compiled it. A seventh entry point added without
+/// the repair would reintroduce exactly that.
+#[cfg(test)]
+mod hot_update_disposition_tests {
+    use super::hot_update_source_disposition;
+
+    /// The two cases must be DISTINGUISHABLE and the recompile case must warn.
+    /// Collapsing them is the defect: a misspelled argument reads as success.
+    #[test]
+    fn a_recompile_is_never_reported_as_a_replacement() {
+        let (replaced, replaced_note) = hot_update_source_disposition(true);
+        let (recompiled, recompiled_note) = hot_update_source_disposition(false);
+
+        assert_ne!(
+            replaced, recompiled,
+            "a supplied source and a stored-source recompile must not render identically"
+        );
+        assert_eq!(replaced, "replaced");
+        assert_eq!(recompiled, "recompiled_stored");
+
+        // The recompile note must say the hash is not evidence the caller's
+        // source was applied — that is the whole reason this field exists.
+        assert!(
+            recompiled_note.contains("content_hash"),
+            "the recompile note must warn that the fresh hash is not evidence: {recompiled_note}"
+        );
+        assert!(recompiled_note.contains("STORED"));
+        assert!(!replaced_note.contains("content_hash"));
+    }
+}
+
+#[cfg(test)]
+mod source_entity_repair_pins {
+    /// Built from parts so this test cannot vouch for itself: a pin whose own
+    /// needle line satisfies it is not a pin.
+    fn needle() -> String {
+        format!("{}_{}_{}", "decode_entities", "outside", "literals")
+    }
+
+    fn read(rel: &str) -> String {
+        std::fs::read_to_string(rel).unwrap_or_else(|e| panic!("cannot read {rel}: {e}"))
+    }
+
+    #[test]
+    fn every_source_taking_handler_routes_through_the_shared_repair() {
+        let n = needle();
+        for (file, want) in [
+            // compile_custom_sandbox, run_sandbox, lint_sandbox, hot_update_module
+            ("src/sandbox.rs", 4usize),
+            // add_node_to_workflow's inline rust_code branch
+            ("src/workflows.rs", 1),
+            // create_scratch_session
+            ("src/advanced.rs", 1),
+        ] {
+            let body = read(file);
+            // Count CALL sites only: the `use` line and prose mentions do not
+            // repair anything.
+            let calls = body
+                .lines()
+                .filter(|l| {
+                    let t = l.trim_start();
+                    !t.starts_with("//")
+                        && !t.starts_with("use ")
+                        && l.contains(&n)
+                        && l.contains('(')
+                })
+                .count();
+            assert_eq!(
+                calls, want,
+                "{file}: expected {want} call(s) to the shared source-entity repair, found {calls} \
+                 — a source-taking handler added or removed without updating this pin"
+            );
+        }
+    }
+
+    /// The inline replace-chain the shared repair replaced must not come back:
+    /// it is literal-blind, and its worst case is silently neutering an HTML
+    /// escaper in a caller's module.
+    #[test]
+    fn no_handler_hand_rolls_the_entity_chain() {
+        let chain = format!("replace(\"{}lt;\", \"<\")", "&");
+        for file in ["src/sandbox.rs", "src/workflows.rs", "src/advanced.rs"] {
+            let body = read(file);
+            let hand_rolled = body
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//") && l.contains(&chain))
+                .count();
+            assert_eq!(
+                hand_rolled, 0,
+                "{file}: hand-rolled HTML-entity decoding is literal-blind — \
+                 use talos_compilation::source_entities instead"
+            );
+        }
     }
 }

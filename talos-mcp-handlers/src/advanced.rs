@@ -1372,7 +1372,13 @@ async fn handle_create_scratch_session(
     // session that fails at run_scratch_session time with a confusing
     // compiler error. Reject whitespace at the boundary, matching
     // the same pattern as MCP-209 lint_sandbox.
-    let code = match args.get("code").and_then(|v| v.as_str()) {
+    // Same literal-aware entity repair as every other source-taking entry
+    // point (see talos_compilation::source_entities).
+    let scratch_decode = args
+        .get("code")
+        .and_then(|v| v.as_str())
+        .map(talos_compilation::source_entities::decode_entities_outside_literals);
+    let code = match scratch_decode.as_ref().map(|d| d.source.as_ref()) {
         Some(c) if c.trim().is_empty() => {
             return mcp_error(req_id, -32602, "code must be non-empty and non-whitespace")
         }

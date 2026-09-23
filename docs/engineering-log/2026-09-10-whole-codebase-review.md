@@ -7136,3 +7136,157 @@ two reasons into one label fails even though the per-value loop passes.
 * This package instruments two gates. The OTHER fail-open-shaped gates in the
   workspace (capability ceilings, module rate limits, Rhai policy evaluation)
   are unmeasured here and are not claimed to be covered.
+
+## Package DZ (2026-09-23) — caller-supplied module source was silently rewritten, and only on two of six paths
+
+This one was found by USING the platform rather than auditing it. Authoring a
+deterministic HTML composer for the new work weekly report, the escaper came
+back from `compile_custom_sandbox` with its literals decoded:
+
+```rust
+'&' => out.push_str("&amp;"),   // arrived as out.push_str("&")
+'<' => out.push_str("&lt;"),    // arrived as out.push_str("<")
+```
+
+The rewritten form is still valid Rust. It compiles, it passes every
+"does it build" check, and the escaper has become a no-op that emits exactly
+the character it exists to neutralise. A module escaping caller-influenced
+text into an operator's console or mail client would silently stop doing so.
+Only `&#39;` tends to break the build, because it can unbalance a char literal
+— that is luck, not a guard, and it is the only reason this surfaced at all.
+
+### The population
+
+Six handlers accept caller-supplied source. **Two decoded, four did not.**
+
+| handler | decoded before | decodes now |
+|---|---|---|
+| `handle_compile_custom_sandbox` | yes | yes |
+| `handle_run_sandbox` | yes | yes |
+| `handle_lint_sandbox` | **no** | yes |
+| `handle_hot_update_module` | **no** | yes |
+| `handle_add_node_to_workflow` (inline `rust_code`) | **no** | yes |
+| `handle_create_scratch_session` | **no** | yes |
+
+So identical source produced different modules depending on which tool
+compiled it. `lint_sandbox` and `compile_custom_sandbox` are a documented pair
+— lint, then compile — and they disagreed in both directions: source carrying
+encoded generics linted as broken and compiled fine, while source carrying a
+legitimate `&amp;` literal linted fine and compiled corrupted. The decode
+chain itself existed in three copies (two inline, plus
+`talos_text_util::decode_html_entities`).
+
+### The decision
+
+The repair is KEPT, because the client problem it was written for is real: a
+client that misreads `serde_json`'s `<` escapes sends
+`HashMap&lt;K, V&gt;`, which is not valid Rust and fails with a message that
+says nothing about encoding. Repairing that is a genuine convenience and
+removing it would regress those clients.
+
+What changed is that the repair is now **literal-aware** and has **one home**:
+`talos_compilation::source_entities::decode_entities_outside_literals` decodes
+in CODE regions only, never inside a string literal, a char literal, or a
+comment. Inside those the bytes are the author's. Outside them an HTML entity
+is not valid Rust anyway, so a decode there can only ever repair client
+damage. Comments count as author bytes too: a doc comment explaining `&amp;`
+must keep saying `&amp;`.
+
+A single forward scan handles line comments, nested block comments (as rustc
+nests them), plain and byte strings with backslash escapes, raw and raw byte
+strings at any hash count, and char literals. Char literals are tracked for
+exactly one reason: a `'"'` literal would otherwise open a phantom string and
+desynchronise the remainder of the file, so a generic further down would go
+unrepaired. A lifetime (`&'a str`) is not a char literal and is correctly not
+treated as one.
+
+The repair is also **reported** rather than silent — `SourceDecode::note()`
+states how many sequences were repaired in code and how many were left alone
+inside literals. That second number is the one the old chain would have
+corrupted, so a caller can now see the difference the fix makes on their own
+source.
+
+### The second defect, same surface, same class
+
+`hot_update_module`'s `rust_code` is optional: omitting it recompiles the
+STORED source. That mints a fresh `content_hash` and a changed `size_bytes` —
+byte-for-byte the shape of a real replacement. A caller who misspells the
+argument (it is `rust_code`, not `source_code`) therefore reads
+`status: "updated"` over a complete no-op, with nothing in the response body
+to tell the two apart.
+
+This was hit for real in this session. The only thing that distinguished it
+was an out-of-band "unknown argument ignored" warning from the client harness,
+which is not part of the tool's answer. The reply now carries
+`source: "replaced" | "recompiled_stored"`, computed by the pure
+`hot_update_source_disposition`, and the recompile note says in words that the
+fresh hash is not evidence the caller's source was applied.
+
+### Mutations: 7 applied, 7 caught after closing one survivor
+
+Each confirmed landed by hash before the run and byte-reverted after.
+
+- **M1** literal-awareness removed → `an_html_escaper_survives_byte_for_byte` fails.
+- **M2** one entry point stops repairing → the source pin fires.
+- **M3** hand-rolled chain reinstated → the second pin fires.
+- **M4** recompile reported as a replacement → the disposition test fails.
+- **M5** the recompile note stops mentioning `content_hash` → same test fails.
+- **M6** entity table reordered → **SURVIVED.**
+- **M7** a bare `&` entity added → the new prefix-free invariant fires.
+
+**M6 refuted this package's own comment**, which is the part worth carrying.
+The table was documented as "longest-first so a prefix can never shadow a
+longer match", and reordering it changes nothing — because no member of the
+set is a prefix of another. The ordering was never load-bearing and the claim
+was unprovable. The property that IS load-bearing is prefix-freeness, and it
+is now pinned by `the_entity_set_is_prefix_free`: add an entity that is a
+prefix of an existing one and a first-match scan would decode the shorter and
+leave the remainder as stray text in the caller's source. M7 proves that
+guard fires. A comment asserting the wrong invariant is the same defect class
+this log is full of, one level down.
+
+### Deliberately not done, and stated limits
+
+`talos_text_util::decode_html_entities` keeps its literal-blind chain and its
+four `talos-engine` callers. A Rhai condition is a different language and a
+different question, and its own `&amp;&amp;` repair is correct for that
+surface. It carries the same blind spot — a Rhai string literal containing an
+entity would be rewritten — which is recorded here and not fixed; no stored
+condition on this fleet has one.
+
+**No lint check was added and `--count` stays 96.** The population is six call
+sites in three files, below the bar this repository ships checks at, and the
+structural answer is stronger: the shared function is now the only decoder in
+the handler tree, so a seventh entry point has nothing else to call. The
+guards are two TEXTUAL source pins, stated as textual — they prove the shared
+repair is NAMED in each file that reads a source argument, never that its
+answer is the one compiled, which is what the shared crate's own 14 tests
+cover. The pins' needle is assembled from parts so a pin cannot vouch for
+itself.
+
+### One unrelated pre-existing flake, fixed here and called out as unrelated
+
+`expired_db_is_refused_in_production_and_passes_elsewhere` (package DM) failed
+roughly one run in three, reproduced three times before being touched. It is
+not related to this package's subject; it is fixed here because a test in a
+crate this PR touches that reds 1 in 3 makes "all gates green before shipping"
+unverifiable.
+
+The cause: an empty tempdir carries no `.git/refs/heads/*` and no `crates/`,
+so the directory mtime is the ONLY signal `advisory_db_age_days` can read.
+`File::open(dir).set_modified()` returns `Ok` on macOS without always taking
+effect. When it did not take, the age read back as 0, the gate CORRECTLY
+passed, and the test failed on `expect_err` against the gate — pointing at the
+gate rather than at its own setup, which is why it read as a gate regression.
+
+The setup now retries up to five times and verifies through
+`advisory_db_age_days` — the same reader the gate uses, so agreement with the
+gate is the property being confirmed rather than a second metadata call. If a
+filesystem will not honour a directory backdate the test skips LOUDLY and says
+so, because the gate's decision is covered without the filesystem by
+`advisory_db::tests::the_gate_refuses_only_an_expired_copy_in_production`.
+
+Measured after the fix: 6/6 green with **zero** skips, so the test genuinely
+exercises rather than silently opting out; and a mutation forcing
+`advisory_db_gate_outcome` to always `Pass` still fails it, so it remains a
+gate.

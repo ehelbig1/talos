@@ -2121,10 +2121,17 @@ async fn handle_add_node_to_workflow(
         }
     }
 
-    let module_id_str: String = if let Some(rust_code) = args
+    // Repair HTML entities with the SAME literal-aware rule the sandbox
+    // compile paths use — this inline-compile route is a source-taking entry
+    // point like any other, and before this it was one of four that did not
+    // repair while compile_custom_sandbox did.
+    let inline_decode = args
         .get("rust_code")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
+        .map(talos_compilation::source_entities::decode_entities_outside_literals);
+    let module_id_str: String = if let Some(rust_code) =
+        inline_decode.as_ref().map(|d| d.source.as_ref())
     {
         // Default to minimal-node — pure computation is almost always
         // enough. Over-privileging silently passes capability ceiling
