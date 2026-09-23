@@ -738,7 +738,42 @@ impl wit_http::Host for TalosContext {
             builder = builder.header("Idempotency-Key", idem.as_str());
         }
         if !body.is_empty() {
-            builder = builder.body(body.clone());
+            // Resolve any `vault://` reference in a JSON body, after the
+            // headers and immediately before the send.
+            //
+            // The guest composed this body with the PLACEHOLDER; only the
+            // bytes handed to reqwest below carry plaintext, and they are
+            // never returned to the guest, logged, or stored. What can reach
+            // `module_executions.output_data` is therefore the placeholder
+            // form — which is what an auditor wants to see and cannot leak.
+            //
+            // The content type comes from the guest's own headers. A body with
+            // no JSON content type is REFUSED rather than rewritten (see
+            // `resolve_vault_json_body`), so this cannot corrupt a binary
+            // payload that happens to contain the marker bytes.
+            let declared_content_type = headers
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+                .map(|(_, v)| v.clone());
+            let resolved_body = match self
+                .resolve_vault_json_body(
+                    crate::context::SecretUseSurface::HttpJsonBody,
+                    &host_str,
+                    &body,
+                    declared_content_type.as_deref(),
+                )
+                .await
+            {
+                Ok(v) => v,
+                // Same exit shape as the header loop's refusal: the
+                // circuit-breaker permit is left unsettled, exactly as the
+                // `?` it mirrors.
+                Err(_) => return Err(deny_forbidden(self, reason_class::SECRET_LOOKUP)),
+            };
+            match resolved_body {
+                Some(substituted) => builder = builder.body(substituted),
+                None => builder = builder.body(body.clone()),
+            }
         }
 
         let response = match builder.send().await {
@@ -2718,5 +2753,56 @@ mod fetch_all_budget_and_breaker_tests {
             "a two-entry batch must spend exactly one trial token and, unsettled, repay it"
         );
         assert_eq!(cb.trial_tally(host), Some((0, 0)));
+    }
+}
+
+/// The body-substitution wiring, pinned TEXTUALLY because it cannot be driven:
+/// `fetch` needs a live secret provider, a resolvable host and a server. Two
+/// silent mutations live here — resolving the body and then sending the
+/// guest's original bytes (the PLACEHOLDER reaches the third party), and
+/// continuing past a refusal instead of returning. Neither changes any
+/// observable value in this process, so a test cannot see them.
+///
+/// Stated as a limit: a pin proves the source says the right thing, never that
+/// the request carried the right bytes.
+#[cfg(test)]
+mod vault_body_wiring_pin {
+    /// Needles are assembled at runtime so this test cannot match its own
+    /// source.
+    fn needle(parts: &[&str]) -> String {
+        parts.concat()
+    }
+
+    #[test]
+    fn the_substituted_body_is_the_one_sent_and_a_refusal_returns() {
+        let src = include_str!("http.rs");
+        let production = src
+            .split_once("#[cfg(test)]")
+            .map_or(src, |(before, _)| before);
+
+        // The resolved bytes, not the guest's originals, are what reqwest gets.
+        assert!(
+            production.contains(&needle(&[
+                "Some(substituted) => builder = builder",
+                ".body(",
+                "substituted)"
+            ])),
+            "the substituted body must be the body that is sent"
+        );
+        // A refusal exits; it never falls through to a send carrying the
+        // unresolved placeholder.
+        assert!(
+            production.contains(&needle(&[
+                "Err(_) => return Err(deny_forbidden(self, ",
+                "reason_class::SECRET_LOOKUP))"
+            ])),
+            "a body-resolution refusal must return, not continue to the send"
+        );
+        // The content type is read from the guest's own headers, so the
+        // JSON-only rule is decided by what the request actually declares.
+        assert!(
+            production.contains(&needle(&["n.eq_ignore_ascii_case(", "\"content-type\")"])),
+            "the declared content type must come from the request's own headers"
+        );
     }
 }

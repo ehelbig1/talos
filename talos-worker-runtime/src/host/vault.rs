@@ -298,6 +298,187 @@ pub(crate) fn vault_path_short_hash(vault_path: &str) -> String {
     hex::encode(&h[..8])
 }
 
+/// Most `vault://` references one request body may carry.
+///
+/// A credential-bearing body needs one, occasionally two (an app secret and a
+/// per-user token). Eight is generous and still bounds a module that would
+/// otherwise turn a single call into a long run of vault lookups.
+pub(crate) const MAX_BODY_VAULT_REFS: usize = 8;
+
+/// Does this byte string contain the `vault://` marker at all?
+///
+/// Byte-level so an unparsed, possibly-binary body can be screened without
+/// UTF-8 validation or a JSON parse.
+pub(crate) fn contains_vault_marker(body: &[u8]) -> bool {
+    body.windows(b"vault://".len()).any(|w| w == b"vault://")
+}
+
+/// JSON pointers of every string VALUE containing a `vault://` reference.
+///
+/// Iterative rather than recursive: a deeply nested body is caller-supplied,
+/// and serde_json's own 128-deep parse limit bounds the input but not a
+/// hand-rolled recursion's stack usage. Keys are never inspected — a key is
+/// structure, and substituting there could collide or invent a field.
+pub(crate) fn collect_vault_string_pointers(doc: &serde_json::Value) -> Vec<(String, String)> {
+    fn escape(token: &str) -> String {
+        // RFC 6901: `~` -> `~0`, `/` -> `~1`.
+        token.replace('~', "~0").replace('/', "~1")
+    }
+    let mut out = Vec::new();
+    let mut stack = vec![(String::new(), doc)];
+    while let Some((path, node)) = stack.pop() {
+        match node {
+            // String VALUES only. A key is structure: substituting there could
+            // collide two fields or invent one.
+            serde_json::Value::String(v) if v.contains("vault://") => {
+                out.push((path, v.clone()));
+            }
+            serde_json::Value::Object(map) => {
+                for (k, v) in map {
+                    stack.push((format!("{path}/{}", escape(k)), v));
+                }
+            }
+            serde_json::Value::Array(items) => {
+                for (i, v) in items.iter().enumerate() {
+                    stack.push((format!("{path}/{i}"), v));
+                }
+            }
+            _ => {}
+        }
+    }
+    // Deterministic order so a denial names the same field every run.
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// Everything decided about a body BEFORE any vault lookup.
+///
+/// `Ok(None)` means "send the body untouched": no marker at all, or a marker
+/// that sits somewhere no substitution may occur. `Err` is a refusal — the
+/// request must not go out. `Ok(Some(..))` hands back the parsed document and
+/// the targets to resolve.
+///
+/// Pure, and separated from `resolve_vault_json_body` for one reason: the
+/// resolution step needs a live secret provider, so anything left inside it is
+/// untestable. Three rules were mutation-proved to SURVIVE while they lived
+/// there — the JSON-only refusal, the reference cap, and the
+/// no-substitutable-value case — which is why they are here instead.
+/// Write one resolved secret into the parsed body at `pointer`.
+///
+/// Pure, so the refusal below is reachable from a test — the enclosing
+/// `resolve_vault_json_body` needs a live secret provider and cannot be
+/// driven from a unit test.
+///
+/// A miss cannot happen in production (nothing mutates the tree between the
+/// collect walk and this write) but is a REFUSAL rather than a silent skip:
+/// leaving the reference in place would send the PLACEHOLDER — the vault
+/// path, naming the provider and the user — to a third party.
+pub(crate) fn apply_body_substitution(
+    doc: &mut serde_json::Value,
+    pointer: &str,
+    resolved: String,
+) -> Result<(), String> {
+    match doc.pointer_mut(pointer) {
+        Some(slot) => {
+            *slot = serde_json::Value::String(resolved);
+            Ok(())
+        }
+        None => Err(
+            "internal: a vault:// body reference could not be addressed for \
+                     substitution; refusing to send the unresolved placeholder"
+                .to_string(),
+        ),
+    }
+}
+
+pub(crate) fn plan_body_substitution(
+    body: &[u8],
+    content_type: Option<&str>,
+) -> Result<Option<(serde_json::Value, Vec<(String, String)>)>, String> {
+    // Fast path: no reference, no parse, no cost. Screened on the RAW bytes so
+    // a merely-large body is untouched and a binary one is never decoded.
+    if !contains_vault_marker(body) {
+        return Ok(None);
+    }
+
+    let is_json = content_type
+        .map(|ct| {
+            let ct = ct.to_ascii_lowercase();
+            ct.starts_with("application/json") || ct.contains("+json")
+        })
+        .unwrap_or(false);
+    if !is_json {
+        return Err(concat!(
+            "a vault:// reference in a request body requires ",
+            "Content-Type: application/json — a non-JSON body is not ",
+            "substitutable and was refused rather than rewritten"
+        )
+        .to_string());
+    }
+
+    let doc: serde_json::Value = serde_json::from_slice(body).map_err(|_| {
+        "request body declares JSON but does not parse; refusing to substitute".to_string()
+    })?;
+
+    let targets = collect_vault_string_pointers(&doc);
+    if targets.is_empty() {
+        // The marker was in the raw bytes but not in any string VALUE — a key,
+        // or a coincidence. Leave the body exactly as the guest built it.
+        return Ok(None);
+    }
+    if targets.len() > MAX_BODY_VAULT_REFS {
+        return Err(format!(
+            "request body carries {} vault:// references; the cap is {MAX_BODY_VAULT_REFS}",
+            targets.len()
+        ));
+    }
+    Ok(Some((doc, targets)))
+}
+
+/// Where a resolved credential is placed in an outbound request.
+///
+/// A CLOSED set, deliberately: the HOST performs the placement, so every
+/// position a credential can occupy is enumerable here and reviewable in one
+/// screen, rather than the guest naming an arbitrary destination.
+///
+/// `Header` is the original and only placement until 2026-09-23. `JsonBody`
+/// exists because some providers authenticate in the request body and cannot
+/// be reached otherwise — Plaid's per-user `access_token` is the first. The
+/// security property is unchanged and shared: the guest holds the
+/// `vault://` PLACEHOLDER, the host holds the plaintext, and the resolved
+/// bytes are never returned to the guest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VaultPlacement<'a> {
+    /// An outbound header value, e.g. `Authorization: Bearer vault://…`.
+    Header(&'a str),
+    /// A JSON string VALUE in the request body, at the given JSON pointer.
+    JsonBody(&'a str),
+}
+
+impl<'a> VaultPlacement<'a> {
+    /// The guest-facing name of the position, used in deny messages and in
+    /// the ledger's `header` field.
+    pub(crate) const fn label(self) -> &'a str {
+        match self {
+            Self::Header(n) | Self::JsonBody(n) => n,
+        }
+    }
+
+    /// The audit-ledger capability label. Distinct per placement so an
+    /// operator reading the WORM chain can tell WHERE a refused credential
+    /// would have gone, not merely that one was refused.
+    pub(crate) const fn audit_label(self) -> &'static str {
+        match self {
+            Self::Header(_) => "vault-header",
+            Self::JsonBody(_) => "vault-json-body",
+        }
+    }
+
+    pub(crate) const fn is_header(self) -> bool {
+        matches!(self, Self::Header(_))
+    }
+}
+
 impl TalosContext {
     /// Resolve `host` and reject if any A/AAAA record falls in the
     /// private/loopback/link-local/CGNAT/IPv4-mapped-IPv6 deny-list.
@@ -469,6 +650,75 @@ impl TalosContext {
     /// the async provider, which (a) blocked a runtime worker thread for
     /// the duration of every vault lookup and (b) made it impossible to
     /// emit signed audit events from the deny paths. Both fixed here.
+    /// Resolve every `vault://` reference in a JSON request BODY.
+    ///
+    /// Returns `Ok(None)` when the body carries no reference at all — the
+    /// overwhelmingly common case, answered without parsing anything.
+    ///
+    /// # The rules, and why each exists
+    ///
+    /// * **JSON only.** A body is substitutable only when it parses as JSON
+    ///   and declares a JSON content type. A binary body containing the bytes
+    ///   `vault://` is a coincidence, not a request to substitute, and
+    ///   rewriting it would corrupt the payload.
+    /// * **String VALUES only, never keys.** A key is structure; substituting
+    ///   there could collide two fields or invent one.
+    /// * **Substitution happens in the parsed tree, not the raw text.** The
+    ///   re-serialisation escapes the credential correctly by construction, so
+    ///   a token containing a quote or backslash cannot break out of its
+    ///   string and alter the request's shape. String splicing into raw JSON
+    ///   would be an injection surface; this is not.
+    /// * **Bounded.** At most [`MAX_BODY_VAULT_REFS`] references per request,
+    ///   so a module cannot turn one call into an unbounded run of vault
+    ///   lookups.
+    /// * **The guest never sees the result.** The resolved bytes go to
+    ///   `reqwest` and are dropped; what the guest holds, and therefore what
+    ///   can ever reach `module_executions.output_data` or a trace, is the
+    ///   PLACEHOLDER form. An auditor reading a stored body sees
+    ///   `vault://plaid/…`, which is more useful than a redacted blob and
+    ///   cannot leak.
+    ///
+    /// Every gate — the module's `allowed_secrets` grant, the reserved
+    /// host-secret deny list, the tier-1 LLM ceiling, the ledger entry — is
+    /// the SHARED one in [`Self::resolve_vault_placed`]. This function adds
+    /// placement, not policy.
+    pub(crate) async fn resolve_vault_json_body(
+        &mut self,
+        surface: SecretUseSurface,
+        destination: &str,
+        body: &[u8],
+        content_type: Option<&str>,
+    ) -> Result<Option<Vec<u8>>, String> {
+        // Every decision that can be made WITHOUT touching the vault is made
+        // in one pure function, so each rule is directly testable —
+        // `resolve_vault_json_body` itself needs a live secret provider and
+        // cannot be driven from a unit test.
+        let Some((mut doc, targets)) = plan_body_substitution(body, content_type)? else {
+            return Ok(None);
+        };
+
+        for (pointer, original) in targets {
+            let resolved = self
+                .resolve_vault_placed(
+                    surface,
+                    destination,
+                    VaultPlacement::JsonBody(&pointer),
+                    &original,
+                )
+                .await?;
+            apply_body_substitution(&mut doc, &pointer, resolved.into_owned())?;
+        }
+
+        serde_json::to_vec(&doc)
+            .map(Some)
+            .map_err(|_| "failed to re-serialise the substituted request body".to_string())
+    }
+
+    /// Resolve a `vault://` reference in a HEADER value.
+    ///
+    /// A thin wrapper over [`Self::resolve_vault_placed`] — the header is one
+    /// PLACEMENT, and every gate lives in the shared body so a second
+    /// placement cannot drift away from the first.
     pub(crate) async fn resolve_vault_header<'a>(
         &mut self,
         surface: SecretUseSurface,
@@ -476,6 +726,33 @@ impl TalosContext {
         header_name: &str,
         value: &'a str,
     ) -> Result<std::borrow::Cow<'a, str>, String> {
+        self.resolve_vault_placed(
+            surface,
+            destination,
+            VaultPlacement::Header(header_name),
+            value,
+        )
+        .await
+    }
+
+    /// Resolve a `vault://` reference for a given [`VaultPlacement`].
+    ///
+    /// # The property this keeps
+    ///
+    /// A module can USE a credential without SEEING it. The guest composes a
+    /// request carrying the literal `vault://<path>`; the host resolves it at
+    /// send time and the resolved bytes are never handed back. "Headers only"
+    /// was a PROXY for that property rather than the property itself, which is
+    /// why adding a second placement is an extension of this function and not
+    /// a new mechanism — every gate below applies to both.
+    pub(crate) async fn resolve_vault_placed<'a>(
+        &mut self,
+        surface: SecretUseSurface,
+        destination: &str,
+        placement: VaultPlacement<'_>,
+        value: &'a str,
+    ) -> Result<std::borrow::Cow<'a, str>, String> {
+        let header_name = placement.label();
         // Resolve a `vault://<path>` reference embedded ANYWHERE in the header
         // value, not only as an exact prefix. The canonical integration-module
         // pattern carries a scheme prefix, e.g.
@@ -531,8 +808,12 @@ impl TalosContext {
             // above is what the operator will see in the guest-side
             // error and the corresponding tracing log line.
             let full_path_hash = format!("{:x}", Sha256::digest(vault_path.as_bytes()));
-            self.record_capability_denied("vault-header", "secret-allowlist", &full_path_hash)
-                .await;
+            self.record_capability_denied(
+                placement.audit_label(),
+                "secret-allowlist",
+                &full_path_hash,
+            )
+            .await;
             tracing::warn!(
                 vault_path = %talos_workflow_job_protocol::redact_vault_path_for_log(vault_path),
                 vault_path_hash = %vault_path_hash,
@@ -567,8 +848,12 @@ impl TalosContext {
             // allowlist-deny path above. Same audit/log/error shape:
             // full hash in audit, truncated hash in guest error + log.
             let full_path_hash = format!("{:x}", Sha256::digest(vault_path.as_bytes()));
-            self.record_capability_denied("vault-header", "tier1-llm-egress", &full_path_hash)
-                .await;
+            self.record_capability_denied(
+                placement.audit_label(),
+                "tier1-llm-egress",
+                &full_path_hash,
+            )
+            .await;
             tracing::warn!(
                 vault_path = %talos_workflow_job_protocol::redact_vault_path_for_log(vault_path),
                 vault_path_hash = %vault_path_hash,
@@ -605,7 +890,19 @@ impl TalosContext {
                 // into_auth_header return the CR/LF-guarded RAW token WITHOUT
                 // prepending a scheme (its `needs_bearer` gate keys on the header
                 // name being "authorization"), so we never emit "Bearer Bearer …".
-                let embedded = !(prefix.is_empty() && suffix.is_empty());
+                // `into_auth_header(handle, name)` prepends "Bearer " only for
+                // an Authorization HEADER carrying a bare token. A JSON body
+                // field must never gain a scheme, so a body placement always
+                // takes the raw-token path.
+                // A HEADER value may be `Bearer vault://…`, so a BARE header
+                // reference resolves to the credential alone and anything else
+                // is spliced into its surrounding text. A body VALUE has no
+                // surrounding text — the slot IS the whole string — so a body
+                // placement is always spliced and never takes the auth-scheme
+                // path, which would prepend an invented `Bearer `.
+                let is_bare_header_value =
+                    prefix.is_empty() && suffix.is_empty() && placement.is_header();
+                let embedded = !is_bare_header_value;
                 let header_result = self
                     .provider
                     .into_auth_header(handle, if embedded { "" } else { header_name });
@@ -886,5 +1183,301 @@ impl TalosContext {
         )
         .await;
         Some(v)
+    }
+}
+
+#[cfg(test)]
+mod vault_body_placement_tests {
+    use super::{collect_vault_string_pointers, contains_vault_marker, VaultPlacement};
+    use serde_json::json;
+
+    fn pointers(v: &serde_json::Value) -> Vec<String> {
+        collect_vault_string_pointers(v)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect()
+    }
+
+    #[test]
+    fn the_marker_screen_works_on_raw_bytes_including_non_utf8() {
+        assert!(contains_vault_marker(br#"{"a":"vault://x/y"}"#));
+        assert!(!contains_vault_marker(br#"{"a":"nothing here"}"#));
+        assert!(!contains_vault_marker(b""));
+        // Invalid UTF-8 must not panic — this screen runs before any parse.
+        assert!(!contains_vault_marker(&[0xff, 0xfe, 0x00, 0x01]));
+        let mut bin = vec![0xffu8, 0x00];
+        bin.extend_from_slice(b"vault://k");
+        assert!(contains_vault_marker(&bin));
+    }
+
+    /// String VALUES only. A key that happens to contain the marker is
+    /// structure, and substituting there could collide or invent a field.
+    #[test]
+    fn a_key_is_never_a_substitution_target() {
+        let doc = json!({ "vault://not-a-secret": "plain value" });
+        assert!(
+            pointers(&doc).is_empty(),
+            "a KEY containing the marker must not be collected"
+        );
+    }
+
+    #[test]
+    fn nested_objects_and_arrays_are_addressed_by_json_pointer() {
+        let doc = json!({
+            "access_token": "vault://plaid/token",
+            "nested": { "inner": "vault://a/b" },
+            "list": ["plain", "vault://c/d"],
+            "number": 42,
+            "null": null,
+        });
+        let mut p = pointers(&doc);
+        p.sort();
+        assert_eq!(
+            p,
+            vec![
+                "/access_token".to_string(),
+                "/list/1".to_string(),
+                "/nested/inner".to_string(),
+            ]
+        );
+        // Every collected pointer must actually address its node, or the
+        // substitution step would refuse and the request would be lost.
+        for ptr in &p {
+            assert!(doc.pointer(ptr).is_some(), "pointer {ptr} does not resolve");
+        }
+    }
+
+    /// RFC 6901 escaping. A key containing `/` or `~` would otherwise build a
+    /// pointer addressing a DIFFERENT node — silently substituting into the
+    /// wrong field.
+    #[test]
+    fn keys_needing_rfc6901_escaping_still_address_their_own_node() {
+        let doc = json!({
+            "a/b": "vault://slash/key",
+            "c~d": "vault://tilde/key",
+        });
+        for (ptr, _) in collect_vault_string_pointers(&doc) {
+            let node = doc
+                .pointer(&ptr)
+                .unwrap_or_else(|| panic!("pointer {ptr} does not resolve"));
+            assert!(
+                node.as_str().is_some_and(|s| s.contains("vault://")),
+                "pointer {ptr} addressed the wrong node: {node:?}"
+            );
+        }
+        assert_eq!(collect_vault_string_pointers(&doc).len(), 2);
+    }
+
+    /// Substitution happens in the PARSED tree, so re-serialisation escapes
+    /// the credential by construction. A token carrying a quote or backslash
+    /// cannot break out of its string and change the request's shape.
+    #[test]
+    fn a_resolved_value_cannot_break_out_of_its_json_string() {
+        let mut doc = json!({ "access_token": "vault://p/t", "keep": "me" });
+        let hostile = r#"a" , "injected":"yes"#;
+        *doc.pointer_mut("/access_token").expect("pointer") =
+            serde_json::Value::String(hostile.to_string());
+        let out = serde_json::to_vec(&doc).expect("serialise");
+        let back: serde_json::Value = serde_json::from_slice(&out).expect("round trip");
+        assert_eq!(back["access_token"], hostile, "the value survives verbatim");
+        assert!(
+            back.get("injected").is_none(),
+            "a quote in the credential must not add a field: {back}"
+        );
+        assert_eq!(back["keep"], "me");
+    }
+
+    #[test]
+    fn the_placement_labels_are_distinct_so_an_auditor_can_tell_them_apart() {
+        let h = VaultPlacement::Header("Authorization");
+        let b = VaultPlacement::JsonBody("/access_token");
+        assert_eq!(h.audit_label(), "vault-header");
+        assert_eq!(b.audit_label(), "vault-json-body");
+        assert_ne!(h.audit_label(), b.audit_label());
+        assert_eq!(h.label(), "Authorization");
+        assert_eq!(b.label(), "/access_token");
+        assert!(h.is_header());
+        assert!(
+            !b.is_header(),
+            "a body placement must never take the auth-scheme path — a JSON \
+             field must not gain a 'Bearer ' prefix"
+        );
+    }
+
+    /// A body with the marker but no substitutable string value is returned
+    /// UNCHANGED, not rewritten.
+    #[test]
+    fn a_marker_outside_any_string_value_collects_nothing() {
+        let doc = json!({ "vault://key-only": 1, "n": 2 });
+        assert!(pointers(&doc).is_empty());
+    }
+
+    #[test]
+    fn deep_nesting_is_walked_without_recursion() {
+        // Build a 200-deep chain — past any hand-rolled recursion's comfort,
+        // and the reason the walk is iterative.
+        let mut doc = json!("vault://deep/secret");
+        for _ in 0..200 {
+            doc = json!({ "n": doc });
+        }
+        let p = pointers(&doc);
+        assert_eq!(p.len(), 1);
+        assert!(doc.pointer(&p[0]).is_some());
+    }
+}
+
+#[cfg(test)]
+mod vault_body_plan_tests {
+    use super::{apply_body_substitution, plan_body_substitution, MAX_BODY_VAULT_REFS};
+
+    const JSON: Option<&str> = Some("application/json");
+
+    /// The write step, both directions. The refusal matters more than it
+    /// looks: a pointer that no longer addresses anything means the reference
+    /// stays in the body, so sending it would hand the vault PATH — provider
+    /// and user — to the third party the request is aimed at.
+    #[test]
+    fn an_unaddressable_pointer_is_refused_rather_than_left_in_place() {
+        let mut doc = serde_json::json!({"access_token": "vault://plaid/token"});
+        let e = apply_body_substitution(&mut doc, "/nope", "s3cr3t".to_string())
+            .expect_err("an unaddressable pointer must refuse");
+        assert!(
+            e.contains("refusing to send the unresolved placeholder"),
+            "{e}"
+        );
+        // The refusal is what keeps the placeholder from being sent: the body
+        // is unchanged and the caller aborts rather than serialising it.
+        assert_eq!(doc["access_token"], "vault://plaid/token");
+        assert!(
+            !e.contains("s3cr3t"),
+            "the refusal must not name the secret: {e}"
+        );
+    }
+
+    #[test]
+    fn an_addressable_pointer_is_replaced_with_the_resolved_value() {
+        let mut doc = serde_json::json!({"a": {"b": ["vault://plaid/token"]}});
+        apply_body_substitution(&mut doc, "/a/b/0", "s3cr3t".to_string()).expect("addressable");
+        assert_eq!(doc["a"]["b"][0], "s3cr3t");
+    }
+
+    /// Substitution happens in the parsed TREE, so a credential containing a
+    /// quote or a backslash is escaped by the serialiser and cannot break out
+    /// of its string. Raw-text splicing would be an injection surface.
+    #[test]
+    fn a_credential_carrying_json_metacharacters_cannot_alter_the_shape() {
+        let mut doc = serde_json::json!({"token": "vault://p/k", "amount": 1});
+        apply_body_substitution(&mut doc, "/token", r#"a"},"amount":999,"x":"\"#.to_string())
+            .expect("addressable");
+        let bytes = serde_json::to_vec(&doc).expect("serialise");
+        let back: serde_json::Value = serde_json::from_slice(&bytes).expect("round trip");
+        assert_eq!(back["amount"], 1, "the injected field must not take effect");
+        assert_eq!(back["token"], r#"a"},"amount":999,"x":"\"#);
+    }
+
+    #[test]
+    fn a_body_with_no_marker_is_sent_untouched_without_parsing() {
+        // Deliberately NOT valid JSON: the marker screen must answer before
+        // any parse, so an ordinary non-JSON body never reaches the parser.
+        let r = plan_body_substitution(b"\xff\xfe binary payload", None).expect("no refusal");
+        assert!(r.is_none());
+    }
+
+    /// The rule that survived its first mutation: a non-JSON body carrying the
+    /// marker is REFUSED, never rewritten. Rewriting would corrupt a binary
+    /// payload that merely contains those bytes.
+    #[test]
+    fn a_marker_in_a_non_json_body_is_refused_not_rewritten() {
+        for ct in [None, Some("text/plain"), Some("application/octet-stream")] {
+            let e = plan_body_substitution(br#"{"t":"vault://a/b"}"#, ct)
+                .expect_err("a non-JSON content type must refuse");
+            assert!(e.contains("application/json"), "{e}");
+            assert!(e.contains("refused"), "{e}");
+        }
+        // The JSON family is accepted, including +json suffixes.
+        for ct in [
+            Some("application/json"),
+            Some("application/json; charset=utf-8"),
+            Some("application/merge-patch+json"),
+        ] {
+            assert!(
+                plan_body_substitution(br#"{"t":"vault://a/b"}"#, ct).is_ok(),
+                "{ct:?} should be substitutable"
+            );
+        }
+    }
+
+    /// The other rule that survived: the per-body reference cap.
+    #[test]
+    fn more_references_than_the_cap_is_refused() {
+        let ok: String = (0..MAX_BODY_VAULT_REFS)
+            .map(|i| format!("\"k{i}\":\"vault://p/{i}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let at_cap = format!("{{{ok}}}");
+        let plan = plan_body_substitution(at_cap.as_bytes(), JSON).expect("at the cap is allowed");
+        assert_eq!(plan.expect("targets").1.len(), MAX_BODY_VAULT_REFS);
+
+        let over: String = (0..MAX_BODY_VAULT_REFS + 1)
+            .map(|i| format!("\"k{i}\":\"vault://p/{i}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let e = plan_body_substitution(format!("{{{over}}}").as_bytes(), JSON)
+            .expect_err("over the cap must refuse");
+        assert!(e.contains("cap is"), "{e}");
+    }
+
+    #[test]
+    fn a_json_content_type_that_does_not_parse_is_refused() {
+        let e = plan_body_substitution(b"{\"t\": \"vault://a/b\" ", JSON)
+            .expect_err("malformed JSON must refuse");
+        assert!(e.contains("does not parse"), "{e}");
+    }
+
+    /// A marker present only in a KEY yields no targets, and the body is sent
+    /// exactly as the guest built it rather than refused.
+    #[test]
+    fn a_marker_only_in_a_key_sends_the_body_untouched() {
+        let r = plan_body_substitution(br#"{"vault://k":1}"#, JSON).expect("not a refusal");
+        assert!(r.is_none());
+    }
+
+    #[test]
+    fn a_normal_credential_body_plans_exactly_one_substitution() {
+        let (_doc, targets) = plan_body_substitution(
+            br#"{"access_token":"vault://plaid/token","count":500}"#,
+            JSON,
+        )
+        .expect("no refusal")
+        .expect("targets");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].0, "/access_token");
+        assert_eq!(targets[0].1, "vault://plaid/token");
+    }
+}
+
+/// TEXTUAL pin, stated as such: a BODY placement must never take the
+/// auth-scheme path.
+///
+/// `into_auth_header` prepends `Bearer ` for a bare token in an Authorization
+/// header. A JSON field must not gain a scheme — `{"access_token":"Bearer x"}`
+/// is a different request, and the provider rejects it. The guard is the
+/// `|| !placement.is_header()` term in the `embedded` decision, which lives
+/// inside `resolve_vault_placed` and cannot be reached without a live secret
+/// provider; removing it was mutation-proved to survive every behavioural test
+/// in this crate.
+#[cfg(test)]
+mod vault_body_scheme_pin {
+    #[test]
+    fn a_body_placement_never_takes_the_auth_scheme_path() {
+        let src = include_str!("vault.rs");
+        let production = &src[..src
+            .find("mod vault_body_placement_tests")
+            .expect("test module marker")];
+        assert!(
+            production.contains("&& placement.is_header();"),
+            "the `embedded` decision must force the raw-token path for a body \
+             placement; without it a JSON field would gain a 'Bearer ' prefix"
+        );
     }
 }

@@ -1135,6 +1135,12 @@ pub(crate) fn capability_world_has_fs_preopen(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SecretUseSurface {
     HttpHeader,
+    /// A `vault://` reference resolved into a JSON REQUEST BODY field. Kept
+    /// distinct from `HttpHeader` so the WORM ledger records WHERE a
+    /// credential was placed, not merely that it was used — the two
+    /// placements have different review properties and an auditor must be
+    /// able to tell them apart.
+    HttpJsonBody,
     GraphqlHeader,
     HttpStreamHeader,
     WebhookHeader,
@@ -1147,6 +1153,7 @@ impl SecretUseSurface {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::HttpHeader => "http-header",
+            Self::HttpJsonBody => "http-json-body",
             Self::GraphqlHeader => "graphql-header",
             Self::HttpStreamHeader => "http-stream-header",
             Self::WebhookHeader => "webhook-header",
