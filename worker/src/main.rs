@@ -672,32 +672,22 @@ static WORKER_SIGNATURE_DIAG_ENABLED: std::sync::LazyLock<bool> =
 
 /// Coarse, non-sensitive classification of a verify failure.
 ///
-/// Returns a stable token. Deliberately NOT the raw error and NOT any request
-/// field: safe to publish on an unverified request, which is exactly when it is
-/// needed. Distinct classes because the operator action differs — `key_config`
-/// is a deploy/env problem, `scheme_mismatch` is version skew between controller
-/// and worker, `replay` is a nonce-cache interaction, `stale_timestamp` is a
-/// LIVENESS failure (a stall or clock skew, not tampering), and `mismatch` is a
-/// genuine signing-payload divergence.
+/// Thin alias for [`talos_workflow_job_protocol::verify_failure_class`], which
+/// is where this mapping LIVES as of 2026-09-23. The tokens are unchanged; what
+/// moved is the home, because the controller's dispatcher is now a second
+/// reader of the token this worker stamps (it re-dispatches a rejection whose
+/// class is in `PRE_EXECUTION_REJECTION_CLASSES` instead of handing the prose
+/// to the node's module-error retry policy). A second copy here would let the
+/// receiver's idea of a class and the sender's retry decision drift apart
+/// silently — the same "one home" rule the tokens themselves were rewritten for
+/// in 2026-08-25, when this was a `contains()` scan over the verifier's error
+/// TEXT rather than a total match over its TYPED reason.
 ///
-/// 2026-08-25: was a `contains()` scan over the verifier's own error TEXT. It is
-/// now a total match over the verifier's TYPED reason
-/// ([`VerifyFailureKind`]) — the tokens are unchanged, but a reworded protocol
-/// message can no longer silently reclassify a failure. Same defect class as the
-/// headline this PR fixes: a classification derived from prose rather than from
-/// the thing that produced it.
+/// Kept as a named function rather than inlining the call so the worker's own
+/// `signature_failure_payload_tests` keep naming the concept they pin. They
+/// drive the SHARED body through it — there is one implementation.
 fn classify_verify_failure(kind: VerifyFailureKind) -> &'static str {
-    match kind {
-        VerifyFailureKind::Replay => "replay",
-        VerifyFailureKind::SchemeRefused => "scheme_mismatch",
-        VerifyFailureKind::KeyError => "key_config",
-        VerifyFailureKind::Stale | VerifyFailureKind::ClockSkewAhead => "stale_timestamp",
-        VerifyFailureKind::BadSignature | VerifyFailureKind::MalformedNonce => "mismatch",
-        // `VerifyFailureKind` is `#[non_exhaustive]`: a new variant must be
-        // given an explicit token here rather than silently becoming
-        // "mismatch" (which would read as tampering).
-        _ => "mismatch",
-    }
+    talos_workflow_job_protocol::verify_failure_class(kind)
 }
 
 /// Build the `output_payload` for a signature-verification failure.
