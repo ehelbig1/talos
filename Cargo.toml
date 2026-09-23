@@ -145,6 +145,7 @@ members = [
     "talos-templates",
     "talos-llm",
     "talos-atlassian",
+    "talos-plaid",
     "talos-slack",
     "talos-compilation",
     "talos-wit-inspector",

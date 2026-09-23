@@ -750,6 +750,44 @@ pub(crate) async fn build_platform_services(
     let gmail_api_client = std::sync::Arc::new(gmail::GmailApiClient::new());
     tracing::info!("Gmail API client initialized");
 
+    // ---------- Plaid integration posture ----------
+    // Read at boot so a MISCONFIGURED deployment says so once, loudly, rather
+    // than on the first financial request hours later. Three states, and each
+    // renders differently on purpose:
+    //   * unset entirely  -> the integration is OFF, which is the normal state
+    //                        for a deployment that does not use Plaid. DEBUG:
+    //                        a WARN here would fire on every healthy boot of
+    //                        every deployment that never wanted it (check 69).
+    //   * fully set       -> INFO naming the ENVIRONMENT, because sandbox and
+    //                        production read different banks and an operator
+    //                        must be able to see which one this process will
+    //                        talk to. The secret is never rendered — the
+    //                        config's Debug redacts it.
+    //   * partial/unknown -> ERROR. Someone intended to enable this and got it
+    //                        wrong; running silently with it off would hide
+    //                        their mistake. The message names the offending
+    //                        variable and never echoes a value.
+    match talos_plaid::PlaidConfig::from_env() {
+        Ok(None) => tracing::debug!(
+            target: "talos_plaid",
+            event_kind = "plaid_not_configured",
+            "Plaid integration is off (PLAID_CLIENT_ID / PLAID_SECRET / PLAID_ENV unset)"
+        ),
+        Ok(Some(cfg)) => tracing::info!(
+            target: "talos_plaid",
+            event_kind = "plaid_configured",
+            env = cfg.env.as_str(),
+            live_money = cfg.env.is_live_money(),
+            "Plaid integration configured"
+        ),
+        Err(e) => tracing::error!(
+            target: "talos_plaid",
+            event_kind = "plaid_misconfigured",
+            error = %e,
+            "Plaid is partially or invalidly configured — the integration stays OFF"
+        ),
+    }
+
     // ---------- Initialize Google Calendar integration service ----------
     // SecretsManager is required (not the per-call fresh instance we used
     // pre-r233) so OAuth-token DEK unwrap uses the shared, KEK-correct

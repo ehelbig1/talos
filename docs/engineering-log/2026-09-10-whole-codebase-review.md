@@ -7586,3 +7586,95 @@ a CONTROL was added beside it — `a_misspelled_cron_argument_still_gets_a_sugge
 — so the updated test cannot pass because the suggester broke entirely instead
 of because `cron` became legitimate. A near-miss must still warn, and must
 still not echo the argument's value.
+
+## Package ED (2026-09-23) — a Plaid integration; the shape was decided by an existing control
+
+The request was to add Plaid and use financial information. The first finding
+determined the whole design, and it is not a preference.
+
+### Plaid cannot be a WASM module
+
+Plaid takes its `access_token` in the JSON REQUEST BODY. A Talos module cannot
+put a secret there, and three separate controls say so:
+
+* `vault://` substitution resolves into HEADERS only
+  (`host::vault::resolve_vault_header`)
+* `get_secret` hands the guest an opaque `u64` handle, never the string
+* `expose_secret` is a rate-limited Tier-2 opt-in that **every engine dispatch
+  path hardcodes to `false`**
+
+So `talos-plaid` is a controller-side crate, beside `talos-gmail`,
+`talos-google-calendar` and `talos-google-cloud`. This is recorded because the
+alternative is tempting and wrong: widening `vault://` to substitute into
+request bodies, or enabling `expose_secret`, are both security regressions, and
+a secret in a body is harder to audit than one in a header.
+
+### It also does not fit the OAuth toolkit
+
+The flow is `link_token` → BROWSER → `public_token` → server exchange →
+long-lived `access_token`. There is no authorize redirect, no state token and
+no refresh token, so `OAuthIntegration` and `consume_oauth_state` do not apply
+to acquisition — though they WOULD apply to a future Plaid Hosted Link
+redirect, which is the natural next step for real accounts.
+`OAuthCredentialService` remains the right store for the per-user token,
+because that is where the tenancy gating lives.
+
+### Posture
+
+The consuming actor must be `max_llm_tier = tier1` **plus**
+`egress_scope = public`. Tier-1 structurally bars every external LLM provider,
+so transaction data cannot reach one; public egress still permits the HTTPS
+call to Plaid itself. That is stricter than the existing work-content actor, which is tier-2 with
+a pinned `PROVIDER` — the tier-1 form makes the guarantee structural rather
+than per-node.
+
+### Decisions
+
+* **`PlaidEnv` has no `Default`.** Sandbox would make a production deployment
+  silently read nothing; production would point a real credential at real banks
+  because a variable was misspelt. An operator states it or the integration
+  stays off. `development` is rejected outright — Plaid retired it, and
+  treating it as either neighbour is exactly the guess this avoids.
+* **All three variables unset = OFF**, so a deployment that does not use Plaid
+  boots clean. A PARTIAL or unrecognised configuration is a hard error naming
+  which variable is wrong, without echoing any value. Empty string counts as
+  absent (check 73).
+* **Every credential-bearing type has a hand-written redacting `Debug`** —
+  `PlaidConfig`, `AccessToken`, `PublicToken`, `PlaidClient` (lint 37).
+* **The error path discards the raw body.** Plaid's error envelope can echo
+  request fields, so it is parsed for `error_type` / `error_code` and the rest
+  is dropped. Bodies are read capped both ways (lint 31).
+* **`Balances` are `Option`.** An unreadable balance renders UNKNOWN, never
+  `0.00` — a determinate negative about someone's money.
+
+### The sync loop has two independent stops
+
+A 40-page cap (500 per page = 20 000 transactions) AND a
+cursor-did-not-advance check. The second is not redundant: a provider that
+keeps reporting `has_more` while returning the same cursor would otherwise burn
+all forty pages on every call and report `truncated` on an account with nothing
+left to fetch. The decision is the pure `sync_step`, extracted because the loop
+body does I/O and this is the part carrying the safety property; a simulation
+drives it from several stall points and asserts termination within the cap.
+
+When the cap binds the caller is TOLD (`SyncPage::truncated`). A prefix
+presented as the whole week is the misleading-report class applied to money.
+
+### Mutations: 7 applied, 7 caught
+
+Each landed by hash and byte-reverted inside a `finally`. The cursor stop
+removed; the page cap removed; the secret printed in `Debug`; the spend sign
+flipped (Plaid signs OUTflows POSITIVE, so inverting it turns a spending report
+into an income report); an unknown environment defaulting to sandbox; an absent
+balance becoming `0.0`; an access token rendering its value.
+
+### Stated limits
+
+* **Nothing is driven against the real Plaid API.** The crate has no live test
+  and the honest guard is the first sandbox call.
+* **The browser Link step is not built.** The only way to obtain a
+  `public_token` today is Plaid Sandbox's `/sandbox/public_token/create`. Real
+  accounts need Hosted Link (redirect-based, and it WOULD reuse
+  `consume_oauth_state`) or a Link component in the editor.
+* **No workflow consumes this yet** — the weekly spending digest is the next
+  package, not this one.
