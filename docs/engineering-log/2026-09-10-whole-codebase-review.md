@@ -7678,3 +7678,195 @@ balance becoming `0.0`; an access token rendering its value.
   `consume_oauth_state`) or a Link component in the editor.
 * **No workflow consumes this yet** — the weekly spending digest is the next
   package, not this one.
+## Package EE (2026-09-23) — placement is not disclosure, and the claim that it was is withdrawn
+
+### What was asked, and the answer that turned out to be wrong
+
+The question was how to make a Plaid integration a WASM module so that best
+practices are followed and the integration is secure. Earlier the same day, in
+this same session, I answered it the other way — and that answer is on main, in
+package ED's commit message, digest bullet and narrative (#933). It read:
+
+> PLAID CANNOT BE A WASM MODULE. It takes its `access_token` in the JSON
+> REQUEST BODY, and three separate controls say a module cannot put a secret
+> there. … Recorded because the alternative is tempting and wrong: widening
+> `vault://` to substitute into bodies, or enabling `expose_secret`, are both
+> security regressions.
+
+The three controls were read correctly and the inference from them was not. The
+correction is the finding, and it is worth more than the feature.
+
+### The three controls, measured
+
+* `resolve_vault_header` is called from **six** host surfaces — `http::fetch`,
+  `http::fetch_all`, `http_stream`, `webhook`, `graphql`, `messaging` — and
+  every one substitutes into a HEADER. There is no other resolution site.
+* `expose_secret` is the single plaintext exit and is gated on
+  `allow_tier2_exposure`, which appears as the literal `false` at **all five**
+  non-test dispatch sites (`talos-google-cloud`, `talos-gmail`,
+  `engine_dispatch_single`, `engine_dispatch_pipeline`, `scheduler_handlers`)
+  and as `true` at none. It is unreachable fleet-wide.
+* `get_secret` hands the guest an opaque `u64`, never the string.
+
+And the consequence, also measured: of the **49** catalog templates that
+reference `vault://`, **0** place a credential in a request body. Not a
+stylistic preference — there was no way to do it.
+
+### Why the inference was wrong
+
+The property those three controls defend is **use without disclosure**: a module
+may cause a credential to be used and must never HOLD it. `expose_secret` and
+`get_secret` are about that property directly. `resolve_vault_header` is not —
+it is an implementation of one PLACEMENT, and placement is orthogonal.
+
+A header substitution and a body substitution disclose exactly the same thing to
+the guest, which is nothing. In both, the guest composes the request with the
+PLACEHOLDER, the host resolves it after the guest has finished, and the resolved
+bytes go to `reqwest` and nowhere else. What can reach `module_executions
+.output_data`, an execution trace or a log line is the placeholder form
+`vault://plaid/…` — which is more useful to an auditor than a redacted blob,
+and cannot leak.
+
+So "widening `vault://` to bodies is a security regression" was wrong. Enabling
+`expose_secret` would have been one; these are not the same act, and collapsing
+them into one sentence cost a correct architecture.
+
+### The shape
+
+`VaultPlacement<'a>` is `Header(&str)` or `JsonBody(&str)` — the header name, or
+the RFC 6901 pointer at which the reference sits. It is a PARAMETER of one
+resolver, `resolve_vault_placed`, and `resolve_vault_header` is now a thin
+wrapper over it. That is the whole reason the enum exists: the `allowed_secrets`
+grant, the reserved-host deny list, the tier-1 LLM ceiling and the WORM ledger
+entry are the same code for both placements, so a second placement cannot drift
+away from the first the way a copied function would.
+
+The placement changes exactly two things, both deliberate:
+
+* the audit label — `vault-header` against `vault-json-body`, so an operator
+  reading the ledger can tell how a credential was used, not merely that it was;
+* the "embedded" test. A header value may be `Bearer vault://…`, so a bare
+  reference is resolved to the credential alone while a reference with a prefix
+  or suffix is spliced into the surrounding text. A body VALUE has no
+  equivalent — the slot is the whole string — so a body placement always takes
+  the embedded path and never the auth-scheme path:
+
+  ```rust
+  let embedded = !(prefix.is_empty() && suffix.is_empty()) || !placement.is_header();
+  ```
+
+  Without the second clause a body reference would be handed back with an
+  invented `Bearer ` prefix.
+
+### Four rules, each because a body is not a header
+
+**JSON only.** A binary payload containing the bytes `vault://` is a
+coincidence, not a request to substitute, and rewriting it would corrupt the
+request. A body carrying the marker without `application/json` (or a `+json`
+suffix) is REFUSED rather than rewritten. The content type comes from the
+guest's OWN headers — the module declares what it is sending, and that
+declaration decides.
+
+**String VALUES only, never keys.** A key is structure. Substituting there could
+collide two fields or invent one, and neither is something a credential
+reference should be able to do to a request's shape.
+
+**Substitution in the parsed TREE, never the raw text.** The re-serialisation
+escapes the credential by construction, so a token containing a quote or a
+backslash cannot break out of its string and add a field. Splicing a secret into
+raw JSON text would be an injection surface whose payload is the secret itself —
+the one string the module cannot inspect and the operator cannot see. This is
+pinned by a test that substitutes `a"},"amount":999,"x":"\` and asserts the
+neighbouring `amount` is unchanged after a round trip.
+
+**Bounded.** `MAX_BODY_VAULT_REFS` = 8 per request, so one call cannot become an
+unbounded run of vault lookups.
+
+And one more that is not a rule about bodies but about honesty: a pointer that
+no longer addresses anything is a REFUSAL, not a silent skip. A skip would leave
+the reference in place and send the vault PATH — which names the provider and
+the user — to the third party the request is aimed at.
+
+### Cost
+
+One substring scan of the raw bytes. No marker, no parse, no decode, no
+allocation — which is every request this fleet makes today. The screen runs on
+the RAW bytes specifically so a large or binary body is never decoded to answer
+a question that has nothing to do with its contents.
+
+### The decisions are pure because the resolver is not testable
+
+`resolve_vault_json_body` needs a live secret provider, so it cannot be driven
+from a unit test. The first mutation run said so plainly: three rules — the
+non-JSON refusal, the reference cap, the auth-scheme path — SURVIVED while they
+lived inside the async body, because nothing could reach them.
+
+They now live in `plan_body_substitution` (marker screen → content-type check →
+parse → collect → cap) and `apply_body_substitution` (the write, and its
+refusal), both pure, both called by the real path and by the fixtures. There is
+one body per rule; the tests do not exercise a copy.
+
+What is left uncovered is stated rather than implied. `resolve_vault_json_body`
+itself is held by a textual pin, and so is the `fetch` wiring — two silent
+mutations live there (resolving the body and then sending the guest's original
+bytes, and continuing past a refusal instead of returning) and neither changes
+an observable value inside this process, so a test cannot see them. A pin proves
+the source says the right thing, never that the request carried the right bytes.
+
+### The limit that is not closed
+
+Substitution does not make a credential unreachable by a module that also
+chooses the destination. A module granted `plaid/*` and an allowed host it
+controls can have the secret echoed back to itself — exactly as it always could
+through a header — and the bound is `allowed_hosts` ∩ `allowed_secrets`,
+unchanged by this package. Body placement is not a new exfiltration surface; it
+is the same one, and the same two grants bound it.
+
+### The consequence for the Plaid work, recorded rather than left to be found
+
+`talos-plaid` shipped one PR earlier (#933) and is on main. Its SCOPE is now
+wrong, not the crate itself, and the distinction matters: with body placement
+the data reads — `/transactions/sync`, `/accounts/balance/get` — belong in a
+module, sandboxed, fuel-bounded, host-allowlisted, with the credential never in
+its address space. That is strictly better than running credentialed code inside
+the credential-owning process, which is what those two calls would have been.
+
+Nothing is deleted here. The crate keeps its config, its redacting types and its
+boot posture; it loses its read half in its own measured package, because a
+deletion is a separate change and this one is about the resolver.
+
+One operation does stay controller-side, and the reason is specific rather than
+general: `/item/public_token/exchange` RETURNS a long-lived `access_token` in
+its response body, and a module's response becomes `module_executions
+.output_data`. A module must not be the thing that receives a credential, even
+though it may cause one to be used.
+
+### Mutations
+
+Ten applied, ten caught, each confirmed landed by hash and byte-reverted under a
+`finally`:
+
+| # | mutation | caught by |
+|---|---|---|
+| S1 | keys become substitution targets | `a_marker_only_in_a_key_sends_the_body_untouched` |
+| S2 | RFC 6901 escaping dropped | `nested_objects_and_arrays_are_addressed_by_json_pointer` |
+| S3 | a body placement takes the auth-scheme path | `vault_body_scheme_pin` |
+| S4 | the two audit labels collapse | placement-label test |
+| S5 | the non-JSON refusal removed | `a_marker_in_a_non_json_body_is_refused_not_rewritten` |
+| S6 | the per-body reference cap removed | `more_references_than_the_cap_is_refused` |
+| S7 | an unaddressable pointer is silently skipped | `an_unaddressable_pointer_is_refused_rather_than_left_in_place` |
+| S8 | the resolved body is computed and discarded | `vault_body_wiring_pin` |
+| S9 | a body refusal falls through to the send | `vault_body_wiring_pin` |
+| S10 | the content type is invented rather than read | `vault_body_wiring_pin` |
+
+Two earlier attempts are recorded as INVALID rather than counted: one inserted a
+dead match arm (a no-op proves nothing) and one replaced the first textual
+occurrence of a method name, which was a doc comment rather than the call.
+
+### One repair to this package's own source
+
+The refusal message for an unaddressable pointer shipped with a run of
+twenty-five spaces inside it — a `\` line continuation eaten by the Python
+heredoc that wrote the file, which is the failure mode this log already records
+under the whitespace-run measurement. Found by scanning the file for
+`\S {5,}\S` inside a string literal rather than by reading it.

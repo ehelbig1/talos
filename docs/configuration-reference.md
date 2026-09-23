@@ -365,7 +365,8 @@ into both deployments.
 > backend you point these variables at.
 >
 > This repo's rule is that plaintext secrets leave the controller host by
-> exactly two audited paths (outbound `vault://` headers, and opt-in Tier-2
+> exactly two audited paths (outbound `vault://` substitution — into a request
+> header, or into a string VALUE of a JSON request body — and opt-in Tier-2
 > `expose_secret`). Span export is not one of them. Setting one of these
 > variables today opts you into a third, unaudited one.
 >
