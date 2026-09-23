@@ -761,6 +761,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                 "type": "object",
                 "properties": {
                     "workflow_id": { "type": "string", "description": "UUID of the workflow" },
+                    "timeout_secs": { "type": "integer", "description": "Alias for `timeout_seconds`, matching the spelling the other 17 duration-taking tools use and the `execution_timeout_secs` this tool renders back. Either is accepted." },
                     "timeout_seconds": {
                         "type": "number",
                         "description": "Maximum allowed execution duration in seconds (1–3600). Honored as-set — \
@@ -11587,7 +11588,15 @@ async fn handle_set_workflow_execution_timeout(
     // fractional values (`30.7 → 30`, `1.99 → 1`) without warning,
     // so a user requesting a 30.7-second timeout silently got 30.
     // Reject non-integer floats explicitly before any range check.
-    let timeout_seconds = match args.get("timeout_seconds") {
+    // Accept `timeout_secs` as well. That is the spelling SEVENTEEN sibling
+    // tools declare and the one this tool's own response renders
+    // (`execution_timeout_secs`), so a caller who reads the field back and
+    // reuses its name was rejected by the only tool in the set that spells it
+    // `timeout_seconds`. Aliasing is the house answer (15 existing sites, e.g.
+    // `capability_world`/`world`); the canonical name is unchanged so nothing
+    // that works today stops working.
+    let timeout_seconds = match crate::utils::arg_or_alias(args, "timeout_seconds", "timeout_secs")
+    {
         None | Some(serde_json::Value::Null) => {
             return mcp_error(req_id, -32602, "Missing required field: timeout_seconds")
         }

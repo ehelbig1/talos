@@ -96,7 +96,8 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                 "type": "object",
                 "properties": {
                     "workflow_id": { "type": "string", "description": "UUID of the workflow to schedule" },
-                    "cron_expression": { "type": "string", "description": "Cron expression (5 or 6 space-separated fields, e.g. '0 9 * * 1-5' for weekdays at 9am)" },
+                    "cron_expression": { "type": "string", "description": "Cron expression (5 or 6 space-separated fields, e.g. '0 9 * * 1-5' for weekdays at 9am). `cron` is accepted as an alias — that is the key schedule readers render this value under." },
+                    "cron": { "type": "string", "description": "Alias for `cron_expression`, matching the key `list_schedules` and the analytics readers render. Either is accepted." },
                     "timezone": { "type": "string", "description": "IANA timezone (default: UTC)" }
                 },
                 "required": ["workflow_id", "cron_expression"]
@@ -218,7 +219,13 @@ async fn handle_create_schedule(
     // 256 chars covers every legitimate cron expression — even
     // 6-field expressions with extended ranges and lists rarely
     // exceed 80 chars.
-    let cron_expression = match args.get("cron_expression").and_then(|v| v.as_str()) {
+    // Accept `cron` as well: `list_schedules` and the analytics readers render
+    // this value under the key `cron`, so a caller who reads a schedule back
+    // and reuses the field name it was given was rejected. Canonical name
+    // unchanged.
+    let cron_expression = match crate::utils::arg_or_alias(args, "cron_expression", "cron")
+        .and_then(|v| v.as_str())
+    {
         Some(c) if c.len() > 256 => {
             return mcp_error(req_id, -32602, "cron_expression must be ≤ 256 characters")
         }
