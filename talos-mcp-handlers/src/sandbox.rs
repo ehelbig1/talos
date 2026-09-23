@@ -329,7 +329,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "test_module",
-            "description": "Test a module in isolation by executing it directly. Does not create a workflow execution — just runs the WASM and returns the output.\n\nINPUT SHAPE (matches workflow dispatch):\n  - `config`: node config (goes to `data[\"config\"]` inside the module — mirrors how add_node_to_workflow's `config` field is delivered at runtime)\n  - `input`: simulated upstream node output (goes to `data[\"input\"]` — mirrors upstream output in a workflow)\n  - Both are also merged at the payload root so `data[\"KEY\"]` access still works\n\nACTOR SCOPING + TIER: pass `actor_id` to scope `agent_memory::*` calls to that actor's stored memories (otherwise memory reads return 0 hits because test_module runs without an actor by default). The actor must be owned by you. NOTE: the run also INHERITS the actor's LLM/egress tier — and WITHOUT an actor_id it defaults to Tier-1 (local-egress-only). So a module that calls an EXTERNAL API (any non-loopback host — Google, Slack, etc.) will fail with a network error unless you pass the actor_id of a Tier-2 actor. `vault://` references in config resolve fine either way; the block is the egress ceiling, not the secret.\n\nBACKWARDS COMPATIBILITY: if only `input` is passed (no `config`), it is interpreted as config and wrapped under `data[\"config\"]` to keep existing call sites working. Prefer the explicit `config` param going forward — the semantics match workflow dispatch exactly.",
+            "description": "Test a module in isolation by executing it directly. Does not create a workflow execution — just runs the WASM and returns the output.\n\nINPUT SHAPE (matches workflow dispatch):\n  - `config`: node config (goes to `data[\"config\"]` inside the module — mirrors how add_node_to_workflow's `config` field is delivered at runtime)\n  - `input`: simulated upstream node output (goes to `data[\"input\"]` — mirrors upstream output in a workflow)\n  - Both are also merged at the payload root so `data[\"KEY\"]` access still works\n\nACTOR SCOPING + TIER: pass `actor_id` to scope `agent_memory::*` calls to that actor's stored memories (otherwise memory reads return 0 hits because test_module runs without an actor by default). The actor must be owned by you. NOTE: the run also INHERITS the actor's LLM/egress tier — and WITHOUT an actor_id it defaults to Tier-1 (local-egress-only). So a module that calls an EXTERNAL API (any non-loopback host — Google, Slack, etc.) will fail with a network error unless the actor permits public egress. That is the EGRESS axis, not the LLM tier: since `egress_scope` was split out, `max_llm_tier=tier1` + `egress_scope=public` reaches an external API while still refusing every external LLM provider — the house pattern for a privacy-sensitive reader, and the correct posture here. (This note used to say \"a Tier-2 actor\", which has been wrong since the split.) `vault://` references in config are delivered to the module AS THE LITERAL, exactly as the engine delivers them, and the host resolves them at the outbound call; the block is the egress ceiling, not the secret.\n\nBACKWARDS COMPATIBILITY: if only `input` is passed (no `config`), it is interpreted as config and wrapped under `data[\"config\"]` to keep existing call sites working. Prefer the explicit `config` param going forward — the semantics match workflow dispatch exactly.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1958,7 +1958,7 @@ async fn handle_run_sandbox(
         &vault_refs,
     );
 
-    let mut payload = {
+    let payload = {
         let mut merged = serde_json::Map::new();
         if let Some(obj) = input.as_object() {
             for (k, v) in obj {
@@ -1984,32 +1984,14 @@ async fn handle_run_sandbox(
         std::collections::HashMap::new()
     };
 
-    // Pre-fetch LLM provider vault keys so run_sandbox / test_module behave
-    // like the workflow engine for LLM-using code (pain point #10, 2026-04-23).
-    if let Ok(llm_keys) = state
-        .secrets_manager
-        .get_llm_vault_keys(agent.user_id)
-        .await
+    // CHECK the references; do NOT substitute. The guest receives the literal
+    // `vault://…`, exactly as the engine delivers it, and the worker resolves
+    // it at the outbound call. Substituting here used to hand a sandbox guest
+    // the plaintext that production never gives it — the one surface where the
+    // scaffold's "modules MUST NOT see the plaintext secret" was untrue.
+    if let Err(msg) =
+        talos_workflow_engine::vault_resolver::check_vault_refs_resolvable(&secrets, &vault_refs)
     {
-        // The cache returns Zeroizing<String> values; the destination map
-        // is a plain HashMap<String, String> that flows into vault://
-        // substitution and into the encrypted secrets payload. Clone the
-        // inner String at this boundary — the cache copy stays zeroized
-        // (drops at end-of-iter), the unzeroized clone lives only for
-        // the duration of `secrets` (one workflow dispatch) and is
-        // dropped with the rest of the request state.
-        for (k, v) in llm_keys {
-            secrets.entry(k).or_insert_with(|| v.as_str().to_string());
-        }
-    }
-
-    // Substitute vault:// references with resolved plaintext. Returns an
-    // actionable error if any referenced secret couldn't be resolved.
-    if let Err(msg) = talos_workflow_engine::vault_resolver::replace_vault_values(
-        &mut payload,
-        &secrets,
-        &vault_refs,
-    ) {
         return mcp_text(req_id, &msg.to_string());
     }
 
@@ -2071,6 +2053,34 @@ async fn handle_run_sandbox(
             .unwrap_or(talos_workflow_job_protocol::LlmTier::Tier1),
         None => talos_workflow_job_protocol::LlmTier::Tier1,
     };
+
+    // THE ENGINE'S OWN RULE, applied here rather than re-derived. Two things it
+    // does that these surfaces did not:
+    //
+    //  * The LLM provider keys are fetched ONLY for a tier-2 actor.
+    //    `build_encrypted_secrets_for` skips that prefetch entirely at Tier-1
+    //    so a tier-1 job "never has an Anthropic/OpenAI/Gemini key on the wire
+    //    (encrypted or otherwise)". Fetching them unconditionally here reached
+    //    around that — the same back-door MCP-692 closed for the tier GATE and
+    //    left open for the key PREFETCH.
+    //  * `retain_wire_safe_secrets` then drops any host-internal OAuth refresh
+    //    token and, at Tier-1, any LLM key that slipped in through an explicit
+    //    `allowed_secrets` entry. It is the backstop, not the gate.
+    if !matches!(llm_tier, talos_workflow_job_protocol::LlmTier::Tier1) {
+        if let Ok(llm_keys) = state
+            .secrets_manager
+            .get_llm_vault_keys(agent.user_id)
+            .await
+        {
+            // The cache returns Zeroizing<String>; the destination is a plain
+            // map that is sealed into the job envelope. The unzeroized clone
+            // lives only for this request.
+            for (k, v) in llm_keys {
+                secrets.entry(k).or_insert_with(|| v.as_str().to_string());
+            }
+        }
+    }
+    talos_workflow_engine::retain_wire_safe_secrets(&mut secrets, core_tier(llm_tier));
 
     // In-process host-diagnostic sink. `run_sandbox` passes
     // `execution_context: None` (below) — it has no `workflow_executions` or
@@ -3498,7 +3508,7 @@ async fn handle_test_module(
     // `data["KEY"]` works for direct testing, and add `config` / `input`
     // sub-objects so `data["config"]["KEY"]` / `data["input"]["KEY"]` work
     // identically to workflow dispatch.
-    let mut payload = {
+    let payload = {
         let mut merged = serde_json::Map::new();
         if let Some(obj) = config_val.as_object() {
             for (k, v) in obj {
@@ -3541,30 +3551,14 @@ async fn handle_test_module(
         std::collections::HashMap::new()
     };
 
-    // Pre-fetch LLM provider vault keys (anthropic/api_key etc.) so modules
-    // calling `talos::core::llm::*` work in test_module the same way they
-    // do when dispatched by the workflow engine. Without this, every test
-    // of an LLM-using module fails with HTTP 401 ("LLM API key not
-    // configured") and the operator gets no hint that the dev path
-    // diverges from production. Pain point #10, fixed 2026-04-23.
-    if let Ok(llm_keys) = state
-        .secrets_manager
-        .get_llm_vault_keys(Some(user_id))
-        .await
+    // CHECK the references; do NOT substitute. The guest receives the literal
+    // `vault://…`, exactly as the engine delivers it, and the worker resolves
+    // it at the outbound call. Substituting here used to hand a sandbox guest
+    // the plaintext that production never gives it — the one surface where the
+    // scaffold's "modules MUST NOT see the plaintext secret" was untrue.
+    if let Err(msg) =
+        talos_workflow_engine::vault_resolver::check_vault_refs_resolvable(&secrets, &vault_refs)
     {
-        for (k, v) in llm_keys {
-            // Same Zeroizing → plain String boundary as the dispatch path above.
-            secrets.entry(k).or_insert_with(|| v.as_str().to_string());
-        }
-    }
-
-    // Substitute vault:// references with resolved plaintext. Returns an
-    // actionable error if any referenced secret couldn't be resolved.
-    if let Err(msg) = talos_workflow_engine::vault_resolver::replace_vault_values(
-        &mut payload,
-        &secrets,
-        &vault_refs,
-    ) {
         return Some(mcp_error(req_id.clone(), -32602, &msg.to_string()));
     }
 
@@ -3598,6 +3592,35 @@ async fn handle_test_module(
             .unwrap_or(talos_workflow_job_protocol::LlmTier::Tier1),
         None => talos_workflow_job_protocol::LlmTier::Tier1,
     };
+
+    // THE ENGINE'S OWN RULE, applied here rather than re-derived. Two things it
+    // does that these surfaces did not:
+    //
+    //  * The LLM provider keys are fetched ONLY for a tier-2 actor.
+    //    `build_encrypted_secrets_for` skips that prefetch entirely at Tier-1
+    //    so a tier-1 job "never has an Anthropic/OpenAI/Gemini key on the wire
+    //    (encrypted or otherwise)". Fetching them unconditionally here reached
+    //    around that — the same back-door MCP-692 closed for the tier GATE and
+    //    left open for the key PREFETCH.
+    //  * `retain_wire_safe_secrets` then drops any host-internal OAuth refresh
+    //    token and, at Tier-1, any LLM key that slipped in through an explicit
+    //    `allowed_secrets` entry. It is the backstop, not the gate.
+    if !matches!(llm_tier, talos_workflow_job_protocol::LlmTier::Tier1) {
+        if let Ok(llm_keys) = state
+            .secrets_manager
+            .get_llm_vault_keys(Some(user_id))
+            .await
+        {
+            // The cache returns Zeroizing<String>; the destination is a plain
+            // map that is sealed into the job envelope. The unzeroized clone
+            // lives only for this request.
+            for (k, v) in llm_keys {
+                secrets.entry(k).or_insert_with(|| v.as_str().to_string());
+            }
+        }
+    }
+    talos_workflow_engine::retain_wire_safe_secrets(&mut secrets, core_tier(llm_tier));
+
     // #750: resolve the actor's REAL data-mutation ceiling, for the same
     // reason MCP-692 resolves the LLM tier here — `test_module` exists to be
     // PREDICTIVE of workflow behaviour, and a permissive hardcode makes it
@@ -4347,6 +4370,34 @@ pub fn run(input: String) -> Result<String, String> {
              //                         // `auth` here is the literal string \"vault://jira/api-token\",\n\
              //                         // NOT the resolved token. Pass it as-is into headers:\n\
              //   5. Build request:     headers: vec![(\"Authorization\".to_string(), auth.to_string())]\n\
+             //\n\
+             // ── When the API takes the credential in the BODY, not a header ────\n\
+             // Some APIs (Plaid, and most `client_id` + `secret` POST APIs) take\n\
+             // their credentials as JSON BODY fields. The host resolves a\n\
+             // vault:// reference inside a JSON request body too, under the same\n\
+             // rules: the body must parse as JSON AND declare a JSON content type\n\
+             // (a non-JSON body carrying the marker is REFUSED, never rewritten),\n\
+             // only string VALUES are substituted (never keys), and at most 8\n\
+             // references per request.\n\
+             //\n\
+             //   CONSTRUCT the reference; do not receive it. A vault:// string\n\
+             //   that arrives in your CONFIG is delivered as the literal, so\n\
+             //   copying it into a body works — but taking a plain identifier and\n\
+             //   building `vault://{ns}/access_token/{id}` yourself keeps the\n\
+             //   marker out of the payload entirely, which is the shape that\n\
+             //   cannot be broken by a future config-handling change.\n\
+             //\n\
+             //   let body = serde_json::json!({\n\
+             //       \"client_id\": format!(\"vault://{ns}/client_id\"),\n\
+             //       \"secret\":    format!(\"vault://{ns}/secret\"),\n\
+             //   });\n\
+             //   let req = Request {\n\
+             //       method: Method::Post,\n\
+             //       url,\n\
+             //       headers: vec![(\"Content-Type\".into(), \"application/json\".into())],\n\
+             //       body: serde_json::to_vec(&body).unwrap(),\n\
+             //       timeout_ms: Some(30_000),\n\
+             //   };\n\
              //                         // The host scans the Authorization value at fetch time,\n\
              //                         // detects the vault:// prefix, resolves the secret, and\n\
              //                         // substitutes \"Bearer <token>\" before the socket write.\n\
@@ -5018,5 +5069,87 @@ mod source_entity_repair_pins {
                  use talos_compilation::source_entities instead"
             );
         }
+    }
+}
+
+/// The engine's wire-safety rule is expressed over `talos_workflow_engine_core`'s
+/// tier type; the sandbox handlers carry the protocol one. One conversion, so
+/// the two surfaces cannot disagree about which tier they are filtering for.
+fn core_tier(t: talos_workflow_job_protocol::LlmTier) -> talos_workflow_engine_core::LlmTier {
+    match t {
+        talos_workflow_job_protocol::LlmTier::Tier2 => talos_workflow_engine_core::LlmTier::Tier2,
+        // Tier-1 AND anything a future protocol release adds. The wildcard is
+        // deliberate and fails CLOSED: this value decides which secrets are
+        // dropped before they reach a worker, so an unrecognised tier must be
+        // treated as the most restrictive one, never as "permit everything".
+        _ => talos_workflow_engine_core::LlmTier::Tier1,
+    }
+}
+
+/// The test surfaces must deliver what production delivers.
+///
+/// Pinned TEXTUALLY, and stated as such: driving `run_sandbox` / `test_module`
+/// end to end needs a database, a compiled module, a worker runtime and a
+/// vault, so what a unit test can assert is that neither handler has regained
+/// the substitution and that both still apply the engine's wire-safety rule.
+/// The BEHAVIOUR of each piece is tested where it lives — `check_vault_refs_
+/// resolvable` in `talos-workflow-engine::vault_resolver`, `retain_wire_safe_
+/// secrets` in `secrets_pipeline`.
+#[cfg(test)]
+mod test_surface_parity_pins {
+    /// Needles assembled at runtime so this pin cannot match its own source.
+    fn needle(parts: &[&str]) -> String {
+        parts.concat()
+    }
+
+    fn production_source() -> String {
+        let src = include_str!("sandbox.rs");
+        // Everything before the first test module is production code.
+        src.split_once("#[cfg(test)]")
+            .map_or(src, |(before, _)| before)
+            .to_string()
+    }
+
+    #[test]
+    fn neither_sandbox_handler_substitutes_plaintext_into_a_payload() {
+        let src = production_source();
+        assert!(
+            !src.contains(&needle(&["replace_vault", "_values"])),
+            "a sandbox handler is writing resolved plaintext into the module payload again; \
+             the engine delivers the literal and the worker resolves at the outbound call"
+        );
+    }
+
+    #[test]
+    fn both_sandbox_handlers_apply_the_engines_wire_safety_rule() {
+        let src = production_source();
+        // Two call sites: run_sandbox and test_module.
+        assert_eq!(
+            src.matches(&needle(&["retain_wire_safe", "_secrets("]))
+                .count(),
+            2,
+            "both sandbox handlers must apply the engine's wire-safety rule — it is what \
+             keeps an OAuth refresh token, and a tier-1 actor's LLM keys, off the wire"
+        );
+        // And the LLM prefetch is gated rather than unconditional.
+        assert_eq!(
+            src.matches(&needle(&["get_llm_vault", "_keys("])).count(),
+            2,
+            "expected exactly one gated LLM prefetch per sandbox handler"
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_tier_is_treated_as_the_most_restrictive() {
+        // The conversion decides which secrets are DROPPED, so the wildcard
+        // must land on Tier1. Asserted through the real function.
+        assert!(matches!(
+            super::core_tier(talos_workflow_job_protocol::LlmTier::Tier1),
+            talos_workflow_engine_core::LlmTier::Tier1
+        ));
+        assert!(matches!(
+            super::core_tier(talos_workflow_job_protocol::LlmTier::Tier2),
+            talos_workflow_engine_core::LlmTier::Tier2
+        ));
     }
 }

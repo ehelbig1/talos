@@ -8144,3 +8144,126 @@ to the pure `sandbox_endpoint_permitted` and now caught.
 * Production still has no way to obtain a `public_token`. Hosted Link or an
   embedded Link component is unbuilt — recorded, not done — so `--public-token`
   is today a parameter with no producer.
+
+## Package EH (2026-09-23) — the helper written to end divergence had become the divergence
+
+### How it was found, and the first reading was wrong
+
+Building a Plaid reader module. It refused its own config: `ACCESS_TOKEN_REF`
+did not start with `vault://`. I had written that guard for an unrelated reason
+— to stop an operator pasting a literal credential into node config — and it
+fired on the platform instead.
+
+My first conclusion was that `get_rust_scaffold`'s security invariant was false:
+
+> SECURITY INVARIANT: WASM modules MUST NOT see the plaintext secret. The
+> vault:// string is delivered AS-IS to your config; the HOST resolves it
+> server-side at the moment of the outbound HTTP call.
+
+That was wrong, and the correction is the finding. `secrets_pipeline::extract_vault_paths`
+says in as many words that *"payload substitution happens on the worker side via
+`EncryptedSecrets`"*, so REAL DISPATCH delivers the literal and the worker
+resolves at the outbound call. The scaffold is right.
+
+What is false is `vault_resolver`'s own module doc:
+
+> `run_sandbox` passing literal `"vault://..."` strings to the module, while
+> `test_module` and the engine injected plaintext. This module guarantees
+> identical behavior everywhere.
+
+Measured: `replace_vault_values` had exactly **two** call sites, both in
+`talos-mcp-handlers/src/sandbox.rs`. The engine was not one of them. The helper
+written to END divergence had become the divergence — and the surface that
+diverged was the one handing a guest the credential.
+
+### Three divergences, all in the same direction
+
+| | engine (production) | `test_module` / `run_sandbox` |
+|---|---|---|
+| config `vault://` | literal delivered; worker resolves at fetch | replaced with **plaintext** in root, `config`, `input` |
+| `retain_wire_safe_secrets` | applied | **not applied** |
+| LLM provider keys | **skipped entirely at tier-1** | injected **unconditionally** |
+
+The third is the one worth dwelling on. CLAUDE.md states the controller-side
+rule as defense in depth: *"`build_encrypted_secrets_for` takes `max_llm_tier`
+and SKIPS the `resolve_llm_keys` prefetch entirely when `Tier1`. Tier-1 jobs
+never have an Anthropic/OpenAI/Gemini key on the wire (encrypted or otherwise) —
+bounds blast radius if a future bypass slips."* `test_module` fetched them for
+every actor, so a tier-1 actor's test job carried exactly those keys.
+
+It is not an exploit: the worker still refuses a tier-1 external LLM call, and
+`check_secret_allowlist` denies a guest `get_secret` on an LLM path. It is the
+defense-in-depth being reachable around — and it is MCP-692's own class. That
+ticket fixed the dev-test back-door for the tier GATE, and its comment sits
+**four lines below** the ungated prefetch it did not fix.
+
+### What changed
+
+`replace_vault_values` is **deleted**, not deprecated. `check_vault_refs_resolvable`
+keeps the two things worth keeping and takes **no payload parameter**, so
+substitution is impossible by TYPE rather than by convention:
+
+* **The reserved-path refusal.** A host-internal OAuth refresh token is refused
+  before the fetch, so it is never fetched, never sealed, never on the wire —
+  and the caller gets a sentence rather than a silent drop. The worker refuses
+  to RESOLVE one independently; this stops it existing in the map at all.
+* **The resolvability check.** Production fails at fetch with a bare
+  `Notfound`; a test surface can name which config key referenced which path.
+  A deliberate test-time EXTRA — stricter than production, never more
+  permissive — stated rather than left to be discovered.
+
+Both handlers now apply the ENGINE's `retain_wire_safe_secrets` (made `pub`, one
+home rather than a copy) and gate the LLM prefetch on the actor's tier.
+`core_tier`'s wildcard fails CLOSED to Tier-1, because that value decides which
+secrets get dropped and an unrecognised tier must not mean "permit everything".
+
+### Blast radius, measured before changing anything
+
+**48 nodes across 23 workflows** carry a config `vault://`, and every single one
+is an auth header: `AUTH_HEADER` (40), `CAL_AUTH` (5), `AUTH_HEADER_WORK` (3).
+
+That population is the proof the change is safe: the header pattern works
+precisely BECAUSE the engine delivers the literal and the worker resolves it. No
+live module needs plaintext in config. Removing the substitution breaks nothing
+in production and makes the test surfaces agree with it.
+
+### Two stale docs on the same surface
+
+* `test_module`'s description said an external API needs *"the actor_id of a
+  Tier-2 actor"*. Wrong since `egress_scope` was split from `max_llm_tier`:
+  **tier1 + egress_scope=public** reaches an external API while still refusing
+  every external LLM provider. Proven live against `sandbox.plaid.com`.
+* The scaffold documented `vault://` for HEADERS only — one release behind the
+  body substitution that makes a `client_id` + `secret`-in-body API buildable.
+  It now documents the body form, its rules, and the advice that matters: build
+  the reference from identifiers rather than receiving it, so the marker never
+  enters the payload at all.
+
+### Mutations
+
+Six applied, each landed by hash and byte-reverted. **Five caught, one recorded
+EQUIVALENT.**
+
+* **H1** — a handler regains substitution: caught by a **compile error**,
+  because the function no longer exists. The structural answer, not a lint.
+* **H2** a handler drops the wire-safety rule, **H4** an unknown tier treated as
+  permissive, **H5** the reserved refresh-token refusal removed, **H6** the
+  resolvability check always passing: caught by tests.
+* **H3** — un-gating the LLM prefetch — is **EQUIVALENT, not a survivor**.
+  `retain_wire_safe_secrets` drops those keys at tier-1 regardless, so the
+  mutation changes no observable behaviour; the filter is the guarantee and the
+  gate only avoids the fetch. Saying which is which matters more than reporting
+  six of six.
+
+### Stated limits
+
+* The handlers are pinned TEXTUALLY. Driving `run_sandbox` / `test_module` end
+  to end needs a database, a compiled module, a worker runtime and a vault, so
+  the pins assert the substitution has not returned and the engine's rule is
+  still applied twice; each piece's BEHAVIOUR is tested where it lives.
+* **The first draft of the resolver tests passed vacuously.** `extract_vault_refs`
+  scans only the TOP LEVEL of the value it is given — the handlers rely on config
+  keys being mirrored to the payload root — while the fixtures nested their
+  references under `config`, so no refs were extracted and every case trivially
+  passed. Each fixture now asserts the references were found before asserting
+  anything about them.

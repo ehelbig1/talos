@@ -2,19 +2,33 @@
 //!
 //! This module centralizes the logic for:
 //! 1. Extracting `vault://<path>` references from a JSON config object.
-//! 2. Replacing those references with the resolved plaintext secret values
-//!    in the payload (top-level, `"config"` sub-object, and `"input"` sub-object).
+//! 2. Verifying each reference can be honoured, WITHOUT substituting anything
+//!    into the payload — the guest receives the literal, exactly as it does in
+//!    production, and the worker resolves at the outbound call.
 //!
 //! Why centralize? Previously, `run_sandbox`, `test_module`, and the engine
-//! each had their own inline extraction loops. Divergence between them caused
-//! modules to behave differently across execution paths (e.g., `run_sandbox`
-//! passing literal `"vault://..."` strings to the module, while `test_module`
-//! and the engine injected plaintext). This module guarantees identical
-//! behavior everywhere.
+//! each had their own inline extraction loops, and modules behaved differently
+//! across execution paths.
+//!
+//! **The direction of that divergence was recorded backwards until 2026-09-23.**
+//! This doc used to say "`run_sandbox` passing literal `vault://...` strings to
+//! the module, while `test_module` and the engine injected plaintext", and
+//! claimed the module "guarantees identical behavior everywhere". The ENGINE
+//! never injected plaintext: `secrets_pipeline::extract_vault_paths` states
+//! that "payload substitution happens on the worker side via
+//! `EncryptedSecrets`", so dispatch delivers the LITERAL and the worker
+//! resolves at the outbound call — which is exactly what
+//! `get_rust_scaffold`'s security invariant tells module authors. The two
+//! SANDBOX handlers were the outliers, and they were the ones putting a
+//! credential in the guest.
+//!
+//! The literal is now what every path delivers. What stays centralized is
+//! reference EXTRACTION, the allowlist merge, and
+//! [`check_vault_refs_resolvable`] — never substitution.
 //!
 //! Runtime enforcement of `allowed_secrets` is in `worker/src/host_impl.rs`
 //! via `talos_workflow_job_protocol::vault_path_permitted` — callers here are responsible
-//! for fetching the permitted secrets and passing them to `replace_vault_values`.
+//! for fetching the permitted secrets and passing them to the worker.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -25,7 +39,7 @@ use std::fmt;
 // Re-exported so every existing call site keeps resolving.
 pub use talos_workflow_job_protocol::{extract_vault_refs, VaultRef};
 
-/// Error returned from [`replace_vault_values`] when a referenced
+/// Error returned from [`check_vault_refs_resolvable`] when a referenced
 /// secret cannot be substituted.
 ///
 /// Matching on the variant is stable across 0.x releases; display
@@ -89,30 +103,47 @@ impl fmt::Display for VaultResolverError {
 
 impl std::error::Error for VaultResolverError {}
 
-/// Replace `vault://<path>` references in the payload with their resolved
-/// plaintext values. Substitutes in three locations to cover both the
-/// caller-supplied input shape and the engine's dispatch convention:
-///   - Top-level payload keys (e.g. `payload["AUTH_HEADER"]`)
-///   - `payload["config"]["AUTH_HEADER"]` (standard config sub-object)
-///   - `payload["input"]["AUTH_HEADER"]` (upstream-output convention)
+/// Verify every `vault://` reference in `refs` can be honoured — WITHOUT
+/// substituting anything into the payload.
 ///
-/// Returns [`VaultResolverError::SecretNotResolved`] if any `vault_path`
-/// in `refs` is absent from `resolved` — so the developer sees
-/// "secret not found" instead of a confusing downstream failure.
-pub fn replace_vault_values(
-    payload: &mut serde_json::Value,
+/// This replaced `replace_vault_values` on 2026-09-23. That function wrote the
+/// resolved PLAINTEXT into the payload root, `config` and `input`, and its own
+/// module doc claimed "`test_module` and the engine injected plaintext … this
+/// module guarantees identical behavior everywhere". Measured, the ENGINE did
+/// no such thing: `secrets_pipeline::extract_vault_paths` says in as many
+/// words that "payload substitution happens on the worker side via
+/// `EncryptedSecrets`", so real dispatch delivers the LITERAL `vault://…` and
+/// the worker resolves it at the moment of the outbound call. The helper
+/// written to END divergence had become the divergence, and the surface that
+/// diverged was the one that handed a guest the credential.
+///
+/// So the two things worth keeping are kept, and the substitution is gone:
+///
+/// * **The reserved-path refusal.** A host-internal OAuth refresh token must
+///   never be fetched into a job's secret map at all. The worker refuses to
+///   RESOLVE one (`is_reserved_host_secret_path`), but refusing here means it
+///   is never fetched, never sealed and never on the wire — and the caller
+///   gets a sentence instead of a silent drop.
+/// * **The resolvability check.** Production fails at fetch time with a bare
+///   `Notfound`; a test surface can say which config key named which path.
+///   That is a deliberate test-time EXTRA, stated rather than silent: it makes
+///   the test stricter than production, never more permissive.
+///
+/// # Errors
+/// [`VaultResolverError::ReservedHostPath`] for a controller-internal path,
+/// [`VaultResolverError::SecretNotResolved`] when a referenced path is absent
+/// from `resolved`.
+pub fn check_vault_refs_resolvable(
     resolved: &HashMap<String, String>,
     refs: &[VaultRef],
 ) -> Result<(), VaultResolverError> {
     for (config_key, vault_path) in refs {
-        // #118 controller-side mirror: refuse to substitute a host-internal
-        // OAuth refresh token into the payload. `is_controller_internal &&
-        // !is_llm` isolates the refresh-token case — LLM provider keys stay
-        // substitutable (the documented `vault://anthropic/api_key` BYO-key
-        // header pattern; the tier ceiling is enforced by the worker's
-        // resolve_vault_header + HTTP-host gate, not here). Closes the
-        // sandbox/replay path where a `["*"]`-resolved refresh token could be
-        // written into a module's input plaintext, bypassing the worker gate.
+        // #118 controller-side mirror: a host-internal OAuth refresh token is
+        // consumed by the controller's refresh loop; modules read the sibling
+        // `access_token`. `is_controller_internal && !is_llm` isolates the
+        // refresh-token case — LLM provider keys stay legitimate (the
+        // documented `vault://anthropic/api_key` BYO-key pattern), and their
+        // tier ceiling is enforced by the worker plus `retain_wire_safe_secrets`.
         if talos_workflow_job_protocol::is_controller_internal_vault_path(vault_path)
             && !talos_workflow_job_protocol::is_llm_provider_vault_path(vault_path)
         {
@@ -121,46 +152,11 @@ pub fn replace_vault_values(
                 vault_path: vault_path.clone(),
             });
         }
-        let plaintext = resolved.get(vault_path.as_str()).ok_or_else(|| {
-            VaultResolverError::SecretNotResolved {
+        if !resolved.contains_key(vault_path.as_str()) {
+            return Err(VaultResolverError::SecretNotResolved {
                 config_key: config_key.clone(),
                 vault_path: vault_path.clone(),
-            }
-        })?;
-        let resolved_value = serde_json::Value::String(plaintext.clone());
-
-        if let Some(obj) = payload.as_object_mut() {
-            // Top-level replacement
-            if obj
-                .get(config_key)
-                .and_then(|v| v.as_str())
-                .map(|s| s.starts_with("vault://"))
-                .unwrap_or(false)
-            {
-                obj.insert(config_key.clone(), resolved_value.clone());
-            }
-            // "config" sub-object replacement
-            if let Some(cfg) = obj.get_mut("config").and_then(|c| c.as_object_mut()) {
-                if cfg
-                    .get(config_key)
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.starts_with("vault://"))
-                    .unwrap_or(false)
-                {
-                    cfg.insert(config_key.clone(), resolved_value.clone());
-                }
-            }
-            // "input" sub-object replacement (upstream-convention)
-            if let Some(inp) = obj.get_mut("input").and_then(|c| c.as_object_mut()) {
-                if inp
-                    .get(config_key)
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.starts_with("vault://"))
-                    .unwrap_or(false)
-                {
-                    inp.insert(config_key.clone(), resolved_value);
-                }
-            }
+            });
         }
     }
     Ok(())
@@ -186,202 +182,104 @@ pub fn merge_vault_refs_into_allowlist(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use serde_json::json;
+    use super::{
+        check_vault_refs_resolvable, extract_vault_refs, merge_vault_refs_into_allowlist,
+        VaultResolverError,
+    };
+    use std::collections::HashMap;
 
-    #[test]
-    fn extract_finds_top_level_vault_refs() {
-        let cfg = json!({
-            "AUTH_HEADER": "vault://oauth/gmail/token",
-            "MAX_RESULTS": "10",
-            "API_KEY": "vault://anthropic/api_key",
-            "URL": "https://example.com"
-        });
-        let refs = extract_vault_refs(&cfg);
-        assert_eq!(refs.len(), 2);
-        assert!(refs
+    fn resolved(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
             .iter()
-            .any(|(k, p)| k == "AUTH_HEADER" && p == "oauth/gmail/token"));
-        assert!(refs
-            .iter()
-            .any(|(k, p)| k == "API_KEY" && p == "anthropic/api_key"));
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    /// `extract_vault_refs` scans the TOP LEVEL of the value it is given; the
+    /// sandbox handlers rely on config keys being mirrored to the payload
+    /// root. Every fixture below asserts the refs were actually found first —
+    /// without that, a shape mistake makes the whole case pass vacuously,
+    /// which is exactly what the first draft of these tests did.
+    fn refs_of(v: &serde_json::Value) -> Vec<(String, String)> {
+        let r = extract_vault_refs(v);
+        assert!(!r.is_empty(), "fixture extracted no refs — it cannot fail");
+        r
     }
 
     #[test]
-    fn extract_finds_embedded_vault_ref_in_bearer_header() {
-        // Regression: catalog integration modules put the vault ref inside a
-        // header template ("Bearer vault://…"), not as a bare prefix. It MUST
-        // still be extracted so the token is prefetched; otherwise the worker
-        // forwards the literal string and the provider returns 401.
-        let cfg = json!({
-            "AUTH_HEADER": "Bearer vault://oauth/gmail/56a7eea7/user@example.com/access_token",
-            "QUERY": "is:unread"
-        });
-        let refs = extract_vault_refs(&cfg);
+    fn a_resolvable_reference_passes() {
+        let payload = serde_json::json!({ "AUTH_HEADER": "Bearer vault://jira/token" });
+        let refs = refs_of(&payload);
+        assert_eq!(refs[0].1, "jira/token");
+        check_vault_refs_resolvable(&resolved(&[("jira/token", "s3cr3t")]), &refs)
+            .expect("resolvable");
+    }
+
+    /// The guarantee that the guest keeps the literal is a TYPE guarantee, not
+    /// an assertion: `check_vault_refs_resolvable` has no payload parameter, so
+    /// it cannot write into one. Substitution would require changing the
+    /// signature, which is what the sandbox source pins watch for.
+    #[test]
+    fn the_checker_cannot_reach_a_payload_at_all() {
+        let refs = refs_of(&serde_json::json!({ "A": "vault://x/y" }));
+        // Compiles only because the checker takes the resolved map and the
+        // refs — nothing it could mutate.
+        let _: Result<(), VaultResolverError> =
+            check_vault_refs_resolvable(&resolved(&[("x/y", "v")]), &refs);
+    }
+
+    #[test]
+    fn an_unresolvable_reference_names_the_key_and_the_path() {
+        let refs = refs_of(&serde_json::json!({ "AUTH": "vault://nope/missing" }));
+        let err = check_vault_refs_resolvable(&HashMap::new(), &refs).expect_err("must refuse");
         assert_eq!(
-            refs.len(),
-            1,
-            "the embedded Bearer vault:// ref must be found"
-        );
-        assert_eq!(refs[0].0, "AUTH_HEADER");
-        assert_eq!(
-            refs[0].1,
-            "oauth/gmail/56a7eea7/user@example.com/access_token"
-        );
-    }
-
-    #[test]
-    fn extract_skips_empty_path() {
-        // "vault://" with no path after is malformed — should not be included.
-        let cfg = json!({ "BROKEN": "vault://" });
-        let refs = extract_vault_refs(&cfg);
-        assert!(refs.is_empty());
-    }
-
-    #[test]
-    fn extract_ignores_non_strings() {
-        let cfg = json!({ "MAX": 10, "ENABLED": true });
-        let refs = extract_vault_refs(&cfg);
-        assert!(refs.is_empty());
-    }
-
-    #[test]
-    fn replace_substitutes_top_level() {
-        let mut payload = json!({
-            "AUTH_HEADER": "vault://oauth/gmail/token",
-            "URL": "https://example.com"
-        });
-        let refs = vec![("AUTH_HEADER".to_string(), "oauth/gmail/token".to_string())];
-        let mut resolved = HashMap::new();
-        resolved.insert(
-            "oauth/gmail/token".to_string(),
-            "actual-token-value".to_string(),
-        );
-
-        replace_vault_values(&mut payload, &resolved, &refs).unwrap();
-        assert_eq!(
-            payload["AUTH_HEADER"].as_str().unwrap(),
-            "actual-token-value"
-        );
-        assert_eq!(payload["URL"].as_str().unwrap(), "https://example.com");
-    }
-
-    #[test]
-    fn replace_substitutes_in_config_subobject() {
-        let mut payload = json!({
-            "config": {
-                "AUTH_HEADER": "vault://oauth/gmail/token",
-                "MAX": "10"
-            }
-        });
-        let refs = vec![("AUTH_HEADER".to_string(), "oauth/gmail/token".to_string())];
-        let mut resolved = HashMap::new();
-        resolved.insert("oauth/gmail/token".to_string(), "actual-token".to_string());
-
-        replace_vault_values(&mut payload, &resolved, &refs).unwrap();
-        assert_eq!(
-            payload["config"]["AUTH_HEADER"].as_str().unwrap(),
-            "actual-token"
-        );
-        assert_eq!(payload["config"]["MAX"].as_str().unwrap(), "10");
-    }
-
-    #[test]
-    fn replace_returns_error_when_secret_missing() {
-        let mut payload = json!({ "AUTH_HEADER": "vault://missing/path" });
-        let refs = vec![("AUTH_HEADER".to_string(), "missing/path".to_string())];
-        let resolved = HashMap::new();
-
-        let err = replace_vault_values(&mut payload, &resolved, &refs)
-            .expect_err("missing secret must error");
-        // The enum is `#[non_exhaustive]` and carries only `SecretNotResolved`
-        // today; the bare `match` still compiles if new variants land, at
-        // which point this test should expand.
-        match &err {
+            err,
             VaultResolverError::SecretNotResolved {
-                config_key,
-                vault_path,
-            } => {
-                assert_eq!(config_key, "AUTH_HEADER");
-                assert_eq!(vault_path, "missing/path");
+                config_key: "AUTH".to_string(),
+                vault_path: "nope/missing".to_string(),
             }
-            other => panic!("expected SecretNotResolved, got {other}"),
-        }
-        // Display still carries both fields for human-readable logs.
-        let rendered = format!("{err}");
-        assert!(rendered.contains("AUTH_HEADER"));
-        assert!(rendered.contains("missing/path"));
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("AUTH"), "{msg}");
+        assert!(msg.contains("nope/missing"), "{msg}");
     }
 
     #[test]
-    fn refuses_to_substitute_oauth_refresh_token() {
-        // #118 controller-side mirror: a config referencing a host-internal
-        // OAuth refresh token must be rejected, NOT substituted into the
-        // payload — even if the secret was resolved (e.g. via a `["*"]` grant).
-        let mut payload = json!({
-            "config": { "RT": "vault://oauth/gmail/u1/primary/refresh_token" }
-        });
-        let refs = vec![(
-            "RT".to_string(),
-            "oauth/gmail/u1/primary/refresh_token".to_string(),
-        )];
-        let mut resolved = HashMap::new();
-        resolved.insert(
-            "oauth/gmail/u1/primary/refresh_token".to_string(),
-            "super-secret-refresh-token".to_string(),
-        );
-
-        let err = replace_vault_values(&mut payload, &resolved, &refs)
-            .expect_err("refresh-token substitution must be refused");
+    fn a_host_internal_refresh_token_is_refused_before_it_is_ever_fetched() {
+        let refs = refs_of(&serde_json::json!({
+            "R": "vault://oauth/gmail/u1/primary/refresh_token"
+        }));
+        // Refused even though it WOULD have resolved — the point is that it is
+        // never fetched into a job's secret map, not that it is missing.
+        let err = check_vault_refs_resolvable(
+            &resolved(&[("oauth/gmail/u1/primary/refresh_token", "rt")]),
+            &refs,
+        )
+        .expect_err("refresh tokens are controller-only");
         assert!(matches!(err, VaultResolverError::ReservedHostPath { .. }));
-        // The plaintext must NOT have leaked into the payload.
-        assert_eq!(
-            payload["config"]["RT"].as_str().unwrap(),
-            "vault://oauth/gmail/u1/primary/refresh_token",
-            "payload must be left untouched — no refresh token written in"
+        assert!(
+            !err.to_string().contains("rt"),
+            "the value must not be echoed"
         );
     }
 
+    /// The CONTROL for the refusal above: an LLM provider key is a legitimate
+    /// reference (the documented BYO-key pattern). Its tier ceiling is enforced
+    /// by the worker and by `retain_wire_safe_secrets`, not here.
     #[test]
-    fn still_substitutes_llm_byo_key_and_oauth_access_token() {
-        // LLM provider keys (documented BYO-key header pattern) and OAuth
-        // ACCESS tokens are legitimate substitutions — the guard must only
-        // catch refresh tokens, nothing else.
-        let mut payload = json!({
-            "config": {
-                "AUTH": "vault://anthropic/api_key",
-                "AT": "vault://oauth/gmail/u1/primary/access_token"
-            }
-        });
-        let refs = vec![
-            ("AUTH".to_string(), "anthropic/api_key".to_string()),
-            (
-                "AT".to_string(),
-                "oauth/gmail/u1/primary/access_token".to_string(),
-            ),
-        ];
-        let mut resolved = HashMap::new();
-        resolved.insert("anthropic/api_key".to_string(), "sk-ant-xxx".to_string());
-        resolved.insert(
-            "oauth/gmail/u1/primary/access_token".to_string(),
-            "ya29.at".to_string(),
-        );
-
-        replace_vault_values(&mut payload, &resolved, &refs).expect("must substitute");
-        assert_eq!(payload["config"]["AUTH"].as_str().unwrap(), "sk-ant-xxx");
-        assert_eq!(payload["config"]["AT"].as_str().unwrap(), "ya29.at");
+    fn an_llm_provider_key_is_not_reserved_here() {
+        let refs = refs_of(&serde_json::json!({ "K": "vault://anthropic/api_key" }));
+        check_vault_refs_resolvable(&resolved(&[("anthropic/api_key", "sk-x")]), &refs)
+            .expect("BYO-key pattern stays legitimate");
     }
 
     #[test]
-    fn merge_dedupes_paths() {
-        let allowed = vec!["oauth/gmail".to_string()];
-        let refs = vec![
-            ("A".to_string(), "oauth/gmail".to_string()), // duplicate
-            ("B".to_string(), "anthropic/api_key".to_string()),
-        ];
-        let merged = merge_vault_refs_into_allowlist(allowed, &refs);
-        assert_eq!(merged.len(), 2);
-        assert!(merged.contains(&"oauth/gmail".to_string()));
-        assert!(merged.contains(&"anthropic/api_key".to_string()));
+    fn the_allowlist_merge_deduplicates() {
+        let refs = refs_of(&serde_json::json!({
+            "A": "vault://x/y", "B": "vault://x/y", "C": "vault://p/q"
+        }));
+        let merged = merge_vault_refs_into_allowlist(vec!["x/y".to_string()], &refs);
+        assert_eq!(merged.iter().filter(|s| *s == "x/y").count(), 1);
+        assert!(merged.contains(&"p/q".to_string()));
     }
 }

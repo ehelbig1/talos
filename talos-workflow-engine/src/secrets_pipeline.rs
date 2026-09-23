@@ -390,7 +390,17 @@ pub(crate) fn filter_tier1_paths(
 ///   * LLM provider keys for Tier-1 — the documented "a tier-1 job must never
 ///     carry an LLM key on the wire" invariant. Tier-2 keeps them for the
 ///     host `llm::*` path (re-added by step 5 of `build_encrypted_secrets_for`).
-pub(crate) fn retain_wire_safe_secrets(
+/// Drop every secret that must never reach a worker for THIS actor.
+///
+/// `pub` since 2026-09-23 so the sandbox handlers apply the ENGINE's rule
+/// rather than a copy of it. Before that they applied nothing: `test_module`
+/// injected LLM provider keys unconditionally, so a TIER-1 actor's test job
+/// carried the very keys `build_encrypted_secrets_for` skips entirely for a
+/// tier-1 dispatch — the controller-side defense-in-depth that exists so a
+/// tier-1 job "never has an Anthropic/OpenAI/Gemini key on the wire" was
+/// reachable around through the dev-test surface. Same class MCP-692 fixed for
+/// the tier GATE and left open for the key PREFETCH four lines above it.
+pub fn retain_wire_safe_secrets(
     secrets: &mut std::collections::HashMap<String, String>,
     max_llm_tier: talos_workflow_engine_core::LlmTier,
 ) {
