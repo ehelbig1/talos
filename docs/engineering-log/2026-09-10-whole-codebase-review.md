@@ -7290,3 +7290,101 @@ Measured after the fix: 6/6 green with **zero** skips, so the test genuinely
 exercises rather than silently opting out; and a mutation forcing
 `advisory_db_gate_outcome` to always `Pass` still fails it, so it remains a
 gate.
+
+## Package EA (2026-09-23) — two instruments that overstated, and one claimed defect withdrawn
+
+Both findings came out of the deploy-124 verification read. The withdrawal is
+the part worth keeping, because it is the failure mode this log exists to
+prevent applied to my own triage.
+
+### Withdrawn: `applied_max_fuel` is not a defect
+
+It was reported in triage as a misleading field — "it asserts what is applied
+and reports the module row instead". The code already answers this. A
+2026-07-26 change added `node_max_fuel_override` and `configured_max_fuel`
+alongside it with a comment naming exactly this confusion, and
+`effective_max_fuel` was renamed to `configured_max_fuel` on 2026-09-03
+precisely because the old name over-claimed what it knew.
+
+All three fields were present in the responses that misled me. I read the
+first and stopped. Nothing shipped for it, and it is recorded here so a future
+session does not "fix" a field that already carries its own disclosure.
+
+### `ws_init_not_received` fired at WARN on ordinary browser behaviour
+
+The pre-init loop collapsed two endings, by choice — the comment said so:
+`// Left before connection_init: the same ending as the deadline`. So a client
+that CLOSED before `connection_init` and a client that held the socket open
+and said nothing for the full 30-second deadline rendered identically, at
+WARN, under a message claiming the deadline had elapsed.
+
+Measured on deploy 124: this was the controller's only WARN, logged **535
+microseconds** after that same socket authenticated. That is a superseded
+reconnect, not a deadline. A level that fires on healthy client behaviour
+trains operators to ignore the level.
+
+`WsHandshakeOutcome::ClosedBeforeInit` (`closed_before_init`) is now distinct
+and reports at DEBUG, for the same reason `no_token` does: the counter carries
+it and there is nothing for an operator to act on. `InitNotReceived` keeps its
+name and NARROWS to what that name always claimed — the deadline elapsed with
+the socket still open, which is a client holding a connection slot in silence
+and is worth attention. `ALL` is 10 and every value is pre-seeded. No series
+was removed and nothing alerts on either, so the narrowing's blast radius is a
+dashboard that does not yet exist. The mapping is the pure `pre_init_ending`.
+
+### `talos_platform_admin_checks_total{outcome="unauthenticated"}` is unreachable
+
+Measured live rather than reasoned: an unauthenticated `dekMigrationStatus`
+reached the resolver and moved the counter by zero. `require_scope(Admin)`
+refuses a caller carrying neither `ApiKeyScopes` nor a session `Uuid`, and it
+sits above **all 11** `require_platform_admin` call sites — while **0 of 16**
+`require_second_factor` sites have one, which is exactly why that gate's
+`unauthenticated` IS reachable and was seen moving 0 to 1 on the same fleet
+the same day.
+
+**Deliberately not fixed by reordering the gates.** For an unauthenticated
+caller both orders refuse; only the caller-facing sentence differs. Reordering
+eleven security-sensitive call sites so a counter can move is the tail wagging
+the dog. The variant stays on the enum because `evaluate_platform_admin` needs
+it to be total, and it stays seeded because a future call site placed ahead of
+the scope gate would otherwise be born at 1 and read 0 forever under
+`increase()`.
+
+What changed is the disclosure. The HELP text now states that the label reads
+0 on every deployment, why, that it is seeded anyway, and which counter to
+read instead.
+
+### Mutations: 6 applied, 6 caught after closing one survivor
+
+- **N1** `pre_init_ending` arms swapped → its test fails
+- **N2** client-close back to WARN → the level pin fires
+- **N3** the `Close` arm stops marking the client as gone → **SURVIVED**
+- **N4** the new outcome dropped from `ALL` → the arity pin fires
+- **N5** the HELP disclosure deleted → the disclosure pin fires
+- **N6** a platform-admin site loses its scope gate → the reachability pin fires
+
+**N3 is the instructive one.** Reverting the `Message::Close` arm so it breaks
+without setting `client_left` restores the defect in full for the explicit
+close path, and `pre_init_ending`'s own test structurally cannot see it: a
+guard at the primitive cannot see a call site. It is closed by a textual pin
+asserting exactly two endings mark the client as gone and that the deadline
+arm marks none.
+
+**Stated limit**: the pre-init loop is still not DRIVEN. Doing so means making
+`handle_websocket_auth` generic over its socket the way package DV did for the
+session, plus a real schema and `AuthService` — a refactor of an auth path,
+and not done here. The pin and this sentence stand in its place.
+
+### Guards, and what each is worth
+
+The pure mapping's own test; a TEXTUAL level pin, because no behavioural test
+in this workspace can observe a tracing level; the call-site pin above; the
+existing handshake pin extended to the new variant; the `ALL.len()` arity pin
+moved 9 to 10; a reachability pin in `talos-api` proving every platform-admin
+site sits behind the scope gate, together with its contrast asserting that no
+privileged-gate site does; and a HELP-text pin in `talos-metrics` that encodes
+the real registry and asserts the disclosure survives — a correct pin beside a
+deleted disclosure leaves an operator reading a permanent 0 as evidence, which
+is the whole defect.
+
+No lint check was added and `--count` stays 96.

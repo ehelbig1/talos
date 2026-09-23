@@ -3359,7 +3359,16 @@ impl TalosMetrics {
                 "Outcomes of the GraphQL platform-admin gate \
                  (require_platform_admin) on cross-tenant and system-wide \
                  operations. `unreadable` means the is_platform_admin read \
-                 failed and the call was refused anyway.",
+                 failed and the call was refused anyway. `unauthenticated` \
+                 reads 0 on every deployment and is NOT evidence that no \
+                 anonymous caller reached a platform-admin operation: every \
+                 current call site runs require_scope(Admin) first, and that \
+                 gate refuses a caller with neither an API key nor a session, \
+                 so the platform-admin gate is never reached without one. It \
+                 is seeded anyway because a future call site placed ahead of \
+                 the scope gate would otherwise be born at 1 and read 0 \
+                 forever under increase(). Read `unauthenticated` on \
+                 talos_privileged_op_total instead, which IS reachable.",
             ),
             &["outcome"],
         )?;
@@ -4136,6 +4145,47 @@ impl TalosMetrics {
     }
 }
 
+/// The platform-admin counter must keep DISCLOSING that its
+/// `unauthenticated` label is unreachable.
+///
+/// `talos-api`'s `platform_admin_reachability_pins` proves the fact (every
+/// `require_platform_admin` call site sits behind `require_scope`, which
+/// refuses an anonymous caller first). This asserts the counter still SAYS
+/// so: a correct pin beside a deleted disclosure leaves an operator reading a
+/// permanent 0 as evidence that no anonymous caller reached a platform-admin
+/// operation, which is exactly the reading the disclosure removes.
+#[cfg(test)]
+mod platform_admin_help_disclosure_tests {
+    use super::TalosMetrics;
+    use prometheus::Encoder;
+
+    #[test]
+    fn the_help_text_names_the_unreachable_label_and_why() {
+        let m = TalosMetrics::new().expect("registry");
+        let mut buf = Vec::new();
+        prometheus::TextEncoder::new()
+            .encode(&m.registry.gather(), &mut buf)
+            .expect("encode");
+        let text = String::from_utf8(buf).expect("utf-8");
+        let help = text
+            .lines()
+            .find(|l| l.starts_with("# HELP talos_platform_admin_checks_total"))
+            .expect("the counter must be registered with a HELP line");
+        assert!(
+            help.contains("unauthenticated"),
+            "HELP must name the unreachable label: {help}"
+        );
+        assert!(
+            help.contains("require_scope"),
+            "HELP must say WHY it is unreachable, not merely that it is: {help}"
+        );
+        assert!(
+            help.contains("talos_privileged_op_total"),
+            "HELP must point at the counter whose unauthenticated IS reachable: {help}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4893,10 +4943,10 @@ mod tests {
                 o.as_str()
             )));
         }
-        assert_eq!(WsHandshakeOutcome::ALL.len(), 9);
+        assert_eq!(WsHandshakeOutcome::ALL.len(), 10);
         assert_eq!(
             warm.matches("talos_ws_handshakes_total{outcome=").count(),
-            9
+            10
         );
         for r in WsSessionEnd::ALL {
             assert!(warm.contains(&format!(

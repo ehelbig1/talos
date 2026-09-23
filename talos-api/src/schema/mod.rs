@@ -1797,3 +1797,96 @@ mod privileged_gate_production_path_tests {
         .await;
     }
 }
+
+/// Why `talos_platform_admin_checks_total{outcome="unauthenticated"}` reads 0
+/// on every deployment, pinned so the counter's HELP text cannot go stale.
+///
+/// `require_scope(Admin)` refuses a caller carrying neither `ApiKeyScopes` nor
+/// a session `Uuid`. Every `require_platform_admin` call site runs it FIRST,
+/// so the platform-admin gate is never reached by an anonymous caller and its
+/// `unauthenticated` arm — which the function must still have to be total —
+/// cannot be delivered by production. Measured live on 2026-09-23: an
+/// unauthenticated `dekMigrationStatus` reached the resolver and moved the
+/// counter by zero.
+///
+/// `require_second_factor` is the CONTRAST and the reason this is worth
+/// pinning rather than assuming: none of its call sites has a scope gate in
+/// front, so its own `unauthenticated` IS reachable and was observed moving
+/// 0 -> 1 on the same fleet the same day.
+///
+/// TEXTUAL, and stated as such: it reads the resolver sources rather than the
+/// call graph, so a gate reached through a helper is invisible to it.
+#[cfg(test)]
+mod platform_admin_reachability_pins {
+    fn read(rel: &str) -> String {
+        std::fs::read_to_string(rel).unwrap_or_else(|e| panic!("cannot read {rel}: {e}"))
+    }
+
+    /// For each `require_platform_admin` call, look back a few lines for a
+    /// `require_scope`. Every one must have it — that is the claim the HELP
+    /// text makes.
+    #[test]
+    fn every_platform_admin_gate_sits_behind_the_scope_gate() {
+        let mut checked = 0usize;
+        for rel in [
+            "src/schema/security/queries.rs",
+            "src/schema/security/mutations.rs",
+        ] {
+            let body = read(rel);
+            let lines: Vec<&str> = body.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                let t = line.trim_start();
+                if t.starts_with("//") || !line.contains("require_platform_admin(ctx)") {
+                    continue;
+                }
+                checked += 1;
+                let lo = i.saturating_sub(8);
+                let has_scope = lines[lo..i].iter().any(|l| l.contains("require_scope("));
+                assert!(
+                    has_scope,
+                    "{rel}:{}: require_platform_admin without require_scope above it. \
+                     That makes talos_platform_admin_checks_total{{outcome=\"unauthenticated\"}} \
+                     REACHABLE, so this pin and the counter's HELP text must be updated together.",
+                    i + 1
+                );
+            }
+        }
+        assert!(
+            checked >= 10,
+            "expected the platform-admin gate at 10+ call sites, found {checked} — \
+             the scan stopped matching and would vouch for nothing"
+        );
+    }
+
+    /// The contrast, so the asymmetry is recorded rather than inferred: the
+    /// privileged gate is NOT behind a scope gate, which is why its
+    /// `unauthenticated` is reachable and the platform-admin one is not.
+    #[test]
+    fn the_privileged_gate_is_not_behind_the_scope_gate() {
+        let body = read("src/schema/security/mutations.rs");
+        let lines: Vec<&str> = body.lines().collect();
+        let mut sites = 0usize;
+        let mut behind_scope = 0usize;
+        for (i, line) in lines.iter().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("//") || !line.contains("require_second_factor(ctx)") {
+                continue;
+            }
+            sites += 1;
+            let lo = i.saturating_sub(8);
+            if lines[lo..i].iter().any(|l| l.contains("require_scope(")) {
+                behind_scope += 1;
+            }
+        }
+        assert!(
+            sites >= 10,
+            "expected 10+ privileged-gate sites, found {sites}"
+        );
+        assert_eq!(
+            behind_scope, 0,
+            "a privileged-gate call site gained a scope gate in front of it — its \
+             `unauthenticated` outcome may no longer be reachable, which the \
+             platform-admin counter's HELP text contrasts against"
+        );
+    }
+}
