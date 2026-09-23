@@ -1807,6 +1807,19 @@ bootstrapSecret:
     # Optional — LLM provider keys. Controller-only; never shipped to worker.
     ANTHROPIC_API_KEY: ""
     OPENAI_API_KEY: ""
+    # Optional — Plaid. Controller-only: the worker is credential-free and a
+    # module reaches Plaid with `vault://` BODY substitution, never an env key.
+    # All three or none — a partial configuration is a hard boot error, and
+    # PLAID_ENV must be exactly `sandbox` or `production` (no default: sandbox
+    # would make a production deployment silently read nothing).
+    PLAID_CLIENT_ID: ""
+    PLAID_SECRET: ""
+    PLAID_ENV: ""
+    # Optional — workflow-definition signing. Blank leaves signing off.
+    TALOS_WORKFLOW_SIGNING_KEY: ""
+    # Optional — appends to the compile dependency allowlist. Blank = the base
+    # allowlist only; this WIDENS a security control, so set it deliberately.
+    MCP_ALLOWED_CRATE_DEPENDENCIES_EXTRA: ""
     # Optional — embedding provider key (leave empty for local Ollama).
     EMBEDDING_API_URL: ""
     EMBEDDING_API_KEY: ""
