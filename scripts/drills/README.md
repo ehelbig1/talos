@@ -303,6 +303,37 @@ wired. That is the strictly harder question, and scheduling it is what turns
 "the off-host copy is uncertified" into one that is continuously answered.
 An out-of-set value is refused at install time rather than reaching the plist.
 
+**Since 2026-09-24 that upgrade actually works.** Until then the drill's
+scheduler propagated only the KEK escrow variables, so a
+`TALOS_DRILL_SCHEDULE_SOURCE=b2` install rendered a plist with no age
+passphrase, no bucket, no endpoint and no region: the job died every week at
+`no age passphrase source configured`, and on the reference host the off-host
+leg had therefore **never run once** — no `source="b2"` series had ever been
+published. The scheduler now carries the same off-host environment the
+upload sidecar's scheduler does, from one shared list
+(`scripts/lib/offhost-env.sh`), so the two cannot drift for a bucket they
+both address. Three things follow:
+
+- the job's PATH must resolve `aws` as well as `cargo` and `docker`, and a
+  `b2` install is refused when it cannot (an `artifact` install is not — the
+  tool list is derived from the source, so a host with no `aws` can still
+  schedule the local drill);
+- setting BOTH `_CMD` and `_FILE` of either escrow pair is refused at install
+  rather than at 03:00 on a Sunday, matching the refusal the drill itself
+  makes;
+- `AWS_SECRET_ACCESS_KEY` is still never propagated. The scheduled run reads
+  it the way `aws` already does — an `~/.aws/credentials` profile readable by
+  your login session. `AWS_ACCESS_KEY_ID`, `AWS_PROFILE` and
+  `AWS_SHARED_CREDENTIALS_FILE` ARE carried: they select a credential without
+  being one.
+
+```bash
+TALOS_DRILL_SCHEDULE_SOURCE=b2 \
+  TALOS_OFFHOST_AGE_PASSPHRASE_CMD='op read "op://Private/Talos age backup/password"' \
+  TALOS_OFFHOST_B2_BUCKET=... TALOS_OFFHOST_B2_ENDPOINT=... TALOS_OFFHOST_B2_REGION=... \
+  make drill-schedule
+```
+
 `StartCalendarInterval` runs missed jobs once the machine wakes, which
 is what makes a weekly cadence workable on a laptop — the same
 wake-aware property the backup sidecars get from their hourly tick.

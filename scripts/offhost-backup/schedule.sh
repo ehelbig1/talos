@@ -47,6 +47,8 @@ LOG="$LOG_DIR/offhost-backup.log"
 # failure: a hardcoded PATH without ~/.cargo/bin, rustup's default).
 # shellcheck source=../lib/launchd-path.sh
 source "$REPO_ROOT/scripts/lib/launchd-path.sh"
+# shellcheck source=../lib/offhost-env.sh
+source "$REPO_ROOT/scripts/lib/offhost-env.sh"
 SCHEDULED_TOOLS=(cargo aws)
 HOUR=3
 MINUTE=30
@@ -78,17 +80,10 @@ xml_escape() {
 # $BACKUP_DIR) or a wrapper that exports it. This is stated here rather than
 # quietly worked around, because a scheduler that "helpfully" copied the
 # secret in would undo the whole containment argument.
-render_env() {
-    local v
-    for v in TALOS_OFFHOST_B2_BUCKET TALOS_OFFHOST_B2_ENDPOINT TALOS_OFFHOST_B2_REGION \
-             TALOS_OFFHOST_AGE_PASSPHRASE_CMD TALOS_OFFHOST_AGE_PASSPHRASE_FILE \
-             TALOS_OFFHOST_ESCROW_TIMEOUT_SECS TALOS_BACKUP_DIR TALOS_TEXTFILE_DIR \
-             AWS_ACCESS_KEY_ID AWS_PROFILE AWS_SHARED_CREDENTIALS_FILE; do
-        if [[ -n "${!v:-}" ]]; then
-            printf '    <key>%s</key><string>%s</string>\n' "$v" "$(xml_escape "${!v}")"
-        fi
-    done
-}
+# The list moved to scripts/lib/offhost-env.sh on 2026-09-24 so the drill's
+# scheduler can carry the SAME set for its `--source b2` mode. Two lists for
+# one bucket is two answers to one question.
+render_env() { render_offhost_plist_env; }
 
 render_plist() {
     cat <<EOF

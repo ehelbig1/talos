@@ -9242,3 +9242,141 @@ makes expressible — `readonly` categorical + `write` verb + `tier1` + egress
 `public` — is the strongest this platform can state for a POST-based financial
 reader: no memory writes, no publishing, no email, no database, no external LLM,
 and a POST to Plaid.
+## EO, 2026-09-24 — the scheduler could not run the leg that matters
+
+### How it was found
+
+A firing alert, not an audit. `TalosBackupRestoreDrillLastRunFailed` was up.
+The metric said `talos_backup_drill_last_status 0`, last success 2026-09-14,
+last run 2026-09-20 — and the alert's own summary distinguishes *"RAN AND
+FAILED"* from *"overdue"*, so this was the bad one.
+
+The log named the failure exactly:
+
+```
+could not read secret op://Talos/TALOS_MASTER_KEY/credential:
+  error initializing client: authorization timeout
+⚠ TALOS_DRILL_ESCROW_KEY_CMD ran but produced NO OUTPUT
+✗ no escrowed KEK available — REFUSING to read it from the live stack.
+```
+
+That refusal is the control working: the drill declines to source the KEK
+from the running controller because doing so answers an easier question.
+
+### Finding 1 — the artifact leg, and it is not ours
+
+The plist's escrow command is well designed: a 1Password **service account**
+token pulled from the macOS keychain, which is the headless-capable path.
+Measured, in this order:
+
+| check | result |
+|---|---|
+| keychain item | present, **128-char** token, readable outside Terminal |
+| `op` | `/usr/local/bin/op`, **2.16.1**, not brew-managed |
+| `op service-account` | **unknown command** |
+| `service account` in `op --help` | absent |
+| `OP_SERVICE_ACCOUNT_TOKEN=… op whoami` | **account is not signed in** |
+
+`op` 2.16.1 predates service accounts, ignores the variable and falls back to
+user auth. That explains the whole run history: only THREE runs have ever
+happened, all `artifact` — two hand-run on Monday 2026-09-14 (a prompt, an
+approval, a pass) and one scheduled on Sunday 2026-09-20 (nobody to approve,
+timeout, fail). **The scheduled drill has never succeeded; its first ever
+unattended execution is the one that failed.**
+
+Operator-owned and deliberately NOT fixed here: their machine, their
+1Password account, and a service account must exist and be granted the vault.
+
+### Finding 2 — and this one is ours
+
+Every drill series carries `source="artifact"`. There is **no `source="b2"`
+series at all**: the off-host leg has never run once. Only one plist exists
+and it runs `artifact`.
+
+It could not have run. `render_escrow_env` propagated four `TALOS_DRILL_*`
+variables and none of the off-host ones, so `TALOS_DRILL_SCHEDULE_SOURCE=b2
+make drill-schedule` rendered a job with no age passphrase, no bucket, no
+endpoint and no region — one that dies weekly at `no age passphrase source
+configured`. The scheduler's own header already called b2 *"the upgrade path
+once the off-host chain and its age passphrase are wired"*; nothing had wired
+it, and package BC recorded the gap without closing it.
+
+**This is the leg the precondition names.** The artifact leg's own output
+says *"NOT proven: that anything survives losing this disk. Run `--source b2`
+for that"*, and package AT made "the off-host backup chain proven end to end"
+the precondition for `MODULE_EXECUTION_RETENTION_ENABLED`. So fixing `op`
+alone would turn the artifact drill green and retention would still,
+correctly, stay off.
+
+The cost is compounding: `module_executions` went 57 755 rows / 193 MB on
+2026-09-13 to **69 331 / 234 MB** — roughly 1 050 rows and 3.7 MB a day,
+against a database at 888 MB, with a retention sweep that exists and has
+never run.
+
+### Decisions
+
+* **ONE home for the list.** `scripts/lib/offhost-env.sh` names every variable
+  a LaunchAgent may carry for an off-host job. Both schedulers source it: they
+  address the same bucket with the same credentials, so two lists are two
+  answers to one question. The twin already had the right list inline and now
+  delegates to the shared one.
+* **The tool list is DERIVED from the source.** `b2` fetches through the `aws`
+  CLI, so `aws` joins `cargo docker` for that mode only, and a `b2` install is
+  refused when it cannot resolve. An `artifact` install is deliberately NOT
+  refused for lacking `aws` — that would be the opposite error, and both
+  halves are pinned so neither can regress alone.
+* **A contradictory pair is refused at INSTALL, for both pairs.** The drill
+  dies when `_CMD` and `_FILE` are both set, because precedence *"would
+  silently ignore one of them — and the one that loses is the FILE, the branch
+  that carries the containment checks"*. Catching it at install costs a line;
+  catching it at 03:00 on a Sunday costs a week. Adding it to the new pair and
+  not its escrow twin would have been the familiar asymmetry.
+* **A MISSING secret keeps warn-and-install, not refusal.** The drill calls
+  the age passphrase *"a SECOND fatal secret … Same containment rules,
+  reusing the same helpers rather than similar ones"*, so it is mirrored on
+  the escrow's existing terms rather than given a third behaviour. Refusal is
+  reserved for the contradictory pair, which has no sibling.
+* **`AWS_SECRET_ACCESS_KEY` is never propagated**; `AWS_ACCESS_KEY_ID`,
+  `AWS_PROFILE` and `AWS_SHARED_CREDENTIALS_FILE` are. `aws.rs` states the
+  asymmetry this rests on — *"the key id may be logged; the secret may not"*.
+  My first draft excluded the key id "for symmetry" and that was wrong
+  against the twin's precedent.
+
+### A measurement error, and the third of its kind
+
+My inventory of the b2 leg's requirements **missed all three**
+`TALOS_OFFHOST_B2_BUCKET` / `_ENDPOINT` / `_REGION`. The grep used
+`TALOS_OFFHOST[A-Z_]*`, and `[A-Z_]` excludes the digit in `B2`, so the names
+could never match. The README caught what the instrument did not.
+
+Without that catch this package would have **moved** the weekly failure from
+*no passphrase* to *no bucket* rather than removing it, while every test I had
+written still passed. A character class has now dropped evidence three times
+in this log.
+
+### Mutations
+
+Nine applied against the final structure, each confirmed landed by hash and
+byte-reverted under a `finally`; nine caught, post-revert green. They cover
+both halves of the derived tool list, the shared list losing the passphrase or
+the bucket, the drill ceasing to emit the block, both pair refusals, the
+secret being added to the list, and the twin forking its own shorter list.
+
+**The harness's early-abort tripwire caught a defect in MY TEST**, which is
+what it exists for: the parity probe set both halves of the passphrase pair
+and so tripped the very guard under test — a probe that fires the thing it is
+measuring proves nothing. It now excludes the FILE half and asserts that both
+plists actually rendered, so the comparison loop cannot pass vacuously over
+two empty strings.
+
+### Stated limits
+
+* This makes the b2 drill **schedulable**, not passing. It needs the
+  operator's bucket credentials and escrowed age passphrase, and finding 1
+  means `op` 2.16.1 cannot fetch either unattended — so every unattended run
+  is still blocked until that is upgraded.
+* Nothing here is provable on this host today: there are still **zero**
+  `source="b2"` series. The honest guard is the first scheduled run after the
+  operator wires the credentials.
+* The artifact leg's failure is untouched by this package.
+
