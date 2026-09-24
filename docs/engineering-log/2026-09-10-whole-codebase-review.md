@@ -8651,3 +8651,50 @@ That measurement also corrected a claim I had been about to make about my own
 Plaid workaround — that granting `write` turned off `email::send`'s only
 control. It did not, for that actor, because it is tier-1. The layered axes
 contained everything except the NATS publish.
+
+### EJ, continued — the fourth population, found by CI
+
+The blast radius was measured in three populations and every one was zero:
+installed modules, production `TalosContext::new` sites, shipped catalog
+templates. CI found a fourth, and the interesting part is not that a fixture
+was stale but that my enumerator could not see the fixtures at all.
+
+Test-vs-production was classified by running `strip_test_modules` over each
+call site. That function finds a column-0 `#[cfg(test)]` region inside a `src/`
+file. A `tests/`-dir binary in a DEPENDENT crate has no such marker anywhere —
+every line of it is production-shaped text — so the enumeration did not
+misclassify those sites, it never enumerated them. The "29 `TalosContext::new`
+sites" I reported is one crate's count; the workspace holds **34**, and the
+other five are in `worker/tests/`.
+
+Two of the five broke, and the second is the one worth carrying:
+
+* `sandbox_security_tests::ssrf_allows_public_ip` — a shared `make_context_with`
+  helper with an empty method list, so a GET to `8.8.8.8` was refused by the
+  method gate and the test read it as the SSRF gate blocking a public IP.
+* `tier1_llm_enforcement_tests::tier2_allows_fetch_to_anthropic_when_host_allowlisted`
+  — a POSITIVE CONTROL. Its seven tier-1 siblings all still passed, because the
+  tier gate fires above the method gate; the one test proving a tier-2 actor
+  *does* reach the host is the one that sits below it. Its panic message reads
+  *"the tier gate is incorrectly tripping on Tier2 — a regression"*, so a reader
+  arriving at this failure would have been sent to the wrong control entirely.
+  A positive control is exactly the test a fail-closed flip breaks, and exactly
+  the one whose failure text is written about a different mechanism.
+
+The other three stay empty deliberately: a `Minimal`-world memory-limiter
+fixture and two that reach no gate. An empty list is now the honest declaration
+for a module that makes no gated call, and declaring five verbs there would
+claim coverage the test does not exercise.
+
+Proof is pre/post against the real tree rather than mutation — both tests RED
+before the fixture edit and GREEN after. The per-binary counts are the second
+half of that proof: 36→37 and 7→8, so nothing flipped the other way, i.e. no
+test in either binary had been passing BECAUSE the method gate refused.
+
+**The gate-sequence lesson generalises past this package.** `cargo test -p
+<touched crates>` runs the crates I edited; `cargo check --workspace
+--all-targets` compiles every dependent crate's test binaries and runs none of
+them. Between the two, five fixtures were built and never executed, and the
+gates were green. A behaviour change in a library crate needs the DEPENDENT
+crates' `tests/` binaries executed, not merely built — and `strip_test_modules`
+is the wrong instrument for finding them.
