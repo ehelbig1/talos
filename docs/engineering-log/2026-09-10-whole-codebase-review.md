@@ -8984,3 +8984,261 @@ before the fourth was right, and **two of them came from truncating my own
 evidence with `head`** — once hiding the writer, once hiding the producer that
 composes the prefix. A grep that returns nothing and a grep that was cut off
 look identical in a terminal.
+
+## EN, 2026-09-24 — `allowed_secrets` has two vocabularies, and four operator surfaces taught the one that delivers nothing
+
+### How it was found
+
+Not by auditing. By building a workflow on the `plaid-read` module shipped two
+packages earlier and watching both of its nodes fail:
+
+```
+node 'transactions' failed: Component returned error: /transactions/sync failed:
+Error { code: 3, name: "forbiddenhost", message: "" } [reason_class=secret-lookup]
+```
+
+**My first diagnosis was wrong, and stating it matters more than quietly moving
+on.** I reasoned that there are two prefetch routes — `get_module_secrets`
+(gated on each secret's `allowed_modules`) and `get_secrets_by_paths` over the
+`vault://` references found in node config — and that the Plaid secrets carry
+`allowed_modules = {}` while the module deliberately builds its references
+internally, so neither route delivers. The `allowed_modules` half was a red
+herring. Reading `engine_dispatch_single.rs` showed the engine passes
+`&wasm_module.allowed_secrets` — **the module's own grant list** — as
+`extra_paths`, and `resolve_secrets_map_for` step 2 resolves those verbatim.
+
+The mechanism, verified at the SQL rather than inferred:
+`SecretsManager::get_secrets_by_paths` runs `WHERE key_path = ANY($1)`, with the
+literal `"*"` the only special case. Exact equality. So `plaid/*` is looked up
+against a path no secret is named, returns no rows, and an empty result is
+`Ok` — nothing logs, nothing fails, and the module simply never receives a
+secret.
+
+### The finding
+
+`allowed_secrets` does two jobs with different vocabularies:
+
+| job | matcher | accepts |
+|---|---|---|
+| permission | `vault_path_permitted` | `*` · exact · bare prefix · `/*` glob |
+| delivery | `get_secrets_by_paths` | `*` · exact |
+
+A prefix or glob entry is a perfectly good permission boundary that prefetches
+nothing. The module header had also argued for internal reference construction
+on a premise that was **false on the production path** — it cited
+`vault_resolver::replace_vault_values` substituting plaintext into config, a
+function package EH (#937) measured as having exactly two call sites, both in
+`sandbox.rs`, never the engine, and then deleted. The live proof sat in the same
+events stream that showed the failure: a Gmail node's `node_input` carried
+`"Bearer vault://oauth/gmail/.../access_token"` — the literal, at runtime.
+
+### The measurement corrected itself, and that is the instructive half
+
+Fleet-wide: **63 grant entries** — 8 exact, 30 naming a path this deployment has
+not stored, and **25 that permit correctly and deliver nothing** (19 glob, 6
+bare prefix).
+
+The node-level pass is where I nearly recorded a false claim. A first query
+joined on `n->'data'->>'module_id'` and read config at `n->'data'->'config'`,
+returned **zero** affected nodes, and I was one step from writing *latent —
+nothing on this fleet uses these grants*. What refuted it was checking a second,
+independent claim against the same query shape: a count of nodes carrying a
+config `vault://` reference also came back **zero**, which contradicted a
+reference I had read with my own eyes minutes earlier. A node's config **IS**
+`data`, and its module id is `type`. The join had matched nothing, so both zeros
+were zeros for the wrong reason.
+
+Re-measured correctly over non-archived workflows:
+
+| grant | config reference | live nodes |
+|---|---|---|
+| delivers | no | 2 |
+| delivers | yes | 7 |
+| **permits only** | yes | **31** |
+| none | no | 43 |
+
+So **31 live nodes do depend on permit-only grants** and every one of them works,
+because it carries the config reference that delivers. The dangerous quadrant —
+permit-only grant *and* no config reference — held exactly **two** nodes, both
+`plaid-read`, both failing, and now holds zero. The conclusion "latent" survived;
+the reasoning behind it did not, and the corrected reasoning is far stronger,
+because those 31 correct uses are the empirical case for disclosure over refusal.
+
+### Decisions
+
+* **ONE home**: `talos_workflow_job_protocol::vault_path_prefetched`, the
+  delivery twin placed beside `vault_path_permitted` so the disagreement is
+  documented where both are read. Pinned by
+  `prefetched_is_strictly_narrower_than_permitted` — the invariant that keeps the
+  asymmetry safe (a dispatch can never put on the wire what the grant does not
+  also permit), with a vacuity guard so the loop cannot pass against two
+  identical matchers.
+* **`test_secret_access` gains a fifth gate, `dispatch_prefetch`.** Its stated
+  purpose is *"use this when get_secret() is failing at runtime to identify
+  which gate is responsible"*, and all four of its existing gates PASSED over a
+  path no dispatch would deliver.
+* **DECIDED: gate 5 is deliberately NOT folded into `would_succeed`.** A path the
+  grant does not prefetch can still arrive by a `vault://<path>` reference in the
+  node's own config — the route 31 live nodes use, and one this tool cannot see,
+  because it takes a module and a path and no node. Folding it in would flip
+  `would_succeed` to false for modules that demonstrably work: the determinate
+  negative in the other direction, which is the defect this package exists to
+  remove.
+* **Deliberately NOT refusing or rewriting a glob at the write.** A glob is a
+  legitimate permission boundary for a config-reference module; 31 live nodes say
+  so. The fix is disclosure.
+* **The sentence has ONE home**, `SECRET_GRANT_DELIVERY_NOTE`, carried by all
+  four surfaces. This is EI's N8 lesson applied before it could bite again: three
+  surfaces agreed on a claim, nothing pinned the words, and a reword stayed
+  green. Gate 3's per-path remedy is pinned NEGATIVELY, because a count pin over
+  static descriptions cannot see a runtime sentence.
+* **No lint check added; `--count` stays 97.** The population is one predicate and
+  four description sites, below #765's bar, and the structural answer is stronger.
+
+### Mutations — and two findings against my own harness
+
+Fourteen applied, each confirmed landed by hash and byte-reverted under a
+`finally`, and the final run was done on a SINGLE tree after a rule was broken
+(see below).
+
+The harness was wrong twice, in opposite directions, and both are worth carrying:
+
+1. **M4's first form did not compile.** Removing the `format!` argument left a
+   `{}` with no argument. My green predicate was `not re.search(r'[1-9]\d* failed')`,
+   which a compile error never matches — so the run scored a build failure as a
+   **SURVIVOR**. This is the "a mutation that does not compile proves nothing"
+   rule biting the instrument written to enforce it. Rewritten as M4v2 to drop the
+   placeholder and the argument together.
+2. **The fix over-corrected.** Detecting a build failure with `^error:` matches
+   cargo's own `error: test failed, to rerun pass …`, so every genuinely CAUGHT
+   mutation was then reported **INVALID**. Narrowed to `could not compile` and
+   `^error[E\d+]`.
+
+A verdict predicate needs three outcomes — caught, survived, and did-not-build —
+and the boundary between the last two is not a generic `error:`.
+
+Final tally: **13 valid mutations, 13 caught**; M4's first form recorded as
+INVALID rather than counted. The set covers both findings: the delivery
+predicate widened to match permission or narrowed to drop the wildcard; gate 5
+folded into `would_succeed`, computed-but-not-reported, or its remedy reverted;
+the shared sentence dropped from either writer surface or reworded to lose the
+config route; gate 1 requiring BOTH routes instead of either, or restoring the
+recompile advice; and the substitution predicate claiming unknown worlds or
+dropping `http`.
+
+**A third harness lesson, and it is a rule I had already been given.** Partway
+through the run I edited `talos-failure-analysis-service` — four stale
+remediation strings naming "the four gates" — while the harness was live. That
+crate is a DEPENDENCY of `talos-mcp-handlers`, so the later mutations compiled
+against a different tree than the earlier ones. Every result was CAUGHT either
+way and the edit was a string change that cannot affect a pin, but a run spread
+across two trees is not a run. It was discarded and the whole set re-executed on
+one tree; that is the number reported above. Two jobs had also been queued to
+fire on the same completion, which would have put a gate build and a mutating
+harness on the target directory at once — stopped before they overlapped.
+
+### Stated limits
+
+* The pins are TEXTUAL. `handle_test_secret_access` is not driven end to end — it
+  needs an `McpState` with a database and a vault — so a gate that decides
+  correctly and renders wrongly is caught by the pin alone. Checks 74b/79b
+  describe the same division of labour.
+* The 30 grant entries naming an unstored path are **deliberately left alone**:
+  that is a module declaring a path this deployment has not provisioned, a steady
+  state, so warning on it at dispatch would fire on a healthy fleet — check 69's
+  trap.
+* `vault_path_prefetched` answers what the GRANT delivers. Whether any node
+  supplies the config route is a different question this predicate does not ask.
+
+### The second finding, which is the more severe one
+
+It surfaced while capturing "before" evidence for the fifth gate. Running
+`test_secret_access` against a working module returned:
+
+```
+"passed": false,
+"reason": "World 'http-node' does NOT import the secrets interface.
+           Recompile with capability_world: secrets-node ..."
+"would_succeed": false
+```
+
+`plaid-read` was, at that moment, fetching 14 accounts and 49 transactions.
+
+A secret reaches a module by one of **two** routes and gate 1 knew about one:
+
+* the **guest** route — the module calls `secrets::get_secret()` itself, which
+  requires the `secrets` interface;
+* the **host** route — the module puts a `vault://<path>` marker in an outbound
+  request's headers or JSON body and the host resolves it at the socket, so the
+  plaintext never enters the guest's address space.
+
+The host route is the *safer* one. It is also what every OAuth integration on
+this platform uses. **Measured: all 38 live nodes carrying a `vault://` config
+reference are `http-node`, across 14 modules** — so gate 1 was **0-for-38** on
+this fleet, and its remedy would have widened 14 modules' capability world while
+fixing nothing. For `plaid-read` specifically the real defect was the grant form,
+and gate 1 was pointing at the capability world.
+
+Note how the two findings interact: the fifth gate would have told the operator
+the truth, and gate 1 would have been shouting a louder, wronger answer beside
+it. Shipping one without the other is half a correction to a single sentence.
+
+**One home**: `talos_capability_world::world_allows_vault_substitution`, placed
+beside `world_allows_secrets`. Its correctness is **derived from
+`wit/talos.wit`, not transcribed from it** — `the_substitution_predicate_matches_the_wit`
+reads each world's own body out of the WIT and asserts the predicate equals
+"imports `http` / `webhook` / `graphql`", with a vacuity floor so a scan that
+stops matching fails rather than passes. A hand-maintained `matches!` list would
+have been one more thing to keep in sync; this cannot drift. Verified at the WIT
+before the predicate was written: `minimal-node` imports no egress interface at
+all, every other world imports all three.
+
+**An unknown world is claimed to have NEITHER route.** For a ceiling predicate
+the safe default is "most privileged"; for a *diagnostic* it is "claim nothing",
+because telling an operator their module can reach a secret on no evidence is the
+same class of defect one level down.
+
+**DECIDED: this ships in the same package rather than first as its own PR.** The
+standing rule is that a more severe finding outranks the package in hand and
+ships first. It is stated here rather than silently taken, because the rule's
+purpose — not letting a bigger problem wait behind a smaller one — is served
+better by one coherent change: same tool, same function, same response contract,
+same pin file. Two PRs would each half-correct the same sentence and collide on
+identical lines.
+
+### An unrelated pre-existing flake, called out rather than absorbed
+
+The protocol crate's
+`shared_nonce_cache_retention_tests::the_retention_window_is_never_narrower_than_the_widest_verifier`
+failed once in six full-suite runs on this branch, and zero times in three runs
+on pristine `origin/main`. It passes in isolation every time.
+
+The mechanism: two tests in that module depend on the process-global
+`JOB_NONCE_CACHE`'s **size** — one deliberately pushes it past the 1024-entry
+sweep threshold — and take `NONCE_CACHE_TEST_SERIAL` to serialise against each
+other. But there are **59 `.verify()` call sites** in the same crate, every one
+of which inserts into that same global without taking the lock. A crate-scoped
+lock only serialises the tests that take it. The six tests added here touch
+nothing near the nonce cache; they changed scheduling enough to surface it once.
+
+**Not fixed here.** It is test-only and pre-existing, and the honest repair
+restructures a security test's relationship to a process global rather than
+papering over it with another lock. Recorded so the next person to see it red in
+CI does not spend the afternoon looking at their own diff.
+
+### The live proof owed since #941
+
+The same workflow discharged the end-to-end demonstration of EL/EM's verb axis.
+Same actor, same module, same workflow, three runs:
+
+| `max_write_ceiling` | `http_verb_ceiling` | outcome |
+|---|---|---|
+| `write` | *(inherit)* | completed |
+| `readonly` | *(inherit)* | refused, `reason_class=write-ceiling` |
+| `readonly` | **`write`** | completed — 14 accounts, 49 transactions |
+
+The only change between runs 2 and 3 is the axis EL added. The resting posture it
+makes expressible — `readonly` categorical + `write` verb + `tier1` + egress
+`public` — is the strongest this platform can state for a POST-based financial
+reader: no memory writes, no publishing, no email, no database, no external LLM,
+and a POST to Plaid.

@@ -568,6 +568,39 @@ pub fn world_allows_secrets(world: &str) -> bool {
     )
 }
 
+/// Worlds from which a module can reach a vault secret WITHOUT importing the
+/// `secrets` interface — the HOST-side `vault://` substitution route.
+///
+/// There are two ways a secret reaches a module and they need different
+/// capabilities:
+///
+///   * the GUEST route — the module calls `secrets::get_secret()` itself, which
+///     needs the `secrets` interface ([`world_allows_secrets`]);
+///   * the HOST route — the module puts a `vault://<path>` marker in an
+///     outbound request's headers or JSON body and the HOST resolves it at the
+///     socket (`resolve_vault_placed`), so the plaintext never enters the
+///     guest's address space at all.
+///
+/// The host route is the SAFER of the two and is what every OAuth integration
+/// on this platform uses, so a diagnostic that only knows about the guest route
+/// reports `would_succeed: false` for modules that demonstrably work — and, far
+/// worse, advises recompiling to a HIGHER capability world to fix it. Measured
+/// 2026-09-24: all 38 live nodes carrying a `vault://` config reference are
+/// `http-node`, so that advice would have widened 14 modules' privilege and
+/// fixed nothing.
+///
+/// Every lattice world except `minimal` imports `http` / `webhook` / `graphql`,
+/// which are the interfaces that perform substitution — derived from
+/// `wit/talos.wit` and PINNED against it by
+/// `the_substitution_predicate_matches_the_wit`, so adding a world to the
+/// lattice cannot silently drift this. A world outside the lattice is NOT
+/// claimed to have the route: an unknown world is unknown, and for a diagnostic
+/// the conservative direction is to claim nothing.
+#[must_use]
+pub fn world_allows_vault_substitution(world: &str) -> bool {
+    is_lattice_world(world) && world_short(world) != "minimal"
+}
+
 /// Worlds whose nodes exist primarily to EGRESS / SEND (make outbound network
 /// calls or publish output) and therefore have NO reason to receive the
 /// injected `__actor_context__` memory view by default.
@@ -1111,6 +1144,73 @@ mod architecture_doc_lattice_tests {
                 .map(str::to_string)
                 .collect();
             assert_eq!(permits, expected, "architecture.md §4.1 row `{ceiling}`");
+        }
+    }
+}
+
+#[cfg(test)]
+mod vault_substitution_route_tests {
+    use super::{compilable_worlds, world_allows_secrets, world_allows_vault_substitution};
+
+    /// The predicate's correctness is DERIVED from `wit/talos.wit`, not
+    /// transcribed from it: this reads the WIT's own world bodies and asserts
+    /// the answer matches "imports an interface that performs `vault://`
+    /// substitution". A world added to the lattice therefore cannot drift the
+    /// predicate silently — the way a hand-maintained `matches!` list would.
+    #[test]
+    fn the_substitution_predicate_matches_the_wit() {
+        let wit = include_str!("../../wit/talos.wit");
+        let mut seen = 0usize;
+        for world in compilable_worlds() {
+            let head = format!("world {}-node {{", super::world_short(world));
+            let start = wit
+                .find(&head)
+                .unwrap_or_else(|| panic!("world `{world}` is not declared in wit/talos.wit"));
+            let body = &wit[start..];
+            let end = body.find("\n}").expect("world body must terminate");
+            let body = &body[..end];
+            // These three are the host functions that call `resolve_vault_placed`.
+            let egress = ["import http;", "import webhook;", "import graphql;"]
+                .iter()
+                .any(|i| body.contains(i));
+            assert_eq!(
+                world_allows_vault_substitution(world),
+                egress,
+                "world `{world}`: predicate says {}, wit says {egress}",
+                world_allows_vault_substitution(world)
+            );
+            seen += 1;
+        }
+        // A scan that matched nothing would pass the loop vacuously.
+        assert!(
+            seen >= 10,
+            "only {seen} worlds checked — the scan is not reading the WIT"
+        );
+    }
+
+    /// The two routes are INDEPENDENT, which is the whole point: `http-node`
+    /// has the host route and not the guest route, and that combination is the
+    /// entire live config-reference population on this fleet.
+    #[test]
+    fn the_two_secret_routes_are_independent() {
+        assert!(!world_allows_secrets("http-node"));
+        assert!(world_allows_vault_substitution("http-node"));
+
+        assert!(world_allows_secrets("secrets-node"));
+        assert!(world_allows_vault_substitution("secrets-node"));
+
+        // `minimal` has neither — it imports no egress interface at all.
+        assert!(!world_allows_secrets("minimal-node"));
+        assert!(!world_allows_vault_substitution("minimal-node"));
+    }
+
+    /// An unknown world is UNKNOWN. Claiming the route for it would tell an
+    /// operator their module can reach a secret on no evidence.
+    #[test]
+    fn an_unknown_world_is_not_claimed_to_have_either_route() {
+        for w in ["banana-node", "", "full-node"] {
+            assert!(!world_allows_vault_substitution(w), "world {w:?}");
+            assert!(!world_allows_secrets(w), "world {w:?}");
         }
     }
 }

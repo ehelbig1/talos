@@ -138,7 +138,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "test_secret_access",
-            "description": "Debug whether a given module would be allowed to read a given secret path WITHOUT actually executing the module. Runs the same three gates the worker enforces and reports each as PASS/FAIL with a human-readable reason:\n\n  1. capability_world — does the module's WIT world import the `secrets` interface? (must be one of: secrets, database, agent, trusted)\n  2. allowed_secrets allowlist — is the path covered by the module's grant (exact / prefix match / wildcard)?\n  3. reserved_host_path — LLM provider keys (anthropic/api_key, openai/api_key, gemini/api_key) are deny-listed for ALL guests, even with allowed_secrets: [\"*\"]; the host uses them via the llm::* interface only.\n  4. vault_presence — is the secret actually stored in the vault for this user?\n\nUse this when get_secret() is failing at runtime with `unauthorized` to identify which gate is responsible without redeploying.",
+            "description": format!("Debug whether a given module would be allowed to read a given secret path WITHOUT actually executing the module. Reports FIVE gates as PASS/FAIL with a human-readable reason:\n\n  1. capability_world — can the module reach a secret AT ALL, by EITHER route: the GUEST route (`secrets::get_secret()`, which needs the secrets interface) or the HOST route (a `vault://` marker in an outbound header or JSON body, resolved by the host at the socket — available to every world above minimal, and the route every OAuth integration uses). The per-route answers are in `gates[0].routes`.\n  2. allowed_secrets allowlist — is the path covered by the module's grant (exact / prefix match / wildcard)?\n  3. reserved_host_path — LLM provider keys (anthropic/api_key, openai/api_key, gemini/api_key) are deny-listed for ALL guests, even with allowed_secrets: [\\\"*\\\"]; the host uses them via the llm::* interface only.\n  4. vault_presence — is the secret actually stored in the vault for this user?\n  5. dispatch_prefetch — will a dispatch actually DELIVER this path on the strength of the grant alone? Gates 1-4 can all pass while the module receives nothing. {}\n\nUse this when get_secret() is failing at runtime with `unauthorized` to identify which gate is responsible without redeploying. NOTE: gate 5 is deliberately NOT folded into `would_succeed`, because the config-reference delivery route is not visible from here.", talos_workflow_job_protocol::SECRET_GRANT_DELIVERY_NOTE),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1365,19 +1365,64 @@ async fn handle_test_secret_access(
 
     // Gate 1: capability world. The worker requires one of these worlds for
     // any secrets:: import. Mirrors worker/src/host_impl.rs lines around 1374.
-    let world_allowed = talos_capability_world::world_allows_secrets(&capability_world);
+    // A secret reaches a module by one of TWO routes and this gate used to know
+    // about one of them. The GUEST route is `secrets::get_secret()`, which needs
+    // the `secrets` interface; the HOST route is a `vault://<path>` marker in an
+    // outbound request's headers or JSON body, resolved by the host at the
+    // socket so the plaintext never enters the guest at all. The host route is
+    // the SAFER one and is what every OAuth integration uses.
+    //
+    // Testing only the guest route made this gate report `would_succeed: false`
+    // for modules that work, under the reason *"World 'http-node' does NOT
+    // import the secrets interface. Recompile with capability_world:
+    // secrets-node"* — specific, actionable and wrong. Measured 2026-09-24: ALL
+    // 38 live nodes carrying a `vault://` config reference are `http-node`
+    // across 14 modules, so this gate was 0-for-38 on the fleet and its remedy
+    // would have widened 14 modules' capability world for nothing. Found while
+    // shipping the dispatch_prefetch gate below: `plaid-read` was fetching 14
+    // accounts and 49 transactions at the moment this tool called it incapable.
+    let guest_route = talos_capability_world::world_allows_secrets(&capability_world);
+    let host_route = talos_capability_world::world_allows_vault_substitution(&capability_world);
+    let world_allowed = guest_route || host_route;
     let gate_capability = serde_json::json!({
         "name": "capability_world",
         "passed": world_allowed,
-        "reason": if world_allowed {
-            format!("World '{}' imports the secrets interface.", capability_world)
-        } else {
-            format!(
-                "World '{}' does NOT import the secrets interface. \
-                 Recompile with capability_world: secrets-node (or higher: \
-                 agent-node, database-node, automation-node).",
+        "routes": {
+            "guest_get_secret": guest_route,
+            "host_vault_substitution": host_route,
+        },
+        "reason": match (guest_route, host_route) {
+            (true, true) => format!(
+                "World '{}' imports the secrets interface, so the module may call \
+                 secrets::get_secret() directly, AND it can egress, so a \
+                 `vault://` marker in an outbound header or JSON body is resolved \
+                 by the host.",
                 capability_world
-            )
+            ),
+            (true, false) => format!(
+                "World '{}' imports the secrets interface, so the module may call \
+                 secrets::get_secret() directly.",
+                capability_world
+            ),
+            (false, true) => format!(
+                "World '{}' does NOT import the secrets interface, so \
+                 secrets::get_secret() is refused — but it can egress, so the \
+                 module reaches this secret by putting `vault://{}` in an \
+                 outbound request's headers or JSON body, which the host resolves \
+                 at the socket. That is the SAFER route (the plaintext never \
+                 enters the guest) and is how every OAuth integration here works, \
+                 so this is NOT a reason to recompile at a higher world.",
+                capability_world, secret_path
+            ),
+            (false, false) => format!(
+                "World '{}' can reach a secret by neither route: it does not \
+                 import the secrets interface (so secrets::get_secret() is \
+                 refused) and it has no egress interface (so there is no outbound \
+                 request for a `vault://` marker to ride). Recompile with \
+                 capability_world: http-node to use the host route, or \
+                 secrets-node for direct guest access.",
+                capability_world
+            ),
         },
     });
 
@@ -1413,14 +1458,57 @@ async fn handle_test_secret_access(
         } else if allowed_secrets.is_empty() {
             format!(
                 "Module's allowed_secrets list is EMPTY (deny-all). \
-                 Recompile with allowed_secrets: [\"{}\"] (exact) or a prefix grant.",
+                 Grant it with allowed_secrets: [\"{}\"] — the EXACT path, which \
+                 also makes the dispatch pre-fetch it (see the dispatch_prefetch \
+                 gate below). A prefix grant would permit this path without \
+                 delivering it.",
                 secret_path
             )
         } else {
             format!(
                 "Path '{}' does not match any entry in the module's allowed_secrets {:?}. \
-                 Add it (exact path or prefix) and recompile.",
+                 Add the EXACT path — a prefix or glob entry permits a path without \
+                 delivering it (see the dispatch_prefetch gate below).",
                 secret_path, allowed_secrets
+            )
+        },
+    });
+
+    // Gate 5: will a dispatch actually DELIVER this path on the strength of the
+    // grant alone? Gates 1-4 answer "is this permitted and does it exist" and
+    // every one of them can pass while the module still gets nothing, because
+    // `allowed_secrets` has two jobs with different vocabularies: the engine
+    // passes the grant list VERBATIM as `extra_paths` to
+    // `SecretsManager::get_secrets_by_paths`, whose non-wildcard query is
+    // `WHERE key_path = ANY($1)` — exact equality, with only the literal `"*"`
+    // special-cased. A prefix or glob entry therefore matches no row, an empty
+    // result is `Ok`, and nothing logs. This tool's stated purpose is "use this
+    // when get_secret() is failing at runtime to identify which gate is
+    // responsible", so a four-PASS verdict over a path that will never be
+    // delivered is the exact failure it exists to prevent.
+    let prefetched =
+        talos_workflow_job_protocol::vault_path_prefetched(&allowed_secrets, &secret_path);
+    let gate_prefetch = serde_json::json!({
+        "name": "dispatch_prefetch",
+        "passed": prefetched,
+        "reason": if prefetched {
+            format!(
+                "The grant names '{}' in a form the dispatch pre-fetches (exact path, or \"*\"), \
+                 so the controller resolves it and the worker receives it.",
+                secret_path
+            )
+        } else {
+            format!(
+                "The grant permits '{}' but will NOT pre-fetch it: only an exact path or \"*\" \
+                 is resolved, and a prefix/glob entry is looked up verbatim against a path \
+                 no secret is named. Two ways to deliver it — (a) add the EXACT path to \
+                 allowed_secrets via update_module_secrets, or (b) put `vault://{}` in the \
+                 node's config, which the engine extracts and resolves separately (this is \
+                 how OAuth integrations work, and it is why this gate does NOT change \
+                 would_succeed: whether any node carries that reference is not visible from \
+                 here, and reporting failure over a route this tool cannot measure would be \
+                 the same defect in the other direction).",
+                secret_path, secret_path
             )
         },
     });
@@ -1472,7 +1560,7 @@ async fn handle_test_secret_access(
         "allowed_secrets": allowed_secrets,
         "secret_path": secret_path,
         "would_succeed": all_pass,
-        "gates": [gate_capability, gate_reserved, gate_allowlist, gate_presence],
+        "gates": [gate_capability, gate_reserved, gate_allowlist, gate_presence, gate_prefetch],
     });
     // No-op when every read succeeded, so the healthy response is
     // byte-identical to the pre-#730 one.

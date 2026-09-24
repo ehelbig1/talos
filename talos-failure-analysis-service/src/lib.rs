@@ -475,10 +475,11 @@ pub fn classify_error(msg: &str) -> (&'static str, &'static str) {
         // Generic Unauthorized that didn't match the more specific HTTP gates.
         // From the worker, this typically means a secrets gate failed
         // (capability world / allowlist / reserved-host). Use
-        // test_secret_access(module_id, secret_path) to identify which gate.
+        // test_secret_access(module_id, secret_path) to identify which of the
+        // five gates failed (see modules.rs — gate 5 is delivery, not permission).
         (
             "auth_error",
-            "Authorization failed. If from a guest module's secrets call, run test_secret_access to identify whether the capability_world, allowed_secrets, or reserved-host gate failed.",
+            "Authorization failed. If from a guest module's secrets call, run test_secret_access to identify which gate failed — capability_world (which covers BOTH the guest secrets::get_secret route and the host vault:// substitution route), allowed_secrets, reserved-host, vault presence, or dispatch_prefetch (a prefix/glob grant permits a path without delivering it).",
         )
     } else if lower.contains("postgres")
         || lower.contains("sqlite")
@@ -678,7 +679,7 @@ pub fn remediation_steps(error_type: &str, module_label: &str) -> Vec<serde_json
         ],
         "missing_secret" => vec![
             serde_json::json!({ "step": 1, "action": "identify_secret", "description": format!("Check which secret key_path node '{}' expects — use get_workflow_quickstart to list required secrets.", module_label), "tool": "get_workflow_quickstart" }),
-            serde_json::json!({ "step": 2, "action": "test_gates", "description": "test_secret_access(module_id, secret_path) tells you whether the path is in the vault, in the allowlist, and within the capability world — all in one call.", "tool": "test_secret_access" }),
+            serde_json::json!({ "step": 2, "action": "test_gates", "description": "test_secret_access(module_id, secret_path) tells you whether the path is in the vault, in the allowlist, within the capability world (by either the guest or the host route), and whether a dispatch will actually DELIVER it — all in one call.", "tool": "test_secret_access" }),
             serde_json::json!({ "step": 3, "action": "provision_secret", "description": "Store the credential in the dashboard (Settings → Secrets) using the correct key_path — secret writes require 2FA and aren't available through MCP.", "tool": null }),
             serde_json::json!({ "step": 4, "action": "retry", "description": "Retry the execution after provisioning the secret.", "tool": "retry_execution" }),
         ],
@@ -703,7 +704,7 @@ pub fn remediation_steps(error_type: &str, module_label: &str) -> Vec<serde_json
             serde_json::json!({ "step": 3, "action": "test", "description": "Re-test the workflow after fixing the config.", "tool": "test_workflow_draft" }),
         ],
         "auth_error" => vec![
-            serde_json::json!({ "step": 1, "action": "test_secret_gates", "description": format!("If node '{}' calls secrets::get_secret directly, run test_secret_access(module_id, secret_path) — it reports which of the four gates failed (capability_world, allowed_secrets, reserved-host, vault presence) without needing a redeploy.", module_label), "tool": "test_secret_access" }),
+            serde_json::json!({ "step": 1, "action": "test_secret_gates", "description": format!("If node '{}' calls secrets::get_secret directly, run test_secret_access(module_id, secret_path) — it reports which of the five gates failed (capability_world, allowed_secrets, reserved-host, vault presence, dispatch_prefetch) without needing a redeploy. Note a module using vault:// substitution in a header or body does NOT need the secrets interface — that is the host route, and gates[0].routes says which routes it has.", module_label), "tool": "test_secret_access" }),
             serde_json::json!({ "step": 2, "action": "check_secret", "description": "If this is a vault:// header substitution, verify the secret is still present and not expired.", "tool": "list_secrets" }),
             serde_json::json!({ "step": 3, "action": "re_provision_secret", "description": "Generate a new token/key and update the secret in the dashboard (Settings → Secrets) — secret writes require 2FA and aren't available through MCP.", "tool": null }),
             serde_json::json!({ "step": 4, "action": "retry", "description": "Retry after updating the credential.", "tool": "retry_execution" }),
