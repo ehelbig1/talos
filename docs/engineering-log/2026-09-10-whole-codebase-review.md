@@ -8698,3 +8698,124 @@ them. Between the two, five fixtures were built and never executed, and the
 gates were green. A behaviour change in a library crate needs the DEPENDENT
 crates' `tests/` binaries executed, not merely built — and `strip_test_modules`
 is the wrong instrument for finding them.
+
+### EK, 2026-09-24 — the carriers, found by the previous package's own proof
+
+EJ's deploy verification called for a live forced refusal. I drove one through
+`run_sandbox` with an allowlisted host so the host gate would pass and the
+method gate would be the thing that refused. It refused, exactly as designed:
+
+    [host:method-allowlist] http-fetch denied by policy 'method-allowlist'
+    (target: GET example.com) — declare the verbs this module uses with
+    update_module_methods
+
+The proof succeeded and the tool was broken. `run_sandbox` has no
+`allowed_methods` parameter; it hardcodes `vec![]` beside a caller-supplied
+`allowed_hosts`. For nine hours it could not issue a single HTTP request.
+
+#### Two claims in EJ's own bullet were false
+
+They are corrected in a new bullet rather than edited in place — EJ is merged,
+and a superseded sentence is archived verbatim (check 88's precedent).
+
+**"Unreachable past its own deny-all."** I read the hardcoded pair in
+`execute_module_string_with_context_and_timeout`, where both lists really are
+`vec![]`, and generalised it to "the `run_sandbox`/`test_module` path". That
+function is `test_module`'s path. `run_sandbox` reaches
+`execute_job_with_full_features`, where the hosts are a caller parameter and
+only the methods are hardcoded. `test_module` was never affected: it forwards
+`module.allowed_methods`. One constructor read, two paths claimed.
+
+**"Seven prose sites swept, including the operator-facing
+`update_module_methods` description."** I swept a schema property in
+`modules.rs`. The tool is declared once, in `sandbox.rs`, and still said
+*"Empty list = allow all methods."* `METHOD_ALLOWLIST_REMEDY` names that tool,
+so an operator arriving from my own refusal read the opposite of the rule that
+had just refused them.
+
+#### The carriers
+
+Five production writers build a module row from a template. **Four carried
+`allowed_hosts` and dropped `allowed_methods`**: `compile_template` (MCP),
+`createModuleFromTemplate` (GraphQL), `restore_pinned_modules`, and the replay
+service's reconstruction. All four resolve the template through the same
+`get_template_for_user`, and the template struct has carried
+`allowed_methods` the whole time.
+
+The GraphQL one is the twin of the MCP one. That pair is what check 68 was
+written about — *"fixing the class converted a uniform bug into a
+protocol-dependent one"* — and I forgot it again in the package that cited it.
+
+The omission was free while empty meant allow-all: it cost the retry
+classification and nothing else. Since EJ each of those paths mints a module
+holding an egress host allowlist it can never use, with a refusal telling the
+operator to declare verbs on a module whose template already declared them.
+
+`talos_registry::InheritedGrants` is the one home now, so the four grants
+travel as one value and the next writer copies four or none.
+
+#### The sandbox default
+
+`run_sandbox` gains `allowed_methods`, defaulting to all five verbs. This is
+the one grant in the family that defaults open, and the argument is specific
+rather than general: the caller supplies the code AND the host allowlist in the
+same call, so there is no third party for the method axis to protect and no
+verb a caller could not have chosen anyway. `allowed_hosts` still defaults
+deny-all, which is the bound that matters. An explicit `[]` is honoured
+verbatim, because that is how a caller rehearses the deny-all posture an
+installed module gets, and the schema states the asymmetry — a sandbox quietly
+more permissive than the module it rehearses is a misleading rehearsal.
+
+#### What was NOT broken, measured rather than assumed
+
+4 of 113 live modules carry hosts-with-no-verbs. I read all four: every one is
+a non-egress trigger or parser whose `fetch_history` is a stub returning
+`Ok(vec![])`, and `network-scanner` reaches the network through raw
+`std::net::TcpStream` — `wasi:sockets`, which this gate does not cover at all.
+They trace to 4 of 75 catalog manifests that declare `allowed_hosts` and no
+`allowed_methods`; the seeder copies them faithfully.
+
+Tightening those four manifests is a least-privilege review of the catalog, not
+a carrier fix, so it is not done here. **No seed-time WARN either**: it would
+fire four times at every boot on a fleet where the state is benign, which is
+check 69's trap. Recorded instead, with one latent hazard beside it —
+`parse_manifest_allowed_methods` drops unrecognised verbs rather than failing,
+so a manifest declaring only `HEAD` (documented as valid in a schema string
+this package corrected, absent from the WIT enum) would seed a silently
+deny-all row. Zero of 75 do today.
+
+#### The prose population was larger than my count, twice
+
+EJ said seven sites. There were **seventeen**. My first grep here found fifteen;
+two more turned up phrased as *"the worker's 'allow every verb'"* rather than
+*"empty = allow all"*.
+
+The reason is structural: EJ's sweep followed the CODE change, and the prose
+lives in crates the code never touched — `talos-registry`,
+`talos-workflow-repository`, `talos-workflow-validation`,
+`talos-workflow-engine-core`, `talos-failure-analysis-service`. That last one
+is the sharpest: it is the remediation advice `analyze_execution_failure`
+renders for a `method_not_allowed` failure, so **the platform's own
+instructions for recovering from this exact refusal told the operator that
+clearing the list grants everything**. `retry.rs` is the other one worth
+naming — EJ corrected one of its four stale comments and left three.
+
+To sweep this class, grep the CLAIM in several phrasings, not the code.
+
+#### The pin's first draft was rejected on measurement
+
+A ±3-line window around each `allowed_hosts` assignment reported **3 of 4** on
+pristine main. It missed the GraphQL twin, whose `allowed_methods` and
+`allowed_hosts` sit nine lines apart — the site most likely to be forgotten,
+which is the gate-that-doesn't-gate shape (#624, checks 64/65). Scanning the
+whole `WasmModule` struct literal by brace balance reports **4 of 4 on
+`fef2c163`, 0 on the fixed tree**, with the files restored byte-for-byte.
+
+The pin also lives in its own file deliberately. Its first draft sat inside
+`sandbox.rs`, one of the three files it reads through `include_str!`, so
+reverting that file to reproduce the defect deleted the test along with it —
+a pin that cannot be run against the tree it vouches for proves less than it
+appears to. A second pin covers the `run_sandbox` call site, which no resolver
+test can see.
+
+Nine mutations, nine caught, no survivors.

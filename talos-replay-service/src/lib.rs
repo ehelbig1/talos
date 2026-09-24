@@ -540,6 +540,12 @@ impl ReplayService {
             .get_template_for_user(module_id, user_id)
             .await
             .map_err(|_| ReplayError::NotFound("Module not found or access denied".to_string()))?;
+        // The four template-inherited grants travel as ONE value
+        // ([`talos_registry::InheritedGrants`]). This site carried
+        // `allowed_hosts` and dropped `allowed_methods` — free while an
+        // empty list meant allow-all, fatal since 2026-09-24. Taken BEFORE
+        // `precompiled_wasm` is moved out of `template` below.
+        let grants = template.inherited_grants();
         let wasm_bytes = template.precompiled_wasm.ok_or_else(|| {
             ReplayError::NotFound(
                 "Template has no compiled WASM. Use compile_template first.".to_string(),
@@ -556,10 +562,10 @@ impl ReplayService {
             size_bytes: 0,
             max_fuel: 10_000_000,
             max_memory_mb: 128,
-            allowed_hosts: template.allowed_hosts,
-            allowed_methods: vec![],
-            allowed_secrets: template.allowed_secrets,
-            requires_approval_for: template.requires_approval_for,
+            allowed_hosts: grants.allowed_hosts,
+            allowed_methods: grants.allowed_methods,
+            allowed_secrets: grants.allowed_secrets,
+            requires_approval_for: grants.requires_approval_for,
             user_id: None,
             capability_world: inspection.capability_world,
             imported_interfaces: inspection.imported_interfaces,
