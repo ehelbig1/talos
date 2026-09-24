@@ -338,6 +338,32 @@ impl wit_http_stream::Host for TalosContext {
                 .await;
             return Err(stream_deny_forbidden(self, reason_class::NO_ALLOWLIST));
         }
+        // Method allowlist (2026-09-24). This surface had NO method gate at
+        // all, which mattered the moment an EMPTY `allowed_methods` started
+        // denying on the other four: without this, "an undeclared module
+        // cannot make HTTP calls" would have been false — it could still open
+        // an SSE read stream. An SSE connect is a GET (the WIT `connect(url,
+        // headers)` carries no method and the protocol is GET by
+        // construction), so that is the verb it must declare. Measured before
+        // adding it: exactly ONE module on the reference fleet mentions
+        // `http_stream` and it declares all five verbs, so the live blast
+        // radius here is zero — which is also why the empty-list arm directly
+        // above (`allowed_hosts`) is the right precedent to sit beside.
+        if !talos_workflow_job_protocol::method_permitted(&self.allowed_methods, "GET") {
+            self.record_capability_denied_detailed(
+                "http-stream",
+                "method-allowlist",
+                &format!("GET {host}"),
+                Some(talos_workflow_job_protocol::METHOD_ALLOWLIST_REMEDY),
+            )
+            .await;
+            tracing::warn!(
+                host = %host,
+                allowed_methods = ?self.allowed_methods,
+                "WASM module attempted an SSE stream but GET is not in allowed_methods"
+            );
+            return Err(stream_deny_forbidden(self, reason_class::METHOD_ALLOWLIST));
+        }
         // SSRF: block private IPs via the shared classifier (covers
         // CGNAT and IPv4-mapped IPv6 the duplicated logic was missing).
         if let Some((ip, policy)) = denied_ip_literal(&parsed) {

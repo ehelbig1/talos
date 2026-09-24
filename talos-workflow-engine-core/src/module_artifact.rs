@@ -65,7 +65,7 @@ pub struct WasmModuleArtifact {
     pub capability_world: String,
     /// Hostnames the worker permits outbound HTTP to.
     pub allowed_hosts: Vec<String>,
-    /// HTTP methods the worker permits. Empty means allow all.
+    /// HTTP methods the worker permits. Empty DENIES every verb (since 2026-09-24, matching `allowed_hosts` and `allowed_secrets`).
     pub allowed_methods: Vec<String>,
     /// Secret path allowlist. Empty = deny all; `["*"]` = allow all.
     pub allowed_secrets: Vec<String>,

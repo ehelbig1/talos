@@ -43,7 +43,10 @@ fn bare_context() -> TalosContext {
     TalosContext::new(
         CapabilityWorld::Http,
         vec![],
-        vec![],
+        ["GET", "POST", "PUT", "PATCH", "DELETE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         128,
         HashMap::new(),
         None,
@@ -113,7 +116,10 @@ async fn fetch_all_cancellation_precedes_the_capability_gate() {
     let mut ctx = TalosContext::new(
         CapabilityWorld::Minimal,
         vec![],
-        vec![],
+        ["GET", "POST", "PUT", "PATCH", "DELETE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         128,
         HashMap::new(),
         None,

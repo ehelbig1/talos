@@ -87,11 +87,32 @@ pub(crate) fn dedup_cacheable_status(status: u16) -> bool {
 /// The honest thing to say is that the ceiling CANNOT express "may POST, but
 /// only reads", and to name the controls that can: the module's
 /// `allowed_methods`, its `allowed_hosts`, and its source.
+///
+/// # The advice has to say what taking it COSTS (2026-09-24)
+///
+/// The first version ended at "raise the actor's write ceiling deliberately"
+/// and stopped there — which is the misleading-report class inside the fix for
+/// the misleading-report class. `actors.max_write_ceiling` is ONE scalar over
+/// fifteen gated ops, so raising it to clear ONE inferred HTTP refusal also
+/// clears every categorical op the actor's capability world grants. Measured
+/// for an `http-node` actor, which imports the HTTP suite plus webhook, email
+/// and events: raising the ceiling additionally permits `webhook-send`,
+/// `email-send` and `messaging-publish`/`-request`.
+///
+/// Those are not equally exposed, and the sentence must not imply they are:
+/// `webhook-send` stays bounded by `allowed_hosts`, and `email-send` is
+/// refused outright above this gate for a tier-1 actor. The one with no other
+/// control is the NATS publish. The sentence names the class and points at
+/// `get_module_info`'s `write_gated_ops` rather than enumerating a list that
+/// would go stale per world.
 pub(crate) const WRITE_CEILING_VERB_DETAIL: &str =
     "the write ceiling classifies by HTTP VERB (GET is the only read verb), so a read-only \
      actor is refused POST/PUT/PATCH/DELETE even when that call is a READ on this API. If \
      these POSTs are reads, the controls that express it are the module's allowed_methods \
-     and allowed_hosts, not this ceiling — raise the actor's write ceiling deliberately";
+     and allowed_hosts, not this ceiling — raise the actor's write ceiling deliberately, \
+     knowing it is one scalar: raising it also permits every other gated op this actor's \
+     capability world grants (for an http-node actor that is webhook-send, email-send and \
+     messaging-publish), which get_module_info reports as write_gated_ops";
 
 pub(crate) fn http_method_mutates(method: &wit_http::Method) -> bool {
     match method {
@@ -593,7 +614,8 @@ impl wit_http::Host for TalosContext {
             );
         }
 
-        // Enforce method allowlist (empty = allow all methods).
+        // Enforce method allowlist (empty = DENY every verb — see
+        // `talos_workflow_job_protocol::method_permitted`).
         let method_str = match req.method {
             wit_http::Method::Get => "GET",
             wit_http::Method::Post => "POST",
@@ -601,16 +623,12 @@ impl wit_http::Host for TalosContext {
             wit_http::Method::Delete => "DELETE",
             wit_http::Method::Patch => "PATCH",
         };
-        if !self.allowed_methods.is_empty()
-            && !self
-                .allowed_methods
-                .iter()
-                .any(|m| m.eq_ignore_ascii_case(method_str))
-        {
-            self.record_capability_denied(
+        if !talos_workflow_job_protocol::method_permitted(&self.allowed_methods, method_str) {
+            self.record_capability_denied_detailed(
                 "http-fetch",
                 "method-allowlist",
                 &format!("{} {}", method_str, host),
+                Some(talos_workflow_job_protocol::METHOD_ALLOWLIST_REMEDY),
             )
             .await;
             tracing::warn!(
@@ -1393,16 +1411,12 @@ impl wit_http::Host for TalosContext {
                 wit_http::Method::Delete => "DELETE",
                 wit_http::Method::Patch => "PATCH",
             };
-            if !self.allowed_methods.is_empty()
-                && !self
-                    .allowed_methods
-                    .iter()
-                    .any(|m| m.eq_ignore_ascii_case(method_str))
-            {
-                self.record_capability_denied(
+            if !talos_workflow_job_protocol::method_permitted(&self.allowed_methods, method_str) {
+                self.record_capability_denied_detailed(
                     "http-fetch-all",
                     "method-allowlist",
                     &format!("{} {}", method_str, host),
+                    Some(talos_workflow_job_protocol::METHOD_ALLOWLIST_REMEDY),
                 )
                 .await;
                 validated.push(Err(deny_forbidden(self, reason_class::METHOD_ALLOWLIST)));
@@ -2196,9 +2210,14 @@ mod breaker_permit_leak_path_tests {
         TalosContext::new(
             CapabilityWorld::Http,
             vec![host.to_string()],
-            // Empty secret grant: this is what makes the `vault://` resolve
-            // below fail deterministically.
-            vec![],
+            // allowed_methods. The empty SECRET grant two lines down
+            // (`HashMap::new()`) is what makes the `vault://` resolve below
+            // fail deterministically — this slot is the method allowlist, and
+            // the comment that used to sit here named the wrong argument.
+            ["GET", "POST", "PUT", "PATCH", "DELETE"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             128,
             HashMap::new(),
             None,
@@ -2483,7 +2502,10 @@ mod idempotency_dedup_tests {
         let mut c = TalosContext::new(
             CapabilityWorld::Http,
             vec![HOST.to_string()],
-            vec![],
+            ["GET", "POST", "PUT", "PATCH", "DELETE"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             128,
             HashMap::new(),
             None,
@@ -2656,7 +2678,10 @@ mod fetch_all_budget_and_breaker_tests {
         let mut c = TalosContext::new(
             CapabilityWorld::Http,
             allowed.iter().map(|s| s.to_string()).collect(),
-            vec![],
+            ["GET", "POST", "PUT", "PATCH", "DELETE"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             128,
             HashMap::new(),
             None,
@@ -2866,6 +2891,13 @@ mod write_ceiling_detail_tests {
         assert!(d.contains("allowed_methods"), "{d}");
         assert!(d.contains("allowed_hosts"), "{d}");
         assert!(d.contains("write ceiling"), "{d}");
+        // And what taking the advice COSTS (2026-09-24). Telling an operator
+        // to raise a ONE-SCALAR ceiling without saying it also clears every
+        // other gated op their capability world grants is the
+        // misleading-report class inside the fix for the misleading-report
+        // class — which is what the first version of this sentence did.
+        assert!(d.contains("one scalar"), "{d}");
+        assert!(d.contains("write_gated_ops"), "{d}");
     }
 
     #[test]

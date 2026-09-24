@@ -2678,6 +2678,67 @@ pub fn vault_path_permitted(allowed: &[String], key_path: &str) -> bool {
 }
 
 // ============================================================================
+// HTTP method allowlist matcher — shared between controller and worker
+// ============================================================================
+
+/// Returns true if `method` is permitted by this module's `allowed_methods`
+/// grant. Sibling of [`vault_path_permitted`], and deliberately the same
+/// shape: ONE home, so every enforcement point agrees on what a grant means.
+///
+/// Semantics:
+///   - `[]` (empty)          → **deny all** (no verb is permitted)
+///   - `["GET", "POST", …]`  → case-insensitive membership
+///
+/// # Empty denies, and that is a 2026-09-24 behaviour change
+///
+/// Until this function existed, all five enforcement points spelled the test
+/// `!allowed.is_empty() && !allowed.contains(method)` — so an EMPTY grant
+/// admitted every verb. That made `allowed_methods` the one member of the
+/// three-part module grant where empty means ALLOW: empty `allowed_hosts`
+/// denies (`host/webhook.rs` refuses outright on an empty list) and empty
+/// `allowed_secrets` denies (`vault_path_permitted` returns `false`). A
+/// module compiled with no method declaration could therefore POST, PUT,
+/// PATCH and DELETE anywhere its host allowlist reached.
+///
+/// Measured on the reference fleet before the flip: of **27** modules in a
+/// capability world above `Minimal` (i.e. able to reach the HTTP suite at
+/// all) with an empty `allowed_methods`, **ZERO** call any HTTP surface —
+/// checked with a deliberately loose predicate (`fetch(`, `::send(`,
+/// `execute(`, `connect(`) over `modules.source_code`, with no NULL source
+/// to hide in. They are LLM, memory, classify and approval modules that
+/// inherit the HTTP imports from their world without using them. So the
+/// allow-on-empty behaviour was never load-bearing here, and the flip is
+/// latent on this fleet.
+///
+/// It is NOT latent in general. A deployment holding an undeclared module
+/// that does call HTTP loses that call, fail-closed, with a refusal naming
+/// `update_module_methods`. That is the same direction as every other gate
+/// in this family and is stated rather than softened.
+///
+/// # No wildcard, deliberately
+///
+/// `allowed_secrets` needs `["*"]` because the vault key space is unbounded.
+/// The method space is **closed at five** — `wit/talos.wit`'s `enum method`
+/// is exactly `get, post, put, delete, patch` — so "every verb" is spelled by
+/// listing five strings, which is what the one module on this fleet that uses
+/// every verb already does (`{GET,POST,PUT,PATCH,DELETE}`). A wildcard would
+/// add a second spelling and a footgun for a bounded set, with no
+/// expressiveness gained.
+#[must_use]
+pub fn method_permitted(allowed: &[String], method: &str) -> bool {
+    !allowed.is_empty() && allowed.iter().any(|m| m.eq_ignore_ascii_case(method))
+}
+
+/// The one sentence every method refusal gives the module author.
+///
+/// The refusal has to name the FIX, not just the rule: an author told only
+/// "method not allowed" for a module that declares nothing has no way to know
+/// that declaring nothing is what denied them.
+pub const METHOD_ALLOWLIST_REMEDY: &str =
+    "declare the verbs this module uses with update_module_methods (an empty \
+     allowed_methods denies every verb, matching allowed_hosts and allowed_secrets)";
+
+// ============================================================================
 // Vault path LOG rendering — shared between controller and worker
 // ============================================================================
 
@@ -10912,5 +10973,78 @@ mod pre_execution_rejection_tests {
             verify_failure_class(VerifyFailureKind::MalformedNonce),
             "mismatch"
         );
+    }
+}
+
+/// [`method_permitted`] — the semantics three grants are supposed to share.
+#[cfg(test)]
+mod method_permitted_tests {
+    use super::{method_permitted, vault_path_permitted, METHOD_ALLOWLIST_REMEDY};
+
+    fn v(xs: &[&str]) -> Vec<String> {
+        xs.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    /// The whole point of the function, and the 2026-09-24 behaviour change.
+    #[test]
+    fn an_empty_grant_denies_every_verb() {
+        for m in ["GET", "POST", "PUT", "PATCH", "DELETE"] {
+            assert!(!method_permitted(&[], m), "empty must deny {m}");
+        }
+    }
+
+    /// CONTROL for the above: the same verbs pass once declared, so the
+    /// refusal cannot be a function that denies everything.
+    #[test]
+    fn a_declared_verb_is_permitted() {
+        let all = v(&["GET", "POST", "PUT", "PATCH", "DELETE"]);
+        for m in ["GET", "POST", "PUT", "PATCH", "DELETE"] {
+            assert!(method_permitted(&all, m), "declared must permit {m}");
+        }
+    }
+
+    #[test]
+    fn an_undeclared_verb_is_refused_even_when_others_are_declared() {
+        let get_only = v(&["GET"]);
+        assert!(method_permitted(&get_only, "GET"));
+        for m in ["POST", "PUT", "PATCH", "DELETE"] {
+            assert!(!method_permitted(&get_only, m), "{m} is not declared");
+        }
+    }
+
+    /// Preserved from the four hand-rolled gates this replaced — every one of
+    /// them used `eq_ignore_ascii_case`, so a `talos.json` written in lower
+    /// case must keep working.
+    #[test]
+    fn matching_is_case_insensitive_as_all_four_gates_were() {
+        assert!(method_permitted(&v(&["get"]), "GET"));
+        assert!(method_permitted(&v(&["GeT"]), "get"));
+        assert!(method_permitted(&v(&["POST"]), "post"));
+    }
+
+    /// Deliberately NO wildcard: the WIT method enum is closed at five, so
+    /// "every verb" is spelled by listing five strings. A `["*"]` grant is a
+    /// module declaring one verb literally named `*`, which does not exist —
+    /// and it must NOT silently mean all, because that would re-create the
+    /// allow-by-accident this change removed, under a second spelling.
+    #[test]
+    fn a_star_is_not_a_wildcard_here_unlike_allowed_secrets() {
+        let star = v(&["*"]);
+        for m in ["GET", "POST"] {
+            assert!(!method_permitted(&star, m), "`*` must not grant {m}");
+        }
+        // The CONTRAST that makes the asymmetry deliberate rather than an
+        // oversight: for secrets, whose key space is unbounded, `*` IS the
+        // documented wildcard.
+        assert!(vault_path_permitted(&star, "anything/at/all"));
+    }
+
+    /// The refusal has to name the FIX, not just the rule.
+    #[test]
+    fn the_remedy_names_the_tool_and_the_empty_case() {
+        assert!(METHOD_ALLOWLIST_REMEDY.contains("update_module_methods"));
+        assert!(METHOD_ALLOWLIST_REMEDY.contains("empty"));
+        assert!(METHOD_ALLOWLIST_REMEDY.contains("allowed_hosts"));
+        assert!(METHOD_ALLOWLIST_REMEDY.contains("allowed_secrets"));
     }
 }
