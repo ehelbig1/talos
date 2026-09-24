@@ -275,7 +275,7 @@ async fn dispatch_monitoring_incident_inner(
     // Fail OPEN to actor-less Tier-2 on any resolution error so a
     // transient DB hiccup never drops an inbound incident.
     let actor_repo = talos_actor_repository::ActorRepository::new(ctx.db_pool.clone());
-    let (resolved_actor, actor_tier, actor_write_ceiling, actor_egress) =
+    let (resolved_actor, actor_tier, actor_write_ceiling, actor_egress, actor_http_verb_ceiling) =
         match actor_repo.resolve_effective_actor(user_id, None).await {
             Ok(aid) => {
                 // #736: one joined SELECT, CLASSIFIED rather than collapsed.
@@ -294,7 +294,7 @@ async fn dispatch_monitoring_incident_inner(
                 // and `reserve_dedup` claimed a 24 h SETNX key above, so an
                 // error would lose the incident permanently AND block a manual
                 // re-push. So the choice is grant-vs-restrict, and we restrict.
-                let (tier, write_ceiling, egress) = match actor_repo
+                let (tier, write_ceiling, egress, actor_http_verb_ceiling) = match actor_repo
                     .read_module_bound_ceilings(aid)
                     .await
                     .resolve_for(
@@ -304,7 +304,13 @@ async fn dispatch_monitoring_incident_inner(
                     Ok(triple) => triple,
                     Err(refusal) => return Err(anyhow::anyhow!("{refusal}")),
                 };
-                (Some(aid), tier, write_ceiling, egress)
+                (
+                    Some(aid),
+                    tier,
+                    write_ceiling,
+                    egress,
+                    actor_http_verb_ceiling,
+                )
             }
             Err(e) => {
                 tracing::warn!(
@@ -315,6 +321,9 @@ async fn dispatch_monitoring_incident_inner(
                     None,
                     talos_workflow_job_protocol::LlmTier::default(),
                     talos_workflow_job_protocol::WriteCeiling::default(),
+                    None,
+                    // No actor → no override; `None` INHERITS the permissive wire
+                    // default beside it rather than inventing a second opinion.
                     None,
                 )
             }
@@ -389,6 +398,7 @@ async fn dispatch_monitoring_incident_inner(
         job_nonce: String::new(),
         max_llm_tier: actor_tier,
         max_write_ceiling: actor_write_ceiling,
+        http_verb_ceiling: actor_http_verb_ceiling,
         egress_scope: actor_egress,
         wasm_bytes: None,
         capability_world: None,

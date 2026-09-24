@@ -111,6 +111,7 @@ async fn main() -> Result<()> {
         max_llm_tier: LlmTier::Tier1,
         max_write_ceiling: talos_workflow_job_protocol::WriteCeiling::Write,
         egress_scope: None,
+        http_verb_ceiling: None,
         dry_run: false,
         reply_topic: None,
         idempotency_key: None,
@@ -177,6 +178,7 @@ async fn main() -> Result<()> {
         max_llm_tier: LlmTier::Tier1,
         max_write_ceiling: talos_workflow_job_protocol::WriteCeiling::Write,
         egress_scope: None,
+        http_verb_ceiling: None,
         reply_topic: None,
     };
     pipeline

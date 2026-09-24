@@ -1187,7 +1187,13 @@ impl WebhookRouter {
             // travels with the job below. Fail OPEN to actor-less Tier-2
             // (today's behaviour) on any resolution error so a transient DB
             // hiccup never drops an inbound webhook.
-            let (resolved_actor, actor_tier, actor_write_ceiling, actor_egress) = {
+            let (
+                resolved_actor,
+                actor_tier,
+                actor_write_ceiling,
+                actor_egress,
+                actor_http_verb_ceiling,
+            ) = {
                 let actor_repo = talos_actor_repository::ActorRepository::new(self.db_pool.clone());
                 match actor_repo
                     .resolve_effective_actor(trigger.user_id, None)
@@ -1211,7 +1217,7 @@ impl WebhookRouter {
                         // the retry would be swallowed as a duplicate, turning a
                         // deferral back into a loss. Same shape as the R2-4
                         // transient-failure branch below.
-                        let (tier, write_ceiling, egress) =
+                        let (tier, write_ceiling, egress, actor_http_verb_ceiling) =
                             match actor_repo
                                 .read_module_bound_ceilings(aid)
                                 .await
@@ -1258,7 +1264,13 @@ impl WebhookRouter {
                                         .into_response());
                                 }
                             };
-                        (Some(aid), tier, write_ceiling, egress)
+                        (
+                            Some(aid),
+                            tier,
+                            write_ceiling,
+                            egress,
+                            actor_http_verb_ceiling,
+                        )
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -1269,6 +1281,9 @@ impl WebhookRouter {
                             None,
                             talos_workflow_job_protocol::LlmTier::default(),
                             talos_workflow_job_protocol::WriteCeiling::default(),
+                            None,
+                            // No actor → no override; `None` INHERITS the permissive wire
+                            // default beside it rather than inventing a second opinion.
                             None,
                         )
                     }
@@ -1451,6 +1466,7 @@ impl WebhookRouter {
                         // wrap-in-a-workflow workaround.
                         max_llm_tier: actor_tier,
                         max_write_ceiling: actor_write_ceiling,
+                        http_verb_ceiling: actor_http_verb_ceiling,
                         egress_scope: actor_egress,
                         job_nonce: String::new(),
                         wasm_bytes: None,
@@ -3130,7 +3146,13 @@ impl WebhookRouter {
             // the live webhook path above). Webhook triggers carry no actor →
             // the user's default actor; its tier travels with the re-dispatched
             // job. Fail OPEN to actor-less Tier-2 on any resolution error.
-            let (resolved_actor, actor_tier, actor_write_ceiling, actor_egress) = {
+            let (
+                resolved_actor,
+                actor_tier,
+                actor_write_ceiling,
+                actor_egress,
+                actor_http_verb_ceiling,
+            ) = {
                 let actor_repo = talos_actor_repository::ActorRepository::new(self.db_pool.clone());
                 match actor_repo.resolve_effective_actor(user_id, None).await {
                     Ok(aid) => {
@@ -3149,7 +3171,7 @@ impl WebhookRouter {
                         // `replayed_at` only AFTER this returns `Ok`, so a
                         // refusal surfaces to the operator and leaves the entry
                         // replayable. Nothing is lost and nothing is granted.
-                        let (tier, write_ceiling, egress) = actor_repo
+                        let (tier, write_ceiling, egress, actor_http_verb_ceiling) = actor_repo
                             .read_module_bound_ceilings(aid)
                             .await
                             .resolve_for(
@@ -3159,7 +3181,13 @@ impl WebhookRouter {
                             .map_err(|refusal| {
                                 anyhow::anyhow!("{refusal} (the entry remains replayable)")
                             })?;
-                        (Some(aid), tier, write_ceiling, egress)
+                        (
+                            Some(aid),
+                            tier,
+                            write_ceiling,
+                            egress,
+                            actor_http_verb_ceiling,
+                        )
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -3170,6 +3198,9 @@ impl WebhookRouter {
                             None,
                             talos_workflow_job_protocol::LlmTier::default(),
                             talos_workflow_job_protocol::WriteCeiling::default(),
+                            None,
+                            // No actor → no override; `None` INHERITS the permissive wire
+                            // default beside it rather than inventing a second opinion.
                             None,
                         )
                     }
@@ -3271,6 +3302,7 @@ impl WebhookRouter {
                     // user's default actor at tier1 gives egress control).
                     max_llm_tier: actor_tier,
                     max_write_ceiling: actor_write_ceiling,
+                    http_verb_ceiling: actor_http_verb_ceiling,
                     egress_scope: actor_egress,
                     wasm_bytes: None,
                     capability_world: None,

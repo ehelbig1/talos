@@ -1236,50 +1236,59 @@ pub async fn process_webhook_events(
     // OPEN to actor-less Tier-2 (today's behaviour) on any resolution error so a
     // transient DB hiccup never drops inbound calendar events.
     let actor_repo = talos_actor_repository::ActorRepository::new(service.db_pool.clone());
-    let (resolved_actor, actor_tier, actor_write_ceiling, actor_egress) = match actor_repo
-        .resolve_effective_actor(user_id, None)
-        .await
-    {
-        Ok(aid) => {
-            // #736: one joined SELECT, CLASSIFIED rather than collapsed.
-            //
-            // The parenthetical this comment used to carry — "air-gapped actor
-            // stays air-gapped via the egress override" — was FALSE: the old
-            // fallback passed `None` for egress and `resolve_local_egress_only`
-            // reads `None => matches!(max_llm_tier, Tier1)`, so `(Tier2, _, None)`
-            // derives PUBLIC egress.
-            //
-            // Refusing is the WORST option on this path, and by the widest
-            // margin of the five: `sync_channel_events` has already COMMITTED
-            // the advanced sync token to the DB before returning the events in
-            // memory, the periodic re-sync task was deliberately removed, and
-            // `webhook_notification_handler` returned 200 before spawning this
-            // task — so Google will never resend them. This site also sits
-            // OUTSIDE the per-event loop, so an error would drop the whole
-            // batch. Restrict, do not refuse.
-            let (tier, write_ceiling, egress) = match actor_repo
-                .read_module_bound_ceilings(aid)
-                .await
-                .resolve_for(aid, talos_actor_repository::DispatchSite::GcalWebhookEvents)
-            {
-                Ok(triple) => triple,
-                Err(refusal) => return Err(anyhow::anyhow!("{refusal}")),
-            };
-            (Some(aid), tier, write_ceiling, egress)
-        }
-        Err(e) => {
-            tracing::warn!(
-                %user_id, error = %e,
-                "gcal dispatch: default-actor resolution failed; dispatching actor-less (Tier-2)"
-            );
-            (
-                None,
-                talos_workflow_job_protocol::LlmTier::default(),
-                talos_workflow_job_protocol::WriteCeiling::default(),
-                None,
-            )
-        }
-    };
+    let (resolved_actor, actor_tier, actor_write_ceiling, actor_egress, actor_http_verb_ceiling) =
+        match actor_repo.resolve_effective_actor(user_id, None).await {
+            Ok(aid) => {
+                // #736: one joined SELECT, CLASSIFIED rather than collapsed.
+                //
+                // The parenthetical this comment used to carry — "air-gapped actor
+                // stays air-gapped via the egress override" — was FALSE: the old
+                // fallback passed `None` for egress and `resolve_local_egress_only`
+                // reads `None => matches!(max_llm_tier, Tier1)`, so `(Tier2, _, None)`
+                // derives PUBLIC egress.
+                //
+                // Refusing is the WORST option on this path, and by the widest
+                // margin of the five: `sync_channel_events` has already COMMITTED
+                // the advanced sync token to the DB before returning the events in
+                // memory, the periodic re-sync task was deliberately removed, and
+                // `webhook_notification_handler` returned 200 before spawning this
+                // task — so Google will never resend them. This site also sits
+                // OUTSIDE the per-event loop, so an error would drop the whole
+                // batch. Restrict, do not refuse.
+                let (tier, write_ceiling, egress, actor_http_verb_ceiling) = match actor_repo
+                    .read_module_bound_ceilings(aid)
+                    .await
+                    .resolve_for(aid, talos_actor_repository::DispatchSite::GcalWebhookEvents)
+                {
+                    Ok(triple) => triple,
+                    Err(refusal) => return Err(anyhow::anyhow!("{refusal}")),
+                };
+                (
+                    Some(aid),
+                    tier,
+                    write_ceiling,
+                    egress,
+                    actor_http_verb_ceiling,
+                )
+            }
+            Err(e) => {
+                tracing::warn!(
+                    %user_id, error = %e,
+                    "gcal dispatch: default-actor resolution failed; dispatching actor-less (Tier-2)"
+                );
+                (
+                    None,
+                    talos_workflow_job_protocol::LlmTier::default(),
+                    talos_workflow_job_protocol::WriteCeiling::default(),
+                    None,
+                    // No actor → no override. The ceiling beside it is the
+                    // permissive wire default, which is this actor-less posture's
+                    // documented shape; `None` here INHERITS it rather than
+                    // inventing a second opinion.
+                    None,
+                )
+            }
+        };
 
     // 3. DEDUPLICATION: Filter out events that were already processed
     // This prevents duplicate execution when multiple watch channels exist for the same calendar
@@ -1615,6 +1624,7 @@ pub async fn process_webhook_events(
             // wrap-in-a-workflow workaround.
             max_llm_tier: actor_tier,
             max_write_ceiling: actor_write_ceiling,
+            http_verb_ceiling: actor_http_verb_ceiling,
             egress_scope: actor_egress,
             wasm_bytes: None, // PERFORMANCE: Include bytes directly (avoids file I/O)
             capability_world: None,

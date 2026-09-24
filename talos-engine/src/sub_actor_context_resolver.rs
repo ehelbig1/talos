@@ -104,6 +104,7 @@ impl SubworkflowActorContextResolver for ControllerSubActorContextResolver {
                     actor_id: Some(actor_id),
                     max_llm_tier: tier,
                     max_write_ceiling: write,
+                    http_verb_ceiling: None,
                     egress_scope: egress,
                 })
             }
@@ -139,6 +140,7 @@ impl SubworkflowActorContextResolver for ControllerSubActorContextResolver {
                     actor_id: None,
                     max_llm_tier: talos_workflow_engine_core::LlmTier::Tier1,
                     max_write_ceiling: talos_workflow_engine_core::WriteCeiling::ReadOnly,
+                    http_verb_ceiling: None,
                     // Fail closed on the egress axis too: no public egress.
                     egress_scope: Some(talos_workflow_engine_core::EgressScope::Local),
                 })

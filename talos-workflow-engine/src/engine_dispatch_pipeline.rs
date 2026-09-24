@@ -443,6 +443,7 @@ impl ParallelWorkflowEngine {
                 // `actors.max_llm_tier` by the controller at dispatch time).
                 max_llm_tier: self.max_llm_tier,
                 max_write_ceiling: self.max_write_ceiling,
+                http_verb_ceiling: self.http_verb_ceiling,
                 egress_scope: self.egress_scope,
                 // Opt-in per-step idempotency (Task 1 follow-up): the resolved
                 // key (or `None` for a non-declaring step), stamped above and
@@ -690,6 +691,7 @@ impl ParallelWorkflowEngine {
             // TalosContext with this value.
             max_llm_tier: self.max_llm_tier,
             max_write_ceiling: self.max_write_ceiling,
+            http_verb_ceiling: self.http_verb_ceiling,
             egress_scope: self.egress_scope,
             total_timeout: std::time::Duration::from_secs(timeout_secs),
             // An explicit head `retry_count` (including 0) wins, as everywhere

@@ -84,6 +84,11 @@ pub struct SubworkflowBinding {
     /// The sub-actor's write ceiling (mutation authority). Composed with the
     /// parent's as `most_restrictive` — never widened.
     pub max_write_ceiling: crate::WriteCeiling,
+    /// Override for the VERB-INFERRED half of the write ceiling
+    /// (`http::fetch`, `http::fetch_all`, `graphql::execute`). `None`
+    /// inherits `max_write_ceiling`, which is byte-identical to the
+    /// pre-2026-09-24 behaviour. See `crate::CeilingAxis`.
+    pub http_verb_ceiling: Option<crate::WriteCeiling>,
     /// The sub-actor's blanket public-egress override (`None` = tier-derived
     /// default). Composed with the parent's via `EgressScope::narrow` —
     /// explicit `Local` on either side wins.

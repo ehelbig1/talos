@@ -676,6 +676,11 @@ pub struct ParallelWorkflowEngine {
     /// Permissive `Write` default (system/actor-less jobs); actor binding
     /// stamps the real ceiling (new actors → `ReadOnly`).
     pub(crate) max_write_ceiling: talos_workflow_engine_core::WriteCeiling,
+    /// Override for the VERB-INFERRED half of the write ceiling
+    /// (`http::fetch`, `http::fetch_all`, `graphql::execute`). `None`
+    /// inherits `max_write_ceiling`, which is byte-identical to the
+    /// pre-2026-09-24 behaviour. See `crate::CeilingAxis`.
+    pub(crate) http_verb_ceiling: Option<talos_workflow_engine_core::WriteCeiling>,
     /// Blanket network-egress scope override, stamped by `apply_actor_to_engine`
     /// from `actors.egress_scope` (independent of `max_llm_tier`). `None` =
     /// tier-derived default. Propagated to every `DispatchJob`/`JobRequest`.
@@ -912,6 +917,11 @@ pub struct AdapterSet {
     /// via `set_max_llm_tier` before running.
     max_llm_tier: talos_workflow_engine_core::LlmTier,
     max_write_ceiling: talos_workflow_engine_core::WriteCeiling,
+    /// Override for the VERB-INFERRED half of the write ceiling
+    /// (`http::fetch`, `http::fetch_all`, `graphql::execute`). `None`
+    /// inherits `max_write_ceiling`, which is byte-identical to the
+    /// pre-2026-09-24 behaviour. See `crate::CeilingAxis`.
+    http_verb_ceiling: Option<talos_workflow_engine_core::WriteCeiling>,
     egress_scope: Option<talos_workflow_engine_core::EgressScope>,
     /// Capability-world ceiling — travels into every sub-engine verbatim
     /// (see the field on `ParallelWorkflowEngine`).
@@ -1019,6 +1029,7 @@ impl AdapterSet {
         // ensemble / sub-workflow a tier-2 actor legitimately runs).
         engine.max_llm_tier = self.max_llm_tier;
         engine.max_write_ceiling = self.max_write_ceiling;
+        engine.http_verb_ceiling = self.http_verb_ceiling;
         engine.egress_scope = self.egress_scope;
         // The capability-world ceiling travels too — dropping it here would
         // let a sub-workflow's modules run above the parent actor's ceiling,
@@ -1100,6 +1111,7 @@ impl ParallelWorkflowEngine {
             // actors. Unlike Tier1 above, a `ReadOnly` default would break
             // trusted actor-less system writes (see DispatchJob::default).
             max_write_ceiling: talos_workflow_engine_core::WriteCeiling::Write,
+            http_verb_ceiling: None,
             actor_context: None,
             module_prefetch_cache: Arc::new(dashmap::DashMap::new()),
             module_artifact_cache: Arc::new(dashmap::DashMap::new()),
@@ -1168,6 +1180,7 @@ impl ParallelWorkflowEngine {
             dry_run: self.dry_run,
             max_llm_tier: self.max_llm_tier,
             max_write_ceiling: self.max_write_ceiling,
+            http_verb_ceiling: self.http_verb_ceiling,
             egress_scope: self.egress_scope,
             max_capability_world: self.max_capability_world.clone(),
             sandbox_root: self.sandbox_root.clone(),

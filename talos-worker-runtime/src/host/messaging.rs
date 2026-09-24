@@ -30,7 +30,8 @@ impl wit_messaging::Host for TalosContext {
             // Write-ceiling gate: publishing a message is an outbound side
             // effect — refuse for read-only actors. Inert unless enforcement
             // is on.
-            if self.write_ceiling_refuses("messaging-publish", &topic).await {
+            if self.write_ceiling_refuses(
+                    talos_workflow_job_protocol::CeilingAxis::Categorical,"messaging-publish", &topic).await {
                 return Err(wit_messaging::Error::Publishfailed);
             }
             // MCP-756 (2026-05-13): cap topic length BEFORE it flows into
@@ -151,7 +152,11 @@ impl wit_messaging::Host for TalosContext {
         }
         // Write-ceiling gate: outbound publish — refuse for read-only actors.
         if self
-            .write_ceiling_refuses("messaging-publish", &msg.topic)
+            .write_ceiling_refuses(
+                talos_workflow_job_protocol::CeilingAxis::Categorical,
+                "messaging-publish",
+                &msg.topic,
+            )
             .await
         {
             return Err(wit_messaging::Error::Publishfailed);
@@ -271,7 +276,11 @@ impl wit_messaging::Host for TalosContext {
         // Write-ceiling gate: request/reply publishes to a responder that may
         // mutate — refuse for read-only actors. Inert unless enforcement is on.
         if self
-            .write_ceiling_refuses("messaging-request", &topic)
+            .write_ceiling_refuses(
+                talos_workflow_job_protocol::CeilingAxis::Categorical,
+                "messaging-request",
+                &topic,
+            )
             .await
         {
             return Err(wit_messaging::Error::Publishfailed);

@@ -386,6 +386,26 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             }
         }),
         serde_json::json!({
+            "name": "set_actor_http_verb_ceiling",
+            "description": "Override the VERB-INFERRED half of an actor's write ceiling, without granting the rest of it. \
+                BACKGROUND: max_write_ceiling governs FIFTEEN gated ops. THREE of them — http::fetch, http::fetch_all and graphql::execute — decide 'is this a mutation?' by INFERRING it from the HTTP verb, and that inference over-refuses by design: GET is the only verb the gate can call a read, so a POST that is a READ on the target API (Plaid's /accounts/balance/get, Elasticsearch's _search, most client_id+secret APIs) is refused under 'readonly'. Until 2026-09-24 the only way to clear that refusal was max_write_ceiling='write', which ALSO grants the twelve CATEGORICAL ops the actor never needed: agent-memory writes, database DML, email, NATS publish, webhook send, object storage, integration state. \
+                THIS TOOL sets that one axis. 'write' = the three inferring gates permit any verb; the twelve categorical ops still follow max_write_ceiling. 'readonly' = non-GET HTTP is refused even for a max_write_ceiling='write' actor (a TIGHTENING: an actor that may keep notes but must not POST anywhere). 'inherit' (or null, or omitting the argument) CLEARS the override, restoring the single-axis behaviour. \
+                THE INTENDED SHAPE for a read-only integration whose reads are POSTs is max_write_ceiling='readonly' PLUS this override at 'write'. \
+                Enforcement is worker-side and gated by the same TALOS_WRITE_CEILING_ENFORCED flag, so the response reports 'enforcement_fleet' and 'ceiling_is_advisory' exactly as set_actor_write_ceiling does. An unrecognised value is REFUSED rather than treated as a clear — a typo must not silently drop a security override.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "actor_id": { "type": "string" },
+                    "ceiling": {
+                        "type": ["string", "null"],
+                        "enum": ["write", "readonly", "inherit", null],
+                        "description": "write = the three verb-inferring gates permit any verb; readonly = they refuse non-GET even at max_write_ceiling=write; inherit/null = clear the override and follow max_write_ceiling"
+                    }
+                },
+                "required": ["actor_id"]
+            }
+        }),
+        serde_json::json!({
             "name": "get_actor_budget",
             "description": "Get the budget policy and current rolling-window usage for an actor.",
             "inputSchema": {
@@ -977,6 +997,9 @@ pub async fn dispatch(
         }
         "set_actor_write_ceiling" => {
             handle_set_actor_write_ceiling(req_id, args, state, user_id).await
+        }
+        "set_actor_http_verb_ceiling" => {
+            handle_set_actor_http_verb_ceiling(req_id, args, state, user_id).await
         }
         "get_actor_budget" => handle_get_actor_budget(req_id, args, state, user_id).await,
         "add_actor_approval_policy" => {
@@ -1887,10 +1910,29 @@ async fn handle_get_actor_summary(
     // already found the row) but is classified rather than folded into the
     // error, on the same rule.
     let ceilings = match state.actor_repo.get_actor_ceilings(actor_id).await {
-        Ok(Some((tier, write, egress))) => serde_json::json!({
+        Ok(Some((tier, write, egress, http_verb))) => serde_json::json!({
             "max_llm_tier": tier.as_signing_str(),
             "max_write_ceiling": write.as_signing_str(),
             "egress_scope": egress.map(|e| e.as_signing_str()),
+            // Rendered as `null` when unset, NOT collapsed into
+            // `max_write_ceiling`'s value: an operator reading
+            // `max_write_ceiling: "readonly"` beside a silent override would
+            // conclude this actor cannot POST, which is the misleading-report
+            // class this axis was added inside of.
+            "http_verb_ceiling": http_verb.map(|c| c.as_signing_str()),
+            "http_verb_ceiling_note": match http_verb {
+                None => "unset — the three verb-inferring gates (http fetch / \
+                         fetch_all, graphql execute) follow max_write_ceiling",
+                Some(talos_workflow_job_protocol::WriteCeiling::Write) =>
+                    "OVERRIDDEN to write — this actor may issue non-GET HTTP \
+                     even at max_write_ceiling=readonly. The twelve categorical \
+                     ops (agent-memory, database, email, messaging, webhook, \
+                     object-storage, integration-state) still follow \
+                     max_write_ceiling.",
+                Some(_) =>
+                    "OVERRIDDEN to readonly — non-GET HTTP is refused for this \
+                     actor even at max_write_ceiling=write.",
+            },
         }),
         Ok(None) => serde_json::json!({
             "error": "the actor row disappeared between reads; ceilings not reported",
@@ -2883,6 +2925,98 @@ async fn handle_set_actor_write_ceiling(
             // True whenever the fleet is not unanimously enforcing — including
             // when it is unknown, because "we cannot say it will be enforced"
             // must read the same as "it will not be".
+            "ceiling_is_advisory": advisory,
+        }))
+        .unwrap_or_default(),
+    )
+}
+
+/// Set (or clear) the actor's override for the VERB-INFERRED half of the write
+/// ceiling.
+///
+/// `max_write_ceiling` governs fifteen gated ops. Three of them infer "is this
+/// a mutation?" from the HTTP verb and over-refuse by design — a POST that is a
+/// READ on the target API is refused because GET is the only verb the gate can
+/// call a read. This tool corrects that inference for ONE actor without
+/// granting the twelve categorical ops, which is what raising
+/// `max_write_ceiling` does.
+async fn handle_set_actor_http_verb_ceiling(
+    req_id: Option<serde_json::Value>,
+    args: &Value,
+    state: &McpState,
+    user_id: Uuid,
+) -> JsonRpcResponse {
+    let actor_id = match resolve_actor_via_repo(&req_id, args, &state.actor_repo, user_id).await {
+        Ok(id) => id,
+        Err(e) => return e,
+    };
+
+    // Three-valued: absent/null CLEARS the override back to inherit. That is a
+    // real operator action (undo), not a missing argument, so it is accepted
+    // rather than refused — but an unrecognised STRING is refused, because a
+    // typo must not silently clear a security override.
+    let ceiling = match args.get("ceiling") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => match v.as_str() {
+            Some("readonly") => Some(talos_workflow_job_protocol::WriteCeiling::ReadOnly),
+            Some("write") => Some(talos_workflow_job_protocol::WriteCeiling::Write),
+            Some("inherit") => None,
+            Some(other) => {
+                return mcp_error(
+                    req_id,
+                    -32602,
+                    &format!(
+                        "ceiling must be 'write', 'readonly' or 'inherit' (null also clears), got '{}'",
+                        talos_text_util::bounded_preview(other, 64)
+                    ),
+                );
+            }
+            None => {
+                let kind = crate::utils::json_type_name(v);
+                return mcp_error(
+                    req_id,
+                    -32602,
+                    &format!("ceiling must be a string ('write', 'readonly', 'inherit') or null, got {kind}"),
+                );
+            }
+        },
+    };
+
+    // Change + record in ONE transaction, under the grant-guard GUC (package
+    // CT + the 20260924120000 escalation trigger).
+    let change = match state
+        .actor_repo
+        .set_actor_http_verb_ceiling(actor_id, user_id, ceiling)
+        .await
+    {
+        Ok(Some(change)) => change,
+        Ok(None) => return mcp_error(req_id, -32602, "Actor not found or access denied"),
+        Err(e) => {
+            tracing::error!(%actor_id, error = %e, "set_actor_http_verb_ceiling failed");
+            return mcp_error(req_id, -32603, "Failed to update actor http-verb ceiling");
+        }
+    };
+
+    let fleet = crate::platform::read_write_ceiling_fleet(&state.db_pool).await;
+    let advisory = talos_worker_identity_repository::write_ceiling_is_advisory(fleet.as_ref());
+    let fleet_json = talos_worker_identity_repository::render_write_ceiling_enforcement(fleet);
+
+    mcp_text(
+        req_id,
+        &serde_json::to_string_pretty(&serde_json::json!({
+            "actor_id": actor_id.to_string(),
+            "previous_http_verb_ceiling": change.previous.as_deref().unwrap_or("inherit"),
+            "http_verb_ceiling": ceiling.map(|c| c.as_signing_str()).unwrap_or("inherit"),
+            "governs": ["http-fetch", "http-fetch-all", "graphql-execute"],
+            "does_not_govern": [
+                "agent-memory-set", "agent-memory-delete",
+                "agent-memory-store-with-embedding", "integration-state-set",
+                "integration-state-delete", "database-query", "object-storage-put",
+                "object-storage-delete", "messaging-publish", "messaging-request",
+                "webhook-send", "email-send",
+            ],
+            "enforcement": "Worker-side at the three verb-inferring egress gates, gated by TALOS_WRITE_CEILING_ENFORCED. Takes effect on the NEXT job dispatched for this actor. The twelve categorical ops listed above continue to follow max_write_ceiling.",
+            "enforcement_fleet": fleet_json,
             "ceiling_is_advisory": advisory,
         }))
         .unwrap_or_default(),

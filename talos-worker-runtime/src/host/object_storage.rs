@@ -156,7 +156,11 @@ impl wit_object_storage::Host for TalosContext {
         // Write-ceiling gate: an object put mutates storage — refuse for
         // read-only actors. Inert unless enforcement is on.
         if self
-            .write_ceiling_refuses("object-storage-put", &format!("{}/{}", req.bucket, req.key))
+            .write_ceiling_refuses(
+                talos_workflow_job_protocol::CeilingAxis::Categorical,
+                "object-storage-put",
+                &format!("{}/{}", req.bucket, req.key),
+            )
             .await
         {
             return Err(wit_object_storage::Error::AccessDenied);
@@ -396,7 +400,11 @@ impl wit_object_storage::Host for TalosContext {
         // Write-ceiling gate: an object delete mutates storage — refuse for
         // read-only actors. Inert unless enforcement is on.
         if self
-            .write_ceiling_refuses("object-storage-delete", &format!("{}/{}", bucket, key))
+            .write_ceiling_refuses(
+                talos_workflow_job_protocol::CeilingAxis::Categorical,
+                "object-storage-delete",
+                &format!("{}/{}", bucket, key),
+            )
             .await
         {
             return Err(wit_object_storage::Error::AccessDenied);

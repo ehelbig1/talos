@@ -1992,6 +1992,14 @@ pub use talos_workflow_engine_core::write_ceiling_denies;
 pub use talos_workflow_engine_core::EgressScope;
 pub use talos_workflow_engine_core::LlmTier;
 pub use talos_workflow_engine_core::WriteCeiling;
+/// Re-exported so the worker can name the axis without a direct
+/// `talos-workflow-engine-core` dependency — `talos-worker-runtime` reaches
+/// core only through this crate, and adding that edge to name one enum
+/// would invert the layering the rest of the ceiling already respects.
+pub use talos_workflow_engine_core::{
+    effective_write_ceiling, http_verb_ceiling_from_db, narrow_verb_inference_override,
+    write_ceiling_denies_axis, CeilingAxis,
+};
 
 /// Map a provider name (case-insensitive) to its data-egress tier.
 /// Anthropic / OpenAI / Gemini = Tier 2 (external). Ollama = Tier 1
@@ -3910,6 +3918,30 @@ pub struct JobRequest {
     /// (or vice-versa) without invalidating the signature.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_scope: Option<EgressScope>,
+    /// Per-actor override for the VERB-INFERRED half of the write ceiling.
+    ///
+    /// `max_write_ceiling` above governs all fifteen gated ops. Three of them
+    /// — `http::fetch`, `http::fetch_all` and `graphql::execute` — decide
+    /// "is this a mutation?" by INFERRING it from the HTTP verb, and that
+    /// inference over-refuses by design: a POST that is a READ on the target
+    /// API (Plaid's `/accounts/balance/get`, Elasticsearch's `_search`) is
+    /// refused anyway, because GET is the only verb the gate can call a read.
+    /// This field lets an operator correct that inference for ONE actor
+    /// without granting the twelve categorical ops (`agent-memory-set`,
+    /// `email-send`, `messaging-publish`, `database-query`, …), which is what
+    /// raising `max_write_ceiling` to `write` does today.
+    ///
+    /// `None` = INHERIT `max_write_ceiling`, which is byte-identical to the
+    /// pre-2026-09-24 behaviour on every path. HMAC-bound ONLY when `Some`
+    /// (see `signing_payload`), so a `None` appends nothing, pre-existing
+    /// signatures stay byte-identical, and the field ships inert — no
+    /// coordinated controller+worker restart for the default path, unlike
+    /// `max_write_ceiling` itself, which is bound unconditionally. When
+    /// `Some`, an on-wire attacker can neither strip it (which would re-impose
+    /// the inference on a deliberately-overridden actor) nor flip
+    /// `readonly`→`write`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_verb_ceiling: Option<WriteCeiling>,
 
     /// When true, non-GET HTTP requests are mocked (returns 200 with dry_run metadata).
     /// GET requests execute normally for data fetching.
@@ -4236,6 +4268,20 @@ impl JobRequest {
         if let Some(scope) = self.egress_scope {
             use std::fmt::Write as _;
             let _ = write!(payload, ":egress={}", scope.as_signing_str());
+        }
+
+        // Verb-inference override appended AT THE END, ONLY when `Some`, per
+        // the wire-format stability rule. `None` — the default and every
+        // existing actor — appends NOTHING, so pre-existing signatures stay
+        // byte-identical and the field ships inert; `max_write_ceiling` above
+        // is bound UNCONDITIONALLY and needed a coordinated restart, this one
+        // does not. When `Some`, the `:hvc=<ceiling>` suffix is HMAC-bound, so
+        // an attacker can neither STRIP it (re-imposing the verb inference on
+        // an actor an operator deliberately overrode, a denial) nor flip
+        // `readonly`→`write` (granting POST-shaped calls the operator refused).
+        if let Some(hvc) = self.http_verb_ceiling {
+            use std::fmt::Write as _;
+            let _ = write!(payload, ":hvc={}", hvc.as_signing_str());
         }
 
         // RFC 0010 P3 (D3b): bind `sealing` + `secret_paths` ONLY when a
@@ -5265,6 +5311,13 @@ pub struct PipelineJobRequest {
     /// [`JobRequest::egress_scope`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub egress_scope: Option<EgressScope>,
+    /// Verb-inference override, stamped uniformly onto every pipeline step
+    /// (mirrors `max_llm_tier` / `max_write_ceiling` / `egress_scope`). `None`
+    /// (default) inherits `max_write_ceiling`. HMAC-bound only when `Some` so
+    /// default messages stay byte-identical. See
+    /// [`JobRequest::http_verb_ceiling`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_verb_ceiling: Option<WriteCeiling>,
 
     /// H-1: signed reply-inbox commitment. Same semantics as
     /// [`JobRequest::reply_topic`] — the worker MUST publish its
@@ -5503,6 +5556,20 @@ impl PipelineJobRequest {
         if let Some(scope) = self.egress_scope {
             use std::fmt::Write as _;
             let _ = write!(payload, ":egress={}", scope.as_signing_str());
+        }
+
+        // Verb-inference override appended AT THE END, ONLY when `Some`, per
+        // the wire-format stability rule. `None` — the default and every
+        // existing actor — appends NOTHING, so pre-existing signatures stay
+        // byte-identical and the field ships inert; `max_write_ceiling` above
+        // is bound UNCONDITIONALLY and needed a coordinated restart, this one
+        // does not. When `Some`, the `:hvc=<ceiling>` suffix is HMAC-bound, so
+        // an attacker can neither STRIP it (re-imposing the verb inference on
+        // an actor an operator deliberately overrode, a denial) nor flip
+        // `readonly`→`write` (granting POST-shaped calls the operator refused).
+        if let Some(hvc) = self.http_verb_ceiling {
+            use std::fmt::Write as _;
+            let _ = write!(payload, ":hvc={}", hvc.as_signing_str());
         }
 
         // RFC 0010 P3 (D3b): bind `sealing` + `secret_paths` ONLY when a
@@ -7271,6 +7338,7 @@ mod tests {
             max_llm_tier: LlmTier::default(),
             max_write_ceiling: WriteCeiling::default(),
             egress_scope: None,
+            http_verb_ceiling: None,
             job_nonce: String::new(),
             actor_id: None,
             wasm_bytes: None,
@@ -7327,6 +7395,7 @@ mod tests {
             max_llm_tier: LlmTier::default(),
             max_write_ceiling: WriteCeiling::default(),
             egress_scope: None,
+            http_verb_ceiling: None,
             job_nonce: String::new(),
             actor_id: None,
             wasm_bytes: None,
@@ -7375,6 +7444,7 @@ mod tests {
             max_llm_tier: LlmTier::default(),
             max_write_ceiling: WriteCeiling::default(),
             egress_scope: None,
+            http_verb_ceiling: None,
             job_nonce: String::new(),
             actor_id: None,
             wasm_bytes: None,
@@ -7556,6 +7626,7 @@ mod tests {
             max_llm_tier: LlmTier::default(),
             max_write_ceiling: WriteCeiling::default(),
             egress_scope: None,
+            http_verb_ceiling: None,
             job_nonce: String::new(),
             actor_id: None,
             wasm_bytes: None,
@@ -7604,6 +7675,7 @@ mod tests {
             max_llm_tier: LlmTier::default(),
             max_write_ceiling: WriteCeiling::default(),
             egress_scope: None,
+            http_verb_ceiling: None,
             job_nonce: String::new(),
             actor_id: None,
             wasm_bytes: None,
@@ -7669,6 +7741,7 @@ mod tests {
             max_llm_tier: LlmTier::default(),
             max_write_ceiling: WriteCeiling::default(),
             egress_scope: None,
+            http_verb_ceiling: None,
             job_nonce: String::new(),
             actor_id,
             wasm_bytes: None,
@@ -7788,6 +7861,7 @@ mod tests {
                 max_llm_tier: LlmTier::default(),
                 max_write_ceiling: WriteCeiling::default(),
                 egress_scope: None,
+                http_verb_ceiling: None,
                 job_nonce: String::new(),
                 actor_id: Some(Uuid::new_v4()),
                 wasm_bytes: None,
@@ -7845,6 +7919,7 @@ mod tests {
             max_llm_tier: LlmTier::default(),
             max_write_ceiling: WriteCeiling::default(),
             egress_scope: None,
+            http_verb_ceiling: None,
             job_nonce: String::new(),
             actor_id: Some(Uuid::new_v4()),
             wasm_bytes: None,
@@ -9212,6 +9287,7 @@ mod tests {
             max_llm_tier: LlmTier::default(),
             max_write_ceiling: WriteCeiling::default(),
             egress_scope: None,
+            http_verb_ceiling: None,
             reply_topic: Some("_INBOX.legit.xyz".to_string()),
         };
         req.sign(&key).unwrap();
@@ -9429,6 +9505,7 @@ mod tests {
             max_llm_tier: LlmTier::default(),
             max_write_ceiling: WriteCeiling::default(),
             egress_scope: None,
+            http_verb_ceiling: None,
             reply_topic: None,
         }
     }
@@ -10470,6 +10547,7 @@ mod protocol_review_2026_09_tests {
             max_llm_tier: LlmTier::default(),
             max_write_ceiling: WriteCeiling::default(),
             egress_scope: None,
+            http_verb_ceiling: None,
             job_nonce: String::new(),
             actor_id: None,
             wasm_bytes: None,
@@ -10620,6 +10698,7 @@ mod protocol_review_2026_09_tests {
             max_llm_tier: LlmTier::default(),
             max_write_ceiling: WriteCeiling::default(),
             egress_scope: None,
+            http_verb_ceiling: None,
             reply_topic: None,
         };
         pipe.sign_ed25519(&sk).unwrap();

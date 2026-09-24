@@ -67,7 +67,11 @@ impl wit_integration_state::Host for TalosContext {
         // for OAuth tokens + watch state — refuse for read-only actors.
         // Inert unless enforcement is on.
         if self
-            .write_ceiling_refuses("integration-state-set", &entry.key)
+            .write_ceiling_refuses(
+                talos_workflow_job_protocol::CeilingAxis::Categorical,
+                "integration-state-set",
+                &entry.key,
+            )
             .await
         {
             return Err(wit_integration_state::Error::Unauthorized);
@@ -146,7 +150,11 @@ impl wit_integration_state::Host for TalosContext {
         // Write-ceiling gate: read-only actors cannot delete integration
         // state. Inert unless enforcement is on.
         if self
-            .write_ceiling_refuses("integration-state-delete", &key)
+            .write_ceiling_refuses(
+                talos_workflow_job_protocol::CeilingAxis::Categorical,
+                "integration-state-delete",
+                &key,
+            )
             .await
         {
             return Err(wit_integration_state::Error::Unauthorized);

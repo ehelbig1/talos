@@ -782,6 +782,22 @@ impl ParallelWorkflowEngine {
         self.max_write_ceiling = ceiling;
     }
 
+    /// Stamp the actor's override for the VERB-INFERRED half of the ceiling
+    /// (`actors.http_verb_ceiling`).
+    ///
+    /// `None` = inherit [`Self::set_max_write_ceiling`]'s value, which is
+    /// byte-identical to the pre-2026-09-24 behaviour. Stamped by
+    /// `apply_actor_to_engine` beside the ceiling itself — the same pairing
+    /// rule check 29 enforces for identity and tier, and for the same reason:
+    /// an axis stamped on one path and forgotten on another is how one control
+    /// comes to mean two things.
+    pub fn set_http_verb_ceiling(
+        &mut self,
+        ceiling: Option<talos_workflow_engine_core::WriteCeiling>,
+    ) {
+        self.http_verb_ceiling = ceiling;
+    }
+
     /// Stamp the actor's capability-world ceiling (`actors.max_capability_world`).
     /// Called by `talos_engine::actor_binding::apply_actor_to_engine` — `None`
     /// for the ceiling-exempt default actor. Every module dispatch, in this

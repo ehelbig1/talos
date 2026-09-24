@@ -342,7 +342,7 @@ impl wit_http::Host for TalosContext {
         if http_method_mutates(&req.method)
             && self
                 .write_ceiling_refuses_detailed(
-                    "http-fetch",
+                    talos_workflow_job_protocol::CeilingAxis::VerbInferred,"http-fetch",
                     host,
                     Some(WRITE_CEILING_VERB_DETAIL),
                 )
@@ -1379,6 +1379,7 @@ impl wit_http::Host for TalosContext {
             if http_method_mutates(&req.method)
                 && self
                     .write_ceiling_refuses_detailed(
+                        talos_workflow_job_protocol::CeilingAxis::VerbInferred,
                         "http-fetch-all",
                         &host,
                         Some(WRITE_CEILING_VERB_DETAIL),

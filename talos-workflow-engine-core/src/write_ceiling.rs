@@ -103,6 +103,125 @@ impl WriteCeiling {
     }
 }
 
+/// Which of the two ceiling axes governs an operation.
+///
+/// # The partition is PROVABILITY, not destination
+///
+/// Measured 2026-09-24 over the fifteen write-ceiling gate sites: **three**
+/// classify "is this a mutation?" by INFERENCE from the HTTP verb, and twelve
+/// do not have to — the op IS the mutation (`agent-memory-set`,
+/// `email-send`, `messaging-publish`, …) or the mutation is PROVEN from the
+/// statement (`database-query` walks the AST, #757/check 85).
+///
+/// The inferring three over-refuse by design and the platform knows it:
+/// `WRITE_CEILING_VERB_DETAIL` tells an operator that a POST which is a READ
+/// on some API (Plaid's `/accounts/balance/get`, Elasticsearch's `_search`)
+/// is refused anyway because GET is the only verb the gate can call a read.
+/// That over-refusal is the correct fail-closed default and it is the ONLY
+/// part of the ceiling an operator has a principled reason to override
+/// separately — which is why the axis is drawn here and not around "does this
+/// leave the process".
+///
+/// A destination-based split was measured and REJECTED for this reason: it
+/// would put `email-send`, `webhook-send` and `messaging-publish` on the same
+/// axis as `http-fetch`, so an actor granted the override to make POST-shaped
+/// READS would also be granted the ability to send mail and publish to NATS —
+/// three categorical side effects it never needed and whose refusal nothing
+/// was over-refusing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum CeilingAxis {
+    /// The op's mutation status is INFERRED from the HTTP verb: `http::fetch`,
+    /// `http::fetch_all`, and `graphql::execute` (whose operation type is not
+    /// provable from the request string, so every call is treated as a
+    /// mutation). Governed by the actor's verb-inference override when it has
+    /// one.
+    VerbInferred,
+    /// The op IS the mutation, or the mutation is proven rather than guessed.
+    /// Governed by `max_write_ceiling` alone — there is nothing here for an
+    /// override to correct.
+    Categorical,
+}
+
+/// The ceiling that actually governs `axis`, given the actor's data ceiling
+/// and its optional verb-inference override.
+///
+/// `None` for the override means INHERIT, which is byte-identical to the
+/// pre-2026-09-24 behaviour on every path — the same shape `egress_scope`
+/// uses, and the reason the new wire field can ship inert with no coordinated
+/// restart.
+///
+/// The override can TIGHTEN as well as loosen: `Some(ReadOnly)` on an actor
+/// whose `max_write_ceiling` is `Write` refuses non-GET HTTP while still
+/// permitting memory writes — an actor that may keep notes but must not POST
+/// anywhere. That direction costs nothing to support and closing it would make
+/// the axis a one-way grant, which is the shape that invites "just set it".
+#[must_use]
+pub fn effective_write_ceiling(
+    axis: CeilingAxis,
+    data_ceiling: WriteCeiling,
+    verb_inference_override: Option<WriteCeiling>,
+) -> WriteCeiling {
+    match axis {
+        CeilingAxis::Categorical => data_ceiling,
+        CeilingAxis::VerbInferred => verb_inference_override.unwrap_or(data_ceiling),
+    }
+}
+
+/// Read the verb-inference override out of its nullable database column.
+///
+/// THREE-VALUED and it must stay so: SQL `NULL` means INHERIT
+/// `max_write_ceiling`, and collapsing it into a value is the failure this
+/// function exists to make testable. Mutating the repository's mapping to
+/// `Some(Write)` survives every test that does not drive a database — and it
+/// would silently grant POST-shaped egress to EVERY actor on the fleet, which
+/// is the loudest possible version of this axis going wrong.
+///
+/// An unrecognised token falls closed to `ReadOnly` via
+/// [`WriteCeiling::from_db_str`], which on THIS axis is the tightening
+/// direction (the three inferring gates refuse non-GET).
+#[must_use]
+pub fn http_verb_ceiling_from_db(column: Option<&str>) -> Option<WriteCeiling> {
+    column.map(WriteCeiling::from_db_str)
+}
+
+/// Does this job's ceiling REFUSE an operation on `axis`?
+///
+/// The two-axis form of [`write_ceiling_denies`]. Every gate site should reach
+/// its verdict through this so the axis assignment is explicit at the call
+/// site rather than implied by which field the site happened to read.
+#[must_use]
+pub fn write_ceiling_denies_axis(
+    enforced: bool,
+    axis: CeilingAxis,
+    data_ceiling: WriteCeiling,
+    verb_inference_override: Option<WriteCeiling>,
+) -> bool {
+    write_ceiling_denies(
+        enforced,
+        effective_write_ceiling(axis, data_ceiling, verb_inference_override),
+    )
+}
+
+/// Narrow an optional verb-inference override the way `most_restrictive`
+/// narrows a ceiling, for sub-workflow composition.
+///
+/// `None` means inherit, so it must NOT win over an explicit `Some`: a parent
+/// that declares nothing cannot widen a child that declares `ReadOnly`, and a
+/// child that declares nothing inherits rather than loosening the parent. Two
+/// explicit values narrow to the more restrictive one.
+#[must_use]
+pub fn narrow_verb_inference_override(
+    parent: Option<WriteCeiling>,
+    child: Option<WriteCeiling>,
+) -> Option<WriteCeiling> {
+    match (parent, child) {
+        (None, None) => None,
+        (Some(v), None) | (None, Some(v)) => Some(v),
+        (Some(a), Some(b)) => Some(a.most_restrictive(b)),
+    }
+}
+
 /// The one write-ceiling decision in the workspace: does this job's ceiling
 /// REFUSE a data-mutating operation?
 ///
@@ -146,6 +265,10 @@ pub const AGENT_MEMORY_SET_OP: &str = "agent-memory-set";
 #[cfg(test)]
 mod tests {
     use super::WriteCeiling;
+    use super::{
+        effective_write_ceiling, narrow_verb_inference_override, write_ceiling_denies_axis,
+        CeilingAxis,
+    };
 
     #[test]
     fn canonical_strings_round_trip() {
@@ -235,5 +358,155 @@ mod tests {
     fn audit_labels_are_the_worker_spelling() {
         assert_eq!(super::WRITE_CEILING_POLICY, "write-ceiling");
         assert_eq!(super::AGENT_MEMORY_SET_OP, "agent-memory-set");
+    }
+
+    // ── The two axes ────────────────────────────────────────────────────
+
+    /// A categorical op reads the DATA ceiling and ignores the override
+    /// entirely. Without this, an override could quietly widen `email-send`.
+    #[test]
+    fn a_categorical_op_ignores_the_verb_override() {
+        for over in [
+            None,
+            Some(WriteCeiling::Write),
+            Some(WriteCeiling::ReadOnly),
+        ] {
+            assert_eq!(
+                effective_write_ceiling(CeilingAxis::Categorical, WriteCeiling::ReadOnly, over),
+                WriteCeiling::ReadOnly,
+                "override {over:?} must not reach a categorical op"
+            );
+        }
+        // Control: the categorical axis DOES follow the data ceiling, so the
+        // assertion above cannot pass by the function returning a constant.
+        assert_eq!(
+            effective_write_ceiling(CeilingAxis::Categorical, WriteCeiling::Write, None),
+            WriteCeiling::Write
+        );
+    }
+
+    /// The motivating case: a POST that is a READ.
+    #[test]
+    fn an_inferred_op_follows_the_override_when_present() {
+        // data=readonly + override=write → the POST-shaped read is permitted…
+        assert!(!write_ceiling_denies_axis(
+            true,
+            CeilingAxis::VerbInferred,
+            WriteCeiling::ReadOnly,
+            Some(WriteCeiling::Write),
+        ));
+        // …and the SAME actor is still refused every categorical op.
+        assert!(write_ceiling_denies_axis(
+            true,
+            CeilingAxis::Categorical,
+            WriteCeiling::ReadOnly,
+            Some(WriteCeiling::Write),
+        ));
+    }
+
+    /// `None` is INHERIT, so an actor with no override behaves exactly as it
+    /// did before the axis existed — on both axes.
+    #[test]
+    fn an_absent_override_is_byte_identical_to_the_one_axis_behaviour() {
+        for ceiling in [WriteCeiling::ReadOnly, WriteCeiling::Write] {
+            for axis in [CeilingAxis::VerbInferred, CeilingAxis::Categorical] {
+                assert_eq!(
+                    write_ceiling_denies_axis(true, axis, ceiling, None),
+                    super::write_ceiling_denies(true, ceiling),
+                    "axis {axis:?} at {ceiling:?} drifted from the one-axis rule"
+                );
+            }
+        }
+    }
+
+    /// The override TIGHTENS as well as loosens.
+    #[test]
+    fn the_override_can_refuse_a_verb_op_for_a_write_actor() {
+        assert!(write_ceiling_denies_axis(
+            true,
+            CeilingAxis::VerbInferred,
+            WriteCeiling::Write,
+            Some(WriteCeiling::ReadOnly),
+        ));
+        // Control: the same actor still writes memory.
+        assert!(!write_ceiling_denies_axis(
+            true,
+            CeilingAxis::Categorical,
+            WriteCeiling::Write,
+            Some(WriteCeiling::ReadOnly),
+        ));
+    }
+
+    /// Enforcement off means no refusal on either axis, whatever the values.
+    #[test]
+    fn unenforced_refuses_nothing_on_either_axis() {
+        for axis in [CeilingAxis::VerbInferred, CeilingAxis::Categorical] {
+            assert!(!write_ceiling_denies_axis(
+                false,
+                axis,
+                WriteCeiling::ReadOnly,
+                Some(WriteCeiling::ReadOnly),
+            ));
+        }
+    }
+
+    /// Sub-workflow narrowing: `None` never widens an explicit value.
+    #[test]
+    fn narrowing_never_widens() {
+        use WriteCeiling::{ReadOnly, Write};
+        assert_eq!(narrow_verb_inference_override(None, None), None);
+        // An absent side inherits the explicit one rather than erasing it.
+        assert_eq!(
+            narrow_verb_inference_override(Some(ReadOnly), None),
+            Some(ReadOnly)
+        );
+        assert_eq!(
+            narrow_verb_inference_override(None, Some(ReadOnly)),
+            Some(ReadOnly)
+        );
+        assert_eq!(
+            narrow_verb_inference_override(Some(Write), None),
+            Some(Write)
+        );
+        // Two explicit values take the more restrictive.
+        assert_eq!(
+            narrow_verb_inference_override(Some(Write), Some(ReadOnly)),
+            Some(ReadOnly)
+        );
+        assert_eq!(
+            narrow_verb_inference_override(Some(ReadOnly), Some(Write)),
+            Some(ReadOnly)
+        );
+        assert_eq!(
+            narrow_verb_inference_override(Some(Write), Some(Write)),
+            Some(Write)
+        );
+    }
+
+    /// SQL NULL is INHERIT and must never become a value.
+    #[test]
+    fn a_null_column_is_inherit_not_a_grant() {
+        use super::http_verb_ceiling_from_db;
+        assert_eq!(http_verb_ceiling_from_db(None), None);
+        // Controls that can fail: the two real tokens DO map, so the assertion
+        // above cannot pass by the function always returning `None`.
+        assert_eq!(
+            http_verb_ceiling_from_db(Some("write")),
+            Some(WriteCeiling::Write)
+        );
+        assert_eq!(
+            http_verb_ceiling_from_db(Some("readonly")),
+            Some(WriteCeiling::ReadOnly)
+        );
+        // An unrecognised token falls CLOSED, and on this axis closed is
+        // ReadOnly — never inherit, which could be `Write`.
+        assert_eq!(
+            http_verb_ceiling_from_db(Some("wrIte")),
+            Some(WriteCeiling::ReadOnly)
+        );
+        assert_eq!(
+            http_verb_ceiling_from_db(Some("")),
+            Some(WriteCeiling::ReadOnly)
+        );
     }
 }

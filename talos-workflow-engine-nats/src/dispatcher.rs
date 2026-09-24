@@ -1381,6 +1381,7 @@ mod resign_payload_tests {
             user_id: uuid::Uuid::new_v4(),
             max_llm_tier: LlmTier::Tier2,
             max_write_ceiling: WriteCeiling::Write,
+            http_verb_ceiling: None,
             egress_scope: None,
             dry_run: false,
             reply_topic: None,
@@ -1716,6 +1717,7 @@ impl NodeDispatcher for NatsNodeDispatcher {
             user_id: job.user_id.unwrap_or_else(uuid::Uuid::nil),
             max_llm_tier: job.max_llm_tier,
             max_write_ceiling: job.max_write_ceiling,
+            http_verb_ceiling: job.http_verb_ceiling,
             egress_scope: job.egress_scope,
             // H-1: stamp the pre-allocated inbox into the request
             // BEFORE signing. The worker will verify wire
@@ -2040,6 +2042,7 @@ impl NodeDispatcher for NatsNodeDispatcher {
             user_id: request.user_id.unwrap_or_else(uuid::Uuid::nil),
             max_llm_tier: request.max_llm_tier,
             max_write_ceiling: request.max_write_ceiling,
+            http_verb_ceiling: request.http_verb_ceiling,
             egress_scope: request.egress_scope,
             // H-1: bind the pre-allocated inbox into the signing
             // payload. Worker will refuse to publish anywhere else.
@@ -2678,6 +2681,7 @@ mod p3_full_loop_tests {
             share_sandbox: false,
             max_llm_tier: talos_workflow_engine_core::LlmTier::Tier2,
             max_write_ceiling: talos_workflow_engine_core::WriteCeiling::Write,
+            http_verb_ceiling: None,
             egress_scope: None,
             total_timeout: std::time::Duration::from_secs(20),
             max_retries: 0,

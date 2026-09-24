@@ -8819,3 +8819,92 @@ appears to. A second pin covers the `run_sandbox` call site, which no resolver
 test can see.
 
 Nine mutations, nine caught, no survivors.
+
+### EL, 2026-09-24 — the write ceiling's two axes
+
+Asked for as "egress vs data", so a Plaid-style reader could POST to its one
+host while staying refused memory, SQL, email and NATS. The measurement decided
+where the line actually goes, and it is not where the word "egress" suggests.
+
+#### The partition is provability
+
+Of the fifteen write-ceiling gate sites, **three** decide "is this a mutation?"
+by inferring it from the HTTP verb — `http::fetch`, `http::fetch_all`, and
+`graphql::execute`, the last because an operation type is not provable from a
+request string. The other **twelve** never have to guess: the op *is* the
+mutation (`agent-memory-set`, `email-send`, `messaging-publish`), or the
+mutation is proven from the statement's AST (`database-query`).
+
+The inferring three over-refuse by design, and the platform already says so —
+EI's `WRITE_CEILING_VERB_DETAIL` tells an operator that a POST which is a READ
+on the target API is refused anyway. That over-refusal is the only part of the
+ceiling an operator has a principled reason to override separately. Everything
+else it refuses, it refuses for a reason no override should touch.
+
+A **destination** split was measured and rejected. It would put `email-send`,
+`webhook-send` and `messaging-publish` on the same axis as `http-fetch`, so an
+actor granted the override to make POST-shaped reads would also gain mail and
+NATS publish — categorical side effects nothing was over-refusing.
+
+#### What it buys on this fleet: one actor of five
+
+Stated plainly because the number is small. `plaid-read` is `http-node`,
+`allowed_methods={POST}`, one host, and calls `http::fetch` and nothing else;
+its actor holds `write` only because Plaid's reads are POSTs. That is the
+package's motivating case and it fits exactly.
+
+The other four write actors all need `data=write`, and the reason is worth
+keeping: **every data mutation on this fleet goes through the
+`__memory_write__` envelope, not a host function.** Eight modules emit it; zero
+call `agent_memory::set`, `integration_state`, `database`, `object_storage`,
+`messaging`, `email` or `webhook` directly. The value of the split here is
+forward-looking — every future API-reader actor — and saying so is more honest
+than implying it unlocks the fleet.
+
+#### Inert by construction
+
+`actors.http_verb_ceiling` is nullable with no default, deliberately. A default
+would make "inherit" indistinguishable from "explicitly set to the inherited
+value", and the three-valued read is what lets the signed field be a
+conditional append (`:hvc=`). A default-shaped job is byte-identical on the
+wire, so unlike `max_write_ceiling` — bound unconditionally, and which needed a
+coordinated controller+worker restart — this one needs none. The twelve
+existing wire-format snapshots pass unchanged with the field present, which is
+the proof, since they carry literal MAC hex.
+
+The column carries **its own escalation trigger**, copied from the sibling
+column's. A guard covering one of two escalation paths is not a guard: without
+it a bulk `UPDATE` could grant POST-shaped egress fleet-wide while the guard on
+`max_write_ceiling` looked on.
+
+#### Four mutations survived the first run
+
+All four were the call-site and plumbing class this session had already been
+bitten by twice:
+
+* the fail-closed actor stamp left the new axis *inheriting*;
+* the repository collapsed SQL `NULL` into `Some(Write)` — which would have
+  granted POST-shaped egress to **every actor on the fleet**;
+* the graphql gate reverted to the categorical axis;
+* a categorical gate (`email-send`) moved onto the verb axis — the override
+  granting mail, the exact thing the chosen partition exists to prevent.
+
+The core unit tests cover the *decision* and are blind to which axis a call site
+passes. What closed them: `ceiling_axis_pins`, which derives the `(op, axis)`
+pairs from the nine host files and asserts the verb axis covers exactly the
+three — with a floor so a scan that stops matching fails rather than vouching
+for nothing; a pure `http_verb_ceiling_from_db` so the NULL mapping is testable
+without a database; and a textual pin on the fail-closed stamp. Nine of nine
+caught on the re-run.
+
+Making the axis a **required parameter** of `write_ceiling_refuses` is the other
+half: a new gate site cannot inherit the wrong half of the ceiling by saying
+nothing, and the compiler enforcing that is stronger than any pin.
+
+#### A pre-existing gap the new snapshot found
+
+`sign_request_with_fixed_nonce` — the hand-rolled signer the wire snapshots use
+— mirrored only `:attempt=` and `:fuel=`. It had never mirrored `:egress=` or
+`:idem=`, invisible because every snapshot left those fields at their defaults.
+The `verify()` round-trip caught it the moment a non-default `:hvc=` snapshot
+existed, which is exactly what that assertion is for.

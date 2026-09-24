@@ -416,6 +416,7 @@ mod dispatch_delivery_tests {
             max_llm_tier: Default::default(),
             max_write_ceiling: Default::default(),
             egress_scope: None,
+            http_verb_ceiling: None,
             wasm_bytes: None,
             capability_world: None,
             integration_name: None,
