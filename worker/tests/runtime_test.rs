@@ -36,10 +36,11 @@ async fn test_runtime_no_nested_block_on() {
             Uuid::nil(),                                      // user_id
             LlmTier::Tier2,                                   // max_llm_tier
             talos_workflow_job_protocol::WriteCeiling::Write, // max_write_ceiling
-            None,                                             // egress_scope: tier default
-            None,                                             // llm_usage_out — not collected
-            None,                                             // host_diag_out — not collected
-            0,                                                // dispatch_attempt
+            None, // http_verb_ceiling — inherit the ceiling above
+            None, // egress_scope: tier default
+            None, // llm_usage_out — not collected
+            None, // host_diag_out — not collected
+            0,    // dispatch_attempt
         )
         .await;
 

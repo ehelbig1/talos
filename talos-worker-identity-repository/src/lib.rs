@@ -255,8 +255,12 @@ pub const WRITE_CEILING_VERB_RULE: &str = "GET is the only read verb";
 /// integration over a POST-based API is refused by it.
 pub const WRITE_CEILING_VERB_NOTE: &str =
     "Note that 'data-mutating' is INFERRED on three of the four legs: the HTTP legs classify by \
-     VERB (GET is the only read verb) and the GraphQL leg treats every call as a mutation, so a \
-     read-only integration over a POST-based API needs 'write'. Only the SQL leg proves it.";
+     VERB (GET is the only read verb) and the GraphQL leg treats every call as a mutation. Only \
+     the SQL leg proves it. A read-only integration over a POST-based API therefore needs the \
+     inference lifted — since 2026-09-24 the narrow way to do that is the actor's \
+     http_verb_ceiling ('write' lifts it on exactly those inferring gates and leaves this \
+     ceiling governing the twelve categorical ops), rather than raising this ceiling, which \
+     grants all fifteen.";
 
 impl WriteCeilingFleetSummary {
     /// One sentence an operator can act on, derived from the state. Rendered
@@ -1311,6 +1315,31 @@ mod write_ceiling_summary_tests {
         // three legs guess cannot tell whether the control ever proves
         // anything.
         assert!(n.contains("Only the SQL leg proves it"), "{n}");
+    }
+
+    /// The note must name the NARROW route, not only the broad one.
+    ///
+    /// This note renders on five operator surfaces. Until #941 the only way to
+    /// clear a verb-inferred refusal WAS raising the whole ceiling, so the note
+    /// said "needs 'write'". #941 split that half onto its own axis, which makes
+    /// the old sentence advice to grant fifteen ops where three would do — the
+    /// misleading-report class, in the platform's own guidance.
+    ///
+    /// Measured: without this test, rewording the note back to "raise this
+    /// ceiling" SURVIVED every other guard in the crate.
+    #[test]
+    fn the_verb_note_names_the_narrow_route_and_prices_the_broad_one() {
+        let n = crate::WRITE_CEILING_VERB_NOTE;
+        // The rule that refused.
+        assert!(n.contains(crate::WRITE_CEILING_VERB_RULE), "{n}");
+        // The narrow route, by the name an operator can act on.
+        assert!(n.contains("http_verb_ceiling"), "{n}");
+        // BOTH halves of its scope — naming only what it lifts is how an
+        // operator concludes it grants everything.
+        assert!(n.contains("twelve categorical"), "{n}");
+        // And the broad option stays priced rather than deleted: an actor whose
+        // case really is a mutation still needs a route.
+        assert!(n.contains("all fifteen"), "{n}");
     }
 
     /// The verb note reaches every state that can REFUSE, and no other.

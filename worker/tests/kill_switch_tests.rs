@@ -341,6 +341,7 @@ async fn pipeline_mid_step_failure_propagates() {
             false,
             talos_workflow_job_protocol::LlmTier::Tier2,
             talos_workflow_job_protocol::WriteCeiling::Write,
+            None, // http_verb_ceiling — inherit the ceiling above
             None, // egress_scope: tier default
             None, // llm_usage_out — not collected in kill-switch tests
         )
@@ -388,6 +389,7 @@ async fn pipeline_mid_step_trap_propagates() {
             false,
             talos_workflow_job_protocol::LlmTier::Tier2,
             talos_workflow_job_protocol::WriteCeiling::Write,
+            None, // http_verb_ceiling — inherit the ceiling above
             None, // egress_scope: tier default
             None, // llm_usage_out — not collected in kill-switch tests
         )
@@ -417,6 +419,7 @@ async fn pipeline_all_steps_ok_succeeds() {
             false,
             talos_workflow_job_protocol::LlmTier::Tier2,
             talos_workflow_job_protocol::WriteCeiling::Write,
+            None, // http_verb_ceiling — inherit the ceiling above
             None, // egress_scope: tier default
             None, // llm_usage_out — not collected in kill-switch tests
         )
@@ -561,6 +564,7 @@ async fn cancellation_preempts_a_compute_bound_module() {
                 Uuid::nil(),     // user_id
                 LlmTier::Tier2,
                 talos_workflow_job_protocol::WriteCeiling::Write,
+                None, // http_verb_ceiling — inherit the ceiling above
                 None, // egress_scope
                 None, // llm_usage_out
                 None, // host_diag_out
@@ -697,6 +701,7 @@ async fn an_uncancelled_compute_bound_job_still_traps_at_its_own_budget() {
             Uuid::nil(),
             LlmTier::Tier2,
             talos_workflow_job_protocol::WriteCeiling::Write,
+            None, // http_verb_ceiling — inherit the ceiling above
             None,
             None,
             None,

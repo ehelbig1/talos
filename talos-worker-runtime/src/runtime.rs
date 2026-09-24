@@ -3464,6 +3464,7 @@ impl TalosRuntime {
             uuid::Uuid::nil(), // user_id — legacy helper has no user context
             talos_workflow_job_protocol::LlmTier::default(), // tier2 for legacy helper
             talos_workflow_job_protocol::WriteCeiling::default(), // write (permissive) for legacy helper
+            None, // http_verb_ceiling — inherit the permissive ceiling above
             None, // egress_scope — legacy helper: tier-derived default
             None, // llm_usage_out — legacy helper doesn't collect usage
             None, // host_diag_out — legacy helper has a real execution id (NATS route)
@@ -3519,6 +3520,12 @@ impl TalosRuntime {
         // ops when `TALOS_WRITE_CEILING_ENFORCED=1`. Stamped onto the
         // TalosContext alongside `max_llm_tier`.
         max_write_ceiling: talos_workflow_job_protocol::WriteCeiling,
+        // Override for the VERB-INFERRED half of the ceiling. `None` inherits
+        // `max_write_ceiling`. Threaded BESIDE its sibling deliberately: #941
+        // added the column, the signed wire field and the gate but never carried
+        // the value from the job onto the context, so the override was a complete
+        // no-op — the wire field arrived and was dropped.
+        http_verb_ceiling: Option<talos_workflow_job_protocol::WriteCeiling>,
         // Blanket network-egress scope override (independent of `max_llm_tier`).
         // `None` = tier-derived default; drives the SSRF `local_egress_only` gate.
         egress_scope: Option<talos_workflow_job_protocol::EgressScope>,
@@ -3795,6 +3802,7 @@ impl TalosRuntime {
                         user_id,
                         max_llm_tier,
                         max_write_ceiling,
+                        http_verb_ceiling,
                         egress_scope,
                         llm_usage_out.clone(),
                         host_diag_out.clone(),
@@ -4036,6 +4044,12 @@ impl TalosRuntime {
         // ops when `TALOS_WRITE_CEILING_ENFORCED=1`. Stamped onto the
         // TalosContext alongside `max_llm_tier`.
         max_write_ceiling: talos_workflow_job_protocol::WriteCeiling,
+        // Override for the VERB-INFERRED half of the ceiling. `None` inherits
+        // `max_write_ceiling`. Threaded BESIDE its sibling deliberately: #941
+        // added the column, the signed wire field and the gate but never carried
+        // the value from the job onto the context, so the override was a complete
+        // no-op — the wire field arrived and was dropped.
+        http_verb_ceiling: Option<talos_workflow_job_protocol::WriteCeiling>,
         // Blanket network-egress scope override (independent of `max_llm_tier`).
         egress_scope: Option<talos_workflow_job_protocol::EgressScope>,
         // R2 token ledger: caller-shared LLM usage accumulator (see
@@ -4185,6 +4199,10 @@ impl TalosRuntime {
         // Wire write ceiling. `write_ceiling_refuses` gates every mutating
         // host op on `ReadOnly` when enforcement is on.
         context.max_write_ceiling = max_write_ceiling;
+        // Wire the verb-inference override BESIDE the ceiling it modifies.
+        // Without this line the field is `None` on every context and the
+        // override does nothing, whatever the actor's column says.
+        context.http_verb_ceiling = http_verb_ceiling;
         // Wire user_id for integration_state scoping + per-user rate limiting.
         // Uuid::nil() means the controller didn't supply one (system
         // execution); integration_state host fns treat that as "not
@@ -4904,6 +4922,12 @@ impl TalosRuntime {
         // dispatch. `ReadOnly` + enforcement on = data-mutating host ops
         // refused.
         max_write_ceiling: talos_workflow_job_protocol::WriteCeiling,
+        // Override for the VERB-INFERRED half of the ceiling. `None` inherits
+        // `max_write_ceiling`. Threaded BESIDE its sibling deliberately: #941
+        // added the column, the signed wire field and the gate but never carried
+        // the value from the job onto the context, so the override was a complete
+        // no-op — the wire field arrived and was dropped.
+        http_verb_ceiling: Option<talos_workflow_job_protocol::WriteCeiling>,
         // Blanket network-egress scope override stamped on every step's
         // TalosContext (independent of `max_llm_tier`). `None` = tier-default.
         egress_scope: Option<talos_workflow_job_protocol::EgressScope>,
@@ -5044,6 +5068,7 @@ impl TalosRuntime {
                         workflow_execution_id,
                         max_llm_tier,
                         max_write_ceiling,
+                        http_verb_ceiling,
                         egress_scope,
                         &shared_state,
                         &shared_llm_usage,
@@ -5153,6 +5178,12 @@ impl TalosRuntime {
         workflow_execution_id: &str,
         max_llm_tier: talos_workflow_job_protocol::LlmTier,
         max_write_ceiling: talos_workflow_job_protocol::WriteCeiling,
+        // Override for the VERB-INFERRED half of the ceiling. `None` inherits
+        // `max_write_ceiling`. Threaded BESIDE its sibling deliberately: #941
+        // added the column, the signed wire field and the gate but never carried
+        // the value from the job onto the context, so the override was a complete
+        // no-op — the wire field arrived and was dropped.
+        http_verb_ceiling: Option<talos_workflow_job_protocol::WriteCeiling>,
         egress_scope: Option<talos_workflow_job_protocol::EgressScope>,
         shared_state: &Arc<std::sync::Mutex<HashMap<String, String>>>,
         shared_llm_usage: &crate::context::LlmUsageAcc,
@@ -5205,6 +5236,9 @@ impl TalosRuntime {
             // Same for the write ceiling — every step's mutating host ops
             // enforce the same `ReadOnly` gate as single-node dispatch.
             context.max_write_ceiling = max_write_ceiling;
+            // See the sibling assignment above: without this the override
+            // is dropped on arrival.
+            context.http_verb_ceiling = http_verb_ceiling;
 
             // Correlate step execution logs with the module ID.
             context.set_request_id(step.module_id.clone());

@@ -1616,6 +1616,10 @@ async fn execute_job(
             req.user_id,
             req.max_llm_tier,
             req.max_write_ceiling,
+            // The signed override, carried from the wire onto the context.
+            // Without this the field arrives and is dropped — which is
+            // exactly what #941 shipped, making the whole axis a no-op.
+            req.http_verb_ceiling,
             req.egress_scope,
             Some(llm_usage_acc.clone()),
             // host_diag_out: the worker has a real execution id, so host
@@ -1978,6 +1982,10 @@ async fn execute_pipeline_job(
             req.share_sandbox,
             req.max_llm_tier,
             req.max_write_ceiling,
+            // The signed override, carried from the wire onto the context.
+            // Without this the field arrives and is dropped — which is
+            // exactly what #941 shipped, making the whole axis a no-op.
+            req.http_verb_ceiling,
             req.egress_scope,
             Some(llm_usage_acc.clone()),
         )

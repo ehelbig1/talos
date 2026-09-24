@@ -1759,6 +1759,8 @@ async fn handle_run_scratch_session(
             user_id, // the caller's real tenant identity (was Uuid::nil())
             talos_workflow_job_protocol::LlmTier::Tier1, // no actor ⇒ fail-closed tier (was Tier-2)
             talos_workflow_job_protocol::WriteCeiling::ReadOnly, // no actor ⇒ no mutation (was Write)
+            // No actor ⇒ no override to honour; inherit the ReadOnly above.
+            None,
             scratch_egress.egress_scope, // Some(Public): private ranges DENIED in-process
             None, // llm_usage_out — no in-process caller drains it (matches test_module)
             None, // host_diag_out — no in-process diagnostic sink on this path

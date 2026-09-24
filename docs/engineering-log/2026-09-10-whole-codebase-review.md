@@ -8908,3 +8908,79 @@ nothing, and the compiler enforcing that is stronger than any pin.
 `:idem=`, invisible because every snapshot left those fields at their defaults.
 The `verify()` round-trip caught it the moment a non-default `:hvc=` snapshot
 existed, which is exactly what that assertion is for.
+
+### EM, 2026-09-24 — the axis that did nothing
+
+Found by surveying the fleet after deploy 136, not by a test.
+
+EL (#941) added `actors.http_verb_ceiling`, a recorded setter with its own
+database escalation trigger, a signed conditional-append wire field, the
+decision in core, sub-workflow narrowing, the axis assignment at all fifteen
+gate sites, four pins and nine mutations.
+
+And `talos-worker-runtime` never copied the value from the job onto the
+context. `TalosContext::http_verb_ceiling` was initialised `None`, read by the
+gate, and assigned nowhere. The override was signed, travelled, arrived, and
+was discarded. Every actor's verb gate still read `max_write_ceiling`.
+
+Measured: `context.max_write_ceiling` is assigned at **two** runtime sites and
+threaded through **four** signatures. `context.http_verb_ceiling` was assigned
+at **zero** and appeared in none of them.
+
+#### Why nine mutations missed it
+
+A mutation can only change code that exists. The defect was an **absent**
+assignment — there was nothing to mutate. And `ceiling_axis_pins`' sibling
+tests check which axis each gate *names*, not whether the value *arrives*.
+
+This is the carrier class for the third time in one session. EJ flipped an
+empty grant from permissive to restrictive; EK found five carriers that had
+been dropping it for free; and EL's own plumbing dropped the next one. The
+shape does not get less likely by having just been fixed one layer up.
+
+#### The pin that did not pin
+
+The first version counted assignments: `context.http_verb_ceiling` must appear
+as often as `context.max_write_ceiling`. Mutating the assignment to
+`context.http_verb_ceiling = None;` **survived** it — the line is present and
+carries nothing, which is the defect restored exactly. The needle now names the
+parameter on the right-hand side.
+
+Two more survived the first run: the pipeline path (same shape) and the fleet
+note, which had no pin at all. Five of five caught after closing them.
+
+#### Four surfaces advising the broad grant
+
+The sharpest line appeared twice, verbatim:
+
+> The ceiling CANNOT express 'may POST, but only reads'
+
+True when EI wrote it. False since EL. Rewritten at
+`WRITE_CEILING_VERB_DETAIL` (the guest-visible refusal),
+`WRITE_CEILING_VERB_NOTE` (five fleet surfaces), `set_actor_write_ceiling`'s
+description, and `analyze_execution_failure`'s remediation step — which pointed
+the operator at `set_actor_write_ceiling` and now names
+`set_actor_http_verb_ceiling` first. Each keeps the broad option **priced**
+(`all fifteen`) rather than deleted: an actor whose case really is a mutation
+still needs a route.
+
+`test_module` now reads the actor's override too. It is a REHEARSAL, and
+reading only `max_write_ceiling` there refuses a POST that the same actor's
+real dispatch permits — the rehearsal disagreeing with production in the one
+direction that matters. `run_sandbox` keeps `None` deliberately: it has no real
+actor binding, the same asymmetry its ceiling comment already records.
+
+#### Measured and NOT changed: `execution_events.error_class`
+
+NULL on all **133,470** rows, which looked like a dead column and is not. It
+has three live producers: the dispatcher's `retry_skipped` event, the
+`node_failed` parse of `(non-transient: …)`, and DX's liveness re-dispatch.
+None has fired — `retry_skipped` has **never** occurred despite 32
+retry-enabled nodes, because every classified error on this fleet is transient,
+and no liveness event has occurred since DX deployed. **Latent, not dead.**
+
+Worth recording how badly I read it: three successive conclusions were wrong
+before the fourth was right, and **two of them came from truncating my own
+evidence with `head`** — once hiding the writer, once hiding the producer that
+composes the prefix. A grep that returns nothing and a grep that was cut off
+look identical in a terminal.
