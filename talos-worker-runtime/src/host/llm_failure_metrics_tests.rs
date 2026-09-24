@@ -266,7 +266,10 @@ fn context_with_metrics_in_world(tier: LlmTier, world: CapabilityWorld) -> Talos
     let mut ctx = TalosContext::new(
         world,
         vec![],
-        vec![],
+        ["GET", "POST", "PUT", "PATCH", "DELETE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         128,
         HashMap::new(),
         None,

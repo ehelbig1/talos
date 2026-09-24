@@ -10,7 +10,10 @@ async fn test_http_fetch_forbidden_world() {
     let mut ctx = TalosContext::new(
         CapabilityWorld::Minimal,
         vec!["*".to_string()],
-        vec![],
+        ["GET", "POST", "PUT", "PATCH", "DELETE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         128,
         HashMap::new(),
         None,
@@ -40,7 +43,10 @@ async fn test_http_fetch_allowlist_enforcement() {
     let mut ctx = TalosContext::new(
         CapabilityWorld::Http,
         vec!["example.com".to_string()],
-        vec![],
+        ["GET", "POST", "PUT", "PATCH", "DELETE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         128,
         HashMap::new(),
         None,
@@ -86,8 +92,11 @@ async fn test_http_fetch_allowlist_enforcement() {
 async fn test_http_ssrf_protection() {
     let mut ctx = TalosContext::new(
         CapabilityWorld::Http,
-        vec!["*".to_string()], // Wildcard allowlist
-        vec![],
+        vec!["*".to_string()], // Wildcard host allowlist
+        ["GET", "POST", "PUT", "PATCH", "DELETE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         128,
         HashMap::new(),
         None,
@@ -135,7 +144,10 @@ async fn test_crypto_hash_limits() {
     let mut ctx = TalosContext::new(
         CapabilityWorld::Minimal,
         vec![],
-        vec![],
+        ["GET", "POST", "PUT", "PATCH", "DELETE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         128,
         HashMap::new(),
         None,
@@ -167,7 +179,10 @@ async fn test_crypto_random_bytes_limits() {
     let mut ctx = TalosContext::new(
         CapabilityWorld::Minimal,
         vec![],
-        vec![],
+        ["GET", "POST", "PUT", "PATCH", "DELETE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         128,
         HashMap::new(),
         None,
@@ -197,7 +212,10 @@ async fn test_json_path_query() {
     let mut ctx = TalosContext::new(
         CapabilityWorld::Minimal,
         vec![],
-        vec![],
+        ["GET", "POST", "PUT", "PATCH", "DELETE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         128,
         HashMap::new(),
         None,
@@ -258,7 +276,10 @@ async fn test_logging_redaction() {
     let mut ctx = TalosContext::new(
         CapabilityWorld::Minimal,
         vec![],
-        vec![],
+        ["GET", "POST", "PUT", "PATCH", "DELETE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         128,
         secrets,
         None,
@@ -289,7 +310,10 @@ async fn test_datetime_operations() {
     let mut ctx = TalosContext::new(
         CapabilityWorld::Minimal,
         vec![],
-        vec![],
+        ["GET", "POST", "PUT", "PATCH", "DELETE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         128,
         HashMap::new(),
         None,
@@ -377,7 +401,10 @@ async fn fetch_with_bearer_sends_single_bearer_prefix() {
         // explicit allowlist (no `*`). So `localhost` reaches the loopback
         // server while still exercising the real fetch_with_bearer path.
         vec!["localhost".to_string()],
-        vec![],
+        ["GET", "POST", "PUT", "PATCH", "DELETE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         128,
         secrets,
         None,
@@ -489,7 +516,10 @@ async fn denied_fetch_lands_in_the_in_process_diagnostic_sink() {
         CapabilityWorld::Http,
         // Empty allowlist ⇒ deny-all, the "no host allowlist configured" arm.
         vec![],
-        vec![],
+        ["GET", "POST", "PUT", "PATCH", "DELETE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         128,
         HashMap::new(),
         None, // redis

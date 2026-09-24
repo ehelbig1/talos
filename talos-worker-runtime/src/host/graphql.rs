@@ -1057,14 +1057,20 @@ impl TalosContext {
             }
         }
 
-        // GraphQL requests are always POST. Reject if POST is not in the allowlist.
-        let allowed_methods = self.allowed_methods.clone();
-        if !allowed_methods.is_empty()
-            && !allowed_methods
-                .iter()
-                .any(|m| m.eq_ignore_ascii_case("POST"))
-        {
+        // GraphQL requests are always POST. Reject if POST is not in the
+        // allowlist — and an EMPTY allowlist denies, which is the whole point
+        // of `method_permitted` (see its docs: empty was the one member of the
+        // three-part grant that meant ALLOW).
+        if !talos_workflow_job_protocol::method_permitted(&self.allowed_methods, "POST") {
+            self.record_capability_denied_detailed(
+                "graphql-execute",
+                "method-allowlist",
+                "",
+                Some(talos_workflow_job_protocol::METHOD_ALLOWLIST_REMEDY),
+            )
+            .await;
             tracing::warn!(
+                allowed_methods = ?self.allowed_methods,
                 "WASM module attempted GraphQL (POST) but POST is not in allowed_methods"
             );
             return Err(gql_deny(self, reason_class::METHOD_ALLOWLIST));

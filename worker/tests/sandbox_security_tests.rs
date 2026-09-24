@@ -26,7 +26,14 @@ fn make_context_with(world: CapabilityWorld, max_memory_mb: usize) -> TalosConte
     TalosContext::new(
         world,
         vec!["*".to_string()],
-        vec![],
+        // All five verbs. Since 2026-09-24 an EMPTY `allowed_methods` denies
+        // every verb (`talos_workflow_job_protocol::method_permitted`), and the
+        // method gate sits below the check under test here — an undeclared list
+        // would refuse the request for a reason this test is not about.
+        ["GET", "POST", "PUT", "PATCH", "DELETE"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect(),
         max_memory_mb,
         HashMap::new(),
         None,

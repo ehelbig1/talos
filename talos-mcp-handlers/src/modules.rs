@@ -325,7 +325,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "allowed_methods": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "HTTP method allowlist (e.g. ['GET', 'POST']). Empty = allow all methods AND classifies the module UNKNOWN (not read-only) for the method-aware retry default, so nodes created from it get retry_count 0. Declare ['GET'] on a read-only module to enforce read-only egress AND earn transient retries."
+                        "description": "HTTP method allowlist (e.g. ['GET', 'POST']). EMPTY DENIES EVERY VERB at all five egress gates (http fetch / fetch_all, graphql, webhook, SSE connect) — the same rule allowed_hosts and allowed_secrets have always had; before 2026-09-24 empty meant allow-all, which made this the one grant where declaring nothing granted everything. Empty also classifies the module UNKNOWN (not read-only) for the method-aware retry default, so nodes created from it get retry_count 0. There is no wildcard: the method set is closed at five, so 'every verb' is ['GET','POST','PUT','PATCH','DELETE'] written out. Declare ['GET'] on a read-only module to enforce read-only egress AND earn transient retries."
                     },
                     "pin_module": { "type": "boolean", "description": "Mark module as pinned so restore_pinned_modules reinstalls it on session start. Useful for modules you always want available (e.g. llm-inference, http-request). Default: false." },
                     "fuel_budget": {

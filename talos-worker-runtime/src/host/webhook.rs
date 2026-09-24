@@ -213,16 +213,17 @@ impl wit_webhook::Host for TalosContext {
         // declared `allowed_methods: ["GET"]` (the read-only shape the engine's
         // method-aware retry default keys on) could still POST through
         // `webhook::send`. Same rule `graphql::execute` applies to its own
-        // implicit POST; empty = allow all (the documented `allowed_methods`
-        // semantics — see the engine retry rules).
-        if !self.allowed_methods.is_empty()
-            && !self
-                .allowed_methods
-                .iter()
-                .any(|m| m.eq_ignore_ascii_case("POST"))
-        {
-            self.record_capability_denied("webhook", "method-allowlist", &format!("POST {host}"))
-                .await;
+        // implicit POST. Since 2026-09-24 an EMPTY allowlist DENIES here too
+        // (`method_permitted`) — the sentence this comment used to end with,
+        // "empty = allow all", was the defect.
+        if !talos_workflow_job_protocol::method_permitted(&self.allowed_methods, "POST") {
+            self.record_capability_denied_detailed(
+                "webhook",
+                "method-allowlist",
+                &format!("POST {host}"),
+                Some(talos_workflow_job_protocol::METHOD_ALLOWLIST_REMEDY),
+            )
+            .await;
             tracing::warn!(
                 host = %host,
                 allowed_methods = ?self.allowed_methods,
@@ -614,22 +615,36 @@ mod webhook_gate_tests {
         assert!(matches!(r, Err(wit_webhook::Error::Sendfailed)), "{r:?}");
         assert_eq!(latched(&c), Some(reason_class::METHOD_ALLOWLIST));
 
-        // Controls: POST listed, and the empty (allow-all) list, both pass the
-        // gate — dry-run mocks the send before any socket.
-        for allowed in [&["POST"][..], &[][..]] {
-            let mut c = ctx(host, allowed, true);
-            let r = c.send(req(host)).await;
-            assert!(
-                matches!(&r, Ok(resp) if resp.status == 200),
-                "{allowed:?}: {r:?}"
-            );
-        }
+        // CONTROL: POST listed passes the gate — dry-run mocks the send
+        // before any socket, so a pass here is the gate's verdict and not a
+        // network result.
+        let mut c = ctx(host, &["POST"], true);
+        let r = c.send(req(host)).await;
+        assert!(matches!(&r, Ok(resp) if resp.status == 200), "{r:?}");
+    }
+
+    /// An EMPTY `allowed_methods` REFUSES, and this test is the behaviour
+    /// change itself (2026-09-24).
+    ///
+    /// Until `method_permitted` existed this case was a CONTROL in the test
+    /// above, asserting that an undeclared module may POST — the assertion
+    /// that encoded "empty means allow all". `allowed_hosts` and
+    /// `allowed_secrets` have always denied on empty; this was the third
+    /// sibling disagreeing with both, so an undeclared module could POST
+    /// anywhere its host allowlist reached.
+    #[tokio::test]
+    async fn an_undeclared_method_list_refuses_the_send() {
+        let host = "1.0.0.3";
+        let mut c = ctx(host, &[], true);
+        let r = c.send(req(host)).await;
+        assert!(matches!(r, Err(wit_webhook::Error::Sendfailed)), "{r:?}");
+        assert_eq!(latched(&c), Some(reason_class::METHOD_ALLOWLIST));
     }
 
     #[tokio::test]
     async fn per_host_limit_is_shared_with_http_fetch() {
         let host = "1.0.0.2";
-        let mut c = ctx(host, &[], true);
+        let mut c = ctx(host, &["POST"], true);
         // Spend the host's budget the way `fetch` would.
         for _ in 0..MAX_HTTP_CALLS_PER_HOST_PER_EXECUTION {
             assert!(c.check_per_host_rate_limit(
@@ -649,7 +664,7 @@ mod webhook_gate_tests {
         cb.force_half_open(host, 0);
         // dry_run = false: the breaker sits AFTER the dry-run mock, and a
         // refusal returns before any socket is opened.
-        let mut c = ctx(host, &[], false);
+        let mut c = ctx(host, &["POST"], false);
         let r = c.send(req(host)).await;
         assert!(matches!(r, Err(wit_webhook::Error::Sendfailed)), "{r:?}");
         assert_eq!(latched(&c), Some(reason_class::CIRCUIT_OPEN));

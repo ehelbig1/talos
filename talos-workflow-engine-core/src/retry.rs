@@ -131,11 +131,17 @@ pub fn default_node_timeout_secs() -> u64 {
 /// # An EMPTY method list is UNKNOWN, not read-only
 ///
 /// `!is_empty()` is load-bearing, not defensive: `.all()` over an empty slice
-/// is vacuously true, and an empty list means "allow every method" at the
-/// worker's enforcement point (`talos-worker-runtime/src/host/http.rs`).
-/// Read-only must be DECLARED. See the note on
-/// [`default_max_retries_for_module`] for why `allowed_methods` is the odd
-/// one out among the per-module declaration lists.
+/// is vacuously true, so without it an undeclared module would read as
+/// read-only and earn a blind retry. Read-only must be DECLARED.
+///
+/// The REASON changed on 2026-09-24 and the verdict did not. This comment used
+/// to end "an empty list means 'allow every method' at the worker's
+/// enforcement point (`talos-worker-runtime/src/host/http.rs`)" — that was the
+/// asymmetry `talos_workflow_job_protocol::method_permitted` removed, and an
+/// empty list now DENIES every verb at all five egress gates, matching
+/// `allowed_hosts` and `allowed_secrets`. Returning `false` here is still
+/// right, for the opposite reason: an undeclared module makes no HTTP call at
+/// all, so there is nothing for a transient retry to re-send.
 #[must_use]
 pub fn methods_are_read_only(allowed_methods: &[String]) -> bool {
     !allowed_methods.is_empty()

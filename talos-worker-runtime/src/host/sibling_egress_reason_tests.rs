@@ -101,8 +101,21 @@ pub(super) const GUEST_STREAM_CONNECTION_FAILED: &str =
 pub(super) const GUEST_STREAM_RATE_LIMITED: &str =
     r#"Component returned error: sse: Error { code: 3, name: "rate-limited", message: "" }"#;
 
+/// The five-verb declaration a module that uses every verb writes out. The
+/// method set is CLOSED at five (`wit/talos.wit`), so this IS "allow all" —
+/// spelled, not inherited from an empty list.
+pub(super) fn all_verbs() -> Vec<String> {
+    ["GET", "POST", "PUT", "PATCH", "DELETE"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
+}
+
 pub(super) fn ctx_with(world: CapabilityWorld, allowed_hosts: Vec<String>) -> TalosContext {
-    ctx_full(world, allowed_hosts, vec![], LlmTier::Tier2)
+    // All five verbs: these tests are about egress REASON CLASSES, not the
+    // method allowlist, and since 2026-09-24 an empty list denies every verb
+    // (`method_permitted`), which would refuse before the class under test.
+    ctx_full(world, allowed_hosts, all_verbs(), LlmTier::Tier2)
 }
 
 pub(super) fn ctx_full(

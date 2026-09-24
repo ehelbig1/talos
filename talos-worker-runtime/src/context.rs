@@ -108,7 +108,8 @@ pub struct TalosContext {
     pub allowed_hosts: Vec<String>,
 
     /// Allowed HTTP methods for outbound requests (`http::fetch` and `graphql::execute`).
-    /// Empty = allow all methods. Non-empty = only those methods permitted.
+    /// Empty = DENY every verb (2026-09-24; `talos_workflow_job_protocol::method_permitted`,
+    /// matching `allowed_hosts` and `allowed_secrets`). Non-empty = only those permitted.
     /// Checked after the host allowlist so both restrictions must pass.
     pub allowed_methods: Vec<String>,
 
@@ -1226,7 +1227,7 @@ impl TalosContext {
     /// when the returned `TalosContext` is dropped.
     ///
     /// * `allowed_hosts` – hostname allowlist for outbound HTTP (empty = deny all; use `["*"]` to allow any host).
-    /// * `allowed_methods` – HTTP method allowlist (empty = allow all; `["GET"]` = read-only).
+    /// * `allowed_methods` – HTTP method allowlist (empty = DENY every verb; `["GET"]` = read-only).
     /// * `max_memory_mb` – memory cap in megabytes.
     /// * `secrets` – pre-fetched, decrypted secret values consumed by the `TalosVaultProvider`.
     ///   After construction the map is owned by the provider; no plaintext copy remains in the context.
@@ -2970,7 +2971,10 @@ mod host_diagnostic_sink_tests {
         TalosContext::new(
             CapabilityWorld::Minimal,
             vec![],
-            vec![],
+            ["GET", "POST", "PUT", "PATCH", "DELETE"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             128,
             HashMap::new(),
             None, // redis
@@ -3224,7 +3228,10 @@ mod denial_ledger_cap_tests {
         TalosContext::new(
             CapabilityWorld::Http,
             vec![],
-            vec![],
+            ["GET", "POST", "PUT", "PATCH", "DELETE"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             128,
             HashMap::new(),
             None,
@@ -3414,7 +3421,10 @@ mod secret_use_ledger_tests {
         let mut c = TalosContext::new(
             CapabilityWorld::Http,
             vec!["gmail.googleapis.com".to_string()],
-            vec![],
+            ["GET", "POST", "PUT", "PATCH", "DELETE"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             128,
             secrets,
             None,
@@ -3649,7 +3659,10 @@ mod secret_use_ledger_tests {
             TalosContext::new(
                 CapabilityWorld::Agent,
                 vec![],
-                vec![],
+                ["GET", "POST", "PUT", "PATCH", "DELETE"]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect(),
                 128,
                 secrets.clone(),
                 None,
@@ -3739,7 +3752,10 @@ mod secret_use_ledger_tests {
         let mut c = TalosContext::new(
             CapabilityWorld::Http,
             vec![],
-            vec![],
+            ["GET", "POST", "PUT", "PATCH", "DELETE"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             128,
             HashMap::new(),
             None,
@@ -3787,7 +3803,10 @@ mod capability_denial_detail_tests {
         let mut c = TalosContext::new(
             CapabilityWorld::Minimal,
             vec![],
-            vec![],
+            ["GET", "POST", "PUT", "PATCH", "DELETE"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
             128,
             HashMap::new(),
             None,

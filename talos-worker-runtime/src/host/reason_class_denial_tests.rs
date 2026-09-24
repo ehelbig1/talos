@@ -56,7 +56,10 @@ fn ctx_with(world: CapabilityWorld, allowed_hosts: Vec<String>) -> TalosContext 
     TalosContext::new(
         world,
         allowed_hosts,
-        vec![],
+        ["GET", "POST", "PUT", "PATCH", "DELETE"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
         128,
         HashMap::new(),
         None,

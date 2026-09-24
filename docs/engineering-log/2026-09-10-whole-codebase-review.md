@@ -8476,3 +8476,225 @@ pin covers the PASS-THROUGH.
 - **`docs/security/ai-injection-audit-2026-07-20.md`** still reads *"Mutating
   host calls | write ceilings at one choke point | now enforced"*. It is a DATED
   audit record and was true on its date; rewriting it would be rewriting history.
+
+---
+
+## EJ (2026-09-24) — `allowed_methods` was the one module grant where declaring nothing granted everything
+
+### Where this came from
+
+Not from a failure. From the question EI's own answer raised: *is verb-based
+read/write classification the best way to handle this?* Measuring that produced
+a sharper finding one layer down — the HTTP leg of the write ceiling is mostly
+redundant with a control that is already per-module and already correct-shaped
+(`allowed_methods`), **except** where that control declares nothing, because
+declaring nothing meant allow-everything.
+
+### The asymmetry, and its precedent one file away
+
+A module carries three grants. Two deny on empty:
+
+| grant | empty means | enforced by |
+|---|---|---|
+| `allowed_hosts` | **deny all** | `host/webhook.rs` refuses outright on an empty list |
+| `allowed_secrets` | **deny all** | `vault_path_permitted` returns `false` |
+| `allowed_methods` | **allow every verb** | four hand-rolled `!is_empty() && …` gates |
+
+CLAUDE.md already named this as anomalous. What it did not say is that the
+correct shape was sitting in the same file family the whole time: `webhook.rs`
+denies on an empty *host* list twelve lines above where it admitted an empty
+*method* list.
+
+### Four copies and a hole
+
+The test was spelled out four times — `http::fetch`, `http::fetch_all`,
+`graphql::execute`, `webhook::send` — each as
+`!allowed.is_empty() && !allowed.iter().any(…)`. Four copies of a security
+predicate is the defect this repo keeps naming, so the fix is ONE home:
+`talos_workflow_job_protocol::method_permitted`, placed beside its sibling
+`vault_path_permitted` because both binaries hold module grants and must agree
+on what one means.
+
+**And there was a fifth surface with no gate at all.** `http_stream::connect`
+never consulted `allowed_methods`. That did not matter while empty meant
+allow-all; it mattered the moment the other four started denying, because
+"an undeclared module cannot make HTTP calls" would have been **false** — it
+could still open an SSE read channel. An SSE connect is a GET (the WIT
+`connect(url, headers)` carries no method), so that is the verb it must now
+declare.
+
+### No wildcard, and the reason is a measurement
+
+`allowed_secrets` needs `["*"]` because the vault key space is unbounded. The
+method space is **closed at five** — `wit/talos.wit`'s `enum method` is exactly
+`get, post, put, delete, patch` — so "every verb" is spelled by listing five
+strings. The one module on this fleet that uses every verb already writes
+`{GET,POST,PUT,PATCH,DELETE}`, which is the shape proving enumeration is
+natural. A wildcard would add a second spelling and a footgun to a bounded set
+for no expressiveness gained, and it would quietly re-create allow-by-accident
+under a new name. `a_star_is_not_a_wildcard_here_unlike_allowed_secrets` pins
+both halves: `*` grants nothing here, and — the CONTRAST that makes the
+asymmetry deliberate rather than an oversight — `*` *is* the documented
+wildcard for secrets.
+
+### Blast radius: zero, triangulated three ways
+
+A fail-closed flip on a grant that 63 of 90 HTTP-capable modules already
+declare needed measuring in every population it could touch, not one.
+
+1. **Installed modules on this fleet.** Of 27 modules in a world above
+   `Minimal` with an empty `allowed_methods`, **0** call any HTTP surface —
+   checked with a deliberately loose predicate (`fetch(`, `::send(`,
+   `execute(`, `connect(`) and with `source_code IS NULL` counted at 0, so
+   there was nowhere to hide. They are LLM, memory, classify and approval
+   modules inheriting the HTTP imports from their world without using them.
+2. **Production context constructions.** Of 29 `TalosContext::new` sites, 24
+   pass an empty method list and exactly **one is production** —
+   `runtime.rs`'s `run_sandbox` / `test_module` path. Its `allowed_hosts` is
+   `vec![]` too, and the host gates run BEFORE the method gate (`http.rs`
+   269/298 before 625), so it is unreachable past its own deny-all. It is left
+   empty deliberately: deny-all on both axes is what that path means.
+3. **Shipped catalog templates** — the population that speaks for OTHER
+   deployments, since every deployment seeds from the same catalog. Of 75
+   templates, 44 call HTTP and all 44 declare their methods; 31 make no HTTP
+   call. **0 break.**
+
+It is not zero in general, and the refusal says so rather than softening it: a
+deployment holding an undeclared HTTP-calling module loses that call,
+fail-closed, with a sentence naming `update_module_methods`.
+
+### My own measurement was wrong once, in the reassuring direction's opposite
+
+The first run of the catalog scan reported **10 templates would break**,
+contradicting the DB's zero. The DB was right. My scan concatenated every `.rs`
+under each template directory, including the **generated** `src/bindings.rs`,
+which declares every host interface of the module's world whether or not the
+module calls it — so `redis-cache` "called" `http::fetch` because its bindings
+file names it. Excluding generated bindings gives 0. Two contradicting
+measurements are a signal to re-read the instrument, and the loud direction is
+not automatically the true one.
+
+### What else had to move, and the class it belongs to
+
+Seven prose sites asserted "empty = allow all", including the **operator-facing
+`update_module_methods` tool description**, which would have told an operator
+the opposite of what the code does. Also `methods_are_read_only`'s doc comment,
+which explained `!is_empty()` by pointing at `host/http.rs` and saying an empty
+list means "allow every method" *there* — naming the exact file this package
+changed. Its VERDICT is unchanged and still right, for the opposite reason: an
+undeclared module makes no HTTP call, so there is nothing for a transient retry
+to re-send.
+
+One pre-existing error surfaced on the way: a fixture comment in `http.rs`
+called the *methods* argument an "empty secret grant" — the secrets argument is
+the `HashMap::new()` two lines below. Corrected where it sat.
+
+### The test that proves the behaviour change is a test that already existed
+
+`post_not_in_allowed_methods_is_refused` carried, as a CONTROL, the assertion
+that an empty list PASSES the gate — i.e. the old rule, written down. It is now
+`an_undeclared_method_list_refuses_the_send`, and that flip is the
+behaviour-change proof; the POST-declared control stays so the refusal cannot
+pass because the gate refuses everything.
+
+Twenty-three test fixtures were updated to declare the verbs they use, which is
+what a real module must now do — so the fixtures became more faithful, not less.
+They are fixtures, not assertions: each was exercising SSRF, breaker,
+reason-class or SSE behaviour and took the allow-all shortcut. Classified by
+running `strip_test_modules` over each site rather than by assuming.
+
+### Guards
+
+- `method_permitted_tests` (6) over the predicate: empty denies every verb, a
+  CONTROL that the same verbs pass once declared, partial declarations,
+  case-insensitivity preserved from all four gates it replaced, the no-wildcard
+  rule with the `allowed_secrets` contrast, and the remedy naming the tool.
+- `method_allowlist_tests` (10) drives the **production host functions** at all
+  five gates — five refusals, four controls proving a declared verb carries the
+  call past the method gate (a guard at the primitive cannot see a call site:
+  checks 74b/79b, the lesson EE's M8, EG's G6 and EC's Q5 each paid for) — plus
+  a TEXTUAL pin (stated) counting call sites per file and asserting the old
+  hand-rolled shape is gone from all four.
+- The pin's needles are ASSEMBLED, because EI's equivalent pin reported three
+  call sites for two gates before its needles were built from parts. Same trap,
+  one package later.
+- EI's detail pin extended for the clause this package added.
+
+### No lint check; `--count` stays 97
+
+*"A file with an egress gate must name the shared predicate"* was built and
+measured: **4 findings on a pristine `origin/main` worktree, 0 on the fixed
+tree**, 100% precision. Rejected anyway on two counts this repo has rejected on
+before: the population is FOUR files, below #765's bar; and it is FILE-scoped,
+so a file naming the predicate in a comment while a gate hand-rolls the test
+satisfies it. The source pin counts call sites per file AND forbids the old
+shape, so it is strictly stronger and costs no check number.
+
+### The one-line EI fix, and why it belongs here
+
+EI's `WRITE_CEILING_VERB_DETAIL` ended *"raise the actor's write ceiling
+deliberately"* and stopped — the misleading-report class inside the fix for the
+misleading-report class. `max_write_ceiling` is ONE scalar over fifteen gated
+ops, so raising it to clear one INFERRED HTTP refusal also clears every
+CATEGORICAL op the actor's capability world grants. Measured for an `http-node`
+actor: `webhook-send`, `email-send`, `messaging-publish`/`-request`.
+
+The sentence does not imply those are equally exposed, because measuring said
+they are not: `webhook-send` stays bounded by `allowed_hosts`, and `email-send`
+is refused outright above that gate for a tier-1 actor (`email.rs` — *"the
+privacy ceiling forbids the operation, not just the host"*). The one with no
+other control is the NATS publish. So the detail names the CLASS and points at
+`get_module_info`'s `write_gated_ops` rather than enumerating a list that goes
+stale per world.
+
+That measurement also corrected a claim I had been about to make about my own
+Plaid workaround — that granting `write` turned off `email::send`'s only
+control. It did not, for that actor, because it is tier-1. The layered axes
+contained everything except the NATS publish.
+
+### EJ, continued — the fourth population, found by CI
+
+The blast radius was measured in three populations and every one was zero:
+installed modules, production `TalosContext::new` sites, shipped catalog
+templates. CI found a fourth, and the interesting part is not that a fixture
+was stale but that my enumerator could not see the fixtures at all.
+
+Test-vs-production was classified by running `strip_test_modules` over each
+call site. That function finds a column-0 `#[cfg(test)]` region inside a `src/`
+file. A `tests/`-dir binary in a DEPENDENT crate has no such marker anywhere —
+every line of it is production-shaped text — so the enumeration did not
+misclassify those sites, it never enumerated them. The "29 `TalosContext::new`
+sites" I reported is one crate's count; the workspace holds **34**, and the
+other five are in `worker/tests/`.
+
+Two of the five broke, and the second is the one worth carrying:
+
+* `sandbox_security_tests::ssrf_allows_public_ip` — a shared `make_context_with`
+  helper with an empty method list, so a GET to `8.8.8.8` was refused by the
+  method gate and the test read it as the SSRF gate blocking a public IP.
+* `tier1_llm_enforcement_tests::tier2_allows_fetch_to_anthropic_when_host_allowlisted`
+  — a POSITIVE CONTROL. Its seven tier-1 siblings all still passed, because the
+  tier gate fires above the method gate; the one test proving a tier-2 actor
+  *does* reach the host is the one that sits below it. Its panic message reads
+  *"the tier gate is incorrectly tripping on Tier2 — a regression"*, so a reader
+  arriving at this failure would have been sent to the wrong control entirely.
+  A positive control is exactly the test a fail-closed flip breaks, and exactly
+  the one whose failure text is written about a different mechanism.
+
+The other three stay empty deliberately: a `Minimal`-world memory-limiter
+fixture and two that reach no gate. An empty list is now the honest declaration
+for a module that makes no gated call, and declaring five verbs there would
+claim coverage the test does not exercise.
+
+Proof is pre/post against the real tree rather than mutation — both tests RED
+before the fixture edit and GREEN after. The per-binary counts are the second
+half of that proof: 36→37 and 7→8, so nothing flipped the other way, i.e. no
+test in either binary had been passing BECAUSE the method gate refused.
+
+**The gate-sequence lesson generalises past this package.** `cargo test -p
+<touched crates>` runs the crates I edited; `cargo check --workspace
+--all-targets` compiles every dependent crate's test binaries and runs none of
+them. Between the two, five fixtures were built and never executed, and the
+gates were green. A behaviour change in a library crate needs the DEPENDENT
+crates' `tests/` binaries executed, not merely built — and `strip_test_modules`
+is the wrong instrument for finding them.
