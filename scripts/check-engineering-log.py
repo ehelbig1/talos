@@ -70,6 +70,7 @@ from pathlib import Path
 BASES = [
     ("d5e3bfbc79aab7398448721b4a1ed47600e27400", "2026-09-09: engineering-log narrative -> docs/engineering-log/<class>.md"),
     ("722c58e22081a5779f96ed9b2ada6f991aaf507a", "2026-09-22: whole-codebase-review package bullets -> the review archive"),
+    ("6b7cd9f3f554209dc43be21c79d80a4e02d0a146", "2026-09-24: post-DN package bullets (DO..EO) compressed to decisions only"),
 ]
 ARCHIVE = Path("docs/engineering-log")
 CLAUDE = Path("CLAUDE.md")
