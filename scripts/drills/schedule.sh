@@ -48,7 +48,8 @@ LOG="$LOG_DIR/backup-drill.log"
 # resolve; if one is missing the run fails loudly at step 0b, not silently.
 # shellcheck source=../lib/launchd-path.sh
 source "$REPO_ROOT/scripts/lib/launchd-path.sh"
-SCHEDULED_TOOLS=(cargo docker)
+# shellcheck source=../lib/offhost-env.sh
+source "$REPO_ROOT/scripts/lib/offhost-env.sh"
 # Sunday 03:00 local. Sunday because a failure then leaves a full working week
 # to fix it before the 14-day threshold.
 WEEKDAY=0
@@ -74,6 +75,18 @@ case "$DRILL_SOURCE" in
     *) printf 'TALOS_DRILL_SCHEDULE_SOURCE must be artifact, b2 or live, got %s\n' \
         "$DRILL_SOURCE" >&2; exit 1 ;;
 esac
+
+# The tool list is DERIVED from the source, not fixed, because `b2` runs one
+# command the other two never do. `--source b2` fetches through the `aws` CLI
+# (talos-offhost-backup/src/aws.rs: B2 is addressed as S3, and credentials
+# reach `aws` through the ENVIRONMENT so they are structurally absent from
+# argv). A scheduled b2 drill whose PATH cannot resolve `aws` fails exactly
+# the way the 2026-09-14 defect failed `cargo` — at `env: aws: No such file
+# or directory`, weekly, with `status` still reporting "✓ scheduled".
+# Listing it unconditionally would be the other error: it would refuse to
+# schedule an `artifact` drill on a host that has no reason to own `aws`.
+SCHEDULED_TOOLS=(cargo docker)
+[[ "$DRILL_SOURCE" == "b2" ]] && SCHEDULED_TOOLS+=(aws)
 
 red()   { printf '\033[31m%s\033[0m\n' "$*"; }
 green() { printf '\033[32m%s\033[0m\n' "$*"; }
@@ -138,6 +151,47 @@ render_escrow_env() {
         printf '    <key>TALOS_DRILL_ESCROW_TIMEOUT_SECS</key><string>%s</string>\n' \
             "$(xml_escape "$TALOS_DRILL_ESCROW_TIMEOUT_SECS")"
     fi
+
+    # ── The off-host job's environment. ───────────────────────────────
+    #
+    # `--source b2` is the only mode that talks to the bucket, and until
+    # 2026-09-24 this function carried nothing for it: a
+    # TALOS_DRILL_SCHEDULE_SOURCE=b2 install rendered a plist with no age
+    # passphrase, no bucket, no endpoint and no region, so the job died
+    # weekly at backup-restore.sh's "no age passphrase source configured"
+    # and the leg that answers "does anything survive losing this disk" had
+    # never run once. The header above already called b2 "the upgrade path
+    # once the off-host chain and its age passphrase are wired" — this is
+    # the wiring.
+    #
+    # The list has ONE home (scripts/lib/offhost-env.sh), shared with
+    # scripts/offhost-backup/schedule.sh: both address the same bucket with
+    # the same credentials, and that file is also where the rule lives that
+    # AWS_SECRET_ACCESS_KEY is never propagated.
+    #
+    # Emitted whenever the variables are set, not gated on DRILL_SOURCE: the
+    # escrow block above is unconditional for the same reason, and silently
+    # dropping a value the operator did set is worse than carrying one the
+    # run will ignore.
+    render_offhost_plist_env
+}
+
+# Refuse a pair where BOTH the command and the file form are set.
+#
+# backup-restore.sh dies on exactly this for both pairs, and its reason is
+# that resolving by precedence "would silently ignore one of them — and the
+# one that loses is the FILE, the branch that carries the containment
+# checks". Catching it HERE costs the operator one line at install; catching
+# it at 03:00 on a Sunday costs a week. This is the one place a refusal beats
+# the warn-and-install treatment the MISSING case gets: a missing secret is
+# an operator act still to come, a contradictory pair is already wrong.
+assert_pair_exclusive() { # <label> <cmd-value> <file-value> <cmd-name> <file-name>
+    if [[ -n "$2" && -n "$3" ]]; then
+        red "✗ refusing to schedule: both $4 and $5 are set."
+        red "  Set exactly one. The drill refuses this pair too, so a plist carrying"
+        red "  both renders a job that dies every week at step 0b ($1)."
+        exit 1
+    fi
 }
 
 render_plist() {
@@ -194,6 +248,12 @@ report_scheduled_path() {
 
 # Resolve the job's PATH or refuse. Shared by `install` and `render`.
 resolve_scheduled_path() {
+    assert_pair_exclusive "KEK escrow" \
+        "${TALOS_DRILL_ESCROW_KEY_CMD:-}" "${TALOS_DRILL_ESCROW_KEY_FILE:-}" \
+        TALOS_DRILL_ESCROW_KEY_CMD TALOS_DRILL_ESCROW_KEY_FILE
+    assert_pair_exclusive "off-host age passphrase" \
+        "${TALOS_OFFHOST_AGE_PASSPHRASE_CMD:-}" "${TALOS_OFFHOST_AGE_PASSPHRASE_FILE:-}" \
+        TALOS_OFFHOST_AGE_PASSPHRASE_CMD TALOS_OFFHOST_AGE_PASSPHRASE_FILE
     if ! SCHEDULED_PATH="$(launchd_path_for "${SCHEDULED_TOOLS[@]}")"; then
         red "✗ refusing to schedule: the drill runs ${SCHEDULED_TOOLS[*]}, and at least one"
         red "  is not on this shell's PATH (named above). A LaunchAgent that cannot find"
@@ -235,6 +295,24 @@ install)
         yellow "    Leaving it as-is means TalosBackupRestoreDrillFailed fires permanently."
         yellow "    That is TRUE — you currently cannot prove recoverability unattended — but a"
         yellow "    permanently-red alert trains you to ignore red. Fix it or unschedule."
+    fi
+    # The b2 leg needs a SECOND secret, and it is worth saying separately:
+    # a green `artifact` drill and a wired escrow key tell an operator
+    # nothing about whether this one can run.
+    if [[ "$DRILL_SOURCE" == "b2" ]]; then
+        if [[ -n "${TALOS_OFFHOST_AGE_PASSPHRASE_CMD:-}${TALOS_OFFHOST_AGE_PASSPHRASE_FILE:-}" ]]; then
+            green "  off-host age passphrase propagated (command/path only, never the passphrase)."
+        else
+            red   "  ⚠ NO OFF-HOST AGE PASSPHRASE — this b2 drill WILL FAIL every week."
+            yellow "    --source b2 opens age-encrypted archives; without the passphrase it dies"
+            yellow "    at '[1/8] fetching backup artifacts' and certifies nothing. Supply ONE of:"
+            yellow "      TALOS_OFFHOST_AGE_PASSPHRASE_CMD='op read \"op://Private/Talos age backup/password\"' \\"
+            yellow "        make drill-schedule"
+            yellow "      TALOS_OFFHOST_AGE_PASSPHRASE_FILE=/Volumes/escrow/talos-age.pass make drill-schedule"
+        fi
+        yellow "  AWS credentials are NOT in the plist, by design: a plist carries a command or"
+        yellow "  a path, never a key. The scheduled run reads them the way \`aws\` already does"
+        yellow "  (~/.aws/credentials), so confirm that file is readable by your login session."
     fi
     ;;
 uninstall)
