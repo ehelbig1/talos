@@ -2966,9 +2966,11 @@ pub fn validate_prepared_with_children(
             // those nodes were declared GET/HEAD-only, and 6 of the 23
             // workflows were flagged ENTIRELY on read-only nodes.
             //
-            // An UNDECLARED `allowed_methods` stays flagged: empty means
-            // "allow every method" at the worker, so it is unknown, not safe
+            // An UNDECLARED `allowed_methods` stays flagged: empty is an
+            // ABSENT declaration, so it is unknown, not safe
             // (`methods_are_read_only` states that once, for both callers).
+            // Until 2026-09-24 empty also meant "allow every method" at the
+            // worker; it now denies every verb. The verdict is unchanged.
             let side_effecting_ids: std::collections::HashSet<Uuid> = template_rows
                 .iter()
                 .filter(|r| module_is_side_effecting(&r.allowed_hosts, &r.allowed_methods))
@@ -6084,9 +6086,11 @@ mod disabled_retry_tests {
         }
     }
 
-    /// An EMPTY `allowed_methods` reads as "allow every verb" at the worker's
-    /// enforcement point, so an http-world module that declares none is
-    /// UNKNOWN, not read-only, and its default is 0. Pinned separately from
+    /// An EMPTY `allowed_methods` is an ABSENT declaration, so an http-world
+    /// module that declares none is UNKNOWN, not read-only, and its default
+    /// is 0. (It read as "allow every verb" at the worker until 2026-09-24
+    /// and denies every verb now; the classification is the same either
+    /// way.) Pinned separately from
     /// the loop above because this is the one asymmetry in the three
     /// declaration lists and the easiest to "simplify" away.
     #[test]

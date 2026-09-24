@@ -2729,6 +2729,37 @@ pub fn method_permitted(allowed: &[String], method: &str) -> bool {
     !allowed.is_empty() && allowed.iter().any(|m| m.eq_ignore_ascii_case(method))
 }
 
+/// Every verb the WIT `enum method` can carry, in one place.
+///
+/// NOT a wildcard and not a default for a MODULE: [`method_permitted`] has no
+/// `["*"]` and an installed module must declare what it uses. This exists
+/// because the set is CLOSED at five (`wit/talos.wit`), so "every verb" is
+/// spelled by listing five strings — and a spelling repeated by hand is a
+/// spelling that drifts.
+///
+/// The one caller that legitimately wants all five is the SANDBOX
+/// (`run_sandbox`), where the operator supplies both the code and the host
+/// allowlist in the same call, so the method axis bounds nothing the host axis
+/// does not already bound. See [`sandbox_default_methods`].
+pub const ALL_HTTP_METHODS: [&str; 5] = ["GET", "POST", "PUT", "PATCH", "DELETE"];
+
+/// The method grant an ephemeral sandbox run gets when the caller names none.
+///
+/// **Deliberately permissive, and it is the one place in this family that is.**
+/// `run_sandbox` compiles and runs operator-supplied code against an
+/// operator-supplied `allowed_hosts` list in a single call: there is no third
+/// party for the method axis to protect, and the host axis — which still
+/// defaults to deny-all — is the bound that matters. Defaulting this closed
+/// instead made `run_sandbox` unable to issue ANY request, with no parameter
+/// to open it, which is what shipped on 2026-09-24 and is what this repairs.
+///
+/// An INSTALLED module gets no such default: it inherits its template's
+/// declaration, or it declares its own, or it is refused.
+#[must_use]
+pub fn sandbox_default_methods() -> Vec<String> {
+    ALL_HTTP_METHODS.iter().map(|m| (*m).to_string()).collect()
+}
+
 /// The one sentence every method refusal gives the module author.
 ///
 /// The refusal has to name the FIX, not just the rule: an author told only
@@ -3718,12 +3749,12 @@ pub struct JobRequest {
     pub cancellation_token: Option<String>,
 
     pub allowed_hosts: Vec<String>,
-    /// HTTP method allowlist. Empty = allow all methods. Non-empty = restrict to listed methods.
+    /// HTTP method allowlist. EMPTY DENIES EVERY VERB; non-empty = only those.
     ///
-    /// Note the asymmetry with the two neighbouring lists: an empty
-    /// `allowed_hosts` DENIES all hosts and an empty `allowed_secrets`
-    /// DENIES all secrets, but an empty `allowed_methods` ALLOWS every
-    /// verb. Because of that, the retry classifier
+    /// The asymmetry this doc used to describe is GONE as of 2026-09-24: an
+    /// empty `allowed_hosts` denies all hosts, an empty `allowed_secrets`
+    /// denies all secrets, and an empty `allowed_methods` now denies every
+    /// verb too ([`method_permitted`]). The retry classifier
     /// (`talos_workflow_engine_core::default_max_retries_for_module`)
     /// treats an empty list as UNKNOWN rather than read-only and grants
     /// no default retries — read-only has to be declared.
@@ -11046,5 +11077,48 @@ mod method_permitted_tests {
         assert!(METHOD_ALLOWLIST_REMEDY.contains("empty"));
         assert!(METHOD_ALLOWLIST_REMEDY.contains("allowed_hosts"));
         assert!(METHOD_ALLOWLIST_REMEDY.contains("allowed_secrets"));
+    }
+}
+
+#[cfg(test)]
+mod sandbox_default_method_tests {
+    use super::*;
+
+    /// The five-verb list and the gate must agree: every verb the constant
+    /// names must be PERMITTED by a grant of that constant, and a grant of it
+    /// must permit nothing else (there is no sixth verb in the WIT enum).
+    #[test]
+    fn the_constant_is_exactly_what_the_gate_permits() {
+        let all = sandbox_default_methods();
+        assert_eq!(all.len(), 5, "the WIT method enum is closed at five");
+        for verb in ALL_HTTP_METHODS {
+            assert!(
+                method_permitted(&all, verb),
+                "{verb} is in ALL_HTTP_METHODS but the gate refuses it"
+            );
+        }
+        // A control that can fail: a verb OUTSIDE the closed set must not be
+        // permitted, so this cannot pass by the gate permitting everything.
+        assert!(
+            !method_permitted(&all, "HEAD"),
+            "HEAD is not in the WIT enum and must not be permitted"
+        );
+    }
+
+    /// The sandbox default is DELIBERATELY the opposite of a module's.
+    ///
+    /// If this ever reads equal, `run_sandbox` has silently inherited the
+    /// installed-module posture and can issue no request at all — which is
+    /// exactly what shipped on 2026-09-24.
+    #[test]
+    fn the_sandbox_default_is_not_the_module_default() {
+        let sandbox = sandbox_default_methods();
+        let module: Vec<String> = Vec::new();
+        assert_ne!(sandbox, module);
+        assert!(method_permitted(&sandbox, "GET"));
+        assert!(
+            !method_permitted(&module, "GET"),
+            "an installed module's empty grant must still DENY"
+        );
     }
 }

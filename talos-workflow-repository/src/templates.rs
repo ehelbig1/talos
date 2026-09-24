@@ -812,8 +812,12 @@ pub struct NodeTemplateRow {
     /// operator override and is honored verbatim.
     pub max_retries: i32,
     /// HTTP method allowlist — input to the method-aware retry default.
-    /// An EMPTY list means "allow every verb" at the worker's enforcement
-    /// point, so the retry default reads it as UNKNOWN and stamps 0.
+    /// An EMPTY list DENIES every verb at the worker's five enforcement
+    /// points (`talos_workflow_job_protocol::method_permitted`, 2026-09-24;
+    /// before that date it meant "allow every verb"). The retry default
+    /// reads empty as UNKNOWN and stamps 0 either way — the VERDICT did not
+    /// change, only its reason: an undeclared module now makes no HTTP call
+    /// at all, so there is nothing for a transient retry to re-send.
     /// Read-only retries require a declared `["GET"]`/`["GET","HEAD"]`.
     pub allowed_methods: Vec<String>,
     /// Capability world — input to the method-aware retry default, and the

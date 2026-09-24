@@ -159,6 +159,8 @@ pub mod configuration;
 pub mod evaluation;
 pub mod executions;
 pub mod graph;
+#[cfg(test)]
+mod inherited_grants_pins;
 pub mod knowledge_graph;
 pub mod ml;
 pub mod modules;

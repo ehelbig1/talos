@@ -175,13 +175,17 @@ pub fn methods_are_read_only(allowed_methods: &[String]) -> bool {
 ///
 /// This function used to read an empty `allowed_methods` as read-only,
 /// because `[].iter().all(..)` is vacuously true. That made the platform
-/// disagree with itself: at the ENFORCEMENT point an empty list means
-/// "allow every method" (`talos-worker-runtime/src/host/http.rs` on both
-/// `fetch` and `fetch_all`, and `host/graphql.rs` for the always-POST
-/// GraphQL call), so an undeclared module may `POST`/`PUT`/`DELETE`/
-/// `PATCH` freely — and was nonetheless handed blind transient retries,
-/// which is exactly the non-idempotent re-fire this function exists to
-/// prevent. An absent declaration is an absence of evidence, so it now
+/// disagree with itself: at the ENFORCEMENT point an empty list MEANT
+/// "allow every method" until 2026-09-24 (`talos-worker-runtime`'s
+/// `host/http.rs` on both `fetch` and `fetch_all`, and `host/graphql.rs`
+/// for the always-POST GraphQL call), so an undeclared module could
+/// `POST`/`PUT`/`DELETE`/`PATCH` freely — and was nonetheless handed blind
+/// transient retries, which is exactly the non-idempotent re-fire this
+/// function exists to prevent. Empty now DENIES every verb at all five
+/// gates (`talos_workflow_job_protocol::method_permitted`), so the same
+/// undeclared module makes no HTTP call at all — the verdict below is
+/// unchanged and its reason is inverted. An absent declaration is an
+/// absence of evidence, so it now
 /// resolves to 0.
 ///
 /// Note that `allowed_methods` is the ODD ONE OUT among the per-module
@@ -330,9 +334,11 @@ mod read_only_declaration_tests {
         assert!(!methods_are_read_only(&m(&["POST"])));
     }
 
-    /// The load-bearing case: empty means "allow every method" at the
-    /// worker, so it is UNKNOWN. `.all()` over an empty slice is vacuously
-    /// true, which is the trap.
+    /// The load-bearing case: empty is an ABSENT declaration, so it is
+    /// UNKNOWN. `.all()` over an empty slice is vacuously true, which is the
+    /// trap. (Until 2026-09-24 empty also meant "allow every method" at the
+    /// worker; it now DENIES every verb. Either way it is not a declaration
+    /// of read-only intent, which is what this asserts.)
     #[test]
     fn undeclared_methods_are_not_read_only() {
         assert!(!methods_are_read_only(&[]));
@@ -417,10 +423,11 @@ mod retry_resolution_tests {
     #[test]
     fn undeclared_method_list_is_unknown_and_fails_closed() {
         // An EMPTY `allowed_methods` is an ABSENT declaration, not a
-        // read-only one. `[].iter().all(..)` is vacuously true, and the
-        // worker's enforcement point reads empty as "allow every method"
-        // (`host/http.rs` fetch + fetch_all, `host/graphql.rs`), so an
-        // undeclared module can POST. Resolve it to 0.
+        // read-only one. `[].iter().all(..)` is vacuously true. Until
+        // 2026-09-24 the worker read empty as "allow every method", so an
+        // undeclared module could POST; it now DENIES every verb at all five
+        // gates, so the module makes no call at all. Absent evidence either
+        // way — resolve it to 0.
         //
         // If this assertion fails: the classifier has started granting
         // retries on the strength of an absent declaration again — check

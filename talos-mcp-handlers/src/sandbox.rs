@@ -173,7 +173,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "allowed_methods": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "HTTP method allowlist (e.g. ['GET', 'POST']). Empty = allow all methods AND classifies the module UNKNOWN (not read-only) for the method-aware retry default, so nodes created from it get retry_count 0. Declare ['GET'] on a read-only module to enforce read-only egress AND earn transient retries."
+                        "description": "HTTP method allowlist (e.g. ['GET', 'POST']). EMPTY DENIES EVERY VERB at all five egress gates (2026-09-24; before that date empty meant allow-all). There is no wildcard — the set is closed at five, so 'every verb' is ['GET','POST','PUT','PATCH','DELETE'] written out. Empty also classifies the module UNKNOWN (not read-only) for the method-aware retry default, so nodes created from it get retry_count 0. Declare ['GET'] on a read-only module to enforce read-only egress AND earn transient retries."
                     },
                     "fuel_budget": {
                         "type": "object",
@@ -232,6 +232,11 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                         "type": "array",
                         "items": { "type": "string" },
                         "description": "Allowed HTTP hosts (default: [] deny-all for all worlds). Required for HTTP-capable modules. Use ['*'] for unrestricted."
+                    },
+                    "allowed_methods": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "HTTP verbs this sandbox may issue. DEFAULT IS ALL FIVE (GET, POST, PUT, PATCH, DELETE) — deliberately, and deliberately UNLIKE an installed module, where an empty allowed_methods DENIES every verb. Here the caller supplies both the code and allowed_hosts in the same call, so the method axis bounds nothing the host axis does not; allowed_hosts still defaults to deny-all, which is the bound that matters. Pass the narrow list your module will actually declare (e.g. ['GET']) to rehearse the installed posture faithfully."
                     },
                     "allowed_secrets": {
                         "type": "array",
@@ -410,7 +415,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "update_module_methods",
-            "description": "Update the allowed_methods list for a compiled module. Controls which HTTP verbs the module may issue (e.g. GET / POST / PATCH). Empty list = allow all methods AND forfeits the automatic transient-retry default (an undeclared list is treated as UNKNOWN, so nodes created from the module default to retry_count 0); declare [\"GET\"] to get read-only retries. Companion to update_module_hosts.",
+            "description": "Update the allowed_methods list for a compiled module. Controls which HTTP verbs the module may issue (e.g. GET / POST / PATCH). EMPTY DENIES EVERY VERB at all five egress gates (http fetch / fetch_all, graphql, webhook, SSE connect) — the same rule allowed_hosts and allowed_secrets have always had; before 2026-09-24 empty meant allow-all, which made this the one grant where declaring nothing granted everything. There is no wildcard: the verb set is closed at five, so \"every verb\" is [\"GET\",\"POST\",\"PUT\",\"PATCH\",\"DELETE\"] written out. Empty also forfeits the automatic transient-retry default (an undeclared list is UNKNOWN, so nodes created from the module default to retry_count 0); declare [\"GET\"] to get read-only retries. Companion to update_module_hosts.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -421,7 +426,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "allowed_methods": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "New allowed_methods list. Each item is an HTTP verb (GET, POST, PUT, PATCH, DELETE, HEAD). Empty list = allow all methods, and the module is then classed UNKNOWN (not read-only) by the retry default, so new nodes get retry_count 0."
+                        "description": "New allowed_methods list. Each item is an HTTP verb (GET, POST, PUT, PATCH, DELETE). EMPTY DENIES EVERY VERB — it does not mean \"unrestricted\"; to grant everything list all five. Empty also classes the module UNKNOWN (not read-only) for the retry default, so new nodes get retry_count 0."
                     }
                 },
                 "required": ["module_id", "allowed_methods"]
@@ -687,6 +692,40 @@ pub(crate) struct InProcessEgress {
 /// rules"). The actor's air-gap is kept and the controller's network is not
 /// exposed. An unreadable scope gets the same treatment: a gate that cannot
 /// read its rule refuses.
+/// The HTTP verbs an ephemeral `run_sandbox` execution may issue.
+///
+/// **This is the one grant on the sandbox path that defaults OPEN, and the
+/// reason is specific rather than general.** `run_sandbox` compiles and runs
+/// operator-supplied code against an operator-supplied `allowed_hosts` list in
+/// a single call. There is no third party for the method axis to protect: a
+/// caller who can choose the host and write the code can already choose the
+/// verb. The bound that matters on this path is `allowed_hosts`, which still
+/// defaults to deny-all.
+///
+/// An INSTALLED module gets the opposite default — an empty `allowed_methods`
+/// DENIES every verb (`talos_workflow_job_protocol::method_permitted`) — and
+/// the schema says so, because a sandbox that is quietly more permissive than
+/// the module it is rehearsing is a misleading rehearsal.
+///
+/// # Why this function exists rather than an `unwrap_or_else` at the call site
+///
+/// The call site needs a database, a compilation container and an `McpState`,
+/// so nothing can drive it in a unit test. The DECISION is pure, so it lives
+/// here where `sandbox_method_default_tests` drives it directly.
+///
+/// An EXPLICIT empty list is honoured verbatim: that is how a caller rehearses
+/// the deny-all posture an installed module gets, and treating it as "absent"
+/// would make that rehearsal impossible.
+#[must_use]
+pub(crate) fn resolve_sandbox_methods(args: &serde_json::Value) -> Vec<String> {
+    match args.get("allowed_methods") {
+        Some(serde_json::Value::Array(_)) => {
+            crate::utils::json_string_array_field_trimmed(args, "allowed_methods")
+        }
+        _ => talos_workflow_job_protocol::sandbox_default_methods(),
+    }
+}
+
 pub(crate) fn in_process_egress_posture(
     actor: ActorEgressRead,
     tier: talos_workflow_job_protocol::LlmTier,
@@ -1807,6 +1846,12 @@ async fn handle_run_sandbox(
     // MCP-243: trimmed variants for run_sandbox security allowlists.
     let allowed_hosts = crate::utils::json_string_array_field_trimmed(args, "allowed_hosts");
     let allowed_secrets = crate::utils::json_string_array_field_trimmed(args, "allowed_secrets");
+    // The method axis is the ONE grant on this path that defaults OPEN, and
+    // `resolve_sandbox_methods` is where that decision lives so a test can
+    // drive it. Absent argument => all five verbs; an explicitly supplied list
+    // is honoured verbatim, INCLUDING an explicitly empty one, which is how a
+    // caller rehearses the deny-all posture an installed module gets.
+    let allowed_methods = resolve_sandbox_methods(args);
 
     let rust_code = talos_workflow_creation_helpers::wrap_rust_code_with_talos_module(
         inner_code,
@@ -2115,7 +2160,7 @@ async fn handle_run_sandbox(
         .execute_job_with_full_features(
             &wasm_bytes,
             egress.allowed_hosts,    // allowed_hosts (posture-narrowed)
-            vec![],                  // allowed_methods
+            allowed_methods,         // see resolve_sandbox_methods
             128,                     // max_memory_mb
             payload,                 // input
             None,                    // execution_fs_dir
@@ -2425,6 +2470,11 @@ async fn handle_compile_template(
             };
 
             // Store as a module
+            // The four template-inherited grants travel as ONE value
+            // ([`talos_registry::InheritedGrants`]). This site carried
+            // `allowed_hosts` and dropped `allowed_methods` — free while an empty
+            // list meant allow-all, fatal since 2026-09-24.
+            let grants = template.inherited_grants();
             let module = talos_registry::WasmModule {
                 name: display_name.clone(),
                 // Force unique content_hash to prevent deduplication.
@@ -2438,10 +2488,10 @@ async fn handle_compile_template(
                 size_bytes: res.size_bytes,
                 max_fuel: 10_000_000,
                 max_memory_mb: 128,
-                allowed_hosts: template.allowed_hosts,
-                allowed_methods: vec![],
-                allowed_secrets: template.allowed_secrets,
-                requires_approval_for: template.requires_approval_for,
+                allowed_hosts: grants.allowed_hosts,
+                allowed_methods: grants.allowed_methods,
+                allowed_secrets: grants.allowed_secrets,
+                requires_approval_for: grants.requires_approval_for,
                 user_id: Some(user_id),
                 capability_world: inspection.capability_world,
                 imported_interfaces: inspection.imported_interfaces,
@@ -3138,7 +3188,13 @@ async fn handle_update_module_hosts(
     ))
 }
 
-/// Update the `allowed_methods` list for a module. Empty list = allow all.
+/// Update the `allowed_methods` list for a module.
+///
+/// An EMPTY list DENIES every verb since 2026-09-24
+/// (`talos_workflow_job_protocol::method_permitted`); it is not a way to
+/// grant everything. This is the tool the refusal itself names
+/// (`METHOD_ALLOWLIST_REMEDY`), so its description is operator-facing in the
+/// strongest sense: an operator arrives here BECAUSE a verb was refused.
 async fn handle_update_module_methods(
     req_id: Option<serde_json::Value>,
     args: &Value,
@@ -3183,7 +3239,7 @@ async fn handle_update_module_methods(
             return Some(mcp_error(
                 req_id,
                 -32602,
-                "allowed_methods is required (array of HTTP verbs; empty = allow all)",
+                "allowed_methods is required (array of HTTP verbs; an empty array DENIES every verb — to grant everything list all five)",
             ))
         }
     };
@@ -3420,6 +3476,12 @@ async fn handle_test_module(
                 .await
             {
                 Ok(template) => {
+                    // The four template-inherited grants travel as ONE value
+                    // ([`talos_registry::InheritedGrants`]). This site carried
+                    // `allowed_hosts` and dropped `allowed_methods` — free while an
+                    // empty list meant allow-all, fatal since 2026-09-24. Taken
+                    // BEFORE `precompiled_wasm` is moved out of `template`.
+                    let grants = template.inherited_grants();
                     let wasm_bytes = match template.precompiled_wasm {
                         Some(b) => b,
                         None => {
@@ -3441,10 +3503,10 @@ async fn handle_test_module(
                         size_bytes: 0,
                         max_fuel: 10_000_000,
                         max_memory_mb: 128,
-                        allowed_hosts: template.allowed_hosts,
-                        allowed_methods: vec![],
-                        allowed_secrets: template.allowed_secrets,
-                        requires_approval_for: template.requires_approval_for,
+                        allowed_hosts: grants.allowed_hosts,
+                        allowed_methods: grants.allowed_methods,
+                        allowed_secrets: grants.allowed_secrets,
+                        requires_approval_for: grants.requires_approval_for,
                         user_id: None,
                         capability_world: inspection.capability_world,
                         imported_interfaces: inspection.imported_interfaces,
@@ -5151,5 +5213,66 @@ mod test_surface_parity_pins {
             super::core_tier(talos_workflow_job_protocol::LlmTier::Tier2),
             talos_workflow_engine_core::LlmTier::Tier2
         ));
+    }
+}
+
+#[cfg(test)]
+mod sandbox_method_default_tests {
+    use super::resolve_sandbox_methods;
+    use serde_json::json;
+
+    /// The regression this package exists for: a sandbox run that names hosts
+    /// and no methods must still be able to issue a request.
+    #[test]
+    fn an_absent_argument_grants_all_five_verbs() {
+        let m = resolve_sandbox_methods(&json!({ "allowed_hosts": ["example.com"] }));
+        assert_eq!(m.len(), 5);
+        for verb in talos_workflow_job_protocol::ALL_HTTP_METHODS {
+            assert!(
+                talos_workflow_job_protocol::method_permitted(&m, verb),
+                "{verb} must be permitted on the default sandbox grant"
+            );
+        }
+    }
+
+    /// An EXPLICIT empty array is honoured verbatim — that is how a caller
+    /// rehearses the deny-all posture an installed module gets, and folding it
+    /// into "absent" would make that rehearsal impossible.
+    #[test]
+    fn an_explicit_empty_array_is_not_the_default() {
+        let m = resolve_sandbox_methods(&json!({ "allowed_methods": [] }));
+        assert!(
+            m.is_empty(),
+            "explicit [] must stay empty, not become all five"
+        );
+        assert!(!talos_workflow_job_protocol::method_permitted(&m, "GET"));
+    }
+
+    /// A declared narrow list is honoured and is NOT widened.
+    #[test]
+    fn a_declared_list_is_honoured_verbatim() {
+        let m = resolve_sandbox_methods(&json!({ "allowed_methods": ["GET"] }));
+        assert_eq!(m, vec!["GET".to_string()]);
+        assert!(talos_workflow_job_protocol::method_permitted(&m, "GET"));
+        assert!(
+            !talos_workflow_job_protocol::method_permitted(&m, "POST"),
+            "a narrow declaration must still refuse the verbs it omits"
+        );
+    }
+
+    /// A non-array value is not a declaration, so it falls to the default
+    /// rather than silently denying everything.
+    #[test]
+    fn a_non_array_value_falls_to_the_default() {
+        for bad in [
+            json!({"allowed_methods": "GET"}),
+            json!({"allowed_methods": null}),
+        ] {
+            assert_eq!(
+                resolve_sandbox_methods(&bad).len(),
+                5,
+                "a non-array allowed_methods must not read as an empty declaration"
+            );
+        }
     }
 }

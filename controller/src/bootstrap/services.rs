@@ -2242,12 +2242,14 @@ pub(crate) async fn seed_templates(
             .unwrap_or_default();
 
         // HTTP verb allowlist. Empty (field absent, or every entry unrecognised)
-        // reproduces the pre-2026-08-25 behaviour exactly: the column is written
-        // as `{}`, which the worker reads as "allow every verb". A declared list
-        // is ENFORCED at `host/http.rs` `fetch` / `fetch_all` and
-        // `host/graphql.rs`, so an under-declared manifest is a runtime denial —
-        // declare the union of verbs the template's source can issue, never a
-        // guess. Parsing lives next to the column it feeds; see
+        // used to reproduce the pre-2026-08-25 behaviour exactly: the column is
+        // written as `{}`, which the worker read as "allow every verb". Since
+        // 2026-09-24 `{}` DENIES every verb, so an empty result is now the
+        // STRICTEST outcome rather than the loosest. A declared list is ENFORCED
+        // at all five egress gates (`host/http.rs` `fetch` / `fetch_all`,
+        // `host/graphql.rs`, `host/webhook.rs`, `host/http_stream.rs`), so an
+        // under-declared manifest is a runtime denial — declare the union of
+        // verbs the template's source can issue, never a guess. Parsing lives next to the column it feeds; see
         // `parse_manifest_allowed_methods` for why an unknown verb is dropped
         // rather than skipping the whole template.
         let allowed_methods = talos_registry::reconcile::parse_manifest_allowed_methods(manifest);

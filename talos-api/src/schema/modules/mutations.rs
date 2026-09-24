@@ -268,12 +268,19 @@ impl ModulesMutations {
         };
 
         // 5. Store module with config as metadata
+        //
+        // The four template-inherited grants travel as ONE value. This site
+        // carried `allowed_hosts` and dropped `allowed_methods` — free while
+        // an empty list meant allow-all, fatal since 2026-09-24 — and it is
+        // the GraphQL twin of `compile_template`, the pair check 68 already
+        // caught once.
+        let grants = template.inherited_grants();
         let module = talos_registry::WasmModule {
             name: module_name.clone(),
             content_hash,
             capability_world,
             imported_interfaces,
-            allowed_methods: vec![],
+            allowed_methods: grants.allowed_methods,
             wasm_bytes,
             source_code: Some(source_code),
             template_id: Some(input.template_id),
@@ -282,9 +289,9 @@ impl ModulesMutations {
             size_bytes,
             max_fuel: 1_000_000,
             max_memory_mb: 128,
-            allowed_hosts: template.allowed_hosts.clone(),
-            allowed_secrets: template.allowed_secrets.clone(),
-            requires_approval_for: template.requires_approval_for.clone(),
+            allowed_hosts: grants.allowed_hosts,
+            allowed_secrets: grants.allowed_secrets,
+            requires_approval_for: grants.requires_approval_for,
             user_id: Some(user_id),
             oci_url: oci_url_opt,
             language: "rust".to_string(),

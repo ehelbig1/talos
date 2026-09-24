@@ -1708,6 +1708,56 @@ pub struct NodeTemplate {
     pub dependencies: Option<JsonValue>,
 }
 
+/// The four grants a module INHERITS from the template it was built from.
+///
+/// # Why this is a type and not four field copies
+///
+/// Five production writers build a `WasmModule` row from a `NodeTemplate`, all
+/// four of the template-derived ones through the same
+/// [`ModuleRegistry::get_template_for_user`]. Measured 2026-09-24, **four of
+/// the five carried `allowed_hosts` and dropped `allowed_methods`**:
+/// `compile_template` (MCP), `createModuleFromTemplate` (GraphQL — the twin
+/// that check 68 was written about, forgotten again), `restore_pinned_modules`
+/// and the replay service's template reconstruction.
+///
+/// That omission was FREE until 2026-09-24 and fatal after it. While an empty
+/// `allowed_methods` meant "allow every verb" the dropped field cost only the
+/// retry classification; since
+/// `talos_workflow_job_protocol::method_permitted` made empty mean DENY, each
+/// of those four paths mints a module that carries an egress host allowlist
+/// and can never issue a request against it — with a refusal telling the
+/// operator to declare verbs on a module whose template already declared them.
+///
+/// Grouping them makes the SET the unit that travels, so the next writer
+/// copies four fields or none. The guard against a fifth writer spreading it
+/// partially is `inherited_grants_pins`, which is textual and says so.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
+pub struct InheritedGrants {
+    /// Egress host allowlist. Empty DENIES every host.
+    pub allowed_hosts: Vec<String>,
+    /// HTTP method allowlist. Empty DENIES every verb (since 2026-09-24).
+    pub allowed_methods: Vec<String>,
+    /// Vault path allowlist. Empty DENIES every secret; `["*"]` is the wildcard.
+    pub allowed_secrets: Vec<String>,
+    /// Operations this module may not perform without an approval gate.
+    pub requires_approval_for: Vec<String>,
+}
+
+impl NodeTemplate {
+    /// The grants a module built from this template inherits, as one value.
+    ///
+    /// See [`InheritedGrants`] for why these four travel together.
+    pub fn inherited_grants(&self) -> InheritedGrants {
+        InheritedGrants {
+            allowed_hosts: self.allowed_hosts.clone(),
+            allowed_methods: self.allowed_methods.clone(),
+            allowed_secrets: self.allowed_secrets.clone(),
+            requires_approval_for: self.requires_approval_for.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct NodeTemplateRow {
     id: Uuid,
@@ -2212,7 +2262,11 @@ pub struct WasmModule {
     pub max_fuel: i64,
     pub max_memory_mb: i32,
     pub allowed_hosts: Vec<String>,
-    /// HTTP method allowlist. Empty = allow all methods. Non-empty = only those methods.
+    /// HTTP method allowlist. EMPTY DENIES EVERY VERB at all five egress gates
+    /// (`talos_workflow_job_protocol::method_permitted`, 2026-09-24 — before
+    /// that date empty meant allow-all, which is why four writers that built
+    /// a module row from a template dropped this field while carrying
+    /// `allowed_hosts`; see [`InheritedGrants`]). Non-empty = only those verbs.
     pub allowed_methods: Vec<String>,
     /// Secret allowlist. Empty = deny all. `["*"]` = allow all. Otherwise explicit names.
     pub allowed_secrets: Vec<String>,
@@ -2738,5 +2792,63 @@ mod wasm_cache_sweep_sql_tests {
         // Empty oci_url is "no oci_url".
         let err = classify_absent_wasm_bytes(Uuid::new_v4(), "x", Some(at), Some(""));
         assert!(err.downcast_ref::<ModuleBytesEvicted>().is_some());
+    }
+}
+
+#[cfg(test)]
+mod inherited_grants_tests {
+    use super::*;
+
+    fn template() -> NodeTemplate {
+        NodeTemplate {
+            id: Uuid::nil(),
+            name: "t".into(),
+            category: "Network".into(),
+            description: None,
+            config_schema: JsonValue::Null,
+            code_template: String::new(),
+            precompiled_wasm: None,
+            icon: None,
+            oci_url: None,
+            allowed_hosts: vec!["api.example.com".into()],
+            allowed_methods: vec!["GET".into(), "POST".into()],
+            allowed_secrets: vec!["stripe".into()],
+            requires_approval_for: vec!["email".into()],
+            max_retries: 0,
+            retry_backoff_ms: 0,
+            capability_world: "http-node".into(),
+            dependencies: None,
+        }
+    }
+
+    /// Every one of the four grants must survive the trip.
+    ///
+    /// The one that matters is `allowed_methods`: four of five writers dropped
+    /// it while carrying `allowed_hosts`, which since 2026-09-24 mints a module
+    /// holding an egress allowlist it can never use.
+    #[test]
+    fn all_four_grants_are_carried() {
+        let t = template();
+        let g = t.inherited_grants();
+        assert_eq!(g.allowed_hosts, t.allowed_hosts);
+        assert_eq!(g.allowed_methods, t.allowed_methods);
+        assert_eq!(g.allowed_secrets, t.allowed_secrets);
+        assert_eq!(g.requires_approval_for, t.requires_approval_for);
+    }
+
+    /// The fixture must be able to FAIL: the four values differ from each
+    /// other, so a constructor that filled every field from one source would
+    /// not pass the test above.
+    #[test]
+    fn the_four_grants_are_distinguishable() {
+        let g = template().inherited_grants();
+        assert_ne!(g.allowed_hosts, g.allowed_methods);
+        assert_ne!(g.allowed_methods, g.allowed_secrets);
+        assert_ne!(g.allowed_secrets, g.requires_approval_for);
+        assert!(
+            !g.allowed_methods.is_empty(),
+            "an empty methods fixture could not tell a carried grant from a \
+             dropped one — the whole defect this type exists for"
+        );
     }
 }

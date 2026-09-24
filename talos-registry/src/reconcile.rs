@@ -152,8 +152,21 @@ const HTTP_VERBS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "
 /// to [`CatalogUpsert::allowed_methods`].
 ///
 /// Returns an EMPTY vec when the field is absent, is not an array, or contains
-/// nothing recognisable — which reproduces the pre-2026-08-25 behaviour exactly,
-/// because the column is then written as `{}` (the worker's "allow every verb").
+/// nothing recognisable — which reproduced the pre-2026-08-25 behaviour exactly
+/// while `{}` meant "allow every verb" at the worker.
+///
+/// **That is no longer a no-op and the direction has inverted.** Since
+/// 2026-09-24 `{}` DENIES every verb
+/// (`talos_workflow_job_protocol::method_permitted`), so a manifest whose
+/// verbs are all unrecognised seeds a catalog row that can never egress —
+/// where before it seeded one that could egress with anything. Measured on
+/// the shipped catalog 2026-09-24: **0 of 75** templates declare an
+/// unrecognised verb, so the drop-don't-fail rule below is latent; and 4 of
+/// 75 declare `allowed_hosts` with no verbs at all, every one of them
+/// verified to make no `http::fetch`-family call (three are webhook
+/// listeners, one uses raw `wasi:sockets`, which this gate does not cover).
+/// Left alone deliberately: tightening those four manifests is a
+/// least-privilege review of the catalog, not a carrier fix.
 ///
 /// **Unknown verbs are dropped, not fatal.** This is the opposite of the
 /// `allowed_hosts` / `allowed_secrets` manifest handling, which skips the whole
@@ -196,8 +209,12 @@ pub struct CatalogUpsert<'a> {
     /// never wrote `modules.allowed_methods` for a shared catalog row — every
     /// catalog row sat permanently at the column default `{}`. At the worker's
     /// three enforcement points (`host/http.rs` `fetch` / `fetch_all`,
-    /// `host/graphql.rs`) an EMPTY list means **allow every verb**, so a catalog
-    /// row could issue any method regardless of what its template does. Catalog
+    /// `host/graphql.rs`) an EMPTY list meant **allow every verb** until
+    /// 2026-09-24, so a catalog row could issue any method regardless of what
+    /// its template does. (Since that date empty DENIES every verb, so the
+    /// same unbound column is now the opposite failure: a catalog row that
+    /// cannot issue any method at all. Binding the column is what fixes both.)
+    /// Catalog
     /// rows ARE dispatched directly by workflow nodes, not only via user copies:
     /// the shipped HTML-email sender is referenced by six enabled workflows and
     /// has no user copy at all. The sibling user-copy path
