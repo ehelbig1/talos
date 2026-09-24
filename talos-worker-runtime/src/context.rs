@@ -3889,9 +3889,12 @@ mod capability_denial_detail_tests {
             ),
             "{line}"
         );
-        // And the addition is the sentence that redirects the diagnosis.
+        // And the addition is the sentence that redirects the diagnosis: the
+        // RULE that refused, and the NARROW tool that lifts it (#942 — the
+        // detail used to point at the whole ceiling, which since #941 grants
+        // fifteen ops where three would do).
         assert!(line.contains("GET is the only read verb"), "{line}");
-        assert!(line.contains("allowed_methods"), "{line}");
+        assert!(line.contains("set_actor_http_verb_ceiling"), "{line}");
     }
 
     /// The CONTROL, so the assertion above cannot pass because every denial

@@ -830,6 +830,7 @@ async fn run_replays(
                 // gate governs live execution, which the actor binding
                 // stamps there.
                 talos_workflow_job_protocol::WriteCeiling::Write,
+                None, // http_verb_ceiling — inherit the permissive ceiling above
                 // Egress scope: replay is an operator-invoked diagnostic; no
                 // actor egress override → tier-derived default. (The tier gate
                 // via `llm_tier` still keeps stored Tier-1 data off external

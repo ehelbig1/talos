@@ -108,11 +108,12 @@ pub(crate) fn dedup_cacheable_status(status: u16) -> bool {
 pub(crate) const WRITE_CEILING_VERB_DETAIL: &str =
     "the write ceiling classifies by HTTP VERB (GET is the only read verb), so a read-only \
      actor is refused POST/PUT/PATCH/DELETE even when that call is a READ on this API. If \
-     these POSTs are reads, the controls that express it are the module's allowed_methods \
-     and allowed_hosts, not this ceiling — raise the actor's write ceiling deliberately, \
-     knowing it is one scalar: raising it also permits every other gated op this actor's \
-     capability world grants (for an http-node actor that is webhook-send, email-send and \
-     messaging-publish), which get_module_info reports as write_gated_ops";
+     these POSTs are reads, set the actor's http_verb_ceiling to 'write' with \
+     set_actor_http_verb_ceiling: that lifts the verb inference on exactly the three gates \
+     that guess (http fetch / fetch_all, graphql execute) and leaves max_write_ceiling \
+     governing the twelve categorical ops — agent-memory, database, email, messaging, \
+     webhook, object-storage, integration-state. Raising max_write_ceiling instead also \
+     works and grants all fifteen, which is more than a POST-shaped read needs";
 
 pub(crate) fn http_method_mutates(method: &wit_http::Method) -> bool {
     match method {
@@ -2887,18 +2888,23 @@ mod write_ceiling_detail_tests {
         assert!(d.contains("GET is the only read verb"), "{d}");
         // The case that motivated it: a POST that is a READ.
         assert!(d.contains("READ"), "{d}");
-        // The way out, and the controls that actually bound it — an operator
-        // told only "denied" goes and widens allowed_hosts, which is wrong.
-        assert!(d.contains("allowed_methods"), "{d}");
-        assert!(d.contains("allowed_hosts"), "{d}");
-        assert!(d.contains("write ceiling"), "{d}");
-        // And what taking the advice COSTS (2026-09-24). Telling an operator
-        // to raise a ONE-SCALAR ceiling without saying it also clears every
-        // other gated op their capability world grants is the
-        // misleading-report class inside the fix for the misleading-report
-        // class — which is what the first version of this sentence did.
-        assert!(d.contains("one scalar"), "{d}");
-        assert!(d.contains("write_gated_ops"), "{d}");
+        // The way out. Until #941 the only way out WAS raising the whole
+        // ceiling, so this sentence said so and priced it ("one scalar",
+        // "write_gated_ops"). #941 split the verb-inferred half onto its own
+        // axis, which makes that advice the BROAD option — it grants fifteen
+        // ops where three would do — so the detail now names the narrow tool
+        // FIRST and keeps the broad one as a stated alternative.
+        assert!(d.contains("set_actor_http_verb_ceiling"), "{d}");
+        assert!(d.contains("http_verb_ceiling"), "{d}");
+        // The narrow grant's SCOPE, both halves: what it lifts and what it
+        // leaves alone. Naming only the first is how an operator concludes it
+        // grants everything.
+        assert!(d.contains("three gates"), "{d}");
+        assert!(d.contains("twelve categorical"), "{d}");
+        // The broad option stays NAMED and PRICED — removing it would leave an
+        // operator whose case really is a mutation with no route at all.
+        assert!(d.contains("max_write_ceiling"), "{d}");
+        assert!(d.contains("all fifteen"), "{d}");
     }
 
     #[test]

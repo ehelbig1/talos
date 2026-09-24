@@ -135,3 +135,84 @@ fn every_categorical_op_stays_off_the_override() {
         );
     }
 }
+
+/// The override must be CARRIED from the job onto the context, not just read.
+///
+/// # Why this pin exists
+///
+/// #941 added the column, the recorded setter, the signed wire field, the
+/// decision, the narrowing, the axis assignment at all fifteen gate sites and
+/// nine mutations — and the worker never copied the value from the job onto
+/// the context. `TalosContext::http_verb_ceiling` was initialised `None` and
+/// read by the gate, so the whole axis was a NO-OP: the override was signed,
+/// travelled, arrived, and was dropped.
+///
+/// Nine mutations missed it because a mutation can only change code that
+/// exists; the defect was an ABSENT assignment. `ceiling_axis_pins`' sibling
+/// tests missed it because they check which axis each gate NAMES, not whether
+/// the value arrives. This pin closes that: the runtime must assign the field
+/// wherever it assigns the ceiling the field modifies.
+///
+/// TEXTUAL, and it says so — driving it end to end needs a real job, a real
+/// component and the process-global enforcement flag (check 82's objection).
+#[test]
+fn the_runtime_carries_the_override_wherever_it_carries_the_ceiling() {
+    let src = include_str!("../runtime.rs");
+    // Assembled so this pin cannot match its own source.
+    let ceiling_assign = format!("context.max_write_{} =", "ceiling");
+    let override_assign = format!("context.http_verb_{} =", "ceiling");
+
+    let ceilings = src.matches(&ceiling_assign).count();
+    // The RHS is part of the needle DELIBERATELY. A first draft counted the
+    // assignment alone, and `context.http_verb_ceiling = None;` satisfied it
+    // while restoring the exact defect — the line is present and carries
+    // nothing. Measured: that mutation SURVIVED until this needle named the
+    // parameter.
+    let carried = format!("{override_assign} http_verb_ceiling;");
+    let overrides = src.matches(carried.as_str()).count();
+
+    assert!(
+        ceilings >= 2,
+        "the ceiling-assignment scan found {ceilings} sites — it has stopped \
+         matching and is vouching for nothing"
+    );
+    assert_eq!(
+        overrides, ceilings,
+        "the runtime assigns `max_write_ceiling` onto the context at {ceilings} \
+         site(s) but the verb-inference override at {overrides}. Every context \
+         that gets a ceiling must get the override that modifies it — a context \
+         missing it silently inherits, which makes the actor's `http_verb_ceiling` \
+         column do nothing at all."
+    );
+}
+
+/// The worker binary must hand the JOB's override to the runtime.
+///
+/// The pin above proves the runtime carries what it is given; this proves the
+/// job's own field is what it is given. Both halves are needed: #941 had the
+/// wire field populated and correct, and lost it at this hand-off.
+#[test]
+fn the_worker_binary_passes_the_jobs_override() {
+    let src = include_str!("../../../worker/src/main.rs");
+    let ceiling_arg = format!("req.max_write_{},", "ceiling");
+    let override_arg = format!("req.http_verb_{},", "ceiling");
+
+    let ceilings = src.matches(&ceiling_arg).count();
+    let overrides = src.matches(&override_arg).count();
+    assert!(
+        !src.contains("            None,\n            req.egress_scope,"),
+        "a dispatch path passes a literal `None` where the job's override \
+         belongs — the field arrives on the wire and is dropped"
+    );
+
+    assert!(
+        ceilings >= 2,
+        "the job-argument scan found {ceilings} sites — it has stopped matching"
+    );
+    assert_eq!(
+        overrides, ceilings,
+        "the worker passes `req.max_write_ceiling` at {ceilings} dispatch \
+         path(s) and `req.http_verb_ceiling` at {overrides}. A path that passes \
+         one without the other drops the signed override on arrival."
+    );
+}

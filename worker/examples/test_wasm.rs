@@ -44,10 +44,11 @@ async fn main() -> anyhow::Result<()> {
             uuid::Uuid::nil(),                                // user_id
             talos_workflow_job_protocol::LlmTier::Tier2,      // max_llm_tier
             talos_workflow_job_protocol::WriteCeiling::Write, // max_write_ceiling
-            None,                                             // egress_scope: tier default
-            None,                                             // llm_usage_out — not collected
-            None,                                             // host_diag_out — not collected
-            0, // dispatch_attempt — a hand-run example, no controller retry loop
+            None, // http_verb_ceiling — inherit the ceiling above
+            None, // egress_scope: tier default
+            None, // llm_usage_out — not collected
+            None, // host_diag_out — not collected
+            0,    // dispatch_attempt — a hand-run example, no controller retry loop
         )
         .await
     {

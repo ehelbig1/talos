@@ -2188,6 +2188,11 @@ async fn handle_run_sandbox(
             // means resolving a ceiling for a path whose actor binding is a
             // synthetic per-user fallback, which is a separate decision.
             talos_workflow_job_protocol::WriteCeiling::Write,
+            // `None` = inherit the permissive ceiling above, which is this
+            // path's documented posture. Not the actor's override: run_sandbox
+            // has no real actor binding, the same asymmetry the comment above
+            // records for the ceiling itself.
+            None,
             egress.egress_scope, // egress_scope — Some(Public): private ranges DENIED in-process
             None,                // llm_usage_out — internal sandbox path doesn't collect usage
             Some(host_diags.clone()), // host_diag_out — no execution row, so this is the ONLY route
@@ -3702,6 +3707,20 @@ async fn handle_test_module(
     // That is the misleading-report class this repo keeps paying for (checks
     // 74 / 76 / 79). The refusal is the same either way; only the sentence
     // changes.
+    // The verb-inference override travels with the ceiling it modifies, because
+    // `test_module` is a REHEARSAL: reading only `max_write_ceiling` here would
+    // refuse a POST that the same actor's real dispatch permits, so the
+    // rehearsal would disagree with production in the one direction that
+    // matters. `None` inherits, which is every actor that has no override.
+    let http_verb_ceiling = match actor_id_opt {
+        Some(aid) => match state.actor_repo.get_actor_ceilings(aid).await {
+            Ok(Some((_, _, _, hv))) => hv,
+            // Unreadable or absent: inherit, and let the ceiling read below
+            // carry the fail-closed verdict and the `unverified` disclosure.
+            _ => None,
+        },
+        None => None,
+    };
     let (write_ceiling, ceiling_unreadable) = match actor_id_opt {
         Some(aid) => match state.actor_repo.get_actor_max_write_ceiling(aid).await {
             Ok(Some(c)) => (c, false),
@@ -3787,8 +3806,9 @@ async fn handle_test_module(
             // readonly actor's memory that a workflow would refuse. See the
             // resolution above for the fail-closed contract.
             write_ceiling,
+            http_verb_ceiling, // the actor's verb-inference override (None = inherit)
             egress.egress_scope, // egress_scope — Some(Public): private ranges DENIED in-process
-            None,                // llm_usage_out — internal sandbox path doesn't collect usage
+            None,              // llm_usage_out — internal sandbox path doesn't collect usage
             Some(host_diags.clone()), // host_diag_out — no execution row, so this is the ONLY route
             0, // dispatch_attempt — an operator-invoked run, no controller retry loop above it
         )
