@@ -75,6 +75,24 @@ pub(crate) fn dedup_cacheable_status(status: u16) -> bool {
 /// is refused those under enforcement. Fail-safe by construction: the
 /// `match` is exhaustive, so a future non-mutating verb added to the WIT
 /// must be classified explicitly rather than defaulting to "read".
+/// The sentence an operator needs when [`http_method_mutates`] refuses them.
+///
+/// The classification is by VERB and the refusal never said so. What an
+/// operator saw was `http-fetch denied by policy 'write-ceiling' (target:
+/// <host>)`, which reads as "this host is blocked" and sends them to
+/// `allowed_hosts`. Measured: that cost one wrong diagnosis, by the author of
+/// the gate, on an API whose READS are POSTs (Plaid — and GraphQL, and most
+/// `client_id` + `secret` APIs, and many search endpoints).
+///
+/// The honest thing to say is that the ceiling CANNOT express "may POST, but
+/// only reads", and to name the controls that can: the module's
+/// `allowed_methods`, its `allowed_hosts`, and its source.
+pub(crate) const WRITE_CEILING_VERB_DETAIL: &str =
+    "the write ceiling classifies by HTTP VERB (GET is the only read verb), so a read-only \
+     actor is refused POST/PUT/PATCH/DELETE even when that call is a READ on this API. If \
+     these POSTs are reads, the controls that express it are the module's allowed_methods \
+     and allowed_hosts, not this ceiling — raise the actor's write ceiling deliberately";
+
 pub(crate) fn http_method_mutates(method: &wit_http::Method) -> bool {
     match method {
         wit_http::Method::Get => false,
@@ -301,7 +319,13 @@ impl wit_http::Host for TalosContext {
         // in the cheap-validation block before the rate-limit charge. Inert
         // unless `TALOS_WRITE_CEILING_ENFORCED=1`.
         if http_method_mutates(&req.method)
-            && self.write_ceiling_refuses("http-fetch", host).await
+            && self
+                .write_ceiling_refuses_detailed(
+                    "http-fetch",
+                    host,
+                    Some(WRITE_CEILING_VERB_DETAIL),
+                )
+                .await
         {
             return Err(deny_forbidden(self, reason_class::WRITE_CEILING));
         }
@@ -1335,7 +1359,13 @@ impl wit_http::Host for TalosContext {
             //     mutate. Per-request so a mixed batch rejects only the
             //     mutating entries. Inert unless enforcement is on.
             if http_method_mutates(&req.method)
-                && self.write_ceiling_refuses("http-fetch-all", &host).await
+                && self
+                    .write_ceiling_refuses_detailed(
+                        "http-fetch-all",
+                        &host,
+                        Some(WRITE_CEILING_VERB_DETAIL),
+                    )
+                    .await
             {
                 validated.push(Err(deny_forbidden(self, reason_class::WRITE_CEILING)));
                 continue;
@@ -2803,6 +2833,91 @@ mod vault_body_wiring_pin {
         assert!(
             production.contains(&needle(&["n.eq_ignore_ascii_case(", "\"content-type\")"])),
             "the declared content type must come from the request's own headers"
+        );
+    }
+}
+
+/// The refusal an operator reads must name the INFERENCE, not just the policy.
+///
+/// These are content assertions on fixed strings, which is what a unit test can
+/// hold: driving the refusal end to end needs a worker, an enforcing flag and a
+/// read-only actor. The wiring — that both HTTP sites and the GraphQL site pass
+/// their detail — is pinned separately, textually and stated as such.
+#[cfg(test)]
+mod write_ceiling_detail_tests {
+    use super::WRITE_CEILING_VERB_DETAIL;
+
+    #[test]
+    fn the_verb_detail_names_the_rule_and_the_way_out() {
+        let d = WRITE_CEILING_VERB_DETAIL;
+        // The rule: why a POST was refused. The phrase is written out rather
+        // than read from `talos_worker_identity_repository::
+        // WRITE_CEILING_VERB_RULE`, which is its shared home for the two
+        // CONTROLLER-side surfaces — the worker must not depend on a
+        // repository crate (check 51's direction), so the second literal is
+        // deliberate and this assertion is what stops it drifting from the
+        // first.
+        assert!(d.contains("VERB"), "{d}");
+        assert!(d.contains("GET is the only read verb"), "{d}");
+        // The case that motivated it: a POST that is a READ.
+        assert!(d.contains("READ"), "{d}");
+        // The way out, and the controls that actually bound it — an operator
+        // told only "denied" goes and widens allowed_hosts, which is wrong.
+        assert!(d.contains("allowed_methods"), "{d}");
+        assert!(d.contains("allowed_hosts"), "{d}");
+        assert!(d.contains("write ceiling"), "{d}");
+    }
+
+    #[test]
+    fn the_graphql_detail_says_a_pure_query_is_refused_too() {
+        let d = crate::host::graphql::GRAPHQL_INFERRED_DETAIL;
+        assert!(d.contains("always POST"), "{d}");
+        assert!(d.contains("query is refused"), "{d}");
+        assert!(d.contains("allowed_hosts"), "{d}");
+    }
+
+    /// TEXTUAL pin, stated as such: every write-ceiling gate whose "mutating"
+    /// verdict is INFERRED must pass a detail. Three gates infer — `fetch`,
+    /// `fetch_all` and `graphql-execute` — and exactly one PROVES: the
+    /// `database-query` leg walks the statement's AST (check 85). The
+    /// categorically-mutating ops are excluded on purpose, because nothing is
+    /// inferred there and "denied" needs no explanation: memory, integration
+    /// state, messaging, email, object storage, and `webhook::send`, whose WIT
+    /// record carries no method field at all and is always an implicit POST.
+    ///
+    /// The needles are ASSEMBLED rather than written out, so this test cannot
+    /// vouch for itself. The scan covers the WHOLE file: splitting off a
+    /// production region would need the column-0 `#[cfg(test)]` strip, whose
+    /// over-run is silent, and `graphql.rs` carries a test module 400 lines
+    /// ABOVE its gate — a naive split reads the gate as missing. This way the
+    /// failure direction is loud instead: a future test that writes the
+    /// call-site form inflates the count and fails here.
+    #[test]
+    fn every_inferring_gate_passes_a_detail() {
+        let http = include_str!("http.rs");
+        let gql = include_str!("graphql.rs");
+        let verb_site = format!("Some({})", "WRITE_CEILING_VERB_DETAIL");
+        let gql_site = format!("Some({})", "GRAPHQL_INFERRED_DETAIL");
+        assert_eq!(
+            http.matches(&verb_site).count(),
+            2,
+            "both HTTP write-ceiling gates must name the verb inference"
+        );
+        assert_eq!(
+            gql.matches(&gql_site).count(),
+            1,
+            "the GraphQL write-ceiling gate must name its inference"
+        );
+        // And no inferring gate may fall back to the bare refusal. The
+        // `_detailed` spelling is not matched: it has no `("` after the name.
+        let bare = "write_ceiling_refuses";
+        assert!(
+            !http.contains(&format!("{bare}(\"http-fetch")),
+            "an HTTP write-ceiling gate lost its operator detail"
+        );
+        assert!(
+            !gql.contains(&format!("{bare}(\"graphql-execute")),
+            "the GraphQL write-ceiling gate lost its operator detail"
         );
     }
 }

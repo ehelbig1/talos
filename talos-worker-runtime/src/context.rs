@@ -2019,16 +2019,42 @@ impl TalosContext {
     /// `dyn RngCore + Send` which is not `Sync`. Matches the existing
     /// inline-audit pattern at `host_impl.rs::secrets::get_secret`.
     pub async fn record_capability_denied(&mut self, capability: &str, policy: &str, target: &str) {
+        self.record_capability_denied_detailed(capability, policy, target, None)
+            .await;
+    }
+
+    /// As [`Self::record_capability_denied`], plus one sentence of operator
+    /// DETAIL appended to the guest-visible diagnostic.
+    ///
+    /// Added 2026-09-23 for the write-ceiling HTTP refusal, where the generic
+    /// line — `http-fetch denied by policy 'write-ceiling' (target: <host>)` —
+    /// is true and unactionable: it does not say that the ceiling classifies by
+    /// HTTP VERB, so an operator whose API answers reads over POST reads it as
+    /// "this host is blocked" and goes looking at `allowed_hosts`. Measured
+    /// cost of that omission: one wrong diagnosis, by the author of the gate.
+    ///
+    /// `detail` is a FIXED string chosen at the call site, never caller data —
+    /// same no-secrets contract as `capability` and `policy`. The ledger
+    /// payload is deliberately UNCHANGED: `capability`/`policy`/`target` are
+    /// the queryable fields and a free-text sentence is not one.
+    pub async fn record_capability_denied_detailed(
+        &mut self,
+        capability: &str,
+        policy: &str,
+        target: &str,
+        detail: Option<&'static str>,
+    ) {
         // Guest-visible diagnostic FIRST (and unconditionally — the audit
         // ledger below is optional wiring, the module author's debugging
         // signal is not). `capability`/`policy` are fixed tokens and
         // `target` already obeys this fn's no-secrets contract, so the
         // pair is safe to surface in the execution log.
-        self.emit_host_diagnostic(
-            policy,
-            &format!("{capability} denied by policy '{policy}' (target: {target})"),
-        )
-        .await;
+        let base = format!("{capability} denied by policy '{policy}' (target: {target})");
+        let line = match detail {
+            Some(d) => format!("{base} — {d}"),
+            None => base,
+        };
+        self.emit_host_diagnostic(policy, &line).await;
         if self.audit_ledger.is_none() {
             return;
         }
@@ -2237,13 +2263,26 @@ impl TalosContext {
     /// `target` is a non-secret detail (key, sanitized URL, table) for the
     /// audit trail — never a secret value.
     pub async fn write_ceiling_refuses(&mut self, op: &str, target: &str) -> bool {
+        self.write_ceiling_refuses_detailed(op, target, None).await
+    }
+
+    /// The write-ceiling refusal, with one sentence of operator detail.
+    ///
+    /// The HTTP call sites pass [`WRITE_CEILING_VERB_DETAIL`] because their
+    /// classification is by VERB and nothing said so — see that constant.
+    pub async fn write_ceiling_refuses_detailed(
+        &mut self,
+        op: &str,
+        target: &str,
+        detail: Option<&'static str>,
+    ) -> bool {
         // Pure decision (flag + ceiling) split out for unit testing; the
         // audit + warn side effects stay here. Short-circuits before any
         // allocation on the default (disabled) path.
         if !write_ceiling_denies(write_ceiling_enforced(), self.max_write_ceiling) {
             return false;
         }
-        self.record_capability_denied(op, "write-ceiling", target)
+        self.record_capability_denied_detailed(op, "write-ceiling", target, detail)
             .await;
         tracing::warn!(
             op,
@@ -3723,5 +3762,99 @@ mod secret_use_ledger_tests {
             .await
             .is_none());
         assert!(c.secret_use_recorded.is_empty());
+    }
+}
+
+/// The operator DETAIL on a capability denial (2026-09-23).
+///
+/// These drive the RECORDER, not the gate: `write_ceiling_enforced()` is a
+/// process-global `OnceLock` over the env, so a sibling test in this binary
+/// decides its value and the gate cannot be flipped per test. The gate's own
+/// contribution is the `Some(detail)` pass-through, which
+/// `host::http::write_ceiling_detail_tests::every_inferring_gate_passes_a_detail`
+/// pins at the call sites. Stated rather than implied.
+#[cfg(test)]
+mod capability_denial_detail_tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use talos_workflow_job_protocol::LlmTier;
+
+    use super::{HostDiagSink, TalosContext};
+    use crate::wit_inspector::CapabilityWorld;
+
+    fn ctx_with_sink() -> (TalosContext, HostDiagSink) {
+        let mut c = TalosContext::new(
+            CapabilityWorld::Minimal,
+            vec![],
+            vec![],
+            128,
+            HashMap::new(),
+            None,
+            None,
+            false,
+            None,
+            Arc::new(crate::expose_fallback::ExposeFallback::new()),
+            LlmTier::default(),
+            None,
+        )
+        .expect("context builds");
+        let s: HostDiagSink = Arc::new(std::sync::Mutex::new(Vec::new()));
+        c.host_diag_sink = Some(s.clone());
+        (c, s)
+    }
+
+    /// The line a module author reads must say the ceiling classified by VERB.
+    /// Without this the diagnostic is `http-fetch denied by policy
+    /// 'write-ceiling' (target: sandbox.plaid.com)` — true, and it sends the
+    /// reader to `allowed_hosts`, which is not the control that refused.
+    #[tokio::test]
+    async fn the_verb_detail_reaches_the_guest_visible_diagnostic() {
+        let (mut c, s) = ctx_with_sink();
+        c.record_capability_denied_detailed(
+            "http-fetch",
+            "write-ceiling",
+            "sandbox.plaid.com",
+            Some(crate::host_impl::WRITE_CEILING_VERB_DETAIL),
+        )
+        .await;
+
+        let lines = s.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        // The base is preserved verbatim — the detail is an addition, not a
+        // replacement, so every existing reader of this line still works.
+        assert!(
+            line.contains(
+                "http-fetch denied by policy 'write-ceiling' (target: sandbox.plaid.com)"
+            ),
+            "{line}"
+        );
+        // And the addition is the sentence that redirects the diagnosis.
+        assert!(line.contains("GET is the only read verb"), "{line}");
+        assert!(line.contains("allowed_methods"), "{line}");
+    }
+
+    /// The CONTROL, so the assertion above cannot pass because every denial
+    /// happens to carry the sentence: a categorically-mutating op passes
+    /// `None` and its line is the base alone.
+    #[tokio::test]
+    async fn a_denial_with_no_detail_is_the_bare_line() {
+        let (mut c, s) = ctx_with_sink();
+        c.record_capability_denied("agent-memory-set", "write-ceiling", "notes/1")
+            .await;
+
+        let lines = s.lock().unwrap().clone();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        assert!(
+            line.ends_with("agent-memory-set denied by policy 'write-ceiling' (target: notes/1)"),
+            "{line}"
+        );
+        assert!(!line.contains("GET is the only read verb"), "{line}");
+        assert!(
+            !line.contains(" — "),
+            "no detail was passed, so none is rendered: {line}"
+        );
     }
 }

@@ -8267,3 +8267,212 @@ EQUIVALENT.**
   references under `config`, so no refs were extracted and every case trivially
   passed. Each fixture now asserts the references were found before asserting
   anything about them.
+
+---
+
+## EI (2026-09-23) — the write ceiling's HTTP and GraphQL legs infer "mutating" from the verb, and nothing an operator reads said so
+
+### How it was found
+
+Not by auditing the gate. By hitting it. The `plaid-read` module built one
+package earlier came back with
+
+```
+reason_class = write-ceiling
+http-fetch denied by policy 'write-ceiling' (target: sandbox.plaid.com)
+```
+
+and the first diagnosis — by the author of the gate, in the same session that
+wrote its tests — went to `allowed_hosts`. The host was allowed. The methods were
+allowed. What refused the call is that Plaid's `/accounts/balance/get` is a
+**POST**, and `http_method_mutates` reads a POST as a mutation because, in its
+own words, *"GET is the only read verb"*.
+
+That is the right fail-closed default. What was missing is that no surface an
+operator reads said it, so the one sentence they get names a policy whose
+vocabulary — "data-mutating host ops" — does not describe what happened.
+
+### Measured before designing
+
+**The control is live, not latent, and the code default is the misleading half.**
+`write_ceiling_enforced()` returns `false` when the env var is unset — but
+`docker-compose.yml` sets `TALOS_WRITE_CEILING_ENFORCED: "1"` on **both**
+services (lines 848 and 938) and `deploy/helm/talos/values.yaml` sets it on both
+(190, 843). Live at the time of writing:
+
+```
+get_platform_info.fleet.write_ceiling.enforced_by = "all"
+```
+
+So the fleet note an operator reads on any shipped deployment is the `All` arm,
+the one that says *Enforced by all N registered worker row(s)*.
+
+**Three legs infer; exactly one proves.** Of the 16 `write_ceiling_refuses*`
+call sites in `talos-worker-runtime`:
+
+| leg | verdict | how |
+|---|---|---|
+| `http-fetch`, `http-fetch-all` | inferred | `http_method_mutates` — *"GET is the only read verb"*, by design |
+| `graphql-execute` | inferred | the gate's own comment: *"the operation type can't be cheaply proven read-only from the request string. Fail-closed"* |
+| `database-query` | **proven** | walks the statement's AST (#757, check 85) |
+| the other twelve | nothing inferred | the op **is** the mutation |
+
+The twelve are `agent-memory-{set,delete,store-with-embedding}`,
+`integration-state-{set,delete}`, `messaging-{publish,publish,request}`,
+`object-storage-{put,delete}`, `email-send` and `webhook-send`. The last is worth
+naming because it *looks* like an HTTP leg and is not: `record webhook-request`
+in `wit/talos.wit` carries `url`, `headers`, `body`, `max-retries`,
+`retry-delay-ms` and **no method field at all**, so it is always an implicit POST
+and refusing it categorically infers nothing.
+
+**The exposure measurement corrected itself twice, and the correction is the
+lesson.** The obvious query — 114 modules, 37 declaring POST, 51 declaring
+nothing, and an empty `allowed_methods` read by the worker's three enforcement
+points as *allow every verb* — gives **88 of 114 (77%) can POST**. That is
+wrong: 24 of those are `minimal-node` and cannot make an HTTP call at all. The
+second attempt counted only `http-node`/`secrets-node`/`network-node`/
+`governance-node`/`automation-node` and got 73, which is also wrong —
+`talos-capability-world`'s own note, verified 2026-07-10, is that *"every world
+above Minimal imports the HTTP suite"*, so `agent-node` and the four
+single-module worlds belong in the population too. The number to carry is
+
+> **64 of 90 HTTP-capable modules (71%) can POST** — 37 declare it, 27 declare
+> nothing; 26 declare read verbs only.
+
+**The actor side is where it is currently thin, and saying so matters more than
+implying the fleet is full of these.** Of 11 actors, 6 hold `write` (5 active)
+and 5 hold `readonly` (1 active). The single active `readonly` actor is bound to
+one workflow, and that workflow's only HTTP-capable module declares
+`allowed_methods = {GET}`. It is **not** refused today. The one refusal this
+gate has produced on this fleet was a POST that is a read.
+
+### What shipped
+
+Nothing about the decision changes. The gate refuses at the same verbs, for the
+same actors, with the same fail-closed direction — it over-refuses and never
+under-refuses. What changes is that three surfaces now say what was *inferred*.
+
+**1. The refusal line.** `TalosContext::record_capability_denied` gains a
+`_detailed` sibling taking `Option<&'static str>`. The base line is unchanged and
+the detail is APPENDED (`{base} — {detail}`), so every existing reader still
+matches. `&'static str` is the point: the detail is chosen at the call site and
+can never be caller data, the same no-secrets contract `capability` and `policy`
+already carry. **The ledger payload is deliberately unchanged** —
+`capability`/`policy`/`target` are the queryable fields and a free-text sentence
+is not one; the detail is for the human reading the execution log.
+
+`WRITE_CEILING_VERB_DETAIL` (http.rs) and `GRAPHQL_INFERRED_DETAIL` (graphql.rs)
+each name the rule, the surprise and the way out. The way out is the load-bearing
+part: an operator told only "denied" widens `allowed_hosts`, which is not the
+control that refused. Both constants say that what actually bounds a POST-reading
+integration is the module's `allowed_methods`, its `allowed_hosts` and its
+source — **not** this ceiling, which cannot express "may POST, but only reads".
+
+**2. The fleet note, with one home.**
+`talos_worker_identity_repository::WRITE_CEILING_VERB_NOTE` is appended to the two
+states that can actually REFUSE (`All`, `Some`) and deliberately NOT to
+`None`/`Unknown`, whose own text already says nothing is being enforced — there
+the question does not arise for the operator reading it. **Five surfaces render
+`WriteCeilingFleetSummary::note()`**: `set_actor_write_ceiling`,
+`get_actor_summary`, `get_my_capability_ceiling`, `get_platform_info.fleet` and
+`security_audit.write_ceiling_enforcement`. One const reaches all five, so they
+cannot word the same fleet differently.
+
+**3. The setter's description**, plus `docs/THREAT_MODEL.md` §6, which states the
+same limit beside the capability-world ceiling it sits next to. The description
+says which leg proves it and that for a read-only integration over a POST-based
+API `write` is the CORRECT setting — because the alternative reading ("I must be
+doing something wrong, my integration only reads") sends an operator looking for
+a fix that does not exist.
+
+### The survivor, and what it says about "one home"
+
+**N8 survived**: rewording `WRITE_CEILING_VERB_NOTE` left every test green. The
+placement test asserted `note().contains(WRITE_CEILING_VERB_NOTE)` — true of *any*
+wording — and the tool-description test read a different literal in another
+crate. Three surfaces agreed on a **claim** and nothing pinned the **words**,
+which is exactly the drift this package was written to close, reproduced inside
+its own guards.
+
+Closed with `WRITE_CEILING_VERB_RULE` — the one phrase every prose surface makes
+— as a `pub const` in the identity repository, which `talos-mcp-handlers` already
+depends on. The worker deliberately does **not** import it: a worker crate taking
+a dependency on a controller-side repository crate is check 51's direction, and
+the worker is credential-free by design. So `WRITE_CEILING_VERB_DETAIL` keeps a
+second literal, with its own assertion and a comment saying why. Three surfaces,
+two homes, and each one fails on its own if it is reworded alone — changing all
+of them together is a decision, which is the difference worth preserving.
+
+### Mutations — 10 applied, 10 caught after closing one survivor
+
+| # | mutation | outcome |
+|---|---|---|
+| N1 | `fetch` gate drops the verb detail | CAUGHT — `every_inferring_gate_passes_a_detail` |
+| N2 | `fetch_all` gate drops the verb detail | CAUGHT — same pin (a guard at the primitive cannot see a second call site) |
+| N3 | GraphQL gate reverts to the bare refusal | CAUGHT — same pin |
+| N4 | recorder computes the detail and discards it | CAUGHT — `the_verb_detail_reaches_the_guest_visible_diagnostic` |
+| N5 | verb note appended to every fleet arm | CAUGHT — the placement control |
+| N6 | partially-enforcing fleet loses the note | CAUGHT — the placement test |
+| N7 | tool description loses the verb paragraph | CAUGHT — the description pin |
+| N8 | fleet note reworded away from the shared rule | **SURVIVED**, closed, re-run CAUGHT |
+| N9 | worker's detail reworded away from the same rule | CAUGHT — two tests |
+| N10 | shared const reworded, so the description no longer matches | CAUGHT — the description pin |
+
+**One mutation is recorded INVALID rather than counted**: N8's first needle
+matched **twice** — the constant *and* the control assertion that must not
+contain it — so it was rewritten with a unique needle and re-run. A needle that
+matches its own guard proves nothing.
+
+### Guards, and what each cannot see
+
+- `capability_denial_detail_tests` drives the **production recorder** against a
+  real `host_diag_sink` and asserts the guest-visible line carries the verb
+  sentence, with a CONTROL: a categorically-mutating op passes `None` and its
+  line is the base alone, with no `—` at all. Without the control the first
+  assertion would pass if every denial carried the sentence, which is a
+  different and wrong rule.
+- `every_inferring_gate_passes_a_detail` is a TEXTUAL pin over the three call
+  sites. Its needles are **assembled** (`format!("Some({})", "WRITE_CEILING_VERB_DETAIL")`)
+  so the test cannot vouch for itself — the first draft wrote them out and
+  matched its own line, which is why `http.rs` reported 3 sites for 2 gates. It
+  scans the WHOLE file rather than a production region: `graphql.rs` carries a
+  `#[cfg(test)]` module **400 lines above** its gate, so a
+  split-at-first-`#[cfg(test)]` reads the gate as missing — which is what it did
+  on the first run. Check 58's over-strip hazard, in a test rather than a lint.
+  The failure direction is now loud instead (a future test writing the call-site
+  form inflates the count).
+- `the_verb_note_is_on_the_states_that_can_refuse_and_only_those` pins the note
+  onto `All`/`Some` and OFF `None`/`Unknown`, asserting on each fixture's state
+  first so it cannot pass because a fixture stopped producing the state it was
+  built for.
+- `the_note_names_the_rule_the_inference_and_the_leg_that_proves_it` is the one
+  N8 forced: the note must make the CLAIM, not merely exist.
+- `write_ceiling_description_tests` reads the shared const rather than a literal,
+  with a CONTROL over the two sibling axis tools (`set_actor_llm_tier_ceiling`,
+  `set_actor_egress_scope`) so it cannot pass because every description happens
+  to mention verbs.
+
+**Stated limit**: the two HTTP gates and the GraphQL gate are **not** driven end
+to end. `write_ceiling_enforced()` is a process-global `OnceLock` over the env, so
+a sibling test in the same binary decides its value and the gate cannot be
+flipped per test — check 82's own objection. The tests drive the RECORDER; the
+pin covers the PASS-THROUGH.
+
+### No lint check; `--count` stays 97
+
+- *"a write-ceiling gate whose verdict is inferred must pass a detail"* —
+  population **three call sites in two files**, both already covered by the pin.
+  Below this repo's bar (#765), and the structural answer is stronger.
+- *"every `write_ceiling_refuses` call site must declare inferred-vs-proven"* —
+  **16 call sites, 13 correctly categorical**, so it ships at 13 markers on
+  correct code and is 0-for-0 as a bug detector. Rejected.
+
+### Deliberately not done
+
+- **No SOC 2 control row for the write ceiling.** The mapping has `CC6.3-13` for
+  the per-actor LLM-tier ceiling and none for this one. Asserting a new control
+  is a compliance claim that deserves its own decision, not a side effect of a
+  disclosure fix.
+- **`docs/security/ai-injection-audit-2026-07-20.md`** still reads *"Mutating
+  host calls | write ceilings at one choke point | now enforced"*. It is a DATED
+  audit record and was true on its date; rewriting it would be rewriting history.
