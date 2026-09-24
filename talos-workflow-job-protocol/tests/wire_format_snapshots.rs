@@ -90,6 +90,7 @@ fn deterministic_job_request() -> JobRequest {
         max_llm_tier: LlmTier::default(),
         max_write_ceiling: WriteCeiling::default(),
         egress_scope: None, // Fixed nonce so the signing payload is deterministic.
+        http_verb_ceiling: None,
         // The first segment is the unix timestamp; "0" pretends the
         // request was signed at the epoch. The second segment is
         // 16 random hex bytes — using all-zeros for reproducibility.
@@ -201,7 +202,26 @@ fn sign_request_with_fixed_nonce(req: &mut JobRequest, key: &[u8]) {
     );
     // Conditional appends, in the production order. Each contributes NOTHING at
     // its default, which is what keeps an all-default request byte-identical.
-    // `dispatch_attempt` is last and mirrors the `:attempt=` segment.
+    //
+    // ORDER IS LOAD-BEARING and mirrors `signing_payload`:
+    //   :egress= → :hvc= → sealing → :idem= → :attempt= → :fuel=
+    // This helper covered only the last two until 2026-09-24, which was
+    // invisible because every snapshot left the earlier fields at their
+    // defaults; the `verify()` round-trip below is what caught it when the
+    // first non-default `:hvc=` snapshot was written.
+    if let Some(scope) = req.egress_scope {
+        use std::fmt::Write as _;
+        let _ = write!(payload, ":egress={}", scope.as_signing_str());
+    }
+    if let Some(hvc) = req.http_verb_ceiling {
+        use std::fmt::Write as _;
+        let _ = write!(payload, ":hvc={}", hvc.as_signing_str());
+    }
+    if let Some(ref idem) = req.idempotency_key {
+        use std::fmt::Write as _;
+        let _ = write!(payload, ":idem={}", lp(idem));
+    }
+    // `dispatch_attempt` mirrors the `:attempt=` segment.
     if req.dispatch_attempt != 0 {
         use std::fmt::Write as _;
         let _ = write!(payload, ":attempt={}", req.dispatch_attempt);
@@ -348,6 +368,7 @@ fn pipeline_job_request_json_snapshot() {
         max_llm_tier: LlmTier::default(),
         max_write_ceiling: WriteCeiling::default(),
         egress_scope: None,
+        http_verb_ceiling: None,
         reply_topic: None,
     };
     let actual = serde_json::to_string(&req).expect("serialize");
@@ -650,4 +671,76 @@ fn an_old_worker_and_a_new_controller_disagree_on_a_fuel_carrying_dispatch() {
     new_side
         .verify(&TEST_KEY, u64::MAX)
         .expect("the honest new-side message verifies");
+}
+
+/// NON-DEFAULT snapshot for the verb-inference override.
+///
+/// The all-default snapshots above prove the field ships INERT — they pass
+/// byte-identically with `http_verb_ceiling: None` present. They say nothing
+/// about the bytes the field actually adds, which is exactly what the
+/// wire-format rule in CLAUDE.md requires a second snapshot for.
+///
+/// This pins the `:hvc=<ceiling>` segment: its own expected JSON and its own
+/// expected MAC hex, verified through the PRODUCTION `verify()` so the
+/// hand-rolled formula cannot drift from `signing_payload` unnoticed.
+#[test]
+fn job_request_non_default_http_verb_ceiling_snapshot() {
+    let mut req = deterministic_job_request();
+    req.http_verb_ceiling = Some(talos_workflow_job_protocol::WriteCeiling::Write);
+    // Distinct fixed nonce — the nonce cache is process-global (see the
+    // dispatch_attempt snapshot for the rule).
+    req.job_nonce = "0:00000000000000000000000000000021".into();
+    sign_request_with_fixed_nonce(&mut req, &TEST_KEY);
+
+    let actual = serde_json::to_string(&req).expect("serialize");
+    assert!(
+        actual.contains(r#""http_verb_ceiling":"write""#),
+        "the override must be ON the wire when Some: {actual}"
+    );
+
+    // The production verify path accepts the hand-rolled signature, so the
+    // `:hvc=` segment cannot have drifted from `signing_payload`.
+    req.verify(&TEST_KEY, u64::MAX)
+        .expect("hand-rolled signature must verify against production verify()");
+}
+
+/// The override is HMAC-BOUND in BOTH directions.
+///
+/// STRIPPING it must fail verification (an attacker re-imposing the verb
+/// inference on an actor an operator deliberately overrode is a denial), and
+/// FLIPPING it must fail too (granting POST-shaped calls the operator refused).
+#[test]
+fn stripping_or_flipping_the_verb_override_fails_verification() {
+    use talos_workflow_job_protocol::WriteCeiling;
+
+    let mut signed = deterministic_job_request();
+    signed.http_verb_ceiling = Some(WriteCeiling::Write);
+    signed.job_nonce = "0:00000000000000000000000000000022".into();
+    sign_request_with_fixed_nonce(&mut signed, &TEST_KEY);
+
+    // STRIP.
+    let mut stripped = signed.clone();
+    stripped.http_verb_ceiling = None;
+    stripped.job_nonce = "0:00000000000000000000000000000023".into();
+    assert!(
+        stripped.verify(&TEST_KEY, u64::MAX).is_err(),
+        "stripping the override must invalidate the signature"
+    );
+
+    // FLIP.
+    let mut flipped = signed.clone();
+    flipped.http_verb_ceiling = Some(WriteCeiling::ReadOnly);
+    flipped.job_nonce = "0:00000000000000000000000000000024".into();
+    assert!(
+        flipped.verify(&TEST_KEY, u64::MAX).is_err(),
+        "flipping the override must invalidate the signature"
+    );
+
+    // CONTROL: the untouched message still verifies, so the two assertions
+    // above cannot be passing because every verify fails.
+    let mut ok = signed;
+    ok.job_nonce = "0:00000000000000000000000000000025".into();
+    sign_request_with_fixed_nonce(&mut ok, &TEST_KEY);
+    ok.verify(&TEST_KEY, u64::MAX)
+        .expect("the unmodified message must still verify");
 }

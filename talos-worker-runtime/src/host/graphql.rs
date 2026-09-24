@@ -787,7 +787,12 @@ impl TalosContext {
         // and refuse for read-only actors. An actor that needs GraphQL reads
         // uses the `Write` ceiling. Inert unless enforcement is on.
         if self
-            .write_ceiling_refuses_detailed("graphql-execute", "", Some(GRAPHQL_INFERRED_DETAIL))
+            .write_ceiling_refuses_detailed(
+                talos_workflow_job_protocol::CeilingAxis::VerbInferred,
+                "graphql-execute",
+                "",
+                Some(GRAPHQL_INFERRED_DETAIL),
+            )
             .await
         {
             // Paired with `queryerror`, the discriminant this arm returns —

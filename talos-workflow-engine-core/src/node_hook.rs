@@ -57,6 +57,11 @@ pub struct NodeCompletionContext<'a> {
     /// wire default — an actor-less system job must not be blocked — and the
     /// restrictive default lives at the actor layer.
     pub max_write_ceiling: crate::WriteCeiling,
+    /// Override for the VERB-INFERRED half of the write ceiling
+    /// (`http::fetch`, `http::fetch_all`, `graphql::execute`). `None`
+    /// inherits `max_write_ceiling`, which is byte-identical to the
+    /// pre-2026-09-24 behaviour. See `crate::CeilingAxis`.
+    pub http_verb_ceiling: Option<crate::WriteCeiling>,
     /// MONOTONIC execution time in milliseconds, measured from dispatch
     /// to completion with `std::time::Instant` — despite the field name,
     /// which is preserved because it is also the name of the column it

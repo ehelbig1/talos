@@ -164,6 +164,7 @@ mod tests {
             dry_run: false,
             max_llm_tier: talos_workflow_engine_core::LlmTier::default(),
             max_write_ceiling: talos_workflow_engine_core::WriteCeiling::default(),
+            http_verb_ceiling: None,
             egress_scope: None,
             idempotency_key: None,
             max_retries: 0,

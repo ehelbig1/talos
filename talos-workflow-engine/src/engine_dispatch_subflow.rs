@@ -1609,6 +1609,19 @@ impl ParallelWorkflowEngine {
             max_write_ceiling: self
                 .max_write_ceiling
                 .most_restrictive(sub.max_write_ceiling),
+            // The verb-inference override narrows on its OWN axis, through its
+            // own rule: `None` means INHERIT, so it must not win over an
+            // explicit value in either direction — a parent that declares
+            // nothing cannot widen a child that declares `readonly`, and a
+            // child that declares nothing does not erase the parent's. Two
+            // explicit values take the more restrictive, exactly like the
+            // ceiling above. Composing this with `Option::or` (the obvious
+            // one-liner) would let a parent's `Some(Write)` silently win over
+            // a child's `Some(ReadOnly)`.
+            http_verb_ceiling: talos_workflow_engine_core::narrow_verb_inference_override(
+                self.http_verb_ceiling,
+                sub.http_verb_ceiling,
+            ),
             egress_scope: talos_workflow_engine_core::EgressScope::narrow(
                 Some(parent_egress),
                 Some(sub_egress_eff),
@@ -1891,6 +1904,7 @@ mod identity_binding_tests {
                 actor_id: Some(sub_actor),
                 max_llm_tier: LlmTier::Tier1,
                 max_write_ceiling: WriteCeiling::ReadOnly,
+                http_verb_ceiling: None,
                 egress_scope: None,
             }),
         );
@@ -1921,6 +1935,7 @@ mod identity_binding_tests {
                 actor_id: Some(sub_actor),
                 max_llm_tier: LlmTier::Tier2,
                 max_write_ceiling: WriteCeiling::Write,
+                http_verb_ceiling: None,
                 egress_scope: Some(EgressScope::Public),
             }),
         );
@@ -1962,6 +1977,7 @@ mod identity_binding_tests {
                 actor_id: Some(sub_actor),
                 max_llm_tier: LlmTier::Tier1,
                 max_write_ceiling: WriteCeiling::ReadOnly,
+                http_verb_ceiling: None,
                 egress_scope: Some(EgressScope::Local),
             },
         );
@@ -1989,6 +2005,7 @@ mod identity_binding_tests {
                 actor_id: None,
                 max_llm_tier: LlmTier::Tier1,
                 max_write_ceiling: WriteCeiling::ReadOnly,
+                http_verb_ceiling: None,
                 egress_scope: Some(EgressScope::Local),
             },
         );

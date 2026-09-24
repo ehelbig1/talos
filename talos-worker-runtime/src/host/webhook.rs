@@ -61,7 +61,14 @@ impl wit_webhook::Host for TalosContext {
         let url = req.url.clone();
         // Write-ceiling gate: an outbound webhook is a mutation/side effect —
         // refuse for read-only actors. Inert unless enforcement is on.
-        if self.write_ceiling_refuses("webhook-send", &url).await {
+        if self
+            .write_ceiling_refuses(
+                talos_workflow_job_protocol::CeilingAxis::Categorical,
+                "webhook-send",
+                &url,
+            )
+            .await
+        {
             return Err(webhook_deny(self, reason_class::WRITE_CEILING));
         }
         // MCP-1148: cap URL bytes BEFORE invoking `url::Url::parse`

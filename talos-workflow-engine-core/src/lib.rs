@@ -208,5 +208,7 @@ pub use system_node::{JoinMode, SystemNodeKind};
 pub use transport::JobTransport;
 pub use wasm_cache::{scoped_wasm_cache_key, scoped_wasm_redis_uri};
 pub use write_ceiling::{
-    write_ceiling_denies, WriteCeiling, AGENT_MEMORY_SET_OP, WRITE_CEILING_POLICY,
+    effective_write_ceiling, http_verb_ceiling_from_db, narrow_verb_inference_override,
+    write_ceiling_denies, write_ceiling_denies_axis, CeilingAxis, WriteCeiling,
+    AGENT_MEMORY_SET_OP, WRITE_CEILING_POLICY,
 };

@@ -58,6 +58,11 @@ pub async fn apply_actor_to_engine(
     fn stamp_most_restrictive(engine: &mut ParallelWorkflowEngine) {
         engine.set_max_llm_tier(LlmTier::Tier1);
         engine.set_max_write_ceiling(WriteCeiling::ReadOnly);
+        // EXPLICIT `ReadOnly`, not `None`. `None` would be restrictive only
+        // because the ceiling above it is — a coincidence that stops holding
+        // the moment this fail-closed stamp is edited. Every axis says the
+        // restrictive thing outright, which is this routine's contract.
+        engine.set_http_verb_ceiling(Some(WriteCeiling::ReadOnly));
         engine.set_egress_scope(Some(talos_workflow_engine_core::EgressScope::Local));
         engine.set_max_capability_world(Some(MOST_RESTRICTIVE_WORLD.to_string()));
     }
@@ -69,7 +74,7 @@ pub async fn apply_actor_to_engine(
     // caller can abort. Reverting any axis to its permissive default on a
     // transient Postgres blip would silently escalate a sensitive actor's
     // authority, which is never acceptable for a privacy/mutation ceiling.
-    let (tier, ceiling, egress) = match repo.get_actor_ceilings(actor_id).await {
+    let (tier, ceiling, egress, http_verb_ceiling) = match repo.get_actor_ceilings(actor_id).await {
         Ok(Some(triple)) => triple,
         Ok(None) => {
             // Actor doesn't exist — caller should have verified ownership.
@@ -114,6 +119,10 @@ pub async fn apply_actor_to_engine(
 
     engine.set_max_llm_tier(tier);
     engine.set_max_write_ceiling(ceiling);
+    // The verb-inference override travels with the ceiling it modifies. `None`
+    // (SQL NULL, every actor that has not been given one) inherits the ceiling
+    // above, so this is inert by default.
+    engine.set_http_verb_ceiling(http_verb_ceiling);
     // Blanket network-egress scope override — independent of the LLM tier.
     // `None` (SQL NULL, the default for every actor) preserves the tier-derived
     // default at the worker; an explicit `local`/`public` overrides only the
@@ -151,4 +160,43 @@ async fn resolve_world_ceiling(
             .await?
             .unwrap_or_else(|| MOST_RESTRICTIVE_WORLD.to_string()),
     ))
+}
+
+#[cfg(test)]
+mod fail_closed_axis_pins {
+    /// The fail-closed stamp must say the restrictive thing on EVERY axis,
+    /// including the verb-inference override.
+    ///
+    /// `None` there would be restrictive only *because* the ceiling stamped
+    /// beside it is `ReadOnly` — a coincidence, and one that stops holding the
+    /// moment that line is edited. Measured: changing the stamp to `None`
+    /// survived the whole engine + core + worker suite, because no test drives
+    /// `apply_actor_to_engine`'s DB-error path (it needs a live repository).
+    ///
+    /// TEXTUAL, and it says so: it proves the restrictive value is WRITTEN, not
+    /// that the function reaches it.
+    #[test]
+    fn the_fail_closed_stamp_is_explicit_on_the_verb_axis() {
+        let src = include_str!("actor_binding.rs");
+        // Assembled so this test cannot match its own source.
+        let setter = format!("set_http_verb_{}(", "ceiling");
+        let restrictive = format!("Some(WriteCeiling::{})", "ReadOnly");
+
+        let body = src
+            .split("fn stamp_most_restrictive(")
+            .nth(1)
+            .expect("the fail-closed stamp routine has been renamed or removed");
+        let block = &body[..body.find("\n    }").unwrap_or(body.len())];
+
+        assert!(
+            block.contains(&setter),
+            "the fail-closed stamp no longer touches the verb-inference axis, \
+             so a DB error leaves it INHERITING: {block}"
+        );
+        assert!(
+            block.contains(&restrictive),
+            "the fail-closed stamp must write an EXPLICIT ReadOnly on the verb \
+             axis, never `None` (inherit): {block}"
+        );
+    }
 }

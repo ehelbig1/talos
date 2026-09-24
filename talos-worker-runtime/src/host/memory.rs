@@ -192,7 +192,14 @@ impl wit_agent_memory::Host for TalosContext {
         }
         // Write-ceiling gate: a read-only actor may recall from memory but
         // never mutate it. Inert unless `TALOS_WRITE_CEILING_ENFORCED=1`.
-        if self.write_ceiling_refuses("agent-memory-set", &key).await {
+        if self
+            .write_ceiling_refuses(
+                talos_workflow_job_protocol::CeilingAxis::Categorical,
+                "agent-memory-set",
+                &key,
+            )
+            .await
+        {
             return Err(wit_agent_memory::Error::NotAvailable);
         }
         // Fail-fast key validation via the canonical validator the controller's
@@ -257,7 +264,11 @@ impl wit_agent_memory::Host for TalosContext {
         }
         // Write-ceiling gate: read-only actors cannot delete memory.
         if self
-            .write_ceiling_refuses("agent-memory-delete", &key)
+            .write_ceiling_refuses(
+                talos_workflow_job_protocol::CeilingAxis::Categorical,
+                "agent-memory-delete",
+                &key,
+            )
             .await
         {
             return Err(wit_agent_memory::Error::NotAvailable);
@@ -335,7 +346,11 @@ impl wit_agent_memory::Host for TalosContext {
         }
         // Write-ceiling gate: read-only actors cannot write semantic memory.
         if self
-            .write_ceiling_refuses("agent-memory-store-with-embedding", &entry.key)
+            .write_ceiling_refuses(
+                talos_workflow_job_protocol::CeilingAxis::Categorical,
+                "agent-memory-store-with-embedding",
+                &entry.key,
+            )
             .await
         {
             return Err(wit_agent_memory::Error::NotAvailable);

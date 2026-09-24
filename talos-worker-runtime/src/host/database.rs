@@ -259,7 +259,8 @@ impl wit_database::Host for TalosContext {
             // has no invertible condition of its own.
             if let Some(audit_target) = write_ceiling_audit_target(&validated) {
                 if self
-                    .write_ceiling_refuses("database-query", audit_target)
+                    .write_ceiling_refuses(
+                    talos_workflow_job_protocol::CeilingAxis::Categorical,"database-query", audit_target)
                     .await
                 {
                     self.last_db_error =

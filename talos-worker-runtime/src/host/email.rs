@@ -56,7 +56,8 @@ impl wit_email::Host for TalosContext {
         // Write-ceiling gate: sending email is an outbound mutation — refuse
         // for read-only actors. Target is empty (recipient addresses are PII
         // and must not enter the WORM ledger). Inert unless enforcement is on.
-        if self.write_ceiling_refuses("email-send", "").await {
+        if self.write_ceiling_refuses(
+                    talos_workflow_job_protocol::CeilingAxis::Categorical,"email-send", "").await {
             return Err(wit_email::Error::Unauthorized);
         }
 

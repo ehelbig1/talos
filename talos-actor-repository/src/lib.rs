@@ -539,6 +539,9 @@ enum ActorCeiling {
     LlmTier,
     EgressScope,
     WriteCeiling,
+    /// Override for the VERB-INFERRED half of the write ceiling. Nullable —
+    /// `None` means inherit `max_write_ceiling`.
+    HttpVerbCeiling,
 }
 
 impl ActorCeiling {
@@ -553,6 +556,9 @@ impl ActorCeiling {
             Self::WriteCeiling => {
                 "SELECT max_write_ceiling FROM actors WHERE id = $1 AND user_id = $2 FOR UPDATE"
             }
+            Self::HttpVerbCeiling => {
+                "SELECT http_verb_ceiling FROM actors WHERE id = $1 AND user_id = $2 FOR UPDATE"
+            }
         }
     }
 
@@ -565,11 +571,17 @@ impl ActorCeiling {
             Self::WriteCeiling => {
                 "UPDATE actors SET max_write_ceiling = $1 WHERE id = $2 AND user_id = $3"
             }
+            Self::HttpVerbCeiling => {
+                "UPDATE actors SET http_verb_ceiling = $1 WHERE id = $2 AND user_id = $3"
+            }
         }
     }
 
+    /// Both ceiling columns carry a database escalation guard
+    /// (`20260709180000`, `20260924120000`), so both need the transaction-local
+    /// GUC. A guard covering one of two escalation paths is not a guard.
     fn needs_grant_guc(self) -> bool {
-        matches!(self, Self::WriteCeiling)
+        matches!(self, Self::WriteCeiling | Self::HttpVerbCeiling)
     }
 
     fn event_type(self) -> &'static str {
@@ -577,6 +589,7 @@ impl ActorCeiling {
             Self::LlmTier => "actor_llm_tier_ceiling_set",
             Self::EgressScope => "actor_egress_scope_set",
             Self::WriteCeiling => "actor_write_ceiling_set",
+            Self::HttpVerbCeiling => "actor_http_verb_ceiling_set",
         }
     }
 
@@ -585,6 +598,7 @@ impl ActorCeiling {
             Self::LlmTier => "tier ceiling",
             Self::EgressScope => "egress scope",
             Self::WriteCeiling => "write ceiling",
+            Self::HttpVerbCeiling => "http-verb ceiling",
         }
     }
 
@@ -593,6 +607,7 @@ impl ActorCeiling {
             Self::LlmTier => ("previous_tier", "new_tier"),
             Self::EgressScope => ("previous_egress_scope", "new_egress_scope"),
             Self::WriteCeiling => ("previous_ceiling", "new_ceiling"),
+            Self::HttpVerbCeiling => ("previous_http_verb_ceiling", "new_http_verb_ceiling"),
         }
     }
 
@@ -600,7 +615,11 @@ impl ActorCeiling {
     /// tier-derived default. The other two columns are NOT NULL.
     fn unset_label(self) -> &'static str {
         match self {
+            // A cleared override INHERITS `max_write_ceiling`; rendering it
+            // "unknown" would read as a failed read rather than a deliberate
+            // unset.
             Self::EgressScope => "default",
+            Self::HttpVerbCeiling => "inherit",
             Self::LlmTier | Self::WriteCeiling => "unknown",
         }
     }
@@ -2939,6 +2958,34 @@ impl ActorRepository {
         .await
     }
 
+    /// Set (or clear) an actor's override for the VERB-INFERRED half of the
+    /// write ceiling, and record it.
+    ///
+    /// `None` clears it back to SQL NULL, which INHERITS `max_write_ceiling` —
+    /// the pre-2026-09-24 behaviour. `Some(Write)` lets the three inferring
+    /// gates (`http::fetch`, `http::fetch_all`, `graphql::execute`) pass any
+    /// verb while the twelve categorical ops still follow `max_write_ceiling`;
+    /// `Some(ReadOnly)` refuses non-GET HTTP even for a `write` actor.
+    ///
+    /// Takes the grant-guard GUC for the same reason
+    /// [`Self::set_actor_max_write_ceiling`] does: this column carries its own
+    /// database escalation trigger (`20260924120000`), so a bulk or
+    /// migration-re-run `UPDATE` cannot grant it behind the operator's back.
+    pub async fn set_actor_http_verb_ceiling(
+        &self,
+        actor_id: Uuid,
+        user_id: Uuid,
+        ceiling: Option<talos_workflow_job_protocol::WriteCeiling>,
+    ) -> Result<Option<CeilingChange>> {
+        self.set_actor_ceiling_recorded(
+            actor_id,
+            user_id,
+            ActorCeiling::HttpVerbCeiling,
+            ceiling.map(|c| c.as_signing_str()),
+        )
+        .await
+    }
+
     /// The one writer of the three per-actor ceilings. Locks the actor row
     /// (ownership-scoped), reads the value it replaces, updates it and writes
     /// the `admin_event_log` record — all in ONE transaction, so a ceiling is
@@ -3021,10 +3068,12 @@ impl ActorRepository {
             talos_workflow_job_protocol::LlmTier,
             talos_workflow_job_protocol::WriteCeiling,
             Option<talos_workflow_job_protocol::EgressScope>,
+            Option<talos_workflow_job_protocol::WriteCeiling>,
         )>,
     > {
         let row = sqlx::query(
-            "SELECT max_llm_tier, max_write_ceiling, egress_scope FROM actors WHERE id = $1",
+            "SELECT max_llm_tier, max_write_ceiling, egress_scope, http_verb_ceiling \
+             FROM actors WHERE id = $1",
         )
         .bind(actor_id)
         .fetch_optional(&self.db_pool)
@@ -3048,7 +3097,15 @@ impl ActorRepository {
             let egress = talos_workflow_job_protocol::EgressScope::from_db_opt(
                 r.try_get::<Option<String>, _>("egress_scope")?.as_deref(),
             );
-            Ok((tier, ceiling, egress))
+            // Three-valued by design: SQL NULL means INHERIT `max_write_ceiling`
+            // and must NOT collapse into a value. `from_db_str` fails closed to
+            // `ReadOnly` on an unrecognised token, which on THIS axis is the
+            // tightening direction (the three inferring gates refuse non-GET).
+            let http_verb = talos_workflow_job_protocol::http_verb_ceiling_from_db(
+                r.try_get::<Option<String>, _>("http_verb_ceiling")?
+                    .as_deref(),
+            );
+            Ok((tier, ceiling, egress, http_verb))
         })
         .transpose()
     }
@@ -4214,6 +4271,9 @@ pub enum ModuleBoundCeilings {
         tier: talos_workflow_job_protocol::LlmTier,
         write_ceiling: talos_workflow_job_protocol::WriteCeiling,
         egress: Option<talos_workflow_job_protocol::EgressScope>,
+        /// Override for the VERB-INFERRED half of the write ceiling. `None`
+        /// inherits `write_ceiling`; see `CeilingAxis`.
+        http_verb_ceiling: Option<talos_workflow_job_protocol::WriteCeiling>,
     },
     /// The read succeeded and there is no such actor row.
     ///
@@ -4336,11 +4396,19 @@ impl ModuleBoundCeilings {
         talos_workflow_job_protocol::LlmTier,
         talos_workflow_job_protocol::WriteCeiling,
         Option<talos_workflow_job_protocol::EgressScope>,
+        Option<talos_workflow_job_protocol::WriteCeiling>,
     ) {
         (
             talos_workflow_job_protocol::LlmTier::Tier1,
             talos_workflow_job_protocol::WriteCeiling::ReadOnly,
             Some(talos_workflow_job_protocol::EgressScope::Local),
+            // The verb-inference override is EXPLICIT `ReadOnly` here, not
+            // `None`. `None` means INHERIT, which would be correct only
+            // because the ceiling beside it is already `ReadOnly` — a
+            // coincidence, and one that would silently stop being fail-closed
+            // if this tuple's ceiling were ever loosened. Say the restrictive
+            // thing on every axis, which is this function's whole contract.
+            Some(talos_workflow_job_protocol::WriteCeiling::ReadOnly),
         )
     }
 
@@ -4354,10 +4422,15 @@ impl ModuleBoundCeilings {
         talos_workflow_job_protocol::LlmTier,
         talos_workflow_job_protocol::WriteCeiling,
         Option<talos_workflow_job_protocol::EgressScope>,
+        Option<talos_workflow_job_protocol::WriteCeiling>,
     ) {
         (
             talos_workflow_job_protocol::LlmTier::Tier2,
             talos_workflow_job_protocol::WriteCeiling::Write,
+            None,
+            // `None` = inherit the `Write` beside it, which is this posture's
+            // whole point: it is the historical permissive shape, stated
+            // rather than tightened here.
             None,
         )
     }
@@ -4385,6 +4458,7 @@ impl ModuleBoundCeilings {
             talos_workflow_job_protocol::LlmTier,
             talos_workflow_job_protocol::WriteCeiling,
             Option<talos_workflow_job_protocol::EgressScope>,
+            Option<talos_workflow_job_protocol::WriteCeiling>,
         ),
         CeilingRefusal,
     > {
@@ -4393,7 +4467,8 @@ impl ModuleBoundCeilings {
                 tier,
                 write_ceiling,
                 egress,
-            } => return Ok((tier, write_ceiling, egress)),
+                http_verb_ceiling,
+            } => return Ok((tier, write_ceiling, egress, http_verb_ceiling)),
             ModuleBoundCeilings::ActorMissing => (
                 "module_bound_ceilings_actor_missing",
                 "actor row not found".to_string(),
@@ -4452,6 +4527,7 @@ pub fn classify_module_bound_ceilings<E: std::fmt::Display>(
             talos_workflow_job_protocol::LlmTier,
             talos_workflow_job_protocol::WriteCeiling,
             Option<talos_workflow_job_protocol::EgressScope>,
+            Option<talos_workflow_job_protocol::WriteCeiling>,
         )>,
         E,
     >,
@@ -4459,11 +4535,14 @@ pub fn classify_module_bound_ceilings<E: std::fmt::Display>(
     match read {
         Err(e) => ModuleBoundCeilings::Unreadable(e.to_string()),
         Ok(None) => ModuleBoundCeilings::ActorMissing,
-        Ok(Some((tier, write_ceiling, egress))) => ModuleBoundCeilings::Resolved {
-            tier,
-            write_ceiling,
-            egress,
-        },
+        Ok(Some((tier, write_ceiling, egress, http_verb_ceiling))) => {
+            ModuleBoundCeilings::Resolved {
+                tier,
+                write_ceiling,
+                egress,
+                http_verb_ceiling,
+            }
+        }
     }
 }
 
@@ -4517,7 +4596,12 @@ mod module_bound_ceilings_tests {
     use talos_workflow_job_protocol::{EgressScope, LlmTier, WriteCeiling};
     use uuid::Uuid;
 
-    type Triple = (LlmTier, WriteCeiling, Option<EgressScope>);
+    type Triple = (
+        LlmTier,
+        WriteCeiling,
+        Option<EgressScope>,
+        Option<WriteCeiling>,
+    );
 
     const ALL_SITES: [DispatchSite; 5] = [
         DispatchSite::GmailMessage,
@@ -4528,7 +4612,7 @@ mod module_bound_ceilings_tests {
     ];
 
     fn ok_tier2() -> Result<Option<Triple>, String> {
-        Ok(Some((LlmTier::Tier2, WriteCeiling::Write, None)))
+        Ok(Some((LlmTier::Tier2, WriteCeiling::Write, None, None)))
     }
 
     fn unreadable() -> ModuleBoundCeilings {
@@ -4579,10 +4663,14 @@ mod module_bound_ceilings_tests {
 
     #[test]
     fn a_resolved_row_passes_its_ceilings_through_verbatim() {
+        // The override is `Some(Write)` DELIBERATELY: a fixture whose fourth
+        // element matched the second could not tell a carried value from one
+        // derived from the ceiling beside it.
         let read: Result<Option<Triple>, String> = Ok(Some((
             LlmTier::Tier1,
             WriteCeiling::ReadOnly,
             Some(EgressScope::Public),
+            Some(WriteCeiling::Write),
         )));
         for site in ALL_SITES {
             assert_eq!(
@@ -4592,7 +4680,8 @@ mod module_bound_ceilings_tests {
                 (
                     LlmTier::Tier1,
                     WriteCeiling::ReadOnly,
-                    Some(EgressScope::Public)
+                    Some(EgressScope::Public),
+                    Some(WriteCeiling::Write)
                 ),
                 "{site:?} must pass a successful read through untouched"
             );
@@ -4636,10 +4725,17 @@ mod module_bound_ceilings_tests {
             (
                 LlmTier::Tier1,
                 WriteCeiling::ReadOnly,
-                Some(EgressScope::Local)
+                Some(EgressScope::Local),
+                Some(WriteCeiling::ReadOnly)
             )
         );
         assert_ne!(got.2, None, "an explicit Local, never a bare None");
+        assert_ne!(
+            got.3, None,
+            "an explicit ReadOnly on the verb axis, never a bare None — \
+             `None` would only be restrictive by coincidence of the ceiling \
+             beside it"
+        );
     }
 
     /// The restrictive triple must match the fail-closed sibling
@@ -4653,7 +4749,8 @@ mod module_bound_ceilings_tests {
             (
                 LlmTier::Tier1,
                 WriteCeiling::ReadOnly,
-                Some(EgressScope::Local)
+                Some(EgressScope::Local),
+                Some(WriteCeiling::ReadOnly)
             )
         );
     }
@@ -4825,7 +4922,8 @@ mod module_bound_ceilings_call_path_tests {
             (
                 LlmTier::Tier1,
                 WriteCeiling::ReadOnly,
-                Some(EgressScope::Local)
+                Some(EgressScope::Local),
+                Some(WriteCeiling::ReadOnly)
             )
         );
     }

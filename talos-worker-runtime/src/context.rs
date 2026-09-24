@@ -296,6 +296,21 @@ pub struct TalosContext {
     /// signed field stays inert until an operator opts in.
     pub max_write_ceiling: talos_workflow_job_protocol::WriteCeiling,
 
+    /// Per-actor override for the VERB-INFERRED half of the write ceiling.
+    ///
+    /// `None` = inherit [`Self::max_write_ceiling`], byte-identical to the
+    /// pre-2026-09-24 behaviour. Only the three gates that INFER "is this a
+    /// mutation?" from the HTTP verb consult it — `http::fetch`,
+    /// `http::fetch_all` and `graphql::execute`. The twelve categorical gates
+    /// (`agent-memory-set`, `email-send`, `messaging-publish`,
+    /// `database-query`, …) read `max_write_ceiling` alone, because there is
+    /// no inference there for an override to correct.
+    ///
+    /// Set post-construction beside `max_write_ceiling` (see
+    /// `TalosRuntime::execute_job_*`), not through `new` — the constructor
+    /// already takes twelve parameters and thirty-four call sites.
+    pub http_verb_ceiling: Option<talos_workflow_job_protocol::WriteCeiling>,
+
     /// Keeps the ephemeral `TempDir` alive until this context is dropped.
     /// Dropping `_ephemeral_dir` removes the directory from the file system.
     _ephemeral_dir: TempDir,
@@ -945,20 +960,24 @@ pub(crate) fn write_ceiling_enforced() -> bool {
         .get_or_init(|| talos_config::bool_env_or_default("TALOS_WRITE_CEILING_ENFORCED", false))
 }
 
-/// Pure write-ceiling decision, split from the env read + audit side effects
-/// in [`TalosContext::write_ceiling_refuses`] so the gate logic is unit-tested
-/// without a live context or process env. Returns `true` when a data-mutating
-/// host op MUST be refused: enforcement is on AND the ceiling forbids writes.
-/// Mirrors the `decide_llm_tier_access` split for the tier-1 gate.
-/// (#750) The BODY moved to `talos_workflow_engine_core::write_ceiling_denies`
-/// and this is now a re-export, not a second implementation. The worker was
-/// the only holder of the rule while the controller's `__memory_write__`
-/// envelope path had no gate at all — a `readonly` actor was refused at
-/// `agent_memory::set` and permitted at `__memory_write__` on the same job.
-/// A shared type (`WriteCeiling`) with a per-process copy of the PREDICATE is
-/// how two paths end up disagreeing about one control; the predicate is now
-/// shared too. The decision tests below still drive it from here.
-pub(crate) use talos_workflow_job_protocol::write_ceiling_denies;
+// Pure write-ceiling decision, split from the env read + audit side effects in
+// `TalosContext::write_ceiling_refuses` so the gate logic is unit-tested
+// without a live context or process env. Returns `true` when a data-mutating
+// host op MUST be refused: enforcement is on AND the ceiling forbids writes.
+//
+// (#750) The BODY lives in `talos_workflow_engine_core::write_ceiling_denies`,
+// not here — the worker held the rule while the controller's
+// `__memory_write__` envelope path had no gate at all, so a `readonly` actor
+// was refused at `agent_memory::set` and permitted at `__memory_write__` on the
+// same job. A shared type with a per-process copy of the PREDICATE is how two
+// paths disagree about one control.
+//
+// (2026-09-24) Production code here no longer calls the ONE-AXIS form: every
+// gate goes through `write_ceiling_denies_axis` so the axis is an explicit
+// argument the compiler demands (see `write_ceiling_refuses`). The decision
+// tests below still drive the one-axis form directly, because the two must
+// agree whenever the override is absent — that agreement is what makes this
+// axis inert by default.
 
 /// Whether read-side STRICT EGRESS is enforced for read-only actors.
 /// Default **off**, and only meaningful when `TALOS_WRITE_CEILING_ENFORCED`
@@ -1026,7 +1045,7 @@ pub fn write_ceiling_enforcement() -> WriteCeilingEnforcement {
 
 #[cfg(test)]
 mod write_ceiling_decision_tests {
-    use super::write_ceiling_denies;
+    use talos_workflow_job_protocol::write_ceiling_denies;
     use talos_workflow_job_protocol::WriteCeiling;
 
     /// The reported posture must come from the SAME readers the gates use.
@@ -1604,6 +1623,8 @@ impl TalosContext {
             // right after `new()`, mirroring `max_llm_tier`. Tests / legacy
             // paths keep the permissive default.
             max_write_ceiling: talos_workflow_job_protocol::WriteCeiling::default(),
+            // `None` = inherit the ceiling above; see the field's docs.
+            http_verb_ceiling: None,
         })
     }
 
@@ -2263,8 +2284,21 @@ impl TalosContext {
     /// `op` is a stable, non-secret label (e.g. `"agent-memory-set"`);
     /// `target` is a non-secret detail (key, sanitized URL, table) for the
     /// audit trail — never a secret value.
-    pub async fn write_ceiling_refuses(&mut self, op: &str, target: &str) -> bool {
-        self.write_ceiling_refuses_detailed(op, target, None).await
+    ///
+    /// `axis` is REQUIRED rather than defaulted, and that is the point: a new
+    /// gate site cannot inherit the wrong half of the ceiling by saying
+    /// nothing. [`CeilingAxis::VerbInferred`] belongs to the three sites that
+    /// guess "is this a mutation?" from the HTTP verb; everything else is
+    /// [`CeilingAxis::Categorical`]. Making it a parameter is a stronger
+    /// guard than a source pin — the compiler enforces it.
+    pub async fn write_ceiling_refuses(
+        &mut self,
+        axis: talos_workflow_job_protocol::CeilingAxis,
+        op: &str,
+        target: &str,
+    ) -> bool {
+        self.write_ceiling_refuses_detailed(axis, op, target, None)
+            .await
     }
 
     /// The write-ceiling refusal, with one sentence of operator detail.
@@ -2273,6 +2307,7 @@ impl TalosContext {
     /// classification is by VERB and nothing said so — see that constant.
     pub async fn write_ceiling_refuses_detailed(
         &mut self,
+        axis: talos_workflow_job_protocol::CeilingAxis,
         op: &str,
         target: &str,
         detail: Option<&'static str>,
@@ -2280,7 +2315,12 @@ impl TalosContext {
         // Pure decision (flag + ceiling) split out for unit testing; the
         // audit + warn side effects stay here. Short-circuits before any
         // allocation on the default (disabled) path.
-        if !write_ceiling_denies(write_ceiling_enforced(), self.max_write_ceiling) {
+        if !talos_workflow_job_protocol::write_ceiling_denies_axis(
+            write_ceiling_enforced(),
+            axis,
+            self.max_write_ceiling,
+            self.http_verb_ceiling,
+        ) {
             return false;
         }
         self.record_capability_denied_detailed(op, "write-ceiling", target, detail)

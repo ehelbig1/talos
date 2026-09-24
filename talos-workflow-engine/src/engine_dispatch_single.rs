@@ -565,6 +565,7 @@ impl ParallelWorkflowEngine {
             dry_run: self.dry_run,
             max_llm_tier: self.max_llm_tier,
             max_write_ceiling: self.max_write_ceiling,
+            http_verb_ceiling: self.http_verb_ceiling,
             egress_scope: self.egress_scope,
             idempotency_key,
             max_retries,

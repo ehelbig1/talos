@@ -267,6 +267,11 @@ pub struct DispatchJob {
     /// fail-closes to `ReadOnly` on DB errors — so a user-built workflow
     /// can't silently mutate data without an explicit grant.
     pub max_write_ceiling: crate::WriteCeiling,
+    /// Override for the VERB-INFERRED half of the write ceiling
+    /// (`http::fetch`, `http::fetch_all`, `graphql::execute`). `None`
+    /// inherits `max_write_ceiling`, which is byte-identical to the
+    /// pre-2026-09-24 behaviour. See `crate::CeilingAxis`.
+    pub http_verb_ceiling: Option<crate::WriteCeiling>,
 
     /// Blanket network-egress scope override (independent of `max_llm_tier`).
     /// `None` (default) falls back to the tier-derived default at the worker;
@@ -423,6 +428,7 @@ impl Default for DispatchJob {
             // and every user workflow must pass through it (lint check 29), so a
             // user-built workflow can't reach this permissive default.
             max_write_ceiling: crate::WriteCeiling::Write,
+            http_verb_ceiling: None,
             egress_scope: None,
             max_retries: 0,
             backoff_ms: 0,
@@ -808,6 +814,7 @@ impl fmt::Debug for DispatchJob {
             .field("dry_run", &self.dry_run)
             .field("max_llm_tier", &self.max_llm_tier)
             .field("max_write_ceiling", &self.max_write_ceiling)
+            .field("http_verb_ceiling", &self.http_verb_ceiling)
             .field("egress_scope", &self.egress_scope)
             .field("idempotency_key", &self.idempotency_key)
             .field("max_retries", &self.max_retries)
@@ -904,6 +911,11 @@ pub struct ChainDispatchRequest {
     /// Sourced from `actors.max_write_ceiling` via the canonical builder;
     /// permissive `Write` default for trusted actor-less jobs.
     pub max_write_ceiling: crate::WriteCeiling,
+    /// Override for the VERB-INFERRED half of the write ceiling
+    /// (`http::fetch`, `http::fetch_all`, `graphql::execute`). `None`
+    /// inherits `max_write_ceiling`, which is byte-identical to the
+    /// pre-2026-09-24 behaviour. See `crate::CeilingAxis`.
+    pub http_verb_ceiling: Option<crate::WriteCeiling>,
 
     /// Blanket network-egress scope override (independent of `max_llm_tier`).
     /// `None` (default) falls back to the tier-derived default at the worker;
