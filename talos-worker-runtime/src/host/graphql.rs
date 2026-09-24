@@ -3,6 +3,20 @@
 
 use super::*;
 
+/// The sentence an operator needs when the GraphQL write-ceiling gate refuses.
+///
+/// This gate INFERS rather than proves: GraphQL is always POST and the
+/// operation type is not cheaply provable from the request string, so every
+/// GraphQL call is treated as a mutation. That is the right fail-closed
+/// default and it was already stated in the code — but never to the operator,
+/// who saw only `graphql-execute denied by policy 'write-ceiling'` and had no
+/// way to learn that a pure QUERY is refused too.
+pub(crate) const GRAPHQL_INFERRED_DETAIL: &str =
+    "GraphQL is always POST and the operation type is not provable from the request string, \
+     so this gate treats EVERY GraphQL call as a mutation — a pure query is refused too. An \
+     actor that needs GraphQL reads needs the write ceiling; the controls that bound it are \
+     the module's allowed_hosts and its source";
+
 use crate::reason_class;
 
 /// L-17 (2026-05-22): shape-based introspection-query detector.
@@ -772,7 +786,10 @@ impl TalosContext {
         // from the request string. Fail-closed — treat GraphQL as a mutation
         // and refuse for read-only actors. An actor that needs GraphQL reads
         // uses the `Write` ceiling. Inert unless enforcement is on.
-        if self.write_ceiling_refuses("graphql-execute", "").await {
+        if self
+            .write_ceiling_refuses_detailed("graphql-execute", "", Some(GRAPHQL_INFERRED_DETAIL))
+            .await
+        {
             // Paired with `queryerror`, the discriminant this arm returns —
             // NOT with `networkerror`. The token matters here beyond
             // diagnostics: `queryerror` contains `query`, which

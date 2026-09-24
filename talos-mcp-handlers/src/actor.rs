@@ -371,7 +371,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                 Enforcement is worker-side, gated by TALOS_WRITE_CEILING_ENFORCED — a WORKER-ONLY flag that is default OFF, so the ceiling can be recorded on a deployment where nothing enforces it. \
                 The response therefore reports what the registered fleet actually says: 'enforcement_fleet.enforced_by' is all|some|none|unknown, and 'ceiling_is_advisory' is true for anything but 'all' (including 'unknown' — 'we cannot say it will be enforced' is not 'it will be'). Setting a ceiling before enabling enforcement is allowed; it is disclosed, not refused. \
                 SCOPE — what the ceiling does NOT cover (#768): it governs the ACTOR's own data plane (actor_memory, integration state, sandbox SQL), on the worker's host ops AND on the controller's two routes for them (a module's returned `__memory_write__` envelope, and every actor-attributed signed-RPC mutation). It deliberately does NOT gate the other two output protocols that reach the database through the same node-completion hook on the same actor binding: `__ops_alert__` (writes `ops_alerts`) and `__ml_distill__` (appends ML dataset rows). Those are PLATFORM ingestion keyed on the actor for TENANCY, not the actor's data, so a 'readonly' actor still lands those rows — which is the point: the intended shape for an alert-triage or teacher-loop actor is 'readonly' PLUS these protocols. \
-                NEW actors default to 'readonly' (so a freshly-built workflow can't silently mutate your data); existing actors were grandfathered to 'write'. Grant 'write' deliberately to actors that need to mutate.",
+                WHAT 'MUTATING' MEANS, and where it is INFERRED rather than proven: the HTTP legs classify by VERB — GET is the only read verb — and the GraphQL leg treats every call as a mutation because the operation type is not provable from the request string. Both are the right fail-closed default and both mean a READ-ONLY integration can still need 'write': an API whose reads are POSTs (Plaid, GraphQL, most client_id+secret APIs, many search endpoints) is refused under 'readonly'. The ceiling CANNOT express 'may POST, but only reads', so for such an actor 'write' is the correct setting and the controls that actually bound it are the module's allowed_methods, its allowed_hosts and its source — not this ceiling. Only the SQL leg proves it, by walking the statement's AST. NEW actors default to 'readonly' (so a freshly-built workflow can't silently mutate your data); existing actors were grandfathered to 'write'. Grant 'write' deliberately to actors that need to mutate.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -6820,5 +6820,69 @@ mod actor_budget_disclosure_tests {
         let note = readings.note();
         assert!(note.contains("DEGRADED"), "{note}");
         assert!(note.contains("null, NOT zero"), "{note}");
+    }
+}
+
+/// The write-ceiling tool description must say where "mutating" is INFERRED
+/// (2026-09-23).
+///
+/// TEXTUAL, and stated as such: it proves the description names the rule and
+/// the controls that really bound a POST-reading integration, not that the
+/// wording is good. It exists because the operator surface and the worker's
+/// fleet note are two files apart and had drifted into describing the same
+/// control at two levels of honesty — the note now carries
+/// `talos_worker_identity_repository::WRITE_CEILING_VERB_NOTE`, and this pins
+/// the tool description to the same claim.
+#[cfg(test)]
+mod write_ceiling_description_tests {
+    fn description() -> String {
+        super::tool_schemas()
+            .into_iter()
+            .find(|s| s["name"] == "set_actor_write_ceiling")
+            .expect("the tool is declared")["description"]
+            .as_str()
+            .expect("description is a string")
+            .to_string()
+    }
+
+    #[test]
+    fn it_names_the_verb_inference_and_the_controls_that_actually_bound_a_post_read() {
+        let d = description();
+        // The rule, in the same words the fleet note uses — read from the
+        // shared const rather than written out, so rewording one surface
+        // alone fails here instead of leaving the two quietly disagreeing.
+        assert!(
+            d.contains(talos_worker_identity_repository::WRITE_CEILING_VERB_RULE),
+            "{d}"
+        );
+        assert!(d.contains("INFERRED"), "{d}");
+        // The one leg that PROVES it — without this the reader cannot tell the
+        // inference is a property of three legs and not of the whole control.
+        assert!(d.contains("AST"), "{d}");
+        // The consequence an operator hits, and the honest way out.
+        assert!(d.contains("allowed_methods"), "{d}");
+        assert!(d.contains("allowed_hosts"), "{d}");
+        // And it must still say what it always said: the default is readonly.
+        assert!(d.contains("NEW actors default to 'readonly'"), "{d}");
+    }
+
+    /// CONTROL: the sibling tools that set the OTHER two axes must not have
+    /// acquired this sentence — it is specific to the write ceiling, and a pin
+    /// that passes because every description mentions verbs proves nothing.
+    #[test]
+    fn the_other_axis_tools_do_not_carry_the_verb_sentence() {
+        for name in ["set_actor_llm_tier_ceiling", "set_actor_egress_scope"] {
+            let d = super::tool_schemas()
+                .into_iter()
+                .find(|s| s["name"] == name)
+                .unwrap_or_else(|| panic!("{name} is declared"))["description"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                !d.contains(talos_worker_identity_repository::WRITE_CEILING_VERB_RULE),
+                "{name}: {d}"
+            );
+        }
     }
 }

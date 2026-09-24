@@ -227,6 +227,37 @@ pub struct WriteCeilingFleetSummary {
     pub state: FleetWriteCeilingState,
 }
 
+/// The one claim about the classifier that every prose surface makes.
+///
+/// Source of truth is `talos_worker_runtime::host::http::http_method_mutates`,
+/// which this crate deliberately does NOT import: a controller-side repository
+/// crate must not take a dependency on the worker runtime (check 51's direction),
+/// and the worker must not take one on a repository crate. So the phrase is a
+/// SHARED LITERAL for the two controller-side surfaces that can see this crate —
+/// [`WRITE_CEILING_VERB_NOTE`] and `set_actor_write_ceiling`'s description — and
+/// the worker's own `WRITE_CEILING_VERB_DETAIL` pins the same words with its own
+/// assertion. Three surfaces, two homes, and each one fails on its own if it is
+/// reworded alone; changing all of them together is a decision, which is the
+/// difference this is meant to preserve.
+pub const WRITE_CEILING_VERB_RULE: &str = "GET is the only read verb";
+
+/// What "data-mutating" MEANS on the enforcing legs, in one sentence.
+///
+/// Appended to the two states that can actually REFUSE (`All`, `Some`), and
+/// deliberately NOT to `None`/`Unknown`, whose own text says nothing is being
+/// enforced — there the question does not arise for the operator reading it.
+///
+/// Three of the four worker legs INFER the verdict and one PROVES it: the SQL
+/// leg walks the statement's AST (#757), while the HTTP legs classify by verb
+/// and the GraphQL leg cannot read the operation type out of the request
+/// string at all. The inference is the right fail-closed default; what was
+/// missing is that anyone reading "enforced" could not tell that a read-only
+/// integration over a POST-based API is refused by it.
+pub const WRITE_CEILING_VERB_NOTE: &str =
+    "Note that 'data-mutating' is INFERRED on three of the four legs: the HTTP legs classify by \
+     VERB (GET is the only read verb) and the GraphQL leg treats every call as a mutation, so a \
+     read-only integration over a POST-based API needs 'write'. Only the SQL leg proves it.";
+
 impl WriteCeilingFleetSummary {
     /// One sentence an operator can act on, derived from the state. Rendered
     /// by every consuming surface so they cannot word the same fleet
@@ -236,14 +267,14 @@ impl WriteCeilingFleetSummary {
         match self.state {
             FleetWriteCeilingState::All => format!(
                 "Enforced by all {} registered worker row(s): a 'readonly' ceiling refuses \
-                 data-mutating host ops.",
-                self.registered_rows
+                 data-mutating host ops. {}",
+                self.registered_rows, WRITE_CEILING_VERB_NOTE
             ),
             FleetWriteCeilingState::Some => format!(
                 "ADVISORY IN PART: only {} of {} registered worker row(s) report enforcement. \
                  Jobs are not routed by enforcement posture, so a 'readonly' actor's job may \
-                 land on a worker that does not enforce.",
-                self.enforcing, self.registered_rows
+                 land on a worker that does not enforce. {}",
+                self.enforcing, self.registered_rows, WRITE_CEILING_VERB_NOTE
             ),
             FleetWriteCeilingState::None => format!(
                 "ADVISORY: all {} registered worker row(s) report TALOS_WRITE_CEILING_ENFORCED \
@@ -1258,6 +1289,74 @@ mod write_ceiling_summary_tests {
             last_liveness_at: None,
             write_ceiling_enforced: enforced,
             write_ceiling_strict_egress: strict,
+        }
+    }
+
+    /// The note must make the CLAIM, not merely exist.
+    ///
+    /// Written after a mutation SURVIVED: rewording the constant left every
+    /// test green, because the placement test asserts `contains(the constant)`
+    /// — true of any wording — and the tool-description test reads a different
+    /// literal in another crate. Two surfaces agreeing on a claim while nothing
+    /// pins the words is the drift this package exists to close.
+    #[test]
+    fn the_note_names_the_rule_the_inference_and_the_leg_that_proves_it() {
+        let n = super::WRITE_CEILING_VERB_NOTE;
+        assert!(n.contains(super::WRITE_CEILING_VERB_RULE), "{n}");
+        // That the verdict is INFERRED is the whole point — without it the
+        // sentence reads as a description of what the ceiling does, not of
+        // what it cannot know.
+        assert!(n.contains("INFERRED"), "{n}");
+        // And the contrast: one leg does not infer. A reader told only that
+        // three legs guess cannot tell whether the control ever proves
+        // anything.
+        assert!(n.contains("Only the SQL leg proves it"), "{n}");
+    }
+
+    /// The verb note reaches every state that can REFUSE, and no other.
+    ///
+    /// The control is the second half: `None`/`Unknown` say nothing is
+    /// enforced, so appending it there would be noise — and without the
+    /// negative assertion this test would pass if the note were appended
+    /// unconditionally, which is a different (and wrong) rule.
+    #[test]
+    fn the_verb_note_is_on_the_states_that_can_refuse_and_only_those() {
+        let refusing = [
+            summarize_write_ceiling_enforcement(&[row("a", Some(true), None)]),
+            summarize_write_ceiling_enforcement(&[
+                row("a", Some(true), None),
+                row("b", Some(false), None),
+            ]),
+        ];
+        for s in &refusing {
+            assert!(
+                matches!(s.state, S::All | S::Some),
+                "fixture drifted: {:?}",
+                s.state
+            );
+            assert!(
+                s.note().contains(super::WRITE_CEILING_VERB_NOTE),
+                "{}",
+                s.note()
+            );
+        }
+
+        let advisory = [
+            summarize_write_ceiling_enforcement(&[row("a", Some(false), None)]),
+            summarize_write_ceiling_enforcement(&[]),
+            summarize_write_ceiling_enforcement(&[row("a", None, None)]),
+        ];
+        for s in &advisory {
+            assert!(
+                matches!(s.state, S::None | S::Unknown),
+                "fixture drifted: {:?}",
+                s.state
+            );
+            assert!(
+                !s.note().contains("GET is the only read verb"),
+                "{}",
+                s.note()
+            );
         }
     }
 
