@@ -163,7 +163,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "allowed_secrets": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Secret key_paths this module can access via secrets::get_secret(). Supports prefix matching: 'anthropic' grants 'anthropic' and 'anthropic/api_key' but NOT 'anthropic-test/key' — the separator must be '/'. Default: [] (deny all). Use ['*'] to allow all secrets."
+                        "description": format!("Secret key_paths this module can access via secrets::get_secret(). Supports prefix matching: 'anthropic' grants 'anthropic' and 'anthropic/api_key' but NOT 'anthropic-test/key' — the separator must be '/'. Default: [] (deny all). Use ['*'] to allow all secrets. {}", talos_workflow_job_protocol::SECRET_GRANT_DELIVERY_NOTE)
                     },
                     "allowed_hosts": {
                         "type": "array",
@@ -377,7 +377,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "update_module_secrets",
-            "description": "Update the allowed_secrets list for a compiled module. Use this to grant or revoke a module's access to specific vault secret paths. Supports prefix matching (e.g., 'oauth/gmail' grants access to 'oauth/gmail/user_id/email/access_token'). Writes to the unified modules table; companion tools update_module_hosts and update_module_methods modify the other permission columns.",
+            "description": format!("Update the allowed_secrets list for a compiled module. Use this to grant or revoke a module's access to specific vault secret paths. Supports prefix matching (e.g., 'oauth/gmail' grants access to 'oauth/gmail/user_id/email/access_token'). {} Writes to the unified modules table; companion tools update_module_hosts and update_module_methods modify the other permission columns.", talos_workflow_job_protocol::SECRET_GRANT_DELIVERY_NOTE),
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -388,7 +388,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                     "allowed_secrets": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "New allowed_secrets list. Replaces the existing list. Use prefix paths for broad grants (e.g., 'oauth/gmail' grants all gmail tokens). Use ['*'] for unrestricted access (not recommended)."
+                        "description": format!("New allowed_secrets list. Replaces the existing list. Use prefix paths for broad grants (e.g., 'oauth/gmail' grants all gmail tokens). Use ['*'] for unrestricted access (not recommended). {}", talos_workflow_job_protocol::SECRET_GRANT_DELIVERY_NOTE)
                     }
                 },
                 "required": ["module_id", "allowed_secrets"]

@@ -174,6 +174,8 @@ pub mod sandbox;
 pub mod schedules;
 pub mod schemas;
 pub mod search;
+#[cfg(test)]
+mod secret_grant_delivery_pins;
 pub mod secrets;
 pub mod ssrf_resolver;
 pub mod tool_hints;

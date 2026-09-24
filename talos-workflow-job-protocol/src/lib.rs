@@ -2685,6 +2685,45 @@ pub fn vault_path_permitted(allowed: &[String], key_path: &str) -> bool {
     })
 }
 
+/// Returns true if a dispatch will PRE-FETCH `key_path` on the strength of the
+/// `allowed_secrets` grant alone.
+///
+/// The delivery twin of [`vault_path_permitted`], and the two deliberately do
+/// NOT agree — that disagreement is the whole reason this function exists.
+/// `allowed_secrets` has two jobs:
+///
+///   1. **Permission** — may this module read this path? Answered by
+///      [`vault_path_permitted`], which matches `*`, an exact path, a bare
+///      prefix and a `/*` glob.
+///   2. **Delivery** — which paths does the controller resolve and put on the
+///      wire? The engine passes the grant list VERBATIM as `extra_paths` to
+///      `resolve_secrets_map_for`, which hands it to
+///      `SecretsManager::get_secrets_by_paths`, whose non-wildcard query is
+///      `WHERE key_path = ANY($1)` — **exact equality**. Only the literal `"*"`
+///      is special-cased (expanded to every secret the user can read).
+///
+/// So a prefix or glob entry is a perfectly good permission boundary and
+/// prefetches NOTHING: no vault row is literally named `plaid/*`, and an empty
+/// result is `Ok`, so nothing logs and nothing fails until the module asks for
+/// a secret that was never delivered.
+///
+/// Semantics — exactly two forms deliver:
+///   - `["*"]`        → every secret the user can read
+///   - `["a/b/c"]`    → that path, if a secret is stored at it
+///   - `["a/b"]`      → does NOT deliver `"a/b/c"` (permits it; delivers nothing)
+///   - `["a/b/*"]`    → delivers nothing, ever
+///
+/// A path this returns `false` for can still reach the module by the OTHER
+/// route: a `vault://<path>` reference in the node's own config, which the
+/// engine extracts (`secrets_pipeline::extract_vault_paths`) and resolves
+/// separately. That is how every OAuth integration works — a bare `oauth/gmail`
+/// grant bounds permission while the node config names the exact token path.
+/// So `false` means "the grant alone will not deliver this", never "this module
+/// cannot obtain this secret".
+pub fn vault_path_prefetched(allowed: &[String], key_path: &str) -> bool {
+    allowed.iter().any(|s| s == "*" || s.as_str() == key_path)
+}
+
 // ============================================================================
 // HTTP method allowlist matcher — shared between controller and worker
 // ============================================================================
@@ -2776,6 +2815,26 @@ pub fn sandbox_default_methods() -> Vec<String> {
 pub const METHOD_ALLOWLIST_REMEDY: &str =
     "declare the verbs this module uses with update_module_methods (an empty \
      allowed_methods denies every verb, matching allowed_hosts and allowed_secrets)";
+
+/// The one home for the sentence every operator surface must say about
+/// `allowed_secrets`: a prefix or glob entry PERMITS a path without DELIVERING
+/// it. Sibling of [`METHOD_ALLOWLIST_REMEDY`].
+///
+/// Four surfaces made the opposite claim before 2026-09-24 — two writer tools
+/// recommended the prefix form outright, `test_secret_access`'s allowlist gate
+/// suggested it as a remedy, and that same tool then returned four PASSes over
+/// a path no dispatch would deliver. They agreed on a claim and nothing pinned
+/// the words, so this const exists to make a reword of one of them a test
+/// failure rather than a silent divergence. See [`vault_path_prefetched`].
+pub const SECRET_GRANT_DELIVERY_NOTE: &str =
+    "Prefix and glob entries govern PERMISSION ONLY. A dispatch pre-fetches a \
+     secret on the strength of this list only when an entry is the EXACT path \
+     or \"*\" (the resolver's non-wildcard query is `key_path = ANY($1)`), so a \
+     grant like 'oauth/gmail' or 'plaid/*' permits a path and delivers nothing. \
+     Either name the exact path here, or reference `vault://<path>` in the \
+     node's config, which the engine resolves separately — that second route is \
+     how OAuth integrations work and is why a prefix grant is still correct for \
+     them.";
 
 // ============================================================================
 // Vault path LOG rendering — shared between controller and worker
@@ -3017,7 +3076,7 @@ mod vault_ref_extraction_tests {
 
 #[cfg(test)]
 mod vault_matcher_tests {
-    use super::vault_path_permitted;
+    use super::{vault_path_permitted, vault_path_prefetched};
 
     fn s(v: &[&str]) -> Vec<String> {
         v.iter().map(|x| x.to_string()).collect()
@@ -3099,6 +3158,128 @@ mod vault_matcher_tests {
             &s(&["oauth/google_cloud_write/*"]),
             "oauth/google_cloud_write/1a361562/9c4d/access_token"
         ));
+    }
+
+    // ── delivery twin ──────────────────────────────────────────────────────
+    //
+    // Every case below pairs the two matchers, because the finding is the
+    // DISAGREEMENT: a grant that permits a path and prefetches nothing reads
+    // as correct at every operator surface and delivers no secret at runtime.
+
+    #[test]
+    fn a_glob_grant_permits_but_never_prefetches() {
+        let grant = s(&["plaid/*"]);
+        // Control: permission is granted, which is why this is invisible.
+        assert!(vault_path_permitted(&grant, "plaid/client_id"));
+        assert!(
+            !vault_path_prefetched(&grant, "plaid/client_id"),
+            "a glob entry is looked up verbatim by `WHERE key_path = ANY($1)` \
+             and no vault row is named `plaid/*`"
+        );
+    }
+
+    #[test]
+    fn a_bare_prefix_grant_permits_but_never_prefetches() {
+        // The OAuth shape: this grant is CORRECT — the node config names the
+        // exact token path — but the grant alone delivers nothing.
+        let grant = s(&["oauth/gmail"]);
+        let path = "oauth/gmail/56a7eea7/user@example.com/access_token";
+        assert!(vault_path_permitted(&grant, path));
+        assert!(!vault_path_prefetched(&grant, path));
+    }
+
+    #[test]
+    fn an_exact_grant_both_permits_and_prefetches() {
+        let grant = s(&["plaid/client_id"]);
+        assert!(vault_path_permitted(&grant, "plaid/client_id"));
+        assert!(vault_path_prefetched(&grant, "plaid/client_id"));
+        // Control: the sibling path in the same namespace does neither.
+        assert!(!vault_path_permitted(&grant, "plaid/secret"));
+        assert!(!vault_path_prefetched(&grant, "plaid/secret"));
+    }
+
+    #[test]
+    fn the_wildcard_both_permits_and_prefetches() {
+        let grant = s(&["*"]);
+        assert!(vault_path_permitted(&grant, "anything/at/all"));
+        assert!(
+            vault_path_prefetched(&grant, "anything/at/all"),
+            "`*` is the one form the resolver special-cases, expanding it to \
+             every secret the user can read"
+        );
+    }
+
+    #[test]
+    fn an_empty_grant_prefetches_nothing() {
+        assert!(!vault_path_prefetched(&[], "plaid/client_id"));
+        assert!(!vault_path_permitted(&[], "plaid/client_id"));
+    }
+
+    /// The invariant that makes the asymmetry SAFE: delivery is strictly
+    /// narrower than permission, so a dispatch can never put a secret on the
+    /// wire that the grant does not also permit. If this ever inverts, the
+    /// prefetch has become an escalation route.
+    #[test]
+    fn prefetched_is_strictly_narrower_than_permitted() {
+        let grants = [
+            vec![],
+            s(&["*"]),
+            s(&["plaid/client_id"]),
+            s(&["plaid"]),
+            s(&["plaid/*"]),
+            s(&["oauth/gmail", "plaid/secret"]),
+        ];
+        let paths = [
+            "plaid/client_id",
+            "plaid/secret",
+            "plaid/access_token/item-1",
+            "oauth/gmail/u/a@b.c/access_token",
+            "anthropic/api_key",
+            "",
+        ];
+        let mut narrower_somewhere = false;
+        for g in &grants {
+            for p in &paths {
+                if vault_path_prefetched(g, p) {
+                    assert!(
+                        vault_path_permitted(g, p),
+                        "grant {g:?} prefetches {p:?} without permitting it — \
+                         the prefetch has become an escalation route"
+                    );
+                }
+                if vault_path_permitted(g, p) && !vault_path_prefetched(g, p) {
+                    narrower_somewhere = true;
+                }
+            }
+        }
+        // The corpus must actually exercise the gap, or the loop above is
+        // vacuous and would pass against two identical matchers.
+        assert!(
+            narrower_somewhere,
+            "corpus never produced a permits-but-does-not-deliver case"
+        );
+    }
+
+    /// The operator sentence is the whole remedy, so pin what it must SAY —
+    /// a correct pin beside a reworded sentence leaves the operator reading
+    /// advice that no longer matches the code.
+    #[test]
+    fn the_shared_delivery_sentence_names_both_routes() {
+        let n = super::SECRET_GRANT_DELIVERY_NOTE;
+        assert!(
+            n.contains("PERMISSION ONLY"),
+            "must name what a prefix does"
+        );
+        assert!(n.contains("EXACT path"), "must name remedy (a)");
+        assert!(
+            n.contains("vault://"),
+            "must name remedy (b), the config route"
+        );
+        assert!(
+            n.contains("OAuth"),
+            "must say why a prefix grant is still correct for OAuth, or a \
+             reader will 'fix' every integration's grant"
+        );
     }
 }
 
