@@ -813,10 +813,13 @@ impl wit_http::Host for TalosContext {
                 // `?` it mirrors.
                 Err(_) => return Err(deny_forbidden(self, reason_class::SECRET_LOOKUP)),
             };
-            match resolved_body {
-                Some(substituted) => builder = builder.body(substituted),
-                None => builder = builder.body(body.clone()),
-            }
+            // SHADOWED, not branched at the send: after this line the
+            // guest's placeholder bytes are not reachable under the name
+            // `body`, so "resolve and then send the originals" — a silent
+            // mutation recorded as open when body substitution shipped —
+            // cannot be spelled by swapping one argument.
+            let body = resolved_body.unwrap_or(body);
+            builder = builder.body(body);
         }
 
         let response = match builder.send().await {
@@ -1566,11 +1569,55 @@ impl wit_http::Host for TalosContext {
                 continue;
             }
 
+            // Resolve any `vault://` reference in this entry's JSON body, under
+            // the SAME four rules and the same refusal as `fetch` — one home,
+            // `resolve_vault_json_body`. Until 2026-09-24 `fetch_all` resolved
+            // headers (just above) and carried `req.body` through VERBATIM, so
+            // the batch sibling of a working `fetch` call silently posted the
+            // marker: the vault PATH, which names the provider and (for gmail)
+            // the account address, reached the destination.
+            //
+            // HERE, in the up-front validation pass, and not in the spawned
+            // task: the resolver takes `&mut self` and the tasks run
+            // concurrently under `buffer_unordered`, which is exactly why the
+            // header resolve already sits in this loop rather than beside the
+            // send.
+            //
+            // A failure is per-ENTRY (`Err` + `continue`), like `header_failed`
+            // above, so one unresolvable body does not fail the batch —
+            // MCP-783's rule that a validation-failed entry keeps its own error
+            // and spends no rate-limit budget.
+            let resolved_body = if req.body.is_empty() {
+                req.body.clone()
+            } else {
+                let declared_content_type = req
+                    .headers
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+                    .map(|(_, v)| v.clone());
+                match self
+                    .resolve_vault_json_body(
+                        crate::context::SecretUseSurface::HttpJsonBody,
+                        &host,
+                        &req.body,
+                        declared_content_type.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(Some(substituted)) => substituted,
+                    Ok(None) => req.body.clone(),
+                    Err(_) => {
+                        validated.push(Err(deny_forbidden(self, reason_class::SECRET_LOOKUP)));
+                        continue;
+                    }
+                }
+            };
+
             validated.push(Ok((
                 req.url.clone(),
                 reqwest_method,
                 hdrs,
-                req.body.clone(),
+                resolved_body,
                 // MCP-584: clamp per-request timeout in fetch_all
                 // exactly as fetch above. Each entry in the batch
                 // could otherwise pass u32::MAX and tie up a slot in
@@ -2813,56 +2860,20 @@ mod fetch_all_budget_and_breaker_tests {
     }
 }
 
-/// The body-substitution wiring, pinned TEXTUALLY because it cannot be driven:
-/// `fetch` needs a live secret provider, a resolvable host and a server. Two
-/// silent mutations live here — resolving the body and then sending the
-/// guest's original bytes (the PLACEHOLDER reaches the third party), and
-/// continuing past a refusal instead of returning. Neither changes any
-/// observable value in this process, so a test cannot see them.
-///
-/// Stated as a limit: a pin proves the source says the right thing, never that
-/// the request carried the right bytes.
-#[cfg(test)]
-mod vault_body_wiring_pin {
-    /// Needles are assembled at runtime so this test cannot match its own
-    /// source.
-    fn needle(parts: &[&str]) -> String {
-        parts.concat()
-    }
-
-    #[test]
-    fn the_substituted_body_is_the_one_sent_and_a_refusal_returns() {
-        let src = include_str!("http.rs");
-        let production = src
-            .split_once("#[cfg(test)]")
-            .map_or(src, |(before, _)| before);
-
-        // The resolved bytes, not the guest's originals, are what reqwest gets.
-        assert!(
-            production.contains(&needle(&[
-                "Some(substituted) => builder = builder",
-                ".body(",
-                "substituted)"
-            ])),
-            "the substituted body must be the body that is sent"
-        );
-        // A refusal exits; it never falls through to a send carrying the
-        // unresolved placeholder.
-        assert!(
-            production.contains(&needle(&[
-                "Err(_) => return Err(deny_forbidden(self, ",
-                "reason_class::SECRET_LOOKUP))"
-            ])),
-            "a body-resolution refusal must return, not continue to the send"
-        );
-        // The content type is read from the guest's own headers, so the
-        // JSON-only rule is decided by what the request actually declares.
-        assert!(
-            production.contains(&needle(&["n.eq_ignore_ascii_case(", "\"content-type\")"])),
-            "the declared content type must come from the request's own headers"
-        );
-    }
-}
+// The body-substitution wiring pin that used to sit here was SUPERSEDED on
+// 2026-09-24 and moved to `host/vault_body_parity_tests.rs`, for two reasons:
+// it now covers four surfaces across three files rather than this one, and a
+// pin must not live in a file it `include_str!`s — reverting that file to
+// reproduce a defect deletes the pin along with it.
+//
+// It recorded two silent mutations as open, and both are now closed. "Resolve
+// the body and then send the guest's originals" no longer has a convenient
+// spelling at `fetch`: the resolved bytes SHADOW `body`, so the placeholder is
+// not reachable under that name at the send. "Continue past a refusal instead
+// of returning" is caught behaviourally — the refusal is observable as the
+// latched `reason_class`, with no network and no server, which is what that
+// pin's own note said a test could not see. What a pin still owns is which
+// BYTES reqwest was handed, because the only observable for that is the socket.
 
 /// The refusal an operator reads must name the INFERENCE, not just the policy.
 ///

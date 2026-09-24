@@ -1116,18 +1116,59 @@ impl TalosContext {
 
         let client = self.http_client.clone();
 
-        let mut body = serde_json::json!({ "query": query });
-        if let Some(vars) = variables {
-            let vars_val: serde_json::Value =
-                serde_json::from_str(&vars).map_err(|_| wit_graphql::Error::Invalidvariables)?;
-            body["variables"] = vars_val;
-        }
+        // The composed envelope is SCOPED to this block and serialized inside
+        // it, so the `Value` does not outlive the serialization. That is
+        // deliberate: it makes `.json(&body)` — the one-token revert that would
+        // send the guest's placeholder instead of the resolved bytes — fail to
+        // compile rather than fail silently on the wire.
+        let body_bytes: Vec<u8> = {
+            let mut body = serde_json::json!({ "query": query });
+            if let Some(vars) = variables {
+                let vars_val: serde_json::Value = serde_json::from_str(&vars)
+                    .map_err(|_| wit_graphql::Error::Invalidvariables)?;
+                body["variables"] = vars_val;
+            }
+            serde_json::to_vec(&body).map_err(|_| wit_graphql::Error::Invalidvariables)?
+        };
+
+        // Resolve any `vault://` reference in the request body, under the SAME
+        // four rules and the same refusal as `http::fetch` — one home,
+        // `resolve_vault_json_body`. Until 2026-09-24 this surface resolved
+        // headers and sent the body VERBATIM, so a marker in a GraphQL
+        // variable was neither substituted nor refused and the vault PATH went
+        // to the destination.
+        //
+        // Serialized ONCE here, which is exactly the byte sequence reqwest's
+        // `.json()` would have produced, and the resolver works on those bytes
+        // rather than re-parsing its own output: a round trip back through
+        // `Value` would re-format every float in the guest's variables for no
+        // gain. With no marker present the bytes are unchanged, so a send that
+        // does not use this feature is byte-identical to before.
+        //
+        // The content type is the HOST's (`application/json`) — this envelope
+        // is composed here, not supplied by the guest — so the JSON-declaration
+        // rule is satisfied by construction and the marker rule that can still
+        // refuse is the unaddressable-pointer one.
+        let body_bytes: Vec<u8> = match self
+            .resolve_vault_json_body(
+                crate::context::SecretUseSurface::GraphqlJsonBody,
+                &target_host,
+                &body_bytes,
+                Some("application/json"),
+            )
+            .await
+        {
+            Ok(Some(substituted)) => substituted,
+            Ok(None) => body_bytes,
+            Err(_) => return Err(gql_deny(self, reason_class::SECRET_LOOKUP)),
+        };
 
         let mut attempts = 0;
         loop {
             let mut req_builder = client
                 .post(&url)
-                .json(&body)
+                .body(body_bytes.clone())
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .timeout(std::time::Duration::from_millis(timeout_ms));
             for (k, v) in &headers {
                 // Networkerror is the closest existing variant; a dedicated forbiddenhost

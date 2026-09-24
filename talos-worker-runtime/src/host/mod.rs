@@ -51,6 +51,11 @@ mod sibling_egress_reason_tests;
 #[cfg(test)]
 mod sse_connect_failure_tests;
 
+/// `vault://` body substitution must reach every guest-composed egress
+/// surface, not only `http::fetch` (2026-09-24).
+#[cfg(test)]
+mod vault_body_parity_tests;
+
 mod cache;
 mod crypto;
 mod data;

@@ -9432,3 +9432,214 @@ above, this is the digest that pointed at it, not a second copy of the story.
 * **EN, 2026-09-24 — `allowed_secrets` has TWO vocabularies and four operator surfaces taught the one that delivers nothing.** Found by USING it, not auditing it: `plaid-read`'s grant was the glob `plaid/*`, both Plaid nodes failed `reason_class=secret-lookup`, and my own first diagnosis (empty `allowed_modules` on the secrets) was WRONG — the mechanism is that the engine passes the grant list VERBATIM as `extra_paths` to `resolve_secrets_map_for` → `SecretsManager::get_secrets_by_paths`, whose non-wildcard query is `WHERE key_path = ANY($1)`, **exact equality**, with only the literal `"*"` special-cased. So PERMISSION (`vault_path_permitted`: exact · bare prefix · `/*` glob · `*`) and DELIVERY (exact · `*`) are different sets: a prefix or glob entry permits a path and prefetches nothing, an empty result is `Ok`, and nothing logs or fails until the module asks for a secret that was never sent. **Measured fleet-wide: 63 grant entries — 8 exact, 30 naming a path this deployment has not stored, and 25 that permit correctly and deliver nothing (19 glob + 6 bare prefix). The NODE-level measurement corrected itself and the correction is the instructive half**: a first pass joined on `n->'data'->>'module_id'` with the config at `n->'data'->'config'` and returned ZERO affected nodes, which I nearly recorded as *latent, nothing uses these grants* — but a node's config IS `data` and its module id is `type`, so the join matched nothing and the zero was for the wrong reason. Re-measured over non-archived workflows: **31 live nodes ARE bound to a permit-only-granted module and every one carries a `vault://` reference in its own config**, so all 31 are delivered by the other route and work; 7 more have a delivering grant AND a config ref; 43 need no secrets. The dangerous quadrant — permit-only grant AND no config reference — held exactly TWO nodes, both `plaid-read`, both failing, and now holds ZERO (fixed by naming its three exact paths, which is also a TIGHTER allowlist than the glob it replaced). Those 31 correct uses are the empirical case for disclosure over refusal. ONE home: `talos_workflow_job_protocol::vault_path_prefetched`, the delivery twin beside `vault_path_permitted`, pinned by `prefetched_is_strictly_narrower_than_permitted` — the invariant that keeps the asymmetry SAFE (a dispatch can never put on the wire what the grant does not also permit), with a vacuity guard so it cannot pass against two identical matchers. `test_secret_access`, whose stated purpose is *"use this when get_secret() is failing at runtime to identify which gate is responsible"*, gains a fifth gate `dispatch_prefetch`; its four existing gates ALL PASSED over a path no dispatch would deliver. **DECIDED: gate 5 is deliberately NOT folded into `would_succeed`** — a path the grant does not prefetch can still arrive by a `vault://<path>` reference in the node's own config, the route 31 of this fleet's live nodes use and one this tool cannot see (it takes a module and a path and no node), so folding it would flip `would_succeed` false for modules that demonstrably work: the determinate negative in the other direction. **Deliberately NOT refusing or rewriting a glob at the write** — a glob is a legitimate permission boundary for a config-ref module (every OAuth integration is one), so the fix is DISCLOSURE. The sentence has ONE home, `SECRET_GRANT_DELIVERY_NOTE` (EI's N8 lesson: three surfaces agreed on a claim, nothing pinned the words, and a reword stayed green), carried by all four surfaces — `test_secret_access`'s description, which also said "the same three gates" while listing four; `compile_custom_sandbox`'s `allowed_secrets`; `update_module_secrets`' description AND its `allowed_secrets` param — with gate 3's per-path remedy (*"Add it (exact path or prefix) and recompile"*) pinned NEGATIVELY, because a count pin over static descriptions cannot see a runtime sentence. **No lint check added and `--count` stays 97**: the population is one predicate and four description sites, below #765's bar, and the structural answer is stronger — one `pub` delivery twin plus a pin that fails if any surface drops the sentence. **Stated limits**: the pins are TEXTUAL and `handle_test_secret_access` is not driven end to end (it needs an `McpState` with a database and a vault), so a gate that decides correctly and renders wrongly is caught by the pin alone; and the 30 entries naming an unstored path are deliberately left alone — that is a module declaring a path this deployment has not provisioned, a steady state, so warning on it at dispatch would fire on a healthy fleet (check 69's trap). **Mutations 13 applied, 13 caught**, each landed by hash and byte-reverted under a `finally`, covering both findings (the delivery predicate widened or narrowed; gate 5 folded into the verdict, computed-but-unreported, or its remedy reverted; the shared sentence dropped from either writer surface or reworded; gate 1 requiring BOTH routes or restoring the recompile advice; the substitution predicate claiming unknown worlds or dropping `http`). **Two findings against my own harness and one rule broken, recorded rather than smoothed over**: M4's first form did not COMPILE and the green predicate `not re.search(r'[1-9]\d* failed')` scored it a SURVIVOR — the "a mutation that does not compile proves nothing" rule defeating the instrument that enforces it; the fix then over-corrected, because `^error:` also matches cargo's own `error: test failed` on an ORDINARY failure, so every genuine catch was reported INVALID (a verdict is THREE-valued, and the boundary is `could not compile` / `^error[E\d+]`, never a generic `error:`). And mid-run I edited `talos-failure-analysis-service` — a DEPENDENCY of `talos-mcp-handlers` — so the set spanned two trees; it was discarded and re-run whole on one tree, which is the 13 reported here. **A MORE SEVERE second finding in the same tool, found while validating the first, and DECIDED to ship in this package rather than first as its own PR.** Gate 1 tested one of the TWO routes a secret takes to a module: the GUEST route (`secrets::get_secret()`, needing the `secrets` interface) and not the HOST route (a `vault://` marker in an outbound header or JSON body, resolved by the host at the socket so the plaintext never enters the guest — the safer route, and the one every OAuth integration uses). **Measured: ALL 38 live nodes carrying a `vault://` config reference are `http-node`, across 14 modules — so gate 1 was 0-for-38 on this fleet**, returning `would_succeed: false` with the remedy *"Recompile with capability_world: secrets-node"*, which would have WIDENED 14 modules' capability world and fixed nothing; `plaid-read` was fetching 14 accounts and 49 transactions at the moment the tool called it incapable, and for it the right answer was the grant form while gate 1 was shouting about the world. ONE home: `talos_capability_world::world_allows_vault_substitution`, whose correctness is **DERIVED from `wit/talos.wit` rather than transcribed** — `the_substitution_predicate_matches_the_wit` reads each world's own body and asserts the predicate equals "imports http/webhook/graphql", with a vacuity floor, so a world added to the lattice cannot drift it the way a hand-maintained `matches!` list would (verified at the WIT: `minimal-node` imports no egress interface and every other world imports all three). An unknown world is claimed to have NEITHER route — for a diagnostic the conservative direction is to claim nothing. Gate 1 now reports per-route answers in `gates[0].routes` and keeps an actionable recompile remedy for the genuinely-unreachable `(false, false)` case, pinned as a CONTROL so the fix cannot pass by removing all advice. **The single-package decision is stated rather than silently taken**: the standing rule is that a more severe finding ships first as its own PR, and these two are the same defect — *this tool's verdict does not describe how secrets actually reach a module* — in the same function, the same response contract and the same pin file, so splitting them would ship two half-corrections to one sentence and collide on identical lines. **Unrelated pre-existing flake, called out rather than absorbed**: the protocol crate's `the_retention_window_is_never_narrower_than_the_widest_verifier` failed once in six full-suite runs on this branch and zero times in three on pristine main — two tests depend on the process-global `JOB_NONCE_CACHE`'s SIZE (the >1024 sweep threshold) while 59 `.verify()` call sites in the same crate mutate that global without taking `NONCE_CACHE_TEST_SERIAL`; the six tests added here only perturbed scheduling. NOT fixed in this package — it is test-only and pre-existing, and the honest fix restructures a security test's relationship to a global. **Also here, the live proof owed since #941**: the EL/EM verb axis is now demonstrated end to end on the fleet — same actor, same module, same workflow, three runs — `write`/inherit → completed; `readonly`/inherit → REFUSED `reason_class=write-ceiling`; `readonly`/**`write`** → completed (14 accounts, 49 transactions). The only change between runs 2 and 3 is the axis EL added, and the resting posture it makes expressible — `readonly` categorical + `write` verb + tier1 + egress public — is the strongest this platform can state for a POST-based financial reader.
 
 * **EO, 2026-09-24 — the drill's scheduler could not run the leg that matters, so the off-host copy had never been certified once.** Found by diagnosing a FIRING alert rather than by audit. `TalosBackupRestoreDrillLastRunFailed` was up; the metric said `last_status 0` with last success 2026-09-14 and last run 2026-09-20, and the alert's own text distinguishes *ran and failed* from *overdue*. **Two findings, and only the second is fixed here.** (1) The `--source artifact` leg fails at the ESCROW step, before any backup or restore logic: the plist's `TALOS_DRILL_ESCROW_KEY_CMD` uses a 1Password SERVICE ACCOUNT token, and the installed `op` is **2.16.1**, which does not implement them — `op service-account` answers *unknown command*, the phrase appears nowhere in `op --help`, and `OP_SERVICE_ACCOUNT_TOKEN=<128 chars> op whoami` answers *account is not signed in*. So `op` ignores the variable and falls back to user auth: interactively it prompts and passes, headless at 03:00 it times out. **Operator-owned and NOT fixed here** (their machine, their 1Password). (2) **The `--source b2` leg has never run, not once** — only ONE plist exists and it runs `artifact`; every drill series carries `source="artifact"` and no `source="b2"` series has ever been published. It could not have run: the scheduler propagated four `TALOS_DRILL_*` variables and NONE of the off-host ones, so a `TALOS_DRILL_SCHEDULE_SOURCE=b2` install rendered a plist with no age passphrase, no bucket, no endpoint and no region — a job that dies weekly at *no age passphrase source configured*. Package BC recorded this as a stated limit; this is the wiring. **The consequence is measurable and compounding**: package AT made *the off-host backup chain proven end-to-end* the precondition for `MODULE_EXECUTION_RETENTION_ENABLED`, which is still unset, and `module_executions` went 57 755 rows / 193 MB (2026-09-13) to **69 331 / 234 MB** — ~1 050 rows and ~3.7 MB a day, on a database now at 888 MB. **ONE home**: `scripts/lib/offhost-env.sh` holds the single list of variables a LaunchAgent may carry for an off-host job, sourced by BOTH schedulers — they address the same bucket with the same credentials, so two lists would be two answers to one question. The twin (`scripts/offhost-backup/schedule.sh`) already had the correct list inline and now delegates. **The tool list is DERIVED, not fixed**: `b2` fetches through the `aws` CLI, so it joins `cargo docker`, and a `b2` install is refused when `aws` is unresolvable — while an `artifact` install is NOT, because refusing to schedule a local drill on a host with no `aws` is the opposite error. Both halves are pinned; a mutation demanding `aws` unconditionally is caught by the `artifact` half. **A contradictory pair is REFUSED at install**, for BOTH pairs — the drill itself dies on `_CMD` and `_FILE` both set (its reason: precedence would silently ignore the FILE branch, *the one that carries the containment checks*), and catching it at install costs one line instead of a week. Adding the check to the off-host pair and not its escrow twin would have been the asymmetry this file keeps paying for. **`AWS_SECRET_ACCESS_KEY` is still never propagated** — a plist is a readable file and would sit beside the path of the ciphertext it opens; `AWS_ACCESS_KEY_ID` / `AWS_PROFILE` / `AWS_SHARED_CREDENTIALS_FILE` ARE carried, on `talos-offhost-backup/src/aws.rs`'s own stated asymmetry that *the key id may be logged; the secret may not*. My first draft excluded the key id "for symmetry" and that was wrong against the twin's precedent. **A MISSING secret keeps the warn-and-install treatment** rather than a refusal, deliberately: the drill calls the age passphrase *a SECOND fatal secret … same containment rules*, so it is mirrored on the escrow's terms; a refusal is reserved for the contradictory pair, which has no sibling treatment. **A measurement error worth carrying**: my own inventory of the b2 leg's requirements MISSED all three `TALOS_OFFHOST_B2_BUCKET`/`_ENDPOINT`/`_REGION` variables, because the character class `[A-Z_]` excludes the digit in `B2` — the README caught what the grep did not, and without it this package would have moved the weekly failure from *no passphrase* to *no bucket* rather than removing it. Third recorded instance of a character class dropping evidence. **Mutations 9 applied, 9 caught**, each landed by hash and byte-reverted under a `finally`. The harness's own early-abort tripwire also caught a defect in MY TEST — the parity probe set both halves of the passphrase pair, tripping the very guard under test, which proves nothing; the probe now excludes the FILE half and asserts both plists actually rendered so the loop cannot pass vacuously over two empty strings. **Stated limits**: this makes the b2 drill SCHEDULABLE, it does not make it PASS — that needs the operator's bucket credentials and escrowed age passphrase, and `op` 2.16.1 cannot fetch either unattended, so finding (1) still blocks every unattended run. Nothing here is provable on this host until those exist: there are still zero `source="b2"` series, and the honest guard is the first scheduled run after the operator wires them. No lint check added and `--count` stays **97** — the population is two schedulers already sharing one list, below #765's bar, and the parity test is stronger than a grep. 
+
+## EQ (2026-09-24) — header substitution reached every egress surface; body substitution reached one of four
+
+### How it was found
+
+Not by auditing. The fleet was read after the #946 deploy to check the
+instruments whose only stated guard was "the live read after deploy" — DU's
+WebSocket series, DY's privileged gate, EA's outcome split. All were present and
+correctly pre-seeded (ten WS outcomes, seven privileged outcomes, four
+platform-admin, seven rate-limit kinds), and **both processes booted with zero
+WARN and zero ERROR** — the rank-training demotion (2026-09-11) and EA's
+`closed_before_init` demotion both holding. The only two firing alerts were the
+operator-owned ones already recorded: EO's drill escrow and DM's advisory DB.
+
+So the fleet offered no defect, and the next package came from the recorded open
+list. EE's own stated limit was the sharpest entry: the `fetch` wiring "covered
+by TEXTUAL pins", with "two silent mutations" living there. Reading that call
+site to price the gap raised the better question — EE made placement a
+PARAMETER of one resolver and wired it at `http::fetch`; where else is there a
+body?
+
+### The measurement
+
+`resolve_vault_header` is called from eight files. `resolve_vault_json_body` was
+called from ONE. Enumerating the guest-composed body-carrying egress surfaces:
+
+| surface | headers | body | live callers |
+|---|---|---|---|
+| `http::fetch` | ✓ | ✓ | 59 |
+| `http::fetch_all` | ✓ | ✗ | 1 |
+| `webhook::send` | ✓ | ✗ | 0 |
+| `graphql::execute` | ✓ | ✗ | 0 |
+
+`fetch_all` is the one that matters as a lesson: it is in the SAME FILE as
+`fetch`, resolves its headers in an up-front pass (because the resolver takes
+`&mut self` and the sends run concurrently under `buffer_unordered`), and
+carried `req.body` through verbatim. EJ's shape exactly — "the correct shape sat
+in the SAME FILE".
+
+**And no surface refused.** A marker in the body on those three was neither
+substituted nor refused: it was transmitted. EE made an unaddressable pointer a
+REFUSAL rather than a silent skip for a stated reason — "leaving the reference in
+place would send the vault PATH, which names the provider and the user, to the
+third party" — and for `oauth/gmail/<uid>/<email>/…` the path carries the
+account address. Three of four surfaces had no such rule.
+
+**Our own documentation invited it.** `get_rust_scaffold` says, unqualified, in a
+section headed "When the API takes the credential in the BODY": *"The host
+resolves a vault:// reference inside a JSON request body too, under the same
+rules … (a non-JSON body carrying the marker is REFUSED, never rewritten)"*. EN's
+`test_secret_access` gate-1 reason, shipped the day before, says a marker "in an
+outbound header or JSON body is resolved by the host" for any world that can
+egress — and `world_allows_vault_substitution` is defined as importing
+http/**webhook**/**graphql**, i.e. **90 of 115 modules** were told the true thing
+about headers and the false thing about bodies. `docs/integrating-external-apps.md`
+advised putting the credential in the JSON body as the remedy.
+
+**Latent, stated plainly**: 0 of 115 modules call `webhook::send` or
+`graphql::execute`, and the single `fetch_all` caller (`readlater-fetch`) carries
+no marker. Nothing leaked on this fleet. The documentation is what made it worth
+fixing rather than recording.
+
+### A measurement error worth carrying
+
+The live-node query returned ZERO rows for markers in node config, against EN's
+measured 38. Both instruments were run over the same rows, so one was wrong.
+Positive control: 38 nodes DO contain a marker and `data` is an object on all
+111. The recursive walk found `data.AUTH_HEADER`; the SQL did not, because the
+stored value is **`Bearer vault://…`** and the predicate was the anchored
+`LIKE 'vault://%'`. The SQL was right about its predicate and wrong about the
+question. This is the third character-class/anchor miss recorded in a week (EO's
+`[A-Z_]` excluding the digit in `B2`); the rule that caught it is "positive-control
+every zero".
+
+### Decisions
+
+* **SUBSTITUTE, not refuse.** Both close the leak. Substituting is what the
+  documentation already promises, what header parity already gives, and it adds
+  no blast radius: the bound stays `allowed_hosts` ∩ `allowed_secrets`,
+  exactly as EE recorded, so a module can reach nothing it could not already
+  reach through a header. Refusing would have retracted documented behaviour and
+  left a body-auth webhook target unreachable.
+* **ONE resolver, four call sites.** `resolve_vault_json_body` is unchanged; only
+  its call sites grew. The four rules (JSON only, string VALUES only, parsed
+  tree, cap 8) and the unaddressable-pointer refusal are inherited rather than
+  restated.
+* **`webhook::send` resolves ONCE, before the retry loop**, for two reasons: a
+  per-attempt resolve re-reads the vault on every retry, and a rotation landing
+  mid-retry would split one logical delivery across two credentials.
+* **AFTER the webhook dedup fingerprint, deliberately.** That hash is computed
+  from the PLACEHOLDER body, which is the stable secret-free request identity;
+  hashing the resolved bytes would put plaintext in the idempotency record and
+  change the fingerprint whenever the credential rotated.
+* **`webhook::send` sets no content type of its own**, so the JSON declaration
+  must come from the guest's headers, and a marker in a body not declared JSON is
+  REFUSED. That is a behaviour change from silently posting the placeholder, in
+  the safer direction, and it is what any real JSON API requires anyway.
+* **GraphQL's envelope is serialized ONCE inside a scoped block.** The resolver
+  works on those bytes rather than re-parsing its own output — a round trip back
+  through `Value` would re-format every float in the guest's variables for no
+  gain — and with no marker the bytes are unchanged, so a send that does not use
+  the feature is byte-identical to before. The scoping is load-bearing: it makes
+  `.json(&body)`, the one-token revert that would send the placeholder, a
+  COMPILE error.
+* **`fetch_all` resolves per ENTRY in the validation pass**, and a failure is
+  `Err` + `continue`, so one unresolvable body does not fail the batch —
+  MCP-783's rule that a validation-failed entry keeps its own error and spends no
+  rate-limit budget.
+* **`fetch`'s resolved bytes now SHADOW the guest's body**, which closes the
+  first of EE's two recorded silent mutations by removing the convenient name
+  rather than by pinning it.
+* **Two new ledger surfaces, `webhook-json-body` and `graphql-json-body`**;
+  `fetch_all` reuses `HttpJsonBody` exactly as its headers reuse `HttpHeader`.
+  `HttpJsonBody`'s own doc already says why placement is recorded distinctly.
+* **Dry-run does not resolve** on `fetch` and `webhook` (both return earlier) and
+  DOES on `fetch_all` (its validation pass already resolved headers under
+  dry-run). Correct either way — dry-run does not egress, so there is nothing to
+  protect and a rehearsal should not spend a vault read — and the asymmetry is
+  pre-existing in the HEADER path, mirrored rather than introduced. Pinned by
+  `webhook_dry_run_does_not_resolve_the_body`, which doubles as the control
+  proving the webhook refusals come from the resolve.
+* **Host-composed bodies are deliberately EXCLUDED, and that is the decision
+  worth recording**: `email::send`'s MIME document, `object_storage`'s signed S3
+  request and the `llm::*` provider envelopes are composed by the host from guest
+  fields. A marker there is prose the guest chose to send, not a credential
+  placement, and substituting would put a secret into an email body or an LLM
+  prompt. They neither substitute nor refuse — refusing would break a user who
+  legitimately writes the string. One home for the sentence,
+  `VAULT_BODY_SUBSTITUTION_SURFACES_NOTE`, carried by the scaffold, the gate-1
+  reason and `docs/integrating-external-apps.md`.
+
+### Guards, and what they prove that a pin cannot
+
+The proof is **pre/post against the real pre-fix tree**, not mutation: the four
+production files were reverted to `origin/main` with the new test file kept, and
+**4 of 11 tests failed** — and the failure messages are the evidence:
+
+* graphql latched `send-failed`, i.e. **the request went out carrying the
+  marker**;
+* both webhook cases latched nothing, i.e. the send was attempted;
+* `fetch_all` returned **Ok** for the marker entry.
+
+`fetch`'s own refusal test PASSED on main, which is the built-in control for the
+whole file: the suite is not green because everything refuses.
+
+The refusal is observable as the latched `reason_class` with no network, and a
+site that does not call the resolver cannot latch `secret-lookup` — so this is a
+behavioural WIRING guard, which EE could only approximate with a pin.
+`a_granted_marker_is_substituted_and_the_marker_never_survives` drives
+`resolve_vault_json_body` with a LIVE provider (`TalosContext::new` takes the
+secrets map), which closes EE's recorded "needs a live secret provider and
+cannot be driven from a unit test".
+
+EE's pin is SUPERSEDED and moved out of `http.rs`: a pin must not live in a file
+it `include_str!`s, because reverting that file to reproduce the defect deletes
+the pin with it (EK's lesson). The replacement covers four surfaces in three
+files.
+
+**Two findings against my own pin, both the traps this file already records.**
+Its first form used `split_once("#[cfg(test)]")` — copied from EE's — and all
+four assertions failed, because `graphql.rs` carries a test module at line 375
+while its resolver call is at 1153: the split truncated 778 lines ABOVE the code
+being pinned and could never have seen it. EI recorded that exact hazard. And
+once the strip was conservative, the negative assertion still failed because my
+own explanatory comment contains the `.json(&body)` form it asserts is absent —
+the self-report trap for the fourth time (checks 73, 87, 97, EG's check 4).
+Comments are stripped from the haystack now, which is why a rule must never be
+enforced against the sentence describing it.
+
+**Mutations: 10 applied, 10 caught, after TWO survived the first run** — and
+both survivors were gaps in the guards rather than in the fix:
+
+* **M3** (webhook assumes `application/json` instead of reading the declared
+  type) survived because the existing no-content-type test used an UNGRANTED
+  path, so it refused for the other reason. The discriminating test uses a
+  GRANTED, present path, where the only thing left that can refuse is the absent
+  JSON declaration.
+* **M4** (`Ok(Some(_)) => body_bytes` — resolve correctly, then send the
+  pre-substitution bytes) survived because the pin asserted that `body_bytes` is
+  sent, not that the `Some` arm RETURNS the substituted value. This is EE's
+  "resolve then send the originals" in the one surface where shadowing could not
+  close it.
+
+### Stated limits
+
+* `fetch_all` iterates `&reqs`, so the guest's `req.body` stays reachable by
+  construction and the resolved bytes cannot shadow it. A one-token revert of the
+  push leaves the resolve running — so every refusal test stays green — and is
+  caught only by the pin. `fetch`'s and `webhook`'s originals are reachable
+  through `req` too; shadowing removes the convenient name, not the field.
+* No test drives a real socket, so what reqwest was HANDED is pinned, not
+  observed. The honest guard for the bytes on the wire is the live read after
+  deploy.
+* The region strip is column-0 anchored and conservative in the safe direction: a
+  missed region end leaves test code in the haystack (a false finding, never a
+  false pass), and an indented `#[cfg(test)]` is not stripped at all.
+* `messaging::publish` was not examined as a body surface; its credential is a
+  header and its payload is a NATS message, not an HTTP request body.
+
+### The lint, BUILT and MEASURED and REJECTED
+
+*A file in `host/` that sends a body must name `resolve_vault_json_body`.*
+Measured on both trees: **8 findings on pristine `origin/main`, of which 2 are
+real — 25% precision — and 6 on the FIXED tree, every one a legitimate
+host-composed surface** (`email`, `limits`, `llm`, `llm_streaming`, `llm_tools`,
+`object_storage`). It ships at 6 markers on correct code. Decisively it is
+FILE-scoped and therefore **green over `fetch_all`**, one of the three defects it
+was written for, because `http.rs` already names the resolver — the
+gate-that-doesn't-gate shape (#624, checks 64/65). `--count` stays **97**. The
+cross-surface pin counts resolver call sites PER FILE, which is what a file-scoped
+grep cannot do.

@@ -1396,8 +1396,9 @@ async fn handle_test_secret_access(
                 "World '{}' imports the secrets interface, so the module may call \
                  secrets::get_secret() directly, AND it can egress, so a \
                  `vault://` marker in an outbound header or JSON body is resolved \
-                 by the host.",
-                capability_world
+                 by the host. {}",
+                capability_world,
+                talos_workflow_job_protocol::VAULT_BODY_SUBSTITUTION_SURFACES_NOTE
             ),
             (true, false) => format!(
                 "World '{}' imports the secrets interface, so the module may call \

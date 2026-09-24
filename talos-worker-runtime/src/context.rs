@@ -1162,8 +1162,17 @@ pub(crate) enum SecretUseSurface {
     /// able to tell them apart.
     HttpJsonBody,
     GraphqlHeader,
+    /// A `vault://` reference resolved into a GraphQL request BODY — the
+    /// host-composed `{query, variables}` envelope. Distinct from
+    /// `GraphqlHeader` for the reason `HttpJsonBody` is distinct from
+    /// `HttpHeader`: the ledger records WHERE the credential was placed.
+    GraphqlJsonBody,
     HttpStreamHeader,
     WebhookHeader,
+    /// A `vault://` reference resolved into a webhook request BODY. `send`
+    /// sets no content type of its own, so the JSON declaration that admits
+    /// substitution comes from the guest's own headers.
+    WebhookJsonBody,
     MessagingHeader,
     LlmProviderKey,
     EmailApiKey,
@@ -1175,8 +1184,10 @@ impl SecretUseSurface {
             Self::HttpHeader => "http-header",
             Self::HttpJsonBody => "http-json-body",
             Self::GraphqlHeader => "graphql-header",
+            Self::GraphqlJsonBody => "graphql-json-body",
             Self::HttpStreamHeader => "http-stream-header",
             Self::WebhookHeader => "webhook-header",
+            Self::WebhookJsonBody => "webhook-json-body",
             Self::MessagingHeader => "messaging-header",
             Self::LlmProviderKey => "llm-provider-key",
             Self::EmailApiKey => "email-api-key",
