@@ -166,8 +166,8 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | `WORKER_SHARED_KEY` (+`_FILE`, `_PREVIOUS`) | none in dev (controller WARNs and boots); in production every NATS dispatch is REFUSED until it is set | both | HMAC shared key for worker auth (rotation-capable); also the IKM for checkpoint/envelope AEAD derivations | 🔒 |
 | `TALOS_AOT_HMAC_KEY` / `_PREVIOUS` | none in dev (an ephemeral random key is minted per process); REQUIRED in production — ≥32 raw bytes or the worker panics at boot | worker | HMAC key signing AOT-compiled WASM cache entries | 🔒 |
 | `TALOS_AUDIT_SIGNING_KEY` / `_PREVIOUS` | none | both | Key signing hash-chained audit-ledger entries (`talos-audit-event`) | 🔒 |
-| `TALOS_WORKFLOW_SIGNING_KEY` | none | controller | Key for workflow-definition signatures | 🔒 |
-| `TALOS_WORKFLOW_SIGNING_STRICT` | `false` | controller | Reject unsigned workflows | 🔒 |
+| ~~`TALOS_WORKFLOW_SIGNING_KEY`~~ | n/a | — | **Not a variable (removed 2026-09-26).** Its reader, `talos-workflow-signing`, had zero callers: no workflow version was ever signed and `workflow_versions.graph_hash`/`graph_signature` were never written. Crate and columns deleted | |
+| ~~`TALOS_WORKFLOW_SIGNING_STRICT`~~ | n/a | — | **Not a variable (removed 2026-09-26).** Documented as "Reject unsigned workflows"; nothing ever consulted it, so no unsigned workflow was ever rejected. Deleted with the crate | |
 | `TALOS_WORKER_REGISTRATION_TOKEN` | none (optional) | both | Shared token for worker self-registration — the SAME value on controller (gate) and worker (bearer); unset on either side disables the handshake | 🔒 |
 | `TALOS_CONTROLLER_URL` | none (dev compose: `http://controller:8000`) | worker | Controller base URL the worker self-registers against — not a secret. Registration also requires the token above **and** `TALOS_WORKER_SIGNING_KEY`; with all three, the worker reports its build into `get_platform_info.fleet` | |
 | `TALOS_WORKER_REG_REQUIRE_BOUND_TOKEN` | unset | controller | Require a bound registration token | 🔒 |
