@@ -88,7 +88,7 @@ BASES = [
      "2026-09-24: post-DN package bullets (DO..EO) compressed to decisions only"),
     ("7457bdbd7520cf5c560052ec04b7ec2163f5aaf5", "3607202af08c60a16396142532719f3ed5656a15",
      "2026-09-25: lint checks 74/88/83/65 compressed to specification only"),
-    ("ef220804da63adf62cfbc1787e047f0932609c79", None,
+    ("ef220804da63adf62cfbc1787e047f0932609c79", "1bd6015cba3c42b98ebee2a12ca5cbeb5404e60c",
      "2026-09-25: the structural-lint check specifications -> structural-lint-checks.md"),
 ]
 ARCHIVE = Path("docs/engineering-log")
