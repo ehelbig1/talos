@@ -58,34 +58,53 @@ function parseMemoryValue(raw: string): unknown {
   return parsed;
 }
 
-async function loadBriefings(): Promise<Briefing[]> {
-  const actors = await listActors();
+/** The server's per-actor row cap on `actorsMemories` (default = max). */
+export const MEMORIES_PER_ACTOR_CAP = 1000;
+const ACTOR_CHUNK = 100;
+
+export interface BriefingsLoad {
+  briefings: Briefing[];
+  /** Actors whose memories could not be read (their chunk failed). */
+  unreadableActors: string[];
+  /** Actors that returned the per-actor cap: older `/latest` rows may be
+   *  missing, because the window is by creation time and an upsert does
+   *  not move it. */
+  possiblyTruncatedActors: string[];
+}
+
+/** Pure fold of the per-chunk reads; a failed chunk is reported, never
+ *  rendered as "no briefings". */
+export function summarizeBriefings(
+  actors: ReadonlyArray<{ id: string; name: string }>,
+  chunks: ReadonlyArray<{
+    ids: string[];
+    result: PromiseSettledResult<ActorMemoryGroup[]>;
+  }>,
+): BriefingsLoad {
   const nameById = new Map(actors.map((a) => [a.id, a.name]));
-
-  // Batched read: pre-fix this fanned out one `actorMemories` GraphQL
-  // round-trip PER actor (1 + N requests); `actorsMemories` returns
-  // every owned actor's memories grouped in ONE request. The server
-  // caps a batch at 100 ids, so chunk defensively for memory-heavy
-  // accounts. One chunk failing must not sink the whole page.
-  const CHUNK = 100;
-  const chunks: string[][] = [];
-  for (let i = 0; i < actors.length; i += CHUNK) {
-    chunks.push(actors.slice(i, i + CHUNK).map((a) => a.id));
+  const name = (id: string) => nameById.get(id) ?? id;
+  const unreadableActors: string[] = [];
+  const possiblyTruncatedActors: string[] = [];
+  const groups: ActorMemoryGroup[] = [];
+  for (const { ids, result } of chunks) {
+    if (result.status === "rejected") {
+      unreadableActors.push(...ids.map(name));
+      continue;
+    }
+    for (const group of result.value) {
+      groups.push(group);
+      if (group.memories.length >= MEMORIES_PER_ACTOR_CAP) {
+        possiblyTruncatedActors.push(name(group.actorId));
+      }
+    }
   }
-  const perChunk = await Promise.all(
-    chunks.map((ids) =>
-      listActorsMemories(ids, "episodic").catch(() => [] as ActorMemoryGroup[]),
-    ),
-  );
-
-  return perChunk
-    .flat()
+  const briefings = groups
     .flatMap((group) =>
       group.memories
         .filter((e) => e.key.endsWith("/latest"))
         .map<Briefing>((e) => ({
           actorId: group.actorId,
-          actorName: nameById.get(group.actorId) ?? group.actorId,
+          actorName: name(group.actorId),
           key: e.key,
           kind: e.key.split("/")[0] ?? e.key,
           updatedAt: e.updatedAt,
@@ -93,6 +112,30 @@ async function loadBriefings(): Promise<Briefing[]> {
         })),
     )
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  return { briefings, unreadableActors, possiblyTruncatedActors };
+}
+
+async function loadBriefings(): Promise<BriefingsLoad> {
+  const actors = await listActors();
+  // Batched read, chunked at the server's 100-id cap. There is no key
+  // filter on `actorsMemories`, so every episodic row is read and the
+  // `/latest` keys are picked out here.
+  const chunks: string[][] = [];
+  for (let i = 0; i < actors.length; i += ACTOR_CHUNK) {
+    chunks.push(actors.slice(i, i + ACTOR_CHUNK).map((a) => a.id));
+  }
+  const results = await Promise.allSettled(
+    chunks.map((ids) => listActorsMemories(ids, "episodic")),
+  );
+  // Nothing readable at all is the page's error state, not "no results".
+  const firstFailure = results.find((r) => r.status === "rejected");
+  if (firstFailure && results.every((r) => r.status === "rejected")) {
+    throw firstFailure.reason;
+  }
+  return summarizeBriefings(
+    actors,
+    chunks.map((ids, i) => ({ ids, result: results[i] })),
+  );
 }
 
 // ── Presentation helpers ─────────────────────────────────────────────────────
@@ -282,18 +325,15 @@ function BriefingCard({ briefing }: { briefing: Briefing }) {
 // ── Page ─────────────────────────────────────────────────────────────────────
 
 export default function Briefings() {
-  const {
-    data: briefings = [],
-    isLoading,
-    isError,
-    refetch,
-    isRefetching,
-  } = useQuery({
+  const { data, isLoading, isError, refetch, isRefetching } = useQuery({
     queryKey: ["briefings"],
     queryFn: loadBriefings,
     refetchOnWindowFocus: true,
   });
 
+  const briefings = useMemo(() => data?.briefings ?? [], [data]);
+  const unreadable = data?.unreadableActors ?? [];
+  const truncated = data?.possiblyTruncatedActors ?? [];
   const hasResults = briefings.length > 0;
   const lastUpdated = useMemo(
     () => (hasResults ? briefings[0].updatedAt : null),
@@ -336,6 +376,23 @@ export default function Briefings() {
           </button>
         </div>
 
+        {!isLoading && !isError && unreadable.length > 0 && (
+          <div
+            role="alert"
+            className="rounded-2xl border border-destructive/20 bg-destructive/5 px-5 py-3 text-xs text-destructive"
+          >
+            Couldn&apos;t read results for {unreadable.join(", ")}. What is
+            shown below may be incomplete.
+          </div>
+        )}
+        {!isLoading && !isError && truncated.length > 0 && (
+          <div className="rounded-2xl border border-warning/20 bg-warning/5 px-5 py-3 text-xs text-warning">
+            {truncated.join(", ")} returned the maximum of{" "}
+            {MEMORIES_PER_ACTOR_CAP} memories; some older results may be
+            missing.
+          </div>
+        )}
+
         {/* Content */}
         {isLoading ? (
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -358,7 +415,7 @@ export default function Briefings() {
               Try again
             </button>
           </div>
-        ) : !hasResults ? (
+        ) : !hasResults && unreadable.length === 0 ? (
           <div className="rounded-[2rem] border border-dashed border-white/10 bg-black/10 p-16 text-center space-y-3">
             <Sparkles className="w-8 h-8 text-muted-foreground/30 mx-auto" />
             <p className="text-sm text-muted-foreground/60 font-medium max-w-md mx-auto">
