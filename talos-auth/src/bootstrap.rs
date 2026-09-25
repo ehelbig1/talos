@@ -9,8 +9,12 @@
 //! is stuck at the default `http-node` ceiling.
 //!
 //! This module closes that gap by running the same promotion dynamically,
-//! every time it's safe to (idempotent, no-op once at least one user has
-//! the elevated grant). Safe to call from:
+//! ONCE per deployment: a `capability_bootstrap` row records that it has
+//! happened (migration `20260925140000`), and every later call is a no-op.
+//! Until 2026-09-25 "done" meant "some user holds `automation-node` now", so
+//! removing the last such grant re-armed it — the next signup was elevated to
+//! the top of the lattice and every restart re-granted the earliest user.
+//! Safe to call from:
 //!
 //! * Controller startup (after migrations run)
 //! * After `auth::signup` (newly-registered user)
@@ -35,11 +39,11 @@
 use sqlx::{Pool, Postgres};
 use uuid::Uuid;
 
-/// Promote the first user if nobody currently has the `automation-node`
-/// ceiling. Idempotent: once any user holds the elevated grant, this is a
-/// no-op. Safe to call repeatedly and from concurrent paths — the
-/// `ON CONFLICT` clause + the `!=` WHERE predicate keep the behavior
-/// stable under races.
+/// Promote the first user to the `automation-node` ceiling, once per
+/// deployment. After the first successful promotion a `capability_bootstrap`
+/// row exists and this is a no-op, whatever happens to the grants later.
+/// Safe to call repeatedly and from concurrent paths: the row's primary key
+/// serialises concurrent bootstraps, so exactly one of them claims it.
 ///
 /// `candidate_user_id` is typically the user who just registered; pass
 /// `None` at startup to let the function pick the earliest-created user.
@@ -47,14 +51,14 @@ pub async fn promote_first_user_if_needed(
     pool: &Pool<Postgres>,
     candidate_user_id: Option<Uuid>,
 ) -> anyhow::Result<bool> {
-    // Fast path: if anyone already has automation-node, nothing to do.
-    let already_bootstrapped: Option<bool> = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM user_capability_grants \
-         WHERE max_capability_world = 'automation-node')",
-    )
-    .fetch_one(pool)
-    .await?;
-    if already_bootstrapped.unwrap_or(false) {
+    // Fast path: the bootstrap has already happened on this deployment. The
+    // grants are deliberately NOT consulted — removing every `automation-node`
+    // grant must not re-arm a promotion.
+    let already_bootstrapped: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM capability_bootstrap)")
+            .fetch_one(pool)
+            .await?;
+    if already_bootstrapped {
         return Ok(false);
     }
 
@@ -146,6 +150,20 @@ pub async fn promote_first_user_if_needed(
     // before, the first user's elevation to the top of the lattice left no
     // record at all).
     let mut tx = pool.begin().await?;
+    // Claim the bootstrap first. A concurrent caller blocks on the primary key
+    // until this transaction ends, then inserts nothing and gives up.
+    let claimed = sqlx::query(
+        "INSERT INTO capability_bootstrap (singleton, user_id, source) \
+         VALUES (true, $1, 'runtime') ON CONFLICT (singleton) DO NOTHING",
+    )
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?
+    .rows_affected();
+    if claimed == 0 {
+        tx.rollback().await?;
+        return Ok(false);
+    }
     let granted = sqlx::query(
         "INSERT INTO user_capability_grants (user_id, max_capability_world, notes) \
          VALUES ($1, 'automation-node', 'Bootstrap: first-user elevation (runtime)') \
@@ -160,9 +178,10 @@ pub async fn promote_first_user_if_needed(
     .await?
     .rows_affected();
     if granted == 0 {
-        // Someone else already holds the top ceiling for this user; nothing
-        // changed, so nothing is recorded.
-        tx.rollback().await?;
+        // This user already holds the top ceiling, so the bootstrap's purpose
+        // is met: its claim commits, but nothing changed and nothing is
+        // recorded as granted.
+        tx.commit().await?;
         return Ok(false);
     }
     talos_admin_event_log::insert_on_conn(

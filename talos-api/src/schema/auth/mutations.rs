@@ -8,8 +8,59 @@ use uuid::Uuid;
 use crate::schema::types::*;
 use crate::schema::{
     password_change_decision, require_2fa, require_scope, ApiKeyScopes, IsTwoFactorVerified,
-    RequestMetadata, SafeErrorExtensions, SecondFactorVerified,
+    RequestMetadata, SafeErrorExtensions, SecondFactorRefusal, SecondFactorVerified,
+    NO_PENDING_SECOND_FACTOR,
 };
+
+/// The request's cookie jar. The GraphQL handler hands one only to a request
+/// with no `X-API-Key` header, so nothing on an API-key request can set a
+/// session cookie (2026-09-25); an operation that needs the jar refuses here.
+fn browser_cookie_jar<'a>(ctx: &Context<'a>) -> Result<&'a Cookies> {
+    ctx.data_opt::<Cookies>().ok_or_else(|| {
+        async_graphql::Error::new(
+            "This operation needs a browser session; it is not available to API-key requests.",
+        )
+        .extend_safe()
+    })
+}
+
+/// Refuse an API-key caller on the 2FA enrolment and verification mutations.
+///
+/// The router marks every API-key request `IsTwoFactorVerified(true)` (keys
+/// skip 2FA by design), so `require_2fa` admits a key of any scope. Before
+/// 2026-09-25 that let a `workflows:read` key on an account without 2FA enrol
+/// its own secret with `enableTwoFactor` (signing the owner out) and then
+/// trade a code for a second-factor-verified browser session with
+/// `verifyTwoFactor` — a session that passes `require_second_factor`. These
+/// operations change how the account's SESSIONS authenticate, which a bearer
+/// token with no second factor of its own must not do.
+fn refuse_api_key_two_factor(ctx: &Context<'_>, operation: &'static str) -> Result<()> {
+    if ctx.data_opt::<ApiKeyScopes>().is_none() {
+        return Ok(());
+    }
+    let refusal = SecondFactorRefusal::ApiKey;
+    tracing::info!(
+        target: "talos_audit",
+        event_kind = "two_factor_operation_refused",
+        reason = refusal.as_str(),
+        operation,
+        user_id = ?ctx.data_opt::<Uuid>(),
+        "2FA enrolment/verification refused for an API-key request"
+    );
+    Err(async_graphql::Error::new(refusal.message()).extend_safe())
+}
+
+/// Charge one 2FA enrolment attempt to the caller (`setupTwoFactor` and
+/// `enableTwoFactor` share the budget; `TotpService::check_enrolment_throttle`).
+async fn throttle_two_factor_enrolment(
+    totp_service: &talos_totp_2fa::TotpService,
+    user_id: Uuid,
+) -> Result<()> {
+    totp_service
+        .check_enrolment_throttle(user_id)
+        .await
+        .map_err(|throttled| async_graphql::Error::new(throttled.to_string()).extend_safe())
+}
 
 #[derive(Default)]
 pub struct AuthMutations;
@@ -195,7 +246,7 @@ impl AuthMutations {
         let auth_service = ctx.data::<Arc<talos_auth::AuthService>>()?;
 
         // Get refresh token from httpOnly cookie
-        let cookies = ctx.data::<Cookies>()?;
+        let cookies = browser_cookie_jar(ctx)?;
         let refresh_token = cookies
             .get("talos_refresh_token")
             .ok_or_else(|| {
@@ -234,7 +285,7 @@ impl AuthMutations {
         let auth_service = ctx.data::<Arc<talos_auth::AuthService>>()?;
 
         // Get refresh token from httpOnly cookie
-        let cookies = ctx.data::<Cookies>()?;
+        let cookies = browser_cookie_jar(ctx)?;
         let refresh_token = cookies
             .get("talos_refresh_token")
             .ok_or_else(|| {
@@ -266,7 +317,6 @@ impl AuthMutations {
         // unchanged — the deliberate session semantics of `require_scope`.
         require_scope(ctx, talos_api_keys::ApiKeyScope::Admin)?;
         let auth_service = ctx.data::<Arc<talos_auth::AuthService>>()?;
-        let cookies = ctx.data::<Cookies>()?;
 
         let user_id = ctx
             .data_opt::<Uuid>()
@@ -284,8 +334,11 @@ impl AuthMutations {
         // current device's cookies in addition to revoking server-side
         // refresh-token rows above; without this the user appears
         // logged-in client-side after a successful logout_all_sessions
-        // call until the access-token JWT expires on its own.
-        super::clear_session_cookies(cookies);
+        // call until the access-token JWT expires on its own. An API-key
+        // request carries no jar (and no browser to clear).
+        if let Some(cookies) = ctx.data_opt::<Cookies>() {
+            super::clear_session_cookies(cookies);
+        }
 
         Ok(true)
     }
@@ -416,6 +469,7 @@ impl AuthMutations {
         // so this is defense-in-depth — but the asymmetry vs.
         // disable_two_factor is the kind of fragility that grows into
         // a real bypass when a future endpoint moves around.
+        refuse_api_key_two_factor(ctx, "setupTwoFactor")?;
         require_2fa(ctx)?;
         let totp_service = ctx.data::<Arc<talos_totp_2fa::TotpService>>()?;
         let auth_service = ctx.data::<Arc<talos_auth::AuthService>>()?;
@@ -424,6 +478,7 @@ impl AuthMutations {
         let user_id = ctx
             .data_opt::<Uuid>()
             .ok_or_else(|| async_graphql::Error::new("Authentication required").extend_safe())?;
+        throttle_two_factor_enrolment(totp_service, *user_id).await?;
 
         let user = auth_service.get_user(*user_id).await.map_err(|e| {
             tracing::error!("Failed to get user: {}", e);
@@ -465,6 +520,7 @@ impl AuthMutations {
         // the full rationale (defense-in-depth on top of the atomic
         // `WHERE totp_enabled IS NOT TRUE` overwrite-refusal in
         // TotpService::enable_2fa).
+        refuse_api_key_two_factor(ctx, "enableTwoFactor")?;
         require_2fa(ctx)?;
         let totp_service = ctx.data::<Arc<talos_totp_2fa::TotpService>>()?;
         let auth_service = ctx.data::<Arc<talos_auth::AuthService>>()?;
@@ -479,11 +535,15 @@ impl AuthMutations {
             async_graphql::Error::new("Failed to get user").extend_safe()
         })?;
 
-        // Enable 2FA (verifies code and generates backup codes)
+        // Enable 2FA (charges the enrolment throttle, verifies the code and
+        // generates backup codes).
         let backup_codes = totp_service
             .enable_2fa(*user_id, &input.secret, &input.code, &user.email)
             .await
             .map_err(|e| {
+                if let Some(throttled) = e.downcast_ref::<talos_totp_2fa::EnrolmentThrottled>() {
+                    return async_graphql::Error::new(throttled.to_string()).extend_safe();
+                }
                 tracing::error!("Failed to enable 2FA: {}", e);
                 async_graphql::Error::new("Failed to enable 2FA").extend_safe()
             })?;
@@ -511,25 +571,24 @@ impl AuthMutations {
         }
 
         // The enrolling browser session proved a code, so it continues as a
-        // second-factor-verified session. An API-key caller gets no cookies.
-        if ctx.data_opt::<crate::schema::ApiKeyScopes>().is_none() {
-            if let Ok(cookies) = ctx.data::<Cookies>() {
-                let auth = talos_auth::SessionAuth::SecondFactorVerified;
-                match (
-                    auth_service.generate_access_token(&user, auth),
-                    auth_service.generate_refresh_token(*user_id, auth).await,
-                ) {
-                    (Ok(access), Ok(refresh)) => {
-                        super::set_session_cookies(cookies, &access, &refresh);
-                    }
-                    (a, r) => tracing::error!(
-                        user_id = %user_id,
-                        access_ok = a.is_ok(),
-                        refresh_ok = r.is_ok(),
-                        "2FA enabled but the enrolling session could not be re-issued; \
-                         the user must sign in again"
-                    ),
+        // second-factor-verified session. (An API-key caller was refused
+        // above, and carries no cookie jar in any case.)
+        if let Ok(cookies) = ctx.data::<Cookies>() {
+            let auth = talos_auth::SessionAuth::SecondFactorVerified;
+            match (
+                auth_service.generate_access_token(&user, auth),
+                auth_service.generate_refresh_token(*user_id, auth).await,
+            ) {
+                (Ok(access), Ok(refresh)) => {
+                    super::set_session_cookies(cookies, &access, &refresh);
                 }
+                (a, r) => tracing::error!(
+                    user_id = %user_id,
+                    access_ok = a.is_ok(),
+                    refresh_ok = r.is_ok(),
+                    "2FA enabled but the enrolling session could not be re-issued; \
+                     the user must sign in again"
+                ),
             }
         }
 
@@ -621,6 +680,23 @@ impl AuthMutations {
                     "Too many 2FA attempts. Please try again later.",
                 )
                 .extend_safe());
+            }
+        }
+
+        // This mutation COMPLETES a 2FA login: it mints a second-factor-
+        // verified session. So it needs a session that is waiting for its
+        // code (2026-09-25). An API key is refused outright, and a session
+        // that is not pending — password-only, or already verified — has no
+        // login to complete; before, either could trade a code for a fresh
+        // verified session.
+        refuse_api_key_two_factor(ctx, "verifyTwoFactor")?;
+        match ctx.data_opt::<IsTwoFactorVerified>() {
+            Some(IsTwoFactorVerified(false)) => {}
+            Some(IsTwoFactorVerified(true)) => {
+                return Err(async_graphql::Error::new(NO_PENDING_SECOND_FACTOR).extend_safe());
+            }
+            None => {
+                return Err(async_graphql::Error::new("Authentication required").extend_safe());
             }
         }
 

@@ -21,12 +21,50 @@ const MAX_2FA_ATTEMPTS: u32 = 5;
 /// Lockout duration after exceeding `MAX_2FA_ATTEMPTS`.
 const LOCKOUT_SECS: u64 = 900; // 15 minutes
 
+/// Enrolment attempts (`setupTwoFactor` + `enableTwoFactor`) one user may make
+/// per [`ENROLMENT_WINDOW_SECS`]. A person enrolling needs two or three. The
+/// bound is on cost, not guessing: an enable hashes ten backup codes with
+/// bcrypt, and nothing else stopped a signed-in caller from enabling and
+/// disabling in a loop.
+pub const MAX_ENROLMENT_ATTEMPTS: u32 = 10;
+/// Length of the fixed enrolment-throttle window.
+const ENROLMENT_WINDOW_SECS: u64 = 900; // 15 minutes
+/// Above this many tracked users the in-memory throttle drops expired windows
+/// before adding one, so the map cannot grow without bound.
+const MAX_TRACKED_ENROLMENT_WINDOWS: usize = 10_000;
+
+/// The caller-facing sentence for [`EnrolmentThrottled`].
+pub const ENROLMENT_THROTTLED_MESSAGE: &str =
+    "Too many two-factor setup attempts. Please try again in 15 minutes.";
+
+/// A user made more than [`MAX_ENROLMENT_ATTEMPTS`] enrolment attempts in the
+/// current window. Carried inside `anyhow::Error` by `enable_2fa`, so a caller
+/// can recognise it with `downcast_ref` and show its message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnrolmentThrottled;
+
+impl std::fmt::Display for EnrolmentThrottled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(ENROLMENT_THROTTLED_MESSAGE)
+    }
+}
+
+impl std::error::Error for EnrolmentThrottled {}
+
+/// One user's in-memory enrolment window.
+#[derive(Debug)]
+struct EnrolmentWindow {
+    attempts: u32,
+    started: Instant,
+}
+
 /// 2FA/TOTP service
 pub struct TotpService {
     db_pool: Pool<Postgres>,
     issuer: String,
     redis_client: Option<Arc<redis::Client>>,
     rate_limits: Arc<DashMap<Uuid, TotpRateState>>,
+    enrolment_windows: Arc<DashMap<Uuid, EnrolmentWindow>>,
     secrets_manager: Arc<SecretsManager>,
 }
 
@@ -65,8 +103,100 @@ impl TotpService {
             issuer,
             redis_client,
             rate_limits: Arc::new(DashMap::new()),
+            enrolment_windows: Arc::new(DashMap::new()),
             secrets_manager,
         }
+    }
+
+    /// Charge one enrolment attempt to `user_id` and refuse past
+    /// [`MAX_ENROLMENT_ATTEMPTS`] per window. `enable_2fa` calls it; the
+    /// `setupTwoFactor` resolver calls it before generating a secret, so both
+    /// steps share one budget.
+    ///
+    /// Redis when configured, so the budget holds across replicas. When Redis
+    /// is absent or failing the attempt is charged to this process's window
+    /// instead, in production too: this bounds CPU, not guessing (the caller
+    /// chooses the secret), so a per-replica bound is still a bound, whereas
+    /// refusing would block enrolment on a Redis outage.
+    pub async fn check_enrolment_throttle(
+        &self,
+        user_id: Uuid,
+    ) -> std::result::Result<(), EnrolmentThrottled> {
+        let attempts = match &self.redis_client {
+            Some(redis) => match self.charge_enrolment_redis(user_id, redis).await {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!(
+                        user_id = %user_id,
+                        "2FA enrolment throttle: Redis unavailable, charging this \
+                         replica's in-memory window instead: {e:#}"
+                    );
+                    u64::from(self.charge_enrolment_memory(user_id, Instant::now()))
+                }
+            },
+            None => u64::from(self.charge_enrolment_memory(user_id, Instant::now())),
+        };
+        if attempts > u64::from(MAX_ENROLMENT_ATTEMPTS) {
+            tracing::info!(
+                target: "talos_audit",
+                event_kind = "2fa_enrolment_throttled",
+                user_id = %user_id,
+                attempts,
+                "2FA enrolment attempt refused: too many attempts in the window"
+            );
+            return Err(EnrolmentThrottled);
+        }
+        Ok(())
+    }
+
+    /// One atomic MULTI: create the window key with its TTL if absent, then
+    /// count this attempt. The TTL is set only by the `SET NX`, so the window
+    /// is fixed from the first attempt and cannot be left without an expiry.
+    async fn charge_enrolment_redis(&self, user_id: Uuid, redis: &redis::Client) -> Result<u64> {
+        let mut conn = redis
+            .get_multiplexed_async_connection()
+            .await
+            .context("Failed to get Redis connection")?;
+        let key = format!("totp_enrol:{user_id}");
+        let (attempts,): (u64,) = redis::pipe()
+            .atomic()
+            .cmd("SET")
+            .arg(&key)
+            .arg(0u8)
+            .arg("NX")
+            .arg("EX")
+            .arg(ENROLMENT_WINDOW_SECS)
+            .ignore()
+            .cmd("INCR")
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .context("Failed to charge the 2FA enrolment window")?;
+        Ok(attempts)
+    }
+
+    /// The in-memory window: fixed from its first attempt, restarted once it
+    /// has run [`ENROLMENT_WINDOW_SECS`]. `now` is a parameter so a test can
+    /// move past the window without subtracting from an `Instant`.
+    fn charge_enrolment_memory(&self, user_id: Uuid, now: Instant) -> u32 {
+        let window = std::time::Duration::from_secs(ENROLMENT_WINDOW_SECS);
+        if self.enrolment_windows.len() > MAX_TRACKED_ENROLMENT_WINDOWS {
+            self.enrolment_windows
+                .retain(|_, w| now.duration_since(w.started) < window);
+        }
+        let mut entry = self
+            .enrolment_windows
+            .entry(user_id)
+            .or_insert_with(|| EnrolmentWindow {
+                attempts: 0,
+                started: now,
+            });
+        if now.duration_since(entry.started) >= window {
+            entry.attempts = 0;
+            entry.started = now;
+        }
+        entry.attempts = entry.attempts.saturating_add(1);
+        entry.attempts
     }
 
     /// Check and record a 2FA attempt for `user_id`.
@@ -602,6 +732,15 @@ impl TotpService {
     /// guard, a partial-2FA session (post-password, pre-TOTP) could call
     /// `enable_two_factor` with an attacker-controlled secret and lock
     /// the legitimate user out of their own account.
+    ///
+    /// Order (2026-09-25): the enrolment throttle, then the already-enabled
+    /// refusal, then the code — all before any of the ten bcrypt hashes, which
+    /// run on the blocking pool. Before, the hashes ran first and inline on the
+    /// async runtime thread (measured: the thread blocked 6.0 s of a 6.1 s
+    /// enrolment in a debug build), so every refused re-enrolment still paid
+    /// for all ten and stalled that thread.
+    /// The `WHERE totp_enabled IS NOT TRUE` guard on the write stays: the early
+    /// read is not atomic with it.
     pub async fn enable_2fa(
         &self,
         user_id: Uuid,
@@ -609,7 +748,19 @@ impl TotpService {
         verification_code: &str,
         email: &str,
     ) -> Result<Vec<String>> {
-        // Verify the code first
+        self.check_enrolment_throttle(user_id).await?;
+
+        let enabled: Option<Option<bool>> =
+            sqlx::query_scalar("SELECT totp_enabled FROM users WHERE id = $1")
+                .bind(user_id)
+                .fetch_optional(&self.db_pool)
+                .await?;
+        match enabled {
+            None => return Err(anyhow!("User not found")),
+            Some(Some(true)) => return Err(already_enabled_refusal(user_id)),
+            Some(_) => {}
+        }
+
         if !self.verify_code(secret, email, verification_code)? {
             return Err(anyhow!("Invalid verification code"));
         }
@@ -617,19 +768,9 @@ impl TotpService {
         // Generate backup codes
         let backup_codes = self.generate_backup_codes();
 
-        // L-13: Hash backup codes before storing. Pre-fix:
-        //   bcrypt::hash(code, ...).unwrap_or_else(|_| code.clone())
-        // — would have stored the PLAINTEXT backup code in the DB if
-        // bcrypt::hash ever failed (essentially impossible in practice,
-        // but the fallback was a security regression in waiting). Now
-        // propagate the error so the caller knows enable_2fa failed
-        // closed rather than completing with weakened credentials.
-        let mut hashed_codes: Vec<String> = Vec::with_capacity(backup_codes.len());
-        for code in &backup_codes {
-            let hash = bcrypt::hash(code, bcrypt::DEFAULT_COST)
-                .map_err(|e| anyhow!("Failed to hash 2FA backup code: {e}"))?;
-            hashed_codes.push(hash);
-        }
+        // L-13: a hash failure fails the enable; a plaintext backup code is
+        // never stored.
+        let hashed_codes = hash_backup_codes(&backup_codes).await?;
 
         // MCP-S2: encrypt the TOTP secret with AAD = user_id so an
         // attacker with DB write capability can't swap victim's
@@ -667,13 +808,7 @@ impl TotpService {
         .await?;
 
         if result.rows_affected() == 0 {
-            tracing::warn!(
-                user_id = %user_id,
-                "enable_2fa rejected: 2FA already enabled — possible re-key attack"
-            );
-            return Err(anyhow!(
-                "Two-factor authentication is already enabled. Disable it first if you need to re-enrol."
-            ));
+            return Err(already_enabled_refusal(user_id));
         }
         talos_admin_event_log::insert_on_conn(
             &mut tx,
@@ -739,11 +874,10 @@ impl TotpService {
     /// Verify 2FA code during login (supports both TOTP and backup codes).
     ///
     /// Includes brute-force protection: after 5 consecutive failures the user
-    /// is locked out for 15 minutes.  Backup code consumption is atomic (uses a
-    /// DB transaction with a PostgreSQL advisory lock) to prevent TOCTOU races.
+    /// is locked out for 15 minutes. Backup-code consumption is atomic: one
+    /// conditional `UPDATE` removes the matched hash only if it is still
+    /// stored, so a code cannot be spent twice.
     pub async fn verify_2fa_login(&self, user_id: Uuid, code: &str, email: &str) -> Result<bool> {
-        use sqlx::Row as _;
-
         // MCP-1095 (2026-05-16): fail-closed when Redis is unavailable
         // at the START of production verification. Pre-fix, when
         // `redis_client = None` (REDIS_URL unset, connect-test failed
@@ -883,113 +1017,39 @@ impl TotpService {
         // correctness for the intended flows.
         let looks_like_backup_code =
             code.len() == 12 && code.chars().all(|c| c.is_ascii_hexdigit());
-        if user.backup_codes.is_some() && looks_like_backup_code {
-            let mut tx = self.db_pool.begin().await?;
-
-            // L-17: derive a 128-bit advisory lock key from the FULL UUID
-            // (split as two i32 halves for `pg_advisory_xact_lock(int4, int4)`).
-            // Pre-fix used only the first 8 bytes of the UUID as a single
-            // i64, giving birthday-collision risk at ~65k users (and any
-            // collision = false-shared lock contention across unrelated
-            // users in the backup-code consumption path). Using both halves
-            // expands the keyspace to 2^128 — collisions cease to be
-            // practically possible.
-            let bytes = user_id.as_bytes();
-            let lock_key_hi = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-            let lock_key_lo = i32::from_be_bytes([bytes[4], bytes[5], bytes[6], bytes[7]])
-                ^ i32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]])
-                ^ i32::from_be_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
-            // Use non-macro form so no offline cache entry is required.
-            sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
-                .bind(lock_key_hi)
-                .bind(lock_key_lo)
-                .execute(&mut *tx)
-                .await?;
-
-            // Re-fetch backup codes inside the lock to get the authoritative state.
-            // Use non-macro `sqlx::query` to avoid requiring an offline cache entry
-            // for this transaction-scoped query.
-            let maybe_row = sqlx::query("SELECT backup_codes FROM users WHERE id = $1")
+        if let (Some(stored), true) = (user.backup_codes, looks_like_backup_code) {
+            // MCP-511: hex is case-insensitive but bcrypt::verify is
+            // byte-exact, and `generate_backup_codes` writes lowercase.
+            let candidate = code.to_ascii_lowercase();
+            // Up to ten bcrypt verifies: on the blocking pool, and before any
+            // transaction or lock is taken (2026-09-25 — they used to run
+            // inline on the async runtime thread, inside a transaction holding
+            // this user's advisory lock).
+            if let Some(matched) = find_backup_code(user_id, candidate, stored).await? {
+                // Spend it atomically: the hash is removed only if it is still
+                // there, so of two concurrent uses of one code exactly one
+                // UPDATE changes a row. The hashes are salted, so the stored
+                // string identifies this one code.
+                let consumed = sqlx::query(
+                    "UPDATE users SET backup_codes = array_remove(backup_codes, $1) \
+                     WHERE id = $2 AND $1 = ANY(backup_codes)",
+                )
+                .bind(&matched)
                 .bind(user_id)
-                .fetch_optional(&mut *tx)
-                .await?;
-
-            let locked_codes: Vec<String> = match maybe_row {
-                None => {
-                    tx.rollback().await?;
-                    self.record_2fa_failure(user_id).await;
-                    return Ok(false);
-                }
-                Some(row) => {
-                    // Nullable column, so the Option is real — but the `.ok()`
-                    // also turned schema drift into "no backup codes", i.e. a
-                    // silent lockout that looks like a wrong code.
-                    let codes: Option<Vec<String>> = row.try_get::<Option<_>, _>("backup_codes")?;
-                    match codes {
-                        None => {
-                            tx.rollback().await?;
-                            self.record_2fa_failure(user_id).await;
-                            return Ok(false);
-                        }
-                        Some(c) => c,
-                    }
-                }
-            };
-
-            // MCP-511: hex is case-insensitive by spec but bcrypt::verify
-            // is byte-exact. `generate_backup_codes` writes lowercase
-            // hex via `hex::encode`, so a user retyping a backup code
-            // in uppercase (handwritten note, password-manager
-            // auto-cap) would pass the `looks_like_backup_code` gate
-            // (which uses `is_ascii_hexdigit`, case-insensitive) and
-            // then silently fail every bcrypt::verify. Normalize to
-            // lowercase before verification — no entropy loss (hex
-            // case carries no info) and matches the stored hash space.
-            let normalized = code.to_ascii_lowercase();
-            for (index, hashed_code) in locked_codes.iter().enumerate() {
-                // MCP-1099 (2026-05-16): log bcrypt::verify Err distinctly
-                // instead of collapsing to a silent mismatch via
-                // `.unwrap_or(false)`. A malformed stored backup-code
-                // hash (DB corruption, schema drift, partial-write
-                // recovery) would otherwise produce a "no codes match"
-                // outcome that is operationally indistinguishable from
-                // a wrong-code user mistake. Sibling fix to the
-                // talos-api-keys verify-loop on the same line; both
-                // mirror MCP-873's mcp-auth pattern.
-                let verified = match bcrypt::verify(&normalized, hashed_code) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        tracing::warn!(
-                            target: "talos_audit",
-                            user_id = %user_id,
-                            backup_index = index,
-                            error = %e,
-                            "backup-code bcrypt::verify failed (possibly malformed stored hash) — skipping"
-                        );
-                        false
-                    }
-                };
-                if verified {
-                    // Remove the consumed backup code atomically.
-                    let mut remaining_codes = locked_codes.clone();
-                    remaining_codes.remove(index);
-
-                    sqlx::query!(
-                        "UPDATE users SET backup_codes = $1 WHERE id = $2",
-                        &remaining_codes[..],
-                        user_id
-                    )
-                    .execute(&mut *tx)
-                    .await?;
-
-                    tx.commit().await?;
+                .execute(&self.db_pool)
+                .await?
+                .rows_affected();
+                if consumed == 1 {
                     tracing::debug!("User {} used backup code", user_id);
                     self.record_2fa_success(user_id).await;
                     return Ok(true);
                 }
+                tracing::warn!(
+                    target: "talos_audit",
+                    user_id = %user_id,
+                    "backup code matched but was already spent by a concurrent attempt"
+                );
             }
-
-            tx.rollback().await?;
         }
 
         // Verification failed — record the failure and return false.
@@ -1021,6 +1081,64 @@ impl TotpService {
 
         Ok(result.0.map(|codes| codes.len()).unwrap_or(0))
     }
+}
+
+/// The refusal for enrolling an account that already has 2FA enabled.
+fn already_enabled_refusal(user_id: Uuid) -> anyhow::Error {
+    tracing::warn!(
+        user_id = %user_id,
+        "enable_2fa rejected: 2FA already enabled — possible re-key attack"
+    );
+    anyhow!(
+        "Two-factor authentication is already enabled. Disable it first if you need to re-enrol."
+    )
+}
+
+/// bcrypt every backup code on the blocking pool. Ten hashes at the default
+/// cost are seconds of CPU; run inline they stall a runtime thread and every
+/// task scheduled on it.
+async fn hash_backup_codes(codes: &[String]) -> Result<Vec<String>> {
+    let codes = codes.to_vec();
+    tokio::task::spawn_blocking(move || {
+        codes
+            .iter()
+            .map(|code| {
+                bcrypt::hash(code, bcrypt::DEFAULT_COST)
+                    .map_err(|e| anyhow!("Failed to hash 2FA backup code: {e}"))
+            })
+            .collect::<Result<Vec<String>>>()
+    })
+    .await
+    .context("2FA backup-code hashing task failed")?
+}
+
+/// The stored hash `candidate` matches, if any, checked on the blocking pool.
+///
+/// MCP-1099: a stored hash bcrypt cannot parse is logged and skipped, never
+/// collapsed silently into "no match".
+async fn find_backup_code(
+    user_id: Uuid,
+    candidate: String,
+    stored: Vec<String>,
+) -> Result<Option<String>> {
+    tokio::task::spawn_blocking(move || {
+        for (index, hashed) in stored.into_iter().enumerate() {
+            match bcrypt::verify(&candidate, &hashed) {
+                Ok(true) => return Some(hashed),
+                Ok(false) => {}
+                Err(e) => tracing::warn!(
+                    target: "talos_audit",
+                    user_id = %user_id,
+                    backup_index = index,
+                    error = %e,
+                    "backup-code bcrypt::verify failed (possibly malformed stored hash) — skipping"
+                ),
+            }
+        }
+        None
+    })
+    .await
+    .context("2FA backup-code verification task failed")
 }
 
 #[cfg(test)]
@@ -1283,8 +1401,11 @@ mod tests {
             .next()
             .expect("success body");
         assert!(success.contains("record_2fa_attempt(talos_metrics::TwoFactorOutcome::Success)"));
-        // And every verification path calls one of the two: six call sites
-        // today (TOTP replay/failure/success, backup-code failure×2/success).
+        // And every verification path calls one of the two: four call sites
+        // today (TOTP replay failure, TOTP success, backup-code success, and
+        // the final failure every other path falls through to — the two
+        // early-exit backup-code failures went with the advisory lock,
+        // 2026-09-25).
         let calls = src
             .matches("self.record_2fa_failure(user_id).await")
             .count()
@@ -1292,8 +1413,54 @@ mod tests {
                 .matches("self.record_2fa_success(user_id).await")
                 .count();
         assert!(
-            calls >= 6,
-            "expected >= 6 recorder call sites, found {calls}"
+            calls >= 4,
+            "expected >= 4 recorder call sites, found {calls}"
+        );
+    }
+
+    /// The in-memory enrolment window, which is what production falls back to
+    /// without Redis: the cap passes, the next attempt is refused, another
+    /// user's budget is separate, and a window that has run its length
+    /// restarts. No database is touched.
+    #[tokio::test]
+    async fn the_in_memory_enrolment_window_bounds_each_user() {
+        let service = stub_service(None);
+        let (user, other) = (Uuid::new_v4(), Uuid::new_v4());
+        for attempt in 1..=MAX_ENROLMENT_ATTEMPTS {
+            assert_eq!(
+                service.check_enrolment_throttle(user).await,
+                Ok(()),
+                "attempt {attempt}"
+            );
+        }
+        assert_eq!(
+            service.check_enrolment_throttle(user).await,
+            Err(EnrolmentThrottled)
+        );
+        assert_eq!(service.check_enrolment_throttle(other).await, Ok(()));
+        assert_eq!(EnrolmentThrottled.to_string(), ENROLMENT_THROTTLED_MESSAGE);
+
+        let later = Instant::now() + std::time::Duration::from_secs(ENROLMENT_WINDOW_SECS);
+        assert_eq!(service.charge_enrolment_memory(user, later), 1);
+    }
+
+    /// `enable_2fa` charges the window before it reads anything, so a
+    /// throttled caller is refused without touching the database (this stub's
+    /// pool can never connect) — and recognisably, by type.
+    #[tokio::test]
+    async fn a_throttled_enable_is_refused_before_the_database() {
+        let service = stub_service(None);
+        let user = Uuid::new_v4();
+        for _ in 0..MAX_ENROLMENT_ATTEMPTS {
+            service.check_enrolment_throttle(user).await.unwrap();
+        }
+        let err = service
+            .enable_2fa(user, "JBSWY3DPEHPK3PXP", "000000", "user@example.com")
+            .await
+            .expect_err("throttled");
+        assert!(
+            err.downcast_ref::<EnrolmentThrottled>().is_some(),
+            "{err:#}"
         );
     }
 }
@@ -1463,6 +1630,47 @@ mod redis_lockout_tests {
         assert!(
             refused.to_string().contains("Too many failed 2FA attempts"),
             "the refusal must be the lockout, not a DB error: {refused}"
+        );
+    }
+
+    /// The enrolment window is shared through Redis: attempts alternate between
+    /// two instances and the one past the cap is refused on both. The window
+    /// key always carries a TTL no longer than the window.
+    #[tokio::test]
+    async fn the_enrolment_window_is_shared_across_instances() {
+        let (a, b) = two_instances_or_skip!();
+        let user_id = Uuid::new_v4();
+        for attempt in 1..=MAX_ENROLMENT_ATTEMPTS {
+            let who = if attempt % 2 == 0 { &a } else { &b };
+            assert_eq!(
+                who.check_enrolment_throttle(user_id).await,
+                Ok(()),
+                "attempt {attempt}"
+            );
+        }
+        assert_eq!(
+            a.check_enrolment_throttle(user_id).await,
+            Err(EnrolmentThrottled)
+        );
+        assert_eq!(
+            b.check_enrolment_throttle(user_id).await,
+            Err(EnrolmentThrottled)
+        );
+        use redis::AsyncCommands as _;
+        let mut conn = a
+            .redis_client
+            .as_ref()
+            .expect("redis client")
+            .get_multiplexed_async_connection()
+            .await
+            .expect("redis connection");
+        let ttl: i64 = conn
+            .ttl(format!("totp_enrol:{user_id}"))
+            .await
+            .expect("read the TTL");
+        assert!(
+            ttl > 0 && ttl <= ENROLMENT_WINDOW_SECS as i64,
+            "the window key must expire with the window, TTL {ttl}"
         );
     }
 }

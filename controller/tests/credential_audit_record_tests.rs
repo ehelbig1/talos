@@ -251,7 +251,7 @@ async fn capability_grants_are_recorded_on_every_surface() {
         repo.delete_capability_grant(target, admin, None)
             .await
             .unwrap(),
-        0
+        talos_actor_repository::CapabilityGrantRevocation::NoGrant
     );
     assert_eq!(
         events(&ctx.db_pool, "capability_grant_revoked", target)
@@ -465,11 +465,14 @@ fn no_credential_record_is_written_outside_its_transaction() {
 async fn a_bootstrap_that_loses_the_race_records_nothing() {
     let ctx = common::setup_test_context().await;
     let user = common::create_test_user(&ctx.auth_service, "cred-boot-race@example.com").await;
-    // Start from a deployment where nobody holds the top ceiling yet.
-    sqlx::query("DELETE FROM user_capability_grants")
-        .execute(&ctx.db_pool)
-        .await
-        .unwrap();
+    // Start from a deployment that has not bootstrapped yet: nobody holds the
+    // top ceiling and the one-shot bootstrap row (2026-09-25) is absent.
+    for statement in [
+        "DELETE FROM user_capability_grants",
+        "DELETE FROM capability_bootstrap",
+    ] {
+        sqlx::query(statement).execute(&ctx.db_pool).await.unwrap();
+    }
     let before = events(&ctx.db_pool, "capability_grant_issued", user)
         .await
         .len();

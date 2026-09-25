@@ -294,6 +294,10 @@ impl PlatformMutations {
 
     /// Revoke a user's capability ceiling grant, reverting to the default (http-node).
     /// Admins can revoke any grant; users can revoke their own.
+    // A self-revoke that would WIDEN the caller's ceiling (withdrawing a
+    // `minimal-node` or `governance-node` grant lands on the `http-node`
+    // default) is refused by `delete_capability_grant` (2026-09-25). Plain
+    // `//` so the SDL description, and the checked-in schema, are unchanged.
     async fn revoke_capability_ceiling(&self, ctx: &Context<'_>, user_id: Uuid) -> Result<bool> {
         require_2fa(ctx)?;
         let revoker_id = ctx
@@ -331,8 +335,9 @@ impl PlatformMutations {
         }
 
         let actor_repo = talos_actor_repository::ActorRepository::new(db_pool.clone());
-        let rows_deleted = actor_repo
-            // Records `capability_grant_revoked` in the same transaction.
+        let outcome = actor_repo
+            // Records `capability_grant_revoked` in the same transaction, and
+            // refuses a self-revoke that would widen the caller's ceiling.
             .delete_capability_grant(user_id, revoker_id, None)
             .await
             .map_err(|e| {
@@ -340,11 +345,27 @@ impl PlatformMutations {
                 async_graphql::Error::new("Failed to revoke capability ceiling").extend_safe()
             })?;
 
-        if rows_deleted == 0 {
-            return Err(async_graphql::Error::new(
-                "No grant found — user is already at the default ceiling",
-            )
-            .extend_safe());
+        match outcome {
+            talos_actor_repository::CapabilityGrantRevocation::Revoked { .. } => {}
+            talos_actor_repository::CapabilityGrantRevocation::NoGrant => {
+                return Err(async_graphql::Error::new(
+                    "No grant found — user is already at the default ceiling",
+                )
+                .extend_safe());
+            }
+            talos_actor_repository::CapabilityGrantRevocation::SelfRevokeWouldWiden { world } => {
+                tracing::info!(
+                    target: "talos_audit",
+                    event_kind = "capability_self_revoke_refused",
+                    user_id = %revoker_id,
+                    world = %world,
+                    "self-revoke refused: it would widen the caller's capability ceiling"
+                );
+                return Err(async_graphql::Error::new(
+                    talos_actor_repository::CapabilityGrantRevocation::self_revoke_refusal(&world),
+                )
+                .extend_safe());
+            }
         }
 
         tracing::info!(
