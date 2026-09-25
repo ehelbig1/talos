@@ -26,6 +26,7 @@
 
 mod admission;
 mod build_skew;
+mod guest_session;
 mod kernel;
 pub mod write_ceiling;
 use kernel::record_rpc_metric;
@@ -726,6 +727,15 @@ pub fn enforce_production_db_sandbox_posture(is_production: bool) -> anyhow::Res
 /// belt-and-suspenders but is currently omitted to keep the wrap
 /// minimal. Operators wanting per-query overrides can extend this
 /// helper.
+///
+/// **Session state the transaction does NOT clear.** A session-level
+/// advisory lock survives COMMIT and ROLLBACK, so the connection is
+/// acquired explicitly and owned by a [`guest_session::GuestSession`]
+/// OUTSIDE the budget timeout: after the transaction ends (commit OR
+/// error) it runs `pg_advisory_unlock_all()` before the connection may
+/// return to the pool, and on a timeout — the connection's state is
+/// unknown, it may be mid-statement — it is detached and closed instead.
+/// See that module for why this is not `DISCARD ALL`.
 async fn execute_guest_query(
     pool: &sqlx::PgPool,
     sql: &str,
@@ -734,19 +744,109 @@ async fn execute_guest_query(
     guest_role: Option<&str>,
 ) -> Result<talos_memory::database_rpc::DatabaseResult, talos_memory::database_rpc::DatabaseRpcError>
 {
-    use sqlx::Row;
+    execute_guest_query_within(
+        pool,
+        sql,
+        params,
+        is_fetch,
+        guest_role,
+        std::time::Duration::from_secs(talos_memory::database_rpc::QUERY_TIMEOUT_SECS),
+    )
+    .await
+}
+
+/// [`execute_guest_query`] with the budget as a parameter, so the timeout
+/// path can be driven by a test in about a second rather than thirty. The
+/// budget covers acquiring the connection AND the guest's transaction, as
+/// the single timeout it replaces did; the post-transaction unlock is
+/// bounded separately (`GUEST_SESSION_RELEASE_TIMEOUT`).
+async fn execute_guest_query_within(
+    pool: &sqlx::PgPool,
+    sql: &str,
+    params: &[String],
+    is_fetch: bool,
+    guest_role: Option<&str>,
+    budget: std::time::Duration,
+) -> Result<talos_memory::database_rpc::DatabaseResult, talos_memory::database_rpc::DatabaseRpcError>
+{
+    use talos_memory::database_rpc::DatabaseRpcError;
+
+    let deadline = tokio::time::Instant::now() + budget;
+    let conn = match tokio::time::timeout_at(deadline, pool.acquire()).await {
+        Ok(Ok(conn)) => conn,
+        Ok(Err(e)) => return Err(DatabaseRpcError::ConnectionFailed(e.to_string())),
+        Err(_) => return Err(DatabaseRpcError::Timeout),
+    };
+    // From here the connection is owned by `session`, OUTSIDE the budget
+    // timeout, so every exit below still has it in hand: the only way back
+    // to the pool is `release()`, and dropping `session` detaches.
+    let mut session = guest_session::GuestSession::new(conn);
+    let Some(tx_conn) = session.connection() else {
+        return Err(DatabaseRpcError::ConnectionFailed(
+            "guest session has no connection".to_string(),
+        ));
+    };
+    let result = match tokio::time::timeout_at(
+        deadline,
+        run_guest_transaction(tx_conn, sql, params, is_fetch, guest_role),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_) => {
+            // The statement may still be executing and the connection's
+            // protocol state is unknown: `session` drops here WITHOUT
+            // `release`, which detaches and closes it (the backend's session
+            // locks go with it once its statement ends). The timeout itself
+            // is already counted and logged by the caller's RPC outcome.
+            tracing::debug!(
+                target: "talos_rpc",
+                event_kind = "database_rpc_guest_connection_closed",
+                reason = "timeout",
+                "database RPC: guest query exceeded its budget; closing its connection"
+            );
+            return Err(DatabaseRpcError::Timeout);
+        }
+    };
+    // Success AND query-error paths both come through here: a session lock
+    // taken by a statement that then failed survived the ROLLBACK too. The
+    // guest's result is returned either way — a failed unlock costs a closed
+    // connection, never a changed answer.
+    if let Err(failure) = session.release().await {
+        tracing::warn!(
+            target: "talos_rpc",
+            event_kind = "database_rpc_guest_connection_closed",
+            reason = %failure,
+            "database RPC: could not clear session-level advisory locks after a guest \
+             query; closed the connection instead of returning it to the pool"
+        );
+    }
+    result
+}
+
+/// The guest's transaction, on the connection `execute_guest_query_within`
+/// owns. Runs under that function's budget; every early return drops `tx`,
+/// which queues a ROLLBACK sqlx sends before the connection's next statement
+/// (the session unlock).
+async fn run_guest_transaction(
+    conn: &mut sqlx::PgConnection,
+    sql: &str,
+    params: &[String],
+    is_fetch: bool,
+    guest_role: Option<&str>,
+) -> Result<talos_memory::database_rpc::DatabaseResult, talos_memory::database_rpc::DatabaseRpcError>
+{
+    use sqlx::{Connection, Row};
     use talos_memory::database_rpc::{
-        DatabaseResult, DatabaseRpcError, MAX_RESULT_BYTES, MAX_RESULT_ROWS, QUERY_TIMEOUT_SECS,
+        DatabaseResult, DatabaseRpcError, MAX_RESULT_BYTES, MAX_RESULT_ROWS,
     };
 
     // The whole query (including the optional role SET, the user SQL,
-    // and the CTE wrap if any) runs under a single tokio timeout.
-    // Pre-fix the fetch path used `q.fetch_one(&pool)` which acquires
-    // its own connection — now we hold one for the transaction. The
-    // controller-side `MAX_IN_FLIGHT = 8` semaphore upstream of this
+    // and the CTE wrap if any) runs under the caller's single budget.
+    // The controller-side `MAX_IN_FLIGHT = 8` semaphore upstream of this
     // call still bounds total concurrent connection-holders.
-    let work = async {
-        let mut tx = pool
+    {
+        let mut tx = conn
             .begin()
             .await
             .map_err(|e| DatabaseRpcError::ConnectionFailed(e.to_string()))?;
@@ -837,11 +937,6 @@ async fn execute_guest_query(
                 rows_affected: r.rows_affected(),
             })
         }
-    };
-
-    match tokio::time::timeout(std::time::Duration::from_secs(QUERY_TIMEOUT_SECS), work).await {
-        Ok(r) => r,
-        Err(_) => Err(DatabaseRpcError::Timeout),
     }
 }
 
@@ -2570,9 +2665,11 @@ pub fn spawn_database_rpc_subscriber(
             // Zombie-permit guard: unlike the other subscribers this
             // path does NOT wrap in `kernel::guard_op` —
             // `execute_guest_query` already runs its entire
-            // transaction under `QUERY_TIMEOUT_SECS` (30 s), which
-            // bounds the permit-holding window; double-wrapping
-            // would just race two identical timers.
+            // transaction under `QUERY_TIMEOUT_SECS` (30 s) and the
+            // post-transaction advisory unlock under its own 5 s bound
+            // (`guest_session::GUEST_SESSION_RELEASE_TIMEOUT`), which
+            // together bound the permit-holding window; double-wrapping
+            // would just race the same timers.
 
             // Wasm-security review 2026-05-22 (MEDIUM-2): per-actor
             // role wrap. When `TALOS_RPC_GUEST_ROLE` is set, every
@@ -3697,6 +3794,65 @@ mod controller_function_deny_tests {
             assert!(
                 controller_side_denied_function(&stmt).is_some(),
                 "canonical deny-list entry `{fn_name}` not caught by controller walker"
+            );
+        }
+    }
+
+    /// The controller twin of the worker's
+    /// `function_deny_list_covers_the_session_state_families`. The advisory
+    /// and large-object families are denied by PREFIX in
+    /// `talos_workflow_job_protocol::is_disallowed_sql_function`, and
+    /// `pg_advisory_lock` / `lo_create` / `lo_get` are deliberately absent
+    /// from the exact list — so these pass only while the mirror routes
+    /// through that one matcher (a mirror that tested
+    /// `DISALLOWED_SQL_FUNCTIONS.contains(..)` would admit every one).
+    #[test]
+    fn session_state_families_are_denied() {
+        for (sql, expected) in [
+            ("SELECT pg_advisory_lock(1)", "pg_advisory_lock"),
+            (
+                "SELECT pg_try_advisory_xact_lock(1)",
+                "pg_try_advisory_xact_lock",
+            ),
+            ("SELECT lo_create(0)", "lo_create"),
+            // FROM-clause (set-returning) form: a TableFactor, not an Expr.
+            ("SELECT * FROM lo_get(1)", "lo_get"),
+            ("SELECT * FROM pg_catalog.lo_get(1)", "pg_catalog.lo_get"),
+            (
+                "SELECT pg_catalog.pg_advisory_lock(1)",
+                "pg_catalog.pg_advisory_lock",
+            ),
+            (
+                "SELECT PG_ADVISORY_LOCK_SHARED(1, 2)",
+                "pg_advisory_lock_shared",
+            ),
+            ("SELECT loread(0, 1)", "loread"),
+            ("SELECT lowrite(0, 'x'::bytea)", "lowrite"),
+            (
+                "SELECT id FROM t WHERE pg_try_advisory_lock(id)",
+                "pg_try_advisory_lock",
+            ),
+            (
+                "SELECT pg_advisory_lock_timeout(1, 5)",
+                "pg_advisory_lock_timeout",
+            ),
+        ] {
+            let stmt = parse_one(sql);
+            assert_eq!(
+                controller_side_denied_function(&stmt).as_deref(),
+                Some(expected),
+                "`{sql}` must be refused by the controller mirror"
+            );
+        }
+        for sql in [
+            "SELECT lower(name), log(2.0), log10(100) FROM t",
+            "SELECT lower_inc(int4range(1, 2)), lower_inf(int4range(1, 2))",
+        ] {
+            let stmt = parse_one(sql);
+            assert_eq!(
+                controller_side_denied_function(&stmt),
+                None,
+                "`{sql}` shares a stem with a family and must stay callable"
             );
         }
     }
