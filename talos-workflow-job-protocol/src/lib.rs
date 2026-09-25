@@ -2826,6 +2826,25 @@ pub const METHOD_ALLOWLIST_REMEDY: &str =
 /// a path no dispatch would deliver. They agreed on a claim and nothing pinned
 /// the words, so this const exists to make a reword of one of them a test
 /// failure rather than a silent divergence. See [`vault_path_prefetched`].
+/// Which outbound surfaces resolve a `vault://` marker placed in a request
+/// BODY, and which deliberately do not.
+///
+/// Header substitution has always reached every egress surface. BODY
+/// substitution reached only `http::fetch` until 2026-09-24, so on
+/// `http::fetch_all`, `webhook::send` and `graphql::execute` a marker was
+/// neither substituted nor refused — it was sent verbatim, and a vault path
+/// names the provider and, for gmail, the account address. All four resolve it
+/// now, under one resolver and one set of rules.
+///
+/// The exclusion is the part worth stating, because it is a DECISION and not a
+/// remainder: on surfaces whose body the HOST composes from guest fields —
+/// `email::send`'s MIME document, `object_storage`'s signed S3 request, the
+/// `llm::*` provider envelopes — a marker is prose the guest chose to send, not
+/// a credential placement, and substituting there would inject a secret into an
+/// email or an LLM prompt. Those surfaces neither substitute nor refuse.
+pub const VAULT_BODY_SUBSTITUTION_SURFACES_NOTE: &str =
+    "A `vault://` marker in a request BODY is resolved by the host on the four      guest-composed egress surfaces — http::fetch, http::fetch_all,      webhook::send and graphql::execute — under one rule set: the body must      parse as JSON and declare a JSON content type (a non-JSON body carrying      the marker is REFUSED, never rewritten), only string VALUES are      substituted, never keys, and at most 8 references per request. It is      deliberately NOT resolved where the HOST composes the body from guest      fields (email::send, object_storage, llm::*): a marker there is prose the      guest chose to send, and substituting it would place a credential in an      email body or an LLM prompt.";
+
 pub const SECRET_GRANT_DELIVERY_NOTE: &str =
     "Prefix and glob entries govern PERMISSION ONLY. A dispatch pre-fetches a \
      secret on the strength of this list only when an entry is the EXACT path \

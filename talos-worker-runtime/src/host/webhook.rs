@@ -399,6 +399,51 @@ impl wit_webhook::Host for TalosContext {
             }
         }
 
+        // Resolve any `vault://` reference in a JSON body, under the SAME four
+        // rules and the same refusal as `http::fetch` — one home,
+        // `resolve_vault_json_body`. Until 2026-09-24 this surface resolved
+        // headers and sent the body VERBATIM, so a marker here was neither
+        // substituted nor refused: the vault PATH, which names the provider
+        // and (for gmail) the account address, went to the destination.
+        //
+        // ONCE, before the retry loop, for two reasons. A per-attempt resolve
+        // would re-read the vault on every retry, and a rotation landing
+        // mid-retry would split one logical delivery across two credentials.
+        //
+        // AFTER the dedup fingerprint above, which is computed from the
+        // PLACEHOLDER body deliberately: that is the stable, secret-free
+        // request identity, and hashing the resolved bytes would both put
+        // plaintext in the idempotency record and change the fingerprint
+        // whenever the credential rotates.
+        //
+        // `send` sets no content type of its own, so the JSON declaration must
+        // come from the guest's own headers. A body carrying the marker with no
+        // JSON content type is REFUSED rather than rewritten — a behaviour
+        // change from silently posting the placeholder, and the same direction
+        // `http::fetch` already takes.
+        let body: Vec<u8> = if body.is_empty() {
+            body.into_bytes()
+        } else {
+            let declared_content_type = headers
+                .iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+                .map(|(_, v)| v.clone());
+            match self
+                .resolve_vault_json_body(
+                    crate::context::SecretUseSurface::WebhookJsonBody,
+                    &host,
+                    body.as_bytes(),
+                    declared_content_type.as_deref(),
+                )
+                .await
+            {
+                Ok(Some(substituted)) => substituted,
+                Ok(None) => body.into_bytes(),
+                // Same exit shape as the header loop's refusal below.
+                Err(_) => return Err(webhook_deny(self, reason_class::SECRET_LOOKUP)),
+            }
+        };
+
         let mut retries = 0u32;
         loop {
             // Circuit breaker — one permit per ATTEMPT, settled with the

@@ -4460,7 +4460,13 @@ pub fn run(input: String) -> Result<String, String> {
              // rules: the body must parse as JSON AND declare a JSON content type\n\
              // (a non-JSON body carrying the marker is REFUSED, never rewritten),\n\
              // only string VALUES are substituted (never keys), and at most 8\n\
-             // references per request.\n\
+             // references per request. This works on the four guest-composed\n\
+             // egress surfaces — http::fetch, http::fetch_all, webhook::send\n\
+             // and graphql::execute. It deliberately does NOT happen where the\n\
+             // HOST composes the body from your fields (email::send,\n\
+             // object_storage, llm::*): a marker there is prose you chose to\n\
+             // send, and substituting it would put a credential in an email\n\
+             // body or an LLM prompt.\n\
              //\n\
              //   CONSTRUCT the reference; do not receive it. A vault:// string\n\
              //   that arrives in your CONFIG is delivered as the literal, so\n\
