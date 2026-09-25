@@ -258,14 +258,29 @@ fn the_shutdown_sequence_is_wired_in_order() {
             .join("\n")
     };
 
-    // Every engine-run chokepoint tracks its run.
-    let nats_run = code(&read("talos-engine/src/nats_run.rs"));
+    // Every engine-run chokepoint tracks its run. Since 2026-09-25 (package
+    // EU) the three chokepoints share ONE tracker, `run_tracked`, which also
+    // races the run against the operator-cancel stop signal — so the track
+    // call appears once and `run_tracked(` three times. Production code only:
+    // the file's own test modules call `run_tracked` too.
+    let nats_run_src = read("talos-engine/src/nats_run.rs");
+    let nats_run = code(
+        &nats_run_src[..nats_run_src
+            .find("#[cfg(test)]")
+            .expect("nats_run.rs test module")],
+    );
     assert_eq!(
         nats_run
             .matches("talos_shutdown::inflight::global().track(execution_id)")
             .count(),
+        1,
+        "the one tracker, run_tracked, tracks the run"
+    );
+    assert_eq!(
+        nats_run.matches("run_tracked(").count(),
         3,
-        "run_with_nats, run_with_seed_via_nats and run_with_trigger_input_via_nats"
+        "run_with_nats, run_with_seed_via_nats and run_with_trigger_input_via_nats \
+         each drive their run through run_tracked"
     );
 
     // The scheduler claims nothing once the drain has begun.
