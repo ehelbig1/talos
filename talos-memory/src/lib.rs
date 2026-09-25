@@ -50,6 +50,17 @@ pub const MAX_VALUE_BYTES: usize = 64 * 1024;
 /// all writers (engine `__memory_write__`, RPC subscriber Set, MCP
 /// handlers).
 pub const MAX_METADATA_BYTES: usize = 16 * 1024;
+/// Per-actor ceiling on `actor_memory` ROWS — live and expired alike, since an
+/// expired row is still a physical row until the sweep removes it.
+///
+/// Enforced since 2026-09-25 INSIDE the one persist statement
+/// (`PERSIST_MEMORY_ROW_SQL`), so every writer that goes through
+/// `persist_memory*` observes it — before that only the MCP `actor_remember`
+/// handler checked it, and a guest module could grow an actor's rows without
+/// bound through the `__memory_write__` envelope or the signed memory RPC.
+/// A refusal is [`MemoryWriteError::QuotaExceeded`]. Overwrites of an
+/// existing key are always admitted. Not applied to the operator-invoked
+/// bulk copy [`clone_memories`] — see its docs.
 pub const MAX_MEMORIES_PER_ACTOR: i64 = 10_000;
 pub const MAX_LIST_LIMIT: i64 = 200;
 /// Hard cap on how many actors one batched listing
@@ -192,8 +203,67 @@ pub fn validate_memory_type(memory_type: &str) -> Result<&'static str> {
     }
 }
 
-static GRAPH_EXTRACTION_SEMAPHORE: std::sync::LazyLock<tokio::sync::Semaphore> =
-    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(5));
+/// How many graph-extraction tasks may RUN at once. Each one is an
+/// entity-extraction pass that can fall back to an LLM call, so this bounds
+/// the load a burst of memory writes puts on the extraction backend.
+/// Unchanged from the pre-2026-09-25 value.
+pub const GRAPH_EXTRACTION_MAX_CONCURRENT: usize = 5;
+
+/// How many graph-extraction tasks may EXIST at once — running plus waiting
+/// for one of the [`GRAPH_EXTRACTION_MAX_CONCURRENT`] slots. A write that
+/// finds all of them taken SHEDS its extraction (no task is spawned) instead
+/// of queueing behind them.
+///
+/// Why a bound at all: until 2026-09-25 every memory write spawned one
+/// detached task that then waited on the 5-permit concurrency semaphore, with
+/// nothing bounding how many could be WAITING. Each parked task holds a clone
+/// of the memory value (up to [`MAX_VALUE_BYTES`] serialised) and waits on an
+/// extraction that takes seconds, so a burst of `__memory_write__` envelopes
+/// or signed `MemoryOp::Set` RPCs — both reachable by any guest module — grew
+/// task count and memory without limit.
+///
+/// Why 64: it caps the parked values at 64 × 64 KiB = 4 MiB of serialised
+/// payload (the in-memory `serde_json::Value` form is a small multiple of
+/// that), and it is ~12 rounds of the 5-wide extraction pool — at seconds per
+/// extraction, about a minute of backlog, beyond which a burst is exactly the
+/// case where extraction should yield rather than queue. Measured on the
+/// reference fleet 2026-09-25: 19 `actor_memory` rows across 6 actors, 7 rows
+/// written in the last 24 h and never more than ONE in any minute of the last
+/// 7 days — so 64 sheds nothing in steady state and only bites a burst ~64×
+/// larger than anything observed. Shedding costs the entity graph the
+/// entities of the shed rows only; the memory row itself is always written
+/// (extraction runs after the write and never gates it), and the
+/// operator-invoked `graph_backfill` tool
+/// (`talos_actor_memory_service::start_graph_backfill`) re-extracts an
+/// actor's live rows later.
+pub const GRAPH_EXTRACTION_MAX_PENDING: usize = 64;
+
+static GRAPH_EXTRACTION_SEMAPHORE: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| {
+        Arc::new(tokio::sync::Semaphore::new(GRAPH_EXTRACTION_MAX_CONCURRENT))
+    });
+
+/// Pending-slot semaphore: one permit per graph-extraction task that exists.
+/// Acquired with `try_acquire_owned` at admission (never awaited) and held by
+/// the spawned task for its whole life — see [`GRAPH_EXTRACTION_MAX_PENDING`].
+static GRAPH_EXTRACTION_PENDING: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| {
+        Arc::new(tokio::sync::Semaphore::new(GRAPH_EXTRACTION_MAX_PENDING))
+    });
+
+/// Process-wide count of graph extractions SHED because every pending slot
+/// was taken. Read through [`graph_extraction_shed_total`].
+static GRAPH_EXTRACTION_SHED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Graph extractions shed since process start because
+/// [`GRAPH_EXTRACTION_MAX_PENDING`] tasks already existed. A shed is a
+/// steady-state answer to a burst, not a fault: the memory row was written;
+/// only its entity extraction was skipped.
+#[must_use]
+pub fn graph_extraction_shed_total() -> u64 {
+    GRAPH_EXTRACTION_SHED_TOTAL.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Graph extraction callback. Controllers wire this at startup via
 /// [`register_graph_hook`]; the worker never registers one (so graph
@@ -501,13 +571,25 @@ pub fn metadata_kind(metadata: Option<&serde_json::Value>) -> Option<&str> {
 /// memories (`kind = None` or a non-synthetic kind such as
 /// `"jira_work_context"`) still extract.
 ///
-/// Safe no-op when no hook is registered.
+/// BOUNDED (2026-09-25): at most [`GRAPH_EXTRACTION_MAX_PENDING`] extraction
+/// tasks exist at once. When every pending slot is taken the extraction is
+/// SHED — no task is spawned, [`graph_extraction_shed_total`] moves — rather
+/// than queued behind the others without limit.
+///
+/// Returns `true` only when an extraction task was actually spawned. `false`
+/// means one of: the kind is synthetic (policy skip), no hook is registered
+/// (worker / tests), or the extraction was shed. A caller that REPORTS an
+/// extraction attempt must report this value, never a precondition computed
+/// beside it — a precondition says an attempt would be made, and a shed
+/// makes that false.
+#[must_use = "report whether extraction was spawned from this value; a shed \
+              extraction must not be reported as attempted"]
 pub fn spawn_graph_extraction(
     actor_id: Uuid,
     key: String,
     value: serde_json::Value,
     kind: Option<&str>,
-) {
+) -> bool {
     // Graph-write policy: synthetic self-output kinds never auto-extract.
     if let Some(k) = kind {
         if is_synthetic_memory_kind(k) {
@@ -519,14 +601,79 @@ pub fn spawn_graph_extraction(
                  (graph-write policy: entity graph is built from real source memories, \
                  not the assistant's own inferences)"
             );
-            return;
+            return false;
         }
     }
     let Some(hook) = GRAPH_HOOK.get().cloned() else {
-        return;
+        return false;
     };
+    admit_graph_extraction(
+        hook,
+        &GRAPH_EXTRACTION_PENDING,
+        &GRAPH_EXTRACTION_SEMAPHORE,
+        &GRAPH_EXTRACTION_SHED_TOTAL,
+        actor_id,
+        key,
+        value,
+    )
+}
+
+/// The admission kernel behind [`spawn_graph_extraction`], with the hook,
+/// both semaphores and the shed counter passed in so a unit test can drive
+/// it without the process-global `GRAPH_HOOK` `OnceLock` (which a test in
+/// this binary could not reset, and which another test could race).
+///
+/// Order is the whole mechanism: a pending slot is taken with
+/// `try_acquire_owned` — never awaited — BEFORE anything is spawned, and is
+/// MOVED into the task, so it is released only when the task ends. The task
+/// then waits for a concurrency permit. Hence at most `pending`'s permit
+/// count of tasks can exist, however many writes arrive.
+fn admit_graph_extraction(
+    hook: Arc<dyn GraphHook>,
+    pending: &Arc<tokio::sync::Semaphore>,
+    concurrency: &Arc<tokio::sync::Semaphore>,
+    shed_total: &std::sync::atomic::AtomicU64,
+    actor_id: Uuid,
+    key: String,
+    value: serde_json::Value,
+) -> bool {
+    let Ok(slot) = Arc::clone(pending).try_acquire_owned() else {
+        let shed = shed_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        // Shedding under a burst is the bound working, so the per-event line
+        // is DEBUG (check 69's lesson: never WARN per event on a healthy
+        // system). One WARN on the first shed of the process and every
+        // 1000th after it keeps a sustained burst visible in the log without
+        // turning it into a flood.
+        if shed == 1 || shed.is_multiple_of(1000) {
+            tracing::warn!(
+                actor_id = %actor_id,
+                shed_total = shed,
+                max_pending = GRAPH_EXTRACTION_MAX_PENDING,
+                "graph entity extraction shed: every pending slot is taken; the memory \
+                 row was written, only its extraction was skipped (logged on the first \
+                 shed and every 1000th)"
+            );
+        } else {
+            tracing::debug!(
+                actor_id = %actor_id,
+                key = %key,
+                shed_total = shed,
+                "graph entity extraction shed (pending slots full)"
+            );
+        }
+        return false;
+    };
+    let concurrency = Arc::clone(concurrency);
     tokio::spawn(async move {
-        let _permit = GRAPH_EXTRACTION_SEMAPHORE.acquire().await;
+        // Held for the task's whole life — released when it ends, however it
+        // ends (including a panic inside the hook, which drops the slot as
+        // the task unwinds).
+        let _slot = slot;
+        let Ok(_permit) = concurrency.acquire_owned().await else {
+            // The semaphore is never closed; if it ever were, skipping the
+            // extraction is the only answer that does not run it unbounded.
+            return;
+        };
         if let Err(e) = hook.extract(actor_id, key.clone(), value).await {
             tracing::debug!(
                 actor_id = %actor_id,
@@ -536,6 +683,7 @@ pub fn spawn_graph_extraction(
             );
         }
     });
+    true
 }
 
 // ============================================================================
@@ -613,6 +761,12 @@ pub struct MemoryHit {
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct PersistOutcome {
     pub embedded: bool,
+    /// From [`persist_memory_with_metadata_typed`] (and the wrappers over
+    /// it): an extraction task was actually SPAWNED — the value
+    /// [`spawn_graph_extraction`] returned, so `false` when the extraction
+    /// was shed under a burst. From the `_in_tx` variants: extraction WOULD
+    /// run (they never spawn; the caller does, post-commit, and must read
+    /// `spawn_graph_extraction`'s own return value for the real answer).
     pub graph_extraction_attempted: bool,
 }
 
@@ -646,6 +800,166 @@ pub struct ForgetOutcome {
 // ============================================================================
 // Writes
 // ============================================================================
+
+/// The ONE statement both persist paths use to create or overwrite an
+/// `actor_memory` row — [`persist_memory_with_metadata_typed`] and
+/// [`persist_memory_in_tx_with_metadata`] — and therefore the ONE place the
+/// per-actor row cap [`MAX_MEMORIES_PER_ACTOR`] is enforced for every writer
+/// that goes through them: MCP `actor_remember`, the engine's
+/// `__memory_write__` envelope, the signed `talos.memory.op` `Set` RPC,
+/// GraphQL `writeActorMemory`, actor scaffolding seeds, the ML digest,
+/// consolidation summaries and `compress_actor_context` replacements.
+///
+/// Until 2026-09-25 the cap was checked ONLY in the MCP `actor_remember`
+/// handler (a check-then-insert), so a guest module could grow one actor's
+/// rows without bound through the envelope or the RPC.
+///
+/// The row is admitted when EITHER:
+/// * the `(actor_id, key)` row already exists — an overwrite is not growth
+///   (this includes an expired/tombstoned row with that key: the write reuses
+///   it rather than adding one); or
+/// * the actor holds fewer than `$13` rows in total. ALL rows count, expired
+///   ones included: an expired row is still a physical row until the sweep
+///   removes it, and a guest can pick a tiny `ttl_hours`, so a live-only count
+///   would let expired rows pile up without bound between sweeps. The count
+///   is bounded — `LIMIT $13` inside the subquery — so an actor over the cap
+///   costs at most `$13` index entries, never a full count.
+///
+/// `EXISTS` is the left operand of the `OR` deliberately: both subqueries are
+/// uncorrelated InitPlans, evaluated lazily, and the `OR` short-circuits, so
+/// an overwrite pays one unique-index probe and never runs the count.
+///
+/// A refused row inserts nothing and raises nothing — `rows_affected() == 0`
+/// is the refusal. For an admitted row the `ON CONFLICT … DO UPDATE` clause is
+/// byte-identical to the unconditional upsert it replaced.
+///
+/// The parameters carry explicit casts because the `SELECT` list of an
+/// `INSERT … SELECT` does not take its types from the target columns the way
+/// `VALUES` does; the casts are what let check 88 PREPARE this statement with
+/// no type list.
+///
+/// **Stated limit — a bounded overshoot, not an exact cap.** Under READ
+/// COMMITTED two writers adding NEW keys for the same actor at `cap − 1` can
+/// both see `cap − 1` rows in their statement snapshots and both insert, so
+/// an actor can end up to (concurrent new-key writers for that one actor)
+/// rows over the cap — bounded in practice by the signed-RPC in-flight cap
+/// and the engine's node concurrency. Making it exact needs the count taken
+/// under a per-actor lock with a FRESH snapshot (a row lock on `actors` in a
+/// separate statement, or a PL/pgSQL `BEFORE INSERT` trigger taking an
+/// advisory lock), i.e. an extra round trip or a migration on every memory
+/// write; a lock taken inside this one statement would not help, because the
+/// statement's snapshot predates the lock.
+const PERSIST_MEMORY_ROW_SQL: &str = "INSERT INTO actor_memory \
+     (actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, embedding, embedding_model, metadata, org_id, importance) \
+     SELECT $1::uuid, $2::text, $3::bytea, $4::uuid, $5::smallint, $6::text, $7::timestamptz, \
+            $8::vector, $9::text, $10::jsonb, $11::uuid, $12::real \
+     WHERE EXISTS (SELECT 1 FROM actor_memory WHERE actor_id = $1 AND key = $2) \
+        OR (SELECT count(*) FROM (SELECT 1 FROM actor_memory WHERE actor_id = $1 LIMIT $13) AS held) < $13 \
+     ON CONFLICT (actor_id, key) DO UPDATE SET \
+         value_enc     = EXCLUDED.value_enc, \
+         value_key_id  = EXCLUDED.value_key_id, \
+         value_format  = EXCLUDED.value_format, \
+         memory_type   = EXCLUDED.memory_type, \
+         expires_at    = EXCLUDED.expires_at, \
+         embedding     = COALESCE(EXCLUDED.embedding, actor_memory.embedding), \
+         embedding_model = COALESCE(EXCLUDED.embedding_model, actor_memory.embedding_model), \
+         metadata      = COALESCE(EXCLUDED.metadata, actor_memory.metadata), \
+         org_id        = EXCLUDED.org_id, \
+         importance    = EXCLUDED.importance, \
+         updated_at    = now()";
+
+/// Reclaim THIS actor's already-expired rows, run once when
+/// [`PERSIST_MEMORY_ROW_SQL`] refuses a write. `expires_at <= now()` is the
+/// exact complement of the readers' visibility predicate
+/// (`expires_at IS NULL OR expires_at > now()`), so every row removed here
+/// is one no reader can see any more — including [`forget`]'s tombstones.
+/// The background `sweep_expired` would delete the same rows (it runs with
+/// a zero grace); this only does it early, for the one actor that needs the
+/// room. Bounded by the actor's own row count, i.e. the cap plus the
+/// overshoot stated on [`PERSIST_MEMORY_ROW_SQL`].
+const RECLAIM_EXPIRED_MEMORY_SQL: &str = "DELETE FROM actor_memory \
+     WHERE actor_id = $1 AND expires_at IS NOT NULL AND expires_at <= now()";
+
+/// Everything one `actor_memory` row write binds, built once per write so
+/// the reclaim retry binds exactly the same values.
+struct MemoryRowWrite<'a> {
+    actor_id: Uuid,
+    key: &'a str,
+    ciphertext: &'a [u8],
+    key_id: Uuid,
+    value_format: i16,
+    memory_type: &'a str,
+    expires_at: Option<DateTime<Utc>>,
+    embedding: &'a Option<pgvector::Vector>,
+    embedding_model: Option<String>,
+    metadata: Option<&'a serde_json::Value>,
+    org_id: Option<Uuid>,
+    importance: f32,
+}
+
+impl MemoryRowWrite<'_> {
+    /// Run [`PERSIST_MEMORY_ROW_SQL`] once. `Ok(true)` = the row was inserted
+    /// or overwritten; `Ok(false)` = the per-actor cap refused it.
+    async fn try_write(&self, conn: &mut sqlx::PgConnection) -> sqlx::Result<bool> {
+        let done = sqlx::query(PERSIST_MEMORY_ROW_SQL)
+            .bind(self.actor_id)
+            .bind(self.key)
+            .bind(self.ciphertext)
+            .bind(self.key_id)
+            .bind(self.value_format)
+            .bind(self.memory_type)
+            .bind(self.expires_at)
+            .bind(self.embedding)
+            .bind(self.embedding_model.as_deref())
+            .bind(self.metadata)
+            .bind(self.org_id)
+            .bind(self.importance)
+            .bind(MAX_MEMORIES_PER_ACTOR)
+            .execute(conn)
+            .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    /// The capped write: try once; if the cap refuses it, reclaim this
+    /// actor's expired rows and — only if that freed at least one — try
+    /// once more. Still refused → [`MemoryWriteError::QuotaExceeded`].
+    ///
+    /// `db_context` names the persist path in the `Db` error so the two
+    /// callers keep their historical messages.
+    async fn write_capped(
+        &self,
+        conn: &mut sqlx::PgConnection,
+        db_context: &'static str,
+    ) -> std::result::Result<(), MemoryWriteError> {
+        let db = |e: sqlx::Error| MemoryWriteError::Db(anyhow::Error::new(e).context(db_context));
+        if self.try_write(&mut *conn).await.map_err(db)? {
+            return Ok(());
+        }
+        let reclaimed = sqlx::query(RECLAIM_EXPIRED_MEMORY_SQL)
+            .bind(self.actor_id)
+            .execute(&mut *conn)
+            .await
+            .map_err(|e| {
+                MemoryWriteError::Db(
+                    anyhow::Error::new(e).context("reclaiming expired actor_memory rows"),
+                )
+            })?
+            .rows_affected();
+        if reclaimed > 0 {
+            tracing::debug!(
+                actor_id = %self.actor_id,
+                reclaimed,
+                "actor_memory cap reached: reclaimed this actor's expired rows before retrying"
+            );
+            if self.try_write(&mut *conn).await.map_err(db)? {
+                return Ok(());
+            }
+        }
+        Err(MemoryWriteError::QuotaExceeded {
+            limit: MAX_MEMORIES_PER_ACTOR,
+        })
+    }
+}
 
 pub async fn persist_memory(
     pool: &Pool<Postgres>,
@@ -865,53 +1179,51 @@ pub async fn persist_memory_with_metadata_typed(
     // updates (the recall-path bump owns those columns).
     let importance_score = actor_context::write_time_importance(canonical_type, metadata) as f32;
 
-    sqlx::query(
-        "INSERT INTO actor_memory \
-         (actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, embedding, embedding_model, metadata, org_id, importance) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
-         ON CONFLICT (actor_id, key) DO UPDATE SET \
-             value_enc     = EXCLUDED.value_enc, \
-             value_key_id  = EXCLUDED.value_key_id, \
-             value_format  = EXCLUDED.value_format, \
-             memory_type   = EXCLUDED.memory_type, \
-             expires_at    = EXCLUDED.expires_at, \
-             embedding     = COALESCE(EXCLUDED.embedding, actor_memory.embedding), \
-             embedding_model = COALESCE(EXCLUDED.embedding_model, actor_memory.embedding_model), \
-             metadata      = COALESCE(EXCLUDED.metadata, actor_memory.metadata), \
-             org_id        = EXCLUDED.org_id, \
-             importance    = EXCLUDED.importance, \
-             updated_at    = now()",
-    )
-    .bind(actor_id)
-    .bind(key)
-    .bind(ciphertext.as_slice())
-    .bind(key_id)
-    .bind(value_format)
-    .bind(canonical_type)
-    .bind(expires_at)
-    .bind(&embedding)
-    .bind(embedding.as_ref().and_then(|_| embedding::active_embedding_model()))
-    .bind(metadata)
-    .bind(org_id)
-    .bind(importance_score)
-    .execute(pool)
-    .await
-    .context("Failed to persist actor memory")
-    .map_err(MemoryWriteError::Db)?;
+    // The capped write (2026-09-25): see `PERSIST_MEMORY_ROW_SQL` — the
+    // per-actor row cap is enforced HERE, for every writer, not only in the
+    // MCP handler that used to be its sole check.
+    let row = MemoryRowWrite {
+        actor_id,
+        key,
+        ciphertext: ciphertext.as_slice(),
+        key_id,
+        value_format,
+        memory_type: canonical_type,
+        expires_at,
+        embedding: &embedding,
+        embedding_model: embedding
+            .as_ref()
+            .and_then(|_| embedding::active_embedding_model()),
+        metadata,
+        org_id,
+        importance: importance_score,
+    };
+    let mut conn = pool
+        .acquire()
+        .await
+        .context("Failed to persist actor memory: acquire connection")
+        .map_err(MemoryWriteError::Db)?;
+    row.write_capped(&mut conn, "Failed to persist actor memory")
+        .await?;
+    drop(conn);
 
     // Graph-write policy (Phase 4): synthetic self-output kinds
     // (reflections/briefs/verdicts/digests — stamped via `metadata.kind`)
     // are EXCLUDED from generic auto-extraction so the assistant's own
     // inferences never pollute the entity graph. `spawn_graph_extraction`
-    // enforces the skip; we surface it in `graph_extraction_attempted` so
-    // callers/metrics observe the true outcome.
+    // enforces the skip.
+    //
+    // `graph_extraction_attempted` is the value `spawn_graph_extraction`
+    // RETURNS, not a precondition computed beside it (2026-09-25): the
+    // extraction can now be SHED when every pending slot is taken, and a
+    // precondition would report an attempt that never happened. The three
+    // cheap checks ahead of it only spare the value clone when extraction
+    // cannot run anyway; they do not decide what is reported.
     let extraction_kind = metadata_kind(metadata);
     let graph_extraction_attempted = canonical_type != "scratchpad"
         && GRAPH_HOOK.get().is_some()
-        && !extraction_kind.is_some_and(is_synthetic_memory_kind);
-    if graph_extraction_attempted {
-        spawn_graph_extraction(actor_id, key.to_string(), value.clone(), extraction_kind);
-    }
+        && !extraction_kind.is_some_and(is_synthetic_memory_kind)
+        && spawn_graph_extraction(actor_id, key.to_string(), value.clone(), extraction_kind);
 
     Ok(PersistOutcome {
         embedded,
@@ -928,6 +1240,11 @@ pub async fn persist_memory_with_metadata_typed(
 /// row that was never committed. The returned `PersistOutcome`
 /// reports whether extraction *would* have run so the caller knows
 /// when to invoke the helper.
+///
+/// Subject to the same per-actor row cap as the non-tx path (see
+/// `PERSIST_MEMORY_ROW_SQL`): a refusal comes back as an `anyhow::Error`
+/// wrapping [`MemoryWriteError::QuotaExceeded`], which a caller can
+/// `downcast_ref` to render.
 pub async fn persist_memory_in_tx<'c>(
     tx: &mut sqlx::Transaction<'c, Postgres>,
     actor_id: Uuid,
@@ -1037,43 +1354,43 @@ pub async fn persist_memory_in_tx_with_metadata<'c>(
     // single-source scorer (memory-type base ⊕ numeric `metadata.importance`).
     let importance_score = actor_context::write_time_importance(canonical_type, metadata) as f32;
 
-    sqlx::query(
-        "INSERT INTO actor_memory \
-         (actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, embedding, embedding_model, metadata, org_id, importance) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
-         ON CONFLICT (actor_id, key) DO UPDATE SET \
-             value_enc     = EXCLUDED.value_enc, \
-             value_key_id  = EXCLUDED.value_key_id, \
-             value_format  = EXCLUDED.value_format, \
-             memory_type   = EXCLUDED.memory_type, \
-             expires_at    = EXCLUDED.expires_at, \
-             embedding     = COALESCE(EXCLUDED.embedding, actor_memory.embedding), \
-             embedding_model = COALESCE(EXCLUDED.embedding_model, actor_memory.embedding_model), \
-             metadata      = COALESCE(EXCLUDED.metadata, actor_memory.metadata), \
-             org_id        = EXCLUDED.org_id, \
-             importance    = EXCLUDED.importance, \
-             updated_at    = now()",
-    )
-    .bind(actor_id)
-    .bind(key)
-    .bind(ciphertext.as_slice())
-    .bind(key_id)
-    .bind(value_format)
-    .bind(canonical_type)
-    .bind(expires_at)
-    .bind(&embedding)
-    .bind(embedding.as_ref().and_then(|_| embedding::active_embedding_model()))
-    .bind(metadata)
-    .bind(org_id)
-    .bind(importance_score)
-    .execute(&mut **tx)
-    .await
-    .context("Failed to persist actor memory (in tx)")?;
+    // The capped write (2026-09-25) — the same statement and the same
+    // reclaim-once rule as the non-tx path, run on the CALLER's transaction,
+    // so the count sees any rows this transaction already deleted (e.g. the
+    // consolidation sources retired just above a summary write). A refusal
+    // is returned as `MemoryWriteError::QuotaExceeded` inside the anyhow
+    // error, so a caller that wants to render it can `downcast_ref`. The
+    // reclaim DELETE runs in the caller's transaction too and rolls back
+    // with it.
+    let row = MemoryRowWrite {
+        actor_id,
+        key,
+        ciphertext: ciphertext.as_slice(),
+        key_id,
+        value_format,
+        memory_type: canonical_type,
+        expires_at,
+        embedding: &embedding,
+        embedding_model: embedding
+            .as_ref()
+            .and_then(|_| embedding::active_embedding_model()),
+        metadata,
+        org_id,
+        importance: importance_score,
+    };
+    row.write_capped(tx, "Failed to persist actor memory (in tx)")
+        .await?;
 
     // Intentionally do NOT spawn graph extraction here — see doc
     // comment above. The caller invokes `spawn_graph_extraction` after
-    // a successful `tx.commit().await`.
-    let graph_extraction_attempted = canonical_type != "scratchpad" && GRAPH_HOOK.get().is_some();
+    // a successful `tx.commit().await`. This flag is a "would run"
+    // precondition, not a report — only `spawn_graph_extraction`'s return
+    // value says whether an extraction was actually spawned (it can be
+    // shed). It honours the synthetic-kind policy so it does not claim an
+    // extraction the helper would refuse.
+    let graph_extraction_attempted = canonical_type != "scratchpad"
+        && GRAPH_HOOK.get().is_some()
+        && !metadata_kind(metadata).is_some_and(is_synthetic_memory_kind);
 
     Ok(PersistOutcome {
         embedded,
@@ -3077,7 +3394,10 @@ pub async fn consolidate_memory_guarded(
     // LLM-laundered text with no provenance; the retired sources already ran
     // extraction at their own write time). Kept as a call so the kind is
     // stamped through the one chokepoint and the policy stays in one place.
-    spawn_graph_extraction(
+    // Its return value (whether a task was spawned — `false` here by policy,
+    // and it could also be shed) is deliberately not reported:
+    // `ConsolidationOutcome` makes no claim about graph extraction.
+    let _extraction_spawned = spawn_graph_extraction(
         actor_id,
         semantic_key.to_string(),
         final_value,
@@ -3347,6 +3667,16 @@ pub async fn measure_value_bytes_in_tx<'c>(
 /// source ciphertext + key_id + memory_type + expires_at + metadata, and
 /// `updated_at` is bumped to NOW(). This matches the prior inline-SQL
 /// behaviour at the two extracted call sites.
+///
+/// **Deliberately NOT subject to [`MAX_MEMORIES_PER_ACTOR`]** (2026-09-25).
+/// The cap lives in the persist statement guest-reachable writes go through;
+/// this is an operator-invoked bulk copy (`clone_actor`, MCP and GraphQL,
+/// behind the same-user check in `ActorRepository::clone_actor_memories`)
+/// into a target actor created by that same call, so the copy is bounded by
+/// the SOURCE actor's own row count — which the cap already bounds — and a
+/// partial clone that silently stopped at the cap would be worse than the
+/// overshoot. A cloned actor that ends above the cap simply refuses new keys
+/// until rows are deleted or expire; overwrites still work.
 pub async fn clone_memories(
     pool: &Pool<Postgres>,
     source_actor_id: Uuid,
@@ -3973,6 +4303,177 @@ mod spawn_graph_extraction_synthetic_kind_tests {
         // Missing / non-string kind → None (treated as non-synthetic).
         assert_eq!(metadata_kind(Some(&serde_json::json!({}))), None);
         assert_eq!(metadata_kind(Some(&serde_json::json!({ "kind": 7 }))), None);
+    }
+}
+
+/// The graph-extraction admission bound (2026-09-25). Drives the REAL kernel
+/// `admit_graph_extraction` — the function `spawn_graph_extraction` delegates
+/// to — with its own hook, semaphores and shed counter, so it neither needs
+/// nor races the process-global `GRAPH_HOOK` `OnceLock`.
+#[cfg(test)]
+mod graph_extraction_admission_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    /// A hook whose `extract` parks on `gate` until the test opens it, and
+    /// counts extractions that started (got a concurrency permit and were
+    /// polled) and finished.
+    struct GatedHook {
+        gate: Arc<tokio::sync::Semaphore>,
+        started: Arc<AtomicUsize>,
+        finished: Arc<AtomicUsize>,
+    }
+
+    impl GraphHook for GatedHook {
+        fn extract(
+            &self,
+            _actor_id: Uuid,
+            _key: String,
+            _value: serde_json::Value,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + Send>>
+        {
+            let gate = Arc::clone(&self.gate);
+            let started = Arc::clone(&self.started);
+            let finished = Arc::clone(&self.finished);
+            Box::pin(async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                // Acquire-and-drop: once the test adds ONE permit, every
+                // parked extraction passes in turn.
+                let _pass = gate.acquire().await?;
+                finished.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    fn alive_tasks() -> usize {
+        tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks()
+    }
+
+    /// A burst ten times the pending bound admits exactly
+    /// `GRAPH_EXTRACTION_MAX_PENDING` extractions and SHEDS the rest.
+    ///
+    /// **This is the bounded-memory assertion, stated as such**: every
+    /// spawned task owns exactly one clone of the memory value (up to
+    /// `MAX_VALUE_BYTES` serialised) until it ends, so "at most PENDING live
+    /// tasks" is "at most PENDING values parked". The pre-fix code spawned one
+    /// task per write, so the same burst left 640 tasks — and 640 values —
+    /// waiting on 5 permits. The runtime's own live-task count is read, not a
+    /// counter the kernel maintains, so the assertion cannot be satisfied by
+    /// bookkeeping that drifts from what actually exists.
+    #[tokio::test]
+    async fn a_burst_is_shed_beyond_the_pending_bound_and_admitted_work_completes() {
+        let pending = Arc::new(tokio::sync::Semaphore::new(GRAPH_EXTRACTION_MAX_PENDING));
+        let concurrency = Arc::new(tokio::sync::Semaphore::new(GRAPH_EXTRACTION_MAX_CONCURRENT));
+        let shed = AtomicU64::new(0);
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(AtomicUsize::new(0));
+        let hook: Arc<dyn GraphHook> = Arc::new(GatedHook {
+            gate: Arc::clone(&gate),
+            started: Arc::clone(&started),
+            finished: Arc::clone(&finished),
+        });
+        let value = serde_json::json!({ "text": "x".repeat(1024) });
+
+        assert_eq!(alive_tasks(), 0, "fresh runtime");
+        let burst = 10 * GRAPH_EXTRACTION_MAX_PENDING;
+        let mut admitted = 0usize;
+        let mut max_alive = 0usize;
+        for i in 0..burst {
+            if admit_graph_extraction(
+                Arc::clone(&hook),
+                &pending,
+                &concurrency,
+                &shed,
+                Uuid::new_v4(),
+                format!("k{i}"),
+                value.clone(),
+            ) {
+                admitted += 1;
+            }
+            max_alive = max_alive.max(alive_tasks());
+        }
+        assert_eq!(
+            admitted, GRAPH_EXTRACTION_MAX_PENDING,
+            "exactly the pending bound is admitted"
+        );
+        assert_eq!(
+            shed.load(Ordering::SeqCst),
+            (burst - GRAPH_EXTRACTION_MAX_PENDING) as u64,
+            "every other write is counted as shed"
+        );
+        assert_eq!(
+            max_alive, GRAPH_EXTRACTION_MAX_PENDING,
+            "live tasks (hence parked values) never exceed the pending bound"
+        );
+        assert_eq!(pending.available_permits(), 0, "every slot is held");
+
+        // Let the admitted tasks run up to the gate: only the concurrency
+        // bound's worth reach the hook; the rest wait for a permit.
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            GRAPH_EXTRACTION_MAX_CONCURRENT,
+            "the concurrency bound still holds"
+        );
+        assert_eq!(alive_tasks(), GRAPH_EXTRACTION_MAX_PENDING);
+
+        // Open the gate: every ADMITTED extraction completes, and each slot
+        // is released when its task ends.
+        gate.add_permits(1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while finished.load(Ordering::SeqCst) < GRAPH_EXTRACTION_MAX_PENDING || alive_tasks() > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "admitted extractions did not complete: finished={} alive={}",
+                finished.load(Ordering::SeqCst),
+                alive_tasks()
+            );
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            finished.load(Ordering::SeqCst),
+            GRAPH_EXTRACTION_MAX_PENDING
+        );
+        assert_eq!(
+            pending.available_permits(),
+            GRAPH_EXTRACTION_MAX_PENDING,
+            "every pending slot is released when its task ends"
+        );
+
+        // With the slots free again, the next write is admitted, not shed.
+        let shed_before = shed.load(Ordering::SeqCst);
+        assert!(admit_graph_extraction(
+            Arc::clone(&hook),
+            &pending,
+            &concurrency,
+            &shed,
+            Uuid::new_v4(),
+            "after".to_string(),
+            value,
+        ));
+        assert_eq!(shed.load(Ordering::SeqCst), shed_before);
+    }
+
+    /// A synthetic kind is a POLICY skip, not a shed: `false`, and the
+    /// process-wide shed counter does not move. Independent of whether a
+    /// hook is registered, because the policy check runs first.
+    #[tokio::test]
+    async fn a_synthetic_kind_is_skipped_without_counting_a_shed() {
+        let before = graph_extraction_shed_total();
+        let spawned = spawn_graph_extraction(
+            Uuid::new_v4(),
+            "k".to_string(),
+            serde_json::json!({}),
+            Some("reflection"),
+        );
+        assert!(!spawned);
+        assert_eq!(graph_extraction_shed_total(), before);
     }
 }
 

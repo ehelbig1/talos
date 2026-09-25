@@ -825,6 +825,13 @@ CTRL_TESTS=(
     # pass a test for the wrong reason). `common` (DATABASE_URL) harness, so
     # CTRL_TESTS and not TC_TESTS (64b).
     "claim_read_disclosure_tier5_tests"
+    # The per-actor actor_memory row cap (2026-09-25) moved into the one
+    # persist statement every writer shares. This drives the two MCP surfaces
+    # whose behaviour that changed — compress_actor_context retiring BEFORE it
+    # writes (so it still works for an actor at the cap), and actor_remember
+    # reclaiming expired rows — through the real dispatch. `common`
+    # (DATABASE_URL) harness, so CTRL_TESTS and not TC_TESTS (64b).
+    "actor_memory_cap_tests"
     # RFC 0012's child-run ledger. A sub-workflow leaves no
     # `workflow_executions` row, so `sub_workflow_runs` is the only evidence it
     # ran — and every question this PR answers is a round trip: which row the
