@@ -73,7 +73,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "cleanup_modules",
-            "description": "Delete compiled modules NOT referenced by any workflow AND compiled more than `days` days ago, optionally scoped by name prefix. Returns count of deleted modules. WARNING: omitting prefix deletes ALL of your unreferenced modules older than `days` and requires confirm: true.\n\nThe age filter matches `find_unreferenced_modules` — survey with that tool using the SAME `days` value and this deletes what it showed you. Without the age filter this tool used to destroy modules you had just compiled and not yet wired into a workflow, which no survey could have shown you.",
+            "description": "Delete compiled modules referenced by NOTHING — no workflow graph, no webhook trigger, no push channel (Gmail / Google Calendar / Google Cloud watch), and no execution history — AND compiled more than `days` days ago, optionally scoped by name prefix. Returns count of deleted modules. WARNING: omitting prefix deletes ALL of your unreferenced modules older than `days` and requires confirm: true. Refuses (deletes nothing) if your push-channel bindings cannot be read.\n\nThe age filter and the exclusions match `find_unreferenced_modules` — survey with that tool using the SAME `days` value and this deletes what it showed you. Without the age filter this tool used to destroy modules you had just compiled and not yet wired into a workflow; without the webhook / push / history exclusions (before 2026-09-25) it deleted modules a webhook or push channel dispatches directly, and their run history with them.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -161,7 +161,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "find_unreferenced_modules",
-            "description": "Find compiled modules not referenced by any workflow. Useful for cleanup. Optionally filter by compile age.",
+            "description": "Find compiled modules referenced by nothing — no workflow graph, webhook trigger, push channel, or execution history. The preview for cleanup_modules (same exclusions, same `days`). Optionally filter by compile age.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -745,6 +745,27 @@ async fn handle_delete_module(
 
 // ── cleanup_modules ──────────────────────────────────────────────────────────
 
+/// The module ids this user's push channels dispatch (Gmail / Calendar / GCP
+/// watches). Their bindings live in encrypted `integration_state`, so no SQL
+/// can exclude them; the bulk-delete and its survey take this set instead.
+///
+/// `Err` names why the set is UNKNOWN — no inventory wired into this process,
+/// or an integration that did not answer. A caller that deletes must refuse
+/// on it; a gate that cannot read its rule must not grant.
+async fn push_bound_modules(
+    state: &McpState,
+    user_id: uuid::Uuid,
+) -> Result<talos_module_repository::PushBoundModules, String> {
+    let Some(inventory) = state.push_channels.as_ref() else {
+        return Err("no push-channel inventory is wired into this process".to_string());
+    };
+    inventory
+        .survey(user_id)
+        .await
+        .bound_modules()
+        .map_err(|e| e.to_string())
+}
+
 async fn handle_cleanup_modules(
     req_id: Option<serde_json::Value>,
     args: &serde_json::Value,
@@ -839,10 +860,33 @@ async fn handle_cleanup_modules(
         Ok(v) => v as i32,
         Err(resp) => return resp,
     };
-    // Only delete modules NOT referenced by any workflow
+    // A module a push channel dispatches is referenced even though no
+    // workflow graph names it. If the bindings cannot be read, REFUSE: deleting
+    // a bound module makes every later push to its channel fail, and its run
+    // history goes with it (module_executions CASCADE).
+    let push_bound = match push_bound_modules(state, user_id).await {
+        Ok(p) => p,
+        Err(why) => {
+            tracing::warn!(
+                target: "talos_audit",
+                %user_id,
+                reason = %why,
+                "cleanup_modules refused: push-channel bindings unreadable"
+            );
+            return mcp_error(
+                req_id,
+                -32000,
+                "Refusing to clean up modules: could not read which modules your push channels \
+                 (Gmail / Google Calendar / Google Cloud watches) dispatch, so a module one of \
+                 them depends on could be deleted. Nothing was deleted; retry shortly.",
+            );
+        }
+    };
+    // Only delete modules referenced by NOTHING: no workflow graph, webhook
+    // trigger, push channel, or execution history (see the repository method).
     match state
         .module_repo
-        .cleanup_unreferenced_modules(user_id, prefix, days)
+        .cleanup_unreferenced_modules(user_id, prefix, days, &push_bound)
         .await
     {
         Ok(deleted) => {
@@ -851,7 +895,10 @@ async fn handle_cleanup_modules(
             mcp_text(
                 req_id,
                 &format!(
-                    "Deleted {} unreferenced module(s) compiled more than {} day(s) ago.",
+                    "Deleted {} unreferenced module(s) compiled more than {} day(s) ago. \
+                     Modules bound to a webhook trigger or a push channel, and modules with \
+                     execution history, are never deleted by this tool — use delete_module \
+                     for those.",
                     deleted, days
                 ),
             )
@@ -2038,9 +2085,23 @@ async fn handle_find_unreferenced_modules(
         Err(resp) => return resp,
     };
 
+    // Read-only, so an unreadable push-binding set does not refuse the
+    // listing — it is disclosed, and the listing is computed without that
+    // exclusion (cleanup_modules itself refuses in the same state).
+    let (push_bound, push_bindings_note) = match push_bound_modules(state, user_id).await {
+        Ok(p) => (p, None),
+        Err(why) => (
+            talos_module_repository::PushBoundModules::default(),
+            Some(format!(
+                "push-channel bindings could not be read ({why}): this listing may include a \
+                 module a push channel dispatches, and cleanup_modules will refuse to run until \
+                 they can be read"
+            )),
+        ),
+    };
     match state
         .module_repo
-        .find_unreferenced_modules(user_id, days)
+        .find_unreferenced_modules(user_id, days, &push_bound)
         .await
     {
         Ok(rows) => {
@@ -2067,6 +2128,9 @@ async fn handle_find_unreferenced_modules(
                 "unreferenced_modules": modules,
                 "count": modules.len(),
                 "filter_days": days,
+                "excludes": "modules named in a workflow graph, bound to a webhook trigger or a \
+                             push channel, or with execution history",
+                "push_channel_bindings": push_bindings_note,
                 "coverage": coverage.to_json(),
                 "cleanup_note": format!(
                     "cleanup_modules(days: {days}) deletes unreferenced modules older than {days} \

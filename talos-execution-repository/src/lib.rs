@@ -3092,24 +3092,47 @@ impl ExecutionRepository {
         Ok(result)
     }
 
-    /// Update workflow graph_json (used by analyze_execution_failure apply_fix path).
-    /// SECURITY: always includes user_id constraint.
+    /// `graph_json` + the `graph_version` it was read at, owner-scoped — the
+    /// read half of the `analyze_execution_failure` auto-fix's
+    /// read-modify-write. Delegates to the one versioned read in
+    /// `talos_workflow_repository::graph_version`.
+    pub async fn get_workflow_graph_versioned_for_user(
+        &self,
+        wf_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<talos_workflow_repository::VersionedGraph>> {
+        talos_workflow_repository::graph_version::read_workflow_graph_versioned(
+            &self.db_pool,
+            wf_id,
+            user_id,
+        )
+        .await
+    }
+
+    /// Write workflow graph_json IF it is still at `expected_version` (used by
+    /// the analyze_execution_failure apply_fix path). SECURITY: owner-scoped.
+    ///
+    /// Until 2026-09-25 this was a second, unconditional copy of the graph
+    /// write returning `()`: a concurrent edit between the auto-fix's read and
+    /// this write was silently discarded, and a zero-row UPDATE (workflow
+    /// deleted meanwhile) still let the caller report `fix_applied: true`. It
+    /// now delegates to the one compare-and-set statement and returns its
+    /// three-valued outcome.
     pub async fn update_workflow_graph(
         &self,
         wf_id: Uuid,
         user_id: Uuid,
         graph_json: &str,
-    ) -> Result<()> {
-        sqlx::query(
-            "UPDATE workflows SET graph_json = $1, updated_at = NOW() \
-             WHERE id = $2 AND user_id = $3",
+        expected_version: i64,
+    ) -> Result<talos_workflow_repository::GraphWrite> {
+        talos_workflow_repository::graph_version::write_workflow_graph_if_unchanged(
+            &self.db_pool,
+            wf_id,
+            user_id,
+            graph_json,
+            expected_version,
         )
-        .bind(graph_json)
-        .bind(wf_id)
-        .bind(user_id)
-        .execute(&self.db_pool)
-        .await?;
-        Ok(())
+        .await
     }
 
     /// Poll [`lookup_execution`] every 150 ms until the execution reaches a

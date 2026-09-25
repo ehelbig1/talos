@@ -5269,6 +5269,13 @@ impl AnalyticsRepository {
         // every reference is canonical and the legacy-alias clauses
         // become structurally redundant — they remain here as a
         // belt-and-suspenders until the column drop in Phase 4 final.
+        //
+        // 2026-09-25: also NOT orphaned — a module a webhook trigger binds, or
+        // one with execution history. `fix_all` deletes this list and the
+        // report tells the operator to run `cleanup_modules` on it; both now
+        // keep such modules (talos_module_repository's shared exclusion), so
+        // listing them would promise a delete that does not happen. Push-channel
+        // bindings are not SQL-visible; `fix_all` re-checks those at delete time.
         let orphaned_modules_fut = async {
             let fetched = sqlx::query(
                 "SELECT m.id, m.name, m.compiled_at, m.size_bytes \
@@ -5280,6 +5287,8 @@ impl AnalyticsRepository {
                     WHERE w.user_id = $1 \
                       AND w.graph_json LIKE '%' || m.id::text || '%' \
                ) \
+               AND NOT EXISTS (SELECT 1 FROM webhook_triggers wt WHERE wt.module_id = m.id) \
+               AND NOT EXISTS (SELECT 1 FROM module_executions me WHERE me.module_id = m.id) \
              ORDER BY m.compiled_at DESC LIMIT 25",
             )
             .bind(user_id)

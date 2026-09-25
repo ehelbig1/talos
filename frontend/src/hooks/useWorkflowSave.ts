@@ -6,13 +6,23 @@ import { useState, useCallback } from "react";
 import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { useShallow } from "zustand/react/shallow";
-import { graphqlRequest } from "@/lib/graphqlClient";
+import {
+  GRAPH_VERSION_CONFLICT_CODE,
+  GraphQLCodedError,
+  graphqlRequest,
+} from "@/lib/graphqlClient";
+import { engineControlKeys } from "@/lib/graphDocument";
 import { useWorkflowStore } from "@/store/workflowStore";
-import type { WorkflowNode } from "@/store/workflowStore";
+import type {
+  WorkflowEdge,
+  WorkflowNode,
+  WorkflowState,
+} from "@/store/workflowStore";
 
 interface SaveResult {
   id: string;
   name: string;
+  graphVersion: number;
 }
 
 interface UseWorkflowSaveOptions {
@@ -39,6 +49,14 @@ interface UseWorkflowSaveOptions {
  * in top-level data fields the engine already reads, and narrowing them is
  * a separate (riskier) change from this fix.
  *
+ * Engine controls (skip / continue-on-error / timeout / retry) are written
+ * ONLY when set (see `lib/graphDocument.ts`): spreading them unconditionally
+ * wrote explicit `undefined`s that overwrote the same keys in the config and
+ * were then dropped by `JSON.stringify`, deleting every MCP-authored control
+ * on the first editor save. Top-level keys of the stored node the editor does
+ * not model (`storedNodeExtras`: `kind`, `description`, …) are written back
+ * verbatim underneath the ones it does.
+ *
  * Exported for unit tests (repo convention: tests exercise the real code).
  */
 export function serializeNode(n: WorkflowNode) {
@@ -49,30 +67,63 @@ export function serializeNode(n: WorkflowNode) {
   if (kind === "dynamicdispatch") kind = "dynamic_dispatch";
   if (kind === "capabilitydispatch") kind = "capability_dispatch";
 
-  const engineExtras = {
-    skip_condition: n.data.skipCondition,
-    continue_on_error: n.data.continueOnError,
-    timeout_secs: n.data.timeoutSecs,
-    retry_count: n.data.retryPolicy?.maxRetries,
-    retry_backoff_ms: n.data.retryPolicy?.backoffMs,
-    retry_condition: n.data.retryPolicy?.retryCondition,
-    retry_delay_expression: n.data.retryPolicy?.retryDelayExpression,
-  };
+  const controls = engineControlKeys({
+    skipCondition: n.data.skipCondition,
+    continueOnError: n.data.continueOnError,
+    timeoutSecs: n.data.timeoutSecs,
+    retryPolicy: n.data.retryPolicy,
+  });
+  // `storedNodeExtras` is editor bookkeeping, never part of `data`.
+  const { storedNodeExtras, ...nodeData } = n.data;
   const data = n.data.systemNodeKind
-    ? { ...n.data, config: n.data.config || {}, ...engineExtras }
-    : { ...(n.data.config || {}), ...engineExtras };
+    ? { ...nodeData, config: n.data.config || {}, ...controls }
+    : { ...(n.data.config || {}), ...controls };
 
   return {
+    ...(storedNodeExtras ?? {}),
     id: n.id,
     type: n.data.moduleId || "unknown",
-    kind,
+    // Only a node created in the editor has a `systemNodeKind`; a loaded
+    // node's stored `kind` rides in `storedNodeExtras` and must not be
+    // overwritten by `undefined`.
+    ...(kind !== undefined ? { kind } : {}),
     position: n.position,
     data,
-    skip_condition: n.data.skipCondition,
-    continue_on_error: n.data.continueOnError,
-    retry_count: n.data.retryPolicy?.maxRetries,
-    retry_backoff_ms: n.data.retryPolicy?.backoffMs,
-    timeout_secs: n.data.timeoutSecs,
+    // The same controls at the node's top level too — where MCP writes the
+    // `retry_*` family and where the engine reads them first.
+    ...controls,
+  };
+}
+
+/** Serialize one canvas edge. Top-level keys of the stored edge the editor
+ *  does not model (`storedEdgeExtras`: `id`, `logic`, …) are written back. */
+export function serializeEdge(e: WorkflowEdge) {
+  const { storedEdgeExtras, ...data } = e.data ?? {};
+  return {
+    ...(storedEdgeExtras ?? {}),
+    source: e.source,
+    target: e.target,
+    sourceHandle: e.sourceHandle,
+    targetHandle: e.targetHandle,
+    condition: e.data?.condition,
+    edge_type: e.data?.edgeType || "default",
+    data,
+  };
+}
+
+/**
+ * The full stored graph document for the editor's current state: the
+ * graph-level keys the editor does not model (`execution_timeout_secs`, …)
+ * first, then the ones it does. Exported for the load → save round-trip test.
+ */
+export function buildGraphDocument(
+  state: Pick<WorkflowState, "nodes" | "edges" | "priority" | "graphExtras">,
+) {
+  return {
+    ...state.graphExtras,
+    priority: state.priority,
+    nodes: state.nodes.map(serializeNode),
+    edges: state.edges.map(serializeEdge),
   };
 }
 
@@ -82,44 +133,39 @@ export function useWorkflowSave({
   onSuccess,
 }: UseWorkflowSaveOptions) {
   const [isSaving, setIsSaving] = useState(false);
-  const { markClean, setWorkflowMeta } = useWorkflowStore(
+  const { markClean, setWorkflowMeta, setGraphVersion } = useWorkflowStore(
     useShallow((s) => ({
       markClean: s.markClean,
       setWorkflowMeta: s.setWorkflowMeta,
+      setGraphVersion: s.setGraphVersion,
     })),
   );
 
   const saveMutation = useMutation({
     mutationFn: async ({ customName }: { customName?: string }) => {
-      const { nodes, edges, maxConcurrentExecutions, priority, intent } =
-        useWorkflowStore.getState();
+      const state = useWorkflowStore.getState();
+      const { maxConcurrentExecutions, intent } = state;
       const nameToSave = customName || workflowName;
 
-      const graphJson = JSON.stringify({
-        priority,
-        nodes: nodes.map(serializeNode),
-        edges: edges.map((e) => ({
-          source: e.source,
-          target: e.target,
-          sourceHandle: e.sourceHandle,
-          targetHandle: e.targetHandle,
-          condition: e.data?.condition,
-          edge_type: e.data?.edgeType || "default",
-          data: e.data,
-        })),
-      });
+      const graphJson = JSON.stringify(buildGraphDocument(state));
 
       const mutation = workflowId
-        ? `mutation UpdateWorkflow($id: UUID!, $input: CreateWorkflowInput!) {
-            updateWorkflow(id: $id, input: $input) { id name intent }
+        ? `mutation UpdateWorkflow($id: UUID!, $input: CreateWorkflowInput!, $expectedGraphVersion: Int) {
+            updateWorkflow(id: $id, input: $input, expectedGraphVersion: $expectedGraphVersion) { id name intent graphVersion }
           }`
         : `mutation CreateWorkflow($input: CreateWorkflowInput!) {
-            createWorkflow(input: $input) { id name intent }
+            createWorkflow(input: $input) { id name intent graphVersion }
           }`;
 
       const variables = workflowId
         ? {
             id: workflowId,
+            // The version the editor's graph was loaded (or last saved) at:
+            // the server refuses the save if anything changed the graph since,
+            // instead of silently overwriting that change. Null only for a
+            // workflow this editor never read a version for.
+            expectedGraphVersion:
+              state.workflowId === workflowId ? state.graphVersion : null,
             input: {
               name: nameToSave,
               graphJson,
@@ -137,22 +183,39 @@ export function useWorkflowSave({
           };
 
       const result = await graphqlRequest<{
-        updateWorkflow?: { id: string; name: string };
-        createWorkflow?: { id: string; name: string };
+        updateWorkflow?: SaveResult;
+        createWorkflow?: SaveResult;
       }>(mutation, variables);
 
       const saved = result.updateWorkflow || result.createWorkflow;
       if (!saved) throw new Error("Failed to save workflow: no data returned");
-      return { id: saved.id, name: saved.name } as SaveResult;
+      return {
+        id: saved.id,
+        name: saved.name,
+        graphVersion: saved.graphVersion,
+      } as SaveResult;
     },
     onSuccess: (saved) => {
       setWorkflowMeta(saved.id, saved.name);
+      // AFTER setWorkflowMeta, which drops a version from another workflow.
+      setGraphVersion(saved.graphVersion);
       markClean();
       toast.success("Workflow saved");
       window.dispatchEvent(new CustomEvent("workflowSaved"));
       onSuccess?.(saved);
     },
-    onError: () => {
+    onError: (error) => {
+      if (
+        error instanceof GraphQLCodedError &&
+        error.code === GRAPH_VERSION_CONFLICT_CODE
+      ) {
+        // Nothing was written. The editor stays dirty so the user's changes
+        // are not lost from the canvas either.
+        toast.error(
+          "Not saved: this workflow was changed elsewhere (e.g. by an MCP tool) since you opened it. Reload it to get the latest version, then re-apply your edit.",
+        );
+        return;
+      }
       toast.error("Failed to save workflow");
     },
   });
