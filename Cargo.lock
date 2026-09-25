@@ -8356,6 +8356,7 @@ dependencies = [
  "chrono",
  "serde_json",
  "sqlx",
+ "talos-admin-event-log",
  "uuid",
 ]
 
@@ -9110,6 +9111,7 @@ dependencies = [
  "dashmap 6.2.1",
  "futures",
  "hex",
+ "http 1.4.0",
  "oauth2",
  "redis",
  "reqwest",
@@ -9117,6 +9119,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sqlx",
+ "talos-config",
  "talos-dlp-provider",
  "talos-http-body",
  "talos-http-utils",

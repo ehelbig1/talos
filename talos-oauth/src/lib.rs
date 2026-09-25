@@ -1,12 +1,17 @@
+pub mod connect_binding;
 pub mod credentials;
 pub mod flow;
 pub mod provider;
 pub mod refresh_task;
 pub mod resolver;
+pub use connect_binding::{
+    check_connect_binding, presented_connect_binding, BindingCheck, BrowserBinding,
+    CONNECT_BINDING_COOKIE,
+};
 pub use credentials::OAuthCredentialService;
 pub use flow::{
-    begin_oauth_authorization, consume_oauth_state, peek_state_provider, AuthorizeRequest,
-    ConsumedOAuthState,
+    begin_oauth_authorization, begin_oauth_authorization_with_subject, consume_oauth_state,
+    issue_bound_state, peek_state_provider, AuthorizeRequest, ConsumedOAuthState,
 };
 pub use provider::{authorization_url, handle_oauth_callback, OAuthIntegration};
 pub use resolver::ControllerSecretsResolver;
@@ -425,9 +430,10 @@ pub fn validate_oauth_state_token_format(state_token: &str) -> Result<()> {
 /// account, capture the resulting `code` + `state`, and feed the victim
 /// the callback URL — logging the victim's browser in as the attacker
 /// (classic login-CSRF / session fixation). The account-LINK flows
-/// (`talos-slack`/`talos-gmail`/`talos-atlassian`) bind the *already
-/// authenticated* `user_id`; the login flow has no user yet, so it
-/// binds an opaque browser-session nonce instead.
+/// bind the *already authenticated* `user_id` AND, since 2026-09-25, a
+/// browser nonce of their own (`connect_binding::BrowserBinding`, a
+/// separate reusable cookie); the login flow has no user yet, so the
+/// browser nonce is its only binding.
 ///
 /// We generate a high-entropy nonce, hand the **plaintext** to the
 /// caller to set as an HttpOnly+Secure+SameSite=Lax cookie, and persist
