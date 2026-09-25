@@ -19,6 +19,7 @@ serde_json.workspace = true
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
 async-trait = "0.1"
 subtle = "2.6"
+sha2 = "0.10"
 talos-capability-world = { path = "../talos-capability-world" }
 talos-config = { path = "../talos-config" }
 talos-http-body = { path = "../talos-http-body" }

@@ -466,6 +466,94 @@ async fn discover_templates(
     Ok(Vec::new())
 }
 
+// ───────────────────────────────────────────────────────────────────────
+// Digest binding (2026-09-25). `cosign verify <repo>:<tag>` resolves the tag
+// itself; a separate `pull_manifest_and_config(<repo>:<tag>)` resolved it
+// AGAIN, so a registry that repointed the tag between the two calls handed us
+// bytes nobody verified. Now the tag is resolved ONCE, cosign verifies
+// `<repo>@<digest>`, and the manifest + config are fetched BY THAT DIGEST and
+// hashed locally (oci-distribution trusts the server's digest header, so the
+// content check is ours).
+// ───────────────────────────────────────────────────────────────────────
+
+/// Accept only `sha256:<64 lowercase hex>` — a registry-supplied digest is
+/// untrusted input that becomes part of a verified reference.
+fn parse_sha256_digest(digest: &str) -> Result<&str> {
+    match digest.strip_prefix("sha256:") {
+        Some(hex)
+            if hex.len() == 64
+                && hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) =>
+        {
+            Ok(digest)
+        }
+        _ => anyhow::bail!("registry returned a malformed manifest digest"),
+    }
+}
+
+/// Does `bytes` hash to `digest` (`sha256:<hex>`)?
+fn content_matches_digest(bytes: &[u8], digest: &str) -> bool {
+    use sha2::Digest as _;
+    format!("sha256:{:x}", sha2::Sha256::digest(bytes)) == digest
+}
+
+/// Resolve a tag reference to its manifest digest ONCE and return the
+/// digest-pinned reference every later step (verify, fetch) must use.
+async fn resolve_pinned_reference(
+    oci: &OciClient,
+    reference: &Reference,
+    auth: &RegistryAuth,
+) -> Result<Reference> {
+    let digest = oci
+        .fetch_manifest_digest(reference, auth)
+        .await
+        .map_err(anyhow::Error::from)?;
+    let digest = parse_sha256_digest(&digest)?;
+    Ok(Reference::with_digest(
+        reference.registry().to_string(),
+        reference.repository().to_string(),
+        digest.to_string(),
+    ))
+}
+
+/// Fetch the manifest and config blob BY DIGEST, checking both hashes locally.
+async fn pull_config_by_digest(
+    oci: &OciClient,
+    pinned: &Reference,
+    auth: &RegistryAuth,
+) -> Result<String> {
+    use oci_distribution::manifest;
+    let digest = pinned
+        .digest()
+        .context("pull_config_by_digest called with an unpinned reference")?;
+    let (raw, _server_digest) = oci
+        .pull_manifest_raw(
+            pinned,
+            auth,
+            &[
+                manifest::OCI_IMAGE_MEDIA_TYPE,
+                manifest::IMAGE_MANIFEST_MEDIA_TYPE,
+            ],
+        )
+        .await
+        .map_err(anyhow::Error::from)?;
+    if !content_matches_digest(&raw, digest) {
+        anyhow::bail!("manifest content does not hash to the verified digest {digest}");
+    }
+    let image: manifest::OciImageManifest =
+        serde_json::from_slice(&raw).context("Parse manifest as an OCI image manifest")?;
+    let config_digest = parse_sha256_digest(&image.config.digest)?;
+    let mut config = Vec::new();
+    oci.pull_blob(pinned, &image.config, &mut config)
+        .await
+        .map_err(anyhow::Error::from)?;
+    if !content_matches_digest(&config, config_digest) {
+        anyhow::bail!("config blob does not hash to its manifest descriptor digest");
+    }
+    String::from_utf8(config).context("config blob is not UTF-8")
+}
+
 /// Pull the index artifact and parse its config blob into the template list.
 /// Returns `Ok(None)` when the artifact doesn't exist (404), `Err` only on
 /// real registry errors so the caller can fall back cleanly.
@@ -490,12 +578,20 @@ async fn try_pull_index(
     // this is two layers of attestation: the index itself, and the
     // individual artifacts it advertises. Failures under Audit
     // policy are logged but allowed to proceed (migration window).
-    let _index_attested = verify_oci_artifact_signature(&reference)
+    let pinned = match resolve_pinned_reference(oci, &reference, auth).await {
+        Ok(p) => p,
+        Err(e) if is_not_found_error(&format!("{e:#}")) => {
+            tracing::debug!("Index artifact {reference} not found — first deploy?");
+            return Ok(None);
+        }
+        Err(e) => return Err(e).context("resolve _index digest"),
+    };
+    let _index_attested = verify_oci_artifact_signature(&pinned)
         .await
-        .with_context(|| format!("Sigstore verify _index artifact {reference}"))?;
+        .with_context(|| format!("Sigstore verify _index artifact {pinned}"))?;
 
-    match oci.pull_manifest_and_config(&reference, auth).await {
-        Ok((_manifest, config_str, _config_digest)) => {
+    match pull_config_by_digest(oci, &pinned, auth).await {
+        Ok(config_str) => {
             let parsed: IndexConfig = serde_json::from_str(&config_str)
                 .context("Parse _index config blob as IndexConfig JSON")?;
             Ok(Some(parsed.templates))
@@ -509,7 +605,7 @@ async fn try_pull_index(
                 tracing::debug!("Index artifact {reference} not found — first deploy?");
                 Ok(None)
             } else {
-                Err(e).context("pull_manifest_and_config(_index)")
+                Err(e).context("pull _index by digest")
             }
         }
     }
@@ -705,14 +801,17 @@ async fn sync_template(
     // template sync; Audit policy logs and continues (the worker
     // still re-verifies at execution time, so Audit is a real
     // migration window).
-    let _template_attested = verify_oci_artifact_signature(&reference)
+    let pinned = resolve_pinned_reference(oci, &reference, auth)
         .await
-        .with_context(|| format!("Sigstore verify template artifact {reference}"))?;
+        .with_context(|| format!("resolve digest for {reference}"))?;
+    let _template_attested = verify_oci_artifact_signature(&pinned)
+        .await
+        .with_context(|| format!("Sigstore verify template artifact {pinned}"))?;
 
-    let (_manifest, config_str, _config_digest) = oci
-        .pull_manifest_and_config(&reference, auth)
+    let config_str = pull_config_by_digest(oci, &pinned, auth)
         .await
-        .with_context(|| format!("pull_manifest_and_config({reference})"))?;
+        .with_context(|| format!("pull {pinned} by digest"))?;
+    let verified_digest = pinned.digest().unwrap_or_default().to_string();
 
     let talos_manifest: serde_json::Value =
         serde_json::from_str(&config_str).context("Config blob is not valid JSON")?;
@@ -771,9 +870,11 @@ async fn sync_template(
     }
     let requires_approval_for: Vec<String> = string_array(&talos_manifest, "requires_approval_for");
 
-    // Same OCI URL format the worker expects.
+    // Same OCI URL format the worker expects, carrying the VERIFIED digest so
+    // the worker pulls exactly the artifact this sync attested (the digest
+    // wins over the tag in `Reference` parsing).
     let oci_url = format!(
-        "oci://{host}/{namespace}/{}:{}",
+        "oci://{host}/{namespace}/{}:{}@{verified_digest}",
         entry.name.to_lowercase().replace(' ', "-"),
         entry.tag
     );
@@ -950,6 +1051,44 @@ fn is_not_found_error(msg: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn digest_parsing_accepts_only_sha256_hex() {
+        let ok = format!("sha256:{}", "a".repeat(64));
+        assert_eq!(parse_sha256_digest(&ok).unwrap(), ok);
+        for bad in [
+            "".to_string(),
+            "sha256:".to_string(),
+            format!("sha512:{}", "a".repeat(64)),
+            format!("sha256:{}", "A".repeat(64)),
+            format!("sha256:{}", "a".repeat(63)),
+            format!("sha256:{}/../x", "a".repeat(64)),
+        ] {
+            assert!(parse_sha256_digest(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn content_digest_check_rejects_other_bytes() {
+        // sha256("abc")
+        let d = "sha256:ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+        assert!(content_matches_digest(b"abc", d));
+        assert!(!content_matches_digest(b"abd", d));
+    }
+
+    /// SOURCE PIN (textual): nothing in this file may pull a manifest by the
+    /// TAG reference after verifying — the defect was verify-tag-then-pull-tag.
+    #[test]
+    fn sync_never_pulls_by_the_unpinned_tag() {
+        let src = include_str!("sync.rs");
+        let needle = format!("pull_manifest_and_{}(&reference", "config");
+        assert!(!src.contains(&needle));
+        assert_eq!(
+            src.matches(&format!("verify_oci_artifact_{}(&pinned)", "signature"))
+                .count(),
+            2
+        );
+    }
 
     #[test]
     fn strip_scheme_handles_all_forms() {
