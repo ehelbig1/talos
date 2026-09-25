@@ -2,6 +2,7 @@ import React, { useState, useMemo, lazy, Suspense } from "react";
 import { useNavigate } from "react-router";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
+import { userFacingErrorMessage } from "@/lib/sanitize";
 
 const WorkflowExecutionHistoryDialog = lazy(
   () => import("@/components/settings/WorkflowExecutionHistoryDialog"),
@@ -70,8 +71,9 @@ export default function Dashboard() {
       toast.success("Workflow deleted");
       setWorkflowToDelete(null);
     },
-    onError: () => {
-      toast.error("Failed to delete workflow");
+    onError: (err) => {
+      // A refusal (running executions, referenced as a sub-workflow) says why.
+      toast.error(userFacingErrorMessage(err, "Failed to delete workflow"));
       setWorkflowToDelete(null);
     },
   });

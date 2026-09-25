@@ -17,7 +17,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { toast } from "sonner";
-import { sanitizeErrorMessage } from "@/lib/sanitize";
+import { userFacingErrorMessage } from "@/lib/sanitize";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 import { gql } from "@/lib/graphqlClient";
 import { qrCodeImageSrc } from "@/lib/qrCode";
@@ -79,7 +79,7 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
     },
     onError: (err: Error) => {
       toast.error(
-        sanitizeErrorMessage(err.message || "Failed to initialize 2FA setup"),
+        userFacingErrorMessage(err, "Failed to initialize 2FA setup"),
       );
     },
   });
@@ -96,7 +96,7 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
       }
     },
     onError: (err: Error) => {
-      toast.error(sanitizeErrorMessage(err.message || "Failed to enable 2FA"));
+      toast.error(userFacingErrorMessage(err, "Failed to enable 2FA"));
     },
   });
 
@@ -106,7 +106,7 @@ export default function TwoFactorSettings({ enabled }: { enabled: boolean }) {
       queryClient.invalidateQueries({ queryKey: ["currentUser"] });
     },
     onError: (err: Error) => {
-      toast.error(sanitizeErrorMessage(err.message || "Failed to disable 2FA"));
+      toast.error(userFacingErrorMessage(err, "Failed to disable 2FA"));
     },
   });
 

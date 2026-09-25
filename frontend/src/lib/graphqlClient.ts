@@ -1,4 +1,4 @@
-import { sanitizeErrorMessage } from "@/lib/sanitize";
+import { DisplaySafeError, sanitizeErrorMessage } from "@/lib/sanitize";
 import { getCsrfToken } from "@/lib/csrf";
 import {
   currentRefreshEpoch,
@@ -182,8 +182,11 @@ export async function graphqlRequest<T>(
       throw new Error(rawMsg);
     }
 
-    // Sanitize and cap error message length to prevent overly verbose backend errors from
-    // flooding the UI or leaking sensitive internal details.
+    // Every error explicitly marked user-facing by the server is shown as
+    // written (see `DisplaySafeError`); anything else is sanitized and capped.
+    if (errors.every((e) => e.extensions?.safe === true)) {
+      throw new DisplaySafeError(rawMsg);
+    }
     throw new Error(sanitizeErrorMessage(rawMsg));
   }
 
