@@ -3699,6 +3699,9 @@ pub async fn refresh_ttl(
 // Operations
 // ============================================================================
 
+/// Rows per page of [`re_encrypt_memories_to_org`] (keyset on `id`).
+const MEMORY_SWEEP_PAGE: i64 = 200;
+
 /// Outcome of [`re_encrypt_memories_to_org`].
 #[derive(Debug, Clone, Default)]
 pub struct MemoryReEncryptStats {
@@ -3724,51 +3727,62 @@ pub async fn re_encrypt_memories_to_org(pool: &Pool<Postgres>) -> Result<MemoryR
     let Some(hook) = MEMORY_CRYPTO_HOOK.get().cloned() else {
         return Ok(MemoryReEncryptStats::default());
     };
-    let rows = sqlx::query(
-        "SELECT am.actor_id, am.key, am.value_enc, am.value_key_id, am.value_format, a.org_id \
+    let mut re_encrypted = 0u64;
+    let mut failed = 0u64;
+    // Keyset-paged on `id`: a bounded page in memory at a time, and a row
+    // that fails (still pending) is stepped over rather than re-read forever.
+    let mut after = Uuid::nil();
+    loop {
+        let page = sqlx::query(
+        "SELECT am.id, am.actor_id, am.key, am.value_enc, am.value_key_id, am.value_format, a.org_id \
          FROM actor_memory am JOIN actors a ON a.id = am.actor_id \
          WHERE a.org_id IS NOT NULL \
-           AND talos_org_dek_pending(am.value_key_id, a.org_id)",
+           AND talos_org_dek_pending(am.value_key_id, a.org_id) \
+           AND am.id > $1 \
+         ORDER BY am.id \
+         LIMIT $2",
     )
+    .bind(after)
+    .bind(MEMORY_SWEEP_PAGE)
     .fetch_all(pool)
     .await
     .context("re_encrypt_memories_to_org: select stale rows")?;
+        let Some(last) = page.last() else { break };
+        after = last.try_get("id")?;
+        let full_page = page.len() as i64 == MEMORY_SWEEP_PAGE;
+        for r in page {
+            let actor_id: Uuid = r.try_get("actor_id")?;
+            let key: String = r.try_get("key")?;
+            let value_enc: Vec<u8> = r.try_get("value_enc")?;
+            let value_key_id: Uuid = r.try_get("value_key_id")?;
+            let src_format: i16 = r.try_get("value_format")?;
+            let org_id: Uuid = r.try_get("org_id")?;
 
-    let mut re_encrypted = 0u64;
-    let mut failed = 0u64;
-    for r in rows {
-        let actor_id: Uuid = r.try_get("actor_id")?;
-        let key: String = r.try_get("key")?;
-        let value_enc: Vec<u8> = r.try_get("value_enc")?;
-        let value_key_id: Uuid = r.try_get("value_key_id")?;
-        let src_format: i16 = r.try_get("value_format")?;
-        let org_id: Uuid = r.try_get("org_id")?;
+            let aad = build_memory_aad(actor_id, &key);
+            let plaintext = match hook
+                .decrypt(value_key_id, value_enc, aad.clone(), src_format)
+                .await
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!(%actor_id, %key, "memory per-org sweep: decrypt failed: {e}");
+                    failed += 1;
+                    continue;
+                }
+            };
+            let (new_key_id, new_ct, new_format) = match hook
+                .encrypt(plaintext.to_string(), Some(org_id), aad)
+                .await
+            {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::error!(%actor_id, %key, "memory per-org sweep: re-encrypt failed: {e}");
+                    failed += 1;
+                    continue;
+                }
+            };
 
-        let aad = build_memory_aad(actor_id, &key);
-        let plaintext = match hook
-            .decrypt(value_key_id, value_enc, aad.clone(), src_format)
-            .await
-        {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!(%actor_id, %key, "memory per-org sweep: decrypt failed: {e}");
-                failed += 1;
-                continue;
-            }
-        };
-        let (new_key_id, new_ct, new_format) = match hook
-            .encrypt(plaintext.to_string(), Some(org_id), aad)
-            .await
-        {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::error!(%actor_id, %key, "memory per-org sweep: re-encrypt failed: {e}");
-                failed += 1;
-                continue;
-            }
-        };
-
-        match sqlx::query(
+            match sqlx::query(
             "UPDATE actor_memory \
              SET value_enc = $1, value_key_id = $2, value_format = $3, org_id = $4, updated_at = now() \
              WHERE actor_id = $5 AND key = $6 AND value_key_id = $7 AND value_format = $8",
@@ -3795,6 +3809,10 @@ pub async fn re_encrypt_memories_to_org(pool: &Pool<Postgres>) -> Result<MemoryR
                 tracing::error!(%actor_id, %key, "memory per-org sweep: update failed: {e}");
                 failed += 1;
             }
+        }
+        }
+        if !full_page {
+            break;
         }
     }
 
