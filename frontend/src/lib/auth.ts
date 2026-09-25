@@ -2,6 +2,10 @@ import { graphqlRequest } from "@/lib/graphqlClient";
 import { refreshSession } from "@/lib/session";
 import { useWorkflowStore } from "@/store/workflowStore";
 import { useUIStore } from "@/store/uiStore";
+import {
+  useEphemeralExecutionStore,
+  usePersistedExecutionStore,
+} from "@/store/executionStore";
 
 // MCP-933 (2026-05-15): removed the parallel `useAuthStore` Zustand
 // store plus `StoredUserProfile`, `clearUserData()`,
@@ -159,12 +163,14 @@ export async function logout(): Promise<void> {
     // Continue with local cleanup even if backend logout fails
   }
 
-  useWorkflowStore.setState({
-    nodes: [],
-    edges: [],
-    workflowId: null,
-    workflowName: "Untitled Workflow",
-  });
+  // Full resets: a partial one left the dirty flag, graph version and the
+  // last user's run history (sessionStorage) behind for the next sign-in.
+  useWorkflowStore.getState().clearWorkflow();
+  useEphemeralExecutionStore.getState().resetNodeStatuses();
+  useEphemeralExecutionStore.getState().clearEvents();
+  useEphemeralExecutionStore.getState().clearCurrentExecution();
+  usePersistedExecutionStore.setState({ workflowStatuses: {} });
+  usePersistedExecutionStore.persist.clearStorage();
   useUIStore.setState({
     showToolbox: true,
     toolboxMode: "full",

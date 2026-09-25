@@ -35,6 +35,14 @@ const proOptions = { hideAttribution: true };
 const nodeTypes = { talosNode: TalosNode };
 const edgeTypes = { conditionEdge: ConditionEdge };
 
+// Module-level so `useSyncExternalStore` sees a stable subscribe function
+// (an inline one re-subscribes on every render).
+function subscribeToResize(onChange: () => void) {
+  window.addEventListener("resize", onChange);
+  return () => window.removeEventListener("resize", onChange);
+}
+const readWindowHeight = () => window.innerHeight;
+
 function Workspace() {
   const navigate = useNavigate();
   const nodes = useWorkflowStore(useShallow((s) => s.nodes));
@@ -119,11 +127,8 @@ function Workspace() {
 
   // Subscribe to window resize for terminal height calculation
   const windowHeight = useSyncExternalStore(
-    (cb) => {
-      window.addEventListener("resize", cb);
-      return () => window.removeEventListener("resize", cb);
-    },
-    () => window.innerHeight,
+    subscribeToResize,
+    readWindowHeight,
   );
 
   const terminalHeight =

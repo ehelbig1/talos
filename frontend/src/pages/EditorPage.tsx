@@ -38,8 +38,8 @@ function ModulePreloader({ moduleId }: { moduleId: string }) {
       undefined,
       mod.importedInterfaces ?? undefined,
     );
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [data]);
+    // `addNode` is a stable store action; `added` makes this run once.
+  }, [data, addNode]);
 
   return null;
 }
