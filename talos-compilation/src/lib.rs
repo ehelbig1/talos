@@ -2673,9 +2673,11 @@ mod jspy_world_detection_tests {
 /// Whether a capability world's linker tier grants the RAW
 /// `wasi:http/outgoing-handler` interface (StarlingMonkey's `fetch`).
 ///
-/// Only the automation (Trusted) tier does — the worker adds
-/// `add_only_http_to_linker_async` there and `add_wasi_http_types_only`
-/// (types, no handler) everywhere else. So JS for any lower world must be
+/// Only the automation (Trusted) tier does — the worker links the GATED
+/// handler there (`talos-worker-runtime/src/host/wasi_http.rs`, since
+/// 2026-09-25: the `talos:core/http` gate set, not upstream's unfiltered
+/// `add_only_http_to_linker_async`) and `add_wasi_http_types_only` (types, no
+/// handler) everywhere else. So JS for any lower world must be
 /// compiled with `jco --disable http` (see `compile_js_in_workspace`);
 /// keeping the handler import would fail to link with
 /// "wasi:http/outgoing-handler not found in the linker". An

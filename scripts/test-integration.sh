@@ -923,6 +923,12 @@ CTRL_TESTS=(
     "actor_budget_coverage_tests"
     # BR: the grant CHECK equals ACTOR_CEILING_WORLDS; one ceiling read.
     "capability_grant_world_check_tests"
+    # 2026-09-25: the sub-workflow binding reads actors.http_verb_ceiling, so a
+    # stricter child is not handed the parent's POST override.
+    "subworkflow_verb_ceiling_binding_tests"
+    # 2026-09-25: create_workflow_from_spec compiles through InlineCompileService,
+    # refuses a taken name, never grants "*" hosts, role-gates each world.
+    "create_workflow_from_spec_gate_tests"
 )
 # 'talos_ctl' is now the migrated TEMPLATE: setup_test_context clones it into a
 # private per-test database (controller/tests/common::isolated_db_pool), so the

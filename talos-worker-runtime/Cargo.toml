@@ -115,6 +115,11 @@ tracing-opentelemetry = "0.33"
 wasmtime-wasi-http = "47.0.3"
 oci-distribution = "0.11.0"
 bytes = "1.11.1"
+# `host::wasi_http` (2026-09-25): the gated wasi:http send path converts the
+# upstream hyper request/response to and from the hardened reqwest client.
+# Both already in Cargo.lock via wasmtime-wasi-http / reqwest — no new crate.
+http = "1"
+http-body-util = "0.1"
 thiserror = "2.0.18"
 
 [dev-dependencies]

@@ -309,16 +309,27 @@ pub struct SourceActorCloneRow {
     pub ceilings: ActorCeilingColumns,
 }
 
-/// The three per-actor ceiling columns as their DB strings — `max_llm_tier`,
-/// `egress_scope` (nullable) and `max_write_ceiling` — read from one row and
-/// written to another without re-interpretation. Used by the one clone path
+/// The four signed per-actor ceiling columns as their DB strings —
+/// `max_llm_tier`, `egress_scope` (nullable), `max_write_ceiling` and
+/// `http_verb_ceiling` (nullable) — read from one row and written to another
+/// without re-interpretation. Used by the one clone path
 /// (`get_source_actor_for_clone` → `insert_actor_with_grants_and_limit_check`),
 /// which both MCP and GraphQL reach through `talos_actor_lifecycle_service::clone_actor`.
+///
+/// `http_verb_ceiling` was missing until 2026-09-25, so a clone of a
+/// `write` + `http_verb_ceiling = readonly` actor (one that may keep notes but
+/// must not POST) came out able to POST. The INSERT now destructures this
+/// struct exhaustively, so a fifth column added here is a compile error until
+/// it is written. Mirrors `talos_workflow_engine_core::ActorCeilings`, which is
+/// the typed form of the same four axes; this one stays as raw strings so a
+/// clone copies the stored token byte-for-byte rather than a re-rendering of
+/// its parse.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActorCeilingColumns {
     pub max_llm_tier: String,
     pub egress_scope: Option<String>,
     pub max_write_ceiling: String,
+    pub http_verb_ceiling: Option<String>,
 }
 
 /// Lightweight actor projection returned by `get_actor_basic_info` — used by
@@ -3357,7 +3368,7 @@ impl ActorRepository {
     ) -> Result<Option<SourceActorCloneRow>> {
         let row = sqlx::query(
             "SELECT name, description, max_capability_world, secret_grants, \
-                    max_llm_tier, egress_scope, max_write_ceiling \
+                    max_llm_tier, egress_scope, max_write_ceiling, http_verb_ceiling \
              FROM actors WHERE id = $1 AND user_id = $2 AND status != 'terminated'",
         )
         .bind(source_actor_id)
@@ -3377,6 +3388,7 @@ impl ActorRepository {
                     max_llm_tier: r.try_get("max_llm_tier")?,
                     egress_scope: r.try_get::<Option<String>, _>("egress_scope")?,
                     max_write_ceiling: r.try_get("max_write_ceiling")?,
+                    http_verb_ceiling: r.try_get::<Option<String>, _>("http_verb_ceiling")?,
                 },
             })
         })
@@ -3445,13 +3457,25 @@ impl ActorRepository {
         // RFC 0006 / RFC 0005 S3: scope to the owner's personal org so the
         // org-pin WITH CHECK enforces (org_id is trigger-stamped, not bound).
         let mut tx = self.begin_personal_org_write(user_id).await?;
-        // `ceilings` (2026-09-10): the source actor's `max_llm_tier` /
-        // `egress_scope` / `max_write_ceiling`, copied verbatim. See
-        // `SourceActorCloneRow::ceilings`.
+        // `ceilings` (2026-09-10; `http_verb_ceiling` 2026-09-25): the source
+        // actor's four signed ceiling columns, copied verbatim. See
+        // `SourceActorCloneRow::ceilings`. Destructured EXHAUSTIVELY (no `..`):
+        // an axis added to `ActorCeilingColumns` must be written here or this
+        // does not compile — the verb override was dropped by a hand-listed
+        // bind below until it was.
+        let ActorCeilingColumns {
+            max_llm_tier,
+            egress_scope,
+            max_write_ceiling,
+            http_verb_ceiling,
+        } = ceilings;
+        // The INSERT carries `http_verb_ceiling` directly: the column's
+        // escalation guard (`20260924120000`) is `BEFORE UPDATE`, so a clone
+        // copies a source's grant exactly as it copies `max_write_ceiling`.
         let result = sqlx::query(
             "INSERT INTO actors (id, user_id, name, description, max_capability_world, secret_grants, \
-                                 max_llm_tier, egress_scope, max_write_ceiling) \
-             SELECT $1, $2, $3, $4, $5, $6, $8, $9, $10 \
+                                 max_llm_tier, egress_scope, max_write_ceiling, http_verb_ceiling) \
+             SELECT $1, $2, $3, $4, $5, $6, $8, $9, $10, $11 \
              WHERE (SELECT COUNT(*) FROM actors WHERE user_id = $2) < $7",
         )
         .bind(actor_id)
@@ -3461,9 +3485,10 @@ impl ActorRepository {
         .bind(max_capability_world)
         .bind(secret_grants)
         .bind(max_actors_per_user)
-        .bind(&ceilings.max_llm_tier)
-        .bind(&ceilings.egress_scope)
-        .bind(&ceilings.max_write_ceiling)
+        .bind(max_llm_tier)
+        .bind(egress_scope)
+        .bind(max_write_ceiling)
+        .bind(http_verb_ceiling)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;

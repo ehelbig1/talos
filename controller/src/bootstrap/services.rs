@@ -1819,6 +1819,19 @@ pub(crate) fn build_schema_and_services(
     // block) so it could be handed into `GraphRagService` for the
     // tier-1 data-egress gate. Reused here without rebuilding.
 
+    // Inline-Rust compile service. Single shared instance backs the
+    // `rust_code` branch of `add_node_to_workflow` (and is ready to
+    // back any future protocol surface — same Arc → same wrap-lint-
+    // compile-mirror flow). Owns the shared-module-overwrite +
+    // permission-drift guards that were inline in workflows.rs.
+    let inline_compile_service =
+        std::sync::Arc::new(talos_inline_compile_service::InlineCompileService::new(
+            workflow_repo.clone(),
+            module_repo.clone(),
+            compiler.clone(),
+            db_pool.clone(),
+        ));
+
     // Pre-build the workflow-creation service so GraphQL and MCP
     // share one instance (one DEK cache, one LLM-client clone, one
     // template registry view). Cheap construction — just stores
@@ -1829,7 +1842,7 @@ pub(crate) fn build_schema_and_services(
             llm_client.clone(),
             dlp_service.clone(),
             module_repo.clone(),
-            compiler.clone(),
+            inline_compile_service.clone(),
         ));
 
     // Hot-update orchestration. Single shared instance — the recompile
@@ -1892,19 +1905,6 @@ pub(crate) fn build_schema_and_services(
         secrets_manager.clone(),
         runtime.clone(),
     ));
-
-    // Inline-Rust compile service. Single shared instance backs the
-    // `rust_code` branch of `add_node_to_workflow` (and is ready to
-    // back any future protocol surface — same Arc → same wrap-lint-
-    // compile-mirror flow). Owns the shared-module-overwrite +
-    // permission-drift guards that were inline in workflows.rs.
-    let inline_compile_service =
-        std::sync::Arc::new(talos_inline_compile_service::InlineCompileService::new(
-            workflow_repo.clone(),
-            module_repo.clone(),
-            compiler.clone(),
-            db_pool.clone(),
-        ));
 
     // Search service. Owns the semantic-search fallback chain
     // (caller embedding → auto-generate → vector → trigram → ILIKE)

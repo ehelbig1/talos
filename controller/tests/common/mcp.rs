@@ -67,6 +67,14 @@ pub async fn mcp_state(db_pool: sqlx::PgPool) -> McpState {
         actor_repo.clone(),
         advanced_repo.clone(),
     );
+    // One instance shared by `add_node_to_workflow` and
+    // `create_workflow_from_spec`, as in the controller bootstrap.
+    let inline_compile_service = Arc::new(talos_inline_compile_service::InlineCompileService::new(
+        workflow_repo.clone(),
+        module_repo.clone(),
+        compiler.clone(),
+        db_pool.clone(),
+    ));
 
     McpState {
         db_pool: db_pool.clone(),
@@ -92,7 +100,7 @@ pub async fn mcp_state(db_pool: sqlx::PgPool) -> McpState {
             None,
             dlp_service.clone(),
             module_repo.clone(),
-            compiler.clone(),
+            inline_compile_service.clone(),
         )),
         hot_update_service: Arc::new(talos_hot_update_service::HotUpdateService::new(
             module_repo.clone(),
@@ -125,12 +133,7 @@ pub async fn mcp_state(db_pool: sqlx::PgPool) -> McpState {
             secrets_manager.clone(),
             runtime.clone(),
         )),
-        inline_compile_service: Arc::new(talos_inline_compile_service::InlineCompileService::new(
-            workflow_repo.clone(),
-            module_repo.clone(),
-            compiler.clone(),
-            db_pool.clone(),
-        )),
+        inline_compile_service,
         search_service: Arc::new(talos_search_service::SearchService::new(
             workflow_repo.clone(),
         )),

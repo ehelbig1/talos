@@ -318,19 +318,23 @@ impl wit_http::Host for TalosContext {
         // host-fn ceiling: those gate key resolution; this gates the
         // network destination. Both are needed — a guest can bring its
         // own key (`config["api_key"]`) and bypass `llm::*` entirely.
-        if matches!(
-            self.max_llm_tier,
-            talos_workflow_job_protocol::LlmTier::Tier1
-        ) {
+        // Egress-posture gate: tier-1 LLM hosts + public IP literals, and
+        // public IP literals for ANY local-egress-only actor (a resolver never
+        // sees a literal) — one predicate, `egress_posture_deny_reason`.
+        {
             let host_lower = host.to_ascii_lowercase();
-            if let Some(policy) = tier1_egress_deny_reason(&host_lower) {
+            if let Some(policy) = egress_posture_deny_reason(
+                &host_lower,
+                self.max_llm_tier,
+                self.local_egress_only,
+            ) {
                 self.record_capability_denied("http-fetch", policy, host)
                     .await;
                 tracing::warn!(
                     host,
                     actor_id = ?self.actor_id,
                     policy,
-                    "tier-1 actor egress refused (external LLM host or public IP literal)"
+                    "actor egress posture refused egress (tier-1: external LLM host or public IP literal; local-only egress: public IP literal)"
                 );
                 return Err(deny_forbidden(self, tier1_egress_class(policy)));
             }
@@ -1358,19 +1362,23 @@ impl wit_http::Host for TalosContext {
 
             // 5. Tier-1 LLM egress ceiling. Per-request so a mixed batch
             //    rejects only the tier-2 LLM entries.
-            if matches!(
-                self.max_llm_tier,
-                talos_workflow_job_protocol::LlmTier::Tier1
-            ) {
+            // Egress-posture gate: tier-1 LLM hosts + public IP literals, and
+            // public IP literals for ANY local-egress-only actor (a resolver never
+            // sees a literal) — one predicate, `egress_posture_deny_reason`.
+            {
                 let host_lower = host.to_ascii_lowercase();
-                if let Some(policy) = tier1_egress_deny_reason(&host_lower) {
+                if let Some(policy) = egress_posture_deny_reason(
+                    &host_lower,
+                    self.max_llm_tier,
+                    self.local_egress_only,
+                ) {
                     self.record_capability_denied("http-fetch-all", policy, &host)
                         .await;
                     tracing::warn!(
                         host = %host,
                         actor_id = ?self.actor_id,
                         policy,
-                        "tier-1 actor fetch_all egress refused (external LLM host or public IP literal)"
+                        "actor egress posture refused fetch_all egress (tier-1: external LLM host or public IP literal; local-only egress: public IP literal)"
                     );
                     validated.push(Err(deny_forbidden(self, tier1_egress_class(policy))));
                     continue;

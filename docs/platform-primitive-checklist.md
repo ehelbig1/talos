@@ -110,7 +110,7 @@ When you think the primitive is done, verify by running a real module that uses 
 
 - [ ] `compile_custom_sandbox` MCP handler accepts any new compile-time declaration.
 - [ ] `install_module_from_catalog` accepts it.
-- [ ] `WorkflowRepository::insert_node_template` / `update_node_template_wasm` / `upsert_wasm_module_for_template` thread it.
+- [ ] `ModuleRepository::mirror_module_write` (reached by `InlineCompileService` and the sandbox compile paths) threads it. (`WorkflowRepository::insert_node_template` / `update_node_template_wasm` were deleted 2026-09-25.)
 - [ ] End-to-end: compile a toy module that uses the new WIT interface, call it from a workflow, verify the DB row exists. Do this BEFORE declaring the primitive done.
 
 ## Meta — how to run the review itself
