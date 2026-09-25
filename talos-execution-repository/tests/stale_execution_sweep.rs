@@ -1,3 +1,4 @@
+// ci-store: migrated — scripts/test-integration.sh runs this with that store (scripts/ci_test_targets.py)
 //! Live-Postgres integration tests for the attributed stale-execution sweep
 //! (`talos_execution_repository::stale_sweep`).
 //!

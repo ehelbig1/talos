@@ -1612,6 +1612,8 @@ impl ParallelWorkflowEngine {
     /// tier, or a Tier-1 actor silently runs Tier-2). This call site is inside
     /// `talos-workflow-engine`, where the setter legitimately lives, so the
     /// bare `set_actor_id` is exempt by design.
+    // disallowed-method: talos_workflow_engine::ParallelWorkflowEngine::set_actor_id — apply_subworkflow_binding stamps the ceilings beside the identity
+    #[allow(clippy::disallowed_methods)]
     pub(crate) fn apply_subworkflow_binding(
         sub_engine: &mut ParallelWorkflowEngine,
         binding: &talos_workflow_engine_core::SubworkflowBinding,
@@ -2025,6 +2027,8 @@ mod identity_binding_tests {
             .is_none());
     }
 
+    // disallowed-method: talos_workflow_engine::ParallelWorkflowEngine::set_actor_id — test: the parent identity the sub-workflow binding must replace
+    #[allow(clippy::disallowed_methods)]
     #[test]
     fn apply_binding_some_actor_rebinds_identity_and_stamps_ceilings() {
         let parent_actor = Uuid::new_v4();
@@ -2056,6 +2060,8 @@ mod identity_binding_tests {
         assert_eq!(e.egress_scope, Some(EgressScope::Local));
     }
 
+    // disallowed-method: talos_workflow_engine::ParallelWorkflowEngine::set_actor_id — test: the parent identity the sub-workflow binding must keep
+    #[allow(clippy::disallowed_methods)]
     #[test]
     fn apply_binding_none_actor_keeps_parent_identity() {
         let parent_actor = Uuid::new_v4();

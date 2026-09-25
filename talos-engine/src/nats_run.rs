@@ -118,6 +118,8 @@ pub fn install_llm_usage_sink(sink: talos_workflow_engine_nats::LlmUsageSink) {
 /// `entry_point` / `execution_id` are for the refusal log only; pass
 /// `None` for the latter when dispatching under a synthetic execution
 /// with no `workflow_executions` row.
+// disallowed-method: talos_workflow_engine_nats::NatsNodeDispatcher::new — build_nats_dispatcher: the one production constructor, behind the signing gate
+#[allow(clippy::disallowed_methods)]
 pub fn build_nats_dispatcher(
     engine: &ParallelWorkflowEngine,
     nats_client: Arc<async_nats::Client>,

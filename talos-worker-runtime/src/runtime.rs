@@ -5916,6 +5916,8 @@ impl TalosRuntime {
 /// ONE place raw module bytes become a `Component`, AOT or JIT, inside the
 /// codegen panic guard. A free function over `&Engine` so it can run on the
 /// blocking pool without borrowing the runtime.
+// disallowed-method: wasmtime::component::Component::new — compile_component_guarded_on, the one call site, inside the panic guard
+#[allow(clippy::disallowed_methods)]
 fn compile_component_guarded_on(
     engine: &Engine,
     wasm_bytes: &[u8],
@@ -5932,9 +5934,10 @@ fn compile_component_guarded_on(
             load_precompiled_on(engine, wasm_bytes, cap)
         } else {
             // THIS is the guarded chokepoint (wrapped by guard_codegen_panic
-            // above); all other sites route here. Trailing marker keeps it on
-            // the call line so the line-based lint (check 53) sees the opt-out.
-            Component::new(engine, wasm_bytes).map_err(Into::into) // allow-unguarded-component-new
+            // above); all other sites route here. Check 53 is a clippy
+            // `disallowed-methods` rule: the allow on this function is the one
+            // sanctioned exception.
+            Component::new(engine, wasm_bytes).map_err(Into::into)
         }
     })
 }

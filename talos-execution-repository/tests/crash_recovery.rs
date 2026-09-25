@@ -1,3 +1,4 @@
+// ci-store: migrated — scripts/test-integration.sh runs this with that store (scripts/ci_test_targets.py)
 //! Live-Postgres integration tests for the crash-recovery claim/fail/reclaim
 //! repository methods (RFC 0003 durable execution). Proves the
 //! safety-critical exactly-once claim, the stale-threshold gating, and the

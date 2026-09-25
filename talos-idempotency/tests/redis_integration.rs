@@ -1,3 +1,4 @@
+// ci-store: redis — scripts/test-integration.sh runs this with that store (scripts/ci_test_targets.py)
 //! Redis-backed integration tests for the idempotency reservation primitive
 //! (`begin` / `complete` / `release`). The atomic GET-and-claim is implemented
 //! as a Redis Lua `EVAL`, so its real behavior — especially that exactly one

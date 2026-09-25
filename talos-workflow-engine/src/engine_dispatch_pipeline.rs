@@ -1171,6 +1171,8 @@ mod pipeline_ledger_finalize_tests {
 
     /// Two-step chain, both steps backed by real artifacts so the pre-dispatch
     /// step loop runs to completion and both `record_started` rows are opened.
+    // disallowed-method: talos_workflow_engine::ParallelWorkflowEngine::set_actor_id — test fixture: an engine with an arbitrary actor, no ceilings in play
+    #[allow(clippy::disallowed_methods)]
     async fn dispatch_chain_once(
         error_message: &str,
     ) -> (
@@ -1185,8 +1187,6 @@ mod pipeline_ledger_finalize_tests {
 
         let mut engine = ParallelWorkflowEngine::new();
         engine.set_user_id(Uuid::new_v4());
-        // Bare `set_actor_id` needs no opt-out: lint check 29 excludes
-        // `talos-workflow-engine/**` wholesale.
         engine.set_actor_id(Uuid::new_v4());
         engine.set_module_execution_store(store.clone());
         engine.set_module_fetcher(Arc::new(

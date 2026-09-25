@@ -1,3 +1,4 @@
+// ci-store: migrated — scripts/test-integration.sh runs this with that store (scripts/ci_test_targets.py)
 //! Integration tests against a live Postgres.
 //!
 //! Gated on `TALOS_TEST_DATABASE_URL` being set — without it, each

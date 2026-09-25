@@ -1,3 +1,4 @@
+// ci-store: services — scripts/test-integration.sh runs this with that store (scripts/ci_test_targets.py)
 //! The AUDIT_LEDGER JetStream stream must be BOUNDED, and an existing
 //! unbounded stream must be brought to the bound IN PLACE without losing what
 //! it holds.

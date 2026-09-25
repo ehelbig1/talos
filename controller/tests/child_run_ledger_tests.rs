@@ -231,6 +231,8 @@ fn parent_engine(
 /// actor at all. `None` is not a permissive actor — it is the Tier-1 fail-safe
 /// with no tenancy principal — and the ledger row is where that becomes
 /// visible after the fact.
+// disallowed-method: talos_workflow_engine::ParallelWorkflowEngine::set_actor_id — test: a parent engine with a known actor
+#[allow(clippy::disallowed_methods)]
 fn parent_engine_bound_to(
     pool: &sqlx::PgPool,
     t: &Seeded,
