@@ -17,7 +17,7 @@ import {
   Zap,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { sanitizeErrorMessage } from "@/lib/sanitize";
+import { sanitizeErrorMessage, userFacingErrorMessage } from "@/lib/sanitize";
 import { toast } from "sonner";
 import type {
   DekRotationResult,
@@ -287,12 +287,12 @@ function RotateMasterKeyCard() {
       setResult(data.rotateMasterKey);
       setNewMasterKey("");
       setConfirmPhrase("");
-      toast.success("Master key rotated — all DEKs re-encrypted");
+      toast.success(
+        "DEKs rewrapped — now remove TALOS_MASTER_KEY_PREVIOUS and roll the controllers",
+      );
     },
     onError: (err: Error) => {
-      toast.error(
-        sanitizeErrorMessage(err.message || "Failed to rotate master key"),
-      );
+      toast.error(userFacingErrorMessage(err, "Failed to rotate master key"));
     },
   });
 
@@ -334,13 +334,13 @@ function RotateMasterKeyCard() {
                 Rotate Root Master Key
               </h3>
               <WarningBadge level="critical">
-                Terminal / Non-Reversible
+                Staged / Highest Privilege
               </WarningBadge>
             </div>
             <p className="text-[11px] text-muted-foreground/40 font-bold uppercase tracking-widest leading-relaxed max-w-2xl">
-              Replaces the root master key and re-encrypts all DEKs. The old
-              master key will no longer be able to decrypt any data after this
-              operation completes. This is the highest privilege security
+              Step 2 of a staged rotation: rewraps every DEK the new master key
+              cannot yet open. The key is never swapped from this page — it must
+              already be deployed. This is the highest privilege security
               operation.
             </p>
           </div>
@@ -351,13 +351,22 @@ function RotateMasterKeyCard() {
           <AlertTriangle className="w-6 h-6 text-destructive shrink-0 mt-1 shadow-[0_0_15px_hsla(var(--destructive),0.5)]" />
           <div className="text-xs text-destructive/80 font-black uppercase tracking-widest leading-relaxed space-y-2">
             <p className="text-destructive">
-              CRITICAL: THIS OPERATION CANNOT BE UNDONE.
+              STAGED PROCEDURE — FOLLOW IN ORDER.
             </p>
-            <p className="opacity-60 font-bold">
-              All DEKs will be re-encrypted with the new master key. Legacy
-              entropy will be permanently purged. Ensure you have established
-              secure persistence for the new key before commitment.
-            </p>
+            <ol className="opacity-60 font-bold list-decimal pl-4 space-y-1">
+              <li>
+                On every controller set TALOS_MASTER_KEY to the NEW key and
+                TALOS_MASTER_KEY_PREVIOUS to the OLD key, then roll the fleet.
+              </li>
+              <li>
+                Enter the new key below and commit. Rows stay readable
+                throughout; an interrupted run can simply be repeated.
+              </li>
+              <li>
+                Remove TALOS_MASTER_KEY_PREVIOUS and roll again. Until then the
+                old key is still required — do not discard it.
+              </li>
+            </ol>
           </div>
         </div>
 
@@ -450,7 +459,10 @@ function RotateMasterKeyCard() {
 
         {result && (
           <ResultBox>
-            <p>{sanitizeErrorMessage(result.message)}</p>
+            <p>
+              Rewrap complete. Final step: remove TALOS_MASTER_KEY_PREVIOUS from
+              every controller and roll again.
+            </p>
             <p className="mt-2 text-[10px] text-success/40">
               {result.reEncryptedDekCount} DEK_NODES_SYNCHRONIZED_WITH_NEW_ROOT
             </p>

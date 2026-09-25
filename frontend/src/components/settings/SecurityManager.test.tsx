@@ -37,6 +37,14 @@ describe("SecurityManager", () => {
     expect(screen.getByText("ROTATE_SYMMETRIC")).toBeInTheDocument();
   });
 
+  it("describes the staged master-key procedure, not an in-memory swap", () => {
+    render(<SecurityManager />);
+    expect(
+      screen.getAllByText(/TALOS_MASTER_KEY_PREVIOUS/).length,
+    ).toBeGreaterThan(0);
+    expect(screen.queryByText(/CANNOT BE UNDONE/)).toBeNull();
+  });
+
   it("opens the DEK rotation confirmation gate", async () => {
     render(<SecurityManager />);
     fireEvent.click(screen.getByText("ROTATE_DEK"));
