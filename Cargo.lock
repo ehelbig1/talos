@@ -7912,6 +7912,7 @@ dependencies = [
  "dirs-next",
  "handlebars",
  "hex",
+ "libc",
  "regex",
  "serde",
  "serde_json",
