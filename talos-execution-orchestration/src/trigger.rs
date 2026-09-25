@@ -528,7 +528,13 @@ impl ExecutionOrchestrationService {
         // 14. Engine build. Lift any caller-provided __actor_context__
         // out so the engine propagates it to ALL nodes (the builder
         // attaches it as a property; not just on the root payload).
-        let lifted_actor_context = input_payload.get("__actor_context__").cloned();
+        // The payload is persisted (`__trigger_input__` in the output, the
+        // failure output), so the decrypted context is REMOVED from it, not
+        // copied; the engine strips engine-authored keys at the seed anyway.
+        let lifted_actor_context =
+            talos_workflow_engine_core::reserved_keys::lift_actor_context_for_storage(
+                &mut input_payload,
+            );
         let nats = self
             .nats_client
             .as_ref()
