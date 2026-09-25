@@ -4,6 +4,7 @@ import ErrorBoundary from "@/components/ErrorBoundary";
 import { loadWorkflowById } from "@/lib/workflowLoader";
 import { useGetModulesLoaderQuery } from "@/generated/graphql";
 import { useWorkflowStore } from "@/store/workflowStore";
+import { UnsavedChangesGuard } from "@/components/UnsavedChangesGuard";
 
 const ExecutionPanel = lazy(() => import("@/components/ExecutionPanel"));
 const Workspace = lazy(() => import("@/components/Workspace"));
@@ -49,12 +50,19 @@ function EditorPage() {
   const moduleId = searchParams.get("moduleId");
 
   useEffect(() => {
-    if (id) {
-      loadWorkflowById(id).catch((err) => {
-        if (import.meta.env.DEV)
-          console.error("Failed to deep-link workflow:", err);
-      });
-    }
+    if (!id) return;
+    // Unsaved edits to THIS workflow (e.g. `/editor` gaining its id after a
+    // first save, or a remount) are kept rather than overwritten.
+    const { isDirty, workflowId } = useWorkflowStore.getState();
+    if (isDirty && workflowId === id) return;
+    let current = true;
+    loadWorkflowById(id, { isCurrent: () => current }).catch((err) => {
+      if (import.meta.env.DEV)
+        console.error("Failed to deep-link workflow:", err);
+    });
+    return () => {
+      current = false;
+    };
   }, [id]);
 
   return (
@@ -76,6 +84,7 @@ function EditorPage() {
             </div>
           }
         >
+          <UnsavedChangesGuard />
           {moduleId && <ModulePreloader moduleId={moduleId} />}
 
           {/* Execution Monitoring Top Bar / Header */}

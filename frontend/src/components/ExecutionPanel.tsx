@@ -162,8 +162,8 @@ export default function ExecutionPanel() {
         return;
       }
 
-      setWorkflowId(selectedWorkflowId);
-      if (selectedWorkflowId) {
+      const load = async () => {
+        setWorkflowId(selectedWorkflowId);
         try {
           await loadWorkflowById(selectedWorkflowId);
         } catch (err: unknown) {
@@ -177,7 +177,22 @@ export default function ExecutionPanel() {
           );
           setWorkflowId(storeWorkflowId || "new");
         }
+      };
+      // Loading replaces the canvas: never silently over unsaved edits.
+      if (useWorkflowStore.getState().isDirty) {
+        setConfirmPending({
+          title: "Switch Workflow",
+          message:
+            "Discard unsaved changes to the current workflow and open another?",
+          confirmLabel: "Discard",
+          onConfirm: () => {
+            setConfirmPending(null);
+            void load();
+          },
+        });
+        return;
       }
+      await load();
     },
     [nodes.length, storeWorkflowId, clearWorkflow],
   );
