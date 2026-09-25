@@ -282,19 +282,72 @@ pub struct EngineOpts {
     pub graph: GraphSource,
 }
 
+/// [`EngineOpts`] whose actor binding has not been decided yet.
+///
+/// [`EngineOpts::for_run`] and [`EngineOpts::for_skip_load`] return THIS, and
+/// [`for_workflow`] accepts only [`EngineOpts`], so an engine cannot be built
+/// until the call site says which actor it runs as — the gate-resolved one
+/// ([`with_effective_actor`](Self::with_effective_actor)), a required one
+/// ([`with_actor_id`](Self::with_actor_id)), or, deliberately and visibly,
+/// none ([`without_actor`](Self::without_actor)).
+///
+/// Until 2026-09-25 `for_run` returned a ready `EngineOpts` with no actor, and
+/// `enqueue_workflow`'s drain passed it straight to `for_workflow`: an engine
+/// with no actor skips `apply_actor_to_engine`, so a workflow bound to a
+/// `readonly` actor ran with the `Write` ceiling and no capability-world
+/// ceiling. Lint check 56 caught only a literal `with_effective_actor(None, …)`
+/// and never saw it, because the defect was the ABSENCE of a call. Absence no
+/// longer compiles.
+#[must_use = "an UnboundEngineOpts builds nothing until its actor binding is decided"]
+#[derive(Debug, Clone)]
+pub struct UnboundEngineOpts(EngineOpts);
+
+impl UnboundEngineOpts {
+    /// Apply the "effective actor" pattern: caller-supplied `arg` wins,
+    /// falling back to the workflow's default `actor_id`. Either or both
+    /// may be `None`. Pass the gate-resolved actor
+    /// (`talos_workflow_authorization::resolve_effective_actor`) as `arg`.
+    pub fn with_effective_actor(
+        mut self,
+        arg: Option<Uuid>,
+        workflow_default: Option<Uuid>,
+    ) -> EngineOpts {
+        self.0.effective_actor_id = arg.or(workflow_default);
+        self.0
+    }
+
+    /// Bind a specific actor unconditionally. Use for paths like
+    /// `handoff_to_actor` where the actor identity is required and the
+    /// "effective" fallback doesn't apply.
+    pub fn with_actor_id(mut self, actor_id: Uuid) -> EngineOpts {
+        self.0.effective_actor_id = Some(actor_id);
+        self.0
+    }
+
+    /// Build with NO actor: no `apply_actor_to_engine`, so the engine keeps
+    /// its unbound defaults (no capability-world ceiling, the default write
+    /// ceiling). Never right for a run the platform starts on a user's
+    /// behalf — resolve the actor through the authorization gate instead.
+    /// Lint check 56 reports every call outside this file; a deliberate one
+    /// carries `// allow-unresolved-effective-actor: <reason>`.
+    pub fn without_actor(self) -> EngineOpts {
+        self.0
+    }
+}
+
 impl EngineOpts {
-    /// Construct opts for a normal workflow run with sensible defaults:
-    /// no actor, no actor_context, [`TimeoutPolicy::Honor`], no dry_run.
-    #[must_use]
-    pub fn for_run(workflow_id: Uuid, graph_json: String) -> Self {
-        Self {
+    /// Start opts for a normal workflow run with sensible defaults:
+    /// no actor_context, [`TimeoutPolicy::Honor`], no dry_run — and an actor
+    /// binding the caller MUST decide next (see [`UnboundEngineOpts`]).
+    pub fn for_run(workflow_id: Uuid, graph_json: String) -> UnboundEngineOpts {
+        UnboundEngineOpts(Self {
             workflow_id,
             effective_actor_id: None,
             actor_context: None,
             timeout: TimeoutPolicy::Honor,
             dry_run: false,
             graph: GraphSource::Json(graph_json),
-        }
+        })
     }
 
     /// Construct opts for a workflow run that resolves its graph some other
@@ -303,38 +356,16 @@ impl EngineOpts {
     ///
     /// Equivalent to `for_run(workflow_id, String::new()).with_skip_graph_load()`
     /// but expresses intent at the call site without the dummy empty string.
-    #[must_use]
-    pub fn for_skip_load(workflow_id: Uuid) -> Self {
-        Self {
+    /// Like `for_run`, the actor binding is decided next.
+    pub fn for_skip_load(workflow_id: Uuid) -> UnboundEngineOpts {
+        UnboundEngineOpts(Self {
             workflow_id,
             effective_actor_id: None,
             actor_context: None,
             timeout: TimeoutPolicy::Honor,
             dry_run: false,
             graph: GraphSource::SkipLoad,
-        }
-    }
-
-    /// Apply the "effective actor" pattern: caller-supplied `arg` wins,
-    /// falling back to the workflow's default `actor_id`. Either or both
-    /// may be `None`.
-    #[must_use]
-    pub fn with_effective_actor(
-        mut self,
-        arg: Option<Uuid>,
-        workflow_default: Option<Uuid>,
-    ) -> Self {
-        self.effective_actor_id = arg.or(workflow_default);
-        self
-    }
-
-    /// Bind a specific actor unconditionally. Use for paths like
-    /// `handoff_to_actor` where the actor identity is required and the
-    /// "effective" fallback doesn't apply.
-    #[must_use]
-    pub fn with_actor_id(mut self, actor_id: Uuid) -> Self {
-        self.effective_actor_id = Some(actor_id);
-        self
+        })
     }
 
     /// Inject pre-resolved actor memory context. Pass `None` to keep
@@ -505,7 +536,7 @@ mod opts_tests {
 
     #[test]
     fn for_run_defaults_match_documented_contract() {
-        let opts = EngineOpts::for_run(wf(), "{}".to_string());
+        let opts = EngineOpts::for_run(wf(), "{}".to_string()).without_actor();
         assert_eq!(opts.workflow_id, wf());
         assert!(opts.effective_actor_id.is_none());
         assert!(opts.actor_context.is_none());
@@ -544,7 +575,9 @@ mod opts_tests {
 
     #[test]
     fn with_timeout_override_replaces_honor() {
-        let opts = EngineOpts::for_run(wf(), "{}".to_string()).with_timeout_override(60);
+        let opts = EngineOpts::for_run(wf(), "{}".to_string())
+            .without_actor()
+            .with_timeout_override(60);
         match opts.timeout {
             TimeoutPolicy::ForceOverride(60) => {}
             other => panic!("expected ForceOverride(60), got {other:?}"),
@@ -553,33 +586,40 @@ mod opts_tests {
 
     #[test]
     fn with_dry_run_toggles_flag() {
-        let opts = EngineOpts::for_run(wf(), "{}".to_string()).with_dry_run(true);
+        let opts = EngineOpts::for_run(wf(), "{}".to_string())
+            .without_actor()
+            .with_dry_run(true);
         assert!(opts.dry_run);
     }
 
     #[test]
     fn with_actor_context_some_sets_it() {
         let ctx = serde_json::json!({"actor_id": "x"});
-        let opts =
-            EngineOpts::for_run(wf(), "{}".to_string()).with_actor_context(Some(ctx.clone()));
+        let opts = EngineOpts::for_run(wf(), "{}".to_string())
+            .without_actor()
+            .with_actor_context(Some(ctx.clone()));
         assert_eq!(opts.actor_context, Some(ctx));
     }
 
     #[test]
     fn with_actor_context_none_stays_none() {
-        let opts = EngineOpts::for_run(wf(), "{}".to_string()).with_actor_context(None);
+        let opts = EngineOpts::for_run(wf(), "{}".to_string())
+            .without_actor()
+            .with_actor_context(None);
         assert!(opts.actor_context.is_none());
     }
 
     #[test]
     fn with_skip_graph_load_replaces_json_variant() {
-        let opts = EngineOpts::for_run(wf(), "{\"nodes\":[]}".to_string()).with_skip_graph_load();
+        let opts = EngineOpts::for_run(wf(), "{\"nodes\":[]}".to_string())
+            .without_actor()
+            .with_skip_graph_load();
         assert!(matches!(opts.graph, GraphSource::SkipLoad));
     }
 
     #[test]
     fn for_skip_load_starts_with_skip_load_variant() {
-        let opts = EngineOpts::for_skip_load(wf());
+        let opts = EngineOpts::for_skip_load(wf()).without_actor();
         assert_eq!(opts.workflow_id, wf());
         assert!(matches!(opts.graph, GraphSource::SkipLoad));
         assert!(opts.effective_actor_id.is_none());

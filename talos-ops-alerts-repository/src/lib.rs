@@ -219,6 +219,7 @@ impl OpsAlertRepository {
     /// Acknowledge a `new` alert. Returns false when the row doesn't exist,
     /// isn't owned, or isn't `new` (guarded transition — no clobbering a
     /// concurrent resolve; the status-guard write class, lint 39 spirit).
+    #[must_use = "the bool says whether THIS caller won the guarded status transition; acting on `Ok(false)` acts on a row another writer owns"]
     pub async fn ack(&self, user_id: Uuid, alert_id: Uuid) -> Result<bool> {
         let res = sqlx::query(
             "UPDATE ops_alerts SET status = 'acked', acked_at = NOW() \

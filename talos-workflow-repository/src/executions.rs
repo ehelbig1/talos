@@ -972,6 +972,7 @@ impl WorkflowRepository {
     /// `ExecutionRepository::mark_execution_running_from_queued` (the
     /// `enqueue_workflow` dispatch path); kept here so this crate's callers
     /// don't take a dependency on `talos-execution-repository`.
+    #[must_use = "the bool says whether THIS caller won the guarded status transition; acting on `Ok(false)` acts on a row another writer owns"]
     pub async fn mark_execution_running_from_queued(&self, execution_id: Uuid) -> Result<bool> {
         let result = sqlx::query(
             "UPDATE workflow_executions SET status = 'running', started_at = NOW() \
