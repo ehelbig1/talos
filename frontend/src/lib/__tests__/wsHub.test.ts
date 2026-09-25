@@ -280,4 +280,74 @@ describe("one shared WebSocket for every subscription", () => {
     vi.advanceTimersByTime(1000);
     expect(FakeWebSocket.instances).toHaveLength(2);
   });
+
+  it("a socket that opens and is closed before any ack stops after the pre-ack cap (no reset on open)", () => {
+    // A disallowed Origin: the upgrade succeeds, then the server closes
+    // with no `connection_error` (1005). Resetting the counter on `open`
+    // made this reconnect every second forever.
+    vi.useFakeTimers();
+    subscribeDlqUpdates(() => {});
+    for (let i = 0; i < 20; i++) {
+      const ws = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+      ws.open();
+      ws.serverClose(1005);
+      vi.advanceTimersByTime(60_000);
+    }
+    // The first socket plus MAX_ATTEMPTS_BEFORE_FIRST_ACK (5) reconnects.
+    expect(FakeWebSocket.instances).toHaveLength(6);
+  });
+
+  it("an ack resets the attempt counter, so a later drop gets the full budget again", () => {
+    vi.useFakeTimers();
+    subscribeDlqUpdates(() => {});
+    for (let i = 0; i < 4; i++) {
+      const ws = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+      ws.open();
+      ws.serverClose(1005);
+      vi.advanceTimersByTime(60_000);
+    }
+    const acked = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+    acked.open();
+    acked.ack();
+    acked.serverClose(1006);
+    // Backoff restarts at 1 s rather than continuing at 16 s.
+    vi.advanceTimersByTime(1000);
+    expect(FakeWebSocket.instances).toHaveLength(6);
+  });
+
+  it("a socket still refused after a successful recovery is rate-limited and then abandoned", async () => {
+    vi.useFakeTimers();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    subscribeDlqUpdates(() => {});
+    const flush = async () => {
+      for (let i = 0; i < 4; i++) await Promise.resolve();
+    };
+    const refuseLatest = async () => {
+      const ws = FakeWebSocket.instances[FakeWebSocket.instances.length - 1];
+      ws.open();
+      ws.emit({ type: "connection_error", payload: { message: "nope" } });
+      await flush();
+    };
+    await refuseLatest(); // refused → immediate recovery → reconnect
+    expect(recoverSession).toHaveBeenCalledTimes(1);
+    expect(FakeWebSocket.instances).toHaveLength(2);
+    await refuseLatest(); // refused again: the next recovery waits
+    expect(recoverSession).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(29_000);
+    await flush();
+    expect(recoverSession).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(1_000);
+    await flush();
+    expect(recoverSession).toHaveBeenCalledTimes(2);
+    expect(FakeWebSocket.instances).toHaveLength(3);
+    await refuseLatest(); // second refusal after a successful recovery: stop
+    vi.advanceTimersByTime(10 * 60_000);
+    await flush();
+    // Refusal → recovery → refusal → one more (rate-limited) recovery →
+    // refusal → stop. Never a tight refresh loop.
+    expect(recoverSession).toHaveBeenCalledTimes(2);
+    expect(FakeWebSocket.instances).toHaveLength(3);
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+  });
 });
