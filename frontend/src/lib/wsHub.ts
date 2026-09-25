@@ -278,12 +278,11 @@ export class SubscriptionHub {
     }
     if (this.reconnectAttempts >= MAX_ATTEMPTS_BEFORE_FIRST_ACK) return;
     this.reconnectAttempts++;
-    const epoch = this.epochAtConnect;
     const run = () => {
       this.reconnectTimer = null;
       if (this.subs.size === 0 || this.ws) return;
       this.lastRecoveryAt = Date.now();
-      recoverSession(epoch).then((recovered) => {
+      recoverSession(this.epochAtConnect).then((recovered) => {
         if (!recovered) return;
         this.recoveredSinceAck = true;
         if (this.subs.size > 0 && !this.ws) this.connect();
