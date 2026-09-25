@@ -369,6 +369,20 @@ if ! cargo test -p talos-rpc-subscribers --lib kernel_two_replica; then
     rc=1
 fi
 
+# ── Guest SQL leaves no session state on the pool  [migrated] ──────────────
+# A session-level advisory lock survives COMMIT and ROLLBACK, so before the
+# backstop a guest's `SELECT pg_advisory_lock(k)` rode its pooled connection
+# back into the controller's pool. These drive `execute_guest_query` on a
+# one-connection pool and read `pg_locks` from a second connection (success,
+# failure and timeout paths), then check migration 20260925160000 left
+# talos_guest and PUBLIC without EXECUTE on either family. Only a live
+# Postgres can show a lock or a privilege.
+echo
+echo "▶ guest SQL session backstop :: talos-rpc-subscribers  [migrated]"
+if ! TALOS_TEST_DATABASE_URL="$MIGRATED_URL" cargo test -p talos-rpc-subscribers --lib guest_session::db_tests; then
+    rc=1
+fi
+
 # ── Audit ledger stream is BOUNDED, and an existing unbounded one is updated  [nats]
 # The AUDIT_LEDGER JetStream stream was created with `..Default::default()` for
 # two months — no max_age, no max_msgs, no max_bytes — and kept every acked
