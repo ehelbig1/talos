@@ -13,7 +13,7 @@ working correctly":
 
 2. **Crypto-path failure counters:**
    - `talos_kek_decrypt_failures_total{provider="active|legacy|both"}` — Vault or env KEK couldn't unwrap a DEK.
-   - `talos_memory_write_failures_total{reason="crypto|db|other"}` — `__memory_write__` hook couldn't persist.
+   - `talos_memory_write_failures_total{reason="crypto|db|other"}` — `__memory_write__` hook couldn't persist. (The same counter also carries `validation`, `quota` — the per-actor row cap refusing a new key — and `write_ceiling`; those are not crypto-path failures and nothing pages on them.)
    - `talos_module_payload_encryption_failures_total{op,stage}` — module_executions `*_enc` column write/read failures.
 
 3. **Vault backend state** — federated from Vault's own `/v1/sys/metrics` endpoint:

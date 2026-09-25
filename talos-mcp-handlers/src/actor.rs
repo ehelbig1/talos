@@ -3804,6 +3804,16 @@ async fn handle_actor_remember(
     // Per-actor memory count cap — only enforce on genuinely new keys
     // (upserts don't grow the table).
     //
+    // 2026-09-25: this pre-check is NO LONGER THE CONTROL. The cap is
+    // enforced inside the one persist statement in talos-memory
+    // (`PERSIST_MEMORY_ROW_SQL`), for every writer — this handler, the
+    // engine's `__memory_write__` envelope, the signed memory RPC, GraphQL.
+    // It stays because it answers the operator with the actual count before
+    // an embedding is computed. It counts LIVE rows while the chokepoint
+    // counts every row and reclaims the actor's expired ones on refusal, so
+    // the two agree after that reclaim; a write that passes here and races
+    // another writer to the cap is refused below with the same remedy.
+    //
     // MCP-384 (2026-05-11): pre-fix both lookups used `.unwrap_or(...)`
     // which silently fell back on any DB error:
     //   * `key_exists.unwrap_or(false)` → DB error treated as
@@ -3952,6 +3962,19 @@ async fn handle_actor_remember(
             )
         }
         Err(e) => {
+            // The per-actor cap refused a NEW key at the persist chokepoint
+            // (this handler's own pre-check above can pass and still lose a
+            // race to the cap). A caller-actionable refusal, not a failure:
+            // -32602 with the remedy, like the pre-check's own message.
+            if let Some(quota @ talos_memory::MemoryWriteError::QuotaExceeded { .. }) =
+                e.downcast_ref::<talos_memory::MemoryWriteError>()
+            {
+                return mcp_error(
+                    req_id,
+                    -32602,
+                    &format!("{quota}. Use actor_forget to delete unused memories."),
+                );
+            }
             tracing::error!("actor_remember: {}", e);
             mcp_error(req_id, -32000, "Failed to store memory")
         }
@@ -6044,28 +6067,21 @@ async fn handle_compress_actor_context(
         }
     };
 
-    let mut entries_written: usize = 0;
-    let mut bytes_added: usize = 0;
-    for (key, value, memory_type, ttl_hours, byte_size) in &prepared {
-        bytes_added += byte_size;
-        if let Err(e) = talos_actor_memory_service::persist_memory_in_tx(
-            &mut tx,
-            actor_id,
-            key.as_str(),
-            value,
-            memory_type.as_str(),
-            *ttl_hours,
-        )
-        .await
-        {
-            tracing::error!("compress_actor_context write key '{}': {}", key, e);
-            // allow-swallowed-result: rollback on a path that is already returning an error; a failed rollback is followed by the tx being dropped, which rolls back anyway.
-            let _ = tx.rollback().await;
-            return mcp_error(req_id, -32000, "Failed to write replacement memory entry");
-        }
-        entries_written += 1;
-    }
-
+    // RETIRE FIRST, then write (2026-09-25). Both halves run in one
+    // transaction either way, so the committed result is the same — except
+    // in two cases, both of which the old write-then-retire order got wrong:
+    //
+    // * An actor at `MAX_MEMORIES_PER_ACTOR`. The cap is enforced inside the
+    //   persist statement and counts the actor's rows as THIS transaction
+    //   sees them, so writing the replacements before retiring the originals
+    //   would be refused as quota — i.e. the tool whose purpose is to shrink
+    //   an actor's memory would fail for exactly the actor that most needs
+    //   it. Retiring first makes the room the replacements then use.
+    // * A key named in BOTH `archive_keys` and `replacement_entries`. The old
+    //   order wrote the replacement and then deleted it (and measured its
+    //   NEW bytes as "removed"); now the original is retired and measured,
+    //   and the replacement survives, as `entries_written` already claimed.
+    //
     // Measure archive sizes and delete within the same transaction. Single
     // CTE collapses the prior 2N round-trips (per-key SELECT octet_length
     // + DELETE) to one statement; CTE evaluation order in Postgres
@@ -6073,12 +6089,12 @@ async fn handle_compress_actor_context(
     // total and rows-affected count match the prior loop semantics.
     //
     // 2026-09-08: REFUSE, do not default. This statement is the RETIREMENT
-    // half of the compression, and the swallow it replaces was the only one
-    // in this handler that survived into a COMMIT: the loop above rolls back
-    // on a failed write, while `.unwrap_or((0, 0))` here let a failed DELETE
-    // reach `tx.commit()` three lines down. The committed state was then the
-    // worst of both — the condensed replacements written AND the originals
-    // still present, i.e. memory GREW — under a response reading
+    // half of the compression, and the swallow it replaced was the only one
+    // in this handler that survived into a COMMIT: a failed write rolls
+    // back, while `.unwrap_or((0, 0))` here let a failed DELETE reach
+    // `tx.commit()`. The committed state was then the worst of both — the
+    // condensed replacements written AND the originals still present, i.e.
+    // memory GREW — under a response reading
     // `status: "compressed", keys_retired: 0, bytes_saved_estimate: 0`.
     // Five rendered fields wrong at once, and `keys_retired: 0` is
     // indistinguishable from the legitimate case where the archive set was
@@ -6119,6 +6135,44 @@ async fn handle_compress_actor_context(
         };
     let bytes_removed = bytes_removed_i64 as usize;
 
+    let mut entries_written: usize = 0;
+    let mut bytes_added: usize = 0;
+    for (key, value, memory_type, ttl_hours, byte_size) in &prepared {
+        bytes_added += byte_size;
+        if let Err(e) = talos_actor_memory_service::persist_memory_in_tx(
+            &mut tx,
+            actor_id,
+            key.as_str(),
+            value,
+            memory_type.as_str(),
+            *ttl_hours,
+        )
+        .await
+        {
+            // allow-swallowed-result: rollback on a path that is already returning an error; a failed rollback is followed by the tx being dropped, which rolls back anyway.
+            let _ = tx.rollback().await;
+            // The per-actor cap can still refuse here when the replacements
+            // add more NEW keys than the retirement freed. Caller-actionable,
+            // and the rollback means nothing was retired either.
+            if let Some(quota @ talos_memory::MemoryWriteError::QuotaExceeded { .. }) =
+                e.downcast_ref::<talos_memory::MemoryWriteError>()
+            {
+                return mcp_error(
+                    req_id,
+                    -32602,
+                    &format!(
+                        "{quota}. Nothing was changed: the replacements add more new keys \
+                         than archive_keys retires. Archive more keys, or write fewer \
+                         replacement entries."
+                    ),
+                );
+            }
+            tracing::error!("compress_actor_context write key '{}': {}", key, e);
+            return mcp_error(req_id, -32000, "Failed to write replacement memory entry");
+        }
+        entries_written += 1;
+    }
+
     if let Err(e) = tx.commit().await {
         tracing::error!("compress_actor_context commit: {}", e);
         return mcp_error(req_id, -32000, "Failed to commit context compression");
@@ -6129,8 +6183,13 @@ async fn handle_compress_actor_context(
     // poison the graph.
     // These are condensed REAL memories (context compression), not synthetic
     // self-outputs, so they carry no synthetic `kind` and DO auto-extract.
+    // Whether each extraction was spawned or SHED (2026-09-25: the pending
+    // queue is bounded) is deliberately not reported — this handler's reply
+    // makes no claim about graph extraction, and a shed is counted by
+    // `talos_memory::graph_extraction_shed_total`.
     for (key, value, _memory_type, _ttl, _bytes) in &prepared {
-        talos_memory::spawn_graph_extraction(actor_id, key.clone(), value.clone(), None);
+        let _extraction_spawned =
+            talos_memory::spawn_graph_extraction(actor_id, key.clone(), value.clone(), None);
     }
 
     let bytes_saved = bytes_removed.saturating_sub(bytes_added);

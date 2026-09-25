@@ -8927,6 +8927,7 @@ dependencies = [
  "subtle",
  "talos-config",
  "talos-http-body",
+ "talos-metrics",
  "talos-text-util",
  "talos-workflow-job-protocol",
  "thiserror 1.0.69",
