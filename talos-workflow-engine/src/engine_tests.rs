@@ -2040,3 +2040,47 @@ mod quality_gate_events {
         assert_eq!(events[0].not_applicable, Some(true));
     }
 }
+
+/// The accumulated-context memo must HIT across dispatches that commit
+/// nothing: only a mutable borrow of `results` invalidates it.
+#[test]
+fn the_accumulated_memo_hits_until_results_are_mutated() {
+    let a = Uuid::new_v4();
+    let labels: HashMap<Uuid, String> = [(a, "fetch".to_string())].into_iter().collect();
+    let mut results = VersionedResults::default();
+    results.insert(a, serde_json::json!({ "v": 1 }));
+    let mut memo = None;
+
+    let first = ParallelWorkflowEngine::build_accumulated_context_memo(
+        &labels,
+        &results,
+        results.version,
+        &mut memo,
+    )
+    .expect("one labelled result");
+    // Shared borrows (gather_inputs, skip checks, a second dispatch) do not
+    // bump the version, so the next dispatch reuses the same snapshot.
+    let _ = results.get(&a);
+    let second = ParallelWorkflowEngine::build_accumulated_context_memo(
+        &labels,
+        &results,
+        results.version,
+        &mut memo,
+    )
+    .expect("memo hit");
+    assert!(Arc::ptr_eq(&first, &second), "no commit ⇒ memo hit");
+
+    // A commit (any `&mut` hand-off) invalidates it.
+    results.insert(Uuid::new_v4(), serde_json::json!({}));
+    let third = ParallelWorkflowEngine::build_accumulated_context_memo(
+        &labels,
+        &results,
+        results.version,
+        &mut memo,
+    )
+    .expect("rebuilt");
+    assert!(
+        !Arc::ptr_eq(&first, &third),
+        "a commit rebuilds the snapshot"
+    );
+}

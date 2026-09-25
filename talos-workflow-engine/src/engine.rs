@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use futures::stream::{FuturesUnordered, StreamExt};
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::Direction;
@@ -15,6 +13,31 @@ use talos_workflow_engine_core::reserved_keys::output_reports_error;
 /// `run_with_workflow_timeout` reports a stopped run as
 /// [`crate::WorkflowEngineError::Cancelled`].
 const RUN_STOPPED: &str = "workflow run stopped: its execution is no longer running";
+
+/// The reactor's `results` map with a mutation counter. Every MUTABLE borrow
+/// (an insert, a `&mut` hand-off to a completion helper) bumps `version`;
+/// shared borrows do not. The accumulated-context memo keys on it, so it is
+/// rebuilt only when `results` could have changed — bumping once per loop
+/// iteration made every dispatch a miss (O(N²·S) deep clones).
+#[derive(Default)]
+struct VersionedResults {
+    map: HashMap<uuid::Uuid, JsonValue>,
+    version: u64,
+}
+
+impl std::ops::Deref for VersionedResults {
+    type Target = HashMap<uuid::Uuid, JsonValue>;
+    fn deref(&self) -> &Self::Target {
+        &self.map
+    }
+}
+
+impl std::ops::DerefMut for VersionedResults {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.version += 1;
+        &mut self.map
+    }
+}
 
 /// A node the engine declined to send because its start row was born
 /// `cancelled` — the parent execution was already cancelled or failed.
@@ -428,7 +451,7 @@ pub(crate) struct CheckpointConfig {
 pub use crate::sandbox::DEFAULT_SANDBOX_ROOT;
 use crate::sandbox::{create_execution_sandbox, SandboxGuard};
 pub use crate::sandbox::{default_sandbox_root, DEFAULT_SANDBOX_DIR_NAME};
-use crate::secrets_pipeline::{build_encrypted_secrets_for, extract_vault_paths};
+use crate::secrets_pipeline::extract_vault_paths;
 // `sanitize_node_output` is used by `engine_completion::handle_node_success`
 // (the post-completion path). Re-imported there because the helper moved
 // out of this file; left without a use here so we don't pull a now-unused
@@ -550,8 +573,6 @@ pub(crate) enum ChainDispatch {
     Disabled,
 }
 
-// Suppress dead‑code warnings to keep the CI passing.
-#[allow(dead_code)]
 /// Parallel execution engine based on Kahn's algorithm.
 ///
 /// # Accessing internal state
@@ -1332,51 +1353,9 @@ impl ParallelWorkflowEngine {
         Some(sanitizer.new_execution(&configs))
     }
 
-    /// Build encrypted secrets for a node dispatch.
-    ///
-    /// Thin wrapper around [`build_encrypted_secrets_for`] that sources
-    /// `vault_paths` from the node's own config and has no additional
-    /// declared paths. Prefer this form on call sites that hold `&self`.
-    ///
-    /// L-1 (2026-05-22): binds the dispatching `execution_id` as
-    /// AEAD AAD on the AES-GCM tag. The worker decrypts with the
-    /// same AAD (from `JobRequest.workflow_execution_id`) — a
-    /// ciphertext transposed between executions under the same
-    /// shared key fails decryption at the worker, providing an
-    /// in-protocol integrity gate independent of the `JobRequest`
-    /// HMAC. The caller passes `execution_id` because the engine
-    /// itself doesn't hold one — it's a per-dispatch parameter.
-    pub(crate) async fn build_encrypted_secrets(
-        &self,
-        node_id: Uuid,
-        execution_id: Uuid,
-        worker_shared_key: &Option<talos_workflow_engine_core::WorkerSharedKey>,
-    ) -> talos_workflow_job_protocol::EncryptedSecrets {
-        let (Some(resolver), Some(key)) = (self.secrets_resolver.as_ref(), worker_shared_key)
-        else {
-            return talos_workflow_job_protocol::EncryptedSecrets::empty();
-        };
-        let vault_paths = self
-            .node_configs
-            .get(&node_id)
-            .map(|cfg| extract_vault_paths(cfg))
-            .unwrap_or_default();
-        build_encrypted_secrets_for(
-            resolver.as_ref(),
-            self.secret_envelope.as_ref(),
-            node_id,
-            self.user_id,
-            &vault_paths,
-            &[],
-            key.as_bytes(),
-            self.max_llm_tier,
-            execution_id.as_bytes(),
-        )
-        .await
-    }
-
-    /// RFC 0010 P3 (D3b): `&self` sibling of [`build_encrypted_secrets`] that
-    /// returns [`DispatchSecrets`] — inline WSK envelope OR the plaintext map for
+    /// RFC 0010 P3 (D3b): `&self` wrapper over
+    /// [`crate::secrets_pipeline::build_dispatch_secrets_for`] that returns
+    /// [`DispatchSecrets`] — inline WSK envelope OR the plaintext map for
     /// claim-based sealing, per `TALOS_ENVELOPE_SEALING`. Used by the loop-node
     /// path so loop bodies seal exactly like single-node dispatches (and thus
     /// don't fail the worker downgrade guard under `required`). Resolve once and
@@ -2014,7 +1993,10 @@ impl ParallelWorkflowEngine {
         // Seed results and pre-resolve the outgoing edges of already-
         // completed (seeded) nodes. The fresh-run case sees only the
         // synthetic trigger here.
-        let mut results: HashMap<Uuid, JsonValue> = initial_results;
+        let mut results = VersionedResults {
+            map: initial_results,
+            version: 0,
+        };
         let seeded: HashSet<Uuid> = results.keys().copied().collect();
         for &node_id in &seeded {
             if let Some(&node_idx) = self.node_map.get(&node_id) {
@@ -2041,21 +2023,9 @@ impl ParallelWorkflowEngine {
         let mut node_timings: HashMap<String, u64> = HashMap::new();
         let mut node_start_times: HashMap<NodeIndex, std::time::Instant> = HashMap::new();
 
-        // P1: monotonic version tag for the `results` map, used to memoize the
-        // Arc-wrapped accumulated-context snapshot so it is rebuilt once per
-        // node-processing step rather than once per node dispatch (was
-        // O(N²·S)). `results` is mutated from several places — the
-        // `commit_and_release!` macro inline below AND the `route_system_node_output`
-        // / `handle_completed_future` helpers that take `&mut results` — so
-        // rather than chase every insert site, the version is bumped once at the
-        // top of the inner work loop. Each inner iteration processes exactly one
-        // node and ends in `continue`/`break`, so a single bump per iteration
-        // guarantees the snapshot read at a dispatch site always reflects every
-        // mutation committed by prior iterations (over-invalidation only forces a
-        // harmless rebuild — it can never serve stale data). The macro keeps the
-        // commit sites self-documenting and is the natural seam if a future
-        // change needs finer-grained invalidation.
-        let mut results_version: u64 = 0;
+        // P1: the Arc-wrapped accumulated-context snapshot is memoized on
+        // `results.version` (see `VersionedResults`), so it is rebuilt only
+        // after a commit — every mutable borrow of `results` bumps it.
         let mut accumulated_memo: Option<(u64, Option<Arc<JsonValue>>)> = None;
         // Every inline commit goes through ONE macro that records the output
         // AND releases the node's successors through `release_successors` —
@@ -2153,14 +2123,6 @@ impl ParallelWorkflowEngine {
                 let Some(node_idx) = ready.pop_front() else {
                     break;
                 };
-                // P1: invalidate the accumulated-context memo once per node
-                // step. Prior iterations may have committed results via the
-                // `commit_and_release!` macro OR via the `&mut results` completion
-                // helpers; bumping here (before any snapshot read in this
-                // iteration) makes the next `build_accumulated_context_memo`
-                // observe all of them. See the counter's declaration for why a
-                // single bump-per-iteration is sufficient and conservative.
-                results_version += 1;
                 // ── Pipeline dispatch (chain head, fresh runs only) ──────
                 if let Some(&chain_idx) = node_to_chain.get(&node_idx) {
                     // Only dispatch when we're at the chain head; non-
@@ -2174,7 +2136,7 @@ impl ParallelWorkflowEngine {
                     let accumulated_snapshot = Self::build_accumulated_context_memo(
                         &self.node_labels,
                         &results,
-                        results_version,
+                        results.version,
                         &mut accumulated_memo,
                     );
                     // Timeout attribution: a chain is dispatched as ONE
@@ -2408,7 +2370,7 @@ impl ParallelWorkflowEngine {
                     commit_paused_result!(node_id, waiting_output);
                     drain_in_flight_before_pause!();
                     return Ok(WorkflowContext {
-                        results,
+                        results: results.map,
                         waiting: true,
                         ..Default::default()
                     });
@@ -2525,7 +2487,7 @@ impl ParallelWorkflowEngine {
                             commit_paused_result!(node_id, waiting_output);
                             drain_in_flight_before_pause!();
                             return Ok(WorkflowContext {
-                                results,
+                                results: results.map,
                                 waiting: true,
                                 ..Default::default()
                             });
@@ -2710,15 +2672,36 @@ impl ParallelWorkflowEngine {
                 if self.is_sub_workflow_node(node_id) {
                     let mut sub_wf_batch: Vec<(NodeIndex, Uuid)> = vec![(node_idx, node_id)];
                     let mut keep: VecDeque<NodeIndex> = VecDeque::with_capacity(ready.len());
+                    let mut skipped_in_batch: Vec<(NodeIndex, Uuid, JsonValue)> = Vec::new();
                     while let Some(other_idx) = ready.pop_front() {
                         let other_id = self.graph[other_idx];
                         if self.is_sub_workflow_node(other_id) {
-                            sub_wf_batch.push((other_idx, other_id));
+                            // The head's skip check ran at the top of this
+                            // iteration; a drained sibling gets its own here.
+                            match self.check_skip_condition(
+                                other_idx,
+                                other_id,
+                                execution_id,
+                                &results,
+                            ) {
+                                Some(output) => {
+                                    skipped_in_batch.push((other_idx, other_id, output))
+                                }
+                                None => sub_wf_batch.push((other_idx, other_id)),
+                            }
                         } else {
                             keep.push_back(other_idx);
                         }
                     }
                     ready = keep;
+                    for (idx, id, output) in skipped_in_batch {
+                        commit_and_release!(idx, id, output, Release::SkippedItself);
+                    }
+                    // The per-node stop check at the loop head covered only
+                    // the head of this batch.
+                    if self.progress.run_aborted() {
+                        return Err(RUN_STOPPED.into());
+                    }
 
                     // `.copied()` yields owned `(NodeIndex, Uuid)` (both Copy) so
                     // the dispatch closure's arg isn't a borrow of the batch —
@@ -2966,7 +2949,7 @@ impl ParallelWorkflowEngine {
                 let accumulated_snapshot = Self::build_accumulated_context_memo(
                     &self.node_labels,
                     &results,
-                    results_version,
+                    results.version,
                     &mut accumulated_memo,
                 );
                 // `__trigger_input__` is synthesized once from the
@@ -3077,6 +3060,7 @@ impl ParallelWorkflowEngine {
 
         // Two-pass scrub: value-based then regex DLP patterns.
         let results: HashMap<Uuid, JsonValue> = results
+            .map
             .into_iter()
             .map(|(k, v)| {
                 let v = exec_ctx.as_ref().map(|c| c.redact_output(&v)).unwrap_or(v);

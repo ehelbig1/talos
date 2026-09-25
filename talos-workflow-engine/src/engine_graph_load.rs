@@ -669,7 +669,6 @@ impl ParallelWorkflowEngine {
     /// Add a directed edge between two nodes already present in the
     /// graph. Returns `Err(WorkflowEngineError::LoadGraph)` if either
     /// endpoint is unknown — typically a typo in the graph builder.
-    #[allow(dead_code)]
     pub fn add_edge(
         &mut self,
         from: Uuid,

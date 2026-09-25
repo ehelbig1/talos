@@ -76,6 +76,19 @@ fn inactive_inputs_skip_envelope() -> JsonValue {
     })
 }
 
+/// Per-node output size guard: `Some(reason)` when `output` serializes past
+/// `max_bytes` (default 5 MiB; `set_max_node_output_bytes`). A multi-MB value
+/// would otherwise be cloned into every downstream input and the final output.
+fn oversized_output_error(output: &JsonValue, max_bytes: usize) -> Option<String> {
+    let len = serde_json::to_vec(output).map(|b| b.len()).ok()?;
+    (len > max_bytes).then(|| {
+        format!(
+            "Node output too large ({len} bytes > {max_bytes} byte limit). \
+             Reduce the amount of data returned by this node."
+        )
+    })
+}
+
 fn is_error_edge(edge: &EdgeLogic) -> bool {
     edge.edge_type == "error"
 }
@@ -237,6 +250,21 @@ impl ParallelWorkflowEngine {
         ready: &mut VecDeque<NodeIndex>,
     ) -> Result<(), String> {
         let finished_id = self.graph[finished_idx];
+        // An oversized output is a FAILURE: error edges, `continue_on_error`
+        // and the run's outcome decide it — never committed as a success.
+        let exec_result = exec_result.and_then(|output| {
+            match oversized_output_error(&output, self.max_node_output_bytes) {
+                Some(msg) => {
+                    tracing::warn!(
+                        node_id = %finished_id,
+                        limit = self.max_node_output_bytes,
+                        "Node output exceeds configured size limit — failing the node"
+                    );
+                    Err(msg)
+                }
+                None => Ok(output),
+            }
+        });
         match exec_result {
             Ok(output) => {
                 self.handle_node_success(
@@ -314,33 +342,7 @@ impl ParallelWorkflowEngine {
             .await;
         }
 
-        // Per-node output size guard: reject outputs larger than the
-        // engine-configured ceiling (default 5 MiB; override via
-        // `set_max_node_output_bytes`). A single misbehaving node can
-        // otherwise produce a multi-MB JSON value that is then cloned
-        // into every downstream node's gathered_inputs and the final
-        // aggregated workflow output, cascading into memory
-        // exhaustion.
-        let max_output_bytes = self.max_node_output_bytes;
-        let output = match serde_json::to_vec(&output) {
-            Ok(bytes) if bytes.len() > max_output_bytes => {
-                tracing::warn!(
-                    node_id = %finished_id,
-                    bytes = bytes.len(),
-                    limit = max_output_bytes,
-                    "Node output exceeds configured size limit — replacing with error"
-                );
-                serde_json::json!({
-                    "__error": true,
-                    "error": format!(
-                        "Node output too large ({} bytes > {} byte limit). \
-                         Reduce the amount of data returned by this node.",
-                        bytes.len(), max_output_bytes
-                    )
-                })
-            }
-            _ => output,
-        };
+        // The output size guard ran in `handle_completed_future`.
         let mut output = output;
         sanitize_node_output(&mut output);
         // A module's committed output is the next node's gathered INPUT, so an
@@ -797,6 +799,14 @@ impl ParallelWorkflowEngine {
 #[cfg(test)]
 mod tests {
     use super::extract_non_transient_class;
+
+    #[test]
+    fn an_output_over_the_ceiling_is_a_failure_reason() {
+        let big = serde_json::json!({ "blob": "x".repeat(100) });
+        let reason = super::oversized_output_error(&big, 64).expect("over the ceiling");
+        assert!(reason.contains("too large"), "{reason}");
+        assert_eq!(super::oversized_output_error(&big, 1 << 20), None);
+    }
 
     #[test]
     fn extracts_classifier_tag_from_canonical_wrapper() {
