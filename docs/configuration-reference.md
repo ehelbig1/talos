@@ -103,7 +103,7 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | `BCRYPT_COST` | `12` | controller | Bcrypt cost factor for password hashing | 🔒 (tuning) |
 | `API_KEY_BCRYPT_COST` | built-in default | talos-api-keys | Bcrypt cost for API-key hashing | 🔒 (tuning) |
 | `TOTP_ISSUER` | `Talos` | controller | TOTP issuer label shown in authenticator apps | |
-| `BOOTSTRAP_FIRST_USER_EMAIL` | none (optional) | controller | Pin the first bootstrap admin user email (`talos-auth`) | |
+| `BOOTSTRAP_FIRST_USER_EMAIL` | none (optional) | controller | Pin the first-user `automation-node` promotion to this email (`talos-auth`). Honoured only for an account that proves it owns the address — an OAuth sign-in with that provider-verified email (a password signup verifies nothing and never qualifies; grant by hand with `grantCapabilityCeiling` instead). An unparsable value REFUSES the promotion (no first-user-wins fallback). Unset = first user wins | |
 
 ### Encryption keys / Vault (KEK/DEK)
 
@@ -320,7 +320,7 @@ the env vars above are fallbacks only. See CLAUDE.md "LLM key resolution".
 | `TALOS_COSIGN_MIN_VERSION` | `2.0.0` | worker | Minimum cosign binary version | 🔒 |
 | `TALOS_COSIGN_SHA256` | none (optional) | worker | Pin the cosign binary SHA-256 | 🔒 |
 | `TALOS_ALLOW_UNATTESTED_WASM` | off | worker | DEV-ONLY: permit unattested WASM modules (`1`/`true`/`yes`). IGNORED in production — `block_unattested = is_production() || !allow` | 🔒 |
-| `TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS` | off | worker | DEV-ONLY: accept OCI manifests whose signature could not be verified. REFUSED whenever the process is in production OR `TALOS_SIGSTORE_REQUIRED` is `required` | 🔒 |
+| ~~`TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS`~~ | n/a | — | **Not a variable (removed 2026-09-25).** The worker now resolves an OCI tag to a manifest ONCE, binds it by the digest it computes from the manifest body, and fetches the layer the manifest names by digest, so a "manifest without a layer descriptor" is simply refused (`oci_manifest_missing_layer_descriptor`) — there is no unverified-bytes path left to opt into | |
 
 Script-level publish knobs (`scripts/publish-images.sh`, not Rust reads):
 `TALOS_PUBLISH_SIGN`, `TALOS_PUBLISH_SKIP_CI_CHECK`, `GITHUB_TOKEN`/`GHCR_TOKEN` 🔒.
@@ -436,6 +436,7 @@ into both deployments.
 | `TALOS_MAX_YAML_BYTES` | 1 MiB | controller | Max YAML workflow size | |
 | `ENABLE_EDGE_ROUTING` | `false` | controller | Per-user vs shared NATS dispatch topic. ONE parser since 2026-09-12: the engine dispatcher compared `== "true"` while the Gmail push used `edge_routing_enabled()`, so `ENABLE_EDGE_ROUTING=1` routed module-bound pushes per-user and engine jobs to the shared topic | |
 | `ENFORCE_RATE_LIMITS_IN_DEV` | `false` | controller | Apply rate limits in dev | |
+| `RATE_LIMIT_IPV6_PREFIX_LEN` | `64` | controller | IPv6 prefix length the per-IP limiters (API/webhook limiter, `tower_governor`, the auth limiter) bucket on; 32–128, anything else uses the default. IPv4 and IPv4-mapped IPv6 key on the IPv4 address. Audit logs keep the full address | |
 | `TALOS_WEBHOOK_USER_RPM` | `300` | talos-webhooks | Per-user webhook rate limit | |
 | `MCP_AGENT_RATE_LIMIT_PER_MIN` | `1000` | controller | MCP agent rate limit | |
 | `MCP_USER_RATE_LIMIT_PER_MIN` | `5000` | controller | MCP user rate limit | |

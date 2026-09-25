@@ -171,7 +171,7 @@ pub use talos_sigstore_policy::{validate_sigstore_identity_regexp, SigstoreRegex
 /// Cert identity + OIDC issuer come from configuration:
 /// - `identity_regexp`: regex matched against the SAN URI of the Fulcio
 ///   cert. Pin to the workflow URL pattern, e.g.
-///   `^https://github\.com/OWNER/talos/\.github/workflows/template-publish\.yml@`
+///   `^https://github\.com/OWNER/talos/\.github/workflows/template-publish\.yml@refs/heads/main$`
 /// - `oidc_issuer`: GitHub Actions = `https://token.actions.githubusercontent.com`
 pub fn cosign_verify_argv(
     reference: &str,
@@ -352,6 +352,165 @@ pub async fn resolve_and_hash_cosign_binary() -> anyhow::Result<String> {
     // resolve (e.g. in a test) is silently ignored.
     let _ = COSIGN_BINARY_PATH.set(path_buf);
     Ok(hash)
+}
+
+/// Manifest media types the worker accepts: single-arch image manifests
+/// only. A multi-arch index is refused (Wasm artifacts are single-arch).
+const OCI_IMAGE_MANIFEST_MEDIA_TYPES: &[&str] = &[
+    oci_distribution::manifest::OCI_IMAGE_MEDIA_TYPE,
+    oci_distribution::manifest::IMAGE_MANIFEST_MEDIA_TYPE,
+];
+const WASM_LAYER_MEDIA_TYPE: &str = "application/vnd.wasm.content.layer.v1+wasm";
+
+/// A manifest resolved ONCE and bound by its content digest.
+#[derive(Debug)]
+pub struct PinnedManifest {
+    /// `sha256:<hex>` of the manifest bytes as received.
+    pub manifest_digest: String,
+    /// `registry/repository@<manifest_digest>` — what cosign verifies.
+    pub pinned_ref: String,
+    /// The Wasm layer to fetch, with foreign `urls` stripped.
+    pub layer: oci_distribution::manifest::OciDescriptor,
+}
+
+/// Bind an OCI reference to the manifest body the registry returned. Pure:
+/// computes the manifest digest from the BODY (never the registry header),
+/// refuses a body that contradicts a digest the reference already names,
+/// refuses an index / non-Wasm / empty / oversized manifest, and builds the
+/// digest-pinned reference cosign must verify.
+pub fn pin_oci_manifest(
+    reference: &oci_distribution::Reference,
+    manifest_body: &[u8],
+    layer_cap: u64,
+) -> Result<PinnedManifest, String> {
+    use oci_distribution::manifest::OciManifest;
+    use sha2::Digest as _;
+    use subtle::ConstantTimeEq as _;
+    let manifest_digest = format!("sha256:{:x}", sha2::Sha256::digest(manifest_body));
+    if let Some(requested) = reference.digest() {
+        let same: bool = requested
+            .as_bytes()
+            .ct_eq(manifest_digest.as_bytes())
+            .into();
+        if !same {
+            return Err(format!(
+                "oci_manifest_digest_mismatch: reference pins {requested}, registry served {manifest_digest}"
+            ));
+        }
+    }
+    let manifest: OciManifest = serde_json::from_slice(manifest_body)
+        .map_err(|_| "oci_manifest_unparseable".to_string())?;
+    let image = match manifest {
+        OciManifest::Image(img) => img,
+        OciManifest::ImageIndex(_) => {
+            return Err(
+                "oci_manifest_is_index: multi-arch image index is not supported \
+                        for Wasm modules"
+                    .to_string(),
+            )
+        }
+    };
+    let sizes: Vec<i64> = image.layers.iter().map(|d| d.size).collect();
+    if let ManifestSizeVerdict::Oversized { declared, cap } =
+        check_manifest_layer_sizes(&sizes, layer_cap)
+    {
+        return Err(format!(
+            "oci_layer_too_large: manifest declares layer of {declared} bytes, \
+             cap is {cap} (set WORKER_MAX_OCI_LAYER_BYTES to override)"
+        ));
+    }
+    if let Some(bad) = image
+        .layers
+        .iter()
+        .find(|l| l.media_type != WASM_LAYER_MEDIA_TYPE)
+    {
+        return Err(format!(
+            "oci_layer_media_type_rejected: {}",
+            sanitize_error_message(&bad.media_type)
+        ));
+    }
+    let mut layer = image
+        .layers
+        .into_iter()
+        .next()
+        .ok_or_else(|| "oci_manifest_missing_layer_descriptor".to_string())?;
+    // A descriptor's foreign `urls` would let a registry send the worker to
+    // an arbitrary host; the blob is fetched from the registry only.
+    layer.urls = None;
+    let pinned_ref = format!(
+        "{}/{}@{}",
+        reference.registry(),
+        reference.repository(),
+        manifest_digest
+    );
+    Ok(PinnedManifest {
+        manifest_digest,
+        pinned_ref,
+        layer,
+    })
+}
+
+#[derive(Debug)]
+enum BlobFetchError {
+    /// The stream exceeded the cap; carries the bytes seen when it stopped.
+    TooLarge(u64),
+    Transport(String),
+}
+
+/// Stream a layer blob by digest, refusing once it exceeds `cap` (so a
+/// registry cannot grow host memory past the cap before any check runs).
+async fn fetch_capped_blob(
+    client: &oci_distribution::Client,
+    image: &oci_distribution::Reference,
+    layer: &oci_distribution::manifest::OciDescriptor,
+    cap: u64,
+) -> Result<Vec<u8>, BlobFetchError> {
+    use futures_util::StreamExt as _;
+    let mut stream = client
+        .pull_blob_stream(image, layer)
+        .await
+        .map_err(|e| BlobFetchError::Transport(e.to_string()))?;
+    let mut out = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| BlobFetchError::Transport(e.to_string()))?;
+        let next = out.len() as u64 + chunk.len() as u64;
+        if next > cap {
+            return Err(BlobFetchError::TooLarge(next));
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Ok(out)
+}
+
+/// Read a filesystem module: regular files only (not a device, FIFO or
+/// directory), size-checked from metadata BEFORE reading, and the read itself
+/// bounded at `cap + 1` so a file that grows mid-read is still refused.
+/// Blocking — call from `spawn_blocking`.
+pub(crate) fn read_module_file_capped(path: &str, cap: u64) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let file = std::fs::File::open(path).map_err(|e| format!("failed to read wasm module: {e}"))?;
+    let meta = file
+        .metadata()
+        .map_err(|e| format!("failed to read wasm module: {e}"))?;
+    if !meta.is_file() {
+        return Err("failed to read wasm module: not a regular file".to_string());
+    }
+    if meta.len() > cap {
+        return Err(format!(
+            "wasm_module_too_large: filesystem file is {} bytes, cap is {cap}",
+            meta.len()
+        ));
+    }
+    let mut out = Vec::with_capacity(meta.len() as usize);
+    file.take(cap.saturating_add(1))
+        .read_to_end(&mut out)
+        .map_err(|e| format!("failed to read wasm module: {e}"))?;
+    if out.len() as u64 > cap {
+        return Err(format!(
+            "wasm_module_too_large: filesystem file exceeds cap {cap}"
+        ));
+    }
+    Ok(out)
 }
 
 /// Decision returned by `verify_oci_layer` — small enum to make the security-
@@ -763,10 +922,59 @@ pub async fn fetch(
                 _ => RegistryAuth::Anonymous,
             };
 
-            let accepted_media_types = vec!["application/vnd.wasm.content.layer.v1+wasm"];
+            let layer_cap = max_oci_layer_bytes();
 
-            // Sigstore signature verification — runs BEFORE the OCI pull
-            // body is processed, so an unsigned or tampered artifact never
+            // W13 (2026-09-25): resolve tag → manifest ONCE, from bytes WE
+            // hash. Pre-fix cosign verified the TAG, `pull_manifest` then
+            // re-resolved it (discarding the digest) and `pull` resolved it a
+            // THIRD time, so the executed-and-cached bytes were never bound to
+            // the manifest the signature covered — a registry could repoint
+            // the tag between the calls. Now one manifest fetch fixes the
+            // digest (computed from the body; the registry's
+            // `Docker-Content-Digest` header is not trusted), cosign verifies
+            // `repo@<that digest>`, and the layer blob is fetched by digest
+            // from that same manifest.
+            let (manifest_body, header_digest) = match client
+                .pull_manifest_raw(&reference, &auth, OCI_IMAGE_MANIFEST_MEDIA_TYPES)
+                .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    ::tracing::warn!(
+                        module_uri = %req.module_uri,
+                        error = %e,
+                        "Failed to fetch OCI manifest"
+                    );
+                    return Err(FetchError {
+                        message: sanitize_error_message(&format!("oci_manifest_fetch_failed: {e}")),
+                    });
+                }
+            };
+            let pinned = match pin_oci_manifest(&reference, &manifest_body, layer_cap) {
+                Ok(p) => p,
+                Err(message) => {
+                    ::tracing::error!(
+                        module_uri = %req.module_uri,
+                        reason = %message,
+                        "OCI manifest refused"
+                    );
+                    return Err(FetchError { message });
+                }
+            };
+            if header_digest != pinned.manifest_digest {
+                ::tracing::warn!(
+                    module_uri = %req.module_uri,
+                    header_digest = %header_digest,
+                    computed_digest = %pinned.manifest_digest,
+                    "registry Docker-Content-Digest disagrees with the manifest body — \
+                     using the computed digest"
+                );
+            }
+            span.set_attribute("oci_manifest_digest", &pinned.manifest_digest);
+
+            // Sigstore signature verification — runs against the DIGEST-PINNED
+            // reference resolved above (never the mutable tag), BEFORE any
+            // layer byte is fetched, so an unsigned or tampered artifact never
             // gets executed OR cached. Policy is process-wide (resolved
             // once from env at startup); enforcement happens per-pull so
             // operators can flip from Audit → Required without restarting.
@@ -823,7 +1031,9 @@ pub async fn fetch(
                         return Err(FetchError { message: err });
                     }
                 } else {
-                    match verify_oci_signature(&image_ref, &identity_regexp, &oidc_issuer).await {
+                    match verify_oci_signature(&pinned.pinned_ref, &identity_regexp, &oidc_issuer)
+                        .await
+                    {
                         Ok(()) => {
                             span.add_event("sigstore_verify_ok");
                         }
@@ -862,83 +1072,9 @@ pub async fn fetch(
                 }
             }
 
-            // H-3: pre-pull manifest size gate. Fetch the manifest by
-            // itself first (small payload, no decompression) and refuse
-            // to pull the full image if any layer's declared size
-            // exceeds the cap. Without this, a hostile registry could
-            // serve a gzipped 100 MB layer that decompresses to 10 GB
-            // and OOMs the worker before any of our integrity checks
-            // (Sigstore, layer-digest, hash) run.
-            //
-            // H1 (2026-05-22): the manifest fetch also tells us the
-            // canonical LAYER digest for this tag at this moment. We
-            // use that digest to key the Redis cache so a tag-repoint
-            // produces a fresh cache entry under the new digest. The
-            // manifest fetch is small (a few KB of JSON, no
-            // decompression); for high-throughput workloads this adds
-            // one round-trip per execution but eliminates the
-            // cache-poisoning window that existed when the cache was
-            // URI-keyed.
-            let layer_cap = max_oci_layer_bytes();
-            let mut expected_layer_digest: Option<String> = None;
-            match client.pull_manifest(&reference, &auth).await {
-                Ok((manifest, _manifest_digest)) => {
-                    // `pull_manifest` returns either an Image manifest
-                    // (single-arch artifact, has `.layers`) or an
-                    // ImageIndex (multi-arch fan-out, has `.manifests`).
-                    // Wasm artifacts are single-arch in practice;
-                    // ImageIndex would mean the registry returned a
-                    // multi-arch image list which we don't currently
-                    // support. Match both shapes — ImageIndex falls
-                    // through to `pull()` which handles it (or errors).
-                    let (declared_sizes, layer_digest) = match &manifest {
-                        oci_distribution::manifest::OciManifest::Image(img) => {
-                            let sizes: Vec<i64> = img.layers.iter().map(|d| d.size).collect();
-                            let digest = img.layers.first().map(|d| d.digest.clone());
-                            (sizes, digest)
-                        }
-                        oci_distribution::manifest::OciManifest::ImageIndex(_) => {
-                            (Vec::new(), None)
-                        }
-                    };
-                    expected_layer_digest = layer_digest;
-                    if let ManifestSizeVerdict::Oversized { declared, cap } =
-                        check_manifest_layer_sizes(&declared_sizes, layer_cap)
-                    {
-                        let err = format!(
-                            "oci_layer_too_large: manifest declares layer of {declared} bytes, \
-                             cap is {cap} (set WORKER_MAX_OCI_LAYER_BYTES to override)"
-                        );
-                        ::tracing::error!(
-                            module_uri = %req.module_uri,
-                            declared_size = declared,
-                            cap_bytes = cap,
-                            "OCI manifest declares oversized layer — refusing to pull"
-                        );
-                        return Err(FetchError { message: err });
-                    }
-                }
-                Err(e) => {
-                    // Don't fail closed here — fall through to `pull()`
-                    // and let it report the real error (could be auth,
-                    // not-found, etc.). The defense-in-depth `data.len()`
-                    // check below still guards against the actual OOM.
-                    // Note: without a manifest fetch we have no
-                    // canonical layer digest, so the cache lookup
-                    // below is a no-op and the M2 hardening
-                    // (`refuse_unverified_oci_manifests`) will refuse
-                    // the pull bytes too unless explicitly opted in.
-                    ::tracing::debug!(
-                        module_uri = %req.module_uri,
-                        error = %e,
-                        "pull_manifest pre-check failed — proceeding to pull() which will report the real error"
-                    );
-                }
-            }
-
-            // H1: digest-keyed cache lookup. Only runs when we
-            // successfully resolved a layer digest from the manifest
-            // above — otherwise there's nothing safe to key off.
+            // H1: digest-keyed cache lookup, keyed on the layer digest named
+            // by the manifest whose OWN digest we computed and (per policy)
+            // signature-verified above.
             //
             // Cache hit re-verifies the cached bytes against the
             // expected digest before serving (defense in depth against
@@ -948,10 +1084,8 @@ pub async fn fetch(
             // `bytes_attested_in_this_run` accordingly so the
             // downstream `expected_wasm_hash` fallback doesn't kick in
             // and re-fail for cached-but-no-hash-provided jobs.
-            let redis_key = expected_layer_digest
-                .as_ref()
-                .map(|d| format!("oci_cache:{}", d));
-            if let (Some(digest), Some(key)) = (&expected_layer_digest, &redis_key) {
+            let redis_key = Some(format!("oci_cache:{}", pinned.layer.digest));
+            if let (Some(digest), Some(key)) = (Some(&pinned.layer.digest), &redis_key) {
                 if let Some(redis_client) = runtime.redis_client() {
                     if let Ok(mut conn) = redis_client.get_multiplexed_async_connection().await {
                         if let Ok(Some(b)) = redis::cmd("GET")
@@ -1013,239 +1147,91 @@ pub async fn fetch(
                 }
             }
 
-            // Only do the full layer pull on cache miss. The pull is
-            // the expensive part (network + decompression); on cache
-            // hit we already have validated bytes and skip it.
+            // Only fetch the layer on cache miss — by DIGEST, from the
+            // pinned manifest, streamed under the layer cap.
             if found_bytes.is_none() {
-                match client.pull(&reference, &auth, accepted_media_types).await {
-                    Ok(image) => {
-                        // The WASM binary is typically the first layer in a Wasm OCI artifact.
-                        // Cross-check the layer's actual sha256 against the manifest's
-                        // declared digest before trusting the bytes — bytes that don't
-                        // match the manifest indicate registry corruption, MITM during
-                        // pull (HTTP only — gated to localhost-dev above), or a bug in
-                        // the publish pipeline. Verification logic lives in the pure
-                        // helper `verify_oci_layer` so the security-critical decision
-                        // is unit-testable.
-                        if let Some(layer) = image.layers.into_iter().next() {
-                            // H-3 defense in depth: even if the manifest
-                            // claimed a small layer (pre-pull check passed)
-                            // OR the registry skipped the manifest's size
-                            // field, refuse if the actual decompressed
-                            // bytes exceed the cap. Reject WITHOUT caching
-                            // so a poisoned layer doesn't persist in Redis
-                            // to OOM the next worker.
-                            if (layer.data.len() as u64) > layer_cap {
-                                let err = format!(
-                                    "oci_layer_too_large_post_pull: actual layer is {} bytes, \
-                                 cap is {} (manifest may have lied about declared size)",
-                                    layer.data.len(),
-                                    layer_cap
-                                );
-                                ::tracing::error!(
-                                    module_uri = %req.module_uri,
-                                    actual_size = layer.data.len(),
-                                    cap_bytes = layer_cap,
-                                    "OCI layer exceeds cap post-pull — refusing to execute or cache"
-                                );
-                                return Err(FetchError { message: err });
-                            }
-                            // H1: prefer the digest we already learned from
-                            // the pre-pull manifest fetch (`expected_layer_digest`,
-                            // captured in the outer scope). Falling back to the
-                            // pull-response's `image.manifest.layers[0].digest`
-                            // covers the (rare) path where the pre-fetch failed
-                            // but the full pull succeeded; both shapes flow
-                            // through the same `verify_oci_layer` check.
-                            let pull_response_digest = image
-                                .manifest
-                                .as_ref()
-                                .and_then(|m| m.layers.first())
-                                .map(|d| d.digest.clone());
-                            let effective_digest =
-                                expected_layer_digest.clone().or(pull_response_digest);
-                            match verify_oci_layer(&layer.data, effective_digest.as_deref()) {
-                                LayerVerdict::Verified { digest } => {
-                                    span.set_attribute("oci_layer_digest", digest);
-                                    span.add_event("oci_pull_success");
-
-                                    // Populate the Redis cache so the next pull of
-                                    // this layer-digest short-circuits the registry
-                                    // round-trip. TTL bounds growth — without it,
-                                    // cache size scales monotonically with distinct
-                                    // digests ever seen. Tag repoints produce new
-                                    // digests and new cache entries; old entries
-                                    // expire on their own TTL.
-                                    //
-                                    // SECURITY: only cache when both layers
-                                    // of attestation passed in THIS pull —
-                                    // sigstore signature AND layer digest.
-                                    // The digest check is already a
-                                    // precondition of this `Verified` arm;
-                                    // the sigstore check is gated below.
-                                    // Caching on a sigstore-Audit failure
-                                    // would poison the cache so future
-                                    // pulls bypass verification entirely
-                                    // (cache hits short-circuit the OCI
-                                    // path). Skipping the SET keeps the
-                                    // bytes from being served to *other*
-                                    // jobs while still honouring the
-                                    // operator-chosen Audit-mode intent
-                                    // for THIS execution.
-                                    //
-                                    // The cache write only happens when we
-                                    // actually have a digest-keyed `redis_key`
-                                    // (set above). Without one, there's no
-                                    // canonical key for future re-verification —
-                                    // skipping the write is correct.
-                                    if sigstore_pass_in_this_run {
-                                        if let Some(key) = redis_key.as_deref() {
-                                            if let Some(redis_client) = runtime.redis_client() {
-                                                if let Ok(mut conn) = redis_client
-                                                    .get_multiplexed_async_connection()
-                                                    .await
-                                                {
-                                                    let _: Result<(), _> = redis::cmd("SET")
-                                                        .arg(key)
-                                                        .arg(&layer.data)
-                                                        .arg("EX")
-                                                        .arg(OCI_CACHE_TTL_SECS)
-                                                        .query_async(&mut conn)
-                                                        .await;
-                                                }
-                                            }
-                                        }
-                                    } else {
-                                        ::tracing::info!(
-                                            module_uri = %req.module_uri,
-                                            "OCI bytes attested by digest only \
-                                             (sigstore failed in audit mode) — \
-                                             skipping cache write so future pulls \
-                                             re-verify against the registry"
-                                        );
-                                    }
-
-                                    // Fresh pull with Sigstore + digest checks both
-                                    // passed in THIS run — attested.
-                                    bytes_attested_in_this_run = true;
-                                    found_bytes = Some(layer.data);
-                                }
-                                LayerVerdict::DigestMismatch { expected, computed } => {
-                                    let err = format!(
-                                        "oci_digest_mismatch: manifest declared {}, computed {}",
-                                        expected, computed
-                                    );
-                                    ::tracing::error!(
-                                        module_uri = %req.module_uri,
-                                        expected = %expected,
-                                        computed = %computed,
-                                        "OCI layer digest mismatch — refusing to execute"
-                                    );
-                                    return Err(FetchError { message: err });
-                                }
-                                LayerVerdict::AcceptedUnverified => {
-                                    // M2 (2026-05-22): refuse to execute
-                                    // bytes that lack a manifest layer
-                                    // descriptor by default. Previously
-                                    // accepted with a WARN; that meant a
-                                    // compromised registry could serve a
-                                    // malformed manifest with arbitrary
-                                    // bytes and the worker would run them
-                                    // (the sigstore + size caps still
-                                    // ran, but no content-addressable
-                                    // attestation tied the bytes to the
-                                    // registry's claim about them).
-                                    //
-                                    // Operators with legacy registries
-                                    // that genuinely produce manifests
-                                    // without layer descriptors can set
-                                    // `TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS=1`
-                                    // to restore the old behaviour, at the
-                                    // cost of accepting unverified bytes.
-                                    //
-                                    // H-5 (2026-05-23, wasm-security review):
-                                    // the env var was a single-knob bypass
-                                    // of the entire layer-digest gate. Even
-                                    // with `TALOS_SIGSTORE_REQUIRED=required`
-                                    // and `is_production() == true`, an
-                                    // operator who toggled this on rendered
-                                    // the integrity contract void with no
-                                    // safety net. Defense-in-depth fix: the
-                                    // env override is now refused whenever
-                                    // Sigstore is `Required` OR the process
-                                    // is in production. Operators on legacy
-                                    // registries must downgrade Sigstore
-                                    // policy AND/OR move out of production
-                                    // mode to use it — making the trade-off
-                                    // explicit rather than hiding it behind
-                                    // one toggle.
-                                    let accept_env = talos_config::bool_env_or_default(
-                                        "TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS",
-                                        false,
-                                    );
-                                    let prod = talos_config::is_production();
-                                    let sigstore_required = matches!(
-                                        SigstorePolicy::from_env(),
-                                        SigstorePolicy::Required
-                                    );
-                                    if accept_env && !prod && !sigstore_required {
-                                        ::tracing::warn!(
-                                            module_uri = %req.module_uri,
-                                            "OCI manifest had no layer descriptor — \
-                                             accepting bytes unverified \
-                                             (TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS=1, \
-                                             dev mode, sigstore not Required)"
-                                        );
-                                        span.add_event("oci_pull_success_unverified");
-                                        found_bytes = Some(layer.data);
-                                    } else {
-                                        let err = if accept_env && (prod || sigstore_required) {
-                                            // Operator tried to use the bypass in an
-                                            // environment that disallows it — call out
-                                            // the conflict explicitly so the operator
-                                            // can choose to downgrade Sigstore policy
-                                            // or move out of production mode if the
-                                            // legacy-registry path is genuinely needed.
-                                            ::tracing::error!(
-                                                module_uri = %req.module_uri,
-                                                prod, sigstore_required,
-                                                "OCI manifest had no layer descriptor AND \
-                                                 TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS=1 was \
-                                                 set in a stricter context — refusing the bypass"
-                                            );
-                                            "oci_manifest_missing_layer_descriptor: \
-                                         registry returned a manifest with no \
-                                         layer digest. TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS=1 \
-                                         is REFUSED in production and when sigstore \
-                                         policy is Required — fix the registry or \
-                                         relax both gates before using the bypass."
-                                        } else {
-                                            ::tracing::error!(
-                                                module_uri = %req.module_uri,
-                                                "OCI manifest had no layer descriptor — \
-                                                 refusing to execute (M2 hardening)"
-                                            );
-                                            "oci_manifest_missing_layer_descriptor: \
-                                         registry returned a manifest with no \
-                                         layer digest — refusing to execute. Set \
-                                         TALOS_OCI_ACCEPT_UNVERIFIED_MANIFESTS=1 \
-                                         to allow legacy registries (dev only, \
-                                         sigstore not Required)."
-                                        };
-                                        return Err(FetchError {
-                                            message: err.to_string(),
-                                        });
-                                    }
-                                }
-                            }
-                        }
+                let blob_ref = Reference::with_digest(
+                    reference.registry().to_string(),
+                    reference.repository().to_string(),
+                    pinned.manifest_digest.clone(),
+                );
+                match fetch_capped_blob(client, &blob_ref, &pinned.layer, layer_cap).await {
+                    Err(BlobFetchError::TooLarge(actual)) => {
+                        let err = format!(
+                            "oci_layer_too_large_post_pull: actual layer is at least {actual} \
+                             bytes, cap is {layer_cap} (manifest may have lied about declared size)"
+                        );
+                        ::tracing::error!(
+                            module_uri = %req.module_uri,
+                            actual_size = actual,
+                            cap_bytes = layer_cap,
+                            "OCI layer exceeds cap post-pull — refusing to execute or cache"
+                        );
+                        return Err(FetchError { message: err });
                     }
-                    Err(e) => {
+                    Err(BlobFetchError::Transport(e)) => {
                         ::tracing::warn!(module_uri = %req.module_uri, error = %e, "Failed to pull WASM artifact from OCI registry");
                         let err_msg = format!("oci_pull_error: {}", e);
                         let sanitized_error = sanitize_error_message(&err_msg);
                         span.add_event(&sanitized_error);
                     }
+                    Ok(data) => match verify_oci_layer(&data, Some(pinned.layer.digest.as_str())) {
+                        LayerVerdict::Verified { digest } => {
+                            span.set_attribute("oci_layer_digest", digest);
+                            span.add_event("oci_pull_success");
+                            // SECURITY: only cache when both layers of
+                            // attestation passed in THIS pull — sigstore (per
+                            // policy) AND the layer digest. Caching on a
+                            // sigstore-Audit failure would let future pulls
+                            // bypass verification (cache hits short-circuit).
+                            if sigstore_pass_in_this_run {
+                                if let Some(key) = redis_key.as_deref() {
+                                    if let Some(redis_client) = runtime.redis_client() {
+                                        if let Ok(mut conn) =
+                                            redis_client.get_multiplexed_async_connection().await
+                                        {
+                                            let _: Result<(), _> = redis::cmd("SET")
+                                                .arg(key)
+                                                .arg(&data)
+                                                .arg("EX")
+                                                .arg(OCI_CACHE_TTL_SECS)
+                                                .query_async(&mut conn)
+                                                .await;
+                                        }
+                                    }
+                                }
+                            } else {
+                                ::tracing::info!(
+                                    module_uri = %req.module_uri,
+                                    "OCI bytes attested by digest only \
+                                     (sigstore failed in audit mode) — \
+                                     skipping cache write so future pulls \
+                                     re-verify against the registry"
+                                );
+                            }
+                            bytes_attested_in_this_run = true;
+                            found_bytes = Some(data);
+                        }
+                        LayerVerdict::DigestMismatch { expected, computed } => {
+                            let err = format!(
+                                "oci_digest_mismatch: manifest declared {}, computed {}",
+                                expected, computed
+                            );
+                            ::tracing::error!(
+                                module_uri = %req.module_uri,
+                                expected = %expected,
+                                computed = %computed,
+                                "OCI layer digest mismatch — refusing to execute"
+                            );
+                            return Err(FetchError { message: err });
+                        }
+                        // Unreachable: a digest was always supplied.
+                        LayerVerdict::AcceptedUnverified => {
+                            return Err(FetchError {
+                                message: "oci_manifest_missing_layer_descriptor".to_string(),
+                            });
+                        }
+                    },
                 }
             } // end `if found_bytes.is_none()` cache-miss block
         }
@@ -1312,34 +1298,37 @@ pub async fn fetch(
             });
         }
     } else {
-        // FALLBACK: Read from file system if bytes not provided
-        match std::fs::read(&req.module_uri) {
+        // FALLBACK: filesystem. W13 (2026-09-25): any signed `module_uri`
+        // that is neither `oci://` nor `redis:wasm:` used to reach
+        // `std::fs::read` — blocking, reading the WHOLE file before the size
+        // cap (`/dev/zero` → OOM). Production has no legitimate filesystem
+        // module source, so it is refused there; elsewhere the read is
+        // stat-first, regular-files-only, capped and off the runtime thread.
+        if talos_config::is_production() {
+            ::tracing::error!(
+                module_uri = %req.module_uri,
+                "module_uri is neither oci:// nor redis:wasm: — filesystem modules are \
+                 refused in production"
+            );
+            return Err(FetchError {
+                message: "unsupported_module_uri_scheme: filesystem module paths are refused \
+                          in production"
+                    .to_string(),
+            });
+        }
+        let layer_cap = max_oci_layer_bytes();
+        let path = req.module_uri.clone();
+        let read = tokio::task::spawn_blocking(move || read_module_file_capped(&path, layer_cap))
+            .await
+            .unwrap_or_else(|_| Err("failed to read wasm module: reader task failed".to_string()));
+        match read {
             Ok(b) => {
-                // H-3: cap applies to filesystem loads too. Even though
-                // the controller would normally bound this via
-                // `expected_wasm_hash` (set from `wasm_modules.content_hash`),
-                // a malicious controller or compromised pod could
-                // request a giant path. Reject loudly.
-                let layer_cap = max_oci_layer_bytes();
-                if (b.len() as u64) > layer_cap {
-                    let err = format!(
-                        "wasm_module_too_large: filesystem file is {} bytes, cap is {layer_cap}",
-                        b.len()
-                    );
-                    ::tracing::error!(
-                        module_uri = %req.module_uri,
-                        file_size = b.len(),
-                        cap_bytes = layer_cap,
-                        "filesystem WASM exceeds cap — refusing to execute"
-                    );
-                    return Err(FetchError { message: err });
-                }
                 span.set_attribute_int("module_size_bytes", b.len() as i64);
                 span.set_attribute("module_source", "filesystem");
                 b
             }
-            Err(e) => {
-                let error_msg = format!("failed to read wasm module: {}", e);
+            Err(error_msg) => {
+                ::tracing::error!(module_uri = %req.module_uri, reason = %error_msg, "filesystem WASM load refused");
                 let sanitized_error = sanitize_error_message(&error_msg);
                 span.set_attribute("error", &sanitized_error);
                 return Err(FetchError {
@@ -1923,5 +1912,119 @@ mod oci_layer_tests {
         std::env::set_var("WORKER_MAX_OCI_LAYER_BYTES", "33554432"); // 32 MiB
         assert_eq!(max_oci_layer_bytes(), 33_554_432);
         std::env::remove_var("WORKER_MAX_OCI_LAYER_BYTES");
+    }
+}
+
+#[cfg(test)]
+mod w13_pinning_tests {
+    use super::*;
+    use oci_distribution::Reference;
+
+    fn manifest(layers: &str) -> Vec<u8> {
+        format!(
+            r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.wasm.config.v1+json","digest":"sha256:{c}","size":2}},"layers":[{layers}]}}"#,
+            c = "0".repeat(64)
+        )
+        .into_bytes()
+    }
+
+    fn wasm_layer(size: i64) -> String {
+        format!(
+            r#"{{"mediaType":"application/vnd.wasm.content.layer.v1+wasm","digest":"sha256:{}","size":{size},"urls":["http://169.254.169.254/x"]}}"#,
+            "a".repeat(64)
+        )
+    }
+
+    fn sha(b: &[u8]) -> String {
+        use sha2::Digest as _;
+        format!("sha256:{:x}", sha2::Sha256::digest(b))
+    }
+
+    #[test]
+    fn cosign_verifies_the_digest_computed_from_the_body_not_the_tag() {
+        let body = manifest(&wasm_layer(10));
+        let r: Reference = "ghcr.io/acme/talos-tools/echo:latest".parse().unwrap();
+        let p = pin_oci_manifest(&r, &body, 1 << 20).unwrap();
+        assert_eq!(p.manifest_digest, sha(&body));
+        assert_eq!(
+            p.pinned_ref,
+            format!("ghcr.io/acme/talos-tools/echo@{}", sha(&body))
+        );
+        assert!(!p.pinned_ref.contains(":latest"));
+        assert!(p.layer.urls.is_none(), "foreign blob urls must be stripped");
+        // The argv cosign runs carries the pinned reference and both pins.
+        let argv = cosign_verify_argv(&p.pinned_ref, "^https://x@", "https://issuer");
+        assert_eq!(argv.last().unwrap(), &p.pinned_ref);
+        assert!(argv.contains(&"--certificate-identity-regexp".to_string()));
+        assert!(argv.contains(&"--certificate-oidc-issuer".to_string()));
+    }
+
+    #[test]
+    fn a_body_that_contradicts_a_pinned_reference_is_refused() {
+        let body = manifest(&wasm_layer(10));
+        let other = format!("sha256:{}", "b".repeat(64));
+        let r: Reference = format!("ghcr.io/acme/echo@{other}").parse().unwrap();
+        assert!(pin_oci_manifest(&r, &body, 1 << 20)
+            .unwrap_err()
+            .starts_with("oci_manifest_digest_mismatch"));
+        let ok: Reference = format!("ghcr.io/acme/echo@{}", sha(&body)).parse().unwrap();
+        assert!(pin_oci_manifest(&ok, &body, 1 << 20).is_ok());
+    }
+
+    #[test]
+    fn index_empty_foreign_and_oversized_manifests_are_refused() {
+        let r: Reference = "ghcr.io/acme/echo:1".parse().unwrap();
+        let index = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[]}"#;
+        assert!(pin_oci_manifest(&r, index, 1 << 20)
+            .unwrap_err()
+            .starts_with("oci_manifest_is_index"));
+        assert!(pin_oci_manifest(&r, &manifest(""), 1 << 20)
+            .unwrap_err()
+            .starts_with("oci_manifest_missing_layer_descriptor"));
+        let tar = format!(
+            r#"{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"sha256:{}","size":1}}"#,
+            "c".repeat(64)
+        );
+        assert!(pin_oci_manifest(&r, &manifest(&tar), 1 << 20)
+            .unwrap_err()
+            .starts_with("oci_layer_media_type_rejected"));
+        assert!(pin_oci_manifest(&r, &manifest(&wasm_layer(100)), 50)
+            .unwrap_err()
+            .starts_with("oci_layer_too_large"));
+    }
+
+    #[test]
+    fn filesystem_reader_refuses_non_regular_and_oversized_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("m.wasm");
+        std::fs::write(&f, b"0123456789").unwrap();
+        let p = f.to_str().unwrap();
+        assert_eq!(read_module_file_capped(p, 10).unwrap().len(), 10);
+        assert!(read_module_file_capped(p, 9)
+            .unwrap_err()
+            .starts_with("wasm_module_too_large"));
+        assert!(
+            read_module_file_capped(dir.path().to_str().unwrap(), 1 << 20)
+                .unwrap_err()
+                .contains("not a regular file")
+        );
+        #[cfg(target_os = "linux")]
+        assert!(read_module_file_capped("/dev/zero", 1 << 20)
+            .unwrap_err()
+            .contains("not a regular file"));
+    }
+
+    /// TEXTUAL pin: the fetch path verifies the pinned reference and never
+    /// re-resolves the tag (`pull` / `pull_manifest` by the tag reference).
+    #[test]
+    fn source_pin_no_tag_re_resolution() {
+        let src = include_str!("module_fetcher.rs");
+        let body = &src[src.find("pub async fn fetch(").unwrap()
+            ..src.find("#[cfg(test)]\nmod oci_layer_tests").unwrap()];
+        assert!(body.contains("verify_oci_signature(&pinned.pinned_ref,"));
+        assert!(!body.contains("verify_oci_signature(&image_ref"));
+        assert!(!body.contains("client.pull(&reference"));
+        assert!(!body.contains("client.pull_manifest(&reference"));
+        assert!(body.contains("fetch_capped_blob(client, &blob_ref"));
     }
 }
