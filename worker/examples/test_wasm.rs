@@ -34,7 +34,7 @@ async fn main() -> anyhow::Result<()> {
             std::collections::HashMap::new(),
             None,
             std::time::Duration::from_secs(10),
-            worker::runtime::RetryPolicy::default(),
+            worker::runtime::RetryPolicy::in_process_transient(),
             None,
             worker::runtime::SecurityPolicy::default(),
             None,                                             // capability_world_hint

@@ -33,6 +33,9 @@ use worker::{circuit_breaker, metrics, metrics_server, sql_validator};
 
 use worker::runtime::TalosRuntime;
 
+#[cfg(test)]
+mod retry_policy_pin;
+
 /// Default maximum concurrent single-node job executions. Overridable via
 /// `TALOS_MAX_CONCURRENT_JOBS`; see [`max_concurrent_jobs`].
 const DEFAULT_MAX_CONCURRENT_JOBS: usize = 100;
@@ -1604,7 +1607,15 @@ async fn execute_job(
             secrets,
             None,        // token_sender
             job_timeout, // per-job timeout — matches the outer tokio::time::timeout
-            RetryPolicy::default(),
+            // NO in-process retry. The controller that dispatched this job owns
+            // its retries and decides them method-aware (resolved `max_retries`,
+            // transient classifier, `retry_condition`), re-dispatching with a
+            // bumped signed `dispatch_attempt`. A retry here re-ran the WHOLE
+            // module on guest-influenced "timeout"/"503" text, blind to
+            // `allowed_methods` — a POST node the controller allowed zero
+            // retries still ran up to four times. Pinned by
+            // `retry_policy_pin.rs`.
+            RetryPolicy::controller_dispatched(),
             None, // No result caching for NATS jobs — each execution must be fresh
             security_policy,
             capability_world_hint,

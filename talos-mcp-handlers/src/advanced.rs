@@ -1749,7 +1749,9 @@ async fn handle_run_scratch_session(
             std::collections::HashMap::new(),
             None,
             std::time::Duration::from_secs(30),
-            talos_worker_runtime::runtime::RetryPolicy::default(),
+            // Embedded rehearsal surface, no controller retry loop above it:
+            // the old in-process policy, named rather than defaulted.
+            talos_worker_runtime::runtime::RetryPolicy::in_process_transient(),
             None,
             talos_worker_runtime::runtime::SecurityPolicy::default(),
             None,                                                // capability_world_hint

@@ -290,6 +290,7 @@ jobs:
             --test child_run_dispatch_recording \
             --test degraded_inputs \
             --test fan_in_join \
+            --test loop_body_gates \
             --test precheck_errors \
             --test rate_limit_store \
             --test subflow_fuel_attribution \

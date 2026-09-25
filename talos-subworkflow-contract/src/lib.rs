@@ -237,8 +237,10 @@ pub async fn run_contract_test(
     // WorkflowGraphStore — we don't want load_graph_from_json fired here.
     // Contract testing is intentionally anonymous (no actor binding); the
     // sub-workflow runs under whatever actor it's bound to in its own graph
-    // when the engine resolves it.
-    let opts = talos_engine::builder::EngineOpts::for_skip_load(workflow_id);
+    // when the engine resolves it (`bind_subengine_actor_and_ceilings`).
+    // allow-unresolved-effective-actor: an operator authoring tool with no
+    // parent run; the child adopts its OWN bound actor at the sub-engine.
+    let opts = talos_engine::builder::EngineOpts::for_skip_load(workflow_id).without_actor();
     let engine = talos_engine::builder::for_workflow(
         deps.registry.clone(),
         secrets_manager,

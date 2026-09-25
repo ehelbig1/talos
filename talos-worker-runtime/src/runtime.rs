@@ -1548,7 +1548,27 @@ fn extract_panic_message_from_stderr(stderr: &str) -> Option<String> {
 
 // Suppress dead‑code warnings for fields and methods that are part of the public API
 #[allow(dead_code)]
-/// Retry policy for WASM execution
+/// In-process retry policy for WASM execution.
+///
+/// An in-process retry re-runs the WHOLE module whenever the error text reads
+/// as transient ([`is_transient_error_text`]: "timeout", "timed out", "503",
+/// "unavailable", …). That text is GUEST-INFLUENCED — a module can print any of
+/// it — and the decision looks at nothing else: not the module's
+/// `allowed_methods`, not its capability world, not its idempotency key. A
+/// module that POSTed and then timed out reading the reply is re-run, and
+/// POSTs again.
+///
+/// So there is deliberately NO `Default`. Until 2026-09-25 `Default` was three
+/// such retries and every caller reached for it, including the worker's NATS
+/// path, where the controller ALREADY retries method-aware (`max_retries` from
+/// `default_max_retries_for_module`, the transient classifier and the node's
+/// `retry_condition`, one re-dispatch per attempt): a node the controller
+/// allowed two retries ran up to 3 × 4 = 12 times, and a state-changing node the
+/// controller allowed ZERO still ran up to four. Every caller now names its
+/// answer: [`RetryPolicy::controller_dispatched`] for a job a controller
+/// dispatched, [`RetryPolicy::none`] for no retry, and
+/// [`RetryPolicy::in_process_transient`] — the old default, named for what it
+/// does — for the controller-embedded rehearsal surfaces that still use it.
 #[derive(Debug, Clone)]
 pub struct RetryPolicy {
     /// Maximum number of retry attempts (0 = no retries)
@@ -1623,28 +1643,49 @@ pub(crate) async fn seal_job_audit_chain(
     Some(guard.append_terminal_anchor("worker"))
 }
 
-impl Default for RetryPolicy {
-    fn default() -> Self {
-        // The default retry policy now provides a modest number of attempts to
-        // improve resiliency for transient failures while still protecting
-        // against duplicate side‑effects. Modules that cannot tolerate retries
-        // should explicitly set `max_attempts = 0`.
+#[allow(dead_code)]
+impl RetryPolicy {
+    /// No retries: the module runs exactly once.
+    pub fn none() -> Self {
+        Self {
+            max_attempts: 0,
+            ..Self::in_process_transient()
+        }
+    }
+
+    /// The policy for a job a CONTROLLER dispatched over NATS: run once.
+    ///
+    /// The controller owns retries for these jobs, and owns them method-aware:
+    /// `talos_workflow_engine_nats::execute_job_with_retry` re-dispatches under
+    /// the node's resolved `max_retries` (`default_max_retries_for_module` when
+    /// the node declared none — 0 for a state-changing module), gated by the
+    /// transient classifier and the node's `retry_condition`, with a bumped,
+    /// signed `dispatch_attempt` per re-dispatch. An in-process retry here
+    /// multiplies that budget and ignores every one of those inputs (see the
+    /// type's docs). One home, so the worker binary cannot pick a different
+    /// answer than the one this name states; pinned at the call site by
+    /// `worker/src/retry_policy_pin.rs`.
+    pub fn controller_dispatched() -> Self {
+        Self::none()
+    }
+
+    /// Three in-process retries on transient-LOOKING error text, whatever the
+    /// module's methods or world — the policy that was `Default` until
+    /// 2026-09-25, named for what it does rather than for how safe it sounds
+    /// (its doc comment said it "protected against duplicate side-effects";
+    /// nothing in it looks at a side effect).
+    ///
+    /// Kept only for the controller-embedded surfaces that have no controller
+    /// retry loop above them (`run_sandbox`, `test_module`, scratch sessions,
+    /// module replay, the legacy `execute_job_with_context` helper). Never use
+    /// it for a controller-dispatched job — that is
+    /// [`RetryPolicy::controller_dispatched`].
+    pub fn in_process_transient() -> Self {
         Self {
             max_attempts: 3,
             initial_backoff: Duration::from_millis(100),
             max_backoff: Duration::from_secs(10),
             backoff_multiplier: 2.0,
-        }
-    }
-}
-
-#[allow(dead_code)]
-impl RetryPolicy {
-    /// No retries
-    pub fn none() -> Self {
-        Self {
-            max_attempts: 0,
-            ..Default::default()
         }
     }
 
@@ -1666,6 +1707,34 @@ impl RetryPolicy {
         let jittered_ms = (base_backoff.as_millis() as f32 * jitter_factor) as u64;
 
         Duration::from_millis(jittered_ms.min(self.max_backoff.as_millis() as u64))
+    }
+}
+
+#[cfg(test)]
+mod retry_policy_constructor_tests {
+    use super::RetryPolicy;
+
+    /// The property the worker's NATS path depends on: a controller-dispatched
+    /// job runs ONCE in this process. `execute_job_with_full_features` runs
+    /// `max_attempts + 1` attempts, so zero is the only value that cannot
+    /// multiply the controller's method-aware budget.
+    #[test]
+    fn a_controller_dispatched_job_gets_no_in_process_retry() {
+        assert_eq!(RetryPolicy::controller_dispatched().max_attempts, 0);
+        assert_eq!(RetryPolicy::none().max_attempts, 0);
+    }
+
+    /// CONTROL: the named rehearsal policy still retries, so the zero above is
+    /// the constructor's answer and not an accident of the struct.
+    #[test]
+    fn the_rehearsal_policy_keeps_its_three_retries() {
+        let p = RetryPolicy::in_process_transient();
+        assert_eq!(p.max_attempts, 3);
+        assert_eq!(
+            RetryPolicy::none().initial_backoff,
+            p.initial_backoff,
+            "none() only zeroes the attempts"
+        );
     }
 }
 
@@ -2225,9 +2294,21 @@ pub(crate) fn is_transient_error_text(error_str: &str) -> bool {
     // token a genuine connection-stall step timeout — the exact
     // 2026-07-23 outage signature — would be misclassified permanent and
     // skip the in-worker retry. Compute-runaway timeouts are caught by
-    // fuel first; a rare epoch-deadline compute timeout retrying wastes
-    // at most the step's budget, and only idempotent steps carry a retry
-    // budget (method-aware default), so this cannot double-fire a send.
+    // fuel first.
+    //
+    // What this classifier does NOT do is decide whether a retry is SAFE: the
+    // text is guest-influenced and says nothing about side effects. Safety
+    // comes from the retry BUDGET each caller hands in, and it differs by
+    // caller. A PIPELINE STEP's budget is the controller-supplied, method-aware
+    // per-step `max_retries` (0 for a state-changing step), so a step cannot
+    // double-fire a send. A single controller-dispatched MODULE gets
+    // `RetryPolicy::controller_dispatched()` — no in-process retry at all; the
+    // controller re-dispatches method-aware. Until 2026-09-25 this comment
+    // claimed the step property for every path while the worker's NATS path
+    // passed a blind three-retry default, so a POST module that timed out ran
+    // up to four times regardless of `allowed_methods`. The embedded rehearsal
+    // surfaces (`run_sandbox`, `test_module`, scratch, replay) still pass
+    // `RetryPolicy::in_process_transient()` and are NOT method-aware.
     if error_str.contains("connection refused")
         || error_str.contains("connection reset")
         || error_str.contains("timeout")
@@ -3462,8 +3543,10 @@ impl TalosRuntime {
             secrets,
             None,                    // token_sender
             Duration::from_secs(30), // Default 30-second timeout
-            RetryPolicy::default(),  // Default retry policy (3 attempts)
-            Some(300),               // Result cache TTL: 5 minutes
+            // No controller retry loop above this legacy helper, so it keeps
+            // the in-process policy it always had — named, not defaulted.
+            RetryPolicy::in_process_transient(),
+            Some(300), // Result cache TTL: 5 minutes
             SecurityPolicy::default(),
             None,                                                 // capability_world_hint
             None,              // max_fuel_override — use runtime default
@@ -3485,7 +3568,8 @@ impl TalosRuntime {
     ///
     /// - Automatic logging (START/END with metrics)
     /// - Automatic timeout (prevents infinite loops)
-    /// - Automatic retry (handles transient failures)
+    /// - In-process retry per the CALLER's `retry_policy` — none for a
+    ///   controller-dispatched job (see [`RetryPolicy`] for why)
     /// - Performance monitoring (compilation, execution, cache metrics)
     /// - Result caching (Redis-backed, configurable TTL)
     /// - Error classification (timeout, out_of_fuel, trap, etc.)

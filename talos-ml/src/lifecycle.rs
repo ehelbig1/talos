@@ -1064,6 +1064,7 @@ impl LifecycleService {
 
     /// One-tap digest verdict: mark resolved (a correction was
     /// appended by the caller) or dismissed. Owner-scoped.
+    #[must_use = "the bool says whether THIS caller won the guarded status transition; acting on `Ok(false)` acts on a row another writer owns"]
     pub async fn set_disagreement_status(
         &self,
         conn: &mut PgConnection,
