@@ -4,6 +4,8 @@
 // get_workflow` and is what every caller actually uses. The bare
 // `talos-db` helpers had no callers (the deferred read-replica wire-in
 // `init_read_replica_pool` is still kept below for the operator hook).
+pub mod migrate;
+
 use anyhow::Context;
 use sqlx::{postgres::PgPoolOptions, Pool, Postgres, Transaction};
 use talos_tenancy::{OrgScope, TenantReadScope};
