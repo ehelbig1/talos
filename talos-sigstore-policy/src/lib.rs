@@ -66,6 +66,13 @@ pub enum SigstoreRegexpRejection {
     /// a `^` anchor is cheap defense in depth (and matches the
     /// documented operator examples in this crate's `human_reason()` text).
     MissingStartAnchor,
+    /// A GitHub workflow pattern that does not pin the REF after the `@`.
+    /// `…/template-publish\.yml@` matches a certificate minted by that
+    /// workflow on ANY branch — including one anyone with push access can
+    /// create — so the pin must name `@refs/heads/<branch>$` (literal branch,
+    /// end-anchored) or `@refs/tags/<prefix>`. Refused under `Required`,
+    /// warned under `Audit` (see [`validate_sigstore_identity_regexp_for_policy`]).
+    UnpinnedWorkflowRef,
 }
 
 impl SigstoreRegexpRejection {
@@ -75,7 +82,7 @@ impl SigstoreRegexpRejection {
             Self::TooBroad => {
                 "TALOS_SIGSTORE_IDENTITY_REGEXP matches anything — pin it to your \
                  workflow URL pattern (e.g. \
-                 `^https://github\\.com/OWNER/talos/\\.github/workflows/template-publish\\.yml@`)"
+                 `^https://github\\.com/OWNER/talos/\\.github/workflows/template-publish\\.yml@refs/heads/main$`)"
             }
             Self::InvalidRegex => {
                 "TALOS_SIGSTORE_IDENTITY_REGEXP is not a valid regex — `cosign verify` will reject every artifact"
@@ -92,7 +99,7 @@ impl SigstoreRegexpRejection {
                  issued by GitHub Actions OIDC contains that path, so a pattern \
                  without it would match unrelated artifacts from any owner/repo. \
                  Use a pattern like \
-                 `^https://github\\.com/OWNER/REPO/\\.github/workflows/WORKFLOW\\.yml@`."
+                 `^https://github\\.com/OWNER/REPO/\\.github/workflows/WORKFLOW\\.yml@refs/heads/main$`."
             }
             Self::UnpinnedGithubOwnerRepo => {
                 "TALOS_SIGSTORE_IDENTITY_REGEXP has a wildcard between `github.com/` \
@@ -104,6 +111,13 @@ impl SigstoreRegexpRejection {
                 "TALOS_SIGSTORE_IDENTITY_REGEXP starts with `https://` but is \
                  missing the `^` start-of-string anchor. Add `^` at the front \
                  (e.g. `^https://github\\.com/OWNER/REPO/...`)."
+            }
+            Self::UnpinnedWorkflowRef => {
+                "TALOS_SIGSTORE_IDENTITY_REGEXP pins the workflow file but not the \
+                 git ref after `@`, so a signature minted by that workflow on ANY \
+                 branch verifies. End the pattern with a literal, end-anchored ref, \
+                 e.g. `...template-publish\\.yml@refs/heads/main$` (or \
+                 `@refs/tags/v` for release tags)."
             }
         }
     }
@@ -228,6 +242,70 @@ pub fn validate_sigstore_identity_regexp(regexp: &str) -> Result<(), SigstoreReg
         }
     }
     Ok(())
+}
+
+/// Does a GitHub workflow pattern pin the git REF after its `@`?
+///
+/// Accepts `@refs/heads/<literal branch>$` and `@refs/tags/<literal prefix>…`.
+/// A pattern with no `.github/workflows/` path is out of range (`true`): the
+/// structural validator decides those. Pure; `false` means "any ref".
+#[must_use]
+pub fn workflow_ref_is_pinned(regexp: &str) -> bool {
+    let Some(wf) = regexp.find(".github/workflows/") else {
+        return true;
+    };
+    let after = &regexp[wf..];
+    let Some(at) = after.find('@') else {
+        return false;
+    };
+    let reference = &after[at + 1..];
+    if let Some(branch) = reference.strip_prefix("refs/heads/") {
+        // A literal branch name, end-anchored: `main` without `$` also
+        // matches `main-evil`.
+        let Some(name) = branch.strip_suffix('$') else {
+            return false;
+        };
+        let literal = name
+            .replace("\\.", "")
+            .replace("\\-", "")
+            .replace("\\_", "");
+        return !literal.is_empty()
+            && literal
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_'));
+    }
+    if let Some(tag) = reference.strip_prefix("refs/tags/") {
+        // A literal first character: `v.*` pins release tags, `.*` pins nothing.
+        return tag
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric());
+    }
+    false
+}
+
+/// [`validate_sigstore_identity_regexp`] plus the ref pin, decided per policy.
+///
+/// * `Err(r)` — refuse (every structural rejection, and an unpinned ref under
+///   `Required`).
+/// * `Ok(Some(UnpinnedWorkflowRef))` — accept with a WARNING (`Audit` /
+///   `Disabled`): existing deployments whose pattern ends at `@` keep
+///   verifying during the migration window instead of losing verification.
+/// * `Ok(None)` — fully pinned.
+pub fn validate_sigstore_identity_regexp_for_policy(
+    regexp: &str,
+    policy: SigstorePolicy,
+) -> Result<Option<SigstoreRegexpRejection>, SigstoreRegexpRejection> {
+    validate_sigstore_identity_regexp(regexp)?;
+    if workflow_ref_is_pinned(regexp) {
+        return Ok(None);
+    }
+    match policy {
+        SigstorePolicy::Required => Err(SigstoreRegexpRejection::UnpinnedWorkflowRef),
+        SigstorePolicy::Audit | SigstorePolicy::Disabled => {
+            Ok(Some(SigstoreRegexpRejection::UnpinnedWorkflowRef))
+        }
+    }
 }
 
 /// The operator's `TALOS_SIGSTORE_REQUIRED` env var name — ONE spelling for
@@ -412,6 +490,68 @@ mod tests {
             "{:?}",
             validate_sigstore_identity_regexp(pattern)
         );
+    }
+
+    const AT_ONLY: &str =
+        "^https://github\\.com/ehelbig1/talos/\\.github/workflows/template-publish\\.yml@";
+    const MAIN_PINNED: &str = "^https://github\\.com/ehelbig1/talos/\\.github/workflows/template-publish\\.yml@refs/heads/main$";
+
+    #[test]
+    fn a_workflow_pin_without_a_ref_is_refused_under_required() {
+        assert_eq!(
+            validate_sigstore_identity_regexp_for_policy(AT_ONLY, SigstorePolicy::Required),
+            Err(SigstoreRegexpRejection::UnpinnedWorkflowRef)
+        );
+        // The migration window: Audit keeps verifying and warns.
+        assert_eq!(
+            validate_sigstore_identity_regexp_for_policy(AT_ONLY, SigstorePolicy::Audit),
+            Ok(Some(SigstoreRegexpRejection::UnpinnedWorkflowRef))
+        );
+        assert_eq!(
+            validate_sigstore_identity_regexp_for_policy(MAIN_PINNED, SigstorePolicy::Required),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn ref_pin_shapes() {
+        let wf = "^https://github\\.com/o/r/\\.github/workflows/p\\.yml@";
+        for pinned in [
+            "refs/heads/main$",
+            "refs/heads/release/v2$",
+            "refs/heads/my\\.branch$",
+            "refs/tags/v.*",
+            "refs/tags/v[0-9]+$",
+        ] {
+            assert!(workflow_ref_is_pinned(&format!("{wf}{pinned}")), "{pinned}");
+        }
+        for loose in [
+            "",
+            ".*",
+            "refs/heads/main", // matches main-evil
+            "refs/heads/.*$",
+            "refs/heads/$",
+            "refs/tags/.*",
+            "refs/pull/1/merge$",
+        ] {
+            assert!(
+                !workflow_ref_is_pinned(&format!("{wf}{loose}")),
+                "{loose:?}"
+            );
+        }
+        // Non-workflow identities are the structural validator's business.
+        assert!(workflow_ref_is_pinned("user@example\\.com"));
+    }
+
+    /// SOURCE PIN, textual: the controller's OCI sync must validate through the
+    /// policy-aware entry point, or an `@`-only pin verifies any branch.
+    #[test]
+    fn the_registry_sync_validates_the_ref_pin() {
+        let src = include_str!("../../talos-registry/src/sync.rs");
+        assert!(src.contains(&format!(
+            "validate_sigstore_identity_regexp_{}(",
+            "for_policy"
+        )));
     }
 
     // ---- SigstorePolicy (moved here from both consumers, 2026-09-13) ----

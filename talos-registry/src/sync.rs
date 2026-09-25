@@ -166,20 +166,30 @@ async fn verify_oci_artifact_signature(reference: &Reference) -> Result<bool> {
     // regexps the worker would refuse. The empty case (no identity pin)
     // is also handled by the validator (`Empty`). Any rejection fails
     // closed under Required and downgrades to unverified under Audit.
-    if let Err(rejection) =
-        talos_sigstore_policy::validate_sigstore_identity_regexp(&identity_regexp)
-    {
-        let msg = format!(
-            "TALOS_SIGSTORE_IDENTITY_REGEXP rejected — {}",
-            rejection.human_reason()
-        );
-        match policy {
-            SigstorePolicy::Required => anyhow::bail!("{msg} (Required policy)"),
-            SigstorePolicy::Audit => {
-                tracing::warn!("{msg} (Audit mode: continuing without verification)");
-                return Ok(false);
+    // The ref pin is policy-aware: an `@`-only workflow pin is refused under
+    // Required and WARNED under Audit (verification still runs).
+    match talos_sigstore_policy::validate_sigstore_identity_regexp_for_policy(
+        &identity_regexp,
+        policy,
+    ) {
+        Ok(None) => {}
+        Ok(Some(warning)) => tracing::warn!(
+            "TALOS_SIGSTORE_IDENTITY_REGEXP — {} (Audit mode: verifying anyway)",
+            warning.human_reason()
+        ),
+        Err(rejection) => {
+            let msg = format!(
+                "TALOS_SIGSTORE_IDENTITY_REGEXP rejected — {}",
+                rejection.human_reason()
+            );
+            match policy {
+                SigstorePolicy::Required => anyhow::bail!("{msg} (Required policy)"),
+                SigstorePolicy::Audit => {
+                    tracing::warn!("{msg} (Audit mode: continuing without verification)");
+                    return Ok(false);
+                }
+                SigstorePolicy::Disabled => unreachable!(),
             }
-            SigstorePolicy::Disabled => unreachable!(),
         }
     }
     let oidc_issuer = env::var("TALOS_SIGSTORE_OIDC_ISSUER")
