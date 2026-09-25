@@ -309,7 +309,62 @@ mod admission_identity_tests {
 // `verify()` returns false if the key is missing — requests are
 // rejected with Unauthorized rather than silently succeeding.
 
+/// Map a failed `MemoryOp::Set` persist onto the wire error the guest sees.
+///
+/// The per-actor row cap (`MemoryWriteError::QuotaExceeded`, enforced inside
+/// the persist chokepoint since 2026-09-25) is recognised by TYPE and answered
+/// `StorageFull` — the guest's "stop writing new keys" signal — rather than
+/// falling into `Internal`, where a quota refusal is indistinguishable from a
+/// database fault. The two text matches are the pre-existing classification,
+/// kept as they were.
+fn classify_memory_set_error(e: &anyhow::Error) -> talos_memory::memory_rpc::MemoryRpcError {
+    use talos_memory::memory_rpc::MemoryRpcError;
+    if matches!(
+        e.downcast_ref::<talos_memory::MemoryWriteError>(),
+        Some(talos_memory::MemoryWriteError::QuotaExceeded { .. })
+    ) {
+        return MemoryRpcError::StorageFull;
+    }
+    let s = e.to_string();
+    if s.contains("too large") {
+        MemoryRpcError::StorageFull
+    } else if s.contains("invalid memory_type") {
+        MemoryRpcError::InvalidInput(s)
+    } else {
+        MemoryRpcError::Internal(s)
+    }
+}
+
+#[cfg(test)]
+mod memory_set_error_tests {
+    use super::classify_memory_set_error;
+    use talos_memory::memory_rpc::MemoryRpcError;
+    use talos_memory::MemoryWriteError;
+
+    #[test]
+    fn a_quota_refusal_is_storage_full_not_internal() {
+        let e: anyhow::Error = MemoryWriteError::QuotaExceeded { limit: 10_000 }.into();
+        assert!(matches!(
+            classify_memory_set_error(&e),
+            MemoryRpcError::StorageFull
+        ));
+        // Through added context too — the classification is by type, not text.
+        let wrapped = anyhow::Error::from(MemoryWriteError::QuotaExceeded { limit: 1 })
+            .context("persisting actor memory");
+        assert!(matches!(
+            classify_memory_set_error(&wrapped),
+            MemoryRpcError::StorageFull
+        ));
+        let db = anyhow::Error::from(MemoryWriteError::Db(anyhow::anyhow!("connection reset")));
+        assert!(matches!(
+            classify_memory_set_error(&db),
+            MemoryRpcError::Internal(_)
+        ));
+    }
+}
+
 /// Wasm-security review 2026-05-22 (MEDIUM-1): controller-side
+/// expression-level function-name deny-list walker./// Wasm-security review 2026-05-22 (MEDIUM-1): controller-side
 /// expression-level function-name deny-list walker.
 ///
 /// Walks every `Expr::Function` in the statement and returns the first
@@ -1931,16 +1986,7 @@ async fn execute_memory_op(
             .await
             {
                 Ok(_) => Ok(MemoryOpResult::Ok),
-                Err(e) => {
-                    let s = e.to_string();
-                    if s.contains("too large") {
-                        Err(MemoryRpcError::StorageFull)
-                    } else if s.contains("invalid memory_type") {
-                        Err(MemoryRpcError::InvalidInput(s))
-                    } else {
-                        Err(MemoryRpcError::Internal(s))
-                    }
-                }
+                Err(e) => Err(classify_memory_set_error(&e)),
             }
         }
         MemoryOp::Delete { key } => {
