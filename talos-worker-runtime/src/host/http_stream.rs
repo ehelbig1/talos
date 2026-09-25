@@ -655,7 +655,7 @@ impl wit_http_stream::Host for TalosContext {
             );
 
             let mut stream = response.bytes_stream();
-            let mut buffer = String::new();
+            let mut lines = super::line_reader::LineReader::new(max_event_bytes);
             let mut event_type: Option<String> = None;
             let mut data_lines: Vec<String> = Vec::new();
             let mut data_bytes: usize = 0;
@@ -726,23 +726,18 @@ impl wit_http_stream::Host for TalosContext {
                         return;
                     }
                 };
-                buffer.push_str(&String::from_utf8_lossy(&chunk));
-
-                if buffer.len() > max_event_bytes {
+                if let Err(e) = lines.push(&chunk) {
                     tracing::warn!(
                         url = %url_owned,
                         max_bytes = max_event_bytes,
-                        actual_bytes = buffer.len(),
+                        actual_bytes = e.tail_bytes,
                         "SSE buffer exceeded max event size with no newline; aborting stream"
                     );
                     announce(&tx, SseStreamEnd::EventBytesCap).await;
                     return;
                 }
 
-                while let Some(nl_pos) = buffer.find('\n') {
-                    let line = buffer[..nl_pos].trim_end_matches('\r').to_string();
-                    buffer = buffer[nl_pos + 1..].to_string();
-
+                while let Some(line) = lines.next_line() {
                     if line.is_empty() {
                         // Blank line = event boundary
                         if !data_lines.is_empty() {

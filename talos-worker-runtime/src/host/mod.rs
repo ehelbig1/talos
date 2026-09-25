@@ -74,6 +74,8 @@ mod http;
 mod http_stream;
 mod integration_state;
 mod limits;
+/// Byte-level SSE line reader shared by the two streaming readers.
+mod line_reader;
 mod llm;
 pub(crate) mod llm_gate;
 pub(crate) mod llm_providers;

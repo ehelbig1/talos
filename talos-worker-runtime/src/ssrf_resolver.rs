@@ -46,8 +46,10 @@
 //!   2. The queried hostname is in the per-execution explicit list
 //!      (the module's `allowed_hosts`, minus any `*` wildcard entries).
 //! Hostnames NOT in the explicit list are always filtered, even when
-//! the env var is set. This matches the host-function pre-call bypass
-//! condition `WORKER_ALLOW_PRIVATE_HOST_TARGETS && allowed_hosts.iter().any(|p| p != "*" && p == host)`.
+//! the env var is set. Both halves have ONE reader shared with the
+//! host-function pre-checks: `host::allow_private_host_targets` (env +
+//! production refusal) and a case-insensitive explicit-host match
+//! (`host::private_host_bypass_applies`).
 
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use std::collections::HashSet;
@@ -67,18 +69,17 @@ use std::sync::Arc;
 /// declaring `["*"]` cannot also opt into the private-IP bypass. An
 /// empty set means "always filter every private IP regardless of env".
 ///
-/// `local_egress_only`: when `true` (a Tier-1, local-Ollama-only actor),
-/// the resolver INVERTS the default public-allow posture and DENIES any
-/// resolved address that is NOT loopback/private/link-local. This closes
-/// the S3 DNS hole (2026-06-23 review): the per-host
-/// `tier1_egress_deny_reason` gate only catches known LLM-provider
-/// hostnames and public IP *literals*, so a Tier-1 actor with a broad
-/// `allowed_hosts` could resolve `data-sink.attacker.com` → a public IP
-/// and POST sensitive data off-host. Enforcing local-only egress at the
-/// connect-time resolver (where the resolved IP is known) aligns the code
-/// with the documented Tier-1 contract — "data must NOT leave host" — and
-/// defeats DNS-rebinding because the gate IS the connect. Local Ollama on
-/// loopback / private-LAN IPs is still reachable.
+/// `local_egress_only`: when `true` (`egress_scope=local`, or a Tier-1 actor
+/// with no override) the posture is STRICTER than the default, never looser:
+/// a public address is denied (S3, 2026-06-23 — "data must NOT leave host")
+/// AND a private / loopback / link-local / metadata address is denied exactly
+/// as under the default posture. Until 2026-09-25 this branch KEPT every
+/// private address, so a local-only guest could reach `169.254.169.254`, the
+/// cluster's RFC1918 services and loopback through an allowlisted hostname —
+/// more than a public-egress actor could. The only private address such a
+/// resolver returns is one the dev private-host bypass admits (same scoping as
+/// the default posture). Local Ollama never used this client: it goes through
+/// `host::llm::local_llm_http_client()`, which has no guest resolver.
 #[derive(Debug, Clone, Default)]
 pub struct SsrfFilteringResolver {
     explicit_private_host_allowed: Arc<HashSet<String>>,
@@ -101,7 +102,7 @@ impl SsrfFilteringResolver {
         let explicit = allowed_hosts
             .iter()
             .filter(|h| h.as_str() != "*")
-            .map(|h| h.to_ascii_lowercase())
+            .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
             .collect::<HashSet<String>>();
         Self {
             explicit_private_host_allowed: Arc::new(explicit),
@@ -120,30 +121,16 @@ impl SsrfFilteringResolver {
         )
     }
 
-    /// Pure bypass decision so the scoping is unit-testable without
-    /// the env or DNS. The resolver follows the same logic at runtime.
-    ///
-    /// Three AND conditions must hold for the bypass to apply:
-    ///   1. `env_toggle_on` — operator has set the global env toggle.
-    ///   2. `!production` — the deployment is dev/test; production
-    ///      ignores the env toggle entirely (wasm-security-review
-    ///      2026-05-22).
-    ///   3. The queried hostname is in this execution's explicit
-    ///      `allowed_hosts` (no `*` wildcards).
-    ///
-    /// `#[cfg(test)]`: test-only pure mirror of the inline decision in
-    /// `resolve()` (which additionally folds in `local_egress_only`).
-    /// No production caller — compiled for tests only so the dead-code
-    /// lint stays honest for release builds.
-    #[cfg(test)]
-    fn bypass_allowed(&self, host_lower: &str, env_toggle_on: bool) -> bool {
-        self.bypass_allowed_with_prod(host_lower, env_toggle_on, false)
+    /// Pure bypass decision — the per-execution half of the dev-only
+    /// private-host bypass. `env_enabled` is
+    /// [`crate::host::allow_private_host_targets`] at runtime, which
+    /// already folds in the production refusal, so the resolver and the
+    /// host-function pre-checks read the toggle from ONE place.
+    fn bypass_allowed(&self, host_lower: &str, env_enabled: bool) -> bool {
+        env_enabled && self.explicit_private_host_allowed.contains(host_lower)
     }
 
-    /// Production-aware variant. Exists for testing — callers in
-    /// production paths use the env- and production-aware shape via
-    /// `resolve()`. `#[cfg(test)]` for the same reason as
-    /// [`Self::bypass_allowed`].
+    /// Test mirror with the production refusal made explicit.
     #[cfg(test)]
     pub(crate) fn bypass_allowed_with_prod(
         &self,
@@ -151,57 +138,38 @@ impl SsrfFilteringResolver {
         env_toggle_on: bool,
         production: bool,
     ) -> bool {
-        env_toggle_on && !production && self.explicit_private_host_allowed.contains(host_lower)
+        self.bypass_allowed(host_lower, env_toggle_on && !production)
+    }
+}
+
+/// Connect-time verdict for one resolved address. Pure so the full
+/// posture x bypass matrix is unit-testable without DNS.
+///
+/// * default posture: public permitted; private denied unless bypassed.
+/// * `local_egress_only`: public ALWAYS denied; private denied unless
+///   bypassed — strictly narrower than the default, never wider.
+pub(crate) fn resolved_addr_permitted(
+    ip: std::net::IpAddr,
+    local_egress_only: bool,
+    bypass: bool,
+) -> bool {
+    let private = crate::host_impl::classify_private_ip(ip).is_some();
+    match (private, local_egress_only) {
+        (true, _) => bypass,
+        (false, true) => false,
+        (false, false) => true,
     }
 }
 
 impl Resolve for SsrfFilteringResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let host = name.as_str().to_string();
-        let host_lower = host.to_ascii_lowercase();
-        let explicit_allowed = self.explicit_private_host_allowed.clone();
+        let host_lower = host.trim_end_matches('.').to_ascii_lowercase();
         let local_egress_only = self.local_egress_only;
+        // One reader for the toggle, shared with the host-fn pre-checks (it
+        // folds in the production refusal and logs once).
+        let bypass = self.bypass_allowed(&host_lower, crate::host::allow_private_host_targets());
         Box::pin(async move {
-            // The reqwest `Name` carries only the hostname; the port
-            // is injected by reqwest's connect layer based on the URL
-            // scheme. We use port 80 here as a placeholder because
-            // tokio's `lookup_host` needs a port to return SocketAddr
-            // (the port is rewritten by reqwest before the connect).
-            let env_toggle =
-                talos_config::bool_env_or_default("WORKER_ALLOW_PRIVATE_HOST_TARGETS", false);
-            // wasm-security-review (2026-05-22): refuse the bypass in
-            // production regardless of the env toggle. The flag is a
-            // dev-only convenience (reaching `host.docker.internal`
-            // from a worker pod, etc.); leaving it active in
-            // production widens the SSRF blast radius for what is at
-            // best a marginal local-dev workflow improvement. The
-            // host-function-entry pre-call check in `host_impl.rs`
-            // mirrors this restriction.
-            let production = talos_config::is_production();
-            if env_toggle && production {
-                tracing::warn!(
-                    host = %host,
-                    "WORKER_ALLOW_PRIVATE_HOST_TARGETS=1 is ignored in production — \
-                     the env toggle is dev-only. Unset it on the deployment, or \
-                     unset RUST_ENV=production if this is a single-pod dev cluster."
-                );
-            }
-            // Per-execution scoping: the env toggle alone is not
-            // sufficient — the hostname must ALSO appear in this
-            // execution's explicit allowed-hosts (no `*`). Same shape
-            // as `bypass_allowed_with_prod` so the unit-test pure
-            // function agrees with this runtime path.
-            //
-            // The private-IP bypass is meaningless for a Tier-1
-            // local-egress-only actor (it would only ever re-permit a
-            // private IP that's already permitted), so we never enter it
-            // when `local_egress_only` is set — keep the two postures
-            // disjoint to avoid any "bypass re-permits public" footgun.
-            let bypass = !local_egress_only
-                && env_toggle
-                && !production
-                && explicit_allowed.contains(&host_lower);
-
             // `lookup_host` needs a port to return SocketAddrs; this `:80` is a
             // throwaway placeholder. The real port is selected by the connector
             // AFTER we zero it out below (see the `set_port(0)` at the return) —
@@ -214,54 +182,23 @@ impl Resolve for SsrfFilteringResolver {
                 }
             };
 
-            let filtered: Vec<SocketAddr> = if bypass {
-                addrs
-            } else if local_egress_only {
-                // S3 (2026-06-23): Tier-1 = "data must NOT leave host".
-                // INVERT the default posture — keep ONLY loopback /
-                // private / link-local addresses, deny every public
-                // (globally-routable) one regardless of hostname. This
-                // blocks `data-sink.attacker.com → public IP` egress that
-                // the name-based `tier1_egress_deny_reason` gate misses,
-                // and defeats DNS-rebinding because the resolved IP is
-                // re-classified at the connect point. Local Ollama on
-                // loopback / private-LAN still resolves.
-                addrs
-                    .into_iter()
-                    .filter(|sa| match crate::host_impl::classify_private_ip(sa.ip()) {
-                        // Private / loopback / link-local — local egress, allowed.
-                        Some(_) => true,
-                        // Public / globally-routable — denied for Tier-1.
-                        None => {
-                            tracing::warn!(
-                                host = %host,
-                                ip = %sa.ip(),
-                                "SECURITY: Tier-1 local-egress-only — blocked public IP from \
-                                 DNS result (data must not leave host)"
-                            );
-                            false
-                        }
-                    })
-                    .collect()
-            } else {
-                addrs
-                    .into_iter()
-                    .filter(|sa| match crate::host_impl::classify_private_ip(sa.ip()) {
-                        None => true,
-                        Some(policy) => {
-                            tracing::warn!(
-                                host = %host,
-                                ip = %sa.ip(),
-                                policy,
-                                env_toggle,
-                                explicit_scoped = explicit_allowed.contains(&host_lower),
-                                "SSRF resolver: filtered private IP from DNS result"
-                            );
-                            false
-                        }
-                    })
-                    .collect()
-            };
+            let filtered: Vec<SocketAddr> = addrs
+                .into_iter()
+                .filter(|sa| {
+                    let ok = resolved_addr_permitted(sa.ip(), local_egress_only, bypass);
+                    if !ok {
+                        tracing::warn!(
+                            host = %host,
+                            ip = %sa.ip(),
+                            local_egress_only,
+                            policy = crate::host_impl::classify_private_ip(sa.ip())
+                                .unwrap_or("public-local-egress-only"),
+                            "SSRF resolver: filtered address from DNS result"
+                        );
+                    }
+                    ok
+                })
+                .collect();
 
             if filtered.is_empty() {
                 tracing::warn!(
@@ -352,43 +289,59 @@ mod tests {
         assert!(!r.bypass_allowed("anything", false));
     }
 
-    /// S3 (2026-06-23): a Tier-1 local-egress-only resolver must DENY a
-    /// public IP and PERMIT loopback/private/link-local. IP-literal hosts
-    /// are resolved by `tokio::net::lookup_host` without any network I/O,
-    /// so this exercises the real `resolve()` filter deterministically.
+    /// A local-egress-only resolver must be STRICTER than the default
+    /// posture: public denied (S3) AND private / loopback / link-local /
+    /// metadata denied. Until 2026-09-25 the private half was KEPT, so a
+    /// local-only guest reached 169.254.169.254 and loopback through any
+    /// allowlisted hostname. IP-literal hosts resolve with no network I/O,
+    /// so this drives the real `resolve()` filter deterministically.
     #[tokio::test]
-    async fn local_egress_only_denies_public_permits_local() {
+    async fn local_egress_only_denies_public_and_private() {
         let r = SsrfFilteringResolver::for_allowed_hosts(&["*".to_string()], true);
+        for host in [
+            "8.8.8.8",
+            "127.0.0.1",
+            "192.168.1.50",
+            "169.254.169.254",
+            "::1",
+        ] {
+            let got = r
+                .resolve(Name::from_str(host).expect("name"))
+                .await
+                .expect("resolve");
+            assert!(
+                got.collect::<Vec<SocketAddr>>().is_empty(),
+                "local-egress-only must drop {host}"
+            );
+        }
+    }
 
-        // Public IP literal → filtered to empty (deny).
-        let public = r
-            .resolve(Name::from_str("8.8.8.8").expect("name"))
-            .await
-            .expect("resolve");
-        assert!(
-            public.collect::<Vec<SocketAddr>>().is_empty(),
-            "Tier-1 local-egress-only must drop a public IP"
-        );
-
-        // Loopback → permitted.
-        let loopback = r
-            .resolve(Name::from_str("127.0.0.1").expect("name"))
-            .await
-            .expect("resolve");
-        assert!(
-            !loopback.collect::<Vec<SocketAddr>>().is_empty(),
-            "Tier-1 local-egress-only must keep loopback (local Ollama)"
-        );
-
-        // Private LAN (RFC1918) → permitted (host-local Ollama on the LAN).
-        let private = r
-            .resolve(Name::from_str("192.168.1.50").expect("name"))
-            .await
-            .expect("resolve");
-        assert!(
-            !private.collect::<Vec<SocketAddr>>().is_empty(),
-            "Tier-1 local-egress-only must keep a private-LAN address"
-        );
+    #[test]
+    fn resolved_addr_verdict_matrix() {
+        use std::net::{IpAddr, Ipv4Addr};
+        let public = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+        let meta = IpAddr::V4(Ipv4Addr::new(169, 254, 169, 254));
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        // Default posture.
+        assert!(resolved_addr_permitted(public, false, false));
+        assert!(!resolved_addr_permitted(meta, false, false));
+        assert!(resolved_addr_permitted(lo, false, true));
+        // Local-only: never public, private only under the dev bypass.
+        assert!(!resolved_addr_permitted(public, true, false));
+        assert!(!resolved_addr_permitted(public, true, true));
+        assert!(!resolved_addr_permitted(meta, true, false));
+        assert!(!resolved_addr_permitted(lo, true, false));
+        assert!(resolved_addr_permitted(lo, true, true));
+        // Local-only is never wider than the default for ANY input.
+        for ip in [public, meta, lo] {
+            for bypass in [false, true] {
+                assert!(
+                    !resolved_addr_permitted(ip, true, bypass)
+                        || resolved_addr_permitted(ip, false, bypass),
+                    "{ip} bypass={bypass}: local-only admitted what the default refuses"
+                );
+            }
+        }
     }
 
     /// The Tier-1 inversion must NOT be re-opened by the dev env-var

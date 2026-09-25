@@ -547,11 +547,7 @@ impl wit_http::Host for TalosContext {
         // a sibling service (e.g. nova on host.docker.internal:3030) while
         // keeping the wildcard-allowlist case fully protected. IP literals
         // are still rejected unconditionally above.
-        let bypass_dns_ssrf = *ALLOW_PRIVATE_HOST_TARGETS
-            && self
-                .allowed_hosts
-                .iter()
-                .any(|p| p != "*" && p == host);
+        let bypass_dns_ssrf = private_host_bypass_applies(&self.allowed_hosts, host);
         if url
             .host()
             .is_some_and(|h| matches!(h, url::Host::Domain(_)))
@@ -1241,7 +1237,6 @@ impl wit_http::Host for TalosContext {
         // separate buffer-then-drain dance. Checks are ordered cheap-first
         // so we never do a DNS lookup or vault resolution for a request
         // we'll reject on a sync check anyway.
-        let bypass_dns_env = *ALLOW_PRIVATE_HOST_TARGETS;
 
         #[allow(clippy::type_complexity)]
         let mut validated: Vec<
@@ -1482,8 +1477,7 @@ impl wit_http::Host for TalosContext {
             //    common entries, so the wall-clock cost is dominated by
             //    the actual HTTP request, not the lookup.
             let is_hostname = matches!(url.host(), Some(url::Host::Domain(_)));
-            let bypass_dns =
-                bypass_dns_env && self.allowed_hosts.iter().any(|p| p != "*" && p == &host);
+            let bypass_dns = private_host_bypass_applies(&self.allowed_hosts, &host);
             if is_hostname && !bypass_dns {
                 match tokio::net::lookup_host(format!("{}:80", host)).await {
                     Ok(addrs) => {
@@ -1814,6 +1808,12 @@ impl wit_http::Host for TalosContext {
 
         let self_http_client = self.http_client.clone();
         let dry_run = self.dry_run;
+        // Batch-wide response-byte budget (see `fetch_all_batch_byte_budget`):
+        // each entry is capped at `max_resp`, but the whole batch is collected
+        // in host memory before it is handed to the guest.
+        let batch_bytes_left = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(
+            fetch_all_batch_byte_budget(self.max_memory_bytes, max_resp),
+        ));
         // The execution's cancellation flag, cloned into every entry future:
         // the moved futures have no `self`, and a cancel arriving mid-batch
         // must stop the entries that have not been sent yet.
@@ -1835,6 +1835,7 @@ impl wit_http::Host for TalosContext {
         let stream =
             futures_util::stream::iter(validated.into_iter().enumerate().map(move |(idx, v)| {
                 let max_r = max_resp;
+                let batch_bytes_left = batch_bytes_left.clone();
                 let self_http_client = self_http_client.clone();
                 let cancelled_flag = cancelled_flag.clone();
                 async move {
@@ -1974,6 +1975,13 @@ impl wit_http::Host for TalosContext {
                 while let Some(chunk_result) = stream.next().await {
                     let chunk = chunk_result.map_err(|_| wit_http::Error::Networkerror)?;
                     if resp_body_bytes.len() + chunk.len() > max_r {
+                        return Err(wit_http::Error::Networkerror);
+                    }
+                    if !reserve_batch_bytes(&batch_bytes_left, chunk.len()) {
+                        tracing::warn!(
+                            "wit_http::fetch_all entry refused: batch response-byte budget \
+                             exhausted (bounded by the execution's guest memory limit)"
+                        );
                         return Err(wit_http::Error::Networkerror);
                     }
                     resp_body_bytes.extend_from_slice(&chunk);
@@ -2991,5 +2999,50 @@ mod write_ceiling_detail_tests {
             !gql.contains(&format!("{bare}(\"graphql-execute")),
             "the GraphQL write-ceiling gate lost its operator detail"
         );
+    }
+}
+
+/// Total response bytes ONE `fetch_all` batch may hold in host memory. Each
+/// entry is capped at `per_response_cap`, but up to 200 entries per host are
+/// buffered together before the batch returns — so the batch is bounded by the
+/// execution's guest memory limit (a batch larger than that could never be
+/// delivered into the guest anyway), and never below one full response.
+pub(crate) fn fetch_all_batch_byte_budget(
+    max_memory_bytes: usize,
+    per_response_cap: usize,
+) -> usize {
+    max_memory_bytes.max(per_response_cap)
+}
+
+/// Atomically take `n` bytes from the batch budget; `false` (and nothing
+/// taken) once the remainder cannot cover them.
+pub(crate) fn reserve_batch_bytes(left: &std::sync::atomic::AtomicUsize, n: usize) -> bool {
+    left.fetch_update(
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+        |cur| cur.checked_sub(n),
+    )
+    .is_ok()
+}
+
+#[cfg(test)]
+mod fetch_all_batch_budget_tests {
+    use super::{fetch_all_batch_byte_budget, reserve_batch_bytes};
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn budget_is_guest_memory_but_never_below_one_response() {
+        assert_eq!(fetch_all_batch_byte_budget(128 << 20, 10 << 20), 128 << 20);
+        assert_eq!(fetch_all_batch_byte_budget(4 << 20, 10 << 20), 10 << 20);
+    }
+
+    #[test]
+    fn reservation_refuses_past_the_budget_and_takes_nothing() {
+        let left = AtomicUsize::new(10);
+        assert!(reserve_batch_bytes(&left, 6));
+        assert!(!reserve_batch_bytes(&left, 5));
+        assert_eq!(left.load(std::sync::atomic::Ordering::Relaxed), 4);
+        assert!(reserve_batch_bytes(&left, 4));
+        assert!(!reserve_batch_bytes(&left, 1));
     }
 }

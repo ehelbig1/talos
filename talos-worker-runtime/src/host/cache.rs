@@ -76,6 +76,73 @@ pub(crate) fn build_namespaced_cache_key(user_id: Option<uuid::Uuid>, key: &str)
 /// `mset` limit.
 const MAX_CACHE_KEY_BYTES: usize = 1024;
 
+/// Per-execution cap on `cache` host calls (every method, reads included).
+/// Same shape and value as `MAX_HTTP_CALLS_PER_EXECUTION`: the Redis behind
+/// this interface also holds the platform's rate-limit, 2FA-lockout and
+/// idempotency state, so an unbounded guest loop is a shared-service DoS.
+pub(crate) const MAX_CACHE_CALLS_PER_EXECUTION: u64 = 1000;
+/// Per-execution cap on bytes WRITTEN (keys + values, `set` and `mset`).
+/// One maximal 10 MiB value fits; `mset`'s 1000 x 10 MiB (10 GB) does not.
+pub(crate) const MAX_CACHE_WRITE_BYTES_PER_EXECUTION: u64 = 64 * 1024 * 1024;
+/// TTL applied to a write that names none (or `0`): no immortal keys.
+pub(crate) const DEFAULT_CACHE_TTL_SECS: u64 = 24 * 60 * 60;
+/// Ceiling on any TTL a module may set (`set`, `mset`, `expire`, `increment`).
+pub(crate) const MAX_CACHE_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// The TTL a write actually gets: `None`/`0` → default, else capped.
+pub(crate) fn effective_cache_ttl(ttl: Option<u32>) -> u64 {
+    match ttl {
+        None | Some(0) => DEFAULT_CACHE_TTL_SECS,
+        Some(secs) => u64::from(secs).min(MAX_CACHE_TTL_SECS),
+    }
+}
+
+/// Atomically charge `n` bytes against a per-execution write budget; `false`
+/// (nothing charged) once `cap` would be exceeded.
+pub(crate) fn reserve_cache_bytes(used: &std::sync::atomic::AtomicU64, n: u64, cap: u64) -> bool {
+    used.fetch_update(
+        std::sync::atomic::Ordering::AcqRel,
+        std::sync::atomic::Ordering::Acquire,
+        |cur| cur.checked_add(n).filter(|next| *next <= cap),
+    )
+    .is_ok()
+}
+
+/// `INCRBY` that also gives a key WITHOUT a TTL the default one, atomically —
+/// a bare `INCRBY` on a missing key creates an immortal counter.
+const INCR_WITH_TTL_LUA: &str = "local v = redis.call('INCRBY', KEYS[1], ARGV[1]) \
+     if redis.call('TTL', KEYS[1]) == -1 then redis.call('EXPIRE', KEYS[1], ARGV[2]) end \
+     return v";
+
+impl TalosContext {
+    /// Charge one cache call (and `write_bytes`) against this execution's
+    /// budgets; audits and returns `true` when REFUSED.
+    async fn cache_budget_refused(
+        &mut self,
+        op: &'static str,
+        target: &str,
+        write_bytes: u64,
+    ) -> bool {
+        let policy =
+            if !self.check_rate_limit(&self.cache_call_count, MAX_CACHE_CALLS_PER_EXECUTION) {
+                "cache-call-budget"
+            } else if write_bytes > 0
+                && !reserve_cache_bytes(
+                    &self.cache_write_bytes,
+                    write_bytes,
+                    MAX_CACHE_WRITE_BYTES_PER_EXECUTION,
+                )
+            {
+                "cache-write-byte-budget"
+            } else {
+                return false;
+            };
+        self.record_capability_denied(op, policy, target).await;
+        tracing::warn!(module_id = ?self.module_id, op, policy, "cache call refused: per-execution budget spent");
+        true
+    }
+}
+
 impl wit_cache::Host for TalosContext {
     async fn get(&mut self, key: String) -> Result<String, wit_cache::Error> {
         let __start = std::time::Instant::now();
@@ -104,6 +171,9 @@ impl wit_cache::Host for TalosContext {
                 return Err(wit_cache::Error::Operationfailed);
             }
 
+            if self.cache_budget_refused("cache-get", &key, 0).await {
+                return Err(wit_cache::Error::Operationfailed);
+            }
             let ns_key = namespaced_cache_key(self, &key);
             use redis::AsyncCommands;
             let mut conn = self
@@ -159,22 +229,23 @@ impl wit_cache::Host for TalosContext {
                 return Err(wit_cache::Error::Operationfailed);
             }
 
+            let write_bytes = (key.len() + value.len()) as u64;
+            if self
+                .cache_budget_refused("cache-set", &key, write_bytes)
+                .await
+            {
+                return Err(wit_cache::Error::Operationfailed);
+            }
             let ns_key = namespaced_cache_key(self, &key);
             use redis::AsyncCommands;
             let mut conn = self
                 .redis_conn()
                 .await
                 .map_err(|_| wit_cache::Error::Connectionfailed)?;
-            match ttl {
-                Some(secs) => conn
-                    .set_ex::<_, _, ()>(&ns_key, &value, secs as u64)
-                    .await
-                    .map_err(|_| wit_cache::Error::Operationfailed),
-                None => conn
-                    .set::<_, _, ()>(&ns_key, &value)
-                    .await
-                    .map_err(|_| wit_cache::Error::Operationfailed),
-            }
+            // Always SET EX: a `None` TTL gets the default, never "forever".
+            conn.set_ex::<_, _, ()>(&ns_key, &value, effective_cache_ttl(ttl))
+                .await
+                .map_err(|_| wit_cache::Error::Operationfailed)
         }
         .await;
 
@@ -204,6 +275,9 @@ impl wit_cache::Host for TalosContext {
                 return Err(wit_cache::Error::Operationfailed);
             }
 
+            if self.cache_budget_refused("cache-delete", &key, 0).await {
+                return Err(wit_cache::Error::Operationfailed);
+            }
             let ns_key = namespaced_cache_key(self, &key);
             use redis::AsyncCommands;
             let mut conn = self
@@ -246,6 +320,9 @@ impl wit_cache::Host for TalosContext {
         if key.is_empty() || key.len() > MAX_CACHE_KEY_BYTES {
             return false;
         }
+        if self.cache_budget_refused("cache-exists", &key, 0).await {
+            return false;
+        }
         let ns_key = namespaced_cache_key(self, &key);
         use redis::AsyncCommands;
         let Ok(mut conn) = self.redis_conn().await else {
@@ -271,13 +348,23 @@ impl wit_cache::Host for TalosContext {
             return Err(wit_cache::Error::Operationfailed);
         }
 
+        // A new counter is a write of its key.
+        if self
+            .cache_budget_refused("cache-increment", &key, key.len() as u64)
+            .await
+        {
+            return Err(wit_cache::Error::Operationfailed);
+        }
         let ns_key = namespaced_cache_key(self, &key);
-        use redis::AsyncCommands;
         let mut conn = self
             .redis_conn()
             .await
             .map_err(|_| wit_cache::Error::Connectionfailed)?;
-        conn.incr::<_, _, i64>(&ns_key, amount)
+        redis::Script::new(INCR_WITH_TTL_LUA)
+            .key(&ns_key)
+            .arg(amount)
+            .arg(DEFAULT_CACHE_TTL_SECS)
+            .invoke_async::<i64>(&mut conn)
             .await
             .map_err(|_| wit_cache::Error::Operationfailed)
     }
@@ -385,6 +472,10 @@ impl wit_cache::Host for TalosContext {
             }
         }
 
+        let target = format!("<batch:{}>", keys.len());
+        if self.cache_budget_refused("cache-mget", &target, 0).await {
+            return Err(wit_cache::Error::Operationfailed);
+        }
         let ns_keys: Vec<String> = keys.iter().map(|k| namespaced_cache_key(self, k)).collect();
         use redis::AsyncCommands;
         let mut conn = self
@@ -452,16 +543,31 @@ impl wit_cache::Host for TalosContext {
             }
         }
 
+        let write_bytes: u64 = pairs.iter().map(|(k, v)| (k.len() + v.len()) as u64).sum();
+        let target = format!("<batch:{}>", pairs.len());
+        if self
+            .cache_budget_refused("cache-mset", &target, write_bytes)
+            .await
+        {
+            return Err(wit_cache::Error::Operationfailed);
+        }
         let ns_pairs: Vec<(String, String)> = pairs
             .into_iter()
             .map(|(k, v)| (namespaced_cache_key(self, &k), v))
             .collect();
-        use redis::AsyncCommands;
         let mut conn = self
             .redis_conn()
             .await
             .map_err(|_| wit_cache::Error::Connectionfailed)?;
-        conn.mset::<_, _, ()>(&ns_pairs)
+        // MSET cannot carry a TTL, so write every pair as SET EX in one
+        // atomic pipeline: no immortal keys, same all-or-nothing shape.
+        let ttl = effective_cache_ttl(None);
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+        for (k, v) in &ns_pairs {
+            pipe.set_ex(k, v, ttl).ignore();
+        }
+        pipe.query_async::<()>(&mut conn)
             .await
             .map_err(|_| wit_cache::Error::Operationfailed)
     }
@@ -483,13 +589,18 @@ impl wit_cache::Host for TalosContext {
             return Err(wit_cache::Error::Operationfailed);
         }
 
+        if self.cache_budget_refused("cache-expire", &key, 0).await {
+            return Err(wit_cache::Error::Operationfailed);
+        }
         let ns_key = namespaced_cache_key(self, &key);
         use redis::AsyncCommands;
         let mut conn = self
             .redis_conn()
             .await
             .map_err(|_| wit_cache::Error::Connectionfailed)?;
-        conn.expire::<_, ()>(&ns_key, ttl as i64)
+        // `0` keeps Redis's meaning (expire now); anything else is capped.
+        let secs = u64::from(ttl).min(MAX_CACHE_TTL_SECS);
+        conn.expire::<_, ()>(&ns_key, secs as i64)
             .await
             .map_err(|_| wit_cache::Error::Operationfailed)
     }
@@ -553,5 +664,110 @@ mod namespaced_cache_key_tests {
         // The injected suffix is present but inert — Redis treats the
         // whole string as one opaque key.
         assert!(got.ends_with(injected));
+    }
+}
+
+#[cfg(test)]
+mod cache_budget_tests {
+    use super::*;
+    use std::sync::atomic::AtomicU64;
+
+    #[test]
+    fn no_write_is_immortal_and_ttls_are_capped() {
+        assert_eq!(effective_cache_ttl(None), DEFAULT_CACHE_TTL_SECS);
+        assert_eq!(effective_cache_ttl(Some(0)), DEFAULT_CACHE_TTL_SECS);
+        assert_eq!(effective_cache_ttl(Some(60)), 60);
+        assert_eq!(effective_cache_ttl(Some(u32::MAX)), MAX_CACHE_TTL_SECS);
+    }
+
+    #[test]
+    fn write_budget_refuses_past_the_cap_and_charges_nothing() {
+        let used = AtomicU64::new(0);
+        assert!(reserve_cache_bytes(
+            &used,
+            10 * 1024 * 1024,
+            MAX_CACHE_WRITE_BYTES_PER_EXECUTION
+        ));
+        // mset's worst case (1000 x 10 MiB) is refused outright.
+        assert!(!reserve_cache_bytes(
+            &used,
+            1000 * 10 * 1024 * 1024,
+            MAX_CACHE_WRITE_BYTES_PER_EXECUTION
+        ));
+        assert_eq!(
+            used.load(std::sync::atomic::Ordering::Relaxed),
+            10 * 1024 * 1024
+        );
+        assert!(!reserve_cache_bytes(
+            &used,
+            u64::MAX,
+            MAX_CACHE_WRITE_BYTES_PER_EXECUTION
+        ));
+    }
+
+    /// TEXTUAL pin: every method charges the budget, and no write path
+    /// can create a key without a TTL.
+    #[test]
+    fn source_pin_every_method_charges_the_budget() {
+        let src = include_str!("cache.rs");
+        let start = src.find("impl wit_cache::Host for TalosContext").unwrap();
+        // Production region only: this test's own needles must not match.
+        let end = src.find("#[cfg(test)]\nmod namespaced_cache_key_tests").unwrap();
+        let body = &src[start..end];
+        for op in [
+            "\"cache-get\", &key, 0",
+            "\"cache-set\", &key, write_bytes",
+            "\"cache-delete\", &key, 0",
+            "\"cache-exists\", &key, 0",
+            "\"cache-increment\", &key",
+            "\"cache-mget\", &target, 0",
+            "\"cache-mset\", &target, write_bytes",
+            "\"cache-expire\", &key, 0",
+        ] {
+            assert!(
+                body.contains(&format!("cache_budget_refused({op}")),
+                "{op} must charge the per-execution cache budget"
+            );
+        }
+        assert!(
+            !body.contains("conn.set::<"),
+            "a TTL-less SET is an immortal key"
+        );
+        assert!(!body.contains("conn.mset::<"), "MSET carries no TTL");
+    }
+
+    /// Behavioural: the budget is charged BEFORE any Redis connection, so a
+    /// spent budget refuses with no Redis configured at all.
+    #[tokio::test]
+    async fn a_spent_call_budget_refuses_before_redis() {
+        use wit_cache::Host;
+        let mut ctx = TalosContext::new(
+            crate::wit_inspector::CapabilityWorld::Cache,
+            vec![],
+            vec![],
+            128,
+            std::collections::HashMap::new(),
+            None,
+            None,
+            false,
+            None,
+            std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+            talos_workflow_job_protocol::LlmTier::Tier2,
+            None,
+        )
+        .expect("context builds");
+        ctx.cache_call_count.store(
+            MAX_CACHE_CALLS_PER_EXECUTION,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        assert!(matches!(
+            ctx.get("k".into()).await,
+            Err(wit_cache::Error::Operationfailed)
+        ));
+        assert!(!ctx.exists("k".into()).await);
+        assert!(matches!(
+            ctx.set("k".into(), "v".into(), None).await,
+            Err(wit_cache::Error::Operationfailed)
+        ));
     }
 }

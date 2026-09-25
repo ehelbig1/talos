@@ -505,8 +505,7 @@ impl TalosContext {
         host: &str,
         capability_label: &'static str,
     ) -> Result<(), &'static str> {
-        let bypass =
-            *ALLOW_PRIVATE_HOST_TARGETS && self.allowed_hosts.iter().any(|p| p != "*" && p == host);
+        let bypass = private_host_bypass_applies(&self.allowed_hosts, host);
         if bypass {
             tracing::debug!(
                 host,
