@@ -14,7 +14,9 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-function respondWith(errors: unknown[]) {
+function respondWith(
+  errors: Array<{ message: string; extensions?: Record<string, unknown> }>,
+) {
   vi.stubGlobal("document", { cookie: "talos_csrf_token=t" });
   server.use(
     http.get("*/auth/csrf", () => HttpResponse.text("ok")),
