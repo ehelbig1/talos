@@ -53,7 +53,9 @@ path at all.
 **Stated limits.** Path gating trusts the file list; the Rust→frontend coupling
 is covered because `talos-api`'s schema snapshot test pins
 `frontend/schema.graphql`, so a GraphQL change touches `frontend/`. The newest
-engineering-log split has no pinned commit until the next change pins it.
+engineering-log split had no pinned commit until the next change pinned it —
+closed the same day: `BASES` now names `1bd6015c` (#957's merge) as that
+split's commit.
 
 **Operator action required.** Enable the GitHub merge queue on `main` and make
 `Quality gate` the only required status check (see `docs/ci.md`).
