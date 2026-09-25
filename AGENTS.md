@@ -67,7 +67,7 @@ talos/
 | `make logs` | Follow logs from all services |
 | `make dev` | Start dev environment and follow frontend logs |
 | `make up-dev` | Build, start, and open an ngrok tunnel |
-| `make lint` | `cargo fmt --check` + `cargo clippy --workspace` |
+| `make lint` | rustfmt + structural lints + cargo-deny (fast; `make lint-full` adds workspace clippy) |
 | `make db-shell` | Open a psql shell against the dev database |
 | `make reset-db` | Drop and recreate the database (destroys data) |
 

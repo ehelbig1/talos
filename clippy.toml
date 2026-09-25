@@ -1,0 +1,30 @@
+# Clippy configuration for the whole workspace.
+#
+# ── disallowed-methods ──────────────────────────────────────────────────
+# "Never call X outside Y" rules that used to be grep checks in
+# scripts/lint-structural.sh. Clippy resolves the call by TYPE, so it also
+# catches what a grep cannot: a `use … as Alias`, a re-export under another
+# path, and the method called in UFCS form (`Type::method(&mut x, …)`).
+#
+# A sanctioned call site carries
+#     // disallowed-method: <path> — <reason>
+#     #[allow(clippy::disallowed_methods)]
+# on the smallest enclosing item. The structural check that owns each rule
+# (its number is in the reason below) verifies that every such allow names a
+# path from this file and sits in a file the rule sanctions
+# (scripts/lint-clippy-disallowed.py holds that table).
+#
+# Two limits of this mechanism, both measured on clippy 0.1.95:
+#   * a path that does not resolve is only a WARNING ("does not refer to a
+#     reachable function"), which `-D warnings` does NOT turn into an error —
+#     so a renamed method would silently drop its rule. quality.yml's clippy
+#     job fails on that warning text, and the owning structural check pins
+#     the workspace-owned methods to their definitions.
+#   * a trait-impl method (`<rhai::Engine as Default>::default`) cannot be
+#     named at all, silently. Check 63 keeps a textual leg for that spelling.
+disallowed-methods = [
+  { path = "talos_workflow_engine::ParallelWorkflowEngine::set_actor_id", reason = "check 29: stamps actor_id without the actor's ceilings — use talos_engine::actor_binding::apply_actor_to_engine (fail-closed to Tier-1) or the builder's with_actor_id(..) + for_workflow(..)" },
+  { path = "wasmtime::component::Component::new", reason = "check 53: Cranelift can PANIC on guest input — route through TalosRuntime::compile_component_guarded so a codegen panic is a per-job error, not a dead process" },
+  { path = "rhai::Engine::new", reason = "check 63: rhai's default engine println!s to stdout and has no op/depth/size caps — use talos_rhai_sandbox::sandboxed_engine(SandboxProfile::…); a compile-only syntax check may use Engine::new_raw()" },
+  { path = "talos_workflow_engine_nats::NatsNodeDispatcher::new", reason = "check 78: a hand-built dispatcher bypasses the production signing-key gate — build it with talos_engine::nats_run::build_nats_dispatcher" },
+]

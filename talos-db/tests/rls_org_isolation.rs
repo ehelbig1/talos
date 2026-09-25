@@ -1,3 +1,4 @@
+// ci-store: migrated — scripts/test-integration.sh runs this with that store (scripts/ci_test_targets.py)
 //! Proves the RFC 0004 org-isolation MECHANISM end-to-end against a live
 //! Postgres: `begin_org_scoped` + a `SET LOCAL app.current_org_id` GUC +
 //! an RLS policy, enforced under a NON-superuser role (the realistic

@@ -5796,6 +5796,8 @@ impl TalosRuntime {
     /// this file routes through here — do not call `Component::new`
     /// directly (an unguarded site reopens the worker-DoS surface; the
     /// structural lint `no_unguarded_component_new` enforces this).
+    // disallowed-method: wasmtime::component::Component::new — compile_component_guarded, the one call site, inside the panic guard
+    #[allow(clippy::disallowed_methods)]
     fn compile_component_guarded(
         &self,
         wasm_bytes: &[u8],
@@ -5814,7 +5816,7 @@ impl TalosRuntime {
                 // THIS is the guarded chokepoint (wrapped by guard_codegen_panic
                 // above); all other sites route here. Trailing marker keeps it on
                 // the call line so the line-based lint (check 53) sees the opt-out.
-                Component::new(&self.engine, wasm_bytes).map_err(Into::into) // allow-unguarded-component-new
+                Component::new(&self.engine, wasm_bytes).map_err(Into::into)
             }
         })
     }

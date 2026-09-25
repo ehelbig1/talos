@@ -1,3 +1,4 @@
+// ci-store: redis — scripts/test-integration.sh runs this with that store (scripts/ci_test_targets.py)
 //! Redis-backed integration tests for `idempotency_middleware` — the full
 //! HTTP-level behavior, not just the `begin`/`complete`/`release` primitive
 //! (which `redis_integration.rs` covers).

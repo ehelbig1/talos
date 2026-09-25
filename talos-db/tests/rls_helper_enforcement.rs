@@ -1,3 +1,4 @@
+// ci-store: migrated — scripts/test-integration.sh runs this with that store (scripts/ci_test_targets.py)
 //! Proves the PRODUCTION helper `talos_db::begin_tenant_read_scoped` (not a
 //! hand-written `SET LOCAL ROLE`) ENFORCES the RFC 0004 RLS policies when
 //! `TALOS_RLS_SET_ROLE=1` — even on a superuser connection (the in-cluster

@@ -1,3 +1,4 @@
+// ci-store: migrated — scripts/test-integration.sh runs this with that store (scripts/ci_test_targets.py)
 //! RFC 0004 M4 — end-to-end proof that `scratch_sessions` is RLS-enforced
 //! through the real `AdvancedRepository` methods, under a NON-superuser
 //! role (the production condition; a superuser would bypass RLS).

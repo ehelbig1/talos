@@ -1,3 +1,4 @@
+// ci-store: selfcontained — scripts/test-integration.sh runs this with that store (scripts/ci_test_targets.py)
 //! Postgres-backed integration test proving the `workflow_executions`
 //! tenant-isolation RLS policy actually isolates orgs — the most critical
 //! security property (a wrong policy is a cross-org data leak).

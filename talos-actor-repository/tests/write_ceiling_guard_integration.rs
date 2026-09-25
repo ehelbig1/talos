@@ -1,3 +1,4 @@
+// ci-store: selfcontained — scripts/test-integration.sh runs this with that store (scripts/ci_test_targets.py)
 //! Postgres-backed integration test for the write-ceiling GRANT guard
 //! (migration 20260709180000).
 //!

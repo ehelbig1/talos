@@ -1,3 +1,4 @@
+// ci-store: selfcontained — scripts/test-integration.sh runs this with that store (scripts/ci_test_targets.py)
 //! Postgres-backed integration test for `ActorRepository::check_execution_allowed`'s
 //! auto-suspend terminal-state guard (MCP-646).
 //!

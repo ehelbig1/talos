@@ -16,7 +16,61 @@
 # Requires Docker and sqlx-cli (`cargo install sqlx-cli`).
 #
 # Usage:  bash scripts/test-integration.sh   (or: make test-integration)
+#         TALOS_IT_SHARD=2/3 …   run one third of the work items (quality.yml)
+#         TALOS_IT_LIST_ONLY=1 … print this shard's work items and exit (no Docker)
 set -euo pipefail
+
+# ── Sharding ────────────────────────────────────────────────────────────────
+# TALOS_IT_SHARD=i/n runs every n-th work item starting at item i (1-based),
+# so quality.yml can split this suite across n runners. The work list below is
+# built in a fixed order, so the shards partition it exactly: every item runs on
+# exactly one shard, and `1/1` (the default, `make test-integration` locally) is
+# the whole suite. The services and databases above are cheap next to the
+# compile, so every shard builds its own; check 88's PREPARE probe is a
+# property of the tree, not of a shard, so only shard 1 runs it.
+SHARD="${TALOS_IT_SHARD:-1/1}"
+SHARD_I="${SHARD%%/*}"
+SHARD_N="${SHARD##*/}"
+if ! [[ "$SHARD_I" =~ ^[0-9]+$ && "$SHARD_N" =~ ^[0-9]+$ ]] || [ "$SHARD_I" -lt 1 ] || [ "$SHARD_I" -gt "$SHARD_N" ]; then
+    echo "✗ TALOS_IT_SHARD must be i/n with 1 <= i <= n (got '$SHARD')" >&2
+    exit 1
+fi
+
+# ── The work list ───────────────────────────────────────────────────────────
+# Test BINARIES are discovered, not listed: scripts/ci_test_targets.py reads
+# each tests/*.rs and classifies it (controller `mod common;` → ctrl,
+# `mod test_helpers;` → tc, `// ci-runner: integration-serial` → ctrl-serial,
+# `// ci-store: <store>` → store). Adding a test file is the whole
+# registration; there is no array here for parallel PRs to collide on.
+# The `lib:` items are library-test FILTERS (unit tests inside src/ that need
+# a live broker or Redis), which a directory walk cannot see — they stay
+# literal and change rarely.
+WORK=()
+while IFS=$'\t' read -r crate bin store; do
+    [ -n "$crate" ] && WORK+=("store|${crate}|${bin}|${store}")
+done < <(python3 scripts/ci_test_targets.py list store)
+WORK+=(
+    "lib|talos-envelope-seal|--lib|RFC 0010 P3 claim protocol [nats + redis]"
+    "lib|talos-workflow-engine-nats|--lib full_claim_loop|RFC 0010 P3 full dispatch→claim loop [nats]"
+    "lib|talos-rpc-subscribers|--lib kernel_two_replica|signed-RPC queue group [nats + nats-perm]"
+    "lib|talos-totp-2fa|--lib redis_lockout_tests|2FA cross-instance lockout [redis]"
+    "lib|talos-worker-runtime|--lib expose_limit_absence_tests|#661 expose-limit error-as-absence [redis]"
+)
+for cat in ctrl ctrl-serial tc; do
+    while IFS=$'\t' read -r crate bin; do
+        [ -n "$crate" ] && WORK+=("${cat}|${crate}|${bin}|")
+    done < <(python3 scripts/ci_test_targets.py list "$cat")
+done
+[ "${#WORK[@]}" -gt 0 ] || { echo "✗ empty work list — discovery is broken" >&2; exit 1; }
+
+if [ "${TALOS_IT_LIST_ONLY:-0}" = "1" ]; then
+    for idx in "${!WORK[@]}"; do
+        [ $(( idx % SHARD_N + 1 )) -eq "$SHARD_I" ] && printf '%s\n' "${WORK[$idx]}"
+    done
+    exit 0
+fi
+
+echo "▶ shard ${SHARD_I}/${SHARD_N}: $(( (${#WORK[@]} - SHARD_I) / SHARD_N + 1 )) of ${#WORK[@]} work items"
 
 REDIS_PORT="${TALOS_IT_REDIS_PORT:-16399}"
 PG_PORT="${TALOS_IT_PG_PORT:-15435}"
@@ -35,11 +89,12 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PG_USER="postgres"
 PG_PASS="test"
 
-# ── Reaping the TC_TESTS harness containers ────────────────────────────────
+# ── Reaping the testcontainer-harness containers ──────────────────────────
 #
-# The 14 TC_TESTS binaries at the bottom of this script self-provision their own
-# Postgres through controller/tests/test_helpers, which holds the handle in a
-# `static`. Statics are never dropped, testcontainers 0.23.3 has no reaper, and
+# The `tc` binaries (scripts/ci_test_targets.py — formerly the TC_TESTS array)
+# self-provision their own Postgres through controller/tests/test_helpers,
+# which holds the handle in a `static`. Statics are never dropped,
+# testcontainers 0.23.3 has no reaper, and
 # `AutoRemove` is hardcoded false — so before this each binary left one live
 # Postgres behind and one run of this script leaked >= 14 of them.
 #
@@ -171,9 +226,10 @@ wait_for "NATS-perm (TCP ${NATS_PERM_PORT})" 30 \
 PG_BASE="postgres://${PG_USER}:${PG_PASS}@127.0.0.1:${PG_PORT}"
 MIGRATED_URL="${PG_BASE}/talos"
 SELFCONTAINED_URL="${PG_BASE}/talos_sc"
-# Dedicated migrated DB for the controller DB-harness binaries (see CTRL_TESTS
-# below). They DELETE global tables in setup, so they get their own DB to stay
-# isolated from the shared 'talos' migrated tests.
+# Dedicated migrated DB for the controller DB-harness binaries (the `ctrl`
+# category, formerly the CTRL_TESTS array). They DELETE global tables in
+# setup, so they get their own DB to stay isolated from the shared 'talos'
+# migrated tests.
 CTL_URL="${PG_BASE}/talos_ctl"
 
 # Build a migrated DB. RFC 0009 phase 2: by default, load the baseline
@@ -206,45 +262,46 @@ echo "▶ creating 'talos_ctl' for the controller DB-harness binaries…"
 docker exec "$PG_NAME" psql -U "$PG_USER" -d talos -c "CREATE DATABASE talos_ctl" >/dev/null
 migrate_db talos_ctl "$CTL_URL"
 
-# Check 88 — every static sqlx statement must PREPARE against the migrated
-# schema. This is the ONLY place it runs with a database: `make lint` leaves
-# the DB leg off (`TALOS_LINT_SQL_PREPARE=1` is opt-in) and, measured
-# 2026-09-12, NOTHING set that variable — no workflow, no runner, no hook — so
-# the gate CLAUDE.md described as "make test-integration runs it against the
-# DB it already builds" had never run anywhere but a developer's shell. The
-# day that was found, #822 had dropped a table one live statement still
-# named, and the probe reported that line on its first run over the tree. The
-# roots mirror `scripts/lint-structural.sh` check 88 (every crate's `src/`
-# except `talos-statement-stats`, whose statements name a relation absent by
-# design). A missing `psql` is a FAILURE, not a skip: asked-for-and-unable-to-
-# run is a green tick over zero statements (checks 64/65).
-echo "▶ check 88: PREPARE every static sqlx statement against 'talos_ctl'…"
-if ! command -v psql >/dev/null 2>&1; then
-    echo "✗ psql is not on PATH — check 88 cannot run (install postgresql-client)" >&2
-    exit 1
+if [ "$SHARD_I" -eq 1 ]; then
+    # Check 88 — every static sqlx statement must PREPARE against the migrated
+    # schema. This is the ONLY place it runs with a database: `make lint` leaves
+    # the DB leg off (`TALOS_LINT_SQL_PREPARE=1` is opt-in) and, measured
+    # 2026-09-12, NOTHING set that variable — no workflow, no runner, no hook — so
+    # the gate CLAUDE.md described as "make test-integration runs it against the
+    # DB it already builds" had never run anywhere but a developer's shell. The
+    # day that was found, #822 had dropped a table one live statement still
+    # named, and the probe reported that line on its first run over the tree. The
+    # roots mirror `scripts/lint-structural.sh` check 88 (every crate's `src/`
+    # except `talos-statement-stats`, whose statements name a relation absent by
+    # design). A missing `psql` is a FAILURE, not a skip: asked-for-and-unable-to-
+    # run is a green tick over zero statements (checks 64/65).
+    echo "▶ check 88: PREPARE every static sqlx statement against 'talos_ctl'…"
+    if ! command -v psql >/dev/null 2>&1; then
+        echo "✗ psql is not on PATH — check 88 cannot run (install postgresql-client)" >&2
+        exit 1
+    fi
+    SQL_PREPARE_ROOTS=()
+    for d in controller worker talos-*; do
+        case "$d" in talos-statement-stats) continue ;; esac
+        [ -d "$d/src" ] && SQL_PREPARE_ROOTS+=("$d/src")
+    done
+    python3 scripts/lint-sql-prepare.py --self-test
+    python3 scripts/lint-sql-prepare.py "$CTL_URL" "${SQL_PREPARE_ROOTS[@]}"
+    # A probe that cannot reach a server must REFUSE, never pass (package BK,
+    # 2026-09-15): until then a wrong password, a missing database, a closed port
+    # and an unresolvable host all exited 0 with the same "scanned N statements"
+    # line as the run above. The run above uses a correct URL, so it cannot see
+    # that regression; this one points at a port nothing listens on and requires
+    # the harness-failure exit, 2 — not 0 (a pass) and not 1 (a finding).
+    set +e
+    python3 scripts/lint-sql-prepare.py "postgresql://talos@127.0.0.1:1/talos_ctl" "${SQL_PREPARE_ROOTS[@]}" >/dev/null 2>&1
+    unreachable_rc=$?
+    set -e
+    if [ "$unreachable_rc" -ne 2 ]; then
+        echo "✗ check 88's probe exited $unreachable_rc against an unreachable server (want 2)" >&2
+        exit 1
+    fi
 fi
-SQL_PREPARE_ROOTS=()
-for d in controller worker talos-*; do
-    case "$d" in talos-statement-stats) continue ;; esac
-    [ -d "$d/src" ] && SQL_PREPARE_ROOTS+=("$d/src")
-done
-python3 scripts/lint-sql-prepare.py --self-test
-python3 scripts/lint-sql-prepare.py "$CTL_URL" "${SQL_PREPARE_ROOTS[@]}"
-# A probe that cannot reach a server must REFUSE, never pass (package BK,
-# 2026-09-15): until then a wrong password, a missing database, a closed port
-# and an unresolvable host all exited 0 with the same "scanned N statements"
-# line as the run above. The run above uses a correct URL, so it cannot see
-# that regression; this one points at a port nothing listens on and requires
-# the harness-failure exit, 2 — not 0 (a pass) and not 1 (a finding).
-set +e
-python3 scripts/lint-sql-prepare.py "postgresql://talos@127.0.0.1:1/talos_ctl" "${SQL_PREPARE_ROOTS[@]}" >/dev/null 2>&1
-unreachable_rc=$?
-set -e
-if [ "$unreachable_rc" -ne 2 ]; then
-    echo "✗ check 88's probe exited $unreachable_rc against an unreachable server (want 2)" >&2
-    exit 1
-fi
-echo "  check 88 refuses an unreachable server (exit 2) ✓"
 
 export TALOS_TEST_REDIS_URL="redis://127.0.0.1:${REDIS_PORT}"
 export TALOS_TEST_NATS_URL="nats://127.0.0.1:${NATS_PORT}"
@@ -253,804 +310,53 @@ export TALOS_TEST_NATS_PERM_CONTROLLER_USER=it-controller
 export TALOS_TEST_NATS_PERM_CONTROLLER_PASSWORD=it-controller-pw
 export TALOS_TEST_NATS_PERM_WORKER_USER=it-worker
 export TALOS_TEST_NATS_PERM_WORKER_PASSWORD=it-worker-pw
-
-# crate : integration-test-binary : datastore (redis | migrated | selfcontained)
-TESTS=(
-    "talos-idempotency:redis_integration:redis"
-    "talos-idempotency:middleware_integration:redis"
-    "talos-tenancy:rls_integration:selfcontained"
-    "talos-actor-repository:budget_guard_integration:selfcontained"
-    # Sibling of budget_guard_integration, same self-contained schema shape.
-    # It was written after the June-2026 "every binary runs in CI" sweep and
-    # never got an entry, so the write-ceiling GRANT guard (the trigger that
-    # refuses a bulk `readonly -> write` escalation) had zero live coverage.
-    "talos-actor-repository:write_ceiling_guard_integration:selfcontained"
-    "talos-db:rls_helper_enforcement:migrated"
-    "talos-db:rls_org_isolation:migrated"
-    "talos-organizations:personal_org_resolution:migrated"
-    "talos-advanced-repository:scratch_rls:migrated"
-    "talos-execution-repository:crash_recovery:migrated"
-    # The attributed stale-execution sweep. Both properties it pins are SQL
-    # properties — "the last node that started and never reported" is a LATERAL
-    # over execution_events, and "the row finalized between the read and the
-    # write" is a status-guarded UPDATE — so only a live database can evaluate
-    # them. The wording itself is unit-tested in src/stale_sweep.rs.
-    "talos-execution-repository:stale_execution_sweep:migrated"
-    # Preview-vs-action scope pins: the per-user predicate on the pinned-module
-    # wasm write (a user-scoped read used to drive a cross-tenant UPDATE) and the
-    # age filter on the cleanup DELETE (which the find_unreferenced_modules
-    # survey has and the DELETE had lost). Both are SQL properties — a live
-    # database is the only thing that can evaluate a WHERE clause.
-    "talos-module-repository:preview_action_scope:migrated"
-    # Can user B resolve user A's private module by NAME? `modules.name` is
-    # unique only per user, and the two lookups behind
-    # `plan_and_execute_workflow`'s `module_name` resolution carried no owner
-    # predicate at all — a caller-supplied string became another tenant's
-    # module id (and, through the by-name row read, its description and
-    # required secrets). RLS cannot stand in for the predicate here: the
-    # policy keys on `org_id`, permits when `app.current_org_ids` is unset,
-    # and the app role carries `rolbypassrls`. Every property is a WHERE or
-    # ORDER BY clause, so only a live database can evaluate one.
-    "talos-module-repository:module_lookup_tenancy:migrated"
-    # "the row is absent" vs "we could not look". `ChannelStore::get_entry`
-    # folded `execute_op`'s Err(KeyNotFound) into an anyhow string, so
-    # Ok(None) was unreachable and three probe handlers answered a pool
-    # timeout with 404 "Watch not found" while three stop_watch paths
-    # answered one with Ok(()). Both halves are properties of a live
-    # database (a real SELECT missing a row; a real pool refusing).
-    "talos-integration-helpers:absence_vs_failure:migrated"
-    "talos-memory:integration:migrated"
-    "talos-system-repo:revocation_query:migrated"
-)
+CTRL_MASTER_KEY="00000000000000000000000000000000000000000000000000000000deadbeef"
 
 rc=0
-for entry in "${TESTS[@]}"; do
-    crate="${entry%%:*}"
-    rest="${entry#*:}"
-    test="${rest%%:*}"
-    store="${rest##*:}"
-    case "$store" in
-        redis)         db="" ;;
-        migrated)      db="$MIGRATED_URL" ;;
-        selfcontained) db="$SELFCONTAINED_URL" ;;
+ran=0
+for idx in "${!WORK[@]}"; do
+    [ $(( idx % SHARD_N + 1 )) -eq "$SHARD_I" ] || continue
+    ran=$((ran + 1))
+    IFS='|' read -r kind crate what extra <<< "${WORK[$idx]}"
+    echo
+    case "$kind" in
+        store)
+            case "$extra" in
+                redis|services) db="" ;;
+                migrated)       db="$MIGRATED_URL" ;;
+                selfcontained)  db="$SELFCONTAINED_URL" ;;
+                *) echo "✗ unknown store '$extra' for ${crate}::${what}" >&2; rc=1; continue ;;
+            esac
+            echo "▶ ${crate} :: ${what}  [${extra}]"
+            TALOS_TEST_DATABASE_URL="$db" cargo test -p "$crate" --test "$what" || rc=1
+            ;;
+        lib)
+            echo "▶ ${crate} ${what}  — ${extra}"
+            # shellcheck disable=SC2086  # `what` is a flag plus an optional filter
+            cargo test -p "$crate" $what || rc=1
+            ;;
+        ctrl|ctrl-serial)
+            threadflag=()
+            [ "$kind" = "ctrl-serial" ] && threadflag=(--test-threads=1)
+            echo "▶ controller :: ${what}  [migrated:talos_ctl template → per-test isolated DB]"
+            # ${arr[@]+…} guard: bash 3.2 (macOS default) treats an EMPTY array
+            # expansion as unbound under `set -u`.
+            DATABASE_URL="$CTL_URL" TALOS_MASTER_KEY="$CTRL_MASTER_KEY" \
+                cargo test -p controller --test "$what" -- ${threadflag[@]+"${threadflag[@]}"} || rc=1
+            ;;
+        tc)
+            # Self-provisions its own Postgres via testcontainers
+            # (controller/tests/test_helpers); ignores DATABASE_URL. One
+            # container per binary, several global writes → single-threaded.
+            echo "▶ controller :: ${what}  [testcontainers, single-threaded]"
+            TALOS_MASTER_KEY="$CTRL_MASTER_KEY" \
+                cargo test -p controller --test "$what" -- --test-threads=1 || rc=1
+            ;;
     esac
-    echo
-    echo "▶ ${crate} :: ${test}  [${store}]"
-    if ! TALOS_TEST_DATABASE_URL="$db" cargo test -p "$crate" --test "$test"; then
-        rc=1
-    fi
-done
-
-# ── RFC 0010 P3 (D3b) envelope-sealing claim protocol ───────────────────────
-# These are gated on TALOS_TEST_NATS_URL / TALOS_TEST_REDIS_URL (exported above)
-# and no-op under a plain `cargo test`. They exercise the claim protocol against
-# a REAL broker: the crypto seal/open, the Redis lease CAS, the responder↔worker
-# handshake, and the FULL dispatch→claim→seal→open loop through the real
-# NatsNodeDispatcher (asserting no plaintext ever crosses the wire).
-#   * `talos-envelope-seal`      — lib (RedisLease CAS) + `nats_claim_integration`
-#   * `talos-workflow-engine-nats` — the `full_claim_loop_over_live_nats` lib test
-echo
-echo "▶ RFC 0010 P3 claim protocol :: talos-envelope-seal  [nats + redis]"
-if ! cargo test -p talos-envelope-seal; then
-    rc=1
-fi
-echo
-echo "▶ RFC 0010 P3 claim protocol :: talos-workflow-engine-nats full loop  [nats]"
-if ! cargo test -p talos-workflow-engine-nats --lib full_claim_loop; then
-    rc=1
-fi
-
-# ── Worker NATS credential :: the broker agrees with the Rust model  [nats-perm]
-# `talos_workflow_job_protocol::nats_permissions` is the one home of the worker
-# credential's subscribe allow-list and publish deny-list, and its unit tests
-# pin the two checked-in `.conf` fragments to it byte-for-byte. Only a live
-# nats-server reading that fragment can prove the broker REFUSES what the model
-# says it refuses (a permission violation is an async -ERR, invisible to unit
-# tests), which is what this binary does — every subject in the table, each
-# with a control on the unrestricted credential, plus the two request/reply
-# shapes (controller→worker job on `_INBOX`, worker→controller RPC on `_WINBOX`).
-echo
-echo "▶ worker NATS credential permissions :: talos-workflow-engine-nats  [nats-perm]"
-if ! cargo test -p talos-workflow-engine-nats --test nats_worker_permissions; then
-    rc=1
-fi
-
-# ── Signed-RPC subscribers :: one replica serves each request  [nats + nats-perm]
-# Every controller replica binds the signed-RPC subjects. With a plain subscribe
-# the broker hands each worker request to ALL of them: measured 2026-09-19 with
-# two kernels on one subject, the replay guard's loser answered `Unauthorized`
-# ahead of the winner's reply for 199 of 199 requests while the write still
-# landed, and with the guard off both replicas executed (398 runs for 199
-# requests). Only a live broker can show delivery counts; the fifth test drives
-# the worker credential on the permissioned broker.
-echo
-echo "▶ signed-RPC queue group :: talos-rpc-subscribers  [nats + nats-perm]"
-if ! cargo test -p talos-rpc-subscribers --lib kernel_two_replica; then
-    rc=1
-fi
-
-# ── Audit ledger stream is BOUNDED, and an existing unbounded one is updated  [nats]
-# The AUDIT_LEDGER JetStream stream was created with `..Default::default()` for
-# two months — no max_age, no max_msgs, no max_bytes — and kept every acked
-# message forever (58 978 / 31 MB on the reference deployment, 2026-09-13).
-# `get_or_create_stream` never touches an existing stream, so the bound has to
-# be applied in place; only a live JetStream can prove that path preserves the
-# messages already in the stream. Needs `-js` on the disposable broker above.
-echo
-echo "▶ audit ledger stream bound :: talos-audit-ledger  [nats]"
-if ! cargo test -p talos-audit-ledger --test audit_ledger_stream_bounds; then
-    rc=1
-fi
-
-# ── #661 error-as-absence :: the tier-2 expose_secret daily cap  [redis] ────
-# A Redis GET FAILURE used to read as "no counter yet today", which both allowed
-# the expose AND ran set_ex(key,1,86400), destroying the day's accumulated
-# count. The test induces a real per-command failure (the key is made a LIST, so
-# GET returns WRONGTYPE while the connection stays healthy) and asserts the call
-# returns Err AND leaves the key untouched. Named here, not merely gated on
-# TALOS_TEST_REDIS_URL, so it is real coverage rather than a green skip (the
-# workspace `--lib` run in quality.yml has no Redis and skips it).
-# ── 2FA lockout is SHARED across controller instances  [redis] ─────────────
-# The recorded finding "the 2FA lockout counter is per-process memory" is
-# refuted for production — the limiter is Redis-backed and production fails
-# closed without it — but nothing drove that path: the cross-instance lockout,
-# the shared counter and its clearing existed only as code. These drive the real
-# gate on two separate TotpService instances (separate DashMaps, separate
-# clients) against one Redis, including through `verify_2fa_login` itself.
-# Named here, not merely gated on TALOS_TEST_REDIS_URL, so it is real coverage
-# rather than a green skip (the workspace `--lib` run in quality.yml has no
-# Redis and skips it).
-echo
-echo "▶ 2FA cross-instance lockout :: talos-totp-2fa  [redis]"
-if ! cargo test -p talos-totp-2fa --lib redis_lockout_tests; then
-    rc=1
-fi
-
-echo
-echo "▶ #661 expose-limit error-as-absence :: talos-worker-runtime  [redis]"
-if ! cargo test -p talos-worker-runtime --lib expose_limit_absence_tests; then
-    rc=1
-fi
-
-# ── Controller DB-harness binaries ──────────────────────────────────────────
-# These predate the TALOS_TEST_DATABASE_URL convention: they read DATABASE_URL
-# directly via controller::db::init_pool, need a non-zero TALOS_MASTER_KEY
-# (SecretsManager rejects all-zero), and DELETE global tables in
-# setup_test_context — so they run SINGLE-THREADED against their OWN migrated DB
-# ('talos_ctl') to stay isolated from the shared-'talos' migrated tests above.
-# Brought into CI after their stale 2FA-context drift was fixed (PR #193); the
-# JWT secret is a hard-coded literal in the harness, so only the master key is
-# needed here. 64 hex = 32 bytes, non-zero.
-CTRL_MASTER_KEY="00000000000000000000000000000000000000000000000000000000deadbeef"
-CTRL_TESTS=(
-    # A cancel stops the ENGINE driving the run (not only the row and the
-    # workers), never for a non-owner; and a start row under a cancelled
-    # execution is reported born `cancelled`, which the engine refuses to
-    # dispatch (2026-09-25).
-    "execution_cancel_engine_stop_tests"
-    # `enqueue_workflow` dispatches only rows its queued->running claim won (a
-    # row cancelled while it waited was run anyway) and runs them as the
-    # gate-resolved actor (an enqueue naming no actor skipped the ceiling and
-    # ran unbound) — 2026-09-25. `common` (DATABASE_URL) harness; uses NATS when
-    # TALOS_TEST_NATS_URL is set, so CTRL_TESTS and not TC_TESTS (64b).
-    "enqueue_drain_tests"
-    # Privileged operations (key material, credential minting, capability
-    # grants, audit settings, ownership transfer) require a VERIFIED second
-    # factor: the gate matrix through the real schema, login/refresh flags, and
-    # enrolment signing out every earlier session (2026-09-18).
-    "privileged_second_factor_tests"
-    # The same gate's ADMITTING outcome on the production path: `permitted`
-    # and `not_enrolled` need a real users row, and without the first of them
-    # a recorder narrowed to refusals is invisible (measured survivor, DY).
-    "privileged_gate_permitted_tests"
-    # Three privilege paths closed 2026-09-25: an API key enrolling or
-    # verifying 2FA to mint a verified session, bcrypt run inline on the async
-    # runtime (and before the already-enrolled refusal), and a capability
-    # bootstrap re-armed by removing the last top grant / a self-revoke that
-    # widens the ceiling. Drives the real schema, TotpService, bootstrap and
-    # MCP handler.
-    "two_factor_session_tests"
-    # A user changing their own password: session gate, shared lockout, atomic
-    # revocation + audit row, conflict on a concurrent change (2026-09-18).
-    "password_change_tests"
-    # Credential and privilege changes are recorded in the same transaction as
-    # the change: API keys (once, not twice), capability grants on every
-    # surface incl. the bootstrap, 2FA enable/disable (2026-09-18).
-    "credential_audit_record_tests"
-    # Privilege changes (actor ceilings on both surfaces, module permissions,
-    # workflow actor binding, module capability world) record in the same
-    # transaction, with what they replaced (2026-09-19).
-    "privilege_audit_record_tests"
-    # The immutability triggers were BEFORE DELETE OR UPDATE ... FOR EACH ROW,
-    # and TRUNCATE fires no row trigger: it emptied an audit table with nothing
-    # raised. Drives TRUNCATE/DELETE/UPDATE against every immutable table on a
-    # migrated clone, pins that a table guarded on rows is guarded on TRUNCATE
-    # too (the invariant that outlives the list), and pins #264/#266 from the
-    # live catalog — an enforced delete action into a table that refuses DELETE
-    # makes the PARENT undeletable. `common` (DATABASE_URL) harness, so
-    # CTRL_TESTS and not TC_TESTS (64b).
-    "audit_immutability_tests"
-    # admin_event_log is append-only, so what a writer stores is what an
-    # auditor reads forever — and of four production writers exactly one both
-    # truncated and redacted. Drives the shared writer and the operator-CLI
-    # caller that wrote raw until package CH. `common` (DATABASE_URL) harness,
-    # so CTRL_TESTS and not TC_TESTS (64b).
-    "admin_event_writer_tests"
-    # Nothing on this platform could say which operator surface is slow: no
-    # per-tool series, no per-call line, and no pg_stat_statements (that last
-    # one is live from 2026-09-10; the counting here stays client-side because
-    # a cluster-wide cumulative view cannot attribute statements to ONE test).
-    # Drives the REAL
-    # `tools/call` chokepoint and asserts the series moved, that three invented
-    # tool names mint ONE `unknown` series (the cardinality guard), and the two
-    # statement-count fixes the measurements justified. `common` (DATABASE_URL)
-    # harness, so CTRL_TESTS and not TC_TESTS (64b).
-    "mcp_tool_instrument_tests"
-    # #786 turned pg_stat_statements COLLECTION on and shipped no reader.
-    # `get_sql_statement_report` is it, and the relation it reads is OPTIONAL by
-    # design — so the arm that regresses silently is the one where the extension
-    # is DROPPED and the report must say `available: false` rather than render
-    # an empty list of slow statements. Also drives the sanitiser END TO END: a
-    # real ANSI escape planted in a real column ALIAS (one of the three things
-    # pg_stat_statements does not normalise) must not reach the report. The
-    # crate is deliberately outside check 88's PREPARE roots, so this binary is
-    # the only thing that can say its SQL runs at all. `common` (DATABASE_URL)
-    # harness, so CTRL_TESTS and not TC_TESTS (64b).
-    "statement_stats_tests"
-    # ADAPTIVE_RANK_LOOKBACK_DAYS is documented as a [1, 3650]-day training
-    # window and a hardcoded row cap binds first — measured on the reference
-    # fleet, the configured 30 days was a fitted 6.56 and every value from 7 to
-    # 3650 produced a bit-identical model. The fit now records the window in
-    # DAYS as well as in rows; this pins the `sqlx::query_as` that carries it to
-    # the operator digest, whose failure mode is a silent NULL (check 88's
-    # class). `common` (DATABASE_URL) harness, so CTRL_TESTS and not TC_TESTS (64b).
-    "rank_training_window_disclosure_tests"
-    # A `sqlx::query("…")` statement is never schema-checked, so one naming a
-    # renamed column or a relation that never existed fails only at request
-    # time. Drives the REAL repository methods and the REAL statements against
-    # a migrated database; `common` (DATABASE_URL) harness, so CTRL_TESTS and
-    # not TC_TESTS (64b).
-    "dead_statement_tests"
-    # `updated_at` must date a user edit, not a maintenance write. Drives the
-    # REAL trigger with the REAL statements the background jobs issue, on the
-    # `common` (DATABASE_URL) harness — so it belongs here, not in TC_TESTS.
-    "updated_at_maintenance_tests"
-    # "scored" and "unscored" are decided from TWO timestamp columns with two
-    # writers that each stamp only their own. Drives the background
-    # recompute's VERBATIM statement plus the on-demand write-back method, on
-    # the `common` (DATABASE_URL) harness — CTRL_TESTS, not TC_TESTS (64b).
-    "readiness_scored_state_tests"
-    # A sub-workflow leaves no `workflow_executions` row, so the hygiene
-    # report's dormant list recommended deleting the flagship's daily child.
-    # Renders the REAL recommendation from a REAL HygieneReport; `common`
-    # harness, so CTRL_TESTS (64b).
-    "dormant_child_workflow_tests"
-    # The OTHER column. `workflows` carries two liveness columns and the dormant
-    # query read one: archiving never clears `is_enabled`, so 8 already-retired
-    # workflows were listed under a delete recommendation. Drives the REAL
-    # hygiene query, the REAL rendered recommendation, the child scan and the
-    # boot warmup, each with its own control; `common` harness, so CTRL_TESTS
-    # (64b).
-    "workflow_liveness_hygiene_tests"
-    # The DISPATCH half of the same pair. #774 taught the REPORT to read both
-    # columns and recorded that NO execution path filtered on `status` at all;
-    # this is the guard for the narrow gate that closed it. Drives the REAL
-    # admission chokepoint (rows asserted, not just the returned variant), the
-    # REAL `WorkflowGraphStore` reads and the REAL handoff read — each with an
-    # ACTIVE *and* a DRAFT control, because the decision was archived-only and a
-    # gate widened to `status = 'active'` must fail here. `common` harness, so
-    # CTRL_TESTS (64b).
-    "archived_dispatch_gate_tests"
-    # The same blindness on the OTHER draft population #758 called latent: the
-    # 7-day `stale_draft_workflows` list, which feeds fix_all's IRREVERSIBLE
-    # auto-delete and session_start's auto-archive. Drives the REAL fix_all
-    # planning path AND `confirm=true` against a real row; `common` harness,
-    # so CTRL_TESTS (64b).
-    "stale_draft_child_workflow_tests"
-    # The NON-destructive half of the same blindness: three readiness scorers
-    # and the reuse report score or count a child from a table that records no
-    # row for it. Drives the REAL scan query, the shared `score_readiness`, the
-    # background writer's verbatim UPDATE and the (previously dead) schedule
-    # exclusion; `common` harness, so CTRL_TESTS (64b).
-    "child_readiness_tests"
-    # RFC 0012 P2: the ANSWER to what child_readiness_tests could only disclose.
-    # A child with enough recorded runs in `sub_workflow_runs` is scored on the
-    # FULL scale with reliability and freshness MEASURED, and the hygiene rows
-    # read the ledger instead of the 5%-recall fuel-rollup proxy. Drives the
-    # real batched ledger read, the real basis decision, the real shared
-    # scorer and the real hygiene report; `common` harness, so CTRL_TESTS (64b).
-    "child_readiness_ledger_tests"
-    # The remainder #760 recorded and did not fix: the auto-archive sweep did
-    # not know about `is_substantive_workflow`, so ONE session_start response
-    # recommended publish_version for a draft and archived it. Drives the REAL
-    # SessionBriefService and the REAL sweep; `common` harness, so CTRL_TESTS
-    # (64b).
-    "session_start_substantive_draft_tests"
-    # The WORM audit-chain sweep enumerated `workflow_executions` while every
-    # ledger object key is `<module_executions.id>/…`, so with the verifier
-    # identity repaired it would have reported 37 silent `verified_ok` over
-    # prefixes holding nothing (`verify_chain` over zero events answers
-    # ok=true). Drives the sweep's EXTRACTED enumeration statement and
-    # `security_audit`'s candidate query against real seeded rows; `common`
-    # harness, so CTRL_TESTS (64b).
-    "audit_chain_population_tests"
-    # A read that FAILED must not render as a read that found nothing. Package
-    # 23 inventoried 210 collapsed awaited reads across the MCP + GraphQL
-    # handler surface and classified 110 of them as CLAIMS. This binary builds a
-    # REAL `McpState` and drives the production `dispatch` for three of the
-    # repaired ones with the relation the read names DROPPED, because the defect
-    # is what the handler BODY renders — checks 74b/79b both state that a guard
-    # at the read cannot see an answer discarded further down. `common`
-    # harness, so CTRL_TESTS (64b).
-    "swallowed_read_disclosure_tests"
-    # The fail-OPEN half of that same inventory: reads whose consumer is an
-    # ENFORCEMENT decision, where the default does not merely make a false
-    # statement, it LIFTS THE BOUND. Drives `run_sandbox` /
-    # `compile_custom_sandbox` (actor capability-world ceiling) and
-    # `tag_workflow` (the 100-tag cap) through the production dispatch with the
-    # relation the gate's read names removed. `common` harness, so CTRL_TESTS
-    # (64b).
-    "fail_open_gate_tests"
-    # A push channel bound to a module that is not there. The create gate (a
-    # `200 OK` on pristine main, with a row landed), the shared three-valued
-    # visibility read pinned against the DISPATCH-time load over the SAME rows,
-    # the operator inventory, and the hygiene finding — every one driven end to
-    # end, because the defect is what the create RETURNS and what the report
-    # SAYS. `common` (DATABASE_URL) harness, so CTRL_TESTS, not TC_TESTS (64b).
-    "push_channel_binding_tests"
-    # ONE TEST PER SITE for the nine fixes #779 shipped with none — it recorded
-    # in its own notes that reverting any of them left every test green. The
-    # rule here is per-SITE rather than per-SHAPE, because "the shape is pinned
-    # elsewhere" is what let `cleanup_module_versions` survive package 23's
-    # mutation. Drives the production dispatch for both halves of
-    # `add_node_to_workflow`'s capability-world gate, the approval WRITE,
-    # export/import, the webhook uniqueness pre-flight, `whoami`, the execution
-    # trace and RFC 0012 P3's own recorded call-site survivor, each with its
-    # control. `common` harness, so CTRL_TESTS (64b).
-    "unguarded_gate_survivor_tests"
-    # The five highest-ranked CLAIM sites the same inventory still carried: the
-    # workflow AUDIT TRAIL (a failed history read reading as "never published" /
-    # "never ran"), the lineage ROOT (a failed lookup substituting the
-    # execution's own id and rendering the standalone claim #771 removed),
-    # `watch_execution`'s event list, the module catalog's install advice, and
-    # the model card's promotion clearance. `common` harness, so CTRL_TESTS
-    # (64b).
-    "claim_read_disclosure_tier3_tests"
-    "api_key_tests"
-    # The MCP agent token is the third bearer credential and until 2026-09-13
-    # the only one whose refusals were counted nowhere: drives the production
-    # middleware on a router against real mcp_agents rows and reads
-    # talos_mcp_auth_total / rate_limit_hits_total{type=mcp_auth} as deltas.
-    "mcp_auth_metrics_tests"
-    # The refresh-token REUSE DETECTOR is the platform's only automated
-    # stolen-credential response, and until 2026-09-21 its whole output was
-    # one log line on a tracing target nothing subscribed to, with a read
-    # whose failure was indistinguishable from "no reuse". Drives the
-    # production AuthService::refresh_access_token through every arm —
-    # including both unreadable ones, via a renamed table — and reads
-    # talos_auth_token_reuse_total / _rotation_audit_arm_total as deltas.
-    # `common` harness, so CTRL_TESTS (64b).
-    "token_reuse_detector_tests"
-    # A read that FAILED is not a row that is ABSENT. Six ML handlers
-    # resolved a model with `let Ok(Some(m)) = … else { "Model not found" }`,
-    # and two service-layer belts swallowed the same Err into NotFound.
-    # Drives the production MCP dispatch and both services with the underlying
-    # table renamed away, with a foreign-row control for the enumeration
-    # property. `common` harness, so CTRL_TESTS (64b).
-    "ml_not_found_split_tests"
-    # Every workflow and module finalizer moves the execution count/duration
-    # families that closed check 58's dead-metric baseline, with the duration
-    # the finalizing UPDATE itself RETURNS; back-dated rows prove the observed
-    # value is the row's own age. `common` harness, so CTRL_TESTS (64b).
-    "execution_metrics_tests"
-    "chain_run_linkage_tests"
-    "admin_event_visibility_tests"
-    # `DatasetService::assign_splits` writes only rows whose split CHANGES:
-    # the holdout is deterministic, so a steady dataset used to rewrite every
-    # row per eval for a net change of zero (110 ms / 2 145 tuples / 2 373
-    # dirtied pages measured on a live copy). `common` harness, so CTRL_TESTS
-    # (64b).
-    "ml_split_churn_tests"
-    # A re-append of an unchanged example writes no row version and does not
-    # touch ml_datasets.updated_at, so the ML policy evaluator does not record a
-    # new model version for it (129 of ops-severity's 162 evaluations in 7 days
-    # were identical, 2026-09-14); the dataset-scoped content fingerprint is
-    # pinned through the real prepare path. `common` harness, so CTRL_TESTS (64b).
-    "ml_append_noop_tests"
-    # The upsert's two embedding clauses (a NULL vector arriving, a model
-    # change) against a local mock embedder the test toggles — its own binary
-    # because the embedding config is a process-wide OnceLock. CTRL_TESTS (64b).
-    "ml_append_embedding_arrival_tests"
-    # Eleven tables no Rust reads or writes are gone (migration 20260912100000);
-    # schema_audit_log and its DDL event trigger stay; every SOC 2 collector
-    # export statement PREPAREs. `common` harness, so CTRL_TESTS (64b).
-    "dead_schema_tests"
-    # The auditor-facing documents (SOC 2 mapping, threat model, security
-    # architecture) name exactly the immutable audit tables and the
-    # actor_budget_policies columns + defaults the migrated schema has
-    # (package BV). `common` harness, so CTRL_TESTS (64b).
-    "auditor_doc_claims_tests"
-    # MCP agent registration and revocation commit with exactly one
-    # admin_event_log record each, a refused change writes nothing, and a failed
-    # audit write leaves the credential untouched (package BW). `common` (64b).
-    "mcp_agent_lifecycle_audit_tests"
-    # No index is redundant by definition (exact duplicate or leading-prefix twin
-    # of a same-predicate sibling); 45 dropped by migration 20260912120000 and the
-    # two invariants pinned over the whole schema. `common` harness (64b).
-    "index_hygiene_tests"
-    # RLS on the three tenant-content tables scoped transactions read
-    # (workflow_versions / execution_approvals / actor_action_log); parent-derived
-    # policies, migration 20260912130000. `common` harness (64b).
-    "rls_scoped_reader_tables_tests"
-    # The eleven RLS policies whose `org_id IS NULL → permit` arm admitted every
-    # row of a never-written column; re-keyed on user_id + parent, migration
-    # 20260912140000. `common` harness (64b).
-    "rls_permit_arm_retired_tests"
-    # secrets: the dead `user_id` column, its three indexes and the org-stamp
-    # trigger that RFC 0006 makes wrong are gone; owner_user_id / org_id indexed
-    # (migration 20260912150000). `common` harness (64b).
-    "secrets_owner_column_tests"
-    # ONE home for the dispatcher-side workflow-failure finalizer (counted); the
-    # actor repository's completion delegates to the counted engine finalizer.
-    # `common` harness (64b).
-    "workflow_failure_finalizer_tests"
-    # The archive's status CHECK equals the live table's (three widenings of the
-    # live constraint never reached the archive; migration 20260912160000).
-    # `common` harness (64b).
-    "archive_status_check_parity_tests"
-    "api_auth_integration_test"
-    "integration_mcp_tests"
-    "auth_concurrency_tests"
-    "security_isolation_tests"
-    "governance_tests"
-    "scheduler_tests"
-    # The scheduler's dispatch PHASE, read from a real clone: a row 70 min
-    # overdue on a non-boot poll is `catchup` (the 2026-09-10 host-resume
-    # herd, which the boot-only classification labelled `steady`); a row 5 s
-    # overdue is `steady`; the boot flag wins over both. Drives the verbatim
-    # due-claim SQL, whose `overdue_secs` projection no unit test can see.
-    # `common` harness, so CTRL_TESTS (64b).
-    "scheduler_catchup_phase_tests"
-    # The deployment-wide execution pause (package BF, 2026-09-14): its writer
-    # bound TEXT into jsonb and had never succeeded, and the scheduler, webhook
-    # router and Gmail push never read it. Drives the one home, the row-creation
-    # chokepoint and the scheduler's defer-not-drop claim against a real clone.
-    "execution_pause_tests"
-    # An approval decision is FINAL (package BH, 2026-09-15): GraphQL
-    # approve/deny could overwrite a decided approval. Drives the guarded
-    # production write, the owner-only "already decided" answer and the
-    # trigger that refuses any writer changing a decision.
-    "approval_decision_finality_tests"
-    # `graph_json` read-modify-writes are compare-and-set on `graph_version`
-    # (2026-09-25): two overlapping graph edits used to each write their own
-    # copy and the later silently discarded the earlier. Drives the repository
-    # CAS, the trigger that owns the column, the GraphQL expected version, and
-    # a real MCP handler racing a committed edit (row lock + pg_stat_activity,
-    # no timing). `common` harness, so CTRL_TESTS (64b).
-    "graph_version_tests"
-    "workflow_version_tests"
-    # #609's closing provenance test (measurement PR 3, D7). Gated here on
-    # arrival rather than later: it is the ONLY coverage of the promoted-vs-
-    # latest attribution in SQL, and an ungated integration binary is one that
-    # silently rots (the PR #181/#182 lesson).
-    "ml_measurement_provenance_tests"
-    # ── The ml_* / report-quality siblings (gated 2026-07-30) ───────────────
-    # Every one of these was written AFTER the June-2026 "100% of tests/-dir
-    # binaries run in CI" sweep and landed in a directory that no runner
-    # enumerated, so they compiled at authoring time and then ran NOWHERE.
-    # Most of them were last EDITED before #520/#527/#607/#609 reworked
-    # talos-ml, and three of the four defects found when they were finally
-    # executed had been sitting latent for weeks.
-    # `ml_registry_tenancy_tests` is the load-bearing one: it is the ONLY
-    # guard on the app-layer
-    # `AND user_id = $2` predicate in ModelRegistry::{resolve_by_name,
-    # resolve_by_id,list_models} — cross-tenant model resolution on the
-    # talos.ml.predict serving path is invisible to RLS on a superuser pool.
-    # Check 64 (scripts/lint-structural.sh) now fails the lint if a new
-    # tests/*.rs binary appears without a runner entry, so this class of
-    # decay can't silently re-open.
-    "ml_registry_tenancy_tests"
-    "ml_correction_tests"
-    "ml_dedupe_tests"
-    "ml_lifecycle_tests"
-    "ml_backend_selection_tests"
-    "report_quality_signals_tests"
-    "ml_digest_tests"
-    "ml_delete_tests"
-    "ml_fewshot_tests"
-    "ml_provision_tests"
-    # The 2026-07-30 promotion-legibility binary: drives run_policy_tick for
-    # real so the ROTATION cursor and the EVAL-ATTEMPT clock are read back as
-    # two separate columns. Pure tests of `should_evaluate` cannot catch a
-    # caller that feeds it the wrong column — which is exactly the defect that
-    # left one model five days and 161 examples past its last policy verdict.
-    "ml_promotion_legibility_tests"
-    # #750: the write-ceiling enforcement posture's DB round trip. Uses the
-    # `common` DATABASE_URL harness, so it belongs in CTRL_TESTS and not
-    # TC_TESTS (sub-leg 64b). It is the only coverage of the parts BETWEEN the
-    # pure summariser and the worker's body shape: that the registration write
-    # persists both bits, unswapped, on both the `register` and `register_tofu`
-    # arms, and that a re-registration overwrites a stale claim including back
-    # to NULL.
-    "worker_write_ceiling_reporting_tests"
-    # ── Tenancy / crypto / status-drift siblings (gated 2026-07-30) ─────────
-    # Same story: isolated-DB-harness binaries that never had a runner entry.
-    # Three guard a security boundary directly — github_app_tenancy_tests
-    # (cross-user GitHub App installation-token minting), oauth_flow_tests
-    # (state-token single-use + provider scoping, i.e. the OAuth CSRF gate),
-    # integration_state_crypto_tests (per-slot AAD threading). The other
-    # three are correctness/drift guards: memory_get_entry_tests (the
-    # agent-memory get-entry read path), module_execution_status_tests and
-    # execution_status_transition_tests (both exist precisely to fail when a
-    # schema/enum or status-guard pair diverges).
-    "github_app_tenancy_tests"
-    "oauth_flow_tests"
-    # GitHub App installation takeover + consent-completion CSRF (2026-09-25):
-    # drives the REAL connect service through connect → setup → authorized
-    # against a loopback github.com, asserting on ROWS that a spoofed setup
-    # `installation_id` moves nothing, that GitHub access alone cannot take an
-    # installation from an active owner, and that a URL minted in one browser
-    # cannot be completed in another. `common` (DATABASE_URL) harness.
-    "github_connect_flow_tests"
-    "integration_state_crypto_tests"
-    "memory_get_entry_tests"
-    "module_execution_status_tests"
-    "execution_status_transition_tests"
-    # What `module_executions.duration_ms` MEANS (2026-08-31). The engine
-    # measures each dispatch monotonically and a BEFORE UPDATE trigger used to
-    # overwrite it with a wall-clock subtraction, so on a suspending host the
-    # column recorded sleep as work. The discarding was done by the DATABASE —
-    # no pure-Rust test can see it, and only a real Postgres carrying the real
-    # trigger can prove a supplied duration survives AND an unsupplied one is
-    # still derived.
-    "module_execution_duration_tests"
-    # What `module_executions.error_type` MEANS (2026-09-04). The column had
-    # five writers and none covered a module that RAN and FAILED, so 59 of 59
-    # failed rows stored NULL while `ModuleExecution.errorType` published the
-    # field over GraphQL. Needs a real Postgres because the derivation is
-    # bound inside `record_completed`'s UPDATE: a pure-Rust test proves the
-    # classifier, only the round trip proves the value is bound and survives.
-    "module_execution_error_type_tests"
-    # Package 31 (2026-09-08): the next tier of the read inventory's CLAIM
-    # sites. Nine of the ten repaired sites are driven through the REAL MCP
-    # dispatch (and one through the real GraphQL schema) with the relation each
-    # read names REMOVED, which is the only way to make a production read fail
-    # deterministically. Needs the `common` DATABASE_URL harness, so CTRL_TESTS
-    # and not TC_TESTS (sub-leg 64b).
-    "claim_read_disclosure_tier4_tests"
-    # The LAST tier of the read inventory's CLAIM sites. Almost every one needs
-    # one read of a table to succeed and the NEXT read of the same table to
-    # fail, so the injection is `ALTER TABLE … DROP COLUMN` rather than a table
-    # drop (package 31 measured that a CASCADE can break an unrelated lookup and
-    # pass a test for the wrong reason). `common` (DATABASE_URL) harness, so
-    # CTRL_TESTS and not TC_TESTS (64b).
-    "claim_read_disclosure_tier5_tests"
-    # RFC 0012's child-run ledger. A sub-workflow leaves no
-    # `workflow_executions` row, so `sub_workflow_runs` is the only evidence it
-    # ran — and every question this PR answers is a round trip: which row the
-    # real chokepoint wrote, which policy applies to it, and which rows the
-    # retention purge selects. Uses the `common` DATABASE_URL harness, so
-    # CTRL_TESTS and not TC_TESTS (sub-leg 64b).
-    "child_run_ledger_tests"
-    # RFC 0012 P3. The cascading-failure check's verdict is now a UNION of two
-    # tables, and the half that matters is the DATABASE's: which rows the
-    # grouped ledger query returns under RLS for the CALLER, what an absent key
-    # means, and where the seven-day window cuts. `common` (DATABASE_URL)
-    # harness, so CTRL_TESTS and not TC_TESTS (64b).
-    "cascading_risk_ledger_tests"
-    # RFC 0012 P3. The SLA monitor and the SLA report now measure over both
-    # tables through one repository read; the UNION SQL, its window and its
-    # per-source split can only be observed against a real Postgres. Also pins
-    # the NULL-webhook threshold row that used to panic the monitor's decode.
-    "sla_ledger_tests"
-    "execution_archive_read_tests"
-    # The same question one table over (2026-08-31). `execution_events.
-    # duration_ms` was derived by a BEFORE INSERT trigger from two event
-    # timestamps while the engine already held a monotonic `Instant` reading
-    # at two of the three emit sites. Same reason a real Postgres is required:
-    # the discarding is the DATABASE's, and the sentinel/derivation split can
-    # only be observed through the round trip.
-    "execution_event_duration_tests"
-    # Where a wasm.log line lands, and what the writer reports when it lands
-    # nowhere (2026-07-30). Needs a real Postgres because the thing under test
-    # IS the `WHERE EXISTS` guard on the log INSERT — the predicate that
-    # silently discarded every Loop-body iteration's logs while `add_log`
-    # returned Ok. A mock cannot fail the way the real statement failed.
-    "wasm_log_routing_tests"
-    # Two controller replicas relaying `wasm.log.*` (2026-09-20). Drives the
-    # production `talos_wasm_log_relay::spawn_wasm_log_relay` twice on the live
-    # broker with TWO databases holding the same execution ids: each line is
-    # stored by exactly one replica, both replicas broadcast every line, a
-    # line that lands nowhere is counted once, and a control shows two plain
-    # subscribers double the rows. Needs `TALOS_TEST_NATS_URL` + the `common`
-    # harness, so CTRL_TESTS (sub-leg 64b).
-    "wasm_log_relay_tests"
-    "job_result_observer_tests"
-    # Shutdown drain (2026-09-21): a controller waits for the runs it is
-    # driving, fails only its OWN leftovers, and never a sibling's run.
-    "shutdown_drain_tests"
-    # cleanup_workflows carries the delete guards (2026-09-21).
-    "cleanup_workflows_guard_tests"
-    # The dashboard delete carries the child-reference guard (2026-09-21).
-    "graphql_delete_child_guard_tests"
-    "workflow_delete_audit_tests"
-    "module_delete_audit_tests"
-    "last_detached_records_tests"
-    # The fleet lease for periodic background loops (2026-09-20). Two pools on
-    # one database stand in for two controller replicas: one holds a period,
-    # the other is refused even with no lock held (the case an advisory lock
-    # gets wrong), a lapsed lease is taken over in place, sixteen concurrent
-    # claims yield one holder, and an unreadable lease is not a claim.
-    "background_lease_tests"
-    # Google Calendar watch create / renew with two controller replicas
-    # (2026-09-20). `events.watch` mints a new Google-side channel per call, so
-    # the count a fake Google sees IS the defect: two services on two pools of
-    # one database must register once on create and once on renew, the loser is
-    # handed the winner's channel, and a renewal that waited must not act on
-    # the row it read before waiting. Also drives `acquire_fleet` directly.
-    "gcal_watch_fleet_lock_tests"
-    # The LLM / ML background loops run once per configured interval for the
-    # fleet (2026-09-21). Before the lease every one of them swept everything
-    # on EVERY controller boot: their tickers fire at start and they select
-    # "least recently processed first" with no due-test. Spawns each PRODUCTION
-    # scheduler twice on one database and reads the stamp its sweep leaves;
-    # the control lapses the lease and requires the next boot tick to sweep.
-    "leased_llm_loops_tests"
-    # The `__memory_write__` write-ceiling gate (#750). Needs a real Postgres
-    # because the property under test is "no actor_memory ROW" — the thing a
-    # silent drop and a correct refusal both produce, distinguished only by the
-    # refusal record. Drives the real engine + real ControllerNodeHook.
-    # `common` harness ⇒ CTRL_TESTS, not TC_TESTS (sub-leg 64b).
-    "write_ceiling_memory_write_tests"
-    # Sibling of the above, deliberately a SEPARATE binary: the engine strips a
-    # refused envelope before the hook sees it, so the hook's own gate is
-    # unreachable from that binary (mutation-proved: neutering it leaves that
-    # binary green). This one calls the hook directly, the way test_module
-    # does. Also a separate PROCESS, because the memory crypto hook is a
-    # process-wide OnceLock.
-    "write_ceiling_hook_gate_tests"
-    # #754: the THIRD surface of the same control — the signed-RPC mutation
-    # routes (`talos.memory.op` Set/Delete, `talos.integration_state.op`
-    # Set/Delete, a mutating `talos.database.query`). Deliberately a separate
-    # binary again, for the same OnceLock reason as the two above, and because
-    # it is the only one that drives a real NATS round trip: it publishes a
-    # SIGNED request at the live subscriber and asserts on the DATABASE. Needs
-    # `TALOS_TEST_NATS_URL` — exported above for both loops — in addition to
-    # the `common` DATABASE_URL harness, so CTRL_TESTS and not TC_TESTS
-    # (sub-leg 64b). Fails on pristine main by assertion (`left: 1, right: 0`).
-    "rpc_write_ceiling_tests"
-    # The signed-RPC data plane must be COUNTED, not only logged. Same harness
-    # and same reason as the binary above (real NATS + `common` DATABASE_URL,
-    # so CTRL_TESTS not TC_TESTS), but it asserts on the SERIES rather than on
-    # the database: `record_rpc_metric` recorded no metric at all until
-    # 2026-09-09, and check 58's stated limit is that it proves an increment
-    # SITE exists and never that anything reaches it.
-    "rpc_instrument_tests"
-    "env_vars"
-    # The hygiene report's stale-draft ADVICE and the DECISION it recommends
-    # (`fix_all`) were built on the same rows and disagreed: `fix_all` has
-    # excluded SUBSTANTIVE drafts since M-I (2026-05-06), the recommendation
-    # never learned it, so one response counted a substantive draft under
-    # "likely scaffolding leftovers … delete with `batch_delete_workflows`"
-    # while the tool it named refused that row. Drives BOTH paths over ONE
-    # report; fails on pristine main by assertion (`left:
-    # ["abandoned-scaffold", "half-built-brief"], right: ["abandoned-scaffold"]`).
-    # `common` DATABASE_URL harness ⇒ CTRL_TESTS, not TC_TESTS (sub-leg 64b).
-    "stale_draft_advice_agreement_tests"
-    # Package BM (2026-09-15): MCP clone_actor and GraphQL cloneActor share one
-    # implementation — ceiling gate, actor limit, grant/budget/policy copy.
-    # `common` DATABASE_URL harness ⇒ CTRL_TESTS, not TC_TESTS (sub-leg 64b).
-    "actor_clone_parity_tests"
-    # Package CC: approval policies on unevaluated triggers are refused.
-    "approval_policy_trigger_refusal_tests"
-    # Package CD: on_budget_exceeded=alert raises an ops alert; every refusal is counted.
-    "actor_budget_alert_tests"
-    "actor_budget_coverage_tests"
-    # BR: the grant CHECK equals ACTOR_CEILING_WORLDS; one ceiling read.
-    "capability_grant_world_check_tests"
-    # 2026-09-25: the sub-workflow binding reads actors.http_verb_ceiling, so a
-    # stricter child is not handed the parent's POST override.
-    "subworkflow_verb_ceiling_binding_tests"
-    # 2026-09-25: create_workflow_from_spec compiles through InlineCompileService,
-    # refuses a taken name, never grants "*" hosts, role-gates each world.
-    "create_workflow_from_spec_gate_tests"
-)
-# 'talos_ctl' is now the migrated TEMPLATE: setup_test_context clones it into a
-# private per-test database (controller/tests/common::isolated_db_pool), so the
-# binaries run multi-threaded with no shared-state cleanup. The one exception is
-# env_vars, which mutates the global DATABASE_URL/ALLOWED_ORIGIN process env and
-# must keep its tests single-threaded within the shared test process.
-for ctest in "${CTRL_TESTS[@]}"; do
-    threadflag=()
-    [ "$ctest" = "env_vars" ] && threadflag=(--test-threads=1)
-    echo
-    echo "▶ controller :: ${ctest}  [migrated:talos_ctl template → per-test isolated DB]"
-    # ${arr[@]+…} guard: bash 3.2 (macOS default) treats an EMPTY array
-    # expansion as unbound under `set -u` and aborts the whole script here.
-    if ! DATABASE_URL="$CTL_URL" TALOS_MASTER_KEY="$CTRL_MASTER_KEY" \
-        cargo test -p controller --test "$ctest" -- ${threadflag[@]+"${threadflag[@]}"}; then
-        rc=1
-    fi
-done
-
-# ── Testcontainers-based controller binaries ────────────────────────────────
-# These self-provision their OWN Postgres via testcontainers (controller/tests/
-# test_helpers) — they IGNORE DATABASE_URL and the shared 'talos*' DBs above, so
-# they only need a Docker daemon (already used by this script) + a non-zero
-# TALOS_MASTER_KEY for any SecretsManager construction. Run single-threaded:
-# each binary shares one container across its tests and several do global writes.
-# All currently green (47 tests across auth / oauth / org-RBAC / registry-access /
-# secrets — security-critical surfaces); gated here so they can't silently rot
-# the way the DB-harness + Phase-5 binaries did. The test_helpers harness shares
-# only the container (one fresh pool per test) so they no longer flake.
-TC_TESTS=(
-    "auth_tests"
-    "oauth_tests"
-    "oauth_scoped_token_tests"
-    "organization_tests"
-    "registry_access_tests"
-    "registry_tests"
-    "secrets_tests"
-    # ── Per-org root-DEK (v4) cutover binaries (gated 2026-07-30) ───────────
-    # These four are the ONLY end-to-end coverage that encryption-at-rest
-    # actually writes format v4 under the right org's root DEK (actor_memory
-    # write + re-encrypt sweep, module_executions payloads, workflow output).
-    # Their own header comments asserted "Env-gated (runs in quality.yml)" —
-    # which was FALSE: no runner named them. The comments now say what is
-    # true. They use the testcontainers harness (test_helpers), not the
-    # DATABASE_URL harness, so they belong in this block.
-    "actor_memory_dek_tests"
-    "actor_memory_sweep_dek_tests"
-    "module_payload_dek_tests"
-    "workflow_output_dek_tests"
-    # ── Module-payload retention sweep (added 2026-08-27) ───────────────────
-    # Proves what the sweep REFUSES to touch: non-terminal rows, and the whole
-    # completed corpus of a rarely-run module (the case an age-only policy
-    # would silently empty). Nulling an AEAD payload is irreversible, so these
-    # are the only guards there are.
-    "module_payload_retention_tests"
-    # ── Module-execution ROW retention sweep (added 2026-08-28) ─────────────
-    # The strictly-more-destructive sibling of the sweep above: it DELETEs rows
-    # and CASCADEs their `module_execution_logs` children, leaving NO tombstone
-    # — so unlike the payload sweep there is nothing queryable after the fact to
-    # tell a deleted execution from one that never ran. Proves what it refuses
-    # to touch: non-terminal rows, rows whose parent workflow execution is still
-    # alive, and the completed replay corpus of a rarely-run module (whose
-    # oldest rows ARE its whole corpus).
-    "module_execution_retention_tests"
-    # ── Execution retention: ONE path, two tiers (added 2026-09-04) ─────────
-    # The archive had held 0 rows across the platform's entire history: a
-    # 6-hourly plain DELETE spawned before the daily archival sweep deleted
-    # exactly the rows archival existed to move, and the archival statement
-    # could not have worked anyway (32 live columns vs 25 archive columns is a
-    # PARSE-time error, raised on every tick since 2026-03-26 and discarded by
-    # `if let Ok(r) = result`). Nothing could tell: `list_archived_executions`
-    # reported "none" forever and no metric or log moved.
-    # `archive_schema_parity_in_the_database` is the standing gate the three
-    # hand-written `sync_archive_*` migrations never had — it fails the moment
-    # a column is added to workflow_executions and not to the archive.
-    "execution_retention_tests"
-    # ── Archived is not absent (added 2026-09-04) ───────────────────────────
-    # #746's first successful archival pass moved 96 executions into
-    # `workflow_executions_archive`; within the hour every by-id reader
-    # answered "Execution not found or access denied" for one of them — a
-    # sentence whose BOTH clauses are false for an archived row. These drive
-    # the three-way `ExecutionRepository::lookup_execution` and, more
-    # importantly, the RLS backstop the archive never had: measured before
-    # this change, `workflow_executions_archive` had relrowsecurity=false and
-    # zero policies while holding real tenant ciphertext, so the app-layer
-    # `AND user_id = $2` was the only tenancy guard on it.
-)
-for tctest in "${TC_TESTS[@]}"; do
-    echo
-    echo "▶ controller :: ${tctest}  [testcontainers, single-threaded]"
-    if ! TALOS_MASTER_KEY="$CTRL_MASTER_KEY" \
-        cargo test -p controller --test "$tctest" -- --test-threads=1; then
-        rc=1
-    fi
 done
 
 echo
+echo "▶ shard ${SHARD_I}/${SHARD_N} ran ${ran} of ${#WORK[@]} work items"
 if [ "$rc" -eq 0 ]; then
     echo "✓ integration tests passed"
 else

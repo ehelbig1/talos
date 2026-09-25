@@ -129,7 +129,7 @@ Running the stack doesn't need a host toolchain, but developing Rust does:
 ```bash
 make check    # fast workspace type-check
 make build    # release build of all binaries
-make lint     # rustfmt + structural + clippy + cargo-deny (matches CI)
+make lint     # rustfmt + structural lints + cargo-deny (fast; lint-full adds clippy, as CI runs)
 make test     # full test suite via cargo-nextest
 ```
 

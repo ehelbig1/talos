@@ -1,3 +1,4 @@
+// ci-store: migrated — scripts/test-integration.sh runs this with that store (scripts/ci_test_targets.py)
 //! Can user B resolve user A's private module by NAME?
 //!
 //! `plan_and_execute_workflow` turns a caller-supplied `module_name` into a

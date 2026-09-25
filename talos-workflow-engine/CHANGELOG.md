@@ -9,6 +9,10 @@ Pre-1.0: breaking changes may occur in any minor version. Once the public
 API stabilizes alongside `talos-workflow-engine-core`, the crate will move to
 1.0 and normal semver applies.
 
+**Adding an entry?** Do not edit `[Unreleased]` below — add a fragment file to
+[`changelog.d/`](changelog.d/README.md). Fragments are folded in at release
+time by `scripts/changelog-fragments.py assemble talos-workflow-engine`.
+
 ## [Unreleased]
 
 ### Fixed

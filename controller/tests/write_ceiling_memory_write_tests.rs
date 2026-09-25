@@ -297,6 +297,8 @@ async fn register_crypto(pool: &sqlx::Pool<sqlx::Postgres>) {
 
 /// Run one node whose output carries `envelope`, under `ceiling`, through the
 /// real engine + real `ControllerNodeHook`. Returns the node's final output.
+// disallowed-method: talos_workflow_engine::ParallelWorkflowEngine::set_actor_id — test: binds the actor whose write ceiling is under test
+#[allow(clippy::disallowed_methods)]
 async fn run_one_node(
     pool: &sqlx::Pool<sqlx::Postgres>,
     actor: Uuid,

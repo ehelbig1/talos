@@ -1063,6 +1063,8 @@ mod single_node_ledger_finalize_tests {
         }
     }
 
+    // disallowed-method: talos_workflow_engine::ParallelWorkflowEngine::set_actor_id — test fixture: an engine with an arbitrary actor, no ceilings in play
+    #[allow(clippy::disallowed_methods)]
     fn engine_with_node(
         node_id: Uuid,
         module_id: Uuid,
@@ -1070,8 +1072,6 @@ mod single_node_ledger_finalize_tests {
     ) -> ParallelWorkflowEngine {
         let mut engine = ParallelWorkflowEngine::new();
         engine.set_user_id(Uuid::new_v4());
-        // Bare `set_actor_id` needs no opt-out: lint check 29 excludes
-        // `talos-workflow-engine/**` wholesale.
         engine.set_actor_id(Uuid::new_v4());
         engine.set_module_execution_store(store);
         engine.set_module_fetcher(Arc::new(
@@ -1732,6 +1732,8 @@ mod reserved_key_set_or_remove_tests {
         jobs[0].input_payload.clone()
     }
 
+    // disallowed-method: talos_workflow_engine::ParallelWorkflowEngine::set_actor_id — test fixture: an engine with an arbitrary actor, no ceilings in play
+    #[allow(clippy::disallowed_methods)]
     fn engine_for(node_id: Uuid, module_id: Uuid) -> ParallelWorkflowEngine {
         let mut engine = ParallelWorkflowEngine::new();
         engine.set_user_id(Uuid::new_v4());
@@ -1823,6 +1825,8 @@ mod capability_ceiling_dispatch_tests {
         }
     }
 
+    // disallowed-method: talos_workflow_engine::ParallelWorkflowEngine::set_actor_id — test fixture: an engine with an arbitrary actor, no ceilings in play
+    #[allow(clippy::disallowed_methods)]
     async fn dispatch(
         ceiling: Option<&str>,
         world: &str,

@@ -1,3 +1,4 @@
+// ci-store: migrated — scripts/test-integration.sh runs this with that store (scripts/ci_test_targets.py)
 //! Integration test for the MCP-agent revocation-definition query.
 //!
 //! `SystemRepository::list_active_agent_ids` is the single source of truth for

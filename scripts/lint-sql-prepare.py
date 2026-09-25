@@ -9,8 +9,9 @@ cleanly, ships, and fails at request time — where a caller's
 `.unwrap_or_default()` renders it as an empty list and an operator reads a
 determinate negative over SQL that has never once executed.
 
-This extracts every static statement and PREPAREs it. See CLAUDE.md check 88 for
-the measured numbers, the two false-positive classes and the stated limits.
+This extracts every static statement and PREPAREs it. See check 88 in
+scripts/lint-structural.sh for the measured numbers, the two false-positive
+classes and the stated limits.
 
 Usage:  lint-sql-prepare.py <database-url> <root>...
         lint-sql-prepare.py --self-test     (resolver fixture, no database)

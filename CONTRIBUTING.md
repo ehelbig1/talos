@@ -9,14 +9,16 @@ make setup      # generates .env with secrets, builds, starts the stack
 make hooks      # installs the git hooks (core.hooksPath=.githooks) — DO THIS ONCE
 ```
 
-`make hooks` is not optional in spirit: the **pre-push** hook runs the same CI-parity gates as `quality.yml` (`make lint` + `make lint-frontend`), and the **pre-commit** hook runs the fast secret/migration/compile checks. Skipping it means CI catches what your machine should have.
+`make hooks` is not optional in spirit: the **pre-commit** hook runs the secret/migration checks and `cargo check` of the crates you staged, and the **pre-push** hook runs the fast gates (`make lint` + `make lint-frontend`: rustfmt, the structural lints, cargo-deny, eslint, prettier). Workspace clippy and vitest are left to CI by default — `TALOS_PREPUSH_FULL=1 git push` runs them locally too. `quality.yml` is the authority either way; the hooks exist so the cheap mistakes fail in seconds instead of in a CI round trip. See [`docs/ci.md`](docs/ci.md).
 
 ## Before you open a PR
 
 ```bash
-make lint                 # rustfmt + WIT drift + the structural lints + clippy + cargo-deny
-make lint-frontend        # eslint + prettier + vitest
-cargo test --workspace    # (heavy; the pre-push hook + quality.yml also run this)
+make lint                 # fast: rustfmt + WIT drift + the structural lints + cargo-deny
+make lint-full            # the above + workspace clippy (-D warnings) — what CI runs
+make lint-frontend        # fast: eslint + prettier   (lint-frontend-full adds vitest)
+make test-changed         # nextest for only the crates you touched
+cargo test --workspace    # (heavy; quality.yml runs this on every PR)
 ```
 
 `bash scripts/lint-structural.sh --count` prints the number of structural checks; `bash scripts/lint-structural.sh` runs them. Each check is tied to a specific past regression and is documented inline in the script.

@@ -1,22 +1,25 @@
 #!/usr/bin/env bash
-# Pre-push gate — runs `make lint` + `make lint-frontend` so the CI-parity
-# quality gates can't silently regress between manual runs.
+# Pre-push gate — FAST by default: `make lint` + `make lint-frontend`.
 #
 # `make lint` covers: WIT drift, the structural lints (`bash
 # scripts/lint-structural.sh --count` for the live number — this comment
 # deliberately doesn't state one; a hardcoded count drifted 40→49 undetected
-# by 2026-07-01) including rustfmt (check 35) and
-# `cargo clippy --workspace --all-targets --no-deps -- -D warnings` (check 7,
-# TALOS_LINT_CLIPPY=1), and offline cargo-deny (bans/licenses/sources).
-# `make lint-frontend` covers: frontend eslint + prettier + vitest.
+# by 2026-07-01) including rustfmt (check 35), and offline cargo-deny
+# (bans/licenses/sources). `make lint-frontend` covers eslint + prettier.
 # Both are the single source of truth for "the gate" — this hook deliberately
 # does NOT re-spell the checks so it can't drift from the Make targets.
 #
-# Why pre-push (not pre-commit): a cold clippy build is 60-90s on a warm tree
-# and tens of minutes on a cold one. Running it on every commit is too heavy;
-# running it once before a push is the right trade-off. The existing
-# `.githooks/pre-commit` keeps the fast checks (secret/migration/compile) on
-# every commit.
+# WHAT IS NOT HERE BY DEFAULT, AND WHY (2026-09-25): workspace clippy (check
+# 7) and vitest. Until then this hook ran both on every push, so a one-line
+# Rust fix paid for a cold clippy build (minutes) that quality.yml then ran
+# AGAIN on the PR — the same check twice, the local copy bypassable with
+# --no-verify and the CI copy not. CI is the authority; the local gate's job
+# is to fail fast on the cheap mistakes (formatting, a structural rule, a lint
+# warning in the frontend). Opt back into the full set with
+#
+#     TALOS_PREPUSH_FULL=1 git push        # make lint-full + lint-frontend-full
+#
+# which is worth doing before a push you expect to be the last one on a PR.
 #
 # ── PATH GATING ──────────────────────────────────────────────────────────
 # Both gates used to run UNCONDITIONALLY, so a docs-only push paid for a
@@ -24,8 +27,8 @@
 # eslint+prettier+vitest suite. Each gate now runs only when the pushed range
 # touches files it can possibly have an opinion about.
 #
-# This does not weaken CI: `quality.yml` runs both suites unconditionally on
-# every PR to main and nightly, so anything skipped here is still gated
+# This does not weaken CI: `quality.yml` runs every suite a change can affect
+# on every PR and in the merge queue, so anything skipped here is still gated
 # before merge. What changes is only WHERE you find out.
 #
 # THE ONE REAL COUPLING, stated rather than buried: the frontend consumes
@@ -50,7 +53,7 @@
 set -euo pipefail
 
 if [ "${SKIP_LINT:-0}" = "1" ]; then
-    echo "pre-push: SKIP_LINT=1 set — skipping the make lint + lint-frontend gates."
+    echo "pre-push: SKIP_LINT=1 set — skipping the lint gates."
     exit 0
 fi
 
@@ -116,28 +119,36 @@ else
     fi
 fi
 
+if [ "${TALOS_PREPUSH_FULL:-0}" = "1" ]; then
+    rust_target=lint-full
+    frontend_target=lint-frontend-full
+else
+    rust_target=lint
+    frontend_target=lint-frontend
+fi
+
 if [ "$run_rust" -eq 1 ]; then
-    echo "pre-push: running 'make lint' (CI-parity gate; bypass with --no-verify)…"
-    if ! make -C "$repo_root" lint; then
+    echo "pre-push: running 'make $rust_target' (bypass with --no-verify; full set: TALOS_PREPUSH_FULL=1)…"
+    if ! make -C "$repo_root" "$rust_target"; then
         echo
-        echo "✗ pre-push: 'make lint' failed — push blocked."
+        echo "✗ pre-push: 'make $rust_target' failed — push blocked."
         echo "  Fix the reported issues, or for an emergency push bypass with:"
         echo "      git push --no-verify"
         exit 1
     fi
 else
-    echo "pre-push: no Rust/infra files in this push — skipping 'make lint' (quality.yml still runs it)."
+    echo "pre-push: no Rust/infra files in this push — skipping 'make $rust_target' (quality.yml still runs it)."
 fi
 
 if [ "$run_frontend" -eq 1 ]; then
-    echo "pre-push: running 'make lint-frontend' (eslint + prettier + vitest)…"
-    if ! make -C "$repo_root" lint-frontend; then
+    echo "pre-push: running 'make $frontend_target'…"
+    if ! make -C "$repo_root" "$frontend_target"; then
         echo
-        echo "✗ pre-push: 'make lint-frontend' failed — push blocked."
+        echo "✗ pre-push: 'make $frontend_target' failed — push blocked."
         echo "  Fix the reported issues, or for an emergency push bypass with:"
         echo "      git push --no-verify"
         exit 1
     fi
 else
-    echo "pre-push: no frontend/ files in this push — skipping 'make lint-frontend' (quality.yml still runs it)."
+    echo "pre-push: no frontend/ files in this push — skipping 'make $frontend_target' (quality.yml still runs it)."
 fi

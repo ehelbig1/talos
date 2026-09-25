@@ -32,7 +32,7 @@ export GIT_SHA_OVERRIDE   := $(shell git rev-parse --short=7 HEAD 2>/dev/null ||
 export GIT_DIRTY_OVERRIDE := $(shell test -n "$$(git status --porcelain 2>/dev/null)" && echo true || echo false)
 
 .PHONY: help setup up down rebuild restart logs ps shell doctor quickstart \
-        check build lint lint-frontend hooks test test-changed test-integration test-clean coverage-html audit check-catalog test-alert-rules ci \
+        check build lint lint-full lint-frontend lint-frontend-full hooks test test-changed test-integration test-clean coverage-html audit check-catalog test-alert-rules ci \
         drill drill-schedule drill-unschedule drill-schedule-status \
         offhost-upload offhost-backfill offhost-plan offhost-probe \
         offhost-schedule offhost-unschedule offhost-status \
@@ -252,7 +252,15 @@ check: ## Fast workspace type-check (no codegen — ~5× faster than full build)
 build: ## Release build of all workspace binaries on the host (Docker uses scripts/release.sh)
 	@cargo build --workspace --release
 
-lint: ## Rustfmt + WIT drift + structural + clippy (-D warnings) + offline cargo-deny — matches CI
+# `make lint` is the FAST gate the pre-push hook runs by default: rustfmt,
+# WIT drift, every structural check EXCEPT clippy, and offline cargo-deny —
+# seconds on a warm tree. `make lint-full` adds check 7's workspace clippy
+# (`--all-targets -D warnings`), minutes cold. CI (quality.yml) runs the full
+# set on every PR and is the authority; the local gates exist to fail fast on
+# the cheap things, not to repeat CI before every push.
+LINT_CLIPPY ?= 0
+
+lint: ## Fast gate: rustfmt + WIT drift + structural lints (no clippy) + offline cargo-deny
 	@printf '▶ wit sync\n'
 	@diff -q wit/talos.wit module-templates/wit/talos.wit >/dev/null 2>&1 \
 	    || { printf '\033[1;31m✗ wit/talos.wit and module-templates/wit/talos.wit have drifted\033[0m\n'; \
@@ -264,9 +272,9 @@ lint: ## Rustfmt + WIT drift + structural + clippy (-D warnings) + offline cargo
 # `cargo fmt --check` prints a diff and exits 1. Do NOT renumber the
 # structural checks to "tidy up" — meta-check 54 pins the count, and
 # CLAUDE.md's "N checks today" sentence to it.
-	@printf '▶ structural lints (incl. rustfmt + clippy --workspace --all-targets --no-deps -D warnings)\n'
+	@printf '▶ structural lints (incl. rustfmt%s)\n' "$(if $(filter 1,$(LINT_CLIPPY)), + clippy --workspace --all-targets --no-deps -D warnings,; clippy: make lint-full)"
 	@bash -n scripts/lint-structural.sh || { printf '\033[1;31m✗ scripts/lint-structural.sh does not parse — no check below ran\033[0m\n'; exit 1; }
-	@TALOS_LINT_CLIPPY=1 bash scripts/lint-structural.sh
+	@TALOS_LINT_CLIPPY=$(LINT_CLIPPY) bash scripts/lint-structural.sh
 	@printf '▶ cargo-deny (offline: bans + licenses + sources)\n'
 	@if command -v cargo-deny >/dev/null 2>&1; then \
 	    cargo deny check bans licenses sources; \
@@ -274,7 +282,20 @@ lint: ## Rustfmt + WIT drift + structural + clippy (-D warnings) + offline cargo
 	    printf '\033[1;33m⊘ cargo-deny not installed — skipping offline supply-chain check (advisories run in `make audit`)\033[0m\n'; \
 	fi
 
-lint-frontend: ## Frontend gate — eslint + prettier + vitest (skips if frontend/node_modules absent)
+lint-full: LINT_CLIPPY = 1
+lint-full: lint ## Everything `make lint` runs, plus workspace clippy (-D warnings) — what CI runs
+
+# Same split for the frontend: eslint + prettier are seconds, vitest is the
+# slow half and runs in CI's frontend job on every frontend change.
+lint-frontend: ## Frontend fast gate — eslint + prettier (skips if frontend/node_modules absent)
+	@if [ -d frontend/node_modules ]; then \
+	    printf '▶ frontend: eslint + prettier (vitest: make lint-frontend-full)\n'; \
+	    cd frontend && npm run lint; \
+	else \
+	    printf '\033[1;33m⊘ frontend/node_modules absent — skipping frontend gate (run: cd frontend && npm ci)\033[0m\n'; \
+	fi
+
+lint-frontend-full: ## Frontend full gate — eslint + prettier + vitest
 	@if [ -d frontend/node_modules ]; then \
 	    printf '▶ frontend: eslint + prettier + vitest\n'; \
 	    cd frontend && npm run lint && npm run test; \
@@ -285,8 +306,10 @@ lint-frontend: ## Frontend gate — eslint + prettier + vitest (skips if fronten
 hooks: ## Install git hooks (.githooks) — activates pre-commit + pre-push gates
 	@git config core.hooksPath .githooks
 	@printf '\033[1;32m✓ git hooks installed\033[0m (core.hooksPath=.githooks)\n'
-	@printf '  pre-commit: secret/migration/compile checks (every commit)\n'
-	@printf '  pre-push:   make lint + make lint-frontend — Rust (fmt/structural/clippy/deny) + frontend (eslint/prettier/vitest), every push\n'
+	@printf '  pre-commit: secret/migration checks + cargo check of the crates you staged\n'
+	@printf '  pre-push:   make lint + make lint-frontend (fast; no clippy, no vitest)\n'
+	@printf '              TALOS_PREPUSH_FULL=1 git push → make lint-full + make lint-frontend-full\n'
+	@printf '  CI (quality.yml) runs everything on every PR and is the authority.\n'
 	@printf '  bypass a push gate in an emergency with: git push --no-verify\n'
 
 test: ## Run the full test suite with cargo-nextest (fast local)
@@ -407,7 +430,7 @@ test-alert-rules: ## promtool `check rules` on both alert files + `test rules` o
 check-catalog: ## Compile every module-templates/* against current WIT (used by CI)
 	@bash scripts/check-catalog.sh
 
-ci: lint lint-frontend audit test check-catalog ## Full local gate matching GitHub Actions CI
+ci: lint-full lint-frontend-full audit test check-catalog ## Full local gate matching GitHub Actions CI
 	@printf '\033[1;32m✓ CI checks passed — safe to push\033[0m\n'
 
 ## ──── Ops ──────────────────────────────────────────────────────────
