@@ -110,6 +110,7 @@ plaintext URLs at boot (lint check 44, `tls-prod-gate-*`).
 | Variable | Default | Component | Purpose | Sensitive |
 |---|---|---|---|---|
 | `TALOS_MASTER_KEY` (+`_FILE`) | required when `KEK_PROVIDER=env`, AND under `KEK_PROVIDER=vault` unless `KEK_DISABLE_LEGACY=true` (the legacy dual-wrap provider still loads it and refuses boot without it) | controller | Master KEK for envelope encryption | 🔒 |
+| `TALOS_MASTER_KEY_PREVIOUS` (+`_FILE`) | unset (no previous key) | controller | The OLD master key during a staged env→env rotation: with `TALOS_MASTER_KEY=<new>` every controller unwraps DEKs new-then-previous, and `rotateMasterKey(<new>)` rewraps the rows still under this key. `rotateMasterKey` REFUSES unless the fleet runs in this posture. Remove it (and roll) once the rewrap reports done | 🔒 |
 | `KEK_PROVIDER` | `env` | controller | KEK provider kind (`env` / `vault`) | 🔒 |
 | `TALOS_ALLOW_ENV_KEK` | unset (refuse) | controller | Explicit opt-in required to boot production with an env-var KEK (lint check 45; fails closed) | 🔒 |
 | `KEK_DISABLE_LEGACY` | `false` | controller | Disable the legacy env-KEK dual-wrap path under `KEK_PROVIDER=vault` (`true`/`1`/`yes`/`on`; before 2026-09-12 only `true`/`1`) | 🔒 |
@@ -563,7 +564,7 @@ Where to SEE the effective window rather than infer it:
 | `GOOGLE_CLOUD_CLIENT_ID`/`_SECRET` ← `GOOGLE_CLIENT_ID`/`_SECRET` | GCP-specific vars override; generic `GOOGLE_*` is the fallback. Intentional layering, not deprecation. |
 | `BASE_URL` default drift | **RESOLVED 2026-07-24**: `talos-api-docs` previously read `BASE_URL` with a drifted `http://localhost:3000` default; it now calls the canonical `talos_config::get_base_url()` accessor (default `http://localhost:8000`, validated). One default everywhere. |
 | `TALOS_BASE_URL` vs `BASE_URL` | Distinct today: `TALOS_BASE_URL` is a platform-status display override (`talos-mcp-handlers`), `BASE_URL` builds real callback/webhook URLs. Confusable naming; prefer `BASE_URL` (via `get_base_url`) for anything functional. |
-| `<VAR>_FILE` / `<VAR>_PREVIOUS` families | Not duplicates — the Docker-secrets and key-rotation patterns: `JWT_SECRET(_FILE)`, `JWT_PRIVATE_KEY(_FILE)`, `JWT_PUBLIC_KEY(_FILE/_PREVIOUS)`, `JWT_ALGORITHM(_PREVIOUS)`, `WORKER_SHARED_KEY(_FILE/_PREVIOUS)`, `TALOS_AOT_HMAC_KEY(_PREVIOUS)`, `TALOS_AUDIT_SIGNING_KEY(_PREVIOUS)`, `TALOS_CONTROLLER_PUBLIC_KEY(_PREVIOUS)`, `TALOS_MASTER_KEY(_FILE)`, `VAULT_*(_FILE)`, `NATS_PASSWORD(_FILE)`. |
+| `<VAR>_FILE` / `<VAR>_PREVIOUS` families | Not duplicates — the Docker-secrets and key-rotation patterns: `JWT_SECRET(_FILE)`, `JWT_PRIVATE_KEY(_FILE)`, `JWT_PUBLIC_KEY(_FILE/_PREVIOUS)`, `JWT_ALGORITHM(_PREVIOUS)`, `WORKER_SHARED_KEY(_FILE/_PREVIOUS)`, `TALOS_AOT_HMAC_KEY(_PREVIOUS)`, `TALOS_AUDIT_SIGNING_KEY(_PREVIOUS)`, `TALOS_CONTROLLER_PUBLIC_KEY(_PREVIOUS)`, `TALOS_MASTER_KEY(_FILE/_PREVIOUS)`, `VAULT_*(_FILE)`, `NATS_PASSWORD(_FILE)`. |
 | `TALOS_MAX_CONCURRENT_EXECUTIONS` vs `TALOS_MAX_CONCURRENT_NODES` | Distinct knobs (execution-level vs node-level concurrency) — easily confused, not duplicates. |
 | `OLLAMA_URL` | Read in ≥3 crates (worker host LLM, talos-config memory loops, controller graph-RAG) with the same default — widely read, not drifted. |
 

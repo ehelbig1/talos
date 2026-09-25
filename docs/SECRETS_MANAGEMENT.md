@@ -652,6 +652,21 @@ export TALOS_MASTER_KEY=$(aws secretsmanager get-secret-value \
   --output text)
 ```
 
+**Rotating the master key (env KEK).** Rotation is staged through the
+environment, never swapped in memory — an in-process swap would leave other
+controller replicas, and the next restart, holding only the old key:
+
+1. On every controller set `TALOS_MASTER_KEY=<new>` and
+   `TALOS_MASTER_KEY_PREVIOUS=<old>`, then roll the fleet. Each replica wraps
+   new DEKs under the new key and unwraps new-then-previous.
+2. Call the `rotateMasterKey(newMasterKey: <new>)` mutation (platform admin +
+   second factor). It rewraps every DEK the new key cannot open and skips the
+   rest; it refuses unless step 1 is in place. If it fails partway, every DEK
+   is still readable — re-run it; rows already rewrapped are skipped.
+3. Remove `TALOS_MASTER_KEY_PREVIOUS` and roll again.
+
+Vault transit keys rotate in Vault (`vault write -f transit/keys/<name>/rotate`).
+
 ### 2. Never Log Secrets
 
 ```rust

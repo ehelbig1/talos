@@ -996,19 +996,29 @@ impl SecretsManager {
     /// Create a new data encryption key.
     /// Wrap with the active KEK provider and store opaque bytes.
     async fn create_new_dek(&self) -> Result<Uuid> {
-        let mut dek_bytes = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut dek_bytes);
+        let mut dek_bytes = Zeroizing::new([0u8; 32]);
+        rand::rngs::OsRng.fill_bytes(dek_bytes.as_mut());
 
+        let mut tx = self
+            .db_pool
+            .begin()
+            .await
+            .context("Failed to begin DEK creation transaction")?;
+        // Wrap AFTER the shared rotation lock: a KEK read before the lock
+        // could be the one `rotate_master_key` is retiring (C2).
+        Self::lock_out_master_key_rotation(&mut tx).await?;
         let active_wrap = self.current_kek()?.wrap_dek(&dek_bytes).await?;
-        let record = sqlx::query!(
-            "INSERT INTO encryption_keys (encrypted_key, algorithm, active) VALUES ($1, $2, true) RETURNING id",
-            &active_wrap,
-            "AES-256-GCM"
+        let id: Uuid = sqlx::query_scalar(
+            "INSERT INTO encryption_keys (encrypted_key, algorithm, active) \
+             VALUES ($1, 'AES-256-GCM', true) RETURNING id",
         )
-        .fetch_one(&self.db_pool)
-        .await?;
+        .bind(&active_wrap)
+        .fetch_one(&mut *tx)
+        .await
+        .context("Failed to insert new DEK")?;
+        tx.commit().await.context("Failed to commit DEK creation")?;
 
-        Ok(record.id)
+        Ok(id)
     }
 
     /// Get the active DEK (decrypt from database)
@@ -1131,11 +1141,31 @@ impl SecretsManager {
         Ok(dek)
     }
 
+    /// Advisory-lock key serialising DEK wrapping against `rotate_master_key`
+    /// ('DK_ROTAT' in ASCII). `rotate_master_key` holds it EXCLUSIVELY for
+    /// the whole rewrap; `rotate_dek` takes it exclusively; every other DEK
+    /// creation takes it SHARED (via [`Self::lock_out_master_key_rotation`])
+    /// and reads the KEK only after acquiring it, so no DEK can be wrapped
+    /// under a KEK the rewrap snapshot has already passed. Always taken
+    /// BEFORE the per-org lock, so the two classes cannot deadlock.
+    const ROTATE_DEK_LOCK_KEY: i64 = 0x44_4B_5F_52_4F_54_41_54;
+
+    /// Take [`Self::ROTATE_DEK_LOCK_KEY`] shared for the rest of `tx`.
+    async fn lock_out_master_key_rotation(tx: &mut sqlx::Transaction<'_, Postgres>) -> Result<()> {
+        sqlx::query("SELECT pg_advisory_xact_lock_shared($1)")
+            .bind(Self::ROTATE_DEK_LOCK_KEY)
+            .execute(&mut **tx)
+            .await
+            .context("Failed to acquire shared DEK rotation lock")?;
+        Ok(())
+    }
+
     /// Domain-separated advisory-lock CLASS for per-org DEK provisioning and
     /// rotation. Uses the TWO-int `pg_advisory_xact_lock(class, key)` form — a
-    /// distinct lock space from the single-bigint `ROTATE_DEK_LOCK_KEY` used by
-    /// the global `rotate_dek`, so a global rotation and a per-org rotation
-    /// never serialize against each other. ('DKOR' in ASCII.)
+    /// distinct lock space from the single-bigint `ROTATE_DEK_LOCK_KEY`, so two
+    /// orgs never serialize on it. (Per-org paths still take
+    /// `ROTATE_DEK_LOCK_KEY` SHARED first, so they wait out a global
+    /// `rotate_dek` / `rotate_master_key`.) ('DKOR' in ASCII.)
     const PER_ORG_DEK_LOCK_CLASS: i32 = 0x444B_4F52;
 
     /// Stable i32 advisory-lock key for an org (first 4 bytes of the UUID, LE).
@@ -1197,18 +1227,19 @@ impl SecretsManager {
     /// concurrency: serialized by a per-org advisory lock + an in-lock
     /// re-check, with `idx_one_active_dek_per_org` as the ultimate guard.
     /// Returns the active DEK id (existing-after-race or newly created).
-    /// Mirrors [`Self::rotate_dek`]'s wrap-before-lock discipline so the slow
-    /// KMS round-trip isn't held across the advisory lock.
+    /// Wraps under the shared rotation lock but BEFORE the per-org lock, so
+    /// the KMS round-trip does not serialise same-org provisioners.
     async fn create_new_dek_for_org(&self, org_id: Uuid) -> Result<Uuid> {
-        let mut dek_bytes = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut dek_bytes);
-        let active_wrap = self.current_kek()?.wrap_dek(&dek_bytes).await?;
+        let mut dek_bytes = Zeroizing::new([0u8; 32]);
+        rand::rngs::OsRng.fill_bytes(dek_bytes.as_mut());
 
         let mut tx = self
             .db_pool
             .begin()
             .await
             .context("Failed to begin per-org DEK transaction")?;
+        Self::lock_out_master_key_rotation(&mut tx).await?;
+        let active_wrap = self.current_kek()?.wrap_dek(&dek_bytes).await?;
 
         sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
             .bind(Self::PER_ORG_DEK_LOCK_CLASS)
@@ -1270,80 +1301,11 @@ impl SecretsManager {
     /// dual-wrap pattern without code changes here.
     async fn decrypt_dek(&self, key_id: Uuid, encrypted_key: &[u8]) -> Result<DataEncryptionKey> {
         let active = self.current_kek()?;
-        match active.unwrap_dek(encrypted_key).await {
-            Ok(bytes) => Ok(DataEncryptionKey {
-                id: key_id,
-                // bytes is already Zeroizing<Vec<u8>>; move it directly
-                // into the cache slot. Previous code did `.to_vec()`
-                // which copied into a plain Vec, defeating the
-                // zeroization guarantee provided by the KEK provider.
-                key: bytes,
-            }),
-            Err(active_err) => {
-                if let Some(m) = talos_metrics::global() {
-                    m.kek_decrypt_failures_total
-                        .with_label_values(&["active"])
-                        .inc();
-                }
-                if let Some(legacy) = self.current_legacy_kek() {
-                    tracing::debug!(
-                        %key_id,
-                        error = %active_err,
-                        "decrypt_dek: active provider failed; trying legacy"
-                    );
-                    let bytes = match legacy.unwrap_dek(encrypted_key).await {
-                        Ok(b) => b,
-                        Err(legacy_err) => {
-                            if let Some(m) = talos_metrics::global() {
-                                m.kek_decrypt_failures_total
-                                    .with_label_values(&["both"])
-                                    .inc();
-                            }
-                            return Err(legacy_err.context(format!(
-                                "decrypt_dek: both active ({}) and legacy ({}) providers failed for {}",
-                                active.name(),
-                                legacy.name(),
-                                key_id
-                            )));
-                        }
-                    };
-                    Ok(DataEncryptionKey {
-                        id: key_id,
-                        // Same zeroization preservation as the active path.
-                        key: bytes,
-                    })
-                } else {
-                    // No legacy provider configured, and the active one just
-                    // failed — so EVERY configured provider is exhausted and
-                    // this read is terminally broken, exactly the condition
-                    // `TalosKEKDecryptFailuresBoth` (critical, `rate(...{
-                    // provider="both"}[5m]) > 0` for 2m) exists to page on.
-                    //
-                    // Before 2026-07-31 only the active+legacy-both-failed
-                    // arm emitted `provider="both"`, so on the two SUPPORTED
-                    // postures that wire no legacy at all — `KEK_PROVIDER=env`
-                    // (the homelab path behind TALOS_ALLOW_ENV_KEK, which
-                    // hardcodes legacy=None) and `KEK_PROVIDER=vault` with
-                    // `KEK_DISABLE_LEGACY=true` (the documented Phase-5 end
-                    // state) — that label value could never be emitted and the
-                    // CRITICAL alert could never fire. A total KEK outage
-                    // surfaced only on the WARNING alert, whose own summary
-                    // says "legacy fallback is carrying the load" when there is
-                    // no legacy to carry it. Same defect class as the three
-                    // dead alerts fixed in #620: a selector that matches no
-                    // emittable series is a false assurance, and a live metric
-                    // with an unreachable label VALUE hides it from check 58,
-                    // which only sees the field.
-                    if let Some(m) = talos_metrics::global() {
-                        m.kek_decrypt_failures_total
-                            .with_label_values(&["both"])
-                            .inc();
-                    }
-                    Err(active_err
-                        .context(format!("decrypt_dek: active provider failed for {key_id}")))
-                }
-            }
-        }
+        let legacy = self.current_legacy_kek();
+        let key =
+            unwrap_dek_with_fallback(active.as_ref(), legacy.as_deref(), key_id, encrypted_key)
+                .await?;
+        Ok(DataEncryptionKey { id: key_id, key })
     }
 
     /// Store a new secret.
@@ -4652,14 +4614,8 @@ impl SecretsManager {
     /// `auditor` is an optional user ID for audit-logging who triggered the rotation.
     pub async fn rotate_dek(&self, auditor: Option<Uuid>) -> Result<Uuid> {
         use rand::RngCore;
-        let mut new_key = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut new_key);
-
-        // Wrap with the current KEK BEFORE acquiring the advisory lock so
-        // the slow KMS round-trip (Vault / AWS KMS) isn't held across the
-        // lock — same pattern as MCP-685/686 (api_keys + webhooks
-        // per-user cap TOCTOU, see `per_user_cap_toctou_pattern.md`).
-        let active_wrap = self.current_kek()?.wrap_dek(&new_key).await?;
+        let mut new_key = Zeroizing::new([0u8; 32]);
+        rand::rngs::OsRng.fill_bytes(new_key.as_mut());
 
         let mut tx = self
             .db_pool
@@ -4695,12 +4651,14 @@ impl SecretsManager {
         // with the SHA-256-derived keys used by `upsert_secret`
         // (those are `i64::from_le_bytes(hash[..8])` of an op-prefixed
         // SHA-256 — astronomically unlikely to match this literal).
-        const ROTATE_DEK_LOCK_KEY: i64 = 0x44_4B_5F_52_4F_54_41_54; // 'DK_ROTAT' in ASCII
         sqlx::query("SELECT pg_advisory_xact_lock($1)")
-            .bind(ROTATE_DEK_LOCK_KEY)
+            .bind(Self::ROTATE_DEK_LOCK_KEY)
             .execute(&mut *tx)
             .await
             .context("Failed to acquire rotate_dek advisory lock")?;
+        // Wrap under the lock: the same key excludes `rotate_master_key`, so
+        // the KEK read here cannot be one a concurrent rewrap is retiring.
+        let active_wrap = self.current_kek()?.wrap_dek(&new_key).await?;
 
         // Deactivate current active GLOBAL DEK. Scoped to `org_id IS NULL`:
         // an unqualified deactivate would clear EVERY org's active DEK too,
@@ -4781,8 +4739,8 @@ impl SecretsManager {
     ///
     /// Serialized by the per-org advisory lock (distinct lock space from the
     /// global `ROTATE_DEK_LOCK_KEY`); `idx_one_active_dek_per_org` is the
-    /// schema-level backstop. Wraps the new key BEFORE the lock (KMS round-trip
-    /// off the lock) exactly like `rotate_dek`.
+    /// schema-level backstop. Wraps under the shared master-key rotation lock,
+    /// before the per-org lock.
     pub async fn rotate_dek_for_org(
         &self,
         org_id: Uuid,
@@ -4798,15 +4756,16 @@ impl SecretsManager {
             return Ok(None);
         }
 
-        let mut new_key = [0u8; 32];
-        rand::rngs::OsRng.fill_bytes(&mut new_key);
-        let active_wrap = self.current_kek()?.wrap_dek(&new_key).await?;
+        let mut new_key = Zeroizing::new([0u8; 32]);
+        rand::rngs::OsRng.fill_bytes(new_key.as_mut());
 
         let mut tx = self
             .db_pool
             .begin()
             .await
             .context("Failed to begin per-org DEK rotation transaction")?;
+        Self::lock_out_master_key_rotation(&mut tx).await?;
+        let active_wrap = self.current_kek()?.wrap_dek(&new_key).await?;
 
         sqlx::query("SELECT pg_advisory_xact_lock($1, $2)")
             .bind(Self::PER_ORG_DEK_LOCK_CLASS)
@@ -5287,19 +5246,31 @@ impl SecretsManager {
             .collect::<Result<Vec<_>>>()
     }
 
-    /// Rotate the master key used for envelope encryption of DEKs.
+    /// Finish a master-key rotation: rewrap every DEK still under the
+    /// PREVIOUS master key onto the new one.
     ///
-    /// This re-encrypts ALL DEKs in the `encryption_keys` table from the old
-    /// master key to the new one, processed in batches of 50 to avoid long
-    /// transactions. After all DEKs are re-encrypted the in-memory master key
-    /// is swapped and the DEK cache is invalidated.
+    /// The key swap itself is NOT done in memory — an in-process swap is
+    /// unsafe on every deployment that matters: other controller replicas
+    /// keep only the old key and cannot unwrap a rewrapped DEK, and the next
+    /// restart reads the old `TALOS_MASTER_KEY` and loses every rewrapped
+    /// DEK. So this call requires the STAGED posture, and refuses otherwise:
     ///
-    /// Returns the number of DEKs that were re-encrypted.
+    /// 1. Set `TALOS_MASTER_KEY=<new>` and `TALOS_MASTER_KEY_PREVIOUS=<old>`
+    ///    on every controller and roll the fleet. Each replica now wraps new
+    ///    DEKs under the new key and unwraps with new-then-previous.
+    /// 2. Call this with the new key (proof the caller holds it). It rewraps
+    ///    the rows the new key cannot open and skips the rest.
+    /// 3. Remove `TALOS_MASTER_KEY_PREVIOUS` and roll again.
+    ///
+    /// Interrupted (DB error, pod kill) at any point, every row stays readable
+    /// — active opens rewrapped rows, previous opens the rest — and a retry
+    /// resumes: rows already under the new key are skipped. Returns the number
+    /// of DEKs rewrapped by THIS call.
     ///
     /// # Security
     /// - The new master key is NEVER logged.
-    /// - Each batch is wrapped in its own transaction for atomicity.
-    /// - If any DEK fails to re-encrypt the operation is aborted immediately.
+    /// - Holds `ROTATE_DEK_LOCK_KEY` exclusively for the whole rewrap, so no
+    ///   DEK is created or rotated while the snapshot is walked.
     pub async fn rotate_master_key(
         &self,
         new_master_key: Zeroizing<Vec<u8>>,
@@ -5308,297 +5279,125 @@ impl SecretsManager {
         if new_master_key.len() != 32 {
             return Err(anyhow!("New master key must be exactly 32 bytes"));
         }
-
-        // env→env rotation: build a fresh EnvKekProvider from the new
-        // bytes and rewrap every DEK through the trait. The current
-        // provider is loaded once and held for the duration; the new
-        // provider is published atomically at the end via the kek RwLock.
-        // For env→Vault (or any cross-provider) rotation, see the
-        // dual-wrap migration plan (Phase 3 of KEK→KMS).
-        //
-        // L-6: param is `Zeroizing<Vec<u8>>` so the caller's allocation
-        // is wiped on drop (and on any early return below). We clone
-        // the inner bytes (32 bytes — cheap) for the new provider; the
-        // EnvKekProvider's internal storage is also Zeroizing-wrapped
-        // (see `kek_provider.rs:97`), so the clone is wiped when the
-        // provider drops. The original Zeroizing wrapper wipes when
-        // this function returns.
-        let old_provider = self.current_kek()?;
-        // F7a: this function ALWAYS builds an `EnvKekProvider` from the new
-        // bytes, so it is an env→env rotation and nothing else. Pre-fix it
-        // never looked at what the ACTIVE provider was: on a
-        // `KEK_PROVIDER=vault` deployment it would have rewrapped every DEK
-        // under an in-memory env KEK and published that as the active
-        // provider — a silent Vault-transit → env downgrade, with the new
-        // master key living in process memory, which `docs/deployment.md`
-        // says production must never do. Refuse unless the active provider
-        // is `env`; the cross-provider path is the dual-wrap migration
-        // (`SecretsManager::with_kek_providers(new, Some(legacy))` — see
-        // its doc comment and Phase 3 of the KEK→KMS plan), not this call.
-        if !master_key_rotation_permitted_for_provider(old_provider.name()) {
+        let active = self.current_kek()?;
+        // F7a: env→env only. On a Vault deployment an env rotation would be a
+        // silent Vault-transit → in-memory-env downgrade.
+        if !master_key_rotation_permitted_for_provider(active.name()) {
             return Err(anyhow!(
                 "rotate_master_key only performs an env→env rotation, but the active KEK \
-                 provider is `{}`. Rotating it here would silently downgrade DEK wrapping to \
-                 an in-memory env KEK. Cross-provider (or Vault key) rotation goes through \
-                 the dual-wrap migration path: boot with the NEW provider active and the \
-                 OLD one as `kek_legacy` (`SecretsManager::with_kek_providers`), let rows \
-                 rewrap, then drop the legacy provider. For Vault transit, rotate the key \
-                 in Vault itself (`vault write -f transit/keys/<name>/rotate`).",
-                old_provider.name()
+                 provider is `{}`. For Vault transit, rotate the key in Vault itself \
+                 (`vault write -f transit/keys/<name>/rotate`); a cross-provider move boots \
+                 with the NEW provider active and the OLD one as legacy \
+                 (`SecretsManager::with_kek_providers`).",
+                active.name()
             ));
         }
-        let new_provider: Arc<dyn kek_provider::KekProvider> = Arc::new(
-            kek_provider::EnvKekProvider::from_raw_bytes_owned(new_master_key.to_vec())?,
+        let requested =
+            kek_provider::EnvKekProvider::from_raw_bytes_owned(new_master_key.to_vec())?;
+        let legacy = self.current_legacy_kek();
+        let posture = master_key_rotation_posture(
+            kek_providers_share_key(active.as_ref(), &requested)?,
+            legacy.is_some(),
         );
+        let legacy = match (posture, legacy) {
+            (MasterKeyRotationPosture::Staged, Some(legacy)) => legacy,
+            (posture, _) => return Err(anyhow!(posture.refusal())),
+        };
 
-        // MCP-701 (2026-05-13): cross-op race vs rotate_dek (MCP-700
-        // follow-up). Pre-fix, a `rotate_dek` that lands during
-        // `rotate_master_key`'s rewrap loop would wrap the new DEK with
-        // the OLD master key (`current_kek()` still returns OLD until
-        // the post-loop swap below), but the new DEK row is NOT in the
-        // `all_dek_ids` snapshot captured here. After the swap +
-        // `kek_legacy` clear, the new DEK's `encrypted_key` is
-        // unrecoverable (active provider fails to unwrap; legacy
-        // provider was cleared).
-        //
-        // Fix: acquire a session-level `pg_advisory_lock` on the same
-        // key `rotate_dek` uses (`ROTATE_DEK_LOCK_KEY` =
-        // 0x44_4B_5F_52_4F_54_41_54 = 'DK_ROTAT'). Held on a dedicated
-        // connection for the duration of this function. Sibling
-        // rotate_dek's `pg_advisory_xact_lock` on the same key will
-        // block until we release here, so any concurrent rotate_dek
-        // waits until our master-key swap is done and `kek_legacy` is
-        // cleared. The new DEK then gets wrapped with the NEW master
-        // (post-swap `current_kek()`) and is correctly recoverable.
-        //
-        // Multi-instance safe: the advisory lock lives in Postgres, so
-        // a rotate_dek on instance B blocks on a rotate_master_key
-        // running on instance A. No process-local Mutex required.
-        //
-        // **Important**: sqlx pool keeps physical Postgres connections
-        // alive across `PoolConnection` drops — the connection is
-        // returned to the pool, NOT closed. A session-level advisory
-        // lock would therefore PERSIST on the physical connection if
-        // we didn't explicitly unlock, leaking the lock to whatever
-        // pool consumer reuses that connection next. The IIFE pattern
-        // below ensures `pg_advisory_unlock` runs whether the inner
-        // block succeeds or returns an `Err` via `?` — without it,
-        // any `?`-bail mid-rotation would leak the lock and stall
-        // every subsequent `rotate_dek` until the connection is
-        // recycled out of the pool (which may never happen).
-        const ROTATE_DEK_LOCK_KEY: i64 = 0x44_4B_5F_52_4F_54_41_54;
+        // Session-level lock on a dedicated connection; released explicitly
+        // below because a pooled connection outlives `PoolConnection` drop.
         let mut lock_conn = self.db_pool.acquire().await.context(
             "Failed to acquire dedicated connection for rotate_master_key advisory lock",
         )?;
         sqlx::query("SELECT pg_advisory_lock($1)")
-            .bind(ROTATE_DEK_LOCK_KEY)
+            .bind(Self::ROTATE_DEK_LOCK_KEY)
             .execute(&mut *lock_conn)
             .await
             .context("Failed to acquire rotate_master_key advisory lock")?;
 
-        // The work below runs under the advisory lock. Wrapped in an
-        // async block so `?`-bails inside still flow through the
-        // explicit unlock at the bottom of this function.
         let rotation_result: Result<u64> = async {
-            // Snapshot the DEK ids AFTER acquiring the lock so any
-            // rotate_dek that landed between `current_kek()` and the lock
-            // acquire (and committed before our lock was granted) is
-            // captured by this snapshot rather than orphaned.
+            // Snapshot under the exclusive lock: every DEK creation takes the
+            // same key shared, so none can land between here and the end.
             let all_dek_ids: Vec<Uuid> = sqlx::query_scalar::<_, Uuid>(
-                "SELECT id FROM encryption_keys ORDER BY created_at ASC",
+                "SELECT id FROM encryption_keys ORDER BY created_at ASC, id ASC",
             )
             .fetch_all(&self.db_pool)
             .await
             .context("Failed to fetch encryption key IDs")?;
-
-            if all_dek_ids.is_empty() {
-                tracing::info!("No DEKs found to re-encrypt during master key rotation");
-                *self
-                    .kek
-                    .write()
-                    .map_err(|_| anyhow!("KEK provider lock poisoned"))? = new_provider;
-                return Ok(0);
-            }
-
             tracing::info!(
                 dek_count = all_dek_ids.len(),
                 auditor = ?auditor,
-                "Starting master key rotation"
+                "Starting master key rewrap"
             );
 
-            // PARTIAL-FAILURE SAFETY BELT (H-1).
-            //
-            // Install the OLD provider as `kek_legacy` BEFORE the rewrap loop
-            // begins. The decrypt_dek fallback path (above) tries the active
-            // provider first and falls back to legacy on failure — so:
-            //
-            //   * Rows already rewrapped (post-loop): unwrappable via NEW
-            //     active provider after the swap below.
-            //   * Rows not yet rewrapped (pre-loop or interrupted): still
-            //     wrapped with the OLD master key — unwrappable via legacy.
-            //
-            // Without this belt, an interrupted rotation (DB error mid-batch,
-            // OOM, pod kill) leaves SOME rows wrapped with NEW master and
-            // SOME with OLD; the manager's `kek` is still OLD because the
-            // swap below was never reached, so NEW-wrapped rows become
-            // un-decryptable until manual intervention. Operators can now
-            // simply retry — every prior partial-rotation row is recovered
-            // via the legacy path.
-            //
-            // We deliberately keep the belt installed even on the success
-            // path until the swap completes; clear it only after both the
-            // rewrap loop AND the active-provider swap have landed.
-            {
-                let mut legacy_guard = self
-                    .kek_legacy
-                    .write()
-                    .map_err(|_| anyhow!("KEK legacy provider lock poisoned"))?;
-                if legacy_guard.is_some() {
-                    // Mid-rotation crash + retry: legacy is already populated
-                    // from the previous attempt. Don't clobber it — that
-                    // legacy provider may still be load-bearing for a
-                    // small slice of rows that haven't reached the new
-                    // master yet. Bail loudly.
-                    return Err(anyhow!(
-                        "rotate_master_key: kek_legacy already populated — \
-                     a previous rotation may still be in progress or \
-                     awaiting recovery. Inspect dek_decrypt_failures \
-                     metrics and either complete the prior rotation or \
-                     manually clear the legacy slot before retrying."
-                    ));
-                }
-                *legacy_guard = Some(Arc::clone(&old_provider));
-            }
-
             const BATCH_SIZE: usize = 50;
-            let mut total_re_encrypted: u64 = 0;
-
+            let mut rewrapped: u64 = 0;
             for batch in all_dek_ids.chunks(BATCH_SIZE) {
                 let mut tx = self
                     .db_pool
                     .begin()
                     .await
                     .context("Failed to begin transaction for master key rotation batch")?;
-
                 for &dek_id in batch {
-                    // Fetch the wrapped DEK with row-level lock
                     let row = sqlx::query(
                         "SELECT encrypted_key FROM encryption_keys WHERE id = $1 FOR UPDATE",
                     )
                     .bind(dek_id)
                     .fetch_one(&mut *tx)
                     .await
-                    .context(format!("Failed to fetch DEK {} for re-encryption", dek_id))?;
-
-                    let encrypted_key: Vec<u8> = Row::get(&row, "encrypted_key");
-
-                    // Unwrap with old provider, rewrap with new provider.
-                    let plaintext =
-                        old_provider
-                            .unwrap_dek(&encrypted_key)
+                    .with_context(|| format!("Failed to fetch DEK {dek_id} for rewrap"))?;
+                    let encrypted_key: Vec<u8> = row.try_get("encrypted_key")?;
+                    let Some(new_stored) =
+                        rewrap_under_active(active.as_ref(), legacy.as_ref(), &encrypted_key)
                             .await
-                            .with_context(|| {
-                                format!("Failed to unwrap DEK {} with old provider", dek_id)
-                            })?;
-                    let mut dek_arr = [0u8; 32];
-                    if plaintext.len() != 32 {
-                        return Err(anyhow!(
-                            "Unwrapped DEK {} has unexpected length: {}",
-                            dek_id,
-                            plaintext.len()
-                        ));
-                    }
-                    dek_arr.copy_from_slice(&plaintext);
-                    let new_stored = new_provider.wrap_dek(&dek_arr).await.with_context(|| {
-                        format!("Failed to rewrap DEK {} with new provider", dek_id)
-                    })?;
-
-                    // Update in database
+                            .with_context(|| format!("Failed to rewrap DEK {dek_id}"))?
+                    else {
+                        continue;
+                    };
                     sqlx::query("UPDATE encryption_keys SET encrypted_key = $1 WHERE id = $2")
                         .bind(&new_stored)
                         .bind(dek_id)
                         .execute(&mut *tx)
                         .await
-                        .context(format!(
-                            "Failed to update DEK {} with new master key encryption",
-                            dek_id
-                        ))?;
-
-                    total_re_encrypted += 1;
+                        .with_context(|| format!("Failed to store rewrapped DEK {dek_id}"))?;
+                    rewrapped += 1;
                 }
-
                 tx.commit()
                     .await
                     .context("Failed to commit master key rotation batch")?;
-
-                tracing::info!(
-                    batch_size = batch.len(),
-                    total_re_encrypted,
-                    "Master key rotation batch committed"
-                );
             }
 
-            // All DEKs rewrapped successfully — atomically publish the new
-            // provider so subsequent reads use it.
-            *self
-                .kek
-                .write()
-                .map_err(|_| anyhow!("KEK provider lock poisoned"))? = new_provider;
-
-            // H-1: clear the partial-failure safety belt now that the swap
-            // has landed and every row is wrapped with the new master key.
-            // The fallback path is no longer needed; keeping legacy
-            // populated would mask a future genuine active-provider failure
-            // by silently succeeding via the (now-stale) old key.
+            // Every row now opens under the active key; keeping the previous
+            // key loaded would mask a future genuine active-KEK failure.
+            // (Other replicas keep theirs until step 3 removes it.)
             if let Ok(mut legacy_guard) = self.kek_legacy.write() {
                 *legacy_guard = None;
             }
-
-            // Invalidate the DEK cache so cached entries are re-decrypted with the new provider
-            self.dek_cache.clear();
-            publish_dek_cache_size(self.dek_cache.len());
-            {
-                let mut active_cache = self.active_dek_cache.write().await;
-                *active_cache = None;
-            }
-
             tracing::info!(
-                total_re_encrypted,
+                rewrapped,
                 auditor = ?auditor,
-                "Master key rotation completed successfully"
+                "Master key rewrap completed; remove TALOS_MASTER_KEY_PREVIOUS and roll"
             );
-
-            Ok(total_re_encrypted)
+            Ok(rewrapped)
         }
         .await;
 
-        // MCP-701: ALWAYS release the session-level advisory lock —
-        // whether the rotation succeeded, or any `?` inside the IIFE
-        // bailed. Without this, a mid-loop bail would leak the lock on
-        // the physical Postgres connection (sqlx pools reuse
-        // connections, so connection drop ≠ session end), and every
-        // subsequent `rotate_dek` would block on its
-        // `pg_advisory_xact_lock` until the connection is eventually
-        // recycled out of the pool — which may never happen on a
-        // long-lived controller process.
+        // ALWAYS release the session lock (MCP-701). If the unlock itself
+        // fails, detach the connection so it is closed rather than returned
+        // to the pool still holding the lock.
         let unlock_res = sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(ROTATE_DEK_LOCK_KEY)
+            .bind(Self::ROTATE_DEK_LOCK_KEY)
             .execute(&mut *lock_conn)
             .await;
         if let Err(e) = unlock_res {
             tracing::error!(
                 error = %e,
-                "rotate_master_key: failed to release advisory lock — \
-                 connection will be recycled out of the pool to be safe"
+                "rotate_master_key: failed to release advisory lock — closing the connection"
             );
-            // Defensively drop the connection rather than returning it
-            // to the pool with a potentially-held lock. PoolConnection
-            // doesn't expose explicit close, but dropping the inner
-            // connection via `detach` would; the simpler approach is
-            // to leak this one connection: sqlx will reap it as part
-            // of normal pool maintenance.
+            drop(lock_conn.detach());
+        } else {
+            drop(lock_conn);
         }
-        drop(lock_conn);
 
         // F7a: audit the rotation the way sibling operator actions are
         // audited (`DEK_CACHE_INVALIDATED` above) — a `secret_audit_log` row
@@ -5822,12 +5621,170 @@ pub fn resolve_secret_references<'a>(
     })
 }
 
+/// Unwrap a DEK with the active KEK, falling back to the legacy one.
+///
+/// The one unwrap rule for `encrypted_key`: [`SecretsManager::decrypt_dek`]
+/// uses it at runtime and `rotate_master_key`'s tests drive it to prove every
+/// row stays readable across an interrupted rewrap. Soft-fall-through to the
+/// legacy provider is kept after Phase 5 as cheap insurance for a future
+/// provider migration (e.g. Vault → AWS KMS).
+pub(crate) async fn unwrap_dek_with_fallback(
+    active: &dyn kek_provider::KekProvider,
+    legacy: Option<&dyn kek_provider::KekProvider>,
+    key_id: Uuid,
+    encrypted_key: &[u8],
+) -> Result<Zeroizing<Vec<u8>>> {
+    let active_err = match active.unwrap_dek(encrypted_key).await {
+        // Already `Zeroizing`; moved, never copied into a plain Vec.
+        Ok(bytes) => return Ok(bytes),
+        Err(e) => e,
+    };
+    if let Some(m) = talos_metrics::global() {
+        m.kek_decrypt_failures_total
+            .with_label_values(&["active"])
+            .inc();
+    }
+    let Some(legacy) = legacy else {
+        // No legacy provider and the active one failed: every configured
+        // provider is exhausted, which is what `TalosKEKDecryptFailuresBoth`
+        // pages on. Emitting `both` here is what makes that alert reachable
+        // on the env-only and vault-without-legacy postures (2026-07-31).
+        if let Some(m) = talos_metrics::global() {
+            m.kek_decrypt_failures_total
+                .with_label_values(&["both"])
+                .inc();
+        }
+        return Err(active_err.context(format!("decrypt_dek: active provider failed for {key_id}")));
+    };
+    tracing::debug!(
+        %key_id,
+        error = %active_err,
+        "decrypt_dek: active provider failed; trying legacy"
+    );
+    legacy
+        .unwrap_dek(encrypted_key)
+        .await
+        .map_err(|legacy_err| {
+            if let Some(m) = talos_metrics::global() {
+                m.kek_decrypt_failures_total
+                    .with_label_values(&["both"])
+                    .inc();
+            }
+            legacy_err.context(format!(
+                "decrypt_dek: both active ({}) and legacy ({}) providers failed for {}",
+                active.name(),
+                legacy.name(),
+                key_id
+            ))
+        })
+}
+
 /// F7a: `rotate_master_key` is an env→env rotation by construction (it always
 /// builds an `EnvKekProvider` from the new bytes), so it may run only while the
 /// ACTIVE provider is `env`. `KekProvider::name()` is `"env"` for
 /// `EnvKekProvider` and `vault://…` for `VaultTransitProvider`.
 pub fn master_key_rotation_permitted_for_provider(active_provider_name: &str) -> bool {
     active_provider_name == "env"
+}
+
+/// Salt under which a KEK proves which key it holds without exposing it.
+const KEK_IDENTITY_SALT: &[u8] = b"talos/kek-identity/v1";
+
+/// Whether two KEK providers hold the same key, compared through an HKDF
+/// purpose key (never the key itself), in constant time. `None` when either
+/// provider cannot derive locally (a KMS-backed KEK).
+pub(crate) fn kek_providers_share_key(
+    a: &dyn kek_provider::KekProvider,
+    b: &dyn kek_provider::KekProvider,
+) -> Result<Option<bool>> {
+    let (Some(ka), Some(kb)) = (
+        a.derive_purpose_key(KEK_IDENTITY_SALT, b"identity")?,
+        b.derive_purpose_key(KEK_IDENTITY_SALT, b"identity")?,
+    ) else {
+        return Ok(None);
+    };
+    let diff = ka
+        .iter()
+        .zip(kb.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y));
+    Ok(Some(diff == 0))
+}
+
+/// What `rotate_master_key` may do given the process's KEK state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MasterKeyRotationPosture {
+    /// Active KEK is the requested key and the previous key is loaded: rewrap.
+    Staged,
+    /// Active KEK is not the requested key: the fleet was not rolled onto it.
+    NotStaged,
+    /// Active KEK is the requested key and no previous key is loaded: every
+    /// row this process can read already opens under it.
+    AlreadyComplete,
+    /// The active KEK cannot prove which key it holds.
+    IdentityUnknown,
+}
+
+/// The decision behind `rotate_master_key`'s refusals; pure so each posture
+/// is unit-tested.
+pub fn master_key_rotation_posture(
+    active_is_requested: Option<bool>,
+    previous_loaded: bool,
+) -> MasterKeyRotationPosture {
+    match (active_is_requested, previous_loaded) {
+        (None, _) => MasterKeyRotationPosture::IdentityUnknown,
+        (Some(false), _) => MasterKeyRotationPosture::NotStaged,
+        (Some(true), true) => MasterKeyRotationPosture::Staged,
+        (Some(true), false) => MasterKeyRotationPosture::AlreadyComplete,
+    }
+}
+
+impl MasterKeyRotationPosture {
+    /// Operator-facing refusal text (`Staged` is not a refusal).
+    pub fn refusal(self) -> &'static str {
+        match self {
+            Self::Staged => "master key rotation is staged",
+            Self::NotStaged => {
+                "rotate_master_key refused: the requested key is not this controller's active \
+                 master key. Master-key rotation is staged through the environment, never \
+                 swapped in memory (other replicas and the next restart would still hold only \
+                 the old key): set TALOS_MASTER_KEY=<new> and TALOS_MASTER_KEY_PREVIOUS=<old> \
+                 on every controller, roll the fleet, call this again with the new key, then \
+                 remove TALOS_MASTER_KEY_PREVIOUS and roll again."
+            }
+            Self::AlreadyComplete => {
+                "rotate_master_key refused: the requested key is already the active master key \
+                 and no TALOS_MASTER_KEY_PREVIOUS is loaded, so there is nothing to rewrap."
+            }
+            Self::IdentityUnknown => {
+                "rotate_master_key refused: the active KEK provider cannot prove which key it \
+                 holds."
+            }
+        }
+    }
+}
+
+/// Rewrap one `encrypted_key` onto `active`. `Ok(None)` when it already opens
+/// under `active` (a resumed rotation skips it); otherwise it must open under
+/// `previous`. Fails closed when neither key opens it.
+pub(crate) async fn rewrap_under_active(
+    active: &dyn kek_provider::KekProvider,
+    previous: &dyn kek_provider::KekProvider,
+    encrypted_key: &[u8],
+) -> Result<Option<Vec<u8>>> {
+    if active.unwrap_dek(encrypted_key).await.is_ok() {
+        return Ok(None);
+    }
+    let plaintext = previous
+        .unwrap_dek(encrypted_key)
+        .await
+        .context("DEK opens under neither the active nor the previous master key")?;
+    let dek: Zeroizing<[u8; 32]> = Zeroizing::new(
+        plaintext
+            .as_slice()
+            .try_into()
+            .map_err(|_| anyhow!("unwrapped DEK has length {}, expected 32", plaintext.len()))?,
+    );
+    Ok(Some(active.wrap_dek(&dek).await?))
 }
 
 #[cfg(test)]
@@ -5843,6 +5800,150 @@ mod master_key_rotation_gate_tests {
         ));
         assert!(!master_key_rotation_permitted_for_provider(""));
         assert!(!master_key_rotation_permitted_for_provider("ENV"));
+    }
+
+    /// Env provider that fails `wrap_dek` after `ok_wraps` successes — a
+    /// rewrap interrupted mid-loop.
+    struct FailingWrap {
+        inner: kek_provider::EnvKekProvider,
+        ok_wraps: std::sync::atomic::AtomicUsize,
+    }
+
+    impl KekProvider for FailingWrap {
+        fn wrap_dek(
+            &self,
+            dek: &[u8; 32],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>>> + Send + '_>>
+        {
+            use std::sync::atomic::Ordering;
+            let left = self.ok_wraps.load(Ordering::SeqCst);
+            if left == 0 {
+                return Box::pin(async { Err(anyhow!("injected wrap failure")) });
+            }
+            self.ok_wraps.store(left - 1, Ordering::SeqCst);
+            self.inner.wrap_dek(dek)
+        }
+        fn unwrap_dek(
+            &self,
+            wrapped: &[u8],
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Zeroizing<Vec<u8>>>> + Send + '_>,
+        > {
+            self.inner.unwrap_dek(wrapped)
+        }
+        fn name(&self) -> &str {
+            "env"
+        }
+        fn derive_purpose_key(
+            &self,
+            salt: &[u8],
+            info: &[u8],
+        ) -> Result<Option<Zeroizing<[u8; 32]>>> {
+            self.inner.derive_purpose_key(salt, info)
+        }
+    }
+
+    fn env(byte: u8) -> kek_provider::EnvKekProvider {
+        kek_provider::EnvKekProvider::from_raw_bytes_owned(vec![byte; 32]).unwrap()
+    }
+
+    #[test]
+    fn posture_requires_the_fleet_to_be_staged() {
+        use MasterKeyRotationPosture::*;
+        assert_eq!(master_key_rotation_posture(Some(true), true), Staged);
+        // The pre-fix in-memory swap (active = old key, nothing staged).
+        assert_eq!(master_key_rotation_posture(Some(false), false), NotStaged);
+        assert_eq!(master_key_rotation_posture(Some(false), true), NotStaged);
+        assert_eq!(
+            master_key_rotation_posture(Some(true), false),
+            AlreadyComplete
+        );
+        assert_eq!(master_key_rotation_posture(None, true), IdentityUnknown);
+        assert!(NotStaged.refusal().contains("TALOS_MASTER_KEY_PREVIOUS"));
+    }
+
+    #[test]
+    fn key_identity_compares_keys_not_providers() {
+        assert_eq!(
+            kek_providers_share_key(&env(3), &env(3)).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            kek_providers_share_key(&env(3), &env(4)).unwrap(),
+            Some(false)
+        );
+    }
+
+    /// C1: a rewrap interrupted mid-loop leaves every DEK readable through
+    /// the runtime unwrap rule, and a retry resumes and finishes.
+    #[tokio::test]
+    async fn interrupted_rewrap_stays_readable_and_a_retry_completes() {
+        let old = env(1);
+        let deks: Vec<[u8; 32]> = (0..5u8).map(|i| [i + 10; 32]).collect();
+        let mut rows = Vec::new();
+        for d in &deks {
+            rows.push(old.wrap_dek(d).await.unwrap());
+        }
+        async fn readable(
+            rows: &[Vec<u8>],
+            deks: &[[u8; 32]],
+            active: &dyn KekProvider,
+            legacy: Option<&dyn KekProvider>,
+        ) {
+            for (row, dek) in rows.iter().zip(deks.iter()) {
+                let got = unwrap_dek_with_fallback(active, legacy, Uuid::nil(), row)
+                    .await
+                    .unwrap();
+                assert_eq!(got.as_slice(), dek);
+            }
+        }
+
+        // Staged process: active = new (fails on the third wrap), legacy = old.
+        let flaky = FailingWrap {
+            inner: env(2),
+            ok_wraps: std::sync::atomic::AtomicUsize::new(2),
+        };
+        let mut failed = false;
+        for row in rows.iter_mut() {
+            match rewrap_under_active(&flaky, &old, row).await {
+                Ok(Some(new)) => *row = new,
+                Ok(None) => {}
+                Err(_) => {
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        assert!(failed, "the injected failure must interrupt the loop");
+        readable(&rows, &deks, &flaky, Some(&old)).await;
+
+        // The retry is still Staged (same process state), skips done rows.
+        let new = env(2);
+        assert_eq!(
+            master_key_rotation_posture(kek_providers_share_key(&new, &env(2)).unwrap(), true),
+            MasterKeyRotationPosture::Staged
+        );
+        let mut rewrapped = 0;
+        for row in rows.iter_mut() {
+            if let Some(n) = rewrap_under_active(&new, &old, row).await.unwrap() {
+                *row = n;
+                rewrapped += 1;
+            }
+        }
+        assert_eq!(
+            rewrapped, 3,
+            "the two rows done before the failure are skipped"
+        );
+        // Done: every row opens with the new key alone.
+        readable(&rows, &deks, &new, None).await;
+    }
+
+    #[tokio::test]
+    async fn rewrap_fails_closed_when_neither_key_opens_the_row() {
+        let stranger = env(9).wrap_dek(&[1u8; 32]).await.unwrap();
+        assert!(rewrap_under_active(&env(2), &env(1), &stranger)
+            .await
+            .is_err());
     }
 
     /// The name the gate tests for must be the one the env provider reports;
