@@ -1254,7 +1254,15 @@ impl wit_http::Host for TalosContext {
         // `networkerror` a redispatch would treat as transient.
         let mut cancelled_during_validation = false;
 
-        for req in &reqs {
+        // CONSUMED, not borrowed. EQ (2026-09-24) recorded as a stated limit
+        // that this loop iterated `&reqs`, so every request's PRE-SUBSTITUTION
+        // body stayed alive and reachable for the rest of the function: a
+        // future `validated.push(Ok((.., req.body.clone(), ..)))` — sending the
+        // bytes that still carry the `vault://` marker — COMPILED, and only the
+        // source pin caught it. Taking ownership makes that a borrow-checker
+        // error instead of a lint finding, and lets the body be MOVED into the
+        // validated tuple rather than cloned.
+        for req in reqs {
             // Per-ENTRY cancellation. The entry check at the top of this fn
             // covered only the first entry: a cancel arriving while entry 1's
             // DNS lookup or vault resolve was in flight let entries 2..N keep
@@ -1596,24 +1604,30 @@ impl wit_http::Host for TalosContext {
             // MCP-783's rule that a validation-failed entry keeps its own error
             // and spends no rate-limit budget.
             let resolved_body = if req.body.is_empty() {
-                req.body.clone()
+                req.body
             } else {
                 let declared_content_type = req
                     .headers
                     .iter()
                     .find(|(n, _)| n.eq_ignore_ascii_case("content-type"))
                     .map(|(_, v)| v.clone());
-                match self
+                // Bound to a local FIRST: a temporary in a `match` scrutinee
+                // lives to the end of the match, so resolving inline would keep
+                // `&req.body` borrowed through the arms and make the move below
+                // a borrow error.
+                let outcome = self
                     .resolve_vault_json_body(
                         crate::context::SecretUseSurface::HttpJsonBody,
                         &host,
                         &req.body,
                         declared_content_type.as_deref(),
                     )
-                    .await
-                {
+                    .await;
+                match outcome {
                     Ok(Some(substituted)) => substituted,
-                    Ok(None) => req.body.clone(),
+                    // No marker in this body: hand the ORIGINAL over by move.
+                    // It is not reachable afterwards, which is the point.
+                    Ok(None) => req.body,
                     Err(_) => {
                         validated.push(Err(deny_forbidden(self, reason_class::SECRET_LOOKUP)));
                         continue;
@@ -1622,7 +1636,7 @@ impl wit_http::Host for TalosContext {
             };
 
             validated.push(Ok((
-                req.url.clone(),
+                req.url,
                 reqwest_method,
                 hdrs,
                 resolved_body,
