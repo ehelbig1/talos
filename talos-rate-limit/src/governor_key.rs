@@ -23,7 +23,7 @@ use axum::http::Request;
 use tower_governor::key_extractor::KeyExtractor;
 use tower_governor::GovernorError;
 
-use crate::middleware::{extract_client_ip, TrustedProxies};
+use crate::middleware::{extract_client_ip, rate_limit_key, TrustedProxies};
 
 /// Keys the governor on the trusted-proxy-resolved client IP.
 #[derive(Clone)]
@@ -42,7 +42,7 @@ impl TrustedProxyClientIpKeyExtractor {
     /// The pure core: peer + headers → key. Split out so it is testable
     /// without a `Request`.
     pub fn resolve(&self, peer: IpAddr, headers: &axum::http::HeaderMap) -> IpAddr {
-        extract_client_ip(peer, headers, &self.trusted_proxies)
+        rate_limit_key(extract_client_ip(peer, headers, &self.trusted_proxies))
     }
 }
 

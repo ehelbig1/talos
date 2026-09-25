@@ -307,6 +307,68 @@ fn parse_xff_entry(entry: &str) -> Option<IpAddr> {
     None
 }
 
+/// Env var for the IPv6 prefix length the per-IP limiters key on.
+pub const IPV6_RATE_LIMIT_PREFIX_ENV: &str = "RATE_LIMIT_IPV6_PREFIX_LEN";
+/// Default: /64, the smallest block an ISP assigns one subscriber — a single
+/// host can rotate through 2^64 addresses inside it, so keying on the full
+/// address gave every IPv6 client an effectively unlimited budget.
+pub const IPV6_RATE_LIMIT_PREFIX_DEFAULT: u8 = 64;
+
+/// The prefix length in force: [`IPV6_RATE_LIMIT_PREFIX_ENV`] when it parses
+/// to 32..=128, else the default. Read once.
+fn ipv6_rate_limit_prefix() -> u8 {
+    static PREFIX: OnceLock<u8> = OnceLock::new();
+    *PREFIX.get_or_init(|| {
+        let raw = talos_config::get_env(IPV6_RATE_LIMIT_PREFIX_ENV, "");
+        parse_ipv6_prefix(&raw).unwrap_or_else(|| {
+            if !raw.trim().is_empty() {
+                tracing::warn!(
+                    value = %raw,
+                    "{IPV6_RATE_LIMIT_PREFIX_ENV} must be 32..=128; using /{IPV6_RATE_LIMIT_PREFIX_DEFAULT}"
+                );
+            }
+            IPV6_RATE_LIMIT_PREFIX_DEFAULT
+        })
+    })
+}
+
+fn parse_ipv6_prefix(raw: &str) -> Option<u8> {
+    raw.trim()
+        .parse::<u8>()
+        .ok()
+        .filter(|p| (32..=128).contains(p))
+}
+
+/// The key a per-IP rate limiter buckets `ip` under: IPv4 as-is, an
+/// IPv4-mapped IPv6 address as its IPv4 form, any other IPv6 address masked
+/// to the configured prefix (default /64). Audit and logging keep the full
+/// address from [`extract_client_ip`]; only limiter keys are coarsened.
+#[must_use]
+pub fn rate_limit_key(ip: IpAddr) -> IpAddr {
+    rate_limit_key_with_prefix(ip, ipv6_rate_limit_prefix())
+}
+
+/// Pure core of [`rate_limit_key`].
+#[must_use]
+pub fn rate_limit_key_with_prefix(ip: IpAddr, prefix: u8) -> IpAddr {
+    match ip {
+        IpAddr::V4(_) => ip,
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return IpAddr::V4(v4);
+            }
+            let bits = u128::from(v6);
+            let prefix = u32::from(prefix.min(128));
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            IpAddr::V6(std::net::Ipv6Addr::from(bits & mask))
+        }
+    }
+}
+
 /// Resolve the real client IP from a request, walking `X-Forwarded-For` per
 /// RFC 7239 §5.2: only trust the header when the direct peer is a configured
 /// trusted proxy, then walk the chain right-to-left and return the first
@@ -393,6 +455,8 @@ pub async fn rate_limit_middleware(
 
     let ip_addr = extract_client_ip(addr.ip(), request.headers(), &trusted_proxies);
     let ip = ip_addr.to_string();
+    // Bucket key: IPv6 coarsened to its prefix (see `rate_limit_key`).
+    let bucket = rate_limit_key(ip_addr).to_string();
 
     // Disable rate limiting completely in development unless explicitly enforced
     let env = rate_limit_env();
@@ -409,7 +473,7 @@ pub async fn rate_limit_middleware(
 
     let is_graphql = request.uri().path().starts_with("/graphql");
 
-    match limiter.check_key(&ip) {
+    match limiter.check_key(&bucket) {
         Ok(_) => {
             let response = next.run(request).await;
             Ok(response)
@@ -681,6 +745,15 @@ impl DistributedRateLimiter {
     }
 
     pub async fn check(&self, identifier: &str) -> bool {
+        // An IP identifier is bucketed by `rate_limit_key` (IPv6 → prefix).
+        let keyed;
+        let identifier = match identifier.parse::<IpAddr>() {
+            Ok(ip) => {
+                keyed = rate_limit_key(ip).to_string();
+                keyed.as_str()
+            }
+            Err(_) => identifier,
+        };
         if let Some(ref client) = self.redis_client {
             match self.check_redis(client, identifier).await {
                 Ok(allowed) => return allowed,
@@ -849,6 +922,41 @@ mod tests {
 
     /// MCP-912: parse helper sanity — accepts both bare and bracketed
     /// forms; rejects garbage.
+    #[test]
+    fn ipv6_is_keyed_on_its_prefix_and_ipv4_mapped_on_ipv4() {
+        let p = |s: &str| s.parse::<IpAddr>().unwrap();
+        // Two hosts inside one /64 share a bucket; the next /64 does not.
+        let a = rate_limit_key_with_prefix(p("2001:db8:1:2:aaaa::1"), 64);
+        let b = rate_limit_key_with_prefix(p("2001:db8:1:2:ffff::9"), 64);
+        let c = rate_limit_key_with_prefix(p("2001:db8:1:3::1"), 64);
+        assert_eq!(a, p("2001:db8:1:2::"));
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        // IPv4 and IPv4-mapped IPv6 are the same IPv4 key, never masked.
+        assert_eq!(
+            rate_limit_key_with_prefix(p("203.0.113.7"), 64),
+            p("203.0.113.7")
+        );
+        assert_eq!(
+            rate_limit_key_with_prefix(p("::ffff:203.0.113.7"), 64),
+            p("203.0.113.7")
+        );
+        // /128 keeps the full address.
+        assert_eq!(
+            rate_limit_key_with_prefix(p("2001:db8::1"), 128),
+            p("2001:db8::1")
+        );
+    }
+
+    #[test]
+    fn ipv6_prefix_env_accepts_only_32_to_128() {
+        assert_eq!(parse_ipv6_prefix("48"), Some(48));
+        assert_eq!(parse_ipv6_prefix(" 128 "), Some(128));
+        for bad in ["", "0", "16", "129", "abc"] {
+            assert_eq!(parse_ipv6_prefix(bad), None, "{bad}");
+        }
+    }
+
     #[test]
     fn parse_xff_entry_accepts_known_forms() {
         assert!(parse_xff_entry("192.0.2.1").is_some());
