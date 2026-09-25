@@ -786,7 +786,7 @@ async fn engine_store_completion_seals_the_output_under_the_rows_key() {
     let wei = Uuid::new_v4();
     insert_workflow_execution(&pool, &s, wei).await;
     let meid = Uuid::new_v4();
-    store
+    let started = store
         .record_started(ExecutionStartedContext {
             id: meid,
             module_id: s.module,
@@ -799,6 +799,11 @@ async fn engine_store_completion_seals_the_output_under_the_rows_key() {
         })
         .await
         .unwrap();
+    assert_eq!(
+        started,
+        talos_workflow_engine_core::StartedRow::Running,
+        "a non-race-safe start row never reports its parent's status"
+    );
     let before = sm.get_active_dek_for_org(s.org).await.unwrap().unwrap().id;
     sm.rotate_dek_for_org(s.org, None).await.unwrap().unwrap();
     store

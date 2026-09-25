@@ -12,6 +12,14 @@ surface stabilizes, the crate will move to 1.0 and normal semver applies.
 
 ### Changed
 
+- **Breaking**: `ModuleExecutionStore::record_started` returns
+  `Result<StartedRow, BoxError>` instead of `Result<(), BoxError>`.
+  `StartedRow::BornCancelled` reports a race-safe start row that entered
+  `cancelled` because the parent workflow execution was already
+  cancelled or failed; the engine refuses to dispatch that node and
+  stops the run. Impls with no parent status to consult return
+  `StartedRow::Running`.
+
 - **Breaking**: `NodeEventWrite` gains an `error_class: Option<String>`
   field and derives `Default`. Dispatchers that construct
   `NodeEventWrite` directly must either set the field explicitly

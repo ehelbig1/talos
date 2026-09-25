@@ -181,21 +181,59 @@ pub(crate) fn truncate_string_field(s: &str) -> Option<String> {
     if s.len() <= MAX_STRING_FIELD_BYTES {
         return None;
     }
-    let mut safe_end = MAX_STRING_FIELD_BYTES;
-    while safe_end > 0 && !s.is_char_boundary(safe_end) {
-        safe_end -= 1;
-    }
     Some(format!(
         "{}...[truncated at {}B]",
-        &s[..safe_end],
+        truncate_at_char_boundary(s, MAX_STRING_FIELD_BYTES),
         MAX_STRING_FIELD_BYTES
     ))
 }
 
+/// The longest prefix of `s` that is at most `max_bytes` long and ends on a
+/// UTF-8 character boundary. `s` itself when it already fits.
+///
+/// The ONE byte-cap truncation in this crate. A byte slice `&s[..n]` PANICS
+/// when `n` lands inside a multi-byte character, and every string this engine
+/// caps is module-, LLM- or user-authored — an em-dash in prose is enough.
+/// Three hand-rolled copies of this walk existed and one site had none (the
+/// ensemble majority-vote key, which panicked the detached engine task and
+/// left the execution `running`). `str::floor_char_boundary` would replace the
+/// loop but is unstable (rust-lang/rust#93743).
+pub(crate) fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 #[cfg(test)]
 mod sanitize_node_output_tests {
-    use super::{sanitize_node_output, truncate_string_field, MAX_STRING_FIELD_BYTES};
+    use super::{
+        sanitize_node_output, truncate_at_char_boundary, truncate_string_field,
+        MAX_STRING_FIELD_BYTES,
+    };
     use serde_json::json;
+
+    #[test]
+    fn truncate_at_char_boundary_never_splits_a_character() {
+        // Every cut position through a run of 3- and 4-byte characters.
+        let s = "a\u{2014}b\u{1F600}c";
+        for max in 0..=s.len() + 1 {
+            let cut = truncate_at_char_boundary(s, max);
+            assert!(cut.len() <= max, "cap {max}");
+            assert!(s.starts_with(cut));
+            // Walked back no further than necessary: the next character
+            // would not have fit.
+            if cut.len() < s.len() {
+                let next = s[cut.len()..].chars().next().unwrap();
+                assert!(cut.len() + next.len_utf8() > max, "cap {max}");
+            }
+        }
+        assert_eq!(truncate_at_char_boundary("short", 99), "short");
+    }
 
     /// The panic this fixes: a 3-byte em-dash straddling the byte cap.
     /// `"—".repeat(n)` puts a boundary every 3 bytes; the cap (a power of

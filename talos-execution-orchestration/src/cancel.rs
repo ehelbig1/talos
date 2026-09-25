@@ -70,6 +70,40 @@ impl CancelBroadcast {
     }
 }
 
+/// Whether the ENGINE — which decides what node is dispatched next — was
+/// stopped, as opposed to the WORKERS, which [`CancelBroadcast`] covers.
+///
+/// Until 2026-09-25 nothing stopped the engine: the cancel updated the row and
+/// told the workers, and the controller driving the run kept dispatching every
+/// remaining node, while the reply said "No further nodes will be dispatched".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineStop {
+    /// The row was not marked, so nothing was signalled.
+    NotAttempted,
+    /// THIS controller was driving the run, and its engine has been stopped:
+    /// it dispatches no further node.
+    StoppedHere,
+    /// This controller is not driving the run. Either it has not started yet
+    /// or already ended — its next dispatch, if any, is refused (the start row
+    /// is born `cancelled`) — or ANOTHER controller replica is driving it. That
+    /// replica stops at its next module dispatch for the same reason, and on
+    /// the fenced paths (scheduler, primary trigger, crash-recovery resume)
+    /// within one fence heartbeat even when no dispatch is due.
+    NotRunningHere,
+}
+
+impl EngineStop {
+    /// A stable machine-readable tag for the MCP/GraphQL response.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NotAttempted => "not_attempted",
+            Self::StoppedHere => "stopped_in_this_controller",
+            Self::NotRunningHere => "not_running_in_this_controller",
+        }
+    }
+}
+
 /// Result of [`ExecutionOrchestrationService::cancel_execution`].
 #[derive(Debug, Clone)]
 pub struct CancelOutcome {
@@ -78,13 +112,16 @@ pub struct CancelOutcome {
     /// three are indistinguishable here by design (tenant isolation); the
     /// protocol layer does a follow-up read to render an actionable message.
     pub marked: bool,
+    /// What happened to the engine driving the run.
+    pub engine: EngineStop,
     /// What happened to the fleet broadcast.
     pub broadcast: CancelBroadcast,
 }
 
 impl ExecutionOrchestrationService {
-    /// Mark an execution cancelled and, only if that succeeded, broadcast a
-    /// signed [`CancelCommand`] to the worker fleet.
+    /// Mark an execution cancelled and, only if that succeeded, stop the
+    /// engine driving it in this process ([`EngineStop`]) and broadcast a
+    /// signed [`CancelCommand`] to the worker fleet ([`CancelBroadcast`]).
     ///
     /// # What the broadcast does and does not buy
     ///
@@ -121,12 +158,24 @@ impl ExecutionOrchestrationService {
         if !marked {
             return Ok(CancelOutcome {
                 marked: false,
+                engine: EngineStop::NotAttempted,
                 broadcast: CancelBroadcast::NotAttempted,
             });
         }
 
+        // Stop the engine first — it decides what is dispatched next — then
+        // tell the workers about what is already in flight. Only after the
+        // UPDATE matched a row the caller owns: the same authorization rule as
+        // the broadcast.
+        let engine = if talos_shutdown::inflight::global().cancel(exec_id) {
+            EngineStop::StoppedHere
+        } else {
+            EngineStop::NotRunningHere
+        };
+
         Ok(CancelOutcome {
             marked: true,
+            engine,
             broadcast: self.broadcast_cancel(exec_id).await,
         })
     }
@@ -191,6 +240,23 @@ impl ExecutionOrchestrationService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_stop_tags_are_stable_and_distinct() {
+        let tags = [
+            EngineStop::NotAttempted.as_str(),
+            EngineStop::StoppedHere.as_str(),
+            EngineStop::NotRunningHere.as_str(),
+        ];
+        assert_eq!(
+            tags,
+            [
+                "not_attempted",
+                "stopped_in_this_controller",
+                "not_running_in_this_controller"
+            ]
+        );
+    }
 
     #[test]
     fn broadcast_tags_are_stable_and_distinct() {

@@ -13,6 +13,33 @@ API stabilizes alongside `talos-workflow-engine-core`, the crate will move to
 
 ### Fixed
 
+- Edge conditions and edge types now apply after EVERY node kind. Only
+  the worker-dispatched module success path evaluated a conditional
+  edge or skipped an error edge; every other commit (judge, inline
+  judge, ensemble, reflective retry, LLM dispatch, agent loop,
+  sub-workflow, the controller-side digests, skip conditions, fan-in,
+  collect, synthesize, verify, loops, error handlers, rate limits)
+  unblocked its children with a bare counter decrement. A judge with
+  `on_failure: "passthrough"` ran both of its conditional branches, and
+  the error-handler child of a system node ran when that node
+  succeeded. Every commit now goes through one successor-release path
+  (`release_successors`).
+- Skip propagation is deterministic. A node runs once every incoming
+  edge has resolved and at least one resolved active, and is otherwise
+  skipped — recorded as `{"__skipped": true, "reason":
+  "no_active_input"}` with the skip cascading to the bottom of the
+  graph. Previously a false condition decremented its grandchildren
+  without enqueuing them, so a merge node ran or silently never ran
+  depending on which branch finished last, and nodes two levels below
+  the false condition were never resolved at all. Early-ready fan-in
+  joins now count parents whose edge resolved active.
+- A run whose start row is born `cancelled` (the parent execution was
+  cancelled or failed) no longer dispatches the node: the engine stops
+  the run and returns `WorkflowEngineError::Cancelled`, without routing
+  the refusal as a node failure.
+- The ensemble `majority_vote` key is cut on a UTF-8 character
+  boundary. A multi-byte character straddling byte 8192 of a
+  candidate's serialized output panicked the engine task.
 - A `loop` node's body now passes the same pre-dispatch gates as a
   single-node dispatch (2026-09-25). `run_loop_iterations` hand-built its
   `DispatchJob` and skipped the capability-world ceiling, the

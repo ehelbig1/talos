@@ -1219,6 +1219,49 @@ async fn handle_replay_execution(
     }
 }
 
+/// The operator-facing sentence for a successful cancel, built from what
+/// actually happened to the two things a cancel can stop: the ENGINE driving
+/// the run (which decides what is dispatched next) and the WORKERS holding an
+/// in-flight job.
+///
+/// Both halves used to be asserted. The reply said "No further nodes will be
+/// dispatched" while nothing stopped the engine — the cancel updated the row
+/// and told the workers, and the controller driving the run kept dispatching
+/// every remaining node. The engine half is now a fact the service reports
+/// (`EngineStop`), and a controller that is NOT driving the run says so
+/// instead of speaking for the replica that is.
+fn cancel_reply_message(
+    engine: talos_execution_orchestration::EngineStop,
+    broadcast_reached_the_fleet: bool,
+) -> String {
+    use talos_execution_orchestration::EngineStop;
+    let engine_part = match engine {
+        EngineStop::StoppedHere => {
+            "Execution marked cancelled. This controller was driving the run and has \
+             stopped its engine: no further nodes will be dispatched."
+        }
+        EngineStop::NotRunningHere | EngineStop::NotAttempted => {
+            "Execution marked cancelled. This controller is not driving the run, so it \
+             stopped no engine. If the run has not started yet, or another controller \
+             replica is driving it, that engine stops when it next dispatches a module \
+             node (its start row is born cancelled), and on the scheduler, primary-trigger \
+             and crash-recovery paths also within one fence check (about 10 s); nodes it \
+             runs inline before then (judge, sub-workflow) still run."
+        }
+    };
+    let worker_part = if broadcast_reached_the_fleet {
+        "A signed cancel was broadcast to the worker fleet: a worker holding an \
+         in-flight job stops it at its next off-host call, and a module making no host \
+         calls at all is trapped out of its own computation within about 100 ms by the \
+         epoch-deadline check. The platform receives no acknowledgement, so that abort \
+         is requested, never confirmed."
+    } else {
+        "NO cancel reached the worker fleet (see cancel_broadcast): a node already in \
+         flight runs to its own timeout or fuel limit."
+    };
+    format!("{engine_part} {worker_part}")
+}
+
 async fn handle_cancel_execution(
     req_id: Option<serde_json::Value>,
     args: &Value,
@@ -1271,25 +1314,15 @@ async fn handle_cancel_execution(
         // and DLQ entry.
         Ok(outcome) if outcome.marked => {
             let requested = outcome.broadcast.reached_the_fleet();
-            let message = if requested {
-                "Execution marked cancelled and a signed cancel was broadcast to the \
-                 worker fleet. No further nodes will be dispatched. A worker holding an \
-                 in-flight job stops it at its next off-host call, and a module making \
-                 no host calls at all is trapped out of its own computation within about \
-                 100 ms by the epoch-deadline check — a compute-bound module no longer \
-                 runs to its timeout. The platform receives no acknowledgement, so the \
-                 abort is requested, never confirmed."
-            } else {
-                "Execution marked cancelled, but NO cancel reached the worker fleet \
-                 (see cancel_broadcast). No further nodes will be dispatched; a node \
-                 already in flight runs to its own timeout or fuel limit."
-            };
             mcp_text(
                 req_id,
                 &serde_json::to_string_pretty(&serde_json::json!({
                     "execution_id": exec_id.to_string(),
                     "status": "cancelled",
-                    "message": message,
+                    "message": cancel_reply_message(outcome.engine, requested),
+                    // Whether the ENGINE driving the run — which decides what
+                    // is dispatched next — was stopped in this controller.
+                    "engine": outcome.engine.as_str(),
                     // Observable: a signed command was published and flushed.
                     "in_flight_abort_requested": requested,
                     // Which of the five broadcast outcomes occurred.
@@ -5243,11 +5276,7 @@ async fn handle_get_execution_waterfall(
     waterfall.push('\n');
 
     for t in &timings {
-        let truncated_label = if t.label.len() > max_label_len {
-            format!("{}...", &t.label[..max_label_len - 3])
-        } else {
-            t.label.clone()
-        };
+        let truncated_label = waterfall_label(&t.label, max_label_len);
 
         let geom = bar_geometry(t.start_ms, t.duration_ms, total_ms, chart_width);
         if geom.beyond_total {
@@ -5295,6 +5324,20 @@ async fn handle_get_execution_waterfall(
     }
 
     respond_maybe_archived(req_id, archived_at, waterfall)
+}
+
+/// A waterfall row label cut to at most `max_len` bytes, ending `...` when
+/// cut. Node labels are user-authored, so the cut is on a UTF-8 character
+/// boundary — the byte slice it replaced (`&label[..max_len - 3]`) panicked
+/// the handler task on a multi-byte character straddling the cut, and
+/// underflowed on a cap below the suffix's length.
+fn waterfall_label(label: &str, max_len: usize) -> std::borrow::Cow<'_, str> {
+    if label.len() > max_len {
+        let kept = talos_text_util::truncate_at_char_boundary(label, max_len.saturating_sub(3));
+        std::borrow::Cow::Owned(format!("{kept}..."))
+    } else {
+        std::borrow::Cow::Borrowed(label)
+    }
 }
 
 /// Where one waterfall bar sits, and whether the row is representable at all.
@@ -8063,6 +8106,77 @@ mod lineage_note_tests {
             "Lineage includes all executions linked via root_execution_id."
         );
         assert!(!lineage_note(false, false, 0, 1, Some(0), true).contains("ROOT could not be read"));
+    }
+}
+
+#[cfg(test)]
+mod cancel_reply_message_tests {
+    use super::cancel_reply_message;
+    use talos_execution_orchestration::EngineStop;
+
+    const NO_FURTHER: &str = "no further nodes will be dispatched";
+
+    #[test]
+    fn only_a_stopped_engine_claims_that_nothing_more_is_dispatched() {
+        for reached in [true, false] {
+            assert!(
+                cancel_reply_message(EngineStop::StoppedHere, reached).contains(NO_FURTHER),
+                "reached={reached}"
+            );
+            let not_here = cancel_reply_message(EngineStop::NotRunningHere, reached);
+            assert!(
+                !not_here.to_lowercase().contains(NO_FURTHER),
+                "a controller not driving the run must not speak for the one that is: {not_here}"
+            );
+            assert!(not_here.contains("not driving the run"));
+        }
+    }
+
+    #[test]
+    fn the_worker_half_follows_the_broadcast() {
+        let reached = cancel_reply_message(EngineStop::StoppedHere, true);
+        assert!(reached.contains("broadcast to the worker fleet"));
+        assert!(reached.contains("requested, never confirmed"));
+        let not_reached = cancel_reply_message(EngineStop::StoppedHere, false);
+        assert!(not_reached.contains("NO cancel reached the worker fleet"));
+        assert!(!not_reached.contains("broadcast to the worker fleet"));
+    }
+}
+
+#[cfg(test)]
+mod waterfall_label_tests {
+    use super::waterfall_label;
+
+    /// Node labels are user-authored. The label column is capped at 30 bytes
+    /// and cut to 27 + `...`, and the cut was a byte slice: a label whose
+    /// multi-byte character straddled byte 27 panicked the handler task,
+    /// dropping the request instead of rendering the chart.
+    #[test]
+    fn a_multibyte_label_across_the_cap_does_not_panic() {
+        let label = format!("{}\u{2014}tail-of-a-long-label", "n".repeat(26));
+        assert!(
+            !label.is_char_boundary(27),
+            "the fixture must straddle the cut"
+        );
+        let out = waterfall_label(&label, 30);
+        assert!(out.ends_with("..."));
+        assert!(out.len() <= 30, "{out:?}");
+        assert_eq!(out, format!("{}...", "n".repeat(26)));
+    }
+
+    #[test]
+    fn a_label_that_fits_is_returned_unchanged() {
+        assert_eq!(waterfall_label("fetch_inbox", 30), "fetch_inbox");
+        let exact = "x".repeat(30);
+        assert_eq!(waterfall_label(&exact, 30), exact);
+    }
+
+    #[test]
+    fn a_cap_too_small_for_the_suffix_does_not_underflow() {
+        // The caller's cap is derived from the labels themselves (the longest,
+        // at most 30), so a cap under 3 with a longer label cannot occur there
+        // today — pinned so a future caller cannot reintroduce `max - 3`.
+        assert_eq!(waterfall_label("abcdef", 2), "...");
     }
 }
 

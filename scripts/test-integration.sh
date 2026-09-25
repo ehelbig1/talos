@@ -423,6 +423,11 @@ fi
 # needed here. 64 hex = 32 bytes, non-zero.
 CTRL_MASTER_KEY="00000000000000000000000000000000000000000000000000000000deadbeef"
 CTRL_TESTS=(
+    # A cancel stops the ENGINE driving the run (not only the row and the
+    # workers), never for a non-owner; and a start row under a cancelled
+    # execution is reported born `cancelled`, which the engine refuses to
+    # dispatch (2026-09-25).
+    "execution_cancel_engine_stop_tests"
     # `enqueue_workflow` dispatches only rows its queued->running claim won (a
     # row cancelled while it waited was run anyway) and runs them as the
     # gate-resolved actor (an enqueue naming no actor skipped the ceiling and

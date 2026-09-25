@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 use talos_workflow_engine_core::{
     BoxError, EventSink, ExecutionStartedContext, ModuleExecutionStore, NodeCompletionContext,
-    NodeEventWrite, NodeLifecycleHook, WriteCeiling,
+    NodeEventWrite, NodeLifecycleHook, StartedRow, WriteCeiling,
 };
 use uuid::Uuid;
 
@@ -360,6 +360,10 @@ pub struct CaptureModuleExecutionStore {
     /// Optional `template_id → wasm_modules.id` mapping returned by
     /// `resolve_module_id`. Unmapped ids pass through unchanged.
     resolver_map: Arc<Mutex<std::collections::HashMap<Uuid, Uuid>>>,
+    /// When set, every race-safe `record_started` reports
+    /// [`StartedRow::BornCancelled`] — the answer a Postgres store gives
+    /// once the parent workflow execution is `cancelled` / `failed`.
+    born_cancelled: bool,
 }
 
 impl CaptureModuleExecutionStore {
@@ -375,6 +379,14 @@ impl CaptureModuleExecutionStore {
             .lock()
             .expect("CaptureModuleExecutionStore mutex poisoned")
             .insert(template_id, wasm_module_id);
+        self
+    }
+
+    /// Report every race-safe start row as born `cancelled`, as a store
+    /// does once the parent execution has been cancelled. Lets a test drive
+    /// the engine's refusal to dispatch into a run that is already over.
+    pub fn with_parent_cancelled(mut self) -> Self {
+        self.born_cancelled = true;
         self
     }
 
@@ -413,7 +425,11 @@ impl std::fmt::Debug for CaptureModuleExecutionStore {
 
 #[async_trait]
 impl ModuleExecutionStore for CaptureModuleExecutionStore {
-    async fn record_started(&self, ctx: ExecutionStartedContext<'_>) -> Result<(), BoxError> {
+    async fn record_started(
+        &self,
+        ctx: ExecutionStartedContext<'_>,
+    ) -> Result<StartedRow, BoxError> {
+        let race_safe = ctx.race_safe_status;
         self.calls
             .lock()
             .expect("CaptureModuleExecutionStore mutex poisoned")
@@ -427,7 +443,11 @@ impl ModuleExecutionStore for CaptureModuleExecutionStore {
                 race_safe_status: ctx.race_safe_status,
                 actor_id: ctx.actor_id,
             });
-        Ok(())
+        Ok(if self.born_cancelled && race_safe {
+            StartedRow::BornCancelled
+        } else {
+            StartedRow::Running
+        })
     }
 
     async fn record_completed(

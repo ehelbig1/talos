@@ -289,6 +289,8 @@ jobs:
             --test checkpointing \
             --test child_run_dispatch_recording \
             --test degraded_inputs \
+            --test edge_routing \
+            --test ensemble_vote_key \
             --test fan_in_join \
             --test loop_body_gates \
             --test precheck_errors \

@@ -11,7 +11,9 @@ use std::sync::Arc;
 
 use petgraph::graph::NodeIndex;
 use serde_json::Value as JsonValue;
-use talos_workflow_engine_core::{DispatchJob, ExecutionStartedContext, NodeEventWrite};
+use talos_workflow_engine_core::{
+    DispatchJob, ExecutionStartedContext, NodeEventWrite, StartedRow,
+};
 use uuid::Uuid;
 
 use crate::emit_event_spawn;
@@ -439,23 +441,17 @@ impl ParallelWorkflowEngine {
         };
 
         // Truncated input preview for the node-I/O inspector.
-        // Walk back from the requested byte cap to the nearest UTF-8
-        // char boundary — slicing by bytes alone panics when the cut
-        // lands inside a multi-byte character (e.g. an em-dash in an
-        // INJECT_CONTEXT actor-memory payload, real prod symptom
-        // 2026-04-29 hit by aegix-ceo's `/watch-semgrep` workflow).
-        // `is_char_boundary` is stable; `floor_char_boundary` would
-        // be cleaner but is still unstable as of Rust 1.95 nightly
-        // (issue #93743).
+        // Cut on a UTF-8 char boundary — slicing by bytes alone panics when
+        // the cut lands inside a multi-byte character (e.g. an em-dash in an
+        // INJECT_CONTEXT actor-memory payload, real prod symptom 2026-04-29).
         {
             let input_preview = {
                 let s = serde_json::to_string(&wrapped_input).unwrap_or_default();
                 if s.len() > 4096 {
-                    let mut safe_end = 4096;
-                    while safe_end > 0 && !s.is_char_boundary(safe_end) {
-                        safe_end -= 1;
-                    }
-                    format!("{}...(truncated)", &s[..safe_end])
+                    format!(
+                        "{}...(truncated)",
+                        crate::validation::truncate_at_char_boundary(&s, 4096)
+                    )
                 } else {
                     s
                 }
@@ -485,7 +481,7 @@ impl ParallelWorkflowEngine {
             // store's resolver maps template → wasm_modules by
             // most-recent compile.
             let actual_module_id = store.resolve_module_id(module_id_resolved).await;
-            if let Err(db_err) = store
+            match store
                 .record_started(ExecutionStartedContext {
                     id: job_id,
                     module_id: actual_module_id,
@@ -514,7 +510,29 @@ impl ParallelWorkflowEngine {
                 })
                 .await
             {
-                tracing::error!("module_execution_store.record_started failed: {}", db_err);
+                Ok(StartedRow::Running) => {}
+                // The parent execution is already `cancelled` / `failed` —
+                // an operator cancel, a stale sweep, a sibling failure the
+                // caller has finalized. Sending the job would run a module
+                // for a run nobody is waiting on. Stop the run instead: the
+                // reactor routes nothing after this, and the run answers
+                // `Cancelled`.
+                Ok(StartedRow::BornCancelled) => {
+                    tracing::info!(
+                        %execution_id,
+                        %node_id,
+                        "execution is no longer running (cancelled or failed) — \
+                         node NOT dispatched; stopping the run"
+                    );
+                    self.progress.abort_run();
+                    return (
+                        node_idx,
+                        Err(crate::engine::NODE_NOT_DISPATCHED.to_string()),
+                    );
+                }
+                Err(db_err) => {
+                    tracing::error!("module_execution_store.record_started failed: {}", db_err);
+                }
             }
         }
 
@@ -910,6 +928,12 @@ impl ParallelWorkflowEngine {
     ///   context, one on module fetch, four on the approval gate, one on the
     ///   freshness contract) all sit ABOVE its `record_started` loop — no row
     ///   is open yet — which is why they are correct as bare returns.
+    /// * single-node and loop — the born-`cancelled` refusal
+    ///   (`StartedRow::BornCancelled`, 2026-09-25) exits below `record_started`
+    ///   WITHOUT passing through here, deliberately: that row entered its
+    ///   terminal state at INSERT (the parent execution was already cancelled
+    ///   or failed), so there is no open row to close, and a completion write
+    ///   would be a second write to a terminal row.
     ///
     /// Payload/error redaction here is deliberate defense in depth: the
     /// Postgres store redacts again at the bind boundary.

@@ -11,6 +11,14 @@ API stabilizes alongside `talos-workflow-engine-core`, the crate will move to
 
 ## [Unreleased]
 
+### Changed
+
+- `CaptureModuleExecutionStore::record_started` returns
+  `StartedRow` (the core trait's new return type). New builder
+  `with_parent_cancelled()` makes every race-safe start report
+  `StartedRow::BornCancelled`, so a test can drive the engine's refusal
+  to dispatch into a run that is already over.
+
 ## [0.2.0] — 2026-04-20
 
 ### Added

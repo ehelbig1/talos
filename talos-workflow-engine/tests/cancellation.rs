@@ -341,3 +341,134 @@ async fn cancel_on_seeded_resume_path() {
     assert!(matches!(err, WorkflowEngineError::Cancelled));
     assert!(started.elapsed() < Duration::from_secs(2));
 }
+
+// ── A start row born `cancelled` stops the run ──────────────────────
+//
+// The race-safe start row inherits the parent execution's status at INSERT
+// time, so it is born `cancelled` once an operator has cancelled the run (or
+// another writer has failed it). Until 2026-09-25 the store counted that row
+// and the engine dispatched the job anyway — the engine had no token to fire
+// on an operator cancel, so every remaining node of a "cancelled" run was
+// still sent to a worker. The store now RETURNS the answer and the engine
+// refuses: nothing is dispatched, nothing is failure-routed, and the run
+// answers `Cancelled`.
+
+/// Records every dispatched module; answers instantly.
+#[derive(Default)]
+struct CountingDispatcher {
+    dispatched: std::sync::Mutex<Vec<Uuid>>,
+}
+
+#[async_trait]
+impl NodeDispatcher for CountingDispatcher {
+    async fn dispatch(&self, job: DispatchJob) -> Result<DispatchResult, BoxError> {
+        self.dispatched.lock().unwrap().push(job.module_id);
+        Ok(DispatchResult {
+            output: json!({"ok": true}),
+        })
+    }
+    async fn dispatch_chain(
+        &self,
+        _request: ChainDispatchRequest,
+    ) -> Result<ChainDispatchResult, BoxError> {
+        Err("chains are disabled on the production entry point".into())
+    }
+}
+
+#[tokio::test]
+async fn a_start_row_born_cancelled_is_not_dispatched_and_the_run_is_cancelled() {
+    use talos_workflow_engine_test_utils::capture::{
+        CaptureEventSink, CaptureModuleExecutionStore, CaptureNodeLifecycleHook,
+    };
+    let (a, handler) = (Uuid::new_v4(), Uuid::new_v4());
+    let graph = WorkflowGraphBuilder::new()
+        .add_module("a", a, None)
+        .add_module("handler", handler, None)
+        // An error edge off the refused node: a refusal must NOT be routed to
+        // it as though the node had failed.
+        .add_raw_edge(json!({
+            "source": "a",
+            "target": "handler",
+            "sourceHandle": "output",
+            "targetHandle": "input",
+            "edge_type": "error",
+        }))
+        .build()
+        .expect("graph builds");
+
+    let mut engine = minimal_engine();
+    engine.set_user_id(Uuid::new_v4());
+    engine.set_module_fetcher(Arc::new(
+        InMemoryModuleFetcher::new()
+            .with_module(a, stub_artifact(a))
+            .with_module(handler, stub_artifact(handler)),
+    ));
+    let store = Arc::new(CaptureModuleExecutionStore::new().with_parent_cancelled());
+    engine.set_module_execution_store(store.clone());
+    let events = Arc::new(CaptureEventSink::new());
+    engine.set_event_sink(events.clone());
+    let hook = Arc::new(CaptureNodeLifecycleHook::new());
+    engine.set_node_hook(hook.clone());
+    engine.set_execution_timeout(Some(Duration::from_secs(30)));
+    engine
+        .load_graph_from_json(&serde_json::to_string(&graph).unwrap())
+        .await
+        .expect("graph loads");
+
+    let dispatcher = Arc::new(CountingDispatcher::default());
+    let result = engine
+        .run_with_trigger_input_transport(dispatcher.clone(), None, json!({}), Uuid::new_v4())
+        .await;
+
+    assert!(
+        matches!(result, Err(WorkflowEngineError::Cancelled)),
+        "a run whose execution is already over must answer Cancelled, got {result:?}"
+    );
+    assert!(
+        dispatcher.dispatched.lock().unwrap().is_empty(),
+        "nothing may be sent to a worker for a cancelled run"
+    );
+    assert!(
+        events.events_of_type("node_failed").is_empty(),
+        "a refused dispatch is not a node failure"
+    );
+    assert!(
+        !hook.calls().iter().any(|c| matches!(
+            c,
+            talos_workflow_engine_test_utils::capture::LifecycleCall::Failed { .. }
+        )),
+        "no on_node_failed (DLQ, sibling-cancel) for a refused dispatch: {:?}",
+        hook.calls()
+    );
+}
+
+#[tokio::test]
+async fn a_start_row_that_is_running_dispatches_normally() {
+    // Control: the same graph against a store whose parent is live.
+    use talos_workflow_engine_test_utils::capture::CaptureModuleExecutionStore;
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    let graph = WorkflowGraphBuilder::new()
+        .add_module("a", a, None)
+        .add_module("b", b, None)
+        .edge("a", "b")
+        .build()
+        .expect("graph builds");
+    let mut engine = minimal_engine();
+    engine.set_user_id(Uuid::new_v4());
+    engine.set_module_fetcher(Arc::new(
+        InMemoryModuleFetcher::new()
+            .with_module(a, stub_artifact(a))
+            .with_module(b, stub_artifact(b)),
+    ));
+    engine.set_module_execution_store(Arc::new(CaptureModuleExecutionStore::new()));
+    engine
+        .load_graph_from_json(&serde_json::to_string(&graph).unwrap())
+        .await
+        .expect("graph loads");
+    let dispatcher = Arc::new(CountingDispatcher::default());
+    engine
+        .run_with_trigger_input_transport(dispatcher.clone(), None, json!({}), Uuid::new_v4())
+        .await
+        .expect("a live run completes");
+    assert_eq!(dispatcher.dispatched.lock().unwrap().as_slice(), &[a, b]);
+}

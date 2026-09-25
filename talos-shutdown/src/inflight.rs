@@ -8,10 +8,17 @@
 //! about an hour later (10 such rows in 30 days on the reference deployment;
 //! the affected workflows normally finish in 17–115 s).
 //!
-//! Two things live here, and both are deliberately process-local:
+//! Three things live here, and all are deliberately process-local:
 //!
 //! * [`InFlightRuns::track`] — called at the engine-run chokepoints. The
-//!   returned guard removes the run when it drops, however the run ends.
+//!   returned guard removes the run when it drops, however the run ends, and
+//!   carries the run's stop signal ([`RunGuard::stop_signal`]), which the
+//!   chokepoint races against the run.
+//! * [`InFlightRuns::cancel`] — an operator cancel: fires the stop signal of
+//!   the run this process is driving, so the engine dispatches nothing more.
+//!   Until 2026-09-25 a cancel updated the row and told the WORKERS; the
+//!   engine here, which decides what is dispatched next, was never told, and
+//!   kept dispatching every remaining node of the "cancelled" run.
 //! * [`InFlightRuns::drain`] — waits until no run is tracked or the grace
 //!   period ends, and returns what is still running so the caller can fail
 //!   exactly those rows at once with an honest reason.
@@ -30,6 +37,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// How long a controller waits at shutdown for the runs it is driving. The
@@ -43,10 +51,17 @@ pub const RUN_DRAIN_GRACE: Duration = Duration::from_secs(120);
 pub struct InFlightRuns {
     // A count per id, not a set: the same execution id can legitimately be
     // tracked twice in sequence-with-overlap (a fenced wrapper around an inner
-    // run), and the outer guard dropping must not hide the inner one.
-    runs: Mutex<HashMap<Uuid, usize>>,
+    // run), and the outer guard dropping must not hide the inner one. The
+    // overlapping trackers share ONE stop signal, so a cancel reaches both.
+    runs: Mutex<HashMap<Uuid, Tracked>>,
     draining: AtomicBool,
     changed: Notify,
+}
+
+#[derive(Debug)]
+struct Tracked {
+    count: usize,
+    stop: CancellationToken,
 }
 
 /// Removes its run from the set when dropped.
@@ -55,6 +70,16 @@ pub struct InFlightRuns {
 pub struct RunGuard {
     runs: Arc<InFlightRuns>,
     execution_id: Uuid,
+    stop: CancellationToken,
+}
+
+impl RunGuard {
+    /// Fired by [`InFlightRuns::cancel`] for this execution. The run
+    /// chokepoint races the run against it and stops the run when it fires.
+    #[must_use]
+    pub fn stop_signal(&self) -> CancellationToken {
+        self.stop.clone()
+    }
 }
 
 /// What [`InFlightRuns::drain`] saw.
@@ -76,10 +101,35 @@ impl InFlightRuns {
 
     /// Track `execution_id` until the returned guard drops.
     pub fn track(self: &Arc<Self>, execution_id: Uuid) -> RunGuard {
-        *self.lock().entry(execution_id).or_insert(0) += 1;
+        let stop = {
+            let mut runs = self.lock();
+            let tracked = runs.entry(execution_id).or_insert_with(|| Tracked {
+                count: 0,
+                stop: CancellationToken::new(),
+            });
+            tracked.count += 1;
+            tracked.stop.clone()
+        };
         RunGuard {
             runs: Arc::clone(self),
             execution_id,
+            stop,
+        }
+    }
+
+    /// Stop the run of `execution_id` if THIS process is driving it: fires
+    /// the stop signal every tracker of that execution holds. Returns whether
+    /// a run was tracked here — `false` means this process is not driving it
+    /// (another replica is, it has not started yet, or it already ended),
+    /// which the caller must report rather than claim the run was stopped.
+    pub fn cancel(&self, execution_id: Uuid) -> bool {
+        let stop = self.lock().get(&execution_id).map(|t| t.stop.clone());
+        match stop {
+            Some(stop) => {
+                stop.cancel();
+                true
+            }
+            None => false,
         }
     }
 
@@ -127,7 +177,7 @@ impl InFlightRuns {
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, usize>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, Tracked>> {
         // A panic while holding this lock cannot leave the map half-written
         // (every critical section is one map operation), so a poisoned lock
         // is still a usable one — and shutdown must not panic on it.
@@ -139,9 +189,9 @@ impl Drop for RunGuard {
     fn drop(&mut self) {
         {
             let mut runs = self.runs.lock();
-            if let Some(count) = runs.get_mut(&self.execution_id) {
-                *count -= 1;
-                if *count == 0 {
+            if let Some(tracked) = runs.get_mut(&self.execution_id) {
+                tracked.count -= 1;
+                if tracked.count == 0 {
                     runs.remove(&self.execution_id);
                 }
             }
@@ -302,5 +352,49 @@ mod tests {
         );
         drop(late);
         assert!(waiter.await.unwrap().remaining.is_empty());
+    }
+
+    #[test]
+    fn cancel_fires_the_stop_signal_of_the_tracked_run_only() {
+        let runs = InFlightRuns::new();
+        let (mine, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let g_mine = runs.track(mine);
+        let g_other = runs.track(other);
+        assert!(
+            runs.cancel(mine),
+            "a tracked run reports it was stopped here"
+        );
+        assert!(g_mine.stop_signal().is_cancelled());
+        assert!(
+            !g_other.stop_signal().is_cancelled(),
+            "a cancel must not reach another execution's run"
+        );
+    }
+
+    #[test]
+    fn cancel_of_a_run_this_process_is_not_driving_says_so() {
+        let runs = InFlightRuns::new();
+        assert!(!runs.cancel(Uuid::new_v4()), "never tracked");
+        let id = Uuid::new_v4();
+        drop(runs.track(id));
+        assert!(!runs.cancel(id), "already ended");
+    }
+
+    #[test]
+    fn overlapping_trackers_of_one_execution_share_the_stop_signal() {
+        // A fenced wrapper around an inner run tracks the same id twice; the
+        // cancel must reach both, and the second guard's signal must be the
+        // same one even though it was tracked after the first.
+        let runs = InFlightRuns::new();
+        let id = Uuid::new_v4();
+        let outer = runs.track(id);
+        let inner = runs.track(id);
+        assert!(runs.cancel(id));
+        assert!(outer.stop_signal().is_cancelled());
+        assert!(inner.stop_signal().is_cancelled());
+        // A LATER run of the same execution id (a resume after this one
+        // ended) starts with a fresh signal.
+        drop((outer, inner));
+        assert!(!runs.track(id).stop_signal().is_cancelled());
     }
 }

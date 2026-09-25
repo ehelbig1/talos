@@ -341,13 +341,38 @@ fn engine_default_sandbox_root_uses_function() {
     assert_eq!(engine.sandbox_root, expected);
 }
 
+/// A join table over `engine`'s graph, as `run_scheduler_loop` builds it.
+fn joins_for(engine: &ParallelWorkflowEngine) -> crate::join_state::Joins {
+    crate::join_state::Joins::new(engine.graph.node_indices().map(|idx| {
+        (
+            idx,
+            engine
+                .graph
+                .edges_directed(idx, petgraph::Direction::Incoming)
+                .count(),
+        )
+    }))
+}
+
+fn plain_edge(edge_type: &str) -> EdgeLogic {
+    EdgeLogic {
+        source_handle: "output".to_string(),
+        target_handle: "input".to_string(),
+        mapping: None,
+        condition: None,
+        edge_type: edge_type.to_string(),
+    }
+}
+
 #[test]
-fn unblock_child_on_failure_does_not_double_enqueue_early_ready_fanin() {
+fn error_edge_release_does_not_double_enqueue_early_ready_fanin() {
     // R2-1 regression: two error-edge parents into one `JoinMode::Any` fan-in
-    // must enqueue the fan-in EXACTLY ONCE. Pre-fix the failure-path loop
-    // decremented + enqueued without removing the `pending` entry on the
-    // 0-transition, so the second parent's unblock re-enqueued the fan-in
-    // (and its whole downstream subgraph) — an exactly-once violation.
+    // must enqueue the fan-in EXACTLY ONCE. The pre-R2-1 failure-path loop
+    // decremented + enqueued without removing the child's entry on the
+    // 0-transition, so the second parent re-enqueued the fan-in (and its whole
+    // downstream subgraph) — an exactly-once violation. Now the join table
+    // decides a node once and ignores later resolutions.
+    use crate::engine_completion::Release;
     let mut engine = ParallelWorkflowEngine::new();
     let p1 = Uuid::new_v4();
     let p2 = Uuid::new_v4();
@@ -367,26 +392,23 @@ fn unblock_child_on_failure_does_not_double_enqueue_early_ready_fanin() {
     let p2_idx = engine.node_map[&p2];
     let fanin_idx = engine.node_map[&fanin];
     for src in [p1_idx, p2_idx] {
-        engine.graph.add_edge(
-            src,
-            fanin_idx,
-            EdgeLogic {
-                source_handle: "output".to_string(),
-                target_handle: "input".to_string(),
-                mapping: None,
-                condition: None,
-                edge_type: "error".to_string(),
-            },
-        );
+        engine.graph.add_edge(src, fanin_idx, plain_edge("error"));
     }
 
-    let mut pending: HashMap<NodeIndex, usize> = HashMap::new();
-    pending.insert(fanin_idx, 2); // two inbound parents
+    let mut joins = joins_for(&engine);
+    let mut results: HashMap<Uuid, JsonValue> = HashMap::new();
     let mut ready: VecDeque<NodeIndex> = VecDeque::new();
 
-    // Both parents fail down the error edge (error-edge path applies early-ready).
-    engine.unblock_child_on_failure(fanin_idx, &mut pending, &mut ready, true);
-    engine.unblock_child_on_failure(fanin_idx, &mut pending, &mut ready, true);
+    // Both parents fail down the error edge.
+    for parent in [p1_idx, p2_idx] {
+        engine.release_successors(
+            parent,
+            Release::FailedToErrorEdges,
+            &mut results,
+            &mut joins,
+            &mut ready,
+        );
+    }
 
     assert_eq!(
         ready.iter().filter(|&&n| n == fanin_idx).count(),
@@ -394,51 +416,64 @@ fn unblock_child_on_failure_does_not_double_enqueue_early_ready_fanin() {
         "early-ready fan-in must be enqueued exactly once across two error-edge parents"
     );
     assert!(
-        !pending.contains_key(&fanin_idx),
-        "the fan-in's pending entry must be removed on the 0-transition so a late parent can't re-enter"
+        !joins.is_undecided(fanin_idx),
+        "the fan-in is decided at the early-ready transition, so a late parent can't re-enter"
     );
 }
 
 #[test]
-fn unblock_child_on_failure_removes_entry_on_all_join_zero_transition() {
-    // The continue_on_error path does NOT apply early-ready (All-style wait),
-    // but MUST still remove the entry on the genuine 0-transition so a later
-    // error-edge parent can't re-enqueue the child.
+fn continued_failure_release_waits_for_every_parent_and_enqueues_once() {
+    // The continue_on_error path never satisfies an early join by itself, but
+    // once every parent has resolved the carried failure is an input: the
+    // child runs, exactly once, and a spurious late release must not
+    // re-enqueue it.
+    use crate::engine_completion::Release;
     let mut engine = ParallelWorkflowEngine::new();
-    let parent = Uuid::new_v4();
+    let p1 = Uuid::new_v4();
+    let p2 = Uuid::new_v4();
     let child = Uuid::new_v4();
-    engine.add_node(parent, Some(Uuid::new_v4()), None, None);
+    engine.add_node(p1, Some(Uuid::new_v4()), None, None);
+    engine.add_node(p2, Some(Uuid::new_v4()), None, None);
     engine.add_node(child, Some(Uuid::new_v4()), None, None);
-    let parent_idx = engine.node_map[&parent];
+    let p1_idx = engine.node_map[&p1];
+    let p2_idx = engine.node_map[&p2];
     let child_idx = engine.node_map[&child];
-    engine.graph.add_edge(
-        parent_idx,
-        child_idx,
-        EdgeLogic {
-            source_handle: "output".to_string(),
-            target_handle: "input".to_string(),
-            mapping: None,
-            condition: None,
-            edge_type: Default::default(),
-        },
-    );
+    engine.graph.add_edge(p1_idx, child_idx, plain_edge(""));
+    engine.graph.add_edge(p2_idx, child_idx, plain_edge(""));
 
-    let mut pending: HashMap<NodeIndex, usize> = HashMap::new();
-    pending.insert(child_idx, 2);
+    let mut joins = joins_for(&engine);
+    let mut results: HashMap<Uuid, JsonValue> = HashMap::new();
     let mut ready: VecDeque<NodeIndex> = VecDeque::new();
 
-    // First parent: 2 -> 1, not ready yet, not enqueued.
-    engine.unblock_child_on_failure(child_idx, &mut pending, &mut ready, false);
+    engine.release_successors(
+        p1_idx,
+        Release::ContinuedAfterFailure,
+        &mut results,
+        &mut joins,
+        &mut ready,
+    );
     assert!(ready.is_empty(), "child must wait for the second parent");
-    assert_eq!(pending.get(&child_idx).copied(), Some(1));
+    assert!(joins.is_undecided(child_idx));
 
-    // Second parent: 1 -> 0, enqueued once and entry removed.
-    engine.unblock_child_on_failure(child_idx, &mut pending, &mut ready, false);
+    engine.release_successors(
+        p2_idx,
+        Release::ContinuedAfterFailure,
+        &mut results,
+        &mut joins,
+        &mut ready,
+    );
     assert_eq!(ready.iter().filter(|&&n| n == child_idx).count(), 1);
-    assert!(!pending.contains_key(&child_idx));
+    assert!(!joins.is_undecided(child_idx));
 
-    // A spurious third call (e.g. a late error-edge parent) must NOT re-enqueue.
-    engine.unblock_child_on_failure(child_idx, &mut pending, &mut ready, false);
+    // A spurious third release (e.g. a late error-edge parent) must NOT
+    // re-enqueue.
+    engine.release_successors(
+        p1_idx,
+        Release::ContinuedAfterFailure,
+        &mut results,
+        &mut joins,
+        &mut ready,
+    );
     assert_eq!(
         ready.iter().filter(|&&n| n == child_idx).count(),
         1,

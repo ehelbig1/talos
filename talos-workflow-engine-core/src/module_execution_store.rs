@@ -85,10 +85,33 @@ impl std::fmt::Debug for ExecutionStartedContext<'_> {
     }
 }
 
+/// What [`ModuleExecutionStore::record_started`] found when it wrote the row.
+///
+/// The race-safe start row inherits the parent workflow's status at INSERT
+/// time (see [`ExecutionStartedContext::race_safe_status`]): a parent already
+/// `cancelled` or `failed` produces a row born `cancelled`. That is the one
+/// moment the dispatch path learns, from the database, that the run it is
+/// part of is over — so the answer is RETURNED, and the engine refuses to
+/// send the job. Until 2026-09-25 it was discarded: the row was born
+/// `cancelled`, counted, and the job was dispatched to a worker anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a BornCancelled start must stop the dispatch"]
+pub enum StartedRow {
+    /// The row entered `running` — or the store cannot tell (a
+    /// non-race-safe insert, an `id` collision that inserted nothing).
+    /// Dispatch proceeds.
+    Running,
+    /// The row entered `cancelled` because the parent workflow execution
+    /// was already `cancelled` / `failed`. The engine must NOT dispatch the
+    /// job, and stops the run.
+    BornCancelled,
+}
+
 /// Record per-dispatch execution rows.
 #[async_trait]
 pub trait ModuleExecutionStore: Send + Sync {
-    /// Insert a "running" row for a dispatched node or pipeline step.
+    /// Insert a "running" row for a dispatched node or pipeline step, and
+    /// report whether it was born `cancelled` (see [`StartedRow`]).
     ///
     /// See [`ExecutionStartedContext`] for the per-field semantics,
     /// including the race-safe-status contract.
@@ -97,7 +120,13 @@ pub trait ModuleExecutionStore: Send + Sync {
     /// impl might use `INSERT ... ON CONFLICT DO NOTHING`).
     /// Observability readers tolerate a missing row (unknown run)
     /// better than a duplicate-key error that aborts dispatch.
-    async fn record_started(&self, ctx: ExecutionStartedContext<'_>) -> Result<(), BoxError>;
+    ///
+    /// Impls that have no parent status to consult return
+    /// [`StartedRow::Running`].
+    async fn record_started(
+        &self,
+        ctx: ExecutionStartedContext<'_>,
+    ) -> Result<StartedRow, BoxError>;
 
     /// Update an existing row with completion state. `status` is one
     /// of `"completed"` / `"failed"` / `"timeout"` / `"cancelled"`
