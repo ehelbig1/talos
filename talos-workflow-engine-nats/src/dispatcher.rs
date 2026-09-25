@@ -1224,12 +1224,13 @@ pub(crate) async fn execute_job_with_retry(
                 // edge case where the worker did receive it and cached
                 // the nonce before the controller's request timed out.
                 if let Some(key) = worker_shared_key {
-                    // Same counter, same meaning: `attempt_base + 1` is the
-                    // first retry.
+                    // The ONE formula: a liveness re-dispatch earlier in this
+                    // job already spent an index, so `base + attempts` alone
+                    // could reuse it (two chains in one WORM partition).
                     current_payload = resign_payload_for_retry(
                         &current_payload,
                         key,
-                        attempt_base.saturating_add(attempts),
+                        next_dispatch_attempt(attempt_base, attempts, liveness_redispatches),
                     )
                     .unwrap_or(current_payload);
                 }
@@ -1312,7 +1313,7 @@ fn resign_payload_for_retry(payload: &[u8], key: &[u8], dispatch_attempt: u32) -
     // recorded wrote two anchors into attempt partition 0 and were reported as
     // `DuplicateSequence` tamper evidence. That path now starts from
     // `DispatchJob::redispatch_attempt_base`, and the attempt passed here is
-    // `attempt_base + attempts`.
+    // always `next_dispatch_attempt(..)`.
     req.dispatch_attempt = dispatch_attempt;
     // RFC 0010 P1: re-sign under the configured dispatch scheme so a retry
     // matches the primary path (Ed25519 when configured, else HMAC).
@@ -4130,6 +4131,34 @@ mod liveness_redispatch_tests {
         );
         let unique: std::collections::BTreeSet<_> = attempts.iter().collect();
         assert_eq!(unique.len(), attempts.len(), "a reused index merges chains");
+    }
+
+    /// The delivery-error retry uses the SAME formula: after a no-responders
+    /// re-dispatch spent index 1, a transport error must not stamp 1 again.
+    #[tokio::test(start_paused = true)]
+    async fn a_transport_error_after_a_liveness_redispatch_never_reuses_an_attempt() {
+        let t = ScriptedTransport::new(vec![
+            Reply::NoResponders,       // liveness re-dispatch   -> attempt 1
+            Reply::OtherDeliveryError, // delivery-error retry   -> attempt 2
+            Reply::Success,
+        ]);
+        assert!(run(&t, 2, None, true).await.is_ok());
+        let attempts: Vec<u32> = t
+            .payloads
+            .lock()
+            .expect("lock")
+            .iter()
+            .map(|p| {
+                serde_json::from_slice::<talos_workflow_job_protocol::JobRequest>(p)
+                    .expect("JobRequest")
+                    .dispatch_attempt
+            })
+            .collect();
+        assert_eq!(
+            attempts,
+            vec![0, 1, 2],
+            "every send needs its own partition"
+        );
     }
 
     /// The backoffs are DERIVED from what each cause says about the fleet, and
