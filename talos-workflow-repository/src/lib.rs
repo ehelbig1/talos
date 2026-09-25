@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 mod executions;
 mod graph_export;
+pub mod graph_version;
 mod search;
 mod stats;
 mod templates;
@@ -20,6 +21,7 @@ mod workflows;
 
 pub use executions::*;
 pub use graph_export::*;
+pub use graph_version::{GraphWrite, VersionedGraph};
 pub use search::*;
 pub use stats::*;
 pub use templates::*;

@@ -178,9 +178,14 @@ async fn each_bulk_surface_writes_one_row_naming_every_module_removed() {
     seed_module(&pool, user, "tmp-old", "http-node", 40).await;
     let fresh = seed_module(&pool, user, "tmp-fresh", "http-node", 0).await;
     assert_eq!(
-        repo.cleanup_unreferenced_modules(user, Some("tmp-"), 30)
-            .await
-            .unwrap(),
+        repo.cleanup_unreferenced_modules(
+            user,
+            Some("tmp-"),
+            30,
+            &talos_module_repository::PushBoundModules::default()
+        )
+        .await
+        .unwrap(),
         1
     );
     assert!(exists(&pool, fresh).await);
@@ -188,7 +193,13 @@ async fn each_bulk_surface_writes_one_row_naming_every_module_removed() {
     // hygiene.
     let orphan = seed_module(&pool, user, "orphan", "minimal-node", 0).await;
     assert_eq!(
-        repo.delete_orphaned_modules(&[orphan], user).await.unwrap(),
+        repo.delete_orphaned_modules(
+            &[orphan],
+            user,
+            &talos_module_repository::PushBoundModules::default()
+        )
+        .await
+        .unwrap(),
         1
     );
 
@@ -255,9 +266,14 @@ async fn a_bulk_record_lists_at_most_a_thousand_and_says_so() {
     .expect("seed 1001");
 
     assert_eq!(
-        repo.cleanup_unreferenced_modules(user, Some("bulk-"), 30)
-            .await
-            .unwrap(),
+        repo.cleanup_unreferenced_modules(
+            user,
+            Some("bulk-"),
+            30,
+            &talos_module_repository::PushBoundModules::default()
+        )
+        .await
+        .unwrap(),
         1001
     );
     let events = module_events(&pool).await;
@@ -294,10 +310,22 @@ async fn a_module_delete_that_cannot_be_recorded_does_not_happen() {
         .await
         .is_err());
     assert!(repo
-        .cleanup_unreferenced_modules(user, Some("keep-"), 30)
+        .cleanup_unreferenced_modules(
+            user,
+            Some("keep-"),
+            30,
+            &talos_module_repository::PushBoundModules::default()
+        )
         .await
         .is_err());
-    assert!(repo.delete_orphaned_modules(&[orphan], user).await.is_err());
+    assert!(repo
+        .delete_orphaned_modules(
+            &[orphan],
+            user,
+            &talos_module_repository::PushBoundModules::default()
+        )
+        .await
+        .is_err());
     for (id, what) in [
         (single, "single"),
         (batch, "batch"),

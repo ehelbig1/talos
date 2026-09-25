@@ -10,7 +10,9 @@ import type {
 import { applyNodeChanges, applyEdgeChanges } from "@xyflow/react";
 
 export interface RetryPolicy {
-  maxRetries: number;
+  // Absent = the graph declares no count, so the engine's method-aware
+  // default applies. NOT the same as 0 (an explicit "never retry").
+  maxRetries?: number;
   backoffMs?: number;
   retryCondition?: string; // Rhai expression returning bool
   retryDelayExpression?: string; // Rhai expression returning int (ms)
@@ -73,6 +75,10 @@ export interface WorkflowNodeData {
   retryPolicy?: RetryPolicy;
   // Additional dynamic properties
   properties?: Record<string, unknown>;
+  // Top-level keys of the STORED node the editor does not model (`kind`,
+  // `description`, …). Carried verbatim through load → save; never shown,
+  // never written into `data`. See `lib/graphDocument.ts`.
+  storedNodeExtras?: Record<string, unknown>;
 }
 
 export type WorkflowNode = RFNode<WorkflowNodeData>;
@@ -82,6 +88,9 @@ export interface EdgeData {
   edgeType?: "default" | "error" | "conditional" | "OnFailure";
   condition?: string;
   mapping?: string;
+  // Top-level keys of the STORED edge the editor does not model (`id`,
+  // `logic`, …), carried verbatim and written back at the edge's top level.
+  storedEdgeExtras?: Record<string, unknown>;
 }
 
 export type WorkflowEdge = RFEdge<EdgeData>;
@@ -94,6 +103,13 @@ export interface WorkflowState {
   maxConcurrentExecutions: number;
   priority: "high" | "normal" | "low";
   intent: Record<string, unknown>;
+  // The `graphVersion` the loaded graph was read at (null for a workflow this
+  // editor has not loaded or saved). Sent as `expectedGraphVersion` so a save
+  // cannot silently overwrite an edit made elsewhere since the load.
+  graphVersion: number | null;
+  // Top-level keys of the stored graph the editor does not model
+  // (`execution_timeout_secs`, …), carried verbatim through load → save.
+  graphExtras: Record<string, unknown>;
   isDirty: boolean;
   onNodesChange: OnNodesChange;
   onEdgesChange: OnEdgesChange;
@@ -121,6 +137,11 @@ export interface WorkflowState {
   setMaxConcurrentExecutions: (count: number) => void;
   setPriority: (priority: "high" | "normal" | "low") => void;
   setIntent: (intent: Record<string, unknown>) => void;
+  setGraphDocument: (doc: {
+    graphVersion: number | null;
+    graphExtras: Record<string, unknown>;
+  }) => void;
+  setGraphVersion: (graphVersion: number | null) => void;
   markClean: () => void;
 }
 
@@ -132,6 +153,8 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   maxConcurrentExecutions: 1,
   priority: "normal",
   intent: {},
+  graphVersion: null,
+  graphExtras: {},
   isDirty: false,
   onNodesChange: (changes) => {
     const nextNodes = applyNodeChanges(changes, get().nodes) as WorkflowNode[];
@@ -253,6 +276,8 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
       maxConcurrentExecutions: 1,
       priority: "normal",
       intent: {},
+      graphVersion: null,
+      graphExtras: {},
       isDirty: false,
     });
   },
@@ -260,7 +285,13 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
     set({ nodes: workflow.nodes, edges: workflow.edges, isDirty: false });
   },
   setWorkflowMeta: (id, name) => {
-    set({ workflowId: id, workflowName: name });
+    // A version belongs to the workflow it was read from: switching identity
+    // drops it, so a save to a different workflow never carries it.
+    set((s) =>
+      id === s.workflowId
+        ? { workflowId: id, workflowName: name }
+        : { workflowId: id, workflowName: name, graphVersion: null },
+    );
   },
   setMaxConcurrentExecutions: (count) => {
     set({ maxConcurrentExecutions: count, isDirty: true });
@@ -270,6 +301,12 @@ export const useWorkflowStore = create<WorkflowState>((set, get) => ({
   },
   setIntent: (intent) => {
     set({ intent, isDirty: true });
+  },
+  setGraphDocument: ({ graphVersion, graphExtras }) => {
+    set({ graphVersion, graphExtras });
+  },
+  setGraphVersion: (graphVersion) => {
+    set({ graphVersion });
   },
   markClean: () => {
     set({ isDirty: false });

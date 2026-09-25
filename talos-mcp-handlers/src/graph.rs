@@ -6,6 +6,7 @@ use super::utils::{
 use super::{auth, McpState};
 use serde_json::json;
 use std::sync::Arc;
+use talos_workflow_repository::{GraphWrite, VersionedGraph};
 use uuid::Uuid;
 
 // Thread-local Rhai validation engine — created once per thread, reused for syntax checks.
@@ -323,16 +324,22 @@ fn upsert_system_node_into_graph(graph: &mut serde_json::Value, node: serde_json
     }
 }
 
-/// Fetch the graph_json for a workflow via the repository, returning a
-/// standard MCP error response when the workflow is not found.
+/// Fetch the graph_json for a workflow via the repository, together with the
+/// `graph_version` it was read at, returning a standard MCP error response
+/// when the workflow is not found. Every mutation handler passes the version
+/// back to [`save_graph_json`], which writes only if nothing changed since.
 async fn fetch_graph_json(
     state: &McpState,
     wf_id: Uuid,
     user_id: Uuid,
     req_id: &Option<serde_json::Value>,
-) -> Result<String, JsonRpcResponse> {
-    match state.workflow_repo.get_workflow_graph(wf_id, user_id).await {
-        Ok(Some(gj)) => Ok(gj),
+) -> Result<VersionedGraph, JsonRpcResponse> {
+    match state
+        .workflow_repo
+        .get_workflow_graph_versioned(wf_id, user_id)
+        .await
+    {
+        Ok(Some(g)) => Ok(g),
         Ok(None) => Err(mcp_denied(
             req_id.clone(),
             -32000,
@@ -344,6 +351,69 @@ async fn fetch_graph_json(
                 req_id.clone(),
                 -32000,
                 "Failed to fetch workflow",
+            ))
+        }
+    }
+}
+
+/// The caller-facing sentence for a [`GraphWrite::Conflict`]. One home, so
+/// every graph-mutating tool says the same thing and the tests pin one string.
+pub(crate) const GRAPH_WRITE_CONFLICT_MESSAGE: &str =
+    "The workflow graph was changed by another call after this one read it; \
+     NOTHING was saved (saving would have discarded that change). Retry this call — \
+     it will apply to the current graph. Parallel edits to one workflow must be \
+     retried on conflict.";
+
+/// Map a compare-and-set graph write's outcome to the MCP response every
+/// graph-mutating handler gives. `Ok(new_version)` only for a real write;
+/// a conflict and a vanished row are both errors, never "saved".
+pub(crate) fn graph_write_response(
+    outcome: anyhow::Result<GraphWrite>,
+    wf_id: Uuid,
+    req_id: &Option<serde_json::Value>,
+    site: &'static str,
+) -> Result<i64, JsonRpcResponse> {
+    match outcome {
+        Ok(GraphWrite::Written { graph_version }) => Ok(graph_version),
+        Ok(GraphWrite::Conflict) => {
+            tracing::info!(
+                workflow_id = %wf_id,
+                site,
+                "graph write refused: graph_version moved since this call read it \
+                 (concurrent edit); nothing persisted"
+            );
+            Err(mcp_error(
+                req_id.clone(),
+                -32000,
+                GRAPH_WRITE_CONFLICT_MESSAGE,
+            ))
+        }
+        // Zero rows on a row that is not there (or not the caller's). Every
+        // caller has already run an ownership-checked read, so this can only
+        // mean the workflow was deleted (or changed hands) between that read
+        // and this write. Reporting Ok here would be the MCP-737/738
+        // misleading-success shape one level down: the handler would answer
+        // "node added" over a graph that was never persisted. Surface it.
+        Ok(GraphWrite::NotFound) => {
+            tracing::warn!(
+                target: "talos_audit",
+                workflow_id = %wf_id,
+                site,
+                "graph write matched 0 rows — workflow missing or not owned by the \
+                 caller at write time; graph NOT persisted"
+            );
+            Err(mcp_denied(
+                req_id.clone(),
+                -32000,
+                "Workflow not found or access denied",
+            ))
+        }
+        Err(e) => {
+            tracing::error!(workflow_id = %wf_id, site, "graph write failed: {}", e);
+            Err(mcp_error(
+                req_id.clone(),
+                -32000,
+                "Failed to save workflow graph",
             ))
         }
     }
@@ -428,45 +498,22 @@ async fn save_graph_json(
     state: &McpState,
     wf_id: Uuid,
     user_id: Uuid,
+    expected_version: i64,
     graph_json: &str,
     req_id: &Option<serde_json::Value>,
 ) -> Result<(), JsonRpcResponse> {
     let canonical = canonicalise_rhai_in_graph_json(graph_json);
     crate::utils::ensure_graph_within_caps(canonical.as_ref(), req_id)?;
-    match state
-        .workflow_repo
-        .update_workflow_graph(wf_id, user_id, canonical.as_ref())
-        .await
-    {
-        // `false` = zero rows matched `id = $2 AND user_id = $3`. Every
-        // caller has already run an ownership-checked read, so this can only
-        // mean the workflow was deleted (or changed hands) between that read
-        // and this write. Reporting Ok here would be the MCP-737/738
-        // misleading-success shape one level down: the handler would answer
-        // "node added" over a graph that was never persisted. Surface it.
-        Ok(true) => Ok(()),
-        Ok(false) => {
-            tracing::warn!(
-                target: "talos_audit",
-                workflow_id = %wf_id,
-                "save_graph_json: UPDATE matched 0 rows — workflow missing or not owned by the \
-                 caller at write time; graph NOT persisted"
-            );
-            Err(mcp_denied(
-                req_id.clone(),
-                -32000,
-                "Workflow not found or access denied",
-            ))
-        }
-        Err(e) => {
-            tracing::error!("save_graph_json: {}", e);
-            Err(mcp_error(
-                req_id.clone(),
-                -32000,
-                "Failed to save workflow graph",
-            ))
-        }
-    }
+    graph_write_response(
+        state
+            .workflow_repo
+            .update_workflow_graph(wf_id, user_id, canonical.as_ref(), expected_version)
+            .await,
+        wf_id,
+        req_id,
+        "save_graph_json",
+    )
+    .map(|_| ())
 }
 
 /// What to do after a graph mutation, decided from the
@@ -953,7 +1000,12 @@ pub(crate) async fn upsert_system_node(
         return Err(crate::utils::workflow_not_found_error(req_id.clone()));
     }
 
-    let graph_json_str = fetch_graph_json_unchecked(state, workflow_id, req_id).await?;
+    // Owner-scoped AND versioned: the write below is a read-modify-write and
+    // must not overwrite a concurrent edit (see `save_graph_json`).
+    let VersionedGraph {
+        graph_json: graph_json_str,
+        graph_version,
+    } = fetch_graph_json(state, workflow_id, user_id, req_id).await?;
     let mut graph: serde_json::Value = serde_json::from_str(&graph_json_str)
         .unwrap_or_else(|_| serde_json::json!({"nodes": [], "edges": []}));
 
@@ -1013,6 +1065,7 @@ pub(crate) async fn upsert_system_node(
         state,
         workflow_id,
         user_id,
+        graph_version,
         &serde_json::to_string(&graph).unwrap_or_default(),
         req_id,
     )
@@ -1993,8 +2046,11 @@ async fn handle_set_speculative_prefetch(
         Err(resp) => return resp,
     };
 
-    let graph_json_str = match fetch_graph_json(state, wf_id, user_id, &req_id).await {
-        Ok(gj) => gj,
+    let VersionedGraph {
+        graph_json: graph_json_str,
+        graph_version,
+    } = match fetch_graph_json(state, wf_id, user_id, &req_id).await {
+        Ok(g) => g,
         Err(e) => return e,
     };
 
@@ -2037,6 +2093,7 @@ async fn handle_set_speculative_prefetch(
         state,
         wf_id,
         user_id,
+        graph_version,
         &serde_json::to_string(&graph).unwrap_or_default(),
         &req_id,
     )
@@ -2076,8 +2133,11 @@ async fn handle_update_node_config(
     let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("");
 
     // Load existing graph
-    let graph_json_str = match fetch_graph_json(state, wf_id, user_id, &req_id).await {
-        Ok(gj) => gj,
+    let VersionedGraph {
+        graph_json: graph_json_str,
+        graph_version,
+    } = match fetch_graph_json(state, wf_id, user_id, &req_id).await {
+        Ok(g) => g,
         Err(e) => return e,
     };
 
@@ -2537,7 +2597,7 @@ async fn handle_update_node_config(
                 }
 
                 let updated_json = graph.to_string();
-                if let Err(e) = save_graph_json(state, wf_id, user_id, &updated_json, &req_id).await {
+                if let Err(e) = save_graph_json(state, wf_id, user_id, graph_version, &updated_json, &req_id).await {
                     return e;
                 }
                 {
@@ -2641,7 +2701,9 @@ async fn handle_update_node_config(
     }
 
     let updated_json = graph.to_string();
-    if let Err(e) = save_graph_json(state, wf_id, user_id, &updated_json, &req_id).await {
+    if let Err(e) =
+        save_graph_json(state, wf_id, user_id, graph_version, &updated_json, &req_id).await
+    {
         return e;
     }
 
@@ -2755,8 +2817,11 @@ async fn handle_update_node_positions(
         return mcp_error(req_id, -32602, "positions map must contain ≤ 5000 entries");
     }
 
-    let graph_json_str = match fetch_graph_json(state, wf_id, user_id, &req_id).await {
-        Ok(gj) => gj,
+    let VersionedGraph {
+        graph_json: graph_json_str,
+        graph_version,
+    } = match fetch_graph_json(state, wf_id, user_id, &req_id).await {
+        Ok(g) => g,
         Err(e) => return e,
     };
 
@@ -2865,7 +2930,9 @@ async fn handle_update_node_positions(
     unknown_node_ids.sort();
 
     let updated_json = serde_json::to_string(&graph).unwrap_or_default();
-    if let Err(e) = save_graph_json(state, wf_id, user_id, &updated_json, &req_id).await {
+    if let Err(e) =
+        save_graph_json(state, wf_id, user_id, graph_version, &updated_json, &req_id).await
+    {
         return e;
     }
 
@@ -2923,8 +2990,11 @@ async fn handle_duplicate_node(
     };
 
     // Load existing graph
-    let graph_json_str = match fetch_graph_json(state, wf_id, user_id, &req_id).await {
-        Ok(gj) => gj,
+    let VersionedGraph {
+        graph_json: graph_json_str,
+        graph_version,
+    } = match fetch_graph_json(state, wf_id, user_id, &req_id).await {
+        Ok(g) => g,
         Err(e) => return e,
     };
 
@@ -2997,7 +3067,9 @@ async fn handle_duplicate_node(
     // it is the documented contract. Sibling siblings at lines 2098
     // (handle_remove_node) and 2151 (handle_update_node_config)
     // closed in the same commit.
-    if let Err(resp) = save_graph_json(state, wf_id, user_id, &updated_json, &req_id).await {
+    if let Err(resp) =
+        save_graph_json(state, wf_id, user_id, graph_version, &updated_json, &req_id).await
+    {
         return resp;
     }
 
@@ -3091,8 +3163,11 @@ async fn handle_add_edge(
     };
 
     // Load existing graph
-    let graph_json_str = match fetch_graph_json(state, wf_id, user_id, &req_id).await {
-        Ok(gj) => gj,
+    let VersionedGraph {
+        graph_json: graph_json_str,
+        graph_version,
+    } = match fetch_graph_json(state, wf_id, user_id, &req_id).await {
+        Ok(g) => g,
         Err(e) => return e,
     };
 
@@ -3150,7 +3225,9 @@ async fn handle_add_edge(
 
     let updated_json = graph.to_string();
     // MCP-737: propagate save errors — see duplicate_node above for rationale.
-    if let Err(resp) = save_graph_json(state, wf_id, user_id, &updated_json, &req_id).await {
+    if let Err(resp) =
+        save_graph_json(state, wf_id, user_id, graph_version, &updated_json, &req_id).await
+    {
         return resp;
     }
 
@@ -3190,8 +3267,11 @@ async fn handle_remove_edge(
     };
 
     // Load existing graph
-    let graph_json_str = match fetch_graph_json(state, wf_id, user_id, &req_id).await {
-        Ok(gj) => gj,
+    let VersionedGraph {
+        graph_json: graph_json_str,
+        graph_version,
+    } = match fetch_graph_json(state, wf_id, user_id, &req_id).await {
+        Ok(g) => g,
         Err(e) => return e,
     };
 
@@ -3210,7 +3290,9 @@ async fn handle_remove_edge(
 
     let updated_json = graph.to_string();
     // MCP-737: propagate save errors — see duplicate_node above for rationale.
-    if let Err(resp) = save_graph_json(state, wf_id, user_id, &updated_json, &req_id).await {
+    if let Err(resp) =
+        save_graph_json(state, wf_id, user_id, graph_version, &updated_json, &req_id).await
+    {
         return resp;
     }
 
@@ -3767,8 +3849,10 @@ async fn handle_copy_node(
     };
 
     // Load source workflow graph
+    // Read-only: the source graph is never written back, so its version is
+    // not needed.
     let source_graph_str = match fetch_graph_json(state, source_wf_id, user_id, &req_id).await {
-        Ok(gj) => gj,
+        Ok(g) => g.graph_json,
         Err(e) => return e,
     };
 
@@ -3789,8 +3873,11 @@ async fn handle_copy_node(
         };
 
     // Load target workflow graph
-    let target_graph_str = match fetch_graph_json(state, target_wf_id, user_id, &req_id).await {
-        Ok(gj) => gj,
+    let VersionedGraph {
+        graph_json: target_graph_str,
+        graph_version,
+    } = match fetch_graph_json(state, target_wf_id, user_id, &req_id).await {
+        Ok(g) => g,
         Err(e) => return e,
     };
 
@@ -3831,7 +3918,15 @@ async fn handle_copy_node(
 
     // Save target workflow
     let updated_graph_str = serde_json::to_string(&target_graph).unwrap_or_default();
-    if let Err(e) = save_graph_json(state, target_wf_id, user_id, &updated_graph_str, &req_id).await
+    if let Err(e) = save_graph_json(
+        state,
+        target_wf_id,
+        user_id,
+        graph_version,
+        &updated_graph_str,
+        &req_id,
+    )
+    .await
     {
         return e;
     }
@@ -3910,8 +4005,11 @@ async fn handle_set_node_description(
     };
 
     // Load workflow graph
-    let graph_json_str = match fetch_graph_json(state, wf_id, user_id, &req_id).await {
-        Ok(gj) => gj,
+    let VersionedGraph {
+        graph_json: graph_json_str,
+        graph_version,
+    } = match fetch_graph_json(state, wf_id, user_id, &req_id).await {
+        Ok(g) => g,
         Err(e) => return e,
     };
 
@@ -3942,7 +4040,16 @@ async fn handle_set_node_description(
 
     // Save updated graph
     let updated_graph_str = serde_json::to_string(&graph).unwrap_or_default();
-    if let Err(e) = save_graph_json(state, wf_id, user_id, &updated_graph_str, &req_id).await {
+    if let Err(e) = save_graph_json(
+        state,
+        wf_id,
+        user_id,
+        graph_version,
+        &updated_graph_str,
+        &req_id,
+    )
+    .await
+    {
         return e;
     }
 
@@ -4252,8 +4359,11 @@ async fn handle_add_skip_condition(
     };
     let dry_run_warning = dry_run_skip_condition(&skip_condition);
 
-    let graph_json_str = match fetch_graph_json(state, workflow_id, user_id, &req_id).await {
-        Ok(gj) => gj,
+    let VersionedGraph {
+        graph_json: graph_json_str,
+        graph_version,
+    } = match fetch_graph_json(state, workflow_id, user_id, &req_id).await {
+        Ok(g) => g,
         Err(e) => return e,
     };
 
@@ -4296,7 +4406,16 @@ async fn handle_add_skip_condition(
     }
 
     let updated_json = serde_json::to_string(&graph).unwrap_or_default();
-    if let Err(e) = save_graph_json(state, workflow_id, user_id, &updated_json, &req_id).await {
+    if let Err(e) = save_graph_json(
+        state,
+        workflow_id,
+        user_id,
+        graph_version,
+        &updated_json,
+        &req_id,
+    )
+    .await
+    {
         return e;
     }
 
@@ -4610,8 +4729,11 @@ async fn handle_set_continue_on_error(
         }
     };
 
-    let graph_json_str = match fetch_graph_json(state, workflow_id, user_id, &req_id).await {
-        Ok(gj) => gj,
+    let VersionedGraph {
+        graph_json: graph_json_str,
+        graph_version,
+    } = match fetch_graph_json(state, workflow_id, user_id, &req_id).await {
+        Ok(g) => g,
         Err(e) => return e,
     };
 
@@ -4654,7 +4776,16 @@ async fn handle_set_continue_on_error(
     }
 
     let updated_json = serde_json::to_string(&graph).unwrap_or_default();
-    if let Err(e) = save_graph_json(state, workflow_id, user_id, &updated_json, &req_id).await {
+    if let Err(e) = save_graph_json(
+        state,
+        workflow_id,
+        user_id,
+        graph_version,
+        &updated_json,
+        &req_id,
+    )
+    .await
+    {
         return e;
     }
 
@@ -4887,8 +5018,11 @@ async fn handle_add_error_handler(
         };
 
     // Load workflow graph
-    let graph_json_str = match fetch_graph_json(state, wf_id, user_id, &req_id).await {
-        Ok(gj) => gj,
+    let VersionedGraph {
+        graph_json: graph_json_str,
+        graph_version,
+    } = match fetch_graph_json(state, wf_id, user_id, &req_id).await {
+        Ok(g) => g,
         Err(e) => return e,
     };
 
@@ -4983,7 +5117,9 @@ async fn handle_add_error_handler(
     }
 
     let updated_json = graph.to_string();
-    if let Err(e) = save_graph_json(state, wf_id, user_id, &updated_json, &req_id).await {
+    if let Err(e) =
+        save_graph_json(state, wf_id, user_id, graph_version, &updated_json, &req_id).await
+    {
         return e;
     }
 
@@ -5039,8 +5175,11 @@ async fn handle_fix_fan_in(
     };
 
     // Load graph
-    let graph_json_str = match fetch_graph_json(state, wf_id, user_id, &req_id).await {
-        Ok(gj) => gj,
+    let VersionedGraph {
+        graph_json: graph_json_str,
+        graph_version,
+    } = match fetch_graph_json(state, wf_id, user_id, &req_id).await {
+        Ok(g) => g,
         Err(e) => return e,
     };
 
@@ -5165,7 +5304,9 @@ async fn handle_fix_fan_in(
 
     // Persist
     let updated_json = graph.to_string();
-    if let Err(e) = save_graph_json(state, wf_id, user_id, &updated_json, &req_id).await {
+    if let Err(e) =
+        save_graph_json(state, wf_id, user_id, graph_version, &updated_json, &req_id).await
+    {
         return e;
     }
 

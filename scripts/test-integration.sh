@@ -714,6 +714,13 @@ CTRL_TESTS=(
     # production write, the owner-only "already decided" answer and the
     # trigger that refuses any writer changing a decision.
     "approval_decision_finality_tests"
+    # `graph_json` read-modify-writes are compare-and-set on `graph_version`
+    # (2026-09-25): two overlapping graph edits used to each write their own
+    # copy and the later silently discarded the earlier. Drives the repository
+    # CAS, the trigger that owns the column, the GraphQL expected version, and
+    # a real MCP handler racing a committed edit (row lock + pg_stat_activity,
+    # no timing). `common` harness, so CTRL_TESTS (64b).
+    "graph_version_tests"
     "workflow_version_tests"
     # #609's closing provenance test (measurement PR 3, D7). Gated here on
     # arrival rather than later: it is the ONLY coverage of the promoted-vs-

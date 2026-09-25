@@ -1118,3 +1118,195 @@ async fn few_shot_projection_carries_everything_the_decrypt_contract_needs() {
 
     cleanup_prefix(&pool, actor_id, &prefix).await;
 }
+
+/// Age every row under `prefix` past the consolidation scan's minimum age.
+async fn age_rows(pool: &Pool<Postgres>, actor_id: Uuid, prefix: &str) {
+    sqlx::query(
+        "UPDATE actor_memory SET updated_at = now() - interval '30 days' \
+         WHERE actor_id = $1 AND key LIKE $2 || '%'",
+    )
+    .bind(actor_id)
+    .bind(prefix)
+    .execute(pool)
+    .await
+    .expect("age rows");
+}
+
+/// The consolidation loop reads its candidates, spends seconds in an LLM call,
+/// then retires them. Until 2026-09-25 the retirement was `DELETE … WHERE key =
+/// ANY($2)`, so a key a writer upserted DURING that call — content the summary
+/// never saw — was deleted with the rest. The retirement is now
+/// compare-and-delete on the `updated_at` each candidate was read at: the
+/// rewritten row survives with its new content, the untouched rows go, and
+/// `__consolidated_from_count__` counts what actually went.
+#[tokio::test]
+async fn consolidation_keeps_a_row_rewritten_after_it_was_read() {
+    let Some((pool, actor_id)) = test_pool_or_skip().await else {
+        return;
+    };
+    let prefix = format!("consol-cas/{}/", Uuid::new_v4());
+    for k in ["a", "b", "c"] {
+        mem::persist_memory(
+            &pool,
+            actor_id,
+            &format!("{prefix}{k}"),
+            &serde_json::json!({ "note": format!("old {k}") }),
+            "episodic",
+            Some(24.0),
+        )
+        .await
+        .expect("persist");
+    }
+    age_rows(&pool, actor_id, &prefix).await;
+
+    // What the loop reads before the LLM call.
+    let candidates: Vec<_> = mem::scan_consolidation_candidates(&pool, actor_id, 1.0, 1.0, 100)
+        .await
+        .expect("scan")
+        .into_iter()
+        .filter(|c| c.key.starts_with(&prefix))
+        .collect();
+    assert_eq!(candidates.len(), 3, "fixture rows must be candidates");
+
+    // A writer upserts `b` while the summary is being generated.
+    let b = format!("{prefix}b");
+    mem::persist_memory(
+        &pool,
+        actor_id,
+        &b,
+        &serde_json::json!({ "note": "NEW b, never summarised" }),
+        "episodic",
+        Some(24.0),
+    )
+    .await
+    .expect("concurrent rewrite");
+
+    let sources: Vec<_> = candidates
+        .iter()
+        .map(|c| mem::RetireSource::if_unchanged(c.key.clone(), c.updated_at))
+        .collect();
+    let summary_key = format!("{prefix}summary");
+    let outcome = mem::consolidate_memory_guarded(
+        &pool,
+        actor_id,
+        &summary_key,
+        serde_json::json!({ "summary": "old a, old b, old c" }),
+        &sources,
+        Some(serde_json::json!({ "kind": "consolidated" })),
+    )
+    .await
+    .expect("consolidate");
+
+    assert_eq!(outcome.retired, 2, "only the unchanged rows are retired");
+    assert_eq!(outcome.kept_changed, vec![b.clone()]);
+    assert!(outcome.summary_written);
+
+    let kept = mem::recall_exact(&pool, actor_id, &b)
+        .await
+        .expect("recall b")
+        .expect("the rewritten row must survive consolidation");
+    assert_eq!(
+        kept.value.get("note").and_then(|v| v.as_str()),
+        Some("NEW b, never summarised")
+    );
+    for k in ["a", "c"] {
+        assert!(
+            mem::recall_exact(&pool, actor_id, &format!("{prefix}{k}"))
+                .await
+                .expect("recall")
+                .is_none(),
+            "{k} was summarised and must be retired"
+        );
+    }
+    let summary = mem::recall_exact(&pool, actor_id, &summary_key)
+        .await
+        .expect("recall summary")
+        .expect("summary written");
+    assert_eq!(
+        summary.value.get("__consolidated_from_count__"),
+        Some(&serde_json::json!(2)),
+        "provenance counts the rows ACTUALLY retired"
+    );
+
+    cleanup_prefix(&pool, actor_id, &prefix).await;
+}
+
+/// Every guarded source changed after it was read: nothing is retired, and
+/// the summary — which describes only content that is still present — is
+/// rolled back rather than written beside it.
+#[tokio::test]
+async fn consolidation_writes_nothing_when_every_source_changed() {
+    let Some((pool, actor_id)) = test_pool_or_skip().await else {
+        return;
+    };
+    let prefix = format!("consol-cas-all/{}/", Uuid::new_v4());
+    let key = format!("{prefix}only");
+    mem::persist_memory(
+        &pool,
+        actor_id,
+        &key,
+        &serde_json::json!({ "note": "old" }),
+        "episodic",
+        Some(24.0),
+    )
+    .await
+    .expect("persist");
+    age_rows(&pool, actor_id, &prefix).await;
+    let read = mem::scan_consolidation_candidates(&pool, actor_id, 1.0, 1.0, 100)
+        .await
+        .expect("scan")
+        .into_iter()
+        .find(|c| c.key == key)
+        .expect("candidate");
+    mem::persist_memory(
+        &pool,
+        actor_id,
+        &key,
+        &serde_json::json!({ "note": "new" }),
+        "episodic",
+        Some(24.0),
+    )
+    .await
+    .expect("rewrite");
+
+    let summary_key = format!("{prefix}summary");
+    let outcome = mem::consolidate_memory_guarded(
+        &pool,
+        actor_id,
+        &summary_key,
+        serde_json::json!({ "summary": "old" }),
+        &[mem::RetireSource::if_unchanged(
+            key.clone(),
+            read.updated_at,
+        )],
+        None,
+    )
+    .await
+    .expect("consolidate");
+    assert_eq!(outcome.retired, 0);
+    assert!(!outcome.summary_written);
+    assert_eq!(outcome.kept_changed, vec![key.clone()]);
+    assert!(mem::recall_exact(&pool, actor_id, &summary_key)
+        .await
+        .expect("recall summary")
+        .is_none());
+    assert!(mem::recall_exact(&pool, actor_id, &key)
+        .await
+        .expect("recall row")
+        .is_some());
+
+    // The operator path (keys only, no read timestamps) still retires by key.
+    let retired = mem::consolidate_memory(
+        &pool,
+        actor_id,
+        &summary_key,
+        serde_json::json!({ "summary": "operator-written" }),
+        std::slice::from_ref(&key),
+        None,
+    )
+    .await
+    .expect("operator consolidate");
+    assert_eq!(retired, 1);
+
+    cleanup_prefix(&pool, actor_id, &prefix).await;
+}

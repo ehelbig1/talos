@@ -44,6 +44,28 @@ export const gql = (strings: TemplateStringsArray, ...values: unknown[]) => {
  */
 export type GraphQLDocument = string | String;
 
+/**
+ * `extensions.code` the server attaches when `updateWorkflow`'s
+ * `expectedGraphVersion` no longer matches the stored graph (someone else
+ * changed it since it was loaded). Mirrors
+ * `talos_api::schema::workflows::mutations::GRAPH_VERSION_CONFLICT_CODE`.
+ */
+export const GRAPH_VERSION_CONFLICT_CODE = "GRAPH_VERSION_CONFLICT";
+
+/**
+ * A GraphQL error the caller must be able to recognise by CODE — the
+ * production sanitizer canonicalises message text, so a message match would
+ * not survive it. Only codes a caller acts on are raised this way.
+ */
+export class GraphQLCodedError extends Error {
+  readonly code: string;
+  constructor(message: string, code: string) {
+    super(message);
+    this.name = "GraphQLCodedError";
+    this.code = code;
+  }
+}
+
 export async function graphqlRequest<T>(
   query: GraphQLDocument,
   variables?: Record<string, unknown>,
@@ -137,6 +159,16 @@ export async function graphqlRequest<T>(
     }
 
     const rawMsg = errors.map((e) => e.message).join(", ");
+
+    const conflict = errors.find(
+      (e) => e.extensions?.code === GRAPH_VERSION_CONFLICT_CODE,
+    );
+    if (conflict) {
+      throw new GraphQLCodedError(
+        sanitizeErrorMessage(conflict.message),
+        GRAPH_VERSION_CONFLICT_CODE,
+      );
+    }
 
     // If we're hitting rate limits, explicitly bubble that up instead of generic sanitization
     if (
