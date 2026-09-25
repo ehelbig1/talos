@@ -35,27 +35,9 @@ let mockWorkflows: unknown[] = [];
 let mockActors: unknown[] = [];
 let mockLatestExecutions: unknown[] = [];
 vi.mock("@/generated/graphql", () => ({
-  useWorkflowsQuery: vi.fn(
-    (_vars: unknown, opts?: { select?: (d: any) => any }) => {
-      const raw = { workflows: mockWorkflows };
-      return {
-        data: opts?.select ? opts.select(raw) : raw,
-        isLoading: false,
-      };
-    },
-  ),
   useListActorsQuery: vi.fn(
     (_vars: unknown, opts?: { select?: (d: any) => any }) => {
       const raw = { actors: mockActors };
-      return {
-        data: opts?.select ? opts.select(raw) : raw,
-        isLoading: false,
-      };
-    },
-  ),
-  useLatestWorkflowExecutionsQuery: vi.fn(
-    (_vars: unknown, opts?: { select?: (d: any) => any }) => {
-      const raw = { latestWorkflowExecutions: mockLatestExecutions };
       return {
         data: opts?.select ? opts.select(raw) : raw,
         isLoading: false,
@@ -78,6 +60,18 @@ vi.mock("@/generated/graphql", () => ({
   })),
   useMySchedulesQuery: vi.fn(() => ({
     data: null,
+    isLoading: false,
+  })),
+}));
+
+// The dashboard's paged/chunked reads (dashboardData.ts has its own tests).
+vi.mock("@/lib/dashboardData", () => ({
+  useDashboardWorkflows: vi.fn(() => ({
+    data: { workflows: mockWorkflows, truncated: false },
+    isLoading: false,
+  })),
+  useLatestExecutions: vi.fn(() => ({
+    data: { latestWorkflowExecutions: mockLatestExecutions },
     isLoading: false,
   })),
 }));
@@ -123,7 +117,8 @@ describe("Dashboard", () => {
   it("renders loading state initially", async () => {
     // Override the hook to return loading state — import the mock dynamically
     const genGraphql = await import("@/generated/graphql");
-    vi.mocked(genGraphql.useWorkflowsQuery).mockReturnValue({
+    const dashData = await import("@/lib/dashboardData");
+    vi.mocked(dashData.useDashboardWorkflows).mockReturnValue({
       data: undefined,
       isLoading: true,
     } as any);
@@ -131,7 +126,7 @@ describe("Dashboard", () => {
       data: undefined,
       isLoading: true,
     } as any);
-    vi.mocked(genGraphql.useLatestWorkflowExecutionsQuery).mockReturnValue({
+    vi.mocked(dashData.useLatestExecutions).mockReturnValue({
       data: undefined,
       isLoading: true,
     } as any);
@@ -159,12 +154,14 @@ describe("Dashboard", () => {
       {
         id: "1",
         name: "Workflow Alpha",
-        graphJson: '{"nodes":[], "edges":[]}',
+        nodeCount: 0,
+        edgeCount: 0,
       },
       {
         id: "2",
         name: "Workflow Beta",
-        graphJson: '{"nodes":[], "edges":[]}',
+        nodeCount: 0,
+        edgeCount: 0,
       },
     ];
 
@@ -176,8 +173,8 @@ describe("Dashboard", () => {
 
   it("filters workflows by search term", async () => {
     mockWorkflows = [
-      { id: "1", name: "Apple", graphJson: '{"nodes":[], "edges":[]}' },
-      { id: "2", name: "Banana", graphJson: '{"nodes":[], "edges":[]}' },
+      { id: "1", name: "Apple", nodeCount: 0, edgeCount: 0 },
+      { id: "2", name: "Banana", nodeCount: 0, edgeCount: 0 },
     ];
 
     renderWithProviders(<Dashboard />);
@@ -199,7 +196,8 @@ describe("Dashboard", () => {
       {
         id: "1",
         name: "Test Workflow",
-        graphJson: '{"nodes":[], "edges":[]}',
+        nodeCount: 0,
+        edgeCount: 0,
       },
     ];
     vi.mocked(loadWorkflowById).mockResolvedValue({

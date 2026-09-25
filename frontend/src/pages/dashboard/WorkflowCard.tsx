@@ -18,8 +18,10 @@ import type { WorkflowRunStatus } from "@/store/executionStore";
 export interface Workflow {
   id: string;
   name: string;
-  graphJson: string;
   actorId?: string | null;
+  /** Counted once when the list is fetched, never per render. */
+  nodeCount: number;
+  edgeCount: number;
 }
 
 export interface WorkflowSchedule {
@@ -40,18 +42,6 @@ export interface WorkflowCardProps {
   actorName?: string;
 }
 
-function parseNodeCount(graphJson: string): { nodes: number; edges: number } {
-  try {
-    const g = JSON.parse(graphJson);
-    return {
-      nodes: g.nodes?.length ?? 0,
-      edges: g.edges?.length ?? 0,
-    };
-  } catch {
-    return { nodes: 0, edges: 0 };
-  }
-}
-
 export default function WorkflowCard({
   workflow,
   runStatus,
@@ -63,7 +53,8 @@ export default function WorkflowCard({
   schedule,
   actorName,
 }: WorkflowCardProps) {
-  const { nodes, edges } = parseNodeCount(workflow.graphJson);
+  const nodes = workflow.nodeCount;
+  const edges = workflow.edgeCount;
   const isRunning = runStatus?.status === "running";
 
   const statusLabel = !runStatus
