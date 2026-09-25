@@ -432,6 +432,13 @@ CTRL_TESTS=(
     # and `not_enrolled` need a real users row, and without the first of them
     # a recorder narrowed to refusals is invisible (measured survivor, DY).
     "privileged_gate_permitted_tests"
+    # Three privilege paths closed 2026-09-25: an API key enrolling or
+    # verifying 2FA to mint a verified session, bcrypt run inline on the async
+    # runtime (and before the already-enrolled refusal), and a capability
+    # bootstrap re-armed by removing the last top grant / a self-revoke that
+    # widens the ceiling. Drives the real schema, TotpService, bootstrap and
+    # MCP handler.
+    "two_factor_session_tests"
     # A user changing their own password: session gate, shared lockout, atomic
     # revocation + audit row, conflict on a concurrent change (2026-09-18).
     "password_change_tests"

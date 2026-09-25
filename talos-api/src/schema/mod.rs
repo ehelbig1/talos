@@ -428,6 +428,12 @@ impl SecondFactorRefusal {
     }
 }
 
+/// `verifyTwoFactor` refuses a session that is not waiting for a 2FA code
+/// (password-only, or already verified): it completes a login, and there is
+/// none to complete.
+pub const NO_PENDING_SECOND_FACTOR: &str =
+    "This session is not waiting for a two-factor code. Sign in to verify one.";
+
 /// The privileged-operation decision, from facts the caller has gathered.
 /// `enrolled` is `None` until it is read, and it is read only when every
 /// cheaper condition has already passed.

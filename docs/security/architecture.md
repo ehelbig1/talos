@@ -267,7 +267,8 @@ Login, 2FA verification and token refresh are GraphQL mutations (`login`,
 ```
 
 A 12-hex-character backup code is accepted in place of a TOTP code (bcrypt-verified
-against the stored backup codes). In production, `verifyTwoFactor` refuses to run
+against the stored backup codes on a blocking thread, and spent by one conditional
+`UPDATE`, so a code verifies once). In production, `verifyTwoFactor` refuses to run
 when no Redis client is configured (`talos-totp-2fa/src/lib.rs`).
 
 ### 3.2 JWT Validation
@@ -313,7 +314,14 @@ caller without checking a scope, and an API-key caller is treated as
 2FA-verified (`talos-api/src/schema/mod.rs`). An API key never satisfies
 `require_second_factor`: the privileged operations need an interactive session
 with a verified second factor. Enabling 2FA signs out the account's existing
-sessions and re-issues the enrolling one as verified.
+sessions and re-issues the enrolling one as verified. An API key cannot set up,
+enable or verify 2FA (`setupTwoFactor`, `enableTwoFactor` and `verifyTwoFactor`
+refuse it), and `verifyTwoFactor` completes only a session that is waiting for
+its code, so a key cannot turn itself into a verified session (until 2026-09-25
+a key of any scope could, on an account without 2FA). An `X-API-Key` request
+gets no cookie jar in the GraphQL handler, so nothing it runs can set a session
+cookie (`controller/src/bootstrap/router.rs`). Enrolment attempts are limited to
+10 per user per 15 minutes (`talos-totp-2fa/src/lib.rs`).
 
 ### 3.4 Refresh Token Flow
 
@@ -375,7 +383,13 @@ names were retired and every gate reads them as unrecognised.
   both single and pipeline paths), which also covers sub-workflow children.
 - Runtime: wasmtime links only the WIT imports of the module's declared world.
 - Grants: a user's own ceiling lives in `user_capability_grants`, whose CHECK
-  constraint admits exactly the 12 worlds; an actor's world cannot exceed it.
+  constraint admits exactly the 12 worlds; an actor's world cannot exceed it. A
+  user with no row holds `http-node`. A user cannot revoke their own grant when
+  that would widen them to it (`minimal-node`, `governance-node`); an admin can
+  (`talos-actor-repository/src/lib.rs::delete_capability_grant`). The first user
+  is promoted to `automation-node` once per deployment, recorded in
+  `capability_bootstrap`; removing that grant later does not promote anyone
+  (`talos-auth/src/bootstrap.rs`).
 
 ### 4.2 Actor Budget System
 

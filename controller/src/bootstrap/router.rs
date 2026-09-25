@@ -1735,9 +1735,6 @@ pub(crate) async fn graphql_handler(
                 .and_then(|s| s.strip_prefix("Bearer ").map(|t| t.to_string()))
         });
 
-    // Inject Cookies into GraphQL context for mutations to set cookies
-    req = req.data(cookies);
-
     // Try API key authentication first (X-API-Key header)
     // MERELY presenting the header commits the request to the API-key lane:
     // a present-but-invalid key fails CLOSED (below), it is NOT downgraded to
@@ -1748,6 +1745,13 @@ pub(crate) async fn graphql_handler(
     // X-API-Key to bypass CSRF and ride the session. Failing closed removes
     // that path.
     let api_key_header_present = headers.contains_key("X-API-Key");
+    // The cookie jar lets mutations set and clear session cookies. An
+    // X-API-Key request gets none (2026-09-25): whether the key is valid or
+    // not, nothing it runs can mint a browser session, and a resolver that
+    // needs the jar refuses it by name (`browser_cookie_jar`).
+    if !api_key_header_present {
+        req = req.data(cookies);
+    }
     let mut authenticated = false;
     // Tracks a JWT session that authenticated but has NOT completed 2FA
     // (password-only). API keys are always 2FA-verified; unauthenticated
@@ -4522,6 +4526,38 @@ mod missing_extension_guard_wiring_tests {
                 "a `{registration}` follows the guard layer, so that route is not covered"
             );
         }
+    }
+}
+
+/// SOURCE PIN, stated as textual: the GraphQL handler hands the cookie jar to
+/// the schema only when the request carries no `X-API-Key` header, and in
+/// exactly one place. `graphql_handler` lives in the controller BINARY, so no
+/// integration test can drive it; the resolver-level refusals are driven in
+/// `controller/tests/two_factor_session_tests`.
+#[cfg(test)]
+mod api_key_cookie_jar_pin {
+    #[test]
+    fn only_a_request_without_an_api_key_header_receives_the_cookie_jar() {
+        let src = include_str!("router.rs");
+        // The production region: a test module later in this file quotes the
+        // needles below.
+        let start = src
+            .find("pub(crate) async fn graphql_handler(")
+            .expect("graphql_handler");
+        let body = &src[start..];
+        let body = &body[..body.find("\n}\n").expect("end of graphql_handler")];
+        let needle = ["req = req.data(", "cookies);"].concat();
+        assert_eq!(
+            body.matches(needle.as_str()).count(),
+            1,
+            "graphql_handler must hand the cookie jar to the schema exactly once"
+        );
+        let at = body.find(needle.as_str()).unwrap();
+        let guard = ["if !api_key_header_present {", "\n        "].concat();
+        assert!(
+            body[..at].ends_with(guard.as_str()),
+            "the cookie jar must be handed over only inside `if !api_key_header_present`"
+        );
     }
 }
 

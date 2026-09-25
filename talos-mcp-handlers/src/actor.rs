@@ -740,7 +740,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "revoke_capability_ceiling",
-            "description": "Revoke a user's capability ceiling grant, reverting them to the default 'http-node' ceiling.",
+            "description": "Revoke a user's capability ceiling grant, reverting them to the default 'http-node' ceiling. You cannot revoke your own grant when that would widen your ceiling (a 'minimal-node' or 'governance-node' grant); a platform admin must.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -4984,7 +4984,7 @@ async fn handle_revoke_capability_ceiling(
         .delete_capability_grant(target_user_id, revoker_id, notes.as_deref())
         .await
     {
-        Ok(rows) if rows > 0 => {
+        Ok(talos_actor_repository::CapabilityGrantRevocation::Revoked { .. }) => {
             // MCP-390's revoke record (who downgraded whom, the ceiling
             // withdrawn, and the operator's `notes`) is written by
             // `delete_capability_grant` in the same transaction as the
@@ -4995,12 +4995,12 @@ async fn handle_revoke_capability_ceiling(
                 &serde_json::to_string_pretty(&serde_json::json!({
                     "revoked": true,
                     "user_id": target_user_str,
-                    "ceiling_reverted_to": "http-node",
+                    "ceiling_reverted_to": talos_capability_world::DEFAULT_USER_CEILING,
                 }))
                 .unwrap_or_default(),
             )
         }
-        Ok(_) => mcp_text(
+        Ok(talos_actor_repository::CapabilityGrantRevocation::NoGrant) => mcp_text(
             req_id,
             &serde_json::to_string_pretty(&serde_json::json!({
                 "revoked": false,
@@ -5009,6 +5009,22 @@ async fn handle_revoke_capability_ceiling(
             }))
             .unwrap_or_default(),
         ),
+        // Withdrawing one's own `minimal-node` / `governance-node` grant
+        // would land on the wider default; nothing was changed.
+        Ok(talos_actor_repository::CapabilityGrantRevocation::SelfRevokeWouldWiden { world }) => {
+            tracing::info!(
+                target: "talos_audit",
+                event_kind = "capability_self_revoke_refused",
+                user_id = %revoker_id,
+                world = %world,
+                "self-revoke refused: it would widen the caller's capability ceiling"
+            );
+            mcp_denied(
+                req_id,
+                -32603,
+                &talos_actor_repository::CapabilityGrantRevocation::self_revoke_refusal(&world),
+            )
+        }
         Err(e) => {
             tracing::error!("revoke_capability_ceiling failed: {:#}", e);
             mcp_error(req_id, -32000, "Failed to revoke capability ceiling")

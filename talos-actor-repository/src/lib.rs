@@ -273,6 +273,33 @@ pub struct ActorMemoryValue {
     pub updated_at: DateTime<Utc>,
 }
 
+/// What `ActorRepository::delete_capability_grant` did.
+#[must_use]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CapabilityGrantRevocation {
+    /// The grant was deleted and the deletion recorded.
+    Revoked { withdrawn: String },
+    /// The user had no grant; nothing changed and nothing was recorded.
+    NoGrant,
+    /// The caller tried to withdraw their own grant, and that would widen
+    /// their ceiling to the default. Nothing changed.
+    SelfRevokeWouldWiden { world: String },
+}
+
+impl CapabilityGrantRevocation {
+    /// The caller-facing refusal for [`Self::SelfRevokeWouldWiden`]; one
+    /// sentence for both the GraphQL and the MCP surface.
+    #[must_use]
+    pub fn self_revoke_refusal(world: &str) -> String {
+        format!(
+            "Your capability grant ('{world}') is narrower than the default ceiling \
+             ('{}'), so removing it would widen your ceiling. Only a platform admin \
+             can revoke it.",
+            talos_capability_world::DEFAULT_USER_CEILING
+        )
+    }
+}
+
 /// Capability grant row returned by `list_capability_grants`.
 #[derive(Debug)]
 pub struct CapabilityGrantRow {
@@ -3158,7 +3185,7 @@ impl ActorRepository {
             Some(world) if talos_capability_world::is_actor_ceiling_world(world) => {
                 world.to_string()
             }
-            _ => "http-node".to_string(),
+            _ => talos_capability_world::DEFAULT_USER_CEILING.to_string(),
         })
     }
 
@@ -3275,29 +3302,48 @@ impl ActorRepository {
         Ok(())
     }
 
-    /// Revoke `target_user_id`'s capability grant, and record it. Returns the
-    /// number of rows deleted (0 when there was no grant, in which case
-    /// nothing is recorded). The deletion and its `capability_grant_revoked`
-    /// row commit in ONE transaction, and the record names the ceiling that
-    /// was withdrawn.
+    /// Revoke `target_user_id`'s capability grant, and record it.
+    ///
+    /// The deletion and its `capability_grant_revoked` row commit in ONE
+    /// transaction, and the record names the ceiling that was withdrawn. No
+    /// grant means no change and no record.
+    ///
+    /// A user may not withdraw their OWN grant when that would widen their
+    /// ceiling (`talos_capability_world::withdrawing_grant_widens`): with no row
+    /// they fall back to `DEFAULT_USER_CEILING`, so self-revoking a
+    /// `minimal-node` or `governance-node` grant used to be a way to raise
+    /// one's own ceiling. That refusal applies to every self-revoke, a
+    /// platform admin's included; revoking ANOTHER user's grant is the admin
+    /// act the callers authorise. The row is locked before the check, so a
+    /// concurrent grant cannot slip between the read and the delete.
     pub async fn delete_capability_grant(
         &self,
         target_user_id: Uuid,
         revoked_by: Uuid,
         notes: Option<&str>,
-    ) -> Result<u64> {
+    ) -> Result<CapabilityGrantRevocation> {
         let mut tx = self.db_pool.begin().await?;
-        let withdrawn: Option<String> = sqlx::query_scalar(
-            "DELETE FROM user_capability_grants WHERE user_id = $1 \
-             RETURNING max_capability_world",
+        let held: Option<String> = sqlx::query_scalar(
+            "SELECT max_capability_world FROM user_capability_grants \
+             WHERE user_id = $1 FOR UPDATE",
         )
         .bind(target_user_id)
         .fetch_optional(&mut *tx)
         .await?;
-        let Some(withdrawn) = withdrawn else {
+        let Some(withdrawn) = held else {
             tx.rollback().await?;
-            return Ok(0);
+            return Ok(CapabilityGrantRevocation::NoGrant);
         };
+        if revoked_by == target_user_id
+            && talos_capability_world::withdrawing_grant_widens(&withdrawn)
+        {
+            tx.rollback().await?;
+            return Ok(CapabilityGrantRevocation::SelfRevokeWouldWiden { world: withdrawn });
+        }
+        sqlx::query("DELETE FROM user_capability_grants WHERE user_id = $1")
+            .bind(target_user_id)
+            .execute(&mut *tx)
+            .await?;
         talos_admin_event_log::insert_on_conn(
             &mut tx,
             Some(revoked_by),
@@ -3314,7 +3360,7 @@ impl ActorRepository {
         )
         .await?;
         tx.commit().await?;
-        Ok(1)
+        Ok(CapabilityGrantRevocation::Revoked { withdrawn })
     }
 
     /// List all capability grants (admin-only). Returns up to 200 rows.

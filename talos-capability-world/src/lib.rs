@@ -505,6 +505,23 @@ pub fn permitted_ceiling_worlds(ceiling: &str) -> Vec<&'static str> {
         .collect()
 }
 
+/// The ceiling a user holds when they have NO `user_capability_grants` row.
+/// Removing a grant puts its holder here.
+pub const DEFAULT_USER_CEILING: &str = "http-node";
+
+/// True when withdrawing a grant of `world` would WIDEN its holder's ceiling:
+/// the default they fall back to permits something `world` did not.
+///
+/// `minimal-node` is below the default, and `governance-node` is incomparable
+/// with it (a governance ceiling has no HTTP), so removing either one grants
+/// something. Every other ceiling already permits `http-node`, so removing it
+/// narrows the holder or leaves them where they were. An unrecognised world
+/// reads as widening, the refusing answer.
+#[must_use]
+pub fn withdrawing_grant_widens(world: &str) -> bool {
+    !ceiling_permits(world, DEFAULT_USER_CEILING)
+}
+
 /// CSV rendering of [`ACTOR_CEILING_WORLDS`].
 pub fn actor_ceiling_worlds_csv() -> String {
     ACTOR_CEILING_WORLDS.join(", ")
@@ -909,6 +926,23 @@ mod ceiling_tests {
     fn denies_secrets_for_unknown_world() {
         assert!(!world_allows_secrets("custom-node"));
         assert!(!world_allows_secrets(""));
+    }
+
+    // -- withdrawing a grant (falls back to DEFAULT_USER_CEILING) --
+
+    #[test]
+    fn withdrawing_a_grant_widens_exactly_when_the_default_is_not_covered() {
+        let widening: Vec<&str> = ACTOR_CEILING_WORLDS
+            .iter()
+            .copied()
+            .filter(|w| withdrawing_grant_widens(w))
+            .collect();
+        assert_eq!(widening, vec!["minimal-node", "governance-node"]);
+        // The default itself is not a widening, and an unknown world is.
+        assert!(!withdrawing_grant_widens(DEFAULT_USER_CEILING));
+        assert!(withdrawing_grant_widens("custom-node"));
+        assert!(withdrawing_grant_widens(""));
+        assert!(is_actor_ceiling_world(DEFAULT_USER_CEILING));
     }
 
     // -- ceiling_permits (partial-order lattice gate) --
