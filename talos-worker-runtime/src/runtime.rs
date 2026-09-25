@@ -62,25 +62,81 @@ pub(crate) fn epoch_ticks_for_timeout(timeout: Duration) -> u64 {
     ticks.max(1)
 }
 
-/// Spawn a background tokio task that increments the engine's epoch
-/// counter every `EPOCH_TICK_INTERVAL_MS`. Returns a `JoinHandle` the
-/// caller can keep (or drop — the task lives for the lifetime of the
-/// process, but cancellation drops cleanly).
+/// The engine's epoch ticker: a dedicated OS thread that calls
+/// `increment_epoch()` every [`EPOCH_TICK_INTERVAL_MS`].
 ///
-/// `Engine` clones are cheap (internal `Arc`) so the closure owns its
-/// own handle without sharing with the runtime's primary engine.
-pub fn spawn_epoch_ticker(engine: Engine) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_millis(EPOCH_TICK_INTERVAL_MS));
-        // Skip the first immediate tick so the engine epoch doesn't
-        // tick at process startup before any deadlines are set.
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        ticker.tick().await;
-        loop {
-            ticker.tick().await;
-            engine.increment_epoch();
-        }
-    })
+/// **Owned by the runtime, started by its constructor (2026-09-25).** Until
+/// then the ticker was a free `spawn_epoch_ticker(engine)` that every binary
+/// had to remember to call, and exactly one did: `worker/src/main.rs`. The
+/// controller builds its own `TalosRuntime` (`bootstrap/services.rs`) for
+/// `run_sandbox`, `test_module`, scratch sessions and module replay — all of
+/// which execute caller-supplied WASM in the CONTROLLER process — and never
+/// started one. With no ticker the engine epoch stays at 0, every
+/// `arm_epoch_deadline` deadline is permanently in the future, and the only
+/// remaining bound is fuel. Fuel prices GUEST instructions, not host work: a
+/// call into a host function costs a handful of fuel however long the host
+/// spends on it, so a guest looping on `json::parse` of a 1 MB string pays a
+/// few fuel per iteration for a full parse each — the default 10M-fuel budget
+/// allows on the order of a million of them. Measured on a runtime with no
+/// ticker: that loop was still running at a 30 s watchdog, against a 2 s
+/// configured timeout (`kill_switch_tests::
+/// a_host_call_loop_under_default_fuel_is_bounded_by_wall_clock`). (Bulk memory
+/// is NOT the hole: the
+/// 2026-09-25 review said `memory.fill` / `memory.copy` cost a flat 5 fuel, but
+/// wasmtime 47's `pre_translate_bulk_op` charges a dynamic-length bulk op its
+/// byte length on top — measured, a 16 MiB fill loop exhausts a 10M budget in
+/// 40 ms.) And the `tokio::time::timeout` around `call_async` cannot fire,
+/// because a host fn that never awaits never returns `Pending`. Moving the
+/// ticker into the constructor makes "a runtime without a ticker"
+/// unrepresentable rather than a thing to remember.
+///
+/// **A thread, not a tokio task.** A ticker task runs on the same worker
+/// threads as the guests it is supposed to preempt. With N tokio workers and N
+/// compute-bound guests that never yield, the task is starved, the epoch stops
+/// advancing, and nothing is ever interrupted — the mechanism fails under
+/// exactly the load it exists for. A dedicated thread cannot be starved by the
+/// runtime and does not need one to exist (the constructor is synchronous).
+///
+/// **Lifetime.** The thread holds an [`wasmtime::EngineWeak`] (wasmtime's own
+/// recommendation for a ticking thread), so it never keeps an engine alive,
+/// and `Drop` sets a stop flag, so a dropped runtime's thread exits within one
+/// tick instead of lingering until every `Component` and `InstancePre` clone
+/// of the engine has also gone. Tests build many runtimes; each thread lives
+/// only as long as its runtime.
+pub(crate) struct EpochTicker {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl EpochTicker {
+    /// Start the ticking thread for `engine`. Failing to start it is a
+    /// construction error: a runtime whose epoch never advances has no
+    /// wall-clock bound on a compute-bound guest, which is the defect this
+    /// type exists to make unrepresentable.
+    pub(crate) fn start(engine: &Engine) -> Result<Self> {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_stop = stop.clone();
+        let weak = engine.weak();
+        std::thread::Builder::new()
+            .name("talos-epoch-ticker".into())
+            .spawn(move || loop {
+                std::thread::sleep(Duration::from_millis(EPOCH_TICK_INTERVAL_MS));
+                if thread_stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                match weak.upgrade() {
+                    Some(engine) => engine.increment_epoch(),
+                    None => return,
+                }
+            })
+            .map_err(|e| anyhow::anyhow!("failed to start the WASM epoch ticker thread: {e}"))?;
+        Ok(Self { stop })
+    }
+}
+
+impl Drop for EpochTicker {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
 }
 
 /// Build the operator-facing message for a fuel-exhaustion trap.
@@ -2134,8 +2190,10 @@ pub(crate) fn circuit_open_message(host: &str) -> String {
 /// Return the first declared host whose per-host circuit breaker is
 /// currently OPEN, or `None` if none are.
 ///
-/// The breaker keys on the target HOST (never the full URL), so this
-/// matches a module's `allowed_hosts` entry against the breaker state.
+/// The breaker keys on `host:port` (never the full URL) and only a
+/// scheme-default port can ever open, so an `allowed_hosts` entry — a host,
+/// not a port — is matched against those two keys by
+/// [`crate::circuit_breaker::HttpCircuitBreaker::is_host_open`].
 /// A wildcard (`*`) or empty entry is skipped — we can't identify the
 /// real target for a wildcard grant, so those fall through to the normal
 /// transient-retry path rather than being gated by an unrelated host's
@@ -2147,7 +2205,7 @@ pub(crate) fn first_open_circuit_host_in<'a>(
 ) -> Option<&'a str> {
     allowed_hosts.iter().map(|h| h.trim()).find(|h| {
         let h = *h;
-        !h.is_empty() && h != "*" && breaker.is_open(h)
+        !h.is_empty() && h != "*" && breaker.is_host_open(h)
     })
 }
 
@@ -2523,6 +2581,9 @@ pub struct TalosRuntime {
     /// mechanism with zero producers. Entries are RAII-scoped; see
     /// [`crate::cancel_registry`].
     cancel_registry: Arc<crate::cancel_registry::CancelRegistry>,
+    /// The engine's epoch ticker, started by the constructor. Held only for
+    /// its `Drop`; see [`EpochTicker`] for why no caller starts one any more.
+    _epoch_ticker: EpochTicker,
 }
 
 // ── Linker builders ──────────────────────────────────────────────────────────
@@ -3054,11 +3115,9 @@ impl TalosRuntime {
         self.redis_client.clone()
     }
 
-    /// M1 (2026-05-22): expose the engine handle so callers (worker
-    /// `main`) can start the background epoch-ticker via
-    /// `spawn_epoch_ticker`. `Engine` is cheap to clone (internal
-    /// `Arc`); cloning gives the ticker an independent handle without
-    /// borrowing through the runtime.
+    /// Expose the engine handle. `Engine` is cheap to clone (internal
+    /// `Arc`). No caller needs it to start the epoch ticker any more — the
+    /// constructor does that (see [`EpochTicker`]).
     pub fn engine_handle(&self) -> Engine {
         self.engine.clone()
     }
@@ -3219,9 +3278,9 @@ impl TalosRuntime {
         //     The deadline is denominated in epoch ticks (one per
         //     `EPOCH_TICK_INTERVAL`); we set it from the per-job
         //     `timeout` so it matches the wall-clock budget.
-        //   * Background ticker — `TalosRuntime::spawn_epoch_ticker`
-        //     calls `engine.increment_epoch()` once per
-        //     EPOCH_TICK_INTERVAL on a dedicated tokio task.
+        //   * Background ticker — [`EpochTicker`], started by this
+        //     constructor, calls `engine.increment_epoch()` once per
+        //     EPOCH_TICK_INTERVAL on a dedicated OS thread.
         //
         // Cost: one atomic increment per tick on the ticker thread
         // + a relaxed load at every loop backedge / function entry
@@ -3306,6 +3365,9 @@ impl TalosRuntime {
         config.cranelift_opt_level(wasmtime::OptLevel::Speed);
 
         let engine = Engine::new(&config)?;
+        // Started here, before anything can execute on this engine, so every
+        // runtime — worker and controller alike — has a live epoch.
+        let _epoch_ticker = EpochTicker::start(&engine)?;
         tracing::info!(
             // Do NOT re-type the version here. This field is what an
             // operator greps to confirm a security bump landed, and it read
@@ -3468,6 +3530,7 @@ impl TalosRuntime {
                 .filter(|n| *n > 0),
             global_expose_fallback: Arc::new(crate::expose_fallback::ExposeFallback::new()),
             cancel_registry: Arc::new(crate::cancel_registry::CancelRegistry::new()),
+            _epoch_ticker,
         })
     }
 
@@ -4333,7 +4396,7 @@ impl TalosRuntime {
         store.limiter(|ctx| ctx as &mut dyn wasmtime::ResourceLimiter);
 
         // M1 (2026-05-22): set the epoch interruption deadline. The
-        // ticker in `spawn_epoch_ticker` increments the engine epoch
+        // runtime's `EpochTicker` thread increments the engine epoch
         // every `EPOCH_TICK_INTERVAL_MS`; this Store traps when the
         // engine reaches `current_epoch + deadline_ticks`. Closes the
         // gap where fuel and wall-clock timeout could both miss a
@@ -4383,19 +4446,25 @@ impl TalosRuntime {
         // ── InstancePre cache lookup ─────────────────────────────────────────
         // On cache hit:  zero compilation, zero linking — just instantiate.
         // On cache miss: compile → link → pre-instantiate → cache.
+        // The cache lookup is resolved to an owned value BEFORE the miss arm,
+        // which now awaits the off-executor compile: a DashMap `Ref` must not
+        // be alive across that await.
+        let cached = cache.get(&module_hash_bytes).map(|entry| entry.clone());
         let instance_pre = {
-            if let Some(entry) = cache.get(&module_hash_bytes) {
+            if let Some(entry) = cached {
                 metrics.cache_hit = true;
                 metrics.compilation_ms = 0;
                 span.add_event("cache_hit");
                 span.set_attribute_bool("cache_hit", true);
-                entry.clone()
+                entry
             } else {
                 metrics.cache_hit = false;
                 span.add_event("compilation_started");
                 span.set_attribute_bool("cache_hit", false);
                 let compilation_start = std::time::Instant::now();
-                let component = self.compile_component_guarded(wasm_bytes, cap.clone())?;
+                let component = self
+                    .compile_component_guarded(wasm_bytes, cap.clone())
+                    .await?;
                 let pre = linker.instantiate_pre(&component)?;
                 metrics.compilation_ms = compilation_start.elapsed().as_millis() as u64;
                 span.add_event("compilation_completed");
@@ -4857,11 +4926,15 @@ impl TalosRuntime {
         hasher.update(wasm_bytes);
         let cache_key: [u8; 32] = hasher.finalize().into();
 
+        // Owned before the awaiting miss arm — see the sibling site above.
+        let cached = cache.get(&cache_key).map(|entry| entry.clone());
         let instance_pre = {
-            if let Some(entry) = cache.get(&cache_key) {
-                entry.clone()
+            if let Some(entry) = cached {
+                entry
             } else {
-                let component = self.compile_component_guarded(wasm_bytes, cap.clone())?;
+                let component = self
+                    .compile_component_guarded(wasm_bytes, cap.clone())
+                    .await?;
                 let pre = linker.instantiate_pre(&component)?;
                 self.cache_insert_instance_pre(tier, cache, cache_key, pre.clone());
                 pre
@@ -5104,12 +5177,15 @@ impl TalosRuntime {
             let (linker, cache, tier) = self.select_tier(&cap)?;
 
             // Get or compile InstancePre.
+            // Owned before the awaiting miss arm — see `execute_job_with_full_features`.
+            let cached = cache.get(&module_hash_bytes).map(|entry| entry.clone());
             let instance_pre = {
-                if let Some(entry) = cache.get(&module_hash_bytes) {
-                    entry.clone()
+                if let Some(entry) = cached {
+                    entry
                 } else {
-                    let component =
-                        self.compile_component_guarded(&step.wasm_bytes, cap.clone())?;
+                    let component = self
+                        .compile_component_guarded(&step.wasm_bytes, cap.clone())
+                        .await?;
                     let pre = linker.instantiate_pre(&component)?;
                     self.cache_insert_instance_pre(tier, cache, module_hash_bytes, pre.clone());
                     pre
@@ -5621,8 +5697,9 @@ impl TalosRuntime {
                 }
             };
 
-            let component_result: anyhow::Result<Component> =
-                self.compile_component_guarded(&wasm_bytes, cap.clone());
+            let component_result: anyhow::Result<Component> = self
+                .compile_component_guarded(&wasm_bytes, cap.clone())
+                .await;
 
             match component_result {
                 Ok(component) => match linker.instantiate_pre(&component) {
@@ -5796,29 +5873,34 @@ impl TalosRuntime {
     /// this file routes through here — do not call `Component::new`
     /// directly (an unguarded site reopens the worker-DoS surface; the
     /// structural lint `no_unguarded_component_new` enforces this).
-    // disallowed-method: wasmtime::component::Component::new — compile_component_guarded, the one call site, inside the panic guard
-    #[allow(clippy::disallowed_methods)]
-    fn compile_component_guarded(
+    ///
+    /// **Off the async executor (2026-09-25).** Cranelift codegen for a cache
+    /// miss is seconds of pure CPU on a large component, and this used to run
+    /// inline in the async execution path — on a tokio worker thread, which
+    /// in the controller is a request-serving thread. The work now runs on the
+    /// blocking pool via `spawn_blocking`; the engine is an `Arc` clone and
+    /// the bytes are copied once per MISS (a hit never reaches here). The
+    /// panic guard runs INSIDE the blocking task, so a codegen panic is still
+    /// a clean per-job `Err`, and a `JoinError` (the task itself failing) is
+    /// mapped to the same generic message rather than propagated.
+    async fn compile_component_guarded(
         &self,
         wasm_bytes: &[u8],
         cap: crate::wit_inspector::CapabilityWorld,
     ) -> Result<Component> {
-        let is_aot = wasm_bytes.starts_with(AOT_VERSION_HDR);
-        let phase = if is_aot {
-            "aot_deserialize"
-        } else {
-            "jit_compile"
-        };
-        guard_codegen_panic(phase, || {
-            if is_aot {
-                self.load_precompiled(wasm_bytes, cap)
-            } else {
-                // THIS is the guarded chokepoint (wrapped by guard_codegen_panic
-                // above); all other sites route here. Trailing marker keeps it on
-                // the call line so the line-based lint (check 53) sees the opt-out.
-                Component::new(&self.engine, wasm_bytes).map_err(Into::into)
-            }
-        })
+        let engine = self.engine.clone();
+        let bytes = wasm_bytes.to_vec();
+        tokio::task::spawn_blocking(move || compile_component_guarded_on(&engine, &bytes, cap))
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    target: "talos_worker",
+                    event_kind = "wasm_compile_task_failed",
+                    error = %e,
+                    "WASM compile task did not complete"
+                );
+                anyhow::anyhow!("module compilation did not complete")
+            })?
     }
 
     pub fn load_precompiled(
@@ -5826,102 +5908,144 @@ impl TalosRuntime {
         precompiled_bytes: &[u8],
         expected_cap: crate::wit_inspector::CapabilityWorld,
     ) -> Result<Component> {
-        use hmac::{Hmac, Mac};
-        use sha2::Sha256;
-        use subtle::ConstantTimeEq;
+        load_precompiled_on(&self.engine, precompiled_bytes, expected_cap)
+    }
+}
 
-        let deserialize_start = std::time::Instant::now();
-
-        // ── Step 1: verify version header ────────────────────────────────────
-        const VERSION_HDR: &[u8] = AOT_VERSION_HDR;
-        let min_len = VERSION_HDR.len() + AOT_HMAC_LEN;
-        if precompiled_bytes.len() < VERSION_HDR.len() {
-            anyhow::bail!("Precompiled blob too short to contain version header");
+/// The synchronous body of [`TalosRuntime::compile_component_guarded`]: the
+/// ONE place raw module bytes become a `Component`, AOT or JIT, inside the
+/// codegen panic guard. A free function over `&Engine` so it can run on the
+/// blocking pool without borrowing the runtime.
+// disallowed-method: wasmtime::component::Component::new — compile_component_guarded_on, the one call site, inside the panic guard
+#[allow(clippy::disallowed_methods)]
+fn compile_component_guarded_on(
+    engine: &Engine,
+    wasm_bytes: &[u8],
+    cap: crate::wit_inspector::CapabilityWorld,
+) -> Result<Component> {
+    let is_aot = wasm_bytes.starts_with(AOT_VERSION_HDR);
+    let phase = if is_aot {
+        "aot_deserialize"
+    } else {
+        "jit_compile"
+    };
+    guard_codegen_panic(phase, || {
+        if is_aot {
+            load_precompiled_on(engine, wasm_bytes, cap)
+        } else {
+            // THIS is the guarded chokepoint (wrapped by guard_codegen_panic
+            // above); all other sites route here. Check 53 is a clippy
+            // `disallowed-methods` rule: the allow on this function is the one
+            // sanctioned exception.
+            Component::new(engine, wasm_bytes).map_err(Into::into)
         }
-        let (hdr, after_hdr) = precompiled_bytes.split_at(VERSION_HDR.len());
-        if hdr != VERSION_HDR {
-            anyhow::bail!(
-                "Precompiled WASM version mismatch – expected {} (version-, \
+    })
+}
+
+/// Verify an AOT blob's integrity tag and deserialize it on `engine`. See
+/// [`TalosRuntime::load_precompiled`] for the contract.
+fn load_precompiled_on(
+    engine: &Engine,
+    precompiled_bytes: &[u8],
+    expected_cap: crate::wit_inspector::CapabilityWorld,
+) -> Result<Component> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    use subtle::ConstantTimeEq;
+
+    let deserialize_start = std::time::Instant::now();
+
+    // ── Step 1: verify version header ────────────────────────────────────
+    const VERSION_HDR: &[u8] = AOT_VERSION_HDR;
+    let min_len = VERSION_HDR.len() + AOT_HMAC_LEN;
+    if precompiled_bytes.len() < VERSION_HDR.len() {
+        anyhow::bail!("Precompiled blob too short to contain version header");
+    }
+    let (hdr, after_hdr) = precompiled_bytes.split_at(VERSION_HDR.len());
+    if hdr != VERSION_HDR {
+        anyhow::bail!(
+            "Precompiled WASM version mismatch – expected {} (version-, \
                  cap-world-, and engine-config-bound HMAC). This blob was compiled \
                  with an older Talos version. Recompile the module.",
-                std::str::from_utf8(VERSION_HDR).unwrap_or("?")
-            );
-        }
-
-        // Guard against legacy blobs that pre-date HMAC signing (they have the
-        // version header but no HMAC tag).  Rather than silently deserializing
-        // untrusted bytes, reject them so the caller knows to recompile.
-        if precompiled_bytes.len() < min_len {
-            anyhow::bail!(
-                "Precompiled blob missing HMAC integrity tag (legacy format). \
-                 Recompile the module to get a signed blob."
-            );
-        }
-
-        // ── Step 2: verify HMAC-SHA256 integrity tag ─────────────────────────
-        // Try each key in the key ring (current key first, then previous keys).
-        // This enables graceful key rotation without invalidating cached blobs.
-        // The HMAC input incorporates expected_cap, so a cap-world mismatch
-        // surfaces as a verification failure here — no separate cap-tag-in-blob
-        // is needed.
-        let (stored_tag, serialized) = after_hdr.split_at(AOT_HMAC_LEN);
-        let key_ring = aot_key_ring();
-        let hmac_input = aot_hmac_input(&expected_cap, serialized);
-        let mut verified = false;
-        let mut matched_key_index = 0usize;
-
-        for (idx, key) in key_ring.verification_keys.iter().enumerate() {
-            let mut mac = Hmac::<Sha256>::new_from_slice(key)
-                .map_err(|e| anyhow::anyhow!("Failed to create AOT HMAC: {}", e))?;
-            mac.update(&hmac_input);
-            let expected_tag = mac.finalize().into_bytes();
-
-            // Constant-time comparison to prevent timing side-channels.
-            if stored_tag.ct_eq(expected_tag.as_slice()).unwrap_u8() == 1 {
-                verified = true;
-                matched_key_index = idx;
-                break;
-            }
-        }
-
-        if !verified {
-            anyhow::bail!(
-                "AOT blob HMAC verification failed — blob may have been tampered with, \
-                 compiled by a different instance, or compiled for a different \
-                 capability world (expected={}). Recompile the module.",
-                expected_cap.as_str()
-            );
-        }
-
-        // Log when a blob was verified with a previous (non-current) key for
-        // operational visibility during key rotation.
-        if matched_key_index > 0 {
-            tracing::info!(
-                key_index = matched_key_index,
-                capability_world = %expected_cap.as_str(),
-                "AOT blob verified with previous key (index {}) — consider recompiling to use current key",
-                matched_key_index
-            );
-        }
-
-        // ── Step 3: deserialize ───────────────────────────────────────────────
-        // SAFETY: The binary blob has just been cryptographically verified
-        // using HMAC-SHA256 under the trusted master key. The tag covers
-        // (version, expected_cap, serialized), so this point is reached only
-        // when the serialized bytes were produced locally for this exact
-        // cap-world.
-        let component = unsafe { Component::deserialize(&self.engine, serialized)? };
-
-        tracing::info!(
-            duration_ms = deserialize_start.elapsed().as_millis(),
-            payload_bytes = serialized.len(),
-            capability_world = %expected_cap.as_str(),
-            "AOT deserialization complete"
+            std::str::from_utf8(VERSION_HDR).unwrap_or("?")
         );
-
-        Ok(component)
     }
 
+    // Guard against legacy blobs that pre-date HMAC signing (they have the
+    // version header but no HMAC tag).  Rather than silently deserializing
+    // untrusted bytes, reject them so the caller knows to recompile.
+    if precompiled_bytes.len() < min_len {
+        anyhow::bail!(
+            "Precompiled blob missing HMAC integrity tag (legacy format). \
+                 Recompile the module to get a signed blob."
+        );
+    }
+
+    // ── Step 2: verify HMAC-SHA256 integrity tag ─────────────────────────
+    // Try each key in the key ring (current key first, then previous keys).
+    // This enables graceful key rotation without invalidating cached blobs.
+    // The HMAC input incorporates expected_cap, so a cap-world mismatch
+    // surfaces as a verification failure here — no separate cap-tag-in-blob
+    // is needed.
+    let (stored_tag, serialized) = after_hdr.split_at(AOT_HMAC_LEN);
+    let key_ring = aot_key_ring();
+    let hmac_input = aot_hmac_input(&expected_cap, serialized);
+    let mut verified = false;
+    let mut matched_key_index = 0usize;
+
+    for (idx, key) in key_ring.verification_keys.iter().enumerate() {
+        let mut mac = Hmac::<Sha256>::new_from_slice(key)
+            .map_err(|e| anyhow::anyhow!("Failed to create AOT HMAC: {}", e))?;
+        mac.update(&hmac_input);
+        let expected_tag = mac.finalize().into_bytes();
+
+        // Constant-time comparison to prevent timing side-channels.
+        if stored_tag.ct_eq(expected_tag.as_slice()).unwrap_u8() == 1 {
+            verified = true;
+            matched_key_index = idx;
+            break;
+        }
+    }
+
+    if !verified {
+        anyhow::bail!(
+            "AOT blob HMAC verification failed — blob may have been tampered with, \
+                 compiled by a different instance, or compiled for a different \
+                 capability world (expected={}). Recompile the module.",
+            expected_cap.as_str()
+        );
+    }
+
+    // Log when a blob was verified with a previous (non-current) key for
+    // operational visibility during key rotation.
+    if matched_key_index > 0 {
+        tracing::info!(
+            key_index = matched_key_index,
+            capability_world = %expected_cap.as_str(),
+            "AOT blob verified with previous key (index {}) — consider recompiling to use current key",
+            matched_key_index
+        );
+    }
+
+    // ── Step 3: deserialize ───────────────────────────────────────────────
+    // SAFETY: The binary blob has just been cryptographically verified
+    // using HMAC-SHA256 under the trusted master key. The tag covers
+    // (version, expected_cap, serialized), so this point is reached only
+    // when the serialized bytes were produced locally for this exact
+    // cap-world.
+    let component = unsafe { Component::deserialize(engine, serialized)? };
+
+    tracing::info!(
+        duration_ms = deserialize_start.elapsed().as_millis(),
+        payload_bytes = serialized.len(),
+        capability_world = %expected_cap.as_str(),
+        "AOT deserialization complete"
+    );
+
+    Ok(component)
+}
+
+impl TalosRuntime {
     /// Execute a pre-compiled WASM module (AOT mode).
     ///
     /// Linker tier is selected from the supplied `cap`, matching the JIT path
@@ -6577,7 +6701,9 @@ mod pipeline_step_retry_tests {
         assert_eq!(first_open_circuit_host_in(&cb, &hosts), None);
         // Trip the breaker for one declared host (default threshold = 5).
         for _ in 0..5 {
-            cb.record_failure("gmail.googleapis.com");
+            cb.record_failure(&crate::circuit_breaker::https_breaker_key(
+                "gmail.googleapis.com",
+            ));
         }
         assert_eq!(
             first_open_circuit_host_in(&cb, &hosts),
@@ -6592,7 +6718,9 @@ mod pipeline_step_retry_tests {
         // A wildcard grant can't identify a real target host, so even a
         // fully-open breaker for some host must not gate a "*" module.
         for _ in 0..5 {
-            cb.record_failure("anything.example.com");
+            cb.record_failure(&crate::circuit_breaker::https_breaker_key(
+                "anything.example.com",
+            ));
         }
         let hosts = vec!["*".to_string(), "".to_string(), "  ".to_string()];
         assert_eq!(first_open_circuit_host_in(&cb, &hosts), None);

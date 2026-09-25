@@ -126,14 +126,30 @@ fn top_level_root_selection_has_introspection(stripped: &str) -> bool {
 /// `__schema` / `__type` meta-field at its top level. The
 /// fragment's brace-balanced body is matched lexically (no full
 /// parse) — sufficient for shape-based detection.
+///
+/// **Linear since 2026-09-25.** The first version found each fragment's
+/// body by walking forward from its `{` to the matching `}`
+/// (`find_brace_balanced_body`) and, when there was no matching `}`, stepped
+/// past the keyword and tried again. An input of `fragment{` repeated —
+/// every body unbalanced — therefore rescanned the whole remaining query once
+/// per keyword: O(n²), about 5·10¹⁰ byte steps for a 1 MB query (the cap
+/// `execute_graphql_inner` allows), and it ran BEFORE the allowlist and the
+/// rate-limit charge, so a guest could repeat it for free. Every `{` is now
+/// matched to its `}` once, up front, by [`match_braces`]; the scan itself
+/// only moves forward. The verdict is unchanged for every input — pinned
+/// against the retained quadratic reference by
+/// `the_linear_scan_agrees_with_the_quadratic_reference`.
 fn fragment_body_has_introspection(stripped: &str) -> bool {
     let bytes = stripped.as_bytes();
-    // Walk for the literal `fragment` keyword with word boundaries.
+    let braces = match_braces(bytes);
+    // Index into `braces` of the first `{` not yet behind the scan. The scan
+    // position only ever increases, so this pointer does too.
+    let mut next_brace = 0usize;
     let mut i = 0;
     while i + 8 < bytes.len() {
         // Cheap initial filter: only attempt the full keyword match
-        // when we see `f` (saves walking byte-by-byte for the rest
-        // of the keyword on every position).
+        // when we see `f`. `bytes[i]` being ASCII also makes `i` a char
+        // boundary, so the slice below cannot panic.
         if bytes[i] == b'f'
             && stripped[i..].starts_with("fragment")
             && is_word_boundary_left(bytes, i)
@@ -142,31 +158,31 @@ fn fragment_body_has_introspection(stripped: &str) -> bool {
                 .map(|c| !(c.is_ascii_alphanumeric() || *c == b'_'))
                 .unwrap_or(true)
         {
-            // Find the opening brace of the fragment body. Anything
-            // between the `fragment` keyword and the next `{` is the
-            // fragment name + `on <type>` clause — we don't care
-            // about its contents, only that we find the brace that
-            // opens the body.
-            let tail = &stripped[i + 8..];
-            if let Some(brace_off) = tail.find('{') {
-                let body_start = i + 8 + brace_off + 1;
-                let body = match find_brace_balanced_body(&stripped[body_start..]) {
-                    Some(b) => b,
+            // The opening brace of the fragment body is the first `{` after
+            // the keyword. Anything between is the fragment name + `on
+            // <type>` clause — we don't care about its contents.
+            while next_brace < braces.len() && braces[next_brace].0 < i + 8 {
+                next_brace += 1;
+            }
+            if let Some(&(open, close)) = braces.get(next_brace) {
+                match close {
+                    Some(close) => {
+                        if root_selection_imports_introspection(&stripped[open + 1..close]) {
+                            return true;
+                        }
+                        // Skip past the body we already scanned.
+                        i = close;
+                        continue;
+                    }
                     None => {
-                        // Malformed fragment — give up on this match
-                        // and continue scanning. The whole query will
-                        // almost certainly fail downstream parse, so
-                        // we don't need a precise verdict here.
+                        // Malformed fragment — give up on this match and
+                        // continue scanning. The whole query will almost
+                        // certainly fail downstream parse, so we don't need
+                        // a precise verdict here.
                         i += 8;
                         continue;
                     }
-                };
-                if root_selection_imports_introspection(body) {
-                    return true;
                 }
-                // Skip past the body we already scanned.
-                i = body_start + body.len();
-                continue;
             }
         }
         i += 1;
@@ -174,10 +190,37 @@ fn fragment_body_has_introspection(stripped: &str) -> bool {
     false
 }
 
-/// Returns the brace-balanced body of a block whose opening `{`
-/// has already been consumed. The returned slice ends at the
-/// matching `}` (exclusive). Returns `None` if no matching brace
-/// is found (malformed input).
+/// Every `{` in `bytes`, in order, paired with the index of its matching `}`
+/// (`None` = it never closes). One pass with a stack, so a query is walked
+/// once however many fragments it declares. A `}` with nothing open is
+/// ignored, exactly as the depth counter it replaces ignored it (that counter
+/// started at 1 on the `{` it was matching, so a stray `}` before any `{`
+/// never reached it). The stack holds indices into the result, so the
+/// allocation is bounded by the number of braces in the (1 MB-capped) query.
+fn match_braces(bytes: &[u8]) -> Vec<(usize, Option<usize>)> {
+    let mut out: Vec<(usize, Option<usize>)> = Vec::new();
+    let mut open: Vec<usize> = Vec::new();
+    for (i, &b) in bytes.iter().enumerate() {
+        match b {
+            b'{' => {
+                open.push(out.len());
+                out.push((i, None));
+            }
+            b'}' => {
+                if let Some(slot) = open.pop() {
+                    out[slot].1 = Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// The pre-2026-09-25 body finder, kept ONLY as the reference the linear
+/// scan is checked against. Returns the brace-balanced body of a block whose
+/// opening `{` has already been consumed, or `None` if it never closes.
+#[cfg(test)]
 fn find_brace_balanced_body(after_open: &str) -> Option<&str> {
     let bytes = after_open.as_bytes();
     let mut depth: i32 = 1;
@@ -196,6 +239,44 @@ fn find_brace_balanced_body(after_open: &str) -> Option<&str> {
         i += 1;
     }
     None
+}
+
+/// The pre-2026-09-25 QUADRATIC fragment scan, verbatim, kept only as the
+/// reference implementation for the equivalence test. Never call it from
+/// production code.
+#[cfg(test)]
+fn fragment_body_has_introspection_reference(stripped: &str) -> bool {
+    let bytes = stripped.as_bytes();
+    let mut i = 0;
+    while i + 8 < bytes.len() {
+        if bytes[i] == b'f'
+            && stripped[i..].starts_with("fragment")
+            && is_word_boundary_left(bytes, i)
+            && bytes
+                .get(i + 8)
+                .map(|c| !(c.is_ascii_alphanumeric() || *c == b'_'))
+                .unwrap_or(true)
+        {
+            let tail = &stripped[i + 8..];
+            if let Some(brace_off) = tail.find('{') {
+                let body_start = i + 8 + brace_off + 1;
+                let body = match find_brace_balanced_body(&stripped[body_start..]) {
+                    Some(b) => b,
+                    None => {
+                        i += 8;
+                        continue;
+                    }
+                };
+                if root_selection_imports_introspection(body) {
+                    return true;
+                }
+                i = body_start + body.len();
+                continue;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Same shape as `top_level_root_selection_has_introspection` but
@@ -653,6 +734,13 @@ mod introspection_detector_tests {
 ///
 /// `&TalosContext` (not `&mut`) so it composes inside a `map_err` closure that
 /// only holds a shared borrow.
+/// Clamp a guest-requested GraphQL retry count to
+/// [`MAX_GRAPHQL_RETRIES_PER_CALL`]. The shadowing line at the top of
+/// `execute_graphql_inner` is the one caller.
+pub(crate) fn clamp_graphql_retries(requested: u32) -> u32 {
+    requested.min(MAX_GRAPHQL_RETRIES_PER_CALL)
+}
+
 fn gql_deny(ctx: &TalosContext, class: &'static str) -> wit_graphql::Error {
     ctx.record_http_denial(class, reason_class::WIT_NETWORKERROR);
     wit_graphql::Error::Networkerror
@@ -752,6 +840,12 @@ impl TalosContext {
         req: wit_graphql::Request,
         max_retries: u32,
     ) -> Result<wit_graphql::Response, wit_graphql::Error> {
+        // Guest-supplied `u32`. Every retry re-sends the whole query to a
+        // third-party host on ONE rate-limit charge, so an unclamped value
+        // turned one `execute_with_retry` into up to 4 billion sends (30 s
+        // backoff cap each) bounded only by the job timeout. Shadowed here, at
+        // the top, so no later line can read the raw value.
+        let max_retries = clamp_graphql_retries(max_retries);
         // MCP-605 (2026-05-12): per-method capability gate. WIT-world
         // linkage already restricts `talos:core/graphql` to http-node
         // and above (minimal-node is the only world that does NOT
@@ -861,7 +955,8 @@ impl TalosContext {
         }
         // MCP-584: clamp caller-supplied timeout in GraphQL exactly
         // as in http::fetch — `option<u32>` is unbounded otherwise.
-        let timeout_ms = req.timeout_ms.unwrap_or(30_000).min(MAX_HTTP_TIMEOUT_MS) as u64;
+        // 2026-09-25: and floored, through the helper `fetch` shares.
+        let timeout_ms = crate::circuit_breaker::clamp_guest_timeout_ms(req.timeout_ms);
 
         // Reject oversized queries and variable payloads to prevent sending
         // multi-GB requests to the remote server (OOM + bandwidth abuse).
@@ -875,72 +970,6 @@ impl TalosContext {
         if let Some(ref vars) = variables {
             if vars.len() > MAX_GRAPHQL_QUERY_BYTES {
                 return Err(wit_graphql::Error::Invalidvariables);
-            }
-        }
-
-        // L-17 (2026-05-22): GraphQL introspection detector + opt-in
-        // block. A guest with `http-node` (or higher) capability and a
-        // remote GraphQL endpoint in its `allowed_hosts` allowlist
-        // can currently enumerate the remote schema via `__schema` /
-        // `__type` queries. Whether that's actually a problem
-        // depends on the endpoint — public APIs (GitHub GraphQL,
-        // GitLab) deliberately ship introspection on; private
-        // internal endpoints often don't. We default to ALLOW
-        // (introspection is a legitimate GraphQL feature) but emit
-        // a structured event on every attempt so operators have
-        // visibility, and gate a hard block behind two opt-in
-        // signals:
-        //
-        //   1. **Tier-1 actor** — privacy-class actors (Ollama-only)
-        //      shouldn't be probing third-party schema shapes; block
-        //      unconditionally so the existing Tier-1 data-egress
-        //      gate has no companion-bypass surface.
-        //   2. **`TALOS_WIT_GRAPHQL_BLOCK_INTROSPECTION=1` env var**
-        //      — operator-wide deny for clusters that don't run
-        //      schema-aware clients.
-        //
-        // Detection is shape-based, not parse-based: we look for the
-        // top-level `__schema` or `__type` selection. A
-        // sophisticated attacker can hide introspection inside a
-        // fragment or alias — that's a known limitation; the
-        // structured event still fires and operators alerting on
-        // `event_kind = "graphql_introspection_attempt"` see the
-        // raw query length and host. Full parse-based detection
-        // would require pulling in a GraphQL parser (e.g.
-        // `async-graphql-parser`) on the worker's WASM execution
-        // hot path — not justified for a defense-in-depth check.
-        if looks_like_graphql_introspection(&query) {
-            let actor_tier = self.max_llm_tier == talos_workflow_job_protocol::LlmTier::Tier1;
-            let env_block =
-                talos_config::bool_env_or_default("TALOS_WIT_GRAPHQL_BLOCK_INTROSPECTION", false);
-            let blocked = actor_tier || env_block;
-
-            // Always emit the structured event so dashboards see
-            // attempts even in allow-mode deployments.
-            tracing::warn!(
-                target: "talos_security_audit",
-                module_id = ?self.module_id,
-                event_kind = "graphql_introspection_attempt",
-                url = %url,
-                query_bytes = query.len(),
-                actor_tier1 = actor_tier,
-                env_block = env_block,
-                blocked,
-                "WASM module attempted a GraphQL introspection query"
-            );
-
-            if blocked {
-                self.record_capability_denied(
-                    "graphql-execute",
-                    if actor_tier {
-                        "tier1-introspection"
-                    } else {
-                        "env-introspection-block"
-                    },
-                    &url,
-                )
-                .await;
-                return Err(gql_deny(self, reason_class::GRAPHQL_INTROSPECTION));
             }
         }
 
@@ -1116,6 +1145,84 @@ impl TalosContext {
             )
             .await;
             return Err(wit_graphql::Error::Networkerror);
+        }
+
+        // The introspection scan runs HERE — after the allowlist, the method
+        // gate and the rate-limit charge — since 2026-09-25. It used to run
+        // before all of them, and it was quadratic: a guest could send a 1 MB
+        // `fragment{fragment{…` query to a host it was not even allowed to
+        // reach, pay no rate-limit slot, get `allowed-hosts` back, and do it
+        // again — ~5·10¹⁰ byte steps of host CPU per call. The scan is linear
+        // now (`fragment_body_has_introspection`), and every scan costs one of
+        // the execution's MAX_GRAPHQL_QUERIES_PER_EXECUTION slots. A blocked
+        // introspection query therefore spends its slot; that is deliberate —
+        // MCP-787's "don't charge for denied calls" rule protects the budget
+        // from PURE VALIDATION denials, and this one runs a scan over the
+        // whole query first.
+        // L-17 (2026-05-22): GraphQL introspection detector + opt-in
+        // block. A guest with `http-node` (or higher) capability and a
+        // remote GraphQL endpoint in its `allowed_hosts` allowlist
+        // can currently enumerate the remote schema via `__schema` /
+        // `__type` queries. Whether that's actually a problem
+        // depends on the endpoint — public APIs (GitHub GraphQL,
+        // GitLab) deliberately ship introspection on; private
+        // internal endpoints often don't. We default to ALLOW
+        // (introspection is a legitimate GraphQL feature) but emit
+        // a structured event on every attempt so operators have
+        // visibility, and gate a hard block behind two opt-in
+        // signals:
+        //
+        //   1. **Tier-1 actor** — privacy-class actors (Ollama-only)
+        //      shouldn't be probing third-party schema shapes; block
+        //      unconditionally so the existing Tier-1 data-egress
+        //      gate has no companion-bypass surface.
+        //   2. **`TALOS_WIT_GRAPHQL_BLOCK_INTROSPECTION=1` env var**
+        //      — operator-wide deny for clusters that don't run
+        //      schema-aware clients.
+        //
+        // Detection is shape-based, not parse-based: we look for the
+        // top-level `__schema` or `__type` selection. A
+        // sophisticated attacker can hide introspection inside a
+        // fragment or alias — that's a known limitation; the
+        // structured event still fires and operators alerting on
+        // `event_kind = "graphql_introspection_attempt"` see the
+        // raw query length and host. Full parse-based detection
+        // would require pulling in a GraphQL parser (e.g.
+        // `async-graphql-parser`) on the worker's WASM execution
+        // hot path — not justified for a defense-in-depth check.
+        if looks_like_graphql_introspection(&query) {
+            let actor_tier = self.max_llm_tier == talos_workflow_job_protocol::LlmTier::Tier1;
+            let env_block =
+                talos_config::bool_env_or_default("TALOS_WIT_GRAPHQL_BLOCK_INTROSPECTION", false);
+            let blocked = actor_tier || env_block;
+
+            // Always emit the structured event so dashboards see
+            // attempts even in allow-mode deployments.
+            tracing::warn!(
+                target: "talos_security_audit",
+                module_id = ?self.module_id,
+                event_kind = "graphql_introspection_attempt",
+                url = %url,
+                query_bytes = query.len(),
+                actor_tier1 = actor_tier,
+                env_block = env_block,
+                blocked,
+                "WASM module attempted a GraphQL introspection query"
+            );
+
+            if blocked {
+                self.record_capability_denied(
+                    "graphql-execute",
+                    if actor_tier {
+                        "tier1-introspection"
+                    } else {
+                        "env-introspection-block"
+                    },
+                    &url,
+                )
+                .await;
+                return Err(gql_deny(self, reason_class::GRAPHQL_INTROSPECTION));
+            }
         }
 
         let client = self.http_client.clone();
@@ -1333,6 +1440,160 @@ const TIER2_EXPOSE_WINDOW_SECS: i64 = 86_400;
 /// wrapped into a huge `u64`.
 pub(crate) fn expose_count_within_limit(count: i64) -> bool {
     u64::try_from(count).is_ok_and(|c| c <= MAX_TIER2_EXPOSES_PER_USER_PER_DAY)
+}
+
+#[cfg(test)]
+mod linear_fragment_scan_tests {
+    use super::{
+        clamp_graphql_retries, fragment_body_has_introspection,
+        fragment_body_has_introspection_reference, looks_like_graphql_introspection,
+        MAX_GRAPHQL_RETRIES_PER_CALL,
+    };
+
+    /// The linear scan must give the SAME verdict as the quadratic one it
+    /// replaced, for every input — this is a performance fix, not a policy
+    /// change. Inputs are built from the tokens the scan actually reacts to,
+    /// in random order and nesting, from a fixed seed (no `rand` dependency;
+    /// a failure reproduces exactly).
+    #[test]
+    fn the_linear_scan_agrees_with_the_quadratic_reference() {
+        const TOKENS: &[&str] = &[
+            "fragment",
+            "fragment ",
+            " fragment",
+            "fragments",
+            "xfragment",
+            "{",
+            "}",
+            "{ ",
+            " }",
+            "__schema",
+            "__type",
+            "__typename",
+            " on Q ",
+            "a",
+            " ",
+            "\n",
+            "_",
+        ];
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next = || {
+            // xorshift64*
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        };
+        let mut disagreements = Vec::new();
+        let (mut positives, mut negatives) = (0usize, 0usize);
+        for _ in 0..20_000 {
+            let len = (next() % 40) as usize;
+            let q: String = (0..len)
+                .map(|_| TOKENS[(next() % TOKENS.len() as u64) as usize])
+                .collect();
+            let linear = fragment_body_has_introspection(&q);
+            if linear {
+                positives += 1;
+            } else {
+                negatives += 1;
+            }
+            if linear != fragment_body_has_introspection_reference(&q) {
+                disagreements.push(q);
+            }
+        }
+        // Anti-vacuity: agreement over inputs that are all `false` would prove
+        // nothing about the arm that returns `true`.
+        assert!(
+            positives >= 100 && negatives >= 100,
+            "the generator must exercise both verdicts (true: {positives}, false: {negatives})"
+        );
+        assert!(
+            disagreements.is_empty(),
+            "linear and reference scans disagree on {} input(s), e.g. {:?}",
+            disagreements.len(),
+            disagreements.first()
+        );
+    }
+
+    /// The input the quadratic scan could not survive: every fragment body is
+    /// unbalanced, so the old finder walked to the end of the query once per
+    /// keyword. A near-1 MB query (the `execute_graphql_inner` cap) must scan
+    /// in bounded time. The bound is generous for a debug build; the old code
+    /// needed ~5·10¹⁰ byte steps for this input.
+    #[test]
+    fn an_unbalanced_fragment_flood_scans_in_linear_time() {
+        let q = "fragment{".repeat(110_000); // 990 000 bytes
+        let start = std::time::Instant::now();
+        let verdict = looks_like_graphql_introspection(&q);
+        let elapsed = start.elapsed();
+        assert!(!verdict);
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "a 1 MB unbalanced-fragment query must scan in linear time, took {elapsed:?}"
+        );
+    }
+
+    /// And the verdict still fires on a real fragment AFTER a flood of
+    /// unbalanced ones — the linear scan must not stop early.
+    #[test]
+    fn a_real_fragment_after_an_unbalanced_flood_is_still_found() {
+        let mut q = "fragment{".repeat(1_000);
+        q.push_str("} ".repeat(1_000).as_str());
+        q.push_str("fragment S on Query { __schema { types { name } } } query Q { ...S }");
+        assert!(fragment_body_has_introspection(&q));
+        assert!(fragment_body_has_introspection_reference(&q));
+    }
+
+    #[test]
+    fn graphql_retries_are_clamped() {
+        assert_eq!(clamp_graphql_retries(0), 0);
+        assert_eq!(clamp_graphql_retries(3), 3);
+        assert_eq!(
+            clamp_graphql_retries(u32::MAX),
+            MAX_GRAPHQL_RETRIES_PER_CALL
+        );
+    }
+
+    /// The clamp is only worth its unit test if the entry point applies it
+    /// before the raw value can be read, and the scan only stops being a free
+    /// CPU sink if it sits after the allowlist and the rate charge. Neither is
+    /// visible to a unit test, so both are pinned in the source of the
+    /// production function (split at the test modules, so this test's own
+    /// text cannot satisfy it).
+    #[test]
+    fn the_entry_point_clamps_first_and_scans_after_the_rate_charge() {
+        let src = include_str!("graphql.rs");
+        let start = src
+            .find("async fn execute_graphql_inner(")
+            .expect("entry point present");
+        let body = &src[start..];
+        let body = &body[..body
+            .find("\n    pub(crate) async fn check_global_expose_limit")
+            .unwrap_or(body.len())];
+        let clamp = body
+            .find(&["let max_retries = clamp_graphql_", "retries(max_retries);"].concat())
+            .expect("max_retries is shadowed by the clamp");
+        let first_gate = body
+            .find("CapabilityWorld::Minimal")
+            .expect("capability gate");
+        assert!(
+            clamp < first_gate,
+            "the clamp must precede every other statement"
+        );
+        let allowlist = body
+            .find("host_allowlist_match(&allowed_hosts, &host)")
+            .expect("allowlist check");
+        let rate = body
+            .find(&["self.check_rate_limit(&self.graphql_", "query_count"].concat())
+            .expect("rate-limit charge");
+        let scan = body
+            .find(&["if looks_like_graphql_", "introspection(&query)"].concat())
+            .expect("introspection scan");
+        assert!(
+            allowlist < scan && rate < scan,
+            "the introspection scan must run after the allowlist and the rate-limit charge"
+        );
+    }
 }
 
 #[cfg(test)]

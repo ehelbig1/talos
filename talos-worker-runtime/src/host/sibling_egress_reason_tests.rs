@@ -356,12 +356,21 @@ async fn a_tier1_graphql_egress_refusal_is_non_transient() {
 /// A Tier-1 actor is also blocked from introspecting a third-party schema.
 /// Its `policy` is an open two-member family; the class is the closed-set
 /// collapse, so `reason_class::ALL` stays closed.
+///
+/// Since 2026-09-25 the introspection scan runs AFTER the allowlist, the method
+/// gate, DNS validation and the rate-limit charge (it is a CPU cost, and used
+/// to be free to repeat against a host the module could not even reach). So
+/// the request must clear every one of them to reach the refusal under test:
+/// POST granted, the host named explicitly, and DNS validation passed through
+/// the dev-only private-target bypass (nextest runs each test in its own
+/// process, as `fetch_with_bearer_sends_single_bearer_prefix` relies on too).
 #[tokio::test]
 async fn a_blocked_graphql_introspection_gets_its_own_class() {
+    std::env::set_var("WORKER_ALLOW_PRIVATE_HOST_TARGETS", "1");
     let mut ctx = ctx_full(
         CapabilityWorld::Http,
-        vec!["*".to_string()],
-        vec![],
+        vec!["ex.test".to_string()],
+        vec!["POST".to_string()],
         LlmTier::Tier1,
     );
     let mut req = gql("https://ex.test/g");

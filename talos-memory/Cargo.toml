@@ -61,6 +61,11 @@ hex = "0.4"
 # live-Postgres suite exercise the genuine encrypt→store→read→decrypt round
 # trip AND the MCP-S2 AAD-binding property, instead of stubbing crypto out.
 aes-gcm = "0.10"
+# Pins `MemoryWriteError::METRIC_LABELS` against the pre-seed loop of
+# `talos_memory_write_failures_total` (write_error.rs tests): talos-metrics
+# cannot depend on this crate, so the two lists meet in a test here. Light:
+# prometheus plus one dependency-free leaf crate.
+talos-metrics = { path = "../talos-metrics" }
 
 [lints]
 workspace = true

@@ -722,6 +722,20 @@ pub struct SseEventInternal {
     pub event_type: Option<String>,
     pub data: String,
     pub id: Option<String>,
+    /// This event's share of its stream's buffered-bytes budget
+    /// (`MAX_SSE_BUFFERED_BYTES_PER_STREAM`), held from the moment the reader
+    /// queues it until the guest receives it. `None` for an event not queued
+    /// by the reader (tests plant events directly).
+    pub(crate) buffered: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl SseEventInternal {
+    /// Bytes this event holds while queued.
+    pub(crate) fn buffered_len(&self) -> usize {
+        self.data.len()
+            + self.event_type.as_ref().map_or(0, String::len)
+            + self.id.as_ref().map_or(0, String::len)
+    }
 }
 
 /// Why the spawned SSE body-reader stopped feeding its channel ABNORMALLY.

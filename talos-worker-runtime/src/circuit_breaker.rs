@@ -465,9 +465,15 @@ impl Default for CircuitBreakerConfig {
 // ## PROCESS-GLOBAL
 //
 // `GLOBAL_CIRCUIT_BREAKER` is one `OnceLock` per worker process, and its map
-// is keyed by hostname and NOTHING else. A worker consumes jobs for every
-// user, every actor and every workflow on the platform, so a circuit opened
-// for `www.googleapis.com` refuses that host for ALL of them until it closes.
+// is keyed by `host:port` (by hostname alone until 2026-09-25 — see
+// `BreakerTarget`) and NOTHING else. A worker consumes jobs for every user,
+// every actor and every workflow on the platform, so a circuit opened for
+// `www.googleapis.com:443` refuses that host for ALL of them until it closes.
+//
+// The same argument binds the transport side as well since 2026-09-25: a
+// failure the GUEST manufactured is not evidence about the host. A 1 ms
+// guest timeout, or a connect to a closed side port, used to count exactly
+// like a dead host; see `send_error_is_host_evidence`.
 //
 // That is defensible for a TRANSPORT failure: a failed TCP connect, a TLS
 // handshake error or a DNS failure is a property of the host and the network
@@ -595,6 +601,122 @@ impl Default for CircuitBreakerConfig {
 // arguably should count; changing it would widen the OPEN decision, which is
 // the surface this change is deliberately keeping still. Left as-is and
 // recorded here.
+
+/// The smallest per-request timeout a guest may ask for, in milliseconds.
+///
+/// `timeout_ms` is guest-supplied (`option<u32>`) on `http::fetch`,
+/// `http::fetch_all` and `graphql::execute`. Until 2026-09-25 it had a
+/// ceiling (`MAX_HTTP_TIMEOUT_MS`) and no floor, so `timeout_ms: Some(1)`
+/// was honoured — and a request that times out after 1 ms is, to this
+/// breaker, a TRANSPORT FAILURE of the host. Five such calls opened the
+/// process-global circuit for a healthy host, for every tenant on the worker.
+/// The floor makes a request at least long enough to mean something; see
+/// [`BREAKER_TIMEOUT_EVIDENCE_FLOOR_MS`] for the separate question of when a
+/// timeout counts as evidence at all.
+pub(crate) const MIN_HTTP_TIMEOUT_MS: u32 = 1_000;
+
+/// A client timeout counts as evidence about the HOST only if the host was
+/// given at least this long. Below it the timeout measures the GUEST's
+/// impatience, which it chose, and is settled as no evidence. 10 s sits under
+/// every timeout the shipped catalog templates request (10–30 s) and under the
+/// 30 s default, so a genuinely unresponsive host still opens its circuit from
+/// real traffic.
+pub(crate) const BREAKER_TIMEOUT_EVIDENCE_FLOOR_MS: u64 = 10_000;
+
+/// Clamp a guest-requested timeout into `[MIN_HTTP_TIMEOUT_MS,
+/// MAX_HTTP_TIMEOUT_MS]`, defaulting to 30 s. ONE home for the three
+/// surfaces that accept a guest timeout, so the floor cannot be applied to
+/// one and forgotten on another.
+pub(crate) fn clamp_guest_timeout_ms(requested: Option<u32>) -> u64 {
+    requested
+        .unwrap_or(30_000)
+        .clamp(MIN_HTTP_TIMEOUT_MS, crate::host::MAX_HTTP_TIMEOUT_MS) as u64
+}
+
+/// What a breaker admission is keyed on, and whether a failure there can
+/// count as evidence about the host.
+///
+/// **Keyed by `host:port`, not by host (2026-09-25).** The map was keyed by
+/// hostname and nothing else, so a guest dialling a CLOSED port on a shared
+/// host (`https://www.googleapis.com:4444/`) collected `connect-refused`
+/// failures against the key that every tenant's real traffic to port 443
+/// used. The port is now part of the key, so a dead side port has its own
+/// circuit.
+///
+/// **And a non-default port is never evidence.** Keying alone still lets a
+/// guest open the circuit for `host:8443` that another tenant legitimately
+/// uses. The scheme's default port is where a host's service lives; anything
+/// else is the guest's choice of target, and a failure there says nothing
+/// about the host every other tenant is talking to. So a circuit can only
+/// ever open for a default-port key. The cost, stated: a host genuinely
+/// serving on a non-default port gets no breaker protection at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BreakerTarget {
+    key: String,
+    default_port: bool,
+}
+
+impl BreakerTarget {
+    /// The target for `url`, or `None` if it has no host (which every caller
+    /// has already refused by the time it asks for admission).
+    pub fn from_url(url: &url::Url) -> Option<Self> {
+        let host = url.host_str()?;
+        // `url` normalises an explicit default port away, so `port()` is
+        // `None` exactly when the request goes to the scheme's default port.
+        let default_port = url.port().is_none();
+        let port = url.port_or_known_default().unwrap_or(0);
+        Some(Self {
+            key: format!("{host}:{port}"),
+            default_port,
+        })
+    }
+
+    /// The breaker map key (`host:port`).
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// A target keyed on a bare string, for this module's own state-machine
+    /// tests, which predate host:port keying and assert on the key directly.
+    #[cfg(test)]
+    pub(crate) fn raw(key: &str) -> Self {
+        Self {
+            key: key.to_string(),
+            default_port: true,
+        }
+    }
+}
+
+/// The key production uses for a request to `https://{host}/…` — derived
+/// through [`BreakerTarget::from_url`], never retyped, so tests that inspect
+/// breaker state after driving a real host function look at the same entry.
+#[cfg(test)]
+pub(crate) fn https_breaker_key(host: &str) -> String {
+    let url = url::Url::parse(&format!("https://{host}/")).expect("test host parses");
+    BreakerTarget::from_url(&url)
+        .expect("test host has a host")
+        .key
+}
+
+/// Is a failed send EVIDENCE that the host is unhealthy? The whole policy,
+/// pure, so it is testable without a socket.
+///
+/// * A reqwest BUILDER error never left the process — no evidence (see the
+///   connectivity-vs-health note above).
+/// * A non-default port is the guest's choice of target — no evidence (see
+///   [`BreakerTarget`]).
+/// * A timeout is evidence only if the host was given at least
+///   [`BREAKER_TIMEOUT_EVIDENCE_FLOOR_MS`].
+/// * Everything else — connect refused, TLS, reset, a long timeout on the
+///   default port — is evidence, exactly as before.
+pub(crate) fn send_error_is_host_evidence(
+    is_builder: bool,
+    default_port: bool,
+    is_timeout: bool,
+    timeout_ms: u64,
+) -> bool {
+    !is_builder && default_port && (!is_timeout || timeout_ms >= BREAKER_TIMEOUT_EVIDENCE_FLOOR_MS)
+}
 
 /// Does this HTTP status mean a half-open recovery trial FAILED?
 ///
@@ -767,11 +889,12 @@ impl HttpCircuitBreaker {
     /// link from a public item to a `#[cfg(test)]` target does not resolve
     /// under `cargo doc`) for why the raw primitive cannot be called from
     /// production.
-    pub fn begin_request(&self, host: &str) -> Option<RequestPermit<'_>> {
-        match self.admit(host) {
+    pub fn begin_request(&self, target: &BreakerTarget) -> Option<RequestPermit<'_>> {
+        match self.admit(&target.key) {
             Ok(trial_epoch) => Some(RequestPermit {
                 breaker: self,
-                host: host.to_string(),
+                host: target.key.clone(),
+                default_port: target.default_port,
                 trial_epoch,
                 settled: false,
             }),
@@ -1166,6 +1289,14 @@ impl HttpCircuitBreaker {
     /// ready for a half-open trial) so the next real request still gets
     /// its single probe via `begin_request`, and `false` for a host with
     /// no record or a Closed/HalfOpen circuit.
+    /// Is the circuit for `host` on either scheme-default port open? The
+    /// retry gate asks about an `allowed_hosts` entry, which names a host and
+    /// not a port; since only default-port keys can ever open (see
+    /// [`BreakerTarget`]), those are the two keys that can answer yes.
+    pub fn is_host_open(&self, host: &str) -> bool {
+        self.is_open(&format!("{host}:443")) || self.is_open(&format!("{host}:80"))
+    }
+
     pub fn is_open(&self, host: &str) -> bool {
         self.records
             .get(host)
@@ -1288,7 +1419,11 @@ impl HttpCircuitBreaker {
 /// entry key.
 pub struct RequestPermit<'a> {
     breaker: &'a HttpCircuitBreaker,
+    /// The breaker key (`host:port`) this admission was taken against.
     host: String,
+    /// Whether the key is a scheme-default port — the only kind whose
+    /// failures can count as host evidence (see [`BreakerTarget`]).
+    default_port: bool,
     /// `Some(epoch)` iff this admission spent a half-open trial token, where
     /// `epoch` identifies the half-open period it came from.
     trial_epoch: Option<Instant>,
@@ -1360,6 +1495,32 @@ impl RequestPermit<'_> {
             return;
         }
         self.breaker.record_failure(&self.host);
+    }
+
+    /// A send failed: settle it as host evidence or as no evidence, by
+    /// [`send_error_is_host_evidence`]. THE production settle for a failed
+    /// send — every surface that takes a permit routes its send error here,
+    /// so the builder / port / timeout-floor rules live in one place and a
+    /// new surface cannot apply two of the three.
+    pub fn settle_send_error(&mut self, is_builder: bool, is_timeout: bool, timeout_ms: u64) {
+        if self.send_error_is_evidence(is_builder, is_timeout, timeout_ms) {
+            self.settle_transport_failure();
+        } else {
+            self.settle_no_evidence();
+        }
+    }
+
+    /// Would a failed send against this permit's target be host evidence?
+    /// [`send_error_is_host_evidence`] with this permit's port already
+    /// applied — for `fetch_all`, which settles a BATCH once per host and so
+    /// weighs each entry's failure before choosing one settlement.
+    pub fn send_error_is_evidence(
+        &self,
+        is_builder: bool,
+        is_timeout: bool,
+        timeout_ms: u64,
+    ) -> bool {
+        send_error_is_host_evidence(is_builder, self.default_port, is_timeout, timeout_ms)
     }
 
     /// The request never left this process, so nothing was learned about the
@@ -1723,7 +1884,7 @@ mod tests {
         }
         // Open + inside cooldown: an HTTP request refused without being sent.
         assert!(
-            cb.begin_request(host).is_none(),
+            cb.begin_request(&BreakerTarget::raw(host)).is_none(),
             "circuit must be open after 5 failures"
         );
         // The job-level retry gate: no request attempted at all.
@@ -1784,7 +1945,7 @@ mod tests {
         // 0.0 < 0.8 → back to Open.
         for _ in 0..3 {
             let mut permit = cb
-                .begin_request(host)
+                .begin_request(&BreakerTarget::raw(host))
                 .expect("half-open must grant its trial tokens");
             permit.settle_transport_failure();
         }
@@ -1807,10 +1968,10 @@ mod tests {
             cb2.record_failure(host2);
         }
         let inflight = cb2
-            .begin_request(host2)
+            .begin_request(&BreakerTarget::raw(host2))
             .expect("first half-open trial is granted");
         assert!(
-            cb2.begin_request(host2).is_none(),
+            cb2.begin_request(&BreakerTarget::raw(host2)).is_none(),
             "second request must be refused — the single trial token is still in flight"
         );
         drop(inflight);
@@ -1895,7 +2056,7 @@ mod tests {
 
         for i in 0..10 {
             let permit = cb
-                .begin_request(host)
+                .begin_request(&BreakerTarget::raw(host))
                 .unwrap_or_else(|| panic!("admission {i} refused — a repaid token was not repaid"));
             drop(permit);
         }
@@ -1920,7 +2081,9 @@ mod tests {
         let host = "no-evidence.example.test";
         cb.force_half_open(host, 2);
 
-        let mut permit = cb.begin_request(host).expect("half-open admits");
+        let mut permit = cb
+            .begin_request(&BreakerTarget::raw(host))
+            .expect("half-open admits");
         assert_eq!(cb.trial_tokens_remaining(host), Some(1));
         permit.settle_no_evidence();
 
@@ -1941,7 +2104,9 @@ mod tests {
         let cb = HttpCircuitBreaker::default();
         let host = "no-evidence-open.example.test";
         for _ in 0..20 {
-            let mut permit = cb.begin_request(host).expect("closed circuit admits");
+            let mut permit = cb
+                .begin_request(&BreakerTarget::raw(host))
+                .expect("closed circuit admits");
             permit.settle_no_evidence();
         }
         assert_eq!(cb.get_state(host), Some("closed".to_string()));
@@ -1962,7 +2127,9 @@ mod tests {
         cb.force_half_open(host, 1);
 
         let inflight = async {
-            let mut permit = cb.begin_request(host).expect("half-open admits");
+            let mut permit = cb
+                .begin_request(&BreakerTarget::raw(host))
+                .expect("half-open admits");
             // Stand in for `resolve_vault_header().await` / `send().await`.
             futures_util::future::pending::<()>().await;
             permit.settle_response(200);
@@ -2012,7 +2179,9 @@ mod tests {
         let host = "stale-epoch.example.test";
         cb.force_half_open(host, 1);
 
-        let straggler = cb.begin_request(host).expect("half-open admits");
+        let straggler = cb
+            .begin_request(&BreakerTarget::raw(host))
+            .expect("half-open admits");
         assert_eq!(cb.trial_tokens_remaining(host), Some(0));
 
         // A new half-open period begins while the request is still in flight.
@@ -2058,7 +2227,9 @@ mod tests {
         let host = "stale-epoch-success.example.test";
         cb.force_half_open(host, 1);
 
-        let mut straggler = cb.begin_request(host).expect("half-open admits");
+        let mut straggler = cb
+            .begin_request(&BreakerTarget::raw(host))
+            .expect("half-open admits");
 
         std::thread::sleep(Duration::from_millis(2));
         cb.force_half_open(host, 3);
@@ -2092,7 +2263,9 @@ mod tests {
         let host = "double-settle.example.test";
         cb.force_half_open(host, 3);
 
-        let mut permit = cb.begin_request(host).expect("half-open admits");
+        let mut permit = cb
+            .begin_request(&BreakerTarget::raw(host))
+            .expect("half-open admits");
         permit.settle_response(200);
         assert_eq!(cb.trial_tally(host), Some((1, 0)));
 
@@ -2141,7 +2314,7 @@ mod tests {
         // the rate check runs only once all three verdicts are in.
         for i in 0..2 {
             let mut permit = cb
-                .begin_request(host)
+                .begin_request(&BreakerTarget::raw(host))
                 .unwrap_or_else(|| panic!("trial {i} must be admitted"));
             permit.settle_response(503);
         }
@@ -2149,11 +2322,13 @@ mod tests {
         assert_eq!(cb.trial_tokens_remaining(host), Some(1));
 
         // The third trial is in flight. This is the ONLY outstanding request.
-        let _third = cb.begin_request(host).expect("the last token");
+        let _third = cb
+            .begin_request(&BreakerTarget::raw(host))
+            .expect("the last token");
         assert_eq!(cb.trial_tokens_remaining(host), Some(0));
 
         assert!(
-            cb.begin_request(host).is_none(),
+            cb.begin_request(&BreakerTarget::raw(host)).is_none(),
             "a caller arriving during a single in-flight trial must be refused \
              half_open_exhausted — no third concurrent request is needed"
         );
@@ -2181,7 +2356,7 @@ mod tests {
             let host = format!("status-cannot-open-{status}.example.test");
             for _ in 0..20 {
                 let mut permit = cb
-                    .begin_request(&host)
+                    .begin_request(&BreakerTarget::raw(&host))
                     .expect("a closed circuit admits everything");
                 permit.settle_response(status);
             }
@@ -2212,7 +2387,9 @@ mod tests {
             let host = format!("trial-4xx-{status}.example.test");
             cb.force_half_open(&host, 3);
             for _ in 0..3 {
-                let mut permit = cb.begin_request(&host).expect("half-open admits");
+                let mut permit = cb
+                    .begin_request(&BreakerTarget::raw(&host))
+                    .expect("half-open admits");
                 permit.settle_response(status);
             }
             assert_eq!(
@@ -2245,7 +2422,9 @@ mod tests {
         let host = "trial-429.example.test";
         cb.force_half_open(host, 3);
         for _ in 0..3 {
-            let mut permit = cb.begin_request(host).expect("half-open admits");
+            let mut permit = cb
+                .begin_request(&BreakerTarget::raw(host))
+                .expect("half-open admits");
             permit.settle_response(429);
         }
         assert_eq!(
@@ -2270,7 +2449,9 @@ mod tests {
         cb.force_half_open(host, 3);
 
         for status in [200u16, 429, 200] {
-            let mut permit = cb.begin_request(host).expect("half-open admits");
+            let mut permit = cb
+                .begin_request(&BreakerTarget::raw(host))
+                .expect("half-open admits");
             permit.settle_response(status);
         }
         assert_eq!(
@@ -2296,7 +2477,9 @@ mod tests {
         cb.force_half_open(host, 3);
 
         for status in [200u16, 500, 200] {
-            let mut permit = cb.begin_request(host).expect("half-open admits");
+            let mut permit = cb
+                .begin_request(&BreakerTarget::raw(host))
+                .expect("half-open admits");
             permit.settle_response(status);
         }
         assert_eq!(
@@ -2327,7 +2510,9 @@ mod tests {
             let host = format!("trial-unhealthy-{status}.example.test");
             cb.force_half_open(&host, 3);
             for _ in 0..3 {
-                let mut permit = cb.begin_request(&host).expect("half-open admits");
+                let mut permit = cb
+                    .begin_request(&BreakerTarget::raw(&host))
+                    .expect("half-open admits");
                 permit.settle_response(status);
             }
             assert_eq!(
@@ -2362,9 +2547,13 @@ mod tests {
         // conclude the trial period.
         cb.force_half_open(host, 4);
 
-        let mut inflight = cb.begin_request(host).expect("half-open admits");
+        let mut inflight = cb
+            .begin_request(&BreakerTarget::raw(host))
+            .expect("half-open admits");
         for _ in 0..3 {
-            let mut permit = cb.begin_request(host).expect("half-open admits");
+            let mut permit = cb
+                .begin_request(&BreakerTarget::raw(host))
+                .expect("half-open admits");
             permit.settle_response(200);
         }
         assert_eq!(
@@ -2392,7 +2581,9 @@ mod tests {
         let cb = HttpCircuitBreaker::default();
         let host = "transport-still-opens.example.test";
         for _ in 0..5 {
-            let mut permit = cb.begin_request(host).expect("closed circuit admits");
+            let mut permit = cb
+                .begin_request(&BreakerTarget::raw(host))
+                .expect("closed circuit admits");
             permit.settle_transport_failure();
         }
         assert_eq!(cb.get_state(host), Some("open".to_string()));
@@ -2448,7 +2639,7 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 for i in 0..250u32 {
                     let host = hosts[(t as usize + i as usize) % hosts.len()];
-                    if let Some(mut permit) = cb.begin_request(host) {
+                    if let Some(mut permit) = cb.begin_request(&BreakerTarget::raw(host)) {
                         match (t + i) % 4 {
                             0 => permit.settle_response(200),
                             1 => permit.settle_response(503),
@@ -2514,6 +2705,227 @@ mod tests {
                 "seeded series {expected} is absent from the exposition; an \
                  alert of the shape increase(...) > 0 would be silent on a \
                  worker that has never tripped the breaker.\n{text}"
+            );
+        }
+    }
+}
+
+/// 2026-09-25: a guest can no longer open a shared circuit with evidence it
+/// manufactured — a 1 ms timeout, or a closed side port on a shared host.
+#[cfg(test)]
+mod guest_manufactured_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn guest_timeouts_are_floored_and_capped() {
+        assert_eq!(clamp_guest_timeout_ms(Some(0)), MIN_HTTP_TIMEOUT_MS as u64);
+        assert_eq!(clamp_guest_timeout_ms(Some(1)), MIN_HTTP_TIMEOUT_MS as u64);
+        assert_eq!(clamp_guest_timeout_ms(None), 30_000);
+        assert_eq!(clamp_guest_timeout_ms(Some(15_000)), 15_000);
+        assert_eq!(
+            clamp_guest_timeout_ms(Some(u32::MAX)),
+            crate::host::MAX_HTTP_TIMEOUT_MS as u64
+        );
+    }
+
+    #[test]
+    fn targets_are_keyed_by_host_and_port() {
+        let t = |u: &str| BreakerTarget::from_url(&url::Url::parse(u).unwrap()).unwrap();
+        assert_eq!(t("https://api.example.com/x").key(), "api.example.com:443");
+        assert!(t("https://api.example.com/x").default_port);
+        // An explicit default port is normalised away by `url`: same target.
+        assert_eq!(
+            t("https://api.example.com:443/x"),
+            t("https://api.example.com/y")
+        );
+        assert_eq!(t("http://api.example.com/").key(), "api.example.com:80");
+        let side = t("https://api.example.com:4444/");
+        assert_eq!(side.key(), "api.example.com:4444");
+        assert!(!side.default_port);
+        assert_ne!(side.key(), t("https://api.example.com/").key());
+    }
+
+    #[test]
+    fn the_evidence_rule() {
+        let floor = BREAKER_TIMEOUT_EVIDENCE_FLOOR_MS;
+        // (is_builder, default_port, is_timeout, timeout_ms) -> evidence
+        let cases = [
+            ((false, true, false, 1_000), true),     // connect refused on 443
+            ((false, true, true, floor), true),      // a long-enough timeout on 443
+            ((false, true, true, floor - 1), false), // the guest's impatience
+            ((false, false, false, 30_000), false),  // a side port is the guest's target
+            ((false, false, true, 30_000), false),
+            ((true, true, false, 30_000), false), // never left the process
+        ];
+        for ((b, d, t, ms), want) in cases {
+            assert_eq!(
+                send_error_is_host_evidence(b, d, t, ms),
+                want,
+                "builder={b} default_port={d} timeout={t} ms={ms}"
+            );
+        }
+    }
+
+    /// Through the real permit API: any number of sub-floor timeouts and
+    /// side-port failures leave the circuit closed; the same count of real
+    /// evidence opens it (the control that proves the loop can open at all).
+    #[test]
+    fn manufactured_failures_cannot_open_a_circuit() {
+        let cb = HttpCircuitBreaker::new_default();
+        let url = |u: &str| url::Url::parse(u).unwrap();
+        let main = BreakerTarget::from_url(&url("https://shared.example/")).unwrap();
+        let side = BreakerTarget::from_url(&url("https://shared.example:4444/")).unwrap();
+        for _ in 0..50 {
+            cb.begin_request(&main)
+                .expect("closed admits")
+                .settle_send_error(false, true, MIN_HTTP_TIMEOUT_MS as u64);
+            cb.begin_request(&side)
+                .expect("closed admits")
+                .settle_send_error(false, false, 30_000);
+        }
+        assert!(
+            !cb.is_open(main.key()),
+            "sub-floor timeouts opened the circuit"
+        );
+        assert!(
+            !cb.is_open(side.key()),
+            "side-port failures opened a circuit"
+        );
+        assert!(!cb.is_host_open("shared.example"));
+
+        // Control: genuine evidence on the default port does open it.
+        for _ in 0..cb.config.failure_threshold {
+            cb.begin_request(&main)
+                .expect("closed admits")
+                .settle_send_error(false, true, BREAKER_TIMEOUT_EVIDENCE_FLOOR_MS);
+        }
+        assert!(
+            cb.is_open(main.key()),
+            "real evidence must still open the circuit"
+        );
+        assert!(cb.is_host_open("shared.example"));
+    }
+
+    /// Production path: `fetch` to a SIDE port of a host. Whatever the network
+    /// does with the connect (refuse, time out, unreachable), it is a
+    /// transport failure on a non-default port, so it must record nothing —
+    /// pre-2026-09-25 each one counted against the bare-host key every
+    /// tenant's port-443 traffic used.
+    #[tokio::test]
+    async fn fetch_to_a_side_port_records_no_evidence_against_the_host() {
+        use crate::bindings::talos::core::http::{self as wit_http, Host as _};
+        let host = "203.0.113.41";
+        let cb = get_global_circuit_breaker();
+        let mut attempts = Vec::new();
+        for _ in 0..3 {
+            let mut ctx = crate::context::TalosContext::new(
+                crate::wit_inspector::CapabilityWorld::Http,
+                vec![host.to_string()],
+                vec!["GET".to_string()],
+                128,
+                std::collections::HashMap::new(),
+                None,
+                None,
+                false,
+                None,
+                std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+                talos_workflow_job_protocol::LlmTier::default(),
+                None,
+            )
+            .expect("test context");
+            attempts.push(tokio::spawn(async move {
+                ctx.fetch(wit_http::Request {
+                    method: wit_http::Method::Get,
+                    url: format!("https://{host}:4444/probe"),
+                    headers: vec![],
+                    body: vec![],
+                    timeout_ms: Some(1),
+                })
+                .await
+            }));
+        }
+        for a in attempts {
+            let r = a.await.expect("task");
+            assert!(
+                matches!(
+                    r,
+                    Err(wit_http::Error::Networkerror) | Err(wit_http::Error::Timeout)
+                ),
+                "premise: the side-port fetch must fail in transport, got {r:?}"
+            );
+        }
+        let side_key = format!("{host}:4444");
+        assert_eq!(
+            cb.consecutive_failures(&side_key),
+            Some(0),
+            "a side-port transport failure is not evidence (the entry exists, so the \
+             requests did reach the breaker)"
+        );
+        assert_eq!(cb.consecutive_failures(&https_breaker_key(host)), None);
+        assert_eq!(
+            cb.consecutive_failures(host),
+            None,
+            "no bare-host key any more"
+        );
+    }
+
+    /// The call-site half, which no unit test above can see: every production
+    /// surface that takes a permit must settle a failed send through
+    /// `settle_send_error` (or, for the batch, `send_error_is_evidence`) and
+    /// build its target with `BreakerTarget::from_url`; every guest-timeout
+    /// surface must go through `clamp_guest_timeout_ms`. Needles are assembled
+    /// so this test's own text cannot satisfy them.
+    #[test]
+    fn every_production_site_uses_the_shared_rules() {
+        // Split at the first test MODULE, not the first `#[cfg(test)]`: a
+        // test-only helper method can sit in the middle of production code.
+        let prod = |src: &'static str| &src[..src.find("#[cfg(test)]\nmod ").unwrap_or(src.len())];
+        let http = prod(include_str!("host/http.rs"));
+        let webhook = prod(include_str!("host/webhook.rs"));
+        // WHOLE file: graphql.rs interleaves `#[cfg(test)]` modules with its
+        // production code (the client sits below them), so a prefix split
+        // would cut the real call site off. Its test text cannot contain the
+        // assembled needles below.
+        let graphql = include_str!("host/graphql.rs");
+        let raw_settle = ["permit.settle_", "transport_failure()"].concat();
+        assert!(
+            !webhook.contains(&raw_settle),
+            "webhook.rs settles a send error without the evidence rule"
+        );
+        // `fetch_all` settles a batch ONCE per host, so it keeps the one raw
+        // settle — reached only through `saw_transport`, which is set only
+        // when `send_error_is_evidence` said yes. Exactly one, and after it.
+        assert_eq!(http.matches(&raw_settle).count(), 1);
+        let predicate = http
+            .find(&["permit.send_error_", "is_evidence("].concat())
+            .expect("fetch_all weighs each entry");
+        assert!(http.find(&raw_settle).expect("present") > predicate);
+        for (name, src) in [("http.rs", http), ("webhook.rs", webhook)] {
+            assert!(
+                src.contains(&["BreakerTarget::", "from_url("].concat()),
+                "{name} must key its permit by host:port"
+            );
+        }
+        assert_eq!(
+            http.matches(&["permit.settle_", "send_error("].concat())
+                .count(),
+            1
+        );
+        assert_eq!(
+            webhook
+                .matches(&["permit.settle_", "send_error("].concat())
+                .count(),
+            2
+        );
+        assert!(http.contains(&["permit.send_error_", "is_evidence("].concat()));
+        let clamp = ["clamp_guest_", "timeout_ms(req.timeout_ms)"].concat();
+        assert_eq!(http.matches(&clamp).count(), 2, "fetch and fetch_all");
+        assert_eq!(graphql.matches(&clamp).count(), 1);
+        let raw_cap = [".min(MAX_HTTP_", "TIMEOUT_MS)"].concat();
+        for (name, src) in [("http.rs", http), ("graphql.rs", graphql)] {
+            assert!(
+                !src.contains(&raw_cap),
+                "{name} clamps a guest timeout without the floor"
             );
         }
     }

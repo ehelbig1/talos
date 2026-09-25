@@ -8,7 +8,7 @@
 //!     stopped by wasmtime fuel metering under the pooling allocator.
 //!  2. `epoch_interruption_kills_runaway_loop_with_huge_fuel` — with fuel
 //!     set absurdly high so it can't be the limiter, the epoch-deadline
-//!     interrupt (driven by `spawn_epoch_ticker`) preempts the same tight
+//!     interrupt (driven by the runtime's own ticker thread) preempts the same tight
 //!     loop. This is the ONLY mechanism that can stop a non-yielding loop
 //!     that a `tokio::time::timeout` alone cannot.
 //!  3. `cancellation_aborts_http_promptly` — a cancelled execution's
@@ -171,10 +171,9 @@ async fn fuel_exhaustion_kills_runaway_loop() {
         std::env::remove_var("WASM_FUEL_LIMIT");
         TalosRuntime::new().expect("runtime")
     };
-    // Epoch ticker as a hang-proof backstop: fuel (10M ≈ 25ms) fires long
-    // before the epoch deadline, but if it somehow didn't, epoch caps the
-    // test at the 30s deadline instead of hanging the suite.
-    let ticker = worker::runtime::spawn_epoch_ticker(rt.engine_handle());
+    // The runtime's own epoch ticker is the hang-proof backstop: fuel (10M ≈
+    // 25ms) fires long before the epoch deadline, but if it somehow didn't,
+    // epoch caps the test at the 30s deadline instead of hanging the suite.
     let bytes = build_minimal_component(LOOP_CORE_WAT);
 
     let start = std::time::Instant::now();
@@ -182,7 +181,6 @@ async fn fuel_exhaustion_kills_runaway_loop() {
         .execute_module_with_timeout(&bytes, "{}", Duration::from_secs(30))
         .await;
     let elapsed = start.elapsed();
-    ticker.abort();
 
     assert!(res.is_err(), "a runaway loop must not return Ok");
     let err = format!("{:#}", res.unwrap_err());
@@ -203,8 +201,8 @@ async fn fuel_exhaustion_kills_runaway_loop() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn epoch_interruption_kills_runaway_loop_with_huge_fuel() {
     // Fuel set absurdly high so it CANNOT be the limiter — only the
-    // epoch-deadline interrupt (driven by the ticker below) can stop the
-    // tight loop. Hold FUEL_ENV_LOCK across the set→new→remove so the
+    // epoch-deadline interrupt (driven by the runtime's own ticker thread)
+    // can stop the tight loop. Hold FUEL_ENV_LOCK across the set→new→remove so the
     // override can't leak into a parallel test's runtime construction.
     let rt = {
         let _g = FUEL_ENV_LOCK.lock().unwrap();
@@ -214,9 +212,9 @@ async fn epoch_interruption_kills_runaway_loop_with_huge_fuel() {
         rt
     };
 
-    // Epoch interruption is inert without a ticker incrementing the engine
-    // epoch — this is the exact wiring `main.rs` does at startup.
-    let ticker = worker::runtime::spawn_epoch_ticker(rt.engine_handle());
+    // No ticker is started here: since 2026-09-25 `TalosRuntime`'s
+    // constructor starts it, so a runtime built the way the CONTROLLER builds
+    // one (which never started a ticker before) is covered too.
 
     let bytes = build_minimal_component(LOOP_CORE_WAT);
     let start = std::time::Instant::now();
@@ -224,7 +222,6 @@ async fn epoch_interruption_kills_runaway_loop_with_huge_fuel() {
     // deadline from the passed timeout, so epoch trips at ~2s.
     let (res, _logs) = rt.execute_test_module_string(&bytes, "{}").await;
     let elapsed = start.elapsed();
-    ticker.abort();
 
     assert!(
         res.is_err(),
@@ -235,6 +232,281 @@ async fn epoch_interruption_kills_runaway_loop_with_huge_fuel() {
     assert!(
         elapsed < Duration::from_secs(20),
         "epoch interrupt must stop the loop near its deadline (elapsed {elapsed:?})"
+    );
+}
+
+// ============================================================================
+// (2b) Wall-clock bounds that hold in the CONTROLLER's runtime too
+// ============================================================================
+//
+// The controller builds its own `TalosRuntime` (run_sandbox, test_module,
+// scratch sessions, module replay) and, until 2026-09-25, never started an
+// epoch ticker — only `worker/src/main.rs` did. These tests build the runtime
+// exactly as the controller does (`TalosRuntime::new()`, nothing else) and
+// assert a bounded return. They run the guest on a SEPARATE thread with its
+// own runtime and wait with `recv_timeout`, because a regression here does not
+// fail — it spins forever, and neither an in-test `tokio::time::timeout` nor
+// the test harness can preempt a guest that never yields.
+
+/// Run `f` on its own OS thread and return its result, or fail the test if it
+/// has not finished within `limit`. On failure the spinning thread is leaked,
+/// which is the point: it is the evidence that nothing preempted the guest.
+fn finish_within<T: Send + 'static>(
+    limit: Duration,
+    what: &str,
+    f: impl FnOnce() -> T + Send + 'static,
+) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    match rx.recv_timeout(limit) {
+        Ok(v) => v,
+        Err(_) => panic!(
+            "{what}: did not return within {limit:?} — the guest was not preempted \
+             (no epoch ticker, or the epoch callback does not yield)"
+        ),
+    }
+}
+
+/// A current-thread runtime, the harshest case: one executor thread shared by
+/// the guest and everything else.
+fn current_thread_rt() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime")
+}
+
+/// `run` writes a 1,000,000-byte JSON string literal (`"aaa…a"`) into its
+/// memory — just under the host's 1 MiB `WASM_MAX_JSON_SIZE` cap, so every
+/// call really parses rather than being refused at the size check (the first
+/// draft was 2 bytes over, and measured a WARN-log loop instead) — then calls
+/// the `json::parse` host function on it forever. Each iteration costs a
+/// few fuel (three constants, a call, a branch) — the host's parse costs no
+/// fuel at all — so the DEFAULT 10M-fuel budget allows on the order of a
+/// million host parses. Measured with no ticker: still running at this test's
+/// 30 s watchdog. Fuel is not a wall-clock bound for host work; only the epoch
+/// is.
+///
+/// (The fill that builds the string is charged its 1 MiB in fuel once, up
+/// front: wasmtime 47 prices a bulk-memory op by its length, which is why this
+/// fixture does NOT loop on `memory.fill` — that exhausts fuel in milliseconds
+/// and would prove nothing.)
+///
+/// `parse: func(json-str: string) -> result<_, error>` lowers to
+/// `(param ptr len retptr)`: the result's two flat values exceed the one-value
+/// limit, so the host writes them through the return pointer (bytes 0..8).
+const HOST_PARSE_LOOP_CORE_WAT: &str = r#"
+(module
+  (import "talos:core/json" "parse" (func $parse (param i32 i32 i32)))
+  (memory (export "memory") 32)
+  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 0))
+  (func (export "run") (param i32 i32) (result i32)
+    (memory.fill (i32.const 16) (i32.const 97) (i32.const 999998))
+    (i32.store8 (i32.const 15) (i32.const 34))
+    (i32.store8 (i32.const 1000014) (i32.const 34))
+    (loop $l
+      (call $parse (i32.const 15) (i32.const 1000000) (i32.const 0))
+      (br $l))
+    (unreachable)))
+"#;
+
+/// The defect this closes: a runtime built the way the CONTROLLER builds one
+/// had no epoch ticker, so a guest looping on a CPU-bound host call under the
+/// DEFAULT fuel budget held its thread past a 30 s watchdog. With the ticker
+/// owned by the constructor it is stopped near its 2 s timeout.
+#[test]
+fn a_host_call_loop_under_default_fuel_is_bounded_by_wall_clock() {
+    let rt = {
+        let _g = FUEL_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("WASM_FUEL_LIMIT");
+        TalosRuntime::new().expect("runtime")
+    };
+    let bytes = build_minimal_component(HOST_PARSE_LOOP_CORE_WAT);
+    let (res, elapsed) = finish_within(
+        Duration::from_secs(30),
+        "json::parse host-call loop",
+        move || {
+            let tokio_rt = current_thread_rt();
+            let start = std::time::Instant::now();
+            let res = tokio_rt.block_on(rt.execute_module_with_timeout(
+                &bytes,
+                "{}",
+                Duration::from_secs(2),
+            ));
+            (res.map_err(|e| format!("{e:#}")), start.elapsed())
+        },
+    );
+    let err = res.expect_err("an endless host-call loop must not return Ok");
+    // Anti-vacuity: the loop must have been stopped by the CLOCK. A fuel trap
+    // or an instantiation failure would also be an `Err`, and would make this
+    // test pass without exercising the ticker at all — which is exactly how
+    // its first draft (a `memory.fill` loop) passed on a tree with no ticker.
+    assert!(
+        !err.contains("fuel"),
+        "the loop must be stopped by the wall clock, not by fuel: {err}"
+    );
+    assert!(
+        err.contains("timed out") || err.contains("interrupt"),
+        "expected a wall-clock stop, got: {err}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "the loop must be stopped near its 2 s timeout (elapsed {elapsed:?})"
+    );
+}
+
+/// The `Yield` half. The guest's OWN deadline is 30 s (the
+/// `execute_module_string` default) and fuel is effectively infinite; the
+/// caller's 1 s `tokio::time::timeout` can only fire if the guest's future
+/// returns `Pending`. A `Continue` epoch extension never does, so the outer
+/// timeout would wait for the 30 s deadline and a sibling task on the same
+/// thread would not run at all. With `Yield` the heartbeat keeps beating and
+/// the outer timeout wins within about a tick.
+#[test]
+fn a_compute_bound_guest_yields_its_thread_to_the_executor() {
+    let rt = {
+        let _g = FUEL_ENV_LOCK.lock().unwrap();
+        std::env::set_var("WASM_FUEL_LIMIT", "1000000000000"); // 1e12 instructions
+        let rt = TalosRuntime::new().expect("runtime");
+        std::env::remove_var("WASM_FUEL_LIMIT");
+        rt
+    };
+    let bytes = build_minimal_component(LOOP_CORE_WAT);
+    let (timed_out, elapsed, beats) = finish_within(
+        Duration::from_secs(20),
+        "outer timeout around a busy guest",
+        move || {
+            let tokio_rt = current_thread_rt();
+            tokio_rt.block_on(async move {
+                let beats = Arc::new(AtomicUsize::new(0));
+                let heartbeat = {
+                    let beats = beats.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                            beats.fetch_add(1, Ordering::Relaxed);
+                        }
+                    })
+                };
+                let start = std::time::Instant::now();
+                let outcome = tokio::time::timeout(
+                    Duration::from_secs(1),
+                    rt.execute_module_string(&bytes, "{}"),
+                )
+                .await;
+                let elapsed = start.elapsed();
+                heartbeat.abort();
+                (outcome.is_err(), elapsed, beats.load(Ordering::Relaxed))
+            })
+        },
+    );
+    assert!(
+        timed_out,
+        "the caller's 1 s timeout must win over the guest's 30 s deadline"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the outer timeout must fire within about a tick of 1 s (elapsed {elapsed:?})"
+    );
+    assert!(
+        beats >= 5,
+        "a sibling task on the same thread must keep running while the guest computes \
+         (heartbeat beat {beats} times in {elapsed:?})"
+    );
+}
+
+/// A component whose `run` returns `ok("{}")` at once, padded with `n` unused
+/// functions so its Cranelift compile takes real time. The padding functions
+/// are exported so dead-code elimination cannot drop them.
+fn big_ok_component(n: usize) -> Vec<u8> {
+    let mut wat = String::from(
+        r#"(module
+  (import "talos:core/logging" "log" (func $log (param i32 i32 i32)))
+  (memory (export "memory") 1)
+  (func (export "cabi_realloc") (param i32 i32 i32 i32) (result i32) (i32.const 200))
+  (func (export "run") (param i32 i32) (result i32)
+    (call $log (i32.const 1) (i32.const 0) (i32.const 0))
+    (i32.store8 (i32.const 100) (i32.const 123))
+    (i32.store8 (i32.const 101) (i32.const 125))
+    (i32.store (i32.const 8) (i32.const 0))
+    (i32.store (i32.const 12) (i32.const 100))
+    (i32.store (i32.const 16) (i32.const 2))
+    (i32.const 8))
+"#,
+    );
+    for i in 0..n {
+        wat.push_str(&format!(
+            "  (func (export \"pad{i}\") (param i32) (result i32)\n"
+        ));
+        wat.push_str("    (local i32)\n");
+        for k in 0..40 {
+            wat.push_str(&format!(
+                "    (local.set 1 (i32.add (i32.mul (local.get 0) (i32.const {})) (local.get 1)))\n",
+                k + 3
+            ));
+        }
+        wat.push_str("    (local.get 1))\n");
+    }
+    wat.push(')');
+    build_minimal_component(&wat)
+}
+
+/// A cache-miss compile must not hold the executor thread. Cranelift codegen
+/// for a large component is pure CPU; until 2026-09-25 it ran inline in the
+/// async execution path, so on the controller — whose runtime serves requests
+/// — every other task on that thread stalled for the whole compile. It now
+/// runs under `spawn_blocking`, so a heartbeat on the SAME current-thread
+/// runtime keeps beating while the module compiles.
+#[test]
+fn a_cache_miss_compile_does_not_hold_the_executor_thread() {
+    let rt = TalosRuntime::new().expect("runtime");
+    let bytes = big_ok_component(3_000);
+    let (res, elapsed, beats) = finish_within(
+        Duration::from_secs(300),
+        "large component compile",
+        move || {
+            let tokio_rt = current_thread_rt();
+            tokio_rt.block_on(async move {
+                let beats = Arc::new(AtomicUsize::new(0));
+                let heartbeat = {
+                    let beats = beats.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                            beats.fetch_add(1, Ordering::Relaxed);
+                        }
+                    })
+                };
+                // Let the heartbeat start before the compile begins.
+                tokio::task::yield_now().await;
+                let start = std::time::Instant::now();
+                let res = rt
+                    .execute_module_with_timeout(&bytes, "{}", Duration::from_secs(120))
+                    .await;
+                let elapsed = start.elapsed();
+                heartbeat.abort();
+                (
+                    res.map_err(|e| format!("{e:#}")),
+                    elapsed,
+                    beats.load(Ordering::Relaxed),
+                )
+            })
+        },
+    );
+    res.expect("the padded component must compile and run");
+    // Anti-vacuity: a compile too fast to measure proves nothing either way.
+    assert!(
+        elapsed >= Duration::from_millis(200),
+        "the fixture must take measurable compile time to be a test at all ({elapsed:?}); \
+         raise the padding"
+    );
+    let expected_beats = (elapsed.as_millis() / 10) as usize;
+    assert!(
+        beats * 4 >= expected_beats,
+        "the executor thread must keep scheduling other tasks during a compile: \
+         {beats} heartbeats in {elapsed:?} (~{expected_beats} if never blocked)"
     );
 }
 
@@ -525,10 +797,8 @@ async fn cancellation_preempts_a_compute_bound_module() {
     /// Effectively infinite — fuel must not be the limiter.
     const HUGE_FUEL: u64 = 1_000_000_000_000;
 
+    // The epoch ticker is started by the runtime's constructor.
     let rt = Arc::new(TalosRuntime::new().expect("runtime"));
-    // Epoch interruption is inert without the ticker — this is the wiring
-    // `worker/src/main.rs` does at startup.
-    let ticker = worker::runtime::spawn_epoch_ticker(rt.engine_handle());
 
     let execution_id = Uuid::new_v4();
     let bytes = build_minimal_component(LOOP_CORE_WAT);
@@ -601,7 +871,6 @@ async fn cancellation_preempts_a_compute_bound_module() {
         .expect("the cancelled job must not run to the 60s timeout")
         .expect("job task panicked");
     let elapsed = cancel_at.elapsed();
-    ticker.abort();
 
     let err = format!("{:#}", res.expect_err("a preempted job must not return Ok"));
 
@@ -671,7 +940,6 @@ async fn an_uncancelled_compute_bound_job_still_traps_at_its_own_budget() {
     const HUGE_FUEL: u64 = 1_000_000_000_000;
 
     let rt = TalosRuntime::new().expect("runtime");
-    let ticker = worker::runtime::spawn_epoch_ticker(rt.engine_handle());
     let bytes = build_minimal_component(LOOP_CORE_WAT);
 
     let start = std::time::Instant::now();
@@ -709,7 +977,6 @@ async fn an_uncancelled_compute_bound_job_still_traps_at_its_own_budget() {
         )
         .await;
     let elapsed = start.elapsed();
-    ticker.abort();
 
     let err = format!("{:#}", res.expect_err("a runaway loop must not return Ok"));
     assert!(

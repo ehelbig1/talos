@@ -595,3 +595,125 @@ fn loopback_http_probe_is_refused_by_the_scheme_gate_not_the_ssrf_guard() {
         "127.0.0.1 is a denied IP literal — but the scheme gate refuses it first"
     );
 }
+
+/// Unit semantics of the per-call `fetch_all` byte budget.
+#[test]
+fn a_batch_reservation_is_released_unless_kept() {
+    use crate::host::BatchByteBudget;
+    let budget = std::sync::Arc::new(BatchByteBudget::new(100));
+    let mut a = budget.reservation();
+    assert!(a.grow(60));
+    let mut b = budget.reservation();
+    assert!(!b.grow(50), "60 + 50 exceeds the cap");
+    assert!(b.grow(40), "a refused grow reserved nothing");
+    assert_eq!(budget.used(), 100);
+    drop(b); // an entry that failed
+    assert_eq!(
+        budget.used(),
+        60,
+        "a dropped reservation gives its bytes back"
+    );
+    a.keep(); // an entry that succeeded
+    assert_eq!(budget.used(), 60, "a kept reservation holds its bytes");
+}
+
+/// Loopback server answering every connection with a `body_len`-byte body.
+async fn spawn_loopback_bulk_server(body_len: usize, conns: usize) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind loopback");
+    let port = listener.local_addr().expect("local_addr").port();
+    tokio::spawn(async move {
+        for _ in 0..conns {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let _ = socket.read(&mut buf).await;
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {body_len}\r\nConnection: close\r\n\r\n"
+                );
+                if socket.write_all(head.as_bytes()).await.is_err() {
+                    return;
+                }
+                let block = vec![b'z'; 64 * 1024];
+                let mut left = body_len;
+                while left > 0 {
+                    let n = left.min(block.len());
+                    if socket.write_all(&block[..n]).await.is_err() {
+                        return; // the client gave up on this entry
+                    }
+                    left -= n;
+                }
+                let _ = socket.flush().await;
+            });
+        }
+    });
+    port
+}
+
+/// Production path: a batch whose bodies are each under the per-entry cap but
+/// together far over the per-CALL budget. Pre-fix every entry succeeded and
+/// the call held all of it (here 64 MiB; up to 10 GB at the call-count cap).
+/// Now the successful bodies together stay within the budget, the rest fail,
+/// and at least one full-size entry still gets through.
+#[tokio::test]
+async fn fetch_all_holds_at_most_one_call_budget_of_response_bytes() {
+    // Same dev-only loopback bypass as `fetch_with_bearer_sends_single_bearer_prefix`
+    // (nextest isolates each test in its own process).
+    std::env::set_var("WORKER_ALLOW_PRIVATE_HOST_TARGETS", "1");
+    std::env::set_var("WASM_ALLOW_INSECURE_HTTP", "1");
+    const BODY: usize = 8 * 1024 * 1024;
+    const ENTRIES: usize = 8;
+    let port = spawn_loopback_bulk_server(BODY, ENTRIES).await;
+
+    let mut ctx = TalosContext::new(
+        CapabilityWorld::Http,
+        vec!["localhost".to_string()],
+        vec!["GET".to_string()],
+        128,
+        HashMap::new(),
+        None,
+        None,
+        false,
+        None,
+        std::sync::Arc::new(crate::expose_fallback::ExposeFallback::new()),
+        LlmTier::default(),
+        None,
+    )
+    .unwrap();
+    let reqs = (0..ENTRIES)
+        .map(|i| wit_http::Request {
+            method: wit_http::Method::Get,
+            url: format!("http://localhost:{port}/{i}"),
+            headers: vec![],
+            body: vec![],
+            timeout_ms: Some(30_000),
+        })
+        .collect();
+    let out = ctx.fetch_all(reqs).await;
+    let ok_bytes: usize = out
+        .iter()
+        .filter_map(|r| r.as_ref().ok())
+        .map(|r| r.body.len())
+        .sum();
+    let ok = out.iter().filter(|r| r.is_ok()).count();
+    assert!(
+        ok >= 1,
+        "at least one full-size entry must fit: {out:?}",
+        out = out
+            .iter()
+            .map(|r| r.as_ref().map(|r| r.body.len()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        ok < ENTRIES,
+        "the batch must not hold every body ({ok} of {ENTRIES} succeeded)"
+    );
+    assert!(
+        ok_bytes <= crate::host::FETCH_ALL_MAX_RESPONSE_BYTES_PER_CALL,
+        "the call held {ok_bytes} response bytes"
+    );
+}

@@ -55,6 +55,11 @@ WORK+=(
     "lib|talos-rpc-subscribers|--lib kernel_two_replica|signed-RPC queue group [nats + nats-perm]"
     "lib|talos-totp-2fa|--lib redis_lockout_tests|2FA cross-instance lockout [redis]"
     "lib|talos-worker-runtime|--lib expose_limit_absence_tests|#661 expose-limit error-as-absence [redis]"
+    # In-crate DB tests: `execute_guest_query` is private, so its session-state
+    # cleanup (advisory locks, pooled-connection reuse vs detach) and the
+    # 20260925160000 privilege revoke are tested inside the crate, against the
+    # MIGRATED database (the only lib item that needs one — hence its own kind).
+    "lib-migrated|talos-rpc-subscribers|--lib guest_session::db_tests|guest SQL session cleanup + advisory/LO privileges [migrated]"
 )
 for cat in ctrl ctrl-serial tc; do
     while IFS=$'\t' read -r crate bin; do
@@ -334,6 +339,11 @@ for idx in "${!WORK[@]}"; do
             echo "▶ ${crate} ${what}  — ${extra}"
             # shellcheck disable=SC2086  # `what` is a flag plus an optional filter
             cargo test -p "$crate" $what || rc=1
+            ;;
+        lib-migrated)
+            echo "▶ ${crate} ${what}  — ${extra}"
+            # shellcheck disable=SC2086  # `what` is a flag plus an optional filter
+            TALOS_TEST_DATABASE_URL="$MIGRATED_URL" cargo test -p "$crate" $what || rc=1
             ;;
         ctrl|ctrl-serial)
             threadflag=()

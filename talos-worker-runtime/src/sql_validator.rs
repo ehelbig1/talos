@@ -1914,6 +1914,56 @@ mod tests {
         assert!(validate_sql("SELECT xmlcomment('hi')", &[]).is_ok());
     }
 
+    /// Session state that outlives the guest's transaction: advisory locks
+    /// (a SESSION lock survives COMMIT/ROLLBACK and rode the pooled connection
+    /// back into the controller's pool) and large objects (persist in
+    /// `pg_largeobject`). Denied by FAMILY prefix in the protocol matcher —
+    /// `pg_advisory_lock`, `lo_create`, `lo_get` are deliberately NOT in the
+    /// exact list, so every case here passes only while this walker routes
+    /// through `talos_workflow_job_protocol::is_disallowed_sql_function`.
+    #[test]
+    fn function_deny_list_covers_the_session_state_families() {
+        for sql in [
+            "SELECT pg_advisory_lock(1)",
+            "SELECT pg_try_advisory_xact_lock(1)",
+            "SELECT lo_create(0)",
+            // FROM-clause (set-returning) form: a TableFactor, not an Expr.
+            "SELECT * FROM lo_get(1)",
+            "SELECT * FROM pg_catalog.lo_get(1)",
+            "SELECT pg_catalog.pg_advisory_lock(1)",
+            "SELECT PG_ADVISORY_LOCK_SHARED(1, 2)",
+            "SELECT Pg_Try_Advisory_Lock(1)",
+            "SELECT lo_from_bytea(0, 'x'::bytea)",
+            "SELECT loread(0, 1)",
+            "SELECT lowrite(0, 'x'::bytea)",
+            // One lock PER ROW, hidden in a predicate.
+            "SELECT id FROM t WHERE pg_try_advisory_lock(id)",
+            "WITH l AS (SELECT pg_advisory_lock(7)) SELECT * FROM l",
+            "SELECT (SELECT (SELECT pg_advisory_lock(7)))",
+            // A family member no current Postgres has: denied by the prefix.
+            "SELECT pg_advisory_lock_timeout(1, 5)",
+        ] {
+            let err = validate_sql(sql, &[]).unwrap_err();
+            assert!(
+                matches!(err, SqlValidationError::DisallowedFunction(_)),
+                "`{sql}` must be refused as a disallowed function, got {err:?}"
+            );
+        }
+        // The function walk runs before the allowlist, so granting the verb
+        // does not re-admit the lock.
+        let ops = vec!["DELETE".to_string()];
+        let err = validate_sql("DELETE FROM t WHERE pg_try_advisory_lock(id)", &ops).unwrap_err();
+        assert!(matches!(err, SqlValidationError::DisallowedFunction(_)));
+        // Controls: the real pg_catalog functions sharing a stem stay callable.
+        for sql in [
+            "SELECT lower(name), log(2.0), log10(100) FROM t",
+            "SELECT lower_inc(int4range(1, 2)), lower_inf(int4range(1, 2))",
+        ] {
+            let result = validate_sql(sql, &[]);
+            assert!(result.is_ok(), "`{sql}` was rejected: {result:?}");
+        }
+    }
+
     #[test]
     fn function_deny_list_walks_into_join_predicates() {
         // Join ON / WHERE / HAVING all reach via the visitor.
@@ -1958,9 +2008,11 @@ mod tests {
 
     #[test]
     fn function_deny_list_does_not_block_user_funcs_with_pg_prefix() {
-        // Tripwire: deny-list must be an exact match, NOT a `starts_with("pg_")`
-        // shortcut that would block legitimate user-defined functions
-        // happening to share a name prefix with the stock pg_* catalog.
+        // Tripwire: deny-list must be an exact match (or one of the narrow
+        // FAMILY prefixes `pg_advisory_` / `pg_try_advisory_` / `lo_`), NOT a
+        // `starts_with("pg_")` shortcut that would block legitimate
+        // user-defined functions happening to share a name prefix with the
+        // stock pg_* catalog.
         let result = validate_sql("SELECT pg_my_custom_business_func(id) FROM t", &[]);
         assert!(
             result.is_ok(),
