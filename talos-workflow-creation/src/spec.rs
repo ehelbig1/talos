@@ -534,14 +534,17 @@ impl super::WorkflowCreationService {
         user_id: Uuid,
         spec_nodes: &[Value],
     ) -> anyhow::Result<ResolveResult> {
+        struct Compiled<'a> {
+            id: String,
+            config: Value,
+            input: talos_inline_compile_service::InlineCompileInput<'a>,
+            compiled: talos_inline_compile_service::CompiledInline,
+        }
+        // Boxed: the compiled arm carries the WASM and the whole input, ~4x
+        // the resolved arm (clippy `large_enum_variant`).
         enum Slot<'a> {
             Done(ResolvedSpecNode),
-            Compiled {
-                id: String,
-                config: Value,
-                input: talos_inline_compile_service::InlineCompileInput<'a>,
-                compiled: talos_inline_compile_service::CompiledInline,
-            },
+            Compiled(Box<Compiled<'a>>),
         }
         let mut slots: Vec<Slot<'_>> = Vec::with_capacity(spec_nodes.len());
         let mut build_errors: Vec<NodeBuildError> = Vec::new();
@@ -666,12 +669,12 @@ impl super::WorkflowCreationService {
                         on_name_collision: talos_inline_compile_service::NameCollision::Refuse,
                     };
                     match self.inline_compile.compile_checked(&input).await {
-                        Ok(compiled) => slots.push(Slot::Compiled {
+                        Ok(compiled) => slots.push(Slot::Compiled(Box::new(Compiled {
                             id: node_id,
                             config,
                             input,
                             compiled,
-                        }),
+                        }))),
                         Err(e) => build_errors.push(node_build_error(&node_id, &e, false)),
                     }
                 }
@@ -699,20 +702,26 @@ impl super::WorkflowCreationService {
         for slot in slots {
             match slot {
                 Slot::Done(r) => resolved.push(r),
-                Slot::Compiled {
-                    id,
-                    config,
-                    input,
-                    compiled,
-                } => match self.inline_compile.persist_compiled(&input, compiled).await {
-                    Ok(outcome) => resolved.push(ResolvedSpecNode {
-                        compilation_note: Some(format!("compiled {} → {}", id, outcome.module_id)),
+                Slot::Compiled(boxed) => {
+                    let Compiled {
                         id,
-                        module_id: outcome.module_id.to_string(),
                         config,
-                    }),
-                    Err(e) => build_errors.push(node_build_error(&id, &e, true)),
-                },
+                        input,
+                        compiled,
+                    } = *boxed;
+                    match self.inline_compile.persist_compiled(&input, compiled).await {
+                        Ok(outcome) => resolved.push(ResolvedSpecNode {
+                            compilation_note: Some(format!(
+                                "compiled {} → {}",
+                                id, outcome.module_id
+                            )),
+                            id,
+                            module_id: outcome.module_id.to_string(),
+                            config,
+                        }),
+                        Err(e) => build_errors.push(node_build_error(&id, &e, true)),
+                    }
+                }
             }
         }
         if !build_errors.is_empty() {
