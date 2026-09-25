@@ -268,8 +268,20 @@ pub(crate) fn reject_diagnostics<T: AdmittableRpc>(
     }
 }
 
+/// The signed-RPC canonical nonce: exactly 32 lowercase hex chars (MCP-1137).
+/// Same rule as `talos_memory::rpc_auth`'s private check, which this crate
+/// cannot call; `canonical_nonce_rule_matches_the_local_cache` pins the two
+/// equal.
+pub(crate) fn is_canonical_rpc_nonce(nonce: &str) -> bool {
+    nonce.len() == 32
+        && nonce
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// THE admission chokepoint. Parse the payload, verify HMAC +
-/// freshness, run the cross-replica replay guard, then record the
+/// freshness, refuse a non-canonical nonce, run the cross-replica replay
+/// guard, then record the
 /// nonce in the process-local cache — in that order, fail-closed at
 /// each step. Returns the only constructible [`Admitted<T>`].
 pub(crate) async fn admit_from_bytes<T: AdmittableRpc>(
@@ -286,6 +298,13 @@ pub(crate) async fn admit_from_bytes<T: AdmittableRpc>(
         return Err(AdmitError::Unauthorized {
             reason: RejectReason::Verify(failure),
         });
+    }
+    // The nonce is inside the signature, so any fleet-key holder picks its
+    // shape. Refuse a non-canonical one BEFORE the shared guard writes it into
+    // a Redis key (a 1 MiB nonce was a 1 MiB key); the local cache below would
+    // refuse it with this same error anyway.
+    if !is_canonical_rpc_nonce(req.nonce()) {
+        return Err(AdmitError::Replay);
     }
     if !crate::crossreplica_replay_ok(T::WIRE_SUBJECT, req.actor_id(), req.nonce()).await {
         return Err(AdmitError::Unauthorized {
@@ -473,6 +492,50 @@ mod admission_tests {
         // Legacy HMAC carries no signer id at all; so does an all-garbage one.
         assert_eq!(sanitize_worker_id(""), "none");
         assert_eq!(sanitize_worker_id("💥 💥"), "none");
+    }
+
+    #[test]
+    fn canonical_nonce_rule_matches_the_local_cache() {
+        let cases = [
+            canonical_nonce(),
+            "0123456789abcdef0123456789abcdef".to_string(),
+            "0123456789ABCDEF0123456789ABCDEF".to_string(),
+            "0".repeat(31),
+            "0".repeat(33),
+            "g".repeat(32),
+            " ".repeat(32),
+            String::new(),
+            "a".repeat(1 << 20),
+            talos_memory::rpc_auth::random_nonce(),
+        ];
+        for nonce in cases {
+            // A fresh actor per case: the local cache answers `true` only for
+            // a canonical, never-seen nonce.
+            let local = talos_memory::rpc_auth::check_and_record_nonce(
+                "canonical_rule_parity",
+                uuid::Uuid::new_v4(),
+                &nonce,
+            );
+            assert_eq!(
+                is_canonical_rpc_nonce(&nonce),
+                local,
+                "rules disagree on a {}-byte nonce",
+                nonce.len()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn non_canonical_nonce_is_refused_like_a_replay() {
+        let req = FakeReq {
+            nonce: "A".repeat(4096),
+            ..FakeReq::admitting()
+        };
+        let bytes = serde_json::to_vec(&req).expect("serialize");
+        assert!(matches!(
+            admit_from_bytes::<FakeReq>(&bytes).await,
+            Err(AdmitError::Replay)
+        ));
     }
 
     #[tokio::test]
