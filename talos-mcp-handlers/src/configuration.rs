@@ -625,9 +625,14 @@ async fn handle_set_workflow_priority(
     // "your workflow doesn't exist" from "the database hiccupped,
     // retry". Surface the error class loudly. Same swallowed-error
     // anti-pattern as MCP-188 (get_schedule_health).
-    let gj = match state
+    // Versioned: stamping `priority` is a read-modify-write of the whole
+    // graph, so it must not overwrite an edit made after this read.
+    let talos_workflow_repository::VersionedGraph {
+        graph_json: gj,
+        graph_version,
+    } = match state
         .workflow_repo
-        .get_workflow_graph_for_similarity(wf_id, user_id)
+        .get_workflow_graph_versioned(wf_id, user_id)
         .await
     {
         Ok(Some(g)) => g,
@@ -657,19 +662,22 @@ async fn handle_set_workflow_priority(
     if let Err(resp) = crate::utils::ensure_graph_within_caps(&updated, &req_id) {
         return resp;
     }
-    match state
-        .workflow_repo
-        .update_workflow_graph_json(wf_id, user_id, &updated)
-        .await
-    {
+    // Until 2026-09-25 this wrote through the UNCONDITIONAL overwrite and
+    // answered success on `Ok(0)`; it is now the compare-and-set write.
+    match crate::graph::graph_write_response(
+        state
+            .workflow_repo
+            .update_workflow_graph(wf_id, user_id, &updated, graph_version)
+            .await,
+        wf_id,
+        &req_id,
+        "set_workflow_priority",
+    ) {
         Ok(_) => mcp_text(req_id, &format!(
             "Workflow {} priority set to '{}'.\nEvery new execution record of this workflow (manual, scheduled, webhook, call/bulk/enqueue, test) will carry this label; nothing runs sooner or later because of it.",
             wf_id, priority
         )),
-        Err(e) => {
-            tracing::error!(workflow_id = %wf_id, "set_workflow_priority update failed: {:#}", e);
-            mcp_error(req_id, -32000, "Failed to save workflow priority")
-        }
+        Err(resp) => resp,
     }
 }
 

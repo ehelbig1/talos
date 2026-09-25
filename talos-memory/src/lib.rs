@@ -2911,55 +2911,142 @@ pub async fn measure_and_forget_keys_in_tx<'c>(
     Ok((row.0, row.1 as u64))
 }
 
+/// One source row a consolidation retires.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetireSource {
+    pub key: String,
+    /// When `Some`, the row is retired ONLY if its `updated_at` still equals
+    /// this — the value the summariser read. A row rewritten after the read
+    /// carries content the summary never saw, so it is KEPT (compare-and-
+    /// delete). `None` retires by key alone: the operator-driven MCP path
+    /// supplies keys and a summary it wrote itself, with no read timestamps.
+    pub expected_updated_at: Option<DateTime<Utc>>,
+}
+
+impl RetireSource {
+    /// Retire by key alone (the operator path).
+    #[must_use]
+    pub fn by_key(key: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            expected_updated_at: None,
+        }
+    }
+
+    /// Retire only if the row is still at `updated_at`.
+    #[must_use]
+    pub fn if_unchanged(key: impl Into<String>, updated_at: DateTime<Utc>) -> Self {
+        Self {
+            key: key.into(),
+            expected_updated_at: Some(updated_at),
+        }
+    }
+}
+
+/// What a consolidation actually did.
+#[must_use]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConsolidationOutcome {
+    /// Source rows deleted. Also what `__consolidated_from_count__` records.
+    pub retired: u64,
+    /// Guarded sources NOT retired because they changed (or vanished) after
+    /// the summariser read them. Their current content is intact.
+    pub kept_changed: Vec<String>,
+    /// `false` when a GUARDED batch retired nothing: every source changed
+    /// after it was read, so the summary described nothing that is going
+    /// away and was rolled back with the (empty) delete.
+    pub summary_written: bool,
+}
+
 /// Atomic persist-summary + forget-sources consolidation kernel — the SINGLE
-/// implementation shared by the MCP `consolidate_actor_memory` handler and the
-/// Phase-3b autonomous consolidation loop (`talos_memory_consolidation`).
+/// implementation shared by the MCP `consolidate_actor_memory` handler (via
+/// [`consolidate_memory`]) and the Phase-3b autonomous consolidation loop
+/// (`talos_memory_consolidation`).
 ///
 /// In ONE committed transaction it:
-///   1. enriches `semantic_value` (when it's a JSON object) with
-///      `__consolidated_from_count__` (source key count) and
-///      `__consolidated_at__` (RFC-3339-ish UTC). Non-object values pass
-///      through untouched. Callers that want a human `__consolidated_note__`
-///      insert it into `semantic_value` before calling.
-///   2. persists the enriched value as a `"semantic"` memory under
-///      `semantic_key`, stamping the passed `metadata` (e.g.
-///      `{"kind": "consolidated", ...}`).
-///   3. hard-deletes the `source_keys` episodic rows (batched DELETE).
+///   1. deletes the source rows — each [`RetireSource`] carrying an
+///      `expected_updated_at` only if the row is STILL at that timestamp. The
+///      loop reads a row, spends seconds in an LLM call, then retires it; a
+///      writer that upserted the same key in between (every write stamps
+///      `updated_at = now()`) put content there the summary never saw. Until
+///      2026-09-25 the delete was by key alone and destroyed it.
+///   2. enriches `semantic_value` (when it's a JSON object) with
+///      `__consolidated_from_count__` (rows ACTUALLY retired) and
+///      `__consolidated_at__`. Non-object values pass through untouched.
+///   3. persists the enriched value as a `"semantic"` memory under
+///      `semantic_key`, stamping the passed `metadata`.
 ///   4. commits — so the summary and the source deletion are all-or-nothing.
-///      Any error before commit rolls back BOTH (zero mutation).
+///      Any error before commit rolls back BOTH (zero mutation). A guarded
+///      batch whose every source changed also rolls back (nothing retired,
+///      [`ConsolidationOutcome::summary_written`] = false).
 ///
 /// Post-commit (outside the tx, by design — a rolled-back tx must not corrupt
 /// the graph) it fires graph-RAG entity extraction for the new semantic row.
-///
-/// Returns the number of source rows retired.
-pub async fn consolidate_memory(
+pub async fn consolidate_memory_guarded(
     pool: &Pool<Postgres>,
     actor_id: Uuid,
     semantic_key: &str,
     semantic_value: serde_json::Value,
-    source_keys: &[String],
+    sources: &[RetireSource],
     metadata: Option<serde_json::Value>,
-) -> Result<u64> {
+) -> Result<ConsolidationOutcome> {
     // Never delete the summary we just wrote: if a caller (e.g. the MCP
     // `consolidate_actor_memory` handler with operator-supplied keys) includes
-    // `semantic_key` in `source_keys`, the DELETE would wipe the fresh summary
-    // in the same tx — losing BOTH the summary and its sources. Filter it out
-    // up front so the provenance count below reflects the rows ACTUALLY retired.
-    let retire_keys: Vec<String> = source_keys
+    // `semantic_key` in the sources, the DELETE would wipe the fresh summary
+    // in the same tx — losing BOTH the summary and its sources.
+    let sources: Vec<&RetireSource> = sources.iter().filter(|s| s.key != semantic_key).collect();
+    let keys: Vec<String> = sources.iter().map(|s| s.key.clone()).collect();
+    let expected: Vec<Option<DateTime<Utc>>> =
+        sources.iter().map(|s| s.expected_updated_at).collect();
+    let any_guarded = expected.iter().any(Option::is_some);
+
+    let mut tx = pool.begin().await.context("consolidate_memory: begin tx")?;
+
+    // Compare-and-delete. `s.expected_updated_at IS NULL` is the key-only
+    // (operator) arm; otherwise the row must be exactly as it was read.
+    let retired_keys: Vec<String> = if keys.is_empty() {
+        Vec::new()
+    } else {
+        sqlx::query_scalar(
+            "DELETE FROM actor_memory m \
+             USING UNNEST($2::text[], $3::timestamptz[]) AS s(key, expected_updated_at) \
+             WHERE m.actor_id = $1 AND m.key = s.key \
+               AND (s.expected_updated_at IS NULL OR m.updated_at = s.expected_updated_at) \
+             RETURNING m.key",
+        )
+        .bind(actor_id)
+        .bind(&keys)
+        .bind(&expected)
+        .fetch_all(&mut *tx)
+        .await
+        .context("consolidate_memory: forget source keys")?
+    };
+    let retired = retired_keys.len() as u64;
+    let retired_set: std::collections::HashSet<&str> =
+        retired_keys.iter().map(String::as_str).collect();
+    let kept_changed: Vec<String> = sources
         .iter()
-        .filter(|k| k.as_str() != semantic_key)
-        .cloned()
+        .filter(|s| s.expected_updated_at.is_some() && !retired_set.contains(s.key.as_str()))
+        .map(|s| s.key.clone())
         .collect();
 
-    // Enrich provenance onto object values only (mirrors the MCP handler's
-    // pre-extraction behaviour). Count from `retire_keys` (post-filter) so
-    // `__consolidated_from_count__` matches the number of rows that will be
-    // retired, not the raw (possibly self-key-inclusive) input.
+    if retired == 0 && any_guarded {
+        tx.rollback()
+            .await
+            .context("consolidate_memory: rollback")?;
+        return Ok(ConsolidationOutcome {
+            retired: 0,
+            kept_changed,
+            summary_written: false,
+        });
+    }
+
+    // Provenance counts the rows ACTUALLY retired, not the keys requested.
     let final_value = if let Some(obj) = semantic_value.as_object() {
         let mut enriched = obj.clone();
         enriched.insert(
             "__consolidated_from_count__".to_string(),
-            serde_json::Value::Number(serde_json::Number::from(retire_keys.len() as u64)),
+            serde_json::Value::Number(serde_json::Number::from(retired)),
         );
         enriched.insert(
             "__consolidated_at__".to_string(),
@@ -2969,11 +3056,6 @@ pub async fn consolidate_memory(
     } else {
         semantic_value
     };
-
-    // Persist the summary + delete the absorbed sources atomically. Without
-    // the transaction, a crash between INSERT and DELETE would leave both the
-    // new semantic entry AND the old episodic entries present simultaneously.
-    let mut tx = pool.begin().await.context("consolidate_memory: begin tx")?;
 
     persist_memory_in_tx_with_metadata(
         &mut tx,
@@ -2986,10 +3068,6 @@ pub async fn consolidate_memory(
     )
     .await
     .context("consolidate_memory: persist semantic summary")?;
-
-    let retired_count = forget_keys_in_tx(&mut tx, actor_id, &retire_keys)
-        .await
-        .context("consolidate_memory: forget source keys")?;
 
     tx.commit().await.context("consolidate_memory: commit")?;
 
@@ -3006,7 +3084,46 @@ pub async fn consolidate_memory(
         Some("consolidated"),
     );
 
-    Ok(retired_count)
+    Ok(ConsolidationOutcome {
+        retired,
+        kept_changed,
+        summary_written: true,
+    })
+}
+
+/// The operator path: retire `source_keys` by key alone (the caller supplied
+/// the keys and wrote the summary itself; it holds no read timestamps). Same
+/// kernel as [`consolidate_memory_guarded`]. Returns the rows retired.
+pub async fn consolidate_memory(
+    pool: &Pool<Postgres>,
+    actor_id: Uuid,
+    semantic_key: &str,
+    semantic_value: serde_json::Value,
+    source_keys: &[String],
+    metadata: Option<serde_json::Value>,
+) -> Result<u64> {
+    let sources: Vec<RetireSource> = source_keys.iter().map(RetireSource::by_key).collect();
+    let outcome = consolidate_memory_guarded(
+        pool,
+        actor_id,
+        semantic_key,
+        semantic_value,
+        &sources,
+        metadata,
+    )
+    .await?;
+    Ok(outcome.retired)
+}
+
+/// One consolidation candidate: a decrypted episodic row plus the
+/// `updated_at` it was read at — the guard the retirement compares against
+/// ([`RetireSource::if_unchanged`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConsolidationCandidate {
+    pub key: String,
+    pub value: serde_json::Value,
+    pub memory_type: String,
+    pub updated_at: DateTime<Utc>,
 }
 
 /// Scan one actor's OLD, COLD, LOW-importance EPISODIC memories — the Phase-3b
@@ -3034,7 +3151,7 @@ pub async fn scan_consolidation_candidates(
     min_age_days: f64,
     max_importance: f64,
     limit: i64,
-) -> Result<Vec<(String, serde_json::Value, String)>> {
+) -> Result<Vec<ConsolidationCandidate>> {
     // `make_interval` takes int4 only (lint 27) — bind i32 days AND cast
     // `$2::int` in SQL. `min_age_days` is an f64 config value; round to the
     // nearest whole day. FLOOR AT 1: a sub-1-day setting (e.g. 0.4) would
@@ -3043,7 +3160,7 @@ pub async fn scan_consolidation_candidates(
     // making recent low-importance rows deletable. Consolidation always leaves
     // at least a full day of headroom.
     let min_age_days_i32 = (min_age_days.round() as i32).max(1);
-    let sql = "SELECT actor_id, key, value_enc, value_key_id, value_format, memory_type \
+    let sql = "SELECT actor_id, key, value_enc, value_key_id, value_format, memory_type, updated_at \
                FROM actor_memory \
                WHERE actor_id = $1 \
                  AND memory_type = 'episodic' \
@@ -3068,8 +3185,14 @@ pub async fn scan_consolidation_candidates(
         // value_format — fails loud on projection drift).
         let key: String = row.try_get::<String, _>("key")?;
         let memory_type: String = row.try_get::<String, _>("memory_type")?;
+        let updated_at: DateTime<Utc> = row.try_get::<DateTime<Utc>, _>("updated_at")?;
         let value = decrypt_row_value(row).await?;
-        out.push((key, value, memory_type));
+        out.push(ConsolidationCandidate {
+            key,
+            value,
+            memory_type,
+            updated_at,
+        });
     }
     Ok(out)
 }

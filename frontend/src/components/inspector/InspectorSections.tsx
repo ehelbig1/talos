@@ -232,15 +232,20 @@ export function RetryPolicySection({
           </label>
           <input
             type="number"
-            placeholder="0"
+            // Empty = no declared count: the engine's method-aware default
+            // applies. That is NOT 0, which means "never retry".
+            placeholder="default"
             className={inputBase}
-            value={data.retryPolicy?.maxRetries ?? 0}
+            value={data.retryPolicy?.maxRetries ?? ""}
             onChange={(e) => {
-              const currentPolicy = data.retryPolicy || { maxRetries: 0 };
+              const currentPolicy = data.retryPolicy || {};
               updateNodeData(nodeId, {
                 retryPolicy: {
                   ...currentPolicy,
-                  maxRetries: Math.max(0, parseInt(e.target.value, 10) || 0),
+                  maxRetries:
+                    e.target.value === ""
+                      ? undefined
+                      : Math.max(0, parseInt(e.target.value, 10) || 0),
                 },
               });
             }}
@@ -257,7 +262,7 @@ export function RetryPolicySection({
             className={inputBase}
             value={data.retryPolicy?.backoffMs ?? 1000}
             onChange={(e) => {
-              const currentPolicy = data.retryPolicy || { maxRetries: 0 };
+              const currentPolicy = data.retryPolicy || {};
               updateNodeData(nodeId, {
                 retryPolicy: {
                   ...currentPolicy,
@@ -280,7 +285,7 @@ export function RetryPolicySection({
             className="relative w-full px-6 py-5 bg-black/40 border border-white/5 font-mono text-[11px] min-h-[140px] transition-premium rounded-[2rem] selection:bg-primary/30 leading-relaxed focus:outline-none focus:border-primary/40 focus:shadow-[0_0_30px_hsla(var(--primary),0.05)]"
             value={data.retryPolicy?.retryCondition ?? ""}
             onChange={(e) => {
-              const currentPolicy = data.retryPolicy || { maxRetries: 0 };
+              const currentPolicy = data.retryPolicy || {};
               updateNodeData(nodeId, {
                 retryPolicy: {
                   ...currentPolicy,
@@ -304,7 +309,7 @@ export function RetryPolicySection({
               type="button"
               key={snippet.label}
               onClick={() => {
-                const currentPolicy = data.retryPolicy || { maxRetries: 0 };
+                const currentPolicy = data.retryPolicy || {};
                 updateNodeData(nodeId, {
                   retryPolicy: {
                     ...currentPolicy,

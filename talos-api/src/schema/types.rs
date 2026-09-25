@@ -15,6 +15,11 @@ pub struct Workflow {
     pub name: String,
     /// Serialized representation of the graph (flexible JSON).
     pub graph_json: String,
+    /// The version `graphJson` is at. Advances whenever the graph changes,
+    /// through ANY writer (this API, MCP tools, rollback). Pass it back as
+    /// `updateWorkflow(expectedGraphVersion:)` so a save made from a stale
+    /// read is refused instead of silently overwriting the newer graph.
+    pub graph_version: i64,
     /// Maximum number of concurrent executions allowed (null = unlimited).
     pub max_concurrent_executions: Option<i32>,
     /// Optional structured intent metadata.

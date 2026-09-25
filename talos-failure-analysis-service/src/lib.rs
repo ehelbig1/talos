@@ -1107,15 +1107,20 @@ impl FailureAnalysisService {
         if apply_fix && apply_fix_available {
             if let Some((failed_node_id_opt, failed_node_label, field_name)) = &apply_fix_candidate
             {
-                // Load graph_json (user-scoped)
-                let graph_json_str = self
+                // Load graph_json (user-scoped) WITH the version it was read
+                // at, so the write below cannot discard a concurrent edit.
+                let versioned = self
                     .execution_repo
-                    .get_workflow_graph_for_user(workflow_id, user_id)
+                    .get_workflow_graph_versioned_for_user(workflow_id, user_id)
                     .await
                     .ok()
                     .flatten();
 
-                if let Some(graph_json_str) = graph_json_str {
+                if let Some(talos_workflow_repository::VersionedGraph {
+                    graph_json: graph_json_str,
+                    graph_version,
+                }) = versioned
+                {
                     let mut graph: serde_json::Value = serde_json::from_str(&graph_json_str)
                         .unwrap_or(serde_json::json!({"nodes":[],"edges":[]}));
 
@@ -1184,7 +1189,12 @@ impl FailureAnalysisService {
                         } else {
                             let db_result = self
                                 .execution_repo
-                                .update_workflow_graph(workflow_id, user_id, &updated_json)
+                                .update_workflow_graph(
+                                    workflow_id,
+                                    user_id,
+                                    &updated_json,
+                                    graph_version,
+                                )
                                 .await;
                             // MCP-882 (2026-05-14): log the underlying error
                             // before collapsing to the generic "Failed to save
@@ -1197,13 +1207,28 @@ impl FailureAnalysisService {
                             // Operator-facing message stays generic; server log
                             // distinguishes the cause.
                             match db_result {
-                                Ok(_) => {
+                                Ok(talos_workflow_repository::GraphWrite::Written { .. }) => {
                                     fix_result = Some(serde_json::json!({
                                         "fix_applied": true,
                                         "patched_node": patched_node_display,
                                         "patched_field": field_name,
                                         "retry_with_execution_id": exec_id.to_string(),
                                         "note": "Field initialized to empty string — call update_node_config to set the correct value, then retry."
+                                    }));
+                                }
+                                // The graph changed between this call's read
+                                // and its write. Writing anyway would discard
+                                // that edit; say so instead of claiming a fix.
+                                Ok(talos_workflow_repository::GraphWrite::Conflict) => {
+                                    fix_result = Some(serde_json::json!({
+                                        "fix_applied": false,
+                                        "error": "The workflow graph was changed by another call while this fix was being prepared; nothing was saved. Re-run analyze_execution_failure with apply_fix to retry against the current graph."
+                                    }));
+                                }
+                                Ok(talos_workflow_repository::GraphWrite::NotFound) => {
+                                    fix_result = Some(serde_json::json!({
+                                        "fix_applied": false,
+                                        "error": "Workflow not found or access denied at write time; nothing was saved"
                                     }));
                                 }
                                 Err(e) => {

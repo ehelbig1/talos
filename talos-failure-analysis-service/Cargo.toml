@@ -18,6 +18,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # Talos crates — repositories
 talos-execution-repository = { path = "../talos-execution-repository" }
+# `VersionedGraph` / `GraphWrite`: the apply_fix path is a graph
+# read-modify-write and must use the one compare-and-set write.
+talos-workflow-repository = { path = "../talos-workflow-repository" }
 
 # The worker's `[reason_class=…]` marker vocabulary. Consumed rather than
 # re-mirrored: this classifier reads worker failure text, and before #714/#717

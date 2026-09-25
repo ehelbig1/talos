@@ -10,6 +10,13 @@ import {
 import { useWorkflowStore } from "@/store/workflowStore";
 import type { WorkflowEdge, EdgeData } from "@/store/workflowStore";
 import { sanitizeErrorMessage } from "@/lib/sanitize";
+import {
+  edgeTopLevelExtras,
+  graphTopLevelExtras,
+  nodeTopLevelExtras,
+  readNodeEngineControls,
+  withoutEngineControls,
+} from "@/lib/graphDocument";
 import { toast } from "sonner";
 // Node/Edge types imported via workflowStore
 
@@ -20,6 +27,7 @@ const _GET_WORKFLOW_LOADER = gql`
       id
       name
       graphJson
+      graphVersion
       actorId
       maxConcurrentExecutions
       intent
@@ -47,6 +55,8 @@ interface GraphNode {
   type: string;
   position: { x: number; y: number };
   data?: Record<string, unknown>;
+  // MCP writers put engine controls (`retry_*`, …) and other keys here.
+  [key: string]: unknown;
 }
 
 interface GraphEdge {
@@ -61,6 +71,8 @@ interface GraphJson {
   nodes: GraphNode[];
   edges: GraphEdge[];
   priority?: "high" | "normal" | "low";
+  // `execution_timeout_secs` and any other graph-level key.
+  [key: string]: unknown;
 }
 
 /**
@@ -214,15 +226,26 @@ export async function loadWorkflowById(workflowId: string): Promise<void> {
         typeof raw.config === "object" &&
         raw.config !== null &&
         ("moduleName" in raw || "moduleId" in raw);
-      const config = legacyNested
+      const rawConfig = legacyNested
         ? (raw.config as Record<string, unknown>)
         : n.data || moduleData?.config || {};
+
+      // Engine controls (skip / continue-on-error / timeout / retry) live in
+      // `data` OR at the node's top level depending on which writer stored
+      // them (MCP puts `retry_*` top-level). Read them from wherever the
+      // engine reads them, and take them OUT of the config so the typed
+      // fields are their single source — the save writes them back.
+      const controls = readNodeEngineControls(n as Record<string, unknown>);
+      const config = withoutEngineControls(rawConfig);
+      const storedNodeExtras = nodeTopLevelExtras(n as Record<string, unknown>);
 
       return {
         id: n.id, // Use backend ID for consistency
         type: "talosNode", // React Flow node type
         position: n.position || { x: 100, y: 100 },
         data: {
+          ...controls,
+          storedNodeExtras,
           label: moduleName, // Use module name as label
           moduleId: n.type, // Module UUID (for execution)
           moduleName: moduleName, // Human-readable name
@@ -254,6 +277,12 @@ export async function loadWorkflowById(workflowId: string): Promise<void> {
       if (condition !== undefined) {
         edgeData.condition = condition;
       }
+      // Top-level edge keys the editor does not model (`id`, `logic`, …) —
+      // carried through so a save does not delete them.
+      const storedEdgeExtras = edgeTopLevelExtras(e);
+      if (Object.keys(storedEdgeExtras).length > 0) {
+        edgeData.storedEdgeExtras = storedEdgeExtras;
+      }
       return {
         id: e.id || `${e.source}-${e.target}`,
         source: e.source,
@@ -276,6 +305,13 @@ export async function loadWorkflowById(workflowId: string): Promise<void> {
         `Loaded workflow: ${workflow.name} (${workflow.id}) with ${nodes.length} nodes`,
       );
     store.setWorkflowMeta(workflow.id, workflow.name);
+    // After setWorkflowMeta (which drops a version belonging to a different
+    // workflow): the version this graph was read at, and the graph-level keys
+    // the editor does not model (`execution_timeout_secs`, …).
+    store.setGraphDocument({
+      graphVersion: workflow.graphVersion,
+      graphExtras: graphTopLevelExtras(graph),
+    });
     store.setMaxConcurrentExecutions(workflow.maxConcurrentExecutions ?? 1);
     store.setPriority(graph.priority ?? "normal");
     store.setIntent(

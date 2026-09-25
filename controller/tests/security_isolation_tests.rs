@@ -219,16 +219,27 @@ async fn test_graph_json_write_refuses_foreign_workflow() {
         .await
         .expect("user B creates a workflow");
 
-    // User A attempts to overwrite user B's graph.
+    // User A attempts to overwrite user B's graph — passing the row's REAL
+    // current version, the strongest form of the attack (the compare-and-set
+    // write added 2026-09-25 must not be what stops it; tenancy must).
+    let current_version = repo
+        .get_workflow_graph_versioned(wf_id, user_b_id)
+        .await
+        .expect("owner reads version")
+        .expect("row exists")
+        .graph_version;
     let attacker_graph = r#"{"nodes":[{"id":"pwned"}],"edges":[]}"#;
-    let affected = repo
-        .update_workflow_graph(wf_id, user_a_id, attacker_graph)
+    let outcome = repo
+        .update_workflow_graph(wf_id, user_a_id, attacker_graph, current_version)
         .await
         .expect("query executes");
-    assert!(
-        !affected,
-        "cross-tenant graph write reported a row affected — the statement lost its \
-         `AND user_id = $3` predicate"
+    // NotFound, and specifically NOT Conflict: a Conflict would tell user A
+    // that the row exists — an id oracle over other tenants' workflows.
+    assert_eq!(
+        outcome,
+        talos_workflow_repository::GraphWrite::NotFound,
+        "cross-tenant graph write was not refused as not-found — the statement lost its \
+         `AND user_id = $3` predicate (Written), or its visibility probe did (Conflict)"
     );
 
     // …and the row is untouched. Read it back as the OWNER, since the
@@ -246,13 +257,16 @@ async fn test_graph_json_write_refuses_foreign_workflow() {
     // The owner's own write still works — this guards against "fixing" the
     // above by making the statement match nothing at all.
     let owner_graph = r#"{"nodes":[{"id":"mine"}],"edges":[]}"#;
-    let affected_owner = repo
-        .update_workflow_graph(wf_id, user_b_id, owner_graph)
+    let outcome_owner = repo
+        .update_workflow_graph(wf_id, user_b_id, owner_graph, current_version)
         .await
         .expect("query executes");
-    assert!(
-        affected_owner,
-        "owner's own graph write reported no rows affected"
+    assert_eq!(
+        outcome_owner,
+        talos_workflow_repository::GraphWrite::Written {
+            graph_version: current_version + 1
+        },
+        "owner's own graph write was not written (or the version did not advance)"
     );
     let after_owner = repo
         .get_workflow_graph(wf_id, user_b_id)

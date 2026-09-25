@@ -760,34 +760,51 @@ impl WorkflowRepository {
         Ok(wf_id)
     }
 
-    /// Update only graph_json (and bump updated_at). Returns `true` if a row
-    /// was affected — i.e. the workflow exists AND belongs to `user_id`.
+    /// Read `graph_json` together with the `graph_version` it was read at —
+    /// the read half of every graph read-modify-write. Pass the version back
+    /// to [`Self::update_workflow_graph`]. `Ok(None)` = no such workflow for
+    /// this user.
+    pub async fn get_workflow_graph_versioned(
+        &self,
+        workflow_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<Option<crate::VersionedGraph>> {
+        crate::graph_version::read_workflow_graph_versioned(&self.db_pool, workflow_id, user_id)
+            .await
+    }
+
+    /// Write `graph_json` IF the row is still at `expected_version`, the
+    /// version the caller's read returned (and bump updated_at).
     ///
-    /// **This is the only graph_json write path.** The former
-    /// `update_workflow_graph_unchecked` (`… WHERE id = $2`, no tenancy
-    /// predicate) was deleted: an audit of its six handlers found every one
-    /// already held `user_id` and had already run an ownership-checked read,
-    /// so the unscoped variant bought one saved bind in exchange for a write
-    /// whose tenancy lived entirely in caller convention. `false` here is a
-    /// real signal (row missing, or owned by someone else) and callers MUST
-    /// surface it rather than discarding it — see
-    /// `talos_mcp_handlers::graph::save_graph_json`.
+    /// **This is the read-modify-write graph_json write path.** It was an
+    /// unconditional UPDATE until 2026-09-25: two overlapping mutations each
+    /// wrote their own copy of the whole document and the later one silently
+    /// discarded the earlier one's change, both answering success. The
+    /// expected version is a REQUIRED parameter so no caller can write without
+    /// having read — the compiler enumerates every site.
+    ///
+    /// [`crate::GraphWrite::Conflict`] means nothing was written and the
+    /// caller must re-read; [`crate::GraphWrite::NotFound`] is the row missing
+    /// or owned by someone else. Neither may be reported as success.
+    ///
+    /// The former `update_workflow_graph_unchecked` (`… WHERE id = $2`, no
+    /// tenancy predicate) stays deleted: the owner predicate is part of the
+    /// statement.
     pub async fn update_workflow_graph(
         &self,
         workflow_id: Uuid,
         user_id: Uuid,
         graph_json: &str,
-    ) -> Result<bool> {
-        let result = sqlx::query(
-            "UPDATE workflows SET graph_json = $1, updated_at = NOW() \
-             WHERE id = $2 AND user_id = $3",
+        expected_version: i64,
+    ) -> Result<crate::GraphWrite> {
+        crate::graph_version::write_workflow_graph_if_unchanged(
+            &self.db_pool,
+            workflow_id,
+            user_id,
+            graph_json,
+            expected_version,
         )
-        .bind(graph_json)
-        .bind(workflow_id)
-        .bind(user_id)
-        .execute(&self.db_pool)
-        .await?;
-        Ok(result.rows_affected() > 0)
+        .await
     }
 
     /// Update workflow metadata fields selectively. Returns true if a row was affected.
@@ -856,12 +873,14 @@ impl WorkflowRepository {
         max_concurrent_executions: Option<i32>,
         intent: Option<&serde_json::Value>,
         org_id: Uuid,
-    ) -> Result<Uuid> {
-        let workflow_id = sqlx::query_scalar::<_, Uuid>(
+    ) -> Result<(Uuid, i64)> {
+        // Returns the new row's `graph_version` too (the column default), so
+        // the caller never hard-codes what a fresh graph's version is.
+        let created = sqlx::query_as::<_, (Uuid, i64)>(
             r#"
             INSERT INTO workflows (name, module_uri, graph_json, user_id, max_concurrent_executions, intent, org_id)
             VALUES ($1, '', $2, $3, $4, $5, $6)
-            RETURNING id
+            RETURNING id, graph_version
             "#,
         )
         .bind(name)
@@ -872,14 +891,22 @@ impl WorkflowRepository {
         .bind(org_id)
         .fetch_one(conn)
         .await?;
-        Ok(workflow_id)
+        Ok(created)
     }
 
     /// Full-field workflow update gated on ownership OR writable-org
     /// access. Takes the caller's connection (tenant-scoped tx built from
     /// the WRITABLE org set — a Viewer must not update an org-shared
-    /// workflow; RFC 0004 M4). Returns rows affected. Do NOT route
-    /// through `self.db_pool`.
+    /// workflow; RFC 0004 M4). Do NOT route through `self.db_pool`.
+    ///
+    /// `expected_graph_version`: when `Some`, the write happens only if the
+    /// row's `graph_version` still equals it (the web editor passes the
+    /// version it loaded, so a save cannot silently overwrite an MCP edit made
+    /// while the editor was open); a mismatch is
+    /// [`crate::GraphWrite::Conflict`] and NOTHING is written. `None` keeps the
+    /// historical unconditional write for API callers that never read a
+    /// version. Either way the trigger advances `graph_version` when the graph
+    /// changes, and `Written` carries the new value.
     #[allow(clippy::too_many_arguments)]
     pub async fn update_workflow_scoped(
         &self,
@@ -891,12 +918,20 @@ impl WorkflowRepository {
         graph_json: &str,
         max_concurrent_executions: Option<i32>,
         intent: Option<&serde_json::Value>,
-    ) -> Result<u64> {
-        let result = sqlx::query(
+        expected_graph_version: Option<i64>,
+    ) -> Result<crate::GraphWrite> {
+        let row = sqlx::query(
             r#"
-            UPDATE workflows
-            SET name = $1, graph_json = $2, max_concurrent_executions = $3, intent = $4, updated_at = NOW()
-            WHERE id = $5 AND (user_id = $6 OR org_id = ANY($7))
+            WITH written AS (
+                UPDATE workflows
+                SET name = $1, graph_json = $2, max_concurrent_executions = $3, intent = $4, updated_at = NOW()
+                WHERE id = $5 AND (user_id = $6 OR org_id = ANY($7))
+                  AND ($8::bigint IS NULL OR graph_version = $8)
+                RETURNING graph_version
+            )
+            SELECT (SELECT graph_version FROM written) AS written_version,
+                   EXISTS (SELECT 1 FROM workflows
+                           WHERE id = $5 AND (user_id = $6 OR org_id = ANY($7))) AS row_visible
             "#,
         )
         .bind(name)
@@ -906,9 +941,13 @@ impl WorkflowRepository {
         .bind(workflow_id)
         .bind(user_id)
         .bind(writable_org_ids)
-        .execute(conn)
+        .bind(expected_graph_version)
+        .fetch_one(conn)
         .await?;
-        Ok(result.rows_affected())
+        Ok(crate::GraphWrite::classify(
+            row.try_get::<Option<i64>, _>("written_version")?,
+            row.try_get::<bool, _>("row_visible")?,
+        ))
     }
 
     /// Delete a workflow gated on ownership OR writable-org access, with the
@@ -1065,7 +1104,7 @@ impl WorkflowRepository {
     ) -> Result<Option<WorkflowAccessRow>> {
         let row = sqlx::query_as::<_, WorkflowAccessRow>(
             r#"
-            SELECT id, name, graph_json, max_concurrent_executions, intent, actor_id
+            SELECT id, name, graph_json, graph_version, max_concurrent_executions, intent, actor_id
             FROM workflows
             WHERE id = $1 AND (user_id = $2 OR org_id = ANY($3))
             "#,
@@ -1090,7 +1129,7 @@ impl WorkflowRepository {
         offset: i64,
     ) -> Result<Vec<WorkflowAccessRow>> {
         let rows = sqlx::query_as::<_, WorkflowAccessRow>(
-            "SELECT id, name, graph_json, max_concurrent_executions, intent, actor_id \
+            "SELECT id, name, graph_json, graph_version, max_concurrent_executions, intent, actor_id \
              FROM workflows WHERE (user_id = $1 OR org_id = ANY($4)) \
              ORDER BY created_at DESC, id DESC LIMIT $2 OFFSET $3",
         )
@@ -2182,9 +2221,17 @@ impl WorkflowRepository {
     // [`Self::get_workflow_name_for_user`] and renders the bare UUID when the
     // referenced workflow is not visible to the caller.
 
-    /// Update the raw `graph_json` column for a workflow scoped to user.
-    /// Used by handlers that mutate the JSON in-Rust then write it back
-    /// (e.g. `set_workflow_priority`).
+    /// OVERWRITE the raw `graph_json` column for a workflow scoped to user,
+    /// with NO version check.
+    ///
+    /// Only for a write that does not derive from a read of the draft —
+    /// `rollback_workflow`, which replaces the draft with a published
+    /// snapshot. A handler that reads the draft, changes it and writes it back
+    /// MUST use [`Self::get_workflow_graph_versioned`] +
+    /// [`Self::update_workflow_graph`] instead, or it re-opens the lost-update
+    /// window that method closes. (`set_workflow_priority` used this until
+    /// 2026-09-25.) The trigger still advances `graph_version` here, so a
+    /// read-modify-write racing this overwrite sees the conflict.
     pub async fn update_workflow_graph_json(
         &self,
         workflow_id: Uuid,
@@ -2559,6 +2606,9 @@ pub struct WorkflowAccessRow {
     pub id: Uuid,
     pub name: String,
     pub graph_json: String,
+    /// The version `graph_json` was read at — what an editor passes back as
+    /// its expected version so its save cannot overwrite a concurrent edit.
+    pub graph_version: i64,
     pub max_concurrent_executions: Option<i32>,
     pub intent: Option<serde_json::Value>,
     pub actor_id: Option<Uuid>,

@@ -1181,7 +1181,17 @@ type MutationRoot {
 	hard failures (DB unavailable, etc.) flow as a GraphQL Error.
 	"""
 	createWorkflowFromDescription(input: CreateWorkflowFromDescriptionInput!): CreateWorkflowFromDescriptionResult!
-	updateWorkflow(id: UUID!, input: CreateWorkflowInput!): Workflow!
+	"""
+	Replace a workflow's name, graph, concurrency cap and intent.
+	
+	`expectedGraphVersion`: the `Workflow.graphVersion` the caller's copy
+	of the graph was read at. When given, the update is applied only if
+	the stored graph is still at that version; if anything changed it in
+	the meantime (an MCP tool, another editor tab, a rollback) the update
+	is REFUSED and nothing is written, instead of silently discarding that
+	change. Omit it for the historical last-writer-wins behaviour.
+	"""
+	updateWorkflow(id: UUID!, input: CreateWorkflowInput!, expectedGraphVersion: Int): Workflow!
 	deleteWorkflow(id: UUID!): Boolean!
 	generateCode(input: GenerateCodeInput!): GenerateCodeResult!
 	publishWorkflowVersion(workflowId: UUID!, description: String): WorkflowVersion!
@@ -1954,6 +1964,13 @@ type Workflow {
 	Serialized representation of the graph (flexible JSON).
 	"""
 	graphJson: String!
+	"""
+	The version `graphJson` is at. Advances whenever the graph changes,
+	through ANY writer (this API, MCP tools, rollback). Pass it back as
+	`updateWorkflow(expectedGraphVersion:)` so a save made from a stale
+	read is refused instead of silently overwriting the newer graph.
+	"""
+	graphVersion: Int!
 	"""
 	Maximum number of concurrent executions allowed (null = unlimited).
 	"""

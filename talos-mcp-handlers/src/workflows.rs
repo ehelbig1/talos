@@ -2072,8 +2072,17 @@ async fn handle_add_node_to_workflow(
         Err(resp) => return resp,
     };
 
-    let graph_json_str = match state.workflow_repo.get_workflow_graph(wf_id, user_id).await {
-        Ok(Some(gj)) => gj,
+    // Read WITH the version: this handler is a read-modify-write, and the
+    // inline-compile path below can hold the read for tens of seconds.
+    let talos_workflow_repository::VersionedGraph {
+        graph_json: graph_json_str,
+        graph_version,
+    } = match state
+        .workflow_repo
+        .get_workflow_graph_versioned(wf_id, user_id)
+        .await
+    {
+        Ok(Some(g)) => g,
         Ok(None) => return mcp_denied(req_id, -32000, "Workflow not found or access denied"),
         Err(e) => {
             tracing::error!("get_workflow_graph error: {}", e);
@@ -2713,25 +2722,18 @@ async fn handle_add_node_to_workflow(
     // not see it: that check greps for a swallowed raw-SQL call, and this is a
     // repository method. (Spelling the grep's literal here would trip check 6,
     // which forbids raw SQL in this crate — found the hard way.)
-    match state
-        .workflow_repo
-        .update_workflow_graph(wf_id, user_id, &updated_json)
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => {
-            tracing::warn!(
-                target: "talos_audit",
-                workflow_id = %wf_id,
-                "add_node_to_workflow: UPDATE matched 0 rows — workflow missing or not owned at \
-                 write time; node NOT persisted"
-            );
-            return mcp_denied(req_id, -32000, "Workflow not found or access denied");
-        }
-        Err(e) => {
-            tracing::error!(workflow_id = %wf_id, "add_node_to_workflow save failed: {}", e);
-            return mcp_error(req_id, -32000, "Failed to save workflow graph");
-        }
+    // Compare-and-set: a concurrent edit since the read above is a
+    // conflict, never an overwrite (see `crate::graph::graph_write_response`).
+    if let Err(resp) = crate::graph::graph_write_response(
+        state
+            .workflow_repo
+            .update_workflow_graph(wf_id, user_id, &updated_json, graph_version)
+            .await,
+        wf_id,
+        &req_id,
+        "add_node_to_workflow",
+    ) {
+        return resp;
     }
 
     // Keep a published workflow's active version in sync with the edited
@@ -9023,7 +9025,15 @@ fn spawn_llm_auto_fill_task(
 
     let repo_fill = state.workflow_repo.clone();
     tokio::spawn(async move {
-        let graph_str = match repo_fill.get_workflow_graph(workflow_id, user_id).await {
+        // Versioned: the LLM calls below hold this read for seconds, and an
+        // edit the user makes meanwhile must not be overwritten by the fill.
+        let talos_workflow_repository::VersionedGraph {
+            graph_json: graph_str,
+            graph_version,
+        } = match repo_fill
+            .get_workflow_graph_versioned(workflow_id, user_id)
+            .await
+        {
             Ok(Some(g)) => g,
             _ => return,
         };
@@ -9108,12 +9118,24 @@ fn spawn_llm_auto_fill_task(
                 // success on a failed write. No API response is involved here,
                 // so the fix is to make the log honest, not to change a caller.
                 match repo_fill
-                    .update_workflow_graph(workflow_id, user_id, &updated_json)
+                    .update_workflow_graph(workflow_id, user_id, &updated_json, graph_version)
                     .await
                 {
-                    Ok(_) => tracing::debug!(
+                    Ok(talos_workflow_repository::GraphWrite::Written { .. }) => tracing::debug!(
                         "auto_fill_config: patched graph for workflow {}",
                         workflow_id
+                    ),
+                    // The user edited the graph while the defaults were being
+                    // suggested. Their edit wins; the suggestions are dropped.
+                    Ok(talos_workflow_repository::GraphWrite::Conflict) => tracing::info!(
+                        workflow_id = %workflow_id,
+                        "auto_fill_config: graph changed while defaults were being suggested; \
+                         suggestions NOT applied (the concurrent edit is kept)"
+                    ),
+                    Ok(talos_workflow_repository::GraphWrite::NotFound) => tracing::warn!(
+                        workflow_id = %workflow_id,
+                        user_id = %user_id,
+                        "auto_fill_config: workflow gone at write time — config defaults not applied"
                     ),
                     Err(e) => tracing::warn!(
                         workflow_id = %workflow_id,
@@ -10355,7 +10377,14 @@ async fn handle_add_edge_to_workflow(
     // Auth check first — load the workflow graph (includes ownership check via user_id).
     // Rhai compilation is deferred until after auth so callers cannot trigger CPU work
     // or distinguish "not found" from "bad syntax" without owning the resource.
-    let graph_json_str = match state.workflow_repo.get_workflow_graph(wf_id, user_id).await {
+    let talos_workflow_repository::VersionedGraph {
+        graph_json: graph_json_str,
+        graph_version,
+    } = match state
+        .workflow_repo
+        .get_workflow_graph_versioned(wf_id, user_id)
+        .await
+    {
         Ok(Some(g)) => g,
         Ok(None) => return mcp_denied(req_id, -32000, "Workflow not found or access denied"),
         Err(e) => {
@@ -10532,29 +10561,20 @@ async fn handle_add_edge_to_workflow(
     if let Err(resp) = crate::utils::ensure_graph_within_caps(&updated_json, &req_id) {
         return resp;
     }
-    // Ownership was already established by the `get_workflow_graph(wf_id,
-    // user_id)` read above; the write now re-states it as `AND user_id = $3`
-    // instead of relying on that read alone, and a 0-row result is surfaced
-    // rather than read as success.
-    match state
-        .workflow_repo
-        .update_workflow_graph(wf_id, user_id, &updated_json)
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => {
-            tracing::warn!(
-                target: "talos_audit",
-                workflow_id = %wf_id,
-                "add_edge_to_workflow: UPDATE matched 0 rows — workflow missing or not owned at \
-                 write time; edge NOT persisted"
-            );
-            return mcp_denied(req_id, -32000, "Workflow not found or access denied");
-        }
-        Err(e) => {
-            tracing::error!(workflow_id = %wf_id, "add_edge_to_workflow save failed: {}", e);
-            return mcp_error(req_id, -32000, "Failed to save workflow graph");
-        }
+    // Ownership was already established by the versioned read above; the
+    // write re-states it as `AND user_id = $3`, writes only if the graph is
+    // still at the version read, and surfaces a 0-row result (missing row or
+    // concurrent edit) rather than reading it as success.
+    if let Err(resp) = crate::graph::graph_write_response(
+        state
+            .workflow_repo
+            .update_workflow_graph(wf_id, user_id, &updated_json, graph_version)
+            .await,
+        wf_id,
+        &req_id,
+        "add_edge_to_workflow",
+    ) {
+        return resp;
     }
 
     // Keep a published workflow's active version in sync with the new edge
@@ -10720,8 +10740,15 @@ async fn handle_swap_node_module(
             .collect();
 
     // ── Fetch workflow graph_json ────────────────────────────────────────────
-    let graph_json_str = match state.workflow_repo.get_workflow_graph(wf_id, user_id).await {
-        Ok(Some(s)) => s,
+    let talos_workflow_repository::VersionedGraph {
+        graph_json: graph_json_str,
+        graph_version,
+    } = match state
+        .workflow_repo
+        .get_workflow_graph_versioned(wf_id, user_id)
+        .await
+    {
+        Ok(Some(g)) => g,
         Ok(None) => return mcp_denied(req_id, -32000, "Workflow not found or access denied"),
         Err(e) => {
             tracing::error!("swap_node_module workflow fetch failed: {}", e);
@@ -10868,13 +10895,18 @@ async fn handle_swap_node_module(
         if let Err(resp) = crate::utils::ensure_graph_within_caps(&updated_json, &req_id) {
             return resp;
         }
-        if let Err(e) = state
-            .workflow_repo
-            .update_workflow_graph(wf_id, user_id, &updated_json)
-            .await
-        {
-            tracing::error!("swap_node_module update failed: {}", e);
-            return mcp_error(req_id, -32000, "Failed to persist workflow graph");
+        // Until 2026-09-25 only `Err` was checked here, so a zero-row write
+        // (workflow deleted meanwhile) reported the swap as done.
+        if let Err(resp) = crate::graph::graph_write_response(
+            state
+                .workflow_repo
+                .update_workflow_graph(wf_id, user_id, &updated_json, graph_version)
+                .await,
+            wf_id,
+            &req_id,
+            "swap_node_module",
+        ) {
+            return resp;
         }
 
         // Keep a published workflow's active version in sync with the swap
@@ -11644,8 +11676,15 @@ async fn handle_set_workflow_execution_timeout(
     };
 
     // Load current graph_json (ownership-gated).
-    let graph_str = match state.workflow_repo.get_workflow_graph(wf_id, user_id).await {
-        Ok(Some(s)) => s,
+    let talos_workflow_repository::VersionedGraph {
+        graph_json: graph_str,
+        graph_version,
+    } = match state
+        .workflow_repo
+        .get_workflow_graph_versioned(wf_id, user_id)
+        .await
+    {
+        Ok(Some(g)) => g,
         Ok(None) => return mcp_denied(req_id, -32000, "Workflow not found or access denied"),
         Err(e) => {
             tracing::error!(workflow_id = %wf_id, "get_workflow_graph failed: {}", e);
@@ -11674,11 +11713,16 @@ async fn handle_set_workflow_execution_timeout(
     if let Err(resp) = crate::utils::ensure_graph_within_caps(&updated_json, &req_id) {
         return resp;
     }
-    match state
-        .workflow_repo
-        .update_workflow_graph(wf_id, user_id, &updated_json)
-        .await
-    {
+    // `Ok(_)` used to answer `updated: true` for a zero-row write too.
+    match crate::graph::graph_write_response(
+        state
+            .workflow_repo
+            .update_workflow_graph(wf_id, user_id, &updated_json, graph_version)
+            .await,
+        wf_id,
+        &req_id,
+        "set_workflow_execution_timeout",
+    ) {
         Ok(_) => mcp_text(
             req_id,
             &serde_json::to_string_pretty(&serde_json::json!({
@@ -11693,10 +11737,7 @@ async fn handle_set_workflow_execution_timeout(
             }))
             .unwrap_or_default(),
         ),
-        Err(e) => {
-            tracing::error!(workflow_id = %wf_id, "set_workflow_execution_timeout failed: {}", e);
-            mcp_error(req_id, -32000, "Failed to update workflow timeout")
-        }
+        Err(resp) => resp,
     }
 }
 

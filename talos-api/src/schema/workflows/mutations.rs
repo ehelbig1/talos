@@ -1,4 +1,4 @@
-use async_graphql::{Context, Result};
+use async_graphql::{Context, ErrorExtensions as _, Result};
 use chrono::Utc;
 use std::sync::Arc;
 // MCP-853 (2026-05-14): `tracing::info` removed; the only previous user
@@ -16,6 +16,17 @@ use talos_engine::events::{ExecutionEvent, ExecutionStatus};
 use talos_registry::ModuleRegistry;
 use talos_workflow_engine_core::WorkerSharedKey;
 use talos_workflow_versions::WorkflowVersionService;
+
+/// `extensions.code` on the `updateWorkflow` refusal when
+/// `expectedGraphVersion` no longer matches. A stable machine token because
+/// the web client's production error sanitizer canonicalises message text; the
+/// editor keys its "reload before saving" handling on this code.
+pub const GRAPH_VERSION_CONFLICT_CODE: &str = "GRAPH_VERSION_CONFLICT";
+
+/// Caller-facing sentence for the same refusal.
+pub const GRAPH_VERSION_CONFLICT_MESSAGE: &str =
+    "This workflow's graph was changed elsewhere after you loaded it; your update was NOT \
+     saved (saving would have discarded that change). Reload the workflow and re-apply your edit.";
 
 #[derive(Default)]
 pub struct WorkflowsMutations;
@@ -341,7 +352,7 @@ impl WorkflowsMutations {
                     tracing::error!(error = %e, "graphql: tenant scope error");
                     async_graphql::Error::new("Request scope error").extend_safe()
                 })?;
-        let workflow_id = workflow_repo
+        let (workflow_id, graph_version) = workflow_repo
             .insert_workflow_scoped(
                 &mut tx,
                 &input.name,
@@ -367,6 +378,7 @@ impl WorkflowsMutations {
             id: workflow_id,
             name: input.name,
             graph_json: input.graph_json,
+            graph_version,
             max_concurrent_executions: input.max_concurrent_executions,
             intent: input.intent,
             actor_id: None,
@@ -435,11 +447,20 @@ impl WorkflowsMutations {
         Ok(map_create_outcome(outcome))
     }
 
+    /// Replace a workflow's name, graph, concurrency cap and intent.
+    ///
+    /// `expectedGraphVersion`: the `Workflow.graphVersion` the caller's copy
+    /// of the graph was read at. When given, the update is applied only if
+    /// the stored graph is still at that version; if anything changed it in
+    /// the meantime (an MCP tool, another editor tab, a rollback) the update
+    /// is REFUSED and nothing is written, instead of silently discarding that
+    /// change. Omit it for the historical last-writer-wins behaviour.
     async fn update_workflow(
         &self,
         ctx: &Context<'_>,
         id: Uuid,
         input: CreateWorkflowInput,
+        expected_graph_version: Option<i64>,
     ) -> Result<Workflow> {
         crate::schema::require_2fa(ctx)?;
         crate::schema::require_scope(ctx, talos_api_keys::ApiKeyScope::WorkflowsWrite)?;
@@ -499,7 +520,7 @@ impl WorkflowsMutations {
                 async_graphql::Error::new("Request scope error").extend_safe()
             })?;
         let workflow_repo = talos_workflow_repository::WorkflowRepository::new(db_pool.clone());
-        let rows_affected = workflow_repo
+        let outcome = workflow_repo
             .update_workflow_scoped(
                 &mut tx,
                 id,
@@ -509,6 +530,7 @@ impl WorkflowsMutations {
                 &input.graph_json,
                 input.max_concurrent_executions,
                 input.intent.as_ref(),
+                expected_graph_version,
             )
             .await
             .map_err(|e| {
@@ -519,13 +541,21 @@ impl WorkflowsMutations {
             .await
             .map_err(|e: sqlx::Error| e.extend_safe())?;
 
-        if rows_affected == 0 {
-            // MCP-918: .extend_safe()
-            return Err(async_graphql::Error::new(
-                "Workflow not found or you don't have permission to update it",
-            )
-            .extend_safe());
-        }
+        let graph_version = match outcome {
+            talos_workflow_repository::GraphWrite::Written { graph_version } => graph_version,
+            talos_workflow_repository::GraphWrite::Conflict => {
+                return Err(async_graphql::Error::new(GRAPH_VERSION_CONFLICT_MESSAGE)
+                    .extend_with(|_, e| e.set("code", GRAPH_VERSION_CONFLICT_CODE))
+                    .extend_safe());
+            }
+            talos_workflow_repository::GraphWrite::NotFound => {
+                // MCP-918: .extend_safe()
+                return Err(async_graphql::Error::new(
+                    "Workflow not found or you don't have permission to update it",
+                )
+                .extend_safe());
+            }
+        };
 
         // Maintain workflow_module_refs junction table.
         sync_workflow_module_refs(db_pool, id, &input.graph_json).await;
@@ -534,6 +564,7 @@ impl WorkflowsMutations {
             id,
             name: input.name,
             graph_json: input.graph_json,
+            graph_version,
             max_concurrent_executions: input.max_concurrent_executions,
             intent: input.intent,
             actor_id: None,

@@ -1471,6 +1471,7 @@ export type GetWorkflowLoaderQuery = {
     id: string;
     name: string;
     graphJson: string;
+    graphVersion: number;
     actorId: string | null;
     maxConcurrentExecutions: number | null;
     intent: unknown;
@@ -5419,6 +5420,7 @@ export const GetWorkflowLoaderDocument = new TypedDocumentString(`
     id
     name
     graphJson
+    graphVersion
     actorId
     maxConcurrentExecutions
     intent
