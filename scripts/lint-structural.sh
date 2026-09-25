@@ -42,8 +42,21 @@ cd "$ROOT"
 
 red()    { printf '\033[1;31m%s\033[0m\n' "$*"; }
 green()  { printf '\033[1;32m%s\033[0m\n' "$*"; }
-yellow() { printf '\033[1;33m%s\033[0m\n' "$*"; }
-bold()   { printf '\033[1m%s\033[0m\n' "$*"; }
+yellow() {
+    printf '\033[1;33m%s\033[0m\n' "$*"
+    # A leg that did not run is recorded for the final summary, so a green
+    # run says what it did NOT check. Hints ("  → …") never match.
+    case "$*" in
+        ⊘*|"⚠ "*skip*|*"— skipping check)") record_skip "$*" ;;
+    esac
+}
+bold()   {
+    printf '\033[1m%s\033[0m\n' "$*"
+    case "$*" in "▶ check "*) CURRENT_CHECK="${*#▶ check }"; CURRENT_CHECK="${CURRENT_CHECK%%:*}" ;; esac
+}
+CURRENT_CHECK="?"
+SKIPPED_LEGS=()
+record_skip() { SKIPPED_LEGS+=("check ${CURRENT_CHECK}: $(printf '%s' "$1" | sed -E 's/^[[:space:]]*(⊘|⚠)?[[:space:]]*//')"); }
 
 # Machine-readable check count, derived from the runtime `▶ check N:`
 # markers so it can't drift from the checks themselves. Used by the
@@ -9351,6 +9364,7 @@ if [ ! -f "$ROOT/scripts/lint-image-pins.py" ]; then
 else
     CK93_RC=0
     CK93_OUT="$(cd "$ROOT" && python3 scripts/lint-image-pins.py "$ROOT" 2>&1)" || CK93_RC=$?
+    case "$CK93_OUT" in *"rendered-chart leg skipped"*) record_skip "rendered-chart leg (helm not on PATH)" ;; esac
     if [ "$CK93_RC" -eq 0 ]; then
         green "✓ every container image reference is digest-pinned ($(echo "$CK93_OUT" | tail -1 | sed -E 's/^ +//'))"
     else
@@ -9524,10 +9538,30 @@ if ! grep -q "${CHECK_COUNT} checks today" CLAUDE.md; then
     yellow "    (and add a one-line entry for any new check to the numbered list)."
     META_FAIL=1
 fi
+# 54(b) — CLAUDE.md's numbered check list (the "Pre-deploy validation"
+# section) must carry each script check number exactly once. The count
+# sentence above cannot see a list that numbers two checks 82 and omits 84.
+DOC_NUMS="$(awk '/^## Pre-deploy validation/{f=1;next} /^## /{f=0} f' CLAUDE.md \
+    | grep -oE '^  [0-9]+\. ' | tr -d ' .' | sort -n || true)"
+if [ -z "$DOC_NUMS" ]; then
+    red "✗ no numbered check list found in CLAUDE.md's '## Pre-deploy validation' section"
+    META_FAIL=1
+else
+    DOC_DUP="$(printf '%s\n' "$DOC_NUMS" | uniq -d | tr '\n' ' ')"
+    DOC_MISSING="$(comm -23 <(echo "$EXPECTED_NUMS" | sort) <(printf '%s\n' "$DOC_NUMS" | sort -u) | sort -n | tr '\n' ' ')"
+    DOC_EXTRA="$(comm -13 <(echo "$EXPECTED_NUMS" | sort) <(printf '%s\n' "$DOC_NUMS" | sort -u) | sort -n | tr '\n' ' ')"
+    if [ -n "$DOC_DUP$DOC_MISSING$DOC_EXTRA" ]; then
+        red "✗ CLAUDE.md's numbered check list disagrees with the script's checks 1..$CHECK_COUNT"
+        [ -n "$DOC_DUP" ] && yellow "  → numbered more than once: $DOC_DUP"
+        [ -n "$DOC_MISSING" ] && yellow "  → no list entry: $DOC_MISSING"
+        [ -n "$DOC_EXTRA" ] && yellow "  → listed but no such check: $DOC_EXTRA"
+        META_FAIL=1
+    fi
+fi
 if [ "$META_FAIL" -gt 0 ]; then
     EXIT_CODE=1
 else
-    green "✓ ${CHECK_COUNT} checks, contiguous numbering, CLAUDE.md count in sync"
+    green "✓ ${CHECK_COUNT} checks, contiguous numbering, CLAUDE.md count + numbered list in sync"
 fi
 
 # 54(c) — this script must be RUN by an auto-triggered workflow. Measured
@@ -9555,6 +9589,13 @@ fi
 echo
 
 # ── Summary ──────────────────────────────────────────────────────────
+# Legs that did NOT run, so a green local run is not read as "everything was
+# checked" (clippy, audit and the SQL PREPARE leg are env-gated; the chart
+# legs need helm; check 72 needs the operator-local marker list).
+if [ "${#SKIPPED_LEGS[@]}" -gt 0 ]; then
+    printf '\033[1;33m⊘ %d leg(s) did not run:\033[0m\n' "${#SKIPPED_LEGS[@]}"
+    printf '    %s\n' "${SKIPPED_LEGS[@]}"
+fi
 if [ "$EXIT_CODE" -eq 0 ]; then
     green "✓ structural lints passed"
 else
