@@ -4227,12 +4227,22 @@ echo
 # and the operator sees a stopped run rather than a red one. If another check
 # assigns from a `grep | grep` pipeline with no `|| true`, it has this bug
 # latent for the day its population reaches zero.
-bold "▶ check 56: with_effective_actor(None, …) without gate-resolved actor"
-UNRESOLVED_ACTOR_HITS="$(grep -rn 'with_effective_actor(None,' \
+#
+# 2026-09-25: the check matched only a literal `with_effective_actor(None, …)`,
+# and the defect it exists for arrived as the ABSENCE of a call instead:
+# `enqueue_workflow`'s drain built `EngineOpts::for_run(…)` with no actor
+# method at all, so a workflow bound to a `readonly` actor ran with the
+# `Write` ceiling and no capability-world ceiling. That shape no longer
+# compiles — `for_run` / `for_skip_load` return `UnboundEngineOpts`, which
+# `for_workflow` does not accept — and the one explicit way to build with no
+# actor, `.without_actor()`, is matched here beside the literal `None`. The
+# roots were a hand-maintained crate list (check 74's rot mode) that missed
+# `talos-subworkflow-contract` and `talos-actor-lifecycle-service`, both engine
+# builders; they are now every crate's `src/`, measured at the same zero.
+bold "▶ check 56: engine built with no gate-resolved actor (literal None or .without_actor())"
+UNRESOLVED_ACTOR_HITS="$(grep -rn 'with_effective_actor(None,\|without_actor()' \
         --include='*.rs' \
-        talos-engine/src talos-scheduler/src talos-webhooks/src \
-        talos-continuation-trigger/src talos-execution-orchestration/src \
-        talos-mcp-handlers/src talos-api/src controller/src 2>/dev/null \
+        talos-*/src controller/src worker/src 2>/dev/null \
     | grep -v 'src/builder.rs' \
     | grep -vE '^[^:]+:[0-9]+:[[:space:]]*//' \
     | while IFS= read -r hit; do
@@ -4243,7 +4253,7 @@ UNRESOLVED_ACTOR_HITS="$(grep -rn 'with_effective_actor(None,' \
         fi
     done || true)"
 if [ -n "$UNRESOLVED_ACTOR_HITS" ]; then
-    red "✗ engine built with a literal-None effective actor (Tier-1 fail-safe by accident):"
+    red "✗ engine built with no gate-resolved actor (literal None / .without_actor()):"
     echo "$UNRESOLVED_ACTOR_HITS" | sed 's/^/    /'
     yellow "  → resolve the actor through the authorization gate"
     yellow "    (talos_workflow_authorization::resolve_effective_actor) and bind its answer,"

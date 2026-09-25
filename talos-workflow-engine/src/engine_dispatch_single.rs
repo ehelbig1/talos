@@ -18,6 +18,147 @@ use crate::emit_event_spawn;
 use crate::engine::{ParallelWorkflowEngine, DEFAULT_NODE_TIMEOUT_SECS};
 use crate::secrets_pipeline::extract_vault_paths;
 
+/// What a module dispatch is cleared to carry once its pre-dispatch gates pass.
+///
+/// `#[must_use]` so a caller cannot run the gates for their refusal and then
+/// build the job from some OTHER retry budget — the loop-body path shipped a
+/// hardcoded `max_retries: 2` beside a perfectly good retry policy.
+#[must_use]
+#[derive(Debug, Clone)]
+pub(crate) struct ModuleDispatchClearance {
+    /// The node's own retry policy (backoff, `retry_condition`, delay
+    /// expression), or the default when it declared none.
+    pub(crate) retry: talos_workflow_engine_core::RetryPolicy,
+    /// The method-aware retry budget, BEFORE any idempotency upgrade: the
+    /// node's explicit `retry_count` when it declared one (0 included),
+    /// otherwise `default_max_retries_for_module` over the module's own
+    /// `allowed_methods` / capability world — 0 for a state-changing module.
+    pub(crate) max_retries: u32,
+}
+
+impl ParallelWorkflowEngine {
+    /// The gates every engine MODULE dispatch passes between "the module is
+    /// fetched" and "a `DispatchJob` is built", in order:
+    ///
+    /// 1. **Capability-world ceiling** — the bound actor's
+    ///    `max_capability_world`, enforced at dispatch so a module reached
+    ///    through a child workflow / loop body cannot run above it.
+    /// 2. **Method-aware retry budget** — see [`ModuleDispatchClearance`].
+    /// 3. **Approval gate** — when the module declares `requires_approval_for`,
+    ///    an approved record must exist; `Pending` and `Denied` refuse.
+    ///
+    /// The fourth gate, the per-module rate limit, is `check_rate_limit`,
+    /// applied by each CALLER once per dispatch: the reactor does it before a
+    /// single-node future is built, and `run_loop_iterations` before every
+    /// body iteration. It is not folded in here because the single-node path
+    /// treats a rate-limited node as a soft `__error` output, not a failure.
+    ///
+    /// Shared by `run_single_node_dispatch` and `run_loop_iterations`. The
+    /// loop body hand-built its `DispatchJob` and applied NONE of the three —
+    /// a `readonly`/`minimal-node` actor's loop could run an `automation-node`
+    /// body, an approval-gated body ran unapproved, and every body got a
+    /// blind `max_retries: 2` whatever its methods. The `Err` is the node
+    /// failure message.
+    pub(crate) async fn clear_module_dispatch(
+        &self,
+        node_id: Uuid,
+        execution_id: Uuid,
+        wasm_module: &talos_workflow_engine_core::WasmModuleArtifact,
+    ) -> Result<ModuleDispatchClearance, String> {
+        // Capability-world ceiling — the actor's, enforced HERE so a module
+        // reached through a sub-workflow / judge / ensemble child (which the
+        // trigger-time gate never saw) cannot run above it. The ceiling on a
+        // sub-engine is the parent's, copied by `AdapterSet`.
+        if let Err(e) = crate::capability_ceiling::refuse_module_over_ceiling(
+            self.max_capability_world.as_deref(),
+            wasm_module.module_id,
+            &wasm_module.capability_world,
+        ) {
+            tracing::warn!(
+                target: "talos_security",
+                %node_id,
+                module_id = %wasm_module.module_id,
+                module_world = %wasm_module.capability_world,
+                ceiling = ?self.max_capability_world,
+                "dispatch refused: module world exceeds the actor's capability ceiling"
+            );
+            return Err(e);
+        }
+
+        // Absent-count fallback is METHOD-AWARE, not a blanket count:
+        // a node that did not declare `retry_count` retries transient
+        // failures only when its module is read-only / pure compute
+        // (worlds minimal/secrets, or http/agent with GET/HEAD-only
+        // methods). Side-effect-capable modules fail closed to 0 so a
+        // retry can never double-fire a send. Explicit per-node
+        // `retry_count` (including 0) always wins.
+        //
+        // "No retry keys at all" and "retry keys but no count" resolve
+        // through the SAME call, which is the point: they used to differ,
+        // and the second silently got 2 for every world.
+        let retry = self
+            .node_meta
+            .get(&node_id)
+            .and_then(|(_, rp, _)| rp.clone())
+            .unwrap_or_default();
+        let max_retries = retry.resolved_max_retries(
+            &wasm_module.allowed_methods,
+            Some(&wasm_module.capability_world),
+        );
+
+        // Approval gate: verify an approved record exists when the
+        // module declares `requires_approval_for`.
+        if !wasm_module.requires_approval_for.is_empty() {
+            if let Some(ref gate) = self.approval_gate {
+                let approval_webhook = self
+                    .node_configs
+                    .get(&node_id)
+                    .and_then(|cfg| cfg.get("NOTIFICATION_WEBHOOK"))
+                    .and_then(|v| v.as_str());
+                match gate
+                    .check_or_request(
+                        execution_id,
+                        node_id,
+                        &wasm_module.requires_approval_for,
+                        approval_webhook,
+                    )
+                    .await
+                {
+                    Ok(talos_workflow_engine_core::ApprovalStatus::Approved) => {}
+                    Ok(talos_workflow_engine_core::ApprovalStatus::Pending) => {
+                        return Err(format!(
+                            "[APPROVAL_PENDING] Execution paused: module {} requires approval for {:?}. \
+                             Not a genuine failure — an approval request has been created; approve it, then retry. \
+                             (Dashboards/alerts can filter on the [APPROVAL_PENDING] prefix.)",
+                            node_id, wasm_module.requires_approval_for
+                        ));
+                    }
+                    Ok(talos_workflow_engine_core::ApprovalStatus::Denied { reason }) => {
+                        return Err(reason);
+                    }
+                    // Defensive `_` arm: ApprovalStatus is `#[non_exhaustive]`,
+                    // so adding a new variant in a minor bump shouldn't break
+                    // the build. Treat unknown variants as a hard failure
+                    // — fail-closed — so an upgrade can't silently let a
+                    // protected node through without explicit handling.
+                    Ok(_) => {
+                        return Err(format!(
+                            "Approval gate returned an unrecognized status \
+                             for node {node_id}; refusing to dispatch"
+                        ));
+                    }
+                    Err(e) => {
+                        tracing::error!(%node_id, "Approval gate check failed: {}", e);
+                        return Err(format!("Approval gate check failed: {e}"));
+                    }
+                }
+            }
+        }
+
+        Ok(ModuleDispatchClearance { retry, max_retries })
+    }
+}
+
 impl ParallelWorkflowEngine {
     /// Build and await the full single-node dispatch future.
     ///
@@ -61,101 +202,22 @@ impl ParallelWorkflowEngine {
             Err(e) => return (node_idx, Err(e)),
         };
 
-        // Capability-world ceiling — the actor's, enforced HERE so a module
-        // reached through a sub-workflow / judge / ensemble child (which the
-        // trigger-time gate never saw) cannot run above it. The ceiling on a
-        // sub-engine is the parent's, copied by `AdapterSet`.
-        if let Err(e) = crate::capability_ceiling::refuse_module_over_ceiling(
-            self.max_capability_world.as_deref(),
-            wasm_module.module_id,
-            &wasm_module.capability_world,
-        ) {
-            tracing::warn!(
-                target: "talos_security",
-                %node_id,
-                module_id = %wasm_module.module_id,
-                module_world = %wasm_module.capability_world,
-                ceiling = ?self.max_capability_world,
-                "dispatch refused: module world exceeds the actor's capability ceiling"
-            );
-            return (node_idx, Err(e));
-        }
-
-        // Absent-count fallback is METHOD-AWARE, not a blanket count:
-        // a node that did not declare `retry_count` retries transient
-        // failures only when its module is read-only / pure compute
-        // (worlds minimal/secrets, or http/agent with GET/HEAD-only
-        // methods). Side-effect-capable modules fail closed to 0 so a
-        // retry can never double-fire a send. Explicit per-node
-        // `retry_count` (including 0) always wins.
-        //
-        // "No retry keys at all" and "retry keys but no count" resolve
-        // through the SAME call, which is the point: they used to differ,
-        // and the second silently got 2 for every world.
-        let retry = self
-            .node_meta
-            .get(&node_id)
-            .and_then(|(_, rp, _)| rp.clone())
-            .unwrap_or_default();
-        let mut max_retries = retry.resolved_max_retries(
-            &wasm_module.allowed_methods,
-            Some(&wasm_module.capability_world),
-        );
-
-        // Approval gate: verify an approved record exists when the
-        // module declares `requires_approval_for`.
-        if !wasm_module.requires_approval_for.is_empty() {
-            if let Some(ref gate) = self.approval_gate {
-                let approval_webhook = self
-                    .node_configs
-                    .get(&node_id)
-                    .and_then(|cfg| cfg.get("NOTIFICATION_WEBHOOK"))
-                    .and_then(|v| v.as_str());
-                match gate
-                    .check_or_request(
-                        execution_id,
-                        node_id,
-                        &wasm_module.requires_approval_for,
-                        approval_webhook,
-                    )
-                    .await
-                {
-                    Ok(talos_workflow_engine_core::ApprovalStatus::Approved) => {}
-                    Ok(talos_workflow_engine_core::ApprovalStatus::Pending) => {
-                        return (
-                            node_idx,
-                            Err(format!(
-                                "[APPROVAL_PENDING] Execution paused: module {} requires approval for {:?}. \
-                             Not a genuine failure — an approval request has been created; approve it, then retry. \
-                             (Dashboards/alerts can filter on the [APPROVAL_PENDING] prefix.)",
-                                node_id, wasm_module.requires_approval_for
-                            )),
-                        );
-                    }
-                    Ok(talos_workflow_engine_core::ApprovalStatus::Denied { reason }) => {
-                        return (node_idx, Err(reason));
-                    }
-                    // Defensive `_` arm: ApprovalStatus is `#[non_exhaustive]`,
-                    // so adding a new variant in a minor bump shouldn't break
-                    // the build. Treat unknown variants as a hard failure
-                    // — fail-closed — so an upgrade can't silently let a
-                    // protected node through without explicit handling.
-                    Ok(_) => {
-                        return (
-                            node_idx,
-                            Err(format!(
-                                "Approval gate returned an unrecognized status \
-                                 for node {node_id}; refusing to dispatch"
-                            )),
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!(%node_id, "Approval gate check failed: {}", e);
-                        return (node_idx, Err(format!("Approval gate check failed: {e}")));
-                    }
-                }
-            }
-        }
+        // The shared pre-dispatch gates: capability ceiling, approval, and the
+        // method-aware retry budget. ONE implementation, also called per loop
+        // body by `run_loop_iterations` — the loop hand-built its job and
+        // skipped all three until 2026-09-25. The per-module rate limit is the
+        // fourth gate; for this path the reactor applies it before this
+        // future is built (`check_rate_limit`), because a rate-limited node
+        // commits a soft `__error` envelope there rather than failing.
+        let clearance = match self
+            .clear_module_dispatch(node_id, execution_id, &wasm_module)
+            .await
+        {
+            Ok(c) => c,
+            Err(e) => return (node_idx, Err(e)),
+        };
+        let retry = clearance.retry;
+        let mut max_retries = clearance.max_retries;
 
         // Bind the concrete executing user_id up front. It's the same id the
         // module fetcher used to pre-warm the redis cache (fetch_module ->
