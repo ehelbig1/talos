@@ -190,7 +190,6 @@ pub struct WebhookRouter {
     worker_shared_key: Option<WorkerSharedKey>,
     worker_manager: Option<Arc<WorkerManager>>,
     module_execution_service: Option<Arc<ModuleExecutionService>>,
-    event_sender: tokio::sync::broadcast::Sender<ExecutionEvent>,
     dlq_service: DlqService,
     /// Optional Redis-backed deduplication. When present, identical webhook deliveries
     /// (same trigger + same payload fingerprint) within the 1-hour window are suppressed.
@@ -223,7 +222,9 @@ impl WebhookRouter {
         circuit_breaker: Arc<CircuitBreaker>,
         worker_manager: Option<Arc<WorkerManager>>,
         module_execution_service: Option<Arc<ModuleExecutionService>>,
-        event_sender: tokio::sync::broadcast::Sender<ExecutionEvent>,
+        // Never read: the router emits no execution events. Kept only so the
+        // constructor's callers need no change.
+        _event_sender: tokio::sync::broadcast::Sender<ExecutionEvent>,
         dlq_event_sender: tokio::sync::broadcast::Sender<talos_engine::events::DlqEvent>,
         dedup: Option<std::sync::Arc<talos_idempotency::WebhookDeduplication>>,
         sealing_handle: Option<talos_integration_helpers::ModuleSealingHandle>,
@@ -239,7 +240,6 @@ impl WebhookRouter {
             worker_shared_key,
             worker_manager,
             module_execution_service,
-            event_sender,
             dlq_service,
             dedup,
             sealing_handle,
@@ -293,10 +293,7 @@ impl WebhookRouter {
                 // signature, etc.) but a misconfigured client can stash
                 // a secret in any custom header — `X-Trace-Id`,
                 // `X-Customer-Ref`, etc. — and operators can't enumerate
-                // every third-party convention. The sibling
-                // `enqueue_webhook_dlq` site (line ~2877) already runs
-                // `redact_str` on each non-sensitive header value; this
-                // brings the entry-level DLQ path in line.
+                // every third-party convention.
                 let scrubbed = talos_dlp_provider::redact_str(v);
                 header_map.insert(name.to_string(), serde_json::Value::String(scrubbed));
             }
@@ -452,11 +449,11 @@ impl WebhookRouter {
 
         // 0. Circuit breaker check — cheapest gate, runs before any DB query or HMAC.
         if let Some(ip) = source_ip {
-            if self.circuit_breaker.is_blocked(ip) {
+            if self.circuit_breaker.is_blocked(ip, trigger_id) {
                 tracing::warn!(
                     trigger_id = %trigger_id,
                     ip = %ip,
-                    "Circuit breaker open: blocking request from repeatedly-failing IP"
+                    "Circuit breaker open: blocking request from a source repeatedly failing this trigger"
                 );
                 // Persist to DLQ as a record of the drop. This is ABOVE the
                 // auth gate, so the entry is stamped unauthenticated and
@@ -475,8 +472,18 @@ impl WebhookRouter {
             }
         }
 
-        // 1. Lookup trigger configuration
-        let trigger = self.get_trigger(trigger_id).await?;
+        // 1. Lookup trigger configuration. An unknown id is the one failure
+        // counted source-wide (by DISTINCT id — see `CircuitBreaker`).
+        let Some(trigger) = self.get_trigger(trigger_id).await? else {
+            if let Some(ip) = source_ip {
+                self.circuit_breaker.record_failure_with_type(
+                    ip,
+                    trigger_id,
+                    CircuitBreakerFailureType::TriggerNotFound,
+                );
+            }
+            return Ok((StatusCode::NOT_FOUND, "Webhook not found").into_response());
+        };
 
         if !trigger.enabled {
             tracing::warn!(
@@ -624,8 +631,11 @@ impl WebhookRouter {
                             "IP not in allowlist"
                         );
                         // IP allowlist rejection counts as auth failure for CB tracking
-                        self.circuit_breaker
-                            .record_failure_with_type(ip, CircuitBreakerFailureType::IpNotAllowed);
+                        self.circuit_breaker.record_failure_with_type(
+                            ip,
+                            trigger_id,
+                            CircuitBreakerFailureType::IpNotAllowed,
+                        );
                         self.log_request(
                             trigger_id,
                             headers,
@@ -748,8 +758,11 @@ impl WebhookRouter {
                      WebhookDeduplication is wired up."
                 );
                 if let Some(ip) = source_ip {
-                    self.circuit_breaker
-                        .record_failure_with_type(ip, CircuitBreakerFailureType::InvalidSignature);
+                    self.circuit_breaker.record_failure_with_type(
+                        ip,
+                        trigger_id,
+                        CircuitBreakerFailureType::InvalidSignature,
+                    );
                 }
                 self.log_request(
                     trigger_id,
@@ -778,6 +791,7 @@ impl WebhookRouter {
                     if let Some(ip) = source_ip {
                         self.circuit_breaker.record_failure_with_type(
                             ip,
+                            trigger_id,
                             CircuitBreakerFailureType::InvalidSignature,
                         );
                     }
@@ -818,8 +832,11 @@ impl WebhookRouter {
                  Check for a DEK/KMS outage or in-progress key rotation."
             );
             if let Some(ip) = source_ip {
-                self.circuit_breaker
-                    .record_failure_with_type(ip, CircuitBreakerFailureType::InvalidSignature);
+                self.circuit_breaker.record_failure_with_type(
+                    ip,
+                    trigger_id,
+                    CircuitBreakerFailureType::InvalidSignature,
+                );
             }
             self.log_request(
                 trigger_id,
@@ -867,6 +884,7 @@ impl WebhookRouter {
                 if let Some(ip) = source_ip {
                     self.circuit_breaker.record_failure_with_type(
                         ip,
+                        trigger_id,
                         CircuitBreakerFailureType::InvalidVerificationToken,
                     );
                 }
@@ -885,6 +903,7 @@ impl WebhookRouter {
                 if let Some(ip) = source_ip {
                     self.circuit_breaker.record_failure_with_type(
                         ip,
+                        trigger_id,
                         CircuitBreakerFailureType::InvalidVerificationToken,
                     );
                 }
@@ -2728,7 +2747,8 @@ impl WebhookRouter {
         }
     }
 
-    async fn get_trigger(&self, trigger_id: Uuid) -> Result<WebhookTrigger> {
+    /// `Ok(None)` = no such trigger (404); `Err` = the lookup failed (500).
+    async fn get_trigger(&self, trigger_id: Uuid) -> Result<Option<WebhookTrigger>> {
         sqlx::query_as::<_, WebhookTrigger>(
             r#"
             SELECT id, user_id, name, module_id, workflow_id,
@@ -2743,17 +2763,9 @@ impl WebhookRouter {
             "#,
         )
         .bind(trigger_id)
-        // fetch_optional, NOT fetch_one + .context("not found"): the latter
-        // stamped "not found" onto EVERY error including transient DB failures
-        // (pool exhaustion, connection drop), which `webhook_handler` then
-        // substring-matched to a 404 — masking a real outage as a missing
-        // trigger (a legit webhook silently 404s during a DB blip) and muddying
-        // the existence oracle. Now a genuine miss → Ok(None) → "not found"
-        // (404); a DB error → Err (no "not found" substring) → 500 + logged.
         .fetch_optional(&self.db_pool)
         .await
-        .context("get_trigger query failed")?
-        .ok_or_else(|| anyhow::anyhow!("Webhook trigger not found"))
+        .context("get_trigger query failed")
     }
 
     /// Verify HMAC signature from webhook request.
@@ -3057,7 +3069,10 @@ impl WebhookRouter {
             return Err(anyhow::Error::new(dlq::ReplayRefused::Unauthenticated));
         }
 
-        let trigger = self.get_trigger(trigger_id).await?;
+        let trigger = self
+            .get_trigger(trigger_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Webhook trigger not found"))?;
 
         if !trigger.enabled {
             return Err(anyhow::Error::new(dlq::ReplayRefused::TriggerDisabled));
@@ -3467,22 +3482,17 @@ pub async fn webhook_handler(
         .await
     {
         Ok(response) => response,
+        // Every refusal `handle_webhook` decides is already an `Ok` response
+        // with its own status; an `Err` is always an internal failure. (This
+        // used to substring-match the message — "not found", "IP" — so any
+        // internal error whose text happened to contain those became a 404/403.)
         Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("not found") {
-                (StatusCode::NOT_FOUND, "Webhook not found").into_response()
-            } else if msg.contains("rate limit") || msg.contains("Rate limit") {
-                (StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded").into_response()
-            } else if msg.contains("IP") || msg.contains("not allowed") {
-                (StatusCode::FORBIDDEN, "Forbidden").into_response()
-            } else {
-                tracing::error!(
-                    trigger_id = %trigger_id,
-                    error = %e,
-                    "Webhook handler error"
-                );
-                (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
-            }
+            tracing::error!(
+                trigger_id = %trigger_id,
+                error = %e,
+                "Webhook handler error"
+            );
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error").into_response()
         }
     }
 }

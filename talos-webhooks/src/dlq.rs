@@ -8,7 +8,10 @@ use uuid::Uuid;
 // Dead Letter Queue (DLQ) System — Bounded, Backpressure-Aware
 // ============================================================================
 
-/// Maximum number of pending DLQ entries before dropping.
+/// Maximum number of PENDING (not yet replayed) `webhook_dlq` rows. Pre-auth
+/// drops (circuit breaker, rate limit) are sender-driven, so without a cap a
+/// sender over a trigger's limit grows the table without bound between
+/// retention sweeps. Enforced per batch in `flush_batch`.
 const DLQ_MAX_PENDING: usize = 10_000;
 /// DLQ channel capacity for async processing.
 const DLQ_CHANNEL_CAPACITY: usize = 1_000;
@@ -76,12 +79,29 @@ pub(crate) struct DlqEntry {
     pub(crate) payload: serde_json::Value,
 }
 
+/// The entries of `batch` that fit under `cap` given `pending` rows already
+/// stored. Authenticated (replayable) entries are kept before pre-auth drop
+/// records, each in arrival order. `pending == None` (count unreadable) keeps
+/// everything.
+fn select_within_cap(batch: &[DlqEntry], pending: Option<usize>, cap: usize) -> Vec<&DlqEntry> {
+    let Some(pending) = pending else {
+        return batch.iter().collect();
+    };
+    let budget = cap.saturating_sub(pending);
+    let (auth, pre_auth): (Vec<&DlqEntry>, Vec<&DlqEntry>) = batch
+        .iter()
+        .partition(|e| dlq_entry_was_authenticated(Some(&e.headers)));
+    auth.into_iter().chain(pre_auth).take(budget).collect()
+}
+
 /// Global DLQ metrics for monitoring.
 #[derive(Debug, Default)]
 pub struct DlqMetrics {
     pub enqueued: AtomicUsize,
     pub dropped_queue_full: AtomicUsize,
     pub dropped_null_payload: AtomicUsize,
+    /// Entries dropped because the table already held `DLQ_MAX_PENDING`.
+    pub dropped_at_cap: AtomicUsize,
     pub db_errors: AtomicUsize,
 }
 
@@ -238,11 +258,42 @@ impl DlqService {
 
     async fn flush_batch(
         db_pool: &Pool<Postgres>,
-        batch: &Vec<DlqEntry>,
+        batch: &[DlqEntry],
         metrics: &Arc<DlqMetrics>,
         dlq_tx: &tokio::sync::broadcast::Sender<talos_engine::events::DlqEvent>,
     ) {
-        for entry in batch {
+        // One bounded count per batch (index-only on `idx_webhook_dlq_pending`).
+        // An unreadable count does not drop anything: the DLQ is a record, and
+        // a failing count means the inserts below will likely fail and be
+        // counted as `db_errors` anyway.
+        let pending = match sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM (SELECT 1 FROM webhook_dlq WHERE replayed_at IS NULL LIMIT $1) p",
+        )
+        .bind(DLQ_MAX_PENDING as i64)
+        .fetch_one(db_pool)
+        .await
+        {
+            Ok(n) => Some(usize::try_from(n).unwrap_or(DLQ_MAX_PENDING)),
+            Err(e) => {
+                tracing::warn!(error = %e, "dlq: pending-count read failed; cap not applied to this batch");
+                None
+            }
+        };
+        let kept = select_within_cap(batch, pending, DLQ_MAX_PENDING);
+        let dropped = batch.len() - kept.len();
+        if dropped > 0 {
+            metrics.dropped_at_cap.fetch_add(dropped, Ordering::Relaxed);
+            if let Some(m) = talos_metrics::global() {
+                m.webhook_dlq_drops_total.inc_by(dropped as f64);
+                m.dlq_drops_total.inc_by(dropped as f64);
+            }
+            tracing::warn!(
+                dropped,
+                cap = DLQ_MAX_PENDING,
+                "webhook DLQ at its pending cap — dropping entries (unauthenticated first)"
+            );
+        }
+        for entry in kept {
             // M T6-1: resolve workflow ownership at emit time so the
             // dlq_updates subscription can filter per-org without a
             // per-event DB lookup. Single statement: INSERT into
@@ -273,6 +324,16 @@ impl DlqService {
 
             match result {
                 Ok(row) => {
+                    let (id, created_at) = match (
+                        row.try_get::<Uuid, _>("id"),
+                        row.try_get::<chrono::DateTime<chrono::Utc>, _>("created_at"),
+                    ) {
+                        (Ok(id), Ok(at)) => (id, at),
+                        (Err(e), _) | (_, Err(e)) => {
+                            tracing::error!(error = %e, "dlq: inserted row unreadable; no event emitted");
+                            continue;
+                        }
+                    };
                     // These three are LEFT JOIN columns, so None is a real
                     // value — but `.ok()` also erased schema drift, and
                     // flush_batch returns () so there is no `?` to reach for.
@@ -299,15 +360,13 @@ impl DlqService {
                     let (wf_id, ev_user_id, ev_org_id) = ownership.unwrap_or((None, None, None));
                     // Broadcast event for real-time UI updates
                     let _ = dlq_tx.send(talos_engine::events::DlqEvent {
-                        id: row.get("id"),
+                        id,
                         workflow_id: wf_id,
                         execution_id: None,
                         node_id: None,
                         error_message: Some(entry.drop_reason.clone()),
                         payload: Some(entry.payload.to_string()),
-                        created_at: row
-                            .get::<chrono::DateTime<chrono::Utc>, _>("created_at")
-                            .to_rfc3339(),
+                        created_at: created_at.to_rfc3339(),
                         replayed_at: None,
                         user_id: ev_user_id,
                         org_id: ev_org_id,
@@ -326,106 +385,6 @@ impl DlqService {
     }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// Webhook DLQ — fire-and-forget persistence of dropped payloads
-// ────────────────────────────────────────────────────────────────────────────
-
-/// Enqueue a dropped webhook payload into the dead-letter queue.
-///
-/// Fire-and-forget via `tokio::spawn` — never blocks the response path.
-/// Authorization headers (Authorization, Cookie) are stripped before storage.
-/// Payload is DLP-scrubbed before storage.
-fn enqueue_webhook_dlq(
-    pool: sqlx::PgPool,
-    trigger_id: Option<Uuid>,
-    source_ip: Option<std::net::IpAddr>,
-    drop_reason: &'static str,
-    headers: &axum::http::HeaderMap,
-    body: &axum::body::Bytes,
-) {
-    // MCP-525: build a sanitized header map.
-    //
-    // Pre-fix the skip list missed several alt-auth header conventions
-    // that real third-party integrations use:
-    //   * `X-Auth-Token` (Atlassian Forge, some Microsoft surfaces)
-    //   * `X-Access-Token` (assorted REST APIs)
-    //   * `Proxy-Authorization` (HTTP RFC 7235)
-    //   * `X-Goog-Api-Key`, `X-Goog-User-Project` (Google APIs)
-    //   * `X-Anthropic-Api-Key` (rare but used in some self-hosted)
-    //   * `X-Amz-Security-Token` (AWS STS via sigv4)
-    //
-    // And header VALUES never went through DLP at all — only the body
-    // did. A legitimate caller whose webhook was dropped (trigger not
-    // found, rate-limited, etc.) could leak any `sk-…` / `ghp_…` /
-    // `Bearer …` / 20-char AWS access key embedded in a custom header
-    // into `webhook_dlq.headers`. Operators inspecting the DLQ would
-    // see those literals verbatim until manual rotation. Now: skip
-    // list expanded AND every surviving header value runs through
-    // `talos_dlp_provider::redact_str` before persistence, same
-    // boundary the body has gone through since the DLQ feature
-    // shipped.
-    let skip_headers = [
-        "authorization",
-        "proxy-authorization",
-        "cookie",
-        "set-cookie",
-        "x-api-key",
-        "x-verification-token",
-        "x-auth-token",
-        "x-access-token",
-        "x-csrf-token",
-        "x-goog-api-key",
-        "x-goog-user-project",
-        "x-amz-security-token",
-        "x-anthropic-api-key",
-    ];
-    let mut header_map = serde_json::Map::new();
-    for (name, value) in headers.iter() {
-        let name_lower = name.as_str().to_lowercase();
-        if skip_headers.contains(&name_lower.as_str()) {
-            continue;
-        }
-        if let Ok(v) = value.to_str() {
-            // DLP-redact the value before storage. Catches secrets
-            // embedded in non-listed custom integration headers
-            // (operator can't enumerate every third-party convention).
-            let scrubbed = talos_dlp_provider::redact_str(v);
-            header_map.insert(name.to_string(), serde_json::Value::String(scrubbed));
-        }
-    }
-    let headers_json = serde_json::Value::Object(header_map);
-
-    // Parse and DLP-scrub the payload
-    let payload_json =
-        serde_json::from_slice::<serde_json::Value>(body).unwrap_or(serde_json::Value::Null);
-    let scrubbed_payload = talos_dlp_provider::redact_json(&payload_json);
-
-    // Skip null payloads (parse failure on empty bodies)
-    if scrubbed_payload.is_null() {
-        return;
-    }
-
-    let source_ip_str = source_ip.map(|ip| ip.to_string());
-
-    tokio::spawn(async move {
-        let result = sqlx::query(
-            "INSERT INTO webhook_dlq (trigger_id, source_ip, drop_reason, headers, payload) \
-             VALUES ($1, $2::inet, $3, $4, $5)",
-        )
-        .bind(trigger_id)
-        .bind(source_ip_str.as_deref())
-        .bind(drop_reason)
-        .bind(&headers_json)
-        .bind(&scrubbed_payload)
-        .execute(&pool)
-        .await;
-
-        if let Err(e) = result {
-            tracing::warn!("Failed to enqueue webhook DLQ entry: {}", e);
-        }
-    });
-}
-
 /// **The wiring nothing else can see.** The DLQ batch processor goes through
 /// `talos_task_supervision::spawn_supervised`; reverting that site to a
 /// bare `tokio::spawn` is behaviourally identical on a healthy process
@@ -434,8 +393,6 @@ fn enqueue_webhook_dlq(
 /// configured. Structural lint check 58 cannot see it either: it asks
 /// whether a metric has an increment SITE, not whether anything reaches
 /// one.
-///
-/// The one bare spawn is the per-drop `webhook_dlq` INSERT, a one-shot.
 ///
 /// The counting rule lives in `talos_task_supervision` so the pins in
 /// the eight crates that carry one cannot drift; its stated limits
@@ -485,8 +442,47 @@ mod task_supervision_pin {
             "The DLQ batch processor must still go through spawn_supervised"
         );
         assert_eq!(
-            bare, 1,
+            bare, 0,
             "the set of deliberately-unsupervised one-shot spawns in this file changed"
         );
+    }
+}
+
+#[cfg(test)]
+mod pending_cap_tests {
+    use super::*;
+
+    fn entry(authenticated: bool, n: u32) -> DlqEntry {
+        DlqEntry {
+            trigger_id: None,
+            source_ip: None,
+            drop_reason: format!("r{n}"),
+            headers: serde_json::json!({ DLQ_AUTHENTICATED_KEY: authenticated }),
+            payload: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn the_cap_keeps_replayable_entries_first() {
+        let batch = vec![
+            entry(false, 1),
+            entry(true, 2),
+            entry(false, 3),
+            entry(true, 4),
+        ];
+        let kept: Vec<_> = select_within_cap(&batch, Some(8), 10)
+            .into_iter()
+            .map(|e| e.drop_reason.clone())
+            .collect();
+        assert_eq!(kept, vec!["r2", "r4"]);
+        assert!(select_within_cap(&batch, Some(10), 10).is_empty());
+        assert!(select_within_cap(&batch, Some(50), 10).is_empty());
+        assert_eq!(select_within_cap(&batch, Some(0), 10).len(), 4);
+    }
+
+    #[test]
+    fn an_unreadable_count_drops_nothing() {
+        let batch = vec![entry(false, 1), entry(true, 2)];
+        assert_eq!(select_within_cap(&batch, None, 0).len(), 2);
     }
 }
