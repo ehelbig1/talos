@@ -30,6 +30,8 @@ export interface TimedEvent extends ExecutionUpdate {
 }
 
 export interface LogEntry {
+  /** Monotonic per page: a stable render key as the window slides. */
+  seq: number;
   text: string;
   level: string;
   timestamp: string;
@@ -140,72 +142,21 @@ export const useEphemeralExecutionStore = create<EphemeralSlice>()((set) => ({
       nodeResults: { ...state.nodeResults, [nodeId]: result },
     })),
 
-  appendNodeStreamingContent: (nodeId, token) =>
-    set((state) => ({
-      nodeStreamingContent: {
-        ...state.nodeStreamingContent,
-        [nodeId]: (state.nodeStreamingContent[nodeId] || "") + token,
-      },
-    })),
+  appendNodeStreamingContent: (nodeId, token) => {
+    pending.tokens.set(nodeId, (pending.tokens.get(nodeId) ?? "") + token);
+    scheduleFlush();
+  },
 
-  addEvent: (event) =>
-    set((state) => {
-      // Process the event into a LogEntry immediately
-      let level = "[INFO]";
-      if (event.status === "FAILED") level = "[ERROR]";
-      if (event.logMessage?.toLowerCase().includes("warn")) level = "[WARN]";
+  addEvent: (event) => {
+    pending.events.push(event);
+    if (pending.events.length > MAX_EVENTS) {
+      pending.events.splice(0, pending.events.length - MAX_EVENTS);
+    }
+    scheduleFlush();
+  },
 
-      const timestamp = `+${(event.elapsedMs / 1000).toFixed(1)}s`;
-      const text = event.logMessage || event.status || "";
-
-      let structured: LogEntry["structured"] | undefined;
-      if (
-        event.logMessage &&
-        (event.logMessage.startsWith("{") || event.logMessage.startsWith("["))
-      ) {
-        try {
-          const parsed = JSON.parse(event.logMessage);
-          if (parsed.type === "llm_stream" || parsed.provider) {
-            structured = {
-              type: "llm_stream",
-              content: parsed.text || parsed.content || event.logMessage,
-            };
-          } else if (parsed.tool_call || parsed.tool_name) {
-            structured = {
-              type: "tool_call",
-              toolName: parsed.tool_name || parsed.tool_call?.name,
-              arguments:
-                typeof parsed.arguments === "string"
-                  ? parsed.arguments
-                  : JSON.stringify(parsed.arguments ?? ""),
-            };
-          } else if (parsed.input_tokens || parsed.output_tokens) {
-            structured = {
-              type: "token_usage",
-              inputTokens: parsed.input_tokens,
-              outputTokens: parsed.output_tokens,
-            };
-          }
-        } catch {
-          // not structured
-        }
-      }
-
-      const newLog: LogEntry = {
-        text,
-        level,
-        timestamp,
-        nodeId: event.nodeId,
-        structured,
-      };
-
-      return {
-        events: [...state.events, event].slice(-5000),
-        processedLogs: [...state.processedLogs, newLog].slice(-5000),
-      };
-    }),
-
-  setRunning: (execId, workflowId) =>
+  setRunning: (execId, workflowId) => {
+    discardPending();
     set({
       currentExecutionId: execId,
       currentWorkflowId: workflowId,
@@ -215,16 +166,142 @@ export const useEphemeralExecutionStore = create<EphemeralSlice>()((set) => ({
       nodeStreamingContent: {},
       events: [],
       processedLogs: [],
-    }),
+    });
+  },
 
-  clearEvents: () => set({ events: [], processedLogs: [] }),
+  clearEvents: () => {
+    discardPending();
+    set({ events: [], processedLogs: [] });
+  },
 
   clearCurrentExecution: () =>
     set({ currentExecutionId: null, isRunning: false }),
 
-  resetNodeStatuses: () =>
-    set({ nodeStatuses: {}, nodeResults: {}, nodeStreamingContent: {} }),
+  resetNodeStatuses: () => {
+    pending.tokens.clear();
+    set({ nodeStatuses: {}, nodeResults: {}, nodeStreamingContent: {} });
+  },
 }));
+
+// ── Batched appends ─────────────────────────────────────────────────────────
+//
+// Events and LLM tokens arrive one WebSocket frame at a time. Applying each
+// one copied the whole 5000-entry window (twice) and notified every
+// subscriber per event / per token. They are buffered and applied at most
+// every FLUSH_INTERVAL_MS (a timer, not rAF: rAF stops in a background tab
+// and the buffer would grow while nobody looks).
+
+const MAX_EVENTS = 5000;
+/** Streaming text kept per node; older text is dropped from the front. */
+export const MAX_STREAMING_CHARS = 64_000;
+const FLUSH_INTERVAL_MS = 50;
+
+const pending = {
+  events: [] as TimedEvent[],
+  tokens: new Map<string, string>(),
+  timer: null as ReturnType<typeof setTimeout> | null,
+};
+let logSeq = 0;
+
+function scheduleFlush() {
+  if (pending.timer === null) {
+    pending.timer = setTimeout(flushExecutionUpdates, FLUSH_INTERVAL_MS);
+  }
+}
+
+function discardPending() {
+  if (pending.timer !== null) clearTimeout(pending.timer);
+  pending.timer = null;
+  pending.events = [];
+  pending.tokens.clear();
+}
+
+/** Keep the newest `max` characters of streamed text. */
+export function boundStreamingText(text: string, max = MAX_STREAMING_CHARS) {
+  return text.length > max ? "…" + text.slice(text.length - max + 1) : text;
+}
+
+function toLogEntry(event: TimedEvent): LogEntry {
+  let level = "[INFO]";
+  if (event.status === "FAILED") level = "[ERROR]";
+  if (event.logMessage?.toLowerCase().includes("warn")) level = "[WARN]";
+
+  const timestamp = `+${(event.elapsedMs / 1000).toFixed(1)}s`;
+  const text = event.logMessage || event.status || "";
+
+  let structured: LogEntry["structured"] | undefined;
+  if (
+    event.logMessage &&
+    (event.logMessage.startsWith("{") || event.logMessage.startsWith("["))
+  ) {
+    try {
+      const parsed = JSON.parse(event.logMessage);
+      if (parsed.type === "llm_stream" || parsed.provider) {
+        structured = {
+          type: "llm_stream",
+          content: parsed.text || parsed.content || event.logMessage,
+        };
+      } else if (parsed.tool_call || parsed.tool_name) {
+        structured = {
+          type: "tool_call",
+          toolName: parsed.tool_name || parsed.tool_call?.name,
+          arguments:
+            typeof parsed.arguments === "string"
+              ? parsed.arguments
+              : JSON.stringify(parsed.arguments ?? ""),
+        };
+      } else if (parsed.input_tokens || parsed.output_tokens) {
+        structured = {
+          type: "token_usage",
+          inputTokens: parsed.input_tokens,
+          outputTokens: parsed.output_tokens,
+        };
+      }
+    } catch {
+      // not structured
+    }
+  }
+
+  return {
+    seq: ++logSeq,
+    text,
+    level,
+    timestamp,
+    nodeId: event.nodeId,
+    structured,
+  };
+}
+
+/** Apply every buffered event and token now. Called by the timer; tests
+ *  call it directly. */
+export function flushExecutionUpdates() {
+  if (pending.timer !== null) clearTimeout(pending.timer);
+  pending.timer = null;
+  const events = pending.events;
+  const tokens = pending.tokens;
+  pending.events = [];
+  pending.tokens = new Map();
+  if (events.length === 0 && tokens.size === 0) return;
+  useEphemeralExecutionStore.setState((state) => {
+    const patch: Partial<EphemeralSlice> = {};
+    if (events.length > 0) {
+      patch.events = state.events.concat(events).slice(-MAX_EVENTS);
+      patch.processedLogs = state.processedLogs
+        .concat(events.map(toLogEntry))
+        .slice(-MAX_EVENTS);
+    }
+    if (tokens.size > 0) {
+      const streaming = { ...state.nodeStreamingContent };
+      for (const [nodeId, text] of tokens) {
+        streaming[nodeId] = boundStreamingText(
+          (streaming[nodeId] ?? "") + text,
+        );
+      }
+      patch.nodeStreamingContent = streaming;
+    }
+    return patch;
+  });
+}
 
 // Unified facade that combines both stores — uses useShallow to prevent new object
 // reference on every render which would cause infinite re-render loops.
