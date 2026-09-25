@@ -589,6 +589,8 @@ pub struct MemoryHit {
     pub memory_type: String,
     pub expires_at: Option<DateTime<Utc>>,
     pub updated_at: DateTime<Utc>,
+    /// Cosine similarity on the vector path; [`KEYWORD_FALLBACK_SCORE`]
+    /// (no similarity claimed) on the keyword fallback.
     pub score: f64,
     /// Per-row `metadata` JSONB — the filter key (`metadata.kind`) is
     /// applied at the DB layer by `recall_semantic_filtered`, but
@@ -1383,7 +1385,7 @@ pub async fn recall_recent_by_types(
          WHERE actor_id = $1 \
            AND memory_type = ANY($2) \
            AND (expires_at IS NULL OR expires_at > now()) \
-         ORDER BY updated_at DESC LIMIT $3",
+         ORDER BY updated_at DESC, id LIMIT $3",
     )
     .bind(actor_id)
     .bind(&owned)
@@ -1433,7 +1435,7 @@ pub async fn recall_recent_excluding_types(
          WHERE actor_id = $1 \
            AND NOT (memory_type = ANY($2)) \
            AND (expires_at IS NULL OR expires_at > now()) \
-         ORDER BY updated_at DESC LIMIT $3",
+         ORDER BY updated_at DESC, id LIMIT $3",
     )
     .bind(actor_id)
     .bind(&owned)
@@ -1489,7 +1491,7 @@ pub async fn recall_recent_excluding_types_and_kinds(
                 OR metadata IS NULL \
                 OR metadata->>'kind' IS NULL \
                 OR metadata->>'kind' != ALL($4::text[])) \
-         ORDER BY updated_at DESC LIMIT $3",
+         ORDER BY updated_at DESC, id LIMIT $3",
     )
     .bind(actor_id)
     .bind(&owned_types)
@@ -1554,7 +1556,7 @@ pub async fn recall_recent_excluding_types_and_kinds_ts(
                 OR metadata IS NULL \
                 OR metadata->>'kind' IS NULL \
                 OR metadata->>'kind' != ALL($4::text[])) \
-         ORDER BY updated_at DESC LIMIT $3",
+         ORDER BY updated_at DESC, id LIMIT $3",
     )
     .bind(actor_id)
     .bind(&owned_types)
@@ -1630,7 +1632,7 @@ pub async fn list_memories(
            AND (expires_at IS NULL OR expires_at > now()) \
            AND ($2::text IS NULL OR key LIKE $2 || '%' ESCAPE '\\') \
            AND ($3::text IS NULL OR memory_type = $3) \
-         ORDER BY updated_at DESC \
+         ORDER BY updated_at DESC, id \
          LIMIT $4",
     )
     .bind(actor_id)
@@ -2048,6 +2050,17 @@ pub async fn recall_semantic_filtered(
         }
     }
 
+    // When the query DID embed, a zero-row vector result means every
+    // embedded row was judged and scored below the floor — the keyword
+    // fallback must not resurrect those. It may only reach rows the vector
+    // search could not judge (no embedding yet, or a different model).
+    // (No active model means nothing was judged: the vector predicate
+    // `embedding_model = NULL` matches no row, so every row is fair game.)
+    let unjudged_only = if embedding_attempted {
+        embedding::active_embedding_model()
+    } else {
+        None
+    };
     let hits = recall_keyword_inner(
         pool,
         actor_id,
@@ -2055,6 +2068,7 @@ pub async fn recall_semantic_filtered(
         limit,
         memory_type_filter,
         exclude_kinds,
+        unjudged_only.as_deref(),
     )
     .await?;
     Ok(SearchOutcome {
@@ -2091,7 +2105,7 @@ pub async fn recall_keyword(
     query: &str,
     limit: i64,
 ) -> Result<Vec<MemoryHit>> {
-    recall_keyword_inner(pool, actor_id, query, limit.clamp(1, 50), None, &[]).await
+    recall_keyword_inner(pool, actor_id, query, limit.clamp(1, 50), None, &[], None).await
 }
 
 async fn recall_keyword_inner(
@@ -2101,6 +2115,9 @@ async fn recall_keyword_inner(
     limit: i64,
     memory_type_filter: Option<&str>,
     exclude_kinds: &[String],
+    // `Some(model)` restricts the match to rows the vector path could not
+    // judge (`embedding IS NULL` or embedded under a different model).
+    unjudged_only: Option<&str>,
 ) -> Result<Vec<MemoryHit>> {
     // Tokenize the query into meaningful terms, then OR-match each as a
     // separate ILIKE. A natural-language question like "which pull
@@ -2153,7 +2170,9 @@ async fn recall_keyword_inner(
                     OR metadata IS NULL \
                     OR metadata->>'kind' IS NULL \
                     OR metadata->>'kind' != ALL($5::text[])) \
-             ORDER BY updated_at DESC \
+               AND ($6::text IS NULL OR embedding IS NULL \
+                    OR embedding_model IS DISTINCT FROM $6) \
+             ORDER BY updated_at DESC, id \
              LIMIT $3",
         )
         .bind(actor_id)
@@ -2161,6 +2180,7 @@ async fn recall_keyword_inner(
         .bind(limit)
         .bind(memory_type_filter)
         .bind(exclude_kinds)
+        .bind(unjudged_only)
         .fetch_all(pool)
         .await?;
         return rows_to_memory_hits(rows).await;
@@ -2199,7 +2219,9 @@ async fn recall_keyword_inner(
                 OR metadata IS NULL \
                 OR metadata->>'kind' IS NULL \
                 OR metadata->>'kind' != ALL($5::text[])) \
-         ORDER BY updated_at DESC \
+           AND ($6::text IS NULL OR embedding IS NULL \
+                OR embedding_model IS DISTINCT FROM $6) \
+         ORDER BY updated_at DESC, id \
          LIMIT $3",
     )
     .bind(actor_id)
@@ -2207,6 +2229,7 @@ async fn recall_keyword_inner(
     .bind(limit)
     .bind(memory_type_filter)
     .bind(exclude_kinds)
+    .bind(unjudged_only)
     .fetch_all(pool)
     .await
     .context("recall_keyword")?;
@@ -2263,18 +2286,20 @@ fn is_stopword(t: &str) -> bool {
     )
 }
 
+/// Similarity score carried by every keyword-fallback hit. A key-name match
+/// is not a similarity measurement, so it claims NONE: the hits keep their
+/// recency order in the list, and a min-score floor or a relevance-weighted
+/// ranker cannot mistake them for strong semantic matches. (Until
+/// 2026-09-26 they carried a positional `1.0 - i*0.02`, which passed every
+/// floor and out-ranked real cosine hits.)
+pub const KEYWORD_FALLBACK_SCORE: f64 = 0.0;
+
 /// Shared rows → MemoryHit conversion used by both the token and whole-
-/// phrase keyword-fallback branches. Score decays 0.02 per rank so the
-/// newest hit (i = 0) lands at 1.0 and the 50th hit (i = 49) at 0.02 —
-/// callers who sort by score are effectively sorting by recency. Beyond
-/// the 50th hit the `.max(0.0)` clamp pins everything to 0.0.
-/// Convert raw rows into MemoryHits, decrypting `value_enc`/`value_key_id`
-/// when present (Phase A). Async because decryption may need to fetch the
-/// DEK via SecretsManager. The score is positional (newest = 1.0) — same
-/// scheme as the legacy sync helper this replaces.
+/// phrase keyword-fallback branches, decrypting `value_enc`/`value_key_id`
+/// (Phase A). Scores are [`KEYWORD_FALLBACK_SCORE`].
 async fn rows_to_memory_hits(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<MemoryHit>> {
     let mut hits = Vec::with_capacity(rows.len());
-    for (i, r) in rows.into_iter().enumerate() {
+    for r in rows {
         // MCP-S2: SELECT actor_id + value_format alongside the existing
         // columns so the AAD-dispatch resolver picks the right path.
         // Callers' SQL must include `actor_id` and `value_format` in
@@ -2305,7 +2330,7 @@ async fn rows_to_memory_hits(rows: Vec<sqlx::postgres::PgRow>) -> Result<Vec<Mem
             memory_type: r.try_get("memory_type")?,
             expires_at: r.try_get("expires_at")?,
             updated_at: r.try_get("updated_at")?,
-            score: (1.0 - (i as f64 * 0.02)).max(0.0),
+            score: KEYWORD_FALLBACK_SCORE,
             metadata: r.try_get::<Option<serde_json::Value>, _>("metadata")?,
             // Phase 3a durable signals. check 52: Option read + `?` fails loud on
             // projection drift; widen `real`/`int4` to the ranker's f64/i64.
@@ -3232,7 +3257,7 @@ pub async fn scan_reflection_input(
                       OR metadata IS NULL \
                       OR metadata->>'kind' IS NULL \
                       OR metadata->>'kind' != ALL($2::text[])) \
-               ORDER BY updated_at DESC \
+               ORDER BY updated_at DESC, id \
                LIMIT $3";
     let rows = sqlx::query(sql)
         .bind(actor_id)

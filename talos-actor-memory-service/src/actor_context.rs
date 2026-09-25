@@ -288,22 +288,25 @@ async fn get_relevant_actor_context_smart(
     } else {
         talos_memory::SearchMethod::Direct
     };
-    let semantic_hits = if let Some(hint) = context_hint {
+    // A keyword-fallback outcome carries no similarity, so its hits join
+    // the merge at recency footing rather than as semantic evidence.
+    let (semantic_hits, keyword_rows) = if let Some(hint) = context_hint {
         let fetch = limit.saturating_mul(3).max(limit + 5) as i64;
-        talos_memory::recall_semantic_filtered(
-            repo.pool(),
-            actor_id,
-            hint,
-            fetch,
-            min_score,
-            None,
-            search_method,
-            &exclude_kinds,
+        talos_memory::actor_context::split_semantic_outcome(
+            talos_memory::recall_semantic_filtered(
+                repo.pool(),
+                actor_id,
+                hint,
+                fetch,
+                min_score,
+                None,
+                search_method,
+                &exclude_kinds,
+            )
+            .await?,
         )
-        .await?
-        .hits
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
 
     // Layer 3: Recency — non-scratchpad, kind-filtered. Unlike the
@@ -319,7 +322,7 @@ async fn get_relevant_actor_context_smart(
     // final packed set — while every extra fetched row costs an AES-GCM
     // decrypt (per-row HKDF subkey) on this per-execution hot path. The 3×
     // semantic over-fetch already supplies the dedup/ranking headroom.
-    let recency = talos_memory::recall_recent_excluding_types_and_kinds_ts(
+    let mut recency = talos_memory::recall_recent_excluding_types_and_kinds_ts(
         repo.pool(),
         actor_id,
         &["scratchpad"],
@@ -327,6 +330,7 @@ async fn get_relevant_actor_context_smart(
         limit as i64,
     )
     .await?;
+    recency.extend(keyword_rows);
 
     // Merge + dedup + scratchpad/floor selection (pure, tested), threading
     // the per-layer relevance/recency/importance signals into Candidates.
