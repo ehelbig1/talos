@@ -13,13 +13,31 @@
 //!   callback depends on the peek being non-destructive, and on it refusing to
 //!   answer for a state the consume would reject,
 //! * an EXPIRED state is not redeemable,
-//! * the PKCE verifier is scrubbed from the row on consume (MCP-1096).
+//! * the PKCE verifier is scrubbed from the row on consume (MCP-1096),
+//! * the state is bound to the BROWSER that started the flow (2026-09-25):
+//!   a callback presenting another browser's binding cookie, or none, is
+//!   refused — and the refusal still burns the state.
 
 mod common;
 
 use talos_oauth::{
-    begin_oauth_authorization, consume_oauth_state, peek_state_provider, AuthorizeRequest,
+    begin_oauth_authorization, begin_oauth_authorization_with_subject, consume_oauth_state,
+    peek_state_provider, AuthorizeRequest, BrowserBinding,
 };
+
+/// The plaintext nonce a browser holding `b`'s cookie would present.
+fn cookie_of(b: &BrowserBinding) -> String {
+    let v = b.set_cookie_header();
+    v.to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .split_once('=')
+        .unwrap()
+        .1
+        .to_string()
+}
 use uuid::Uuid;
 
 async fn seed_user(pool: &sqlx::Pool<sqlx::Postgres>, id: Uuid, email: &str) {
@@ -52,10 +70,12 @@ async fn oauth_state_is_single_use_provider_scoped_and_user_bound() {
     let (pool, _db) = common::isolated_db_pool().await;
     let user = Uuid::new_v4();
     seed_user(&pool, user, "oauth-flow@tenancy.test").await;
+    let browser = BrowserBinding::fresh();
+    let cookie = cookie_of(&browser);
 
     // begin: the authorize URL carries the PKCE challenge (S256) + state, and
     // the state is persisted bound to `user`.
-    let (auth_url, state) = begin_oauth_authorization(&pool, &req(), user)
+    let (auth_url, state) = begin_oauth_authorization(&pool, &req(), user, &browser)
         .await
         .expect("begin_oauth_authorization");
     assert!(
@@ -70,7 +90,7 @@ async fn oauth_state_is_single_use_provider_scoped_and_user_bound() {
     assert!(!state.is_empty());
 
     // consume: recovers the bound user_id (the tenancy anchor) + PKCE verifier.
-    let consumed = consume_oauth_state(&pool, "test-provider", &state)
+    let consumed = consume_oauth_state(&pool, "test-provider", &state, Some(&cookie))
         .await
         .expect("consume valid state");
     assert_eq!(
@@ -84,7 +104,7 @@ async fn oauth_state_is_single_use_provider_scoped_and_user_bound() {
 
     // replay: a second consume of the same state must fail (atomic single-use).
     assert!(
-        consume_oauth_state(&pool, "test-provider", &state)
+        consume_oauth_state(&pool, "test-provider", &state, Some(&cookie))
             .await
             .is_err(),
         "state token must be single-use — replay must fail"
@@ -92,17 +112,17 @@ async fn oauth_state_is_single_use_provider_scoped_and_user_bound() {
 
     // provider-scoping: a fresh token can't be consumed under a DIFFERENT
     // provider, and that failed attempt must NOT burn it.
-    let (_url2, state2) = begin_oauth_authorization(&pool, &req(), user)
+    let (_url2, state2) = begin_oauth_authorization(&pool, &req(), user, &browser)
         .await
         .expect("begin second");
     assert!(
-        consume_oauth_state(&pool, "other-provider", &state2)
+        consume_oauth_state(&pool, "other-provider", &state2, Some(&cookie))
             .await
             .is_err(),
         "state token is provider-scoped"
     );
     assert!(
-        consume_oauth_state(&pool, "test-provider", &state2)
+        consume_oauth_state(&pool, "test-provider", &state2, Some(&cookie))
             .await
             .is_ok(),
         "a wrong-provider attempt must not consume the token"
@@ -110,7 +130,7 @@ async fn oauth_state_is_single_use_provider_scoped_and_user_bound() {
 
     // format gate: malformed state (spaces / punctuation) fails before any DB work.
     assert!(
-        consume_oauth_state(&pool, "test-provider", "not a valid state!!")
+        consume_oauth_state(&pool, "test-provider", "not a valid state!!", Some(&cookie))
             .await
             .is_err(),
         "malformed state must fail the format gate"
@@ -128,8 +148,10 @@ async fn peek_state_provider_routes_without_consuming() {
     let (pool, _db) = common::isolated_db_pool().await;
     let user = Uuid::new_v4();
     seed_user(&pool, user, "oauth-peek@tenancy.test").await;
+    let browser = BrowserBinding::fresh();
+    let cookie = cookie_of(&browser);
 
-    let (_url, state) = begin_oauth_authorization(&pool, &req(), user)
+    let (_url, state) = begin_oauth_authorization(&pool, &req(), user, &browser)
         .await
         .expect("begin");
 
@@ -142,7 +164,7 @@ async fn peek_state_provider_routes_without_consuming() {
         );
     }
     assert!(
-        consume_oauth_state(&pool, "test-provider", &state)
+        consume_oauth_state(&pool, "test-provider", &state, Some(&cookie))
             .await
             .is_ok(),
         "peeking MUST NOT consume the state — the multi-tier Google callback \
@@ -191,8 +213,10 @@ async fn expired_state_is_neither_consumable_nor_routable() {
     let (pool, _db) = common::isolated_db_pool().await;
     let user = Uuid::new_v4();
     seed_user(&pool, user, "oauth-expiry@tenancy.test").await;
+    let browser = BrowserBinding::fresh();
+    let cookie = cookie_of(&browser);
 
-    let (_url, state) = begin_oauth_authorization(&pool, &req(), user)
+    let (_url, state) = begin_oauth_authorization(&pool, &req(), user, &browser)
         .await
         .expect("begin");
 
@@ -208,7 +232,7 @@ async fn expired_state_is_neither_consumable_nor_routable() {
     );
 
     assert!(
-        consume_oauth_state(&pool, "test-provider", &state)
+        consume_oauth_state(&pool, "test-provider", &state, Some(&cookie))
             .await
             .is_err(),
         "an expired state token must not be redeemable"
@@ -229,8 +253,10 @@ async fn pkce_verifier_is_scrubbed_from_the_row_on_consume() {
     let (pool, _db) = common::isolated_db_pool().await;
     let user = Uuid::new_v4();
     seed_user(&pool, user, "oauth-scrub@tenancy.test").await;
+    let browser = BrowserBinding::fresh();
+    let cookie = cookie_of(&browser);
 
-    let (_url, state) = begin_oauth_authorization(&pool, &req(), user)
+    let (_url, state) = begin_oauth_authorization(&pool, &req(), user, &browser)
         .await
         .expect("begin");
 
@@ -242,7 +268,7 @@ async fn pkce_verifier_is_scrubbed_from_the_row_on_consume() {
             .expect("read verifier");
     let stored = stored.expect("a PKCE verifier must be persisted at authorize time");
 
-    let consumed = consume_oauth_state(&pool, "test-provider", &state)
+    let consumed = consume_oauth_state(&pool, "test-provider", &state, Some(&cookie))
         .await
         .expect("consume");
     assert_eq!(
@@ -262,4 +288,146 @@ async fn pkce_verifier_is_scrubbed_from_the_row_on_consume() {
         after, None,
         "the verifier must be NULLed once handed to the caller (MCP-1096)"
     );
+}
+
+/// The consent-completion CSRF (2026-09-25). A state carries the user who
+/// STARTED the flow; before this, nothing tied it to the browser that FINISHES
+/// it, so an attacker could hand a victim an authorize URL minted under the
+/// attacker's account and receive the victim's provider credential. The consume
+/// now refuses any callback that does not present the starting browser's
+/// binding cookie — and burns the state doing so, so there is no retry.
+#[tokio::test]
+async fn a_state_started_in_one_browser_is_refused_in_another() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let attacker = Uuid::new_v4();
+    seed_user(&pool, attacker, "oauth-attacker@tenancy.test").await;
+
+    let attacker_browser = BrowserBinding::fresh();
+    let victim_browser = BrowserBinding::fresh();
+    let (_url, state) = begin_oauth_authorization(&pool, &req(), attacker, &attacker_browser)
+        .await
+        .expect("begin");
+
+    // The victim's browser completes consent and lands on the callback.
+    assert!(
+        consume_oauth_state(
+            &pool,
+            "test-provider",
+            &state,
+            Some(&cookie_of(&victim_browser))
+        )
+        .await
+        .is_err(),
+        "a callback from a different browser must be refused"
+    );
+    // The refusal burned the state: not even the right browser can use it now.
+    assert!(
+        consume_oauth_state(
+            &pool,
+            "test-provider",
+            &state,
+            Some(&cookie_of(&attacker_browser))
+        )
+        .await
+        .is_err(),
+        "a refused binding must still consume the state (no retry)"
+    );
+
+    // No cookie at all is no binding.
+    let (_url, state) = begin_oauth_authorization(&pool, &req(), attacker, &attacker_browser)
+        .await
+        .expect("begin");
+    assert!(
+        consume_oauth_state(&pool, "test-provider", &state, None)
+            .await
+            .is_err(),
+        "a callback with no binding cookie must be refused"
+    );
+
+    // The starting browser itself succeeds.
+    let (_url, state) = begin_oauth_authorization(&pool, &req(), attacker, &attacker_browser)
+        .await
+        .expect("begin");
+    let consumed = consume_oauth_state(
+        &pool,
+        "test-provider",
+        &state,
+        Some(&cookie_of(&attacker_browser)),
+    )
+    .await
+    .expect("the starting browser completes its own flow");
+    assert_eq!(consumed.user_id, attacker);
+    assert_eq!(consumed.bound_subject, None);
+}
+
+/// Only the SHA-256 of the binding is persisted, never the cookie value.
+#[tokio::test]
+async fn only_the_binding_hash_is_stored() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let user = Uuid::new_v4();
+    seed_user(&pool, user, "oauth-hash@tenancy.test").await;
+    let browser = BrowserBinding::fresh();
+    let (_url, state) = begin_oauth_authorization(&pool, &req(), user, &browser)
+        .await
+        .expect("begin");
+    let stored: Option<String> = sqlx::query_scalar(
+        "SELECT session_binding_hash FROM oauth_state_tokens WHERE state_token = $1",
+    )
+    .bind(&state)
+    .fetch_one(&pool)
+    .await
+    .expect("read hash");
+    assert_eq!(stored.as_deref(), Some(browser.hash().as_str()));
+    assert_ne!(stored.as_deref(), Some(cookie_of(&browser).as_str()));
+}
+
+/// A state row with NO binding — the shape every connect row had before this
+/// change, and what a writer that skipped the rule would produce — is refused,
+/// whatever cookie arrives. An unbound state is the defect itself.
+#[tokio::test]
+async fn an_unbound_state_row_is_refused() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let user = Uuid::new_v4();
+    seed_user(&pool, user, "oauth-unbound@tenancy.test").await;
+    let state = "legacyunboundstate0123456789abcdef";
+    sqlx::query(
+        "INSERT INTO oauth_state_tokens (state_token, provider, user_id) VALUES ($1, $2, $3)",
+    )
+    .bind(state)
+    .bind("test-provider")
+    .bind(user)
+    .execute(&pool)
+    .await
+    .expect("insert pre-fix row");
+    let any_browser = BrowserBinding::fresh();
+    assert!(
+        consume_oauth_state(
+            &pool,
+            "test-provider",
+            state,
+            Some(&cookie_of(&any_browser))
+        )
+        .await
+        .is_err(),
+        "a state with no stored binding must not be redeemable"
+    );
+}
+
+/// `bound_subject` round-trips server-side and is handed back only to the
+/// consume — the GitHub App flow carries its installation id this way.
+#[tokio::test]
+async fn a_bound_subject_round_trips_through_the_consume() {
+    let (pool, _db) = common::isolated_db_pool().await;
+    let user = Uuid::new_v4();
+    seed_user(&pool, user, "oauth-subject@tenancy.test").await;
+    let browser = BrowserBinding::fresh();
+    let (url, state) =
+        begin_oauth_authorization_with_subject(&pool, &req(), user, &browser, Some("424242"))
+            .await
+            .expect("begin");
+    assert!(!url.contains("424242"), "the subject stays server-side");
+    let consumed = consume_oauth_state(&pool, "test-provider", &state, Some(&cookie_of(&browser)))
+        .await
+        .expect("consume");
+    assert_eq!(consumed.bound_subject.as_deref(), Some("424242"));
 }

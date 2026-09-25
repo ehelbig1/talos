@@ -5,21 +5,24 @@
 //! `talos_github::GithubAppConfig::from_env()`, registers the two routes, and
 //! provides the auth middleware that injects the connecting user's id.
 //!
-//! Security shape:
+//! Security shape (see `service.rs` for the full rationale):
 //! * Initiate (`/api/github/connect`) is session-authenticated; the `user_id` is
-//!   stored in the single-use `oauth_state_tokens` row.
-//! * The Setup-URL callback (`/api/github/setup`) is a cross-site redirect from
-//!   github.com — no session auth — so it recovers `user_id` from the state
-//!   token (atomic single-use consume), validates the untrusted params, then
-//!   fetches + persists the installation.
+//!   stored in a single-use `oauth_state_tokens` row bound to this browser.
+//! * The Setup-URL callback (`/api/github/setup`) trusts nothing it is handed:
+//!   it consumes the state and starts GitHub's user authorization.
+//! * The Callback-URL (`/api/github/authorized`) claims the installation only
+//!   if the authorizing GitHub user can access it, and never moves an active
+//!   installation another Talos user holds.
 
 mod handlers;
 mod service;
 mod token_resolver;
 
 pub use handlers::{
-    connect_github_handler, github_setup_callback_handler, list_github_installations_handler,
-    SetupParams,
+    connect_github_handler, github_authorized_callback_handler, github_setup_callback_handler,
+    list_github_installations_handler, AuthorizedParams, SetupParams,
 };
-pub use service::{GithubConnectService, InstallationSummary, SetupOutcome};
+pub use service::{
+    AuthorizedOutcome, ClaimRefusal, GithubConnectService, InstallationSummary, SetupOutcome,
+};
 pub use token_resolver::{parse_github_app_secret_path, GithubTokenResolver, GITHUB_APP_SCHEME};

@@ -163,6 +163,7 @@ pub async fn disconnect_integration_handler(
 pub async fn connect_gmail_handler(
     State(service): State<Arc<GmailIntegrationService>>,
     Extension(user_id): Extension<Uuid>,
+    headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     if !service.is_configured() {
         return (
@@ -176,16 +177,23 @@ pub async fn connect_gmail_handler(
             .into_response();
     }
 
-    match service.get_authorization_url(user_id).await {
-        Ok((url, csrf_token)) => Json(ApiResponse {
-            success: true,
-            data: Some(OAuthUrlResponse {
-                authorization_url: url,
-                csrf_token,
+    // Bind the state to THIS browser (connect-binding cookie): the callback
+    // must present it, so a URL minted here cannot be completed by someone
+    // else's browser — see talos_oauth::connect_binding.
+    let binding = talos_oauth::BrowserBinding::for_request(&headers);
+    match service.get_authorization_url(user_id, &binding).await {
+        Ok((url, csrf_token)) => (
+            [binding.set_cookie_pair()],
+            Json(ApiResponse {
+                success: true,
+                data: Some(OAuthUrlResponse {
+                    authorization_url: url,
+                    csrf_token,
+                }),
+                error: None,
             }),
-            error: None,
-        })
-        .into_response(),
+        )
+            .into_response(),
         Err(e) => {
             // MCP-924: log server-side, generic to client. See list_integrations_handler.
             tracing::error!(
@@ -213,6 +221,7 @@ pub async fn connect_gmail_handler(
 pub async fn gmail_callback_handler(
     Query(params): Query<OAuthCallbackParams>,
     State(service): State<Arc<GmailIntegrationService>>,
+    headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     // MCP-1021 (2026-05-15): route through `talos_config::get_frontend_url()`
     // (same fix as the talos-atlassian sibling handler). The canonical
@@ -261,7 +270,16 @@ pub async fn gmail_callback_handler(
     };
 
     // Exchange code for tokens and create integration (state validated inside for CSRF protection)
-    match service.handle_callback(code, state).await {
+    match service
+        .handle_callback(
+            code,
+            state,
+            // The connect-binding cookie set at /connect — the consume refuses a
+            // state started in a different browser.
+            talos_oauth::presented_connect_binding(&headers).as_deref(),
+        )
+        .await
+    {
         Ok(integration) => {
             // The account email is the provider key of this credential's
             // vault path; log the same hashed token the path lines carry, not

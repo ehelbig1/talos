@@ -626,7 +626,13 @@ pub(crate) async fn build_platform_services(
     // with a broken connect flow.
     let github_app_config = talos_github::GithubAppConfig::from_env()
         .map_err(|e| anyhow::anyhow!("Invalid GitHub App configuration: {}", e))?;
-    if github_app_config.is_some() {
+    // The connect flow additionally needs the App's user-authorization
+    // credentials (it verifies installation ownership with them);
+    // `GithubConnectService::new` WARNs and disables it when they are absent.
+    if github_app_config
+        .as_ref()
+        .is_some_and(|c| c.user_auth().is_some())
+    {
         tracing::info!("GitHub App connect flow enabled (RFC 0008)");
     }
     // B4-wiring: inject the App installation-token provider into the engine's
