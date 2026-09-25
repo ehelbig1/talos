@@ -1061,6 +1061,7 @@ struct OAuthUrlResponse {
 pub async fn connect_calendar_handler(
     State(service): State<Arc<GoogleCalendarService>>,
     Extension(user_id): Extension<Uuid>,
+    headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     if !service.is_configured() {
         return (
@@ -1074,16 +1075,23 @@ pub async fn connect_calendar_handler(
             .into_response();
     }
 
-    match service.get_authorization_url(user_id).await {
-        Ok((url, csrf_token)) => Json(ApiResponse {
-            success: true,
-            data: Some(OAuthUrlResponse {
-                authorization_url: url,
-                csrf_token,
+    // Bind the state to THIS browser (connect-binding cookie): the callback
+    // must present it, so a URL minted here cannot be completed by someone
+    // else's browser — see talos_oauth::connect_binding.
+    let binding = talos_oauth::BrowserBinding::for_request(&headers);
+    match service.get_authorization_url(user_id, &binding).await {
+        Ok((url, csrf_token)) => (
+            [binding.set_cookie_pair()],
+            Json(ApiResponse {
+                success: true,
+                data: Some(OAuthUrlResponse {
+                    authorization_url: url,
+                    csrf_token,
+                }),
+                error: None,
             }),
-            error: None,
-        })
-        .into_response(),
+        )
+            .into_response(),
         Err(e) => {
             // Log server-side, generic to client (MCP-923/924 posture).
             tracing::error!(
@@ -1113,6 +1121,7 @@ pub async fn connect_calendar_handler(
 pub async fn calendar_callback_handler(
     axum::extract::Query(params): axum::extract::Query<CalendarOAuthCallbackParams>,
     State(service): State<Arc<GoogleCalendarService>>,
+    headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     use axum::response::Redirect;
     let frontend_url = talos_config::get_frontend_url();
@@ -1136,7 +1145,16 @@ pub async fn calendar_callback_handler(
         }
     };
 
-    match service.handle_callback(code, state).await {
+    match service
+        .handle_callback(
+            code,
+            state,
+            // The connect-binding cookie set at /connect — the consume refuses a
+            // state started in a different browser.
+            talos_oauth::presented_connect_binding(&headers).as_deref(),
+        )
+        .await
+    {
         Ok(_integration) => Redirect::to(&format!(
             "{}/settings?google_calendar_connected=1#integrations",
             frontend_url

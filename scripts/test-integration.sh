@@ -760,6 +760,13 @@ CTRL_TESTS=(
     # schema/enum or status-guard pair diverges).
     "github_app_tenancy_tests"
     "oauth_flow_tests"
+    # GitHub App installation takeover + consent-completion CSRF (2026-09-25):
+    # drives the REAL connect service through connect → setup → authorized
+    # against a loopback github.com, asserting on ROWS that a spoofed setup
+    # `installation_id` moves nothing, that GitHub access alone cannot take an
+    # installation from an active owner, and that a URL minted in one browser
+    # cannot be completed in another. `common` (DATABASE_URL) harness.
+    "github_connect_flow_tests"
     "integration_state_crypto_tests"
     "memory_get_entry_tests"
     "module_execution_status_tests"

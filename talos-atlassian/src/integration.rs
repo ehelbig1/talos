@@ -136,11 +136,15 @@ impl AtlassianIntegrationService {
     /// Stores `user_id` in the state token so the callback can identify the
     /// user without requiring session auth (cross-site redirects from OAuth
     /// providers may not carry session cookies).
-    pub async fn get_authorization_url(&self, user_id: Uuid) -> Result<(String, String)> {
+    pub async fn get_authorization_url(
+        &self,
+        user_id: Uuid,
+        binding: &talos_oauth::BrowserBinding,
+    ) -> Result<(String, String)> {
         // Delegate to the shared driver — it builds the authorize URL from
         // `authorize_request()` and persists the PKCE + CSRF state token bound
         // to `user_id`. See the `OAuthIntegration` impl below.
-        talos_oauth::authorization_url(&self.db_pool, self, user_id).await
+        talos_oauth::authorization_url(&self.db_pool, self, user_id, binding).await
     }
 
     /// Handle the OAuth callback: validate CSRF, exchange code, discover cloud sites,
@@ -151,12 +155,14 @@ impl AtlassianIntegrationService {
         &self,
         code: String,
         state: String,
+        presented_binding: Option<&str>,
     ) -> Result<AtlassianIntegration> {
         // Delegate to the shared driver — it consumes + validates the CSRF state
         // token (single-use, format, tenancy) and only then hands the validated
         // `ConsumedOAuthState` to `complete_callback()`. See the
         // `OAuthIntegration` impl below.
-        talos_oauth::handle_oauth_callback(&self.db_pool, self, &code, &state).await
+        talos_oauth::handle_oauth_callback(&self.db_pool, self, &code, &state, presented_binding)
+            .await
     }
 }
 
@@ -731,7 +737,7 @@ mod tests {
     async fn get_authorization_url_fails_before_any_db_write_when_unconfigured() {
         let svc = unconfigured_service();
         let err = svc
-            .get_authorization_url(Uuid::new_v4())
+            .get_authorization_url(Uuid::new_v4(), &talos_oauth::BrowserBinding::fresh())
             .await
             .expect_err("must fail closed");
         // The config error surfaces verbatim — the driver evaluates
@@ -759,7 +765,7 @@ mod tests {
         // The pool is unreachable and no HTTP mock exists, so reaching
         // either later stage would produce a different error.
         let err = svc
-            .handle_callback("dummy-code".to_string(), "bad state!".to_string())
+            .handle_callback("dummy-code".to_string(), "bad state!".to_string(), None)
             .await
             .expect_err("malformed state must be rejected");
         let chain = error_chain(&err);
@@ -773,7 +779,7 @@ mod tests {
     async fn callback_rejects_empty_state_before_db_or_exchange() {
         let svc = configured_service();
         let err = svc
-            .handle_callback("dummy-code".to_string(), String::new())
+            .handle_callback("dummy-code".to_string(), String::new(), None)
             .await
             .expect_err("empty state must be rejected");
         let chain = error_chain(&err);
@@ -793,7 +799,11 @@ mod tests {
         // token-endpoint error instead (and would have leaked an outbound
         // request carrying client_secret for an unvalidated state).
         let err = svc
-            .handle_callback("dummy-code".to_string(), "wellformedstate123".to_string())
+            .handle_callback(
+                "dummy-code".to_string(),
+                "wellformedstate123".to_string(),
+                None,
+            )
             .await
             .expect_err("unreachable DB must fail the state consume");
         let chain = error_chain(&err);

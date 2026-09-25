@@ -472,7 +472,7 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "resource_type": { "type": "string", "description": "Only events about this resource type (writer vocabulary: workflow, module, actor, ml_model, api_key, mcp_agent, user, execution, system, worker_provisioning_token)." },
+                    "resource_type": { "type": "string", "description": "Only events about this resource type (writer vocabulary: workflow, module, actor, ml_model, api_key, mcp_agent, user, execution, system, worker_provisioning_token, github_app_installation)." },
                     "event_type": { "type": "string", "description": "Only this event type (e.g. workflow_deleted, actor_llm_tier_ceiling_set)." },
                     "all_users": { "type": "boolean", "description": "Platform-admin only: every user's actions plus system-authored rows. Default false = your own actions." },
                     "limit": { "type": "number", "description": "Page size (default 50, max 200)." },
