@@ -71,6 +71,7 @@ BASES = [
     ("d5e3bfbc79aab7398448721b4a1ed47600e27400", "2026-09-09: engineering-log narrative -> docs/engineering-log/<class>.md"),
     ("722c58e22081a5779f96ed9b2ada6f991aaf507a", "2026-09-22: whole-codebase-review package bullets -> the review archive"),
     ("6b7cd9f3f554209dc43be21c79d80a4e02d0a146", "2026-09-24: post-DN package bullets (DO..EO) compressed to decisions only"),
+    ("7457bdbd7520cf5c560052ec04b7ec2163f5aaf5", "2026-09-25: lint checks 74/88/83/65 compressed to specification only"),
 ]
 ARCHIVE = Path("docs/engineering-log")
 CLAUDE = Path("CLAUDE.md")
