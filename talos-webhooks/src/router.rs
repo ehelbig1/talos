@@ -452,7 +452,7 @@ impl WebhookRouter {
 
         // 0. Circuit breaker check — cheapest gate, runs before any DB query or HMAC.
         if let Some(ip) = source_ip {
-            if self.circuit_breaker.is_blocked(ip) {
+            if self.circuit_breaker.is_blocked(ip, trigger_id) {
                 tracing::warn!(
                     trigger_id = %trigger_id,
                     ip = %ip,
@@ -624,8 +624,11 @@ impl WebhookRouter {
                             "IP not in allowlist"
                         );
                         // IP allowlist rejection counts as auth failure for CB tracking
-                        self.circuit_breaker
-                            .record_failure_with_type(ip, CircuitBreakerFailureType::IpNotAllowed);
+                        self.circuit_breaker.record_failure_with_type(
+                            ip,
+                            trigger_id,
+                            CircuitBreakerFailureType::IpNotAllowed,
+                        );
                         self.log_request(
                             trigger_id,
                             headers,
@@ -748,8 +751,11 @@ impl WebhookRouter {
                      WebhookDeduplication is wired up."
                 );
                 if let Some(ip) = source_ip {
-                    self.circuit_breaker
-                        .record_failure_with_type(ip, CircuitBreakerFailureType::InvalidSignature);
+                    self.circuit_breaker.record_failure_with_type(
+                        ip,
+                        trigger_id,
+                        CircuitBreakerFailureType::InvalidSignature,
+                    );
                 }
                 self.log_request(
                     trigger_id,
@@ -778,6 +784,7 @@ impl WebhookRouter {
                     if let Some(ip) = source_ip {
                         self.circuit_breaker.record_failure_with_type(
                             ip,
+                            trigger_id,
                             CircuitBreakerFailureType::InvalidSignature,
                         );
                     }
@@ -818,8 +825,11 @@ impl WebhookRouter {
                  Check for a DEK/KMS outage or in-progress key rotation."
             );
             if let Some(ip) = source_ip {
-                self.circuit_breaker
-                    .record_failure_with_type(ip, CircuitBreakerFailureType::InvalidSignature);
+                self.circuit_breaker.record_failure_with_type(
+                    ip,
+                    trigger_id,
+                    CircuitBreakerFailureType::InvalidSignature,
+                );
             }
             self.log_request(
                 trigger_id,
@@ -867,6 +877,7 @@ impl WebhookRouter {
                 if let Some(ip) = source_ip {
                     self.circuit_breaker.record_failure_with_type(
                         ip,
+                        trigger_id,
                         CircuitBreakerFailureType::InvalidVerificationToken,
                     );
                 }
@@ -885,6 +896,7 @@ impl WebhookRouter {
                 if let Some(ip) = source_ip {
                     self.circuit_breaker.record_failure_with_type(
                         ip,
+                        trigger_id,
                         CircuitBreakerFailureType::InvalidVerificationToken,
                     );
                 }
@@ -1711,9 +1723,10 @@ impl WebhookRouter {
 
             let (response_body, success, error_msg) = match result {
                 Ok(Ok(output)) => {
-                    // Auth passed and execution succeeded — clear any CB failures for this IP.
+                    // Auth passed and execution succeeded. `record_success` is a deliberate
+                    // no-op (MCP-439: a success must not wipe failure history).
                     if let Some(ip) = source_ip {
-                        self.circuit_breaker.record_success(ip);
+                        self.circuit_breaker.record_success(ip, trigger_id);
                     }
                     (output, true, None)
                 }

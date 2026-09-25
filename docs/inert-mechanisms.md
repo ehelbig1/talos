@@ -298,7 +298,8 @@ module keeps fetching, keeps sending, keeps calling the LLM.
 exploited, and three sibling controls ARE live:**
 * Fuel metering and **epoch interruption** genuinely stop a runaway or
   non-yielding loop (`kill_switch_tests` 1 and 2 — those mechanisms have real
-  production drivers, `spawn_epoch_ticker` among them).
+  production drivers — the epoch ticker is started by `TalosRuntime`'s own
+  constructor since 2026-09-25, in the controller as well as the worker).
 * Per-attempt timeouts and the workflow-budget clamp (#686) bound duration.
 * So the exposure is not unbounded: it is **the remaining budget of the
   in-flight node**, not forever.

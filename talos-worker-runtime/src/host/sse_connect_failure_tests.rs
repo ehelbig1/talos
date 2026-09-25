@@ -444,6 +444,7 @@ async fn next_event_reports_an_abnormal_end_once_and_still_answers_none() {
             event_type: None,
             data: "first".to_string(),
             id: None,
+            buffered: None,
         },
     ))
     .await

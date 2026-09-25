@@ -446,6 +446,17 @@ impl wit_webhook::Host for TalosContext {
             }
         };
 
+        // Breaker target: `host:port` (see `BreakerTarget`). `send` uses a
+        // fixed 30 s client timeout, above the evidence floor, so here only
+        // the PORT rule can turn a transport failure into no-evidence.
+        let Some(breaker_target) = crate::circuit_breaker::BreakerTarget::from_url(&parsed_url)
+        else {
+            return Err(webhook_deny(self, reason_class::URL_PARSE));
+        };
+        /// `send`'s client timeout (below), named once so the breaker's
+        /// evidence rule reads the value the request actually used.
+        const WEBHOOK_SEND_TIMEOUT_MS: u64 = 30_000;
+
         let mut retries = 0u32;
         loop {
             // Circuit breaker — one permit per ATTEMPT, settled with the
@@ -455,7 +466,8 @@ impl wit_webhook::Host for TalosContext {
             // circuit against was still POSTed to `1 + max_retries` times per
             // send. Refused here = `sendfailed` (non-transient), latched
             // `circuit-open` so the operator sees why nothing went out.
-            let Some(mut permit) = get_global_circuit_breaker().begin_request(&host) else {
+            let Some(mut permit) = get_global_circuit_breaker().begin_request(&breaker_target)
+            else {
                 tracing::warn!(host = %host, "Circuit breaker open - rejecting webhook send");
                 self.emit_network_failure(
                     reason_class::CIRCUIT_OPEN,
@@ -471,7 +483,7 @@ impl wit_webhook::Host for TalosContext {
             let mut req_builder = client
                 .post(&url)
                 .body(body.clone())
-                .timeout(std::time::Duration::from_secs(30));
+                .timeout(std::time::Duration::from_millis(WEBHOOK_SEND_TIMEOUT_MS));
             for (k, v) in &headers {
                 let resolved = self
                     .resolve_vault_header(
@@ -554,13 +566,13 @@ impl wit_webhook::Host for TalosContext {
                     });
                 }
                 Err(e) if retries < max_retries => {
-                    // Same accounting as `fetch`: a builder error never left
-                    // the process and says nothing about the host.
-                    if e.is_builder() {
-                        permit.settle_no_evidence();
-                    } else {
-                        permit.settle_transport_failure();
-                    }
+                    // Same accounting as `fetch`, from the same place: a
+                    // builder error or a non-default port is no evidence.
+                    permit.settle_send_error(
+                        e.is_builder(),
+                        e.is_timeout(),
+                        WEBHOOK_SEND_TIMEOUT_MS,
+                    );
                     retries += 1;
                     if e.is_timeout() {
                         // Same reasoning as the terminal transport arm below:
@@ -587,11 +599,11 @@ impl wit_webhook::Host for TalosContext {
                     tokio::time::sleep(std::time::Duration::from_millis(retry_delay_ms)).await;
                 }
                 Err(e) => {
-                    if e.is_builder() {
-                        permit.settle_no_evidence();
-                    } else {
-                        permit.settle_transport_failure();
-                    }
+                    permit.settle_send_error(
+                        e.is_builder(),
+                        e.is_timeout(),
+                        WEBHOOK_SEND_TIMEOUT_MS,
+                    );
                     // THE transport site. It CLEARS rather than latching — the
                     // totality rule requires every failing return to DECIDE
                     // the latch, not that every one names a class. Clearing is
@@ -715,13 +727,16 @@ mod webhook_gate_tests {
     async fn an_open_circuit_refuses_the_send_before_it_leaves() {
         let host = "1.0.0.3";
         let cb = get_global_circuit_breaker();
-        cb.force_half_open(host, 0);
+        cb.force_half_open(&crate::circuit_breaker::https_breaker_key(host), 0);
         // dry_run = false: the breaker sits AFTER the dry-run mock, and a
         // refusal returns before any socket is opened.
         let mut c = ctx(host, &["POST"], false);
         let r = c.send(req(host)).await;
         assert!(matches!(r, Err(wit_webhook::Error::Sendfailed)), "{r:?}");
         assert_eq!(latched(&c), Some(reason_class::CIRCUIT_OPEN));
-        assert_eq!(cb.trial_tally(host), Some((0, 0)));
+        assert_eq!(
+            cb.trial_tally(&crate::circuit_breaker::https_breaker_key(host)),
+            Some((0, 0))
+        );
     }
 }

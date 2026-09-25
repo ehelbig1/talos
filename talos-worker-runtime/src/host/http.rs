@@ -146,6 +146,89 @@ fn deny_forbidden(ctx: &TalosContext, class: &'static str) -> wit_http::Error {
 
 /// Latch `class` against the `invalidurl` discriminant and return it.
 /// Sibling of [`deny_forbidden`]; see its doc for why the pairing lives here.
+/// Response bytes one `fetch_all` call may hold across ALL its entries
+/// (2026-09-25), unless the per-entry cap is set higher (then that). Half-ish
+/// of the guest's 128 MiB memory slot, which must receive the whole list.
+pub(crate) const FETCH_ALL_MAX_RESPONSE_BYTES_PER_CALL: usize = 32 * 1024 * 1024;
+
+/// A byte budget shared by the concurrent entries of one `fetch_all` call.
+pub(crate) struct BatchByteBudget {
+    used: std::sync::atomic::AtomicUsize,
+    cap: usize,
+}
+
+impl BatchByteBudget {
+    pub(crate) fn new(cap: usize) -> Self {
+        Self {
+            used: std::sync::atomic::AtomicUsize::new(0),
+            cap,
+        }
+    }
+
+    /// Bytes currently reserved by entries still running or already kept.
+    #[cfg(test)]
+    pub(crate) fn used(&self) -> usize {
+        self.used.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// A reservation that grows chunk by chunk and is RELEASED on drop unless
+    /// kept — so every early return of an entry gives its bytes back.
+    pub(crate) fn reservation(self: &std::sync::Arc<Self>) -> BatchReservation {
+        BatchReservation {
+            budget: self.clone(),
+            held: 0,
+            kept: false,
+        }
+    }
+
+    fn try_reserve(&self, n: usize) -> bool {
+        use std::sync::atomic::Ordering;
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                let next = cur.checked_add(n)?;
+                (next <= self.cap).then_some(next)
+            })
+            .is_ok()
+    }
+
+    fn release(&self, n: usize) {
+        self.used.fetch_sub(n, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
+/// One entry's share of a [`BatchByteBudget`].
+pub(crate) struct BatchReservation {
+    budget: std::sync::Arc<BatchByteBudget>,
+    held: usize,
+    kept: bool,
+}
+
+impl BatchReservation {
+    /// Reserve `n` more bytes; `false` (reserving nothing) if the call's
+    /// budget cannot take them.
+    pub(crate) fn grow(&mut self, n: usize) -> bool {
+        if self.budget.try_reserve(n) {
+            self.held += n;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// The entry succeeded: its bytes stay reserved for the life of the call.
+    pub(crate) fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for BatchReservation {
+    fn drop(&mut self) {
+        if !self.kept && self.held > 0 {
+            self.budget.release(self.held);
+        }
+    }
+}
+
 fn deny_invalid_url(ctx: &TalosContext, class: &'static str) -> wit_http::Error {
     ctx.record_http_denial(class, reason_class::WIT_INVALIDURL);
     wit_http::Error::Invalidurl
@@ -679,7 +762,16 @@ impl wit_http::Host for TalosContext {
         //
         // `fetch_all` takes ONE permit per distinct host in the batch (see its
         // admission pass) and settles each after the join.
-        let Some(mut permit) = get_global_circuit_breaker().begin_request(&host_str) else {
+        //
+        // Keyed by `host:port` (see `BreakerTarget`): a guest dialling a closed
+        // side port of a shared host no longer counts against the key every
+        // tenant's port-443 traffic uses. `from_url` is `None` only for a URL
+        // with no host, which the https-only scheme gate above has already
+        // refused; the arm is unreachable, not a new refusal.
+        let Some(breaker_target) = crate::circuit_breaker::BreakerTarget::from_url(&url) else {
+            return Err(deny_invalid_url(self, reason_class::URL_PARSE));
+        };
+        let Some(mut permit) = get_global_circuit_breaker().begin_request(&breaker_target) else {
             tracing::warn!(host = %host, "Circuit breaker open - rejecting HTTP request");
             self.emit_network_failure(
                 reason_class::CIRCUIT_OPEN,
@@ -738,7 +830,12 @@ impl wit_http::Host for TalosContext {
         // wit_agent_orchestration::invoke convention at line 6095
         // (`timeout_ms.min(120_000)`); same fix applied to fetch_all
         // and execute_graphql_inner below.
-        let timeout_ms = req.timeout_ms.unwrap_or(30_000).min(MAX_HTTP_TIMEOUT_MS) as u64;
+        //
+        // 2026-09-25: and floored at MIN_HTTP_TIMEOUT_MS, through the one
+        // helper all three guest-timeout surfaces share. A 1 ms timeout used to
+        // be honoured and then settled as a host transport failure, so five of
+        // them opened the process-global circuit for a healthy host.
+        let timeout_ms = crate::circuit_breaker::clamp_guest_timeout_ms(req.timeout_ms);
         let url_str = req.url.clone();
 
         let client = self.http_client.clone();
@@ -850,22 +947,20 @@ impl wit_http::Host for TalosContext {
                 resp
             }
             Err(e) => {
-                if e.is_builder() {
-                    // The request was never constructed, so it never left the
-                    // process and nothing was learned about the host. On this
-                    // path that means a header name or value the GUEST wrote
-                    // that `http::HeaderName`/`HeaderValue` refused —
-                    // `RequestBuilder::header` stores the error and surfaces
-                    // it here at `send()`. Feeding it to `record_failure`
-                    // (the pre-2026-08-12 behaviour) let a module open a
-                    // shared, process-global circuit for a healthy host with
-                    // five malformed-header fetches and zero packets. The
-                    // guest-visible error and the reason class below are
-                    // unchanged; only the breaker's accounting is.
-                    permit.settle_no_evidence();
-                } else {
-                    permit.settle_transport_failure();
-                }
+                // Evidence or not is decided in ONE place,
+                // `RequestPermit::settle_send_error`:
+                //  * a BUILDER error never left the process — a header name or
+                //    value the GUEST wrote that `http::HeaderName`/`HeaderValue`
+                //    refused. Feeding it to `record_failure` (pre-2026-08-12)
+                //    let five malformed-header fetches open a shared circuit
+                //    for a healthy host with zero packets sent;
+                //  * a non-default port is the guest's choice of target
+                //    (2026-09-25);
+                //  * a timeout shorter than BREAKER_TIMEOUT_EVIDENCE_FLOOR_MS
+                //    measures the guest's impatience, not the host (2026-09-25).
+                // The guest-visible error and the reason class below are
+                // unchanged; only the breaker's accounting is.
+                permit.settle_send_error(e.is_builder(), e.is_timeout(), timeout_ms);
                 // D3 — the ONE place the real transport error is surfaced.
                 // Worker log only (never host→guest, never a stored payload):
                 // URL erased, DLP-redacted, then IP/path-sanitized. Before
@@ -1644,7 +1739,8 @@ impl wit_http::Host for TalosContext {
                 // exactly as fetch above. Each entry in the batch
                 // could otherwise pass u32::MAX and tie up a slot in
                 // the buffer_unordered pool.
-                req.timeout_ms.unwrap_or(30_000).min(MAX_HTTP_TIMEOUT_MS) as u64,
+                // 2026-09-25: floored too, through the shared helper.
+                crate::circuit_breaker::clamp_guest_timeout_ms(req.timeout_ms),
             )));
         }
 
@@ -1693,15 +1789,18 @@ impl wit_http::Host for TalosContext {
         // seen for that host — a transport failure beats a status, a 5xx beats
         // a 2xx — so a batch is one trial, not N.
         let breaker = get_global_circuit_breaker();
+        // Keyed by the BREAKER key (`host:port`, see `BreakerTarget`), so one
+        // batch spanning two ports of one host is two admissions, as two
+        // `fetch` calls would be.
         let mut host_permits: std::collections::HashMap<
             String,
             crate::circuit_breaker::RequestPermit<'static>,
         > = std::collections::HashMap::new();
         let mut breaker_refused: std::collections::HashSet<String> =
             std::collections::HashSet::new();
-        // Host per input slot — used for admission now and for the settle +
-        // per-failure diagnostics after the join. `None` = the entry failed
-        // validation (already diagnosed at validation time).
+        // Host per input slot — used for the per-failure diagnostics after the
+        // join. `None` = the entry failed validation (already diagnosed at
+        // validation time).
         let request_hosts: Vec<Option<String>> = validated
             .iter()
             .map(|v| {
@@ -1712,32 +1811,55 @@ impl wit_http::Host for TalosContext {
                 })
             })
             .collect();
-        for (v, host) in validated.iter_mut().zip(request_hosts.iter()) {
-            let Some(host) = host else { continue };
+        // Breaker target per input slot — admission now, settle after the
+        // join. Same `None` convention as `request_hosts`.
+        let request_targets: Vec<Option<crate::circuit_breaker::BreakerTarget>> = validated
+            .iter()
+            .map(|v| {
+                v.as_ref().ok().and_then(|(u, _, _, _, _)| {
+                    url::Url::parse(u)
+                        .ok()
+                        .and_then(|p| crate::circuit_breaker::BreakerTarget::from_url(&p))
+                })
+            })
+            .collect();
+        // Effective (clamped) timeout per input slot: whether a TIMEOUT counts
+        // as host evidence depends on how long the host was given.
+        let request_timeouts: Vec<u64> = validated
+            .iter()
+            .map(|v| v.as_ref().map_or(0, |(_, _, _, _, t)| *t))
+            .collect();
+        for (v, target) in validated.iter_mut().zip(request_targets.iter()) {
+            let Some(target) = target else {
+                continue;
+            };
             if v.is_err() {
                 continue;
             }
-            if !host_permits.contains_key(host) && !breaker_refused.contains(host) {
-                match breaker.begin_request(host) {
+            let key = target.key();
+            if !host_permits.contains_key(key) && !breaker_refused.contains(key) {
+                match breaker.begin_request(target) {
                     Some(permit) => {
-                        host_permits.insert(host.clone(), permit);
+                        host_permits.insert(key.to_string(), permit);
                     }
                     None => {
-                        breaker_refused.insert(host.clone());
+                        breaker_refused.insert(key.to_string());
                     }
                 }
             }
-            if breaker_refused.contains(host) {
+            if breaker_refused.contains(key) {
                 *v = Err(wit_http::Error::Networkerror);
             }
         }
-        for host in &breaker_refused {
-            tracing::warn!(host = %host, "fetch_all: circuit breaker open — entries to this host refused");
+        // `target` is the breaker key, `host:port` — the host is safe to name
+        // (the module declared it in `allowed_hosts`) and so is the port.
+        for target in &breaker_refused {
+            tracing::warn!(target_key = %target, "fetch_all: circuit breaker open — entries to this host refused");
             self.emit_network_failure(
                 reason_class::CIRCUIT_OPEN,
                 reason_class::WIT_NETWORKERROR,
                 &format!(
-                    "circuit breaker open for '{host}' after recent failures — \
+                    "circuit breaker open for '{target}' after recent failures — \
                      the batch entries to it were rejected without being sent; it closes automatically"
                 ),
             )
@@ -1781,6 +1903,18 @@ impl wit_http::Host for TalosContext {
             "WASM_HTTP_MAX_RESPONSE_BYTES",
             10 * 1024 * 1024_usize,
         );
+        // The per-CALL budget (2026-09-25). `max_resp` bounds ONE entry; the
+        // batch holds every successful body until it returns, and a batch may
+        // be as large as the execution's remaining call budget (up to 1 000),
+        // so the whole call could park 10 GB in worker memory — none of which
+        // the guest's 128 MiB memory could even receive. Every entry now
+        // reserves its bytes against one shared budget as they arrive; an
+        // entry that would cross it fails (`networkerror`, "response over
+        // limits") and releases what it had reserved. At least one full-size
+        // entry always fits.
+        let batch_budget = std::sync::Arc::new(BatchByteBudget::new(
+            max_resp.max(FETCH_ALL_MAX_RESPONSE_BYTES_PER_CALL),
+        ));
 
         // ── Concurrent dispatch with backpressure ─────────────────────────
         // Use buffer_unordered to limit concurrent requests and prevent
@@ -1825,7 +1959,11 @@ impl wit_http::Host for TalosContext {
         #[derive(Clone, Copy)]
         enum BatchSendOutcome {
             Status(u16),
-            Transport,
+            /// A transport failure; `timed_out` feeds the evidence predicate
+            /// (a short guest timeout is not evidence about the host).
+            Transport {
+                timed_out: bool,
+            },
             /// `reqwest` never built the request — a guest-authored header
             /// it refused. Nothing left the process (`settle_no_evidence`).
             NoEvidence,
@@ -1835,6 +1973,7 @@ impl wit_http::Host for TalosContext {
         let stream =
             futures_util::stream::iter(validated.into_iter().enumerate().map(move |(idx, v)| {
                 let max_r = max_resp;
+                let batch_budget = batch_budget.clone();
                 let self_http_client = self_http_client.clone();
                 let cancelled_flag = cancelled_flag.clone();
                 async move {
@@ -1914,7 +2053,9 @@ impl wit_http::Host for TalosContext {
                     *outcome_slot = Some(if e.is_builder() {
                         BatchSendOutcome::NoEvidence
                     } else {
-                        BatchSendOutcome::Transport
+                        BatchSendOutcome::Transport {
+                            timed_out: e.is_timeout(),
+                        }
                     });
                     if e.is_timeout() {
                         wit_http::Error::Timeout
@@ -1969,6 +2110,9 @@ impl wit_http::Host for TalosContext {
                 };
 
                 let mut resp_body_bytes = Vec::new();
+                // Released on every early return by `Drop`; kept (the bytes
+                // stay in the returned response) only by `keep()` below.
+                let mut reserved = batch_budget.reservation();
                 let mut stream = response.bytes_stream();
                 use futures_util::StreamExt;
                 while let Some(chunk_result) = stream.next().await {
@@ -1976,8 +2120,12 @@ impl wit_http::Host for TalosContext {
                     if resp_body_bytes.len() + chunk.len() > max_r {
                         return Err(wit_http::Error::Networkerror);
                     }
+                    if !reserved.grow(chunk.len()) {
+                        return Err(wit_http::Error::Networkerror);
+                    }
                     resp_body_bytes.extend_from_slice(&chunk);
                 }
+                reserved.keep();
 
                         Ok(wit_http::Response {
                             status,
@@ -2006,17 +2154,32 @@ impl wit_http::Host for TalosContext {
         // evidence about the host). A host whose entries were ALL cancelled
         // or dry-run has its permit dropped unsettled, which repays any trial
         // token and records neither outcome (see `RequestPermit`).
+        //
+        // A transport failure is weighed by the SAME predicate `fetch` uses
+        // (`send_error_is_host_evidence`): on a non-default port, or a timeout
+        // shorter than the evidence floor, it is no evidence — it neither
+        // opens the circuit nor outranks a status.
         let mut any_dispatch_cancelled = false;
-        for (host, mut permit) in host_permits.drain() {
+        for (key, mut permit) in host_permits.drain() {
             let mut saw_transport = false;
             let mut worst_status: Option<u16> = None;
             let mut saw_no_evidence = false;
             for (idx, _, outcome) in &indexed {
-                if request_hosts.get(*idx).and_then(|h| h.as_deref()) != Some(host.as_str()) {
+                let Some(target) = request_targets.get(*idx).and_then(|t| t.as_ref()) else {
+                    continue;
+                };
+                if target.key() != key.as_str() {
                     continue;
                 }
                 match outcome {
-                    Some(BatchSendOutcome::Transport) => saw_transport = true,
+                    Some(BatchSendOutcome::Transport { timed_out }) => {
+                        if permit.send_error_is_evidence(false, *timed_out, request_timeouts[*idx])
+                        {
+                            saw_transport = true;
+                        } else {
+                            saw_no_evidence = true;
+                        }
+                    }
                     Some(BatchSendOutcome::Status(st)) => {
                         worst_status = Some(worst_status.map_or(*st, |w| w.max(*st)));
                     }
@@ -2071,10 +2234,10 @@ impl wit_http::Host for TalosContext {
                     continue;
                 }
                 // Breaker-refused entries were diagnosed at admission time.
-                if request_hosts
+                if request_targets
                     .get(*idx)
-                    .and_then(|h| h.as_deref())
-                    .is_some_and(|h| breaker_refused.contains(h))
+                    .and_then(|t| t.as_ref())
+                    .is_some_and(|t| breaker_refused.contains(t.key()))
                 {
                     continue;
                 }
@@ -2335,7 +2498,7 @@ mod breaker_permit_leak_path_tests {
         let cb = get_global_circuit_breaker();
 
         // Leg 1 — the breaker is genuinely on this request's path.
-        cb.force_half_open(host, 0);
+        cb.force_half_open(&crate::circuit_breaker::https_breaker_key(host), 0);
         let refused = ctx().fetch(build()).await;
         assert!(
             matches!(refused, Err(wit_http::Error::Networkerror)),
@@ -2345,24 +2508,28 @@ mod breaker_permit_leak_path_tests {
         );
 
         // Leg 2 — the exit under test repays its token.
-        cb.force_half_open(host, 1);
-        assert_eq!(cb.trial_tokens_remaining(host), Some(1));
+        cb.force_half_open(&crate::circuit_breaker::https_breaker_key(host), 1);
+        assert_eq!(
+            cb.trial_tokens_remaining(&crate::circuit_breaker::https_breaker_key(host)),
+            Some(1)
+        );
         let _ = ctx().fetch(build()).await;
 
         assert_eq!(
-            cb.trial_tokens_remaining(host),
+            cb.trial_tokens_remaining(&crate::circuit_breaker::https_breaker_key(host)),
             Some(1),
             "{what}: the half-open trial token was spent and never repaid. Three of \
              these strand the host at half-open-with-zero-tokens for the life of the \
              worker process — HalfOpen has no time bound and nothing refills it."
         );
         assert_eq!(
-            cb.get_state(host).as_deref(),
+            cb.get_state(&crate::circuit_breaker::https_breaker_key(host))
+                .as_deref(),
             Some("half_open"),
             "{what}: the circuit must be exactly where it started"
         );
         assert_eq!(
-            cb.trial_tally(host),
+            cb.trial_tally(&crate::circuit_breaker::https_breaker_key(host)),
             Some((0, 0)),
             "{what}: an abandoned trial must record neither a success nor a failure"
         );
@@ -2459,7 +2626,7 @@ mod breaker_permit_leak_path_tests {
         let user = uuid::Uuid::new_v4();
         seed_dedup(user, host, key, 200, b"cached");
         let cb = get_global_circuit_breaker();
-        cb.force_half_open(host, 0);
+        cb.force_half_open(&crate::circuit_breaker::https_breaker_key(host), 0);
 
         let mut ctx = ctx_for(host);
         ctx.user_id = Some(user);
@@ -2475,11 +2642,14 @@ mod breaker_permit_leak_path_tests {
             .expect("cached hit is served ahead of the breaker");
         assert_eq!(resp.status, 200);
         assert_eq!(
-            cb.trial_tokens_remaining(host),
+            cb.trial_tokens_remaining(&crate::circuit_breaker::https_breaker_key(host)),
             Some(0),
             "no token was touched"
         );
-        assert_eq!(cb.trial_tally(host), Some((0, 0)));
+        assert_eq!(
+            cb.trial_tally(&crate::circuit_breaker::https_breaker_key(host)),
+            Some((0, 0))
+        );
     }
 
     /// The dedup path must still return the cached response — the permit must
@@ -2522,11 +2692,15 @@ mod breaker_permit_leak_path_tests {
         ));
 
         assert_eq!(
-            cb.get_state(host).as_deref(),
+            cb.get_state(&crate::circuit_breaker::https_breaker_key(host))
+                .as_deref(),
             Some("closed"),
             "a guest-side rejection must not move a healthy circuit in any direction"
         );
-        assert_eq!(cb.consecutive_failures(host), Some(0));
+        assert_eq!(
+            cb.consecutive_failures(&crate::circuit_breaker::https_breaker_key(host)),
+            Some(0)
+        );
     }
 }
 
@@ -2839,7 +3013,7 @@ mod fetch_all_budget_and_breaker_tests {
         let cb = get_global_circuit_breaker();
 
         // Refused: half-open with zero tokens.
-        cb.force_half_open(host, 0);
+        cb.force_half_open(&crate::circuit_breaker::https_breaker_key(host), 0);
         let mut c = ctx(&[host], true);
         let out = c
             .fetch_all(vec![post_to(host, "a"), post_to(host, "b")])
@@ -2858,7 +3032,7 @@ mod fetch_all_budget_and_breaker_tests {
 
         // Admitted: ONE token for the whole batch, repaid because dry-run
         // produced no evidence about the host.
-        cb.force_half_open(host, 1);
+        cb.force_half_open(&crate::circuit_breaker::https_breaker_key(host), 1);
         let mut c = ctx(&[host], true);
         let out = c
             .fetch_all(vec![post_to(host, "a"), post_to(host, "b")])
@@ -2874,11 +3048,14 @@ mod fetch_all_budget_and_breaker_tests {
             "admitted entries are charged"
         );
         assert_eq!(
-            cb.trial_tokens_remaining(host),
+            cb.trial_tokens_remaining(&crate::circuit_breaker::https_breaker_key(host)),
             Some(1),
             "a two-entry batch must spend exactly one trial token and, unsettled, repay it"
         );
-        assert_eq!(cb.trial_tally(host), Some((0, 0)));
+        assert_eq!(
+            cb.trial_tally(&crate::circuit_breaker::https_breaker_key(host)),
+            Some((0, 0))
+        );
     }
 }
 
