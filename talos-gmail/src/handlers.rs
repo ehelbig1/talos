@@ -8,6 +8,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use talos_integration_helpers::api_json::ApiJson;
+use talos_integration_helpers::push_ack::{
+    defer_unreadable_watch, PushIntegration, PushWatchLookup,
+};
 use uuid::Uuid;
 
 /// Response for OAuth initiation
@@ -772,11 +775,17 @@ pub async fn pubsub_push_handler(
                 email = %notification.email_address,
                 "gmail pubsub: no active watch; acking"
             );
-            return StatusCode::OK;
+            return PushWatchLookup::Absent.status();
         }
         Err(e) => {
-            tracing::error!(error = %e, "gmail pubsub: lookup failed");
-            return StatusCode::OK;
+            // The lookup did not ANSWER — the watch may well exist. Acking
+            // would discard this delivery permanently, and this is the
+            // platform's busiest inbound path (pa-ask-email was 5 805 of
+            // 11 275 executions over the 30 days to 2026-09-25, 51%), so the
+            // dropped push is an inbound question nobody ever sees. 503 makes
+            // Pub/Sub redeliver within its retention.
+            tracing::error!(error = %e, "gmail pubsub: watch lookup unreadable; deferring");
+            return defer_unreadable_watch(PushIntegration::Gmail);
         }
     };
 
