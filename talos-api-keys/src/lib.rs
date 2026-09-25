@@ -73,6 +73,32 @@ const _: () = assert!(
      key-format migration; existing keys were hashed with the old layout)"
 );
 
+/// Failed validations a key prefix may spend per [`FAILURE_WINDOW`] before
+/// the legacy bcrypt path refuses it.
+const FAILURE_LIMIT: usize = 60;
+const FAILURE_WINDOW: StdDuration = StdDuration::from_secs(60);
+/// Bound on the in-memory limiter map.
+const RATE_LIMITER_MAX_ENTRIES: usize = 10_000;
+/// Minimum seconds between two `last_used_at` / `usage_count` writes per key.
+const USAGE_WRITE_INTERVAL_SECS: i32 = 60;
+
+/// SHA-256 hex digest of a full API key, as stored in `api_keys.key_digest`.
+/// A plain hash is sufficient: the key carries 256 random bits, so there is
+/// nothing for a slow or keyed hash to protect against brute force.
+#[must_use]
+pub fn api_key_digest(full_key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(full_key.as_bytes()))
+}
+
+/// Constant-time equality of a stored and a presented digest.
+#[must_use]
+pub fn digest_matches(stored: &str, presented: &str) -> bool {
+    use subtle::ConstantTimeEq;
+    stored.len() == presented.len()
+        && stored.as_bytes().ct_eq(presented.as_bytes()).unwrap_u8() == 1
+}
+
 pub struct ApiKeyService {
     db_pool: Pool<Postgres>,
     // Simple in‑memory rate limiter: prefix -> (count, window_start)
@@ -281,17 +307,20 @@ impl ApiKeyService {
 
         // Insert into database and return the ID and expires_at using RETURNING
         // This avoids the N+1 query problem of fetching all keys to find the new one
-        let record = sqlx::query!(
-            "INSERT INTO api_keys (user_id, name, key_hash, key_prefix, scopes, expires_at)
-             VALUES ($1, $2, $3, $4, $5, $6)
+        // `key_hash` (bcrypt) is still written so a controller rolled back to
+        // a bcrypt-only verifier keeps accepting keys minted by this one.
+        let (record_id, record_expires_at): (Uuid, Option<DateTime<Utc>>) = sqlx::query_as(
+            "INSERT INTO api_keys (user_id, name, key_hash, key_digest, key_prefix, scopes, expires_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
              RETURNING id, expires_at",
-            user_id,
-            name,
-            key_hash,
-            prefix,
-            &scope_strings[..],
-            expires_at
         )
+        .bind(user_id)
+        .bind(name)
+        .bind(&key_hash)
+        .bind(api_key_digest(&full_key))
+        .bind(&prefix)
+        .bind(&scope_strings[..])
+        .bind(expires_at)
         .fetch_one(&mut *tx)
         .await
         .context("Failed to create API key")?;
@@ -300,7 +329,7 @@ impl ApiKeyService {
             &mut tx,
             user_id,
             "api_key_created",
-            record.id,
+            record_id,
             &format!("API key '{}' created", name),
             serde_json::json!({ "name": name, "scopes": scope_strings }),
         )
@@ -313,16 +342,21 @@ impl ApiKeyService {
         tracing::info!("Created API key '{}' for user {}", name, user_id);
 
         // Return the full key (only time it's returned!) along with metadata
-        Ok((full_key, record.id, record.expires_at))
+        Ok((full_key, record_id, record_expires_at))
     }
 
-    /// Validate an API key and return the user_id and scopes
+    /// Validate an API key and return the user_id and scopes.
+    ///
+    /// 2026-09-26: a key is checked by a constant-time compare of its SHA-256
+    /// digest (`api_keys.key_digest`), not bcrypt on every request — the key
+    /// is 256 random bits, so a slow hash buys nothing and cost ~100 ms of CPU
+    /// per authenticated call. Rows minted before the digest existed are
+    /// bcrypt-verified ONCE and upgraded in place. The per-prefix limiter now
+    /// counts FAILED validations only: a correct key is never limited (it was
+    /// capped at 60/min, and anyone who knew the visible prefix could spend
+    /// that budget), and the budget still guards the legacy bcrypt path. A key
+    /// whose owner is deactivated no longer validates.
     pub async fn validate_key(&self, api_key: &str) -> Result<(Uuid, Vec<ApiKeyScope>)> {
-        // ---- Rate limiting ---------------------------------------------------
-        // Simple token bucket: max 60 requests per minute per key prefix.
-        const LIMIT: usize = 60;
-        const WINDOW: StdDuration = StdDuration::from_secs(60);
-
         // Constant-time format check against the known key prefix to prevent
         // timing-based enumeration of valid vs. invalid key formats.
         use subtle::ConstantTimeEq;
@@ -345,80 +379,50 @@ impl ApiKeyService {
             return Err(anyhow!("Invalid API key format"));
         }
 
-        // Rate limit check/update with Redis fallback.
-        // First try distributed rate limiting via Redis.
-        if let Some(redis) = &self.redis_client {
-            match self.check_rate_limit_redis(prefix.clone(), redis).await {
-                Ok(true) => {
-                    tracing::warn!("API key rate limit exceeded for prefix {}", prefix);
-                    talos_metrics::record_api_key_validation(
-                        talos_metrics::ApiKeyValidation::RateLimited,
-                    );
-                    talos_metrics::record_rate_limit_hit(talos_metrics::RateLimitKind::ApiKey);
-                    return Err(anyhow!("Rate limit exceeded"));
-                }
-                Ok(false) => {} // Rate limit OK, continue
-                Err(e) => {
-                    tracing::warn!(
-                        "Redis rate limit check failed, falling back to in-memory: {}",
-                        e
-                    );
-                    // Fall through to in-memory check
-                }
+        // Candidates with this prefix whose OWNER is still active.
+        let keys: Vec<(
+            Uuid,
+            Uuid,
+            String,
+            Option<String>,
+            Vec<String>,
+            Option<DateTime<Utc>>,
+        )> = sqlx::query_as(
+            "SELECT k.id, k.user_id, k.key_hash, k.key_digest, k.scopes, k.expires_at
+                 FROM api_keys k
+                 JOIN users u ON u.id = k.user_id AND u.is_active = true
+                 WHERE k.key_prefix = $1 AND k.is_active = true",
+        )
+        .bind(&prefix)
+        .fetch_all(&self.db_pool)
+        .await?;
+
+        // `expired` is reported only when every candidate was past its expiry
+        // — see `talos_metrics::ApiKeyValidation`.
+        let now = Utc::now();
+        let presented = api_key_digest(api_key);
+        let mut expired_seen = false;
+        let mut live = Vec::with_capacity(keys.len());
+        for k in keys {
+            if k.5.is_some_and(|e| e < now) {
+                expired_seen = true;
+            } else {
+                live.push(k);
             }
         }
 
-        // Fall back to in-memory rate limiting.
-        {
-            let mut map = self.rate_limiter.lock().await;
+        let mut matched = live
+            .iter()
+            .find(|k| {
+                k.3.as_deref()
+                    .is_some_and(|d| digest_matches(d, &presented))
+            })
+            .map(|k| (k.0, k.1, k.4.clone()));
 
-            // Prevent unbounded memory growth: cleanup BEFORE insertion
-            // This ensures we don't grow beyond 10k entries even briefly
-            if map.len() >= 10000 {
-                // Retain only entries within the time window
-                let now = Instant::now();
-                map.retain(|_, (_, start)| now.duration_since(*start) <= WINDOW);
-
-                // L-18: if still at capacity after cleanup, evict the
-                // OLDEST entry rather than rejecting NEW prefixes.
-                // Pre-fix, a new legitimate API key minted under load
-                // would be locked out for the full window because the
-                // map was full of stale prefixes from past bursts.
-                // Drop-oldest preserves capacity for the new prefix and
-                // (worst case) recreates an evicted prefix's counter on
-                // its next request — which is benign: the worst that
-                // happens is one bonus request slips through before the
-                // counter ramps back up. Production should always use
-                // Redis (line above this branch).
-                if map.len() >= 10000 && !map.contains_key(&prefix) {
-                    if let Some(oldest_key) = map
-                        .iter()
-                        .min_by_key(|(_, (_, start))| *start)
-                        .map(|(k, _)| k.clone())
-                    {
-                        map.remove(&oldest_key);
-                        tracing::warn!(
-                            target: "talos_api_keys",
-                            event_kind = "rate_limiter_evicted_oldest",
-                            evicted = %oldest_key,
-                            "API key rate limiter at cap; evicted oldest prefix to admit new"
-                        );
-                    } else {
-                        // Map is genuinely empty after retain — should
-                        // not happen given len>=10000 above, but be
-                        // defensive.
-                        return Err(anyhow!("Rate limiter overloaded — try again shortly"));
-                    }
-                }
-            }
-
-            let entry = map.entry(prefix.clone()).or_insert((0, Instant::now()));
-            let (ref mut count, ref mut start) = *entry;
-            if start.elapsed() > WINDOW {
-                *count = 0;
-                *start = Instant::now();
-            }
-            if *count >= LIMIT {
+        // Legacy rows (no digest yet): bcrypt, behind the failure budget.
+        let legacy: Vec<_> = live.iter().filter(|k| k.3.is_none()).collect();
+        if matched.is_none() && !legacy.is_empty() {
+            if self.failures_exceeded(&prefix).await {
                 tracing::warn!("API key rate limit exceeded for prefix {}", prefix);
                 talos_metrics::record_api_key_validation(
                     talos_metrics::ApiKeyValidation::RateLimited,
@@ -426,145 +430,181 @@ impl ApiKeyService {
                 talos_metrics::record_rate_limit_hit(talos_metrics::RateLimitKind::ApiKey);
                 return Err(anyhow!("Rate limit exceeded"));
             }
-            *count += 1;
-        }
-
-        // Find keys with matching prefix
-        let keys = sqlx::query!(
-            "SELECT id, user_id, key_hash, scopes, expires_at, is_active
-             FROM api_keys
-             WHERE key_prefix = $1 AND is_active = true",
-            prefix
-        )
-        .fetch_all(&self.db_pool)
-        .await?;
-
-        // Try to verify against each key with this prefix. `expired` is
-        // reported only when every candidate was past its expiry — see
-        // `talos_metrics::ApiKeyValidation`.
-        let mut expired_seen = false;
-        for key_record in keys {
-            // Check expiration
-            if let Some(expires_at) = key_record.expires_at {
-                if expires_at < Utc::now() {
-                    expired_seen = true;
-                    continue;
-                }
-            }
-
-            // Verify hash (offloaded to blocking thread pool to avoid blocking async executor)
-            //
-            // MCP-1099 (2026-05-16): log both failure paths distinctly,
-            // mirroring MCP-873's MCP-auth fix. Pre-fix the outer + inner
-            // `.unwrap_or(false)` collapsed BOTH spawn-blocking JoinError
-            // (thread panic — operator-actionable runtime issue) AND
-            // bcrypt::verify Err (malformed stored hash — DB corruption
-            // or schema drift) into a silent mismatch. Symptom: every
-            // affected user got a 401 with no operator signal that the
-            // underlying `api_keys.key_hash` column had a broken row.
-            // We continue past per-key failures (other keys with the
-            // same prefix may verify cleanly) but emit `target =
-            // "talos_audit"` WARNs so SIEM/dashboards see the dual-
-            // failure class. Sibling discipline to the auth_audit_log
-            // + secret_audit_log writers.
-            let api_key_owned = api_key.to_string();
-            let key_hash_clone = key_record.key_hash.clone();
-            let key_id_for_log = key_record.id;
-            let join_result =
-                tokio::task::spawn_blocking(move || verify(&api_key_owned, &key_hash_clone)).await;
-            let hash_match = match join_result {
-                Ok(Ok(b)) => b,
-                Ok(Err(e)) => {
-                    tracing::warn!(
-                        target: "talos_audit",
-                        api_key_id = %key_id_for_log,
-                        error = %e,
-                        "api-key bcrypt::verify failed (possibly malformed stored hash) — skipping this candidate"
-                    );
-                    false
-                }
-                Err(e) => {
-                    tracing::error!(
-                        target: "talos_audit",
-                        api_key_id = %key_id_for_log,
-                        error = %e,
-                        "api-key bcrypt spawn_blocking JoinError (thread panic) — skipping this candidate"
-                    );
-                    false
-                }
-            };
-            if hash_match {
-                // Update last used and verify it's still active (prevent TOCTOU)
-                let update_result = sqlx::query(
-                    "UPDATE api_keys
-                     SET last_used_at = NOW(), usage_count = usage_count + 1
-                     WHERE id = $1 AND is_active = true",
-                )
-                .bind(key_record.id)
-                .execute(&self.db_pool)
+            for key_record in legacy {
+                // MCP-1099: a JoinError (thread panic) and a bcrypt Err
+                // (malformed stored hash) are logged distinctly and skip
+                // this candidate; other keys with the prefix may verify.
+                let api_key_owned = zeroize::Zeroizing::new(api_key.to_string());
+                let key_hash_clone = key_record.2.clone();
+                let key_id_for_log = key_record.0;
+                let join_result = tokio::task::spawn_blocking(move || {
+                    verify(api_key_owned.as_str(), &key_hash_clone)
+                })
                 .await;
-
-                match update_result {
-                    Ok(res) if res.rows_affected() == 0 => {
-                        tracing::warn!("API key was deactivated during validation");
-                        talos_metrics::record_api_key_validation(
-                            talos_metrics::ApiKeyValidation::Invalid,
+                let hash_match = match join_result {
+                    Ok(Ok(b)) => b,
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            target: "talos_audit",
+                            api_key_id = %key_id_for_log,
+                            error = %e,
+                            "api-key bcrypt::verify failed (possibly malformed stored hash) — skipping this candidate"
                         );
-                        return Err(anyhow!("Invalid or expired API key"));
+                        false
                     }
                     Err(e) => {
-                        // Fail closed: if we can't atomically verify the key is
-                        // still active, reject it. A transient DB error is safer
-                        // to treat as a rejection than to allow an unverified key.
-                        tracing::warn!("API key atomic verification failed: {}", e);
-                        return Err(anyhow!("API key verification failed"));
+                        tracing::error!(
+                            target: "talos_audit",
+                            api_key_id = %key_id_for_log,
+                            error = %e,
+                            "api-key bcrypt spawn_blocking JoinError (thread panic) — skipping this candidate"
+                        );
+                        false
                     }
-                    Ok(_) => {} // Key verified and usage recorded atomically
-                }
-
-                // Parse scopes — unknown scope strings are warned and dropped.
-                // In production, any unrecognized scope causes the key to be
-                // rejected entirely (fail-closed) to prevent privilege confusion.
-                let mut scopes: Vec<ApiKeyScope> = Vec::new();
-                let mut has_unknown_scope = false;
-                for s in &key_record.scopes {
-                    match ApiKeyScope::from_string(s) {
-                        Some(scope) => scopes.push(scope),
-                        None => {
-                            has_unknown_scope = true;
-                            tracing::warn!(
-                                key_id = %key_record.id,
-                                scope = s.as_str(),
-                                "API key has unrecognized scope in database"
-                            );
-                        }
+                };
+                if hash_match {
+                    // Upgrade once; later validations take the digest path.
+                    if let Err(e) = sqlx::query(
+                        "UPDATE api_keys SET key_digest = $2 WHERE id = $1 AND key_digest IS NULL",
+                    )
+                    .bind(key_record.0)
+                    .bind(&presented)
+                    .execute(&self.db_pool)
+                    .await
+                    {
+                        tracing::warn!(
+                            api_key_id = %key_record.0,
+                            error = %e,
+                            "api-key digest upgrade failed; the key stays on the bcrypt path"
+                        );
                     }
+                    matched = Some((key_record.0, key_record.1, key_record.4.clone()));
+                    break;
                 }
-                if has_unknown_scope && talos_config::is_production() {
-                    tracing::error!(
-                        key_id = %key_record.id,
-                        "Rejecting API key with invalid scopes in production (fail-closed)"
-                    );
-                    talos_metrics::record_api_key_validation(
-                        talos_metrics::ApiKeyValidation::Invalid,
-                    );
-                    return Err(anyhow!("API key configuration error — contact support"));
-                }
-
-                talos_metrics::record_api_key_validation(talos_metrics::ApiKeyValidation::Valid);
-                return Ok((key_record.user_id, scopes));
-            } else {
-                tracing::warn!("API key hash mismatch for prefix {}", prefix);
             }
         }
 
-        tracing::warn!("API key validation failed: no matching active key");
-        talos_metrics::record_api_key_validation(if expired_seen {
-            talos_metrics::ApiKeyValidation::Expired
-        } else {
-            talos_metrics::ApiKeyValidation::Invalid
-        });
-        Err(anyhow!("Invalid or expired API key"))
+        let Some((key_id, user_id, stored_scopes)) = matched else {
+            self.charge_failure(&prefix).await;
+            tracing::warn!("API key validation failed: no matching active key");
+            talos_metrics::record_api_key_validation(if expired_seen {
+                talos_metrics::ApiKeyValidation::Expired
+            } else {
+                talos_metrics::ApiKeyValidation::Invalid
+            });
+            return Err(anyhow!("Invalid or expired API key"));
+        };
+
+        // Usage bookkeeping, at most once per `USAGE_WRITE_INTERVAL_SECS` per
+        // key: a write per request was a row update on every authenticated
+        // call. `usage_count` therefore counts those writes, not requests. A
+        // failed write fails closed (a database we cannot write is not one we
+        // trust to have answered the read above).
+        if let Err(e) = sqlx::query(
+            "UPDATE api_keys
+             SET last_used_at = NOW(), usage_count = usage_count + 1
+             WHERE id = $1 AND is_active = true
+               AND (last_used_at IS NULL
+                    OR last_used_at < NOW() - make_interval(secs => $2::int))",
+        )
+        .bind(key_id)
+        .bind(USAGE_WRITE_INTERVAL_SECS)
+        .execute(&self.db_pool)
+        .await
+        {
+            tracing::warn!("API key usage write failed: {}", e);
+            return Err(anyhow!("API key verification failed"));
+        }
+
+        // Parse scopes — unknown scope strings are warned and dropped.
+        // In production, any unrecognized scope causes the key to be
+        // rejected entirely (fail-closed) to prevent privilege confusion.
+        let mut scopes: Vec<ApiKeyScope> = Vec::new();
+        let mut has_unknown_scope = false;
+        for s in &stored_scopes {
+            match ApiKeyScope::from_string(s) {
+                Some(scope) => scopes.push(scope),
+                None => {
+                    has_unknown_scope = true;
+                    tracing::warn!(
+                        key_id = %key_id,
+                        scope = s.as_str(),
+                        "API key has unrecognized scope in database"
+                    );
+                }
+            }
+        }
+        if has_unknown_scope && talos_config::is_production() {
+            tracing::error!(
+                key_id = %key_id,
+                "Rejecting API key with invalid scopes in production (fail-closed)"
+            );
+            talos_metrics::record_api_key_validation(talos_metrics::ApiKeyValidation::Invalid);
+            return Err(anyhow!("API key configuration error — contact support"));
+        }
+
+        talos_metrics::record_api_key_validation(talos_metrics::ApiKeyValidation::Valid);
+        Ok((user_id, scopes))
+    }
+
+    /// Has `prefix` spent its failed-validation budget in the current window?
+    /// Redis first (fleet-wide); the in-memory map when Redis is absent or
+    /// fails.
+    async fn failures_exceeded(&self, prefix: &str) -> bool {
+        if let Some(redis) = &self.redis_client {
+            match Self::redis_failures(prefix, redis, false).await {
+                Ok(n) => return n >= FAILURE_LIMIT as i64,
+                Err(e) => tracing::warn!(
+                    "Redis rate limit check failed, falling back to in-memory: {}",
+                    e
+                ),
+            }
+        }
+        let map = self.rate_limiter.lock().await;
+        map.get(prefix).is_some_and(|(count, start)| {
+            start.elapsed() <= FAILURE_WINDOW && *count >= FAILURE_LIMIT
+        })
+    }
+
+    /// Count one failed validation against `prefix`.
+    async fn charge_failure(&self, prefix: &str) {
+        if let Some(redis) = &self.redis_client {
+            match Self::redis_failures(prefix, redis, true).await {
+                Ok(_) => return,
+                Err(e) => tracing::warn!(
+                    "Redis rate limit charge failed, falling back to in-memory: {}",
+                    e
+                ),
+            }
+        }
+        let mut map = self.rate_limiter.lock().await;
+        // Prevent unbounded memory growth: cleanup BEFORE insertion.
+        if map.len() >= RATE_LIMITER_MAX_ENTRIES {
+            let now = Instant::now();
+            map.retain(|_, (_, start)| now.duration_since(*start) <= FAILURE_WINDOW);
+            // L-18: still at capacity — evict the OLDEST entry rather than
+            // refusing to track a new prefix.
+            if map.len() >= RATE_LIMITER_MAX_ENTRIES && !map.contains_key(prefix) {
+                if let Some(oldest_key) = map
+                    .iter()
+                    .min_by_key(|(_, (_, start))| *start)
+                    .map(|(k, _)| k.clone())
+                {
+                    map.remove(&oldest_key);
+                    tracing::warn!(
+                        target: "talos_api_keys",
+                        event_kind = "rate_limiter_evicted_oldest",
+                        evicted = %oldest_key,
+                        "API key rate limiter at cap; evicted oldest prefix to admit new"
+                    );
+                }
+            }
+        }
+        let entry = map.entry(prefix.to_string()).or_insert((0, Instant::now()));
+        if entry.1.elapsed() > FAILURE_WINDOW {
+            *entry = (0, Instant::now());
+        }
+        entry.0 += 1;
     }
 
     /// Get a specific API key
@@ -795,13 +835,14 @@ impl ApiKeyService {
         }
 
         let new_id: Uuid = sqlx::query_scalar(
-            "INSERT INTO api_keys (user_id, name, key_hash, key_prefix, scopes, expires_at)
-             VALUES ($1, $2, $3, $4, $5, $6)
+            "INSERT INTO api_keys (user_id, name, key_hash, key_digest, key_prefix, scopes, expires_at)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)
              RETURNING id",
         )
         .bind(user_id)
         .bind(&old_key.name)
         .bind(&key_hash)
+        .bind(api_key_digest(&full_key))
         .bind(&prefix)
         .bind(&scope_strings[..])
         .bind(expires_at)
@@ -864,34 +905,27 @@ impl ApiKeyService {
         .context("Failed to record the API key lifecycle event")
     }
 
-    /// Check rate limit using Redis (distributed across instances).
-    /// Returns true if rate limit exceeded, false if allowed.
+    /// Read (`charge = false`) or increment (`charge = true`) the fleet-wide
+    /// failed-validation count for `prefix`.
     ///
-    /// MCP-455: pre-fix INCR and EXPIRE were two separate commands; if
-    /// the EXPIRE leg failed transiently (network blip, mid-flight
-    /// reconnect, server shutdown), INCR had already created the key
-    /// with NO TTL. Subsequent requests would see `count > 1`, skip
-    /// EXPIRE, and the key would persist forever — permanently
-    /// rate-limiting the affected key_prefix until an operator
-    /// manually deleted the Redis key. The L-19 review fix added a
-    /// warn-log on EXPIRE failure but didn't close the underlying
-    /// race. Move to an EVAL'd Lua script so both ops execute
-    /// atomically on the server. Same fix as MCP-442 in
-    /// `talos-rate-limit::middleware::check_redis`.
-    async fn check_rate_limit_redis(
-        &self,
-        prefix: String,
-        redis: &Arc<redis::Client>,
-    ) -> Result<bool> {
-        const LIMIT: usize = 60;
-        const WINDOW_SECS: u64 = 60;
-
+    /// MCP-455: the increment is an EVAL'd Lua script so INCR and EXPIRE run
+    /// atomically — a separate EXPIRE that failed left a key with no TTL that
+    /// rate-limited the prefix forever.
+    async fn redis_failures(prefix: &str, redis: &Arc<redis::Client>, charge: bool) -> Result<i64> {
         let mut conn = redis
             .get_multiplexed_async_connection()
             .await
             .context("Failed to get Redis connection")?;
 
         let key = format!("api_key_rate_limit:{}", prefix);
+        if !charge {
+            let count: Option<i64> = redis::cmd("GET")
+                .arg(&key)
+                .query_async(&mut conn)
+                .await
+                .context("Redis rate-limit read failed")?;
+            return Ok(count.unwrap_or(0));
+        }
 
         const RATE_LIMIT_SCRIPT: &str = r#"
             local count = redis.call('INCR', KEYS[1])
@@ -904,12 +938,11 @@ impl ApiKeyService {
             .arg(RATE_LIMIT_SCRIPT)
             .arg(1)
             .arg(&key)
-            .arg(WINDOW_SECS as i64)
+            .arg(FAILURE_WINDOW.as_secs() as i64)
             .query_async(&mut conn)
             .await
             .context("Redis rate-limit script failed")?;
-
-        Ok(count > LIMIT as i64)
+        Ok(count)
     }
 
     /// Clean up expired API keys.
@@ -978,6 +1011,39 @@ mod tests {
 
         // Keys should be long enough (prefix + secret)
         assert!(key1.len() > 50);
+    }
+
+    #[test]
+    fn the_digest_is_sha256_hex_and_compares_in_constant_time() {
+        // SHA-256("abc"), the FIPS 180-2 test vector.
+        assert_eq!(
+            api_key_digest("abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let (key, _) = ApiKeyService::generate_key();
+        let d = api_key_digest(&key);
+        assert!(digest_matches(&d, &api_key_digest(&key)));
+        let (other, _) = ApiKeyService::generate_key();
+        assert!(!digest_matches(&d, &api_key_digest(&other)));
+        assert!(!digest_matches(&d, &d[..63]));
+    }
+
+    /// Only FAILED validations spend the per-prefix budget: 60 charges trip
+    /// it, and a prefix nobody failed on is never over.
+    #[tokio::test]
+    async fn the_limiter_counts_failures_only() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@localhost/unused")
+            .expect("lazy pool");
+        let svc = ApiKeyService::new(pool, None);
+        assert!(!svc.failures_exceeded("aaaaaaaa").await);
+        for _ in 0..FAILURE_LIMIT - 1 {
+            svc.charge_failure("aaaaaaaa").await;
+        }
+        assert!(!svc.failures_exceeded("aaaaaaaa").await);
+        svc.charge_failure("aaaaaaaa").await;
+        assert!(svc.failures_exceeded("aaaaaaaa").await);
+        assert!(!svc.failures_exceeded("bbbbbbbb").await);
     }
 
     #[test]

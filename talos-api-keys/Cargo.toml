@@ -26,6 +26,7 @@ talos-dlp-provider = { path = "../talos-dlp-provider" }
 tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
 tracing.workspace = true
 uuid.workspace = true
+zeroize = "1.8"
 
 [lints]
 workspace = true
