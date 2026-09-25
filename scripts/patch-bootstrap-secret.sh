@@ -145,15 +145,22 @@ if ! command -v jq >/dev/null 2>&1; then
     exit 1
 fi
 
+# Values never go on a command line (`--arg v "$secret"` put every value in
+# jq's argv, and `patch -p "$json"` in kubectl's — both world-readable via
+# /proc/<pid>/cmdline and `ps`). Each value is staged in a 0600 file inside a
+# private mktemp dir, read by `jq --rawfile`, and the patch reaches kubectl as
+# a 0600 `--patch-file`. The dir is removed on every exit path.
+STAGE_DIR="$(umask 077; mktemp -d)"
+trap 'rm -rf "$STAGE_DIR"' EXIT
 jq_args=()
 jq_filter='{stringData: {}}'
 for i in "${!key_order[@]}"; do
     k="${key_order[$i]}"
-    v="${pairs[$k]}"
-    jq_args+=(--arg "k$i" "$k" --arg "v$i" "$v")
+    (umask 077; printf '%s' "${pairs[$k]}" > "$STAGE_DIR/v$i")
+    jq_args+=(--arg "k$i" "$k" --rawfile "v$i" "$STAGE_DIR/v$i")
     jq_filter+=" | .stringData[\$k$i] = \$v$i"
 done
-patch_json=$(jq -n "${jq_args[@]}" "$jq_filter")
+(umask 077; jq -n "${jq_args[@]}" "$jq_filter" > "$STAGE_DIR/patch.json")
 
 say "Patching $NAMESPACE/$SECRET with ${#pairs[@]} key(s):"
 for k in "${key_order[@]}"; do
@@ -162,7 +169,7 @@ for k in "${key_order[@]}"; do
     printf '  %s%s%s = <%d chars>\n' "$DIM" "$k" "$RESET" "${#pairs[$k]}"
 done
 
-if ! "${KUBECTL[@]}" -n "$NAMESPACE" patch secret "$SECRET" -p "$patch_json"; then
+if ! "${KUBECTL[@]}" -n "$NAMESPACE" patch secret "$SECRET" --patch-file "$STAGE_DIR/patch.json"; then
     err "Patch failed."
     exit 1
 fi
