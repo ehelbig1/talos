@@ -24,14 +24,13 @@ talos-config = { path = "../talos-config" }
 talos-metrics = { path = "../talos-metrics" }
 talos-secrets-manager = { path = "../talos-secrets-manager" }
 subtle = "2.4"
+# `spawn_blocking` for the bcrypt backup-code hashes and verifies.
+tokio.workspace = true
 totp-rs = "5.7"
 tracing.workspace = true
 urlencoding = "2.1"
 uuid.workspace = true
 zeroize = "1.8"
-
-[dev-dependencies]
-tokio.workspace = true
 
 [lints]
 workspace = true
