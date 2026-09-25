@@ -15,9 +15,12 @@
 //! * IPv4-mapped IPv6 (`::ffff:`-prefixed) addresses that resolve to any
 //!   of the above.
 //! * Non-canonical IPv4 encodings (octal `0177.0.0.1`, hex `0x7f.0.0.1`,
-//!   single integer `2130706433`, zero-padded `127.000.000.001`) — these
-//!   would slip past the literal-string blocklist while still resolving
-//!   to private IPs through `getaddrinfo`.
+//!   single integer `2130706433`, zero-padded `127.000.000.001`,
+//!   percent-encoded `%31%32%37.0.0.1`), even for a public address.
+//!
+//! The host is classified as `url::Url` (WHATWG, the parser reqwest uses)
+//! parses it — decoded and normalised — through `talos-ssrf-classify`, so
+//! the check and the connect can never disagree about the destination.
 //!
 //! # What this does NOT defend against
 //!
@@ -30,17 +33,6 @@
 //! later), call this AT FIRE TIME — write-time validation alone leaves a
 //! gap when SSRF rules tighten between write and fire.
 
-use std::str::FromStr;
-
-/// Returns true if `s` looks like an attempt to encode an IPv4 address in a
-/// non-canonical form that the OS resolver (`getaddrinfo`) would still
-/// accept and normalise — octal (`0177.0.0.1`), hex (`0x7f.0.0.1`),
-/// integer (`2130706433`), or zero-padded decimal (`127.000.000.001`).
-///
-/// Bypasses against the literal-string blocklist were the issue: an
-/// attacker could pass `https://0177.0.0.1/` and the host-prefix checks
-/// would let it through, but reqwest → getaddrinfo → connect ends up at
-/// 127.0.0.1. We don't try to *interpret* these — we reject them.
 /// MCP-196 (2026-05-08): RFC 3986 character whitelist. Returns true
 /// for characters that may appear unencoded in a URL — alphanumeric
 /// (unreserved without `-._~`, but `-` and `.` and `_` and `~` are
@@ -81,44 +73,6 @@ fn is_valid_url_char(c: char) -> bool {
         )
 }
 
-pub fn looks_like_obfuscated_ipv4(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
-    }
-    // Single integer encoding: a bare base-10 integer that's actually an IP.
-    // 32-bit unsigned max is 4_294_967_295. Values that fit in u32 are
-    // potential single-int IPv4 encodings; integer 32 alone shouldn't get
-    // misclassified as a hostname.
-    if s.chars().all(|c| c.is_ascii_digit()) && s.len() <= 10 {
-        if let Ok(n) = s.parse::<u64>() {
-            // Anything that fits in u32 is a valid getaddrinfo single-int IPv4.
-            // Single digits are very unlikely to be real hostnames either.
-            if n <= u32::MAX as u64 {
-                return true;
-            }
-        }
-    }
-    // Hex octet form: `0x7f.0.0.1` or full hex `0x7f000001`.
-    if s.contains("0x") || s.contains("0X") {
-        return true;
-    }
-    // Dotted form with a non-canonical octet (leading zero, hex prefix,
-    // out-of-range, or empty between dots). Strict canonical IPv4 always
-    // parses cleanly via `Ipv4Addr::from_str`; if it doesn't and the string
-    // is digits/dots only, it's an obfuscation attempt.
-    let only_digits_and_dots = s.chars().all(|c| c.is_ascii_digit() || c == '.');
-    if only_digits_and_dots && s.contains('.') {
-        // 1) Strict-canonical parser succeeds → not obfuscated.
-        if std::net::Ipv4Addr::from_str(s).is_ok() {
-            return false;
-        }
-        // 2) Same shape but parser rejected (leading-zero octet, bad octet,
-        //    too few/many dots). Treat as an attempt — reject.
-        return true;
-    }
-    false
-}
-
 /// Validates that a URL is safe for outbound HTTP requests (SSRF protection).
 ///
 /// Returns `Ok(())` if the URL is safe, `Err(reason)` if it should be rejected.
@@ -157,213 +111,76 @@ pub fn check_outbound_url_no_ssrf(url: &str) -> Result<(), &'static str> {
         );
     }
 
-    // IPv6 addresses in URLs use bracket notation (RFC 3986): https://[::1]/path
-    //
-    // MCP-505: extract the authority component (before path/query/fragment),
-    // then strip the userinfo (everything before the LAST '@') BEFORE
-    // matching against blocklist patterns. Pre-fix the host extraction
-    // for non-bracketed URLs split on `[/, ?, #, :]` — which preserved
-    // the userinfo as part of the matched "host" string. So
-    // `https://example.com@127.0.0.1/path` extracted
-    // `host = "example.com@127.0.0.1"`, which matches no blocklist
-    // entry — but `url::Url` (used by reqwest internally) parses
-    // `example.com` as userinfo and connects to `127.0.0.1`. Real
-    // SSRF bypass via the userinfo trick (RFC 3986 §3.2.1).
-    let after_scheme = url.trim_start_matches("https://");
+    // Classify the host exactly as reqwest will see it: `url::Url` (WHATWG)
+    // percent-decodes the host and normalises every IPv4 spelling (octal,
+    // hex, integer, trailing dot, `%31%32%37.0.0.1`) to an address. IP-literal
+    // hosts skip the connect-time resolver gate, so this is the only check
+    // they get — classify the PARSED host, never the raw text.
+    let parsed = url::Url::parse(url).map_err(|_| "URL is not a valid absolute URL")?;
+    if parsed.scheme() != "https" {
+        return Err(
+            "URL must use https:// — plaintext HTTP is not permitted for outbound requests",
+        );
+    }
+    classify_url_host(url, parsed.host())
+}
+
+const BLOCKED_DESTINATION: &str =
+    "URL points to a blocked destination (localhost, private IP, or cloud metadata endpoint)";
+const NON_CANONICAL_IPV4: &str =
+    "URL host uses a non-canonical IPv4 encoding (octal, hex, integer, zero-padded, or \
+     percent-encoded). Use a hostname or canonical dotted-decimal form (e.g. 192.0.2.1).";
+
+/// Decide on a parsed URL host. `raw_url` is only used to require that an
+/// IPv4 literal was written canonically.
+fn classify_url_host(raw_url: &str, host: Option<url::Host<&str>>) -> Result<(), &'static str> {
+    match host {
+        None => Err(BLOCKED_DESTINATION),
+        Some(url::Host::Ipv4(addr)) => {
+            if classify_private_ip(std::net::IpAddr::V4(addr)).is_some() {
+                return Err(BLOCKED_DESTINATION);
+            }
+            // A public address spelled non-canonically is still refused: the
+            // spelling has no legitimate use and hides the target from review.
+            if raw_authority_host(raw_url) != addr.to_string() {
+                return Err(NON_CANONICAL_IPV4);
+            }
+            Ok(())
+        }
+        Some(url::Host::Ipv6(addr)) => match classify_private_ip(std::net::IpAddr::V6(addr)) {
+            Some(_) => Err(BLOCKED_DESTINATION),
+            None => Ok(()),
+        },
+        Some(url::Host::Domain(domain)) => {
+            // `url` lowercases and IDNA-normalises domains; a trailing root dot
+            // names the same host.
+            let d = domain.trim_end_matches('.');
+            let blocked = d.is_empty()
+                || d == "localhost"
+                || d.ends_with(".localhost")
+                || d == "metadata"
+                || d == "metadata.google.internal";
+            if blocked {
+                Err(BLOCKED_DESTINATION)
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+/// The host text as written (lowercased), after the LAST `@` of the authority
+/// (RFC 3986 §3.2.1 userinfo) and before any port.
+fn raw_authority_host(url: &str) -> String {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
     let authority_end = after_scheme
         .find(['/', '?', '#'])
         .unwrap_or(after_scheme.len());
     let authority = &after_scheme[..authority_end];
-    // Last '@' in the authority is the userinfo terminator; everything
-    // after it is host + optional :port (or bracketed-IPv6 + :port).
-    let host_and_port: &str = match authority.rfind('@') {
-        Some(at) => &authority[at + 1..],
-        None => authority,
-    };
-    let host = if host_and_port.starts_with('[') {
-        host_and_port
-            .trim_start_matches('[')
-            .split(']')
-            .next()
-            .unwrap_or("")
-            .to_lowercase()
-    } else {
-        host_and_port.split(':').next().unwrap_or("").to_lowercase()
-    };
-
-    if looks_like_obfuscated_ipv4(&host) {
-        return Err(
-            "URL host uses a non-canonical IPv4 encoding (octal, hex, integer, or zero-padded). \
-             Use a hostname or canonical dotted-decimal form (e.g. 192.0.2.1).",
-        );
-    }
-
-    let ipv4_is_blocked = |addr: &str| -> bool {
-        addr == "127.0.0.1"
-            || addr.starts_with("10.")
-            || addr.starts_with("192.168.")
-            || addr.starts_with("169.254.")
-            || (addr.starts_with("172.") && {
-                let oct: u8 = addr
-                    .split('.')
-                    .nth(1)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
-                (16..=31).contains(&oct)
-            })
-            // MCP-542: CGNAT (100.64.0.0/10, RFC 6598). Shared-address-
-            // space for carrier-grade NAT; ALSO used by AWS PrivateLink,
-            // GCP internal load balancers, and other cloud-internal
-            // endpoints. The worker's `classify_private_ip` covers this
-            // (and so does the worker error-sanitiser per MCP-530) but
-            // this canonical SSRF guard didn't — leaving a gap for
-            // background webhook fires that point at cloud-internal
-            // 100.64.x.x services.
-            || (addr.starts_with("100.") && {
-                let oct: u8 = addr
-                    .split('.')
-                    .nth(1)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(0);
-                (64..=127).contains(&oct)
-            })
-    };
-
-    let ipv4_mapped_part: Option<String> = if let Some(rest) = host.strip_prefix("::ffff:") {
-        Some(rest.to_string())
-    } else {
-        host.strip_prefix("0:0:0:0:0:ffff:")
-            .map(|rest| rest.to_string())
-    };
-
-    // If the IPv4-mapped part itself is obfuscated (e.g. ::ffff:0177.0.0.1),
-    // reject before passing it through the literal-prefix block check.
-    if let Some(ref mapped) = ipv4_mapped_part {
-        if looks_like_obfuscated_ipv4(mapped) {
-            return Err(
-                "URL host uses a non-canonical IPv4 encoding (octal, hex, integer, or zero-padded). \
-                 Use a hostname or canonical dotted-decimal form (e.g. 192.0.2.1).",
-            );
-        }
-    }
-
-    let blocked = matches!(
-        host.as_str(),
-        "localhost" | "127.0.0.1" | "::1" | "0.0.0.0"
-            | "0:0:0:0:0:0:0:1"
-            | "169.254.169.254"   // AWS/GCP/Azure metadata
-            | "metadata.google.internal"
-    ) || host.starts_with("127.")  // entire 127.0.0.0/8 loopback range
-        // MCP-1067 (2026-05-15): entire 0.0.0.0/8 IPv4 unspecified
-        // range. Pre-fix only the literal `"0.0.0.0"` exact match
-        // was caught; `0.0.0.1`, `0.0.0.42`, `0.255.255.255` slipped
-        // through. On Linux the kernel routes `0.x.y.z` to
-        // `127.0.0.1` so an attacker who supplies `http://0.0.0.1:8080`
-        // gets loopback access. This is the talos-http-utils sibling
-        // of the worker's MCP-553 fix (`classify_private_ipv4` uses
-        // `addr.is_unspecified()` for the same coverage). Same
-        // hostname false-positive trade-off as `host.starts_with("10.")`
-        // / `host.starts_with("172.")` — defense-in-depth over a rare
-        // legitimate hostname (`0.example.com`).
-        || host.starts_with("0.")
-        || host.starts_with("10.")
-        || host.starts_with("192.168.")
-        || (host.starts_with("172.") && {
-            let oct: u8 = host
-                .split('.')
-                .nth(1)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            (16..=31).contains(&oct)
-        })
-        // MCP-542: CGNAT 100.64.0.0/10. See `ipv4_is_blocked` for
-        // rationale (cloud-internal services frequently live here).
-        || (host.starts_with("100.") && {
-            let oct: u8 = host
-                .split('.')
-                .nth(1)
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            (64..=127).contains(&oct)
-        })
-        // MCP-1071 (2026-05-15): IPv4 multicast (224.0.0.0/4).
-        // Sibling-parity with the worker's `classify_private_ipv4`
-        // (`addr.is_multicast()`) and the WASI socket gate
-        // (`ip.is_multicast()`). Pre-fix ssrf.rs caught IPv6
-        // multicast via the post-parse `v6.is_multicast()` arm but
-        // had no IPv4 equivalent — a controller-side caller
-        // (`talos-execution-orchestration::failure_webhook`,
-        // `talos-engine::approval_gate`, `talos-audit-ledger`,
-        // GraphQL config validation) submitting `http://224.0.0.1/`
-        // (link-local multicast) passed the guard. Threat is bounded
-        // (most VMs don't route multicast) but the three SSRF
-        // surfaces should agree on what's blocked. First-octet
-        // range 224..=239 matches the IANA multicast block.
-        || {
-            let oct: u8 = host
-                .split('.')
-                .next()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(0);
-            (224..=239).contains(&oct)
-        }
-        || host.starts_with("169.254.")
-        || host.starts_with("fc") // IPv6 ULA fc00::/7 (lower half)
-        || host.starts_with("fd") // IPv6 ULA fc00::/7 (upper half)
-        || host.starts_with("fe80") // IPv6 link-local
-        || ipv4_mapped_part
-            .as_deref()
-            .map(ipv4_is_blocked)
-            .unwrap_or(false)
-        || host.is_empty();
-
-    if blocked {
-        return Err(
-            "URL points to a blocked destination (localhost, private IP, or cloud metadata endpoint)",
-        );
-    }
-
-    // MCP-458: parse the host as IPv6 and check `.to_ipv4_mapped()`
-    // to catch the pure-hex IPv4-mapped IPv6 bypass. Pre-fix
-    // `[::ffff:7f00:1]` slipped through every literal-prefix check —
-    // the strip_prefix(`::ffff:`) above produced `7f00:1` which
-    // doesn't match dotted-decimal patterns like `127.` — but the OS
-    // resolves the whole IPv6 to 127.0.0.1 and reqwest connects to
-    // loopback. Cases caught by this gate that string-prefix matches
-    // can't see:
-    //   * `::ffff:7f00:1`        (hex form of ::ffff:127.0.0.1)
-    //   * `::ffff:a00:1`         (hex form of ::ffff:10.0.0.1)
-    //   * `0:0:0:0:0:ffff:7f00:1` (expanded hex form)
-    //   * any compressed-zero form (`0::ffff:7f00:1`, etc.)
-    //
-    // We also reject IPv6 loopback / unspecified / link-local / ULA
-    // here for cases the literal-prefix check missed (e.g.
-    // `[0:0:0:0:0:0:0:1]` vs `[::1]`).
-    // IP-literal hosts skip the resolve-time SSRF gate (reqwest connects to a
-    // literal directly, no DNS), so the canonical classifier is applied here on
-    // the parsed address. This catches every IPv6 spelling of an internal
-    // target — loopback/unspecified/link-local/ULA/site-local, IPv4-mapped
-    // (`::ffff:7f00:1`), and the other IPv4-in-IPv6 transition forms
-    // (IPv4-compatible, NAT64 `64:ff9b::/96`, 6to4 `2002::/16`) that the
-    // string-prefix checks above can't see (MCP-458/542/1068 + the 2026-05-31
-    // transition-form sweep, now in talos-ssrf-classify).
-    if let Ok(v6) = std::net::Ipv6Addr::from_str(&host) {
-        if classify_private_ip(std::net::IpAddr::V6(v6)).is_some() {
-            return Err(
-                "URL points to a blocked destination (localhost, private IP, or cloud metadata endpoint)",
-            );
-        }
-    }
-
-    // Finally: any host that parses as a strict-canonical Ipv4Addr but
-    // wasn't caught above is a public IP we permit. Anything that looked
-    // like dotted decimal but failed the strict parse was already rejected
-    // by `looks_like_obfuscated_ipv4`. No additional canonical-IPv4 work
-    // needed here — kept this comment so future maintainers don't try to
-    // add a second parsing layer.
-    let _ = std::net::Ipv4Addr::from_str(&host).ok();
-
-    Ok(())
+    let host_and_port = authority
+        .rfind('@')
+        .map_or(authority, |at| &authority[at + 1..]);
+    host_and_port.split(':').next().unwrap_or("").to_lowercase()
 }
 
 // The SSRF private-IP classifier is the single source of truth in
@@ -570,16 +387,12 @@ mod tests {
         }
     }
 
-    /// MCP-1071: 240.0.0.0/4 (reserved, not multicast) and the boundary
-    /// `223.255.255.255` and `240.0.0.1` should still PASS — the deny
-    /// is strictly 224..=239 first-octet.
+    /// MCP-1071: the boundary `223.x` stays public. (`240.0.0.0/4` was
+    /// accepted here until 2026-09-26; it is reserved class E and is now
+    /// refused by the shared classifier.)
     #[test]
     fn accepts_addresses_adjacent_to_multicast_range() {
-        for url in [
-            "https://223.0.0.1/",
-            "https://223.255.255.255/",
-            "https://240.0.0.1/",
-        ] {
+        for url in ["https://223.0.0.1/", "https://223.255.255.255/"] {
             assert!(
                 check_outbound_url_no_ssrf(url).is_ok(),
                 "should accept {url} (just outside multicast range)"
@@ -805,5 +618,70 @@ mod tests {
     fn allows_normal_hostname() {
         assert!(check_outbound_url_no_ssrf("https://example.com/").is_ok());
         assert!(check_outbound_url_no_ssrf("https://api.partner.io/v1/foo").is_ok());
+    }
+
+    /// The host is classified as reqwest's `url` parser decodes it, so a
+    /// percent-encoded or otherwise-disguised internal literal cannot pass.
+    #[test]
+    fn rejects_encoded_and_disguised_internal_literals() {
+        for url in [
+            "https://%31%32%37.0.0.1/",
+            "https://127.0.0.1%2e/",
+            "https://127.0.0.1./",
+            "https://%31%36%39.254.169.254/latest/meta-data/",
+            "https://017700000001/",        // octal integer
+            "https://0x7f.1/",              // hex, short form
+            "https://127.1/",               // short dotted form
+            "https://3232235777/",          // 192.168.1.1 as an integer
+            "https://0300.0250.0001.0001/", // 192.168.1.1 octal dotted
+            "https://[::ffff:0:7f00:1]/",   // IPv4-translated loopback
+            "https://[0000:0000:0000:0000:0000:0000:0000:0001]/",
+            "https://[::FFFF:127.0.0.1]/",
+            "https://[64:ff9b::7f00:1]/", // NAT64 loopback
+            "https://[2002:7f00:1::]/",   // 6to4 loopback
+            "https://[fe80::1%25eth0]/",  // zone id
+            "https://localhost./",
+            "https://api.localhost/",
+            "https://METADATA.google.internal./",
+        ] {
+            assert!(
+                check_outbound_url_no_ssrf(url).is_err(),
+                "should reject {url}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_non_canonical_public_ipv4() {
+        // 8.8.8.8 spelled as hex / an integer / percent-encoded.
+        for url in [
+            "https://0x08080808/",
+            "https://134744072/",
+            "https://%38.8.8.8/",
+        ] {
+            let err = check_outbound_url_no_ssrf(url).unwrap_err();
+            assert!(err.contains("non-canonical"), "{url}: {err}");
+        }
+        assert!(check_outbound_url_no_ssrf("https://8.8.8.8/").is_ok());
+    }
+
+    /// Only IP literals are classified by address: a hostname whose text
+    /// happens to start like a private range is an ordinary DNS name (the
+    /// connect-time resolver gates what it resolves to).
+    #[test]
+    fn hostnames_are_not_classified_by_text_prefix() {
+        for url in [
+            "https://fcbarcelona.com/",
+            "https://fd-api.example.com/",
+            "https://10.example.com/",
+        ] {
+            assert!(check_outbound_url_no_ssrf(url).is_ok(), "{url}");
+        }
+    }
+
+    #[test]
+    fn rejects_unparseable_urls() {
+        assert!(check_outbound_url_no_ssrf("https://").is_err());
+        assert!(check_outbound_url_no_ssrf("https://[::1/").is_err());
     }
 }
