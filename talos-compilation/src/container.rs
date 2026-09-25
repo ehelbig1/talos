@@ -20,6 +20,8 @@ use std::path::Path;
 use anyhow::{bail, Context, Result};
 use tokio::process::Command;
 
+use crate::sandbox_run::SandboxCommand;
+
 /// The default container image built by `scripts/build-compiler-image.sh`.
 const DEFAULT_IMAGE: &str = "talos-builder:latest";
 
@@ -105,13 +107,14 @@ const HOST_SPAWN_ENV_ALLOWLIST: &[&str] = &[
     "VIRTUAL_ENV",
 ];
 
-/// Build a HOST-side `Command` whose environment is `env_clear()`ed and then
+/// Build a HOST-side command whose environment is `env_clear()`ed and then
 /// re-populated ONLY from [`HOST_SPAWN_ENV_ALLOWLIST`]. Every host-fallback
 /// spawn in this crate goes through here — `build_command`, `audit_command`,
 /// `tool_command` — so a fourth spawn site cannot quietly inherit the
 /// controller's credentials again. Callers may still `.env(...)` on top
-/// (e.g. `CARGO_TARGET_DIR`).
-pub fn host_command(program: &str) -> Command {
+/// (e.g. `CARGO_TARGET_DIR`). It is a [`SandboxCommand`], so it too can only
+/// be started through the bounded `run` (2026-09-25).
+pub(crate) fn host_command(program: &str) -> SandboxCommand {
     let mut cmd = Command::new(program);
     cmd.env_clear();
     for key in HOST_SPAWN_ENV_ALLOWLIST {
@@ -119,7 +122,7 @@ pub fn host_command(program: &str) -> Command {
             cmd.env(key, v);
         }
     }
-    cmd
+    SandboxCommand::host(cmd)
 }
 
 /// MCP-753 (2026-05-13): read an env var and treat empty strings as
@@ -375,7 +378,7 @@ fn detect_runtime() -> Option<&'static str> {
     None
 }
 
-/// Build a [`Command`] that runs `cargo` inside an isolated container.
+/// Build a [`SandboxCommand`] that runs `cargo` inside an isolated container.
 ///
 /// The returned command is pre-configured with security flags but has no
 /// arguments yet — the caller appends `cargo component build ...` or
@@ -396,7 +399,7 @@ fn detect_runtime() -> Option<&'static str> {
 /// # Fallback
 ///
 /// Decided by [`sandbox_decision`]: a host run (container mode off, or no
-/// runtime) outside production, or in production with the ack token, returns a plain `Command::new("cargo")`
+/// runtime) outside production, or in production with the ack token, returns a scrubbed `host_command("cargo")`
 /// that runs directly on the host (with `CARGO_TARGET_DIR` set to the same
 /// per-user cache when provided, so the host path gets identical reuse).
 pub fn build_command(
@@ -404,7 +407,7 @@ pub fn build_command(
     cargo_registry_cache: &Path,
     wit_dir: &Path,
     target_cache: Option<&Path>,
-) -> Result<Command> {
+) -> Result<SandboxCommand> {
     let Some(runtime) = resolve_sandbox_runtime("build")? else {
         let mut cmd = host_command("cargo");
         if let Some(cache) = target_cache {
@@ -468,9 +471,11 @@ pub fn build_command(
         format!("{}:/cache/target:rw", cache_abs.display())
     });
 
-    let mut cmd = Command::new(runtime);
+    // `run --name talos-sandbox-<uuid> --label talos.sandbox=1` — the name
+    // is what lets a timed-out or cancelled build be removed (see
+    // `sandbox_run`).
+    let mut cmd = SandboxCommand::container_run(runtime);
     cmd.args([
-        "run",
         "--rm",
         // SECURITY: No network access — proc macros cannot phone home
         "--network=none",
@@ -521,7 +526,7 @@ pub fn build_command(
     Ok(cmd)
 }
 
-/// Build a [`Command`] for running `cargo audit` inside the container.
+/// Build a [`SandboxCommand`] for running `cargo audit` inside the container.
 ///
 /// Identical security flags as [`build_command`] including `--network=none`.
 /// The RustSec advisory database is pre-fetched into the talos-builder
@@ -531,7 +536,7 @@ pub fn build_command(
 /// the path is explicit, matching the controller image's identical
 /// stable bake-in. If you set `TALOS_BUILDER_IMAGE` to a custom image,
 /// bake the DB at the same path or every audit fails closed.
-pub fn audit_command(workspace: &Path, cargo_registry_cache: &Path) -> Result<Command> {
+pub fn audit_command(workspace: &Path, cargo_registry_cache: &Path) -> Result<SandboxCommand> {
     let Some(runtime) = resolve_sandbox_runtime("audit")? else {
         return Ok(host_command("cargo"));
     };
@@ -563,9 +568,8 @@ pub fn audit_command(workspace: &Path, cargo_registry_cache: &Path) -> Result<Co
         registry_abs.display()
     );
 
-    let mut cmd = Command::new(runtime);
+    let mut cmd = SandboxCommand::container_run(runtime);
     cmd.args([
-        "run",
         "--rm",
         "--network=none",
         "--read-only",
@@ -597,7 +601,7 @@ pub fn audit_command(workspace: &Path, cargo_registry_cache: &Path) -> Result<Co
     Ok(cmd)
 }
 
-/// Build a [`Command`] that runs an arbitrary sandboxed TOOL (jco,
+/// Build a [`SandboxCommand`] that runs an arbitrary sandboxed TOOL (jco,
 /// componentize-py) against a compile workspace — the generic sibling of
 /// [`build_command`], which hardcodes `cargo` + the registry mount.
 ///
@@ -609,8 +613,8 @@ pub fn audit_command(workspace: &Path, cargo_registry_cache: &Path) -> Result<Co
 /// the host-fallback Command has `current_dir(workspace)` set, so the same
 /// relative args resolve in both modes.
 ///
-/// Host fallback (container off / no runtime) returns a bare
-/// `Command::new(tool)` — the caller MUST gate that path through
+/// Host fallback (container off / no runtime) returns a scrubbed
+/// `host_command(tool)` — the caller MUST gate that path through
 /// `require_host_lang_toolchain_allowed` (use [`will_sandbox`] to decide),
 /// because these tools execute user-supplied code at compile time
 /// (componentize-py runs Python introspection; jco evaluates module
@@ -618,7 +622,7 @@ pub fn audit_command(workspace: &Path, cargo_registry_cache: &Path) -> Result<Co
 ///
 /// `tool` must be a bare program name from this crate (no caller/user
 /// input) — asserted against a path-free charset as defense in depth.
-pub fn tool_command(tool: &str, workspace: &Path) -> Result<Command> {
+pub fn tool_command(tool: &str, workspace: &Path) -> Result<SandboxCommand> {
     // Defense in depth: refuse anything that isn't a simple program name.
     // `tool` is always a crate-internal constant ("jco", "componentize-py");
     // this assert keeps that true if a future caller plumbs user input here.
@@ -673,9 +677,8 @@ pub fn tool_command(tool: &str, workspace: &Path) -> Result<Command> {
         .with_context(|| format!("Failed to resolve workspace path: {}", workspace.display()))?;
     let workspace_mount = format!("{}:/build:rw", workspace_abs.display());
 
-    let mut cmd = Command::new(runtime);
+    let mut cmd = SandboxCommand::container_run(runtime);
     cmd.args([
-        "run",
         "--rm",
         // SECURITY: identical envelope to build_command — see its comments.
         "--network=none",
@@ -1013,8 +1016,13 @@ mod tests {
         // A stand-in for WORKER_SHARED_KEY / TALOS_MASTER_KEY / DATABASE_URL:
         // present in the controller process, must be ABSENT in the child.
         std::env::set_var("TALOS_TEST_SECRET_SHOULD_NOT_LEAK", "leak-canary-9f3a");
+        let slot = crate::sandbox_run::CompileSlot::acquire(std::sync::Arc::new(
+            tokio::sync::Semaphore::new(1),
+        ))
+        .await
+        .expect("fresh semaphore");
         let out = host_command("env")
-            .output()
+            .run(std::time::Duration::from_secs(10), &slot)
             .await
             .expect("`env` must be spawnable in the test environment");
         std::env::remove_var("TALOS_TEST_SECRET_SHOULD_NOT_LEAK");
