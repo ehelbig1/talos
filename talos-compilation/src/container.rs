@@ -53,7 +53,15 @@ const CONTAINER_PIDS_LIMIT: &str = "512";
 /// `DATABASE_URL`, `ANTHROPIC_API_KEY`, the vault token, … — and a
 /// user-supplied `build.rs`, proc-macro, or `env!("TALOS_MASTER_KEY")` runs
 /// in that process. The container path never had this problem (`podman run`
-/// starts from an empty environment); this makes the fallback match it.
+/// starts from an empty environment).
+///
+/// This narrows the fallback; it does NOT make it equivalent to the
+/// container. The build still runs as the controller's user, in its PID and
+/// mount namespaces, with its network: a `build.rs` can read the parent's
+/// environment from `/proc/<ppid>/environ` (blocked only while the controller
+/// is non-dumpable) and any file the controller user can read. That is why
+/// production refuses the host fallback without an explicit
+/// single-tenant-RCE acknowledgement (`sandbox_decision`).
 ///
 /// The list is what the toolchains demonstrably need: process basics (PATH,
 /// HOME, user, locale, temp dir, XDG cache roots — jco's wizer step writes a
