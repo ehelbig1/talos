@@ -1996,20 +1996,60 @@ impl HygieneService {
                 serde_json::json!(candidates.stale_exec_ids.len());
         }
 
-        // 3. Delete orphaned compiled modules (not referenced by any workflow)
+        // 3. Delete orphaned compiled modules — referenced by NOTHING. The
+        // repository re-checks workflow graphs, webhook triggers and execution
+        // history at DELETE time; push-channel bindings live in encrypted
+        // `integration_state`, so they are surveyed here and passed in. If they
+        // cannot be read, NO module is deleted (a gate that cannot read its
+        // rule must not grant).
         if !candidates.orphaned_module_ids.is_empty() {
-            let (count, error) = destructive_step_result(
-                self.module_repo
-                    .delete_orphaned_modules(&candidates.orphaned_module_ids, user_id)
-                    .await,
-                user_id,
-                "orphaned-module delete",
-                "NO module was deleted",
-            );
-            fix_results["orphaned_modules_deleted"] = count;
-            if let Some(error) = error {
-                fix_results["orphaned_modules_delete_error"] = error;
+            let push_bound = match &self.push_channels {
+                None => Err("no push-channel inventory is wired into this process".to_string()),
+                Some(set) => set
+                    .survey(user_id)
+                    .await
+                    .bound_modules()
+                    .map_err(|e| e.to_string()),
+            };
+            match push_bound {
+                Err(why) => {
+                    tracing::warn!(
+                        target: "talos_audit",
+                        %user_id,
+                        reason = %why,
+                        "hygiene fix_all: orphaned-module delete skipped — push-channel bindings \
+                         unreadable"
+                    );
+                    fix_results["orphaned_modules_deleted"] = serde_json::Value::Null;
+                    fix_results["orphaned_modules_delete_error"] = serde_json::json!(
+                        "push-channel bindings could not be read, so a module a push channel \
+                         dispatches could not be excluded; NO module was deleted"
+                    );
+                }
+                Ok(push_bound) => {
+                    let (count, error) = destructive_step_result(
+                        self.module_repo
+                            .delete_orphaned_modules(
+                                &candidates.orphaned_module_ids,
+                                user_id,
+                                &push_bound,
+                            )
+                            .await,
+                        user_id,
+                        "orphaned-module delete",
+                        "NO module was deleted",
+                    );
+                    fix_results["orphaned_modules_deleted"] = count;
+                    if let Some(error) = error {
+                        fix_results["orphaned_modules_delete_error"] = error;
+                    }
+                }
             }
+            // Deleted can be LOWER than previewed: the delete re-checks every
+            // reference at delete time and keeps anything bound or with run
+            // history. Saying so stops the gap reading as a partial failure.
+            fix_results["orphaned_modules_previewed"] =
+                serde_json::json!(candidates.orphaned_module_ids.len());
         }
 
         serde_json::json!({
@@ -3031,7 +3071,10 @@ mod destructive_preview_pins {
     /// patch to the one step that broke it.
     #[test]
     fn every_destructive_fix_all_step_is_bounded_by_its_preview() {
-        let src = include_str!("lib.rs");
+        // Whitespace-insensitive: rustfmt wraps a call whose argument list
+        // grows (the orphaned-module step gained its push-binding argument),
+        // and a pin that a formatter can break — or satisfy — is testing layout.
+        let src: String = include_str!("lib.rs").split_whitespace().collect();
         for needle in [
             concat!("delete_workflows_checked(&candidates.", "draft_ids"),
             concat!(

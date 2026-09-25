@@ -31,7 +31,7 @@
 
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Pool, Postgres, Row};
-use talos_module_repository::ModuleRepository;
+use talos_module_repository::{ModuleRepository, PushBoundModules};
 use uuid::Uuid;
 
 async fn pool_or_skip() -> Option<Pool<Postgres>> {
@@ -322,7 +322,7 @@ async fn cleanup_spares_a_module_too_recent_to_appear_in_the_survey() {
 
     // The survey an operator would run first, at the default window.
     let surveyed = repo
-        .find_unreferenced_modules(user, 30)
+        .find_unreferenced_modules(user, 30, &PushBoundModules::default())
         .await
         .expect("survey");
     assert!(
@@ -331,7 +331,7 @@ async fn cleanup_spares_a_module_too_recent_to_appear_in_the_survey() {
     );
 
     let deleted = repo
-        .cleanup_unreferenced_modules(user, Some(&prefix), 30)
+        .cleanup_unreferenced_modules(user, Some(&prefix), 30, &PushBoundModules::default())
         .await
         .expect("cleanup");
 
@@ -363,7 +363,7 @@ async fn cleanup_deletes_exactly_what_the_survey_listed() {
 
     let repo = ModuleRepository::new(pool.clone());
     let surveyed: Vec<Uuid> = repo
-        .find_unreferenced_modules(user, 30)
+        .find_unreferenced_modules(user, 30, &PushBoundModules::default())
         .await
         .expect("survey")
         .into_iter()
@@ -377,7 +377,7 @@ async fn cleanup_deletes_exactly_what_the_survey_listed() {
     );
 
     let deleted = repo
-        .cleanup_unreferenced_modules(user, Some(&prefix), 30)
+        .cleanup_unreferenced_modules(user, Some(&prefix), 30, &PushBoundModules::default())
         .await
         .expect("cleanup");
 
@@ -390,6 +390,161 @@ async fn cleanup_deletes_exactly_what_the_survey_listed() {
         module_exists(&pool, fresh).await,
         "the fresh module, absent from the survey, survives"
     );
+
+    drop_users(&pool, &[user]).await;
+}
+
+// ── Defect (2026-09-25): "unreferenced" meant "not in a workflow graph" ──────
+
+/// A module a webhook trigger binds directly (`webhook_triggers.module_id`).
+async fn bind_webhook(pool: &Pool<Postgres>, user_id: Uuid, module_id: Uuid) {
+    sqlx::query(
+        "INSERT INTO webhook_triggers (name, module_id, verification_token, user_id) \
+         VALUES ('bound', $1, $2, $3)",
+    )
+    .bind(module_id)
+    .bind(Uuid::new_v4().to_string())
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .expect("seed webhook trigger");
+}
+
+/// Give a module one row of execution history.
+async fn record_run(pool: &Pool<Postgres>, user_id: Uuid, module_id: Uuid) {
+    let actor = Uuid::new_v4();
+    sqlx::query("INSERT INTO actors (id, user_id, name) VALUES ($1, $2, $3)")
+        .bind(actor)
+        .bind(user_id)
+        .bind(format!("mod-scope-actor-{actor}"))
+        .execute(pool)
+        .await
+        .expect("seed actor");
+    sqlx::query(
+        "INSERT INTO module_executions (module_id, user_id, status, trigger_type, actor_id) \
+         VALUES ($1, $2, 'completed', 'manual', $3)",
+    )
+    .bind(module_id)
+    .bind(user_id)
+    .bind(actor)
+    .execute(pool)
+    .await
+    .expect("seed module execution");
+}
+
+async fn run_count(pool: &Pool<Postgres>, module_id: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM module_executions WHERE module_id = $1")
+        .bind(module_id)
+        .fetch_one(pool)
+        .await
+        .expect("count runs")
+}
+
+/// **The defect, verbatim.** `cleanup_unreferenced_modules` excluded only
+/// modules named in a workflow graph. A module bound to a webhook trigger, one
+/// a push channel dispatches, and one with run history were all "unreferenced"
+/// — the delete made every later webhook / push delivery fail, and the
+/// `module_executions` CASCADE took the run history with it. Now none of the
+/// three is surveyed or deleted, while an aged module referenced by nothing
+/// still is (the control that the exclusions are not blocking everything).
+///
+/// On the pre-fix tree all three bound modules are deleted and this fails.
+#[tokio::test]
+async fn cleanup_spares_webhook_push_and_history_bound_modules() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let user = seed_user(&pool, "bound").await;
+    let prefix = format!("pa-scope-bound-{}", Uuid::new_v4().simple());
+    let webhook = seed_module(&pool, user, &format!("{prefix}-webhook"), Some(b"W"), 60).await;
+    let pushed = seed_module(&pool, user, &format!("{prefix}-push"), Some(b"W"), 60).await;
+    let ran = seed_module(&pool, user, &format!("{prefix}-ran"), Some(b"W"), 60).await;
+    let unbound = seed_module(&pool, user, &format!("{prefix}-unbound"), Some(b"W"), 60).await;
+    bind_webhook(&pool, user, webhook).await;
+    record_run(&pool, user, ran).await;
+    let push_bound = PushBoundModules::from_ids(vec![pushed]);
+
+    let repo = ModuleRepository::new(pool.clone());
+    let surveyed: Vec<Uuid> = repo
+        .find_unreferenced_modules(user, 30, &push_bound)
+        .await
+        .expect("survey")
+        .into_iter()
+        .filter(|m| m.name.starts_with(&prefix))
+        .map(|m| m.id)
+        .collect();
+    assert_eq!(
+        surveyed,
+        vec![unbound],
+        "the survey lists only the module referenced by nothing"
+    );
+
+    let deleted = repo
+        .cleanup_unreferenced_modules(user, Some(&prefix), 30, &push_bound)
+        .await
+        .expect("cleanup");
+    assert_eq!(deleted, 1, "cleanup deletes exactly what the survey listed");
+    assert!(
+        !module_exists(&pool, unbound).await,
+        "the unbound module is gone"
+    );
+    assert!(
+        module_exists(&pool, webhook).await,
+        "a webhook-bound module must survive cleanup"
+    );
+    assert!(
+        module_exists(&pool, pushed).await,
+        "a push-channel-bound module must survive cleanup"
+    );
+    assert!(
+        module_exists(&pool, ran).await,
+        "a module with execution history must survive cleanup"
+    );
+    assert_eq!(
+        run_count(&pool, ran).await,
+        1,
+        "its run history must survive too (module_executions CASCADEs)"
+    );
+
+    drop_users(&pool, &[user]).await;
+}
+
+/// The hygiene `fix_all` delete had the same hole with a different query: it
+/// deleted whatever ids the report's graph-only orphan query listed. It now
+/// re-checks every reference at DELETE time, so even ids handed to it verbatim
+/// are kept when something binds them.
+#[tokio::test]
+async fn hygiene_orphan_delete_rechecks_every_binding_at_delete_time() {
+    let Some(pool) = pool_or_skip().await else {
+        return;
+    };
+    let user = seed_user(&pool, "hygiene").await;
+    let prefix = format!("pa-scope-hyg-{}", Uuid::new_v4().simple());
+    let webhook = seed_module(&pool, user, &format!("{prefix}-webhook"), Some(b"W"), 0).await;
+    let pushed = seed_module(&pool, user, &format!("{prefix}-push"), Some(b"W"), 0).await;
+    let ran = seed_module(&pool, user, &format!("{prefix}-ran"), Some(b"W"), 0).await;
+    let unbound = seed_module(&pool, user, &format!("{prefix}-unbound"), Some(b"W"), 0).await;
+    bind_webhook(&pool, user, webhook).await;
+    record_run(&pool, user, ran).await;
+
+    let repo = ModuleRepository::new(pool.clone());
+    let deleted = repo
+        .delete_orphaned_modules(
+            &[webhook, pushed, ran, unbound],
+            user,
+            &PushBoundModules::from_ids(vec![pushed]),
+        )
+        .await
+        .expect("hygiene delete");
+    assert_eq!(deleted, 1);
+    assert!(!module_exists(&pool, unbound).await);
+    for (label, id) in [("webhook", webhook), ("push", pushed), ("history", ran)] {
+        assert!(
+            module_exists(&pool, id).await,
+            "{label}-bound module was deleted"
+        );
+    }
+    assert_eq!(run_count(&pool, ran).await, 1);
 
     drop_users(&pool, &[user]).await;
 }

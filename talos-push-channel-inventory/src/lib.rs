@@ -253,6 +253,57 @@ impl PushChannelInventorySet {
     }
 }
 
+/// The module ids some push channel dispatches — every one a module that must
+/// NOT be deleted as "unreferenced". A push channel's binding lives in an
+/// AEAD-encrypted `integration_state` row, so no SQL statement can see it; a
+/// bulk module delete takes this set as a REQUIRED parameter instead.
+///
+/// Build it from a survey that answered for every integration
+/// ([`PushChannelSurvey::bound_modules`]); a partial survey is refused there,
+/// because a list with a hole in it would read as "nothing bound".
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PushBoundModules {
+    ids: Vec<Uuid>,
+}
+
+impl PushBoundModules {
+    /// For a caller that enumerated the bindings itself (tests). Sorted and
+    /// de-duplicated.
+    #[must_use]
+    pub fn from_ids(mut ids: Vec<Uuid>) -> Self {
+        ids.sort_unstable();
+        ids.dedup();
+        Self { ids }
+    }
+
+    #[must_use]
+    pub fn ids(&self) -> &[Uuid] {
+        &self.ids
+    }
+
+    #[must_use]
+    pub fn contains(&self, id: Uuid) -> bool {
+        self.ids.binary_search(&id).is_ok()
+    }
+}
+
+/// A survey could not produce [`PushBoundModules`]: these integrations did not
+/// answer, so whether they bind a module is unknown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PushBindingsUnreadable(pub Vec<&'static str>);
+
+impl std::fmt::Display for PushBindingsUnreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "push-channel bindings unreadable for: {}",
+            self.0.join(", ")
+        )
+    }
+}
+
+impl std::error::Error for PushBindingsUnreadable {}
+
 /// The result of asking every wired inventory.
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct PushChannelSurvey {
@@ -286,6 +337,20 @@ impl PushChannelSurvey {
             .collect()
     }
 
+    /// Every module id a surveyed channel binds, whatever its classification
+    /// (a `Missing` or `Unreadable` binding still names the id). `Err` when
+    /// any integration could not be read: its channels are absent from
+    /// `rows`, and a delete gated on this set must REFUSE rather than read the
+    /// hole as "nothing bound there".
+    pub fn bound_modules(&self) -> Result<PushBoundModules, PushBindingsUnreadable> {
+        if !self.unreadable_integrations.is_empty() {
+            return Err(PushBindingsUnreadable(self.unreadable_integrations.clone()));
+        }
+        Ok(PushBoundModules::from_ids(
+            self.rows.iter().filter_map(|r| r.module_id).collect(),
+        ))
+    }
+
     /// True when nothing about this survey is worth a report key. Distinct from
     /// "no rows": an integration that could not be read has something to say.
     #[must_use]
@@ -311,6 +376,32 @@ pub enum PushChannelReadout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bound_modules_names_every_bound_id_and_refuses_a_partial_survey() {
+        let bound = Uuid::new_v4();
+        let missing = Uuid::new_v4();
+        let mut survey = PushChannelSurvey {
+            rows: vec![
+                row(ModuleBinding::Bound, Some(bound)),
+                row(ModuleBinding::Missing, Some(missing)),
+                row(ModuleBinding::None, None),
+            ],
+            surveyed_integrations: vec!["gmail", "google_cloud"],
+            unreadable_integrations: vec![],
+        };
+        let set = survey.bound_modules().expect("complete survey");
+        assert!(set.contains(bound) && set.contains(missing));
+        assert_eq!(set.ids().len(), 2);
+
+        // One integration did not answer: its bindings are unknown, so the
+        // set is refused rather than returned with a hole in it.
+        survey.unreadable_integrations.push("google_calendar");
+        assert_eq!(
+            survey.bound_modules(),
+            Err(PushBindingsUnreadable(vec!["google_calendar"]))
+        );
+    }
 
     fn row(binding: ModuleBinding, module_id: Option<Uuid>) -> PushChannelRow {
         PushChannelRow {

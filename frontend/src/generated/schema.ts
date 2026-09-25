@@ -1122,6 +1122,16 @@ export type MutationRoot = {
   updateResourceQuotas: ResourceQuota;
   updateSchedule: WorkflowScheduleObj;
   updateSecret: Secret;
+  /**
+   * Replace a workflow's name, graph, concurrency cap and intent.
+   *
+   * `expectedGraphVersion`: the `Workflow.graphVersion` the caller's copy
+   * of the graph was read at. When given, the update is applied only if
+   * the stored graph is still at that version; if anything changed it in
+   * the meantime (an MCP tool, another editor tab, a rollback) the update
+   * is REFUSED and nothing is written, instead of silently discarding that
+   * change. Omit it for the historical last-writer-wins behaviour.
+   */
   updateWorkflow: Workflow;
   verifyTwoFactor: AuthPayload;
   writeActorMemory: ActorMemoryEntry;
@@ -1412,6 +1422,7 @@ export type MutationRootUpdateSecretArgs = {
 };
 
 export type MutationRootUpdateWorkflowArgs = {
+  expectedGraphVersion?: InputMaybe<Scalars["Int"]["input"]>;
   id: Scalars["UUID"]["input"];
   input: CreateWorkflowInput;
 };
@@ -2273,6 +2284,13 @@ export type Workflow = {
   actorName?: Maybe<Scalars["String"]["output"]>;
   /** Serialized representation of the graph (flexible JSON). */
   graphJson: Scalars["String"]["output"];
+  /**
+   * The version `graphJson` is at. Advances whenever the graph changes,
+   * through ANY writer (this API, MCP tools, rollback). Pass it back as
+   * `updateWorkflow(expectedGraphVersion:)` so a save made from a stale
+   * read is refused instead of silently overwriting the newer graph.
+   */
+  graphVersion: Scalars["Int"]["output"];
   id: Scalars["UUID"]["output"];
   /** Optional structured intent metadata. */
   intent?: Maybe<Scalars["JSON"]["output"]>;

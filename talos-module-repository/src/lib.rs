@@ -18,6 +18,32 @@ use uuid::Uuid;
 /// than defaulting it.
 pub const UNREFERENCED_MODULES_LIMIT: i64 = 50;
 
+pub use talos_push_channel_inventory::PushBoundModules;
+
+/// Over alias `m`: nothing OUTSIDE a workflow graph dispatches module `m`, and
+/// it has no execution history. The ONE spelling every BULK module delete and
+/// its survey share (`cleanup_modules`, `find_unreferenced_modules`, the
+/// hygiene `fix_all` delete).
+///
+/// * `webhook_triggers.module_id` — a module-bound webhook dispatches the
+///   module directly; the FK is `ON DELETE SET NULL`, so deleting it leaves a
+///   trigger that dispatches nothing. Any tenant's trigger protects it.
+/// * `module_executions.module_id` — the FK is `ON DELETE CASCADE` (restored
+///   deliberately by `20260423180000`, the column is NOT NULL and read by ~70
+///   files), so deleting a module deletes its run history, including the node
+///   rows of past WORKFLOW executions that ran it before a later edit swapped
+///   it out. A bulk "unreferenced" sweep must not rewrite history as a side
+///   effect; an operator who means it deletes the module explicitly.
+///
+/// Push-channel bindings are NOT here: they live in encrypted
+/// `integration_state`, so each statement also takes a [`PushBoundModules`].
+macro_rules! module_unbound_outside_graphs_sql {
+    () => {
+        "NOT EXISTS (SELECT 1 FROM webhook_triggers wt WHERE wt.module_id = m.id) \
+         AND NOT EXISTS (SELECT 1 FROM module_executions me WHERE me.module_id = m.id)"
+    };
+}
+
 /// How a module write records a capability-world change: who made it, the
 /// event type, and how to describe a `(previous, new)` transition. The
 /// description is the caller's (it knows the dependents, the rank change);
@@ -1145,35 +1171,48 @@ impl ModuleRepository {
     /// belongs on a survey, not on a DELETE, so `find_unreferenced_modules`
     /// now discloses its own truncation rather than this statement pretending
     /// to a bound it should not have.
+    ///
+    /// **"Unreferenced" means by NOTHING, not only by a workflow graph**
+    /// (2026-09-25). This statement used to exclude only modules named in a
+    /// workflow graph, so it deleted a module a webhook trigger or a push
+    /// channel dispatches directly — every later delivery then failed — and,
+    /// through `module_executions`' CASCADE, its whole run history. It now
+    /// applies `module_unbound_outside_graphs_sql!` and `push_bound`, the same
+    /// exclusions as the survey.
     pub async fn cleanup_unreferenced_modules(
         &self,
         user_id: Uuid,
         prefix_filter: Option<&str>,
         older_than_days: i32,
+        push_bound: &PushBoundModules,
     ) -> Result<u64> {
         // Single statement with optional name filter via boolean parameter so
         // there's no dynamic SQL — the `$2::bool` arm short-circuits when no
         // prefix was given.
         let pattern = prefix_filter.map(|p| format!("{}%", p));
         let mut tx = self.db_pool.begin().await?;
-        let removed: Vec<RemovedModule> = sqlx::query_as(
-            "DELETE FROM modules \
-             WHERE user_id = $1 \
-               AND ($2::bool IS FALSE OR name LIKE $3) \
-               AND compiled_at IS NOT NULL \
-               AND compiled_at < NOW() - make_interval(days => $4::int) \
-               AND id NOT IN ( \
+        let removed: Vec<RemovedModule> = sqlx::query_as(concat!(
+            "DELETE FROM modules m \
+             WHERE m.user_id = $1 \
+               AND ($2::bool IS FALSE OR m.name LIKE $3) \
+               AND m.compiled_at IS NOT NULL \
+               AND m.compiled_at < NOW() - make_interval(days => $4::int) \
+               AND m.id NOT IN ( \
                  SELECT DISTINCT unnest(regexp_matches( \
                    graph_json, '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}', 'g' \
                  ))::uuid \
                  FROM workflows WHERE user_id = $1 \
                ) \
-             RETURNING id, name, capability_world",
-        )
+               AND ",
+            module_unbound_outside_graphs_sql!(),
+            " AND NOT (m.id = ANY($5::uuid[])) \
+             RETURNING m.id, m.name, m.capability_world",
+        ))
         .bind(user_id)
         .bind(prefix_filter.is_some())
         .bind(pattern.as_deref())
         .bind(older_than_days)
+        .bind(push_bound.ids())
         .fetch_all(&mut *tx)
         .await?;
         record_module_deletes(
@@ -1491,12 +1530,18 @@ impl ModuleRepository {
     /// [`UNREFERENCED_MODULES_LIMIT`] rows — the caller MUST disclose that cap,
     /// because this is the preview leg of an irreversible `cleanup_modules`
     /// delete. Phase 5: queries the unified `modules` table.
+    ///
+    /// Applies the SAME exclusions as [`Self::cleanup_unreferenced_modules`]
+    /// (webhook binding, execution history, `push_bound`), so the survey never
+    /// lists a module the delete would refuse — nor, before 2026-09-25, omit
+    /// the reason the delete would have destroyed one.
     pub async fn find_unreferenced_modules(
         &self,
         user_id: Uuid,
         days: i32,
+        push_bound: &PushBoundModules,
     ) -> Result<Vec<UnreferencedModule>> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(concat!(
             "SELECT m.id, m.name, m.compiled_at \
              FROM modules m \
              WHERE m.user_id = $1 \
@@ -1506,11 +1551,15 @@ impl ModuleRepository {
                    SELECT 1 FROM workflows w \
                    WHERE w.user_id = $1 AND w.graph_json LIKE '%' || m.id::text || '%' \
                ) \
+               AND ",
+            module_unbound_outside_graphs_sql!(),
+            " AND NOT (m.id = ANY($4::uuid[])) \
              ORDER BY m.compiled_at ASC LIMIT $3",
-        )
+        ))
         .bind(user_id)
         .bind(days)
         .bind(UNREFERENCED_MODULES_LIMIT)
+        .bind(push_bound.ids())
         .fetch_all(&self.db_pool)
         .await?;
         rows.iter()
@@ -2252,12 +2301,53 @@ impl ModuleRepository {
         Ok(id)
     }
 
-    /// Delete user-owned modules whose ids are in the given list.
-    /// Used by the hygiene-fix path in `mcp/analytics.rs`. Returns rows
-    /// affected.
-    pub async fn delete_orphaned_modules(&self, ids: &[Uuid], user_id: Uuid) -> Result<u64> {
-        self.delete_modules_recorded(ids, user_id, ModuleDeleteSurface::HygieneFixAll)
-            .await
+    /// Delete the hygiene report's "orphaned" modules among `ids` — the
+    /// `fix_all` step. Returns rows deleted, which can be FEWER than `ids`.
+    ///
+    /// Until 2026-09-25 this was the plain delete-by-id: the report's orphan
+    /// query checked only workflow graphs, so `fix_all` deleted modules a
+    /// webhook trigger or a push channel dispatches, and their run history
+    /// with them. The DELETE now re-checks, at delete time, that nothing
+    /// references the module — a workflow graph, a webhook trigger, execution
+    /// history (`module_unbound_outside_graphs_sql!`) or `push_bound` — so the
+    /// guarantee does not depend on what the preview query happened to test.
+    pub async fn delete_orphaned_modules(
+        &self,
+        ids: &[Uuid],
+        user_id: Uuid,
+        push_bound: &PushBoundModules,
+    ) -> Result<u64> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let mut tx = self.db_pool.begin().await?;
+        let removed: Vec<RemovedModule> = sqlx::query_as(concat!(
+            "DELETE FROM modules m \
+             WHERE m.id = ANY($1) \
+               AND m.user_id = $2 \
+               AND NOT EXISTS ( \
+                   SELECT 1 FROM workflows w \
+                   WHERE w.user_id = $2 AND w.graph_json LIKE '%' || m.id::text || '%' \
+               ) \
+               AND ",
+            module_unbound_outside_graphs_sql!(),
+            " AND NOT (m.id = ANY($3::uuid[])) \
+             RETURNING m.id, m.name, m.capability_world",
+        ))
+        .bind(ids)
+        .bind(user_id)
+        .bind(push_bound.ids())
+        .fetch_all(&mut *tx)
+        .await?;
+        record_module_deletes(
+            &mut tx,
+            user_id,
+            ModuleDeleteSurface::HygieneFixAll,
+            &removed,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(removed.len() as u64)
     }
 
     /// True if a module exists with the given canonical id. Used by
@@ -4057,7 +4147,7 @@ mod preview_action_scope_pins {
     fn cleanup_delete_carries_the_age_filter_the_survey_previews_with() {
         assert!(
             src().contains(concat!(
-                "AND compiled_at < NOW() - make_interval(days => ",
+                "AND m.compiled_at < NOW() - make_interval(days => ",
                 "$4::int)"
             )),
             "cleanup_unreferenced_modules lost its age predicate; the operator then \
@@ -4066,11 +4156,12 @@ mod preview_action_scope_pins {
         );
         assert!(
             src().contains(concat!(
-                "AND compiled_at ",
-                "IS NOT NULL \\\n               AND"
+                "AND m.compiled_at ",
+                "IS NOT NULL \\\n               AND m.compiled_at < NOW() - make_interval(days => $4::int)"
             )),
             "cleanup_unreferenced_modules lost the `compiled_at IS NOT NULL` guard \
-             the survey also applies"
+             the survey also applies (the needle carries the DELETE's own `$4` so the \
+             survey's identical `m.compiled_at IS NOT NULL` cannot satisfy it)"
         );
     }
 
