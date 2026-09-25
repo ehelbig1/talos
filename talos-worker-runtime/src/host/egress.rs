@@ -128,6 +128,117 @@ pub(crate) fn tier1_egress_deny_reason(host_lower: &str) -> Option<&'static str>
     None
 }
 
+/// Audit policy for a PUBLIC IP literal refused because the actor is
+/// local-egress-only for a reason OTHER than tier 1 (`tier2` +
+/// `egress_scope = local`). A tier-1 actor keeps `tier1-public-ip-egress`.
+pub(crate) const LOCAL_EGRESS_PUBLIC_IP_POLICY: &str = "local-egress-public-ip";
+
+/// The ONE egress-posture deny decision every guest HTTP surface takes before
+/// sending (`http::fetch`, `http::fetch_all`, `graphql::execute`,
+/// `webhook::send`, `http_stream::connect`, and the `wasi:http` outgoing
+/// hook).
+///
+/// Two independent axes, and until 2026-09-25 only one of them was consulted
+/// here:
+///
+/// * `max_llm_tier == Tier1` → [`tier1_egress_deny_reason`]: an external LLM
+///   provider host, or ANY public IP literal (a provider reached by raw IP).
+///   Unchanged, and still applied to a `tier1` + `egress_scope = public`
+///   actor, whose public egress is for declared hostnames, not for an LLM
+///   provider reached by address.
+/// * `local_egress_only` → a public IP literal. The connect-time
+///   `SsrfFilteringResolver` is what enforces local-only egress, and a
+///   resolver is never CONSULTED for an IP literal — so a `tier2` +
+///   `egress_scope = local` actor, whose `local_egress_only` is true, could
+///   reach `https://8.8.8.8/` through every surface while its hostnames were
+///   correctly refused at connect. The public-literal deny sat inside
+///   `if max_llm_tier == Tier1` at all four sites, which is the defect.
+///
+/// `host_lower` MUST already be lowercased. Returns the audit policy string;
+/// map it onto a reason class with [`crate::reason_class::tier1_egress_class`].
+pub(crate) fn egress_posture_deny_reason(
+    host_lower: &str,
+    max_llm_tier: talos_workflow_job_protocol::LlmTier,
+    local_egress_only: bool,
+) -> Option<&'static str> {
+    if matches!(max_llm_tier, talos_workflow_job_protocol::LlmTier::Tier1) {
+        if let Some(policy) = tier1_egress_deny_reason(host_lower) {
+            return Some(policy);
+        }
+    }
+    if local_egress_only && is_public_ip_literal(host_lower) {
+        return Some(LOCAL_EGRESS_PUBLIC_IP_POLICY);
+    }
+    None
+}
+
+/// A globally-routable IP literal (bracketed IPv6 accepted): one the SSRF
+/// classifier does NOT call private/loopback/link-local/CGNAT/unspecified.
+fn is_public_ip_literal(host_lower: &str) -> bool {
+    let bare = host_lower
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(host_lower);
+    bare.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| classify_private_ip(ip).is_none())
+}
+
+#[cfg(test)]
+mod egress_posture_tests {
+    use super::{egress_posture_deny_reason, LOCAL_EGRESS_PUBLIC_IP_POLICY};
+    use talos_workflow_job_protocol::LlmTier::{Tier1, Tier2};
+
+    /// The defect: tier 2 + local-only egress let a public IP literal out.
+    #[test]
+    fn a_local_egress_tier2_actor_is_refused_a_public_ip_literal() {
+        for host in ["8.8.8.8", "203.0.113.10", "[2606:4700:4700::1111]"] {
+            assert_eq!(
+                egress_posture_deny_reason(host, Tier2, true),
+                Some(LOCAL_EGRESS_PUBLIC_IP_POLICY),
+                "{host}"
+            );
+        }
+    }
+
+    /// Controls: the same literal is fine for a public-egress tier-2 actor, and
+    /// local literals stay reachable for a local-only actor (local Ollama).
+    #[test]
+    fn controls_public_scope_and_local_literals() {
+        assert_eq!(egress_posture_deny_reason("8.8.8.8", Tier2, false), None);
+        for host in ["127.0.0.1", "10.0.0.3", "192.168.1.50", "[::1]"] {
+            assert_eq!(
+                egress_posture_deny_reason(host, Tier2, true),
+                None,
+                "{host}"
+            );
+        }
+        // A hostname is left to the connect-time resolver, not refused here.
+        assert_eq!(egress_posture_deny_reason("example.com", Tier2, true), None);
+    }
+
+    /// Tier 1 is unchanged, including under `egress_scope = public`
+    /// (`local_egress_only = false`): the provider host and public literals
+    /// are still refused with the tier-1 policies.
+    #[test]
+    fn tier1_keeps_its_own_policies_whatever_the_scope() {
+        for local in [true, false] {
+            assert_eq!(
+                egress_posture_deny_reason("api.anthropic.com", Tier1, local),
+                Some("tier1-llm-egress")
+            );
+            assert_eq!(
+                egress_posture_deny_reason("8.8.8.8", Tier1, local),
+                Some("tier1-public-ip-egress")
+            );
+        }
+        // A tier-2 actor is never refused a provider HOSTNAME by this gate.
+        assert_eq!(
+            egress_posture_deny_reason("api.anthropic.com", Tier2, true),
+            None
+        );
+    }
+}
+
 #[cfg(test)]
 mod tier1_egress_tests {
     use super::tier1_egress_deny_reason;

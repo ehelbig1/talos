@@ -24,8 +24,11 @@ fn declared_axes() -> Vec<(String, String)> {
     let inferred = format!("CeilingAxis::{}", "VerbInferred");
     let categorical = format!("CeilingAxis::{}", "Categorical");
 
-    let files: [&str; 9] = [
+    let files: [&str; 10] = [
         include_str!("http.rs"),
+        // The raw `wasi:http` gate (trusted world, 2026-09-25): a second
+        // `http-fetch` site on the verb axis, so the op SET is unchanged.
+        include_str!("wasi_http.rs"),
         include_str!("graphql.rs"),
         include_str!("webhook.rs"),
         include_str!("email.rs"),
@@ -118,6 +121,27 @@ fn exactly_three_gates_use_the_verb_inferred_axis() {
          operator sets to let a POST-shaped READ through — it must not also \
          grant email, NATS publish, memory writes or SQL DML."
     );
+}
+
+/// One op label, one axis. The same op is gated at more than one site (a raw
+/// `wasi:http` request is an `http-fetch` too, 2026-09-25), and two sites
+/// disagreeing about its axis would make the override grant it on one surface
+/// and not the other. Neither test beside this one sees that: the set of
+/// verb-inferred ops is unchanged by a second site flipping to categorical.
+#[test]
+fn every_op_has_exactly_one_axis_across_all_its_sites() {
+    let mut by_op: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
+    for (op, axis) in declared_axes() {
+        by_op.entry(op).or_default().insert(axis);
+    }
+    for (op, axes) in by_op {
+        assert_eq!(
+            axes.len(),
+            1,
+            "`{op}` is declared on more than one axis: {axes:?}"
+        );
+    }
 }
 
 #[test]

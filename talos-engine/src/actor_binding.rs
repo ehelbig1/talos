@@ -18,8 +18,7 @@
 use anyhow::Result;
 use talos_actor_repository::ActorRepository;
 use talos_workflow_engine::ParallelWorkflowEngine;
-use talos_workflow_engine_core::LlmTier;
-use talos_workflow_engine_core::WriteCeiling;
+use talos_workflow_engine_core::ActorCeilings;
 use uuid::Uuid;
 
 /// Apply the actor context to a workflow engine: sets `actor_id`
@@ -56,14 +55,10 @@ pub async fn apply_actor_to_engine(
     // ONE routine stamps the fail-closed posture on all four axes, so no
     // early-return path below can leave one axis at its permissive default.
     fn stamp_most_restrictive(engine: &mut ParallelWorkflowEngine) {
-        engine.set_max_llm_tier(LlmTier::Tier1);
-        engine.set_max_write_ceiling(WriteCeiling::ReadOnly);
-        // EXPLICIT `ReadOnly`, not `None`. `None` would be restrictive only
-        // because the ceiling above it is — a coincidence that stops holding
-        // the moment this fail-closed stamp is edited. Every axis says the
-        // restrictive thing outright, which is this routine's contract.
-        engine.set_http_verb_ceiling(Some(WriteCeiling::ReadOnly));
-        engine.set_egress_scope(Some(talos_workflow_engine_core::EgressScope::Local));
+        // `ActorCeilings::FAIL_CLOSED` is the ONE fail-closed value, shared
+        // with the sub-workflow binding's DB-error arm: explicit `ReadOnly` on
+        // the verb override and explicit `Local` egress, never `None`.
+        engine.set_ceilings(ActorCeilings::FAIL_CLOSED);
         engine.set_max_capability_world(Some(MOST_RESTRICTIVE_WORLD.to_string()));
     }
 
@@ -117,17 +112,17 @@ pub async fn apply_actor_to_engine(
         }
     };
 
-    engine.set_max_llm_tier(tier);
-    engine.set_max_write_ceiling(ceiling);
-    // The verb-inference override travels with the ceiling it modifies. `None`
-    // (SQL NULL, every actor that has not been given one) inherits the ceiling
-    // above, so this is inert by default.
-    engine.set_http_verb_ceiling(http_verb_ceiling);
-    // Blanket network-egress scope override — independent of the LLM tier.
-    // `None` (SQL NULL, the default for every actor) preserves the tier-derived
-    // default at the worker; an explicit `local`/`public` overrides only the
-    // blanket public-egress SSRF gate.
-    engine.set_egress_scope(egress);
+    // All four signed ceilings stamped as ONE value (`set_ceilings`
+    // destructures exhaustively). The verb-inference override travels with
+    // the ceiling it modifies — `None` (SQL NULL) inherits it, so it is inert
+    // by default; `egress_scope` `None` preserves the tier-derived default at
+    // the worker.
+    engine.set_ceilings(ActorCeilings {
+        max_llm_tier: tier,
+        max_write_ceiling: ceiling,
+        http_verb_ceiling,
+        egress_scope: egress,
+    });
     engine.set_max_capability_world(world);
     Ok(())
 }
@@ -167,20 +162,18 @@ mod fail_closed_axis_pins {
     /// The fail-closed stamp must say the restrictive thing on EVERY axis,
     /// including the verb-inference override.
     ///
-    /// `None` there would be restrictive only *because* the ceiling stamped
-    /// beside it is `ReadOnly` — a coincidence, and one that stops holding the
-    /// moment that line is edited. Measured: changing the stamp to `None`
-    /// survived the whole engine + core + worker suite, because no test drives
+    /// Since 2026-09-25 the stamp is `set_ceilings(ActorCeilings::FAIL_CLOSED)`
+    /// — ONE value shared with the sub-workflow binding's DB-error arm, whose
+    /// every axis (explicit `Some(ReadOnly)` on the verb override, never
+    /// `None`) is pinned BEHAVIOURALLY by
+    /// `talos_workflow_engine_core`'s `fail_closed_is_restrictive_on_every_axis_explicitly`.
+    /// What stays textual is that this routine uses it: no test drives
     /// `apply_actor_to_engine`'s DB-error path (it needs a live repository).
-    ///
-    /// TEXTUAL, and it says so: it proves the restrictive value is WRITTEN, not
-    /// that the function reaches it.
     #[test]
-    fn the_fail_closed_stamp_is_explicit_on_the_verb_axis() {
+    fn the_fail_closed_stamp_uses_the_shared_fail_closed_value() {
         let src = include_str!("actor_binding.rs");
         // Assembled so this test cannot match its own source.
-        let setter = format!("set_http_verb_{}(", "ceiling");
-        let restrictive = format!("Some(WriteCeiling::{})", "ReadOnly");
+        let stamp = format!("set_ceilings(ActorCeilings::{})", "FAIL_CLOSED");
 
         let body = src
             .split("fn stamp_most_restrictive(")
@@ -189,14 +182,9 @@ mod fail_closed_axis_pins {
         let block = &body[..body.find("\n    }").unwrap_or(body.len())];
 
         assert!(
-            block.contains(&setter),
-            "the fail-closed stamp no longer touches the verb-inference axis, \
-             so a DB error leaves it INHERITING: {block}"
-        );
-        assert!(
-            block.contains(&restrictive),
-            "the fail-closed stamp must write an EXPLICIT ReadOnly on the verb \
-             axis, never `None` (inherit): {block}"
+            block.contains(&stamp),
+            "the fail-closed stamp no longer stamps the shared FAIL_CLOSED \
+             ceilings, so an axis can be left at its permissive value: {block}"
         );
     }
 }
