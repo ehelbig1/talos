@@ -3447,7 +3447,7 @@ mod full_tier_reservation_tests {
 /// legitimate value (a job with no secrets), but it must be constructed
 /// via the explicitly-named [`EncryptedSecrets::empty`] so it can never
 /// arise by *accident* — e.g. `encrypted_secrets: talos_workflow_job_protocol::EncryptedSecrets::empty()` in
-/// a dispatch path that should have called `build_encrypted_secrets()`,
+/// a dispatch path that should have called `secrets_pipeline::build_encrypted_secrets_for`,
 /// which silently strips a module's secret access (the real loop-node
 /// bug, 2026-04-16). This makes lint check 17 a compiler guarantee: the
 /// empty case now costs a deliberate `::empty()` at the call site.
@@ -3464,7 +3464,7 @@ impl EncryptedSecrets {
     /// secrets. Deliberately named (not `Default`) so choosing "no
     /// secrets" is always an explicit decision at the call site. If a
     /// module is *expected* to have secrets, do NOT use this — go through
-    /// the engine's `build_encrypted_secrets()` prefetch instead.
+    /// the engine's `secrets_pipeline::build_encrypted_secrets_for` prefetch instead.
     #[must_use]
     pub fn empty() -> Self {
         Self {
@@ -3580,17 +3580,19 @@ impl EncryptedSecrets {
             ));
         }
 
-        let plaintext =
-            serde_json::to_vec(secrets).map_err(|e| format!("serialize secrets: {e}"))?;
+        // Plaintext buffer and subkey are wiped on drop (every return path).
+        let plaintext = zeroize::Zeroizing::new(
+            serde_json::to_vec(secrets).map_err(|e| format!("serialize secrets: {e}"))?,
+        );
 
         // The AES-GCM key is an HKDF subkey of the root, never the raw
         // root (which is also the HMAC signing key). v2: a non-empty `aad`
         // folds the per-job context into the subkey so the random-nonce
         // budget is per-job. Encrypt and decrypt derive it identically, so
         // the round-trip stays symmetric.
-        let aead_key = envelope_seal_key(key, aad);
-        let cipher =
-            Aes256Gcm::new_from_slice(&aead_key).map_err(|e| format!("create cipher: {e}"))?;
+        let aead_key = zeroize::Zeroizing::new(envelope_seal_key(key, aad));
+        let cipher = Aes256Gcm::new_from_slice(aead_key.as_slice())
+            .map_err(|e| format!("create cipher: {e}"))?;
 
         // OsRng (CSPRNG via getrandom) for nonce parity with the rest of
         // the Talos signing surface — see talos-memory/src/rpc_auth.rs's
@@ -3606,7 +3608,7 @@ impl EncryptedSecrets {
             .encrypt(
                 nonce,
                 Payload {
-                    msg: plaintext.as_ref(),
+                    msg: plaintext.as_slice(),
                     aad,
                 },
             )
@@ -3659,18 +3661,20 @@ impl EncryptedSecrets {
         // envelope.) For an empty `aad` there is only the v1 key. AES-GCM's
         // tag makes the extra attempt safe — a wrong key cannot forge a
         // passing tag. `aad` is bound into the tag on every attempt.
-        let candidates: Vec<[u8; 32]> = if aad.is_empty() {
-            vec![derive_envelope_aead_key_v1(key)]
+        let candidates: Vec<zeroize::Zeroizing<[u8; 32]>> = if aad.is_empty() {
+            vec![zeroize::Zeroizing::new(derive_envelope_aead_key_v1(key))]
         } else {
             vec![
-                derive_envelope_aead_key_v2(key, aad),
-                derive_envelope_aead_key_v1(key),
+                zeroize::Zeroizing::new(derive_envelope_aead_key_v2(key, aad)),
+                zeroize::Zeroizing::new(derive_envelope_aead_key_v1(key)),
             ]
         };
 
         for aead_key in candidates {
-            let cipher =
-                Aes256Gcm::new_from_slice(&aead_key).map_err(|e| format!("create cipher: {e}"))?;
+            let cipher = Aes256Gcm::new_from_slice(aead_key.as_slice())
+                .map_err(|e| format!("create cipher: {e}"))?;
+            // The decrypted JSON buffer is wiped once parsed. (The returned
+            // map holds plain Strings — its owner is responsible for it.)
             if let Ok(plaintext) = cipher.decrypt(
                 nonce,
                 Payload {
@@ -3678,7 +3682,8 @@ impl EncryptedSecrets {
                     aad,
                 },
             ) {
-                return serde_json::from_slice(&plaintext)
+                let plaintext = zeroize::Zeroizing::new(plaintext);
+                return serde_json::from_slice(plaintext.as_slice())
                     .map_err(|e| format!("deserialize secrets: {e}"));
             }
         }
