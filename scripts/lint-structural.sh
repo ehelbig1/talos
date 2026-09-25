@@ -3063,6 +3063,18 @@ bold "▶ check 36: cargo audit (RustSec dependency advisories)"
 # (independent of code), so an always-on default would make this script
 # non-deterministic and offline-hostile. CI / pre-publish should export
 # `TALOS_LINT_AUDIT=1`; locally, run `make audit` or set the env for parity.
+# Leg 36a (always on, offline): cargo-audit's ignore list must mirror
+# deny.toml's. The two drifted (a repo-root audit.toml nothing read, still
+# ignoring four ids deny.toml had dropped and missing three it had added),
+# so a local `cargo audit` failed on an exemption deny.toml already granted.
+AUDIT_SYNC_OUT="$(python3 scripts/lint-audit-ignore-sync.py 2>&1)" && AUDIT_SYNC_RC=0 || AUDIT_SYNC_RC=$?
+if [ "$AUDIT_SYNC_RC" -eq 0 ]; then
+    green "✓ .cargo/audit.toml ignores mirror deny.toml"
+else
+    red "✗ .cargo/audit.toml and deny.toml advisory ignores disagree"
+    printf '%s\n' "$AUDIT_SYNC_OUT" | sed 's/^/    /'
+    EXIT_CODE=1
+fi
 if [ "${TALOS_LINT_AUDIT:-0}" = "1" ]; then
     if ! command -v cargo-audit >/dev/null 2>&1; then
         yellow "⊘ audit check skipped (cargo-audit not installed — \`cargo install cargo-audit\`)"

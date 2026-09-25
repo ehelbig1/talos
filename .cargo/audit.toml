@@ -1,0 +1,31 @@
+# cargo-audit configuration. cargo-audit reads `.cargo/audit.toml` in the
+# directory it runs from (and `~/.cargo/audit.toml`); a repo-root
+# `audit.toml` is read by nothing, which is how the previous copy drifted.
+#
+# SOURCE OF TRUTH: deny.toml `[advisories].ignore` (with the full rationale
+# per entry). Every id there MUST appear here; an id here that is NOT in
+# deny.toml must sit under an `# audit-only:` comment saying why cargo-deny
+# does not need it. `scripts/lint-audit-ignore-sync.py` (lint check 36)
+# enforces both directions.
+#
+# Only VULNERABILITY advisories fail `cargo audit`; unmaintained/unsound
+# entries are listed so the output stays quiet where deny.toml has decided.
+
+[advisories]
+ignore = [
+    # --- mirrored from deny.toml (rationale lives there) ---
+    "RUSTSEC-2023-0071",  # rsa Marvin attack — private-key op never reached
+    "RUSTSEC-2024-0384",  # instant unmaintained
+    "RUSTSEC-2024-0436",  # paste unmaintained
+    "RUSTSEC-2025-0012",  # backoff unmaintained
+    "RUSTSEC-2025-0134",  # rustls-pemfile unmaintained
+    "RUSTSEC-2026-0249",  # smartstring unmaintained (rhai)
+    "RUSTSEC-2026-0253",  # lru pop() unsound — keys cannot panic on drop
+    "RUSTSEC-2026-0173",  # proc-macro-error2 unmaintained (build-time, age)
+
+    # audit-only: tokio-tar is a DEV dependency (testcontainers). cargo-deny
+    # filters dev deps (`exclude-dev = true`); cargo-audit reads Cargo.lock
+    # and cannot, so it needs the explicit ignore. No production binary
+    # links tokio-tar.
+    "RUSTSEC-2025-0111",
+]

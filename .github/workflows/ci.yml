@@ -224,14 +224,10 @@ jobs:
           tool: cargo-audit
 
       - name: RUSTSEC advisory scan
-        # cargo-audit operates on Cargo.lock alone (no `cargo metadata`
-        # resolution), so the sibling repo isn't required here.
-        # `audit.toml` ignores are kept synced with `deny.toml`'s
-        # `[advisories].ignore`.
-        run: |
-          mkdir -p ~/.cargo
-          cp audit.toml ~/.cargo/audit.toml
-          cargo audit
+        # cargo-audit operates on Cargo.lock alone and reads the checked-in
+        # `.cargo/audit.toml` from the working directory; its ignores are
+        # kept equal to deny.toml's by lint check 36.
+        run: cargo audit
 
       - name: Secret pattern scan
         run: |
