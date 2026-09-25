@@ -780,6 +780,12 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                 eliminating the 10+ call pattern of create_workflow + N×add_node_to_workflow + M×add_edge_to_workflow. \
                 Each node specifies either module_name (catalog lookup by name), module_id (UUID), \
                 or rust_code (compiled inline, ~30-60s per node). \
+                Inline nodes compile through the same gates as add_node_to_workflow, and the node id \
+                becomes the MODULE name: a spec creates modules and never overwrites one, so an id \
+                already naming one of your modules is refused (reference it with module_id instead, or \
+                change its code with hot_update_module). An inline module gets exactly the \
+                allowed_hosts / allowed_methods / allowed_secrets the node declares — none by default, \
+                and never \"*\" hosts. Every node is compiled before any module is written. \
                 Edges use source/target node IDs and may include condition and edge_type. \
                 Returns the workflow_id and a compilation summary for each inline node.",
             "inputSchema": {
@@ -803,6 +809,8 @@ pub fn tool_schemas() -> Vec<serde_json::Value> {
                                     "description": format!("Capability world for rust_code nodes (default: minimal-node). Options: {}.", worlds_csv)
                                 },
                                 "allowed_secrets": { "type": "array", "items": { "type": "string" }, "description": "Vault paths this inline node may access (e.g. [\"api/my-service\", \"*\"])" },
+                                "allowed_hosts": { "type": "array", "items": { "type": "string" }, "description": "Hosts this inline node's module may call over HTTP (e.g. [\"api.example.com\"]). Default: none. \"*\" is refused — a spec grants egress by host name; widen deliberately with update_module_hosts." },
+                                "allowed_methods": { "type": "array", "items": { "type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"] }, "description": "HTTP verbs this inline node's module may use. Default: none (an empty list denies every verb)." },
                                 "config": { "type": "object", "description": "Node configuration key-value pairs, same as update_node_config" }
                             },
                             "required": ["id"]
@@ -2269,6 +2277,9 @@ async fn handle_add_node_to_workflow(
                 dependencies,
                 integration_name,
                 fuel_budget,
+                // Re-running add_node_to_workflow with the same node_id
+                // updates that node's module (guarded).
+                on_name_collision: talos_inline_compile_service::NameCollision::Recompile,
             })
             .await
         {
@@ -11858,6 +11869,22 @@ async fn handle_create_workflow_from_spec(
         }
     };
 
+    // Role gate, per compiled world — the same gate every other compile path
+    // runs (`require_agent_role_permits_world`). Before 2026-09-25 this path
+    // compiled at whatever world the spec named, for any agent role. Runs over
+    // `inline_compile_worlds`, which follows the service's own resolution
+    // precedence, so it sees exactly the nodes that will compile.
+    for (_node_id, world) in talos_workflow_creation::inline_compile_worlds(&spec_nodes) {
+        if let Err(resp) = crate::sandbox::require_agent_role_permits_world(
+            &req_id,
+            &agent,
+            world,
+            "compile inline modules for",
+        ) {
+            return resp;
+        }
+    }
+
     let outcome = match state
         .workflow_creation_service
         .create_from_spec(CreateFromSpecRequest {
@@ -11980,6 +12007,22 @@ async fn handle_create_workflow_from_spec(
         CreateFromSpecOutcome::EdgeConditionTooLong => {
             mcp_error(req_id, -32602, "Edge condition must be ≤ 2000 characters")
         }
+        CreateFromSpecOutcome::DuplicateNodeId { node_id } => mcp_error(
+            req_id,
+            -32602,
+            &format!(
+                "Node id '{}' appears more than once in this spec; node ids must be unique.",
+                node_id
+            ),
+        ),
+        CreateFromSpecOutcome::InvalidInlineNode { node_id, reason } => {
+            mcp_error(req_id, -32602, &format!("Node '{}': {}", node_id, reason))
+        }
+        // Absent and foreign are one answer (no module-UUID existence oracle).
+        CreateFromSpecOutcome::ModuleNotAccessible {
+            node_id: _,
+            module_id,
+        } => crate::utils::module_not_accessible_error(req_id, module_id),
     }
 }
 

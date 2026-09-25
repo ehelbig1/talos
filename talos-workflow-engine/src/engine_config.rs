@@ -798,6 +798,38 @@ impl ParallelWorkflowEngine {
         self.http_verb_ceiling = ceiling;
     }
 
+    /// Stamp all four signed per-actor ceilings at once.
+    ///
+    /// Destructures exhaustively, so a fifth axis added to
+    /// [`talos_workflow_engine_core::ActorCeilings`] is a compile error here
+    /// until it is stamped — the verb override was silently dropped on the
+    /// sub-workflow path precisely because the stamp there listed the axes by
+    /// hand (2026-09-25). Prefer this over the four single-axis setters
+    /// whenever the value came from an actor.
+    pub fn set_ceilings(&mut self, ceilings: talos_workflow_engine_core::ActorCeilings) {
+        let talos_workflow_engine_core::ActorCeilings {
+            max_llm_tier,
+            max_write_ceiling,
+            http_verb_ceiling,
+            egress_scope,
+        } = ceilings;
+        self.max_llm_tier = max_llm_tier;
+        self.max_write_ceiling = max_write_ceiling;
+        self.http_verb_ceiling = http_verb_ceiling;
+        self.egress_scope = egress_scope;
+    }
+
+    /// The four signed per-actor ceilings this engine currently carries.
+    #[must_use]
+    pub fn ceilings(&self) -> talos_workflow_engine_core::ActorCeilings {
+        talos_workflow_engine_core::ActorCeilings {
+            max_llm_tier: self.max_llm_tier,
+            max_write_ceiling: self.max_write_ceiling,
+            http_verb_ceiling: self.http_verb_ceiling,
+            egress_scope: self.egress_scope,
+        }
+    }
+
     /// Stamp the actor's capability-world ceiling (`actors.max_capability_world`).
     /// Called by `talos_engine::actor_binding::apply_actor_to_engine` — `None`
     /// for the ceiling-exempt default actor. Every module dispatch, in this

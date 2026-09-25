@@ -510,6 +510,12 @@ pub(crate) fn tier1_egress_class(policy: &str) -> &'static str {
     match policy {
         "tier1-llm-egress" => TIER1_LLM_EGRESS,
         "tier1-public-ip-egress" => TIER1_PUBLIC_IP_EGRESS,
+        // A tier-2 + `egress_scope = local` actor refused a public IP literal
+        // (2026-09-25). This IS the blanket local-egress-only gate that
+        // `TIER1_EGRESS` names, decided at validation time because a resolver
+        // never sees a literal — explicit so the mapping is a decision, not a
+        // fall-through, and `ALL` stays closed.
+        "local-egress-public-ip" => TIER1_EGRESS,
         _ => TIER1_EGRESS,
     }
 }

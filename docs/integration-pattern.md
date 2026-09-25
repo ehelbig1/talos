@@ -237,6 +237,36 @@ template: expired, wrong audience, wrong issuer, missing kid,
 unknown kid with network unavailable, tampered signature, `alg:
 none`, HS256, backoff guard.
 
+#### What the transport is told when the watch lookup produces no row
+
+Immediately after authenticating a delivery every push handler asks *which
+watch is this for?*, and that lookup is **three-valued**. The two non-`Found`
+answers mean opposite things and must get opposite status codes:
+
+| lookup | meaning | answer | why |
+|---|---|---|---|
+| `Ok(None)` | the watch is definitely not there (revoked, or renewed while the old id was in flight) | **200 — ack** | a determinate answer; deferring makes the transport redeliver for the life of the subscription |
+| `Err(_)` | the lookup did not answer (pool timeout, Postgres restart) | **503 — defer** | existence is UNKNOWN; acking tells the transport it was handled and drops it permanently, and nothing else retries it |
+
+Use `talos_integration_helpers::push_ack::{PushWatchLookup, defer_unreadable_watch}` —
+the decision has ONE home so the two cannot be answered the same way by
+accident, and `defer_unreadable_watch` counts the deferral on
+`talos_google_push_deferred_total` as it returns the status.
+
+**This is the same fail-closed rule §3 already states for `check_module_binding`
+(`Unreadable` → 503, retryable), and it did not replicate.** The Calendar
+webhook — the first integration, and the one this document is distilled from —
+had it right: `Ok(None)` → 200, `Err` → 500. Gmail and GCP, written second and
+third by copying the pattern, returned **200 for both**, so a transient database
+failure discarded a push Pub/Sub would have redelivered. Fixed 2026-09-25
+(package ES); if you are writing the fourth integration, this row of the table
+is the one to copy deliberately rather than by imitation.
+
+Note the ORDERING too: this lookup sits above the execution-pause gate, so on a
+database outage it is reached first — the pause gate's own
+deferred-not-dropped reasoning is unreachable in exactly the scenario it was
+written for.
+
 ### 3. Watch lifecycle — `<integration>/watch.rs`
 
 A service struct + five methods:

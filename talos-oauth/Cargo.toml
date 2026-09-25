@@ -15,6 +15,9 @@ chrono.workspace = true
 dashmap = "6.1"
 futures = "0.3"
 hex = "0.4"
+# Cookie / Set-Cookie header types for the connect browser binding (the same
+# `http` 1.x axum and reqwest already use).
+http = "1"
 redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "tls-rustls", "tls-rustls-webpki-roots", "tokio-rustls-comp"] }
 oauth2 = { version = "5.0.0", default-features = false, features = ["reqwest", "rustls-tls"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -22,6 +25,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio-rustls", "macros", "uuid", "json", "chrono"] }
+talos-config = { path = "../talos-config" }
 talos-dlp-provider = { path = "../talos-dlp-provider" }
 talos-http-body = { path = "../talos-http-body" }
 # Reactive-repair outcome counter (talos_oauth_reactive_refresh_total). The

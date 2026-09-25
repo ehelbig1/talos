@@ -26,7 +26,7 @@ pub mod webhook;
 pub use actor_budget::{BudgetCap, BudgetMode};
 pub use execution::ModuleExecutionOutcome;
 pub use execution_pause::{PauseGatePath, PauseRefusal};
-pub use google_push::{JwkRefreshOutcome, PushIntegration, PushRefusalReason};
+pub use google_push::{JwkRefreshOutcome, PushDeferReason, PushIntegration, PushRefusalReason};
 pub use mcp::McpToolOutcome;
 pub use outcome_class::OutcomeClass;
 pub use rpc::{seeded_pairs as rpc_seeded_pairs, RpcOutcome, RpcSubject};
@@ -718,6 +718,28 @@ pub fn record_google_push_accepted_on(metrics: &TalosMetrics, integration: PushI
     metrics
         .google_push_accepted_total
         .with_label_values(&[integration.as_str()])
+        .inc();
+}
+
+/// Count one push DEFERRED for redelivery. Not a refusal: see
+/// [`PushDeferReason`]. The transport retries, so this series climbing means
+/// work is being delayed — and, if it keeps climbing past the subscription's
+/// retention, eventually lost.
+pub fn record_google_push_deferred(integration: PushIntegration, reason: PushDeferReason) {
+    if let Some(m) = global() {
+        record_google_push_deferred_on(m, integration, reason);
+    }
+}
+
+/// [`record_google_push_deferred`] against an explicit registry (tests).
+pub fn record_google_push_deferred_on(
+    metrics: &TalosMetrics,
+    integration: PushIntegration,
+    reason: PushDeferReason,
+) {
+    metrics
+        .google_push_deferred_total
+        .with_label_values(&[integration.as_str(), reason.as_str()])
         .inc();
 }
 
@@ -1877,6 +1899,10 @@ pub struct TalosMetrics {
     // seeded over their closed sets (`google_push`).
     pub google_push_refusals_total: CounterVec,
     pub google_push_accepted_total: CounterVec,
+    /// `talos_google_push_deferred_total{integration,reason}` — pushes handed
+    /// back to the transport for redelivery because Talos could not answer.
+    /// `PushIntegration::ALL` x `PushDeferReason::ALL`, seeded at 0. Package ES.
+    pub google_push_deferred_total: CounterVec,
 
     // Deployment-wide execution pause — added 2026-09-14 (package BF) when the
     // pause turned out never to have taken effect. `PauseGatePath::ALL` ×
@@ -3504,6 +3530,31 @@ impl TalosMetrics {
                 .with_label_values(&[integration.as_str()])
                 .inc_by(0.0);
         }
+        let google_push_deferred_total = CounterVec::new(
+            prometheus::Opts::new(
+                "talos_google_push_deferred_total",
+                "Google push deliveries handed BACK to the transport for redelivery \
+                 (503), by integration (gmail | gcp) and reason. Not a refusal: \
+                 talos_google_push_refusals_total counts pushes we REJECTED, this counts \
+                 pushes we could not ANSWER. reason=watch_lookup_unreadable (the \
+                 watch/channel lookup returned Err, so the row's existence is unknown — \
+                 an ABSENT row is a determinate answer and is acked instead). Closed sets \
+                 (talos_metrics::{PushIntegration, PushDeferReason}), both pairs \
+                 pre-seeded at 0. Deferral is the safe direction, but a deferral that \
+                 repeats past the subscription's retention (7 d by default) becomes real \
+                 loss, which is why it is counted rather than only logged. Not alerted: no \
+                 baseline — this arm has never fired on the reference fleet.",
+            ),
+            &["integration", "reason"],
+        )?;
+        registry.register(Box::new(google_push_deferred_total.clone()))?;
+        for integration in PushIntegration::ALL {
+            for reason in PushDeferReason::ALL {
+                google_push_deferred_total
+                    .with_label_values(&[integration.as_str(), reason.as_str()])
+                    .inc_by(0.0);
+            }
+        }
         let google_jwk_refresh_total = CounterVec::new(
             prometheus::Opts::new(
                 "talos_google_jwk_refresh_total",
@@ -4094,6 +4145,7 @@ impl TalosMetrics {
             platform_admin_checks_total,
             google_push_refusals_total,
             google_push_accepted_total,
+            google_push_deferred_total,
             execution_pause_refusals_total,
             webhook_duplicate_suppressed_total,
             actor_budget_refusals_total,
@@ -4608,6 +4660,60 @@ mod tests {
         // The counter is seeded, so its line count does not move.
         assert_eq!(lines(&cold, "talos_rpc_calls_total"), 64);
         assert_eq!(lines(&warm, "talos_rpc_calls_total"), 64);
+    }
+
+    /// The DEFERRED-push counter (package ES) is seeded over its whole closed
+    /// product and moved by exactly the integration it was given.
+    ///
+    /// The seeding is the load-bearing half: this arm has never fired on the
+    /// reference fleet, so on any controller that has not deferred a push the
+    /// series would be ABSENT, and `increase()` over an absent series matches
+    /// nothing — "no push has ever been deferred" and "the deferral is not
+    /// wired" would render identically. The counter is also asserted to be
+    /// SEPARATE from the refusal counter: a refusal means we rejected a sender,
+    /// a deferral means we could not answer one, and folding them would put a
+    /// platform failure behind a counter whose every other value is the
+    /// fail-closed control working as designed.
+    #[test]
+    fn google_push_deferred_is_seeded_over_its_closed_product() {
+        let m = TalosMetrics::new().unwrap();
+        let cold = m.render_prometheus().expect("render");
+        for integration in PushIntegration::ALL {
+            for reason in PushDeferReason::ALL {
+                assert!(
+                    cold.contains(&format!(
+                        "talos_google_push_deferred_total{{integration=\"{}\",reason=\"{}\"}} 0",
+                        integration.as_str(),
+                        reason.as_str()
+                    )),
+                    "unseeded pair {}/{} reads as absent, not zero",
+                    integration.as_str(),
+                    reason.as_str()
+                );
+            }
+        }
+        record_google_push_deferred_on(
+            &m,
+            PushIntegration::Gmail,
+            PushDeferReason::WatchLookupUnreadable,
+        );
+        let warm = m.render_prometheus().expect("render");
+        assert!(warm.contains(
+            "talos_google_push_deferred_total{integration=\"gmail\",reason=\"watch_lookup_unreadable\"} 1"
+        ));
+        assert!(
+            warm.contains(
+                "talos_google_push_deferred_total{integration=\"gcp\",reason=\"watch_lookup_unreadable\"} 0"
+            ),
+            "one integration's deferral must not move another's"
+        );
+        // A deferral is NOT a refusal.
+        assert!(
+            warm.contains(
+                "talos_google_push_refusals_total{integration=\"gmail\",reason=\"invalid\"} 0"
+            ),
+            "the refusal counter must be untouched by a deferral"
+        );
     }
 
     /// The accepted-push counter (2026-09-18) is seeded for every

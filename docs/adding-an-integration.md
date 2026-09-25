@@ -38,12 +38,43 @@ SSRF-safe, and OOM-bounded without you having to re-derive any of it.
    you add a provider-side lookup table, its credential lookup **must** carry
    `AND user_id = $requesting_user` and fail closed.
 
-2. **Callback identity comes from the state token, never the session cookie.**
+2. **Callback identity comes from the state token, never the session cookie —
+   and the state is bound to the BROWSER that started the flow.**
    The OAuth callback recovers `user_id` from `oauth_state_tokens` (set at
    authorize time), because an attacker who completes consent on *their* account
-   can hand a victim the callback URL. `consume_oauth_state` does this for you —
-   use it. State consume MUST be atomic single-use
+   can hand a victim the callback URL. State consume MUST be atomic single-use
    (`UPDATE … used=true … WHERE used=false … RETURNING`).
+
+   The state alone proves which Talos user **started** the flow, not which
+   browser **finished** it. The reverse attack is the dangerous one: the
+   attacker starts a connect under their own account and hands the victim the
+   *authorize* URL; the victim consents, and the victim's refresh token is stored
+   under the attacker's `user_id`. (Every integration except the login flow had
+   this until 2026-09-25.) So:
+
+   * the **connect** handler builds `talos_oauth::BrowserBinding::for_request(&headers)`,
+     passes it to `get_authorization_url` / `authorization_url`, and sets
+     `binding.set_cookie_pair()` on its response — the `talos_oauth_connect`
+     cookie (`HttpOnly`, `SameSite=Lax` so it survives the provider's
+     cross-site redirect back, 10 minutes, `Secure` in production). Only its
+     SHA-256 is stored on the state row;
+   * the **callback** handler passes `talos_oauth::presented_connect_binding(&headers)`
+     to `handle_callback` / `handle_oauth_callback`, and `consume_oauth_state`
+     refuses a missing, ambiguous or mismatched cookie — and a state row with
+     no binding at all. The refusal still burns the state (no retry), and logs
+     `event_kind = "oauth_connect_binding_refused"` under `talos_audit` with the
+     reason and never a value.
+
+   Do not "fix" a failing callback by making the binding optional: an unbound
+   state is the defect. Because the callback host must receive a cookie set on
+   the connect response, the redirect URI's HOST must be the host the SPA calls
+   `/api/.../connect` on (cookies are per-host, not per-port).
+
+   **A callback parameter the provider does not sign is not evidence.** GitHub
+   documents that its App Setup-URL `installation_id` can be spoofed; the
+   GitHub App flow therefore proves access with a user token
+   (`GET /user/installations`) before claiming, and its claim never reassigns
+   an active installation another user holds (`GithubAppInstallationRepository::claim_recorded`).
 
 3. **Inbound push/webhook requests must be authenticated before any DB work,**
    and mapped to the owning user via the *owned trigger/channel row* or a
@@ -123,19 +154,33 @@ SSRF-safe, and OOM-bounded without you having to re-derive any of it.
    — consume-before-exchange — impossible to skip):
 
    ```rust
-   pub async fn get_authorization_url(&self, user_id: Uuid) -> Result<(String, String)> {
-       talos_oauth::authorization_url(&self.db_pool, self, user_id).await
+   pub async fn get_authorization_url(
+       &self,
+       user_id: Uuid,
+       binding: &talos_oauth::BrowserBinding,
+   ) -> Result<(String, String)> {
+       talos_oauth::authorization_url(&self.db_pool, self, user_id, binding).await
    }
-   pub async fn handle_callback(&self, code: String, state: String) -> Result<MyIntegration> {
-       talos_oauth::handle_oauth_callback(&self.db_pool, self, &code, &state).await
+   pub async fn handle_callback(
+       &self,
+       code: String,
+       state: String,
+       presented_binding: Option<&str>,
+   ) -> Result<MyIntegration> {
+       talos_oauth::handle_oauth_callback(&self.db_pool, self, &code, &state, presented_binding)
+           .await
    }
    ```
 
    **`talos-slack` is the canonical reference implementation** — copy its shape.
 
 5. **Wire the two HTTP handlers** (authorize redirect + callback) in `talos-api`
-   / `talos-mcp-handlers`, gated by the usual auth (`require_2fa`, scope). The
-   callback handler just calls `handle_callback`.
+   / `talos-mcp-handlers`, gated by the usual auth (`require_2fa`, scope). Both
+   take `headers: HeaderMap`: the connect handler sets the binding cookie on
+   its response (rule 2), and the callback handler passes the presented cookie
+   to `handle_callback`. The callback route carries NO session auth — the
+   session cookie is `SameSite=Strict` and never arrives on the provider's
+   redirect.
 
 6. **Add the provider hostname to the LLM/host allow/deny lists only if
    relevant**, and register the crate in the workspace `Cargo.toml`.
@@ -182,6 +227,7 @@ coding. Key extra rules:
 - [ ] Every response body via `talos_http_body::read_json_capped` / `read_error_text_capped` — **lint 31**
 - [ ] OAuth via `OAuthIntegration` + drivers (or `begin`/`consume` primitives) — no hand-rolled PKCE/CSRF/consume
 - [ ] Credentials stored via `OAuthCredentialService` against the **state-bound `user_id`**
+- [ ] Connect handler sets the `BrowserBinding` cookie; callback passes `presented_connect_binding` — **rule 2**
 - [ ] Any provider-side credential lookup filters `AND user_id = $requesting_user` and fails closed — **tenancy**
 - [ ] Inbound requests authenticated (HMAC/JWT/`token_hash`) before DB work — **lint 41**
 - [ ] No token / refresh-token / email logged; secret structs have a redacting `Debug` — **lint 37**

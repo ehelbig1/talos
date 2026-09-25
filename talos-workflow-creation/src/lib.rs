@@ -29,8 +29,8 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde_json::Value;
-use talos_compilation::CompilationService;
 use talos_dlp_provider::DlpService;
+use talos_inline_compile_service::InlineCompileService;
 use talos_llm::LlmClient;
 use talos_module_repository::ModuleRepository;
 use talos_workflow_repository::WorkflowRepository;
@@ -38,8 +38,10 @@ use uuid::Uuid;
 
 pub mod spec;
 pub use spec::{
-    BuildStage, CreateFromSpecOutcome, CreateFromSpecRequest, NodeBuildError, SpecCreatedOutcome,
-    MAX_EDGE_CONDITION_LEN, MAX_SPEC_DESCRIPTION_LEN, MAX_SPEC_NAME_LEN, MAX_SPEC_NODES,
+    classify_spec_node, inline_compile_worlds, spec_node_id, BuildStage, CreateFromSpecOutcome,
+    CreateFromSpecRequest, NodeBuildError, SpecCreatedOutcome, SpecNodeSource,
+    MAX_EDGE_CONDITION_LEN, MAX_INLINE_NODE_ID_LEN, MAX_INLINE_RUST_BYTES,
+    MAX_SPEC_DESCRIPTION_LEN, MAX_SPEC_NAME_LEN, MAX_SPEC_NODES,
 };
 
 /// Input to [`WorkflowCreationService::create_from_description`].
@@ -261,7 +263,7 @@ pub enum InputError {
 /// service holds no per-request state.
 ///
 /// Dependencies — three are always required (`workflow_repo`,
-/// `dlp_service`, `module_repo`, `compiler`); `llm_client` is
+/// `dlp_service`, `module_repo`, `inline_compile`); `llm_client` is
 /// optional because [`Self::create_from_description`] gracefully
 /// degrades to the explicit-modules-only path when no LLM is
 /// configured (typically: tests, dev environments without
@@ -274,8 +276,10 @@ pub struct WorkflowCreationService {
     /// resolution path (`module_name` → template UUID).
     pub(crate) module_repo: Arc<ModuleRepository>,
     /// Used by [`Self::create_from_spec`] for the inline-Rust
-    /// node-compilation path.
-    pub(crate) compiler: Arc<CompilationService>,
+    /// node-compilation path — the SAME service `add_node_to_workflow`
+    /// compiles through (2026-09-25). Before this the spec path held a raw
+    /// `CompilationService` and ran none of that service's gates.
+    pub(crate) inline_compile: Arc<InlineCompileService>,
 }
 
 impl WorkflowCreationService {
@@ -284,14 +288,14 @@ impl WorkflowCreationService {
         llm_client: Option<Arc<LlmClient>>,
         dlp_service: Arc<DlpService>,
         module_repo: Arc<ModuleRepository>,
-        compiler: Arc<CompilationService>,
+        inline_compile: Arc<InlineCompileService>,
     ) -> Self {
         Self {
             workflow_repo,
             llm_client,
             dlp_service,
             module_repo,
-            compiler,
+            inline_compile,
         }
     }
 

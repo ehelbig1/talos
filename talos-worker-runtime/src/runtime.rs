@@ -2467,9 +2467,11 @@ pub struct TalosRuntime {
 /// required either; we register them (and only them) in non-trusted worlds to
 /// preserve forward type-compatibility while ensuring the egress handler is
 /// unavailable — a component importing `wasi:http/outgoing-handler` under a
-/// non-trusted world now FAILS TO LINK (fail closed). The full handler is
-/// registered ONLY by [`build_trusted_linker`], whose automation modules are
-/// operator-authored and allowed unrestricted egress by design.
+/// non-trusted world now FAILS TO LINK (fail closed). The handler is
+/// registered ONLY by [`build_trusted_linker`], and since 2026-09-25 it is the
+/// GATED handler in `host::wasi_http` over a hardened send path — the
+/// "operator-authored, unrestricted by design" premise was false (any user
+/// with an `automation-node` grant compiles such a module).
 fn add_wasi_http_types_only(l: &mut Linker<TalosContext>) -> Result<()> {
     use wasmtime_wasi_http::p2::{bindings, WasiHttp};
     let options = bindings::LinkOptions::default();
@@ -2597,12 +2599,18 @@ fn build_trusted_linker(engine: &Engine) -> Result<Linker<TalosContext>> {
     let mut l = Linker::new(engine);
 
     wasmtime_wasi::p2::add_to_linker_async(&mut l)?;
-    // SECURITY (H2): the trusted/automation tier is the ONLY world that
-    // receives the full `wasi:http` surface including `outgoing-handler`
-    // (unfiltered egress via default_hooks). Trusted modules are
-    // operator-authored and allowed unrestricted egress by design;
-    // non-trusted worlds get types only (see add_wasi_http_types_only).
-    wasmtime_wasi_http::p2::add_only_http_to_linker_async(&mut l)?;
+    // SECURITY: the trusted/automation tier is the ONLY world that receives
+    // `wasi:http/outgoing-handler` — and since 2026-09-25 it is the GATED one
+    // (`host::wasi_http::GatedOutgoing`: the `talos:core/http` gate set —
+    // allowlist, SSRF, egress posture, write ceiling, method allowlist, rate
+    // limits, ledger) over the hardened send path. Before that this linked
+    // upstream's handler with `default_hooks()`: unfiltered egress, on the
+    // stated premise that trusted modules are operator-authored, which is not
+    // true — any user holding an `automation-node` grant compiles one, and
+    // `talos-compilation` wires a JS module's `fetch` to this handler.
+    // Non-trusted worlds get types only (see add_wasi_http_types_only).
+    add_wasi_http_types_only(&mut l)?;
+    crate::host::wasi_http::add_gated_outgoing_handler(&mut l)?;
     crate::bindings::AutomationNode::add_to_linker::<TalosContext, HasSelf<TalosContext>>(
         &mut l,
         |ctx| ctx,
@@ -6603,7 +6611,9 @@ mod tests {
             "secrets linker (derives from network) must NOT register outgoing-handler"
         );
 
-        // The trusted/automation tier IS allowed unrestricted egress by design.
+        // The trusted/automation tier registers the handler — the GATED one
+        // (`host::wasi_http`); `the_trusted_handler_is_the_gated_one` pins
+        // which implementation it is.
         assert!(
             has_outgoing_handler(build_trusted_linker(&eng).unwrap()),
             "trusted linker MUST register wasi:http/outgoing-handler"

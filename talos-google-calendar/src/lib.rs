@@ -315,8 +315,12 @@ impl GoogleCalendarService {
     /// callback recovers identity from the token — never a session cookie
     /// (see the `OAuthIntegration` impl for the anti-hijack rationale).
     /// Returns `(authorization_url, csrf_state_token)`.
-    pub async fn get_authorization_url(&self, user_id: Uuid) -> Result<(String, String)> {
-        talos_oauth::authorization_url(&self.db_pool, self, user_id).await
+    pub async fn get_authorization_url(
+        &self,
+        user_id: Uuid,
+        binding: &talos_oauth::BrowserBinding,
+    ) -> Result<(String, String)> {
+        talos_oauth::authorization_url(&self.db_pool, self, user_id, binding).await
     }
 
     /// Handle the dedicated Calendar OAuth callback: the shared driver consumes
@@ -327,8 +331,10 @@ impl GoogleCalendarService {
         &self,
         code: String,
         state: String,
+        presented_binding: Option<&str>,
     ) -> Result<GoogleCalendarIntegration> {
-        talos_oauth::handle_oauth_callback(&self.db_pool, self, &code, &state).await
+        talos_oauth::handle_oauth_callback(&self.db_pool, self, &code, &state, presented_binding)
+            .await
     }
 
     /// Get integration by ID

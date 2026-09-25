@@ -99,13 +99,10 @@ impl SubworkflowActorContextResolver for ControllerSubActorContextResolver {
             // `actor_id` is present so the sub-engine adopts the sub-workflow's
             // OWN memory scope; ceilings are the sub-actor's RAW values (the
             // executor narrows them against the parent).
-            Ok(Some((actor_id, tier, write, egress))) => {
+            Ok(Some((actor_id, ceilings))) => {
                 Some(talos_workflow_engine_core::SubworkflowBinding {
                     actor_id: Some(actor_id),
-                    max_llm_tier: tier,
-                    max_write_ceiling: write,
-                    http_verb_ceiling: None,
-                    egress_scope: egress,
+                    ceilings,
                 })
             }
             // Workflow not visible / no bound actor / actor not owned →
@@ -134,15 +131,15 @@ impl SubworkflowActorContextResolver for ControllerSubActorContextResolver {
                     %workflow_id,
                     error = %e,
                     "resolve_binding: DB error resolving sub-workflow actor binding; \
-                     failing closed to (Tier1, ReadOnly), keeping parent identity"
+                     failing closed on every ceiling axis, keeping parent identity"
                 );
+                // `FAIL_CLOSED` is restrictive on ALL four axes EXPLICITLY —
+                // including the verb override, which this arm used to leave
+                // `None`, so a parent's `Some(Write)` override survived the
+                // fail-closed stamp (2026-09-25).
                 Some(talos_workflow_engine_core::SubworkflowBinding {
                     actor_id: None,
-                    max_llm_tier: talos_workflow_engine_core::LlmTier::Tier1,
-                    max_write_ceiling: talos_workflow_engine_core::WriteCeiling::ReadOnly,
-                    http_verb_ceiling: None,
-                    // Fail closed on the egress axis too: no public egress.
-                    egress_scope: Some(talos_workflow_engine_core::EgressScope::Local),
+                    ceilings: talos_workflow_engine_core::ActorCeilings::FAIL_CLOSED,
                 })
             }
         }

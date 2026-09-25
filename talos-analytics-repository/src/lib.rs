@@ -2978,6 +2978,8 @@ impl AnalyticsRepository {
                         EXISTS (SELECT 1 FROM users x WHERE x.id = a.resource_id) \
                       WHEN a.resource_type = 'worker_provisioning_token' THEN \
                         EXISTS (SELECT 1 FROM worker_provisioning_tokens x WHERE x.id = a.resource_id) \
+                      WHEN a.resource_type = 'github_app_installation' THEN \
+                        EXISTS (SELECT 1 FROM github_app_installations x WHERE x.id = a.resource_id) \
                       WHEN a.resource_type = 'execution' THEN \
                         EXISTS (SELECT 1 FROM workflow_executions x WHERE x.id = a.resource_id) \
                         OR EXISTS (SELECT 1 FROM workflow_executions_archive x WHERE x.id = a.resource_id) \

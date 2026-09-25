@@ -203,25 +203,6 @@ pub fn write_ceiling_denies_axis(
     )
 }
 
-/// Narrow an optional verb-inference override the way `most_restrictive`
-/// narrows a ceiling, for sub-workflow composition.
-///
-/// `None` means inherit, so it must NOT win over an explicit `Some`: a parent
-/// that declares nothing cannot widen a child that declares `ReadOnly`, and a
-/// child that declares nothing inherits rather than loosening the parent. Two
-/// explicit values narrow to the more restrictive one.
-#[must_use]
-pub fn narrow_verb_inference_override(
-    parent: Option<WriteCeiling>,
-    child: Option<WriteCeiling>,
-) -> Option<WriteCeiling> {
-    match (parent, child) {
-        (None, None) => None,
-        (Some(v), None) | (None, Some(v)) => Some(v),
-        (Some(a), Some(b)) => Some(a.most_restrictive(b)),
-    }
-}
-
 /// The one write-ceiling decision in the workspace: does this job's ceiling
 /// REFUSE a data-mutating operation?
 ///
@@ -265,10 +246,7 @@ pub const AGENT_MEMORY_SET_OP: &str = "agent-memory-set";
 #[cfg(test)]
 mod tests {
     use super::WriteCeiling;
-    use super::{
-        effective_write_ceiling, narrow_verb_inference_override, write_ceiling_denies_axis,
-        CeilingAxis,
-    };
+    use super::{effective_write_ceiling, write_ceiling_denies_axis, CeilingAxis};
 
     #[test]
     fn canonical_strings_round_trip() {
@@ -448,39 +426,6 @@ mod tests {
                 Some(WriteCeiling::ReadOnly),
             ));
         }
-    }
-
-    /// Sub-workflow narrowing: `None` never widens an explicit value.
-    #[test]
-    fn narrowing_never_widens() {
-        use WriteCeiling::{ReadOnly, Write};
-        assert_eq!(narrow_verb_inference_override(None, None), None);
-        // An absent side inherits the explicit one rather than erasing it.
-        assert_eq!(
-            narrow_verb_inference_override(Some(ReadOnly), None),
-            Some(ReadOnly)
-        );
-        assert_eq!(
-            narrow_verb_inference_override(None, Some(ReadOnly)),
-            Some(ReadOnly)
-        );
-        assert_eq!(
-            narrow_verb_inference_override(Some(Write), None),
-            Some(Write)
-        );
-        // Two explicit values take the more restrictive.
-        assert_eq!(
-            narrow_verb_inference_override(Some(Write), Some(ReadOnly)),
-            Some(ReadOnly)
-        );
-        assert_eq!(
-            narrow_verb_inference_override(Some(ReadOnly), Some(Write)),
-            Some(ReadOnly)
-        );
-        assert_eq!(
-            narrow_verb_inference_override(Some(Write), Some(Write)),
-            Some(Write)
-        );
     }
 
     /// SQL NULL is INHERIT and must never become a value.
