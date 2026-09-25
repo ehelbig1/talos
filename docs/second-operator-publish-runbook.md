@@ -18,7 +18,7 @@ What you need: **write access to the repo** (enough to run
 
 ```bash
 # 1. Confirm the commit you want to ship has a green quality.yml run
-#    (quality.yml runs on every push to main, so merged commits have one):
+#    (the merge queue runs quality.yml on the exact commit that lands on main, so merged commits have one):
 gh run list --workflow quality.yml --commit "$(git rev-parse origin/main)"
 
 # 2. Dispatch the publish (from main):

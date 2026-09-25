@@ -87,6 +87,28 @@ EXIT_CODE=0
 TREE_PRUNE_FIND=( -not -path '*/.claude/*' -not -path '*/.git/*' )
 TREE_PRUNE_GREP=( --exclude-dir=.claude --exclude-dir=.git )
 
+# ── clippy `disallowed-methods` rules (checks 29, 53, 63, 78) ─────────
+# Four "never call X outside Y" rules are enforced by CLIPPY, which resolves
+# the call by type — an alias, a re-export or a UFCS call cannot hide one
+# from it, and each could hide from the grep these checks used to run. The
+# rules live in clippy.toml; clippy fails `-D warnings` on a call anywhere
+# (quality.yml's clippy job on every PR; check 7 locally with
+# TALOS_LINT_CLIPPY=1 / `make lint-full`). What clippy cannot judge is WHERE
+# an `#[allow(clippy::disallowed_methods)]` may sit, so each check below asks
+# scripts/lint-clippy-disallowed.py to verify its clippy.toml entry, pin the
+# method it names to its definition (an unresolvable path is only a clippy
+# WARNING), and confine the allows that name it to the sanctioned files.
+clippy_disallowed_rule() {
+    local out
+    if out="$(python3 scripts/lint-clippy-disallowed.py check "$1" 2>&1)"; then
+        green "$out"
+        return 0
+    fi
+    while IFS= read -r l; do red "$l"; done <<< "$out"
+    EXIT_CODE=1
+    return 1
+}
+
 # ── 1. Raw actor_memory SQL + legacy value-column projections ─────────
 bold "▶ check 1: actor_memory writes + value-column projections outside talos-memory/"
 
@@ -659,18 +681,35 @@ bold "▶ check 7: cargo clippy --workspace --all-targets --no-deps -- -D warnin
 # stays: dependencies' lints are not ours to fix.
 #
 # This check is gated behind TALOS_LINT_CLIPPY=1 by default because
-# clippy is a 60-90s build for a fresh tree. CI sets the env. Local
-# `make lint` callers can opt in by exporting it.
+# clippy is a 60-90s build for a fresh tree. CI runs it as its own job;
+# `make lint-full` sets the env locally.
 #
 # The output is CAPTURED, not discarded. It used to be `>/dev/null 2>&1` with
 # a "re-run for diagnostics" hint, which made every clippy failure cost the
 # build TWICE — and in a cold worktree that second build is tens of minutes.
 # Same reasoning as check 35. Keeping the log on disk (rather than streaming
 # it) preserves the one-line-per-check output shape on the passing path.
+#
+# Since 2026-09-25 clippy.toml carries the `disallowed-methods` rules checks
+# 29, 53, 63 and 78 used to grep for. Two textual legs run whether or not
+# clippy does: every `allow(clippy::disallowed_methods)` must name the rule
+# it waives (so no allow silently waives the others), and — with clippy on —
+# its log must not say a disallowed path "does not refer to a reachable
+# function": that is only a WARNING, `-D warnings` does not fail it, and it
+# means a rule has silently stopped applying (measured on clippy 0.1.95).
+CLIPPY_ALLOWS_OUT="$(python3 scripts/lint-clippy-disallowed.py check-allows 2>&1)" \
+    && green "$CLIPPY_ALLOWS_OUT" \
+    || { while IFS= read -r l; do red "$l"; done <<< "$CLIPPY_ALLOWS_OUT"; EXIT_CODE=1; }
 if [ "${TALOS_LINT_CLIPPY:-0}" = "1" ]; then
     CLIPPY_LOG="$(mktemp "${TMPDIR:-/tmp}/talos-clippy.XXXXXX")"
     if cargo clippy --workspace --all-targets --no-deps -- -D warnings >"$CLIPPY_LOG" 2>&1; then
-        green "✓ clippy --workspace --all-targets --no-deps clean (-D warnings)"
+        if grep -q 'does not refer to a reachable function' "$CLIPPY_LOG"; then
+            red "✗ a clippy.toml disallowed-methods path no longer resolves — that rule is off:"
+            grep -A3 'does not refer to a reachable function' "$CLIPPY_LOG" | head -20
+            EXIT_CODE=1
+        else
+            green "✓ clippy --workspace --all-targets --no-deps clean (-D warnings)"
+        fi
         rm -f "$CLIPPY_LOG"
     else
         red "✗ clippy --workspace --all-targets --no-deps failed (-D warnings)"
@@ -680,8 +719,8 @@ if [ "${TALOS_LINT_CLIPPY:-0}" = "1" ]; then
         EXIT_CODE=1
     fi
 else
-    yellow "⊘ clippy check skipped (set TALOS_LINT_CLIPPY=1 to enable)"
-    yellow "  CI runs this gate; opt in locally for parity at PR time"
+    yellow "⊘ clippy check skipped (make lint-full / TALOS_LINT_CLIPPY=1 to enable)"
+    yellow "  CI runs this gate on every Rust change; opt in locally for parity"
 fi
 echo
 
@@ -2658,56 +2697,21 @@ bold "▶ check 29: no bare engine.set_actor_id() outside the actor-application 
 #   * talos-engine/src/actor_binding.rs     — `apply_actor_to_engine` (the canonical stamp).
 # Consumers must route through `apply_actor_to_engine`, or the builder's
 # `with_actor_id(...)` followed by `for_workflow(...)` (which re-applies the tier).
-# Opt out (a new path that stamps the tier itself) with
-# `// allow-bare-set-actor-id: <reason>` within 4 lines above.
+# A new path that stamps the tier itself is added to rule 29's sanctioned
+# files in scripts/lint-clippy-disallowed.py and carries
+# `// disallowed-method: <path> — <reason>` + `#[allow(clippy::disallowed_methods)]`
+# on its function (the old `// allow-bare-set-actor-id:` marker had no uses).
 
-SET_ACTOR_VIOLATIONS=0
-if [ -n "$RG_BIN" ]; then
-    sa_matches=$("$RG_BIN" -n --no-heading \
-        -g '*.rs' \
-        -g '!talos-engine/src/actor_binding.rs' \
-        -g '!talos-workflow-engine/**' \
-        -g '!**/tests/**' -g '!**/*_tests.rs' \
-        -e '\.set_actor_id\(' \
-        . 2>/dev/null || true)
-else
-    sa_matches=$(grep -rnE --include='*.rs' '\.set_actor_id\(' \
-        talos-* worker controller 2>/dev/null \
-        | grep -vE 'talos-engine/src/actor_binding\.rs|talos-workflow-engine/|/tests/|_tests\.rs' || true)
-fi
-
-if [ -n "$sa_matches" ]; then
-    while IFS= read -r line; do
-        file=$(echo "$line" | cut -d: -f1)
-        lineno=$(echo "$line" | cut -d: -f2)
-        body=$(echo "$line" | cut -d: -f3-)
-        [ -f "$file" ] || continue
-        # Skip the definition / doc-comment references / commented lines.
-        if echo "$body" | grep -qE 'fn set_actor_id|^\s*//|//!'; then
-            continue
-        fi
-        if [ -n "$lineno" ] && [ "$lineno" -gt 1 ]; then
-            start=$((lineno > 4 ? lineno - 4 : 1))
-            ctx=$(sed -n "${start},${lineno}p" "$file" 2>/dev/null || true)
-            if echo "$ctx" | grep -q '// allow-bare-set-actor-id:'; then
-                continue
-            fi
-        fi
-        printf '  %s\n' "$line"
-        SET_ACTOR_VIOLATIONS=$((SET_ACTOR_VIOLATIONS + 1))
-    done <<< "$sa_matches"
-fi
-
-if [ "$SET_ACTOR_VIOLATIONS" -gt 0 ]; then
-    red "✗ $SET_ACTOR_VIOLATIONS bare engine.set_actor_id() call(s) outside the actor-application path"
+# Enforced by clippy since 2026-09-25 (clippy.toml): the grep this replaced
+# matched `.set_actor_id(` only, so the UFCS spelling
+# `ParallelWorkflowEngine::set_actor_id(&mut e, id)` was invisible to it.
+# Sanctioned: talos-workflow-engine/src (the type's own crate),
+# talos-engine/src/actor_binding.rs, and tests.
+if ! clippy_disallowed_rule 29; then
     yellow "  → use talos_engine::actor_binding::apply_actor_to_engine(&repo, &mut engine, actor_id)"
     yellow "    — it stamps actor_id AND max_llm_tier (fail-closed to Tier-1), or the builder's"
     yellow "    with_actor_id(..) + for_workflow(..). Bare set_actor_id leaves a tier-1 actor at"
     yellow "    the default Tier-2 — a data-egress hole."
-    yellow "  → Opt out (path stamps the tier itself): // allow-bare-set-actor-id: <reason>"
-    EXIT_CODE=1
-else
-    green "✓ engine.set_actor_id() confined to the canonical actor-application path"
 fi
 echo
 
@@ -4115,20 +4119,17 @@ echo
 # so an unguarded panic unwinds through the whole worker and kills every
 # in-flight job — a guest-influenceable DoS. All component compilation
 # MUST route through `TalosRuntime::compile_component_guarded` (which wraps
-# it in `guard_codegen_panic`). The single legitimate site inside that
-# method is tagged `// allow-unguarded-component-new`.
+# it in `guard_codegen_panic`).
+#
+# Enforced by clippy since 2026-09-25 (clippy.toml), WORKSPACE-wide: the grep
+# this replaced scanned worker/src + talos-worker-runtime/src only, so a
+# `Component::new` in the controller (which links the runtime for the WIT
+# inspector, and would die the same way) was out of its range. The one
+# sanctioned call is inside `compile_component_guarded`.
 bold "▶ check 53: unguarded wasmtime Component::new in worker runtime (must route through the panic guard)"
-UNGUARDED_CN="$(grep -rEn 'Component::new\(' --include='*.rs' worker/src talos-worker-runtime/src 2>/dev/null \
-    | grep -v 'allow-unguarded-component-new' \
-    | grep -vE '//.*Component::new' || true)"
-if [ -n "$UNGUARDED_CN" ]; then
-    red "✗ direct wasmtime Component::new outside the panic guard:"
-    echo "$UNGUARDED_CN" | sed 's/^/    /'
+if ! clippy_disallowed_rule 53; then
     yellow "  → route it through TalosRuntime::compile_component_guarded so a Cranelift"
-    yellow "    codegen panic becomes a clean per-job error instead of crashing the worker."
-    EXIT_CODE=1
-else
-    green "✓ all worker Component::new sites route through the codegen panic guard"
+    yellow "    codegen panic becomes a clean per-job error instead of crashing the process."
 fi
 echo
 
@@ -5086,22 +5087,24 @@ else
 fi
 
 # Part B — nobody else constructs a rhai Engine.
+# Part B, since 2026-09-25: `rhai::Engine::new` is a clippy disallowed method
+# (clippy.toml), which sees an aliased or re-exported constructor the grep
+# could not. `Engine::default()` CANNOT be expressed there — clippy silently
+# ignores a trait-impl path (`<rhai::Engine as Default>::default`, measured
+# on 0.1.95) — so that one spelling keeps the textual scan below.
 if [ "$RHAI_FAIL" != "2" ]; then
+    if ! clippy_disallowed_rule 63; then
+        RHAI_FAIL=1
+    fi
     RAW_RHAI_HITS=""
     RHAI_SCANNED=0
     while IFS= read -r f; do
         [ -n "$f" ] || continue
         RHAI_SCANNED=$((RHAI_SCANNED + 1))
-        # Skip the builder's own file, and any file with the opt-out marker.
         case "$f" in "./$RHAI_SANDBOX_REL") continue ;; esac
         grep -q 'allow-raw-rhai-engine' "$f" && continue
-        # Strip //-comments so prose naming Engine::new() doesn't self-trip.
-        # The `if hit=…; then` wrapper is load-bearing under `set -euo
-        # pipefail`: the inner greps legitimately exit 1 on "no match", and a
-        # BARE assignment from a failing pipeline aborts the whole script
-        # (measured: the lint died silently after part A). Keep the wrapper.
         if hit="$(sed 's|//.*||' "$f" \
-                | grep -nE '(^|[^A-Za-z0-9_:])(rhai::)?Engine::(new|default)[[:space:]]*\([[:space:]]*\)' \
+                | grep -nE '(^|[^A-Za-z0-9_:])(rhai::)?Engine::default[[:space:]]*\([[:space:]]*\)' \
                 | grep -v 'wasmtime::' | head -3)"; then
             if [ -n "$hit" ]; then
                 RAW_RHAI_HITS="${RAW_RHAI_HITS}${f#./}:
@@ -5113,9 +5116,6 @@ $(echo "$hit" | sed 's/^/    /')
                     -not -path '*/target/*' \
                     "${TREE_PRUNE_FIND[@]}")"
 
-    # A check that scans nothing reports success. Fail loud instead — this is
-    # what an absolute-path walk from inside a `.claude/worktrees/…` checkout
-    # did before it was caught in review.
     if [ "$RHAI_SCANNED" -lt 100 ]; then
         red "✗ check 63 part B scanned only $RHAI_SCANNED .rs files — the walk is broken"
         yellow "  → expected the whole workspace; a near-empty scan means the find"
@@ -5123,8 +5123,13 @@ $(echo "$hit" | sed 's/^/    /')
         yellow "    is itself under an excluded path). Fix the find, do not lower this."
         RHAI_FAIL=1
     elif [ -n "$RAW_RHAI_HITS" ]; then
-        red "✗ raw rhai Engine construction outside the sandbox builder:"
+        red "✗ rhai Engine::default() outside the sandbox builder:"
         echo "$RAW_RHAI_HITS" | sed 's/^/  /'
+        RHAI_FAIL=1
+    else
+        green "✓ no rhai Engine::default() outside talos-rhai-sandbox"
+    fi
+    if [ "$RHAI_FAIL" = "1" ]; then
         yellow "  → every engine that EVALUATES an expression must come from"
         yellow "    talos_rhai_sandbox::sandboxed_engine(SandboxProfile::…), which applies"
         yellow "    the op/depth/size caps, disables eval + the module resolver, and"
@@ -5132,10 +5137,7 @@ $(echo "$hit" | sed 's/^/    /')
         yellow "    how the dispatch evaluator ended up with no discard and no caps."
         yellow "  → a COMPILE-ONLY syntax check needs no builder: use Engine::new_raw()"
         yellow "    and call only Engine::compile (no print handler, no eval)."
-        yellow "  → opt-out: '// allow-raw-rhai-engine: <reason>' in the file."
-        RHAI_FAIL=1
-    else
-        green "✓ no raw rhai Engine construction outside talos-rhai-sandbox"
+        yellow "  → Engine::default() opt-out: '// allow-raw-rhai-engine: <reason>' in the file."
     fi
 fi
 
@@ -5186,227 +5188,114 @@ echo
 #         script) every CTRL_TESTS/TC_TESTS entry would still read as "gated"
 #         while running nowhere — the exact shape of the defect this check
 #         exists to end, one level up.
-bold "▶ check 64: every tests/*.rs binary is named by a CI runner"
+bold "▶ check 64: every tests/*.rs binary is run by a CI runner"
 
+# Since 2026-09-25 the runners DISCOVER their binaries instead of naming them:
+# scripts/ci_test_targets.py classifies every tests/*.rs and tests/*/main.rs
+# (controller `mod common;` → ctrl, `mod test_helpers;` → tc,
+# `// ci-runner: integration-serial` → ctrl-serial, `// ci-store: <store>` →
+# store, `// ci-ungated: <reason>` → ungated, else dbfree), and both runners
+# ask it. The hand-kept arrays this check used to parse were the line every
+# parallel PR appended to. What the check proves now:
+#   (a) the classifier accepts the tree — every marker well-formed, no
+#       service-reading binary left to default into the DB-free job (the
+#       "green over zero assertions" case), the >=50-target floor;
+#   (b) the runners are WIRED to it — quality.yml runs the DB-free script and
+#       `make test-integration`, the Makefile runs test-integration.sh, and
+#       each script actually calls the classifier for its categories. Without
+#       this, a runner that stopped asking would leave every binary "gated"
+#       while running nowhere — the original defect one level up;
+#   (c) no runner still names a binary LITERALLY that the classifier already
+#       runs (it would run twice and re-grow the hand list), and no literal
+#       entry names a target that does not exist (cargo's `no test target
+#       named X` — the #567 lesson). 64b's harness partition is now the
+#       classifier's own rule, so it cannot disagree with a list.
 CI_GATE_FAIL=0
 QUALITY_YML=".github/workflows/quality.yml"
 INTEGRATION_SH="scripts/test-integration.sh"
+DBFREE_SH="scripts/ci-run-dbfree-tests.sh"
+CLASSIFIER="scripts/ci_test_targets.py"
 
-if [ ! -f "$QUALITY_YML" ] || [ ! -f "$INTEGRATION_SH" ]; then
-    red "✗ check 64 cannot find its runner files ($QUALITY_YML / $INTEGRATION_SH)"
-    CI_GATE_FAIL=1
-else
-    # Strip full-line and trailing comments, then join backslash
-    # continuations so a multi-line `cargo nextest run -p X \ --test a \
-    # --test b` reads as one logical command.
-    strip_comments() {
-        sed -e 's/[[:space:]]#.*$//' -e 's/^[[:space:]]*#.*$//' "$1"
-    }
-
-    # Emit `crate:binary` (or `crate:*` for a whole-crate run) for every
-    # literal `cargo (test|nextest run)` invocation in a file. Lines whose
-    # package or test name is a SHELL VARIABLE (the `for ctest in …; do
-    # cargo test -p controller --test "$ctest"` loop bodies) are skipped —
-    # matching them would mark EVERY controller binary as gated, which is
-    # the exact false negative this check exists to prevent. Those loops'
-    # real contents come from the array parsers below.
-    cargo_gates() {
-        strip_comments "$1" \
-            | awk '{ l=$0; while (l ~ /\\$/) { sub(/\\$/,"",l); if ((getline n) > 0) l = l " " n; else break } print l }' \
-            | grep -E 'cargo (nextest run|test)' \
-            | while IFS= read -r line; do
-                crate="$(printf '%s\n' "$line" | grep -oE '(-p|--package) [A-Za-z0-9_-]+' | head -1 | awk '{print $2}')"
-                # No literal package (e.g. `--workspace`, or `-p "$crate"`).
-                [ -n "$crate" ] || continue
-                tests="$(printf '%s\n' "$line" | grep -oE '\--test [A-Za-z0-9_]+' | awk '{print $2}')"
-                if [ -n "$tests" ]; then
-                    printf '%s\n' "$tests" | sed "s#^#${crate}:#"
-                elif printf '%s\n' "$line" | grep -qE '\--test([[:space:]]|$)'; then
-                    # `--test "$var"` — variable-driven, contributes nothing.
-                    continue
-                elif ! printf '%s\n' "$line" | grep -qE '\--(lib|doc|bins?|examples?)([[:space:]]|$)'; then
-                    # Whole-crate invocation (e.g. `cargo test -p
-                    # talos-envelope-seal`) — covers every binary in it.
-                    printf '%s:*\n' "$crate"
-                fi
-            done
-    }
-
-    # --- (a) quality.yml + (b) test-integration.sh cargo invocations.
-    # Every parser below is `|| true`-terminated. Under `set -euo pipefail` a
-    # grep that matches nothing makes the whole command-substitution
-    # assignment non-zero, which aborts the ENTIRE lint script silently at
-    # this line — the emptiest possible input (a runner file that stopped
-    # naming any test) would kill the run instead of failing this check with a
-    # message. An empty parse is a legitimate input here; let the reporting
-    # below be what fails.
-    GATED="$(cargo_gates "$QUALITY_YML" || true)
-$(cargo_gates "$INTEGRATION_SH" || true)"
-    # TESTS=( "crate:binary:store" … )
-    GATED="$GATED
-$(
-        strip_comments "$INTEGRATION_SH" \
-            | sed -n '/^TESTS=(/,/^)/p' \
-            | grep -oE '"[A-Za-z0-9_-]+:[A-Za-z0-9_]+:[a-z]+"' \
-            | tr -d '"' | sed -E 's#:[a-z]+$##' || true
-)"
-    # CTRL_TESTS / TC_TESTS =( "binary" … ) — all controller binaries.
-    GATED="$GATED
-$(
-        strip_comments "$INTEGRATION_SH" \
-            | sed -n -e '/^CTRL_TESTS=(/,/^)/p' -e '/^TC_TESTS=(/,/^)/p' \
-            | grep -oE '"[A-Za-z0-9_]+"' \
-            | tr -d '"' | sed 's#^#controller:#' || true
-)"
-    GATED="$(printf '%s\n' "$GATED" | grep -v '^$' | sort -u || true)"
-
-    # --- (c) walk every crate's tests/ dir for cargo-discovered targets:
-    #         `tests/<name>.rs` AND `tests/<dir>/main.rs`.
-    UNGATED_HITS=""
-    STALE_MARKERS=""
-    EXISTING_TARGETS=""
-    CI_GATE_SCANNED=0
-    while IFS= read -r tf; do
-        [ -n "$tf" ] || continue
-        CI_GATE_SCANNED=$((CI_GATE_SCANNED + 1))
-        if [ "$(basename "$tf")" = "main.rs" ]; then
-            # tests/<dir>/main.rs → target named <dir>; crate is two levels up
-            # from the tests/ dir rather than one.
-            bin="$(basename "$(dirname "$tf")")"
-            crate_dir="$(dirname "$(dirname "$(dirname "$tf")")")"
-        else
-            bin="$(basename "$tf" .rs)"
-            crate_dir="$(dirname "$(dirname "$tf")")"
-        fi
-        crate="$(grep -m1 -E '^name[[:space:]]*=' "$crate_dir/Cargo.toml" 2>/dev/null \
-                    | sed -E 's/^name[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')"
-        [ -n "$crate" ] || crate="$(basename "$crate_dir")"
-        EXISTING_TARGETS="${EXISTING_TARGETS}${crate}:${bin}
-"
-        marked=0
-        grep -qE '^[[:space:]]*(//|#)[[:space:]]*ci-ungated:' "$tf" && marked=1
-        if printf '%s\n' "$GATED" | grep -qxF -e "${crate}:${bin}" -e "${crate}:*"; then
-            if [ "$marked" = "1" ]; then
-                STALE_MARKERS="${STALE_MARKERS}  ${tf#./}  (crate ${crate})
-"
-            fi
-        elif [ "$marked" = "0" ]; then
-            UNGATED_HITS="${UNGATED_HITS}  ${tf#./}  → would need '${crate}:${bin}'
-"
-        fi
-    done <<< "$(find . -type d -name tests \
-                    -not -path './target/*' -not -path './vendor/*' \
-                    -not -path './frontend/*' -not -path '*/node_modules/*' \
-                    "${TREE_PRUNE_FIND[@]}" \
-                    -exec sh -c 'ls -1 "$1"/*.rs "$1"/*/main.rs 2>/dev/null' _ {} \; | sort)"
-
-    # --- (d) the reverse direction: a runner entry naming a target that does
-    # not exist. `crate:*` whole-crate entries are skipped (they name no
-    # specific target).
-    STALE_ENTRIES=""
-    while IFS= read -r g; do
-        [ -n "$g" ] || continue
-        case "$g" in *:\*) continue ;; esac
-        printf '%s\n' "$EXISTING_TARGETS" | grep -qxF "$g" \
-            || STALE_ENTRIES="${STALE_ENTRIES}  ${g}
-"
-    done <<< "$GATED"
-
-    # A walk that scans nothing reports success. Fail loud instead (the
-    # check-63 lesson — an absolute walk rooted under an excluded path).
-    if [ "$CI_GATE_SCANNED" -lt 50 ]; then
-        red "✗ check 64 found only $CI_GATE_SCANNED tests/*.rs binaries — the walk is broken"
-        yellow "  → expected the whole workspace (~90). Fix the find, do not lower this."
+for f64 in "$QUALITY_YML" "$INTEGRATION_SH" "$DBFREE_SH" "$CLASSIFIER"; do
+    if [ ! -f "$f64" ]; then
+        red "✗ check 64 cannot find $f64"
         CI_GATE_FAIL=1
     fi
-    if [ -n "$UNGATED_HITS" ]; then
-        red "✗ integration-test binaries that NO CI runner names:"
-        printf '%s' "$UNGATED_HITS"
-        yellow "  → a tests/*.rs that no runner enumerates compiles at authoring time"
-        yellow "    and then runs NOWHERE. That is how 28 binaries — including the"
-        yellow "    only cross-tenant guard on the ml serving path — silently rotted"
-        yellow "    for seven weeks behind a docs claim of '100%, no exclusions'."
-        yellow "  → add it to CTRL_TESTS / TC_TESTS / TESTS in scripts/test-integration.sh"
-        yellow "    (needs a DB or a container) or to a 'cargo nextest run -p <crate>"
-        yellow "    --test <name>' step in .github/workflows/quality.yml (DB-free)."
-        yellow "  → if it genuinely cannot run in CI, say why in the file itself:"
-        yellow "    '// ci-ungated: <reason>'. Do NOT gate a test that early-returns"
-        yellow "    without a provider — a green check over zero assertions is worse"
-        yellow "    than an honest exclusion."
-        CI_GATE_FAIL=1
-    fi
-    if [ -n "$STALE_MARKERS" ]; then
-        red "✗ '// ci-ungated:' marker on a binary that IS gated (stale claim):"
-        printf '%s' "$STALE_MARKERS"
-        yellow "  → the marker says CI cannot run this; a runner says it does. Delete"
-        yellow "    the marker, or remove the runner entry — leaving both is the same"
-        yellow "    misleading-comment class this check exists to end."
-        CI_GATE_FAIL=1
-    fi
-    if [ -n "$STALE_ENTRIES" ]; then
-        red "✗ CI runner names a test target that does not exist:"
-        printf '%s' "$STALE_ENTRIES"
-        yellow "  → cargo fails the whole job with 'no test target named <name>'"
-        yellow "    (the PR #567 lesson — a deleted test file broke the Rust check"
-        yellow "    while the code was fine). Delete the runner entry too, or"
-        yellow "    restore the file. Grep .github/ + Makefile before deleting a test."
+done
+
+if [ "$CI_GATE_FAIL" -eq 0 ]; then
+    # (a) the classifier's own verdict over the tree.
+    if CLASSIFY_OUT="$(python3 "$CLASSIFIER" check 2>&1)"; then
+        CI_GATE_SUMMARY="$(printf '%s\n' "$CLASSIFY_OUT" | tail -1)"
+    else
+        red "✗ scripts/ci_test_targets.py refuses the tree:"
+        printf '%s\n' "$CLASSIFY_OUT" | sed 's/^/  /'
+        yellow "  → a binary that reads TALOS_TEST_* needs '// ci-store: <migrated|selfcontained|redis|services>'"
+        yellow "    (the integration runner provides that store) or '// ci-ungated: <reason>'."
+        yellow "    Do NOT leave it to run in the DB-free job: it would early-return green."
         CI_GATE_FAIL=1
     fi
 
-    # --- (e) the runner file this check trusts must actually be invoked by CI.
-    # Without this, dropping the `make test-integration` step from quality.yml
-    # would leave every CTRL_TESTS/TC_TESTS entry reading as "gated" while
-    # running nowhere — the original defect, one level up.
-    if ! grep -qE '^[[:space:]]*run:[[:space:]]*make test-integration[[:space:]]*$' "$QUALITY_YML"; then
+    # (b) wiring. Comments stripped so a mention in prose does not count.
+    # Read into variables and match with here-strings: `sed | grep -q` under
+    # `set -o pipefail` reports a PRESENT line as missing whenever grep exits
+    # early and sed takes SIGPIPE (measured on this very check's first run).
+    strip64() { sed -e 's/[[:space:]]#.*$//' -e 's/^[[:space:]]*#.*$//' "$1"; }
+    Q64="$(strip64 "$QUALITY_YML")"
+    I64="$(strip64 "$INTEGRATION_SH")"
+    D64="$(strip64 "$DBFREE_SH")"
+    if ! grep -qE '^[[:space:]]*run:[[:space:]]*make test-integration[[:space:]]*$' <<< "$Q64"; then
         red "✗ $QUALITY_YML no longer runs 'make test-integration'"
-        yellow "  → check 64 counts every CTRL_TESTS / TC_TESTS / TESTS entry in"
-        yellow "    $INTEGRATION_SH as gated. That is only true while CI invokes"
-        yellow "    the script. Restore the step, or teach this check the new path."
+        CI_GATE_FAIL=1
+    fi
+    if ! grep -qE "^[[:space:]]*run:[[:space:]]*bash $DBFREE_SH[[:space:]]*\$" <<< "$Q64"; then
+        red "✗ $QUALITY_YML no longer runs '$DBFREE_SH' (the DB-free test binaries)"
         CI_GATE_FAIL=1
     fi
     if ! grep -qE 'bash[[:space:]]+scripts/test-integration\.sh' Makefile 2>/dev/null; then
         red "✗ the Makefile 'test-integration' target no longer runs $INTEGRATION_SH"
-        yellow "  → same reason as above: the entries in that script are only"
-        yellow "    coverage while something actually executes it."
         CI_GATE_FAIL=1
     fi
-
-    # ── 64b: named by a runner is not named by the RIGHT runner (2026-09-04, #748) ──
-    # The controller DB-harness binaries partition by an invisible property:
-    # `mod common;` files need DATABASE_URL (the CTRL_TESTS loop supplies it,
-    # plus TALOS_MASTER_KEY, default threads); `mod test_helpers;` files
-    # self-provision a testcontainer (TC_TESTS, no DATABASE_URL,
-    # --test-threads=1). Leg 64 above proves only the UNION — that a binary is
-    # named SOMEWHERE — so a `common` binary registered in TC_TESTS is green
-    # here and dies in CI in 0.00 s at `common/mod.rs:117` before any
-    # assertion. That is exactly how #748's own first CI run failed. Measured
-    # before writing: post-fix 45 agree / 0 mismatch; pristine main 0
-    # pre-existing — a population of one, deterministic (a `^mod X;` grep
-    # against two arrays), 100% precision. Proven three ways on scratch copies
-    # of the runner: silent on the fixed tree, fires "OTHER list" on the
-    # pre-fix registration, fires "neither" when unregistered. Stated limit:
-    # literal array names and literal `mod` lines — a third harness or a
-    # renamed array is invisible until added here. No opt-out: there is no
-    # legitimate reason for a binary to sit in the list whose environment it
-    # cannot run in.
-    CTRL64="$(awk '/^CTRL_TESTS=\(/{f=1;next} f&&/^\)/{f=0} f' "$INTEGRATION_SH" | grep -oE '"[a-z_0-9]+"' | tr -d '"')"
-    TC64="$(awk '/^TC_TESTS=\(/{f=1;next} f&&/^\)/{f=0} f' "$INTEGRATION_SH" | grep -oE '"[a-z_0-9]+"' | tr -d '"')"
-    for f64 in controller/tests/*.rs; do
-        name64="$(basename "$f64" .rs)"
-        if grep -qE '^mod common;' "$f64"; then want64="CTRL_TESTS"; have64="$CTRL64"; other64="$TC64"; h64="common"
-        elif grep -qE '^mod test_helpers;' "$f64"; then want64="TC_TESTS"; have64="$TC64"; other64="$CTRL64"; h64="test_helpers"
-        else continue; fi
-        if ! printf '%s\n' "$have64" | grep -qx "$name64"; then
-            if printf '%s\n' "$other64" | grep -qx "$name64"; then
-                red "✗ controller/tests/${name64}.rs uses the ${h64} harness but is registered in the OTHER runner list — it starts in CI and dies before any assertion; move it to ${want64}"
-            else
-                red "✗ controller/tests/${name64}.rs uses the ${h64} harness but is in neither runner list; add it to ${want64}"
-            fi
+    if ! grep -qE 'ci_test_targets\.py grouped dbfree' <<< "$D64"; then
+        red "✗ $DBFREE_SH no longer asks the classifier for the dbfree binaries"
+        CI_GATE_FAIL=1
+    fi
+    for cat64 in 'list store' 'ctrl ctrl-serial tc'; do
+        if ! grep -qF "$cat64" <<< "$I64"; then
+            red "✗ $INTEGRATION_SH no longer runs the classifier's '$cat64' binaries"
             CI_GATE_FAIL=1
         fi
     done
+
+    # (c) literal `cargo … --test X` entries: must exist, must not duplicate
+    # a discovered binary.
+    ALL64="$(python3 "$CLASSIFIER" list dbfree 2>/dev/null; python3 "$CLASSIFIER" list store 2>/dev/null | cut -f1,2
+             for c64 in ctrl ctrl-serial tc ungated; do python3 "$CLASSIFIER" list "$c64" 2>/dev/null; done)"
+    RUN64="$(python3 "$CLASSIFIER" list dbfree 2>/dev/null; python3 "$CLASSIFIER" list store 2>/dev/null | cut -f1,2
+             for c64 in ctrl ctrl-serial tc; do python3 "$CLASSIFIER" list "$c64" 2>/dev/null; done)"
+    LITERAL64="$(for rf in "$Q64" "$I64"; do
+        printf '%s\n' "$rf" \
+          | awk '{ l=$0; while (l ~ /\\$/) { sub(/\\$/,"",l); if ((getline n) > 0) l = l " " n; else break } print l }' \
+          | { grep -E 'cargo (nextest run|test)' || true; } \
+          | while IFS= read -r line; do
+              crate="$(printf '%s\n' "$line" | { grep -oE '(-p|--package) [A-Za-z0-9_-]+' || true; } | head -1 | awk '{print $2}')"
+              [ -n "$crate" ] || continue
+              { printf '%s\n' "$line" | grep -oE '\--test [A-Za-z0-9_]+' || true; } | awk -v c="$crate" '{print c "\t" $2}'
+            done
+      done)"
+    while IFS=$'\t' read -r lc lb; do
+        [ -n "$lc" ] || continue
+        if ! printf '%s\n' "$ALL64" | grep -qxF "$(printf '%s\t%s' "$lc" "$lb")"; then
+            red "✗ a CI runner names '$lc --test $lb', which is not a test target (cargo: 'no test target named')"
+            CI_GATE_FAIL=1
+        elif printf '%s\n' "$RUN64" | grep -qxF "$(printf '%s\t%s' "$lc" "$lb")"; then
+            red "✗ a CI runner names '$lc --test $lb' literally, but the classifier already runs it — delete the literal entry"
+            CI_GATE_FAIL=1
+        fi
+    done <<< "$LITERAL64"
+
     if [ "$CI_GATE_FAIL" -eq 0 ]; then
-        green "✓ all $CI_GATE_SCANNED cargo test targets are gated or explicitly marked ci-ungated (runners wired, no stale entries)"
+        green "✓ every test target is run by a discovered runner or marked ci-ungated ($CI_GATE_SUMMARY)"
     fi
 fi
 
@@ -7808,14 +7697,14 @@ echo
 #       without this, (a) is defeated by hand-rolling a dispatcher next to
 #       the builder and never calling it. Leg (b) ships at ZERO and is
 #       PROPHYLACTIC: it found nothing on either tree.
-# Stated limits: both legs are TEXTUAL. (a) locates the function by its
-# name and reads to the next column-0 `}`, so a rename or a nested
-# column-0 brace inside a string would mislead it (loud direction: the
-# region shrinks and the gate reads as missing). (b) pins one constructor
-# identifier, so a differently-named dispatcher type, or one obtained from
-# a helper in a third crate, is invisible. Neither leg can prove the gate's
-# DECISION is right — only that it is present and can refuse.
-# Opt-out `// allow-ungated-nats-dispatcher: <reason>` (leg b).
+# Stated limits: (a) is TEXTUAL — it locates the function by its name and
+# reads to the next column-0 `}`, so a rename or a nested column-0 brace
+# inside a string would mislead it (loud direction: the region shrinks and
+# the gate reads as missing). (b) is clippy's since 2026-09-25, so an alias
+# no longer hides a construction, but a differently-named dispatcher type is
+# still out of range. Neither leg can prove the gate's DECISION is right —
+# only that it is present and can refuse. A sanctioned (b) site carries
+# `// disallowed-method: <path> — <reason>` + `#[allow(clippy::disallowed_methods)]`.
 bold "▶ check 78: one production signing gate for NATS dispatch"
 DISPATCH_GATE_FAIL=0
 NATS_RUN_FILE="talos-engine/src/nats_run.rs"
@@ -7844,19 +7733,12 @@ else
     fi
 fi
 
-while IFS=: read -r f n _rest; do
-    [ -n "${f:-}" ] || continue
-    case "$f" in
-        ./talos-engine/src/nats_run.rs) continue ;;
-        ./talos-workflow-engine-nats/*) continue ;;
-    esac
-    lo=$(( n > 8 ? n - 8 : 1 ))
-    if sed -n "${lo},${n}p" "$f" | grep -q 'allow-ungated-nats-dispatcher:'; then continue; fi
-    red "✗ $f:$n constructs a NatsNodeDispatcher outside build_nats_dispatcher — bypasses the signing gate"
+# Leg (b), since 2026-09-25: `NatsNodeDispatcher::new` is a clippy
+# disallowed method (clippy.toml) — sanctioned only in nats_run.rs and the
+# type's own crate — so an aliased constructor is caught too.
+if ! clippy_disallowed_rule 78; then
     DISPATCH_GATE_FAIL=$((DISPATCH_GATE_FAIL + 1))
-done < <(grep -rn --include='*.rs' --exclude-dir=target --exclude-dir=vendor \
-             --exclude-dir=node_modules "${TREE_PRUNE_GREP[@]}" \
-             -E 'NatsNodeDispatcher::new\(' . 2>/dev/null || true)
+fi
 
 if [ "$DISPATCH_GATE_FAIL" -gt 0 ]; then
     yellow "  → every NATS dispatch path must obtain its dispatcher from"
@@ -9441,9 +9323,12 @@ bold "▶ check 96: the CLAUDE.md engineering-log split lost nothing"
 # 2026-09-22 that script was WIRED INTO NOTHING — no lint check, no CI job, no
 # hook — so the first split's proof had only ever run by hand (check 64's
 # rule: a gate nobody runs certifies nothing). It runs its own `--self-test`
-# first (seven fixtures through the SAME `check()` body, each flipping exactly
-# one leg) and FAILS rather than skips when a base commit cannot be read (a
-# shallow CI checkout fetches it on demand). No opt-out.
+# first (fixtures through the SAME `check()` body, each flipping exactly one
+# leg) and FAILS rather than skips when a base commit cannot be read (a
+# shallow CI checkout fetches it on demand). Since 2026-09-25 each split is
+# pinned as (pre-split commit, split commit) and held only to what IT
+# removed, so an ordinary later edit to CLAUDE.md is no longer charged to a
+# split. No opt-out.
 CK96_RC=0
 CK96_OUT="$(cd "$ROOT" && python3 scripts/check-engineering-log.py --self-test 2>&1 && python3 scripts/check-engineering-log.py 2>&1)" || CK96_RC=$?
 if [ "$CK96_RC" -eq 0 ]; then
@@ -9451,7 +9336,7 @@ if [ "$CK96_RC" -eq 0 ]; then
 else
     echo "$CK96_OUT" | sed 's/^/  /'
     red "✗ the CLAUDE.md engineering-log split lost a line, an order, or a decision (or the checker could not run)"
-    yellow "  → every line removed from CLAUDE.md must appear VERBATIM and CONTIGUOUSLY under docs/engineering-log/,"
+    yellow "  → every line a split (BASES in scripts/check-engineering-log.py) removed from CLAUDE.md must appear VERBATIM and CONTIGUOUSLY under docs/engineering-log/,"
     yellow "    and every decision-marker line must be kept or represented in the digest that points at its archive file."
     EXIT_CODE=1
 fi
@@ -9509,13 +9394,25 @@ if ! grep -q "${CHECK_COUNT} checks today" CLAUDE.md; then
     DOC_CLAIM="$(grep -oE '[0-9]+ checks today' CLAUDE.md | head -1 || true)"
     red "✗ CLAUDE.md check count is stale: says '${DOC_CLAIM:-<none found>}', script has ${CHECK_COUNT}"
     yellow "  → update the '<N> checks today' sentence in CLAUDE.md's pre-deploy section"
-    yellow "    (and add a one-line entry for any new check to the numbered list)."
+    yellow "    (and add a one-line entry for any new check to the index)."
+    META_FAIL=1
+fi
+# The one-line index in CLAUDE.md's "Structural lint checks" digest
+# subsection must name exactly checks 1..N. The long numbered list it replaced
+# (2026-09-25) had drifted from the script with no check noticing: two entries
+# numbered 82, none for 84 or 97.
+INDEX_NUMS="$(awk '/^### Structural lint checks/ {on=1; next} on && /^##/ {exit} on' CLAUDE.md \
+    | grep -oE '^  [0-9]+\. ' | grep -oE '[0-9]+' | sort -n || true)"
+if [ "$INDEX_NUMS" != "$EXPECTED_NUMS" ]; then
+    red "✗ CLAUDE.md's structural-lint index does not name exactly checks 1..$CHECK_COUNT"
+    diff <(echo "$EXPECTED_NUMS") <(echo "$INDEX_NUMS") | sed 's/^/    /' || true
+    yellow "  → one line per check, '  N. <title>', under '### Structural lint checks'."
     META_FAIL=1
 fi
 if [ "$META_FAIL" -gt 0 ]; then
     EXIT_CODE=1
 else
-    green "✓ ${CHECK_COUNT} checks, contiguous numbering, CLAUDE.md count in sync"
+    green "✓ ${CHECK_COUNT} checks, contiguous numbering, CLAUDE.md count and index in sync"
 fi
 
 # 54(c) — this script must be RUN by an auto-triggered workflow. Measured

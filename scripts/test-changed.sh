@@ -38,42 +38,18 @@ changed_paths=$(
   } | sort -u
 )
 
-# Map a file path to its owning workspace crate name: walk up to the nearest
-# ancestor dir holding a Cargo.toml with a [package] section, and read `name`.
-crate_for() {
-  local dir; dir=$(dirname "$1")
-  while [ "$dir" != "." ] && [ "$dir" != "/" ]; do
-    if [ -f "$dir/Cargo.toml" ] && grep -q '^\[package\]' "$dir/Cargo.toml" 2>/dev/null; then
-      grep -m1 '^name[[:space:]]*=' "$dir/Cargo.toml" | sed -E 's/^name[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/'
-      return 0
-    fi
-    dir=$(dirname "$dir")
-  done
-  return 1
-}
+# shellcheck source=lib/workspace-crates.sh
+. scripts/lib/workspace-crates.sh
 
-crates=""
+crates=$(printf '%s\n' "$changed_paths" | crates_for_paths)
 root_manifest_touched=0
-while IFS= read -r path; do
-  [ -z "$path" ] && continue
-  case "$path" in
-    *.rs|*/Cargo.toml|Cargo.toml|*.wit) ;;
-    *) continue ;;
-  esac
-  # A bare root Cargo.toml / Cargo.lock change affects the whole workspace.
-  if [ "$path" = "Cargo.toml" ] || [ "$path" = "Cargo.lock" ]; then
-    root_manifest_touched=1
-    continue
-  fi
-  if c=$(crate_for "$path"); then
-    crates="$crates$c"$'\n'
-  fi
-done <<< "$changed_paths"
-
-crates=$(printf '%s' "$crates" | sed '/^$/d' | sort -u)
+if printf '%s\n' "$crates" | grep -qx '\*'; then
+  root_manifest_touched=1
+  crates=$(printf '%s\n' "$crates" | grep -vx '\*' || true)
+fi
 
 if [ "$root_manifest_touched" = "1" ]; then
-  printf '%s⚠ root Cargo.toml/Cargo.lock changed%s — that can affect the whole workspace; consider %smake test%s.\n' \
+  printf '%s⚠ a workspace-wide input changed (root Cargo.toml/Cargo.lock, .cargo/, wit/)%s — that can affect every crate; consider %smake test%s.\n' \
     "$YEL" "$RST" "$DIM" "$RST"
 fi
 

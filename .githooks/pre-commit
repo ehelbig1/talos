@@ -91,13 +91,35 @@ if [ -f "$MARKER_FILE" ]; then
     fi
 fi
 
-# 5. Verify Rust compiles (quick check)
-if [ -n "$STAGED_RS" ]; then
-    echo "Checking Rust compilation..."
-    cargo check --workspace 2>/dev/null || {
-        echo "ERROR: Rust compilation failed."
-        exit 1
-    }
+# 5. The crates you staged still compile.
+# This ran `cargo check --workspace` whenever any .rs was staged, which
+# re-checks every reverse dependency of the touched crate — a one-line edit to
+# a protocol crate re-checked ~100 crates on every commit. It now checks only
+# the crates that own the staged files (all targets, so a staged test file is
+# covered too) and falls back to the whole workspace when a workspace-wide
+# input changed. Downstream breakage is CI's job (quality.yml's clippy and
+# test jobs build everything); `make lint-full` runs it locally on demand.
+STAGED_RUST_INPUTS=$(git diff --cached --name-only --diff-filter=ACMR -- '*.rs' '*Cargo.toml' 'Cargo.lock' '*.wit' '.cargo/*' 'rust-toolchain.toml' || true)
+if [ -n "$STAGED_RUST_INPUTS" ]; then
+    cd "$(git rev-parse --show-toplevel)"
+    # shellcheck source=../scripts/lib/workspace-crates.sh
+    . scripts/lib/workspace-crates.sh
+    STAGED_CRATES=$(printf '%s\n' "$STAGED_RUST_INPUTS" | crates_for_paths)
+    CHECK_ARGS=()
+    if printf '%s\n' "$STAGED_CRATES" | grep -qx '\*'; then
+        CHECK_ARGS=(--workspace)
+    else
+        while IFS= read -r c; do
+            [ -n "$c" ] && CHECK_ARGS+=(-p "$c")
+        done <<< "$STAGED_CRATES"
+    fi
+    if [ "${#CHECK_ARGS[@]}" -gt 0 ]; then
+        echo "Checking compilation: cargo check ${CHECK_ARGS[*]} --all-targets"
+        cargo check "${CHECK_ARGS[@]}" --all-targets --quiet --message-format short || {
+            echo "ERROR: Rust compilation failed."
+            exit 1
+        }
+    fi
 fi
 
 echo "Pre-commit checks passed."

@@ -1,3 +1,4 @@
+// ci-store: migrated — scripts/test-integration.sh runs this with that store (scripts/ci_test_targets.py)
 //! `ChannelStore::get_entry` must answer THREE ways, not two.
 //!
 //! Gated on `TALOS_TEST_DATABASE_URL` (a migrated database) and run by

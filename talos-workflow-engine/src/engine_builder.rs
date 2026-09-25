@@ -97,6 +97,8 @@ impl ParallelWorkflowEngineBuilder {
     }
 
     /// Set the actor id that owns this execution.
+    // disallowed-method: talos_workflow_engine::ParallelWorkflowEngine::set_actor_id — the builder stamps the ceilings in for_workflow
+    #[allow(clippy::disallowed_methods)]
     pub fn with_actor_id(mut self, id: Uuid) -> Self {
         self.inner.set_actor_id(id);
         self

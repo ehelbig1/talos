@@ -1,3 +1,4 @@
+// ci-store: services — scripts/test-integration.sh runs this with that store (scripts/ci_test_targets.py)
 //! RFC 0010 P3 (D3b) — live-NATS integration test for the claim responder ↔
 //! worker-client handshake.
 //!

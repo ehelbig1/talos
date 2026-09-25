@@ -44,6 +44,18 @@ STATED LIMITS.
     zero, and still misses the same bullet. The per-file minimum overlap is
     printed instead, so thinning coverage is visible in a diff, and the human
     spot-check is the rest of the guard.
+  * Each entry in BASES pins one split as (pre-split commit, split commit).
+    What a split REMOVED is `pre` minus the split commit's CLAUDE.md, and only
+    that is held to the three legs. Until 2026-09-25 the split commit was not
+    pinned and every leg compared `pre` against TODAY's CLAUDE.md, so ANY
+    later edit to a line that existed in any base — rewording a rule, bumping
+    "96 checks today" to "97" — failed leg 1 until the superseded text was
+    copied into an archive file (the review archive carries four such copies
+    of that one sentence). That charged every ordinary CLAUDE.md edit to a
+    split it had nothing to do with; git history already keeps the old text.
+    The newest split may carry `None` for its commit (the change that makes
+    it has no SHA yet); it is then compared against today's file, and its
+    commit should be pinned in the next change that touches this list.
   * Each entry in BASES pins one split's pre-split file. A second split
     (2026-09-22: the whole-codebase-review package bullets moved out of
     CLAUDE.md) does not move the first pin — every leg runs against EVERY
@@ -64,14 +76,20 @@ import subprocess
 import sys
 from pathlib import Path
 
-# (revision, what that split moved). Order is chronological; every leg runs
-# against every base. FULL 40-character ids: GitHub serves a fetch-by-SHA only
+# (pre-split revision, split revision or None, what that split moved). Order
+# is chronological; every leg runs against every base. FULL 40-character ids: GitHub serves a fetch-by-SHA only
 # for the full id, and a shallow CI checkout has to fetch these on demand.
 BASES = [
-    ("d5e3bfbc79aab7398448721b4a1ed47600e27400", "2026-09-09: engineering-log narrative -> docs/engineering-log/<class>.md"),
-    ("722c58e22081a5779f96ed9b2ada6f991aaf507a", "2026-09-22: whole-codebase-review package bullets -> the review archive"),
-    ("6b7cd9f3f554209dc43be21c79d80a4e02d0a146", "2026-09-24: post-DN package bullets (DO..EO) compressed to decisions only"),
-    ("7457bdbd7520cf5c560052ec04b7ec2163f5aaf5", "2026-09-25: lint checks 74/88/83/65 compressed to specification only"),
+    ("d5e3bfbc79aab7398448721b4a1ed47600e27400", "bebbfc3e824880026ace303e905a31f034d151ea",
+     "2026-09-09: engineering-log narrative -> docs/engineering-log/<class>.md"),
+    ("722c58e22081a5779f96ed9b2ada6f991aaf507a", "9c65371f0b595d61a31367780c80f8707adce790",
+     "2026-09-22: whole-codebase-review package bullets -> the review archive"),
+    ("6b7cd9f3f554209dc43be21c79d80a4e02d0a146", "3860dad20098ef3ffe7c32a5f794288278086b96",
+     "2026-09-24: post-DN package bullets (DO..EO) compressed to decisions only"),
+    ("7457bdbd7520cf5c560052ec04b7ec2163f5aaf5", "3607202af08c60a16396142532719f3ed5656a15",
+     "2026-09-25: lint checks 74/88/83/65 compressed to specification only"),
+    ("ef220804da63adf62cfbc1787e047f0932609c79", None,
+     "2026-09-25: the structural-lint check specifications -> structural-lint-checks.md"),
 ]
 ARCHIVE = Path("docs/engineering-log")
 CLAUDE = Path("CLAUDE.md")
@@ -136,7 +154,8 @@ def tokens(text):
 
 
 def check(bases, now, archive_text, verbose=False, out=print):
-    """ONE body for every leg. `bases` is [(label, [lines])], `now` the current
+    """ONE body for every leg. `bases` is [(label, [pre lines], [split-commit
+    lines] or None)], `now` the current
     CLAUDE.md lines, `archive_text` {filename: text}. Returns True when clean.
     Both the real run and `--self-test` call this and nothing else."""
     archive_files = sorted(archive_text)
@@ -174,12 +193,15 @@ def check(bases, now, archive_text, verbose=False, out=print):
     bad = bool(unpointed)
     out(f"now: {len(now)-1} lines; archive: {len(archive_files)} files, "
         f"{sum(len(t.split(chr(10)))-1 for t in archive_text.values())} lines")
-    for label, base in bases:
+    for label, base, after in bases:
+        # What THIS split removed: `after` is the split commit's CLAUDE.md, or
+        # today's when the split has no commit yet.
+        after_set = now_set if after is None else {ln.strip() for ln in after}
         # ---- leg 1: removed subset of archived ----------------------------
         missing, removed = [], 0
         for ln in base:
             st = ln.strip()
-            if len(st) < MIN_LEN or st in now_set:
+            if len(st) < MIN_LEN or st in after_set:
                 continue
             removed += 1
             if st not in archive_lines:
@@ -187,7 +209,7 @@ def check(bases, now, archive_text, verbose=False, out=print):
         # ---- leg 3: removed runs survive contiguously --------------------
         runs, cur = [], []
         for ln in base:
-            if ln.strip() and ln.strip() not in now_set:
+            if ln.strip() and ln.strip() not in after_set:
                 cur.append(ln)
             else:
                 if len(cur) >= 2:
@@ -205,7 +227,7 @@ def check(bases, now, archive_text, verbose=False, out=print):
         kept, archived_ok, not_in_archive, unrepresented = [], [], [], []
         for lineno, line in base_markers:
             st = line.strip()
-            if st in now_set:
+            if st in after_set:
                 kept.append((lineno, st))
                 continue
             if st not in archive_lines:
@@ -301,7 +323,7 @@ def self_test():
         base1 = digest[:2] + story_a + digest[2:]                    # first split moved story_a
         cut = 2 + len(head_a) + 2
         base2 = digest[:cut] + story_b + digest[cut:]                # second split moved story_b
-        return [("one", base1), ("two", base2)], digest
+        return [("one", base1, None), ("two", base2, None)], digest
 
     clean_archive = {"a.md": "\n".join(story_a) + "\n", "b.md": "\n".join(story_b) + "\n"}
 
@@ -340,6 +362,18 @@ def self_test():
     ok1, _ = run(bases[:1], now, {"a.md": clean_archive["a.md"], "b.md": story_b[0] + "\n"})
     assert ok1, "with only the first base checked the second split's loss is invisible — that is what the list is for"
     cases += 1
+    # a pinned split is charged only with what IT removed: an ordinary later
+    # edit to a line the split kept is not a loss (it is when unpinned)
+    edited = [("kept line one, reworded later" if l == "kept line one" else l) for l in now]
+    pinned = [(label, pre, now) for label, pre, _ in bases]
+    ok, rep = run(pinned, edited, clean_archive)
+    assert ok, "a later edit must not be charged to a pinned split\n" + rep
+    ok, rep = run(bases, edited, clean_archive)
+    assert not ok and "LEG 1  missing from archive  : 1" in rep, rep
+    # ...and a pinned split still owes everything it DID remove
+    ok, rep = run(pinned, edited, {"a.md": "\n".join(story_a[1:]) + "\n", "b.md": clean_archive["b.md"]})
+    assert not ok and "LEG 1  missing from archive  : 1" in rep, rep
+    cases += 1
     # no archive at all
     ok, rep = run(bases, now, {})
     assert not ok and "no archive files" in rep
@@ -352,7 +386,8 @@ def main():
     if "--self-test" in sys.argv:
         return self_test()
     verbose = "--verbose" in sys.argv
-    bases = [(f"{rev} ({what})", base_text(rev)) for rev, what in BASES]
+    bases = [(f"{pre} ({what})", base_text(pre), None if post is None else base_text(post))
+             for pre, post, what in BASES]
     now = CLAUDE.read_text().split("\n")
     archive_files = sorted(p for p in ARCHIVE.glob("*.md") if p.name != "README.md")
     archive_text = {p.name: p.read_text() for p in archive_files}

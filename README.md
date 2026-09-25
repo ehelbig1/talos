@@ -165,13 +165,13 @@ Production deployments use the Helm chart in `deploy/helm/talos/` and HashiCorp 
 
 ```bash
 make up-dev                # Start all services
-make lint                  # Lint Rust + frontend + structural lint
+make lint                  # rustfmt + structural lints + cargo-deny (make lint-full adds clippy)
 make coverage              # Tests with coverage
 cargo check --workspace    # Quick Rust compile check
 cargo test --workspace     # Full test suite (~2,900 tests)
 ```
 
-The `make lint` step runs `scripts/lint-structural.sh`, which enforces 20 architectural invariants tied to specific past regressions — raw `actor_memory` SQL outside `talos-memory/`, controller route ↔ nginx ConfigMap drift, the legacy `__agent_context__` key, per-call `SecretsManager::new(...)` outside canonical wiring, helm chart clean-render with toggles, raw sqlx in MCP handlers, clippy parity, `trigger_type` / boolean column drift against schema, silent `let _ = sqlx::query(...).await` swallows outside tests, misleading-success Err-only webhook fires, caller-supplied limit clamp drift, chart-wide labels under NetworkPolicy selectors, async-graphql `Error::new` missing `.extend_safe()`, graph-JSON writes via canonical chokepoint, WIT-file drift between `wit/` and `module-templates/wit/`, `encrypted_secrets: Default::default()` outside tests, JobResult `.sign()` not using `sign_with_worker_id`, worker dual-publishing of JobResult, and wasmtime WASM proposal opt-in/out drift.
+The `make lint` step runs `scripts/lint-structural.sh`, which enforces the repository's architectural invariants (`bash scripts/lint-structural.sh --count` prints how many), each tied to a specific past regression — among them raw `actor_memory` SQL outside `talos-memory/`, controller route ↔ nginx ConfigMap drift, the legacy `__agent_context__` key, per-call `SecretsManager::new(...)` outside canonical wiring, helm chart clean-render with toggles, raw sqlx in MCP handlers, clippy parity, `trigger_type` / boolean column drift against schema, silent `let _ = sqlx::query(...).await` swallows outside tests, misleading-success Err-only webhook fires, caller-supplied limit clamp drift, chart-wide labels under NetworkPolicy selectors, async-graphql `Error::new` missing `.extend_safe()`, graph-JSON writes via canonical chokepoint, WIT-file drift between `wit/` and `module-templates/wit/`, `encrypted_secrets: Default::default()` outside tests, JobResult `.sign()` not using `sign_with_worker_id`, worker dual-publishing of JobResult, and wasmtime WASM proposal opt-in/out drift.
 
 ---
 

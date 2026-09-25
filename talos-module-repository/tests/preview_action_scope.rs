@@ -1,3 +1,4 @@
+// ci-store: migrated — scripts/test-integration.sh runs this with that store (scripts/ci_test_targets.py)
 //! Does the module cleanup/restore ACTION touch the set its PREVIEW showed?
 //!
 //! Two defects, both found by auditing every preview→act pair in the repo after
