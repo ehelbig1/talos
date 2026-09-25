@@ -54,6 +54,8 @@ spec:
       labels:
         {{- include "talos.componentLabels" (list . "minio-provisioning") | nindent 8 }}
     spec:
+      # No Kubernetes API access needed: no service-account token in the pod.
+      automountServiceAccountToken: false
       restartPolicy: OnFailure
       {{- include "talos.imagePullSecrets" . | nindent 6 }}
       securityContext:

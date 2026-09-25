@@ -867,7 +867,7 @@ services:
       TALOS_REPLAY_FAIL_CLOSED: ${TALOS_REPLAY_FAIL_CLOSED:-false}
       TALOS_SIGNATURE_DIAG: ${TALOS_SIGNATURE_DIAG:-}
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     volumes:
       # DEV template live-editing: bind-mount the repo's module-templates
       # over the image-baked copy so install_module_from_catalog picks up
@@ -1605,7 +1605,7 @@ services:
       # resolves to the frontend container itself, not the controller.
       API_PROXY_TARGET: http://controller:8000
     ports:
-      - "3002:3000"
+      - "127.0.0.1:3002:3000"
     volumes:
       # Mount host source so Vite HMR picks up file changes without rebuilding
       - ./frontend/src:/app/src

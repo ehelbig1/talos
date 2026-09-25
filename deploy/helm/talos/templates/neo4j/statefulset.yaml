@@ -27,6 +27,8 @@ spec:
         checksum/neo4j-auth-data: {{ include "talos.secretChecksum" (dict "ns" .Release.Namespace "name" (include "talos.componentName" (list . "neo4j"))) }}
         checksum/bootstrap-secret-data: {{ include "talos.secretChecksum" (dict "ns" .Release.Namespace "name" (include "talos.bootstrapSecretName" .)) }}
     spec:
+      # No Kubernetes API access needed: no service-account token in the pod.
+      automountServiceAccountToken: false
       {{- include "talos.imagePullSecrets" . | nindent 6 }}
       securityContext:
         {{- include "talos.podSecurityContext" . | nindent 8 }}
