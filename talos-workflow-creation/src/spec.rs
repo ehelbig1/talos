@@ -3,11 +3,23 @@
 //! Takes a fully-specified workflow (nodes + edges, where each node is
 //! either a module UUID, a catalog name, or inline Rust source) and:
 //!
-//! 1. Resolves every node to a stored module_id, compiling inline-Rust
-//!    nodes through `talos-compilation` along the way.
-//! 2. Validates that all edge endpoints reference resolved nodes.
-//! 3. Builds the React-Flow-compatible graph_json shape.
-//! 4. Inserts the workflow row.
+//! 1. Validates the spec's STRUCTURE with no I/O: node ids unique, every
+//!    inline node's name / size / grants well-formed (never `"*"` hosts),
+//!    every edge endpoint a node of this spec.
+//! 2. Resolves every node to a module: an explicit `module_id` the caller can
+//!    see, a catalog name, or inline Rust compiled through
+//!    `talos_inline_compile_service::InlineCompileService::compile_checked` —
+//!    the same gates (`is_compilable_world`, dependency allowlist, lint) as
+//!    `add_node_to_workflow`, and NO write yet.
+//! 3. Persists the compiled modules (only once every node compiled), refusing
+//!    a name that is already taken rather than overwriting it.
+//! 4. Builds the React-Flow-compatible graph_json shape and inserts the
+//!    workflow row.
+//!
+//! The per-node ROLE gate (`require_agent_role_permits_world`) needs the
+//! caller's agent identity, which is a protocol concern: the MCP handler runs
+//! it over [`inline_compile_worlds`] BEFORE calling in, so it sees exactly the
+//! nodes this module will compile.
 //!
 //! The pre-extraction call site
 //! (`handle_create_workflow_from_spec` in `talos-mcp-handlers`) was
@@ -34,6 +46,15 @@ pub const MAX_EDGE_CONDITION_LEN: usize = 2_000;
 /// Maximum chars in `capability_world` for inline-rust nodes. Mirrors
 /// the pre-extraction limit.
 pub const MAX_CAPABILITY_WORLD_LEN: usize = 100;
+/// Maximum bytes of inline `rust_code` per node — `add_node_to_workflow`'s
+/// cap. Before 2026-09-25 the spec path had none.
+pub const MAX_INLINE_RUST_BYTES: usize = 512 * 1024;
+/// Maximum chars in an inline node's `id`, which doubles as the MODULE name —
+/// `add_node_to_workflow`'s cap.
+pub const MAX_INLINE_NODE_ID_LEN: usize = 200;
+/// The closed HTTP verb set (`wit/talos.wit`'s `enum method`). An inline
+/// node's `allowed_methods` may name only these.
+const HTTP_VERBS: [&str; 5] = ["GET", "POST", "PUT", "PATCH", "DELETE"];
 
 /// Input to [`super::WorkflowCreationService::create_from_spec`].
 ///
@@ -96,6 +117,17 @@ pub enum CreateFromSpecOutcome {
     },
     /// An edge's `condition` exceeds [`MAX_EDGE_CONDITION_LEN`].
     EdgeConditionTooLong,
+    /// Two nodes in the spec share an `id`. The graph would carry two nodes
+    /// under one id, and for inline nodes the second would collide with the
+    /// module the first creates.
+    DuplicateNodeId { node_id: String },
+    /// An inline-rust node's name, size or grants are malformed — including
+    /// an `allowed_hosts` containing `"*"`, which a spec never grants.
+    InvalidInlineNode { node_id: String, reason: String },
+    /// A node's explicit `module_id` names no module the caller can see.
+    /// Absent and foreign are ONE answer (a module-UUID existence oracle
+    /// otherwise — `add_node_to_workflow`'s rule).
+    ModuleNotAccessible { node_id: String, module_id: Uuid },
 }
 
 /// Per-node breakdown for the build-error path. Each variant of `stage`
@@ -112,18 +144,273 @@ pub struct NodeBuildError {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuildStage {
+    /// A pre-compile gate refused (invalid world, dependency allowlist).
+    Validate,
     Lint,
     Compile,
+    /// A module with this name already exists; nothing was written for it.
+    NameCollision,
     Store,
 }
 
 impl BuildStage {
     pub fn tag(self) -> &'static str {
         match self {
+            Self::Validate => "validate",
             Self::Lint => "lint",
             Self::Compile => "compile",
+            Self::NameCollision => "name_collision",
             Self::Store => "store",
         }
+    }
+}
+
+/// How one spec node resolves to a module. The ONE place the precedence
+/// (`module_id` > `module_name` > `rust_code`) is written, shared by the
+/// service and by the MCP handler's role gate ([`inline_compile_worlds`]) so
+/// the gate sees exactly the nodes that will compile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpecNodeSource<'a> {
+    ModuleId(&'a str),
+    ModuleName(&'a str),
+    InlineRust {
+        rust_code: &'a str,
+        /// Defaulted to `"minimal-node"` when absent.
+        capability_world: &'a str,
+    },
+    Missing,
+}
+
+/// Classify a spec node by the resolution precedence.
+#[must_use]
+pub fn classify_spec_node(spec_node: &Value) -> SpecNodeSource<'_> {
+    if let Some(mid) = spec_node.get("module_id").and_then(|v| v.as_str()) {
+        return SpecNodeSource::ModuleId(mid);
+    }
+    if let Some(name) = spec_node.get("module_name").and_then(|v| v.as_str()) {
+        return SpecNodeSource::ModuleName(name);
+    }
+    if let Some(rust_code) = spec_node.get("rust_code").and_then(|v| v.as_str()) {
+        let capability_world = spec_node
+            .get("capability_world")
+            .and_then(|v| v.as_str())
+            .unwrap_or("minimal-node");
+        return SpecNodeSource::InlineRust {
+            rust_code,
+            capability_world,
+        };
+    }
+    SpecNodeSource::Missing
+}
+
+/// A spec node's `id` (defaulted to `"node"`, the pre-extraction default).
+#[must_use]
+pub fn spec_node_id(spec_node: &Value) -> &str {
+    spec_node
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("node")
+}
+
+/// `(node_id, capability_world)` for every node the spec will COMPILE — the
+/// input to the caller's per-world role gate.
+#[must_use]
+pub fn inline_compile_worlds(spec_nodes: &[Value]) -> Vec<(&str, &str)> {
+    spec_nodes
+        .iter()
+        .filter_map(|n| match classify_spec_node(n) {
+            SpecNodeSource::InlineRust {
+                capability_world, ..
+            } => Some((spec_node_id(n), capability_world)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The grants an inline node's module is created with. Always explicit —
+/// the world-derived `["*"]` host default is never reached from a spec.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InlineGrants {
+    pub(crate) allowed_hosts: Vec<String>,
+    pub(crate) allowed_secrets: Vec<String>,
+    pub(crate) allowed_methods: Vec<String>,
+}
+
+/// Parse an optional array-of-strings field strictly: absent / null is empty,
+/// a non-array or a non-string element is an error (before 2026-09-25 a
+/// non-string secret was silently dropped).
+fn strict_str_array(spec_node: &Value, field: &str) -> Result<Vec<String>, String> {
+    match spec_node.get(field) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(arr)) => arr
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                v.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("{field}[{i}] must be a string"))
+            })
+            .collect(),
+        Some(_) => Err(format!("{field} must be an array of strings")),
+    }
+}
+
+/// Validate an inline-rust node with no I/O and return the grants its module
+/// is created with. Pure, so every refusal is unit-tested.
+pub(crate) fn validate_inline_spec_node(
+    node_id: &str,
+    spec_node: &Value,
+    rust_code: &str,
+) -> Result<InlineGrants, String> {
+    // The id IS the module name: `add_node_to_workflow`'s charset and length.
+    if node_id.is_empty() || node_id.len() > MAX_INLINE_NODE_ID_LEN {
+        return Err(format!(
+            "id must be 1-{MAX_INLINE_NODE_ID_LEN} characters (it becomes the module name)"
+        ));
+    }
+    if !node_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return Err(
+            "id may only contain ASCII alphanumeric characters, hyphens, underscores, and dots \
+             (it becomes the module name)"
+                .to_string(),
+        );
+    }
+    if rust_code.len() > MAX_INLINE_RUST_BYTES {
+        return Err("rust_code exceeds maximum size of 512 KiB".to_string());
+    }
+    let allowed_hosts = strict_str_array(spec_node, "allowed_hosts")?;
+    if allowed_hosts.iter().any(|h| h.trim() == "*") {
+        return Err(
+            "allowed_hosts may not contain \"*\": a spec grants egress by host NAME. \
+             List the hosts this module calls; granting every host is a deliberate \
+             act for update_module_hosts, not a side effect of authoring a workflow."
+                .to_string(),
+        );
+    }
+    if let Some(h) = allowed_hosts.iter().find(|h| h.trim().is_empty()) {
+        return Err(format!("allowed_hosts entry {h:?} is empty"));
+    }
+    let allowed_secrets = strict_str_array(spec_node, "allowed_secrets")?;
+    let allowed_methods: Vec<String> = strict_str_array(spec_node, "allowed_methods")?
+        .into_iter()
+        .map(|m| m.to_ascii_uppercase())
+        .collect();
+    if let Some(bad) = allowed_methods
+        .iter()
+        .find(|m| !HTTP_VERBS.contains(&m.as_str()))
+    {
+        return Err(format!(
+            "allowed_methods entry {bad:?} is not one of {}",
+            HTTP_VERBS.join(", ")
+        ));
+    }
+    Ok(InlineGrants {
+        allowed_hosts,
+        allowed_secrets,
+        allowed_methods,
+    })
+}
+
+/// Everything about a spec that can be refused with no I/O: node ids unique,
+/// each node resolvable in shape, inline nodes well-formed, every edge
+/// endpoint a node of this spec. Runs BEFORE any compile or write, so a spec
+/// with a bad edge no longer leaves compiled modules behind.
+pub(crate) fn validate_spec_structure(
+    spec_nodes: &[Value],
+    spec_edges: &[Value],
+) -> Option<CreateFromSpecOutcome> {
+    let mut ids: HashSet<&str> = HashSet::with_capacity(spec_nodes.len());
+    for spec_node in spec_nodes {
+        let node_id = spec_node_id(spec_node);
+        if !ids.insert(node_id) {
+            return Some(CreateFromSpecOutcome::DuplicateNodeId {
+                node_id: node_id.to_string(),
+            });
+        }
+        match classify_spec_node(spec_node) {
+            SpecNodeSource::ModuleId(mid) => {
+                if mid.parse::<Uuid>().is_err() {
+                    return Some(CreateFromSpecOutcome::InvalidModuleId {
+                        node_id: node_id.to_string(),
+                        module_id_value: mid.to_string(),
+                    });
+                }
+            }
+            SpecNodeSource::ModuleName(_) => {}
+            SpecNodeSource::InlineRust {
+                rust_code,
+                capability_world,
+            } => {
+                if capability_world.len() > MAX_CAPABILITY_WORLD_LEN {
+                    return Some(CreateFromSpecOutcome::CapabilityWorldTooLong {
+                        node_id: node_id.to_string(),
+                    });
+                }
+                if let Err(reason) = validate_inline_spec_node(node_id, spec_node, rust_code) {
+                    return Some(CreateFromSpecOutcome::InvalidInlineNode {
+                        node_id: node_id.to_string(),
+                        reason,
+                    });
+                }
+            }
+            SpecNodeSource::Missing => {
+                return Some(CreateFromSpecOutcome::NodeMissingResolutionField {
+                    node_id: node_id.to_string(),
+                });
+            }
+        }
+    }
+    for edge in spec_edges {
+        let src = edge.get("source").and_then(|v| v.as_str()).unwrap_or("");
+        let tgt = edge.get("target").and_then(|v| v.as_str()).unwrap_or("");
+        if !ids.contains(src) {
+            return Some(CreateFromSpecOutcome::EdgeReferencesUnknownNode {
+                endpoint: "source",
+                value: src.to_string(),
+            });
+        }
+        if !ids.contains(tgt) {
+            return Some(CreateFromSpecOutcome::EdgeReferencesUnknownNode {
+                endpoint: "target",
+                value: tgt.to_string(),
+            });
+        }
+        if let Some(cond) = edge.get("condition").and_then(|v| v.as_str()) {
+            if cond.len() > MAX_EDGE_CONDITION_LEN {
+                return Some(CreateFromSpecOutcome::EdgeConditionTooLong);
+            }
+        }
+    }
+    None
+}
+
+/// Map a compile/persist refusal onto the per-node breakdown. Uses the
+/// service's `user_facing_message`, so an internal error stays generic.
+fn node_build_error(
+    node_id: &str,
+    e: &talos_inline_compile_service::InlineCompileError,
+    persisting: bool,
+) -> NodeBuildError {
+    use talos_inline_compile_service::InlineCompileError as E;
+    let stage = match e {
+        E::InvalidArg(_) | E::DependencyValidation(_) | E::CapabilityCeilingViolation(_) => {
+            BuildStage::Validate
+        }
+        E::LintFailed(_) => BuildStage::Lint,
+        E::CompilationFailed(_) | E::NoWasmEmitted => BuildStage::Compile,
+        E::NameCollision(_) | E::SharedModuleOverwrite(_) | E::PermissionDrift(_) => {
+            BuildStage::NameCollision
+        }
+        E::Internal(_) if persisting => BuildStage::Store,
+        E::Internal(_) => BuildStage::Compile,
+    };
+    NodeBuildError {
+        node_id: node_id.to_string(),
+        stage,
+        messages: vec![e.user_facing_message()],
     }
 }
 
@@ -161,6 +448,9 @@ impl super::WorkflowCreationService {
     ///     .await?;
     /// match outcome { ... }
     /// ```
+    ///
+    /// The caller must have run its per-world role gate over
+    /// [`inline_compile_worlds`] first — this service has no agent identity.
     pub async fn create_from_spec(
         &self,
         req: CreateFromSpecRequest<'_>,
@@ -176,36 +466,16 @@ impl super::WorkflowCreationService {
             return Ok(CreateFromSpecOutcome::TooManyNodes);
         }
 
-        // ── Phase 1: Resolve each node ───────────────────────────────
-        let resolution = self.resolve_spec_nodes(req.user_id, req.spec_nodes).await?;
-        let resolved = match resolution {
+        // ── Phase 1: Structure — no I/O, before anything is compiled ─
+        if let Some(outcome) = validate_spec_structure(req.spec_nodes, req.spec_edges) {
+            return Ok(outcome);
+        }
+
+        // ── Phase 2: Resolve + compile every node, write nothing ─────
+        let resolved = match self.resolve_spec_nodes(req.user_id, req.spec_nodes).await? {
             ResolveResult::Resolved(r) => r,
             ResolveResult::Outcome(o) => return Ok(o),
         };
-
-        // ── Phase 2: Validate edges ──────────────────────────────────
-        let resolved_ids: HashSet<&str> = resolved.iter().map(|r| r.id.as_str()).collect();
-        for edge in req.spec_edges {
-            let src = edge.get("source").and_then(|v| v.as_str()).unwrap_or("");
-            let tgt = edge.get("target").and_then(|v| v.as_str()).unwrap_or("");
-            if !resolved_ids.contains(src) {
-                return Ok(CreateFromSpecOutcome::EdgeReferencesUnknownNode {
-                    endpoint: "source",
-                    value: src.to_string(),
-                });
-            }
-            if !resolved_ids.contains(tgt) {
-                return Ok(CreateFromSpecOutcome::EdgeReferencesUnknownNode {
-                    endpoint: "target",
-                    value: tgt.to_string(),
-                });
-            }
-            if let Some(cond) = edge.get("condition").and_then(|v| v.as_str()) {
-                if cond.len() > MAX_EDGE_CONDITION_LEN {
-                    return Ok(CreateFromSpecOutcome::EdgeConditionTooLong);
-                }
-            }
-        }
 
         // ── Phase 3: Build graph JSON ────────────────────────────────
         let graph_nodes = build_spec_graph_nodes(&resolved);
@@ -252,141 +522,166 @@ impl super::WorkflowCreationService {
         }))
     }
 
+    /// Resolve every node; compile every inline node through
+    /// `InlineCompileService::compile_checked`; and only when ALL of them
+    /// compiled, persist the compiled modules. A failure anywhere before the
+    /// persist step writes nothing, so a retry after fixing node 3 does not
+    /// collide with modules nodes 1 and 2 left behind.
+    ///
+    /// Assumes [`validate_spec_structure`] passed.
     async fn resolve_spec_nodes(
         &self,
         user_id: Uuid,
         spec_nodes: &[Value],
     ) -> anyhow::Result<ResolveResult> {
-        let mut resolved: Vec<ResolvedSpecNode> = Vec::new();
+        enum Slot<'a> {
+            Done(ResolvedSpecNode),
+            Compiled {
+                id: String,
+                config: Value,
+                input: talos_inline_compile_service::InlineCompileInput<'a>,
+                compiled: talos_inline_compile_service::CompiledInline,
+            },
+        }
+        let mut slots: Vec<Slot<'_>> = Vec::with_capacity(spec_nodes.len());
         let mut build_errors: Vec<NodeBuildError> = Vec::new();
 
         for spec_node in spec_nodes {
-            let node_id = spec_node
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("node")
-                .to_string();
+            let node_id = spec_node_id(spec_node).to_string();
             let config = spec_node
                 .get("config")
                 .cloned()
                 .unwrap_or(serde_json::json!({}));
 
-            // Path A — explicit module_id.
-            if let Some(mid_str) = spec_node.get("module_id").and_then(|v| v.as_str()) {
-                if mid_str.parse::<Uuid>().is_ok() {
-                    resolved.push(ResolvedSpecNode {
+            match classify_spec_node(spec_node) {
+                // Path A — explicit module_id. Visibility-gated like
+                // `add_node_to_workflow` (2026-09-25): before this a spec
+                // accepted any tenant's module UUID at authoring time.
+                SpecNodeSource::ModuleId(mid_str) => {
+                    let mid: Uuid = mid_str.parse()?;
+                    if !self
+                        .module_repo
+                        .module_accessible_by_user(mid, user_id)
+                        .await?
+                    {
+                        return Ok(ResolveResult::Outcome(
+                            CreateFromSpecOutcome::ModuleNotAccessible {
+                                node_id,
+                                module_id: mid,
+                            },
+                        ));
+                    }
+                    slots.push(Slot::Done(ResolvedSpecNode {
                         id: node_id,
                         module_id: mid_str.to_string(),
                         config,
                         compilation_note: None,
-                    });
-                    continue;
+                    }));
                 }
-                return Ok(ResolveResult::Outcome(
-                    CreateFromSpecOutcome::InvalidModuleId {
-                        node_id,
-                        module_id_value: mid_str.to_string(),
-                    },
-                ));
-            }
-
-            // Path B — catalog name lookup.
-            if let Some(module_name) = spec_node.get("module_name").and_then(|v| v.as_str()) {
-                // MCP-886 (2026-05-14): log DB errors before collapsing
-                // to None. Pre-fix the swallow turned a transient sqlx
-                // failure into "module not found, here are similar
-                // names" — operator-facing error misdirected the user
-                // to fix their spec when the actual issue was infra.
-                // Behaviour preserved (still falls through to the
-                // None branch) since spec resolution has its own
-                // operator-actionable surface; telemetry-only fix.
-                let resolved_id = match self
-                    .module_repo
-                    .find_template_id_by_name_normalised(module_name, user_id)
-                    .await
-                {
-                    Ok(opt) => opt,
-                    Err(e) => {
-                        tracing::warn!(
-                            module_name = %module_name,
-                            error = %e,
-                            "spec: find_template_id_by_name_normalised failed — \
-                             falling through to 'module not found' suggestion path. \
-                             User will see 'module not found' but actual cause is DB."
-                        );
-                        None
-                    }
-                };
-                match resolved_id {
-                    Some(tid) => {
-                        resolved.push(ResolvedSpecNode {
+                // Path B — catalog name lookup.
+                SpecNodeSource::ModuleName(module_name) => {
+                    // MCP-886 (2026-05-14): log DB errors before collapsing
+                    // to None. Behaviour preserved (still falls through to
+                    // the None branch) since spec resolution has its own
+                    // operator-actionable surface; telemetry-only fix.
+                    let resolved_id = match self
+                        .module_repo
+                        .find_template_id_by_name_normalised(module_name, user_id)
+                        .await
+                    {
+                        Ok(opt) => opt,
+                        Err(e) => {
+                            tracing::warn!(
+                                module_name = %module_name,
+                                error = %e,
+                                "spec: find_template_id_by_name_normalised failed — \
+                                 falling through to 'module not found' suggestion path. \
+                                 User will see 'module not found' but actual cause is DB."
+                            );
+                            None
+                        }
+                    };
+                    match resolved_id {
+                        Some(tid) => slots.push(Slot::Done(ResolvedSpecNode {
                             id: node_id,
                             module_id: tid.to_string(),
                             config,
                             compilation_note: None,
-                        });
-                    }
-                    None => {
-                        let suggestions = self
-                            .module_repo
-                            .suggest_template_names_for_miss(module_name, user_id, 5)
-                            .await;
-                        return Ok(ResolveResult::Outcome(
-                            CreateFromSpecOutcome::UnknownCatalogModule {
-                                node_id,
-                                module_name: module_name.to_string(),
-                                suggestions,
-                            },
-                        ));
+                        })),
+                        None => {
+                            let suggestions = self
+                                .module_repo
+                                .suggest_template_names_for_miss(module_name, user_id, 5)
+                                .await;
+                            return Ok(ResolveResult::Outcome(
+                                CreateFromSpecOutcome::UnknownCatalogModule {
+                                    node_id,
+                                    module_name: module_name.to_string(),
+                                    suggestions,
+                                },
+                            ));
+                        }
                     }
                 }
-                continue;
-            }
-
-            // Path C — inline rust_code compile.
-            if let Some(rust_code) = spec_node.get("rust_code").and_then(|v| v.as_str()) {
-                let world = spec_node
-                    .get("capability_world")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("minimal-node");
-                if world.len() > MAX_CAPABILITY_WORLD_LEN {
+                // Path C — inline rust_code, through the SAME service
+                // `add_node_to_workflow` uses (world allowlist, dependency
+                // allowlist, lint, compile), with EXPLICIT grants — never the
+                // world-derived `["*"]` host default — and a refusal, not an
+                // overwrite, on a taken name.
+                SpecNodeSource::InlineRust {
+                    rust_code,
+                    capability_world,
+                } => {
+                    let grants = match validate_inline_spec_node(
+                        spec_node_id(spec_node),
+                        spec_node,
+                        rust_code,
+                    ) {
+                        Ok(g) => g,
+                        // Unreachable after `validate_spec_structure`; kept
+                        // total rather than `expect`ed.
+                        Err(reason) => {
+                            return Ok(ResolveResult::Outcome(
+                                CreateFromSpecOutcome::InvalidInlineNode { node_id, reason },
+                            ))
+                        }
+                    };
+                    let input = talos_inline_compile_service::InlineCompileInput {
+                        user_id,
+                        // The workflow row does not exist yet. The id scopes
+                        // only the shared-module guard, which `Refuse` never
+                        // reaches.
+                        workflow_id: Uuid::nil(),
+                        // Spec workflows are created unbound.
+                        workflow_actor_id: None,
+                        node_id: spec_node_id(spec_node),
+                        rust_code,
+                        capability_world,
+                        explicit_allowed_hosts: Some(grants.allowed_hosts),
+                        explicit_allowed_secrets: Some(grants.allowed_secrets),
+                        explicit_allowed_methods: Some(grants.allowed_methods),
+                        dependencies: None,
+                        integration_name: None,
+                        fuel_budget: None,
+                        on_name_collision: talos_inline_compile_service::NameCollision::Refuse,
+                    };
+                    match self.inline_compile.compile_checked(&input).await {
+                        Ok(compiled) => slots.push(Slot::Compiled {
+                            id: node_id,
+                            config,
+                            input,
+                            compiled,
+                        }),
+                        Err(e) => build_errors.push(node_build_error(&node_id, &e, false)),
+                    }
+                }
+                // Refused by `validate_spec_structure`.
+                SpecNodeSource::Missing => {
                     return Ok(ResolveResult::Outcome(
-                        CreateFromSpecOutcome::CapabilityWorldTooLong { node_id },
+                        CreateFromSpecOutcome::NodeMissingResolutionField { node_id },
                     ));
                 }
-                let allowed_secrets: Vec<String> = spec_node
-                    .get("allowed_secrets")
-                    .and_then(|v| v.as_array())
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|s| s.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-
-                match self
-                    .build_inline_rust_node(user_id, &node_id, rust_code, world, &allowed_secrets)
-                    .await
-                {
-                    BuildOutcome::Resolved(template_id) => {
-                        resolved.push(ResolvedSpecNode {
-                            id: node_id.clone(),
-                            module_id: template_id.to_string(),
-                            config,
-                            compilation_note: Some(format!(
-                                "compiled {} → {}",
-                                node_id, template_id
-                            )),
-                        });
-                    }
-                    BuildOutcome::Failed(err) => build_errors.push(err),
-                }
-                continue;
             }
-
-            return Ok(ResolveResult::Outcome(
-                CreateFromSpecOutcome::NodeMissingResolutionField { node_id },
-            ));
         }
 
         if !build_errors.is_empty() {
@@ -396,203 +691,38 @@ impl super::WorkflowCreationService {
                 },
             ));
         }
+
+        // Every node compiled: persist. A failure HERE (a name taken since
+        // the pre-compile check, a database error) can leave earlier nodes'
+        // modules written — the one window this ordering does not close.
+        let mut resolved = Vec::with_capacity(slots.len());
+        for slot in slots {
+            match slot {
+                Slot::Done(r) => resolved.push(r),
+                Slot::Compiled {
+                    id,
+                    config,
+                    input,
+                    compiled,
+                } => match self.inline_compile.persist_compiled(&input, compiled).await {
+                    Ok(outcome) => resolved.push(ResolvedSpecNode {
+                        compilation_note: Some(format!("compiled {} → {}", id, outcome.module_id)),
+                        id,
+                        module_id: outcome.module_id.to_string(),
+                        config,
+                    }),
+                    Err(e) => build_errors.push(node_build_error(&id, &e, true)),
+                },
+            }
+        }
+        if !build_errors.is_empty() {
+            return Ok(ResolveResult::Outcome(
+                CreateFromSpecOutcome::NodeBuildErrors {
+                    errors: build_errors,
+                },
+            ));
+        }
         Ok(ResolveResult::Resolved(resolved))
-    }
-
-    async fn build_inline_rust_node(
-        &self,
-        user_id: Uuid,
-        node_id: &str,
-        rust_code: &str,
-        world: &str,
-        allowed_secrets: &[String],
-    ) -> BuildOutcome {
-        // Inject `#[talos_module]` attribute before `fn run` if the
-        // user's source didn't already include it. Pre-extraction this
-        // was an inline regex+match; now centralised in `inject_module_macro`.
-        let wrapped = inject_module_macro(rust_code, world);
-
-        // Lint pre-flight (catches the common authoring errors before
-        // we burn a compilation slot).
-        let lint_world = if world.ends_with("-node") {
-            world.to_string()
-        } else {
-            format!("{}-node", world)
-        };
-        // The `Err` arm WARNs and proceeds (2026-09-07). Refusing would be
-        // wrong: the full compile below re-runs the identical
-        // `analyze::lint_source_code` static pass and is the enforcing one, so
-        // a lint-runner outage costs compile budget, not a check. What was
-        // wrong was the SILENCE — `talos_inline_compile_service` logs this
-        // (its L-32 arm) and the other two call sites of `lint_code` did not.
-        let lint_outcome = self
-            .compiler
-            .lint_code(Some(user_id), node_id, &wrapped, &lint_world, None)
-            .await;
-        if let Err(e) = &lint_outcome {
-            tracing::warn!(
-                node_id = %node_id,
-                error = %e,
-                event_kind = "lint_preflight_unavailable",
-                surface = "create_workflow_from_spec",
-                "lint pre-flight could not run; proceeding to the full compile, which \
-                 re-runs the same static analysis and is the enforcing pass"
-            );
-        }
-        if let Ok(lint_errors) = lint_outcome {
-            if !lint_errors.is_empty() {
-                let msgs: Vec<String> = lint_errors
-                    .iter()
-                    .map(|e| match (e.line, e.column) {
-                        (Some(l), Some(c)) => format!("Line {}:{}: {}", l, c, e.message),
-                        _ => e.message.clone(),
-                    })
-                    .collect();
-                return BuildOutcome::Failed(NodeBuildError {
-                    node_id: node_id.to_string(),
-                    stage: BuildStage::Lint,
-                    messages: msgs,
-                });
-            }
-        }
-
-        // Full compile.
-        let job_id = Uuid::new_v4();
-        let compile_result = self
-            .compiler
-            .compile_to_wasm_with_config(
-                user_id,
-                job_id,
-                node_id,
-                &wrapped,
-                &serde_json::json!({}),
-                None,
-            )
-            .await;
-
-        let (wasm_bytes, _content_hash) = match compile_result {
-            Ok(res) if res.success => match res.wasm_bytes {
-                Some(b) => (b, res.content_hash),
-                None => {
-                    return BuildOutcome::Failed(NodeBuildError {
-                        node_id: node_id.to_string(),
-                        stage: BuildStage::Compile,
-                        messages: vec!["Compiled successfully but no WASM bytes returned".into()],
-                    });
-                }
-            },
-            Ok(res) => {
-                let msgs: Vec<String> = res.errors.iter().map(|e| e.message.clone()).collect();
-                return BuildOutcome::Failed(NodeBuildError {
-                    node_id: node_id.to_string(),
-                    stage: BuildStage::Compile,
-                    messages: if msgs.is_empty() {
-                        vec!["Compilation failed (no output)".into()]
-                    } else {
-                        msgs
-                    },
-                });
-            }
-            Err(e) => {
-                return BuildOutcome::Failed(NodeBuildError {
-                    node_id: node_id.to_string(),
-                    stage: BuildStage::Compile,
-                    messages: vec![e.to_string()],
-                });
-            }
-        };
-
-        // Determine allowed_hosts from capability_world: any of the
-        // network-capable worlds gets `["*"]`, others nothing.
-        let allowed_hosts: Vec<String> = if world.contains("http")
-            || world.contains("network")
-            || world.contains("secrets")
-            || world.contains("automation")
-            || world.contains("database")
-        {
-            vec!["*".to_string()]
-        } else {
-            vec![]
-        };
-
-        // Upsert into modules table by (name, user_id).
-        //
-        // MCP-886 (2026-05-14): log DB errors before collapsing to
-        // None. Pre-fix `.unwrap_or(None)` made a sqlx failure look
-        // like "no existing template" — the upsert path then took the
-        // INSERT branch instead of UPDATE. On a (node_id, user_id)
-        // unique-constraint, the INSERT would fail with its own
-        // error so the corruption was bounded; without that
-        // constraint, a duplicate row could be silently created. Log
-        // here so post-incident review can correlate the upstream
-        // DB blip with the downstream upsert failure.
-        let existing = match self
-            .workflow_repo
-            .find_node_template_by_name_and_user(node_id, user_id)
-            .await
-        {
-            Ok(opt) => opt,
-            Err(e) => {
-                tracing::warn!(
-                    node_id = %node_id,
-                    user_id = %user_id,
-                    error = %e,
-                    "spec build_inline_rust_node: find_node_template_by_name_and_user failed — \
-                     falling through to INSERT (will surface as a unique-constraint error \
-                     downstream if the row actually exists)"
-                );
-                None
-            }
-        };
-        let integration_name_ref: Option<&str> = None;
-        let template_id = if let Some(eid) = existing {
-            if let Err(e) = self
-                .workflow_repo
-                .update_node_template_wasm(
-                    eid,
-                    &wasm_bytes,
-                    rust_code,
-                    world,
-                    allowed_secrets,
-                    &allowed_hosts,
-                    integration_name_ref,
-                )
-                .await
-            {
-                return BuildOutcome::Failed(NodeBuildError {
-                    node_id: node_id.to_string(),
-                    stage: BuildStage::Store,
-                    messages: vec![e.to_string()],
-                });
-            }
-            eid
-        } else {
-            let new_id = Uuid::new_v4();
-            if let Err(e) = self
-                .workflow_repo
-                .insert_node_template(
-                    new_id,
-                    node_id,
-                    &wasm_bytes,
-                    rust_code,
-                    world,
-                    allowed_secrets,
-                    &allowed_hosts,
-                    user_id,
-                    integration_name_ref,
-                )
-                .await
-            {
-                return BuildOutcome::Failed(NodeBuildError {
-                    node_id: node_id.to_string(),
-                    stage: BuildStage::Store,
-                    messages: vec![e.to_string()],
-                });
-            }
-            new_id
-        };
-
-        BuildOutcome::Resolved(template_id)
     }
 }
 
@@ -603,34 +733,6 @@ impl super::WorkflowCreationService {
 enum ResolveResult {
     Resolved(Vec<ResolvedSpecNode>),
     Outcome(CreateFromSpecOutcome),
-}
-
-enum BuildOutcome {
-    Resolved(Uuid),
-    Failed(NodeBuildError),
-}
-
-/// Inject `#[talos_sdk_macros::talos_module(world = "<world>")]` on
-/// the line above `fn run(`, unless the source already carries the
-/// attribute. Pure helper — exported so unit tests cover the macro-
-/// rewriting logic without round-tripping through the compiler.
-pub(crate) fn inject_module_macro(rust_code: &str, world: &str) -> String {
-    if rust_code.contains("#[talos_module") || rust_code.contains("talos_sdk_macros::talos_module")
-    {
-        return rust_code.to_string();
-    }
-    static RE_RUN_FN_SPEC: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"(?m)^[ \t]*(pub[ \t]+)?fn[ \t]+run[ \t]*\(").unwrap()
-    });
-    match RE_RUN_FN_SPEC.find(rust_code) {
-        Some(m) => format!(
-            "{}#[talos_sdk_macros::talos_module(world = \"{}\")]\n{}",
-            &rust_code[..m.start()],
-            world,
-            &rust_code[m.start()..]
-        ),
-        None => rust_code.to_string(),
-    }
 }
 
 /// Build the React-Flow node array. Pure projection — exposed for
@@ -687,44 +789,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn inject_macro_skips_when_already_present_attribute_form() {
-        let src = "#[talos_module(world = \"http-node\")]\nfn run() {}";
-        assert_eq!(inject_module_macro(src, "http-node"), src);
-    }
-
-    #[test]
-    fn inject_macro_skips_when_already_present_path_form() {
-        let src = "#[talos_sdk_macros::talos_module(world = \"http-node\")]\nfn run() {}";
-        assert_eq!(inject_module_macro(src, "http-node"), src);
-    }
-
-    #[test]
-    fn inject_macro_inserts_above_pub_fn_run() {
-        let src = "use foo;\npub fn run() {}\n";
-        let out = inject_module_macro(src, "minimal-node");
-        assert!(out.contains("#[talos_sdk_macros::talos_module(world = \"minimal-node\")]"));
-        assert!(out.contains("pub fn run() {}"));
-        // Macro is on the line directly above `pub fn run`.
-        let macro_idx = out.find("#[talos_sdk_macros::talos_module").unwrap();
-        let fn_idx = out.find("pub fn run").unwrap();
-        assert!(macro_idx < fn_idx);
-    }
-
-    #[test]
-    fn inject_macro_inserts_above_bare_fn_run() {
-        let src = "fn run() {}";
-        let out = inject_module_macro(src, "http-node");
-        assert!(out.starts_with("#[talos_sdk_macros::talos_module(world = \"http-node\")]"));
-    }
-
-    #[test]
-    fn inject_macro_returns_unchanged_when_no_run_fn() {
-        let src = "fn other() {}";
-        // No run fn → can't safely inject; return as-is.
-        assert_eq!(inject_module_macro(src, "minimal-node"), src);
-    }
-
-    #[test]
     fn build_spec_graph_nodes_lays_out_vertically() {
         let resolved = vec![
             ResolvedSpecNode {
@@ -773,8 +837,167 @@ mod tests {
 
     #[test]
     fn build_stage_tags() {
+        assert_eq!(BuildStage::Validate.tag(), "validate");
         assert_eq!(BuildStage::Lint.tag(), "lint");
         assert_eq!(BuildStage::Compile.tag(), "compile");
+        assert_eq!(BuildStage::NameCollision.tag(), "name_collision");
         assert_eq!(BuildStage::Store.tag(), "store");
+    }
+
+    fn inline(id: &str, extra: serde_json::Value) -> serde_json::Value {
+        let mut n = serde_json::json!({
+            "id": id,
+            "rust_code": "fn run() {}",
+            "capability_world": "http-node",
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            n[k] = v.clone();
+        }
+        n
+    }
+
+    fn reason(o: Option<CreateFromSpecOutcome>) -> String {
+        match o {
+            Some(CreateFromSpecOutcome::InvalidInlineNode { reason, .. }) => reason,
+            other => panic!("expected InvalidInlineNode, got {other:?}"),
+        }
+    }
+
+    /// 2026-09-25: a spec never grants every host. Pre-fix the world alone
+    /// decided, and every network-capable world got `["*"]`.
+    #[test]
+    fn a_wildcard_host_is_refused() {
+        for hosts in [
+            serde_json::json!(["*"]),
+            serde_json::json!(["api.example.com", " * "]),
+        ] {
+            let r = reason(validate_spec_structure(
+                &[inline("n1", serde_json::json!({ "allowed_hosts": hosts }))],
+                &[],
+            ));
+            assert!(r.contains("\"*\""), "{r}");
+        }
+    }
+
+    /// Absent grants are EMPTY, not the world default — an http-node module
+    /// created by a spec with no `allowed_hosts` can reach nothing until its
+    /// hosts are named.
+    #[test]
+    fn absent_grants_are_empty_not_the_world_default() {
+        let n = inline("n1", serde_json::json!({}));
+        let g = validate_inline_spec_node("n1", &n, "fn run() {}").unwrap();
+        assert!(g.allowed_hosts.is_empty());
+        assert!(g.allowed_methods.is_empty());
+        assert!(g.allowed_secrets.is_empty());
+        // Control: named hosts and verbs pass through (verbs uppercased).
+        let n = inline(
+            "n1",
+            serde_json::json!({ "allowed_hosts": ["api.example.com"], "allowed_methods": ["get", "POST"] }),
+        );
+        let g = validate_inline_spec_node("n1", &n, "fn run() {}").unwrap();
+        assert_eq!(g.allowed_hosts, vec!["api.example.com".to_string()]);
+        assert_eq!(
+            g.allowed_methods,
+            vec!["GET".to_string(), "POST".to_string()]
+        );
+    }
+
+    #[test]
+    fn inline_node_names_sizes_and_grants_are_validated() {
+        for (node, needle) in [
+            (
+                inline("bad name", serde_json::json!({})),
+                "may only contain",
+            ),
+            (inline(&"x".repeat(201), serde_json::json!({})), "1-200"),
+            (
+                inline("n1", serde_json::json!({ "allowed_secrets": ["ok", 7] })),
+                "allowed_secrets[1]",
+            ),
+            (
+                inline("n1", serde_json::json!({ "allowed_methods": ["FETCH"] })),
+                "FETCH",
+            ),
+            (
+                inline(
+                    "n1",
+                    serde_json::json!({ "allowed_hosts": "api.example.com" }),
+                ),
+                "must be an array",
+            ),
+        ] {
+            let r = reason(validate_spec_structure(&[node], &[]));
+            assert!(r.contains(needle), "{needle}: {r}");
+        }
+        let big = serde_json::json!({
+            "id": "n1",
+            "rust_code": "x".repeat(MAX_INLINE_RUST_BYTES + 1),
+        });
+        assert!(reason(validate_spec_structure(&[big], &[])).contains("512 KiB"));
+    }
+
+    /// Two nodes sharing an id are refused before anything compiles — for
+    /// inline nodes the second would otherwise collide with the first's
+    /// module.
+    #[test]
+    fn duplicate_node_ids_are_refused() {
+        let out = validate_spec_structure(
+            &[
+                inline("n1", serde_json::json!({})),
+                inline("n1", serde_json::json!({})),
+            ],
+            &[],
+        );
+        assert!(matches!(
+            out,
+            Some(CreateFromSpecOutcome::DuplicateNodeId { node_id }) if node_id == "n1"
+        ));
+    }
+
+    /// Edges are checked against the SPEC's ids before anything compiles, so a
+    /// bad edge no longer leaves compiled modules behind.
+    #[test]
+    fn edges_are_validated_before_compile() {
+        let out = validate_spec_structure(
+            &[inline("n1", serde_json::json!({}))],
+            &[serde_json::json!({ "source": "n1", "target": "ghost" })],
+        );
+        assert!(matches!(
+            out,
+            Some(CreateFromSpecOutcome::EdgeReferencesUnknownNode {
+                endpoint: "target",
+                ..
+            })
+        ));
+        // Control: a well-formed spec passes.
+        assert!(validate_spec_structure(
+            &[
+                inline("n1", serde_json::json!({})),
+                inline("n2", serde_json::json!({}))
+            ],
+            &[serde_json::json!({ "source": "n1", "target": "n2" })],
+        )
+        .is_none());
+    }
+
+    /// The role gate's input follows the SAME precedence the service resolves
+    /// by: a node carrying `module_id` AND `rust_code` compiles nothing.
+    #[test]
+    fn inline_compile_worlds_follows_resolution_precedence() {
+        let nodes = vec![
+            inline("a", serde_json::json!({})),
+            serde_json::json!({ "id": "b", "rust_code": "fn run() {}" }),
+            serde_json::json!({
+                "id": "c",
+                "module_id": "00000000-0000-0000-0000-000000000001",
+                "rust_code": "fn run() {}",
+                "capability_world": "automation-node",
+            }),
+            serde_json::json!({ "id": "d", "module_name": "x", "rust_code": "fn run() {}" }),
+        ];
+        assert_eq!(
+            inline_compile_worlds(&nodes),
+            vec![("a", "http-node"), ("b", "minimal-node")]
+        );
     }
 }

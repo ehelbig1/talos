@@ -1043,19 +1043,23 @@ impl TalosContext {
             // Tier-1 LLM egress ceiling — same host deny-list as fetch.
             // GraphQL is an orthogonal transport, not a way around the
             // privacy ceiling.
-            if matches!(
-                self.max_llm_tier,
-                talos_workflow_job_protocol::LlmTier::Tier1
-            ) {
+            // Egress-posture gate: tier-1 LLM hosts + public IP literals, and
+            // public IP literals for ANY local-egress-only actor (a resolver never
+            // sees a literal) — one predicate, `egress_posture_deny_reason`.
+            {
                 let host_lower = host.to_ascii_lowercase();
-                if let Some(policy) = tier1_egress_deny_reason(&host_lower) {
+                if let Some(policy) = egress_posture_deny_reason(
+                    &host_lower,
+                    self.max_llm_tier,
+                    self.local_egress_only,
+                ) {
                     self.record_capability_denied("graphql", policy, &host)
                         .await;
                     tracing::warn!(
                         host = %host,
                         actor_id = ?self.actor_id,
                         policy,
-                        "tier-1 actor GraphQL egress refused (external LLM host or public IP literal)"
+                        "actor egress posture refused GraphQL egress (tier-1: external LLM host or public IP literal; local-only egress: public IP literal)"
                     );
                     return Err(gql_deny(self, reason_class::tier1_egress_class(policy)));
                 }

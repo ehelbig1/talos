@@ -1362,7 +1362,8 @@ impl WorkflowRepository {
     }
 
     /// Resolve a WORKFLOW's bound actor identity AND privilege ceilings
-    /// (`actor_id`, `max_llm_tier`, `max_write_ceiling`, `egress_scope`) in
+    /// (`actor_id` plus all four signed ceilings as one
+    /// [`talos_workflow_engine_core::ActorCeilings`]) in
     /// ONE narrow query, scoped to `user_id` on BOTH the workflow and the
     /// actor. Returns `Ok(None)` when the workflow isn't visible to the
     /// user, has no bound actor, or the actor isn't owned by the user — the
@@ -1382,20 +1383,20 @@ impl WorkflowRepository {
     /// parse through the fail-closed `from_db_str` helpers (unknown /
     /// malformed values → `Tier1` / `ReadOnly`), so column drift can never
     /// widen a sub-workflow's authority.
+    ///
+    /// `http_verb_ceiling` was NOT projected until 2026-09-25, and the caller
+    /// answered `None` for it unconditionally — so a child bound to an actor
+    /// whose override is `readonly` could never tighten a parent's POST grant.
+    /// It is three-valued (`http_verb_ceiling_from_db`): SQL NULL stays
+    /// `None` = inherit this actor's OWN `max_write_ceiling`.
     pub async fn get_workflow_actor_binding(
         &self,
         workflow_id: Uuid,
         user_id: Uuid,
-    ) -> Result<
-        Option<(
-            Uuid,
-            talos_workflow_engine_core::LlmTier,
-            talos_workflow_engine_core::WriteCeiling,
-            Option<talos_workflow_engine_core::EgressScope>,
-        )>,
-    > {
+    ) -> Result<Option<(Uuid, talos_workflow_engine_core::ActorCeilings)>> {
         let row = sqlx::query(
-            "SELECT a.id AS actor_id, a.max_llm_tier, a.max_write_ceiling, a.egress_scope \
+            "SELECT a.id AS actor_id, a.max_llm_tier, a.max_write_ceiling, a.egress_scope, \
+                    a.http_verb_ceiling \
              FROM workflows w \
              JOIN actors a ON a.id = w.actor_id \
              WHERE w.id = $1 AND w.user_id = $2 AND a.user_id = $2",
@@ -1418,7 +1419,19 @@ impl WorkflowRepository {
             let egress = talos_workflow_engine_core::EgressScope::from_db_opt(
                 r.try_get::<Option<String>, _>("egress_scope")?.as_deref(),
             );
-            Ok((actor_id, tier, ceiling, egress))
+            let http_verb = talos_workflow_engine_core::http_verb_ceiling_from_db(
+                r.try_get::<Option<String>, _>("http_verb_ceiling")?
+                    .as_deref(),
+            );
+            Ok((
+                actor_id,
+                talos_workflow_engine_core::ActorCeilings {
+                    max_llm_tier: tier,
+                    max_write_ceiling: ceiling,
+                    http_verb_ceiling: http_verb,
+                    egress_scope: egress,
+                },
+            ))
         })
         .transpose()
     }

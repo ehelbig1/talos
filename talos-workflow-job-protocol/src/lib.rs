@@ -1997,8 +1997,8 @@ pub use talos_workflow_engine_core::WriteCeiling;
 /// core only through this crate, and adding that edge to name one enum
 /// would invert the layering the rest of the ceiling already respects.
 pub use talos_workflow_engine_core::{
-    effective_write_ceiling, http_verb_ceiling_from_db, narrow_verb_inference_override,
-    write_ceiling_denies_axis, CeilingAxis,
+    effective_write_ceiling, http_verb_ceiling_from_db, write_ceiling_denies_axis, ActorCeilings,
+    CeilingAxis,
 };
 
 /// Map a provider name (case-insensitive) to its data-egress tier.
