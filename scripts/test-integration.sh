@@ -423,6 +423,12 @@ fi
 # needed here. 64 hex = 32 bytes, non-zero.
 CTRL_MASTER_KEY="00000000000000000000000000000000000000000000000000000000deadbeef"
 CTRL_TESTS=(
+    # `enqueue_workflow` dispatches only rows its queued->running claim won (a
+    # row cancelled while it waited was run anyway) and runs them as the
+    # gate-resolved actor (an enqueue naming no actor skipped the ceiling and
+    # ran unbound) — 2026-09-25. `common` (DATABASE_URL) harness; uses NATS when
+    # TALOS_TEST_NATS_URL is set, so CTRL_TESTS and not TC_TESTS (64b).
+    "enqueue_drain_tests"
     # Privileged operations (key material, credential minting, capability
     # grants, audit settings, ownership transfer) require a VERIFIED second
     # factor: the gate matrix through the real schema, login/refresh flags, and

@@ -808,7 +808,9 @@ async fn run_replays(
                 secrets.clone(),
                 None,
                 Duration::from_secs(timeout_secs),
-                talos_worker_runtime::runtime::RetryPolicy::default(),
+                // No controller retry loop above a replay: the old in-process
+                // policy, named rather than defaulted (NOT method-aware).
+                talos_worker_runtime::runtime::RetryPolicy::in_process_transient(),
                 None,
                 talos_worker_runtime::runtime::SecurityPolicy::default(),
                 None,
