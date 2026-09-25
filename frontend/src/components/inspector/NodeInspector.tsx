@@ -56,6 +56,7 @@ const STATUS_DOT: Record<NodeStatusType, string> = {
     "bg-primary animate-status-pulse shadow-[0_0_10px_hsla(var(--primary),0.5)]",
   success: "bg-success shadow-[0_0_10px_hsla(var(--success),0.5)]",
   failed: "bg-destructive shadow-[0_0_10px_hsla(var(--destructive),0.5)]",
+  skipped: "bg-muted-foreground/50",
   awaiting_approval:
     "bg-warning animate-pulse shadow-[0_0_10px_hsla(var(--warning),0.5)]",
 };
@@ -65,6 +66,7 @@ const STATUS_LABEL: Record<NodeStatusType, string> = {
   running: "EXECUTING_LOGIC",
   success: "SEQUENCE_COMPLETE",
   failed: "EXECUTION_FAILURE",
+  skipped: "SKIPPED",
   awaiting_approval: "PENDING_AUTHORIZATION",
 };
 
@@ -536,7 +538,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                       </div>
                       <div className="flex-1 space-y-2">
                         <div className="flex items-center gap-3">
-                          {ev.status === "SUCCESS" && (
+                          {ev.status === "COMPLETED" && (
                             <CheckCircle2 className="w-3.5 h-3.5 text-success/60" />
                           )}
                           <span
@@ -544,7 +546,7 @@ export const NodeInspector: React.FC<NodeInspectorProps> = ({
                               "block font-black uppercase tracking-widest text-[11px]",
                               ev.status === "FAILED"
                                 ? "text-destructive"
-                                : ev.status === "AwaitingApproval"
+                                : ev.status === "WAITING"
                                   ? "text-warning"
                                   : "text-white/60 group-hover:text-white transition-premium",
                             )}

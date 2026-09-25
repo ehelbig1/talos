@@ -16,6 +16,35 @@ import {
 } from "@/lib/graphqlApi";
 import type { ExecStatus, LaneState } from "./types";
 
+const TERMINAL: ReadonlySet<ExecStatus> = new Set([
+  "completed",
+  "failed",
+  "cancelled",
+  "idle",
+]);
+/** History reads per completed lane before its output is given up on. */
+const MAX_OUTPUT_FETCH_ATTEMPTS = 5;
+
+/**
+ * A lane's status after one `executionUpdates` event. The server sends the
+ * uppercase `ExecutionStatus` values; only an execution-level event (no
+ * `nodeId`) can end the run — a node's COMPLETED/FAILED is not the run's.
+ */
+export function laneStatusFromEvent(
+  current: ExecStatus,
+  event: Pick<ExecutionUpdate, "status" | "nodeId">,
+): ExecStatus {
+  if (TERMINAL.has(current)) return current;
+  if (!event.nodeId) {
+    if (event.status === "COMPLETED") return "completed";
+    if (event.status === "FAILED") return "failed";
+  }
+  if (event.status === "RUNNING" || event.status === "WAITING") {
+    return "running";
+  }
+  return current;
+}
+
 export function useCompareRun({
   selectedWorkflowId,
   selectedActorIds,
@@ -27,6 +56,11 @@ export function useCompareRun({
 }) {
   const [lanes, setLanes] = useState<LaneState[]>([]);
   const [running, setRunning] = useState(false);
+  // The polling loop reads the latest lanes here instead of via an updater.
+  const lanesRef = useRef<LaneState[]>(lanes);
+  useEffect(() => {
+    lanesRef.current = lanes;
+  }, [lanes]);
 
   // Subscriptions cleanup refs
   const unsubscribesRef = useRef<Array<() => void>>([]);
@@ -127,33 +161,22 @@ export function useCompareRun({
 
         // Subscribe to live updates for this execution
         const unsub = subscribeExecution(execId, (event: ExecutionUpdate) => {
+          const now = Date.now();
           setLanes((prev) =>
             prev.map((l) => {
               if (l.actor.id !== actor.id) return l;
-              const newLogs = event.logMessage
-                ? [...l.logs, event.logMessage]
-                : l.logs;
-              let newStatus: ExecStatus = l.status;
-              if (event.status === "running") newStatus = "running";
-              else if (event.status === "completed") newStatus = "completed";
-              else if (event.status === "failed") newStatus = "failed";
-              else if (event.status === "cancelled") newStatus = "cancelled";
-
-              const now = Date.now();
-              const durationMs =
-                newStatus === "completed" || newStatus === "failed"
-                  ? l.startedAt
-                    ? now - l.startedAt
-                    : null
-                  : l.durationMs;
-
+              const newStatus = laneStatusFromEvent(l.status, event);
+              const ended =
+                newStatus !== l.status &&
+                (newStatus === "completed" || newStatus === "failed");
               return {
                 ...l,
                 status: newStatus,
-                logs: newLogs,
-                durationMs,
+                logs: event.logMessage ? [...l.logs, event.logMessage] : l.logs,
+                durationMs:
+                  ended && l.startedAt ? now - l.startedAt : l.durationMs,
                 errorMessage:
-                  newStatus === "failed"
+                  ended && newStatus === "failed"
                     ? (event.logMessage ?? l.errorMessage)
                     : l.errorMessage,
               };
@@ -183,75 +206,80 @@ export function useCompareRun({
     if (outputPollTimeoutRef.current) {
       clearTimeout(outputPollTimeoutRef.current);
     }
-    const interval = setInterval(async () => {
-      setLanes((current) => {
-        // Check if all lanes are terminal
-        const allDone = current.every(
-          (l) =>
-            l.status === "completed" ||
-            l.status === "failed" ||
-            l.status === "cancelled" ||
-            l.status === "idle",
-        );
-        if (allDone) {
-          clearInterval(interval);
-          setRunning(false);
-        }
-        return current;
-      });
-
-      // Fetch output for completed lanes that still lack output
-      setLanes((current) =>
-        current.map((l) => {
-          if (
-            (l.status === "completed" || l.status === "failed") &&
-            l.executionId &&
-            l.output === null &&
-            actorIds.includes(l.actor.id)
-          ) {
-            // Fire-and-forget fetch
-            getWorkflowExecutionHistory(selectedWorkflowId, 50)
-              .then((history) => {
-                const match = history.find((e) => e.id === l.executionId);
-                if (match) {
-                  setLanes((prev) =>
-                    prev.map((lane) =>
-                      lane.executionId === l.executionId
-                        ? {
-                            ...lane,
-                            output:
-                              match.outputData != null
-                                ? typeof match.outputData === "string"
-                                  ? match.outputData
-                                  : JSON.stringify(match.outputData)
-                                : lane.output,
-                            errorMessage:
-                              match.errorMessage ?? lane.errorMessage,
-                            durationMs: match.durationMs ?? lane.durationMs,
-                          }
-                        : lane,
-                    ),
-                  );
-                }
-              })
-              .catch((err: unknown) => {
-                if (import.meta.env.DEV)
-                  console.warn("Failed to load execution history:", err);
-              });
-          }
-          return l;
-        }),
+    // Side effects live here, never inside a `setLanes` updater (React may
+    // invoke an updater twice). Each finished lane's output is read until
+    // it is found, at most MAX_OUTPUT_FETCH_ATTEMPTS times — not every tick.
+    const resolved = new Set<string>();
+    const attempts = new Map<string, number>();
+    let inFlight = false;
+    const stop = () => {
+      clearInterval(interval);
+      outputPollIntervalRef.current = null;
+      if (outputPollTimeoutRef.current) {
+        clearTimeout(outputPollTimeoutRef.current);
+        outputPollTimeoutRef.current = null;
+      }
+      setRunning(false);
+    };
+    const interval = setInterval(() => {
+      if (inFlight) return;
+      const current = lanesRef.current.filter((l) =>
+        actorIds.includes(l.actor.id),
       );
+      const pending = current.filter(
+        (l): l is LaneState & { executionId: string } =>
+          (l.status === "completed" || l.status === "failed") &&
+          l.executionId !== null &&
+          l.output === null &&
+          !resolved.has(l.executionId) &&
+          (attempts.get(l.executionId) ?? 0) < MAX_OUTPUT_FETCH_ATTEMPTS,
+      );
+      if (pending.length === 0) {
+        if (current.every((l) => TERMINAL.has(l.status))) stop();
+        return;
+      }
+      for (const l of pending) {
+        attempts.set(l.executionId, (attempts.get(l.executionId) ?? 0) + 1);
+      }
+      inFlight = true;
+      getWorkflowExecutionHistory(selectedWorkflowId, 50)
+        .then((history) => {
+          const byId = new Map(history.map((e) => [e.id, e]));
+          for (const l of pending) {
+            if (byId.has(l.executionId)) resolved.add(l.executionId);
+          }
+          setLanes((prev) =>
+            prev.map((lane) => {
+              const match = lane.executionId
+                ? byId.get(lane.executionId)
+                : undefined;
+              if (!match) return lane;
+              return {
+                ...lane,
+                output:
+                  match.outputData != null
+                    ? typeof match.outputData === "string"
+                      ? match.outputData
+                      : JSON.stringify(match.outputData)
+                    : lane.output,
+                errorMessage: match.errorMessage ?? lane.errorMessage,
+                durationMs: match.durationMs ?? lane.durationMs,
+              };
+            }),
+          );
+        })
+        .catch((err: unknown) => {
+          if (import.meta.env.DEV)
+            console.warn("Failed to load execution history:", err);
+        })
+        .finally(() => {
+          inFlight = false;
+        });
     }, 3000);
     outputPollIntervalRef.current = interval;
 
     // Safety stop after 10 minutes
-    outputPollTimeoutRef.current = setTimeout(() => {
-      clearInterval(interval);
-      outputPollIntervalRef.current = null;
-      outputPollTimeoutRef.current = null;
-      setRunning(false);
-    }, 600_000);
+    outputPollTimeoutRef.current = setTimeout(stop, 600_000);
   };
 
   const handleReset = () => {

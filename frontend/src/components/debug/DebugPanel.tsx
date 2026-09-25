@@ -109,6 +109,7 @@ export const DebugPanel: React.FC<DebugPanelProps> = ({ nodeId }) => {
     running: "text-blue-400",
     success: "text-green-400",
     failed: "text-red-400",
+    skipped: "text-muted-foreground",
     awaiting_approval: "text-amber-400",
   };
 

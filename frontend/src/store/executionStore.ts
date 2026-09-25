@@ -9,6 +9,7 @@ export type NodeStatusType =
   | "running"
   | "success"
   | "failed"
+  | "skipped"
   | "awaiting_approval";
 
 export interface NodeStatus {

@@ -15,12 +15,10 @@ interface TimelineEventProps {
  * Extracted from ExecutionPanel for readability and reuse.
  */
 export function TimelineEvent({ ev, idx: _idx, nodeName }: TimelineEventProps) {
-  const isFailed = ev.status === "NodeFailed" || ev.status === "FAILED";
-  const isCompleted =
-    ev.status === "NodeCompleted" || ev.status === "COMPLETED";
-  const isRunningStatus =
-    ev.status === "NodeRunning" || ev.status === "RUNNING";
-  const isApproval = ev.status === "AwaitingApproval";
+  const isFailed = ev.status === "FAILED";
+  const isCompleted = ev.status === "COMPLETED";
+  const isRunningStatus = ev.status === "RUNNING";
+  const isApproval = ev.status === "WAITING";
 
   return (
     <div className="flex gap-6 group animate-in fade-in slide-in-from-left-4 duration-500">

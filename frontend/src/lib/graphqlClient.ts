@@ -8,6 +8,7 @@ import {
 } from "@/lib/session";
 import { subscribeOverSharedSocket } from "@/lib/wsHub";
 import { config } from "@/config";
+import type { ExecutionStatus } from "@/generated/schema";
 /**
  * Minimal GraphQL client used by the Talos frontend — TRANSPORT ONLY.
  *
@@ -205,13 +206,22 @@ export function graphqlFetcher<TData, TVariables>(
  * Subscribe to a GraphQL subscription using a raw WebSocket.
  * The function returns an unsubscribe callback.
  */
+/**
+ * The wire values of the server's `ExecutionStatus` enum, derived from the
+ * generated type so a literal the server never sends (`"AwaitingApproval"`)
+ * is a compile error. Node-level `WAITING` means the node is paused on an
+ * approval gate; execution-level `WAITING` (no `nodeId`) means the run is
+ * suspended.
+ */
+export type ExecutionStatusValue = `${ExecutionStatus}`;
+
 export interface ExecutionUpdate {
   traceId?: string;
   spanId?: string;
 
   executionId: string;
   nodeId?: string;
-  status: string;
+  status: ExecutionStatusValue;
   logMessage?: string;
   // Enhanced tracking fields
   retryAttempt?: number;
