@@ -880,7 +880,7 @@ worker:
   # address `worker.sigstore.*`, and a rename would be a second spelling.
   sigstore:
     required: ""              # "" (→ disabled) | "disabled" | "audit" | "required"
-    identityRegexp: ""        # e.g. "^https://github\\.com/OWNER/talos/\\.github/workflows/template-publish\\.yml@"
+    identityRegexp: ""        # e.g. "^https://github\\.com/OWNER/talos/\\.github/workflows/template-publish\\.yml@refs/heads/main$" — pin the REF: a pattern ending at `@` admits a signature from any branch
     oidcIssuer: "https://token.actions.githubusercontent.com"
 
   # TALOS_WORKER_LIVENESS_INTERVAL_SECS — seconds between this worker's
@@ -1815,8 +1815,6 @@ bootstrapSecret:
     PLAID_CLIENT_ID: ""
     PLAID_SECRET: ""
     PLAID_ENV: ""
-    # Optional — workflow-definition signing. Blank leaves signing off.
-    TALOS_WORKFLOW_SIGNING_KEY: ""
     # Optional — appends to the compile dependency allowlist. Blank = the base
     # allowlist only; this WIDENS a security control, so set it deliberately.
     MCP_ALLOWED_CRATE_DEPENDENCIES_EXTRA: ""

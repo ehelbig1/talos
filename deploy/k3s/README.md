@@ -500,7 +500,10 @@ To enable enforcement, add to `install.env`:
 
 ```bash
 TALOS_SIGSTORE_REQUIRED=true
-TALOS_SIGSTORE_IDENTITY_REGEXP='^https://github\.com/OWNER/talos/\.github/workflows/template-publish\.yml@'
+# Optional — derived from TALOS_GHCR_OWNER / TALOS_GHCR_REPO when unset.
+# YAML-escaped (doubled backslashes): install.sh writes it into a
+# double-quoted Helm values string.
+TALOS_SIGSTORE_IDENTITY_REGEXP='^https://github\\.com/OWNER/talos/\\.github/workflows/template-publish\\.yml@refs/heads/main$'
 ```
 
 Three modes:
@@ -513,9 +516,11 @@ Three modes:
 
 The identity regexp **must** match the SAN URI of the signing
 certificate. For GitHub Actions keyless, the SAN is the fully-qualified
-workflow URL plus `@<git ref>`. The trailing `@` in the pattern is
-critical — it prevents a fork-named workflow (`template-publish.yml-evil.yml`)
-from matching.
+workflow URL plus `@<git ref>`. The `@refs/heads/main$` suffix is
+critical: the `@` stops a fork-named workflow (`template-publish.yml-evil.yml`)
+from matching, and the pinned ref + `$` stop a signature minted by a
+`workflow_dispatch` run pointed at any other branch (the workflow itself also
+refuses to run off `main`).
 
 After enabling, redeploy the worker and watch the first WASM execution:
 

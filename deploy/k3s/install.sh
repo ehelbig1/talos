@@ -65,10 +65,14 @@
 #                                      it demands an explicit choice, and "disabled" is one).
 #                              "audit"    → verify, log on failure, continue (migration).
 #                              "required" → verify, refuse on failure (production).
-#   TALOS_SIGSTORE_IDENTITY_REGEXP  Required when TALOS_SIGSTORE_REQUIRED is set. Regex matched
-#                                   against the SAN URI of the Fulcio cert. For GitHub Actions
-#                                   keyless, pin to the workflow URL pattern. Example:
-#                                   ^https://github\\.com/${TALOS_GHCR_OWNER}/talos/\\.github/workflows/template-publish\\.yml@
+#   TALOS_SIGSTORE_IDENTITY_REGEXP  Regex matched against the SAN URI of the Fulcio cert
+#                                   (`<workflow URL>@<git ref>`). Unset while enforcement
+#                                   is on → derived from TALOS_GHCR_OWNER/TALOS_GHCR_REPO as
+#                                   template-publish.yml@refs/heads/main. Set by hand, write
+#                                   it YAML-escaped (doubled backslashes) and pin the ref:
+#                                   ^https://github\\.com/${TALOS_GHCR_OWNER}/talos/\\.github/workflows/template-publish\\.yml@refs/heads/main$
+#                                   A pattern ending at `@` admits a signature from ANY
+#                                   branch a workflow_dispatch was pointed at.
 #   ANTHROPIC_API_KEY / OPENAI_API_KEY
 #   EMBEDDING_API_URL / EMBEDDING_API_KEY / EMBEDDING_MODEL / EMBEDDING_DIMENSIONS / EMBEDDING_MAX_RPM
 #       Pick a provider (in order of recommendation):
@@ -143,6 +147,20 @@ done
 TALOS_API_HOST="${TALOS_API_HOST:-api.$TALOS_HOST}"
 TALOS_FRONTEND_HOST="${TALOS_FRONTEND_HOST:-$TALOS_HOST}"
 TALOS_GHCR_REPO="${TALOS_GHCR_REPO:-talos}"
+
+# Template-signing identity: pinned to template-publish.yml ON refs/heads/main.
+# YAML-escaped (doubled backslashes) because it lands in a double-quoted
+# values string below.
+case "${TALOS_SIGSTORE_REQUIRED:-disabled}" in
+    ""|disabled|false) ;;
+    *)
+        if [[ -z "${TALOS_SIGSTORE_IDENTITY_REGEXP:-}" ]]; then
+            TALOS_SIGSTORE_IDENTITY_REGEXP="^https://github\\\\.com/${TALOS_GHCR_OWNER:-OWNER}/${TALOS_GHCR_REPO}/\\\\.github/workflows/template-publish\\\\.yml@refs/heads/main\$"
+        elif [[ "$TALOS_SIGSTORE_IDENTITY_REGEXP" != *'@refs/heads/main$' ]]; then
+            warn "TALOS_SIGSTORE_IDENTITY_REGEXP does not end in '@refs/heads/main\$' — a signature minted from any other branch would be admitted."
+        fi
+        ;;
+esac
 
 [[ $EUID -eq 0 ]] || die "run as root (or via sudo)."
 

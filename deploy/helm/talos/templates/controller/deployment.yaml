@@ -258,7 +258,6 @@ spec:
                 "TALOS_AUDIT_SIGNING_KEY"
                 "ANTHROPIC_API_KEY" "OPENAI_API_KEY"
                 "PLAID_CLIENT_ID" "PLAID_SECRET" "PLAID_ENV"
-                "TALOS_WORKFLOW_SIGNING_KEY"
                 "MCP_ALLOWED_CRATE_DEPENDENCIES_EXTRA"
                 "EMBEDDING_API_KEY"
                 "GOOGLE_CLIENT_ID" "GOOGLE_CLIENT_SECRET"

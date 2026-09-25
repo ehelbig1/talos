@@ -23,7 +23,7 @@ on:
   workflow_dispatch:
     inputs:
       controller_image:
-        description: "Controller image to use as the template builder (default: ghcr.io/{owner}/talos-controller:latest). Resolved to a digest and cosign-verified against main-publish.yml's identity before it runs."
+        description: "Controller image to use as the template builder (default: ghcr.io/{owner}/talos-controller:main-latest). Resolved to a digest and cosign-verified against main-publish.yml's identity before it runs."
         required: false
         type: string
       allow_unverified_builder:
@@ -35,7 +35,7 @@ on:
 permissions:
   contents: read
   packages: write   # ghcr.io push
-  id-token: write   # reserved for future Sigstore keyless signing
+  id-token: write   # Sigstore keyless signing (identity = this workflow @ refs/heads/main)
 
 env:
   REGISTRY: ghcr.io
@@ -56,6 +56,18 @@ jobs:
     timeout-minutes: 30
 
     steps:
+      # The OIDC identity clusters pin is `template-publish.yml@refs/heads/main`
+      # (TALOS_SIGSTORE_IDENTITY_REGEXP). A dispatch can target ANY branch and
+      # would otherwise sign that branch's templates with this same workflow
+      # identity — so refuse every other ref before anything is pushed or signed.
+      - name: Require refs/heads/main
+        run: |
+          if [[ "${{ github.ref }}" != "refs/heads/main" ]]; then
+            echo "::error::template-publish.yml may only run on refs/heads/main (got ${{ github.ref }})."
+            echo "Re-dispatch with:  gh workflow run template-publish.yml --ref main"
+            exit 1
+          fi
+
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
@@ -107,7 +119,7 @@ jobs:
           set -euxo pipefail
           IMAGE="${{ inputs.controller_image }}"
           if [ -z "$IMAGE" ]; then
-            IMAGE="${REGISTRY}/${{ github.repository_owner }}/talos-controller:latest"
+            IMAGE="${REGISTRY}/${{ github.repository_owner }}/talos-controller:main-latest"
           fi
           docker pull "$IMAGE"
           DIGEST_REF="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE")"

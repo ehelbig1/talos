@@ -42,14 +42,16 @@ script's terminal output).
 
 ```bash
 cosign verify \
-  --certificate-identity-regexp '^https://github\.com/<owner>/talos/\.github/workflows/main-publish\.yml@' \
+  --certificate-identity-regexp '^https://github\.com/<owner>/talos/\.github/workflows/main-publish\.yml@refs/heads/main$' \
   --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
   ghcr.io/<owner>/talos-controller@<digest>
 ```
 
-The trailing `@` after the workflow filename is **load-bearing** — without it
-a fork workflow named `main-publish.yml-evil.yml` would also match. Append
-`refs/heads/main$` to additionally pin the ref. This same workflow-URI form is
+The `@refs/heads/main$` suffix is **load-bearing**. The `@` stops a fork
+workflow named `main-publish.yml-evil.yml` from matching; the ref stops a
+signature minted by a `workflow_dispatch` run pointed at any other branch
+(the workflow's `publish-ref-gate` job also refuses every ref but `main`),
+and the `$` stops `refs/heads/main-evil`. This same workflow-URI form is
 what the cluster's Sigstore admission policy should pin
 (`security.sigstore.certIdentityRegex` in the chart / the regexp `install.sh`
 generates) — it never changes when the humans do.
