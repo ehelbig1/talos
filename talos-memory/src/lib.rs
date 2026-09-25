@@ -867,6 +867,13 @@ pub async fn persist_memory_with_metadata_typed(
     // updates (the recall-path bump owns those columns).
     let importance_score = actor_context::write_time_importance(canonical_type, metadata) as f32;
 
+    // Overwrite semantics (2026-09-26): the row describes THIS write.
+    // * embedding — a failed regeneration stores NULL, never the previous
+    //   content's vector (the backfill repairs NULL; nothing repairs a stale
+    //   vector, and the ciphertext's random nonce means "unchanged" cannot be
+    //   proven here without a decrypt).
+    // * metadata — omitted means NULL, not "inherit the old `kind`" (an
+    //   inherited kind silently kept a rewritten key excluded from recall).
     sqlx::query(
         "INSERT INTO actor_memory \
          (actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, embedding, embedding_model, metadata, org_id, importance) \
@@ -877,9 +884,9 @@ pub async fn persist_memory_with_metadata_typed(
              value_format  = EXCLUDED.value_format, \
              memory_type   = EXCLUDED.memory_type, \
              expires_at    = EXCLUDED.expires_at, \
-             embedding     = COALESCE(EXCLUDED.embedding, actor_memory.embedding), \
-             embedding_model = COALESCE(EXCLUDED.embedding_model, actor_memory.embedding_model), \
-             metadata      = COALESCE(EXCLUDED.metadata, actor_memory.metadata), \
+             embedding     = EXCLUDED.embedding, \
+             embedding_model = EXCLUDED.embedding_model, \
+             metadata      = EXCLUDED.metadata, \
              org_id        = EXCLUDED.org_id, \
              importance    = EXCLUDED.importance, \
              updated_at    = now()",
@@ -1039,6 +1046,13 @@ pub async fn persist_memory_in_tx_with_metadata<'c>(
     // single-source scorer (memory-type base ⊕ numeric `metadata.importance`).
     let importance_score = actor_context::write_time_importance(canonical_type, metadata) as f32;
 
+    // Overwrite semantics (2026-09-26): the row describes THIS write.
+    // * embedding — a failed regeneration stores NULL, never the previous
+    //   content's vector (the backfill repairs NULL; nothing repairs a stale
+    //   vector, and the ciphertext's random nonce means "unchanged" cannot be
+    //   proven here without a decrypt).
+    // * metadata — omitted means NULL, not "inherit the old `kind`" (an
+    //   inherited kind silently kept a rewritten key excluded from recall).
     sqlx::query(
         "INSERT INTO actor_memory \
          (actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, embedding, embedding_model, metadata, org_id, importance) \
@@ -1049,9 +1063,9 @@ pub async fn persist_memory_in_tx_with_metadata<'c>(
              value_format  = EXCLUDED.value_format, \
              memory_type   = EXCLUDED.memory_type, \
              expires_at    = EXCLUDED.expires_at, \
-             embedding     = COALESCE(EXCLUDED.embedding, actor_memory.embedding), \
-             embedding_model = COALESCE(EXCLUDED.embedding_model, actor_memory.embedding_model), \
-             metadata      = COALESCE(EXCLUDED.metadata, actor_memory.metadata), \
+             embedding     = EXCLUDED.embedding, \
+             embedding_model = EXCLUDED.embedding_model, \
+             metadata      = EXCLUDED.metadata, \
              org_id        = EXCLUDED.org_id, \
              importance    = EXCLUDED.importance, \
              updated_at    = now()",
@@ -3332,6 +3346,9 @@ pub async fn measure_value_bytes_in_tx<'c>(
     Ok(size.unwrap_or(0))
 }
 
+/// Rows per `clone_memories` UNNEST insert.
+const CLONE_INSERT_CHUNK: usize = 500;
+
 /// Bulk-copy the live `semantic` and `episodic` memories of one actor to
 /// another, in a single SQL round-trip. Returns the number of rows
 /// written.
@@ -3369,9 +3386,9 @@ pub async fn measure_value_bytes_in_tx<'c>(
 ///
 /// On `ON CONFLICT (actor_id, key)` (i.e. the destination already has a
 /// memory at the same key), the destination row is overwritten with the
-/// source ciphertext + key_id + memory_type + expires_at + metadata, and
-/// `updated_at` is bumped to NOW(). This matches the prior inline-SQL
-/// behaviour at the two extracted call sites.
+/// source ciphertext + key_id + memory_type + expires_at + metadata, its
+/// embedding is cleared (it described the OLD content; the backfill
+/// regenerates it), and `updated_at` is bumped to NOW().
 pub async fn clone_memories(
     pool: &Pool<Postgres>,
     source_actor_id: Uuid,
@@ -3515,6 +3532,8 @@ pub async fn clone_memories(
                    memory_type = EXCLUDED.memory_type, \
                    expires_at = EXCLUDED.expires_at, \
                    metadata = EXCLUDED.metadata, \
+                   embedding = NULL, \
+                   embedding_model = NULL, \
                    updated_at = NOW() \
              RETURNING 1 \
          ) SELECT COUNT(*) FROM inserted",
@@ -3525,11 +3544,23 @@ pub async fn clone_memories(
     .await
     .context("clone_memories: bulk copy v0 (legacy no-AAD) rows")?;
 
+    // One UNNEST statement per chunk rather than one INSERT per row.
     let mut v1_count: i64 = 0;
-    for row in v1_buffered {
-        sqlx::query(
+    for chunk in v1_buffered.chunks(CLONE_INSERT_CHUNK) {
+        let keys: Vec<&str> = chunk.iter().map(|r| r.key.as_str()).collect();
+        let ciphertexts: Vec<&[u8]> = chunk.iter().map(|r| r.new_ciphertext.as_slice()).collect();
+        let key_ids: Vec<Uuid> = chunk.iter().map(|r| r.new_key_id).collect();
+        let formats: Vec<i16> = chunk.iter().map(|r| r.new_format).collect();
+        let types: Vec<&str> = chunk.iter().map(|r| r.memory_type.as_str()).collect();
+        let expires: Vec<Option<chrono::DateTime<chrono::Utc>>> =
+            chunk.iter().map(|r| r.new_expires_at).collect();
+        let metadata: Vec<Option<serde_json::Value>> =
+            chunk.iter().map(|r| r.metadata.clone()).collect();
+        let inserted = sqlx::query(
             "INSERT INTO actor_memory (actor_id, key, value_enc, value_key_id, value_format, memory_type, expires_at, metadata, org_id, updated_at) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW()) \
+             SELECT $1, u.key, u.value_enc, u.value_key_id, u.value_format, u.memory_type, u.expires_at, u.metadata, $9, NOW() \
+             FROM UNNEST($2::text[], $3::bytea[], $4::uuid[], $5::int2[], $6::text[], $7::timestamptz[], $8::jsonb[]) \
+                  AS u(key, value_enc, value_key_id, value_format, memory_type, expires_at, metadata) \
              ON CONFLICT (actor_id, key) DO UPDATE \
                SET value_enc = EXCLUDED.value_enc, \
                    value_key_id = EXCLUDED.value_key_id, \
@@ -3538,21 +3569,23 @@ pub async fn clone_memories(
                    expires_at = EXCLUDED.expires_at, \
                    metadata = EXCLUDED.metadata, \
                    org_id = EXCLUDED.org_id, \
+                   embedding = NULL, \
+                   embedding_model = NULL, \
                    updated_at = NOW()",
         )
         .bind(target_actor_id)
-        .bind(&row.key)
-        .bind(row.new_ciphertext.as_slice())
-        .bind(row.new_key_id)
-        .bind(row.new_format)
-        .bind(&row.memory_type)
-        .bind(row.new_expires_at)
-        .bind(row.metadata)
+        .bind(&keys)
+        .bind(&ciphertexts)
+        .bind(&key_ids)
+        .bind(&formats)
+        .bind(&types)
+        .bind(&expires)
+        .bind(&metadata)
         .bind(target_org)
         .execute(&mut *tx)
         .await
-        .with_context(|| format!("clone_memories: insert v1 target row key={}", row.key))?;
-        v1_count += 1;
+        .context("clone_memories: insert re-encrypted target rows")?;
+        v1_count += inserted.rows_affected() as i64;
     }
 
     tx.commit()

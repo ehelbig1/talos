@@ -1310,3 +1310,62 @@ async fn consolidation_writes_nothing_when_every_source_changed() {
 
     cleanup_prefix(&pool, actor_id, &prefix).await;
 }
+
+/// An overwrite describes THIS write: omitted metadata is NULL (not the old
+/// `kind`), and the previous content's embedding never survives a content
+/// update (NULL when regeneration is unavailable, otherwise a fresh vector).
+#[tokio::test]
+async fn overwrite_replaces_metadata_and_never_keeps_a_stale_embedding() {
+    let Some((pool, actor_id)) = test_pool_or_skip().await else {
+        return;
+    };
+    let prefix = format!("talos-memory-test/{}/", Uuid::new_v4());
+    let key = format!("{prefix}overwrite");
+    mem::persist_memory_with_metadata(
+        &pool,
+        actor_id,
+        &key,
+        &serde_json::json!({ "text": "first" }),
+        Some(&serde_json::json!({ "kind": "daily_brief" })),
+        "semantic",
+        None,
+    )
+    .await
+    .expect("persist first");
+    // Plant a sentinel vector standing in for the OLD content's embedding.
+    sqlx::query(
+        "UPDATE actor_memory SET embedding = array_fill(0.125::real, ARRAY[1024])::vector, \
+         embedding_model = 'stale-sentinel' WHERE actor_id = $1 AND key = $2",
+    )
+    .bind(actor_id)
+    .bind(&key)
+    .execute(&pool)
+    .await
+    .expect("plant sentinel");
+
+    mem::persist_memory(
+        &pool,
+        actor_id,
+        &key,
+        &serde_json::json!({ "text": "second, different content" }),
+        "semantic",
+        None,
+    )
+    .await
+    .expect("overwrite");
+    let (metadata, model): (Option<serde_json::Value>, Option<String>) = sqlx::query_as(
+        "SELECT metadata, embedding_model FROM actor_memory WHERE actor_id = $1 AND key = $2",
+    )
+    .bind(actor_id)
+    .bind(&key)
+    .fetch_one(&pool)
+    .await
+    .expect("read back");
+    assert_eq!(metadata, None, "omitted metadata must not inherit the old kind");
+    assert_ne!(
+        model.as_deref(),
+        Some("stale-sentinel"),
+        "the old content's embedding must not survive the overwrite"
+    );
+    cleanup_prefix(&pool, actor_id, &prefix).await;
+}
