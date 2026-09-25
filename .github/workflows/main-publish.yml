@@ -154,9 +154,11 @@ jobs:
     # Defence in depth behind publish-ref-gate.
     if: ${{ github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
-    # 60 minutes — the cold cargo workspace build takes ~45 min on a
-    # 16-CPU runner; warm builds with BuildKit cache hit ~15 min.
-    timeout-minutes: 60
+    # The cold `docker`-profile workspace build took ~45 min on a 16-CPU
+    # runner; the `dist` profile (opt-level=3 + thin LTO) is slower and its
+    # CI time is not yet measured, so the ceiling is doubled rather than
+    # guessed tight. Revisit after the first dist publish.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
@@ -267,9 +269,13 @@ jobs:
           # Build args expose the git SHA to the controller binary's
           # build.rs so session_start.server_version reflects this commit.
           # Mirrors release.yml's GIT_SHA_OVERRIDE pattern.
+          # CARGO_PROFILE=dist: the optimised shipping profile (Cargo.toml);
+          # the Dockerfiles default to the fast dev `docker` profile. The
+          # frontend Dockerfile declares no such ARG and ignores it.
           build-args: |
             GIT_SHA_OVERRIDE=${{ github.sha }}
             GIT_DIRTY_OVERRIDE=false
+            CARGO_PROFILE=dist
 
       # Persist the digest as a tiny artifact so the sign + summarise
       # jobs can read it back. One artifact per service; downstream jobs

@@ -4,7 +4,7 @@
 # ══════════════════════════════════════════════════════════════════════════════
 # Base image digest matches controller/Dockerfile so both binaries link
 # against the same glibc/OpenSSL versions. Bump together when rotating.
-FROM rust:1.91@sha256:867f1d1162913c401378a8504fb17fe2032c760dc316448766f150a130204aad AS builder
+FROM rust:1.95@sha256:f49565f188ee00bc2a18dd418183f2c5f23ef7d6e691890517ed341a598f67c3 AS builder
 
 # All Talos crates — including the engine + protocol crates folded
 # back from the sibling repo in May-2026 — live in this single
@@ -15,7 +15,9 @@ WORKDIR /app/talos
 # Install mold — a modern linker that is 5-10x faster than GNU ld for the final link step.
 RUN apt-get update && apt-get install -y mold && rm -rf /var/lib/apt/lists/*
 
-# opt-level=1 uses ~4x less LLVM memory than release; 8 jobs is safe on a 16-CPU host.
+# Cargo profile — see controller/Dockerfile. `docker` for dev compose,
+# `dist` for published images.
+ARG CARGO_PROFILE=docker
 ENV CARGO_BUILD_JOBS=8
 ENV RUSTFLAGS="-C link-arg=-fuse-ld=mold --cfg rustix_use_libc"
 
@@ -58,14 +60,14 @@ COPY . .
 # actual compilation anyway.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/app/talos/target,sharing=locked \
-    cargo build --profile docker --bin worker 2>&1 && \
-    cp target/docker/worker /app/worker-bin
+    cargo build --profile "${CARGO_PROFILE}" --bin worker 2>&1 && \
+    cp "target/${CARGO_PROFILE}/worker" /app/worker-bin
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Stage 2: Minimal runtime image
 # ══════════════════════════════════════════════════════════════════════════════
 # IMPORTANT: The runtime base MUST match the builder's Debian version.
-# rust:1.91 is based on Debian trixie (glibc 2.39, OpenSSL 3.3).
+# rust:1.95 is based on Debian trixie (glibc 2.41, OpenSSL 3.5).
 # Using bookworm-slim (glibc 2.36, OpenSSL 3.0) causes "GLIBC_2.38 not found"
 # and "OPENSSL_3.3.0 not found" crashes at startup.
 FROM debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc4017c709b6259bc132
@@ -79,15 +81,23 @@ FROM debian:trixie-slim@sha256:d7e12182ce18b85b93007c1dedf31f2d29e01ccf3182cc401
 # The downloaded binary is the runtime trust root for every WASM module —
 # a poisoned cosign would silently validate attacker-signed artifacts.
 # We verify against the upstream-published SHA256 from cosign_checksums.txt
-# at the same release tag; bump COSIGN_SHA256 in lockstep with COSIGN_VERSION.
+# at the same release tag; bump both COSIGN_SHA256_* in lockstep with
+# COSIGN_VERSION (and controller/Dockerfile's copy).
+ARG TARGETARCH
 ARG COSIGN_VERSION=v2.4.1
-ARG COSIGN_SHA256=8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b
-RUN apt-get update \
+ARG COSIGN_SHA256_AMD64=8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b
+ARG COSIGN_SHA256_ARM64=3b2e2e3854d0356c45fe6607047526ccd04742d20bd44afb5be91fa2a6e7cb4a
+RUN case "${TARGETARCH}" in \
+      amd64) COSIGN_SHA256="${COSIGN_SHA256_AMD64}" ;; \
+      arm64) COSIGN_SHA256="${COSIGN_SHA256_ARM64}" ;; \
+      *) echo "unsupported TARGETARCH ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+ && apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl libssl3t64 \
  && curl -fsSL \
       --retry 5 --retry-delay 5 --retry-connrefused \
       --connect-timeout 30 --max-time 180 \
-      "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64" \
+      "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-${TARGETARCH}" \
       -o /usr/local/bin/cosign \
  && echo "${COSIGN_SHA256}  /usr/local/bin/cosign" | sha256sum -c - \
  && chmod +x /usr/local/bin/cosign \

@@ -1896,7 +1896,6 @@ dependencies = [
  "talos-workflow-liveness",
  "talos-workflow-manifest",
  "talos-workflow-repository",
- "talos-workflow-signing",
  "talos-workflow-types",
  "talos-workflow-validation",
  "talos-workflow-versions",
@@ -7966,6 +7965,7 @@ dependencies = [
  "talos-registry",
  "talos-secrets-manager",
  "talos-workflow-authorization",
+ "talos-workflow-engine-core",
  "talos-workflow-job-protocol",
  "talos-workflow-liveness",
  "talos-workflow-repository",
@@ -8577,6 +8577,7 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
 ]
 
@@ -10176,18 +10177,6 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
-]
-
-[[package]]
-name = "talos-workflow-signing"
-version = "0.1.0"
-dependencies = [
- "hex",
- "hmac 0.12.1",
- "sha2 0.10.9",
- "talos-config",
- "tracing",
- "zeroize",
 ]
 
 [[package]]

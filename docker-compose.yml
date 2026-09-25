@@ -461,6 +461,9 @@ services:
         # variable is unset (e.g. building from a tarball).
         GIT_SHA_OVERRIDE: ${GIT_SHA_OVERRIDE:-unknown}
         GIT_DIRTY_OVERRIDE: ${GIT_DIRTY_OVERRIDE:-false}
+        # Cargo profile: `docker` (fast, opt-level=1) for dev; publish-images.sh
+        # sets TALOS_CARGO_PROFILE=dist for shipped images.
+        CARGO_PROFILE: ${TALOS_CARGO_PROFILE:-docker}
     container_name: talos-controller
     environment:
       DATABASE_URL: postgres://talos:${POSTGRES_PASSWORD}@postgres:5432/talos
@@ -933,6 +936,7 @@ services:
         # controller's build-skew WARN fires on a healthy same-tree fleet.
         GIT_SHA_OVERRIDE: ${GIT_SHA_OVERRIDE:-unknown}
         GIT_DIRTY_OVERRIDE: ${GIT_DIRTY_OVERRIDE:-false}
+        CARGO_PROFILE: ${TALOS_CARGO_PROFILE:-docker}
     environment:
       # Injection audit 2026-07-20: the per-actor write-ceiling gate
       # (readonly vs write) was inert without this — ceilings in the DB

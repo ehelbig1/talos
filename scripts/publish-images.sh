@@ -237,6 +237,9 @@ export DOCKER_DEFAULT_PLATFORM="$PLATFORM"
 
 export GIT_SHA_OVERRIDE="$GIT_SHA"
 export GIT_DIRTY_OVERRIDE="$GIT_DIRTY"
+# Shipped images build the optimised `dist` cargo profile (Cargo.toml); dev
+# compose keeps the fast `docker` profile. Mirrors main-publish.yml.
+export TALOS_CARGO_PROFILE="${TALOS_CARGO_PROFILE:-dist}"
 
 # Build each service. Most use `docker compose build` (picks up build
 # args from docker-compose.yml), but the frontend gets a separate

@@ -82,7 +82,6 @@ members = [
     "talos-unusable-password",
     "talos-measurement",
     "talos-trace-nats",
-    "talos-workflow-signing",
     "talos-capability-downgrade",
     "talos-workflow-creation",
     "talos-workflow-creation-helpers",
@@ -274,3 +273,23 @@ incremental = false
 # parallel cores producing object files for mold to link.
 codegen-units = 256
 debug = false
+
+# Published images (main-publish.yml / release.yml / publish-images.sh pass
+# `CARGO_PROFILE=dist` to the controller + worker Dockerfiles). `docker` above
+# stays the fast dev-compose build; shipping opt-level=1 made every production
+# node pay for build speed nobody there benefits from.
+#   * lto = "thin" + 16 CGUs: most of fat-LTO's cross-crate inlining at a
+#     fraction of its link time and memory on a 100-crate workspace.
+#   * panic stays `unwind` (inherited): the worker's `guard_codegen_panic`
+#     (lint check 53) is a catch_unwind; `abort` would turn one bad guest
+#     into a dead worker.
+#   * strip = "debuginfo", not "symbols": the symbol table stays, so a panic
+#     backtrace still names functions.
+[profile.dist]
+inherits = "release"
+opt-level = 3
+codegen-units = 16
+lto = "thin"
+incremental = false
+debug = false
+strip = "debuginfo"

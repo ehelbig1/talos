@@ -3,14 +3,20 @@
 # ════════════════════════════════════════════════════════════════════════════
 # Stage 1: Runtime tools (cached — only rebuilds when this block changes)
 # ════════════════════════════════════════════════════════════════════════════
-FROM rust:1.91@sha256:867f1d1162913c401378a8504fb17fe2032c760dc316448766f150a130204aad AS runtime-base
+FROM rust:1.95@sha256:f49565f188ee00bc2a18dd418183f2c5f23ef7d6e691890517ed341a598f67c3 AS runtime-base
 
 RUN apt-get update && apt-get install -y ca-certificates git && rm -rf /var/lib/apt/lists/*
-RUN rustup default stable && rustup component add rustfmt && \
+# The base image's toolchain IS the pin (rust-toolchain.toml's channel) — no
+# `rustup default stable`, which floated to whatever stable was current at
+# build time for every host-fallback compile.
+RUN rustup component add rustfmt && \
     rustup target add wasm32-wasip1 wasm32-wasip2
 
-# Install tools one at a time (each cached independently)
-RUN cargo install sqlx-cli --locked --features postgres
+# Install tools one at a time (each cached independently). Every install is
+# version-pinned: an unpinned `cargo install` resolves to the newest release
+# at build time (sqlx-cli would silently jump to 0.9 while the workspace
+# links sqlx 0.8.6).
+RUN cargo install sqlx-cli --version 0.8.6 --locked --features postgres
 RUN cargo install wizer --version 9.0.0 --features="env_logger structopt"
 RUN cargo install cargo-component --version 0.21.1 --locked
 # cargo-audit gates every WASM compile in production. The compilation
@@ -20,7 +26,29 @@ RUN cargo install cargo-component --version 0.21.1 --locked
 # setup. Without cargo-audit on the runtime image, that fallback fails
 # with "no such subcommand: audit" and every install_module_from_catalog
 # / compile_custom_sandbox / inline rust_code request blocks.
-RUN cargo install cargo-audit --locked
+RUN cargo install cargo-audit --version 0.22.2 --locked
+
+# `cosign` verifies the Sigstore signature of the OCI template index and every
+# template before the controller's catalog sync (talos-registry::sync) trusts
+# them. Without it that sync answers `cosign_unavailable` for every artifact.
+# Same pinned release + upstream sha256 as worker/Dockerfile — bump together.
+ARG TARGETARCH
+ARG COSIGN_VERSION=v2.4.1
+ARG COSIGN_SHA256_AMD64=8b24b946dd5809c6bd93de08033bcf6bc0ed7d336b7785787c080f574b89249b
+ARG COSIGN_SHA256_ARM64=3b2e2e3854d0356c45fe6607047526ccd04742d20bd44afb5be91fa2a6e7cb4a
+RUN case "${TARGETARCH}" in \
+      amd64) COSIGN_SHA256="${COSIGN_SHA256_AMD64}" ;; \
+      arm64) COSIGN_SHA256="${COSIGN_SHA256_ARM64}" ;; \
+      *) echo "unsupported TARGETARCH ${TARGETARCH}" >&2; exit 1 ;; \
+    esac \
+ && curl -fsSL \
+      --retry 5 --retry-delay 5 --retry-connrefused \
+      --connect-timeout 30 --max-time 180 \
+      "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-${TARGETARCH}" \
+      -o /usr/local/bin/cosign \
+ && echo "${COSIGN_SHA256}  /usr/local/bin/cosign" | sha256sum -c - \
+ && chmod +x /usr/local/bin/cosign \
+ && /usr/local/bin/cosign version
 
 RUN groupadd -r talos && useradd -r -g talos -u 1001 talos
 
@@ -63,20 +91,22 @@ RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
 # ════════════════════════════════════════════════════════════════════════════
 # Stage 2: Build the controller binary
 # ════════════════════════════════════════════════════════════════════════════
-FROM rust:1.91@sha256:867f1d1162913c401378a8504fb17fe2032c760dc316448766f150a130204aad AS builder
+FROM rust:1.95@sha256:f49565f188ee00bc2a18dd418183f2c5f23ef7d6e691890517ed341a598f67c3 AS builder
 
 # All Talos crates — including the engine + protocol crates folded
 # back from the sibling repo in May-2026 — live in this single
 # workspace. The Dockerfile no longer needs `additional_contexts` to
 # pull the engine from an external path.
 WORKDIR /app/talos
-RUN rustup default stable
 
 # Install mold — a modern linker that is 5-10x faster than GNU ld for the final link step.
 RUN apt-get update && apt-get install -y mold && rm -rf /var/lib/apt/lists/*
 
-# opt-level=1 uses ~4x less LLVM memory than release (opt-level=3), so we can safely
-# use 8 parallel jobs on a 16-CPU / 23 GB Docker Desktop host.
+# Cargo profile. `docker` (opt-level=1, 256 CGUs) is the fast dev-compose build
+# and uses ~4x less LLVM memory than release, so 8 parallel jobs are safe on a
+# 16-CPU / 23 GB Docker Desktop host. Published images pass
+# CARGO_PROFILE=dist (main-publish.yml, release.yml, publish-images.sh).
+ARG CARGO_PROFILE=docker
 ENV CARGO_BUILD_JOBS=8
 ENV RUSTFLAGS="-C link-arg=-fuse-ld=mold --cfg rustix_use_libc"
 
@@ -112,8 +142,8 @@ ENV SQLX_OFFLINE=1
 # the shared registry cache mount without it (cargo unpack "File exists").
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/app/talos/target,sharing=locked \
-    cargo build --profile docker --bin controller && \
-    cp /app/talos/target/docker/controller /app/controller-bin
+    cargo build --profile "${CARGO_PROFILE}" --bin controller && \
+    cp "/app/talos/target/${CARGO_PROFILE}/controller" /app/controller-bin
 
 # ════════════════════════════════════════════════════════════════════════════
 # Stage 3: Final runtime image
