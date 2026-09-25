@@ -410,11 +410,46 @@ pub async fn run_with_nats(
         "run_with_nats",
         Some(execution_id),
     )?;
-    // Tracked for the shutdown drain (`talos_shutdown::inflight`): this
-    // process is driving the run until this future ends.
-    let _in_flight = talos_shutdown::inflight::global().track(execution_id);
-    talos_workflow_engine_nats::run_with_nats(engine, dispatcher, worker_shared_key, execution_id)
-        .await
+    run_tracked(
+        execution_id,
+        talos_workflow_engine_nats::run_with_nats(
+            engine,
+            dispatcher,
+            worker_shared_key,
+            execution_id,
+        ),
+    )
+    .await
+}
+
+/// Drive `run` as one of THIS process's in-flight runs: tracked for the
+/// shutdown drain, and stopped when an operator cancels the execution
+/// (`talos_shutdown::inflight::InFlightRuns::cancel`, called by
+/// `cancel_execution` after the row is marked).
+///
+/// The stop is a drop of the run future — exactly what the engine's own
+/// cancellation token does — so no further node is dispatched by this
+/// controller, and the run answers `Cancelled`, which every caller already
+/// treats as "do not mark the row failed". Every production engine run
+/// enters through one of the three functions below, all of which call this.
+async fn run_tracked<F>(execution_id: Uuid, run: F) -> Result<WorkflowContext, WorkflowEngineError>
+where
+    F: Future<Output = Result<WorkflowContext, WorkflowEngineError>>,
+{
+    let guard = talos_shutdown::inflight::global().track(execution_id);
+    let stop = guard.stop_signal();
+    tokio::select! {
+        biased;
+        () = stop.cancelled() => {
+            tracing::info!(
+                %execution_id,
+                "execution cancelled: this controller stopped the engine driving it — \
+                 no further nodes will be dispatched"
+            );
+            Err(WorkflowEngineError::Cancelled)
+        }
+        result = run => result,
+    }
 }
 
 /// Controller-convenience: seed + dispatch via a raw
@@ -466,11 +501,9 @@ pub fn run_with_seed_via_nats(
         initial_results,
         execution_id,
     );
-    // Tracked for the shutdown drain, for as long as the returned future runs.
-    Box::pin(async move {
-        let _in_flight = talos_shutdown::inflight::global().track(execution_id);
-        run.await
-    })
+    // Tracked (shutdown drain + operator cancel) for as long as the returned
+    // future runs.
+    Box::pin(run_tracked(execution_id, run))
 }
 
 /// Controller-convenience: dispatch a graph feeding `trigger_input` to
@@ -500,16 +533,16 @@ pub async fn run_with_trigger_input_via_nats(
         "run_with_trigger_input_via_nats",
         Some(execution_id),
     )?;
-    // Tracked for the shutdown drain (`talos_shutdown::inflight`).
-    let _in_flight = talos_shutdown::inflight::global().track(execution_id);
-    engine
-        .run_with_trigger_input_transport(
+    run_tracked(
+        execution_id,
+        engine.run_with_trigger_input_transport(
             dispatcher,
             worker_shared_key,
             trigger_input,
             execution_id,
-        )
-        .await
+        ),
+    )
+    .await
 }
 
 /// Production fail-closed posture for the dispatch-signing SCHEME (2026-09-12,
@@ -688,6 +721,98 @@ mod dispatch_scheme_posture_tests {
         );
         assert!(
             bootstrap.contains("enforce_production_db_sandbox_posture(config::is_production())")
+        );
+    }
+}
+
+/// An operator cancel reaches the engine driving the run.
+///
+/// `cancel_execution` fires `talos_shutdown::inflight::global().cancel(id)`
+/// after the row is marked; `run_tracked` is what that signal stops.
+#[cfg(test)]
+mod operator_cancel_tests {
+    use super::run_tracked;
+    use std::time::Duration;
+    use talos_workflow_engine::WorkflowEngineError;
+    use talos_workflow_engine_core::WorkflowContext;
+    use uuid::Uuid;
+
+    async fn until_tracked(id: Uuid) {
+        for _ in 0..200 {
+            if talos_shutdown::inflight::global().snapshot().contains(&id) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the run was never tracked");
+    }
+
+    #[tokio::test]
+    async fn an_operator_cancel_stops_the_run_this_process_is_driving() {
+        let id = Uuid::new_v4();
+        let run = tokio::spawn(run_tracked(id, async {
+            // Stands in for a reactor with nodes still to dispatch.
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(WorkflowContext::default())
+        }));
+        until_tracked(id).await;
+
+        assert!(
+            talos_shutdown::inflight::global().cancel(id),
+            "the registry must report that this process was driving the run"
+        );
+        let result = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("the cancel must stop the run promptly, not at its end")
+            .expect("run task");
+        assert!(
+            matches!(result, Err(WorkflowEngineError::Cancelled)),
+            "{result:?}"
+        );
+        assert!(
+            !talos_shutdown::inflight::global().snapshot().contains(&id),
+            "a stopped run is no longer tracked"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_uncancelled_run_returns_its_own_result() {
+        let id = Uuid::new_v4();
+        let result = run_tracked(id, async { Ok(WorkflowContext::default()) }).await;
+        assert!(result.is_ok());
+        // A cancel for a DIFFERENT execution never reaches this one.
+        let other = Uuid::new_v4();
+        let run = tokio::spawn(run_tracked(id, async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok(WorkflowContext::default())
+        }));
+        until_tracked(id).await;
+        assert!(!talos_shutdown::inflight::global().cancel(other));
+        assert!(run.await.expect("run task").is_ok());
+    }
+
+    /// Source pin (stated as textual): every public engine-run entry point in
+    /// this file goes through `run_tracked`. A behavioural test cannot see an
+    /// entry point that tracks the run for the shutdown drain but skips the
+    /// stop signal — the drain would still work and the cancel would silently
+    /// stop nothing on that path.
+    #[test]
+    fn every_engine_run_entry_point_is_tracked_with_the_stop_signal() {
+        let src = include_str!("nats_run.rs");
+        let production = &src[..src.find("#[cfg(test)]").expect("test module")];
+        let call = ["run_tracked", "(\n"].concat();
+        let calls =
+            production.matches(&call).count() + production.matches("Box::pin(run_tracked(").count();
+        assert_eq!(
+            calls, 3,
+            "run_with_nats, run_with_seed_via_nats and run_with_trigger_input_via_nats \
+             must each drive their run through run_tracked"
+        );
+        let bare_track = ["inflight::global()", ".track("].concat();
+        assert_eq!(
+            production.matches(&bare_track).count(),
+            1,
+            "only run_tracked may track a run — a bare track() skips the stop signal"
         );
     }
 }

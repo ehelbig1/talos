@@ -32,7 +32,7 @@
 //!   something outside the engine, which is what a wall-clock timeout
 //!   is actually about.
 //! * **Completed count** — *every* node kind, counted at the two commit
-//!   chokepoints (`commit_result!` and `route_system_node_output`) plus
+//!   chokepoints (`commit_and_release!` and `route_system_node_output`) plus
 //!   the dispatch-pool completion branch. One caveat worth knowing when
 //!   reading the number: a pipeline CHAIN completes as a single unit
 //!   (one future, one commit), so an `a→b→c` chain contributes 1, not 3.
@@ -149,6 +149,19 @@ struct ProgressInner {
     /// is a graph problem, and one caused by a spent budget is a run
     /// problem, and the deadline alone cannot tell them apart.
     deadline: std::sync::Mutex<Option<(Instant, u64)>>,
+    /// This run's abort token, stamped by
+    /// [`crate::engine::run_with_workflow_timeout`] next to the deadline and
+    /// raced against the reactor there. A dispatch site that learns the run
+    /// is over — a start row born `cancelled` because the parent execution
+    /// was cancelled or failed — fires it through [`ExecutionProgress::abort_run`],
+    /// and the run returns [`crate::WorkflowEngineError::Cancelled`] instead
+    /// of dispatching its remaining nodes.
+    ///
+    /// Same lifetime rules as `deadline`: written once per run at the
+    /// wrapper, not cleared by `reset()`, and a sub-workflow engine has its
+    /// own handle. `None` only on a handle no run has started through the
+    /// wrapper, where `abort_run` is a no-op and `run_aborted` is `false`.
+    run_abort: std::sync::Mutex<Option<tokio_util::sync::CancellationToken>>,
 }
 
 impl ExecutionProgress {
@@ -173,6 +186,42 @@ impl ExecutionProgress {
         if let Ok(mut slot) = self.inner.deadline.lock() {
             *slot = deadline;
         }
+    }
+
+    /// Stamp this run's abort token. Called only from
+    /// [`crate::engine::run_with_workflow_timeout`].
+    pub(crate) fn set_run_abort(&self, token: tokio_util::sync::CancellationToken) {
+        if let Ok(mut slot) = self.inner.run_abort.lock() {
+            *slot = Some(token);
+        }
+    }
+
+    /// Stop this run: no further node is dispatched and the run returns
+    /// `Cancelled`. Idempotent; a no-op before the wrapper stamped a token.
+    pub(crate) fn abort_run(&self) {
+        if let Some(token) = self
+            .inner
+            .run_abort
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone())
+        {
+            token.cancel();
+        }
+    }
+
+    /// Whether this run has been stopped — by [`Self::abort_run`] or by the
+    /// caller's cancellation token, which the stamped token is a child of.
+    pub(crate) fn run_aborted(&self) -> bool {
+        self.inner
+            .run_abort
+            .lock()
+            .ok()
+            .and_then(|slot| {
+                slot.as_ref()
+                    .map(tokio_util::sync::CancellationToken::is_cancelled)
+            })
+            .unwrap_or(false)
     }
 
     /// This run's absolute wall-clock deadline, if it has one.

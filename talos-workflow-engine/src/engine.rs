@@ -10,6 +10,17 @@ use std::pin::Pin;
 use std::sync::{LazyLock, OnceLock};
 use talos_workflow_engine_core::reserved_keys::output_reports_error;
 
+/// The reactor's error when its run was stopped mid-flight (see
+/// [`ExecutionProgress::abort_run`]). Never surfaces to a caller:
+/// `run_with_workflow_timeout` reports a stopped run as
+/// [`crate::WorkflowEngineError::Cancelled`].
+const RUN_STOPPED: &str = "workflow run stopped: its execution is no longer running";
+
+/// A node the engine declined to send because its start row was born
+/// `cancelled` — the parent execution was already cancelled or failed.
+pub(crate) const NODE_NOT_DISPATCHED: &str =
+    "node not dispatched: the workflow execution is no longer running (cancelled or failed)";
+
 /// Wrap a scheduler future in the workflow-level wall-clock cap and
 /// produce the typed [`crate::WorkflowEngineError`] result.
 ///
@@ -36,16 +47,14 @@ async fn run_with_workflow_timeout(
     fut: impl std::future::Future<Output = Result<talos_workflow_engine_core::WorkflowContext, String>>,
 ) -> Result<talos_workflow_engine_core::WorkflowContext, crate::WorkflowEngineError> {
     // Race the inner scheduler against:
-    // 1. The optional caller-supplied cancellation token (returns
-    //    `WorkflowEngineError::Cancelled`).
+    // 1. The run's abort token — a child of the optional caller-supplied
+    //    cancellation token, also fired by the engine itself when a dispatch
+    //    finds the run already over (returns `WorkflowEngineError::Cancelled`).
     // 2. The workflow-level wall-clock cap (returns `Timeout`).
     // 3. The inner scheduler's own completion (returns its result).
     //
     // `tokio::pin!` keeps the future on the stack so it can be polled
-    // from within `select!` without needing `Box::pin`. The cancel
-    // branch is only enabled when a token was provided — using
-    // `if let Some(...)` inside `select!` would require pre-cloning
-    // the token, so we branch above instead.
+    // from within `select!` without needing `Box::pin`.
     tokio::pin!(fut);
     let timeout_dur = (secs > 0).then(|| std::time::Duration::from_secs(secs));
 
@@ -66,10 +75,21 @@ async fn run_with_workflow_timeout(
     // exists.
     progress.set_deadline(timeout_dur.map(|d| (std::time::Instant::now() + d, secs)));
 
-    let inner_result: Result<Result<_, String>, ()> = match (cancel, timeout_dur) {
-        (Some(token), Some(dur)) => tokio::select! {
+    // The run's OWN abort token: a child of the caller's token when there is
+    // one (so the caller's cancel still reaches it), a fresh token otherwise.
+    // Published on the progress handle so a dispatch site that discovers the
+    // run is already over — a start row born `cancelled` — can stop it. The
+    // reactor also checks it before starting a node or routing a completion,
+    // so nothing is dispatched or failure-routed after the abort.
+    let run_token = cancel.map_or_else(tokio_util::sync::CancellationToken::new, |t| {
+        t.child_token()
+    });
+    progress.set_run_abort(run_token.clone());
+
+    let inner_result: Result<Result<_, String>, ()> = match timeout_dur {
+        Some(dur) => tokio::select! {
             biased; // honour cancellation before timeout if both fire same tick
-            () = token.cancelled() => return Err(crate::WorkflowEngineError::Cancelled),
+            () = run_token.cancelled() => return Err(crate::WorkflowEngineError::Cancelled),
             r = tokio::time::timeout(dur, &mut fut) => match r {
                 Ok(inner) => Ok(inner),
                 Err(_) => return Err(crate::WorkflowEngineError::Timeout {
@@ -78,22 +98,19 @@ async fn run_with_workflow_timeout(
                 }),
             },
         },
-        (Some(token), None) => tokio::select! {
+        None => tokio::select! {
             biased;
-            () = token.cancelled() => return Err(crate::WorkflowEngineError::Cancelled),
+            () = run_token.cancelled() => return Err(crate::WorkflowEngineError::Cancelled),
             inner = &mut fut => Ok(inner),
         },
-        (None, Some(dur)) => match tokio::time::timeout(dur, fut).await {
-            Ok(inner) => Ok(inner),
-            Err(_) => {
-                return Err(crate::WorkflowEngineError::Timeout {
-                    secs,
-                    attribution: progress.describe(),
-                })
-            }
-        },
-        (None, None) => Ok(fut.await),
     };
+    // The reactor can finish in the SAME poll that fired the token (a refused
+    // dispatch returns, the reactor sees `run_aborted` and bails with a plain
+    // error). A run that was aborted at any point answers `Cancelled`, never
+    // an execution error the caller would record as a failure.
+    if run_token.is_cancelled() {
+        return Err(crate::WorkflowEngineError::Cancelled);
+    }
     match inner_result {
         Ok(Ok(ctx)) => Ok(ctx),
         Ok(Err(e)) => Err(crate::WorkflowEngineError::execution(e)),
@@ -364,7 +381,9 @@ pub const DEFAULT_AGENT_LOOP_MAX_HISTORY: usize = 20;
 pub const DEFAULT_MAX_SUBFLOW_DEPTH: usize = 16;
 
 use crate::emit_event_spawn;
+use crate::engine_completion::Release;
 use crate::execution_progress::ExecutionProgress;
+use crate::join_state::Joins;
 use talos_workflow_engine_core::{
     CheckpointStore, EdgeLogic, EventSink, ModuleFetcher, NodeEventWrite, NodeLifecycleHook,
     SecretsResolver, SystemNodeKind, WorkflowContext, WorkflowGraphStore,
@@ -1982,46 +2001,39 @@ impl ParallelWorkflowEngine {
             }
         }
 
-        // In-degree counter.
-        let mut pending: HashMap<NodeIndex, usize> = HashMap::new();
-        for idx in self.graph.node_indices() {
-            let deps = self
-                .graph
-                .neighbors_directed(idx, Direction::Incoming)
-                .count();
-            pending.insert(idx, deps);
-        }
+        // Join table: every node waits on its incoming EDGES, and each edge
+        // resolves active or inactive exactly once (see `join_state`). Counts
+        // edges, not distinct parents, exactly as the counter it replaced did.
+        let mut joins = Joins::new(self.graph.node_indices().map(|idx| {
+            (
+                idx,
+                self.graph.edges_directed(idx, Direction::Incoming).count(),
+            )
+        }));
 
-        // Seed results and pre-propagate pending counts for already-
-        // completed (seeded) nodes. The fresh-run case sees an empty
-        // `initial_results` and this whole block is a no-op.
+        // Seed results and pre-resolve the outgoing edges of already-
+        // completed (seeded) nodes. The fresh-run case sees only the
+        // synthetic trigger here.
         let mut results: HashMap<Uuid, JsonValue> = initial_results;
         let seeded: HashSet<Uuid> = results.keys().copied().collect();
         for &node_id in &seeded {
             if let Some(&node_idx) = self.node_map.get(&node_id) {
-                pending.insert(node_idx, 0);
+                joins.decide(node_idx);
                 for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-                    if let Some(cnt) = pending.get_mut(&child) {
-                        if *cnt > 0 {
-                            *cnt -= 1;
-                        }
-                    }
+                    joins.resolve_seeded(child);
                 }
             }
         }
 
-        // Initial ready queue: zero-pending nodes that weren't seeded.
-        // Edge-condition evaluation happens in the reactor loop AFTER
-        // nodes produce output, not here at seed time (seeded nodes may
-        // be synthetic triggers whose output doesn't contain the fields
-        // conditions reference).
-        let mut ready: VecDeque<NodeIndex> = VecDeque::new();
-        for idx in self.graph.node_indices() {
-            let node_id = self.graph[idx];
-            if pending.get(&idx).copied().unwrap_or(1) == 0 && !seeded.contains(&node_id) {
-                ready.push_back(idx);
-            }
-        }
+        // Initial ready queue, in graph order: roots and nodes whose every
+        // parent was seeded. Edge-condition evaluation happens in
+        // `release_successors` AFTER nodes produce output, not here at seed
+        // time (seeded nodes may be synthetic triggers whose output doesn't
+        // contain the fields conditions reference).
+        let mut ready: VecDeque<NodeIndex> = joins
+            .take_initially_ready(self.graph.node_indices())
+            .into_iter()
+            .collect();
 
         // Trait-object futures so we can push both pipeline-chain and
         // single-node futures (different concrete async block types).
@@ -2033,7 +2045,7 @@ impl ParallelWorkflowEngine {
         // Arc-wrapped accumulated-context snapshot so it is rebuilt once per
         // node-processing step rather than once per node dispatch (was
         // O(N²·S)). `results` is mutated from several places — the
-        // `commit_result!` macro inline below AND the `route_system_node_output`
+        // `commit_and_release!` macro inline below AND the `route_system_node_output`
         // / `handle_completed_future` helpers that take `&mut results` — so
         // rather than chase every insert site, the version is bumped once at the
         // top of the inner work loop. Each inner iteration processes exactly one
@@ -2045,14 +2057,30 @@ impl ParallelWorkflowEngine {
         // change needs finer-grained invalidation.
         let mut results_version: u64 = 0;
         let mut accumulated_memo: Option<(u64, Option<Arc<JsonValue>>)> = None;
-        macro_rules! commit_result {
-            ($id:expr, $value:expr) => {{
+        // Every inline commit goes through ONE macro that records the output
+        // AND releases the node's successors through `release_successors` —
+        // the same edge loop (conditions, error-edge types, skip cascade) the
+        // module completion path runs. The two used to be separate calls, and
+        // the second one was a bare counter decrement that consulted neither
+        // conditions nor edge types.
+        macro_rules! commit_and_release {
+            ($idx:expr, $id:expr, $value:expr, $how:expr) => {{
                 // Timeout attribution: this macro is the chokepoint for
                 // every locally-computed / inline-awaited node commit, so
                 // counting here keeps `nodes completed` honest across all
                 // node kinds rather than only worker-dispatched ones. The
                 // in-flight removal is a no-op for kinds that never
                 // entered the pool.
+                self.progress.mark_finished($id);
+                results.insert($id, $value);
+                self.release_successors($idx, $how, &mut results, &mut joins, &mut ready);
+            }};
+        }
+        // A PAUSE commits the pausing node's envelope and deliberately
+        // releases NOTHING: the run returns right after, and the resume seeds
+        // the node's external value, whose edges resolve at seed time.
+        macro_rules! commit_paused_result {
+            ($id:expr, $value:expr) => {{
                 self.progress.mark_finished($id);
                 results.insert($id, $value);
             }};
@@ -2074,6 +2102,9 @@ impl ParallelWorkflowEngine {
         macro_rules! drain_in_flight_before_pause {
             () => {{
                 while let Some((finished_idx, exec_result)) = executing.next().await {
+                    if self.progress.run_aborted() {
+                        return Err(RUN_STOPPED.into());
+                    }
                     self.progress.mark_finished(self.graph[finished_idx]);
                     let wall_time_ms = node_start_times
                         .remove(&finished_idx)
@@ -2092,7 +2123,7 @@ impl ParallelWorkflowEngine {
                         chains_ctx,
                         &exec_ctx,
                         &mut results,
-                        &mut pending,
+                        &mut joins,
                         &mut ready,
                     )
                     .await?;
@@ -2114,12 +2145,17 @@ impl ParallelWorkflowEngine {
             // the pool simply get processed on the next pass once a slot frees —
             // correctness and ordering are unchanged, only dispatch is throttled.
             while executing.len() < max_concurrent_nodes {
+                // A stopped run starts nothing new. The wrapper turns this
+                // error into `Cancelled` (see `run_with_workflow_timeout`).
+                if self.progress.run_aborted() {
+                    return Err(RUN_STOPPED.into());
+                }
                 let Some(node_idx) = ready.pop_front() else {
                     break;
                 };
                 // P1: invalidate the accumulated-context memo once per node
                 // step. Prior iterations may have committed results via the
-                // `commit_result!` macro OR via the `&mut results` completion
+                // `commit_and_release!` macro OR via the `&mut results` completion
                 // helpers; bumping here (before any snapshot read in this
                 // iteration) makes the next `build_accumulated_context_memo`
                 // observe all of them. See the counter's declaration for why a
@@ -2174,15 +2210,13 @@ impl ParallelWorkflowEngine {
                 if let Some(output) =
                     self.check_skip_condition(node_idx, node_id, execution_id, &results)
                 {
-                    commit_result!(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
+                    commit_and_release!(node_idx, node_id, output, Release::SkippedItself);
                     continue;
                 }
 
                 // ── FanIn aggregation (local computation, no dispatch) ───────
                 if let Some(output) = self.try_dispatch_fan_in(node_idx, node_id, &results) {
-                    commit_result!(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
+                    commit_and_release!(node_idx, node_id, output, Release::Succeeded);
                     continue;
                 }
 
@@ -2190,8 +2224,7 @@ impl ParallelWorkflowEngine {
                 if let Some(output) =
                     self.try_dispatch_collect(node_idx, node_id, execution_id, &results)
                 {
-                    commit_result!(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
+                    commit_and_release!(node_idx, node_id, output, Release::Succeeded);
                     continue;
                 }
 
@@ -2199,7 +2232,7 @@ impl ParallelWorkflowEngine {
                 //
                 // Async (one injected-reader DB round-trip), output flows
                 // downstream — so it takes the `route_system_node_output`
-                // path like Judge, not the bare `commit_result!` of the
+                // path like Judge, not the bare `commit_and_release!` of the
                 // pure-local nodes. No worker dispatch and no secrets:
                 // the `encrypted_secrets` discipline does not apply here
                 // by construction (nothing leaves the controller).
@@ -2220,7 +2253,7 @@ impl ParallelWorkflowEngine {
                         chains_ctx,
                         &exec_ctx,
                         &mut results,
-                        &mut pending,
+                        &mut joins,
                         &mut ready,
                     )
                     .await?;
@@ -2249,7 +2282,7 @@ impl ParallelWorkflowEngine {
                         chains_ctx,
                         &exec_ctx,
                         &mut results,
-                        &mut pending,
+                        &mut joins,
                         &mut ready,
                     )
                     .await?;
@@ -2276,7 +2309,7 @@ impl ParallelWorkflowEngine {
                         chains_ctx,
                         &exec_ctx,
                         &mut results,
-                        &mut pending,
+                        &mut joins,
                         &mut ready,
                     )
                     .await?;
@@ -2303,7 +2336,7 @@ impl ParallelWorkflowEngine {
                         chains_ctx,
                         &exec_ctx,
                         &mut results,
-                        &mut pending,
+                        &mut joins,
                         &mut ready,
                     )
                     .await?;
@@ -2314,8 +2347,7 @@ impl ParallelWorkflowEngine {
                 if let Some(output) =
                     self.try_dispatch_synthesize(node_idx, node_id, execution_id, &results)
                 {
-                    commit_result!(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
+                    commit_and_release!(node_idx, node_id, output, Release::Succeeded);
                     continue;
                 }
 
@@ -2335,8 +2367,7 @@ impl ParallelWorkflowEngine {
                 {
                     match verify_outcome {
                         Ok(output) => {
-                            commit_result!(node_id, output);
-                            self.unblock_successors(node_idx, &mut pending, &mut ready);
+                            commit_and_release!(node_idx, node_id, output, Release::Succeeded);
                         }
                         Err(error_msg) => {
                             let chains_ctx = if chains_live {
@@ -2352,7 +2383,7 @@ impl ParallelWorkflowEngine {
                                 chains_ctx,
                                 &exec_ctx,
                                 &mut results,
-                                &mut pending,
+                                &mut joins,
                                 &mut ready,
                             )
                             .await?;
@@ -2374,7 +2405,7 @@ impl ParallelWorkflowEngine {
                 if let Some(outcome) = self.try_dispatch_wait(node_id, execution_id) {
                     use crate::scheduler_handlers::WaitOutcome;
                     let WaitOutcome::Pause { waiting_output } = outcome;
-                    commit_result!(node_id, waiting_output);
+                    commit_paused_result!(node_id, waiting_output);
                     drain_in_flight_before_pause!();
                     return Ok(WorkflowContext {
                         results,
@@ -2402,7 +2433,7 @@ impl ParallelWorkflowEngine {
                         chains_ctx,
                         &exec_ctx,
                         &mut results,
-                        &mut pending,
+                        &mut joins,
                         &mut ready,
                     )
                     .await?;
@@ -2438,7 +2469,7 @@ impl ParallelWorkflowEngine {
                         chains_ctx,
                         &exec_ctx,
                         &mut results,
-                        &mut pending,
+                        &mut joins,
                         &mut ready,
                     )
                     .await?;
@@ -2471,7 +2502,7 @@ impl ParallelWorkflowEngine {
                         chains_ctx,
                         &exec_ctx,
                         &mut results,
-                        &mut pending,
+                        &mut joins,
                         &mut ready,
                     )
                     .await?;
@@ -2487,12 +2518,11 @@ impl ParallelWorkflowEngine {
                     use crate::scheduler_handlers::ConfidenceGateOutcome;
                     match outcome {
                         ConfidenceGateOutcome::Proceed(output) => {
-                            commit_result!(node_id, output);
-                            self.unblock_successors(node_idx, &mut pending, &mut ready);
+                            commit_and_release!(node_idx, node_id, output, Release::Succeeded);
                             continue;
                         }
                         ConfidenceGateOutcome::Pause { waiting_output } => {
-                            commit_result!(node_id, waiting_output);
+                            commit_paused_result!(node_id, waiting_output);
                             drain_in_flight_before_pause!();
                             return Ok(WorkflowContext {
                                 results,
@@ -2519,7 +2549,7 @@ impl ParallelWorkflowEngine {
                                 chains_ctx,
                                 &exec_ctx,
                                 &mut results,
-                                &mut pending,
+                                &mut joins,
                                 &mut ready,
                             )
                             .await?;
@@ -2554,7 +2584,7 @@ impl ParallelWorkflowEngine {
                         chains_ctx,
                         &exec_ctx,
                         &mut results,
-                        &mut pending,
+                        &mut joins,
                         &mut ready,
                     )
                     .await?;
@@ -2587,7 +2617,7 @@ impl ParallelWorkflowEngine {
                         chains_ctx,
                         &exec_ctx,
                         &mut results,
-                        &mut pending,
+                        &mut joins,
                         &mut ready,
                     )
                     .await?;
@@ -2635,7 +2665,7 @@ impl ParallelWorkflowEngine {
                         chains_ctx,
                         &exec_ctx,
                         &mut results,
-                        &mut pending,
+                        &mut joins,
                         &mut ready,
                     )
                     .await?;
@@ -2644,15 +2674,13 @@ impl ParallelWorkflowEngine {
 
                 // ── WhileLoop dispatch (local computation) ──────────────────
                 if let Some(output) = self.try_dispatch_while_loop(node_idx, node_id, &results) {
-                    commit_result!(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
+                    commit_and_release!(node_idx, node_id, output, Release::Succeeded);
                     continue;
                 }
 
                 // ── RepeatLoop dispatch (local computation) ─────────────────
                 if let Some(output) = self.try_dispatch_repeat_loop(node_idx, node_id, &results) {
-                    commit_result!(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
+                    commit_and_release!(node_idx, node_id, output, Release::Succeeded);
                     continue;
                 }
 
@@ -2752,7 +2780,7 @@ impl ParallelWorkflowEngine {
                                 chains_ctx,
                                 &exec_ctx,
                                 &mut results,
-                                &mut pending,
+                                &mut joins,
                                 &mut ready,
                             )
                             .await?;
@@ -2785,8 +2813,7 @@ impl ParallelWorkflowEngine {
                 {
                     match outcome {
                         Ok(output) => {
-                            commit_result!(node_id, output);
-                            self.unblock_successors(node_idx, &mut pending, &mut ready);
+                            commit_and_release!(node_idx, node_id, output, Release::Succeeded);
                         }
                         Err(error_msg) => {
                             let chains_ctx = if chains_live {
@@ -2802,7 +2829,7 @@ impl ParallelWorkflowEngine {
                                 chains_ctx,
                                 &exec_ctx,
                                 &mut results,
-                                &mut pending,
+                                &mut joins,
                                 &mut ready,
                             )
                             .await?;
@@ -2848,8 +2875,12 @@ impl ParallelWorkflowEngine {
                             "Capability dispatch failed but continue_on_error is set — continuing"
                         );
                     }
-                    commit_result!(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
+                    let how = if output_reports_error(&output) {
+                        Release::ContinuedAfterFailure
+                    } else {
+                        Release::Succeeded
+                    };
+                    commit_and_release!(node_idx, node_id, output, how);
                     continue;
                 }
 
@@ -2900,22 +2931,34 @@ impl ParallelWorkflowEngine {
                             "Loop body failed but continue_on_error is set — continuing"
                         );
                     }
-                    commit_result!(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
+                    let how = if output_reports_error(&output) {
+                        Release::ContinuedAfterFailure
+                    } else {
+                        Release::Succeeded
+                    };
+                    commit_and_release!(node_idx, node_id, output, how);
                     continue;
                 }
 
                 // ── ErrorHandler dispatch (pattern filtering) ───────────────
+                // `Some` only for a pattern MISMATCH: the handler skipped itself.
                 if let Some(output) = self.try_dispatch_error_handler(node_idx, node_id, &results) {
-                    commit_result!(node_id, output);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
+                    commit_and_release!(node_idx, node_id, output, Release::SkippedItself);
                     continue;
                 }
 
                 // ── Single-node dispatch ─────────────────────────────────────
+                // A rate-limited node is committed as a continued failure: its
+                // error envelope reaches every child, exactly as
+                // `continue_on_error` would carry it (the documented contract of
+                // `check_rate_limit`).
                 if let Some(error_envelope) = self.check_rate_limit(node_id).await {
-                    commit_result!(node_id, error_envelope);
-                    self.unblock_successors(node_idx, &mut pending, &mut ready);
+                    commit_and_release!(
+                        node_idx,
+                        node_id,
+                        error_envelope,
+                        Release::ContinuedAfterFailure
+                    );
                     continue;
                 }
 
@@ -2988,6 +3031,13 @@ impl ParallelWorkflowEngine {
             // passed only when chain detection actually ran
             // (fresh-run path); seeded runs supply `None`.
             if let Some((finished_idx, exec_result)) = executing.next().await {
+                // A completion that arrives after the run was stopped — the
+                // refused dispatch itself among them — is not routed: no
+                // failure event, no DLQ entry, no error-edge handler for a
+                // node the engine declined to send.
+                if self.progress.run_aborted() {
+                    return Err(RUN_STOPPED.into());
+                }
                 // Timeout attribution: clear the in-flight marker
                 // unconditionally (keyed on the graph id, so it covers
                 // the chain-head entry too, which never appears in
@@ -3018,7 +3068,7 @@ impl ParallelWorkflowEngine {
                     chains_ctx,
                     &exec_ctx,
                     &mut results,
-                    &mut pending,
+                    &mut joins,
                     &mut ready,
                 )
                 .await?;

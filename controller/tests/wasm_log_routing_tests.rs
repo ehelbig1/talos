@@ -262,7 +262,7 @@ async fn a_row_recorded_by_the_execution_store_makes_loop_logs_persist() {
         talos_engine::module_execution_store::PostgresModuleExecutionStore::new(f.pool.clone());
     // The id the loop body now dispatches under.
     let iter_exec_id = Uuid::new_v4();
-    store
+    let started = store
         .record_started(ExecutionStartedContext {
             id: iter_exec_id,
             module_id: f.module,
@@ -275,6 +275,11 @@ async fn a_row_recorded_by_the_execution_store_makes_loop_logs_persist() {
         })
         .await
         .expect("record_started must succeed for a loop iteration");
+    assert_eq!(
+        started,
+        talos_workflow_engine_core::StartedRow::Running,
+        "the parent execution is live, so the iteration is dispatched"
+    );
 
     // Now the worker's log line for that job id has somewhere to land.
     let outcome = f

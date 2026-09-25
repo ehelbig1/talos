@@ -180,7 +180,7 @@ pub use judge_score_recorder::JudgeScoreRecorder;
 pub use llm_tier::LlmTier;
 pub use memory_freshness::MemoryFreshnessResolver;
 pub use module_artifact::WasmModuleArtifact;
-pub use module_execution_store::{ExecutionStartedContext, ModuleExecutionStore};
+pub use module_execution_store::{ExecutionStartedContext, ModuleExecutionStore, StartedRow};
 pub use module_fetcher::ModuleFetcher;
 pub use node_hook::{NodeCompletionContext, NodeLifecycleHook};
 pub use node_identity::{engine_node_uuid, node_module_id};

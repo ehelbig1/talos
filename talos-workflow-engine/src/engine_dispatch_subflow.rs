@@ -678,11 +678,11 @@ impl ParallelWorkflowEngine {
                             .or_else(|| r.get("output"))
                             .map(|v| v.to_string())
                             .unwrap_or_else(|| r.to_string());
-                        if s.len() > MAX_VOTE_KEY_BYTES {
-                            s[..MAX_VOTE_KEY_BYTES].to_string()
-                        } else {
-                            s
-                        }
+                        // On a char boundary: `s` is module/LLM-authored,
+                        // and a byte slice through a multi-byte character
+                        // panics the detached engine task.
+                        crate::validation::truncate_at_char_boundary(&s, MAX_VOTE_KEY_BYTES)
+                            .to_string()
                     };
                     let entry = vote_counts.entry(key_val).or_insert((0, r.clone()));
                     entry.0 += 1;

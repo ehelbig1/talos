@@ -1,35 +1,84 @@
 //! Post-dispatch completion handlers — extracted from engine.rs
 //!
-//! These three methods are the hand-off between a future returning
-//! from `executing.next().await` and the reactor's bookkeeping
-//! (results map, pending counts, ready queue, lifecycle hook). They
-//! split into:
+//! These methods are the hand-off between a finished node and the
+//! reactor's bookkeeping (results map, join table, ready queue, lifecycle
+//! hook). They split into:
 //!
 //! * `handle_completed_future` — the dispatch entry point. Routes
 //!   `Ok` to `handle_node_success` and `Err` to `handle_node_failure`.
 //! * `handle_node_success` — size-guard, sanitize, store, fire
-//!   `on_node_completed`, walk successors with `FanIn` / edge-condition
-//!   awareness.
+//!   `on_node_completed`, release successors.
 //! * `handle_node_failure` — DLP-scrub, emit `node_failed`, route to
 //!   error edges / `continue_on_error` / scheduler-fatal abort.
+//! * `release_successors` — the ONE successor-release path: resolves every
+//!   outgoing edge (condition, error-edge type) and cascades skips. Every
+//!   commit in the reactor, of every node kind, ends here.
 //!
-//! Pure code movement from the previous engine.rs location — no
-//! behaviour change. Lifted out so the reactor body in
-//! `run_scheduler_loop` reads as a sequence of named handler calls
-//! and so this ~400-line failure-and-success-routing block stays
-//! auditable in isolation.
+//! Lifted out of engine.rs so the reactor body in `run_scheduler_loop`
+//! reads as a sequence of named handler calls and so the
+//! failure-and-success-routing block stays auditable in isolation.
 
 use std::collections::{HashMap, VecDeque};
 use talos_workflow_engine_core::reserved_keys::{error_reason, output_reports_error};
 
 use petgraph::graph::NodeIndex;
+use petgraph::visit::EdgeRef;
 use petgraph::Direction;
 use serde_json::Value as JsonValue;
-use talos_workflow_engine_core::NodeEventWrite;
+use talos_workflow_engine_core::{EdgeLogic, JoinMode, NodeEventWrite, SystemNodeKind};
 use uuid::Uuid;
 
 use crate::engine::ParallelWorkflowEngine;
+use crate::join_state::{EdgeResolution, JoinVerdict, Joins};
 use crate::validation::sanitize_node_output;
+
+/// How a node's fate decides its OUTGOING edges — the argument to
+/// [`ParallelWorkflowEngine::release_successors`], the ONE place a finished
+/// node hands work to its children.
+///
+/// Every node kind — a worker-dispatched module, an inline system node, a
+/// sub-workflow, a skip — goes through the same edge loop, so "a conditional
+/// edge is followed only when its condition holds" and "an error edge fires
+/// only on failure" mean the same thing after every one of them. Until
+/// 2026-09-25 only the module success path applied either rule; every other
+/// commit decremented its children's counters and nothing else, so a judge's
+/// `passthrough` verdict ran both of its conditional branches and a
+/// sub-workflow's error handler ran when the sub-workflow succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Release {
+    /// The node committed an output (read back from `results`). An error edge
+    /// resolves inactive; a conditional edge resolves active only when its
+    /// condition holds against that output; any other edge is active.
+    Succeeded,
+    /// The node's own gate skipped it (`skip_condition`, an `ErrorHandler`
+    /// whose pattern did not match). It neither produced output nor failed:
+    /// an error edge is inactive, a CONDITIONAL edge is inactive without
+    /// being evaluated (there is no output to test it against), and an
+    /// unconditional edge stays active — its child runs and sees the skip
+    /// envelope, as it always has.
+    SkippedItself,
+    /// The node failed and has error edges: only the error edges are active.
+    FailedToErrorEdges,
+    /// The node failed under `continue_on_error`: every edge carries the
+    /// failure envelope, conditions unevaluated — the historical contract of
+    /// that path. See [`EdgeResolution::ActiveAfterFailure`] for why it does
+    /// not satisfy an early-ready join by itself.
+    ContinuedAfterFailure,
+}
+
+/// The envelope written for a node whose every incoming edge resolved
+/// inactive. `reason` distinguishes it from a node that skipped ITSELF
+/// (`skip_condition`, `error_pattern_mismatch`).
+fn inactive_inputs_skip_envelope() -> JsonValue {
+    serde_json::json!({
+        "__skipped": true,
+        "reason": "no_active_input",
+    })
+}
+
+fn is_error_edge(edge: &EdgeLogic) -> bool {
+    edge.edge_type == "error"
+}
 
 /// Extract a retry-classifier tag from an error message shaped like
 /// `"Job failed (non-transient: <class>): <detail>"`.
@@ -71,7 +120,7 @@ impl ParallelWorkflowEngine {
     /// `handle_completed_future` with `Err(message)`, which respects
     /// `continue_on_error` and error-edge routing identically to
     /// regular module failures. Without the marker, we fall through
-    /// to the normal insert-and-unblock-successors path.
+    /// to the normal insert-and-release-successors path.
     ///
     /// Consolidates the fix pattern from three earlier single-site
     /// commits (verify-node: b69aad5, `confidence_gate`: a7dd2b3,
@@ -96,12 +145,12 @@ impl ParallelWorkflowEngine {
         chains_ctx: Option<(&[Vec<NodeIndex>], &HashMap<NodeIndex, usize>)>,
         exec_ctx: &Option<Box<dyn talos_workflow_engine_core::ExecutionSanitizer>>,
         results: &mut HashMap<Uuid, JsonValue>,
-        pending: &mut HashMap<NodeIndex, usize>,
+        joins: &mut Joins,
         ready: &mut VecDeque<NodeIndex>,
     ) -> Result<(), String> {
         // Timeout attribution: the commit chokepoint for system nodes
         // that route their output here instead of through the
-        // `commit_result!` macro. Counted once for both branches; the
+        // `commit_and_release!` macro. Counted once for both branches; the
         // `executing.next()` completion path marks its own nodes and
         // never reaches this function, so there is no double count.
         self.progress.mark_finished(self.graph[node_idx]);
@@ -124,14 +173,14 @@ impl ParallelWorkflowEngine {
                 chains_ctx,
                 exec_ctx,
                 results,
-                pending,
+                joins,
                 ready,
             )
             .await
         } else {
             let node_id = self.graph[node_idx];
             results.insert(node_id, output);
-            self.unblock_successors(node_idx, pending, ready);
+            self.release_successors(node_idx, Release::Succeeded, results, joins, ready);
             Ok(())
         }
     }
@@ -142,10 +191,9 @@ impl ParallelWorkflowEngine {
     /// Handles both the `Ok(output)` and `Err(error_message)` paths:
     ///
     /// * **Success.** Size-guard the output, sanitize it, insert into
-    ///   `results`, fire the `on_node_completed` hook, clear pending
-    ///   counts for any interior chain nodes (primary scheduler only),
-    ///   then walk successors decrementing pending counts, applying
-    ///   `FanIn` early-ready rules and edge-condition evaluation.
+    ///   `results`, fire the `on_node_completed` hook, decide any interior
+    ///   chain nodes (primary scheduler only), then release successors
+    ///   through [`Self::release_successors`].
     ///
     /// * **Failure.** DLP-scrub the error, emit `node_failed`, and
     ///   route based on node topology: if the node has outgoing error
@@ -185,7 +233,7 @@ impl ParallelWorkflowEngine {
         chains_ctx: Option<(&[Vec<NodeIndex>], &HashMap<NodeIndex, usize>)>,
         exec_ctx: &Option<Box<dyn talos_workflow_engine_core::ExecutionSanitizer>>,
         results: &mut HashMap<Uuid, JsonValue>,
-        pending: &mut HashMap<NodeIndex, usize>,
+        joins: &mut Joins,
         ready: &mut VecDeque<NodeIndex>,
     ) -> Result<(), String> {
         let finished_id = self.graph[finished_idx];
@@ -199,7 +247,7 @@ impl ParallelWorkflowEngine {
                     wall_time_ms,
                     chains_ctx,
                     results,
-                    pending,
+                    joins,
                     ready,
                 )
                 .await;
@@ -215,7 +263,7 @@ impl ParallelWorkflowEngine {
                     chains_ctx,
                     exec_ctx,
                     results,
-                    pending,
+                    joins,
                     ready,
                 )
                 .await
@@ -233,7 +281,7 @@ impl ParallelWorkflowEngine {
         wall_time_ms: u64,
         chains_ctx: Option<(&[Vec<NodeIndex>], &HashMap<NodeIndex, usize>)>,
         results: &mut HashMap<Uuid, JsonValue>,
-        pending: &mut HashMap<NodeIndex, usize>,
+        joins: &mut Joins,
         ready: &mut VecDeque<NodeIndex>,
     ) {
         // Log `node_completed` synchronously so child `node_started`
@@ -417,152 +465,13 @@ impl ParallelWorkflowEngine {
             }
         }
 
-        // Chain execution: clear `pending` for interior chain nodes so
-        // their would-be successors (already run inside the pipeline)
-        // don't wait on them. Primary scheduler only — seeded path
-        // doesn't run pipeline batching.
-        if let Some((chains, node_to_chain)) = chains_ctx {
-            if let Some(&chain_idx) = node_to_chain.get(&finished_idx) {
-                for &n in &chains[chain_idx] {
-                    pending.insert(n, 0);
-                }
-            }
-        }
+        // Chain execution: the chain's nodes ran inside the pipeline, so
+        // decide them all — none may be enqueued again by a later
+        // resolution. Primary scheduler only — the seeded path doesn't run
+        // pipeline batching.
+        self.decide_chain_members(finished_idx, chains_ctx, joins);
 
-        // Decrement children counters for finished_idx's successors.
-        // On SUCCESS, skip error-edge children (they only fire on failure).
-        for child in self
-            .graph
-            .neighbors_directed(finished_idx, Direction::Outgoing)
-        {
-            let is_error_edge = self
-                .graph
-                .edges_connecting(finished_idx, child)
-                .any(|e| e.weight().edge_type == "error");
-            if is_error_edge {
-                let child_id = self.graph[child];
-                results.insert(child_id, serde_json::json!({"__skipped": true}));
-                continue;
-            }
-            if let Some(cnt) = pending.get_mut(&child) {
-                // Guard the decrement: under early-ready join modes the counter
-                // may already be 0 when a parent completes (see the removal note
-                // below), and an unguarded `*cnt -= 1` on 0 underflows — a panic
-                // in debug, a wrap to usize::MAX in release.
-                if *cnt > 0 {
-                    *cnt -= 1;
-                }
-
-                // FanIn early-ready logic: some join modes don't
-                // require ALL parents to complete.
-                self.apply_fan_in_early_ready(child, pending);
-
-                if pending.get(&child).copied().unwrap_or(1) == 0 {
-                    // The join is satisfied — this child's fate is decided
-                    // exactly once here. Remove its `pending` entry so a parent
-                    // that completes LATER (possible under the `Any`/`N`/
-                    // `Majority` join modes, which zero the counter before every
-                    // parent finishes) can't re-enter this block: without the
-                    // removal that late parent would underflow the counter and
-                    // re-enqueue the child, double-dispatching its entire
-                    // downstream subgraph. Termination keys on `ready`/`executing`,
-                    // not `pending`, so early removal is safe.
-                    pending.remove(&child);
-                    // Check edge conditions before enqueuing.
-                    let child_node_id = self.graph[child];
-                    let mut condition_failed = false;
-                    for edge_ref in self.graph.edges_connecting(finished_idx, child) {
-                        tracing::debug!(
-                            condition = ?edge_ref.weight().condition,
-                            edge_type = %edge_ref.weight().edge_type,
-                            child = %child_node_id,
-                            "Evaluating edge"
-                        );
-                        if let Some(ref cond) = edge_ref.weight().condition {
-                            let unwrapped = Self::unwrap_output(&output);
-                            if !self.eval_bool_kinded(
-                                crate::condition_eval::ConditionKind::Edge,
-                                cond,
-                                unwrapped,
-                            ) {
-                                tracing::info!(
-                                    child_node_id = %child_node_id,
-                                    condition = %cond,
-                                    output_keys = ?unwrapped
-                                        .as_object()
-                                        .map(|m| m.keys().cloned().collect::<Vec<_>>())
-                                        .unwrap_or_default(),
-                                    "Edge condition false — child node will be skipped"
-                                );
-                                condition_failed = true;
-                                break;
-                            }
-                        }
-                    }
-                    if condition_failed {
-                        tracing::info!(
-                            node_id = %child_node_id,
-                            "Skipping node: edge condition evaluated to false"
-                        );
-                        results.insert(child_node_id, serde_json::json!({"__skipped": true}));
-                        // Cascade skip: decrement pending counts for the
-                        // skipped node's children. Those grandchildren
-                        // get picked up when their pending reaches 0 in
-                        // a future iteration.
-                        for grandchild in self.graph.neighbors_directed(child, Direction::Outgoing)
-                        {
-                            if let Some(gc_cnt) = pending.get_mut(&grandchild) {
-                                if *gc_cnt > 0 {
-                                    *gc_cnt -= 1;
-                                }
-                            }
-                        }
-                    } else {
-                        ready.push_back(child);
-                    }
-                }
-            }
-        }
-    }
-
-    /// Decrement a child's pending-parent counter on a FAILURE-path unblock
-    /// (error-edge or `continue_on_error`) and enqueue it to `ready` exactly
-    /// once when the join is satisfied.
-    ///
-    /// This mirrors the zero-transition discipline in `handle_node_success`
-    /// (see the removal note there): on the 0-transition the child's `pending`
-    /// entry is REMOVED so that a parent which completes LATER — possible under
-    /// the `Any`/`N`/`Majority` early-ready join modes, which zero the counter
-    /// before every parent finishes — cannot re-enter and re-enqueue the child,
-    /// double-dispatching its entire downstream subgraph. Termination keys on
-    /// `ready`/`executing`, not `pending`, so early removal is safe.
-    ///
-    /// Before this helper the two failure loops decremented + enqueued WITHOUT
-    /// the removal, so two error-edge parents into one early-ready fan-in (or a
-    /// `continue_on_error` parent leaving the entry at 0 for a later error-edge
-    /// parent) double-enqueued the fan-in — an exactly-once violation reachable
-    /// purely in-process. `apply_early_ready` matches the per-branch behavior:
-    /// the error-edge path applies early-ready (like success); the
-    /// `continue_on_error` path historically does not.
-    pub(crate) fn unblock_child_on_failure(
-        &self,
-        child: NodeIndex,
-        pending: &mut HashMap<NodeIndex, usize>,
-        ready: &mut VecDeque<NodeIndex>,
-        apply_early_ready: bool,
-    ) {
-        if let Some(cnt) = pending.get_mut(&child) {
-            if *cnt > 0 {
-                *cnt -= 1;
-            }
-            if apply_early_ready {
-                self.apply_fan_in_early_ready(child, pending);
-            }
-            if pending.get(&child).copied().unwrap_or(1) == 0 {
-                pending.remove(&child);
-                ready.push_back(child);
-            }
-        }
+        self.release_successors(finished_idx, Release::Succeeded, results, joins, ready);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -576,7 +485,7 @@ impl ParallelWorkflowEngine {
         chains_ctx: Option<(&[Vec<NodeIndex>], &HashMap<NodeIndex, usize>)>,
         exec_ctx: &Option<Box<dyn talos_workflow_engine_core::ExecutionSanitizer>>,
         results: &mut HashMap<Uuid, JsonValue>,
-        pending: &mut HashMap<NodeIndex, usize>,
+        joins: &mut Joins,
         ready: &mut VecDeque<NodeIndex>,
     ) -> Result<(), String> {
         // Two-pass scrub: value-based (known secrets) then regex DLP.
@@ -615,19 +524,13 @@ impl ParallelWorkflowEngine {
             .await;
         }
 
-        let error_children: Vec<NodeIndex> = self
+        let error_edges = self
             .graph
-            .neighbors_directed(finished_idx, Direction::Outgoing)
-            .filter(|&child_idx| {
-                if let Some(edge_idx) = self.graph.find_edge(finished_idx, child_idx) {
-                    self.graph[edge_idx].edge_type == "error"
-                } else {
-                    false
-                }
-            })
-            .collect();
+            .edges_directed(finished_idx, Direction::Outgoing)
+            .filter(|e| is_error_edge(e.weight()))
+            .count();
 
-        if !error_children.is_empty() {
+        if error_edges > 0 {
             // Route error to error-handler nodes instead of failing.
             let error_payload = serde_json::json!({
                 "__error": true,
@@ -641,41 +544,23 @@ impl ParallelWorkflowEngine {
             results.insert(finished_id, error_payload);
             tracing::info!(
                 %finished_id,
-                error_handlers = error_children.len(),
+                error_handlers = error_edges,
                 "Node failed but has error handler edges — routing to error handlers"
             );
 
-            // Chain interior nodes get their pending cleared too —
-            // primary scheduler only.
-            if let Some((chains, node_to_chain)) = chains_ctx {
-                if let Some(&chain_idx) = node_to_chain.get(&finished_idx) {
-                    for &n in &chains[chain_idx] {
-                        pending.insert(n, 0);
-                    }
-                }
-            }
+            // Chain interior nodes are decided too — primary scheduler only.
+            self.decide_chain_members(finished_idx, chains_ctx, joins);
 
-            // Unblock ONLY error-edge children; skip default /
-            // conditional children because the parent failed and the
-            // success path is dead.
-            for child in self
-                .graph
-                .neighbors_directed(finished_idx, Direction::Outgoing)
-            {
-                let has_error_edge = self
-                    .graph
-                    .edges_connecting(finished_idx, child)
-                    .any(|e| e.weight().edge_type == "error");
-                if !has_error_edge {
-                    let child_id = self.graph[child];
-                    results.insert(child_id, serde_json::json!({"__skipped": true}));
-                    continue;
-                }
-
-                // error-edge unblock: apply early-ready (same as the success
-                // path) and remove on the 0-transition to prevent re-enqueue.
-                self.unblock_child_on_failure(child, pending, ready, true);
-            }
+            // Only the error edges carry the failure; the success path is
+            // dead, and its children cascade as skipped unless another live
+            // edge reaches them.
+            self.release_successors(
+                finished_idx,
+                Release::FailedToErrorEdges,
+                results,
+                joins,
+                ready,
+            );
             return Ok(());
         }
 
@@ -701,15 +586,13 @@ impl ParallelWorkflowEngine {
                     "__continued": true,
                 }),
             );
-            for child in self
-                .graph
-                .neighbors_directed(finished_idx, Direction::Outgoing)
-            {
-                // continue_on_error unblock: historically does NOT apply
-                // early-ready, but MUST still remove on the 0-transition so a
-                // later error-edge parent can't re-enqueue the child.
-                self.unblock_child_on_failure(child, pending, ready, false);
-            }
+            self.release_successors(
+                finished_idx,
+                Release::ContinuedAfterFailure,
+                results,
+                joins,
+                ready,
+            );
             return Ok(());
         }
 
@@ -746,6 +629,168 @@ impl ParallelWorkflowEngine {
         // engine's `Arc` for the lifetime of the caller.
         self.module_prefetch_cache.clear();
         Err(format!("node '{node_label}' failed: {error_msg}"))
+    }
+
+    /// Resolve every outgoing edge of `finished_idx` according to `how`, then
+    /// enqueue each child whose fate that decides and cascade each child it
+    /// skips. The ONE successor-release path: the module completion handler,
+    /// the system-node router, both failure routes and every inline commit in
+    /// the reactor call it, and nothing else may touch the join table's
+    /// verdicts.
+    ///
+    /// A node skipped here is written as
+    /// `{"__skipped": true, "reason": "no_active_input"}` and its own outgoing
+    /// edges resolve inactive in turn, iteratively, so the cascade reaches the
+    /// bottom of the graph in one call and every node it reaches is RECORDED
+    /// as skipped. Because a node's verdict depends only on the set of its
+    /// resolved edges (see [`Joins`]), the outcome does not depend on the
+    /// order in which parents finish.
+    ///
+    /// Conditions are evaluated against the output already committed to
+    /// `results` for `finished_idx` — the sanitized, size-guarded value the
+    /// children will actually receive.
+    pub(crate) fn release_successors(
+        &self,
+        finished_idx: NodeIndex,
+        how: Release,
+        results: &mut HashMap<Uuid, JsonValue>,
+        joins: &mut Joins,
+        ready: &mut VecDeque<NodeIndex>,
+    ) {
+        // Decide every edge first, against an immutable view of the committed
+        // output; the verdicts below then write skip envelopes into `results`.
+        let resolutions: Vec<(NodeIndex, EdgeResolution)> = {
+            let committed = results.get(&self.graph[finished_idx]);
+            self.graph
+                .edges_directed(finished_idx, Direction::Outgoing)
+                .map(|edge| {
+                    (
+                        edge.target(),
+                        self.resolve_edge(edge.weight(), how, committed),
+                    )
+                })
+                .collect()
+        };
+
+        let mut to_skip: VecDeque<NodeIndex> = VecDeque::new();
+        for (child, resolution) in resolutions {
+            self.apply_join_verdict(child, resolution, joins, ready, &mut to_skip);
+        }
+        while let Some(skipped) = to_skip.pop_front() {
+            let skipped_id = self.graph[skipped];
+            tracing::info!(
+                node_id = %skipped_id,
+                "Skipping node: no incoming edge carried output (false condition, \
+                 error edge off a success, success edge off a failure, or skipped parent)"
+            );
+            results.insert(skipped_id, inactive_inputs_skip_envelope());
+            let children: Vec<NodeIndex> = self
+                .graph
+                .edges_directed(skipped, Direction::Outgoing)
+                .map(|edge| edge.target())
+                .collect();
+            for child in children {
+                self.apply_join_verdict(
+                    child,
+                    EdgeResolution::Inactive,
+                    joins,
+                    ready,
+                    &mut to_skip,
+                );
+            }
+        }
+    }
+
+    fn apply_join_verdict(
+        &self,
+        child: NodeIndex,
+        resolution: EdgeResolution,
+        joins: &mut Joins,
+        ready: &mut VecDeque<NodeIndex>,
+        to_skip: &mut VecDeque<NodeIndex>,
+    ) {
+        match joins.resolve(child, resolution, self.fan_in_join_mode(child)) {
+            JoinVerdict::Run => ready.push_back(child),
+            JoinVerdict::Skip => to_skip.push_back(child),
+            JoinVerdict::Waiting | JoinVerdict::AlreadyDecided => {}
+        }
+    }
+
+    /// How one outgoing edge resolves for a node that finished `how`.
+    fn resolve_edge(
+        &self,
+        edge: &EdgeLogic,
+        how: Release,
+        committed: Option<&JsonValue>,
+    ) -> EdgeResolution {
+        let error_edge = is_error_edge(edge);
+        match how {
+            Release::FailedToErrorEdges => {
+                if error_edge {
+                    EdgeResolution::Active
+                } else {
+                    EdgeResolution::Inactive
+                }
+            }
+            Release::ContinuedAfterFailure => EdgeResolution::ActiveAfterFailure,
+            Release::SkippedItself => {
+                if error_edge || edge.condition.is_some() {
+                    EdgeResolution::Inactive
+                } else {
+                    EdgeResolution::Active
+                }
+            }
+            Release::Succeeded => {
+                if error_edge {
+                    return EdgeResolution::Inactive;
+                }
+                let Some(cond) = edge.condition.as_deref() else {
+                    return EdgeResolution::Active;
+                };
+                let context = committed.map_or(&JsonValue::Null, |v| Self::unwrap_output(v));
+                if self.eval_bool_kinded(crate::condition_eval::ConditionKind::Edge, cond, context)
+                {
+                    EdgeResolution::Active
+                } else {
+                    tracing::info!(
+                        condition = %cond,
+                        output_keys = ?context
+                            .as_object()
+                            .map(|m| m.keys().cloned().collect::<Vec<_>>())
+                            .unwrap_or_default(),
+                        "Edge condition false — the edge will not carry output"
+                    );
+                    EdgeResolution::Inactive
+                }
+            }
+        }
+    }
+
+    /// The `FanIn` join mode of `idx`, or `None` for every other node kind
+    /// (which waits for all of its incoming edges).
+    fn fan_in_join_mode(&self, idx: NodeIndex) -> Option<&JoinMode> {
+        match self.node_meta.get(&self.graph[idx]) {
+            Some((_, _, Some(SystemNodeKind::FanIn { join_mode, .. }))) => Some(join_mode),
+            _ => None,
+        }
+    }
+
+    /// A pipeline chain completes as ONE future keyed on its tail: decide
+    /// every member so none is enqueued again. No-op on the seeded scheduler,
+    /// which runs no chains.
+    fn decide_chain_members(
+        &self,
+        finished_idx: NodeIndex,
+        chains_ctx: Option<(&[Vec<NodeIndex>], &HashMap<NodeIndex, usize>)>,
+        joins: &mut Joins,
+    ) {
+        if let Some((chains, node_to_chain)) = chains_ctx {
+            if let Some(&chain_idx) = node_to_chain.get(&finished_idx) {
+                for &n in &chains[chain_idx] {
+                    joins.decide(n);
+                }
+            }
+        }
     }
 }
 

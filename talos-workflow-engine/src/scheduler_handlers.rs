@@ -5,15 +5,16 @@
 //! `None`. If the variant matches, the method computes the node's
 //! output (optionally awaiting sub-workflow dispatch), emits any
 //! lifecycle events that belong with the handler's semantics, and
-//! returns `Some(output)`. The scheduler caller then inserts the
-//! output into `results` and unblocks successors uniformly via
-//! [`ParallelWorkflowEngine::unblock_successors`].
+//! returns `Some(output)`. The scheduler caller then commits the
+//! output and releases successors uniformly via
+//! `ParallelWorkflowEngine::release_successors` (edge conditions, error-edge
+//! types and the skip cascade apply after every node kind).
 //!
 //! Splitting each handler out of the reactor loop keeps the scheduler
 //! body focused on topology (ready queue, futures, chain routing) and
 //! lets each kind's semantics stay auditable in isolation.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Arc;
 use talos_workflow_engine_core::reserved_keys::output_reports_error;
 
@@ -21,7 +22,7 @@ use petgraph::graph::NodeIndex;
 use petgraph::Direction;
 use serde_json::{json, Value as JsonValue};
 use talos_workflow_engine_core::{
-    DispatchJob, EdgeLogic, ExecutionStartedContext, NodeDispatcher, SystemNodeKind,
+    DispatchJob, EdgeLogic, ExecutionStartedContext, NodeDispatcher, StartedRow, SystemNodeKind,
     WorkerSharedKey,
 };
 
@@ -86,39 +87,6 @@ pub(crate) enum WaitOutcome {
 }
 
 impl ParallelWorkflowEngine {
-    /// Decrement every successor's pending-count and push nodes whose
-    /// count reached zero onto the ready queue.
-    ///
-    /// Every local-computation handler calls this after inserting its
-    /// output into `results`. The two-phase update — decrement first,
-    /// then check zero — is load-bearing: a node with two pending
-    /// predecessors decrements twice, and only the second decrement
-    /// should enqueue it.
-    pub(crate) fn unblock_successors(
-        &self,
-        node_idx: NodeIndex,
-        pending: &mut HashMap<NodeIndex, usize>,
-        ready: &mut VecDeque<NodeIndex>,
-    ) {
-        for child in self.graph.neighbors_directed(node_idx, Direction::Outgoing) {
-            if let Some(cnt) = pending.get_mut(&child) {
-                let was_positive = *cnt > 0;
-                if was_positive {
-                    *cnt -= 1;
-                }
-                // Enqueue only on the TRANSITION to zero, and remove the entry so
-                // a parent completing later (possible under early-ready fan-in)
-                // can't re-enter and double-enqueue this child. Mirrors the
-                // removal in `handle_node_success`. Pre-fix, an unconditional
-                // `if *cnt == 0` re-enqueued a child whose counter was already 0.
-                if was_positive && *cnt == 0 {
-                    pending.remove(&child);
-                    ready.push_back(child);
-                }
-            }
-        }
-    }
-
     /// [`SystemNodeKind::Collect`] — aggregate every parent branch's
     /// output into a single `{count, items: [...]}` envelope.
     pub(crate) fn try_dispatch_collect(
@@ -2536,7 +2504,7 @@ impl ParallelWorkflowEngine {
             // so it can't linger in 'running'.
             let iter_exec_id = Uuid::new_v4();
             if let Some(ref store) = self.module_execution_store {
-                if let Err(db_err) = store
+                match store
                     .record_started(ExecutionStartedContext {
                         id: iter_exec_id,
                         module_id: iter_module_id,
@@ -2555,15 +2523,39 @@ impl ParallelWorkflowEngine {
                     })
                     .await
                 {
-                    // Non-fatal: losing the audit row must not fail the
-                    // iteration. It does mean this iteration's logs will be
-                    // dropped downstream — which the subscriber now reports
-                    // as `wasm_log_orphaned` instead of swallowing.
-                    tracing::error!(
-                        %iter_exec_id,
-                        "module_execution_store.record_started failed for loop iteration: {}",
-                        db_err
-                    );
+                    Ok(StartedRow::Running) => {}
+                    // The parent execution is over (cancelled / failed): do
+                    // not send this iteration, and stop the run — same rule
+                    // as single-node dispatch.
+                    Ok(StartedRow::BornCancelled) => {
+                        tracing::info!(
+                            %execution_id,
+                            %node_id,
+                            iteration,
+                            "execution is no longer running (cancelled or failed) — \
+                             loop iteration NOT dispatched; stopping the run"
+                        );
+                        self.progress.abort_run();
+                        last_output = serde_json::json!({
+                            "__error": true,
+                            "error_message": crate::engine::NODE_NOT_DISPATCHED,
+                        });
+                        termination_reason = "run_stopped";
+                        terminating_error = Some(crate::engine::NODE_NOT_DISPATCHED.to_string());
+                        break;
+                    }
+                    Err(db_err) => {
+                        // Non-fatal: losing the audit row must not fail the
+                        // iteration. It does mean this iteration's logs will
+                        // be dropped downstream — which the subscriber now
+                        // reports as `wasm_log_orphaned` instead of
+                        // swallowing.
+                        tracing::error!(
+                            %iter_exec_id,
+                            "module_execution_store.record_started failed for loop iteration: {}",
+                            db_err
+                        );
+                    }
                 }
             }
             let iter_started = std::time::Instant::now();

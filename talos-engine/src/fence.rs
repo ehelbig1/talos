@@ -25,6 +25,19 @@
 //! legitimate next resumer can BOTH observe `resuming`, but only one holds the
 //! current epoch. See `docs/split-brain-fencing-design.md`.
 //!
+//! ## Status: a run that is already over (2026-09-25)
+//!
+//! The heartbeat also reads `status`, and stops the run when the row has
+//! become TERMINAL — `cancelled` by an operator, `failed` by the stale sweep
+//! or an operator cleanup, `completed` by anyone but this controller (which
+//! only finalizes after the run returns). An operator cancel stops a run
+//! driven by THIS process at once, through `talos_shutdown::inflight`; this
+//! poll is the cross-replica backstop for a run another controller is
+//! driving, bounded by [`FENCE_HEARTBEAT_SECS`], and only on the fenced
+//! paths listed below. On every path, the first module dispatch after the
+//! row turned terminal is refused anyway: its start row is born `cancelled`
+//! (`StartedRow::BornCancelled`) and the engine stops the run.
+//!
 //! ## Fresh-run coverage
 //!
 //! Fencing now covers THREE entry paths:
@@ -199,11 +212,42 @@ pub fn was_fenced(err: &WorkflowEngineError) -> bool {
     matches!(err, WorkflowEngineError::Cancelled)
 }
 
-/// Poll the execution's epoch every [`FENCE_HEARTBEAT_SECS`]; cancel `token`
-/// (aborting the engine) the moment the epoch no longer equals `my_epoch`, the
-/// row vanishes, or — implicitly — the caller cancels the token to signal the
-/// run finished. A transient query error is logged and retried (a DB blip must
-/// not abort a healthy resume; a real supersede persists and trips next tick).
+/// What one fence poll decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FenceDecision {
+    /// The row is still this controller's and still live.
+    Continue,
+    /// Another claim/reclaim advanced the epoch: this controller was superseded.
+    Superseded { observed_epoch: i64 },
+    /// The row is terminal — cancelled by an operator, or finalized by
+    /// another writer. Nobody is waiting on this run any more.
+    Terminal { status: String },
+    /// The row no longer exists.
+    Vanished,
+}
+
+/// Pure: the fence's verdict on one observation of the row. Supersede is
+/// checked first — a superseded controller must stop whatever the status
+/// says, and the log line should name the reason that is about ownership.
+fn fence_decision(my_epoch: i64, observed: Option<(i64, &str)>) -> FenceDecision {
+    match observed {
+        None => FenceDecision::Vanished,
+        Some((epoch, _)) if epoch != my_epoch => FenceDecision::Superseded {
+            observed_epoch: epoch,
+        },
+        Some((_, status @ ("cancelled" | "failed" | "completed"))) => FenceDecision::Terminal {
+            status: status.to_string(),
+        },
+        Some(_) => FenceDecision::Continue,
+    }
+}
+
+/// Poll the execution's epoch AND status every [`FENCE_HEARTBEAT_SECS`];
+/// cancel `token` (aborting the engine) the moment the epoch no longer equals
+/// `my_epoch`, the row turns terminal, or the row vanishes. The caller
+/// dropping the heartbeat ends the poll. A transient query error is logged and
+/// retried (a DB blip must not abort a healthy run; a real supersede or cancel
+/// persists and trips next tick).
 async fn epoch_fence_heartbeat(
     pool: Pool<Postgres>,
     execution_id: Uuid,
@@ -219,18 +263,41 @@ async fn epoch_fence_heartbeat(
             // Caller cancelled (run finished) — stop polling.
             () = token.cancelled() => break,
             _ = tick.tick() => {
-                match current_epoch(&pool, execution_id).await {
-                    Ok(Some(epoch)) if epoch == my_epoch => { /* still ours */ }
-                    Ok(Some(epoch)) => {
+                let observed = match current_ownership(&pool, execution_id).await {
+                    Ok(observed) => observed,
+                    Err(e) => {
                         tracing::warn!(
-                            %execution_id, held_epoch = my_epoch, observed_epoch = epoch,
+                            %execution_id, error = %e,
+                            "crash-recovery FENCE: heartbeat query failed; will retry next tick"
+                        );
+                        continue;
+                    }
+                };
+                match fence_decision(
+                    my_epoch,
+                    observed.as_ref().map(|(epoch, status)| (*epoch, status.as_str())),
+                ) {
+                    FenceDecision::Continue => {}
+                    FenceDecision::Superseded { observed_epoch } => {
+                        tracing::warn!(
+                            %execution_id, held_epoch = my_epoch, observed_epoch,
                             "crash-recovery FENCE: epoch advanced — this controller was \
                              superseded by another claim/reclaim; aborting the resume"
                         );
                         token.cancel();
                         break;
                     }
-                    Ok(None) => {
+                    FenceDecision::Terminal { status } => {
+                        tracing::info!(
+                            %execution_id, %status,
+                            "execution FENCE: the execution is no longer running (an operator \
+                             cancel, or finalized by another writer); stopping this run — no \
+                             further nodes will be dispatched"
+                        );
+                        token.cancel();
+                        break;
+                    }
+                    FenceDecision::Vanished => {
                         tracing::warn!(
                             %execution_id, held_epoch = my_epoch,
                             "crash-recovery FENCE: execution row no longer exists; aborting the resume"
@@ -238,27 +305,22 @@ async fn epoch_fence_heartbeat(
                         token.cancel();
                         break;
                     }
-                    Err(e) => tracing::warn!(
-                        %execution_id, error = %e,
-                        "crash-recovery FENCE: epoch heartbeat query failed; will retry next tick"
-                    ),
                 }
             }
         }
     }
 }
 
-/// Single-column primary-key read of the current ownership epoch. Returns
+/// Single-row primary-key read of the ownership epoch and status. Returns
 /// `None` if the row is gone.
-async fn current_epoch(
+async fn current_ownership(
     pool: &Pool<Postgres>,
     execution_id: Uuid,
-) -> Result<Option<i64>, sqlx::Error> {
-    let row: Option<(i64,)> = sqlx::query_as("SELECT epoch FROM workflow_executions WHERE id = $1")
+) -> Result<Option<(i64, String)>, sqlx::Error> {
+    sqlx::query_as("SELECT epoch, status FROM workflow_executions WHERE id = $1")
         .bind(execution_id)
         .fetch_optional(pool)
-        .await?;
-    Ok(row.map(|r| r.0))
+        .await
 }
 
 #[cfg(test)]
@@ -271,6 +333,35 @@ mod tests {
     /// other error (e.g. Timeout) MUST still be marked failed. A regression
     /// here would either clobber a new owner's row (false-true) or leak a
     /// genuinely-failed execution back into the claimable set (false-false).
+    #[test]
+    fn the_fence_stops_a_run_whose_row_turned_terminal() {
+        for status in ["cancelled", "failed", "completed"] {
+            assert_eq!(
+                fence_decision(3, Some((3, status))),
+                FenceDecision::Terminal {
+                    status: status.to_string()
+                },
+                "{status}"
+            );
+        }
+        for live in ["running", "resuming", "queued", "waiting"] {
+            assert_eq!(
+                fence_decision(3, Some((3, live))),
+                FenceDecision::Continue,
+                "{live}"
+            );
+        }
+    }
+
+    #[test]
+    fn supersede_is_reported_before_status() {
+        assert_eq!(
+            fence_decision(3, Some((4, "cancelled"))),
+            FenceDecision::Superseded { observed_epoch: 4 }
+        );
+        assert_eq!(fence_decision(3, None), FenceDecision::Vanished);
+    }
+
     #[test]
     fn was_fenced_only_matches_cancellation() {
         assert!(was_fenced(&WorkflowEngineError::Cancelled));

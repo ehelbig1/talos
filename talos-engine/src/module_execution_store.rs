@@ -17,7 +17,9 @@ use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 use sqlx::{Pool, Postgres};
 use std::sync::Arc;
-use talos_workflow_engine_core::{BoxError, ExecutionStartedContext, ModuleExecutionStore};
+use talos_workflow_engine_core::{
+    BoxError, ExecutionStartedContext, ModuleExecutionStore, StartedRow,
+};
 use uuid::Uuid;
 
 /// Default Talos impl. Holds a Postgres pool + optional SecretsManager
@@ -56,7 +58,10 @@ impl PostgresModuleExecutionStore {
     /// and all three engine callers of `record_started` route through it — so
     /// instrumenting here covers every production start-row write without
     /// touching `talos-workflow-engine` (which owns the trait, not the DB).
-    async fn record_started_inner(&self, ctx: ExecutionStartedContext<'_>) -> Result<(), BoxError> {
+    async fn record_started_inner(
+        &self,
+        ctx: ExecutionStartedContext<'_>,
+    ) -> Result<StartedRow, BoxError> {
         let ExecutionStartedContext {
             id,
             module_id,
@@ -164,12 +169,17 @@ impl PostgresModuleExecutionStore {
             .bind(actor_id)
             .fetch_optional(&self.pool)
             .await
-            .and_then(|inserted| -> Result<(), sqlx::Error> {
+            .and_then(|inserted| -> Result<StartedRow, sqlx::Error> {
                 // A row born `cancelled` is terminal at birth: it is the one
                 // module-execution outcome no finalizer will ever see, so it
                 // is counted here, with no duration (it never ran). The
                 // status read propagates (check 52): a projection that stops
                 // returning `status` must be an error, not an uncounted row.
+                //
+                // And it is RETURNED: the parent run is `cancelled` or
+                // `failed`, so the engine must not dispatch the job this row
+                // describes. `None` (an `id` collision, nothing inserted)
+                // says nothing about the parent and reads as `Running`.
                 use sqlx::Row as _;
                 if let Some(row) = inserted {
                     let status: String = row.try_get("status")?;
@@ -178,9 +188,10 @@ impl PostgresModuleExecutionStore {
                             talos_metrics::ModuleExecutionOutcome::Cancelled,
                             None,
                         );
+                        return Ok(StartedRow::BornCancelled);
                     }
                 }
-                Ok(())
+                Ok(StartedRow::Running)
             })
         } else {
             // allow-trigger-type-column: same as the race-safe arm above —
@@ -205,7 +216,7 @@ impl PostgresModuleExecutionStore {
             .bind(actor_id)
             .execute(&self.pool)
             .await
-            .map(|_| ())
+            .map(|_| StartedRow::Running)
         };
         result.map_err(|e| -> BoxError { e.into() })
     }
@@ -221,7 +232,10 @@ impl std::fmt::Debug for PostgresModuleExecutionStore {
 
 #[async_trait]
 impl ModuleExecutionStore for PostgresModuleExecutionStore {
-    async fn record_started(&self, ctx: ExecutionStartedContext<'_>) -> Result<(), BoxError> {
+    async fn record_started(
+        &self,
+        ctx: ExecutionStartedContext<'_>,
+    ) -> Result<StartedRow, BoxError> {
         let result = self.record_started_inner(ctx).await;
         // The SINGLE production chokepoint for `module_executions` start-row
         // writes. `record_started`'s Err is NON-FATAL at every caller by design

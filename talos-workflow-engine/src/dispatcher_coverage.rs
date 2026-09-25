@@ -158,7 +158,8 @@ pub enum SystemNodeErrorRouting {
 ///
 /// **What this does and does not buy.**  It is a compile-time obligation
 /// to CLASSIFY, not a proof that the classification is true: nothing here
-/// can observe a reactor branch quietly reverting to `commit_result!`.
+/// can observe a reactor branch quietly reverting to a plain
+/// `commit_and_release!` success commit.
 /// The enforcement for that is behavioural, at the call site —
 /// `tests/system_node_failure_routing.rs` drives the real reactor for
 /// `SubWorkflow` / `AgentLoop` / `ReActLoop`, and `tests/precheck_errors.rs`

@@ -2,7 +2,8 @@
 //!
 //! Hosts the per-kind computation the scheduler-side `try_dispatch_*`
 //! wrappers (see `scheduler_handlers`) and the reactor loop lean on:
-//! fan-in aggregation (`aggregate_fan_in`, `apply_fan_in_early_ready`),
+//! fan-in aggregation (`aggregate_fan_in`; the early-ready join rule
+//! lives in `join_state`),
 //! synthesize / verify / confidence-gate evaluation, input gathering
 //! and accumulated-context memoization, module artifact fetching, the
 //! world-aware memory-injection gate (`node_needs_memory_for_world`),
@@ -16,7 +17,7 @@ use std::sync::Arc;
 use petgraph::graph::NodeIndex;
 use petgraph::Direction;
 use serde_json::{Map, Value as JsonValue};
-use talos_workflow_engine_core::{JoinMode, ModuleFetcher, NodeEventWrite, SystemNodeKind};
+use talos_workflow_engine_core::{JoinMode, ModuleFetcher, NodeEventWrite};
 use uuid::Uuid;
 
 use crate::emit_event_spawn;
@@ -883,55 +884,6 @@ impl ParallelWorkflowEngine {
                     }))
                 }
             }
-        }
-    }
-
-    /// `FanIn` early-ready: apply a [`JoinMode::Any`] / `Majority` /
-    /// `N(k)` short-circuit on `child` if it's a `FanIn` node and enough
-    /// parents have completed to satisfy the join. Mutates `pending`
-    /// by zeroing the child's counter when the join is satisfied.
-    /// `JoinMode::All` waits for every parent and is the default
-    /// zero-action branch.
-    pub(crate) fn apply_fan_in_early_ready(
-        &self,
-        child: NodeIndex,
-        pending: &mut HashMap<NodeIndex, usize>,
-    ) {
-        let Some((_, _, Some(SystemNodeKind::FanIn { join_mode, .. }))) =
-            self.node_meta.get(&self.graph[child])
-        else {
-            return;
-        };
-        let total_parents = self
-            .graph
-            .neighbors_directed(child, Direction::Incoming)
-            .count();
-        let cnt = *pending.get(&child).unwrap_or(&0);
-        // `saturating_sub`: defence-in-depth against a stale/underflowed counter
-        // so the completed-parent count can never wrap (the removal in
-        // `handle_node_success` is the primary guard).
-        let completed_parents = total_parents.saturating_sub(cnt);
-        match join_mode {
-            JoinMode::Any => {
-                if cnt > 0 {
-                    pending.insert(child, 0);
-                }
-            }
-            JoinMode::Majority => {
-                if completed_parents > total_parents / 2 && cnt > 0 {
-                    pending.insert(child, 0);
-                }
-            }
-            JoinMode::N(n) => {
-                if completed_parents >= *n as usize && cnt > 0 {
-                    pending.insert(child, 0);
-                }
-            }
-            JoinMode::All => {} // default: wait for everyone
-            // `JoinMode` is `#[non_exhaustive]`; default to `All`-style
-            // wait-for-everyone behavior for unknown variants until the
-            // engine adds explicit handling.
-            _ => {}
         }
     }
 

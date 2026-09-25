@@ -192,15 +192,45 @@ annotations, matching the React Flow frontend's behavior.
   // handle on the target.
   "targetHandle": "error",
 
-  // Optional edge logic. Controls whether the edge fires based on
-  // the source output. Defaults to `always`.
-  //
-  //   "always"                   — fire unconditionally
-  //   {"condition": "expr"}     — fire when `expr` is truthy
-  //   {"not_condition": "expr"} — fire when `expr` is falsy
-  "logic": { "condition": "ok == true" }
+  // Optional. A Rhai expression evaluated against the SOURCE node's
+  // committed output; the edge carries that output only when it
+  // evaluates true. Absent = unconditional.
+  "condition": "ok == true",
+
+  // Optional. `"error"` marks an error edge: it carries the source's
+  // failure envelope when the source FAILS, and never fires on a
+  // success. Anything else (default `"default"`) is a success edge.
+  "edge_type": "default"
 }
 ```
+
+### How a node's incoming edges decide whether it runs
+
+Every edge resolves exactly once, when its source's fate is known, and
+resolves ACTIVE (it carries output) or INACTIVE (it never will). The rule is
+the same after EVERY node kind — a module, a judge, a sub-workflow, an inline
+system node, a skip:
+
+| Source outcome | error edge | edge with `condition` | plain edge |
+|---|---|---|---|
+| committed an output | inactive | active iff the condition holds | active |
+| skipped by its own `skip_condition` (or an unmatched `error_handler` pattern) | inactive | inactive (no output to test) | active |
+| failed, and has error edges | active | inactive | inactive |
+| failed under `continue_on_error` | active | active (not evaluated) | active |
+
+A node waits until ALL of its incoming edges have resolved, then RUNS if at
+least one resolved active and is SKIPPED otherwise — recorded in the results
+as `{"__skipped": true, "reason": "no_active_input"}`, with its own outgoing
+edges resolving inactive in turn, all the way down. So an if/else pair of
+conditional edges merging into one node runs that node once, via whichever
+branch was taken, regardless of which branch finishes first. A `fan_in` with
+an early-ready `join_mode` (`any` / `n` / `majority`) counts only parents
+whose edge resolved active from a success or an error route; a failure
+carried by `continue_on_error` counts only once every parent has resolved.
+
+On a resume from a checkpoint (Wait / confidence-gate pause), the edges of an
+already-completed node resolve active at seed time — conditions are not
+re-evaluated against the stored output.
 
 ## Per-kind `data` — selected shapes
 

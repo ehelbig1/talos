@@ -9,6 +9,9 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 tokio = { version = "1", features = ["sync", "signal", "macros", "rt", "time"] }
+# `CancellationToken` for the per-run stop signal `inflight::InFlightRuns::cancel`
+# fires (an operator cancel reaching the engine driving the run).
+tokio-util = { version = "0.7", default-features = false }
 uuid.workspace = true
 tracing.workspace = true
 

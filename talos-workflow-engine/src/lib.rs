@@ -60,6 +60,7 @@ mod execution_progress;
 pub mod graph_builder;
 pub mod graph_json;
 mod graph_parser;
+mod join_state;
 mod oauth_reauth;
 mod sandbox;
 mod scheduler_handlers;
